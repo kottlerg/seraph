@@ -2233,7 +2233,9 @@ pub struct IpcMessage
     /// and for unbadged endpoints.
     pub badge: u64,
     data: [u64; MSG_DATA_WORDS_MAX],
-    /// Number of valid `u64` words in `data`. `<= MSG_DATA_WORDS_MAX`.
+    /// Number of valid `u64` words in `data`. `<= MSG_DATA_WORDS_MAX`: the
+    /// builder's setters assert the bound, and [`IpcMessage::from_ipc_buf`]
+    /// requires it of its caller.
     data_len: u8,
     /// Number of valid slots in `cap_slots`. `<= MSG_CAP_SLOTS_MAX`.
     cap_count: u8,
@@ -2299,15 +2301,14 @@ impl IpcMessage
     #[must_use]
     pub fn data_bytes(&self) -> &[u8]
     {
-        // SAFETY: `data` is `[u64; MSG_DATA_WORDS_MAX]` — contiguous and
-        // u64-aligned, which is stricter than u8 alignment. Length
-        // `word_count * 8` stays inside the array (`word_count <=
-        // MSG_DATA_WORDS_MAX` by invariant).
+        let words = self.words();
+        // SAFETY: `words` is a bounds-checked sub-slice of `data`, so a byte
+        // view of `words.len() * 8` bytes from its start covers only
+        // initialised memory of that array; u64 alignment is stricter than
+        // u8 alignment, and the shared borrow of `self` keeps the array
+        // alive and unmodified for the returned slice's lifetime.
         unsafe {
-            core::slice::from_raw_parts(
-                self.data.as_ptr().cast::<u8>(),
-                self.data_len as usize * core::mem::size_of::<u64>(),
-            )
+            core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), core::mem::size_of_val(words))
         }
     }
 
@@ -2386,7 +2387,8 @@ impl IpcMessage
     {
         for (i, &val) in self.words().iter().enumerate()
         {
-            // SAFETY: `data_len <= MSG_DATA_WORDS_MAX` invariant, so
+            // SAFETY: `words()` is a bounds-checked sub-slice of the
+            // `MSG_DATA_WORDS_MAX`-word `data` array, so
             // `i < MSG_DATA_WORDS_MAX` and the offset is within the
             // 4 KiB buffer. Caller guarantees pointer validity.
             unsafe { core::ptr::write_volatile(ipc_buf.add(i), val) };
@@ -2509,10 +2511,20 @@ impl IpcMessageBuilder
     /// Explicitly set `word_count`. Useful when a protocol wants padding
     /// words counted (`words`/`word`/`bytes` auto-grow only to the
     /// highest touched word).
+    ///
+    /// # Panics
+    /// Panics in every build if `len > MSG_DATA_WORDS_MAX`. The count is a
+    /// protocol constant, so an overrun is a programmer error — the same
+    /// one an out-of-range index in `word`/`words`/`bytes` reports through
+    /// the array bounds check — and it must not reach the `data_len <=
+    /// MSG_DATA_WORDS_MAX` invariant the message's views rely on.
     #[must_use]
     pub fn word_count(mut self, len: usize) -> Self
     {
-        debug_assert!(len <= MSG_DATA_WORDS_MAX);
+        assert!(
+            len <= MSG_DATA_WORDS_MAX,
+            "IpcMessageBuilder::word_count: len exceeds MSG_DATA_WORDS_MAX"
+        );
         self.msg.data_len = len as u8;
         self
     }

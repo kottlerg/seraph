@@ -180,7 +180,8 @@ pub struct ThreadControlBlock
     /// Inline message buffer for in-flight IPC data (the staged message).
     ipc_msg: Message,
 
-    /// Caller bound for the implicit reply (set on receive, cleared on reply).
+    /// Caller bound by the last receive (consumed by the reply, released at the
+    /// next receive, or cleared by a cancel or dealloc claim).
     reply_tcb: AtomicPtr<ThreadControlBlock>,
 
     /// Wakeup value (notification bits, event payload, or wait-set member badge).

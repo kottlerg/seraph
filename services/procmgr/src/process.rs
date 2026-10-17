@@ -2617,6 +2617,22 @@ pub fn teardown_entry(entry: ProcessEntry, memmgr_ep: u32, ipc_buf: *mut u64)
 /// namespace authority. `finalize_creation` already bound the child's
 /// main thread to procmgr's shared death queue, so this just configures
 /// the thread and kicks it.
+///
+/// # Errors
+/// Returns the `START_PROCESS` reply code (`services/procmgr/docs/ipc-interface.md`
+/// § Label 2):
+/// - `procmgr_errors::INVALID_BADGE` (4) — no process in `table` carries
+///   `badge`.
+/// - `procmgr_errors::ALREADY_STARTED` (5) — the process was started before.
+/// - `procmgr_errors::OUT_OF_MEMORY` (2) — a namespace or cwd override is
+///   pending and either the scratch mapping of the child's `ProcessInfo`
+///   page or the `cap_copy` of an override cap into the child's `CSpace`
+///   failed.
+/// - `3` — `thread_configure_with_tls` of the child's main thread failed.
+///   A raw value with no `procmgr_errors` constant.
+/// - `6` — `thread_start` of the child's main thread failed with an error
+///   other than `Interrupted`, which is retried. A raw value with no
+///   `procmgr_errors` constant.
 pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u32) -> Result<(), u64>
 {
     let entry = table

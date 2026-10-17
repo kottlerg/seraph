@@ -258,8 +258,8 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
 // ── SYS_THREAD_START (self) ──────────────────────────────────────────────────
 
 /// A thread starting itself through its own Thread cap gets `InvalidArgument`:
-/// it is running, so there is nothing to start, and a start it made while a
-/// stop landed on it would wait for its own deschedule.
+/// it is running, so there is nothing to start. The kernel's refusal of a
+/// self-start as such is reachable only once a stop has landed on the caller.
 pub fn start_self_invalid_argument(ctx: &TestContext) -> TestResult
 {
     if thread_start(ctx.thread_cap) != Err(SyscallError::InvalidArgument as i64)

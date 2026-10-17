@@ -476,8 +476,9 @@ pub struct ThreadControlBlock
     /// Inline message buffer for in-flight IPC data.
     pub ipc_msg: crate::ipc::message::Message,
 
-    /// Thread waiting for our reply (set on receive, cleared on reply).
-    /// `AtomicPtr` because cancel/dealloc paths mutate this from outside
+    /// Caller bound by this thread's last receive: consumed by its reply,
+    /// released at its next receive, or cleared by the cancel and dealloc
+    /// claims. `AtomicPtr` because those claims mutate it from outside
     /// `ep.lock`; see docs/scheduling-internals.md § Cross-CPU TCB Ownership.
     pub reply_tcb: core::sync::atomic::AtomicPtr<ThreadControlBlock>,
 

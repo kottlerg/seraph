@@ -37,9 +37,11 @@ const RESERVED_VA: u64 = 0x3E_1000_0000;
 /// Badge bound with the handler and delivered in the fault message.
 const FAULT_BADGE: u64 = 0xC0FF_EE02;
 
-/// Register-file buffer size; the arch `TrapFrame` is 168 B (x86-64) / 280 B
-/// (RISC-V), both within this bound.
+/// Register-file buffer size; holds the arch `TrapFrame`
+/// (`crate::arch::TRAP_FRAME_BYTES`) on every architecture, as the guard
+/// below checks.
 const BUF: usize = 512;
+const _: () = assert!(BUF as u64 >= crate::arch::TRAP_FRAME_BYTES);
 
 /// Child cap slot for the success notification, stashed so the recovery routine
 /// can read it without depending on register state across the PC redirect.

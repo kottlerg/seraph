@@ -69,8 +69,7 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
      subsequent deaths can.
    * Spawn a fresh instance via the shared primitive
      [`walk_and_create_from_file`](#shared-spawn-primitives) (VFS
-     path) or `CREATE_PROCESS` with a fresh module-cap derivation,
-     replaying the recipe's `argv` / `env` from the stored
+     path), replaying the recipe's `argv` / `env` from the stored
      [`RestartRecipe`](../src/service.rs).
    * Re-apply the per-service namespace policy **and `cwd`** via
      [`apply_namespace_policy`](#shared-spawn-primitives).
@@ -140,7 +139,6 @@ at reconciliation time. The fixed-size fields live on `ServiceEntry`:
 | `ns_policy_kind` / `ns_subtree_path` / `ns_subtree_rights` | `namespace = ...` |
 | `thread_cap` | endowment thread cap (bind-only) or `Launched.thread_cap` (svcmgr-launched) |
 | `process_handle` | `Launched.process_handle` for svcmgr-launched; `0` for init-spawned (see DESTROY_PROCESS comment above) |
-| `module_cap` | `0` (services restart from their `vfs_path`; no module caps are held) |
 
 The heap-backed launch surfaces that don't fit the fixed record are held
 in a parallel [`RestartRecipe`](../src/service.rs) table

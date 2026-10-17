@@ -10,8 +10,8 @@
 //! `fault_resume_modifies_pc`). This exercises the `FAULT_KIND_EXCEPTION` path on
 //! the real trap surface:
 //!
-//!   1. A child bound to an endpoint executes an illegal instruction (`ud2` on
-//!      x86-64, `unimp` on RISC-V), trapping.
+//!   1. A child bound to an endpoint executes an illegal instruction
+//!      (`crate::arch::illegal_instruction`), trapping.
 //!   2. The harness thread receives the kernel-synthesized fault, verifies its
 //!      shape (`FAULT_LABEL`, badge, `FAULT_KIND_EXCEPTION`, normalized
 //!      `FAULT_EXC_ILLEGAL_INSTRUCTION`, captured faulting IP), reads the
@@ -42,9 +42,11 @@ use crate::{ChildStack, TestContext, TestResult};
 /// Badge bound with the handler and delivered in the fault message.
 const FAULT_BADGE: u64 = 0xC0FF_EE04;
 
-/// Register-file buffer size; the arch `TrapFrame` is 168 B (x86-64) / 280 B
-/// (RISC-V), both within this bound.
+/// Register-file buffer size; holds the arch `TrapFrame`
+/// (`crate::arch::TRAP_FRAME_BYTES`) on every architecture, as the guard
+/// below checks.
 const BUF: usize = 512;
+const _: () = assert!(BUF as u64 >= crate::arch::TRAP_FRAME_BYTES);
 
 /// Child cap slot for the success notification, stashed so the recovery routine
 /// can read it without depending on register state across the PC redirect.
@@ -128,22 +130,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 /// Child entry: execute an illegal instruction. The trap is redirected to the
 /// bound handler, which points this thread at [`recovery_child`] rather than
-/// resuming the faulting instruction. The loop only satisfies `-> !` and is
-/// never reached.
+/// resuming the faulting instruction, so control never returns here.
 fn fault_child(_arg: u64) -> !
 {
-    // SAFETY: a deliberately illegal instruction. The bound handler resumes this
-    // thread at recovery_child, so control never returns here.
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        core::arch::asm!("ud2");
-        #[cfg(target_arch = "riscv64")]
-        core::arch::asm!("unimp");
-    }
-    loop
-    {
-        core::hint::spin_loop();
-    }
+    crate::arch::illegal_instruction()
 }
 
 /// Recovery routine the handler redirects the faulting thread into. Signals

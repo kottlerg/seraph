@@ -14,7 +14,7 @@
 
 use ipc::{devmgr_labels, procmgr_labels};
 
-use super::{Definition, NamespaceShape, ProvidedName};
+use super::{Definition, NamespaceShape, ProvidedName, build_blob};
 use crate::REGISTRY_CAPACITY;
 use crate::registry_lookup_derived;
 use crate::restart::{
@@ -34,10 +34,6 @@ pub struct Launched
     /// the same object. Zero for pure-consumer services.
     pub provided_endpoint: u32,
 }
-
-// The argv/env wire-blob encoder lives beside the parser that bounds its
-// output, so launch, restart, and parse-time validation share one encoding.
-pub(crate) use svcmgr_defs::build_blob;
 
 /// Delete a set of cap slots, skipping the zero sentinel. Used on the
 /// launch/restart cleanup paths where a partially-assembled cap set must

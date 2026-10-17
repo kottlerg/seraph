@@ -86,10 +86,14 @@ const RESERVED_VA: u64 = 0x3E_8000_0000;
 /// Badge bound with the fault handler and delivered in each fault message.
 const FAULT_BADGE: u64 = 0xC0FF_EE08;
 
-/// Label of the controller's calls to the handler. The endpoint is FIFO, so
-/// the handler's answer proves it is past every message queued before the
-/// call; the handler exits after answering one with [`QUIT`] set.
+/// Label of the controller's sync calls to the handler. The endpoint is FIFO,
+/// so the handler's answer proves it is past every message queued before the
+/// call; the handler keeps receiving after it.
 const SYNC_LABEL: u64 = 0x5EC0;
+/// Label of the controller's last call to the handler, which answers it and
+/// exits. The handler exits on nothing else (a failed receive is retried), so
+/// no controller call can queue on an endpoint nothing receives on.
+const QUIT_LABEL: u64 = 0x5EC1;
 
 /// Bound on each in-round wait, in microseconds.
 const ROUND_WAIT_US: u64 = 100_000;
@@ -123,10 +127,12 @@ static RECV_ENTERED: AtomicU32 = AtomicU32::new(0);
 static RESUMED: AtomicU32 = AtomicU32::new(0);
 /// Fault replies that failed: a stop cancelled the fault under the handler.
 static REPLY_FAILED: AtomicU32 = AtomicU32::new(0);
-/// The handler's maps that failed, and its receives that failed or returned
-/// a message that is neither a fault nor a sync, with the last such result.
+/// The handler's maps that failed; and its receives that failed or returned
+/// a message that is neither a fault nor a sync, and its sync (or echo)
+/// replies that failed.
 static MAP_FAILED: AtomicU32 = AtomicU32::new(0);
 static BAD_RECVS: AtomicU32 = AtomicU32::new(0);
+/// The last result any failure counter above, or [`UNMAP_FAILED`], recorded.
 static BAD_RESULT: AtomicU64 = AtomicU64::new(0);
 
 /// The handler's IPC buffer (one live user).
@@ -265,7 +271,7 @@ fn report(tally: &Tally) -> TestResult
     check_bad(
         &BAD_RECVS,
         "stress::stop_fault_sender: a receive by the handler failed or returned an unexpected \
-         message",
+         message, or a sync reply failed",
     )?;
     if progress < resumed
     {
@@ -465,7 +471,6 @@ fn round(th: u32, cycle: u32, tally: &mut Tally) -> Result<Option<u64>, &'static
 /// round's phase. Returns [`Wait::Exited`] if the faulter died meanwhile.
 fn arm(th: u32, cycle: u32, tally: &mut Tally) -> Result<Wait, &'static str>
 {
-    let progress = PROGRESS.load(Ordering::Acquire);
     let attempted = await_faulter(th, tally, || {
         ATTEMPTS.load(Ordering::Acquire) != PROGRESS.load(Ordering::Acquire)
     })?;
@@ -473,6 +478,11 @@ fn arm(th: u32, cycle: u32, tally: &mut Tally) -> Result<Wait, &'static str>
     {
         return Ok(Wait::Exited);
     }
+    // Snapshot both counters only now, after the attempt was seen: a
+    // snapshot taken before the first wait could already differ (an attempt
+    // completed and the next began meanwhile), and the second wait would
+    // return at once instead of aligning to a receive entry.
+    let progress = PROGRESS.load(Ordering::Acquire);
     let entered = RECV_ENTERED.load(Ordering::Acquire);
     let receiving = await_faulter(th, tally, || {
         RECV_ENTERED.load(Ordering::Acquire) != entered
@@ -532,10 +542,18 @@ fn stop_and_restart(th: u32, tally: &mut Tally) -> Result<Option<u64>, &'static 
         tally.reply_during_stop += 1;
     }
     let before = PROGRESS.load(Ordering::Acquire);
-    thread_start(th).map_err(|e| {
+    if let Err(e) = thread_start(th)
+    {
+        // A stop that landed during the faulter's fault-kill exit returned
+        // Ok (the drain ends when the target commits Exited over Stopped);
+        // the dead faulter then refuses the start.
+        if e == SyscallError::InvalidArgument as i64 && spawn::is_exited(th)?
+        {
+            return exit_reason(th).map(Some);
+        }
         log_error("ktest: stress::stop_fault_sender thread_start error=", e);
-        "stress::stop_fault_sender: thread_start failed"
-    })?;
+        return Err("stress::stop_fault_sender: thread_start failed");
+    }
     match await_faulter(th, tally, || PROGRESS.load(Ordering::Acquire) != before)?
     {
         Wait::Done =>
@@ -558,8 +576,7 @@ fn stop_and_restart(th: u32, tally: &mut Tally) -> Result<Option<u64>, &'static 
 fn await_faulter(th: u32, tally: &mut Tally, done: impl Fn() -> bool)
 -> Result<Wait, &'static str>
 {
-    let elapsed_us = || system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(0);
-    let start = elapsed_us();
+    let start = elapsed_us()?;
     let mut spins = 0u32;
     loop
     {
@@ -574,7 +591,7 @@ fn await_faulter(th: u32, tally: &mut Tally, done: impl Fn() -> bool)
             {
                 return Ok(Wait::Exited);
             }
-            if elapsed_us().saturating_sub(start) > ROUND_WAIT_US
+            if elapsed_us()?.saturating_sub(start) > ROUND_WAIT_US
             {
                 tally.starved += 1;
                 return Ok(Wait::Expired);
@@ -582,6 +599,13 @@ fn await_faulter(th: u32, tally: &mut Tally, done: impl Fn() -> bool)
         }
         core::hint::spin_loop();
     }
+}
+
+/// Microseconds since boot; the clock every bounded wait is measured on.
+fn elapsed_us() -> Result<u64, &'static str>
+{
+    system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "stress::stop_fault_sender: system_info(ElapsedUs) failed")
 }
 
 /// The exit reason of the exited faulter `th`.
@@ -607,7 +631,7 @@ fn faulter_died(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally, reason:
         );
     }
     tally.killed += 1;
-    sync_handler(ctx, parts)?;
+    call_handler(ctx, parts, SYNC_LABEL)?;
     mem_unmap(ctx.aspace_cap, RESERVED_VA, 1)
         .map_err(|_| "stress::stop_fault_sender: unmap after a death failed")?;
     if let Some(th) = parts.faulter.take()
@@ -618,9 +642,9 @@ fn faulter_died(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally, reason:
     Ok(())
 }
 
-/// Call the handler with [`SYNC_LABEL`] and check its answer, which proves
-/// it is past every message queued before the call.
-fn sync_handler(ctx: &TestContext, parts: &Parts) -> TestResult
+/// Call the handler with `label` ([`SYNC_LABEL`] or [`QUIT_LABEL`]) and check
+/// its answer, which proves it is past every message queued before the call.
+fn call_handler(ctx: &TestContext, parts: &Parts, label: u64) -> TestResult
 {
     let ep = parts.ep.ok_or("stress::stop_fault_sender: no endpoint")?;
     let handler = parts
@@ -632,21 +656,21 @@ fn sync_handler(ctx: &TestContext, parts: &Parts) -> TestResult
         return Err("stress::stop_fault_sender: the handler exited early");
     }
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-    let reply = unsafe { ipc::ipc_call(ep, &IpcMessage::new(SYNC_LABEL), ctx.ipc_buf) }
-        .map_err(|_| "stress::stop_fault_sender: sync call failed")?;
-    if reply.label == SYNC_LABEL
+    let reply = unsafe { ipc::ipc_call(ep, &IpcMessage::new(label), ctx.ipc_buf) }
+        .map_err(|_| "stress::stop_fault_sender: call to the handler failed")?;
+    if reply.label == label
     {
         Ok(())
     }
     else
     {
-        Err("stress::stop_fault_sender: the handler answered a sync with the wrong label")
+        Err("stress::stop_fault_sender: the handler answered a call with the wrong label")
     }
 }
 
 /// End the children: set [`QUIT`], restart the faulter if a failed round
 /// left it stopped, wait for it to exit (voluntarily, or killed by the last
-/// stop), then sync the handler so it exits, and wait for it.
+/// stop), then send the handler its quit call, and wait for it to exit.
 fn finish(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally) -> TestResult
 {
     QUIT.store(1, Ordering::Release);
@@ -674,7 +698,8 @@ fn finish(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally) -> TestResult
             );
         }
     }
-    sync_handler(ctx, parts)?;
+    crate::log("ktest: stress::stop_fault_sender rounds done");
+    call_handler(ctx, parts, QUIT_LABEL)?;
     let handler = parts
         .handler
         .ok_or("stress::stop_fault_sender: no handler")?;
@@ -750,9 +775,9 @@ fn faulter_entry(arg: u64) -> !
         unsafe {
             page.write_volatile(u64::from(attempt));
         }
-        if mem_unmap(aspace, RESERVED_VA, 1).is_err()
+        if let Err(e) = mem_unmap(aspace, RESERVED_VA, 1)
         {
-            UNMAP_FAILED.fetch_add(1, Ordering::AcqRel);
+            record_bad(&UNMAP_FAILED, e);
         }
         PROGRESS.fetch_add(1, Ordering::AcqRel);
     }
@@ -761,7 +786,8 @@ fn faulter_entry(arg: u64) -> !
 
 /// Handler: register the IPC buffer, then loop: spin a varying delay,
 /// receive, and answer. A fault is answered by [`service_fault`]; a sync is
-/// echoed, and ends the loop once told to quit. Anything else is tallied.
+/// echoed; the quit call is echoed and ends the loop. Anything else is
+/// tallied and echoed.
 fn handler_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `setup` published for the handler.
@@ -788,29 +814,36 @@ fn handler_entry(arg: u64) -> !
         // SAFETY: `buf` was registered as this thread's IPC buffer above.
         let recv_result =
             unsafe { ipc::ipc_recv(args.ep, buf) }.inspect_err(|&e| record_bad(&BAD_RECVS, e));
-        let Ok(msg) = recv_result
-        else
+        let msg = match recv_result
         {
-            if QUIT.load(Ordering::Acquire) != 0
-            {
-                break;
-            }
-            continue;
+            Ok(msg) => msg,
+            // The endpoint goes only after this thread is deleted; any other
+            // failure is transient, and exiting on it would leave a controller
+            // call queued meanwhile waiting for good.
+            Err(e) if e == SyscallError::InvalidCapability as i64 => break,
+            Err(_) => continue,
         };
         if msg.label == FAULT_LABEL && msg.badge == FAULT_BADGE
         {
             service_fault(&args, buf);
             continue;
         }
-        if msg.label != SYNC_LABEL
+        if msg.label != SYNC_LABEL && msg.label != QUIT_LABEL
         {
             // cast_possible_wrap: the label is recorded as a raw word.
             #[allow(clippy::cast_possible_wrap)]
             record_bad(&BAD_RECVS, msg.label as i64);
         }
         // SAFETY: as above.
-        let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(msg.label), buf) };
-        if QUIT.load(Ordering::Acquire) != 0
+        let echoed = unsafe { ipc::ipc_reply(&IpcMessage::new(msg.label), buf) };
+        // A sync reply answers the controller's blocked call, so its failure
+        // is a test defect (unlike a fault reply's, which a stop's
+        // cancellation causes by design); tally it so the report names it.
+        if let Err(e) = echoed
+        {
+            record_bad(&BAD_RECVS, e);
+        }
+        if msg.label == QUIT_LABEL
         {
             break;
         }

@@ -41,5 +41,5 @@ pub mod launch;
 pub mod reconcile;
 
 pub use svcmgr_defs::{
-    Definition, NamespaceShape, ProvidedName, RestartPolicy, SERVICES_DIR, parse,
+    Definition, NamespaceShape, ProvidedName, RestartPolicy, SERVICES_DIR, build_blob, parse,
 };

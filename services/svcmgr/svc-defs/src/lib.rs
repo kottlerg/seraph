@@ -170,3 +170,22 @@ pub struct ProvidedName
 /// against svcmgr's `system_root_cap`. That cap is universal, so
 /// absolute lookups via `std::fs` resolve normally.
 pub const SERVICES_DIR: &str = "/config/svcmgr/services";
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn populated_tokens_pack_nul_separated_and_terminated_with_their_count()
+    {
+        let tokens = [String::from("a"), String::from("bc")];
+        assert_eq!(build_blob(&tokens), (b"a\0bc\0".to_vec(), 2));
+    }
+
+    #[test]
+    fn no_tokens_pack_to_the_empty_blob_and_zero_count()
+    {
+        assert_eq!(build_blob(&[]), (Vec::new(), 0));
+    }
+}

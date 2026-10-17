@@ -2234,7 +2234,7 @@ pub struct IpcMessage
     pub badge: u64,
     data: [u64; MSG_DATA_WORDS_MAX],
     /// Number of valid `u64` words in `data`. `<= MSG_DATA_WORDS_MAX`: every
-    /// [`IpcMessageBuilder`] setter asserts the bound in every build (an
+    /// [`IpcMessageBuilder`] setter panics past the bound in every build (an
     /// empty source at an out-of-range start included), and
     /// [`IpcMessage::from_ipc_buf`] requires it of its caller.
     data_len: u8,
@@ -2433,15 +2433,14 @@ impl IpcMessageBuilder
     /// Set data word `idx`; grow `word_count` to cover it if needed.
     ///
     /// # Panics
-    /// Panics in every build if `idx >= MSG_DATA_WORDS_MAX`; see
-    /// [`IpcMessageBuilder::word_count`] for why the bound is asserted.
+    /// Panics in every build if `idx >= MSG_DATA_WORDS_MAX` (the array
+    /// bounds check on the `MSG_DATA_WORDS_MAX`-word data array, which
+    /// fires before `word_count` can grow past the bound); see
+    /// [`IpcMessageBuilder::word_count`] for why an overrun is treated as
+    /// a programmer error.
     #[must_use]
     pub fn word(mut self, idx: usize, val: u64) -> Self
     {
-        assert!(
-            idx < MSG_DATA_WORDS_MAX,
-            "IpcMessageBuilder::word: idx exceeds MSG_DATA_WORDS_MAX"
-        );
         self.msg.data[idx] = val;
         let needed = (idx as u8) + 1;
         if self.msg.data_len < needed
@@ -2549,8 +2548,8 @@ impl IpcMessageBuilder
     /// # Panics
     /// Panics in every build if `len > MSG_DATA_WORDS_MAX`. The count is a
     /// protocol constant, so an overrun is a programmer error — the same
-    /// one `word`/`words`/`bytes` assert on an out-of-range index — and it
-    /// must not reach the `data_len <= MSG_DATA_WORDS_MAX` invariant the
+    /// one `word`/`words`/`bytes` panic on for an out-of-range index — and
+    /// it must not reach the `data_len <= MSG_DATA_WORDS_MAX` invariant the
     /// message's views rely on.
     #[must_use]
     pub fn word_count(mut self, len: usize) -> Self

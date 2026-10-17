@@ -75,9 +75,10 @@ const LATE_SPAN_US: u64 = WAIT_MS * 1000;
 const RESULT_SPINS: u32 = 200_000;
 
 /// Controller waits this long, in microseconds, for the waiter to enter a
-/// cycle's timed wait before failing the test. Between cycles the waiter only
-/// spins on `ACKED` and publishes its results, so a longer absence is a
-/// waiter that never came back from the previous cycle.
+/// cycle's timed wait before failing the test. The controller has already
+/// seen `FINISHED` reach the previous cycle, and between cycles the waiter
+/// only spins on `ACKED` and stores `TIMED`, so a longer absence is a waiter
+/// that is not being dispatched (or, on cycle 1, never started).
 const ENTER_TIMEOUT_US: u64 = 1_000_000;
 
 /// After the release delivery, the controller sleeps this many 1 ms steps for

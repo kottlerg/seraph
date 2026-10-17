@@ -1171,7 +1171,9 @@ can lock the object after it is freed
 ([#443](https://github.com/kottlerg/seraph/issues/443) § Source pointer held past its free). A
 thread running on another CPU is marked `Stopped` under every CPU's scheduler lock, and the call
 returns once that CPU has descheduled it, at its next slice expiry or the thread's own park or
-yield; the inter-processor interrupt sent to that CPU only forces a trap (see
+yield, or once an object teardown has committed `Exited` over it; the inter-processor interrupt
+sent to that CPU only forces a trap. A caller that is itself stopped while it waits deschedules in
+place; its call completes when it is restarted and the target has left its CPU (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
 Protocol).
 

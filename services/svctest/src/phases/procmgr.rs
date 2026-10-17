@@ -10,6 +10,8 @@
 
 use std::os::seraph::startup_info;
 
+use syscall_abi::MSG_DATA_WORDS_MAX;
+
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
@@ -38,6 +40,14 @@ pub fn command_phases() -> &'static [Phase]
         Phase {
             name: "command_invalid_elf_loop",
             run: command_invalid_elf_loop_phase,
+        },
+        Phase {
+            name: "command_blobs_over_message",
+            run: command_blobs_over_message_phase,
+        },
+        Phase {
+            name: "command_blobs_fill_message",
+            run: command_blobs_fill_message_phase,
         },
         Phase {
             name: "stdio_file_unsupported",
@@ -221,6 +231,55 @@ pub fn command_invalid_elf_loop_phase(_: &Caps)
         "hello after invalid-ELF loop exited non-zero",
     );
     std::os::seraph::log!("command_invalid_elf_loop phase passed");
+}
+
+/// Fixture the blob-size cells spawn; its path is argv[0] on the wire.
+const BLOB_FIXTURE: &str = "/programs/hello";
+
+/// A `Command` for [`BLOB_FIXTURE`] whose packed argv blob is exactly
+/// `ipc::ARGS_BLOB_MAX` bytes (argv[0] and one filler token, each
+/// NUL-terminated) and whose packed env blob is one `K=<v...>` entry of
+/// `env_bytes` bytes including its NUL. `env_clear` keeps svctest's own
+/// `SERAPH_*` entries out of the count.
+fn command_with_packed_blobs(env_bytes: usize) -> std::process::Command
+{
+    let argv0_bytes = BLOB_FIXTURE.len() + 1;
+    let filler = "a".repeat(ipc::ARGS_BLOB_MAX - argv0_bytes - 1);
+    let value = "v".repeat(env_bytes - "K=".len() - 1);
+    let mut cmd = std::process::Command::new(BLOB_FIXTURE);
+    cmd.arg(filler).env_clear().env("K", value);
+    cmd
+}
+
+pub fn command_blobs_over_message_phase(_: &Caps)
+{
+    // argv and env each at ARGS_BLOB_MAX pack to 1 + 32 + 1 + 32 words, two
+    // past the data area: std must refuse before any cap is minted.
+    let err = command_with_packed_blobs(ipc::ARGS_BLOB_MAX)
+        .spawn()
+        .expect_err("argv and env jointly over the message must not spawn");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::ArgumentListTooLong,
+        "joint blob overflow must surface as ArgumentListTooLong, got {err:?}"
+    );
+    std::os::seraph::log!("command_blobs_over_message phase passed");
+}
+
+pub fn command_blobs_fill_message_phase(_: &Caps)
+{
+    // file_size word + 32 argv words + env header + 30 env words = 64: the
+    // data area exactly full, which must still spawn and run.
+    let env_words = MSG_DATA_WORDS_MAX - 2 - ipc::ARGS_BLOB_MAX / 8;
+    let mut child = command_with_packed_blobs(env_words * 8)
+        .spawn()
+        .expect("argv and env filling the message exactly must spawn");
+    let status = child.wait().expect("wait on blob-fill child failed");
+    assert!(
+        status.success(),
+        "blob-fill child did not exit cleanly: {status}"
+    );
+    std::os::seraph::log!("command_blobs_fill_message phase passed");
 }
 
 pub fn stdio_file_unsupported_phase(_: &Caps)

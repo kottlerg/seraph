@@ -164,8 +164,8 @@ pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
 // the `process::{ProcessTable, ProcessEntry, RecentExits, MAX_PROCESSES}` paths
 // `main.rs` already uses keep resolving unchanged.
 pub use process_table::{
-    MAX_PROCESSES, ProcessEntry, ProcessTable, RecentExits, badge_is_acceptable,
-    resolve_spawn_sched,
+    ChildArgs, ChildEnv, CreateBlobs, MAX_PROCESSES, ProcessEntry, ProcessTable, RecentExits,
+    badge_is_acceptable, resolve_spawn_sched,
 };
 
 // ── Process table (impure operations) ─────────────────────────────────────────
@@ -446,30 +446,6 @@ pub struct UniversalCaps
     /// [`Self::memmgr_endpoint`] (the child's badged cap). Zero when memmgr is
     /// not reachable.
     pub self_memmgr_ep: u32,
-}
-
-/// Program arguments delivered to a child process at spawn time.
-///
-/// `blob` is a concatenation of `count` NUL-terminated UTF-8 strings. Empty
-/// slice + zero count means "no argv". The blob format and its page-remainder
-/// bound are defined by the argv section comment above
-/// `ProcessInfo::args_offset` in `abi/process-abi/src/lib.rs`.
-#[derive(Clone, Copy, Default)]
-pub struct ChildArgs<'a>
-{
-    pub blob: &'a [u8],
-    pub count: u32,
-}
-
-/// Environment variables delivered to a child process at spawn time.
-///
-/// Same shape as [`ChildArgs`] except each entry is `KEY=VALUE`. Empty
-/// slice + zero count means "no env". Same page-remainder bound.
-#[derive(Clone, Copy, Default)]
-pub struct ChildEnv<'a>
-{
-    pub blob: &'a [u8],
-    pub count: u32,
 }
 
 /// TLS template metadata extracted from a child's `PT_TLS` segment,

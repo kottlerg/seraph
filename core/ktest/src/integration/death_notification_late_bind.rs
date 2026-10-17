@@ -100,8 +100,7 @@ fn late_bind_after_death(
     crate::spawn::configure_and_start(&child, entry, stack_top, 0)
         .map_err(|_| "death_notification_late_bind: configure_and_start failed")?;
 
-    crate::spawn::wait_until_exited(child.th, MAX_POLLS)
-        .map_err(|_| "death_notification_late_bind: child never reached Exited")?;
+    crate::spawn::wait_until_exited(child.th, MAX_POLLS)?;
 
     // Bind a fresh queue onto the already-dead thread; the kernel delivers the
     // retained reason synchronously inside the bind syscall.
@@ -146,8 +145,7 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, clean_exit_child, stack_top, 0)
         .map_err(|_| "death_notification_late_bind: configure_and_start (control) failed")?;
 
-    crate::spawn::wait_until_exited(child.th, MAX_POLLS)
-        .map_err(|_| "death_notification_late_bind: control child never reached Exited")?;
+    crate::spawn::wait_until_exited(child.th, MAX_POLLS)?;
 
     // The death walk posts asynchronously on the child's CPU; poll for it.
     let payload = poll_event(eq)?;

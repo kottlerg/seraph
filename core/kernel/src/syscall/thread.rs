@@ -363,82 +363,134 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
         else if let Some(run_cpu) = running_on
         {
-            // Cross-CPU drain: the IPI's trap snapshots the target's user
-            // registers; the remote CPU drops the Stopped target at its next
-            // slice-expiry schedule(true), whose trap leaves the snapshot
-            // sys_thread_read_regs reads once this drain completes.
-            let current_cpu = crate::arch::current::cpu::current_cpu() as usize;
-            if run_cpu != current_cpu
-            {
-                // SAFETY: run_cpu < CPU_COUNT.
-                crate::sched::prod_remote_cpu(run_cpu);
-
-                let sched_remote = crate::sched::scheduler_for(run_cpu);
-                let spin_start = crate::arch::current::timer::current_tick();
-                let mut warned = false;
-                // The drain spins until the remote CPU deschedules `target_tcb`.
-                // This syscall runs with IF=0; spinning at IF=0 would block an
-                // inbound TLB-shootdown IPI targeted at this CPU and deadlock it
-                // (the initiator spins for our ACK with IF enabled). Enable
-                // interrupts across the spin and disable preemption so the
-                // scheduler cannot migrate us mid-drain — the #207 pattern
-                // dealloc's UAF gate uses.
-                crate::percpu::preempt_disable();
-                // SAFETY: ring 0; restored after the spin below.
-                let drain_saved_int = crate::arch::current::cpu::save_and_disable_interrupts();
-                // SAFETY: ring 0; IDT loaded; preempt disabled.
-                crate::arch::current::interrupts::enable();
-                while {
-                    let s = sched_remote.lock.lock_raw();
-                    let still_current = sched_remote.current == target_tcb;
-                    // A start cannot commit while the target is current here,
-                    // but an object teardown can commit Exited over it. The
-                    // bounded-spin invariant assumes the target stays in
-                    // schedule()'s requeue denylist (Stopped or Exited); read
-                    // state under the same lock the all-locks commits hold, and
-                    // bail once it is no longer Stopped so a teardown that then
-                    // reaps the target is not waited on here.
-                    let still_stopped = (*target_tcb).state == ThreadState::Stopped;
-                    sched_remote.lock.unlock_raw(s);
-                    still_current && still_stopped
-                }
-                {
-                    // Single-shot diagnostic at >100 ms.
-                    if !warned
-                    {
-                        let now = crate::arch::current::timer::current_tick();
-                        let tps = crate::arch::current::timer::ticks_per_second();
-                        if tps != 0 && now.saturating_sub(spin_start) > tps / 10
-                        {
-                            warned = true;
-                            // SAFETY: target_tcb validated above; cur read racily for diagnostic.
-                            #[allow(unused_unsafe)]
-                            unsafe {
-                                let tid = (*target_tcb).thread_id;
-                                let st = (*target_tcb).state;
-                                let cur = sched_remote.current;
-                                let cur_tid = if cur.is_null() { 0 } else { (*cur).thread_id };
-                                crate::kprintln!(
-                                    "kernel: sys_thread_stop spin >100ms target_tid={} \
-                                     state={:?} run_cpu={} cur_tid={}",
-                                    tid,
-                                    st,
-                                    run_cpu,
-                                    cur_tid
-                                );
-                            }
-                        }
-                    }
-                    core::hint::spin_loop();
-                }
-                // SAFETY: drain_saved_int from save_and_disable_interrupts above.
-                crate::arch::current::cpu::restore_interrupts(drain_saved_int);
-                crate::percpu::preempt_enable();
-            }
+            drain_remote_stopped(target_tcb, caller_tcb, run_cpu);
         }
     }
 
     Ok(0)
+}
+
+/// Wait for `run_cpu`, which still runs `target_tcb` after `commit_stopped`
+/// marked it `Stopped`, to deschedule it, so the register snapshot
+/// `sys_thread_read_regs` reads is the one that trap leaves. Returns at once
+/// when `run_cpu` is this CPU. A stop of the calling thread landing meanwhile
+/// deschedules it in place; the drain resumes when it is restarted.
+///
+/// # Safety
+/// `target_tcb` and `caller_tcb` (the running thread) must be valid TCBs,
+/// `run_cpu < CPU_COUNT`, and no lock may be held.
+#[cfg(not(test))]
+unsafe fn drain_remote_stopped(
+    target_tcb: *mut crate::sched::thread::ThreadControlBlock,
+    caller_tcb: *mut crate::sched::thread::ThreadControlBlock,
+    run_cpu: usize,
+)
+{
+    use crate::sched::thread::ThreadState;
+    // SAFETY: per the caller contract; every lock_raw below is paired with its
+    // unlock, and the interrupt and preemption state is restored on every exit.
+    unsafe {
+        // Cross-CPU drain: the IPI's trap snapshots the target's user
+        // registers; the remote CPU drops the Stopped target at its next
+        // slice-expiry schedule(true), whose trap leaves the snapshot
+        // sys_thread_read_regs reads once this drain completes.
+        let current_cpu = crate::arch::current::cpu::current_cpu() as usize;
+        if run_cpu != current_cpu
+        {
+            // SAFETY: run_cpu < CPU_COUNT.
+            crate::sched::prod_remote_cpu(run_cpu);
+
+            let sched_remote = crate::sched::scheduler_for(run_cpu);
+            let spin_start = crate::arch::current::timer::current_tick();
+            let mut warned = false;
+            // The drain spins until the remote CPU deschedules `target_tcb`.
+            // This syscall runs with IF=0; spinning at IF=0 would block an
+            // inbound TLB-shootdown IPI targeted at this CPU and deadlock it
+            // (the initiator spins for our ACK with IF enabled). Enable
+            // interrupts across the spin and disable preemption so the
+            // scheduler cannot migrate us mid-drain — the #207 pattern
+            // dealloc's UAF gate uses.
+            crate::percpu::preempt_disable();
+            // SAFETY: ring 0; restored after the spin below.
+            let mut drain_saved_int = crate::arch::current::cpu::save_and_disable_interrupts();
+            // SAFETY: ring 0; IDT loaded; preempt disabled.
+            crate::arch::current::interrupts::enable();
+            while {
+                let s = sched_remote.lock.lock_raw();
+                let still_current = sched_remote.current == target_tcb;
+                // A start cannot commit while the target is current here,
+                // but an object teardown can commit Exited over it. The
+                // bounded-spin invariant assumes the target stays in
+                // schedule()'s requeue denylist (Stopped or Exited); read
+                // state under the same lock the all-locks commits hold, and
+                // bail once it is no longer Stopped so a teardown that then
+                // reaps the target is not waited on here.
+                let still_stopped = (*target_tcb).state == ThreadState::Stopped;
+                sched_remote.lock.unlock_raw(s);
+                still_current && still_stopped
+            }
+            {
+                // Single-shot diagnostic at >100 ms.
+                if !warned
+                {
+                    let now = crate::arch::current::timer::current_tick();
+                    let tps = crate::arch::current::timer::ticks_per_second();
+                    if tps != 0 && now.saturating_sub(spin_start) > tps / 10
+                    {
+                        warned = true;
+                        // SAFETY: target_tcb validated above; cur read racily for diagnostic.
+                        #[allow(unused_unsafe)]
+                        unsafe {
+                            let tid = (*target_tcb).thread_id;
+                            let st = (*target_tcb).state;
+                            let cur = sched_remote.current;
+                            let cur_tid = if cur.is_null() { 0 } else { (*cur).thread_id };
+                            crate::kprintln!(
+                                "kernel: sys_thread_stop spin >100ms target_tid={} \
+                                 state={:?} run_cpu={} cur_tid={}",
+                                tid,
+                                st,
+                                run_cpu,
+                                cur_tid
+                            );
+                        }
+                    }
+                }
+                // A stop of this thread landing meanwhile (a peer stopping
+                // its stopper, or an object teardown) commits Stopped or
+                // Exited over it under every CPU lock while it spins here,
+                // and this preempt-disabled window suppresses the
+                // slice-expiry switch that would deschedule it: deschedule
+                // in place and, once restarted, resume the drain. The state
+                // is read under this thread's own sched_lock, which those
+                // commits hold. Two threads stopping each other thus both
+                // end Stopped instead of both spinning.
+                let caller_stopped = {
+                    let f = (*caller_tcb).sched_lock.lock_raw();
+                    let st = (*caller_tcb).state;
+                    (*caller_tcb).sched_lock.unlock_raw(f);
+                    matches!(st, ThreadState::Stopped | ThreadState::Exited)
+                };
+                if caller_stopped
+                {
+                    // SAFETY: drain_saved_int from save_and_disable_interrupts.
+                    crate::arch::current::cpu::restore_interrupts(drain_saved_int);
+                    crate::percpu::preempt_enable();
+                    crate::sched::schedule(false);
+                    crate::percpu::preempt_disable();
+                    // SAFETY: ring 0; restored after the spin below.
+                    drain_saved_int = crate::arch::current::cpu::save_and_disable_interrupts();
+                    // SAFETY: ring 0; IDT loaded; preempt disabled.
+                    crate::arch::current::interrupts::enable();
+                    continue;
+                }
+                core::hint::spin_loop();
+            }
+            // SAFETY: drain_saved_int from save_and_disable_interrupts above.
+            crate::arch::current::cpu::restore_interrupts(drain_saved_int);
+            crate::percpu::preempt_enable();
+        }
+    }
 }
 
 /// Cancel the IPC block on a thread that is in `Blocked` state.
@@ -446,8 +498,9 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Unlinks the thread from the relevant IPC queue and, on each arm's exclusive
 /// wake-claim win, stamps the park episode [`PARK_DISPOSITION_INTERRUPTED`]
 /// (fault episodes get `FAULT_OUTCOME_KILL`) so the restarted thread's resume
-/// consumes the cancellation instead of a stale wake deposit. A lost claim
-/// means a genuine waker owns the episode; its deposit stands untouched.
+/// consumes the cancellation instead of a stale wake deposit, and clears the
+/// thread's park binding. A lost claim means a genuine waker owns the episode;
+/// its deposit stands untouched, and its `enqueue_and_wake` clears the binding.
 ///
 /// [`PARK_DISPOSITION_INTERRUPTED`]: crate::sched::thread::PARK_DISPOSITION_INTERRUPTED
 ///
@@ -493,14 +546,21 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
     // whose add then refuses). The timer pop clears the deadline under the same
     // lock, so a pop that won leaves the episode to its wake. Its claim deposits
     // nothing, so a cancellation stamp is the only deposit.
+    // Set at each arm's claim win; the binding below is cleared only then.
+    let mut claimed = false;
     // SAFETY: tcb validated by caller; fields read/written under sched_lock;
     // SLEEP_LIST_LOCK is a leaf, nested under sched_lock.
-    let (ipc_state, blocked_on) = unsafe {
+    let (ipc_state, blocked_on, park_seq) = unsafe {
         let saved = (*tcb).sched_lock.lock_raw();
-        let snap = ((*tcb).ipc_state, (*tcb).blocked_on_object);
+        let snap = (
+            (*tcb).ipc_state,
+            (*tcb).blocked_on_object,
+            (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed),
+        );
         let blocked = (*tcb).state == crate::sched::thread::ThreadState::Blocked;
         if blocked && snap.0 == IpcThreadState::None && crate::sched::sleep_list_remove(tcb)
         {
+            claimed = true;
             crate::sched::thread::stamp_park_deposit(
                 tcb,
                 crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
@@ -552,6 +612,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
             {
                 if unlinked
                 {
+                    claimed = true;
                     // SAFETY: tcb valid; the unlink won the episode.
                     unsafe {
                         (*tcb).fault_outcome.store(
@@ -564,6 +625,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
             }
             else if unlinked
             {
+                claimed = true;
                 // Claim = the send-queue unlink under ep.lock (recv dequeues
                 // under the same lock, so winning it makes this the episode's
                 // sole depositor). A stopped sys_ipc_call caller resumes via
@@ -596,6 +658,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // and the resume publishes it (fail-open).
                     if unlink_from_wait_queue(tcb, &mut (*ep).recv_head, &mut (*ep).recv_tail)
                     {
+                        claimed = true;
                         crate::sched::thread::stamp_park_deposit(
                             tcb,
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
@@ -650,6 +713,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                         // the error path instead of reading a stale ipc_msg.
                         if cancelled
                         {
+                            claimed = true;
                             crate::sched::thread::stamp_park_deposit(
                                 tcb,
                                 crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
@@ -698,6 +762,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                             .is_ok();
                         if cancelled
                         {
+                            claimed = true;
                             (*tcb).fault_outcome.store(
                                 crate::ipc::fault::FAULT_OUTCOME_KILL,
                                 core::sync::atomic::Ordering::Release,
@@ -731,6 +796,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // delivers it (fail-open).
                     if (*sig).waiters.remove(tcb)
                     {
+                        claimed = true;
                         // Re-derive the observer flag like every other
                         // waiter-removal site; leaving it set would pin all
                         // future sends onto the slow path.
@@ -769,6 +835,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // (fail-open).
                     if (*eq).waiters.remove(tcb)
                     {
+                        claimed = true;
                         // A timed wait's entry goes with the waiter, under
                         // eq.lock, as at every waiter claim.
                         if (*tcb)
@@ -803,6 +870,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // (fail-open).
                     if (*ws).waiters.remove(tcb)
                     {
+                        claimed = true;
                         crate::sched::thread::stamp_park_deposit(
                             tcb,
                             crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
@@ -817,16 +885,20 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
         {}
     }
 
-    // Clear the binding under sched_lock, but only if the thread is still Blocked
-    // on the same object we cancelled: a waker that won the source-lock race above
-    // may have already woken (and possibly re-bound) it, in which case
-    // enqueue_and_wake already cleared these fields and we must not clobber a
-    // fresh binding.
+    // Clear the binding under sched_lock only if this cancel claimed the park.
+    // On a lost claim the waker owns the episode: its enqueue_and_wake clears
+    // the binding, and it may already have let the thread run and park again
+    // (every park commit advances park_seq, and the caller's commit retries on
+    // a changed one). Clearing here after a lost claim would race the waker's
+    // own reads of the binding, such as the reply's fault-arm test of
+    // ipc_state after it won the reply_tcb CAS.
     // SAFETY: tcb is valid; fields written under sched_lock.
     unsafe {
         let saved = (*tcb).sched_lock.lock_raw();
-        if (*tcb).state == crate::sched::thread::ThreadState::Blocked
+        if claimed
+            && (*tcb).state == crate::sched::thread::ThreadState::Blocked
             && (*tcb).ipc_state == ipc_state
+            && (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
         {
             (*tcb).ipc_state = IpcThreadState::None;
             (*tcb).blocked_on_object = core::ptr::null_mut();

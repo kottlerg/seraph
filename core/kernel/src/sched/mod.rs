@@ -3622,13 +3622,17 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 
 /// Send a wakeup IPI to `target_cpu` without enqueueing anything.
 ///
-/// Used by `sys_thread_stop` and the `sys_thread_start` settle loop on the
-/// CPU running a target they have marked `Stopped`. The IPI's handler does
-/// no work: the trap it forces snapshots the target's user registers and
-/// returns to user mode, and the CPU drops the `Stopped` target at its next
-/// slice-expiry `schedule(true)` (or the target's own park or yield), where
-/// the requeue denylist leaves it unlinked. The callers' drains wait for
-/// that; the prod itself only exits a `hlt` on an idle CPU.
+/// Used wherever a path needs a remote CPU to take a trap: the
+/// `sys_thread_stop` and `sys_thread_start` drains and the object-teardown
+/// stop (`stop_threads_bound_to`) on a CPU running a target they marked
+/// `Stopped` or `Exited`, and `sys_thread_set_affinity` on a CPU running a
+/// target whose affinity it changed. The IPI's handler does no work: the trap
+/// it forces snapshots the target's user registers and returns to user mode,
+/// and the CPU acts on the target at its next slice-expiry `schedule(true)` (or
+/// the target's own park or yield), where the requeue denylist drops a
+/// `Stopped` or `Exited` target and the affinity check relocates a moved one.
+/// The callers' drains wait for that; the prod itself only exits a `hlt` on an
+/// idle CPU.
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`). Self-IPI

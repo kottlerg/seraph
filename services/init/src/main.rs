@@ -36,26 +36,6 @@ pub(crate) mod walk;
 
 pub(crate) use syscall_abi::PAGE_SIZE;
 
-/// Start `thread_cap`, retrying while the start returns `Interrupted`: init
-/// itself was stopped while the start waited for the target to settle, so
-/// nothing was started and a retry is safe.
-///
-/// # Errors
-/// Returns the first error other than `Interrupted`, as `syscall::thread_start`
-/// reports it.
-pub(crate) fn start_thread(thread_cap: u32) -> Result<(), i64>
-{
-    loop
-    {
-        match syscall::thread_start(thread_cap)
-        {
-            Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 =>
-            {}
-            other => return other,
-        }
-    }
-}
-
 /// init main-thread IPC buffer.
 pub(crate) const INIT_IPC_BUF_VA: u64 = 0x0000_0000_C000_0000;
 
@@ -104,6 +84,28 @@ pub(crate) static ENDPOINT_SLAB: core::sync::atomic::AtomicU32 =
 pub(crate) fn endpoint_slab() -> u32
 {
     ENDPOINT_SLAB.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// ── Thread start ─────────────────────────────────────────────────────────────
+
+/// Start `thread_cap`, retrying while the start returns `Interrupted`: init
+/// itself was stopped while the start waited for the target to settle, so
+/// nothing was started and a retry is safe.
+///
+/// # Errors
+/// Returns the first error other than `Interrupted`, as `syscall::thread_start`
+/// reports it.
+pub(crate) fn start_thread(thread_cap: u32) -> Result<(), i64>
+{
+    loop
+    {
+        match syscall::thread_start(thread_cap)
+        {
+            Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 =>
+            {}
+            other => return other,
+        }
+    }
 }
 
 // ── Cap descriptor helpers ───────────────────────────────────────────────────

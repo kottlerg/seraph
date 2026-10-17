@@ -168,20 +168,30 @@ pub fn configure_and_start_pinned(
     Ok(())
 }
 
-/// Poll `thread` (a Thread cap with OBSERVE) at 1 ms intervals until it
-/// reports `Exited`; returns its retained exit reason. Fails after
-/// `max_polls` polls.
+/// Whether `thread` (a Thread cap with OBSERVE) reports `Exited`: the state
+/// in the high word of its `CAP_INFO_THREAD_STATE`.
+pub fn is_exited(thread: u32) -> Result<bool, &'static str>
+{
+    let packed = syscall::cap_info(thread, syscall_abi::CAP_INFO_THREAD_STATE)
+        .map_err(|_| "spawn::is_exited: cap_info(THREAD_STATE) failed")?;
+    // cast_possible_truncation: 8-bit state in the high word, 32-bit reason low.
+    #[allow(clippy::cast_possible_truncation)]
+    let state = (packed >> 32) as u32;
+    Ok(state == syscall_abi::THREAD_STATE_EXITED)
+}
+
+/// Poll `thread` (a Thread cap with OBSERVE) at 1 ms intervals until
+/// [`is_exited`] reports it; returns its retained exit reason, the low word
+/// of its `CAP_INFO_THREAD_STATE`. Fails after `max_polls` polls.
 pub fn wait_until_exited(thread: u32, max_polls: u32) -> Result<u64, &'static str>
 {
     let mut polls = 0;
     loop
     {
-        let packed = syscall::cap_info(thread, syscall_abi::CAP_INFO_THREAD_STATE)
-            .map_err(|_| "spawn::wait_until_exited: cap_info(THREAD_STATE) failed")?;
-        // cast_possible_truncation: 8-bit state in the high word, 32-bit reason low.
-        #[allow(clippy::cast_possible_truncation)]
-        if (packed >> 32) as u32 == syscall_abi::THREAD_STATE_EXITED
+        if is_exited(thread)?
         {
+            let packed = syscall::cap_info(thread, syscall_abi::CAP_INFO_THREAD_STATE)
+                .map_err(|_| "spawn::wait_until_exited: cap_info(THREAD_STATE) failed")?;
             return Ok(packed & 0xFFFF_FFFF);
         }
         polls += 1;

@@ -229,9 +229,10 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             crate::sched::StartCommit::Refused => return Err(SyscallError::InvalidArgument),
             crate::sched::StartCommit::CallerStopped =>
             {
-                // Deschedule now, as a self-stop does: the stopper's prod was
-                // absorbed while the start waited, and the syscall epilogue
-                // reschedules only an Exited thread. The restart resumes here.
+                // Deschedule now, as a self-stop does: the settle loop's
+                // preempt-disabled window made the timer skip its slice-expiry
+                // switch, and the syscall epilogue reschedules only an Exited
+                // thread. The restart resumes here.
                 crate::sched::schedule(false);
                 return Err(SyscallError::Interrupted);
             }
@@ -362,8 +363,10 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
         else if let Some(run_cpu) = running_on
         {
-            // Cross-CPU drain: IPI forces the remote into schedule() so
-            // sys_thread_read_regs sees a fresh trap_frame.
+            // Cross-CPU drain: the IPI's trap snapshots the target's user
+            // registers; the remote CPU drops the Stopped target at its next
+            // slice-expiry schedule(true), whose trap leaves the snapshot
+            // sys_thread_read_regs reads once this drain completes.
             let current_cpu = crate::arch::current::cpu::current_cpu() as usize;
             if run_cpu != current_cpu
             {

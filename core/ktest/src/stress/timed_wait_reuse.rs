@@ -86,6 +86,14 @@ const TIMED_DELIVERY: u32 = 0;
 const TIMED_TIMEOUT: u32 = 1;
 const TIMED_BAD: u32 = 2;
 
+/// How the waiter's untimed wait ended, read from `UNTIMED_OK`: in a
+/// delivery, or in a timeout or an error.
+enum UntimedOutcome
+{
+    Delivered,
+    Failed,
+}
+
 /// Source index of a cycle: the notification on even cycles, the event
 /// queue on odd ones.
 const NOTIFICATION: usize = 0;
@@ -243,10 +251,17 @@ fn cycles(sig: u32, eq: u32) -> Result<Tally, &'static str>
         }
         deliver(1).map_err(|_| "stress::timed_wait_reuse: delivery failed")?;
         await_results(cycle, deliver)?;
-        let untimed_ok = UNTIMED_OK.load(Ordering::Acquire) != 0;
+        let untimed = if UNTIMED_OK.load(Ordering::Acquire) != 0
+        {
+            UntimedOutcome::Delivered
+        }
+        else
+        {
+            UntimedOutcome::Failed
+        };
         let timed = TIMED_RESULT.load(Ordering::Acquire);
         ACKED.store(cycle, Ordering::Release);
-        let timed = check(source, timed, untimed_ok)?;
+        let timed = check(source, timed, untimed)?;
         if late
         {
             if timed == TIMED_DELIVERY
@@ -302,7 +317,7 @@ fn await_results(cycle: u32, deliver: impl Fn(u64) -> Result<(), i64>) -> TestRe
 
 /// Check one cycle's results; returns the timed outcome, `TIMED_DELIVERY` or
 /// `TIMED_TIMEOUT`.
-fn check(source: usize, timed: u32, untimed_ok: bool) -> Result<u32, &'static str>
+fn check(source: usize, timed: u32, untimed: UntimedOutcome) -> Result<u32, &'static str>
 {
     let notification = source == NOTIFICATION;
     match timed
@@ -318,13 +333,13 @@ fn check(source: usize, timed: u32, untimed_ok: bool) -> Result<u32, &'static st
             return Err("stress::timed_wait_reuse: a timed event queue wait returned an error");
         }
     }
-    match (untimed_ok, notification)
+    match (untimed, notification)
     {
-        (true, _) => Ok(timed),
-        (false, true) => Err(
+        (UntimedOutcome::Delivered, _) => Ok(timed),
+        (UntimedOutcome::Failed, true) => Err(
             "stress::timed_wait_reuse: an untimed notification wait returned a timeout or error",
         ),
-        (false, false) =>
+        (UntimedOutcome::Failed, false) =>
         {
             Err("stress::timed_wait_reuse: an untimed event queue wait returned a timeout or error")
         }

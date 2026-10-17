@@ -387,9 +387,10 @@ still delivered — with zero caps; the sender keeps its capabilities (see
 
 ### `SYS_NOTIFICATION_SEND` (3)
 
-OR bits into a notification object. Non-blocking; if threads are waiting, wakes the
-longest-waiting one with every pending bit (see `SYS_NOTIFICATION_WAIT` and
-[ipc-design.md](../../../docs/ipc-design.md) § Notifications).
+OR bits into a notification object. Non-blocking; if threads are waiting and pending bits
+remain when the send claims them, wakes the longest-waiting one with every pending bit. A send
+whose bits an arriving wait or a concurrent send already took wakes no waiter (see
+`SYS_NOTIFICATION_WAIT` and [ipc-design.md](../../../docs/ipc-design.md) § Notifications).
 
 **Arguments:**
 

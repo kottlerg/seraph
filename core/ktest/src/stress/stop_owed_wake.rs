@@ -37,27 +37,27 @@
 //! with the sender at 2 CPUs. The controller, pinned to CPU 1, stops and
 //! restarts the waiter [`CYCLES`] times, waiting after each restart until the
 //! waiter has run and entered a wait (bounded; a starved round is logged), then
-//! spinning a varying time, in two phases: alone, then while a starter on CPU 3 (a CPU no other participant
-//! uses) loops `thread_start` on the waiter. In the second phase the
-//! controller also stops the starter every [`STARTER_STOP_PERIOD`] rounds,
-//! right after stopping the waiter, and restarts it once its own restart of
-//! the waiter returns, so a stop can land on the starter while its start
-//! waits for the waiter to settle. A wait must return delivered bits or
-//! `Interrupted`; a send must succeed; a controller start must succeed or
-//! return `InvalidArgument` (another start won, or the waiter was not
-//! stopped), and in the first phase, with no starter racing, every controller
-//! start must succeed; a starter start may also return `Interrupted` (its
-//! caller was stopped), which is tallied and logged but not required, since
-//! the window is narrow. Only the controller stops the waiter, so each stop
-//! is ended by exactly one committed start: in the second phase the starter's
-//! successful starts must equal the controller's `InvalidArgument` starts,
-//! which a start committing twice for one stop, or an interrupted start
-//! committing, would break. The kernel's debug assertions are the tripwires
-//! for the hazards themselves: a TCB pushed onto a wait queue it is already
-//! on, a restart with a wake still owed, and a park committed while linked on
-//! a run queue. The test also fails if the race never armed: if, in the first
-//! phase, no stop cancelled a wait or no wait received a delivery, or, in the
-//! second, the starter never won a restart.
+//! spinning a varying time, in two phases: alone, then while a starter on
+//! CPU 3 (a CPU no other participant uses) loops `thread_start` on the waiter.
+//! In the second phase the controller also stops the starter every
+//! [`STARTER_STOP_PERIOD`] rounds, right after stopping the waiter, and
+//! restarts it once its own restart of the waiter returns, so a stop can land
+//! on the starter while its start waits for the waiter to settle. A wait must
+//! return delivered bits or `Interrupted`; a send must succeed; a controller
+//! start must succeed or return `InvalidArgument` (another start won, or the
+//! waiter was not stopped), and in the first phase, with no starter racing,
+//! every controller start must succeed; a starter start may also return
+//! `Interrupted` (its caller was stopped), which is tallied and logged but not
+//! required, since the window is narrow. Only the controller stops the waiter,
+//! so each stop is ended by exactly one committed start: in the second phase
+//! the starter's successful starts must equal the controller's
+//! `InvalidArgument` starts, which a start committing twice for one stop, or
+//! an interrupted start committing, would break. The kernel's debug assertions
+//! are the tripwires for the hazards themselves: a TCB pushed onto a wait
+//! queue it is already on, a restart with a wake still owed, and a park
+//! committed while linked on a run queue. The test also fails if the race
+//! never armed: if, in the first phase, no stop cancelled a wait or no wait
+//! received a delivery, or, in the second, the starter never won a restart.
 //!
 //! Needs **≥ 2 CPUs**; the second phase needs **≥ 4** and is skipped below.
 
@@ -94,6 +94,10 @@ const STARTER_STOP_PERIOD: u32 = 16;
 /// then distinct from each other and from the waiter's and sender's.
 const RACE_MIN_CPUS: u64 = 4;
 
+/// Bound on the controller's wait, after each restart, for the waiter to run
+/// and enter its next wait before the round's varying spin.
+const ENTRY_WAIT_US: u64 = 100_000;
+
 /// Set by the controller once the rounds are done; every child exits.
 static QUIT: AtomicU32 = AtomicU32::new(0);
 /// Set by the controller for the second phase; the starter races it then.
@@ -110,17 +114,14 @@ static STARTER_WINS: AtomicU32 = AtomicU32::new(0);
 static STARTER_INTERRUPTED: AtomicU32 = AtomicU32::new(0);
 /// Children that have exited.
 static EXITED: AtomicU32 = AtomicU32::new(0);
-/// The waiter's tallies: waits it entered, and waits that returned bits or
-/// `Interrupted`.
+/// Waits the waiter entered.
 static WAITS_ENTERED: AtomicU32 = AtomicU32::new(0);
 /// Rounds in which the waiter did not enter a new wait within
 /// [`ENTRY_WAIT_US`] of its restart (its CPU was not dispatching it).
 static STARVED_ROUNDS: AtomicU32 = AtomicU32::new(0);
-
-/// Bound on the controller's wait, after each restart, for the waiter to run
-/// and enter its next wait before the round's varying spin.
-const ENTRY_WAIT_US: u64 = 100_000;
+/// The waiter's waits that returned delivered bits.
 static DELIVERED: AtomicU32 = AtomicU32::new(0);
+/// The waiter's waits that returned `Interrupted` (cancelled by a stop).
 static INTERRUPTED: AtomicU32 = AtomicU32::new(0);
 /// Waits that returned neither, failed sends, and starts that returned an
 /// error other than `InvalidArgument` (or, for the starter's, `Interrupted`),
@@ -142,11 +143,10 @@ enum Phases
     AloneThenRacing,
 }
 
-/// What the rounds saw: the waits of the first phase, and the restarts won
-/// and lost in the second (`None` when the second phase was skipped).
+/// What the rounds saw: the first phase's wait outcomes, and the restarts
+/// won and lost in the second (`None` when the second phase was skipped).
 struct Armed
 {
-    waits_entered: u32,
     delivered: u32,
     interrupted: u32,
     race: Option<Race>,
@@ -216,18 +216,18 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     crate::log_u64(
         "ktest: stress::stop_owed_wake waits_entered=",
-        u64::from(armed.waits_entered),
+        u64::from(WAITS_ENTERED.load(Ordering::Acquire)),
     );
     crate::log_u64(
         "ktest: stress::stop_owed_wake starved_rounds=",
         u64::from(STARVED_ROUNDS.load(Ordering::Acquire)),
     );
     crate::log_u64(
-        "ktest: stress::stop_owed_wake delivered=",
+        "ktest: stress::stop_owed_wake first-phase delivered=",
         u64::from(armed.delivered),
     );
     crate::log_u64(
-        "ktest: stress::stop_owed_wake interrupted=",
+        "ktest: stress::stop_owed_wake first-phase interrupted=",
         u64::from(armed.interrupted),
     );
     check_bad(
@@ -410,7 +410,6 @@ fn run_phases(waiter_th: u32, starter_th: u32, phases: Phases) -> Result<Armed, 
             "stress::stop_owed_wake: a restart returned InvalidArgument with no start racing it",
         );
     }
-    let waits_entered = WAITS_ENTERED.load(Ordering::Acquire);
     let delivered = DELIVERED.load(Ordering::Acquire);
     let interrupted = INTERRUPTED.load(Ordering::Acquire);
     let race = match phases
@@ -435,7 +434,6 @@ fn run_phases(waiter_th: u32, starter_th: u32, phases: Phases) -> Result<Armed, 
         }
     };
     Ok(Armed {
-        waits_entered,
         delivered,
         interrupted,
         race,

@@ -29,13 +29,12 @@
 
 use ipc::IpcMessage;
 use syscall::{
-    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, cap_info, ipc_buffer_set,
+    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
     notification_send, notification_wait, notification_wait_timeout, thread_exit,
     thread_set_fault_handler, thread_sleep, thread_start, thread_stop,
 };
 use syscall_abi::{
-    CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, FAULT_CLASS_ALL, FAULT_LABEL, RIGHTS_EP_SEND_GRANT,
-    SyscallError, THREAD_STATE_EXITED,
+    EXIT_FAULT_BASE, FAULT_CLASS_ALL, FAULT_LABEL, RIGHTS_EP_SEND_GRANT, SyscallError,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -284,7 +283,8 @@ fn displace_fault(ctx: &TestContext, parts: &mut Parts, objects: &Objects, acc: 
     }
     // The faulter must still be fault-blocked here, so that its `Exited`
     // after the next receive is that receive's release, not an earlier kill.
-    if thread_exited(fault_th)?
+    if spawn::is_exited(fault_th)
+        .map_err(|_| "integration::reply_binding_displaced: cap_info(thread state) failed")?
     {
         return Err(
             "integration::reply_binding_displaced: the faulter exited before the later receive",
@@ -302,17 +302,6 @@ fn displace_fault(ctx: &TestContext, parts: &mut Parts, objects: &Objects, acc: 
         );
     }
     reply_and_check(ctx, objects.done, acc, &CALLER_C).map(|_| ())
-}
-
-/// Whether `thread` reports `Exited`.
-fn thread_exited(thread: u32) -> Result<bool, &'static str>
-{
-    let packed = cap_info(thread, CAP_INFO_THREAD_STATE)
-        .map_err(|_| "integration::reply_binding_displaced: cap_info(thread state) failed")?;
-    // cast_possible_truncation: 8-bit state in the high word.
-    #[allow(clippy::cast_possible_truncation)]
-    let state = (packed >> 32) as u32;
-    Ok(state == THREAD_STATE_EXITED)
 }
 
 /// Start `caller`, wait until it is about to call, and receive its call as

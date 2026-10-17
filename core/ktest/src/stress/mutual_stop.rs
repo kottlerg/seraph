@@ -51,17 +51,24 @@
 //!
 //! Required: both children exited voluntarily; both counted loops during the
 //! rounds; no stop or start by a child returned an error other than those
-//! above (the last offending result is logged); and, per direction, the
-//! stops that returned `Ok` equal the starts that returned `Ok` from the
-//! peer and from the controller together, since each child is the only
-//! stopper of the other and the kernel commits exactly one start per stop.
-//! On the unfixed kernel the first mutual stop wedges CPUs 1 and 2, the
-//! controller's next restart waits forever for a child to leave its CPU, and
-//! the boot ends in the harness watchdog.
+//! above (the last offending result is logged); per direction, the stops
+//! that returned `Ok` equal the starts that returned `Ok` from the peer and
+//! from the controller together, since each child is the only stopper of the
+//! other and the kernel commits exactly one start per stop; and some round's
+//! two restarts both returned `Ok`, the witness that a mutual stop occurred:
+//! a stopped child stops no one and only the controller restarts one, so
+//! when the first restart finds one child stopped and the second, issued
+//! before the child it released can have run its spin and stopped its peer
+//! again, finds the other stopped too, both were stopped at once, which only
+//! concurrent stops of each other leave behind (a mutual stop's pair goes
+//! uncounted when the released child restarts its peer before the controller
+//! does, so the count is a floor). On the unfixed kernel the first mutual
+//! stop wedges CPUs 1 and 2, the controller's next restart waits forever for
+//! a child to leave its CPU, and the boot ends in the harness watchdog.
 //!
 //! Needs **≥ 3 CPUs**.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
     cap_create_thread, cap_delete, system_info, thread_configure, thread_exit, thread_set_affinity,
@@ -69,7 +76,11 @@ use syscall::{
 };
 use syscall_abi::{EXIT_VOLUNTARY, SyscallError, SystemInfoType};
 
+use crate::tally::{BadTally, log_error};
 use crate::{ChildStack, TestContext, TestResult, spawn};
+
+/// This cell's log name.
+const CELL: &str = "stress::mutual_stop";
 
 /// Controller rounds.
 const CYCLES: u32 = 200;
@@ -112,11 +123,9 @@ static STOPS_OK: [AtomicU32; CHILDREN] = [AtomicU32::new(0), AtomicU32::new(0)];
 static STARTS_OK: [AtomicU32; CHILDREN] = [AtomicU32::new(0), AtomicU32::new(0)];
 static STARTS_INTERRUPTED: [AtomicU32; CHILDREN] = [AtomicU32::new(0), AtomicU32::new(0)];
 /// Stops and starts by a child that returned an error other than the
-/// accepted ones, each with the last such error for the failure report.
-static BAD_STOPS: AtomicU32 = AtomicU32::new(0);
-static BAD_STOP_RESULT: AtomicU64 = AtomicU64::new(0);
-static BAD_STARTS: AtomicU32 = AtomicU32::new(0);
-static BAD_START_RESULT: AtomicU64 = AtomicU64::new(0);
+/// accepted ones (with the last such error).
+static BAD_STOPS: BadTally = BadTally::new();
+static BAD_STARTS: BadTally = BadTally::new();
 
 /// A child's arguments, handed to its entry by address.
 #[derive(Clone, Copy)]
@@ -167,9 +176,9 @@ struct Tally
     controller_starts_ok: [u32; CHILDREN],
     /// Per child: loops it had counted when the rounds ended.
     progress_in_rounds: [u32; CHILDREN],
-    /// Rounds whose two restarts both returned `Ok` (a pair a mutual stop
-    /// left stopped; logged only, since one child may restart the other
-    /// first).
+    /// Rounds whose two restarts both returned `Ok`: pairs a mutual stop
+    /// left stopped (the module doc says why), a floor since the released
+    /// child may restart its peer first. Required non-zero.
     both_restarted: u32,
     /// Rounds in which a child counted no loop within [`ROUND_WAIT_US`].
     starved: u32,
@@ -184,7 +193,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         crate::log("ktest: stress::mutual_stop SKIP (need 3+ CPUs)");
         return Ok(());
     }
-    for counter in [&GO, &QUIT, &QUIESCED, &EXITED, &BAD_STOPS, &BAD_STARTS]
+    for counter in [&GO, &QUIT, &QUIESCED, &EXITED]
         .into_iter()
         .chain(PROGRESS.iter())
         .chain(STOPS_OK.iter())
@@ -192,6 +201,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         .chain(STARTS_INTERRUPTED.iter())
     {
         counter.store(0, Ordering::Release);
+    }
+    for tally in [&BAD_STOPS, &BAD_STARTS]
+    {
+        tally.reset();
     }
 
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
@@ -204,9 +217,50 @@ pub fn run(ctx: &TestContext) -> TestResult
     report(&tally)
 }
 
-/// Log the tallies and check them: nothing failed, both children looped,
-/// and each stop was ended by exactly one start.
+/// Log the tallies, then check them: nothing failed, both children looped,
+/// each stop was ended by exactly one start, and some round found both
+/// children stopped.
 fn report(tally: &Tally) -> TestResult
+{
+    log_tallies(tally);
+    BAD_STOPS.check(
+        CELL,
+        "stress::mutual_stop: a stop by a child failed other than with InvalidState",
+    )?;
+    BAD_STARTS.check(
+        CELL,
+        "stress::mutual_stop: a start by a child failed other than with InvalidArgument or \
+         Interrupted",
+    )?;
+    for (index, progress) in tally.progress_in_rounds.iter().enumerate()
+    {
+        if *progress == 0
+        {
+            return Err("stress::mutual_stop: a child counted no loop during the rounds");
+        }
+        let peer = 1 - index;
+        let stops = STOPS_OK[index].load(Ordering::Acquire);
+        let starts = STARTS_OK[index].load(Ordering::Acquire) + tally.controller_starts_ok[peer];
+        if stops != starts
+        {
+            return Err(
+                "stress::mutual_stop: a child's Ok stops differ from the Ok starts of its peer \
+                 (a stop ended by more or fewer than one start)",
+            );
+        }
+    }
+    if tally.both_restarted == 0
+    {
+        return Err(
+            "stress::mutual_stop: no round found both children stopped (no mutual stop \
+             occurred; never armed)",
+        );
+    }
+    Ok(())
+}
+
+/// Log each child's tallies, then the controller's.
+fn log_tallies(tally: &Tally)
 {
     for (index, labels) in CHILD_LABELS.iter().enumerate()
     {
@@ -235,52 +289,6 @@ fn report(tally: &Tally) -> TestResult
         "ktest: stress::mutual_stop starved=",
         u64::from(tally.starved),
     );
-    check_bad(
-        &BAD_STOPS,
-        &BAD_STOP_RESULT,
-        "stress::mutual_stop: a stop by a child failed other than with InvalidState",
-    )?;
-    check_bad(
-        &BAD_STARTS,
-        &BAD_START_RESULT,
-        "stress::mutual_stop: a start by a child failed other than with InvalidArgument or \
-         Interrupted",
-    )?;
-    for (index, progress) in tally.progress_in_rounds.iter().enumerate()
-    {
-        if *progress == 0
-        {
-            return Err("stress::mutual_stop: a child counted no loop during the rounds");
-        }
-        let peer = 1 - index;
-        let stops = STOPS_OK[index].load(Ordering::Acquire);
-        let starts = STARTS_OK[index].load(Ordering::Acquire) + tally.controller_starts_ok[peer];
-        if stops != starts
-        {
-            return Err(
-                "stress::mutual_stop: a child's Ok stops differ from the Ok starts of its peer \
-                 (a stop ended by more or fewer than one start)",
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Fail with `message` if `count` is non-zero, logging the count and the
-/// last offending result.
-fn check_bad(count: &AtomicU32, last: &AtomicU64, message: &'static str) -> TestResult
-{
-    let n = count.load(Ordering::Acquire);
-    if n == 0
-    {
-        return Ok(());
-    }
-    crate::log_u64("ktest: stress::mutual_stop bad count=", u64::from(n));
-    crate::log_u64(
-        "ktest: stress::mutual_stop last bad result=",
-        last.load(Ordering::Acquire),
-    );
-    Err(message)
 }
 
 /// Create and start the children, run the rounds, end the children, and
@@ -467,23 +475,6 @@ fn finish(th: [u32; CHILDREN], tally: &mut Tally) -> TestResult
     Ok(())
 }
 
-/// Log a syscall error word after `label`.
-fn log_error(label: &str, error: i64)
-{
-    // cast_sign_loss: the raw error word is only logged.
-    #[allow(clippy::cast_sign_loss)]
-    crate::log_u64(label, error as u64);
-}
-
-/// Record a failed result in `count` and `last`.
-fn record_bad(count: &AtomicU32, last: &AtomicU64, result: i64)
-{
-    // cast_sign_loss: the raw result word is only logged.
-    #[allow(clippy::cast_sign_loss)]
-    last.store(result as u64, Ordering::Release);
-    count.fetch_add(1, Ordering::AcqRel);
-}
-
 /// Child: once released, loop until told to quit: stop the peer, spin a
 /// varying delay, start the peer, count the loop.
 fn child_entry(arg: u64) -> !
@@ -528,7 +519,7 @@ fn stop_peer(peer: u32, index: usize)
         }
         Err(e) if e == SyscallError::InvalidState as i64 =>
         {}
-        Err(e) => record_bad(&BAD_STOPS, &BAD_STOP_RESULT, e),
+        Err(e) => BAD_STOPS.record_error(e),
     }
 }
 
@@ -549,6 +540,6 @@ fn start_peer(peer: u32, index: usize)
         {
             STARTS_INTERRUPTED[index].fetch_add(1, Ordering::AcqRel);
         }
-        Err(e) => record_bad(&BAD_STARTS, &BAD_START_RESULT, e),
+        Err(e) => BAD_STARTS.record_error(e),
     }
 }

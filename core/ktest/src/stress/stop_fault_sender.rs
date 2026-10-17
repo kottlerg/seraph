@@ -53,9 +53,10 @@
 //!
 //! Needs **≥ 3 CPUs**.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use ipc::IpcMessage;
+use ipc::recv_guard::RecvGuard;
 use syscall::{
     cap_create_endpoint, cap_create_thread, cap_delete, ipc_buffer_set, mem_map, mem_unmap,
     system_info, thread_configure, thread_exit, thread_set_affinity, thread_set_fault_handler,
@@ -66,7 +67,11 @@ use syscall_abi::{
     FAULT_REPLY_RESUME, MAP_WRITABLE, SyscallError, SystemInfoType,
 };
 
+use crate::tally::{BadTally, log_error};
 use crate::{ChildStack, TestContext, TestResult, spawn};
+
+/// This cell's log name.
+const CELL: &str = "stress::stop_fault_sender";
 
 /// Stop/start rounds.
 const CYCLES: u32 = 1000;
@@ -110,7 +115,8 @@ const FAULTER_STACK: usize = 0;
 const HANDLER_STACK: usize = 1;
 
 /// Set by the controller once the rounds are done: the faulter exits at its
-/// next loop top, the handler after its next sync reply.
+/// next loop top (the handler exits on the controller's [`QUIT_LABEL`] call
+/// instead, so it answers every call queued before it).
 static QUIT: AtomicU32 = AtomicU32::new(0);
 /// Set by the handler once its IPC buffer is registered.
 static HANDLER_READY: AtomicU32 = AtomicU32::new(0);
@@ -118,8 +124,8 @@ static HANDLER_READY: AtomicU32 = AtomicU32::new(0);
 /// and the page unmapped again).
 static ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 static PROGRESS: AtomicU32 = AtomicU32::new(0);
-/// The faulter's unmaps that failed.
-static UNMAP_FAILED: AtomicU32 = AtomicU32::new(0);
+/// The faulter's unmaps that failed (with the last error).
+static UNMAP_FAILED: BadTally = BadTally::new();
 /// Receives the handler entered.
 static RECV_ENTERED: AtomicU32 = AtomicU32::new(0);
 /// Fault replies that returned `Ok` after a successful map: faults the
@@ -128,12 +134,10 @@ static RESUMED: AtomicU32 = AtomicU32::new(0);
 /// Fault replies that failed: a stop cancelled the fault under the handler.
 static REPLY_FAILED: AtomicU32 = AtomicU32::new(0);
 /// The handler's maps that failed; and its receives that failed or returned
-/// a message that is neither a fault nor a sync, and its sync (or echo)
-/// replies that failed.
-static MAP_FAILED: AtomicU32 = AtomicU32::new(0);
-static BAD_RECVS: AtomicU32 = AtomicU32::new(0);
-/// The last result any failure counter above, or [`UNMAP_FAILED`], recorded.
-static BAD_RESULT: AtomicU64 = AtomicU64::new(0);
+/// a message that is neither a fault, a sync, nor the quit call, and its
+/// sync, quit, or echo replies that failed (each with the last such result).
+static MAP_FAILED: BadTally = BadTally::new();
+static BAD_RECVS: BadTally = BadTally::new();
 
 /// The handler's IPC buffer (one live user).
 #[repr(C, align(4096))]
@@ -208,15 +212,16 @@ pub fn run(ctx: &TestContext) -> TestResult
         &HANDLER_READY,
         &ATTEMPTS,
         &PROGRESS,
-        &UNMAP_FAILED,
         &RECV_ENTERED,
         &RESUMED,
         &REPLY_FAILED,
-        &MAP_FAILED,
-        &BAD_RECVS,
     ]
     {
         counter.store(0, Ordering::Release);
+    }
+    for tally in [&UNMAP_FAILED, &MAP_FAILED, &BAD_RECVS]
+    {
+        tally.reset();
     }
 
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
@@ -260,16 +265,16 @@ fn report(tally: &Tally) -> TestResult
     {
         crate::log_u64(label, u64::from(value));
     }
-    check_bad(
-        &MAP_FAILED,
+    MAP_FAILED.check(
+        CELL,
         "stress::stop_fault_sender: a map by the handler failed",
     )?;
-    check_bad(
-        &UNMAP_FAILED,
+    UNMAP_FAILED.check(
+        CELL,
         "stress::stop_fault_sender: an unmap by the faulter failed",
     )?;
-    check_bad(
-        &BAD_RECVS,
+    BAD_RECVS.check(
+        CELL,
         "stress::stop_fault_sender: a receive by the handler failed or returned an unexpected \
          message, or a sync reply failed",
     )?;
@@ -296,23 +301,6 @@ fn report(tally: &Tally) -> TestResult
         );
     }
     Ok(())
-}
-
-/// Fail with `message` if `count` is non-zero, logging the count and the
-/// last offending result.
-fn check_bad(count: &AtomicU32, message: &'static str) -> TestResult
-{
-    let n = count.load(Ordering::Acquire);
-    if n == 0
-    {
-        return Ok(());
-    }
-    crate::log_u64("ktest: stress::stop_fault_sender bad count=", u64::from(n));
-    crate::log_u64(
-        "ktest: stress::stop_fault_sender last bad result=",
-        BAD_RESULT.load(Ordering::Acquire),
-    );
-    Err(message)
 }
 
 /// Create the endpoint, the page, and the children, run the rounds, end the
@@ -741,23 +729,6 @@ fn release(ctx: &TestContext, parts: &Parts) -> TestResult
     }
 }
 
-/// Log a syscall error word after `label`.
-fn log_error(label: &str, error: i64)
-{
-    // cast_sign_loss: the raw error word is only logged.
-    #[allow(clippy::cast_sign_loss)]
-    crate::log_u64(label, error as u64);
-}
-
-/// Record a failed result in `count` and [`BAD_RESULT`].
-fn record_bad(count: &AtomicU32, result: i64)
-{
-    // cast_sign_loss: the raw result word is only logged.
-    #[allow(clippy::cast_sign_loss)]
-    BAD_RESULT.store(result as u64, Ordering::Release);
-    count.fetch_add(1, Ordering::AcqRel);
-}
-
 /// Faulter: until told to quit, count an attempt, store to the reserved
 /// page, unmap the page the handler mapped for it, and count the completion.
 // cast_possible_truncation: the argument is a 32-bit cap handle.
@@ -777,7 +748,7 @@ fn faulter_entry(arg: u64) -> !
         }
         if let Err(e) = mem_unmap(aspace, RESERVED_VA, 1)
         {
-            record_bad(&UNMAP_FAILED, e);
+            UNMAP_FAILED.record_error(e);
         }
         PROGRESS.fetch_add(1, Ordering::AcqRel);
     }
@@ -787,7 +758,8 @@ fn faulter_entry(arg: u64) -> !
 /// Handler: register the IPC buffer, then loop: spin a varying delay,
 /// receive, and answer. A fault is answered by [`service_fault`]; a sync is
 /// echoed; the quit call is echoed and ends the loop. Anything else is
-/// tallied and echoed.
+/// tallied and echoed. A `RecvGuard` bounds the retries of a failed receive
+/// (docs/ipc-design.md § Receive-Failure Policy).
 fn handler_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `setup` published for the handler.
@@ -800,6 +772,7 @@ fn handler_entry(arg: u64) -> !
         thread_exit()
     }
     HANDLER_READY.store(1, Ordering::Release);
+    let mut guard = RecvGuard::new(crate::tally::recv_diag);
     let mut receives = 0u32;
     loop
     {
@@ -813,15 +786,25 @@ fn handler_entry(arg: u64) -> !
         RECV_ENTERED.fetch_add(1, Ordering::AcqRel);
         // SAFETY: `buf` was registered as this thread's IPC buffer above.
         let recv_result =
-            unsafe { ipc::ipc_recv(args.ep, buf) }.inspect_err(|&e| record_bad(&BAD_RECVS, e));
+            unsafe { ipc::ipc_recv(args.ep, buf) }.inspect_err(|&e| BAD_RECVS.record_error(e));
         let msg = match recv_result
         {
-            Ok(msg) => msg,
-            // The endpoint goes only after this thread is deleted; any other
-            // failure is transient, and exiting on it would leave a controller
-            // call queued meanwhile waiting for good.
+            Ok(msg) =>
+            {
+                guard.on_success();
+                msg
+            }
+            // The endpoint goes only after this thread is deleted, so its
+            // loss ends the loop. Exiting on any other failure would leave a
+            // controller call queued meanwhile waiting for good, so the guard
+            // retries it instead: with backoff, and ending the harness with
+            // `EXIT_RECV_WEDGE` once a streak proves the failure persistent.
             Err(e) if e == SyscallError::InvalidCapability as i64 => break,
-            Err(_) => continue,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
         if msg.label == FAULT_LABEL && msg.badge == FAULT_BADGE
         {
@@ -830,9 +813,7 @@ fn handler_entry(arg: u64) -> !
         }
         if msg.label != SYNC_LABEL && msg.label != QUIT_LABEL
         {
-            // cast_possible_wrap: the label is recorded as a raw word.
-            #[allow(clippy::cast_possible_wrap)]
-            record_bad(&BAD_RECVS, msg.label as i64);
+            BAD_RECVS.record(msg.label);
         }
         // SAFETY: as above.
         let echoed = unsafe { ipc::ipc_reply(&IpcMessage::new(msg.label), buf) };
@@ -841,7 +822,7 @@ fn handler_entry(arg: u64) -> !
         // cancellation causes by design); tally it so the report names it.
         if let Err(e) = echoed
         {
-            record_bad(&BAD_RECVS, e);
+            BAD_RECVS.record_error(e);
         }
         if msg.label == QUIT_LABEL
         {
@@ -862,7 +843,7 @@ fn service_fault(args: &HandlerArgs, buf: *mut u64)
         Ok(()) => FAULT_REPLY_RESUME,
         Err(e) =>
         {
-            record_bad(&MAP_FAILED, e);
+            MAP_FAILED.record_error(e);
             FAULT_REPLY_KILL
         }
     };

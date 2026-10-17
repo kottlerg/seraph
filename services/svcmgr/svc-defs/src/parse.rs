@@ -181,6 +181,16 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 }
                 seen_argv = true;
                 argv = value.split_whitespace().map(str::to_owned).collect();
+                // The blob is NUL-delimited, so an embedded NUL would split
+                // one token into two on the child's side while the label
+                // still carries the parser's count.
+                if argv.iter().any(|tok| tok.contains('\0'))
+                {
+                    return Err(ParseError::InvalidValue(
+                        lineno,
+                        "argv tokens must not contain NUL",
+                    ));
+                }
                 argv_words = check_blob(
                     lineno,
                     &argv,
@@ -202,6 +212,13 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                         return Err(ParseError::InvalidValue(
                             lineno,
                             "env tokens must be KEY=VAL",
+                        ));
+                    }
+                    if tok.contains('\0')
+                    {
+                        return Err(ParseError::InvalidValue(
+                            lineno,
+                            "env tokens must not contain NUL",
                         ));
                     }
                     env.push(tok.to_owned());
@@ -642,6 +659,21 @@ sched_max = 12\n";
         assert!(matches!(
             parse_with("priorty = 5\n"),
             Err(ParseError::UnknownKey(_, _))
+        ));
+    }
+
+    #[test]
+    fn startup_tokens_containing_nul_are_rejected()
+    {
+        // A NUL inside a token would add a string boundary to the packed
+        // blob without adding to the label's count; both keys refuse it.
+        assert!(matches!(
+            parse_with("argv = a\0b\n"),
+            Err(ParseError::InvalidValue(5, why)) if why.starts_with("argv tokens")
+        ));
+        assert!(matches!(
+            parse_with("env = K=v\0w\n"),
+            Err(ParseError::InvalidValue(5, why)) if why.starts_with("env tokens must not")
         ));
     }
 

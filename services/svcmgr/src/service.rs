@@ -60,9 +60,10 @@ pub struct ServiceEntry
     /// `CREATE_FROM_FILE`. The sole restart source: every restartable
     /// service is reloaded from the filesystem.
     pub vfs_path: [u8; ipc::MAX_PATH_LEN],
-    /// Length of `vfs_path` in bytes (0 = module-loaded).
+    /// Length of `vfs_path` in bytes. Zero only for an empty slot: every
+    /// reconciled entry carries its recipe's `binary` path.
     pub vfs_path_len: u8,
-    /// Extra named restart-bundle caps beyond `thread/module`. Each
+    /// Extra named restart-bundle caps beyond the thread cap. Each
     /// entry is re-derived and re-delivered over the bootstrap protocol
     /// after a restart so the child comes back with its full cap set.
     pub bundle: [registry::Entry; MAX_BUNDLE_CAPS],
@@ -83,12 +84,14 @@ pub struct ServiceEntry
     /// bootstrap (`cap_derive_badge(svcmgr_bootstrap_ep, SEND, badge)`).
     pub bootstrap_badge: u64,
     /// Badged SEND cap on procmgr's service endpoint identifying the
-    /// current process instance. Populated by the restart path after the
-    /// first successful `CREATE_FROM_FILE` reply; used to call
-    /// `DESTROY_PROCESS` before spawning the next restart so procmgr can
-    /// reclaim kernel objects and return its memory caps to memmgr's pool.
-    /// Zero for the initial instance (which svcmgr never created — init
-    /// did), so the first death cannot destroy; subsequent deaths can.
+    /// current process instance. Set at first launch for svcmgr-launched
+    /// services (reconciliation records the launch's handle) and refreshed
+    /// after each successful `CREATE_FROM_FILE` reply on restart; used to
+    /// call `DESTROY_PROCESS` before spawning the next restart so procmgr
+    /// can reclaim kernel objects and return its memory caps to memmgr's
+    /// pool. Zero only for init-endowed services (which svcmgr never
+    /// created — init did), so their first death cannot destroy; the
+    /// restart then populates it and subsequent deaths can.
     pub process_handle: u32,
     /// Namespace-policy kind reconciliation recorded from the `.svc`
     /// `namespace = ...` line; one of `ipc::svcmgr_labels::NS_POLICY_*`.

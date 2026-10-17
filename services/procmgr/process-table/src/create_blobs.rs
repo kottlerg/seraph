@@ -18,9 +18,11 @@ use ipc::{ARGS_BLOB_MAX, IpcMessage};
 /// Program arguments delivered to a child process at spawn time.
 ///
 /// `blob` is a concatenation of `count` NUL-terminated UTF-8 strings. Empty
-/// slice + zero count means "no argv". The blob format and its page-remainder
-/// bound are defined by the argv section comment above
-/// `ProcessInfo::args_offset` in `abi/process-abi/src/lib.rs`.
+/// slice + zero count means "no argv". The blob format is defined by the
+/// argv section comment above `ProcessInfo::args_offset` in
+/// `abi/process-abi/src/lib.rs`; the bound is the wire limit the decoder
+/// enforces — at most `ipc::ARGS_BLOB_MAX` bytes per blob, argv and env
+/// together within `MSG_DATA_WORDS_MAX`, an oversize blob degraded to empty.
 #[derive(Clone, Copy, Default)]
 pub struct ChildArgs<'a>
 {
@@ -31,7 +33,7 @@ pub struct ChildArgs<'a>
 /// Environment variables delivered to a child process at spawn time.
 ///
 /// Same shape as [`ChildArgs`] except each entry is `KEY=VALUE`. Empty
-/// slice + zero count means "no env". Same page-remainder bound.
+/// slice + zero count means "no env". Same wire bound.
 #[derive(Clone, Copy, Default)]
 pub struct ChildEnv<'a>
 {
@@ -211,10 +213,18 @@ mod tests
     #[test]
     fn env_header_past_the_delivered_words_degrades_env_to_empty()
     {
-        // Declares one env entry but delivers only the argv word.
+        // A valid env header and blob sit in the data array at words 1..3,
+        // but the delivered count stops at the argv word. Without the
+        // delivered-count gate the decoder would read the header anyway and
+        // report a 4-byte env blob (zero-filled, as the bytes are past the
+        // delivered view), so only the gate makes env empty here.
         let argv = b"arg0\0\0\0\0";
+        let env = b"K=V\0";
         let msg = IpcMessage::builder(label(argv.len() as u64, 1, 1))
             .bytes(0, argv)
+            .word(1, env.len() as u64)
+            .bytes(2, env)
+            .word_count(1)
             .build();
         assert_eq!(msg.word_count(), 1);
         let blobs = CreateBlobs::extract(&msg, 0);
@@ -223,16 +233,64 @@ mod tests
     }
 
     #[test]
-    fn env_declared_past_the_blob_max_degrades_env_to_empty()
+    fn env_at_the_blob_max_with_empty_argv_extracts_fully()
     {
+        // No argv puts the env header at the first word; the blob fills the
+        // per-blob bound exactly and must come through intact.
+        let env = [b'e'; ARGS_BLOB_MAX];
+        let msg = IpcMessage::builder(label(0, 0, 1))
+            .word(0, ARGS_BLOB_MAX as u64)
+            .bytes(1, &env)
+            .build();
+        let blobs = CreateBlobs::extract(&msg, 0);
+        assert!(blobs.args().blob.is_empty());
+        assert_eq!(blobs.env().blob, &env[..]);
+        assert_eq!(blobs.env().count, 1);
+    }
+
+    #[test]
+    fn env_one_past_the_blob_max_degrades_env_to_empty()
+    {
+        // The whole oversize blob is delivered, so only the bound (not a
+        // short message) can make the decoder drop it.
         let argv = b"arg0\0";
+        let env = [b'e'; ARGS_BLOB_MAX + 1];
         let msg = IpcMessage::builder(label(argv.len() as u64, 1, 1))
             .bytes(0, argv)
-            .word(1, 0xFFFF)
-            .word(2, 0x61)
+            .word(1, env.len() as u64)
+            .bytes(2, &env)
             .build();
         let blobs = CreateBlobs::extract(&msg, 0);
         assert_eq!(blobs.args().blob, argv);
         assert!(blobs.env().blob.is_empty());
+    }
+
+    #[test]
+    fn blob_bytes_declared_past_the_delivered_words_read_as_zero()
+    {
+        // argv: 16 bytes declared, one word delivered. The blob keeps its
+        // declared length and the undelivered tail is zero; without the
+        // delivered-words clip the copy would slice past the message view.
+        let argv = b"arg0\0\0\0\0";
+        let msg = IpcMessage::builder(label(16, 1, 0)).bytes(0, argv).build();
+        assert_eq!(msg.word_count(), 1);
+        let blobs = CreateBlobs::extract(&msg, 0);
+        assert_eq!(blobs.args().blob.len(), 16);
+        assert_eq!(&blobs.args().blob[..8], argv);
+        assert_eq!(&blobs.args().blob[8..], &[0u8; 8]);
+
+        // env: header declares 16 bytes over one delivered env word.
+        let argv = b"a\0";
+        let env = b"K=V\0\0\0\0\0";
+        let msg = IpcMessage::builder(label(argv.len() as u64, 1, 1))
+            .bytes(0, argv)
+            .word(1, 16)
+            .bytes(2, env)
+            .build();
+        assert_eq!(msg.word_count(), 3);
+        let blobs = CreateBlobs::extract(&msg, 0);
+        assert_eq!(blobs.env().blob.len(), 16);
+        assert_eq!(&blobs.env().blob[..8], env);
+        assert_eq!(&blobs.env().blob[8..], &[0u8; 8]);
     }
 }

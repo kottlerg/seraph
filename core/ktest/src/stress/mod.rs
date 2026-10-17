@@ -38,6 +38,7 @@ mod mutual_stop;
 mod priority_dealloc_race;
 mod retype_concurrent;
 mod split_delete_race;
+mod stop_claimed_delete;
 mod stop_fault_sender;
 mod stop_owed_wake;
 mod stop_park_race;
@@ -96,6 +97,7 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!("stress::stop_fault_sender", stop_fault_sender::run(ctx));
     run_integration_test!("stress::mutual_stop", mutual_stop::run(ctx));
     run_integration_test!("stress::stop_repark", stop_repark::run(ctx));
+    run_integration_test!("stress::stop_claimed_delete", stop_claimed_delete::run(ctx));
     run_integration_test!(
         "stress::timed_wait_source_delete",
         timed_wait_source_delete::run(ctx)

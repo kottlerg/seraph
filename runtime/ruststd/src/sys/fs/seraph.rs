@@ -79,7 +79,7 @@ use crate::sys::{unsupported, unsupported_err};
 
 use ipc::{IpcMessage, fs_errors, fs_labels, ns_labels};
 use namespace_protocol::{NodeKind, NsError, validate_name};
-use syscall_abi::PAGE_SIZE;
+use syscall_abi::{MSG_DATA_WORDS_MAX, PAGE_SIZE};
 
 // `release_handler` lives in a sibling file (not a subdirectory),
 // because the upstream `library/std/src/sys/fs/` directory mixes
@@ -1872,7 +1872,10 @@ pub fn mkdir(path: &Path) -> io::Result<()>
 /// Rename an entry within a single directory. Cross-directory rename
 /// is not supported on the wire (see `shared/ipc/src/lib.rs`
 /// `FS_RENAME` rustdoc) and is tracked separately; the PAL surfaces
-/// it as `InvalidInput`.
+/// it as `InvalidInput`. The two names share the request's data area
+/// after the two length words, so a pair whose combined length does not
+/// fit there is refused as `InvalidFilename` even though each name alone
+/// passes `validate_name`.
 pub fn rename(from: &Path, to: &Path) -> io::Result<()>
 {
     let ipc_buf = crate::os::seraph::current_ipc_buf();
@@ -1908,6 +1911,20 @@ pub fn rename(from: &Path, to: &Path) -> io::Result<()>
         return Err(io::const_error!(
             io::ErrorKind::InvalidInput,
             "seraph fs: cross-directory rename not supported",
+        ));
+    }
+
+    // The names pack contiguously from word 2, so their sum, not each
+    // name's own `validate_name` bound, decides whether the request fits
+    // the data area; refuse here rather than let the builder assert on
+    // caller-supplied lengths.
+    if src.leaf.len() + dst.leaf.len() > (MSG_DATA_WORDS_MAX - 2) * 8
+    {
+        release_split_parent(&src);
+        release_split_parent(&dst);
+        return Err(io::const_error!(
+            io::ErrorKind::InvalidFilename,
+            "seraph fs: rename source and target names together exceed the request size",
         ));
     }
 

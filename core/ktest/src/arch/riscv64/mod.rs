@@ -17,6 +17,11 @@ mod sbi_gating;
 
 use crate::TestContext;
 
+/// Exception cause a not-present user store faults with (store/AMO page
+/// fault), as recorded in `EXIT_FAULT_BASE + <vector>` when the fault kills
+/// the thread.
+pub const PAGE_FAULT_STORE_VECTOR: u64 = 15;
+
 /// Run every RISC-V-specific Tier 1 test. x86-64's wrapped-stack probe has no
 /// RISC-V counterpart: the RISC-V entry alignment, `sp & !0xF`, rounds down
 /// without wrapping, so the raw stack check covers it.

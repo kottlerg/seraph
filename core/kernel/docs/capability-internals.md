@@ -892,9 +892,10 @@ cannot be derived, and are not tracked for revocation (see
 [docs/ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model). A reply
 capability is not a `CapTag` variant; it is an implicit per-thread mechanism
 created by the kernel at `SYS_IPC_RECV` time and stored in a per-thread slot,
-outside the process CSpace. The kernel clears the per-thread reply slot after
-`SYS_IPC_REPLY` (see [ipc-internals.md](ipc-internals.md) § Receive Path (Server)
-and § Reply Path).
+outside the process CSpace. The kernel clears the per-thread reply slot when
+`SYS_IPC_REPLY` consumes it, or at the thread's next `SYS_IPC_RECV` that passes its
+capability check and cap-slot pre-allocation, which releases the unreplied caller (see
+[ipc-internals.md](ipc-internals.md) § Receive Path (Server) and § Reply Path).
 
 ---
 

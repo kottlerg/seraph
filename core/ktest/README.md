@@ -54,6 +54,7 @@ kernel's own source layout.
 | `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, type-specific fields) |
 | `retype.rs` | Retype primitive: augmentation and donation spill, PT walk budget, kernel PT pool |
 | `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_MEMORY_SPLIT`, `SYS_ASPACE_QUERY` |
+| `entropy.rs` | `SYS_GETRANDOM`, including an unmapped or read-only buffer refused with `InvalidAddress` |
 | `notification.rs` | `SYS_NOTIFICATION_SEND`, `SYS_NOTIFICATION_WAIT` (blocking and `notification_wait_timeout`) |
 | `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` (blocking, `try_recv`, timeout) |
 | `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT`, including a second concurrent `wait_set_wait` refused with `InvalidState` |
@@ -62,6 +63,8 @@ kernel's own source layout.
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
 | `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT` (`SYS_SBI_CALL` is under `src/arch/<arch>/`) |
 | `sysinfo.rs` | `SYS_SYSTEM_INFO` |
+| `crypto.rs` | Shared `crypto` crate known-answer tests (SHA-512, Ed25519 verify) run on-target (not a syscall surface) |
+| `init_layout.rs` | Kernel init-bootstrap ASLR draws: the `InitInfo` VA, init stack, and PIE image base lie in their windows |
 
 Adding a new syscall means adding a section in the appropriate file here.
 
@@ -91,7 +94,7 @@ concurrent notification and queue events.
 | `multi_caller_ipc_fifo.rs` | Three concurrent IPC callers verify FIFO send-queue ordering |
 | `ipc_call_interrupted_stop_start.rs` | A client stopped while parked in `ipc_call` and then restarted returns `Interrupted`, never a stale reply (#361) |
 | `park_interrupted_stop_start.rs` | A thread stopped while parked in any non-call blocking syscall and then restarted returns `Interrupted`, never a stale wake deposit (#363) |
-| `reply_binding_displaced.rs` | A server that receives again without replying releases the caller its earlier receive bound: a released `ipc_call` returns `Interrupted` and the released caller stops and restarts; a released fault-blocked thread is killed with the fault exit reason; the later receive's caller gets its reply |
+| `reply_binding_displaced.rs` | A server that receives again without replying releases the caller its earlier receive bound: a released `ipc_call` returns `Interrupted` and the released caller stops and restarts; a released fault-blocked thread, still alive before the later receive, is killed with the fault exit reason; the later receive's caller gets its reply |
 | `destroyed_source_interrupts.rs` | Every waiter parked on a notification (two untimed or two timed), an event queue (two), or a wait set (one) destroyed under it returns `Interrupted`, never a fabricated success |
 | `queued_waiters_fifo.rs` | Two threads waiting on one notification or event queue are woken in arrival order: each delivery wakes the longest waiter only, and a queued waiter whose timed wait expires (at the head or the tail) leaves the other waiting for the next delivery |
 | `cap_delegation_chain.rs` | Multi-level rights attenuation and cascaded revocation |
@@ -129,15 +132,14 @@ to turn the tier off.
 
 Order matches `stress/mod.rs` dispatch order.
 
-Concurrency knobs ramp every per-test worker count to the `u64` notification-
-bitmask ceiling (64 workers) and iteration counts 5-10× higher than a
-trivial smoke-test would need. The point is that one ktest boot
-exercises enough contention to surface latent
-races, rather than needing tens of repeat runs to flake-mine. The
-`u64` width caps per-test workers at 64; lifting that would require
-re-encoding the per-worker bookkeeping from a bitmask to an atomic-
-counter ledger. The `MAX_STRESS_THREADS = 64` cap in `stress/mod.rs`
-mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
+Concurrency knobs ramp worker-pool cells (`NUM_WORKERS`, `NUM_CHILDREN`, `NUM_SENDERS`,
+`NUM_CALLERS`) toward the `u64` notification-bitmask ceiling of 64 workers, and iteration counts
+5-10× higher than a trivial smoke-test would need. Race cells use a fixed set of a few participants
+and scale through their iteration knob (`CYCLES`, `ITERATIONS`) instead. The point is that one ktest
+boot exercises enough contention to surface latent races, rather than needing tens of repeat runs to
+flake-mine. The `u64` width caps per-test workers at 64; lifting that would require re-encoding the
+per-worker bookkeeping from a bitmask to an atomic-counter ledger. The `MAX_STRESS_THREADS = 64` cap
+in `stress/mod.rs` mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
 
 | File | Scenario | Knobs |
 |---|---|---|
@@ -153,7 +155,7 @@ mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
 | `stop_resume_race.rs` | Race `thread_stop` against a concurrent `thread_start` (resume) on a `Running` pinned victim across three CPUs (stop-drain liveness) | `CYCLES=256` |
 | `stop_sleep_window.rs` | Stop and restart a thread looping `thread_sleep(1)` on the timer CPU, so stops land around the park commit, the sleep-list add, and the timer's claim; each sleep returns `Ok` or `Interrupted` | `CYCLES=2000` |
 | `stop_park_race.rs` | Stop and restart a peer entering a notification wait, an IPC call, or a sleep; each park returns its genuine result or `Interrupted`, and every kind sees a cancellation | `CYCLES=150`, `SLEEP_MS=2` |
-| `stop_owed_wake.rs` | Stop and restart a notification waiter while a sender keeps claiming its wait, alone and then (4+ CPUs) with a starter racing every restart; every wait returns bits or `Interrupted` and both occur; every start succeeds or returns `InvalidArgument`, none returns `InvalidArgument` while the controller is alone, and with the starter racing it wins some restarts and its wins equal the controller's losses (one committed start per stop); the kernel's wait-queue and owed-wake assertions hold | `CYCLES=2000` per phase |
+| `stop_owed_wake.rs` | Stop and restart a notification waiter while a sender keeps claiming its wait (each round waits, bounded by `ENTRY_WAIT_US`, for the restarted waiter to enter a wait), alone and then (4+ CPUs) with a starter racing every restart, itself stopped and restarted by the controller every `STARTER_STOP_PERIOD` rounds; every wait returns bits or `Interrupted` and both occur; every start succeeds or returns `InvalidArgument` (or, for the starter's, `Interrupted`, tallied but not required), none returns `InvalidArgument` while the controller is alone, and with the starter racing it wins some restarts and its wins equal the controller's losses (one committed start per stop, none from an interrupted start); the kernel's wait-queue and owed-wake assertions hold | `CYCLES=2000` per phase, `STARTER_STOP_PERIOD=16` |
 | `timed_wait_source_delete.rs` | Destroy a notification or event queue around a timed waiter's deadlines; each wait ends in a timeout, `Interrupted`, or `InvalidCapability` | `CYCLES=200`, `WAIT_MS=1` |
 | `timed_waiter_thread_delete.rs` | Delete a timed waiter's last Thread cap around its deadlines (plain sleep, notification, event queue) | `CYCLES=192`, `WAIT_MS=1` |
 | `timed_wait_reuse.rs` | A timed wait claimed by a delivery at its deadline, followed by an untimed wait on the same source: the untimed wait never returns a timeout | `CYCLES=400`, `WAIT_MS=1` |

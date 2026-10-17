@@ -16,7 +16,7 @@ use process_abi::{
     PROCESS_MAIN_TLS_MAX_PAGES,
 };
 use process_layout::{ProcessLayout, choose_process_layout};
-use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE};
+use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE, SyscallError};
 
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
 const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
@@ -203,9 +203,12 @@ impl TableExt for ProcessTable
     /// `direction` is one of `ipc::procmgr_labels::PIPE_DIR_STDIN`,
     /// `PIPE_DIR_STDOUT`, `PIPE_DIR_STDERR`. The three caps are
     /// `cap_copy`'d into the child's `CSpace` with `RIGHTS_MEM_MAP_RW` for
-    /// the memory cap and `RIGHTS_ALL` for the two notifications: each peer
-    /// both kicks and awaits each notification, so it needs Notify and Wait
-    /// rights (`abi/process-abi` `ProcessInfo` pipe fields).
+    /// the memory cap and `RIGHTS_ALL` for the two notifications. Per pipe,
+    /// each end kicks one notification and waits on the other (the writer
+    /// kicks `data` and waits on `space`, the reader the reverse; the
+    /// parent's death bridge kicks both), and both ends hold both caps with
+    /// Notify and Wait rights (`abi/process-abi` `ProcessInfo` pipe fields),
+    /// so the child's copies carry Notify and Wait whichever end it holds.
     /// The resulting slot indices are written into the matching
     /// `<dir>_memory_cap` / `<dir>_data_notification_cap` /
     /// `<dir>_space_notification_cap` fields of the child's `ProcessInfo`.
@@ -2666,7 +2669,19 @@ pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u32) -> 
     )
     .map_err(|_| 3u64)?;
 
-    syscall::thread_start(entry.thread_cap).map_err(|_| 6u64)?;
+    // `Interrupted` means procmgr's thread was stopped while the start waited
+    // for the child's thread to settle; nothing was started, so the start is
+    // retried.
+    loop
+    {
+        match syscall::thread_start(entry.thread_cap)
+        {
+            Ok(()) => break,
+            Err(e) if e == SyscallError::Interrupted as i64 =>
+            {}
+            Err(_) => return Err(6),
+        }
+    }
 
     entry.started = true;
     Ok(())

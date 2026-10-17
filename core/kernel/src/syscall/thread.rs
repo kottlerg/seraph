@@ -227,7 +227,14 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             crate::sched::StartCommit::Committed(seq) => seq,
             crate::sched::StartCommit::Refused => return Err(SyscallError::InvalidArgument),
-            crate::sched::StartCommit::CallerStopped => return Err(SyscallError::Interrupted),
+            crate::sched::StartCommit::CallerStopped =>
+            {
+                // Deschedule now, as a self-stop does: the stopper's prod was
+                // absorbed while the start waited, and the syscall epilogue
+                // reschedules only an Exited thread. The restart resumes here.
+                crate::sched::schedule(false);
+                return Err(SyscallError::Interrupted);
+            }
         };
         // Route to correct CPU based on affinity. The thread is already Ready
         // (committed above), so use enqueue_ready_thread to link it: the gated

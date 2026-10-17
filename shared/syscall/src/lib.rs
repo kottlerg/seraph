@@ -1423,10 +1423,12 @@ pub fn thread_configure_with_tls(
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid, the
-/// thread has not been configured yet, or it is not `Created`/`Stopped` under
-/// the locked commit — including one a concurrent start already resumed, or
-/// one that exited or was killed by an object teardown after the first check
-/// (`InvalidArgument`).
+/// thread has not been configured yet, is the calling thread itself, or is not
+/// `Created`/`Stopped` under the locked commit — including one a concurrent
+/// start already resumed, or one that exited or was killed by an object
+/// teardown after the first check (`InvalidArgument`); `-16` (`Interrupted`)
+/// if the calling thread is stopped while the start waits for the target to
+/// leave its CPU or for an owed wake (nothing is started; a retry is safe).
 #[inline]
 pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 {

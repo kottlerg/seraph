@@ -422,8 +422,8 @@ pub struct ThreadControlBlock
     ///
     /// Keyed on the TCB itself, not on whichever run queue happens to link it:
     /// the owning lock of `{state, ipc_state, queued_on, run_queue_next,
-    /// preferred_cpu, blocked_on_object, wake_pending, park_seq}` is always this lock,
-    /// regardless of which CPU the TCB is on. This is what collapses the
+    /// preferred_cpu, blocked_on_object, wake_pending, park_seq, start_seq}` is
+    /// always this lock, regardless of which CPU the TCB is on. This is what collapses the
     /// positional-ownership race class — two CPUs can no longer pick two
     /// different locks for one TCB. Lock order: source IPC lock → `sched_lock`
     /// → per-CPU `PerCpuScheduler.lock`. See
@@ -676,12 +676,13 @@ pub struct ThreadControlBlock
     /// tore the binding down (`cancel_ipc_block`, the endpoint park rollbacks,
     /// the `dealloc_object(Thread)` detach).
     ///
-    /// Two paths spin on it (Acquire): `dealloc_object(Thread)` after its
-    /// wait-object unlink and before `retype_free`, so a thread claimed for
-    /// wake is not freed under the in-flight wake (the wake-side analogue of
-    /// `context_saved`); and the settle loop of `SYS_THREAD_START`
-    /// (`sched::start_under_all_locks`), so a restart does not race a late
-    /// wake. See
+    /// Two paths wait on it: `dealloc_object(Thread)`, which spins with
+    /// Acquire loads after its wait-object unlink and before `retype_free`, so
+    /// a thread claimed for wake is not freed under the in-flight wake (the
+    /// wake-side analogue of `context_saved`); and the settle loop of
+    /// `SYS_THREAD_START` (`sched::start_under_all_locks`), whose Relaxed
+    /// loads hold the target's `sched_lock` (and, for the commit's re-check,
+    /// every CPU lock), so a restart does not race a late wake. See
     /// `docs/scheduling-internals.md` § Cross-CPU TCB Ownership.
     pub wake_in_flight: core::sync::atomic::AtomicU32,
 

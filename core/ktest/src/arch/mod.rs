@@ -7,7 +7,8 @@
 //!
 //! One module per architecture, selected here by `target_arch` (the arch-module
 //! declaration site, per docs/coding-standards.md § C). Each exposes the same
-//! entry points; architecture-specific ktest code belongs behind them.
+//! entry points and constants; architecture-specific ktest code belongs behind
+//! them.
 //!
 //! TODO: move every `#[cfg(target_arch)]` item outside `src/arch/` behind this
 //! surface. Deferred because the move is ktest-wide restructuring, separate from
@@ -21,4 +22,4 @@ mod current;
 #[path = "riscv64/mod.rs"]
 mod current;
 
-pub use current::{run_integration, run_unit};
+pub use current::{PAGE_FAULT_STORE_VECTOR, run_integration, run_unit};

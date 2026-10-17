@@ -48,9 +48,10 @@
 //! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
 //! - `destroyed_source_interrupts.rs` — every waiter on a notification, event queue, or wait set
 //!   destroyed under it returns `Interrupted`, never a fabricated success
-//! - `reply_binding_displaced.rs` — a server's second receive without a reply releases the first
-//!   caller with `Interrupted`; the second call completes, and the released caller stops and
-//!   restarts
+//! - `reply_binding_displaced.rs` — a server that receives again without replying releases the
+//!   caller its earlier receive bound: a released `ipc_call` returns `Interrupted` and the
+//!   released caller stops and restarts; a released fault-blocked thread is killed with the
+//!   fault exit reason; the later receive's caller gets its reply
 //! - `queued_waiters_fifo.rs` — threads waiting on one notification or event queue are woken in
 //!   arrival order, one per delivery, including after a timed waiter expires at the head or the
 //!   tail

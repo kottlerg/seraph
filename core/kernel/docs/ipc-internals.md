@@ -85,8 +85,9 @@ one set of links suffices). No separate allocation. Threads are served in arriva
    e. Release endpoint lock
    f. Transfer capability slots (see capability-internals.md)
    g. enqueue_and_wake(recv_tcb) on its selected CPU
-   h. Committed: call the scheduler. Refused: return through the
-      disposition
+   h. Call the scheduler whether the park committed or was refused (a
+      refused park that left the thread runnable is requeued), then
+      return through the disposition
 
 5. else (no receiver yet):
    // Slow path, all under the endpoint lock until step e
@@ -98,8 +99,9 @@ one set of links suffices). No separate allocation. Threads are served in arriva
    d. If the park committed and made the send queue non-empty, notify the
       endpoint's wait set (waitset_notify)
    e. Release endpoint lock
-   f. Committed: call the scheduler. Refused: return through the
-      disposition
+   f. Call the scheduler whether the park committed or was refused (a
+      refused park that left the thread runnable is requeued), then
+      return through the disposition
 ```
 
 **Message copy:** The label, counts, badge, and packed cap handles travel in
@@ -155,8 +157,9 @@ syscall on either side. Nothing is allocated on the path.
       refusal, unlink current_tcb from the recv queue, and stamp INTERRUPTED
       if the refusal was a stop (RefusedStop)
    c. Release endpoint lock
-   d. Committed: call the scheduler. Refused: return through the
-      disposition
+   d. Call the scheduler whether the park committed or was refused (a
+      refused park that left the thread runnable is requeued), then
+      return through the disposition
 ```
 
 ### Reply Path
@@ -328,10 +331,12 @@ pub struct NotificationState
 5. if waiters is non-empty:
    a. delivered = bits.swap(0, Ordering::Relaxed)
    b. if delivered == 0: release sig.lock; return None
-      (a fast-path notification_wait between steps 1 and 4 consumed our
-       bits; the queued waiters are *new* waiters who must NOT be
-       touched, else one receives wakeup_value=0 — a spurious wake,
-       since 0-bit sends are rejected at step 1)
+      (between steps 1 and 4 our bits were claimed, by a newly arriving
+       notification_wait that found them pending and returned without
+       blocking, or by a concurrent send's step a; the queued waiters
+       were already waiting and none is touched, else one receives
+       wakeup_value=0 — a spurious wake, since 0-bit sends are rejected
+       before step 1)
    c. tcb = waiters.pop() (the longest-waiting thread);
       has_observer = (waiters non-empty || wait_set != null)
    d. claim_waiter(tcb, delivered): wake_in_flight = 1,

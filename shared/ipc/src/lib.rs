@@ -2574,17 +2574,29 @@ pub unsafe fn ipc_call(ep: u32, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
 /// [`IpcMessage`] before returning. After return the IPC buffer is scratch
 /// — nested IPC between `ipc_recv` and reading the message is safe.
 ///
-/// A reply still pending from an earlier receive is released first: that
+/// A reply still pending from an earlier receive is released once the
+/// receive passes its capability check and cap-slot pre-allocation: that
 /// caller's `ipc_call` returns `Interrupted`, and a fault-blocked caller is
-/// killed. A server therefore replies before it receives again.
+/// killed. A receive refused before then keeps the pending binding. A
+/// server therefore replies before it receives again.
 ///
 /// # Safety
 /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC buffer
 /// page as registered via `syscall::ipc_buffer_set`.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the endpoint cap is invalid or
-/// the receive is interrupted.
+/// Returns a negative `i64` error code:
+/// - `InvalidCapability` — `ep` is not a live Endpoint cap.
+/// - `InsufficientRights` — `ep` lacks Receive rights.
+/// - `QuotaExceeded` — the cap-slot pre-allocation for incoming caps was
+///   refused because this thread's `CSpace` directory is structurally full.
+/// - `OutOfMemory` — the cap-slot pre-allocation was refused because the
+///   `CSpace`'s slot-page pool is exhausted.
+/// - `Interrupted` — this thread was stopped, or the endpoint was destroyed,
+///   while the receive was blocked.
+///
+/// The first four refuse the receive before any pending reply is released,
+/// so a pending caller stays bound.
 #[inline]
 pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 {

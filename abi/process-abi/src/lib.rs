@@ -374,9 +374,8 @@ pub struct ProcessInfo
     // 0` means "no argv delivered".
     //
     // The page remainder after the fixed struct is where the blob lives,
-    // not its limit: argv is bounded by the wire, `ipc::ARGS_BLOB_MAX`
-    // bytes per blob and argv plus env within `MSG_DATA_WORDS_MAX`, and
-    // procmgr degrades an oversize blob to empty.
+    // not its limit; the bound is the create-request wire contract in
+    // `services/procmgr/docs/ipc-interface.md` § CREATE_PROCESS.
     /// Byte offset from the `ProcessInfo` page base where the argv blob
     /// begins. 0 when no argv was provided.
     pub args_offset: u32,
@@ -393,7 +392,8 @@ pub struct ProcessInfo
     // argv blob, between `env_offset` and `env_offset + env_bytes`. The
     // blob is a concatenation of `env_count` NUL-terminated UTF-8 strings,
     // each of shape `KEY=VALUE`. `env_offset == 0` OR `env_count == 0`
-    // means "no env delivered". Same wire bound as argv.
+    // means "no env delivered". The bound is the same wire contract as
+    // argv's.
     /// Byte offset from the `ProcessInfo` page base where the env blob
     /// begins. 0 when no env was provided.
     pub env_offset: u32,

@@ -20,7 +20,7 @@
 use crate::REGISTRY_CAPACITY;
 use crate::definitions::build_blob;
 use crate::definitions::launch::{
-    assemble_boot_caps, delete_caps, mint_logd_boot_caps, resolve_seeds,
+    LaunchKind, assemble_boot_caps, delete_caps, mint_logd_boot_caps, resolve_seeds,
 };
 use crate::service::{MAX_RESTARTS, POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
 use ipc::{IpcMessage, procmgr_labels};
@@ -404,7 +404,7 @@ fn restart_process(
     // instance to the same object consumers already hold a SEND on.
     let boot_caps: Vec<u32> = if matches!(recipe, Some(r) if r.log_sink)
     {
-        mint_logd_boot_caps(ctx, false)
+        mint_logd_boot_caps(ctx, LaunchKind::Restart)
     }
     else
     {

@@ -22,7 +22,10 @@ pub mod parse;
 /// stack-envelope writer expects from a list of tokens. Returns
 /// `(blob, count)`. Empty input yields an empty blob with `count = 0`,
 /// matching the "no argv / no env" wire shape. [`parse::parse`] bounds a
-/// recipe's blobs so the count fits the label's 8-bit field.
+/// recipe's blobs so the count fits the label's 8-bit field and guarantees
+/// every token is NUL-free, which this encoder relies on: the blob's NUL
+/// boundaries are then exactly the `count` token boundaries the label
+/// declares.
 #[must_use]
 pub fn build_blob(tokens: &[String]) -> (Vec<u8>, u32)
 {

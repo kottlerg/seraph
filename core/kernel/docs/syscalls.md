@@ -1173,7 +1173,10 @@ thread running on another CPU is marked `Stopped` under every CPU's scheduler lo
 returns once that CPU has descheduled it, at its next slice expiry or the thread's own park or
 yield, or once an object teardown has committed `Exited` over it; the inter-processor interrupt
 sent to that CPU only forces a trap. A caller that is itself stopped while it waits deschedules in
-place; its call completes when it is restarted and the target has left its CPU (see
+place; once restarted it re-resolves `thread_cap`, and its call completes when the target has left
+its CPU, or at once when that slot no longer names the target with Control rights — the target may
+then still be executing, and a `SYS_THREAD_READ_REGS` through another capability is not guaranteed
+a fresh `trap_frame` (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
 Protocol).
 

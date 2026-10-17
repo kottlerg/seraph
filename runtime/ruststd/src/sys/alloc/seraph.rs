@@ -669,9 +669,10 @@ fn slab_round_to_class(bytes: u64) -> u64 {
 /// to the first returned cap (any cap unblocks sub-page retypes; a too-small
 /// cap simply means the next page-sized retype request triggers a refresh).
 ///
-/// Returns `Some((slot, pages, phys))` on success, `None` on IPC failure, an
-/// empty reply, or a reply whose declared count is not backed by its caps
-/// and data words. `phys` is the chosen cap's physical base, which memmgr reports
+/// Returns `Some((slot, pages, phys))` on success, `None` on IPC failure, a
+/// reply carrying no caps, or a reply whose data words do not cover its count
+/// (the declared count is clamped to the caps actually transferred, never
+/// refused). `phys` is the chosen cap's physical base, which memmgr reports
 /// at `data[1 + returned + i]`; the caller passes it to [`slab_release_fresh`]
 /// to return the run to memmgr's pool mid-life. Also used by the pipe
 /// machinery (`sys::pipe`) for ring pages, which need the phys base so the

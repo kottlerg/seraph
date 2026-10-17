@@ -525,12 +525,13 @@ unsafe fn stopper_stopped(caller_tcb: *mut crate::sched::thread::ThreadControlBl
 {
     use crate::sched::thread::ThreadState;
     // SAFETY: per contract; lock_raw paired with unlock_raw.
-    unsafe {
+    let st = unsafe {
         let f = (*caller_tcb).sched_lock.lock_raw();
         let st = (*caller_tcb).state;
         (*caller_tcb).sched_lock.unlock_raw(f);
-        matches!(st, ThreadState::Stopped | ThreadState::Exited)
-    }
+        st
+    };
+    matches!(st, ThreadState::Stopped | ThreadState::Exited)
 }
 
 /// Whether `thread_idx` in `cspace` still names `target_tcb` with Control
@@ -569,8 +570,9 @@ unsafe fn slot_names_thread(
 /// wake-claim win, stamps the park episode [`PARK_DISPOSITION_INTERRUPTED`]
 /// (fault episodes get `FAULT_OUTCOME_KILL`) so the restarted thread's resume
 /// consumes the cancellation instead of a stale wake deposit, and clears the
-/// thread's park binding. A lost claim means a genuine waker owns the episode;
-/// its deposit stands untouched, and its `enqueue_and_wake` clears the binding,
+/// thread's park binding, whatever state a concurrent stop or teardown commits
+/// over the claimed park meanwhile. A lost claim means a genuine waker owns the
+/// episode; its deposit stands untouched, and its `enqueue_and_wake` clears the binding,
 /// on the link path or in the arm that aborts on a `Stopped` or `Exited`
 /// thread.
 ///
@@ -965,12 +967,14 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
     // (every park commit advances park_seq, and the caller's commit retries on
     // a changed one). Clearing here after a lost claim would race the waker's
     // own reads of the binding, such as the reply's fault-arm test of
-    // ipc_state after it won the reply_tcb CAS.
+    // ipc_state after it won the reply_tcb CAS. The thread's state is not
+    // consulted: a concurrent stop or teardown may have committed Stopped or
+    // Exited over the claimed park meanwhile, and the won claim still owns the
+    // binding (no other path clears it).
     // SAFETY: tcb is valid; fields written under sched_lock.
     unsafe {
         let saved = (*tcb).sched_lock.lock_raw();
         if claimed
-            && (*tcb).state == crate::sched::thread::ThreadState::Blocked
             && (*tcb).ipc_state == ipc_state
             && (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
         {

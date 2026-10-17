@@ -292,9 +292,10 @@ stated explicitly.
     gate-spins earlier (#289).
 11. sleep_list_remove(tcb) — tcb is Exited and off every CPU, so no add can
     follow, and a timer pop that won the race still holds the full binding
-    (Sleep List Invariant 6). Then acquire the source IPC lock for tcb's
-    blocked_on_object (if any) and unlink tcb from the source's wait or
-    waiter queue. Known gap: nothing pins the source here, and a waker that
+    (Sleep List Invariant 6). Then snapshot tcb's (ipc_state,
+    blocked_on_object) under tcb's sched_lock, release it, acquire the source
+    IPC lock for blocked_on_object (if any) and unlink tcb from the source's
+    wait or waiter queue. Known gap: nothing pins the source here, and a waker that
     claimed tcb before its Exited mark leaves the binding set until its wake
     lands (`enqueue_and_wake`'s abort arm clears it), so a concurrent last-cap
     delete can free the source first (#443 § Source pointer held past its
@@ -314,7 +315,9 @@ stated explicitly.
                         fault reply does not target this freed faulter. The
                         faulter never resumes, so no fault_outcome is recorded.
       - None: no source-side cleanup needed.
-12. Clear tcb.blocked_on_object = null.
+12. Clear tcb.blocked_on_object = null under tcb's sched_lock: the abort arm
+    of a wake that claimed tcb before its Exited mark writes the same pair
+    under that lock.
 13. Release tcb's fault-handler binding, if any: atomically swap
     tcb.fault_handler to null and dec_ref the prior EndpointObject; if its
     refcount reaches 0, enqueue the orphaned endpoint header on the cascade
@@ -324,7 +327,8 @@ stated explicitly.
 14. Wake-in-flight gate (#160): spin, preempt-disabled with interrupts
     enabled, until tcb.wake_in_flight == 0 — a waker that claimed tcb (under a
     source lock, or the timer at its pop) set it before its enqueue_and_wake,
-    which clears it. Then sleep_wakeups_quiesce(): a timer batch that popped
+    which clears it after releasing tcb's sched_lock, as its last touch of the
+    TCB. Then sleep_wakeups_quiesce(): a timer batch that popped
     tcb keeps its pointer until the batch ends (Sleep List Invariant 9).
 15. (x86_64 only) Release IOPB if bound.
 16. Unregister tcb from the live-thread registry.
@@ -687,16 +691,21 @@ The handler then drains the target.
      otherwise deschedule it, and the syscall epilogue reschedules only an `Exited` thread. When it
      is restarted it re-resolves its target through its own capability slot (nothing pins the
      slot across the park) and re-enters the drain only if the slot still names the target with
-     Control rights, returning once the target has left its CPU; otherwise the target was deleted
-     meanwhile and the drain ends. Two threads stopping each other concurrently therefore both end
-     `Stopped`, restartable by a third, instead of both spinning forever.
+     Control rights, returning once the target has left its CPU; otherwise the caller no longer
+     holds that capability in the slot (deleted, moved, or revoked) and the call returns at once,
+     whether or not a target still reachable through another capability has left its CPU. Two
+     threads stopping each other concurrently therefore both end `Stopped`, restartable by a
+     third, instead of both spinning forever.
 
 **Invariants:**
 
 1. The drain spin in step 4 is the correctness requirement: it returns only once the remote CPU
    has descheduled the target through a trap, which is what gives `sys_thread_read_regs` a fresh
    `trap_frame`. The wakeup IPI contributes no descheduling (its handler does no work); it exits a
-   `hlt` on an idle CPU and forces one register snapshot.
+   `hlt` on an idle CPU and forces one register snapshot. A stopper restarted after its in-place
+   park upholds this only through the slot it re-resolves: when that slot no longer names the
+   target, the call returns without the drain, and a `sys_thread_read_regs` through another
+   capability may read a `trap_frame` the target has not yet saved.
 2. For Ready targets on a remote run queue, no IPI and no drain are needed; the all-locks commit
    unlinks the TCB from every run queue at once, and the `schedule()` skip-loop is only
    defence-in-depth.

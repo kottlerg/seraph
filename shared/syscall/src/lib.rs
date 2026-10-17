@@ -622,6 +622,19 @@ pub fn ipc_buffer_set(virt: u64) -> Result<(), i64>
 /// entry point.
 ///
 /// Returns `(reply_label, reply_word_count)` on success.
+///
+/// # Errors
+/// Returns a negative `i64` error code, per `SYS_IPC_CALL` in
+/// `core/kernel/docs/syscalls.md`: `InvalidCapability` (`ep` is not a live
+/// Endpoint cap, or a cap slot is stale or Null), `InsufficientRights` (`ep`
+/// lacks Send, or Grant on a cap-bearing call), `InvalidArgument` (bad
+/// count, a cap slot repeated in one message, or `data_count > 0` with no
+/// IPC buffer page registered), `InvalidAddress` (the registered IPC buffer
+/// page is unmapped), `InvalidState` (a cap slot is pinned by an in-flight
+/// `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), or `Interrupted` (the call was
+/// cancelled while blocked, including by the receiver receiving again before
+/// it replied). Cap-slot problems are rejected before the caller blocks; a
+/// refusal arising only afterwards delivers the message with zero caps.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_call(
@@ -670,6 +683,16 @@ pub fn raw_ipc_call(
 /// entry point.
 ///
 /// Returns `(label, badge, word_count)` on success.
+///
+/// # Errors
+/// Returns a negative `i64` error code, per `SYS_IPC_RECV` in
+/// `core/kernel/docs/syscalls.md`: `InvalidCapability` (`ep` is not a live
+/// Endpoint cap), `InsufficientRights` (`ep` lacks Receive), `QuotaExceeded`
+/// (this thread's `CSpace` directory is structurally full for an incoming
+/// cap transfer), `OutOfMemory` (the `CSpace` slot-page pool is exhausted),
+/// or `Interrupted` (this thread was stopped, or the endpoint destroyed,
+/// while the receive was blocked). The first four refuse the receive before
+/// any pending reply is released.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
@@ -693,6 +716,19 @@ pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
 
 /// Raw `SYS_IPC_REPLY`. Intended for `shared/ipc`'s `IpcMessage`-snapshot
 /// wrapper; other callers should use that higher-level entry point.
+///
+/// # Errors
+/// Returns a negative `i64` error code, per `SYS_IPC_REPLY` in
+/// `core/kernel/docs/syscalls.md`: `InvalidCapability` (no pending reply, or
+/// a reply cap slot is stale or Null), `InvalidArgument` (bad count, a cap
+/// slot repeated in the reply, or `data_count > 0` with no IPC buffer page
+/// registered), `InvalidAddress` (the registered IPC buffer page is
+/// unmapped), `InvalidState` (a reply cap slot is pinned by an in-flight
+/// `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), `QuotaExceeded` / `OutOfMemory` (the
+/// caller's `CSpace` cannot accept the reply caps), or `Interrupted`. An
+/// error consumes the pending reply: a caller that was pending has already
+/// been woken with the `IPC_REPLY_TRANSFER_FAILED` label, so the reply must
+/// not be retried.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_reply(
@@ -1422,13 +1458,16 @@ pub fn thread_configure_with_tls(
 /// The thread must have been configured via [`thread_configure`] first.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the thread cap is invalid, the
-/// thread has not been configured yet, is the calling thread itself, or is not
-/// `Created`/`Stopped` under the locked commit — including one a concurrent
-/// start already resumed, or one that exited or was killed by an object
-/// teardown after the first check (`InvalidArgument`); `-16` (`Interrupted`)
-/// if the calling thread is stopped while the start waits for the target to
-/// leave its CPU or for an owed wake (nothing is started; a retry is safe).
+/// Returns a negative `i64` error code if the thread cap is invalid
+/// (`InvalidCapability`) or lacks Control rights (`InsufficientRights`); if
+/// the thread has not been configured yet, is the calling thread itself, or
+/// is not `Created`/`Stopped` under the locked commit — including one a
+/// concurrent start already resumed, or one that exited or was killed by an
+/// object teardown after the first check (`InvalidArgument`); or `-16`
+/// (`Interrupted`) if the calling thread is stopped while the start waits for
+/// the target to leave its CPU or for an owed wake: the caller is descheduled
+/// in place and sees `Interrupted` once restarted; nothing was started and a
+/// retry is safe.
 #[inline]
 pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 {

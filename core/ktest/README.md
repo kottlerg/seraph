@@ -35,8 +35,10 @@ which live under `src/arch/<arch>/` (see below).
 
 `src/arch/` is ktest's arch-dispatch surface: one module per architecture,
 selected by `target_arch` in `src/arch/mod.rs`, each exposing the same
-entry points. Tier 1 reaches the tests behind it through
-`crate::arch::run_unit` and Tier 2 through `crate::arch::run_integration`.
+entry points and constants. Tier 1 reaches the tests behind it through
+`crate::arch::run_unit` and Tier 2 through `crate::arch::run_integration`;
+arch-neutral tests take the vector a not-present user store faults with
+from `crate::arch::PAGE_FAULT_STORE_VECTOR`.
 Per-arch helpers and branches inside arch-neutral tests, and other arch-specific
 items elsewhere in ktest, are still gated in place with `#[cfg(target_arch)]`;
 #460 lists them.

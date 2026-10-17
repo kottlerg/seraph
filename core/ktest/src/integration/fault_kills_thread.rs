@@ -15,7 +15,8 @@
 //!   2. The parent polls the child's kernel-authoritative lifecycle state via
 //!      `cap_info(CAP_INFO_THREAD_STATE)` until it reports `Exited`.
 //!   3. The recorded exit reason must be `EXIT_FAULT_BASE + <fault vector>`
-//!      (`#PF` = 14 on x86-64; store/AMO page fault = 15 on RISC-V).
+//!      (`crate::arch::PAGE_FAULT_STORE_VECTOR`: `#PF` on x86-64, the
+//!      store/AMO page fault on RISC-V).
 //!
 //! Beyond confirming the kill path, the bounded poll guards against a
 //! mis-classification that would treat an unmapped address as spurious and
@@ -30,12 +31,6 @@ use crate::{ChildStack, TestContext, TestResult};
 /// A user VA that no test maps — canonical in every paging mode (below the
 /// 2^38 Sv39 user half), well clear of every other test's mappings.
 const WILD_VA: u64 = 0x3E_0000_0000;
-
-/// Fault vector recorded in `exit_reason` for a not-present store.
-#[cfg(target_arch = "x86_64")]
-const FAULT_VECTOR: u64 = 14; // #PF
-#[cfg(target_arch = "riscv64")]
-const FAULT_VECTOR: u64 = 15; // store/AMO page fault
 
 /// Poll bound: at ~1 ms per `thread_sleep(1)`, ~2 s before declaring the child
 /// never faulted. Comfortably above any scheduling latency on a busy SMP run.
@@ -52,7 +47,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, fault_child, stack_top, 0)
         .map_err(|_| "integration::fault_kills_thread: configure_and_start failed")?;
 
-    let expected = EXIT_FAULT_BASE + FAULT_VECTOR;
+    let expected = EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR;
     let mut polls = 0;
     loop
     {

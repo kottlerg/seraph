@@ -909,17 +909,21 @@ pub fn set_name(_name: &CStr) {
 }
 
 pub fn sleep(dur: Duration) {
-    // A stop and restart of this thread ends a sleep early with `Interrupted`;
-    // sleep again for whatever remains of `dur`. Any other error ends the
-    // sleep early, as `sleep` has no way to report it.
+    // `thread_sleep` can end before `dur` elapses: a stop and restart of this
+    // thread returns `Interrupted`, and a full kernel sleep list returns
+    // `OutOfMemory`. `sleep` cannot report either and must never sleep less
+    // than `dur`, so every error retries for whatever remains; an error other
+    // than `Interrupted` yields first so a full sleep list can drain rather
+    // than spinning on the syscall. Only a kernel-completed sleep returns.
     let start = crate::time::Instant::now();
     let mut left = dur;
     loop {
         // Round up to whole ms so a sub-ms sleep (or remainder) still sleeps.
         let ms = u64::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
         match syscall::thread_sleep(ms) {
+            Ok(()) => return,
             Err(e) if e == SyscallError::Interrupted as i64 => {}
-            _ => return,
+            Err(_) => yield_now(),
         }
         match dur.checked_sub(start.elapsed()) {
             Some(rest) if !rest.is_zero() => left = rest,

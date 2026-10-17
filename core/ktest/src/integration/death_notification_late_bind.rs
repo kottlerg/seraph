@@ -41,12 +41,6 @@ use crate::{ChildStack, TestContext, TestResult};
 /// two never share a mapping.
 const WILD_VA: u64 = 0x3E_6000_0000;
 
-/// Fault vector recorded in `exit_reason` for a not-present store.
-#[cfg(target_arch = "x86_64")]
-const FAULT_VECTOR: u64 = 14; // #PF
-#[cfg(target_arch = "riscv64")]
-const FAULT_VECTOR: u64 = 15; // store/AMO page fault
-
 /// Distinct, non-zero correlators so a dropped or misrouted event surfaces as
 /// a wrong high word rather than a coincidental zero.
 const CORR_CLEAN: u32 = 0x1111;
@@ -71,7 +65,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     late_bind_after_death(ctx, clean_exit_child, CORR_CLEAN, 0)?;
 
     // Scenario 2: fault, bind after death.
-    late_bind_after_death(ctx, fault_child, CORR_FAULT, EXIT_FAULT_BASE + FAULT_VECTOR)?;
+    late_bind_after_death(
+        ctx,
+        fault_child,
+        CORR_FAULT,
+        EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR,
+    )?;
 
     // Scenario 3: negative control — bind before start fires exactly once.
     bind_before_start_fires_once(ctx)?;

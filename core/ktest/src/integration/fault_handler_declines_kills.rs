@@ -33,12 +33,6 @@ const RESERVED_VA: u64 = 0x3E_5000_0000;
 /// Badge bound with the handler and delivered in the fault message.
 const FAULT_BADGE: u64 = 0xC0FF_EE03;
 
-/// Fault vector recorded in `exit_reason` for a not-present store.
-#[cfg(target_arch = "x86_64")]
-const FAULT_VECTOR: u64 = 14; // #PF
-#[cfg(target_arch = "riscv64")]
-const FAULT_VECTOR: u64 = 15; // store/AMO page fault
-
 /// Poll bound: ~2 s at ~1 ms per `thread_sleep(1)` before declaring failure.
 const MAX_POLLS: u32 = 2000;
 
@@ -72,7 +66,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // The declined fault is terminal: the child must reach Exited with the
     // standard fault exit reason.
-    let expected = EXIT_FAULT_BASE + FAULT_VECTOR;
+    let expected = EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR;
     let mut polls = 0;
     loop
     {

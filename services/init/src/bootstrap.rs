@@ -1671,6 +1671,10 @@ pub fn bootstrap_procmgr(
 /// `_start` calls `heap_bootstrap` which depends on memmgr being live.
 pub fn start_procmgr(pm: &ProcmgrBootstrap)
 {
-    let _ = crate::start_thread(pm.thread);
+    if crate::start_thread(pm.thread).is_err()
+    {
+        log("init: FATAL: cannot start procmgr");
+        syscall::thread_exit();
+    }
     log("procmgr started");
 }

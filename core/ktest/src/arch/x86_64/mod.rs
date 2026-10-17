@@ -20,6 +20,10 @@ mod syscall_rflags_hardening;
 
 use crate::TestContext;
 
+/// Exception vector a not-present user store faults with (`#PF`), as recorded
+/// in `EXIT_FAULT_BASE + <vector>` when the fault kills the thread.
+pub const PAGE_FAULT_STORE_VECTOR: u64 = 14;
+
 /// Run every x86-64-specific Tier 1 test.
 pub fn run_unit(ctx: &TestContext)
 {

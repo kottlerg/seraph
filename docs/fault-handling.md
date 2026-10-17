@@ -61,7 +61,8 @@ Not yet implemented (this section is narrowed as each part lands):
 - **Active unbind/rebind cancellation.** Clearing or rebinding a handler governs *future*
   faults; it does not yet actively cancel a fault already in flight on the affected thread.
   An in-flight fault is still resolved by the handler's reply, handler-thread death, a later
-  receive on the handler thread while the fault reply is pending, the faulting thread being
+  receive on the handler thread while the fault reply is pending (a receive that passes its
+  capability and headroom checks; [Liveness](#liveness) rule 2), the faulting thread being
   stopped or destroyed, or the handler endpoint being destroyed (all implemented). The
   remaining trigger — the binding being cleared mid-fault — is the only
   [Kill](#delivery-resume-and-kill) path not yet wired.
@@ -190,9 +191,9 @@ it resumes by re-executing its faulting instruction, not by returning a value.
   instruction now succeeds.
 - **Kill (cancellation).** If the binding is severed before a reply — the handler thread dies, the
   binding is cleared (design intent; not yet implemented, #242), the thread is stopped, or the
-  handler thread receives again while the fault reply is still pending
-  ([IPC Design](ipc-design.md#the-callreply-model)) — the faulting thread is killed, exactly as an
-  unhandled fault. It is never resumed with a spurious value.
+  handler thread receives again while the fault reply is still pending, with a receive that passes
+  its capability and headroom checks ([Liveness](#liveness) rule 2) — the faulting thread is
+  killed, exactly as an unhandled fault. It is never resumed with a spurious value.
 
 ### Modifying the faulting thread
 
@@ -227,8 +228,7 @@ The kernel ignores reply data words. The reply **label** conveys disposition:
 2. Handler-thread death releases any fault-blocked thread awaiting that handler, killing it
    (the [Kill](#delivery-resume-and-kill) path), as does a later receive on the handler thread
    while the fault-blocked thread's reply is still pending (a receive that passes its capability
-   and headroom checks; see [IPC Design](ipc-design.md#the-callreply-model) § The Call/Reply
-   Model).
+   and headroom checks; see [IPC Design](ipc-design.md#the-callreply-model)).
 3. A faulting thread blocked on a handler endpoint that has not yet received is released if
    that endpoint is destroyed.
 4. Handler death is a system-level failure. Clients block on their next fault until a

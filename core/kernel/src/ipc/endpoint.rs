@@ -411,11 +411,14 @@ pub unsafe fn endpoint_call(
 /// never replied to.
 ///
 /// The swap of `reply_tcb` to null is the episode claim, competing as any
-/// reply-slot claim does with `cancel_ipc_block`, the `dealloc_object(Thread)`
-/// client and server arms, and the commit-failure rollbacks (`endpoint_reply`
-/// and the `SYS_IPC_REPLY` failure-path swap run only on this thread). On a win the caller's call fails with `Interrupted`, or a
-/// fault-blocked caller is killed, and the caller is woken; the
-/// `wake_in_flight` pin set at bind keeps it alive until that wake clears it.
+/// reply-slot claim does with `cancel_ipc_block` and the
+/// `dealloc_object(Thread)` client and server arms. The other claimants
+/// cannot run meanwhile: `endpoint_reply`, the `SYS_IPC_REPLY` failure-path
+/// swap and `endpoint_recv`'s rebind rollback run on this thread, and
+/// `endpoint_call`'s rollback only while this server is parked. On a win the
+/// caller's call fails with `Interrupted`, or a fault-blocked caller is
+/// killed, and the caller is woken; the `wake_in_flight` pin set at bind
+/// keeps it alive until that wake clears it.
 ///
 /// # Safety
 /// `server` must be the running thread's valid TCB. Call with no scheduler

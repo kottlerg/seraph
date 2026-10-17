@@ -213,10 +213,11 @@ pub enum SyscallError
     /// A blocking operation was cancelled: the thread was stopped, the object
     /// it was blocked on was destroyed, or, for a call, the server received
     /// again without replying. The thread sees this as the return value of its
-    /// blocked syscall. Batched capability operations (revoke, delete, move, a
-    /// range split) also return it at their liveness backstop; each syscall's
-    /// entry in core/kernel/docs/syscalls.md gives the state the backstop
-    /// leaves.
+    /// blocked syscall. `SYS_THREAD_START` also returns it when its caller is
+    /// stopped while the start waits for the target to settle (nothing is
+    /// started). Batched capability operations (revoke, delete, move, a range
+    /// split) also return it at their liveness backstop; each syscall's entry
+    /// in core/kernel/docs/syscalls.md gives the state the backstop leaves.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full). Unlike `OutOfMemory`, donating memory (augment
@@ -2194,7 +2195,8 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   first. `SYS_IPC_CALL` and `SYS_IPC_RECV` queued on an endpoint,
   `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and `SYS_WAIT_SET_WAIT` also return `Interrupted`
   when the object waited on is destroyed under the caller, and `SYS_IPC_CALL` returns it when the
-  receiving thread receives again before replying.
+  receiving thread receives again before replying. `SYS_THREAD_START` returns `Interrupted` when
+  its caller is stopped while the start waits for the target to settle; nothing is started.
 
 ---
 

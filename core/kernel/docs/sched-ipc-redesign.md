@@ -333,15 +333,17 @@ each change; the binding statement of the resulting invariants is
 
 These race fixes are independent of the lock and landed in the same migration
 (each a verified-reachable race):
-- **B (dealloc double-wakes):** the IPC dealloc arms (`event_queue_drop`,
-  Notification dealloc and endpoint dealloc drain in `cap/object.rs`) snapshot the
-  waiter and set `wake_in_flight` under the source lock (`eq`/`sig`/`ep`) before
-  `enqueue_and_wake` — the discipline `notification_send`/`event_queue_post`
-  already use. (`event_queue_drop`'s old "under eq.lock" comment was a lie — no
-  lock was held; it now takes `eq.lock`. The endpoint drain holds `ep.lock` across
-  the per-waiter `enqueue_and_wake` walk, which is sound because
-  `ep.lock → sched_lock → run-queue` is the canonical order;
-  [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy.)
+- **B (dealloc double-wakes):** the IPC dealloc arms claim each waiter (set
+  `wake_in_flight`) under the source lock before `enqueue_and_wake` — the
+  discipline `notification_send`/`event_queue_post` already use. With multi-waiter
+  queues, the Notification dealloc arm in `cap/object.rs`, `event_queue_drop`, and
+  `wait_set_drop` drain every waiter through `interrupt_all_waiters`, which claims
+  each, stamps its park `Interrupted`, and wakes it while still holding the source
+  lock (`sig`/`eq`/`ws`). (`event_queue_drop`'s old "under eq.lock" comment was a
+  lie — no lock was held; it now takes `eq.lock`.) The endpoint dealloc drain
+  likewise holds `ep.lock` across its per-waiter `enqueue_and_wake` walk. Both are
+  sound because `source lock → sched_lock → run-queue` is the canonical order;
+  [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy rule 5.
 - **C (sleep-list UAF/lost-wake):** `dealloc_object(Thread)` calls
   `sleep_list_remove(tcb)` before free (no such call existed before — a killed
   plain sleeper left a dangling pointer the next timer tick dereferenced), placed

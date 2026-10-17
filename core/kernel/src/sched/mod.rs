@@ -387,10 +387,10 @@ pub const SPIN_SITE_START_SETTLE: u32 = 7;
 /// first of which `stop_threads_bound_to`'s phase-2 spin shares), the
 /// `dealloc_object(AddressSpace)` root-free gate, the timer-dispatch gate the
 /// Notification, `EventQueue`, and Thread dealloc arms share, the
-/// `sys_thread_start` owed-wake gate, and the `schedule()` context-saved
-/// dispatch barrier — the protocol spins that can wedge a CPU
-/// silently (the `sys_thread_stop` drain carries its own overlong-duration
-/// warning). Diagnostic-only — never gates control flow.
+/// `sys_thread_start` settle loop (`start_under_all_locks`), and the
+/// `schedule()` context-saved dispatch barrier — the protocol spins that can
+/// wedge a CPU silently (the `sys_thread_stop` drain carries its own
+/// overlong-duration warning). Diagnostic-only — never gates control flow.
 #[cfg(not(test))]
 static SPIN_SITE: [core::sync::atomic::AtomicU32; MAX_CPUS] =
     [const { core::sync::atomic::AtomicU32::new(SPIN_SITE_NONE) }; MAX_CPUS];
@@ -2513,9 +2513,10 @@ pub enum StartCommit
 ///
 /// The loop ends without writing when the target is no longer `Created` or
 /// `Stopped` ([`StartCommit::Refused`]: a concurrent start resumed it, or it
-/// is `Exited`), and when the calling thread is itself stopped
-/// ([`StartCommit::CallerStopped`]), so a start never spins on a thread that
-/// is running again, and never blocks the stop of its own caller. It runs
+/// is `Exited`), and when a pass that must wait finds the calling thread
+/// itself stopped ([`StartCommit::CallerStopped`]; read under the caller's
+/// `sched_lock`), so a start never spins on a thread that is running again,
+/// and never blocks the stop of its own caller. It runs
 /// preempt-disabled with interrupts enabled (the #207 envelope); spin site
 /// `start:settle`.
 ///
@@ -2538,19 +2539,20 @@ pub unsafe fn start_under_all_locks(
     unsafe { crate::arch::current::interrupts::enable() };
     spin_site_enter(SPIN_SITE_START_SETTLE);
     let mut prodded: Option<usize> = None;
-    let outcome = loop
-    {
-        // SAFETY: caller is the running thread; a stop commits its state
-        // under every scheduler lock, and the volatile read re-reads it on
-        // each pass.
-        let caller_state = unsafe { core::ptr::read_volatile(&raw const (*caller).state) };
-        if matches!(
-            caller_state,
+    // Read under the caller's own sched_lock, which every stop or teardown
+    // commit of it holds.
+    // SAFETY: caller is the running thread's valid TCB; lock_raw paired.
+    let caller_stopped = || unsafe {
+        let f = (*caller).sched_lock.lock_raw();
+        let state = (*caller).state;
+        (*caller).sched_lock.unlock_raw(f);
+        matches!(
+            state,
             thread::ThreadState::Stopped | thread::ThreadState::Exited
         )
-        {
-            break StartCommit::CallerStopped;
-        }
+    };
+    let outcome = loop
+    {
         // SAFETY: tcb valid per contract; state is written under sched_lock,
         // and the pin and save flag are atomics.
         let (state, owed, saved) = unsafe {
@@ -2579,19 +2581,22 @@ pub unsafe fn start_under_all_locks(
             is_current
         });
         if let Some(cpu) = running_on
+            && prodded != Some(cpu)
         {
-            if prodded != Some(cpu)
-            {
-                // SAFETY: cpu < cpu_count; the caller is running here, so a
-                // `Stopped` target current elsewhere is on a remote CPU.
-                unsafe { prod_remote_cpu(cpu) };
-                prodded = Some(cpu);
-            }
-            core::hint::spin_loop();
-            continue;
+            // SAFETY: cpu < cpu_count; the caller is running here, so a
+            // `Stopped` target current elsewhere is on a remote CPU.
+            unsafe { prod_remote_cpu(cpu) };
+            prodded = Some(cpu);
         }
-        if owed || !saved
+        // Only a pass that must wait checks the caller: a target that is
+        // already settled is committed even if a stop of the caller is in
+        // flight, as any syscall completes before its thread deschedules.
+        if running_on.is_some() || owed || !saved
         {
+            if caller_stopped()
+            {
+                break StartCommit::CallerStopped;
+            }
             core::hint::spin_loop();
             continue;
         }
@@ -2611,6 +2616,7 @@ pub unsafe fn start_under_all_locks(
             Some(StateCommit::Committed(_)) => break StartCommit::Committed(seq),
             Some(_) => break StartCommit::Refused,
             // Unsettled again under the locks; take another pass.
+            None if caller_stopped() => break StartCommit::CallerStopped,
             None =>
             {}
         }

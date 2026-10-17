@@ -8,7 +8,8 @@
 //! Covers: `SYS_THREAD_CONFIGURE`, `SYS_THREAD_START`, `SYS_THREAD_STOP`,
 //! `SYS_THREAD_YIELD`, `SYS_THREAD_EXIT`, `SYS_THREAD_READ_REGS`,
 //! `SYS_THREAD_WRITE_REGS`, `SYS_THREAD_SET_PRIORITY`,
-//! `SYS_THREAD_SET_AFFINITY`.
+//! `SYS_THREAD_SET_AFFINITY`, `SYS_THREAD_SLEEP`,
+//! `SYS_THREAD_BIND_NOTIFICATION`.
 //!
 //! `SYS_THREAD_EXIT` is exercised implicitly — every child thread entry
 //! function calls `thread_exit()`.
@@ -1011,7 +1012,6 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
 ///
 /// Each spinner publishes its current CPU into `BALANCE_OBSERVED_CPU[i]`
 /// on every loop iteration and exits when `BALANCE_SHOULD_EXIT` is set.
-#[allow(clippy::cast_possible_truncation)]
 fn balance_spawn_spinners(
     ctx: &TestContext,
     n: usize,
@@ -1033,6 +1033,9 @@ fn balance_spawn_spinners(
         // Initial pinning to `initial_cpu` forces the first enqueue there.
         // SAFETY: per-spinner stack slot, no aliasing.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(STACK_BALANCE_SPINNERS[i]) });
+        // cast_possible_truncation: `i` is below `BALANCE_MAX_SPINNERS` (8), so
+        // the cast is exact on any pointer width.
+        #[allow(clippy::cast_possible_truncation)]
         let arg = (i as u64) << 32 | u64::from(child_sig);
         crate::spawn::configure_and_start_pinned(
             &child,

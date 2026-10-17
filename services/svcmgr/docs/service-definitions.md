@@ -84,7 +84,12 @@ spawns:
   per token, and holds at most 255 tokens (the label's 8-bit count fields);
 * together, the message body — one file-size word, the argv words, one
   env-length word, and the env words — is at most `MSG_DATA_WORDS_MAX` (64)
-  eight-byte words, so argv and env cannot both fill `ARGS_BLOB_MAX`.
+  eight-byte words, so argv and env cannot both fill `ARGS_BLOB_MAX`;
+* no token contains a NUL byte: the blob is NUL-delimited, so an embedded
+  NUL would add a string boundary the label's count does not carry and the
+  child would see a different split. The parser rejects such a line as
+  `InvalidValue`, the same input `std::process::Command` rejects with
+  `InvalidInput`.
 
 ## `restart`
 

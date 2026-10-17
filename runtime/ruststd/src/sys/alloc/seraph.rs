@@ -669,8 +669,9 @@ fn slab_round_to_class(bytes: u64) -> u64 {
 /// to the first returned cap (any cap unblocks sub-page retypes; a too-small
 /// cap simply means the next page-sized retype request triggers a refresh).
 ///
-/// Returns `Some((slot, pages, phys))` on success, `None` on IPC failure or
-/// empty reply. `phys` is the chosen cap's physical base, which memmgr reports
+/// Returns `Some((slot, pages, phys))` on success, `None` on IPC failure, an
+/// empty reply, or a reply whose declared count is not backed by its caps
+/// and data words. `phys` is the chosen cap's physical base, which memmgr reports
 /// at `data[1 + returned + i]`; the caller passes it to [`slab_release_fresh`]
 /// to return the run to memmgr's pool mid-life. Also used by the pipe
 /// machinery (`sys::pipe`) for ring pages, which need the phys base so the
@@ -686,11 +687,14 @@ pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u
     if reply.label != 0 {
         return None;
     }
-    let returned = reply.word(0) as usize;
-    if returned == 0 {
+    let caps = reply.caps();
+    // The count is wire input: bound it by the caps actually transferred
+    // and by the words actually delivered (one page count and one phys base
+    // per cap after the count word) before it indexes either.
+    let returned = (reply.word(0) as usize).min(caps.len());
+    if returned == 0 || 1 + 2 * returned > reply.word_count() {
         return None;
     }
-    let caps = reply.caps();
     // Reply layout: data[1+i] = page_count_i, data[1+returned+i] = phys_base_i.
     // Prefer the first cap that already covers `min_pages`.
     for i in 0..returned {

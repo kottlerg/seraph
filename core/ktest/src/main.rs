@@ -35,6 +35,7 @@ mod integration;
 mod serial;
 mod spawn;
 mod stress;
+mod tally;
 mod unit;
 
 #[cfg(target_arch = "x86_64")]

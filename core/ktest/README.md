@@ -37,9 +37,9 @@ which live under `src/arch/<arch>/` (see below).
 selected by `target_arch` in `src/arch/mod.rs`, each exposing the same
 entry points and constants. Tier 1 reaches the tests behind it through
 `crate::arch::run_unit` and Tier 2 through `crate::arch::run_integration`;
-arch-neutral tests take the vectors a not-present user store and an illegal
-instruction fault with from `crate::arch::PAGE_FAULT_STORE_VECTOR` and
-`crate::arch::ILLEGAL_INSTRUCTION_VECTOR`, raise the latter through
+arch-neutral tests take the vector of a not-present user store from
+`crate::arch::PAGE_FAULT_STORE_VECTOR` and that of an illegal-instruction
+fault from `crate::arch::ILLEGAL_INSTRUCTION_VECTOR`, raise the latter through
 `crate::arch::illegal_instruction`, and take the kernel `TrapFrame`'s size and
 instruction-pointer offset from `crate::arch::TRAP_FRAME_BYTES` and
 `crate::arch::IP_OFFSET`.
@@ -153,25 +153,26 @@ in `stress/mod.rs` mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
 | `cap_tree_deep.rs` | 8-level derivation chain with cascading revocation | `CHAIN_DEPTH=8`, `PASSES=500` |
 | `cspace_recycle.rs` | Repeated `CSpace` create+delete past the live-count bound (free-list recycling) | `ITERATIONS=10_000` |
 | `event_queue_fill_drain.rs` | Fill/drain cycles on a capacity-8 queue (ring buffer wrap-around) | `CAPACITY=8`, `CYCLES=2000` |
-| `idle_wake_race.rs` | Race wake of an idle CPU with concurrent ready-queue entry under affinity migration | `ITERATIONS=50_000` |
+| `idle_wake_race.rs` | Race wake of an idle CPU with concurrent ready-queue entry under affinity migration (≥ 2 CPUs) | `ITERATIONS=50_000` |
 | `thread_churn.rs` | Rapid thread create/destroy cycles (TCB and CSpace cleanup) | `ITERATIONS=1000` |
 | `cap_delete_running.rs` | Delete capabilities while child threads actively spin | `NUM_CHILDREN=16` |
-| `cap_delete_reply_wake.rs` | `cap_delete` of a server a client is `BlockedOnReply` on must wake that client (#351, the dealloc deferred reply-wake liveness invariant) | `CYCLES=2000` |
+| `cap_delete_reply_wake.rs` | `cap_delete` of a server a client is `BlockedOnReply` on must wake that client (#351, the dealloc deferred reply-wake liveness invariant) (≥ 2 CPUs) | `CYCLES=2000` |
 | `priority_dealloc_race.rs` | Race `sys_thread_set_priority` against `cap_delete(Thread)` and affinity-driven migration (covers Scheduling-group all-locks discipline) | `NUM_WORKERS=16`, `CYCLES=200` |
-| `stop_reply_race.rs` | Race `thread_stop` on a reply-blocked client against `cap_delete` of the server it is parked on (#317 cross-CPU UAF) | `CYCLES=300` |
-| `stop_resume_race.rs` | Race `thread_stop` against a concurrent `thread_start` (resume) on a `Running` pinned victim across three CPUs (stop-drain liveness) | `CYCLES=256` |
+| `stop_reply_race.rs` | Race `thread_stop` on a reply-blocked client against `cap_delete` of the server it is parked on (#317 cross-CPU UAF) (≥ 2 CPUs) | `CYCLES=300` |
+| `stop_resume_race.rs` | Race `thread_stop` against a concurrent `thread_start` (resume) on a `Running` pinned victim across three CPUs (stop-drain liveness) (≥ 3 CPUs) | `CYCLES=256` |
 | `stop_sleep_window.rs` | Stop and restart a thread looping `thread_sleep(1)` on the timer CPU, so stops land around the park commit, the sleep-list add, and the timer's claim; each sleep returns `Ok` or `Interrupted` (≥ 2 CPUs) | `CYCLES=2000` |
 | `stop_park_race.rs` | Stop and restart a peer entering a notification wait, an IPC call, or a sleep; each park returns its genuine result or `Interrupted`, and every kind sees a cancellation (≥ 2 CPUs) | `CYCLES=150`, `SLEEP_MS=2` |
 | `stop_owed_wake.rs` | Stop and restart a notification waiter while a sender keeps claiming its wait (each round waits, bounded by `ENTRY_WAIT_US`, for the restarted waiter to enter a wait), alone and then (4+ CPUs) with a starter racing every restart, itself stopped and restarted by the controller every `STARTER_STOP_PERIOD` rounds; every wait returns bits or `Interrupted` and both occur; every start succeeds or returns `InvalidArgument` (or, for the starter's, `Interrupted`, tallied but not required), none returns `InvalidArgument` while the controller is alone, and with the starter racing it wins some restarts and its wins equal the controller's losses (one committed start per stop, none from an interrupted start); the kernel's wait-queue and owed-wake assertions hold (≥ 2 CPUs; the racing phase needs 4) | `CYCLES=2000` per phase, `STARTER_STOP_PERIOD=16` |
 | `stop_fault_sender.rs` | Stop and restart a thread faulting in a loop while its fault handler dequeues each fault from the send queue and replies `RESUME`; a stop that cancels a fault no reply claimed kills the faulter by design, and every `RESUME` reply that returned `Ok` must be honoured: the completed faults equal the `Ok` replies (#443; ≥ 3 CPUs) | `CYCLES=1000` |
-| `mutual_stop.rs` | Two children holding each other's Thread cap stop and restart each other in a loop while the controller restarts whichever pair a mutual stop left stopped; both must exit voluntarily, both must make progress, every stop and start must return an accepted result, and per direction the `Ok` stops equal the `Ok` starts (needs ≥ 3 CPUs; on the unfixed kernel the first mutual stop wedges both CPUs) | `CYCLES=200` |
-| `stop_repark.rs` | Stop and restart a waiter alternating between two notifications, then two event queues, while a sender delivers to whichever it is parked on, so a stop's cancellation races a wake that re-parks the waiter on the other source; every wait returns its own source's result or `Interrupted`, deliveries on both sources are consumed during and after the rounds, and some stop interrupts a wait (needs ≥ 2 CPUs) | `CYCLES=1000` per phase |
+| `mutual_stop.rs` | Two children holding each other's Thread cap stop and restart each other in a loop while the controller restarts whichever pair a mutual stop left stopped; both must exit voluntarily, both must make progress, every stop and start must return an accepted result, per direction the `Ok` stops equal the `Ok` starts, and some round must find both stopped (the witness of a mutual stop) (needs ≥ 3 CPUs; on the unfixed kernel the first mutual stop wedges both CPUs) | `CYCLES=200` |
+| `stop_repark.rs` | Stop and restart a waiter alternating between two notifications, then two event queues, while a sender delivers to whichever it is parked on, so a stop's cancellation races a wake that re-parks the waiter on the other source; every wait returns its own source's result or `Interrupted`, deliveries on both sources are consumed during and after the rounds, and some stop interrupts a wait (needs ≥ 3 CPUs) | `CYCLES=1000` per phase |
+| `stop_claimed_delete.rs` | Each round parks a fresh waiter on a fresh notification, then event queue, while a sender serves each wait it enters; the controller stops the waiter around the sender's claim of its park, waits the sender out, deletes the source's last capability, then the stopped waiter's Thread capability (the delete that walked the freed source through the binding a lost cancel left for its waker); every wait returns the delivery or `Interrupted`, every live delivery succeeds, deliveries are consumed, and some stop lands on a waiter inside a wait (the claimed-then-stopped interleaving is reached statistically; the kernel's debug assertions are the tripwires) (≥ 3 CPUs) | `CYCLES=1000` per phase |
 | `timed_wait_source_delete.rs` | Destroy a notification or event queue around a timed waiter's deadlines; each wait ends in a timeout, `Interrupted`, or `InvalidCapability` (≥ 2 CPUs) | `CYCLES=200`, `WAIT_MS=1` |
 | `timed_waiter_thread_delete.rs` | Delete a timed waiter's last Thread cap around its deadlines (plain sleep, notification, event queue) (≥ 2 CPUs) | `CYCLES=192`, `WAIT_MS=1` |
 | `timed_wait_reuse.rs` | A timed wait claimed by a delivery at its deadline, followed by an untimed wait on the same source: the untimed wait never returns a timeout (≥ 2 CPUs) | `CYCLES=400`, `WAIT_MS=1` |
 | `double_enqueue_storm.rs` | Run-queue double-link guard regression (#244): wake + priority + affinity churn, then wake racing `cap_delete(Thread)` | `NUM_WORKERS=32`, `CYCLES=600` |
-| `event_try_recv_post_race.rs` | A non-blocking `SYS_EVENT_RECV` try-once racing a concurrent `event_post` must never leave the poller wakeable (#352) | `CYCLES=1024` |
-| `load_balance_handoff_steal.rs` | Arm the load-balancer mid-handoff steal (#314/#293): unpinned IPC clients vs round-robin-pinned servers expose `pull_unpinned_ready` stealing a `context_saved == 0` thread | `NUM_PAIRS=16`, `ITERS=16000` |
+| `event_try_recv_post_race.rs` | A non-blocking `SYS_EVENT_RECV` try-once racing a concurrent `event_post` must never leave the poller wakeable (#352) (≥ 2 CPUs) | `CYCLES=1024` |
+| `load_balance_handoff_steal.rs` | Arm the load-balancer mid-handoff steal (#314/#293): unpinned IPC clients vs round-robin-pinned servers expose `pull_unpinned_ready` stealing a `context_saved == 0` thread (≥ 2 CPUs) | `NUM_PAIRS=16`, `ITERS=16000` |
 | `concurrent_notification.rs` | Multiple threads sending distinct bits to one notification simultaneously | `NUM_SENDERS=64`, `SEND_ITERATIONS=5000` |
 | `concurrent_ipc.rs` | Multiple callers racing on one endpoint (send-queue safety) | `NUM_CALLERS=64`, `CYCLES=200` |
 | `cap_revoke_under_use.rs` | Revoke root while child threads actively send on derived caps | `NUM_CHILDREN=64` |
@@ -205,7 +206,8 @@ cycle counts; no PASS/FAIL verdict.
 
 ## Test infrastructure
 
-Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`):
+Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` items in
+`src/tally.rs`):
 
 - `TestResult` — `Result<(), &'static str>` — no heap, no allocation.
 - `run_test!(name, body)` — macro that logs the test name, runs `body`,
@@ -237,6 +239,14 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`):
   whether a thread's `CAP_INFO_THREAD_STATE` reports `Exited`, poll it until
   it does, or poll a Memory cap's available bytes until they return to a
   baseline; the way a test observes a deferred (off-CPU) reclaim completing.
+- `tally::BadTally` — a count of the results a stress cell's children
+  recorded as bad, with the last such result word; a child cannot return a
+  `TestResult`, so the cell's report `check`s each tally (logging the count
+  and the last result under the cell's name) once the rounds are over.
+  `tally::log_error(label, error)` logs a syscall error word, and
+  `tally::recv_diag` is the diagnostic hook a cell's blocking receive loop
+  hands its `ipc::recv_guard::RecvGuard`
+  ([docs/ipc-design.md](../../docs/ipc-design.md) § Receive-Failure Policy).
 
 ## Compile-time options
 

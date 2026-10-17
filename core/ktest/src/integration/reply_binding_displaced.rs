@@ -225,7 +225,7 @@ fn phases(ctx: &TestContext, parts: &mut Parts) -> TestResult
     displace_fault(ctx, parts, &objects, acc)
 }
 
-/// Phase 1: receive A's call, receive B's call without replying to A, and
+/// Displaced call: receive A's call, receive B's call without replying to A, and
 /// check that A was released, B's reply arrives, and A stops and restarts.
 /// Returns the `done` bits collected.
 fn displace_call(
@@ -257,7 +257,7 @@ fn displace_call(
     Ok(acc)
 }
 
-/// Phase 2: receive a fault without replying, receive C's call, and check
+/// Displaced fault: receive a fault without replying, receive C's call, and check
 /// that the faulter was killed and C's reply arrives.
 fn displace_fault(ctx: &TestContext, parts: &mut Parts, objects: &Objects, acc: u64) -> TestResult
 {

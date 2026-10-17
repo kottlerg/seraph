@@ -19,8 +19,8 @@ Process startup in Seraph has two layers:
    userspace binary defines `main()`; `_start()` reads the handover struct,
    constructs a `StartupInfo`, and calls `main()`. std-built services use an
    idiomatic `fn main()` that reaches the caps via `std::os::seraph::startup_info()`.
-   procmgr, init, and ktest run on bespoke runtimes and take `&StartupInfo`
-   directly.
+   init, ktest, and memmgr run on bespoke runtimes and take `&StartupInfo`
+   directly (see [`main()` Signature](#main-signature)).
 
 Both layers are defined in this crate. Init is a special case: its handover
 struct is `InitInfo` (from [`abi/init-protocol`](../init-protocol/README.md)),
@@ -60,7 +60,9 @@ field groups rather than mirroring every field, so the two cannot drift. As of
   `tls_template_memsz`, `tls_template_align`.
 - **argv / env blobs** — `args_offset`, `args_bytes`, `args_count`,
   `env_offset`, `env_bytes`, `env_count` (blobs are written into the same page
-  after the fixed struct, bounded by the page remainder).
+  after the fixed struct; the bound is the wire limit, `ipc::ARGS_BLOB_MAX`
+  per blob and argv plus env within `MSG_DATA_WORDS_MAX`, and procmgr degrades
+  an oversize blob to empty).
 - **Namespace** — `system_root_cap`, `current_dir_cap`.
 - **Logging** — `log_send_cap` (deprecated; migrating to `service_registry_cap`).
 - **Main-thread layout** — `stack_top_vaddr`, `stack_pages`, `main_tls_vaddr`

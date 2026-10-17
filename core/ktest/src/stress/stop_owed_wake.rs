@@ -61,7 +61,7 @@
 //!
 //! Needs **≥ 2 CPUs**; the second phase needs **≥ 4** and is skipped below.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, notification_send,
@@ -70,7 +70,11 @@ use syscall::{
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
+use crate::tally::{BadTally, log_error};
 use crate::{ChildStack, TestContext, TestResult, spawn};
+
+/// This cell's name in log lines.
+const CELL: &str = "stress::stop_owed_wake";
 
 /// Stop/start rounds per phase.
 const CYCLES: u32 = 2000;
@@ -127,12 +131,9 @@ static INTERRUPTED: AtomicU32 = AtomicU32::new(0);
 /// error other than `InvalidArgument` (or, for the starter's, `Interrupted`),
 /// each with the last such result (a wait's bits or error, a send's or a
 /// start's error) for the failure report.
-static BAD_WAITS: AtomicU32 = AtomicU32::new(0);
-static BAD_WAIT_RESULT: AtomicU64 = AtomicU64::new(0);
-static BAD_SENDS: AtomicU32 = AtomicU32::new(0);
-static BAD_SEND_RESULT: AtomicU64 = AtomicU64::new(0);
-static BAD_STARTS: AtomicU32 = AtomicU32::new(0);
-static BAD_START_RESULT: AtomicU64 = AtomicU64::new(0);
+static BAD_WAITS: BadTally = BadTally::new();
+static BAD_SENDS: BadTally = BadTally::new();
+static BAD_STARTS: BadTally = BadTally::new();
 
 /// Which phases a run has: the controller alone, then (with
 /// [`RACE_MIN_CPUS`] or more) the starter racing it.
@@ -181,12 +182,13 @@ pub fn run(ctx: &TestContext) -> TestResult
         &STARVED_ROUNDS,
         &DELIVERED,
         &INTERRUPTED,
-        &BAD_WAITS,
-        &BAD_SENDS,
-        &BAD_STARTS,
     ]
     {
         counter.store(0, Ordering::Release);
+    }
+    for tally in [&BAD_WAITS, &BAD_SENDS, &BAD_STARTS]
+    {
+        tally.reset();
     }
 
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
@@ -230,19 +232,13 @@ pub fn run(ctx: &TestContext) -> TestResult
         "ktest: stress::stop_owed_wake first-phase interrupted=",
         u64::from(armed.interrupted),
     );
-    check_bad(
-        &BAD_WAITS,
-        Some(&BAD_WAIT_RESULT),
+    BAD_WAITS.check(
+        CELL,
         "stress::stop_owed_wake: a wait returned neither bits nor Interrupted",
     )?;
-    check_bad(
-        &BAD_SENDS,
-        Some(&BAD_SEND_RESULT),
-        "stress::stop_owed_wake: a send failed",
-    )?;
-    check_bad(
-        &BAD_STARTS,
-        Some(&BAD_START_RESULT),
+    BAD_SENDS.check(CELL, "stress::stop_owed_wake: a send failed")?;
+    BAD_STARTS.check(
+        CELL,
         "stress::stop_owed_wake: a start failed other than with InvalidArgument or Interrupted",
     )?;
     if armed.delivered == 0
@@ -286,26 +282,6 @@ fn check_race(race: &Race) -> TestResult
         );
     }
     Ok(())
-}
-
-/// Fail with `message` if `count` is non-zero, logging the count and, when
-/// recorded, the last offending result.
-fn check_bad(count: &AtomicU32, last: Option<&AtomicU64>, message: &'static str) -> TestResult
-{
-    let n = count.load(Ordering::Acquire);
-    if n == 0
-    {
-        return Ok(());
-    }
-    crate::log_u64("ktest: stress::stop_owed_wake bad count=", u64::from(n));
-    if let Some(last) = last
-    {
-        crate::log_u64(
-            "ktest: stress::stop_owed_wake last bad result=",
-            last.load(Ordering::Acquire),
-        );
-    }
-    Err(message)
 }
 
 /// Create the notification and the children (the waiter, the sender, and the
@@ -559,14 +535,6 @@ fn await_starter_idle() -> TestResult
     Err("stress::stop_owed_wake: the starter did not leave its last start")
 }
 
-/// Log a syscall error word after `label`.
-fn log_error(label: &str, error: i64)
-{
-    // cast_sign_loss: the raw error word is only logged.
-    #[allow(clippy::cast_sign_loss)]
-    crate::log_u64(label, error as u64);
-}
-
 /// Wait for every child to exit, waking the waiter until it does.
 fn await_exit(sig: u32) -> TestResult
 {
@@ -606,8 +574,7 @@ fn waiter_entry(arg: u64) -> !
                 // cast_sign_loss: the raw result word is only logged.
                 #[allow(clippy::cast_sign_loss)]
                 let word = other.unwrap_or_else(|e| e as u64);
-                BAD_WAIT_RESULT.store(word, Ordering::Release);
-                BAD_WAITS.fetch_add(1, Ordering::AcqRel);
+                BAD_WAITS.record(word);
             }
         }
     }
@@ -625,10 +592,7 @@ fn sender_entry(arg: u64) -> !
     {
         if let Err(e) = notification_send(sig, 1)
         {
-            // cast_sign_loss: the raw error word is only logged.
-            #[allow(clippy::cast_sign_loss)]
-            BAD_SEND_RESULT.store(e as u64, Ordering::Release);
-            BAD_SENDS.fetch_add(1, Ordering::AcqRel);
+            BAD_SENDS.record_error(e);
         }
         for _ in 0..64
         {
@@ -670,13 +634,7 @@ fn starter_entry(arg: u64) -> !
             {
                 STARTER_INTERRUPTED.fetch_add(1, Ordering::AcqRel);
             }
-            Err(e) =>
-            {
-                // cast_sign_loss: the raw error word is only logged.
-                #[allow(clippy::cast_sign_loss)]
-                BAD_START_RESULT.store(e as u64, Ordering::Release);
-                BAD_STARTS.fetch_add(1, Ordering::AcqRel);
-            }
+            Err(e) => BAD_STARTS.record_error(e),
         }
         STARTER_BUSY.store(0, Ordering::SeqCst);
     }

@@ -33,11 +33,11 @@
 //! Two phases, one per source kind: two notifications, then two event
 //! queues. A waiter pinned to CPU 1 loops: wait on A, wait on B, counting
 //! each wait it enters (the count's parity names the source) and each
-//! result. A sender, on CPU 2 (sharing CPU 0 with the controller at 2
-//! CPUs), serves each wait the waiter enters: it spins a varying delay, then
-//! delivers to that wait's source if the waiter is still in it (a wait a
-//! stop has already ended gets nothing, so a stale delivery does not keep
-//! the next wait on that source from parking). The controller, pinned to
+//! result. A sender, pinned to CPU 2, serves each wait the waiter enters: it
+//! spins a varying delay, then delivers to that wait's source unless the
+//! waiter has entered a later wait, so no wait is served twice (a stop may
+//! have ended the wait meanwhile; the delivery then stays on the source and
+//! the waiter's next wait on it consumes it). The controller, pinned to
 //! CPU 0, runs [`CYCLES`] rounds per phase: stop the waiter, spin a varying
 //! delay, restart it, wait until it enters its next wait (bounded by
 //! [`ENTRY_WAIT_US`]; a round that times out is tallied), and spin a varying
@@ -56,9 +56,11 @@
 //! onto a wait queue) are the tripwires for a live park's binding being
 //! cleared.
 //!
-//! Needs **≥ 2 CPUs**.
+//! Needs **≥ 3 CPUs**: at 2 the floor-priority sender would share CPU 0 with
+//! the controller, which it never preempts, so no delivery would be in
+//! flight while the controller stops the waiter.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
     cap_create_notification, cap_create_thread, cap_delete, event_post, event_queue_create,
@@ -67,7 +69,11 @@ use syscall::{
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
+use crate::tally::{BadTally, log_error};
 use crate::{ChildStack, TestContext, TestResult, spawn};
+
+/// This cell's log name.
+const CELL: &str = "stress::stop_repark";
 
 /// Stop/start rounds per phase.
 const CYCLES: u32 = 1000;
@@ -77,13 +83,14 @@ const CYCLES: u32 = 1000;
 const SOURCES: usize = 2;
 const CHILDREN: usize = 2;
 
-/// CPUs needed: the waiter's, and one the controller and sender share.
-const MIN_CPUS: u64 = 2;
+/// CPUs needed: one per participant, so the sender's deliveries run
+/// concurrently with the controller's stops.
+const MIN_CPUS: u64 = 3;
 
-/// The controller's and the waiter's CPUs; the sender takes CPU 2, or
-/// shares CPU 0 with the controller below 3 CPUs.
+/// The controller's, the waiter's, and the sender's CPUs.
 const CONTROLLER_CPU: u32 = 0;
 const WAITER_CPU: u32 = 1;
+const SENDER_CPU: u32 = 2;
 
 /// Stress stack indices of the waiter and the sender.
 const WAITER_STACK: usize = 0;
@@ -100,7 +107,7 @@ const VALUES: [u64; SOURCES] = [1 << 0, 1 << 1];
 
 /// Bound on the controller's wait, after each restart, for the waiter to
 /// enter its next wait, in microseconds, and the spins it waits busily
-/// before polling in 1 ms sleeps (which let a sender sharing its CPU run).
+/// before polling in 1 ms sleeps.
 const ENTRY_WAIT_US: u64 = 100_000;
 const ENTRY_SPINS: u32 = 100_000;
 
@@ -130,13 +137,10 @@ static WAITS_ENTERED: AtomicU32 = AtomicU32::new(0);
 /// `Interrupted` (cancelled by a stop).
 static DELIVERED: [AtomicU32; SOURCES] = [AtomicU32::new(0), AtomicU32::new(0)];
 static INTERRUPTED: [AtomicU32; SOURCES] = [AtomicU32::new(0), AtomicU32::new(0)];
-/// Waits that returned neither, and the sender's deliveries that failed,
-/// each with the last such result (a wait's value or error, a delivery's
-/// error) for the failure report.
-static BAD_WAITS: AtomicU32 = AtomicU32::new(0);
-static BAD_WAIT_RESULT: AtomicU64 = AtomicU64::new(0);
-static BAD_SENDS: AtomicU32 = AtomicU32::new(0);
-static BAD_SEND_RESULT: AtomicU64 = AtomicU64::new(0);
+/// Waits that returned neither (with the wait's value or error), and the
+/// sender's deliveries that failed (with the error).
+static BAD_WAITS: BadTally = BadTally::new();
+static BAD_SENDS: BadTally = BadTally::new();
 
 /// A phase's source kind.
 #[derive(Clone, Copy)]
@@ -188,13 +192,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "stress::stop_repark: system_info(CpuCount) failed")?;
     if cpus < MIN_CPUS
     {
-        crate::log("ktest: stress::stop_repark SKIP (need 2+ CPUs)");
+        crate::log("ktest: stress::stop_repark SKIP (need 3+ CPUs)");
         return Ok(());
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_repark: pin controller failed")?;
-    let sender_cpu = u32::try_from(2 % cpus).unwrap_or(0);
-    let result = phases(ctx, sender_cpu);
+    let result = phases(ctx);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_repark: restore controller affinity failed");
     result?;
@@ -202,7 +205,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 }
 
 /// Run one phase per source kind and check each.
-fn phases(ctx: &TestContext, sender_cpu: u32) -> TestResult
+fn phases(ctx: &TestContext) -> TestResult
 {
     for (kind, name) in [
         (
@@ -216,7 +219,7 @@ fn phases(ctx: &TestContext, sender_cpu: u32) -> TestResult
     ]
     {
         crate::log(name);
-        let seen = phase(ctx, kind, sender_cpu)?;
+        let seen = phase(ctx, kind)?;
         report(&seen)?;
     }
     Ok(())
@@ -242,16 +245,11 @@ fn report(seen: &Seen) -> TestResult
     {
         crate::log_u64(label, u64::from(value));
     }
-    check_bad(
-        &BAD_WAITS,
-        &BAD_WAIT_RESULT,
+    BAD_WAITS.check(
+        CELL,
         "stress::stop_repark: a wait returned neither its source's delivery nor Interrupted",
     )?;
-    check_bad(
-        &BAD_SENDS,
-        &BAD_SEND_RESULT,
-        "stress::stop_repark: a delivery by the sender failed",
-    )?;
+    BAD_SENDS.check(CELL, "stress::stop_repark: a delivery by the sender failed")?;
     if seen.delivered.contains(&0)
     {
         return Err(
@@ -266,46 +264,26 @@ fn report(seen: &Seen) -> TestResult
     Ok(())
 }
 
-/// Fail with `message` if `count` is non-zero, logging the count and the
-/// last offending result.
-fn check_bad(count: &AtomicU32, last: &AtomicU64, message: &'static str) -> TestResult
-{
-    let n = count.load(Ordering::Acquire);
-    if n == 0
-    {
-        return Ok(());
-    }
-    crate::log_u64("ktest: stress::stop_repark bad count=", u64::from(n));
-    crate::log_u64(
-        "ktest: stress::stop_repark last bad result=",
-        last.load(Ordering::Acquire),
-    );
-    Err(message)
-}
-
 /// One phase: create the sources and the children, run the rounds, pause
 /// the sender, run the final check, end the children, and release
 /// everything whatever the outcome. Returns what the rounds saw.
-fn phase(ctx: &TestContext, kind: Kind, sender_cpu: u32) -> Result<Seen, &'static str>
+fn phase(ctx: &TestContext, kind: Kind) -> Result<Seen, &'static str>
 {
-    for counter in [
-        &QUIT,
-        &SENDER_BUSY,
-        &EXITED,
-        &WAITS_ENTERED,
-        &BAD_WAITS,
-        &BAD_SENDS,
-    ]
-    .into_iter()
-    .chain(DELIVERED.iter())
-    .chain(INTERRUPTED.iter())
+    for counter in [&QUIT, &SENDER_BUSY, &EXITED, &WAITS_ENTERED]
+        .into_iter()
+        .chain(DELIVERED.iter())
+        .chain(INTERRUPTED.iter())
     {
         counter.store(0, Ordering::Release);
+    }
+    for tally in [&BAD_WAITS, &BAD_SENDS]
+    {
+        tally.reset();
     }
     SENDING.store(1, Ordering::SeqCst);
 
     let mut parts = Parts::default();
-    let result = setup(ctx, kind, sender_cpu, &mut parts).and_then(|()| {
+    let result = setup(ctx, kind, &mut parts).and_then(|()| {
         let waiter = parts.waiter.ok_or("stress::stop_repark: no waiter")?;
         let sources = sources_of(&parts)?;
         let ran = rounds(waiter);
@@ -330,7 +308,7 @@ fn phase(ctx: &TestContext, kind: Kind, sender_cpu: u32) -> Result<Seen, &'stati
 
 /// Create the two sources, publish the children's arguments, create the
 /// waiter and the sender in ktest's own `CSpace`, and start both.
-fn setup(ctx: &TestContext, kind: Kind, sender_cpu: u32, parts: &mut Parts) -> TestResult
+fn setup(ctx: &TestContext, kind: Kind, parts: &mut Parts) -> TestResult
 {
     for slot in &mut parts.sources
     {
@@ -355,7 +333,7 @@ fn setup(ctx: &TestContext, kind: Kind, sender_cpu: u32, parts: &mut Parts) -> T
         sender_entry,
         SENDER_STACK,
         arg,
-        sender_cpu,
+        SENDER_CPU,
     )?;
     for th in [parts.waiter, parts.sender].into_iter().flatten()
     {
@@ -453,8 +431,7 @@ fn rounds(waiter: u32) -> Result<u32, &'static str>
 /// Wait, for at most [`ENTRY_WAIT_US`], until the restarted waiter has
 /// entered a wait since its stop (`WAITS_ENTERED` moved past `entered`), so
 /// each round stops a waiter that has run. The first [`ENTRY_SPINS`] polls
-/// are busy; later ones sleep 1 ms, which lets a sender sharing the
-/// controller's CPU serve the waiter. Returns whether it did in time.
+/// are busy; later ones sleep 1 ms. Returns whether it did in time.
 fn await_entry(entered: u32) -> bool
 {
     let elapsed_us = || system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(0);
@@ -601,21 +578,6 @@ fn deliver(kind: Kind, source: u32, value: u64) -> Result<(), i64>
     }
 }
 
-/// Log a syscall error word after `label`.
-fn log_error(label: &str, error: i64)
-{
-    // cast_sign_loss: the raw error word is only logged.
-    #[allow(clippy::cast_sign_loss)]
-    crate::log_u64(label, error as u64);
-}
-
-/// Record a failed result word in `count` and `last`.
-fn record_bad(count: &AtomicU32, last: &AtomicU64, word: u64)
-{
-    last.store(word, Ordering::Release);
-    count.fetch_add(1, Ordering::AcqRel);
-}
-
 /// Waiter: until told to quit, wait on A then on B, counting each entry
 /// and classifying each result.
 fn waiter_entry(arg: u64) -> !
@@ -642,7 +604,7 @@ fn waiter_entry(arg: u64) -> !
                     // cast_sign_loss: the raw result word is only logged.
                     #[allow(clippy::cast_sign_loss)]
                     let word = other.unwrap_or_else(|e| e as u64);
-                    record_bad(&BAD_WAITS, &BAD_WAIT_RESULT, word);
+                    BAD_WAITS.record(word);
                 }
             }
         }
@@ -681,9 +643,12 @@ fn sender_entry(arg: u64) -> !
 }
 
 /// Serve the wait the waiter entered as its `entered`th: spin a varying
-/// delay, then deliver to its source if the waiter is still in it. A wait a
-/// stop has ended meanwhile gets nothing: a delivery to it would make the
-/// next wait on that source return at once instead of parking.
+/// delay, then deliver to its source unless the waiter has entered a later
+/// wait, so no wait is served twice. A stop may have ended the wait
+/// meanwhile without the waiter re-entering yet; the delivery then stays on
+/// the source (a notification bit, or a queue entry
+/// [`EVENT_QUEUE_CAPACITY`] has room for) and the waiter's next wait on it
+/// consumes it.
 fn serve(kind: Kind, sources: [u32; SOURCES], entered: u32)
 {
     let index = usize::from((entered & 1) == 0);
@@ -698,8 +663,6 @@ fn serve(kind: Kind, sources: [u32; SOURCES], entered: u32)
     }
     if let Err(e) = deliver(kind, sources[index], VALUES[index])
     {
-        // cast_sign_loss: the raw error word is only logged.
-        #[allow(clippy::cast_sign_loss)]
-        record_bad(&BAD_SENDS, &BAD_SEND_RESULT, e as u64);
+        BAD_SENDS.record_error(e);
     }
 }

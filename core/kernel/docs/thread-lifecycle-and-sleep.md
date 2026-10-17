@@ -295,9 +295,10 @@ stated explicitly.
     (Sleep List Invariant 6). Then acquire the source IPC lock for tcb's
     blocked_on_object (if any) and unlink tcb from the source's wait or
     waiter queue. Known gap: nothing pins the source here, and a waker that
-    claimed tcb before its Exited mark leaves the binding set, so a
-    concurrent last-cap delete can free the source first (#443 § Source
-    pointer held past its free). Branches:
+    claimed tcb before its Exited mark leaves the binding set until its wake
+    lands (`enqueue_and_wake`'s abort arm clears it), so a concurrent last-cap
+    delete can free the source first (#443 § Source pointer held past its
+    free). Branches:
       - BlockedOnSend / BlockedOnRecv: ep.lock; unlink_from_wait_queue.
       - BlockedOnNotification: sig.lock; remove tcb from the waiter queue.
       - BlockedOnEventQueue: eq.lock; remove tcb from the waiter queue.
@@ -656,8 +657,11 @@ The handler then drains the target.
    `Stopped` thread registered as a source's waiter or on the sleep list. The object-teardown stop
    (`stop_threads_bound_to`) commits `Exited` through the same loop. A park that a waker claimed
    first (removed from the queue, `wake_in_flight = 1`) is not cancelled; the stop commits over it
-   and the waker's later `enqueue_and_wake` aborts on `Stopped`, leaving the deposit for the
-   resume (invariant 4).
+   and the waker's later `enqueue_and_wake` aborts on `Stopped`, clearing the park binding it owns
+   and leaving the deposit for the resume (invariant 4). Until that wake lands the `Stopped`
+   thread still carries the binding; `dealloc_object(Thread)` waits out the pin before it frees
+   the thread, but its drain step 11 reads the binding first (#443 § Source pointer held past its
+   free).
 3. **Self-stop fast path.** If the target is the calling thread, call `schedule(false)` immediately.
    The skip-loop in `schedule()` never re-enqueues a `Stopped` TCB.
 4. **Cross-CPU drain.** If `running_on = Some(run_cpu)` and `run_cpu != current_cpu`:
@@ -681,9 +685,11 @@ The handler then drains the target.
      its Control cap stopping it back, or an object teardown) leaves the spin envelope and calls
      `schedule(false)`: this preempt-disabled window suppresses the slice-expiry switch that would
      otherwise deschedule it, and the syscall epilogue reschedules only an `Exited` thread. When it
-     is restarted it re-enters the drain and returns once its target has left its CPU. Two threads
-     stopping each other concurrently therefore both end `Stopped`, restartable by a third, instead
-     of both spinning forever.
+     is restarted it re-resolves its target through its own capability slot (nothing pins the
+     slot across the park) and re-enters the drain only if the slot still names the target with
+     Control rights, returning once the target has left its CPU; otherwise the target was deleted
+     meanwhile and the drain ends. Two threads stopping each other concurrently therefore both end
+     `Stopped`, restartable by a third, instead of both spinning forever.
 
 **Invariants:**
 

@@ -115,16 +115,19 @@ A notification is a kernel object containing a single machine word used as a bit
 bit represents a distinct event type, defined by the service using the notification.
 
 **Delivery:** The sender ORs one or more bits into the notification word. This is O(1) and
-never blocks. If receivers are already waiting, the one that has waited longest is woken with
-every pending bit. If not, the bits accumulate until a receiver next waits.
+never blocks. If receivers are already waiting, the send then claims every pending bit and wakes
+the one that has waited longest with them. If none is waiting, the bits accumulate until a
+receiver next waits. The OR and the claim are not one atomic step: between them, a receiver that
+begins waiting can find the bits pending and take them without blocking, or a concurrent send can
+claim them, and a send whose bits were taken this way wakes no queued waiter.
 
 **Coalescing:** Setting an already-set bit is idempotent.
 
 **Receipt:** The receiver waits on the notification object and receives the full bitmask,
 which is atomically cleared on read. The receiver then inspects each set bit and
 acts accordingly. Several threads may wait on one notification; they queue in arrival order and
-each delivery wakes one of them. Destroying the notification wakes every waiter with
-`Interrupted`. See
+each send that claims pending bits wakes one of them. Destroying the notification wakes every
+waiter with `Interrupted`. See
 [syscalls.md § `SYS_NOTIFICATION_WAIT`](../core/kernel/docs/syscalls.md#sys_notification_wait-4).
 
 Notifications are appropriate for: hardware interrupt delivery, timer expiry, IPC endpoint

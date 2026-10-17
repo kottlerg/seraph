@@ -1126,7 +1126,7 @@ pub fn finalize_memmgr(
         mm.process_info_va,
     )
     .ok()?;
-    syscall::thread_start(mm.mm_thread).ok()?;
+    crate::start_thread(mm.mm_thread).ok()?;
     log("memmgr started");
 
     Some(MemmgrFinalize {
@@ -1671,6 +1671,6 @@ pub fn bootstrap_procmgr(
 /// `_start` calls `heap_bootstrap` which depends on memmgr being live.
 pub fn start_procmgr(pm: &ProcmgrBootstrap)
 {
-    let _ = syscall::thread_start(pm.thread);
+    let _ = crate::start_thread(pm.thread);
     log("procmgr started");
 }

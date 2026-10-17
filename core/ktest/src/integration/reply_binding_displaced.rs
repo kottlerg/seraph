@@ -29,12 +29,13 @@
 
 use ipc::IpcMessage;
 use syscall::{
-    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
+    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, cap_info, ipc_buffer_set,
     notification_send, notification_wait, notification_wait_timeout, thread_exit,
     thread_set_fault_handler, thread_sleep, thread_start, thread_stop,
 };
 use syscall_abi::{
-    EXIT_FAULT_BASE, FAULT_CLASS_ALL, FAULT_LABEL, RIGHTS_EP_SEND_GRANT, SyscallError,
+    CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, FAULT_CLASS_ALL, FAULT_LABEL, RIGHTS_EP_SEND_GRANT,
+    SyscallError, THREAD_STATE_EXITED,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -70,16 +71,10 @@ const EXIT_POLLS: u32 = 2000;
 
 /// Unmapped user VA the faulter stores to; canonical in every paging mode
 /// (below the 2^38 Sv39 user half). Distinct from other tests.
-const RESERVED_VA: u64 = 0x3E_6000_0000;
+const RESERVED_VA: u64 = 0x3E_7000_0000;
 
 /// Badge bound with the fault handler and delivered in the fault message.
 const FAULT_BADGE: u64 = 0xC0FF_EE07;
-
-/// Fault vector recorded in `exit_reason` for a not-present store.
-#[cfg(target_arch = "x86_64")]
-const FAULT_VECTOR: u64 = 14; // #PF
-#[cfg(target_arch = "riscv64")]
-const FAULT_VECTOR: u64 = 15; // store/AMO page fault
 
 /// Index of callers A, B and C in the stacks, buffers, and arguments.
 const A: usize = 0;
@@ -287,11 +282,19 @@ fn displace_fault(ctx: &TestContext, parts: &mut Parts, objects: &Objects, acc: 
     {
         return Err("integration::reply_binding_displaced: unexpected fault message");
     }
+    // The faulter must still be fault-blocked here, so that its `Exited`
+    // after the next receive is that receive's release, not an earlier kill.
+    if thread_exited(fault_th)?
+    {
+        return Err(
+            "integration::reply_binding_displaced: the faulter exited before the later receive",
+        );
+    }
 
     let acc = call_and_receive(ctx, parts, objects, &CALLER_C, acc)?;
     let reason = spawn::wait_until_exited(fault_th, EXIT_POLLS)
         .map_err(|_| "integration::reply_binding_displaced: the released faulter never exited")?;
-    if reason != EXIT_FAULT_BASE + FAULT_VECTOR
+    if reason != EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR
     {
         return Err(
             "integration::reply_binding_displaced: the released faulter exited with the wrong \
@@ -299,6 +302,17 @@ fn displace_fault(ctx: &TestContext, parts: &mut Parts, objects: &Objects, acc: 
         );
     }
     reply_and_check(ctx, objects.done, acc, &CALLER_C).map(|_| ())
+}
+
+/// Whether `thread` reports `Exited`.
+fn thread_exited(thread: u32) -> Result<bool, &'static str>
+{
+    let packed = cap_info(thread, CAP_INFO_THREAD_STATE)
+        .map_err(|_| "integration::reply_binding_displaced: cap_info(thread state) failed")?;
+    // cast_possible_truncation: 8-bit state in the high word.
+    #[allow(clippy::cast_possible_truncation)]
+    let state = (packed >> 32) as u32;
+    Ok(state == THREAD_STATE_EXITED)
 }
 
 /// Start `caller`, wait until it is about to call, and receive its call as

@@ -149,11 +149,11 @@ pub unsafe fn notification_send(
 
         if delivered == 0
         {
-            // A concurrent fast-path notification_wait already consumed our
-            // bits. The queued waiters are *new* waiters; do NOT touch them
-            // (delivering wakeup_value=0 would be a spurious wake, since
-            // notification_send rejects 0-bit sends). See ipc-internals.md
-            // § Send Path.
+            // A newly arriving notification_wait or a concurrent send
+            // already claimed our bits. The queued waiters were already
+            // waiting; do NOT touch them (delivering wakeup_value=0 would be
+            // a spurious wake, since 0-bit sends are rejected). See
+            // ipc-internals.md § Send Path.
             None
         }
         else

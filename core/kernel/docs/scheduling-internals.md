@@ -78,11 +78,9 @@ skipping levels, risks deadlock.
    run-queue link acquires the per-CPU scheduler.lock under that. `(*tcb).sched_lock` is the single
    authoritative serializer of the TCB's Scheduling field group (`{state, ipc_state, queued_on,
    run_queue_next, preferred_cpu, blocked_on_object, wake_pending, park_seq, start_seq}`), keyed on
-   the TCB
-   pointer
-   rather than on whichever CPU's queue currently links it. The per-CPU scheduler.lock no longer
-   guards any TCB's `state`; it guards only that CPU's run-queue list structure
-   (head/tail/`non_empty`/load). See § Cross-CPU TCB Ownership.
+   the TCB pointer rather than on whichever CPU's queue currently links it. The per-CPU
+   scheduler.lock no longer guards any TCB's `state`; it guards only that CPU's run-queue list
+   structure (head/tail/`non_empty`/load). See § Cross-CPU TCB Ownership.
 
 2. **At most one source IPC lock at a time.** A code path holding `sig.lock` MUST NOT acquire
    `ep.lock`, `eq.lock`, or `ws.lock`. The exceptions are `waitset_notify`, `waitset_add`, and
@@ -340,7 +338,7 @@ write, and the canonical helper / locks held. Deviations from this table are bug
 | `Blocked` | `Stopped` | `sys_thread_stop` on blocked target | calling CPU | `commit_cancelling_park(Stopped)`: `cancel_ipc_block` first (acquires the source IPC lock and unlinks the waiter), then the all-locks commit, refused and retried while the target's `park_seq` differs from the snapshot taken with the `Blocked` read — so a park committed after an unlocked `Running`/`Ready` read is cancelled too, never overwritten (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol)) |
 | `*` | `Exited` | `sys_thread_exit` (self) or fault handler | running CPU | `exit_under_all_locks(reason)` (on the dying CPU; the exit reason and `Exited` are written in one all-locks hold, refused if already `Exited`), then `schedule(false)` |
 | `*` | `Exited` | `dealloc_object(Thread)` (refcount → 0) | calling CPU | acquires `(*tcb).sched_lock` (outer), then every CPU's scheduler.lock in ascending order, writes `Exited`, walks `remove_from_queue` for every CPU, releases all; then waits unconditionally for `sched.current != tcb` on *every* CPU *and* `tcb.context_saved == 1` (see Cross-CPU TCB Ownership) before freeing |
-| `Exited` | `*` | any lifecycle write (`sys_thread_start`, `sys_thread_stop`, a second exit) | calling CPU | refused: the all-locks commit (`set_state_under_all_locks`, `exit_under_all_locks`, `commit_cancelling_park`) returns `StateCommit::RefusedExited`, `start_under_all_locks` returns `None`, and `enqueue_ready_thread` returns `ReadyLink::Exited` when the target is `Exited` under the held locks — `Exited` is terminal. A lifecycle syscall's unlocked precheck can race an object teardown (§ Thread Registry) or an exit; `sys_thread_start` then returns `InvalidArgument`, `sys_thread_stop` `InvalidState`, and neither revives the thread (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#lifecycle-state-machine)). |
+| `Exited` | `*` | any lifecycle write (`sys_thread_start`, `sys_thread_stop`, a second exit) | calling CPU | refused: the all-locks commit (`set_state_under_all_locks`, `exit_under_all_locks`, `commit_cancelling_park`) returns `StateCommit::RefusedExited`, `start_under_all_locks` returns `StartCommit::Refused`, and `enqueue_ready_thread` returns `ReadyLink::Exited` when the target is `Exited` under the held locks — `Exited` is terminal. A lifecycle syscall's unlocked precheck can race an object teardown (§ Thread Registry) or an exit; `sys_thread_start` then returns `InvalidArgument`, `sys_thread_stop` `InvalidState`, and neither revives the thread (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#lifecycle-state-machine)). |
 
 All `Running→Blocked` parks MUST route through `commit_blocked_under_local_lock` (or
 `commit_reply_rebind_under_local_lock` for `endpoint_recv`'s rebind); all `Blocked→Ready` *wakes*
@@ -431,7 +429,7 @@ destination scheduler's lock. The known sites are:
   links `current` directly on the destination CPU's queue (under the
   still-held `current.sched_lock` + the destination run-queue lock).
 - `sys_thread_start` (`core/kernel/src/syscall/thread.rs`), which calls
-  `start_under_all_locks(target)` to commit the state transition and then
+  `start_under_all_locks(target, caller)` to commit the state transition and then
   a separate `enqueue_ready_thread(target_cpu, start_seq)` to commit the
   queue link, made only while that commit is still current.
 
@@ -660,9 +658,9 @@ not-`current`-anywhere + `cs == 1` (prodding the CPU still running it) **before*
 a state `schedule()`'s requeue denylist rejects, so the owning CPU deschedules it without
 re-linking. Each pass re-reads the target's state and ends the start once a concurrent start has
 resumed it, so the loop never waits on a thread that is running again; the commit re-checks the
-drain under the all-CPU locks. Without the drain a
-resumed thread could be force-linked on a second CPU while still live on the first — the same
-cross-CPU double-dispatch class as #314/#293. The `sys_thread_start` transition is specified in
+drain under the all-CPU locks. Without the drain a resumed thread could be force-linked on a second
+CPU while still live on the first — the same cross-CPU double-dispatch class as #314/#293. The
+`sys_thread_start` transition is specified in
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Lifecycle State Machine.
 
 **Step 11 — load-balancer liveness gate (issue #314/#293).** A thread can legitimately be `Ready`

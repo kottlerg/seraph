@@ -474,6 +474,10 @@ pub fn run_all(ctx: &TestContext)
         "thread::stop_again_invalid_state",
         thread::stop_again_invalid_state(ctx)
     );
+    run_test!(
+        "thread::start_self_invalid_argument",
+        thread::start_self_invalid_argument(ctx)
+    );
     run_test!("thread::write_regs_resume", thread::write_regs_resume(ctx));
     run_test!(
         "thread::set_priority_in_band",

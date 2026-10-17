@@ -116,6 +116,10 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// with `seed`/`provides`, `sched_max` below `priority`), or `argv` / `env`
 /// that would not fit procmgr's `CREATE_FROM_FILE` message
 /// ([`ParseError::TooLarge`]).
+// too_many_lines: one pass over the `key = value` grammar whose per-key
+// `match` is a flat table of short arms sharing the duplicate-key and
+// mandatory-key bookkeeping locals; moving arms into helpers would thread
+// those locals through every helper without buying structural clarity.
 #[allow(clippy::too_many_lines)]
 pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
 {

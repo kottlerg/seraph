@@ -48,8 +48,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::fault_kills_thread: configure_and_start failed")?;
 
     let expected = EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR;
-    let reason = crate::spawn::wait_until_exited(child.th, MAX_POLLS)
-        .map_err(|_| "integration::fault_kills_thread: child never faulted/exited")?;
+    let reason = crate::spawn::wait_until_exited(child.th, MAX_POLLS)?;
     if reason != expected
     {
         return Err("integration::fault_kills_thread: wrong exit reason for fault");

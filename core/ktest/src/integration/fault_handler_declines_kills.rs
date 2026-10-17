@@ -64,8 +64,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // The declined fault is terminal: the child must reach Exited with the
     // standard fault exit reason.
     let expected = EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR;
-    let reason = crate::spawn::wait_until_exited(child.th, MAX_POLLS)
-        .map_err(|_| "fault_handler_declines_kills: child never died after KILL reply")?;
+    let reason = crate::spawn::wait_until_exited(child.th, MAX_POLLS)?;
     if reason != expected
     {
         return Err("fault_handler_declines_kills: wrong exit reason after KILL");

@@ -18,8 +18,9 @@
 //! restart cap set.
 
 use crate::REGISTRY_CAPACITY;
+use crate::definitions::build_blob;
 use crate::definitions::launch::{
-    assemble_boot_caps, build_blob, delete_caps, mint_logd_boot_caps, resolve_seeds,
+    assemble_boot_caps, delete_caps, mint_logd_boot_caps, resolve_seeds,
 };
 use crate::service::{MAX_RESTARTS, POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
 use ipc::{IpcMessage, procmgr_labels};

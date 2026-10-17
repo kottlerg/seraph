@@ -37,9 +37,11 @@ which live under `src/arch/<arch>/` (see below).
 selected by `target_arch` in `src/arch/mod.rs`, each exposing the same
 entry points and constants. Tier 1 reaches the tests behind it through
 `crate::arch::run_unit` and Tier 2 through `crate::arch::run_integration`;
-arch-neutral tests take the vector a not-present user store faults with
-from `crate::arch::PAGE_FAULT_STORE_VECTOR`, and the kernel `TrapFrame`'s
-size and instruction-pointer offset from `crate::arch::TRAP_FRAME_BYTES` and
+arch-neutral tests take the vectors a not-present user store and an illegal
+instruction fault with from `crate::arch::PAGE_FAULT_STORE_VECTOR` and
+`crate::arch::ILLEGAL_INSTRUCTION_VECTOR`, raise the latter through
+`crate::arch::illegal_instruction`, and take the kernel `TrapFrame`'s size and
+instruction-pointer offset from `crate::arch::TRAP_FRAME_BYTES` and
 `crate::arch::IP_OFFSET`.
 Per-arch helpers and branches inside arch-neutral tests, and other arch-specific
 items elsewhere in ktest, are still gated in place with `#[cfg(target_arch)]`;
@@ -132,7 +134,8 @@ right for.
 Stress and torture tests that exercise race conditions, resource exhaustion, deep
 capability trees, and concurrent operations. They run on every boot under
 `KtestConfig::DEFAULT` (`run_stress: true`); see [Compile-time options](#compile-time-options)
-to turn the tier off.
+to turn the tier off. SMP-dependent cells self-skip (logging `SKIP`) below their CPU minimum;
+the rows below state it for the cells that pin their participants to CPUs.
 
 Order matches `stress/mod.rs` dispatch order.
 
@@ -157,13 +160,15 @@ in `stress/mod.rs` mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
 | `priority_dealloc_race.rs` | Race `sys_thread_set_priority` against `cap_delete(Thread)` and affinity-driven migration (covers Scheduling-group all-locks discipline) | `NUM_WORKERS=16`, `CYCLES=200` |
 | `stop_reply_race.rs` | Race `thread_stop` on a reply-blocked client against `cap_delete` of the server it is parked on (#317 cross-CPU UAF) | `CYCLES=300` |
 | `stop_resume_race.rs` | Race `thread_stop` against a concurrent `thread_start` (resume) on a `Running` pinned victim across three CPUs (stop-drain liveness) | `CYCLES=256` |
-| `stop_sleep_window.rs` | Stop and restart a thread looping `thread_sleep(1)` on the timer CPU, so stops land around the park commit, the sleep-list add, and the timer's claim; each sleep returns `Ok` or `Interrupted` | `CYCLES=2000` |
-| `stop_park_race.rs` | Stop and restart a peer entering a notification wait, an IPC call, or a sleep; each park returns its genuine result or `Interrupted`, and every kind sees a cancellation | `CYCLES=150`, `SLEEP_MS=2` |
-| `stop_owed_wake.rs` | Stop and restart a notification waiter while a sender keeps claiming its wait (each round waits, bounded by `ENTRY_WAIT_US`, for the restarted waiter to enter a wait), alone and then (4+ CPUs) with a starter racing every restart, itself stopped and restarted by the controller every `STARTER_STOP_PERIOD` rounds; every wait returns bits or `Interrupted` and both occur; every start succeeds or returns `InvalidArgument` (or, for the starter's, `Interrupted`, tallied but not required), none returns `InvalidArgument` while the controller is alone, and with the starter racing it wins some restarts and its wins equal the controller's losses (one committed start per stop, none from an interrupted start); the kernel's wait-queue and owed-wake assertions hold | `CYCLES=2000` per phase, `STARTER_STOP_PERIOD=16` |
-| `stop_fault_sender.rs` | Stop and restart a thread faulting in a loop while its fault handler, after a varying delay, dequeues each fault, maps the page, and replies `RESUME` (the faulter unmaps it and faults again), so stops land on the send-queued fault around the handler's dequeue; a stop that cancels a fault before a reply claims it kills the faulter by design (the controller checks the fault exit reason, syncs the handler, and respawns it), but every `RESUME` reply that returned `Ok` must be honoured: the completed faults equal the `Ok` replies, every death carries the fault exit reason, no map, unmap, or receive fails, and both a cancelled fault and a survived in-flight stop occur (#443) | `CYCLES=1000` |
-| `timed_wait_source_delete.rs` | Destroy a notification or event queue around a timed waiter's deadlines; each wait ends in a timeout, `Interrupted`, or `InvalidCapability` | `CYCLES=200`, `WAIT_MS=1` |
-| `timed_waiter_thread_delete.rs` | Delete a timed waiter's last Thread cap around its deadlines (plain sleep, notification, event queue) | `CYCLES=192`, `WAIT_MS=1` |
-| `timed_wait_reuse.rs` | A timed wait claimed by a delivery at its deadline, followed by an untimed wait on the same source: the untimed wait never returns a timeout | `CYCLES=400`, `WAIT_MS=1` |
+| `stop_sleep_window.rs` | Stop and restart a thread looping `thread_sleep(1)` on the timer CPU, so stops land around the park commit, the sleep-list add, and the timer's claim; each sleep returns `Ok` or `Interrupted` (≥ 2 CPUs) | `CYCLES=2000` |
+| `stop_park_race.rs` | Stop and restart a peer entering a notification wait, an IPC call, or a sleep; each park returns its genuine result or `Interrupted`, and every kind sees a cancellation (≥ 2 CPUs) | `CYCLES=150`, `SLEEP_MS=2` |
+| `stop_owed_wake.rs` | Stop and restart a notification waiter while a sender keeps claiming its wait (each round waits, bounded by `ENTRY_WAIT_US`, for the restarted waiter to enter a wait), alone and then (4+ CPUs) with a starter racing every restart, itself stopped and restarted by the controller every `STARTER_STOP_PERIOD` rounds; every wait returns bits or `Interrupted` and both occur; every start succeeds or returns `InvalidArgument` (or, for the starter's, `Interrupted`, tallied but not required), none returns `InvalidArgument` while the controller is alone, and with the starter racing it wins some restarts and its wins equal the controller's losses (one committed start per stop, none from an interrupted start); the kernel's wait-queue and owed-wake assertions hold (≥ 2 CPUs; the racing phase needs 4) | `CYCLES=2000` per phase, `STARTER_STOP_PERIOD=16` |
+| `stop_fault_sender.rs` | Stop and restart a thread faulting in a loop while its fault handler dequeues each fault from the send queue and replies `RESUME`; a stop that cancels a fault no reply claimed kills the faulter by design, and every `RESUME` reply that returned `Ok` must be honoured: the completed faults equal the `Ok` replies (#443; ≥ 3 CPUs) | `CYCLES=1000` |
+| `mutual_stop.rs` | Two children holding each other's Thread cap stop and restart each other in a loop while the controller restarts whichever pair a mutual stop left stopped; both must exit voluntarily, both must make progress, every stop and start must return an accepted result, and per direction the `Ok` stops equal the `Ok` starts (needs ≥ 3 CPUs; on the unfixed kernel the first mutual stop wedges both CPUs) | `CYCLES=200` |
+| `stop_repark.rs` | Stop and restart a waiter alternating between two notifications, then two event queues, while a sender delivers to whichever it is parked on, so a stop's cancellation races a wake that re-parks the waiter on the other source; every wait returns its own source's result or `Interrupted`, deliveries on both sources are consumed during and after the rounds, and some stop interrupts a wait (needs ≥ 2 CPUs) | `CYCLES=1000` per phase |
+| `timed_wait_source_delete.rs` | Destroy a notification or event queue around a timed waiter's deadlines; each wait ends in a timeout, `Interrupted`, or `InvalidCapability` (≥ 2 CPUs) | `CYCLES=200`, `WAIT_MS=1` |
+| `timed_waiter_thread_delete.rs` | Delete a timed waiter's last Thread cap around its deadlines (plain sleep, notification, event queue) (≥ 2 CPUs) | `CYCLES=192`, `WAIT_MS=1` |
+| `timed_wait_reuse.rs` | A timed wait claimed by a delivery at its deadline, followed by an untimed wait on the same source: the untimed wait never returns a timeout (≥ 2 CPUs) | `CYCLES=400`, `WAIT_MS=1` |
 | `double_enqueue_storm.rs` | Run-queue double-link guard regression (#244): wake + priority + affinity churn, then wake racing `cap_delete(Thread)` | `NUM_WORKERS=32`, `CYCLES=600` |
 | `event_try_recv_post_race.rs` | A non-blocking `SYS_EVENT_RECV` try-once racing a concurrent `event_post` must never leave the poller wakeable (#352) | `CYCLES=1024` |
 | `load_balance_handoff_steal.rs` | Arm the load-balancer mid-handoff steal (#314/#293): unpinned IPC clients vs round-robin-pinned servers expose `pull_unpinned_ready` stealing a `context_saved == 0` thread | `NUM_PAIRS=16`, `ITERS=16000` |
@@ -205,19 +210,23 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`):
 - `TestResult` — `Result<(), &'static str>` — no heap, no allocation.
 - `run_test!(name, body)` — macro that logs the test name, runs `body`,
   records PASS or FAIL (with reason), and never panics.
-- `TestContext` — thin struct carrying `aspace_cap`, `cspace_cap`, the
-  IPC buffer pointer, `memory_base` (first RAM Memory cap), and
-  `sbi_control_cap` (zero on x86-64). Passed by reference to every
-  test function. `cspace_cap` is queried via
+- `TestContext` — thin struct carrying `aspace_cap`, `cspace_cap`,
+  `thread_cap` (ktest's own Thread cap, through which a test pins or
+  reprioritises the harness thread), the IPC buffer pointer `ipc_buf`,
+  `memory_base` (first RAM Memory cap), `sbi_control_cap` (zero on
+  x86-64), `sched_control_cap` (the root `SchedControl`), and
+  `init_info_va` (the `InitInfo` page's VA). Passed by reference to
+  every test function. `cspace_cap` is queried via
   `cap_info(_, CAP_INFO_CSPACE_CAPACITY)` by hardware tests whose
   scans must cover slots populated after `aspace_cap` (e.g. narrow
   `IoPort` caps carved by `ioport::bind_port_range` on `x86_64`).
 - `PASS_COUNT` / `FAIL_COUNT` — atomic counters updated by `run_test!`.
 - `log(msg)` / `log_u64(prefix, value)` — heap-free logging utilities.
-- `spawn::new_child(ctx)` / `configure_and_start(child, …)` /
-  `configure_and_start_pinned(child, …)` — child-thread spawn helper
-  wrapping the cspace + thread + configure + start sequence that ~30
-  sites duplicated.
+- `spawn::new_child(ctx)` / `spawn::new_child_at(ctx, sched_cap, priority)` /
+  `configure_and_start(child, …)` / `configure_and_start_pinned(child, …)` —
+  child-thread spawn helper wrapping the cspace + thread + configure + start
+  sequence that ~25 sites duplicated; `new_child` creates the thread at the
+  floor priority, `new_child_at` at `priority` under `sched_cap`'s band.
 - `spawn::ArgBlock` / `spawn::child_args` — per-test static argument
   entries a child receives by address. A child's single `u64` argument
   holds at most two 32-bit capability handles (as halves); anything more

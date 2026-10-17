@@ -44,6 +44,7 @@ const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
 static mut STACK_CONFIGURE: ChildStack = ChildStack::ZERO;
 static mut STACK_STOP_REGS: ChildStack = ChildStack::ZERO;
 static mut STACK_WRITE_REGS: ChildStack = ChildStack::ZERO;
+static mut STACK_DOUBLE_STOP: ChildStack = ChildStack::ZERO;
 static mut STACK_CONFIGURE_ERR: ChildStack = ChildStack::ZERO;
 static mut STACK_CONFIGURE_NON_USER: ChildStack = ChildStack::ZERO;
 static mut STACK_SPLIT_ROLLBACK: ChildStack = ChildStack::ZERO;
@@ -220,9 +221,7 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
     let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for double-stop test failed")?;
 
-    // Tests run sequentially; STACK_STOP_REGS contents are stale but the child
-    // from the previous test is stopped. Using STACK_WRITE_REGS for safety.
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_WRITE_REGS));
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_DOUBLE_STOP));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
     crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
         .map_err(|_| "thread::stop_again_invalid_state: configure_and_start failed")?;

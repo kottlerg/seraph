@@ -52,8 +52,8 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 | Key | Required | Value |
 |---|---|---|
 | `binary` | yes | Absolute path under svcmgr's root. Walked from `system_root_cap` at launch / restart. |
-| `argv` | no | Space-separated badges. Becomes NUL-separated, NUL-terminated bytes on the wire. Bounded; see [`argv` / `env`](#argv--env). |
-| `env` | no | Space-separated `KEY=VAL` badges. Same NUL packing and bounds as `argv`. |
+| `argv` | no | Space-separated tokens. Becomes NUL-separated, NUL-terminated bytes on the wire. Bounded; see [`argv` / `env`](#argv--env). |
+| `env` | no | Space-separated `KEY=VAL` tokens. Same NUL packing and bounds as `argv`. |
 | `restart` | yes | One of `never`, `on_failure`, `always`. |
 | `critical` | yes | `yes` or `no`. Whether the system is viable without this service once it is permanently down. Orthogonal to `restart`. |
 | `namespace` | yes | One of `none`, `universal`, `subtree:<path>:<rights>`. |
@@ -135,7 +135,7 @@ The primary lever for confining a service to only what it needs.
 |---|---|
 | `none` | No namespace cap delivered. The child's `ProcessInfo.system_root_cap` stays zero; std-side absolute-path filesystem operations return `Unsupported` (see [Namespace Model](../../../docs/namespace-model.md#initial-capability-delivery)). Default tight choice for services with no filesystem dependency. |
 | `universal` | `cap_copy` of svcmgr's own root (the system universal root). Reserved for services that need genuine root authority (vfsd as the namespace authority, devmgr for `/dev`, procmgr for walking `/services` and `/programs`, svctest as the namespace tester). |
-| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<rights>` is a `+`-joined list of named badges (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown badges are parser errors. Empty rights list is a parser error. |
+| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<rights>` is a `+`-joined list of rights names (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown rights names are parser errors. Empty rights list is a parser error. |
 
 Example subtree clause:
 

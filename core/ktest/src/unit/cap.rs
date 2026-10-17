@@ -992,14 +992,13 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
 
     cap_delete(child.cs)
         .map_err(|_| "stop_bound: cap_delete(cspace) under blocked child failed")?;
-    let state = cap_info(child.th, syscall_abi::CAP_INFO_THREAD_STATE)
-        .map_err(|_| "stop_bound: cap_info(thread state, blocked) failed")?;
-    if (state >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED
+    if !crate::spawn::is_exited(child.th)?
     {
         cap_delete(child.th).ok();
         return Err("stop_bound: blocked child not Exited after its CSpace was deleted");
     }
-    if state & 0xFFFF_FFFF != syscall_abi::EXIT_KILLED
+    // Exited is terminal, so the one-poll wait returns the retained reason.
+    if crate::spawn::wait_until_exited(child.th, 1)? != syscall_abi::EXIT_KILLED
     {
         cap_delete(child.th).ok();
         return Err("stop_bound: blocked child's exit reason is not EXIT_KILLED");
@@ -1026,14 +1025,13 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
 
     cap_delete(child.cs)
         .map_err(|_| "stop_bound: cap_delete(cspace) under spinning child failed")?;
-    let state = cap_info(child.th, syscall_abi::CAP_INFO_THREAD_STATE)
-        .map_err(|_| "stop_bound: cap_info(thread state, spin) failed")?;
-    if (state >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED
+    if !crate::spawn::is_exited(child.th)?
     {
         cap_delete(child.th).ok();
         return Err("stop_bound: spinning child not Exited after its CSpace was deleted");
     }
-    if state & 0xFFFF_FFFF != syscall_abi::EXIT_KILLED
+    // Exited is terminal, so the one-poll wait returns the retained reason.
+    if crate::spawn::wait_until_exited(child.th, 1)? != syscall_abi::EXIT_KILLED
     {
         cap_delete(child.th).ok();
         return Err("stop_bound: spinning child's exit reason is not EXIT_KILLED");

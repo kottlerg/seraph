@@ -34,10 +34,9 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
-    MAP_READ, MAP_WRITABLE, cap_delete, cap_info, mem_map, mem_protect, mem_unmap, system_info,
-    thread_sleep,
+    MAP_READ, MAP_WRITABLE, cap_delete, mem_map, mem_protect, mem_unmap, system_info, thread_sleep,
 };
-use syscall_abi::{CAP_INFO_THREAD_STATE, SystemInfoType, THREAD_STATE_EXITED};
+use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -143,7 +142,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         {
             break;
         }
-        if child_exited(&child)? && PHASE.load(Ordering::Acquire) < PHASE_WROTE
+        if crate::spawn::is_exited(child.th)? && PHASE.load(Ordering::Acquire) < PHASE_WROTE
         {
             cleanup(ctx, Some(&child), memory_cap);
             return Err("integration::tlb_widen_retry: child killed writing widened mapping");
@@ -175,7 +174,8 @@ fn parent_wait_phase(target: u32, child: &crate::spawn::SpawnedChild) -> bool
     let mut polls = 0;
     while PHASE.load(Ordering::Acquire) < target
     {
-        if child_exited(child).unwrap_or(true) && PHASE.load(Ordering::Acquire) < target
+        if crate::spawn::is_exited(child.th).unwrap_or(true)
+            && PHASE.load(Ordering::Acquire) < target
         {
             return false;
         }
@@ -189,18 +189,6 @@ fn parent_wait_phase(target: u32, child: &crate::spawn::SpawnedChild) -> bool
     true
 }
 
-/// Whether the child thread has reached the `Exited` state.
-fn child_exited(child: &crate::spawn::SpawnedChild) -> Result<bool, &'static str>
-{
-    let packed = cap_info(child.th, CAP_INFO_THREAD_STATE)
-        .map_err(|_| "integration::tlb_widen_retry: cap_info(THREAD_STATE) failed")?;
-    // cast_possible_truncation: the kernel packs an 8-bit state code in the high
-    // word and a 32-bit exit reason in the low word.
-    #[allow(clippy::cast_possible_truncation)]
-    let state = (packed >> 32) as u32;
-    Ok(state == THREAD_STATE_EXITED)
-}
-
 /// Wait for the child to exit cooperatively, then delete its caps, unmap the
 /// page, and return the cap to the pool. Safe to call on any error path.
 fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, memory_cap: u32)
@@ -211,7 +199,7 @@ fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, memory
         // cap_delete never races a still-running pinned thread (which can hang
         // the harness on a CPU with no other ready thread).
         let mut polls = 0;
-        while !child_exited(child).unwrap_or(true)
+        while !crate::spawn::is_exited(child.th).unwrap_or(true)
         {
             polls += 1;
             if polls >= MAX_POLLS

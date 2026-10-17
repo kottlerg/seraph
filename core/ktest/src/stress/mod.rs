@@ -34,12 +34,14 @@ mod event_try_recv_post_race;
 mod fpu_migration_churn;
 mod idle_wake_race;
 mod load_balance_handoff_steal;
+mod mutual_stop;
 mod priority_dealloc_race;
 mod retype_concurrent;
 mod split_delete_race;
 mod stop_fault_sender;
 mod stop_owed_wake;
 mod stop_park_race;
+mod stop_repark;
 mod stop_reply_race;
 mod stop_resume_race;
 mod stop_sleep_window;
@@ -92,6 +94,8 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!("stress::stop_park_race", stop_park_race::run(ctx));
     run_integration_test!("stress::stop_owed_wake", stop_owed_wake::run(ctx));
     run_integration_test!("stress::stop_fault_sender", stop_fault_sender::run(ctx));
+    run_integration_test!("stress::mutual_stop", mutual_stop::run(ctx));
+    run_integration_test!("stress::stop_repark", stop_repark::run(ctx));
     run_integration_test!(
         "stress::timed_wait_source_delete",
         timed_wait_source_delete::run(ctx)

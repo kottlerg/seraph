@@ -435,7 +435,10 @@ fn rounds(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally) -> TestResult
         let th = parts
             .faulter
             .ok_or("stress::stop_fault_sender: no faulter")?;
-        if let Some(reason) = round(th, cycle, tally)?
+        let handler = parts
+            .handler
+            .ok_or("stress::stop_fault_sender: no handler")?;
+        if let Some(reason) = round(th, handler, cycle, tally)?
         {
             faulter_died(ctx, parts, tally, reason)?;
         }
@@ -443,23 +446,24 @@ fn rounds(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally) -> TestResult
     Ok(())
 }
 
-/// One round against the live faulter `th`. Returns its exit reason if it
-/// died.
-fn round(th: u32, cycle: u32, tally: &mut Tally) -> Result<Option<u64>, &'static str>
+/// One round against the live faulter `th`, served by `handler`. Returns
+/// the faulter's exit reason if it died.
+fn round(th: u32, handler: u32, cycle: u32, tally: &mut Tally)
+-> Result<Option<u64>, &'static str>
 {
-    if arm(th, cycle, tally)? == Wait::Exited
+    if arm(th, handler, cycle, tally)? == Wait::Exited
     {
         return exit_reason(th).map(Some);
     }
-    stop_and_restart(th, tally)
+    stop_and_restart(th, handler, tally)
 }
 
 /// Wait for a fault attempt in flight, then for the handler's next receive
 /// entry (or the faulter completing the fault meanwhile), then spin the
 /// round's phase. Returns [`Wait::Exited`] if the faulter died meanwhile.
-fn arm(th: u32, cycle: u32, tally: &mut Tally) -> Result<Wait, &'static str>
+fn arm(th: u32, handler: u32, cycle: u32, tally: &mut Tally) -> Result<Wait, &'static str>
 {
-    let attempted = await_faulter(th, tally, || {
+    let attempted = await_faulter(th, handler, tally, || {
         ATTEMPTS.load(Ordering::Acquire) != PROGRESS.load(Ordering::Acquire)
     })?;
     if attempted == Wait::Exited
@@ -472,7 +476,7 @@ fn arm(th: u32, cycle: u32, tally: &mut Tally) -> Result<Wait, &'static str>
     // return at once instead of aligning to a receive entry.
     let progress = PROGRESS.load(Ordering::Acquire);
     let entered = RECV_ENTERED.load(Ordering::Acquire);
-    let receiving = await_faulter(th, tally, || {
+    let receiving = await_faulter(th, handler, tally, || {
         RECV_ENTERED.load(Ordering::Acquire) != entered
             || PROGRESS.load(Ordering::Acquire) != progress
     })?;
@@ -506,7 +510,7 @@ fn phase_spins(cycle: u32) -> u32
 /// Stop the faulter, note whether a fault attempt was in flight and whether
 /// a reply returned `Ok` during the stop, restart it, and wait for it to
 /// complete the fault or die. Returns its exit reason if it died.
-fn stop_and_restart(th: u32, tally: &mut Tally) -> Result<Option<u64>, &'static str>
+fn stop_and_restart(th: u32, handler: u32, tally: &mut Tally) -> Result<Option<u64>, &'static str>
 {
     let resumed = RESUMED.load(Ordering::Acquire);
     if let Err(e) = thread_stop(th)
@@ -542,7 +546,8 @@ fn stop_and_restart(th: u32, tally: &mut Tally) -> Result<Option<u64>, &'static 
         log_error("ktest: stress::stop_fault_sender thread_start error=", e);
         return Err("stress::stop_fault_sender: thread_start failed");
     }
-    match await_faulter(th, tally, || PROGRESS.load(Ordering::Acquire) != before)?
+    let completed = || PROGRESS.load(Ordering::Acquire) != before;
+    match await_faulter(th, handler, tally, completed)?
     {
         Wait::Done =>
         {
@@ -558,11 +563,18 @@ fn stop_and_restart(th: u32, tally: &mut Tally) -> Result<Option<u64>, &'static 
 }
 
 /// Spin until `done` holds, the faulter `th` has exited, or
-/// [`ROUND_WAIT_US`] elapsed; an expired wait is tallied. The exit and the
-/// clock are syscalls, polled every [`POLL_SPINS`] spins so the reaction to
-/// `done` stays tight.
-fn await_faulter(th: u32, tally: &mut Tally, done: impl Fn() -> bool)
--> Result<Wait, &'static str>
+/// [`ROUND_WAIT_US`] elapsed; an expired wait is tallied. A `handler` that
+/// has exited meanwhile (its receive guard's fatal exit ends that thread
+/// alone) fails the round at once: nothing would answer the faulter's
+/// faults or the controller's calls again. The exits and the clock are
+/// syscalls, polled every [`POLL_SPINS`] spins so the reaction to `done`
+/// stays tight.
+fn await_faulter(
+    th: u32,
+    handler: u32,
+    tally: &mut Tally,
+    done: impl Fn() -> bool,
+) -> Result<Wait, &'static str>
 {
     let start = elapsed_us()?;
     let mut spins = 0u32;
@@ -578,6 +590,10 @@ fn await_faulter(th: u32, tally: &mut Tally, done: impl Fn() -> bool)
             if spawn::is_exited(th)?
             {
                 return Ok(Wait::Exited);
+            }
+            if spawn::is_exited(handler)?
+            {
+                return Err("stress::stop_fault_sender: the handler exited during a round");
             }
             if elapsed_us()?.saturating_sub(start) > ROUND_WAIT_US
             {
@@ -797,8 +813,11 @@ fn handler_entry(arg: u64) -> !
             // The endpoint goes only after this thread is deleted, so its
             // loss ends the loop. Exiting on any other failure would leave a
             // controller call queued meanwhile waiting for good, so the guard
-            // retries it instead: with backoff, and ending the harness with
-            // `EXIT_RECV_WEDGE` once a streak proves the failure persistent.
+            // retries it instead: with backoff, and, once a streak proves
+            // the failure persistent, a `SYS_PROCESS_EXIT` with
+            // `EXIT_RECV_WEDGE` that ends this thread alone (ktest has no
+            // procmgr to reap its siblings); the controller's waits poll this
+            // thread's exit and fail the round.
             Err(e) if e == SyscallError::InvalidCapability as i64 => break,
             Err(e) =>
             {

@@ -38,6 +38,10 @@ pub fn phases() -> &'static [Phase]
             run: std_rename_phase,
         },
         Phase {
+            name: "std_rename_names_too_long",
+            run: std_rename_names_too_long_phase,
+        },
+        Phase {
             name: "std_remove_dir_all",
             run: std_remove_dir_all_phase,
         },
@@ -159,6 +163,27 @@ pub fn std_rename_phase(_: &Caps)
     assert_eq!(&got[..], b"renameme");
     std::fs::remove_file(b).expect("cleanup");
     std::os::seraph::log!("std_rename phase passed");
+}
+
+/// Leaf length that passes `validate_name` on its own while two such names
+/// overflow the `FS_RENAME` data area left after its two length words.
+const RENAME_LONG_NAME_LEN: usize = (syscall_abi::MSG_DATA_WORDS_MAX - 2) * 8 / 2 + 2;
+const _: () = assert!(RENAME_LONG_NAME_LEN <= namespace_protocol::MAX_NAME_LEN);
+
+/// Two root-anchored names of [`RENAME_LONG_NAME_LEN`] bytes: the combined
+/// leaf-length check in `std::fs::rename` fires before any `FS_RENAME` is
+/// sent, so neither name needs to exist for the refusal to be observable.
+pub fn std_rename_names_too_long_phase(_: &Caps)
+{
+    let from = format!("/{}", "a".repeat(RENAME_LONG_NAME_LEN));
+    let to = format!("/{}", "b".repeat(RENAME_LONG_NAME_LEN));
+    let err = std::fs::rename(&from, &to).expect_err("oversize rename pair must be refused");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::InvalidFilename,
+        "oversize rename pair must surface as InvalidFilename, got {err:?}"
+    );
+    std::os::seraph::log!("std_rename_names_too_long phase passed");
 }
 
 pub fn std_remove_dir_all_phase(_: &Caps)

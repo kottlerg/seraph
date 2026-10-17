@@ -99,8 +99,11 @@ static IDLE_TCBS_PTR: core::sync::atomic::AtomicPtr<MaybeUninit<ThreadControlBlo
 static IDLE_STACK_TOPS_PTR: core::sync::atomic::AtomicPtr<u64> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
-/// Return the `PerCpuScheduler` pointer for `cpu`. Caller must guarantee
-/// `cpu < CPU_COUNT` and that [`init_per_cpu_storage`] has run.
+/// Return the `PerCpuScheduler` pointer for `cpu`.
+///
+/// # Safety
+/// `cpu < CPU_COUNT`, and [`init_per_cpu_storage`] has run (the allocation it
+/// publishes covers `CPU_COUNT` slots).
 #[cfg(not(test))]
 #[inline]
 unsafe fn scheduler_ptr(cpu: usize) -> *mut PerCpuScheduler
@@ -114,8 +117,11 @@ unsafe fn scheduler_ptr(cpu: usize) -> *mut PerCpuScheduler
     unsafe { base.add(cpu) }
 }
 
-/// Return the idle-TCB slot pointer for `cpu`. Same contract as
-/// [`scheduler_ptr`].
+/// Return the idle-TCB slot pointer for `cpu`.
+///
+/// # Safety
+/// As [`scheduler_ptr`]: `cpu < CPU_COUNT`, and [`init_per_cpu_storage`] has
+/// run.
 #[cfg(not(test))]
 #[inline]
 unsafe fn idle_tcb_ptr(cpu: usize) -> *mut MaybeUninit<ThreadControlBlock>
@@ -129,8 +135,11 @@ unsafe fn idle_tcb_ptr(cpu: usize) -> *mut MaybeUninit<ThreadControlBlock>
     unsafe { base.add(cpu) }
 }
 
-/// Return the idle-stack-top slot pointer for `cpu`. Same contract as
-/// [`idle_tcb_ptr`].
+/// Return the idle-stack-top slot pointer for `cpu`.
+///
+/// # Safety
+/// As [`scheduler_ptr`]: `cpu < CPU_COUNT`, and [`init_per_cpu_storage`] has
+/// run.
 #[cfg(not(test))]
 #[inline]
 unsafe fn idle_stack_top_slot(cpu: usize) -> *mut u64
@@ -2256,8 +2265,7 @@ pub fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
 
 /// Test stub for `init_storage`.
 #[cfg(test)]
-#[allow(unused_variables)]
-pub fn init_storage(cpu_count: u32, allocator: &mut crate::mm::BuddyAllocator) {}
+pub fn init_storage(_cpu_count: u32, _allocator: &mut crate::mm::BuddyAllocator) {}
 
 #[cfg(not(test))]
 fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
@@ -2370,7 +2378,6 @@ pub(crate) fn alloc_zeroed_slab<T>(
 /// never called; this stub satisfies the call site without requiring access to
 /// arch-specific types that are unavailable on the host.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub fn init(_cpu_count: u32) -> u32
 {
     0
@@ -3537,7 +3544,6 @@ pub unsafe fn commit_blocked_under_local_lock(
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn commit_blocked_under_local_lock(
     _tcb: *mut ThreadControlBlock,
     _ipc: thread::IpcThreadState,
@@ -3610,7 +3616,6 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn commit_reply_rebind_under_local_lock(
     _tcb: *mut ThreadControlBlock,
     _ipc: thread::IpcThreadState,
@@ -3646,7 +3651,6 @@ pub unsafe fn prod_remote_cpu(target_cpu: usize)
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
 
 /// Migrate a `Ready` thread from `src_cpu`'s run queue onto `dst_cpu`'s
@@ -3858,7 +3862,6 @@ unsafe fn relocate_ready_thread(
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn migrate_ready_thread(
     _tcb: *mut thread::ThreadControlBlock,
     _src_cpu: usize,
@@ -3987,7 +3990,6 @@ pub unsafe fn relocate_ready_priority(
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn relocate_ready_priority(
     _tcb: *mut thread::ThreadControlBlock,
     _old_prio: u8,
@@ -4105,7 +4107,6 @@ unsafe fn try_pull_balance(this_cpu: usize)
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 unsafe fn try_pull_balance(_this_cpu: usize) {}
 
 /// Locate the first unpinned Ready thread on `src_cpu`'s run queues and
@@ -4255,7 +4256,6 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 
 /// Make a not-live thread `Ready` and link it on `target_cpu`'s run queue,
@@ -4272,7 +4272,10 @@ unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 /// - `Ready`: already linked; coalesce (a Ready coalesce is only ever a
 ///   same-event duplicate, so dropping it is lost-wake-safe; do not set
 ///   `wake_pending`).
-/// - `Stopped`/`Exited`: a concurrent stop/dealloc won; abort.
+/// - `Stopped`/`Exited`: a concurrent stop/dealloc won; abort. This arm and
+///   the `Ready` arm clear the park binding (`ipc_state`, `blocked_on_object`)
+///   under `sched_lock`: the binding of a claimed park whose cancel lost the
+///   claim is this wake's to clear.
 /// - `Blocked`/`Created`: not live — make `Ready` and link under the target
 ///   run-queue lock (`sched_lock` outer → run-queue lock inner).
 ///
@@ -4282,7 +4285,11 @@ unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 /// (all-CPU-locks, ascending) serialises against the link.
 ///
 /// Every exit path clears `wake_in_flight` so a waiting `dealloc_object(Thread)`
-/// can proceed.
+/// can proceed. On the arms that do not link, that clear follows the
+/// `sched_lock` release and is the waker's last touch of the TCB: an `Exited`
+/// thread is held from `retype_free` by the pin alone. The link path clears it
+/// under the held locks: the thread is `Ready` there, and every `Exited` commit
+/// must first take the `sched_lock` this path holds.
 ///
 /// # Safety
 /// - `tcb` must be a valid [`ThreadControlBlock`] pointer
@@ -4324,13 +4331,14 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         // it Running).
         thread::ThreadState::Running =>
         {
-            // SAFETY: wake_pending / wake_in_flight written under sched_lock.
+            // SAFETY: wake_pending written under sched_lock; the pin release
+            // follows the unlock (see the abort arm below).
             unsafe {
                 (*tcb).wake_pending = true;
+                (*tcb).sched_lock.unlock_raw(sched_saved);
                 (*tcb)
                     .wake_in_flight
                     .store(0, core::sync::atomic::Ordering::Release);
-                (*tcb).sched_lock.unlock_raw(sched_saved);
             }
             return;
         }
@@ -4346,15 +4354,17 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         // and finds no binding to unlink.
         thread::ThreadState::Ready | thread::ThreadState::Stopped | thread::ThreadState::Exited =>
         {
-            // SAFETY: the binding and wake_in_flight are written under
-            // sched_lock, held here.
+            // SAFETY: the binding is written under sched_lock, held here. The
+            // pin release is this waker's last touch of the TCB: on an Exited
+            // thread it alone holds dealloc_object(Thread) from retype_free,
+            // so the unlock's write to sched_lock precedes it.
             unsafe {
                 (*tcb).ipc_state = thread::IpcThreadState::None;
                 (*tcb).blocked_on_object = core::ptr::null_mut();
+                (*tcb).sched_lock.unlock_raw(sched_saved);
                 (*tcb)
                     .wake_in_flight
                     .store(0, core::sync::atomic::Ordering::Release);
-                (*tcb).sched_lock.unlock_raw(sched_saved);
             }
             return;
         }
@@ -4422,7 +4432,6 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
 
 /// Test stub for `enqueue_and_wake` (no-op in test mode).
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize) {}
 
 /// Make `tcb` `Ready` and link it on `target_cpu`'s run queue, under the
@@ -4715,8 +4724,7 @@ pub unsafe fn select_target_cpu_excluding(
 
 /// Test stub for `select_target_cpu` (always returns CPU 0).
 #[cfg(test)]
-#[allow(unused_variables)]
-pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
+pub unsafe fn select_target_cpu(_tcb: *mut ThreadControlBlock) -> usize
 {
     0
 }
@@ -4753,7 +4761,6 @@ unsafe fn wake_idle_cpu(target_cpu: usize)
 
 /// Test stub for `wake_idle_cpu` (no-op in test mode).
 #[cfg(test)]
-#[allow(unused_variables)]
 unsafe fn wake_idle_cpu(_target_cpu: usize) {}
 
 // ── schedule ──────────────────────────────────────────────────────────────────

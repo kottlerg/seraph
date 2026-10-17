@@ -88,6 +88,21 @@ fn check_blob(
     Ok(blob.len().div_ceil(8))
 }
 
+/// Bound a `binary` or `subtree:<path>` value against `ipc::MAX_PATH_LEN`.
+/// svcmgr keeps both paths in fixed `MAX_PATH_LEN` buffers on the
+/// `ServiceEntry` it restarts from (see
+/// `services/svcmgr/docs/restart-protocol.md` § Recipe storage); a longer path
+/// would launch once from the recipe string and then restart along a
+/// truncated path, so the recipe is refused here instead.
+fn check_path_len(lineno: usize, path: &str, too_long: &'static str) -> Result<(), ParseError>
+{
+    if path.len() > ipc::MAX_PATH_LEN
+    {
+        return Err(ParseError::InvalidValue(lineno, too_long));
+    }
+    Ok(())
+}
+
 /// Parse a `priority = ` / `sched_max = ` value: a decimal priority level
 /// within the kernel's assignable userspace range
 /// `[PRIORITY_MIN, PRIORITY_MAX]`.
@@ -113,8 +128,9 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// violate the grammar or a semantic rule: a missing `=`, an unknown or
 /// duplicated key, a missing mandatory key, a malformed value, an
 /// inconsistent combination (`cwd` with `namespace = none`, `log_sink`
-/// with `seed`/`provides`, `sched_max` below `priority`), or `argv` / `env`
-/// that would not fit procmgr's `CREATE_FROM_FILE` message
+/// with `seed`/`provides`, `sched_max` below `priority`), a `binary` or
+/// subtree path over `ipc::MAX_PATH_LEN` ([`ParseError::InvalidValue`]), or
+/// `argv` / `env` that would not fit procmgr's `CREATE_FROM_FILE` message
 /// ([`ParseError::TooLarge`]).
 // too_many_lines: one pass over the `key = value` grammar whose per-key
 // `match` is a flat table of short arms sharing the duplicate-key and
@@ -171,6 +187,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 {
                     return Err(ParseError::InvalidValue(lineno, "binary must be absolute"));
                 }
+                check_path_len(lineno, value, "binary path exceeds MAX_PATH_LEN bytes")?;
                 binary = Some(value.to_owned());
             }
             "argv" =>
@@ -460,6 +477,11 @@ fn parse_namespace(lineno: usize, value: &str) -> Result<NamespaceShape, ParseEr
         {
             return Err(ParseError::BadNamespace(lineno, value.to_owned()));
         }
+        check_path_len(
+            lineno,
+            path,
+            "namespace subtree path exceeds MAX_PATH_LEN bytes",
+        )?;
         let rights = parse_rights(lineno, rights_str)?;
         return Ok(NamespaceShape::Subtree {
             path: path.to_owned(),
@@ -729,6 +751,51 @@ sched_max = 12\n";
         assert!(matches!(
             parse_with(&both),
             Err(ParseError::TooLarge(0, why)) if why.starts_with("argv and env together")
+        ));
+    }
+
+    /// Recipe whose `binary` is an absolute path of exactly `len` bytes.
+    fn recipe_with_binary_len(len: usize) -> String
+    {
+        format!(
+            "binary = /{}\nrestart = never\ncritical = no\nnamespace = none\n",
+            "b".repeat(len - 1)
+        )
+    }
+
+    /// Recipe whose `namespace` is a subtree of an absolute path of exactly
+    /// `len` bytes.
+    fn recipe_with_subtree_len(len: usize) -> String
+    {
+        format!(
+            "binary = /services/x\nrestart = never\ncritical = no\n\
+             namespace = subtree:/{}:LOOKUP\n",
+            "s".repeat(len - 1)
+        )
+    }
+
+    #[test]
+    fn binary_path_is_bounded_by_max_path_len()
+    {
+        let at = parse("x", &recipe_with_binary_len(ipc::MAX_PATH_LEN)).expect("at MAX_PATH_LEN");
+        assert_eq!(at.binary.len(), ipc::MAX_PATH_LEN);
+        assert!(matches!(
+            parse("x", &recipe_with_binary_len(ipc::MAX_PATH_LEN + 1)),
+            Err(ParseError::InvalidValue(1, why)) if why.starts_with("binary path")
+        ));
+    }
+
+    #[test]
+    fn namespace_subtree_path_is_bounded_by_max_path_len()
+    {
+        let at = parse("x", &recipe_with_subtree_len(ipc::MAX_PATH_LEN)).expect("at MAX_PATH_LEN");
+        assert!(matches!(
+            at.namespace,
+            NamespaceShape::Subtree { ref path, .. } if path.len() == ipc::MAX_PATH_LEN
+        ));
+        assert!(matches!(
+            parse("x", &recipe_with_subtree_len(ipc::MAX_PATH_LEN + 1)),
+            Err(ParseError::InvalidValue(4, why)) if why.starts_with("namespace subtree path")
         ));
     }
 

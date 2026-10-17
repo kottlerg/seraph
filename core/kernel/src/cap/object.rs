@@ -2145,15 +2145,15 @@ unsafe fn dealloc_object_one(
                     // This is the strict predecessor of retype_free that the
                     // cancel_ipc_block / dealloc(client) CLOSURE LEMMA relies on: a
                     // withdrawer reading `blocked_on == server` under the client
-                    // sched_lock thereby proves the server is not yet freed. It MUST
-                    // run here, while `bound` is still pinned by wake_in_flight = 1
-                    // (set at the claim above): for an Exited `bound` (a concurrent
-                    // dealloc(client) won the reap) enqueue_and_wake takes its Exited
-                    // arm and does NOT null blocked_on, and clearing wake_in_flight
-                    // there would unblock that dealloc(client) to retype_free `bound`
-                    // — so the null must precede the wake. Only the client's
-                    // sched_lock is taken (the server's was released with the all-CPU
-                    // locks above), so there is no two-TCB-sched_lock nesting.
+                    // sched_lock thereby proves the server is not yet freed. It runs
+                    // here, while `bound` is still pinned by wake_in_flight = 1 (set
+                    // at the claim above), so the null is ordered before this
+                    // server's free whichever arm enqueue_and_wake takes: the pin
+                    // release of its Exited arm lets a concurrent dealloc(client)
+                    // retype_free `bound`, and the lemma's predecessor must already
+                    // stand. Only the client's sched_lock is taken (the server's was
+                    // released with the all-CPU locks above), so there is no
+                    // two-TCB-sched_lock nesting.
                     // SAFETY: bound kept valid by wake_in_flight = 1 above.
                     unsafe {
                         let bs = (*bound).sched_lock.lock_raw();
@@ -2208,14 +2208,23 @@ unsafe fn dealloc_object_one(
                 // dangling waiter pointer to the freed TCB. A subsequent
                 // notification_send would return that pointer, and the caller
                 // would enqueue_and_wake a freed TCB — use-after-free.
+                // The binding pair is read and cleared under tcb's sched_lock:
+                // the abort arm of a wake that claimed tcb before its Exited
+                // mark writes the same pair under that lock (see
+                // docs/scheduling-internals.md § Cross-CPU TCB Ownership). The
+                // source locks below are taken after it is released, never
+                // inside it.
                 // SAFETY: tcb is valid (not yet freed); blocked_on_object
                 // and ipc_state are always valid on an initialized TCB.
                 unsafe {
                     use crate::sched::thread::IpcThreadState;
+                    let sched_saved = (*tcb).sched_lock.lock_raw();
                     let blocked_obj = (*tcb).blocked_on_object;
+                    let bound_state = (*tcb).ipc_state;
+                    (*tcb).sched_lock.unlock_raw(sched_saved);
                     if !blocked_obj.is_null()
                     {
-                        match (*tcb).ipc_state
+                        match bound_state
                         {
                             IpcThreadState::BlockedOnNotification =>
                             {
@@ -2349,7 +2358,9 @@ unsafe fn dealloc_object_one(
                             IpcThreadState::None =>
                             {}
                         }
+                        let sched_saved = (*tcb).sched_lock.lock_raw();
                         (*tcb).blocked_on_object = core::ptr::null_mut();
+                        (*tcb).sched_lock.unlock_raw(sched_saved);
                     }
                 }
 

@@ -130,7 +130,8 @@ wake-decision now contend for the SAME per-TCB lock. Add `wake_pending: bool` to
 the Scheduling group. A waker that finds `state==Running` sets `wake_pending=true`
 under `sched_lock` and aborts the link. `commit_blocked_under_local_lock`, before
 writing `Blocked`, re-reads `wake_pending` under `sched_lock`; if set, it
-**refuses to park** (returns false, thread stays runnable) — the wake-before-park
+**refuses to park** (returns `ParkCommit::RefusedWake`; the thread stays
+runnable) — the wake-before-park
 refuse-to-park semantic, now lock-serialized instead of
 schedule()-timing-dependent. No wake is lost. The binding rules are
 [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy (the park commit) and
@@ -152,13 +153,13 @@ which the `enqueue_and_wake` gate and its callers preserve:
    `enqueue_and_wake`. So `wake_pending` set ⇒ payload already deposited — no
    spurious-zero/garbage wake. (`wake_pending` is set inside `enqueue_and_wake`,
    strictly after the upstream deposit under the source lock.)
-2. Refuse-to-park leaves `state==Running`, so the caller's existing `!committed`
+2. Refuse-to-park leaves `state==Running`, so the caller's refused-park
    rollback routes the thread through `schedule()`, which REQUEUES a runnable
    thread (vs. DRAINS a Stopped/Exited one) → it resumes at the line after
-   `schedule()` and reads the deposited field. The single `false` return serves
-   both the stop/exit and the refuse-to-park case because the post-`schedule()`
+   `schedule()` and reads the deposited field. `ParkCommit::RefusedWake` and
+   `ParkCommit::RefusedStop` share that rollback because the post-`schedule()`
    outcome is **state-driven**, not return-value-driven.
-3. Each primitive's `!committed` rollback MUST NOT clobber the deposited field
+3. Each primitive's refused-park rollback MUST NOT clobber the deposited field
    (it may clear only the waiter-queue entry + restore `context_saved`). This holds for
    every primitive — `notification_wait`, `event_queue_recv`, `waitset_wait`, and
    the three endpoint sites (binding rule: [scheduling-internals.md](scheduling-internals.md)
@@ -214,12 +215,17 @@ each change; the binding statement of the resulting invariants is
   (`target_cpu` is the caller-computed placement *hint* from `select_target_cpu`;
   exclusivity is decided by `state` under `sched_lock`, not by the CPU choice).
   It acquires `(*tcb).sched_lock` first and classifies `state`:
-  - `Stopped|Exited` → clear `wake_in_flight`, return (a stop/dealloc won).
-  - `Running` → set `wake_pending`, clear `wake_in_flight`, return. The
+  - `Stopped|Exited` → clear the park binding (`ipc_state`/`blocked_on_object`),
+    release `sched_lock`, clear `wake_in_flight`, return (a stop/dealloc won;
+    the binding of a claimed park whose cancel lost the claim is this wake's
+    to clear, and the pin release is the waker's last touch of the TCB).
+  - `Running` → set `wake_pending`, release `sched_lock`, clear
+    `wake_in_flight`, return. The
     wake-before-park net: the thread is mid-park; its `commit_blocked` sees the
     flag and refuses. Safe per §2.1 (the payload was deposited upstream).
-  - `Ready` → clear `wake_in_flight`, return (coalesce; do NOT set
-    `wake_pending`). The thread is already linked, will be dispatched, and will
+  - `Ready` → clear the park binding, release `sched_lock`, clear
+    `wake_in_flight`, return (coalesce; do NOT set `wake_pending`). The thread
+    is already linked, will be dispatched, and will
     consume the deposited payload; a `Ready` coalesce is only ever a same-event
     duplicate (a claim removes the thread from its source's wait queue ⇒ a
     distinct event cannot target an already-woken thread). Setting

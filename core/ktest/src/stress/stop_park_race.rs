@@ -36,8 +36,10 @@
 //! - sleep: `Ok` or `Interrupted`.
 //!
 //! Anything else fails the test, as does a kind for which no stop cancelled a
-//! park (the race never armed for it). The kernel's debug assertions (the
-//! spurious-resume tripwire, the pop-time sleep-list checks) are tripwires too.
+//! park (the race never armed for it) and a peer that reports no result
+//! within [`RESULT_WAIT_US`] (a call whose server has exited blocks for
+//! good). The kernel's debug assertions (the spurious-resume tripwire, the
+//! pop-time sleep-list checks) are tripwires too.
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -69,6 +71,11 @@ const SLEEP_MS: u64 = 2;
 /// Controller spins this many rounds for a peer's result before yielding
 /// (and, for a notification peer, rescuing it).
 const RESULT_SPINS: u32 = 200_000;
+
+/// Bound on the controller's wait for a peer's result, in microseconds;
+/// past it the peer is taken as blocked for good (a call whose server has
+/// exited, a park nothing wakes) and the race fails rather than hangs.
+const RESULT_WAIT_US: u64 = 2_000_000;
 
 /// Peer result codes.
 const RESULT_GENUINE: u32 = 1;
@@ -288,7 +295,27 @@ fn race_once(kind: Kind, peer: u32, source: Option<u32>, cycle: u32) -> Result<b
     }
     thread_stop(peer).map_err(|_| "stress::stop_park_race: thread_stop failed")?;
     thread_start(peer).map_err(|_| "stress::stop_park_race: thread_start failed")?;
+    await_result(kind, source, cycle)?;
+    let result = RESULT.load(Ordering::Acquire);
+    ACKED.store(cycle, Ordering::Release);
+    match result
+    {
+        RESULT_GENUINE => Ok(false),
+        RESULT_INTERRUPTED => Ok(true),
+        _ => Err(
+            "stress::stop_park_race: a stopped park returned neither its genuine result \
+                  nor Interrupted",
+        ),
+    }
+}
 
+/// Wait for the peer to publish cycle `cycle`'s result: spin [`RESULT_SPINS`]
+/// rounds, then release a notification peer through its genuine waker
+/// (once) and yield in 1 ms sleeps, for at most [`RESULT_WAIT_US`] on the
+/// `ElapsedUs` clock.
+fn await_result(kind: Kind, source: Option<u32>, cycle: u32) -> TestResult
+{
+    let start = elapsed_us()?;
     let mut spins = 0u32;
     let mut rescued = false;
     while FINISHED.load(Ordering::Acquire) != cycle
@@ -307,19 +334,20 @@ fn race_once(kind: Kind, peer: u32, source: Option<u32>, cycle: u32) -> Result<b
                 .map_err(|_| "stress::stop_park_race: rescue send failed")?;
             rescued = true;
         }
+        if elapsed_us()?.saturating_sub(start) > RESULT_WAIT_US
+        {
+            return Err("stress::stop_park_race: the peer never reported its result");
+        }
         let _ = thread_sleep(1);
     }
-    let result = RESULT.load(Ordering::Acquire);
-    ACKED.store(cycle, Ordering::Release);
-    match result
-    {
-        RESULT_GENUINE => Ok(false),
-        RESULT_INTERRUPTED => Ok(true),
-        _ => Err(
-            "stress::stop_park_race: a stopped park returned neither its genuine result \
-                  nor Interrupted",
-        ),
-    }
+    Ok(())
+}
+
+/// Microseconds since boot; the clock the result wait is bounded on.
+fn elapsed_us() -> Result<u64, &'static str>
+{
+    system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "stress::stop_park_race: system_info(ElapsedUs) failed")
 }
 
 /// Peer loop: announce each cycle's park, run it, classify and publish.

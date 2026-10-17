@@ -349,9 +349,9 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
 
         // Cancel any park (the stopped thread's blocked syscall returns
-        // Interrupted on restart) and commit Stopped over it; a Ready or
-        // Running target is drained by the all-locks write, the scheduler
-        // skip-loop, and the cross-CPU IPI below. See
+        // Interrupted on restart) and commit Stopped over it; a Ready target
+        // is unlinked by the all-locks write, and a remote Running target by
+        // the drain below (its CPU's next slice-expiry schedule(true)). See
         // docs/thread-lifecycle-and-sleep.md § `sys_thread_stop` Cross-CPU Stop
         // Protocol; an `Exited` target is refused (terminal).
         let running_on = commit_stopped(target_tcb)?;
@@ -391,13 +391,13 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 while {
                     let s = sched_remote.lock.lock_raw();
                     let still_current = sched_remote.current == target_tcb;
-                    // A concurrent sys_thread_start may resume the target out of
-                    // Stopped (last-writer-wins). The bounded-spin invariant
-                    // assumes the target stays in schedule()'s requeue denylist
-                    // (Stopped); once it is no longer Stopped the stop was
-                    // overtaken and the re-dispatched target may never
-                    // deschedule. Read state under the same lock
-                    // set_state_under_all_locks holds, then bail.
+                    // A start cannot commit while the target is current here,
+                    // but an object teardown can commit Exited over it. The
+                    // bounded-spin invariant assumes the target stays in
+                    // schedule()'s requeue denylist (Stopped or Exited); read
+                    // state under the same lock the all-locks commits hold, and
+                    // bail once it is no longer Stopped so a teardown that then
+                    // reaps the target is not waited on here.
                     let still_stopped = (*target_tcb).state == ThreadState::Stopped;
                     sched_remote.lock.unlock_raw(s);
                     still_current && still_stopped
@@ -539,24 +539,25 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     (*ep).lock.unlock_raw(saved);
                 }
             }
-            // A fault sender (queued for delivery) cancelled mid-fault must kill,
-            // not resume, when next scheduled: its resume runs the fault helper,
-            // which has no syscall to return `Interrupted` to. No reply can be
-            // in flight for a send-queued faulter, so the marker is unconditional.
+            // A fault sender (queued for delivery) whose fault this cancel
+            // claimed must kill, not resume, when next scheduled: its resume
+            // runs the fault helper, which has no syscall to return
+            // `Interrupted` to. Only the unlink win is that claim: a lost
+            // unlink means a racing endpoint_recv dequeued us, and its rebind
+            // chain (a handler reply, or its teardown) owns the episode and
+            // writes the disposition; a KILL stored here would overwrite a
+            // handler's RESUME. The retry pass cancels the rebound park.
             // SAFETY: tcb valid; fault_outcome / in_fault_delivery always valid.
             if unsafe { (*tcb).in_fault_delivery }
             {
-                // SAFETY: tcb valid.
-                unsafe {
-                    (*tcb).fault_outcome.store(
-                        crate::ipc::fault::FAULT_OUTCOME_KILL,
-                        core::sync::atomic::Ordering::Release,
-                    );
-                    // Episode stamp only on the unlink win: a lost unlink means
-                    // a racing endpoint_recv dequeued us and its rebind chain
-                    // owns the episode (commit or teardown both stamp).
-                    if unlinked
-                    {
+                if unlinked
+                {
+                    // SAFETY: tcb valid; the unlink won the episode.
+                    unsafe {
+                        (*tcb).fault_outcome.store(
+                            crate::ipc::fault::FAULT_OUTCOME_KILL,
+                            core::sync::atomic::Ordering::Release,
+                        );
                         crate::sched::thread::stamp_deposit_episode(tcb);
                     }
                 }

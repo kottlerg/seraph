@@ -44,9 +44,11 @@
 //!     tracks into `CommandEnv`. Both are serialised at `spawn` time into the
 //!     label + data of `CREATE_FROM_FILE` (same encoding as `CREATE_PROCESS`
 //!     and end up in the child's `ProcessInfo` page, surfaced via
-//!     `std::env::{args, vars}` on the child side. Blobs are bounded by
-//!     `ipc::ARGS_BLOB_MAX` and 8-bit counts; oversize returns
-//!     `ArgumentListTooLong`.
+//!     `std::env::{args, vars}` on the child side. Each blob is bounded by
+//!     `ipc::ARGS_BLOB_MAX` and an 8-bit count, and the packed message
+//!     (file-size word, argv words, env-length word, env words) by
+//!     `MSG_DATA_WORDS_MAX`, so argv and env cannot both fill
+//!     `ARGS_BLOB_MAX`; oversize returns `ArgumentListTooLong`.
 
 use crate::ffi::{OsStr, OsString};
 pub use crate::ffi::OsString as EnvKey;
@@ -72,7 +74,7 @@ use ipc::{procmgr_errors, procmgr_labels};
 const BRIDGE_SENTINEL_DROP: u64 = u64::MAX;
 
 use syscall::EXIT_KILLED;
-use syscall_abi::SyscallError;
+use syscall_abi::{MSG_DATA_WORDS_MAX, SyscallError};
 
 // ── Stdio ───────────────────────────────────────────────────────────────────
 
@@ -355,6 +357,29 @@ impl Command {
         }
         let env_count: u32 = env_count_usize as u32;
 
+        // CREATE_FROM_FILE wire: word 0 = file_size, words 1.. = argv,
+        // env header, env. Both blobs fit `ARGS_BLOB_MAX` on their own, but
+        // together they can exceed the message's data area; reject that
+        // here, before any cap is minted, instead of letting the builder
+        // assert on it.
+        let argv_words = if args_blob.is_empty() {
+            0
+        } else {
+            args_blob.len().div_ceil(8)
+        };
+        let env_header_words = if env_count > 0 && !env_blob.is_empty() {
+            1 + env_blob.len().div_ceil(8)
+        } else {
+            0
+        };
+        let total_words = 1 + argv_words + env_header_words;
+        if total_words > MSG_DATA_WORDS_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::ArgumentListTooLong,
+                "argv and env together exceed the CREATE_FROM_FILE message size",
+            ));
+        }
+
         // SAFETY: `info.ipc_buffer` is the kernel-registered IPC buffer for
         // this thread, installed at `_start` time; page-aligned, u64-aligned,
         // and mapped for the process lifetime.
@@ -380,17 +405,6 @@ impl Command {
             })?;
         let file_cap = walked.file_cap;
         let file_size = walked.size;
-
-        let argv_words = if args_blob.is_empty() {
-            0
-        } else {
-            args_blob.len().div_ceil(8)
-        };
-        let env_header_words = if env_count > 0 && !env_blob.is_empty() {
-            1 + env_blob.len().div_ceil(8)
-        } else {
-            0
-        };
 
         // Create the per-child death `EventQueue` BEFORE issuing
         // CREATE_FROM_FILE so a POST-only copy can ride along as the
@@ -421,10 +435,9 @@ impl Command {
             }
         };
 
-        // CREATE_FROM_FILE wire: word 0 = file_size, words 1.. = argv,
-        // env header, env. Caps: [file_cap, death_relay]. Command-spawned
-        // children skip the creator endpoint slot; the death relay is the
-        // trailing cap (flagged by `CREATE_DEATH_RELAY`).
+        // Caps: [file_cap, death_relay]. Command-spawned children skip the
+        // creator endpoint slot; the death relay is the trailing cap
+        // (flagged by `CREATE_DEATH_RELAY`).
         let argv_word_offset: usize = 1;
         let env_len_word_offset = argv_word_offset + argv_words;
         let env_blob_word_offset = env_len_word_offset + 1;
@@ -457,7 +470,6 @@ impl Command {
         };
         // Death relay is the trailing cap (peeled off the tail procmgr-side).
         let builder = builder.cap(death_relay);
-        let total_words = 1 + argv_words + env_header_words;
         let msg = builder.word_count(total_words).build();
 
         // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page for

@@ -36,17 +36,11 @@ use syscall_abi::{
     FAULT_REPLY_RESUME, RIGHTS_ALL,
 };
 
+use crate::arch::IP_OFFSET;
 use crate::{ChildStack, TestContext, TestResult};
 
 /// Badge bound with the handler and delivered in the fault message.
 const FAULT_BADGE: u64 = 0xC0FF_EE04;
-
-/// Instruction-pointer field offset in the architecture `TrapFrame` (matches the
-/// kernel layout: x86-64 `rip` at 120, RISC-V `sepc` at 248).
-#[cfg(target_arch = "x86_64")]
-const IP_OFFSET: usize = 120;
-#[cfg(target_arch = "riscv64")]
-const IP_OFFSET: usize = 248;
 
 /// Register-file buffer size; the arch `TrapFrame` is 168 B (x86-64) / 280 B
 /// (RISC-V), both within this bound.

@@ -12,7 +12,7 @@
 //!
 //! TODO: move every `#[cfg(target_arch)]` item outside `src/arch/` behind this
 //! surface. Deferred because the move is ktest-wide restructuring, separate from
-//! the kernel fixes the code here validates; #460 lists the remaining sites.
+//! the kernel fixes the code here validates; #460 tracks the move.
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]
@@ -22,4 +22,6 @@ mod current;
 #[path = "riscv64/mod.rs"]
 mod current;
 
-pub use current::{PAGE_FAULT_STORE_VECTOR, run_integration, run_unit};
+pub use current::{
+    IP_OFFSET, PAGE_FAULT_STORE_VECTOR, TRAP_FRAME_BYTES, run_integration, run_unit,
+};

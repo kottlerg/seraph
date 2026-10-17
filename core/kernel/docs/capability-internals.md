@@ -893,9 +893,11 @@ cannot be derived, and are not tracked for revocation (see
 capability is not a `CapTag` variant; it is an implicit per-thread mechanism
 created by the kernel at `SYS_IPC_RECV` time and stored in a per-thread slot,
 outside the process CSpace. The kernel clears the per-thread reply slot when
-`SYS_IPC_REPLY` consumes it, or at the thread's next `SYS_IPC_RECV` that passes its
-capability check and cap-slot pre-allocation, which releases the unreplied caller (see
-[ipc-internals.md](ipc-internals.md) § Receive Path (Server) and § Reply Path).
+`SYS_IPC_REPLY` consumes it, at the thread's next `SYS_IPC_RECV` that passes its
+capability check and cap-slot pre-allocation, which releases the unreplied caller, or
+when a stop (`cancel_ipc_block`) or a teardown claims the bound caller (see
+[ipc-internals.md](ipc-internals.md) § Receive Path (Server) and § Reply Path, and
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § BlockedOnReply Edge).
 
 ---
 

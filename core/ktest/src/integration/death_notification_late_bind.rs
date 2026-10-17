@@ -27,12 +27,10 @@
 //!      proving the process-exit syscall records the encoded code on the thread.
 
 use syscall::{
-    cap_delete, cap_info, event_queue_create, event_try_recv, process_exit,
-    thread_bind_notification, thread_exit, thread_sleep,
+    cap_delete, event_queue_create, event_try_recv, process_exit, thread_bind_notification,
+    thread_exit, thread_sleep,
 };
-use syscall_abi::{
-    CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, SyscallError, THREAD_STATE_EXITED, encode_exit_code,
-};
+use syscall_abi::{EXIT_FAULT_BASE, SyscallError, encode_exit_code};
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -102,7 +100,8 @@ fn late_bind_after_death(
     crate::spawn::configure_and_start(&child, entry, stack_top, 0)
         .map_err(|_| "death_notification_late_bind: configure_and_start failed")?;
 
-    wait_until_exited(child.th)?;
+    crate::spawn::wait_until_exited(child.th, MAX_POLLS)
+        .map_err(|_| "death_notification_late_bind: child never reached Exited")?;
 
     // Bind a fresh queue onto the already-dead thread; the kernel delivers the
     // retained reason synchronously inside the bind syscall.
@@ -147,7 +146,8 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, clean_exit_child, stack_top, 0)
         .map_err(|_| "death_notification_late_bind: configure_and_start (control) failed")?;
 
-    wait_until_exited(child.th)?;
+    crate::spawn::wait_until_exited(child.th, MAX_POLLS)
+        .map_err(|_| "death_notification_late_bind: control child never reached Exited")?;
 
     // The death walk posts asynchronously on the child's CPU; poll for it.
     let payload = poll_event(eq)?;
@@ -165,31 +165,6 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
     cap_delete(child.th).ok();
     cap_delete(child.cs).ok();
     Ok(())
-}
-
-/// Poll `cap_info(CAP_INFO_THREAD_STATE)` until the thread reports `Exited`.
-fn wait_until_exited(thread_cap: u32) -> TestResult
-{
-    let mut polls = 0;
-    loop
-    {
-        let packed = cap_info(thread_cap, CAP_INFO_THREAD_STATE)
-            .map_err(|_| "death_notification_late_bind: cap_info(THREAD_STATE) failed")?;
-        // cast_possible_truncation: the kernel packs an 8-bit state code in the
-        // high word and a 32-bit exit reason in the low word.
-        #[allow(clippy::cast_possible_truncation)]
-        let state = (packed >> 32) as u32;
-        if state == THREAD_STATE_EXITED
-        {
-            return Ok(());
-        }
-        polls += 1;
-        if polls >= MAX_POLLS
-        {
-            return Err("death_notification_late_bind: child never reached Exited");
-        }
-        thread_sleep(1).ok();
-    }
 }
 
 /// Bounded poll for a death event the child posts asynchronously on its own CPU.

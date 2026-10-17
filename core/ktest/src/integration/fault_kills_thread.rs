@@ -23,8 +23,8 @@
 //! retry forever: such a bug never reaches `Exited`, so the test fails on the
 //! poll bound rather than hanging.
 
-use syscall::{cap_delete, cap_info, thread_sleep};
-use syscall_abi::{CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, THREAD_STATE_EXITED};
+use syscall::cap_delete;
+use syscall_abi::EXIT_FAULT_BASE;
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -48,31 +48,11 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::fault_kills_thread: configure_and_start failed")?;
 
     let expected = EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR;
-    let mut polls = 0;
-    loop
+    let reason = crate::spawn::wait_until_exited(child.th, MAX_POLLS)
+        .map_err(|_| "integration::fault_kills_thread: child never faulted/exited")?;
+    if reason != expected
     {
-        let packed = cap_info(child.th, CAP_INFO_THREAD_STATE)
-            .map_err(|_| "integration::fault_kills_thread: cap_info(THREAD_STATE) failed")?;
-        // cast_possible_truncation: the kernel packs an 8-bit state code in the
-        // high word and a 32-bit exit reason in the low word.
-        #[allow(clippy::cast_possible_truncation)]
-        let state = (packed >> 32) as u32;
-        if state == THREAD_STATE_EXITED
-        {
-            let reason = packed & 0xFFFF_FFFF;
-            if reason != expected
-            {
-                return Err("integration::fault_kills_thread: wrong exit reason for fault");
-            }
-            break;
-        }
-
-        polls += 1;
-        if polls >= MAX_POLLS
-        {
-            return Err("integration::fault_kills_thread: child never faulted/exited");
-        }
-        thread_sleep(1).ok();
+        return Err("integration::fault_kills_thread: wrong exit reason for fault");
     }
 
     cap_delete(child.th).ok();

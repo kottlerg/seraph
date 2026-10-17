@@ -270,8 +270,9 @@ pointer is dereferenced (see [ipc-design.md](../../../docs/ipc-design.md) § Mes
 when the message carries capabilities.
 
 **Errors:** `InvalidCapability` (also: a cap slot is stale or Null),
-`InsufficientRights`, `InvalidArgument` (bad count, a cap slot repeated in one
-message, or `data_count` > 0 with no IPC buffer page registered),
+`InsufficientRights`, `InvalidArgument` (a cap slot repeated in one message, or
+`data_count` > 0 with no IPC buffer page registered; a `data_count` or `cap_count` above
+its maximum is clamped, not refused),
 `InvalidAddress` (registered IPC buffer page unmapped), `InvalidState` (a cap
 slot is pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), `Interrupted` (the call was
 cancelled while blocked, including by the receiving thread receiving again before it replied; see
@@ -330,7 +331,9 @@ stale), `InvalidArgument` (also: a cap slot repeated in one reply, or
 (registered IPC buffer page unmapped), `InvalidState` (a reply cap slot is
 pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), `QuotaExceeded` (caller's CSpace
 directory structurally full for reply cap transfer), `OutOfMemory`
-(slot-page pool exhausted), `Interrupted`. Every payload or cap failure while
+(slot-page pool exhausted); a `data_count` or `cap_count` above its maximum is clamped, not
+refused, and the call never blocks, so it never returns `Interrupted`. Every payload or cap
+failure while
 a caller is pending — the data-path errors above included — consumes the
 pending reply and wakes the caller with the `IPC_REPLY_TRANSFER_FAILED` label
 and zero caps while the server receives the error (see
@@ -1165,9 +1168,10 @@ way, never left registered as a waiter (see
 Protocol). This does not hold for a stop of a thread waiting on a
 notification, event queue, or wait set whose last capability is deleted concurrently: the cancel
 can lock the object after it is freed
-([#443](https://github.com/kottlerg/seraph/issues/443) § Source pointer held past its free). If the
-thread is running on another CPU, an
-inter-processor interrupt is sent to force it out of userspace (see
+([#443](https://github.com/kottlerg/seraph/issues/443) § Source pointer held past its free). A
+thread running on another CPU is marked `Stopped` under every CPU's scheduler lock, and the call
+returns once that CPU has descheduled it, at its next slice expiry or the thread's own park or
+yield; the inter-processor interrupt sent to that CPU only forces a trap (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
 Protocol).
 

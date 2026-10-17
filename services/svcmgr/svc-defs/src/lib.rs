@@ -6,15 +6,42 @@
 //! Pure `.svc` service-definition types and parser for svcmgr.
 //!
 //! Holds the plain-data recipe record ([`Definition`] and its component
-//! enums) plus the `key = value` parser ([`parse`]). Nothing here touches a
-//! syscall, IPC, or `std::os::seraph` surface, so the whole crate is
-//! host-reachable and host-tested — the `.svc` files are external input and
-//! their parser carries unit tests per
+//! enums), the `key = value` parser ([`parse`]), and the argv/env wire-blob
+//! encoder ([`build_blob`]) the parser validates against procmgr's
+//! `CREATE_FROM_FILE` limits. Nothing here touches a syscall, IPC, or
+//! `std::os::seraph` surface, so the whole crate is host-reachable and
+//! host-tested — the `.svc` files are external input and their parser
+//! carries unit tests per
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 //! The impure launch/restart machinery that consumes a parsed [`Definition`]
 //! stays in `svcmgr` (`definitions::launch` / `definitions::reconcile`).
 
 pub mod parse;
+
+/// Build the NUL-separated, NUL-terminated wire blob procmgr's
+/// stack-envelope writer expects from a list of tokens. Returns
+/// `(blob, count)`. Empty input yields an empty blob with `count = 0`,
+/// matching the "no argv / no env" wire shape. [`parse::parse`] bounds a
+/// recipe's blobs so the count fits the label's 8-bit field.
+#[must_use]
+pub fn build_blob(tokens: &[String]) -> (Vec<u8>, u32)
+{
+    if tokens.is_empty()
+    {
+        return (Vec::new(), 0);
+    }
+    let mut blob: Vec<u8> = Vec::with_capacity(tokens.iter().map(|t| t.len() + 1).sum());
+    for tok in tokens
+    {
+        blob.extend_from_slice(tok.as_bytes());
+        blob.push(0);
+    }
+    // cast_possible_truncation: the parser bounds a recipe's token count to
+    // `u8::MAX`, so the count fits.
+    #[allow(clippy::cast_possible_truncation)]
+    let count = tokens.len() as u32;
+    (blob, count)
+}
 
 /// Restart-policy values parsed from the `restart = ...` line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

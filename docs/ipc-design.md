@@ -240,6 +240,7 @@ The kernel does not provide:
 
 ## Summarized By
 
+[core/kernel/README.md](../core/kernel/README.md),
 [Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [IPC Subsystem Internals](../core/kernel/docs/ipc-internals.md),
 [SMP Scheduling and Locking Invariants](../core/kernel/docs/scheduling-internals.md),

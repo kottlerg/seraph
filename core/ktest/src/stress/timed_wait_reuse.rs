@@ -35,7 +35,10 @@
 //! timeouts. Userspace cannot see whether a round landed between the pop and
 //! the claim; seeing both outcomes proves the sweep crossed the timer's claim
 //! point, so its finely spaced rounds near that point are the ones that race
-//! it.
+//! it. Every wait on the waiter is bounded ([`ENTER_TIMEOUT_US`],
+//! [`RESULT_SPINS`] then [`RELEASE_SLEEPS`]), so a waiter that never enters
+//! its timed wait, or never comes back from its untimed one, fails the test
+//! instead of hanging it.
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -70,6 +73,17 @@ const LATE_SPAN_US: u64 = WAIT_MS * 1000;
 /// Controller spins this many rounds for the untimed wait's result before
 /// releasing it with a second delivery.
 const RESULT_SPINS: u32 = 200_000;
+
+/// Controller waits this long, in microseconds, for the waiter to enter a
+/// cycle's timed wait before failing the test. Between cycles the waiter only
+/// spins on `ACKED` and publishes its results, so a longer absence is a
+/// waiter that never came back from the previous cycle.
+const ENTER_TIMEOUT_US: u64 = 1_000_000;
+
+/// After the release delivery, the controller sleeps this many 1 ms steps for
+/// the waiter's results before failing the test: an untimed wait the release
+/// does not return is the hazard itself, seen from the controller's side.
+const RELEASE_SLEEPS: u32 = 1000;
 
 /// Waiter → controller handshake: the cycle whose timed wait the waiter is
 /// entering, and the cycle whose results it has published.
@@ -241,10 +255,7 @@ fn cycles(sig: u32, eq: u32) -> Result<Tally, &'static str>
                 event_post(eq, value)
             }
         };
-        while TIMED.load(Ordering::Acquire) != cycle
-        {
-            core::hint::spin_loop();
-        }
+        await_timed_wait(cycle)?;
         if late
         {
             late_delay(cycle)?;
@@ -290,12 +301,30 @@ fn late_delay(cycle: u32) -> TestResult
     Ok(())
 }
 
+/// Wait for the waiter to enter `cycle`'s timed wait, for at most
+/// [`ENTER_TIMEOUT_US`].
+fn await_timed_wait(cycle: u32) -> TestResult
+{
+    let until = elapsed_us()? + ENTER_TIMEOUT_US;
+    while TIMED.load(Ordering::Acquire) != cycle
+    {
+        if elapsed_us()? >= until
+        {
+            return Err("stress::timed_wait_reuse: the waiter did not enter its timed wait");
+        }
+        core::hint::spin_loop();
+    }
+    Ok(())
+}
+
 /// Wait for the waiter to publish `cycle`'s results, releasing its untimed
 /// wait with a second delivery if it has not returned after
-/// [`RESULT_SPINS`].
+/// [`RESULT_SPINS`], and failing if it has still not returned after
+/// [`RELEASE_SLEEPS`] more 1 ms sleeps.
 fn await_results(cycle: u32, deliver: impl Fn(u64) -> Result<(), i64>) -> TestResult
 {
     let mut spins = 0u32;
+    let mut sleeps = 0u32;
     let mut released = false;
     while FINISHED.load(Ordering::Acquire) != cycle
     {
@@ -310,6 +339,14 @@ fn await_results(cycle: u32, deliver: impl Fn(u64) -> Result<(), i64>) -> TestRe
             deliver(2).map_err(|_| "stress::timed_wait_reuse: release failed")?;
             released = true;
         }
+        if sleeps >= RELEASE_SLEEPS
+        {
+            return Err(
+                "stress::timed_wait_reuse: the waiter did not return from its untimed wait after \
+                 the release",
+            );
+        }
+        sleeps += 1;
         let _ = thread_sleep(1);
     }
     Ok(())

@@ -35,24 +35,9 @@ pub struct Launched
     pub provided_endpoint: u32,
 }
 
-/// Build the NUL-separated, NUL-terminated wire blob procmgr's
-/// stack-envelope writer expects from a list of tokens. Returns
-/// `(blob, count)`. Empty input yields an empty blob with `count = 0`,
-/// matching the "no argv / no env" wire shape.
-pub(crate) fn build_blob(tokens: &[String]) -> (Vec<u8>, u32)
-{
-    if tokens.is_empty()
-    {
-        return (Vec::new(), 0);
-    }
-    let mut blob: Vec<u8> = Vec::with_capacity(tokens.iter().map(|t| t.len() + 1).sum());
-    for tok in tokens
-    {
-        blob.extend_from_slice(tok.as_bytes());
-        blob.push(0);
-    }
-    (blob, tokens.len() as u32)
-}
+// The argv/env wire-blob encoder lives beside the parser that bounds its
+// output, so launch, restart, and parse-time validation share one encoding.
+pub(crate) use svcmgr_defs::build_blob;
 
 /// Delete a set of cap slots, skipping the zero sentinel. Used on the
 /// launch/restart cleanup paths where a partially-assembled cap set must

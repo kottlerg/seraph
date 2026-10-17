@@ -682,7 +682,12 @@ fn run(info_ptr: u64) -> !
     // single reap-handoff route once every loader has copied the ELF.
 
     // Memmgr is now ingesting; start procmgr.
-    bootstrap::start_procmgr(&pm);
+    if bootstrap::start_procmgr(&pm).is_err()
+    {
+        logging::log("FATAL: cannot start procmgr");
+        syscall::thread_exit();
+    }
+    logging::log("procmgr started");
 
     // Serve procmgr's bootstrap round.
     //

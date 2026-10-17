@@ -284,7 +284,8 @@ is sound only because the idle thread's time slice is permanently zero, so
 `timer_tick` returns before `schedule()` for it. Kernel-mode preemption
 exists only at a slice expiry with preemption enabled, and every kernel
 window that enables interrupts — shootdown ack-waits, the teardown gates,
-the contended `pt_lock` path, the `sys_thread_stop` drain — runs
+the timer-batch quiesce (`sleep_wakeups_quiesce`), the contended `pt_lock`
+path, the `sys_thread_stop` drain, the `sys_thread_start` settle loop — runs
 preempt-disabled and returns to the saved interrupt state through
 `restore_interrupts`, which writes that state whatever the current one; the
 contract is stated in [arch-interface.md](arch-interface.md). A window that

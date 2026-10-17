@@ -2508,8 +2508,10 @@ pub enum StartCommit
 /// commits only when all four are settled; the commit re-checks them under
 /// the all-CPU locks ([`start_ready_to_link`]), since a concurrent start and
 /// stop can cycle the thread through a run, a park and a claim between a pass
-/// and the commit. A CPU still running the target is prodded into
-/// `schedule()`, where the `Stopped` target's requeue denylist drops it.
+/// and the commit. A CPU still running the target is prodded
+/// ([`prod_remote_cpu`]); it drops the `Stopped` target at its next
+/// slice-expiry `schedule(true)` or the target's own park or yield, where the
+/// requeue denylist leaves it unlinked.
 ///
 /// The loop ends without writing when the target is no longer `Created` or
 /// `Stopped` ([`StartCommit::Refused`]: a concurrent start resumed it, or it
@@ -3620,9 +3622,13 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 
 /// Send a wakeup IPI to `target_cpu` without enqueueing anything.
 ///
-/// Used by `sys_thread_stop` to force a remote Running target to trap
-/// into kernel and run `schedule()`, which then drains the Stopped TCB
-/// via the skip-loop.
+/// Used by `sys_thread_stop` and the `sys_thread_start` settle loop on the
+/// CPU running a target they have marked `Stopped`. The IPI's handler does
+/// no work: the trap it forces snapshots the target's user registers and
+/// returns to user mode, and the CPU drops the `Stopped` target at its next
+/// slice-expiry `schedule(true)` (or the target's own park or yield), where
+/// the requeue denylist leaves it unlinked. The callers' drains wait for
+/// that; the prod itself only exits a `hlt` on an idle CPU.
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`). Self-IPI

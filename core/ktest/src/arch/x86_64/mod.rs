@@ -24,6 +24,14 @@ use crate::TestContext;
 /// in `EXIT_FAULT_BASE + <vector>` when the fault kills the thread.
 pub const PAGE_FAULT_STORE_VECTOR: u64 = 14;
 
+/// Size of the kernel `TrapFrame` (`core/kernel/src/arch/x86_64/trap_frame.rs`):
+/// the byte count `thread_read_regs` returns.
+pub const TRAP_FRAME_BYTES: u64 = 168;
+
+/// Byte offset of the instruction pointer (`rip`) in the kernel `TrapFrame`:
+/// the field a register-file edit redirects.
+pub const IP_OFFSET: usize = 120;
+
 /// Run every x86-64-specific Tier 1 test.
 pub fn run_unit(ctx: &TestContext)
 {

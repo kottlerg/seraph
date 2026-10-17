@@ -4339,12 +4339,18 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         {}
         // Already Ready (will be dispatched and consume the deposit; a Ready
         // coalesce is only a same-event duplicate), or a concurrent stop/dealloc
-        // already won (Stopped/Exited). Either way: do not link. Release the
-        // wake-in-flight gate so a waiting dealloc_object(Thread) can proceed.
+        // already won (Stopped/Exited). Either way: do not link. The claimed
+        // park's binding is this wake's to clear (a cancel that lost the claim
+        // left it; on Ready it is already clear), then release the
+        // wake-in-flight gate so a waiting dealloc_object(Thread) can proceed
+        // and finds no binding to unlink.
         thread::ThreadState::Ready | thread::ThreadState::Stopped | thread::ThreadState::Exited =>
         {
-            // SAFETY: wake_in_flight written under sched_lock.
+            // SAFETY: the binding and wake_in_flight are written under
+            // sched_lock, held here.
             unsafe {
+                (*tcb).ipc_state = thread::IpcThreadState::None;
+                (*tcb).blocked_on_object = core::ptr::null_mut();
                 (*tcb)
                     .wake_in_flight
                     .store(0, core::sync::atomic::Ordering::Release);

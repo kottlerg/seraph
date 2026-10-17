@@ -142,7 +142,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         {
             break;
         }
-        if crate::spawn::is_exited(child.th)? && PHASE.load(Ordering::Acquire) < PHASE_WROTE
+        // A refused liveness probe is taken as an exit, so this branch cleans up.
+        if crate::spawn::is_exited(child.th).unwrap_or(true)
+            && PHASE.load(Ordering::Acquire) < PHASE_WROTE
         {
             cleanup(ctx, Some(&child), memory_cap);
             return Err("integration::tlb_widen_retry: child killed writing widened mapping");

@@ -106,7 +106,11 @@ identical across both code paths:
   universal `root_dir_cap` for the binary path, then call
   `procmgr_labels::CREATE_FROM_FILE` with argv / env blobs. Both paths
   build the blobs from the recipe: launch from the parsed `Definition`,
-  restart from the stored [`RestartRecipe`](../src/service.rs).
+  restart from the stored [`RestartRecipe`](../src/service.rs). Before
+  minting any cap the primitive refuses (logged, returns `None`) argv / env
+  whose packed layout exceeds `MSG_DATA_WORDS_MAX`, a backstop behind the
+  parser's `TooLarge` rejection; on restart that `None` fails the attempt
+  and is routed through `permanent_death_outcome`.
 * [`apply_namespace_policy`](../src/restart.rs) — resolve the namespace
   cap for `NS_POLICY_NONE` / `_UNIVERSAL` / `_SUBTREE`, then hand it (and
   the optional `cwd` cap) to the shared `configure_namespace_caps`. Both

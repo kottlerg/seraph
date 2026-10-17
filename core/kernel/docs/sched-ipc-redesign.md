@@ -406,6 +406,12 @@ cell.
 
 ## 7. Known residual (separate surface)
 
+Historical: the race below was closed after this redesign by the CLOSURE LEMMA
+(scheduling-internals.md § Cross-CPU TCB Ownership; `cancel_ipc_block` re-reads
+`blocked_on_object` under the client's `sched_lock`, which a dying server nulls
+before it is freed), and #317 is closed. The paragraph records what the redesign
+left open at the time.
+
 One race is acknowledged but deliberately NOT closed by this redesign, because it
 is a different review surface (the rare STOP path, not thread-churn) and needs a
 server-lifetime mechanism this work does not introduce: `cancel_ipc_block(bound)`

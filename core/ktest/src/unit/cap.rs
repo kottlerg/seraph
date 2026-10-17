@@ -992,13 +992,14 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
 
     cap_delete(child.cs)
         .map_err(|_| "stop_bound: cap_delete(cspace) under blocked child failed")?;
-    if !crate::spawn::is_exited(child.th)?
-    {
-        cap_delete(child.th).ok();
-        return Err("stop_bound: blocked child not Exited after its CSpace was deleted");
-    }
-    // Exited is terminal, so the one-poll wait returns the retained reason.
-    if crate::spawn::wait_until_exited(child.th, 1)? != syscall_abi::EXIT_KILLED
+    // Exited is terminal, so the one-poll wait returns the retained reason
+    // from the same state read that refuses a child in any other state.
+    let reason = crate::spawn::wait_until_exited(child.th, 1)
+        .inspect_err(|_| {
+            cap_delete(child.th).ok();
+        })
+        .map_err(|_| "stop_bound: blocked child not Exited after its CSpace was deleted")?;
+    if reason != syscall_abi::EXIT_KILLED
     {
         cap_delete(child.th).ok();
         return Err("stop_bound: blocked child's exit reason is not EXIT_KILLED");
@@ -1025,13 +1026,13 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
 
     cap_delete(child.cs)
         .map_err(|_| "stop_bound: cap_delete(cspace) under spinning child failed")?;
-    if !crate::spawn::is_exited(child.th)?
-    {
-        cap_delete(child.th).ok();
-        return Err("stop_bound: spinning child not Exited after its CSpace was deleted");
-    }
-    // Exited is terminal, so the one-poll wait returns the retained reason.
-    if crate::spawn::wait_until_exited(child.th, 1)? != syscall_abi::EXIT_KILLED
+    // As above: one state read reports the retained reason or refuses.
+    let reason = crate::spawn::wait_until_exited(child.th, 1)
+        .inspect_err(|_| {
+            cap_delete(child.th).ok();
+        })
+        .map_err(|_| "stop_bound: spinning child not Exited after its CSpace was deleted")?;
+    if reason != syscall_abi::EXIT_KILLED
     {
         cap_delete(child.th).ok();
         return Err("stop_bound: spinning child's exit reason is not EXIT_KILLED");

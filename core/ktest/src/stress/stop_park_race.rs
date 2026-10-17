@@ -44,6 +44,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use ipc::IpcMessage;
+use ipc::recv_guard::RecvGuard;
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
     notification_send, notification_wait, system_info, thread_exit, thread_set_affinity,
@@ -396,7 +397,9 @@ fn sleep_peer(_arg: u64) -> !
 }
 
 /// IPC server: answer every call with [`REPLY_LABEL`]; a reply whose caller
-/// was cancelled meanwhile fails and is ignored. Runs until deleted.
+/// was cancelled meanwhile fails and is ignored. Runs until deleted (or
+/// until its endpoint goes first); a `RecvGuard` bounds the retries of a
+/// failed receive (docs/ipc-design.md § Receive-Failure Policy).
 // cast_possible_truncation: the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
 fn server_entry(arg: u64) -> !
@@ -408,13 +411,20 @@ fn server_entry(arg: u64) -> !
     {
         thread_exit()
     }
+    let mut guard = RecvGuard::new(crate::tally::recv_diag);
     loop
     {
         // SAFETY: `buf` was registered as this thread's IPC buffer above.
-        if unsafe { ipc::ipc_recv(ep, buf) }.is_ok()
+        match unsafe { ipc::ipc_recv(ep, buf) }
         {
-            // SAFETY: as above.
-            let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(REPLY_LABEL), buf) };
+            Ok(_) =>
+            {
+                guard.on_success();
+                // SAFETY: as above.
+                let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(REPLY_LABEL), buf) };
+            }
+            Err(e) if e == SyscallError::InvalidCapability as i64 => thread_exit(),
+            Err(e) => guard.on_failure(e),
         }
     }
 }

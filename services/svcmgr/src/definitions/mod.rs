@@ -17,9 +17,9 @@
 //! first-launch (when init didn't bootstrap the service) and restart
 //! (when init did).
 //!
-//! The plain-data recipe types and the `.svc` parser live in the
-//! host-tested `svcmgr-defs` crate (re-exported here); this module keeps
-//! the impure halves:
+//! The plain-data recipe types, the `.svc` parser, and the argv/env
+//! wire-blob encoder `build_blob` live in the host-tested `svcmgr-defs`
+//! crate (re-exported here); this module keeps the impure halves:
 //!
 //! At [`crate::svcmgr_labels::HANDOVER_COMPLETE`] svcmgr calls
 //! [`reconcile::reconcile_and_launch`]:

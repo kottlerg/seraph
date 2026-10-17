@@ -158,11 +158,13 @@ pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
     true
 }
 
-// Pure process-table, badge, and recent-exit logic now lives in the
-// host-testable `procmgr-process-table` crate; the syscall/IPC-bearing
-// operations below stay in the service and drive its lookups. Re-exported so
-// the `process::{ProcessTable, ProcessEntry, RecentExits, MAX_PROCESSES}` paths
-// `main.rs` already uses keep resolving unchanged.
+// Pure process-table, badge, recent-exit, and create-request blob logic
+// (`ChildArgs`, `ChildEnv`, `CreateBlobs`) lives in the host-testable
+// `procmgr-process-table` crate; the syscall/IPC-bearing operations below
+// stay in the service and drive its lookups. Re-exported so the
+// `process::{ProcessTable, ProcessEntry, RecentExits, MAX_PROCESSES}` paths
+// `main.rs` uses, and its `process::CreateBlobs::extract` call sites in the
+// two create handlers, resolve through this module.
 pub use process_table::{
     ChildArgs, ChildEnv, CreateBlobs, MAX_PROCESSES, ProcessEntry, ProcessTable, RecentExits,
     badge_is_acceptable, resolve_spawn_sched,

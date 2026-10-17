@@ -104,6 +104,7 @@ its child body and exits, and an unmatched token falls through to the normal run
 | `sandbox-child`             | `namespace`    | `ns_sandbox` (namespace attenuation)        |
 | `programs-child`            | `namespace`    | `ns_programs_subtree` (`/programs` subtree) |
 | `cwd-child`                 | `procmgr`      | `command_cwd_inherit` (cwd-cap delivery)    |
+| `blobs-fill-child`          | `procmgr`      | `command_blobs_fill_message` (argv/env at the message bound) |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |
 | `random-diverge-child`      | `random`       | `random` (per-process hash seed)            |

@@ -353,7 +353,8 @@ pub fn command_blobs_fill_message_phase(_: &Caps)
     assert_eq!(
         status.code(),
         Some(0),
-        "blob-fill child did not see the packed argv and env intact: {status}"
+        "blob-fill child exit {status}: 6=argv mismatch, 7=env mismatch \
+         (see blobs_fill_child_main)"
     );
     std::os::seraph::log!("command_blobs_fill_message phase passed");
 }

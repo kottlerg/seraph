@@ -672,7 +672,9 @@ pub struct ThreadControlBlock
     /// Set by a waker that claims the thread from a wait object (notification,
     /// endpoint, event queue, or wait set) under that object's lock, and by
     /// `endpoint_call` / `endpoint_recv` before they publish a reply binding
-    /// to it. Cleared by `enqueue_and_wake` when the owed wake lands, or, for a
+    /// to it. Cleared by `enqueue_and_wake` when the owed wake lands (on the
+    /// arms that do not link, after it releases `sched_lock`: the clear is the
+    /// waker's last touch of the TCB), or, for a
     /// reply binding no wake will follow, by the path whose `reply_tcb` CAS
     /// tore the binding down (`cancel_ipc_block`, the endpoint park rollbacks,
     /// the `dealloc_object(Thread)` detach).

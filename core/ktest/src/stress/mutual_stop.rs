@@ -55,16 +55,20 @@
 //! that returned `Ok` equal the starts that returned `Ok` from the peer and
 //! from the controller together, since each child is the only stopper of the
 //! other and the kernel commits exactly one start per stop; and some round's
-//! two restarts both returned `Ok`, the witness that a mutual stop occurred:
-//! a stopped child stops no one and only the controller restarts one, so
-//! when the first restart finds one child stopped and the second, issued
-//! before the child it released can have run its spin and stopped its peer
-//! again, finds the other stopped too, both were stopped at once, which only
-//! concurrent stops of each other leave behind (a mutual stop's pair goes
-//! uncounted when the released child restarts its peer before the controller
-//! does, so the count is a floor). On the unfixed kernel the first mutual
-//! stop wedges CPUs 1 and 2, the controller's next restart waits forever for
-//! a child to leave its CPU, and the boot ends in the harness watchdog.
+//! two restarts both returned `Ok`, the witness of a mutual stop: a stopped
+//! child stops no one and only the controller restarts one, so when the
+//! first restart finds one child stopped and the second finds the other
+//! stopped too, both were stopped at once, which only concurrent stops of
+//! each other leave behind, provided the second restart is issued before
+//! the child the first released has run its spin and stopped its peer
+//! again. The count is a floor under that timing assumption (a mutual
+//! stop's pair goes uncounted when the released child restarts its peer
+//! before the controller does); a controller delayed between its two
+//! restarts, however briefly, can count a sequential stop instead, so the
+//! witness is statistical, not exact. On the unfixed kernel the first
+//! mutual stop wedges CPUs 1 and 2, the controller's next restart waits
+//! forever for a child to leave its CPU, and the boot ends in the harness
+//! watchdog.
 //!
 //! Needs **≥ 3 CPUs**.
 
@@ -177,8 +181,10 @@ struct Tally
     /// Per child: loops it had counted when the rounds ended.
     progress_in_rounds: [u32; CHILDREN],
     /// Rounds whose two restarts both returned `Ok`: pairs a mutual stop
-    /// left stopped (the module doc says why), a floor since the released
-    /// child may restart its peer first. Required non-zero.
+    /// left stopped (the module doc says why), a floor under a timing
+    /// assumption: the released child may restart its peer first (the pair
+    /// uncounted), and a controller delayed between its two restarts may
+    /// count a sequential stop. Required non-zero.
     both_restarted: u32,
     /// Rounds in which a child counted no loop within [`ROUND_WAIT_US`].
     starved: u32,

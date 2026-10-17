@@ -77,6 +77,13 @@ pub use syscall_abi::{
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
 
 /// Issue a syscall with up to 2 arguments. Returns the primary return value.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a1` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -103,6 +110,14 @@ unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64
     ret
 }
 
+/// Issue a syscall with up to 2 arguments. Returns the primary return value.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a1` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -127,6 +142,13 @@ unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64
 }
 
 /// Issue a syscall with up to 4 arguments.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a3` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -154,6 +176,14 @@ unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
     ret
 }
 
+/// Issue a syscall with up to 4 arguments.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a3` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -180,6 +210,13 @@ unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
 }
 
 /// Issue a syscall with up to 5 arguments. Returns the primary return value.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a4` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -208,6 +245,14 @@ unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
     ret
 }
 
+/// Issue a syscall with up to 5 arguments. Returns the primary return value.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a4` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -235,6 +280,13 @@ unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
 }
 
 /// Issue a syscall with up to 3 arguments.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a2` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -261,6 +313,14 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
     ret
 }
 
+/// Issue a syscall with up to 3 arguments.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a2` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -290,6 +350,13 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 /// r9 is marked clobbered because `SYS_IPC_CALL`'s kernel handler writes
 /// `reply_word_count` into r9 via `set_ipc_call_return`; even though this
 /// wrapper does not read r9, LLVM must not assume r9 is preserved.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a4` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -321,6 +388,14 @@ unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) ->
     (ret, secondary)
 }
 
+/// Issue a syscall with up to 5 arguments. Returns (primary, secondary).
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a4` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -354,6 +429,13 @@ unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) ->
 /// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary, quaternary).
 ///
 /// Used by `ipc_recv` to retrieve `(ret, label, badge, word_count)`.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0` that call's
+/// argument per `core/kernel/docs/syscalls.md`; a pointer argument must be
+/// valid for the access the call's contract specifies. The kernel ABI's
+/// register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -385,6 +467,16 @@ unsafe fn syscall1_ret4(nr: u64, a0: u64) -> (i64, u64, u64, u64)
     (ret, secondary, tertiary, quaternary)
 }
 
+/// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary, quaternary).
+///
+/// Used by `ipc_recv` to retrieve `(ret, label, badge, word_count)`.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0` that call's
+/// argument per `core/kernel/docs/syscalls.md`; a pointer argument must be
+/// valid for the access the call's contract specifies. The kernel ABI's
+/// register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -416,6 +508,13 @@ unsafe fn syscall1_ret4(nr: u64, a0: u64) -> (i64, u64, u64, u64)
 /// Issue a syscall with 6 arguments; read back 3 return values.
 ///
 /// Used by `raw_ipc_call` to retrieve `(ret, reply_label, reply_word_count)`.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a5` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -456,6 +555,16 @@ unsafe fn syscall6_ret3(
     (ret, secondary, tertiary)
 }
 
+/// Issue a syscall with 6 arguments; read back 3 return values.
+///
+/// Used by `raw_ipc_call` to retrieve `(ret, reply_label, reply_word_count)`.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a5` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
@@ -494,6 +603,13 @@ unsafe fn syscall6_ret3(
 }
 
 /// Issue a syscall with 6 arguments. Returns the primary return value.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a5` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -523,6 +639,14 @@ unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64
     ret
 }
 
+/// Issue a syscall with 6 arguments. Returns the primary return value.
+///
+/// # Safety
+///
+/// `nr` must be a syscall number the kernel defines and `a0`..`a5` that
+/// call's arguments in the order `core/kernel/docs/syscalls.md` gives; a
+/// pointer argument must be valid for the access the call's contract
+/// specifies. The kernel ABI's register clobbers are declared in the asm.
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.

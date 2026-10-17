@@ -25,6 +25,34 @@ re-authors the default-init bundle). See
 [`xtask/README.md`](../../xtask/README.md) for the bundle-vs-mkdisk
 authoring discipline.
 
+## Source Layout
+
+```
+ktest/
+├── Cargo.toml              # Workspace member; no_std binary
+├── README.md
+└── src/
+    ├── main.rs             # _start, InitInfo intake, TestContext, run_test!, tier dispatch,
+    │                       # summary, shutdown
+    ├── cmdline.rs          # Compile-time configuration (KtestConfig::DEFAULT)
+    ├── serial.rs           # Direct serial output
+    ├── framebuffer.rs      # Direct framebuffer output
+    ├── frame_pool.rs       # Memory capability pool for tests that map memory
+    ├── spawn.rs            # Child-thread spawn helpers, argument blocks, exit probes
+    ├── tally.rs            # Failure tallies and receive-guard diagnostics for stress cells
+    ├── ioport.rs           # Per-thread I/O port access (x86-64)
+    ├── acpi_shutdown.rs    # ACPI S5 shutdown (x86-64)
+    ├── sbi_shutdown.rs     # SBI SRST shutdown (RISC-V)
+    ├── arch/               # Arch-dispatch surface (see Test structure)
+    │   ├── mod.rs          # Selects the active arch module by target_arch
+    │   ├── x86_64/         # x86-64 entry points, constants, and arch-only tests
+    │   └── riscv64/        # RISC-V entry points, constants, and arch-only tests
+    ├── unit/               # Tier 1: per-syscall isolation tests, one file per surface
+    ├── integration/        # Tier 2: cross-subsystem scenarios, one file per scenario
+    ├── stress/             # Tier S: race and exhaustion cells, one file per race
+    └── bench/              # Tier 3: cycle-count benchmarks, one file per surface
+```
+
 ## Test structure
 
 Tests are organised across four tiers (unit, integration, stress, and
@@ -166,7 +194,8 @@ in `stress/mod.rs` mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
 | `stop_fault_sender.rs` | Stop and restart a thread faulting in a loop while its fault handler dequeues each fault from the send queue and replies `RESUME`; a stop that cancels a fault no reply claimed kills the faulter by design, and every `RESUME` reply that returned `Ok` must be honoured: the completed faults equal the `Ok` replies (#443; ≥ 3 CPUs) | `CYCLES=1000` |
 | `mutual_stop.rs` | Two children holding each other's Thread cap stop and restart each other in a loop while the controller restarts whichever pair a mutual stop left stopped; both must exit voluntarily, both must make progress, every stop and start must return an accepted result, per direction the `Ok` stops equal the `Ok` starts, and some round must find both stopped (the witness of a mutual stop) (needs ≥ 3 CPUs; on the unfixed kernel the first mutual stop wedges both CPUs) | `CYCLES=200` |
 | `stop_repark.rs` | Stop and restart a waiter alternating between two notifications, then two event queues, while a sender delivers to whichever it is parked on, so a stop's cancellation races a wake that re-parks the waiter on the other source; every wait returns its own source's result or `Interrupted`, deliveries on both sources are consumed during and after the rounds, and some stop interrupts a wait (needs ≥ 3 CPUs) | `CYCLES=1000` per phase |
-| `stop_claimed_delete.rs` | Each round parks a fresh waiter on a fresh notification, then event queue, while a sender serves each wait it enters; the controller stops the waiter around the sender's claim of its park, waits the sender out, deletes the source's last capability, then the stopped waiter's Thread capability (the delete that walked the freed source through the binding a lost cancel left for its waker); every wait returns the delivery or `Interrupted`, every live delivery succeeds, deliveries are consumed, and some stop lands on a waiter inside a wait (the claimed-then-stopped interleaving is reached statistically; the kernel's debug assertions are the tripwires) (≥ 3 CPUs) | `CYCLES=1000` per phase |
+| `stop_claimed_delete.rs` | Each round parks a fresh waiter on a fresh notification, then event queue, while a sender serves each wait it enters; the controller stops the waiter around the sender's claim of its park, alone and then racing a second stopper whose stop lands concurrently (`Ok`, or `InvalidState` for a waiter the other stop reached first), waits the sender out, deletes the source's last capability, then the stopped waiter's Thread capability (the delete that walks the freed source through a binding a lost cancel leaves for its waker, or a won cancel's tail leaves when another stop commits between the claim and the tail); every wait returns the delivery or `Interrupted`, every delivery succeeds, deliveries are consumed, some stop lands on a waiter inside a wait, and with the second stopper some of its stops commit (the claimed-then-stopped interleavings are reached statistically; the kernel's debug assertions are the tripwires) (≥ 4 CPUs) | `CYCLES=1000` per phase (four phases) |
+| `stop_target_vanishes.rs` | Stop a stopper while it drains a target it has stopped on a third CPU, then make its handle to that target vanish before restarting it: delete the target's last Thread cap (the target is torn down and respawned), then move the cap to a fresh slot (the target lives on), so the resumed drain re-resolves a slot that no longer names its target and returns at once; the stopper must loop again in every round and the target progress after it, every stop and start by the stopper must return an accepted result, some stop must land in the drain (the stopper's in-syscall flag with a probe stop answering `InvalidState`) and at least as many of its calls must hit `InvalidCapability`, and the stopper and the last target must exit voluntarily (≥ 3 CPUs; without the slot re-check the first delete round's restart reads a freed TCB) | `CYCLES=200` per phase |
 | `timed_wait_source_delete.rs` | Destroy a notification or event queue around a timed waiter's deadlines; each wait ends in a timeout, `Interrupted`, or `InvalidCapability` (≥ 2 CPUs) | `CYCLES=200`, `WAIT_MS=1` |
 | `timed_waiter_thread_delete.rs` | Delete a timed waiter's last Thread cap around its deadlines (plain sleep, notification, event queue) (≥ 2 CPUs) | `CYCLES=192`, `WAIT_MS=1` |
 | `timed_wait_reuse.rs` | A timed wait claimed by a delivery at its deadline, followed by an untimed wait on the same source: the untimed wait never returns a timeout (≥ 2 CPUs) | `CYCLES=400`, `WAIT_MS=1` |
@@ -179,7 +208,7 @@ in `stress/mod.rs` mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
 | `concurrent_map_unmap.rs` | Multiple threads mapping/unmapping distinct VAs in the same address space | `NUM_CHILDREN=16`, `MAP_ITERATIONS=1000` |
 | `retype_concurrent.rs` | Multiple workers retyping concurrently against one Memory-backed allocator | `NUM_WORKERS=64`, `ITERS_PER_WORKER=1000` |
 | `split_delete_race.rs` | A same-CSpace sibling deletes the original while this thread splits it across three reparent batches; the split's result classifies each cycle and the slot count returns to baseline | `CYCLES=40`, `CHILDREN=600` |
-| `fpu_migration_churn.rs` | 100 cycles of FPU-owner thread migration across CPUs; validates eager save / lazy restore under churn | `CYCLES=100` |
+| `fpu_migration_churn.rs` | 100 cycles of FPU-owner thread migration across CPUs; validates eager save / lazy restore under churn (≥ 2 CPUs) | `CYCLES=100` |
 | `concurrent_event_producers.rs` | Multiple producers post concurrently to one event queue; consumer verifies every producer's full sequence | `NUM_PRODUCERS=4`, `MESSAGES_PER_PRODUCER=64` |
 
 ### Tier 3 — `src/bench/`
@@ -240,7 +269,7 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   it does, or poll a Memory cap's available bytes until they return to a
   baseline; the way a test observes a deferred (off-CPU) reclaim completing.
 - `tally::BadTally` — a count of the results a stress cell's children
-  recorded as bad, with the last such result word; a child cannot return a
+  recorded as bad, with one of the last such result words; a child cannot return a
   `TestResult`, so the cell's report `check`s each tally (logging the count
   and the last result under the cell's name) once the rounds are over.
   `tally::log_error(label, error)` logs a syscall error word, and
@@ -289,6 +318,23 @@ On RISC-V shutdown uses SBI SRST via the `SYS_SBI_CALL` syscall.
 Each tier has its own flag (`run_unit`, `run_integration`, `run_stress`,
 `run_bench`), all `true` by default, so every tier runs. Clearing flags
 before recompiling is how a narrower-scope run is produced.
+
+---
+
+## Relevant Design Documents
+
+| Document | Content |
+|---|---|
+| [docs/testing.md](../../docs/testing.md) | Tier taxonomy, the `[ktest]` marker, sysroot layout, and gating |
+| [docs/build-system.md](../../docs/build-system.md) | Toolchain, the sysroot, and the `cargo xtask` commands that build and boot ktest |
+| [docs/bootstrap.md](../../docs/bootstrap.md) | The kernel's init handover ktest receives in place of init |
+| [abi/init-protocol/README.md](../../abi/init-protocol/README.md) | `InitInfo`: the page and initial capability set ktest reads at `_start` |
+| [core/kernel/docs/syscalls.md](../kernel/docs/syscalls.md) | The syscall surface Tier 1 exercises, with each call's errors |
+| [core/kernel/docs/thread-lifecycle-and-sleep.md](../kernel/docs/thread-lifecycle-and-sleep.md) | The stop protocol and park semantics the stop and sleep stress cells race |
+| [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics and the receive-failure policy the cells' `RecvGuard`s follow |
+| [docs/fault-handling.md](../../docs/fault-handling.md) | The pager protocol the fault integration tests and `stop_fault_sender` drive |
+| [docs/console-model.md](../../docs/console-model.md) | ktest's direct serial and framebuffer output across boot |
+| [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety, and testing rules |
 
 ---
 

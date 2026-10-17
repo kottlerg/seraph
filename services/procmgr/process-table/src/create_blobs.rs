@@ -20,9 +20,11 @@ use ipc::{ARGS_BLOB_MAX, IpcMessage};
 /// `blob` is a concatenation of `count` NUL-terminated UTF-8 strings. Empty
 /// slice + zero count means "no argv". The blob format is defined by the
 /// argv section comment above `ProcessInfo::args_offset` in
-/// `abi/process-abi/src/lib.rs`; the bound is the wire limit the decoder
-/// enforces — at most `ipc::ARGS_BLOB_MAX` bytes per blob, argv and env
-/// together within `MSG_DATA_WORDS_MAX`, an oversize blob degraded to empty.
+/// `abi/process-abi/src/lib.rs`; the bounds are the create-request wire
+/// contract in `services/procmgr/docs/ipc-interface.md` § `CREATE_PROCESS`, as
+/// [`CreateBlobs::extract`] applies it: a blob declared over
+/// `ipc::ARGS_BLOB_MAX` is empty here, and a blob declared past the delivered
+/// words keeps its declared length with the undelivered tail zero.
 #[derive(Clone, Copy, Default)]
 pub struct ChildArgs<'a>
 {
@@ -33,7 +35,7 @@ pub struct ChildArgs<'a>
 /// Environment variables delivered to a child process at spawn time.
 ///
 /// Same shape as [`ChildArgs`] except each entry is `KEY=VALUE`. Empty
-/// slice + zero count means "no env". Same wire bound.
+/// slice + zero count means "no env". Same wire contract and decoding.
 #[derive(Clone, Copy, Default)]
 pub struct ChildEnv<'a>
 {

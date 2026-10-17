@@ -7,12 +7,13 @@
 //!
 //! A race cell's children classify each result of the syscalls under test
 //! into the results the scenario accepts and the rest. A child cannot return
-//! a `TestResult`, so it counts the rest, keeping the last offending result
-//! word, in a [`BadTally`] the cell's report checks once the rounds are
-//! over; the tally is the channel through which a child's failure reaches
-//! the verdict. [`log_error`] prints a syscall error word the way the
-//! tallies record it, and [`recv_diag`] is the diagnostic hook the cells'
-//! blocking receive loops hand their `RecvGuard`
+//! a `TestResult`, so it counts the rest, keeping an offending result word,
+//! in a [`BadTally`] the cell's report checks once the rounds are over; the
+//! tally is the channel through which a child's failure reaches the
+//! verdict. [`log_error`] prints a syscall error word the way the tallies
+//! record it, [`log_cell_u64`] prints a value under a cell's name, and
+//! [`recv_diag`] is the diagnostic hook the cells' blocking receive loops
+//! hand their `RecvGuard`
 //! ([docs/ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure
 //! Policy).
 
@@ -22,8 +23,9 @@ use ipc::recv_guard::RecvFailureStage;
 
 use crate::TestResult;
 
-/// Results a cell's children recorded as bad: their count, and the last
-/// such result word (a value, or an error word) for the failure report.
+/// Results a cell's children recorded as bad: their count, and one of the
+/// last such result words (a value, or an error word) for the failure
+/// report; the last, unless children record concurrently.
 pub struct BadTally
 {
     count: AtomicU32,
@@ -49,7 +51,10 @@ impl BadTally
         self.last.store(0, Ordering::Release);
     }
 
-    /// Record a bad result `word`.
+    /// Record a bad result `word`. The word and the count are two atomics,
+    /// stored one after the other, so under concurrent recorders the word
+    /// the report shows is one of the last recorded, not necessarily the
+    /// last: the report needs a witness of the failure, not its order.
     pub fn record(&self, word: u64)
     {
         self.last.store(word, Ordering::Release);
@@ -88,8 +93,9 @@ impl Default for BadTally
 }
 
 /// Log `value` after `ktest: <cell><suffix>`, composed in a stack buffer (no
-/// heap); a prefix longer than the buffer is cut.
-fn log_cell_u64(cell: &str, suffix: &str, value: u64)
+/// heap); a prefix longer than the buffer is cut. `cell` is the cell's log
+/// name (`stress::<name>`) and `suffix` starts with the separating space.
+pub fn log_cell_u64(cell: &str, suffix: &str, value: u64)
 {
     let mut prefix = [0u8; 96];
     let mut len = 0usize;
@@ -113,8 +119,11 @@ pub fn log_error(label: &str, error: i64)
 
 /// Diagnostic hook for a cell's `RecvGuard`: log the stage and the error
 /// word. ktest logs each cell's name before running it, so the line names
-/// none; at the fatal stage the guard then ends the harness with
-/// `EXIT_RECV_WEDGE`.
+/// none. At the fatal stage the guard then calls `SYS_PROCESS_EXIT` with
+/// `EXIT_RECV_WEDGE`, which ends the calling thread alone, with that exit
+/// reason, since ktest has no procmgr to reap the rest of the process
+/// (core/kernel/docs/syscalls.md § `SYS_PROCESS_EXIT`); the cell's bounded
+/// waits on the dead receiver then fail its round.
 pub fn recv_diag(stage: RecvFailureStage, error: i64)
 {
     let label = match stage

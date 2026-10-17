@@ -1771,7 +1771,7 @@ pub fn readdir(path: &Path) -> io::Result<ReadDir>
 /// to a directory (use `rmdir` / `remove_dir_all` for those).
 pub fn unlink(path: &Path) -> io::Result<()>
 {
-    remove_leaf(path, /*expect_dir=*/ false)
+    remove_leaf(path, NodeKind::File)
 }
 
 /// Remove an empty directory. Returns `NotADirectory` if the leaf
@@ -1779,10 +1779,13 @@ pub fn unlink(path: &Path) -> io::Result<()>
 /// directory is non-empty.
 pub fn rmdir(path: &Path) -> io::Result<()>
 {
-    remove_leaf(path, /*expect_dir=*/ true)
+    remove_leaf(path, NodeKind::Dir)
 }
 
-fn remove_leaf(path: &Path, expect_dir: bool) -> io::Result<()>
+/// Remove the leaf of `path` after confirming it is an `expected` node.
+/// `unlink` and `rmdir` differ only in that expectation and in the std
+/// `ErrorKind` a mismatch maps to.
+fn remove_leaf(path: &Path, expected: NodeKind) -> io::Result<()>
 {
     let ipc_buf = crate::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
@@ -1810,23 +1813,21 @@ fn remove_leaf(path: &Path, expect_dir: bool) -> io::Result<()>
             return Err(e);
         }
     };
-    let kind_is_dir = matches!(walked.kind, NodeKind::Dir);
     let _ = syscall::cap_delete(walked.cap);
-    if expect_dir && !kind_is_dir
+    if walked.kind != expected
     {
         release_split_parent(&split);
-        return Err(io::const_error!(
-            io::ErrorKind::NotADirectory,
-            "seraph fs: target is not a directory",
-        ));
-    }
-    if !expect_dir && kind_is_dir
-    {
-        release_split_parent(&split);
-        return Err(io::const_error!(
-            io::ErrorKind::IsADirectory,
-            "seraph fs: target is a directory",
-        ));
+        return Err(match expected
+        {
+            NodeKind::Dir => io::const_error!(
+                io::ErrorKind::NotADirectory,
+                "seraph fs: target is not a directory",
+            ),
+            NodeKind::File => io::const_error!(
+                io::ErrorKind::IsADirectory,
+                "seraph fs: target is a directory",
+            ),
+        });
     }
 
     let label = fs_labels::FS_REMOVE | ((split.leaf.len() as u64) << 16);

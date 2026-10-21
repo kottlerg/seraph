@@ -386,6 +386,12 @@ pub const SPIN_SITE_DEALLOC_TIMER_DISPATCH: u32 = 6;
 /// `sys_thread_start` settle loop ([`start_under_all_locks`]): spinning until
 /// the target is off every CPU, its save published, and no wake is owed.
 pub const SPIN_SITE_START_SETTLE: u32 = 7;
+/// Register-access wait ([`with_held_frame`]): spinning until a fault-blocked
+/// thread still switching out is off every CPU with its save published.
+pub const SPIN_SITE_REGS_SETTLE: u32 = 8;
+/// `sys_thread_stop` save wait (`await_stopped_save`): spinning until a
+/// target that left its CPU before the commit publishes its save.
+pub const SPIN_SITE_STOP_SAVE: u32 = 9;
 
 /// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
 /// executing, for the softlockup watchdog. A wedged CPU (no non-idle dispatch
@@ -396,7 +402,9 @@ pub const SPIN_SITE_START_SETTLE: u32 = 7;
 /// first of which `stop_threads_bound_to`'s phase-2 spin shares), the
 /// `dealloc_object(AddressSpace)` root-free gate, the timer-dispatch gate the
 /// Notification, `EventQueue`, and Thread dealloc arms share, the
-/// `sys_thread_start` settle loop (`start_under_all_locks`), and the
+/// `sys_thread_start` settle loop (`start_under_all_locks`), the register-access
+/// wait (`with_held_frame`), the `sys_thread_stop` save wait
+/// (`await_stopped_save`), and the
 /// `schedule()` context-saved dispatch barrier — the protocol spins that can
 /// wedge a CPU silently (the `sys_thread_stop` drain carries its own
 /// overlong-duration warning). Diagnostic-only — never gates control flow.
@@ -441,6 +449,8 @@ fn spin_site_name(site: u32) -> &'static str
         SPIN_SITE_DEALLOC_AS_ACTIVE => "dealloc:as-active",
         SPIN_SITE_DEALLOC_TIMER_DISPATCH => "dealloc:timer-dispatch",
         SPIN_SITE_START_SETTLE => "start:settle",
+        SPIN_SITE_REGS_SETTLE => "regs:settle",
+        SPIN_SITE_STOP_SAVE => "stop:save",
         _ => "none",
     }
 }
@@ -1190,11 +1200,14 @@ fn watchdog_dump(reason: &str)
                 value
             );
         }
-        // Dump the user-mode trap frame if present: tells us where in
-        // userspace the thread entered its currently-stuck syscall.
-        // SAFETY: trap_frame is set by every userspace-syscall entry and
-        // cleared on userspace return; reading the pointed-to TrapFrame
-        // races benignly with concurrent writes (we're already in stall).
+        // Dump the user-mode trap frame if present: the frame of the
+        // thread's last entry from user mode (republished by the syscall
+        // dispatcher for an in-flight syscall), telling where in userspace
+        // it entered the kernel.
+        // SAFETY: trap_frame is an atomic pointer, so the load is race-free;
+        // the pointed-to frame is on the stalled thread's kernel stack and the
+        // field reads race benignly with that thread's own writes (we're
+        // already in stall).
         let user_frame = unsafe {
             let s = scheduler_for(cpu);
             let cur = s.current;
@@ -1204,7 +1217,9 @@ fn watchdog_dump(reason: &str)
             }
             else
             {
-                (*cur).trap_frame
+                (*cur)
+                    .trap_frame
+                    .load(core::sync::atomic::Ordering::Relaxed)
             };
             if tf.is_null()
             {
@@ -2193,7 +2208,7 @@ pub fn init(cpu_count: u32) -> u32
                     is_user: false,
                     saved_state: saved,
                     kernel_stack_top: stack_top,
-                    trap_frame: core::ptr::null_mut(),
+                    trap_frame: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                     address_space: core::ptr::null_mut(),
                     cspace: core::ptr::null_mut(),
@@ -2843,7 +2858,12 @@ pub unsafe fn with_held_frame<R>(
                 let run = access.take();
                 // SAFETY: trap_frame is read under the held sched_lock; access
                 // is the caller's.
-                let frame = unsafe { (*tcb).trap_frame }.cast::<u8>();
+                let frame = unsafe {
+                    (*tcb)
+                        .trap_frame
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                }
+                .cast::<u8>();
                 Some(run.map(|f| f(frame)))
             }
             Look::Refused => Some(None),
@@ -2864,11 +2884,13 @@ pub unsafe fn with_held_frame<R>(
             waiting = Some(unsafe { crate::arch::current::cpu::save_and_disable_interrupts() });
             // SAFETY: ring 0; IDT loaded; preempt disabled.
             unsafe { crate::arch::current::interrupts::enable() };
+            spin_site_enter(SPIN_SITE_REGS_SETTLE);
         }
         core::hint::spin_loop();
     };
     if let Some(saved_int) = waiting
     {
+        spin_site_exit();
         // SAFETY: saved_int from save_and_disable_interrupts above.
         unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
         crate::percpu::preempt_enable();
@@ -5915,7 +5937,13 @@ pub(crate) unsafe extern "C" fn user_thread_trampoline() -> !
     // to a valid, initialized TrapFrame. The initial RSP for this function is set below the
     // TrapFrame (see sys_cap_create_thread: trampoline_rsp = kstack_top - tf_size - TRAMPOLINE_FRAME)
     // so this C function's stack frame does not overlap the TrapFrame.
-    unsafe { crate::arch::current::context::return_to_user((*tcb).trap_frame) }
+    unsafe {
+        crate::arch::current::context::return_to_user(
+            (*tcb)
+                .trap_frame
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
 }
 
 // ── enter ─────────────────────────────────────────────────────────────────────
@@ -6010,7 +6038,9 @@ pub fn enter() -> !
 
     // Record the trap_frame pointer in the TCB so future trap handlers can
     // find the correct frame when the thread is running.
-    init_tcb.trap_frame = tf_ptr;
+    init_tcb
+        .trap_frame
+        .store(tf_ptr, core::sync::atomic::Ordering::Relaxed);
 
     // Mark init's address space as active on CPU 0 (BSP) before entering user
     // mode. Must precede `first_entry_to_user`, which tags the entry: the active

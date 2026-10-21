@@ -122,7 +122,9 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Store the trap frame pointer so sched::schedule() can find it.
     // SAFETY: target_tcb validated non-null; trap_frame field assignment is valid.
     unsafe {
-        (*target_tcb).trap_frame = tf_ptr;
+        (*target_tcb)
+            .trap_frame
+            .store(tf_ptr, core::sync::atomic::Ordering::Relaxed);
     }
 
     // The first scheduler switch into this thread pulls `SavedState.fs_base`
@@ -203,7 +205,10 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             return Err(SyscallError::InvalidArgument);
         }
-        if (*target_tcb).trap_frame.is_null()
+        if (*target_tcb)
+            .trap_frame
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .is_null()
         {
             return Err(SyscallError::InvalidArgument);
         }
@@ -410,10 +415,12 @@ unsafe fn await_stopped_save(target_tcb: *mut crate::sched::thread::ThreadContro
     let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
     // SAFETY: ring 0; IDT loaded; preempt disabled.
     unsafe { crate::arch::current::interrupts::enable() };
+    crate::sched::spin_site_enter(crate::sched::SPIN_SITE_STOP_SAVE);
     while unsaved()
     {
         core::hint::spin_loop();
     }
+    crate::sched::spin_site_exit();
     // SAFETY: saved_int from save_and_disable_interrupts above.
     unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
     crate::percpu::preempt_enable();

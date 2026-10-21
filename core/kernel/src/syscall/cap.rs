@@ -1139,7 +1139,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 is_user: true,
                 saved_state: saved,
                 kernel_stack_top: kstack_top,
-                trap_frame: core::ptr::null_mut(),
+                trap_frame: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                 address_space: as_ptr,
                 cspace: new_cs_ptr,
@@ -1795,7 +1795,14 @@ fn log_self_cap_delete_refused(tcb: *mut crate::sched::thread::ThreadControlBloc
         return;
     }
     // SAFETY: tcb is the live caller; trap_frame is its in-flight syscall frame.
-    let (tid, tf) = unsafe { ((*tcb).thread_id, (*tcb).trap_frame) };
+    let (tid, tf) = unsafe {
+        (
+            (*tcb).thread_id,
+            (*tcb)
+                .trap_frame
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    };
     if tf.is_null()
     {
         crate::kprintln!(

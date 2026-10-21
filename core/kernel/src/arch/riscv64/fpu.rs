@@ -348,7 +348,9 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
     // SAFETY: trap_frame points at the TCB's on-kernel-stack trap frame
     // and is non-null whenever extended.area is non-null (user threads).
     unsafe {
-        let tf = (*tcb).trap_frame;
+        let tf = (*tcb)
+            .trap_frame
+            .load(core::sync::atomic::Ordering::Relaxed);
         if !tf.is_null()
         {
             (*tf).sstatus &= !(SSTATUS_FS_MASK | SSTATUS_VS_MASK);

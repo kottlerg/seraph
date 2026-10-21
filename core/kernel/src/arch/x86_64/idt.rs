@@ -838,13 +838,17 @@ isr_stub!(isr31, 31, has_error_code = false, ist = 0);
 /// The syscall entry builds its frame in the slot `SYS_THREAD_CONFIGURE` placed
 /// `trap_frame` at (just below the kernel stack top), but an interrupt or
 /// exception trampoline builds it below the hardware iret words and the stub's
-/// two pushes. Every entry from user mode publishes its own frame, so a thread
-/// descheduled from any of them leaves `trap_frame` naming the frame it resumes
-/// from: the frame `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` act on (see
-/// `docs/scheduling-internals.md` § Cross-CPU TCB Ownership). The running
-/// thread is the only writer; a reader on another CPU acts only once the thread
-/// is off every CPU with its save published (`sched::with_held_frame`), which
-/// orders this store before the read.
+/// two pushes. Every entry from user mode at which the thread can be descheduled
+/// publishes its own frame (interrupts, exceptions other than `#DF`/`#MC`, page
+/// faults, syscalls), so a thread descheduled from any of them leaves
+/// `trap_frame` naming the frame it resumes from: the frame
+/// `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` act on (see
+/// `docs/arch-interface.md` § `trap_frame`). The NMI (IST2), `#DF`/`#MC` (IST1,
+/// terminal) and `#NM` (builds no frame) entries publish nothing; none of them
+/// deschedules the thread. The running thread is the only writer; the register
+/// syscalls read only once the thread is off every CPU with its save published
+/// (`sched::with_held_frame`), which orders this store before the read, and the
+/// softlockup watchdog's diagnostic read is of the atomic pointer only.
 ///
 /// # Safety
 /// `frame` must be the live frame an entry from user mode built on the current
@@ -858,7 +862,11 @@ pub(super) unsafe fn publish_user_frame(frame: *mut TrapFrame)
     if !tcb.is_null()
     {
         // SAFETY: tcb is the running thread; it alone writes its trap_frame.
-        unsafe { (*tcb).trap_frame = frame };
+        unsafe {
+            (*tcb)
+                .trap_frame
+                .store(frame, core::sync::atomic::Ordering::Relaxed);
+        };
     }
 }
 
@@ -1437,11 +1445,17 @@ unsafe fn redirect_user_fault(
 {
     // SAFETY: tcb valid; repoint trap_frame at the live frame for the duration of
     // the block, restoring the prior pointer afterward.
-    let saved_tf = unsafe { (*tcb).trap_frame };
+    let saved_tf = unsafe {
+        (*tcb)
+            .trap_frame
+            .load(core::sync::atomic::Ordering::Relaxed)
+    };
     // SAFETY: tcb valid; trap_frame is the live-frame pointer read/edited by the
     // register syscalls while this thread is BlockedOnFault.
     unsafe {
-        (*tcb).trap_frame = frame;
+        (*tcb)
+            .trap_frame
+            .store(frame, core::sync::atomic::Ordering::Relaxed);
     }
 
     // SAFETY: handler bound; trap_frame points at the live frame; no lock held.
@@ -1449,7 +1463,9 @@ unsafe fn redirect_user_fault(
 
     // SAFETY: restore the prior trap_frame pointer.
     unsafe {
-        (*tcb).trap_frame = saved_tf;
+        (*tcb)
+            .trap_frame
+            .store(saved_tf, core::sync::atomic::Ordering::Relaxed);
     }
 
     matches!(outcome, crate::ipc::fault::FaultOutcome::Resume)

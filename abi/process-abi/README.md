@@ -30,20 +30,19 @@ Process startup in Seraph has two layers:
 This crate defines `ProcessInfo` and the memmgr runtime's `main(&StartupInfo) -> !` convention;
 the std-built convention and its `StartupInfo` type are defined by
 [`runtime/ruststd`](../../runtime/ruststd/README.md) (`std::os::seraph`). init and ktest sit
-outside both: their
-handover struct is `InitInfo` (from [`abi/init-protocol`](../init-protocol/README.md)),
-populated by the kernel rather than procmgr, and each consumes it in its own
-`_start` without constructing a `StartupInfo` or calling a `main()`.
+outside both conventions: their handover struct is `InitInfo` (from
+[`abi/init-protocol`](../init-protocol/README.md)), populated by the kernel rather than
+procmgr, and each consumes it in its own `_start` without constructing a `StartupInfo` or
+calling a `main()`.
 
 ---
 
 ## ProcessInfo
 
-The procmgr-to-process handover struct. Placed by procmgr in a single read-only
-page at a virtual address procmgr chooses per-process (via `process-layout`) and
-delivers in the entry register (`rdi`/`a0`), analogous to how the kernel places
-`InitInfo` for init. The address is not a fixed ABI constant — the process reads
-it as the argument to `_start`.
+The creator-to-process handover struct. The creator (procmgr, or init for memmgr and procmgr) places
+it in a single read-only page at a virtual address it chooses per process (via `process-layout`) and
+delivers it in the entry register (`rdi`/`a0`), analogous to how the kernel places `InitInfo` for
+init. The address is not a fixed ABI constant — the process reads it as the argument to `_start`.
 
 The struct MUST be `#[repr(C)]` with stable layout. The process MUST check
 `version == PROCESS_ABI_VERSION` before accessing any other field.

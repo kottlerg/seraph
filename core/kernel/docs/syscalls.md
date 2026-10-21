@@ -1123,7 +1123,8 @@ not virgin, not siblings, or either has children), `InvalidCapability`,
 ### `SYS_THREAD_START` (19)
 
 Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it for scheduling.
-Starting a thread whose fault episode a stop cancelled kills it as an unhandled fault, which posts
+Starting a thread whose fault episode a stop cancelled (before any reply claimed it) kills it as an
+unhandled fault, which posts
 its death and address-space observers (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill).
@@ -1166,8 +1167,10 @@ Stop a running or runnable thread. The thread transitions to `Stopped` state.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-A fault-blocked target's fault episode is cancelled with a kill outcome (no syscall returns) and the
-thread is left `Stopped`; the next `SYS_THREAD_START` kills it as an unhandled fault (see
+A fault-blocked target's fault episode, unless the handler's reply claimed it first, is cancelled
+with a kill outcome (no syscall returns) and the thread is left `Stopped`; the next
+`SYS_THREAD_START` then kills it as an unhandled fault, while a thread whose `RESUME` reply won
+resumes its faulting instruction when next started (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
 cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker or

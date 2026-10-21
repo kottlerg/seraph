@@ -185,9 +185,10 @@ Capabilities passed in IPC messages are moved, not copied; see
 Under the fault-handler protocol ([Fault Handling](fault-handling.md)), a userspace thread fault the
 kernel cannot resolve is delivered to the thread's bound fault-handler endpoint as a
 kernel-originated synchronous message, suspending the thread until the handler replies — resuming
-it, or killing it on `FAULT_REPLY_KILL` — or the binding is severed and the thread is killed, at
-once or, for a thread a stop cancelled, when it is next started (severing by clearing the binding
-mid-fault: design intent; not yet implemented, #242). This reuses the call/reply machinery above —
+it, or killing it on `FAULT_REPLY_KILL` — or the binding is severed and the thread is killed
+(severing by clearing the binding mid-fault: design intent; not yet implemented, #242); a stop of
+the thread before any reply claims the fault cancels the episode too, and the thread is then killed
+only if it is started again. This reuses the call/reply machinery above —
 the suspended thread occupies the caller's role and the handler services it with the ordinary
 receive/reply cycle. See [Fault Handling](fault-handling.md).
 

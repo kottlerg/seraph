@@ -39,8 +39,8 @@
 //! A stop that cancels a fault no reply has claimed kills the faulter on
 //! restart by design (docs/fault-handling.md § Delivery, Resume, and Kill: a
 //! stop "gives the episode a kill outcome and leaves the thread `Stopped`"),
-//! whether the cancel won the send-queue unlink or,
-//! after the handler dequeued the fault, the reply claim. The controller then
+//! whether the cancel won the send-queue unlink or, after the handler
+//! dequeued the fault, the reply claim. The controller then
 //! checks the exit reason is the fault's, has a syncer thread call the handler
 //! with a sync message it answers only once past every earlier message (so any
 //! service of the dead faulter is over), waits for that answer, bounded and

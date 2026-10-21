@@ -13,9 +13,9 @@
 //! constants below; the page-reservation allocator (`std::sys::reserve`)
 //! owns its own arena disjoint from the heap.
 //!
-//! Bootstrap is explicit: `std::os::seraph::heap_bootstrap(procmgr_ep,
-//! self_aspace)` must be called once, after the bootstrap IPC round
-//! that produces `procmgr_ep`, before the first allocation. An
+//! Bootstrap is explicit: `heap_bootstrap(memmgr_ep, self_aspace)` must
+//! be called once, with the `memmgr_endpoint_cap` `ProcessInfo`
+//! delivers, before the first allocation. An
 //! allocation before bootstrap returns a null pointer and the alloc
 //! crate aborts via `handle_alloc_error`.
 //!
@@ -461,12 +461,12 @@ pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
         return false;
     }
 
-    // The base draw happens before the allocator exists: the raw getrandom
+    // The base draw happens before the allocator exists: the getrandom
     // wrapper is a registers-only syscall and must stay non-allocating, like
     // the IPC wrappers below. A failed draw degrades to the deterministic
     // default base (no log surface exists this early).
     let mut entropy = [0u8; 8];
-    let heap_base = match syscall::getrandom(entropy.as_mut_ptr(), entropy.len()) {
+    let heap_base = match syscall::getrandom(&mut entropy) {
         Ok(n) if n == entropy.len() as u64 => {
             HEAP_BASE_DEFAULT
                 + ((u64::from_le_bytes(entropy) & ((1 << HEAP_BASE_SLOTS_LOG2) - 1)) << 12)
@@ -662,50 +662,103 @@ fn slab_round_to_class(bytes: u64) -> u64 {
     }
 }
 
-/// Request a Memory cap from memmgr covering at least `min_pages` 4-KiB
-/// pages. memmgr's best-effort reply may return up to four Memory caps, each
-/// covering one or more contiguous pages. We accept the first cap whose
-/// declared `page_count` is `>= min_pages`; if none qualifies, we fall back
-/// to the first returned cap (any cap unblocks sub-page retypes; a too-small
-/// cap simply means the next page-sized retype request triggers a refresh).
+/// Request one Memory cap from memmgr covering a single contiguous run of at
+/// least `min_pages` 4-KiB pages.
 ///
-/// Returns `Some((slot, pages, phys))` on success, `None` on IPC failure, a
-/// reply carrying no caps, or a reply whose data words do not cover its count
-/// (the declared count is clamped to the caps actually transferred, never
-/// refused). `phys` is the chosen cap's physical base, which memmgr reports
-/// at `data[1 + returned + i]`; the caller passes it to [`slab_release_fresh`]
-/// to return the run to memmgr's pool mid-life. Also used by the pipe
-/// machinery (`sys::pipe`) for ring pages, which need the phys base so the
-/// grant can be returned when the pipe ends its life.
+/// Every caller retypes from or maps exactly one cap, so the request sets
+/// `REQUIRE_CONTIGUOUS`: memmgr replies with one cap covering all `min_pages`
+/// or refuses with `OUT_OF_MEMORY_CONTIGUOUS`. The reply is still treated as
+/// wire input: the first returned cap whose declared page count covers
+/// `min_pages` is kept, and every other cap the reply carries is deleted and
+/// its run returned to memmgr (see [`release_reply_caps`]).
+///
+/// Returns `Some((slot, pages, phys))` on success. `phys` is the kept cap's
+/// physical base, which memmgr reports at `data[1 + returned + i]`; the
+/// caller passes it to [`slab_release_fresh`] to return the run to memmgr's
+/// pool mid-life. Also used by the pipe machinery (`sys::pipe`) for ring
+/// pages, which need the phys base so the grant can be returned when the
+/// pipe ends its life.
+///
+/// Returns `None` on IPC failure, a memmgr error label, a `min_pages` that
+/// does not fit the request's 32-bit page-count field, a reply whose clamped
+/// count (the declared count bounded by the caps actually transferred) is
+/// zero, a reply whose data words do not cover that count, or a reply none of
+/// whose caps covers `min_pages`. A refused reply's caps are released the
+/// same way as the unchosen caps of an accepted one.
 pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u64)> {
     let ipc_buf = current_ipc_buf();
     if ipc_buf.is_null() {
         return None;
     }
-    let msg = ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, min_pages).build();
+    let want = u32::try_from(min_pages).ok()?;
+    // data[0] low half = want_pages, high half = flags.
+    let flags = u64::from(ipc::memmgr_labels::REQUIRE_CONTIGUOUS) << 32;
+    let msg =
+        ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, u64::from(want) | flags).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) }.ok()?;
-    if reply.label != 0 {
-        return None;
-    }
     let caps = reply.caps();
-    // The count is wire input: bound it by the caps actually transferred
-    // and by the words actually delivered (one page count and one phys base
-    // per cap after the count word) before it indexes either.
-    let returned = (reply.word(0) as usize).min(caps.len());
-    if returned == 0 || 1 + 2 * returned > reply.word_count() {
-        return None;
-    }
+    let words = reply.words();
+    // The count is wire input: bound it by the caps actually transferred,
+    // then require the words actually delivered to cover one page count and
+    // one phys base per cap after the count word before either is indexed.
+    // An error reply defines no data layout, so its count is zero.
+    let returned = match words.first() {
+        Some(&count) if reply.label == 0 => (count as usize).min(caps.len()),
+        _ => 0,
+    };
+    let covered = returned != 0 && 1 + 2 * returned <= words.len();
     // Reply layout: data[1+i] = page_count_i, data[1+returned+i] = phys_base_i.
-    // Prefer the first cap that already covers `min_pages`.
-    for i in 0..returned {
-        let pages = reply.word(1 + i);
-        if pages >= min_pages {
-            return Some((caps[i], pages, reply.word(1 + returned + i)));
+    let keep = if covered {
+        (0..returned).find(|&i| words[1 + i] >= min_pages)
+    } else {
+        None
+    };
+    release_reply_caps(memmgr_ep, ipc_buf, caps, words, returned, keep);
+    let i = keep?;
+    Some((caps[i], words[1 + i], words[1 + returned + i]))
+}
+
+/// Delete every cap a `REQUEST_MEMORY_CAPS` reply transferred except the one
+/// at index `keep`, and return each deleted cap's run to memmgr's pool with
+/// one `RELEASE_MEMORY_CAPS` naming the phys bases the reply reported.
+///
+/// `returned` is the reply's clamped count. A cap at or past it, or one whose
+/// phys word the reply did not deliver, has no base to name: its slot is
+/// still freed, and its run stays accounted to this process until it dies.
+/// The release is best-effort: memmgr ignores a base that matches no
+/// outstanding grant, and a failed IPC leaves the runs accounted the same way.
+fn release_reply_caps(
+    memmgr_ep: u32,
+    ipc_buf: *mut u64,
+    caps: &[u32],
+    words: &[u64],
+    returned: usize,
+    keep: Option<usize>,
+) {
+    let mut bases = [0u64; syscall_abi::MSG_CAP_SLOTS_MAX];
+    let mut n = 0;
+    for (i, &cap) in caps.iter().enumerate() {
+        if keep == Some(i) {
+            continue;
+        }
+        let _ = syscall::cap_delete(cap);
+        // `n` stays below `caps.len()`, which the kernel bounds by
+        // `MSG_CAP_SLOTS_MAX`, so the store is in bounds.
+        if let Some(&base) = words.get(1 + returned + i).filter(|_| i < returned) {
+            bases[n] = base;
+            n += 1;
         }
     }
-    // Fallback: take the first (smaller) cap so sub-page retypes still work.
-    Some((caps[0], reply.word(1), reply.word(1 + returned)))
+    if n == 0 {
+        return;
+    }
+    let msg = ipc::IpcMessage::builder(RELEASE_MEMORY_CAPS)
+        .word(0, n as u64)
+        .words(1, &bases[..n])
+        .build();
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+    let _ = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) };
 }
 
 /// Bytes withheld from a fresh grant's local ledger as slack against any
@@ -813,8 +866,8 @@ fn slab_retype_pooled<T>(
             return Some(out);
         }
 
-        // Refill: request a fresh cap from memmgr. One attempt — propagate
-        // failure rather than loop on best-effort partial replies.
+        // Refill: request a fresh contiguous cap from memmgr. One attempt —
+        // propagate failure rather than retry.
         let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
         if ep == 0 {
             return None;

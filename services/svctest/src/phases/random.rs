@@ -82,7 +82,7 @@ fn layout_fingerprint() -> String
 fn draw_u64() -> u64
 {
     let mut buf = [0u8; 8];
-    let n = syscall::getrandom(buf.as_mut_ptr(), buf.len()).expect("SYS_GETRANDOM failed");
+    let n = syscall::getrandom(&mut buf).expect("SYS_GETRANDOM failed");
     assert_eq!(n, buf.len() as u64, "SYS_GETRANDOM short draw");
     u64::from_ne_bytes(buf)
 }
@@ -174,7 +174,7 @@ pub fn random_contention_phase(_: &Caps)
                 for i in 0..DRAWS
                 {
                     let mut buf = [0u8; 32];
-                    let n = syscall::getrandom(buf.as_mut_ptr(), buf.len())
+                    let n = syscall::getrandom(&mut buf)
                         .unwrap_or_else(|e| panic!("thread {t}: SYS_GETRANDOM failed: {e}"));
                     assert_eq!(n, buf.len() as u64, "thread {t}: short draw at {i}");
                     assert_ne!(buf, [0u8; 32], "thread {t}: all-zero draw at {i}");

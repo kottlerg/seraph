@@ -330,7 +330,11 @@ pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, iop
 extern "C" fn log_thread_entry(arg: u64) -> !
 {
     // Register this thread's IPC buffer.
-    if syscall::ipc_buffer_set(LOG_THREAD_IPC_BUF_VA).is_err()
+    // SAFETY: LOG_THREAD_IPC_BUF_VA was mapped by `spawn_log_thread` as this
+    // thread's dedicated IPC buffer page; the log loop reaches it only as the raw
+    // `ipc_buf` pointer the IPC wrappers take, so no Rust reference into it spans
+    // an IPC syscall.
+    if unsafe { syscall::ipc_buffer_set(LOG_THREAD_IPC_BUF_VA) }.is_err()
     {
         serial_log("init: log thread: ipc_buffer_set failed");
         syscall::thread_exit();

@@ -1175,8 +1175,8 @@ yield, or once an object teardown has committed `Exited` over it; the inter-proc
 sent to that CPU only forces a trap. A caller that is itself stopped while it waits deschedules in
 place; once restarted it re-resolves `thread_cap`, and its call completes when the target has left
 its CPU, or at once when that slot no longer names the target with Control rights — the target may
-then still be executing, and a `SYS_THREAD_READ_REGS` through another capability is not guaranteed
-a fresh `trap_frame` (see
+then still be executing, and neither `SYS_THREAD_READ_REGS` nor `SYS_THREAD_WRITE_REGS` through
+another capability is guaranteed to act on the `trap_frame` the target resumes from (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
 Protocol).
 
@@ -1381,6 +1381,12 @@ The buffer receives an architecture-defined register file structure (layout
 published in the kernel ABI headers). If `buf_size` is smaller than the required
 size, the call fails with `InvalidArgument`.
 
+A thread stopped while it runs on another CPU is `Stopped` from the stop's commit, but it executes
+until that CPU deschedules it; the stop call that stopped it returns only after that (see
+[`SYS_THREAD_STOP`](#sys_thread_stop-20)), except a restarted stopper's call whose slot no longer
+names the target. A read in that window may return the frame of the target's previous kernel
+entry; a caller that needs the current registers reads after the stop call returns.
+
 **Capability requirement:** `thread_cap` MUST have Observe rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Observe), `InvalidState`
@@ -1409,6 +1415,12 @@ or otherwise edit the faulting thread before replying (see
 [`docs/fault-handling.md`](../../../docs/fault-handling.md)). The kernel validates
 that the register values are safe (e.g. the instruction pointer is in a canonical
 range; privilege bits cannot be set).
+
+A thread stopped while it runs on another CPU is `Stopped` from the stop's commit, but it executes
+until that CPU deschedules it; the stop call that stopped it returns only after that (see
+[`SYS_THREAD_STOP`](#sys_thread_stop-20)), except a restarted stopper's call whose slot no longer
+names the target. A write in that window succeeds but lands in a frame the target does not
+resume from, so it is lost; a caller writes after the stop call returns.
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
 

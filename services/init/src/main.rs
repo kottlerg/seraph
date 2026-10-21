@@ -426,7 +426,10 @@ fn run(info_ptr: u64) -> !
         logging::log("init: FATAL: cannot place IPC buffer page");
         syscall::thread_exit();
     }
-    if syscall::ipc_buffer_set(INIT_IPC_BUF_VA).is_err()
+    // SAFETY: INIT_IPC_BUF_VA was just mapped as init's dedicated IPC buffer page;
+    // init reaches it only as the raw `ipc_buf` pointer the IPC wrappers take, so no
+    // Rust reference into it spans an IPC syscall.
+    if unsafe { syscall::ipc_buffer_set(INIT_IPC_BUF_VA) }.is_err()
     {
         logging::log("init: FATAL: ipc_buffer_set failed");
         syscall::thread_exit();

@@ -40,9 +40,10 @@
 //! restart by design (docs/fault-handling.md § Delivery, Resume, and Kill:
 //! "the thread is stopped"), whether the cancel won the send-queue unlink or,
 //! after the handler dequeued the fault, the reply claim. The controller then
-//! checks the exit reason is the fault's, calls the handler with a sync
-//! message it answers only once past every earlier message (so any service of
-//! the dead faulter is over), unmaps the page, and respawns the faulter. A
+//! checks the exit reason is the fault's, has a syncer thread call the handler
+//! with a sync message it answers only once past every earlier message (so any
+//! service of the dead faulter is over), waits for that answer, bounded and
+//! polling the handler's exit, unmaps the page, and respawns the faulter. A
 //! fault reply that returned `Ok` won the reply claim, so its `RESUME` stands
 //! and the faulter completes that fault: at the end, the completed faults
 //! must equal the `Ok` replies. The unfixed kernel kills a faulter whose
@@ -53,14 +54,15 @@
 //!
 //! Needs **≥ 3 CPUs**.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use ipc::IpcMessage;
 use ipc::recv_guard::RecvGuard;
 use syscall::{
-    cap_create_endpoint, cap_create_thread, cap_delete, ipc_buffer_set, mem_map, mem_unmap,
-    system_info, thread_configure, thread_exit, thread_set_affinity, thread_set_fault_handler,
-    thread_sleep, thread_start, thread_stop,
+    cap_create_endpoint, cap_create_notification, cap_create_thread, cap_delete, ipc_buffer_set,
+    mem_map, mem_unmap, notification_send, notification_wait, system_info, thread_configure,
+    thread_exit, thread_set_affinity, thread_set_fault_handler, thread_sleep, thread_start,
+    thread_stop,
 };
 use syscall_abi::{
     EXIT_FAULT_BASE, EXIT_VOLUNTARY, FAULT_CLASS_ALL, FAULT_LABEL, FAULT_REPLY_KILL,
@@ -76,10 +78,13 @@ const CELL: &str = "stress::stop_fault_sender";
 /// Stop/start rounds.
 const CYCLES: u32 = 1000;
 
-/// The controller's, the faulter's, and the handler's CPUs.
+/// The controller's, the faulter's, and the handler's CPUs. The syncer shares
+/// the faulter's: it runs only while no faulter does (after a death, and after
+/// the last faulter exited), and otherwise parks in its notification wait.
 const CONTROLLER_CPU: u32 = 0;
 const FAULTER_CPU: u32 = 1;
 const HANDLER_CPU: u32 = 2;
+const SYNCER_CPU: u32 = FAULTER_CPU;
 
 /// CPUs needed: one per participant.
 const MIN_CPUS: u64 = 3;
@@ -91,31 +96,41 @@ const RESERVED_VA: u64 = 0x3E_8000_0000;
 /// Badge bound with the fault handler and delivered in each fault message.
 const FAULT_BADGE: u64 = 0xC0FF_EE08;
 
-/// Label of the controller's sync calls to the handler. The endpoint is FIFO,
-/// so the handler's answer proves it is past every message queued before the
-/// call; the handler keeps receiving after it.
+/// Label of the sync calls the syncer makes to the handler for the
+/// controller. The endpoint is FIFO, so the handler's answer proves it is past
+/// every message queued before the call; the handler keeps receiving after it.
 const SYNC_LABEL: u64 = 0x5EC0;
-/// Label of the controller's last call to the handler, which answers it and
-/// exits. The handler exits on nothing else (a failed receive is retried), so
-/// no controller call can queue on an endpoint nothing receives on.
+/// Label of the syncer's last call to the handler, which answers it and exits.
+/// The handler exits on nothing else short of its receive guard's fatal exit
+/// (a failed receive is retried), and the controller's wait for an answer
+/// polls the handler's exit, so a call left queued on an endpoint nothing
+/// receives on blocks only the syncer.
 const QUIT_LABEL: u64 = 0x5EC1;
 
 /// Bound on each in-round wait, in microseconds.
 const ROUND_WAIT_US: u64 = 100_000;
 
-/// Spins between a waiting controller's polls of the faulter's exit and the
-/// clock (two syscalls); between polls it only reads the counters.
+/// Bound on the controller's wait for the handler to answer a sync call, in
+/// microseconds. The handler answers once it finishes the message it holds,
+/// which takes no blocking syscall; a handler whose receives fail meanwhile
+/// has already failed the cell (each failed receive is tallied), so the bound
+/// need not outlast its receive guard's backoff.
+const SYNC_WAIT_US: u64 = 1_000_000;
+
+/// Spins between a waiting controller's polls of the children's exits and
+/// the clock (syscalls); between polls it only reads the counters.
 const POLL_SPINS: u32 = 1024;
 
 /// Bound on the waits for a child to exit or come up, in 1 ms polls.
 const EXIT_POLLS: u32 = 2000;
 
-/// Stress stack indices of the faulter and the handler.
+/// Stress stack indices of the faulter, the handler, and the syncer.
 const FAULTER_STACK: usize = 0;
 const HANDLER_STACK: usize = 1;
+const SYNCER_STACK: usize = 2;
 
 /// Set by the controller once the rounds are done: the faulter exits at its
-/// next loop top (the handler exits on the controller's [`QUIT_LABEL`] call
+/// next loop top (the handler exits on the syncer's [`QUIT_LABEL`] call
 /// instead, so it answers every call queued before it).
 static QUIT: AtomicU32 = AtomicU32::new(0);
 /// Set by the handler once its IPC buffer is registered.
@@ -133,17 +148,31 @@ static RECV_ENTERED: AtomicU32 = AtomicU32::new(0);
 static RESUMED: AtomicU32 = AtomicU32::new(0);
 /// Fault replies that failed: a stop cancelled the fault under the handler.
 static REPLY_FAILED: AtomicU32 = AtomicU32::new(0);
+/// The label of the call the controller asks the syncer for, stored before
+/// the request's notification send.
+static SYNC_REQUEST: AtomicU64 = AtomicU64::new(0);
+/// Calls to the handler the syncer completed, answered or not.
+static SYNCS_DONE: AtomicU32 = AtomicU32::new(0);
+/// Sync and quit calls the handler answered, counted before its reply, so a
+/// handler that exits after answering the quit call is not taken for one
+/// that exited before it.
+static SYNCS_ANSWERED: AtomicU32 = AtomicU32::new(0);
+/// The syncer's calls that failed or were answered with another label (with
+/// the last such result).
+static BAD_SYNCS: BadTally = BadTally::new();
 /// The handler's maps that failed; and its receives that failed or returned
 /// a message that is neither a fault, a sync, nor the quit call, and its
 /// sync, quit, or echo replies that failed (each with the last such result).
 static MAP_FAILED: BadTally = BadTally::new();
 static BAD_RECVS: BadTally = BadTally::new();
 
-/// The handler's IPC buffer (one live user).
+/// A child's IPC buffer page (one live user each).
 #[repr(C, align(4096))]
 struct IpcBufPage([u64; 512]);
 // SAFETY: used only by the handler, of which one runs per test.
 static mut HANDLER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+// SAFETY: used only by the syncer, of which one runs per test.
+static mut SYNCER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
 /// The handler's arguments, handed to its entry by address.
 #[derive(Clone, Copy)]
@@ -168,7 +197,9 @@ struct Parts
 {
     ep: Option<u32>,
     frame: Option<u32>,
+    sync_notif: Option<u32>,
     handler: Option<u32>,
+    syncer: Option<u32>,
     faulter: Option<u32>,
 }
 
@@ -215,11 +246,14 @@ pub fn run(ctx: &TestContext) -> TestResult
         &RECV_ENTERED,
         &RESUMED,
         &REPLY_FAILED,
+        &SYNCS_DONE,
+        &SYNCS_ANSWERED,
     ]
     {
         counter.store(0, Ordering::Release);
     }
-    for tally in [&UNMAP_FAILED, &MAP_FAILED, &BAD_RECVS]
+    SYNC_REQUEST.store(0, Ordering::Release);
+    for tally in [&UNMAP_FAILED, &MAP_FAILED, &BAD_RECVS, &BAD_SYNCS]
     {
         tally.reset();
     }
@@ -311,7 +345,7 @@ fn with_parts(ctx: &TestContext) -> Result<Tally, &'static str>
     let result = setup(ctx, &mut parts).and_then(|()| {
         let mut tally = Tally::default();
         let ran = rounds(ctx, &mut parts, &mut tally);
-        let ended = finish(ctx, &mut parts, &mut tally);
+        let ended = finish(&mut parts, &mut tally);
         ran?;
         ended?;
         Ok(tally)
@@ -322,7 +356,8 @@ fn with_parts(ctx: &TestContext) -> Result<Tally, &'static str>
 }
 
 /// Create the endpoint, take a page from the frame pool, start the handler
-/// and wait until it receives, then start the first faulter.
+/// and wait until it receives, start the syncer, then start the first
+/// faulter.
 fn setup(ctx: &TestContext, parts: &mut Parts) -> TestResult
 {
     let ep = *parts.ep.insert(
@@ -356,7 +391,29 @@ fn setup(ctx: &TestContext, parts: &mut Parts) -> TestResult
         .ok_or("stress::stop_fault_sender: no handler")?;
     thread_start(handler).map_err(|_| "stress::stop_fault_sender: start handler failed")?;
     await_handler_ready(handler)?;
+    spawn_syncer(ctx, parts, ep)?;
     spawn_faulter(ctx, parts)
+}
+
+/// Create the syncer's request notification, then the syncer, handed the
+/// endpoint and the notification as the two halves of its argument, and
+/// start it.
+fn spawn_syncer(ctx: &TestContext, parts: &mut Parts, ep: u32) -> TestResult
+{
+    let notif = *parts.sync_notif.insert(
+        cap_create_notification(ctx.memory_base)
+            .map_err(|_| "stress::stop_fault_sender: create sync notification failed")?,
+    );
+    create_thread(
+        ctx,
+        &mut parts.syncer,
+        syncer_entry,
+        SYNCER_STACK,
+        (u64::from(notif) << 32) | u64::from(ep),
+        SYNCER_CPU,
+    )?;
+    let syncer = parts.syncer.ok_or("stress::stop_fault_sender: no syncer")?;
+    thread_start(syncer).map_err(|_| "stress::stop_fault_sender: start syncer failed")
 }
 
 /// Create a thread in ktest's own `CSpace`, configured to enter `entry(arg)`
@@ -375,9 +432,9 @@ fn create_thread(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::stop_fault_sender: create thread failed")?,
     );
-    // SAFETY: stress stacks 0 and 1 belong to this test's faulter and
-    // handler; stress tests run sequentially, and the faulter's stack is
-    // reused only after the thread on it exited and was deleted.
+    // SAFETY: stress stacks 0, 1, and 2 belong to this test's faulter,
+    // handler, and syncer; stress tests run sequentially, and the faulter's
+    // stack is reused only after the thread on it exited and was deleted.
     let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack]) });
     thread_configure(th, entry as *const () as u64, top, arg)
         .map_err(|_| "stress::stop_fault_sender: thread_configure failed")?;
@@ -566,7 +623,7 @@ fn stop_and_restart(th: u32, handler: u32, tally: &mut Tally) -> Result<Option<u
 /// [`ROUND_WAIT_US`] elapsed; an expired wait is tallied. A `handler` that
 /// has exited meanwhile (its receive guard's fatal exit ends that thread
 /// alone) fails the round at once: nothing would answer the faulter's
-/// faults or the controller's calls again. The exits and the clock are
+/// faults or the syncer's calls again. The exits and the clock are
 /// syscalls, polled every [`POLL_SPINS`] spins so the reaction to `done`
 /// stays tight.
 fn await_faulter(
@@ -635,7 +692,7 @@ fn faulter_died(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally, reason:
         );
     }
     tally.killed += 1;
-    call_handler(ctx, parts, SYNC_LABEL)?;
+    call_handler(parts, SYNC_LABEL)?;
     mem_unmap(ctx.aspace_cap, RESERVED_VA, 1)
         .map_err(|_| "stress::stop_fault_sender: unmap after a death failed")?;
     if let Some(th) = parts.faulter.take()
@@ -646,36 +703,70 @@ fn faulter_died(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally, reason:
     Ok(())
 }
 
-/// Call the handler with `label` ([`SYNC_LABEL`] or [`QUIT_LABEL`]) and check
-/// its answer, which proves it is past every message queued before the call.
-fn call_handler(ctx: &TestContext, parts: &Parts, label: u64) -> TestResult
+/// Have the syncer call the handler with `label` ([`SYNC_LABEL`] or
+/// [`QUIT_LABEL`]), wait for the call to return, and check the handler's
+/// answer, which proves it is past every message queued before the call.
+///
+/// The call blocks the syncer, not the controller: a handler that exits
+/// (its receive guard's fatal exit) before it receives the call leaves the
+/// call queued for good, so the controller's wait is bounded by
+/// [`SYNC_WAIT_US`] and polls the handler's and the syncer's exits, failing
+/// at once on a handler that exited without answering or a syncer that
+/// exited without completing the call. The syncer is deleted with the rest,
+/// wherever it is.
+fn call_handler(parts: &Parts, label: u64) -> TestResult
 {
-    let ep = parts.ep.ok_or("stress::stop_fault_sender: no endpoint")?;
+    let notif = parts
+        .sync_notif
+        .ok_or("stress::stop_fault_sender: no sync notification")?;
     let handler = parts
         .handler
         .ok_or("stress::stop_fault_sender: no handler")?;
-    // A call nothing receives would block for good.
-    if spawn::is_exited(handler)?
+    let syncer = parts.syncer.ok_or("stress::stop_fault_sender: no syncer")?;
+    let before = SYNCS_DONE.load(Ordering::Acquire);
+    let answered = SYNCS_ANSWERED.load(Ordering::Acquire);
+    SYNC_REQUEST.store(label, Ordering::Release);
+    notification_send(notif, 1)
+        .map_err(|_| "stress::stop_fault_sender: the sync request send failed")?;
+    let start = elapsed_us()?;
+    let mut spins = 0u32;
+    while SYNCS_DONE.load(Ordering::Acquire) == before
     {
-        return Err("stress::stop_fault_sender: the handler exited early");
+        spins = spins.wrapping_add(1);
+        if spins.is_multiple_of(POLL_SPINS)
+        {
+            // Each exit is read before the counter its thread advances
+            // ahead of exiting, so a thread that exits just after doing its
+            // part is not taken for one that exited before it.
+            if spawn::is_exited(handler)? && SYNCS_ANSWERED.load(Ordering::Acquire) == answered
+            {
+                return Err("stress::stop_fault_sender: the handler exited before a sync answer");
+            }
+            if spawn::is_exited(syncer)? && SYNCS_DONE.load(Ordering::Acquire) == before
+            {
+                return Err(
+                    "stress::stop_fault_sender: the syncer exited before its call returned",
+                );
+            }
+            if elapsed_us()?.saturating_sub(start) > SYNC_WAIT_US
+            {
+                return Err("stress::stop_fault_sender: the handler did not answer a sync call");
+            }
+        }
+        core::hint::spin_loop();
     }
-    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-    let reply = unsafe { ipc::ipc_call(ep, &IpcMessage::new(label), ctx.ipc_buf) }
-        .map_err(|_| "stress::stop_fault_sender: call to the handler failed")?;
-    if reply.label == label
-    {
-        Ok(())
-    }
-    else
-    {
-        Err("stress::stop_fault_sender: the handler answered a call with the wrong label")
-    }
+    BAD_SYNCS.check(
+        CELL,
+        "stress::stop_fault_sender: a sync call to the handler failed or was answered with \
+         another label",
+    )
 }
 
 /// End the children: set [`QUIT`], restart the faulter if a failed round
 /// left it stopped, wait for it to exit (voluntarily, or killed by the last
-/// stop), then send the handler its quit call, and wait for it to exit.
-fn finish(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally) -> TestResult
+/// stop), then have the syncer send the handler its quit call, and wait for
+/// both to exit.
+fn finish(parts: &mut Parts, tally: &mut Tally) -> TestResult
 {
     QUIT.store(1, Ordering::Release);
     if let Some(th) = parts.faulter
@@ -703,23 +794,29 @@ fn finish(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally) -> TestResult
         }
     }
     crate::log("ktest: stress::stop_fault_sender rounds done");
-    call_handler(ctx, parts, QUIT_LABEL)?;
+    call_handler(parts, QUIT_LABEL)?;
     let handler = parts
         .handler
         .ok_or("stress::stop_fault_sender: no handler")?;
     spawn::wait_until_exited(handler, EXIT_POLLS)
-        .map_err(|_| "stress::stop_fault_sender: the handler did not exit")
+        .map_err(|_| "stress::stop_fault_sender: the handler did not exit")?;
+    let syncer = parts.syncer.ok_or("stress::stop_fault_sender: no syncer")?;
+    spawn::wait_until_exited(syncer, EXIT_POLLS)
+        .map_err(|_| "stress::stop_fault_sender: the syncer did not exit")
         .map(|_| ())
 }
 
 /// Delete the children (a deletion ends a thread wherever it is, so the
 /// stacks are free for the next test even after a failed round), unmap the
-/// page, return it to the pool, and delete the endpoint.
+/// page, return it to the pool, and delete the notification and the
+/// endpoint.
 fn release(ctx: &TestContext, parts: &Parts) -> TestResult
 {
     let mut ok = true;
     // The faulter first: its fault binding holds a reference on the endpoint.
-    for th in [parts.faulter, parts.handler].into_iter().flatten()
+    for th in [parts.faulter, parts.syncer, parts.handler]
+        .into_iter()
+        .flatten()
     {
         ok &= cap_delete(th).is_ok();
     }
@@ -731,9 +828,9 @@ fn release(ctx: &TestContext, parts: &Parts) -> TestResult
         // map it.
         unsafe { crate::frame_pool::free(frame) };
     }
-    if let Some(ep) = parts.ep
+    for cap in [parts.sync_notif, parts.ep].into_iter().flatten()
     {
-        ok &= cap_delete(ep).is_ok();
+        ok &= cap_delete(cap).is_ok();
     }
     if ok
     {
@@ -783,7 +880,11 @@ fn handler_entry(arg: u64) -> !
     // SAFETY: sole user of HANDLER_IPC_BUF (one handler per test; stress
     // tests run sequentially).
     let buf = core::ptr::addr_of_mut!(HANDLER_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: HANDLER_IPC_BUF is a page-aligned page dedicated to the kernel
+    // while registered: only this thread uses it, and only through the raw
+    // `buf` the `ipc` wrappers take, so no Rust reference into it is live
+    // across an IPC syscall.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }
@@ -811,13 +912,13 @@ fn handler_entry(arg: u64) -> !
                 msg
             }
             // The endpoint goes only after this thread is deleted, so its
-            // loss ends the loop. Exiting on any other failure would leave a
-            // controller call queued meanwhile waiting for good, so the guard
-            // retries it instead: with backoff, and, once a streak proves
-            // the failure persistent, a `SYS_PROCESS_EXIT` with
-            // `EXIT_RECV_WEDGE` that ends this thread alone (ktest has no
-            // procmgr to reap its siblings); the controller's waits poll this
-            // thread's exit and fail the round.
+            // loss ends the loop. The guard retries any other failure: with
+            // backoff, and, once a streak proves the failure persistent, a
+            // `SYS_PROCESS_EXIT` with `EXIT_RECV_WEDGE` that ends this thread
+            // alone (ktest has no procmgr to reap its siblings). Every
+            // controller wait, the wait for a sync answer included, polls
+            // this thread's exit and fails the round; a syncer call left
+            // queued blocks only the syncer, which the release deletes.
             Err(e) if e == SyscallError::InvalidCapability as i64 => break,
             Err(e) =>
             {
@@ -830,13 +931,17 @@ fn handler_entry(arg: u64) -> !
             service_fault(&args, buf);
             continue;
         }
-        if msg.label != SYNC_LABEL && msg.label != QUIT_LABEL
+        if msg.label == SYNC_LABEL || msg.label == QUIT_LABEL
+        {
+            SYNCS_ANSWERED.fetch_add(1, Ordering::AcqRel);
+        }
+        else
         {
             BAD_RECVS.record(msg.label);
         }
         // SAFETY: as above.
         let echoed = unsafe { ipc::ipc_reply(&IpcMessage::new(msg.label), buf) };
-        // A sync reply answers the controller's blocked call, so its failure
+        // A sync reply answers the syncer's blocked call, so its failure
         // is a test defect (unlike a fault reply's, which a stop's
         // cancellation causes by design); tally it so the report names it.
         if let Err(e) = echoed
@@ -881,4 +986,48 @@ fn service_fault(args: &HandlerArgs, buf: *mut u64)
             REPLY_FAILED.fetch_add(1, Ordering::AcqRel);
         }
     }
+}
+
+/// Syncer: register the IPC buffer, then, per request the controller sends
+/// on the notification, call the handler with the requested label, tally a
+/// call that failed or was answered with another label, and count the call
+/// done; exit after the quit call. `arg` holds the endpoint in its low half
+/// and the notification in its high half.
+// cast_possible_truncation: each half of the argument is a 32-bit cap handle.
+#[allow(clippy::cast_possible_truncation)]
+fn syncer_entry(arg: u64) -> !
+{
+    let ep = arg as u32;
+    let notif = (arg >> 32) as u32;
+    // SAFETY: sole user of SYNCER_IPC_BUF (one syncer per test; stress tests
+    // run sequentially).
+    let buf = core::ptr::addr_of_mut!(SYNCER_IPC_BUF).cast::<u64>();
+    // SAFETY: SYNCER_IPC_BUF is a page-aligned page dedicated to the kernel
+    // while registered: only this thread uses it, and only through the raw
+    // `buf` the `ipc` wrappers take, so no Rust reference into it is live
+    // across an IPC syscall.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
+    {
+        thread_exit()
+    }
+    // A failed wait ends the loop; the controller's wait polls this
+    // thread's exit and fails at once.
+    while notification_wait(notif).is_ok()
+    {
+        let label = SYNC_REQUEST.load(Ordering::Acquire);
+        // SAFETY: `buf` was registered as this thread's IPC buffer above.
+        match unsafe { ipc::ipc_call(ep, &IpcMessage::new(label), buf) }
+        {
+            Ok(reply) if reply.label == label =>
+            {}
+            Ok(reply) => BAD_SYNCS.record(reply.label),
+            Err(e) => BAD_SYNCS.record_error(e),
+        }
+        SYNCS_DONE.fetch_add(1, Ordering::AcqRel);
+        if label == QUIT_LABEL
+        {
+            break;
+        }
+    }
+    thread_exit()
 }

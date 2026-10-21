@@ -670,14 +670,18 @@ pub struct ThreadControlBlock
     /// park whose `enqueue_and_wake` has not yet run.
     ///
     /// Set by a waker that claims the thread from a wait object (notification,
-    /// endpoint, event queue, or wait set) under that object's lock, and by
+    /// endpoint, event queue, or wait set) under that object's lock; by the
+    /// sleep timer when it pops a plain sleeper, under `SLEEP_LIST_LOCK`; by
     /// `endpoint_call` / `endpoint_recv` before they publish a reply binding
-    /// to it. Cleared by `enqueue_and_wake` when the owed wake lands (on the
-    /// arms that do not link, after it releases `sched_lock`: the clear is the
-    /// waker's last touch of the TCB), or, for a
-    /// reply binding no wake will follow, by the path whose `reply_tcb` CAS
-    /// tore the binding down (`cancel_ipc_block`, the endpoint park rollbacks,
-    /// the `dealloc_object(Thread)` detach).
+    /// to it; and by a server's `dealloc_object(Thread)` when it claims a
+    /// reply-bound or fault-bound client.
+    ///
+    /// Cleared by `enqueue_and_wake` when the owed wake lands: before it
+    /// releases `sched_lock`, except on a thread already `Exited`, where the
+    /// clear follows the release and is the waker's last touch of the TCB.
+    /// For a reply binding no wake will follow, it is cleared by the path
+    /// whose `reply_tcb` CAS tore the binding down (`cancel_ipc_block`, the
+    /// endpoint park rollbacks, the `dealloc_object(Thread)` detach).
     ///
     /// Two paths wait on it: `dealloc_object(Thread)`, which spins with
     /// Acquire loads after its wait-object unlink and before `retype_free`, so

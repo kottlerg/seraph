@@ -179,8 +179,9 @@ handover contract is defined in
 procmgr is the sole producer of `ProcessInfo` for all non-init
 processes. Init and ktest use a different handover path
 (kernel-produced `InitInfo` from
-[`abi/init-protocol`](../../abi/init-protocol/README.md)) but share the
-same `main()` signature defined in `abi/process-abi`.
+[`abi/init-protocol`](../../abi/init-protocol/README.md)): each consumes
+`InitInfo` in its own `_start`, constructs no `StartupInfo`, and defines
+no `main()` of either shape `abi/process-abi` describes.
 
 ---
 

@@ -414,7 +414,9 @@ fn call(args: &CallerArgs) -> Option<Result<IpcMessage, i64>>
 {
     // SAFETY: buffer `index` belongs to this caller alone.
     let buf = unsafe { core::ptr::addr_of_mut!(CALLER_IPC_BUFS[args.index]) }.cast::<u64>();
-    ipc_buffer_set(buf as u64).ok()?;
+    // SAFETY: `buf` points at a page-aligned static dedicated to this thread's IPC buffer; no Rust
+    // reference into it is ever taken, so the kernel's IPC writes alias no Rust data.
+    unsafe { ipc_buffer_set(buf as u64) }.ok()?;
     notification_send(args.done, args.ready).ok();
     // SAFETY: `buf` was registered as this thread's IPC buffer above.
     Some(unsafe { ipc::ipc_call(args.ep, &IpcMessage::new(args.label), buf) })

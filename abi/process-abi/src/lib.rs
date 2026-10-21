@@ -8,12 +8,13 @@
 //!
 //! Defines [`ProcessInfo`] (the `#[repr(C)]` handover struct placed at a
 //! well-known virtual address before the new process runs) and [`StartupInfo`]
-//! (the Rust-native type passed to `main()`).
+//! (the Rust-native view of it: memmgr's `main` receives it by reference, and
+//! std-built binaries read it through `std::os::seraph::startup_info()`).
 //!
 //! The ABI delivers the kernel-object caps (thread/aspace/cspace), the
-//! pre-mapped IPC buffer, the creator endpoint cap, the procmgr service
-//! endpoint (used to bootstrap the allocator), and the three standard-stream
-//! caps (stdin/stdout/stderr) that back `std::io`. Genuinely service-specific
+//! pre-mapped IPC buffer, the creator endpoint cap, the procmgr and memmgr
+//! service endpoints (the heap bootstraps from the memmgr endpoint), and the
+//! three standard-stream caps (stdin/stdout/stderr) that back `std::io`. Genuinely service-specific
 //! capabilities (registry handles, device caps, block-device endpoints, etc.)
 //! are still requested by the child at startup over IPC on the creator
 //! endpoint — see `shared/ipc/src/lib.rs::bootstrap`.
@@ -525,7 +526,9 @@ pub struct ProcessInfo
 
 // ── StartupInfo ──────────────────────────────────────────────────────────────
 
-/// Rust-native startup information passed to `main()`.
+/// Rust-native view of the startup handover data: memmgr's `main` receives it
+/// by reference, and std-built binaries read it through
+/// `std::os::seraph::startup_info()`.
 ///
 /// Constructed by `_start()` from [`ProcessInfo`].
 pub struct StartupInfo

@@ -36,10 +36,12 @@
 //! - sleep: `Ok` or `Interrupted`.
 //!
 //! Anything else fails the test, as does a kind for which no stop cancelled a
-//! park (the race never armed for it) and a peer that reports no result
-//! within [`RESULT_WAIT_US`] (a call whose server has exited blocks for
-//! good). The kernel's debug assertions (the spurious-resume tripwire, the
-//! pop-time sleep-list checks) are tripwires too.
+//! park (the race never armed for it), a peer that never approaches its park
+//! within [`APPROACH_WAIT_US`] (one that exited, such as a call peer whose IPC
+//! buffer registration failed), and a peer that reports no result within
+//! [`RESULT_WAIT_US`] (a call whose server has exited blocks for good). The
+//! kernel's debug assertions (the spurious-resume tripwire, the pop-time
+//! sleep-list checks) are tripwires too.
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -76,6 +78,17 @@ const RESULT_SPINS: u32 = 200_000;
 /// past it the peer is taken as blocked for good (a call whose server has
 /// exited, a park nothing wakes) and the race fails rather than hangs.
 const RESULT_WAIT_US: u64 = 2_000_000;
+
+/// Bound on the controller's wait for a peer to announce its next park, in
+/// microseconds. A live peer announces at once after the controller's
+/// acknowledgement; past the bound, or once the peer has exited, the race
+/// fails rather than hangs.
+const APPROACH_WAIT_US: u64 = 2_000_000;
+
+/// Spins between the controller's polls of the peer's exit and the clock
+/// (syscalls) while it waits for a park announcement; between polls it only
+/// reads the handshake.
+const POLL_SPINS: u32 = 1024;
 
 /// Peer result codes.
 const RESULT_GENUINE: u32 = 1;
@@ -283,10 +296,7 @@ fn teardown(peer: Option<&spawn::SpawnedChild>, objects: &PhaseObjects) -> TestR
 /// park ended `Interrupted`.
 fn race_once(kind: Kind, peer: u32, source: Option<u32>, cycle: u32) -> Result<bool, &'static str>
 {
-    while PARKING.load(Ordering::Acquire) != cycle
-    {
-        core::hint::spin_loop();
-    }
+    await_parking(peer, cycle)?;
     // Vary the stop's phase against the park: 0 to 4095 spins (a
     // multiplicative hash of the cycle).
     for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 20)
@@ -307,6 +317,28 @@ fn race_once(kind: Kind, peer: u32, source: Option<u32>, cycle: u32) -> Result<b
                   nor Interrupted",
         ),
     }
+}
+
+/// Spin until the peer `peer` announces it is about to park in cycle `cycle`,
+/// for at most [`APPROACH_WAIT_US`] on the `ElapsedUs` clock. The peer's exit
+/// and the clock are polled every [`POLL_SPINS`] spins, so the reaction to
+/// the announcement stays tight; a peer that exited, or that never
+/// announced in time, fails the race.
+fn await_parking(peer: u32, cycle: u32) -> TestResult
+{
+    let start = elapsed_us()?;
+    let mut spins = 0u32;
+    while PARKING.load(Ordering::Acquire) != cycle
+    {
+        spins = spins.wrapping_add(1);
+        if spins.is_multiple_of(POLL_SPINS)
+            && (spawn::is_exited(peer)? || elapsed_us()?.saturating_sub(start) > APPROACH_WAIT_US)
+        {
+            return Err("stress::stop_park_race: the peer never approached its park");
+        }
+        core::hint::spin_loop();
+    }
+    Ok(())
 }
 
 /// Wait for the peer to publish cycle `cycle`'s result: spin [`RESULT_SPINS`]
@@ -343,7 +375,8 @@ fn await_result(kind: Kind, source: Option<u32>, cycle: u32) -> TestResult
     Ok(())
 }
 
-/// Microseconds since boot; the clock the result wait is bounded on.
+/// Microseconds since boot; the clock the announcement and result waits are
+/// bounded on.
 fn elapsed_us() -> Result<u64, &'static str>
 {
     system_info(SystemInfoType::ElapsedUs as u64)
@@ -399,7 +432,11 @@ fn call_peer(arg: u64) -> !
     let ep = arg as u32;
     // SAFETY: sole live user of PEER_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(PEER_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: PEER_IPC_BUF is a page-aligned page dedicated to the kernel
+    // while registered: only this thread uses it, and only through the raw
+    // `buf` the `ipc` wrappers take, so no Rust reference into it is live
+    // across an IPC syscall.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }
@@ -435,7 +472,11 @@ fn server_entry(arg: u64) -> !
     let ep = arg as u32;
     // SAFETY: sole live user of SERVER_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: SERVER_IPC_BUF is a page-aligned page dedicated to the kernel
+    // while registered: only this thread uses it, and only through the raw
+    // `buf` the `ipc` wrappers take, so no Rust reference into it is live
+    // across an IPC syscall.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }

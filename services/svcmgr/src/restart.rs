@@ -361,9 +361,11 @@ fn restart_process(
     // ProcessInfo memory cap) before spawning a fresh one. CSpace teardown
     // cascades: memory caps handed to the dead process via `REQUEST_MEMORY_CAPS`
     // (which procmgr no longer holds caps on) get dec-ref'd and reclaimed
-    // into memmgr's pool. The initial instance was created
-    // by init, not svcmgr, so svcmgr has no handle for it — `process_handle
-    // == 0` on first death, and we skip; subsequent deaths reclaim.
+    // into memmgr's pool. An init-endowed (bind-only) service's initial
+    // instance was created by init, not svcmgr, so svcmgr has no handle for
+    // it — `process_handle == 0` on its first death, and we skip; subsequent
+    // deaths reclaim. A svcmgr-launched service holds the handle
+    // reconciliation recorded at launch, so its first death reclaims too.
     if svc.process_handle != 0
     {
         let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);

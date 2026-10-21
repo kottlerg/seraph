@@ -270,7 +270,9 @@ fn client_entry(arg: u64) -> !
 
     // SAFETY: sole live user of CLIENT_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(CLIENT_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` points at a page-aligned static dedicated to this thread's IPC buffer; no Rust
+    // reference into it is ever taken, so the kernel's IPC writes alias no Rust data.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }
@@ -297,7 +299,9 @@ fn server_entry(arg: u64) -> !
 
     // SAFETY: sole user of SERVER_IPC_BUF.
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` points at a page-aligned static dedicated to this thread's IPC buffer; no Rust
+    // reference into it is ever taken, so the kernel's IPC writes alias no Rust data.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }

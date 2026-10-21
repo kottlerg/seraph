@@ -70,7 +70,8 @@ impl BadTally
     }
 
     /// Fail with `message` if anything was recorded, logging the count and
-    /// the last result under `cell`, the cell's log name (`stress::<name>`).
+    /// the recorded result word (one of the last, per [`record`](Self::record))
+    /// under `cell`, the cell's log name (`stress::<name>`).
     pub fn check(&self, cell: &str, message: &'static str) -> TestResult
     {
         let n = self.count.load(Ordering::Acquire);
@@ -122,8 +123,9 @@ pub fn log_error(label: &str, error: i64)
 /// none. At the fatal stage the guard then calls `SYS_PROCESS_EXIT` with
 /// `EXIT_RECV_WEDGE`, which ends the calling thread alone, with that exit
 /// reason, since ktest has no procmgr to reap the rest of the process
-/// (core/kernel/docs/syscalls.md § `SYS_PROCESS_EXIT`); the cell's bounded
-/// waits on the dead receiver then fail its round.
+/// (core/kernel/docs/syscalls.md § `SYS_PROCESS_EXIT`). Every cell wait
+/// that depends on the receiver is bounded or polls its exit, so the dead
+/// receiver fails the cell's round rather than hanging the harness.
 pub fn recv_diag(stage: RecvFailureStage, error: i64)
 {
     let label = match stage

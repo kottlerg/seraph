@@ -4285,11 +4285,12 @@ unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 /// (all-CPU-locks, ascending) serialises against the link.
 ///
 /// Every exit path clears `wake_in_flight` so a waiting `dealloc_object(Thread)`
-/// can proceed. On the arms that do not link, that clear follows the
-/// `sched_lock` release and is the waker's last touch of the TCB: an `Exited`
-/// thread is held from `retype_free` by the pin alone. The link path clears it
-/// under the held locks: the thread is `Ready` there, and every `Exited` commit
-/// must first take the `sched_lock` this path holds.
+/// can proceed. On every arm but `Exited` the clear precedes the `sched_lock`
+/// release: once the lock drops, the thread can park again and a later claim
+/// re-pin it, which a delayed clear would erase, and the TCB cannot be freed
+/// before an `Exited` commit takes the lock. On the `Exited` arm the clear
+/// follows the release and is the waker's last touch of the TCB: the pin alone
+/// holds `retype_free` there, and an `Exited` thread is never claimed again.
 ///
 /// # Safety
 /// - `tcb` must be a valid [`ThreadControlBlock`] pointer
@@ -4331,14 +4332,16 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         // it Running).
         thread::ThreadState::Running =>
         {
-            // SAFETY: wake_pending written under sched_lock; the pin release
-            // follows the unlock (see the abort arm below).
+            // SAFETY: wake_pending and wake_in_flight written under sched_lock.
+            // The pin is released before the unlock: once the lock drops the
+            // thread can park again and a later claim re-pin it, which a
+            // delayed clear would erase.
             unsafe {
                 (*tcb).wake_pending = true;
-                (*tcb).sched_lock.unlock_raw(sched_saved);
                 (*tcb)
                     .wake_in_flight
                     .store(0, core::sync::atomic::Ordering::Release);
+                (*tcb).sched_lock.unlock_raw(sched_saved);
             }
             return;
         }
@@ -4346,18 +4349,36 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         thread::ThreadState::Blocked | thread::ThreadState::Created =>
         {}
         // Already Ready (will be dispatched and consume the deposit; a Ready
-        // coalesce is only a same-event duplicate), or a concurrent stop/dealloc
-        // already won (Stopped/Exited). Either way: do not link. The claimed
-        // park's binding is this wake's to clear (a cancel that lost the claim
-        // left it; on Ready it is already clear), then release the
-        // wake-in-flight gate so a waiting dealloc_object(Thread) can proceed
-        // and finds no binding to unlink.
-        thread::ThreadState::Ready | thread::ThreadState::Stopped | thread::ThreadState::Exited =>
+        // coalesce is only a same-event duplicate), or a concurrent stop
+        // already won (Stopped). Either way: do not link. The claimed park's
+        // binding is this wake's to clear (a cancel that lost the claim left
+        // it; on Ready it is already clear). The pin is released before the
+        // unlock: once the lock drops a Ready thread can run, park again and be
+        // re-pinned by a later claim, which a delayed clear would erase; and
+        // neither state can be freed before an Exited commit takes this lock.
+        thread::ThreadState::Ready | thread::ThreadState::Stopped =>
         {
-            // SAFETY: the binding is written under sched_lock, held here. The
-            // pin release is this waker's last touch of the TCB: on an Exited
-            // thread it alone holds dealloc_object(Thread) from retype_free,
-            // so the unlock's write to sched_lock precedes it.
+            // SAFETY: the binding and wake_in_flight are written under
+            // sched_lock, held here.
+            unsafe {
+                (*tcb).ipc_state = thread::IpcThreadState::None;
+                (*tcb).blocked_on_object = core::ptr::null_mut();
+                (*tcb)
+                    .wake_in_flight
+                    .store(0, core::sync::atomic::Ordering::Release);
+                (*tcb).sched_lock.unlock_raw(sched_saved);
+            }
+            return;
+        }
+        // A concurrent dealloc already won (Exited): do not link. Clear the
+        // binding as above, then release the pin after the unlock. The pin
+        // alone holds dealloc_object(Thread) from retype_free here, so its
+        // release is this waker's last touch of the TCB; an Exited thread
+        // never parks again, so no later claim can re-pin it.
+        thread::ThreadState::Exited =>
+        {
+            // SAFETY: the binding is written under sched_lock, held here; the
+            // TCB stays valid until the pin release below.
             unsafe {
                 (*tcb).ipc_state = thread::IpcThreadState::None;
                 (*tcb).blocked_on_object = core::ptr::null_mut();

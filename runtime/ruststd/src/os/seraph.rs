@@ -16,7 +16,7 @@
 //!     `StartupInfo` stashed by `_start`. Services use these to obtain their
 //!     initial caps.
 //!   * `heap_bootstrap` / `heap_is_initialized` — allocator bring-up against
-//!     procmgr.
+//!     memmgr.
 //!   * `abort_thread` — placeholder thread terminator.
 
 // std requires every public item to carry a stability attribute. Everything
@@ -353,7 +353,12 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
 
     // Register the IPC buffer before any IPC-using code runs. Idempotent in
     // the kernel, so services that call `ipc_buffer_set` again are fine.
-    let _ = syscall::ipc_buffer_set(info.ipc_buffer_vaddr);
+    // SAFETY: the creator maps `ipc_buffer_vaddr` as this thread's dedicated
+    // IPC buffer page (`ProcessInfo::ipc_buffer_vaddr`) and no Rust object
+    // lives in it; the runtime reaches it only as the raw `current_ipc_buf`
+    // pointer the IPC wrappers take, so no Rust reference into it spans an
+    // IPC syscall.
+    let _ = unsafe { syscall::ipc_buffer_set(info.ipc_buffer_vaddr) };
     set_current_ipc_buf(info.ipc_buffer_vaddr as *mut u64);
 
     // Build the argv slice from the ProcessInfo-page region procmgr wrote.
@@ -535,11 +540,11 @@ static _START_REF: unsafe extern "C" fn(u64) -> ! = _start;
 
 // ── Public helpers surfaced on std::os::seraph ──────────────────────────────
 
-/// Initialise the process heap against procmgr.
+/// Initialise the process heap against memmgr.
 ///
-/// Must be called once, after the bootstrap IPC round that obtains
-/// `procmgr_ep`, before the first allocation through the `System`
-/// allocator. Idempotent — subsequent calls are no-ops.
+/// Must be called once, with the `memmgr_endpoint_cap` `ProcessInfo`
+/// delivers as `memmgr_ep`, before the first allocation through the
+/// `System` allocator. Idempotent — subsequent calls are no-ops.
 ///
 /// `self_aspace` is the process's own `AddressSpace` cap slot. The
 /// bootstrap IPC round uses the calling thread's registered IPC buffer
@@ -548,8 +553,8 @@ static _START_REF: unsafe extern "C" fn(u64) -> ! = _start;
 ///
 /// Returns `true` if the heap is usable after this call.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn heap_bootstrap(procmgr_ep: u32, self_aspace: u32) -> bool {
-    pal_alloc::heap_bootstrap(procmgr_ep, self_aspace)
+pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
+    pal_alloc::heap_bootstrap(memmgr_ep, self_aspace)
 }
 
 /// Returns `true` once `heap_bootstrap` has completed successfully.

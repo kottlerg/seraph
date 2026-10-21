@@ -212,7 +212,10 @@ fn child_entry(arg: u64) -> !
     } = unsafe { child_args(arg) };
 
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if ipc_buffer_set(buf_addr).is_err()
+    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
+    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
+    // the `ipc` wrappers.
+    if unsafe { ipc_buffer_set(buf_addr) }.is_err()
     {
         thread_exit()
     }

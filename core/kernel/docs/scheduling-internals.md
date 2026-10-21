@@ -214,14 +214,18 @@ hang). See § Thread Registry.
    commit the `Running → Blocked` transition via
    `crate::sched::commit_blocked_under_local_lock(tcb, ipc_state, blocked_on)`. The helper acquires
    `(*tcb).sched_lock` (NOT the CPU lock), reads `state`, and writes `Blocked` only if
-   `state ∈ {Running, Ready}` AND `wake_pending` is clear. It returns `false` — refusing to park —
-   in two cases the caller handles identically: a concurrent all-locks `Stopped`/`Exited` commit
-   already won (then `schedule()` drains the thread), or
-   `wake_pending` is set (a waker raced ahead, found the thread still live, coalesced its link, and
-   recorded the wake under `sched_lock`; the helper consumes the flag and leaves the thread
-   `Running`, and `schedule()` requeues the runnable thread so it resumes and consumes the
-   already-deposited payload). On `false` the caller MUST roll back the source-side waiter
-   registration AND MUST NOT clobber any deposited `wakeup_value`/`ipc_msg`. A committed park
+   `state ∈ {Running, Ready}` AND `wake_pending` is clear, returning `ParkCommit::Committed`. It
+   refuses to park in two cases: `ParkCommit::RefusedStop`, when a concurrent all-locks
+   `Stopped`/`Exited` commit already won (then `schedule()` drains the thread), and
+   `ParkCommit::RefusedWake`, when `wake_pending` is set (a waker raced ahead, found the thread
+   still live, coalesced its link, and recorded the wake under `sched_lock`; the helper consumes
+   the flag and leaves the thread `Running`, and `schedule()` requeues the runnable thread so it
+   resumes and consumes the already-deposited payload). On either refusal the caller MUST roll
+   back the source-side waiter registration. A `RefusedStop` rollback stamps the park episode
+   cancelled (no waker saw the registration, so the rollback owns the episode); a `RefusedWake`
+   rollback MUST NOT clobber the deposited `wakeup_value`/`ipc_msg`. `endpoint_call` treats both
+   refusals as a cancelled call and stamps the episode either way (see
+   [sched-ipc-redesign.md](sched-ipc-redesign.md) §2.1). A committed park
    advances `park_seq`, so a stop or teardown that read the thread before the park
    (`commit_cancelling_park`) finds the generation changed, cancels the new park, and retries.
    `commit_reply_rebind_under_local_lock` is the sibling for `endpoint_recv`'s
@@ -329,13 +333,13 @@ write, and the canonical helper / locks held. Deviations from this table are bug
 | `Ready` | `Running` | `schedule()` selecting next | running CPU | `next.sched_lock` (the incoming dispatch flip; serialises with a concurrent `enqueue_and_wake(next)` which then coalesces) |
 | `Running` | `Ready` | `schedule(requeue_current=true)` (yield, preempt) | running CPU | `current.sched_lock` (outer) → running CPU's scheduler.lock (inner); if `cpu_affinity` excludes the running CPU the requeue is linked directly on the target CPU under `current.sched_lock` + the target run-queue lock after dropping the local lock (inlined, not via `enqueue_and_wake`, to avoid re-acquiring `current.sched_lock`) |
 | `Ready` (on CPU A) | `Ready` (on CPU B) | `sys_thread_set_affinity` (active migration) or periodic load balancer | calling CPU | `migrate_ready_thread(tcb, A, B)`; `(*tcb).sched_lock` (outer) then both scheduler.locks in ascending-CPU order (inner) |
-| `Running` | `Blocked` | IPC blocking entry (`endpoint_call`, `notification_wait`, `event_queue_recv`, `waitset_wait`) | running CPU | `commit_blocked_under_local_lock(tcb, ipc, blocked_on)` (acquires `(*tcb).sched_lock`); on `false` (a stop/exit won, or `wake_pending` forced a refuse-to-park) the IPC primitive rolls back its waiter registration without clobbering the deposited payload. `endpoint_recv`'s dequeued sender rebinds via `commit_reply_rebind_under_local_lock` instead |
+| `Running` | `Blocked` | IPC blocking entry (`endpoint_call`, `notification_wait`, `event_queue_recv`, `waitset_wait`) | running CPU | `commit_blocked_under_local_lock(tcb, ipc, blocked_on)` (acquires `(*tcb).sched_lock`); on a refusal (`ParkCommit::RefusedStop`: a stop/exit won; `ParkCommit::RefusedWake`: `wake_pending` forced a refuse-to-park) the IPC primitive rolls back its waiter registration — a `RefusedStop` rollback stamps the episode cancelled, a `RefusedWake` rollback leaves the deposited payload (Lock Hierarchy rule 8). `endpoint_recv`'s dequeued sender rebinds via `commit_reply_rebind_under_local_lock` instead |
 | `Blocked` | `Ready` | IPC wake (`notification_send`, `event_queue_post`, `endpoint_reply`, `endpoint_call` server-wake, `waitset_notify`, and the receive-entry release of an unreplied caller, `release_unreplied_caller`, per [ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model) | wake-issuing CPU | source IPC lock to snapshot wakeup payload, *released*, then `enqueue_and_wake(target_cpu)`; `endpoint_reply` takes no source lock: the `reply_tcb` CAS is the claim, then stamp and `enqueue_and_wake(target_cpu)`; `release_unreplied_caller` takes none either: the `reply_tcb` `swap(null)` is the claim, then the INTERRUPTED stamp and `enqueue_and_wake(target_cpu)` |
 | `Blocked` | `Ready` | timeout from sleep list | timer-firing CPU | `SLEEP_LIST_LOCK` to pop expired entries (released first), then source IPC lock to arbitrate (the TCB still queued on the source in the popped park) and write the wake payload (a plain sleeper is claimed at the pop), then `enqueue_and_wake(target_cpu)` |
 | `Blocked` | `Blocked` (binding cleared) | `cancel_ipc_block` (called from `sys_thread_stop` or the object-teardown stop on a blocked target) | calling CPU | `(*tcb).sched_lock` to snapshot `(state, ipc_state, blocked_on_object, park_seq)` and re-verify `Blocked` (cancelling a plain sleep through `sleep_list_remove` under it; released first), then the source IPC lock matching `tcb.ipc_state` to unlink the waiter, then `sched_lock` again to clear the binding only if this cancel claimed the park (a lost claim's waker owns the episode and clears the binding in `enqueue_and_wake`, on its link path or in its arm that aborts on a thread the stop committed `Stopped` or `Exited` over meanwhile; it may already have let the thread park again, on the same source or another of the same kind, and the caller's commit retries on the changed `park_seq`); the caller's commit then writes `Stopped` or `Exited` |
 | `Running` | `Blocked` (`BlockedOnFault`) | fault redirection — `ipc::fault::fault_dispatch` delivering a kernel-unresolvable fault to the thread's bound handler endpoint | running CPU (arch fault handler) | `commit_blocked_under_local_lock(tcb, BlockedOnFault, handler)`; kernel-synthesized, the faulter takes the caller role in the endpoint call/reply machinery (see [fault-handling.md](../../../docs/fault-handling.md#mechanism-overview)) |
 | `Blocked` (`BlockedOnFault`) | `Ready` | fault reply (`sys_ipc_reply`) or cancellation (handler death via `server_reply_wake`, endpoint-dealloc send-drain, the handler's next `SYS_IPC_RECV` via `release_unreplied_caller`, which records `Kill`) | wake-issuing CPU | the wake-claim winner records `fault_outcome` (`Resume`/`Kill`) then `enqueue_and_wake(target_cpu)` (`cancel_ipc_block` records `Kill` without a wake — the stop or teardown commit that follows leaves the faulter `Stopped` or `Exited` — and the `dealloc_object(Thread)` unlink of a dying faulter records nothing); the faulter resumes inside `fault_dispatch` (re-executing its faulting instruction or running the kill path) rather than returning a syscall value (see [fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill)) |
-| `Running` | `Stopped` | `sys_thread_stop` on running target | calling CPU | `commit_cancelling_park(Stopped)`; if running on a remote CPU, `prod_remote_cpu(run_cpu)` and spin until `sched_remote.current != tcb` or the target is no longer `Stopped` (a teardown committed `Exited`); a stopper itself stopped meanwhile deschedules in place and resumes the drain on restart (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol)) |
+| `Running` | `Stopped` | `sys_thread_stop` on running target | calling CPU | `commit_cancelling_park(Stopped)`; if running on a remote CPU, `prod_remote_cpu(run_cpu)` and spin until `sched_remote.current != tcb` or the target is no longer `Stopped` (a teardown committed `Exited`); a stopper itself stopped meanwhile deschedules in place and, on restart, re-enters the drain only if its capability slot still names the target with Control rights, otherwise returning at once (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol)) |
 | `Ready` | `Stopped` | `sys_thread_stop` on a Ready target | calling CPU | `commit_cancelling_park(Stopped)`; the all-locks commit also walks every CPU's run queue and calls `remove_from_queue` inside the all-locks region. See § *Stopped/Exited drain* below. |
 | `Blocked` | `Stopped` | `sys_thread_stop` on blocked target | calling CPU | `commit_cancelling_park(Stopped)`: `cancel_ipc_block` first (acquires the source IPC lock and unlinks the waiter), then the all-locks commit, refused and retried while the target's `park_seq` differs from the snapshot taken with the `Blocked` read — so a park committed after an unlocked `Running`/`Ready` read is cancelled too, never overwritten (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol)) |
 | `*` | `Exited` | `sys_thread_exit` (self) or fault handler | running CPU | `exit_under_all_locks(reason)` (on the dying CPU; the exit reason and `Exited` are written in one all-locks hold, refused if already `Exited`), then `schedule(false)` |
@@ -753,22 +757,27 @@ Producer side (`enqueue_and_wake`, `core/kernel/src/sched/mod.rs`):
 ```
 1. Acquire (*tcb).sched_lock (the Scheduling-group serializer; outer).
 2. Read tcb.state under sched_lock and classify:
-   - Running  → set wake_pending = true; release sched_lock; clear
-                wake_in_flight; RETURN (coalesce; the wake-before-park net —
+   - Running  → set wake_pending = true; clear wake_in_flight; release
+                sched_lock; RETURN (coalesce; the wake-before-park net —
                 commit_blocked refuses to park and the resume path delivers
                 the already-deposited payload).
-   - Ready    → ipc_state = None, blocked_on_object = null; release
-                sched_lock; clear wake_in_flight; RETURN (coalesce; already
+   - Ready    → ipc_state = None, blocked_on_object = null; clear
+                wake_in_flight; release sched_lock; RETURN (coalesce; already
                 linked, a same-event duplicate — do NOT set wake_pending).
-   - Stopped/Exited → ipc_state = None, blocked_on_object = null; release
-                sched_lock; clear wake_in_flight; RETURN (a concurrent stop /
-                dealloc won; linking would re-introduce a freed or
-                stop-pending TCB; the binding of a claimed park whose cancel
-                lost the claim is this wake's to clear).
-   On these three arms the wake_in_flight clear follows the sched_lock
-   release: it is the waker's last touch of the TCB, which the pin alone
-   holds from retype_free once Exited.
+   - Stopped  → as Ready (a concurrent stop won; linking would re-introduce
+                a stop-pending TCB; the binding of a claimed park whose
+                cancel lost the claim is this wake's to clear).
+   - Exited   → ipc_state = None, blocked_on_object = null; release
+                sched_lock; clear wake_in_flight; RETURN (a concurrent
+                dealloc won; linking would re-introduce a freed TCB).
    - Blocked/Created → fall through to the link path.
+   Only the Exited arm clears wake_in_flight after releasing sched_lock: the
+   pin alone holds retype_free there, so its clear is the waker's last touch
+   of the TCB, and an Exited thread is never claimed again. On every other
+   arm the clear precedes the release, because once the lock drops the
+   thread can park again and a later claim re-pin it, which a delayed clear
+   would erase; no such thread can be freed before an Exited commit takes
+   the lock.
 3. Acquire target scheduler.lock UNDER sched_lock (inner).
 4. Set tcb.state = Ready, ipc_state = None, blocked_on_object = null,
    wake_pending = false; read priority under the held sched_lock (so a

@@ -180,8 +180,7 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 
     // Read the register file.
     let mut reg_buf = [0u8; BUF_SIZE];
-    let bytes = thread_read_regs(child.th, reg_buf.as_mut_ptr(), BUF_SIZE)
-        .map_err(|_| "thread_read_regs failed")?;
+    let bytes = thread_read_regs(child.th, &mut reg_buf).map_err(|_| "thread_read_regs failed")?;
 
     if bytes != TRAP_FRAME_BYTES
     {
@@ -292,15 +291,14 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
     PHASE2_SIG.store(child_ready, Ordering::Release);
 
     let mut reg_buf = [0u8; BUF_SIZE];
-    thread_read_regs(child.th, reg_buf.as_mut_ptr(), BUF_SIZE)
+    thread_read_regs(child.th, &mut reg_buf)
         .map_err(|_| "thread_read_regs for write_regs_resume failed")?;
 
     // Overwrite instruction pointer to redirect child to phase2_entry.
     let phase2_ptr = phase2_entry as *const () as u64;
     reg_buf[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&phase2_ptr.to_le_bytes());
 
-    thread_write_regs(child.th, reg_buf.as_ptr(), BUF_SIZE)
-        .map_err(|_| "thread_write_regs failed")?;
+    thread_write_regs(child.th, &reg_buf).map_err(|_| "thread_write_regs failed")?;
 
     // Resume — child runs phase2_entry and sends 0x2. The helper is single-shot,
     // so the resume calls `thread_start` directly.

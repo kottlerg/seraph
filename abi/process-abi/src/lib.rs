@@ -444,7 +444,7 @@ pub struct ProcessInfo
     /// on a migration path to lookup via [`service_registry_cap`]. New
     /// services MUST NOT add per-service fixed slots like this one;
     /// the registry is the system-wide service-discovery channel from
-    /// this point forward. See follow-up issue tracking the migration.
+    /// this point forward. The migration is tracked by #74.
     ///
     /// Procmgr derives this cap per spawn via `cap_derive_badge` on
     /// the log endpoint it holds, using the child's procmgr-assigned
@@ -453,8 +453,8 @@ pub struct ProcessInfo
     /// matches it directly against the death-notification correlator
     /// procmgr posts on child exit.
     ///
-    /// Zero when no logger is reachable (memmgr; processes spawned
-    /// before the log endpoint exists).
+    /// Zero for memmgr (init populates its `ProcessInfo` without a log cap)
+    /// and for children procmgr spawns when it holds no log-endpoint source.
     /// `seraph::log!` silently drops in that case.
     ///
     /// The log receiver itself (logd) deletes its seeded copy at startup:

@@ -601,8 +601,7 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// On a terminal fault by any thread in the address space (no handler bound,
 /// the handler replied `KILL`, or the fault episode was cancelled; see
 /// docs/fault-handling.md § Delivery, Resume, and Kill), the kernel posts the
-/// fault class to each bound
-/// observer. The kernel only notifies; it never enumerates or terminates
+/// fault class to each bound observer. The kernel only notifies; it never enumerates or terminates
 /// threads, and normal `thread_exit` does NOT fire these observers.
 ///
 /// Binding onto an address space that has *already* terminal-faulted posts the

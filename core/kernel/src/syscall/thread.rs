@@ -1718,7 +1718,6 @@ pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::arch::current::trap_frame::TrapFrame as ArchTF;
     use crate::cap::object::ThreadObject;
     use crate::cap::slot::ThreadRights;
-    use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
     use core::mem::{MaybeUninit, size_of};
 
@@ -1753,23 +1752,12 @@ pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // SAFETY: target_tcb is valid.
-    unsafe {
-        // A fault-blocked thread (Blocked + BlockedOnFault) exposes its faulting
-        // register frame through `trap_frame` for the bound handler to read and
-        // modify before replying, so the fault-handler protocol permits register
-        // access in that state too — not only `Stopped`. See
-        // `docs/fault-handling.md` § Modifying the faulting thread.
-        // This early refusal spares the copy-in; the write below re-checks
-        // under the target's sched_lock.
-        let st = (*target_tcb).state;
-        let fault_blocked = st == ThreadState::Blocked
-            && (*target_tcb).ipc_state == crate::sched::thread::IpcThreadState::BlockedOnFault;
-        if st != ThreadState::Stopped && !fault_blocked
-        {
-            return Err(SyscallError::InvalidState);
-        }
-    }
+    // A fault-blocked thread (Blocked + BlockedOnFault) exposes its faulting
+    // register frame for the bound handler to read and modify before replying,
+    // so the fault-handler protocol permits register access in that state too,
+    // not only `Stopped` (see `docs/fault-handling.md` § Modifying the faulting
+    // thread). The state is decided only under the target's sched_lock, by the
+    // write below.
 
     let copy_size = size_of::<ArchTF>();
     if buf_size < copy_size || buf_ptr == 0

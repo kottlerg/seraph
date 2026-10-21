@@ -594,7 +594,9 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
                     crate::sched::post_death_notification(tcb, 0x1000 + cause_code);
                 }
 
-                // Terminal fault (no handler bound, or handler replied KILL): notify
+                // Terminal fault (no handler bound, or a Kill outcome: the handler
+                // replied KILL or the episode was cancelled; see docs/fault-handling.md
+                // § Delivery, Resume, and Kill): notify
                 // the faulting thread's address-space observers with the fault class
                 // so procmgr can tear the whole process down. Reached only on the
                 // terminal path; normal thread_exit never lands here.

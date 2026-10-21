@@ -52,10 +52,11 @@
 //! rounds both outcomes must occur. That requirement is statistical, but the
 //! delay sweep forces each order at its extremes, where one side's spin
 //! outlasts the other's syscall. The cell proves the outcome contract on
-//! every round; it reaches the unlocked kernel's torn frame only when a
-//! dispatch lands inside configure's few-instruction window between its
-//! check and its writes, so it is a tripwire for that race, not a
-//! deterministic witness.
+//! every round. It can fail on the unlocked kernel only when the start's
+//! commit lands inside configure's few-instruction window between its check
+//! and its writes: the thread then runs the old frame while configure
+//! returns `Ok`, or, if its dispatch overlaps the writes, a torn one. So the
+//! cell is a tripwire for that race, not a deterministic witness.
 //!
 //! Needs **≥ 2 CPUs**.
 

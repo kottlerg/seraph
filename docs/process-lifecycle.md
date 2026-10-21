@@ -501,9 +501,10 @@ buffer handoff between processes uses Memory-cap moves over IPC.
 Userspace fault handling is specified as the pager protocol in
 [Fault Handling](fault-handling.md). An unresolved fault is delivered to the
 thread's bound handler (memmgr, the default pager, unless the process was
-created `CREATE_PINNED`); a thread with no bound handler, or whose handler
-replies `KILL`, terminates, which surfaces through the normal process-death
-notification flow above.
+created `CREATE_PINNED`); a thread with no bound handler, whose handler replies
+`KILL`, or whose fault episode is cancelled (see
+[Fault Handling](fault-handling.md#delivery-resume-and-kill)), terminates, which surfaces
+through the normal process-death notification flow above.
 
 ---
 

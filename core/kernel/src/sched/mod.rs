@@ -1178,12 +1178,14 @@ fn watchdog_dump(reason: &str)
             // lock state word, which lives in a static or a retype slab —
             // kernel direct-map storage that stays mapped for the kernel's
             // lifetime, even after the slab is recycled — and the checks
-            // above give a non-null address aligned for the width read. Every
-            // lock state word is an atomic of that width, so a Relaxed atomic
-            // load of it is race-free against the lock's own atomic writers;
-            // a stale address names a recycled word of the same storage, so
-            // the line may be mislabeled but the read stays sound. The value
-            // is diagnostic only.
+            // above give a non-null address aligned for the width read. While
+            // the breadcrumb is current the word is an atomic of that width,
+            // so a Relaxed atomic load is race-free against the lock's own
+            // atomic writers. A breadcrumb that went stale between the reads
+            // can name a word since recycled to another object, or pair the
+            // kind with another kind's word, which this load may then race: a
+            // known residual of the stall dump, which runs only once a CPU has
+            // stopped making progress and whose value is diagnostic only.
             let value = unsafe {
                 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
                 match lock_kind.word_width()
@@ -1207,12 +1209,16 @@ fn watchdog_dump(reason: &str)
                 value
             );
         }
-        // Name the thread's last entry from user mode: the syscall number the
-        // dispatcher stamped on the TCB and the address of the frame that entry
-        // built. The frame itself is not read: it lives on a thread that may
-        // still be running and writing it.
-        // SAFETY: cur is this CPU's current TCB, live while it is current;
-        // trap_frame and syscall_nr are atomics, so both loads are race-free.
+        // Name the syscall the thread entered from user mode, from the
+        // dispatcher's stamp on the TCB. Neither the frame nor its address is
+        // printed: the frame lives on a thread that may still be running and
+        // writing it, and its address is a kernel-stack VA this mirrored
+        // console must not show.
+        // SAFETY: `cur` is an unlocked, possibly stale read of CPU `cpu`'s
+        // `current`; the TCB slab stays mapped, so the loads cannot fault,
+        // and `trap_frame` and `syscall_nr` are atomics, so they are
+        // race-free. A TCB switched away and recycled meanwhile can only be
+        // misreported, and the line is diagnostic only.
         let user_entry = unsafe {
             let s = scheduler_for(cpu);
             let cur = s.current;
@@ -1222,18 +1228,19 @@ fn watchdog_dump(reason: &str)
             }
             else
             {
-                let tf = (*cur)
+                let entered = !(*cur)
                     .trap_frame
-                    .load(core::sync::atomic::Ordering::Relaxed);
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .is_null();
                 let nr = (*cur)
                     .syscall_nr
                     .load(core::sync::atomic::Ordering::Relaxed);
-                (!tf.is_null()).then_some((tf as usize, nr))
+                entered.then_some(nr)
             }
         };
-        if let Some((frame, syscall_nr)) = user_entry
+        if let Some(syscall_nr) = user_entry
         {
-            crate::kprintln!("    user_frame=0x{:x} syscall_nr={}", frame, syscall_nr);
+            crate::kprintln!("    user thread syscall_nr={}", syscall_nr);
         }
     }
     // Derivation-lock state, holder CPU, and the most recent acquisition's

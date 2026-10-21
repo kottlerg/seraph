@@ -70,10 +70,9 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
 {
     let frame = tf;
     // SAFETY: caller guarantees tf is valid. The `&mut` is not exclusive for
-    // the whole call: while the thread blocks in a handler, SYS_THREAD_WRITE_REGS
-    // from another CPU, and riscv64's switch-out, can write the frame through
-    // the published `trap_frame`, a gap docs/arch-interface.md § `trap_frame`
-    // states and #443 tracks.
+    // the whole call: while the thread blocks in a handler, other paths access
+    // the frame through the published `trap_frame`, a gap
+    // docs/arch-interface.md § `trap_frame` states and #443 tracks.
     let tf = unsafe { &mut *tf };
 
     let nr = tf.syscall_nr();
@@ -226,9 +225,9 @@ fn sys_yield(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Marks the current thread as `Exited` and calls `schedule()` to switch
 /// to the next runnable thread. The exited thread is never re-enqueued.
 ///
-/// Note: full resource cleanup (freeing kernel stack, TCB, `CSpace` entries)
-/// requires a process-manager teardown path that does not yet exist. For now
-/// the TCB is abandoned in place — it will not be scheduled again.
+/// The exited TCB is never scheduled again; its kernel stack and the TCB are
+/// freed by `dealloc_object(Thread)` when its last capability is deleted
+/// (procmgr's cap-revoke teardown, for process threads).
 #[cfg(not(test))]
 fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -601,8 +600,9 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// On a terminal fault by any thread in the address space (no handler bound,
 /// the handler replied `KILL`, or the fault episode was cancelled; see
 /// docs/fault-handling.md § Delivery, Resume, and Kill), the kernel posts the
-/// fault class to each bound observer. The kernel only notifies; it never enumerates or terminates
-/// threads, and normal `thread_exit` does NOT fire these observers.
+/// fault class to each bound observer. The kernel only notifies; it never
+/// enumerates or terminates threads, and normal `thread_exit` does NOT fire
+/// these observers.
 ///
 /// Binding onto an address space that has *already* terminal-faulted posts the
 /// retained fault reason to the `EventQueue` immediately (serialised on the

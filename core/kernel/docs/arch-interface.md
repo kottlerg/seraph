@@ -547,13 +547,13 @@ deschedule nothing: `#DF` and `#MC` (IST1, terminal), the NMI (IST2), `#NM` (bui
 frame), and the spurious vector 255 (`iretq` only).
 
 Several paths hold the published frame as a `&mut TrapFrame` across a point where the thread is
-descheduled: the syscall dispatcher hands one to each handler for the whole syscall, including
-while the thread is blocked in it, and on riscv64 `trap_dispatch` takes the frame as `&mut` for
-the whole trap (across preemption) and `redirect_user_fault` holds it across the fault block.
-Meanwhile `SYS_THREAD_WRITE_REGS`, issued by any other thread on a `Stopped` or fault-blocked
-thread, writes that frame, and riscv64's switch-out clears its FS/VS bits. That violates the
-`&mut`'s uniqueness; passing these paths a non-unique frame handle (as x86-64's trap entries
-already take `*mut TrapFrame`) is tracked by [#443](https://github.com/kottlerg/seraph/issues/443).
+descheduled: the syscall dispatcher hands one to each handler for the whole syscall, including while
+the thread is blocked in it, and on riscv64 `trap_dispatch` takes the frame as `&mut` for the whole
+trap (across preemption) and `redirect_user_fault` holds it across the fault block. Meanwhile
+another thread's `SYS_THREAD_READ_REGS` or `SYS_THREAD_WRITE_REGS` on a `Stopped` or fault-blocked
+thread reads or writes that frame, and riscv64's switch-out clears its FS/VS bits. That violates the
+`&mut`'s uniqueness; passing these paths a non-unique frame handle (as x86-64's trap entries already
+take `*mut TrapFrame`) is tracked by [#443](https://github.com/kottlerg/seraph/issues/443).
 
 ```rust
 pub struct TrapFrame { /* arch-specific layout */ }

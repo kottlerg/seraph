@@ -466,9 +466,9 @@ pub(super) unsafe extern "C" fn common_exception_handler(
 
             // Terminal fault (no handler bound, or a Kill outcome: the handler
             // replied KILL or the episode was cancelled; see docs/fault-handling.md
-            // § Delivery, Resume, and Kill): notify
-            // the faulting thread's address-space observers with the fault class
-            // so procmgr can tear the whole process down. Reached only on the
+            // § Delivery, Resume, and Kill): notify the faulting thread's
+            // address-space observers with the fault class so procmgr can tear the
+            // whole process down. Reached only on the
             // terminal path; normal thread_exit never lands here.
             // SAFETY: tcb validated non-null; address_space may be null for
             // kernel threads, which post_aspace_death_notification handles.
@@ -851,8 +851,8 @@ isr_stub!(isr31, 31, has_error_code = false, ist = 0);
 /// the only writer after configuration; the register syscalls read only once
 /// the thread is off every CPU with its save published
 /// (`sched::with_held_frame`), which orders this store before the read. The
-/// softlockup watchdog loads the atomic pointer and then takes a volatile,
-/// diagnostic-only copy of the frame of a thread that may still be running.
+/// softlockup watchdog loads only the atomic pointer (and the TCB's
+/// `syscall_nr` stamp), for diagnostics, and never reads the frame.
 ///
 /// # Safety
 /// `frame` must be the live frame an entry from user mode built on the current

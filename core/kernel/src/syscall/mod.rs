@@ -56,6 +56,39 @@ use syscall::{
 
 // ── Syscall dispatch ──────────────────────────────────────────────────────────
 
+/// Record a syscall's entry: the calling thread's `syscall_nr` stamp, this
+/// CPU's stamp for the softlockup watchdog, and the thread's `trap_frame`.
+///
+/// Every entry from user mode at which the thread can be descheduled
+/// publishes its live frame as the thread's `trap_frame` (see
+/// docs/arch-interface.md § `trap_frame`); an interrupt or exception taken
+/// since the last syscall may have pointed it at a frame lower on the stack.
+///
+/// # Safety
+/// Called from syscall entry with interrupts masked, with `frame` the live
+/// frame on the calling thread's kernel stack.
+#[cfg(not(test))]
+unsafe fn stamp_syscall_entry(nr: u64, frame: *mut TrapFrame)
+{
+    // SAFETY: syscall context; `current` is the calling thread and stable
+    // here, and it alone writes its own `syscall_nr` and `trap_frame`.
+    // Null-guarded like every handler's own check rather than asserted: the
+    // diagnostic stamp must never be the thing that faults.
+    unsafe {
+        let tcb = current_tcb();
+        if !tcb.is_null()
+        {
+            (*tcb)
+                .syscall_nr
+                .store(nr, core::sync::atomic::Ordering::Relaxed);
+            crate::sched::note_cpu_syscall(nr);
+            (*tcb)
+                .trap_frame
+                .store(frame, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// Syscall dispatcher: called from the arch-specific trap/syscall entry stub.
 ///
 /// Reads the syscall number from `tf`, invokes the handler, and writes the
@@ -76,28 +109,9 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     let tf = unsafe { &mut *tf };
 
     let nr = tf.syscall_nr();
-    // SAFETY: syscall context on the caller's kernel stack with interrupts
-    // masked; `current` is the calling thread and stable here, and it alone
-    // writes its own `syscall_nr` and `trap_frame`. Null-guarded like every
-    // handler's own check rather than asserted: the diagnostic stamp must
-    // never be the thing that faults.
-    unsafe {
-        let tcb = current_tcb();
-        if !tcb.is_null()
-        {
-            (*tcb)
-                .syscall_nr
-                .store(nr, core::sync::atomic::Ordering::Relaxed);
-            // Every entry from user mode at which the thread can be descheduled
-            // publishes its live frame as the thread's `trap_frame` (see
-            // docs/arch-interface.md § `trap_frame`); an interrupt or exception
-            // taken since the last syscall may have pointed it at a frame lower
-            // on the stack.
-            (*tcb)
-                .trap_frame
-                .store(frame, core::sync::atomic::Ordering::Relaxed);
-        }
-    }
+    // SAFETY: syscall entry on the caller's kernel stack; `frame` is its live
+    // frame.
+    unsafe { stamp_syscall_entry(nr, frame) };
 
     let ret: Result<u64, SyscallError> = match nr
     {
@@ -225,9 +239,9 @@ fn sys_yield(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Marks the current thread as `Exited` and calls `schedule()` to switch
 /// to the next runnable thread. The exited thread is never re-enqueued.
 ///
-/// The exited TCB is never scheduled again; its kernel stack and the TCB are
-/// freed by `dealloc_object(Thread)` when its last capability is deleted
-/// (procmgr's cap-revoke teardown, for process threads).
+/// Its kernel stack and TCB are freed by `dealloc_object(Thread)` when its
+/// last capability is deleted (procmgr's cap-revoke teardown, for process
+/// threads).
 #[cfg(not(test))]
 fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {

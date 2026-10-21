@@ -237,7 +237,7 @@ Created ──(SYS_THREAD_START)──► Ready ──(scheduled)──► Runni
 
 Running / Ready / Blocked ──(SYS_THREAD_STOP)──► Stopped
 Stopped ──(SYS_THREAD_START)──► Ready
-Running ──(SYS_THREAD_EXIT)──► Exited (TCB freed when its last capability is deleted)
+Running ──(SYS_THREAD_EXIT / SYS_PROCESS_EXIT)──► Exited (TCB freed at its last cap delete)
 any state ──(object teardown / terminal fault)──► Exited
 ```
 

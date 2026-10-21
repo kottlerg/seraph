@@ -524,18 +524,6 @@ impl LockKind
         }
     }
 
-    /// Width in bytes of the lock's state word.
-    #[cfg(not(test))]
-    fn word_width(self) -> usize
-    {
-        match self
-        {
-            Self::RetypeAlloc | Self::Pool => 8,
-            Self::Derivation | Self::MemoryRead | Self::MemoryWrite => 4,
-            Self::KernelPtPool => 1,
-        }
-    }
-
     /// Decode a breadcrumb encoding; `None` for 0 (no wait) or garbage.
     #[cfg(not(test))]
     fn from_code(code: u32) -> Option<Self>
@@ -553,8 +541,8 @@ const LOCK_WAIT_NONE: u32 = 0;
 /// the address of its state word. These locks spin with interrupts masked
 /// (syscall context), inside a preempt-disabled window, or inside the idle
 /// thread's deferred reclaim, so a CPU wedged on one shows no protocol spin
-/// site and looks silent or idle; this breadcrumb names the lock and lets
-/// the dump read its state word. Recorded only once the first acquisition
+/// site and looks silent or idle; this breadcrumb names the lock and its
+/// state word's address for the dump. Recorded only once the first acquisition
 /// attempt fails, so the uncontended fast path stores nothing.
 /// Diagnostic-only — never gates control flow.
 #[cfg(not(test))]
@@ -564,6 +552,31 @@ static LOCK_WAIT_KIND: [core::sync::atomic::AtomicU32; MAX_CPUS] =
 #[cfg(not(test))]
 static LOCK_WAIT_WORD: [core::sync::atomic::AtomicU64; MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+
+/// Per-CPU stamp of the last syscall number entered on that CPU
+/// (`u64::MAX` before the first), written by the syscall dispatcher, for the
+/// softlockup watchdog: it names a stalled CPU's syscall without reading
+/// another CPU's TCB or frame. Diagnostic-only — never gates control flow.
+#[cfg(not(test))]
+static CPU_SYSCALL_NR: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; MAX_CPUS];
+
+/// Stamp `nr` as the last syscall entered on the current CPU; see
+/// [`CPU_SYSCALL_NR`]. Called with interrupts masked (syscall entry), so the
+/// CPU index is stable.
+#[cfg(not(test))]
+pub fn note_cpu_syscall(nr: u64)
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    if cpu < MAX_CPUS
+    {
+        CPU_SYSCALL_NR[cpu].store(nr, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Test stub; see [`note_cpu_syscall`].
+#[cfg(test)]
+pub fn note_cpu_syscall(_nr: u64) {}
 
 /// Record that the current CPU is spinning for the lock of kind `kind` whose
 /// state word lives at address `word`. Callers spin with interrupts masked,
@@ -1160,87 +1173,24 @@ fn watchdog_dump(reason: &str)
         // The breadcrumb belongs to another CPU, which may leave and
         // re-enter a wait meanwhile: the kind is read before and after the
         // word (Acquire, paired with the writer's Release), and the pair is
-        // used only if both reads agree and the word is a non-zero address
-        // aligned for that kind's width. A wait exited and re-entered
-        // meanwhile can still pair the kind with the earlier word — or,
-        // across two re-entries, with a word recorded for another kind — a
-        // stale but mapped address aligned for the width read, so the line
-        // may be mislabeled but the read stays sound.
+        // reported only if both reads agree. The lock word itself is not
+        // read: a breadcrumb gone stale meanwhile can name storage since
+        // recycled to another object.
         let kind_before = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
         let word = LOCK_WAIT_WORD[cpu].load(core::sync::atomic::Ordering::Relaxed) as usize;
         let kind_after = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
         if let Some(lock_kind) = LockKind::from_code(kind_before)
             && kind_after == kind_before
             && word != 0
-            && word.is_multiple_of(lock_kind.word_width())
         {
-            // SAFETY: `word` was recorded by a spinner as the address of a
-            // lock state word, which lives in a static or a retype slab —
-            // kernel direct-map storage that stays mapped for the kernel's
-            // lifetime, even after the slab is recycled — and the checks
-            // above give a non-null address aligned for the width read. While
-            // the breadcrumb is current the word is an atomic of that width,
-            // so a Relaxed atomic load is race-free against the lock's own
-            // atomic writers. A breadcrumb that went stale between the reads
-            // can name a word since recycled to another object, or pair the
-            // kind with another kind's word, which this load may then race: a
-            // known residual of the stall dump, which runs only once a CPU has
-            // stopped making progress and whose value is diagnostic only.
-            let value = unsafe {
-                use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
-                match lock_kind.word_width()
-                {
-                    8 => AtomicU64::from_ptr(core::ptr::with_exposed_provenance_mut::<u64>(word))
-                        .load(Ordering::Relaxed),
-                    1 => u64::from(
-                        AtomicU8::from_ptr(core::ptr::with_exposed_provenance_mut::<u8>(word))
-                            .load(Ordering::Relaxed),
-                    ),
-                    _ => u64::from(
-                        AtomicU32::from_ptr(core::ptr::with_exposed_provenance_mut::<u32>(word))
-                            .load(Ordering::Relaxed),
-                    ),
-                }
-            };
-            crate::kprintln!(
-                "    waiting on {} lock @0x{:x} word=0x{:x}",
-                lock_kind.name(),
-                word,
-                value
-            );
+            crate::kprintln!("    waiting on {} lock @0x{:x}", lock_kind.name(), word);
         }
-        // Name the syscall the thread entered from user mode, from the
-        // dispatcher's stamp on the TCB. Neither the frame nor its address is
-        // printed: the frame lives on a thread that may still be running and
-        // writing it, and its address is a kernel-stack VA this mirrored
-        // console must not show.
-        // SAFETY: `cur` is an unlocked, possibly stale read of CPU `cpu`'s
-        // `current`; the TCB slab stays mapped, so the loads cannot fault,
-        // and `trap_frame` and `syscall_nr` are atomics, so they are
-        // race-free. A TCB switched away and recycled meanwhile can only be
-        // misreported, and the line is diagnostic only.
-        let user_entry = unsafe {
-            let s = scheduler_for(cpu);
-            let cur = s.current;
-            if cur.is_null()
-            {
-                None
-            }
-            else
-            {
-                let entered = !(*cur)
-                    .trap_frame
-                    .load(core::sync::atomic::Ordering::Relaxed)
-                    .is_null();
-                let nr = (*cur)
-                    .syscall_nr
-                    .load(core::sync::atomic::Ordering::Relaxed);
-                entered.then_some(nr)
-            }
-        };
-        if let Some(syscall_nr) = user_entry
+        // The last syscall entered on this CPU, from the dispatcher's per-CPU
+        // stamp; the stalled thread's frame and TCB are not read.
+        let syscall_nr = CPU_SYSCALL_NR[cpu].load(core::sync::atomic::Ordering::Relaxed);
+        if syscall_nr != u64::MAX
         {
-            crate::kprintln!("    user thread syscall_nr={}", syscall_nr);
+            crate::kprintln!("    last syscall on this cpu: nr={}", syscall_nr);
         }
     }
     // Derivation-lock state, holder CPU, and the most recent acquisition's

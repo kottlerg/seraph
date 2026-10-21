@@ -194,10 +194,12 @@ it resumes by re-executing its faulting instruction, not by returning a value.
   while the fault reply is still pending, with a receive that passes its capability and headroom
   checks ([Liveness](#liveness) rule 2), or the handler endpoint is destroyed while the fault is
   still queued on it ([Liveness](#liveness) rule 3) — the faulting thread is killed, exactly as an
-  unhandled fault. A stop of the faulting thread also cancels the episode, but kills nothing at
-  once: it gives the episode a kill outcome and leaves the thread `Stopped`; when next started, the
-  thread is killed as an unhandled fault. Destroying it while stopped ends it as for any stopped
-  thread. A cancelled fault-blocked thread is never resumed.
+  unhandled fault. A stop of the faulting thread before any reply claims the fault also cancels the
+  episode, but kills nothing at once: it gives the episode a kill outcome and leaves the thread
+  `Stopped`; when next started, the thread is killed as an unhandled fault. A stop after the
+  handler's reply claimed the fault leaves that reply's disposition: the started thread resumes.
+  Destroying it while stopped ends it as for any stopped thread. A cancelled fault-blocked thread is
+  never resumed.
 
 ### Modifying the faulting thread
 

@@ -2622,8 +2622,8 @@ pub unsafe fn ipc_call(ep: u32, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
 /// A reply still pending from an earlier receive is released once the
 /// receive passes its capability check and cap-slot pre-allocation: that
 /// caller's `ipc_call` returns `Interrupted`, and a fault-blocked caller is
-/// killed. A receive refused before then keeps the pending binding. A
-/// server therefore replies before it receives again.
+/// killed. A receive refused before then keeps the pending binding (see
+/// `docs/ipc-design.md` § The Call/Reply Model).
 ///
 /// # Safety
 /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC buffer

@@ -598,8 +598,8 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
                 // replied KILL or the episode was cancelled; see docs/fault-handling.md
                 // § Delivery, Resume, and Kill): notify the faulting thread's
                 // address-space observers with the fault class so procmgr can tear the
-                // whole process down. Reached only on the
-                // terminal path; normal thread_exit never lands here.
+                // whole process down. Reached only on the terminal path; normal
+                // thread_exit never lands here.
                 // SAFETY: tcb validated non-null; address_space may be null for
                 // kernel threads, which post_aspace_death_notification handles.
                 unsafe {
@@ -729,9 +729,9 @@ fn normalize_riscv_exception(cause: u64) -> u64
 /// handler-modified sepc), `false` if the fault is terminal (the handler declined
 /// or the binding was severed).
 ///
-/// RISC-V already uses a single [`TrapFrame`] for every kernel entry, so — unlike
-/// x86-64 — no frame copy is needed: `(*tcb).trap_frame` is pointed at the live
-/// trap `frame` for the duration of the block, so the handler's
+/// As on x86-64 (`x86_64/idt.rs::redirect_user_fault`), no frame copy is
+/// needed: `(*tcb).trap_frame` is pointed at the live trap `frame` for the
+/// duration of the block, so the handler's
 /// `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` read and edit the faulting
 /// registers in place, and `sret` restores the same frame on resume.
 ///

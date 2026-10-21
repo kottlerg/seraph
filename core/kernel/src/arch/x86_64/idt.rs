@@ -468,8 +468,8 @@ pub(super) unsafe extern "C" fn common_exception_handler(
             // replied KILL or the episode was cancelled; see docs/fault-handling.md
             // § Delivery, Resume, and Kill): notify the faulting thread's
             // address-space observers with the fault class so procmgr can tear the
-            // whole process down. Reached only on the
-            // terminal path; normal thread_exit never lands here.
+            // whole process down. Reached only on the terminal path; normal
+            // thread_exit never lands here.
             // SAFETY: tcb validated non-null; address_space may be null for
             // kernel threads, which post_aspace_death_notification handles.
             unsafe {

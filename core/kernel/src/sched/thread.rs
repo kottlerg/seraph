@@ -587,11 +587,11 @@ pub struct ThreadControlBlock
     pub trap_frame: core::sync::atomic::AtomicPtr<crate::arch::current::trap_frame::TrapFrame>,
 
     /// Number of the syscall the thread is executing: Relaxed-stored by the
-    /// dispatcher at entry and reset to `u64::MAX` at exit. Read by the
-    /// lock-holder stamps, which must not follow `trap_frame` from a
-    /// possibly stale TCB pointer and may read it from another CPU in the
-    /// state they report, and by the softlockup watchdog's dump, from another
-    /// CPU (diagnostic only). A caller passing `u64::MAX` as a syscall number is
+    /// dispatcher at entry and reset to `u64::MAX` at exit. Read, among
+    /// others, by the lock-holder stamps, which must not follow `trap_frame`
+    /// from a possibly stale TCB pointer and may read it from another CPU in
+    /// the state they report, and by the panic handler's same-CPU context
+    /// dump. A caller passing `u64::MAX` as a syscall number is
     /// rejected as unknown and reads here as "no syscall".
     pub syscall_nr: core::sync::atomic::AtomicU64,
 

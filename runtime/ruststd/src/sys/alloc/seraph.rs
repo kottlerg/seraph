@@ -13,11 +13,12 @@
 //! constants below; the page-reservation allocator (`std::sys::reserve`)
 //! owns its own arena disjoint from the heap.
 //!
-//! Bootstrap is explicit: `heap_bootstrap(memmgr_ep, self_aspace)` must
-//! be called once, with the `memmgr_endpoint_cap` `ProcessInfo`
-//! delivers, before the first allocation. An
-//! allocation before bootstrap returns a null pointer and the alloc
-//! crate aborts via `handle_alloc_error`.
+//! Bootstrap is explicit: `_start` (`std::os::seraph`) calls
+//! `heap_bootstrap(memmgr_ep, self_aspace)` with
+//! `ProcessInfo.memmgr_endpoint_cap` before `main` whenever that cap is
+//! non-zero, and any later call is a no-op. An allocation before bootstrap
+//! returns a null pointer and the alloc crate aborts via
+//! `handle_alloc_error`.
 //!
 //! The IPC buffer pointer used by `grow` is read from the TLS slot
 //! populated in `_start` / the thread trampoline (see
@@ -269,7 +270,7 @@ impl Heap {
         null_mut()
     }
 
-    /// Extend the heap by requesting fresh pages from procmgr, mapping
+    /// Extend the heap by requesting fresh pages from memmgr, mapping
     /// them immediately above `mapped_end`, and appending the new region
     /// to the free list.
     ///
@@ -367,7 +368,11 @@ impl Heap {
                     return false;
                 }
                 let va = start_va + mapped * PAGE_SIZE;
-                if !self.mem_map_with_augment_retry(cap_slot, va, pages_in_cap) {
+                // SAFETY: `va` lies at or above `mapped_end` and inside the heap
+                // zone below `max` (`grow` clamps `pages` to that window): VA
+                // the heap owns and has not yet mapped, so no Rust object
+                // occupies it.
+                if !unsafe { self.mem_map_with_augment_retry(cap_slot, va, pages_in_cap) } {
                     return false;
                 }
                 mapped += pages_in_cap;
@@ -395,10 +400,20 @@ impl Heap {
     /// memmgr, augment the AS via `cap_create_aspace(memory_cap, self_aspace,
     /// init_pages=1)`, and retry the map — augmenting up to `PT_FUND_ROUNDS`
     /// times. If the map still fails the caller treats the grow as failed.
-    fn mem_map_with_augment_retry(&self, memory_cap: u32, va: u64, pages: u64) -> bool {
+    ///
+    /// # Safety
+    /// The `pages` pages at `va` must be unmapped heap-zone VA that no Rust
+    /// object occupies, as `syscall::mem_map` requires for the caller's own
+    /// address space.
+    unsafe fn mem_map_with_augment_retry(&self, memory_cap: u32, va: u64, pages: u64) -> bool {
         const SYSCALL_OUT_OF_MEMORY: i64 = -8;
         for _ in 0..PT_FUND_ROUNDS {
-            match syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) {
+            // SAFETY: the span is unmapped heap-zone VA, per this function's
+            // contract.
+            let mapped = unsafe {
+                syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE)
+            };
+            match mapped {
                 Ok(()) => return true,
                 Err(SYSCALL_OUT_OF_MEMORY) => { /* fall through to augment + retry */ }
                 Err(_) => return false,
@@ -417,7 +432,9 @@ impl Heap {
                 return false;
             }
         }
-        syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE).is_ok()
+        // SAFETY: the span is unmapped heap-zone VA, per this function's contract.
+        unsafe { syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) }
+            .is_ok()
     }
 }
 
@@ -514,8 +531,14 @@ pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
                 return false;
             }
             let va = heap_base + mapped * PAGE_SIZE;
-            if syscall::mem_map(cap_slot, self_aspace, va, 0, pages_in_cap, MAP_WRITABLE).is_err()
-            {
+            // SAFETY: `va` lies in the initial heap span at `heap_base`, inside the
+            // heap zone this allocator alone maps (zone map in
+            // `shared/process-layout`); the `INITIALIZED` exchange above admits one
+            // bootstrap, so nothing occupies the span yet.
+            let map = unsafe {
+                syscall::mem_map(cap_slot, self_aspace, va, 0, pages_in_cap, MAP_WRITABLE)
+            };
+            if map.is_err() {
                 return false;
             }
             mapped += pages_in_cap;
@@ -764,9 +787,20 @@ fn release_reply_caps(
 /// Bytes withheld from a fresh grant's local ledger as slack against any
 /// kernel-side retype cost the mirror does not model. The kernel debits
 /// exactly the class-rounded dispatch cost, so this is conservative; the
-/// slow-path resync reads the authoritative ledger anyway. Also why a
-/// page-aligned request asks memmgr for its page count plus one.
+/// slow-path resync reads the authoritative ledger anyway. Every request
+/// asks memmgr for the pages covering the class plus this reserve
+/// ([`slab_want_pages`]).
 const ALLOCATOR_METADATA_RESERVE: u64 = 64;
+
+/// Pages a slab request asks memmgr for: the fewest that cover the
+/// class-rounded `need` plus [`ALLOCATOR_METADATA_RESERVE`]. A sub-page class
+/// asks for one page and a page-aligned class for one page over its own page
+/// count. Every request sets `REQUIRE_CONTIGUOUS` ([`slab_request_pages`]),
+/// so asking for no more than this keeps a one-page free run able to serve a
+/// sub-page class.
+fn slab_want_pages(need: u64) -> u64 {
+    (need + ALLOCATOR_METADATA_RESERVE).div_ceil(PAGE_SIZE)
+}
 
 /// Retype under `pool`'s lock via `retype`. On an exhausted local ledger:
 /// resync from the kernel's `available_bytes` (recovers auto-reclaimed
@@ -994,9 +1028,9 @@ pub fn slab_release_fresh(phys: u64) {
 /// a cap too small for the class, or `retype` itself fails.
 pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<T>) -> Option<T> {
     let need = slab_round_to_class(min_bytes);
-    // One page over the class's own page count, so `need` still fits after
-    // the ledger withholds `ALLOCATOR_METADATA_RESERVE` from the grant.
-    let want_pages = need.div_ceil(PAGE_SIZE).max(1) + 1;
+    // Sized so `need` still fits after the ledger withholds
+    // `ALLOCATOR_METADATA_RESERVE` from the grant.
+    let want_pages = slab_want_pages(need);
     if need <= 128 {
         slab_retype_pooled(&SLAB_BIN_128, need, want_pages, retype)
     } else if need <= 512 {
@@ -1030,8 +1064,7 @@ pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<
 /// iteration until process death.
 pub fn object_slab_acquire_fresh(min_bytes: u64) -> Option<SlabGrant> {
     let need = slab_round_to_class(min_bytes);
-    let want_pages = need.div_ceil(PAGE_SIZE).max(1) + 1;
-    slab_acquire_fresh(need, want_pages)
+    slab_acquire_fresh(need, slab_want_pages(need))
 }
 
 /// memmgr's current free-pool size in bytes (`QUERY_POOL_STATUS`, reply
@@ -1128,16 +1161,16 @@ unsafe impl GlobalAlloc for System {
             // successful grow covers single allocations up to one
             // grow-increment larger than the largest existing free block;
             // anything beyond that returns null to `handle_alloc_error`.
-            // Multiple grow rounds are NOT attempted: each grown page
-            // consumes one CSpace slot (procmgr's `REQUEST_MEMORY_CAPS` ABI
-            // is one cap per page), and the fixed 256-slot child CSpace
-            // saturates after a few hundred pages. Once that cap-transfer
-            // fails, the kernel's `ipc_reply` currently leaves the caller
-            // blocked rather than returning an error. Bounded grow keeps
-            // grow within CSpace headroom. IPC wrappers under the lock
-            // are non-allocating (the IPC buffer is the pre-registered
-            // page, not heap-backed), so there is no re-entrant
-            // allocation here.
+            // The single bounded grow bounds the work done under the heap
+            // lock per allocation: memmgr's `REQUEST_MEMORY_CAPS` reply
+            // carries up to `MSG_CAP_SLOTS_MAX` caps, each covering a
+            // contiguous run of one or more pages
+            // (services/memmgr/docs/ipc-interface.md § Label 1), so one
+            // grow is at most `grow_exact`'s bounded count of IPC rounds,
+            // and a refused or failed round fails the grow. IPC wrappers
+            // under the lock are non-allocating (the IPC buffer is the
+            // pre-registered page, not heap-backed), so there is no
+            // re-entrant allocation here.
             let want = layout.size().saturating_add(layout.align());
             if heap.grow(want) {
                 ptr = heap.alloc(layout);

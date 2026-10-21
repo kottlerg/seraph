@@ -527,8 +527,8 @@ words:
 
 A round with fewer than two caps, or not marked done, is a bootstrap
 failure and the driver exits. The log and procmgr endpoints are not
-part of this round; the driver takes them from `ProcessInfo` (exposed
-to `main` as `StartupInfo`), per
+part of this round; the driver takes them from `ProcessInfo` (read
+through `std::os::seraph::startup_info()`), per
 [abi/process-abi/README.md](../../../abi/process-abi/README.md)
 § ProcessInfo.
 

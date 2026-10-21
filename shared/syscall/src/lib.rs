@@ -755,20 +755,24 @@ pub fn process_exit(code: u32) -> !
 /// calling thread issues, until the thread registers another page or 0.
 ///
 /// # Safety
-/// `virt` (when non-zero) must name a page the caller dedicates to the kernel
-/// for as long as it stays registered, and no Rust reference into that page
-/// may be live across an IPC syscall: the page is accessed only through raw
-/// pointers, as the `shared/ipc` wrappers do.
+/// An address the kernel registers (non-zero, page-aligned, below the user-half
+/// top) must name a page the caller dedicates to the kernel for as long as it
+/// stays registered, and no Rust reference into that page may be live across
+/// an IPC syscall: the page is accessed only through raw pointers, as the
+/// `shared/ipc` wrappers do. A misaligned or out-of-range address is rejected
+/// and registers nothing, so passing one carries no obligation.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the kernel rejects the call
-/// (e.g., address is not page-aligned).
+/// Returns `InvalidAddress` when `virt` is non-zero and either not page-aligned
+/// or at or above the user-half top.
 #[inline]
 pub unsafe fn ipc_buffer_set(virt: u64) -> Result<(), i64>
 {
-    // SAFETY: syscall2 issues raw syscall instruction; virt is virtual address passed as u64;
-    // kernel validates alignment and mapping before registering buffer. The caller's
-    // contract dedicates the page to the kernel for later IPC syscalls.
+    // SAFETY: syscall2 issues raw syscall instruction; virt is a virtual address passed as
+    // u64. The kernel checks only page alignment and the user-half bound before registering
+    // it; it does not check that the page is mapped (a later IPC copy to an unmapped buffer
+    // fails with `InvalidAddress`). The caller's contract dedicates a registered page to the
+    // kernel for later IPC syscalls.
     let ret = unsafe { syscall2(SYS_IPC_BUFFER_SET, virt, 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
@@ -1197,11 +1201,18 @@ pub fn cap_create_thread(
 ///
 /// W^X is enforced: WRITE and EXECUTE may not both be set.
 ///
+/// # Safety
+/// When `aspace_cap` names the caller's own address space, the span of
+/// `page_count` pages at `virt` must not alias memory Rust code already owns
+/// (a live object, reference, stack, or allocation): the new mapping changes
+/// the bytes behind it outside the compiler's knowledge. A map into another
+/// address space places no obligation on the caller's memory.
+///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, `virt` is
 /// not page-aligned or out of range, the memory region is too small, or W^X is violated.
 #[inline]
-pub fn mem_map(
+pub unsafe fn mem_map(
     memory_cap: u32,
     aspace_cap: u32,
     virt: u64,
@@ -1212,7 +1223,8 @@ pub fn mem_map(
 {
     // SAFETY: syscall6 issues raw syscall instruction; all arguments are scalar u64 values
     // (cap indices, virtual address, page offset, count, prot bits); kernel validates
-    // caps, mappings, and permissions.
+    // caps, mappings, and permissions. The caller's contract keeps the span clear of
+    // memory Rust code owns.
     let ret = unsafe {
         syscall6(
             SYS_MEM_MAP,
@@ -1236,15 +1248,24 @@ pub fn mem_map(
 /// Unmapping a page that is not mapped is a no-op (not an error).
 /// `virt` must be page-aligned and in the user address range.
 ///
+/// # Safety
+/// When `aspace_cap` names the caller's own address space, no live Rust
+/// object or reference may lie in the span of `page_count` pages at `virt`,
+/// and the span must not hold the page registered with [`ipc_buffer_set`]
+/// while it stays registered: the pages vanish beneath any such access.
+/// An unmap in another address space places no obligation on the caller's
+/// memory.
+///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid or `virt` is
 /// not page-aligned.
 #[inline]
-pub fn mem_unmap(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
+pub unsafe fn mem_unmap(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
 {
     // SAFETY: syscall4 issues raw syscall instruction; all arguments are scalar u64 values
     // (cap index, virtual address, page count, flags=0); kernel validates cap and unmaps pages.
     // arg3 is passed explicitly so it is never an uninitialised register (the flag path keys on it).
+    // The caller's contract keeps live Rust objects and the IPC buffer out of the span.
     let ret = unsafe { syscall4(SYS_MEM_UNMAP, u64::from(aspace_cap), virt, page_count, 0) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
@@ -1257,14 +1278,23 @@ pub fn mem_unmap(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
 /// Intended for region teardown (memmgr `UNREGISTER_REGION`): pass the whole
 /// region span in one call so a wholly-covered intermediate table is reclaimed.
 ///
+/// # Safety
+/// When `aspace_cap` names the caller's own address space, no live Rust
+/// object or reference may lie in the span of `page_count` pages at `virt`,
+/// and the span must not hold the page registered with [`ipc_buffer_set`]
+/// while it stays registered: the pages vanish beneath any such access.
+/// An unmap in another address space places no obligation on the caller's
+/// memory.
+///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid or `virt` is
 /// not page-aligned.
 #[inline]
-pub fn mem_unmap_reclaim(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
+pub unsafe fn mem_unmap_reclaim(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
 {
     // SAFETY: syscall4 issues raw syscall instruction; all arguments are scalar u64 values
     // (cap index, virtual address, page count, reclaim flag); kernel validates cap and unmaps pages.
+    // The caller's contract keeps live Rust objects and the IPC buffer out of the span.
     let ret = unsafe {
         syscall4(
             SYS_MEM_UNMAP,
@@ -1283,12 +1313,20 @@ pub fn mem_unmap_reclaim(aspace_cap: u32, virt: u64, page_count: u64) -> Result<
 /// the Memory cap's rights. `prot` encoding: bit 1 = WRITE, bit 2 = EXECUTE.
 /// W^X is enforced. Returns an error if any page is not currently mapped.
 ///
+/// # Safety
+/// When `aspace_cap` names the caller's own address space, no live Rust
+/// object or reference may lie in the span of `page_count` pages at `virt`,
+/// and the span must not hold the page registered with [`ipc_buffer_set`]
+/// while it stays registered: a narrowed permission faults any such access
+/// the compiler assumes valid. A protect in another address space places no
+/// obligation on the caller's memory.
+///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the
 /// requested permissions exceed the cap's rights, or any target page is
 /// not currently mapped.
 #[inline]
-pub fn mem_protect(
+pub unsafe fn mem_protect(
     memory_cap: u32,
     aspace_cap: u32,
     virt: u64,
@@ -1298,6 +1336,7 @@ pub fn mem_protect(
 {
     // SAFETY: syscall5 issues raw syscall instruction; all arguments are scalar u64 values
     // (cap indices, virtual address, page count, protection flags); kernel validates caps and rights.
+    // The caller's contract keeps live Rust objects and the IPC buffer out of the span.
     let ret = unsafe {
         syscall5(
             SYS_MEM_PROTECT,
@@ -2396,15 +2435,23 @@ pub fn thread_set_fault_handler(
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Copy the register state of a stopped thread into `buf`.
+/// Copy the register state of a stopped or fault-blocked thread into `buf`.
 ///
-/// The thread must be in `Stopped` state. `buf` must be at least
-/// `size_of::<TrapFrame>()` bytes (architecture-defined). Returns the number
-/// of bytes written on success.
+/// The thread must be `Stopped` and descheduled (no longer on any CPU), or
+/// fault-blocked (`BlockedOnFault`, its faulting frame exposed to the bound
+/// handler). `buf` must be at least `size_of::<TrapFrame>()` bytes
+/// (architecture-defined). Returns the number of bytes written on success.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the thread cap is invalid, the
-/// thread is not stopped, or `buf` is too small.
+/// Returns a negative `i64` error code:
+/// - `InvalidCapability` — `thread_cap` is not a live Thread cap.
+/// - `InsufficientRights` — `thread_cap` lacks `OBSERVE`.
+/// - `InvalidState` — the thread is neither `Stopped` and descheduled nor
+///   fault-blocked (a `Stopped` thread still on a CPU is refused).
+/// - `InvalidArgument` — `buf` is shorter than the `TrapFrame`, or the
+///   thread has no saved frame.
+/// - `InvalidAddress` — `buf` is not wholly in the user half, or the
+///   kernel's copy into it faults.
 // cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
 #[allow(clippy::cast_sign_loss)]
 #[inline]
@@ -2413,7 +2460,7 @@ pub fn thread_read_regs(thread_cap: u32, buf: &mut [u8]) -> Result<u64, i64>
     // SAFETY: syscall3 issues raw syscall instruction; `buf` is an exclusive borrow valid for
     // `buf.len()` bytes of writes, passed as (VA, length); the kernel validates the thread cap
     // and the length and writes the TrapFrame only within that span, only if the thread is
-    // stopped.
+    // `Stopped` and descheduled or fault-blocked.
     let ret = unsafe {
         syscall3(
             SYS_THREAD_READ_REGS,
@@ -2425,22 +2472,35 @@ pub fn thread_read_regs(thread_cap: u32, buf: &mut [u8]) -> Result<u64, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
-/// Write register state from `buf` into a stopped thread.
+/// Write register state from `buf` into a stopped or fault-blocked thread.
 ///
-/// The thread must be in `Stopped` state. `buf` must contain a complete
-/// `TrapFrame` (`buf.len() >= size_of::<TrapFrame>()`). The kernel validates
-/// that no privilege bits are set before applying the registers.
+/// The thread must be `Stopped` and descheduled (no longer on any CPU), or
+/// fault-blocked (`BlockedOnFault`, its faulting frame exposed to the bound
+/// handler). `buf` must contain a complete `TrapFrame`
+/// (`buf.len() >= size_of::<TrapFrame>()`). The kernel sanitizes the frame
+/// before applying it: on x86-64 it rejects a non-user `rip` or `rsp` and
+/// forces the segment selectors and the privileged `rflags` bits to user
+/// values; on riscv64 it rejects a non-user `sepc` but does not check
+/// `sstatus` (`SPP`, `SUM`), per
+/// [#443](https://github.com/kottlerg/seraph/issues/443).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the thread cap is invalid, the
-/// thread is not stopped, `buf` is too small, or privilege bits are set.
+/// Returns a negative `i64` error code:
+/// - `InvalidCapability` — `thread_cap` is not a live Thread cap.
+/// - `InsufficientRights` — `thread_cap` lacks `CONTROL`.
+/// - `InvalidState` — the thread is neither `Stopped` and descheduled nor
+///   fault-blocked (a `Stopped` thread still on a CPU is refused).
+/// - `InvalidArgument` — `buf` is shorter than the `TrapFrame`, the frame
+///   fails sanitization, or the thread has no saved frame.
+/// - `InvalidAddress` — `buf` is not wholly in the user half, or the
+///   kernel's copy from it faults.
 #[inline]
 pub fn thread_write_regs(thread_cap: u32, buf: &[u8]) -> Result<(), i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; `buf` is a shared borrow valid for
     // `buf.len()` bytes of reads, passed as (VA, length); the kernel validates the thread cap
-    // and the length and reads only within that span, applying the TrapFrame only if the
-    // thread is stopped and no privilege bits are set.
+    // and the length and reads only within that span, applying the sanitized TrapFrame only
+    // if the thread is `Stopped` and descheduled or fault-blocked.
     let ret = unsafe {
         syscall3(
             SYS_THREAD_WRITE_REGS,
@@ -2464,9 +2524,12 @@ pub fn thread_write_regs(thread_cap: u32, buf: &[u8]) -> Result<(), i64>
 /// CSPRNG; userspace holds no generator state.
 ///
 /// # Errors
-/// Returns a negative `i64` error code: `InvalidArgument` if `buf.len() >
-/// MAX_GETRANDOM_LEN`, or `InvalidAddress` if the kernel's copy into `buf`
-/// faults.
+/// Returns a negative `i64` error code:
+/// - `InvalidArgument` — `buf.len() > MAX_GETRANDOM_LEN`.
+/// - `InvalidAddress` — the kernel's copy into `buf` faults. A slice is
+///   non-null and in the user half, so the kernel's range check never fires.
+/// - `WouldBlock` — the entropy pool is not yet seeded; unreachable once
+///   userspace runs, as the kernel seeds it during boot.
 #[inline]
 pub fn getrandom(buf: &mut [u8]) -> Result<u64, i64>
 {
@@ -2489,7 +2552,12 @@ pub fn getrandom(buf: &mut [u8]) -> Result<u64, i64>
 /// those bytes before it reports a fault on another page of the span.
 ///
 /// # Errors
-/// Returns the same negative `i64` codes as [`getrandom`].
+/// Returns a negative `i64` error code:
+/// - `InvalidArgument` — `len > MAX_GETRANDOM_LEN`.
+/// - `InvalidAddress` — `buf` is null with `len > 0`, the span is not wholly
+///   in the user half, or the kernel's copy into it faults.
+/// - `WouldBlock` — the entropy pool is not yet seeded; unreachable once
+///   userspace runs, as the kernel seeds it during boot.
 // cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
 #[allow(clippy::cast_sign_loss)]
 #[inline]

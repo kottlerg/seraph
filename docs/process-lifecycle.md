@@ -263,7 +263,9 @@ Two handover surfaces carry the parent-to-child contract:
 - **`InitInfo`** — kernel-populated, delivered to init at boot. Defined
   by [`abi/init-protocol`](../abi/init-protocol/). Carries the entire
   initial CSpace layout, including platform resources only init needs.
-- **`ProcessInfo`** — procmgr-populated for every other process.
+- **`ProcessInfo`** — procmgr-populated for every process except init's
+  raw-bootstrap set (memmgr and procmgr), whose `ProcessInfo` init
+  populates.
   Defined by [`abi/process-abi`](../abi/process-abi/). Carries only
   what a single service or application requires.
 

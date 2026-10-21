@@ -6,18 +6,25 @@
 //! Userspace process startup ABI: the binary contract between a process creator
 //! and the created process.
 //!
-//! Defines [`ProcessInfo`] (the `#[repr(C)]` handover struct placed at a
-//! well-known virtual address before the new process runs) and [`StartupInfo`]
-//! (the Rust-native view of it: memmgr's `main` receives it by reference, and
-//! std-built binaries read it through `std::os::seraph::startup_info()`).
+//! Defines [`ProcessInfo`] (the `#[repr(C)]` handover struct the creator maps
+//! read-only before the new process runs, at a creator-chosen virtual address
+//! delivered in the entry register) and [`StartupInfo`] (a Rust-native view of
+//! it that only memmgr's bespoke `_start` constructs, passing `&StartupInfo` to
+//! memmgr's `main`). std's `_start` builds its own same-purpose type,
+//! `std::os::seraph::StartupInfo`, a superset adding `sched_control_cap`,
+//! `initial_priority`, and `log_send_cap`, read through
+//! `std::os::seraph::startup_info()`.
 //!
-//! The ABI delivers the kernel-object caps (thread/aspace/cspace), the
-//! pre-mapped IPC buffer, the creator endpoint cap, the procmgr and memmgr
-//! service endpoints (the heap bootstraps from the memmgr endpoint), and the
-//! three standard-stream caps (stdin/stdout/stderr) that back `std::io`. Genuinely service-specific
-//! capabilities (registry handles, device caps, block-device endpoints, etc.)
-//! are still requested by the child at startup over IPC on the creator
-//! endpoint — see `shared/ipc/src/lib.rs::bootstrap`.
+//! `ProcessInfo` delivers exactly the cap slots its fields name: the
+//! kernel-object self caps and a baseline `SchedControl` cap; the creator,
+//! procmgr, memmgr (the heap bootstraps from it), and service-registry
+//! endpoints; the stdio ring memory and notification caps that back
+//! `std::io`; the namespace root and current-directory caps; the log
+//! endpoint; and the pager endpoint. It also carries the IPC buffer, the TLS
+//! template, argv/env, and the main-thread layout. Service-specific
+//! capabilities (device caps, block-device endpoints, etc.) are requested by
+//! the child at startup over IPC on the creator endpoint — see
+//! `ipc::bootstrap`.
 
 // Under `rustc-dep-of-std` (build-std), use the core facade and no_core
 // so this crate can sit inside std's dep graph. Mirrors abi/syscall and
@@ -205,11 +212,10 @@ pub const PROCESS_MAIN_TLS_MAX_PAGES: u64 = 4;
 /// process receives it as the argument to `_start` rather than reading a fixed
 /// address.
 ///
-/// All slot indices refer to the process's own `CSpace`. Beyond the kernel-
-/// object self-caps, the creator endpoint, the procmgr endpoint, and the
-/// three standard-stream caps, no further service-specific capabilities are
-/// delivered through this page — the child requests them from its creator
-/// over IPC at startup (see `ipc::bootstrap`).
+/// All slot indices refer to the process's own `CSpace`. Only the cap slots
+/// named by this struct's fields are delivered through this page;
+/// service-specific capabilities come from the creator over IPC at startup
+/// (see `ipc::bootstrap`).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ProcessInfo
@@ -526,11 +532,13 @@ pub struct ProcessInfo
 
 // ── StartupInfo ──────────────────────────────────────────────────────────────
 
-/// Rust-native view of the startup handover data: memmgr's `main` receives it
-/// by reference, and std-built binaries read it through
-/// `std::os::seraph::startup_info()`.
+/// Rust-native view of the startup handover data.
 ///
-/// Constructed by `_start()` from [`ProcessInfo`].
+/// Only memmgr's bespoke `_start` constructs it, from [`ProcessInfo`], and
+/// passes `&StartupInfo` to memmgr's `main`. std's `_start` builds its own
+/// same-purpose type, `std::os::seraph::StartupInfo` — a superset adding
+/// `sched_control_cap`, `initial_priority`, and `log_send_cap` — which
+/// std-built binaries read through `std::os::seraph::startup_info()`.
 pub struct StartupInfo
 {
     /// Virtual address of the IPC buffer page.
@@ -552,10 +560,9 @@ pub struct StartupInfo
     /// Zero when unreachable (procmgr itself, or earlier in the boot chain).
     pub procmgr_endpoint: u32,
 
-    /// `CSpace` slot of a badged SEND cap on memmgr's service endpoint.
-    /// Used by `std::os::seraph::_start` to bootstrap the heap allocator.
-    /// Zero when unreachable (memmgr itself, init, or earlier in the boot
-    /// chain).
+    /// `CSpace` slot of a badged SEND cap on memmgr's service endpoint,
+    /// copied from [`ProcessInfo::memmgr_endpoint_cap`]. Zero when
+    /// unreachable (memmgr itself, init, or earlier in the boot chain).
     pub memmgr_endpoint: u32,
 
     /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, the

@@ -245,14 +245,13 @@ pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, iop
     // derived child cap is needed.
     for i in 0..LOG_THREAD_STACK_PAGES
     {
-        if arena
-            .place_page(
-                info.aspace_cap,
-                LOG_THREAD_STACK_VA + i * PAGE_SIZE,
-                syscall::MAP_WRITABLE,
-                |_| {},
-            )
-            .is_none()
+        let va = LOG_THREAD_STACK_VA + i * PAGE_SIZE;
+        // SAFETY: the log-thread stack range is init-private VA, disjoint from
+        // every other init mapping (constants above) and not yet mapped, so no
+        // Rust object occupies it.
+        let placed =
+            unsafe { arena.place_page(info.aspace_cap, va, syscall::MAP_WRITABLE, |_| {}) };
+        if placed.is_none()
         {
             log("init: FATAL: cannot place log thread stack");
             syscall::thread_exit();
@@ -260,14 +259,18 @@ pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, iop
     }
 
     // Offset-map the log thread's IPC buffer (zeroed by `place_page`).
-    if arena
-        .place_page(
+    // SAFETY: LOG_THREAD_IPC_BUF_VA is init-private VA, disjoint from every other
+    // init mapping (constants above) and not yet mapped, so no Rust object
+    // occupies it.
+    let placed = unsafe {
+        arena.place_page(
             info.aspace_cap,
             LOG_THREAD_IPC_BUF_VA,
             syscall::MAP_WRITABLE,
             |_| {},
         )
-        .is_none()
+    };
+    if placed.is_none()
     {
         log("init: FATAL: cannot place log thread IPC buffer");
         syscall::thread_exit();

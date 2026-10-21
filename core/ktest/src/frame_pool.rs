@@ -31,9 +31,9 @@
 //!
 //! // In a test:
 //! let frame = frame_pool::alloc().ok_or("frame pool exhausted")?;
-//! mem_map(frame, aspace_cap, va, 0, 1)?;
+//! unsafe { mem_map(frame, aspace_cap, va, 0, 1, MAP_WRITABLE) }?;
 //! // ... test logic ...
-//! mem_unmap(aspace_cap, va, 1)?;
+//! unsafe { mem_unmap(aspace_cap, va, 1) }?;
 //! unsafe { frame_pool::free(frame) };
 //! ```
 //!
@@ -42,7 +42,7 @@
 //! ```ignore
 //! let mut frame = FrameGuard::new(ctx.aspace_cap)
 //!     .ok_or("frame pool exhausted")?;
-//! frame.map(TEST_VA)?;
+//! unsafe { frame.map(TEST_VA) }?;
 //! // ... test logic ...
 //! // Drop automatically unmaps and returns to pool
 //! ```
@@ -375,19 +375,30 @@ impl FrameGuard
 
     /// Map the frame at the given virtual address.
     ///
+    /// # Safety
+    ///
+    /// When the guard's address space is the caller's own, the page at `va`
+    /// must not alias memory Rust code already owns, as `syscall::mem_map`
+    /// requires, and every Rust reference into it must end before the guard
+    /// drops (drop unmaps it).
+    ///
     /// # Errors
     ///
     /// Returns the syscall error code if `mem_map` fails.
-    pub fn map(&mut self, va: u64) -> Result<(), i64>
+    pub unsafe fn map(&mut self, va: u64) -> Result<(), i64>
     {
-        syscall::mem_map(
-            self.memory_cap,
-            self.aspace_cap,
-            va,
-            0,
-            1,
-            syscall::MAP_WRITABLE,
-        )?;
+        // SAFETY: the caller's contract keeps the page at `va` clear of memory
+        // Rust code owns.
+        unsafe {
+            syscall::mem_map(
+                self.memory_cap,
+                self.aspace_cap,
+                va,
+                0,
+                1,
+                syscall::MAP_WRITABLE,
+            )
+        }?;
         self.mapped_va = Some(va);
         Ok(())
     }
@@ -400,7 +411,9 @@ impl Drop for FrameGuard
         // Unmap if mapped
         if let Some(va) = self.mapped_va
         {
-            let _ = syscall::mem_unmap(self.aspace_cap, va, 1);
+            // SAFETY: `map`'s contract ends every Rust reference into the page
+            // before the guard drops.
+            let _ = unsafe { syscall::mem_unmap(self.aspace_cap, va, 1) };
         }
 
         // Return to pool

@@ -2747,6 +2747,68 @@ unsafe fn start_ready_to_link(tcb: *mut ThreadControlBlock, cpu_count: usize) ->
     settled && (0..cpu_count).all(|cpu| unsafe { scheduler_for(cpu).current } != tcb)
 }
 
+/// Run `access` on `tcb`'s register frame (`trap_frame`, possibly null) while
+/// the thread is held still, and return its result; `None`, without calling
+/// `access`, when the thread is not.
+///
+/// Held still means fault-blocked (`Blocked` with `BlockedOnFault`: the
+/// faulter does not touch its frame until a fault reply resumes it), or
+/// `Stopped`, `current` on no CPU, and with its last register save published
+/// (`context_saved`). A thread stopped while it runs on another CPU is
+/// `Stopped` from the stop's commit but executes, and may enter or leave the
+/// kernel through its frame, until that CPU deschedules it. `access` runs
+/// under `tcb`'s `sched_lock`, which every dispatch, start, and stop or exit
+/// commit takes, so the thread stays held still for its duration; `access`
+/// must therefore not fault or take another TCB's `sched_lock`.
+///
+/// # Safety
+/// `tcb` must be valid, and the caller must hold no scheduler lock and no
+/// `sched_lock`.
+#[cfg(not(test))]
+pub unsafe fn with_held_frame<R>(
+    tcb: *mut ThreadControlBlock,
+    access: impl FnOnce(*mut u8) -> R,
+) -> Option<R>
+{
+    use core::sync::atomic::Ordering;
+    let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    // SAFETY: tcb valid per contract; lock_raw paired with the unlock below.
+    let saved = unsafe { (*tcb).sched_lock.lock_raw() };
+    // SAFETY: state and ipc_state are written under the held sched_lock.
+    let (state, ipc_state) = unsafe { ((*tcb).state, (*tcb).ipc_state) };
+    let held = match state
+    {
+        thread::ThreadState::Blocked => ipc_state == thread::IpcThreadState::BlockedOnFault,
+        thread::ThreadState::Stopped =>
+        {
+            // A Stopped thread cannot become `current` while this sched_lock
+            // is held (dispatch takes it), so one pass over the CPUs, each
+            // read under that CPU's lock, sees every CPU it can still be on.
+            let off_cpu = (0..cpu_count).all(|cpu| {
+                // SAFETY: cpu < cpu_count; scheduler slab initialised by init();
+                // lock_raw paired with unlock_raw.
+                unsafe {
+                    let s = scheduler_for(cpu);
+                    let f = s.lock.lock_raw();
+                    let on = s.current == tcb;
+                    s.lock.unlock_raw(f);
+                    !on
+                }
+            });
+            // SAFETY: context_saved is an atomic; Acquire pairs with the
+            // Release that publishes the switch-out save.
+            off_cpu && unsafe { (*tcb).context_saved.load(Ordering::Acquire) } != 0
+        }
+        _ => false,
+    };
+    // SAFETY: trap_frame is read under the held sched_lock; access is the
+    // caller's.
+    let result = held.then(|| access(unsafe { (*tcb).trap_frame }.cast::<u8>()));
+    // SAFETY: paired with the lock_raw above.
+    unsafe { (*tcb).sched_lock.unlock_raw(saved) };
+    result
+}
+
 /// Shared body of [`set_state_under_all_locks`], [`exit_under_all_locks`],
 /// [`commit_cancelling_park`], and [`start_under_all_locks`].
 ///

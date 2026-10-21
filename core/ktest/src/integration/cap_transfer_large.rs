@@ -57,6 +57,8 @@ struct ChildArgs
     test_sig: u32,
     sync_sig: u32,
     go_sig: u32,
+    /// The child's round: its IPC buffer page.
+    round: usize,
 }
 
 static CHILD_ARGS: ArgBlock<ChildArgs, 2> = ArgBlock::new(ChildArgs {
@@ -64,7 +66,21 @@ static CHILD_ARGS: ArgBlock<ChildArgs, 2> = ArgBlock::new(ChildArgs {
     test_sig: 0,
     sync_sig: 0,
     go_sig: 0,
+    round: 0,
 });
+
+/// An IPC buffer page for one child thread, apart from ktest's own `IPC_BUF`: a child's IPC
+/// and its parent's run on different threads, each through its own registered page.
+#[repr(C, align(4096))]
+struct IpcBufPage([u64; 512]);
+
+impl IpcBufPage
+{
+    const ZERO: Self = Self([0u64; 512]);
+}
+
+// SAFETY: page `r` is registered only by round `r`'s child, one per round.
+static mut CHILD_IPC_BUFS: [IpcBufPage; 2] = [IpcBufPage::ZERO; 2];
 
 /// Which side reaches the endpoint first, selecting the transfer direction.
 #[derive(Clone, Copy)]
@@ -114,6 +130,7 @@ fn run_round(ctx: &TestContext, round: usize, order: Order) -> TestResult
                 test_sig: child_test_sig,
                 sync_sig: child_sync_sig,
                 go_sig: child_go_sig,
+                round,
             },
         )
     };
@@ -187,6 +204,7 @@ fn child_entry(arg: u64) -> !
         test_sig,
         sync_sig,
         go_sig,
+        round,
     } = unsafe { child_args(arg) };
 
     let fail = || -> ! {
@@ -194,10 +212,13 @@ fn child_entry(arg: u64) -> !
         thread_exit()
     };
 
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
-    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
-    // the `ipc` wrappers.
+    // SAFETY: only the address of page `round` is taken; no reference into `CHILD_IPC_BUFS` is
+    // formed.
+    let buf_addr = unsafe { core::ptr::addr_of_mut!(CHILD_IPC_BUFS[round]) } as u64;
+    // SAFETY: page `round` of `CHILD_IPC_BUFS` is page-aligned and registered only by this round's
+    // child, so the page is dedicated to the kernel as this thread's IPC buffer; no Rust reference
+    // into it is ever taken, the page being reached only through raw pointers and the `ipc`
+    // wrappers.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         fail();

@@ -25,19 +25,24 @@ pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, iters: u32)
     for _ in 0..n
     {
         let t0 = cycles_now();
-        if syscall::mem_map(
-            memory_cap,
-            ctx.aspace_cap,
-            BENCH_VA,
-            0,
-            1,
-            syscall::MAP_WRITABLE,
-        )
-        .is_err()
+        // SAFETY: `BENCH_VA` is a fixed ktest bench VA outside the harness image, stacks, and
+        // InitInfo page; no Rust code touches the page.
+        let mapped = unsafe {
+            syscall::mem_map(
+                memory_cap,
+                ctx.aspace_cap,
+                BENCH_VA,
+                0,
+                1,
+                syscall::MAP_WRITABLE,
+            )
+        };
+        if mapped.is_err()
         {
             break;
         }
-        let _ = syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1);
+        // SAFETY: no Rust code touches the bench page; nothing lives in it.
+        let _ = unsafe { syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1) };
         let t1 = cycles_now();
         let delta = t1.saturating_sub(t0);
         if delta < min
@@ -77,15 +82,19 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
         return;
     };
 
-    if syscall::mem_map(
-        memory_cap,
-        ctx.aspace_cap,
-        BENCH_VA,
-        0,
-        1,
-        syscall::MAP_WRITABLE,
-    )
-    .is_err()
+    // SAFETY: `BENCH_VA` is a fixed ktest bench VA outside the harness image, stacks, and
+    // InitInfo page; no Rust code touches the page.
+    let mapped = unsafe {
+        syscall::mem_map(
+            memory_cap,
+            ctx.aspace_cap,
+            BENCH_VA,
+            0,
+            1,
+            syscall::MAP_WRITABLE,
+        )
+    };
+    if mapped.is_err()
     {
         // SAFETY: memory_cap is from pool and was not mapped (mem_map failed).
         unsafe { crate::frame_pool::free(memory_cap) };
@@ -99,25 +108,33 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
     for _ in 0..n
     {
         let t0 = cycles_now();
-        if syscall::mem_protect(
-            memory_cap,
-            ctx.aspace_cap,
-            BENCH_VA,
-            1,
-            syscall::MAP_READONLY,
-        )
-        .is_err()
+        // SAFETY: `BENCH_VA` is a fixed ktest bench VA outside the harness image, stacks, and
+        // InitInfo page; no Rust code touches the page.
+        let mapped = unsafe {
+            syscall::mem_protect(
+                memory_cap,
+                ctx.aspace_cap,
+                BENCH_VA,
+                1,
+                syscall::MAP_READONLY,
+            )
+        };
+        if mapped.is_err()
         {
             break;
         }
-        if syscall::mem_protect(
-            memory_cap,
-            ctx.aspace_cap,
-            BENCH_VA,
-            1,
-            syscall::MAP_WRITABLE,
-        )
-        .is_err()
+        // SAFETY: `BENCH_VA` is a fixed ktest bench VA outside the harness image, stacks, and
+        // InitInfo page; no Rust code touches the page.
+        let mapped = unsafe {
+            syscall::mem_protect(
+                memory_cap,
+                ctx.aspace_cap,
+                BENCH_VA,
+                1,
+                syscall::MAP_WRITABLE,
+            )
+        };
+        if mapped.is_err()
         {
             break;
         }
@@ -134,7 +151,8 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
         total = total.saturating_add(delta);
     }
 
-    let _ = syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1);
+    // SAFETY: no Rust code touches the bench page; nothing lives in it.
+    let _ = unsafe { syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1) };
     // SAFETY: memory_cap is from pool and now unmapped.
     unsafe { crate::frame_pool::free(memory_cap) };
 

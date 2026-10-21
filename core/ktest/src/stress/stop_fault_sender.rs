@@ -86,7 +86,8 @@ const FAULTER_CPU: u32 = 1;
 const HANDLER_CPU: u32 = 2;
 const SYNCER_CPU: u32 = FAULTER_CPU;
 
-/// CPUs needed: one per participant.
+/// CPUs needed: one each for the controller, the faulter, and the handler, the
+/// syncer sharing the faulter's.
 const MIN_CPUS: u64 = 3;
 
 /// Unmapped user VA the faulter stores to; canonical in every paging mode
@@ -693,7 +694,9 @@ fn faulter_died(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally, reason:
     }
     tally.killed += 1;
     call_handler(parts, SYNC_LABEL)?;
-    mem_unmap(ctx.aspace_cap, RESERVED_VA, 1)
+    // SAFETY: `RESERVED_VA` lies outside every Rust object, stack, and IPC buffer page in ktest's
+    // address space; the page there is reached only through the dead faulter's raw pointer.
+    unsafe { mem_unmap(ctx.aspace_cap, RESERVED_VA, 1) }
         .map_err(|_| "stress::stop_fault_sender: unmap after a death failed")?;
     if let Some(th) = parts.faulter.take()
     {
@@ -820,7 +823,10 @@ fn release(ctx: &TestContext, parts: &Parts) -> TestResult
     {
         ok &= cap_delete(th).is_ok();
     }
-    let unmapped = mem_unmap(ctx.aspace_cap, RESERVED_VA, 1).is_ok();
+    // SAFETY: `RESERVED_VA` lies outside every Rust object, stack, and IPC buffer page in ktest's
+    // address space; the page there is reached only through the faulter's raw pointer, and the
+    // faulter is deleted above.
+    let unmapped = unsafe { mem_unmap(ctx.aspace_cap, RESERVED_VA, 1) }.is_ok();
     ok &= unmapped;
     if let Some(frame) = parts.frame.filter(|_| unmapped)
     {
@@ -859,7 +865,10 @@ fn faulter_entry(arg: u64) -> !
         unsafe {
             page.write_volatile(u64::from(attempt));
         }
-        if let Err(e) = mem_unmap(aspace, RESERVED_VA, 1)
+        // SAFETY: `RESERVED_VA` lies outside every Rust object, stack, and IPC buffer page in
+        // this address space; the store above reached the page only through a raw pointer, and
+        // no reference into it is held.
+        if let Err(e) = unsafe { mem_unmap(aspace, RESERVED_VA, 1) }
         {
             UNMAP_FAILED.record_error(e);
         }
@@ -962,7 +971,10 @@ fn handler_entry(arg: u64) -> !
 /// and the fault declined, so the faulter does not re-fault for good.
 fn service_fault(args: &HandlerArgs, buf: *mut u64)
 {
-    let disposition = match mem_map(args.frame, args.aspace, RESERVED_VA, 0, 1, MAP_WRITABLE)
+    // SAFETY: `RESERVED_VA` lies outside every Rust object, stack, and allocation in ktest's
+    // address space; the page mapped there is reached only through the faulter's raw pointer.
+    let mapped = unsafe { mem_map(args.frame, args.aspace, RESERVED_VA, 0, 1, MAP_WRITABLE) };
+    let disposition = match mapped
     {
         Ok(()) => FAULT_REPLY_RESUME,
         Err(e) =>

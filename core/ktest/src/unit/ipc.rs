@@ -44,6 +44,42 @@ static mut RECV_OOM_STACK: ChildStack = ChildStack::ZERO;
 static mut STALE_REPLY_STACK: ChildStack = ChildStack::ZERO;
 static mut FOUR_CAPS_STACK: ChildStack = ChildStack::ZERO;
 
+/// An IPC buffer page for one child thread, apart from ktest's own `IPC_BUF`: a child's IPC
+/// and its parent's run on different threads, each through its own registered page.
+#[repr(C, align(4096))]
+struct IpcBufPage([u64; 512]);
+// SAFETY: registered only by the `caller_entry` child; `call_reply_recv` and
+// `recv_unbadged_returns_zero` each spawn one such child, and tests run one at a time.
+static mut CALLER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+// SAFETY: registered only by the `queued_caller_entry` child; `recv_finds_queued_caller` spawns one
+// such child, and tests run one at a time.
+static mut QUEUED_CALLER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+// SAFETY: registered only by the `data_caller_entry` child; `call_with_data_words` spawns one such
+// child, and tests run one at a time.
+static mut DATA_CALLER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+// SAFETY: registered only by the `cap_xfer_caller_entry` child; `call_with_cap_transfer` spawns one
+// such child, and tests run one at a time.
+static mut CAP_XFER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+// SAFETY: registered only by the `badge_caller_entry` child; `recv_delivers_badge` spawns one such
+// child, and tests run one at a time.
+static mut BADGE_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+// SAFETY: registered only by the `snapshot_caller_entry` child;
+// `recv_snapshot_survives_buffer_clobber` spawns one such child, and tests run one at a time.
+static mut SNAPSHOT_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+// SAFETY: registered only by the `reply_oom_caller_entry` child;
+// `reply_oom_wakes_caller_with_transfer_failed` spawns one such child, and tests run one at a time.
+static mut REPLY_OOM_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+// SAFETY: registered only by the `dup_reply_caller_entry` child;
+// `reply_duplicate_cap_slot_rejected` and `reply_stale_cap_handle_rejected` each spawn one such
+// child, and tests run one at a time.
+static mut DUP_REPLY_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+// SAFETY: registered only by the `four_caps_caller_entry` child; `call_four_caps_transfer` spawns
+// one such child, and tests run one at a time.
+static mut FOUR_CAPS_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+// SAFETY: registered only by the `recv_oom_victim_entry` child; `recv_oom_returns_cleanly` spawns
+// one such child, and tests run one at a time.
+static mut RECV_OOM_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+
 /// Arguments of the cap-transfer children (`cap_xfer`, `four_caps`,
 /// `recv_oom`), handed to their entries by address; `memory` carries RETYPE
 /// so the child can mint the transferred objects.
@@ -507,12 +543,12 @@ fn caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let notify_slot = (arg >> 32) as u32;
 
-    // Register the shared IPC buffer for this child thread. Each thread has its
-    // own IPC buffer pointer in its TCB; the child must register before calling.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
-    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
-    // the `ipc` wrappers.
+    // Register this child's own IPC buffer page. Each thread has its own IPC buffer
+    // pointer in its TCB; the child must register before calling.
+    let buf_addr = core::ptr::addr_of_mut!(CALLER_IPC_BUF) as u64;
+    // SAFETY: `CALLER_IPC_BUF` is a page-aligned static only this entry's child registers, so the
+    // page is dedicated to the kernel as this thread's IPC buffer; no Rust reference into it is
+    // ever taken, the page being reached only through raw pointers and the `ipc` wrappers.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(notify_slot, 0xBAD).ok();
@@ -552,11 +588,11 @@ fn queued_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 
-    // Register the shared IPC buffer for this child thread.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
-    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
-    // the `ipc` wrappers.
+    // Register this child's own IPC buffer page.
+    let buf_addr = core::ptr::addr_of_mut!(QUEUED_CALLER_IPC_BUF) as u64;
+    // SAFETY: `QUEUED_CALLER_IPC_BUF` is a page-aligned static only this entry's child registers,
+    // so the page is dedicated to the kernel as this thread's IPC buffer; no Rust reference into it
+    // is ever taken, the page being reached only through raw pointers and the `ipc` wrappers.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
@@ -590,12 +626,12 @@ fn data_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 
-    // Register the shared IPC buffer for this child thread. Each thread has its
-    // own IPC buffer pointer in its TCB; the child must register before calling.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
-    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
-    // the `ipc` wrappers.
+    // Register this child's own IPC buffer page. Each thread has its own IPC buffer
+    // pointer in its TCB; the child must register before calling.
+    let buf_addr = core::ptr::addr_of_mut!(DATA_CALLER_IPC_BUF) as u64;
+    // SAFETY: `DATA_CALLER_IPC_BUF` is a page-aligned static only this entry's child registers, so
+    // the page is dedicated to the kernel as this thread's IPC buffer; no Rust reference into it is
+    // ever taken, the page being reached only through raw pointers and the `ipc` wrappers.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
@@ -629,10 +665,10 @@ fn cap_xfer_caller_entry(arg: u64) -> !
     } = unsafe { child_args(arg) };
 
     // Register IPC buffer for cap transfer.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
-    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
-    // the `ipc` wrappers.
+    let buf_addr = core::ptr::addr_of_mut!(CAP_XFER_IPC_BUF) as u64;
+    // SAFETY: `CAP_XFER_IPC_BUF` is a page-aligned static only this entry's child registers, so the
+    // page is dedicated to the kernel as this thread's IPC buffer; no Rust reference into it is
+    // ever taken, the page being reached only through raw pointers and the `ipc` wrappers.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
@@ -666,11 +702,11 @@ fn badge_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 
-    // Register the shared IPC buffer for this child thread.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
-    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
-    // the `ipc` wrappers.
+    // Register this child's own IPC buffer page.
+    let buf_addr = core::ptr::addr_of_mut!(BADGE_IPC_BUF) as u64;
+    // SAFETY: `BADGE_IPC_BUF` is a page-aligned static only this entry's child registers, so the
+    // page is dedicated to the kernel as this thread's IPC buffer; no Rust reference into it is
+    // ever taken, the page being reached only through raw pointers and the `ipc` wrappers.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
@@ -778,10 +814,10 @@ fn snapshot_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
-    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
-    // the `ipc` wrappers.
+    let buf_addr = core::ptr::addr_of_mut!(SNAPSHOT_IPC_BUF) as u64;
+    // SAFETY: `SNAPSHOT_IPC_BUF` is a page-aligned static only this entry's child registers, so the
+    // page is dedicated to the kernel as this thread's IPC buffer; no Rust reference into it is
+    // ever taken, the page being reached only through raw pointers and the `ipc` wrappers.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
@@ -937,10 +973,10 @@ fn reply_oom_caller_entry(arg: u64) -> !
         memory: memory_slot,
     } = unsafe { child_args(arg) };
 
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
-    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
-    // the `ipc` wrappers.
+    let buf_addr = core::ptr::addr_of_mut!(REPLY_OOM_IPC_BUF) as u64;
+    // SAFETY: `REPLY_OOM_IPC_BUF` is a page-aligned static only this entry's child registers, so
+    // the page is dedicated to the kernel as this thread's IPC buffer; no Rust reference into it is
+    // ever taken, the page being reached only through raw pointers and the `ipc` wrappers.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(ready_slot, 0xBAD).ok();
@@ -1139,10 +1175,10 @@ fn dup_reply_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
-    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
-    // the `ipc` wrappers.
+    let buf_addr = core::ptr::addr_of_mut!(DUP_REPLY_IPC_BUF) as u64;
+    // SAFETY: `DUP_REPLY_IPC_BUF` is a page-aligned static only this entry's child registers, so
+    // the page is dedicated to the kernel as this thread's IPC buffer; no Rust reference into it is
+    // ever taken, the page being reached only through raw pointers and the `ipc` wrappers.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
@@ -1331,10 +1367,10 @@ fn four_caps_caller_entry(arg: u64) -> !
         memory: memory_slot,
     } = unsafe { child_args(arg) };
 
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
-    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
-    // the `ipc` wrappers.
+    let buf_addr = core::ptr::addr_of_mut!(FOUR_CAPS_IPC_BUF) as u64;
+    // SAFETY: `FOUR_CAPS_IPC_BUF` is a page-aligned static only this entry's child registers, so
+    // the page is dedicated to the kernel as this thread's IPC buffer; no Rust reference into it is
+    // ever taken, the page being reached only through raw pointers and the `ipc` wrappers.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
@@ -1450,10 +1486,10 @@ fn recv_oom_victim_entry(arg: u64) -> !
         memory: memory_slot,
     } = unsafe { child_args(arg) };
 
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
-    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
-    // the `ipc` wrappers.
+    let buf_addr = core::ptr::addr_of_mut!(RECV_OOM_IPC_BUF) as u64;
+    // SAFETY: `RECV_OOM_IPC_BUF` is a page-aligned static only this entry's child registers, so the
+    // page is dedicated to the kernel as this thread's IPC buffer; no Rust reference into it is
+    // ever taken, the page being reached only through raw pointers and the `ipc` wrappers.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();

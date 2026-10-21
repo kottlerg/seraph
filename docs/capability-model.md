@@ -700,10 +700,13 @@ capability reference counts reach zero. This path has known kernel memory-safety
 
 Beyond that stop, the kernel's role in death is *notification*. An
 `AddressSpace` carries a death-observer set (mirroring the per-thread death
-observers). On a terminal fault by any thread in the address space — no fault
-handler bound, or the handler replied `KILL` — the kernel posts the fault class
-(`EXIT_FAULT_BASE + vector`) to each bound observer and exits the faulting
-thread. procmgr binds such an observer at process creation, so a fatal fault on
+observers). On a terminal fault by any thread in the address space (no fault
+handler bound, the handler replied `KILL`, or the fault episode was cancelled:
+handler-thread death, a stop of the faulting thread, or a later receive on the
+handler thread while the fault reply is pending; see
+[Fault Handling](fault-handling.md#delivery-resume-and-kill)), the kernel posts
+the fault class (`EXIT_FAULT_BASE + vector`) to each bound observer and exits
+the faulting thread. procmgr binds such an observer at process creation, so a fatal fault on
 any thread — a worker, not just the main thread — drives procmgr's teardown of
 the whole process. Normal thread exit does not fire these observers.
 

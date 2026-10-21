@@ -190,10 +190,13 @@ it resumes by re-executing its faulting instruction, not by returning a value.
   instruction. For a page fault whose handler has installed a satisfying mapping, the
   instruction now succeeds.
 - **Kill (cancellation).** If the binding is severed before a reply — the handler thread dies, the
-  binding is cleared (design intent; not yet implemented, #242), the thread is stopped, or the
-  handler thread receives again while the fault reply is still pending, with a receive that passes
-  its capability and headroom checks ([Liveness](#liveness) rule 2) — the faulting thread is
-  killed, exactly as an unhandled fault. It is never resumed with a spurious value.
+  binding is cleared (design intent; not yet implemented, #242), or the handler thread receives
+  again while the fault reply is still pending, with a receive that passes its capability and
+  headroom checks ([Liveness](#liveness) rule 2) — the faulting thread is killed, exactly as an
+  unhandled fault. A stop of the faulting thread also cancels the episode, but kills nothing at
+  once: the stop records `FAULT_OUTCOME_KILL` and leaves the thread `Stopped`; when next started,
+  the thread is killed as an unhandled fault. Destroying it while stopped ends it as for any
+  stopped thread. A cancelled fault-blocked thread is never resumed.
 
 ### Modifying the faulting thread
 

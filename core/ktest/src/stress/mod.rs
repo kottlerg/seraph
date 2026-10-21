@@ -27,6 +27,7 @@ mod concurrent_event_producers;
 mod concurrent_ipc;
 mod concurrent_map_unmap;
 mod concurrent_notification;
+mod configure_start_race;
 mod cspace_recycle;
 mod double_enqueue_storm;
 mod event_queue_fill_drain;
@@ -92,6 +93,10 @@ pub fn run_all(ctx: &TestContext)
     );
     run_integration_test!("stress::stop_reply_race", stop_reply_race::run(ctx));
     run_integration_test!("stress::stop_resume_race", stop_resume_race::run(ctx));
+    run_integration_test!(
+        "stress::configure_start_race",
+        configure_start_race::run(ctx)
+    );
     run_integration_test!("stress::stop_sleep_window", stop_sleep_window::run(ctx));
     run_integration_test!("stress::stop_park_race", stop_park_race::run(ctx));
     run_integration_test!("stress::stop_owed_wake", stop_owed_wake::run(ctx));

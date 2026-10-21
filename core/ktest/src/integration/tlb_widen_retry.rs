@@ -40,8 +40,8 @@ use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult};
 
-/// User-half VA used only by this test (5.375 GiB), clear of other tests.
-const WIDEN_VA: u64 = 0x1_5800_0000;
+/// User-half VA used only by this test (5.4375 GiB), clear of other tests.
+const WIDEN_VA: u64 = 0x1_5C00_0000;
 
 /// Sentinel the child stores through the widened mapping.
 const SENTINEL: u64 = 0xCAFE_F00D;

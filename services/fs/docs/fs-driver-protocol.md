@@ -459,6 +459,15 @@ directory cap with `MUTATE_DIR`.
 | `data[1]` | Destination name length |
 | `bytes(2, &concat(src, dst))` | Source bytes immediately followed by destination bytes (no padding) starting at byte 16 |
 
+Both names share the data area after the two length words, so
+`data[0] + data[1]` MUST be at most `(MSG_DATA_WORDS_MAX - 2) * 8` =
+496 bytes. The bound is less than two names of the per-name maximum
+(`MAX_NAME_LEN`, 255 bytes, per
+[`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)):
+a pair of individually valid names can exceed it. In ruststd,
+`std::fs::rename` refuses such a pair with `InvalidFilename` before
+sending.
+
 **Reply (success)**: `label = 0`, empty body.
 
 Cross-directory rename is deferred: servers cannot introspect the

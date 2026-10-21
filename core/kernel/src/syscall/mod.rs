@@ -69,7 +69,11 @@ use syscall::{
 pub unsafe fn dispatch(tf: *mut TrapFrame)
 {
     let frame = tf;
-    // SAFETY: caller guarantees tf is valid and exclusively accessible.
+    // SAFETY: caller guarantees tf is valid. The `&mut` is not exclusive for
+    // the whole call: while the thread blocks in a handler, SYS_THREAD_WRITE_REGS
+    // from another CPU, and riscv64's switch-out, can write the frame through
+    // the published `trap_frame`, a gap docs/arch-interface.md § `trap_frame`
+    // states and #443 tracks.
     let tf = unsafe { &mut *tf };
 
     let nr = tf.syscall_nr();
@@ -85,9 +89,11 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
             (*tcb)
                 .syscall_nr
                 .store(nr, core::sync::atomic::Ordering::Relaxed);
-            // Every entry from user mode publishes its live frame as the
-            // thread's `trap_frame`; an interrupt or exception taken since the
-            // last syscall may have pointed it at a frame lower on the stack.
+            // Every entry from user mode at which the thread can be descheduled
+            // publishes its live frame as the thread's `trap_frame` (see
+            // docs/arch-interface.md § `trap_frame`); an interrupt or exception
+            // taken since the last syscall may have pointed it at a frame lower
+            // on the stack.
             (*tcb)
                 .trap_frame
                 .store(frame, core::sync::atomic::Ordering::Relaxed);
@@ -593,7 +599,9 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg2 = caller-chosen `correlator` (opaque routing tag).
 ///
 /// On a terminal fault by any thread in the address space (no handler bound,
-/// or handler replied `KILL`), the kernel posts the fault class to each bound
+/// the handler replied `KILL`, or the fault episode was cancelled; see
+/// docs/fault-handling.md § Delivery, Resume, and Kill), the kernel posts the
+/// fault class to each bound
 /// observer. The kernel only notifies; it never enumerates or terminates
 /// threads, and normal `thread_exit` does NOT fire these observers.
 ///

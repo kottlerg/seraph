@@ -574,11 +574,13 @@ pub struct ThreadControlBlock
     /// Pointer to the `TrapFrame` of the thread's last entry from user mode,
     /// on its kernel stack below `kernel_stack_top` (null for kernel threads).
     ///
-    /// Set by `SYS_THREAD_CONFIGURE` to the slot its first entry to user mode
-    /// resumes from, and republished by every entry from user mode (see
-    /// `docs/arch-interface.md` § `trap_frame`). The running thread is the only
-    /// writer after configuration; atomic so a diagnostic read from another
-    /// CPU (the softlockup watchdog) is race-free. Relaxed suffices: the
+    /// Set by `SYS_THREAD_CONFIGURE` (under the thread's `sched_lock`, while
+    /// `Created`) to the slot its first entry to user mode resumes from, and
+    /// republished by every entry from user mode at which the thread can be
+    /// descheduled (see `docs/arch-interface.md` § `trap_frame`). The running
+    /// thread is the only writer after configuration; atomic so the softlockup
+    /// watchdog's load from another CPU is race-free (its copy of the frame
+    /// itself is a volatile, diagnostic-only read). Relaxed suffices: the
     /// register syscalls read it only after the switch-out's `context_saved`
     /// Release (`sched::with_held_frame`).
     pub trap_frame: core::sync::atomic::AtomicPtr<crate::arch::current::trap_frame::TrapFrame>,

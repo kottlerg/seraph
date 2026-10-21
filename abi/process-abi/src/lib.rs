@@ -309,11 +309,13 @@ pub struct ProcessInfo
     /// This is the **only** service-discovery slot in `ProcessInfo`.
     /// New services do not get their own dedicated slot; they are
     /// resolved by name through this single handle. The deprecated
-    /// `log_send_cap` below predates this convention and will be
-    /// migrated to the same mechanism in a separate PR.
+    /// `log_send_cap` below predates this convention and is migrating
+    /// to the same mechanism (#74).
     ///
-    /// Zero when no svcmgr is reachable (svcmgr itself, anything
-    /// before svcmgr exists). Consumers must tolerate zero.
+    /// init creates svcmgr's endpoint before it bootstraps procmgr, so
+    /// procmgr mints a nonzero cap for every child it spawns, svcmgr
+    /// included. Zero for the processes init populates directly
+    /// (memmgr, procmgr). Consumers must tolerate zero.
     pub service_registry_cap: u32,
 
     /// `CSpace` slot of the shmem memory cap backing `std::io::stdin`.
@@ -451,8 +453,8 @@ pub struct ProcessInfo
     /// matches it directly against the death-notification correlator
     /// procmgr posts on child exit.
     ///
-    /// Zero when no logger is reachable (init, memmgr, procmgr
-    /// themselves; processes spawned before the log endpoint exists).
+    /// Zero when no logger is reachable (memmgr; processes spawned
+    /// before the log endpoint exists).
     /// `seraph::log!` silently drops in that case.
     ///
     /// The log receiver itself (logd) deletes its seeded copy at startup:
@@ -507,7 +509,7 @@ pub struct ProcessInfo
     /// pager (memmgr's service endpoint). Nonzero for ordinary processes —
     /// demand paging is the system-wide default — and zero only for pinned
     /// processes (`procmgr_labels::CREATE_PINNED`, e.g. DMA drivers) and the
-    /// pre-pager bootstrap (init/memmgr/procmgr).
+    /// pre-pager bootstrap (memmgr/procmgr).
     ///
     /// procmgr binds the main thread's fault handler to this endpoint at
     /// creation; the runtime reads this slot and `pager_badge` to bind the

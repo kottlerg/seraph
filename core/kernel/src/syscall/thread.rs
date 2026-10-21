@@ -81,13 +81,6 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Thread must be in Created state to configure.
-    // SAFETY: target_tcb validated non-null; state field always valid.
-    if unsafe { (*target_tcb).state } != ThreadState::Created
-    {
-        return Err(SyscallError::InvalidArgument);
-    }
-
     // The entry point, the aligned stack pointer and the TLS base must be user
     // addresses: the thread's first return to user mode resumes at the entry on
     // that stack. On x86-64 an `iretq` to a non-canonical RIP faults in ring 0
@@ -107,6 +100,22 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // the stack top. This mirrors the setup in `sched::enter()`.
     let tf_size = size_of::<ArchTrapFrame>() as u64;
     let tf_ptr = (kstack_top - tf_size) as *mut ArchTrapFrame;
+
+    // The thread must be `Created`, decided under its sched_lock and held for
+    // the writes below: a concurrent SYS_THREAD_START's commit takes the same
+    // lock, so it either commits before (and this call is refused) or after
+    // the frame, `trap_frame` and `saved_state` are complete. A `Created`
+    // thread is current on no CPU.
+    // SAFETY: target_tcb validated non-null; lock_raw paired with the
+    // unlock_raw on both paths below.
+    let sched_saved = unsafe { (*target_tcb).sched_lock.lock_raw() };
+    // SAFETY: state is written under the held sched_lock.
+    if unsafe { (*target_tcb).state } != ThreadState::Created
+    {
+        // SAFETY: paired with the lock_raw above.
+        unsafe { (*target_tcb).sched_lock.unlock_raw(sched_saved) };
+        return Err(SyscallError::InvalidArgument);
+    }
 
     // Zero then populate user-mode entry fields.
     // SAFETY: kstack_top - tf_size is within the allocated kernel stack (4 pages);
@@ -132,10 +141,13 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // caller-supplied value; no-op on architectures that carry TLS state in
     // the trap frame (RISC-V uses `tp` there).
     // SAFETY: target_tcb validated non-null; saved_state has no interior
-    // mutability and is exclusively owned by this thread in Created state.
+    // mutability, and the thread is `Created` under the held sched_lock, so
+    // no switch reads it meanwhile.
     unsafe {
         crate::arch::current::context::seed_tls_base(&mut (*target_tcb).saved_state, tls_base);
     }
+    // SAFETY: paired with the lock_raw above.
+    unsafe { (*target_tcb).sched_lock.unlock_raw(sched_saved) };
 
     Ok(0)
 }

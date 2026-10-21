@@ -81,8 +81,9 @@
 //! free, or, once the delete phase's respawn has reused the TCB, the fresh
 //! target's state; either ends the drain unless the reused TCB holds a
 //! `Stopped` thread still switching out, and no assertion catches the stale
-//! read: the drain re-reads only `state`, `current` and `context_saved`, and
-//! checks nothing on the TCB's magic word (which the free poisons).
+//! read: the drain re-reads `state`, `current`, `context_saved` (and, in its
+//! slow-drain diagnostic, `thread_id`), and checks nothing on the TCB's magic
+//! word (which the free poisons).
 //!
 //! Needs **≥ 3 CPUs**.
 

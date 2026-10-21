@@ -2262,6 +2262,7 @@ source of truth.
 [Kernel Entropy Subsystem](entropy.md), [IPC Subsystem Internals](ipc-internals.md),
 [Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[Thread Lifecycle and Sleep List Invariants](thread-lifecycle-and-sleep.md),
 [core/ktest/README.md](../../ktest/README.md),
 [Capability Model](../../../docs/capability-model.md), [IPC Design](../../../docs/ipc-design.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),

@@ -73,11 +73,11 @@ jobs:
         run: |
           sudo apt-get update
           # Ubuntu 26.04 ships the riscv64 system emulator in its own
-          # package, no longer in qemu-system-misc; older images have no
-          # such package and keep it in qemu-system-misc.
+          # package, qemu-system-riscv, no longer in qemu-system-misc; older
+          # images have no such package and keep it in qemu-system-misc.
           riscv=""
-          if apt-cache show qemu-system-riscv64 >/dev/null 2>&1; then
-            riscv=qemu-system-riscv64
+          if apt-cache show qemu-system-riscv >/dev/null 2>&1; then
+            riscv=qemu-system-riscv
           fi
           sudo apt-get install -y \
             qemu-system-x86 \

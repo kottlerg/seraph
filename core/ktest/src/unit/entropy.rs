@@ -11,8 +11,9 @@ use syscall_abi::SyscallError;
 /// A canonical user-half virtual address that ktest never maps.
 const UNMAPPED_USER_VA: u64 = 0x3E_3000_0000;
 
-/// Safe test VA (1 GiB), well above ktest's load address and stack. Mapped and
-/// unmapped within a single test, so it is free between tests.
+/// Test VA (5 GiB), below ktest's image, stack, and `InitInfo` windows and above
+/// its device mappings, so no Rust object, stack, or IPC buffer page lies there.
+/// Mapped and unmapped within a single test, so it is free between tests.
 const RO_TEST_VA: u64 = 0x1_4000_0000;
 
 /// `getrandom` into a valid buffer fills the whole span with non-zero entropy.
@@ -61,11 +62,13 @@ pub fn getrandom_readonly_ptr_invalid_address(ctx: &TestContext) -> TestResult
 {
     let mut frame = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
         .ok_or("getrandom RO: frame pool exhausted")?;
-    frame
-        .map(RO_TEST_VA)
-        .map_err(|_| "getrandom RO: mem_map failed")?;
+    // SAFETY: no Rust object, stack, or allocation lies at `RO_TEST_VA`, and no Rust reference
+    // into the page is taken, so none outlives the guard's drop.
+    unsafe { frame.map(RO_TEST_VA) }.map_err(|_| "getrandom RO: mem_map failed")?;
     // prot = 0: read-only (no WRITE/EXECUTE). Drops the W bit on the live PTE.
-    syscall::mem_protect(frame.cap(), ctx.aspace_cap, RO_TEST_VA, 1, 0)
+    // SAFETY: the page at `RO_TEST_VA` is this cell's own frame, which holds no Rust object or
+    // IPC buffer page and is reached only through the raw pointer passed to the kernel below.
+    unsafe { syscall::mem_protect(frame.cap(), ctx.aspace_cap, RO_TEST_VA, 1, 0) }
         .map_err(|_| "getrandom RO: mem_protect to read-only failed")?;
 
     // SAFETY: the span lies in this cell's own frame, mapped read-only above, so

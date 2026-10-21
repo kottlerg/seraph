@@ -283,7 +283,11 @@ impl Pipe {
         // the original stays clean for the child handoff derivations.
         let map_result = syscall::cap_derive(memory_cap, syscall::RIGHTS_MEM_MAP_RW)
             .and_then(|rw| {
-                let r = syscall::mem_map(rw, aspace, parent_va, 0, 1, syscall::MAP_WRITABLE);
+                // SAFETY: parent_va is the page `reserve_pages` just reserved for
+                // this ring: reserved, unbacked VA no Rust object occupies.
+                let r = unsafe {
+                    syscall::mem_map(rw, aspace, parent_va, 0, 1, syscall::MAP_WRITABLE)
+                };
                 let _ = syscall::cap_delete(rw);
                 r
             });
@@ -301,6 +305,11 @@ impl Pipe {
             SpscHeader::init(parent_va as *mut SpscHeader, RING_CAPACITY);
         }
 
+        // SAFETY: parent_va is the ring page this function mapped; only
+        // `SpscHeader::init` has touched it, through a raw pointer, and no Rust
+        // reference into it exists until the Pipe below is built.
+        let unmap_ring = || unsafe { syscall::mem_unmap(aspace, parent_va, 1) };
+
         // Allocator failure here is rare (memmgr unreachable / OOM); tear
         // down what we have so far before reporting.
         let data_notification = match crate::sys::alloc::seraph::object_slab_retype(120, |slab| {
@@ -310,7 +319,7 @@ impl Pipe {
         {
             Ok(s) => s,
             Err(e) => {
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
+                let _ = unmap_ring();
                 let _ = syscall::cap_delete(memory_cap);
                 crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
                 unreserve_pages(reserved);
@@ -325,7 +334,7 @@ impl Pipe {
             Ok(s) => s,
             Err(e) => {
                 let _ = syscall::cap_delete(data_notification);
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
+                let _ = unmap_ring();
                 let _ = syscall::cap_delete(memory_cap);
                 crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
                 unreserve_pages(reserved);
@@ -343,7 +352,7 @@ impl Pipe {
             Err(_) => {
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
+                let _ = unmap_ring();
                 let _ = syscall::cap_delete(memory_cap);
                 crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
                 unreserve_pages(reserved);
@@ -358,7 +367,7 @@ impl Pipe {
                 let _ = syscall::cap_delete(memory_handoff);
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
+                let _ = unmap_ring();
                 let _ = syscall::cap_delete(memory_cap);
                 crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
                 unreserve_pages(reserved);
@@ -374,7 +383,7 @@ impl Pipe {
                 let _ = syscall::cap_delete(memory_handoff);
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
+                let _ = unmap_ring();
                 let _ = syscall::cap_delete(memory_cap);
                 crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
                 unreserve_pages(reserved);
@@ -419,7 +428,9 @@ impl Pipe {
     ) -> io::Result<Pipe> {
         let child_va = reserved.va_start();
         let memory_caps = [memory_cap, 0, 0, 0];
-        match SharedBuffer::attach(&memory_caps, 1, aspace, child_va) {
+        // SAFETY: child_va is the caller-reserved range: reserved, unbacked VA no
+        // Rust object occupies, which the returned Pipe then owns.
+        match unsafe { SharedBuffer::attach(&memory_caps, 1, aspace, child_va) } {
             // Same forget-the-SharedBuffer trick: Pipe's Drop unmaps.
             Ok(sb) => core::mem::forget(sb),
             Err(_) => {
@@ -680,7 +691,10 @@ impl Drop for Pipe {
             }
         }
         // Unmap the ring page from this process's aspace.
-        let _ = syscall::mem_unmap(self.aspace, self.ring_vaddr, 1);
+        // SAFETY: the ring page belongs to this Pipe; every reference into it
+        // (`header`, `writer`, `reader`) borrows `self` and has ended, including
+        // the `mark_closed` borrow above.
+        let _ = unsafe { syscall::mem_unmap(self.aspace, self.ring_vaddr, 1) };
         // Release this side's cap slots. The peer's Drop releases its
         // own copies; the underlying kernel objects free when refcount
         // hits zero.

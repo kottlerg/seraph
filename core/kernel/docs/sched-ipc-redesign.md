@@ -154,8 +154,9 @@ which the `enqueue_and_wake` gate and its callers preserve:
    `enqueue_and_wake`. So `wake_pending` set ⇒ payload already deposited — no
    spurious-zero/garbage wake. (`wake_pending` is set inside `enqueue_and_wake`,
    strictly after the upstream deposit under the source lock.)
-2. Both refusals dequeue the waiter and restore `context_saved`, and the
-   thread then passes through `schedule()`, which REQUEUES a runnable thread
+2. In each IPC primitive both refusals dequeue the waiter and restore
+   `context_saved`, and the thread then passes through `schedule()`, which
+   REQUEUES a runnable thread
    (`ParkCommit::RefusedWake`: still `Running`) and DRAINS a Stopped/Exited
    one (`ParkCommit::RefusedStop`); either way it resumes at the line after
    `schedule()` and reads its park disposition. The variant decides that

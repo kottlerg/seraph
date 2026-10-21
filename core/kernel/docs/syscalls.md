@@ -1142,9 +1142,11 @@ Protocol, invariant 4).
 `InvalidArgument` (the target is the caller, is not yet configured, or is not in Created/Stopped
 state under the locked commit — including one a concurrent start already resumed, or one that
 exited or was killed by an object teardown after the first check), `Interrupted` (the caller was
-itself stopped while the start waited for the target to leave its CPU or for an owed wake). Of
-concurrent starts of one stopped thread, exactly one succeeds. A start that a concurrent
-`SYS_THREAD_STOP` overtakes after its commit succeeds and leaves the thread `Stopped`.
+itself stopped while the start waited for the target to leave its CPU or for an owed wake). Each
+stop admits at most one start commit: absent an intervening stop, exactly one of several
+concurrent starts of one stopped thread succeeds. A start that a concurrent `SYS_THREAD_STOP`
+overtakes after its commit succeeds and leaves the thread `Stopped`, and a later start can then
+commit again.
 
 ---
 
@@ -1165,18 +1167,17 @@ syscall on the target thread returns `Interrupted`, unless a genuine waker or th
 claimed the wake first); a target that blocks while the stop is in progress is cancelled the same
 way, never left registered as a waiter (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
-Protocol). This does not hold for a stop of a thread waiting on a
-notification, event queue, or wait set whose last capability is deleted concurrently: the cancel
-can lock the object after it is freed
+Protocol). This does not hold for a stop of a thread waiting on a notification, event queue, or wait
+set whose last capability is deleted concurrently: the cancel can lock the object after it is freed
 ([#443](https://github.com/kottlerg/seraph/issues/443) § Source pointer held past its free). A
 thread running on another CPU is marked `Stopped` under every CPU's scheduler lock, and the call
-returns once that CPU has descheduled it, at its next slice expiry or the thread's own park or
-yield, or once an object teardown has committed `Exited` over it; the inter-processor interrupt
-sent to that CPU only forces a trap. A caller that is itself stopped while it waits deschedules in
-place; once restarted it re-resolves `thread_cap`, and its call completes when the target has left
-its CPU, or at once when that slot no longer names the target with Control rights — the target may
-then still be executing, and neither `SYS_THREAD_READ_REGS` nor `SYS_THREAD_WRITE_REGS` through
-another capability is guaranteed to act on the `trap_frame` the target resumes from (see
+returns once that CPU has descheduled it and published its register save, at its next slice expiry
+or the thread's own park or yield, or once an object teardown has committed `Exited` over it; the
+inter-processor interrupt sent to that CPU only forces a trap. A caller that is itself stopped while
+it waits deschedules in place; once restarted it re-resolves `thread_cap`, and its call completes
+when the target has left its CPU, or at once when that slot no longer names the target with Control
+rights — the target may then still be executing, and `SYS_THREAD_READ_REGS` and
+`SYS_THREAD_WRITE_REGS` refuse it with `InvalidState` until it has left its CPU (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
 Protocol).
 
@@ -1382,16 +1383,20 @@ published in the kernel ABI headers). If `buf_size` is smaller than the required
 size, the call fails with `InvalidArgument`.
 
 A thread stopped while it runs on another CPU is `Stopped` from the stop's commit, but it executes
-until that CPU deschedules it; the stop call that stopped it returns only after that (see
-[`SYS_THREAD_STOP`](#sys_thread_stop-20)), except a restarted stopper's call whose slot no longer
-names the target. A read in that window may return the frame of the target's previous kernel
-entry; a caller that needs the current registers reads after the stop call returns.
+until that CPU deschedules it, so the call refuses it with `InvalidState` until it is `current` on
+no CPU with its last register save published; the access then runs under the target's scheduling
+lock, which every dispatch, start, and stop takes. The stop call that stopped the thread returns
+only once it has left its CPU with its save published (see
+[`SYS_THREAD_STOP`](#sys_thread_stop-20)), except a restarted
+stopper's call whose slot no longer names the target, so a caller that issues this after its own
+stop returns is not refused for this reason.
 
 **Capability requirement:** `thread_cap` MUST have Observe rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Observe), `InvalidState`
-(thread neither stopped nor fault-blocked), `InvalidArgument` (buffer too small or
-invalid pointer).
+(thread neither stopped and descheduled nor fault-blocked), `InvalidArgument` (buffer too small,
+null pointer, or no register frame), `InvalidAddress` (buffer outside the user half or not
+writable).
 
 ---
 
@@ -1414,19 +1419,25 @@ reply (`BlockedOnFault`) — the latter lets a bound fault handler advance the P
 or otherwise edit the faulting thread before replying (see
 [`docs/fault-handling.md`](../../../docs/fault-handling.md)). The kernel validates
 that the register values are safe (e.g. the instruction pointer is in a canonical
-range; privilege bits cannot be set).
+range; privilege bits cannot be set). On riscv64 the supplied `sstatus` is applied as given
+(its SPP and SUM bits are not forced), a gap
+[#443](https://github.com/kottlerg/seraph/issues/443) holds.
 
 A thread stopped while it runs on another CPU is `Stopped` from the stop's commit, but it executes
-until that CPU deschedules it; the stop call that stopped it returns only after that (see
-[`SYS_THREAD_STOP`](#sys_thread_stop-20)), except a restarted stopper's call whose slot no longer
-names the target. A write in that window succeeds but lands in a frame the target does not
-resume from, so it is lost; a caller writes after the stop call returns.
+until that CPU deschedules it, so the call refuses it with `InvalidState` until it is `current` on
+no CPU with its last register save published; the access then runs under the target's scheduling
+lock, which every dispatch, start, and stop takes. The stop call that stopped the thread returns
+only once it has left its CPU with its save published (see
+[`SYS_THREAD_STOP`](#sys_thread_stop-20)), except a restarted
+stopper's call whose slot no longer names the target, so a caller that issues this after its own
+stop returns is not refused for this reason.
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control), `InvalidState`
-(thread neither stopped nor fault-blocked), `InvalidArgument` (buffer wrong size, invalid
-pointer, or illegal register values).
+(thread neither stopped and descheduled nor fault-blocked), `InvalidArgument` (buffer too small,
+null pointer, no register frame, or illegal register values), `InvalidAddress` (buffer outside
+the user half or not readable).
 
 ---
 

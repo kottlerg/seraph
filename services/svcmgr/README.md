@@ -33,8 +33,8 @@ svcmgr/
 ├── Cargo.toml
 ├── README.md
 ├── src/
-│   ├── main.rs                    # _start, IPC dispatch, dispatch_deaths,
-│   │                              # initiate_graceful_shutdown
+│   ├── main.rs                    # main() (std runtime), IPC dispatch,
+│   │                              # dispatch_deaths, initiate_graceful_shutdown
 │   ├── service.rs                 # ServiceEntry, RestartRecipe, SvcmgrCaps,
 │   │                              # restart-policy constants
 │   ├── restart.rs                 # Shared spawn primitives

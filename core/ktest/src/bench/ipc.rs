@@ -20,6 +20,14 @@ use crate::{ChildStack, spawn};
 
 static mut BENCH_IPC_STACK: ChildStack = ChildStack::ZERO;
 
+/// The caller child's IPC buffer page, apart from ktest's own `IPC_BUF`: the
+/// child's calls and the parent's receives and replies run on different
+/// threads, each through its own registered page.
+#[repr(C, align(4096))]
+struct IpcBufPage([u64; 512]);
+// SAFETY: used only by the caller child, of which one runs per benchmark.
+static mut CALLER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+
 /// The caller child's arguments, handed to `ipc_caller_entry` by address.
 #[derive(Clone, Copy)]
 struct CallerArgs
@@ -44,11 +52,11 @@ fn ipc_caller_entry(arg: u64) -> !
         n,
     } = unsafe { spawn::child_args(arg) };
 
-    // Register the shared IPC buffer for this child thread.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
-    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
-    // the `ipc` wrappers.
+    // Register this child's own IPC buffer page.
+    let buf_addr = core::ptr::addr_of_mut!(CALLER_IPC_BUF) as u64;
+    // SAFETY: `CALLER_IPC_BUF` is a page-aligned static this child alone registers, so the page
+    // is dedicated to the kernel as its IPC buffer; no Rust reference into it is ever taken, the
+    // page being reached only through raw pointers and the `ipc` wrappers.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 1).ok();

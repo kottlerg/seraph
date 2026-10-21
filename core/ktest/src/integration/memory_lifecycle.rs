@@ -38,8 +38,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     drop(memory_b);
 
     // ── 2. Map memory_a (one page) at TEST_VA. ───────────────────────────────
-    memory_a
-        .map(TEST_VA)
+    // SAFETY: `TEST_VA` is a fixed ktest test VA outside the harness image, stacks,
+    // and InitInfo page, unmapped before this cell; this cell never dereferences it.
+    unsafe { memory_a.map(TEST_VA) }
         .map_err(|_| "integration::memory_lifecycle: mem_map failed")?;
 
     // ── 3. Verify the mapping via aspace_query. ───────────────────────────────
@@ -51,18 +52,22 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // ── 4. Change protection to read-only. ───────────────────────────────────
-    mem_protect(memory_a.cap(), ctx.aspace_cap, TEST_VA, 1, 0)
+    // SAFETY: this cell never dereferences `TEST_VA`; nothing lives in the page.
+    unsafe { mem_protect(memory_a.cap(), ctx.aspace_cap, TEST_VA, 1, 0) }
         .map_err(|_| "integration::memory_lifecycle: mem_protect (read-only) failed")?;
 
     // ── 5. Protect an unmapped VA — must fail. ────────────────────────────────
-    let protect_err = mem_protect(memory_a.cap(), ctx.aspace_cap, TEST_VA + 0x10_0000, 1, 0);
+    // SAFETY: the span is unmapped test VA; nothing lives in it.
+    let protect_err =
+        unsafe { mem_protect(memory_a.cap(), ctx.aspace_cap, TEST_VA + 0x10_0000, 1, 0) };
     if protect_err.is_ok()
     {
         return Err("integration::memory_lifecycle: mem_protect on unmapped VA should fail");
     }
 
     // ── 6. Unmap the page. ────────────────────────────────────────────────────
-    mem_unmap(ctx.aspace_cap, TEST_VA, 1)
+    // SAFETY: this cell never dereferences `TEST_VA`; nothing lives in the page.
+    unsafe { mem_unmap(ctx.aspace_cap, TEST_VA, 1) }
         .map_err(|_| "integration::memory_lifecycle: mem_unmap failed")?;
 
     // ── 7. Verify the page is no longer mapped. ───────────────────────────────
@@ -75,7 +80,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // ── 8. Second unmap must be a no-op (not an error). ──────────────────────
-    mem_unmap(ctx.aspace_cap, TEST_VA, 1)
+    // SAFETY: the page is already unmapped; nothing lives in it.
+    unsafe { mem_unmap(ctx.aspace_cap, TEST_VA, 1) }
         .map_err(|_| "integration::memory_lifecycle: idempotent mem_unmap failed")?;
 
     // FrameGuard drop unmaps (third time, also idempotent) and returns to pool.

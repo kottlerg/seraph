@@ -10,18 +10,22 @@ processes started through it.
 
 Process startup in Seraph has two layers:
 
-1. **Handover struct** — a `#[repr(C)]`, version-gated structure placed at a
-   well-known virtual address before the new process runs. The producer is
-   procmgr for all normal processes. The struct provides the process with its
-   initial capability layout, IPC buffer, and startup context.
+1. **Handover struct** — a `#[repr(C)]`, version-gated structure the creator
+   maps read-only before the new process runs, at a creator-chosen virtual
+   address it delivers in the entry register. procmgr produces it for every
+   process except memmgr and procmgr, whose `ProcessInfo` init populates. The
+   struct provides the process with its initial capability layout, IPC
+   buffer, and startup context.
 
 2. **`main()` convention** — the entry point convention for a process started
-   from a `ProcessInfo` page: `_start()` reads the handover struct, constructs
-   a `StartupInfo`, and calls `main()`. std-built services use an idiomatic
-   `fn main()` that reaches the caps via `std::os::seraph::startup_info()`.
-   memmgr runs on a bespoke runtime and takes `&StartupInfo` directly. init
-   and ktest consume `InitInfo` in their own `_start` and define no `main()`
-   of either shape (see [`main()` Signature](#main-signature)).
+   from a `ProcessInfo` page: `_start()` reads the handover struct, builds a
+   Rust-native view of it, and enters `main()`. std-built services use an
+   idiomatic `fn main()` that reads std's own `std::os::seraph::StartupInfo`
+   through `std::os::seraph::startup_info()`. memmgr runs on a bespoke runtime
+   whose `_start` constructs this crate's `StartupInfo` and passes
+   `&StartupInfo` to its `main`. init and ktest consume `InitInfo` in their own
+   `_start` and define no `main()` of either shape (see
+   [`main()` Signature](#main-signature)).
 
 Both layers are defined in this crate. init and ktest sit outside both: their
 handover struct is `InitInfo` (from [`abi/init-protocol`](../init-protocol/README.md)),
@@ -106,21 +110,23 @@ protocol on `creator_endpoint_cap`, not through `ProcessInfo`.
 
 ## StartupInfo
 
-The Rust-native view of the handover data: memmgr's `main` receives it by
-reference, and std-built binaries read it through
-`std::os::seraph::startup_info()`. It is NOT `#[repr(C)]` and provides
-ergonomic access to the handover data. It is constructed from
-`ProcessInfo` by `_start()`: `std::os::seraph::_start` for std-built binaries
-and memmgr's bespoke `_start`. init and ktest construct none.
+The Rust-native view of the handover data. It is NOT `#[repr(C)]`. Only
+memmgr's bespoke `_start` constructs `process_abi::StartupInfo`, from
+`ProcessInfo`, and passes `&StartupInfo` to memmgr's `main`. std's `_start`
+(`std::os::seraph::_start`, in `runtime/ruststd/src/os/seraph.rs`) builds its
+own same-purpose type, `std::os::seraph::StartupInfo`: a `#[stable]`-attributed
+superset that adds `sched_control_cap`, `initial_priority`, and `log_send_cap`,
+which std-built binaries read through `std::os::seraph::startup_info()`. init
+and ktest construct neither.
 
-The authoritative definition is [`src/lib.rs`](src/lib.rs) (`struct StartupInfo`);
-the std overlay carries a `#[stable]`-attributed mirror at
-`runtime/ruststd/src/os/seraph.rs`. It exposes the same groups as `ProcessInfo`
-(identity, service endpoints, stdio rings + notifications, TLS template,
-argv/env as resolved `&[u8]` slices, namespace, main-thread layout including
-`main_tls_vaddr`, and the v18 `pager_endpoint_cap` / `pager_badge`), with cap
-slots delivered as `u32` values
-and `args_blob` / `env_blob` resolved from the handover page into slices.
+The authoritative definition is [`src/lib.rs`](src/lib.rs) (`struct StartupInfo`).
+It carries the self caps (`self_thread`, `self_aspace`, `self_cspace`), the IPC
+buffer, the creator, procmgr, memmgr, and service-registry endpoints, the stdio
+rings and their notifications, the namespace caps, the TLS template, argv/env,
+the main-thread layout including `main_tls_vaddr`, and the v18
+`pager_endpoint_cap` / `pager_badge`. Cap slots are `u32` values, and
+`args_blob` / `env_blob` are resolved from the handover page into `&[u8]`
+slices.
 
 Values are copied out of the handover page verbatim, so the struct does
 not borrow from it (except the argv/env slices, which point into the
@@ -160,9 +166,9 @@ data via `std::os::seraph::startup_info()`; init and ktest define neither.
   `InitInfo` page address and delivers it in the entry register, as procmgr
   does for `ProcessInfo`.
 
-The std and memmgr variants construct the same `StartupInfo` shape from
-`ProcessInfo`; the init / ktest variant builds none and defines no `main()`
-of either shape.
+The std variant builds `std::os::seraph::StartupInfo` and the memmgr variant
+this crate's `StartupInfo`, each from `ProcessInfo`; the init / ktest variant
+builds none and defines no `main()` of either shape.
 
 ---
 
@@ -170,7 +176,7 @@ of either shape.
 
 | | init-protocol | process-abi |
 |---|---|---|
-| Producer | Kernel (Phase 9) | procmgr |
+| Producer | Kernel (Phase 9) | procmgr (init for memmgr and procmgr) |
 | Consumer | init, ktest | All other processes |
 | Handover struct | `InitInfo` | `ProcessInfo` |
 | Page address | Kernel-chosen, delivered in entry register | Creator-chosen, delivered in entry register |

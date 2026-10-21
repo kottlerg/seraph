@@ -20,7 +20,8 @@ use syscall_abi::PAGE_SIZE;
 /// `new` reserves a contiguous unmapped VA range, calls `mem_map` against
 /// `memory_cap` with the requested rights, and stores the range so `Drop`
 /// can mirror the cleanup. Forgets the range on map-failure (allocator
-/// only tracks VA — the failed map leaves no kernel-side state).
+/// only tracks VA — the failed map leaves no kernel-side state). Every
+/// access through [`ScratchMapping::va`] must end before the mapping drops.
 pub struct ScratchMapping
 {
     range: Option<ReservedRange>,
@@ -41,7 +42,9 @@ impl ScratchMapping
     {
         let range = reserve_pages(pages).ok()?;
         let va = range.va_start();
-        if syscall::mem_map(memory_cap, self_aspace, va, 0, pages, prot).is_err()
+        // SAFETY: `va` is the range `reserve_pages` just reserved: unbacked VA no
+        // Rust object occupies.
+        if unsafe { syscall::mem_map(memory_cap, self_aspace, va, 0, pages, prot) }.is_err()
         {
             unreserve_pages(range);
             return None;
@@ -78,7 +81,10 @@ impl Drop for ScratchMapping
         if let Some(range) = self.range.take()
         {
             let va = range.va_start();
-            let _ = syscall::mem_unmap(self.self_aspace, va, self.pages);
+            // SAFETY: the span is this mapping's own reserved range; a reference
+            // into it exists only inside a caller's raw deref of `va()`, which the
+            // type's contract ends before drop.
+            let _ = unsafe { syscall::mem_unmap(self.self_aspace, va, self.pages) };
             unreserve_pages(range);
         }
         if self.owns_cap != 0
@@ -195,7 +201,12 @@ pub(crate) fn load_elf_segment_into_child(
             {
                 if self.mapped > 0
                 {
-                    let _ = syscall::mem_unmap(self.self_aspace, range.va_start(), self.mapped);
+                    // SAFETY: the guard still holds the range only on an exit
+                    // before `span` is formed (the success path takes it first),
+                    // so no reference into the scratch pages exists.
+                    let _ = unsafe {
+                        syscall::mem_unmap(self.self_aspace, range.va_start(), self.mapped)
+                    };
                 }
                 unreserve_pages(range);
             }
@@ -241,15 +252,19 @@ pub(crate) fn load_elf_segment_into_child(
             return Err(procmgr_errors::OUT_OF_MEMORY);
         };
         scratch.caps.push(memory_cap);
-        if syscall::mem_map(
-            memory_cap,
-            self_aspace,
-            scratch_base + i * PAGE_SIZE,
-            0,
-            1,
-            syscall::MAP_WRITABLE,
-        )
-        .is_err()
+        // SAFETY: page `i` of the range `reserve_pages` just reserved: unbacked
+        // VA no Rust object occupies.
+        let mapped = unsafe {
+            syscall::mem_map(
+                memory_cap,
+                self_aspace,
+                scratch_base + i * PAGE_SIZE,
+                0,
+                1,
+                syscall::MAP_WRITABLE,
+            )
+        };
+        if mapped.is_err()
         {
             std::os::seraph::log!(
                 "procmgr: load_elf_segment: scratch map failed vaddr=0x{:x}",
@@ -271,7 +286,9 @@ pub(crate) fn load_elf_segment_into_child(
     // child.
     if let Some(range) = scratch.range.take()
     {
-        let _ = syscall::mem_unmap(self_aspace, range.va_start(), scratch.mapped);
+        // SAFETY: `span`'s last use is the `fill` call above, so no reference into
+        // the scratch pages is live.
+        let _ = unsafe { syscall::mem_unmap(self_aspace, range.va_start(), scratch.mapped) };
         unreserve_pages(range);
         scratch.mapped = 0;
     }
@@ -298,7 +315,9 @@ pub(crate) fn load_elf_segment_into_child(
             );
             return Err(procmgr_errors::INSUFFICIENT_RIGHTS);
         };
-        let mapped = syscall::mem_map(derived, child_aspace, page_vaddr, 0, 1, 0);
+        // SAFETY: `child_aspace` is the not-yet-started child's `AddressSpace`,
+        // not procmgr's own, so the map places nothing over procmgr's memory.
+        let mapped = unsafe { syscall::mem_map(derived, child_aspace, page_vaddr, 0, 1, 0) };
         let _ = syscall::cap_delete(derived);
         if let Err(e) = mapped
         {

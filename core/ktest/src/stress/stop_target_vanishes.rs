@@ -59,7 +59,7 @@
 //! fresh slot and publishes that. It restarts A (`Ok`, or `InvalidArgument`
 //! for an A not stopped) and waits, bounded by [`ROUND_WAIT_US`], for A to
 //! count another loop and for B to progress; a round whose A never loops
-//! again is the hazard's symptom and fails the phase. After the rounds the
+//! again, or whose B never progresses, fails the phase. After the rounds the
 //! controller sets [`QUIT`] and restarts both, bounded, until each has
 //! exited; B exits only once A has stopped stopping, so no stop lands on B
 //! inside its exit.
@@ -114,8 +114,8 @@ const TARGET_STACK: usize = 1;
 
 /// Bound on each of a round's waits, in microseconds: for the stopper to
 /// count a loop (before its stop, and after its restart) and for the target
-/// to progress. A loop spans at most a few slice expiries; a stopper that
-/// never loops again after its restart is the hazard's symptom.
+/// to progress. A loop spans at most a few slice expiries; a wait that
+/// outlasts the bound fails the phase.
 const ROUND_WAIT_US: u64 = 1_000_000;
 
 /// Bound on the wait for both children to exit, in 1 ms polls.

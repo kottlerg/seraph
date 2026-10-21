@@ -31,8 +31,10 @@ use syscall::{MAP_READ, MAP_WRITABLE, aspace_query, mem_map, mem_unmap};
 
 use crate::{TestContext, TestResult};
 
-/// Safe test virtual address: 1 GiB. Well above ktest's load address and stack.
-/// Used consistently across mm tests to avoid mapping conflicts.
+/// Test virtual address: 5 GiB, below ktest's image, stack, and `InitInfo`
+/// windows and above its device mappings, so no Rust object, stack, or IPC
+/// buffer page lies there or in the pages above it the mm tests use. Used
+/// consistently across mm tests to avoid mapping conflicts.
 const TEST_VA: u64 = 0x1_4000_0000;
 
 // ── SYS_MEMORY_SPLIT / SYS_MEMORY_MERGE ─────────────────────────────────────────
@@ -105,7 +107,9 @@ pub fn mem_map_unmap(ctx: &TestContext) -> TestResult
         .ok_or("mem_map_unmap: frame pool exhausted")?;
 
     // Map one page at TEST_VA, offset 0 within the cap region.
-    memory_cap.map(TEST_VA).map_err(|_| "mem_map failed")?;
+    // SAFETY: no Rust object, stack, or allocation lies at `TEST_VA` (see `TEST_VA`), and no Rust
+    // reference into the page is taken, so none outlives the guard's drop.
+    unsafe { memory_cap.map(TEST_VA) }.map_err(|_| "mem_map failed")?;
 
     // Verify the mapping appears in the address space.
     let phys =
@@ -131,12 +135,14 @@ pub fn mem_protect(ctx: &TestContext) -> TestResult
     let mut memory_cap = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
         .ok_or("mem_protect: frame pool exhausted")?;
 
-    memory_cap
-        .map(TEST_VA)
-        .map_err(|_| "mem_map for protect test failed")?;
+    // SAFETY: no Rust object, stack, or allocation lies at `TEST_VA` (see `TEST_VA`), and no Rust
+    // reference into the page is taken, so none outlives the guard's drop.
+    unsafe { memory_cap.map(TEST_VA) }.map_err(|_| "mem_map for protect test failed")?;
 
     // prot = 0: read-only. Always valid regardless of Memory cap rights.
-    syscall::mem_protect(memory_cap.cap(), ctx.aspace_cap, TEST_VA, 1, 0)
+    // SAFETY: `TEST_VA` holds this test's own frame and no Rust object, reference, or IPC buffer
+    // page (see `TEST_VA`).
+    unsafe { syscall::mem_protect(memory_cap.cap(), ctx.aspace_cap, TEST_VA, 1, 0) }
         .map_err(|_| "mem_protect (read-only) failed")?;
 
     // FrameGuard drop unmaps and returns frame to pool.
@@ -152,7 +158,9 @@ pub fn mem_protect_unmapped_err(ctx: &TestContext) -> TestResult
         crate::frame_pool::alloc().ok_or("mem_protect_unmapped_err: frame pool exhausted")?;
     // 0x1000_0000 is not mapped by ktest.
     let unmapped_va = 0x1000_0000u64;
-    let err = syscall::mem_protect(memory_cap, ctx.aspace_cap, unmapped_va, 1, 0);
+    // SAFETY: nothing is mapped at `unmapped_va`, so no Rust object, reference, or IPC buffer
+    // page lies there.
+    let err = unsafe { syscall::mem_protect(memory_cap, ctx.aspace_cap, unmapped_va, 1, 0) };
 
     // SAFETY: memory_cap was allocated from pool and never mapped.
     unsafe { crate::frame_pool::free(memory_cap) };
@@ -172,12 +180,16 @@ pub fn mem_unmap_idempotent(ctx: &TestContext) -> TestResult
     let mut memory_cap = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
         .ok_or("mem_unmap_idempotent: frame pool exhausted")?;
 
-    memory_cap
-        .map(TEST_VA)
-        .map_err(|_| "mem_map for idempotent-unmap test failed")?;
-    mem_unmap(ctx.aspace_cap, TEST_VA, 1).map_err(|_| "first mem_unmap failed")?;
+    // SAFETY: no Rust object, stack, or allocation lies at `TEST_VA` (see `TEST_VA`), and no Rust
+    // reference into the page is taken, so none outlives the guard's drop.
+    unsafe { memory_cap.map(TEST_VA) }.map_err(|_| "mem_map for idempotent-unmap test failed")?;
+    // SAFETY: `TEST_VA` holds this test's own frame and no Rust object, reference, or IPC buffer
+    // page (see `TEST_VA`).
+    unsafe { mem_unmap(ctx.aspace_cap, TEST_VA, 1) }.map_err(|_| "first mem_unmap failed")?;
     // Second unmap of the same range must succeed (no-op).
-    mem_unmap(ctx.aspace_cap, TEST_VA, 1).map_err(|_| "second mem_unmap (idempotent) failed")?;
+    // SAFETY: as above; the page is now unmapped.
+    unsafe { mem_unmap(ctx.aspace_cap, TEST_VA, 1) }
+        .map_err(|_| "second mem_unmap (idempotent) failed")?;
 
     // FrameGuard drop will try to unmap again (third time) — also idempotent.
     Ok(())
@@ -223,7 +235,9 @@ pub fn mem_map_unaligned_vaddr_err(ctx: &TestContext) -> TestResult
 {
     let memory_cap =
         crate::frame_pool::alloc().ok_or("mem_map_unaligned_vaddr_err: frame pool exhausted")?;
-    let err = mem_map(memory_cap, ctx.aspace_cap, TEST_VA + 1, 0, 1, MAP_WRITABLE);
+    // SAFETY: the span lies in the page at `TEST_VA`, where no Rust object, stack, or allocation
+    // lies (see `TEST_VA`).
+    let err = unsafe { mem_map(memory_cap, ctx.aspace_cap, TEST_VA + 1, 0, 1, MAP_WRITABLE) };
 
     // SAFETY: memory_cap was allocated from pool and never successfully mapped.
     unsafe { crate::frame_pool::free(memory_cap) };
@@ -244,7 +258,8 @@ pub fn mem_map_kernel_half_err(ctx: &TestContext) -> TestResult
     let memory_cap =
         crate::frame_pool::alloc().ok_or("mem_map_kernel_half_err: frame pool exhausted")?;
     let kernel_va: u64 = 0xFFFF_FFFF_8000_0000;
-    let err = mem_map(memory_cap, ctx.aspace_cap, kernel_va, 0, 1, MAP_WRITABLE);
+    // SAFETY: `kernel_va` is in the kernel half, where no Rust object of ktest's lies.
+    let err = unsafe { mem_map(memory_cap, ctx.aspace_cap, kernel_va, 0, 1, MAP_WRITABLE) };
 
     // SAFETY: memory_cap was allocated from pool and never successfully mapped.
     unsafe { crate::frame_pool::free(memory_cap) };
@@ -292,9 +307,9 @@ pub fn mem_protect_exceeds_cap_rights_err(ctx: &TestContext) -> TestResult
 
     let mut frame = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
         .ok_or("mem_protect_exceeds_cap_rights_err: frame pool exhausted")?;
-    frame
-        .map(PROTECT_TEST_VA)
-        .map_err(|_| "mem_map for protect-rights test failed")?;
+    // SAFETY: no Rust object, stack, or allocation lies at `PROTECT_TEST_VA` (see `TEST_VA`), and
+    // no Rust reference into the page is taken, so none outlives the guard's drop.
+    unsafe { frame.map(PROTECT_TEST_VA) }.map_err(|_| "mem_map for protect-rights test failed")?;
 
     // Attenuate to a no-WRITE cap (MAP only) over the same frame; mem_protect
     // checks the requested perms against this cap's rights, not the mapping cap.
@@ -302,7 +317,10 @@ pub fn mem_protect_exceeds_cap_rights_err(ctx: &TestContext) -> TestResult
         .map_err(|_| "mem_protect_exceeds_cap_rights_err: cap_derive failed")?;
 
     // Read-only cap has no WRITE — requesting WRITE must fail.
-    let err = syscall::mem_protect(ro_cap, ctx.aspace_cap, PROTECT_TEST_VA, 1, MAP_WRITABLE);
+    // SAFETY: `PROTECT_TEST_VA` holds this test's own frame and no Rust object, reference, or IPC
+    // buffer page (see `TEST_VA`).
+    let err =
+        unsafe { syscall::mem_protect(ro_cap, ctx.aspace_cap, PROTECT_TEST_VA, 1, MAP_WRITABLE) };
 
     // The parent frame keeps the object alive, so deleting the derived slot is
     // safe; FrameGuard's drop unmaps PROTECT_TEST_VA and returns the frame.
@@ -330,16 +348,21 @@ pub fn mem_map_multi_page(ctx: &TestContext) -> TestResult
     let memory_b = crate::frame_pool::alloc().ok_or("mem_map_multi_page: memory_b exhausted")?;
 
     // Map each cap at consecutive pages.
-    mem_map(memory_a, ctx.aspace_cap, MULTI_VA, 0, 1, MAP_WRITABLE)
+    // SAFETY: no Rust object, stack, or allocation lies in the two pages at `MULTI_VA` (see
+    // `TEST_VA`).
+    unsafe { mem_map(memory_a, ctx.aspace_cap, MULTI_VA, 0, 1, MAP_WRITABLE) }
         .map_err(|_| "mem_map memory_a failed")?;
-    mem_map(
-        memory_b,
-        ctx.aspace_cap,
-        MULTI_VA + 0x1000,
-        0,
-        1,
-        MAP_WRITABLE,
-    )
+    // SAFETY: as above.
+    unsafe {
+        mem_map(
+            memory_b,
+            ctx.aspace_cap,
+            MULTI_VA + 0x1000,
+            0,
+            1,
+            MAP_WRITABLE,
+        )
+    }
     .map_err(|_| "mem_map memory_b failed")?;
 
     // Both pages must be queryable.
@@ -357,8 +380,11 @@ pub fn mem_map_multi_page(ctx: &TestContext) -> TestResult
         return Err("both pages mapped to same physical address");
     }
 
-    mem_unmap(ctx.aspace_cap, MULTI_VA, 1).ok();
-    mem_unmap(ctx.aspace_cap, MULTI_VA + 0x1000, 1).ok();
+    // SAFETY: the two pages at `MULTI_VA` hold this test's own frames and no Rust object,
+    // reference, or IPC buffer page (see `TEST_VA`).
+    unsafe { mem_unmap(ctx.aspace_cap, MULTI_VA, 1) }.ok();
+    // SAFETY: as above.
+    unsafe { mem_unmap(ctx.aspace_cap, MULTI_VA + 0x1000, 1) }.ok();
     // SAFETY: caps allocated from pool and now unmapped.
     unsafe {
         crate::frame_pool::free(memory_a);
@@ -374,7 +400,8 @@ pub fn mem_map_zero_pages_err(ctx: &TestContext) -> TestResult
 {
     let memory_cap =
         crate::frame_pool::alloc().ok_or("mem_map_zero_pages_err: frame pool exhausted")?;
-    let err = mem_map(memory_cap, ctx.aspace_cap, TEST_VA, 0, 0, MAP_WRITABLE);
+    // SAFETY: no Rust object, stack, or allocation lies at `TEST_VA` (see `TEST_VA`).
+    let err = unsafe { mem_map(memory_cap, ctx.aspace_cap, TEST_VA, 0, 0, MAP_WRITABLE) };
 
     // SAFETY: memory_cap allocated from pool and never mapped.
     unsafe { crate::frame_pool::free(memory_cap) };
@@ -395,7 +422,8 @@ pub fn mem_map_offset_beyond_memory_err(ctx: &TestContext) -> TestResult
         .ok_or("mem_map_offset_beyond_memory_err: frame pool exhausted")?;
     // Pool frames are single-page (4 KiB). offset_pages=1 means byte offset 0x1000,
     // which is at the end of the cap region — mapping 1 page from there overflows.
-    let err = mem_map(memory_cap, ctx.aspace_cap, TEST_VA, 1, 1, MAP_WRITABLE);
+    // SAFETY: no Rust object, stack, or allocation lies at `TEST_VA` (see `TEST_VA`).
+    let err = unsafe { mem_map(memory_cap, ctx.aspace_cap, TEST_VA, 1, 1, MAP_WRITABLE) };
 
     // SAFETY: memory_cap allocated from pool and never mapped.
     unsafe { crate::frame_pool::free(memory_cap) };
@@ -412,7 +440,9 @@ pub fn mem_map_offset_beyond_memory_err(ctx: &TestContext) -> TestResult
 /// `mem_unmap` with a non-page-aligned virtual address must return an error.
 pub fn mem_unmap_unaligned_err(ctx: &TestContext) -> TestResult
 {
-    let err = mem_unmap(ctx.aspace_cap, TEST_VA + 1, 1);
+    // SAFETY: the span lies in the page at `TEST_VA`, which holds no Rust object, reference, or
+    // IPC buffer page (see `TEST_VA`).
+    let err = unsafe { mem_unmap(ctx.aspace_cap, TEST_VA + 1, 1) };
     if err.is_ok()
     {
         return Err("mem_unmap with unaligned VA should fail");
@@ -429,17 +459,21 @@ pub fn mem_protect_wx_err(ctx: &TestContext) -> TestResult
 
     let mut memory_cap = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
         .ok_or("mem_protect_wx_err: frame pool exhausted")?;
-    memory_cap
-        .map(WX_TEST_VA)
-        .map_err(|_| "mem_map for wx test failed")?;
+    // SAFETY: no Rust object, stack, or allocation lies at `WX_TEST_VA` (see `TEST_VA`), and no
+    // Rust reference into the page is taken, so none outlives the guard's drop.
+    unsafe { memory_cap.map(WX_TEST_VA) }.map_err(|_| "mem_map for wx test failed")?;
 
-    let err = syscall::mem_protect(
-        memory_cap.cap(),
-        ctx.aspace_cap,
-        WX_TEST_VA,
-        1,
-        MAP_WRITABLE | syscall::MAP_EXECUTABLE,
-    );
+    // SAFETY: `WX_TEST_VA` holds this test's own frame and no Rust object, reference, or IPC
+    // buffer page (see `TEST_VA`).
+    let err = unsafe {
+        syscall::mem_protect(
+            memory_cap.cap(),
+            ctx.aspace_cap,
+            WX_TEST_VA,
+            1,
+            MAP_WRITABLE | syscall::MAP_EXECUTABLE,
+        )
+    };
     if err.is_ok()
     {
         return Err("mem_protect with WRITE|EXECUTE should fail (W^X violation)");
@@ -455,14 +489,17 @@ pub fn mem_map_wx_prot_err(ctx: &TestContext) -> TestResult
     let memory_cap = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
         .ok_or("mem_map_wx_prot_err: frame pool exhausted")?;
 
-    let err = mem_map(
-        memory_cap.cap(),
-        ctx.aspace_cap,
-        0x1_4400_0000,
-        0,
-        1,
-        MAP_WRITABLE | syscall::MAP_EXECUTABLE,
-    );
+    // SAFETY: no Rust object, stack, or allocation lies at 0x1_4400_0000 (see `TEST_VA`).
+    let err = unsafe {
+        mem_map(
+            memory_cap.cap(),
+            ctx.aspace_cap,
+            0x1_4400_0000,
+            0,
+            1,
+            MAP_WRITABLE | syscall::MAP_EXECUTABLE,
+        )
+    };
 
     if err.is_ok()
     {
@@ -524,18 +561,23 @@ pub fn init_segment_caps_aligned(ctx: &TestContext) -> TestResult
         // full-rights, so deriving perms from cap rights would request W+X and
         // trip W^X. Explicit MAP_READ maps read-only regardless of cap rights;
         // the probe only needs the page's phys base.
-        mem_map(seg_cap, ctx.aspace_cap, SEG_PROBE_VA, 0, 1, MAP_READ)
+        // SAFETY: no Rust object, stack, or allocation lies at `SEG_PROBE_VA` (see `TEST_VA`);
+        // the probe mapping is read-only and only queried, never dereferenced.
+        unsafe { mem_map(seg_cap, ctx.aspace_cap, SEG_PROBE_VA, 0, 1, MAP_READ) }
             .map_err(|_| "init_segment_caps_aligned: mem_map failed")?;
 
         let phys = aspace_query(ctx.aspace_cap, SEG_PROBE_VA)
             .map_err(|_| "init_segment_caps_aligned: aspace_query failed")?;
         if phys == 0 || phys & 0xFFF != 0
         {
-            mem_unmap(ctx.aspace_cap, SEG_PROBE_VA, 1).ok();
+            // SAFETY: the probe page at `SEG_PROBE_VA` holds no Rust object, reference, or IPC
+            // buffer page (see `TEST_VA`).
+            unsafe { mem_unmap(ctx.aspace_cap, SEG_PROBE_VA, 1) }.ok();
             return Err("init_segment_caps_aligned: segment cap mapped to non-page-aligned PA");
         }
 
-        mem_unmap(ctx.aspace_cap, SEG_PROBE_VA, 1)
+        // SAFETY: as above.
+        unsafe { mem_unmap(ctx.aspace_cap, SEG_PROBE_VA, 1) }
             .map_err(|_| "init_segment_caps_aligned: mem_unmap failed")?;
     }
 

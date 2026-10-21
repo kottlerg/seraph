@@ -112,7 +112,10 @@ fn locate_fadt_fields(info: &InitInfo) -> Option<(u16, u64)>
     };
 
     let pages = pages_for(region_phys, region_size);
-    let _ = syscall::mem_unmap(info.aspace_cap, ACPI_MAP_BASE, pages);
+    // SAFETY: the FADT is read only through the `read_*_at` helpers, which take
+    // the address by value and return owned values; no reference into the
+    // mapping is live.
+    let _ = unsafe { syscall::mem_unmap(info.aspace_cap, ACPI_MAP_BASE, pages) };
     Some((pm1a, dsdt_phys))
 }
 
@@ -140,15 +143,20 @@ fn locate_and_parse_dsdt(info: &InitInfo, dsdt_phys: u64) -> Option<u16>
         let region_size = d.aux1;
         let pages = pages_for(region_phys, region_size);
         let vaddr = ACPI_MAP_BASE + 0x10_0000;
-        if syscall::mem_map(
-            d.slot,
-            info.aspace_cap,
-            vaddr,
-            0,
-            pages,
-            syscall::MAP_READONLY,
-        )
-        .is_err()
+        // SAFETY: `vaddr` lies in the fixed ktest ACPI band at `ACPI_MAP_BASE`, outside the
+        // harness image, stacks, and InitInfo page, and unmapped: every cell has unmapped
+        // its VA before shutdown runs, and each region here is unmapped before the next maps.
+        let mapped = unsafe {
+            syscall::mem_map(
+                d.slot,
+                info.aspace_cap,
+                vaddr,
+                0,
+                pages,
+                syscall::MAP_READONLY,
+            )
+        };
+        if mapped.is_err()
         {
             continue;
         }
@@ -158,7 +166,10 @@ fn locate_and_parse_dsdt(info: &InitInfo, dsdt_phys: u64) -> Option<u16>
         // SAFETY: dsdt_vaddr is mapped; offset 4 is the SDT length field.
         let dsdt_len = unsafe { read_u32_at(dsdt_vaddr, 4) } as usize;
         let result = scan_dsdt_for_s5(dsdt_vaddr, dsdt_len);
-        let _ = syscall::mem_unmap(info.aspace_cap, vaddr, pages);
+        // SAFETY: the DSDT is read only through `read_u32_at` and
+        // `scan_dsdt_for_s5`, which take the address by value and return owned
+        // values; no reference into the mapping is live.
+        let _ = unsafe { syscall::mem_unmap(info.aspace_cap, vaddr, pages) };
         return result;
     }
     None
@@ -191,15 +202,20 @@ fn find_table_in_acpi_regions(
         let region_phys = d.aux0;
         let region_size = d.aux1;
         let pages = pages_for(region_phys, region_size);
-        if syscall::mem_map(
-            d.slot,
-            info.aspace_cap,
-            map_vaddr,
-            0,
-            pages,
-            syscall::MAP_READONLY,
-        )
-        .is_err()
+        // SAFETY: `map_vaddr` lies in the fixed ktest ACPI band at `ACPI_MAP_BASE`, outside the
+        // harness image, stacks, and InitInfo page, and unmapped: every cell has unmapped
+        // its VA before shutdown runs, and each region here is unmapped before the next maps.
+        let mapped = unsafe {
+            syscall::mem_map(
+                d.slot,
+                info.aspace_cap,
+                map_vaddr,
+                0,
+                pages,
+                syscall::MAP_READONLY,
+            )
+        };
+        if mapped.is_err()
         {
             continue;
         }
@@ -210,7 +226,10 @@ fn find_table_in_acpi_regions(
             return Some((d.slot, region_phys, region_size, off));
         }
 
-        let _ = syscall::mem_unmap(info.aspace_cap, map_vaddr, pages);
+        // SAFETY: the region is scanned only through `scan_for_signature`, which
+        // takes the address by value and returns an owned offset; no reference into
+        // the mapping is live.
+        let _ = unsafe { syscall::mem_unmap(info.aspace_cap, map_vaddr, pages) };
     }
     None
 }

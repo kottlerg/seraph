@@ -110,7 +110,10 @@ fn main() -> !
     let dev_count = unsafe { pci::pci_enumerate(ecam_va, start_bus, end_bus, &mut devices) };
     std::os::seraph::log!("PCI devices found: {:#x}", dev_count as u64);
 
-    let _ = syscall::mem_unmap(caps.self_aspace, ecam_va, ecam_pages);
+    // SAFETY: `pci_enumerate` read the ECAM window through raw pointers and has
+    // returned; the device table it filled is an owned copy, so no reference into
+    // the window is live.
+    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, ecam_va, ecam_pages) };
     unreserve_pages(ecam_range);
 
     // Create block device service endpoint for the driver to receive on.
@@ -782,15 +785,19 @@ fn read_xsdt_phys(caps: &caps::DevmgrCaps) -> Option<u64>
     let rsdp_page_offset = (caps.rsdp_page_base & 0xFFF) as usize;
     let range = reserve_pages(1).ok()?;
     let va = range.va_start();
-    if syscall::mem_map(
-        caps.rsdp_memory_cap,
-        caps.self_aspace,
-        va,
-        0,
-        1,
-        syscall_abi::MAP_READONLY,
-    )
-    .is_err()
+    // SAFETY: `va` is the range `reserve_pages` just reserved: unbacked VA no Rust object
+    // occupies.
+    let mapped = unsafe {
+        syscall::mem_map(
+            caps.rsdp_memory_cap,
+            caps.self_aspace,
+            va,
+            0,
+            1,
+            syscall_abi::MAP_READONLY,
+        )
+    };
+    if mapped.is_err()
     {
         unreserve_pages(range);
         return None;
@@ -799,7 +806,9 @@ fn read_xsdt_phys(caps: &caps::DevmgrCaps) -> Option<u64>
     let rsdp_bytes =
         unsafe { core::slice::from_raw_parts((va as *const u8).add(rsdp_page_offset), 36) };
     let xsdt_phys = firmware::acpi::rsdp_xsdt_phys(rsdp_bytes);
-    let _ = syscall::mem_unmap(caps.self_aspace, va, 1);
+    // SAFETY: `rsdp_bytes`' last use is the parse above, which returns an owned
+    // address, so no reference into the page is live.
+    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, 1) };
     unreserve_pages(range);
     xsdt_phys
 }
@@ -813,15 +822,19 @@ fn read_xsdt_entries(caps: &caps::DevmgrCaps, xsdt_phys: u64) -> Option<std::vec
     let map_pages = region_pages.min(FIRMWARE_MAP_MAX_PAGES);
     let range = reserve_pages(map_pages).ok()?;
     let va = range.va_start();
-    if syscall::mem_map(
-        region.slot,
-        caps.self_aspace,
-        va,
-        0,
-        map_pages,
-        syscall_abi::MAP_READONLY,
-    )
-    .is_err()
+    // SAFETY: `va` is the range `reserve_pages` just reserved: unbacked VA no Rust object
+    // occupies.
+    let mapped = unsafe {
+        syscall::mem_map(
+            region.slot,
+            caps.self_aspace,
+            va,
+            0,
+            map_pages,
+            syscall_abi::MAP_READONLY,
+        )
+    };
+    if mapped.is_err()
     {
         unreserve_pages(range);
         return None;
@@ -842,7 +855,9 @@ fn read_xsdt_entries(caps: &caps::DevmgrCaps, xsdt_phys: u64) -> Option<std::vec
             }
         }
     }
-    let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
+    // SAFETY: `region_bytes`' last use is the walk above, which copied the entries
+    // into an owned vec, so no reference into the region is live.
+    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, map_pages) };
     unreserve_pages(range);
     Some(entries)
 }
@@ -856,15 +871,19 @@ fn read_mcfg_at(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<firmware::Ecam
     let map_pages = region_pages.min(FIRMWARE_MAP_MAX_PAGES);
     let range = reserve_pages(map_pages).ok()?;
     let va = range.va_start();
-    if syscall::mem_map(
-        region.slot,
-        caps.self_aspace,
-        va,
-        0,
-        map_pages,
-        syscall_abi::MAP_READONLY,
-    )
-    .is_err()
+    // SAFETY: `va` is the range `reserve_pages` just reserved: unbacked VA no Rust object
+    // occupies.
+    let mapped = unsafe {
+        syscall::mem_map(
+            region.slot,
+            caps.self_aspace,
+            va,
+            0,
+            map_pages,
+            syscall_abi::MAP_READONLY,
+        )
+    };
+    if mapped.is_err()
     {
         unreserve_pages(range);
         return None;
@@ -883,7 +902,9 @@ fn read_mcfg_at(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<firmware::Ecam
             ecam = firmware::acpi::parse_mcfg_ecam(&region_bytes[off..tbl_end]);
         }
     }
-    let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
+    // SAFETY: `region_bytes`' last use is the parse above, which returns an owned
+    // `EcamLocation`, so no reference into the region is live.
+    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, map_pages) };
     unreserve_pages(range);
     ecam
 }
@@ -894,15 +915,19 @@ fn discover_ecam_dtb(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
     let map_pages = dtb_pages.min(FIRMWARE_MAP_MAX_PAGES);
     let range = reserve_pages(map_pages).ok()?;
     let va = range.va_start();
-    if syscall::mem_map(
-        caps.dtb_memory_cap,
-        caps.self_aspace,
-        va,
-        0,
-        map_pages,
-        syscall_abi::MAP_READONLY,
-    )
-    .is_err()
+    // SAFETY: `va` is the range `reserve_pages` just reserved: unbacked VA no Rust object
+    // occupies.
+    let mapped = unsafe {
+        syscall::mem_map(
+            caps.dtb_memory_cap,
+            caps.self_aspace,
+            va,
+            0,
+            map_pages,
+            syscall_abi::MAP_READONLY,
+        )
+    };
+    if mapped.is_err()
     {
         unreserve_pages(range);
         return None;
@@ -916,7 +941,9 @@ fn discover_ecam_dtb(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
         )
     };
     let ecam = firmware::dtb::Fdt::new(blob_bytes).and_then(|fdt| fdt.find_pci_ecam());
-    let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
+    // SAFETY: the `Fdt` borrowing `blob_bytes` is a temporary of the parse above,
+    // which returns an owned `EcamLocation`, so no reference into the blob is live.
+    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, map_pages) };
     unreserve_pages(range);
     ecam
 }
@@ -946,15 +973,19 @@ fn read_table_sig(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<[u8; 4]>
     let map_pages = region_pages.min(FIRMWARE_MAP_MAX_PAGES);
     let range = reserve_pages(map_pages).ok()?;
     let va = range.va_start();
-    if syscall::mem_map(
-        region.slot,
-        caps.self_aspace,
-        va,
-        0,
-        map_pages,
-        syscall_abi::MAP_READONLY,
-    )
-    .is_err()
+    // SAFETY: `va` is the range `reserve_pages` just reserved: unbacked VA no Rust object
+    // occupies.
+    let mapped = unsafe {
+        syscall::mem_map(
+            region.slot,
+            caps.self_aspace,
+            va,
+            0,
+            map_pages,
+            syscall_abi::MAP_READONLY,
+        )
+    };
+    if mapped.is_err()
     {
         unreserve_pages(range);
         return None;
@@ -970,7 +1001,9 @@ fn read_table_sig(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<[u8; 4]>
     {
         None
     };
-    let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
+    // SAFETY: `bytes` ends with the block above and the signature is an owned
+    // copy, so no reference into the region is live.
+    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, map_pages) };
     unreserve_pages(range);
     sig
 }

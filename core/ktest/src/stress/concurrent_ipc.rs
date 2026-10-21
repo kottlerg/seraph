@@ -29,7 +29,8 @@ struct CallerArgs
     done: u32,
     /// 1-based caller label carried in the call.
     label: u64,
-    bit_index: u64,
+    /// The caller's index: its done bit and its IPC buffer page.
+    bit_index: usize,
 }
 
 static CALLER_ARGS: spawn::ArgBlock<CallerArgs, NUM_CALLERS> = spawn::ArgBlock::new(CallerArgs {
@@ -38,6 +39,20 @@ static CALLER_ARGS: spawn::ArgBlock<CallerArgs, NUM_CALLERS> = spawn::ArgBlock::
     label: 0,
     bit_index: 0,
 });
+
+/// An IPC buffer page for one child thread, apart from ktest's own `IPC_BUF`: a child's IPC
+/// and its parent's run on different threads, each through its own registered page.
+#[repr(C, align(4096))]
+struct IpcBufPage([u64; 512]);
+
+impl IpcBufPage
+{
+    const ZERO: Self = Self([0u64; 512]);
+}
+
+// SAFETY: page `i` is registered only by caller `i` of the running cycle, and each cycle reaps its
+// callers before the next starts.
+static mut CALLER_IPC_BUFS: [IpcBufPage; NUM_CALLERS] = [IpcBufPage::ZERO; NUM_CALLERS];
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -70,7 +85,7 @@ pub fn run(ctx: &TestContext) -> TestResult
                         ep: child_ep,
                         done: child_done,
                         label: (i + 1) as u64,
-                        bit_index: i as u64,
+                        bit_index: i,
                     },
                 )
             };
@@ -163,11 +178,14 @@ fn caller_entry(arg: u64) -> !
     } = unsafe { spawn::child_args(arg) };
     let done_bit = 1u64 << bit_index;
 
-    // Register the shared IPC buffer for this child thread.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
-    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
-    // the `ipc` wrappers.
+    // Register this child's own IPC buffer page.
+    // SAFETY: only the address of page `bit_index` is taken; no reference into `CALLER_IPC_BUFS` is
+    // formed.
+    let buf_addr = unsafe { core::ptr::addr_of_mut!(CALLER_IPC_BUFS[bit_index]) } as u64;
+    // SAFETY: page `bit_index` of `CALLER_IPC_BUFS` is page-aligned and registered only by this
+    // caller (one per concurrent caller), so the page is dedicated to the kernel as this thread's
+    // IPC buffer; no Rust reference into it is ever taken, the page being reached only through raw
+    // pointers and the `ipc` wrappers.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, done_bit).ok();

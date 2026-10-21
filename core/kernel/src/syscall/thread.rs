@@ -365,14 +365,64 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             drain_remote_stopped(target_tcb, caller_tcb, caller_cspace, thread_idx, run_cpu);
         }
+        else
+        {
+            await_stopped_save(target_tcb);
+        }
     }
 
     Ok(0)
 }
 
+/// Wait for a `Stopped` target that no CPU ran at the stop's commit to
+/// publish its last register save (`context_saved`), so a register read
+/// after the stop returns finds the frame settled. A target that left its
+/// CPU just before the commit may still be mid-switch there; the wait is that
+/// switch's tail. It ends early when an object teardown commits `Exited`.
+///
+/// # Safety
+/// `target_tcb` must be a valid TCB, and no lock may be held.
+#[cfg(not(test))]
+unsafe fn await_stopped_save(target_tcb: *mut crate::sched::thread::ThreadControlBlock)
+{
+    use crate::sched::thread::ThreadState;
+    use core::sync::atomic::Ordering;
+
+    let unsaved = || {
+        // SAFETY: target_tcb valid per contract; state is read under the
+        // sched_lock every Stopped/Exited commit holds; lock_raw paired with
+        // unlock_raw.
+        unsafe {
+            let f = (*target_tcb).sched_lock.lock_raw();
+            let stopped = (*target_tcb).state == ThreadState::Stopped;
+            (*target_tcb).sched_lock.unlock_raw(f);
+            stopped && (*target_tcb).context_saved.load(Ordering::Acquire) == 0
+        }
+    };
+    if !unsaved()
+    {
+        return;
+    }
+    // Spin with interrupts enabled and preemption disabled, as the drain does,
+    // so an inbound TLB-shootdown IPI is still acknowledged.
+    crate::percpu::preempt_disable();
+    // SAFETY: ring 0; restored below.
+    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+    // SAFETY: ring 0; IDT loaded; preempt disabled.
+    unsafe { crate::arch::current::interrupts::enable() };
+    while unsaved()
+    {
+        core::hint::spin_loop();
+    }
+    // SAFETY: saved_int from save_and_disable_interrupts above.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+    crate::percpu::preempt_enable();
+}
+
 /// Wait for `run_cpu`, which still runs `target_tcb` after `commit_stopped`
-/// marked it `Stopped`, to deschedule it, so the register snapshot
-/// `sys_thread_read_regs` reads is the one that trap leaves. Returns at once
+/// marked it `Stopped`, to deschedule it and publish its register save
+/// (`context_saved`), so the register snapshot `sys_thread_read_regs` reads
+/// is the one that trap leaves. Returns at once
 /// when `run_cpu` is this CPU, and when an object teardown commits `Exited`
 /// over the target. A stop of the calling thread landing meanwhile
 /// deschedules it in place; once restarted it resumes the drain if
@@ -433,7 +483,13 @@ unsafe fn drain_remote_stopped(
             let still_current = sched_remote.current == target_tcb;
             let still_stopped = (*target_tcb).state == ThreadState::Stopped;
             sched_remote.lock.unlock_raw(s);
-            still_current && still_stopped
+            // The drain also outlasts the switch-out's save: `current` moves
+            // off the target before `switch()` publishes `context_saved`.
+            let unsaved = (*target_tcb)
+                .context_saved
+                .load(core::sync::atomic::Ordering::Acquire)
+                == 0;
+            still_stopped && (still_current || unsaved)
         };
         if !draining
         {
@@ -1523,17 +1579,17 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg1 = Pointer to caller-supplied buffer (user VA).
 /// arg2 = Size of the buffer in bytes.
 ///
-/// The thread must be in Stopped state. Copies the full `TrapFrame` to the
-/// caller's buffer. Returns the number of bytes written on success.
+/// The thread must be fault-blocked, or `Stopped` and descheduled
+/// (`sched::with_held_frame`). Copies the full `TrapFrame` to the caller's
+/// buffer. Returns the number of bytes written on success.
 #[cfg(not(test))]
 pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::arch::current::trap_frame::TrapFrame as ArchTF;
     use crate::cap::object::ThreadObject;
     use crate::cap::slot::ThreadRights;
-    use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
-    use core::mem::size_of;
+    use core::mem::{MaybeUninit, size_of};
 
     let thread_idx = tf.arg(0) as u32;
     let buf_ptr = tf.arg(1);
@@ -1567,27 +1623,41 @@ pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // SAFETY: target_tcb validated non-null; state/trap_frame fields always valid.
-    unsafe {
-        // A fault-blocked thread (Blocked + BlockedOnFault) exposes its faulting
-        // register frame through `trap_frame` for the bound handler to read and
-        // modify before replying, so the fault-handler protocol permits register
-        // access in that state too — not only `Stopped`. See
-        // `docs/fault-handling.md` § Modifying the faulting thread.
-        let st = (*target_tcb).state;
-        let fault_blocked = st == ThreadState::Blocked
-            && (*target_tcb).ipc_state == crate::sched::thread::IpcThreadState::BlockedOnFault;
-        if st != ThreadState::Stopped && !fault_blocked
+    // Snapshot the frame while the target is held still, so the copy never
+    // races the target's own trap entry or return. A fault-blocked thread
+    // (Blocked + BlockedOnFault) exposes its faulting frame for the bound
+    // handler to read and modify before replying, so the fault-handler
+    // protocol permits register access in that state too (see
+    // `docs/fault-handling.md` § Modifying the faulting thread).
+    let copy_size = size_of::<ArchTF>();
+    let mut frame: MaybeUninit<ArchTF> = MaybeUninit::zeroed();
+    let take_snapshot = |src: *mut u8| {
+        if src.is_null()
         {
-            return Err(SyscallError::InvalidState);
+            return false;
         }
-        if (*target_tcb).trap_frame.is_null()
-        {
-            return Err(SyscallError::InvalidArgument);
-        }
+        // SAFETY: src is the target's non-null trap_frame, valid for
+        // copy_size reads; frame is valid for copy_size writes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.cast_const(),
+                frame.as_mut_ptr().cast::<u8>(),
+                copy_size,
+            );
+        };
+        true
+    };
+    // SAFETY: target_tcb validated non-null; the closure only copies the
+    // frame into a kernel stack buffer, which cannot fault.
+    let snapshot = unsafe { crate::sched::with_held_frame(target_tcb, take_snapshot) };
+    match snapshot
+    {
+        None => return Err(SyscallError::InvalidState),
+        Some(false) => return Err(SyscallError::InvalidArgument),
+        Some(true) =>
+        {}
     }
 
-    let copy_size = size_of::<ArchTF>();
     if buf_size < copy_size || buf_ptr == 0
     {
         return Err(SyscallError::InvalidArgument);
@@ -1603,13 +1673,12 @@ pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidAddress);
     }
 
-    // Copy the target's TrapFrame to the user buffer with fault recovery: an
-    // unmapped or read-only buffer returns InvalidAddress instead of faulting.
-    // SAFETY: trap_frame validated non-null; src is valid for copy_size reads;
-    //         buf_ptr is the validated user destination span.
+    // Copy the snapshot to the user buffer with fault recovery: an unmapped or
+    // read-only buffer returns InvalidAddress instead of faulting.
+    // SAFETY: frame holds copy_size initialised bytes; buf_ptr is the
+    //         validated user destination span.
     unsafe {
-        let src = (*target_tcb).trap_frame as *const u8;
-        crate::uaccess::copy_to_user(buf_ptr, src, copy_size)?;
+        crate::uaccess::copy_to_user(buf_ptr, frame.as_ptr().cast::<u8>(), copy_size)?;
     }
 
     Ok(copy_size as u64)
@@ -1621,8 +1690,9 @@ pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg1 = Pointer to register-file buffer in caller's address space.
 /// arg2 = Size of the buffer in bytes.
 ///
-/// The thread must be in Stopped state. The kernel validates register values
-/// for safety (no privilege escalation) before writing. Returns 0 on success.
+/// The thread must be fault-blocked, or `Stopped` and descheduled
+/// (`sched::with_held_frame`). The kernel validates register values
+/// before writing. Returns 0 on success.
 #[cfg(not(test))]
 pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1671,16 +1741,14 @@ pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // modify before replying, so the fault-handler protocol permits register
         // access in that state too — not only `Stopped`. See
         // `docs/fault-handling.md` § Modifying the faulting thread.
+        // This early refusal spares the copy-in; the write below re-checks
+        // under the target's sched_lock.
         let st = (*target_tcb).state;
         let fault_blocked = st == ThreadState::Blocked
             && (*target_tcb).ipc_state == crate::sched::thread::IpcThreadState::BlockedOnFault;
         if st != ThreadState::Stopped && !fault_blocked
         {
             return Err(SyscallError::InvalidState);
-        }
-        if (*target_tcb).trap_frame.is_null()
-        {
-            return Err(SyscallError::InvalidArgument);
         }
     }
 
@@ -1715,17 +1783,29 @@ pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Architecture-specific register safety validation.
     validate_write_regs(&mut regs)?;
 
-    // Write the validated TrapFrame into the target thread.
-    // SAFETY: target_tcb and trap_frame are valid.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            core::ptr::addr_of!(regs).cast::<u8>(),
-            (*target_tcb).trap_frame.cast::<u8>(),
-            copy_size,
-        );
+    // Write the validated TrapFrame into the target while it is held still, so
+    // the write never races the target's own trap entry or return.
+    let write_frame = |dst: *mut u8| {
+        if dst.is_null()
+        {
+            return false;
+        }
+        // SAFETY: dst is the target's non-null trap_frame, valid for
+        // copy_size writes; regs is valid for copy_size reads.
+        unsafe {
+            core::ptr::copy_nonoverlapping(core::ptr::addr_of!(regs).cast::<u8>(), dst, copy_size);
+        };
+        true
+    };
+    // SAFETY: target_tcb validated non-null; the closure only copies a kernel
+    // stack buffer into the frame, which cannot fault.
+    let written = unsafe { crate::sched::with_held_frame(target_tcb, write_frame) };
+    match written
+    {
+        None => Err(SyscallError::InvalidState),
+        Some(false) => Err(SyscallError::InvalidArgument),
+        Some(true) => Ok(0),
     }
-
-    Ok(0)
 }
 
 /// Validate and sanitize a user-supplied `TrapFrame` before writing it into a

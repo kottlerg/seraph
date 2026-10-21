@@ -246,6 +246,7 @@ The kernel does not provide:
 [SMP Scheduling and Locking Invariants](../core/kernel/docs/scheduling-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [Thread Lifecycle and Sleep List Invariants](../core/kernel/docs/thread-lifecycle-and-sleep.md),
+[core/ktest/README.md](../core/ktest/README.md),
 [Architecture Overview](architecture.md), [Capability Model](capability-model.md),
 [Fault Handling](fault-handling.md),
 [programs/capexhaust/README.md](../programs/capexhaust/README.md),

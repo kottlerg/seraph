@@ -40,11 +40,14 @@ pub fn run(ctx: &TestContext) -> TestResult
         .ok_or("shared_memory_two_aspaces: frame_pool::alloc returned None")?;
 
     // Map into ktest's aspace.
-    mem_map(memory_cap, ctx.aspace_cap, VA_A, 0, 1, MAP_WRITABLE)
+    // SAFETY: `VA_A` is a fixed ktest test VA outside the harness image, stacks,
+    // and InitInfo page, unmapped before this cell; no Rust code touches the page.
+    unsafe { mem_map(memory_cap, ctx.aspace_cap, VA_A, 0, 1, MAP_WRITABLE) }
         .map_err(|_| "shared_memory_two_aspaces: mem_map (aspace A) failed")?;
 
     // Map the same Memory cap into the new aspace at a different VA.
-    mem_map(memory_cap, aspace_b, VA_B, 0, 1, MAP_WRITABLE)
+    // SAFETY: `aspace_b` is a fresh address space, not ktest's own.
+    unsafe { mem_map(memory_cap, aspace_b, VA_B, 0, 1, MAP_WRITABLE) }
         .map_err(|_| "shared_memory_two_aspaces: mem_map (aspace B) failed")?;
 
     // Both queries must return the same physical address — the kernel-side
@@ -63,9 +66,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // Cleanup: unmap from both aspaces before returning the cap to the pool.
-    mem_unmap(ctx.aspace_cap, VA_A, 1)
+    // SAFETY: no Rust code touches the page at `VA_A`; nothing lives in it.
+    unsafe { mem_unmap(ctx.aspace_cap, VA_A, 1) }
         .map_err(|_| "shared_memory_two_aspaces: mem_unmap (A) failed")?;
-    mem_unmap(aspace_b, VA_B, 1).map_err(|_| "shared_memory_two_aspaces: mem_unmap (B) failed")?;
+    // SAFETY: `aspace_b` is not ktest's own address space.
+    unsafe { mem_unmap(aspace_b, VA_B, 1) }
+        .map_err(|_| "shared_memory_two_aspaces: mem_unmap (B) failed")?;
 
     // SAFETY: memory_cap is from pool and now unmapped from both aspaces.
     unsafe { crate::frame_pool::free(memory_cap) };

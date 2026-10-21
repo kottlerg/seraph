@@ -542,9 +542,10 @@ static _START_REF: unsafe extern "C" fn(u64) -> ! = _start;
 
 /// Initialise the process heap against memmgr.
 ///
-/// Must be called once, with the `memmgr_endpoint_cap` `ProcessInfo`
-/// delivers as `memmgr_ep`, before the first allocation through the
-/// `System` allocator. Idempotent — subsequent calls are no-ops.
+/// `_start` calls it with `ProcessInfo.memmgr_endpoint_cap` as `memmgr_ep`
+/// before `main` whenever that cap is non-zero, so the `System` allocator
+/// serves `main` from its first line. Only the first call does work; any
+/// later call is a no-op returning `true`.
 ///
 /// `self_aspace` is the process's own `AddressSpace` cap slot. The
 /// bootstrap IPC round uses the calling thread's registered IPC buffer

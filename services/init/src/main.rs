@@ -300,11 +300,19 @@ impl MemoryAlloc
 
     /// Allocate a page, map it writable at `va` in `aspace`, zero it, and
     /// return the memory cap.
-    pub(crate) fn alloc_zero_page(&mut self, aspace: u32, va: u64) -> Option<u32>
+    ///
+    /// # Safety
+    /// `aspace` must be init's own address space (the zeroing writes through
+    /// `va` in it), and the page at `va` must be unmapped VA that no Rust
+    /// object occupies, as `syscall::mem_map` requires.
+    pub(crate) unsafe fn alloc_zero_page(&mut self, aspace: u32, va: u64) -> Option<u32>
     {
         let cap = self.alloc_page()?;
-        syscall::mem_map(cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).ok()?;
-        // SAFETY: va is mapped writable and covers one page.
+        // SAFETY: the caller's contract keeps the page at `va` clear of memory
+        // Rust code owns.
+        unsafe { syscall::mem_map(cap, aspace, va, 0, 1, syscall::MAP_WRITABLE) }.ok()?;
+        // SAFETY: va is mapped writable in init's own address space and covers one
+        // page.
         unsafe {
             core::ptr::write_bytes(va as *mut u8, 0, PAGE_SIZE as usize);
         }
@@ -414,14 +422,18 @@ fn run(info_ptr: u64) -> !
 
     // Offset-map init's IPC buffer from the arena (zeroed by `place_page`) and
     // register it.
-    if init_arena
-        .place_page(
+    // SAFETY: INIT_IPC_BUF_VA is init's private IPC-buffer page, disjoint from
+    // every other init mapping (constants above) and not yet mapped, so no Rust
+    // object occupies it.
+    let placed = unsafe {
+        init_arena.place_page(
             info.aspace_cap,
             INIT_IPC_BUF_VA,
             syscall::MAP_WRITABLE,
             |_| {},
         )
-        .is_none()
+    };
+    if placed.is_none()
     {
         logging::log("init: FATAL: cannot place IPC buffer page");
         syscall::thread_exit();
@@ -588,7 +600,11 @@ fn run(info_ptr: u64) -> !
     // enters the dispatch loop before procmgr starts (procmgr's std
     // `_start` calls `heap_bootstrap` which calls memmgr's
     // `REQUEST_MEMORY_CAPS`, so memmgr must be live first).
-    let Some(phys_table_memory) = alloc.alloc_zero_page(info.aspace_cap, TEMP_MAP_BASE)
+    // SAFETY: `info.aspace_cap` is init's own address space, and TEMP_MAP_BASE is
+    // init's private scratch region, unmapped again since both module loads
+    // above, so no Rust object occupies the page.
+    let Some(phys_table_memory) =
+        (unsafe { alloc.alloc_zero_page(info.aspace_cap, TEMP_MAP_BASE) })
     else
     {
         logging::log("FATAL: phys-table page alloc failed");
@@ -617,7 +633,9 @@ fn run(info_ptr: u64) -> !
     let phys_dst = TEMP_MAP_BASE as *mut u64;
     // SAFETY: phys_dst points at the one mapped 4 KiB page.
     unsafe { bootstrap::write_memmgr_aux_memory(phys_dst, info, &mm_final) };
-    let _ = syscall::mem_unmap(info.aspace_cap, TEMP_MAP_BASE, 1);
+    // SAFETY: the page was written only through the raw `phys_dst` pointer, and
+    // `write_memmgr_aux_memory` has returned; no reference into it is live.
+    let _ = unsafe { syscall::mem_unmap(info.aspace_cap, TEMP_MAP_BASE, 1) };
     let Ok(phys_table_ro_cap) = syscall::cap_derive(phys_table_memory, syscall::RIGHTS_MEM_MAP)
     else
     {

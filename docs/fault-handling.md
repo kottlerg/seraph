@@ -330,6 +330,7 @@ svcmgr service definitions carry no paging key; see
 [Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
 [SMP Scheduling and Locking Invariants](../core/kernel/docs/scheduling-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
+[core/ktest/README.md](../core/ktest/README.md),
 [Capability Model](capability-model.md), [IPC Design](ipc-design.md),
 [Process Lifecycle](process-lifecycle.md), [Userspace Memory Model](userspace-memory-model.md),
 [programs/demandpaged/README.md](../programs/demandpaged/README.md),

@@ -179,12 +179,22 @@ pub(super) fn unregister(state: &ReleaseState, badge: u64) -> Option<Arc<FileEnt
     reg.remove(&badge)
 }
 
-/// Add an outstanding mapping to a `FileEntry`. Called by `File::read`
-/// after a successful `FS_READ_MEMORY` so a forced release can find it.
-pub(super) fn add_mapping(entry: &FileEntry, m: OutstandingMapping)
+/// Add an outstanding mapping to a `FileEntry`, then run `read` with the
+/// entry's mapping lock still held, and return its result. Called by
+/// `File::read` after a successful `FS_READ_MEMORY` so a forced release can
+/// find the mapping. `read` is the local copy out of the mapped page: holding
+/// the lock across it keeps [`take_mapping`] (and with it every unmap of the
+/// page) from running until `read` has returned and its borrow of the page has
+/// ended. `read` MUST NOT block or touch this entry's mappings.
+pub(super) fn add_mapping_then<R>(
+    entry: &FileEntry,
+    m: OutstandingMapping,
+    read: impl FnOnce() -> R,
+) -> R
 {
     let mut maps = entry.mappings.lock().unwrap_or_else(PoisonError::into_inner);
     maps.push(m);
+    read()
 }
 
 /// Take a mapping by cookie. Returns `Some` to whichever of the local
@@ -218,7 +228,11 @@ pub(super) fn release_one_local(entry: &FileEntry, aspace: u32, cookie: u64)
     {
         return;
     };
-    let _ = syscall::mem_unmap(aspace, m.range.va_start(), m.range.page_count());
+    // SAFETY: `take_mapping` hands `m` to exactly one releaser, and only after
+    // `File::read`'s borrow of the page has ended: that borrow lives inside
+    // `add_mapping_then`, under the mapping lock `take_mapping` also takes. The
+    // range is reserved VA private to this mapping, so nothing else lies in it.
+    let _ = unsafe { syscall::mem_unmap(aspace, m.range.va_start(), m.range.page_count()) };
     let _ = syscall::cap_delete(m.memory_cap);
     pal_reserve::unreserve_pages(m.range);
 }

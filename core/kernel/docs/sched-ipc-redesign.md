@@ -113,8 +113,8 @@ structure (head/tail/non_empty/load) of one CPU; it no longer "owns" any TCB's
 `state` (see [scheduling-internals.md](scheduling-internals.md) § Cross-CPU TCB Ownership).
 
 **The invariant that kills the class — "enqueue requires not-live."**
-`enqueue_and_wake` acquires `(*tcb).sched_lock` FIRST (before `select_target_cpu`,
-before any run-queue lock), reads `state` under it, and links ONLY a not-live
+`enqueue_and_wake` acquires `(*tcb).sched_lock` FIRST (before any run-queue lock;
+`target_cpu` is the caller's placement hint), reads `state` under it, and links ONLY a not-live
 thread (`Blocked`, or `Created`; a start or resume links through
 `enqueue_ready_thread`). If `state` is
 `Running`/`Ready` the wake is **coalesced** (no-op against the live/queued
@@ -208,17 +208,17 @@ each change; the binding statement of the resulting invariants is
   order). It landed together with that sole consumer plus a host unit test, not
   ahead of it (an unused `pub fn` would have stood as a `dead_code` warning).
 
-- **`sched_lock: Spinlock` and `wake_pending: bool`** are TCB fields at the end
-  of the `=== Scheduling state ===` group, initialised (`Spinlock::new()`,
-  `wake_pending = false`) at every ctor site (idle in `mod.rs`, init in
-  `main.rs`, create-thread in `cap.rs`, host `make_tcb` in `run_queue.rs`; a
-  zeroed ticket lock is already unlocked). These are additive — adding them alone
-  is no behavior change.
+- **`sched_lock: Spinlock` and `wake_pending: bool`** are TCB fields in the
+  `=== Scheduling state ===` group (with the later `park_seq` and `start_seq`), initialised
+  (`Spinlock::new()`, `wake_pending = false`) at every ctor site (idle in `mod.rs`, init in
+  `main.rs`, create-thread in `cap.rs`, host `make_tcb` in `run_queue.rs`; a zeroed ticket lock is
+  already unlocked). These are additive — adding them alone is no behavior change.
 
-- **`commit_blocked_under_local_lock` / `commit_reply_rebind_under_local_lock`**
-  acquire `(*tcb).sched_lock` (not the CPU lock), consult `wake_pending`, and
-  refuse to park when it is set. IPC primitives keep the source IPC lock outer;
-  only the commit-helper internals changed, not the call sites.
+- **`commit_blocked_under_local_lock` / `commit_reply_rebind_under_local_lock`** acquire
+  `(*tcb).sched_lock` (not the CPU lock). The park commit consults `wake_pending` and refuses to
+  park when it is set; the rebind commits only a thread still `Blocked` and refuses every other
+  state. IPC primitives keep the source IPC lock outer; only the commit-helper internals changed,
+  not the call sites.
 
 - **`enqueue_and_wake`** is the exclusivity gate. Its signature is unchanged
   (`target_cpu` is the caller-computed placement *hint* from `select_target_cpu`;
@@ -377,6 +377,9 @@ These race fixes are independent of the lock and landed in the same migration
   win, and the per-entry claim never dereferences a possibly-freed TCB to choose
   its arm (correct by construction, not by timing;
   [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Sleep List Invariants).
+  The IPC arms' pop-time source and TCB pointers also need a lifetime gate:
+  the timer-batch quiesce (`sleep_wakeups_quiesce`), which the Notification,
+  EventQueue and Thread dealloc arms pass before freeing (Sleep List Invariant 9).
 - **E (stop vs shootdown):** `sys_thread_stop`'s cross-CPU drain spin
   (`syscall/thread.rs`) ran at IF=0 and could deadlock against an in-flight TLB
   shootdown; it now runs under `preempt_disable` + IF-enabled (the #207 pattern

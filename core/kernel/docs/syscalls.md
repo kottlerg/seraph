@@ -1123,6 +1123,10 @@ not virgin, not siblings, or either has children), `InvalidCapability`,
 ### `SYS_THREAD_START` (19)
 
 Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it for scheduling.
+Starting a thread whose fault episode a stop cancelled kills it as an unhandled fault, which posts
+its death and address-space observers (see
+[docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
+Resume, and Kill).
 A stopped thread whose blocked syscall a waker claimed before the stop is restarted only once that
 waker's wake has landed, so the resumed syscall returns the delivered result (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
@@ -1162,10 +1166,13 @@ Stop a running or runnable thread. The thread transitions to `Stopped` state.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is cancelled (the blocked
-syscall on the target thread returns `Interrupted`, unless a genuine waker or the sleep timer
-claimed the wake first); a target that blocks while the stop is in progress is cancelled the same
-way, never left registered as a waiter (see
+A fault-blocked target's fault episode is cancelled with a kill outcome (no syscall returns) and the
+thread is left `Stopped`; the next `SYS_THREAD_START` kills it as an unhandled fault (see
+[docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
+Resume, and Kill). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
+cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker or
+the sleep timer claimed the wake first); a target that blocks while the stop is in progress is
+cancelled the same way, never left registered as a waiter (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
 Protocol). This does not hold for a stop of a thread waiting on a notification, event queue, or wait
 set whose last capability is deleted concurrently: the cancel can lock the object after it is freed
@@ -1973,12 +1980,11 @@ Translate a user virtual address to its mapped physical address.
 
 ### `SYS_ASPACE_BIND_NOTIFICATION` (53)
 
-Bind a terminal-fault death observer to an address space. When any thread in the space
-faults terminally (see [capability-model.md](../../../docs/capability-model.md) § "Kill process"
-pattern for the triggers), the kernel posts the
-fault reason to the bound event queue. Voluntary `SYS_THREAD_EXIT` does not fire these
-observers (see [capability-model.md](../../../docs/capability-model.md) § "Kill process"
-pattern).
+Bind a terminal-fault death observer to an address space. When any thread in the space faults
+terminally (see [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern
+for the triggers), the kernel posts the fault reason to the bound event queue. Voluntary
+`SYS_THREAD_EXIT` does not fire these observers (see
+[capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern).
 
 **Arguments:**
 

@@ -576,21 +576,22 @@ pub struct ThreadControlBlock
     ///
     /// Set by `SYS_THREAD_CONFIGURE` (under the thread's `sched_lock`, while
     /// `Created`), or by `sched::enter` for init, to the slot its first entry
-    /// to user mode resumes from, and
-    /// republished by every entry from user mode at which the thread can be
-    /// descheduled (see `docs/arch-interface.md` § `trap_frame`). The running
-    /// thread is the only writer after configuration; atomic so the softlockup
-    /// watchdog's load from another CPU is race-free (its copy of the frame
-    /// itself is a volatile, diagnostic-only read). Relaxed suffices: the
-    /// register syscalls read it only after the switch-out's `context_saved`
-    /// Release (`sched::with_held_frame`).
+    /// to user mode resumes from, and republished by every entry from user
+    /// mode at which the thread can be descheduled (see
+    /// `docs/arch-interface.md` § `trap_frame`). The running thread is the only
+    /// writer after configuration; atomic so the cross-CPU loads (the
+    /// softlockup watchdog's, which reads only the pointer, and
+    /// `sys_thread_start`'s unlocked null check) are race-free. Relaxed
+    /// suffices: the register syscalls read it only after the switch-out's
+    /// `context_saved` Release (`sched::with_held_frame`).
     pub trap_frame: core::sync::atomic::AtomicPtr<crate::arch::current::trap_frame::TrapFrame>,
 
     /// Number of the syscall the thread is executing: Relaxed-stored by the
     /// dispatcher at entry and reset to `u64::MAX` at exit. Read by the
     /// lock-holder stamps, which must not follow `trap_frame` from a
     /// possibly stale TCB pointer and may read it from another CPU in the
-    /// state they report. A caller passing `u64::MAX` as a syscall number is
+    /// state they report, and by the softlockup watchdog's dump, from another
+    /// CPU (diagnostic only). A caller passing `u64::MAX` as a syscall number is
     /// rejected as unknown and reads here as "no syscall".
     pub syscall_nr: core::sync::atomic::AtomicU64,
 

@@ -1178,19 +1178,26 @@ fn watchdog_dump(reason: &str)
             // lock state word, which lives in a static or a retype slab —
             // kernel direct-map storage that stays mapped for the kernel's
             // lifetime, even after the slab is recycled — and the checks
-            // above give a non-null address aligned for the width read. The
-            // read is volatile and nothing is written; the value is
-            // diagnostic only.
+            // above give a non-null address aligned for the width read. Every
+            // lock state word is an atomic of that width, so a Relaxed atomic
+            // load of it is race-free against the lock's own atomic writers;
+            // a stale address names a recycled word of the same storage, so
+            // the line may be mislabeled but the read stays sound. The value
+            // is diagnostic only.
             let value = unsafe {
+                use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
                 match lock_kind.word_width()
                 {
-                    8 => core::ptr::read_volatile(core::ptr::with_exposed_provenance::<u64>(word)),
-                    1 => u64::from(core::ptr::read_volatile(
-                        core::ptr::with_exposed_provenance::<u8>(word),
-                    )),
-                    _ => u64::from(core::ptr::read_volatile(
-                        core::ptr::with_exposed_provenance::<u32>(word),
-                    )),
+                    8 => AtomicU64::from_ptr(core::ptr::with_exposed_provenance_mut::<u64>(word))
+                        .load(Ordering::Relaxed),
+                    1 => u64::from(
+                        AtomicU8::from_ptr(core::ptr::with_exposed_provenance_mut::<u8>(word))
+                            .load(Ordering::Relaxed),
+                    ),
+                    _ => u64::from(
+                        AtomicU32::from_ptr(core::ptr::with_exposed_provenance_mut::<u32>(word))
+                            .load(Ordering::Relaxed),
+                    ),
                 }
             };
             crate::kprintln!(
@@ -1200,47 +1207,33 @@ fn watchdog_dump(reason: &str)
                 value
             );
         }
-        // Dump the user-mode trap frame if present: the frame of the
-        // thread's last entry from user mode (republished by the syscall
-        // dispatcher for an in-flight syscall), telling where in userspace
-        // it entered the kernel.
-        // SAFETY: trap_frame is an atomic pointer, so its load is race-free.
-        // The frame it names is on the stalled thread's kernel stack, which
-        // that thread may still write: this diagnostic-only read (the one
-        // exception to docs/scheduling-internals.md § Cross-CPU TCB Ownership's
-        // `with_held_frame` rule) copies it with a volatile load and decides
-        // nothing, so a torn copy can only misreport the printed PC.
-        let user_frame = unsafe {
+        // Name the thread's last entry from user mode: the syscall number the
+        // dispatcher stamped on the TCB and the address of the frame that entry
+        // built. The frame itself is not read: it lives on a thread that may
+        // still be running and writing it.
+        // SAFETY: cur is this CPU's current TCB, live while it is current;
+        // trap_frame and syscall_nr are atomics, so both loads are race-free.
+        let user_entry = unsafe {
             let s = scheduler_for(cpu);
             let cur = s.current;
-            let tf = if cur.is_null()
-            {
-                core::ptr::null_mut()
-            }
-            else
-            {
-                (*cur)
-                    .trap_frame
-                    .load(core::sync::atomic::Ordering::Relaxed)
-            };
-            if tf.is_null()
+            if cur.is_null()
             {
                 None
             }
             else
             {
-                // The syscall number comes from the dispatcher's stamp on
-                // the TCB, not the frame.
+                let tf = (*cur)
+                    .trap_frame
+                    .load(core::sync::atomic::Ordering::Relaxed);
                 let nr = (*cur)
                     .syscall_nr
                     .load(core::sync::atomic::Ordering::Relaxed);
-                let snapshot = core::ptr::read_volatile(tf);
-                Some((snapshot.instruction_pointer(), nr))
+                (!tf.is_null()).then_some((tf as usize, nr))
             }
         };
-        if let Some((user_pc, syscall_nr)) = user_frame
+        if let Some((frame, syscall_nr)) = user_entry
         {
-            crate::kprintln!("    user_pc=0x{:x} syscall_nr={}", user_pc, syscall_nr);
+            crate::kprintln!("    user_frame=0x{:x} syscall_nr={}", frame, syscall_nr);
         }
     }
     // Derivation-lock state, holder CPU, and the most recent acquisition's

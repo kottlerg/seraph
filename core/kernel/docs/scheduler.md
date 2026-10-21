@@ -238,6 +238,8 @@ Created ──(SYS_THREAD_START)──► Ready ──(scheduled)──► Runni
 Running / Ready / Blocked ──(SYS_THREAD_STOP)──► Stopped
 Stopped ──(SYS_THREAD_START)──► Ready
 Running ──(SYS_THREAD_EXIT)──► Exited (TCB freed when its last capability is deleted)
+any state ──(object teardown / terminal fault)──► Exited (see thread-lifecycle-and-sleep.md
+          § Lifecycle State Machine for every Exited transition)
 ```
 
 State transitions are governed by the per-field-group ownership rules in

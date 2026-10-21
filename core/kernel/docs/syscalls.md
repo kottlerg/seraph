@@ -1974,7 +1974,8 @@ Translate a user virtual address to its mapped physical address.
 ### `SYS_ASPACE_BIND_NOTIFICATION` (53)
 
 Bind a terminal-fault death observer to an address space. When any thread in the space
-faults terminally (no handler bound, or the handler replied KILL), the kernel posts the
+faults terminally (see [capability-model.md](../../../docs/capability-model.md) § "Kill process"
+pattern for the triggers), the kernel posts the
 fault reason to the bound event queue. Voluntary `SYS_THREAD_EXIT` does not fire these
 observers (see [capability-model.md](../../../docs/capability-model.md) § "Kill process"
 pattern).

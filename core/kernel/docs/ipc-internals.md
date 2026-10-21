@@ -597,7 +597,8 @@ waitset_notify(wait_set, member_idx):
       on a refusal, remove current_tcb from waiters, and stamp INTERRUPTED
       if the refusal was a stop (RefusedStop)
    c. Release lock
-   d. Committed: call the scheduler. When woken (or refused), return
+   d. Call the scheduler whether the park committed or was refused (a
+      refused park that left the thread runnable is requeued), then return
       Interrupted if the park is INTERRUPTED (a stop, or the wait set
       destroyed under the waiter), else return wakeup_value
 ```

@@ -1754,10 +1754,12 @@ unsafe fn panic_context_dump()
         // The frame of the thread's last entry from user mode: an in-flight
         // syscall's, or an interrupt's or exception's taken from user mode
         // (docs/arch-interface.md § `trap_frame`), so it is reported as the
-        // user frame, with the registers a syscall would carry its number and
-        // arguments in.
+        // user frame, with the registers a syscall would carry its arguments
+        // in.
         // SAFETY: a non-null trap_frame names a frame on this thread's kernel
-        // stack; syscall_nr/arg/instruction_pointer are plain field reads.
+        // stack, and this is that thread's own CPU; arg/instruction_pointer
+        // are plain field reads of that frame, and `syscall_nr` is a Relaxed
+        // load of the TCB's stamp.
         // The syscall number is the dispatcher's stamp on the TCB: the frame's
         // number register is overwritten by a returned result on x86-64.
         let (ip, nr, a0, a1, a2) = unsafe {

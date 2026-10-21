@@ -106,8 +106,10 @@ protocol on `creator_endpoint_cap`, not through `ProcessInfo`.
 
 ## StartupInfo
 
-The struct passed to `main()`. This is a Rust-native type (NOT `#[repr(C)]`)
-providing ergonomic access to the handover data. It is constructed from
+The Rust-native view of the handover data: memmgr's `main` receives it by
+reference, and std-built binaries read it through
+`std::os::seraph::startup_info()`. It is NOT `#[repr(C)]` and provides
+ergonomic access to the handover data. It is constructed from
 `ProcessInfo` by `_start()`: `std::os::seraph::_start` for std-built binaries
 and memmgr's bespoke `_start`. init and ktest construct none.
 
@@ -179,9 +181,6 @@ of either shape.
 [Init-protocol](../init-protocol/README.md) is the kernel-to-init contract: it carries the
 full initial CSpace layout, including platform resources only init needs. Process-abi
 carries only what a single service or application requires.
-
-The `CapDescriptor` type SHOULD be shared between the two crates (via a common
-dependency or identical definition) to avoid divergence.
 
 ---
 

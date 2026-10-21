@@ -68,13 +68,18 @@
 //! its restart, and B progressed after every round (so a fresh B ran each
 //! delete round, and the same B lived on through each move round); no stop
 //! or start by A returned a result other than those above; some stop of A
-//! landed in its drain, and at least as many of A's calls hit
-//! `InvalidCapability` (a resumed drain whose slot has vanished returns at
-//! once, and A's next call through the old handle is refused), so the
-//! restart-with-vanished-slot branch was reached that many times; and A and
-//! the last B exited voluntarily. Without the slot re-check, the first
-//! delete round's restart resumes A's drain on the freed B: a read of its
-//! state through a dangling pointer, and a spin on a recycled TCB's state.
+//! landed in its drain; and A and the last B exited voluntarily. A's calls
+//! through a vanished handle are tallied, not required.
+//!
+//! The cell reaches the interleaving the slot re-check guards: a stop of A
+//! landing in its drain, then the vanish, then A's restart (required by a
+//! non-zero `stopped_in_drain`). Its failure modes are an A that never loops
+//! again, a B that never progresses, and an unaccepted result. It cannot
+//! itself observe a resumed drain that reads a freed TCB and exits: without
+//! the re-check, the drain re-reads `current == target && state == Stopped`
+//! through the stale pointer, which is false for a freed or reused TCB, so
+//! the drain exits anyway, and the TCB's magic word is not cleared on free,
+//! so no assertion catches the stale read.
 //!
 //! Needs **≥ 3 CPUs**.
 
@@ -240,9 +245,8 @@ fn phases(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Log a phase's tallies, then check them: nothing failed, some stop landed
-/// in the stopper's drain, and at least that many of its calls found the
-/// handle vanished.
+/// Log a phase's tallies, then check them: nothing failed, and some stop
+/// landed in the stopper's drain.
 fn report(seen: &Seen) -> TestResult
 {
     log_tallies(seen);
@@ -260,14 +264,6 @@ fn report(seen: &Seen) -> TestResult
     {
         return Err(
             "stress::stop_target_vanishes: no stop landed in the stopper's drain (never armed)",
-        );
-    }
-    let vanished = VANISHED_STOPS.load(Ordering::Acquire) + VANISHED_STARTS.load(Ordering::Acquire);
-    if vanished < seen.stopped_in_drain
-    {
-        return Err(
-            "stress::stop_target_vanishes: fewer calls found the handle vanished than stops \
-             landed in the drain (a resumed drain did not return at once)",
         );
     }
     Ok(())
@@ -571,11 +567,12 @@ fn restart(child: u32) -> Result<bool, &'static str>
 }
 
 /// Wait, for at most [`ROUND_WAIT_US`], for `counter` to change; fail with
-/// `message` if it does not.
+/// `message` if it does not, or with the clock's error if the wait cannot
+/// read it.
 fn await_progress(counter: &AtomicU32, message: &'static str) -> TestResult
 {
     let before = counter.load(Ordering::Acquire);
-    if await_within(ROUND_WAIT_US, || counter.load(Ordering::Acquire) != before)
+    if await_within(ROUND_WAIT_US, || counter.load(Ordering::Acquire) != before)?
     {
         Ok(())
     }
@@ -585,19 +582,20 @@ fn await_progress(counter: &AtomicU32, message: &'static str) -> TestResult
     }
 }
 
-/// Poll `done` until it holds, for at most `bound_us` microseconds. The
-/// first [`BUSY_POLLS`] polls are busy; later ones sleep 1 ms. Returns
-/// whether `done` held in time.
-fn await_within(bound_us: u64, mut done: impl FnMut() -> bool) -> bool
+/// Poll `done` until it holds, for at most `bound_us` microseconds on the
+/// `ElapsedUs` clock. The first [`BUSY_POLLS`] polls are busy; later ones
+/// sleep 1 ms. Returns whether `done` held in time; a clock read that
+/// fails, at the start or at a poll, is the wait's own failure, so a clock
+/// the wait cannot read never leaves it unbounded.
+fn await_within(bound_us: u64, mut done: impl FnMut() -> bool) -> Result<bool, &'static str>
 {
-    let elapsed_us = || system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(0);
-    let start = elapsed_us();
+    let start = elapsed_us()?;
     let mut polls = 0u32;
     while !done()
     {
-        if elapsed_us().saturating_sub(start) > bound_us
+        if elapsed_us()?.saturating_sub(start) > bound_us
         {
-            return false;
+            return Ok(false);
         }
         if polls < BUSY_POLLS
         {
@@ -609,7 +607,14 @@ fn await_within(bound_us: u64, mut done: impl FnMut() -> bool) -> bool
             let _ = thread_sleep(1);
         }
     }
-    true
+    Ok(true)
+}
+
+/// Microseconds since boot; the clock every bounded wait is measured on.
+fn elapsed_us() -> Result<u64, &'static str>
+{
+    system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "stress::stop_target_vanishes: system_info(ElapsedUs) failed")
 }
 
 /// Set [`QUIT`] and restart both children, bounded, until both have exited

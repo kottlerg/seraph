@@ -115,7 +115,8 @@ structure (head/tail/non_empty/load) of one CPU; it no longer "owns" any TCB's
 **The invariant that kills the class — "enqueue requires not-live."**
 `enqueue_and_wake` acquires `(*tcb).sched_lock` FIRST (before `select_target_cpu`,
 before any run-queue lock), reads `state` under it, and links ONLY a not-live
-thread (`Blocked`, or `Created`/`Stopped` for start/resume). If `state` is
+thread (`Blocked`, or `Created`; a start or resume links through
+`enqueue_ready_thread`). If `state` is
 `Running`/`Ready` the wake is **coalesced** (no-op against the live/queued
 incarnation) — now SAFE, not a #289 lost-wake, because the read is serialized
 against the parking commit (below). A `Running` thread can no longer be linked on
@@ -153,17 +154,24 @@ which the `enqueue_and_wake` gate and its callers preserve:
    `enqueue_and_wake`. So `wake_pending` set ⇒ payload already deposited — no
    spurious-zero/garbage wake. (`wake_pending` is set inside `enqueue_and_wake`,
    strictly after the upstream deposit under the source lock.)
-2. Refuse-to-park leaves `state==Running`, so the caller's refused-park
-   rollback routes the thread through `schedule()`, which REQUEUES a runnable
-   thread (vs. DRAINS a Stopped/Exited one) → it resumes at the line after
-   `schedule()` and reads the deposited field. `ParkCommit::RefusedWake` and
-   `ParkCommit::RefusedStop` share that rollback because the post-`schedule()`
-   outcome is **state-driven**, not return-value-driven.
-3. Each primitive's refused-park rollback MUST NOT clobber the deposited field
-   (it may clear only the waiter-queue entry + restore `context_saved`). This holds for
-   every primitive — `notification_wait`, `event_queue_recv`, `waitset_wait`, and
-   the three endpoint sites (binding rule: [scheduling-internals.md](scheduling-internals.md)
-   § Lock Hierarchy).
+2. Both refusals dequeue the waiter and restore `context_saved`, and the
+   thread then passes through `schedule()`, which REQUEUES a runnable thread
+   (`ParkCommit::RefusedWake`: still `Running`) and DRAINS a Stopped/Exited
+   one (`ParkCommit::RefusedStop`); either way it resumes at the line after
+   `schedule()` and reads its park disposition. The variant decides that
+   disposition: a `RefusedStop` rollback owns the episode (no waker saw the
+   registration) and stamps it `INTERRUPTED`, so the restarted thread reports
+   the cancellation; a `RefusedWake` rollback leaves the coalesced deposit
+   for the resume to deliver. `endpoint_call` stamps the episode cancelled on
+   either refusal (a coalesced wake there is a stray that cancels the call),
+   and `sys_thread_sleep`, which registers on no source, returns at once on
+   `RefusedWake` (the zero-length sleep is done) and deschedules in place
+   before returning `Interrupted` on `RefusedStop`.
+3. A `RefusedWake` rollback MUST NOT clobber the deposited field (it may clear
+   only the waiter-queue entry and restore `context_saved`). This holds for
+   `notification_wait`, `event_queue_recv`, `waitset_wait`, and `endpoint_recv`
+   (binding rule: [scheduling-internals.md](scheduling-internals.md) § Lock
+   Hierarchy).
 
 `wake_pending` is only reachable for wakers NOT serialized with the parker by a
 source lock — the IPC reply / cross-path races behind #284/#289. Source-lock-
@@ -215,16 +223,23 @@ each change; the binding statement of the resulting invariants is
   (`target_cpu` is the caller-computed placement *hint* from `select_target_cpu`;
   exclusivity is decided by `state` under `sched_lock`, not by the CPU choice).
   It acquires `(*tcb).sched_lock` first and classifies `state`:
-  - `Stopped|Exited` → clear the park binding (`ipc_state`/`blocked_on_object`),
-    release `sched_lock`, clear `wake_in_flight`, return (a stop/dealloc won;
-    the binding of a claimed park whose cancel lost the claim is this wake's
-    to clear, and the pin release is the waker's last touch of the TCB).
-  - `Running` → set `wake_pending`, release `sched_lock`, clear
-    `wake_in_flight`, return. The
+  - `Stopped` → clear the park binding (`ipc_state`/`blocked_on_object`),
+    clear `wake_in_flight`, release `sched_lock`, return (a stop won; the
+    binding of a claimed park whose cancel lost the claim is this wake's to
+    clear).
+  - `Exited` → clear the park binding, release `sched_lock`, then clear
+    `wake_in_flight`, return (a dealloc won; the pin alone holds `retype_free`
+    here, so its release is the waker's last touch of the TCB, and an `Exited`
+    thread is never claimed again).
+  - `Running` → set `wake_pending`, clear `wake_in_flight`, release
+    `sched_lock`, return. The
     wake-before-park net: the thread is mid-park; its `commit_blocked` sees the
     flag and refuses. Safe per §2.1 (the payload was deposited upstream).
-  - `Ready` → clear the park binding, release `sched_lock`, clear
-    `wake_in_flight`, return (coalesce; do NOT set `wake_pending`). The thread
+  - `Ready` → clear the park binding, clear `wake_in_flight`, release
+    `sched_lock`, return (coalesce; do NOT set `wake_pending`). On this arm and
+    the `Running` and `Stopped` arms the pin is cleared under the lock: once it
+    drops, the thread can park again and a later claim re-pin it, which a
+    delayed clear would erase. The thread
     is already linked, will be dispatched, and will
     consume the deposited payload; a `Ready` coalesce is only ever a same-event
     duplicate (a claim removes the thread from its source's wait queue ⇒ a

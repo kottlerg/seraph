@@ -51,10 +51,11 @@
 //!
 //! Required: both children exited voluntarily; both counted loops during the
 //! rounds; no stop or start by a child returned an error other than those
-//! above (the last offending result is logged); per direction, the stops
-//! that returned `Ok` equal the starts that returned `Ok` from the peer and
-//! from the controller together, since each child is the only stopper of the
-//! other and the kernel commits exactly one start per stop; and some round's
+//! above (one of the last offending results is logged: both children record
+//! into the same tallies); per direction, the stops that returned `Ok` equal
+//! the starts that returned `Ok` from the peer and from the controller
+//! together, since each child is the only stopper of the other and the
+//! kernel commits exactly one start per stop; and some round's
 //! two restarts both returned `Ok`, the witness of a mutual stop: a stopped
 //! child stops no one and only the controller restarts one, so when the
 //! first restart finds one child stopped and the second finds the other
@@ -127,7 +128,8 @@ static STOPS_OK: [AtomicU32; CHILDREN] = [AtomicU32::new(0), AtomicU32::new(0)];
 static STARTS_OK: [AtomicU32; CHILDREN] = [AtomicU32::new(0), AtomicU32::new(0)];
 static STARTS_INTERRUPTED: [AtomicU32; CHILDREN] = [AtomicU32::new(0), AtomicU32::new(0)];
 /// Stops and starts by a child that returned an error other than the
-/// accepted ones (with the last such error).
+/// accepted ones (with one of the last such errors: both children record
+/// into each tally).
 static BAD_STOPS: BadTally = BadTally::new();
 static BAD_STARTS: BadTally = BadTally::new();
 
@@ -392,7 +394,7 @@ fn rounds(th: [u32; CHILDREN], tally: &mut Tally) -> TestResult
         {
             tally.both_restarted += 1;
         }
-        await_progress(before, tally);
+        await_progress(before, tally)?;
         // 0 to 4095 spins (a multiplicative hash of the round).
         for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 20)
         {
@@ -421,11 +423,12 @@ fn restart(child: u32) -> Result<bool, &'static str>
 
 /// Spin, for at most [`ROUND_WAIT_US`], until both children have counted a
 /// loop past `before`. A round that times out is counted in `tally.starved`
-/// and proceeds: the next round's restarts end any pair left stopped.
-fn await_progress(before: [u32; CHILDREN], tally: &mut Tally)
+/// and proceeds: the next round's restarts end any pair left stopped. A
+/// clock read that fails, at the start or at a poll, fails the round, so a
+/// clock the wait cannot read never leaves it unbounded.
+fn await_progress(before: [u32; CHILDREN], tally: &mut Tally) -> TestResult
 {
-    let elapsed_us = || system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(0);
-    let start = elapsed_us();
+    let start = elapsed_us()?;
     loop
     {
         let advanced = PROGRESS
@@ -434,15 +437,22 @@ fn await_progress(before: [u32; CHILDREN], tally: &mut Tally)
             .all(|(p, b)| p.load(Ordering::Acquire) != b);
         if advanced
         {
-            return;
+            return Ok(());
         }
-        if elapsed_us().saturating_sub(start) > ROUND_WAIT_US
+        if elapsed_us()?.saturating_sub(start) > ROUND_WAIT_US
         {
             tally.starved += 1;
-            return;
+            return Ok(());
         }
         core::hint::spin_loop();
     }
+}
+
+/// Microseconds since boot; the clock the round wait is bounded on.
+fn elapsed_us() -> Result<u64, &'static str>
+{
+    system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "stress::mutual_stop: system_info(ElapsedUs) failed")
 }
 
 /// Set [`QUIT`] and restart both children, bounded, until both have exited

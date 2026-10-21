@@ -19,8 +19,7 @@ const RO_TEST_VA: u64 = 0x1_4000_0000;
 pub fn getrandom_fills_buffer(_ctx: &TestContext) -> TestResult
 {
     let mut buf = [0u8; 32];
-    let n = syscall::getrandom(buf.as_mut_ptr(), buf.len())
-        .map_err(|_| "getrandom failed on a valid buffer")?;
+    let n = syscall::getrandom(&mut buf).map_err(|_| "getrandom failed on a valid buffer")?;
     if n != buf.len() as u64
     {
         return Err("getrandom returned a short count");
@@ -40,7 +39,9 @@ pub fn getrandom_fills_buffer(_ctx: &TestContext) -> TestResult
 /// the fatal kernel-exception handler.
 pub fn getrandom_unmapped_ptr_invalid_address(_ctx: &TestContext) -> TestResult
 {
-    let r = syscall::getrandom(UNMAPPED_USER_VA as *mut u8, 16);
+    // SAFETY: UNMAPPED_USER_VA is never mapped in ktest's address space, so the
+    // span holds no byte the caller could own; the kernel can only fault on it.
+    let r = unsafe { syscall::getrandom_raw(UNMAPPED_USER_VA as *mut u8, 16) };
     if r == Err(SyscallError::InvalidAddress as i64)
     {
         Ok(())
@@ -67,7 +68,10 @@ pub fn getrandom_readonly_ptr_invalid_address(ctx: &TestContext) -> TestResult
     syscall::mem_protect(frame.cap(), ctx.aspace_cap, RO_TEST_VA, 1, 0)
         .map_err(|_| "getrandom RO: mem_protect to read-only failed")?;
 
-    let r = syscall::getrandom(RO_TEST_VA as *mut u8, 16);
+    // SAFETY: the span lies in this cell's own frame, mapped read-only above, so
+    // the address space maps none of it writable and no Rust reference into it
+    // exists; the kernel can only fault on it.
+    let r = unsafe { syscall::getrandom_raw(RO_TEST_VA as *mut u8, 16) };
     if r != Err(SyscallError::InvalidAddress as i64)
     {
         return Err(
@@ -81,8 +85,8 @@ pub fn getrandom_readonly_ptr_invalid_address(ctx: &TestContext) -> TestResult
 /// `getrandom` with `len > MAX_GETRANDOM_LEN` returns `InvalidArgument`.
 pub fn getrandom_over_max_len_invalid_arg(_ctx: &TestContext) -> TestResult
 {
-    let mut buf = [0u8; 8];
-    let r = syscall::getrandom(buf.as_mut_ptr(), syscall::MAX_GETRANDOM_LEN + 1);
+    let mut buf = [0u8; syscall::MAX_GETRANDOM_LEN + 1];
+    let r = syscall::getrandom(&mut buf);
     if r == Err(SyscallError::InvalidArgument as i64)
     {
         Ok(())
@@ -104,8 +108,7 @@ pub fn getrandom_reseed_interval_stream(_ctx: &TestContext) -> TestResult
     for i in 0..300
     {
         let mut buf = [0u8; 8];
-        let n = syscall::getrandom(buf.as_mut_ptr(), buf.len())
-            .map_err(|_| "getrandom failed mid-stream")?;
+        let n = syscall::getrandom(&mut buf).map_err(|_| "getrandom failed mid-stream")?;
         if n != buf.len() as u64
         {
             return Err("getrandom returned a short count mid-stream");

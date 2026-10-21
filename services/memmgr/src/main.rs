@@ -1933,7 +1933,11 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
 
 fn main(startup: &StartupInfo) -> !
 {
-    if syscall::ipc_buffer_set(startup.ipc_buffer as u64).is_err()
+    // SAFETY: init maps `ipc_buffer` as memmgr's dedicated IPC buffer page
+    // (`ProcessInfo::ipc_buffer_vaddr`); memmgr reaches it only as the raw
+    // `ipc_buf` pointer its handlers and the IPC wrappers take, so no Rust
+    // reference into it spans an IPC syscall.
+    if unsafe { syscall::ipc_buffer_set(startup.ipc_buffer as u64) }.is_err()
     {
         syscall::thread_exit();
     }

@@ -10,8 +10,12 @@
 //! and counts bit-packed into the label (see
 //! `services/procmgr/docs/ipc-interface.md`). Every field is client input,
 //! so this decoder never indexes the message with a client-derived offset it
-//! has not first bounded: a declaration that does not fit degrades the blob
-//! to empty, matching the wire contract, instead of panicking procmgr.
+//! has not first bounded. A blob is emptied only when a declared length is
+//! over `ipc::ARGS_BLOB_MAX` (an oversized argv length empties env as well)
+//! or the env header word lies outside the delivered words; blob bytes
+//! declared past the delivered words read as zero (see
+//! [`CreateBlobs::extract`]). Either way the decoder follows the wire
+//! contract instead of panicking procmgr.
 
 use ipc::{ARGS_BLOB_MAX, IpcMessage};
 

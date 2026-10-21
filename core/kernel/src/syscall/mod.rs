@@ -710,10 +710,15 @@ pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBl
 /// - Insufficient rights → [`SyscallError::InsufficientRights`].
 ///
 /// # Safety
-/// `cspace` must be null or point at a live `CSpace`. The returned reference
-/// borrows the slot, not the object it names: nothing pins that object past
-/// the lookup, so a caller that dereferences the object across a point where
-/// another thread may delete its last capability reads freed memory
+/// `cspace` must be null or the `CSpace` bound to the calling (running)
+/// thread, and the caller must not park while it uses the returned slot:
+/// only for that `CSpace` does its refcount-0 teardown stop the caller and
+/// wait for it to leave every CPU before the slot pages are freed, which is
+/// what makes the `'static` borrow sound. The slot's contents may be
+/// recycled concurrently (the unlocked tag and generation checks narrow that
+/// race, they do not close it), and nothing pins the object the slot names
+/// past the lookup, so a caller that dereferences the object across a point
+/// where another thread may delete its last capability reads freed memory
 /// (#443 § Unpinned capability lookup).
 #[cfg(not(test))]
 pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(

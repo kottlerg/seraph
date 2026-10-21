@@ -37,7 +37,7 @@ const ELF_PAGE_TEMP_VA: u64 = TEMP_MAP_BASE + 0x1000_0000;
 fn draw_layout_entropy() -> Option<[u8; process_layout::LAYOUT_ENTROPY_BYTES]>
 {
     let mut entropy = [0_u8; process_layout::LAYOUT_ENTROPY_BYTES];
-    let n = syscall::getrandom(entropy.as_mut_ptr(), entropy.len()).ok()?;
+    let n = syscall::getrandom(&mut entropy).ok()?;
     (n == entropy.len() as u64).then_some(entropy)
 }
 

@@ -276,7 +276,9 @@ fn server_entry(arg: u64) -> !
     // SERVER_IPC_BUF; sequential cycles never alias it.
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
 
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` points at a page-aligned static dedicated to this thread's IPC buffer; no Rust
+    // reference into it is ever taken, so the kernel's IPC writes alias no Rust data.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }
@@ -309,7 +311,9 @@ fn client_entry(arg: u64) -> !
     // CLIENT_IPC_BUF; sequential cycles never alias it.
     let buf = core::ptr::addr_of_mut!(CLIENT_IPC_BUF).cast::<u64>();
 
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` points at a page-aligned static dedicated to this thread's IPC buffer; no Rust
+    // reference into it is ever taken, so the kernel's IPC writes alias no Rust data.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }

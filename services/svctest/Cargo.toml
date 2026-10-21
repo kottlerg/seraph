@@ -16,7 +16,8 @@ process-abi = { workspace = true }
 process-layout = { path = "../../shared/process-layout" }
 syscall = { path = "../../shared/syscall" }
 # `MSG_DATA_WORDS_MAX`: the blob-size cells size argv/env against the
-# `CREATE_FROM_FILE` data area.
+# `CREATE_FROM_FILE` data area, and the `fs_std` rename cell sizes its long
+# leaf names so two of them overflow the `FS_RENAME` data area.
 syscall-abi = { path = "../../abi/syscall" }
 shmem = { path = "../../shared/shmem" }
 

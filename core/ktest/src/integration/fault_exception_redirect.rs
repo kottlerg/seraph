@@ -96,7 +96,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Read the fault-blocked thread's registers and confirm the captured IP in
     // the message matches the register frame.
     let mut reg_buf = [0u8; BUF];
-    thread_read_regs(child.th, reg_buf.as_mut_ptr(), BUF)
+    thread_read_regs(child.th, &mut reg_buf)
         .map_err(|_| "fault_exception_redirect: thread_read_regs failed")?;
     let ip = u64::from_le_bytes(
         reg_buf[IP_OFFSET..IP_OFFSET + 8]
@@ -112,7 +112,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // child never re-executes the illegal instruction.
     let recovery_ptr = recovery_child as *const () as u64;
     reg_buf[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&recovery_ptr.to_le_bytes());
-    thread_write_regs(child.th, reg_buf.as_ptr(), BUF)
+    thread_write_regs(child.th, &reg_buf)
         .map_err(|_| "fault_exception_redirect: thread_write_regs failed")?;
 
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.

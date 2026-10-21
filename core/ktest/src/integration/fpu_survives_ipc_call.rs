@@ -69,7 +69,10 @@ fn child_entry(_arg: u64) -> !
     // invariant. Done before the FP-preserving block so any FP clobber
     // here is irrelevant.
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if ipc_buffer_set(buf_addr).is_err()
+    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
+    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
+    // the `ipc` wrappers.
+    if unsafe { ipc_buffer_set(buf_addr) }.is_err()
     {
         thread_exit();
     }
@@ -176,7 +179,10 @@ fn child_entry(_arg: u64) -> !
 {
     // Register this thread's IPC buffer. See x86_64 sibling for rationale.
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if ipc_buffer_set(buf_addr).is_err()
+    // SAFETY: `IPC_BUF` is a page-aligned static ktest dedicates to the kernel as an IPC buffer
+    // page; ktest never takes a Rust reference into it, reaching it only through raw pointers and
+    // the `ipc` wrappers.
+    if unsafe { ipc_buffer_set(buf_addr) }.is_err()
     {
         thread_exit();
     }

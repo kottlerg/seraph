@@ -21,7 +21,7 @@
 /// the buffer is full.
 pub fn fill_bytes(bytes: &mut [u8]) {
     for chunk in bytes.chunks_mut(syscall::MAX_GETRANDOM_LEN) {
-        match syscall::getrandom(chunk.as_mut_ptr(), chunk.len()) {
+        match syscall::getrandom(chunk) {
             Ok(n) if n as usize == chunk.len() => {}
             // The kernel fills a well-formed in-bounds buffer completely and
             // never blocks once seeded, so a short count or error is a kernel

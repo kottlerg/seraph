@@ -1315,7 +1315,7 @@ unsafe fn kernel_entry_post_rebase(
                         is_user: true,
                         saved_state: init_saved,
                         kernel_stack_top: kstack_top,
-                        trap_frame: core::ptr::null_mut(),
+                        trap_frame: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                         syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                         address_space: init_as_ptr,
                         ipc_buffer: 0,
@@ -1696,15 +1696,17 @@ unsafe extern "C" {
 static PANIC_DUMP_READY: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Best-effort panic context: CPU, current thread, the in-flight syscall, and a
-/// kernel-text stack scan. The in-flight syscall is the load-bearing line for
-/// issue #316: a torn-context (#314) makes a syscall execute with garbage
-/// register args, which reach a stdlib precondition (`slice::get_unchecked`) and
-/// panic — this dump shows the syscall + args, pinning kernel-side corruption vs
-/// a deterministic kernel bug. Serial-only / lock-bypassing, mirroring the panic
-/// banner. Skips entirely until the per-CPU subsystem is initialized
-/// (`PANIC_DUMP_READY`); after that every read is null-checked or stack-bounded,
-/// so the dump cannot fault.
+/// Best-effort panic context: CPU, current thread, the frame of its last entry
+/// from user mode, and a kernel-text stack scan. The user frame is the
+/// load-bearing line for issue #316: a torn-context (#314) makes a syscall
+/// execute with garbage register args, which reach a stdlib precondition
+/// (`slice::get_unchecked`) and panic — for a panic inside a syscall the frame
+/// is that syscall's, showing its number and args, pinning kernel-side
+/// corruption vs a deterministic kernel bug; for a panic in an interrupt or
+/// exception taken from user mode it is that entry's frame. Serial-only /
+/// lock-bypassing, mirroring the panic banner. Skips entirely until the per-CPU
+/// subsystem is initialized (`PANIC_DUMP_READY`); after that every read is
+/// null-checked or stack-bounded, so the dump cannot fault.
 ///
 /// # Safety
 /// Called only from the panic handler.
@@ -1734,22 +1736,41 @@ unsafe fn panic_context_dump()
     }
     // SAFETY: cur non-null; thread_id / trap_frame / kernel_stack_top are
     // always valid to read on a live TCB.
-    let (tid, tf, stack_top) =
-        unsafe { ((*cur).thread_id, (*cur).trap_frame, (*cur).kernel_stack_top) };
+    let (tid, tf, stack_top) = unsafe {
+        (
+            (*cur).thread_id,
+            (*cur)
+                .trap_frame
+                .load(core::sync::atomic::Ordering::Relaxed),
+            (*cur).kernel_stack_top,
+        )
+    };
     // SAFETY: panic path; lock-bypassing serial write.
     unsafe {
         console::panic_write_fmt(format_args!("  context: cpu={cpu} tid={tid}\n"));
     }
     if !tf.is_null()
     {
-        // SAFETY: a non-null trap_frame is the in-flight userspace register
-        // snapshot; syscall_nr/arg are plain field reads.
-        let (nr, a0, a1, a2) =
-            unsafe { ((*tf).syscall_nr(), (*tf).arg(0), (*tf).arg(1), (*tf).arg(2)) };
+        // The frame of the thread's last entry from user mode: an in-flight
+        // syscall's, or an interrupt's or exception's taken from user mode
+        // (docs/arch-interface.md § `trap_frame`), so it is reported as the
+        // user frame, with the registers a syscall would carry its number and
+        // arguments in.
+        // SAFETY: a non-null trap_frame names a frame on this thread's kernel
+        // stack; syscall_nr/arg/instruction_pointer are plain field reads.
+        let (ip, nr, a0, a1, a2) = unsafe {
+            (
+                (*tf).instruction_pointer(),
+                (*tf).syscall_nr(),
+                (*tf).arg(0),
+                (*tf).arg(1),
+                (*tf).arg(2),
+            )
+        };
         // SAFETY: panic path; lock-bypassing serial write.
         unsafe {
             console::panic_write_fmt(format_args!(
-                "  in-flight syscall: nr={nr} args=[{a0:#x}, {a1:#x}, {a2:#x}]\n"
+                "  last user entry: ip={ip:#x} nr/rv={nr} args=[{a0:#x}, {a1:#x}, {a2:#x}]\n"
             ));
         }
     }
@@ -1836,8 +1857,8 @@ fn panic(info: &PanicInfo) -> !
             console::panic_write_fmt(format_args!("\nPANIC: {}\n", info.message()));
         }
     }
-    // Best-effort context: CPU, current thread, the in-flight syscall, and a
-    // kernel-text stack scan. A torn-context (#314) makes a syscall execute with
+    // Best-effort context: CPU, current thread, its last user-mode entry frame,
+    // and a kernel-text stack scan. A torn-context (#314) makes a syscall execute with
     // garbage register args that reach a stdlib precondition (e.g.
     // slice::get_unchecked) — this dump pins the kernel call site #316 needs.
     // SAFETY: panic path; every read inside is bounded / null-checked.

@@ -535,14 +535,16 @@ The full user-mode register snapshot saved on the kernel stack at every privileg
 The layout is architecture-specific; these methods let shared `syscall/` and `sched/` code
 operate on frames without `#[cfg(target_arch)]`.
 
-Every entry from user mode points the thread's `trap_frame` at the frame it built, so a thread
-descheduled from any entry leaves `trap_frame` naming the frame it resumes from, the one
-`SYS_THREAD_READ_REGS` and `SYS_THREAD_WRITE_REGS` act on. On riscv64 every U-mode trap builds the
+Every entry from user mode at which the thread can be descheduled points the thread's
+`trap_frame` at the frame it built, so a thread descheduled from any such entry leaves
+`trap_frame` naming the frame it resumes from, the one `SYS_THREAD_READ_REGS` and
+`SYS_THREAD_WRITE_REGS` act on. On riscv64 every U-mode trap builds the
 frame in the slot just below the kernel stack top that `SYS_THREAD_CONFIGURE` initialises. On
 x86-64 the syscall entry builds it in that slot (the syscall dispatcher republishes it), while the
 interrupt and exception trampolines build it below the hardware iret words and the stub's two
-pushes and publish it through `idt::publish_user_frame` (`#DF` and `#MC`, which run on an IST
-stack and are terminal, publish nothing).
+pushes and publish it through `idt::publish_user_frame`. The x86-64 entries that publish nothing
+deschedule nothing: `#DF` and `#MC` (IST1, terminal), the NMI (IST2), and `#NM` (builds no
+frame).
 
 ```rust
 pub struct TrapFrame { /* arch-specific layout */ }

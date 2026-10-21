@@ -746,11 +746,18 @@ unsafe fn redirect_user_fault(
     // Point trap_frame at the live frame so the handler's register access targets
     // the faulting state; restore the previous pointer afterward.
     // SAFETY: tcb valid; frame is a valid live TrapFrame.
-    let saved_tf = unsafe { (*tcb).trap_frame };
+    let saved_tf = unsafe {
+        (*tcb)
+            .trap_frame
+            .load(core::sync::atomic::Ordering::Relaxed)
+    };
     // SAFETY: tcb valid; trap_frame is the pointer the register syscalls read
     // while this thread is BlockedOnFault.
     unsafe {
-        (*tcb).trap_frame = core::ptr::from_mut(frame);
+        (*tcb).trap_frame.store(
+            core::ptr::from_mut(frame),
+            core::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     // SAFETY: handler bound; trap_frame points at the live frame; no lock held.
@@ -758,7 +765,9 @@ unsafe fn redirect_user_fault(
 
     // SAFETY: restore the previous trap_frame pointer.
     unsafe {
-        (*tcb).trap_frame = saved_tf;
+        (*tcb)
+            .trap_frame
+            .store(saved_tf, core::sync::atomic::Ordering::Relaxed);
     }
 
     matches!(outcome, crate::ipc::fault::FaultOutcome::Resume)

@@ -68,6 +68,7 @@ use syscall::{
 #[cfg(not(test))]
 pub unsafe fn dispatch(tf: *mut TrapFrame)
 {
+    let frame = tf;
     // SAFETY: caller guarantees tf is valid and exclusively accessible.
     let tf = unsafe { &mut *tf };
 
@@ -87,7 +88,9 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
             // Every entry from user mode publishes its live frame as the
             // thread's `trap_frame`; an interrupt or exception taken since the
             // last syscall may have pointed it at a frame lower on the stack.
-            (*tcb).trap_frame = core::ptr::from_mut(tf);
+            (*tcb)
+                .trap_frame
+                .store(frame, core::sync::atomic::Ordering::Relaxed);
         }
     }
 

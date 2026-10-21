@@ -275,7 +275,7 @@ pub struct ProcessInfo
     /// `DESTROY_PROCESS`, future supervision RPCs) and for any future
     /// procmgr-served operation that is not heap-bootstrap.
     ///
-    /// Zero when no procmgr is reachable (procmgr itself, init, anything
+    /// Zero when no procmgr is reachable (procmgr itself, anything
     /// before procmgr exists). Consumers must tolerate zero.
     pub procmgr_endpoint_cap: u32,
 
@@ -289,7 +289,7 @@ pub struct ProcessInfo
     /// per-process tracking, so allocations are accounted to the correct
     /// process.
     ///
-    /// Zero when no memmgr is reachable (memmgr itself, init, anything
+    /// Zero when no memmgr is reachable (memmgr itself, anything
     /// before memmgr exists). Consumers must tolerate zero.
     pub memmgr_endpoint_cap: u32,
 
@@ -312,7 +312,7 @@ pub struct ProcessInfo
     /// `log_send_cap` below predates this convention and will be
     /// migrated to the same mechanism in a separate PR.
     ///
-    /// Zero when no svcmgr is reachable (svcmgr itself, init, anything
+    /// Zero when no svcmgr is reachable (svcmgr itself, anything
     /// before svcmgr exists). Consumers must tolerate zero.
     pub service_registry_cap: u32,
 
@@ -556,13 +556,16 @@ pub struct StartupInfo
     /// `CSpace` slot of own `CSpace` capability.
     pub self_cspace: u32,
 
-    /// `CSpace` slot of a badged SEND cap on procmgr's service endpoint.
-    /// Zero when unreachable (procmgr itself, or earlier in the boot chain).
+    /// `CSpace` slot of a badged SEND cap on procmgr's service endpoint,
+    /// copied from [`ProcessInfo::procmgr_endpoint_cap`]. Zero for memmgr,
+    /// this type's only constructor: init writes none into its `ProcessInfo`.
     pub procmgr_endpoint: u32,
 
     /// `CSpace` slot of a badged SEND cap on memmgr's service endpoint,
     /// copied from [`ProcessInfo::memmgr_endpoint_cap`]. Zero for memmgr,
-    /// this type's only constructor, which holds no SEND on its own endpoint.
+    /// this type's only constructor: init delivers memmgr no badged client SEND
+    /// in `ProcessInfo` (memmgr serves its endpoint through the full-rights cap
+    /// its bootstrap round delivers).
     pub memmgr_endpoint: u32,
 
     /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, the

@@ -571,11 +571,17 @@ pub struct ThreadControlBlock
     /// Stored in TSS RSP0 (x86-64) or sscratch (RISC-V) on every context switch.
     pub kernel_stack_top: u64,
 
-    /// Pointer to the `TrapFrame` on the kernel stack (null for kernel threads).
+    /// Pointer to the `TrapFrame` of the thread's last entry from user mode,
+    /// on its kernel stack below `kernel_stack_top` (null for kernel threads).
     ///
-    /// Populated by `syscall_entry` / trap handler on each kernel entry.
-    /// Points into the kernel stack below `kernel_stack_top`.
-    pub trap_frame: *mut crate::arch::current::trap_frame::TrapFrame,
+    /// Set by `SYS_THREAD_CONFIGURE` to the slot its first entry to user mode
+    /// resumes from, and republished by every entry from user mode (see
+    /// `docs/arch-interface.md` § `trap_frame`). The running thread is the only
+    /// writer after configuration; atomic so a diagnostic read from another
+    /// CPU (the softlockup watchdog) is race-free. Relaxed suffices: the
+    /// register syscalls read it only after the switch-out's `context_saved`
+    /// Release (`sched::with_held_frame`).
+    pub trap_frame: core::sync::atomic::AtomicPtr<crate::arch::current::trap_frame::TrapFrame>,
 
     /// Number of the syscall the thread is executing: Relaxed-stored by the
     /// dispatcher at entry and reset to `u64::MAX` at exit. Read by the

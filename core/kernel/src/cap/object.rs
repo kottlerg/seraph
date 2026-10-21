@@ -1315,7 +1315,14 @@ fn log_self_teardown(tcb: *mut crate::sched::thread::ThreadControlBlock, what: &
         return;
     }
     // SAFETY: tcb is valid here — about to be marked Exited, not yet freed.
-    let (tid, tf) = unsafe { ((*tcb).thread_id, (*tcb).trap_frame) };
+    let (tid, tf) = unsafe {
+        (
+            (*tcb).thread_id,
+            (*tcb)
+                .trap_frame
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    };
     if tf.is_null()
     {
         crate::kprintln!(

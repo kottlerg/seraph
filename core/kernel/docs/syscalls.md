@@ -1389,7 +1389,9 @@ lock, which every dispatch, start, and stop takes. The stop call that stopped th
 only once it has left its CPU with its save published (see
 [`SYS_THREAD_STOP`](#sys_thread_stop-20)), except a restarted
 stopper's call whose slot no longer names the target, so a caller that issues this after its own
-stop returns is not refused for this reason.
+stop returns is not refused for this reason. A fault-blocked thread is accessed once it is
+`current` on no CPU with its save published; a call that finds it still switching out waits for
+that switch to finish.
 
 **Capability requirement:** `thread_cap` MUST have Observe rights.
 
@@ -1430,7 +1432,9 @@ lock, which every dispatch, start, and stop takes. The stop call that stopped th
 only once it has left its CPU with its save published (see
 [`SYS_THREAD_STOP`](#sys_thread_stop-20)), except a restarted
 stopper's call whose slot no longer names the target, so a caller that issues this after its own
-stop returns is not refused for this reason.
+stop returns is not refused for this reason. A fault-blocked thread is accessed once it is
+`current` on no CPU with its save published; a call that finds it still switching out waits for
+that switch to finish.
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
@@ -2258,6 +2262,7 @@ source of truth.
 [Kernel Entropy Subsystem](entropy.md), [IPC Subsystem Internals](ipc-internals.md),
 [Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[core/ktest/README.md](../../ktest/README.md),
 [Capability Model](../../../docs/capability-model.md), [IPC Design](../../../docs/ipc-design.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [Testing](../../../docs/testing.md),

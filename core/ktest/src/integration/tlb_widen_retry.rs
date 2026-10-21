@@ -40,7 +40,7 @@ use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult};
 
-/// User-half VA used only by this test (1.375 GiB), clear of other tests.
+/// User-half VA used only by this test (5.375 GiB), clear of other tests.
 const WIDEN_VA: u64 = 0x1_5800_0000;
 
 /// Sentinel the child stores through the widened mapping.
@@ -221,9 +221,11 @@ fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, memory
         cap_delete(child.th).ok();
         cap_delete(child.cs).ok();
     }
-    mem_unmap(ctx.aspace_cap, WIDEN_VA, 1).ok();
-    // SAFETY: the page is now unmapped, so the cap is free to return.
-    unsafe { crate::frame_pool::free(memory_cap) };
+    if mem_unmap(ctx.aspace_cap, WIDEN_VA, 1).is_ok()
+    {
+        // SAFETY: the page is now unmapped, so the cap is free to return.
+        unsafe { crate::frame_pool::free(memory_cap) };
+    }
 }
 
 /// Child entry: cache a read-only TLB entry, wait for the parent's widen, then

@@ -844,11 +844,13 @@ isr_stub!(isr31, 31, has_error_code = false, ist = 0);
 /// `trap_frame` naming the frame it resumes from: the frame
 /// `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` act on (see
 /// `docs/arch-interface.md` § `trap_frame`). The NMI (IST2), `#DF`/`#MC` (IST1,
-/// terminal) and `#NM` (builds no frame) entries publish nothing; none of them
-/// deschedules the thread. The running thread is the only writer; the register
-/// syscalls read only once the thread is off every CPU with its save published
-/// (`sched::with_held_frame`), which orders this store before the read, and the
-/// softlockup watchdog's diagnostic read is of the atomic pointer only.
+/// terminal), `#NM` (builds no frame) and the spurious vector 255 (`iretq` only)
+/// publish nothing; none of them deschedules the thread. The running thread is
+/// the only writer after configuration; the register syscalls read only once
+/// the thread is off every CPU with its save published
+/// (`sched::with_held_frame`), which orders this store before the read. The
+/// softlockup watchdog loads the atomic pointer and then takes a volatile,
+/// diagnostic-only copy of the frame of a thread that may still be running.
 ///
 /// # Safety
 /// `frame` must be the live frame an entry from user mode built on the current

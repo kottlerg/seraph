@@ -543,8 +543,14 @@ frame in the slot just below the kernel stack top that `SYS_THREAD_CONFIGURE` in
 x86-64 the syscall entry builds it in that slot (the syscall dispatcher republishes it), while the
 interrupt and exception trampolines build it below the hardware iret words and the stub's two
 pushes and publish it through `idt::publish_user_frame`. The x86-64 entries that publish nothing
-deschedule nothing: `#DF` and `#MC` (IST1, terminal), the NMI (IST2), and `#NM` (builds no
-frame).
+deschedule nothing: `#DF` and `#MC` (IST1, terminal), the NMI (IST2), `#NM` (builds no
+frame), and the spurious vector 255 (`iretq` only).
+
+The syscall dispatcher hands each handler a `&mut TrapFrame` to the published frame for the whole
+syscall, including while the thread is blocked in it, and two paths write that frame meanwhile:
+`SYS_THREAD_WRITE_REGS` on the stopped thread from another CPU, and riscv64's switch-out, which
+clears the frame's FS/VS bits. That violates the `&mut`'s uniqueness; passing handlers a
+non-unique frame handle is tracked by [#443](https://github.com/kottlerg/seraph/issues/443).
 
 ```rust
 pub struct TrapFrame { /* arch-specific layout */ }

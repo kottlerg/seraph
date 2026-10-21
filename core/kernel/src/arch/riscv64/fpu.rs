@@ -346,7 +346,10 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
     // resumes U-mode with FS = VS = Off — without this, trap_entry would
     // restore sstatus from the frame and undo the lazy-trap re-arm.
     // SAFETY: trap_frame points at the TCB's on-kernel-stack trap frame
-    // and is non-null whenever extended.area is non-null (user threads).
+    // and is non-null whenever extended.area is non-null (user threads). A
+    // syscall blocked in this switch-out still holds a `&mut` to the same
+    // frame; that aliasing gap is stated in docs/arch-interface.md
+    // § `trap_frame` and tracked by #443.
     unsafe {
         let tf = (*tcb)
             .trap_frame

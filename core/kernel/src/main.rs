@@ -1758,10 +1758,14 @@ unsafe fn panic_context_dump()
         // arguments in.
         // SAFETY: a non-null trap_frame names a frame on this thread's kernel
         // stack; syscall_nr/arg/instruction_pointer are plain field reads.
+        // The syscall number is the dispatcher's stamp on the TCB: the frame's
+        // number register is overwritten by a returned result on x86-64.
         let (ip, nr, a0, a1, a2) = unsafe {
             (
                 (*tf).instruction_pointer(),
-                (*tf).syscall_nr(),
+                (*cur)
+                    .syscall_nr
+                    .load(core::sync::atomic::Ordering::Relaxed),
                 (*tf).arg(0),
                 (*tf).arg(1),
                 (*tf).arg(2),
@@ -1770,7 +1774,7 @@ unsafe fn panic_context_dump()
         // SAFETY: panic path; lock-bypassing serial write.
         unsafe {
             console::panic_write_fmt(format_args!(
-                "  last user entry: ip={ip:#x} nr/rv={nr} args=[{a0:#x}, {a1:#x}, {a2:#x}]\n"
+                "  last user entry: ip={ip:#x} syscall_nr={nr} args=[{a0:#x}, {a1:#x}, {a2:#x}]\n"
             ));
         }
     }

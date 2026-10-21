@@ -1204,10 +1204,12 @@ fn watchdog_dump(reason: &str)
         // thread's last entry from user mode (republished by the syscall
         // dispatcher for an in-flight syscall), telling where in userspace
         // it entered the kernel.
-        // SAFETY: trap_frame is an atomic pointer, so the load is race-free;
-        // the pointed-to frame is on the stalled thread's kernel stack and the
-        // field reads race benignly with that thread's own writes (we're
-        // already in stall).
+        // SAFETY: trap_frame is an atomic pointer, so its load is race-free.
+        // The frame it names is on the stalled thread's kernel stack, which
+        // that thread may still write: this diagnostic-only read (the one
+        // exception to docs/scheduling-internals.md § Cross-CPU TCB Ownership's
+        // `with_held_frame` rule) copies it with a volatile load and decides
+        // nothing, so a torn copy can only misreport the printed PC.
         let user_frame = unsafe {
             let s = scheduler_for(cpu);
             let cur = s.current;
@@ -1232,7 +1234,8 @@ fn watchdog_dump(reason: &str)
                 let nr = (*cur)
                     .syscall_nr
                     .load(core::sync::atomic::Ordering::Relaxed);
-                Some(((*tf).instruction_pointer(), nr))
+                let snapshot = core::ptr::read_volatile(tf);
+                Some((snapshot.instruction_pointer(), nr))
             }
         };
         if let Some((user_pc, syscall_nr)) = user_frame

@@ -50,13 +50,6 @@ const SPIN_ITERS: u64 = 50_000;
 
 static mut STACK: ChildStack = ChildStack::ZERO;
 
-/// An IPC buffer page for one child thread, apart from ktest's own `IPC_BUF`: a child's IPC
-/// and its parent's run on different threads, each through its own registered page.
-#[repr(C, align(4096))]
-struct IpcBufPage([u64; 512]);
-// SAFETY: registered only by the child, of which one runs per test.
-static mut CHILD_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
-
 // Resources are published to the child via statics rather than the entry
 // argument so the inline-asm block can load them without depending on any
 // register the kernel-side entry-frame setup may not preserve. Matches the
@@ -75,11 +68,8 @@ fn child_entry(_arg: u64) -> !
     // later grows data words and matches the buffer-registered ktest
     // invariant. Done before the FP-preserving block so any FP clobber
     // here is irrelevant.
-    let buf_addr = core::ptr::addr_of_mut!(CHILD_IPC_BUF) as u64;
-    // SAFETY: `CHILD_IPC_BUF` is a page-aligned static only this child registers, so the page is
-    // dedicated to the kernel as this thread's IPC buffer; no Rust reference into it is ever taken,
-    // the page being reached only through raw pointers and the `ipc` wrappers.
-    if unsafe { ipc_buffer_set(buf_addr) }.is_err()
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if ipc_buffer_set(buf_addr).is_err()
     {
         thread_exit();
     }
@@ -185,11 +175,8 @@ fn child_entry(_arg: u64) -> !
 fn child_entry(_arg: u64) -> !
 {
     // Register this thread's IPC buffer. See x86_64 sibling for rationale.
-    let buf_addr = core::ptr::addr_of_mut!(CHILD_IPC_BUF) as u64;
-    // SAFETY: `CHILD_IPC_BUF` is a page-aligned static only this child registers, so the page is
-    // dedicated to the kernel as this thread's IPC buffer; no Rust reference into it is ever taken,
-    // the page being reached only through raw pointers and the `ipc` wrappers.
-    if unsafe { ipc_buffer_set(buf_addr) }.is_err()
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if ipc_buffer_set(buf_addr).is_err()
     {
         thread_exit();
     }

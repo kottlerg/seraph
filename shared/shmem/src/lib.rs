@@ -100,17 +100,9 @@ impl SharedBuffer
     /// Attach to a shared buffer using memory caps received from the peer.
     /// Maps `memory_caps[..pages]` sequentially read-write at `vaddr`.
     ///
-    /// # Safety
-    /// When `aspace` names the caller's own address space, the `pages` pages
-    /// at `vaddr` must not alias memory Rust code already owns (a reserved,
-    /// unbacked range), as `syscall::mem_map` requires; the returned buffer
-    /// then owns the span until it drops.
-    ///
     /// # Errors
-    /// [`ShmemError::InvalidPageCount`] if `pages` is zero, exceeds
-    /// [`MAX_PAGES`], or exceeds `memory_caps.len()`;
-    /// [`ShmemError::MapFailed`] if any derive or map call rejects.
-    pub unsafe fn attach(
+    /// [`ShmemError::MapFailed`] if any map call rejects.
+    pub fn attach(
         memory_caps: &[u32],
         pages: u32,
         aspace: u32,
@@ -128,29 +120,22 @@ impl SharedBuffer
                 Ok(c) => c,
                 Err(_) =>
                 {
-                    // SAFETY: pages `0..i` were mapped by this call and not yet
-                    // handed out.
-                    unsafe { unmap_range(aspace, vaddr, i) };
+                    unmap_range(aspace, vaddr, i);
                     return Err(ShmemError::MapFailed);
                 }
             };
-            // SAFETY: page `i` of the span the caller's contract keeps clear of
-            // memory Rust code owns.
-            let mapped = unsafe {
-                syscall::mem_map(
-                    rw,
-                    aspace,
-                    vaddr + u64::from(i) * PAGE_SIZE,
-                    0,
-                    1,
-                    syscall::MAP_WRITABLE,
-                )
-            };
-            if mapped.is_err()
+            if syscall::mem_map(
+                rw,
+                aspace,
+                vaddr + u64::from(i) * PAGE_SIZE,
+                0,
+                1,
+                syscall::MAP_WRITABLE,
+            )
+            .is_err()
             {
                 let _ = syscall::cap_delete(rw);
-                // SAFETY: pages `0..i` were mapped by this call and not yet handed out.
-                unsafe { unmap_range(aspace, vaddr, i) };
+                unmap_range(aspace, vaddr, i);
                 return Err(ShmemError::MapFailed);
             }
             let _ = syscall::cap_delete(rw);
@@ -202,27 +187,17 @@ impl Drop for SharedBuffer
 {
     fn drop(&mut self)
     {
-        // SAFETY: the span is the mapping `attach` created for this buffer, which
-        // owns it; `as_bytes_mut` slices borrow `self` and end before drop, and a
-        // ring built over the region holds it only under `from_raw`'s contract
-        // that the mapping outlive the ring.
-        let _ = unsafe { syscall::mem_unmap(self.aspace, self.vaddr, u64::from(self.page_count)) };
+        let _ = syscall::mem_unmap(self.aspace, self.vaddr, u64::from(self.page_count));
     }
 }
 
 /// Best-effort unmap of `count` pages starting at `vaddr`. Used during
 /// failure cleanup; errors are swallowed.
-///
-/// # Safety
-/// The `count` pages at `vaddr` must be pages `attach` just mapped, with no
-/// Rust object or reference into them yet.
-unsafe fn unmap_range(aspace: u32, vaddr: u64, count: u32)
+fn unmap_range(aspace: u32, vaddr: u64, count: u32)
 {
     for i in 0..count
     {
-        // SAFETY: page `i` is one `attach` mapped this call and nothing has
-        // been handed out over it, per this function's contract.
-        let _ = unsafe { syscall::mem_unmap(aspace, vaddr + u64::from(i) * PAGE_SIZE, 1u64) };
+        let _ = syscall::mem_unmap(aspace, vaddr + u64::from(i) * PAGE_SIZE, 1u64);
     }
 }
 
@@ -334,9 +309,8 @@ unsafe impl<'a> Send for SpscReader<'a> {}
 ///
 /// # Safety
 /// The header at `region_vaddr` must have been initialised by
-/// [`SpscHeader::init`], and the region must stay mapped for `'a`. Only one
-/// `SpscWriter` and one `SpscReader` may exist at a time for a given shared
-/// region.
+/// [`SpscHeader::init`]. Only one `SpscWriter` and one `SpscReader` may
+/// exist at a time for a given shared region.
 pub unsafe fn spsc_pair<'a>(region_vaddr: u64) -> (SpscWriter<'a>, SpscReader<'a>)
 {
     // SAFETY: caller contract.
@@ -353,8 +327,8 @@ impl<'a> SpscWriter<'a>
     /// Wrap a pre-initialised shared region as a writer.
     ///
     /// # Safety
-    /// The region must start with an initialised [`SpscHeader`] and stay
-    /// mapped for `'a`. Only one writer may exist at a time.
+    /// The region must start with an initialised [`SpscHeader`]. Only one
+    /// writer may exist at a time.
     pub unsafe fn from_raw(region_vaddr: u64) -> Self
     {
         // SAFETY: caller contract.
@@ -417,8 +391,8 @@ impl<'a> SpscReader<'a>
     /// Wrap a pre-initialised shared region as a reader.
     ///
     /// # Safety
-    /// The region must start with an initialised [`SpscHeader`] and stay
-    /// mapped for `'a`. Only one reader may exist at a time.
+    /// The region must start with an initialised [`SpscHeader`]. Only one
+    /// reader may exist at a time.
     pub unsafe fn from_raw(region_vaddr: u64) -> Self
     {
         // SAFETY: caller contract.

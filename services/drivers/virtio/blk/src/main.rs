@@ -340,19 +340,15 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
         syscall::thread_exit();
     };
     let ring_va = ring_range.va_start();
-    // SAFETY: `ring_va` is the range `reserve_pages` just reserved: unbacked VA no Rust
-    // object occupies.
-    let mapped = unsafe {
-        syscall::mem_map(
-            ring_memory,
-            caps.self_aspace,
-            ring_va,
-            0,
-            ring_pages,
-            syscall::MAP_READONLY | syscall::MAP_WRITABLE,
-        )
-    };
-    if mapped.is_err()
+    if syscall::mem_map(
+        ring_memory,
+        caps.self_aspace,
+        ring_va,
+        0,
+        ring_pages,
+        syscall::MAP_READONLY | syscall::MAP_WRITABLE,
+    )
+    .is_err()
     {
         std::os::seraph::log!("ring mem_map failed");
         syscall::thread_exit();
@@ -445,19 +441,15 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
         syscall::thread_exit();
     };
     let data_va = data_range.va_start();
-    // SAFETY: `data_va` is the page `reserve_pages` just reserved: unbacked VA no Rust
-    // object occupies.
-    let mapped = unsafe {
-        syscall::mem_map(
-            data_memory,
-            caps.self_aspace,
-            data_va,
-            0,
-            1,
-            syscall::MAP_READONLY | syscall::MAP_WRITABLE,
-        )
-    };
-    if mapped.is_err()
+    if syscall::mem_map(
+        data_memory,
+        caps.self_aspace,
+        data_va,
+        0,
+        1,
+        syscall::MAP_READONLY | syscall::MAP_WRITABLE,
+    )
+    .is_err()
     {
         std::os::seraph::log!("data mem_map failed");
         syscall::thread_exit();

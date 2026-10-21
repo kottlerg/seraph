@@ -86,10 +86,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Map the page read-only. MAP_READ forces R-- regardless of the Memory cap's
     // rights, so the child caches a narrow entry the widen can later broaden.
-    // SAFETY: `WIDEN_VA` is a fixed ktest test VA outside the harness image, stacks,
-    // and InitInfo page, unmapped before this cell; the child reaches it only through
-    // a raw pointer.
-    if unsafe { mem_map(memory_cap, ctx.aspace_cap, WIDEN_VA, 0, 1, MAP_READ) }.is_err()
+    if mem_map(memory_cap, ctx.aspace_cap, WIDEN_VA, 0, 1, MAP_READ).is_err()
     {
         // SAFETY: memory_cap is from the pool and was never mapped.
         unsafe { crate::frame_pool::free(memory_cap) };
@@ -121,18 +118,14 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Widen R-- → RW-. Same Memory cap, strictly broader rights ⇒ MapOutcome::Widen ⇒
     // the kernel elides the remote shootdown, leaving CPU 1's stale entry live.
-    // SAFETY: the child reaches the page only through a raw pointer, so no reference into
-    // it is live; the widen only broadens access.
-    let widened = unsafe {
-        mem_protect(
-            memory_cap,
-            ctx.aspace_cap,
-            WIDEN_VA,
-            1,
-            MAP_READ | MAP_WRITABLE,
-        )
-    };
-    if widened.is_err()
+    if mem_protect(
+        memory_cap,
+        ctx.aspace_cap,
+        WIDEN_VA,
+        1,
+        MAP_READ | MAP_WRITABLE,
+    )
+    .is_err()
     {
         cleanup(ctx, Some(&child), memory_cap);
         return Err("integration::tlb_widen_retry: mem_protect widen failed");
@@ -228,9 +221,7 @@ fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, memory
         cap_delete(child.th).ok();
         cap_delete(child.cs).ok();
     }
-    // SAFETY: the child reached the page only through a raw pointer and is
-    // deleted (or never started); no reference into it exists.
-    unsafe { mem_unmap(ctx.aspace_cap, WIDEN_VA, 1) }.ok();
+    mem_unmap(ctx.aspace_cap, WIDEN_VA, 1).ok();
     // SAFETY: the page is now unmapped, so the cap is free to return.
     unsafe { crate::frame_pool::free(memory_cap) };
 }

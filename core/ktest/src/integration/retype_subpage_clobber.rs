@@ -55,17 +55,12 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Map the cap region's first page writable and clobber the freed slot's
     // link cell (offset 0) exactly as an aliasing writer would, then unmap.
-    // SAFETY: `CLOBBER_VA` is a fixed ktest test VA outside the harness image,
-    // stacks, and InitInfo page, unmapped before this cell; it is written only
-    // through the raw volatile store below.
-    unsafe { mem_map(memory_cap, ctx.aspace_cap, CLOBBER_VA, 0, 1, MAP_WRITABLE) }
+    mem_map(memory_cap, ctx.aspace_cap, CLOBBER_VA, 0, 1, MAP_WRITABLE)
         .map_err(|_| "integration::retype_subpage_clobber: mem_map failed")?;
     // SAFETY: CLOBBER_VA..+8 is mapped writable just above and exclusively
     // owned by this thread for the duration of the write.
     unsafe { core::ptr::write_volatile(CLOBBER_VA as *mut u64, POISON) };
-    // SAFETY: the page was written only through a raw volatile store; no reference
-    // into it exists.
-    unsafe { mem_unmap(ctx.aspace_cap, CLOBBER_VA, 1) }
+    mem_unmap(ctx.aspace_cap, CLOBBER_VA, 1)
         .map_err(|_| "integration::retype_subpage_clobber: mem_unmap failed")?;
 
     // Drive another sub-page retype. The allocator pops the valid head

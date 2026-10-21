@@ -432,11 +432,7 @@ fn call_peer(arg: u64) -> !
     let ep = arg as u32;
     // SAFETY: sole live user of PEER_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(PEER_IPC_BUF).cast::<u64>();
-    // SAFETY: PEER_IPC_BUF is a page-aligned page dedicated to the kernel
-    // while registered: only this thread uses it, and only through the raw
-    // `buf` the `ipc` wrappers take, so no Rust reference into it is live
-    // across an IPC syscall.
-    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
+    if ipc_buffer_set(buf as u64).is_err()
     {
         thread_exit()
     }
@@ -472,11 +468,7 @@ fn server_entry(arg: u64) -> !
     let ep = arg as u32;
     // SAFETY: sole live user of SERVER_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
-    // SAFETY: SERVER_IPC_BUF is a page-aligned page dedicated to the kernel
-    // while registered: only this thread uses it, and only through the raw
-    // `buf` the `ipc` wrappers take, so no Rust reference into it is live
-    // across an IPC syscall.
-    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
+    if ipc_buffer_set(buf as u64).is_err()
     {
         thread_exit()
     }

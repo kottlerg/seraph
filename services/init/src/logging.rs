@@ -245,13 +245,14 @@ pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, iop
     // derived child cap is needed.
     for i in 0..LOG_THREAD_STACK_PAGES
     {
-        let va = LOG_THREAD_STACK_VA + i * PAGE_SIZE;
-        // SAFETY: the log-thread stack range is init-private VA, disjoint from
-        // every other init mapping (constants above) and not yet mapped, so no
-        // Rust object occupies it.
-        let placed =
-            unsafe { arena.place_page(info.aspace_cap, va, syscall::MAP_WRITABLE, |_| {}) };
-        if placed.is_none()
+        if arena
+            .place_page(
+                info.aspace_cap,
+                LOG_THREAD_STACK_VA + i * PAGE_SIZE,
+                syscall::MAP_WRITABLE,
+                |_| {},
+            )
+            .is_none()
         {
             log("init: FATAL: cannot place log thread stack");
             syscall::thread_exit();
@@ -259,18 +260,14 @@ pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, iop
     }
 
     // Offset-map the log thread's IPC buffer (zeroed by `place_page`).
-    // SAFETY: LOG_THREAD_IPC_BUF_VA is init-private VA, disjoint from every other
-    // init mapping (constants above) and not yet mapped, so no Rust object
-    // occupies it.
-    let placed = unsafe {
-        arena.place_page(
+    if arena
+        .place_page(
             info.aspace_cap,
             LOG_THREAD_IPC_BUF_VA,
             syscall::MAP_WRITABLE,
             |_| {},
         )
-    };
-    if placed.is_none()
+        .is_none()
     {
         log("init: FATAL: cannot place log thread IPC buffer");
         syscall::thread_exit();
@@ -333,11 +330,7 @@ pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, iop
 extern "C" fn log_thread_entry(arg: u64) -> !
 {
     // Register this thread's IPC buffer.
-    // SAFETY: LOG_THREAD_IPC_BUF_VA was mapped by `spawn_log_thread` as this
-    // thread's dedicated IPC buffer page; the log loop reaches it only as the raw
-    // `ipc_buf` pointer the IPC wrappers take, so no Rust reference into it spans
-    // an IPC syscall.
-    if unsafe { syscall::ipc_buffer_set(LOG_THREAD_IPC_BUF_VA) }.is_err()
+    if syscall::ipc_buffer_set(LOG_THREAD_IPC_BUF_VA).is_err()
     {
         serial_log("init: log thread: ipc_buffer_set failed");
         syscall::thread_exit();

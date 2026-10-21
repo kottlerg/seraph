@@ -216,26 +216,21 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 
     for _ in 0..n
     {
-        // SAFETY: `BENCH_VA` is a fixed ktest bench VA outside the harness image, stacks, and
-        // InitInfo page, unmapped at loop top; no Rust code touches the page.
-        let mapped = unsafe {
-            syscall::mem_map(
-                memory_cap,
-                ctx.aspace_cap,
-                BENCH_VA,
-                0,
-                1,
-                syscall::MAP_WRITABLE,
-            )
-        };
-        if mapped.is_err()
+        if syscall::mem_map(
+            memory_cap,
+            ctx.aspace_cap,
+            BENCH_VA,
+            0,
+            1,
+            syscall::MAP_WRITABLE,
+        )
+        .is_err()
         {
             break;
         }
         // Measure the unmap — that's the path that issues the shootdown IPI.
         let t0 = cycles_now();
-        // SAFETY: no Rust code touches the bench page; nothing lives in it.
-        let _ = unsafe { syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1) };
+        let _ = syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1);
         let t1 = cycles_now();
         let delta = t1.saturating_sub(t0);
         if delta < min
@@ -424,10 +419,7 @@ fn conc_worker_entry(arg: u64) -> !
         // Time the map — a fresh map (the VA is unmapped at loop top), whose
         // remote shootdown the operation-class elision skips.
         let m0 = cycles_now();
-        // SAFETY: `va` is this worker's private slot in the fixed ktest bench band
-        // at `CONC_VA_BASE`, outside the harness image, stacks, and InitInfo page,
-        // unmapped at loop top; no Rust code touches the page.
-        let mr = unsafe { syscall::mem_map(memory, aspace, va, 0, 1, syscall::MAP_WRITABLE) };
+        let mr = syscall::mem_map(memory, aspace, va, 0, 1, syscall::MAP_WRITABLE);
         let m1 = cycles_now();
         if mr.is_err()
         {
@@ -437,8 +429,7 @@ fn conc_worker_entry(arg: u64) -> !
         conc_map_fold(m1.saturating_sub(m0));
         // Time the unmap — the path that issues the shootdown IPI volley.
         let t0 = cycles_now();
-        // SAFETY: no Rust code touches the bench page; nothing lives in it.
-        let r = unsafe { syscall::mem_unmap(aspace, va, 1) };
+        let r = syscall::mem_unmap(aspace, va, 1);
         let t1 = cycles_now();
         if r.is_err()
         {
@@ -608,8 +599,7 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         // cast_possible_truncation: i < allocated ≤ MAX_PINNED.
         #[allow(clippy::cast_possible_truncation)]
         let va = CONC_VA_BASE + (i as u64) * CONC_VA_STRIDE;
-        // SAFETY: `va` is worker `i`'s bench slot, which no Rust code touches.
-        let _ = unsafe { syscall::mem_unmap(ctx.aspace_cap, va, 1) };
+        let _ = syscall::mem_unmap(ctx.aspace_cap, va, 1);
         // SAFETY: frame is from the pool and now unmapped (above).
         unsafe { crate::frame_pool::free(*fr) };
     }

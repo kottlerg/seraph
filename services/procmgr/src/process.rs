@@ -66,7 +66,7 @@ fn next_process_badge() -> Option<u64>
 fn draw_layout_entropy() -> Option<[u8; process_layout::LAYOUT_ENTROPY_BYTES]>
 {
     let mut entropy = [0_u8; process_layout::LAYOUT_ENTROPY_BYTES];
-    let n = syscall::getrandom(&mut entropy).ok()?;
+    let n = syscall::getrandom(entropy.as_mut_ptr(), entropy.len()).ok()?;
     (n == entropy.len() as u64).then_some(entropy)
 }
 
@@ -811,9 +811,7 @@ fn populate_child_info(
     drop(scratch);
 
     let pi_ro = syscall::cap_derive(pi_memory, syscall::RIGHTS_MEM_MAP).ok()?;
-    // SAFETY: `child_aspace` is the not-yet-started child's `AddressSpace`, not
-    // procmgr's own, so the map places nothing over procmgr's memory.
-    unsafe { syscall::mem_map(pi_ro, child_aspace, layout.process_info_va, 0, 1, 0) }.ok()?;
+    syscall::mem_map(pi_ro, child_aspace, layout.process_info_va, 0, 1, 0).ok()?;
     // pi_memory stays in procmgr's CSpace as the teardown handle (revoke
     // cascades to any descendants); the mapping doesn't need pi_ro to
     // outlive this call.
@@ -905,9 +903,7 @@ fn finalize_main_tls(alloc: MainTlsAlloc, _self_aspace: u32, child_aspace: u32) 
     drop(alloc.scratch);
 
     let tls_rw = syscall::cap_derive(alloc.memory_cap, syscall::RIGHTS_MEM_MAP_RW).ok()?;
-    // SAFETY: `child_aspace` is the not-yet-started child's `AddressSpace`, not
-    // procmgr's own, so the map places nothing over procmgr's memory.
-    unsafe { syscall::mem_map(tls_rw, child_aspace, alloc.tls_block_base, 0, 1, 0) }.ok()?;
+    syscall::mem_map(tls_rw, child_aspace, alloc.tls_block_base, 0, 1, 0).ok()?;
     // alloc.memory_cap stays as the teardown handle; tls_rw is transient.
     let _ = syscall::cap_delete(tls_rw);
 
@@ -1049,18 +1045,14 @@ fn map_child_stack_and_ipc(
     {
         let memory_cap = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
         let rw = syscall::cap_derive(memory_cap, syscall::RIGHTS_MEM_MAP_RW).ok()?;
-        // SAFETY: `child_aspace` is the not-yet-started child's `AddressSpace`,
-        // not procmgr's own, so the map places nothing over procmgr's memory.
-        unsafe {
-            syscall::mem_map(
-                rw,
-                child_aspace,
-                stack_base + u64::from(i) * PAGE_SIZE,
-                0,
-                1,
-                0,
-            )
-        }
+        syscall::mem_map(
+            rw,
+            child_aspace,
+            stack_base + u64::from(i) * PAGE_SIZE,
+            0,
+            1,
+            0,
+        )
         .ok()?;
         // Drop procmgr's transient slots; mapping owns no cap-refcount and
         // memmgr's outer pins the memory cap until PROCESS_DIED.
@@ -1070,9 +1062,7 @@ fn map_child_stack_and_ipc(
 
     let ipc_memory = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
     let ipc_rw = syscall::cap_derive(ipc_memory, syscall::RIGHTS_MEM_MAP_RW).ok()?;
-    // SAFETY: `child_aspace` is the not-yet-started child's `AddressSpace`, not
-    // procmgr's own, so the map places nothing over procmgr's memory.
-    unsafe { syscall::mem_map(ipc_rw, child_aspace, layout.ipc_buffer_va, 0, 1, 0) }.ok()?;
+    syscall::mem_map(ipc_rw, child_aspace, layout.ipc_buffer_va, 0, 1, 0).ok()?;
     let _ = syscall::cap_delete(ipc_rw);
     let _ = syscall::cap_delete(ipc_memory);
 

@@ -892,9 +892,7 @@ fn write_memory_chunks(
         io::Error::other("seraph fs: reserve_pages failed for write frame")
     })?;
     let va = range.va_start();
-    // SAFETY: `va` is the page `reserve_pages` just reserved: unbacked VA no Rust
-    // object occupies.
-    if unsafe { syscall::mem_map(memory_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE) }.is_err()
+    if syscall::mem_map(memory_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
     {
         crate::sys::reserve::unreserve_pages(range);
         let _ = syscall::cap_delete(memory_cap);
@@ -947,9 +945,7 @@ fn write_memory_chunks(
     })();
 
     // Tear down regardless of result.
-    // SAFETY: the frame at `va` is private to this call and was written only
-    // through a raw pointer; no reference into it is live.
-    let _ = unsafe { syscall::mem_unmap(aspace, va, 1) };
+    let _ = syscall::mem_unmap(aspace, va, 1);
     let _ = syscall::cap_delete(memory_cap);
     crate::sys::reserve::unreserve_pages(range);
 
@@ -1408,11 +1404,7 @@ impl File
             }
         };
         let va = range.va_start();
-        // SAFETY: `va` is the page `reserve_pages` just reserved: unbacked VA no
-        // Rust object occupies.
-        let mapped =
-            unsafe { syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READONLY) };
-        if mapped.is_err()
+        if syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READONLY).is_err()
         {
             crate::sys::reserve::unreserve_pages(range);
             let _ = syscall::cap_delete(memory_cap);
@@ -1423,30 +1415,26 @@ impl File
         // Register the mapping with the release handler before exposing
         // it to the local copy: a forced release racing in must observe
         // the entry so it can clean up if it wins. Local cleanup below
-        // wins via take_mapping if we ack first. The copy runs under the
-        // entry's mapping lock, so a racing release cannot unmap the page
-        // while `src` borrows it.
-        let copy_len = bytes_valid.min(buf.len());
-        release_handler::add_mapping_then(
+        // wins via take_mapping if we ack first.
+        release_handler::add_mapping(
             self.entry.as_ref(),
             OutstandingMapping {
                 cookie,
                 range,
                 memory_cap,
             },
-            || {
-                // SAFETY: VA is mapped read-only for one page and stays mapped
-                // while this closure runs (`add_mapping_then`); the fs invariant
-                // is `memory_data_offset + bytes_valid <= PAGE_SIZE`.
-                let src = unsafe {
-                    core::slice::from_raw_parts(
-                        (va + memory_data_offset as u64) as *const u8,
-                        bytes_valid,
-                    )
-                };
-                buf[..copy_len].copy_from_slice(&src[..copy_len]);
-            },
         );
+
+        let copy_len = bytes_valid.min(buf.len());
+        // SAFETY: VA is mapped read-only for one page; the fs invariant
+        // is `memory_data_offset + bytes_valid <= PAGE_SIZE`.
+        let src = unsafe {
+            core::slice::from_raw_parts(
+                (va + memory_data_offset as u64) as *const u8,
+                bytes_valid,
+            )
+        };
+        buf[..copy_len].copy_from_slice(&src[..copy_len]);
         self.pos.fetch_add(copy_len as u64, Ordering::Relaxed);
 
         // Proactive release: synchronous FS_RELEASE_MEMORY on the file
@@ -1632,13 +1620,11 @@ impl Drop for File
             {
                 for m in release_handler::drain_mappings(entry.as_ref())
                 {
-                    // SAFETY: drop holds `&mut self`, so no `File::read` borrow
-                    // of a mapped page is live, and the handler thread can no
-                    // longer take `m` (drained and unregistered above). The range
-                    // is reserved VA private to this mapping.
-                    let _ = unsafe {
-                        syscall::mem_unmap(self.aspace, m.range.va_start(), m.range.page_count())
-                    };
+                    let _ = syscall::mem_unmap(
+                        self.aspace,
+                        m.range.va_start(),
+                        m.range.page_count(),
+                    );
                     let _ = syscall::cap_delete(m.memory_cap);
                     crate::sys::reserve::unreserve_pages(m.range);
                 }

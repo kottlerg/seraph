@@ -76,10 +76,12 @@
 //! non-zero `stopped_in_drain`). Its failure modes are an A that never loops
 //! again, a B that never progresses, and an unaccepted result. It cannot
 //! itself observe a resumed drain that reads a freed TCB and exits: without
-//! the re-check, the drain re-reads `current == target && state == Stopped`
-//! through the stale pointer, which is false for a freed or reused TCB, so
-//! the drain exits anyway, and the TCB's magic word is not cleared on free,
-//! so no assertion catches the stale read.
+//! the re-check, the drain re-reads the target's state through the stale
+//! pointer and finds the `Exited` mark the target's dealloc wrote before the
+//! free, or, once the delete phase's respawn has reused the TCB, the fresh
+//! target's state; either ends the drain unless the reused TCB holds a
+//! `Stopped` thread still switching out, and no assertion catches the stale
+//! read, because the TCB's magic word is not cleared on free.
 //!
 //! Needs **≥ 3 CPUs**.
 

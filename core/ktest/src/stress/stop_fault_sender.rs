@@ -694,9 +694,7 @@ fn faulter_died(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally, reason:
     }
     tally.killed += 1;
     call_handler(parts, SYNC_LABEL)?;
-    // SAFETY: `RESERVED_VA` lies outside every Rust object, stack, and IPC buffer page in ktest's
-    // address space; the page there is reached only through the dead faulter's raw pointer.
-    unsafe { mem_unmap(ctx.aspace_cap, RESERVED_VA, 1) }
+    mem_unmap(ctx.aspace_cap, RESERVED_VA, 1)
         .map_err(|_| "stress::stop_fault_sender: unmap after a death failed")?;
     if let Some(th) = parts.faulter.take()
     {
@@ -823,10 +821,7 @@ fn release(ctx: &TestContext, parts: &Parts) -> TestResult
     {
         ok &= cap_delete(th).is_ok();
     }
-    // SAFETY: `RESERVED_VA` lies outside every Rust object, stack, and IPC buffer page in ktest's
-    // address space; the page there is reached only through the faulter's raw pointer, and the
-    // faulter is deleted above.
-    let unmapped = unsafe { mem_unmap(ctx.aspace_cap, RESERVED_VA, 1) }.is_ok();
+    let unmapped = mem_unmap(ctx.aspace_cap, RESERVED_VA, 1).is_ok();
     ok &= unmapped;
     if let Some(frame) = parts.frame.filter(|_| unmapped)
     {
@@ -865,10 +860,7 @@ fn faulter_entry(arg: u64) -> !
         unsafe {
             page.write_volatile(u64::from(attempt));
         }
-        // SAFETY: `RESERVED_VA` lies outside every Rust object, stack, and IPC buffer page in
-        // this address space; the store above reached the page only through a raw pointer, and
-        // no reference into it is held.
-        if let Err(e) = unsafe { mem_unmap(aspace, RESERVED_VA, 1) }
+        if let Err(e) = mem_unmap(aspace, RESERVED_VA, 1)
         {
             UNMAP_FAILED.record_error(e);
         }
@@ -889,11 +881,7 @@ fn handler_entry(arg: u64) -> !
     // SAFETY: sole user of HANDLER_IPC_BUF (one handler per test; stress
     // tests run sequentially).
     let buf = core::ptr::addr_of_mut!(HANDLER_IPC_BUF).cast::<u64>();
-    // SAFETY: HANDLER_IPC_BUF is a page-aligned page dedicated to the kernel
-    // while registered: only this thread uses it, and only through the raw
-    // `buf` the `ipc` wrappers take, so no Rust reference into it is live
-    // across an IPC syscall.
-    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
+    if ipc_buffer_set(buf as u64).is_err()
     {
         thread_exit()
     }
@@ -971,9 +959,7 @@ fn handler_entry(arg: u64) -> !
 /// and the fault declined, so the faulter does not re-fault for good.
 fn service_fault(args: &HandlerArgs, buf: *mut u64)
 {
-    // SAFETY: `RESERVED_VA` lies outside every Rust object, stack, and allocation in ktest's
-    // address space; the page mapped there is reached only through the faulter's raw pointer.
-    let mapped = unsafe { mem_map(args.frame, args.aspace, RESERVED_VA, 0, 1, MAP_WRITABLE) };
+    let mapped = mem_map(args.frame, args.aspace, RESERVED_VA, 0, 1, MAP_WRITABLE);
     let disposition = match mapped
     {
         Ok(()) => FAULT_REPLY_RESUME,
@@ -1014,11 +1000,7 @@ fn syncer_entry(arg: u64) -> !
     // SAFETY: sole user of SYNCER_IPC_BUF (one syncer per test; stress tests
     // run sequentially).
     let buf = core::ptr::addr_of_mut!(SYNCER_IPC_BUF).cast::<u64>();
-    // SAFETY: SYNCER_IPC_BUF is a page-aligned page dedicated to the kernel
-    // while registered: only this thread uses it, and only through the raw
-    // `buf` the `ipc` wrappers take, so no Rust reference into it is live
-    // across an IPC syscall.
-    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
+    if ipc_buffer_set(buf as u64).is_err()
     {
         thread_exit()
     }

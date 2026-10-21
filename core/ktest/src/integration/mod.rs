@@ -19,6 +19,8 @@
 //!
 //! Files:
 //! - `thread_lifecycle.rs`       — full thread lifecycle end-to-end
+//! - `stop_read_regs_remote.rs` — a thread stopped while running on another CPU has its registers
+//!   read and rewritten as soon as the stop returns
 //! - `cap_transfer.rs`           — capability rights through an IPC endpoint round-trip
 //! - `cap_transfer_large.rs`     — IPC transfer of a cap with a multi-batch child list
 //! - `wait_concurrency.rs`       — wait set with simultaneous notification and queue sources
@@ -86,6 +88,7 @@ pub mod reply_binding_displaced;
 pub mod retype_reclaim;
 pub mod retype_subpage_clobber;
 pub mod shared_memory_two_aspaces;
+pub mod stop_read_regs_remote;
 pub mod thread_lifecycle;
 pub mod tlb_coherency;
 pub mod tlb_widen_retry;
@@ -103,6 +106,10 @@ use crate::run_integration_test;
 pub fn run_all(ctx: &TestContext)
 {
     run_integration_test!("integration::thread_lifecycle", thread_lifecycle::run(ctx));
+    run_integration_test!(
+        "integration::stop_read_regs_remote",
+        stop_read_regs_remote::run(ctx)
+    );
     run_integration_test!(
         "integration::death_notification_late_bind",
         death_notification_late_bind::run(ctx)

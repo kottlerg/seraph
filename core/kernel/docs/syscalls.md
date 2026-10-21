@@ -1175,11 +1175,11 @@ returns once that CPU has descheduled it and published its register save, at its
 or the thread's own park or yield, or once an object teardown has committed `Exited` over it; the
 inter-processor interrupt sent to that CPU only forces a trap. A caller that is itself stopped while
 it waits deschedules in place; once restarted it re-resolves `thread_cap`, and its call completes
-when the target has left its CPU, or at once when that slot no longer names the target with Control
-rights — the target may then still be executing, and `SYS_THREAD_READ_REGS` and
-`SYS_THREAD_WRITE_REGS` refuse it with `InvalidState` until it has left its CPU (see
-[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
-Protocol).
+when the target has left its CPU and published its register save, or at once when that slot no
+longer names the target with Control rights — the target may then still be executing, and
+`SYS_THREAD_READ_REGS` and `SYS_THREAD_WRITE_REGS` refuse it with `InvalidState` until it has left
+its CPU with its save published (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md)
+§ `sys_thread_stop` Cross-CPU Stop Protocol).
 
 **Capability requirement:** `thread_cap` must have Control rights.
 

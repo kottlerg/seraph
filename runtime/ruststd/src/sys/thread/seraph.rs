@@ -869,12 +869,7 @@ extern "C" fn thread_entry(arg: u64) -> ! {
     // SAFETY: arg was produced via `Box::into_raw(Box::new(SpawnArgs {..}))`
     // in Thread::new; this is the sole consumer.
     let args = unsafe { Box::from_raw(arg as *mut SpawnArgs) };
-    // SAFETY: `ipc_buffer_vaddr` is the page `Thread::new` allocated solely as
-    // this thread's IPC buffer and freed only by `reclaim` after the thread has
-    // left user mode; the runtime reaches it only as the raw `current_ipc_buf`
-    // pointer the IPC wrappers take, so no Rust reference into it spans an IPC
-    // syscall.
-    let _ = unsafe { syscall::ipc_buffer_set(args.ipc_buffer_vaddr) };
+    let _ = syscall::ipc_buffer_set(args.ipc_buffer_vaddr);
     crate::os::seraph::set_current_ipc_buf(args.ipc_buffer_vaddr as *mut u64);
 
     // SAFETY: args.init was produced via `Box::into_raw(init)` in

@@ -161,27 +161,25 @@ fn mapper_entry(arg: u64) -> !
 
     for _ in 0..MAP_ITERATIONS
     {
-        // SAFETY: `va` is this child's private slot in the fixed ktest stress band at
-        // `STRESS_MAP_BASE`, outside the harness image, stacks, and InitInfo page,
-        // unmapped at loop top; no Rust code dereferences it.
-        if unsafe { mem_map(memory_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE) }.is_err()
+        if mem_map(memory_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
         {
             // Send done_bit | error indicator (bit 32).
             notification_send(done_slot, done_bit | (1 << 32)).ok();
             thread_exit();
         }
 
-        // Verify the mapping exists via aspace_query (non-destructive). The
-        // stress exercises only the map/unmap paths, so nothing writes through
-        // the new VA.
+        // Verify the mapping exists via aspace_query (non-destructive).
+        // We do NOT write through the new VA because pool frames are
+        // backed by ktest's BSS segment — the physical page is already
+        // mapped in BSS, so writing via the stress VA would corrupt
+        // ktest's own statics.
         if syscall::aspace_query(aspace, va).is_err()
         {
             notification_send(done_slot, done_bit | (1 << 32)).ok();
             thread_exit();
         }
 
-        // SAFETY: no Rust code dereferences `va`; nothing lives in the page.
-        if unsafe { mem_unmap(aspace, va, 1) }.is_err()
+        if mem_unmap(aspace, va, 1).is_err()
         {
             notification_send(done_slot, done_bit | (1 << 32)).ok();
             thread_exit();

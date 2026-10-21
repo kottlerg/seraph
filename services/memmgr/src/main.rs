@@ -250,15 +250,8 @@ fn arena_grow(pool: &mut FreePool) -> bool
     let (self_aspace, page_idx, arena_base) =
         unsafe { (ARENA_SELF_ASPACE, ARENA_PAGES, ARENA_BASE_VA) };
     let va = arena_base + u64::from(page_idx) * PAGE_SIZE;
-    let mapped = va < META_ARENA_CEILING && {
-        // SAFETY: `va` is the next unmapped page of memmgr's private arena
-        // window (`ARENA_PAGES` pages below it are mapped, and the ceiling
-        // check above precedes the map); the window lies below
-        // `META_ARENA_CEILING`, clear of every other mapping memmgr holds, so
-        // no Rust object occupies the page.
-        unsafe { syscall::mem_map(outer, self_aspace, va, 0, 1, MAP_READ | MAP_WRITABLE) }.is_ok()
-    };
-    if !mapped
+    if va >= META_ARENA_CEILING
+        || syscall::mem_map(outer, self_aspace, va, 0, 1, MAP_READ | MAP_WRITABLE).is_err()
     {
         // Return the unusable frame to the pool; it stays owned and counted.
         let _ = pool.push(FreeRun {
@@ -895,10 +888,7 @@ fn bootstrap_from_init(
     };
     let phys_table_cap = round.caps[1];
     let mut phys_bases = [0u64; BOOTSTRAP_MAX_MEMORY_CAPS];
-    // SAFETY: `phys_table_va` lies in memmgr's private phys-table scratch window
-    // (below the arena window, const-asserted above), mapped by nothing else, so
-    // no Rust object occupies it.
-    if unsafe { syscall::mem_map(phys_table_cap, self_aspace, phys_table_va, 0, 1, 0) }.is_err()
+    if syscall::mem_map(phys_table_cap, self_aspace, phys_table_va, 0, 1, 0).is_err()
     {
         return None;
     }
@@ -956,9 +946,7 @@ fn bootstrap_from_init(
         )
     };
 
-    // SAFETY: the scratch page was read only through raw `read_volatile`
-    // pointers, all finished above; no reference into it exists.
-    let _ = unsafe { syscall::mem_unmap(self_aspace, phys_table_va, 1) };
+    let _ = syscall::mem_unmap(self_aspace, phys_table_va, 1);
     let _ = syscall::cap_delete(phys_table_cap);
 
     Some(InitBootstrap {
@@ -1604,11 +1592,7 @@ fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
     // leaf PTE and reclaim the now-empty intermediate page tables to the child's
     // PT growth pool (one coarse shootdown). Done before re-pooling the backing
     // frames so no frame is re-handed to a future fault before its PTE clears.
-    // SAFETY: `aspace_cap` is the client's delegated `AddressSpace`
-    // (`DELEGATE_ASPACE`), never memmgr's own (0 when none was delegated, which
-    // the kernel rejects), so no memmgr memory lies in the span.
-    let _ =
-        unsafe { syscall::mem_unmap_reclaim(aspace_cap, region.va_base, region.len / PAGE_SIZE) };
+    let _ = syscall::mem_unmap_reclaim(aspace_cap, region.va_base, region.len / PAGE_SIZE);
     record.return_frames_in(region.va_base, end, pool);
     // Restore contiguity across the reclaimed runs. The per-frame
     // `push_or_coalesce` only fires `coalesce` under slot pressure, so a churn
@@ -1743,20 +1727,15 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     // directly (the kernel grants read at every map, and W^X is enforced); no
     // per-fault inner derivation is needed. The kernel holds the mapping
     // independently of the cap, which stays in memmgr as the reclaim anchor.
-    // SAFETY: `record.aspace_cap` is the faulting client's delegated
-    // `AddressSpace` (`DELEGATE_ASPACE`), never memmgr's own, so the map places
-    // nothing over memmgr's memory.
-    let mapped = unsafe {
-        syscall::mem_map(
-            outer,
-            record.aspace_cap,
-            chunk_base,
-            0,
-            u64::from(pages),
-            region.prot,
-        )
-    };
-    if mapped.is_err()
+    if syscall::mem_map(
+        outer,
+        record.aspace_cap,
+        chunk_base,
+        0,
+        u64::from(pages),
+        region.prot,
+    )
+    .is_err()
     {
         record.pop_frame();
         let _ = pool.push(FreeRun {
@@ -1954,11 +1933,7 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
 
 fn main(startup: &StartupInfo) -> !
 {
-    // SAFETY: init maps `ipc_buffer` as memmgr's dedicated IPC buffer page
-    // (`ProcessInfo::ipc_buffer_vaddr`); memmgr reaches it only as the raw
-    // `ipc_buf` pointer its handlers and the IPC wrappers take, so no Rust
-    // reference into it spans an IPC syscall.
-    if unsafe { syscall::ipc_buffer_set(startup.ipc_buffer as u64) }.is_err()
+    if syscall::ipc_buffer_set(startup.ipc_buffer as u64).is_err()
     {
         syscall::thread_exit();
     }

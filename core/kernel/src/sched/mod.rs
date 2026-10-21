@@ -2749,17 +2749,23 @@ unsafe fn start_ready_to_link(tcb: *mut ThreadControlBlock, cpu_count: usize) ->
 
 /// Run `access` on `tcb`'s register frame (`trap_frame`, possibly null) while
 /// the thread is held still, and return its result; `None`, without calling
-/// `access`, when the thread is not.
+/// `access`, when the thread is neither fault-blocked nor `Stopped`, or is
+/// `Stopped` but not yet settled.
 ///
-/// Held still means fault-blocked (`Blocked` with `BlockedOnFault`: the
-/// faulter does not touch its frame until a fault reply resumes it), or
-/// `Stopped`, `current` on no CPU, and with its last register save published
-/// (`context_saved`). A thread stopped while it runs on another CPU is
-/// `Stopped` from the stop's commit but executes, and may enter or leave the
-/// kernel through its frame, until that CPU deschedules it. `access` runs
-/// under `tcb`'s `sched_lock`, which every dispatch, start, and stop or exit
-/// commit takes, so the thread stays held still for its duration; `access`
-/// must therefore not fault or take another TCB's `sched_lock`.
+/// Held still means `current` on no CPU with the last register save
+/// published (`context_saved`), and either `Stopped` or fault-blocked
+/// (`Blocked` with `BlockedOnFault`). A thread stopped while it runs on
+/// another CPU is `Stopped` from the stop's commit but executes, and may
+/// enter or leave the kernel through its frame, until that CPU deschedules
+/// it; such a thread is refused. A fault-blocked thread is waited for
+/// instead: the fault protocol hands its frame to the bound handler, and a
+/// faulter that has committed its park is only finishing its switch out
+/// (whose save writes the frame on riscv64), so the wait is that switch's
+/// tail. The wait spins outside every lock with interrupts enabled, and the
+/// state is re-checked under the lock. `access` runs under `tcb`'s
+/// `sched_lock`, which every dispatch, start, and stop or exit commit takes,
+/// so the thread stays held still for its duration; `access` must therefore
+/// not fault or take another TCB's `sched_lock`.
 ///
 /// # Safety
 /// `tcb` must be valid, and the caller must hold no scheduler lock and no
@@ -2771,22 +2777,37 @@ pub unsafe fn with_held_frame<R>(
 ) -> Option<R>
 {
     use core::sync::atomic::Ordering;
-    let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
-    // SAFETY: tcb valid per contract; lock_raw paired with the unlock below.
-    let saved = unsafe { (*tcb).sched_lock.lock_raw() };
-    // SAFETY: state and ipc_state are written under the held sched_lock.
-    let (state, ipc_state) = unsafe { ((*tcb).state, (*tcb).ipc_state) };
-    let held = match state
+
+    /// What a locked look at the thread decided.
+    enum Look
     {
-        thread::ThreadState::Blocked => ipc_state == thread::IpcThreadState::BlockedOnFault,
-        thread::ThreadState::Stopped =>
+        /// Held still: run the access.
+        Held,
+        /// Fault-blocked but still switching out: wait and look again.
+        Settling,
+        /// Not accessible.
+        Refused,
+    }
+
+    let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    let mut waiting: Option<u64> = None;
+    let mut access = Some(access);
+    let result = loop
+    {
+        // SAFETY: tcb valid per contract; lock_raw paired with the unlock below.
+        let saved = unsafe { (*tcb).sched_lock.lock_raw() };
+        // SAFETY: state and ipc_state are written under the held sched_lock.
+        let (state, ipc_state) = unsafe { ((*tcb).state, (*tcb).ipc_state) };
+        let fault_blocked = state == thread::ThreadState::Blocked
+            && ipc_state == thread::IpcThreadState::BlockedOnFault;
+        let look = if state == thread::ThreadState::Stopped || fault_blocked
         {
-            // A Stopped thread cannot become `current` while this sched_lock
-            // is held (dispatch takes it), so one pass over the CPUs, each
-            // read under that CPU's lock, sees every CPU it can still be on.
+            // Neither state can become `current` while this sched_lock is
+            // held (dispatch takes it), so one pass over the CPUs, each read
+            // under that CPU's lock, sees every CPU it can still be on.
             let off_cpu = (0..cpu_count).all(|cpu| {
-                // SAFETY: cpu < cpu_count; scheduler slab initialised by init();
-                // lock_raw paired with unlock_raw.
+                // SAFETY: cpu < cpu_count; scheduler slab initialised by
+                // init(); lock_raw paired with unlock_raw.
                 unsafe {
                     let s = scheduler_for(cpu);
                     let f = s.lock.lock_raw();
@@ -2797,15 +2818,61 @@ pub unsafe fn with_held_frame<R>(
             });
             // SAFETY: context_saved is an atomic; Acquire pairs with the
             // Release that publishes the switch-out save.
-            off_cpu && unsafe { (*tcb).context_saved.load(Ordering::Acquire) } != 0
+            let saved_regs = unsafe { (*tcb).context_saved.load(Ordering::Acquire) } != 0;
+            if off_cpu && saved_regs
+            {
+                Look::Held
+            }
+            else if fault_blocked
+            {
+                Look::Settling
+            }
+            else
+            {
+                Look::Refused
+            }
         }
-        _ => false,
+        else
+        {
+            Look::Refused
+        };
+        let done = match look
+        {
+            Look::Held =>
+            {
+                let run = access.take();
+                // SAFETY: trap_frame is read under the held sched_lock; access
+                // is the caller's.
+                let frame = unsafe { (*tcb).trap_frame }.cast::<u8>();
+                Some(run.map(|f| f(frame)))
+            }
+            Look::Refused => Some(None),
+            Look::Settling => None,
+        };
+        // SAFETY: paired with the lock_raw above.
+        unsafe { (*tcb).sched_lock.unlock_raw(saved) };
+        if let Some(r) = done
+        {
+            break r;
+        }
+        if waiting.is_none()
+        {
+            // Spin with interrupts enabled and preemption disabled, as the stop
+            // drain does, so an inbound TLB-shootdown IPI is still acknowledged.
+            crate::percpu::preempt_disable();
+            // SAFETY: ring 0; restored after the loop.
+            waiting = Some(unsafe { crate::arch::current::cpu::save_and_disable_interrupts() });
+            // SAFETY: ring 0; IDT loaded; preempt disabled.
+            unsafe { crate::arch::current::interrupts::enable() };
+        }
+        core::hint::spin_loop();
     };
-    // SAFETY: trap_frame is read under the held sched_lock; access is the
-    // caller's.
-    let result = held.then(|| access(unsafe { (*tcb).trap_frame }.cast::<u8>()));
-    // SAFETY: paired with the lock_raw above.
-    unsafe { (*tcb).sched_lock.unlock_raw(saved) };
+    if let Some(saved_int) = waiting
+    {
+        // SAFETY: saved_int from save_and_disable_interrupts above.
+        unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+        crate::percpu::preempt_enable();
+    }
     result
 }
 

@@ -76,7 +76,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── Step 5: Read registers — verify IP is non-zero. ───────────────────────
     let mut reg_buf = [0u8; BUF];
-    thread_read_regs(child.th, &mut reg_buf)
+    thread_read_regs(child.th, reg_buf.as_mut_ptr(), BUF)
         .map_err(|_| "integration::thread_lifecycle: thread_read_regs failed")?;
 
     let ip = u64::from_le_bytes(
@@ -95,7 +95,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     PHASE2_SIG.store(child_ready, Ordering::Release);
     let phase2_ptr = phase2_entry as *const () as u64;
     reg_buf[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&phase2_ptr.to_le_bytes());
-    thread_write_regs(child.th, &reg_buf)
+    thread_write_regs(child.th, reg_buf.as_ptr(), BUF)
         .map_err(|_| "integration::thread_lifecycle: thread_write_regs failed")?;
 
     // ── Step 7: Resume — child lands in phase2_entry and sends 0x2. ──────────

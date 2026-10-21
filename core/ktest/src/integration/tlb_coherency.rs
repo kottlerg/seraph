@@ -127,19 +127,14 @@ pub fn run(ctx: &TestContext) -> TestResult
         let reclaim = phase == 1;
         for cycle in 0..CYCLES
         {
-            // SAFETY: `TEST_VA` is a fixed ktest test VA outside the harness image,
-            // stacks, and InitInfo page, unmapped at the end of every cycle; both
-            // threads reach it only through raw volatile accesses.
-            unsafe {
-                mem_map(
-                    memory_cap,
-                    ctx.aspace_cap,
-                    TEST_VA,
-                    0,
-                    1,
-                    syscall::MAP_WRITABLE,
-                )
-            }
+            mem_map(
+                memory_cap,
+                ctx.aspace_cap,
+                TEST_VA,
+                0,
+                1,
+                syscall::MAP_WRITABLE,
+            )
             .map_err(|_| "integration::tlb_coherency: mem_map failed")?;
 
             // Stamp the freshly mapped frame so the child can validate the
@@ -164,18 +159,14 @@ pub fn run(ctx: &TestContext) -> TestResult
             }
 
             // Unmap. Phase 1 also reclaims the now-empty intermediate PT.
-            // Both threads reach the page only through raw volatile accesses, so
-            // no reference into it is live at either unmap.
             if reclaim
             {
-                // SAFETY: see above.
-                unsafe { mem_unmap_reclaim(ctx.aspace_cap, TEST_VA, 1) }
+                mem_unmap_reclaim(ctx.aspace_cap, TEST_VA, 1)
                     .map_err(|_| "integration::tlb_coherency: mem_unmap_reclaim failed")?;
             }
             else
             {
-                // SAFETY: see above.
-                unsafe { mem_unmap(ctx.aspace_cap, TEST_VA, 1) }
+                mem_unmap(ctx.aspace_cap, TEST_VA, 1)
                     .map_err(|_| "integration::tlb_coherency: mem_unmap failed")?;
             }
 

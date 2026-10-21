@@ -397,9 +397,7 @@ fn recv_entry(arg: u64) -> !
     let (ep, done) = unpack(arg);
     // SAFETY: sole live user of CHILD_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(CHILD_IPC_BUF).cast::<u64>();
-    // SAFETY: `buf` points at a page-aligned static dedicated to this thread's IPC buffer; no Rust
-    // reference into it is ever taken, so the kernel's IPC writes alias no Rust data.
-    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
+    if ipc_buffer_set(buf as u64).is_err()
     {
         thread_exit()
     }

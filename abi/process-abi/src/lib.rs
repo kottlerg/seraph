@@ -561,8 +561,8 @@ pub struct StartupInfo
     pub procmgr_endpoint: u32,
 
     /// `CSpace` slot of a badged SEND cap on memmgr's service endpoint,
-    /// copied from [`ProcessInfo::memmgr_endpoint_cap`]. Zero when
-    /// unreachable (memmgr itself, init, or earlier in the boot chain).
+    /// copied from [`ProcessInfo::memmgr_endpoint_cap`]. Zero for memmgr,
+    /// this type's only constructor, which holds no SEND on its own endpoint.
     pub memmgr_endpoint: u32,
 
     /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, the

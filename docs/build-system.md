@@ -320,7 +320,8 @@ truth; the supervisor paging extensions (Svpbmt, Svinval, Svnapot) are required 
 kernel, whose paging subsystem refuses CPUs that lack them during boot, before the first
 userspace mapping (see [platform-requirements.md](platform-requirements.md)). The named
 `-cpu rva23s64` model (QEMU ≥ 9.1, 2024-09), a superset that adds the remaining RVA23
-mandates, is a documented configuration alternative when the CI runner floor supports it.
+mandates, is a documented configuration alternative; the explicit string stays the default
+because it also runs on the QEMU 8.0 minimum.
 
 ---
 

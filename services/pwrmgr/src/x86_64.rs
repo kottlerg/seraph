@@ -200,28 +200,21 @@ where
     let pages = pages_for(view.region_base, view.region_size);
     let range = reserve_pages(pages).ok()?;
     let map_vaddr = range.va_start();
-    // SAFETY: `map_vaddr` is the range `reserve_pages` just reserved: unbacked VA
-    // no Rust object occupies.
-    let mapped = unsafe {
-        syscall::mem_map(
-            view.memory_cap,
-            self_aspace,
-            map_vaddr,
-            0,
-            pages,
-            MAP_READONLY,
-        )
-    };
+    let mapped = syscall::mem_map(
+        view.memory_cap,
+        self_aspace,
+        map_vaddr,
+        0,
+        pages,
+        MAP_READONLY,
+    );
     let out = if mapped.is_ok()
     {
         // The memory cap maps from the page containing `region_base`; the table
         // sits at `table_phys` within it.
         let table_vaddr = map_vaddr + (view.table_phys - (view.region_base & !0xFFF));
         let r = f(table_vaddr);
-        // SAFETY: `f` has returned; every caller reads the table only through raw
-        // reads of `table_vaddr` and returns owned values, so no reference into
-        // the span is live.
-        let _ = unsafe { syscall::mem_unmap(self_aspace, map_vaddr, pages) };
+        let _ = syscall::mem_unmap(self_aspace, map_vaddr, pages);
         r
     }
     else

@@ -1169,20 +1169,15 @@ fn handle_write_memory_node_cap(
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     };
-    // SAFETY: `va` is fat's private `FS_WRITE_MEMORY` scratch page (`write_memory_va`),
-    // reserved VA mapped only by this handler, which the single dispatch thread runs
-    // and which unmaps it before returning, so no Rust object occupies it.
-    let mapped = unsafe {
-        syscall::mem_map(
-            restricted_cap,
-            self_aspace,
-            va,
-            0,
-            1,
-            syscall_abi::MAP_READONLY,
-        )
-    };
-    if mapped.is_err()
+    if syscall::mem_map(
+        restricted_cap,
+        self_aspace,
+        va,
+        0,
+        1,
+        syscall_abi::MAP_READONLY,
+    )
+    .is_err()
     {
         let _ = syscall::cap_delete(restricted_cap);
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
@@ -1202,9 +1197,7 @@ fn handle_write_memory_node_cap(
             byte_count,
         );
     }
-    // SAFETY: the page was read only through the raw copy above; no reference
-    // into it exists.
-    let _ = unsafe { syscall::mem_unmap(self_aspace, va, 1) };
+    let _ = syscall::mem_unmap(self_aspace, va, 1);
     // Drop the rights-restricted sub-cap we derived to satisfy W^X
     // at mem_map. The original src_cap is unaffected and returns to
     // the caller in the reply.

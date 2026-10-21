@@ -134,10 +134,7 @@ fn install_stub(
 {
     let frame =
         crate::frame_pool::alloc().ok_or("retype::stub: frame_pool::alloc returned None")?;
-    // SAFETY: `STUB_SCRATCH_VA` is a fixed ktest test VA outside the harness image,
-    // stacks, and InitInfo page, unmapped between uses; it is written only through
-    // raw volatile stores below.
-    unsafe { mem_map(frame, ctx.aspace_cap, STUB_SCRATCH_VA, 0, 1, MAP_WRITABLE) }
+    mem_map(frame, ctx.aspace_cap, STUB_SCRATCH_VA, 0, 1, MAP_WRITABLE)
         .map_err(|_| "retype::stub: scratch mem_map failed")?;
     let mut bytes = [0u8; 32];
     let len = emit(&mut bytes);
@@ -146,13 +143,9 @@ fn install_stub(
         // SAFETY: STUB_SCRATCH_VA..+PAGE is mapped writable just above; i < 32.
         unsafe { (STUB_SCRATCH_VA as *mut u8).add(i).write_volatile(*b) };
     }
-    // SAFETY: the scratch page was written only through raw volatile stores; no
-    // reference into it exists.
-    unsafe { mem_unmap(ctx.aspace_cap, STUB_SCRATCH_VA, 1) }
+    mem_unmap(ctx.aspace_cap, STUB_SCRATCH_VA, 1)
         .map_err(|_| "retype::stub: scratch mem_unmap failed")?;
-    // SAFETY: `aspace` is the stub's freshly minted address space (both callers
-    // create it with `cap_create_aspace`), not ktest's own.
-    unsafe { mem_map(frame, aspace, STUB_VA, 0, 1, MAP_EXECUTABLE) }
+    mem_map(frame, aspace, STUB_VA, 0, 1, MAP_EXECUTABLE)
         .map_err(|_| "retype::stub: executable mem_map failed")?;
     Ok(frame)
 }
@@ -408,8 +401,7 @@ pub fn pt_budget_exhaustion_returns_oom(ctx: &TestContext) -> TestResult
     for i in 0..16u64
     {
         let va = TEST_VA_BASE + i * 0x4000_0000; // 1 GiB stride
-        // SAFETY: `aspace` is a freshly minted address space, not ktest's own.
-        match unsafe { mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE) }
+        match mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE)
         {
             Ok(()) =>
             {}
@@ -449,8 +441,7 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
     for i in 0..mappings
     {
         let va = TEST_VA_BASE + i as u64 * stride;
-        // SAFETY: `aspace` is a freshly minted address space, not ktest's own.
-        if unsafe { mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE) }.is_err()
+        if mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE).is_err()
         {
             cap_delete(aspace).ok();
             return Err("retype::deep_pt: mem_map failed despite ample budget");
@@ -461,8 +452,7 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
     for i in 0..mappings
     {
         let va = TEST_VA_BASE + i as u64 * stride;
-        // SAFETY: `aspace` is a freshly minted address space, not ktest's own.
-        unsafe { mem_unmap(aspace, va, 1) }.ok();
+        mem_unmap(aspace, va, 1).ok();
     }
 
     cap_delete(aspace).ok();
@@ -490,8 +480,7 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
 
     // Map one page at a fresh 2 MiB-aligned VA: allocates the full intermediate
     // chain (3 pages) from the pool.
-    // SAFETY: `aspace` is a freshly minted address space, not ktest's own.
-    if unsafe { mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE) }.is_err()
+    if mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE).is_err()
     {
         cap_delete(aspace).ok();
         return Err("retype::region_reclaim: initial mem_map failed");
@@ -506,8 +495,7 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
 
     // Reclaiming unmap: clears the leaf, empties PT→PD→PDPT, returns all three
     // to the pool and credits the budget.
-    // SAFETY: `aspace` is a freshly minted address space, not ktest's own.
-    if unsafe { mem_unmap_reclaim(aspace, TEST_VA_BASE, 1) }.is_err()
+    if mem_unmap_reclaim(aspace, TEST_VA_BASE, 1).is_err()
     {
         cap_delete(aspace).ok();
         return Err("retype::region_reclaim: mem_unmap_reclaim failed");
@@ -527,14 +515,12 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
 
     // The returned pages are reusable: remap the same VA (re-allocates the
     // chain from the pool), then tear it down again.
-    // SAFETY: `aspace` is a freshly minted address space, not ktest's own.
-    if unsafe { mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE) }.is_err()
+    if mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE).is_err()
     {
         cap_delete(aspace).ok();
         return Err("retype::region_reclaim: remap after reclaim failed");
     }
-    // SAFETY: `aspace` is a freshly minted address space, not ktest's own.
-    unsafe { mem_unmap_reclaim(aspace, TEST_VA_BASE, 1) }.ok();
+    mem_unmap_reclaim(aspace, TEST_VA_BASE, 1).ok();
 
     cap_delete(aspace).ok();
     Ok(())
@@ -564,8 +550,7 @@ pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestR
     for i in 0..N
     {
         let va = TEST_VA_BASE + i * STRIDE;
-        // SAFETY: `aspace` is a freshly minted address space, not ktest's own.
-        if unsafe { mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE) }.is_err()
+        if mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE).is_err()
         {
             cap_delete(aspace).ok();
             return Err("retype::concurrent_regions: mem_map failed");
@@ -583,8 +568,7 @@ pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestR
     for i in 0..N
     {
         let va = TEST_VA_BASE + i * STRIDE;
-        // SAFETY: `aspace` is a freshly minted address space, not ktest's own.
-        if unsafe { mem_unmap_reclaim(aspace, va, 1) }.is_err()
+        if mem_unmap_reclaim(aspace, va, 1).is_err()
         {
             cap_delete(aspace).ok();
             return Err("retype::concurrent_regions: mem_unmap_reclaim failed");
@@ -1114,18 +1098,15 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     let mut map_failures = 0u32;
     for i in 0..REGIONS
     {
-        // SAFETY: `aspace` is a freshly minted address space, not ktest's own.
-        let mapped = unsafe {
-            mem_map(
-                memory,
-                aspace,
-                TEST_VA_BASE + i * REGION_STRIDE,
-                0,
-                1,
-                MAP_WRITABLE,
-            )
-        };
-        if mapped.is_err()
+        if mem_map(
+            memory,
+            aspace,
+            TEST_VA_BASE + i * REGION_STRIDE,
+            0,
+            1,
+            MAP_WRITABLE,
+        )
+        .is_err()
         {
             map_failures += 1;
         }
@@ -1139,8 +1120,7 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     let mut reclaim_failures = 0u32;
     for i in 0..REGIONS
     {
-        // SAFETY: `aspace` is a freshly minted address space, not ktest's own.
-        if unsafe { mem_unmap_reclaim(aspace, TEST_VA_BASE + i * REGION_STRIDE, 1) }.is_err()
+        if mem_unmap_reclaim(aspace, TEST_VA_BASE + i * REGION_STRIDE, 1).is_err()
         {
             reclaim_failures += 1;
         }

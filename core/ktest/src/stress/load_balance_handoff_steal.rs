@@ -329,9 +329,7 @@ fn client_entry(arg: u64) -> !
 
     // SAFETY: client `idx` is the sole user of IPC_BUFS[idx] this run.
     let buf = unsafe { core::ptr::addr_of_mut!(IPC_BUFS[idx]) }.cast::<u64>();
-    // SAFETY: `buf` points at a page-aligned static dedicated to this thread's IPC buffer; no Rust
-    // reference into it is ever taken, so the kernel's IPC writes alias no Rust data.
-    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
+    if ipc_buffer_set(buf as u64).is_err()
     {
         notification_send(done, done_bit).ok();
         thread_exit()
@@ -375,9 +373,7 @@ fn server_entry(arg: u64) -> !
 
     // SAFETY: server `buf_index` is the sole user of IPC_BUFS[buf_index] this run.
     let buf = unsafe { core::ptr::addr_of_mut!(IPC_BUFS[buf_index]) }.cast::<u64>();
-    // SAFETY: `buf` points at a page-aligned static dedicated to this thread's IPC buffer; no Rust
-    // reference into it is ever taken, so the kernel's IPC writes alias no Rust data.
-    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
+    if ipc_buffer_set(buf as u64).is_err()
     {
         thread_exit()
     }

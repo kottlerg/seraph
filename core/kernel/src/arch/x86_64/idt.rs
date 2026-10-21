@@ -523,6 +523,13 @@ extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64
     // paranoid_exception_trampoline on this stack.
     let f = unsafe { &*tf };
     let from_user = (f.cs & 3) != 0;
+    // #DF and #MC run on the IST1 stack and are terminal; every other vector's
+    // frame from user mode is on the thread's kernel stack.
+    if from_user && vector != 8 && vector != 18
+    {
+        // SAFETY: tf is the live user frame on the current kernel stack.
+        unsafe { publish_user_frame(tf) };
+    }
     // #DF (8) and #MC (18) are non-restartable aborts; both run on the IST1 stack,
     // which is not re-entrant across the reschedule a redirect performs. They are
     // never delivered to a resumable handler — always terminal.
@@ -825,14 +832,52 @@ isr_stub!(isr31, 31, has_error_code = false, ist = 0);
 
 // ── Shared IRQ trampoline ─────────────────────────────────────────────────────
 
+/// Point the current thread's `trap_frame` at `frame`, the live frame an entry
+/// from user mode built on its kernel stack.
+///
+/// The syscall entry builds its frame in the slot `SYS_THREAD_CONFIGURE` placed
+/// `trap_frame` at (just below the kernel stack top), but an interrupt or
+/// exception trampoline builds it below the hardware iret words and the stub's
+/// two pushes. Every entry from user mode publishes its own frame, so a thread
+/// descheduled from any of them leaves `trap_frame` naming the frame it resumes
+/// from: the frame `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` act on (see
+/// `docs/scheduling-internals.md` § Cross-CPU TCB Ownership). The running
+/// thread is the only writer; a reader on another CPU acts only once the thread
+/// is off every CPU with its save published (`sched::with_held_frame`), which
+/// orders this store before the read.
+///
+/// # Safety
+/// `frame` must be the live frame an entry from user mode built on the current
+/// thread's kernel stack, not an IST stack.
+#[cfg(not(test))]
+pub(super) unsafe fn publish_user_frame(frame: *mut TrapFrame)
+{
+    // SAFETY: interrupt or exception context; current_tcb is the thread whose
+    // kernel stack holds `frame`.
+    let tcb = unsafe { crate::syscall::current_tcb() };
+    if !tcb.is_null()
+    {
+        // SAFETY: tcb is the running thread; it alone writes its trap_frame.
+        unsafe { (*tcb).trap_frame = frame };
+    }
+}
+
 /// Route a device/timer/IPI interrupt by its IDT vector to the existing handler.
 ///
-/// Called from [`common_irq_trampoline`] with the stub-pushed vector. Each
-/// handler performs its own EOI; this only dispatches. The device range carries
-/// the GSI as `vector - 33` (the GSI indexes `IRQ_TABLE`; see `irq.rs`).
+/// Called from [`common_irq_trampoline`] with the stub-pushed vector and, for an
+/// interrupt taken from user mode, the live user frame (null otherwise), which
+/// it publishes as the thread's `trap_frame` first ([`publish_user_frame`]).
+/// Each handler performs its own EOI; this only dispatches. The device range
+/// carries the GSI as `vector - 33` (the GSI indexes `IRQ_TABLE`; see `irq.rs`).
 #[cfg(not(test))]
-extern "C" fn irq_dispatch(vector: u64)
+extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
 {
+    if !user_frame.is_null()
+    {
+        // SAFETY: the ring-3 trampoline path passes the frame it built on the
+        // current thread's kernel stack.
+        unsafe { publish_user_frame(user_frame) };
+    }
     match vector
     {
         v if v == u64::from(super::timer::TIMER_VECTOR) => super::timer::timer_isr(),
@@ -886,6 +931,7 @@ unsafe extern "C" fn common_irq_trampoline()
             "lfence\n",
             tf_build_asm!(),
             "mov rdi, [rsp + 168]\n", // arg0 = vector
+            "mov rsi, rsp\n",         // arg1 = *mut TrapFrame (the live user frame)
             "call {dispatch}\n",
             tf_resume_asm!(),
             // ── ring-0: minimal save (no user state) ──
@@ -901,6 +947,7 @@ unsafe extern "C" fn common_irq_trampoline()
             "push r10\n",
             "push r11\n",
             "mov rdi, [rsp + 72]\n", // arg0 = vector
+            "xor esi, esi\n",        // arg1 = null: no user frame
             "call {dispatch}\n",
             "pop r11\n",
             "pop r10\n",
@@ -1184,6 +1231,11 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
     // SAFETY: tf is constructed by isr_page_fault on this stack.
     let f = unsafe { &*tf };
     let from_user = (f.cs & 3) != 0;
+    if from_user
+    {
+        // SAFETY: tf is the live user frame on the current kernel stack.
+        unsafe { publish_user_frame(tf) };
+    }
     // A reserved-bit violation is never a stale-TLB fault; only well-formed
     // present/permission faults from userspace are retry candidates.
     if from_user && error_code & ERR_RSVD == 0

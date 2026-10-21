@@ -35,13 +35,6 @@ const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
-/// An IPC buffer page for one child thread, apart from ktest's own `IPC_BUF`: a child's IPC
-/// and its parent's run on different threads, each through its own registered page.
-#[repr(C, align(4096))]
-struct IpcBufPage([u64; 512]);
-// SAFETY: registered only by the child, of which one runs per test.
-static mut CHILD_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
-
 /// The child's arguments (slots in its own `CSpace`), handed to
 /// `child_entry` by address.
 #[derive(Clone, Copy)]
@@ -178,12 +171,9 @@ fn child_entry(arg: u64) -> !
         sync_sig: sync_sig_slot,
     } = unsafe { child_args(arg) };
 
-    // Register this child's own IPC buffer page.
-    let buf_addr = core::ptr::addr_of_mut!(CHILD_IPC_BUF) as u64;
-    // SAFETY: `CHILD_IPC_BUF` is a page-aligned static only this child registers, so the page is
-    // dedicated to the kernel as this thread's IPC buffer; no Rust reference into it is ever taken,
-    // the page being reached only through raw pointers and the `ipc` wrappers.
-    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
+    // Register the shared IPC buffer for this child thread.
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if syscall::ipc_buffer_set(buf_addr).is_err()
     {
         notification_send(sync_sig_slot, 0xBAD).ok();
         thread_exit()

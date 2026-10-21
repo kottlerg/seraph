@@ -79,9 +79,7 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
             }
             Ok(())
         })();
-        // SAFETY: `MMIO_TEST_VA` is a fixed ktest test VA outside the harness image,
-        // stacks, and InitInfo page, and this cell never dereferences it.
-        let _ = unsafe { mem_unmap(ctx.aspace_cap, MMIO_TEST_VA, 1) };
+        let _ = mem_unmap(ctx.aspace_cap, MMIO_TEST_VA, 1);
         syscall::cap_delete(lo).ok();
         return result;
     }

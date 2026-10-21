@@ -27,7 +27,10 @@ Process startup in Seraph has two layers:
    `_start` and define no `main()` of either shape (see
    [`main()` Signature](#main-signature)).
 
-Both layers are defined in this crate. init and ktest sit outside both: their
+This crate defines `ProcessInfo` and the memmgr runtime's `main(&StartupInfo) -> !` convention;
+the std-built convention and its `StartupInfo` type are defined by
+[`runtime/ruststd`](../../runtime/ruststd/README.md) (`std::os::seraph`). init and ktest sit
+outside both: their
 handover struct is `InitInfo` (from [`abi/init-protocol`](../init-protocol/README.md)),
 populated by the kernel rather than procmgr, and each consumes it in its own
 `_start` without constructing a `StartupInfo` or calling a `main()`.
@@ -125,12 +128,11 @@ buffer, the creator, procmgr, memmgr, and service-registry endpoints, the stdio
 rings and their notifications, the namespace caps, the TLS template, argv/env,
 the main-thread layout including `main_tls_vaddr`, and the v18
 `pager_endpoint_cap` / `pager_badge`. Cap slots are `u32` values, and
-`args_blob` / `env_blob` are resolved from the handover page into `&[u8]`
-slices.
+`args_blob` / `env_blob` are `&[u8]` slices; memmgr's `_start`, the only
+constructor, leaves both empty, since init writes no argv or env for memmgr.
 
 Values are copied out of the handover page verbatim, so the struct does
-not borrow from it (except the argv/env slices, which point into the
-read-only handover page that lives for the process's lifetime).
+not borrow from it.
 
 ---
 

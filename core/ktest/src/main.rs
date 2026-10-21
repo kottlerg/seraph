@@ -333,11 +333,9 @@ fn run(info_ptr: u64) -> !
 
     // Register the IPC buffer before any IPC syscall. All Tier 1 IPC tests
     // and integration tests depend on this.
+    // SAFETY: IPC_BUF is a page-aligned static in ktest's BSS; single-threaded here.
     let ipc_buf_ptr = core::ptr::addr_of_mut!(IPC_BUF).cast::<u64>();
-    // SAFETY: IPC_BUF is a page-aligned static in ktest's BSS that ktest dedicates to the
-    // kernel as an IPC buffer page; ktest never takes a Rust reference into it, reaching it
-    // only through raw pointers and the `ipc` wrappers.
-    unsafe { syscall::ipc_buffer_set(ipc_buf_ptr as u64) }.unwrap_or_else(|_| {
+    syscall::ipc_buffer_set(ipc_buf_ptr as u64).unwrap_or_else(|_| {
         log("ktest: FATAL: ipc_buffer_set failed");
         halt()
     });

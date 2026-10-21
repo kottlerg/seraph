@@ -97,10 +97,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Back the faulting page from the frame pool, then resume the child.
     let mem = crate::frame_pool::alloc()
         .ok_or("fault_pager_roundtrip: frame_pool::alloc returned None")?;
-    // SAFETY: `RESERVED_VA` is a fixed ktest test VA outside the harness image,
-    // stacks, and InitInfo page, left unmapped until this fault; the child reaches
-    // it only through a raw pointer.
-    unsafe { mem_map(mem, ctx.aspace_cap, RESERVED_VA, 0, 1, MAP_WRITABLE) }
+    mem_map(mem, ctx.aspace_cap, RESERVED_VA, 0, 1, MAP_WRITABLE)
         .map_err(|_| "fault_pager_roundtrip: mem_map failed")?;
 
     // Reply RESUME, deliberately attaching a (null) cap slot. The kernel must
@@ -123,9 +120,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // binding's reference on the endpoint), then the rest.
     cap_delete(child.th).ok();
     cap_delete(child.cs).ok();
-    // SAFETY: the child reached the page only through a raw pointer and is
-    // deleted; no reference into it exists.
-    unsafe { mem_unmap(ctx.aspace_cap, RESERVED_VA, 1) }.ok();
+    mem_unmap(ctx.aspace_cap, RESERVED_VA, 1).ok();
     // SAFETY: mem is from the pool and now unmapped.
     unsafe { crate::frame_pool::free(mem) };
     cap_delete(ep).ok();

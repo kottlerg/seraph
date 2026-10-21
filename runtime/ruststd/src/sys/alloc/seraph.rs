@@ -368,11 +368,7 @@ impl Heap {
                     return false;
                 }
                 let va = start_va + mapped * PAGE_SIZE;
-                // SAFETY: `va` lies at or above `mapped_end` and inside the heap
-                // zone below `max` (`grow` clamps `pages` to that window): VA
-                // the heap owns and has not yet mapped, so no Rust object
-                // occupies it.
-                if !unsafe { self.mem_map_with_augment_retry(cap_slot, va, pages_in_cap) } {
+                if !self.mem_map_with_augment_retry(cap_slot, va, pages_in_cap) {
                     return false;
                 }
                 mapped += pages_in_cap;
@@ -400,20 +396,10 @@ impl Heap {
     /// memmgr, augment the AS via `cap_create_aspace(memory_cap, self_aspace,
     /// init_pages=1)`, and retry the map — augmenting up to `PT_FUND_ROUNDS`
     /// times. If the map still fails the caller treats the grow as failed.
-    ///
-    /// # Safety
-    /// The `pages` pages at `va` must be unmapped heap-zone VA that no Rust
-    /// object occupies, as `syscall::mem_map` requires for the caller's own
-    /// address space.
-    unsafe fn mem_map_with_augment_retry(&self, memory_cap: u32, va: u64, pages: u64) -> bool {
+    fn mem_map_with_augment_retry(&self, memory_cap: u32, va: u64, pages: u64) -> bool {
         const SYSCALL_OUT_OF_MEMORY: i64 = -8;
         for _ in 0..PT_FUND_ROUNDS {
-            // SAFETY: the span is unmapped heap-zone VA, per this function's
-            // contract.
-            let mapped = unsafe {
-                syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE)
-            };
-            match mapped {
+            match syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) {
                 Ok(()) => return true,
                 Err(SYSCALL_OUT_OF_MEMORY) => { /* fall through to augment + retry */ }
                 Err(_) => return false,
@@ -432,9 +418,7 @@ impl Heap {
                 return false;
             }
         }
-        // SAFETY: the span is unmapped heap-zone VA, per this function's contract.
-        unsafe { syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) }
-            .is_ok()
+        syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE).is_ok()
     }
 }
 
@@ -478,12 +462,12 @@ pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
         return false;
     }
 
-    // The base draw happens before the allocator exists: the getrandom
+    // The base draw happens before the allocator exists: the raw getrandom
     // wrapper is a registers-only syscall and must stay non-allocating, like
     // the IPC wrappers below. A failed draw degrades to the deterministic
     // default base (no log surface exists this early).
     let mut entropy = [0u8; 8];
-    let heap_base = match syscall::getrandom(&mut entropy) {
+    let heap_base = match syscall::getrandom(entropy.as_mut_ptr(), entropy.len()) {
         Ok(n) if n == entropy.len() as u64 => {
             HEAP_BASE_DEFAULT
                 + ((u64::from_le_bytes(entropy) & ((1 << HEAP_BASE_SLOTS_LOG2) - 1)) << 12)
@@ -531,14 +515,8 @@ pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
                 return false;
             }
             let va = heap_base + mapped * PAGE_SIZE;
-            // SAFETY: `va` lies in the initial heap span at `heap_base`, inside the
-            // heap zone this allocator alone maps (zone map in
-            // `shared/process-layout`); the `INITIALIZED` exchange above admits one
-            // bootstrap, so nothing occupies the span yet.
-            let map = unsafe {
-                syscall::mem_map(cap_slot, self_aspace, va, 0, pages_in_cap, MAP_WRITABLE)
-            };
-            if map.is_err() {
+            if syscall::mem_map(cap_slot, self_aspace, va, 0, pages_in_cap, MAP_WRITABLE).is_err()
+            {
                 return false;
             }
             mapped += pages_in_cap;

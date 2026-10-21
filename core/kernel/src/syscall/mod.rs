@@ -73,9 +73,10 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
 
     let nr = tf.syscall_nr();
     // SAFETY: syscall context on the caller's kernel stack with interrupts
-    // masked; `current` is the calling thread and stable here. Null-guarded
-    // like every handler's own check rather than asserted: the diagnostic
-    // stamp must never be the thing that faults.
+    // masked; `current` is the calling thread and stable here, and it alone
+    // writes its own `syscall_nr` and `trap_frame`. Null-guarded like every
+    // handler's own check rather than asserted: the diagnostic stamp must
+    // never be the thing that faults.
     unsafe {
         let tcb = current_tcb();
         if !tcb.is_null()
@@ -83,6 +84,10 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
             (*tcb)
                 .syscall_nr
                 .store(nr, core::sync::atomic::Ordering::Relaxed);
+            // Every entry from user mode publishes its live frame as the
+            // thread's `trap_frame`; an interrupt or exception taken since the
+            // last syscall may have pointed it at a frame lower on the stack.
+            (*tcb).trap_frame = core::ptr::from_mut(tf);
         }
     }
 

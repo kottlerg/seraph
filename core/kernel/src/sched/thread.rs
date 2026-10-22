@@ -579,9 +579,8 @@ pub struct ThreadControlBlock
     /// to user mode resumes from, and republished by every entry from user
     /// mode at which the thread can be descheduled (see
     /// `docs/arch-interface.md` § `trap_frame`). The running thread is the only
-    /// writer after configuration; atomic so the cross-CPU loads (the
-    /// softlockup watchdog's, which reads only the pointer, and
-    /// `sys_thread_start`'s unlocked null check) are race-free. Relaxed
+    /// writer after configuration; atomic so the cross-CPU load of
+    /// `sys_thread_start`'s unlocked null check is race-free. Relaxed
     /// suffices: the register syscalls read it only after the switch-out's
     /// `context_saved` Release (`sched::with_held_frame`).
     pub trap_frame: core::sync::atomic::AtomicPtr<crate::arch::current::trap_frame::TrapFrame>,

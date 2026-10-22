@@ -555,8 +555,9 @@ static LOCK_WAIT_WORD: [core::sync::atomic::AtomicU64; MAX_CPUS] =
 
 /// Per-CPU stamp of the last syscall number entered on that CPU
 /// (`u64::MAX` before the first), written by the syscall dispatcher, for the
-/// softlockup watchdog: it names a stalled CPU's syscall without reading
-/// another CPU's TCB or frame. Diagnostic-only — never gates control flow.
+/// softlockup watchdog: it names the last syscall entered on a stalled CPU,
+/// which need not be the one it is executing, without reading another CPU's
+/// TCB or frame. Diagnostic-only — never gates control flow.
 #[cfg(not(test))]
 static CPU_SYSCALL_NR: [core::sync::atomic::AtomicU64; MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; MAX_CPUS];
@@ -573,10 +574,6 @@ pub fn note_cpu_syscall(nr: u64)
         CPU_SYSCALL_NR[cpu].store(nr, core::sync::atomic::Ordering::Relaxed);
     }
 }
-
-/// Test stub; see [`note_cpu_syscall`].
-#[cfg(test)]
-pub fn note_cpu_syscall(_nr: u64) {}
 
 /// Record that the current CPU is spinning for the lock of kind `kind` whose
 /// state word lives at address `word`. Callers spin with interrupts masked,
@@ -1092,7 +1089,11 @@ fn watchdog_dump(reason: &str)
     #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpu_count
     {
-        // SAFETY: scheduler slabs initialised; we only read fields, no writes.
+        // SAFETY: scheduler slabs initialised and the TCB slab stays mapped,
+        // so these reads cannot fault. They are not race-free: another CPU's
+        // plain `current` and that TCB's fields are read without their locks,
+        // a diagnostic-only residual #440 records (nothing here decides
+        // anything, but a stalled CPU's thread may still be changing them).
         let (cur_is_null, tid, state, ipc, blocked_on, prio, pref, last_tick, mask) = unsafe {
             let s = scheduler_for(cpu);
             let cur = s.current;
@@ -1166,8 +1167,8 @@ fn watchdog_dump(reason: &str)
         {
             crate::kprintln!("    spinning in {}", spin_site_name(spin));
         }
-        // Name the bare spin lock this CPU is waiting for, if any, and read
-        // its state word: these waits spin with interrupts masked, inside a
+        // Name the bare spin lock this CPU is waiting for, if any: these
+        // waits spin with interrupts masked, inside a
         // preempt-disabled window, or on the idle thread, so a wedged CPU is
         // otherwise indistinguishable from a silent or idle one.
         // The breadcrumb belongs to another CPU, which may leave and
@@ -1235,7 +1236,10 @@ fn watchdog_dump(reason: &str)
     #[allow(clippy::needless_range_loop)]
     for i in 0..n.min(8)
     {
-        // SAFETY: read-only snapshot; benign racy load — we're already in stall.
+        // SAFETY: the entries and the TCBs they name stay mapped, so these
+        // reads cannot fault. They are not race-free: the list is read after
+        // SLEEP_LIST_LOCK is released and each TCB's fields without its lock,
+        // a diagnostic-only residual #440 records.
         let (tid, state, ipc, dl) = unsafe {
             let t = SLEEP_LIST[i];
             if t.is_null()

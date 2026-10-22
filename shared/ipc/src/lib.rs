@@ -2672,7 +2672,7 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// Returns a negative `i64` error code: `InvalidCapability` (no pending
 /// reply target, or a reply cap slot is stale or Null), `InvalidArgument`
 /// (a cap slot repeated in the reply), `InvalidState` (a reply cap slot is
-/// pinned by an in-flight `SYS_CAP_REVOKE`), or `QuotaExceeded` /
+/// pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), or `QuotaExceeded` /
 /// `OutOfMemory` (the caller's `CSpace` cannot accept the reply caps). The
 /// reply never blocks, so it never returns `Interrupted`; the message's
 /// counts are within the kernel's maxima by construction (the kernel clamps

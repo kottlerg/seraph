@@ -77,8 +77,7 @@ Both lists are packed as NUL-separated, NUL-terminated bytes into svcmgr's
 `CREATE_FROM_FILE` message to procmgr (see
 [procmgr's IPC interface](../../procmgr/docs/ipc-interface.md)) and replayed
 on every restart. The parser rejects a recipe whose packing would not fit
-that message, applying the limits `std::process::Command` applies to its own
-spawns:
+that message:
 
 * each blob is at most `ipc::ARGS_BLOB_MAX` (256) bytes, counting one NUL
   per token, and holds at most 255 tokens (the label's 8-bit count fields);
@@ -88,8 +87,7 @@ spawns:
 * no token contains a NUL byte: the blob is NUL-delimited, so an embedded
   NUL would add a string boundary the label's count does not carry and the
   child would see a different split. The parser rejects such a line as
-  `InvalidValue`, the same input `std::process::Command` rejects with
-  `InvalidInput`.
+  `InvalidValue`.
 
 ## `restart`
 

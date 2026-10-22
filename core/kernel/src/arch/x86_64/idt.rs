@@ -834,24 +834,12 @@ isr_stub!(isr31, 31, has_error_code = false, ist = 0);
 
 // ── Shared IRQ trampoline ─────────────────────────────────────────────────────
 
-/// Point the current thread's `trap_frame` at `frame`, the live frame an entry
-/// from user mode built on its kernel stack.
-///
-/// The syscall entry builds its frame in the slot `SYS_THREAD_CONFIGURE` placed
-/// `trap_frame` at (just below the kernel stack top), but an interrupt or
-/// exception trampoline builds it below the hardware iret words and the stub's
-/// two pushes. Every entry from user mode at which the thread can be descheduled
-/// publishes its own frame (interrupts, exceptions other than `#DF`/`#MC`, page
-/// faults, syscalls), so a thread descheduled from any of them leaves
-/// `trap_frame` naming the frame it resumes from: the frame
-/// `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` act on (see
-/// `docs/arch-interface.md` § `trap_frame`). The NMI (IST2), `#DF`/`#MC` (IST1,
-/// terminal), `#NM` (builds no frame) and the spurious vector 255 (`iretq` only)
-/// publish nothing; none of them deschedules the thread. The running thread is
-/// the only writer after configuration; the register syscalls read only once
-/// the thread is off every CPU with its save published
-/// (`sched::with_held_frame`), which orders this store before the read. The
-/// softlockup watchdog reads neither the pointer nor the frame.
+/// Point the current thread's `trap_frame` at `frame`, the live frame an
+/// interrupt or exception trampoline built on its kernel stack for an entry
+/// from user mode (the rule, and the entries that publish nothing, are in
+/// `docs/arch-interface.md` § `trap_frame`). The running thread is the only
+/// writer; the register syscalls read the pointer only once the thread is off
+/// every CPU with its save published (`sched::with_held_frame`).
 ///
 /// # Safety
 /// `frame` must be the live frame an entry from user mode built on the current

@@ -2591,7 +2591,7 @@ impl IpcMessageBuilder
 /// caller has insufficient rights (`GRANT` missing on a cap-bearing call),
 /// a cap slot is stale or Null (`InvalidCapability`), a cap slot is
 /// repeated in the message (`InvalidArgument`), a cap slot is pinned by an
-/// in-flight `SYS_CAP_REVOKE` (`InvalidState`), or the call is
+/// in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE` (`InvalidState`), or the call is
 /// interrupted. Cap-slot problems are rejected before blocking; a refusal
 /// arising only afterwards delivers the message with zero caps (the
 /// caller keeps its capabilities).
@@ -2660,7 +2660,7 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// all-or-nothing with the reply. An `Err` return consumes the pending
 /// reply either way: when a caller was claimed it has already been woken
 /// with the synthetic `IPC_REPLY_TRANSFER_FAILED` label (a reply cap slot
-/// stale, repeated, revoke-pinned, or unacceptable to its `CSpace`), and
+/// stale, repeated, pinned by an in-flight revoke or move, or unacceptable to its `CSpace`), and
 /// when none was pending there is nothing to wake — in both cases the
 /// reply must not be retried.
 ///

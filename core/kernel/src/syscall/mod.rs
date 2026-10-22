@@ -72,15 +72,17 @@ unsafe fn stamp_syscall_entry(nr: u64, frame: *mut TrapFrame)
 {
     // Null-guarded like every handler's own check rather than asserted: the
     // diagnostic stamp must never be the thing that faults.
-    // SAFETY: syscall context; `current` is the calling thread and stable
-    // here, and it alone writes its own `syscall_nr` and `trap_frame`.
+    // SAFETY: kernel context with the scheduler initialised and interrupts
+    // masked, so `current_tcb` reads this CPU's current thread.
     let tcb = unsafe { current_tcb() };
     crate::sched::note_cpu_syscall(nr);
     if tcb.is_null()
     {
         return;
     }
-    // SAFETY: tcb is the running thread's live TCB (checked non-null above).
+    // SAFETY: tcb is the running thread's live TCB (checked non-null above),
+    // and the running thread alone writes its own `syscall_nr` and
+    // `trap_frame` after configuration.
     unsafe {
         (*tcb)
             .syscall_nr

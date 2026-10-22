@@ -1123,8 +1123,9 @@ not virgin, not siblings, or either has children), `InvalidCapability`,
 ### `SYS_THREAD_START` (19)
 
 Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it for scheduling.
-Starting a thread whose fault episode a stop cancelled (before any reply claimed it) kills it as an
-unhandled fault, which posts its death and address-space observers (see
+Starting a thread whose fault episode a stop cancelled (before any reply claimed it), or whose
+handler's claiming reply was `FAULT_REPLY_KILL`, kills it as an unhandled fault, which posts its
+death and address-space observers (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill).
 A stopped thread whose blocked syscall a waker claimed before the stop is restarted only once that
@@ -1168,16 +1169,18 @@ Stop a running or runnable thread. The thread transitions to `Stopped` state.
 
 A fault-blocked target's fault episode, unless the handler's reply claimed it first, is cancelled
 with a kill outcome (no syscall returns) and the thread is left `Stopped`; the next
-`SYS_THREAD_START` then kills it as an unhandled fault, while a thread whose `RESUME` reply won
-resumes its faulting instruction when next started (see
+`SYS_THREAD_START` then kills it as an unhandled fault. A thread whose handler's reply claimed the
+fault first keeps that reply's outcome: when next started it resumes its faulting instruction on
+`FAULT_REPLY_RESUME` and is killed on `FAULT_REPLY_KILL` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
 cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker or
 the sleep timer claimed the wake first); a target that blocks while the stop is in progress is
 cancelled the same way, never left registered as a waiter (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
-Protocol). This does not hold for a stop of a thread waiting on a notification, event queue, or wait
-set whose last capability is deleted concurrently: the cancel can lock the object after it is freed
+Protocol). This does not hold for a stop of a thread waiting on an endpoint (queued to send or
+receive), a notification, an event queue, or a wait set whose last capability is deleted
+concurrently: the cancel can lock the object after it is freed
 ([#443](https://github.com/kottlerg/seraph/issues/443) § Source pointer held past its free). A
 thread running on another CPU is marked `Stopped` under every CPU's scheduler lock, and the call
 returns once that CPU has descheduled it and published its register save, at its next slice expiry
@@ -2236,13 +2239,13 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
   `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`,
-  `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via
-  `SYS_THREAD_STOP`, unless its wake (a delivery, or a sleep's elapsed deadline) was claimed
-  first. `SYS_IPC_CALL` and `SYS_IPC_RECV` queued on an endpoint,
-  `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and `SYS_WAIT_SET_WAIT` also return `Interrupted`
-  when the object waited on is destroyed under the caller, and `SYS_IPC_CALL` returns it when the
-  receiving thread receives again before replying. `SYS_THREAD_START` returns `Interrupted` when
-  its caller is stopped while the start waits for the target to settle; nothing is started.
+  `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`,
+  unless its wake (a delivery, or a sleep's elapsed deadline) was claimed first. `SYS_IPC_CALL` and
+  `SYS_IPC_RECV` queued on an endpoint, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
+  `SYS_WAIT_SET_WAIT` also return `Interrupted` when the object waited on is destroyed under the
+  caller, and `SYS_IPC_CALL` returns it when the receiving thread receives again before replying or
+  is destroyed before replying. `SYS_THREAD_START` returns `Interrupted` when its caller is stopped
+  while the start waits for the target to settle; nothing is started.
 
 ---
 

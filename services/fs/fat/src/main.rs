@@ -1557,6 +1557,24 @@ fn handle_remove_node_cap(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+/// Whether the directory slot at `loc` still holds a live entry (its first
+/// byte is not the `0xE5` deleted marker); `None` if the sector cannot be
+/// read.
+fn slot_live(
+    loc: dir::DirEntryLocation,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+) -> Option<bool>
+{
+    let mut buf = Box::new([0u8; SECTOR_SIZE]);
+    if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
+    {
+        return None;
+    }
+    Some(buf[loc.offset_in_sector] != 0xE5)
+}
+
 /// `FS_RENAME`: rename an entry within a single directory.
 // too_many_lines: one request's sequential validation, lookup, and the
 // non-atomic insert-then-remove, whose order crash-safety.md documents.
@@ -1644,13 +1662,29 @@ fn handle_rename_node_cap(
     }
     if let Err(e) = remove_entry(state, parent_cluster, src_name, cache, block_dev, ipc_buf)
     {
-        // Undo the destination insert, best-effort, so an error reply does not
-        // leave two entries sharing one chain (crash-safety.md's duplicate
-        // entry). remove_entry only marks the slots deleted; the source still
-        // owns the chain.
-        let _ = remove_entry(state, parent_cluster, dst_name, cache, block_dev, ipc_buf);
-        reply_err(fat_error_to_wire(e), ipc_buf);
-        return;
+        // remove_entry marks the long-name slots before the 8.3 slot and stops
+        // at the first failed write, so the source's 8.3 entry, the one that
+        // owns the chain, may or may not be gone. Undo the destination only
+        // while that entry is still live, so an error reply leaves no
+        // duplicate (crash-safety.md); once it is deleted the destination is
+        // the file's only entry and the rename has taken effect. If its state
+        // cannot be read, keep both names.
+        match slot_live(src_loc, cache, block_dev, ipc_buf)
+        {
+            Some(true) =>
+            {
+                let _ = remove_entry(state, parent_cluster, dst_name, cache, block_dev, ipc_buf);
+                reply_err(fat_error_to_wire(e), ipc_buf);
+                return;
+            }
+            Some(false) =>
+            {}
+            None =>
+            {
+                reply_err(fat_error_to_wire(e), ipc_buf);
+                return;
+            }
+        }
     }
 
     // Drop any cached node referencing the now-deleted source slot.

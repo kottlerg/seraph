@@ -1233,8 +1233,8 @@ pub mod fs_labels
     ///
     /// Reply (label `fs_errors::SUCCESS`): `data[0]` = entry kind (per
     /// `namespace_protocol::NodeKind`), `caps[0]` = node cap for the
-    /// newly-created file. Errors include `EXISTS`, `NO_SPACE`,
-    /// `PERMISSION_DENIED`.
+    /// newly-created file. Errors: as `services/fs/docs/fs-driver-protocol.md`
+    /// § Label 13: `FS_CREATE` lists them.
     pub const FS_CREATE: u64 = 13;
     /// Remove a file or empty directory from a directory.
     ///

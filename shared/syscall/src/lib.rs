@@ -2594,7 +2594,8 @@ pub fn thread_bind_notification(
 /// thread defers the terminal fault, cancelling the episode before any reply
 /// claims it or keeping a claimed `KILL`, and it takes effect, and is posted,
 /// only if the thread is started again (docs/fault-handling.md § Delivery,
-/// Resume, and Kill) — the kernel posts `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
+/// Resume, and Kill) — the kernel posts
+/// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
 /// `event_queue_cap`, where `exit_reason` is the fault class
 /// (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on
 /// riscv64). Normal `thread_exit` does NOT post to these

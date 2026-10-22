@@ -899,9 +899,11 @@ fn owed_wake_scan()
         {
             return;
         }
-        // SAFETY: t is a registry-walked TCB held stable by the registry
-        // lock; plain scalar reads. Torn observations are absorbed by the
-        // grace window (rule 1) and the two-scan persistence (rules 2, 3).
+        // SAFETY: t is a registry-walked TCB kept mapped by the registry lock,
+        // so these reads cannot fault. They are not race-free: the fields
+        // are `sched_lock`-owned and read without it, a diagnostic-only
+        // residual #440 records; a torn observation is absorbed by the grace
+        // window (rule 1) and the two-scan persistence (rules 2, 3).
         let (state, ipc, tid, dl, wif, wp, started) = unsafe {
             (
                 (*t).state,
@@ -1167,10 +1169,10 @@ fn watchdog_dump(reason: &str)
         {
             crate::kprintln!("    spinning in {}", spin_site_name(spin));
         }
-        // Name the bare spin lock this CPU is waiting for, if any: these
-        // waits spin with interrupts masked, inside a
-        // preempt-disabled window, or on the idle thread, so a wedged CPU is
-        // otherwise indistinguishable from a silent or idle one.
+        // Name the bare spin lock this CPU is waiting for, if any: these waits
+        // spin with interrupts masked, inside a preempt-disabled window, or on
+        // the idle thread, so a wedged CPU is otherwise indistinguishable from
+        // a silent or idle one.
         // The breadcrumb belongs to another CPU, which may leave and
         // re-enter a wait meanwhile: the kind is read before and after the
         // word (Acquire, paired with the writer's Release), and the pair is
@@ -1278,15 +1280,17 @@ fn watchdog_dump(reason: &str)
     // Defined outside the `try_for_each` call so the `kprintln!` expansions are
     // not lexically inside the `unsafe` wrapping that call (which would flag
     // their macro-internal `unsafe` as redundant). Each raw deref is its own
-    // tight `unsafe`; the field reads race benignly by the stalled contract.
+    // tight `unsafe`. The `sched_lock`-owned fields below are read without
+    // that lock: a diagnostic-only residual #440 records.
     let dump_thread = |t: *mut ThreadControlBlock| {
-        // SAFETY: t is a registry-walked TCB held stable by the registry lock.
+        // SAFETY: t is a registry-walked TCB kept mapped by the registry lock,
+        // so the read cannot fault; it races `sched_lock` writers (#440).
         let state = unsafe { (*t).state };
         match state
         {
             thread::ThreadState::Blocked =>
             {
-                // SAFETY: same contract; reads only plain scalar fields.
+                // SAFETY: as above: mapped, not race-free (#440).
                 let (tid, ipc, blocked_on, prio, pref, wake_pending, wake_in_flight, dl, started) = unsafe {
                     (
                         (*t).thread_id,
@@ -1315,14 +1319,15 @@ fn watchdog_dump(reason: &str)
                     dl,
                     started
                 );
-                // SAFETY: same contract; watchdog_decode_blocked_on only reads.
+                // SAFETY: as above; watchdog_decode_blocked_on reads the object
+                // without its lock (#440).
                 unsafe { watchdog_decode_blocked_on(t) };
             }
             thread::ThreadState::Ready
             | thread::ThreadState::Stopped
             | thread::ThreadState::Created =>
             {
-                // SAFETY: same contract; reads only plain scalar fields.
+                // SAFETY: as above: mapped, not race-free (#440).
                 let (tid, prio, pref, aff, queued_on, cs, wif, wp) = unsafe {
                     (
                         (*t).thread_id,
@@ -1401,7 +1406,8 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
             let eq = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
             // SAFETY: ipc_state classifies blocked_on as an EventQueueState;
             // the queue probe takes the queue's address without reading it and
-            // reads t's tag, t being kept mapped by the held registry lock.
+            // reads t's tag, t being kept mapped by the held registry lock; the
+            // object's fields are read without its lock (#440).
             let (queued, count, capacity) = unsafe {
                 (
                     crate::ipc::WaitQueue::tags_racy(core::ptr::addr_of!((*eq).waiters), t),

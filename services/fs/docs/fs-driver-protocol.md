@@ -464,9 +464,8 @@ Both names share the data area after the two length words, so
 496 bytes. The bound is less than two names of the per-name maximum
 (`MAX_NAME_LEN`, 255 bytes, per
 [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)):
-a pair of individually valid names can exceed it. In ruststd,
-`std::fs::rename` refuses such a pair with `InvalidFilename` before
-sending.
+a pair of individually valid names can exceed it, and a client MUST NOT
+send such a pair.
 
 **Reply (success)**: `label = 0`, empty body.
 

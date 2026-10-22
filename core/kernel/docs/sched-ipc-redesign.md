@@ -339,8 +339,11 @@ each change; the binding statement of the resulting invariants is
   pull via `try_lock_raw` after the run-queue locks) and read `state == Ready`
   authoritatively, dropping the old `preferred_cpu == src` heuristic
   (`remove_from_queue(src)` is the sole on-src arbiter); `cancel_ipc_block`
-  snapshots `(state, ipc_state, blocked_on_object)` under `sched_lock` and clears
-  the binding with a re-verify (closing finding D, stale-binding).
+  snapshots `(state, ipc_state, blocked_on_object, park_seq)` under `sched_lock`
+  and clears the binding only after winning the park's claim, re-verifying
+  `ipc_state` and `park_seq`; on a lost claim the waker's `enqueue_and_wake`
+  clears it, on its link path or in its Stopped/Exited abort arm (closing finding
+  D, stale-binding).
   `sys_thread_set_priority` — missed by the first lifecycle pass — was likewise
   wrapped `sched_lock`-first (it reads `state` and mutates `queued_on` under the
   all-CPU locks, an unserialized Scheduling-group writer otherwise).

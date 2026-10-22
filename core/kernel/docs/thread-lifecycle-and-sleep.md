@@ -1,11 +1,12 @@
 # Thread Lifecycle and Sleep List Invariants
 
 This document specifies the cross-cutting invariants for thread lifecycle transitions
-(`sys_thread_{start,stop,resume,exit}` and `dealloc_object(Thread)`), the global sleep list
-(`SLEEP_LIST` + `SLEEP_LIST_LOCK`), and the timer-driven wakeup arbitration in
-`sleep_check_wakeups`. It is sibling to [scheduling-internals.md](scheduling-internals.md) and binds
-the same authority for the surfaces below; cross-cutting concurrency rules established there (lock
-hierarchy, cross-CPU TCB ownership, wake protocol) MUST hold here.
+(`sys_thread_start` (first start and resume), `sys_thread_stop`, `sys_exit` / `sys_process_exit`,
+and `dealloc_object(Thread)`), the global sleep list (`SLEEP_LIST` + `SLEEP_LIST_LOCK`), and the
+timer-driven wakeup arbitration in `sleep_check_wakeups`. It is sibling to
+[scheduling-internals.md](scheduling-internals.md) and binds the same authority for the surfaces
+below; cross-cutting concurrency rules established there (lock hierarchy, cross-CPU TCB ownership,
+wake protocol) MUST hold here.
 
 This document is the authoritative reference consulted before any change that touches:
 - `core/kernel/src/sched/mod.rs` — `sleep_list_add`, `sleep_list_remove`, `sleep_check_wakeups`,
@@ -37,7 +38,7 @@ invariants.
 | Doc | Owns |
 |---|---|
 | [scheduling-internals.md](scheduling-internals.md) | Lock hierarchy, cross-CPU TCB ownership table, wake protocol, BSP boot transient, IPI taxonomy, atomic ordering pairings. |
-| **This document** | Sleep-list invariants, capacity, and BSP-servicing model (including the timed-source quiesce); `timed_out` cross-CPU protocol; `sys_thread_{start,stop,resume,exit}` state-machine table and the stop protocol (`commit_cancelling_park`); `dealloc_object(Thread)` cross-CPU drain protocol; `BlockedOnReply` edge between client cancel and server dealloc. |
+| **This document** | Sleep-list invariants, capacity, and BSP-servicing model (including the timed-source quiesce); `timed_out` cross-CPU protocol; `sys_thread_start` / `sys_thread_stop` / `sys_exit` / `sys_process_exit` state-machine table and the stop protocol (`commit_cancelling_park`); `dealloc_object(Thread)` cross-CPU drain protocol; `BlockedOnReply` edge between client cancel and server dealloc. |
 | [scheduler.md](scheduler.md) | Scheduling algorithm (priority, FIFO, slice, affinity, idle role). |
 | [ipc-internals.md](ipc-internals.md) | IPC primitive object layouts and syscall paths. |
 
@@ -218,7 +219,7 @@ the handler uses for the target's `state` write.
 | `sys_thread_write_regs` | `Stopped`, or `Blocked` (`BlockedOnFault`) | unchanged | calling CPU | Copies and validates the user `TrapFrame`, then writes it through `sched::with_held_frame` (as for `sys_thread_read_regs`), so the target, `Stopped` or fault-blocked, is off every CPU with its save published for the write. |
 | `sys_exit` (self) | `*` | `Exited` | running CPU = current CPU | `exit_under_all_locks(self, reason)` (the `Exited` commit with the exit reason in the same all-locks hold), then `post_death_notification`, then `schedule(false)`. The all-locks write ensures any peer-CPU `schedule()` reading `state` under its own sched.lock sees `Exited` and refuses to re-enqueue. |
 | `sys_process_exit` (self) | `*` | `Exited` | running CPU = current CPU | `exit_under_all_locks(self, encode_exit_code(code))`, then `post_death_notification`, then `schedule(false)`, as for `sys_exit`; it makes no address-space death post. A refusal means a teardown already committed `EXIT_KILLED`; the post still carries this path's own reason. |
-| arch fault handler (page fault, GP fault, etc.) | `*` | `Exited` | trapping CPU = current CPU | As for `sys_exit`, with reason `EXIT_FAULT_BASE + vector`, plus a `post_aspace_death_notification` to the address-space observers before `schedule(false)`. |
+| arch fault handler (page fault, GP fault, etc.) | `*` | `Exited` | trapping CPU = current CPU | As for `sys_exit`, with reason `EXIT_FAULT_BASE + vector` (x86-64) or `EXIT_FAULT_BASE + cause` (riscv64), plus a `post_aspace_death_notification` to the address-space observers before `schedule(false)`. |
 | `dealloc_object(Thread)` (caller ≠ tcb) | `*` | `Exited` | calling CPU (refcount → 0) | Acquires every CPU's scheduler.lock in ascending order, writes `state = Exited`, walks `remove_from_queue` for every CPU, releases all. After release: unconditionally scans every CPU until none has `sched.current == tcb`, then unconditionally on `tcb.context_saved == 1`, then proceeds to source-IPC unlink + free. See Drain Protocol below. |
 | `dealloc_object(Thread)` (caller == tcb, self-teardown) | `Running` | `Exited` | calling CPU = running CPU | A thread deleting the last capability to its own `Thread` object cannot run the post-release scan (its CPU's `current == tcb` never clears from within the spin). Marks Exited + drains run queues only, queues the object on this CPU's deferred-reclaim stack, and returns; the syscall epilogue reschedules and the free completes off-CPU. See [Self-teardown](#self-teardown-the-caller-is-the-freed-thread) below. |
 | `dealloc_object(CSpaceObj)` / `dealloc_object(AddressSpace)` — bound-thread stop (`stop_threads_bound_to`) | `*` | `Exited` | calling CPU (object refcount → 0) | For every registered thread bound to the dying object: `commit_cancelling_park(tcb, Exited, Some(EXIT_KILLED))` — `cancel_ipc_block` if `Blocked`, then the `Exited` commit with `EXIT_KILLED` recorded in the same all-locks hold, retried while `park_seq` changed (a commit refused because the thread exited on its own meanwhile writes neither, and that thread still posts its own reason — no death walk posts `EXIT_KILLED`; an observer bound after the stop receives it through the bind); running CPUs are prodded after the registry lock is released and the caller spins until no other CPU has a bound thread as `current` (and, for an `AddressSpace`, until `active_cpus` is empty). The thread is stopped, not freed: its object waits for its own last cap. If the caller's own thread is stopped — bound here, or by a concurrent teardown — nothing is freed: the object goes onto this CPU's deferred-reclaim stack (as in the self-teardown row) and the epilogue schedules the thread away. See [scheduling-internals.md § Thread Registry](scheduling-internals.md#thread-registry). |

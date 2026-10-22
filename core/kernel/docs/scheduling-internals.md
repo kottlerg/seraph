@@ -1179,9 +1179,12 @@ once-per-boot dump latch (`WATCHDOG_FIRED`, claimed via
 first detector to trip wins; one dump per boot keeps the serial log
 readable, prevents a dump storm when many CPUs observe the same stall, and
 the first dump is the uncontaminated evidence. The dump is callable from
-any CPU in interrupt context: shared structures are read benign-racily or
-via try-lock (`SLEEP_LIST_LOCK`, the registry walk) so a wedged lock holder
-cannot deadlock the dump itself.
+any CPU in interrupt context: it takes only try-locks (`SLEEP_LIST_LOCK` for
+the sleep count, the registry walk's `try_for_each`), so a wedged lock holder
+cannot deadlock the dump itself, and reads the per-CPU thread snapshot, the
+sleep-list entries, the walked threads' scheduling fields and their blocking
+objects without those structures' own locks, a diagnostic-only residual
+[#440](https://github.com/kottlerg/seraph/issues/440) records.
 
 Three detectors feed the latch:
 
@@ -1287,10 +1290,8 @@ inside a preempt-disabled window, or on the idle thread inside a deferred reclai
 breadcrumb a CPU wedged on one is indistinguishable from a silent or idle one. The dump also prints
 the derivation lock's state word and the CPU stamped as its write holder
 (`DerivationLock::debug_snapshot`), so a held lock with no spinning holder is visible as a leaked or
-wedged hold. Each per-CPU line also names the last syscall entered on that CPU, from the
-dispatcher's per-CPU stamp (`note_cpu_syscall`); that line reads no TCB or frame. The dump's other
-cross-CPU reads (the per-CPU thread snapshot and the sleep list) are taken without their locks, a
-diagnostic-only residual [#440](https://github.com/kottlerg/seraph/issues/440) records.
+wedged hold. Under each per-CPU line the dump also prints the last syscall entered on that CPU,
+from the dispatcher's per-CPU stamp (`note_cpu_syscall`); the syscall line reads no TCB or frame.
 
 The dump then walks the live-thread registry (§ Thread Registry) and prints every non-running
 registered thread. For a `Blocked` thread it shows the `wake_pending`/`wake_in_flight` flags and a

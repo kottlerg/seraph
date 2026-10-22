@@ -502,7 +502,8 @@ Userspace fault handling is specified as the pager protocol in
 [Fault Handling](fault-handling.md). An unresolved fault is delivered to the
 thread's bound handler (memmgr, the default pager, unless the process was
 created `CREATE_PINNED`); a thread with no bound handler, whose handler replies
-`KILL`, or whose fault episode is cancelled by handler-thread death, destruction of the handler
+`KILL`, or whose fault episode is cancelled by destruction of the handler thread (deletion of its
+last Thread capability), destruction of the handler
 endpoint while the fault is still queued on it, or a later receive on the handler thread that
 passes its capability and headroom checks, terminates, which surfaces through the normal
 process-death notification flow above; a thread whose episode a stop cancelled terminates that way

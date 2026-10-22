@@ -837,9 +837,10 @@ isr_stub!(isr31, 31, has_error_code = false, ist = 0);
 /// Point the current thread's `trap_frame` at `frame`, the live frame an
 /// interrupt or exception trampoline built on its kernel stack for an entry
 /// from user mode (the rule, and the entries that publish nothing, are in
-/// `docs/arch-interface.md` § `trap_frame`). The running thread is the only
-/// writer; the register syscalls read the pointer only once the thread is off
-/// every CPU with its save published (`sched::with_held_frame`).
+/// `docs/arch-interface.md` § `trap_frame`). After configuration the running
+/// thread is the only writer; the register syscalls read the pointer only once
+/// the thread is off every CPU with its save published
+/// (`sched::with_held_frame`).
 ///
 /// # Safety
 /// `frame` must be the live frame an entry from user mode built on the current

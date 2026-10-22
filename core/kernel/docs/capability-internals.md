@@ -897,7 +897,7 @@ outside the process CSpace. The kernel clears the per-thread reply slot when
 capability check and cap-slot pre-allocation, which releases the unreplied caller, or
 when a stop (`cancel_ipc_block`) or a teardown claims the bound caller (see
 [ipc-internals.md](ipc-internals.md) § Receive Path (Server) and § Reply Path, and
-[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § BlockedOnReply Edge).
+[thread-lifecycle-and-sleep.md § BlockedOnReply Edge — Symmetry Rules](thread-lifecycle-and-sleep.md#blockedonreply-edge--symmetry-rules)).
 
 ---
 

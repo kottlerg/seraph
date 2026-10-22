@@ -506,7 +506,7 @@ domains:
    the all-locks region releases. For a `BlockedOnReply` client it stamps the park episode
    `INTERRUPTED` (per the episode table in
    [ipc-internals.md](ipc-internals.md#park-dispositions-and-episodes)); for a `BlockedOnFault`
-   client (handler-thread death) it instead records
+   client (destruction of the handler thread) it instead records
    `fault_outcome = Kill` (read on entry to the branch, before `ipc_state` is cleared) so the
    faulter runs its kill path on resume. Without this, a client blocked on a dying server/handler
    would remain blocked indefinitely with a dangling `blocked_on_object` pointer to freed memory.

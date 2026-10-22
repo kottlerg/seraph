@@ -1073,8 +1073,11 @@ fn bsp_stall_check(own_heartbeat: u64)
 
 /// Dump scheduler state for a detected wedge: per-CPU current threads, the
 /// sleep list, and all non-running registered threads. Callable from any CPU
-/// in interrupt context; shared structures are read benign-racily or via
-/// try-lock so a wedged lock holder cannot deadlock the dump.
+/// in interrupt context. The sleep list and the registry are taken only by
+/// try-lock, so a wedged holder of either cannot deadlock the dump (its output
+/// still takes the console lock); the per-CPU snapshot, the sleep-list
+/// entries, the walked TCB fields and the blocking objects are read without
+/// their locks, a diagnostic-only residual #440 records.
 #[cfg(not(test))]
 #[allow(clippy::too_many_lines)]
 fn watchdog_dump(reason: &str)
@@ -1378,10 +1381,11 @@ fn watchdog_dump(reason: &str)
 /// waker's deposit and the run-queue link) — the #351 lost-wakeup signature.
 ///
 /// # Safety
-/// `t` is a registry-walked TCB pointer held stable by the registry lock. All
-/// reads are benign-racy diagnostics. The blocking object is read without its
-/// lock, and nothing pins it, so its scalar fields may be stale; no pointer
-/// read from it is followed. The waiter-queue probe reads only `t`'s queue tag
+/// `t` is a registry-walked TCB pointer kept mapped by the registry lock. Its
+/// `sched_lock`-owned fields and the blocking object's fields are read without
+/// their locks, so the reads are not race-free: a diagnostic-only residual
+/// #440 records. Nothing pins the object, so its scalar fields may be stale; no
+/// pointer read from it is followed. The waiter-queue probe reads only `t`'s queue tag
 /// (`WaitQueue::tags_racy`).
 #[cfg(not(test))]
 // cast_ptr_alignment: blocked_on_object is stored as *mut u8 but always points
@@ -1391,7 +1395,8 @@ fn watchdog_dump(reason: &str)
 unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
 {
     use core::sync::atomic::Ordering;
-    // SAFETY: caller contract; reads ipc_state + blocked_on scalars.
+    // SAFETY: caller contract: t is mapped; the binding is read without
+    // sched_lock (#440).
     let (ipc, blocked_on) = unsafe { ((*t).ipc_state, (*t).blocked_on_object) };
     if blocked_on.is_null()
     {
@@ -1452,7 +1457,8 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
         IpcThreadState::BlockedOnSend | IpcThreadState::BlockedOnRecv =>
         {
             let ep = blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
-            // SAFETY: ipc_state classifies blocked_on as an EndpointState.
+            // SAFETY: ipc_state classifies blocked_on as an EndpointState; its
+            // queue heads are read without ep.lock (#440).
             let (send_head, recv_head) = unsafe { ((*ep).send_head, (*ep).recv_head) };
             crate::kprintln!(
                 "      ep: send_head={:p} recv_head={:p}",

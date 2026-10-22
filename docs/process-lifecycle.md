@@ -422,7 +422,7 @@ a fault or kill reason — defined once in `syscall_abi`:
 |---|---|---|
 | `0` (`EXIT_VOLUNTARY`) | Voluntary, clean | success — `sys_process_exit(0)`, `sys_thread_exit`, `ExitCode::SUCCESS` |
 | `1 ..= 0x0FFF` | Voluntary, code | `sys_process_exit(code)` via `encode_exit_code` (saturating); `std::process::exit(n)` / non-zero `ExitCode` |
-| `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector`) | Fault | unhandled CPU/VM fault; kernel-terminated |
+| `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on riscv64) | Fault | unhandled CPU/VM fault; kernel-terminated |
 | `0x2000` (`EXIT_KILLED`) | Killed | recorded by the kernel as the retained reason of a thread stopped by its `CSpace`/`AddressSpace` teardown (that stop posts no death event; an observer bound afterwards receives the retained reason through the bind); posted by userspace (`Child::kill`) |
 
 `sys_process_exit` records the encoded reason as the calling thread's exit reason and posts it to
@@ -498,16 +498,15 @@ Seraph does not implement `fork()` or copy-on-write. Process creation
 is always from-scratch via `CREATE_PROCESS` or `CREATE_FROM_FILE`; zero-copy
 buffer handoff between processes uses Memory-cap moves over IPC.
 
-Userspace fault handling is specified as the pager protocol in
-[Fault Handling](fault-handling.md). An unresolved fault is delivered to the
-thread's bound handler (memmgr, the default pager, unless the process was
-created `CREATE_PINNED`); a thread with no bound handler, whose handler replies
+Userspace fault handling is specified as the pager protocol in [Fault Handling](fault-handling.md).
+An unresolved fault is delivered to the thread's bound handler (memmgr, the default pager, unless
+the process was created `CREATE_PINNED`); a thread with no bound handler, whose handler replies
 `KILL`, or whose fault episode is cancelled by destruction of the handler thread (deletion of its
-last Thread capability), destruction of the handler
-endpoint while the fault is still queued on it, or a later receive on the handler thread that
-passes its capability and headroom checks, terminates, which surfaces through the normal
-process-death notification flow above; a thread whose episode a stop cancelled terminates that way
-only if it is started again (see [Fault Handling](fault-handling.md#delivery-resume-and-kill)).
+last Thread capability), destruction of the handler endpoint while the fault is still queued on it,
+or a later receive on the handler thread that passes its capability and headroom checks, terminates,
+which surfaces through the normal process-death notification flow above; a thread whose episode a
+stop cancelled terminates that way only if it is started again (see
+[Fault Handling](fault-handling.md#delivery-resume-and-kill)).
 
 ---
 

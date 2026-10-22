@@ -681,9 +681,10 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
     use crate::ipc::wait_set::WaitSetState;
     use crate::sched::thread::IpcThreadState;
 
-    // Snapshot (state, ipc_state, blocked_on_object) under the per-TCB sched_lock
-    // — the authoritative serializer for the Scheduling field group. Reading the
-    // pair without it would race enqueue_and_wake / commit_blocked (which write
+    // Snapshot (state, ipc_state, blocked_on_object, park_seq) under the
+    // per-TCB sched_lock — the authoritative serializer for the Scheduling
+    // field group; park_seq also gates the binding clear at the tail. Reading
+    // them without it would race enqueue_and_wake / commit_blocked (which write
     // these under sched_lock) and could observe a torn binding. If a concurrent
     // waker already moved the thread off Blocked, its wake stands: there is
     // nothing to cancel, so return without touching the source or the episode.

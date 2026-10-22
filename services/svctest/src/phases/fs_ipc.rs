@@ -504,9 +504,6 @@ pub fn fs_request_bounds_phase(_: &Caps)
     std::os::seraph::log!("fs_request_bounds phase passed");
 }
 
-// too_many_lines: one sequential scenario (stage a page, write it through
-// FS_WRITE_MEMORY, read it back through std::fs) whose steps share state.
-#[allow(clippy::too_many_lines)]
 pub fn fs_write_memory_phase(_: &Caps)
 {
     use std::io::Read;

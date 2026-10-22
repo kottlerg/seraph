@@ -1644,6 +1644,11 @@ fn handle_rename_node_cap(
     }
     if let Err(e) = remove_entry(state, parent_cluster, src_name, cache, block_dev, ipc_buf)
     {
+        // Undo the destination insert, best-effort, so an error reply does not
+        // leave two entries sharing one chain (crash-safety.md's duplicate
+        // entry). remove_entry only marks the slots deleted; the source still
+        // owns the chain.
+        let _ = remove_entry(state, parent_cluster, dst_name, cache, block_dev, ipc_buf);
         reply_err(fat_error_to_wire(e), ipc_buf);
         return;
     }

@@ -43,7 +43,7 @@ but reconciles to FAT 0.
   through it could corrupt unrelated data once those clusters are
   reused.
 
-* **Duplicate entry (rename window c)**: two directory entries with the
+* **Duplicate entry (rename window b)**: two directory entries with the
   same `first_cluster`. Reads via either entry behave correctly until
   the chain is mutated through one of them; subsequent reads via the
   other entry see the mutation. Removing one entry frees the chain

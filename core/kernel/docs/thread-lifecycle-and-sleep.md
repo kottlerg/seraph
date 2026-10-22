@@ -661,14 +661,14 @@ The handler then drains the target.
       [ipc-internals.md](ipc-internals.md#park-dispositions-and-episodes) § Park Dispositions and
       Episodes) so the restarted thread's resume reports the cancellation.
    3. The all-locks commit: acquire the target's `sched_lock`, then every CPU's scheduler.lock in
-      ascending order; if `park_seq` still equals the snapshot, write `state = Stopped`, drain
-      the run queues, and snapshot `running_on` (the CPU whose `sched.current == target_tcb`, if
-      any); release all locks. A changed `park_seq` means the target parked, or was rebound, after
-      the snapshot — a park this pass did not cancel — so nothing is written and the loop
-      repeats. The commit returns `StateCommit`: `Committed(running_on)` on a write, or
-      `RefusedExited` when the target exited after step 1's unlocked check; `commit_stopped`
-      surfaces the refusal as `InvalidState` (table row
-      `sys_thread_stop (Created or Exited or Stopped)`).
+      ascending order; if `park_seq` still equals the snapshot, write `state = Stopped`, drain the
+      run queues, and snapshot `running_on` (the CPU whose `sched.current == target_tcb`, if any);
+      release all locks. A changed `park_seq` means the target parked, or was rebound, after the
+      snapshot (a park this pass's cancel may or may not have claimed), so nothing is written and
+      the loop repeats; the next pass cancels that park, or finds it already cancelled. The commit
+      returns `StateCommit`: `Committed(running_on)` on a write, or `RefusedExited` when the target
+      exited after step 1's unlocked check; `commit_stopped` surfaces the refusal as `InvalidState`
+      (table row `sys_thread_stop (Created or Exited or Stopped)`).
 
    So `Stopped` is never written over a park that was not cancelled: a stop never leaves a
    `Stopped` thread registered as a source's waiter or on the sleep list. The object-teardown stop

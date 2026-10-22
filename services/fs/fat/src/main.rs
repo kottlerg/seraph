@@ -1558,6 +1558,8 @@ fn handle_remove_node_cap(
 }
 
 /// `FS_RENAME`: rename an entry within a single directory.
+// too_many_lines: one request's sequential validation, lookup, and the
+// non-atomic remove-then-insert, whose order crash-safety.md documents.
 #[allow(clippy::too_many_lines)]
 fn handle_rename_node_cap(
     node_id: NodeId,

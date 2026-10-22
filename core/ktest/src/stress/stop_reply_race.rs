@@ -161,13 +161,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     let second_stopper = cpus >= 4;
     if !second_stopper
     {
+        crate::log("ktest: stress::stop_reply_race second-stopper race SKIP (need 4+ CPUs)");
         return cycles(
             ctx,
             Placement {
                 base: 0,
                 span: cpu_count,
             },
-            false,
+            Stoppers::One,
         );
     }
     // The controller takes CPU 0 so a floor-priority child never shares its
@@ -180,7 +181,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             base: CONTROLLER_CPU + 1,
             span: cpu_count - 1,
         },
-        true,
+        Stoppers::Two,
     );
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_reply_race: restore controller affinity failed");
@@ -207,10 +208,20 @@ impl Placement
     }
 }
 
-/// Run [`CYCLES`] races with the children placed per `place`, a second
-/// stopper in each when `second_stopper`.
-fn cycles(ctx: &TestContext, place: Placement, second_stopper: bool) -> TestResult
+/// Who stops each cycle's client: the controller alone, or the controller and
+/// a second stopper.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stoppers
 {
+    One,
+    Two,
+}
+
+/// Run [`CYCLES`] races with the children placed per `place` and stopped by
+/// `stoppers`.
+fn cycles(ctx: &TestContext, place: Placement, stoppers: Stoppers) -> TestResult
+{
+    let second_stopper = stoppers == Stoppers::Two;
     STOPPER_GO.store(0, Ordering::Release);
     STOPPER_DONE.store(0, Ordering::Release);
     SECOND_STOPS_OK.store(0, Ordering::Release);
@@ -387,7 +398,8 @@ fn race(
 }
 
 /// Spawn the cycle's second stopper on `cpu`, distinct from the server's, the
-/// client's and the controller's (see `Placement`), holding a CONTROL copy of the client's Thread capability.
+/// client's and the controller's (see `Placement`), holding a CONTROL copy of
+/// the client's Thread capability.
 fn spawn_stopper(
     ctx: &TestContext,
     client_th: u32,

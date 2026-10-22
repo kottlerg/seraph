@@ -421,10 +421,13 @@ pub fn fs_rename_phase(_: &Caps)
 /// panicked on either before the bounds), so a later read still succeeds.
 pub fn fs_request_bounds_phase(_: &Caps)
 {
-    // The inline reply ceiling: MSG_DATA_WORDS_MAX words after word 0's count.
+    // The inline reply ceiling: the MSG_DATA_WORDS_MAX - 1 words that follow
+    // word 0's byte count.
     const INLINE_MAX: usize = (syscall_abi::MSG_DATA_WORDS_MAX - 1) * 8;
 
     let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
+    // page, so the u64 cast is aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     let svctest = svctest_dir_cap(ipc_buf);
@@ -432,8 +435,9 @@ pub fn fs_request_bounds_phase(_: &Caps)
     let name: &[u8] = b"bounds.bin";
     let _ = fs_remove(svctest, name, ipc_buf);
     let (cap, _) = fs_create(svctest, name, ipc_buf).expect("FS_CREATE bounds failed");
-    #[allow(clippy::cast_possible_truncation)]
-    let pattern: Vec<u8> = (0..1024u32).map(|i| (i * 7 + 3) as u8).collect();
+    let pattern: Vec<u8> = (0..1024u32)
+        .map(|i| u8::try_from((i * 7 + 3) & 0xFF).unwrap_or(0))
+        .collect();
     for (i, chunk) in pattern.chunks(INLINE_MAX).enumerate()
     {
         fs_write_inline(cap, (i * INLINE_MAX) as u64, chunk, ipc_buf)

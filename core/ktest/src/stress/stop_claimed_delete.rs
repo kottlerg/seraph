@@ -37,6 +37,15 @@
 //! through it just the same. The tail clears a won claim's binding whatever
 //! state another commit wrote meanwhile.
 //!
+//! The claim itself must take only the park the stop snapshotted. The
+//! sender may claim that park and the waiter loop into a fresh wait on the
+//! same source before the cancel takes the source lock. A cancel that
+//! removed the fresh park would find the tail's `park_seq` test failing, and
+//! the retried pass nothing left to claim, so the stop would commit
+//! `Stopped` over a binding to a source the waiter is no longer queued on.
+//! The cancel removes the waiter only while its `park_seq` equals the
+//! snapshot, so the retry claims and clears the fresh park instead.
+//!
 //! ## How this exercises it
 //!
 //! Four phases: for each source kind, a notification and then an event

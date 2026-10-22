@@ -777,7 +777,7 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // Transfer caps from caller to server (if any). The pre_allocate
         // above guarantees the destination has the worst-case headroom. A
         // failure here (a source cap gone stale, or pinned by an in-flight
-        // revoke) is post-commit — endpoint_recv already dequeued the
+        // revoke or move) is post-commit — endpoint_recv already dequeued the
         // sender and rebound it BlockedOnReply — so the message MUST still
         // be delivered: degrade to zero caps (the transfer fails
         // atomically, so the sender keeps its caps) rather than losing the

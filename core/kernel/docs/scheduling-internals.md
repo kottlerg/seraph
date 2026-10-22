@@ -187,27 +187,28 @@ hang). See § Thread Registry.
    [capability-internals.md](capability-internals.md) for the deferred-cleanup pattern.
 
 7. **`cancel_ipc_block` MUST acquire the source lock matching `tcb.ipc_state`.** It first snapshots
-   `(state, ipc_state, blocked_on_object)` under `(*tcb).sched_lock` (the authoritative serializer;
-   a bare read would race `enqueue_and_wake` / `commit_blocked` and observe a torn binding) and
-   returns early if the thread is no longer `Blocked` — a concurrent waker won, so there is nothing
-   to cancel; a plain sleeper (`ipc_state == None`) is cancelled there, under `sched_lock`, through
-   `sleep_list_remove` (`SLEEP_LIST_LOCK` is a leaf). `sched_lock` is released BEFORE the source
-   lock is taken (lock order is source IPC → `sched_lock`, so the two are never nested). Every
-   read or write of the source's waiter queue (or its endpoint wait queue) then requires the
-   matching source lock; reads from non-owning CPUs without it are races. The dealloc paths in
+   `(state, ipc_state, blocked_on_object, park_seq)` under `(*tcb).sched_lock` (the authoritative
+   serializer; a bare read would race `enqueue_and_wake` / `commit_blocked` and observe a torn
+   binding) and returns early if the thread is no longer `Blocked` — a concurrent waker won, so
+   there is nothing to cancel; a plain sleeper (`ipc_state == None`) is cancelled there, under
+   `sched_lock`, through `sleep_list_remove` (`SLEEP_LIST_LOCK` is a leaf). `sched_lock` is released
+   BEFORE the source lock is taken (lock order is source IPC → `sched_lock`, so the two are never
+   nested). Every read or write of the source's waiter queue (or its endpoint wait queue) then
+   requires the matching source lock; reads from non-owning CPUs without it are races. After the
+   unlink the binding is cleared under `sched_lock` only when this cancel won the claim; a lost
+   claim's waker clears it in `enqueue_and_wake`. The dealloc paths in
    `core/kernel/src/cap/object.rs` (Endpoint, Notification, EventQueue, WaitSet, and Thread arms)
-   follow the same source-lock rule. **The
-   `BlockedOnReply`/`BlockedOnFault` reply binding is the exception with no source lock: its
-   `server.reply_tcb` CAS dereferences the *server* TCB, which a concurrent `dealloc_object(Thread)`
-   on the server could free (#317).** That CAS is instead performed under the *client's*
-   `(*tcb).sched_lock`, gated by a `(*tcb).blocked_on_object == server` re-read — by
-   `cancel_ipc_block` and by the two `dealloc_object(Thread)` client-side reply/fault arms alike.
-   `dealloc_object(Thread)` on the *server* nulls a claimed client's `blocked_on_object` under that
-   same client `sched_lock` strictly before `retype_free`. By the CLOSURE LEMMA (§ Cross-CPU TCB
-   Ownership, Reply slot) observing `blocked_on == server` under the client lock proves the server
-   is not yet freed, so the CAS dereferences live memory. Each site holds exactly one TCB's
-   `sched_lock` and runs a wait-free CAS on the other TCB, preserving the never-two-`sched_lock`s
-   rule.
+   follow the same source-lock rule. **The `BlockedOnReply`/`BlockedOnFault` reply binding is the
+   exception with no source lock: its `server.reply_tcb` CAS dereferences the *server* TCB, which a
+   concurrent `dealloc_object(Thread)` on the server could free (#317).** That CAS is instead
+   performed under the *client's* `(*tcb).sched_lock`, gated by a
+   `(*tcb).blocked_on_object == server` re-read — by `cancel_ipc_block` and by the two
+   `dealloc_object(Thread)` client-side reply/fault arms alike. `dealloc_object(Thread)` on the
+   *server* nulls a claimed client's `blocked_on_object` under that same client `sched_lock`
+   strictly before `retype_free`. By the CLOSURE LEMMA (§ Cross-CPU TCB Ownership, Reply slot)
+   observing `blocked_on == server` under the client lock proves the server is not yet freed, so the
+   CAS dereferences live memory. Each site holds exactly one TCB's `sched_lock` and runs a wait-free
+   CAS on the other TCB, preserving the never-two-`sched_lock`s rule.
 
 8. **Blocking commit MUST go through `commit_blocked_under_local_lock`.** A primitive that parks the
    calling thread (`notification_wait`, `event_queue_recv`, `endpoint_call`, `waitset_wait`) MUST
@@ -1179,12 +1180,16 @@ once-per-boot dump latch (`WATCHDOG_FIRED`, claimed via
 first detector to trip wins; one dump per boot keeps the serial log
 readable, prevents a dump storm when many CPUs observe the same stall, and
 the first dump is the uncontaminated evidence. The dump is callable from
-any CPU in interrupt context: it takes only try-locks (`SLEEP_LIST_LOCK` for
-the sleep count, the registry walk's `try_for_each`), so a wedged lock holder
-cannot deadlock the dump itself, and reads the per-CPU thread snapshot, the
-sleep-list entries, the walked threads' scheduling fields and their blocking
-objects without those structures' own locks, a diagnostic-only residual
-[#440](https://github.com/kottlerg/seraph/issues/440) records.
+any CPU in interrupt context: it takes the structures it inspects only by
+try-lock (`SLEEP_LIST_LOCK` for the sleep count, the registry walk's
+`try_for_each`), so a wedged holder of either cannot deadlock the dump, though
+every line it prints still takes the console lock (`kprintln!`). It reads the
+per-CPU thread snapshot, the sleep-list entries, the walked threads' scheduling
+fields and their blocking objects without those structures' own locks, and the
+owed-wake detector (2 below) reads the walked threads' `sched_lock`-owned
+fields holding only the registry lock: a diagnostic-only residual
+[#440](https://github.com/kottlerg/seraph/issues/440) records (detector 2's grace window and
+two-scan persistence absorb torn observations but do not make its reads race-free).
 
 Three detectors feed the latch:
 

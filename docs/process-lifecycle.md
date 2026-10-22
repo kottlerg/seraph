@@ -506,7 +506,7 @@ last Thread capability), destruction of the handler endpoint while the fault is 
 or a later receive on the handler thread that passes its capability and headroom checks, terminates,
 which surfaces through the normal process-death notification flow above; a stop of the faulting
 thread defers that termination (before any reply claims the fault it cancels the episode, after a
-`KILL` reply claims it it keeps that disposition), and the thread terminates that way, and
+`KILL` reply has claimed it, that disposition stands), and the thread terminates that way, and
 observers are posted, only if it is started again (see
 [Fault Handling](fault-handling.md#delivery-resume-and-kill)).
 

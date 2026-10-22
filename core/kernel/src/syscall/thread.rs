@@ -664,16 +664,18 @@ unsafe fn clear_reply_binding(tcb: *mut crate::sched::thread::ThreadControlBlock
 
 /// Cancel the IPC block on a thread that is in `Blocked` state.
 ///
-/// Unlinks the thread from the relevant IPC queue, for the park it snapshotted
-/// only (a later park on the same source is left to the caller's retry), and,
-/// on each arm's exclusive wake-claim win, stamps the park episode [`PARK_DISPOSITION_INTERRUPTED`]
-/// (fault episodes get `FAULT_OUTCOME_KILL`) so the restarted thread's resume
-/// consumes the cancellation instead of a stale wake deposit, and clears the
-/// thread's park binding, whatever state a concurrent stop or teardown commits
-/// over the claimed park meanwhile. A lost claim means a genuine waker owns the
-/// episode; its deposit stands untouched, and its `enqueue_and_wake` clears the binding,
-/// on the link path or in the arm that aborts on a `Stopped` or `Exited`
-/// thread.
+/// Unlinks the thread from the relevant IPC queue, for a source waiter only the
+/// park it snapshotted (a later park on the same source is left to the caller's
+/// retry; the reply and fault arms gate on a `blocked_on_object` re-read
+/// instead and may cancel a later park on the same server), and, on each arm's
+/// exclusive wake-claim win, stamps the park episode
+/// [`PARK_DISPOSITION_INTERRUPTED`] (fault episodes get `FAULT_OUTCOME_KILL`)
+/// so the restarted thread's resume consumes the cancellation instead of a
+/// stale wake deposit, and clears the thread's park binding, whatever state a
+/// concurrent stop or teardown commits over the claimed park meanwhile. A lost
+/// claim means a genuine waker owns the episode; its deposit stands untouched,
+/// and its `enqueue_and_wake` clears the binding, on the link path or in the
+/// arm that aborts on a `Stopped` or `Exited` thread.
 ///
 /// [`PARK_DISPOSITION_INTERRUPTED`]: crate::sched::thread::PARK_DISPOSITION_INTERRUPTED
 ///
@@ -792,9 +794,10 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
             // `Interrupted` to. Only the unlink win is that claim: a lost
             // unlink means a racing endpoint_recv dequeued us, and its rebind
             // chain (a handler reply, or its teardown) owns the episode and
-            // writes the disposition, or a concurrent cancel already claimed
-            // and stamped it; a KILL stored here would overwrite a handler's
-            // RESUME. The retry pass cancels the rebound park.
+            // writes the disposition, or the endpoint's dealloc drain or a
+            // concurrent cancel already claimed and stamped it; a KILL stored
+            // here would overwrite a handler's RESUME. The retry pass cancels
+            // the rebound park.
             // SAFETY: tcb valid; fault_outcome / in_fault_delivery always valid.
             if unsafe { (*tcb).in_fault_delivery }
             {
@@ -818,7 +821,8 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // under the same lock, so winning it makes this the episode's
                 // sole depositor). A stopped sys_ipc_call caller resumes via
                 // the disposition; a lost unlink hands the episode to the
-                // racing rebind chain.
+                // racing rebind chain, the endpoint's dealloc drain, or a
+                // concurrent cancel that already claimed it.
                 // SAFETY: tcb valid; claim won per the comment above.
                 unsafe {
                     crate::sched::thread::stamp_park_deposit(
@@ -843,8 +847,8 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // dequeues receivers under the same lock, so winning it makes
                     // this the episode's sole depositor). A lost unlink means a
                     // caller already deposited into ipc_msg, whose delivery stands
-                    // and the resume publishes (fail-open), or a concurrent cancel
-                    // already claimed the park.
+                    // and the resume publishes (fail-open), or the endpoint's
+                    // dealloc drain or a concurrent cancel already claimed the park.
                     if same_park(tcb)
                         && unlink_from_wait_queue(tcb, &mut (*ep).recv_head, &mut (*ep).recv_tail)
                     {

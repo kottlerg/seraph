@@ -97,7 +97,7 @@ kernel/
 │   │   └── selftest.rs         # Boot-time power-on self-test
 │   ├── ipc/                    # IPC subsystem
 │   │   ├── mod.rs              # Shared waiter queue (WaitQueue), claims, timed-park arming
-│   │   ├── endpoint.rs         # Endpoint object: wait queues, state machine
+│   │   ├── endpoint.rs         # Endpoint object: send/recv queues, call/recv/reply rendezvous
 │   │   ├── notification.rs     # Notification object: atomic bitmask
 │   │   ├── event_queue.rs      # Event queue: ring buffer
 │   │   ├── fault.rs            # Fault redirection to a thread's fault handler

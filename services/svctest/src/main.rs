@@ -38,8 +38,9 @@ fn main()
     std::os::seraph::log::register_name(b"svctest");
 
     // Re-entry hook: phases that respawn `/tests/svctest` with a role token
-    // as argv[1] (some roles take further arguments after it) jump here. The reentry module dispatches into the
-    // phase module that owns each role. A matching role's child main
+    // as argv[1] (some roles take further arguments after it) jump here.
+    // The reentry module dispatches into the phase module that owns each
+    // role. A matching role's child main
     // diverges (`std::process::exit`); on a miss control falls
     // through to the parent test sequence.
     let mut argv = std::env::args();

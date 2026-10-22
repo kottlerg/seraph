@@ -652,12 +652,13 @@ The handler then drains the target.
 2. `commit_cancelling_park(target, Stopped, None)` loops over the sub-steps below:
    1. Snapshot `(state, park_seq)` under the target's `sched_lock`.
    2. If the snapshot is `Blocked`, call `cancel_ipc_block(target)` — acquires the source IPC lock
-      matching `tcb.ipc_state`, unlinks the waiter only while its `park_seq` still equals the value
-      `cancel_ipc_block` snapshotted under `sched_lock` on entry (a park entered after that
-      snapshot is left for the next pass; one entered between sub-step 1 and it is cancelled in
-      this pass, and the commit's `park_seq` mismatch forces the retry), and on the claim win
-      stamps the park episode
-      `INTERRUPTED` (fault episodes: `fault_outcome = Kill`; see
+      matching `tcb.ipc_state`, unlinks a source waiter only while its `park_seq` still equals the
+      value `cancel_ipc_block` snapshotted under `sched_lock` on entry (a park entered after that
+      snapshot is left for the next pass; one entered between sub-step 1 and it is cancelled in this
+      pass, and the commit's `park_seq` mismatch forces the retry; the reply and fault arms gate on
+      a `blocked_on_object` re-read under `sched_lock` instead, so they may cancel a later park on
+      the same server in this pass, which the mismatch then retries over), and on the claim win
+      stamps the park episode `INTERRUPTED` (fault episodes: `fault_outcome = Kill`; see
       [ipc-internals.md](ipc-internals.md#park-dispositions-and-episodes) § Park Dispositions and
       Episodes) so the restarted thread's resume reports the cancellation.
    3. The all-locks commit: acquire the target's `sched_lock`, then every CPU's scheduler.lock in
@@ -665,10 +666,11 @@ The handler then drains the target.
       run queues, and snapshot `running_on` (the CPU whose `sched.current == target_tcb`, if any);
       release all locks. A changed `park_seq` means the target parked, or was rebound, after the
       snapshot (a park this pass's cancel may or may not have claimed), so nothing is written and
-      the loop repeats; the next pass cancels that park, or finds it already cancelled. The commit
-      returns `StateCommit`: `Committed(running_on)` on a write, or `RefusedExited` when the target
-      exited after step 1's unlocked check; `commit_stopped` surfaces the refusal as `InvalidState`
-      (table row `sys_thread_stop (Created or Exited or Stopped)`).
+      the loop repeats; the next pass cancels that park, finds it already cancelled, or finds a
+      waker's claim and commits over it (see below). The commit returns `StateCommit`:
+      `Committed(running_on)` on a write, or `RefusedExited` when the target exited after step 1's
+      unlocked check; `commit_stopped` surfaces the refusal as `InvalidState` (table row
+      `sys_thread_stop (Created or Exited or Stopped)`).
 
    So `Stopped` is never written over a park that was not cancelled: a stop never leaves a
    `Stopped` thread registered as a source's waiter or on the sleep list. The object-teardown stop

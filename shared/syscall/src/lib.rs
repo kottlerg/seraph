@@ -2587,8 +2587,10 @@ pub fn thread_bind_notification(
 ///
 /// When a thread in the target address space takes a *terminal* fault — any
 /// kill outcome of the fault protocol: no fault handler bound, a `KILL` reply,
-/// or a fault episode cancelled by destruction of the handler thread or of its
-/// queued-on endpoint, or by a later receive on the handler; a stop of the
+/// or a fault episode cancelled by destruction of the handler thread, by
+/// destruction of the handler endpoint while the fault is still queued on it,
+/// or by a later receive on the handler thread that passes its capability and
+/// headroom checks while the fault reply is pending; a stop of the
 /// faulting thread before any reply claims the fault cancels the episode, and
 /// the terminal fault takes effect, and is posted, only if the thread is
 /// started again (docs/fault-handling.md § Delivery, Resume, and Kill) — the

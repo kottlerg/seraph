@@ -129,8 +129,8 @@ struct Idtr
 // ── Unified entry frame ─────────────────────────────────────────────────────
 //
 // Every ring-3 entry at which a thread can be stopped — syscall (syscall.rs),
-// exception/#PF, and ring-3 IRQ (a ring-3 NMI is terminal or returns) — lands on the one canonical `TrapFrame`
-// (the userspace register ABI). The fault redirect points `tcb->trap_frame` at
+// exception/#PF, and ring-3 IRQ (a ring-3 NMI is terminal or returns) —
+// lands on the one canonical `TrapFrame` (the userspace register ABI). The fault redirect points `tcb->trap_frame` at
 // the live on-stack frame directly (symmetric with
 // riscv64/interrupts.rs::redirect_user_fault), so there is no second frame type
 // and no copy.

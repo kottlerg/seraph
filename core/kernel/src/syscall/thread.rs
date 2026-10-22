@@ -664,8 +664,9 @@ unsafe fn clear_reply_binding(tcb: *mut crate::sched::thread::ThreadControlBlock
 
 /// Cancel the IPC block on a thread that is in `Blocked` state.
 ///
-/// Unlinks the thread from the relevant IPC queue and, on each arm's exclusive
-/// wake-claim win, stamps the park episode [`PARK_DISPOSITION_INTERRUPTED`]
+/// Unlinks the thread from the relevant IPC queue, for the park it snapshotted
+/// only (a later park on the same source is left to the caller's retry), and,
+/// on each arm's exclusive wake-claim win, stamps the park episode [`PARK_DISPOSITION_INTERRUPTED`]
 /// (fault episodes get `FAULT_OUTCOME_KILL`) so the restarted thread's resume
 /// consumes the cancellation instead of a stale wake deposit, and clears the
 /// thread's park binding, whatever state a concurrent stop or teardown commits
@@ -752,6 +753,19 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
     // sched_lock means the two are never nested) and unlinks this thread from the
     // source's waiter / queue, racing any concurrent waker for the binding under
     // that same source lock. See docs/scheduling-internals.md § Lock Hierarchy.
+    //
+    // A source arm claims only the snapshotted park: a waker may have claimed
+    // it since, and the thread run and parked on the same source again. Every
+    // park on a source commits (advancing park_seq) under that source's lock,
+    // so under it the queued thread's park_seq names the park it is queued
+    // for. Claiming the later park here would leave its binding past the tail,
+    // whose clear requires the snapshotted park_seq, and the retried commit
+    // would write Stopped or Exited over a binding to a source the thread is
+    // no longer queued on.
+    let same_park = |t: *mut crate::sched::thread::ThreadControlBlock| {
+        // SAFETY: t is the caller's valid tcb; park_seq is atomic.
+        unsafe { (*t).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq }
+    };
     match ipc_state
     {
         IpcThreadState::BlockedOnSend =>
@@ -765,8 +779,8 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // SAFETY: blocked_on is a valid EndpointState ptr.
                 unsafe {
                     let saved = (*ep).lock.lock_raw();
-                    unlinked =
-                        unlink_from_wait_queue(tcb, &mut (*ep).send_head, &mut (*ep).send_tail);
+                    unlinked = same_park(tcb)
+                        && unlink_from_wait_queue(tcb, &mut (*ep).send_head, &mut (*ep).send_tail);
                     // Republish send-queue level after the unlink (#285-adjacent).
                     (*ep).refresh_send_ready();
                     (*ep).lock.unlock_raw(saved);
@@ -829,7 +843,8 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // this the episode's sole depositor). A lost unlink means a
                     // caller already deposited into ipc_msg; that delivery stands
                     // and the resume publishes it (fail-open).
-                    if unlink_from_wait_queue(tcb, &mut (*ep).recv_head, &mut (*ep).recv_tail)
+                    if same_park(tcb)
+                        && unlink_from_wait_queue(tcb, &mut (*ep).recv_head, &mut (*ep).recv_tail)
                     {
                         claimed = true;
                         crate::sched::thread::stamp_park_deposit(
@@ -969,7 +984,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // (every genuine waker claims under the same lock). A lost
                     // race means the waker's deposit stands; the resume
                     // delivers it (fail-open).
-                    if (*sig).waiters.remove(tcb)
+                    if (*sig).waiters.remove_if(tcb, same_park)
                     {
                         claimed = true;
                         // Re-derive the observer flag like every other
@@ -1008,7 +1023,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // Claim = the removal from the waiter queue under eq.lock; a
                     // lost race means a genuine wake's deposit stands
                     // (fail-open).
-                    if (*eq).waiters.remove(tcb)
+                    if (*eq).waiters.remove_if(tcb, same_park)
                     {
                         claimed = true;
                         // A timed wait's entry goes with the waiter, under
@@ -1043,7 +1058,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // Claim = the removal from the waiter queue under ws.lock;
                     // a lost race means a genuine wake's deposit stands
                     // (fail-open).
-                    if (*ws).waiters.remove(tcb)
+                    if (*ws).waiters.remove_if(tcb, same_park)
                     {
                         claimed = true;
                         crate::sched::thread::stamp_park_deposit(

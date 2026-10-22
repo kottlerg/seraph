@@ -466,7 +466,8 @@ Both names share the data area after the two length words, so
 (`MAX_NAME_LEN`, 255 bytes, per
 [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)):
 a pair of individually valid names can exceed it, and a client MUST NOT
-send such a pair.
+send such a pair. The server replies `IO_ERROR` to a zero length, or to
+lengths whose sum exceeds the data the message carries.
 
 **Reply (success)**: `label = 0`, empty body.
 
@@ -483,7 +484,9 @@ intent; not yet implemented). Tracked as
 for the post-crash visible states.
 
 **Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination
-occupied), `NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`.
+occupied), `NO_SPACE`, `IO_ERROR` (malformed name lengths, an invalid
+name), `PERMISSION_DENIED`, `INVALID_BADGE` (the badge is not a
+directory node).
 
 ---
 

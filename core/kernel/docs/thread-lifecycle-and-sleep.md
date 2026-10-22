@@ -652,7 +652,9 @@ The handler then drains the target.
 2. `commit_cancelling_park(target, Stopped, None)` loops over the sub-steps below:
    1. Snapshot `(state, park_seq)` under the target's `sched_lock`.
    2. If the snapshot is `Blocked`, call `cancel_ipc_block(target)` — acquires the source IPC lock
-      matching `tcb.ipc_state`, unlinks the waiter, and on the claim win stamps the park episode
+      matching `tcb.ipc_state`, unlinks the waiter only while its `park_seq` still equals the
+      snapshot (a later park on the same source is left for the next pass), and on the claim win
+      stamps the park episode
       `INTERRUPTED` (fault episodes: `fault_outcome = Kill`; see
       [ipc-internals.md](ipc-internals.md#park-dispositions-and-episodes) § Park Dispositions and
       Episodes) so the restarted thread's resume reports the cancellation.

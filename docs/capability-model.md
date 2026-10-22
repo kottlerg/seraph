@@ -704,8 +704,9 @@ the address space (no fault handler bound, the handler replied `KILL`, or the fa
 cancelled by destruction of the handler thread (deletion of its last Thread capability), by
 destruction of the handler endpoint while the fault is still queued on it, or by a later receive on
 the handler thread that passes its capability and headroom checks while the fault reply is pending;
-a stop of the faulting thread before any reply claims the fault cancels the episode, and the
-terminal fault takes effect if the thread is started again; see
+a stop of the faulting thread defers the terminal fault — before any reply claims the fault it
+cancels the episode, after a `KILL` reply claims it it keeps that disposition — and the terminal
+fault takes effect, and is posted, only if the thread is started again; see
 [Fault Handling](fault-handling.md#delivery-resume-and-kill)), the kernel posts the fault class
 (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on riscv64) to each bound observer
 and exits the faulting thread. procmgr binds such an observer at process creation, so a fatal fault

@@ -178,6 +178,8 @@ pub fn fs_rights_attenuation_phase(_: &Caps)
     );
 
     let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
+    // page, so the u64 cast is aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
@@ -284,6 +286,8 @@ pub fn fs_rights_attenuation_phase(_: &Caps)
 pub fn fs_write_phase(_: &Caps)
 {
     let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
+    // page, so the u64 cast is aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     let svctest = svctest_dir_cap(ipc_buf);
@@ -316,6 +320,8 @@ pub fn fs_write_phase(_: &Caps)
 pub fn fs_create_remove_phase(_: &Caps)
 {
     let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
+    // page, so the u64 cast is aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     let svctest = svctest_dir_cap(ipc_buf);
@@ -347,6 +353,8 @@ pub fn fs_create_remove_phase(_: &Caps)
 pub fn fs_mkdir_phase(_: &Caps)
 {
     let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
+    // page, so the u64 cast is aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     let svctest = svctest_dir_cap(ipc_buf);
@@ -382,6 +390,8 @@ pub fn fs_mkdir_phase(_: &Caps)
 pub fn fs_rename_phase(_: &Caps)
 {
     let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
+    // page, so the u64 cast is aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     let svctest = svctest_dir_cap(ipc_buf);
@@ -494,7 +504,9 @@ pub fn fs_request_bounds_phase(_: &Caps)
     std::os::seraph::log!("fs_request_bounds phase passed");
 }
 
-#[allow(clippy::too_many_lines, clippy::items_after_statements)]
+// too_many_lines: one sequential scenario (stage a page, write it through
+// FS_WRITE_MEMORY, read it back through std::fs) whose steps share state.
+#[allow(clippy::too_many_lines)]
 pub fn fs_write_memory_phase(_: &Caps)
 {
     use std::io::Read;
@@ -504,6 +516,8 @@ pub fn fs_write_memory_phase(_: &Caps)
     const WRITE_LEN: usize = 2048;
 
     let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
+    // page, so the u64 cast is aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     let svctest = svctest_dir_cap(ipc_buf);
@@ -592,6 +606,8 @@ pub fn fs_write_memory_phase(_: &Caps)
 pub fn fs_write_cache_coherence_phase(_: &Caps)
 {
     let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
+    // page, so the u64 cast is aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     let svctest = svctest_dir_cap(ipc_buf);
@@ -617,6 +633,8 @@ pub fn fs_write_cache_coherence_phase(_: &Caps)
     std::os::seraph::log!("fs_write_cache_coherence phase passed");
 }
 
+// too_many_lines: three scoped write-invariant checks (rights attenuation,
+// empty-file dedupe, FAT chain past EOC) sharing the phase's directory caps.
 #[allow(clippy::too_many_lines)]
 pub fn fs_write_invariants_phase(_: &Caps)
 {
@@ -626,6 +644,8 @@ pub fn fs_write_invariants_phase(_: &Caps)
     const INLINE_CHUNK: usize = 504;
 
     let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
+    // page, so the u64 cast is aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 

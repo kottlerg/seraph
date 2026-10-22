@@ -393,6 +393,9 @@ unsafe fn clear_sip_ssip()
 ///
 /// Called with interrupts disabled (sstatus.SIE is cleared on trap entry).
 #[cfg(not(test))]
+// too_many_lines: the single scause dispatch (interrupt, syscall, user fault,
+// kernel fault) stays one function so the trap-frame ownership and SIE
+// discipline read in one place.
 #[allow(clippy::too_many_lines)]
 extern "C" fn trap_dispatch(frame: &mut TrapFrame)
 {

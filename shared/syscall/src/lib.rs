@@ -2587,14 +2587,20 @@ pub fn thread_bind_notification(
 ///
 /// When a thread in the target address space takes a *terminal* fault — any
 /// kill outcome of the fault protocol: no fault handler bound, a `KILL` reply,
-/// or a cancelled fault episode (docs/fault-handling.md § Delivery, Resume,
-/// and Kill) — the kernel posts
+/// or a fault episode cancelled by destruction of the handler thread or of its
+/// queued-on endpoint, or by a later receive on the handler; a stop of the
+/// faulting thread before any reply claims the fault cancels the episode, and
+/// the terminal fault takes effect, and is posted, only if the thread is
+/// started again (docs/fault-handling.md § Delivery, Resume, and Kill) — the
+/// kernel posts
 /// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
 /// `event_queue_cap`, where `exit_reason` is the fault class
 /// (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on
 /// riscv64). Normal `thread_exit` does NOT post to these
 /// observers. Passing `correlator = 0` keeps the payload equal to the bare
-/// fault class (low 32 bits).
+/// fault class (low 32 bits). If the address space has already faulted
+/// terminally, the kernel posts the retained reason to `event_queue_cap` at
+/// once and the call still succeeds.
 ///
 /// `aspace_cap` requires the `CONTROL` right; `event_queue_cap` requires the
 /// `POST` right. Multiple observers can be registered — up to the kernel's

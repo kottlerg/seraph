@@ -1079,6 +1079,9 @@ fn bsp_stall_check(own_heartbeat: u64)
 /// entries, the walked TCB fields and the blocking objects are read without
 /// their locks, a diagnostic-only residual #440 records.
 #[cfg(not(test))]
+// too_many_lines: one flat, sequential diagnostic dump (per-CPU snapshot,
+// sleep list, registry walk); splitting it would scatter the try-lock and
+// unlocked-read discipline the rustdoc states.
 #[allow(clippy::too_many_lines)]
 fn watchdog_dump(reason: &str)
 {

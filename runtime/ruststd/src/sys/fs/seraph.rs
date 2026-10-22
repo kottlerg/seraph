@@ -99,8 +99,9 @@ const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 /// that also fits within the current page goes inline; anything larger
 /// or page-straddling takes the frame path.
 ///
-/// 504 is the FS_READ IPC reply ceiling: 63 data words × 8 bytes minus
-/// the 8-byte length prefix in word 0 (`abi/syscall/MSG_DATA_WORDS_MAX`).
+/// 504 is the FS_READ IPC reply ceiling: 64 data words
+/// (`abi/syscall/MSG_DATA_WORDS_MAX`) × 8 bytes minus the 8-byte length
+/// prefix in word 0.
 /// At or below this size, a single FS_READ carries the bytes. The
 /// `fsbench` numbers in `services/fs/docs/fs-driver-protocol.md` show
 /// inline is roughly 2× cheaper per call on both x86_64 and riscv64,
@@ -111,8 +112,8 @@ const READ_INLINE_THRESHOLD: usize = 504;
 /// Per-call crossover threshold between the inline FS_WRITE path and
 /// the zero-copy FS_WRITE_MEMORY path. A `write()` of at most this many
 /// bytes goes inline; anything larger takes the frame path. Mirrors
-/// `READ_INLINE_THRESHOLD` for symmetry: 504 bytes = 63 data words ×
-/// 8 bytes − 8 bytes of length prefix in word 0.
+/// `READ_INLINE_THRESHOLD` for symmetry: 504 bytes = 64 data words
+/// (`MSG_DATA_WORDS_MAX`) × 8 bytes − 8 bytes of length prefix in word 0.
 const WRITE_INLINE_THRESHOLD: usize = 504;
 
 // ── Public type stubs ─────────────────────────────────────────────────────
@@ -1312,8 +1313,8 @@ impl File
 
         // Inline path: small reads or page-tail reads that don't cross a
         // page boundary. Threshold equals the FS_READ IPC payload
-        // ceiling: 63 data words × 8 bytes = 504, minus the 8-byte
-        // length prefix in word 0. Above this a single inline reply
+        // ceiling: 64 data words (`MSG_DATA_WORDS_MAX`) × 8 bytes = 512,
+        // minus the 8-byte length prefix in word 0 = 504. Above this a single inline reply
         // cannot carry the bytes; below this the per-call cost is
         // strictly cheaper than the frame path on both x86_64 and
         // riscv64 (≈ 2× factor; see fsbench numbers recorded in

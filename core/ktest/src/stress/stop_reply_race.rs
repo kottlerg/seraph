@@ -35,10 +35,11 @@
 //! as close to simultaneously as serial syscall issue allows, alternating
 //! their order by cycle parity to cover both interleavings.
 //!
-//! With three or more CPUs, a second stopper pinned to a third CPU stops the
-//! client too, released by the controller just before its own stop and
-//! delete and after a cycle-varying spin, so two cancels race one
-//! reply-blocked client while the server is freed. A cancel that wins the
+//! With four or more CPUs, the controller pins itself to CPU 0, the server,
+//! the client and a second stopper take three distinct other CPUs, and the
+//! second stopper stops the client too, released by the controller just
+//! before its own stop and delete and after a cycle-varying spin, so two
+//! cancels race one reply-blocked client while the server is freed. A cancel that wins the
 //! `reply_tcb` CAS leaves the server's slot null, so the server's dealloc no
 //! longer reaches the client; were the client's binding still naming the
 //! server once the winner dropped the client's `sched_lock`, the other
@@ -65,9 +66,11 @@
 //! cores to race). Post-#317 the harness boots clean to
 //! `[ktest] ALL TESTS PASSED`. With a second stopper, the cell also requires
 //! every second stop to have finished before the cycle's cleanup, and some
-//! second stop to have returned `Ok` (it committed, so the two stops raced
-//! rather than the second always finding the client already stopped or
-//! gone). Any use-after-free of the freed server TCB
+//! second stop to have returned `Ok`: the second stopper sometimes reached the
+//! client before it was stopped or gone, rather than always arriving late.
+//! Userspace cannot observe that the two cancels overlapped inside one
+//! client's `sched_lock` window, so that interleaving is reached
+//! statistically across the cycles. Any use-after-free of the freed server TCB
 //! surfaces as a kernel magic-cookie debug-assert / `#PF` / double-enqueue
 //! panic that the harness reports as FAIL — it is raised by the kernel, not by
 //! this test.
@@ -77,7 +80,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
-    notification_send, notification_wait, thread_exit, thread_sleep, thread_stop,
+    notification_send, notification_wait, thread_exit, thread_set_affinity, thread_sleep,
+    thread_stop,
 };
 use syscall_abi::{RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, RIGHTS_THREAD_CONTROL, SystemInfoType};
 
@@ -102,6 +106,9 @@ const BIT_CLIENT_WOKE: u64 = 1 << 1;
 /// short window after it signals armed so the controller's race lands while the
 /// TCB still exists.
 const SERVER_SPIN: u32 = 200;
+
+/// The controller's CPU while a second stopper runs.
+const CONTROLLER_CPU: u32 = 0;
 
 /// Bound on the second stopper's cycle-varying spin between its release and
 /// its stop, so its cancel lands before, during, or after the controller's.
@@ -150,8 +157,60 @@ pub fn run(ctx: &TestContext) -> TestResult
         crate::log("ktest: stress::stop_reply_race SKIP (need 2+ CPUs)");
         return Ok(());
     }
-    let cpu_mod = u32::try_from(cpus).unwrap_or(1).max(1);
-    let second_stopper = cpus >= 3;
+    let cpu_count = u32::try_from(cpus).unwrap_or(2);
+    let second_stopper = cpus >= 4;
+    if !second_stopper
+    {
+        return cycles(
+            ctx,
+            Placement {
+                base: 0,
+                span: cpu_count,
+            },
+            false,
+        );
+    }
+    // The controller takes CPU 0 so a floor-priority child never shares its
+    // CPU and runs only after the controller's race.
+    thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
+        .map_err(|_| "stress::stop_reply_race: pin controller failed")?;
+    let result = cycles(
+        ctx,
+        Placement {
+            base: CONTROLLER_CPU + 1,
+            span: cpu_count - 1,
+        },
+        true,
+    );
+    let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
+        .map_err(|_| "stress::stop_reply_race: restore controller affinity failed");
+    result?;
+    restore
+}
+
+/// The CPUs a cycle's children take: `base + (cycle + k) % span`, with
+/// `k` = 0 for the server, 1 for the client and 2 for the second stopper, so
+/// the three are distinct whenever `span >= 3` (and the server and client
+/// whenever `span >= 2`).
+#[derive(Clone, Copy)]
+struct Placement
+{
+    base: u32,
+    span: u32,
+}
+
+impl Placement
+{
+    fn cpu(self, cycle: u32, k: u32) -> u32
+    {
+        self.base + (cycle + k) % self.span
+    }
+}
+
+/// Run [`CYCLES`] races with the children placed per `place`, a second
+/// stopper in each when `second_stopper`.
+fn cycles(ctx: &TestContext, place: Placement, second_stopper: bool) -> TestResult
+{
     STOPPER_GO.store(0, Ordering::Release);
     STOPPER_DONE.store(0, Ordering::Release);
     SECOND_STOPS_OK.store(0, Ordering::Release);
@@ -164,11 +223,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         // CYCLES is a compile-time constant well below u32::MAX, so the narrow
         // cast is safe; try_from keeps clippy honest.
         let cycle_u32 = u32::try_from(cycle).unwrap_or(0);
-        let server_cpu = cycle_u32 % cpu_mod;
+        let server_cpu = place.cpu(cycle_u32, 0);
         // Different CPU from the server: the cancel-CAS and the dealloc-free
-        // must run on different cores to actually race. With cpus >= 2,
-        // `(cycle + 1) % cpus != cycle % cpus`.
-        let client_cpu = (cycle_u32 + 1) % cpu_mod;
+        // must run on different cores to actually race (see `Placement`).
+        let client_cpu = place.cpu(cycle_u32, 1);
 
         let ep = cap_create_endpoint(ctx.memory_base)
             .map_err(|_| "stress::stop_reply_race: cap_create_endpoint failed")?;
@@ -198,7 +256,12 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         let stopper = if second_stopper
         {
-            Some(spawn_stopper(ctx, client.th, cycle_u32, cpu_mod)?)
+            Some(spawn_stopper(
+                ctx,
+                client.th,
+                cycle_u32,
+                place.cpu(cycle_u32, 2),
+            )?)
         }
         else
         {
@@ -323,13 +386,13 @@ fn race(
     Ok(())
 }
 
-/// Spawn the cycle's second stopper on a CPU other than the server's and the
-/// client's, holding a CONTROL copy of the client's Thread capability.
+/// Spawn the cycle's second stopper on `cpu`, distinct from the server's, the
+/// client's and the controller's (see `Placement`), holding a CONTROL copy of the client's Thread capability.
 fn spawn_stopper(
     ctx: &TestContext,
     client_th: u32,
     cycle: u32,
-    cpu_mod: u32,
+    cpu: u32,
 ) -> Result<spawn::SpawnedChild, &'static str>
 {
     let stopper = spawn::new_child(ctx)
@@ -340,9 +403,7 @@ fn spawn_stopper(
     let arg = u64::from(target) | (u64::from(cycle + 1) << 32);
     // SAFETY: stack index 2 is the stopper's; sequential cycles never alias.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[2]) });
-    // With cpu_mod >= 3 this differs from the server's (cycle) and the
-    // client's (cycle + 1) CPU.
-    spawn::configure_and_start_pinned(&stopper, stopper_entry, stack, arg, (cycle + 2) % cpu_mod)
+    spawn::configure_and_start_pinned(&stopper, stopper_entry, stack, arg, cpu)
         .map_err(|_| "stress::stop_reply_race: start stopper failed")?;
     Ok(stopper)
 }

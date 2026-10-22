@@ -53,6 +53,10 @@ pub fn phases_pre_relative() -> &'static [Phase]
             run: fs_rename_phase,
         },
         Phase {
+            name: "fs_request_bounds",
+            run: fs_request_bounds_phase,
+        },
+        Phase {
             name: "fs_write_memory",
             run: fs_write_memory_phase,
         },
@@ -408,6 +412,82 @@ pub fn fs_rename_phase(_: &Caps)
     fs_remove(svctest, dst, ipc_buf).expect("cleanup dst");
     let _ = syscall::cap_delete(svctest);
     std::os::seraph::log!("fs_rename phase passed");
+}
+
+/// Client-controlled lengths fatfs must bound before use: an inline
+/// `FS_READ` asking for more than fits the reply returns a short read of the
+/// 504-byte inline ceiling, and an `FS_RENAME` whose name lengths overflow
+/// their sum is refused with `IO_ERROR`. fatfs answers every request (it
+/// panicked on either before the bounds), so a later read still succeeds.
+pub fn fs_request_bounds_phase(_: &Caps)
+{
+    // The inline reply ceiling: MSG_DATA_WORDS_MAX words after word 0's count.
+    const INLINE_MAX: usize = (syscall_abi::MSG_DATA_WORDS_MAX - 1) * 8;
+
+    let info = startup_info();
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let svctest = svctest_dir_cap(ipc_buf);
+
+    let name: &[u8] = b"bounds.bin";
+    let _ = fs_remove(svctest, name, ipc_buf);
+    let (cap, _) = fs_create(svctest, name, ipc_buf).expect("FS_CREATE bounds failed");
+    #[allow(clippy::cast_possible_truncation)]
+    let pattern: Vec<u8> = (0..1024u32).map(|i| (i * 7 + 3) as u8).collect();
+    for (i, chunk) in pattern.chunks(INLINE_MAX).enumerate()
+    {
+        fs_write_inline(cap, (i * INLINE_MAX) as u64, chunk, ipc_buf)
+            .expect("FS_WRITE bounds failed");
+    }
+
+    // A sector-aligned read of a whole sector or more filled 65 reply words.
+    for max_len in [512, u64::MAX]
+    {
+        let got = fs_read_bytes(cap, 0, max_len, ipc_buf)
+            .expect("fs_request_bounds: oversize FS_READ failed");
+        assert_eq!(
+            got.len(),
+            INLINE_MAX,
+            "fs_request_bounds: FS_READ max_len={max_len} returned {} bytes",
+            got.len()
+        );
+        assert_eq!(
+            &got[..],
+            &pattern[..INLINE_MAX],
+            "fs_request_bounds: FS_READ bytes"
+        );
+    }
+
+    // Name lengths whose sum overflows; the names themselves are short.
+    for (src_len, dst_len) in [(u64::MAX, 1), (1, u64::MAX - 8)]
+    {
+        let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_RENAME)
+            .word(0, src_len)
+            .word(1, dst_len)
+            .bytes(2, b"ab")
+            .build();
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(svctest, &msg, ipc_buf) }
+            .expect("fs_request_bounds: FS_RENAME ipc_call failed");
+        assert_eq!(
+            reply.label,
+            ipc::fs_errors::IO_ERROR,
+            "fs_request_bounds: FS_RENAME src_len={src_len} dst_len={dst_len} returned {}",
+            reply.label
+        );
+    }
+
+    let got = fs_read_bytes(cap, 0, 16, ipc_buf).expect("fs_request_bounds: FS_READ after");
+    assert_eq!(
+        &got[..],
+        &pattern[..16],
+        "fs_request_bounds: fatfs still serves reads"
+    );
+
+    let _ = syscall::cap_delete(cap);
+    fs_remove(svctest, name, ipc_buf).expect("cleanup bounds.bin");
+    let _ = syscall::cap_delete(svctest);
+    std::os::seraph::log!("fs_request_bounds phase passed");
 }
 
 #[allow(clippy::too_many_lines, clippy::items_after_statements)]

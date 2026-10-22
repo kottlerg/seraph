@@ -1578,14 +1578,20 @@ fn handle_rename_node_cap(
     let src_len = msg.word(0) as usize;
     let dst_len = msg.word(1) as usize;
     let data_bytes = msg.data_bytes();
-    let name_off = 16; // words 0,1 = lengths (16 bytes), names from word 2
-    if src_len == 0 || dst_len == 0 || data_bytes.len() < name_off + src_len + dst_len
+    let name_off: usize = 16; // words 0,1 = lengths (16 bytes), names from word 2
+    // Both lengths are client words: bound their sum without overflow
+    // before slicing.
+    let Some(name_end) = name_off
+        .checked_add(src_len)
+        .and_then(|end| end.checked_add(dst_len))
+        .filter(|&end| src_len != 0 && dst_len != 0 && end <= data_bytes.len())
+    else
     {
         reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
-    }
+    };
     let src_name = &data_bytes[name_off..name_off + src_len];
-    let dst_name = &data_bytes[name_off + src_len..name_off + src_len + dst_len];
+    let dst_name = &data_bytes[name_off + src_len..name_end];
 
     if namespace_protocol::validate_name(src_name).is_err()
         || namespace_protocol::validate_name(dst_name).is_err()

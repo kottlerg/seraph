@@ -83,8 +83,9 @@ reject with `NsError::PermissionDenied` otherwise.
 
 Used for short reads (≤ 504 bytes that fit within the current page);
 larger or page-straddling reads use
-[`FS_READ_MEMORY`](#label-7-fs_read_memory). The threshold is
-client-side policy, not server-enforced; see
+[`FS_READ_MEMORY`](#label-7-fs_read_memory). Which label a read uses is
+client-side policy: the server accepts either, and answers an inline
+request for more than 504 bytes with a short read of at most 504; see
 [Inline-vs-memory-cap crossover](#inline-vs-memory-cap-crossover-client-policy).
 
 **Request**

@@ -1802,6 +1802,9 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Clears the back-pointer on the source. Stale entries for the removed
 /// member are silently skipped by subsequent `SYS_WAIT_SET_WAIT` calls.
 #[cfg(not(test))]
+// too_many_lines: one logical operation (cap resolution plus the per-source
+// back-pointer clear under the documented lock order) whose source arms share
+// the lock bookkeeping.
 #[allow(clippy::too_many_lines)]
 pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {

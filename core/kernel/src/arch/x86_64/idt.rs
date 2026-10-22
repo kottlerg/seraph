@@ -12,11 +12,12 @@
 //! - A common exception handler that prints diagnostics and halts.
 //!
 //! Every ring-3 entry at which a thread can be stopped (exception, `#PF`, and
-//! ring-3 IRQ; a ring-3 NMI is terminal or returns) builds the one canonical [`TrapFrame`] on the kernel stack via
-//! `tf_build_asm` and writes it back on exit via `tf_restore_asm` (inside
-//! `tf_resume_asm` for the normal stubs, `paranoid_exit_asm` for the paranoid
-//! ones); the fault redirect points `tcb->trap_frame` at that live frame with no
-//! copy. See the "Unified entry frame" section.
+//! ring-3 IRQ; a ring-3 NMI is terminal or returns) builds the one canonical
+//! [`TrapFrame`] on the kernel stack via `tf_build_asm` and writes it back on
+//! exit via `tf_restore_asm` (inside `tf_resume_asm` for the normal stubs,
+//! `paranoid_exit_asm` for the paranoid ones); the fault redirect points
+//! `tcb->trap_frame` at that live frame with no copy. See the "Unified entry
+//! frame" section.
 //!
 //! # Entry and exit discipline
 //! Every stub that runs kernel code clears DF and AC (`cld`, `clac`) on entry and
@@ -128,7 +129,7 @@ struct Idtr
 // ── Unified entry frame ─────────────────────────────────────────────────────
 //
 // Every ring-3 entry at which a thread can be stopped — syscall (syscall.rs),
-// exception/#PF/NMI, and ring-3 IRQ — lands on the one canonical `TrapFrame`
+// exception/#PF, and ring-3 IRQ (a ring-3 NMI is terminal or returns) — lands on the one canonical `TrapFrame`
 // (the userspace register ABI). The fault redirect points `tcb->trap_frame` at
 // the live on-stack frame directly (symmetric with
 // riscv64/interrupts.rs::redirect_user_fault), so there is no second frame type

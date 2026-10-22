@@ -496,7 +496,12 @@ domains:
    under the client's per-TCB `sched_lock` — not a per-CPU scheduler.lock and not `ep.lock`. The
    lock is held across a re-read of the client's `blocked_on_object` and the CAS; a dying server
    nulls a claimed client's `blocked_on_object` under that same `sched_lock` before it is freed, so
-   observing `blocked_on_object == server` under the lock pins the server alive for the CAS.
+   observing `blocked_on_object == server` under the lock pins the server alive for the CAS. On a
+   CAS win the cancel clears the client's `(ipc_state, blocked_on_object)` binding in the same
+   `sched_lock` hold: the server's `reply_tcb` is now null, so its dealloc (actor 6) no longer
+   reaches this client, and a binding left naming the server would let a second canceller, or the
+   client's own `dealloc_object(Thread)`, pass the re-read after the server is freed (see
+   [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 7).
 5. **Client dealloc via `dealloc_object(Thread)`** —
    `compare_exchange(this_client, null, AcqRel, Acquire)` in the BlockedOnReply branch of the
    source-IPC unlink walk. Mirrors `cancel_ipc_block`'s discipline.

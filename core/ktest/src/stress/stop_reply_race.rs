@@ -35,6 +35,17 @@
 //! as close to simultaneously as serial syscall issue allows, alternating
 //! their order by cycle parity to cover both interleavings.
 //!
+//! With three or more CPUs, a second stopper pinned to a third CPU stops the
+//! client too, released by the controller just before its own stop and
+//! delete and after a cycle-varying spin, so two cancels race one
+//! reply-blocked client while the server is freed. A cancel that wins the
+//! `reply_tcb` CAS leaves the server's slot null, so the server's dealloc no
+//! longer reaches the client; were the client's binding still naming the
+//! server once the winner dropped the client's `sched_lock`, the other
+//! cancel's `blocked_on == server` re-read would pass and its CAS would run
+//! on the freed server. The winner clears the binding inside that same hold
+//! (core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 7).
+//!
 //! ## Anti-vacuous guard
 //!
 //! A run that never armed the race (server never received, so no client was
@@ -52,17 +63,23 @@
 //!
 //! SMP-only (skips on `< 2` CPUs — the free and the CAS must run on different
 //! cores to race). Post-#317 the harness boots clean to
-//! `[ktest] ALL TESTS PASSED`. Any use-after-free of the freed server TCB
+//! `[ktest] ALL TESTS PASSED`. With a second stopper, the cell also requires
+//! every second stop to have finished before the cycle's cleanup, and some
+//! second stop to have returned `Ok` (it committed, so the two stops raced
+//! rather than the second always finding the client already stopped or
+//! gone). Any use-after-free of the freed server TCB
 //! surfaces as a kernel magic-cookie debug-assert / `#PF` / double-enqueue
 //! panic that the harness reports as FAIL — it is raised by the kernel, not by
 //! this test.
+
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
     notification_send, notification_wait, thread_exit, thread_sleep, thread_stop,
 };
-use syscall_abi::{RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, SystemInfoType};
+use syscall_abi::{RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, RIGHTS_THREAD_CONTROL, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -85,6 +102,24 @@ const BIT_CLIENT_WOKE: u64 = 1 << 1;
 /// short window after it signals armed so the controller's race lands while the
 /// TCB still exists.
 const SERVER_SPIN: u32 = 200;
+
+/// Bound on the second stopper's cycle-varying spin between its release and
+/// its stop, so its cancel lands before, during, or after the controller's.
+const STOPPER_SPIN_MAX: u32 = 64;
+
+/// Bound on the controller's wait for the second stopper to finish a cycle's
+/// stop, in 1 ms sleeps.
+const STOPPER_WAIT_MS: u32 = 2000;
+
+/// Controller → second stopper: the cycle, counted from 1, whose client it is
+/// to stop now. The stopper spins on it rather than blocking, so its release
+/// costs no wake latency.
+static STOPPER_GO: AtomicU32 = AtomicU32::new(0);
+/// Second stopper → controller: the cycle, counted from 1, whose stop it has
+/// returned from.
+static STOPPER_DONE: AtomicU32 = AtomicU32::new(0);
+/// Second stops that returned `Ok`.
+static SECOND_STOPS_OK: AtomicU32 = AtomicU32::new(0);
 
 /// A page-aligned 4 KiB IPC buffer page (`MSG_DATA_WORDS_MAX`-wide, like
 /// ktest's own `IPC_BUF`). One per concurrent child.
@@ -116,6 +151,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     }
     let cpu_mod = u32::try_from(cpus).unwrap_or(1).max(1);
+    let second_stopper = cpus >= 3;
+    STOPPER_GO.store(0, Ordering::Release);
+    STOPPER_DONE.store(0, Ordering::Release);
+    SECOND_STOPS_OK.store(0, Ordering::Release);
 
     // Anti-vacuous accumulator: every cycle must arm the race exactly once.
     let mut armed_cycles = 0usize;
@@ -156,6 +195,15 @@ pub fn run(ctx: &TestContext) -> TestResult
             client_cpu,
         )
         .map_err(|_| "stress::stop_reply_race: start client failed")?;
+
+        let stopper = if second_stopper
+        {
+            Some(spawn_stopper(ctx, client.th, cycle_u32, cpu_mod)?)
+        }
+        else
+        {
+            None
+        };
 
         // Let the client reach `ipc_call` and park on the endpoint send queue
         // before the server receives it (the children run strictly below
@@ -200,28 +248,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         // its short busy-spin (TCB still live) when the race fires.
         let _ = thread_sleep(1);
 
-        // ── The race. ───────────────────────────────────────────────────────
-        //
-        // A: thread_stop(client) → cancel_ipc_block BlockedOnReply arm → the
-        //    (now-guarded) server.reply_tcb CAS, reading the server TCB.
-        // B: cap_delete(server th) → dealloc(Thread) → claim-CAS → gates →
-        //    deferred client wake → retype_free of the server TCB.
-        //
-        // Client and server are pinned to different CPUs, so A's CAS and B's
-        // free execute on different cores. Alternate the issue order by parity
-        // to cover both interleavings.
-        if cycle % 2 == 0
-        {
-            let _ = thread_stop(client.th);
-            cap_delete(server.th)
-                .map_err(|_| "stress::stop_reply_race: cap_delete server th (A-first) failed")?;
-        }
-        else
-        {
-            cap_delete(server.th)
-                .map_err(|_| "stress::stop_reply_race: cap_delete server th (B-first) failed")?;
-            let _ = thread_stop(client.th);
-        }
+        race(cycle_u32, client.th, server.th, stopper)?;
 
         // ── Per-cycle cleanup. ──────────────────────────────────────────────
         //
@@ -245,8 +272,94 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         return Err("stress::stop_reply_race: race never armed on some cycle");
     }
+    if second_stopper && SECOND_STOPS_OK.load(Ordering::Acquire) == 0
+    {
+        return Err(
+            "stress::stop_reply_race: no second stop committed (the two-stop race never armed)",
+        );
+    }
 
     Ok(())
+}
+
+/// The race, A: `thread_stop(client)` → `cancel_ipc_block`'s
+/// `BlockedOnReply` arm → the (guarded) `server.reply_tcb` CAS, reading the
+/// server TCB; B: `cap_delete(server th)` → `dealloc_object(Thread)` →
+/// claim-CAS → gates → deferred client wake → `retype_free` of the server
+/// TCB. Client and server are pinned to different CPUs, so A's CAS and B's
+/// free execute on different cores; the issue order alternates by cycle
+/// parity to cover both interleavings. A second stopper, if any, is released
+/// first and races A with a second cancel, then is reaped once its stop
+/// returns.
+fn race(
+    cycle: u32,
+    client_th: u32,
+    server_th: u32,
+    stopper: Option<spawn::SpawnedChild>,
+) -> TestResult
+{
+    STOPPER_GO.store(cycle + 1, Ordering::Release);
+    if cycle.is_multiple_of(2)
+    {
+        let _ = thread_stop(client_th);
+        cap_delete(server_th)
+            .map_err(|_| "stress::stop_reply_race: cap_delete server th (A-first) failed")?;
+    }
+    else
+    {
+        cap_delete(server_th)
+            .map_err(|_| "stress::stop_reply_race: cap_delete server th (B-first) failed")?;
+        let _ = thread_stop(client_th);
+    }
+
+    if let Some(stopper) = stopper
+    {
+        await_stopper(cycle + 1)?;
+        cap_delete(stopper.th)
+            .map_err(|_| "stress::stop_reply_race: cap_delete stopper th failed")?;
+        cap_delete(stopper.cs)
+            .map_err(|_| "stress::stop_reply_race: cap_delete stopper cs failed")?;
+    }
+    Ok(())
+}
+
+/// Spawn the cycle's second stopper on a CPU other than the server's and the
+/// client's, holding a CONTROL copy of the client's Thread capability.
+fn spawn_stopper(
+    ctx: &TestContext,
+    client_th: u32,
+    cycle: u32,
+    cpu_mod: u32,
+) -> Result<spawn::SpawnedChild, &'static str>
+{
+    let stopper = spawn::new_child(ctx)
+        .map_err(|_| "stress::stop_reply_race: spawn::new_child stopper failed")?;
+    let target = cap_copy(client_th, stopper.cs, RIGHTS_THREAD_CONTROL)
+        .map_err(|_| "stress::stop_reply_race: cap_copy stopper target failed")?;
+    // arg packs target_slot[31:0] | cycle (from 1)[63:32].
+    let arg = u64::from(target) | (u64::from(cycle + 1) << 32);
+    // SAFETY: stack index 2 is the stopper's; sequential cycles never alias.
+    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[2]) });
+    // With cpu_mod >= 3 this differs from the server's (cycle) and the
+    // client's (cycle + 1) CPU.
+    spawn::configure_and_start_pinned(&stopper, stopper_entry, stack, arg, (cycle + 2) % cpu_mod)
+        .map_err(|_| "stress::stop_reply_race: start stopper failed")?;
+    Ok(stopper)
+}
+
+/// Wait, bounded by [`STOPPER_WAIT_MS`], until the second stopper has
+/// returned from cycle `round`'s stop.
+fn await_stopper(round: u32) -> TestResult
+{
+    for _ in 0..STOPPER_WAIT_MS
+    {
+        if STOPPER_DONE.load(Ordering::Acquire) == round
+        {
+            return Ok(());
+        }
+        let _ = thread_sleep(1);
+    }
+    Err("stress::stop_reply_race: the second stopper did not finish its stop")
 }
 
 // ── Child entries ───────────────────────────────────────────────────────────
@@ -292,6 +405,34 @@ fn server_entry(arg: u64) -> !
     {
         core::hint::spin_loop();
     }
+    thread_exit()
+}
+
+/// Second stopper: spin until the controller releases this cycle, spin a
+/// cycle-varying delay, stop the client, and record the stop's return.
+// cast_possible_truncation: the target is a kernel cap slot index < 2^32 and
+// the cycle fits the high half.
+#[allow(clippy::cast_possible_truncation)]
+fn stopper_entry(arg: u64) -> !
+{
+    let target = (arg & 0xFFFF_FFFF) as u32;
+    let round = (arg >> 32) as u32;
+    while STOPPER_GO.load(Ordering::Acquire) != round
+    {
+        core::hint::spin_loop();
+    }
+    for _ in 0..(round % STOPPER_SPIN_MAX)
+    {
+        core::hint::spin_loop();
+    }
+    // Ok, InvalidState (the controller's stop reached the client first), or
+    // an error for a client already woken and exited: only the commit is
+    // tallied.
+    if thread_stop(target).is_ok()
+    {
+        SECOND_STOPS_OK.fetch_add(1, Ordering::AcqRel);
+    }
+    STOPPER_DONE.store(round, Ordering::Release);
     thread_exit()
 }
 

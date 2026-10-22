@@ -2585,11 +2585,14 @@ pub fn thread_bind_notification(
 
 /// Register a terminal-fault death-notification observer on an address space.
 ///
-/// When a thread in the target address space takes a *terminal* fault — no
-/// fault handler bound, or the handler replies `KILL` — the kernel posts
+/// When a thread in the target address space takes a *terminal* fault — any
+/// kill outcome of the fault protocol: no fault handler bound, a `KILL` reply,
+/// or a cancelled fault episode (docs/fault-handling.md § Delivery, Resume,
+/// and Kill) — the kernel posts
 /// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
 /// `event_queue_cap`, where `exit_reason` is the fault class
-/// (`EXIT_FAULT_BASE + vector`). Normal `thread_exit` does NOT post to these
+/// (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on
+/// riscv64). Normal `thread_exit` does NOT post to these
 /// observers. Passing `correlator = 0` keeps the payload equal to the bare
 /// fault class (low 32 bits).
 ///

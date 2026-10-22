@@ -56,7 +56,7 @@ use fat::{next_cluster, read_file_data};
 use file::{MAX_OPEN_FILES, OpenFile, OutstandingPage};
 use ipc::{IpcMessage, fs_labels, ns_labels};
 use namespace_protocol::{GateError, NamespaceRights, NodeId, NodeKind, gate, pack as pack_badge};
-use syscall_abi::{PAGE_SIZE, RIGHTS_MEM_MAP};
+use syscall_abi::{MSG_DATA_WORDS_MAX, PAGE_SIZE, RIGHTS_MEM_MAP};
 
 /// Monotonic counter for open-file slot identity. Starts at 1 (0 = unbadged).
 ///
@@ -476,7 +476,9 @@ fn handle_read_node_cap(
     }
 
     let offset = msg.word(0);
-    let max_len = msg.word(1);
+    // The reply carries the count in word 0, so the data fits in the
+    // remaining MSG_DATA_WORDS_MAX - 1 words.
+    let max_len = msg.word(1).min(((MSG_DATA_WORDS_MAX - 1) * 8) as u64);
 
     let mut out = [0u8; SECTOR_SIZE];
     let bytes_read = read_file_data(

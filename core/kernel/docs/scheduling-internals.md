@@ -196,20 +196,23 @@ hang). See § Thread Registry.
    nested). Every read or write of the source's waiter queue (or its endpoint wait queue) then
    requires the matching source lock; reads from non-owning CPUs without it are races. After the
    unlink the binding is cleared under `sched_lock` only when this cancel won the claim and the
-   binding's `ipc_state` and `park_seq` still match the snapshot; a lost claim's waker clears it
-   in `enqueue_and_wake`. The dealloc paths in
-   `core/kernel/src/cap/object.rs` (Endpoint, Notification, EventQueue, WaitSet, and Thread arms)
-   follow the same source-lock rule. **The `BlockedOnReply`/`BlockedOnFault` reply binding is the
-   exception with no source lock: its `server.reply_tcb` CAS dereferences the *server* TCB, which a
-   concurrent `dealloc_object(Thread)` on the server could free (#317).** That CAS is instead
-   performed under the *client's* `(*tcb).sched_lock`, gated by a
-   `(*tcb).blocked_on_object == server` re-read — by `cancel_ipc_block` and by the two
-   `dealloc_object(Thread)` client-side reply/fault arms alike. `dealloc_object(Thread)` on the
-   *server* nulls a claimed client's `blocked_on_object` under that same client `sched_lock`
-   strictly before `retype_free`. By the CLOSURE LEMMA (§ Cross-CPU TCB Ownership, Reply slot)
-   observing `blocked_on == server` under the client lock proves the server is not yet freed, so the
-   CAS dereferences live memory. Each site holds exactly one TCB's `sched_lock` and runs a wait-free
-   CAS on the other TCB, preserving the never-two-`sched_lock`s rule.
+   binding's `ipc_state` and `park_seq` still match the snapshot; a lost claim's waker clears it in
+   `enqueue_and_wake`. The dealloc paths in `core/kernel/src/cap/object.rs` (Endpoint, Notification,
+   EventQueue, WaitSet, and Thread arms) follow the same source-lock rule. **The
+   `BlockedOnReply`/`BlockedOnFault` reply binding is the exception with no source lock: its
+   `server.reply_tcb` CAS dereferences the *server* TCB, which a concurrent `dealloc_object(Thread)`
+   on the server could free (#317).** That CAS is instead performed under the *client's*
+   `(*tcb).sched_lock`, gated by a `(*tcb).blocked_on_object == server` re-read — by
+   `cancel_ipc_block` and by the two `dealloc_object(Thread)` client-side reply/fault arms alike.
+   `dealloc_object(Thread)` on the *server* nulls a claimed client's `blocked_on_object` under that
+   same client `sched_lock` strictly before `retype_free`. By the CLOSURE LEMMA (§ Cross-CPU TCB
+   Ownership, Reply slot) observing `blocked_on == server` under the client lock proves the server
+   is not yet freed, so the CAS dereferences live memory. The lemma needs the binding cleared
+   whenever `reply_tcb` is: a won CAS leaves the server's `reply_tcb` null, so
+   `dealloc_object(Thread)` on the server no longer reaches this client, and `cancel_ipc_block`
+   clears the client's binding inside the same `sched_lock` hold as its CAS win, before any second
+   canceller can re-read it. Each site holds exactly one TCB's `sched_lock` and runs a wait-free CAS
+   on the other TCB, preserving the never-two-`sched_lock`s rule.
 
 8. **Blocking commit MUST go through `commit_blocked_under_local_lock`.** A primitive that parks the
    calling thread (`notification_wait`, `event_queue_recv`, `endpoint_call`, `waitset_wait`) MUST
@@ -341,9 +344,9 @@ write, and the canonical helper / locks held. Deviations from this table are bug
 | `Running` | `Blocked` | IPC blocking entry (`endpoint_call`, `notification_wait`, `event_queue_recv`, `waitset_wait`) | running CPU | `commit_blocked_under_local_lock(tcb, ipc, blocked_on)` (acquires `(*tcb).sched_lock`); on a refusal (`ParkCommit::RefusedStop`: a stop/exit won; `ParkCommit::RefusedWake`: `wake_pending` forced a refuse-to-park) the IPC primitive rolls back its waiter registration — a `RefusedStop` rollback stamps the episode cancelled, a `RefusedWake` rollback leaves the deposited payload, and `endpoint_call` stamps the call cancelled on either refusal (Lock Hierarchy rule 8). `endpoint_recv`'s dequeued sender rebinds via `commit_reply_rebind_under_local_lock` instead |
 | `Blocked` | `Ready` | IPC wake (`notification_send`, `event_queue_post`, `endpoint_reply`, `endpoint_call` server-wake, `waitset_notify`, and the receive-entry release of an unreplied caller, `release_unreplied_caller`, per [ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model) | wake-issuing CPU | source IPC lock to snapshot wakeup payload, *released*, then `enqueue_and_wake(target_cpu)`; `endpoint_reply` takes no source lock: the `reply_tcb` CAS is the claim, then stamp and `enqueue_and_wake(target_cpu)`; `release_unreplied_caller` takes none either: the `reply_tcb` `swap(null)` is the claim, then the INTERRUPTED stamp and `enqueue_and_wake(target_cpu)` |
 | `Blocked` | `Ready` | timeout from sleep list | timer-firing CPU | `SLEEP_LIST_LOCK` to pop expired entries (released first), then source IPC lock to arbitrate (the TCB still queued on the source in the popped park) and write the wake payload (a plain sleeper is claimed at the pop), then `enqueue_and_wake(target_cpu)` |
-| `Blocked` | `Blocked` (binding cleared) | `cancel_ipc_block` (called from `sys_thread_stop` or the object-teardown stop on a blocked target) | calling CPU | `(*tcb).sched_lock` to snapshot `(state, ipc_state, blocked_on_object, park_seq)` and re-verify `Blocked` (cancelling a plain sleep through `sleep_list_remove` under it; released first), then the source IPC lock matching `tcb.ipc_state` to unlink the waiter, then `sched_lock` again to clear the binding only if this cancel claimed the park (a lost claim's waker owns the episode and clears the binding in `enqueue_and_wake`, on its link path or in its arm that aborts on a thread the stop committed `Stopped` or `Exited` over meanwhile; it may already have let the thread park again, on the same source or another of the same kind, and the caller's commit retries on the changed `park_seq`); the caller's commit then writes `Stopped` or `Exited` |
+| `Blocked` | `Blocked` (binding cleared) | `cancel_ipc_block` (called from `sys_thread_stop` or the object-teardown stop on a blocked target) | calling CPU | `(*tcb).sched_lock` to snapshot `(state, ipc_state, blocked_on_object, park_seq)` and re-verify `Blocked` (cancelling a plain sleep through `sleep_list_remove` under it; released first), then the source IPC lock matching `tcb.ipc_state` to unlink the waiter, then `sched_lock` again to clear the binding only if this cancel claimed the park (the reply and fault arms instead clear it inside the `sched_lock` hold of their `reply_tcb` CAS win; a lost claim's waker owns the episode and clears the binding in `enqueue_and_wake`, on its link path or in its arm that aborts on a thread the stop committed `Stopped` or `Exited` over meanwhile; it may already have let the thread park again, on the same source or another of the same kind, and the caller's commit retries on the changed `park_seq`); the caller's commit then writes `Stopped` or `Exited` |
 | `Running` | `Blocked` (`BlockedOnFault`) | fault redirection — `ipc::fault::fault_dispatch` delivering a kernel-unresolvable fault to the thread's bound handler endpoint | running CPU (arch fault handler) | `commit_blocked_under_local_lock(tcb, BlockedOnFault, handler)`; kernel-synthesized, the faulter takes the caller role in the endpoint call/reply machinery (see [fault-handling.md](../../../docs/fault-handling.md#mechanism-overview)) |
-| `Blocked` (`BlockedOnFault`) | `Ready` | fault reply (`sys_ipc_reply`) or cancellation (handler-thread destruction, `dealloc_object(Thread)`, via `server_reply_wake`, endpoint-dealloc send-drain, the handler's next `SYS_IPC_RECV` via `release_unreplied_caller`, which records `Kill`) | wake-issuing CPU | the wake-claim winner records `fault_outcome` (`Resume`/`Kill`) then `enqueue_and_wake(target_cpu)` (`cancel_ipc_block` records `Kill` without a wake — the stop or teardown commit that follows leaves the faulter `Stopped` or `Exited` — and the `dealloc_object(Thread)` unlink of a dying faulter records nothing); the faulter resumes inside `fault_dispatch` (re-executing its faulting instruction or running the kill path) rather than returning a syscall value (see [fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill)) |
+| `Blocked` (`BlockedOnFault`) | `Ready` | fault reply (`sys_ipc_reply`) or cancellation (handler-thread destruction in `dealloc_object(Thread)`, via `server_reply_wake`; endpoint-dealloc send-drain; the handler's next `SYS_IPC_RECV`, via `release_unreplied_caller`; each records `Kill`) | wake-issuing CPU | the wake-claim winner records `fault_outcome` (`Resume`/`Kill`) then `enqueue_and_wake(target_cpu)` (`cancel_ipc_block` records `Kill` without a wake — the stop or teardown commit that follows leaves the faulter `Stopped` or `Exited` — and the `dealloc_object(Thread)` unlink of a dying faulter records nothing); the faulter resumes inside `fault_dispatch` (re-executing its faulting instruction or running the kill path) rather than returning a syscall value (see [fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill)) |
 | `Running` | `Stopped` | `sys_thread_stop` on running target | calling CPU | `commit_cancelling_park(Stopped)`; if running on a remote CPU, `prod_remote_cpu(run_cpu)` and spin until `sched_remote.current != tcb` and `context_saved == 1`, or the target is no longer `Stopped` (a teardown committed `Exited`); a stopper itself stopped meanwhile deschedules in place and, on restart, re-enters the drain only if its capability slot still names the target with Control rights, otherwise returning at once (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol)) |
 | `Ready` | `Stopped` | `sys_thread_stop` on a Ready target | calling CPU | `commit_cancelling_park(Stopped)`; the all-locks commit also walks every CPU's run queue and calls `remove_from_queue` inside the all-locks region. See § *Stopped/Exited drain* below. A target `current` on no CPU at the commit may still be finishing its switch out on the CPU it just left: the call waits (`await_stopped_save`, interrupts enabled) until its `context_saved` is set or a teardown commits `Exited`. |
 | `Blocked` | `Stopped` | `sys_thread_stop` on blocked target | calling CPU | `commit_cancelling_park(Stopped)`: `cancel_ipc_block` first (acquires the source IPC lock and unlinks the waiter), then the all-locks commit, refused and retried while the target's `park_seq` differs from the snapshot taken with the `Blocked` read — so a park committed after an unlocked `Running`/`Ready` read is cancelled too, never overwritten (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol)). A target `current` on no CPU at the commit may still be finishing its switch out on the CPU it just left: the call waits (`await_stopped_save`, interrupts enabled) until its `context_saved` is set or a teardown commits `Exited`. |
@@ -1347,9 +1350,10 @@ for a genuinely stuck IPI; a non-shootdown stall re-checks on the next tick
 once the pending slots drain.
 
 **Why kernel-side:** when every CPU is in kernel mode, no userspace monitor
-gets dispatched. The dump is also the only path that reads per-CPU
-scheduler state without blocking on a scheduler, sleep-list or registry lock
-a stalled CPU may hold (its output still takes the console lock).
+gets dispatched. The dump, like the stop drain's slow-drain warning below,
+reads per-CPU scheduler state without blocking on a scheduler, sleep-list or
+registry lock a stalled CPU may hold (its output still takes the console
+lock).
 
 **Bounded-spin diagnostics elsewhere:** two protocol-required spins (the
 `context_saved` Acquire spin in `schedule()`, which also reports a spin-site

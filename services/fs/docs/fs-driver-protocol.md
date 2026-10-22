@@ -93,7 +93,7 @@ client-side policy, not server-enforced; see
 |---|---|
 | `label` | `2` |
 | `data[0]` | Byte offset |
-| `data[1]` | Maximum bytes to read (capped at the IPC inline ceiling, 512 bytes) |
+| `data[1]` | Maximum bytes to read; the server clamps it to 504 bytes (`(MSG_DATA_WORDS_MAX - 1) × 8`, the inline reply ceiling after the count word) |
 
 **Reply (success)**
 
@@ -189,8 +189,8 @@ memory cap  otherwise
 ```
 
 `READ_INLINE_THRESHOLD = 504` bytes. This is the FS_READ IPC payload
-ceiling — 63 data words × 8 bytes minus the 8-byte length prefix in
-word 0 (`MSG_DATA_WORDS_MAX` in `abi/syscall`). Above this size a
+ceiling — `MSG_DATA_WORDS_MAX` (64, in `abi/syscall`) data words × 8
+bytes, minus the 8-byte length prefix in word 0. Above this size a
 single inline reply cannot carry the bytes; below it the per-call cost
 is strictly cheaper than the memory-cap path on both supported architectures.
 

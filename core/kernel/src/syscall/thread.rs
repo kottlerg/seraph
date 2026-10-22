@@ -641,6 +641,27 @@ unsafe fn slot_names_thread(
     }
 }
 
+/// Clear a reply/fault park binding whose `reply_tcb` CAS the caller just
+/// won, inside the same `sched_lock` hold. The won CAS leaves the server's
+/// `reply_tcb` null, so a later `dealloc_object(Thread)` of the server no
+/// longer reaches this client to null its binding before the free; a binding
+/// left naming the server past this hold would let a second canceller, or
+/// `dealloc_object(Thread)` of this client, pass its `blocked_on == server`
+/// re-read and CAS through a freed server (docs/scheduling-internals.md
+/// § Lock Hierarchy rule 7).
+///
+/// # Safety
+/// `tcb` must be a valid TCB whose `sched_lock` the caller holds.
+#[cfg(not(test))]
+unsafe fn clear_reply_binding(tcb: *mut crate::sched::thread::ThreadControlBlock)
+{
+    // SAFETY: caller holds tcb.sched_lock, which serializes these fields.
+    unsafe {
+        (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
+        (*tcb).blocked_on_object = core::ptr::null_mut();
+    }
+}
+
 /// Cancel the IPC block on a thread that is in `Blocked` state.
 ///
 /// Unlinks the thread from the relevant IPC queue and, on each arm's exclusive
@@ -870,6 +891,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                                 tcb,
                                 crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                             );
+                            clear_reply_binding(tcb);
                             (*tcb)
                                 .wake_in_flight
                                 .store(0, core::sync::atomic::Ordering::Release);
@@ -922,6 +944,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                             // CAS win = episode claim (fault disposition lives
                             // in fault_outcome; stamp the episode only).
                             crate::sched::thread::stamp_deposit_episode(tcb);
+                            clear_reply_binding(tcb);
                             (*tcb)
                                 .wake_in_flight
                                 .store(0, core::sync::atomic::Ordering::Release);
@@ -1048,7 +1071,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
     // ipc_state after it won the reply_tcb CAS. The thread's state is not
     // consulted: a concurrent stop or teardown may have committed Stopped or
     // Exited over the claimed park meanwhile, and the won claim still owns the
-    // binding (no other path clears it).
+    // binding (no other path clears it). The reply and fault arms have already
+    // cleared it inside their CAS hold (clear_reply_binding), so the ipc_state
+    // test below skips them.
     // SAFETY: tcb is valid; fields written under sched_lock.
     unsafe {
         let saved = (*tcb).sched_lock.lock_raw();

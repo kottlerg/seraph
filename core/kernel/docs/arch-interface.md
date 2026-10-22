@@ -543,8 +543,9 @@ frame in the slot just below the kernel stack top that `SYS_THREAD_CONFIGURE` in
 x86-64 the syscall entry builds it in that slot (the syscall dispatcher republishes it), while the
 interrupt and exception trampolines build it below the hardware iret words and the stub's two
 pushes and publish it through `idt::publish_user_frame`. The x86-64 entries that publish nothing
-deschedule nothing: `#DF` and `#MC` (IST1, terminal), the NMI (IST2), `#NM` (builds no
-frame), and the spurious vector 255 (`iretq` only).
+deschedule nothing the thread resumes from: `#DF` and `#MC` (IST1, terminal), the NMI (IST2;
+terminal on a hardware NMI, returning on the watchdog backtrace ping), `#NM` (builds no frame), and
+the spurious vector 255 (`iretq` only).
 
 Several paths hold the published frame as a `&mut TrapFrame` across a point where the thread is
 descheduled: the syscall dispatcher hands one to each handler for the whole syscall, including while

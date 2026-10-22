@@ -549,8 +549,8 @@ pub struct ThreadControlBlock
     /// [`crate::ipc::fault::FAULT_OUTCOME_RESUME`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_KILL`]. Set to `RESUME`/`KILL` by the
     /// single wake-claim winner (genuine reply, handler-thread destruction,
-    /// cancellation),
-    /// so resume-vs-cancellation is unambiguous. See `docs/fault-handling.md`.
+    /// cancellation), so resume-vs-cancellation is unambiguous. See
+    /// `docs/fault-handling.md`.
     pub fault_outcome: core::sync::atomic::AtomicU8,
 
     /// True while this thread is delivering / blocked on a fault. Set before

@@ -429,7 +429,8 @@ Unlink a file or empty directory. Badge = parent-directory cap with
 **Reply (success)**: `label = 0`, empty body.
 
 **Errors**: `NOT_FOUND`, `NOT_EMPTY` (directory has entries other
-than `.` and `..`), `IO_ERROR`, `PERMISSION_DENIED`.
+than `.` and `..`), `IO_ERROR`, `PERMISSION_DENIED`, `INVALID_BADGE`
+(the badge is not a directory node).
 
 ---
 
@@ -467,7 +468,8 @@ Both names share the data area after the two length words, so
 [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)):
 a pair of individually valid names can exceed it, and a client MUST NOT
 send such a pair. The server replies `IO_ERROR` to a zero length, or to
-lengths whose sum exceeds the data the message carries.
+lengths whose sum exceeds the name bytes the message carries after the two
+length words.
 
 **Reply (success)**: `label = 0`, empty body.
 
@@ -484,9 +486,10 @@ intent; not yet implemented). Tracked as
 for the post-crash visible states.
 
 **Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination
-occupied), `NO_SPACE`, `IO_ERROR` (malformed name lengths, an invalid
-name), `PERMISSION_DENIED`, `INVALID_BADGE` (the badge is not a
-directory node).
+occupied; fatfs currently surfaces `NO_SPACE` for it, as for `FS_CREATE`,
+tracked in [#447](https://github.com/kottlerg/seraph/issues/447)),
+`NO_SPACE`, `IO_ERROR` (malformed name lengths, an invalid name),
+`PERMISSION_DENIED`, `INVALID_BADGE` (the badge is not a directory node).
 
 ---
 

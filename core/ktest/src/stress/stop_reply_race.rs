@@ -168,7 +168,7 @@ pub fn run(ctx: &TestContext) -> TestResult
                 base: 0,
                 span: cpu_count,
             },
-            Stoppers::One,
+            Stops::Single,
         );
     }
     // The controller takes CPU 0 so a floor-priority child never shares its
@@ -181,7 +181,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             base: CONTROLLER_CPU + 1,
             span: cpu_count - 1,
         },
-        Stoppers::Two,
+        Stops::Double,
     );
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_reply_race: restore controller affinity failed");
@@ -211,17 +211,17 @@ impl Placement
 /// Who stops each cycle's client: the controller alone, or the controller and
 /// a second stopper.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Stoppers
+enum Stops
 {
-    One,
-    Two,
+    Single,
+    Double,
 }
 
 /// Run [`CYCLES`] races with the children placed per `place` and stopped by
-/// `stoppers`.
-fn cycles(ctx: &TestContext, place: Placement, stoppers: Stoppers) -> TestResult
+/// `stops`.
+fn cycles(ctx: &TestContext, place: Placement, stops: Stops) -> TestResult
 {
-    let second_stopper = stoppers == Stoppers::Two;
+    let second_stopper = stops == Stops::Double;
     STOPPER_GO.store(0, Ordering::Release);
     STOPPER_DONE.store(0, Ordering::Release);
     SECOND_STOPS_OK.store(0, Ordering::Release);

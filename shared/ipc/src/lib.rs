@@ -1266,12 +1266,13 @@ pub mod fs_labels
     /// (`cap_info` does not expose badge bits), so a cross-directory
     /// destination cannot be resolved to a `NodeId` server-side.
     ///
-    /// Not atomic: an interrupted rename can leave both names present
-    /// or neither. See `services/fs/fat/docs/crash-safety.md`.
+    /// Not atomic: an interrupted rename can leave only the source, both
+    /// names, or only the destination present. See
+    /// `services/fs/fat/docs/crash-safety.md`.
     ///
-    /// Reply (label `fs_errors::SUCCESS`): empty body. Errors:
-    /// `NOT_FOUND` (source missing), `EXISTS` (destination occupied),
-    /// `NO_SPACE`, `IO_ERROR`.
+    /// Reply (label `fs_errors::SUCCESS`): empty body. Errors: as
+    /// `services/fs/docs/fs-driver-protocol.md` § Label 16: `FS_RENAME`
+    /// lists them.
     pub const FS_RENAME: u64 = 16;
     /// Truncate a file to a new length.
     ///

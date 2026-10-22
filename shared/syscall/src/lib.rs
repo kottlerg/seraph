@@ -2590,10 +2590,12 @@ pub fn thread_bind_notification(
 /// or a fault episode cancelled by destruction of the handler thread, by
 /// destruction of the handler endpoint while the fault is still queued on it,
 /// or by a later receive on the handler thread that passes its capability and
-/// headroom checks while the fault reply is pending; a stop of the
-/// faulting thread before any reply claims the fault cancels the episode, and
-/// the terminal fault takes effect, and is posted, only if the thread is
-/// started again (docs/fault-handling.md § Delivery, Resume, and Kill) — the
+/// headroom checks while the fault reply is pending. A stop of the faulting
+/// thread defers the terminal fault: before any reply claims the fault it
+/// cancels the episode, after a `KILL` reply claims it it keeps that
+/// disposition, and either way the terminal fault takes effect, and is
+/// posted, only if the thread is started again (docs/fault-handling.md
+/// § Delivery, Resume, and Kill) — the
 /// kernel posts
 /// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
 /// `event_queue_cap`, where `exit_reason` is the fault class

@@ -12,7 +12,7 @@
 //! - Reads ≤ 504 bytes that fit within the current page use the
 //!   inline `FS_READ` path; payload bytes ride in the IPC buffer.
 //! - Larger reads use `FS_READ_MEMORY`: the driver returns a Memory cap
-//!   cap covering one cached page; we reserve VA, `mem_map` it
+//!   covering one cached page; we reserve VA, `mem_map` it
 //!   read-only, memcpy out, then proactively release the cache slot
 //!   via `FS_RELEASE_MEMORY` and tear the mapping down locally.
 //!
@@ -1317,10 +1317,9 @@ impl File
         // ceiling: 64 data words (`MSG_DATA_WORDS_MAX`) × 8 bytes = 512,
         // minus the 8-byte length prefix in word 0 = 504. Above this a
         // single inline reply cannot carry the bytes; below this the
-        // per-call cost is
-        // strictly cheaper than the frame path on both x86_64 and
-        // riscv64 (≈ 2× factor; see fsbench numbers recorded in
-        // `services/fs/docs/fs-driver-protocol.md`).
+        // per-call cost is strictly cheaper than the frame path on both
+        // x86_64 and riscv64 (≈ 2× factor; see fsbench numbers recorded
+        // in `services/fs/docs/fs-driver-protocol.md`).
         let page_off = (pos % PAGE_SIZE) as usize;
         if want <= READ_INLINE_THRESHOLD && page_off + want <= PAGE_SIZE_USIZE
         {

@@ -70,22 +70,24 @@ use syscall::{
 #[cfg(not(test))]
 unsafe fn stamp_syscall_entry(nr: u64, frame: *mut TrapFrame)
 {
-    // SAFETY: syscall context; `current` is the calling thread and stable
-    // here, and it alone writes its own `syscall_nr` and `trap_frame`.
     // Null-guarded like every handler's own check rather than asserted: the
     // diagnostic stamp must never be the thing that faults.
+    // SAFETY: syscall context; `current` is the calling thread and stable
+    // here, and it alone writes its own `syscall_nr` and `trap_frame`.
+    let tcb = unsafe { current_tcb() };
+    crate::sched::note_cpu_syscall(nr);
+    if tcb.is_null()
+    {
+        return;
+    }
+    // SAFETY: tcb is the running thread's live TCB (checked non-null above).
     unsafe {
-        let tcb = current_tcb();
-        if !tcb.is_null()
-        {
-            (*tcb)
-                .syscall_nr
-                .store(nr, core::sync::atomic::Ordering::Relaxed);
-            crate::sched::note_cpu_syscall(nr);
-            (*tcb)
-                .trap_frame
-                .store(frame, core::sync::atomic::Ordering::Relaxed);
-        }
+        (*tcb)
+            .syscall_nr
+            .store(nr, core::sync::atomic::Ordering::Relaxed);
+        (*tcb)
+            .trap_frame
+            .store(frame, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -109,8 +111,8 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     let tf = unsafe { &mut *tf };
 
     let nr = tf.syscall_nr();
-    // SAFETY: syscall entry on the caller's kernel stack; `frame` is its live
-    // frame.
+    // SAFETY: syscall entry with interrupts masked, on the caller's kernel
+    // stack; `frame` is its live frame.
     unsafe { stamp_syscall_entry(nr, frame) };
 
     let ret: Result<u64, SyscallError> = match nr

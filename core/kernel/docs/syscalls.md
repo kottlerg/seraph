@@ -1124,8 +1124,7 @@ not virgin, not siblings, or either has children), `InvalidCapability`,
 
 Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it for scheduling.
 Starting a thread whose fault episode a stop cancelled (before any reply claimed it) kills it as an
-unhandled fault, which posts
-its death and address-space observers (see
+unhandled fault, which posts its death and address-space observers (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill).
 A stopped thread whose blocked syscall a waker claimed before the stop is restarted only once that

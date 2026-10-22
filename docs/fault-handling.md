@@ -197,7 +197,8 @@ it resumes by re-executing its faulting instruction, not by returning a value.
   unhandled fault. A stop of the faulting thread before any reply claims the fault also cancels the
   episode, but kills nothing at once: it gives the episode a kill outcome and leaves the thread
   `Stopped`; when next started, the thread is killed as an unhandled fault. A stop after the
-  handler's reply claimed the fault leaves that reply's disposition: the started thread resumes.
+  handler's reply claimed the fault leaves that reply's disposition: when next started, the thread
+  resumes on a `FAULT_REPLY_RESUME` reply and is killed on a `FAULT_REPLY_KILL` reply.
   Destroying it while stopped ends it as for any stopped thread. A cancelled fault-blocked thread is
   never resumed.
 

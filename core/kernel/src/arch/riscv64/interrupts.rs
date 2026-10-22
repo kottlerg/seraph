@@ -731,9 +731,9 @@ fn normalize_riscv_exception(cause: u64) -> u64
 ///
 /// As on x86-64 (`x86_64/idt.rs::redirect_user_fault`), no frame copy is
 /// needed: `(*tcb).trap_frame` is pointed at the live trap `frame` for the
-/// duration of the block, so the handler's
-/// `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` read and edit the faulting
-/// registers in place, and `sret` restores the same frame on resume.
+/// duration of the block, so the handler's `SYS_THREAD_READ_REGS` /
+/// `SYS_THREAD_WRITE_REGS` read and edit the faulting registers in place, and
+/// `sret` restores the same frame on resume.
 ///
 /// # Safety
 /// `tcb` is the current user thread and has a bound handler; `frame` is the live

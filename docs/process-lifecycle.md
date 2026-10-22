@@ -513,6 +513,7 @@ only if it is started again (see [Fault Handling](fault-handling.md#delivery-res
 ## Summarized By
 
 [abi/init-protocol/README.md](../abi/init-protocol/README.md),
+[abi/process-abi/README.md](../abi/process-abi/README.md),
 [Memory Map Translation](../core/boot/docs/memory-map.md),
 [Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),

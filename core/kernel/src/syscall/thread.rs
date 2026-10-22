@@ -569,8 +569,10 @@ unsafe fn warn_slow_drain(
     {
         return false;
     }
-    // SAFETY: per contract; `current` is read without the lock for the
-    // diagnostic only.
+    // SAFETY: target_tcb is valid per contract and the remote CPU's current
+    // TCB stays mapped, so these reads cannot fault. They are not race-free:
+    // `current` and both TCBs' fields are read without their locks, a
+    // diagnostic-only residual #440 records.
     let (tid, st, cur_tid) = unsafe {
         let cur = crate::sched::scheduler_for(run_cpu).current;
         (

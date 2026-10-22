@@ -702,9 +702,9 @@ Beyond that stop, the kernel's role in death is *notification*. An `AddressSpace
 death-observer set (mirroring the per-thread death observers). On a terminal fault by any thread in
 the address space (no fault handler bound, the handler replied `KILL`, or the fault episode was
 cancelled by handler-thread death, destruction of the handler endpoint while the fault is still
-queued on it, or a later receive on the handler thread, past its capability and cap-slot checks,
-while the fault reply is pending; a stop of the faulting thread cancels the episode, and the
-terminal fault takes effect if the thread is started again; see
+queued on it, or a later receive on the handler thread that passes its capability and headroom
+checks while the fault reply is pending; a stop of the faulting thread before any reply claims the
+fault cancels the episode, and the terminal fault takes effect if the thread is started again; see
 [Fault Handling](fault-handling.md#delivery-resume-and-kill)), the kernel posts the fault class
 (`EXIT_FAULT_BASE + vector`) to each bound observer and exits the faulting thread. procmgr binds
 such an observer at process creation, so a fatal fault on any thread — a worker, not just the main

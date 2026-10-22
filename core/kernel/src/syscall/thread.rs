@@ -792,8 +792,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
             // `Interrupted` to. Only the unlink win is that claim: a lost
             // unlink means a racing endpoint_recv dequeued us, and its rebind
             // chain (a handler reply, or its teardown) owns the episode and
-            // writes the disposition; a KILL stored here would overwrite a
-            // handler's RESUME. The retry pass cancels the rebound park.
+            // writes the disposition, or a concurrent cancel already claimed
+            // and stamped it; a KILL stored here would overwrite a handler's
+            // RESUME. The retry pass cancels the rebound park.
             // SAFETY: tcb valid; fault_outcome / in_fault_delivery always valid.
             if unsafe { (*tcb).in_fault_delivery }
             {
@@ -841,8 +842,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // Claim = the recv-queue unlink under ep.lock (endpoint_call
                     // dequeues receivers under the same lock, so winning it makes
                     // this the episode's sole depositor). A lost unlink means a
-                    // caller already deposited into ipc_msg; that delivery stands
-                    // and the resume publishes it (fail-open).
+                    // caller already deposited into ipc_msg, whose delivery stands
+                    // and the resume publishes (fail-open), or a concurrent cancel
+                    // already claimed the park.
                     if same_park(tcb)
                         && unlink_from_wait_queue(tcb, &mut (*ep).recv_head, &mut (*ep).recv_tail)
                     {

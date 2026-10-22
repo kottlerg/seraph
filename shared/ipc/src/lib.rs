@@ -1241,8 +1241,9 @@ pub mod fs_labels
     /// Request: badge = parent-directory cap (must carry `MUTATE_DIR`),
     /// `label = FS_REMOVE | (name_len << 16)`, name bytes from word 0.
     ///
-    /// Reply (label `fs_errors::SUCCESS`): empty body. Errors:
-    /// `NOT_FOUND`, `NOT_EMPTY` (directory has entries), `IO_ERROR`.
+    /// Reply (label `fs_errors::SUCCESS`): empty body. Errors: as
+    /// `services/fs/docs/fs-driver-protocol.md` § Label 14: `FS_REMOVE`
+    /// lists them.
     pub const FS_REMOVE: u64 = 14;
     /// Create a new (empty) directory in a directory.
     ///
@@ -1260,7 +1261,7 @@ pub mod fs_labels
     /// `IpcMessageBuilder::bytes(2, &concat(src, dst))` — source bytes
     /// first, destination bytes immediately after with no padding.
     ///
-    /// Cross-directory rename is deferred to a follow-up Issue: the
+    /// Cross-directory rename is deferred to Issue #89: the
     /// caller cannot supply a second directory cap because servers
     /// cannot introspect the badge packed inside a cap they receive
     /// (`cap_info` does not expose badge bits), so a cross-directory

@@ -5,8 +5,9 @@
 
 //! argv-driven child-mode dispatch.
 //!
-//! Several phases respawn `/tests/svctest` with a single argv token to
-//! exercise child-side behaviour (namespace attenuation propagation,
+//! Several phases respawn `/tests/svctest` with a role token as argv[1]
+//! (some roles take further arguments after it, e.g. `blobs-fill-child`'s
+//! filler token) to exercise child-side behaviour (namespace attenuation propagation,
 //! cwd-cap delivery, `/programs`-subtree attenuation). The child-mode
 //! function for each role lives in the phase module that spawns it;
 //! `dispatch` consults each module's `reentry_main(role)` so a new

@@ -483,7 +483,10 @@ intent; not yet implemented). Tracked as
 
 `FS_RENAME` is not atomic — see
 [`services/fs/fat/docs/crash-safety.md`](../fat/docs/crash-safety.md)
-for the post-crash visible states.
+for the post-crash visible states. If the source's removal fails after the
+destination was inserted, the server removes the destination again before
+replying with the error; if that undo also fails, both names stay present,
+the duplicate-entry state crash-safety.md describes.
 
 **Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination
 occupied; fatfs currently surfaces `NO_SPACE` for it, as for `FS_CREATE`,

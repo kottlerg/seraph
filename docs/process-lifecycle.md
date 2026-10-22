@@ -504,8 +504,10 @@ the process was created `CREATE_PINNED`); a thread with no bound handler, whose 
 `KILL`, or whose fault episode is cancelled by destruction of the handler thread (deletion of its
 last Thread capability), destruction of the handler endpoint while the fault is still queued on it,
 or a later receive on the handler thread that passes its capability and headroom checks, terminates,
-which surfaces through the normal process-death notification flow above; a thread whose episode a
-stop cancelled terminates that way only if it is started again (see
+which surfaces through the normal process-death notification flow above; a stop of the faulting
+thread defers that termination (before any reply claims the fault it cancels the episode, after a
+`KILL` reply claims it it keeps that disposition), and the thread terminates that way, and
+observers are posted, only if it is started again (see
 [Fault Handling](fault-handling.md#delivery-resume-and-kill)).
 
 ---

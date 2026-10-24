@@ -714,9 +714,11 @@ atomic instruction in the no-waiter case.
 The IPC paths interact with the scheduler only through its park and wake primitives:
 `commit_blocked_under_local_lock` to park, `commit_reply_rebind_under_local_lock` to rebind an
 already parked sender to its reply, `withdraw_uncontested_park` to un-commit a timed park the full
-sleep list refused (rule 8's sanctioned exception), `select_target_cpu` and `enqueue_and_wake` to
-wake, `schedule` to switch away, and `sleep_list_add` and `sleep_list_remove` for timed waits (see §
-Waking the Recipient). The scheduler itself does not need to know about IPC.
+sleep list refused, `select_target_cpu` and `enqueue_and_wake` to wake, `schedule` to switch away,
+and `sleep_list_add` and `sleep_list_remove` for timed waits (see § Waking the Recipient). The
+un-commit is the sanctioned exception that rule 8 of
+[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)
+makes for a park no waker can have claimed. The scheduler itself does not need to know about IPC.
 
 The scheduler's preemption timer does not interrupt the IPC fast path. Syscall entry
 masks interrupts, and every IPC object lock is an IRQ-disabling

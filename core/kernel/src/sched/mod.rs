@@ -1571,7 +1571,10 @@ static TIMER_DISPATCH_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SleepAddError
 {
-    /// The list is at [`MAX_SLEEPING`]; the caller withdraws its park.
+    /// The list is at [`MAX_SLEEPING`]; the caller withdraws its park, or, if
+    /// a stop or teardown already claimed it, deschedules
+    /// (docs/thread-lifecycle-and-sleep.md § Sleep List Invariants, invariant
+    /// 4).
     Full,
     /// `sleep_deadline` was already 0 under `SLEEP_LIST_LOCK`: a cancellation
     /// (`sleep_list_remove`) landed between the park commit and the add. The
@@ -1593,8 +1596,11 @@ pub fn sleep_deadline_after_ms(ms: u64) -> u64
 /// `sleep_deadline` set and state = Blocked.
 ///
 /// Refuses with [`SleepAddError::Cancelled`] when `sleep_deadline` reads 0
-/// under the lock, and with [`SleepAddError::Full`] at capacity; the caller
-/// MUST withdraw the park. A TCB already listed keeps its single
+/// under the lock: the caller MUST NOT arm or withdraw, and proceeds to
+/// `schedule()`, where the cancellation's stamp decides the resume. Refuses
+/// with [`SleepAddError::Full`] at capacity: the caller MUST withdraw the
+/// park (`sys_thread_sleep` through a `sleep_list_remove` claim it may lose,
+/// a timed IPC wait through [`withdraw_uncontested_park`]). A TCB already listed keeps its single
 /// entry, which carries the deadline the caller just wrote.
 /// See docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
 ///

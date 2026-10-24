@@ -303,8 +303,9 @@ unsafe fn commit_stopped(
 ///
 /// Cancels any park — an IPC wait or a `SYS_THREAD_SLEEP` — including one the
 /// target commits while the stop is in progress: the stopped thread's blocked
-/// syscall returns `Interrupted` on restart, unless a genuine waker or the
-/// sleep timer claimed the wake first. A thread may stop itself (arg0 refers
+/// syscall returns `Interrupted` on restart, unless a genuine waker, the
+/// sleep timer, or the target's own full-list withdrawal (a timed wait or
+/// sleep that found the sleep list full) claimed it first. A thread may stop itself (arg0 refers
 /// to the calling thread).
 ///
 /// Returns 0 on success.

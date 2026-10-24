@@ -3,9 +3,9 @@
 
 // core/ktest/src/stress/sleep_list_full.rs
 
-//! Stress: stop and restart a thread looping `thread_sleep(1)` while the
-//! kernel's sleep list is held at capacity, then sleep once more after the
-//! list drains.
+//! Stress: with the kernel's sleep list held at capacity, check that timed
+//! IPC waits time out at once, stop and restart a thread looping them, then
+//! one looping `thread_sleep(1)`, and sleep once more after the list drains.
 //!
 //! ## The hazard
 //!
@@ -201,8 +201,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Fill the sleep list, run the victim's storm, and delete every filler and
-/// the victim whatever the outcome.
+/// Fill the sleep list, check the timed waits, run the timed-wait storm and
+/// the sleep storm (each reaps its own victim), and delete every filler
+/// whatever the outcome.
 fn with_fillers(ctx: &TestContext) -> TestResult
 {
     let cs = cap_create_cspace(ctx.memory_base, 0, 4)
@@ -461,10 +462,11 @@ fn storm(child: &spawn::SpawnedChild, fillers: &[u32]) -> TestResult
     }
 
     // Stop the victim, raise QUIT, then free the slots: stopping a sleeping
-    // filler cancels its sleep and removes its entry. The victim reads QUIT
-    // after each sleep returns, so a result read with QUIT still 0 was taken
-    // on the full list, and one read with QUIT set may have met the drained
-    // list; the victim then needs one sleep that returns Ok.
+    // filler cancels its sleep and removes its entry. QUIT rises while the
+    // victim is stopped, so a sleep it starts after reading QUIT set starts
+    // on the drained list and alone must return Ok, and one during which
+    // QUIT rose may have started on the full list, so it or the next sleep
+    // must return Ok.
     thread_stop(child.th).map_err(|_| "stress::sleep_list_full: stop victim failed")?;
     QUIT.store(1, Ordering::Release);
     for &th in fillers

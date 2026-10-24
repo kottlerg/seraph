@@ -693,8 +693,9 @@ The handler then drains the target.
 
    So `Stopped` is never written over a live park: every park the commit lands on was cancelled by
    this stop or a concurrent one, already claimed by a waker, or withdrawn by the target itself on a
-   full sleep list (the commit then lands on the restored `Running`, and the restarted thread
-   returns its withdrawal result: `OutOfMemory`, `0` bits or `WouldBlock`), so a stop never leaves a
+   full sleep list (the commit then lands on the restored `Running`; the target returns its
+   withdrawal result, `OutOfMemory`, `0` bits or `WouldBlock`, to user mode and the stop drains it
+   as a running target), so a stop never leaves a
    `Stopped` thread registered as a source's waiter or on the sleep list. The object-teardown stop
    (`stop_threads_bound_to`) commits `Exited` through the same loop. A park that a waker claimed
    first (removed from the queue, `wake_in_flight = 1`) is not cancelled; the stop commits over it

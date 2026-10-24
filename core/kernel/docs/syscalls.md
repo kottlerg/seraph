@@ -505,7 +505,7 @@ out-of-band marker (`tcb.timed_out`) rather than an in-band
 (0 included; see [ipc-internals.md](ipc-internals.md) § Event Queue, Recv Path)
 — contrast `SYS_NOTIFICATION_WAIT`, where a notification wake never carries
 0 bits because `notification_send` rejects zero-bit sends, so a `0` result
-means the timeout elapsed.
+means the wait timed out (the timeout elapsed, or the sleep list was full).
 
 ---
 
@@ -1177,10 +1177,11 @@ fault first keeps that reply's outcome: when next started it resumes its faultin
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
 cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker,
-the sleep timer, or the target's own full-list withdrawal (a timed wait or sleep that found the
-kernel's sleep list full; invariant 4 of
-[thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants))
-claimed it first); a target that blocks while the stop is in progress is
+the sleep timer, or the target's own full-list withdrawal claimed it first). A full-list
+withdrawal is a timed wait or sleep that found the kernel's sleep list full; it reports its timeout
+or `OutOfMemory` (invariant 4 of
+[thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants)).
+A target that blocks while the stop is in progress is
 cancelled the same way, never left registered as a waiter (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
 Protocol). This does not hold for a stop of a thread waiting on an endpoint (queued to send or
@@ -1528,7 +1529,8 @@ No capability is required — this syscall acts on the calling thread implicitly
 
 **Errors:** `InvalidCapability` (no current thread), `OutOfMemory` (kernel sleep list at
 capacity), `Interrupted` (the thread was stopped before or during the sleep, unless the timer had
-already claimed its elapsed deadline).
+already claimed its elapsed deadline, or the sleep found the sleep list full and withdrew first,
+which returns `OutOfMemory`).
 
 ---
 

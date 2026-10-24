@@ -56,8 +56,8 @@ mod timed_waiter_thread_delete;
 
 use crate::{ChildStack, TestContext, run_integration_test};
 
-/// Number of shared child stacks, and so the maximum concurrent child threads
-/// of every stress cell that draws from [`STRESS_STACKS`].
+/// Number of shared child stacks, and so the maximum children a stress cell
+/// runs on [`STRESS_STACKS`] stacks at once.
 /// `sleep_list_full`, which needs one sleeper per sleep-list slot
 /// (`MAX_SLEEPING` = 128), draws one `STRESS_STACKS` stack for its victims
 /// and carries its own 128 × 8 KiB filler stacks (1 MiB more BSS), so it runs

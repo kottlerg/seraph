@@ -103,6 +103,10 @@ impl Condvar {
                 woke = true;
             }
         }
+        // Without a notification cap, wait out the duration (or a notify).
+        while sig == 0 && self.gen_counter.load(Relaxed) == before && start.elapsed() < timeout {
+            core::hint::spin_loop();
+        }
         mutex.lock();
         // Contract: return `true` if we did NOT time out. A notification wake
         // or an early end counts as "did not time out", and so does a moved

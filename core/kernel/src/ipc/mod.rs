@@ -249,8 +249,8 @@ static FULL_LIST_REPORTED: core::sync::atomic::AtomicBool =
 /// List Invariants, invariant 8). Returns `false`, with the deadline cleared,
 /// when the sleep list is full: the caller then dequeues the waiter, withdraws
 /// the park ([`crate::sched::withdraw_uncontested_park`]) and reports an
-/// immediate timeout, so a timed wait never waits past its bound. `wait` names the wait in the one-time
-/// diagnostic.
+/// immediate timeout, so a timed wait never waits past its bound. `wait`
+/// names the wait in the one-time diagnostic.
 ///
 /// # Safety
 /// `tcb` is the running caller, committed `Blocked` on a source whose lock the

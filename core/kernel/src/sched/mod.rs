@@ -1495,8 +1495,9 @@ pub static BOOT_TRANSIENT_ACTIVE: core::sync::atomic::AtomicBool =
 /// Maximum number of concurrently sleeping threads the fixed sleep list (and
 /// its expiry scratch buffer) can hold. `sleep_list_add` refuses with
 /// [`SleepAddError::Full`] past this cap rather than dropping silently:
-/// `SYS_THREAD_SLEEP` rolls back its park and returns `OutOfMemory`, and a
-/// timed IPC wait degrades to an untimed one.
+/// `SYS_THREAD_SLEEP` withdraws its park and returns `OutOfMemory` (or, when a
+/// stop already claimed the park, `Interrupted`), and a timed IPC wait
+/// degrades to an untimed one.
 pub const MAX_SLEEPING: usize = 128;
 
 /// Global list of sleeping threads. Protected by its own spinlock.

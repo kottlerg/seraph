@@ -673,9 +673,12 @@ unsafe fn clear_reply_binding(tcb: *mut crate::sched::thread::ThreadControlBlock
 /// so the restarted thread's resume consumes the cancellation instead of a
 /// stale wake deposit, and clears the thread's park binding, whatever state a
 /// concurrent stop or teardown commits over the claimed park meanwhile. A lost
-/// claim means a genuine waker owns the episode; its deposit stands untouched,
-/// and its `enqueue_and_wake` clears the binding, on the link path or in the
-/// arm that aborts on a `Stopped` or `Exited` thread.
+/// claim means another claimant owns the episode and its deposit stands: a
+/// waker, whose `enqueue_and_wake` clears the binding (on the link path or in
+/// the arm that aborts on a `Stopped` or `Exited` thread); a concurrent cancel,
+/// which clears it in its own tail; the source's dealloc drain, which wakes
+/// the thread through `enqueue_and_wake`; or the thread's own
+/// `dealloc_object(Thread)`, whose drain clears it as the thread dies.
 ///
 /// [`PARK_DISPOSITION_INTERRUPTED`]: crate::sched::thread::PARK_DISPOSITION_INTERRUPTED
 ///
@@ -998,8 +1001,10 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     let saved = (*sig).lock.lock_raw();
                     // Claim = the removal from the waiter queue under sig.lock
                     // (every genuine waker claims under the same lock). A lost
-                    // race means the waker's deposit stands; the resume
-                    // delivers it (fail-open).
+                    // race means the waker's deposit stands and the resume
+                    // delivers it (fail-open), or a concurrent cancel already
+                    // claimed and stamped it, or the thread's own
+                    // dealloc_object(Thread) unlinked it as it dies.
                     if (*sig).waiters.remove_if(tcb, same_park)
                     {
                         claimed = true;
@@ -1040,7 +1045,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     let saved = (*eq).lock.lock_raw();
                     // Claim = the removal from the waiter queue under eq.lock; a
                     // lost race means a genuine wake's deposit stands
-                    // (fail-open).
+                    // (fail-open), or a concurrent cancel already claimed and
+                    // stamped it, or the thread's own dealloc_object(Thread)
+                    // unlinked it as it dies.
                     if (*eq).waiters.remove_if(tcb, same_park)
                     {
                         claimed = true;
@@ -1077,7 +1084,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     let saved = (*ws).lock.lock_raw();
                     // Claim = the removal from the waiter queue under ws.lock;
                     // a lost race means a genuine wake's deposit stands
-                    // (fail-open).
+                    // (fail-open), or a concurrent cancel already claimed and
+                    // stamped it, or the thread's own dealloc_object(Thread)
+                    // unlinked it as it dies.
                     if (*ws).waiters.remove_if(tcb, same_park)
                     {
                         claimed = true;
@@ -1096,17 +1105,17 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
     }
 
     // Clear the binding under sched_lock only if this cancel claimed the park.
-    // On a lost claim the waker owns the episode: its enqueue_and_wake clears
-    // the binding (when it links the thread, or in its arm that aborts on a
-    // thread a stop committed over meanwhile), and it may already have let the
-    // thread run and park again
+    // On a lost claim the winner owns the episode and clears the binding (see
+    // the rustdoc above): a waker in enqueue_and_wake, when it links the
+    // thread or in its arm that aborts on a thread a stop committed over
+    // meanwhile, and it may already have let the thread run and park again
     // (every park commit advances park_seq, and the caller's commit retries on
-    // a changed one). Clearing here after a lost claim would race the waker's
+    // a changed one). Clearing here after a lost claim would race the winner's
     // own reads of the binding, such as the reply's fault-arm test of
     // ipc_state after it won the reply_tcb CAS. The thread's state is not
     // consulted: a concurrent stop or teardown may have committed Stopped or
     // Exited over the claimed park meanwhile, and the won claim still owns the
-    // binding (no other path clears it). The reply and fault arms have already
+    // binding (for a live thread no other path clears it). The reply and fault arms have already
     // cleared it inside their CAS hold (clear_reply_binding), so the ipc_state
     // test below skips them.
     // SAFETY: tcb is valid; fields written under sched_lock.

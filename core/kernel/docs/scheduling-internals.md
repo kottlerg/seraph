@@ -58,7 +58,8 @@ skipping levels, risks deadlock.
         │         └─────► SLEEP_LIST_LOCK   (leaf; held alone, under a source
         │                                    lock, under one TCB's sched_lock
         │                                    (cancel_ipc_block's plain-sleep
-        │                                    cancel); either nesting may itself
+        │                                    cancel, sys_thread_sleep's
+        │                                    full-list withdrawal); either nesting may itself
         │                                    sit under THREAD_REGISTRY_LOCK in
         │                                    the object-teardown walk — never
         │                                    over any other lock)
@@ -201,10 +202,11 @@ hang). See § Thread Registry.
    snapshotted one is left for the retried commit's next pass. After the unlink the binding is
    cleared under `sched_lock` only when this cancel won the claim and the binding's `ipc_state` and
    `park_seq` still match the snapshot. After a lost claim the party that won clears it: a waker
-   in `enqueue_and_wake`, a concurrent cancel in its own tail, or the target's own
-   `dealloc_object(Thread)` drain, step 12 of
+   in `enqueue_and_wake` (the source's dealloc drain wakes through it too), or a concurrent cancel
+   in its own tail; for a dying thread its own `dealloc_object(Thread)` drain instead nulls
+   `blocked_on_object` at step 12 of
    [thread-lifecycle-and-sleep.md § `dealloc_object(Thread)` Drain Protocol](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
-   (for a dying thread it unlinked). The
+   (the freed TCB's `ipc_state` is never read again). The
    dealloc paths in `core/kernel/src/cap/object.rs` (Endpoint, Notification, EventQueue, WaitSet,
    and Thread arms) follow the same source-lock rule. **The `BlockedOnReply`/`BlockedOnFault` reply
    binding is the exception with no source lock: its `server.reply_tcb` CAS dereferences the
@@ -255,7 +257,9 @@ hang). See § Thread Registry.
    link (`queued_on` tripwires in `commit_blocked_under_local_lock` and `PerCpuScheduler::enqueue`
    enforce this in debug builds; #352). The only sanctioned exception is a parker that un-commits
    under `sched_lock` while provably untargetable by any waker — `sys_thread_sleep`'s
-   sleep-list-capacity rollback, which registered with no wake source. Non-blocking polls MUST NOT
+   full-list withdrawal, which registered with no wake source and un-commits only after winning
+   the park's claim (`sleep_list_remove` under `sched_lock`, the claim a cancel makes); a lost
+   withdrawal reaches `schedule()`. Non-blocking polls MUST NOT
    use the park path at all: `SYS_EVENT_RECV`'s `u64::MAX` try-once mode is `event_queue_try_recv`,
    a pure peek under `eq.lock` that takes no TCB and cannot register a waiter. For
    `sys_ipc_call`/fault park episodes, every deposit additionally carries a reply-disposition stamp

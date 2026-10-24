@@ -433,10 +433,12 @@ Unlink a file or empty directory. Badge = parent-directory cap with
 than `.` and `..`), `IO_ERROR`, `PERMISSION_DENIED`, `INVALID_BADGE`
 (the badge is not a directory node).
 
-`FS_REMOVE` is not atomic either: an error reply can leave any of
-[`crash-safety.md`](../fat/docs/crash-safety.md)'s `FS_REMOVE` states.
-Once the driver's cached view shows the entry deleted, it drops the
-entry's node, so caps held on it reply `INVALID_BADGE`
+`FS_REMOVE` is not atomic: an error reply can leave any of
+[`crash-safety.md`](../fat/docs/crash-safety.md)'s `FS_REMOVE` states, and
+the driver's cached copy of a sector whose write failed keeps the new bytes
+until a later write of that sector succeeds or the page is evicted. Once
+the cached view shows the entry deleted, the driver drops the entry's node,
+so caps held on it no longer name it
 ([#447](https://github.com/kottlerg/seraph/issues/447)).
 
 ---
@@ -491,9 +493,10 @@ intent; not yet implemented). Tracked as
 `FS_RENAME` is not atomic — see
 [`services/fs/fat/docs/crash-safety.md`](../fat/docs/crash-safety.md)
 for the post-crash visible states. The server does not roll a failed rename
-back, so an error reply can leave any of those states too, and the driver's
-cached view of the directory can differ from the disk until the page is
-written back or evicted. Rollback of a failed rename is tracked in
+back, so an error reply can leave any of those states too, with the same
+cached-sector caveat as `FS_REMOVE`; once the cached view shows the source
+deleted, the driver drops the source's node, on success and on error. Rollback
+of a failed rename is tracked in
 [#447](https://github.com/kottlerg/seraph/issues/447).
 
 **Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination

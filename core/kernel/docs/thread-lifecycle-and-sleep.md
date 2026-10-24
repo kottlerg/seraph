@@ -74,9 +74,9 @@ claims against concurrent IPC sources via the relevant source IPC lock (Notifica
 
 1. **`SLEEP_LIST_LOCK` is leaf-only.** Per
    [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 3. Wake
-   direction is `source.lock → SLEEP_LIST_LOCK`, and `cancel_ipc_block` nests it inside the
-   target's `sched_lock`; timer direction releases `SLEEP_LIST_LOCK` before any source lock —
-   sequential, not nested.
+   direction is `source.lock → SLEEP_LIST_LOCK`, `cancel_ipc_block` nests it inside the target's
+   `sched_lock`, and `sys_thread_sleep`'s full-list withdrawal nests it inside the sleeper's own;
+   timer direction releases `SLEEP_LIST_LOCK` before any source lock — sequential, not nested.
 
 2. **A listed TCB is a `Blocked` sleeper or timed waiter.** Its `ipc_state` is `None` (plain sleep)
    or `BlockedOnNotification` / `BlockedOnEventQueue` with a non-null `blocked_on_object`
@@ -100,7 +100,9 @@ claims against concurrent IPC sources via the relevant source IPC lock (Notifica
 
 4. **Capacity is hard.** At `SLEEP_COUNT == MAX_SLEEPING`, `sleep_list_add` refuses
    (`SleepAddError::Full`). Parking syscalls either roll back to an indefinite IPC wait
-   (`sys_notification_wait`, `sys_event_recv`) or surface `OutOfMemory` (`sys_thread_sleep`).
+   (`sys_notification_wait`, `sys_event_recv`, whose timeout then never fires) or surface
+   `OutOfMemory` (`sys_thread_sleep`, unless a stop or teardown already claimed the park, in which
+   case the sleeper returns `Interrupted`; see § `sys_thread_sleep` and the Plain-Sleep Path).
    Silent drop is forbidden — it would hang the parker.
 
 5. **`sleep_check_wakeups` is BSP-only.** APs' timer ticks do not touch the sleep list. A BSP stuck

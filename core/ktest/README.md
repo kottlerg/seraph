@@ -175,7 +175,10 @@ and scale through their iteration knob (`CYCLES`, `ITERATIONS`) instead. The poi
 boot exercises enough contention to surface latent races, rather than needing tens of repeat runs to
 flake-mine. The `u64` width caps per-test workers at 64; lifting that would require re-encoding the
 per-worker bookkeeping from a bitmask to an atomic-counter ledger. The `MAX_STRESS_THREADS = 64` cap
-in `stress/mod.rs` mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
+in `stress/mod.rs` mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB) for cells drawing on
+the shared `STRESS_STACKS`. `sleep_list_full` is the exception: a resource-exhaustion race cell
+whose participant count is fixed by the kernel's `MAX_SLEEPING` (128), it counts with an atomic
+counter and carries its own 128 × 8 KiB filler stacks.
 
 | File | Scenario | Knobs |
 |---|---|---|

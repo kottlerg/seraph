@@ -28,8 +28,8 @@
 //!
 //! [`FILLERS`] threads, one per sleep-list slot, each loop
 //! `thread_sleep(FILL_SLEEP_MS)`; the controller, pinned to CPU 0, waits
-//! until each has entered its sleep and a probe `thread_sleep(1)` of its
-//! own returns `OutOfMemory`, which proves the list is full. A victim
+//! until every filler has started and a probe `thread_sleep(1)` of its own
+//! returns `OutOfMemory`, which proves every slot is held. A victim
 //! pinned to CPU 1 then loops `thread_sleep(1)` while the controller issues
 //! [`CYCLES`] stop/start pairs against it, each after a cycle-varying spin,
 //! so stops land before, inside and after the victim's commit-to-withdrawal
@@ -101,6 +101,9 @@ static BAD: AtomicU64 = AtomicU64::new(0);
 /// The victim's sleep after the drain: 1 = `Ok`, 2 = anything else.
 static AFTER: AtomicU32 = AtomicU32::new(0);
 
+/// Run the cell: skip below 2 CPUs; otherwise fail if a storm sleep
+/// returned neither `OutOfMemory` nor `Interrupted`, if none met the full
+/// list, or if the sleep after the drain did not return `Ok`.
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)
@@ -255,11 +258,11 @@ fn storm(child: &spawn::SpawnedChild, fillers: &[u32]) -> TestResult
         thread_start(child.th).map_err(|_| "stress::sleep_list_full: thread_start failed")?;
     }
 
-    // Hold the victim stopped while the list drains, so none of its storm
-    // sleeps can meet a free slot. Stopping a sleeping filler cancels its
-    // sleep and removes its entry. The controller busy-waits from here: a
-    // sleep of its own would take a slot. The victim's first sleep after the
-    // restart sees QUIT and is the one on the drained list.
+    // Stop the victim, raise QUIT, then free the slots: stopping a sleeping
+    // filler cancels its sleep and removes its entry. The victim reads QUIT
+    // after each sleep returns, so a result read with QUIT still 0 was taken
+    // on the full list, and one read with QUIT set may have met the drained
+    // list; the victim then needs one sleep that returns Ok.
     thread_stop(child.th).map_err(|_| "stress::sleep_list_full: stop victim failed")?;
     QUIT.store(1, Ordering::Release);
     for &th in fillers
@@ -270,7 +273,8 @@ fn storm(child: &spawn::SpawnedChild, fillers: &[u32]) -> TestResult
     await_flag(&DONE, "stress::sleep_list_full: the victim never finished")
 }
 
-/// Busy-wait, bounded, until `flag` is set.
+/// Busy-wait, bounded, until `flag` is set. The controller spins rather
+/// than sleeps: while the list is full a sleep returns `OutOfMemory` at once.
 fn await_flag(flag: &AtomicU32, err: &'static str) -> TestResult
 {
     for _ in 0..WAIT_POLLS
@@ -302,9 +306,23 @@ fn filler_entry(_arg: u64) -> !
 fn victim_entry(_arg: u64) -> !
 {
     RUNNING.store(1, Ordering::Release);
-    while QUIT.load(Ordering::Acquire) == 0
+    let after = loop
     {
-        match thread_sleep(1)
+        let slept = thread_sleep(1);
+        if QUIT.load(Ordering::Acquire) != 0
+        {
+            // This sleep may have met the drained list; if it did not
+            // return Ok, the next one must.
+            break if slept.is_ok() || thread_sleep(1).is_ok()
+            {
+                1
+            }
+            else
+            {
+                2
+            };
+        }
+        match slept
         {
             Err(e) if e == SyscallError::OutOfMemory as i64 => OOM.fetch_add(1, Ordering::Relaxed),
             Err(e) if e == SyscallError::Interrupted as i64 =>
@@ -313,8 +331,7 @@ fn victim_entry(_arg: u64) -> !
             }
             _ => BAD.fetch_add(1, Ordering::Relaxed),
         };
-    }
-    let after = if thread_sleep(1).is_ok() { 1 } else { 2 };
+    };
     AFTER.store(after, Ordering::Release);
     DONE.store(1, Ordering::Release);
     thread_exit()

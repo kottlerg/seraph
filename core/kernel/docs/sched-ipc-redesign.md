@@ -343,8 +343,9 @@ each change; the binding statement of the resulting invariants is
   and clears the binding only after winning the park's claim, re-verifying
   `ipc_state` and `park_seq` (the reply and fault arms clear it inside the
   `sched_lock` hold of their `reply_tcb` CAS win); on a lost claim the party
-  that won clears it, as scheduling-internals.md § Lock Hierarchy rule 7 lists
-  (closing finding D, stale-binding).
+  that won clears it, as
+  [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)
+  rule 7 lists (closing finding D, stale-binding).
   `sys_thread_set_priority` — missed by the first lifecycle pass — was likewise
   wrapped `sched_lock`-first (it reads `state` and mutates `queued_on` under the
   all-CPU locks, an unserialized Scheduling-group writer otherwise).

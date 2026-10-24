@@ -672,8 +672,9 @@ The handler then drains the target.
       unlocked check; `commit_stopped` surfaces the refusal as `InvalidState` (table row
       `sys_thread_stop (Created or Exited or Stopped)`).
 
-   So `Stopped` is never written over a park that was not cancelled: a stop never leaves a
-   `Stopped` thread registered as a source's waiter or on the sleep list. The object-teardown stop
+   So `Stopped` is never written over a live park: every park the commit lands on was cancelled
+   by this stop or already claimed by a waker, so a stop never leaves a `Stopped` thread
+   registered as a source's waiter or on the sleep list. The object-teardown stop
    (`stop_threads_bound_to`) commits `Exited` through the same loop. A park that a waker claimed
    first (removed from the queue, `wake_in_flight = 1`) is not cancelled; the stop commits over it
    and the waker's later `enqueue_and_wake` aborts on `Stopped`, clearing the park binding it owns

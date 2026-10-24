@@ -99,11 +99,13 @@ claims against concurrent IPC sources via the relevant source IPC lock (Notifica
    `sleep_deadline_after_ms` never yields 0.
 
 4. **Capacity is hard.** At `SLEEP_COUNT == MAX_SLEEPING`, `sleep_list_add` refuses
-   (`SleepAddError::Full`). Parking syscalls either roll back to an indefinite IPC wait
-   (`sys_notification_wait`, `sys_event_recv`, whose timeout then never fires) or surface
-   `OutOfMemory` (`sys_thread_sleep`, unless a stop or teardown already claimed the park, in which
-   case the sleeper returns `Interrupted`; see § `sys_thread_sleep` and the Plain-Sleep Path).
-   Silent drop is forbidden — it would hang the parker.
+   (`SleepAddError::Full`). A timed `sys_notification_wait` or `sys_event_recv` withdraws its park
+   (`ipc::withdraw_timed_park`, under the source lock that has held it queued, so no waker or cancel
+   can have claimed it) and reports an immediate timeout: `0` bits, or `WouldBlock`.
+   `sys_thread_sleep` surfaces `OutOfMemory`, unless a stop or teardown already claimed the park:
+   the sleeper then deschedules, a stopped one returning `Interrupted` when restarted and a
+   torn-down one never returning (see § `sys_thread_sleep` and the Plain-Sleep Path). Silent drop is
+   forbidden — it would hang the parker.
 
 5. **`sleep_check_wakeups` is BSP-only.** APs' timer ticks do not touch the sleep list. A BSP stuck
    in an interrupt-disabled critical section delays all timeout wakes; this is a deliberate
@@ -625,9 +627,10 @@ Episodes.
 
 1. `ipc_state == None` is the discriminator that selects the plain-sleep arm in
    `sleep_check_wakeups`. The plain arm claims at the pop because no IPC source is competing.
-2. The plain sleep needs no source-lock arbitration. The timer and `cancel_ipc_block` arbitrate on
-   the deadline under `SLEEP_LIST_LOCK`: the pop clears it with the entry, and `sleep_list_remove`
-   clears it and returns whether it was still non-zero, so exactly one of them takes the episode.
+2. The plain sleep needs no source-lock arbitration. The timer, `cancel_ipc_block` and, on a full
+   list, the sleeper's own withdrawal arbitrate on the deadline under `SLEEP_LIST_LOCK`: the pop
+   clears it with the entry, and `sleep_list_remove` clears it and returns whether it was still
+   non-zero, so exactly one of them takes the episode.
 3. The cancel path: `sys_thread_stop` (or an object-teardown stop) on a sleeper runs
    `cancel_ipc_block`, which, while it holds the target's `sched_lock` and sees `Blocked` with
    `ipc_state == None`, calls `sleep_list_remove`. A `true` return is the episode claim: the cancel
@@ -642,7 +645,9 @@ Episodes.
    park. A `false` return means another claimant took the episode first, and the restarted sleeper
    returns what that claimant deposited: the timer's pop (its wake aborted by `enqueue_and_wake` if
    the stop commits first) deposits nothing, so the sleeper returns `Ok`, honest for a deadline that
-   elapsed; a concurrent canceller stamped `INTERRUPTED`. A stop that wins against the park commit
+   elapsed; a concurrent canceller stamped `INTERRUPTED`; or the sleeper's own full-list withdrawal
+   won, and it returns `OutOfMemory` while the stop commits over the restored `Running`. A stop that
+   wins against the park commit
    (`ParkCommit::RefusedStop`) makes `sys_thread_sleep` deschedule in place and return `Interrupted`
    directly.
 

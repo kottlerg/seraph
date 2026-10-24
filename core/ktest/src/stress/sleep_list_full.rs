@@ -36,11 +36,19 @@
 //! window. With the list full no victim sleep can be listed, so every
 //! result must be `OutOfMemory` or `Interrupted`. The controller then stops
 //! the victim, stops every filler (each stop cancels the filler's sleep and
-//! removes its entry), and restarts the victim, whose next `thread_sleep(1)`
+//! removes its entry), and restarts the victim. The victim reads QUIT after
+//! each sleep returns: the first sleep to return with QUIT set may still be
+//! a storm sleep the final stop interrupted, so it or the sleep after it
 //! must return `Ok`: the list has room again and no earlier cancellation's
 //! stamp is left to report. The fillers are deleted last.
 //!
-//! Required: every result during the storm is `OutOfMemory` or
+//! With the list full, before the storm, a timed `notification_wait` and a
+//! timed `event_recv` must each time out at once (`0` bits, `WouldBlock`):
+//! a timed wait that cannot be armed reports its timeout rather than waiting
+//! untimed (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
+//! Invariants, invariant 4).
+//!
+//! Required: every result read with QUIT clear is `OutOfMemory` or
 //! `Interrupted`; some result is `OutOfMemory` (the full-list path ran); the
 //! sleep after the drain returns `Ok`. Userspace cannot tell a won
 //! withdrawal that a stop then committed over from one no stop reached, so
@@ -52,8 +60,9 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
-    cap_create_cspace, cap_create_thread, cap_delete, system_info, thread_exit,
-    thread_set_affinity, thread_sleep, thread_start, thread_stop,
+    cap_create_cspace, cap_create_notification, cap_create_thread, cap_delete, event_queue_create,
+    event_recv_timeout, notification_wait_timeout, system_info, thread_exit, thread_set_affinity,
+    thread_sleep, thread_start, thread_stop,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
@@ -68,6 +77,10 @@ const FILLERS: usize = 128;
 /// How long each filler sleeps per iteration, in milliseconds; far longer
 /// than the cell runs, so no filler frees its slot until it is deleted.
 const FILL_SLEEP_MS: u64 = 600_000;
+
+/// Timeout of the timed waits issued with the list full, in milliseconds;
+/// they must return at once, long before it.
+const TIMED_WAIT_MS: u64 = 60_000;
 
 /// Stop/start pairs to issue against the victim.
 const CYCLES: u32 = 2000;
@@ -87,7 +100,7 @@ struct FillStack([u8; 8192]);
 // before this cell returns and stress cells run sequentially.
 static mut FILL_STACKS: [FillStack; FILLERS] = [const { FillStack([0; 8192]) }; FILLERS];
 
-/// Fillers that have entered their first sleep.
+/// Fillers that have started (counted just before their first sleep).
 static FILLED: AtomicU32 = AtomicU32::new(0);
 /// Set by the controller once the victim may stop looping.
 static QUIT: AtomicU32 = AtomicU32::new(0);
@@ -101,9 +114,12 @@ static BAD: AtomicU64 = AtomicU64::new(0);
 /// The victim's sleep after the drain: 1 = `Ok`, 2 = anything else.
 static AFTER: AtomicU32 = AtomicU32::new(0);
 
-/// Run the cell: skip below 2 CPUs; otherwise fail if a storm sleep
-/// returned neither `OutOfMemory` nor `Interrupted`, if none met the full
-/// list, or if the sleep after the drain did not return `Ok`.
+/// Run the cell with `ctx`'s controller thread, address space and memory:
+/// skip below 2 CPUs; otherwise fail if a timed wait on the full list did not
+/// time out at once, if a storm sleep returned neither `OutOfMemory` nor
+/// `Interrupted`, if none met the full list, or if no sleep after the drain
+/// returned `Ok`. Setup, a bounded wait, a stop or start, or teardown that
+/// fails returns `Err` naming the step.
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)
@@ -160,6 +176,7 @@ fn with_fillers(ctx: &TestContext) -> TestResult
     let mut created = 0usize;
     let mut result = spawn_fillers(ctx, cs, &mut fillers, &mut created)
         .and_then(|()| await_full())
+        .and_then(|()| timed_waits_time_out(ctx))
         .and_then(|()| with_victim(ctx, &fillers[..created]));
     // Deleting a filler removes its sleep entry if a failed storm left one.
     for &th in &fillers[..created]
@@ -221,6 +238,39 @@ fn await_full() -> TestResult
         }
     }
     Err("stress::sleep_list_full: the sleep list never filled")
+}
+
+/// With the list full, a timed notification wait and a timed event receive
+/// must time out at once (0 bits, `WouldBlock`) rather than wait untimed: a
+/// regression hangs here, which fails the boot.
+fn timed_waits_time_out(ctx: &TestContext) -> TestResult
+{
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "stress::sleep_list_full: create notification failed")?;
+    let Ok(eq) = event_queue_create(ctx.memory_base, 4)
+    else
+    {
+        let _ = cap_delete(sig);
+        return Err("stress::sleep_list_full: create event queue failed");
+    };
+    let notified = notification_wait_timeout(sig, TIMED_WAIT_MS);
+    let received = event_recv_timeout(eq, TIMED_WAIT_MS);
+    let deleted = cap_delete(sig).and(cap_delete(eq));
+    if notified != Ok(0)
+    {
+        return Err(
+            "stress::sleep_list_full: a timed notification wait on the full list did not \
+                    time out",
+        );
+    }
+    if received != Err(SyscallError::WouldBlock as i64)
+    {
+        return Err(
+            "stress::sleep_list_full: a timed event receive on the full list did not time \
+                    out",
+        );
+    }
+    deleted.map_err(|_| "stress::sleep_list_full: delete wait sources failed")
 }
 
 /// Start the victim, storm it, delete the fillers' sleeps by deleting the
@@ -301,8 +351,9 @@ fn filler_entry(_arg: u64) -> !
     }
 }
 
-/// Victim: `thread_sleep(1)` until released, tallying each result, then one
-/// more sleep on the drained list.
+/// Victim: loop `thread_sleep(1)`, reading QUIT after each sleep returns and
+/// tallying results read with QUIT clear; on the first result read with QUIT
+/// set, record `Ok` if that sleep, or one more, returned `Ok`.
 fn victim_entry(_arg: u64) -> !
 {
     RUNNING.store(1, Ordering::Release);

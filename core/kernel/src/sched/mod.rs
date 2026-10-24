@@ -1192,7 +1192,11 @@ fn watchdog_dump(reason: &str)
             && kind_after == kind_before
             && word != 0
         {
-            crate::kprintln!("    waiting on {} lock @0x{:x}", lock_kind.name(), word);
+            // The lock word's address is a kernel VA: serial only
+            // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+            // diagnostics).
+            crate::kprintln!("    waiting on {} lock", lock_kind.name());
+            crate::kprintln_serial!("    lock word @0x{:x}", word);
         }
         // The last syscall entered on this CPU, from the dispatcher's per-CPU
         // stamp; the stalled thread's frame and TCB are not read.
@@ -1496,8 +1500,8 @@ pub static BOOT_TRANSIENT_ACTIVE: core::sync::atomic::AtomicBool =
 /// its expiry scratch buffer) can hold. `sleep_list_add` refuses with
 /// [`SleepAddError::Full`] past this cap rather than dropping silently:
 /// `SYS_THREAD_SLEEP` withdraws its park and returns `OutOfMemory` (or, when a
-/// stop already claimed the park, `Interrupted`), and a timed IPC wait
-/// degrades to an untimed one.
+/// stop already claimed the park, `Interrupted`), and a timed IPC wait times
+/// out at once.
 pub const MAX_SLEEPING: usize = 128;
 
 /// Global list of sleeping threads. Protected by its own spinlock.
@@ -3573,11 +3577,9 @@ pub enum ParkCommit
 /// source-side registration stands MUST reach `schedule()` before returning
 /// to user mode or attempting another commit — the wake deposited against the
 /// park is consumed only by a run-queue dequeue inside `schedule()`; any other
-/// exit leaks the waker's link (#352). The only sanctioned exception is a
-/// parker that un-commits under `sched_lock` while provably untargetable by
-/// any waker — `sys_thread_sleep`'s sleep-list-capacity rollback, which
-/// registered with no wake source. See docs/scheduling-internals.md § Lock
-/// Hierarchy.
+/// exit leaks the waker's link (#352). The sanctioned exceptions are the
+/// full-list withdrawals of docs/scheduling-internals.md § Lock Hierarchy
+/// rule 8.
 ///
 /// # Safety
 /// `tcb` must point to the current CPU's running thread.

@@ -236,18 +236,28 @@ pub(crate) unsafe fn claim_waiter(tcb: *mut ThreadControlBlock, value: u64)
     }
 }
 
+/// Set once [`arm_timed_park`] has reported a full sleep list. A caller that
+/// meets a full list retries at once, so the report is once per boot rather
+/// than once per wait.
+#[cfg(not(test))]
+static FULL_LIST_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Arm the sleep-list entry of `tcb`'s just-committed timed park with
 /// `deadline`, under the source lock that has held `tcb` queued since its push,
 /// so no claim can have run yet (docs/thread-lifecycle-and-sleep.md § Sleep
-/// List Invariants, invariant 8). With the sleep list full the wait degrades
-/// to untimed: the source can still wake it, only the timeout is lost.
-/// `wait` names the wait in that diagnostic.
+/// List Invariants, invariant 8). Returns `false`, with the deadline cleared,
+/// when the sleep list is full: the caller then withdraws the park
+/// ([`withdraw_timed_park`]) and reports an immediate timeout, so a timed wait
+/// never waits past its bound. `wait` names the wait in the one-time
+/// diagnostic.
 ///
 /// # Safety
 /// `tcb` is the running caller, committed `Blocked` on a source whose lock the
 /// caller holds; no scheduler or sleep-list lock is held.
 #[cfg(not(test))]
 pub(crate) unsafe fn arm_timed_park(tcb: *mut ThreadControlBlock, deadline: u64, wait: &str)
+-> bool
 {
     // SAFETY: tcb is the running caller per the contract.
     let added = unsafe {
@@ -262,18 +272,55 @@ pub(crate) unsafe fn arm_timed_park(tcb: *mut ThreadControlBlock, deadline: u64,
         added != Err(crate::sched::SleepAddError::Cancelled),
         "{wait}: timed arm cancelled under the source lock"
     );
-    if added == Err(crate::sched::SleepAddError::Full)
+    if added != Err(crate::sched::SleepAddError::Full)
+    {
+        return true;
+    }
+    if !FULL_LIST_REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed)
     {
         crate::kprintln!(
-            "kernel: sleep_list capacity reached ({}); {wait} falling back to indefinite wait",
+            "sleep_list capacity reached ({}); {wait} and later timed waits time out at once",
             crate::sched::MAX_SLEEPING,
         );
-        // SAFETY: tcb valid; the source lock is held.
-        unsafe {
-            (*tcb)
-                .sleep_deadline
-                .store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+    // SAFETY: tcb valid; the source lock is held.
+    unsafe {
+        (*tcb)
+            .sleep_deadline
+            .store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+    false
+}
+
+/// Withdraw `tcb`'s just-committed timed park after [`arm_timed_park`] found
+/// the sleep list full: restore `Running` and clear the park binding under
+/// `sched_lock`. The caller has removed `tcb` from the source's queue while
+/// holding the source lock it held since the push, so no waker or cancel can
+/// have claimed the park (every claim of a source waiter takes that lock):
+/// the un-commit is rule 8's sanctioned exception
+/// (docs/scheduling-internals.md § Lock Hierarchy). A concurrent
+/// `dealloc_object(Thread)` that already committed `Exited` keeps it.
+///
+/// # Safety
+/// `tcb` is the running caller; the caller holds the source lock, has
+/// dequeued `tcb`, and holds no scheduler or sleep-list lock.
+#[cfg(not(test))]
+pub(crate) unsafe fn withdraw_timed_park(tcb: *mut ThreadControlBlock)
+{
+    // SAFETY: tcb valid per the contract; the fields are written under
+    // sched_lock (lock order source → sched_lock).
+    unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        if (*tcb).state == crate::sched::thread::ThreadState::Blocked
+        {
+            (*tcb).state = crate::sched::thread::ThreadState::Running;
         }
+        (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
+        (*tcb).blocked_on_object = core::ptr::null_mut();
+        (*tcb).sched_lock.unlock_raw(saved);
+        (*tcb)
+            .context_saved
+            .store(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 

@@ -165,7 +165,8 @@ pub const SYS_NOTIFICATION_SEND: u64 = 3;
 /// arg0 = notification cap index (WAIT right). arg1 = `timeout_ms`: `0` means
 /// block indefinitely (the only behaviour before the timeout extension);
 /// `> 0` means block until bits are delivered *or* `timeout_ms`
-/// milliseconds have elapsed, whichever comes first.
+/// milliseconds have elapsed, whichever comes first; if the kernel's sleep
+/// list is full when the wait parks, the wait is untimed.
 ///
 /// On success returns `0` in the primary return register and the bitmask
 /// in the secondary register (rdx / a1). A notification wake always carries
@@ -188,7 +189,8 @@ pub const SYS_EVENT_POST: u64 = 5;
 /// - `u64::MAX` is non-blocking try-once: returns `WouldBlock` immediately
 ///   if the queue is empty.
 /// - `1 ..= u64::MAX-1` blocks until a post arrives or the timeout
-///   elapses, whichever comes first. On timeout returns `WouldBlock`
+///   elapses, whichever comes first (untimed if the kernel's sleep list is
+///   full when the wait parks). On timeout returns `WouldBlock`
 ///   (same code as the try-once-empty case — both mean "no payload
 ///   available"; the caller already knows which mode it asked for).
 ///

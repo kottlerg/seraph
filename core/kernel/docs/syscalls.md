@@ -422,7 +422,7 @@ entire bitmask (see [ipc-design.md](../../../docs/ipc-design.md) § Notification
 | # | Name | Description |
 |---|---|---|
 | 0 | `notification_cap` | Notification capability with Wait rights |
-| 1 | `timeout_ms` | `0` = block indefinitely; `>0` = wake after at most `timeout_ms` ms, unless the kernel's sleep list is full when the wait parks, in which case the wait is untimed (thread-lifecycle-and-sleep.md § Sleep List Invariants, invariant 4) |
+| 1 | `timeout_ms` | `0` = block indefinitely; `>0` = wake after at most `timeout_ms` ms; a wait that finds the kernel's sleep list full times out at once, returning `0` bits ([thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants), invariant 4) |
 
 **Return:**
 
@@ -483,7 +483,7 @@ Dequeue the next entry from an event queue with optional bounded wait.
 |-------------------|-----------------------------------------------------------------|
 | `0`               | Block forever until a post arrives                              |
 | `u64::MAX`        | Non-blocking try-once; return `WouldBlock` if empty             |
-| `1 ..= MAX-1`     | Block until post arrives or `timeout_ms` ms elapse (untimed if the kernel's sleep list is full when the wait parks) |
+| `1 ..= MAX-1`     | Block until post arrives or `timeout_ms` ms elapse (`WouldBlock` at once if the kernel's sleep list is full when the wait parks) |
 
 **Return:**
 

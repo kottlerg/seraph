@@ -674,8 +674,8 @@ unsafe fn clear_reply_binding(tcb: *mut crate::sched::thread::ThreadControlBlock
 /// stale wake deposit, and clears the thread's park binding, whatever state a
 /// concurrent stop or teardown commits over the claimed park meanwhile. A lost
 /// claim means another claimant owns the episode, its deposit stands, and
-/// that claimant clears the binding (docs/scheduling-internals.md § Lock
-/// Hierarchy rule 7).
+/// rule 7 of docs/scheduling-internals.md § Lock Hierarchy names who retires
+/// the binding.
 ///
 /// [`PARK_DISPOSITION_INTERRUPTED`]: crate::sched::thread::PARK_DISPOSITION_INTERRUPTED
 ///
@@ -1102,8 +1102,8 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
     }
 
     // Clear the binding under sched_lock only if this cancel claimed the park.
-    // On a lost claim the winner owns the episode and clears the binding
-    // (docs/scheduling-internals.md § Lock Hierarchy rule 7); a waker may
+    // On a lost claim the winner owns the episode and rule 7 names who retires
+    // the binding (docs/scheduling-internals.md § Lock Hierarchy); a waker may
     // already have let the thread run and park again (every park commit
     // advances park_seq, and the caller's commit retries on a changed one).
     // Clearing here after a lost claim would race the winner's

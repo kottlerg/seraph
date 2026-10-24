@@ -926,8 +926,8 @@ pub fn notification_wait(sig: u32) -> Result<u64, i64>
 /// on timeout.
 ///
 /// `timeout_ms == 0` is equivalent to [`notification_wait`] — block indefinitely.
-/// If the kernel's sleep list is full when the wait parks, the wait is
-/// untimed, so `timeout_ms` bounds the wait only while the list has room.
+/// If the kernel's sleep list is full when the wait parks, it returns `Ok(0)`
+/// at once, as a timeout.
 ///
 /// Same register layout as [`notification_wait`]: status in the primary register,
 /// bitmask in the secondary. Timeout is notified in-band as `bits == 0`
@@ -2043,7 +2043,7 @@ pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
 /// [`event_recv`]); `timeout_ms == u64::MAX` is a non-blocking poll (same as
 /// [`event_try_recv`]); any other value blocks for up to `timeout_ms`
 /// milliseconds, then returns `Err(-6)` (`WouldBlock`) if no post arrived
-/// (untimed if the kernel's sleep list is full when the wait parks).
+/// (at once if the kernel's sleep list is full when the wait parks).
 ///
 /// # Errors
 /// Returns `-6` (`WouldBlock`) on timeout or empty try-once; `-16`

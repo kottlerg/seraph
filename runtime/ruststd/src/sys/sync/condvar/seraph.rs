@@ -14,14 +14,16 @@
 //!
 //! `wait_timeout` passes the millisecond timeout through `arg1` of
 //! `SYS_NOTIFICATION_WAIT`. A non-zero bit return means notification wake; a
-//! `0` return means the timer expired.
+//! `0` return means the wait timed out, which the kernel also reports at once
+//! when its sleep list is full, so `wait_timeout` waits again for what is
+//! left of the duration and reports a timeout only once it has elapsed.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use crate::sync::atomic::AtomicU32;
 use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
 use crate::sys::sync::Mutex;
-use crate::time::Duration;
+use crate::time::{Duration, Instant};
 
 const WAKE_BURST: u32 = 16;
 
@@ -77,30 +79,39 @@ impl Condvar {
     /// `mutex` must be held by the calling thread.
     pub unsafe fn wait_timeout(&self, mutex: &Mutex, timeout: Duration) -> bool {
         let before = self.gen_counter.load(Relaxed);
+        let start = Instant::now();
         // SAFETY: contract inherited from caller.
         unsafe { mutex.unlock() };
         let sig = ensure_notification(&self.notification);
-        // Round to milliseconds. `0` to the syscall means "block
-        // indefinitely", so push any sub-millisecond non-zero duration
-        // up to 1 and handle Duration::ZERO explicitly.
-        let mut ms = timeout.as_millis();
-        if ms == 0 && !timeout.is_zero() {
-            ms = 1;
+        // A 0-bit return means the wait timed out, which the kernel reports
+        // at once when its sleep list is full and up to a tick early
+        // otherwise, so wait again for whatever of `timeout` is left: the
+        // result reports a timeout only once the duration has elapsed.
+        let mut woke = false;
+        while sig != 0 && !woke && self.gen_counter.load(Relaxed) == before {
+            let Some(left) = timeout.checked_sub(start.elapsed()).filter(|d| !d.is_zero()) else {
+                break;
+            };
+            // Round up to whole milliseconds: `0` to the syscall means
+            // "block indefinitely".
+            let ms = u64::try_from(left.as_micros().div_ceil(1000)).unwrap_or(u64::MAX).max(1);
+            // Non-zero bits are a notification wake. An error (a stop's
+            // `Interrupted`) ends the wait early; it is reported as a
+            // spurious wake, not a timeout, since the duration may not have
+            // elapsed.
+            if !matches!(syscall::notification_wait_timeout(sig, ms), Ok(0)) {
+                woke = true;
+            }
         }
-        let ms = u64::try_from(ms).unwrap_or(u64::MAX);
-        let woke_on_notification = if sig != 0 && ms != 0 {
-            // Returns non-zero bits on notification wake, 0 on timeout.
-            matches!(syscall::notification_wait_timeout(sig, ms), Ok(b) if b != 0)
-        } else {
-            false
-        };
+        // Without a notification cap, wait out the duration (or a notify).
+        while sig == 0 && self.gen_counter.load(Relaxed) == before && start.elapsed() < timeout {
+            core::hint::spin_loop();
+        }
         mutex.lock();
         // Contract: return `true` if we did NOT time out. A notification wake
-        // (non-zero bits) counts as "did not time out". If the generation
-        // counter moved while we were parked, a notify happened even if
-        // the kernel delivered it as a notification edge that merged with the
-        // timeout, so report non-timeout.
-        woke_on_notification || self.gen_counter.load(Relaxed) != before
+        // or an early end counts as "did not time out", and so does a moved
+        // generation counter (a notify whose edge merged with a timeout).
+        woke || self.gen_counter.load(Relaxed) != before
     }
 }
 

@@ -11,12 +11,13 @@
 //! - Stubs for the APIC timer (vector 32) and spurious (vector 255).
 //! - A common exception handler that prints diagnostics and halts.
 //!
-//! Every ring-3 entry at which a thread can be stopped (exception, `#PF`, NMI,
-//! and ring-3 IRQ) builds the one canonical [`TrapFrame`] on the kernel stack via
-//! `tf_build_asm` and writes it back on exit via `tf_restore_asm` (inside
-//! `tf_resume_asm` for the normal stubs, `paranoid_exit_asm` for the paranoid
-//! ones); the fault redirect points `tcb->trap_frame` at that live frame with no
-//! copy. See the "Unified entry frame" section.
+//! Every ring-3 entry at which a thread can be stopped (exception, `#PF`, and
+//! ring-3 IRQ; a ring-3 NMI is terminal or returns) builds the one canonical
+//! [`TrapFrame`] on the kernel stack via `tf_build_asm` and writes it back on
+//! exit via `tf_restore_asm` (inside `tf_resume_asm` for the normal stubs,
+//! `paranoid_exit_asm` for the paranoid ones); the fault redirect points
+//! `tcb->trap_frame` at that live frame with no copy. See the "Unified entry
+//! frame" section.
 //!
 //! # Entry and exit discipline
 //! Every stub that runs kernel code clears DF and AC (`cld`, `clac`) on entry and
@@ -128,11 +129,11 @@ struct Idtr
 // ── Unified entry frame ─────────────────────────────────────────────────────
 //
 // Every ring-3 entry at which a thread can be stopped — syscall (syscall.rs),
-// exception/#PF/NMI, and ring-3 IRQ — lands on the one canonical `TrapFrame`
-// (the userspace register ABI). The fault redirect points `tcb->trap_frame` at
-// the live on-stack frame directly (symmetric with
-// riscv64/interrupts.rs::redirect_user_fault), so there is no second frame type
-// and no copy.
+// exception/#PF, and ring-3 IRQ (a ring-3 NMI is terminal or returns) —
+// lands on the one canonical `TrapFrame` (the userspace register ABI). The
+// fault redirect points `tcb->trap_frame` at the live on-stack frame directly
+// (symmetric with riscv64/interrupts.rs::redirect_user_fault), so there is no
+// second frame type and no copy.
 //
 // The CPU + each stub leave a uniform stub frame on entry to a trampoline
 // (S = rsp at the trampoline label):
@@ -464,10 +465,12 @@ pub(super) unsafe extern "C" fn common_exception_handler(
                 crate::sched::post_death_notification(tcb, 0x1000 + vector);
             }
 
-            // Terminal fault (no handler bound, or handler replied KILL): notify
-            // the faulting thread's address-space observers with the fault class
-            // so procmgr can tear the whole process down. Reached only on the
-            // terminal path; normal thread_exit never lands here.
+            // Terminal fault (no handler bound, or a Kill outcome: the handler
+            // replied KILL or the episode was cancelled; see docs/fault-handling.md
+            // § Delivery, Resume, and Kill): notify the faulting thread's
+            // address-space observers with the fault class so procmgr can tear the
+            // whole process down. Reached only on the terminal path; normal
+            // thread_exit never lands here.
             // SAFETY: tcb validated non-null; address_space may be null for
             // kernel threads, which post_aspace_death_notification handles.
             unsafe {
@@ -523,6 +526,13 @@ extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64
     // paranoid_exception_trampoline on this stack.
     let f = unsafe { &*tf };
     let from_user = (f.cs & 3) != 0;
+    // #DF and #MC run on the IST1 stack and are terminal; every other vector's
+    // frame from user mode is on the thread's kernel stack.
+    if from_user && vector != 8 && vector != 18
+    {
+        // SAFETY: tf is the live user frame on the current kernel stack.
+        unsafe { publish_user_frame(tf) };
+    }
     // #DF (8) and #MC (18) are non-restartable aborts; both run on the IST1 stack,
     // which is not re-entrant across the reschedule a redirect performs. They are
     // never delivered to a resumable handler — always terminal.
@@ -825,14 +835,50 @@ isr_stub!(isr31, 31, has_error_code = false, ist = 0);
 
 // ── Shared IRQ trampoline ─────────────────────────────────────────────────────
 
+/// Point the current thread's `trap_frame` at `frame`, the live frame an
+/// interrupt or exception trampoline built on its kernel stack for an entry
+/// from user mode (the rule, and the entries that publish nothing, are in
+/// `docs/arch-interface.md` § `trap_frame`). After configuration the running
+/// thread is the only writer; the register syscalls read the pointer only once
+/// the thread is off every CPU with its save published
+/// (`sched::with_held_frame`).
+///
+/// # Safety
+/// `frame` must be the live frame an entry from user mode built on the current
+/// thread's kernel stack, not an IST stack.
+#[cfg(not(test))]
+pub(super) unsafe fn publish_user_frame(frame: *mut TrapFrame)
+{
+    // SAFETY: interrupt or exception context; current_tcb is the thread whose
+    // kernel stack holds `frame`.
+    let tcb = unsafe { crate::syscall::current_tcb() };
+    if !tcb.is_null()
+    {
+        // SAFETY: tcb is the running thread; it alone writes its trap_frame.
+        unsafe {
+            (*tcb)
+                .trap_frame
+                .store(frame, core::sync::atomic::Ordering::Relaxed);
+        };
+    }
+}
+
 /// Route a device/timer/IPI interrupt by its IDT vector to the existing handler.
 ///
-/// Called from [`common_irq_trampoline`] with the stub-pushed vector. Each
-/// handler performs its own EOI; this only dispatches. The device range carries
-/// the GSI as `vector - 33` (the GSI indexes `IRQ_TABLE`; see `irq.rs`).
+/// Called from [`common_irq_trampoline`] with the stub-pushed vector and, for an
+/// interrupt taken from user mode, the live user frame (null otherwise), which
+/// it publishes as the thread's `trap_frame` first ([`publish_user_frame`]).
+/// Each handler performs its own EOI; this only dispatches. The device range
+/// carries the GSI as `vector - 33` (the GSI indexes `IRQ_TABLE`; see `irq.rs`).
 #[cfg(not(test))]
-extern "C" fn irq_dispatch(vector: u64)
+extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
 {
+    if !user_frame.is_null()
+    {
+        // SAFETY: the ring-3 trampoline path passes the frame it built on the
+        // current thread's kernel stack.
+        unsafe { publish_user_frame(user_frame) };
+    }
     match vector
     {
         v if v == u64::from(super::timer::TIMER_VECTOR) => super::timer::timer_isr(),
@@ -886,6 +932,7 @@ unsafe extern "C" fn common_irq_trampoline()
             "lfence\n",
             tf_build_asm!(),
             "mov rdi, [rsp + 168]\n", // arg0 = vector
+            "mov rsi, rsp\n",         // arg1 = *mut TrapFrame (the live user frame)
             "call {dispatch}\n",
             tf_resume_asm!(),
             // ── ring-0: minimal save (no user state) ──
@@ -901,6 +948,7 @@ unsafe extern "C" fn common_irq_trampoline()
             "push r10\n",
             "push r11\n",
             "mov rdi, [rsp + 72]\n", // arg0 = vector
+            "xor esi, esi\n",        // arg1 = null: no user frame
             "call {dispatch}\n",
             "pop r11\n",
             "pop r10\n",
@@ -1184,6 +1232,11 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
     // SAFETY: tf is constructed by isr_page_fault on this stack.
     let f = unsafe { &*tf };
     let from_user = (f.cs & 3) != 0;
+    if from_user
+    {
+        // SAFETY: tf is the live user frame on the current kernel stack.
+        unsafe { publish_user_frame(tf) };
+    }
     // A reserved-bit violation is never a stale-TLB fault; only well-formed
     // present/permission faults from userspace are retry candidates.
     if from_user && error_code & ERR_RSVD == 0
@@ -1385,11 +1438,17 @@ unsafe fn redirect_user_fault(
 {
     // SAFETY: tcb valid; repoint trap_frame at the live frame for the duration of
     // the block, restoring the prior pointer afterward.
-    let saved_tf = unsafe { (*tcb).trap_frame };
+    let saved_tf = unsafe {
+        (*tcb)
+            .trap_frame
+            .load(core::sync::atomic::Ordering::Relaxed)
+    };
     // SAFETY: tcb valid; trap_frame is the live-frame pointer read/edited by the
     // register syscalls while this thread is BlockedOnFault.
     unsafe {
-        (*tcb).trap_frame = frame;
+        (*tcb)
+            .trap_frame
+            .store(frame, core::sync::atomic::Ordering::Relaxed);
     }
 
     // SAFETY: handler bound; trap_frame points at the live frame; no lock held.
@@ -1397,7 +1456,9 @@ unsafe fn redirect_user_fault(
 
     // SAFETY: restore the prior trap_frame pointer.
     unsafe {
-        (*tcb).trap_frame = saved_tf;
+        (*tcb)
+            .trap_frame
+            .store(saved_tf, core::sync::atomic::Ordering::Relaxed);
     }
 
     matches!(outcome, crate::ipc::fault::FaultOutcome::Resume)

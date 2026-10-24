@@ -99,8 +99,11 @@ static IDLE_TCBS_PTR: core::sync::atomic::AtomicPtr<MaybeUninit<ThreadControlBlo
 static IDLE_STACK_TOPS_PTR: core::sync::atomic::AtomicPtr<u64> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
-/// Return the `PerCpuScheduler` pointer for `cpu`. Caller must guarantee
-/// `cpu < CPU_COUNT` and that [`init_per_cpu_storage`] has run.
+/// Return the `PerCpuScheduler` pointer for `cpu`.
+///
+/// # Safety
+/// `cpu < CPU_COUNT`, and [`init_per_cpu_storage`] has run (the allocation it
+/// publishes covers `CPU_COUNT` slots).
 #[cfg(not(test))]
 #[inline]
 unsafe fn scheduler_ptr(cpu: usize) -> *mut PerCpuScheduler
@@ -114,8 +117,11 @@ unsafe fn scheduler_ptr(cpu: usize) -> *mut PerCpuScheduler
     unsafe { base.add(cpu) }
 }
 
-/// Return the idle-TCB slot pointer for `cpu`. Same contract as
-/// [`scheduler_ptr`].
+/// Return the idle-TCB slot pointer for `cpu`.
+///
+/// # Safety
+/// As [`scheduler_ptr`]: `cpu < CPU_COUNT`, and [`init_per_cpu_storage`] has
+/// run.
 #[cfg(not(test))]
 #[inline]
 unsafe fn idle_tcb_ptr(cpu: usize) -> *mut MaybeUninit<ThreadControlBlock>
@@ -129,8 +135,11 @@ unsafe fn idle_tcb_ptr(cpu: usize) -> *mut MaybeUninit<ThreadControlBlock>
     unsafe { base.add(cpu) }
 }
 
-/// Return the idle-stack-top slot pointer for `cpu`. Same contract as
-/// [`idle_tcb_ptr`].
+/// Return the idle-stack-top slot pointer for `cpu`.
+///
+/// # Safety
+/// As [`scheduler_ptr`]: `cpu < CPU_COUNT`, and [`init_per_cpu_storage`] has
+/// run.
 #[cfg(not(test))]
 #[inline]
 unsafe fn idle_stack_top_slot(cpu: usize) -> *mut u64
@@ -370,6 +379,19 @@ pub const SPIN_SITE_SCHED_CONTEXT_SAVED: u32 = 4;
 /// `dealloc_object(AddressSpace)` root-free gate: spinning until no CPU has
 /// the dying address space loaded (`active_cpus` empty).
 pub const SPIN_SITE_DEALLOC_AS_ACTIVE: u32 = 5;
+/// Notification / `EventQueue` / Thread dealloc gate: spinning until the timer
+/// batch that may have snapshotted the dying source or TCB finishes
+/// dispatching ([`sleep_wakeups_quiesce`]).
+pub const SPIN_SITE_DEALLOC_TIMER_DISPATCH: u32 = 6;
+/// `sys_thread_start` settle loop ([`start_under_all_locks`]): spinning until
+/// the target is off every CPU, its save published, and no wake is owed.
+pub const SPIN_SITE_START_SETTLE: u32 = 7;
+/// Register-access wait ([`with_held_frame`]): spinning until a fault-blocked
+/// thread still switching out is off every CPU with its save published.
+pub const SPIN_SITE_REGS_SETTLE: u32 = 8;
+/// `sys_thread_stop` save wait (`await_stopped_save`): spinning until a
+/// target that left its CPU before the commit publishes its save.
+pub const SPIN_SITE_STOP_SAVE: u32 = 9;
 
 /// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
 /// executing, for the softlockup watchdog. A wedged CPU (no non-idle dispatch
@@ -378,10 +400,14 @@ pub const SPIN_SITE_DEALLOC_AS_ACTIVE: u32 = 5;
 /// Set on gate entry, cleared on exit; [`SPIN_SITE_NONE`] when not spinning.
 /// The reporting sites are the three `dealloc_object(Thread)` gates (the
 /// first of which `stop_threads_bound_to`'s phase-2 spin shares), the
-/// `dealloc_object(AddressSpace)` root-free gate, and the `schedule()`
-/// context-saved dispatch barrier — the protocol spins that can wedge a CPU
-/// silently (the `sys_thread_stop` drain carries its own overlong-duration
-/// warning). Diagnostic-only — never gates control flow.
+/// `dealloc_object(AddressSpace)` root-free gate, the timer-dispatch gate the
+/// Notification, `EventQueue`, and Thread dealloc arms share, the
+/// `sys_thread_start` settle loop (`start_under_all_locks`), the register-access
+/// wait (`with_held_frame`), the `sys_thread_stop` save wait
+/// (`await_stopped_save`), and the
+/// `schedule()` context-saved dispatch barrier — the protocol spins that can
+/// wedge a CPU silently (the `sys_thread_stop` drain carries its own
+/// overlong-duration warning). Diagnostic-only — never gates control flow.
 #[cfg(not(test))]
 static SPIN_SITE: [core::sync::atomic::AtomicU32; MAX_CPUS] =
     [const { core::sync::atomic::AtomicU32::new(SPIN_SITE_NONE) }; MAX_CPUS];
@@ -421,6 +447,10 @@ fn spin_site_name(site: u32) -> &'static str
         SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT => "dealloc:wake-in-flight",
         SPIN_SITE_SCHED_CONTEXT_SAVED => "schedule:context-saved",
         SPIN_SITE_DEALLOC_AS_ACTIVE => "dealloc:as-active",
+        SPIN_SITE_DEALLOC_TIMER_DISPATCH => "dealloc:timer-dispatch",
+        SPIN_SITE_START_SETTLE => "start:settle",
+        SPIN_SITE_REGS_SETTLE => "regs:settle",
+        SPIN_SITE_STOP_SAVE => "stop:save",
         _ => "none",
     }
 }
@@ -494,18 +524,6 @@ impl LockKind
         }
     }
 
-    /// Width in bytes of the lock's state word.
-    #[cfg(not(test))]
-    fn word_width(self) -> usize
-    {
-        match self
-        {
-            Self::RetypeAlloc | Self::Pool => 8,
-            Self::Derivation | Self::MemoryRead | Self::MemoryWrite => 4,
-            Self::KernelPtPool => 1,
-        }
-    }
-
     /// Decode a breadcrumb encoding; `None` for 0 (no wait) or garbage.
     #[cfg(not(test))]
     fn from_code(code: u32) -> Option<Self>
@@ -523,8 +541,8 @@ const LOCK_WAIT_NONE: u32 = 0;
 /// the address of its state word. These locks spin with interrupts masked
 /// (syscall context), inside a preempt-disabled window, or inside the idle
 /// thread's deferred reclaim, so a CPU wedged on one shows no protocol spin
-/// site and looks silent or idle; this breadcrumb names the lock and lets
-/// the dump read its state word. Recorded only once the first acquisition
+/// site and looks silent or idle; this breadcrumb names the lock and its
+/// state word's address for the dump. Recorded only once the first acquisition
 /// attempt fails, so the uncontended fast path stores nothing.
 /// Diagnostic-only — never gates control flow.
 #[cfg(not(test))]
@@ -534,6 +552,28 @@ static LOCK_WAIT_KIND: [core::sync::atomic::AtomicU32; MAX_CPUS] =
 #[cfg(not(test))]
 static LOCK_WAIT_WORD: [core::sync::atomic::AtomicU64; MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+
+/// Per-CPU stamp of the last syscall number entered on that CPU
+/// (`u64::MAX` before the first), written by the syscall dispatcher, for the
+/// softlockup watchdog: it names the last syscall entered on a stalled CPU,
+/// which need not be the one it is executing, without reading another CPU's
+/// TCB or frame. Diagnostic-only — never gates control flow.
+#[cfg(not(test))]
+static CPU_SYSCALL_NR: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; MAX_CPUS];
+
+/// Stamp `nr` as the last syscall entered on the current CPU; see
+/// [`CPU_SYSCALL_NR`]. Called with interrupts masked (syscall entry), so the
+/// CPU index is stable.
+#[cfg(not(test))]
+pub fn note_cpu_syscall(nr: u64)
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    if cpu < MAX_CPUS
+    {
+        CPU_SYSCALL_NR[cpu].store(nr, core::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Record that the current CPU is spinning for the lock of kind `kind` whose
 /// state word lives at address `word`. Callers spin with interrupts masked,
@@ -859,15 +899,18 @@ fn owed_wake_scan()
         {
             return;
         }
-        // SAFETY: t is a registry-walked TCB held stable by the registry
-        // lock; plain scalar reads. Torn observations are absorbed by the
-        // grace window (rule 1) and the two-scan persistence (rules 2, 3).
+        // SAFETY: t is a registry-walked TCB kept mapped by the registry lock,
+        // so these reads cannot fault. They are not race-free: the fields
+        // are `sched_lock`-owned and read without it, a diagnostic-only
+        // residual #440 records; a torn observation is absorbed by the grace
+        // window (rule 1) and the two-scan persistence (rules 2, 3).
         let (state, ipc, tid, dl, wif, wp, started) = unsafe {
             (
                 (*t).state,
                 (*t).ipc_state,
                 (*t).thread_id,
-                (*t).sleep_deadline,
+                (*t).sleep_deadline
+                    .load(core::sync::atomic::Ordering::Relaxed),
                 (*t).wake_in_flight
                     .load(core::sync::atomic::Ordering::Relaxed),
                 (*t).wake_pending,
@@ -1030,9 +1073,15 @@ fn bsp_stall_check(own_heartbeat: u64)
 
 /// Dump scheduler state for a detected wedge: per-CPU current threads, the
 /// sleep list, and all non-running registered threads. Callable from any CPU
-/// in interrupt context; shared structures are read benign-racily or via
-/// try-lock so a wedged lock holder cannot deadlock the dump.
+/// in interrupt context. The sleep list and the registry are taken only by
+/// try-lock, so a wedged holder of either cannot deadlock the dump (its output
+/// still takes the console lock); the per-CPU snapshot, the sleep-list
+/// entries, the walked TCB fields and the blocking objects are read without
+/// their locks, a diagnostic-only residual #440 records.
 #[cfg(not(test))]
+// too_many_lines: one flat, sequential diagnostic dump (per-CPU snapshot,
+// sleep list, registry walk); splitting it would scatter the try-lock and
+// unlocked-read discipline the rustdoc states.
 #[allow(clippy::too_many_lines)]
 fn watchdog_dump(reason: &str)
 {
@@ -1048,7 +1097,11 @@ fn watchdog_dump(reason: &str)
     #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpu_count
     {
-        // SAFETY: scheduler slabs initialised; we only read fields, no writes.
+        // SAFETY: scheduler slabs initialised and the TCB slab stays mapped,
+        // so these reads cannot fault. They are not race-free: another CPU's
+        // plain `current` and that TCB's fields are read without their locks,
+        // a diagnostic-only residual #440 records (nothing here decides
+        // anything, but a stalled CPU's thread may still be changing them).
         let (cur_is_null, tid, state, ipc, blocked_on, prio, pref, last_tick, mask) = unsafe {
             let s = scheduler_for(cpu);
             let cur = s.current;
@@ -1122,86 +1175,35 @@ fn watchdog_dump(reason: &str)
         {
             crate::kprintln!("    spinning in {}", spin_site_name(spin));
         }
-        // Name the bare spin lock this CPU is waiting for, if any, and read
-        // its state word: these waits spin with interrupts masked, inside a
-        // preempt-disabled window, or on the idle thread, so a wedged CPU is
-        // otherwise indistinguishable from a silent or idle one.
+        // Name the bare spin lock this CPU is waiting for, if any: these waits
+        // spin with interrupts masked, inside a preempt-disabled window, or on
+        // the idle thread, so a wedged CPU is otherwise indistinguishable from
+        // a silent or idle one.
         // The breadcrumb belongs to another CPU, which may leave and
         // re-enter a wait meanwhile: the kind is read before and after the
         // word (Acquire, paired with the writer's Release), and the pair is
-        // used only if both reads agree and the word is a non-zero address
-        // aligned for that kind's width. A wait exited and re-entered
-        // meanwhile can still pair the kind with the earlier word — or,
-        // across two re-entries, with a word recorded for another kind — a
-        // stale but mapped address aligned for the width read, so the line
-        // may be mislabeled but the read stays sound.
+        // reported only if both reads agree. The lock word itself is not
+        // read: a breadcrumb gone stale meanwhile can name storage since
+        // recycled to another object.
         let kind_before = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
         let word = LOCK_WAIT_WORD[cpu].load(core::sync::atomic::Ordering::Relaxed) as usize;
         let kind_after = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
         if let Some(lock_kind) = LockKind::from_code(kind_before)
             && kind_after == kind_before
             && word != 0
-            && word.is_multiple_of(lock_kind.word_width())
         {
-            // SAFETY: `word` was recorded by a spinner as the address of a
-            // lock state word, which lives in a static or a retype slab —
-            // kernel direct-map storage that stays mapped for the kernel's
-            // lifetime, even after the slab is recycled — and the checks
-            // above give a non-null address aligned for the width read. The
-            // read is volatile and nothing is written; the value is
-            // diagnostic only.
-            let value = unsafe {
-                match lock_kind.word_width()
-                {
-                    8 => core::ptr::read_volatile(core::ptr::with_exposed_provenance::<u64>(word)),
-                    1 => u64::from(core::ptr::read_volatile(
-                        core::ptr::with_exposed_provenance::<u8>(word),
-                    )),
-                    _ => u64::from(core::ptr::read_volatile(
-                        core::ptr::with_exposed_provenance::<u32>(word),
-                    )),
-                }
-            };
-            crate::kprintln!(
-                "    waiting on {} lock @0x{:x} word=0x{:x}",
-                lock_kind.name(),
-                word,
-                value
-            );
+            // The lock word's address is a kernel VA: serial only
+            // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+            // diagnostics).
+            crate::kprintln!("    waiting on {} lock", lock_kind.name());
+            crate::kprintln_serial!("    lock word @0x{:x}", word);
         }
-        // Dump the user-mode trap frame if present: tells us where in
-        // userspace the thread entered its currently-stuck syscall.
-        // SAFETY: trap_frame is set by every userspace-syscall entry and
-        // cleared on userspace return; reading the pointed-to TrapFrame
-        // races benignly with concurrent writes (we're already in stall).
-        let user_frame = unsafe {
-            let s = scheduler_for(cpu);
-            let cur = s.current;
-            let tf = if cur.is_null()
-            {
-                core::ptr::null_mut()
-            }
-            else
-            {
-                (*cur).trap_frame
-            };
-            if tf.is_null()
-            {
-                None
-            }
-            else
-            {
-                // The syscall number comes from the dispatcher's stamp on
-                // the TCB, not the frame.
-                let nr = (*cur)
-                    .syscall_nr
-                    .load(core::sync::atomic::Ordering::Relaxed);
-                Some(((*tf).instruction_pointer(), nr))
-            }
-        };
-        if let Some((user_pc, syscall_nr)) = user_frame
+        // The last syscall entered on this CPU, from the dispatcher's per-CPU
+        // stamp; the stalled thread's frame and TCB are not read.
+        let syscall_nr = CPU_SYSCALL_NR[cpu].load(core::sync::atomic::Ordering::Relaxed);
+        if syscall_nr != u64::MAX
         {
-            crate::kprintln!("    user_pc=0x{:x} syscall_nr={}", user_pc, syscall_nr);
+            crate::kprintln!("    last syscall on this cpu: nr={}", syscall_nr);
         }
     }
     // Derivation-lock state, holder CPU, and the most recent acquisition's
@@ -1246,7 +1248,10 @@ fn watchdog_dump(reason: &str)
     #[allow(clippy::needless_range_loop)]
     for i in 0..n.min(8)
     {
-        // SAFETY: read-only snapshot; benign racy load — we're already in stall.
+        // SAFETY: the entries and the TCBs they name stay mapped, so these
+        // reads cannot fault. They are not race-free: the list is read after
+        // SLEEP_LIST_LOCK is released and each TCB's fields without its lock,
+        // a diagnostic-only residual #440 records.
         let (tid, state, ipc, dl) = unsafe {
             let t = SLEEP_LIST[i];
             if t.is_null()
@@ -1257,7 +1262,8 @@ fn watchdog_dump(reason: &str)
                 (*t).thread_id,
                 (*t).state,
                 (*t).ipc_state,
-                (*t).sleep_deadline,
+                (*t).sleep_deadline
+                    .load(core::sync::atomic::Ordering::Relaxed),
             )
         };
         crate::kprintln!(
@@ -1275,24 +1281,26 @@ fn watchdog_dump(reason: &str)
     // waiter parked on an IPC object, or a `Ready` thread stranded in a run
     // queue that a wedged CPU never dispatched (the `mask` bit is set but no
     // dispatch happens). For `Blocked` threads the `blocked_on` decode says
-    // whether the blocking object still names the waiter (no wake issued) or
-    // holds data with a cleared slot (a wake deposited but never linked); for
-    // `Ready`/`Stopped` threads the scheduling fields say why a runnable thread
-    // is neither dispatched locally nor stolen (`context_saved`/`queued_on`/
-    // affinity / save-window pin).
+    // whether the blocking object still queues the thread (no wake issued) or
+    // holds data while it is no longer queued (a wake deposited but never
+    // linked); for `Ready`/`Stopped` threads the scheduling fields say why a
+    // runnable thread is neither dispatched locally nor stolen
+    // (`context_saved`/`queued_on`/affinity / save-window pin).
     crate::kprintln!("  NON-RUNNING REGISTERED THREADS:");
     // Defined outside the `try_for_each` call so the `kprintln!` expansions are
     // not lexically inside the `unsafe` wrapping that call (which would flag
     // their macro-internal `unsafe` as redundant). Each raw deref is its own
-    // tight `unsafe`; the field reads race benignly by the stalled contract.
+    // tight `unsafe`. The `sched_lock`-owned fields below are read without
+    // that lock: a diagnostic-only residual #440 records.
     let dump_thread = |t: *mut ThreadControlBlock| {
-        // SAFETY: t is a registry-walked TCB held stable by the registry lock.
+        // SAFETY: t is a registry-walked TCB kept mapped by the registry lock,
+        // so the read cannot fault; it races `sched_lock` writers (#440).
         let state = unsafe { (*t).state };
         match state
         {
             thread::ThreadState::Blocked =>
             {
-                // SAFETY: same contract; reads only plain scalar fields.
+                // SAFETY: as above: mapped, not race-free (#440).
                 let (tid, ipc, blocked_on, prio, pref, wake_pending, wake_in_flight, dl, started) = unsafe {
                     (
                         (*t).thread_id,
@@ -1303,7 +1311,8 @@ fn watchdog_dump(reason: &str)
                         (*t).wake_pending,
                         (*t).wake_in_flight
                             .load(core::sync::atomic::Ordering::Relaxed),
-                        (*t).sleep_deadline,
+                        (*t).sleep_deadline
+                            .load(core::sync::atomic::Ordering::Relaxed),
                         (*t).park_started_tick,
                     )
                 };
@@ -1320,14 +1329,15 @@ fn watchdog_dump(reason: &str)
                     dl,
                     started
                 );
-                // SAFETY: same contract; watchdog_decode_blocked_on only reads.
+                // SAFETY: as above; watchdog_decode_blocked_on reads the object
+                // without its lock (#440).
                 unsafe { watchdog_decode_blocked_on(t) };
             }
             thread::ThreadState::Ready
             | thread::ThreadState::Stopped
             | thread::ThreadState::Created =>
             {
-                // SAFETY: same contract; reads only plain scalar fields.
+                // SAFETY: as above: mapped, not race-free (#440).
                 let (tid, prio, pref, aff, queued_on, cs, wif, wp) = unsafe {
                     (
                         (*t).thread_id,
@@ -1373,14 +1383,17 @@ fn watchdog_dump(reason: &str)
 
 /// Decode and print the IPC object a `Blocked` thread is parked on, for the
 /// softlockup watchdog dump. The telling field is whether the object still
-/// names `t` as its waiter (the wake was never issued) or has been cleared /
+/// queues `t` as a waiter (the wake was never issued) or has dequeued it /
 /// carries data while `t` is still `Blocked` (the wake was lost between the
 /// waker's deposit and the run-queue link) — the #351 lost-wakeup signature.
 ///
 /// # Safety
-/// `t` is a registry-walked TCB pointer held stable by the registry lock. All
-/// reads are benign-racy by the watchdog's already-stalled contract; the
-/// blocking object is read without its lock (the kernel is wedged).
+/// `t` is a registry-walked TCB pointer kept mapped by the registry lock. Its
+/// `sched_lock`-owned fields and the blocking object's fields are read without
+/// their locks, so the reads are not race-free: a diagnostic-only residual
+/// #440 records. Nothing pins the object, so its scalar fields may be stale; no
+/// pointer read from it is followed. The waiter-queue probe reads only `t`'s queue tag
+/// (`WaitQueue::tags_racy`).
 #[cfg(not(test))]
 // cast_ptr_alignment: blocked_on_object is stored as *mut u8 but always points
 // at a properly-aligned IPC object whose concrete type is named by ipc_state;
@@ -1389,7 +1402,8 @@ fn watchdog_dump(reason: &str)
 unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
 {
     use core::sync::atomic::Ordering;
-    // SAFETY: caller contract; reads ipc_state + blocked_on scalars.
+    // SAFETY: caller contract: t is mapped; the binding is read without
+    // sched_lock (#440).
     let (ipc, blocked_on) = unsafe { ((*t).ipc_state, (*t).blocked_on_object) };
     if blocked_on.is_null()
     {
@@ -1402,17 +1416,20 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
         IpcThreadState::BlockedOnEventQueue =>
         {
             let eq = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
-            // SAFETY: ipc_state classifies blocked_on as an EventQueueState.
-            let (waiter_is_self, count, capacity) = unsafe {
+            // SAFETY: ipc_state classifies blocked_on as an EventQueueState;
+            // the queue probe takes the queue's address without reading it and
+            // reads t's tag, t being kept mapped by the held registry lock; the
+            // object's fields are read without its lock (#440).
+            let (queued, count, capacity) = unsafe {
                 (
-                    core::ptr::eq((*eq).waiter, t),
+                    crate::ipc::WaitQueue::tags_racy(core::ptr::addr_of!((*eq).waiters), t),
                     (*eq).count.load(Ordering::Relaxed),
                     (*eq).capacity,
                 )
             };
             crate::kprintln!(
-                "      eq: waiter_is_self={} count={} capacity={}",
-                waiter_is_self,
+                "      eq: queued={} count={} capacity={}",
+                queued,
                 count,
                 capacity
             );
@@ -1420,18 +1437,14 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
         IpcThreadState::BlockedOnNotification =>
         {
             let sig = blocked_on.cast::<crate::ipc::notification::NotificationState>();
-            // SAFETY: ipc_state classifies blocked_on as a NotificationState.
-            let (waiter_is_self, bits) = unsafe {
+            // SAFETY: as for the event-queue arm, for a NotificationState.
+            let (queued, bits) = unsafe {
                 (
-                    core::ptr::eq((*sig).waiter, t),
+                    crate::ipc::WaitQueue::tags_racy(core::ptr::addr_of!((*sig).waiters), t),
                     (*sig).bits.load(Ordering::Relaxed),
                 )
             };
-            crate::kprintln!(
-                "      notif: waiter_is_self={} bits=0x{:x}",
-                waiter_is_self,
-                bits
-            );
+            crate::kprintln!("      notif: queued={} bits=0x{:x}", queued, bits);
         }
         IpcThreadState::BlockedOnReply | IpcThreadState::BlockedOnFault =>
         {
@@ -1451,7 +1464,8 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
         IpcThreadState::BlockedOnSend | IpcThreadState::BlockedOnRecv =>
         {
             let ep = blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
-            // SAFETY: ipc_state classifies blocked_on as an EndpointState.
+            // SAFETY: ipc_state classifies blocked_on as an EndpointState; its
+            // queue heads are read without ep.lock (#440).
             let (send_head, recv_head) = unsafe { ((*ep).send_head, (*ep).recv_head) };
             crate::kprintln!(
                 "      ep: send_head={:p} recv_head={:p}",
@@ -1462,9 +1476,10 @@ unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
         IpcThreadState::BlockedOnWaitSet =>
         {
             let ws = blocked_on.cast::<crate::ipc::wait_set::WaitSetState>();
-            // SAFETY: ipc_state classifies blocked_on as a WaitSetState.
-            let waiter_is_self = unsafe { core::ptr::eq((*ws).waiter, t) };
-            crate::kprintln!("      waitset: waiter_is_self={}", waiter_is_self);
+            // SAFETY: as for the event-queue arm, for a WaitSetState.
+            let queued =
+                unsafe { crate::ipc::WaitQueue::tags_racy(core::ptr::addr_of!((*ws).waiters), t) };
+            crate::kprintln!("      waitset: queued={}", queued);
         }
         IpcThreadState::None =>
         {}
@@ -1482,9 +1497,11 @@ pub static BOOT_TRANSIENT_ACTIVE: core::sync::atomic::AtomicBool =
 // ── Sleep list ───────────────────────────────────────────────────────────────
 
 /// Maximum number of concurrently sleeping threads the fixed sleep list (and
-/// its expiry scratch buffer) can hold. `sleep_list_add` returns `Err` past
-/// this cap rather than dropping silently; the caller rolls back the park
-/// and the sleep degrades to an immediate return.
+/// its expiry scratch buffer) can hold. `sleep_list_add` refuses with
+/// [`SleepAddError::Full`] past this cap rather than dropping silently:
+/// `SYS_THREAD_SLEEP` withdraws its park and returns `OutOfMemory` (or, when a
+/// stop already claimed the park, `Interrupted`), and a timed IPC wait times
+/// out at once.
 pub const MAX_SLEEPING: usize = 128;
 
 /// Global list of sleeping threads. Protected by its own spinlock.
@@ -1502,20 +1519,12 @@ static mut SLEEP_LIST: [*mut ThreadControlBlock; MAX_SLEEPING] =
 #[cfg(not(test))]
 static mut SLEEP_COUNT: usize = 0;
 
-/// Scratch buffer holding the TCBs `sleep_check_wakeups` collects between
-/// dropping `SLEEP_LIST_LOCK` and waking them.
-///
-/// Off-stack via the CPU0-static idiom of docs/scheduling-internals.md
-/// § Off-Stack Scratch for Ceiling-Sized Arrays: a `[_; MAX_SLEEPING]` frame in
-/// `timer_tick` (which inlines `sleep_check_wakeups`) would overrun the timer
-/// ISR's borrowed kernel stack. `sleep_check_wakeups` runs only on CPU0 (see
-/// `timer_tick`'s `cpu == 0` gate) behind an interrupt gate (IF=0), so it is
-/// non-reentrant and this single buffer needs no lock of its own.
 /// One expired sleeper, snapshotted under `SLEEP_LIST_LOCK` at pop. The
-/// per-entry claim loop dispatches off this snapshot rather than re-reading the
-/// TCB, so a concurrent `dealloc_object(Thread)` that frees the TCB after the
-/// lock is dropped is never observed as a torn binding (it cannot be observed at
-/// all on the no-claim paths, which never dereference the TCB).
+/// per-entry claim loop dispatches off this snapshot rather than re-reading
+/// the TCB's binding, which may have changed since the pop. The timed IPC arms
+/// read the TCB's wait-queue tag and `park_seq` under the snapshotted source's
+/// lock; the TCB stays allocated because `dealloc_object(Thread)` waits in
+/// [`sleep_wakeups_quiesce`] for the batch to end before the free.
 #[cfg(not(test))]
 #[derive(Clone, Copy)]
 struct ExpiredWaiter
@@ -1523,6 +1532,8 @@ struct ExpiredWaiter
     tcb: *mut ThreadControlBlock,
     ipc_state: thread::IpcThreadState,
     blocked_on: *mut u8,
+    /// `park_seq` of the popped park: a timed-wait claim requires it unchanged.
+    park_seq: u32,
 }
 
 #[cfg(not(test))]
@@ -1532,25 +1543,94 @@ impl ExpiredWaiter
         tcb: core::ptr::null_mut(),
         ipc_state: thread::IpcThreadState::None,
         blocked_on: core::ptr::null_mut(),
+        park_seq: 0,
     };
 }
 
+/// Scratch buffer holding the TCBs `sleep_check_wakeups` collects between
+/// dropping `SLEEP_LIST_LOCK` and waking them.
+///
+/// Off-stack via the CPU0-static idiom of docs/scheduling-internals.md
+/// § Off-Stack Scratch for Ceiling-Sized Arrays: a `[_; MAX_SLEEPING]` frame in
+/// `timer_tick` (which inlines `sleep_check_wakeups`) would overrun the timer
+/// ISR's borrowed kernel stack. `sleep_check_wakeups` runs only on CPU0 (see
+/// `timer_tick`'s `cpu == 0` gate) behind an interrupt gate (IF=0), so it is
+/// non-reentrant and this single buffer needs no lock of its own.
 #[cfg(not(test))]
 static mut EXPIRED_SCRATCH: [ExpiredWaiter; MAX_SLEEPING] = [ExpiredWaiter::EMPTY; MAX_SLEEPING];
+
+/// Timer-dispatch sequence: odd while [`sleep_check_wakeups`] dispatches a
+/// popped batch, even otherwise. Advanced to odd under `SLEEP_LIST_LOCK` by a
+/// pop that took at least one entry, and back to even (Release) after that
+/// batch's last claim. [`sleep_wakeups_quiesce`] reads it to wait out a batch
+/// that may hold a raw pointer to a source object being freed.
+#[cfg(not(test))]
+static TIMER_DISPATCH_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Why [`sleep_list_add`] did not list the thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepAddError
+{
+    /// The list is at [`MAX_SLEEPING`]; the caller withdraws its park, or, if
+    /// a stop or teardown already claimed it, deschedules
+    /// (docs/thread-lifecycle-and-sleep.md § Sleep List Invariants, invariant
+    /// 4).
+    Full,
+    /// `sleep_deadline` was already 0 under `SLEEP_LIST_LOCK`: a cancellation
+    /// (`sleep_list_remove`) landed between the park commit and the add. The
+    /// caller must not arm the timeout; the cancellation owns the episode.
+    Cancelled,
+}
+
+/// Tick deadline `ms` milliseconds from now, never 0 (0 means "no pending
+/// sleep" in `sleep_deadline`, and [`sleep_list_add`] refuses it).
+#[cfg(not(test))]
+pub fn sleep_deadline_after_ms(ms: u64) -> u64
+{
+    let tps = crate::arch::current::timer::ticks_per_second();
+    let now = crate::arch::current::timer::current_tick();
+    now.saturating_add(ms.saturating_mul(tps) / 1000).max(1)
+}
 
 /// Add a thread to the sleep list. The TCB must already have
 /// `sleep_deadline` set and state = Blocked.
 ///
-/// Returns `Err(())` at capacity; the caller MUST roll back the park.
+/// Refuses with [`SleepAddError::Cancelled`] when `sleep_deadline` reads 0
+/// under the lock: the caller MUST NOT arm or withdraw, and proceeds to
+/// `schedule()`, where the cancellation's stamp decides the resume. Refuses
+/// with [`SleepAddError::Full`] at capacity: the caller MUST withdraw the
+/// park (`sys_thread_sleep` through a `sleep_list_remove` claim it may lose,
+/// a timed IPC wait through [`withdraw_uncontested_park`]). A TCB already listed keeps its single
+/// entry, which carries the deadline the caller just wrote.
 /// See docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
+///
+/// # Safety
+/// `tcb` must point to a live TCB: the running parker's own.
 #[cfg(not(test))]
-pub fn sleep_list_add(tcb: *mut ThreadControlBlock) -> Result<(), ()>
+pub unsafe fn sleep_list_add(tcb: *mut ThreadControlBlock) -> Result<(), SleepAddError>
 {
     // SAFETY: lock serialises all sleep list access.
     let saved = unsafe { SLEEP_LIST_LOCK.lock_raw() };
-    // SAFETY: single-writer access under lock.
+    // SAFETY: single-writer access under lock; tcb valid per caller contract.
     let result = unsafe {
-        if SLEEP_COUNT < MAX_SLEEPING
+        let listed = SLEEP_LIST[..SLEEP_COUNT].contains(&tcb);
+        debug_assert!(
+            !listed,
+            "sleep_list_add: tid={} already listed",
+            (*tcb).thread_id
+        );
+        if (*tcb)
+            .sleep_deadline
+            .load(core::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            Err(SleepAddError::Cancelled)
+        }
+        else if listed
+        {
+            Ok(())
+        }
+        else if SLEEP_COUNT < MAX_SLEEPING
         {
             SLEEP_LIST[SLEEP_COUNT] = tcb;
             SLEEP_COUNT += 1;
@@ -1558,7 +1638,7 @@ pub fn sleep_list_add(tcb: *mut ThreadControlBlock) -> Result<(), ()>
         }
         else
         {
-            Err(())
+            Err(SleepAddError::Full)
         }
     };
     // SAFETY: paired with lock_raw above.
@@ -1566,19 +1646,25 @@ pub fn sleep_list_add(tcb: *mut ThreadControlBlock) -> Result<(), ()>
     result
 }
 
-/// Remove a thread from the sleep list if present. Called by `notification_send`
-/// when waking a waiter that was registered with a timeout, so the timer
-/// path does not later try to double-wake it.
+/// Cancel `tcb`'s pending sleep: under `SLEEP_LIST_LOCK`, remove every entry
+/// for `tcb` and clear its `sleep_deadline`.
 ///
-/// Returns `true` if the thread was on the list and was removed.
+/// Returns `true` if `sleep_deadline` was non-zero, i.e. this call cancelled
+/// a pending sleep — listed, or committed but not yet added (a later
+/// [`sleep_list_add`] then refuses with [`SleepAddError::Cancelled`]). The
+/// timer pop clears the deadline under the same lock, so exactly one of the
+/// pop and this call observes it non-zero.
+/// See docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
+///
+/// # Safety
+/// `tcb` must point to a live TCB (kept alive by the caller's lock or claim).
 #[cfg(not(test))]
-pub fn sleep_list_remove(tcb: *mut ThreadControlBlock) -> bool
+pub unsafe fn sleep_list_remove(tcb: *mut ThreadControlBlock) -> bool
 {
     // SAFETY: lock serialises all sleep list access.
     let saved = unsafe { SLEEP_LIST_LOCK.lock_raw() };
-    let mut removed = false;
-    // SAFETY: single-writer access under lock.
-    unsafe {
+    // SAFETY: single-writer access under lock; tcb valid per caller contract.
+    let pending = unsafe {
         let mut i = 0;
         while i < SLEEP_COUNT
         {
@@ -1587,30 +1673,75 @@ pub fn sleep_list_remove(tcb: *mut ThreadControlBlock) -> bool
                 SLEEP_COUNT -= 1;
                 SLEEP_LIST[i] = SLEEP_LIST[SLEEP_COUNT];
                 SLEEP_LIST[SLEEP_COUNT] = core::ptr::null_mut();
-                removed = true;
-                break;
             }
-            i += 1;
+            else
+            {
+                i += 1;
+            }
         }
-    }
+        (*tcb)
+            .sleep_deadline
+            .swap(0, core::sync::atomic::Ordering::Relaxed)
+            != 0
+    };
     // SAFETY: paired with lock_raw above.
     unsafe { SLEEP_LIST_LOCK.unlock_raw(saved) };
-    removed
+    pending
+}
+
+/// Wait until every timer batch whose pop preceded this call has finished
+/// dispatching — the gate the Notification, `EventQueue`, and Thread dealloc
+/// arms pass before freeing an object a batch may still hold from its pop
+/// (docs/thread-lifecycle-and-sleep.md § Sleep List Invariants, invariant 9).
+///
+/// Spins with interrupts enabled and preemption disabled. The caller MUST
+/// NOT hold any IPC source, scheduler, or sleep-list lock (the batch takes
+/// source and scheduler locks).
+#[cfg(not(test))]
+pub fn sleep_wakeups_quiesce()
+{
+    // SAFETY: lock serialises all sleep list access; paired below.
+    let saved = unsafe { SLEEP_LIST_LOCK.lock_raw() };
+    // Acquire: an even value returns at once, so it must order the batch's
+    // last access (its Release increment) before the caller's free.
+    let seq = TIMER_DISPATCH_SEQ.load(core::sync::atomic::Ordering::Acquire);
+    // SAFETY: paired with lock_raw above.
+    unsafe { SLEEP_LIST_LOCK.unlock_raw(saved) };
+    if seq & 1 == 0
+    {
+        return;
+    }
+    crate::percpu::preempt_disable();
+    // SAFETY: ring 0; restored below.
+    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+    // SAFETY: ring 0; IDT loaded; preempt disabled.
+    unsafe { crate::arch::current::interrupts::enable() };
+    spin_site_enter(SPIN_SITE_DEALLOC_TIMER_DISPATCH);
+    while TIMER_DISPATCH_SEQ.load(core::sync::atomic::Ordering::Acquire) == seq
+    {
+        core::hint::spin_loop();
+    }
+    spin_site_exit();
+    // SAFETY: saved_int from save_and_disable_interrupts above.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+    crate::percpu::preempt_enable();
 }
 
 /// Check sleeping threads and wake any whose deadline has passed.
 ///
-/// Called from `timer_tick()` on the BSP. Collects expired threads under the
-/// sleep list lock, then wakes them after releasing it.
+/// Called from `timer_tick()` on the BSP. Pops expired entries under the
+/// sleep list lock (clearing each `sleep_deadline` there), then claims them
+/// after releasing it.
 ///
-/// Notification-wait-with-timeout threads are on this list AND registered as a
-/// notification waiter. If `notification_send` claims the waiter first, it removes the
-/// tcb from the sleep list under `sig.lock`, so we will not see it here.
-/// If we reach a notification-waiter tcb here, we must arbitrate against a
-/// concurrent `notification_send` by taking `sig.lock` and checking whether we
-/// are still registered as the waiter before claiming the wake.
+/// A popped entry is a plain sleeper (`ipc_state == None`), claimed at the
+/// pop, or a timed notification / event-queue waiter, which the timer
+/// arbitrates against the source's other wakers under the source lock: it
+/// claims only while the thread is still queued there in the popped park.
+/// Every other waiter claimer removes the entry under that source lock, so no
+/// other binding can be popped (docs/thread-lifecycle-and-sleep.md § Sleep
+/// List Invariants).
 // too_many_lines: flat dispatch over every claimable `IpcThreadState`
-// (notification, event queue, reply, plain sleep); each arm is independent and
+// (notification, event queue, plain sleep); each arm is independent and
 // short, and splitting would require duplicating the SLEEP_LIST snapshot
 // plumbing.
 #[allow(clippy::too_many_lines)]
@@ -1638,7 +1769,15 @@ pub fn sleep_check_wakeups()
         while i < SLEEP_COUNT
         {
             let tcb = SLEEP_LIST[i];
-            if !tcb.is_null() && (*tcb).sleep_deadline <= now
+            let deadline = (*tcb)
+                .sleep_deadline
+                .load(core::sync::atomic::Ordering::Relaxed);
+            debug_assert!(
+                deadline != 0,
+                "sleep_check_wakeups: tid={} listed with sleep_deadline 0",
+                (*tcb).thread_id
+            );
+            if deadline <= now
             {
                 // Snapshot the binding under SLEEP_LIST_LOCK, where the TCB is
                 // provably alive: dealloc_object(Thread) removes its entry from
@@ -1647,24 +1786,43 @@ pub fn sleep_check_wakeups()
                 // TCB to choose its arm.
                 let ipc_state = (*tcb).ipc_state;
                 let blocked_on = (*tcb).blocked_on_object;
+                let park_seq = (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed);
+                debug_assert!(
+                    matches!(ipc_state, thread::IpcThreadState::None)
+                        || (matches!(
+                            ipc_state,
+                            thread::IpcThreadState::BlockedOnNotification
+                                | thread::IpcThreadState::BlockedOnEventQueue
+                        ) && !blocked_on.is_null()),
+                    "sleep_check_wakeups: tid={} popped with binding {:?}/{:p}",
+                    (*tcb).thread_id,
+                    ipc_state,
+                    blocked_on
+                );
                 // A plain sleeper (no IPC source object) has no competing waker,
                 // so claim it here: set wake_in_flight = 1 under the lock so a
                 // concurrent dealloc_object(Thread) that lost the list race waits
                 // at its wake-in-flight gate for our enqueue_and_wake instead of
                 // freeing this TCB after the pop. (Cleared by enqueue_and_wake.)
-                // The IPC arms instead claim under their own source lock at the win
-                // below; BlockedOnReply/Fault already carry wake_in_flight = 1 from
-                // the block entry.
+                // The timed IPC arms instead claim under their own source lock at
+                // the win below.
                 if matches!(ipc_state, thread::IpcThreadState::None)
                 {
                     (*tcb)
                         .wake_in_flight
                         .store(1, core::sync::atomic::Ordering::Release);
                 }
+                // The pop consumes the deadline with the entry, so a
+                // sleep_list_remove racing this claim sees 0 and leaves the
+                // episode to the timer.
+                (*tcb)
+                    .sleep_deadline
+                    .store(0, core::sync::atomic::Ordering::Relaxed);
                 expired[n] = ExpiredWaiter {
                     tcb,
                     ipc_state,
                     blocked_on,
+                    park_seq,
                 };
                 n += 1;
                 // Remove from list by swapping with last entry.
@@ -1680,6 +1838,13 @@ pub fn sleep_check_wakeups()
         }
     }
 
+    // A batch is in flight: the claims below lock sources through pop-time
+    // pointers that hold no reference (see sleep_wakeups_quiesce).
+    if n != 0
+    {
+        TIMER_DISPATCH_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
     // SAFETY: paired with lock_raw above.
     unsafe { SLEEP_LIST_LOCK.unlock_raw(saved) };
 
@@ -1689,18 +1854,15 @@ pub fn sleep_check_wakeups()
         tcb,
         ipc_state,
         blocked_on,
+        park_seq,
     } in expired.iter().take(n)
     {
-        if tcb.is_null()
-        {
-            continue;
-        }
         // ipc_state/blocked_on are the pop-time snapshot (taken under
-        // SLEEP_LIST_LOCK), NOT a fresh (*tcb) read: a concurrent
-        // dealloc_object(Thread) may have freed the TCB once the lock was dropped,
-        // so dispatching off a live dereference here would be a use-after-free.
-        // The matching source object (blocked_on) is independently refcounted and
-        // remains valid; the no-claim arms below touch only it, never the TCB.
+        // SLEEP_LIST_LOCK), not a fresh (*tcb) read: the live binding may have
+        // changed since, and each arm's claim decides against the snapshot.
+        // The TCB and the source object (blocked_on) are both held alive by the
+        // dispatch sequence: their deallocs wait in sleep_wakeups_quiesce until
+        // this batch ends.
 
         let claimed = match ipc_state
         {
@@ -1715,33 +1877,36 @@ pub fn sleep_check_wakeups()
                 // break a circular module import.
                 #[allow(clippy::cast_ptr_alignment)]
                 let sig_state = blocked_on.cast::<crate::ipc::notification::NotificationState>();
-                // SAFETY: sig_state is valid for the duration of the wait;
-                // lock serialises against notification_send.
+                // SAFETY: sig_state is kept alive by the dispatch sequence (its
+                // dealloc quiesces this batch); lock serialises against
+                // notification_send.
                 let saved_sig = unsafe { (*sig_state).lock.lock_raw() };
-                // SAFETY: same as above.
-                let we_win = unsafe { (*sig_state).waiter } == tcb;
+                // Claim only the park that was popped: the queue may hold the
+                // same TCB again in a later wait (claimed by a sender and
+                // re-parked since the pop), whose park_seq differs. The queue
+                // tag and park_seq are both written under sig.lock, so the
+                // reads are stable here.
+                // SAFETY: as above; tcb, too, is kept alive by the dispatch
+                // sequence (its Thread dealloc quiesces this batch).
+                let we_win = unsafe {
+                    (*sig_state).waiters.remove_if(tcb, |t| {
+                        (*t).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
+                    })
+                };
                 if we_win
                 {
-                    // SAFETY: we hold sig.lock and sig.waiter == tcb, so a
-                    // dealloc(tcb) BlockedOnNotification unlink (which needs
-                    // sig.lock to clear the waiter) cannot have freed tcb yet.
-                    // Claim it for wake under sig.lock: set wake_in_flight = 1
-                    // before the TCB writes so a concurrent dealloc(tcb) waits at
-                    // its gate (#160); cleared by enqueue_and_wake. wakeup_value=0
-                    // is the timeout marker (notification_send rejects 0-bit
-                    // sends). State/ipc_state/blocked_on are committed by
-                    // enqueue_and_wake under sched.lock.
+                    // Claim it for wake under sig.lock: removing it from the
+                    // queue is the claim, and wake_in_flight = 1 makes a
+                    // concurrent dealloc(tcb) (whose unlink needs sig.lock) wait
+                    // at its gate (#160); cleared by enqueue_and_wake.
+                    // wakeup_value = 0 is the timeout marker (notification_send
+                    // rejects 0-bit sends). State/ipc_state/blocked_on are
+                    // committed by enqueue_and_wake under sched.lock.
+                    // SAFETY: tcb was just removed from sig_state's queue;
+                    // sig.lock held.
                     unsafe {
-                        (*tcb)
-                            .wake_in_flight
-                            .store(1, core::sync::atomic::Ordering::Release);
-                        (*sig_state).waiter = core::ptr::null_mut();
-                        (*sig_state).has_observer.store(
-                            u8::from(!(*sig_state).wait_set.is_null()),
-                            core::sync::atomic::Ordering::Relaxed,
-                        );
-                        (*tcb).wakeup_value = 0;
-                        (*tcb).sleep_deadline = 0;
+                        crate::ipc::claim_waiter(tcb, 0);
+                        (*sig_state).refresh_observer();
                     }
                 }
                 // SAFETY: paired with lock_raw above.
@@ -1757,33 +1922,32 @@ pub fn sleep_check_wakeups()
                 // suppressed for the same reason as the notification arm above.
                 #[allow(clippy::cast_ptr_alignment)]
                 let eq_state = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
-                // SAFETY: eq_state is valid for the duration of the wait;
-                // lock serialises against event_queue_post. Lock order:
-                // SLEEP_LIST_LOCK was already released above; we now take
-                // eq.lock alone — no cycle (post path is eq.lock →
-                // SLEEP_LIST_LOCK).
+                // SAFETY: eq_state is kept alive by the dispatch sequence (its
+                // dealloc quiesces this batch); lock serialises against
+                // event_queue_post. Lock order: SLEEP_LIST_LOCK was already
+                // released above; we now take eq.lock alone — no cycle (post
+                // path is eq.lock → SLEEP_LIST_LOCK).
                 let saved_eq = unsafe { (*eq_state).lock.lock_raw() };
-                // SAFETY: same as above.
-                let we_win = unsafe { (*eq_state).waiter } == tcb;
+                // Claim only the park that was popped (see the notification
+                // arm); the queue tag and park_seq are written under eq.lock.
+                // SAFETY: as above; tcb, too, is kept alive by the dispatch
+                // sequence.
+                let we_win = unsafe {
+                    (*eq_state).waiters.remove_if(tcb, |t| {
+                        (*t).park_seq.load(core::sync::atomic::Ordering::Relaxed) == park_seq
+                    })
+                };
                 if we_win
                 {
-                    // SAFETY: we hold eq.lock and eq.waiter == tcb, so a
-                    // dealloc(tcb) BlockedOnEventQueue unlink (which needs eq.lock
-                    // to clear the waiter) cannot have freed tcb yet. Claim it for
-                    // wake under eq.lock: set wake_in_flight = 1 before the TCB
-                    // writes so a concurrent dealloc(tcb) waits at its gate (#160);
-                    // cleared by enqueue_and_wake. Event payloads can be any u64
-                    // (including 0); `timed_out` is the out-of-band timeout marker,
-                    // read-and-cleared by sys_event_recv on resume. State/etc.
-                    // committed by enqueue_and_wake.
+                    // Claim it for wake under eq.lock, as in the notification
+                    // arm. Event payloads can be any u64 (including 0);
+                    // `timed_out` is the out-of-band timeout marker,
+                    // read-and-cleared by sys_event_recv on resume.
+                    // SAFETY: tcb was just removed from eq_state's queue;
+                    // eq.lock held.
                     unsafe {
-                        (*tcb)
-                            .wake_in_flight
-                            .store(1, core::sync::atomic::Ordering::Release);
-                        (*eq_state).waiter = core::ptr::null_mut();
-                        (*tcb).wakeup_value = 0;
+                        crate::ipc::claim_waiter(tcb, 0);
                         (*tcb).timed_out = true;
-                        (*tcb).sleep_deadline = 0;
                     }
                 }
                 // SAFETY: paired with lock_raw above.
@@ -1791,134 +1955,28 @@ pub fn sleep_check_wakeups()
                 we_win
             }
 
-            crate::sched::thread::IpcThreadState::BlockedOnReply if !blocked_on.is_null() =>
-            {
-                // BlockedOnReply: `blocked_on` is the SERVER's TCB. The
-                // server's `reply_tcb` points to this tcb (the client) until
-                // `endpoint_reply`, `cancel_ipc_block`, or
-                // `dealloc_object_one(Thread)`'s reply-bound waker clears
-                // it.
-                //
-                // Defensive guard: no current code path adds a
-                // `BlockedOnReply` TCB to the sleep list (the IPC
-                // call/recv path does not accept a timeout — see
-                // `sys_ipc_call` and `sys_ipc_recv` in
-                // `core/kernel/src/syscall/ipc.rs`). If a future timeout
-                // surface is introduced, the `_` fall-through below
-                // would treat a `BlockedOnReply` waiter as a plain sleep
-                // and claim the wake unconditionally, racing with a
-                // concurrent `endpoint_reply` / cancel / dealloc and
-                // producing a double-`enqueue_and_wake`. This arm
-                // forecloses that by CAS-claiming the server's
-                // `reply_tcb` slot the same way every other reply-side
-                // writer does.
-                //
-                // CAS the server's `reply_tcb` from `tcb` (us) to null;
-                // success means we claim the wake, failure means the
-                // server/cancel/dealloc beat us. Lock order: SLEEP_LIST_LOCK
-                // was released above; this is a lock-free atomic.
-                // cast_ptr_alignment suppressed for the same reason as the
-                // notification arm above.
-                #[allow(clippy::cast_ptr_alignment)]
-                let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
-                // SAFETY: server is a valid TCB pointer; reply_tcb is AtomicPtr.
-                let we_win = unsafe {
-                    (*server)
-                        .reply_tcb
-                        .compare_exchange(
-                            tcb,
-                            core::ptr::null_mut(),
-                            core::sync::atomic::Ordering::AcqRel,
-                            core::sync::atomic::Ordering::Acquire,
-                        )
-                        .is_ok()
-                };
-                if we_win
-                {
-                    // SAFETY: tcb still valid; see above. State/ipc_state/
-                    // blocked_on_object are committed by enqueue_and_wake
-                    // under sched.lock. The CAS win is the episode claim: a
-                    // timed-out call is a cancellation, so the caller's resume
-                    // takes the Interrupted path, not a stale ipc_msg read.
-                    unsafe {
-                        crate::sched::thread::stamp_park_deposit(
-                            tcb,
-                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
-                        );
-                        (*tcb).wakeup_value = 0;
-                        (*tcb).timed_out = true;
-                        (*tcb).sleep_deadline = 0;
-                    }
-                }
-                we_win
-            }
+            // Plain sleep — the timer is the only waker. Claimed under
+            // SLEEP_LIST_LOCK at pop (wake_in_flight = 1), so a concurrent
+            // dealloc(tcb) is gated and tcb stays valid until enqueue_and_wake.
+            crate::sched::thread::IpcThreadState::None => true,
 
-            crate::sched::thread::IpcThreadState::BlockedOnFault if !blocked_on.is_null() =>
-            {
-                // Defensive: fault delivery never arms the sleep list, so this
-                // arm is currently unreachable. It forecloses the same hazard the
-                // BlockedOnReply arm documents — were a fault-timeout surface ever
-                // added, the `_` fall-through would treat a BlockedOnFault waiter
-                // as a plain sleep and claim it unconditionally, racing a
-                // concurrent reply/cancel into a double-wake. `blocked_on` is the
-                // handler (server) TCB; CAS its reply_tcb the same way every other
-                // reply-side writer does; on win, a timeout is a cancellation, so
-                // mark the disposition Kill.
-                // cast_ptr_alignment suppressed as in the notification arm above.
-                #[allow(clippy::cast_ptr_alignment)]
-                let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
-                // SAFETY: server is a valid TCB pointer; reply_tcb is AtomicPtr.
-                let we_win = unsafe {
-                    (*server)
-                        .reply_tcb
-                        .compare_exchange(
-                            tcb,
-                            core::ptr::null_mut(),
-                            core::sync::atomic::Ordering::AcqRel,
-                            core::sync::atomic::Ordering::Acquire,
-                        )
-                        .is_ok()
-                };
-                if we_win
-                {
-                    // SAFETY: tcb still valid; fault_outcome / sleep_deadline
-                    // always valid. State committed by enqueue_and_wake. CAS
-                    // win = episode claim; the fault disposition is the KILL.
-                    unsafe {
-                        (*tcb).fault_outcome.store(
-                            crate::ipc::fault::FAULT_OUTCOME_KILL,
-                            core::sync::atomic::Ordering::Release,
-                        );
-                        crate::sched::thread::stamp_deposit_episode(tcb);
-                        (*tcb).sleep_deadline = 0;
-                    }
-                }
-                we_win
-            }
-
-            _ =>
-            {
-                // Plain sleep — the timer is the only waker (reachable only for
-                // ipc_state None; the IPC-bound states have explicit arms above).
-                // We claimed it under SLEEP_LIST_LOCK at pop (wake_in_flight = 1),
-                // so a concurrent dealloc(tcb) is gated and tcb is still valid.
-                // SAFETY: tcb valid per the wake-in-flight claim at pop.
-                unsafe {
-                    (*tcb).sleep_deadline = 0;
-                }
-                true
-            }
+            // No other binding is ever listed (asserted at pop): the parks that
+            // arm a timeout are the three above, and every claimer of their
+            // source removes the entry under the source lock. Never claim
+            // here: no wake_in_flight pin and no source lock arbitrates such a
+            // binding, so a claim could race its real waker.
+            _ => false,
         };
 
         if claimed
         {
             // SAFETY: tcb is kept valid by wake_in_flight = 1 (set at the claim
             // above — at pop for plain sleep, under the source lock for the IPC
-            // arms, or at block entry for reply/fault), so a concurrent
-            // dealloc(tcb) waits at its gate rather than freeing it.
-            // enqueue_and_wake reads state under sched_lock and either links a
-            // still-Blocked thread or, if dealloc already marked it Exited, aborts
-            // the link — both clear wake_in_flight, releasing that gate.
+            // arms), so a concurrent dealloc(tcb) waits at its gate rather than
+            // freeing it. enqueue_and_wake reads state under sched_lock and either
+            // links a still-Blocked thread or, if a stop or dealloc already moved
+            // it off Blocked, aborts the link — both clear wake_in_flight,
+            // releasing that gate.
             //
             // select_target_cpu, like every other wake path: it honours a hard
             // affinity changed mid-sleep (raw preferred_cpu would not) and
@@ -1929,6 +1987,13 @@ pub fn sleep_check_wakeups()
             // the transition by state.
             unsafe { enqueue_and_wake(tcb, cpu) };
         }
+    }
+
+    if n != 0
+    {
+        // Release: orders this batch's last source access before a
+        // sleep_wakeups_quiesce caller's Acquire observes the even value.
+        TIMER_DISPATCH_SEQ.fetch_add(1, core::sync::atomic::Ordering::Release);
     }
 }
 
@@ -2104,6 +2169,8 @@ pub fn init(cpu_count: u32) -> u32
                     sched_lock: crate::sync::Spinlock::new(),
                     wake_pending: false,
                     park_started_tick: 0,
+                    park_seq: core::sync::atomic::AtomicU32::new(0),
+                    start_seq: 0,
                     ipc_state: IpcThreadState::None,
                     ipc_msg: crate::ipc::message::Message::default(),
                     reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
@@ -2115,6 +2182,8 @@ pub fn init(cpu_count: u32) -> u32
                     #[cfg(debug_assertions)]
                     deposit_episode: core::sync::atomic::AtomicU32::new(0),
                     ipc_wait_next: None,
+                    ipc_wait_prev: core::ptr::null_mut(),
+                    ipc_wait_queue: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     fault_handler: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     fault_badge: core::sync::atomic::AtomicU64::new(0),
                     fault_outcome: core::sync::atomic::AtomicU8::new(0),
@@ -2122,7 +2191,7 @@ pub fn init(cpu_count: u32) -> u32
                     is_user: false,
                     saved_state: saved,
                     kernel_stack_top: stack_top,
-                    trap_frame: core::ptr::null_mut(),
+                    trap_frame: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     syscall_nr: core::sync::atomic::AtomicU64::new(u64::MAX),
                     address_space: core::ptr::null_mut(),
                     cspace: core::ptr::null_mut(),
@@ -2139,7 +2208,7 @@ pub fn init(cpu_count: u32) -> u32
                     death_observers: [thread::DeathObserver::empty(); thread::MAX_DEATH_OBSERVERS],
                     death_observer_count: 0,
                     exit_reason: 0,
-                    sleep_deadline: 0,
+                    sleep_deadline: core::sync::atomic::AtomicU64::new(0),
                     extended: thread::ExtendedState::empty(),
                     // Idle TCBs stay off the registry: they bind no CSpace
                     // or address space (null above), so the object-teardown
@@ -2194,8 +2263,7 @@ pub fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
 
 /// Test stub for `init_storage`.
 #[cfg(test)]
-#[allow(unused_variables)]
-pub fn init_storage(cpu_count: u32, allocator: &mut crate::mm::BuddyAllocator) {}
+pub fn init_storage(_cpu_count: u32, _allocator: &mut crate::mm::BuddyAllocator) {}
 
 #[cfg(not(test))]
 fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
@@ -2308,7 +2376,6 @@ pub(crate) fn alloc_zeroed_slab<T>(
 /// never called; this stub satisfies the call site without requiring access to
 /// arch-specific types that are unavailable on the host.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub fn init(_cpu_count: u32) -> u32
 {
     0
@@ -2409,17 +2476,174 @@ pub unsafe fn set_state_under_all_locks(
 ) -> StateCommit
 {
     // SAFETY: caller contract.
-    unsafe { commit_state_under_all_locks(tcb, new_state, None) }
+    let commit = unsafe { commit_state_under_all_locks(tcb, new_state, None, None, None) };
+    // Without an expected park generation the commit always resolves.
+    debug_assert!(
+        commit.is_some(),
+        "set_state_under_all_locks: unresolved commit"
+    );
+    commit.unwrap_or(StateCommit::RefusedExited)
+}
+
+/// Outcome of [`start_under_all_locks`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StartCommit
+{
+    /// The thread is committed `Ready`; the payload is the start generation
+    /// (`start_seq`) [`enqueue_ready_thread`] must see.
+    Committed(u32),
+    /// Nothing was written: the thread is not `Created`/`Stopped` (a
+    /// concurrent start resumed it, or it is `Exited`).
+    Refused,
+    /// Nothing was written: the calling thread was itself stopped (or killed)
+    /// while the start waited for the target to settle.
+    CallerStopped,
+}
+
+/// Commit `tcb` `Ready` for `SYS_THREAD_START` once it is safe to link,
+/// returning the start generation the commit advanced (`start_seq`) for
+/// [`enqueue_ready_thread`].
+///
+/// A thread stopped while running may still be `current` on a remote CPU, or
+/// still owed a wake by a waker that claimed its park before the stop; linking
+/// it then would dispatch it on a second CPU (#314/#293), or let the late wake
+/// link a later park. Each pass of the settle loop therefore reads the
+/// target's state, its owed-wake pin (`wake_in_flight`) and its save flag
+/// (`context_saved`) under its `sched_lock`, scans every CPU's `current`, and
+/// commits only when all four are settled; the commit re-checks them under
+/// the all-CPU locks ([`start_ready_to_link`]), since a concurrent start and
+/// stop can cycle the thread through a run, a park and a claim between a pass
+/// and the commit. A CPU still running the target is prodded
+/// ([`prod_remote_cpu`]); it drops the `Stopped` target at its next
+/// slice-expiry `schedule(true)` or the target's own park or yield, where the
+/// requeue denylist leaves it unlinked.
+///
+/// The loop ends without writing when the target is no longer `Created` or
+/// `Stopped` ([`StartCommit::Refused`]: a concurrent start resumed it, or it
+/// is `Exited`), and when a pass that must wait finds the calling thread
+/// itself stopped ([`StartCommit::CallerStopped`]; read under the caller's
+/// `sched_lock`), so a start never spins on a thread that is running again,
+/// and never blocks the stop of its own caller. It runs
+/// preempt-disabled with interrupts enabled (the #207 envelope); spin site
+/// `start:settle`.
+///
+/// # Safety
+/// `tcb` must be a valid TCB other than the calling thread's, and the caller
+/// (`caller`, the running thread) must hold no lock.
+#[cfg(not(test))]
+pub unsafe fn start_under_all_locks(
+    tcb: *mut ThreadControlBlock,
+    caller: *mut ThreadControlBlock,
+) -> StartCommit
+{
+    use core::sync::atomic::Ordering;
+
+    let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    crate::percpu::preempt_disable();
+    // SAFETY: ring 0; restored below.
+    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+    // SAFETY: ring 0; IDT loaded; preempt disabled.
+    unsafe { crate::arch::current::interrupts::enable() };
+    spin_site_enter(SPIN_SITE_START_SETTLE);
+    let mut prodded: Option<usize> = None;
+    // Read under the caller's own sched_lock, which every stop or teardown
+    // commit of it holds.
+    // SAFETY: caller is the running thread's valid TCB; lock_raw paired.
+    let caller_stopped = || unsafe {
+        let f = (*caller).sched_lock.lock_raw();
+        let state = (*caller).state;
+        (*caller).sched_lock.unlock_raw(f);
+        matches!(
+            state,
+            thread::ThreadState::Stopped | thread::ThreadState::Exited
+        )
+    };
+    let outcome = loop
+    {
+        // SAFETY: tcb valid per contract; state is written under sched_lock,
+        // and the pin and save flag are atomics.
+        let (state, owed, saved) = unsafe {
+            let f = (*tcb).sched_lock.lock_raw();
+            let snap = (
+                (*tcb).state,
+                (*tcb).wake_in_flight.load(Ordering::Relaxed) != 0,
+                (*tcb).context_saved.load(Ordering::Acquire) != 0,
+            );
+            (*tcb).sched_lock.unlock_raw(f);
+            snap
+        };
+        if !matches!(
+            state,
+            thread::ThreadState::Created | thread::ThreadState::Stopped
+        )
+        {
+            break StartCommit::Refused;
+        }
+        // SAFETY: cpu < cpu_count; each CPU lock is taken alone.
+        let running_on = (0..cpu_count).find(|&cpu| unsafe {
+            let sched = scheduler_for(cpu);
+            let f = sched.lock.lock_raw();
+            let is_current = sched.current == tcb;
+            sched.lock.unlock_raw(f);
+            is_current
+        });
+        if let Some(cpu) = running_on
+            && prodded != Some(cpu)
+        {
+            // SAFETY: cpu < cpu_count; the caller is running here, so a
+            // `Stopped` target current elsewhere is on a remote CPU.
+            unsafe { prod_remote_cpu(cpu) };
+            prodded = Some(cpu);
+        }
+        // Only a pass that must wait checks the caller: a target that is
+        // already settled is committed even if a stop of the caller is in
+        // flight, as any syscall completes before its thread deschedules.
+        if running_on.is_some() || owed || !saved
+        {
+            if caller_stopped()
+            {
+                break StartCommit::CallerStopped;
+            }
+            core::hint::spin_loop();
+            continue;
+        }
+        let mut seq = 0;
+        // SAFETY: tcb valid; no lock held.
+        let commit = unsafe {
+            commit_state_under_all_locks(
+                tcb,
+                thread::ThreadState::Ready,
+                None,
+                None,
+                Some(&mut seq),
+            )
+        };
+        match commit
+        {
+            Some(StateCommit::Committed(_)) => break StartCommit::Committed(seq),
+            Some(_) => break StartCommit::Refused,
+            // Unsettled again under the locks; take another pass.
+            None if caller_stopped() => break StartCommit::CallerStopped,
+            None =>
+            {}
+        }
+    };
+    spin_site_exit();
+    // SAFETY: saved_int from save_and_disable_interrupts above.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+    crate::percpu::preempt_enable();
+    outcome
 }
 
 /// Mark `tcb` `Exited` with `exit_reason` recorded under the same all-locks
-/// hold as the state write — every exit path's commit: the thread's own
-/// exit and fault paths, and the object-teardown walk (`EXIT_KILLED`). A
-/// refused commit (the thread is already `Exited`) writes neither, so the
-/// reason recorded by the commit that won survives; an exit path whose
-/// commit lost still posts its own reason (no death walk posts
-/// `EXIT_KILLED`; a bind after the stop delivers it), so a thread killed
-/// mid-exit carries `EXIT_KILLED` only as its retained reason.
+/// hold as the state write — the commit of the thread's own exit and fault
+/// paths (the object-teardown walk records `EXIT_KILLED` through
+/// [`commit_cancelling_park`], with the same refusal rule). A refused commit
+/// (the thread is already `Exited`) writes neither, so the reason recorded by
+/// the commit that won survives; an exit path whose commit lost still posts
+/// its own reason (no death walk posts `EXIT_KILLED`; a bind after the stop
+/// delivers it), so a thread killed mid-exit carries `EXIT_KILLED` only as
+/// its retained reason.
 ///
 /// # Safety
 /// As for [`set_state_under_all_locks`].
@@ -2427,10 +2651,250 @@ pub unsafe fn set_state_under_all_locks(
 pub unsafe fn exit_under_all_locks(tcb: *mut ThreadControlBlock, exit_reason: u64) -> StateCommit
 {
     // SAFETY: caller contract.
-    unsafe { commit_state_under_all_locks(tcb, thread::ThreadState::Exited, Some(exit_reason)) }
+    let commit = unsafe {
+        commit_state_under_all_locks(
+            tcb,
+            thread::ThreadState::Exited,
+            Some(exit_reason),
+            None,
+            None,
+        )
+    };
+    // Without an expected park generation the commit always resolves.
+    debug_assert!(commit.is_some(), "exit_under_all_locks: unresolved commit");
+    commit.unwrap_or(StateCommit::RefusedExited)
 }
 
-/// Shared body of [`set_state_under_all_locks`] and [`exit_under_all_locks`].
+/// Commit `Stopped` (or `Exited` with `exit_reason`) over whatever park the
+/// thread holds, cancelling that park first — the commit `SYS_THREAD_STOP`
+/// and the object-teardown stop use.
+///
+/// Each pass snapshots `(state, park_seq)` under the TCB's `sched_lock`,
+/// runs `cancel_ipc_block` if the snapshot is `Blocked`, then commits under
+/// the all-locks discipline only if `park_seq` is unchanged. A thread that
+/// parked (or was rebound) after the snapshot advanced `park_seq`, so the
+/// pass is retried and that park is cancelled too: the commit never writes
+/// over a live park (one it did not cancel was already claimed by a waker,
+/// whose late wake aborts on the committed state, or by a concurrent
+/// cancel). See
+/// docs/thread-lifecycle-and-sleep.md
+/// § `sys_thread_stop` Cross-CPU Stop Protocol.
+///
+/// Returns [`StateCommit::Committed`] with the CPU whose `current` is the
+/// thread (`None` when it runs nowhere), or [`StateCommit::RefusedExited`]
+/// when the thread is already `Exited` (nothing written; `exit_reason` too is
+/// left as the winning commit recorded it).
+///
+/// # Safety
+/// `tcb` must be a valid TCB pointer. The caller MUST NOT hold the target's
+/// `sched_lock`, any per-CPU scheduler lock, or any IPC source lock
+/// (`cancel_ipc_block`'s contract); it MAY hold `THREAD_REGISTRY_LOCK`.
+#[cfg(not(test))]
+pub unsafe fn commit_cancelling_park(
+    tcb: *mut ThreadControlBlock,
+    new_state: thread::ThreadState,
+    exit_reason: Option<u64>,
+) -> StateCommit
+{
+    loop
+    {
+        // SAFETY: tcb valid per caller contract; state and park_seq are read
+        // under sched_lock, their writers' lock.
+        let (state, seq) = unsafe {
+            let saved = (*tcb).sched_lock.lock_raw();
+            let snap = (
+                (*tcb).state,
+                (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed),
+            );
+            (*tcb).sched_lock.unlock_raw(saved);
+            snap
+        };
+        if state == thread::ThreadState::Blocked
+        {
+            // SAFETY: caller contract matches cancel_ipc_block's.
+            unsafe { crate::syscall::thread::cancel_ipc_block(tcb) };
+        }
+        // SAFETY: caller contract.
+        let commit =
+            unsafe { commit_state_under_all_locks(tcb, new_state, exit_reason, Some(seq), None) };
+        if let Some(commit) = commit
+        {
+            return commit;
+        }
+    }
+}
+
+/// Whether a `Stopped` or `Created` `tcb` may be committed `Ready` and linked
+/// by a start: it is `current` on no CPU, its last register save has
+/// published (`context_saved`), and no waker owes it a wake
+/// (`wake_in_flight`). The settle loop of [`start_under_all_locks`] waits
+/// for these, but a concurrent start and stop can cycle the thread through a
+/// run, a park and a claim between a pass and the commit, so the commit
+/// re-reads them here.
+///
+/// # Safety
+/// `tcb` must be valid, and the caller must hold `tcb`'s `sched_lock` and
+/// every CPU's scheduler lock (`current` is written under its CPU's lock).
+#[cfg(not(test))]
+unsafe fn start_ready_to_link(tcb: *mut ThreadControlBlock, cpu_count: usize) -> bool
+{
+    use core::sync::atomic::Ordering;
+    // SAFETY: tcb valid; the pin and save flag are atomics.
+    let settled = unsafe {
+        (*tcb).wake_in_flight.load(Ordering::Relaxed) == 0
+            && (*tcb).context_saved.load(Ordering::Acquire) != 0
+    };
+    // SAFETY: every CPU lock is held per contract; cpu < cpu_count.
+    settled && (0..cpu_count).all(|cpu| unsafe { scheduler_for(cpu).current } != tcb)
+}
+
+/// Run `access` on `tcb`'s register frame (`trap_frame`, possibly null) while
+/// the thread is held still, and return its result; `None`, without calling
+/// `access`, when the thread is neither fault-blocked nor `Stopped`, or is
+/// `Stopped` but not yet settled.
+///
+/// Held still means `current` on no CPU with the last register save
+/// published (`context_saved`), and either `Stopped` or fault-blocked
+/// (`Blocked` with `BlockedOnFault`). A thread stopped while it runs on
+/// another CPU is `Stopped` from the stop's commit but executes, and may
+/// enter or leave the kernel through its frame, until that CPU deschedules
+/// it; such a thread is refused. A fault-blocked thread is waited for
+/// instead: the fault protocol hands its frame to the bound handler, and a
+/// faulter that has committed its park is only finishing its switch out
+/// (whose save writes the frame on riscv64), so the wait is that switch's
+/// tail. The wait spins outside every lock with interrupts enabled, and the
+/// state is re-checked under the lock. `access` runs under `tcb`'s
+/// `sched_lock`, which every dispatch, start, and stop or exit commit takes,
+/// so the thread stays held still for its duration; `access` must therefore
+/// not fault or take another TCB's `sched_lock`.
+///
+/// # Safety
+/// `tcb` must be valid, and the caller must hold no scheduler lock and no
+/// `sched_lock`.
+#[cfg(not(test))]
+pub unsafe fn with_held_frame<R>(
+    tcb: *mut ThreadControlBlock,
+    access: impl FnOnce(*mut u8) -> R,
+) -> Option<R>
+{
+    use core::sync::atomic::Ordering;
+
+    /// What a locked look at the thread decided.
+    enum Look
+    {
+        /// Held still: run the access.
+        Held,
+        /// Fault-blocked but still switching out: wait and look again.
+        Settling,
+        /// Not accessible.
+        Refused,
+    }
+
+    let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    let mut waiting: Option<u64> = None;
+    let mut access = Some(access);
+    let result = loop
+    {
+        // SAFETY: tcb valid per contract; lock_raw paired with the unlock below.
+        let saved = unsafe { (*tcb).sched_lock.lock_raw() };
+        // SAFETY: state and ipc_state are written under the held sched_lock.
+        let (state, ipc_state) = unsafe { ((*tcb).state, (*tcb).ipc_state) };
+        let fault_blocked = state == thread::ThreadState::Blocked
+            && ipc_state == thread::IpcThreadState::BlockedOnFault;
+        let look = if state == thread::ThreadState::Stopped || fault_blocked
+        {
+            // Neither state can become `current` while this sched_lock is
+            // held (dispatch takes it), so one pass over the CPUs, each read
+            // under that CPU's lock, sees every CPU it can still be on.
+            let off_cpu = (0..cpu_count).all(|cpu| {
+                // SAFETY: cpu < cpu_count; scheduler slab initialised by
+                // init(); lock_raw paired with unlock_raw.
+                unsafe {
+                    let s = scheduler_for(cpu);
+                    let f = s.lock.lock_raw();
+                    let on = s.current == tcb;
+                    s.lock.unlock_raw(f);
+                    !on
+                }
+            });
+            // SAFETY: context_saved is an atomic; Acquire pairs with the
+            // Release that publishes the switch-out save.
+            let saved_regs = unsafe { (*tcb).context_saved.load(Ordering::Acquire) } != 0;
+            if off_cpu && saved_regs
+            {
+                Look::Held
+            }
+            else if fault_blocked
+            {
+                Look::Settling
+            }
+            else
+            {
+                Look::Refused
+            }
+        }
+        else
+        {
+            Look::Refused
+        };
+        let done = match look
+        {
+            Look::Held =>
+            {
+                let run = access.take();
+                // SAFETY: trap_frame is read under the held sched_lock; access
+                // is the caller's.
+                let frame = unsafe {
+                    (*tcb)
+                        .trap_frame
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                }
+                .cast::<u8>();
+                Some(run.map(|f| f(frame)))
+            }
+            Look::Refused => Some(None),
+            Look::Settling => None,
+        };
+        // SAFETY: paired with the lock_raw above.
+        unsafe { (*tcb).sched_lock.unlock_raw(saved) };
+        if let Some(r) = done
+        {
+            break r;
+        }
+        if waiting.is_none()
+        {
+            // Spin with interrupts enabled and preemption disabled, as the stop
+            // drain does, so an inbound TLB-shootdown IPI is still acknowledged.
+            crate::percpu::preempt_disable();
+            // SAFETY: ring 0; restored after the loop.
+            waiting = Some(unsafe { crate::arch::current::cpu::save_and_disable_interrupts() });
+            // SAFETY: ring 0; IDT loaded; preempt disabled.
+            unsafe { crate::arch::current::interrupts::enable() };
+            spin_site_enter(SPIN_SITE_REGS_SETTLE);
+        }
+        core::hint::spin_loop();
+    };
+    if let Some(saved_int) = waiting
+    {
+        spin_site_exit();
+        // SAFETY: saved_int from save_and_disable_interrupts above.
+        unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+        crate::percpu::preempt_enable();
+    }
+    result
+}
+
+/// Shared body of [`set_state_under_all_locks`], [`exit_under_all_locks`],
+/// [`commit_cancelling_park`], and [`start_under_all_locks`].
+///
+/// With `expected_park_seq`, returns `None` without writing when the TCB's
+/// `park_seq` differs under the locks (a park committed after the caller's
+/// snapshot); otherwise always `Some`. With `start` (a `SYS_THREAD_START`
+/// commit), refuses ([`StateCommit::RefusedState`]) a TCB that is neither
+/// `Created` nor `Stopped` under the locks, returns `None` without writing
+/// while the TCB is not yet safe to link ([`start_ready_to_link`]), and on a
+/// commit advances the TCB's `start_seq` and stores the new value through
+/// `start`.
 ///
 /// # Safety
 /// As for [`set_state_under_all_locks`].
@@ -2439,7 +2903,9 @@ unsafe fn commit_state_under_all_locks(
     tcb: *mut ThreadControlBlock,
     new_state: thread::ThreadState,
     exit_reason: Option<u64>,
-) -> StateCommit
+    expected_park_seq: Option<u32>,
+    start: Option<&mut u32>,
+) -> Option<StateCommit>
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
 
@@ -2465,11 +2931,25 @@ unsafe fn commit_state_under_all_locks(
     }
 
     // `Exited` is terminal (see the function doc): read under the same locks
-    // every writer of `state` on this path holds.
-    // SAFETY: tcb validated by caller; state field always valid.
-    let exited = unsafe { (*tcb).state == thread::ThreadState::Exited };
+    // every writer of `state` on this path holds. `park_seq` is written only
+    // under the held sched_lock.
+    // SAFETY: tcb validated by caller; state and park_seq fields always valid.
+    let (exited, park_changed, wrong_state, start_unsettled) = unsafe {
+        let startable = matches!(
+            (*tcb).state,
+            thread::ThreadState::Created | thread::ThreadState::Stopped
+        );
+        (
+            (*tcb).state == thread::ThreadState::Exited,
+            expected_park_seq.is_some_and(|seq| {
+                seq != (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed)
+            }),
+            start.is_some() && !startable,
+            start.is_some() && startable && !start_ready_to_link(tcb, cpu_count),
+        )
+    };
     let mut running_on: Option<usize> = None;
-    if !exited
+    if !exited && !park_changed && !wrong_state && !start_unsettled
     {
         // Write the state and snapshot priority under all locks so the queue
         // drain below sees a value coherent with the state we just published.
@@ -2483,6 +2963,11 @@ unsafe fn commit_state_under_all_locks(
             if let Some(reason) = exit_reason
             {
                 (*tcb).exit_reason = reason;
+            }
+            if let Some(seq) = start
+            {
+                (*tcb).start_seq = (*tcb).start_seq.wrapping_add(1);
+                *seq = (*tcb).start_seq;
             }
             (*tcb).state = new_state;
             (*tcb).priority
@@ -2538,11 +3023,19 @@ unsafe fn commit_state_under_all_locks(
 
     if exited
     {
-        StateCommit::RefusedExited
+        Some(StateCommit::RefusedExited)
+    }
+    else if park_changed || start_unsettled
+    {
+        None
+    }
+    else if wrong_state
+    {
+        Some(StateCommit::RefusedState)
     }
     else
     {
-        StateCommit::Committed(running_on)
+        Some(StateCommit::Committed(running_on))
     }
 }
 
@@ -2558,6 +3051,9 @@ pub enum StateCommit
     Committed(Option<usize>),
     /// Nothing was written: the thread is `Exited`, which is terminal.
     RefusedExited,
+    /// Nothing was written: a [`start_under_all_locks`] commit found the
+    /// thread neither `Created` nor `Stopped`.
+    RefusedState,
 }
 
 /// Wait until `tcb` has left every CPU and its in-flight register save has
@@ -2769,7 +3265,7 @@ unsafe fn mark_bound_threads(
             // `state` is read without `sched_lock` here and below: `Exited`
             // is terminal, so a positive read is final, and a negative read
             // is re-decided under the full lock set by
-            // `exit_under_all_locks`, which refuses an exited thread
+            // `commit_cancelling_park`, which refuses an exited thread
             // (docs/scheduling-internals.md § Cross-CPU TCB Ownership).
             if !bound(tcb) || (*tcb).state == thread::ThreadState::Exited
             {
@@ -2778,16 +3274,17 @@ unsafe fn mark_bound_threads(
             // Reading our own CPU's `current` needs no lock — only this
             // CPU writes it at dispatch, and we are that running thread.
             let is_self = core::ptr::eq(tcb, scheduler_for(this_cpu).current);
-            if (*tcb).state == thread::ThreadState::Blocked
-            {
-                crate::syscall::thread::cancel_ipc_block(tcb);
-            }
-            // Retained reason for `CAP_INFO_THREAD_STATE` and late-bound
-            // observers, written under the same hold as the Exited commit so
-            // a thread that exited on its own meanwhile (commit refused)
-            // keeps its own reason. Not posted: kernel-initiated teardown is
-            // silent, as for a thread reaped through its own capability.
-            let committed = exit_under_all_locks(tcb, syscall::EXIT_KILLED);
+            // Cancel any park and commit Exited over it. The retained reason
+            // for `CAP_INFO_THREAD_STATE` and late-bound observers is written
+            // under the same hold as the Exited commit, so a thread that
+            // exited on its own meanwhile (commit refused) keeps its own
+            // reason. Not posted: kernel-initiated teardown is silent, as for
+            // a thread reaped through its own capability.
+            let committed = commit_cancelling_park(
+                tcb,
+                thread::ThreadState::Exited,
+                Some(syscall::EXIT_KILLED),
+            );
             if is_self
             {
                 self_bound = true;
@@ -2883,11 +3380,12 @@ unsafe fn scan_bound_current(
 /// `bound`, before the object's storage is reclaimed.
 ///
 /// Phase 1 ([`mark_bound_threads`]) walks the thread registry under its
-/// lock: each bound thread not already `Exited` has any IPC block cancelled
-/// and is marked `Exited` under the all-locks discipline with `EXIT_KILLED`
-/// recorded as its retained exit reason in the same hold
-/// (`exit_under_all_locks`, draining every run queue); CPUs found
-/// running one are recorded. Phase 2, with the registry released — a CPU
+/// lock: each bound thread not already `Exited` has any park cancelled and
+/// is marked `Exited` under the all-locks discipline with `EXIT_KILLED`
+/// recorded as its retained exit reason in the same hold, the commit retried
+/// until no park was committed since the cancel ([`commit_cancelling_park`],
+/// draining every run queue); CPUs found running one are recorded. Phase 2,
+/// with the registry released — a CPU
 /// spinning on the registry lock inside `register` cannot deschedule, so it
 /// must not be waited for while the lock is held — prods those CPUs and
 /// spins until no CPU other than this one has a bound thread as `current`.
@@ -2898,9 +3396,6 @@ unsafe fn scan_bound_current(
 /// `dealloc_object(Thread)` then runs its full drain on an already-Exited,
 /// off-CPU thread. A stopped server's reply-bound client is released by
 /// that later drain, exactly as for a server stopped by `SYS_THREAD_STOP`.
-/// For a thread displaced from a server's pending-reply binding, neither the
-/// stop nor the later drain is memory-safe (docs/scheduling-internals.md
-/// § Thread Registry, #443).
 ///
 /// Returns `true` if the running thread has itself been stopped — it was
 /// bound to this object, or a concurrent teardown on another CPU stopped it
@@ -3030,6 +3525,16 @@ pub unsafe fn wait_until_aspace_inactive(
 
 /// Test stub.
 #[cfg(test)]
+pub unsafe fn start_under_all_locks(
+    _tcb: *mut ThreadControlBlock,
+    _caller: *mut ThreadControlBlock,
+) -> StartCommit
+{
+    StartCommit::Committed(0)
+}
+
+/// Test stub.
+#[cfg(test)]
 pub unsafe fn set_state_under_all_locks(
     _tcb: *mut ThreadControlBlock,
     _new_state: thread::ThreadState,
@@ -3078,11 +3583,9 @@ pub enum ParkCommit
 /// source-side registration stands MUST reach `schedule()` before returning
 /// to user mode or attempting another commit — the wake deposited against the
 /// park is consumed only by a run-queue dequeue inside `schedule()`; any other
-/// exit leaks the waker's link (#352). The only sanctioned exception is a
-/// parker that un-commits under `sched_lock` while provably untargetable by
-/// any waker — `sys_thread_sleep`'s sleep-list-capacity rollback, which
-/// registered with no wake source. See docs/scheduling-internals.md § Lock
-/// Hierarchy.
+/// exit leaks the waker's link (#352). The sanctioned exceptions are the
+/// full-list withdrawals of docs/scheduling-internals.md § Lock Hierarchy
+/// rule 8.
 ///
 /// # Safety
 /// `tcb` must point to the current CPU's running thread.
@@ -3140,6 +3643,9 @@ pub unsafe fn commit_blocked_under_local_lock(
                     (*tcb).state = thread::ThreadState::Blocked;
                     (*tcb).ipc_state = ipc;
                     (*tcb).blocked_on_object = blocked_on;
+                    (*tcb)
+                        .park_seq
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     // Diagnostic stamp for the owed-wake detector; written
                     // under sched_lock like the rest of the Scheduling group.
                     (*tcb).park_started_tick = crate::arch::current::timer::current_tick();
@@ -3173,7 +3679,6 @@ pub unsafe fn commit_blocked_under_local_lock(
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn commit_blocked_under_local_lock(
     _tcb: *mut ThreadControlBlock,
     _ipc: thread::IpcThreadState,
@@ -3181,6 +3686,39 @@ pub unsafe fn commit_blocked_under_local_lock(
 ) -> ParkCommit
 {
     ParkCommit::Committed
+}
+
+/// Withdraw the caller's just-committed park that no waker or cancel can have
+/// claimed: restore `Running` and clear the park binding under `sched_lock`.
+/// The one user is a timed notification or event-queue wait whose
+/// [`crate::ipc::arm_timed_park`] found the sleep list full: it has dequeued
+/// itself while holding the source lock it held since the push, and every
+/// claim of a source waiter takes that lock, so the un-commit is a sanctioned
+/// exception to the reach-`schedule()` rule (docs/scheduling-internals.md
+/// § Lock Hierarchy rule 8). A `Stopped` or `Exited` commit that already
+/// landed is kept. `context_saved` stays 0, as after `sys_thread_sleep`'s own
+/// full-list withdrawal: the still-`current` thread's live registers are
+/// authoritative, and its next switch-out republishes 1.
+///
+/// # Safety
+/// `tcb` is the running caller, already dequeued from its source under the
+/// source lock the caller still holds; no scheduler or sleep-list lock is
+/// held.
+#[cfg(not(test))]
+pub unsafe fn withdraw_uncontested_park(tcb: *mut ThreadControlBlock)
+{
+    // SAFETY: tcb valid per the contract; state and the binding are written
+    // under its sched_lock (lock order source → sched_lock).
+    unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        if (*tcb).state == thread::ThreadState::Blocked
+        {
+            (*tcb).state = thread::ThreadState::Running;
+        }
+        (*tcb).ipc_state = thread::IpcThreadState::None;
+        (*tcb).blocked_on_object = core::ptr::null_mut();
+        (*tcb).sched_lock.unlock_raw(saved);
+    }
 }
 
 /// Commit a `BlockedOnSend → BlockedOnReply`/`BlockedOnFault` reply rebind for a
@@ -3226,6 +3764,9 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
             unsafe {
                 (*tcb).ipc_state = ipc;
                 (*tcb).blocked_on_object = blocked_on;
+                (*tcb)
+                    .park_seq
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
             true
         }
@@ -3243,7 +3784,6 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn commit_reply_rebind_under_local_lock(
     _tcb: *mut ThreadControlBlock,
     _ipc: thread::IpcThreadState,
@@ -3255,9 +3795,17 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 
 /// Send a wakeup IPI to `target_cpu` without enqueueing anything.
 ///
-/// Used by `sys_thread_stop` to force a remote Running target to trap
-/// into kernel and run `schedule()`, which then drains the Stopped TCB
-/// via the skip-loop.
+/// Used wherever a path needs a remote CPU to take a trap: the
+/// `sys_thread_stop` and `sys_thread_start` drains and the object-teardown
+/// stop (`stop_threads_bound_to`) on a CPU running a target they marked
+/// `Stopped` or `Exited`, and `sys_thread_set_affinity` on a CPU running a
+/// target whose affinity it changed. The IPI's handler does no work: the trap
+/// it forces snapshots the target's user registers and returns to user mode,
+/// and the CPU acts on the target at its next slice-expiry `schedule(true)` (or
+/// the target's own park or yield), where the requeue denylist drops a
+/// `Stopped` or `Exited` target and the affinity check relocates a moved one.
+/// The callers' drains wait for that; the prod itself only exits a `hlt` on an
+/// idle CPU.
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`). Self-IPI
@@ -3271,127 +3819,7 @@ pub unsafe fn prod_remote_cpu(target_cpu: usize)
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
-
-/// Spin until `tcb` is `current` on no CPU and its register save is published
-/// (`context_saved == 1`), prodding the owning remote CPU so it reaches
-/// `schedule()` promptly.
-///
-/// This is the "wait until the target has provably switched away on every CPU
-/// and committed its register file" barrier that `dealloc_object(Thread)`
-/// (`cap/object.rs`, the #207 free-gate) and `sys_thread_stop`'s drain already
-/// depend on. `sys_thread_start` reuses it before force-linking a resumed
-/// thread: a thread stopped while Running may still be `current`/executing on a
-/// remote CPU, and `enqueue_ready_thread` would otherwise dispatch it on a
-/// second CPU while it still runs on the first (the cross-CPU double-dispatch of
-/// #314/#293).
-///
-/// The caller MUST hold no scheduler lock and MUST have left `tcb` in a state
-/// `schedule()`'s requeue denylist rejects (`Stopped`/`Exited`/`Created`) so the
-/// owning CPU deschedules it WITHOUT re-linking it onto a run queue. The scan
-/// and spins take each per-CPU `scheduler.lock` one at a time and hold no lock
-/// across the wait; they run preempt-disabled with interrupts ENABLED (the #207
-/// envelope) so an inbound TLB/FPU IPI to this CPU stays serviceable.
-///
-/// # Safety
-/// `tcb` must be a valid [`ThreadControlBlock`] pointer.
-#[cfg(not(test))]
-pub unsafe fn await_descheduled(tcb: *mut thread::ThreadControlBlock)
-{
-    use core::sync::atomic::Ordering;
-
-    let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
-    let me = crate::arch::current::cpu::current_cpu() as usize;
-
-    // #207 spin envelope: preempt-disabled, interrupts enabled. We enter at
-    // IF=0 (syscall); spinning at IF=0 would block an inbound TLB/FPU shootdown
-    // IPI targeted at this CPU and deadlock its initiator. Enabling IF keeps it
-    // serviceable while `preempt_disable` pins us so the scheduler cannot
-    // migrate us mid-drain. Mirrors `dealloc_object(Thread)` and the stop drain.
-    crate::percpu::preempt_disable();
-    // SAFETY: ring 0; restored below.
-    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
-    // SAFETY: ring 0; IDT loaded; preempt disabled.
-    unsafe { crate::arch::current::interrupts::enable() };
-
-    // Step 1: not `current` on any CPU. Find the (at most one) CPU still naming
-    // `tcb` as current, prod it into `schedule()`, and spin on just that CPU's
-    // lock until it switches away; then re-scan. The target is denylisted, so
-    // the owning CPU drops it without re-linking — once a full scan is clean no
-    // CPU can re-install it.
-    loop
-    {
-        let run_cpu = 'scan: {
-            for cpu in 0..cpu_count
-            {
-                // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
-                let s = unsafe { scheduler_for(cpu) };
-                // SAFETY: lock_raw/unlock_raw paired; no other lock held across.
-                let is_cur = unsafe {
-                    let f = s.lock.lock_raw();
-                    let c = s.current == tcb;
-                    s.lock.unlock_raw(f);
-                    c
-                };
-                if is_cur
-                {
-                    break 'scan Some(cpu);
-                }
-            }
-            None
-        };
-        let Some(run_cpu) = run_cpu
-        else
-        {
-            break;
-        };
-        // The target is Created/Stopped and the caller is the Running thread, so
-        // the target can never be `current` on the calling CPU; the prod always
-        // targets a remote. The assert fails loudly if a future change breaks
-        // that invariant (a self-`current` target would spin forever below).
-        debug_assert!(
-            run_cpu != me,
-            "await_descheduled: target is current on the calling CPU"
-        );
-        if run_cpu != me
-        {
-            // SAFETY: run_cpu < cpu_count.
-            unsafe { prod_remote_cpu(run_cpu) };
-        }
-        // SAFETY: run_cpu < cpu_count.
-        let sched = unsafe { scheduler_for(run_cpu) };
-        // SAFETY: lock_raw/unlock_raw paired; no other lock held across the spin.
-        while unsafe {
-            let f = sched.lock.lock_raw();
-            let still_current = sched.current == tcb;
-            sched.lock.unlock_raw(f);
-            still_current
-        }
-        {
-            core::hint::spin_loop();
-        }
-    }
-
-    // Step 2: register save published. The owning CPU's `switch()` stores
-    // `context_saved = 1` (Release) after saving `tcb`; pair with an Acquire
-    // load here. A Created/never-run thread inits `context_saved = 1`, so this
-    // is immediate on the first-start path.
-    // SAFETY: tcb valid; context_saved is AtomicU32.
-    while unsafe { (*tcb).context_saved.load(Ordering::Acquire) } == 0
-    {
-        core::hint::spin_loop();
-    }
-
-    // SAFETY: saved_int from save_and_disable_interrupts above.
-    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
-    crate::percpu::preempt_enable();
-}
-
-/// Test stub.
-#[cfg(test)]
-#[allow(unused_variables)]
-pub unsafe fn await_descheduled(_tcb: *mut thread::ThreadControlBlock) {}
 
 /// Migrate a `Ready` thread from `src_cpu`'s run queue onto `dst_cpu`'s
 /// run queue.
@@ -3602,7 +4030,6 @@ unsafe fn relocate_ready_thread(
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn migrate_ready_thread(
     _tcb: *mut thread::ThreadControlBlock,
     _src_cpu: usize,
@@ -3731,7 +4158,6 @@ pub unsafe fn relocate_ready_priority(
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn relocate_ready_priority(
     _tcb: *mut thread::ThreadControlBlock,
     _old_prio: u8,
@@ -3849,7 +4275,6 @@ unsafe fn try_pull_balance(this_cpu: usize)
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 unsafe fn try_pull_balance(_this_cpu: usize) {}
 
 /// Locate the first unpinned Ready thread on `src_cpu`'s run queues and
@@ -3999,7 +4424,6 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
 
 /// Test stub.
 #[cfg(test)]
-#[allow(unused_variables)]
 unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 
 /// Make a not-live thread `Ready` and link it on `target_cpu`'s run queue,
@@ -4016,7 +4440,10 @@ unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 /// - `Ready`: already linked; coalesce (a Ready coalesce is only ever a
 ///   same-event duplicate, so dropping it is lost-wake-safe; do not set
 ///   `wake_pending`).
-/// - `Stopped`/`Exited`: a concurrent stop/dealloc won; abort.
+/// - `Stopped`/`Exited`: a concurrent stop/dealloc won; abort. This arm and
+///   the `Ready` arm clear the park binding (`ipc_state`, `blocked_on_object`)
+///   under `sched_lock`: the binding of a claimed park whose cancel lost the
+///   claim is this wake's to clear.
 /// - `Blocked`/`Created`: not live — make `Ready` and link under the target
 ///   run-queue lock (`sched_lock` outer → run-queue lock inner).
 ///
@@ -4026,7 +4453,12 @@ unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 /// (all-CPU-locks, ascending) serialises against the link.
 ///
 /// Every exit path clears `wake_in_flight` so a waiting `dealloc_object(Thread)`
-/// can proceed.
+/// can proceed. On every arm but `Exited` the clear precedes the `sched_lock`
+/// release: once the lock drops, the thread can park again and a later claim
+/// re-pin it, which a delayed clear would erase, and the TCB cannot be freed
+/// before an `Exited` commit takes the lock. On the `Exited` arm the clear
+/// follows the release and is the waker's last touch of the TCB: the pin alone
+/// holds `retype_free` there, and an `Exited` thread is never claimed again.
 ///
 /// # Safety
 /// - `tcb` must be a valid [`ThreadControlBlock`] pointer
@@ -4068,7 +4500,10 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         // it Running).
         thread::ThreadState::Running =>
         {
-            // SAFETY: wake_pending / wake_in_flight written under sched_lock.
+            // SAFETY: wake_pending and wake_in_flight written under sched_lock.
+            // The pin is released before the unlock: once the lock drops the
+            // thread can park again and a later claim re-pin it, which a
+            // delayed clear would erase.
             unsafe {
                 (*tcb).wake_pending = true;
                 (*tcb)
@@ -4082,17 +4517,43 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         thread::ThreadState::Blocked | thread::ThreadState::Created =>
         {}
         // Already Ready (will be dispatched and consume the deposit; a Ready
-        // coalesce is only a same-event duplicate), or a concurrent stop/dealloc
-        // already won (Stopped/Exited). Either way: do not link. Release the
-        // wake-in-flight gate so a waiting dealloc_object(Thread) can proceed.
-        thread::ThreadState::Ready | thread::ThreadState::Stopped | thread::ThreadState::Exited =>
+        // coalesce is only a same-event duplicate), or a concurrent stop
+        // already won (Stopped). Either way: do not link. The claimed park's
+        // binding is this wake's to clear (a cancel that lost the claim left
+        // it; on Ready it is already clear). The pin is released before the
+        // unlock: once the lock drops a Ready thread can run, park again and be
+        // re-pinned by a later claim, which a delayed clear would erase; and
+        // neither state can be freed before an Exited commit takes this lock.
+        thread::ThreadState::Ready | thread::ThreadState::Stopped =>
         {
-            // SAFETY: wake_in_flight written under sched_lock.
+            // SAFETY: the binding and wake_in_flight are written under
+            // sched_lock, held here.
             unsafe {
+                (*tcb).ipc_state = thread::IpcThreadState::None;
+                (*tcb).blocked_on_object = core::ptr::null_mut();
                 (*tcb)
                     .wake_in_flight
                     .store(0, core::sync::atomic::Ordering::Release);
                 (*tcb).sched_lock.unlock_raw(sched_saved);
+            }
+            return;
+        }
+        // A concurrent dealloc already won (Exited): do not link. Clear the
+        // binding as above, then release the pin after the unlock. The pin
+        // alone holds dealloc_object(Thread) from retype_free here, so its
+        // release is this waker's last touch of the TCB; an Exited thread
+        // never parks again, so no later claim can re-pin it.
+        thread::ThreadState::Exited =>
+        {
+            // SAFETY: the binding is written under sched_lock, held here; the
+            // TCB stays valid until the pin release below.
+            unsafe {
+                (*tcb).ipc_state = thread::IpcThreadState::None;
+                (*tcb).blocked_on_object = core::ptr::null_mut();
+                (*tcb).sched_lock.unlock_raw(sched_saved);
+                (*tcb)
+                    .wake_in_flight
+                    .store(0, core::sync::atomic::Ordering::Release);
             }
             return;
         }
@@ -4160,45 +4621,66 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
 
 /// Test stub for `enqueue_and_wake` (no-op in test mode).
 #[cfg(test)]
-#[allow(unused_variables)]
 pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize) {}
 
 /// Make `tcb` `Ready` and link it on `target_cpu`'s run queue, under the
 /// per-TCB `sched_lock` — the DELIBERATE-placement primitive.
 ///
-/// Unlike [`enqueue_and_wake`], this does NOT classify `state` beyond the
-/// terminal check: it forces the `→Ready` transition and links. Use it only
-/// when the caller owns the transition and has established the thread is not
-/// live on any CPU — today only `sys_thread_start` (first start and resume,
+/// Unlike [`enqueue_and_wake`], this skips the wake gate's state
+/// classification: it links a thread that is already `Ready`, provided it is
+/// still `Ready` at the caller's `start_seq` (below). Use it only when the
+/// caller owns the transition and has established the thread is not live on
+/// any CPU — today only `sys_thread_start` (first start and resume,
 /// `Created`/`Stopped` → run). Routing that through the gated
 /// `enqueue_and_wake` would be wrong: the thread is already `Ready`, which
 /// the gate coalesces — dropping it from every run queue.
 ///
-/// Returns `false` without writing or linking if the thread is `Exited`
-/// under `sched_lock`: an object teardown or an exit on another CPU can mark
-/// it between the caller's own state commit and this link, and `Exited` is
-/// terminal (see [`set_state_under_all_locks`]).
+/// `start_seq` is the generation the caller's [`start_under_all_locks`]
+/// commit returned. The link is made only if, under `sched_lock`, the thread
+/// is still `Ready` at that generation; otherwise the commit was superseded
+/// between commit and link and nothing is written or linked:
+/// [`ReadyLink::Exited`] if an object teardown or an exit on another CPU
+/// marked it `Exited` (terminal; see [`set_state_under_all_locks`]), else
+/// [`ReadyLink::Superseded`] (a stop, and possibly a restart that owns its own
+/// link, came between).
 ///
 /// Lock order: `(*tcb).sched_lock` (outer) → target run-queue lock (inner), then
 /// `wake_idle_cpu` after both are released — identical to `enqueue_and_wake`'s
-/// link path. Clears `wake_pending` and `wake_in_flight`.
+/// link path. Clears `wake_pending`; `wake_in_flight` is already 0 (the
+/// caller's commit found it 0 under its locks, and a thread still `Ready` at
+/// that `start_seq` has not run since, so nothing can have claimed it).
 ///
 /// # Safety
-/// - `tcb` must be a valid [`ThreadControlBlock`] pointer, not live or linked on
-///   any CPU.
+/// - `tcb` must be a valid [`ThreadControlBlock`] pointer. While it is `Ready`
+///   at `start_seq` it is not live or linked on any CPU (the caller drained it
+///   before its commit, and only a later commit can link it); in any other
+///   state this function touches nothing.
 /// - `target_cpu` must be < [`MAX_CPUS`] and initialized by `sched::init`.
 /// - The caller must hold no run-queue lock.
 #[cfg(not(test))]
-pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usize) -> bool
+pub unsafe fn enqueue_ready_thread(
+    tcb: *mut ThreadControlBlock,
+    target_cpu: usize,
+    start_seq: u32,
+) -> ReadyLink
 {
     // SAFETY: tcb valid; sched_lock (outer) paired with unlock below.
     let sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
-    // SAFETY: state read under sched_lock, which every lifecycle writer holds.
-    if unsafe { (*tcb).state } == thread::ThreadState::Exited
+    // SAFETY: state and start_seq read under sched_lock, which every lifecycle
+    // writer holds.
+    let refusal = unsafe {
+        match (*tcb).state
+        {
+            thread::ThreadState::Exited => Some(ReadyLink::Exited),
+            thread::ThreadState::Ready if (*tcb).start_seq == start_seq => None,
+            _ => Some(ReadyLink::Superseded),
+        }
+    };
+    if let Some(refusal) = refusal
     {
         // SAFETY: paired with the lock_raw above.
         unsafe { (*tcb).sched_lock.unlock_raw(sched_saved) };
-        return false;
+        return refusal;
     }
     // SAFETY: caller guarantees target_cpu is initialized.
     let sched = unsafe { scheduler_for(target_cpu) };
@@ -4230,14 +4712,18 @@ pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usi
 
     set_reschedule_pending_for(target_cpu);
 
-    // Clear the wake-in-flight gate defensively so a waiting dealloc may proceed
-    // (deliberate placements do not set it, but keep the invariant uniform).
+    // The commit found no wake owed under its locks, and a thread still Ready
+    // at that start_seq has not run since: no waker can have claimed it.
     // SAFETY: tcb valid; locks held.
-    unsafe {
+    let owed = unsafe {
         (*tcb)
             .wake_in_flight
-            .store(0, core::sync::atomic::Ordering::Release);
-    }
+            .load(core::sync::atomic::Ordering::Relaxed)
+    };
+    debug_assert_eq!(
+        owed, 0,
+        "enqueue_ready_thread: a waker still owes this thread a wake"
+    );
 
     // Release inner (run-queue) then outer (sched_lock); never IPI under
     // sched_lock.
@@ -4249,15 +4735,31 @@ pub unsafe fn enqueue_ready_thread(tcb: *mut ThreadControlBlock, target_cpu: usi
 
     // SAFETY: target_cpu validated < MAX_CPUS by scheduler_for.
     unsafe { wake_idle_cpu(target_cpu) };
-    true
+    ReadyLink::Linked
+}
+
+/// Outcome of [`enqueue_ready_thread`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadyLink
+{
+    /// The thread is `Ready` and linked on the target run queue.
+    Linked,
+    /// Nothing linked: a stop (and possibly a restart, which links the thread
+    /// itself) superseded the caller's start commit.
+    Superseded,
+    /// Nothing linked: the thread is `Exited`.
+    Exited,
 }
 
 /// Test stub for `enqueue_ready_thread` (no-op in test mode).
 #[cfg(test)]
-#[allow(unused_variables)]
-pub unsafe fn enqueue_ready_thread(_tcb: *mut ThreadControlBlock, _target_cpu: usize) -> bool
+pub unsafe fn enqueue_ready_thread(
+    _tcb: *mut ThreadControlBlock,
+    _target_cpu: usize,
+    _start_seq: u32,
+) -> ReadyLink
 {
-    true
+    ReadyLink::Linked
 }
 
 /// Select target CPU for enqueueing a thread based on affinity, soft
@@ -4411,8 +4913,7 @@ pub unsafe fn select_target_cpu_excluding(
 
 /// Test stub for `select_target_cpu` (always returns CPU 0).
 #[cfg(test)]
-#[allow(unused_variables)]
-pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
+pub unsafe fn select_target_cpu(_tcb: *mut ThreadControlBlock) -> usize
 {
     0
 }
@@ -4449,7 +4950,6 @@ unsafe fn wake_idle_cpu(target_cpu: usize)
 
 /// Test stub for `wake_idle_cpu` (no-op in test mode).
 #[cfg(test)]
-#[allow(unused_variables)]
 unsafe fn wake_idle_cpu(_target_cpu: usize) {}
 
 // ── schedule ──────────────────────────────────────────────────────────────────
@@ -5454,7 +5954,13 @@ pub(crate) unsafe extern "C" fn user_thread_trampoline() -> !
     // to a valid, initialized TrapFrame. The initial RSP for this function is set below the
     // TrapFrame (see sys_cap_create_thread: trampoline_rsp = kstack_top - tf_size - TRAMPOLINE_FRAME)
     // so this C function's stack frame does not overlap the TrapFrame.
-    unsafe { crate::arch::current::context::return_to_user((*tcb).trap_frame) }
+    unsafe {
+        crate::arch::current::context::return_to_user(
+            (*tcb)
+                .trap_frame
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
 }
 
 // ── enter ─────────────────────────────────────────────────────────────────────
@@ -5549,7 +6055,9 @@ pub fn enter() -> !
 
     // Record the trap_frame pointer in the TCB so future trap handlers can
     // find the correct frame when the thread is running.
-    init_tcb.trap_frame = tf_ptr;
+    init_tcb
+        .trap_frame
+        .store(tf_ptr, core::sync::atomic::Ordering::Relaxed);
 
     // Mark init's address space as active on CPU 0 (BSP) before entering user
     // mode. Must precede `first_entry_to_user`, which tags the entry: the active

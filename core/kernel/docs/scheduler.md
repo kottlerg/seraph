@@ -6,8 +6,8 @@ to prefer spreading threads across physical cores rather than packing them onto 
 
 The scheduler interacts with two subsystems:
 
-- **IPC** — IPC interacts with the scheduler only through its park and wake primitives and
-  performs no direct context switch (see
+- **IPC** — IPC interacts with the scheduler only through its park, un-commit and wake
+  primitives and performs no direct context switch (see
   [ipc-internals.md § IPC Scheduling Interaction](ipc-internals.md#ipc-scheduling-interaction))
 - **Architecture layer** — context save/restore and the preemption timer are implemented
   by the arch-dispatch surface defined in [arch-interface.md](arch-interface.md)
@@ -180,14 +180,19 @@ pub struct ThreadControlBlock
     /// Inline message buffer for in-flight IPC data (the staged message).
     ipc_msg: Message,
 
-    /// Caller bound for the implicit reply (set on receive, cleared on reply).
+    /// Caller bound by the last receive (consumed by the reply, released at the
+    /// next receive, or cleared by a cancel or dealloc claim).
     reply_tcb: AtomicPtr<ThreadControlBlock>,
 
     /// Wakeup value (notification bits, event payload, or wait-set member badge).
     wakeup_value: u64,
 
-    /// Intrusive IPC wait queue link.
+    /// Intrusive IPC wait queue links (endpoints link `ipc_wait_next` only;
+    /// notifications, event queues and wait sets link both ways through
+    /// `ipc::WaitQueue` and tag the queue in `ipc_wait_queue`).
     ipc_wait_next: Option<*mut ThreadControlBlock>,
+    ipc_wait_prev: *mut ThreadControlBlock,
+    ipc_wait_queue: AtomicPtr<WaitQueue>,
 
     // === Context ===
 
@@ -230,9 +235,16 @@ Created ──(SYS_THREAD_START)──► Ready ──(scheduled)──► Runni
                                   ▼
                                 Ready
 
-Running ──(SYS_THREAD_STOP)──► Stopped
-Running ──(SYS_THREAD_EXIT)──► Exited (TCB freed)
+Blocked ──(full-list withdrawal: SYS_THREAD_SLEEP, timed notification / event wait)──► Running
+Running / Ready / Blocked ──(SYS_THREAD_STOP)──► Stopped
+Stopped ──(SYS_THREAD_START)──► Ready
+Running ──(SYS_THREAD_EXIT / SYS_PROCESS_EXIT)──► Exited (TCB freed at its last cap delete)
+any state ──(object teardown / terminal fault)──► Exited
 ```
+
+Every `Exited` transition, and the rule for each, is listed in
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#lifecycle-state-machine)
+§ Lifecycle State Machine.
 
 State transitions are governed by the per-field-group ownership rules in
 [scheduling-internals.md](scheduling-internals.md). Cross-CPU writes to TCB

@@ -72,15 +72,24 @@ jobs:
       - name: Install QEMU, firmware, and zstd
         run: |
           sudo apt-get update
+          # Ubuntu 26.04 ships the riscv64 system emulator in its own
+          # package, qemu-system-riscv, no longer in qemu-system-misc; older
+          # images have no such package and keep it in qemu-system-misc.
+          riscv=""
+          if apt-cache show qemu-system-riscv >/dev/null 2>&1; then
+            riscv=qemu-system-riscv
+          fi
           sudo apt-get install -y \
             qemu-system-x86 \
             qemu-system-misc \
+            $riscv \
             ovmf \
             qemu-efi-riscv64 \
             zstd
 
       - name: Log QEMU versions
         run: |
+          set -o pipefail
           qemu-system-x86_64 --version | head -n1
           qemu-system-riscv64 --version | head -n1
 

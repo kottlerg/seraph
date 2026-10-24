@@ -30,7 +30,7 @@ pub const FAULT_OUTCOME_PENDING: u8 = 0;
 /// [`ThreadControlBlock::fault_outcome`] value: resume (re-execute / continue).
 pub const FAULT_OUTCOME_RESUME: u8 = 1;
 /// [`ThreadControlBlock::fault_outcome`] value: kill (handler declined, handler
-/// died, binding severed, or thread cancelled).
+/// thread destroyed, binding severed, or thread cancelled).
 pub const FAULT_OUTCOME_KILL: u8 = 2;
 
 /// Architecture-neutral description of a fault, marshalled into the fault

@@ -318,9 +318,10 @@ plus the `--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
 `-cpu max,migratable=no` on x86-64 TCG. The explicit feature string is the source of
 truth; the supervisor paging extensions (Svpbmt, Svinval, Svnapot) are required by the
 kernel, whose paging subsystem refuses CPUs that lack them during boot, before the first
-userspace mapping (see [platform-requirements.md](platform-requirements.md)). The named
-`-cpu rva23s64` model (QEMU ≥ 9.1, 2024-09), a superset that adds the remaining RVA23
-mandates, is a documented configuration alternative when the CI runner floor supports it.
+userspace mapping (see [platform-requirements.md](platform-requirements.md)). QEMU ≥ 9.1
+(2024-09) adds the named `-cpu rva23s64` model, a superset covering the remaining RVA23
+mandates; the runner passes the explicit string instead because it also runs on the QEMU 8.0
+minimum.
 
 ---
 

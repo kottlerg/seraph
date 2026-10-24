@@ -366,9 +366,14 @@ pub unsafe fn consume_park_interrupted(tcb: *mut ThreadControlBlock) -> bool
 /// Per-thread kernel state.
 ///
 /// # Safety invariant
-/// `run_queue_next` and `ipc_wait_next` are raw intrusive pointers. They are
-/// only valid when the TCB is on a run queue or IPC wait queue respectively.
-/// Access is serialised by the owning CPU's `PerCpuScheduler` lock.
+/// `run_queue_next`, `ipc_wait_next` and `ipc_wait_prev` are raw intrusive
+/// pointers. They are only valid when the TCB is on a run queue or IPC wait
+/// queue respectively. `run_queue_next` is serialised by the owning CPU's
+/// `PerCpuScheduler` lock; `ipc_wait_next`, `ipc_wait_prev` and the
+/// `ipc_wait_queue` tag are written under the lock of the IPC source whose
+/// queue links the TCB. Any source-lock holder may read the tag to test
+/// membership in its own queue (see [`crate::ipc::WaitQueue`]); the softlockup
+/// watchdog also reads it without a lock.
 #[repr(C)]
 pub struct ThreadControlBlock
 {
@@ -417,8 +422,8 @@ pub struct ThreadControlBlock
     ///
     /// Keyed on the TCB itself, not on whichever run queue happens to link it:
     /// the owning lock of `{state, ipc_state, queued_on, run_queue_next,
-    /// preferred_cpu, blocked_on_object, wake_pending}` is always this lock,
-    /// regardless of which CPU the TCB is on. This is what collapses the
+    /// preferred_cpu, blocked_on_object, wake_pending, park_seq, start_seq}` is
+    /// always this lock, regardless of which CPU the TCB is on. This is what collapses the
     /// positional-ownership race class — two CPUs can no longer pick two
     /// different locks for one TCB. Lock order: source IPC lock → `sched_lock`
     /// → per-CPU `PerCpuScheduler.lock`. See
@@ -442,6 +447,29 @@ pub struct ThreadControlBlock
     /// control flow.
     pub park_started_tick: u64,
 
+    /// Park-binding generation: advanced under [`sched_lock`](Self::sched_lock)
+    /// by every commit that publishes a new `Blocked` binding
+    /// (`commit_blocked_under_local_lock`, `commit_reply_rebind_under_local_lock`).
+    /// A stop or teardown snapshots it with `state`, cancels the park it saw,
+    /// and commits only if it is unchanged, so it never writes `Stopped` or
+    /// `Exited` over a live park: one it did not cancel was already claimed by
+    /// a waker or a concurrent cancel (docs/thread-lifecycle-and-sleep.md
+    /// § `sys_thread_stop` Cross-CPU Stop Protocol). The timer snapshots it at a
+    /// sleep-list pop and claims only the park it popped (§ Sleep List
+    /// Invariants). Atomic (Relaxed) because the timer reads it under
+    /// `SLEEP_LIST_LOCK` or the source lock rather than `sched_lock`; every
+    /// write holds `sched_lock`.
+    pub park_seq: core::sync::atomic::AtomicU32,
+
+    /// Start generation: advanced under [`sched_lock`](Self::sched_lock) by
+    /// each `SYS_THREAD_START` `Ready` commit (`start_under_all_locks`). The
+    /// start then links the thread only if the generation is unchanged and the
+    /// thread still `Ready`, so a stop (and any restart) landing between its
+    /// commit and its link supersedes it instead of being overwritten by a
+    /// second link (`enqueue_ready_thread`). A plain `u32`, like
+    /// `wake_pending`: every read and write holds `sched_lock`.
+    pub start_seq: u32,
+
     // === IPC state ===
     /// Current IPC blocking reason (None when not blocked on IPC).
     pub ipc_state: IpcThreadState,
@@ -449,8 +477,9 @@ pub struct ThreadControlBlock
     /// Inline message buffer for in-flight IPC data.
     pub ipc_msg: crate::ipc::message::Message,
 
-    /// Thread waiting for our reply (set on receive, cleared on reply).
-    /// `AtomicPtr` because cancel/dealloc paths mutate this from outside
+    /// Caller bound by this thread's last receive: consumed by its reply,
+    /// released at its next receive, or cleared by the cancel and dealloc
+    /// claims. `AtomicPtr` because those claims mutate it from outside
     /// `ep.lock`; see docs/scheduling-internals.md § Cross-CPU TCB Ownership.
     pub reply_tcb: core::sync::atomic::AtomicPtr<ThreadControlBlock>,
 
@@ -477,8 +506,19 @@ pub struct ThreadControlBlock
     #[cfg(debug_assertions)]
     pub deposit_episode: core::sync::atomic::AtomicU32,
 
-    /// Intrusive IPC wait-queue link.
+    /// Intrusive IPC wait-queue link: the successor on an endpoint queue, or
+    /// on an [`ipc::WaitQueue`](crate::ipc::WaitQueue).
     pub ipc_wait_next: Option<*mut ThreadControlBlock>,
+
+    /// Predecessor on an [`ipc::WaitQueue`](crate::ipc::WaitQueue) (null off
+    /// one; endpoint queues do not use it).
+    pub ipc_wait_prev: *mut ThreadControlBlock,
+
+    /// The [`ipc::WaitQueue`](crate::ipc::WaitQueue) linking this TCB, or
+    /// null. Written under that queue's source lock; it names a queue only
+    /// while the TCB is on it, so a holder of one source lock can test
+    /// membership of its own queue without walking it.
+    pub ipc_wait_queue: core::sync::atomic::AtomicPtr<crate::ipc::WaitQueue>,
 
     // === Fault-handler binding ===
     /// Bound fault-handler endpoint object (`null` = none). Kernel-unresolvable
@@ -509,8 +549,9 @@ pub struct ThreadControlBlock
     /// [`crate::ipc::fault::FAULT_OUTCOME_PENDING`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_RESUME`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_KILL`]. Set to `RESUME`/`KILL` by the
-    /// single wake-claim winner (genuine reply, handler death, cancellation),
-    /// so resume-vs-cancellation is unambiguous. See `docs/fault-handling.md`.
+    /// single wake-claim winner (genuine reply, handler-thread destruction,
+    /// cancellation), so resume-vs-cancellation is unambiguous. See
+    /// `docs/fault-handling.md`.
     pub fault_outcome: core::sync::atomic::AtomicU8,
 
     /// True while this thread is delivering / blocked on a fault. Set before
@@ -532,17 +573,26 @@ pub struct ThreadControlBlock
     /// Stored in TSS RSP0 (x86-64) or sscratch (RISC-V) on every context switch.
     pub kernel_stack_top: u64,
 
-    /// Pointer to the `TrapFrame` on the kernel stack (null for kernel threads).
+    /// Pointer to the `TrapFrame` of the thread's last entry from user mode,
+    /// on its kernel stack below `kernel_stack_top` (null for kernel threads).
     ///
-    /// Populated by `syscall_entry` / trap handler on each kernel entry.
-    /// Points into the kernel stack below `kernel_stack_top`.
-    pub trap_frame: *mut crate::arch::current::trap_frame::TrapFrame,
+    /// Set by `SYS_THREAD_CONFIGURE` (under the thread's `sched_lock`, while
+    /// `Created`), or by `sched::enter` for init, to the slot its first entry
+    /// to user mode resumes from, and republished by every entry from user
+    /// mode at which the thread can be descheduled (see
+    /// `docs/arch-interface.md` § `trap_frame`). The running thread is the only
+    /// writer after configuration; atomic so the cross-CPU load of
+    /// `sys_thread_start`'s unlocked null check is race-free. Relaxed
+    /// suffices: the register syscalls read it only after the switch-out's
+    /// `context_saved` Release (`sched::with_held_frame`).
+    pub trap_frame: core::sync::atomic::AtomicPtr<crate::arch::current::trap_frame::TrapFrame>,
 
     /// Number of the syscall the thread is executing: Relaxed-stored by the
-    /// dispatcher at entry and reset to `u64::MAX` at exit. Read by the
-    /// lock-holder stamps, which must not follow `trap_frame` from a
-    /// possibly stale TCB pointer and may read it from another CPU in the
-    /// state they report. A caller passing `u64::MAX` as a syscall number is
+    /// dispatcher at entry and reset to `u64::MAX` at exit. Read, among
+    /// others, by the lock-holder stamps, which must not follow `trap_frame`
+    /// from a possibly stale TCB pointer and may read it from another CPU in
+    /// the state they report, and by the panic handler's same-CPU context
+    /// dump. A caller passing `u64::MAX` as a syscall number is
     /// rejected as unknown and reads here as "no syscall".
     pub syscall_nr: core::sync::atomic::AtomicU64,
 
@@ -627,14 +677,30 @@ pub struct ThreadControlBlock
     /// on RISC-V RVWMO.
     pub context_saved: core::sync::atomic::AtomicU32,
 
-    /// Set to 1 by a waker that has popped this thread from a wait object
-    /// (notification, endpoint, event queue, or wait set) under that object's lock
-    /// but has not yet called `enqueue_and_wake`; cleared to 0 by
-    /// `enqueue_and_wake`.
-    /// `dealloc_object(Thread)` spins on this (Acquire) after its wait-object
-    /// unlink and before `retype_free`, so a thread popped for wake cannot be
-    /// freed out from under the in-flight wake. This is the wake-side analogue
-    /// of `context_saved` (the switch-side gate). See
+    /// The owed-wake pin: 1 while some path holds a claim on this thread's
+    /// park whose `enqueue_and_wake` has not yet run.
+    ///
+    /// Set by a waker that claims the thread from a wait object (notification,
+    /// endpoint, event queue, or wait set) under that object's lock; by the
+    /// sleep timer when it pops a plain sleeper, under `SLEEP_LIST_LOCK`; by
+    /// `endpoint_call` / `endpoint_recv` before they publish a reply binding
+    /// to it; and by a server's `dealloc_object(Thread)` when it claims a
+    /// reply-bound or fault-bound client.
+    ///
+    /// Cleared by `enqueue_and_wake` when the owed wake lands: before it
+    /// releases `sched_lock`, except on a thread already `Exited`, where the
+    /// clear follows the release and is the waker's last touch of the TCB.
+    /// For a reply binding no wake will follow, it is cleared by the path
+    /// whose `reply_tcb` CAS tore the binding down (`cancel_ipc_block`, the
+    /// endpoint park rollbacks, the `dealloc_object(Thread)` detach).
+    ///
+    /// Two paths wait on it: `dealloc_object(Thread)`, which spins with
+    /// Acquire loads after its wait-object unlink and before `retype_free`, so
+    /// a thread claimed for wake is not freed under the in-flight wake (the
+    /// wake-side analogue of `context_saved`); and the settle loop of
+    /// `SYS_THREAD_START` (`sched::start_under_all_locks`), whose Relaxed
+    /// loads hold the target's `sched_lock` (and, for the commit's re-check,
+    /// every CPU lock), so a restart does not race a late wake. See
     /// `docs/scheduling-internals.md` § Cross-CPU TCB Ownership.
     pub wake_in_flight: core::sync::atomic::AtomicU32,
 
@@ -663,7 +729,8 @@ pub struct ThreadControlBlock
 
     /// Exit reason recorded by the kernel at the moment this thread became
     /// `Exited`, under the same all-locks hold as that commit
-    /// (`exit_under_all_locks`): by `sys_thread_exit` (clean exit, value `0`),
+    /// (`exit_under_all_locks`, or `commit_cancelling_park` for object
+    /// teardown): by `sys_thread_exit` (clean exit, value `0`),
     /// by `sys_process_exit` (`encode_exit_code(arg0)`, a voluntary code in
     /// `[0, EXIT_FAULT_BASE)`), by the architecture fault handlers (value
     /// `EXIT_FAULT_BASE + vector`) before they call `post_death_notification`,
@@ -678,8 +745,14 @@ pub struct ThreadControlBlock
     pub exit_reason: u64,
 
     // === Sleep ===
-    /// Tick deadline for `SYS_THREAD_SLEEP`. 0 = not sleeping.
-    pub sleep_deadline: u64,
+    /// Tick deadline of this thread's pending sleep-list entry (a plain
+    /// `SYS_THREAD_SLEEP` or a timed IPC wait); 0 = none. Set by the parker
+    /// before its `sleep_list_add`; cleared under `SLEEP_LIST_LOCK`, by the
+    /// timer pop or `sleep_list_remove`, together with the entry, or by the
+    /// parker's own rollback of a deadline it never listed. Atomic because
+    /// waker prechecks read it under a source lock, not that lock.
+    /// See docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
+    pub sleep_deadline: core::sync::atomic::AtomicU64,
 
     // === FPU / SIMD / Vector extended state ===
     /// Per-thread XSAVE area pointer for the FPU/SIMD/V eager-save /

@@ -7,5 +7,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[dependencies]
+# `IpcMessage` and `ARGS_BLOB_MAX`: the create-request blob decoder reads the
+# message snapshot directly, so its bounds checks are host-tested.
+ipc = { path = "../../../shared/ipc" }
+
 [lints]
 workspace = true

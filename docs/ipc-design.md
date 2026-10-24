@@ -44,16 +44,12 @@ or reused.
 
 A server that needs to delegate work may make a downstream call before replying: the pending reply
 stays bound to the receiving thread until that thread replies, and the downstream call does not
-touch that binding. A delegating server therefore replies before it next receives. When a later
-receive delivers a message while a reply is still pending, the kernel overwrites the binding. The
-displaced caller (a thread blocked in `call` or a fault-blocked thread) is then outside every
-guarantee the system and kernel documents state for a blocked or bound thread: no reply reaches it;
-stopping it, tearing down its CSpace or AddressSpace, or deleting its last Thread capability can
-hang the kernel or touch freed kernel memory; and restarting a stopped one trips a debug-build
-kernel assertion, while a release build fails the call closed with `Interrupted` (or kills a
-fault-blocked thread), per the fail-closed resume rule in
-[ipc-internals.md](../core/kernel/docs/ipc-internals.md#park-dispositions-and-episodes). This is a
-defect; its consequences are listed in [#443](https://github.com/kottlerg/seraph/issues/443).
+touch that binding. A delegating server therefore replies before it next receives. A receive
+that passes its capability and headroom checks while a reply is still pending first releases the
+pending caller, so a binding is never overwritten: a thread blocked in `call` returns
+`Interrupted`, and a fault-blocked thread is killed, as for any cancelled call or fault episode. A
+receive refused by those checks leaves the binding in place (the mechanism is in
+[ipc-internals.md](../core/kernel/docs/ipc-internals.md#receive-path-server)).
 
 ### Message Format
 
@@ -119,14 +115,20 @@ A notification is a kernel object containing a single machine word used as a bit
 bit represents a distinct event type, defined by the service using the notification.
 
 **Delivery:** The sender ORs one or more bits into the notification word. This is O(1) and
-never blocks. If the receiver is already waiting, it is woken immediately. If not,
-the bits accumulate until the receiver next waits.
+never blocks. If receivers are already waiting, the send then claims every pending bit and wakes
+the one that has waited longest with them. If none is waiting, the bits accumulate until a
+receiver next waits. The OR and the claim are not one atomic step: between them, a receiver that
+begins waiting can find the bits pending and take them without blocking, or a concurrent send can
+claim them, and a send whose bits were taken this way wakes no queued waiter.
 
 **Coalescing:** Setting an already-set bit is idempotent.
 
 **Receipt:** The receiver waits on the notification object and receives the full bitmask,
 which is atomically cleared on read. The receiver then inspects each set bit and
-acts accordingly.
+acts accordingly. Several threads may wait on one notification; they queue in arrival order and
+each send that claims pending bits wakes one of them. Destroying the notification wakes every
+waiter with `Interrupted`. See
+[syscalls.md § `SYS_NOTIFICATION_WAIT`](../core/kernel/docs/syscalls.md#sys_notification_wait-4).
 
 Notifications are appropriate for: hardware interrupt delivery, timer expiry, IPC endpoint
 readiness, DMA completion, and any event where what matters is that something happened,
@@ -147,7 +149,9 @@ as two distinct entries in order.
 
 **Receipt:** The receiver waits on the queue and receives the next available entry.
 If multiple entries are available, subsequent receives return them in order without
-blocking.
+blocking. Blocked receivers queue in arrival order, and each posted entry goes to the one that
+has waited longest. Destroying the queue wakes every waiter with `Interrupted`. See
+[syscalls.md § `SYS_EVENT_RECV`](../core/kernel/docs/syscalls.md#sys_event_recv-6).
 
 Event queues are appropriate for: process lifecycle events (exit, notification delivery),
 anything where ordering or count of events matters, and cases where coalescing would
@@ -158,8 +162,11 @@ cause correctness problems.
 ## Waiting on Multiple Sources
 
 A **wait set** aggregates any combination of endpoints, notifications, and event queues.
-A process waits on the set and is woken when any member becomes ready; the result
-identifies which source triggered the wake.
+A thread waits on the set and is woken when any member becomes ready; the result
+identifies which source triggered the wake. A wait set takes one waiting thread at a time: a
+second thread's wait on the same set is refused with `InvalidState`. Destroying the set wakes
+its waiter with `Interrupted`. See
+[syscalls.md § `SYS_WAIT_SET_WAIT`](../core/kernel/docs/syscalls.md#sys_wait_set_wait-28).
 
 ---
 
@@ -175,17 +182,16 @@ Capabilities passed in IPC messages are moved, not copied; see
 
 ## Fault Delivery
 
-Under the fault-handler protocol ([Fault Handling](fault-handling.md)), a userspace thread
-fault the kernel cannot resolve is delivered to the thread's bound fault-handler endpoint as
-a kernel-originated synchronous message, suspending the thread until the handler replies —
-resuming it, or killing it on `FAULT_REPLY_KILL` — or the binding is severed and the thread
-is killed (severing by clearing the binding mid-fault: design intent; not yet implemented,
-#242). This reuses the call/reply machinery above — the suspended thread occupies the
-caller's role and the handler services it with the ordinary receive/reply cycle. The
-guarantee does not hold for a fault-blocked thread displaced by a later receive on its handler
-while its reply is still pending, as
-[§ The Call/Reply Model](#the-callreply-model) describes
-([#443](https://github.com/kottlerg/seraph/issues/443)). See [Fault Handling](fault-handling.md).
+Under the fault-handler protocol ([Fault Handling](fault-handling.md)), a userspace thread fault the
+kernel cannot resolve is delivered to the thread's bound fault-handler endpoint as a
+kernel-originated synchronous message, suspending the thread until the handler replies — resuming
+it, or killing it on `FAULT_REPLY_KILL` — or the binding is severed and the thread is killed
+(severing by clearing the binding mid-fault: design intent; not yet implemented, #242); a stop of
+the thread defers this (before any reply claims the fault it cancels the episode; after a reply
+claims it, that reply's disposition stands), and the thread is resumed or killed only if it is
+started again. This reuses the call/reply machinery above —
+the suspended thread occupies the caller's role and the handler services it with the ordinary
+receive/reply cycle. See [Fault Handling](fault-handling.md).
 
 ---
 
@@ -222,9 +228,10 @@ shared/ipc policy block.
 
 ## Kernel Role
 
-The kernel delivers messages, manages endpoint queuing, and transfers capability
-references all-or-nothing with messages (see § Message Format). It has no opinion on
-message content, service protocols, or what capabilities mean to the receiving process.
+The kernel delivers messages, manages endpoint queuing and the waiters of notifications, event
+queues, and wait sets, and transfers capability references all-or-nothing with messages (see
+§ Message Format). It has no opinion on message content, service protocols, or what capabilities
+mean to the receiving process.
 
 The kernel does not provide:
 - Service discovery — endpoint capabilities are delegated by init or a parent
@@ -235,13 +242,15 @@ The kernel does not provide:
 
 ## Summarized By
 
+[core/kernel/README.md](../core/kernel/README.md),
 [Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [IPC Subsystem Internals](../core/kernel/docs/ipc-internals.md),
 [SMP Scheduling and Locking Invariants](../core/kernel/docs/scheduling-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [Thread Lifecycle and Sleep List Invariants](../core/kernel/docs/thread-lifecycle-and-sleep.md),
+[core/ktest/README.md](../core/ktest/README.md),
 [Architecture Overview](architecture.md), [Capability Model](capability-model.md),
-[Fault Handling](fault-handling.md), [Process Lifecycle](process-lifecycle.md),
+[Fault Handling](fault-handling.md),
 [programs/capexhaust/README.md](../programs/capexhaust/README.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
 [shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md)

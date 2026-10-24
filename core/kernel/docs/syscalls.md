@@ -207,10 +207,18 @@ pub enum SyscallError
     QueueFull = -13,
     // -14 retired (`DmaUnsafe`, removed with `SYS_DMA_GRANT`); never reuse.
     /// The target object is not in the required state for this operation
-    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
+    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`, or a wait set
+    /// another thread already waits on).
     InvalidState = -15,
-    /// A blocking operation was cancelled because the thread was stopped.
-    /// The stopped thread sees this as the return value of its blocked syscall.
+    /// A blocking operation was cancelled: the thread was stopped, the object
+    /// it was blocked on was destroyed, or, for a call, the server received
+    /// again, or was destroyed, before replying. The thread sees this as the
+    /// return value of its blocked syscall. `SYS_THREAD_START` also returns it
+    /// when its caller is stopped while the start waits for the target to
+    /// settle (nothing is started). Batched capability operations (revoke,
+    /// delete, move, a range split) also return it at their liveness backstop;
+    /// each syscall's entry in core/kernel/docs/syscalls.md gives the state the
+    /// backstop leaves.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
     /// directory is full). Unlike `OutOfMemory`, donating memory (augment
@@ -263,10 +271,13 @@ pointer is dereferenced (see [ipc-design.md](../../../docs/ipc-design.md) § Mes
 when the message carries capabilities.
 
 **Errors:** `InvalidCapability` (also: a cap slot is stale or Null),
-`InsufficientRights`, `InvalidArgument` (bad count, a cap slot repeated in one
-message, or `data_count` > 0 with no IPC buffer page registered),
+`InsufficientRights`, `InvalidArgument` (a cap slot repeated in one message, or
+`data_count` > 0 with no IPC buffer page registered; a `data_count` or `cap_count` above
+its maximum is clamped, not refused),
 `InvalidAddress` (registered IPC buffer page unmapped), `InvalidState` (a cap
-slot is pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), `Interrupted`. Cap-slot
+slot is pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), `Interrupted` (the call was
+cancelled while blocked, including by the receiving thread receiving again before it replied; see
+`SYS_IPC_RECV`). Cap-slot
 problems are rejected before the caller blocks; a refusal that arises only
 afterwards degrades to delivery with zero caps (the caller keeps its
 capabilities; see [ipc-design.md](../../../docs/ipc-design.md) § Message Format).
@@ -321,7 +332,9 @@ stale), `InvalidArgument` (also: a cap slot repeated in one reply, or
 (registered IPC buffer page unmapped), `InvalidState` (a reply cap slot is
 pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), `QuotaExceeded` (caller's CSpace
 directory structurally full for reply cap transfer), `OutOfMemory`
-(slot-page pool exhausted), `Interrupted`. Every payload or cap failure while
+(slot-page pool exhausted); a `data_count` or `cap_count` above its maximum is clamped, not
+refused, and the call never blocks, so it never returns `Interrupted`. Every payload or cap
+failure while
 a caller is pending — the data-path errors above included — consumes the
 pending reply and wakes the caller with the `IPC_REPLY_TRANSFER_FAILED` label
 and zero caps while the server receives the error (see
@@ -351,10 +364,12 @@ Wait for a call on an endpoint. Blocks until a caller arrives.
 The message's data words are written to the receiver's registered IPC buffer page, followed by the
 cap-transfer result block (count, then the delivered destination handles) at word offset
 `MSG_DATA_WORDS_MAX`. The kernel binds the caller to the receiving thread as its reply capability
-(the per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly. A receive that
-delivers a message while a reply is still pending overwrites the binding; the displaced caller is
-outside the guarantees of this document ([ipc-design.md](../../../docs/ipc-design.md) § The
-Call/Reply Model, [#443](https://github.com/kottlerg/seraph/issues/443)).
+(the per-thread `reply_tcb` field); `SYS_IPC_REPLY` consumes this binding implicitly. A receive
+that passes its capability check and cap-slot pre-allocation while a reply is still pending first
+releases the pending caller (a receive refused before then leaves the binding): its
+`SYS_IPC_CALL` returns `Interrupted`, and a fault-blocked caller is killed as for any cancelled
+fault episode. The binding is therefore never overwritten
+([ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model).
 
 For a call, the badge is the value attached to the sender's endpoint capability via
 `SYS_CAP_DERIVE_BADGE`; it identifies the caller without a forgeable PID. For a
@@ -376,8 +391,10 @@ still delivered — with zero caps; the sender keeps its capabilities (see
 
 ### `SYS_NOTIFICATION_SEND` (3)
 
-OR bits into a notification object. Non-blocking; wakes the waiter if one is present
-(see [ipc-design.md](../../../docs/ipc-design.md) § Notifications).
+OR bits into a notification object. Non-blocking; if threads are waiting and pending bits
+remain when the send claims them, wakes the longest-waiting one with every pending bit. A send
+whose bits an arriving wait or a concurrent send already took wakes no waiter (see
+`SYS_NOTIFICATION_WAIT` and [ipc-design.md](../../../docs/ipc-design.md) § Notifications).
 
 **Arguments:**
 
@@ -405,16 +422,14 @@ entire bitmask (see [ipc-design.md](../../../docs/ipc-design.md) § Notification
 | # | Name | Description |
 |---|---|---|
 | 0 | `notification_cap` | Notification capability with Wait rights |
-| 1 | `timeout_ms` | `0` = block indefinitely; `>0` = wake after at most `timeout_ms` ms |
+| 1 | `timeout_ms` | `0` = block indefinitely; `>0` = wake after at most `timeout_ms` ms; a wait that finds the kernel's sleep list full times out at once, returning `0` bits ([thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants), invariant 4) |
 
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: acquired bitmask on success (non-zero on notification wake,
-  because `notification_send` rejects zero-bit sends; `0` when the timeout
-  elapses, or when the notification is destroyed while the caller waits, which
-  returns success with no `Interrupted` stamp, even with `timeout_ms` = `0`;
-  #443)
+  because `notification_send` rejects zero-bit sends; `0` when the wait
+  times out: the timeout elapsed, or the sleep list was full when it parked)
 
 Same register layout as `SYS_EVENT_RECV`. The split avoids aliasing
 bit-63-set bitmasks with the dispatcher's negative-Err encoding, so the
@@ -422,7 +437,12 @@ full 64-bit bitmask range is usable.
 
 **Capability requirement:** `notification_cap` must have Wait rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights`, `Interrupted`.
+**Errors:** `InvalidCapability`, `InsufficientRights`, `Interrupted` (the caller was stopped, or the
+notification was destroyed while the caller waited).
+
+Several threads may wait on one notification. They queue in arrival order, and each delivery wakes
+the longest-waiting one with every pending bit. A wait that enters while bits are pending takes
+them at once, ahead of any queued waiter.
 
 ---
 
@@ -463,27 +483,29 @@ Dequeue the next entry from an event queue with optional bounded wait.
 |-------------------|-----------------------------------------------------------------|
 | `0`               | Block forever until a post arrives                              |
 | `u64::MAX`        | Non-blocking try-once; return `WouldBlock` if empty             |
-| `1 ..= MAX-1`     | Block until post arrives or `timeout_ms` ms elapse              |
+| `1 ..= MAX-1`     | Block until post arrives or `timeout_ms` ms elapse (`WouldBlock` at once if the kernel's sleep list is full when the wait parks) |
 
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
-- `rdx`/`a1`: dequeued payload word (valid on success); a queue destroyed
-  while the caller is parked returns success with a payload of `0` that was
-  never posted (#443)
+- `rdx`/`a1`: dequeued payload word (valid on success)
 
 **Capability requirement:** `queue_cap` must have Recv rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights`, `WouldBlock`, `Interrupted`.
+**Errors:** `InvalidCapability`, `InsufficientRights`, `WouldBlock`, `Interrupted` (the caller was
+stopped, or the queue was destroyed while the caller was parked).
 
-`WouldBlock` covers both the try-once-empty case and the timer-fired case;
+Blocked receivers queue in arrival order; each post wakes the longest-waiting one.
+
+`WouldBlock` covers both the try-once-empty case and the timer-fired case
+(including the immediate timeout on a full sleep list);
 the caller already knows which mode it asked for. The kernel uses an
 out-of-band marker (`tcb.timed_out`) rather than an in-band
 `wakeup_value` sentinel because event-queue payloads may be any `u64`
 (0 included; see [ipc-internals.md](ipc-internals.md) § Event Queue, Recv Path)
 — contrast `SYS_NOTIFICATION_WAIT`, where a notification wake never carries
 0 bits because `notification_send` rejects zero-bit sends, so a `0` result
-means the timeout elapsed or the notification was destroyed.
+means the wait timed out (the timeout elapsed, or the sleep list was full).
 
 ---
 
@@ -794,9 +816,11 @@ Registry). **The stop includes the caller**: a thread deleting the last capabili
 is stopped by that delete and the call does not return; the object is reclaimed once the thread is
 off its CPU. This path has known kernel memory-safety gaps, tracked in
 [#443](https://github.com/kottlerg/seraph/issues/443) (see
-[ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model and
 [capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage: Hybrid
-Two-Level Radix). The caller's own `Thread` object is treated differently, as below.
+Two-Level Radix and
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
+§ `dealloc_object(Thread)` Drain Protocol, step 11). The caller's own `Thread` object is treated
+differently, as below.
 
 Refused for two cases, both returning `InvalidState` with the capability left in
 place: a thread may not delete the last capability to its **own running**
@@ -1100,7 +1124,16 @@ not virgin, not siblings, or either has children), `InvalidCapability`,
 
 ### `SYS_THREAD_START` (19)
 
-Transition a thread from `Created` state to `Ready` and enqueue it for scheduling.
+Transition a thread from `Created` or `Stopped` state to `Ready` and enqueue it for scheduling.
+Starting a thread whose fault episode a stop cancelled (before any reply claimed it), or whose
+handler's claiming reply was `FAULT_REPLY_KILL`, kills it as an unhandled fault, which posts its
+death and address-space observers (see
+[docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
+Resume, and Kill).
+A stopped thread whose blocked syscall a waker claimed before the stop is restarted only once that
+waker's wake has landed, so the resumed syscall returns the delivered result (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
+Protocol, invariant 4).
 
 **Arguments:**
 
@@ -1113,9 +1146,14 @@ Transition a thread from `Created` state to `Ready` and enqueue it for schedulin
 **Capability requirement:** `thread_cap` must have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
-`InvalidArgument` (thread not in Created/Stopped state — including one that exited or
-was killed by an object teardown between the check and the locked commit — or not yet
-configured).
+`InvalidArgument` (the target is the caller, is not yet configured, or is not in Created/Stopped
+state under the locked commit — including one a concurrent start already resumed, or one that
+exited or was killed by an object teardown after the first check), `Interrupted` (the caller was
+itself stopped while the start waited for the target to leave its CPU or for an owed wake). Each
+stop admits at most one start commit: absent an intervening stop, exactly one of several
+concurrent starts of one stopped thread succeeds. A start that a concurrent `SYS_THREAD_STOP`
+overtakes after its commit succeeds and leaves the thread `Stopped`, and a later start can then
+commit again.
 
 ---
 
@@ -1131,20 +1169,42 @@ Stop a running or runnable thread. The thread transitions to `Stopped` state.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-If the thread is blocked on IPC, the block is cancelled (the blocked syscall on the target thread
-returns `Interrupted`). This does not hold for a caller displaced from a server's pending-reply
-binding: the stop is not memory-safe, and its outcome is in
-[ipc-design.md](../../../docs/ipc-design.md) § The Call/Reply Model
-([#443](https://github.com/kottlerg/seraph/issues/443)). If the thread is running on another CPU, an
-inter-processor interrupt is sent to force it out of userspace (see
+A fault-blocked target's fault episode, unless the handler's reply claimed it first, is cancelled
+with a kill outcome (no syscall returns) and the thread is left `Stopped`; the next
+`SYS_THREAD_START` then kills it as an unhandled fault. A thread whose handler's reply claimed the
+fault first keeps that reply's outcome: when next started it resumes its faulting instruction on
+`FAULT_REPLY_RESUME` and is killed on `FAULT_REPLY_KILL` (see
+[docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
+Resume, and Kill). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
+cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker,
+the sleep timer, or the target's own full-list withdrawal claimed it first). A full-list
+withdrawal is a timed wait or sleep that found the kernel's sleep list full; it reports its timeout
+or `OutOfMemory` (invariant 4 of
+[thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants)).
+A target that blocks while the stop is in progress is
+cancelled the same way, never left registered as a waiter (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
-Protocol).
+Protocol). This does not hold for a stop of a thread waiting on an endpoint (queued to send or
+receive), a notification, an event queue, or a wait set whose last capability is deleted
+concurrently: the cancel can lock the object after it is freed
+([#443](https://github.com/kottlerg/seraph/issues/443) § Source pointer held past its free). A
+thread running on another CPU is marked `Stopped` under every CPU's scheduler lock, and the call
+returns once that CPU has descheduled it and published its register save, at its next slice expiry
+or the thread's own park or yield, or once an object teardown has committed `Exited` over it; the
+inter-processor interrupt sent to that CPU only forces a trap. A caller that is itself stopped while
+it waits deschedules in place; once restarted it re-resolves `thread_cap`, and its call completes
+when the target has left its CPU and published its register save, or at once when that slot no
+longer names the target with Control rights — the target may then still be executing, and
+`SYS_THREAD_READ_REGS` and `SYS_THREAD_WRITE_REGS` refuse it with `InvalidState` until it has left
+its CPU with its save published (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md)
+§ `sys_thread_stop` Cross-CPU Stop Protocol).
 
 **Capability requirement:** `thread_cap` must have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
-`InvalidState` (thread already stopped or exited, including one killed by an object
-teardown concurrently with the call).
+`InvalidState` (thread not yet started, already stopped, or exited when the call reads it,
+including one killed by an object teardown concurrently with the call; two concurrent stops of one
+running thread can both succeed).
 
 ---
 
@@ -1340,11 +1400,23 @@ The buffer receives an architecture-defined register file structure (layout
 published in the kernel ABI headers). If `buf_size` is smaller than the required
 size, the call fails with `InvalidArgument`.
 
+A thread stopped while it runs on another CPU is `Stopped` from the stop's commit, but it executes
+until that CPU deschedules it, so the call refuses it with `InvalidState` until it is `current` on
+no CPU with its last register save published; the access then runs under the target's scheduling
+lock, which every dispatch, start, and stop takes. The stop call that stopped the thread returns
+only once it has left its CPU with its save published (see
+[`SYS_THREAD_STOP`](#sys_thread_stop-20)), except a restarted
+stopper's call whose slot no longer names the target, so a caller that issues this after its own
+stop returns is not refused for this reason. A fault-blocked thread is accessed once it is
+`current` on no CPU with its save published; a call that finds it still switching out waits for
+that switch to finish.
+
 **Capability requirement:** `thread_cap` MUST have Observe rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Observe), `InvalidState`
-(thread neither stopped nor fault-blocked), `InvalidArgument` (buffer too small or
-invalid pointer).
+(thread neither stopped and descheduled nor fault-blocked), `InvalidArgument` (buffer too small,
+null pointer, or no register frame), `InvalidAddress` (buffer outside the user half or not
+writable).
 
 ---
 
@@ -1367,13 +1439,27 @@ reply (`BlockedOnFault`) — the latter lets a bound fault handler advance the P
 or otherwise edit the faulting thread before replying (see
 [`docs/fault-handling.md`](../../../docs/fault-handling.md)). The kernel validates
 that the register values are safe (e.g. the instruction pointer is in a canonical
-range; privilege bits cannot be set).
+range; privilege bits cannot be set). On riscv64 the supplied `sstatus` is applied as given
+(its SPP and SUM bits are not forced), a gap
+[#443](https://github.com/kottlerg/seraph/issues/443) holds.
+
+A thread stopped while it runs on another CPU is `Stopped` from the stop's commit, but it executes
+until that CPU deschedules it, so the call refuses it with `InvalidState` until it is `current` on
+no CPU with its last register save published; the access then runs under the target's scheduling
+lock, which every dispatch, start, and stop takes. The stop call that stopped the thread returns
+only once it has left its CPU with its save published (see
+[`SYS_THREAD_STOP`](#sys_thread_stop-20)), except a restarted
+stopper's call whose slot no longer names the target, so a caller that issues this after its own
+stop returns is not refused for this reason. A fault-blocked thread is accessed once it is
+`current` on no CPU with its save published; a call that finds it still switching out waits for
+that switch to finish.
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control), `InvalidState`
-(thread neither stopped nor fault-blocked), `InvalidArgument` (buffer wrong size, invalid
-pointer, or illegal register values).
+(thread neither stopped and descheduled nor fault-blocked), `InvalidArgument` (buffer too small,
+null pointer, no register frame, or illegal register values), `InvalidAddress` (buffer outside
+the user half or not readable).
 
 ---
 
@@ -1442,7 +1528,9 @@ Block the calling thread for a bounded duration. The timer wakes it at the deadl
 No capability is required — this syscall acts on the calling thread implicitly.
 
 **Errors:** `InvalidCapability` (no current thread), `OutOfMemory` (kernel sleep list at
-capacity), `Interrupted` (the thread was stopped before or during the sleep).
+capacity), `Interrupted` (the thread was stopped before or during the sleep, unless the timer had
+already claimed its elapsed deadline, or the sleep found the sleep list full and withdrew first,
+which returns `OutOfMemory`).
 
 ---
 
@@ -1537,7 +1625,10 @@ are ready simultaneously, subsequent calls return them without blocking (see
 
 **Capability requirement:** `wait_set_cap` must have Wait rights.
 
-**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `Interrupted`.
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Wait), `InvalidState` (another
+thread already waits on the set; the caller does not wait — a wait set takes one waiter at a
+time), `Interrupted` (the caller was stopped, or the wait set was destroyed while the
+caller waited).
 
 ---
 
@@ -1901,11 +1992,11 @@ Translate a user virtual address to its mapped physical address.
 
 ### `SYS_ASPACE_BIND_NOTIFICATION` (53)
 
-Bind a terminal-fault death observer to an address space. When any thread in the space
-faults terminally (no handler bound, or the handler replied KILL), the kernel posts the
-fault reason to the bound event queue. Voluntary `SYS_THREAD_EXIT` does not fire these
-observers (see [capability-model.md](../../../docs/capability-model.md) § "Kill process"
-pattern).
+Bind a terminal-fault death observer to an address space. When any thread in the space faults
+terminally (see [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern
+for the triggers), the kernel posts the fault reason to the bound event queue. Voluntary
+`SYS_THREAD_EXIT` does not fire these observers (see
+[capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern).
 
 **Arguments:**
 
@@ -2154,8 +2245,16 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   § Lock Hierarchy).
 
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
-  `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`) returns
-  `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`.
+  `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`,
+  `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`,
+  unless its wake (a delivery, or a sleep's elapsed deadline) was claimed first, or a timed wait
+  or sleep that found the kernel's sleep list full withdrew itself first (it then reports its
+  timeout or `OutOfMemory`). `SYS_IPC_CALL` and
+  `SYS_IPC_RECV` queued on an endpoint, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
+  `SYS_WAIT_SET_WAIT` also return `Interrupted` when the object waited on is destroyed under the
+  caller, and `SYS_IPC_CALL` returns it when the receiving thread receives again before replying or
+  is destroyed before replying. `SYS_THREAD_START` returns `Interrupted` when its caller is stopped
+  while the start waits for the target to settle; nothing is started.
 
 ---
 
@@ -2179,11 +2278,15 @@ source of truth.
 ## Summarized By
 
 [core/kernel/README.md](../README.md), [Architecture Abstraction Layer](arch-interface.md),
+[Capability Subsystem Internals](capability-internals.md),
 [Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
 [Kernel Entropy Subsystem](entropy.md), [IPC Subsystem Internals](ipc-internals.md),
 [Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
-[IPC Design](../../../docs/ipc-design.md), [Process Lifecycle](../../../docs/process-lifecycle.md),
+[Thread Lifecycle and Sleep List Invariants](thread-lifecycle-and-sleep.md),
+[core/ktest/README.md](../../ktest/README.md),
+[Capability Model](../../../docs/capability-model.md), [IPC Design](../../../docs/ipc-design.md),
+[Process Lifecycle](../../../docs/process-lifecycle.md),
 [Testing](../../../docs/testing.md),
 [services/drivers/serial/README.md](../../../services/drivers/serial/README.md),
 [memmgr Memory Pool](../../../services/memmgr/docs/memory-pool.md),

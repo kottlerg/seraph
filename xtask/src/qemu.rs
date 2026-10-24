@@ -285,8 +285,9 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     // that the kernel's boot gate refuses to run without (explicit `=on`
     // pins against QEMU default drift). RVA23 also mandates Zfa, Zfhmin,
     // Zihintntl, Zicond, Zimop, Zcmop, Zcb, Zvfhmin, Zvbb, Zvkt, Zkt — those
-    // land as QEMU coverage broadens. A future bump should switch to
-    // `-cpu rva23s64` once the floor QEMU version on CI hosts is >= 9.1.
+    // land as QEMU coverage broadens. The explicit string is kept rather
+    // than `-cpu rva23s64` (QEMU >= 9.1) because it also runs on the QEMU
+    // 8.0 minimum (docs/build-system.md § QEMU and Firmware).
     //
     // The trailing satp-mode properties (`RiscvMmu::cpu_satp_props`) pin the
     // paging-mode ceiling the guest advertises via DTB `mmu-type`.

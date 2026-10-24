@@ -60,18 +60,27 @@ jobs:
       - name: Install QEMU and firmware
         run: |
           sudo apt-get update
+          # Ubuntu 26.04 ships the riscv64 system emulator in its own
+          # package, qemu-system-riscv, no longer in qemu-system-misc; older
+          # images have no such package and keep it in qemu-system-misc.
+          riscv=""
+          if apt-cache show qemu-system-riscv >/dev/null 2>&1; then
+            riscv=qemu-system-riscv
+          fi
           sudo apt-get install -y \
             qemu-system-x86 \
             qemu-system-misc \
+            $riscv \
             ovmf \
             qemu-efi-riscv64
 
       - name: Log QEMU versions
         # Seraph requires QEMU ≥ 8.0 (RISC-V V extension support). The
         # explicit `-cpu rv64,v=true,...` invocation in `xtask/src/qemu.rs`
-        # works on every supported version; `-cpu rva23s64` becomes usable
-        # at QEMU ≥ 9.1 and is the preferred form once CI runners ship it.
+        # works on every supported version; `-cpu rva23s64` is usable from
+        # QEMU 9.1, and the CI runners ship QEMU 10.2.1.
         run: |
+          set -o pipefail
           qemu-system-x86_64 --version | head -n1
           qemu-system-riscv64 --version | head -n1
 

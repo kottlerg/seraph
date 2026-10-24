@@ -2664,7 +2664,8 @@ pub unsafe fn exit_under_all_locks(tcb: *mut ThreadControlBlock, exit_reason: u6
 /// parked (or was rebound) after the snapshot advanced `park_seq`, so the
 /// pass is retried and that park is cancelled too: the commit never writes
 /// over a live park (one it did not cancel was already claimed by a waker,
-/// whose late wake aborts on the committed state). See
+/// whose late wake aborts on the committed state, or by a concurrent
+/// cancel). See
 /// docs/thread-lifecycle-and-sleep.md
 /// § `sys_thread_stop` Cross-CPU Stop Protocol.
 ///

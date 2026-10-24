@@ -778,7 +778,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let ep = blocked_on.cast::<EndpointState>();
-                // SAFETY: blocked_on was the snapshotted binding to a EndpointState;
+                // SAFETY: blocked_on was the snapshotted binding to an EndpointState;
                 // nothing pins the source across the snapshot, a gap
                 // #443 § Source pointer held past its free records.
                 unsafe {
@@ -797,9 +797,10 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
             // unlink means a racing endpoint_recv dequeued us, and its rebind
             // chain (a handler reply, or its teardown) owns the episode and
             // writes the disposition, or the endpoint's dealloc drain or a
-            // concurrent cancel already claimed and stamped it; a KILL stored
-            // here would overwrite a handler's RESUME. The retry pass cancels
-            // the rebound park.
+            // concurrent cancel already claimed and stamped it, or the
+            // thread's own dealloc_object(Thread) unlinked it as it dies; a
+            // KILL stored here would overwrite a handler's RESUME. The retry
+            // pass cancels the rebound park.
             // SAFETY: tcb valid; fault_outcome / in_fault_delivery always valid.
             if unsafe { (*tcb).in_fault_delivery }
             {
@@ -824,7 +825,8 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // sole depositor). A stopped sys_ipc_call caller resumes via
                 // the disposition; a lost unlink hands the episode to the
                 // racing rebind chain, the endpoint's dealloc drain, or a
-                // concurrent cancel that already claimed it.
+                // concurrent cancel that already claimed it, or the thread's
+                // own dealloc_object(Thread) unlinked it as it dies.
                 // SAFETY: tcb valid; claim won per the comment above.
                 unsafe {
                     crate::sched::thread::stamp_park_deposit(
@@ -842,7 +844,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let ep = blocked_on.cast::<EndpointState>();
-                // SAFETY: blocked_on was the snapshotted binding to a EndpointState;
+                // SAFETY: blocked_on was the snapshotted binding to an EndpointState;
                 // nothing pins the source across the snapshot, a gap
                 // #443 § Source pointer held past its free records.
                 unsafe {
@@ -852,7 +854,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // this the episode's sole depositor). A lost unlink means a
                     // caller already deposited into ipc_msg, whose delivery stands
                     // and the resume publishes (fail-open), or the endpoint's
-                    // dealloc drain or a concurrent cancel already claimed the park.
+                    // dealloc drain or a concurrent cancel already claimed the
+                    // park, or the thread's own dealloc_object(Thread) unlinked
+                    // it as it dies.
                     if same_park(tcb)
                         && unlink_from_wait_queue(tcb, &mut (*ep).recv_head, &mut (*ep).recv_tail)
                     {
@@ -1029,7 +1033,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let eq = blocked_on.cast::<EventQueueState>();
-                // SAFETY: blocked_on was the snapshotted binding to a EventQueueState;
+                // SAFETY: blocked_on was the snapshotted binding to an EventQueueState;
                 // nothing pins the source across the snapshot, a gap
                 // #443 § Source pointer held past its free records.
                 unsafe {

@@ -434,33 +434,39 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
         Err(crate::sched::SleepAddError::Full) =>
         {
-            // Sleep list at capacity. Roll back the Blocked commit:
-            // sys_thread_sleep has no IPC source to fall back on; the only
-            // honest answer is to surface the failure to userspace. See
-            // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants. No
-            // waker targets a plain sleeper, so the thread is still Blocked
-            // unless a canceller won (it then commits Stopped or Exited over
-            // the restored Running); restore Running under sched_lock.
-            // The successful commit_blocked above cleared context_saved = 0;
-            // this rollback leaves the thread Running with cs = 0, which is
-            // intentional and benign — cs = 0 truthfully means "live registers
+            // Sleep list at capacity: withdraw the park. sys_thread_sleep has
+            // no IPC source to fall back on, so the honest answer is to
+            // surface the failure (docs/thread-lifecycle-and-sleep.md § Sleep
+            // List Invariants). The withdrawal is the claim a cancel makes,
+            // sleep_list_remove under sched_lock, true while the deadline is
+            // still pending: winning it means no stop or teardown claimed the
+            // park, so restore Running and report OutOfMemory (a later stop
+            // commits over the restored Running). Losing it means one did and
+            // stamped the park INTERRUPTED; fall through to schedule() as the
+            // Ok path does, and the resume consumes the stamp.
+            // A won withdrawal leaves the thread Running with cs = 0 (the
+            // commit_blocked above cleared context_saved), which is
+            // intentional and benign: cs = 0 truthfully means "live registers
             // authoritative" for a still-`current`, never-switched-out thread,
             // no path dispatches a not-linked `current` thread cross-CPU, and
             // the next switch-out republishes cs = 1. Do NOT "restore" cs = 1
             // here.
-            // SAFETY: tcb valid; restoring before any schedule().
-            unsafe {
+            // SAFETY: tcb valid; SLEEP_LIST_LOCK is a leaf under sched_lock;
+            // restoring before any schedule().
+            let withdrawn = unsafe {
                 let saved = (*tcb).sched_lock.lock_raw();
-                if (*tcb).state == crate::sched::thread::ThreadState::Blocked
+                let won = crate::sched::sleep_list_remove(tcb);
+                if won && (*tcb).state == crate::sched::thread::ThreadState::Blocked
                 {
                     (*tcb).state = crate::sched::thread::ThreadState::Running;
                 }
-                (*tcb)
-                    .sleep_deadline
-                    .store(0, core::sync::atomic::Ordering::Relaxed);
                 (*tcb).sched_lock.unlock_raw(saved);
+                won
+            };
+            if withdrawn
+            {
+                return Err(SyscallError::OutOfMemory);
             }
-            return Err(SyscallError::OutOfMemory);
         }
     }
 

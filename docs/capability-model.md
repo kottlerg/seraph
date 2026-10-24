@@ -705,7 +705,7 @@ cancelled by destruction of the handler thread (deletion of its last Thread capa
 destruction of the handler endpoint while the fault is still queued on it, or by a later receive on
 the handler thread that passes its capability and headroom checks while the fault reply is pending;
 a stop of the faulting thread defers the terminal fault — before any reply claims the fault it
-cancels the episode, after a `KILL` reply has claimed it, that disposition stands — and the terminal
+cancels the episode; after a `KILL` reply has claimed it, that disposition stands — and the terminal
 fault takes effect, and is posted, only if the thread is started again; see
 [Fault Handling](fault-handling.md#delivery-resume-and-kill)), the kernel posts the fault class
 (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on riscv64) to each bound observer

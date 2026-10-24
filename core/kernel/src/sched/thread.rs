@@ -452,7 +452,8 @@ pub struct ThreadControlBlock
     /// (`commit_blocked_under_local_lock`, `commit_reply_rebind_under_local_lock`).
     /// A stop or teardown snapshots it with `state`, cancels the park it saw,
     /// and commits only if it is unchanged, so it never writes `Stopped` or
-    /// `Exited` over a park it did not cancel (docs/thread-lifecycle-and-sleep.md
+    /// `Exited` over a live park: one it did not cancel was already claimed by
+    /// a waker or a concurrent cancel (docs/thread-lifecycle-and-sleep.md
     /// § `sys_thread_stop` Cross-CPU Stop Protocol). The timer snapshots it at a
     /// sleep-list pop and claims only the park it popped (§ Sleep List
     /// Invariants). Atomic (Relaxed) because the timer reads it under

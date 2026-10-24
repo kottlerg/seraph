@@ -778,7 +778,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let ep = blocked_on.cast::<EndpointState>();
-                // SAFETY: blocked_on is a valid EndpointState ptr.
+                // SAFETY: blocked_on was the snapshotted binding to a EndpointState;
+                // nothing pins the source across the snapshot, a gap
+                // #443 § Source pointer held past its free records.
                 unsafe {
                     let saved = (*ep).lock.lock_raw();
                     unlinked = same_park(tcb)
@@ -840,7 +842,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let ep = blocked_on.cast::<EndpointState>();
-                // SAFETY: blocked_on is a valid EndpointState ptr.
+                // SAFETY: blocked_on was the snapshotted binding to a EndpointState;
+                // nothing pins the source across the snapshot, a gap
+                // #443 § Source pointer held past its free records.
                 unsafe {
                     let saved = (*ep).lock.lock_raw();
                     // Claim = the recv-queue unlink under ep.lock (endpoint_call
@@ -983,7 +987,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let sig = blocked_on.cast::<NotificationState>();
-                // SAFETY: blocked_on is a valid NotificationState ptr.
+                // SAFETY: blocked_on was the snapshotted binding to a NotificationState;
+                // nothing pins the source across the snapshot, a gap
+                // #443 § Source pointer held past its free records.
                 unsafe {
                     let saved = (*sig).lock.lock_raw();
                     // Claim = the removal from the waiter queue under sig.lock
@@ -1023,7 +1029,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let eq = blocked_on.cast::<EventQueueState>();
-                // SAFETY: blocked_on is a valid EventQueueState ptr.
+                // SAFETY: blocked_on was the snapshotted binding to a EventQueueState;
+                // nothing pins the source across the snapshot, a gap
+                // #443 § Source pointer held past its free records.
                 unsafe {
                     let saved = (*eq).lock.lock_raw();
                     // Claim = the removal from the waiter queue under eq.lock; a
@@ -1058,7 +1066,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let ws = blocked_on.cast::<WaitSetState>();
-                // SAFETY: blocked_on is a valid WaitSetState ptr.
+                // SAFETY: blocked_on was the snapshotted binding to a WaitSetState;
+                // nothing pins the source across the snapshot, a gap
+                // #443 § Source pointer held past its free records.
                 unsafe {
                     let saved = (*ws).lock.lock_raw();
                     // Claim = the removal from the waiter queue under ws.lock;

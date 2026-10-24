@@ -410,7 +410,8 @@ empty (size 0, no allocated cluster).
 
 **Errors**: `INVALID_BADGE`, `EXISTS` (the dispatch may currently
 surface `NO_SPACE` for duplicate names — to be tightened),
-`NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`.
+`NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`, `TOO_MANY_OPEN` (the
+driver's node table is full; the entry was created).
 
 ---
 
@@ -483,15 +484,13 @@ intent; not yet implemented). Tracked as
 
 `FS_RENAME` is not atomic — see
 [`services/fs/fat/docs/crash-safety.md`](../fat/docs/crash-safety.md)
-for the post-crash visible states. If the source's removal fails after the
-destination was inserted, the server checks the source's 8.3 entry, which
-owns the chain. While it is still live, the server removes the destination
-again and replies with the error: the source is present, the destination
-gone, unless that undo also fails, which leaves both names (the
-duplicate-entry state crash-safety.md describes). If the removal had
-already deleted it, the destination is the file's only entry and the
-rename replies `SUCCESS`. If the entry cannot be read, the server replies
-with the error and keeps both names.
+for the post-crash visible states. The same states are reachable without a
+crash: if the source's removal fails after the destination was inserted, the
+server replies with the error and does not undo the insert, so both names
+can remain (the duplicate-entry state), or a long-named source whose
+long-name slots were already cleared remains only under its 8.3 alias.
+Rollback of a failed rename is tracked in
+[#447](https://github.com/kottlerg/seraph/issues/447).
 
 **Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination
 occupied; fatfs currently surfaces `NO_SPACE` for it, as for `FS_CREATE`,

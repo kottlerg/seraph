@@ -86,10 +86,12 @@ claims against concurrent IPC sources via the relevant source IPC lock (Notifica
 3. **An entry and its deadline go together.** `sleep_deadline` is set by the parker before
    `sleep_list_add`. Once added it is cleared only under `SLEEP_LIST_LOCK`, together with the entry:
    by the timer pop, or by `sleep_list_remove`, which removes every entry for the TCB and returns
-   whether the deadline was still non-zero. The one other clear is the parker's own rollback of a
-   deadline it never listed: `sys_thread_sleep` after a refused park commit (no lock) or a full list
-   (under its `sched_lock`), and `arm_timed_park` (the timed `notification_wait` /
-   `event_queue_recv` arm) after a full list (under the source lock). `sleep_list_add` refuses
+   whether the deadline was still non-zero. `sys_thread_sleep` withdraws a park the full list
+   refused through that same `sleep_list_remove`, under its `sched_lock`: the claim a cancel makes,
+   so only one of them sees the deadline non-zero. The one other clear is the parker's own rollback
+   of a deadline it never listed: `sys_thread_sleep` after a refused park commit (no lock), and
+   `arm_timed_park` (the timed `notification_wait` / `event_queue_recv` arm) after a full list
+   (under the source lock). `sleep_list_add` refuses
    (`SleepAddError::Cancelled`) a TCB whose deadline is already 0 under the lock — a cancellation
    landed between the park commit and the add — and never lists a TCB twice (a second add keeps
    the one entry, debug-asserted). So no entry outlives its park, and one `sleep_list_remove`

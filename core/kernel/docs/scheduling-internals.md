@@ -202,7 +202,9 @@ hang). See § Thread Registry.
    cleared under `sched_lock` only when this cancel won the claim and the binding's `ipc_state` and
    `park_seq` still match the snapshot. After a lost claim the party that won clears it: a waker
    in `enqueue_and_wake`, a concurrent cancel in its own tail, or the target's own
-   `dealloc_object(Thread)` drain (step 12) for a dying thread it unlinked. The
+   `dealloc_object(Thread)` drain, step 12 of
+   [thread-lifecycle-and-sleep.md § `dealloc_object(Thread)` Drain Protocol](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
+   (for a dying thread it unlinked). The
    dealloc paths in `core/kernel/src/cap/object.rs` (Endpoint, Notification, EventQueue, WaitSet,
    and Thread arms) follow the same source-lock rule. **The `BlockedOnReply`/`BlockedOnFault` reply
    binding is the exception with no source lock: its `server.reply_tcb` CAS dereferences the

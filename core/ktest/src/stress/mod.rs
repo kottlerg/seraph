@@ -38,6 +38,7 @@ mod load_balance_handoff_steal;
 mod mutual_stop;
 mod priority_dealloc_race;
 mod retype_concurrent;
+mod sleep_list_full;
 mod split_delete_race;
 mod stop_claimed_delete;
 mod stop_fault_sender;
@@ -98,6 +99,7 @@ pub fn run_all(ctx: &TestContext)
         configure_start_race::run(ctx)
     );
     run_integration_test!("stress::stop_sleep_window", stop_sleep_window::run(ctx));
+    run_integration_test!("stress::sleep_list_full", sleep_list_full::run(ctx));
     run_integration_test!("stress::stop_park_race", stop_park_race::run(ctx));
     run_integration_test!("stress::stop_owed_wake", stop_owed_wake::run(ctx));
     run_integration_test!("stress::stop_fault_sender", stop_fault_sender::run(ctx));

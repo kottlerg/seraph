@@ -433,6 +433,12 @@ Unlink a file or empty directory. Badge = parent-directory cap with
 than `.` and `..`), `IO_ERROR`, `PERMISSION_DENIED`, `INVALID_BADGE`
 (the badge is not a directory node).
 
+`FS_REMOVE` is not atomic either: an error reply can leave any of
+[`crash-safety.md`](../fat/docs/crash-safety.md)'s `FS_REMOVE` states.
+Once the driver's cached view shows the entry deleted, it drops the
+entry's node, so caps held on it reply `INVALID_BADGE`
+([#447](https://github.com/kottlerg/seraph/issues/447)).
+
 ---
 
 ## Label 15: `FS_MKDIR`
@@ -484,14 +490,10 @@ intent; not yet implemented). Tracked as
 
 `FS_RENAME` is not atomic — see
 [`services/fs/fat/docs/crash-safety.md`](../fat/docs/crash-safety.md)
-for the post-crash visible states. The same states are reachable without a
-crash: if the source's removal fails after the destination was inserted, the
-server replies with the error and does not undo the insert. After an error
-reply the directory can hold any of crash-safety.md's `FS_RENAME` states:
-both names (the duplicate-entry state), a long-named source only under its
-8.3 alias once its long-name slots were cleared, or only the destination if
-the source's 8.3 entry was already deleted (the rename took effect).
-Rollback of a failed rename is tracked in
+for the post-crash visible states. The server does not roll a failed rename
+back, so an error reply can leave any of those states too, and the driver's
+cached view of the directory can differ from the disk until the page is
+written back or evicted. Rollback of a failed rename is tracked in
 [#447](https://github.com/kottlerg/seraph/issues/447).
 
 **Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination

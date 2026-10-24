@@ -486,9 +486,11 @@ intent; not yet implemented). Tracked as
 [`services/fs/fat/docs/crash-safety.md`](../fat/docs/crash-safety.md)
 for the post-crash visible states. The same states are reachable without a
 crash: if the source's removal fails after the destination was inserted, the
-server replies with the error and does not undo the insert, so both names
-can remain (the duplicate-entry state), or a long-named source whose
-long-name slots were already cleared remains only under its 8.3 alias.
+server replies with the error and does not undo the insert. After an error
+reply the directory can hold any of crash-safety.md's `FS_RENAME` states:
+both names (the duplicate-entry state), a long-named source only under its
+8.3 alias once its long-name slots were cleared, or only the destination if
+the source's 8.3 entry was already deleted (the rename took effect).
 Rollback of a failed rename is tracked in
 [#447](https://github.com/kottlerg/seraph/issues/447).
 

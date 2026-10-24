@@ -604,8 +604,10 @@ invariants common with the global wake protocol (`RESCHEDULE_PENDING`, `non_empt
    sched_lock (a refusal rolls back the deadline and returns: RefusedWake →
    Ok(0), RefusedStop → deschedule, then Interrupted).
 4. sleep_list_add(tcb): Ok, or Cancelled (a canceller already cleared the
-   deadline and stamped the park; proceed to schedule), or Full (restore
-   Running under sched_lock, clear the deadline, return OutOfMemory).
+   deadline and stamped the park; proceed to schedule), or Full (withdraw
+   under sched_lock with sleep_list_remove: a true return restores Running
+   and returns OutOfMemory; false means a canceller claimed the park and
+   stamped it, so proceed to schedule).
 5. schedule(false).
 6. On resume: the syscall consumes the park disposition (Ok(0) on a timer
    wake, Interrupted on a cancel).
@@ -628,12 +630,15 @@ Episodes.
    stamps the park `INTERRUPTED`, so the restarted sleeper returns `Interrupted` instead of
    reporting the truncated sleep as success. It covers the window between step 3 and step 4: the
    entry is not listed yet, the remove clears the deadline, and step 4's add refuses with
-   `Cancelled`, so no entry is left behind for a thread the stop has cancelled. Holding `sched_lock`
-   keeps the park from changing under the remove, so a cancel never claims a later park. A `false`
-   return means another claimant took the episode first, and the restarted sleeper returns what that
-   claimant deposited: the timer's pop (its wake aborted by `enqueue_and_wake` if the stop commits
-   first) deposits nothing, so the sleeper returns `Ok`, honest for a deadline that elapsed; a
-   concurrent canceller stamped `INTERRUPTED`. A stop that wins against the park commit
+   `Cancelled`, so no entry is left behind for a thread the stop has cancelled; when the add finds
+   the list full instead, the sleeper withdraws the park with the same `sleep_list_remove` under
+   `sched_lock`, so the cancel's claim and the withdrawal exclude each other, and a sleeper whose
+   park a cancel claimed deschedules and returns `Interrupted` rather than `OutOfMemory`. Holding
+   `sched_lock` keeps the park from changing under the remove, so a cancel never claims a later
+   park. A `false` return means another claimant took the episode first, and the restarted sleeper
+   returns what that claimant deposited: the timer's pop (its wake aborted by `enqueue_and_wake` if
+   the stop commits first) deposits nothing, so the sleeper returns `Ok`, honest for a deadline that
+   elapsed; a concurrent canceller stamped `INTERRUPTED`. A stop that wins against the park commit
    (`ParkCommit::RefusedStop`) makes `sys_thread_sleep` deschedule in place and return `Interrupted`
    directly.
 
@@ -672,16 +677,15 @@ The handler then drains the target.
       unlocked check; `commit_stopped` surfaces the refusal as `InvalidState` (table row
       `sys_thread_stop (Created or Exited or Stopped)`).
 
-   So `Stopped` is never written over a live park: every park the commit lands on was cancelled
-   by this stop or already claimed by a waker, so a stop never leaves a `Stopped` thread
-   registered as a source's waiter or on the sleep list. The object-teardown stop
+   So `Stopped` is never written over a live park: every park the commit lands on was cancelled by
+   this stop or a concurrent one, or already claimed by a waker, so a stop never leaves a `Stopped`
+   thread registered as a source's waiter or on the sleep list. The object-teardown stop
    (`stop_threads_bound_to`) commits `Exited` through the same loop. A park that a waker claimed
    first (removed from the queue, `wake_in_flight = 1`) is not cancelled; the stop commits over it
    and the waker's later `enqueue_and_wake` aborts on `Stopped`, clearing the park binding it owns
-   and leaving the deposit for the resume (invariant 4). Until that wake lands the `Stopped`
-   thread still carries the binding; `dealloc_object(Thread)` waits out the pin before it frees
-   the thread, but its drain step 11 reads the binding first (#443 § Source pointer held past its
-   free).
+   and leaving the deposit for the resume (invariant 4). Until that wake lands the `Stopped` thread
+   still carries the binding; `dealloc_object(Thread)` waits out the pin before it frees the thread,
+   but its drain step 11 reads the binding first (#443 § Source pointer held past its free).
 3. **Self-stop fast path.** If the target is the calling thread, call `schedule(false)` immediately.
    The skip-loop in `schedule()` never re-enqueues a `Stopped` TCB.
 4. **Cross-CPU drain.** If `running_on = Some(run_cpu)` and `run_cpu != current_cpu`:

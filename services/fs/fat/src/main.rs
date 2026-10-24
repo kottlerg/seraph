@@ -1534,6 +1534,12 @@ fn handle_remove_node_cap(
         Ok(r) => r,
         Err(e) =>
         {
+            // A failed removal may already have marked the 8.3 slot; drop
+            // its node then too, as below.
+            if slot_deleted_in_cache(removed_loc, cache, block_dev, ipc_buf)
+            {
+                nodes.invalidate_for_loc(removed_loc);
+            }
             reply_err(fat_error_to_wire(e), ipc_buf);
             return;
         }
@@ -1541,6 +1547,7 @@ fn handle_remove_node_cap(
 
     if let Err(e) = free_entry_data(state, &removed, cache, block_dev, ipc_buf)
     {
+        nodes.invalidate_for_loc(removed_loc);
         reply_err(fat_error_to_wire(e), ipc_buf);
         return;
     }
@@ -1555,6 +1562,23 @@ fn handle_remove_node_cap(
     let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Whether the cached copy of the directory slot at `loc` carries the `0xE5`
+/// deleted marker. A cached node for a slot must be dropped once the cache
+/// shows it deleted, because a later `FS_CREATE` picks free slots from the
+/// same cached view and would otherwise dedupe to the stale `NodeId`. A
+/// sector that cannot be read counts as not deleted.
+fn slot_deleted_in_cache(
+    loc: dir::DirEntryLocation,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let mut buf = Box::new([0u8; SECTOR_SIZE]);
+    cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
+        && buf[loc.offset_in_sector] == 0xE5
 }
 
 /// `FS_RENAME`: rename an entry within a single directory.
@@ -1645,7 +1669,13 @@ fn handle_rename_node_cap(
     if let Err(e) = remove_entry(state, parent_cluster, src_name, cache, block_dev, ipc_buf)
     {
         // No rollback: the destination stays inserted, so an error here can
-        // leave both names (fs-driver-protocol.md § Label 16; #447).
+        // leave both names (fs-driver-protocol.md § Label 16; #447). A
+        // failed removal may already have marked the source's 8.3 slot;
+        // drop its node then, as on success.
+        if slot_deleted_in_cache(src_loc, cache, block_dev, ipc_buf)
+        {
+            nodes.invalidate_for_loc(src_loc);
+        }
         reply_err(fat_error_to_wire(e), ipc_buf);
         return;
     }

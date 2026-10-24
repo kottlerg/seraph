@@ -59,9 +59,9 @@ use crate::{ChildStack, TestContext, run_integration_test};
 /// Number of shared child stacks, and so the maximum concurrent child threads
 /// of every stress cell that draws from [`STRESS_STACKS`].
 /// `sleep_list_full`, which needs one sleeper per sleep-list slot
-/// (`MAX_SLEEPING` = 128), takes one slot for its victim and carries its own
-/// 128 × 8 KiB filler stacks (1 MiB more BSS) for the rest of its 129
-/// concurrent children, in addition.
+/// (`MAX_SLEEPING` = 128), draws one `STRESS_STACKS` stack for its victims
+/// and carries its own 128 × 8 KiB filler stacks (1 MiB more BSS), so it runs
+/// 129 concurrent children, past this cap.
 ///
 /// 64 matches the width of the `u64` notification bitmask used by tests that
 /// allocate one bit per worker (`concurrent_notification`, `retype_concurrent`,

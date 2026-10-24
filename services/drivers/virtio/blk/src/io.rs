@@ -16,6 +16,8 @@
 //! [`IoLayout::write_chain`] parameterise the data-segment physical
 //! address. The driver's own page never holds bulk data.
 
+use std::time::{Duration, Instant};
+
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::SplitVirtqueue;
 
@@ -139,8 +141,11 @@ impl IoLayout
     }
 }
 
-/// Maximum wait iterations before treating the request as timed out.
-const MAX_WAIT_ATTEMPTS: usize = 1000;
+/// How long a request may take before it is treated as timed out, measured
+/// on the monotonic clock: a per-iteration wait that returns early (the
+/// kernel times a wait out at once when its sleep list is full) costs a
+/// re-poll, not part of the budget.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// Per-iteration timeout on the IRQ-notification wait, in milliseconds.
 ///
@@ -149,8 +154,7 @@ const MAX_WAIT_ATTEMPTS: usize = 1000;
 /// iteration's poll-burst will observe completion regardless of whether the
 /// IRQ ever fires. The actual completion time of a virtio-blk request on
 /// QEMU is sub-millisecond, so a 50 ms ceiling is two orders of magnitude
-/// over the expected wake and three orders under the outer-loop deadline
-/// (`MAX_WAIT_ATTEMPTS * IRQ_WAIT_TIMEOUT_MS` = 50 s upper bound).
+/// over the expected wake and three orders under [`REQUEST_TIMEOUT`].
 const IRQ_WAIT_TIMEOUT_MS: u64 = 50;
 
 /// Submit a read or write request and wait for completion via IRQ notification.
@@ -219,7 +223,8 @@ pub fn submit_and_wait(
     // timeout so a completion that lands between the poll burst and the
     // kernel parking the thread is recovered on the next iteration's burst
     // rather than wedging the driver forever.
-    for _ in 0..MAX_WAIT_ATTEMPTS
+    let start = Instant::now();
+    while start.elapsed() < REQUEST_TIMEOUT
     {
         // Poll burst before blocking. VirtIO devices typically complete in
         // microseconds; spinning for a few thousand cycles is still cheap

@@ -171,7 +171,8 @@ pub const SYS_NOTIFICATION_SEND: u64 = 3;
 /// On success returns `0` in the primary return register and the bitmask
 /// in the secondary register (rdx / a1). A notification wake always carries
 /// non-zero bits, because `notification_send` rejects zero-bit sends. A `0`
-/// bitmask with a `0` status means the timeout elapsed. A stop of the
+/// bitmask with a `0` status means the wait timed out: its timeout elapsed,
+/// or it found the sleep list full and returned at once. A stop of the
 /// caller, or the destruction of the notification under it, returns
 /// `Interrupted`. Several threads may wait; they queue in arrival order and
 /// each delivery wakes the longest-waiting one with every pending bit (a

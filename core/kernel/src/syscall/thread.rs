@@ -1001,7 +1001,8 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // race means the waker's deposit stands and the resume
                     // delivers it (fail-open), or a concurrent cancel already
                     // claimed and stamped it, or the thread's own
-                    // dealloc_object(Thread) unlinked it as it dies.
+                    // dealloc_object(Thread) unlinked it as it dies, or its
+                    // own full-list withdrawal dequeued it and returns 0 bits.
                     if (*sig).waiters.remove_if(tcb, same_park)
                     {
                         claimed = true;
@@ -1044,7 +1045,8 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                     // lost race means a genuine wake's deposit stands
                     // (fail-open), or a concurrent cancel already claimed and
                     // stamped it, or the thread's own dealloc_object(Thread)
-                    // unlinked it as it dies.
+                    // unlinked it as it dies, or its own full-list withdrawal
+                    // dequeued it and returns WouldBlock.
                     if (*eq).waiters.remove_if(tcb, same_park)
                     {
                         claimed = true;

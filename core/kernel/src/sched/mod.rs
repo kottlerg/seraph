@@ -1571,7 +1571,7 @@ static TIMER_DISPATCH_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SleepAddError
 {
-    /// The list is at [`MAX_SLEEPING`]; the caller rolls back or degrades.
+    /// The list is at [`MAX_SLEEPING`]; the caller withdraws its park.
     Full,
     /// `sleep_deadline` was already 0 under `SLEEP_LIST_LOCK`: a cancellation
     /// (`sleep_list_remove`) landed between the park commit and the add. The
@@ -1594,7 +1594,7 @@ pub fn sleep_deadline_after_ms(ms: u64) -> u64
 ///
 /// Refuses with [`SleepAddError::Cancelled`] when `sleep_deadline` reads 0
 /// under the lock, and with [`SleepAddError::Full`] at capacity; the caller
-/// MUST roll back or degrade the park. A TCB already listed keeps its single
+/// MUST withdraw the park. A TCB already listed keeps its single
 /// entry, which carries the deadline the caller just wrote.
 /// See docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
 ///
@@ -3680,6 +3680,39 @@ pub unsafe fn commit_blocked_under_local_lock(
 ) -> ParkCommit
 {
     ParkCommit::Committed
+}
+
+/// Withdraw the caller's just-committed park that no waker or cancel can have
+/// claimed: restore `Running` and clear the park binding under `sched_lock`.
+/// The one user is a timed notification or event-queue wait whose
+/// [`crate::ipc::arm_timed_park`] found the sleep list full: it has dequeued
+/// itself while holding the source lock it held since the push, and every
+/// claim of a source waiter takes that lock, so the un-commit is a sanctioned
+/// exception to the reach-`schedule()` rule (docs/scheduling-internals.md
+/// § Lock Hierarchy rule 8). A `Stopped` or `Exited` commit that already
+/// landed is kept. `context_saved` stays 0, as after `sys_thread_sleep`'s own
+/// full-list withdrawal: the still-`current` thread's live registers are
+/// authoritative, and its next switch-out republishes 1.
+///
+/// # Safety
+/// `tcb` is the running caller, already dequeued from its source under the
+/// source lock the caller still holds; no scheduler or sleep-list lock is
+/// held.
+#[cfg(not(test))]
+pub unsafe fn withdraw_uncontested_park(tcb: *mut ThreadControlBlock)
+{
+    // SAFETY: tcb valid per the contract; state and the binding are written
+    // under its sched_lock (lock order source → sched_lock).
+    unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        if (*tcb).state == thread::ThreadState::Blocked
+        {
+            (*tcb).state = thread::ThreadState::Running;
+        }
+        (*tcb).ipc_state = thread::IpcThreadState::None;
+        (*tcb).blocked_on_object = core::ptr::null_mut();
+        (*tcb).sched_lock.unlock_raw(saved);
+    }
 }
 
 /// Commit a `BlockedOnSend → BlockedOnReply`/`BlockedOnFault` reply rebind for a

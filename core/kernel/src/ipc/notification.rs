@@ -326,7 +326,7 @@ pub unsafe fn notification_wait(
             unsafe {
                 sig.waiters.remove(caller);
                 sig.refresh_observer();
-                crate::ipc::withdraw_timed_park(caller);
+                crate::sched::withdraw_uncontested_park(caller);
                 sig.lock.unlock_raw(saved);
             }
             return Ok(0);

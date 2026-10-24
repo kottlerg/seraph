@@ -326,7 +326,7 @@ pub unsafe fn event_queue_recv(
             // SAFETY: caller was pushed above; eq.lock held throughout.
             unsafe {
                 eq.waiters.remove(caller);
-                crate::ipc::withdraw_timed_park(caller);
+                crate::sched::withdraw_uncontested_park(caller);
                 eq.lock.unlock_raw(saved);
             }
             return Ok(None);

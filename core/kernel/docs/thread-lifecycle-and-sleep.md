@@ -10,7 +10,9 @@ wake protocol) MUST hold here.
 
 This document is the authoritative reference consulted before any change that touches:
 - `core/kernel/src/sched/mod.rs` — `sleep_list_add`, `sleep_list_remove`, `sleep_check_wakeups`,
-  `sleep_wakeups_quiesce`, `sleep_deadline_after_ms`, `commit_cancelling_park`,
+  `sleep_wakeups_quiesce`, `sleep_deadline_after_ms`, `withdraw_uncontested_park` (called by
+  `notification_wait` and `event_queue_recv` when `arm_timed_park` finds the list full),
+  `commit_cancelling_park`,
   `start_under_all_locks`, `with_held_frame`, `post_death_notification`.
 - `core/kernel/src/syscall/{thread,mod}.rs` — `sys_thread_configure`, `sys_thread_start`,
   `sys_thread_stop`, `sys_thread_read_regs`, `sys_thread_write_regs`, `sys_thread_set_priority`,
@@ -48,7 +50,8 @@ invariants.
 
 In scope:
 
-- `core/kernel/src/sched/mod.rs` — sleep list, timer quiesce, `commit_cancelling_park`,
+- `core/kernel/src/sched/mod.rs` — sleep list, timer quiesce, `withdraw_uncontested_park`,
+  `commit_cancelling_park`,
   `start_under_all_locks`, `with_held_frame`, and `post_death_notification`.
 - `core/kernel/src/sched/thread.rs` — `ThreadState`, `IpcThreadState`, TCB.
 - `core/kernel/src/syscall/{thread,mod}.rs` — lifecycle and register-access syscalls and
@@ -100,8 +103,8 @@ claims against concurrent IPC sources via the relevant source IPC lock (Notifica
 
 4. **Capacity is hard.** At `SLEEP_COUNT == MAX_SLEEPING`, `sleep_list_add` refuses
    (`SleepAddError::Full`). A timed `sys_notification_wait` or `sys_event_recv` withdraws its park
-   (`ipc::withdraw_timed_park`, under the source lock that has held it queued, so no waker or cancel
-   can have claimed it) and reports an immediate timeout: `0` bits, or `WouldBlock`.
+   (`sched::withdraw_uncontested_park`, under the source lock that has held it queued, so no waker
+   or cancel can have claimed it) and reports an immediate timeout: `0` bits, or `WouldBlock`.
    `sys_thread_sleep` surfaces `OutOfMemory`, unless a stop or teardown already claimed the park:
    the sleeper then deschedules, a stopped one returning `Interrupted` when restarted and a
    torn-down one never returning (see § `sys_thread_sleep` and the Plain-Sleep Path). Silent drop is
@@ -639,14 +642,16 @@ Episodes.
    entry is not listed yet, the remove clears the deadline, and step 4's add refuses with
    `Cancelled`, so no entry is left behind for a thread the stop has cancelled; when the add finds
    the list full instead, the sleeper withdraws the park with the same `sleep_list_remove` under
-   `sched_lock`, so the cancel's claim and the withdrawal exclude each other, and a sleeper whose
-   park a cancel claimed deschedules and returns `Interrupted` rather than `OutOfMemory`. Holding
+   `sched_lock`, so the cancel's claim and the withdrawal exclude each other: a sleeper whose park
+   a cancel claimed deschedules and returns `Interrupted` rather than `OutOfMemory`, and a stop
+   that finds the sleeper already withdrawn sees it `Running`, its `cancel_ipc_block` returns
+   early, its commit writes `Stopped` over the restored `Running`, and the sleeper returns
+   `OutOfMemory`. Holding
    `sched_lock` keeps the park from changing under the remove, so a cancel never claims a later
    park. A `false` return means another claimant took the episode first, and the restarted sleeper
    returns what that claimant deposited: the timer's pop (its wake aborted by `enqueue_and_wake` if
    the stop commits first) deposits nothing, so the sleeper returns `Ok`, honest for a deadline that
-   elapsed; a concurrent canceller stamped `INTERRUPTED`; or the sleeper's own full-list withdrawal
-   won, and it returns `OutOfMemory` while the stop commits over the restored `Running`. A stop that
+   elapsed; a concurrent canceller stamped `INTERRUPTED`. A stop that
    wins against the park commit
    (`ParkCommit::RefusedStop`) makes `sys_thread_sleep` deschedule in place and return `Interrupted`
    directly.
@@ -687,8 +692,10 @@ The handler then drains the target.
       `sys_thread_stop (Created or Exited or Stopped)`).
 
    So `Stopped` is never written over a live park: every park the commit lands on was cancelled by
-   this stop or a concurrent one, or already claimed by a waker, so a stop never leaves a `Stopped`
-   thread registered as a source's waiter or on the sleep list. The object-teardown stop
+   this stop or a concurrent one, already claimed by a waker, or withdrawn by the target itself on a
+   full sleep list (the commit then lands on the restored `Running`, and the restarted thread
+   returns its withdrawal result: `OutOfMemory`, `0` bits or `WouldBlock`), so a stop never leaves a
+   `Stopped` thread registered as a source's waiter or on the sleep list. The object-teardown stop
    (`stop_threads_bound_to`) commits `Exited` through the same loop. A park that a waker claimed
    first (removed from the queue, `wake_in_flight = 1`) is not cancelled; the stop commits over it
    and the waker's later `enqueue_and_wake` aborts on `Stopped`, clearing the park binding it owns

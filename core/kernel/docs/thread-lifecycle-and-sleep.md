@@ -12,8 +12,7 @@ This document is the authoritative reference consulted before any change that to
 - `core/kernel/src/sched/mod.rs` — `sleep_list_add`, `sleep_list_remove`, `sleep_check_wakeups`,
   `sleep_wakeups_quiesce`, `sleep_deadline_after_ms`, `withdraw_uncontested_park` (called by
   `notification_wait` and `event_queue_recv` when `arm_timed_park` finds the list full),
-  `commit_cancelling_park`,
-  `start_under_all_locks`, `with_held_frame`, `post_death_notification`.
+  `commit_cancelling_park`, `start_under_all_locks`, `with_held_frame`, `post_death_notification`.
 - `core/kernel/src/syscall/{thread,mod}.rs` — `sys_thread_configure`, `sys_thread_start`,
   `sys_thread_stop`, `sys_thread_read_regs`, `sys_thread_write_regs`, `sys_thread_set_priority`,
   `sys_exit`, `sys_process_exit`, `sys_thread_sleep`, `cancel_ipc_block`.
@@ -51,8 +50,8 @@ invariants.
 In scope:
 
 - `core/kernel/src/sched/mod.rs` — sleep list, timer quiesce, `withdraw_uncontested_park`,
-  `commit_cancelling_park`,
-  `start_under_all_locks`, `with_held_frame`, and `post_death_notification`.
+  `commit_cancelling_park`, `start_under_all_locks`, `with_held_frame`, and
+  `post_death_notification`.
 - `core/kernel/src/sched/thread.rs` — `ThreadState`, `IpcThreadState`, TCB.
 - `core/kernel/src/syscall/{thread,mod}.rs` — lifecycle and register-access syscalls and
   `cancel_ipc_block`.
@@ -227,7 +226,7 @@ the handler uses for the target's `state` write.
 | `sys_thread_read_regs` | `Stopped`, or `Blocked` (`BlockedOnFault`) | unchanged | calling CPU | `sched::with_held_frame`: under the target's `sched_lock`, the target, `Stopped` or fault-blocked, must be `current` on no CPU with its save published; a `Stopped` target not yet settled is refused (`InvalidState`) and a fault-blocked one still switching out is waited for (outside every lock, interrupts enabled, preemption disabled; spin site `regs:settle`). The frame is snapshotted under the lock and copied to the caller's buffer after it. No scheduler-state mutation. |
 | `sys_thread_write_regs` | `Stopped`, or `Blocked` (`BlockedOnFault`) | unchanged | calling CPU | Copies and validates the user `TrapFrame`, then writes it through `sched::with_held_frame` (as for `sys_thread_read_regs`), so the target, `Stopped` or fault-blocked, is off every CPU with its save published for the write. |
 | `sys_exit` (self) | `*` | `Exited` | running CPU = current CPU | `exit_under_all_locks(self, reason)` (the `Exited` commit with the exit reason in the same all-locks hold), then `post_death_notification`, then `schedule(false)`. The all-locks write ensures any peer-CPU `schedule()` reading `state` under its own sched.lock sees `Exited` and refuses to re-enqueue. |
-| `sys_process_exit` (self) | `*` | `Exited` | running CPU = current CPU | `exit_under_all_locks(self, encode_exit_code(code))`, then `post_death_notification`, then `schedule(false)`, as for `sys_exit`; it makes no address-space death post. A refusal means a teardown already committed `EXIT_KILLED`; the post still carries this path's own reason. |
+| `sys_process_exit` (self) | `*` | `Exited` | running CPU = current CPU | `exit_under_all_locks(self, encode_exit_code(code))`, then `post_death_notification`, then `schedule(false)`, as for `sys_exit`; it makes no address-space death post. A refusal means the thread was already torn down: an object-teardown stop recorded `EXIT_KILLED`, or a `dealloc_object(Thread)` committed `Exited`; the post still carries this path's own reason. |
 | arch fault handler (page fault, GP fault, etc.) | `*` | `Exited` | trapping CPU = current CPU | As for `sys_exit`, with reason `EXIT_FAULT_BASE + vector` (x86-64) or `EXIT_FAULT_BASE + cause` (riscv64), plus a `post_aspace_death_notification` to the address-space observers before `schedule(false)`. |
 | `dealloc_object(Thread)` (caller ≠ tcb) | `*` | `Exited` | calling CPU (refcount → 0) | Acquires every CPU's scheduler.lock in ascending order, writes `state = Exited`, walks `remove_from_queue` for every CPU, releases all. After release: unconditionally scans every CPU until none has `sched.current == tcb`, then unconditionally on `tcb.context_saved == 1`, then proceeds to source-IPC unlink + free. See Drain Protocol below. |
 | `dealloc_object(Thread)` (caller == tcb, self-teardown) | `Running` | `Exited` | calling CPU = running CPU | A thread deleting the last capability to its own `Thread` object cannot run the post-release scan (its CPU's `current == tcb` never clears from within the spin). Marks Exited + drains run queues only, queues the object on this CPU's deferred-reclaim stack, and returns; the syscall epilogue reschedules and the free completes off-CPU. See [Self-teardown](#self-teardown-the-caller-is-the-freed-thread) below. |
@@ -642,19 +641,17 @@ Episodes.
    entry is not listed yet, the remove clears the deadline, and step 4's add refuses with
    `Cancelled`, so no entry is left behind for a thread the stop has cancelled; when the add finds
    the list full instead, the sleeper withdraws the park with the same `sleep_list_remove` under
-   `sched_lock`, so the cancel's claim and the withdrawal exclude each other: a sleeper whose park
-   a cancel claimed deschedules and returns `Interrupted` rather than `OutOfMemory`, and a stop
-   that finds the sleeper already withdrawn sees it `Running`, its `cancel_ipc_block` returns
-   early, its commit writes `Stopped` over the restored `Running`, and the sleeper returns
-   `OutOfMemory`. Holding
-   `sched_lock` keeps the park from changing under the remove, so a cancel never claims a later
-   park. A `false` return means another claimant took the episode first, and the restarted sleeper
-   returns what that claimant deposited: the timer's pop (its wake aborted by `enqueue_and_wake` if
-   the stop commits first) deposits nothing, so the sleeper returns `Ok`, honest for a deadline that
-   elapsed; a concurrent canceller stamped `INTERRUPTED`. A stop that
-   wins against the park commit
-   (`ParkCommit::RefusedStop`) makes `sys_thread_sleep` deschedule in place and return `Interrupted`
-   directly.
+   `sched_lock`, so the cancel's claim and the withdrawal exclude each other: a sleeper whose park a
+   cancel claimed deschedules and returns `Interrupted` rather than `OutOfMemory`, and a stop that
+   finds the sleeper already withdrawn sees it `Running`, its `cancel_ipc_block` returns early, its
+   commit writes `Stopped` over the restored `Running`, and the sleeper returns `OutOfMemory`.
+   Holding `sched_lock` keeps the park from changing under the remove, so a cancel never claims a
+   later park. A `false` return means another claimant took the episode first, and the restarted
+   sleeper returns what that claimant deposited: the timer's pop (its wake aborted by
+   `enqueue_and_wake` if the stop commits first) deposits nothing, so the sleeper returns `Ok`,
+   honest for a deadline that elapsed; a concurrent canceller stamped `INTERRUPTED`. A stop that
+   wins against the park commit (`ParkCommit::RefusedStop`) makes `sys_thread_sleep` deschedule in
+   place and return `Interrupted` directly.
 
 ---
 
@@ -693,10 +690,11 @@ The handler then drains the target.
 
    So `Stopped` is never written over a live park: every park the commit lands on was cancelled by
    this stop or a concurrent one, already claimed by a waker, or withdrawn by the target itself on a
-   full sleep list (the commit then lands on the restored `Running`; the target returns its
-   withdrawal result, `OutOfMemory`, `0` bits or `WouldBlock`, to user mode and the stop drains it
-   as a running target), so a stop never leaves a
-   `Stopped` thread registered as a source's waiter or on the sleep list. The object-teardown stop
+   full sleep list (the target returns its withdrawal result, `OutOfMemory`, `0` bits or
+   `WouldBlock`, to user mode, and the commit lands on it in whatever state that return left it:
+   still `Running`, drained as a running target; `Ready` after a preemption, unlinked and
+   save-waited; or parked again, which the retry cancels), so a stop never leaves a `Stopped` thread
+   registered as a source's waiter or on the sleep list. The object-teardown stop
    (`stop_threads_bound_to`) commits `Exited` through the same loop. A park that a waker claimed
    first (removed from the queue, `wake_in_flight = 1`) is not cancelled; the stop commits over it
    and the waker's later `enqueue_and_wake` aborts on `Stopped`, clearing the park binding it owns

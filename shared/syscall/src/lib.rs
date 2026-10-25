@@ -2244,7 +2244,9 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 ///
 /// If the thread was blocked (on IPC or in [`thread_sleep`]), or blocks while
 /// the stop is in progress, the blocking syscall returns `Interrupted` once
-/// the thread is restarted, unless its wake was claimed first. The kernel's
+/// the thread is restarted, unless its wake was claimed first, or a timed
+/// wait or sleep that found the kernel's sleep list full withdrew itself
+/// first (it then returns its timeout or `OutOfMemory`). The kernel's
 /// known exceptions (#443) are listed in `core/kernel/docs/syscalls.md`
 /// § `SYS_THREAD_STOP`. A thread may stop itself (pass its own thread cap).
 ///
@@ -2535,8 +2537,10 @@ pub fn sbi_call(
 ///
 /// # Errors
 /// Returns `-16` (`Interrupted`) if the thread is stopped before or during
-/// the sleep (and restarted), `-8` (`OutOfMemory`) if the kernel's sleep list
-/// is full, or another negative `i64` error code on failure.
+/// the sleep (and restarted), unless the timer had already claimed the
+/// elapsed deadline (the sleep returns `Ok`), `-8` (`OutOfMemory`) if the
+/// kernel's sleep list is full (even when a stop then lands, if the sleep
+/// withdrew first), or another negative `i64` error code on failure.
 #[inline]
 pub fn thread_sleep(ms: u64) -> Result<(), i64>
 {

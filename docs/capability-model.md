@@ -699,19 +699,25 @@ capability reference counts reach zero. This path has known kernel memory-safety
 [syscalls.md](../core/kernel/docs/syscalls.md#sys_thread_stop-20) § `SYS_THREAD_STOP`).
 
 Beyond that stop, the kernel's role in death is *notification*. An `AddressSpace` carries a
-death-observer set (mirroring the per-thread death observers). On a terminal fault by any thread in
-the address space (no fault handler bound, the handler replied `KILL`, or the fault episode was
-cancelled by destruction of the handler thread (deletion of its last Thread capability), by
-destruction of the handler endpoint while the fault is still queued on it, or by a later receive on
-the handler thread that passes its capability and headroom checks while the fault reply is pending;
-a stop of the faulting thread defers the terminal fault — before any reply claims the fault it
-cancels the episode; after a `KILL` reply has claimed it, that disposition stands — and the terminal
-fault takes effect, and is posted, only if the thread is started again; see
-[Fault Handling](fault-handling.md#delivery-resume-and-kill)), the kernel posts the fault class
+death-observer set (mirroring the per-thread death observers). A fault is terminal when:
+
+- no fault handler is bound;
+- the handler replies `KILL`; or
+- the fault episode is cancelled: by destruction of the handler thread (deletion of its last
+  Thread capability), by destruction of the handler endpoint while the fault is still queued on it,
+  or by a later receive on the handler thread that passes its capability and headroom checks while
+  the fault reply is pending.
+
+On a terminal fault by any thread in the address space, the kernel posts the fault class
 (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on riscv64) to each bound observer
-and exits the faulting thread. procmgr binds such an observer at process creation, so a fatal fault
-on any thread — a worker, not just the main thread — drives procmgr's teardown of the whole process.
-Normal thread exit does not fire these observers.
+and exits the faulting thread. A stop of the faulting thread defers this: before any reply claims
+the fault it cancels the episode; after a `KILL` reply has claimed it, that disposition stands;
+either way the terminal fault takes effect, and is posted, only if the thread is started again (see
+[Fault Handling](fault-handling.md#delivery-resume-and-kill)).
+
+procmgr binds such an observer at process creation, so a fatal fault on any thread — a worker, not
+just the main thread — drives procmgr's teardown of the whole process. Normal thread exit does not
+fire these observers.
 
 ---
 

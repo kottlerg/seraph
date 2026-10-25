@@ -24,6 +24,13 @@
 //! core/kernel/docs/thread-lifecycle-and-sleep.md § `sys_thread_sleep` and
 //! the Plain-Sleep Path, invariant 3).
 //!
+//! A timed `notification_wait` or `event_recv` on a full list withdraws its
+//! park under the source lock it has held since queuing itself
+//! (`sched::withdraw_uncontested_park`), so no cancel can claim it: a stop's
+//! `cancel_ipc_block` loses the unlink and finds the target `Running`, and
+//! the target reports its timeout (`0` bits, `WouldBlock`) rather than
+//! `Interrupted`.
+//!
 //! ## How this exercises it
 //!
 //! [`FILLERS`] threads, one per sleep-list slot, each loop
@@ -426,7 +433,7 @@ fn wait_victim_entry(arg: u64) -> !
     thread_exit()
 }
 
-/// Start the victim, storm it, delete the fillers' sleeps by deleting the
+/// Start the victim, storm it, cancel the fillers' sleeps by stopping the
 /// fillers, then let the victim sleep once more; always reap the victim.
 fn with_victim(ctx: &TestContext, fillers: &[u32]) -> TestResult
 {

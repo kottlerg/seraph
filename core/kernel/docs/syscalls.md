@@ -1181,11 +1181,10 @@ the sleep timer, or the target's own full-list withdrawal claimed it first). A f
 withdrawal is a timed wait or sleep that found the kernel's sleep list full; it reports its timeout
 or `OutOfMemory` (invariant 4 of
 [thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants)).
-A target that blocks while the stop is in progress is
-cancelled the same way, never left registered as a waiter (see
-[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop` Cross-CPU Stop
-Protocol). This does not hold for a stop of a thread waiting on an endpoint (queued to send or
-receive), a notification, an event queue, or a wait set whose last capability is deleted
+A target that blocks while the stop is in progress is cancelled the same way, never left registered
+as a waiter (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop`
+Cross-CPU Stop Protocol). This does not hold for a stop of a thread waiting on an endpoint (queued
+to send or receive), a notification, an event queue, or a wait set whose last capability is deleted
 concurrently: the cancel can lock the object after it is freed
 ([#443](https://github.com/kottlerg/seraph/issues/443) § Source pointer held past its free). A
 thread running on another CPU is marked `Stopped` under every CPU's scheduler lock, and the call

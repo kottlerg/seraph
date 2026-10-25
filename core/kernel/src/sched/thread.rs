@@ -466,8 +466,9 @@ pub struct ThreadControlBlock
     /// start then links the thread only if the generation is unchanged and the
     /// thread still `Ready`, so a stop (and any restart) landing between its
     /// commit and its link supersedes it instead of being overwritten by a
-    /// second link (`enqueue_ready_thread`). A plain `u32`, like
-    /// `wake_pending`: every read and write holds `sched_lock`.
+    /// second link (`enqueue_ready_thread`). A plain `u32` owned by
+    /// `sched_lock`: every read and write holds it (the bare-field exception
+    /// of docs/coding-standards.md § Concurrency).
     pub start_seq: u32,
 
     // === IPC state ===
@@ -511,7 +512,9 @@ pub struct ThreadControlBlock
     pub ipc_wait_next: Option<*mut ThreadControlBlock>,
 
     /// Predecessor on an [`ipc::WaitQueue`](crate::ipc::WaitQueue) (null off
-    /// one; endpoint queues do not use it).
+    /// one; endpoint queues do not use it). Owned by the lock of the source
+    /// whose queue links this TCB (the bare-field exception of
+    /// docs/coding-standards.md § Concurrency).
     pub ipc_wait_prev: *mut ThreadControlBlock,
 
     /// The [`ipc::WaitQueue`](crate::ipc::WaitQueue) linking this TCB, or

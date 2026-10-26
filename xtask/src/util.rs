@@ -87,7 +87,7 @@ fn install_hint_for(name: &str) -> String
             .into(),
         "qemu-system-riscv64" => "Install with:\n  \
             Fedora:           dnf install qemu-system-riscv\n  \
-            Debian / Ubuntu:  apt install qemu-system-misc\n  \
+            Debian / Ubuntu:  apt install qemu-system-riscv (older releases: qemu-system-misc)\n  \
             Arch:             pacman -S qemu-system-riscv\n  \
             macOS (Homebrew): brew install qemu\n  \
             FreeBSD:          pkg install qemu"

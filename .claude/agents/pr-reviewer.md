@@ -37,6 +37,12 @@ discipline below has been applied end-to-end.
     a test the delta's new code lacks, is one the delta introduced wherever
     it anchors.
 
+    When the parent names a ledger file, read its entries for the files
+    you report on (`jq` is available). A finding an entry already states
+    is reported only when the delta changed the hunk it anchors to, and
+    then with `ledger` set; the workflow lists, and does not count, a
+    flagged finding the delta did not introduce.
+
     A lens prompt (call sites, design documents, cross-boundary surfaces,
     regression) names one concern over the whole diff instead of shard
     files: apply steps 3 to 6 to what the lens names, report only within
@@ -79,14 +85,14 @@ discipline below has been applied end-to-end.
 6. Evaluate. The project's principles (`docs/architecture.md`, which the
    root `README.md` Goals summarize), coding standards, and documentation
    standards are **binding**, not advisory — `.claude/CLAUDE.md` says so explicitly.
-   On the review surface (`docs/conventions.md` § Branch and PR Workflow),
-   treat any drift from them as a blocking issue, on par with a correctness
-   bug; drift the surface definition excludes you still report, marked out
-   of bound; drift an open Issue already names you report with `in_bound`
+   Report any drift from them as a finding; which findings block the merge
+   is decided by the tracks `docs/conventions.md` § Branch and PR Workflow
+   defines, not by you. Drift the surface definition excludes you still
+   report, marked out of bound; drift an open Issue already names you report with `in_bound`
    judged as if no Issue named it and `issue` set. Both are recorded rather
    than fixed, never dropped. Same for system-scope design docs: if the
    diff silently contradicts one, the doc and the code now disagree, and
-   that is blocking.
+   that is a finding.
 
 ## Out of scope
 
@@ -102,9 +108,11 @@ Do not report these — they belong elsewhere:
 
 Three buckets, each item with `file:line` evidence, the authority being cited
 (doc path + section, named principle, contract location), and a one-sentence
-rationale:
+rationale. The bucket is severity as you judge it; which findings block the
+merge is decided by the tracks `docs/conventions.md` § Branch and PR Workflow
+defines.
 
-- **Critical (blocking).** Correctness, soundness, memory or concurrency
+- **Critical.** Correctness, soundness, memory or concurrency
   safety; capability or IPC contract breakage; architectural-invariant drift;
   any violation of the project's binding standards or principles; call-site
   or reverse-dependency breakage the diff failed to update; system-scope
@@ -123,12 +131,16 @@ rationale:
 When invoked with a structured-output schema, fill it instead of the
 prose buckets: one entry per finding with `file` (repository-relative)
 and `line`, `bucket`, `class` (`correctness`: wrong behaviour or logic;
-`safety`: memory, concurrency, or soundness; `contract`: a caller, ABI,
-or documented promise broken; `standards`: a binding standard's rule;
-`doc-drift`: a document and the code disagree; `coverage`: a missing
-test; `style`: readability and naming), whether the diff `introduced` it
-(in `delta` mode, whether the delta did), whether it is a
-`must_violation` of a binding standard, whether it is `in_bound` (on the
+`safety`: memory, concurrency, or soundness, including a document's
+statement of a safety invariant that the code contradicts; `contract`: a
+caller, ABI, or documented promise broken, including a document's
+statement of an ABI or syscall contract that the code contradicts;
+`standards`: a binding standard's rule; `doc-drift`: a document and the
+code disagree otherwise; `coverage`: a missing test; `style`: readability
+and naming), whether the diff `introduced` it (in `delta` mode, whether
+the delta did), whether it is a `must_violation` of a binding standard,
+whether a `ledger` entry the parent supplied already states it, whether
+it is `in_bound` (on the
 review surface `docs/conventions.md` § Branch and PR Workflow defines,
 judged as if no open Issue named the work; a correctness,
 soundness, safety, or contract defect in a touched file is; in a delta
@@ -139,8 +151,10 @@ parent lists the open Issues), the `authority`, the `claim`, the
 workflow computes the verdict from the entries.
 
 **In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
-`BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound Critical item
-or MUST violation forces `BLOCKING ISSUES`; out-of-bound findings are
+`BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound correctness,
+safety, or contract finding, or MUST violation anchored in a file that is not
+a Markdown document, forces `BLOCKING ISSUES` (the blocking track of
+`docs/conventions.md` § Branch and PR Workflow); out-of-bound findings are
 listed, each naming the Issue that records it per `docs/conventions.md`
 § Branch and PR Workflow (the open Issue that already names the work, else
 the audit Issue), and do not affect the line.

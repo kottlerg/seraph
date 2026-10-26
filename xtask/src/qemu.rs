@@ -5,7 +5,8 @@
 
 //! Shared QEMU argv construction and per-launch pflash cache for RISC-V.
 //!
-//! Both `run` and `run-parallel` produce QEMU command lines from the same
+//! Every command that launches QEMU (`run`, `run-parallel`, `test-kaslr`,
+//! `test-terminal`, `test-vmgenid`) produces its command line from the same
 //! source of truth (`build_qemu_argv`). Firmware discovery lives in
 //! `firmware::{find_ovmf_code, find_riscv_firmware}`; the padding +
 //! caching of RISC-V pflash images stays here in `prepare_riscv_firmware`.

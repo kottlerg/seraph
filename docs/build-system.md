@@ -316,13 +316,13 @@ table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 `-cpu rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on`
 plus the `--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
 `-cpu max,migratable=no` on x86-64 TCG. The explicit feature string is the source of
-truth; the supervisor paging extensions (Svpbmt, Svinval, Svnapot) are required by the
-kernel, whose paging subsystem refuses CPUs that lack them during boot, before the first
-userspace mapping (see [platform-requirements.md](platform-requirements.md)). The explicit
-feature string is what `xtask` passes on every supported QEMU, from the 8.0 minimum to the
-10.2 the pinned CI image ships (§ Continuous Integration); the named `-cpu rva23s64` model
-(QEMU ≥ 9.1, 2024-09), a superset that adds the remaining RVA23 mandates, is a documented
-configuration alternative on hosts that have it.
+truth on every supported QEMU, from the 8.0 minimum to the 10.2 the pinned CI image ships
+(§ Continuous Integration); the supervisor paging extensions (Svpbmt, Svinval, Svnapot) are
+required by the kernel, whose paging subsystem refuses CPUs that lack them during boot, before
+the first userspace mapping (see [platform-requirements.md](platform-requirements.md)). The
+named `-cpu rva23s64` model (QEMU ≥ 10.0, 2025-04) is a superset of this string that adds the
+remaining RVA23 mandates; `xtask` does not expose it, and the explicit string stays so the 8.0
+minimum holds.
 
 ---
 

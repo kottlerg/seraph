@@ -69,10 +69,9 @@ jobs:
             qemu-efi-riscv64
 
       - name: Log QEMU versions
-        # Seraph requires QEMU ≥ 8.0 (RISC-V V extension support; see
-        # docs/build-system.md § QEMU and Firmware). The explicit
-        # `-cpu rv64,v=true,...` invocation in `xtask/src/qemu.rs` works on
-        # every supported version; the pinned image ships QEMU 10.2.
+        # A missing binary fails here rather than at the first boot. The
+        # version floor and the pinned image's QEMU are in
+        # docs/build-system.md § QEMU and Firmware and § Continuous Integration.
         run: |
           qemu-system-x86_64 --version
           qemu-system-riscv64 --version

@@ -808,8 +808,10 @@ const seen = []
 // moves onto the surface only when it names no Issue. A record without an
 // Issue adopts a later reporter's Issue only before its verification starts;
 // a record with an Issue keeps it, and the authority refuter's issue_refuted
-// vote decides. A nit that names no MUST violation is never verified, so an
-// Issue any reporter names on it is final whichever reporter arrived first.
+// vote decides. A nit that cannot block (soft class, and no MUST violation
+// anchored outside Markdown) is never verified, so an Issue any reporter names
+// on it is final whichever reporter arrived first; a nit that can block is
+// verified like any other finding.
 // A finding flagged as already in the ledger (an entry states it and the delta
 // left its hunk unchanged) becomes a `ledgered` record, or joins the ledgered
 // record at its anchor: listed, never verified or counted, and never a target
@@ -819,6 +821,9 @@ const seen = []
 // same root cause: it joins that record's group and takes the group's verdict
 // instead of its own verification.
 const ledgered = []
+// Verifications started outside the review pipeline (a group member that left
+// its group after the group's verdict was copied); awaited before the verdict.
+const late_verifications = []
 
 // The authority's document and section title (to the first separator), so the
 // wordings one reviewer gives the same section ("§ Concurrency (bare-field
@@ -877,6 +882,8 @@ function reconcile(dup, f, source, in_bound, surface) {
         } else {
             dup.annotations.push('placed on the surface by ' + source)
             dup.in_bound = true
+            // A group verdict is for findings off the surface only.
+            if (dup.group_lead) detach(dup)
         }
     } else if (!dup.issue && f.issue) {
         if (dup.verify_started) {
@@ -889,6 +896,25 @@ function reconcile(dup, f, source, in_bound, surface) {
         }
     }
     absorb(dup, f, source)
+}
+
+// A grouped record placed on the surface leaves its group for refuters of its
+// own. Its verification is the lead's until then: not yet started, awaiting
+// the lead (the member branch of `verify_one` re-checks the group), or
+// already copied, in which case it is reset and verified late.
+function detach(dup) {
+    const lead = dup.group_lead
+    lead.group.splice(lead.group.indexOf(dup), 1)
+    dup.group_lead = null
+    dup.annotations.push(
+        'left the root-cause group of ' + lead.file + ':' + lead.line + ' for its own verification')
+    if (dup.status !== 'pending') {
+        dup.status = 'pending'
+        dup.votes = []
+        dup.verification = null
+        dup.verify_started = false
+        late_verifications.push(verify_one(dup))
+    }
 }
 
 function ledger_record(f, source, in_bound, surface) {
@@ -948,6 +974,9 @@ function dedup(findings, source) {
         if (lead) {
             record.group_lead = lead
             lead.group.push(record)
+            // The lead's verification is the member's from this moment, so a
+            // later Issue claim is annotated, not adopted.
+            record.verify_started = true
             record.annotations.push(
                 'verified with ' + lead.file + ':' + lead.line + ' (same root cause)')
         }
@@ -967,10 +996,12 @@ function verify_one(f) {
     }
     if (f.group_lead) {
         const lead = f.group_lead
-        // A member's verification is the lead's, so a later Issue claim on it
-        // is annotated, not adopted, like one named after verification began.
-        f.verify_started = true
         return verify_one(lead).then(() => {
+            // Detached while waiting: refuters of its own.
+            if (!f.group_lead) {
+                f.verify_started = false
+                return verify_one(f)
+            }
             f.status = lead.status
             f.votes = lead.votes
             // The group shares one Issue claim; the lead's authority vote
@@ -1088,6 +1119,8 @@ review_items.forEach((item, i) => {
         log(item.label + ': no result (dropped by the pipeline)')
     }
 })
+
+await parallel(late_verifications.map((p) => () => p))
 
 const results = reviewed.filter(Boolean)
 const audit = results.map((r) => r.audit).find(Boolean) || null

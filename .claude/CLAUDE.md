@@ -77,8 +77,10 @@ truth for "how work is tracked and shipped" on this project.
   `@pr-auditor` directly in parallel (single message, two `Agent` tool
   calls) with the PR number as scope, the open Issue list (`gh issue list
   --state open --limit 500 --json number,title`), and, for a re-review,
-  the `since` head and the ledger path, and apply the same verdict
-  handling.
+  the `since` head and the ledger path; save the reviewer's findings with
+  their status, the recorded and dropped ones, the verdict, and the head as
+  `<mode>-<head>.json` in the workflow's shape, so the ledger command reads
+  a fallback run too, and apply the same verdict handling.
 
   Before each `delta` run, build the ledger that section names from every
   saved run record of the PR:
@@ -90,7 +92,7 @@ truth for "how work is tracked and shipped" on this project.
               + (if .verdict == "NON-BLOCKING ISSUES ONLY" then .findings else [] end))[]
              | {run: $run, file, line, class, bucket, must_violation, status, issue,
                 claim, fix})]
-         | unique_by([.run, .file, .line, .class, .bucket, .must_violation])' \
+         | unique' \
       target/xtask/review/pr<N>/*-*.json > target/xtask/review/pr<N>/ledger.json
   ```
 
@@ -115,8 +117,8 @@ truth for "how work is tracked and shipped" on this project.
   After the fixes are pushed and CI is green again, run the workflow in
   `delta` mode. Prompt for the merge decision only under that section's
   merge-prompt condition; when a `NON-BLOCKING ISSUES ONLY` run meets it,
-  offer one more fix round beside the merge. Merge
-  via `gh pr merge <N> --merge --delete-branch` (per
+  offer one more fix round beside the merge. Merge via
+  `gh pr merge <N> --merge --delete-branch` (per
   [docs/conventions.md](../docs/conventions.md) § Merge method).
 - On red: surface the failing job's tail (`gh run view <run-id> --log-failed`
   or equivalent) so the user can see the actual error without asking.

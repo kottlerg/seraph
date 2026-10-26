@@ -199,12 +199,12 @@ are forbidden; `master` MUST NOT receive force pushes.
   clarification of that rule alone, which is its record. A finding MUST
   NOT be waived or ruled outside the standards. The reviewer verdict is
   `BLOCKING ISSUES` when a blocking finding is on the surface or a reviewer
-  returned no result,
-  `NON-BLOCKING ISSUES ONLY` when only non-blocking findings are on it, and
-  `READY TO MERGE` when none is. The merge prompt MUST follow a completed
-  run with no failed agent and `AUDIT PASS` whose reviewer verdict is
-  `READY TO MERGE`, or `NON-BLOCKING ISSUES ONLY` once every finding the
-  run leaves on the surface is recorded as the next item says; the prompt
+  returned no result, `NON-BLOCKING ISSUES ONLY` when only non-blocking
+  findings are on it, and `READY TO MERGE` when none is. The merge prompt
+  MUST follow a completed run with no failed agent and `AUDIT PASS` whose
+  reviewer verdict is `READY TO MERGE`, or `NON-BLOCKING ISSUES ONLY` once
+  every finding the run leaves on the surface is recorded as the next item
+  says and no contested finding on the surface is unresolved; the prompt
   offers the merge or one more fix round. `.claude/CLAUDE.md` § PR
   workflow operations gives the assistant's procedure.
 - The review surface of a change is what it touches: the changed hunks and
@@ -219,11 +219,13 @@ are forbidden; `master` MUST NOT receive force pushes.
   statement the delta made stale, or a test the delta's new code lacks, is
   one the delta introduced. Correctness, soundness, safety, and contract
   findings stay on the surface as above. A finding on the surface is on one
-  of two tracks. It is blocking when it is a correctness, soundness,
-  safety, or contract defect, in code or in a document's statement of a
-  safety invariant, ABI, or syscall contract, or a MUST violation of a
-  binding standard, of whatever class, anchored in a file that is not a
-  Markdown document; a blocking finding on the surface MUST be fixed before
+  of two tracks. It is blocking when it is of class correctness,
+  soundness, safety, or contract, wherever it anchors (a document's
+  statement of a safety invariant, an ABI or syscall contract, or another
+  documented promise that the code contradicts is such a defect), or a MUST
+  violation of a binding standard, of whatever class, anchored in a file
+  that is not a Markdown document; a blocking finding on the surface MUST
+  be fixed before
   merge. Every other finding on the surface (a MUST violation anchored in a
   Markdown document, a rule that is not a MUST, documentation drift,
   coverage, style: wording, wrapping, nits) is non-blocking: when the run
@@ -239,10 +241,10 @@ are forbidden; `master` MUST NOT receive force pushes.
   later fix round fixes is ticked on that Issue in the same push, and an
   Issue left with no open item is closed by the PR via `Fixes #N`. A
   re-review MUST NOT re-raise a finding an earlier run of the same PR
-  recorded, dropped, or the maintainer ruled
-  on unless the delta changed the hunk it anchors to; the workflow reads a
-  ledger built from the saved run records, and a finding the ledger holds
-  whose hunk the delta left unchanged is listed, not counted. A finding off
+  recorded, dropped, or the maintainer ruled on unless the delta changed
+  the hunk it anchors to; the workflow reads a ledger built from the saved
+  run records, and a finding the ledger holds whose hunk the delta left
+  unchanged is listed, not counted. A finding off
   the surface MUST be recorded, not fixed: the pre-merge review reports it
   as out of bound, and it is appended, with file, line, authority, and fix,
   to the open Issue that already names the work, else to the PR's follow-up
@@ -251,10 +253,12 @@ are forbidden; `master` MUST NOT receive force pushes.
   maintainer's approval, is off the surface of every other PR; a finding on
   it is recorded against that Issue.
   A finding two independent refuters refute on evidence is dropped and listed
-  in the report's Dropped section. Findings off the surface that share file,
-  class, bucket, MUST flag, named Issue, and authority are one root cause:
-  the first is verified and each of the others takes the group's verdict.
-  Every other finding is fixed or recorded.
+  in the report's Dropped section. The review verifies every finding that
+  can block and every Critical or Should finding; a nit that cannot block is
+  fixed or recorded unverified. Verified findings off the surface that share
+  file, class, bucket, MUST flag, named Issue, and authority are one root
+  cause: the first is verified and each of the others takes the group's
+  verdict. Every other finding is fixed or recorded.
 
 ### Branch naming
 

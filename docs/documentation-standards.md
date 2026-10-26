@@ -4,12 +4,13 @@ This document is the authoritative standard for all documentation in the Seraph 
 It governs document structure, authority relationships, linking, and maintenance discipline.
 
 A violation of this standard that the pre-merge review finds on the review surface in a
-Markdown document is non-blocking under [conventions.md](conventions.md) § Branch and PR
-Workflow, which owns that rule, unless it is a document's statement of a safety invariant,
-ABI, or syscall contract that the code contradicts, which that section puts on the blocking
-track; a non-blocking violation is fixed in the batch when the run has blocking findings, and
-otherwise recorded on the PR's follow-up Issue before merge. A violation off the surface is
-recorded as that section says.
+Markdown document is non-blocking; [conventions.md](conventions.md) § Branch and PR Workflow
+owns that rule. The exception is a finding the review classes as a correctness, safety, or
+contract defect (a document's statement of a safety invariant, an ABI or syscall contract, or
+another documented promise that the code contradicts), which that section puts on the blocking
+track. A non-blocking violation is fixed in the batch when the run has blocking findings, and
+otherwise recorded on the PR's follow-up Issue before the merge prompt. A violation off the
+surface is recorded as that section says.
 
 ---
 

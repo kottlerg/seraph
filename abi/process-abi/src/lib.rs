@@ -6,17 +6,25 @@
 //! Userspace process startup ABI: the binary contract between a process creator
 //! and the created process.
 //!
-//! Defines [`ProcessInfo`] (the `#[repr(C)]` handover struct placed at a
-//! well-known virtual address before the new process runs) and [`StartupInfo`]
-//! (the Rust-native type passed to `main()`).
+//! Defines [`ProcessInfo`] (the `#[repr(C)]` handover struct the creator maps
+//! read-only before the new process runs, at a creator-chosen virtual address
+//! delivered in the entry register) and [`StartupInfo`] (a Rust-native view of
+//! it that only memmgr's bespoke `_start` constructs, passing `&StartupInfo` to
+//! memmgr's `main`). std's `_start` builds its own same-purpose type,
+//! `std::os::seraph::StartupInfo`, a superset adding `sched_control_cap`,
+//! `initial_priority`, and `log_send_cap`, read through
+//! `std::os::seraph::startup_info()`.
 //!
-//! The ABI delivers the kernel-object caps (thread/aspace/cspace), the
-//! pre-mapped IPC buffer, the creator endpoint cap, the procmgr service
-//! endpoint (used to bootstrap the allocator), and the three standard-stream
-//! caps (stdin/stdout/stderr) that back `std::io`. Genuinely service-specific
-//! capabilities (registry handles, device caps, block-device endpoints, etc.)
-//! are still requested by the child at startup over IPC on the creator
-//! endpoint — see `shared/ipc/src/lib.rs::bootstrap`.
+//! `ProcessInfo` delivers exactly the cap slots its fields name: the
+//! kernel-object self caps and a baseline `SchedControl` cap; the creator,
+//! procmgr, memmgr (the heap bootstraps from it), and service-registry
+//! endpoints; the stdio ring memory and notification caps that back
+//! `std::io`; the namespace root and current-directory caps; the log
+//! endpoint; and the pager endpoint. It also carries the IPC buffer, the TLS
+//! template, argv/env, and the main-thread layout. Service-specific
+//! capabilities (device caps, block-device endpoints, etc.) are requested by
+//! the child at startup over IPC on the creator endpoint — see
+//! `ipc::bootstrap`.
 
 // Under `rustc-dep-of-std` (build-std), use the core facade and no_core
 // so this crate can sit inside std's dep graph. Mirrors abi/syscall and
@@ -204,11 +212,10 @@ pub const PROCESS_MAIN_TLS_MAX_PAGES: u64 = 4;
 /// process receives it as the argument to `_start` rather than reading a fixed
 /// address.
 ///
-/// All slot indices refer to the process's own `CSpace`. Beyond the kernel-
-/// object self-caps, the creator endpoint, the procmgr endpoint, and the
-/// three standard-stream caps, no further service-specific capabilities are
-/// delivered through this page — the child requests them from its creator
-/// over IPC at startup (see `ipc::bootstrap`).
+/// All slot indices refer to the process's own `CSpace`. Only the cap slots
+/// named by this struct's fields are delivered through this page;
+/// service-specific capabilities come from the creator over IPC at startup
+/// (see `ipc::bootstrap`).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ProcessInfo
@@ -268,7 +275,7 @@ pub struct ProcessInfo
     /// `DESTROY_PROCESS`, future supervision RPCs) and for any future
     /// procmgr-served operation that is not heap-bootstrap.
     ///
-    /// Zero when no procmgr is reachable (procmgr itself, init, anything
+    /// Zero when no procmgr is reachable (procmgr itself, anything
     /// before procmgr exists). Consumers must tolerate zero.
     pub procmgr_endpoint_cap: u32,
 
@@ -282,7 +289,7 @@ pub struct ProcessInfo
     /// per-process tracking, so allocations are accounted to the correct
     /// process.
     ///
-    /// Zero when no memmgr is reachable (memmgr itself, init, anything
+    /// Zero when no memmgr is reachable (memmgr itself, anything
     /// before memmgr exists). Consumers must tolerate zero.
     pub memmgr_endpoint_cap: u32,
 
@@ -302,11 +309,13 @@ pub struct ProcessInfo
     /// This is the **only** service-discovery slot in `ProcessInfo`.
     /// New services do not get their own dedicated slot; they are
     /// resolved by name through this single handle. The deprecated
-    /// `log_send_cap` below predates this convention and will be
-    /// migrated to the same mechanism in a separate PR.
+    /// `log_send_cap` below predates this convention and is migrating
+    /// to the same mechanism (#74).
     ///
-    /// Zero when no svcmgr is reachable (svcmgr itself, init, anything
-    /// before svcmgr exists). Consumers must tolerate zero.
+    /// init creates svcmgr's endpoint before it bootstraps procmgr, so
+    /// procmgr mints a nonzero cap for every child it spawns, svcmgr
+    /// included. Zero for the processes init populates directly
+    /// (memmgr, procmgr). Consumers must tolerate zero.
     pub service_registry_cap: u32,
 
     /// `CSpace` slot of the shmem memory cap backing `std::io::stdin`.
@@ -373,8 +382,9 @@ pub struct ProcessInfo
     // NUL-terminated UTF-8 strings. `args_offset == 0` OR `args_count ==
     // 0` means "no argv delivered".
     //
-    // Argv is bounded by what fits in the remainder of the ProcessInfo
-    // page after the fixed struct. Procmgr rejects oversized blobs.
+    // The page remainder after the fixed struct is where the blob lives,
+    // not its limit; the bound is the create-request wire contract in
+    // `services/procmgr/docs/ipc-interface.md` § CREATE_PROCESS.
     /// Byte offset from the `ProcessInfo` page base where the argv blob
     /// begins. 0 when no argv was provided.
     pub args_offset: u32,
@@ -391,7 +401,8 @@ pub struct ProcessInfo
     // argv blob, between `env_offset` and `env_offset + env_bytes`. The
     // blob is a concatenation of `env_count` NUL-terminated UTF-8 strings,
     // each of shape `KEY=VALUE`. `env_offset == 0` OR `env_count == 0`
-    // means "no env delivered". Same page-remainder bound as argv.
+    // means "no env delivered". The bound is the same wire contract as
+    // argv's.
     /// Byte offset from the `ProcessInfo` page base where the env blob
     /// begins. 0 when no env was provided.
     pub env_offset: u32,
@@ -433,7 +444,7 @@ pub struct ProcessInfo
     /// on a migration path to lookup via [`service_registry_cap`]. New
     /// services MUST NOT add per-service fixed slots like this one;
     /// the registry is the system-wide service-discovery channel from
-    /// this point forward. See follow-up issue tracking the migration.
+    /// this point forward. The migration is tracked by #74.
     ///
     /// Procmgr derives this cap per spawn via `cap_derive_badge` on
     /// the log endpoint it holds, using the child's procmgr-assigned
@@ -442,8 +453,8 @@ pub struct ProcessInfo
     /// matches it directly against the death-notification correlator
     /// procmgr posts on child exit.
     ///
-    /// Zero when no logger is reachable (init, memmgr, procmgr
-    /// themselves; processes spawned before the log endpoint exists).
+    /// Zero for memmgr (init populates its `ProcessInfo` without a log cap)
+    /// and for children procmgr spawns when it holds no log-endpoint source.
     /// `seraph::log!` silently drops in that case.
     ///
     /// The log receiver itself (logd) deletes its seeded copy at startup:
@@ -459,10 +470,9 @@ pub struct ProcessInfo
     //   * `space_notification` — reader kicks writer after consuming bytes;
     //                      writer awaits this when the ring is full.
     //
-    // Both processes hold caps to both notifications (kernel notification objects do
-    // not distinguish send/wait rights at the cap level). Single-waiter
-    // invariant holds because at most one side blocks on each notification at
-    // any given moment.
+    // Both processes hold caps to both notifications, with Notify and Wait
+    // rights. At most one side blocks on each notification at any given
+    // moment.
     //
     // Zero in any slot means the corresponding notification is not attached;
     // the AnonPipe peer treats `notification_wait` as a no-op and falls back
@@ -499,7 +509,7 @@ pub struct ProcessInfo
     /// pager (memmgr's service endpoint). Nonzero for ordinary processes —
     /// demand paging is the system-wide default — and zero only for pinned
     /// processes (`procmgr_labels::CREATE_PINNED`, e.g. DMA drivers) and the
-    /// pre-pager bootstrap (init/memmgr/procmgr).
+    /// pre-pager bootstrap (memmgr/procmgr).
     ///
     /// procmgr binds the main thread's fault handler to this endpoint at
     /// creation; the runtime reads this slot and `pager_badge` to bind the
@@ -524,9 +534,13 @@ pub struct ProcessInfo
 
 // ── StartupInfo ──────────────────────────────────────────────────────────────
 
-/// Rust-native startup information passed to `main()`.
+/// Rust-native view of the startup handover data.
 ///
-/// Constructed by `_start()` from [`ProcessInfo`].
+/// Only memmgr's bespoke `_start` constructs it, from [`ProcessInfo`], and
+/// passes `&StartupInfo` to memmgr's `main`. std's `_start` builds its own
+/// same-purpose type, `std::os::seraph::StartupInfo` — a superset adding
+/// `sched_control_cap`, `initial_priority`, and `log_send_cap` — which
+/// std-built binaries read through `std::os::seraph::startup_info()`.
 pub struct StartupInfo
 {
     /// Virtual address of the IPC buffer page.
@@ -544,14 +558,16 @@ pub struct StartupInfo
     /// `CSpace` slot of own `CSpace` capability.
     pub self_cspace: u32,
 
-    /// `CSpace` slot of a badged SEND cap on procmgr's service endpoint.
-    /// Zero when unreachable (procmgr itself, or earlier in the boot chain).
+    /// `CSpace` slot of a badged SEND cap on procmgr's service endpoint,
+    /// copied from [`ProcessInfo::procmgr_endpoint_cap`]. Zero for memmgr,
+    /// this type's only constructor: init writes none into its `ProcessInfo`.
     pub procmgr_endpoint: u32,
 
-    /// `CSpace` slot of a badged SEND cap on memmgr's service endpoint.
-    /// Used by `std::os::seraph::_start` to bootstrap the heap allocator.
-    /// Zero when unreachable (memmgr itself, init, or earlier in the boot
-    /// chain).
+    /// `CSpace` slot of a badged SEND cap on memmgr's service endpoint,
+    /// copied from [`ProcessInfo::memmgr_endpoint_cap`]. Zero for memmgr,
+    /// this type's only constructor: init delivers memmgr no badged client SEND
+    /// in `ProcessInfo` (memmgr serves its endpoint through the full-rights cap
+    /// its bootstrap round delivers).
     pub memmgr_endpoint: u32,
 
     /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, the

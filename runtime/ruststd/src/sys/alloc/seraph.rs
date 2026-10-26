@@ -13,11 +13,12 @@
 //! constants below; the page-reservation allocator (`std::sys::reserve`)
 //! owns its own arena disjoint from the heap.
 //!
-//! Bootstrap is explicit: `std::os::seraph::heap_bootstrap(procmgr_ep,
-//! self_aspace)` must be called once, after the bootstrap IPC round
-//! that produces `procmgr_ep`, before the first allocation. An
-//! allocation before bootstrap returns a null pointer and the alloc
-//! crate aborts via `handle_alloc_error`.
+//! Bootstrap is explicit: `_start` (`std::os::seraph`) calls
+//! `heap_bootstrap(memmgr_ep, self_aspace)` with
+//! `ProcessInfo.memmgr_endpoint_cap` before `main` whenever that cap is
+//! non-zero, and any later call is a no-op. An allocation before bootstrap
+//! returns a null pointer and the alloc crate aborts via
+//! `handle_alloc_error`.
 //!
 //! The IPC buffer pointer used by `grow` is read from the TLS slot
 //! populated in `_start` / the thread trampoline (see
@@ -269,7 +270,7 @@ impl Heap {
         null_mut()
     }
 
-    /// Extend the heap by requesting fresh pages from procmgr, mapping
+    /// Extend the heap by requesting fresh pages from memmgr, mapping
     /// them immediately above `mapped_end`, and appending the new region
     /// to the free list.
     ///
@@ -662,53 +663,122 @@ fn slab_round_to_class(bytes: u64) -> u64 {
     }
 }
 
-/// Request a Memory cap from memmgr covering at least `min_pages` 4-KiB
-/// pages. memmgr's best-effort reply may return up to four Memory caps, each
-/// covering one or more contiguous pages. We accept the first cap whose
-/// declared `page_count` is `>= min_pages`; if none qualifies, we fall back
-/// to the first returned cap (any cap unblocks sub-page retypes; a too-small
-/// cap simply means the next page-sized retype request triggers a refresh).
+/// Request one Memory cap from memmgr covering a single contiguous run of at
+/// least `min_pages` 4-KiB pages.
 ///
-/// Returns `Some((slot, pages, phys))` on success, `None` on IPC failure or
-/// empty reply. `phys` is the chosen cap's physical base, which memmgr reports
-/// at `data[1 + returned + i]`; the caller passes it to [`slab_release_fresh`]
-/// to return the run to memmgr's pool mid-life. Also used by the pipe
-/// machinery (`sys::pipe`) for ring pages, which need the phys base so the
-/// grant can be returned when the pipe ends its life.
+/// Every caller retypes from or maps exactly one cap, so the request sets
+/// `REQUIRE_CONTIGUOUS`: memmgr replies with one cap covering all `min_pages`
+/// or refuses with `OUT_OF_MEMORY_CONTIGUOUS`. The reply is still treated as
+/// wire input: the first returned cap whose declared page count covers
+/// `min_pages` is kept, and every other cap the reply carries is deleted and
+/// its run returned to memmgr (see [`release_reply_caps`]).
+///
+/// Returns `Some((slot, pages, phys))` on success. `phys` is the kept cap's
+/// physical base, which memmgr reports at `data[1 + returned + i]`; the
+/// caller passes it to [`slab_release_fresh`] to return the run to memmgr's
+/// pool mid-life. Also used by the pipe machinery (`sys::pipe`) for ring
+/// pages, which need the phys base so the grant can be returned when the
+/// pipe ends its life.
+///
+/// Returns `None` on IPC failure, a memmgr error label, a `min_pages` that
+/// does not fit the request's 32-bit page-count field, a reply whose clamped
+/// count (the declared count bounded by the caps actually transferred) is
+/// zero, a reply whose data words do not cover that count, or a reply none of
+/// whose caps covers `min_pages`. A refused reply's caps are released the
+/// same way as the unchosen caps of an accepted one.
 pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u64)> {
     let ipc_buf = current_ipc_buf();
     if ipc_buf.is_null() {
         return None;
     }
-    let msg = ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, min_pages).build();
+    let want = u32::try_from(min_pages).ok()?;
+    // data[0] low half = want_pages, high half = flags.
+    let flags = u64::from(ipc::memmgr_labels::REQUIRE_CONTIGUOUS) << 32;
+    let msg =
+        ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, u64::from(want) | flags).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) }.ok()?;
-    if reply.label != 0 {
-        return None;
-    }
-    let returned = reply.word(0) as usize;
-    if returned == 0 {
-        return None;
-    }
     let caps = reply.caps();
+    let words = reply.words();
+    // The count is wire input: bound it by the caps actually transferred,
+    // then require the words actually delivered to cover one page count and
+    // one phys base per cap after the count word before either is indexed.
+    // An error reply defines no data layout, so its count is zero.
+    let returned = match words.first() {
+        Some(&count) if reply.label == 0 => (count as usize).min(caps.len()),
+        _ => 0,
+    };
+    let covered = returned != 0 && 1 + 2 * returned <= words.len();
     // Reply layout: data[1+i] = page_count_i, data[1+returned+i] = phys_base_i.
-    // Prefer the first cap that already covers `min_pages`.
-    for i in 0..returned {
-        let pages = reply.word(1 + i);
-        if pages >= min_pages {
-            return Some((caps[i], pages, reply.word(1 + returned + i)));
+    let keep = if covered {
+        (0..returned).find(|&i| words[1 + i] >= min_pages)
+    } else {
+        None
+    };
+    release_reply_caps(memmgr_ep, ipc_buf, caps, words, returned, keep);
+    let i = keep?;
+    Some((caps[i], words[1 + i], words[1 + returned + i]))
+}
+
+/// Delete every cap a `REQUEST_MEMORY_CAPS` reply transferred except the one
+/// at index `keep`, and return each deleted cap's run to memmgr's pool with
+/// one `RELEASE_MEMORY_CAPS` naming the phys bases the reply reported.
+///
+/// `returned` is the reply's clamped count. A cap at or past it, or one whose
+/// phys word the reply did not deliver, has no base to name: its slot is
+/// still freed, and its run stays accounted to this process until it dies.
+/// The release is best-effort: memmgr ignores a base that matches no
+/// outstanding grant, and a failed IPC leaves the runs accounted the same way.
+fn release_reply_caps(
+    memmgr_ep: u32,
+    ipc_buf: *mut u64,
+    caps: &[u32],
+    words: &[u64],
+    returned: usize,
+    keep: Option<usize>,
+) {
+    let mut bases = [0u64; syscall_abi::MSG_CAP_SLOTS_MAX];
+    let mut n = 0;
+    for (i, &cap) in caps.iter().enumerate() {
+        if keep == Some(i) {
+            continue;
+        }
+        let _ = syscall::cap_delete(cap);
+        // `n` stays below `caps.len()`, which the kernel bounds by
+        // `MSG_CAP_SLOTS_MAX`, so the store is in bounds.
+        if let Some(&base) = words.get(1 + returned + i).filter(|_| i < returned) {
+            bases[n] = base;
+            n += 1;
         }
     }
-    // Fallback: take the first (smaller) cap so sub-page retypes still work.
-    Some((caps[0], reply.word(1), reply.word(1 + returned)))
+    if n == 0 {
+        return;
+    }
+    let msg = ipc::IpcMessage::builder(RELEASE_MEMORY_CAPS)
+        .word(0, n as u64)
+        .words(1, &bases[..n])
+        .build();
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+    let _ = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) };
 }
 
 /// Bytes withheld from a fresh grant's local ledger as slack against any
 /// kernel-side retype cost the mirror does not model. The kernel debits
 /// exactly the class-rounded dispatch cost, so this is conservative; the
-/// slow-path resync reads the authoritative ledger anyway. Also why a
-/// page-aligned request asks memmgr for its page count plus one.
+/// slow-path resync reads the authoritative ledger anyway. Every request
+/// asks memmgr for the pages covering the class plus this reserve
+/// ([`slab_want_pages`]).
 const ALLOCATOR_METADATA_RESERVE: u64 = 64;
+
+/// Pages a slab request asks memmgr for: the fewest that cover the
+/// class-rounded `need` plus [`ALLOCATOR_METADATA_RESERVE`]. A sub-page class
+/// asks for one page and a page-aligned class for one page over its own page
+/// count. Every request sets `REQUIRE_CONTIGUOUS` ([`slab_request_pages`]),
+/// so asking for no more than this keeps a one-page free run able to serve a
+/// sub-page class.
+fn slab_want_pages(need: u64) -> u64 {
+    (need + ALLOCATOR_METADATA_RESERVE).div_ceil(PAGE_SIZE)
+}
 
 /// Retype under `pool`'s lock via `retype`. On an exhausted local ledger:
 /// resync from the kernel's `available_bytes` (recovers auto-reclaimed
@@ -808,8 +878,8 @@ fn slab_retype_pooled<T>(
             return Some(out);
         }
 
-        // Refill: request a fresh cap from memmgr. One attempt — propagate
-        // failure rather than loop on best-effort partial replies.
+        // Refill: request a fresh contiguous cap from memmgr. One attempt —
+        // propagate failure rather than retry.
         let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
         if ep == 0 {
             return None;
@@ -936,9 +1006,9 @@ pub fn slab_release_fresh(phys: u64) {
 /// a cap too small for the class, or `retype` itself fails.
 pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<T>) -> Option<T> {
     let need = slab_round_to_class(min_bytes);
-    // One page over the class's own page count, so `need` still fits after
-    // the ledger withholds `ALLOCATOR_METADATA_RESERVE` from the grant.
-    let want_pages = need.div_ceil(PAGE_SIZE).max(1) + 1;
+    // Sized so `need` still fits after the ledger withholds
+    // `ALLOCATOR_METADATA_RESERVE` from the grant.
+    let want_pages = slab_want_pages(need);
     if need <= 128 {
         slab_retype_pooled(&SLAB_BIN_128, need, want_pages, retype)
     } else if need <= 512 {
@@ -972,8 +1042,7 @@ pub fn object_slab_retype<T>(min_bytes: u64, retype: impl FnOnce(u32) -> Option<
 /// iteration until process death.
 pub fn object_slab_acquire_fresh(min_bytes: u64) -> Option<SlabGrant> {
     let need = slab_round_to_class(min_bytes);
-    let want_pages = need.div_ceil(PAGE_SIZE).max(1) + 1;
-    slab_acquire_fresh(need, want_pages)
+    slab_acquire_fresh(need, slab_want_pages(need))
 }
 
 /// memmgr's current free-pool size in bytes (`QUERY_POOL_STATUS`, reply
@@ -1070,16 +1139,16 @@ unsafe impl GlobalAlloc for System {
             // successful grow covers single allocations up to one
             // grow-increment larger than the largest existing free block;
             // anything beyond that returns null to `handle_alloc_error`.
-            // Multiple grow rounds are NOT attempted: each grown page
-            // consumes one CSpace slot (procmgr's `REQUEST_MEMORY_CAPS` ABI
-            // is one cap per page), and the fixed 256-slot child CSpace
-            // saturates after a few hundred pages. Once that cap-transfer
-            // fails, the kernel's `ipc_reply` currently leaves the caller
-            // blocked rather than returning an error. Bounded grow keeps
-            // grow within CSpace headroom. IPC wrappers under the lock
-            // are non-allocating (the IPC buffer is the pre-registered
-            // page, not heap-backed), so there is no re-entrant
-            // allocation here.
+            // The single bounded grow bounds the work done under the heap
+            // lock per allocation: memmgr's `REQUEST_MEMORY_CAPS` reply
+            // carries up to `MSG_CAP_SLOTS_MAX` caps, each covering a
+            // contiguous run of one or more pages
+            // (services/memmgr/docs/ipc-interface.md § Label 1), so one
+            // grow is at most `grow_exact`'s bounded count of IPC rounds,
+            // and a refused or failed round fails the grow. IPC wrappers
+            // under the lock are non-allocating (the IPC buffer is the
+            // pre-registered page, not heap-backed), so there is no
+            // re-entrant allocation here.
             let want = layout.size().saturating_add(layout.align());
             if heap.grow(want) {
                 ptr = heap.alloc(layout);

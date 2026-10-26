@@ -24,6 +24,12 @@ pub fn phases() -> &'static [Phase]
     ]
 }
 
+/// Bound on the 1 ms polls of a piped `try_wait` after the child's stdout
+/// reached EOF.
+const TRY_WAIT_POLLS: u32 = 5000;
+
+// too_many_lines: the phase is a sequence of independent numbered scenarios
+// sharing one log narrative.
 #[allow(clippy::too_many_lines)]
 pub fn pipes_phase(_: &Caps)
 {
@@ -67,6 +73,16 @@ pub fn pipes_phase(_: &Caps)
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn /programs/stdiotest (piped) failed");
+
+        // The child blocks on stdin until the write below, so it is alive:
+        // a piped `try_wait` must report that without blocking.
+        assert!(
+            child
+                .try_wait()
+                .expect("stdiotest try_wait (alive) failed")
+                .is_none(),
+            "stdiotest try_wait reported an exit before its stdin was written"
+        );
 
         {
             let mut stdin = child
@@ -120,7 +136,18 @@ pub fn pipes_phase(_: &Caps)
             }
         }
 
-        let status = child.wait().expect("stdiotest wait failed");
+        // Poll the piped `try_wait` until it reports the exit.
+        let mut status = None;
+        for _ in 0..TRY_WAIT_POLLS
+        {
+            status = child.try_wait().expect("stdiotest try_wait failed");
+            if status.is_some()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let status = status.expect("stdiotest try_wait never reported the exit");
         assert!(status.success(), "stdiotest did not exit cleanly: {status}");
         std::os::seraph::log!("pipes: stdiotest round-trip ok");
     }

@@ -60,8 +60,14 @@ handle (`CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`).
 
 procmgr maps the module, parses the ELF, creates the child's address space,
 CSpace, and thread, maps LOAD segments, and populates the `ProcessInfo`
-handover page. An oversized argv or env blob degrades to empty. procmgr deletes
-its copies of cap[0] and cap[1] whether creation succeeds or fails.
+handover page. The whole data area is bounded by `MSG_DATA_WORDS_MAX` (64
+words), so argv and env cannot both reach 256 bytes; the sender keeps the packed
+layout within it. An oversized argv or env blob degrades to empty, and procmgr
+never reads past the data area: an `args_bytes` over 256 degrades env along
+with argv (the env header position derives from it), an env header word beyond
+the delivered word count degrades env to empty, and blob bytes declared beyond
+the delivered words read as zero. procmgr deletes its copies of cap[0] and
+cap[1] whether creation succeeds or fails.
 
 **Reply (success):**
 
@@ -165,7 +171,7 @@ embedded in the endpoint capability.
 | 3 | (none) | `thread_configure_with_tls` failed |
 | 4 | `INVALID_BADGE` | No process with the given badge exists |
 | 5 | `ALREADY_STARTED` | Process was already started |
-| 6 | (none) | `thread_start` failed |
+| 6 | (none) | `thread_start` failed with an error other than `Interrupted`, which procmgr retries |
 
 Codes 3 and 6 are raw values with no `procmgr_errors` constant.
 

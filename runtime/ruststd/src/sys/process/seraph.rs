@@ -44,9 +44,11 @@
 //!     tracks into `CommandEnv`. Both are serialised at `spawn` time into the
 //!     label + data of `CREATE_FROM_FILE` (same encoding as `CREATE_PROCESS`
 //!     and end up in the child's `ProcessInfo` page, surfaced via
-//!     `std::env::{args, vars}` on the child side. Blobs are bounded by
-//!     `ipc::ARGS_BLOB_MAX` and 8-bit counts; oversize returns
-//!     `ArgumentListTooLong`.
+//!     `std::env::{args, vars}` on the child side. Each blob is bounded by
+//!     `ipc::ARGS_BLOB_MAX` and an 8-bit count, and the packed message
+//!     (file-size word, argv words, env-length word, env words) by
+//!     `MSG_DATA_WORDS_MAX`, so argv and env cannot both fill
+//!     `ARGS_BLOB_MAX`; oversize returns `ArgumentListTooLong`.
 
 use crate::ffi::{OsStr, OsString};
 pub use crate::ffi::OsString as EnvKey;
@@ -72,6 +74,7 @@ use ipc::{procmgr_errors, procmgr_labels};
 const BRIDGE_SENTINEL_DROP: u64 = u64::MAX;
 
 use syscall::EXIT_KILLED;
+use syscall_abi::{MSG_DATA_WORDS_MAX, SyscallError};
 
 // ── Stdio ───────────────────────────────────────────────────────────────────
 
@@ -354,6 +357,29 @@ impl Command {
         }
         let env_count: u32 = env_count_usize as u32;
 
+        // CREATE_FROM_FILE wire: word 0 = file_size, words 1.. = argv,
+        // env header, env. Both blobs fit `ARGS_BLOB_MAX` on their own, but
+        // together they can exceed the message's data area; reject that
+        // here, before any cap is minted, instead of letting the builder
+        // assert on it.
+        let argv_words = if args_blob.is_empty() {
+            0
+        } else {
+            args_blob.len().div_ceil(8)
+        };
+        let env_header_words = if env_count > 0 && !env_blob.is_empty() {
+            1 + env_blob.len().div_ceil(8)
+        } else {
+            0
+        };
+        let total_words = 1 + argv_words + env_header_words;
+        if total_words > MSG_DATA_WORDS_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::ArgumentListTooLong,
+                "argv and env together exceed the CREATE_FROM_FILE message size",
+            ));
+        }
+
         // SAFETY: `info.ipc_buffer` is the kernel-registered IPC buffer for
         // this thread, installed at `_start` time; page-aligned, u64-aligned,
         // and mapped for the process lifetime.
@@ -379,17 +405,6 @@ impl Command {
             })?;
         let file_cap = walked.file_cap;
         let file_size = walked.size;
-
-        let argv_words = if args_blob.is_empty() {
-            0
-        } else {
-            args_blob.len().div_ceil(8)
-        };
-        let env_header_words = if env_count > 0 && !env_blob.is_empty() {
-            1 + env_blob.len().div_ceil(8)
-        } else {
-            0
-        };
 
         // Create the per-child death `EventQueue` BEFORE issuing
         // CREATE_FROM_FILE so a POST-only copy can ride along as the
@@ -420,10 +435,9 @@ impl Command {
             }
         };
 
-        // CREATE_FROM_FILE wire: word 0 = file_size, words 1.. = argv,
-        // env header, env. Caps: [file_cap, death_relay]. Command-spawned
-        // children skip the creator endpoint slot; the death relay is the
-        // trailing cap (flagged by `CREATE_DEATH_RELAY`).
+        // Caps: [file_cap, death_relay]. Command-spawned children skip the
+        // creator endpoint slot; the death relay is the trailing cap
+        // (flagged by `CREATE_DEATH_RELAY`).
         let argv_word_offset: usize = 1;
         let env_len_word_offset = argv_word_offset + argv_words;
         let env_blob_word_offset = env_len_word_offset + 1;
@@ -456,7 +470,6 @@ impl Command {
         };
         // Death relay is the trailing cap (peeled off the tail procmgr-side).
         let builder = builder.cap(death_relay);
-        let total_words = 1 + argv_words + env_header_words;
         let msg = builder.word_count(total_words).build();
 
         // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page for
@@ -615,7 +628,7 @@ impl Command {
                     completion_notification,
                     pipe_notifications,
                     exit_reason: exit_reason.clone(),
-                    peer_dead,
+                    peer_dead: peer_dead.clone(),
                 };
                 let handle = crate::thread::Builder::new()
                     .name(crate::string::String::from("seraph-deathbridge"))
@@ -627,6 +640,7 @@ impl Command {
                     completion_notification,
                     handle: Some(handle),
                     exit_reason,
+                    peer_dead,
                 })
             })();
             match bridge_setup {
@@ -958,12 +972,17 @@ struct Bridge {
     /// Bridge → `wait` rendezvous. Bridge `notification_send`s once after
     /// publishing `exit_reason`; `wait` `notification_wait`s.
     completion_notification: u32,
-    /// Bridge thread handle. Taken by `wait` (after completion fires)
-    /// or `Drop` (after sentinel post).
+    /// Bridge thread handle. Taken by `wait` (after completion fires), by
+    /// `try_wait` (after seeing `peer_dead`), or by `Drop` (after sentinel
+    /// post).
     handle: Option<JoinHandle<()>>,
     /// Exit reason published by the bridge before raising
-    /// `completion_notification`. Read by `wait` after the wake.
+    /// `completion_notification`. Read by `wait` after the wake and by
+    /// `try_wait` after seeing `peer_dead`.
     exit_reason: Arc<AtomicU64>,
+    /// Set by the bridge (Release) after publishing `exit_reason`; polled by
+    /// `try_wait`, which must not block.
+    peer_dead: Arc<AtomicBool>,
 }
 
 pub struct Process {
@@ -1014,13 +1033,19 @@ impl Process {
         }
         let reason = if let Some(b) = self.bridge.as_mut() {
             // Bridge raises `completion_notification` exactly once after
-            // publishing `exit_reason`. Loop on zero-bit wakes
-            // (e.g. spurious / timeout) until real bits arrive.
+            // publishing `exit_reason`. An untimed wait always returns
+            // non-zero bits; the zero-bit retry is defensive. `Interrupted`
+            // (this thread was stopped and restarted) waits again.
             loop {
-                let bits = syscall::notification_wait(b.completion_notification)
-                    .map_err(|_| io::Error::other("notification_wait on completion_notification failed"))?;
-                if bits != 0 {
-                    break;
+                match syscall::notification_wait(b.completion_notification) {
+                    Ok(0) => {}
+                    Ok(_) => break,
+                    Err(e) if e == SyscallError::Interrupted as i64 => {}
+                    Err(_) => {
+                        return Err(io::Error::other(
+                            "notification_wait on completion_notification failed",
+                        ));
+                    }
                 }
             }
             if let Some(h) = b.handle.take() {
@@ -1029,12 +1054,19 @@ impl Process {
             b.exit_reason.load(Ordering::Acquire)
         } else {
             // Non-piped: `wait` consumes the kernel's death post on
-            // `death_eq` directly. No bridge thread allocated. A `death_eq`
-            // destroyed while `wait` is parked returns `Ok(0)`, not an error
-            // (a kernel defect tracked in #443), so `wait` caches and returns
-            // `ExitStatus(0)` for a death that was never reported.
-            syscall::event_recv(self.death_eq)
-                .map_err(|_| io::Error::other("event_recv on child death queue failed"))?
+            // `death_eq` directly. No bridge thread allocated. `Interrupted`
+            // (this thread was stopped and restarted, or `death_eq` was
+            // destroyed under the wait) waits again; a destroyed queue then
+            // fails the next receive.
+            loop {
+                match syscall::event_recv(self.death_eq) {
+                    Ok(reason) => break reason,
+                    Err(e) if e == SyscallError::Interrupted as i64 => {}
+                    Err(_) => {
+                        return Err(io::Error::other("event_recv on child death queue failed"));
+                    }
+                }
+            }
         };
         let status = ExitStatus(reason);
         self.exit_status = Some(status);
@@ -1046,23 +1078,17 @@ impl Process {
             return Ok(Some(cached));
         }
         let reason = if let Some(b) = self.bridge.as_mut() {
-            // `notification_wait_timeout(_, 0)` returns immediately. Non-zero
-            // wakeup_value means the bridge published `exit_reason` and
-            // raised `completion_notification`; zero means "nothing pending".
-            match syscall::notification_wait_timeout(b.completion_notification, 0) {
-                Ok(bits) if bits != 0 => {
-                    if let Some(h) = b.handle.take() {
-                        let _ = h.join();
-                    }
-                    b.exit_reason.load(Ordering::Acquire)
-                }
-                Ok(_) => return Ok(None),
-                Err(_) => {
-                    return Err(io::Error::other(
-                        "notification_wait_timeout on completion_notification failed",
-                    ));
-                }
+            // A blocking wait would stall here (a 0 timeout waits forever),
+            // so poll the death flag the bridge sets after `exit_reason`.
+            if !b.peer_dead.load(Ordering::Acquire) {
+                return Ok(None);
             }
+            // The bridge's remaining work (pipe kicks, ring releases, the
+            // completion send) is bounded; join it before reporting.
+            if let Some(h) = b.handle.take() {
+                let _ = h.join();
+            }
+            b.exit_reason.load(Ordering::Acquire)
         } else {
             // Non-piped: `event_try_recv` returns `WouldBlock` (-6) if
             // the kernel hasn't posted yet.
@@ -1112,9 +1138,8 @@ impl Drop for Process {
 
 // ── Death bridge ───────────────────────────────────────────────────────────
 //
-// One thread per piped spawn (the bridge runs unconditionally — even
-// non-piped children benefit from the `completion_notification` rendezvous,
-// and the per-pipe arrays are simply empty). Receives the kernel's
+// One thread per piped spawn; non-piped spawns have no bridge, and `wait`
+// consumes `death_eq` directly. Receives the kernel's
 // death notification on `death_eq` and translates it into:
 //   * `peer_dead.store(true)` — fired on every child death, clean exit
 //     included. Every parent-side `Pipe` checks this atom before each
@@ -1163,20 +1188,16 @@ struct BridgeHandles {
 }
 
 fn bridge_main(h: BridgeHandles) {
-    // A `death_eq` destroyed while this wait is parked returns `Ok(0)`, not
-    // an error (a kernel defect tracked in #443). The bridge then runs the
-    // whole death path below, as for a real death, for a child that may
-    // still be alive: it records exit reason 0, a clean exit the child never
-    // reported, sets `peer_dead` so the parent's pipe ends report EOF or
-    // `BrokenPipe`, kicks every pipe notification, and reports the death to
-    // each `RingRelease`, so a ring grant returns to memmgr once its parent
-    // end is dropped (at once for an end already dropped) while the child
-    // may still be writing through its mapping.
-    let payload = match syscall::event_recv(h.death_eq) {
-        Ok(p) => p,
-        // `event_recv` error (`death_eq` invalid, or the wait interrupted)
-        // — nothing to do, exit without firing any wakes.
-        Err(_) => return,
+    let payload = loop {
+        match syscall::event_recv(h.death_eq) {
+            Ok(p) => break p,
+            // A stop and restart of this thread, or `death_eq` destroyed
+            // under the wait; a destroyed queue fails the next receive.
+            Err(e) if e == SyscallError::Interrupted as i64 => {}
+            // `death_eq` invalid — nothing to do, exit without firing any
+            // wakes.
+            Err(_) => return,
+        }
     };
     if payload == BRIDGE_SENTINEL_DROP {
         // Spawner is dropping the Process; do not fire any wakes.

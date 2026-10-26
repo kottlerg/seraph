@@ -7,11 +7,12 @@
 //!
 //! One module per architecture, selected here by `target_arch` (the arch-module
 //! declaration site, per docs/coding-standards.md § C). Each exposes the same
-//! entry points; architecture-specific ktest code belongs behind them.
+//! entry points and constants; architecture-specific ktest code belongs behind
+//! them.
 //!
 //! TODO: move every `#[cfg(target_arch)]` item outside `src/arch/` behind this
 //! surface. Deferred because the move is ktest-wide restructuring, separate from
-//! the kernel fixes the code here validates; #460 lists the remaining sites.
+//! the kernel fixes the code here validates; #460 tracks the move.
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]
@@ -21,4 +22,7 @@ mod current;
 #[path = "riscv64/mod.rs"]
 mod current;
 
-pub use current::{run_integration, run_unit};
+pub use current::{
+    ILLEGAL_INSTRUCTION_VECTOR, IP_OFFSET, PAGE_FAULT_STORE_VECTOR, TRAP_FRAME_BYTES,
+    illegal_instruction, run_integration, run_unit,
+};

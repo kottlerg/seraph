@@ -27,6 +27,7 @@ mod concurrent_event_producers;
 mod concurrent_ipc;
 mod concurrent_map_unmap;
 mod concurrent_notification;
+mod configure_start_race;
 mod cspace_recycle;
 mod double_enqueue_storm;
 mod event_queue_fill_drain;
@@ -34,16 +35,33 @@ mod event_try_recv_post_race;
 mod fpu_migration_churn;
 mod idle_wake_race;
 mod load_balance_handoff_steal;
+mod mutual_stop;
 mod priority_dealloc_race;
 mod retype_concurrent;
+mod sleep_list_full;
 mod split_delete_race;
+mod stop_claimed_delete;
+mod stop_fault_sender;
+mod stop_owed_wake;
+mod stop_park_race;
+mod stop_repark;
 mod stop_reply_race;
 mod stop_resume_race;
+mod stop_sleep_window;
+mod stop_target_vanishes;
 mod thread_churn;
+mod timed_wait_reuse;
+mod timed_wait_source_delete;
+mod timed_waiter_thread_delete;
 
 use crate::{ChildStack, TestContext, run_integration_test};
 
-/// Maximum concurrent child threads across all stress tests.
+/// Number of shared child stacks, and so the maximum children a stress cell
+/// runs on [`STRESS_STACKS`] stacks at once.
+/// `sleep_list_full`, which needs one sleeper per sleep-list slot
+/// (`MAX_SLEEPING` = 128), draws one `STRESS_STACKS` stack for its victims
+/// and carries its own 128 × 8 KiB filler stacks (1 MiB more BSS), so it runs
+/// 129 concurrent children, past this cap.
 ///
 /// 64 matches the width of the `u64` notification bitmask used by tests that
 /// allocate one bit per worker (`concurrent_notification`, `retype_concurrent`,
@@ -81,6 +99,31 @@ pub fn run_all(ctx: &TestContext)
     );
     run_integration_test!("stress::stop_reply_race", stop_reply_race::run(ctx));
     run_integration_test!("stress::stop_resume_race", stop_resume_race::run(ctx));
+    run_integration_test!(
+        "stress::configure_start_race",
+        configure_start_race::run(ctx)
+    );
+    run_integration_test!("stress::stop_sleep_window", stop_sleep_window::run(ctx));
+    run_integration_test!("stress::sleep_list_full", sleep_list_full::run(ctx));
+    run_integration_test!("stress::stop_park_race", stop_park_race::run(ctx));
+    run_integration_test!("stress::stop_owed_wake", stop_owed_wake::run(ctx));
+    run_integration_test!("stress::stop_fault_sender", stop_fault_sender::run(ctx));
+    run_integration_test!("stress::mutual_stop", mutual_stop::run(ctx));
+    run_integration_test!("stress::stop_repark", stop_repark::run(ctx));
+    run_integration_test!("stress::stop_claimed_delete", stop_claimed_delete::run(ctx));
+    run_integration_test!(
+        "stress::stop_target_vanishes",
+        stop_target_vanishes::run(ctx)
+    );
+    run_integration_test!(
+        "stress::timed_wait_source_delete",
+        timed_wait_source_delete::run(ctx)
+    );
+    run_integration_test!(
+        "stress::timed_waiter_thread_delete",
+        timed_waiter_thread_delete::run(ctx)
+    );
+    run_integration_test!("stress::timed_wait_reuse", timed_wait_reuse::run(ctx));
     run_integration_test!(
         "stress::double_enqueue_storm",
         double_enqueue_storm::run(ctx)

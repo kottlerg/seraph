@@ -11,9 +11,10 @@
 //! buffers are page-aligned heap allocations. Join synchronises on a
 //! Notification cap; the child thread signals just before calling
 //! SYS_THREAD_EXIT, and join then reclaims the child's kernel object, caps, and
-//! heap/VA resources. A detached handle (dropped without join) hands its
-//! resources to the in-module `reaper`, which reclaims them once the child's
-//! kernel death notification lands (see the `reaper` module).
+//! heap/VA resources. A detached handle (dropped without join), or a join whose
+//! wait fails for a reason other than `Interrupted`, hands its resources to the
+//! in-module `reaper`, which reclaims them once the child's kernel death
+//! notification lands (see the `reaper` module).
 //!
 //! Native ELF TLS is live: `SYS_THREAD_CONFIGURE` accepts `tls_base`, the
 //! kernel context switch saves/restores `IA32_FS_BASE` (x86-64) / `tp`
@@ -31,7 +32,7 @@ use crate::num::NonZero;
 use crate::thread::ThreadInit;
 use crate::time::Duration;
 
-use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE};
+use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE, SyscallError};
 
 /// Default minimum stack size. Matches the upstream unsupported-PAL value.
 pub const DEFAULT_MIN_STACK_SIZE: usize = 64 * 1024;
@@ -84,7 +85,8 @@ impl ThreadResources {
     /// Reclaim every owned resource: delete the Thread cap (drives
     /// `dealloc_object(Thread)` — drain + `retype_free` + ancestor `dec_ref`),
     /// delete the done-notification cap, free the TLS block and IPC buffer, and
-    /// release the stack.
+    /// release the stack. A `done_notification` of 0 (the permanently null
+    /// slot, set by a join whose wait failed) deletes nothing.
     ///
     /// # Safety
     /// The owning thread MUST have left user-mode (joined, or its kernel death
@@ -373,7 +375,18 @@ impl Thread {
         // if the reaper is unavailable, fall back to leak-on-detach (`None`).
         let reaper = reaper::register(thread_cap);
 
-        if let Err(_) = syscall::thread_start(thread_cap) {
+        // `Interrupted` means this thread was stopped while the start waited
+        // for the child to settle; nothing was started, so the start is
+        // retried. Any other error leaves the child never started and is
+        // fatal to the spawn.
+        let started = loop {
+            match syscall::thread_start(thread_cap) {
+                Ok(()) => break true,
+                Err(e) if e == SyscallError::Interrupted as i64 => {}
+                Err(_) => break false,
+            }
+        };
+        if !started {
             if let Some((slot, generation)) = reaper {
                 reaper::release(slot, generation);
             }
@@ -428,15 +441,49 @@ impl Thread {
         // without spinning since the child has already exited), and frees the
         // memory. A spurious early wake only makes the cap delete briefly spin
         // in the kernel drain protocol — correct, never a use-after-free.
-        let _ = syscall::notification_wait(res.done_notification);
-        // SAFETY: the child has left user-mode (it signalled done_notification).
-        unsafe { res.reclaim() };
-
-        // Release this thread's reaper slot so its (eventual) death-post is a
-        // no-op, then opportunistically reap any detached threads that have died.
-        if let Some((slot, generation)) = reaper {
-            reaper::release(slot, generation);
+        // `Interrupted` (this thread was stopped and restarted) and a zero-bit
+        // return wait again: the child may still be running. Any other error
+        // means the private done-notification cap is gone and no wait can
+        // succeed; the child is then handed to the reaper as if detached, so
+        // its kernel death notification reclaims it, rather than reclaimed
+        // under a child that may still be in user mode. Its done-notification
+        // index is first set to the permanently null slot 0, so the later
+        // `reclaim` deletes nothing there rather than an unrelated cap that
+        // has since taken the freed slot. Without a reaper slot its resources
+        // are leaked until process death.
+        let signalled = loop {
+            match syscall::notification_wait(res.done_notification) {
+                Ok(0) => {}
+                Ok(_) => break true,
+                Err(e) if e == SyscallError::Interrupted as i64 => {}
+                Err(_) => break false,
+            }
+        };
+        if signalled {
+            // SAFETY: the child has left user-mode (it signalled
+            // done_notification).
+            unsafe { res.reclaim() };
+            // Release this thread's reaper slot so its (eventual) death-post
+            // is a no-op.
+            if let Some((slot, generation)) = reaper {
+                reaper::release(slot, generation);
+            }
+        } else {
+            let mut res = res;
+            res.done_notification = 0;
+            match reaper {
+                Some((slot, generation)) => {
+                    if let Some(res) = reaper::detach(slot, generation, res) {
+                        // SAFETY: the child already exited (its death-post was
+                        // observed while still Reserved); reclaiming now is
+                        // safe.
+                        unsafe { res.reclaim() };
+                    }
+                }
+                None => core::mem::forget(res),
+            }
         }
+        // Opportunistically reap any detached threads that have died.
         reaper::sweep();
     }
 }
@@ -493,18 +540,21 @@ impl Drop for Thread {
 /// Every spawned thread binds a death observer (before `thread_start`) to one
 /// process-global death `EventQueue`, with a generation-tagged correlator that
 /// names a registry slot. A joined thread reclaims its own resources directly
-/// and frees its slot; a detached thread leaves its resources in the slot.
-/// `sweep` drains the `EventQueue` on every spawn/join and reclaims any detached
-/// thread whose death-post has landed. The generation tag makes a stale post
-/// for an already-joined or reused slot a no-op.
+/// and frees its slot, unless its join wait failed, in which case it is handed
+/// to the registry like a detached one; a detached thread leaves its resources
+/// in the slot. `sweep` drains the `EventQueue` on every spawn/join and
+/// reclaims any thread left in a slot whose death-post has landed. The
+/// generation tag makes a stale post for an already-joined or reused slot a
+/// no-op.
 mod reaper {
     use super::ThreadResources;
     use crate::cell::UnsafeCell;
     use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     /// Max concurrently-bound spawned threads. A spawn beyond this falls back to
-    /// leak-on-detach (join still reclaims directly). 64 covers realistic
-    /// thread fan-out; raising it only costs registry static size.
+    /// leak-on-detach (join still reclaims directly, unless its wait fails, when
+    /// the thread leaks like a detached one). 64 covers realistic thread
+    /// fan-out; raising it only costs registry static size.
     const REAPER_SLOTS: usize = 64;
     /// Death `EventQueue` capacity. Drained on every spawn/join, so overflow
     /// needs >128 detached threads dying between two thread ops — pathological;
@@ -678,10 +728,11 @@ mod reaper {
         REAPER.lock.unlock();
     }
 
-    /// Hand a detached thread's resources to the registry. If the child already
-    /// died (its death-post was observed while `Reserved`), returns the
-    /// resources for the caller to reclaim immediately; otherwise stores them
-    /// for `sweep` and returns `None`.
+    /// Hand a detached thread's resources to the registry, or a joined
+    /// thread's whose join wait failed (that caller clears `done_notification`
+    /// first). If the child already died (its death-post was observed while
+    /// `Reserved`), returns the resources for the caller to reclaim
+    /// immediately; otherwise stores them for `sweep` and returns `None`.
     pub(super) fn detach(
         slot: usize,
         generation: u32,
@@ -858,11 +909,26 @@ pub fn set_name(_name: &CStr) {
 }
 
 pub fn sleep(dur: Duration) {
-    // Round up sub-ms durations to 1 ms so short sleeps still yield.
-    let mut ms = dur.as_millis();
-    if ms == 0 && !dur.is_zero() {
-        ms = 1;
+    // `thread_sleep` can end before `dur` elapses: a stop and restart of this
+    // thread returns `Interrupted`, and a full kernel sleep list returns
+    // `OutOfMemory`. `sleep` cannot report either and must never sleep less
+    // than `dur`, so every error retries for whatever remains; an error other
+    // than `Interrupted` yields first so a full sleep list can drain rather
+    // than spinning on the syscall. The loop returns once the kernel
+    // completes a sleep, or once `dur` has elapsed across the retries.
+    let start = crate::time::Instant::now();
+    let mut left = dur;
+    loop {
+        // Round up to whole ms so a sub-ms sleep (or remainder) still sleeps.
+        let ms = u64::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
+        match syscall::thread_sleep(ms) {
+            Ok(()) => return,
+            Err(e) if e == SyscallError::Interrupted as i64 => {}
+            Err(_) => yield_now(),
+        }
+        match dur.checked_sub(start.elapsed()) {
+            Some(rest) if !rest.is_zero() => left = rest,
+            _ => return,
+        }
     }
-    let ms = u64::try_from(ms).unwrap_or(u64::MAX);
-    let _ = syscall::thread_sleep(ms);
 }

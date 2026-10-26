@@ -18,6 +18,7 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
+mod arch;
 mod caps;
 mod firmware;
 mod pci;
@@ -708,43 +709,7 @@ fn discover_ecam(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
     {
         return Some(loc);
     }
-    platform_default_ecam()
-}
-
-/// Platform-default ECAM when neither ACPI MCFG nor a DTB exposes one.
-///
-/// On RISC-V the QEMU `virt` machine has a stable, well-known PCI ECAM
-/// at `[0x3000_0000, 0x4000_0000)` for buses 0..=255. Some EDK2 builds
-/// shipped with distro packages (Ubuntu's `qemu-efi-riscv64`, observed
-/// on CI) publish ACPI but omit MCFG and do not re-expose the `OpenSBI`
-/// DTB through the UEFI configuration table, leaving both discovery
-/// paths empty. Falling back to the QEMU virt constants here keeps
-/// devmgr functional on those firmware builds.
-///
-/// On x86-64 no comparable single-target fallback exists; the function
-/// returns `None` so the boot halts and the missing firmware is
-/// surfaced explicitly. New RISC-V hardware that diverges from QEMU
-/// virt will need real `_CRS` parsing or a DTB published by its
-/// firmware — replace this stub at that point.
-// The `Option` return is the unified call-site shape; the riscv64
-// arm always succeeds, but `discover_ecam` chains it after two
-// fallible firmware probes that may also yield `Some(...)`.
-#[allow(clippy::unnecessary_wraps)]
-#[cfg(target_arch = "riscv64")]
-fn platform_default_ecam() -> Option<firmware::EcamLocation>
-{
-    Some(firmware::EcamLocation {
-        phys_base: 0x3000_0000,
-        size: 0x1000_0000,
-        start_bus: 0,
-        end_bus: 255,
-    })
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn platform_default_ecam() -> Option<firmware::EcamLocation>
-{
-    None
+    arch::current::platform_default_ecam()
 }
 
 fn discover_ecam_acpi(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
@@ -2041,7 +2006,8 @@ fn carve_rtc_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
 ///
 /// The window is the QEMU `virt` NS16550 at `[0x1000_0000, 0x1000_1000)` —
 /// a fixed part of the QEMU virt machine model, the same basis on which
-/// [`platform_default_ecam`] and the seeded goldfish-RTC aperture are
+/// [`arch::current::platform_default_ecam`] and the seeded goldfish-RTC
+/// aperture are
 /// identified. The bootloader independently discovers this base via ACPI
 /// SPCR for its early console; replacing this constant with forwarded
 /// SPCR/`_CRS` discovery is part of the data-driven device-binding follow-up.

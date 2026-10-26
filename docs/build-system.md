@@ -376,8 +376,8 @@ The jobs that boot under QEMU (`validate` in `build-test.yml` and `burnin`
 in `burnin.yml`) install it and run on the pinned `ubuntu-26.04` runner
 image, whose archive ships `qemu-system-riscv64` in the `qemu-system-riscv`
 package (QEMU 10.2); the pin and the install list move together. The
-`build-image` job of `release.yml` only builds, installs no QEMU, and runs
-on `ubuntu-latest`.
+`build-image` job of `release.yml` boots nothing (its one `cargo xtask`
+command is `build`), so it installs no QEMU and runs on `ubuntu-latest`.
 
 `build-test.yml` cancels stacked runs on the same ref
 (`cancel-in-progress: true`). `burnin.yml` and `release.yml` do not

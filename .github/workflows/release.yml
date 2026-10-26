@@ -69,8 +69,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # `cargo xtask build` launches nothing, so this job installs no QEMU
-      # or firmware; only the jobs that boot (docs/build-system.md
+      # `cargo xtask build` boots nothing under QEMU, so this job installs
+      # no QEMU or firmware; only the jobs that boot (docs/build-system.md
       # § Continuous Integration) do.
       - name: Install zstd
         run: |

@@ -240,9 +240,8 @@ stated explicitly.
     (`save_and_disable_interrupts` → `enable`); the local CPU MUST be
     able to service incoming flush / TLB-shootdown IPIs during the
     spin or it deadlocks against a peer CPU sending an IPI to it
-    (observed locally and on CI). Preemption is
-    disabled so a timer tick mid-spin cannot reschedule the dealloc
-    caller off this CPU.
+    (observed locally and on CI). Preemption is disabled so a timer
+    tick mid-spin cannot reschedule the dealloc caller off this CPU.
 11. Acquire the source IPC lock for tcb's blocked_on_object (if any) and unlink
     tcb from the source's wait queue / waiter slot. Branches:
       - BlockedOnSend / BlockedOnRecv: ep.lock; unlink_from_wait_queue.

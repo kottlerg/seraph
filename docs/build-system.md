@@ -316,11 +316,13 @@ table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 `-cpu rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on`
 plus the `--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
 `-cpu max,migratable=no` on x86-64 TCG. The explicit feature string is the source of
-truth; the supervisor paging extensions (Svpbmt, Svinval, Svnapot) are required by the
-kernel, whose paging subsystem refuses CPUs that lack them during boot, before the first
-userspace mapping (see [platform-requirements.md](platform-requirements.md)). The named
-`-cpu rva23s64` model (QEMU ≥ 9.1, 2024-09), a superset that adds the remaining RVA23
-mandates, is a documented configuration alternative when the CI runner floor supports it.
+truth on every supported QEMU, including the 10.2 the pinned CI image ships (§ Continuous
+Integration); the supervisor paging extensions (Svpbmt, Svinval, Svnapot) are
+required by the kernel, whose paging subsystem refuses CPUs that lack them during boot, before
+the first userspace mapping (see [platform-requirements.md](platform-requirements.md)). The
+named `-cpu rva23s64` model (QEMU ≥ 10.0, 2025-04) is a superset of this string that adds the
+remaining RVA23 mandates; `xtask` does not expose it, and the explicit string stays so the 8.0
+minimum holds.
 
 ---
 
@@ -369,6 +371,12 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 | `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs` and then `cargo xtask test`; the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, and runs one `run-parallel --parallel 1 --runs 1 --timeout 180` iteration; ktest cells then run `test-kaslr`, and usertest cells re-mirror the default boot (`mkdisk`) and run `test-terminal`, plus `test-vmgenid` on x86_64. |
 | `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run-parallel --parallel 2 --runs 20 --timeout 180`. |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
+
+The jobs that install QEMU (`validate` in `build-test.yml`, `burnin` in
+`burnin.yml`, and `build-image` in `release.yml`) run on the pinned
+`ubuntu-26.04` runner image, whose archive ships `qemu-system-riscv64` in the
+`qemu-system-riscv` package (QEMU 10.2); the pin and the install list move
+together.
 
 `build-test.yml` cancels stacked runs on the same ref
 (`cancel-in-progress: true`). `burnin.yml` and `release.yml` do not

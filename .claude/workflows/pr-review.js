@@ -399,7 +399,9 @@ const doc_line = (d) => '- ' + d
 
 phase('Scope')
 
-const DELTA_RANGE = DELTA ? SINCE + ' <head>' : null
+// The delta is the tree diff since..head limited to the files the whole PR diff
+// touches, so a change only a merge or rebase of the base made is not in it.
+const DELTA_RANGE = DELTA ? SINCE + ' <head> -- <every file the PR diff touches>' : null
 
 const SCOPE_PROMPT = [
     'Scope pull request #' + PR + ' for a sharded review.' +
@@ -411,9 +413,11 @@ const SCOPE_PROMPT = [
         '`gh issue list --state open --limit 500 --json number,title`.' +
         (DELTA
             ? ' Then run `git cat-file -e ' + SINCE + '^{commit}` (reachability), ' +
-                '`git diff --numstat --no-renames ' + DELTA_RANGE + '` (a tree diff between ' +
-                'the two commits, valid whether or not ' + SINCE + ' is an ancestor of the ' +
-                'head), and `git log --format=%B ' + SINCE + '..<head>`.'
+                '`git diff --numstat --no-renames ' + DELTA_RANGE + '` (the delta: a tree ' +
+                'diff between the two commits, valid whether or not ' + SINCE + ' is an ' +
+                'ancestor of the head, limited to the PR\'s own files; wherever this prompt ' +
+                'says the delta, it means this diff, never a change only a merge or rebase of ' +
+                'the base made), and `git log --format=%B ' + SINCE + '..<head>`.'
             : ''),
     '',
     'Return, per the schema, with every path repository-relative exactly as git prints it:',
@@ -425,8 +429,8 @@ const SCOPE_PROMPT = [
     '- pr_has_code: whether the whole PR diff changes a file of kind code.',
     '- files: one entry per file in ' +
         (DELTA
-            ? 'the tree diff ' + DELTA_RANGE + ' (every file it lists; the script drops, and ' +
-                'logs, a file the whole PR diff does not touch)'
+            ? 'the delta (every file it lists; the script drops, and logs, a file the ' +
+                'whole PR diff does not touch)'
             : 'the PR diff') +
         ', with path; changed = added plus deleted lines; kind = code (Rust, assembly, ' +
         'linker scripts, build inputs, anything a build embeds), markdown, comment-only (only ' +
@@ -439,7 +443,7 @@ const SCOPE_PROMPT = [
     '- design_docs: ' +
         (DELTA
             ? 'the documents that state facts the delta changed: every Markdown document the ' +
-                'delta edits that the whole PR diff also touches, and every tracked Markdown ' +
+                'delta edits, and every tracked Markdown ' +
                 'document (`git ls-files \'*.md\'`) ' +
                 'whose text names a changed item, a constant, state, error, or section the ' +
                 'delta renamed or redefined, or a behaviour the delta changed (search for each ' +
@@ -512,8 +516,8 @@ scope.design_docs = scope.design_docs.map(normalize)
 // A delta reviews only the PR's own files: one a merge or rebase of the base
 // branch changed between `since` and the head is master's, not this PR's. The
 // numstat runs without rename detection, so a renamed file keeps its new path.
-// The design-docs criterion counts only the PR's own edits, so a document is
-// listed for a base-only edit only when it also names a fact the PR changed.
+// The scope agent builds every delta criterion from the delta limited to the
+// PR's files, so this filter is a backstop that logs what it drops.
 if (DELTA && pr_files.size > 0) {
     for (const f of scope.files) {
         if (!pr_files.has(f.path)) log('delta: ' + f.path + ' is not in the PR diff; not reviewed')
@@ -541,7 +545,10 @@ const HEAD_LINE =
     'Scope: pull request #' + PR + ', mode ' + MODE + '. Merge base ' + scope.base + ', head ' +
     scope.head + '. The working tree is checked out at the head; `gh pr diff ' + PR +
     '` is the PR diff' +
-    (DELTA ? ' and `git diff ' + SINCE + ' ' + scope.head + '` is the delta' : '') + '.'
+    (DELTA
+        ? ' and `git diff ' + SINCE + ' ' + scope.head + ' -- <the PR diff\'s files>` is the ' +
+            'delta (a change only a merge or rebase of the base made is not in it)'
+        : '') + '.'
 
 const DELTA_NOTE = DELTA
     ? 'This is a re-review: the previous run reviewed head ' + SINCE + ', and the commits and ' +

@@ -112,16 +112,20 @@ truth for "how work is tracked and shipped" on this project.
   commits; recorded findings via `gh issue edit` on the Issue the section
   names; after a `NON-BLOCKING ISSUES ONLY` run, the run's surface
   findings recorded the same way on the follow-up Issue of each finding's
-  scope, as the section defines it. The scope's follow-up Issue is found
-  with `gh issue list --state open --search '"defects found by review"
-  in:title' --json number,title`; when the scope has none, it is filed
-  with the user's approval as `gh issue create --milestone <current>
-  --label <subsystem> --label <class>`, the current milestone being the
-  one [docs/conventions.md](../docs/conventions.md) § Milestones defines
-  and the labels the ones its § Labels requires. A PR that ticks items on
-  a follow-up Issue carries `Refs #N` in its body, and `Fixes #N` only
-  under that section's closing condition. `AUDIT FAIL`
-  items via `gh pr edit`, `gh issue edit`, or commits; a contested
+  scope, as the section defines it: the Issue the PR drains in that scope
+  when it drains one (its body carries `Refs #N` for it), else the scope's
+  rolling Issue, found with `gh issue list --state open --search
+  '"defects found by review" in:title' --json number,title` and, when the
+  scope has none, filed with the user's approval as `gh issue create
+  --milestone <current> --label <subsystem> --label <class>`, the current
+  milestone being the one [docs/conventions.md](../docs/conventions.md)
+  § Milestones defines and the labels the ones its § Labels requires. A
+  PR that fixes items on a follow-up Issue ticks each with
+  `(fixed by PR #<M>)` and carries `Refs #N` in its body, and `Fixes #N`
+  only under that section's closing condition. Before each run, an Issue
+  the PR body closes that carries no milestone gets the current one
+  (`gh issue edit <N> --milestone <current>`), which the audit checks.
+  `AUDIT FAIL` items via `gh pr edit`, `gh issue edit`, or commits; a contested
   finding put to the user and resolved as the section says. Before
   pushing a fix, for every fact it changes (a symbol, a constant, a rule
   sentence, a state or section name) walk the `## Summarized By` lists
@@ -133,10 +137,7 @@ truth for "how work is tracked and shipped" on this project.
   After the fixes are pushed and CI is green again, run the workflow in
   `delta` mode. Prompt for the merge decision only under that section's
   merge-prompt condition; when a `NON-BLOCKING ISSUES ONLY` run meets it,
-  offer one more fix round beside the merge. Before the prompt, every
-  Issue the PR body closes that carries no milestone gets the current one
-  (`gh issue edit <N> --milestone <current>`, per
-  [docs/conventions.md](../docs/conventions.md) § Milestones). Merge via
+  offer one more fix round beside the merge. Merge via
   `gh pr merge <N> --merge --delete-branch` (per
   [docs/conventions.md](../docs/conventions.md) § Merge method).
 - On red: surface the failing job's tail (`gh run view <run-id> --log-failed`

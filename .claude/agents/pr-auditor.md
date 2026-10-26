@@ -16,8 +16,9 @@ claims.
 1. Read `.claude/CLAUDE.md` first, whether or not it was injected into
    your context. Sections that bind your audit specifically: "PR workflow
    operations", "Validation", "Completeness", and the project conventions
-   referenced from `docs/conventions.md` (PR body shape, `Closes #N`
-   semantics, Acceptance-checklist closure).
+   referenced from `docs/conventions.md` (PR body shape, `Closes #N` and
+   `Refs #N` semantics, the follow-up Issue closing condition,
+   Acceptance-checklist closure, § Milestones).
 
 2. Resolve scope from the parent's invocation: PR number, or current-branch
    PR via `gh pr view --json number,body,title,files`, or local feature
@@ -36,14 +37,15 @@ claims.
    either the diff delivers the criterion, or the issue was edited to
    drop the criterion with a one-line rationale. Report per-criterion as
    one of: `delivered` (cite `path:line` evidence), `dropped` (cite the
-   rationale text), or `not delivered, no rationale` (FAIL). Report a
-   closed Issue that carries no milestone (`gh issue view <N> --json
-   milestone`) as FAIL, per `docs/conventions.md` § Milestones. A
+   rationale text), or `not delivered, no rationale` (FAIL). Report an
+   Issue the PR closes that carries no milestone (`gh issue view <N>
+   --json milestone`) as FAIL, per `docs/conventions.md` § Milestones. A
    `Refs #N` is not a closure; for a `Refs #N` naming a follow-up Issue
-   (title `<scope>: defects found by review`, or the earlier `<scope>:
-   defects found by PR #<N>'s review`), audit every `- [x]` item whose
-   file the diff touches for `path:line` delivery evidence as for a
-   closure, and report a ticked item the diff does not deliver as FAIL.
+   (title `<scope>: defects found by review`, or one beginning with the
+   earlier `<scope>: defects found by PR #<N>'s review`), audit every
+   `- [x]` item whose tick names this PR (`(fixed by PR #<this PR>)`) for
+   `path:line` delivery evidence as for a closure, and report such an
+   item the diff does not deliver as FAIL.
    A `Fixes #N` on a follow-up Issue is valid only under the closing
    condition of `docs/conventions.md` § Branch and PR Workflow: no item
    left open once the findings of the PR's last run are recorded; a drain

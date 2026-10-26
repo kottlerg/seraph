@@ -5,6 +5,9 @@ title: ''
 labels: bug
 ---
 
+<!-- Set the milestone to the current one, the lowest-versioned open milestone
+(docs/conventions.md § Milestones). -->
+
 ## Summary
 
 <!-- One sentence. -->

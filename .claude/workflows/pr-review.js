@@ -12,23 +12,37 @@
 // soon as its shard completes. Synthesize renders one report. The script
 // computes the reviewer verdict line itself and derives the audit verdict line
 // from the auditor's per-section verdicts. Findings on the review surface
-// (docs/conventions.md § Branch and PR Workflow) count toward the verdict;
-// findings off it are recorded for the open Issue that already names the work,
-// else for the audit Issue. `.claude/CLAUDE.md` § PR workflow operations says
-// when the assistant runs this workflow and what it does with the result.
+// (docs/conventions.md § Branch and PR Workflow) count toward the verdict, and
+// only those on its blocking track (class correctness, safety, or contract, or
+// a MUST violation anchored outside Markdown) make it `BLOCKING ISSUES`.
+// Findings off the surface are recorded for the open Issue that already names
+// the work, else for the audit Issue; those that share a file, class, bucket,
+// MUST flag, and authority are one root cause and are verified once as a
+// group. A delta run names the ledger of the earlier runs' recorded, dropped,
+// and contested findings; a finding a reviewer flags as already in it, and the
+// delta did not introduce, is listed and not counted. `.claude/CLAUDE.md` § PR
+// workflow operations says when the assistant runs this workflow, how it
+// builds the ledger, and what it does with the result.
 //
-// args: { pr: number, mode: 'full' | 'delta' | 'scope', since?: string }
+// args: { pr: number, mode: 'full' | 'delta' | 'scope', since?: string,
+//         ledger?: string }
 //   mode 'full'  reviews every file in the PR diff.
 //   mode 'delta' reviews the files whose content changed between `since` (the
 //                head the previous run reviewed) and the head, verifies the
 //                fixes claimed since then, and adds a whole-PR correctness-only
 //                regression lens that also verifies claimed fixes for files
-//                outside the delta. The whole-diff lenses run in both modes;
-//                the cross-boundary lens runs whenever the PR diff, not only
-//                the delta, touches a code file. `since` must resolve in this
+//                outside the delta. The call-sites and cross-boundary lenses
+//                cover the whole PR diff in both modes (the cross-boundary lens
+//                runs whenever the PR diff, not only the delta, touches a code
+//                file); the design-docs lenses read only the documents that
+//                state facts the delta changed. `since` must resolve in this
 //                clone; it need not be an ancestor of the head, so an amended
 //                or rebased branch still works, at the cost of over-including
 //                files a rebase brought in.
+//   ledger       path of the ledger file `.claude/CLAUDE.md` § PR workflow
+//                operations builds; required in 'delta' mode, allowed with
+//                'scope' and `since`, rejected otherwise. Reviewers read it
+//                with `jq`.
 //   mode 'scope' stops after Scope and returns the shard plan and sample
 //                prompts (one agent); with `since` it scopes as delta would.
 
@@ -54,6 +68,8 @@ const PR = Number(args && args.pr)
 const MODE = args && MODES.includes(args.mode) ? args.mode : null
 const SINCE = args && typeof args.since === 'string' && args.since.trim() ? args.since.trim() : null
 const DELTA = SINCE !== null
+const LEDGER =
+    args && typeof args.ledger === 'string' && args.ledger.trim() ? args.ledger.trim() : null
 
 if (!Number.isInteger(PR) || PR <= 0) return { error: 'args.pr must be a pull request number' }
 if (MODE === null) return { error: "args.mode must be 'full', 'delta', or 'scope'" }
@@ -62,6 +78,14 @@ if (MODE === 'delta' && !DELTA) {
 }
 if (MODE === 'full' && DELTA) {
     return { error: "args.since is only meaningful with mode 'delta' or 'scope'" }
+}
+if (MODE === 'delta' && LEDGER === null) {
+    return {
+        error: "args.ledger (the ledger file of the earlier runs) is required in 'delta' mode",
+    }
+}
+if (!DELTA && LEDGER !== null) {
+    return { error: 'args.ledger is only meaningful with `since`' }
 }
 
 // ─── Tunables ───
@@ -76,6 +100,15 @@ const VERIFY_LENSES = ['reality', 'authority']
 // delta introduced it. The schema's class enum is their union.
 const ALWAYS_IN_BOUND = ['correctness', 'safety', 'contract']
 const SOFT_CLASSES = ['standards', 'doc-drift', 'coverage', 'style']
+// The blocking track (docs/conventions.md § Branch and PR Workflow): a finding
+// of the first set, or a MUST violation of a standard anchored outside Markdown.
+const blocks = (f) =>
+    ALWAYS_IN_BOUND.includes(f.class) ||
+    (f.class === 'standards' && f.must_violation && !f.file.endsWith('.md'))
+// Binding on every introduced change, so every shard reads them in a delta run
+// even when the narrowed design-document list omits them; never a design-docs
+// lens document in that mode.
+const STANDARDS_DOCS = ['docs/coding-standards.md', 'docs/documentation-standards.md']
 // The sections pr-auditor's Output lists; the audit must return each of them.
 const AUDIT_SECTION_NAMES = [
     'PR-body checklist', 'per-issue closure', 'silent-deferral scan', 'test-plan honesty',
@@ -185,13 +218,18 @@ const SCOPE_SCHEMA = {
 const FINDING_SCHEMA = {
     type: 'object',
     required: [
-        'file', 'line', 'bucket', 'class', 'introduced', 'must_violation', 'in_bound',
+        'file', 'line', 'bucket', 'class', 'introduced', 'must_violation', 'ledger', 'in_bound',
         'issue', 'authority', 'claim', 'evidence', 'fix',
     ],
     properties: {
         file: { type: 'string', description: PATH_DESCRIPTION },
         line: { type: 'integer', description: '1-based line the finding anchors to.' },
-        bucket: { enum: ['critical', 'should', 'nit'] },
+        bucket: {
+            enum: ['critical', 'should', 'nit'],
+            description:
+                'Severity as you judge it; which findings block the merge is decided by class ' +
+                'and MUST flag (docs/conventions.md § Branch and PR Workflow), not by the bucket.',
+        },
         class: { enum: [...ALWAYS_IN_BOUND, ...SOFT_CLASSES] },
         introduced: {
             type: 'boolean',
@@ -201,6 +239,12 @@ const FINDING_SCHEMA = {
         must_violation: {
             type: 'boolean',
             description: 'It names a MUST violation of a binding standard.',
+        },
+        ledger: {
+            type: 'boolean',
+            description:
+                'An entry of the ledger the prompt names already states this finding at this ' +
+                'anchor (false when no ledger was named).',
         },
         in_bound: {
             type: 'boolean',
@@ -379,19 +423,29 @@ const SCOPE_PROMPT = [
     '- changed_items: every public or crate-visible function, type, trait, constant, syscall, ' +
         'or wire-protocol element whose signature, contract, semantics, or documentation the ' +
         'PR diff changes, with the kind of change.',
-    '- design_docs: the documents that govern the touched areas, found by walking the scope ' +
-        'order `docs/documentation-standards.md` § Document Hierarchy defines: system scope ' +
-        '(the top-level `docs/*.md`), component scope (`<component>/README.md`), and ' +
-        'design-authority scope (`<component>/docs/*.md`). ' +
-        'Also list `docs/releases/README.md` with the system-scope documents: the standard ' +
-        'places it in no scope, and its § Backlinks and Change Propagation release-notes ' +
-        'exception calls it an ordinary authoritative document. ' +
-        'Also list the root `README.md` and ' +
-        'the touched component\'s grouping `README.md` (`<group>/README.md` for the top-level ' +
-        'group directory the component sits in) as routing documents, not authorities; ' +
-        'include every document the diff itself edits. List only ' +
-        'paths `git ls-files` prints: a document you cannot confirm exists at the head is left ' +
-        'out, since a lens reads what it is given.',
+    '- design_docs: ' +
+        (DELTA
+            ? 'the documents that state facts the delta changed: every Markdown document the ' +
+                'delta edits, and every tracked Markdown document (`git ls-files \'*.md\'`) ' +
+                'whose text names a changed item, a constant, state, error, or section the ' +
+                'delta renamed or redefined, or a behaviour the delta changed (search for each ' +
+                'symbol and each distinctive phrase of the changed statements). Not the ' +
+                'hierarchy walk: a document the delta left true is not listed, and the root ' +
+                '`README.md` and a grouping `README.md` are listed only when the search finds ' +
+                'them. '
+            : 'the documents that govern the touched areas, found by walking the scope ' +
+                'order `docs/documentation-standards.md` § Document Hierarchy defines: system ' +
+                'scope (the top-level `docs/*.md`), component scope (`<component>/README.md`), ' +
+                'and design-authority scope (`<component>/docs/*.md`). ' +
+                'Also list `docs/releases/README.md` with the system-scope documents: the ' +
+                'standard places it in no scope, and its § Backlinks and Change Propagation ' +
+                'release-notes exception calls it an ordinary authoritative document. ' +
+                'Also list the root `README.md` and ' +
+                'the touched component\'s grouping `README.md` (`<group>/README.md` for the ' +
+                'top-level group directory the component sits in) as routing documents, not ' +
+                'authorities; include every document the diff itself edits. ') +
+        'List only paths `git ls-files` prints: a document you cannot confirm exists at the ' +
+        'head is left out, since a lens reads what it is given.',
     '- claimed_fixes: ' +
         (DELTA
             ? 'every fix the commit messages in ' + SINCE + '..<head> and the PR body claim, as ' +
@@ -501,8 +555,27 @@ const docs_for = (component) => {
     const authorities = scope.design_docs.filter(
         (d) => !routing.includes(d) && (d.startsWith('docs/') || component_of(d) === component),
     )
+    if (DELTA) {
+        for (const d of STANDARDS_DOCS) if (!authorities.includes(d)) authorities.push(d)
+    }
     return { authorities, routing }
 }
+
+// A delta run names the ledger in every reviewer prompt; a shard gets the `jq`
+// filter for its own files.
+const ledger_note = (paths) =>
+    LEDGER === null
+        ? null
+        : '\nLedger `' + LEDGER + '`: every finding the earlier runs of this PR recorded, ' +
+            'dropped, or the maintainer ruled on (status contested), with the run that ' +
+            'reported it. ' +
+            (paths
+                ? 'Read the entries for your files: `jq \'.[] | select(' +
+                    paths.map((p) => '.file == "' + p + '"').join(' or ') + ')\' ' + LEDGER +
+                    '`. '
+                : 'Read the entries for the files you report on. ') +
+            'Do not re-raise a finding an entry already states unless the delta changed the ' +
+            'hunk it anchors to; set `ledger` true on a finding an entry states.'
 
 function shard_prompt(shard) {
     const paths = new Set(shard.files.map((f) => f.path))
@@ -528,6 +601,7 @@ function shard_prompt(shard) {
         bullets(docs.routing, doc_line),
         '',
         ISSUES_BLOCK,
+        ledger_note([...paths]),
         DELTA
             ? '\nClaimed fixes for your files, each to be verified against the code:\n' +
                 bullets(fixes, fix_line)
@@ -573,15 +647,22 @@ if (scope.pr_has_code) {
 }
 
 // One design-docs lens per MAX_LENS_DOCS documents, so no single agent has to
-// hold every governing document at once.
-const doc_lens_count = Math.ceil(scope.design_docs.length / MAX_LENS_DOCS)
-for (let start = 0; start < scope.design_docs.length; start += MAX_LENS_DOCS) {
-    const docs = scope.design_docs.slice(start, start + MAX_LENS_DOCS)
+// hold every governing document at once. In a delta run the documents are the
+// ones that state facts the delta changed, and the binding standards stay with
+// the shards.
+const lens_docs = DELTA
+    ? scope.design_docs.filter((d) => !STANDARDS_DOCS.includes(d))
+    : scope.design_docs
+const doc_lens_count = Math.ceil(lens_docs.length / MAX_LENS_DOCS)
+for (let start = 0; start < lens_docs.length; start += MAX_LENS_DOCS) {
+    const docs = lens_docs.slice(start, start + MAX_LENS_DOCS)
     const index = start / MAX_LENS_DOCS + 1
     lenses.push({
         name: 'design-docs' + (doc_lens_count > 1 ? '#' + index : ''),
         body: () => [
-            'Lens: design documents against the code, over the whole diff' +
+            'Lens: design documents ' +
+                (DELTA ? 'that state facts the delta changed, ' : '') +
+                'against the code, over the whole diff' +
                 (doc_lens_count > 1 ? ' (documents ' + index + ' of ' + doc_lens_count + ')' : '') +
                 '.',
             'Read each document below in full. Report every place the diff silently ' +
@@ -616,9 +697,10 @@ if (DELTA) {
 
 const lens_prompt = (lens) =>
     [
-        LENS_HEADER, '', ...lens.body(), '', ISSUES_BLOCK, '',
+        LENS_HEADER, '', ...lens.body(), '', ISSUES_BLOCK, ledger_note(null), '',
         'Fill the structured schema. Structured output only.',
     ]
+        .filter((line) => line !== null)
         .join('\n')
 
 if (MODE === 'scope') {
@@ -626,6 +708,7 @@ if (MODE === 'scope') {
         scope,
         shards,
         lenses: lenses.map((l) => l.name),
+        ledger: LEDGER,
         sample_prompts: {
             shard: shards.length ? shard_prompt(shards[0]) : null,
             lens: lenses.length ? lens_prompt(lenses[0]) : null,
@@ -654,7 +737,11 @@ function verify_prompt(f, lens) {
     const tree =
         'The working tree is checked out at the head; `gh pr diff ' + PR + '` is the diff. ' +
         'A defect may be in code or in a document; an absence (a missing check, test, or ' +
-        'statement) is exhibited by the place where it should be.'
+        'statement) is exhibited by the place where it should be.' +
+        (LEDGER === null
+            ? ''
+            : ' The ledger `' + LEDGER + '` lists what earlier runs recorded or dropped; an ' +
+                'entry is context, not evidence either way.')
     if (lens === 'reality') {
         return [
             'You are an independent skeptic. Try to refute this review finding on the facts. ' +
@@ -715,10 +802,31 @@ const seen = []
 // a record with an Issue keeps it, and the authority refuter's issue_refuted
 // vote decides. A nit that names no MUST violation is never verified, so an
 // Issue any reporter names on it is final whichever reporter arrived first.
+// A finding flagged as already in the ledger, and not introduced by the delta,
+// becomes a `ledgered` record: listed, never verified or counted; a later
+// reporter's copy of it is absorbed like any duplicate. An off-surface record
+// that shares file, class, bucket, MUST flag, and authority with an earlier
+// off-surface record is the same root cause: it joins that record's group and
+// takes the group's verdict instead of its own verification.
+const ledgered = []
+
+// The authority's document and first section word, so the wordings one
+// reviewer gives the same section ("§ Concurrency (bare-field exception)",
+// "§ B Concurrency exception conditions") key alike.
+function authority_key(authority) {
+    const text = String(authority).toLowerCase().replace(/\([^)]*\)/g, ' ')
+        .replace(/\s+/g, ' ').trim()
+    const m = text.match(/^(\S+\.md) ?(?:§|section)? ?(?:[a-z]\.? (?=[a-z]))?([a-z][a-z-]*)/)
+    return m ? m[1] + ' § ' + m[2] : text.slice(0, 60)
+}
+
+const verifiable = (f) => !(f.bucket === 'nit' && !f.must_violation)
+
 function dedup(findings, source) {
     const fresh = []
     for (const f of findings) {
         f.file = normalize(f.file)
+        const in_ledger = DELTA && f.ledger === true && !f.introduced
         // Work an open Issue already names is off the surface whatever its
         // class; an Issue number that is not open is not a placement.
         if (f.issue && !open_issue_numbers.has(f.issue)) {
@@ -768,27 +876,63 @@ function dedup(findings, source) {
             }
             dup.sources.push(source)
             dup.evidence += '\n[also reported by ' + source + ': ' + f.claim + '] ' + f.evidence
+            if (in_ledger && dup.status !== 'ledgered') {
+                dup.annotations.push(source + ' flagged it as already in the ledger')
+            }
             continue
         }
         const record = {
             ...f, in_bound, surface, sources: [source], issue_source: f.issue ? source : '',
             duplicates: 0, status: 'pending', votes: [], verify_started: false, annotations: [],
+            group: [], group_lead: null, verification: null,
         }
         seen.push(record)
+        if (in_ledger) {
+            record.status = 'ledgered'
+            ledgered.push(record)
+            continue
+        }
+        if (!record.in_bound && verifiable(record)) {
+            const key = authority_key(record.authority)
+            const lead = seen.find(
+                (s) =>
+                    s !== record && !s.in_bound && s.status !== 'ledgered' && !s.group_lead &&
+                    verifiable(s) && s.file === record.file && s.class === record.class &&
+                    s.bucket === record.bucket && s.must_violation === record.must_violation &&
+                    authority_key(s.authority) === key,
+            )
+            if (lead) {
+                record.group_lead = lead
+                lead.group.push(record)
+                record.annotations.push(
+                    'verified with ' + lead.file + ':' + lead.line + ' (same root cause)')
+            }
+        }
         fresh.push(record)
     }
     return fresh
 }
 
 // Verification writes into the record itself, so annotations dedup makes on
-// the `seen` record later still reach the report.
+// the `seen` record later still reach the report. A group member waits for its
+// lead's verification and copies the verdict; the lead's promise is created on
+// first demand, so a member reported before the lead's own turn still gets it.
 function verify_one(f) {
-    if (f.bucket === 'nit' && !f.must_violation) {
+    if (!verifiable(f)) {
         f.status = 'nit'
         return Promise.resolve(f)
     }
+    if (f.group_lead) {
+        const lead = f.group_lead
+        return verify_one(lead).then(() => {
+            f.status = lead.status
+            f.votes = lead.votes
+            return f
+        })
+    }
+    if (f.verification) return f.verification
     f.verify_started = true
-    return parallel(
+    f.verification = parallel(
         VERIFY_LENSES.map((lens) => () => {
             // The 1-based record index keeps the label unique when two records
             // share a location (dedup keeps different buckets or flags apart).
@@ -835,6 +979,7 @@ function verify_one(f) {
         f.votes = valid
         return f
     })
+    return f.verification
 }
 
 const review_items = [
@@ -892,7 +1037,9 @@ review_items.forEach((item, i) => {
 
 const results = reviewed.filter(Boolean)
 const audit = results.map((r) => r.audit).find(Boolean) || null
+// Ledgered records never entered a verification list; `all` is what was judged.
 const all = results.flatMap((r) => r.findings)
+const groups = all.filter((f) => f.group.length > 0)
 const dropped = all.filter((f) => f.status === 'dropped')
 const surviving = all.filter((f) => f.status !== 'dropped')
 // Findings on the review surface are fixed; findings off it are recorded for
@@ -905,20 +1052,20 @@ const count = (status) => findings.filter((f) => f.status === status).length
 log(
     'Review done: ' + all.length + ' findings; ' + count('confirmed') + ' confirmed, ' +
         count('contested') + ' contested, ' + count('unverified') + ' unverified, ' +
-        count('nit') + ' nits, ' + recorded.length + ' recorded off the surface, ' +
-        dropped.length + ' dropped' +
+        count('nit') + ' nits, ' + recorded.length + ' recorded off the surface (' +
+        groups.length + ' root-cause groups), ' + dropped.length + ' dropped, ' +
+        ledgered.length + ' in the ledger' +
         (failed_review.length ? '; failed reviewers: ' + failed_review.join(', ') : ''),
 )
 
 // ─── Verdicts (computed here, not by an agent) ───
 
 // A failed shard or lens reviewer means part of the diff was never reviewed;
-// that is a blocking condition in itself. A failed auditor or synthesizer is
-// reported through the audit verdict and the notes, and a failed verifier
-// through the notes and the failed list, not through the reviewer verdict.
-const blocking =
-    failed_review.length > 0 ||
-    findings.some((f) => f.bucket === 'critical' || f.must_violation)
+// that is a blocking condition in itself. Otherwise only a finding on the
+// blocking track blocks. A failed auditor or synthesizer is reported through
+// the audit verdict and the notes, and a failed verifier through the notes and
+// the failed list, not through the reviewer verdict.
+const blocking = failed_review.length > 0 || findings.some(blocks)
 const verdict = blocking
     ? 'BLOCKING ISSUES'
     : findings.length > 0
@@ -973,7 +1120,9 @@ const stats = {
     unverified: count('unverified'),
     nits: count('nit'),
     recorded: recorded.length,
+    groups: groups.length,
     dropped: dropped.length,
+    ledgered: ledgered.length,
     get failed() {
         return [...failed_review, ...failed_other]
     },
@@ -993,9 +1142,12 @@ const clip = (s, n) => (s.length > n ? s.slice(0, n) + '…' : s)
 // Issue adoption, an Issue named after verification began, unjudged claims)
 // follow it whole, so the report shows them.
 function for_render(f) {
-    const { annotations, ...rest } = f
+    const { annotations, group, group_lead, verification, ...rest } = f
     return {
         ...rest,
+        blocking: blocks(f),
+        group_size: group.length ? group.length + 1 : 0,
+        group_lead: group_lead ? group_lead.file + ':' + group_lead.line : null,
         evidence:
             clip(f.evidence, RENDER_EVIDENCE_CHARS) +
             annotations.map((a) => '\n[' + a + ']').join(''),
@@ -1014,22 +1166,26 @@ const SYNTH_PROMPT = [
         'a bucket by file and group entries that share one root cause under one lead entry ' +
         'that still lists every file:line, each site with its own status and MUST-violation ' +
         'tags. Each entry: `file:line` [status] claim, with ' +
-        '`(MUST violation)` after the status when must_violation is true, since such an entry ' +
-        'on the review surface blocks the merge whatever its bucket, and in the Recorded ' +
-        'section `file:line` [status] (bucket) claim. Authority: ' +
+        '`(blocking)` after the status when blocking is true, since such an entry on the ' +
+        'review surface blocks the merge whatever its bucket, and `(MUST violation)` after it ' +
+        'when must_violation is true; in the Recorded section `file:line` [status] (bucket) ' +
+        'claim, with `[group of N]` after the status of an entry whose group_size is N, and ' +
+        'with `[verified with file:line]` on an entry whose group_lead is set. Authority: ' +
         'the cited authority. Rationale: one sentence from the evidence. Fix: the proposed ' +
         'fix. Every bracketed note at the end of a finding\'s evidence (the script\'s ' +
         'placement, Issue-adoption, late-Issue, and unjudged-Issue notes) is rendered ' +
         'verbatim as its own line on the entry. For contested and unverified entries add ' +
         'one line per verifier vote with its ' +
         'lens, refuted flag, confidence, and evidence. The dropped section lists each dropped ' +
-        'finding in one line with the refuting evidence. The audit section lists each audit ' +
-        'section with its verdict and items. Keep each entry to its fields; the full record ' +
-        'is saved beside the report.',
+        'finding in one line with the refuting evidence. The ledger section lists each ' +
+        'ledgered finding in one line: `file:line` (bucket, class) claim. The audit section ' +
+        'lists each audit section with its verdict and items. Keep each entry to its fields; ' +
+        'the full record is saved beside the report.',
     '',
-    'Headings, in this order: `# Pre-merge review: PR #' + PR + '`, `## Critical (blocking)`, ' +
+    'Headings, in this order: `# Pre-merge review: PR #' + PR + '`, `## Critical`, ' +
         '`## Should fix`, `## Nit`, `## Recorded for audit (off the review surface)`, ' +
-        '`## Dropped by verification`, `## Audit`. The recorded section lists each off-surface ' +
+        '`## Dropped by verification`, `## Ledger (not re-raised)`, `## Audit`. The recorded ' +
+        'section lists each off-surface ' +
         'finding with the same fields as the others, naming its `issue` when set; they are ' +
         'appended to the open Issue that already names the work, else to the audit Issue, not ' +
         'fixed. Write `(none)` under an empty heading. Do not write verdict lines; the ' +
@@ -1043,6 +1199,9 @@ const SYNTH_PROMPT = [
     '',
     'Dropped (JSON):',
     JSON.stringify(dropped.map(for_render), null, 1),
+    '',
+    'Ledgered (JSON):',
+    JSON.stringify(ledgered.map(for_render), null, 1),
     '',
     'Audit (JSON):',
     JSON.stringify(audit, null, 1),
@@ -1065,7 +1224,8 @@ if (!synthesized) {
 const body = synthesized
     ? synthesized.report
     : '# Pre-merge review: PR #' + PR + '\n\nSynthesis agent returned no result; ' +
-        'the raw findings are in the `findings`, `recorded`, `dropped`, and `audit` fields.\n'
+        'the raw findings are in the `findings`, `recorded`, `ledgered`, `dropped`, and ' +
+        '`audit` fields.\n'
 
 // The two verdict lines stand alone so they can be surfaced verbatim; notes
 // follow on their own lines.
@@ -1075,4 +1235,24 @@ const report =
 
 stats.agents = agent_calls
 
-return { verdict, audit_verdict, report, findings, recorded, dropped, audit, stats: { ...stats } }
+// Records carry cyclic group links; the returned copies drop them.
+const plain = (f) => {
+    const { group, group_lead, verification, ...rest } = f
+    return {
+        ...rest,
+        group_size: group.length ? group.length + 1 : 0,
+        group_lead: group_lead ? group_lead.file + ':' + group_lead.line : null,
+    }
+}
+
+return {
+    verdict,
+    audit_verdict,
+    report,
+    findings: findings.map(plain),
+    recorded: recorded.map(plain),
+    ledgered: ledgered.map(plain),
+    dropped: dropped.map(plain),
+    audit,
+    stats: { ...stats },
+}

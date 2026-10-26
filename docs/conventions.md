@@ -231,9 +231,10 @@ are forbidden; `master` MUST NOT receive force pushes.
   with its owner) is documentation drift. Every other finding on the
   surface (one of class standards, documentation-drift, coverage, or style
   that is not a MUST violation or is one anchored in a Markdown document:
-  wording, wrapping, nits) is non-blocking: when the run has blocking
-  findings it is fixed in the same batch, and otherwise it MUST be recorded
-  on the PR's follow-up Issue before the merge prompt. The PR's follow-up
+  wording, wrapping, nits) is non-blocking: when the reviewer verdict is
+  `BLOCKING ISSUES` it is fixed in the same batch, and after a
+  `NON-BLOCKING ISSUES ONLY` run it MUST be recorded on the PR's follow-up
+  Issue before the merge prompt. The PR's follow-up
   Issue for a file is the open Issue whose title begins `<scope>: defects
   found by PR #N's review`, where `<scope>` is the narrowest commit-title
   scope (§ Commit Messages) that covers the file; it is filed with the
@@ -260,10 +261,11 @@ are forbidden; `master` MUST NOT receive force pushes.
   in the report's Dropped section. The review verifies every finding that
   can block and every Critical or Should finding, on or off the surface,
   except a finding the ledger holds, which is listed unverified; a nit that
-  cannot block is fixed or recorded unverified. Verified findings off the surface that share
-  file, class, bucket, MUST flag, named Issue, and authority are one root
-  cause: the first is verified and each of the others takes the group's
-  verdict. Every other finding is fixed or recorded.
+  cannot block is fixed or recorded unverified. Verified findings off the
+  surface that share file, class, bucket, MUST flag, named Issue, and
+  authority are one root cause: the first is verified and each of the
+  others takes the group's verdict. Every other finding is fixed or
+  recorded.
 
 ### Branch naming
 

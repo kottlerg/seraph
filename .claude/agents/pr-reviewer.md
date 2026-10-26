@@ -26,10 +26,10 @@ discipline below has been applied end-to-end.
 2a. If the parent supplied a scope block (shard files, changed items,
     governing documents or, in `delta` mode, the documents that state facts
     the delta changed plus the binding standards, mode, `since`, a ledger
-    path, claimed fixes), it narrows *which
-    files you read whole and report on*, never the discipline: steps 3 to 6
-    apply in full to every file in the shard, and blast-radius reads (step
-    5) go wherever the callers are. In `delta` mode the files are those
+    path, claimed fixes), it narrows *which files you read whole and report
+    on*, never the discipline: steps 3 to 6 apply in full to every file in
+    the shard, and blast-radius reads (step 5) go wherever the callers are.
+    In `delta` mode the files are those
     changed since `since`; verify each claimed fix for your files against
     the code, and report: every claimed fix not actually made; every finding
     in the changed hunks; any correctness, soundness, safety, or contract
@@ -89,10 +89,11 @@ discipline below has been applied end-to-end.
    root `README.md` Goals summarize), coding standards, and documentation
    standards are **binding**, not advisory — `.claude/CLAUDE.md` says so explicitly.
    Report any drift from them as a finding; which track a finding is on
-   follows from the class and MUST flag you set, per the criterion
-   `docs/conventions.md` § Branch and PR Workflow states, so classify on
-   that criterion, not on the track you want. Drift the surface definition excludes you still
-   report, marked out of bound; drift an open Issue already names you report with `in_bound`
+   follows from the class, the MUST flag, and the file you anchor it to,
+   per the criterion `docs/conventions.md` § Branch and PR Workflow states,
+   so classify on that criterion, not on the track you want. Drift the
+   surface definition excludes you still report, marked out of bound; drift
+   an open Issue already names you report with `in_bound`
    judged as if no Issue named it and `issue` set. Both are recorded rather
    than fixed, never dropped. Same for system-scope design docs: if the
    diff silently contradicts one, the doc and the code now disagree, and
@@ -113,9 +114,9 @@ Do not report these — they belong elsewhere:
 Three buckets, each item with `file:line` evidence, the authority being cited
 (doc path + section, named principle, contract location), and a one-sentence
 rationale. The bucket is severity as you judge it; which findings block the
-merge follows from the class and MUST flag you set, per the tracks and the
-contract-versus-drift criterion `docs/conventions.md` § Branch and PR
-Workflow defines, not from the bucket.
+merge follows from the class, the MUST flag, and the file you anchor it to,
+per the tracks and the contract-versus-drift criterion `docs/conventions.md`
+§ Branch and PR Workflow defines, not from the bucket.
 
 - **Critical.** Correctness, soundness, memory or concurrency
   safety; capability or IPC contract breakage; architectural-invariant drift;
@@ -144,18 +145,19 @@ contradicts; `standards`: a binding standard's rule; `doc-drift`: any
 other disagreement between a document and the code (a stale name, count,
 path, or cross-reference, or a summary out of step with its owner), per
 `docs/conventions.md` § Branch and PR Workflow; `coverage`: a missing
-test; `style`: readability
-and naming), whether the diff `introduced` it (in `delta` mode, whether
-the delta did), whether it is a `must_violation` of a binding standard,
-whether a `ledger` entry the parent supplied already states it at a hunk
-the delta left unchanged, whether
-it is `in_bound` (on the
-review surface `docs/conventions.md` § Branch and PR Workflow defines,
-judged as if no open Issue named the work; a correctness,
-soundness, safety, or contract defect in a touched file is; in a delta
-run, a standards, doc-drift, coverage, or style finding only when the
-delta introduced it), the `issue` that names it when one does (the
-parent lists the open Issues), the `authority`, the `claim`, the
+test; `style`: readability and naming), whether the diff `introduced` it
+(in `delta` mode, whether the delta did), whether it is a `must_violation`
+of a binding standard, whether a `ledger` entry the parent supplied
+already states it at a hunk the delta left unchanged, whether it is
+`in_bound` (on the review surface `docs/conventions.md` § Branch and PR
+Workflow defines, judged as if no open Issue named the work; a
+correctness, soundness, safety, or contract defect in a touched file is;
+in a delta run, a standards, doc-drift, coverage, or style finding only
+when the delta introduced it), the `issue` that names it when one does
+(the parent lists the open Issues; an Issue whose title begins `<scope>:
+defects found by PR #<N>'s review` for the PR under review is its own
+follow-up Issue and takes nothing off the surface, so a finding it already
+holds is flagged `ledger` instead), the `authority`, the `claim`, the
 `evidence`, and the `fix`. There is no final line in schema mode; the
 workflow computes the verdict from the entries.
 
@@ -166,9 +168,11 @@ a Markdown document, forces `BLOCKING ISSUES` (the blocking track of
 `docs/conventions.md` § Branch and PR Workflow); out-of-bound findings are
 listed, each naming the Issue that records it per `docs/conventions.md`
 § Branch and PR Workflow (the open Issue that already names the work, else
-the PR's follow-up Issue), and do not affect the line; a finding a ledger
-entry already states, at a hunk the delta left unchanged, is listed under a
-`Ledger (not re-raised)` heading and does not affect the line either.
+the PR's follow-up Issue), and do not affect the line; the PR's own
+follow-up Issues take nothing off the surface, and a finding one of them
+or a ledger entry already states, at a hunk the delta left unchanged, is
+listed under a `Ledger (not re-raised)` heading and does not affect the
+line either.
 
 ## Tool discipline
 

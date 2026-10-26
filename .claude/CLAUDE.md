@@ -65,19 +65,19 @@ truth for "how work is tracked and shipped" on this project.
   is the saved `pr-review` workflow; this bullet is the maintainer's
   standing request to run it:
   `Workflow({name: "pr-review", args: {pr: <N>, mode: "full"}})` for the
-  first run on a PR, then `mode: "delta"` with `since` set to the head
-  the previous run reviewed and `ledger` set to the ledger file built
-  below. The workflow's header comment describes what it does. Save the
+  first run on a PR (a later full run adds `ledger` once one exists), then
+  `mode: "delta"` with `since` set to the head the previous run reviewed
+  and `ledger` set to the ledger file built below. The workflow's header comment describes what it does. Save the
   report as `target/xtask/review/pr<N>/<mode>-<head>.md` and the whole
   returned object as `<mode>-<head>.json` beside it (the ledger command
   below reads its `verdict`, `stats`, `findings`, `recorded`, and
-  `dropped`), and surface both verdict lines to the user verbatim. If the Workflow tool is
-  unavailable (the directly invoked agents are then the review, per that
-  section), invoke `@pr-reviewer` and
-  `@pr-auditor` directly in parallel (single message, two `Agent` tool
-  calls) with the PR number as scope, the open Issue list (`gh issue list
-  --state open --limit 500 --json number,title`), and, for a re-review,
-  the `since` head and the ledger path; save the reviewer's findings
+  `dropped`), and surface both verdict lines to the user verbatim. If the
+  Workflow tool is unavailable (the directly invoked agents are then the
+  review, per that section), invoke `@pr-reviewer` and `@pr-auditor`
+  directly in parallel (single message, two `Agent` tool calls) with the
+  PR number as scope, the open Issue list (`gh issue list --state open
+  --limit 500 --json number,title`), and, for a re-review, the `since`
+  head and the ledger path; save the reviewer's findings
   (status `unverified`, since no refuter judged them, or `nit` for a nit
   that cannot block), the recorded and dropped ones, the `verdict`, and
   the head as `stats.head`, as `<mode>-<head>.json` in the workflow's
@@ -156,8 +156,8 @@ truth for "how work is tracked and shipped" on this project.
   [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow
   defines it, are the scope, surfaced incidentally: blocking ones MUST be
   fixed in the same pass, and non-blocking ones MUST be fixed in that batch
-  when the run has blocking findings and otherwise recorded as that section
-  says. Findings off the surface MUST be
+  when the reviewer verdict is `BLOCKING ISSUES` and otherwise recorded as
+  that section says. Findings off the surface MUST be
   recorded in the same pass, never dropped: on the open Issue that already
   names the work, else on the PR's follow-up Issue that section defines
   (filed with the user's approval).

@@ -41,9 +41,10 @@
 //                or rebased branch still works, at the cost of over-including
 //                files a rebase brought in.
 //   ledger       path of the ledger file `.claude/CLAUDE.md` § PR workflow
-//                operations builds; required in 'delta' mode, allowed with
-//                'scope' and `since`, rejected otherwise. Reviewers read it
-//                with `jq`.
+//                operations builds; required in 'delta' mode and taken in
+//                every mode once one exists, so a full run after the PR's
+//                follow-up Issues exist lists what they hold. Reviewers read
+//                it with `jq`.
 //   mode 'scope' stops after Scope and returns the shard plan and sample
 //                prompts (one agent); with `since` it scopes as delta would.
 
@@ -84,9 +85,6 @@ if (MODE === 'delta' && LEDGER === null) {
     return {
         error: "args.ledger (the ledger file of the earlier runs) is required in 'delta' mode",
     }
-}
-if (!DELTA && LEDGER !== null) {
-    return { error: 'args.ledger is only meaningful with `since`' }
 }
 
 // ─── Tunables ───
@@ -266,7 +264,8 @@ const FINDING_SCHEMA = {
                 'such a finding is recorded against that Issue, not fixed here. This pull ' +
                 'request\'s own follow-up Issues (title beginning `<scope>: defects found by ' +
                 'PR #<N>\'s review`) take nothing off its surface: a finding one already holds ' +
-                'is flagged `ledger`, not placed on it.',
+                'is flagged `ledger` when a ledger is named, not placed on it ' +
+                '(docs/conventions.md § Branch and PR Workflow).',
         },
         authority: { type: 'string', description: 'Doc path and section, or contract location.' },
         claim: { type: 'string' },
@@ -437,7 +436,7 @@ const SCOPE_PROMPT = [
                 'symbol and each distinctive phrase of the changed statements), and every ' +
                 'document the `## Summarized By` section of an edited Markdown document lists ' +
                 '(`docs/documentation-standards.md` § Change propagation procedure). Not the ' +
-                'hierarchy walk: a document the delta left true is not listed, and the root ' +
+                'hierarchy walk: a document the search does not find is not listed, and the root ' +
                 '`README.md` and a grouping `README.md` are listed only when the search finds ' +
                 'them. '
             : 'the documents that govern the touched areas, found by walking the scope ' +
@@ -470,7 +469,9 @@ if (!scope.tree_at_head) {
     return { error: 'The working tree is not a clean checkout of the PR head ' + scope.head + '.' }
 }
 if (DELTA && !scope.since_reachable) {
-    return { error: 'since ' + SINCE + ' does not resolve in this clone; run mode full.' }
+    return {
+        error: 'since ' + SINCE + ' does not resolve in this clone; run mode full with the ledger.',
+    }
 }
 
 // Every path the agents return joins by string equality below, so normalize
@@ -553,7 +554,10 @@ const ISSUES_BLOCK = [
         'its number on such a finding, reading the Issue body when its title matches the ' +
         'area; 0 otherwise). An Issue whose title begins `<scope>: defects found by PR #' +
         PR + '\'s review` is this pull request\'s own follow-up Issue: it takes nothing off ' +
-        'the surface, and a finding it already holds is flagged `ledger` instead:',
+        'the surface, and a finding it already holds ' +
+        (LEDGER === null
+            ? 'is reported where the surface puts it:'
+            : 'is flagged `ledger` instead:'),
     bullets(scope.open_issues, (i) => '- #' + i.number + ' ' + i.title),
 ].join('\n')
 
@@ -849,10 +853,12 @@ const AUTHORITY_SECTION = new RegExp(
 )
 
 function authority_key(authority) {
-    const text = String(authority).toLowerCase().replace(/\([^)]*\)/g, ' ')
-        .replace(/\s+/g, ' ').trim()
+    const plain = String(authority).toLowerCase().replace(/\s+/g, ' ').trim()
+    const text = plain.replace(/\([^)]*\)/g, ' ').replace(/\s+/g, ' ').trim()
     const m = text.match(AUTHORITY_SECTION)
-    return m ? m[1] + ' § ' + m[2].trim() : text
+    // Without a document and section, only an identical authority (its
+    // parentheticals included) is the same root cause.
+    return m ? m[1] + ' § ' + m[2].trim() : plain
 }
 
 // The findings docs/conventions.md § Branch and PR Workflow says the review
@@ -975,7 +981,7 @@ function dedup(findings, source) {
             !soft_preexisting &&
             (f.in_bound || (ALWAYS_IN_BOUND.includes(f.class) && pr_files.has(f.file)))
         const in_bound = !f.issue && surface
-        if (DELTA && f.ledger === true) {
+        if (LEDGER !== null && f.ledger === true) {
             ledger_record(f, source, in_bound, surface)
             continue
         }
@@ -1274,7 +1280,8 @@ const SYNTH_PROMPT = [
         'in the entry, each with its status tag; ' +
         'do not drop, add, merge, re-rank, or soften a finding. You may order entries within ' +
         'a bucket by file and group entries that share one root cause under one lead entry ' +
-        'that still lists every file:line, each site with its own status and MUST-violation ' +
+        'that still lists every file:line, each site with its own status, blocking, and ' +
+        'MUST-violation ' +
         'tags. Each entry: `file:line` [status] claim, with ' +
         '`(blocking)` after the status when blocking is true, since such an entry on the ' +
         'review surface blocks the merge whatever its bucket, and `(MUST violation)` after it ' +

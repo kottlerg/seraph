@@ -17,7 +17,9 @@ permissions:
 
 jobs:
   burnin:
-    runs-on: ubuntu-latest
+    # Pinned: `qemu-system-riscv` is a package of the 26.04 archive, so the image
+    # and the install list below move together.
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -38,7 +40,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             qemu-system-x86 \
-            qemu-system-misc \
             qemu-system-riscv \
             ovmf \
             qemu-efi-riscv64

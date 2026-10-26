@@ -370,7 +370,10 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 | `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run-parallel --parallel 2 --runs 20 --timeout 180`. |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
 
-`build-test.yml` cancels stacked runs on the same ref
+The jobs that install QEMU (`validate`, the burn-in matrix, and `build-image`)
+run on the pinned `ubuntu-26.04` runner image, whose archive ships
+`qemu-system-riscv64` in the `qemu-system-riscv` package (QEMU 10.2); the pin
+and the install list move together. `build-test.yml` cancels stacked runs on the same ref
 (`cancel-in-progress: true`). `burnin.yml` and `release.yml` do not
 cancel on the same ref — a tag-push run completes even if a later tag
 pushes.

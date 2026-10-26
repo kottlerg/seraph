@@ -29,22 +29,22 @@ discipline below has been applied end-to-end.
     path, claimed fixes), it narrows *which files you read whole and report
     on*, never the discipline: steps 3 to 6 apply in full to every file in
     the shard, and blast-radius reads (step 5) go wherever the callers are.
-    In `delta` mode the files are those
-    changed since `since`; verify each claimed fix for your files against
-    the code, and report: every claimed fix not actually made; every finding
-    in the changed hunks; any correctness, soundness, safety, or contract
-    defect anywhere in the file. Per `docs/conventions.md` § Branch and PR
-    Workflow, a standards, doc-drift, coverage, or style finding the delta
-    did not introduce is out of bound; a statement the delta made stale, or
-    a test the delta's new code lacks, is one the delta introduced wherever
-    it anchors.
+    In `delta` mode the files are those changed since `since`; verify each
+    claimed fix for your files against the code, and report: every claimed
+    fix not actually made; every finding in the changed hunks; any
+    correctness, soundness, safety, or contract defect anywhere in the
+    file. Per `docs/conventions.md` § Branch and PR Workflow, a standards,
+    doc-drift, coverage, or style finding the delta did not introduce is out
+    of bound; a statement the delta made stale, or a test the delta's new
+    code lacks, is one the delta introduced wherever it anchors.
 
     Per `docs/conventions.md` § Branch and PR Workflow, when the parent
     names a ledger file, read its entries for the files you report on
     (`jq` is available). Set `ledger` on a finding an entry already states
-    when the delta left the hunk it anchors to unchanged; the workflow
-    lists such a finding and does not count it. When the delta changed
-    that hunk, report the finding with `ledger` false, as a fresh finding.
+    when the hunk it anchors to is unchanged since the run the entry names
+    (its `run` field; `git diff <run> <head> -- <file>` shows the change);
+    the workflow lists such a finding and does not count it. When that hunk
+    changed, report the finding with `ledger` false, as a fresh finding.
 
     A lens prompt (call sites, design documents, cross-boundary surfaces,
     regression) names one concern over the whole diff instead of shard
@@ -93,11 +93,11 @@ discipline below has been applied end-to-end.
    per the criterion `docs/conventions.md` § Branch and PR Workflow states,
    so classify on that criterion, not on the track you want. Drift the
    surface definition excludes you still report, marked out of bound; drift
-   an open Issue already names you report with `in_bound`
-   judged as if no Issue named it and `issue` set. Both are recorded rather
-   than fixed, never dropped. Same for system-scope design docs: if the
-   diff silently contradicts one, the doc and the code now disagree, and
-   that is a finding.
+   an open Issue already names you report with `in_bound` judged as if no
+   Issue named it and `issue` set. Both are recorded rather than fixed,
+   never dropped. Same for system-scope design docs: if the diff silently
+   contradicts one, the doc and the code now disagree, and that is a
+   finding.
 
 ## Out of scope
 
@@ -154,12 +154,14 @@ Workflow defines, judged as if no open Issue named the work; a
 correctness, soundness, safety, or contract defect in a touched file is;
 in a delta run, a standards, doc-drift, coverage, or style finding only
 when the delta introduced it), the `issue` that names it when one does
-(the parent lists the open Issues; an Issue whose title begins `<scope>:
-defects found by PR #<N>'s review` for the PR under review is its own
-follow-up Issue and takes nothing off the surface, so a finding it already
-holds is flagged `ledger` instead), the `authority`, the `claim`, the
-`evidence`, and the `fix`. There is no final line in schema mode; the
-workflow computes the verdict from the entries.
+(the parent lists the open Issues; per `docs/conventions.md` § Branch and
+PR Workflow an Issue whose title begins `<scope>: defects found by PR
+#<N>'s review` for the PR under review is its own follow-up Issue and takes
+nothing off the surface, so a finding it already holds is flagged `ledger`
+when the parent names a ledger and otherwise reported where the surface
+puts it), the `authority`, the `claim`, the `evidence`, and the `fix`.
+There is no final line in schema mode; the workflow computes the verdict
+from the entries.
 
 **In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
 `BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound correctness,
@@ -170,9 +172,9 @@ listed, each naming the Issue that records it per `docs/conventions.md`
 § Branch and PR Workflow (the open Issue that already names the work, else
 the PR's follow-up Issue), and do not affect the line; the PR's own
 follow-up Issues take nothing off the surface, and a finding one of them
-or a ledger entry already states, at a hunk the delta left unchanged, is
-listed under a `Ledger (not re-raised)` heading and does not affect the
-line either.
+or a ledger entry already states, at a hunk unchanged since the run that
+reported it, is listed under a `Ledger (not re-raised)` heading and does
+not affect the line either.
 
 ## Tool discipline
 

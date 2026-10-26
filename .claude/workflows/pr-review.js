@@ -18,12 +18,12 @@
 // Findings off the surface are recorded for the open Issue that already names
 // the work, else for the PR's follow-up Issue; those that share a file, class,
 // bucket, MUST flag, Issue, and authority are one root cause and are verified
-// once as a group. A delta run names the ledger of the earlier runs' recorded,
-// dropped, and contested findings; a finding a reviewer flags as already in
-// it, at a hunk the delta left unchanged, is listed and not counted.
-// `.claude/CLAUDE.md` § PR
-// workflow operations says when the assistant runs this workflow, how it
-// builds the ledger, and what it does with the result.
+// once as a group. A run that names the ledger of the earlier runs' recorded,
+// dropped, and contested findings (required in a delta run) lists, and does
+// not count, a finding a reviewer flags as already in it at a hunk unchanged
+// since the run the entry names. `.claude/CLAUDE.md` § PR workflow operations
+// says when the assistant runs this workflow, how it builds the ledger, and
+// what it does with the result.
 //
 // args: { pr: number, mode: 'full' | 'delta' | 'scope', since?: string,
 //         ledger?: string }
@@ -226,8 +226,9 @@ const FINDING_SCHEMA = {
         bucket: {
             enum: ['critical', 'should', 'nit'],
             description:
-                'Severity as you judge it; which findings block the merge is decided by class ' +
-                'and MUST flag (docs/conventions.md § Branch and PR Workflow), not by the bucket.',
+                'Severity as you judge it; which findings block the merge is decided by class, ' +
+                'MUST flag, and the anchor file (docs/conventions.md § Branch and PR Workflow), ' +
+                'not by the bucket.',
         },
         class: { enum: [...ALWAYS_IN_BOUND, ...SOFT_CLASSES] },
         introduced: {
@@ -243,8 +244,8 @@ const FINDING_SCHEMA = {
             type: 'boolean',
             description:
                 'An entry of the ledger the prompt names already states this finding, and the ' +
-                'delta left the hunk it anchors to unchanged (false when no ledger was named or ' +
-                'the delta changed that hunk).',
+                'hunk it anchors to is unchanged since the run the entry names (false when no ' +
+                'ledger was named or that hunk changed).',
         },
         in_bound: {
             type: 'boolean',
@@ -580,8 +581,8 @@ const docs_for = (component) => {
     return { authorities, routing }
 }
 
-// A delta run names the ledger in every reviewer prompt; a shard gets the `jq`
-// filter for its own files.
+// A run that names a ledger passes it to every reviewer prompt; a shard gets
+// the `jq` filter for its own files.
 const ledger_note = (paths) =>
     LEDGER === null
         ? null
@@ -593,9 +594,10 @@ const ledger_note = (paths) =>
                     paths.map((p) => '.file == "' + p + '"').join(' or ') + ')\' ' + LEDGER +
                     '`. '
                 : 'Read the entries for the files you report on. ') +
-            'Do not re-raise a finding an entry already states unless the delta changed the ' +
-            'hunk it anchors to: set `ledger` true on a finding an entry states at a hunk the ' +
-            'delta left unchanged, and false on one in a hunk the delta changed.'
+            'Do not re-raise a finding an entry already states unless the hunk it anchors to ' +
+            'changed since the run the entry names (its `run` field; `git diff <run> <head> -- ' +
+            '<file>` shows the change): set `ledger` true on a finding an entry states at a ' +
+            'hunk unchanged since that run, and false on one in a hunk that changed.'
 
 function shard_prompt(shard) {
     const paths = new Set(shard.files.map((f) => f.path))

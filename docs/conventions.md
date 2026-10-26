@@ -234,21 +234,22 @@ are forbidden; `master` MUST NOT receive force pushes.
   wording, wrapping, nits) is non-blocking: when the reviewer verdict is
   `BLOCKING ISSUES` it is fixed in the same batch, and after a
   `NON-BLOCKING ISSUES ONLY` run it MUST be recorded on the PR's follow-up
-  Issue before the merge prompt. The PR's follow-up
-  Issue for a file is the open Issue whose title begins `<scope>: defects
-  found by PR #N's review`, where `<scope>` is the narrowest commit-title
-  scope (§ Commit Messages) that covers the file; it is filed with the
-  maintainer's approval when the first finding needs it, and it is where a
-  finding off the surface is recorded too when no open Issue already names
-  the work. A finding is recorded as a `- [ ]` task-list item under the
-  Issue's `## Acceptance` section, carrying file, line, authority, and fix.
-  A recorded finding that a later fix round fixes is ticked on that Issue in
-  the same push, and an Issue left with no open item is closed by the PR via
-  `Fixes #N`. A re-review MUST NOT re-raise a finding an earlier run of the
-  same PR recorded, dropped, or the maintainer ruled on unless the delta
-  changed the hunk it anchors to; the workflow reads a ledger built from the
-  saved run records, and a finding the ledger holds whose hunk the delta
-  left unchanged is listed, not counted. A finding off the surface MUST be
+  Issue before the merge prompt. The PR's follow-up Issue for a file is the
+  open Issue whose title begins `<scope>: defects found by PR #N's review`,
+  where `<scope>` is the narrowest commit-title scope (§ Commit Messages)
+  that covers the file; it is filed with the maintainer's approval when the
+  first finding needs it, and it is where a finding off the surface is
+  recorded too when no open Issue already names the work. A finding is
+  recorded as a `- [ ]` task-list item under the Issue's `## Acceptance`
+  section, carrying file, line, authority, and fix. A recorded finding that
+  a later fix round fixes is ticked on that Issue in the same push, and an
+  Issue left with no open item is closed by the PR via `Fixes #N`. A later
+  run of the same PR, delta or full, MUST NOT re-raise a finding an earlier
+  run recorded, dropped, or the maintainer ruled on unless the hunk it
+  anchors to changed since the run that reported it; the workflow reads a
+  ledger built from the saved run records, each entry naming its run, and
+  a finding the ledger holds whose hunk is unchanged since that run is
+  listed, not counted. A finding off the surface MUST be
   recorded, not fixed: the pre-merge review reports it as out of bound, and
   it is appended, with file, line, authority, and fix, to the open Issue
   that already names the work, else to the PR's follow-up Issue for its

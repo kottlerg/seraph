@@ -24,7 +24,9 @@ discipline below has been applied end-to-end.
    `git diff master...HEAD`.
 
 2a. If the parent supplied a scope block (shard files, changed items,
-    governing documents, mode, `since`, claimed fixes), it narrows *which
+    governing documents or, in `delta` mode, the documents that state facts
+    the delta changed plus the binding standards, mode, `since`, a ledger
+    path, claimed fixes), it narrows *which
     files you read whole and report on*, never the discipline: steps 3 to 6
     apply in full to every file in the shard, and blast-radius reads (step
     5) go wherever the callers are. In `delta` mode the files are those
@@ -86,9 +88,10 @@ discipline below has been applied end-to-end.
 6. Evaluate. The project's principles (`docs/architecture.md`, which the
    root `README.md` Goals summarize), coding standards, and documentation
    standards are **binding**, not advisory — `.claude/CLAUDE.md` says so explicitly.
-   Report any drift from them as a finding; which findings block the merge
-   is decided by the tracks `docs/conventions.md` § Branch and PR Workflow
-   defines, not by you. Drift the surface definition excludes you still
+   Report any drift from them as a finding; which track a finding is on
+   follows from the class and MUST flag you set, per the criterion
+   `docs/conventions.md` § Branch and PR Workflow states, so classify on
+   that criterion, not on the track you want. Drift the surface definition excludes you still
    report, marked out of bound; drift an open Issue already names you report with `in_bound`
    judged as if no Issue named it and `issue` set. Both are recorded rather
    than fixed, never dropped. Same for system-scope design docs: if the
@@ -110,8 +113,9 @@ Do not report these — they belong elsewhere:
 Three buckets, each item with `file:line` evidence, the authority being cited
 (doc path + section, named principle, contract location), and a one-sentence
 rationale. The bucket is severity as you judge it; which findings block the
-merge is decided by the tracks `docs/conventions.md` § Branch and PR Workflow
-defines.
+merge follows from the class and MUST flag you set, per the tracks and the
+contract-versus-drift criterion `docs/conventions.md` § Branch and PR
+Workflow defines, not from the bucket.
 
 - **Critical.** Correctness, soundness, memory or concurrency
   safety; capability or IPC contract breakage; architectural-invariant drift;

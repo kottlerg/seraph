@@ -162,7 +162,10 @@ truth for "how work is tracked and shipped" on this project.
   names the work, else on the PR's follow-up Issue that section defines
   (filed with the user's approval).
 - "Out of scope", "follow-up", and similar deferrals MUST NOT be used to
-  avoid mechanically reachable work on the surface.
+  avoid mechanically reachable blocking work on the surface; a non-blocking
+  surface finding is deferred only by recording it on the PR's follow-up
+  Issue as [docs/conventions.md](../docs/conventions.md) § Branch and PR
+  Workflow allows.
 - Material scope expansions MUST be stated in one line and continued, not
   paused for permission.
 - Genuine deferrals (different review surface, or expansion too large to

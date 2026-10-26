@@ -263,7 +263,10 @@ const FINDING_SCHEMA = {
             type: 'integer',
             description:
                 'The open Issue that already names this work, when one does (0 otherwise); ' +
-                'such a finding is recorded against that Issue, not fixed here.',
+                'such a finding is recorded against that Issue, not fixed here. This pull ' +
+                'request\'s own follow-up Issues (title beginning `<scope>: defects found by ' +
+                'PR #<N>\'s review`) take nothing off its surface: a finding one already holds ' +
+                'is flagged `ledger`, not placed on it.',
         },
         authority: { type: 'string', description: 'Doc path and section, or contract location.' },
         claim: { type: 'string' },
@@ -539,10 +542,18 @@ const LENS_HEADER = [
 
 // Work an open Issue already names is off the surface of this PR; every
 // reviewer gets the list so it can set `issue` on such a finding.
+// This pull request's own follow-up Issues hold findings its earlier runs
+// recorded; they take nothing off its surface (docs/conventions.md § Branch
+// and PR Workflow), so a finding placed on one is kept where the surface puts it.
+const OWN_FOLLOW_UP = new RegExp("^[^:]+: defects found by PR #" + PR + "'s review")
+const own_follow_up = (n) => OWN_FOLLOW_UP.test(issue_title(n))
+
 const ISSUES_BLOCK = [
     'Open Issues (work one of them already names is off the review surface: set `issue` to ' +
         'its number on such a finding, reading the Issue body when its title matches the ' +
-        'area; 0 otherwise):',
+        'area; 0 otherwise). An Issue whose title begins `<scope>: defects found by PR #' +
+        PR + '\'s review` is this pull request\'s own follow-up Issue: it takes nothing off ' +
+        'the surface, and a finding it already holds is flagged `ledger` instead:',
     bullets(scope.open_issues, (i) => '- #' + i.number + ' ' + i.title),
 ].join('\n')
 
@@ -841,7 +852,7 @@ function authority_key(authority) {
     const text = String(authority).toLowerCase().replace(/\([^)]*\)/g, ' ')
         .replace(/\s+/g, ' ').trim()
     const m = text.match(AUTHORITY_SECTION)
-    return m ? m[1] + ' § ' + m[2].trim() : text.slice(0, 60)
+    return m ? m[1] + ' § ' + m[2].trim() : text
 }
 
 // The findings docs/conventions.md § Branch and PR Workflow says the review
@@ -946,10 +957,15 @@ function dedup(findings, source) {
     for (const f of findings) {
         f.file = normalize(f.file)
         // Work an open Issue already names is off the surface whatever its
-        // class; an Issue number that is not open is not a placement.
+        // class; an Issue number that is not open, or this pull request's own
+        // follow-up Issue, is not a placement.
         if (f.issue && !open_issue_numbers.has(f.issue)) {
             log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
                 ', not an open Issue; kept on the surface')
+            f.issue = 0
+        } else if (f.issue && own_follow_up(f.issue)) {
+            log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
+                ", this pull request's own follow-up Issue; kept where the surface puts it")
             f.issue = 0
         }
         // In a delta run a soft-class finding is on the surface only when the

@@ -38,7 +38,9 @@ pub struct EndpointState
     wait_set: *mut u8,
     wait_set_member_idx: u8,
 
-    /// Lock protecting the queues and the call/recv rendezvous.
+    /// Serialises every non-atomic field that changes after construction:
+    /// the two queues, the call/recv rendezvous, and the wait-set
+    /// back-pointer pair.
     lock: Spinlock,
 }
 ```
@@ -315,7 +317,9 @@ pub struct NotificationState
     /// is documented in scheduling-internals.md § Atomic Ordering Invariants.
     pub has_observer: AtomicU8,
 
-    /// Spinlock serialising slow-path send/wait and waiter-queue mutations.
+    /// Spinlock serialising every non-atomic field that changes after
+    /// construction: the waiter queue, the slow-path send/wait, and the
+    /// wait-set back-pointer pair.
     pub lock: Spinlock,
 }
 ```
@@ -400,10 +404,21 @@ bit-63-set bitmasks with negative-Err codes.
 ```rust
 pub struct EventQueueState
 {
+    /// Serialises every non-atomic field that changes after construction:
+    /// the ring contents, `write_idx`, `read_idx`, `waiters`, and the
+    /// wait-set back-pointer pair.
     pub lock: Spinlock,
+
+    /// Ring body, inline after this struct in the retype slot (set at
+    /// construction).
+    pub ring: *mut u64,
 
     /// Capacity of the ring (fixed at creation).
     pub capacity: u32,
+
+    /// Entry count: atomic so the wait-set readiness check reads it without
+    /// the lock; every mutation is under `lock`.
+    pub count: AtomicU32,
 
     /// Write index (producer position, modulo capacity).
     pub write_idx: u32,
@@ -414,7 +429,10 @@ pub struct EventQueueState
     /// Receivers blocked in SYS_EVENT_RECV, in arrival order.
     pub waiters: WaitQueue,
 
-    // ... additional bookkeeping fields ...
+    /// Wait-set back-pointer (null if not in any wait set) and this queue's
+    /// member index in that set.
+    pub wait_set: *mut u8,
+    pub wait_set_member_idx: u8,
 }
 ```
 
@@ -513,6 +531,9 @@ pub const WAIT_SET_MAX_MEMBERS: usize = 16;
 
 pub struct WaitSetState
 {
+    /// Serialises every field that changes after construction: `members`,
+    /// `member_count`, `ready_ring`, `ready_head`, `ready_tail`, and
+    /// `waiters`. Inner to every source's lock (see § Lock Ordering).
     lock: Spinlock,
 
     /// Registered members. A slot whose `source_ptr` is null is vacant.

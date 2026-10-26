@@ -32,7 +32,8 @@
 //! either way its commit lands on the state the target's return left; the
 //! target reports its timeout (`0` bits, `WouldBlock`) rather than
 //! `Interrupted` (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep
-//! List Invariants, invariant 4).
+//! List Invariants, invariant 4, and § `sys_thread_stop` Cross-CPU Stop
+//! Protocol, step 2).
 //!
 //! ## How this exercises it
 //!

@@ -478,11 +478,14 @@ pub struct ThreadControlBlock
     /// Inline message buffer for in-flight IPC data. Owned by the holder of
     /// this thread's park claim: the source's `ep.lock` while the thread is
     /// queued on it (the thread fills it before it enqueues itself; the party
-    /// that dequeues it reads or fills it under the same lock), and the won
-    /// `reply_tcb` claim once the thread is bound for reply (the reply, or the
-    /// failed-transfer sentinel, is written by that claim's winner). The
-    /// resuming thread reads it with no lock (the bare-field exception of
-    /// docs/coding-standards.md § Concurrency).
+    /// that dequeues it reads or fills it under the same lock, and may finish
+    /// the capability-transfer results after releasing it while it still holds
+    /// the dequeue claim, the `wake_in_flight` pin that lasts until its
+    /// `enqueue_and_wake`: `deliver_call_caps`), and the won `reply_tcb` claim
+    /// once the thread is bound for reply (the reply, or the failed-transfer
+    /// sentinel, is written by that claim's winner). The resuming thread reads
+    /// it with no lock (the bare-field exception of docs/coding-standards.md
+    /// § Concurrency).
     pub ipc_msg: crate::ipc::message::Message,
 
     /// Caller bound by this thread's last receive: consumed by its reply,
@@ -638,22 +641,22 @@ pub struct ThreadControlBlock
     /// to this page when `data_count > 0`.
     pub ipc_buffer: u64,
 
-    /// Wakeup value delivered to this thread when unblocked from a notification wait.
+    /// Wakeup value delivered to this thread when its IPC wait is claimed.
     ///
-    /// Owned by the source lock: the parking syscall resets it under that lock,
-    /// and the waker that claims the park writes it there (`claim_waiter`: the
-    /// bits `notification_send` acquired on the waiter's behalf, an event-queue
-    /// payload, or `0` from the sleep-list timer claim). Read by the resuming
-    /// syscall with no lock (the bare-field exception of
-    /// docs/coding-standards.md § Concurrency).
+    /// Owned by the source lock: the waker that claims the park writes it
+    /// under that lock (`claim_waiter`: the bits `notification_send` acquired
+    /// on the waiter's behalf, an event-queue payload, a wait-set member badge
+    /// from `waitset_notify`, or `0` from the sleep-list timer claim and from
+    /// a source's dealloc drain). The resuming syscall reads and then clears
+    /// it with no lock, before the thread can park again (the bare-field
+    /// exception of docs/coding-standards.md § Concurrency).
     pub wakeup_value: u64,
 
     /// Out-of-band timeout marker. True iff the most recent wake came from
     /// the sleep-list timer arm in `sleep_check_wakeups`. Owned by the source
-    /// lock: the parking syscall clears it under `eq.lock`, and the timer claim
-    /// sets it under the same lock. Read-and-cleared by the resuming syscall
-    /// with no lock (the bare-field exception of docs/coding-standards.md
-    /// § Concurrency).
+    /// lock: the timer claim sets it under `eq.lock`; the resuming syscall
+    /// reads and clears it with no lock, before the thread can park again
+    /// (the bare-field exception of docs/coding-standards.md § Concurrency).
     ///
     /// Required by `sys_event_recv` because event-queue payloads may be any
     /// `u64` (including 0), so `wakeup_value` cannot itself encode the

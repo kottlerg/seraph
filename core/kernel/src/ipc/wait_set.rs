@@ -168,8 +168,8 @@ impl WaitSetMember
 pub struct WaitSetState
 {
     /// Per-`WaitSetState` spinlock. Serialises every mutation of the
-    /// fields below — `members`, `ready_ring`, `waiters`, and the read/write
-    /// pointers. Acquired by `waitset_wait`, `waitset_notify`,
+    /// fields below — `members`, `member_count`, `ready_ring`, `waiters`,
+    /// and the read/write pointers. Acquired by `waitset_wait`, `waitset_notify`,
     /// `waitset_add`, `waitset_remove`, and `wait_set_drop`.
     ///
     /// Lock order: `<source>.lock` (Notification/Endpoint/EventQueue) is OUTER,

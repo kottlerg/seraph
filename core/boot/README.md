@@ -21,6 +21,7 @@ documented in [docs/kernel-handoff.md](docs/kernel-handoff.md).
 ```
 boot/
 ├── Cargo.toml                  # seraph-boot crate (UEFI application)
+├── build.rs                    # Passes the RISC-V UEFI linker script to the linker
 ├── linker/
 │   └── riscv64-uefi.ld         # Linker script for RISC-V PE/COFF pipeline
 └── src/
@@ -103,7 +104,8 @@ The bootloader is built as part of the Seraph workspace. Refer to
 
 On x86-64, the Rust toolchain emits a PE/COFF `.efi` directly. On RISC-V, LLVM has
 no PE/COFF backend, so the output ELF is converted to a flat binary with a
-hand-crafted header prepended. See [docs/riscv-uefi-boot.md](docs/riscv-uefi-boot.md)
+hand-crafted header prepended; `build.rs` passes `linker/riscv64-uefi.ld` to the
+linker for that target. See [docs/riscv-uefi-boot.md](docs/riscv-uefi-boot.md)
 for details.
 
 ---

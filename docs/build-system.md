@@ -112,6 +112,17 @@ the per-arch primitives are in `core/kernel/src/arch/{x86_64,riscv64}/fpu.rs`.
 The x86-64 bootloader uses the built-in `x86_64-unknown-uefi` target, so no
 custom JSON is needed. The RISC-V bootloader uses
 `riscv64imac-seraph-uefi.json` because no equivalent built-in target exists.
+Its linker script, `core/boot/linker/riscv64-uefi.ld`, is passed by
+`core/boot/build.rs` as an absolute `-T` link argument, the way
+`core/kernel/build.rs` passes the kernel's, and `cargo xtask build` sets
+`RUSTFLAGS` for the bootloader build (`-Zunstable-options`, plus
+`-C jump-tables=no` on RISC-V, where UEFI cannot relocate jump tables).
+Cargo reads the `.cargo/config.toml` of the current directory and of every
+parent directory and joins their `rustflags` arrays, so a checkout nested
+under another (a worktree under `.claude/worktrees/`) receives every flag in
+those files once per file; `RUSTFLAGS` is used in place of them all, and a
+build-script link arg is emitted once, so the bootloader link is the same
+from any checkout.
 
 Custom targets require `-Zbuild-std` (`core,alloc,compiler_builtins` for
 kernel/no_std triples; `core,alloc,std,panic_abort` for std-userspace

@@ -183,7 +183,7 @@ The RISC-V bootloader uses a custom Cargo target specification,
 | `features` | `"+m,+a,+c"` (RV64IMAC) | `"+m,+a,+c"` (RV64IMAC) |
 | `linker` | `"rust-lld"` | `"rust-lld"` |
 | `linker-flavor` | `"ld.lld"` | `"ld.lld"` |
-| `pre-link-args` | custom linker script | custom linker script |
+| linker script | `-T` link arg from `core/boot/build.rs` | `-T` link arg from `core/kernel/build.rs` |
 
 The `relocation-model: "pic"` setting (with `-pie`,
 `position-independent-executables`, and `static-position-independent-executables`)
@@ -202,9 +202,11 @@ so every relocation is a base-relative `R_RISCV_RELATIVE`.
 The RISC-V UEFI image is produced by `cargo xtask build --arch riscv64`.
 Internally the pipeline runs in three steps:
 
-1. The bootloader crate is compiled against `riscv64imac-seraph-uefi`,
-   producing an ELF that contains the `.pecoff_header` section (assembled
-   from `header.S`) at load address `0x0`, followed by `.text` at `0x1000`.
+1. The bootloader crate is compiled against `riscv64imac-seraph-uefi` and
+   linked with `linker/riscv64-uefi.ld`, which `build.rs` passes to the
+   linker, producing an ELF that contains the `.pecoff_header` section
+   (assembled from `header.S`) at load address `0x0`, followed by `.text` at
+   `0x1000`.
 2. `llvm-objcopy -O binary` strips all ELF structure and emits only the
    section data in load-address order. Byte 0 of the output is the MZ
    signature from `.pecoff_header`; byte `0x1000` is the entry trampoline.

@@ -79,6 +79,23 @@ impl Arch
         }
     }
 
+    /// `RUSTFLAGS` for the UEFI bootloader build.
+    ///
+    /// Cargo uses the variable in place of every config-file `rustflags`
+    /// entry, so the bootloader's flags do not depend on which
+    /// `.cargo/config.toml` files cargo merges: a checkout nested under
+    /// another receives its parent's entries too. The linker script comes
+    /// from `core/boot/build.rs`; `jump-tables=no` avoids jump tables that
+    /// UEFI cannot relocate.
+    pub fn boot_rustflags(self) -> &'static str
+    {
+        match self
+        {
+            Arch::X86_64 => "-Zunstable-options",
+            Arch::Riscv64 => "-Zunstable-options -C jump-tables=no",
+        }
+    }
+
     /// UEFI fallback bootloader filename placed at EFI/BOOT/<name>.
     ///
     /// This is the path UEFI firmware searches when no explicit boot entry exists.

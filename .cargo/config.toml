@@ -18,15 +18,10 @@ json-target-spec = true
 [env]
 RUST_TARGET_PATH = { value = "xtask/targets", relative = true }
 
+# Cargo joins this array with the one in every parent directory's config
+# (a checkout nested under another), so a flag a link must receive exactly
+# once does not belong here: the bootloader's flags come from `cargo xtask`
+# (`RUSTFLAGS`, which cargo uses instead of this file) and its linker script
+# from core/boot/build.rs.
 [build]
 rustflags = ["-Zunstable-options"]
-
-# RISC-V UEFI bootloader link flags.
-# The linker script path is relative to the workspace root.
-# jump-tables=no avoids generating jump tables that UEFI can't relocate.
-[target.riscv64imac-seraph-uefi]
-rustflags = [
-    "-Zunstable-options",
-    "-C", "link-arg=-Tcore/boot/linker/riscv64-uefi.ld",
-    "-C", "jump-tables=no",
-]

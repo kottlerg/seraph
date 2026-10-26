@@ -100,7 +100,8 @@ feature) MAY stay unassigned; it is assigned when it is scheduled. The rule appl
 filed before it: the maintainer assigns each a milestone or confirms it as unscheduled work. An
 Issue that closes without a milestone, or under one other than the current milestone, MUST be
 assigned the current milestone when it closes; step 7 of § Release Production then settles every
-closed Issue on the release whose tag contains its fix.
+closed Issue on a release: the one whose tag contains its fix, or for an Issue closed without one,
+the one current when it closed.
 
 ### Commit and PR cross-references
 
@@ -366,9 +367,9 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    `burnin.yml` run for the same tag completed successfully.
 7. The maintainer creates `v<X>.<Y>.<Z+1>` when no `v<X>.<Y>.*` milestone
    above `v<X>.<Y>.<Z>` is open. Every Issue in `v<X>.<Y>.<Z>` or a lower open
-   milestone moves to `v<X>.<Y>.<Z>` when a commit the tag contains closed
-   it, and otherwise to the lowest-versioned open milestone above
-   `v<X>.<Y>.<Z>`. The maintainer then closes `v<X>.<Y>.<Z>` and every lower
+   milestone moves to `v<X>.<Y>.<Z>` when it is closed and no commit outside
+   the tag closed it, and otherwise to the lowest-versioned open milestone
+   above `v<X>.<Y>.<Z>`. The maintainer then closes `v<X>.<Y>.<Z>` and every lower
    open milestone; the lowest-versioned open milestone is current
    (§ Milestones).
 

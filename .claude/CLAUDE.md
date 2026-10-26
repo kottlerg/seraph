@@ -119,14 +119,17 @@ truth for "how work is tracked and shipped" on this project.
   the user's approval as `gh issue create --milestone <current> --label
   <subsystem> --label <class>`, the current milestone being the one
   [docs/conventions.md](../docs/conventions.md) § Milestones defines and
-  the labels the ones its § Labels requires. A finding the Issue already
-  holds is not appended again. A PR that fixes items on a follow-up Issue
-  ticks each there with `(fixed by PR #<M>)`, copies those items, ticked,
-  into its body's `## Acceptance`, and carries `Refs #N` in its body, and
-  `Fixes #N` only under that section's closing condition. Before each
-  run, an Issue the PR closes (by its body or a commit) that carries no
-  milestone gets the current one (`gh issue edit <N> --milestone
-  <current>`), which the audit checks. `AUDIT FAIL` items via
+  the labels the ones its § Labels requires. Before recording a finding,
+  and after fixing one, search every open follow-up Issue of its scope,
+  rolling and earlier-pattern, for an item stating it: a finding one holds
+  is recorded nowhere, and its fix ticks that item. A PR that fixes items
+  on a follow-up Issue ticks each there with `(fixed by PR #<M>)`, copies
+  those items, ticked, into its body's `## Acceptance`, and carries
+  `Refs #N` in its body, and `Fixes #N` only under that section's closing
+  condition. Before each run, an Issue the PR closes (by its body or a
+  commit) whose milestone is missing or not the current one gets the
+  current one (`gh issue edit <N> --milestone <current>`), which the audit
+  checks. `AUDIT FAIL` items via
   `gh pr edit`, `gh issue edit`, or commits; a contested
   finding put to the user and resolved as the section says. Before
   pushing a fix, for every fact it changes (a symbol, a constant, a rule

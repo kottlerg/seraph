@@ -19,10 +19,11 @@
 // the work, else for the follow-up Issue of their scope; those that share a
 // file, class, bucket, MUST flag, Issue, and authority are one root cause and
 // are verified once as a group. A follow-up Issue names findings, not work, so
-// naming one takes nothing off the surface. A run that names the ledger of the earlier runs' recorded,
-// dropped, and contested findings (required in a delta run) lists, and does
-// not count, a finding a reviewer flags as already in it at a hunk unchanged
-// since the run the entry names, when that run resolves in the clone.
+// naming one takes nothing off the surface. A run that names the ledger of the
+// earlier runs' recorded, dropped, and contested findings (required in a delta
+// run) lists, and does not count, a finding a reviewer flags as already in it
+// at a hunk unchanged since the run the entry names, when that run resolves in
+// the clone.
 // `.claude/CLAUDE.md` § PR workflow operations says when the assistant runs
 // this workflow, how it builds the ledger, and what it does with the result.
 //
@@ -268,8 +269,9 @@ const FINDING_SCHEMA = {
                 'Issue (title `<scope>: defects found by review`, or one beginning with the ' +
                 'earlier `<scope>: defects found by PR #<N>\'s review`) names findings, not ' +
                 'work, and takes nothing off the surface: never name one here; a finding an ' +
-                'earlier run of this pull request recorded on one is flagged `ledger` when a ' +
-                'ledger is named (docs/conventions.md § Branch and PR Workflow).',
+                'earlier run of this pull request recorded on one is flagged `ledger` only ' +
+                'under the `ledger` field\'s conditions (docs/conventions.md § Branch and PR ' +
+                'Workflow).',
         },
         authority: { type: 'string', description: 'Doc path and section, or contract location.' },
         claim: { type: 'string' },
@@ -569,7 +571,8 @@ const ISSUES_BLOCK = [
         'so never set `issue` to one; a finding it already holds ' +
         (LEDGER === null
             ? 'is reported where the surface puts it:'
-            : 'is flagged `ledger` when an earlier run of this pull request recorded it, and ' +
+            : 'is flagged `ledger` only under the ledger rule below (an entry states it at a ' +
+                'hunk unchanged since the entry\'s run, and that run resolves in the clone), and ' +
                 'otherwise reported where the surface puts it:'),
     bullets(scope.open_issues, (i) => '- #' + i.number + ' ' + i.title),
 ].join('\n')

@@ -163,9 +163,9 @@ PR Workflow an Issue whose title is `<scope>: defects found by review`,
 or begins with the earlier `<scope>: defects found by PR #<N>'s review`, is a
 follow-up Issue, which names findings, not work: it takes nothing off the
 surface, so `issue` is never set to it, and a finding it already holds is
-flagged `ledger` when an earlier run of this PR recorded it and the parent
-names a ledger, and otherwise reported where the surface puts it), the
-`authority`, the `claim`, the `evidence`, and the `fix`.
+flagged `ledger` only as step 2a says, and otherwise reported where the
+surface puts it), the `authority`, the `claim`, the `evidence`, and the
+`fix`.
 There is no final line in schema mode; the workflow computes the verdict
 from the entries.
 

@@ -98,8 +98,9 @@ class) MUST carry a milestone from creation: the current milestone, or the later
 planned for. Only future-state work no release has scheduled (a design umbrella, an unscheduled
 feature) MAY stay unassigned; it is assigned when it is scheduled. The rule applies to open Issues
 filed before it: the maintainer assigns each a milestone or confirms it as unscheduled work. An
-Issue that closes without a milestone, or under a milestone other than the current one, MUST be
-assigned, retroactively, the milestone that was current when it closed.
+Issue that closes without a milestone, or under one other than the current milestone, MUST be
+assigned the current milestone when it closes; step 7 of § Release Production then settles every
+closed Issue on the release whose tag contains its fix.
 
 ### Commit and PR cross-references
 
@@ -284,17 +285,19 @@ are forbidden; `master` MUST NOT receive force pushes.
   with the maintainer's approval, is off the surface of every other PR; a
   finding on it is recorded against that Issue. A follow-up Issue names
   findings, not work: it takes nothing off any PR's surface, so a finding it
-  holds is reported, counted, and fixed or recorded wherever the surface
-  definition above puts it; a finding it already holds is not appended to it
-  again, and the fix of one ticks its item. A finding two independent
-  refuters refute on evidence is dropped and listed in the report's Dropped
-  section. The review verifies every finding that can block and every
-  Critical or Should finding, on or off the surface, except a finding the
-  ledger rule above lists, not counts, which is listed unverified; a nit
-  that cannot block is fixed or recorded unverified. Verified findings off
-  the surface that share file, class, bucket, MUST flag, named Issue, and
-  authority are one root cause: the first is verified and each of the others
-  takes the group's verdict. Every other finding is fixed or recorded.
+  holds is, unless the ledger rule above lists it, reported, counted, and
+  fixed or recorded wherever the surface definition above puts it. A finding
+  any open follow-up Issue of its scope already holds is not recorded again
+  on any Issue, and its fix ticks its item on the Issue that holds it. A
+  finding two independent refuters refute on evidence is dropped and listed
+  in the report's Dropped section. The review verifies every finding that
+  can block and every Critical or Should finding, on or off the surface,
+  except a finding the ledger rule above lists, not counts, which is listed
+  unverified; a nit that cannot block is fixed or recorded unverified.
+  Verified findings off the surface that share file, class, bucket, MUST
+  flag, named Issue, and authority are one root cause: the first is verified
+  and each of the others takes the group's verdict. Every other finding is
+  fixed or recorded.
 
 ### Branch naming
 
@@ -362,13 +365,12 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
 6. The maintainer publishes the draft Release manually after verifying the
    `burnin.yml` run for the same tag completed successfully.
 7. The maintainer creates `v<X>.<Y>.<Z+1>` when no `v<X>.<Y>.*` milestone
-   above `v<X>.<Y>.<Z>` is open. An Issue closed before the tag was pushed
-   that carries a lower open milestone moves to `v<X>.<Y>.<Z>`, which shipped
-   it; an Issue still open in `v<X>.<Y>.<Z>` or a lower open milestone, or
-   closed in one after the tag was pushed, moves to the lowest-versioned open
-   milestone above `v<X>.<Y>.<Z>`. The maintainer then closes `v<X>.<Y>.<Z>`
-   and every lower open milestone; the lowest-versioned open milestone is
-   current (§ Milestones).
+   above `v<X>.<Y>.<Z>` is open. Every Issue in `v<X>.<Y>.<Z>` or a lower open
+   milestone moves to `v<X>.<Y>.<Z>` when a commit the tag contains closed
+   it, and otherwise to the lowest-versioned open milestone above
+   `v<X>.<Y>.<Z>`. The maintainer then closes `v<X>.<Y>.<Z>` and every lower
+   open milestone; the lowest-versioned open milestone is current
+   (§ Milestones).
 
 ---
 

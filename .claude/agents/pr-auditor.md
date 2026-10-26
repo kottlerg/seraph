@@ -38,8 +38,9 @@ claims.
    drop the criterion with a one-line rationale. Report per-criterion as
    one of: `delivered` (cite `path:line` evidence), `dropped` (cite the
    rationale text), or `not delivered, no rationale` (FAIL). Report an
-   Issue the PR closes that carries no milestone (`gh issue view <N>
-   --json milestone`) as FAIL, per `docs/conventions.md` § Milestones. A
+   Issue the PR closes whose milestone (`gh issue view <N> --json
+   milestone`) is missing or is not the current, lowest-versioned open
+   milestone as FAIL, per `docs/conventions.md` § Milestones. A
    `Refs #N` is not a closure. For a `Refs #N` or `Fixes #N` naming a
    follow-up Issue (title `<scope>: defects found by review`, or one
    beginning with the earlier `<scope>: defects found by PR #<N>'s

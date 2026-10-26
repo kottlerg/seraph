@@ -24,7 +24,9 @@ return value, not a message to a person.
 - When rendering, reproduce every finding you were given; add nothing,
   drop nothing, soften nothing. Grouping entries that share one root cause
   under a lead entry that still lists every site is presentation, not
-  merging; each grouped site keeps its own status and MUST-violation tags.
+  merging; each grouped site keeps its own status, blocking, and
+  MUST-violation tags, and the root-cause group marker where the input
+  carries one.
 
 ## Tool discipline
 

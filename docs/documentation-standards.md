@@ -111,6 +111,11 @@ When implementation changes invalidate documentation:
 
 This procedure is mandatory. Skipping it allows silent conceptual drift.
 
+A violation of this standard that the pre-merge review finds in a Markdown document is
+non-blocking under [conventions.md](conventions.md) § Branch and PR Workflow, which owns that
+rule: it is fixed in the batch when the run has blocking findings, and otherwise recorded on
+the PR's follow-up Issue before merge.
+
 ---
 
 ## Documentation and Code Comments

@@ -69,24 +69,32 @@ truth for "how work is tracked and shipped" on this project.
   the previous run reviewed and `ledger` set to the ledger file built
   below. The workflow's header comment describes what it does. Save the
   report as `target/xtask/review/pr<N>/<mode>-<head>.md` and the returned
-  `findings`, `recorded`, `ledgered`, `dropped`, and `audit` fields as
-  `<mode>-<head>.json` beside it, and surface both verdict lines to the
-  user verbatim. If the Workflow tool is unavailable (the directly invoked
-  agents are then the review, per that section), invoke `@pr-reviewer` and
+  object (`verdict`, `audit_verdict`, `findings`, `recorded`, `ledgered`,
+  `dropped`, `audit`, `stats`) as `<mode>-<head>.json` beside it, and
+  surface both verdict lines to the user verbatim. If the Workflow tool is
+  unavailable (the directly invoked agents are then the review, per that
+  section), invoke `@pr-reviewer` and
   `@pr-auditor` directly in parallel (single message, two `Agent` tool
   calls) with the PR number as scope, the open Issue list (`gh issue list
-  --state open --limit 500 --json number,title`), and the ledger path, and
-  apply the same verdict handling.
+  --state open --limit 500 --json number,title`), and, for a re-review,
+  the `since` head and the ledger path, and apply the same verdict
+  handling.
 
   Before each `delta` run, build the ledger that section names from every
   saved run record of the PR:
 
   ```sh
   jq -s '[.[] | .stats.head[0:8] as $run
-          | ((.recorded + .dropped + [.findings[] | select(.status == "contested")])[]
-             | {run: $run, file, line, class, bucket, status, issue, claim, fix})]' \
+          | ((.recorded + .dropped
+              + [.findings[] | select(.status == "contested")]
+              + (if .verdict == "NON-BLOCKING ISSUES ONLY" then .findings else [] end))[]
+             | {run: $run, file, line, class, bucket, status, issue, claim, fix})]
+         | unique_by([.run, .file, .line, .class, .bucket])' \
       target/xtask/review/pr<N>/*-*.json > target/xtask/review/pr<N>/ledger.json
   ```
+
+  The surface findings of a `NON-BLOCKING ISSUES ONLY` run enter the ledger
+  because the procedure below records them before the merge prompt.
 
   Handle the run's findings as that section says, in one pass: fixes via
   commits; recorded findings via `gh issue edit` on the Issue the section
@@ -94,19 +102,19 @@ truth for "how work is tracked and shipped" on this project.
   items via `gh pr edit`, `gh issue edit`, or commits; a contested
   finding put to the user and resolved as the section says. Before
   pushing a fix, for every fact it changes (a symbol, a constant, a rule
-  sentence, a state or section name) `grep -rn` the tree (`*.md`, `*.rs`,
-  `.claude/`) for every other statement of it and update each copy in the
-  same push, walking the `## Summarized By` lists as well
+  sentence, a state or section name) walk the `## Summarized By` lists
   ([docs/documentation-standards.md](../docs/documentation-standards.md)
-  § Change propagation procedure owns the rule).
+  § Change propagation procedure owns that rule) and, as the assistant's
+  mechanics, `git grep -n` the tracked tree for every other statement of
+  it, and update each copy in the same push.
 
   After the fixes are pushed and CI is green again, run the workflow in
   `delta` mode. Prompt for the merge decision only under that section's
   merge-prompt condition; when a `NON-BLOCKING ISSUES ONLY` run meets it,
-  first record the run's surface findings on the per-component follow-up
-  Issues the section defines (`gh issue create` with the user's approval,
-  `gh issue edit` thereafter) and offer one more fix round beside the
-  merge. Merge via `gh pr merge <N> --merge --delete-branch` (per
+  first record the run's surface findings on the follow-up Issues the
+  section defines (`gh issue create` with the user's approval, `gh issue
+  edit` thereafter) and offer one more fix round beside the merge. Merge
+  via `gh pr merge <N> --merge --delete-branch` (per
   [docs/conventions.md](../docs/conventions.md) § Merge method).
 - On red: surface the failing job's tail (`gh run view <run-id> --log-failed`
   or equivalent) so the user can see the actual error without asking.
@@ -144,8 +152,8 @@ truth for "how work is tracked and shipped" on this project.
   fixed in the same pass, and non-blocking ones MUST be fixed in that batch
   or recorded as that section says. Findings off the surface MUST be
   recorded in the same pass, never dropped: on the open Issue that already
-  names the work, else on the open audit Issue (or a new one filed with the
-  user's approval).
+  names the work, else on the PR's follow-up Issue that section defines
+  (filed with the user's approval).
 - "Out of scope", "follow-up", and similar deferrals MUST NOT be used to
   avoid mechanically reachable work on the surface.
 - Material scope expansions MUST be stated in one line and continued, not

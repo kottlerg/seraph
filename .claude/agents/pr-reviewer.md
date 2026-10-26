@@ -37,11 +37,12 @@ discipline below has been applied end-to-end.
     a test the delta's new code lacks, is one the delta introduced wherever
     it anchors.
 
-    When the parent names a ledger file, read its entries for the files
-    you report on (`jq` is available). A finding an entry already states
-    is reported only when the delta changed the hunk it anchors to, and
-    then with `ledger` set; the workflow lists, and does not count, a
-    flagged finding the delta did not introduce.
+    Per `docs/conventions.md` § Branch and PR Workflow, when the parent
+    names a ledger file, read its entries for the files you report on
+    (`jq` is available). Set `ledger` on a finding an entry already states
+    when the delta left the hunk it anchors to unchanged; the workflow
+    lists such a finding and does not count it. When the delta changed
+    that hunk, report the finding with `ledger` false, as a fresh finding.
 
     A lens prompt (call sites, design documents, cross-boundary surfaces,
     regression) names one concern over the whole diff instead of shard
@@ -139,7 +140,8 @@ statement of an ABI or syscall contract that the code contradicts;
 code disagree otherwise; `coverage`: a missing test; `style`: readability
 and naming), whether the diff `introduced` it (in `delta` mode, whether
 the delta did), whether it is a `must_violation` of a binding standard,
-whether a `ledger` entry the parent supplied already states it, whether
+whether a `ledger` entry the parent supplied already states it at a hunk
+the delta left unchanged, whether
 it is `in_bound` (on the
 review surface `docs/conventions.md` § Branch and PR Workflow defines,
 judged as if no open Issue named the work; a correctness,
@@ -157,7 +159,9 @@ a Markdown document, forces `BLOCKING ISSUES` (the blocking track of
 `docs/conventions.md` § Branch and PR Workflow); out-of-bound findings are
 listed, each naming the Issue that records it per `docs/conventions.md`
 § Branch and PR Workflow (the open Issue that already names the work, else
-the audit Issue), and do not affect the line.
+the PR's follow-up Issue), and do not affect the line; a finding a ledger
+entry already states, at a hunk the delta left unchanged, is listed under a
+`Ledger (not re-raised)` heading and does not affect the line either.
 
 ## Tool discipline
 

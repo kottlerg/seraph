@@ -16,11 +16,12 @@
 // only those on its blocking track (class correctness, safety, or contract, or
 // a MUST violation anchored outside Markdown) make it `BLOCKING ISSUES`.
 // Findings off the surface are recorded for the open Issue that already names
-// the work, else for the audit Issue; those that share a file, class, bucket,
-// MUST flag, and authority are one root cause and are verified once as a
-// group. A delta run names the ledger of the earlier runs' recorded, dropped,
-// and contested findings; a finding a reviewer flags as already in it, and the
-// delta did not introduce, is listed and not counted. `.claude/CLAUDE.md` § PR
+// the work, else for the PR's follow-up Issue; those that share a file, class,
+// bucket, MUST flag, Issue, and authority are one root cause and are verified
+// once as a group. A delta run names the ledger of the earlier runs' recorded,
+// dropped, and contested findings; a finding a reviewer flags as already in
+// it, at a hunk the delta left unchanged, is listed and not counted.
+// `.claude/CLAUDE.md` § PR
 // workflow operations says when the assistant runs this workflow, how it
 // builds the ledger, and what it does with the result.
 //
@@ -101,10 +102,10 @@ const VERIFY_LENSES = ['reality', 'authority']
 const ALWAYS_IN_BOUND = ['correctness', 'safety', 'contract']
 const SOFT_CLASSES = ['standards', 'doc-drift', 'coverage', 'style']
 // The blocking track (docs/conventions.md § Branch and PR Workflow): a finding
-// of the first set, or a MUST violation of a standard anchored outside Markdown.
+// of the first set, or a MUST violation of a standard, of whatever class,
+// anchored outside Markdown.
 const blocks = (f) =>
-    ALWAYS_IN_BOUND.includes(f.class) ||
-    (f.class === 'standards' && f.must_violation && !f.file.endsWith('.md'))
+    ALWAYS_IN_BOUND.includes(f.class) || (f.must_violation && !f.file.endsWith('.md'))
 // Binding on every introduced change, so every shard reads them in a delta run
 // even when the narrowed design-document list omits them; never a design-docs
 // lens document in that mode.
@@ -243,8 +244,9 @@ const FINDING_SCHEMA = {
         ledger: {
             type: 'boolean',
             description:
-                'An entry of the ledger the prompt names already states this finding at this ' +
-                'anchor (false when no ledger was named).',
+                'An entry of the ledger the prompt names already states this finding, and the ' +
+                'delta left the hunk it anchors to unchanged (false when no ledger was named or ' +
+                'the delta changed that hunk).',
         },
         in_bound: {
             type: 'boolean',
@@ -429,7 +431,9 @@ const SCOPE_PROMPT = [
                 'delta edits, and every tracked Markdown document (`git ls-files \'*.md\'`) ' +
                 'whose text names a changed item, a constant, state, error, or section the ' +
                 'delta renamed or redefined, or a behaviour the delta changed (search for each ' +
-                'symbol and each distinctive phrase of the changed statements). Not the ' +
+                'symbol and each distinctive phrase of the changed statements), and every ' +
+                'document the `## Summarized By` section of an edited Markdown document lists ' +
+                '(`docs/documentation-standards.md` § Change propagation procedure). Not the ' +
                 'hierarchy walk: a document the delta left true is not listed, and the root ' +
                 '`README.md` and a grouping `README.md` are listed only when the search finds ' +
                 'them. '
@@ -575,7 +579,8 @@ const ledger_note = (paths) =>
                     '`. '
                 : 'Read the entries for the files you report on. ') +
             'Do not re-raise a finding an entry already states unless the delta changed the ' +
-            'hunk it anchors to; set `ledger` true on a finding an entry states.'
+            'hunk it anchors to: set `ledger` true on a finding an entry states at a hunk the ' +
+            'delta left unchanged, and false on one in a hunk the delta changed.'
 
 function shard_prompt(shard) {
     const paths = new Set(shard.files.map((f) => f.path))
@@ -594,7 +599,10 @@ function shard_prompt(shard) {
             'defect at a caller under the caller\'s own file:line:',
         bullets(items, item_line),
         '',
-        'Design documents governing this shard (read the relevant ones in full):',
+        (DELTA
+            ? 'Documents that state facts the delta changed, plus the binding standards (read ' +
+                'the relevant ones in full):'
+            : 'Design documents governing this shard (read the relevant ones in full):'),
         bullets(docs.authorities, doc_line),
         '',
         'Routing documents (not authorities; for context only):',
@@ -740,8 +748,8 @@ function verify_prompt(f, lens) {
         'statement) is exhibited by the place where it should be.' +
         (LEDGER === null
             ? ''
-            : ' The ledger `' + LEDGER + '` lists what earlier runs recorded or dropped; an ' +
-                'entry is context, not evidence either way.')
+            : ' The ledger `' + LEDGER + '` lists what earlier runs recorded, dropped, or the ' +
+                'maintainer ruled on; an entry is context, not evidence either way.')
     if (lens === 'reality') {
         return [
             'You are an independent skeptic. Try to refute this review finding on the facts. ' +
@@ -802,31 +810,104 @@ const seen = []
 // a record with an Issue keeps it, and the authority refuter's issue_refuted
 // vote decides. A nit that names no MUST violation is never verified, so an
 // Issue any reporter names on it is final whichever reporter arrived first.
-// A finding flagged as already in the ledger, and not introduced by the delta,
-// becomes a `ledgered` record: listed, never verified or counted; a later
-// reporter's copy of it is absorbed like any duplicate. An off-surface record
-// that shares file, class, bucket, MUST flag, and authority with an earlier
-// off-surface record is the same root cause: it joins that record's group and
-// takes the group's verdict instead of its own verification.
+// A finding flagged as already in the ledger (an entry states it and the delta
+// left its hunk unchanged) becomes a `ledgered` record, or joins the ledgered
+// record at its anchor: listed, never verified or counted, and never a target
+// for other reports, so a report without the flag at the same anchor is a
+// record of its own. An off-surface record that shares file, class, bucket,
+// MUST flag, Issue, and authority with an earlier off-surface record is the
+// same root cause: it joins that record's group and takes the group's verdict
+// instead of its own verification.
 const ledgered = []
 
-// The authority's document and first section word, so the wordings one
-// reviewer gives the same section ("§ Concurrency (bare-field exception)",
-// "§ B Concurrency exception conditions") key alike.
+// The authority's document and section title (to the first separator), so the
+// wordings one reviewer gives the same section ("§ Concurrency (bare-field
+// exception)", "§ Concurrency, second bullet") key alike while sections that
+// differ ("§ SYS_MEM_MAP", "§ SYS_CAP_INFO") stay apart.
 function authority_key(authority) {
     const text = String(authority).toLowerCase().replace(/\([^)]*\)/g, ' ')
         .replace(/\s+/g, ' ').trim()
-    const m = text.match(/^(\S+\.md) ?(?:§|section)? ?(?:[a-z]\.? (?=[a-z]))?([a-z][a-z-]*)/)
-    return m ? m[1] + ' § ' + m[2] : text.slice(0, 60)
+    const m = text.match(/^(\S+\.md) ?(?:§|section)? ?([a-z0-9_][a-z0-9_ -]*?) ?(?:[;,.—:]|$)/)
+    return m ? m[1] + ' § ' + m[2].trim() : text.slice(0, 60)
 }
 
 const verifiable = (f) => !(f.bucket === 'nit' && !f.must_violation)
+
+const new_record = (f, source, in_bound, surface) => ({
+    ...f, in_bound, surface, sources: [source], issue_source: f.issue ? source : '',
+    duplicates: 0, status: 'pending', votes: [], verify_started: false, annotations: [],
+    group: [], group_lead: null, verification: null,
+})
+
+const nearest = (list, f, source) =>
+    list
+        .filter(
+            (s) =>
+                !s.sources.includes(source) && s.file === f.file && s.class === f.class &&
+                s.bucket === f.bucket && s.must_violation === f.must_violation &&
+                Math.abs(s.line - f.line) <= DEDUP_LINE_SLACK,
+        )
+        .sort((a, b) => Math.abs(a.line - f.line) - Math.abs(b.line - f.line))[0]
+
+function absorb(dup, f, source) {
+    dup.duplicates += 1
+    dup.sources.push(source)
+    dup.evidence += '\n[also reported by ' + source + ': ' + f.claim + '] ' + f.evidence
+}
+
+// A duplicate's placement is reconciled with the Issue (the dedup comment
+// states the rule), then the duplicate is absorbed.
+function reconcile(dup, f, source, in_bound, surface) {
+    dup.surface = dup.surface || surface
+    if (in_bound && !dup.in_bound) {
+        if (dup.issue) {
+            dup.annotations.push('placed on the surface by ' + source + '; ' +
+                dup.issue_source + ' named #' + dup.issue)
+        } else {
+            dup.annotations.push('placed on the surface by ' + source)
+            dup.in_bound = true
+        }
+    } else if (!dup.issue && f.issue) {
+        if (dup.verify_started) {
+            dup.annotations.push(source + ' named #' + f.issue + ' after verification began')
+        } else {
+            dup.issue = f.issue
+            dup.issue_source = source
+            dup.in_bound = false
+            dup.annotations.push('#' + f.issue + ' adopted from ' + source)
+        }
+    }
+    absorb(dup, f, source)
+}
+
+function ledger_record(f, source, in_bound, surface) {
+    const same = nearest(ledgered, f, source)
+    if (same) {
+        absorb(same, f, source)
+        return
+    }
+    const record = new_record(f, source, in_bound, surface)
+    record.status = 'ledgered'
+    seen.push(record)
+    ledgered.push(record)
+}
+
+function find_group_lead(record) {
+    if (record.in_bound || !verifiable(record)) return null
+    const key = authority_key(record.authority)
+    return seen.find(
+        (s) =>
+            s !== record && !s.in_bound && s.status !== 'ledgered' && !s.group_lead &&
+            verifiable(s) && s.file === record.file && s.class === record.class &&
+            s.bucket === record.bucket && s.must_violation === record.must_violation &&
+            s.issue === record.issue && authority_key(s.authority) === key,
+    ) || null
+}
 
 function dedup(findings, source) {
     const fresh = []
     for (const f of findings) {
         f.file = normalize(f.file)
-        const in_ledger = DELTA && f.ledger === true && !f.introduced
         // Work an open Issue already names is off the surface whatever its
         // class; an Issue number that is not open is not a placement.
         if (f.issue && !open_issue_numbers.has(f.issue)) {
@@ -841,72 +922,23 @@ function dedup(findings, source) {
             !soft_preexisting &&
             (f.in_bound || (ALWAYS_IN_BOUND.includes(f.class) && pr_files.has(f.file)))
         const in_bound = !f.issue && surface
-        const distance = (s) => Math.abs(s.line - f.line)
-        const dup = seen
-            .filter(
-                (s) =>
-                    !s.sources.includes(source) &&
-                    s.file === f.file && s.class === f.class && s.bucket === f.bucket &&
-                    s.must_violation === f.must_violation && distance(s) <= DEDUP_LINE_SLACK,
-            )
-            .sort((a, b) => distance(a) - distance(b))[0]
+        if (DELTA && f.ledger === true) {
+            ledger_record(f, source, in_bound, surface)
+            continue
+        }
+        const dup = nearest(seen.filter((s) => s.status !== 'ledgered'), f, source)
         if (dup) {
-            dup.duplicates += 1
-            // Placement is reconciled with the Issue (the function comment
-            // states the rule).
-            dup.surface = dup.surface || surface
-            if (in_bound && !dup.in_bound) {
-                if (dup.issue) {
-                    dup.annotations.push('placed on the surface by ' + source + '; ' +
-                        dup.issue_source + ' named #' + dup.issue)
-                } else {
-                    dup.annotations.push('placed on the surface by ' + source)
-                    dup.in_bound = true
-                }
-            } else if (!dup.issue && f.issue) {
-                if (dup.verify_started) {
-                    dup.annotations.push(
-                        source + ' named #' + f.issue + ' after verification began')
-                } else {
-                    dup.issue = f.issue
-                    dup.issue_source = source
-                    dup.in_bound = false
-                    dup.annotations.push('#' + f.issue + ' adopted from ' + source)
-                }
-            }
-            dup.sources.push(source)
-            dup.evidence += '\n[also reported by ' + source + ': ' + f.claim + '] ' + f.evidence
-            if (in_ledger && dup.status !== 'ledgered') {
-                dup.annotations.push(source + ' flagged it as already in the ledger')
-            }
+            reconcile(dup, f, source, in_bound, surface)
             continue
         }
-        const record = {
-            ...f, in_bound, surface, sources: [source], issue_source: f.issue ? source : '',
-            duplicates: 0, status: 'pending', votes: [], verify_started: false, annotations: [],
-            group: [], group_lead: null, verification: null,
-        }
+        const record = new_record(f, source, in_bound, surface)
         seen.push(record)
-        if (in_ledger) {
-            record.status = 'ledgered'
-            ledgered.push(record)
-            continue
-        }
-        if (!record.in_bound && verifiable(record)) {
-            const key = authority_key(record.authority)
-            const lead = seen.find(
-                (s) =>
-                    s !== record && !s.in_bound && s.status !== 'ledgered' && !s.group_lead &&
-                    verifiable(s) && s.file === record.file && s.class === record.class &&
-                    s.bucket === record.bucket && s.must_violation === record.must_violation &&
-                    authority_key(s.authority) === key,
-            )
-            if (lead) {
-                record.group_lead = lead
-                lead.group.push(record)
-                record.annotations.push(
-                    'verified with ' + lead.file + ':' + lead.line + ' (same root cause)')
-            }
+        const lead = find_group_lead(record)
+        if (lead) {
+            record.group_lead = lead
+            lead.group.push(record)
+            record.annotations.push(
+                'verified with ' + lead.file + ':' + lead.line + ' (same root cause)')
         }
         fresh.push(record)
     }
@@ -924,9 +956,18 @@ function verify_one(f) {
     }
     if (f.group_lead) {
         const lead = f.group_lead
+        const claimed = f.issue
         return verify_one(lead).then(() => {
             f.status = lead.status
             f.votes = lead.votes
+            // The group shares one Issue claim; the lead's authority vote
+            // judged it for every member.
+            if (claimed && !lead.issue) {
+                f.issue = 0
+                f.in_bound = f.surface
+                f.annotations.push('#' + claimed + ' does not name this work (judged on the ' +
+                    'group lead); placed on the surface')
+            }
             return f
         })
     }
@@ -1043,7 +1084,7 @@ const groups = all.filter((f) => f.group.length > 0)
 const dropped = all.filter((f) => f.status === 'dropped')
 const surviving = all.filter((f) => f.status !== 'dropped')
 // Findings on the review surface are fixed; findings off it are recorded for
-// the open Issue that already names the work, else for the audit Issue, and do
+// the open Issue that already names the work, else for the PR's follow-up Issue, and do
 // not count toward the verdict.
 const findings = surviving.filter((f) => f.in_bound)
 const recorded = surviving.filter((f) => !f.in_bound)
@@ -1187,7 +1228,8 @@ const SYNTH_PROMPT = [
         '`## Dropped by verification`, `## Ledger (not re-raised)`, `## Audit`. The recorded ' +
         'section lists each off-surface ' +
         'finding with the same fields as the others, naming its `issue` when set; they are ' +
-        'appended to the open Issue that already names the work, else to the audit Issue, not ' +
+        'appended to the open Issue that already names the work, else to the PR\'s follow-up ' +
+        'Issue, not ' +
         'fixed. Write `(none)` under an empty heading. Do not write verdict lines; the ' +
         'workflow appends them.',
     '',

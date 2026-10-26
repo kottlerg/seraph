@@ -176,7 +176,8 @@ a Markdown document, forces `BLOCKING ISSUES` (the blocking track of
 `docs/conventions.md` § Branch and PR Workflow); out-of-bound findings are
 listed, each naming the Issue that records it per `docs/conventions.md`
 § Branch and PR Workflow (the open Issue that already names the work, else
-the follow-up Issue of its scope), and do not affect the line. A
+the open follow-up Issue of its scope that already holds it, else the
+follow-up Issue of its scope), and do not affect the line. A
 follow-up Issue takes nothing off the surface: a finding one already holds
 is reported where the surface puts it. A finding a ledger entry already
 states at a hunk unchanged since the run the entry names, when that run

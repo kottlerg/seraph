@@ -413,8 +413,7 @@ const SCOPE_PROMPT = [
             ? ' Then run `git cat-file -e ' + SINCE + '^{commit}` (reachability), ' +
                 '`git diff --numstat --no-renames ' + DELTA_RANGE + '` (a tree diff between ' +
                 'the two commits, valid whether or not ' + SINCE + ' is an ancestor of the ' +
-                'head), and ' +
-                '`git log --format=%B ' + SINCE + '..<head>`.'
+                'head), and `git log --format=%B ' + SINCE + '..<head>`.'
             : ''),
     '',
     'Return, per the schema, with every path repository-relative exactly as git prints it:',
@@ -440,7 +439,8 @@ const SCOPE_PROMPT = [
     '- design_docs: ' +
         (DELTA
             ? 'the documents that state facts the delta changed: every Markdown document the ' +
-                'delta edits, and every tracked Markdown document (`git ls-files \'*.md\'`) ' +
+                'delta edits that the whole PR diff also touches, and every tracked Markdown ' +
+                'document (`git ls-files \'*.md\'`) ' +
                 'whose text names a changed item, a constant, state, error, or section the ' +
                 'delta renamed or redefined, or a behaviour the delta changed (search for each ' +
                 'symbol and each distinctive phrase of the changed statements), and every ' +
@@ -510,14 +510,15 @@ for (const i of scope.changed_items) i.file = normalize(i.file)
 for (const c of scope.claimed_fixes) c.file = normalize(c.file)
 scope.design_docs = scope.design_docs.map(normalize)
 // A delta reviews only the PR's own files: one a merge or rebase of the base
-// branch changed between `since` and the head is master's, not this PR's, and
-// is neither sharded nor given to the design-docs lens. The numstat runs
-// without rename detection, so a renamed file keeps its new path.
+// branch changed between `since` and the head is master's, not this PR's. The
+// numstat runs without rename detection, so a renamed file keeps its new path.
+// The design-docs criterion counts only the PR's own edits, so a document is
+// listed for a base-only edit only when it also names a fact the PR changed.
 if (DELTA && pr_files.size > 0) {
-    const base_only = new Set(scope.files.filter((f) => !pr_files.has(f.path)).map((f) => f.path))
-    for (const p of base_only) log('delta: ' + p + ' is not in the PR diff; not reviewed')
-    scope.files = scope.files.filter((f) => !base_only.has(f.path))
-    scope.design_docs = scope.design_docs.filter((d) => !base_only.has(d))
+    for (const f of scope.files) {
+        if (!pr_files.has(f.path)) log('delta: ' + f.path + ' is not in the PR diff; not reviewed')
+    }
+    scope.files = scope.files.filter((f) => pr_files.has(f.path))
 }
 
 const shards = shards_of(scope.files)
@@ -1332,7 +1333,8 @@ const SYNTH_PROMPT = [
         'section lists each off-surface ' +
         'finding with the same fields as the others, naming its `issue` when set; they are ' +
         'appended to the open Issue that already names the work, else to the follow-up ' +
-        'Issue of their scope, not ' +
+        'Issue of their scope unless an open follow-up Issue of that scope already holds ' +
+        'them (docs/conventions.md § Branch and PR Workflow), not ' +
         'fixed. Write `(none)` under an empty heading. Do not write verdict lines; the ' +
         'workflow appends them.',
     '',

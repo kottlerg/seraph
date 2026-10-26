@@ -92,7 +92,12 @@ Every Issue MUST carry at least one **Subsystem** label and at least one **Class
 ### Milestones
 
 Each `Y` bump (`v0.1.0`, `v0.2.0`, …) and each shipped `Z` patch (`v0.1.1`, …) has a GitHub
-milestone. Issues blocking a milestone MUST be assigned to it; everything else MUST stay unassigned.
+milestone. The current milestone is the lowest-versioned open one. An Issue a release will
+absorb (a defect, a cleanup, a follow-up Issue the pre-merge review files, scheduled work of any
+class) MUST carry a milestone from creation: the current milestone, or the later release it is
+planned for. Only future-state work no release has scheduled (a design umbrella, an unscheduled
+feature) MAY stay unassigned; it is assigned when it is scheduled. An Issue that closes without a
+milestone MUST be assigned, retroactively, the milestone that was current when it closed.
 
 ### Commit and PR cross-references
 

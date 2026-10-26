@@ -249,15 +249,15 @@ are forbidden; `master` MUST NOT receive force pushes.
   anchors to changed since the run that reported it; the workflow reads a
   ledger built from the saved run records, each entry naming its run, and
   a finding the ledger holds whose hunk is unchanged since that run is
-  listed, not counted. A finding off the surface MUST be
-  recorded, not fixed: the pre-merge review reports it as out of bound, and
-  it is appended, with file, line, authority, and fix, to the open Issue
-  that already names the work, else to the PR's follow-up Issue for its
-  file, before the merge prompt. No finding is dropped for being off the
-  surface. Work an open Issue already names, filed with the maintainer's
-  approval, is off the surface of every other PR; a finding on it is
-  recorded against that Issue. The PR's own follow-up Issues take nothing
-  off its surface: a finding one of them already holds is a ledger entry.
+  listed, not counted. A finding off the surface MUST be recorded, not
+  fixed: the pre-merge review reports it as out of bound, and it is
+  appended, with file, line, authority, and fix, to the open Issue that
+  already names the work, else to the PR's follow-up Issue for its file,
+  before the merge prompt. No finding is dropped for being off the surface.
+  Work an open Issue already names, filed with the maintainer's approval,
+  is off the surface of every other PR; a finding on it is recorded against
+  that Issue. The PR's own follow-up Issues take nothing off its surface: a
+  finding one of them already holds is a ledger entry.
   A finding two independent refuters refute on evidence is dropped and listed
   in the report's Dropped section. The review verifies every finding that
   can block and every Critical or Should finding, on or off the surface,

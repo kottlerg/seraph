@@ -828,8 +828,9 @@ const seen = []
 // vote decides. A nit that cannot block is not verified (docs/conventions.md
 // § Branch and PR Workflow says what the review verifies), so an Issue any
 // reporter names on it is final whichever reporter arrived first.
-// A finding flagged as already in the ledger (an entry states it and the delta
-// left its hunk unchanged) becomes a `ledgered` record, or joins the ledgered
+// A finding flagged as already in the ledger (an entry states it at a hunk
+// unchanged since the run the entry names) becomes a `ledgered` record, or
+// joins the ledgered
 // record at its anchor: listed, never verified or counted, and never a target
 // for other reports, so a report without the flag at the same anchor is a
 // record of its own. An off-surface record that shares file, class, bucket,

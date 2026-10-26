@@ -247,8 +247,8 @@ are forbidden; `master` MUST NOT receive force pushes.
   the one open Issue whose title is `<scope>: defects found by review`,
   where `<scope>` is a commit-title scope (§ Commit Messages), the narrowest
   that covers the file; every PR's findings in that scope append to it, and
-  it is filed, with the maintainer's approval, the current milestone (§
-  Milestones), and the labels § Labels requires, only when the scope has
+  it is filed, with the maintainer's approval, the current milestone
+  (§ Milestones), and the labels § Labels requires, only when the scope has
   none open. An open Issue whose title begins
   `<scope>: defects found by PR #N's review`, filed before the rolling
   Issues, is a follow-up Issue under every rule below; a finding recorded in
@@ -363,11 +363,13 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    follow `TEMPLATE.md`'s structure.
 6. The maintainer publishes the draft Release manually after verifying the
    `burnin.yml` run for the same tag completed successfully.
-7. The maintainer creates `v<X>.<Y>.<Z+1>` when the released line has no open
-   milestone above `v<X>.<Y>.<Z>`, then moves every Issue still open in
-   `v<X>.<Y>.<Z>` and in every lower open milestone to the lowest-versioned open
-   milestone above `v<X>.<Y>.<Z>`, and closes those milestones; that milestone
-   becomes current (§ Milestones).
+7. The maintainer creates `v<X>.<Y>.<Z+1>` when no `v<X>.<Y>.*` milestone
+   above `v<X>.<Y>.<Z>` is open; moves every Issue closed in a lower open
+   milestone to `v<X>.<Y>.<Z>`, the release that shipped it; moves every Issue
+   still open in `v<X>.<Y>.<Z>` or a lower open milestone to the
+   lowest-versioned open milestone above `v<X>.<Y>.<Z>`; and closes
+   `v<X>.<Y>.<Z>` and every lower open milestone. The lowest-versioned open
+   milestone is then current (§ Milestones).
 
 ---
 

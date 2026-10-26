@@ -29,7 +29,9 @@ discipline below has been applied end-to-end.
     path, claimed fixes), it narrows *which files you read whole and report
     on*, never the discipline: steps 3 to 6 apply in full to every file in
     the shard, and blast-radius reads (step 5) go wherever the callers are.
-    In `delta` mode the files are those changed since `since`; verify each
+    In `delta` mode the files are those changed since `since` that the
+    whole PR diff also touches (a file only a merge or rebase of the base
+    branch changed is not reviewed); verify each
     claimed fix for your files against the code, and report: every claimed
     fix not actually made; every finding in the changed hunks; any
     correctness, soundness, safety, or contract defect anywhere in the

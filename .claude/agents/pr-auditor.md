@@ -40,14 +40,20 @@ claims.
    rationale text), or `not delivered, no rationale` (FAIL). Report an
    Issue the PR closes that carries no milestone (`gh issue view <N>
    --json milestone`) as FAIL, per `docs/conventions.md` § Milestones. A
-   `Refs #N` is not a closure; for a `Refs #N` naming a follow-up Issue
-   (title `<scope>: defects found by review`, or one beginning with the
-   earlier `<scope>: defects found by PR #<N>'s review`), audit every
-   item the PR body's `## Acceptance` copies from it for `path:line`
-   delivery evidence as for a closure; report as FAIL such an item the
-   diff does not deliver, one not ticked on the Issue with
-   `(fixed by PR #<this PR>)`, and an item ticked on the Issue with that
-   marker that the PR body does not copy.
+   `Refs #N` is not a closure. For a `Refs #N` or `Fixes #N` naming a
+   follow-up Issue (title `<scope>: defects found by review`, or one
+   beginning with the earlier `<scope>: defects found by PR #<N>'s
+   review`), audit every item the PR body's `## Acceptance` copies from
+   it for `path:line` delivery evidence as for a closure; report as FAIL
+   such an item the diff does not deliver, one not ticked on the Issue
+   with `(fixed by PR #<this PR>)`, and an item ticked on the Issue with
+   that marker that the PR body does not copy. Report as FAIL an
+   unmarked `- [x]` item on the Issue whose file the diff touches and
+   that the diff delivers (a tick this PR made without its marker); on a
+   rolling Issue, whose ticks all carry a marker, report every unmarked
+   `- [x]` item as FAIL; list, without failing, an unmarked tick on an
+   earlier-pattern Issue whose file the diff touches but does not
+   deliver, since it may predate the marker.
    A `Fixes #N` on a follow-up Issue is valid only under the closing
    condition of `docs/conventions.md` § Branch and PR Workflow: no item
    left open once the findings of the PR's last run are recorded; a drain

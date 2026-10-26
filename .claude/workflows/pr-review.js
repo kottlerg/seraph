@@ -269,10 +269,10 @@ const FINDING_SCHEMA = {
                 'such a finding is recorded against that Issue, not fixed here. A follow-up ' +
                 'Issue (title `<scope>: defects found by review`, or one beginning with the ' +
                 'earlier `<scope>: defects found by PR #<N>\'s review`) names findings, not ' +
-                'work, and takes ' +
-                'nothing off the surface: set it only on a finding it already holds, which ' +
-                'the workflow lists and does not count unless it is on the blocking track and ' +
-                'on this pull request\'s surface (docs/conventions.md § Branch and PR Workflow).',
+                'work, and takes nothing off the surface: set it only on a finding it already ' +
+                'holds, which the workflow lists and does not count unless it is on the ' +
+                'blocking track and on this pull request\'s surface (docs/conventions.md ' +
+                '§ Branch and PR Workflow).',
         },
         authority: { type: 'string', description: 'Doc path and section, or contract location.' },
         claim: { type: 'string' },
@@ -849,7 +849,10 @@ const seen = []
 // clone) becomes a `ledgered` record, or joins the ledgered record at its
 // anchor: listed, never verified or counted, and never a target for other
 // reports, so a report without the flag at the same anchor is a record of
-// its own. An off-surface record that shares file, class, bucket, MUST
+// its own. A report that names a follow-up Issue is an ordinary record that
+// keeps the holder (`held_by`), merged with other reports of the same
+// finding as usual; after verification, a held record that is not on both
+// the blocking track and the surface moves to the ledger. An off-surface record that shares file, class, bucket, MUST
 // flag, Issue, and authority with an earlier off-surface record is the same
 // root cause: it joins that record's group and takes the group's verdict
 // instead of its own verification.
@@ -915,7 +918,8 @@ function note_holder(record, f) {
     record.held_by = f.held_by
     record.holder_noted = true
     record.annotations.push('#' + f.held_by + ' is a follow-up Issue that holds this ' +
-        'finding; when it is fixed here, its item on #' + f.held_by + ' is ticked')
+        'finding; it stays only on the blocking track and the surface, where its fix ticks ' +
+        'the item on #' + f.held_by)
 }
 
 function reconcile(dup, f, source, in_bound, surface) {
@@ -968,11 +972,12 @@ function ledger_record(f, source, in_bound, surface) {
     const same = nearest(ledgered, f, source)
     if (same) {
         // The ledger section names a held finding's follow-up Issue.
-        if (!same.issue && f.issue) same.issue = f.issue
+        if (!same.issue && (f.issue || f.held_by)) same.issue = f.issue || f.held_by
         absorb(same, f, source)
         return
     }
     const record = new_record(f, source, in_bound, surface)
+    if (!record.issue && f.held_by) record.issue = f.held_by
     record.status = 'ledgered'
     seen.push(record)
     ledgered.push(record)
@@ -1007,50 +1012,14 @@ function dedup(findings, source) {
         const surface =
             !soft_preexisting &&
             (f.in_bound || (ALWAYS_IN_BOUND.includes(f.class) && pr_files.has(f.file)))
-        // A follow-up Issue is a ledger source (docs/conventions.md § Branch and
-        // PR Workflow): a finding it holds is never recorded again. One on the
-        // blocking track that the surface rule places on this PR's surface stays
-        // there to be fixed, naming its holder; every other one is listed, not
-        // counted.
+        // A follow-up Issue holds findings, not work: naming one takes nothing off
+        // the surface. The record keeps the holder, and aggregation decides
+        // whether it stays, whatever order its reports arrived in.
         if (f.issue && follow_up_issue(f.issue)) {
-            if (blocks(f) && surface) {
-                log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
-                    ', a follow-up Issue; on the blocking track and the surface, it stays')
-                f.held_by = f.issue
-                f.issue = 0
-            } else {
-                log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
-                    ', a follow-up Issue that holds it; listed, not counted')
-                // An earlier report of the same finding that named no holder
-                // joins the ledger with it, unless its verification began.
-                const unflagged = nearest(seen.filter((s) => s.status !== 'ledgered'), f, source)
-                if (unflagged && !unflagged.verify_started && !unflagged.group_lead &&
-                    unflagged.group.length === 0) {
-                    unflagged.status = 'ledgered'
-                    unflagged.issue = f.issue
-                    unflagged.issue_source = source
-                    unflagged.in_bound = false
-                    ledgered.push(unflagged)
-                    absorb(unflagged, f, source)
-                    continue
-                }
-                if (unflagged) {
-                    unflagged.annotations.push(source + ' reports #' + f.issue + ', a follow-up ' +
-                        'Issue, holds this finding; it is not recorded again')
-                }
-                ledger_record(f, source, surface, surface)
-                continue
-            }
-        }
-        // A later report of a finding a follow-up Issue already holds joins
-        // that ledgered record, whether or not it names the holder.
-        if (!f.issue && !(blocks(f) && surface)) {
-            const held = nearest(
-                ledgered.filter((s) => s.issue && follow_up_issue(s.issue)), f, source)
-            if (held) {
-                absorb(held, f, source)
-                continue
-            }
+            log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
+                ', a follow-up Issue that holds it')
+            f.held_by = f.issue
+            f.issue = 0
         }
         const in_bound = !f.issue && surface
         if (LEDGER !== null && f.ledger === true) {
@@ -1087,9 +1056,6 @@ function dedup(findings, source) {
 // lead's verification and copies the verdict; the lead's promise is created on
 // first demand, so a member reported before the lead's own turn still gets it.
 function verify_one(f) {
-    // A record a later report moved to the ledger is listed there, not verified
-    // or counted among its shard's findings.
-    if (f.status === 'ledgered') return Promise.resolve(null)
     if (!verifiable(f)) {
         f.status = 'nit'
         return Promise.resolve(f)
@@ -1230,7 +1196,20 @@ await parallel(late_verifications.map((p) => () => p))
 const results = reviewed.filter(Boolean)
 const audit = results.map((r) => r.audit).find(Boolean) || null
 // Ledgered records never entered a verification list; `all` is what was judged.
-const all = results.flatMap((r) => r.findings)
+// A finding a follow-up Issue holds is never recorded again
+// (docs/conventions.md § Branch and PR Workflow): unless it is on the blocking
+// track and the surface, it is listed in the ledger under its holder, whatever
+// its verification found.
+const collected = results.flatMap((r) => r.findings)
+for (const f of collected) {
+    if (f.held_by && !(blocks(f) && f.surface)) {
+        f.status = 'ledgered'
+        f.issue = f.held_by
+        f.in_bound = false
+        ledgered.push(f)
+    }
+}
+const all = collected.filter((f) => f.status !== 'ledgered')
 const groups = all.filter((f) => f.group.length > 0)
 const dropped = all.filter((f) => f.status === 'dropped')
 const surviving = all.filter((f) => f.status !== 'dropped')

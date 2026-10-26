@@ -99,9 +99,8 @@ planned for. Only future-state work no release has scheduled (a design umbrella,
 feature) MAY stay unassigned; it is assigned when it is scheduled. The rule applies to open Issues
 filed before it: the maintainer assigns each a milestone or confirms it as unscheduled work. An
 Issue that closes without a milestone, or under one other than the current milestone, MUST be
-assigned the current milestone when it closes; step 7 of § Release Production then settles every
-closed Issue on a release: the one whose tag contains its fix, or for an Issue closed without one,
-the one current when it closed.
+assigned the current milestone when it closes; step 7 of § Release Production decides the release
+a closed Issue settles on.
 
 ### Commit and PR cross-references
 

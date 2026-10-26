@@ -114,17 +114,17 @@ truth for "how work is tracked and shipped" on this project.
   scope, as the section defines it: the Issue the PR drains in that scope
   when it drains one (the lowest-numbered when it drains several; its
   body carries `Refs #N` for each), else the scope's rolling Issue, found
-  with `gh issue list --state open --search '"defects found by review"
-  in:title' --json number,title` and, when the scope has none, filed with
-  the user's approval as `gh issue create --milestone <current> --label
-  <subsystem> --label <class>`, the current milestone being the one
-  [docs/conventions.md](../docs/conventions.md) § Milestones defines and
-  the labels the ones its § Labels requires. Before recording a finding,
-  and after fixing one, search every open follow-up Issue of its scope,
-  rolling and earlier-pattern (`gh issue list --state open --search
-  '"defects found by" in:title' --json number,title`, then the titles
-  beginning `<scope>:`), for an item stating it: a finding one holds is
-  recorded nowhere, and its fix ticks that item. A PR that fixes items
+  with `gh issue list --state open --limit 500 --search '"defects found
+  by review" in:title' --json number,title` and, when the scope has none,
+  filed with the user's approval as `gh issue create --milestone
+  <current> --label <subsystem> --label <class>`, the current milestone
+  being the one [docs/conventions.md](../docs/conventions.md) § Milestones
+  defines and the labels the ones its § Labels requires. Before recording
+  a finding, and after fixing one, search every open follow-up Issue of
+  its scope, rolling and earlier-pattern (`gh issue list --state open
+  --limit 500 --search '"defects found by" in:title' --json number,title`,
+  then the titles beginning `<scope>:`), for an item stating it: a finding
+  one holds is recorded nowhere, and its fix ticks that item. A PR that fixes items
   on a follow-up Issue ticks each there with `(fixed by PR #<M>)`, copies
   those items, ticked, into its body's `## Acceptance`, and carries
   `Refs #N` in its body, and `Fixes #N` only under that section's closing

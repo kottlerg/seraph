@@ -246,14 +246,15 @@ are forbidden; `master` MUST NOT receive force pushes.
   Issue left with no open item is closed by the PR via `Fixes #N`. A later
   run of the same PR, delta or full, MUST NOT re-raise a finding an earlier
   run recorded, dropped, or the maintainer ruled on unless the hunk it
-  anchors to changed since the run that reported it; the workflow reads a
-  ledger built from the saved run records, each entry naming its run, and
-  a finding the ledger holds whose hunk is unchanged since that run is
-  listed, not counted. A finding off the surface MUST be recorded, not
-  fixed: the pre-merge review reports it as out of bound, and it is
-  appended, with file, line, authority, and fix, to the open Issue that
-  already names the work, else to the PR's follow-up Issue for its file,
-  before the merge prompt. No finding is dropped for being off the surface.
+  anchors to changed since the run that reported it, or that run no longer
+  resolves in the clone; the workflow reads a ledger built from the saved
+  run records, each entry naming its run, and a finding the ledger holds
+  whose hunk is unchanged since a run that resolves is listed, not counted.
+  A finding off the surface MUST be recorded, not fixed: the pre-merge
+  review reports it as out of bound, and it is appended, with file, line,
+  authority, and fix, to the open Issue that already names the work, else
+  to the PR's follow-up Issue for its file, before the merge prompt. No
+  finding is dropped for being off the surface.
   Work an open Issue already names, filed with the maintainer's approval,
   is off the surface of every other PR; a finding on it is recorded against
   that Issue. The PR's own follow-up Issues take nothing off its surface: a

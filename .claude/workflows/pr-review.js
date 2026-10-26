@@ -21,9 +21,9 @@
 // once as a group. A run that names the ledger of the earlier runs' recorded,
 // dropped, and contested findings (required in a delta run) lists, and does
 // not count, a finding a reviewer flags as already in it at a hunk unchanged
-// since the run the entry names. `.claude/CLAUDE.md` § PR workflow operations
-// says when the assistant runs this workflow, how it builds the ledger, and
-// what it does with the result.
+// since the run the entry names, when that run resolves in the clone.
+// `.claude/CLAUDE.md` § PR workflow operations says when the assistant runs
+// this workflow, how it builds the ledger, and what it does with the result.
 //
 // args: { pr: number, mode: 'full' | 'delta' | 'scope', since?: string,
 //         ledger?: string }
@@ -830,13 +830,13 @@ const seen = []
 // § Branch and PR Workflow says what the review verifies), so an Issue any
 // reporter names on it is final whichever reporter arrived first.
 // A finding flagged as already in the ledger (an entry states it at a hunk
-// unchanged since the run the entry names) becomes a `ledgered` record, or
-// joins the ledgered record at its anchor: listed, never verified or counted,
-// and never a target for other reports, so a report without the flag at the
-// same anchor is a record of its own. An off-surface record that shares file,
-// class, bucket,
-// MUST flag, Issue, and authority with an earlier off-surface record is the
-// same root cause: it joins that record's group and takes the group's verdict
+// unchanged since the run the entry names, and that run resolves in the
+// clone) becomes a `ledgered` record, or joins the ledgered record at its
+// anchor: listed, never verified or counted, and never a target for other
+// reports, so a report without the flag at the same anchor is a record of
+// its own. An off-surface record that shares file, class, bucket, MUST
+// flag, Issue, and authority with an earlier off-surface record is the same
+// root cause: it joins that record's group and takes the group's verdict
 // instead of its own verification.
 const ledgered = []
 // Verifications started outside the review pipeline (a group member that left

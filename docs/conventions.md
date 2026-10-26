@@ -246,14 +246,16 @@ are forbidden; `master` MUST NOT receive force pushes.
   Issue left with no open item is closed by the PR via `Fixes #N`. A later
   run of the same PR, delta or full, MUST NOT re-raise a finding an earlier
   run recorded, dropped, or the maintainer ruled on unless the hunk it
-  anchors to changed since the run that reported it; the workflow reads a
-  ledger built from the saved run records, each entry naming its run, and
-  a finding the ledger holds whose hunk is unchanged since that run is
-  listed, not counted. A finding off the surface MUST be recorded, not
-  fixed: the pre-merge review reports it as out of bound, and it is
-  appended, with file, line, authority, and fix, to the open Issue that
-  already names the work, else to the PR's follow-up Issue for its file,
-  before the merge prompt. No finding is dropped for being off the surface.
+  anchors to changed since the run that reported it, or that run no longer
+  resolves in the clone; the workflow reads a ledger built from the saved
+  run records, each entry naming its run, and a finding the ledger holds
+  whose hunk is unchanged since the run its entry names, when that run
+  resolves, is listed, not counted. A finding off the surface MUST be
+  recorded, not fixed: the pre-merge review reports it as out of bound,
+  and it is appended, with file, line, authority, and fix, to the open
+  Issue that already names the work, else to the PR's follow-up Issue for
+  its file, before the merge prompt. No finding is dropped for being off
+  the surface.
   Work an open Issue already names, filed with the maintainer's approval,
   is off the surface of every other PR; a finding on it is recorded against
   that Issue. The PR's own follow-up Issues take nothing off its surface: a
@@ -261,12 +263,12 @@ are forbidden; `master` MUST NOT receive force pushes.
   independent refuters refute on evidence is dropped and listed in the
   report's Dropped section. The review verifies every finding that can
   block and every Critical or Should finding, on or off the surface, except
-  a finding the ledger holds at a hunk unchanged since the run that
-  reported it, which is listed unverified; a nit that cannot block is fixed
-  or recorded unverified. Verified findings off the surface that share
-  file, class, bucket, MUST flag, named Issue, and authority are one root
-  cause: the first is verified and each of the others takes the group's
-  verdict. Every other finding is fixed or recorded.
+  a finding the ledger rule above lists, not counts, which is listed
+  unverified; a nit that cannot block is fixed or recorded unverified.
+  Verified findings off the surface that share file, class, bucket, MUST
+  flag, named Issue, and authority are one root cause: the first is
+  verified and each of the others takes the group's verdict. Every other
+  finding is fixed or recorded.
 
 ### Branch naming
 

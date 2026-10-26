@@ -67,7 +67,8 @@ truth for "how work is tracked and shipped" on this project.
   `Workflow({name: "pr-review", args: {pr: <N>, mode: "full"}})` for the
   first run on a PR (a later full run adds `ledger` once one exists), then
   `mode: "delta"` with `since` set to the head the previous run reviewed
-  and `ledger` set to the ledger file built below. The workflow's header comment describes what it does. Save the
+  and `ledger` set to the ledger file built below. The workflow's header
+  comment describes what it does. Save the
   report as `target/xtask/review/pr<N>/<mode>-<head>.md` and the whole
   returned object as `<mode>-<head>.json` beside it (the ledger command
   below reads its `verdict`, `stats`, `findings`, `recorded`, and

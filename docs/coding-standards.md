@@ -219,12 +219,16 @@ let value = unsafe { ptr.read() };
 
 - Shared mutable state MUST be protected by an explicit synchronisation primitive. Use
   `Mutex<T>` rather than a bare `T` with a separate lock — the type system should enforce
-  the invariant. The one exception is a kernel thread-control-block field whose owning lock
-  guards more than one field or lives in another object: a field of the per-TCB `sched_lock`'s
-  group, or an intrusive link owned by an IPC source's lock. Such a field MAY be a bare `T`
-  when its owner is recorded in
+  the invariant. The exception is a kernel field whose owner a design document records: a
+  thread-control-block field whose owner
   [scheduling-internals.md § Cross-CPU TCB Ownership](../core/kernel/docs/scheduling-internals.md#cross-cpu-tcb-ownership)
-  and its rustdoc names that lock.
+  names (the TCB's own `sched_lock`, an IPC source's lock, or, for a field that table assigns
+  to it, the claim on the thread's park episode), and a field of an IPC source object that the
+  source's own `lock` serialises, as the object's § Object Structure in
+  [ipc-internals.md](../core/kernel/docs/ipc-internals.md) records. Such a field MAY be a bare
+  `T` when a rustdoc names that owner: the field's own for a thread-control-block field, whose
+  owners differ field by field; the object's for an IPC source object, whose non-atomic fields
+  share its one `lock`.
 - Prefer message passing over shared memory; shared memory is a deliberate optimisation,
   not the default.
 - Lock ordering MUST be documented and consistent. When acquiring multiple locks, always

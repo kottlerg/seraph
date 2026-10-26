@@ -475,7 +475,14 @@ pub struct ThreadControlBlock
     /// Current IPC blocking reason (None when not blocked on IPC).
     pub ipc_state: IpcThreadState,
 
-    /// Inline message buffer for in-flight IPC data.
+    /// Inline message buffer for in-flight IPC data. Owned by the holder of
+    /// this thread's park claim: the source's `ep.lock` while the thread is
+    /// queued on it (the thread fills it before it enqueues itself; the party
+    /// that dequeues it reads or fills it under the same lock), and the won
+    /// `reply_tcb` claim once the thread is bound for reply (the reply, or the
+    /// failed-transfer sentinel, is written by that claim's winner). The
+    /// resuming thread reads it with no lock (the bare-field exception of
+    /// docs/coding-standards.md § Concurrency).
     pub ipc_msg: crate::ipc::message::Message,
 
     /// Caller bound by this thread's last receive: consumed by its reply,
@@ -508,7 +515,9 @@ pub struct ThreadControlBlock
     pub deposit_episode: core::sync::atomic::AtomicU32,
 
     /// Intrusive IPC wait-queue link: the successor on an endpoint queue, or
-    /// on an [`ipc::WaitQueue`](crate::ipc::WaitQueue).
+    /// on an [`ipc::WaitQueue`](crate::ipc::WaitQueue). Owned by the lock of
+    /// the source whose queue links this TCB (`ep.lock` for an endpoint queue;
+    /// the bare-field exception of docs/coding-standards.md § Concurrency).
     pub ipc_wait_next: Option<*mut ThreadControlBlock>,
 
     /// Predecessor on an [`ipc::WaitQueue`](crate::ipc::WaitQueue) (null off
@@ -557,12 +566,16 @@ pub struct ThreadControlBlock
     /// `docs/fault-handling.md`.
     pub fault_outcome: core::sync::atomic::AtomicU8,
 
-    /// True while this thread is delivering / blocked on a fault. Set before
-    /// the fault is delivered to the handler endpoint and cleared when the
-    /// thread resumes. Read by `endpoint_recv` to transition a dequeued
-    /// fault sender to `BlockedOnFault` (rather than `BlockedOnReply`) and by
-    /// the cancellation paths to mark the [`fault_outcome`](Self::fault_outcome)
-    /// as `KILL`.
+    /// True while this thread is delivering / blocked on a fault. Written only
+    /// by this thread, outside any park: `fault_dispatch` sets it before the
+    /// fault park commits and clears it after the park resumes. Owned, for
+    /// every other reader, by the claim on that park (the `ep.lock` dequeue in
+    /// `endpoint_recv`, a won `reply_tcb` CAS or swap, a won send-queue unlink
+    /// in `cancel_ipc_block`, the endpoint dealloc drain's detach), which the
+    /// park's commit orders after the write; those readers transition a
+    /// dequeued fault sender to `BlockedOnFault` (rather than `BlockedOnReply`)
+    /// or mark the [`fault_outcome`](Self::fault_outcome) `KILL` (the
+    /// bare-field exception of docs/coding-standards.md § Concurrency).
     pub in_fault_delivery: bool,
 
     // === Context ===
@@ -627,13 +640,20 @@ pub struct ThreadControlBlock
 
     /// Wakeup value delivered to this thread when unblocked from a notification wait.
     ///
-    /// Set by `notification_send` when it wakes a blocked waiter: stores the bits that
-    /// were acquired on the waiter's behalf. Read by `sys_notification_wait` on resume.
+    /// Owned by the source lock: the parking syscall resets it under that lock,
+    /// and the waker that claims the park writes it there (`claim_waiter`: the
+    /// bits `notification_send` acquired on the waiter's behalf, an event-queue
+    /// payload, or `0` from the sleep-list timer claim). Read by the resuming
+    /// syscall with no lock (the bare-field exception of
+    /// docs/coding-standards.md § Concurrency).
     pub wakeup_value: u64,
 
     /// Out-of-band timeout marker. True iff the most recent wake came from
-    /// the sleep-list timer arm in `sleep_check_wakeups`. Read-and-cleared by
-    /// the resuming syscall.
+    /// the sleep-list timer arm in `sleep_check_wakeups`. Owned by the source
+    /// lock: the parking syscall clears it under `eq.lock`, and the timer claim
+    /// sets it under the same lock. Read-and-cleared by the resuming syscall
+    /// with no lock (the bare-field exception of docs/coding-standards.md
+    /// § Concurrency).
     ///
     /// Required by `sys_event_recv` because event-queue payloads may be any
     /// `u64` (including 0), so `wakeup_value` cannot itself encode the

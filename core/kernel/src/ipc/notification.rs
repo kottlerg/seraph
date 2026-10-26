@@ -31,7 +31,9 @@ use crate::sched::thread::ThreadControlBlock;
 ///
 /// Constructed in place in a retype slot of a Memory capability. The `KernelObjectHeader` is
 /// NOT included here; it lives in `cap::object::NotificationKernelObject` which
-/// wraps this struct.
+/// wraps this struct. `lock` serialises every non-atomic field that changes
+/// after construction (the bare-field exception of docs/coding-standards.md
+/// § Concurrency).
 pub struct NotificationState
 {
     /// Pending notification bits. Senders OR into this; the waiter read-and-clears.

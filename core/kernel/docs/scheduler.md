@@ -244,7 +244,9 @@ any state ──(object teardown / terminal fault)──► Exited
 
 Every `Exited` transition, and the rule for each, is listed in
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#lifecycle-state-machine)
-§ Lifecycle State Machine.
+§ Lifecycle State Machine; the full-list withdrawal and the stop are specified in its
+[§ Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants) (invariant 4) and
+[§ `sys_thread_stop` Cross-CPU Stop Protocol](thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol).
 
 State transitions are governed by the per-field-group ownership rules in
 [scheduling-internals.md](scheduling-internals.md). Cross-CPU writes to TCB

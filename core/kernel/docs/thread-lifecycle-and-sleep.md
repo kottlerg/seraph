@@ -643,15 +643,15 @@ Episodes.
    the list full instead, the sleeper withdraws the park with the same `sleep_list_remove` under
    `sched_lock`, so the cancel's claim and the withdrawal exclude each other: a sleeper whose park a
    cancel claimed deschedules and returns `Interrupted` rather than `OutOfMemory`, and a stop that
-   finds the sleeper already withdrawn sees it `Running`, its `cancel_ipc_block` returns early, its
-   commit writes `Stopped` over the restored `Running`, and the sleeper returns `OutOfMemory`.
-   Holding `sched_lock` keeps the park from changing under the remove, so a cancel never claims a
-   later park. A `false` return means another claimant took the episode first, and the restarted
-   sleeper returns what that claimant deposited: the timer's pop (its wake aborted by
-   `enqueue_and_wake` if the stop commits first) deposits nothing, so the sleeper returns `Ok`,
-   honest for a deadline that elapsed; a concurrent canceller stamped `INTERRUPTED`. A stop that
-   wins against the park commit (`ParkCommit::RefusedStop`) makes `sys_thread_sleep` deschedule in
-   place and return `Interrupted` directly.
+   reads the sleeper after a won withdrawal has no park to cancel: the sleeper returns
+   `OutOfMemory`, and the stop's commit lands on whatever state that return left it (see
+   § `sys_thread_stop` Cross-CPU Stop Protocol, step 2). Holding `sched_lock` keeps the park from
+   changing under the remove, so a cancel never claims a later park. A `false` return means another
+   claimant took the episode first, and the restarted sleeper returns what that claimant deposited:
+   the timer's pop (its wake aborted by `enqueue_and_wake` if the stop commits first) deposits
+   nothing, so the sleeper returns `Ok`, honest for a deadline that elapsed; a concurrent canceller
+   stamped `INTERRUPTED`. A stop that wins against the park commit (`ParkCommit::RefusedStop`) makes
+   `sys_thread_sleep` deschedule in place and return `Interrupted` directly.
 
 ---
 

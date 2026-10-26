@@ -162,7 +162,9 @@ impl WaitSetMember
 /// the 512 B retype bin (≈ 440 B: 16 × 24 B members, plus ready ring,
 /// waiter-queue tail, and bookkeeping). The cap-create path constructs
 /// both objects in place inside the source `Memory` cap's region;
-/// nothing else is allocated.
+/// nothing else is allocated. `lock` serialises every field that changes
+/// after construction (the bare-field exception of docs/coding-standards.md
+/// § Concurrency).
 pub struct WaitSetState
 {
     /// Per-`WaitSetState` spinlock. Serialises every mutation of the

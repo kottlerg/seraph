@@ -718,7 +718,9 @@ sleep list refused, `select_target_cpu` and `enqueue_and_wake` to wake, `schedul
 and `sleep_list_add` and `sleep_list_remove` for timed waits (see § Waking the Recipient). The
 un-commit is the sanctioned exception that rule 8 of
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)
-makes for a park no waker can have claimed. The scheduler itself does not need to know about IPC.
+makes for a park no waker can have claimed; its rules are
+[thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants),
+invariant 4. The scheduler itself does not need to know about IPC.
 
 The scheduler's preemption timer does not interrupt the IPC fast path. Syscall entry
 masks interrupts, and every IPC object lock is an IRQ-disabling

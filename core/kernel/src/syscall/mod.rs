@@ -257,10 +257,11 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // dealloc on another CPU observes a coherent state and the local
         // schedule() below sees the Exited skip-bit. The reason (0 = clean
         // exit) is written in the same hold. A refusal means the thread was
-        // already torn down (an object-teardown stop recorded `EXIT_KILLED`,
-        // or a dealloc_object(Thread) committed Exited); this path still posts its own
-        // reason below — no death walk posts `EXIT_KILLED` (see the ABI
-        // constant) — so only the retained value says killed.
+        // already torn down: an object-teardown stop recorded `EXIT_KILLED`,
+        // or a `dealloc_object(Thread)` committed `Exited`. This path still
+        // posts its own reason below (no death walk posts `EXIT_KILLED`; see
+        // the ABI constant), so after a teardown stop only the retained value
+        // says killed.
         // SAFETY: tcb validated non-null.
         let _ = unsafe { crate::sched::exit_under_all_locks(tcb, 0) };
 
@@ -315,9 +316,10 @@ fn sys_process_exit(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         // Commit Exited under all-CPU scheduler.locks (see sys_exit); the
         // reason is written in the same hold. A refusal means the thread was
-        // already torn down (an object-teardown stop recorded `EXIT_KILLED`,
-        // or a dealloc_object(Thread) committed Exited); the post below still carries
-        // this path's own reason (no death walk posts `EXIT_KILLED`).
+        // already torn down: an object-teardown stop recorded `EXIT_KILLED`,
+        // or a `dealloc_object(Thread)` committed `Exited`. The post below
+        // still carries this path's own reason (no death walk posts
+        // `EXIT_KILLED`).
         // SAFETY: tcb validated non-null.
         let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
 

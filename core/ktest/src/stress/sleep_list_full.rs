@@ -26,10 +26,13 @@
 //!
 //! A timed `notification_wait` or `event_recv` on a full list withdraws its
 //! park under the source lock it has held since queuing itself
-//! (`sched::withdraw_uncontested_park`), so no cancel can claim it: a stop's
-//! `cancel_ipc_block` loses the unlink and finds the target `Running`, and
-//! the target reports its timeout (`0` bits, `WouldBlock`) rather than
-//! `Interrupted`.
+//! (`sched::withdraw_uncontested_park`), so no cancel can claim it: a stop
+//! whose cancel snapshotted the park loses the unlink, one that snapshots
+//! after the withdrawal finds the target `Running` and cancels nothing, and
+//! either way its commit lands on the state the target's return left; the
+//! target reports its timeout (`0` bits, `WouldBlock`) rather than
+//! `Interrupted` (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep
+//! List Invariants, invariant 4).
 //!
 //! ## How this exercises it
 //!

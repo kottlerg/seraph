@@ -47,7 +47,9 @@ use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
 /// Kernel state backing an Endpoint capability.
 ///
 /// The send/recv queues are intrusive singly-linked lists through `ipc_wait_next`
-/// in each TCB. Both queues have FIFO ordering.
+/// in each TCB. Both queues have FIFO ordering. `lock` serialises every
+/// non-atomic field that changes after construction (the bare-field
+/// exception of docs/coding-standards.md § Concurrency).
 pub struct EndpointState
 {
     /// Head of the blocked-senders queue (callers waiting for a receiver).

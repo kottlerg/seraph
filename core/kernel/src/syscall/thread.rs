@@ -802,20 +802,19 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
             // thread's own dealloc_object(Thread) unlinked it as it dies; a
             // KILL stored here would overwrite a handler's RESUME. The retry
             // pass cancels the rebound park.
-            // SAFETY: tcb valid; fault_outcome / in_fault_delivery always valid.
-            if unsafe { (*tcb).in_fault_delivery }
+            // SAFETY: tcb valid; in_fault_delivery is read only behind a won
+            // unlink, the claim that orders it after the faulter's own write.
+            let fault_sender = unlinked && unsafe { (*tcb).in_fault_delivery };
+            if fault_sender
             {
-                if unlinked
-                {
-                    claimed = true;
-                    // SAFETY: tcb valid; the unlink won the episode.
-                    unsafe {
-                        (*tcb).fault_outcome.store(
-                            crate::ipc::fault::FAULT_OUTCOME_KILL,
-                            core::sync::atomic::Ordering::Release,
-                        );
-                        crate::sched::thread::stamp_deposit_episode(tcb);
-                    }
+                claimed = true;
+                // SAFETY: tcb valid; the unlink won the episode.
+                unsafe {
+                    (*tcb).fault_outcome.store(
+                        crate::ipc::fault::FAULT_OUTCOME_KILL,
+                        core::sync::atomic::Ordering::Release,
+                    );
+                    crate::sched::thread::stamp_deposit_episode(tcb);
                 }
             }
             else if unlinked

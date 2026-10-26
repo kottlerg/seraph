@@ -411,7 +411,8 @@ const SCOPE_PROMPT = [
         '`gh issue list --state open --limit 500 --json number,title`.' +
         (DELTA
             ? ' Then run `git cat-file -e ' + SINCE + '^{commit}` (reachability), ' +
-                '`git diff --numstat ' + DELTA_RANGE + '` (a tree diff between the two ' +
+                '`git diff --numstat --no-renames ' + DELTA_RANGE + '` (a tree diff between ' +
+                'the two ' +
                 'commits, valid whether or not ' + SINCE + ' is an ancestor of the head), and ' +
                 '`git log --format=%B ' + SINCE + '..<head>`.'
             : ''),
@@ -506,8 +507,15 @@ if (DELTA && MODE !== 'scope' && pr_files.size === 0) {
     return { error: 'scope returned no pr_files; the in-bound gate cannot be applied' }
 }
 // A delta reviews only the PR's own files: one a merge or rebase of the base
-// branch changed between `since` and the head is master's, not this PR's.
-if (DELTA && pr_files.size > 0) scope.files = scope.files.filter((f) => pr_files.has(f.path))
+// branch changed between `since` and the head is master's, not this PR's. The
+// numstat runs without rename detection, so a renamed file keeps its new path.
+if (DELTA && pr_files.size > 0) {
+    const kept = scope.files.filter((f) => pr_files.has(f.path))
+    for (const f of scope.files) {
+        if (!pr_files.has(f.path)) log('delta: ' + f.path + ' is not in the PR diff; not reviewed')
+    }
+    scope.files = kept
+}
 for (const i of scope.changed_items) i.file = normalize(i.file)
 for (const c of scope.claimed_fixes) c.file = normalize(c.file)
 scope.design_docs = scope.design_docs.map(normalize)

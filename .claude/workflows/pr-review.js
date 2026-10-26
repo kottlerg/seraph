@@ -7,9 +7,9 @@
 //
 // Scope (one agent) materializes the diff and the surfaces it touches. Review
 // runs one `pr-reviewer` per shard of changed files, whole-diff lenses, and the
-// `pr-auditor`, all in parallel. Verify puts every Critical and Should finding,
-// and every finding that names a MUST violation, to two independent refuters as
-// soon as its shard completes. Synthesize renders one report. The script
+// `pr-auditor`, all in parallel. Verify puts every finding that can block, and
+// every Critical and Should finding, to two independent refuters as soon as its
+// shard completes. Synthesize renders one report. The script
 // computes the reviewer verdict line itself and derives the audit verdict line
 // from the auditor's per-section verdicts. Findings on the review surface
 // (docs/conventions.md § Branch and PR Workflow) count toward the verdict, and
@@ -56,7 +56,7 @@ export const meta = {
         { title: 'Review', detail: 'one pr-reviewer per shard, whole-diff lenses, pr-auditor' },
         {
             title: 'Verify',
-            detail: 'two independent refuters per Critical, Should, or MUST-violation finding',
+            detail: 'two independent refuters per finding that can block, or is Critical or Should',
         },
         { title: 'Synthesize', detail: 'one report; verdict lines computed by the script' },
     ],
@@ -822,16 +822,27 @@ const ledgered = []
 
 // The authority's document and section title (to the first separator), so the
 // wordings one reviewer gives the same section ("§ Concurrency (bare-field
-// exception)", "§ Concurrency, second bullet") key alike while sections that
-// differ ("§ SYS_MEM_MAP", "§ SYS_CAP_INFO") stay apart.
+// exception)", "§ Concurrency, second bullet", "§ B. Concurrency") key alike
+// while sections that differ ("§ SYS_MEM_MAP" and "§ SYS_CAP_INFO", "§ D.
+// Testing" and "§ D. What Must Be Tested") stay apart: a letter or number
+// prefix is skipped, and a period ends the title only when a space or the
+// end follows it.
+const AUTHORITY_SECTION = new RegExp(
+    '^(\\S+\\.md) ?(?:§|section)? ?' +
+        '(?:[a-z]\\.? (?=[a-z])|[0-9]+(?:\\.[0-9]+)*\\.? )?' +
+        '([a-z0-9_][a-z0-9_ -]*?) ?(?:[;,—:]|\\. |\\.$|$)',
+)
+
 function authority_key(authority) {
     const text = String(authority).toLowerCase().replace(/\([^)]*\)/g, ' ')
         .replace(/\s+/g, ' ').trim()
-    const m = text.match(/^(\S+\.md) ?(?:§|section)? ?([a-z0-9_][a-z0-9_ -]*?) ?(?:[;,.—:]|$)/)
+    const m = text.match(AUTHORITY_SECTION)
     return m ? m[1] + ' § ' + m[2].trim() : text.slice(0, 60)
 }
 
-const verifiable = (f) => !(f.bucket === 'nit' && !f.must_violation)
+// Every finding that can block is verified, whatever its bucket; a nit that
+// cannot block is not.
+const verifiable = (f) => blocks(f) || f.bucket !== 'nit'
 
 const new_record = (f, source, in_bound, surface) => ({
     ...f, in_bound, surface, sources: [source], issue_source: f.issue ? source : '',
@@ -956,17 +967,19 @@ function verify_one(f) {
     }
     if (f.group_lead) {
         const lead = f.group_lead
-        const claimed = f.issue
+        // A member's verification is the lead's, so a later Issue claim on it
+        // is annotated, not adopted, like one named after verification began.
+        f.verify_started = true
         return verify_one(lead).then(() => {
             f.status = lead.status
             f.votes = lead.votes
             // The group shares one Issue claim; the lead's authority vote
             // judged it for every member.
-            if (claimed && !lead.issue) {
+            if (f.issue && !lead.issue) {
+                f.annotations.push('#' + f.issue + ' does not name this work (judged on the ' +
+                    'group lead); placed on the surface')
                 f.issue = 0
                 f.in_bound = f.surface
-                f.annotations.push('#' + claimed + ' does not name this work (judged on the ' +
-                    'group lead); placed on the surface')
             }
             return f
         })

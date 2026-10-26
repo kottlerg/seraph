@@ -68,10 +68,10 @@ truth for "how work is tracked and shipped" on this project.
   first run on a PR, then `mode: "delta"` with `since` set to the head
   the previous run reviewed and `ledger` set to the ledger file built
   below. The workflow's header comment describes what it does. Save the
-  report as `target/xtask/review/pr<N>/<mode>-<head>.md` and the returned
-  object (`verdict`, `audit_verdict`, `findings`, `recorded`, `ledgered`,
-  `dropped`, `audit`, `stats`) as `<mode>-<head>.json` beside it, and
-  surface both verdict lines to the user verbatim. If the Workflow tool is
+  report as `target/xtask/review/pr<N>/<mode>-<head>.md` and the whole
+  returned object as `<mode>-<head>.json` beside it (the ledger command
+  below reads its `verdict`, `stats`, `findings`, `recorded`, and
+  `dropped`), and surface both verdict lines to the user verbatim. If the Workflow tool is
   unavailable (the directly invoked agents are then the review, per that
   section), invoke `@pr-reviewer` and
   `@pr-auditor` directly in parallel (single message, two `Agent` tool
@@ -88,17 +88,21 @@ truth for "how work is tracked and shipped" on this project.
           | ((.recorded + .dropped
               + [.findings[] | select(.status == "contested")]
               + (if .verdict == "NON-BLOCKING ISSUES ONLY" then .findings else [] end))[]
-             | {run: $run, file, line, class, bucket, status, issue, claim, fix})]
-         | unique_by([.run, .file, .line, .class, .bucket])' \
+             | {run: $run, file, line, class, bucket, must_violation, status, issue,
+                claim, fix})]
+         | unique_by([.run, .file, .line, .class, .bucket, .must_violation])' \
       target/xtask/review/pr<N>/*-*.json > target/xtask/review/pr<N>/ledger.json
   ```
 
   The surface findings of a `NON-BLOCKING ISSUES ONLY` run enter the ledger
-  because the procedure below records them before the merge prompt.
+  because the pass below records them after every such run, whatever its
+  audit verdict and failed-agent list.
 
   Handle the run's findings as that section says, in one pass: fixes via
   commits; recorded findings via `gh issue edit` on the Issue the section
-  names, or `gh issue create` with the user's approval; `AUDIT FAIL`
+  names, or `gh issue create` with the user's approval; after a
+  `NON-BLOCKING ISSUES ONLY` run, the run's surface findings recorded the
+  same way on the follow-up Issues the section defines; `AUDIT FAIL`
   items via `gh pr edit`, `gh issue edit`, or commits; a contested
   finding put to the user and resolved as the section says. Before
   pushing a fix, for every fact it changes (a symbol, a constant, a rule
@@ -111,9 +115,7 @@ truth for "how work is tracked and shipped" on this project.
   After the fixes are pushed and CI is green again, run the workflow in
   `delta` mode. Prompt for the merge decision only under that section's
   merge-prompt condition; when a `NON-BLOCKING ISSUES ONLY` run meets it,
-  first record the run's surface findings on the follow-up Issues the
-  section defines (`gh issue create` with the user's approval, `gh issue
-  edit` thereafter) and offer one more fix round beside the merge. Merge
+  offer one more fix round beside the merge. Merge
   via `gh pr merge <N> --merge --delete-branch` (per
   [docs/conventions.md](../docs/conventions.md) § Merge method).
 - On red: surface the failing job's tail (`gh run view <run-id> --log-failed`

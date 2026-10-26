@@ -196,10 +196,10 @@ are forbidden; `master` MUST NOT receive force pushes.
   is recorded, with the maintainer's answer, on the Issue that records it
   (the open Issue that already names the work, else the PR's follow-up
   Issue defined below), or, when it misread a rule, resolved by the
-  clarification of that rule alone,
-  which is its record. A finding MUST NOT be waived or ruled outside the
-  standards. The reviewer verdict is `BLOCKING ISSUES` when a blocking
-  finding is on the surface or a reviewer returned no result,
+  clarification of that rule alone, which is its record. A finding MUST
+  NOT be waived or ruled outside the standards. The reviewer verdict is
+  `BLOCKING ISSUES` when a blocking finding is on the surface or a reviewer
+  returned no result,
   `NON-BLOCKING ISSUES ONLY` when only non-blocking findings are on it, and
   `READY TO MERGE` when none is. The merge prompt MUST follow a completed
   run with no failed agent and `AUDIT PASS` whose reviewer verdict is
@@ -229,15 +229,17 @@ are forbidden; `master` MUST NOT receive force pushes.
   coverage, style: wording, wrapping, nits) is non-blocking: when the run
   has blocking findings it is fixed in the same batch, and otherwise it
   MUST be recorded on the PR's follow-up Issue before the merge prompt. The
-  PR's follow-up Issue for a file is the open Issue titled `<scope>: defects
-  found by PR #N's review`, where `<scope>` is the narrowest commit-title
-  scope (§ Commit Messages) that covers the file; it is filed with the
-  maintainer's approval when the first finding needs it, and it is where a
-  finding off the surface is recorded too when no open Issue already names
-  the work. A recorded finding that a later fix round fixes is ticked on
-  that Issue in the same push, and an Issue left with no open entry is
-  closed by the PR via `Fixes #N`. A re-review MUST NOT re-raise a finding
-  an earlier run of the same PR recorded, dropped, or the maintainer ruled
+  PR's follow-up Issue for a file is the open Issue whose title begins
+  `<scope>: defects found by PR #N's review`, where `<scope>` is the
+  narrowest commit-title scope (§ Commit Messages) that covers the file; it
+  is filed with the maintainer's approval when the first finding needs it,
+  and it is where a finding off the surface is recorded too when no open
+  Issue already names the work. A finding is recorded as a `- [ ]` task-list
+  item carrying file, line, authority, and fix. A recorded finding that a
+  later fix round fixes is ticked on that Issue in the same push, and an
+  Issue left with no open item is closed by the PR via `Fixes #N`. A
+  re-review MUST NOT re-raise a finding an earlier run of the same PR
+  recorded, dropped, or the maintainer ruled
   on unless the delta changed the hunk it anchors to; the workflow reads a
   ledger built from the saved run records, and a finding the ledger holds
   whose hunk the delta left unchanged is listed, not counted. A finding off
@@ -250,9 +252,9 @@ are forbidden; `master` MUST NOT receive force pushes.
   it is recorded against that Issue.
   A finding two independent refuters refute on evidence is dropped and listed
   in the report's Dropped section. Findings off the surface that share file,
-  class, bucket, MUST flag, and authority are one root cause: the first is
-  verified and each of the others takes the group's verdict. Every other
-  finding is fixed or recorded.
+  class, bucket, MUST flag, named Issue, and authority are one root cause:
+  the first is verified and each of the others takes the group's verdict.
+  Every other finding is fixed or recorded.
 
 ### Branch naming
 

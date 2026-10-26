@@ -3,6 +3,14 @@
 This document is the authoritative standard for all documentation in the Seraph project.
 It governs document structure, authority relationships, linking, and maintenance discipline.
 
+A violation of this standard that the pre-merge review finds on the review surface in a
+Markdown document is non-blocking under [conventions.md](conventions.md) § Branch and PR
+Workflow, which owns that rule, unless it is a document's statement of a safety invariant,
+ABI, or syscall contract that the code contradicts, which that section puts on the blocking
+track; a non-blocking violation is fixed in the batch when the run has blocking findings, and
+otherwise recorded on the PR's follow-up Issue before merge. A violation off the surface is
+recorded as that section says.
+
 ---
 
 ## Document Hierarchy
@@ -110,11 +118,6 @@ When implementation changes invalidate documentation:
 3. Review and update each identified summary if necessary.
 
 This procedure is mandatory. Skipping it allows silent conceptual drift.
-
-A violation of this standard that the pre-merge review finds in a Markdown document is
-non-blocking under [conventions.md](conventions.md) § Branch and PR Workflow, which owns that
-rule: it is fixed in the batch when the run has blocking findings, and otherwise recorded on
-the PR's follow-up Issue before merge.
 
 ---
 

@@ -267,8 +267,8 @@ const FINDING_SCHEMA = {
                 'Issue (title `<scope>: defects found by review`, or the earlier `<scope>: ' +
                 'defects found by PR #<N>\'s review`) names findings, not work, and takes ' +
                 'nothing off the surface: set it only on a finding it already holds, which ' +
-                'the workflow lists and does not count (docs/conventions.md § Branch and PR ' +
-                'Workflow).',
+                'the workflow lists and does not count unless it is on the blocking track ' +
+                '(docs/conventions.md § Branch and PR Workflow).',
         },
         authority: { type: 'string', description: 'Doc path and section, or contract location.' },
         claim: { type: 'string' },
@@ -548,9 +548,11 @@ const LENS_HEADER = [
 // reviewer gets the list so it can set `issue` on such a finding.
 // A follow-up Issue holds the findings earlier runs of any PR recorded in its
 // scope; it takes nothing off the surface (docs/conventions.md § Branch and PR
-// Workflow), and a finding placed on one is one it already holds: listed, not
-// counted. The second alternative matches the per-PR titles filed before the
-// rolling Issues.
+// Workflow), and a non-blocking finding placed on one is one it already holds:
+// listed, not counted. A finding on the blocking track stays on the surface
+// whatever Issue holds it. The second alternative matches the per-PR titles
+// filed before the rolling Issues, follow-up Issues for every rule but
+// recording.
 const FOLLOW_UP = /^[^:]+: defects found by (?:review|PR #\d+'s review)/
 const follow_up_issue = (n) => FOLLOW_UP.test(issue_title(n))
 
@@ -561,7 +563,7 @@ const ISSUES_BLOCK = [
         'before the rolling Issues, `<scope>: defects found by PR #<N>\'s review`) is a ' +
         'follow-up Issue: it names findings, not work, and takes nothing off the surface; ' +
         'set `issue` to it only on a finding it already holds (read its body), which the ' +
-        'workflow lists and does not count:',
+        'workflow lists and does not count unless it is on the blocking track:',
     bullets(scope.open_issues, (i) => '- #' + i.number + ' ' + i.title),
 ].join('\n')
 
@@ -971,11 +973,17 @@ function dedup(findings, source) {
         f.file = normalize(f.file)
         // Work an open Issue already names is off the surface whatever its
         // class; an Issue number that is not open is not a placement, and a
-        // follow-up Issue is a ledger source: a finding it holds is listed,
-        // not counted.
+        // follow-up Issue is a ledger source: a non-blocking finding it holds
+        // is listed, not counted, while one on the blocking track stays on
+        // the surface (docs/conventions.md § Branch and PR Workflow).
         if (f.issue && !open_issue_numbers.has(f.issue)) {
             log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
                 ', not an open Issue; kept on the surface')
+            f.issue = 0
+        } else if (f.issue && follow_up_issue(f.issue) && blocks(f)) {
+            log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
+                ', a follow-up Issue; a finding on the blocking track stays on the surface')
+            f.held_by = f.issue
             f.issue = 0
         }
         // In a delta run a soft-class finding is on the surface only when the
@@ -1001,6 +1009,10 @@ function dedup(findings, source) {
             continue
         }
         const record = new_record(f, source, in_bound, surface)
+        if (f.held_by) {
+            record.annotations.push('#' + f.held_by + ' is a follow-up Issue that holds this ' +
+                'finding; on the blocking track it stays on the surface')
+        }
         seen.push(record)
         const lead = find_group_lead(record)
         if (lead) {

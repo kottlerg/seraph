@@ -15,8 +15,7 @@ a caller or user relies on (a syscall, ABI, IPC, or command-line contract, or a 
 invariant), which that section puts on the blocking track. A non-blocking violation is fixed in
 the batch when the reviewer verdict is `BLOCKING ISSUES`, and after a run whose verdict is
 `NON-BLOCKING ISSUES ONLY` it is recorded on the follow-up Issue of its scope before the merge
-prompt.
-A violation off the surface is recorded as that section says.
+prompt. A violation off the surface is recorded as that section says.
 
 ---
 

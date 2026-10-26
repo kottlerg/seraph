@@ -103,7 +103,7 @@ milestone MUST be assigned, retroactively, the milestone that was current when i
 
 - Commit messages MAY reference Issues by `#N` where useful.
 - A commit or PR description that changes an Issue without closing it (ticking items on a
-  follow-up Issue it drains in part) references it via `Refs #N`, which auto-closes nothing.
+  follow-up Issue it drains in part) MUST reference it via `Refs #N`, which auto-closes nothing.
 - Any commit or PR description that closes an Issue MUST reference it via `Fixes #N` /
   `Closes #N` so the merge auto-closes the Issue. Manual `gh issue close` after the fact is a
   procedural miss, not a substitute.
@@ -245,23 +245,27 @@ are forbidden; `master` MUST NOT receive force pushes.
   the one open Issue titled `<scope>: defects found by review`, where
   `<scope>` is a commit-title scope (§ Commit Messages), the narrowest that
   covers the file; every PR's findings in that scope append to it, and it is
-  filed, with the maintainer's approval and the current milestone
-  (§ Milestones), only when the scope has none open. It is where a finding
-  off the surface is recorded too when no open Issue already names the
-  work. A finding is recorded as a `- [ ]` task-list item under the Issue's
-  `## Acceptance` section, carrying file, line, authority, fix, and the PR
-  and head that reported it. A follow-up Issue is drained in batch, by a PR
-  that changes its scope for another reason or by a sweep PR that drains
-  several scopes' Issues; no merge requires a drain. A PR that fixes
-  recorded items ticks them on the Issue in the same push and references
-  the Issue with `Refs #N`; it closes the Issue with `Fixes #N` only when
-  the reviewer verdict of its last run is `READY TO MERGE` and no item is
-  left open. A finding such a PR's run leaves in the same scope is appended
-  to the Issue it drains, which stays open; a drain PR MUST NOT file a
-  successor. When a follow-up Issue accumulates items of one pattern a
-  script can decide (a wrapping or layout rule), the preferred drain is a
-  `cargo xtask lint-docs` rule for the pattern, whose landing ticks those
-  items. A later run of the same PR, delta or full, MUST NOT re-raise a
+  filed, with the maintainer's approval, the current milestone
+  (§ Milestones), and the labels § Labels requires, only when the scope has
+  none open. An open Issue titled `<scope>: defects found by PR #N's
+  review`, filed before the rolling Issues, is a follow-up Issue for every
+  rule below except recording, which goes to the rolling Issue of its
+  scope. The rolling Issue is where a finding off the surface is recorded
+  too when no open Issue already names the work. A finding is recorded as
+  a `- [ ]` task-list item under the Issue's `## Acceptance` section,
+  carrying file, line, authority, fix, and the PR and head that reported
+  it. A follow-up Issue is drained in batch, by a PR that changes its scope
+  for another reason or by a sweep PR that drains several scopes' Issues;
+  no merge requires a drain. A PR that fixes recorded items ticks them on
+  the Issue in the same push and MUST reference the Issue with `Refs #N`;
+  it closes the Issue with `Fixes #N` only when no item is left open once
+  the findings of its last run are recorded. A finding such a PR's run
+  leaves in the same scope is appended to the Issue it drains, which stays
+  open; a drain PR MUST NOT file a successor. When a follow-up Issue
+  accumulates items of one pattern a script can decide (a wrapping or
+  layout rule), the preferred drain is a `cargo xtask lint-docs` rule for
+  the pattern, whose landing ticks those items. A later run of the same
+  PR, delta or full, MUST NOT re-raise a
   finding an earlier run recorded, dropped, or the maintainer ruled on
   unless the hunk it anchors to changed since the run that reported it, or
   that run no longer resolves in the clone; the workflow reads a ledger
@@ -275,10 +279,12 @@ are forbidden; `master` MUST NOT receive force pushes.
   off the surface. Work an open Issue already names, filed with the
   maintainer's approval, is off the surface of every other PR; a finding on
   it is recorded against that Issue. A follow-up Issue names findings, not
-  work: it takes nothing off any PR's surface, and a finding it already
-  holds is, like a ledger entry, listed and not counted by every run of any
-  PR, and is not recorded again. A finding two independent refuters refute
-  on evidence is dropped and listed in the report's Dropped section. The
+  work: it takes nothing off any PR's surface. A non-blocking finding it
+  already holds is, like a ledger entry, listed and not counted by every
+  run of any PR, and is not recorded again; a finding on the blocking track
+  that it holds stays on the surface of a PR that touches its file, is
+  fixed there, and its item is ticked. A finding two independent refuters
+  refute on evidence is dropped and listed in the report's Dropped section. The
   review verifies every finding that can block and every Critical or Should
   finding, on or off the surface, except a finding the ledger rule above
   lists, not counts, or a follow-up Issue holds, which is listed
@@ -353,6 +359,8 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    follow `TEMPLATE.md`'s structure.
 6. The maintainer publishes the draft Release manually after verifying the
    `burnin.yml` run for the same tag completed successfully.
+7. The maintainer closes the `v<X>.<Y>.<Z>` milestone; the next-lowest open
+   milestone becomes current (§ Milestones).
 
 ---
 

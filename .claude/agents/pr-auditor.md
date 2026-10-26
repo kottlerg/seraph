@@ -36,13 +36,19 @@ claims.
    either the diff delivers the criterion, or the issue was edited to
    drop the criterion with a one-line rationale. Report per-criterion as
    one of: `delivered` (cite `path:line` evidence), `dropped` (cite the
-   rationale text), or `not delivered, no rationale` (FAIL). A `Refs #N`
-   is not a closure and is not audited for delivery. A `Fixes #N` on a
-   follow-up Issue (title `<scope>: defects found by review`) is valid
-   only under the closing condition of `docs/conventions.md` § Branch and
-   PR Workflow (no item left open); a drain that leaves items open MUST
-   say `Refs #N` instead. Report a `Fixes` on such an Issue with open
-   items as FAIL.
+   rationale text), or `not delivered, no rationale` (FAIL). Report a
+   closed Issue that carries no milestone (`gh issue view <N> --json
+   milestone`) as FAIL, per `docs/conventions.md` § Milestones. A
+   `Refs #N` is not a closure; for a `Refs #N` naming a follow-up Issue
+   (title `<scope>: defects found by review`, or the earlier `<scope>:
+   defects found by PR #<N>'s review`), audit every `- [x]` item whose
+   file the diff touches for `path:line` delivery evidence as for a
+   closure, and report a ticked item the diff does not deliver as FAIL.
+   A `Fixes #N` on a follow-up Issue is valid only under the closing
+   condition of `docs/conventions.md` § Branch and PR Workflow: no item
+   left open once the findings of the PR's last run are recorded; a drain
+   that leaves items open MUST say `Refs #N` instead. Report a `Fixes` on
+   such an Issue with open items as FAIL.
 
 6. Silent-deferral scan. The target notification is *intent to defer
    mechanically-reachable work this PR should have covered*, not in-code
@@ -61,9 +67,9 @@ claims.
    `docs/conventions.md` § Branch and PR Workflow allows; surface every
    hit matching the criteria above. A hit is reconciled when the same text
    names the Issue filed for the deferral under the Completeness rule (the
-   scope's follow-up Issue for a recorded non-blocking finding), or when it is not a deferral of
-   this PR's work (a rule's wording, a quotation, a description of past
-   work).
+   scope's follow-up Issue for a recorded non-blocking finding), or when
+   it is not a deferral of this PR's work (a rule's wording, a quotation,
+   a description of past work).
 
 7. Test-plan honesty: every `- [x]` under `## Test plan` in the PR body
    should have plausible basis (cited tool output, file presence, commit

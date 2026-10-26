@@ -160,8 +160,9 @@ when the delta introduced it), the `issue` that names it when one does
 PR Workflow an Issue titled `<scope>: defects found by review`, or by the
 earlier pattern `<scope>: defects found by PR #<N>'s review`, is a
 follow-up Issue, which names findings, not work: it takes nothing off the
-surface, and `issue` is set to it only on a finding it already holds,
-which the workflow lists and does not count), the `authority`, the
+surface, and `issue` is set to it only on a finding it already holds; the
+workflow lists and does not count such a finding unless it is on the
+blocking track, which stays on the surface), the `authority`, the
 `claim`, the `evidence`, and the `fix`.
 There is no final line in schema mode; the workflow computes the verdict
 from the entries.
@@ -174,10 +175,12 @@ a Markdown document, forces `BLOCKING ISSUES` (the blocking track of
 listed, each naming the Issue that records it per `docs/conventions.md`
 § Branch and PR Workflow (the open Issue that already names the work, else
 the follow-up Issue of its scope), and do not affect the line; a follow-up
-Issue takes nothing off the surface, and a finding one already holds, or a
-ledger entry already states at a hunk unchanged since the run the entry
-names when that run resolves in the clone, is listed under a
-`Ledger (not re-raised)` heading and does not affect the line either.
+Issue takes nothing off the surface, and a non-blocking finding one
+already holds, or a ledger entry already states at a hunk unchanged since
+the run the entry names, when that run resolves in the clone, is listed
+under a `Ledger (not re-raised)` heading and does not affect the line
+either; a finding on the blocking track that a follow-up Issue holds
+stays on the surface.
 
 ## Tool discipline
 

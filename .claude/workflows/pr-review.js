@@ -412,8 +412,8 @@ const SCOPE_PROMPT = [
         (DELTA
             ? ' Then run `git cat-file -e ' + SINCE + '^{commit}` (reachability), ' +
                 '`git diff --numstat --no-renames ' + DELTA_RANGE + '` (a tree diff between ' +
-                'the two ' +
-                'commits, valid whether or not ' + SINCE + ' is an ancestor of the head), and ' +
+                'the two commits, valid whether or not ' + SINCE + ' is an ancestor of the ' +
+                'head), and ' +
                 '`git log --format=%B ' + SINCE + '..<head>`.'
             : ''),
     '',
@@ -426,8 +426,8 @@ const SCOPE_PROMPT = [
     '- pr_has_code: whether the whole PR diff changes a file of kind code.',
     '- files: one entry per file in ' +
         (DELTA
-            ? 'the tree diff ' + DELTA_RANGE + ' that the whole PR diff also touches (a file ' +
-                'only a merge or rebase of the base branch changed is not listed)'
+            ? 'the tree diff ' + DELTA_RANGE + ' (every file it lists; the script drops, and ' +
+                'logs, a file the whole PR diff does not touch)'
             : 'the PR diff') +
         ', with path; changed = added plus deleted lines; kind = code (Rust, assembly, ' +
         'linker scripts, build inputs, anything a build embeds), markdown, comment-only (only ' +

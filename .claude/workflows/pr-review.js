@@ -506,19 +506,19 @@ const issue_title = (n) => (scope.open_issues.find((i) => i.number === n) || {})
 if (DELTA && MODE !== 'scope' && pr_files.size === 0) {
     return { error: 'scope returned no pr_files; the in-bound gate cannot be applied' }
 }
-// A delta reviews only the PR's own files: one a merge or rebase of the base
-// branch changed between `since` and the head is master's, not this PR's. The
-// numstat runs without rename detection, so a renamed file keeps its new path.
-if (DELTA && pr_files.size > 0) {
-    const kept = scope.files.filter((f) => pr_files.has(f.path))
-    for (const f of scope.files) {
-        if (!pr_files.has(f.path)) log('delta: ' + f.path + ' is not in the PR diff; not reviewed')
-    }
-    scope.files = kept
-}
 for (const i of scope.changed_items) i.file = normalize(i.file)
 for (const c of scope.claimed_fixes) c.file = normalize(c.file)
 scope.design_docs = scope.design_docs.map(normalize)
+// A delta reviews only the PR's own files: one a merge or rebase of the base
+// branch changed between `since` and the head is master's, not this PR's, and
+// is neither sharded nor given to the design-docs lens. The numstat runs
+// without rename detection, so a renamed file keeps its new path.
+if (DELTA && pr_files.size > 0) {
+    const base_only = new Set(scope.files.filter((f) => !pr_files.has(f.path)).map((f) => f.path))
+    for (const p of base_only) log('delta: ' + p + ' is not in the PR diff; not reviewed')
+    scope.files = scope.files.filter((f) => !base_only.has(f.path))
+    scope.design_docs = scope.design_docs.filter((d) => !base_only.has(d))
+}
 
 const shards = shards_of(scope.files)
 const delta_paths = new Set(scope.files.map((f) => f.path))

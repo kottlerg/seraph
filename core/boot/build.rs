@@ -7,27 +7,28 @@
 
 fn main()
 {
-    // Cargo sets both variables for every build script it runs; their
-    // absence is a cargo defect with no recoverable state.
-    #[allow(clippy::unwrap_used)]
-    let target = std::env::var("TARGET").unwrap();
-    #[allow(clippy::unwrap_used)]
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    // Cargo sets both for every build script it runs; without them there is
+    // nothing to emit, and the riscv64 link then fails on the missing script.
+    let (Ok(target), Ok(manifest_dir)) =
+        (std::env::var("TARGET"), std::env::var("CARGO_MANIFEST_DIR"))
+    else
+    {
+        return;
+    };
 
     println!("cargo:rerun-if-changed=build.rs");
 
     // Only the RISC-V PE/COFF pipeline links against a script. The x86-64
     // bootloader uses the built-in `x86_64-unknown-uefi` target, and the host
-    // target (`cargo test`, clippy) must not be linked with it.
+    // target (`cargo test`, clippy) must not be linked with it. The triple is
+    // the one `Arch::boot_target_triple` in xtask names; rename both together.
     if target != "riscv64imac-seraph-uefi"
     {
         return;
     }
 
-    // A build-script link arg reaches the linker once, by an absolute path
-    // that holds from any working directory; a `.cargo/config.toml` entry is
-    // joined with every parent directory's config (a checkout nested under
-    // another), which would hand the linker the script twice.
+    // Emitted here, not in `.cargo/config.toml`; docs/build-system.md
+    // § Custom Targets says why.
     let linker_script = format!("{manifest_dir}/linker/riscv64-uefi.ld");
     println!("cargo:rustc-link-arg=-T{linker_script}");
     println!("cargo:rerun-if-changed={linker_script}");

@@ -105,8 +105,9 @@ The bootloader is built as part of the Seraph workspace. Refer to
 On x86-64, the Rust toolchain emits a PE/COFF `.efi` directly. On RISC-V, LLVM has
 no PE/COFF backend, so the output ELF is converted to a flat binary with a
 hand-crafted header prepended; `build.rs` passes `linker/riscv64-uefi.ld` to the
-linker for that target. See [docs/riscv-uefi-boot.md](docs/riscv-uefi-boot.md)
-for details.
+linker for that target (summarized from
+[docs/build-system.md § Custom Targets](../../docs/build-system.md#custom-targets)).
+See [docs/riscv-uefi-boot.md](docs/riscv-uefi-boot.md) for details.
 
 ---
 

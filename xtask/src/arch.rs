@@ -70,6 +70,9 @@ impl Arch
     }
 
     /// Rust target triple for the UEFI bootloader.
+    ///
+    /// `core/boot/build.rs` matches the riscv64 name exactly to decide
+    /// whether to pass the linker script; rename both together.
     pub fn boot_target_triple(self) -> &'static str
     {
         match self
@@ -79,14 +82,11 @@ impl Arch
         }
     }
 
-    /// `RUSTFLAGS` for the UEFI bootloader build.
+    /// `RUSTFLAGS` for the UEFI bootloader build and its lint pass.
     ///
-    /// Cargo uses the variable in place of every config-file `rustflags`
-    /// entry, so the bootloader's flags do not depend on which
-    /// `.cargo/config.toml` files cargo merges: a checkout nested under
-    /// another receives its parent's entries too. The linker script comes
-    /// from `core/boot/build.rs`; `jump-tables=no` avoids jump tables that
-    /// UEFI cannot relocate.
+    /// Set in place of every config-file `rustflags` and of an inherited
+    /// `RUSTFLAGS`, which the bootloader build replaces rather than extends;
+    /// `docs/build-system.md` § Custom Targets says why.
     pub fn boot_rustflags(self) -> &'static str
     {
         match self

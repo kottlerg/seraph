@@ -40,8 +40,9 @@ commitments).
 Setting `default-members = ["xtask"]` in the workspace root `Cargo.toml` means
 bare `cargo build` and `cargo run` operate only on the host-target xtask
 binary. Components targeting the kernel, bootloader, or std-userspace triples
-must be built via `cargo xtask build` so the correct custom target JSON and
-`-Zbuild-std` flags are passed.
+must be built via `cargo xtask build` so the correct custom target JSON,
+`-Zbuild-std` flags, and (for the bootloader) `RUSTFLAGS` are passed
+(§ Custom Targets).
 
 [`abi/boot-protocol`](../abi/boot-protocol/README.md) is the source of truth for the boot
 protocol ABI; both the bootloader and kernel depend on it. The kernel-entry contract the
@@ -119,10 +120,10 @@ Its linker script, `core/boot/linker/riscv64-uefi.ld`, is passed by
 `-C jump-tables=no` on RISC-V, where UEFI cannot relocate jump tables).
 Cargo reads the `.cargo/config.toml` of the current directory and of every
 parent directory and joins their `rustflags` arrays, so a checkout nested
-under another (a worktree under `.claude/worktrees/`) receives every flag in
-those files once per file; `RUSTFLAGS` is used in place of them all, and a
-build-script link arg is emitted once, so the bootloader link is the same
-from any checkout.
+under another (a worktree under `.claude/worktrees/`) receives a flag once
+for each config file that lists it; `RUSTFLAGS` is used in place of them
+all, and a build-script link arg is emitted once, so the bootloader link is
+the same from any checkout.
 
 Custom targets require `-Zbuild-std` (`core,alloc,compiler_builtins` for
 kernel/no_std triples; `core,alloc,std,panic_abort` for std-userspace
@@ -405,7 +406,9 @@ The merge-gating rule (CI must pass green before merge) lives in
 
 ## Summarized By
 
-[README.md](../README.md), [ELF Loading](../core/boot/docs/elf-loading.md),
+[README.md](../README.md), [core/boot/README.md](../core/boot/README.md),
+[ELF Loading](../core/boot/docs/elf-loading.md),
+[RISC-V UEFI Boot](../core/boot/docs/riscv-uefi-boot.md),
 [core/kernel/README.md](../core/kernel/README.md), [System Bootstrap](bootstrap.md),
 [Coding Standards](coding-standards.md), [Platform Requirements](platform-requirements.md),
 [docs/releases/README.md](releases/README.md), [rootfs/README.md](../rootfs/README.md),

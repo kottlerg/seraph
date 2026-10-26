@@ -18,10 +18,7 @@ json-target-spec = true
 [env]
 RUST_TARGET_PATH = { value = "xtask/targets", relative = true }
 
-# Cargo joins this array with the one in every parent directory's config
-# (a checkout nested under another), so a flag a link must receive exactly
-# once does not belong here: the bootloader's flags come from `cargo xtask`
-# (`RUSTFLAGS`, which cargo uses instead of this file) and its linker script
-# from core/boot/build.rs.
+# Bootloader flags are set by `cargo xtask` (`RUSTFLAGS`) and
+# core/boot/build.rs, not here; see docs/build-system.md § Custom Targets.
 [build]
 rustflags = ["-Zunstable-options"]

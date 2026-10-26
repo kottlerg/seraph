@@ -894,10 +894,9 @@ fn clippy_host(ctx: &BuildContext) -> Result<()>
     clippy_check(ctx, &["-p", "xtask", "-p", "seraph-wrapper-shim"])
 }
 
-/// Run `cargo clippy` with the given flags and treat all warnings as errors.
-///
-/// Called before every `cargo build` invocation with identical flags, so lints
-/// are enforced on every component build — not just on dedicated lint passes.
+/// Run `cargo clippy` with the given flags, no extra environment, and the
+/// plain toolchain, treating all warnings as errors: the host crates' lint
+/// pass (`clippy_host`).
 fn clippy_check(ctx: &BuildContext, flags: &[&str]) -> Result<()>
 {
     clippy_check_ext(ctx, flags, &[], None)
@@ -917,8 +916,10 @@ fn clippy_check(ctx: &BuildContext, flags: &[&str]) -> Result<()>
 /// wrapper on every workspace crate, and `CLIPPY_ARGS` feeds the same
 /// lint args that `cargo clippy -- …` would pass through.
 ///
-/// `env` is set on the invocation exactly as the matching `cargo build`
-/// sets it, so the lint pass compiles what the build compiles.
+/// Called before every component `cargo build` with identical flags and
+/// `env`, so lints are enforced on every component build — not just on
+/// dedicated lint passes — and the lint pass compiles what the build
+/// compiles.
 fn clippy_check_ext(
     ctx: &BuildContext,
     flags: &[&str],

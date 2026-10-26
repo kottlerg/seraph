@@ -188,17 +188,24 @@ are forbidden; `master` MUST NOT receive force pushes.
   the closure audit; when the Workflow tool is unavailable, the
   `pr-reviewer` and `pr-auditor` agents invoked directly are the review,
   and their prose verdict lines are the gate. Findings are handled per the
-  review surface defined below, as one batch per run. A finding the
-  verifiers contested MUST be put to the maintainer; on the surface it MUST
-  resolve in the same PR as a fix, as a clarification of the rule it
-  misread, or, when the maintainer finds it false on the facts, as a
-  clarification of the code or document it misread; off the surface it is
-  recorded, with the maintainer's answer, on the Issue that records it (the
-  open Issue that already names the work, else the audit Issue), or, when
-  it misread a rule, resolved by the clarification of that rule alone,
-  which is its record. A finding MUST NOT be waived or ruled outside the
-  standards. The merge prompt MUST follow a completed run with no failed
-  agent, `READY TO MERGE`, and `AUDIT PASS`. `.claude/CLAUDE.md` § PR
+  review surface and the two tracks defined below, as one batch per run. A
+  finding the verifiers contested MUST be put to the maintainer; on the
+  surface it MUST resolve in the same PR as a fix, as a clarification of
+  the rule it misread, or, when the maintainer finds it false on the facts,
+  as a clarification of the code or document it misread; off the surface it
+  is recorded, with the maintainer's answer, on the Issue that records it
+  (the open Issue that already names the work, else the PR's follow-up
+  Issue defined below), or, when it misread a rule, resolved by the
+  clarification of that rule alone, which is its record. A finding MUST
+  NOT be waived or ruled outside the standards. The reviewer verdict is
+  `BLOCKING ISSUES` when a blocking finding is on the surface or a reviewer
+  returned no result, `NON-BLOCKING ISSUES ONLY` when only non-blocking
+  findings are on it, and `READY TO MERGE` when none is. The merge prompt
+  MUST follow a completed run with no failed agent and `AUDIT PASS` whose
+  reviewer verdict is `READY TO MERGE`, or `NON-BLOCKING ISSUES ONLY` once
+  every finding the run leaves on the surface is recorded as the next item
+  says and no contested finding on the surface is unresolved; the prompt
+  offers the merge or one more fix round. `.claude/CLAUDE.md` § PR
   workflow operations gives the assistant's procedure.
 - The review surface of a change is what it touches: the changed hunks and
   the items that contain them (a function, a paragraph, a section, a table
@@ -211,17 +218,55 @@ are forbidden; `master` MUST NOT receive force pushes.
   the surface only when the delta introduced it, wherever it anchors: a
   statement the delta made stale, or a test the delta's new code lacks, is
   one the delta introduced. Correctness, soundness, safety, and contract
-  findings stay on the surface as above. A finding on the surface MUST be
-  fixed before merge. A finding off the surface MUST be recorded, not fixed:
-  the pre-merge review reports it as out of bound, and it is appended, with
-  file, line, authority, and fix, to the open Issue that already names the
-  work, else to the open audit Issue for that surface (or to a new one,
-  filed with the maintainer's approval) before the merge prompt. No finding
-  is dropped for being off the surface. Work an open
-  Issue already names, filed with the maintainer's approval, is off the
-  surface of every other PR; a finding on it is recorded against that Issue.
-  A finding two independent refuters refute on evidence is dropped and listed
-  in the report's Dropped section; every other finding is fixed or recorded.
+  findings stay on the surface as above. A finding on the surface is on one
+  of two tracks. It is blocking when it is of class correctness, safety
+  (which covers soundness), or contract, wherever it anchors, or a MUST
+  violation of a binding standard, of whatever class, anchored in a file
+  that is not a Markdown document; a blocking finding on the surface MUST
+  be fixed before merge. A document statement the code contradicts is a
+  contract or safety defect when it states behaviour a caller or user
+  relies on (a syscall, ABI, IPC, or command-line contract, or a safety
+  invariant); every other disagreement between a document and the code
+  (a stale name, count, path, or cross-reference, or a summary out of step
+  with its owner) is documentation drift. Every other finding on the
+  surface (one of class standards, documentation-drift, coverage, or style
+  that is not a MUST violation or is one anchored in a Markdown document:
+  wording, wrapping, nits) is non-blocking: when the reviewer verdict is
+  `BLOCKING ISSUES` it is fixed in the same batch, and after a
+  `NON-BLOCKING ISSUES ONLY` run it MUST be recorded on the PR's follow-up
+  Issue before the merge prompt. The PR's follow-up Issue for a file is the
+  open Issue whose title begins `<scope>: defects found by PR #N's review`,
+  where `<scope>` is the narrowest commit-title scope (§ Commit Messages)
+  that covers the file; it is filed with the maintainer's approval when the
+  first finding needs it, and it is where a finding off the surface is
+  recorded too when no open Issue already names the work. A finding is
+  recorded as a `- [ ]` task-list item under the Issue's `## Acceptance`
+  section, carrying file, line, authority, and fix. A recorded finding that
+  a later fix round fixes is ticked on that Issue in the same push, and an
+  Issue left with no open item is closed by the PR via `Fixes #N`. A later
+  run of the same PR, delta or full, MUST NOT re-raise a finding an earlier
+  run recorded, dropped, or the maintainer ruled on unless the hunk it
+  anchors to changed since the run that reported it; the workflow reads a
+  ledger built from the saved run records, each entry naming its run, and
+  a finding the ledger holds whose hunk is unchanged since that run is
+  listed, not counted. A finding off the surface MUST be recorded, not
+  fixed: the pre-merge review reports it as out of bound, and it is
+  appended, with file, line, authority, and fix, to the open Issue that
+  already names the work, else to the PR's follow-up Issue for its file,
+  before the merge prompt. No finding is dropped for being off the surface.
+  Work an open Issue already names, filed with the maintainer's approval,
+  is off the surface of every other PR; a finding on it is recorded against
+  that Issue. The PR's own follow-up Issues take nothing off its surface: a
+  finding one of them already holds is a ledger entry. A finding two
+  independent refuters refute on evidence is dropped and listed in the
+  report's Dropped section. The review verifies every finding that can
+  block and every Critical or Should finding, on or off the surface, except
+  a finding the ledger holds at a hunk unchanged since the run that
+  reported it, which is listed unverified; a nit that cannot block is fixed
+  or recorded unverified. Verified findings off the surface that share
+  file, class, bucket, MUST flag, named Issue, and authority are one root
+  cause: the first is verified and each of the others takes the group's
+  verdict. Every other finding is fixed or recorded.
 
 ### Branch naming
 

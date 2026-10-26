@@ -5,6 +5,20 @@ It governs document structure, authority relationships, linking, and maintenance
 
 ---
 
+## Violations
+
+A violation of this standard that the pre-merge review finds on the review surface in a
+Markdown document is non-blocking; [conventions.md](conventions.md) § Branch and PR Workflow
+owns that rule. The exception is a finding the review classes as correctness, safety (which
+covers soundness), or contract: a document statement the code contradicts that states behaviour
+a caller or user relies on (a syscall, ABI, IPC, or command-line contract, or a safety
+invariant), which that section puts on the blocking track. A non-blocking violation is fixed in
+the batch when the reviewer verdict is `BLOCKING ISSUES`, and after a run whose verdict is
+`NON-BLOCKING ISSUES ONLY` it is recorded on the PR's follow-up Issue before the merge prompt.
+A violation off the surface is recorded as that section says.
+
+---
+
 ## Document Hierarchy
 
 Five documentation scopes exist:

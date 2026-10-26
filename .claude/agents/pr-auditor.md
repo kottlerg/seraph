@@ -49,12 +49,15 @@ claims.
    - Diff: surface only multi-word deferral phrases — `out of scope`,
      `follow-up`, `deferred to`, `for a future PR`, `for now`,
      `will come later`. Do **not** flag bare `TODO` tokens in the diff.
-   Per the Completeness rule in `.claude/CLAUDE.md`, mechanically
-   reachable work cannot be deferred; surface every hit matching the
+   Per the Completeness rule in `.claude/CLAUDE.md`, blocking work on the
+   review surface cannot be deferred, and a non-blocking surface finding
+   is recorded on the PR's follow-up Issue only as `docs/conventions.md`
+   § Branch and PR Workflow allows; surface every hit matching the
    criteria above. A hit is reconciled when the same text names the Issue
-   filed for the deferral under the Completeness rule, or when it is not a
-   deferral of this PR's work (a rule's wording, a quotation, a
-   description of past work).
+   filed for the deferral under the Completeness rule (the follow-up Issue
+   for a recorded non-blocking finding), or when it is not a deferral of
+   this PR's work (a rule's wording, a quotation, a description of past
+   work).
 
 7. Test-plan honesty: every `- [x]` under `## Test plan` in the PR body
    should have plausible basis (cited tool output, file presence, commit

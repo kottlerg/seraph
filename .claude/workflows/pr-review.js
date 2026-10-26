@@ -834,10 +834,9 @@ const seen = []
 // joins the ledgered record at its anchor: listed, never verified or counted,
 // and never a target for other reports, so a report without the flag at the
 // same anchor is a record of its own. An off-surface record that shares file,
-// class, bucket,
-// MUST flag, Issue, and authority with an earlier off-surface record is the
-// same root cause: it joins that record's group and takes the group's verdict
-// instead of its own verification.
+// class, bucket, MUST flag, Issue, and authority with an earlier off-surface
+// record is the same root cause: it joins that record's group and takes the
+// group's verdict instead of its own verification.
 const ledgered = []
 // Verifications started outside the review pipeline (a group member that left
 // its group after the group's verdict was copied); awaited before the verdict.

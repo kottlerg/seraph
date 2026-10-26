@@ -716,10 +716,10 @@ fn discover_ecam(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
 /// On RISC-V the QEMU `virt` machine has a stable, well-known PCI ECAM
 /// at `[0x3000_0000, 0x4000_0000)` for buses 0..=255. Some EDK2 builds
 /// shipped with distro packages (Ubuntu's `qemu-efi-riscv64`, observed
-/// on `ubuntu-latest` GitHub runners) publish ACPI but omit MCFG and do
-/// not re-expose the `OpenSBI` DTB through the UEFI configuration table,
-/// leaving both discovery paths empty. Falling back to the QEMU virt
-/// constants here keeps devmgr functional on those firmware builds.
+/// on CI) publish ACPI but omit MCFG and do not re-expose the `OpenSBI`
+/// DTB through the UEFI configuration table, leaving both discovery
+/// paths empty. Falling back to the QEMU virt constants here keeps
+/// devmgr functional on those firmware builds.
 ///
 /// On x86-64 no comparable single-target fallback exists; the function
 /// returns `None` so the boot halts and the missing firmware is

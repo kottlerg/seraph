@@ -61,9 +61,7 @@ jobs:
     # match the version they encode.
     if: startsWith(github.ref, 'refs/tags/v')
     needs: preflight
-    # Pinned with the install list below; see docs/build-system.md
-    # § Continuous Integration.
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -71,20 +69,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install QEMU, firmware, and zstd
+      # `cargo xtask build` launches nothing, so this job installs no QEMU
+      # or firmware; only the jobs that boot (docs/build-system.md
+      # § Continuous Integration) do.
+      - name: Install zstd
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            qemu-system-x86 \
-            qemu-system-riscv \
-            ovmf \
-            qemu-efi-riscv64 \
-            zstd
-
-      - name: Log QEMU versions
-        run: |
-          qemu-system-x86_64 --version
-          qemu-system-riscv64 --version
+          sudo apt-get install -y zstd
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master

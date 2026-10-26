@@ -79,8 +79,8 @@ truth for "how work is tracked and shipped" on this project.
   review, per that section), invoke `@pr-reviewer` and `@pr-auditor`
   directly in parallel (single message, two `Agent` tool calls) with the
   PR number as scope, the open Issue list (`gh issue list --state open
-  --limit 500 --json number,title`), and, for a re-review, the `since`
-  head and the ledger path; save the reviewer's findings
+  --limit 500 --json number,title`), the ledger path once one exists, and,
+  for a delta run, the `since` head; save the reviewer's findings
   (status `unverified`, since no refuter judged them, or `nit` for a nit
   that cannot block), the recorded and dropped ones, the `verdict`, and
   the head as `stats.head`, as `<mode>-<head>.json` in the workflow's

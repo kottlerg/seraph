@@ -219,43 +219,48 @@ are forbidden; `master` MUST NOT receive force pushes.
   statement the delta made stale, or a test the delta's new code lacks, is
   one the delta introduced. Correctness, soundness, safety, and contract
   findings stay on the surface as above. A finding on the surface is on one
-  of two tracks. It is blocking when it is of class correctness,
-  soundness, safety, or contract, wherever it anchors (a document's
-  statement of a safety invariant, an ABI or syscall contract, or another
-  documented promise that the code contradicts is such a defect), or a MUST
+  of two tracks. It is blocking when it is of class correctness, safety
+  (which covers soundness), or contract, wherever it anchors, or a MUST
   violation of a binding standard, of whatever class, anchored in a file
   that is not a Markdown document; a blocking finding on the surface MUST
-  be fixed before
-  merge. Every other finding on the surface (a MUST violation anchored in a
-  Markdown document, a rule that is not a MUST, documentation drift,
-  coverage, style: wording, wrapping, nits) is non-blocking: when the run
-  has blocking findings it is fixed in the same batch, and otherwise it
-  MUST be recorded on the PR's follow-up Issue before the merge prompt. The
+  be fixed before merge. A document statement the code contradicts is a
+  contract or safety defect when it states behaviour a caller or user
+  relies on (a syscall, ABI, IPC, or command-line contract, or a safety
+  invariant); every other disagreement between a document and the code
+  (a stale name, count, path, or cross-reference, or a summary out of step
+  with its owner) is documentation drift. Every other finding on the
+  surface (a MUST violation of class standards, documentation drift,
+  coverage, or style anchored in a Markdown document, a rule that is not a
+  MUST, documentation drift, coverage, style: wording, wrapping, nits) is
+  non-blocking: when the run has blocking findings it is fixed in the same
+  batch, and otherwise it MUST be recorded on the PR's follow-up Issue
+  before the merge prompt. The
   PR's follow-up Issue for a file is the open Issue whose title begins
   `<scope>: defects found by PR #N's review`, where `<scope>` is the
   narrowest commit-title scope (§ Commit Messages) that covers the file; it
   is filed with the maintainer's approval when the first finding needs it,
   and it is where a finding off the surface is recorded too when no open
   Issue already names the work. A finding is recorded as a `- [ ]` task-list
-  item carrying file, line, authority, and fix. A recorded finding that a
-  later fix round fixes is ticked on that Issue in the same push, and an
-  Issue left with no open item is closed by the PR via `Fixes #N`. A
-  re-review MUST NOT re-raise a finding an earlier run of the same PR
-  recorded, dropped, or the maintainer ruled on unless the delta changed
-  the hunk it anchors to; the workflow reads a ledger built from the saved
-  run records, and a finding the ledger holds whose hunk the delta left
-  unchanged is listed, not counted. A finding off
-  the surface MUST be recorded, not fixed: the pre-merge review reports it
-  as out of bound, and it is appended, with file, line, authority, and fix,
-  to the open Issue that already names the work, else to the PR's follow-up
-  Issue for its file, before the merge prompt. No finding is dropped for
-  being off the surface. Work an open Issue already names, filed with the
-  maintainer's approval, is off the surface of every other PR; a finding on
-  it is recorded against that Issue.
+  item under the Issue's `## Acceptance` section, carrying file, line,
+  authority, and fix. A recorded finding that a later fix round fixes is
+  ticked on that Issue in the same push, and an Issue left with no open item
+  is closed by the PR via `Fixes #N`. A re-review MUST NOT re-raise a
+  finding an earlier run of the same PR recorded, dropped, or the maintainer
+  ruled on unless the delta changed the hunk it anchors to; the workflow
+  reads a ledger built from the saved run records, and a finding the ledger
+  holds whose hunk the delta left unchanged is listed, not counted. A
+  finding off the surface MUST be recorded, not fixed: the pre-merge review
+  reports it as out of bound, and it is appended, with file, line,
+  authority, and fix, to the open Issue that already names the work, else
+  to the PR's follow-up Issue for its file, before the merge prompt. No
+  finding is dropped for being off the surface. Work an open Issue already
+  names, filed with the maintainer's approval, is off the surface of every
+  other PR; a finding on it is recorded against that Issue.
   A finding two independent refuters refute on evidence is dropped and listed
-  in the report's Dropped section. The review verifies every finding that
-  can block and every Critical or Should finding; a nit that cannot block is
-  fixed or recorded unverified. Verified findings off the surface that share
+  in the report's Dropped section. The review verifies every finding it
+  counts that can block, and every Critical or Should finding it counts; a
+  finding the ledger holds is listed unverified, and a nit that cannot block
+  is fixed or recorded unverified. Verified findings off the surface that share
   file, class, bucket, MUST flag, named Issue, and authority are one root
   cause: the first is verified and each of the others takes the group's
   verdict. Every other finding is fixed or recorded.

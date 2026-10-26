@@ -135,9 +135,12 @@ and `line`, `bucket`, `class` (`correctness`: wrong behaviour or logic;
 `safety`: memory, concurrency, or soundness, including a document's
 statement of a safety invariant that the code contradicts; `contract`: a
 caller, ABI, or documented promise broken, including a document's
-statement of an ABI or syscall contract that the code contradicts;
-`standards`: a binding standard's rule; `doc-drift`: a document and the
-code disagree otherwise; `coverage`: a missing test; `style`: readability
+statement of a syscall, ABI, IPC, or command-line contract that the code
+contradicts; `standards`: a binding standard's rule; `doc-drift`: any
+other disagreement between a document and the code (a stale name, count,
+path, or cross-reference, or a summary out of step with its owner), per
+`docs/conventions.md` § Branch and PR Workflow; `coverage`: a missing
+test; `style`: readability
 and naming), whether the diff `introduced` it (in `delta` mode, whether
 the delta did), whether it is a `must_violation` of a binding standard,
 whether a `ledger` entry the parent supplied already states it at a hunk
@@ -165,7 +168,7 @@ entry already states, at a hunk the delta left unchanged, is listed under a
 
 ## Tool discipline
 
-Read-only. `Bash` is for `git` and `gh` read-only subcommands plus
+Read-only. `Bash` is for `git` and `gh` read-only subcommands plus `jq` and
 `grep`/`find`/`rg`-class shell utilities. Do not edit, commit, push, or call
 `gh pr edit`, `gh issue edit`, `gh pr merge`, or any other write-class
 operation. You report; you do not act.

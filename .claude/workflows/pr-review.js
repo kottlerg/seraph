@@ -808,10 +808,9 @@ const seen = []
 // moves onto the surface only when it names no Issue. A record without an
 // Issue adopts a later reporter's Issue only before its verification starts;
 // a record with an Issue keeps it, and the authority refuter's issue_refuted
-// vote decides. A nit that cannot block (soft class, and no MUST violation
-// anchored outside Markdown) is never verified, so an Issue any reporter names
-// on it is final whichever reporter arrived first; a nit that can block is
-// verified like any other finding.
+// vote decides. A nit that cannot block is not verified (docs/conventions.md
+// § Branch and PR Workflow says what the review verifies), so an Issue any
+// reporter names on it is final whichever reporter arrived first.
 // A finding flagged as already in the ledger (an entry states it and the delta
 // left its hunk unchanged) becomes a `ledgered` record, or joins the ledgered
 // record at its anchor: listed, never verified or counted, and never a target
@@ -845,8 +844,8 @@ function authority_key(authority) {
     return m ? m[1] + ' § ' + m[2].trim() : text.slice(0, 60)
 }
 
-// Every finding that can block is verified, whatever its bucket; a nit that
-// cannot block is not.
+// The findings docs/conventions.md § Branch and PR Workflow says the review
+// verifies.
 const verifiable = (f) => blocks(f) || f.bucket !== 'nit'
 
 const new_record = (f, source, in_bound, surface) => ({
@@ -882,7 +881,7 @@ function reconcile(dup, f, source, in_bound, surface) {
         } else {
             dup.annotations.push('placed on the surface by ' + source)
             dup.in_bound = true
-            // A group verdict is for findings off the surface only.
+            // A member's proxy verdict is for findings off the surface only.
             if (dup.group_lead) detach(dup)
         }
     } else if (!dup.issue && f.issue) {
@@ -901,18 +900,19 @@ function reconcile(dup, f, source, in_bound, surface) {
 // A grouped record placed on the surface leaves its group for refuters of its
 // own. Its verification is the lead's until then: not yet started, awaiting
 // the lead (the member branch of `verify_one` re-checks the group), or
-// already copied, in which case it is reset and verified late.
+// already copied, in which case it is reset and verified late. The flag the
+// group set is cleared; its own verification sets it again when it begins.
 function detach(dup) {
     const lead = dup.group_lead
     lead.group.splice(lead.group.indexOf(dup), 1)
     dup.group_lead = null
+    dup.verify_started = false
     dup.annotations.push(
         'left the root-cause group of ' + lead.file + ':' + lead.line + ' for its own verification')
     if (dup.status !== 'pending') {
         dup.status = 'pending'
         dup.votes = []
         dup.verification = null
-        dup.verify_started = false
         late_verifications.push(verify_one(dup))
     }
 }
@@ -974,9 +974,11 @@ function dedup(findings, source) {
         if (lead) {
             record.group_lead = lead
             lead.group.push(record)
-            // The lead's verification is the member's from this moment, so a
-            // later Issue claim is annotated, not adopted.
+            // The group's Issue claim is fixed at formation: the lead's
+            // verification is the member's from this moment, and neither
+            // adopts a later Issue claim, which is annotated instead.
             record.verify_started = true
+            lead.verify_started = true
             record.annotations.push(
                 'verified with ' + lead.file + ':' + lead.line + ' (same root cause)')
         }
@@ -1002,16 +1004,21 @@ function verify_one(f) {
                 f.verify_started = false
                 return verify_one(f)
             }
-            f.status = lead.status
-            f.votes = lead.votes
             // The group shares one Issue claim; the lead's authority vote
-            // judged it for every member.
+            // judged it for every member. A member the refuted claim puts on
+            // the surface leaves the group for refuters of its own.
             if (f.issue && !lead.issue) {
                 f.annotations.push('#' + f.issue + ' does not name this work (judged on the ' +
-                    'group lead); placed on the surface')
+                    'group lead)' + (f.surface ? '; placed on the surface' : ''))
                 f.issue = 0
-                f.in_bound = f.surface
+                if (f.surface) {
+                    f.in_bound = true
+                    detach(f)
+                    return verify_one(f)
+                }
             }
+            f.status = lead.status
+            f.votes = lead.votes
             return f
         })
     }

@@ -77,10 +77,12 @@ truth for "how work is tracked and shipped" on this project.
   `@pr-auditor` directly in parallel (single message, two `Agent` tool
   calls) with the PR number as scope, the open Issue list (`gh issue list
   --state open --limit 500 --json number,title`), and, for a re-review,
-  the `since` head and the ledger path; save the reviewer's findings with
-  their status, the recorded and dropped ones, the verdict, and the head as
-  `<mode>-<head>.json` in the workflow's shape, so the ledger command reads
-  a fallback run too, and apply the same verdict handling.
+  the `since` head and the ledger path; save the reviewer's findings
+  (status `unverified`, since no refuter judged them, or `nit` for a nit
+  that cannot block), the recorded and dropped ones, the `verdict`, and
+  the head as `stats.head`, as `<mode>-<head>.json` in the workflow's
+  shape, so the ledger command reads a fallback run too, and apply the
+  same verdict handling.
 
   Before each `delta` run, build the ledger that section names from every
   saved run record of the PR:
@@ -154,7 +156,8 @@ truth for "how work is tracked and shipped" on this project.
   [docs/conventions.md](../docs/conventions.md) § Branch and PR Workflow
   defines it, are the scope, surfaced incidentally: blocking ones MUST be
   fixed in the same pass, and non-blocking ones MUST be fixed in that batch
-  or recorded as that section says. Findings off the surface MUST be
+  when the run has blocking findings and otherwise recorded as that section
+  says. Findings off the surface MUST be
   recorded in the same pass, never dropped: on the open Issue that already
   names the work, else on the PR's follow-up Issue that section defines
   (filed with the user's approval).

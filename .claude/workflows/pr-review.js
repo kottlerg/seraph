@@ -551,8 +551,7 @@ const LENS_HEADER = [
 // Workflow), and a non-blocking finding placed on one is one it already holds:
 // listed, not counted. A finding on the blocking track stays on the surface
 // whatever Issue holds it. The second alternative matches the per-PR titles
-// filed before the rolling Issues, follow-up Issues for every rule but
-// recording.
+// filed before the rolling Issues, follow-up Issues under every rule.
 const FOLLOW_UP = /^[^:]+: defects found by (?:review|PR #\d+'s review)/
 const follow_up_issue = (n) => FOLLOW_UP.test(issue_title(n))
 

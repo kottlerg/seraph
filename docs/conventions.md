@@ -248,13 +248,14 @@ are forbidden; `master` MUST NOT receive force pushes.
   filed, with the maintainer's approval, the current milestone
   (§ Milestones), and the labels § Labels requires, only when the scope has
   none open. An open Issue titled `<scope>: defects found by PR #N's
-  review`, filed before the rolling Issues, is a follow-up Issue for every
-  rule below except recording, which goes to the rolling Issue of its
-  scope. The rolling Issue is where a finding off the surface is recorded
-  too when no open Issue already names the work. A finding is recorded as
-  a `- [ ]` task-list item under the Issue's `## Acceptance` section,
-  carrying file, line, authority, fix, and the PR and head that reported
-  it. A follow-up Issue is drained in batch, by a PR that changes its scope
+  review`, filed before the rolling Issues, is a follow-up Issue under
+  every rule below; a finding recorded in its scope goes to the rolling
+  Issue unless the recording PR drains it. The rolling Issue is where a
+  finding off the surface is recorded too when no open Issue already names
+  the work. A finding is recorded as a `- [ ]` task-list item under the
+  Issue's `## Acceptance` section, carrying file, line, authority, fix,
+  and the PR and head that reported it. A follow-up Issue is drained in
+  batch, by a PR that changes its scope
   for another reason or by a sweep PR that drains several scopes' Issues;
   no merge requires a drain. A PR that fixes recorded items ticks them on
   the Issue in the same push and MUST reference the Issue with `Refs #N`;

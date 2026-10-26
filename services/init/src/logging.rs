@@ -315,7 +315,7 @@ pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, iop
         log("init: FATAL: cannot configure log thread");
         syscall::thread_exit();
     }
-    if syscall::thread_start(thread_cap).is_err()
+    if crate::start_thread(thread_cap).is_err()
     {
         log("init: FATAL: cannot start log thread");
         syscall::thread_exit();

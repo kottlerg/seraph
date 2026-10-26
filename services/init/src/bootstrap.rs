@@ -1126,7 +1126,7 @@ pub fn finalize_memmgr(
         mm.process_info_va,
     )
     .ok()?;
-    syscall::thread_start(mm.mm_thread).ok()?;
+    crate::start_thread(mm.mm_thread).ok()?;
     log("memmgr started");
 
     Some(MemmgrFinalize {
@@ -1669,8 +1669,14 @@ pub fn bootstrap_procmgr(
 /// Start procmgr's thread. Call after [`finalize_memmgr`] has ingested
 /// memmgr's pool and entered the dispatch loop, since procmgr's
 /// `_start` calls `heap_bootstrap` which depends on memmgr being live.
-pub fn start_procmgr(pm: &ProcmgrBootstrap)
+/// Like the other bootstrap entry points, it reports failure to
+/// [`crate::run`], which decides that init cannot continue.
+///
+/// # Errors
+/// Returns the error [`crate::start_thread`] reports: the first
+/// `syscall::thread_start` failure other than `Interrupted`, which
+/// `start_thread` retries.
+pub fn start_procmgr(pm: &ProcmgrBootstrap) -> Result<(), i64>
 {
-    let _ = syscall::thread_start(pm.thread);
-    log("procmgr started");
+    crate::start_thread(pm.thread)
 }

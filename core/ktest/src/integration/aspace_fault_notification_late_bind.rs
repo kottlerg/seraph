@@ -20,9 +20,9 @@
 
 use syscall::{
     aspace_bind_notification, cap_create_aspace, cap_create_cspace, cap_create_thread, cap_delete,
-    cap_info, event_queue_create, event_try_recv, thread_configure, thread_sleep, thread_start,
+    event_queue_create, event_try_recv, thread_configure, thread_start,
 };
-use syscall_abi::{CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, SyscallError, THREAD_STATE_EXITED};
+use syscall_abi::{EXIT_FAULT_BASE, SyscallError};
 
 use crate::{TestContext, TestResult};
 
@@ -58,25 +58,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     thread_start(thread).map_err(|_| "aspace_fault_notification_late_bind: thread_start failed")?;
 
     // Poll until the thread is Exited; capture the kernel-recorded fault reason.
-    let mut polls = 0;
-    let fault_reason = loop
-    {
-        let packed = cap_info(thread, CAP_INFO_THREAD_STATE)
-            .map_err(|_| "aspace_fault_notification_late_bind: cap_info(THREAD_STATE) failed")?;
-        // cast_possible_truncation: 8-bit state in the high word, 32-bit reason low.
-        #[allow(clippy::cast_possible_truncation)]
-        let state = (packed >> 32) as u32;
-        if state == THREAD_STATE_EXITED
-        {
-            break packed & 0xFFFF_FFFF;
-        }
-        polls += 1;
-        if polls >= MAX_POLLS
-        {
-            return Err("aspace_fault_notification_late_bind: thread never faulted/exited");
-        }
-        thread_sleep(1).ok();
-    };
+    let fault_reason = crate::spawn::wait_until_exited(thread, MAX_POLLS)?;
     // It must be a real terminal fault, not a clean exit (reason 0).
     if fault_reason < EXIT_FAULT_BASE
     {

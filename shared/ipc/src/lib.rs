@@ -1233,16 +1233,17 @@ pub mod fs_labels
     ///
     /// Reply (label `fs_errors::SUCCESS`): `data[0]` = entry kind (per
     /// `namespace_protocol::NodeKind`), `caps[0]` = node cap for the
-    /// newly-created file. Errors include `EXISTS`, `NO_SPACE`,
-    /// `PERMISSION_DENIED`.
+    /// newly-created file. Errors: as `services/fs/docs/fs-driver-protocol.md`
+    /// § Label 13: `FS_CREATE` lists them.
     pub const FS_CREATE: u64 = 13;
     /// Remove a file or empty directory from a directory.
     ///
     /// Request: badge = parent-directory cap (must carry `MUTATE_DIR`),
     /// `label = FS_REMOVE | (name_len << 16)`, name bytes from word 0.
     ///
-    /// Reply (label `fs_errors::SUCCESS`): empty body. Errors:
-    /// `NOT_FOUND`, `NOT_EMPTY` (directory has entries), `IO_ERROR`.
+    /// Reply (label `fs_errors::SUCCESS`): empty body. Errors: as
+    /// `services/fs/docs/fs-driver-protocol.md` § Label 14: `FS_REMOVE`
+    /// lists them.
     pub const FS_REMOVE: u64 = 14;
     /// Create a new (empty) directory in a directory.
     ///
@@ -1260,18 +1261,19 @@ pub mod fs_labels
     /// `IpcMessageBuilder::bytes(2, &concat(src, dst))` — source bytes
     /// first, destination bytes immediately after with no padding.
     ///
-    /// Cross-directory rename is deferred to a follow-up Issue: the
+    /// Cross-directory rename is deferred to Issue #89: the
     /// caller cannot supply a second directory cap because servers
     /// cannot introspect the badge packed inside a cap they receive
     /// (`cap_info` does not expose badge bits), so a cross-directory
     /// destination cannot be resolved to a `NodeId` server-side.
     ///
-    /// Not atomic: an interrupted rename can leave both names present
-    /// or neither. See `services/fs/fat/docs/crash-safety.md`.
+    /// Not atomic: an interrupted rename can leave only the source, both
+    /// names, or only the destination present. See
+    /// `services/fs/fat/docs/crash-safety.md`.
     ///
-    /// Reply (label `fs_errors::SUCCESS`): empty body. Errors:
-    /// `NOT_FOUND` (source missing), `EXISTS` (destination occupied),
-    /// `NO_SPACE`, `IO_ERROR`.
+    /// Reply (label `fs_errors::SUCCESS`): empty body. Errors: as
+    /// `services/fs/docs/fs-driver-protocol.md` § Label 16: `FS_RENAME`
+    /// lists them.
     pub const FS_RENAME: u64 = 16;
     /// Truncate a file to a new length.
     ///
@@ -2233,7 +2235,10 @@ pub struct IpcMessage
     /// and for unbadged endpoints.
     pub badge: u64,
     data: [u64; MSG_DATA_WORDS_MAX],
-    /// Number of valid `u64` words in `data`. `<= MSG_DATA_WORDS_MAX`.
+    /// Number of valid `u64` words in `data`. `<= MSG_DATA_WORDS_MAX`: every
+    /// [`IpcMessageBuilder`] setter panics past the bound in every build (an
+    /// empty source at an out-of-range start included), and
+    /// [`IpcMessage::from_ipc_buf`] requires it of its caller.
     data_len: u8,
     /// Number of valid slots in `cap_slots`. `<= MSG_CAP_SLOTS_MAX`.
     cap_count: u8,
@@ -2264,16 +2269,19 @@ impl IpcMessage
         IpcMessageBuilder::new(label)
     }
 
-    /// Read data word `idx`. Debug-panics only on the outer array bound
-    /// (`idx >= MSG_DATA_WORDS_MAX`). Reading past the sender's declared
+    /// Read data word `idx`. Reading past the sender's declared
     /// `word_count()` returns zero — the unused array slots are zero-init
     /// and the kernel does not write them past the declared range. This
     /// is a deliberate contract so protocols that carry optional trailing
     /// words at fixed offsets keep working.
+    ///
+    /// # Panics
+    /// Panics in every build if `idx >= MSG_DATA_WORDS_MAX` (the array
+    /// bounds check); the index is a protocol constant, so an overrun is a
+    /// programmer error.
     #[must_use]
     pub fn word(&self, idx: usize) -> u64
     {
-        debug_assert!(idx < MSG_DATA_WORDS_MAX);
         self.data[idx]
     }
 
@@ -2299,15 +2307,14 @@ impl IpcMessage
     #[must_use]
     pub fn data_bytes(&self) -> &[u8]
     {
-        // SAFETY: `data` is `[u64; MSG_DATA_WORDS_MAX]` — contiguous and
-        // u64-aligned, which is stricter than u8 alignment. Length
-        // `word_count * 8` stays inside the array (`word_count <=
-        // MSG_DATA_WORDS_MAX` by invariant).
+        let words = self.words();
+        // SAFETY: `words` is a bounds-checked sub-slice of `data`, so a byte
+        // view of `words.len() * 8` bytes from its start covers only
+        // initialised memory of that array; u64 alignment is stricter than
+        // u8 alignment, and the shared borrow of `self` keeps the array
+        // alive and unmodified for the returned slice's lifetime.
         unsafe {
-            core::slice::from_raw_parts(
-                self.data.as_ptr().cast::<u8>(),
-                self.data_len as usize * core::mem::size_of::<u64>(),
-            )
+            core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), core::mem::size_of_val(words))
         }
     }
 
@@ -2386,7 +2393,8 @@ impl IpcMessage
     {
         for (i, &val) in self.words().iter().enumerate()
         {
-            // SAFETY: `data_len <= MSG_DATA_WORDS_MAX` invariant, so
+            // SAFETY: `words()` is a bounds-checked sub-slice of the
+            // `MSG_DATA_WORDS_MAX`-word `data` array, so
             // `i < MSG_DATA_WORDS_MAX` and the offset is within the
             // 4 KiB buffer. Caller guarantees pointer validity.
             unsafe { core::ptr::write_volatile(ipc_buf.add(i), val) };
@@ -2425,10 +2433,16 @@ impl IpcMessageBuilder
     }
 
     /// Set data word `idx`; grow `word_count` to cover it if needed.
+    ///
+    /// # Panics
+    /// Panics in every build if `idx >= MSG_DATA_WORDS_MAX` (the array
+    /// bounds check on the `MSG_DATA_WORDS_MAX`-word data array, which
+    /// fires before `word_count` can grow past the bound); see
+    /// [`IpcMessageBuilder::word_count`] for why an overrun is treated as
+    /// a programmer error.
     #[must_use]
     pub fn word(mut self, idx: usize, val: u64) -> Self
     {
-        debug_assert!(idx < MSG_DATA_WORDS_MAX);
         self.msg.data[idx] = val;
         let needed = (idx as u8) + 1;
         if self.msg.data_len < needed
@@ -2440,10 +2454,19 @@ impl IpcMessageBuilder
 
     /// Write `src` words contiguously starting at word `start`; grow
     /// `word_count` to cover the range.
+    ///
+    /// # Panics
+    /// Panics in every build if `start + src.len() > MSG_DATA_WORDS_MAX`,
+    /// an empty `src` at an out-of-range `start` included, so `word_count`
+    /// can never be set past the bound; see
+    /// [`IpcMessageBuilder::word_count`] for why the bound is asserted.
     #[must_use]
     pub fn words(mut self, start: usize, src: &[u64]) -> Self
     {
-        debug_assert!(start + src.len() <= MSG_DATA_WORDS_MAX);
+        assert!(
+            start + src.len() <= MSG_DATA_WORDS_MAX,
+            "IpcMessageBuilder::words: range exceeds MSG_DATA_WORDS_MAX"
+        );
         for (i, &val) in src.iter().enumerate()
         {
             self.msg.data[start + i] = val;
@@ -2458,11 +2481,21 @@ impl IpcMessageBuilder
 
     /// Pack `src` bytes into data words (little-endian u64), starting at
     /// word `start_word`. Grows `word_count` to cover the packed bytes.
+    ///
+    /// # Panics
+    /// Panics in every build if the packed range
+    /// `start_word + src.len().div_ceil(8)` exceeds `MSG_DATA_WORDS_MAX`, an
+    /// empty `src` at an out-of-range `start_word` included, so `word_count`
+    /// can never be set past the bound; see
+    /// [`IpcMessageBuilder::word_count`] for why the bound is asserted.
     #[must_use]
     pub fn bytes(mut self, start_word: usize, src: &[u8]) -> Self
     {
         let word_count = src.len().div_ceil(8);
-        debug_assert!(start_word + word_count <= MSG_DATA_WORDS_MAX);
+        assert!(
+            start_word + word_count <= MSG_DATA_WORDS_MAX,
+            "IpcMessageBuilder::bytes: range exceeds MSG_DATA_WORDS_MAX"
+        );
         for i in 0..word_count
         {
             let base = i * 8;
@@ -2487,11 +2520,15 @@ impl IpcMessageBuilder
     /// Append one capability to transfer. `handle` must be the full cap
     /// handle as returned by the cap syscalls (index + per-slot generation)
     /// — the kernel generation-validates it and rejects a stale handle with
-    /// `InvalidCapability`. Debug-panics if the slot array is full.
+    /// `InvalidCapability`.
+    ///
+    /// # Panics
+    /// Panics in every build if `MSG_CAP_SLOTS_MAX` caps are already
+    /// appended (the slot array bounds check); a message's cap count is a
+    /// protocol constant, so an overrun is a programmer error.
     #[must_use]
     pub fn cap(mut self, handle: u32) -> Self
     {
-        debug_assert!((self.msg.cap_count as usize) < MSG_CAP_SLOTS_MAX);
         let i = self.msg.cap_count as usize;
         self.msg.cap_slots[i] = handle;
         self.msg.cap_count += 1;
@@ -2509,10 +2546,20 @@ impl IpcMessageBuilder
     /// Explicitly set `word_count`. Useful when a protocol wants padding
     /// words counted (`words`/`word`/`bytes` auto-grow only to the
     /// highest touched word).
+    ///
+    /// # Panics
+    /// Panics in every build if `len > MSG_DATA_WORDS_MAX`. The count is a
+    /// protocol constant, so an overrun is a programmer error — the same
+    /// one `word`/`words`/`bytes` panic on for an out-of-range index — and
+    /// it must not reach the `data_len <= MSG_DATA_WORDS_MAX` invariant the
+    /// message's views rely on.
     #[must_use]
     pub fn word_count(mut self, len: usize) -> Self
     {
-        debug_assert!(len <= MSG_DATA_WORDS_MAX);
+        assert!(
+            len <= MSG_DATA_WORDS_MAX,
+            "IpcMessageBuilder::word_count: len exceeds MSG_DATA_WORDS_MAX"
+        );
         self.msg.data_len = len as u8;
         self
     }
@@ -2546,7 +2593,7 @@ impl IpcMessageBuilder
 /// caller has insufficient rights (`GRANT` missing on a cap-bearing call),
 /// a cap slot is stale or Null (`InvalidCapability`), a cap slot is
 /// repeated in the message (`InvalidArgument`), a cap slot is pinned by an
-/// in-flight `SYS_CAP_REVOKE` (`InvalidState`), or the call is
+/// in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE` (`InvalidState`), or the call is
 /// interrupted. Cap-slot problems are rejected before blocking; a refusal
 /// arising only afterwards delivers the message with zero caps (the
 /// caller keeps its capabilities).
@@ -2574,13 +2621,29 @@ pub unsafe fn ipc_call(ep: u32, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
 /// [`IpcMessage`] before returning. After return the IPC buffer is scratch
 /// — nested IPC between `ipc_recv` and reading the message is safe.
 ///
+/// A reply still pending from an earlier receive is released once the
+/// receive passes its capability check and cap-slot pre-allocation: that
+/// caller's `ipc_call` returns `Interrupted`, and a fault-blocked caller is
+/// killed. A receive refused before then keeps the pending binding (see
+/// `docs/ipc-design.md` § The Call/Reply Model).
+///
 /// # Safety
 /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC buffer
 /// page as registered via `syscall::ipc_buffer_set`.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the endpoint cap is invalid or
-/// the receive is interrupted.
+/// Returns a negative `i64` error code:
+/// - `InvalidCapability` — `ep` is not a live Endpoint cap.
+/// - `InsufficientRights` — `ep` lacks Receive rights.
+/// - `QuotaExceeded` — the cap-slot pre-allocation for incoming caps was
+///   refused because this thread's `CSpace` directory is structurally full.
+/// - `OutOfMemory` — the cap-slot pre-allocation was refused because the
+///   `CSpace`'s slot-page pool is exhausted.
+/// - `Interrupted` — this thread was stopped, or the endpoint was destroyed,
+///   while the receive was blocked.
+///
+/// The first four refuse the receive before any pending reply is released,
+/// so a pending caller stays bound.
 #[inline]
 pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 {
@@ -2599,7 +2662,7 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// all-or-nothing with the reply. An `Err` return consumes the pending
 /// reply either way: when a caller was claimed it has already been woken
 /// with the synthetic `IPC_REPLY_TRANSFER_FAILED` label (a reply cap slot
-/// stale, repeated, revoke-pinned, or unacceptable to its `CSpace`), and
+/// stale, repeated, pinned by an in-flight revoke or move, or unacceptable to its `CSpace`), and
 /// when none was pending there is nothing to wake — in both cases the
 /// reply must not be retried.
 ///
@@ -2610,10 +2673,12 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` (no pending
 /// reply target, or a reply cap slot is stale or Null), `InvalidArgument`
-/// (bad count, or a cap slot repeated in the reply), `InvalidState` (a
-/// reply cap slot is pinned by an in-flight `SYS_CAP_REVOKE`),
-/// `QuotaExceeded` / `OutOfMemory` (the caller's `CSpace` cannot accept
-/// the reply caps), or `Interrupted`.
+/// (a cap slot repeated in the reply), `InvalidState` (a reply cap slot is
+/// pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), or `QuotaExceeded` /
+/// `OutOfMemory` (the caller's `CSpace` cannot accept the reply caps). The
+/// reply never blocks, so it never returns `Interrupted`; the message's
+/// counts are within the kernel's maxima by construction (the kernel clamps
+/// larger ones rather than rejecting them).
 #[inline]
 pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 {
@@ -2624,4 +2689,67 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
     let caps = msg.caps();
     let (cap_lo, cap_hi) = syscall::pack_cap_handles(caps);
     syscall::raw_ipc_reply(msg.label, msg.word_count(), caps.len(), cap_lo, cap_hi)
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn packed_bytes_round_trip_through_data_bytes_with_zero_padding()
+    {
+        // 13 bytes straddle a word boundary: the tail word must carry the
+        // 5 live bytes little-endian and zero padding above them.
+        let payload: [u8; 13] = *b"seraph-ipc:13";
+        let msg = IpcMessage::builder(7).bytes(1, &payload).build();
+        assert_eq!(msg.word_count(), 3);
+        let bytes = msg.data_bytes();
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(&bytes[..8], &[0u8; 8]);
+        assert_eq!(&bytes[8..21], &payload);
+        assert_eq!(&bytes[21..], &[0u8; 3]);
+    }
+
+    #[test]
+    fn setters_accept_ranges_ending_exactly_at_the_data_bound()
+    {
+        let msg = IpcMessage::builder(1)
+            .words(MSG_DATA_WORDS_MAX - 2, &[1, 2])
+            .bytes(MSG_DATA_WORDS_MAX - 1, &[0xAA; 8])
+            .word_count(MSG_DATA_WORDS_MAX)
+            .build();
+        assert_eq!(msg.word_count(), MSG_DATA_WORDS_MAX);
+        assert_eq!(msg.word(MSG_DATA_WORDS_MAX - 2), 1);
+        assert_eq!(msg.word(MSG_DATA_WORDS_MAX - 1), 0xAAAA_AAAA_AAAA_AAAA);
+    }
+
+    #[test]
+    fn reading_past_the_declared_count_yields_zero()
+    {
+        let msg = IpcMessage::builder(1).word(2, 9).build();
+        assert_eq!(msg.word_count(), 3);
+        assert_eq!(msg.word(MSG_DATA_WORDS_MAX - 1), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "word_count: len exceeds MSG_DATA_WORDS_MAX")]
+    fn word_count_past_the_data_bound_panics()
+    {
+        let _ = IpcMessage::builder(1).word_count(MSG_DATA_WORDS_MAX + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "words: range exceeds MSG_DATA_WORDS_MAX")]
+    fn empty_words_at_an_out_of_range_start_panics()
+    {
+        let _ = IpcMessage::builder(1).words(MSG_DATA_WORDS_MAX + 1, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "bytes: range exceeds MSG_DATA_WORDS_MAX")]
+    fn empty_bytes_at_an_out_of_range_start_panics()
+    {
+        let _ = IpcMessage::builder(1).bytes(MSG_DATA_WORDS_MAX + 1, &[]);
+    }
 }

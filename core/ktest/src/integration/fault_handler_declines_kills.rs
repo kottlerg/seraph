@@ -18,11 +18,8 @@
 //! bound rather than hanging.
 
 use ipc::IpcMessage;
-use syscall::{cap_create_endpoint, cap_delete, cap_info, thread_set_fault_handler, thread_sleep};
-use syscall_abi::{
-    CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, FAULT_CLASS_ALL, FAULT_LABEL, FAULT_REPLY_KILL,
-    THREAD_STATE_EXITED,
-};
+use syscall::{cap_create_endpoint, cap_delete, thread_set_fault_handler};
+use syscall_abi::{EXIT_FAULT_BASE, FAULT_CLASS_ALL, FAULT_LABEL, FAULT_REPLY_KILL};
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -32,12 +29,6 @@ const RESERVED_VA: u64 = 0x3E_5000_0000;
 
 /// Badge bound with the handler and delivered in the fault message.
 const FAULT_BADGE: u64 = 0xC0FF_EE03;
-
-/// Fault vector recorded in `exit_reason` for a not-present store.
-#[cfg(target_arch = "x86_64")]
-const FAULT_VECTOR: u64 = 14; // #PF
-#[cfg(target_arch = "riscv64")]
-const FAULT_VECTOR: u64 = 15; // store/AMO page fault
 
 /// Poll bound: ~2 s at ~1 ms per `thread_sleep(1)` before declaring failure.
 const MAX_POLLS: u32 = 2000;
@@ -72,29 +63,11 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // The declined fault is terminal: the child must reach Exited with the
     // standard fault exit reason.
-    let expected = EXIT_FAULT_BASE + FAULT_VECTOR;
-    let mut polls = 0;
-    loop
+    let expected = EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR;
+    let reason = crate::spawn::wait_until_exited(child.th, MAX_POLLS)?;
+    if reason != expected
     {
-        let packed = cap_info(child.th, CAP_INFO_THREAD_STATE)
-            .map_err(|_| "fault_handler_declines_kills: cap_info(THREAD_STATE) failed")?;
-        // cast_possible_truncation: state code is the packed high word.
-        #[allow(clippy::cast_possible_truncation)]
-        let state = (packed >> 32) as u32;
-        if state == THREAD_STATE_EXITED
-        {
-            if packed & 0xFFFF_FFFF != expected
-            {
-                return Err("fault_handler_declines_kills: wrong exit reason after KILL");
-            }
-            break;
-        }
-        polls += 1;
-        if polls >= MAX_POLLS
-        {
-            return Err("fault_handler_declines_kills: child never died after KILL reply");
-        }
-        thread_sleep(1).ok();
+        return Err("fault_handler_declines_kills: wrong exit reason after KILL");
     }
 
     cap_delete(child.th).ok();

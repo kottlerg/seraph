@@ -8,7 +8,8 @@
 //! Covers: `SYS_THREAD_CONFIGURE`, `SYS_THREAD_START`, `SYS_THREAD_STOP`,
 //! `SYS_THREAD_YIELD`, `SYS_THREAD_EXIT`, `SYS_THREAD_READ_REGS`,
 //! `SYS_THREAD_WRITE_REGS`, `SYS_THREAD_SET_PRIORITY`,
-//! `SYS_THREAD_SET_AFFINITY`.
+//! `SYS_THREAD_SET_AFFINITY`, `SYS_THREAD_SLEEP`,
+//! `SYS_THREAD_BIND_NOTIFICATION`.
 //!
 //! `SYS_THREAD_EXIT` is exercised implicitly — every child thread entry
 //! function calls `thread_exit()`.
@@ -30,6 +31,7 @@ use syscall::{
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
+use crate::arch::{IP_OFFSET, TRAP_FRAME_BYTES};
 use crate::{ChildStack, TestContext, TestResult};
 
 // Notification NOTIFY / WAIT rights. Tests that pin a child in notification_wait give
@@ -39,22 +41,11 @@ use crate::{ChildStack, TestContext, TestResult};
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
 
-// Expected TrapFrame size per architecture (kernel/src/arch/*/trap_frame.rs).
-#[cfg(target_arch = "x86_64")]
-const TRAP_FRAME_BYTES: u64 = 168;
-#[cfg(target_arch = "riscv64")]
-const TRAP_FRAME_BYTES: u64 = 280;
-
-// Byte offset of the instruction pointer within TrapFrame.
-#[cfg(target_arch = "x86_64")]
-const IP_OFFSET: usize = 120; // TrapFrame.rip
-#[cfg(target_arch = "riscv64")]
-const IP_OFFSET: usize = 248; // TrapFrame.sepc
-
 // Child stacks — one per test that spawns a child, to avoid aliasing.
 static mut STACK_CONFIGURE: ChildStack = ChildStack::ZERO;
 static mut STACK_STOP_REGS: ChildStack = ChildStack::ZERO;
 static mut STACK_WRITE_REGS: ChildStack = ChildStack::ZERO;
+static mut STACK_DOUBLE_STOP: ChildStack = ChildStack::ZERO;
 static mut STACK_CONFIGURE_ERR: ChildStack = ChildStack::ZERO;
 static mut STACK_CONFIGURE_NON_USER: ChildStack = ChildStack::ZERO;
 static mut STACK_SPLIT_ROLLBACK: ChildStack = ChildStack::ZERO;
@@ -231,9 +222,7 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
     let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for double-stop test failed")?;
 
-    // Tests run sequentially; STACK_STOP_REGS contents are stale but the child
-    // from the previous test is stopped. Using STACK_WRITE_REGS for safety.
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_WRITE_REGS));
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_DOUBLE_STOP));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
     crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
         .map_err(|_| "thread::stop_again_invalid_state: configure_and_start failed")?;
@@ -252,6 +241,20 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
     cap_delete(ready).map_err(|_| "cap_delete ready after double-stop test failed")?;
     cap_delete(block).map_err(|_| "cap_delete block after double-stop test failed")?;
     cap_delete(child.cs).map_err(|_| "cap_delete cs after double-stop test failed")?;
+    Ok(())
+}
+
+// ── SYS_THREAD_START (self) ──────────────────────────────────────────────────
+
+/// A thread starting itself through its own Thread cap gets `InvalidArgument`:
+/// it is running, so there is nothing to start. The kernel's refusal of a
+/// self-start as such is reachable only once a stop has landed on the caller.
+pub fn start_self_invalid_argument(ctx: &TestContext) -> TestResult
+{
+    if thread_start(ctx.thread_cap) != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("thread_start on the caller's own Thread cap did not return InvalidArgument");
+    }
     Ok(())
 }
 
@@ -1009,7 +1012,6 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
 ///
 /// Each spinner publishes its current CPU into `BALANCE_OBSERVED_CPU[i]`
 /// on every loop iteration and exits when `BALANCE_SHOULD_EXIT` is set.
-#[allow(clippy::cast_possible_truncation)]
 fn balance_spawn_spinners(
     ctx: &TestContext,
     n: usize,
@@ -1031,6 +1033,9 @@ fn balance_spawn_spinners(
         // Initial pinning to `initial_cpu` forces the first enqueue there.
         // SAFETY: per-spinner stack slot, no aliasing.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(STACK_BALANCE_SPINNERS[i]) });
+        // cast_possible_truncation: `i` is below `BALANCE_MAX_SPINNERS` (8), so
+        // the cast is exact on any pointer width.
+        #[allow(clippy::cast_possible_truncation)]
         let arg = (i as u64) << 32 | u64::from(child_sig);
         crate::spawn::configure_and_start_pinned(
             &child,

@@ -108,9 +108,16 @@ truth for "how work is tracked and shipped" on this project.
 
   Handle the run's findings as that section says, in one pass: fixes via
   commits; recorded findings via `gh issue edit` on the Issue the section
-  names, or `gh issue create` with the user's approval; after a
-  `NON-BLOCKING ISSUES ONLY` run, the run's surface findings recorded the
-  same way on the follow-up Issues the section defines; `AUDIT FAIL`
+  names; after a `NON-BLOCKING ISSUES ONLY` run, the run's surface
+  findings recorded the same way on the follow-up Issue of each finding's
+  scope, as the section defines it. The scope's follow-up Issue is found
+  with `gh issue list --state open --search '"defects found by review"
+  in:title' --json number,title`; when the scope has none, it is filed
+  with the user's approval as `gh issue create --milestone <current>`,
+  the current milestone being the one [docs/conventions.md](../docs/conventions.md)
+  § Milestones defines. A PR that ticks items on a follow-up Issue carries
+  `Refs #N` in its body, and `Fixes #N` only under that section's closing
+  condition. `AUDIT FAIL`
   items via `gh pr edit`, `gh issue edit`, or commits; a contested
   finding put to the user and resolved as the section says. Before
   pushing a fix, for every fact it changes (a symbol, a constant, a rule
@@ -163,13 +170,13 @@ truth for "how work is tracked and shipped" on this project.
   when the reviewer verdict is `BLOCKING ISSUES` and otherwise recorded as
   that section says. Findings off the surface MUST be recorded in the same
   pass, never dropped: on the open Issue that already names the work, else
-  on the PR's follow-up Issue that section defines (filed with the user's
-  approval).
+  on the follow-up Issue of its scope that section defines (filed with the
+  user's approval).
 - "Out of scope", "follow-up", and similar deferrals MUST NOT be used to
   avoid mechanically reachable blocking work on the surface; a non-blocking
-  surface finding is deferred only by recording it on the PR's follow-up
-  Issue as [docs/conventions.md](../docs/conventions.md) § Branch and PR
-  Workflow allows.
+  surface finding is deferred only by recording it on the follow-up Issue
+  of its scope as [docs/conventions.md](../docs/conventions.md) § Branch
+  and PR Workflow allows.
 - Material scope expansions MUST be stated in one line and continued, not
   paused for permission.
 - Genuine deferrals (different review surface, or expansion too large to

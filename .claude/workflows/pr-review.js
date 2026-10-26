@@ -16,12 +16,13 @@
 // only those on its blocking track (class correctness, safety, or contract, or
 // a MUST violation anchored outside Markdown) make it `BLOCKING ISSUES`.
 // Findings off the surface are recorded for the open Issue that already names
-// the work, else for the PR's follow-up Issue; those that share a file, class,
-// bucket, MUST flag, Issue, and authority are one root cause and are verified
-// once as a group. A run that names the ledger of the earlier runs' recorded,
-// dropped, and contested findings (required in a delta run) lists, and does
-// not count, a finding a reviewer flags as already in it at a hunk unchanged
-// since the run the entry names. `.claude/CLAUDE.md` § PR workflow operations
+// the work, else for the follow-up Issue of their scope; those that share a
+// file, class, bucket, MUST flag, Issue, and authority are one root cause and
+// are verified once as a group. A finding a follow-up Issue already holds, and,
+// in a run that names the ledger of the earlier runs' recorded, dropped, and
+// contested findings (required in a delta run), a finding a reviewer flags as
+// already in it at a hunk unchanged since the run the entry names, is listed
+// and not counted. `.claude/CLAUDE.md` § PR workflow operations
 // says when the assistant runs this workflow, how it builds the ledger, and
 // what it does with the result.
 //
@@ -42,9 +43,9 @@
 //                files a rebase brought in.
 //   ledger       path of the ledger file `.claude/CLAUDE.md` § PR workflow
 //                operations builds; required in 'delta' mode and taken in
-//                every mode once one exists, so a full run after the PR's
-//                follow-up Issues exist lists what they hold. Reviewers read
-//                it with `jq`.
+//                every mode once one exists, so a full run after an earlier
+//                run dropped or contested findings lists them. Reviewers
+//                read it with `jq`.
 //   mode 'scope' stops after Scope and returns the shard plan and sample
 //                prompts (one agent); with `since` it scopes as delta would.
 
@@ -262,11 +263,12 @@ const FINDING_SCHEMA = {
             type: 'integer',
             description:
                 'The open Issue that already names this work, when one does (0 otherwise); ' +
-                'such a finding is recorded against that Issue, not fixed here. This pull ' +
-                'request\'s own follow-up Issues (title beginning `<scope>: defects found by ' +
-                'PR #<N>\'s review`) take nothing off its surface: a finding one already holds ' +
-                'is flagged `ledger` when a ledger is named, not placed on it ' +
-                '(docs/conventions.md § Branch and PR Workflow).',
+                'such a finding is recorded against that Issue, not fixed here. A follow-up ' +
+                'Issue (title `<scope>: defects found by review`, or the earlier `<scope>: ' +
+                'defects found by PR #<N>\'s review`) names findings, not work, and takes ' +
+                'nothing off the surface: set it only on a finding it already holds, which ' +
+                'the workflow lists and does not count (docs/conventions.md § Branch and PR ' +
+                'Workflow).',
         },
         authority: { type: 'string', description: 'Doc path and section, or contract location.' },
         claim: { type: 'string' },
@@ -544,21 +546,22 @@ const LENS_HEADER = [
 
 // Work an open Issue already names is off the surface of this PR; every
 // reviewer gets the list so it can set `issue` on such a finding.
-// This pull request's own follow-up Issues hold findings its earlier runs
-// recorded; they take nothing off its surface (docs/conventions.md § Branch
-// and PR Workflow), so a finding placed on one is kept where the surface puts it.
-const OWN_FOLLOW_UP = new RegExp("^[^:]+: defects found by PR #" + PR + "'s review")
-const own_follow_up = (n) => OWN_FOLLOW_UP.test(issue_title(n))
+// A follow-up Issue holds the findings earlier runs of any PR recorded in its
+// scope; it takes nothing off the surface (docs/conventions.md § Branch and PR
+// Workflow), and a finding placed on one is one it already holds: listed, not
+// counted. The second alternative matches the per-PR titles filed before the
+// rolling Issues.
+const FOLLOW_UP = /^[^:]+: defects found by (?:review|PR #\d+'s review)/
+const follow_up_issue = (n) => FOLLOW_UP.test(issue_title(n))
 
 const ISSUES_BLOCK = [
     'Open Issues (work one of them already names is off the review surface: set `issue` to ' +
         'its number on such a finding, reading the Issue body when its title matches the ' +
-        'area; 0 otherwise). An Issue whose title begins `<scope>: defects found by PR #' +
-        PR + '\'s review` is this pull request\'s own follow-up Issue: it takes nothing off ' +
-        'the surface, and a finding it already holds ' +
-        (LEDGER === null
-            ? 'is reported where the surface puts it:'
-            : 'is flagged `ledger` instead:'),
+        'area; 0 otherwise). An Issue titled `<scope>: defects found by review` (or, from ' +
+        'before the rolling Issues, `<scope>: defects found by PR #<N>\'s review`) is a ' +
+        'follow-up Issue: it names findings, not work, and takes nothing off the surface; ' +
+        'set `issue` to it only on a finding it already holds (read its body), which the ' +
+        'workflow lists and does not count:',
     bullets(scope.open_issues, (i) => '- #' + i.number + ' ' + i.title),
 ].join('\n')
 
@@ -966,15 +969,12 @@ function dedup(findings, source) {
     for (const f of findings) {
         f.file = normalize(f.file)
         // Work an open Issue already names is off the surface whatever its
-        // class; an Issue number that is not open, or this pull request's own
-        // follow-up Issue, is not a placement.
+        // class; an Issue number that is not open is not a placement, and a
+        // follow-up Issue is a ledger source: a finding it holds is listed,
+        // not counted.
         if (f.issue && !open_issue_numbers.has(f.issue)) {
             log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
                 ', not an open Issue; kept on the surface')
-            f.issue = 0
-        } else if (f.issue && own_follow_up(f.issue)) {
-            log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
-                ", this pull request's own follow-up Issue; kept where the surface puts it")
             f.issue = 0
         }
         // In a delta run a soft-class finding is on the surface only when the
@@ -984,6 +984,12 @@ function dedup(findings, source) {
             !soft_preexisting &&
             (f.in_bound || (ALWAYS_IN_BOUND.includes(f.class) && pr_files.has(f.file)))
         const in_bound = !f.issue && surface
+        if (f.issue && follow_up_issue(f.issue)) {
+            log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
+                ', a follow-up Issue that holds it; listed, not counted')
+            ledger_record(f, source, surface, surface)
+            continue
+        }
         if (LEDGER !== null && f.ledger === true) {
             ledger_record(f, source, in_bound, surface)
             continue
@@ -1162,8 +1168,8 @@ const groups = all.filter((f) => f.group.length > 0)
 const dropped = all.filter((f) => f.status === 'dropped')
 const surviving = all.filter((f) => f.status !== 'dropped')
 // Findings on the review surface are fixed; findings off it are recorded for
-// the open Issue that already names the work, else for the PR's follow-up Issue, and do
-// not count toward the verdict.
+// the open Issue that already names the work, else for the follow-up Issue of
+// their scope, and do not count toward the verdict.
 const findings = surviving.filter((f) => f.in_bound)
 const recorded = surviving.filter((f) => !f.in_bound)
 const count = (status) => findings.filter((f) => f.status === status).length
@@ -1298,7 +1304,8 @@ const SYNTH_PROMPT = [
         'one line per verifier vote with its ' +
         'lens, refuted flag, confidence, and evidence. The dropped section lists each dropped ' +
         'finding in one line with the refuting evidence. The ledger section lists each ' +
-        'ledgered finding in one line: `file:line` (bucket, class) claim. The audit section ' +
+        'ledgered finding in one line: `file:line` (bucket, class) claim, with `held by #N` ' +
+        'when its `issue` is set. The audit section ' +
         'lists each audit section with its verdict and items. Keep each entry to its fields; ' +
         'the full record is saved beside the report.',
     '',
@@ -1307,8 +1314,8 @@ const SYNTH_PROMPT = [
         '`## Dropped by verification`, `## Ledger (not re-raised)`, `## Audit`. The recorded ' +
         'section lists each off-surface ' +
         'finding with the same fields as the others, naming its `issue` when set; they are ' +
-        'appended to the open Issue that already names the work, else to the PR\'s follow-up ' +
-        'Issue, not ' +
+        'appended to the open Issue that already names the work, else to the follow-up ' +
+        'Issue of their scope, not ' +
         'fixed. Write `(none)` under an empty heading. Do not write verdict lines; the ' +
         'workflow appends them.',
     '',

@@ -102,6 +102,8 @@ milestone MUST be assigned, retroactively, the milestone that was current when i
 ### Commit and PR cross-references
 
 - Commit messages MAY reference Issues by `#N` where useful.
+- A commit or PR description that changes an Issue without closing it (ticking items on a
+  follow-up Issue it drains in part) references it via `Refs #N`, which auto-closes nothing.
 - Any commit or PR description that closes an Issue MUST reference it via `Fixes #N` /
   `Closes #N` so the merge auto-closes the Issue. Manual `gh issue close` after the fact is a
   procedural miss, not a substitute.
@@ -199,8 +201,8 @@ are forbidden; `master` MUST NOT receive force pushes.
   the rule it misread, or, when the maintainer finds it false on the facts,
   as a clarification of the code or document it misread; off the surface it
   is recorded, with the maintainer's answer, on the Issue that records it
-  (the open Issue that already names the work, else the PR's follow-up
-  Issue defined below), or, when it misread a rule, resolved by the
+  (the open Issue that already names the work, else the follow-up Issue of
+  its scope defined below), or, when it misread a rule, resolved by the
   clarification of that rule alone, which is its record. A finding MUST
   NOT be waived or ruled outside the standards. The reviewer verdict is
   `BLOCKING ISSUES` when a blocking finding is on the surface or a reviewer
@@ -238,37 +240,49 @@ are forbidden; `master` MUST NOT receive force pushes.
   that is not a MUST violation or is one anchored in a Markdown document:
   wording, wrapping, nits) is non-blocking: when the reviewer verdict is
   `BLOCKING ISSUES` it is fixed in the same batch, and after a
-  `NON-BLOCKING ISSUES ONLY` run it MUST be recorded on the PR's follow-up
-  Issue before the merge prompt. The PR's follow-up Issue for a file is the
-  open Issue whose title begins `<scope>: defects found by PR #N's review`,
-  where `<scope>` is the narrowest commit-title scope (§ Commit Messages)
-  that covers the file; it is filed with the maintainer's approval when the
-  first finding needs it, and it is where a finding off the surface is
-  recorded too when no open Issue already names the work. A finding is
-  recorded as a `- [ ]` task-list item under the Issue's `## Acceptance`
-  section, carrying file, line, authority, and fix. A recorded finding that
-  a later fix round fixes is ticked on that Issue in the same push, and an
-  Issue left with no open item is closed by the PR via `Fixes #N`. A later
-  run of the same PR, delta or full, MUST NOT re-raise a finding an earlier
-  run recorded, dropped, or the maintainer ruled on unless the hunk it
-  anchors to changed since the run that reported it; the workflow reads a
-  ledger built from the saved run records, each entry naming its run, and
-  a finding the ledger holds whose hunk is unchanged since that run is
-  listed, not counted. A finding off the surface MUST be recorded, not
-  fixed: the pre-merge review reports it as out of bound, and it is
-  appended, with file, line, authority, and fix, to the open Issue that
-  already names the work, else to the PR's follow-up Issue for its file,
+  `NON-BLOCKING ISSUES ONLY` run it MUST be recorded on the follow-up Issue
+  of its scope before the merge prompt. The follow-up Issue of a scope is
+  the one open Issue titled `<scope>: defects found by review`, where
+  `<scope>` is a commit-title scope (§ Commit Messages), the narrowest that
+  covers the file; every PR's findings in that scope append to it, and it is
+  filed, with the maintainer's approval and the current milestone
+  (§ Milestones), only when the scope has none open. It is where a finding
+  off the surface is recorded too when no open Issue already names the
+  work. A finding is recorded as a `- [ ]` task-list item under the Issue's
+  `## Acceptance` section, carrying file, line, authority, fix, and the PR
+  and head that reported it. A follow-up Issue is drained in batch, by a PR
+  that changes its scope for another reason or by a sweep PR that drains
+  several scopes' Issues; no merge requires a drain. A PR that fixes
+  recorded items ticks them on the Issue in the same push and references
+  the Issue with `Refs #N`; it closes the Issue with `Fixes #N` only when
+  the reviewer verdict of its last run is `READY TO MERGE` and no item is
+  left open. A finding such a PR's run leaves in the same scope is appended
+  to the Issue it drains, which stays open; a drain PR MUST NOT file a
+  successor. When a follow-up Issue accumulates items of one pattern a
+  script can decide (a wrapping or layout rule), the preferred drain is a
+  `cargo xtask lint-docs` rule for the pattern, whose landing ticks those
+  items. A later run of the same PR, delta or full, MUST NOT re-raise a
+  finding an earlier run recorded, dropped, or the maintainer ruled on
+  unless the hunk it anchors to changed since the run that reported it; the
+  workflow reads a ledger built from the saved run records, each entry
+  naming its run, and a finding the ledger holds whose hunk is unchanged
+  since that run is listed, not counted. A finding off the surface MUST be
+  recorded, not fixed: the pre-merge review reports it as out of bound, and
+  it is appended, with file, line, authority, and fix, to the open Issue
+  that already names the work, else to the follow-up Issue of its scope,
   before the merge prompt. No finding is dropped for being off the surface.
   Work an open Issue already names, filed with the maintainer's approval,
   is off the surface of every other PR; a finding on it is recorded against
-  that Issue. The PR's own follow-up Issues take nothing off its surface: a
-  finding one of them already holds is a ledger entry. A finding two
-  independent refuters refute on evidence is dropped and listed in the
-  report's Dropped section. The review verifies every finding that can
-  block and every Critical or Should finding, on or off the surface, except
-  a finding the ledger holds at a hunk unchanged since the run that
-  reported it, which is listed unverified; a nit that cannot block is fixed
-  or recorded unverified. Verified findings off the surface that share
+  that Issue. A follow-up Issue names findings, not work: it takes nothing
+  off any PR's surface, and a finding it already holds is, like a ledger
+  entry, listed and not counted by every run of any PR, and is not recorded
+  again. A finding two independent refuters refute on evidence is dropped
+  and listed in the report's Dropped section. The review verifies every
+  finding that can block and every Critical or Should finding, on or off
+  the surface, except a finding the ledger holds at a hunk unchanged since
+  the run that reported it or a follow-up Issue holds, which is listed
+  unverified; a nit that cannot block is fixed or recorded unverified.
+  Verified findings off the surface that share
   file, class, bucket, MUST flag, named Issue, and authority are one root
   cause: the first is verified and each of the others takes the group's
   verdict. Every other finding is fixed or recorded.

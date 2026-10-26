@@ -157,11 +157,12 @@ correctness, soundness, safety, or contract defect in a touched file is;
 in a delta run, a standards, doc-drift, coverage, or style finding only
 when the delta introduced it), the `issue` that names it when one does
 (the parent lists the open Issues; per `docs/conventions.md` § Branch and
-PR Workflow an Issue whose title begins `<scope>: defects found by PR
-#<N>'s review` for the PR under review is its own follow-up Issue and takes
-nothing off the surface, so a finding it already holds is flagged `ledger`
-when the parent names a ledger and otherwise reported where the surface
-puts it), the `authority`, the `claim`, the `evidence`, and the `fix`.
+PR Workflow an Issue titled `<scope>: defects found by review`, or by the
+earlier pattern `<scope>: defects found by PR #<N>'s review`, is a
+follow-up Issue, which names findings, not work: it takes nothing off the
+surface, and `issue` is set to it only on a finding it already holds,
+which the workflow lists and does not count), the `authority`, the
+`claim`, the `evidence`, and the `fix`.
 There is no final line in schema mode; the workflow computes the verdict
 from the entries.
 
@@ -172,9 +173,9 @@ a Markdown document, forces `BLOCKING ISSUES` (the blocking track of
 `docs/conventions.md` § Branch and PR Workflow); out-of-bound findings are
 listed, each naming the Issue that records it per `docs/conventions.md`
 § Branch and PR Workflow (the open Issue that already names the work, else
-the PR's follow-up Issue), and do not affect the line; the PR's own
-follow-up Issues take nothing off the surface, and a finding one of them
-or a ledger entry already states, at a hunk unchanged since the run that
+the follow-up Issue of its scope), and do not affect the line; a follow-up
+Issue takes nothing off the surface, and a finding one already holds, or a
+ledger entry already states at a hunk unchanged since the run that
 reported it, is listed under a `Ledger (not re-raised)` heading and does
 not affect the line either.
 

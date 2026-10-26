@@ -36,7 +36,13 @@ claims.
    either the diff delivers the criterion, or the issue was edited to
    drop the criterion with a one-line rationale. Report per-criterion as
    one of: `delivered` (cite `path:line` evidence), `dropped` (cite the
-   rationale text), or `not delivered, no rationale` (FAIL).
+   rationale text), or `not delivered, no rationale` (FAIL). A `Refs #N`
+   is not a closure and is not audited for delivery. A `Fixes #N` on a
+   follow-up Issue (title `<scope>: defects found by review`) is valid
+   only under the closing condition of `docs/conventions.md` § Branch and
+   PR Workflow (no item left open); a drain that leaves items open MUST
+   say `Refs #N` instead. Report a `Fixes` on such an Issue with open
+   items as FAIL.
 
 6. Silent-deferral scan. The target notification is *intent to defer
    mechanically-reachable work this PR should have covered*, not in-code
@@ -51,11 +57,11 @@ claims.
      `will come later`. Do **not** flag bare `TODO` tokens in the diff.
    Per the Completeness rule in `.claude/CLAUDE.md`, blocking work on the
    review surface cannot be deferred, and a non-blocking surface finding
-   is recorded on the PR's follow-up Issue only as `docs/conventions.md`
-   § Branch and PR Workflow allows; surface every hit matching the
-   criteria above. A hit is reconciled when the same text names the Issue
-   filed for the deferral under the Completeness rule (the follow-up Issue
-   for a recorded non-blocking finding), or when it is not a deferral of
+   is recorded on the follow-up Issue of its scope only as
+   `docs/conventions.md` § Branch and PR Workflow allows; surface every
+   hit matching the criteria above. A hit is reconciled when the same text
+   names the Issue filed for the deferral under the Completeness rule (the
+   scope's follow-up Issue for a recorded non-blocking finding), or when it is not a deferral of
    this PR's work (a rule's wording, a quotation, a description of past
    work).
 

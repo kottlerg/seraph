@@ -290,9 +290,8 @@ stated explicitly.
    (`save_and_disable_interrupts` → `enable`); the local CPU MUST be
    able to service incoming flush / TLB-shootdown IPIs during the
    spin or it deadlocks against a peer CPU sending an IPI to it
-   (observed locally and on `ubuntu-latest` CI). Preemption is
-   disabled so a timer tick mid-spin cannot reschedule the dealloc
-   caller off this CPU.
+   (observed locally and on CI). Preemption is disabled so a timer
+   tick mid-spin cannot reschedule the dealloc caller off this CPU.
 10. If a server_reply_wake was prepared in step 5, null the claimed client's
     blocked_on_object under the client's sched_lock, recompute the target CPU
     via select_target_cpu_excluding(bound, Some(this_cpu)) — excluding THIS

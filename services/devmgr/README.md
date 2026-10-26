@@ -13,6 +13,10 @@ devmgr/
 ├── README.md
 ├── src/
 │   ├── main.rs                     # Bootstrap, registry service loop, QUERY_* handlers
+│   ├── arch/                       # Arch-dispatch surface: platform-default ECAM
+│   │   ├── mod.rs                  # `arch::current` re-export (the cfg(target_arch) site)
+│   │   ├── x86_64/mod.rs           # No platform default; returns None
+│   │   └── riscv64/mod.rs          # QEMU virt ECAM window
 │   ├── caps.rs                     # Capability absorbers and device-info catalog
 │   ├── firmware/                   # ACPI / DTB parsing helpers
 │   ├── pci.rs                      # PCI ECAM enumeration + BAR splitting

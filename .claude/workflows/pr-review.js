@@ -245,7 +245,7 @@ const FINDING_SCHEMA = {
             description:
                 'An entry of the ledger the prompt names already states this finding, and the ' +
                 'hunk it anchors to is unchanged since the run the entry names (false when no ' +
-                'ledger was named or that hunk changed).',
+                'ledger was named, that hunk changed, or that run does not resolve in the clone).',
         },
         in_bound: {
             type: 'boolean',
@@ -594,10 +594,11 @@ const ledger_note = (paths) =>
                     paths.map((p) => '.file == "' + p + '"').join(' or ') + ')\' ' + LEDGER +
                     '`. '
                 : 'Read the entries for the files you report on. ') +
-            'Do not re-raise a finding an entry already states unless the hunk it anchors to ' +
-            'changed since the run the entry names (its `run` field; `git diff <run> <head> -- ' +
-            '<file>` shows the change): set `ledger` true on a finding an entry states at a ' +
-            'hunk unchanged since that run, and false on one in a hunk that changed.'
+            'Report a finding an entry already states with `ledger` true when the hunk it ' +
+            'anchors to is unchanged since the run the entry names (its `run` field; `git diff ' +
+            '<run> <head> -- <file>` shows the change); the workflow lists it and does not ' +
+            'count it. Report it with `ledger` false when that hunk changed, or when `<run>` ' +
+            'does not resolve in the clone.'
 
 function shard_prompt(shard) {
     const paths = new Set(shard.files.map((f) => f.path))
@@ -830,10 +831,10 @@ const seen = []
 // reporter names on it is final whichever reporter arrived first.
 // A finding flagged as already in the ledger (an entry states it at a hunk
 // unchanged since the run the entry names) becomes a `ledgered` record, or
-// joins the ledgered
-// record at its anchor: listed, never verified or counted, and never a target
-// for other reports, so a report without the flag at the same anchor is a
-// record of its own. An off-surface record that shares file, class, bucket,
+// joins the ledgered record at its anchor: listed, never verified or counted,
+// and never a target for other reports, so a report without the flag at the
+// same anchor is a record of its own. An off-surface record that shares file,
+// class, bucket,
 // MUST flag, Issue, and authority with an earlier off-surface record is the
 // same root cause: it joins that record's group and takes the group's verdict
 // instead of its own verification.

@@ -257,16 +257,16 @@ are forbidden; `master` MUST NOT receive force pushes.
   Work an open Issue already names, filed with the maintainer's approval,
   is off the surface of every other PR; a finding on it is recorded against
   that Issue. The PR's own follow-up Issues take nothing off its surface: a
-  finding one of them already holds is a ledger entry.
-  A finding two independent refuters refute on evidence is dropped and listed
-  in the report's Dropped section. The review verifies every finding that
-  can block and every Critical or Should finding, on or off the surface,
-  except a finding the ledger holds, which is listed unverified; a nit that
-  cannot block is fixed or recorded unverified. Verified findings off the
-  surface that share file, class, bucket, MUST flag, named Issue, and
-  authority are one root cause: the first is verified and each of the
-  others takes the group's verdict. Every other finding is fixed or
-  recorded.
+  finding one of them already holds is a ledger entry. A finding two
+  independent refuters refute on evidence is dropped and listed in the
+  report's Dropped section. The review verifies every finding that can
+  block and every Critical or Should finding, on or off the surface, except
+  a finding the ledger holds at a hunk unchanged since the run that
+  reported it, which is listed unverified; a nit that cannot block is fixed
+  or recorded unverified. Verified findings off the surface that share
+  file, class, bucket, MUST flag, named Issue, and authority are one root
+  cause: the first is verified and each of the others takes the group's
+  verdict. Every other finding is fixed or recorded.
 
 ### Branch naming
 

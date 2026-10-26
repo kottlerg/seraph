@@ -44,7 +44,8 @@ discipline below has been applied end-to-end.
     when the hunk it anchors to is unchanged since the run the entry names
     (its `run` field; `git diff <run> <head> -- <file>` shows the change);
     the workflow lists such a finding and does not count it. When that hunk
-    changed, report the finding with `ledger` false, as a fresh finding.
+    changed, or `<run>` does not resolve in the clone, report the finding
+    with `ledger` false, as a fresh finding.
 
     A lens prompt (call sites, design documents, cross-boundary surfaces,
     regression) names one concern over the whole diff instead of shard
@@ -149,7 +150,7 @@ test; `style`: readability and naming), whether the diff `introduced` it
 (in `delta` mode, whether the delta did), whether it is a `must_violation`
 of a binding standard, whether a `ledger` entry the parent supplied
 already states it at a hunk unchanged since the run the entry names (its
-`run` field), whether it is
+`run` field; false when that run does not resolve), whether it is
 `in_bound` (on the review surface `docs/conventions.md` § Branch and PR
 Workflow defines, judged as if no open Issue named the work; a
 correctness, soundness, safety, or contract defect in a touched file is;

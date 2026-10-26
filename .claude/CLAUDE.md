@@ -82,12 +82,11 @@ truth for "how work is tracked and shipped" on this project.
   --limit 500 --json number,title`), the ledger path once one exists, and,
   for a delta run, the `since` head; save the reviewer's findings
   (status `unverified`, since no refuter judged them, or `nit` for a nit
-  that cannot block), the recorded and dropped ones, the ones its
-  `Ledger (not re-raised)` heading lists (ledger-flagged or held by a
-  follow-up Issue) as `ledgered`, the `verdict`, and the head as
-  `stats.head`, as `<mode>-<head>.json` in the workflow's shape, so the
-  ledger command reads a fallback run too, and apply the same verdict
-  handling.
+  that cannot block), the recorded and dropped ones, the ledger-flagged
+  ones its `Ledger (not re-raised)` heading lists as `ledgered`, the
+  `verdict`, and the head as `stats.head`, as `<mode>-<head>.json` in the
+  workflow's shape, so the ledger command reads a fallback run too, and
+  apply the same verdict handling.
 
   Before each run after the first (every `delta` run, and a `full` run
   once a record exists), build the ledger that section names from every
@@ -120,14 +119,15 @@ truth for "how work is tracked and shipped" on this project.
   the user's approval as `gh issue create --milestone <current> --label
   <subsystem> --label <class>`, the current milestone being the one
   [docs/conventions.md](../docs/conventions.md) § Milestones defines and
-  the labels the ones its § Labels requires. A PR that fixes items on a
-  follow-up Issue ticks each there with `(fixed by PR #<M>)`, copies
-  those items, ticked, into its body's `## Acceptance`, and carries
-  `Refs #N` in its body, and `Fixes #N` only under that section's closing
-  condition. Before each run, an Issue the PR closes (by its body or a
-  commit) that carries no milestone gets the current one
-  (`gh issue edit <N> --milestone <current>`), which the audit checks.
-  `AUDIT FAIL` items via `gh pr edit`, `gh issue edit`, or commits; a contested
+  the labels the ones its § Labels requires. A finding the Issue already
+  holds is not appended again. A PR that fixes items on a follow-up Issue
+  ticks each there with `(fixed by PR #<M>)`, copies those items, ticked,
+  into its body's `## Acceptance`, and carries `Refs #N` in its body, and
+  `Fixes #N` only under that section's closing condition. Before each
+  run, an Issue the PR closes (by its body or a commit) that carries no
+  milestone gets the current one (`gh issue edit <N> --milestone
+  <current>`), which the audit checks. `AUDIT FAIL` items via
+  `gh pr edit`, `gh issue edit`, or commits; a contested
   finding put to the user and resolved as the section says. Before
   pushing a fix, for every fact it changes (a symbol, a constant, a rule
   sentence, a state or section name) walk the `## Summarized By` lists

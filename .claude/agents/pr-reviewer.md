@@ -162,10 +162,10 @@ when the delta introduced it), the `issue` that names it when one does
 PR Workflow an Issue whose title is `<scope>: defects found by review`,
 or begins with the earlier `<scope>: defects found by PR #<N>'s review`, is a
 follow-up Issue, which names findings, not work: it takes nothing off the
-surface, and `issue` is set to it only on a finding it already holds; the
-workflow lists and does not count such a finding unless it is on the
-blocking track and on the surface, where it stays), the `authority`, the
-`claim`, the `evidence`, and the `fix`.
+surface, so `issue` is never set to it, and a finding it already holds is
+flagged `ledger` when an earlier run of this PR recorded it and the parent
+names a ledger, and otherwise reported where the surface puts it), the
+`authority`, the `claim`, the `evidence`, and the `fix`.
 There is no final line in schema mode; the workflow computes the verdict
 from the entries.
 
@@ -177,13 +177,11 @@ a Markdown document, forces `BLOCKING ISSUES` (the blocking track of
 listed, each naming the Issue that records it per `docs/conventions.md`
 § Branch and PR Workflow (the open Issue that already names the work, else
 the follow-up Issue of its scope), and do not affect the line. A
-follow-up Issue takes nothing off the surface. A finding one already
-holds, other than one on the blocking track that the surface definition
-places on the surface (which stays there), and a finding a ledger entry
-already states at a hunk unchanged since the run the entry names, when
-that run resolves in the clone, are listed under a
-`Ledger (not re-raised)` heading, are not recorded again, and do not
-affect the line either.
+follow-up Issue takes nothing off the surface: a finding one already holds
+is reported where the surface puts it. A finding a ledger entry already
+states at a hunk unchanged since the run the entry names, when that run
+resolves in the clone, is listed under a `Ledger (not re-raised)` heading
+and does not affect the line either.
 
 ## Tool discipline
 

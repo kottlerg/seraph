@@ -286,7 +286,7 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     // pins against QEMU default drift). RVA23 also mandates Zfa, Zfhmin,
     // Zihintntl, Zicond, Zimop, Zcmop, Zcb, Zvfhmin, Zvbb, Zvkt, Zkt — those
     // land as QEMU coverage broadens. Which QEMU versions this string targets,
-    // and the `-cpu rva23s64` alternative, are specified in
+    // and why the named `-cpu rva23s64` model is not used, are specified in
     // docs/build-system.md § QEMU and Firmware.
     //
     // The trailing satp-mode properties (`RiscvMmu::cpu_satp_props`) pin the

@@ -61,8 +61,8 @@ jobs:
     # match the version they encode.
     if: startsWith(github.ref, 'refs/tags/v')
     needs: preflight
-    # Pinned: `qemu-system-riscv` is a package of the 26.04 archive, so the image
-    # and the install list below move together.
+    # Pinned with the install list below; see docs/build-system.md
+    # § Continuous Integration.
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false

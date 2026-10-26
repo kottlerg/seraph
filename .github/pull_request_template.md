@@ -2,11 +2,13 @@
 <one to three sentences: what changed and why>
 
 Closes #<issue>
-<!-- For a follow-up Issue this PR drains in part, write `Refs #<issue>` instead and tick each
-fixed item with `(fixed by PR #<this PR>)` (docs/conventions.md § Branch and PR Workflow). -->
+<!-- For a follow-up Issue this PR drains in part, write `Refs #<issue>` instead, tick each
+fixed item on the Issue with `(fixed by PR #<this PR>)`, and copy only those items below
+(docs/conventions.md § Branch and PR Workflow). -->
 
 ## Acceptance
-<copy the Acceptance section of the linked Issue verbatim; tick items completed by this PR>
+<copy the Acceptance section of the linked Issue verbatim (for a follow-up Issue drained in part,
+only the items this PR fixes); tick items completed by this PR>
 - [ ]
 
 ## Test plan

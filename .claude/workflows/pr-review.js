@@ -41,8 +41,9 @@
 //                file); the design-docs lenses read only the documents that
 //                state facts the delta changed. `since` must resolve in this
 //                clone; it need not be an ancestor of the head, so an amended
-//                or rebased branch still works, at the cost of over-including
-//                files a rebase brought in.
+//                or rebased branch still works. Only files the PR diff also
+//                touches are reviewed, so files a merge or rebase of the base
+//                brought in are not.
 //   ledger       path of the ledger file `.claude/CLAUDE.md` § PR workflow
 //                operations builds; required in 'delta' mode and taken in
 //                every mode once one exists, so a full run after an earlier
@@ -266,8 +267,9 @@ const FINDING_SCHEMA = {
             description:
                 'The open Issue that already names this work, when one does (0 otherwise); ' +
                 'such a finding is recorded against that Issue, not fixed here. A follow-up ' +
-                'Issue (title `<scope>: defects found by review`, or the earlier `<scope>: ' +
-                'defects found by PR #<N>\'s review`) names findings, not work, and takes ' +
+                'Issue (title `<scope>: defects found by review`, or one beginning with the ' +
+                'earlier `<scope>: defects found by PR #<N>\'s review`) names findings, not ' +
+                'work, and takes ' +
                 'nothing off the surface: set it only on a finding it already holds, which ' +
                 'the workflow lists and does not count unless it is on the blocking track and ' +
                 'on this pull request\'s surface (docs/conventions.md § Branch and PR Workflow).',
@@ -423,7 +425,10 @@ const SCOPE_PROMPT = [
         (DELTA ? 'whether ' + SINCE + ' resolves to a commit.' : 'true (no `since` given).'),
     '- pr_has_code: whether the whole PR diff changes a file of kind code.',
     '- files: one entry per file in ' +
-        (DELTA ? 'the tree diff ' + DELTA_RANGE : 'the PR diff') +
+        (DELTA
+            ? 'the tree diff ' + DELTA_RANGE + ' that the whole PR diff also touches (a file ' +
+                'only a merge or rebase of the base branch changed is not listed)'
+            : 'the PR diff') +
         ', with path; changed = added plus deleted lines; kind = code (Rust, assembly, ' +
         'linker scripts, build inputs, anything a build embeds), markdown, comment-only (only ' +
         'comment lines changed), rules (`.claude/` and `.github/`), or other.',
@@ -501,6 +506,9 @@ const issue_title = (n) => (scope.open_issues.find((i) => i.number === n) || {})
 if (DELTA && MODE !== 'scope' && pr_files.size === 0) {
     return { error: 'scope returned no pr_files; the in-bound gate cannot be applied' }
 }
+// A delta reviews only the PR's own files: one a merge or rebase of the base
+// branch changed between `since` and the head is master's, not this PR's.
+if (DELTA && pr_files.size > 0) scope.files = scope.files.filter((f) => pr_files.has(f.path))
 for (const i of scope.changed_items) i.file = normalize(i.file)
 for (const c of scope.claimed_fixes) c.file = normalize(c.file)
 scope.design_docs = scope.design_docs.map(normalize)
@@ -562,8 +570,7 @@ const ISSUES_BLOCK = [
         'its number on such a finding, reading the Issue body when its title matches the ' +
         'area; 0 otherwise). An Issue whose title is `<scope>: defects found by review` (or, ' +
         'from before the rolling Issues, begins `<scope>: defects found by PR #<N>\'s review`) ' +
-        'is a ' +
-        'follow-up Issue: it names findings, not work, and takes nothing off the surface; ' +
+        'is a follow-up Issue: it names findings, not work, and takes nothing off the surface; ' +
         'set `issue` to it only on a finding it already holds (read its body), which the ' +
         'workflow lists and does not count unless it is on the blocking track and on this ' +
         'pull request\'s surface:',
@@ -908,8 +915,7 @@ function note_holder(record, f) {
     record.held_by = f.held_by
     record.holder_noted = true
     record.annotations.push('#' + f.held_by + ' is a follow-up Issue that holds this ' +
-        'finding; on the blocking track and this pull request\'s surface, it is fixed here ' +
-        'and its item ticked')
+        'finding; when it is fixed here, its item on #' + f.held_by + ' is ticked')
 }
 
 function reconcile(dup, f, source, in_bound, surface) {
@@ -1015,7 +1021,34 @@ function dedup(findings, source) {
             } else {
                 log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
                     ', a follow-up Issue that holds it; listed, not counted')
+                // An earlier report of the same finding that named no holder
+                // joins the ledger with it, unless its verification began.
+                const unflagged = nearest(seen.filter((s) => s.status !== 'ledgered'), f, source)
+                if (unflagged && !unflagged.verify_started && !unflagged.group_lead &&
+                    unflagged.group.length === 0) {
+                    unflagged.status = 'ledgered'
+                    unflagged.issue = f.issue
+                    unflagged.issue_source = source
+                    unflagged.in_bound = false
+                    ledgered.push(unflagged)
+                    absorb(unflagged, f, source)
+                    continue
+                }
+                if (unflagged) {
+                    unflagged.annotations.push(source + ' reports #' + f.issue + ', a follow-up ' +
+                        'Issue, holds this finding; it is not recorded again')
+                }
                 ledger_record(f, source, surface, surface)
+                continue
+            }
+        }
+        // A later report of a finding a follow-up Issue already holds joins
+        // that ledgered record, whether or not it names the holder.
+        if (!f.issue && !(blocks(f) && surface)) {
+            const held = nearest(
+                ledgered.filter((s) => s.issue && follow_up_issue(s.issue)), f, source)
+            if (held) {
+                absorb(held, f, source)
                 continue
             }
         }
@@ -1054,6 +1087,9 @@ function dedup(findings, source) {
 // lead's verification and copies the verdict; the lead's promise is created on
 // first demand, so a member reported before the lead's own turn still gets it.
 function verify_one(f) {
+    // A record a later report moved to the ledger is listed there, not verified
+    // or counted among its shard's findings.
+    if (f.status === 'ledgered') return Promise.resolve(null)
     if (!verifiable(f)) {
         f.status = 'nit'
         return Promise.resolve(f)

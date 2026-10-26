@@ -5,8 +5,8 @@ title: ''
 labels: bug
 ---
 
-<!-- Set the milestone to the current one, the lowest-versioned open milestone
-(docs/conventions.md § Milestones). -->
+<!-- Set the milestone: the current one (the lowest-versioned open milestone) or the later
+release this defect is planned for (docs/conventions.md § Milestones). -->
 
 ## Summary
 

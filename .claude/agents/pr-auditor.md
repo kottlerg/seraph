@@ -43,9 +43,11 @@ claims.
    `Refs #N` is not a closure; for a `Refs #N` naming a follow-up Issue
    (title `<scope>: defects found by review`, or one beginning with the
    earlier `<scope>: defects found by PR #<N>'s review`), audit every
-   `- [x]` item whose tick names this PR (`(fixed by PR #<this PR>)`) for
-   `path:line` delivery evidence as for a closure, and report such an
-   item the diff does not deliver as FAIL.
+   item the PR body's `## Acceptance` copies from it for `path:line`
+   delivery evidence as for a closure; report as FAIL such an item the
+   diff does not deliver, one not ticked on the Issue with
+   `(fixed by PR #<this PR>)`, and an item ticked on the Issue with that
+   marker that the PR body does not copy.
    A `Fixes #N` on a follow-up Issue is valid only under the closing
    condition of `docs/conventions.md` § Branch and PR Workflow: no item
    left open once the findings of the PR's last run are recorded; a drain

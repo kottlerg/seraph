@@ -174,13 +174,14 @@ a Markdown document, forces `BLOCKING ISSUES` (the blocking track of
 `docs/conventions.md` § Branch and PR Workflow); out-of-bound findings are
 listed, each naming the Issue that records it per `docs/conventions.md`
 § Branch and PR Workflow (the open Issue that already names the work, else
-the follow-up Issue of its scope), and do not affect the line; a follow-up
-Issue takes nothing off the surface, and a non-blocking finding one
-already holds, or a ledger entry already states at a hunk unchanged since
-the run the entry names, when that run resolves in the clone, is listed
-under a `Ledger (not re-raised)` heading and does not affect the line
-either; a finding on the blocking track that a follow-up Issue holds
-stays on the surface when the surface definition places it there.
+the follow-up Issue of its scope), and do not affect the line. A
+follow-up Issue takes nothing off the surface. A finding one already
+holds, other than one on the blocking track that the surface definition
+places on the surface (which stays there), and a finding a ledger entry
+already states at a hunk unchanged since the run the entry names, when
+that run resolves in the clone, are listed under a
+`Ledger (not re-raised)` heading, are not recorded again, and do not
+affect the line either.
 
 ## Tool discipline
 

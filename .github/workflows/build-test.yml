@@ -63,6 +63,7 @@ jobs:
           sudo apt-get install -y \
             qemu-system-x86 \
             qemu-system-misc \
+            qemu-system-riscv \
             ovmf \
             qemu-efi-riscv64
 
@@ -72,8 +73,8 @@ jobs:
         # works on every supported version; `-cpu rva23s64` becomes usable
         # at QEMU ≥ 9.1 and is the preferred form once CI runners ship it.
         run: |
-          qemu-system-x86_64 --version | head -n1
-          qemu-system-riscv64 --version | head -n1
+          qemu-system-x86_64 --version
+          qemu-system-riscv64 --version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master

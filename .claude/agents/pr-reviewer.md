@@ -31,9 +31,10 @@ discipline below has been applied end-to-end.
     the shard, and blast-radius reads (step 5) go wherever the callers are.
     In `delta` mode the files are those changed since `since` that the
     whole PR diff also touches (a file only a merge or rebase of the base
-    branch changed is not reviewed); verify each
-    claimed fix for your files against the code, and report: every claimed
-    fix not actually made; every finding in the changed hunks; any
+    branch changed is not reviewed, and a changed hunk the PR diff does not
+    show came from the base and is not one the delta introduced); verify
+    each claimed fix for your files against the code, and report: every
+    claimed fix not actually made; every finding in the changed hunks; any
     correctness, soundness, safety, or contract defect anywhere in the
     file. Per `docs/conventions.md` § Branch and PR Workflow, a standards,
     doc-drift, coverage, or style finding the delta did not introduce is out

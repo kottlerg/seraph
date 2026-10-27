@@ -92,12 +92,15 @@ fn svcmgr_publish_gate_phase(_caps: &Caps)
     std::os::seraph::log!("svcmgr publish-gate phase passed (UNAUTHORIZED reply)");
 }
 
-/// The SEND svcmgr publishes under `svcmgr` must carry a badge with no
-/// verb-bit. Already badged, it cannot be re-badged, so a consumer cannot
-/// mint `HANDOVER_AUTHORITY` from it: the kernel refuses a re-badge of a
-/// badged source with `InvalidArgument`. Free of `PUBLISH_AUTHORITY`, it
-/// fails the publish gate: a nameful, capless `PUBLISH_ENDPOINT` through it
-/// replies `UNAUTHORIZED`, where the bit would reach the cap check.
+/// The SEND svcmgr publishes under `svcmgr` must be badged and lack
+/// `PUBLISH_AUTHORITY`. Already badged, it cannot be re-badged, so a
+/// consumer cannot mint `HANDOVER_AUTHORITY` from it: the kernel refuses a
+/// re-badge of a badged source with `InvalidArgument`. Lacking
+/// `PUBLISH_AUTHORITY`, it fails the publish gate: a nameful, capless
+/// `PUBLISH_ENDPOINT` through it replies `UNAUTHORIZED`, where the bit would
+/// reach the cap check. Whether the badge carries `HANDOVER_AUTHORITY` is
+/// not observable after the handover; a compile-time assertion beside
+/// `ipc::svcmgr_labels::PUBLISHED_SEND_BADGE` keeps every verb-bit out of it.
 fn svcmgr_published_send_badged_phase(_caps: &Caps)
 {
     let (registry_cap, ipc_buf) = registry_cap_and_buf("svcmgr_published_send_badged");
@@ -151,5 +154,5 @@ fn svcmgr_published_send_badged_phase(_caps: &Caps)
         ipc::svcmgr_errors::UNAUTHORIZED,
         "PUBLISH_ENDPOINT through the published svcmgr SEND must reply UNAUTHORIZED (got {publish_label:#x})"
     );
-    std::os::seraph::log!("svcmgr published-send phase passed (badged, no verb-bit)");
+    std::os::seraph::log!("svcmgr published-send phase passed (badged, no PUBLISH_AUTHORITY)");
 }

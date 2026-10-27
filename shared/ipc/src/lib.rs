@@ -804,6 +804,7 @@ pub mod svcmgr_labels
     /// `QUERY_ENDPOINT` through it but cannot re-badge it to mint
     /// [`HANDOVER_AUTHORITY`] or [`PUBLISH_AUTHORITY`].
     pub const PUBLISHED_SEND_BADGE: u64 = 1;
+    const _: () = core::assert!(PUBLISHED_SEND_BADGE & crate::VERB_BIT_MASK == 0);
     /// Publish a named endpoint into the discovery registry.
     ///
     /// Label bits 16..31 carry `name_len`; data words from 0 carry the name

@@ -141,8 +141,9 @@ pub fn copy(ctx: &TestContext) -> TestResult
 
 /// `cap_insert` places a copy at a caller-chosen slot index in another `CSpace`.
 ///
-/// Like `cap_copy` but the destination slot is explicit. We verify the source
-/// is unaffected (insert is a copy, not a move).
+/// Like `cap_copy` but the destination slot is explicit. We verify the returned
+/// handle names the requested slot and the source is unaffected (insert is a
+/// copy, not a move).
 pub fn insert(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
@@ -150,8 +151,13 @@ pub fn insert(ctx: &TestContext) -> TestResult
     let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "create_cspace for insert test failed")?;
 
-    // Insert at slot 5 in dest_cs.
-    cap_insert(sig, dest_cs, 5, syscall::RIGHTS_ALL).map_err(|_| "cap_insert failed")?;
+    // Insert at slot 5 in dest_cs; the returned handle names that slot.
+    let handle =
+        cap_insert(sig, dest_cs, 5, syscall::RIGHTS_ALL).map_err(|_| "cap_insert failed")?;
+    if syscall_abi::cap_handle_index(handle) != 5
+    {
+        return Err("cap_insert handle does not name the requested slot");
+    }
 
     // Source slot is preserved (insert = copy, not move).
     notification_send(sig, 0x1)

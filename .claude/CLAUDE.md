@@ -80,7 +80,9 @@ truth for "how work is tracked and shipped" on this project.
   directly in parallel (single message, two `Agent` tool calls) with the
   PR number as scope, the open Issue list (`gh issue list --state open
   --limit 500 --json number,title`), the ledger path once one exists, and,
-  for a delta run, the `since` head; save the reviewer's findings
+  for a delta run, the `since` head and the merge bases at `since` and at
+  the head (`git merge-base <sha> origin/master` for each); save the
+  reviewer's findings
   (status `unverified`, since no refuter judged them, or `nit` for a nit
   that cannot block), the recorded and dropped ones, the ledger-flagged
   ones its `Ledger (not re-raised)` heading lists as `ledgered`, the

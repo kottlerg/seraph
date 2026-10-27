@@ -437,8 +437,7 @@ const SCOPE_PROMPT = [
             : ''),
     '',
     'Return, per the schema, with every path repository-relative exactly as git prints it:',
-    '- head: the PR head SHA; base: the merge base of the head and the base branch; ' +
-        'since_base: ' +
+    '- head: the PR head SHA; base: the merge base of the head and the base branch; since_base: ' +
         (DELTA ? 'the merge base of ' + SINCE + ' and the base branch.' : 'an empty string.'),
     '- repo_root: the absolute path of the working tree root.',
     '- tree_at_head: whether HEAD is the PR head and the tree is clean.',

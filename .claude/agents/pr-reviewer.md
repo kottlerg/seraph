@@ -33,13 +33,15 @@ discipline below has been applied end-to-end.
     whole PR diff also touches (a file only a merge or rebase of the base
     branch changed is not reviewed). A changed hunk is the base's only when
     it also appears in the diff between the merge bases at `since` and at
-    the head, which the parent names; with equal merge bases every changed
-    hunk is the PR's. A standards, doc-drift, coverage, or style finding in
-    a base hunk is not one the delta introduced; a correctness, safety, or
-    contract defect in one stays in bound. Verify each claimed fix for your
-    files against the code, and report: every claimed fix not actually
-    made; every finding in the changed hunks; any correctness, soundness,
-    safety, or contract defect anywhere in the file. Per
+    the head, which the parent names (when it does not, compute each as
+    `git merge-base <sha> origin/<base branch>`); with equal merge bases
+    every changed hunk is the PR's. A standards, doc-drift, coverage, or
+    style finding in a base hunk is not one the delta introduced; a
+    correctness, safety, or contract defect in one stays in bound. Verify
+    each claimed fix for your files against the code, and report: every
+    claimed fix not actually made; every finding in the changed hunks; any
+    correctness, soundness, safety, or contract defect anywhere in the
+    file. Per
     `docs/conventions.md` § Branch and PR Workflow, a standards,
     doc-drift, coverage, or style finding the delta did not introduce is out
     of bound; a statement the delta made stale, or a test the delta's new

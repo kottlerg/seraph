@@ -37,9 +37,13 @@ jobs:
       - name: cargo xtask test
         run: cargo xtask test
 
+  qemu-debs:
+    uses: ./.github/workflows/qemu-debs.yml
+
   validate:
-    # Pinned with the install list below; see docs/build-system.md
+    # Pinned with the qemu-debs job's image; see docs/build-system.md
     # § Continuous Integration.
+    needs: qemu-debs
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
@@ -59,14 +63,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Restore QEMU and firmware packages
+        uses: actions/cache/restore@v6
+        with:
+          path: qemu-debs
+          key: ${{ needs.qemu-debs.outputs.key }}
+
       - name: Install QEMU and firmware
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            qemu-system-x86 \
-            qemu-system-riscv \
-            ovmf \
-            qemu-efi-riscv64
+        # See docs/build-system.md § Continuous Integration.
+        run: .github/scripts/qemu-packages.sh install qemu-debs
 
       - name: Log QEMU versions
         # A missing binary fails here rather than at the first boot. The

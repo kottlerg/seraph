@@ -55,8 +55,9 @@ Five documentation scopes exist:
 - `.claude/` holds the assistant's operating instructions; its files are outside this
   hierarchy and are neither authoritative documents nor summaries. A restatement of a rule
   in them MUST name the document that owns it.
-- `.github/` holds CI workflows and the Issue and PR templates; its Markdown files are
-  outside this hierarchy and are neither authoritative documents nor summaries.
+- `.github/` holds CI workflows, their scripts, and the Issue and PR templates; its
+  Markdown files are outside this hierarchy and are neither authoritative documents nor
+  summaries.
 
 ---
 

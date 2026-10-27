@@ -578,7 +578,8 @@ pub fn lfn_checksum(name: &[u8; 11]) -> u8
 /// Parse a single 32-byte FAT directory entry.
 ///
 /// Returns `None` for end-of-directory (`0x00`), deleted (`0xE5`),
-/// volume-label, and LFN entries (`attr=0x0F`). The returned
+/// LFN (`attr=0x0F`), and volume-label (`ATTR_VOLUME_ID`, attr bit `0x08`)
+/// entries. The returned
 /// [`DirEntry`] carries `lfn_len = 0`; callers that have accumulated
 /// an LFN run via [`LfnAccum`] populate `lfn` / `lfn_len` themselves.
 #[must_use]
@@ -592,7 +593,7 @@ pub fn parse_dir_entry(raw: &[u8]) -> Option<DirEntry>
     {
         return None;
     }
-    if raw[11] == 0x0F
+    if raw[11] == 0x0F || raw[11] & 0x08 != 0
     {
         return None;
     }
@@ -720,7 +721,8 @@ pub enum RemoveStep
     /// alias; [`RemoveRunScan::run`] lists every slot it occupies.
     Found
     {
-        cluster: u32
+        /// First cluster of the matched entry ([`DirEntry::cluster`]).
+        cluster: u32,
     },
 }
 
@@ -744,6 +746,7 @@ pub struct RemoveRunScan<L>
 
 impl<L: Copy + Default> RemoveRunScan<L>
 {
+    /// An empty scan: no LFN run accumulated, no slot positions recorded.
     #[must_use]
     pub fn new() -> Self
     {
@@ -762,13 +765,25 @@ impl<L: Copy + Default> RemoveRunScan<L>
 
     /// Every slot the entry the last [`RemoveStep::Found`] reported
     /// occupies: its LFN slots in on-disk order, then the 8.3 slot.
+    /// Meaningful only after [`Self::step`] returns `Found`.
     #[must_use]
     pub fn run(&self) -> &[L]
     {
         &self.slots[..self.len]
     }
 
-    /// Feed the 32-byte slot `raw`, found at `loc`, to the scan for `name`.
+    /// Feed the directory slot `raw`, found at `loc`, to the scan for the
+    /// path component `name`.
+    ///
+    /// Returns [`RemoveStep::EndOfDir`] on an end-of-directory slot (`0x00`),
+    /// [`RemoveStep::Found`] when `raw` is an 8.3 entry that `name` matches by
+    /// its validated long name or its short alias (after which
+    /// [`Self::run`] lists the entry's slots), and [`RemoveStep::Continue`]
+    /// otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `raw` is shorter than one 32-byte directory slot.
     pub fn step(&mut self, raw: &[u8], loc: L, name: &[u8]) -> RemoveStep
     {
         if raw[0] == 0x00
@@ -1008,6 +1023,11 @@ mod tests
         lfn[0] = 0x41;
         lfn[11] = 0x0F; // LFN attr
         assert!(parse_dir_entry(&lfn).is_none());
+
+        let mut label = [0x20u8; 32];
+        label[..11].copy_from_slice(b"SERAPH     ");
+        label[11] = 0x08 | 0x20; // volume label, archive bit set
+        assert!(parse_dir_entry(&label).is_none());
     }
 
     #[test]

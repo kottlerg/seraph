@@ -1478,8 +1478,9 @@ fn locate_entry_with_lfn_run(
 /// Per-sector walk for [`locate_entry_with_lfn_run`]. Returns the
 /// matching entry, whose slots [`RemoveRunScan::run`] then lists, or
 /// `None` to continue. On end-of-directory, returns the sentinel
-/// [`RemovedEntry`] `start_cluster == u32::MAX` so the caller maps to
-/// `NotFound`.
+/// [`RemovedEntry`] `start_cluster == u32::MAX`, which the caller maps to
+/// [`FatError::Corrupt`]: lookup found the entry, and it is gone before
+/// the end of the directory.
 fn scan_sector_for_remove(
     sector_lba: u32,
     name: &[u8],

@@ -347,7 +347,7 @@ cells automatically; variants belong to the tiers below.
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
-| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface, or that states a concurrency-fix purpose as Repeat count defines it (see Boundary surface, Memory surface, and Repeat count below), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
+| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, and Repeat count below), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
 | Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 64, 65, and 128 harts; x86_64 256 and 512 vCPUs) and the memory variation, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
@@ -366,11 +366,11 @@ or memory size, and owes no local host run, whatever file it is in:
 - lint attributes: `#[allow(...)]`, `#[expect(...)]`, `#[warn(...)]`, `#[deny(...)]`, their inner
   `#![...]` forms, and a `#[cfg_attr(<predicate>, <lint attribute>)]`;
 - code compiled only for host tests: a `#[cfg(test)]` module or item, or a `#[test]` function;
-- the deletion of a named item (a function, constant, static, type, or module; not an `impl`
-  block or a trait-method implementation) that nothing names at the PR head outside comments and
-  Markdown (`git grep -w <name> <head>` finds no other use) and that carries no attribute making
-  it reachable without its name (`#[no_mangle]`, `#[export_name]`, `#[used]`, `#[link_section]`,
-  `#[global_allocator]`, `#[panic_handler]`).
+- the deletion of a named function, constant, static, or type (not a module, an `impl` block, or
+  a trait-method implementation) that nothing names at the PR head outside comments and Markdown
+  (`git grep -w <name> <head>` finds no other use) and that carries no attribute making it
+  reachable without its name (`no_mangle`, `export_name`, `used`, `link_section`,
+  `global_allocator`, or `panic_handler`, in the plain or the `unsafe(...)` form).
 
 A PR whose changes outside Markdown are all inert owes no local host run, whatever purpose it
 states. The surfaces below, and Repeat count, are judged on the non-inert lines only.
@@ -398,15 +398,17 @@ changed line that names one of these items as a whole identifier or lies within 
 
 - CPU-count width: `MAX_CPUS`, `CpuMask`, `CPU_MASK_WORDS`;
 - per-CPU storage: `alloc_zeroed_slab`, and the definition of every function that calls it (the
-  per-CPU storage initialisers; a call to an initialiser is not itself on the surface);
-  `kernel_reserve_pages` (the CPU-scaled kernel reserve); and the element types of the per-CPU
-  arrays and slabs, today `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through
-  `MaybeUninit`), `TssWithIopb`, `TagState`, `CpuRng`, `Prng`, `Acc`, `Sample`, and
-  `TlbShootdownRequest` (`git grep -n -E 'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the
-  arrays and slabs). A change that alters an element type's size is on the surface whether it
-  edits the type's own fields or a type or constant the element holds by value (for example
-  `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`), and so is a change to a constant
-  that sizes a per-CPU allocation (`KERNEL_STACK_PAGES` for the idle stacks);
+  per-CPU storage initialisers; a call to one is on the surface only when it names another listed
+  item, as a call to an `init_ap_*` initialiser does); `kernel_reserve_pages` (the CPU-scaled
+  kernel reserve); and the element types of the per-CPU arrays and slabs, today `PerCpuData`,
+  `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`, `TagState`,
+  `CpuRng`, `Acc`, `Sample`, and `TlbShootdownRequest`
+  (`git grep -n -E 'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and
+  also the single-slot entropy pool slab, which is not per-CPU). A change that alters an element
+  type's size is on the surface whether it edits the type's own fields or a type or constant the
+  element holds by value (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside
+  `PerCpuScheduler`, or `Prng` inside `CpuRng`), and so is a change to a constant that sizes a
+  per-CPU allocation (`KERNEL_STACK_PAGES` for the idle stacks);
 - CPU enumeration and bringup: `parse_cpu_topology`, `parse_madt_topology`, and `parse_cpu_count`
   in the bootloader, and `start_ap`, `sbi_hart_start`, `kernel_entry_ap`, every `init_ap`, and the
   `init_ap_*` per-CPU storage initialisers in the kernel;
@@ -426,7 +428,9 @@ changes. The second prints every file header of the diff and every line, changed
 names a listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
 item's definition prints that item's name. Each printed name is a candidate: the PR owes the set
 when a non-inert changed line names the item or lies within its definition, read in that file's
-hunk. The screen finds named items and changes inside their definitions; it does not follow a size
+hunk. A printed `alloc_zeroed_slab` call is a candidate for the initialiser that encloses it: the
+set is owed when a non-inert changed line lies within that function, read in the widened hunk. The
+screen finds named items and changes inside their definitions; it does not follow a size
 change through a nested type or a sizing constant, so a diff that changes a struct's fields or a
 constant's value is also read against the per-CPU storage bullet (`git grep -n -w <name> <head>`
 shows where the type or constant is held). A diff for which neither command prints a candidate,
@@ -504,13 +508,16 @@ its body states that its purpose is the fix of a concurrency defect in the sched
 cross-CPU signalling mechanisms. Such a PR, unless its changes outside Markdown are all inert, owes
 the riscv64 64- and 65-hart and the x86_64 256-vCPU boundaries three times each (`--runs 3`),
 whether or not its diff changes the CPU-count surface: a race in those mechanisms can fail rarely
-enough that one run misses it. A concurrency fix elsewhere is not a concurrency-fix purpose. Its
-other owed runs stay at `--runs 1`. A change to those mechanisms' files without that stated purpose
-does not raise the count.
+enough that one run misses it. That PR's other owed runs stay at `--runs 1`. A concurrency fix
+elsewhere is not a concurrency-fix purpose, and a change to those mechanisms' files without that
+stated purpose does not raise the count.
 
 **When the runs are owed.** Each local host run a PR owes MUST pass, at its repeat count, at one
-head that covers the merge head. The PR's own diff at a head is the diff from that head's merge base
-with the fetched `master` to the head (after `git fetch origin`,
+head that covers the merge head. Only a `PASS` outcome of `run-parallel`
+([xtask/README.md](../xtask/README.md)) passes; a `QEMU-CRASH` run, a crash of the host
+emulator, is run again, and the PR body links its preserved log; `OK` and `ERR` count as
+failures. The PR's own diff at a head is the diff from that head's merge base with the fetched
+`master` to the head (after `git fetch origin`,
 `git diff $(git merge-base <head> origin/master) <head>`), so it excludes what a merge or rebase
 from `master` brings in. A run's surface is the surface that owes it: the CPU-count surface for the
 boundary set, the memory surface for the memory variation, and, for the runs a concurrency-fix
@@ -530,8 +537,9 @@ on the open Issue for that boundary (today [#421](https://github.com/kottlerg/se
 for the x86_64 high-smp budget overruns and [#455](https://github.com/kottlerg/seraph/issues/455)
 for the 512-vCPU IPI watchdog), or on a new Issue when that boundary has none, and the run does not
 block the PR. The PR body reports such a run as HANG or FAIL with a link to that record. Any other
-failure of a run the PR does not owe (a memory-variation failure, or a boundary failure no open
-Issue names), and any HANG or failure of a run the PR owes, blocks the PR.
+HANG or failure of a run the PR does not owe (a memory-variation HANG or failure, or a boundary
+failure no open Issue for that boundary names), and any HANG or failure of a run the PR owes,
+blocks the PR.
 
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step

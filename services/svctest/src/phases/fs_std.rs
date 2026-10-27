@@ -50,6 +50,10 @@ pub fn phases() -> &'static [Phase]
             run: std_bulk_write_phase,
         },
         Phase {
+            name: "std_frame_write_pool",
+            run: std_frame_write_pool_phase,
+        },
+        Phase {
             name: "std_read_dir",
             run: std_read_dir_phase,
         },
@@ -238,6 +242,52 @@ pub fn std_bulk_write_phase(_: &Caps)
     }
     std::fs::remove_file(path).expect("cleanup");
     std::os::seraph::log!("std_bulk_write phase passed");
+}
+
+/// Each frame-path write (over 504 bytes) returns its source page to memmgr
+/// when it ends, so repeated writes leave memmgr's free pool where it was.
+/// The writes go to one offset, so the fs driver's cache does not grow, and a
+/// first write before the baseline settles this process's heap and the
+/// driver's cache page. A leak of one page per write drops the pool by
+/// `FRAME_WRITES` pages, four times the slack, on every attempt; the pool
+/// is system-wide, so another process's allocation can perturb one
+/// attempt, and the phase passes when any of `ATTEMPTS` stays in slack.
+pub fn std_frame_write_pool_phase(_: &Caps)
+{
+    use std::io::{Seek, SeekFrom, Write};
+    const FRAME_WRITES: u64 = 64;
+    const SLACK_BYTES: u64 = (FRAME_WRITES / 4) * 4096;
+    const ATTEMPTS: usize = 3;
+
+    let path = "/data/svctest/std_frame_pool.bin";
+    let _ = std::fs::remove_file(path);
+    let chunk = vec![0x5Au8; 2048];
+    let mut f = std::fs::File::create(path).expect("create frame-pool file");
+    f.write_all(&chunk).expect("warm-up frame write");
+    let mut drops = Vec::with_capacity(ATTEMPTS);
+    for _ in 0..ATTEMPTS
+    {
+        let before = std::os::seraph::memmgr_pool_free_bytes().expect("memmgr pool query");
+        for _ in 0..FRAME_WRITES
+        {
+            f.seek(SeekFrom::Start(0)).expect("seek to start");
+            f.write_all(&chunk).expect("frame write");
+        }
+        let after = std::os::seraph::memmgr_pool_free_bytes().expect("memmgr pool query");
+        drops.push(before.saturating_sub(after));
+        if drops.last().is_some_and(|&d| d <= SLACK_BYTES)
+        {
+            break;
+        }
+    }
+    drop(f);
+    std::fs::remove_file(path).expect("cleanup");
+    assert!(
+        drops.iter().any(|&d| d <= SLACK_BYTES),
+        "frame writes dropped memmgr's free pool past {SLACK_BYTES} bytes on every attempt: \
+         {drops:?}"
+    );
+    std::os::seraph::log!("std_frame_write_pool phase passed (pool drops {drops:?})");
 }
 
 pub fn std_read_dir_phase(_: &Caps)

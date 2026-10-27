@@ -515,16 +515,6 @@ struct WalkedNode
     kind: NodeKind,
 }
 
-/// Internal kind-parameterised walk shared by [`walk_path_to_file`] and
-/// [`walk_path_to_dir`]. `requested_rights` is the mask sent on every
-/// hop; the namespace server intersects it against parent rights and
-/// per-entry `max_rights`. Callers wanting "everything I'm allowed"
-/// pass `0xFFFF`; callers walking-and-attenuating a subtree pass the
-/// target rights mask directly.
-///
-/// A path with no components (e.g. `"/"`) denotes the anchor directory
-/// itself: directory walks (`Dir`/`Any`) return an owned derived copy
-/// of `root_cap`; file walks reject it with `InvalidInput`.
 /// Every namespace right `namespace_protocol::rights` defines. A walk that
 /// requests all of them asks for whatever the anchor holds.
 const NS_DEFINED_RIGHTS: u64 = {
@@ -534,6 +524,18 @@ const NS_DEFINED_RIGHTS: u64 = {
     (LOOKUP | READDIR | STAT | READ | WRITE | EXEC | MUTATE_DIR | ADMIN) as u64
 };
 
+/// Internal kind-parameterised walk shared by [`walk_path_to_file`] and
+/// [`walk_path_to_dir`]. `requested_rights` is the mask sent on every
+/// hop; the namespace server intersects it against parent rights and
+/// per-entry `max_rights`. Callers wanting "everything I'm allowed"
+/// pass `0xFFFF`; callers walking-and-attenuating a subtree pass the
+/// target rights mask directly.
+///
+/// A path with no components (e.g. `"/"`) denotes the anchor directory
+/// itself: directory walks (`Dir`/`Any`) return an owned `SEND` copy of
+/// `root_cap` when `requested_rights` includes every right in
+/// [`NS_DEFINED_RIGHTS`], and `InvalidInput` otherwise, since no hop
+/// narrows the anchor; file walks reject it with `InvalidInput`.
 fn walk_components(
     root_cap: u32,
     path_str: &str,
@@ -922,13 +924,24 @@ fn acquire_write_frame(aspace: u32, memmgr_ep: u32) -> io::Result<WriteFrame>
         slab_release_fresh(phys);
         io::Error::other("seraph fs: reserve_pages failed for write frame")
     })?;
-    if !fund_aspace_pt_budget(aspace, 1)
-        || syscall::mem_map(cap, aspace, range.va_start(), 0, 1, syscall::MAP_WRITABLE).is_err()
+    let failure = if !fund_aspace_pt_budget(aspace, 1)
+    {
+        Some("seraph fs: page-table funding failed for write frame")
+    }
+    else if syscall::mem_map(cap, aspace, range.va_start(), 0, 1, syscall::MAP_WRITABLE).is_err()
+    {
+        Some("seraph fs: mem_map MAP_WRITABLE failed")
+    }
+    else
+    {
+        None
+    };
+    if let Some(msg) = failure
     {
         crate::sys::reserve::unreserve_pages(range);
         let _ = syscall::cap_delete(cap);
         slab_release_fresh(phys);
-        return Err(io::Error::other("seraph fs: mem_map MAP_WRITABLE failed"));
+        return Err(io::Error::other(msg));
     }
     Ok(WriteFrame { cap, phys, range })
 }
@@ -938,10 +951,14 @@ fn acquire_write_frame(aspace: u32, memmgr_ep: u32) -> io::Result<WriteFrame>
 /// by its phys base. The release relies on the driver holding no mapping
 /// of the frame past the copy, which services/fs/docs/fs-driver-protocol.md
 /// § Label 12 requires of it; revocation withdraws a derivation the driver
-/// kept but not a mapping it made.
+/// kept but not a mapping it made. A frame whose unmap fails stays mapped,
+/// reserved, and accounted to this process until it exits.
 fn release_write_frame(frame: WriteFrame, aspace: u32)
 {
-    let _ = syscall::mem_unmap(aspace, frame.va(), 1);
+    if syscall::mem_unmap(aspace, frame.va(), 1).is_err()
+    {
+        return;
+    }
     crate::sys::reserve::unreserve_pages(frame.range);
     let _ = syscall::cap_revoke(frame.cap);
     let _ = syscall::cap_delete(frame.cap);
@@ -951,8 +968,8 @@ fn release_write_frame(frame: WriteFrame, aspace: u32)
 /// How one `FS_WRITE_MEMORY` chunk failed.
 enum ChunkError
 {
-    /// The call itself failed, possibly after the driver received it, so
-    /// the driver may still copy from the frame.
+    /// The call was interrupted after it blocked, possibly after the driver
+    /// received it, so the driver may still copy from the frame.
     Call(io::Error),
     /// The frame was not lent, or the driver replied: the frame is idle.
     Settled(io::Error),
@@ -1065,8 +1082,19 @@ fn write_frame_chunk(
         }
     }
     let _ = syscall::cap_delete(lent);
-    let reply = reply.map_err(|_| {
-        ChunkError::Call(io::Error::other("seraph fs: FS_WRITE_MEMORY ipc_call failed"))
+    // `Interrupted` is the one error an `ipc_call` can return after the
+    // driver received the message; every other one is a refusal before the
+    // call blocked (`ipc::ipc_call` # Errors).
+    let reply = reply.map_err(|e| {
+        let err = io::Error::other("seraph fs: FS_WRITE_MEMORY ipc_call failed");
+        if e == syscall_abi::SyscallError::Interrupted as i64
+        {
+            ChunkError::Call(err)
+        }
+        else
+        {
+            ChunkError::Settled(err)
+        }
     })?;
     if reply.label != fs_errors::SUCCESS
     {
@@ -1522,25 +1550,8 @@ impl File
             return Ok(0);
         };
 
-        let range = match crate::sys::reserve::reserve_pages(1)
-        {
-            Ok(r) => r,
-            Err(_) =>
-            {
-                let _ = syscall::cap_delete(memory_cap);
-                self.release_frame(cookie);
-                return Err(io::Error::other("seraph fs: reserve_pages failed"));
-            }
-        };
+        let range = self.map_frame(memory_cap, cookie)?;
         let va = range.va_start();
-        if !crate::sys::alloc::seraph::fund_aspace_pt_budget(self.aspace, 1)
-            || syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READONLY).is_err()
-        {
-            crate::sys::reserve::unreserve_pages(range);
-            let _ = syscall::cap_delete(memory_cap);
-            self.release_frame(cookie);
-            return Err(io::Error::other("seraph fs: mem_map failed"));
-        }
 
         // Register the mapping with the release handler before exposing
         // it to the local copy: a forced release racing in must observe
@@ -1577,6 +1588,49 @@ impl File
         release_handler::release_one_local(self.entry.as_ref(), self.aspace, cookie);
 
         Ok(copy_len)
+    }
+
+    /// Reserve a page, fund this address space's page tables for it, and map
+    /// the read frame `memory_cap` read-only there. On failure the frame cap
+    /// is deleted and `cookie` released.
+    fn map_frame(
+        &self,
+        memory_cap: u32,
+        cookie: u64,
+    ) -> io::Result<crate::sys::reserve::ReservedRange>
+    {
+        let range = match crate::sys::reserve::reserve_pages(1)
+        {
+            Ok(r) => r,
+            Err(_) =>
+            {
+                let _ = syscall::cap_delete(memory_cap);
+                self.release_frame(cookie);
+                return Err(io::Error::other("seraph fs: reserve_pages failed"));
+            }
+        };
+        let va = range.va_start();
+        let failure = if !crate::sys::alloc::seraph::fund_aspace_pt_budget(self.aspace, 1)
+        {
+            Some("seraph fs: page-table funding failed for read frame")
+        }
+        else if syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READONLY)
+            .is_err()
+        {
+            Some("seraph fs: mem_map failed")
+        }
+        else
+        {
+            None
+        };
+        if let Some(msg) = failure
+        {
+            crate::sys::reserve::unreserve_pages(range);
+            let _ = syscall::cap_delete(memory_cap);
+            self.release_frame(cookie);
+            return Err(io::Error::other(msg));
+        }
+        Ok(range)
     }
 
     /// Validate an `FS_READ_MEMORY` success reply as wire input before the
@@ -2220,7 +2274,14 @@ fn drain_dir_recursive(dir_cap: u32, ipc_buf: *mut u64) -> io::Result<()>
 
         if matches!(entry.kind, NodeKind::Dir)
         {
-            let leaf_str = core::str::from_utf8(&entry.name).unwrap_or("");
+            // A non-UTF-8 name cannot be walked by path; an empty stand-in
+            // would name `dir_cap` itself and recurse without end.
+            let leaf_str = core::str::from_utf8(&entry.name).map_err(|_| {
+                io::const_error!(
+                    io::ErrorKind::InvalidData,
+                    "seraph fs: directory entry name is not UTF-8",
+                )
+            })?;
             let walked = walk_components(
                 dir_cap,
                 leaf_str,

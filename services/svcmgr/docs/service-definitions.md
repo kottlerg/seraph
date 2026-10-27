@@ -138,7 +138,7 @@ The primary lever for confining a service to only what it needs.
 |---|---|
 | `none` | No namespace cap delivered. The child's `ProcessInfo.system_root_cap` stays zero; std-side absolute-path filesystem operations return `Unsupported` (see [Namespace Model](../../../docs/namespace-model.md#initial-capability-delivery)). Default tight choice for services with no filesystem dependency. |
 | `universal` | `cap_copy` of svcmgr's own root (the system universal root). Reserved for services that need genuine root authority (vfsd as the namespace authority, devmgr for `/dev`, procmgr for walking `/services` and `/programs`, svctest as the namespace tester). |
-| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<path>` is absolute and at most `ipc::MAX_PATH_LEN` (48) bytes, the same fixed-buffer bound as `binary`; longer is a parser error. `<rights>` is a `+`-joined list of rights names (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown rights names are parser errors. Empty rights list is a parser error. |
+| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<path>` is absolute and at most `ipc::MAX_PATH_LEN` (48) bytes, the same fixed-buffer bound as `binary`; longer is a parser error. `<rights>` is a `+`-joined list of rights names (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown rights names are parser errors. Empty rights list is a parser error. A `<path>` of `/` names svcmgr's root itself, which no hop narrows, so it must name every right (use `universal`); a narrower list is a parser error. |
 
 Example subtree clause:
 
@@ -152,7 +152,10 @@ When set, svcmgr walks `<cwd>` from its own root with
 `LOOKUP+READDIR+STAT+READ` rights and passes the resulting directory
 cap as the child's `ProcessInfo.current_dir_cap`. The path must
 resolve inside the namespace. With `namespace = none`, `cwd` is a
-parser error.
+parser error. A `cwd` of `/` is a parser error too: it names svcmgr's
+root itself, and only a hop narrows rights
+([Namespace Model § Namespace Rights](../../../docs/namespace-model.md#namespace-rights)),
+so the walk cannot hand over the root with those rights.
 
 `std::env::current_dir()` returns `Unsupported` until a path string
 is recorded via `std::env::set_current_dir`; the cap and the

@@ -348,8 +348,10 @@ pub fn command_blobs_over_message_phase(_: &Caps)
 /// created.
 pub fn command_non_utf8_refused_phase(_: &Caps)
 {
-    // SAFETY: this target's `OsStr` is the byte-string encoding, for which
-    // every byte sequence is valid.
+    // SAFETY: safe Rust cannot build a non-UTF-8 `OsString` here, since
+    // `std::os::seraph` offers no `OsStringExt::from_vec`. This target's
+    // `OsStr` uses std's byte-string encoding, which accepts every byte
+    // sequence, so `[0xFF]` is a validly encoded `OsStr` on it.
     let invalid = unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(vec![0xFF]) };
 
     let err = std::process::Command::new(BLOB_FIXTURE)

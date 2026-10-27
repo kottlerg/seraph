@@ -298,8 +298,8 @@ pub fn rwlock_queued_readers_phase(_: &Caps)
         r.join().expect("rwlock reader panicked");
     }
 
-    // The contended readers acquired with the waiters bit set; a free lock
-    // must still be taken by the non-blocking paths.
+    // After contended readers and writer, the free lock must still be taken
+    // by the non-blocking paths.
     let held = lock
         .try_write()
         .expect("try_write on a free lock after contended readers");

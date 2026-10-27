@@ -239,6 +239,12 @@ mod tests
     }
 
     #[test]
+    fn bounded_fields_finds_no_fields_in_an_empty_blob()
+    {
+        assert_eq!(bounded_fields(b"", 3), (0, 0));
+    }
+
+    #[test]
     fn bounded_fields_covers_every_field_for_an_exact_count()
     {
         let blob = b"a\0b\0c\0";

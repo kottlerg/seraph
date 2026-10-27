@@ -293,6 +293,13 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 {
                     return Err(ParseError::InvalidValue(lineno, "cwd must be non-empty"));
                 }
+                if names_root(value)
+                {
+                    return Err(ParseError::InvalidValue(
+                        lineno,
+                        "cwd must not be the root: the cwd walk cannot narrow it",
+                    ));
+                }
                 cwd = Some(value.to_owned());
             }
             "seed" =>
@@ -483,12 +490,37 @@ fn parse_namespace(lineno: usize, value: &str) -> Result<NamespaceShape, ParseEr
             "namespace subtree path exceeds MAX_PATH_LEN bytes",
         )?;
         let rights = parse_rights(lineno, rights_str)?;
+        if names_root(path) && rights & ALL_RIGHTS != ALL_RIGHTS
+        {
+            return Err(ParseError::InvalidValue(
+                lineno,
+                "namespace subtree of the root must name every right; use universal",
+            ));
+        }
         return Ok(NamespaceShape::Subtree {
             path: path.to_owned(),
             rights,
         });
     }
     Err(ParseError::BadNamespace(lineno, value.to_owned()))
+}
+
+/// Every right `parse_rights` names.
+const ALL_RIGHTS: u32 = ns_rights::LOOKUP
+    | ns_rights::READDIR
+    | ns_rights::STAT
+    | ns_rights::READ
+    | ns_rights::WRITE
+    | ns_rights::EXEC
+    | ns_rights::MUTATE_DIR
+    | ns_rights::ADMIN;
+
+/// A path with no components names the walk's anchor, the root, which
+/// `std::os::seraph::namespace_lookup_dir` returns only for a request of
+/// every right: no hop narrows it.
+fn names_root(path: &str) -> bool
+{
+    path.split('/').all(str::is_empty)
 }
 
 /// Parse a `+`-joined list of named rights tokens (LOOKUP, STAT, …)
@@ -796,6 +828,38 @@ sched_max = 12\n";
         assert!(matches!(
             parse("x", &recipe_with_subtree_len(ipc::MAX_PATH_LEN + 1)),
             Err(ParseError::InvalidValue(4, why)) if why.starts_with("namespace subtree path")
+        ));
+    }
+
+    #[test]
+    fn namespace_subtree_of_the_root_needs_every_right()
+    {
+        let recipe = |rights: &str| {
+            format!(
+                "binary = /services/x\nrestart = never\ncritical = no\n\
+                 namespace = subtree:/:{rights}\n"
+            )
+        };
+        assert!(matches!(
+            parse("x", &recipe("LOOKUP+READ")),
+            Err(ParseError::InvalidValue(4, why)) if why.starts_with("namespace subtree of the root")
+        ));
+        let full = parse(
+            "x",
+            &recipe("LOOKUP+READDIR+STAT+READ+WRITE+EXEC+MUTATE_DIR+ADMIN"),
+        )
+        .expect("a root subtree with every right parses");
+        assert!(matches!(full.namespace, NamespaceShape::Subtree { ref path, .. } if path == "/"));
+    }
+
+    #[test]
+    fn cwd_of_the_root_is_rejected()
+    {
+        let recipe = "binary = /services/x\nrestart = never\ncritical = no\n\
+                      namespace = universal\ncwd = /\n";
+        assert!(matches!(
+            parse("x", recipe),
+            Err(ParseError::InvalidValue(5, why)) if why.starts_with("cwd must not be the root")
         ));
     }
 

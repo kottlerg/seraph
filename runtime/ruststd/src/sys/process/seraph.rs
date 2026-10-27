@@ -1172,10 +1172,12 @@ impl Drop for Process {
 //     and re-checks the flag.
 //   * `DESTROY_PROCESS` on the process handle, so the child's address
 //     space is gone before any ring page is returned.
-//   * `RingRelease::on_peer_death` per piped direction — returns the
-//     direction's ring-page grant to memmgr when the parent end is
-//     already dropped; otherwise the parent's later `Pipe::Drop` sends
-//     the release. Exactly-once by the shared state machine.
+//   * `RingRelease::on_peer_death` per piped direction, only once that
+//     call succeeded — returns the direction's ring-page grant to memmgr
+//     when the parent end is already dropped; otherwise the parent's later
+//     `Pipe::Drop` sends the release. Exactly-once by the shared state
+//     machine. A failed teardown call reports no death, so the grants stay
+//     accounted to the spawner until it exits.
 //   * `exit_reason.store(reason)` + `notification_send(completion_notification)`
 //     — the rendezvous point `Process::wait` blocks on.
 //
@@ -1244,27 +1246,42 @@ fn bridge_main(h: BridgeHandles) {
     // replies once procmgr has revoked the child's address space
     // (services/procmgr/docs/ipc-interface.md § Label 8), or at once for a
     // child procmgr already reaped; after that no child thread can touch a
-    // ring.
-    let ipc_buf = crate::os::seraph::current_ipc_buf();
-    if !ipc_buf.is_null() {
-        let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
-        // SAFETY: ipc_buf is this thread's kernel-registered IPC buffer.
-        let _ = unsafe { ipc::ipc_call(h.process_handle, &destroy_msg, ipc_buf) };
-    }
-    // Report the child's death to each direction's ring-grant release
-    // state; send the release for ends the parent already dropped.
-    // Kicks first: waking blocked readers/writers must not wait on the
-    // procmgr and memmgr round-trips here.
-    for sig in h.pipe_notifications.iter().flatten() {
-        if let Some(rr) = &sig.ring_release {
-            if rr.on_peer_death() {
-                crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
+    // ring. Without a successful reply the child's death is not reported
+    // to the ring-release state, so its grants stay accounted to this
+    // process until it exits. Kicks first: waking blocked readers/writers
+    // must not wait on the procmgr and memmgr round-trips here.
+    if destroy_child(h.process_handle) {
+        // Report the child's death to each direction's ring-grant release
+        // state; send the release for ends the parent already dropped.
+        for sig in h.pipe_notifications.iter().flatten() {
+            if let Some(rr) = &sig.ring_release {
+                if rr.on_peer_death() {
+                    crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
+                }
             }
         }
     }
     // Raise the rendezvous notification last so a `wait` that wakes
     // observes `exit_reason` already published.
     let _ = syscall::notification_send(h.completion_notification, 1);
+}
+
+/// Send `DESTROY_PROCESS` on `process_handle`, retrying a call this thread's
+/// stop and restart interrupted, and report whether procmgr replied.
+fn destroy_child(process_handle: u32) -> bool {
+    let ipc_buf = crate::os::seraph::current_ipc_buf();
+    if ipc_buf.is_null() {
+        return false;
+    }
+    let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
+    loop {
+        // SAFETY: ipc_buf is this thread's kernel-registered IPC buffer.
+        match unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_buf) } {
+            Ok(_) => return true,
+            Err(e) if e == SyscallError::Interrupted as i64 => {}
+            Err(_) => return false,
+        }
+    }
 }
 
 // ── ExitStatus / ExitCode ───────────────────────────────────────────────────

@@ -98,9 +98,9 @@ label field identifies the operation.
 Notifications that init has finished serving the handover endowment.
 svcmgr honours it once, and only from a caller whose badge carries the
 `svcmgr_labels::HANDOVER_AUTHORITY` verb-bit (bit 62): init derives a
-SEND with that badge for the call and deletes it after. Only svcmgr's
-trusted minters hold an unbadged SEND on the endpoint (init, and procmgr's
-per-child source), and every other SEND is already badged without the
+SEND with that badge for the call and deletes it after. Only svcmgr and
+its trusted minters hold an unbadged SEND on the endpoint (init, and
+procmgr's per-child source), and every other SEND is already badged without the
 bit: devmgr's with `PUBLISH_AUTHORITY`, the published `svcmgr` name's with
 `svcmgr_labels::PUBLISHED_SEND_BADGE`, and each per-process
 `service_registry_cap` with a process badge procmgr keeps clear of verb

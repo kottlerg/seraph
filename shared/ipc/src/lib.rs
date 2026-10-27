@@ -793,11 +793,10 @@ pub mod svcmgr_labels
     /// a SEND it derives for the handover call and deletes after. Only
     /// svcmgr and its trusted minters hold an unbadged SEND on svcmgr's
     /// endpoint (init, and procmgr's per-child source), which is what keeps
-    /// the bit theirs: every
-    /// other SEND on the endpoint is already badged (a badge is set once)
-    /// without it — devmgr's with [`PUBLISH_AUTHORITY`], the published
-    /// `svcmgr` name's with [`PUBLISHED_SEND_BADGE`], and each per-process
-    /// `service_registry_cap` with a process badge, which
+    /// the bit theirs: every other SEND on the endpoint is already badged (a
+    /// badge is set once) without it — devmgr's with [`PUBLISH_AUTHORITY`],
+    /// the published `svcmgr` name's with [`PUBLISHED_SEND_BADGE`], and each
+    /// per-process `service_registry_cap` with a process badge, which
     /// [`VERB_BIT_MASK`](crate::VERB_BIT_MASK) keeps clear of verb bits.
     pub const HANDOVER_AUTHORITY: u64 = 1u64 << 62;
     /// Badge on the SEND svcmgr publishes on its own endpoint under the

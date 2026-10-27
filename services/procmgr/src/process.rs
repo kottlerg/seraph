@@ -36,7 +36,8 @@ const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 /// Redraws until the low 32 bits clear `LOG_BADGE_FIRST_CHILD` — keeping the
 /// badge out of the reserved log-badge / no-correlator range that the old
 /// monotonic counter held structurally by starting at 16 — and avoid the
-/// reserved init-reap correlator; see [`badge_is_acceptable`]. Because the
+/// reserved init-reap correlator, and until no verb bit
+/// (`ipc::VERB_BIT_MASK`) is set; see [`badge_is_acceptable`]. Because the
 /// death-EQ correlator is only the low 32 bits, two *live* processes can collide
 /// there at ~2⁻³² (≤`MAX_PROCESSES` live), which `take_by_correlator` resolves
 /// to the first match: an accepted, vanishingly-rare narrowing of the former
@@ -52,6 +53,7 @@ fn next_process_badge() -> Option<u64>
             t,
             ipc::log_badges::LOG_BADGE_FIRST_CHILD,
             ipc::procmgr_labels::INIT_REAP_CORRELATOR,
+            ipc::VERB_BIT_MASK,
         )
         {
             return Some(t);

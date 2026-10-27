@@ -105,6 +105,10 @@ pub fn run_all(ctx: &TestContext)
         "cap::insert_out_of_bounds_err",
         cap::insert_out_of_bounds_err(ctx)
     );
+    run_test!(
+        "cap::move_out_of_bounds_err",
+        cap::move_out_of_bounds_err(ctx)
+    );
     run_test!("cap::derive_zero_rights", cap::derive_zero_rights(ctx));
     run_test!("cap::revoke_null_slot_err", cap::revoke_null_slot_err(ctx));
     run_test!(

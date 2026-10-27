@@ -770,7 +770,7 @@ pub mod procmgr_process_state
     pub const EXITED: u64 = 3;
 }
 
-pub const SVCMGR_LABELS_VERSION: u32 = 4;
+pub const SVCMGR_LABELS_VERSION: u32 = 5;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -814,17 +814,37 @@ pub mod svcmgr_labels
     /// line in `/config/svcmgr/services/<name>.svc` so attenuation survives a
     /// crash-restart cycle.
     pub const NS_POLICY_SUBTREE: u8 = 2;
-    /// Notification that init handover is complete.
+    /// Notification that init handover is complete. Honoured once, and
+    /// only from a caller whose badge carries [`HANDOVER_AUTHORITY`];
+    /// svcmgr replies [`svcmgr_errors::UNAUTHORIZED`] to any other caller
+    /// and to a repeat.
     pub const HANDOVER_COMPLETE: u64 = 2;
+    /// Verb-bit authorising [`HANDOVER_COMPLETE`]. init alone mints it, on
+    /// a SEND it derives for the handover call and deletes after. Only
+    /// svcmgr and its trusted minters hold an unbadged SEND on svcmgr's
+    /// endpoint (init, and procmgr's per-child source), which is what keeps
+    /// the bit theirs: every other SEND on the endpoint is already badged (a
+    /// badge is set once) without it — devmgr's with [`PUBLISH_AUTHORITY`],
+    /// the published `svcmgr` name's with [`PUBLISHED_SEND_BADGE`], and each
+    /// per-process `service_registry_cap` with a process badge, which
+    /// [`VERB_BIT_MASK`](crate::VERB_BIT_MASK) keeps clear of verb bits.
+    pub const HANDOVER_AUTHORITY: u64 = 1u64 << 62;
+    /// Badge on the SEND svcmgr publishes on its own endpoint under the
+    /// `svcmgr` name: a fixed value with no verb bit, so a consumer can
+    /// `QUERY_ENDPOINT` through it but cannot re-badge it to mint
+    /// [`HANDOVER_AUTHORITY`] or [`PUBLISH_AUTHORITY`].
+    pub const PUBLISHED_SEND_BADGE: u64 = 1;
+    const _: () = core::assert!(PUBLISHED_SEND_BADGE & crate::VERB_BIT_MASK == 0);
     /// Publish a named endpoint into the discovery registry.
     ///
-    /// Data words: `[name_len, name_words...]`. One cap attached = the
-    /// endpoint the name resolves to.
+    /// Label bits 16..31 carry `name_len`; data words from 0 carry the name
+    /// bytes packed little-endian. `caps[0]` is the endpoint the name
+    /// resolves to.
     pub const PUBLISH_ENDPOINT: u64 = 3;
     /// Look up a named endpoint; reply transfers the cap if known.
     ///
-    /// Label's high 16 bits carry `name_len` (see `shared/ipc` `read_path`
-    /// pattern); data words carry the name. Reply attaches the cap on
+    /// Label bits 16..31 carry `name_len` (see `shared/ipc` `read_path`
+    /// pattern); data words from 0 carry the name. Reply attaches the cap on
     /// success, or returns `svcmgr_errors::UNKNOWN_NAME` on miss.
     pub const QUERY_ENDPOINT: u64 = 4;
 
@@ -1897,6 +1917,16 @@ pub mod stream_labels
     pub const STREAM_REGISTER_NAME: u64 = 11;
 }
 
+/// Badge bits that endpoints gating a label on a verb-bit use for it: each
+/// `*_AUTHORITY` constant in this crate is one of these bits. A minter whose
+/// badges carry other information onto such an endpoint keeps them clear —
+/// procmgr's random per-process badge, stamped on the child's svcmgr-registry
+/// and procmgr SENDs — so only a server's trusted minters set a verb bit
+/// (docs/capability-model.md § Verb-bit authority pattern). Endpoints with no
+/// verb gate (bootstrap endpoints, memmgr, namespace node caps) do not
+/// reserve them.
+pub const VERB_BIT_MASK: u64 = (1u64 << 63) | (1u64 << 62);
+
 /// Reserved log-endpoint badges.
 ///
 /// Every badged SEND cap on the log endpoint carries a `u64` badge
@@ -2185,7 +2215,8 @@ pub mod svcmgr_errors
     /// revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
     /// Caller's badge lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
-    /// `PUBLISH_ENDPOINT` request.
+    /// `PUBLISH_ENDPOINT` request or [`svcmgr_labels::HANDOVER_AUTHORITY`] on
+    /// a `HANDOVER_COMPLETE`, or the handover has already run.
     pub const UNAUTHORIZED: u64 = 8;
     /// Client-side: the underlying `ipc_call` returned `Err` (no reply
     /// from svcmgr, transport-level failure). Never emitted by svcmgr

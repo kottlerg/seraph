@@ -47,8 +47,10 @@ svcmgr/
 │   │   └── reconcile.rs           # PendingRegistration + reconcile_and_launch
 │   └── arch/                      # Per-arch halt() entry
 ├── svc-defs/                      # `svcmgr-defs` crate: host-tested `.svc`
-│                                  # Definition types, parser, and argv/env
-│                                  # wire-blob encoder (`build_blob`)
+│                                  # Definition types, parser, argv/env
+│                                  # wire-blob encoder (`build_blob`), and
+│                                  # the `cwd_rights` / `handover_permitted`
+│                                  # decisions
 └── docs/
     ├── ipc-interface.md           # handover endowment, HANDOVER_COMPLETE,
     │                              # PUBLISH_ENDPOINT / QUERY_ENDPOINT
@@ -95,8 +97,9 @@ svcmgr/
   [`restart::handle_death`](src/restart.rs); shared spawn primitives
   re-spawn the service from the recorded recipe. The `.svc` file is the
   single source of truth for both launch and restart — fixed fields on
-  `ServiceEntry`, the heap-backed argv/env/cwd/seed on a parallel
-  `RestartRecipe` — so a restart reproduces the first-launch surfaces
+  `ServiceEntry`, the argv/env/cwd/seed, log-sink flag, and scheduling
+  fields on a parallel `RestartRecipe` — so a restart reproduces the
+  first-launch surfaces
   ([docs/restart-protocol.md](docs/restart-protocol.md) § Recipe storage).
   Whether a service restarts is decided by its `restart` policy + budget
   alone; `critical` is orthogonal (see graceful shutdown below and
@@ -180,7 +183,7 @@ via direct `QUERY_ENDPOINT` calls. The handover endowment and
 | Name | Source | Cap shape |
 |---|---|---|
 | `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on the root filesystem's namespace endpoint at its root directory |
-| `svcmgr` | svcmgr (its own service ep) | un-badged SEND on svcmgr's own service endpoint |
+| `svcmgr` | svcmgr (its own service ep) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) |
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
@@ -207,10 +210,11 @@ tree.
 
 ## Restart policy
 
-Each `.svc` carries `restart = never | on_failure | always`. Restart
-attempts are counted per service. After a configurable maximum
-(`MAX_RESTARTS`, currently `1`) in a short window, the service is
-marked degraded and not restarted automatically. See
+Each `.svc` carries `restart = never | on_failure | always`. Restarts
+are counted per service over its lifetime (no window, no reset). Once
+`MAX_RESTARTS` (currently `1`) restarts have run, the service's next
+death leaves it permanently down — degraded, or a graceful shutdown for
+`critical = yes`. See
 [docs/restart-protocol.md](docs/restart-protocol.md).
 
 ---

@@ -165,7 +165,8 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   drivers dir (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)):
   - `rootfs.root` — the endowed `SEND` on the root filesystem's
     namespace endpoint (FS-driver-agnostic by design).
-  - `svcmgr` — un-badged SEND on svcmgr's own service endpoint.
+  - `svcmgr` — SEND on svcmgr's own service endpoint, badged
+    `svcmgr_labels::PUBLISHED_SEND_BADGE` (no verb-bit).
   - `devmgr.registry` — `REGISTRY_QUERY_AUTHORITY`-badged SEND minted
     from the endowed devmgr-registry source. Consumers needing to
     resolve a device driver themselves (`programs/terminal` →
@@ -205,7 +206,12 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   init's CSpace while the objects keep backing init's running threads.
   This round runs before `HANDOVER_COMPLETE` so procmgr's death
   observers are bound before real-logd can release init-logd.
-- Notification `HANDOVER_COMPLETE`. svcmgr scans `/config/svcmgr/services/`,
+- Notification `HANDOVER_COMPLETE`, called through a SEND badged with
+  the `svcmgr_labels::HANDOVER_AUTHORITY` verb-bit that init derives for
+  the call and deletes after; svcmgr honours the label once, and only
+  from a badge carrying that bit (see
+  [Label 2](../../svcmgr/docs/ipc-interface.md#label-2-handover_complete)).
+  svcmgr scans `/config/svcmgr/services/`,
   reconciles the parked substrate against the recipes, and launches the
   defined-but-unparked services (`logd`, `timed`, `pwrmgr`, `terminal`,
   staged harnesses) from disk (see

@@ -67,20 +67,24 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
      instance's kernel objects. Init-spawned services start with
      `process_handle == 0`, so the first death cannot destroy;
      subsequent deaths can.
+   * Delete the dead instance's `thread_cap`, svcmgr's reference to the
+     exited thread.
    * Spawn a fresh instance via the shared primitive
      [`walk_and_create_from_file`](#shared-spawn-primitives) (VFS
      path), replaying the recipe's `argv` / `env` from the stored
      [`RestartRecipe`](../src/service.rs).
    * Re-apply the per-service namespace policy **and `cwd`** via
      [`apply_namespace_policy`](#shared-spawn-primitives).
+   * Start the child via [`start_process`](#shared-spawn-primitives)
+     (`START_PROCESS`).
    * Serve the restart bootstrap round, re-resolving the recipe's
-     `seed` names from the discovery registry in declaration order (or,
-     for init-endowed services with no seeds, re-deriving the stored
-     bundle caps).
+     `seed` names from the discovery registry in declaration order.
    * Rebind death-notification on the new thread cap using the same
      correlator so subsequent crashes route back to the same entry.
    * On success: increment `restart_count`, return `Restarted`.
-   * On failure: route through `permanent_death_outcome`.
+   * On failure: any failure after `CREATE_FROM_FILE` destroys the new
+     child via `DESTROY_PROCESS`, as first launch does; then route
+     through `permanent_death_outcome`.
 
 `dispatch_deaths` reacts to `Unrecoverable` by calling
 `initiate_graceful_shutdown`, which resolves
@@ -121,9 +125,9 @@ identical across both code paths:
 The launch path is documented in
 [service-definitions.md](service-definitions.md#reconciliation). The
 `.svc` recipe is the single source of truth for both paths: the fixed
-fields are recorded on `ServiceEntry` and the heap-backed surfaces
-(argv / env / cwd / seed) on the parallel `RestartRecipe`, so a restart
-reproduces the first-launch spawn shape byte-for-byte. The binary path
+fields are recorded on `ServiceEntry` and the argv / env / cwd / seed,
+log-sink flag, and scheduling fields on the parallel `RestartRecipe`, so
+a restart reproduces the first-launch spawn shape byte-for-byte. The binary path
 is re-walked on every spawn, so a binary update on disk is picked up by
 the next restart without code changes.
 
@@ -144,8 +148,10 @@ at reconciliation time. The fixed-size fields live on `ServiceEntry`:
 | `thread_cap` | endowment thread cap (bind-only) or `Launched.thread_cap` (svcmgr-launched) |
 | `process_handle` | `Launched.process_handle` for svcmgr-launched; `0` for init-spawned (see DESTROY_PROCESS comment above) |
 
-The heap-backed launch surfaces that don't fit the fixed record are held
-in a parallel [`RestartRecipe`](../src/service.rs) table
+The launch surfaces svcmgr replays beyond the fixed record (the
+heap-backed argv / env / cwd / seed, plus the log-sink flag and
+scheduling fields) are held in a parallel
+[`RestartRecipe`](../src/service.rs) table
 (`SvcmgrState.recipes`), index-aligned with `services[]` via the death
 correlator:
 
@@ -155,10 +161,14 @@ correlator:
 | `env` | `env = ...` |
 | `cwd` | `cwd = ...` |
 | `seed` | `seed = ...` |
+| `log_sink` | `log_sink = ...` |
+| `priority` | `priority = ...` (`0` = unset) |
+| `sched_max` | `sched_max = ...` (`0` = unset) |
 
-`restart_process` replays all four on every respawn — argv/env into
-`CREATE_FROM_FILE`, cwd through `apply_namespace_policy`, and seeds
-re-resolved from the discovery registry — so a restarted child comes
+`restart_process` replays every field on every respawn — argv/env and the
+scheduling fields into `CREATE_FROM_FILE`, cwd through
+`apply_namespace_policy`, seeds re-resolved from the discovery registry,
+and `log_sink` selecting the log-sink round — so a restarted child comes
 back with the same surfaces first launch gave it.
 
 ---

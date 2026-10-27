@@ -57,8 +57,8 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 | `restart` | yes | One of `never`, `on_failure`, `always`. |
 | `critical` | yes | `yes` or `no`. Whether the system is viable without this service once it is permanently down. Orthogonal to `restart`. |
 | `namespace` | yes | One of `none`, `universal`, `subtree:<path>:<rights>`. |
-| `cwd` | no | Path interpreted relative to svcmgr's universal root. Forbidden when `namespace = none`. |
-| `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name; cap[i+1] for a `provides` service, see [`seed`](#seed)). |
+| `cwd` | no | Path interpreted relative to svcmgr's universal root; must lie inside the namespace (see [`cwd`](#cwd)). Forbidden when `namespace = none`. |
+| `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name; cap[i+1] for a `provides` service). At most `MSG_CAP_SLOTS_MAX` (4) names, or 3 for a `provides` service; see [`seed`](#seed). |
 | `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one badged SEND per entry into the discovery registry. See [`provides`](#provides). |
 | `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
 | `priority` | no | Priority level (`1..=30`) the service's initial thread is created at. Unset: procmgr's default (`sched_policy::DEFAULT_SPAWN_PRIORITY`, clamped to the band). See [`priority` / `sched_max`](#priority--sched_max). |
@@ -97,10 +97,11 @@ that message:
 | `on_failure` | Restart only on a fault exit (`exit_reason >= EXIT_FAULT_BASE`). Clean exits are treated as intentional. |
 | `always` | Restart on every exit, clean or faulty. Default for daemons that should never terminate during normal operation. |
 
-Restart attempts are counted per service. After
-`service::MAX_RESTARTS` (currently `1`) consecutive restarts in a
-short window, the service is marked degraded and not restarted
-automatically — see [restart-protocol.md](restart-protocol.md).
+Restarts are counted per service over its lifetime: the count has no
+window and is never reset. Once `service::MAX_RESTARTS` (currently `1`)
+restarts have run, the next death leaves the service permanently down:
+degraded, or a graceful shutdown for `critical = yes` (see
+[`critical`](#critical)). See [restart-protocol.md](restart-protocol.md).
 
 ## `critical`
 
@@ -138,7 +139,7 @@ The primary lever for confining a service to only what it needs.
 |---|---|
 | `none` | No namespace cap delivered. The child's `ProcessInfo.system_root_cap` stays zero; std-side absolute-path filesystem operations return `Unsupported` (see [Namespace Model](../../../docs/namespace-model.md#initial-capability-delivery)). Default tight choice for services with no filesystem dependency. |
 | `universal` | `cap_copy` of svcmgr's own root (the system universal root). Reserved for services that need genuine root authority (vfsd as the namespace authority, devmgr for `/dev`, procmgr for walking `/services` and `/programs`, svctest as the namespace tester). |
-| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<path>` is absolute and at most `ipc::MAX_PATH_LEN` (48) bytes, the same fixed-buffer bound as `binary`; longer is a parser error. `<rights>` is a `+`-joined list of rights names (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown rights names are parser errors. Empty rights list is a parser error. A `<path>` of `/` names svcmgr's root itself, which no hop narrows, so it must name every right (use `universal`); a narrower list is a parser error. |
+| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<path>` is absolute, names a directory below the root, and is at most `ipc::MAX_PATH_LEN` (48) bytes, the same fixed-buffer bound as `binary`; longer is a parser error, and so is a path with no components (`subtree:/`, which no namespace server would attenuate; use `universal`). `<rights>` is a `+`-joined list of rights names (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown rights names are parser errors. Empty rights list is a parser error. |
 
 Example subtree clause:
 
@@ -150,14 +151,20 @@ namespace = subtree:/data:LOOKUP+READDIR+STAT+READ+WRITE
 
 When set, svcmgr walks `<cwd>` from its own root with
 `LOOKUP+READDIR+STAT+READ` rights and passes the resulting directory
-cap as the child's `ProcessInfo.current_dir_cap`. The path must
-resolve inside the namespace. With `namespace = none`, `cwd` is a
-parser error. A `cwd` of `/` is a parser error too: it names svcmgr's
-root itself, and rights narrow only at an `NS_LOOKUP` hop, as
+cap as the child's `ProcessInfo.current_dir_cap`; under
+`namespace = subtree:<path>:<rights>` it requests only those of the four
+rights that `<rights>` grants, so the cwd cap never exceeds the namespace
+cap. The path must resolve inside the namespace. With a subtree
+namespace, a `cwd` that is neither `<path>` nor a path below it
+(compared by whole components, so `/data2` is outside `/data`) is a
+parser error, as is a `cwd` whose `<rights>` lack `LOOKUP`; namespace
+servers reject `.` and `..` components, so an accepted path cannot walk
+back out. Under `namespace = universal`, a `cwd` of `/` is a parser
+error: it names svcmgr's root itself, and rights narrow only at an
+`NS_LOOKUP` hop, as
 [Namespace Model § Per-Entry Rights and Visibility](../../../docs/namespace-model.md#per-entry-rights-and-visibility)
-defines (a holder cannot re-badge its own cap, per
-[Capability Model § Badges](../../../docs/capability-model.md#badges)),
-so the walk cannot hand over the root with those rights.
+defines, so the walk cannot hand over the root with those rights. With
+`namespace = none`, `cwd` is a parser error.
 
 `std::env::current_dir()` returns `Unsupported` until a path string
 is recorded via `std::env::set_current_dir`; the cap and the
@@ -198,11 +205,10 @@ seed = rootfs.root pwrmgr.shutdown pwrmgr.deny
 ```
 
 becomes `caps = [rootfs_root_send, pwrmgr_shutdown_send,
-pwrmgr_deny_send]` on the child's `bootstrap::request_round`. The
-list is truncated to `MSG_CAP_SLOTS_MAX` (currently 4) entries, or one fewer
-for a `provides` service, whose provider RECV takes cap[0]. A recipe with
-more than 4 seeds is logged; a provider's dropped fourth seed is not
-([#451](https://github.com/kottlerg/seraph/issues/451)).
+pwrmgr_deny_send]` on the child's `bootstrap::request_round`. A
+bootstrap round carries at most `MSG_CAP_SLOTS_MAX` (currently 4) caps, and
+a `provides` service's provider RECV takes cap[0], so a recipe with more
+than 4 seeds, or more than 3 for a `provides` service, is a parser error.
 
 An unresolved name leaves slot `i` as `0`. Consumers that already tolerate `cap == 0 → skip`
 (e.g. svctest's pwrmgr phases, per
@@ -213,22 +219,22 @@ misconfiguration.
 Well-known names are centralised in
 [`ipc::published_names`](../../../shared/ipc/src/lib.rs):
 
-| Name | Publisher (today) | Cap shape |
+| Name | Publisher | Cap shape |
 |---|---|---|
-| `rootfs.root` | init Phase 3 | badged SEND on the root filesystem's namespace endpoint at its root directory (FS-driver-agnostic) |
+| `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on the root filesystem's namespace endpoint at its root directory (FS-driver-agnostic) |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
 | `timed` | svcmgr (`timed.svc` provider) | un-badged SEND on timed's service endpoint (wall-clock) |
-| `svcmgr` | init Phase 3 | un-badged SEND on svcmgr's own service endpoint |
-| `devmgr.registry` | init Phase 3 | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint |
+| `svcmgr` | svcmgr (its own service endpoint) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) |
+| `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint |
 
 ## `provides`
 
 Declares the registry names a service's own endpoint is published under.
 svcmgr creates a service endpoint, serves its RECV as bootstrap `cap[0]`
 (ahead of the `seed` caps), and publishes one SEND per entry. If the RECV
-derive fails on a restart, svcmgr delivers the seeds shifted down into
-cap[0] ([#451](https://github.com/kottlerg/seraph/issues/451)). Providers
+derive fails, on first launch or on a restart, svcmgr destroys the new
+child instead of shifting the seeds down into cap[0]. Providers
 launch ahead of pure consumers during reconciliation, so a provided name
 is resolvable before any consumer queries it. The endpoint persists across
 restarts (svcmgr holds the source), so a cached client cap survives a
@@ -240,7 +246,7 @@ consumer's `QUERY_ENDPOINT` lookup unchanged):
 
 | Suffix | Badge | Use |
 |---|---|---|
-| *(none)* | `0` (unbadged) | Plain SEND. e.g. `timed`. |
+| *(none)* | `0` (unbadged) | Plain SEND, for an endpoint whose server gates no label on a verb-bit: a consumer can badge an unbadged SEND itself ([Capability Model](../../../docs/capability-model.md#verb-bit-authority-pattern)). e.g. `timed`. |
 | `:auth` | `1 << 63` | The universal verb-authority bit shared by every `*_AUTHORITY` constant — the server's `badge & (1 << 63)` gate passes. e.g. `pwrmgr.shutdown:auth`. |
 | `:deny` | `1` | Present so the cap resolves, but the authority gate fails. The negative-test twin. e.g. `pwrmgr.deny:deny`. |
 
@@ -299,7 +305,7 @@ At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 
 | Definition | Pending registration | Outcome |
 |---|---|---|
-| present | present | **bind only** — bind death-notification on the endowed thread cap; record a `ServiceEntry` with the parsed recipe for restart use. |
+| present | present | **bind only** — bind death-notification on the endowed thread cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink flag, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
 | present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, `CONFIGURE_NAMESPACE` with the namespace+cwd, `START_PROCESS`, serve the seed bootstrap round. If `restart != never`, bind death-notification and record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 

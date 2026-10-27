@@ -47,8 +47,10 @@ svcmgr/
 │   │   └── reconcile.rs           # PendingRegistration + reconcile_and_launch
 │   └── arch/                      # Per-arch halt() entry
 ├── svc-defs/                      # `svcmgr-defs` crate: host-tested `.svc`
-│                                  # Definition types, parser, and argv/env
-│                                  # wire-blob encoder (`build_blob`)
+│                                  # Definition types, parser, argv/env
+│                                  # wire-blob encoder (`build_blob`), and
+│                                  # the `cwd_rights` / `handover_permitted`
+│                                  # decisions
 └── docs/
     ├── ipc-interface.md           # handover endowment, HANDOVER_COMPLETE,
     │                              # PUBLISH_ENDPOINT / QUERY_ENDPOINT

@@ -9,7 +9,8 @@ publish.workspace = true
 
 [dependencies]
 # `ipc::ARGS_BLOB_MAX` bounds the argv/env wire blobs the parser validates;
-# `ipc::MAX_PATH_LEN` bounds the `binary` and `subtree:<path>` values.
+# `ipc::MAX_PATH_LEN` bounds the `binary` and `subtree:<path>` values;
+# `ipc::svcmgr_labels::HANDOVER_AUTHORITY` is the bit `handover_permitted` tests.
 ipc = { path = "../../../shared/ipc" }
 registry = { path = "../../../shared/registry" }
 namespace-protocol = { path = "../../../shared/namespace-protocol" }

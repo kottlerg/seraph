@@ -791,8 +791,9 @@ pub mod svcmgr_labels
     pub const HANDOVER_COMPLETE: u64 = 2;
     /// Verb-bit authorising [`HANDOVER_COMPLETE`]. init alone mints it, on
     /// a SEND it derives for the handover call and deletes after. Only
-    /// trusted minters hold an unbadged SEND on svcmgr's endpoint (init and
-    /// procmgr's per-child source), which is what keeps the bit theirs: every
+    /// svcmgr and its trusted minters hold an unbadged SEND on svcmgr's
+    /// endpoint (init, and procmgr's per-child source), which is what keeps
+    /// the bit theirs: every
     /// other SEND on the endpoint is already badged (a badge is set once)
     /// without it — devmgr's with [`PUBLISH_AUTHORITY`], the published
     /// `svcmgr` name's with [`PUBLISHED_SEND_BADGE`], and each per-process
@@ -806,13 +807,14 @@ pub mod svcmgr_labels
     pub const PUBLISHED_SEND_BADGE: u64 = 1;
     /// Publish a named endpoint into the discovery registry.
     ///
-    /// Data words: `[name_len, name_words...]`. One cap attached = the
-    /// endpoint the name resolves to.
+    /// Label bits 16..31 carry `name_len`; data words from 0 carry the name
+    /// bytes packed little-endian. `caps[0]` is the endpoint the name
+    /// resolves to.
     pub const PUBLISH_ENDPOINT: u64 = 3;
     /// Look up a named endpoint; reply transfers the cap if known.
     ///
-    /// Label's high 16 bits carry `name_len` (see `shared/ipc` `read_path`
-    /// pattern); data words carry the name. Reply attaches the cap on
+    /// Label bits 16..31 carry `name_len` (see `shared/ipc` `read_path`
+    /// pattern); data words from 0 carry the name. Reply attaches the cap on
     /// success, or returns `svcmgr_errors::UNKNOWN_NAME` on miss.
     pub const QUERY_ENDPOINT: u64 = 4;
 
@@ -1885,11 +1887,14 @@ pub mod stream_labels
     pub const STREAM_REGISTER_NAME: u64 = 11;
 }
 
-/// Badge bits reserved for verb authority on every endpoint: each
-/// `*_AUTHORITY` constant in this crate is one of these bits. A minter that
-/// draws badges at random (procmgr's per-process badge) keeps them clear, so
-/// only a server's trusted minters set a verb bit (docs/capability-model.md
-/// § Verb-bit authority pattern).
+/// Badge bits that endpoints gating a label on a verb-bit use for it: each
+/// `*_AUTHORITY` constant in this crate is one of these bits. A minter whose
+/// badges carry other information onto such an endpoint keeps them clear —
+/// procmgr's random per-process badge, stamped on the child's svcmgr-registry
+/// and procmgr SENDs — so only a server's trusted minters set a verb bit
+/// (docs/capability-model.md § Verb-bit authority pattern). Endpoints with no
+/// verb gate (bootstrap endpoints, memmgr, namespace node caps) do not
+/// reserve them.
 pub const VERB_BIT_MASK: u64 = (1u64 << 63) | (1u64 << 62);
 
 /// Reserved log-endpoint badges.

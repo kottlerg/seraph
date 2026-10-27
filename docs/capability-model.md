@@ -438,12 +438,13 @@ the verb-bit; a holder of an unprivileged cap cannot re-derive an
 authority cap. The server's dispatcher checks
 `msg.badge & VERB_BIT != 0` before servicing the privileged label and
 replies `UNAUTHORIZED` otherwise. The verb-bits in use are bits 62 and 63
-(`ipc::VERB_BIT_MASK`). A minter that hands out badges carrying other
-information keeps them clear: procmgr's random per-process badge, stamped
-on every child's registry, log, and process-handle SENDs, is redrawn until
-neither bit is set. An unbadged SEND on such an endpoint stays with the
-server and its trusted minters, since its holder could badge it with any
-verb-bit.
+(`ipc::VERB_BIT_MASK`). On an endpoint that gates labels this way, a
+minter that hands out badges carrying other information keeps them clear:
+procmgr's random per-process badge, stamped on every SEND procmgr mints
+for a child (its procmgr, registry, and log SENDs) and on its process
+handle, is redrawn until neither bit is set. An un-badged SEND on such an
+endpoint stays with the server and its trusted minters, since its holder
+could badge it with any verb-bit.
 
 ---
 

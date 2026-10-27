@@ -16,12 +16,16 @@ pub fn phases() -> &'static [Phase]
 {
     &[
         Phase {
-            name: "svcmgr_handover_repeat",
-            run: svcmgr_handover_repeat_phase,
+            name: "svcmgr_handover_gate",
+            run: svcmgr_handover_gate_phase,
         },
         Phase {
             name: "svcmgr_publish_gate",
             run: svcmgr_publish_gate_phase,
+        },
+        Phase {
+            name: "svcmgr_published_send_badged",
+            run: svcmgr_published_send_badged_phase,
         },
     ]
 }
@@ -42,14 +46,16 @@ fn registry_cap_and_buf(phase: &str) -> (u32, *mut u64)
     (registry_cap, ipc_buf)
 }
 
-/// A `HANDOVER_COMPLETE` after init's handover must be refused. Were it
+/// A `HANDOVER_COMPLETE` through the per-process SEND, whose process badge
+/// procmgr keeps clear of `HANDOVER_AUTHORITY`, must be refused. Were it
 /// honoured, svcmgr would re-run reconciliation and launch a second instance
-/// of every defined service. svctest runs only after the handover, so this
-/// exercises the once-only rule; the badge half of the gate is host-tested
-/// in `svcmgr-defs` (`handover_permitted`).
-fn svcmgr_handover_repeat_phase(_caps: &Caps)
+/// of every defined service. svctest runs after the handover, so the
+/// once-only rule would refuse it as well; that rule alone is host-tested in
+/// `svcmgr-defs` (`handover_is_honoured_only_once`), since only init can mint
+/// a SEND that passes the badge test.
+fn svcmgr_handover_gate_phase(_caps: &Caps)
 {
-    let (registry_cap, ipc_buf) = registry_cap_and_buf("svcmgr_handover_repeat");
+    let (registry_cap, ipc_buf) = registry_cap_and_buf("svcmgr_handover_gate");
     let msg = ipc::IpcMessage::new(ipc::svcmgr_labels::HANDOVER_COMPLETE);
     // SAFETY: ipc_buf is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(registry_cap, &msg, ipc_buf) }
@@ -57,10 +63,10 @@ fn svcmgr_handover_repeat_phase(_caps: &Caps)
     assert_eq!(
         reply.label,
         ipc::svcmgr_errors::UNAUTHORIZED,
-        "svcmgr HANDOVER_COMPLETE after the handover must reply UNAUTHORIZED (got {:#x})",
+        "svcmgr HANDOVER_COMPLETE without HANDOVER_AUTHORITY must reply UNAUTHORIZED (got {:#x})",
         reply.label
     );
-    std::os::seraph::log!("svcmgr handover-repeat phase passed (UNAUTHORIZED reply)");
+    std::os::seraph::log!("svcmgr handover-gate phase passed (UNAUTHORIZED reply)");
 }
 
 /// `PUBLISH_ENDPOINT` through the per-process SEND must fail the
@@ -84,4 +90,44 @@ fn svcmgr_publish_gate_phase(_caps: &Caps)
         reply.label
     );
     std::os::seraph::log!("svcmgr publish-gate phase passed (UNAUTHORIZED reply)");
+}
+
+/// The SEND svcmgr publishes under `svcmgr` must already be badged, so a
+/// consumer that resolves it cannot re-badge it with a verb-bit and forge
+/// `HANDOVER_COMPLETE` or `PUBLISH_ENDPOINT` authority.
+fn svcmgr_published_send_badged_phase(_caps: &Caps)
+{
+    let (registry_cap, ipc_buf) = registry_cap_and_buf("svcmgr_published_send_badged");
+    let name = ipc::published_names::SVCMGR;
+    let label = ipc::svcmgr_labels::QUERY_ENDPOINT | ((name.len() as u64) << 16);
+    let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(registry_cap, &msg, ipc_buf) }
+        .expect("svcmgr QUERY_ENDPOINT ipc_call must return a reply");
+    assert_eq!(
+        reply.label,
+        ipc::svcmgr_errors::SUCCESS,
+        "svcmgr QUERY_ENDPOINT(svcmgr) must resolve (got {:#x})",
+        reply.label
+    );
+    let published = reply.caps().first().copied().unwrap_or(0);
+    assert_ne!(
+        published, 0,
+        "svcmgr QUERY_ENDPOINT(svcmgr) returned no cap"
+    );
+    let rebadged = syscall::cap_derive_badge(
+        published,
+        syscall::RIGHTS_EP_SEND,
+        ipc::svcmgr_labels::HANDOVER_AUTHORITY,
+    );
+    if let Ok(forged) = rebadged
+    {
+        let _ = syscall::cap_delete(forged);
+    }
+    let _ = syscall::cap_delete(published);
+    assert!(
+        rebadged.is_err(),
+        "the published svcmgr SEND must be badged: re-badging it with HANDOVER_AUTHORITY succeeded"
+    );
+    std::os::seraph::log!("svcmgr published-send phase passed (re-badge refused)");
 }

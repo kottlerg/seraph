@@ -13,8 +13,10 @@ svcmgr holds the Receive-side capability (delivered in the handover
 endowment) and multiplexes it with the shared death-notification
 EventQueue via a WaitSet.
 
-A SEND on the same endpoint (without the [`PUBLISH_AUTHORITY`](#publish-authority)
-verb bit) is delivered to every process via
+A SEND on the same endpoint (carrying neither the
+[`PUBLISH_AUTHORITY`](#publish-authority) nor the
+[`HANDOVER_AUTHORITY`](#label-2-handover_complete) verb bit) is delivered to
+every process via
 [`ProcessInfo.service_registry_cap`](../../../abi/process-abi/README.md#processinfo)
 so userspace consumers can
 `QUERY_ENDPOINT` for published names.

@@ -368,10 +368,10 @@ pub fn resolve_spawn_sched(
 /// - **equal to `reserved_low32`** — the init-reap correlator
 ///   (`INIT_REAP_CORRELATOR`), which `dispatch_death` routes to init teardown.
 ///
-/// and no bit of `verb_bits` may be set: the badge rides each child's
-/// registry SEND on svcmgr's endpoint (and its log SEND and process handle),
-/// where a verb bit (`ipc::VERB_BIT_MASK`) would grant the child an authority
-/// its servers reserve to trusted minters.
+/// and no bit of `verb_bits` may be set: the badge rides every SEND procmgr
+/// mints for the child (its procmgr, svcmgr-registry, and log SENDs) and its
+/// process handle, where a verb bit (`ipc::VERB_BIT_MASK`) would grant the
+/// child an authority its servers reserve to trusted minters.
 ///
 /// All are reachable under random badge minting; the old monotonic counter
 /// started at `LOG_BADGE_FIRST_CHILD` and so upheld the floor structurally.

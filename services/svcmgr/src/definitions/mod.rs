@@ -16,9 +16,11 @@
 //! neither `seed` nor `provides`. The same definition drives both first
 //! launch (for services init did not bootstrap) and every restart.
 //!
-//! The plain-data recipe types, the `.svc` parser, and the argv/env
-//! wire-blob encoder `build_blob` live in the host-tested `svcmgr-defs`
-//! crate (re-exported here); this module keeps the impure halves:
+//! The plain-data recipe types, the `.svc` parser, the argv/env wire-blob
+//! encoder `build_blob`, and the cwd-cap rights (`cwd_rights`) and
+//! `HANDOVER_COMPLETE` gate (`handover_permitted`) decisions live in the
+//! host-tested `svcmgr-defs` crate (re-exported here); this module keeps the
+//! impure halves:
 //!
 //! At [`crate::svcmgr_labels::HANDOVER_COMPLETE`] svcmgr calls
 //! [`reconcile::reconcile_and_launch`]:

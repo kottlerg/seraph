@@ -148,8 +148,10 @@ at reconciliation time. The fixed-size fields live on `ServiceEntry`:
 | `thread_cap` | endowment thread cap (bind-only) or `Launched.thread_cap` (svcmgr-launched) |
 | `process_handle` | `Launched.process_handle` for svcmgr-launched; `0` for init-spawned (see DESTROY_PROCESS comment above) |
 
-The heap-backed launch surfaces that don't fit the fixed record are held
-in a parallel [`RestartRecipe`](../src/service.rs) table
+The launch surfaces svcmgr replays beyond the fixed record (the
+heap-backed argv / env / cwd / seed, plus the log-sink flag and
+scheduling fields) are held in a parallel
+[`RestartRecipe`](../src/service.rs) table
 (`SvcmgrState.recipes`), index-aligned with `services[]` via the death
 correlator:
 

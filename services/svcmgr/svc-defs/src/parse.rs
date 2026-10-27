@@ -148,7 +148,8 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// `log_sink` with `seed`/`provides`, more
 /// `seed` names than the bootstrap caps left after a provider's RECV,
 /// `sched_max` below `priority`), a `binary` or
-/// subtree path over `ipc::MAX_PATH_LEN` ([`ParseError::InvalidValue`]), or
+/// subtree path over `ipc::MAX_PATH_LEN` or with no path components
+/// ([`ParseError::InvalidValue`]), or
 /// `argv` / `env` that would not fit procmgr's `CREATE_FROM_FILE` message
 /// ([`ParseError::TooLarge`]).
 // too_many_lines: one pass over the `key = value` grammar whose per-key
@@ -526,6 +527,16 @@ fn parse_namespace(lineno: usize, value: &str) -> Result<NamespaceShape, ParseEr
         {
             return Err(ParseError::BadNamespace(lineno, value.to_owned()));
         }
+        // A path with no components walks no NS_LOOKUP hop, so no namespace
+        // server attenuates the cap to `<rights>`: the child would get
+        // svcmgr's root at full rights.
+        if path.split('/').all(str::is_empty)
+        {
+            return Err(ParseError::InvalidValue(
+                lineno,
+                "namespace subtree path must name a directory below the root (use universal)",
+            ));
+        }
         check_path_len(
             lineno,
             path,
@@ -876,7 +887,7 @@ sched_max = 12\n";
                  namespace = subtree:{subtree}:LOOKUP\ncwd = {cwd}\n"
             )
         };
-        for (subtree, cwd) in [("/data/", "/data"), ("/data/", "/data/logs"), ("/", "/etc")]
+        for (subtree, cwd) in [("/data/", "/data"), ("/data/", "/data/logs")]
         {
             parse("x", &recipe(subtree, cwd)).expect("cwd inside subtree");
         }
@@ -884,6 +895,22 @@ sched_max = 12\n";
             parse("x", &recipe("/data/", "/data2")),
             Err(ParseError::InvalidValue(0, why)) if why.starts_with("cwd must be")
         ));
+    }
+
+    #[test]
+    fn subtree_path_with_no_components_is_rejected()
+    {
+        for path in ["/", "//"]
+        {
+            let recipe = format!(
+                "binary = /services/x\nrestart = never\ncritical = no\n\
+                 namespace = subtree:{path}:LOOKUP\n"
+            );
+            assert!(matches!(
+                parse("x", &recipe),
+                Err(ParseError::InvalidValue(4, why)) if why.starts_with("namespace subtree path must")
+            ));
+        }
     }
 
     #[test]

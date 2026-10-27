@@ -99,9 +99,9 @@ that message:
 
 Restarts are counted per service over its lifetime: the count has no
 window and is never reset. Once `service::MAX_RESTARTS` (currently `1`)
-restarts have run, the next death leaves the service permanently down —
+restarts have run, the next death leaves the service permanently down:
 degraded, or a graceful shutdown for `critical = yes` (see
-[`critical`](#critical)) — see [restart-protocol.md](restart-protocol.md).
+[`critical`](#critical)). See [restart-protocol.md](restart-protocol.md).
 
 ## `critical`
 
@@ -139,7 +139,7 @@ The primary lever for confining a service to only what it needs.
 |---|---|
 | `none` | No namespace cap delivered. The child's `ProcessInfo.system_root_cap` stays zero; std-side absolute-path filesystem operations return `Unsupported` (see [Namespace Model](../../../docs/namespace-model.md#initial-capability-delivery)). Default tight choice for services with no filesystem dependency. |
 | `universal` | `cap_copy` of svcmgr's own root (the system universal root). Reserved for services that need genuine root authority (vfsd as the namespace authority, devmgr for `/dev`, procmgr for walking `/services` and `/programs`, svctest as the namespace tester). |
-| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<path>` is absolute and at most `ipc::MAX_PATH_LEN` (48) bytes, the same fixed-buffer bound as `binary`; longer is a parser error. `<rights>` is a `+`-joined list of rights names (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown rights names are parser errors. Empty rights list is a parser error. |
+| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<path>` is absolute, names a directory below the root, and is at most `ipc::MAX_PATH_LEN` (48) bytes, the same fixed-buffer bound as `binary`; longer is a parser error, and so is a path with no components (`subtree:/`, which no namespace server would attenuate; use `universal`). `<rights>` is a `+`-joined list of rights names (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown rights names are parser errors. Empty rights list is a parser error. |
 
 Example subtree clause:
 
@@ -241,7 +241,7 @@ consumer's `QUERY_ENDPOINT` lookup unchanged):
 
 | Suffix | Badge | Use |
 |---|---|---|
-| *(none)* | `0` (unbadged) | Plain SEND. e.g. `timed`. |
+| *(none)* | `0` (unbadged) | Plain SEND, for an endpoint whose server gates no label on a verb-bit: a consumer can badge an unbadged SEND itself ([Capability Model](../../../docs/capability-model.md#verb-bit-authority-pattern)). e.g. `timed`. |
 | `:auth` | `1 << 63` | The universal verb-authority bit shared by every `*_AUTHORITY` constant — the server's `badge & (1 << 63)` gate passes. e.g. `pwrmgr.shutdown:auth`. |
 | `:deny` | `1` | Present so the cap resolves, but the authority gate fails. The negative-test twin. e.g. `pwrmgr.deny:deny`. |
 

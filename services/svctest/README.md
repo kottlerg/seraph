@@ -42,7 +42,7 @@ services/svctest/
         ├── fs_ipc.rs          # Raw `FS_*` IPC against vfsd and fatfs
         ├── fs_std.rs          # `std::fs` over the FS IPC contract
         ├── pwrmgr.rs          # Shutdown cap-deny check and terminal shutdown
-        ├── svcmgr.rs          # svcmgr's handover and publish gates via the registry SEND
+        ├── svcmgr.rs          # svcmgr's handover and publish gates; published `svcmgr` SEND badged
         └── timed.rs           # `SystemTime::now()` through svcmgr and timed
 ```
 

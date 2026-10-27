@@ -219,9 +219,21 @@ pub(super) fn release_one_local(entry: &FileEntry, aspace: u32, cookie: u64)
     {
         return;
     };
-    let _ = syscall::mem_unmap(aspace, m.range.va_start(), m.range.page_count());
+    discard_mapping(m, aspace);
+}
+
+/// Unmap an outstanding mapping and delete its cap. The VA returns to the
+/// reservation arena only once the unmap succeeds; a range still mapped
+/// stays reserved until this process exits, so no later reservation can
+/// land on the driver's page.
+pub(super) fn discard_mapping(m: OutstandingMapping, aspace: u32)
+{
+    let unmapped = syscall::mem_unmap(aspace, m.range.va_start(), m.range.page_count()).is_ok();
     let _ = syscall::cap_delete(m.memory_cap);
-    pal_reserve::unreserve_pages(m.range);
+    if unmapped
+    {
+        pal_reserve::unreserve_pages(m.range);
+    }
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,

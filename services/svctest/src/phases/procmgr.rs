@@ -55,6 +55,10 @@ pub fn command_phases() -> &'static [Phase]
             run: command_non_utf8_refused_phase,
         },
         Phase {
+            name: "command_from_spawned_thread",
+            run: command_from_spawned_thread_phase,
+        },
+        Phase {
             name: "stdio_file_unsupported",
             run: stdio_file_unsupported_phase,
         },
@@ -374,6 +378,58 @@ pub fn command_non_utf8_refused_phase(_: &Caps)
         "a non-UTF-8 env value must surface as InvalidInput, got {err:?}"
     );
     std::os::seraph::log!("command_non_utf8_refused phase passed");
+}
+
+/// `Command::spawn`, `Child::kill`, and dropping an unwaited `Child` each
+/// call procmgr through the calling thread's IPC buffer, so all three must
+/// work from a spawned thread as from main.
+pub fn command_from_spawned_thread_phase(_: &Caps)
+{
+    use std::process::{Command, Stdio};
+
+    let spawner = std::thread::Builder::new()
+        .name("command_spawner".into())
+        .spawn(|| {
+            let output = Command::new("/programs/hello")
+                .output()
+                .expect("Command::output from a spawned thread failed");
+            assert!(
+                output.status.success(),
+                "hello spawned from a thread did not exit cleanly: {}",
+                output.status
+            );
+            assert!(
+                !output.stdout.is_empty(),
+                "hello spawned from a thread produced no stdout"
+            );
+
+            // stdiotest blocks on its piped stdin, so the kill and the drop
+            // below each land on a live child.
+            let mut child = Command::new("/programs/stdiotest")
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("spawning stdiotest from a spawned thread failed");
+            child
+                .kill()
+                .expect("Child::kill from a spawned thread failed");
+            let status = child.wait().expect("wait on the killed stdiotest failed");
+            assert_eq!(
+                status.to_string(),
+                "killed",
+                "a killed child must report killed, got {status}"
+            );
+
+            let unwaited = Command::new("/programs/stdiotest")
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("spawning the unwaited stdiotest failed");
+            drop(unwaited);
+        })
+        .expect("command_from_spawned_thread spawn failed");
+    spawner
+        .join()
+        .expect("command_from_spawned_thread child panicked");
+    std::os::seraph::log!("command_from_spawned_thread phase passed");
 }
 
 /// `file_size` word + 32 argv words + env header + 30 env words = 64: the

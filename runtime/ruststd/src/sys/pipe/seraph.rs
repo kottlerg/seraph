@@ -86,7 +86,9 @@ const RING_RELEASED: u8 = 4;
 /// `DESTROY_PROCESS` has returned, by which point procmgr has revoked the
 /// child's address space. `Pipe::Drop` and the death bridge each report
 /// their side's completion here; whichever observes the other side
-/// already done gets `true` back and sends the release.
+/// already done gets `true` back and sends the release. A parent end
+/// whose ring unmap fails never reports, so its grant stays accounted to
+/// the spawner until exit.
 pub struct RingRelease {
     phys: u64,
     state: AtomicU8,
@@ -315,10 +317,7 @@ impl Pipe {
         {
             Ok(s) => s,
             Err(e) => {
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
-                let _ = syscall::cap_delete(memory_cap);
-                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                unreserve_pages(reserved);
+                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
                 return Err(e);
             }
         };
@@ -330,10 +329,7 @@ impl Pipe {
             Ok(s) => s,
             Err(e) => {
                 let _ = syscall::cap_delete(data_notification);
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
-                let _ = syscall::cap_delete(memory_cap);
-                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                unreserve_pages(reserved);
+                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
                 return Err(e);
             }
         };
@@ -348,10 +344,7 @@ impl Pipe {
             Err(_) => {
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
-                let _ = syscall::cap_delete(memory_cap);
-                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                unreserve_pages(reserved);
+                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (memory handoff) failed",
                 ));
@@ -363,10 +356,7 @@ impl Pipe {
                 let _ = syscall::cap_delete(memory_handoff);
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
-                let _ = syscall::cap_delete(memory_cap);
-                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                unreserve_pages(reserved);
+                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (data handoff) failed",
                 ));
@@ -379,10 +369,7 @@ impl Pipe {
                 let _ = syscall::cap_delete(memory_handoff);
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
-                let _ = syscall::cap_delete(memory_cap);
-                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                unreserve_pages(reserved);
+                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (space handoff) failed",
                 ));
@@ -463,8 +450,8 @@ impl Pipe {
         })
     }
 
-    /// Spawn-failure path: the child is being destroyed without ever
-    /// having run, but the release was already armed for the bridge,
+    /// Spawn-failure path: the child never ran, or its `DESTROY_PROCESS`
+    /// has returned, but the release was already armed for the bridge,
     /// which will exit via the drop sentinel without reporting a death.
     /// Report the peer dead here instead so this end's eventual `Drop`
     /// returns the ring grant.
@@ -722,6 +709,19 @@ impl Drop for Pipe {
                 crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
             }
         }
+    }
+}
+
+/// Error-path teardown of a parent ring page mapped at `reserved` in
+/// `aspace`. The page returns to memmgr and its VA to the arena only once
+/// the unmap succeeds; a page still mapped stays held, with its VA, until
+/// this process exits, as in `Pipe::drop`.
+fn discard_mapped_ring(aspace: u32, memory_cap: u32, ring_phys: u64, reserved: ReservedRange) {
+    let unmapped = syscall::mem_unmap(aspace, reserved.va_start(), 1).is_ok();
+    let _ = syscall::cap_delete(memory_cap);
+    if unmapped {
+        crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
+        unreserve_pages(reserved);
     }
 }
 

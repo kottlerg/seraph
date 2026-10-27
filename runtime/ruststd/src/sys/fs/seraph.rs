@@ -299,67 +299,36 @@ impl Iterator for ReadDir
         }
         loop
         {
-            let msg = IpcMessage::builder(ns_labels::NS_READDIR)
-                .word(0, self.next_idx)
-                .build();
-            // SAFETY: ipc_buf is the registered IPC buffer.
-            let reply = match unsafe { ipc::ipc_call(self.dir_cap, &msg, ipc_buf) }
+            let entry = match ns_readdir_one(self.dir_cap, self.next_idx, ipc_buf)
             {
-                Ok(r) => r,
-                Err(_) =>
-                {
-                    return Some(Err(io::Error::other(
-                        "seraph fs: NS_READDIR ipc_call failed",
-                    )));
-                }
+                Ok(Some(e)) => e,
+                Ok(None) => return None,
+                Err(e) => return Some(Err(e)),
             };
-            if reply.label == fs_labels::END_OF_DIR
-            {
-                return None;
-            }
-            if reply.label != 0
-            {
-                return Some(Err(ns_error_to_io(reply.label)));
-            }
-
-            let kind_word = reply.word(0);
-            let name_len = reply.word(1) as usize;
-            let bytes = reply.data_bytes();
-            const NAME_OFF: usize = 16; // words 0,1 = kind + name_len
-            let end = NAME_OFF.saturating_add(name_len).min(bytes.len());
-            if end < NAME_OFF + name_len
-            {
-                return Some(Err(io::Error::other(
-                    "seraph fs: NS_READDIR truncated name",
-                )));
-            }
-            let name_bytes = &bytes[NAME_OFF..end];
-
             self.next_idx = self.next_idx.saturating_add(1);
 
             // Filter the FAT-surfaced `.` / `..` entries. Std iterates
             // children, not the dir-self / dir-parent pseudo-entries.
-            if name_bytes == b"." || name_bytes == b".."
+            if entry.name == b"." || entry.name == b".."
             {
                 continue;
             }
 
-            let kind = if kind_word == NodeKind::Dir as u64
+            // The name is wire input. `DirEntry::path` joins it onto the
+            // parent, so only a single valid component names this entry; an
+            // empty name or one with a slash would name another node.
+            if validate_name(&entry.name).is_err()
             {
-                NodeKind::Dir
+                return Some(Err(io::const_error!(
+                    io::ErrorKind::InvalidData,
+                    "seraph fs: NS_READDIR returned an invalid entry name",
+                )));
             }
-            else
-            {
-                NodeKind::File
-            };
-            let name = OsString::from(
-                core::str::from_utf8(name_bytes)
-                    .unwrap_or("<non-utf8>")
-                    .to_owned(),
-            );
+            // `validate_name` accepts only UTF-8.
+            let name = OsString::from(core::str::from_utf8(&entry.name).unwrap_or_default());
             return Some(Ok(DirEntry {
                 name,
-                kind,
+                kind: entry.kind,
                 parent_path: self.parent_path.clone(),
             }));
         }
@@ -1848,13 +1817,7 @@ impl Drop for File
             {
                 for m in release_handler::drain_mappings(entry.as_ref())
                 {
-                    let _ = syscall::mem_unmap(
-                        self.aspace,
-                        m.range.va_start(),
-                        m.range.page_count(),
-                    );
-                    let _ = syscall::cap_delete(m.memory_cap);
-                    crate::sys::reserve::unreserve_pages(m.range);
+                    release_handler::discard_mapping(m, self.aspace);
                 }
             }
         }

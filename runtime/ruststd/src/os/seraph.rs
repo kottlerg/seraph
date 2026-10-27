@@ -52,7 +52,9 @@ pub use process_abi::StackNote;
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 #[derive(Debug, Clone, Copy)]
 pub struct StartupInfo {
-    /// Virtual address of the pre-mapped IPC buffer page.
+    /// Virtual address of the main thread's pre-mapped IPC buffer page.
+    /// Every other thread registers its own; IPC from any thread goes
+    /// through [`current_ipc_buf`].
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub ipc_buffer: *mut u8,
     /// Cap slot of the SEND endpoint back to the creator, or 0 when absent.

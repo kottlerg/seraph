@@ -130,14 +130,21 @@ const PATH_DESCRIPTION =
 const SCOPE_SCHEMA = {
     type: 'object',
     required: [
-        'head', 'base', 'repo_root', 'tree_at_head', 'since_reachable', 'pr_has_code', 'files',
-        'pr_files', 'open_issues', 'changed_items', 'design_docs', 'claimed_fixes',
+        'head', 'base', 'since_base', 'repo_root', 'tree_at_head', 'since_reachable',
+        'pr_has_code', 'files', 'pr_files', 'open_issues', 'changed_items', 'design_docs',
+        'claimed_fixes',
     ],
     properties: {
         head: { type: 'string', description: 'Full SHA of the PR head commit.' },
         base: {
             type: 'string',
             description: 'Full SHA of the merge base of the PR head and its base branch.',
+        },
+        since_base: {
+            type: 'string',
+            description:
+                'In delta mode, full SHA of the merge base of `since` and the base branch; ' +
+                'an empty string in every other mode.',
         },
         repo_root: {
             type: 'string',
@@ -402,8 +409,9 @@ phase('Scope')
 
 // The delta is the tree diff since..head limited to the files the whole PR diff
 // touches, so a file only a merge or rebase of the base changed is not in it. A
-// hunk the base brought into a PR file still is; the prompts tell the agents that
-// a delta hunk `gh pr diff` does not show is the base's change.
+// hunk the base brought into a PR file still is: by provenance, a delta hunk is
+// the base's only when it also appears in the diff between the merge bases at
+// `since` and at the head, and with equal merge bases every delta hunk is the PR's.
 const DELTA_RANGE = DELTA ? SINCE + ' <head> -- <every file the PR diff touches>' : null
 
 const SCOPE_PROMPT = [
@@ -416,17 +424,22 @@ const SCOPE_PROMPT = [
         '`gh issue list --state open --limit 500 --json number,title`.' +
         (DELTA
             ? ' Then run `git cat-file -e ' + SINCE + '^{commit}` (reachability), ' +
+                '`git merge-base ' + SINCE + ' origin/<baseRefName>` (since_base), ' +
                 '`git diff --numstat --no-renames ' + DELTA_RANGE + '` (the delta: a tree ' +
                 'diff between the two commits, valid whether or not ' + SINCE + ' is an ' +
                 'ancestor of the head, limited to the PR\'s own files, so a file only a merge ' +
-                'or rebase of the base changed is not in it; a hunk in it that `gh pr diff` ' +
-                'does not show came from the base, and wherever this prompt says the delta it ' +
-                'means this diff without such hunks), and `git log --format=%B ' + SINCE +
-                '..<head>`.'
+                'or rebase of the base changed is not in it), and `git log --format=%B ' +
+                SINCE + '..<head>`. A hunk of the delta is the base\'s only when it also ' +
+                'appears in `git diff <since_base> <base> -- <file>`; when the two merge bases ' +
+                'are equal, every delta hunk is the PR\'s. A base hunk counts toward the file ' +
+                'list and `changed`, but no criterion below treats it as a change the delta ' +
+                'made.'
             : ''),
     '',
     'Return, per the schema, with every path repository-relative exactly as git prints it:',
-    '- head: the PR head SHA; base: the merge base of the head and the base branch.',
+    '- head: the PR head SHA; base: the merge base of the head and the base branch; ' +
+        'since_base: ' +
+        (DELTA ? 'the merge base of ' + SINCE + ' and the base branch.' : 'an empty string.'),
     '- repo_root: the absolute path of the working tree root.',
     '- tree_at_head: whether HEAD is the PR head and the tree is clean.',
     '- since_reachable: ' +
@@ -492,6 +505,9 @@ if (DELTA && !scope.since_reachable) {
         error: 'since ' + SINCE + ' does not resolve in this clone; run mode full with the ledger.',
     }
 }
+if (DELTA && MODE !== 'scope' && !/^[0-9a-f]{40}$/.test(scope.since_base || '')) {
+    return { error: 'scope returned no since_base; base hunks cannot be told apart' }
+}
 
 // Every path the agents return joins by string equality below, so normalize
 // the forms an agent may emit despite the schema description.
@@ -522,7 +538,7 @@ scope.design_docs = scope.design_docs.map(normalize)
 // branch changed between `since` and the head is master's, not this PR's. The
 // numstat runs without rename detection, so a renamed file keeps its new path.
 // The scope agent lists only the PR's files, so this filter is a backstop that
-// logs what it drops; base hunks inside a PR file are the reviewers' to tell apart.
+// logs what it drops; base hunks inside a PR file are told apart by provenance.
 if (DELTA && pr_files.size > 0) {
     for (const f of scope.files) {
         if (!pr_files.has(f.path)) log('delta: ' + f.path + ' is not in the PR diff; not reviewed')
@@ -552,9 +568,16 @@ const HEAD_LINE =
     '` is the PR diff' +
     (DELTA
         ? ' and `git diff ' + SINCE + ' ' + scope.head + ' -- <the PR diff\'s files>` is the ' +
-            'delta (a file only a merge or rebase of the base changed is not in it; a hunk in ' +
-            'it that the PR diff does not show came from the base, is not one the delta ' +
-            'introduced, and puts no finding on the surface)'
+            'delta (a file only a merge or rebase of the base changed is not in it). A delta ' +
+            'hunk is the base\'s only when it also appears in `git diff ' + scope.since_base +
+            ' ' + scope.base + ' -- <file>`, the change between the merge bases at ' + SINCE +
+            ' and at the head' +
+            (scope.since_base === scope.base
+                ? '; here they are equal, so every delta hunk is the PR\'s'
+                : '') +
+            '. A standards, doc-drift, coverage, or style finding in a base hunk is not one ' +
+            'the delta introduced; a correctness, safety, or contract defect in one stays on ' +
+            'the surface, as in any touched file'
         : '') + '.'
 
 const DELTA_NOTE = DELTA

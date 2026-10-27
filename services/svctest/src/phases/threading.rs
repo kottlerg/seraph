@@ -5,8 +5,9 @@
 
 //! Threading / per-thread state surface: Mutex+Arc multi-threading,
 //! per-thread stdio IPC buffer, per-thread allocator grows, the
-//! `thread_local!` macro, a spawned thread's identity and park/unpark
-//! through its handle, `RwLock` wakes for several queued readers, and
+//! `thread_local!` macro and its destructors at a spawned thread's exit, a
+//! spawned thread's identity and park/unpark through its handle, `RwLock`
+//! wakes for several queued readers and its non-blocking paths, and
 //! `Condvar::wait_timeout`.
 
 use std::cell::Cell;
@@ -41,6 +42,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "thread_identity",
             run: thread_identity_phase,
+        },
+        Phase {
+            name: "tls_destructors",
+            run: tls_destructors_phase,
         },
         Phase {
             name: "rwlock_queued_readers",
@@ -229,6 +234,34 @@ pub fn thread_identity_phase(_: &Caps)
     std::os::seraph::log!("thread_identity phase passed");
 }
 
+/// A spawned thread's `thread_local!` destructors run when it exits, before
+/// `join` returns.
+pub fn tls_destructors_phase(_: &Caps)
+{
+    struct SetOnDrop(Arc<AtomicBool>);
+    impl Drop for SetOnDrop
+    {
+        fn drop(&mut self)
+        {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    std::thread_local! {
+        static GUARD: Cell<Option<SetOnDrop>> = const { Cell::new(None) };
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let flag = dropped.clone();
+    thread::spawn(move || GUARD.with(|g| g.set(Some(SetOnDrop(flag)))))
+        .join()
+        .expect("tls_destructors child panicked");
+    assert!(
+        dropped.load(Ordering::Acquire),
+        "a spawned thread's thread_local! value was not dropped at exit"
+    );
+    std::os::seraph::log!("tls_destructors phase passed");
+}
+
 /// Two readers queued behind a held write lock both acquire once it is
 /// released: each woken waiter passes the wake on, so none is stranded.
 pub fn rwlock_queued_readers_phase(_: &Caps)
@@ -264,6 +297,15 @@ pub fn rwlock_queued_readers_phase(_: &Caps)
     {
         r.join().expect("rwlock reader panicked");
     }
+
+    // The contended readers acquired with the waiters bit set; a free lock
+    // must still be taken by the non-blocking paths.
+    let held = lock
+        .try_write()
+        .expect("try_write on a free lock after contended readers");
+    drop(held);
+    let shared = lock.try_read().expect("try_read on a free lock");
+    drop(shared);
     std::os::seraph::log!("rwlock_queued_readers phase passed");
 }
 

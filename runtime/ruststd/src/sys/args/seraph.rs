@@ -9,7 +9,7 @@
 //!
 //! The blob format is defined by the argv section comment above
 //! `ProcessInfo::args_offset` in `abi/process-abi/src/lib.rs`; the field walks
-//! are `argv_env::next_field` and `argv_env::prev_field`.
+//! are `argv_env::{bounded_fields, next_field, prev_field}`.
 //!
 //! Each entry comes out of `args_os()` as its raw bytes, since an `OsString`
 //! on this target is a byte string; `args()` panics on an entry that is not
@@ -17,7 +17,7 @@
 //! non-UTF-8 argv should use `args_os`. Both iterators are double-ended and
 //! exact-size: the front and back walks consume disjoint entries.
 
-use argv_env::{next_field, prev_field};
+use argv_env::{bounded_fields, next_field, prev_field};
 
 use crate::ffi::OsString;
 use crate::fmt;
@@ -44,15 +44,7 @@ pub fn args() -> Args {
     let Some(s) = try_startup_info() else {
         return Args { blob: &[], cursor: 0, end: 0, remaining: 0 };
     };
-    let mut end = 0;
-    let mut remaining = 0;
-    while remaining < s.args_count {
-        let Some((_, next)) = next_field(s.args_blob, end) else {
-            break;
-        };
-        end = next.min(s.args_blob.len());
-        remaining += 1;
-    }
+    let (end, remaining) = bounded_fields(s.args_blob, s.args_count);
     Args { blob: s.args_blob, cursor: 0, end, remaining }
 }
 

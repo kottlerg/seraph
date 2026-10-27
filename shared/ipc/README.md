@@ -3,8 +3,8 @@
 Shared IPC helpers for Seraph userspace: the stack-owned `IpcMessage` snapshot type, the
 `ipc_call` / `ipc_recv` / `ipc_reply` wrappers that keep the kernel's per-thread IPC buffer as
 scratch at the syscall boundary, the generic bootstrap protocol, the `RecvGuard`
-receive-failure policy for blocking receive loops, and the per-service IPC label and
-error-code modules.
+receive-failure policy for blocking receive loops, the per-service IPC label and
+error-code modules, and reply-shape decoders (today `memmgr_grant_layout`).
 
 `no_std`; builds inside std's dependency graph through the `rustc-dep-of-std` feature.
 
@@ -17,7 +17,7 @@ shared/ipc/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    ├── lib.rs                  # IpcMessage, call/recv/reply wrappers, label and error modules
+    ├── lib.rs                  # IpcMessage, call/recv/reply wrappers, labels, errors, decoders
     ├── bootstrap.rs            # Creator-to-child bootstrap rounds (request/reply/error)
     └── recv_guard.rs           # RecvGuard backoff and EXIT_RECV_WEDGE policy
 ```

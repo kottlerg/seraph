@@ -80,12 +80,13 @@ const RING_RELEASED: u8 = 4;
 ///
 /// Returning the page is safe only once neither side can write through
 /// it: the parent end must be dropped (unmapped, caps deleted) AND the
-/// child must be dead (its threads are stopped by death-post time; the
-/// child's mapping may outlive that until procmgr's teardown, which
-/// memmgr's release contract tolerates) or never wired. `Pipe::Drop`
-/// and the spawn's death-bridge thread each report their side's
-/// completion here; whichever observes the other side already done
-/// gets `true` back and sends the release.
+/// child must be torn down or never wired. A death post alone does not
+/// stop the child's other threads (docs/process-lifecycle.md § Exit
+/// reason), so the death bridge reports the death only after its
+/// `DESTROY_PROCESS` has returned, by which point procmgr has revoked the
+/// child's address space. `Pipe::Drop` and the death bridge each report
+/// their side's completion here; whichever observes the other side
+/// already done gets `true` back and sends the release.
 pub struct RingRelease {
     phys: u64,
     state: AtomicU8,

@@ -385,7 +385,10 @@ crossover Issue tracks per-arch tuning.
 
 The driver mem-maps the source memory cap read-only into its own address
 space for the duration of the copy. The cap returns to the caller in
-every outcome (mirror of the read-memory ownership discipline).
+every outcome (mirror of the read-memory ownership discipline). The
+driver MUST NOT keep a mapping of the source page, or any capability to
+it, past its reply: once the reply arrives the caller may return the
+page to memmgr's pool, which another process can then be granted.
 
 **Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `IO_ERROR`,
 `PERMISSION_DENIED`, `NO_SPACE`, `BAD_MEMORY_OFFSET`.

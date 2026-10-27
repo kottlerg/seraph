@@ -20,10 +20,10 @@
 //! - Writes ≤ 504 bytes use the inline `FS_WRITE` path with the
 //!   payload riding in the IPC buffer.
 //! - Larger writes use `FS_WRITE_MEMORY`: one memmgr-allocated page per
-//!   process is mapped MAP_WRITABLE in the caller's address space, filled
+//!   write is mapped MAP_WRITABLE in the caller's address space, filled
 //!   chunk-by-chunk, and lent to the driver as a DMA source through a
-//!   `MAP`-only derivation per chunk. The page stays mapped and accounted
-//!   for the process lifetime (see `WriteFrame`).
+//!   `MAP`-only derivation per chunk; the page's run goes back to memmgr
+//!   once the write ends (see `release_write_frame`).
 //!
 //! ## Directory mutation
 //! `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME` operate against
@@ -71,7 +71,7 @@ use crate::hash::{Hash, Hasher};
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::path::{Path, PathBuf};
 pub use crate::sys::fs::common::Dir;
-use crate::sync::{Arc, Mutex, PoisonError};
+use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::vec::Vec;
 use crate::sys::time::SystemTime;
@@ -865,30 +865,31 @@ fn write_inline(
     Ok(written)
 }
 
-/// The source frame every frame-path write copies through: one page from
-/// memmgr, mapped writable at a reserved VA for the process lifetime.
-///
-/// It is never returned to memmgr. The driver maps the frame for each copy
-/// (services/fs/docs/fs-driver-protocol.md § Label 12: `FS_WRITE_MEMORY`),
-/// and the client cannot withdraw a mapping the driver made, so releasing
-/// the run mid-life could hand memory the driver can still reach to another
-/// process. One frame per process bounds what stays accounted; the lock
-/// around it serialises frame-path writes.
-#[derive(Clone, Copy)]
+/// One write's source frame: a page from memmgr, mapped writable at a
+/// reserved VA for the length of the write.
 struct WriteFrame
 {
     cap: u32,
-    va: u64,
+    phys: u64,
+    range: crate::sys::reserve::ReservedRange,
 }
 
-static WRITE_FRAME: Mutex<Option<WriteFrame>> = Mutex::new(None);
+impl WriteFrame
+{
+    fn va(&self) -> u64
+    {
+        self.range.va_start()
+    }
+}
 
-/// Request the process's write frame from memmgr and map it. A frame that
-/// fails to map was never shown to a driver, so its cap is deleted and its
-/// run returned.
+/// Request a source frame from memmgr, fund this address space's page
+/// tables for it, and map it. A frame that fails to map was never shown to
+/// a driver, so its cap is deleted and its run returned.
 fn acquire_write_frame(aspace: u32, memmgr_ep: u32) -> io::Result<WriteFrame>
 {
-    use crate::sys::alloc::seraph::{slab_release_fresh, slab_request_pages};
+    use crate::sys::alloc::seraph::{
+        fund_aspace_pt_budget, slab_release_fresh, slab_request_pages,
+    };
 
     let (cap, _, phys) = slab_request_pages(memmgr_ep, 1)
         .ok_or_else(|| io::Error::other("seraph fs: memmgr REQUEST_MEMORY_CAPS failed"))?;
@@ -897,20 +898,47 @@ fn acquire_write_frame(aspace: u32, memmgr_ep: u32) -> io::Result<WriteFrame>
         slab_release_fresh(phys);
         io::Error::other("seraph fs: reserve_pages failed for write frame")
     })?;
-    let va = range.va_start();
-    if syscall::mem_map(cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
+    if !fund_aspace_pt_budget(aspace, 1)
+        || syscall::mem_map(cap, aspace, range.va_start(), 0, 1, syscall::MAP_WRITABLE).is_err()
     {
         crate::sys::reserve::unreserve_pages(range);
         let _ = syscall::cap_delete(cap);
         slab_release_fresh(phys);
         return Err(io::Error::other("seraph fs: mem_map MAP_WRITABLE failed"));
     }
-    // The reservation stays held, like the mapping, for the process lifetime.
-    Ok(WriteFrame { cap, va })
+    Ok(WriteFrame { cap, phys, range })
+}
+
+/// Tear a write frame down and return its run to memmgr: unmap it, revoke
+/// the derivations lent to the driver, delete the cap, and release the run
+/// by its phys base. The release relies on the driver holding no mapping
+/// of the frame past the copy, which services/fs/docs/fs-driver-protocol.md
+/// § Label 12 requires of it; revocation withdraws a derivation the driver
+/// kept but not a mapping it made.
+fn release_write_frame(frame: WriteFrame, aspace: u32)
+{
+    let _ = syscall::mem_unmap(aspace, frame.va(), 1);
+    crate::sys::reserve::unreserve_pages(frame.range);
+    let _ = syscall::cap_revoke(frame.cap);
+    let _ = syscall::cap_delete(frame.cap);
+    crate::sys::alloc::seraph::slab_release_fresh(frame.phys);
+}
+
+/// How one `FS_WRITE_MEMORY` chunk failed.
+enum ChunkError
+{
+    /// The call itself failed, possibly after the driver received it, so
+    /// the driver may still copy from the frame.
+    Call(io::Error),
+    /// The frame was not lent, or the driver replied: the frame is idle.
+    Settled(io::Error),
 }
 
 /// Bulk write via `FS_WRITE_MEMORY`: loop chunks of at most `PAGE_SIZE`
-/// bytes through the process's [`WriteFrame`] and into the file.
+/// bytes through a [`WriteFrame`] acquired for this write and into the
+/// file, then release the frame with [`release_write_frame`]. After a
+/// failed call the driver may still be copying from the frame, so it is
+/// left mapped and accounted to this process until it exits instead.
 ///
 /// Returns the bytes written. An error after some chunks reached the file
 /// returns their count instead, as a short write, so the caller's position
@@ -924,19 +952,15 @@ fn write_memory_chunks(
     ipc_buf: *mut u64,
 ) -> io::Result<usize>
 {
-    let mut slot = WRITE_FRAME.lock().unwrap_or_else(PoisonError::into_inner);
-    let frame = match *slot
-    {
-        Some(frame) => frame,
-        None => *slot.insert(acquire_write_frame(aspace, memmgr_ep)?),
-    };
-
+    let frame = acquire_write_frame(aspace, memmgr_ep)?;
     let mut total: usize = 0;
+    let mut error = None;
+    let mut frame_idle = true;
     while total < payload.len()
     {
         let chunk = &payload[total..(payload.len().min(total + PAGE_SIZE_USIZE))];
         let chunk_offset = base_offset.saturating_add(total as u64);
-        match write_frame_chunk(file_cap, frame, chunk_offset, chunk, ipc_buf)
+        match write_frame_chunk(file_cap, &frame, chunk_offset, chunk, ipc_buf)
         {
             Ok(n) =>
             {
@@ -947,14 +971,32 @@ fn write_memory_chunks(
                     break;
                 }
             }
-            Err(e) if total == 0 => return Err(e),
-            Err(_) => break,
+            Err(ChunkError::Settled(e)) =>
+            {
+                error = Some(e);
+                break;
+            }
+            Err(ChunkError::Call(e)) =>
+            {
+                frame_idle = false;
+                error = Some(e);
+                break;
+            }
         }
     }
-    Ok(total)
+    if frame_idle
+    {
+        release_write_frame(frame, aspace);
+    }
+    match error
+    {
+        Some(e) if total == 0 => Err(e),
+        _ => Ok(total),
+    }
 }
 
-/// Copy `chunk` into `frame` and send one `FS_WRITE_MEMORY` for it.
+/// Copy `chunk` into `frame`, zero the rest of the page, and send one
+/// `FS_WRITE_MEMORY` for it.
 ///
 /// The driver receives a `MAP`-only derivation of the frame cap, never the
 /// frame cap itself, and returns it as services/fs/docs/fs-driver-protocol.md
@@ -967,19 +1009,22 @@ fn write_memory_chunks(
 /// than `chunk` holds.
 fn write_frame_chunk(
     file_cap: u32,
-    frame: WriteFrame,
+    frame: &WriteFrame,
     offset: u64,
     chunk: &[u8],
     ipc_buf: *mut u64,
-) -> io::Result<usize>
+) -> Result<usize, ChunkError>
 {
-    // SAFETY: `frame.va` is mapped writable for one page, which the
-    // `WRITE_FRAME` lock reserves to this thread; `chunk.len() <= PAGE_SIZE`.
+    // SAFETY: the frame is mapped writable for one page at `frame.va()` and
+    // used by this write alone; `chunk.len() <= PAGE_SIZE`.
     unsafe {
-        core::ptr::copy_nonoverlapping(chunk.as_ptr(), frame.va as *mut u8, chunk.len());
+        let va = frame.va() as *mut u8;
+        core::ptr::copy_nonoverlapping(chunk.as_ptr(), va, chunk.len());
+        core::ptr::write_bytes(va.add(chunk.len()), 0, PAGE_SIZE_USIZE - chunk.len());
     }
-    let lent = syscall::cap_derive(frame.cap, syscall_abi::RIGHTS_MEM_MAP)
-        .map_err(|_| io::Error::other("seraph fs: cap_derive of write frame failed"))?;
+    let lent = syscall::cap_derive(frame.cap, syscall_abi::RIGHTS_MEM_MAP).map_err(|_| {
+        ChunkError::Settled(io::Error::other("seraph fs: cap_derive of write frame failed"))
+    })?;
     let msg = IpcMessage::builder(fs_labels::FS_WRITE_MEMORY)
         .word(0, offset)
         .word(1, chunk.len() as u64)
@@ -996,19 +1041,20 @@ fn write_frame_chunk(
         }
     }
     let _ = syscall::cap_delete(lent);
-    let reply =
-        reply.map_err(|_| io::Error::other("seraph fs: FS_WRITE_MEMORY ipc_call failed"))?;
+    let reply = reply.map_err(|_| {
+        ChunkError::Call(io::Error::other("seraph fs: FS_WRITE_MEMORY ipc_call failed"))
+    })?;
     if reply.label != fs_errors::SUCCESS
     {
-        return Err(map_fs_error(reply.label));
+        return Err(ChunkError::Settled(map_fs_error(reply.label)));
     }
     let n = reply.word(0) as usize;
     if n > chunk.len()
     {
-        return Err(io::const_error!(
+        return Err(ChunkError::Settled(io::const_error!(
             io::ErrorKind::InvalidData,
             "seraph fs: FS_WRITE_MEMORY reported more bytes than were sent",
-        ));
+        )));
     }
     Ok(n)
 }
@@ -1463,7 +1509,8 @@ impl File
             }
         };
         let va = range.va_start();
-        if syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READONLY).is_err()
+        if !crate::sys::alloc::seraph::fund_aspace_pt_budget(self.aspace, 1)
+            || syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READONLY).is_err()
         {
             crate::sys::reserve::unreserve_pages(range);
             let _ = syscall::cap_delete(memory_cap);

@@ -307,8 +307,7 @@ impl Heap {
     ///
     /// On failure, every cap of the failing reply that is not mapped is
     /// deleted and its run returned to memmgr ([`release_reply_caps`]). A
-    /// cap whose map failed partway (`SYS_MEM_MAP` maps page by page and
-    /// rolls nothing back, core/kernel/docs/syscalls.md § SYS_MEM_MAP) is
+    /// failed map can leave some of the cap's pages mapped, so that cap is
     /// unmapped first, and kept, still accounted to this process, if the
     /// unmap fails. The pages mapped before the failure, by this reply or an
     /// earlier round, are still added to the free list with `mapped_end`

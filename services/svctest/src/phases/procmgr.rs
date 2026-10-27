@@ -51,6 +51,10 @@ pub fn command_phases() -> &'static [Phase]
             run: command_blobs_fill_message_phase,
         },
         Phase {
+            name: "command_non_utf8_refused",
+            run: command_non_utf8_refused_phase,
+        },
+        Phase {
             name: "stdio_file_unsupported",
             run: stdio_file_unsupported_phase,
         },
@@ -337,6 +341,37 @@ pub fn command_blobs_over_message_phase(_: &Caps)
         "joint blob overflow must surface as ArgumentListTooLong, got {err:?}"
     );
     std::os::seraph::log!("command_blobs_over_message phase passed");
+}
+
+/// The process ABI defines argv and env as UTF-8 strings, so std refuses a
+/// non-UTF-8 argument or env value with `InvalidInput` before any child is
+/// created.
+pub fn command_non_utf8_refused_phase(_: &Caps)
+{
+    // SAFETY: this target's `OsStr` is the byte-string encoding, for which
+    // every byte sequence is valid.
+    let invalid = unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(vec![0xFF]) };
+
+    let err = std::process::Command::new(BLOB_FIXTURE)
+        .arg(&invalid)
+        .spawn()
+        .expect_err("a non-UTF-8 argument must not spawn");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::InvalidInput,
+        "a non-UTF-8 argument must surface as InvalidInput, got {err:?}"
+    );
+
+    let err = std::process::Command::new(BLOB_FIXTURE)
+        .env("SVCTEST_NON_UTF8", &invalid)
+        .spawn()
+        .expect_err("a non-UTF-8 env value must not spawn");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::InvalidInput,
+        "a non-UTF-8 env value must surface as InvalidInput, got {err:?}"
+    );
+    std::os::seraph::log!("command_non_utf8_refused phase passed");
 }
 
 /// `file_size` word + 32 argv words + env header + 30 env words = 64: the

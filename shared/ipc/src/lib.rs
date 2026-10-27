@@ -459,11 +459,11 @@ pub mod memmgr_labels
     /// `phys_base_for_cap_i: u64`; `caps[0..count]` = Memory capabilities
     /// (MAP|WRITE rights); [`super::memmgr_grant_layout`] checks the shape.
     /// `sum(page_count_for_cap_i) == want_pages` for both contiguous and
-    /// best-effort replies. Each reply
-    /// cap MUST additionally carry `MemRights::RETYPE` so the caller can
-    /// retype the memory into kernel objects via the `SYS_CAP_CREATE_*`
-    /// syscalls; memmgr derives reply caps with `RIGHTS_ALL`, which
-    /// preserves the RETYPE bit stamped at boot by the kernel.
+    /// best-effort replies. Each reply cap MUST additionally carry
+    /// `MemRights::RETYPE` so the caller can retype the memory into kernel
+    /// objects via the `SYS_CAP_CREATE_*` syscalls; memmgr derives reply caps
+    /// with `RIGHTS_ALL`, which preserves the RETYPE bit stamped at boot by
+    /// the kernel.
     pub const REQUEST_MEMORY_CAPS: u64 = 1;
     /// Voluntarily return previously-granted Memory caps to the pool
     /// mid-life. Callable from any badged cap. The caller names each region

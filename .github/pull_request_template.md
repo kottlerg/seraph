@@ -22,8 +22,9 @@ this PR fixes); tick items completed by this PR>
 
 ## Validation
 <validated head; for a documentation-only or comment-only delta since it, say so; each local host
-run docs/testing.md § Coverage tiers owes, with its `--runs` count and the head it ran at, or that
-none is owed and why>
+run docs/testing.md § Coverage tiers owes, with its `--runs` count and the head it ran at (a run not
+owed that HANGs or fails as that section allows, with the link to its record), or that none is owed
+and why>
 
 ## Notes
 <design tradeoffs; follow-ups filed as Issues; anything reviewers should see>

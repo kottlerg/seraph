@@ -117,32 +117,35 @@ claims.
    (`git diff $(git merge-base <head> origin/master) <head>`; the parent
    fetches `origin` before the run, so read `origin/master` as it is), set
    aside its inert lines as that section defines them, and run that
-   section's screen commands. The boundary set is owed only when a
-   non-inert line meets the Boundary surface definition, the memory
-   variation only when one meets the Memory surface definition, and
-   `--runs 3` on the riscv64 64- and 65-hart and x86_64 256-vCPU boundaries
-   only when the PR body states that its purpose is a concurrency fix in the
-   scheduling, wake, or cross-CPU signalling mechanisms. Owed runs follow
-   from those definitions alone: a non-inert change to a file under
-   `core/kernel/` or `core/boot/` that meets neither surface owes no run, and
-   a run the body reports that is not owed is not a FAIL. The body's
-   `## Validation` MUST report each owed run with its `--runs` count and the
-   head it ran at, and the PR's own non-inert changes to that run's surface
-   MUST be the same at that head and at the PR head; or, when none is owed,
-   the body MUST say so and why. FAIL when an owed run is missing, its count
-   is below the one that section requires, its head is absent or does not
-   cover the PR head, it is reported as HANG or FAIL without the record that
-   section requires or on a PR whose diff changes that run's surface, or a
-   "none owed" statement is absent or contradicted by the PR's own diff.
+   section's screen commands, reading each candidate's hunk as that section
+   says. The boundary set is owed only when a non-inert line meets the
+   Boundary surface definition, the memory variation only when one meets
+   the Memory surface definition, and the riscv64 64- and 65-hart and
+   x86_64 256-vCPU boundaries at `--runs 3` whenever the PR body states that
+   its purpose is a concurrency fix in the scheduling, wake, or cross-CPU
+   signalling mechanisms, whether or not a line meets either surface.
+   Outside those cases no run is owed: a non-inert change to a file under
+   `core/kernel/` or `core/boot/` that meets neither surface owes none, and
+   a run the body reports that is not owed is not a FAIL. A run's surface
+   is the one that owes it, as When the runs are owed defines it; for the
+   runs a concurrency-fix purpose owes, it is every non-inert line of the
+   PR's own diff. The body's `## Validation` MUST report each owed run with
+   its `--runs` count and the head it ran at, and the PR's own non-inert
+   changes to that run's surface MUST be the same at that head and at the
+   PR head; or, when none is owed, the body MUST say so and why. FAIL when
+   an owed run is missing, its count is below the one that section
+   requires, its head is absent or does not cover the PR head, it is
+   reported as HANG or FAIL (an owed run's HANG or failure blocks; only a
+   run the PR does not owe may be reported so, with the record that section
+   requires), or a "none owed" statement is absent or contradicted by the
+   PR's own diff or a stated concurrency-fix purpose.
 
-   CPU-count width: FAIL this section, whatever the body reports, when a
-   line the PR's own diff adds under `core/kernel/`, `core/boot/`, or an
-   in-tree crate either one depends on introduces a structure with one entry
-   or bit per CPU whose width does not come from `MAX_CPUS`, a literal
-   standing in for the CPU count or a CPU-mask width, a fixed-width integer
-   holding a set of CPUs, or an `as` cast of a CPU index or count to a type
-   that cannot represent `MAX_CPUS` (`docs/coding-standards.md`
-   § CPU-Count Width). Cite each such line.
+   CPU-count width: a line the PR's own diff adds that introduces a
+   structure with one entry or one bit per CPU is on the Boundary surface
+   whatever file it is in, so it owes the boundary set; FAIL a "none owed"
+   statement on such a PR and cite the line. Whether that structure's width
+   meets `docs/coding-standards.md` § CPU-Count Width is code quality,
+   which pr-reviewer step 7 gates.
 
 10. PR-body claims: the body's prose (Summary, Notes, and any section
     the template does not define) against the diff. Every file, argument,

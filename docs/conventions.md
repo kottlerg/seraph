@@ -339,10 +339,11 @@ gives the PR-level linear view.
   it MUST say so (see [testing.md](testing.md#coverage-tiers)).
 - Every PR body MUST report, in its `## Validation` section, each local host
   run [testing.md](testing.md#coverage-tiers) § Coverage tiers owes, with its
-  `--runs` count and the head it ran at (a run that section lets HANG without
-  blocking, with the link to its record), or state that none is owed and why
-  (that the PR's non-inert lines change neither surface that section names,
-  or that its changes outside Markdown are all inert).
+  `--runs` count and the head it ran at (a run the PR does not owe that
+  HANGs or fails as that section allows, with the link to its record), or
+  state that none is owed and why (that the PR's changes outside Markdown
+  are all inert, or that its non-inert lines change neither surface that
+  section names and it states no concurrency-fix purpose).
 
 ## CI Gating
 

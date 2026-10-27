@@ -347,14 +347,14 @@ cells automatically; variants belong to the tiers below.
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
-| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface (see Boundary surface and Memory surface below), once per PR (see Repeat count and When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
+| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface, or whose stated purpose is a concurrency fix (see Boundary surface, Memory surface, and Repeat count below), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
 | Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 64, 65, and 128 harts; x86_64 256 and 512 vCPUs) and the memory variation, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 65-vCPU guest is a ~16× thread oversubscription and a 512-vCPU guest is
 infeasible there. High `-smp` coverage is local by design, not an
-oversight. The local host runs below are procedurally REQUIRED for PRs
-that change their surfaces, and the release host runs for each tag —
+oversight. The local host runs below are procedurally REQUIRED for the PRs
+that owe them, and the release host runs for each tag —
 binding the same way the
 [pre-merge review](conventions.md#branch-and-pr-workflow) is, with no CI
 surface.
@@ -373,50 +373,68 @@ A PR whose changes outside Markdown are all inert owes no local host run. The su
 judged on the non-inert lines only.
 
 **Boundary surface.** The boundary set below is owed when, and only when, the PR's own diff (see
-When the runs are owed below) makes a non-inert change to the CPU-count surface: the code whose
-behaviour or size depends on how many CPUs boot. The surface is these files as a whole:
+When the runs are owed below) makes a non-inert change to the CPU-count surface, or the PR states a
+concurrency-fix purpose (see Repeat count below). The CPU-count surface is the code that fixes the
+CPU-count width, enumerates and brings up CPUs, sizes per-CPU storage, or signals across CPUs, and
+it is exactly what this paragraph lists. Code that only reads the booted CPU count (`CPU_COUNT`, a
+`cpu_count` argument) to iterate over CPUs is not on it; the rules of
+[coding-standards.md](coding-standards.md) § CPU-Count Width and the release host runs cover it.
+The surface is these files as a whole:
 
 - `core/kernel/src/cpu_mask.rs` (the CPU mask type and its width);
 - `core/kernel/src/percpu.rs` (per-CPU data and its slabs);
 - `core/kernel/src/arch/x86_64/ap_trampoline.rs` and `core/kernel/src/arch/riscv64/ap_trampoline.rs`
   (AP and hart bringup);
 - `core/kernel/src/mm/tlb_shootdown.rs` (the TLB-shootdown broadcast);
+- `core/kernel/src/mm/tag_allocator.rs` (the per-CPU address-space tags, whose count it fits to
+  the CPU count);
 
-and, in any other file, a changed line that names one of these items as a whole identifier, or that
-lies within one's definition (its attributes, signature, fields, or body):
+and, in any other file, a line that adds a structure with one entry or one bit per CPU, and a
+changed line that names one of these items as a whole identifier or lies within one's definition
+(its attributes, signature, fields, or body):
 
 - CPU-count width: `MAX_CPUS`, `CpuMask`, `CPU_MASK_WORDS`;
-- per-CPU arrays and slabs: `alloc_zeroed_slab`, and every type the tree defines that is the element
-  type `T` of a `[T; MAX_CPUS]` or of an `alloc_zeroed_slab::<T>` call
-  (`git grep -n -E 'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists them), since a change to such a
-  type's fields changes the array or slab size;
-- AP and hart bringup: `start_ap`, `sbi_hart_start`, `kernel_entry_ap`, every `init_ap`, and the
-  `init_ap_*` per-CPU storage initialisers;
+- per-CPU storage: `alloc_zeroed_slab` and every function that calls it (the per-CPU storage
+  initialisers), `kernel_reserve_pages` (the CPU-scaled kernel reserve), and the element types of
+  the per-CPU arrays and slabs, a change to whose fields changes the array or slab size: today
+  `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
+  `TagState`, `CpuRng`, `Prng`, `Acc`, `Sample`, and `TlbShootdownRequest`
+  (`git grep -n -E 'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs);
+- CPU enumeration and bringup: `parse_cpu_topology`, `parse_madt_topology`, and `parse_cpu_count`
+  in the bootloader, and `start_ap`, `sbi_hart_start`, `kernel_entry_ap`, every `init_ap`, and the
+  `init_ap_*` per-CPU storage initialisers in the kernel;
 - IPI send and receive: `send_wakeup_ipi`, `send_tlb_shootdown_ipi`, `send_init_ipi`, `send_sipi`,
   `send_nmi_to`, `sbi_send_ipi_to`, `sbi_hart_mask`, `wait_for_ack`, `IpiWaitCtx`, the
-  `IPI_VECTOR_*` constants, the x86_64 `ipi_*` stubs and handlers in `idt.rs`, and the riscv64
-  `handle_software_interrupt`;
+  `IPI_VECTOR_*` constants, the x86_64 `ipi_*` stubs and handlers in `idt.rs`, the x86_64 ICR and
+  x2APIC primitives (`apic_send_icr`, `wait_icr_idle`, `enable_x2apic_this_cpu`, and
+  `X2APIC_ENABLED`), and the riscv64 `handle_software_interrupt`;
 - the TLB-shootdown broadcast: `shootdown`, `shootdown_range`, `service_shootdowns`,
   `shootdown_remote`, and `needs_remote_shootdown`.
 
-The list is closed: a change anywhere else, however close to the scheduler or the SMP paths, owes no
-boundary run. A PR that adds an item whose behaviour or size depends on the CPU count and that names
-none of the items above MUST add it to this list. The commands below screen a diff for the surface;
-every line they print is a candidate, and it is on the surface when it is not inert and meets the
-definition above. The `@@` header names the top-level item a hunk falls in; a hunk inside a method
-or a nested module shows the `impl` or `mod` line instead, so a hunk in a file that defines a
-listed item is read against that item's span.
+A change anywhere else, however close to the scheduler or the SMP paths, is off the surface. A PR
+that adds an item of the kinds above that names none of the listed items MUST add it to this list.
+The commands below screen a diff for the surface. The first lists the whole-surface files the diff
+changes. The second prints every file header of the diff and every line, changed or context, that
+names a listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
+item's definition prints that item's name. Each printed name is a candidate: the PR owes the set
+when a non-inert changed line names the item or lies within its definition, read in that file's
+hunk. A diff for which neither command prints a candidate, and that adds no per-CPU structure, is
+off the surface.
 
 ```sh
 B=$(git merge-base <head> origin/master)
 git diff --stat "$B" <head> -- core/kernel/src/cpu_mask.rs core/kernel/src/percpu.rs \
-    core/kernel/src/mm/tlb_shootdown.rs 'core/kernel/src/arch/*/ap_trampoline.rs'
-S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|start_ap|sbi_hart_start|kernel_entry_ap'
-S="$S|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdown|init)_ipi|send_sipi|send_nmi_to"
-S="$S|sbi_send_ipi_to|sbi_hart_mask|wait_for_ack|IpiWaitCtx|IPI_VECTOR_[A-Z_]+"
-S="$S|ipi_[a-z_]+_(stub|handler)|handle_software_interrupt|shootdown(_range|_remote)?"
-S="$S|service_shootdowns|needs_remote_shootdown"
-git diff -U0 "$B" <head> -- . ':(exclude)*.md' | grep -E '^(@@|[-+][^-+])' | grep -w -E "$S"
+    core/kernel/src/mm/tlb_shootdown.rs core/kernel/src/mm/tag_allocator.rs \
+    'core/kernel/src/arch/*/ap_trampoline.rs'
+S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|kernel_reserve_pages|PerCpuData'
+S="$S|PerCpuScheduler|ThreadControlBlock|TssWithIopb|TagState|CpuRng|Prng|Acc|Sample"
+S="$S|TlbShootdownRequest|parse_cpu_topology|parse_madt_topology|parse_cpu_count|start_ap"
+S="$S|sbi_hart_start|kernel_entry_ap|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdown|init)_ipi"
+S="$S|send_sipi|send_nmi_to|sbi_send_ipi_to|sbi_hart_mask|wait_for_ack|IpiWaitCtx"
+S="$S|IPI_VECTOR_[A-Z_]+|ipi_[a-z_]+_(stub|handler)|apic_send_icr|wait_icr_idle"
+S="$S|enable_x2apic_this_cpu|X2APIC_ENABLED|handle_software_interrupt"
+S="$S|shootdown(_range|_remote)?|service_shootdowns|needs_remote_shootdown"
+git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($S)\b"
 ```
 
 The boundary set is every boundary CPU count below, each once (`--runs 1`, raised only as Repeat
@@ -448,15 +466,21 @@ hart-scaled firmware allocations once collided with the kernel image's load addr
 ([#377](https://github.com/kottlerg/seraph/issues/377)); the 512-vCPU run is `MAX_CPUS`.
 
 **Memory surface.** The memory variation below is owed when, and only when, the PR's own diff makes
-a non-inert change to the code sized by the guest's RAM: `core/kernel/src/mm/buddy.rs` and
+a non-inert change to the memory surface: the code that sizes or maps physical memory by the
+guest's RAM, exactly as listed here. It is `core/kernel/src/mm/buddy.rs` and
 `core/kernel/src/mm/init.rs` as a whole, and, in any other file, a changed line that names, or lies
-within the definition of, `translate_memory_map`, `drain_and_install_seed`, or
-`INIT_INFO_MAX_PAGES`. The screen works as the boundary one does:
+within the definition of, one of these items: the boot memory map and the direct map
+(`translate_memory_map`, `max_ram_address`, `direct_map_ceiling`, `compute_max_physical_address`,
+`init_kernel_page_tables`, and `BOOT_TABLE_POOL_SIZE`), and the drain of RAM into Memory caps
+(`drain_and_install_seed`, `coalesce_ram_blocks`, `MAX_DRAIN_BLOCKS`, `populate_cspace`, and
+`INIT_INFO_MAX_PAGES`). The screen works as the boundary one does:
 
 ```sh
 git diff --stat "$B" <head> -- core/kernel/src/mm/buddy.rs core/kernel/src/mm/init.rs
-git diff -U0 "$B" <head> -- . ':(exclude)*.md' | grep -E '^(@@|[-+][^-+])' \
-    | grep -w -E 'translate_memory_map|drain_and_install_seed|INIT_INFO_MAX_PAGES'
+M='translate_memory_map|max_ram_address|direct_map_ceiling|compute_max_physical_address'
+M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|drain_and_install_seed|coalesce_ram_blocks"
+M="$M|MAX_DRAIN_BLOCKS|populate_cspace|INIT_INFO_MAX_PAGES"
+git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($M)\b"
 
 # Memory variation (either arch):
 cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1 --timeout 300
@@ -473,31 +497,32 @@ without that stated purpose does not raise the count.
 head that covers the merge head. The PR's own diff at a head is the diff from that head's merge base
 with the fetched `master` to the head (after `git fetch origin`,
 `git diff $(git merge-base <head> origin/master) <head>`), so it excludes what a merge or rebase
-from `master` brings in. A run at head H covers a later head M when the PR's own diff makes the same
-non-inert changes to that run's surface at H and at M; for the runs the concurrency-fix purpose
-owes, that surface is every non-inert line of the PR's own diff. An update from `master` that leaves
-those changes as they were therefore owes no run; one whose conflict resolution alters them does. A
-fix round that alters them breaks the coverage of the runs that surface owes, and those runs MUST be
-run again at a head after it. The PR body MUST report each run it owes with its `--runs` count and
-the head it ran at, or state that none is owed and why (that its non-inert lines change neither
-surface, or that its changes outside Markdown are all inert).
+from `master` brings in. A run's surface is the surface that owes it: the CPU-count surface for the
+boundary set, the memory surface for the memory variation, and, for the runs a concurrency-fix
+purpose owes, every non-inert line of the PR's own diff. A run at head H covers a later head M when
+the PR's own diff makes the same non-inert changes to that run's surface at H and at M. An update
+from `master` that leaves those changes as they were therefore owes no run; one whose conflict
+resolution alters them does. A fix round that alters them breaks the coverage of the runs that
+surface owes, and those runs MUST be run again at a head after it. The PR body MUST report each run
+it owes with its `--runs` count and the head it ran at, or state that none is owed and why: that
+its changes outside Markdown are all inert, or that its non-inert lines change neither surface and
+it states no concurrency-fix purpose.
 
-**Hangs at oversubscription.** A boundary run that HANGs (outlives its `--timeout` budget), or
-fails with a defect an open Issue for that boundary already names, on a PR whose own diff makes no
-non-inert change to the CPU-count surface is not the PR's defect: the preserved log is recorded on
-the open Issue for that boundary (today [#421](https://github.com/kottlerg/seraph/issues/421) for
-the x86_64 high-smp budget overruns and [#455](https://github.com/kottlerg/seraph/issues/455) for
-the 512-vCPU IPI watchdog), or on a new Issue when that boundary has none, and the run does not
-block the PR. The PR body reports such a
-run as HANG or FAIL with a link to that record. Any other failure, and any HANG or failure on a PR
-whose diff changes the surface, blocks the PR.
+**Hangs at oversubscription.** A boundary run the PR does not owe, that is, one whose surface the
+PR's own diff does not change, that HANGs (outlives its `--timeout` budget) or fails with a defect
+an open Issue for that boundary already names is not the PR's defect: the preserved log is recorded
+on the open Issue for that boundary (today [#421](https://github.com/kottlerg/seraph/issues/421)
+for the x86_64 high-smp budget overruns and [#455](https://github.com/kottlerg/seraph/issues/455)
+for the 512-vCPU IPI watchdog), or on a new Issue when that boundary has none, and the run does not
+block the PR. The PR body reports such a run as HANG or FAIL with a link to that record. Any other
+failure, and any HANG or failure of a run the PR owes, blocks the PR.
 
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
 4), the maintainer MUST run, on the commit to be tagged, the riscv64 64- and
 65-hart and the x86_64 256-vCPU boundaries three times each (`--runs 3`), the
 riscv64 128-hart and the x86_64 512-vCPU boundaries once each, and the memory
-variation once, so every tag boots at every CPU count the project supports. A
+variation once, so every tag boots at each boundary CPU count. A
 failure blocks the tag, MUST be filed as an Issue, and is bisected over the
 release's PRs.
 

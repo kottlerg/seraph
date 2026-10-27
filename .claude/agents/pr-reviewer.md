@@ -116,9 +116,10 @@ discipline below has been applied end-to-end.
    come from `MAX_CPUS`, a literal standing in for the CPU count or a
    CPU-mask width, a fixed-width integer holding a set of CPUs, or an `as`
    cast of a CPU index or count to a type that cannot represent `MAX_CPUS`,
-   as a blocking finding: bucket Critical, class `correctness`,
-   `must_violation` true, `introduced` true, citing that section. No
-   boundary boot runs on a PR that does not change the CPU-count surface
+   as a blocking finding: bucket Critical, `must_violation` true, citing
+   that section, class `standards` (`correctness` when the width defect
+   misbehaves at a CPU count up to `MAX_CPUS`), and `introduced` set as
+   the schema defines for the mode. Most PRs owe no boundary boot
    (`docs/testing.md` § Coverage tiers), so this check is the gate for that
    defect class; do not discount a finding because a boot at the boundary
    CPU counts would catch it.

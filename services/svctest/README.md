@@ -28,7 +28,7 @@ services/svctest/
         ├── mod.rs             # Ordered phase registry; one module per surface under test
         ├── startup.rs         # argv, env, stack envelope, TLS at entry; unset cwd path
         ├── memmgr.rs          # Heap allocator over memmgr; all-RAM-accounted identity
-        ├── threading.rs       # Threads, per-thread state, `thread_local!`, `Condvar`
+        ├── threading.rs       # Threads, `thread_local!`, park/unpark, `RwLock`, `Condvar`
         ├── procmgr.rs         # `std::process::Command` spawn, cwd, and error paths
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
@@ -68,8 +68,9 @@ cap-deny phase (`caps[2]`), and the pwrmgr shutdown phase (`caps[1]`) log the sk
 when their slot is zero; the devmgr orphan-teardown phase (`caps[3]`) instead fails its
 assertion.
 
-The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, and env
-carries `SERAPH_TEST=1` and `SERAPH_MODE=boot`.
+The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
+the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
+`SERAPH_MODE=boot`.
 
 ---
 

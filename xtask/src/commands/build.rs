@@ -533,14 +533,16 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         flags.push("--release");
     }
 
+    let env = [("RUSTFLAGS", args.arch.boot_rustflags())];
     if !args.skip_lints
     {
-        clippy_check(ctx, &flags)?;
+        clippy_check_ext(ctx, &flags, &env, None)?;
     }
 
     let mut cmd = cargo(&ctx.root);
     cmd.arg("build").args(&flags);
     cmd.args(debug_config_flags(args, "boot"));
+    cmd.envs(env);
     run_cmd(&mut cmd)?;
 
     let efi_boot_dir = ctx.sysroot_efi_boot();
@@ -690,7 +692,7 @@ fn build_group(
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
     if !args.skip_lints
     {
-        clippy_check_ext(ctx, &flags_ref, seraph.as_ref())?;
+        clippy_check_ext(ctx, &flags_ref, &[], seraph.as_ref())?;
     }
 
     let mut cmd = cargo(&ctx.root);
@@ -783,7 +785,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
     if !args.skip_lints
     {
-        clippy_check_ext(ctx, &flags_ref, seraph.as_ref())?;
+        clippy_check_ext(ctx, &flags_ref, &[], seraph.as_ref())?;
     }
 
     let mut cmd = cargo(&ctx.root);
@@ -892,13 +894,12 @@ fn clippy_host(ctx: &BuildContext) -> Result<()>
     clippy_check(ctx, &["-p", "xtask", "-p", "seraph-wrapper-shim"])
 }
 
-/// Run `cargo clippy` with the given flags and treat all warnings as errors.
-///
-/// Called before every `cargo build` invocation with identical flags, so lints
-/// are enforced on every component build — not just on dedicated lint passes.
+/// Run `cargo clippy` with the given flags, no extra environment, and the
+/// plain toolchain, treating all warnings as errors: the host crates' lint
+/// pass (`clippy_host`).
 fn clippy_check(ctx: &BuildContext, flags: &[&str]) -> Result<()>
 {
-    clippy_check_ext(ctx, flags, None)
+    clippy_check_ext(ctx, flags, &[], None)
 }
 
 /// Clippy invocation that optionally wires the seraph toolchain mirror so
@@ -914,13 +915,20 @@ fn clippy_check(ctx: &BuildContext, flags: &[&str]) -> Result<()>
 /// with `RUSTC_WORKSPACE_WRAPPER=<ws-clippy>` runs the mirror-aware
 /// wrapper on every workspace crate, and `CLIPPY_ARGS` feeds the same
 /// lint args that `cargo clippy -- …` would pass through.
+///
+/// Called before every component `cargo build` with identical flags and
+/// `env`, so lints are enforced on every component build — not just on
+/// dedicated lint passes — and the lint pass compiles what the build
+/// compiles.
 fn clippy_check_ext(
     ctx: &BuildContext,
     flags: &[&str],
+    env: &[(&str, &str)],
     seraph: Option<&rust_src::SeraphToolchain>,
 ) -> Result<()>
 {
     let mut cmd = cargo(&ctx.root);
+    cmd.envs(env.iter().copied());
     if let Some(s) = seraph
     {
         cmd.arg("check").args(flags);

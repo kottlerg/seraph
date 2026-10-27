@@ -21,6 +21,7 @@ documented in [docs/kernel-handoff.md](docs/kernel-handoff.md).
 ```
 boot/
 ├── Cargo.toml                  # seraph-boot crate (UEFI application)
+├── build.rs                    # Passes the RISC-V UEFI linker script to the linker
 ├── linker/
 │   └── riscv64-uefi.ld         # Linker script for RISC-V PE/COFF pipeline
 └── src/
@@ -103,8 +104,10 @@ The bootloader is built as part of the Seraph workspace. Refer to
 
 On x86-64, the Rust toolchain emits a PE/COFF `.efi` directly. On RISC-V, LLVM has
 no PE/COFF backend, so the output ELF is converted to a flat binary with a
-hand-crafted header prepended. See [docs/riscv-uefi-boot.md](docs/riscv-uefi-boot.md)
-for details.
+hand-crafted header prepended; `build.rs` passes `linker/riscv64-uefi.ld` to the
+linker for that target (summarized from
+[docs/build-system.md § Custom Targets](../../docs/build-system.md#custom-targets)).
+See [docs/riscv-uefi-boot.md](docs/riscv-uefi-boot.md) for details.
 
 ---
 
@@ -173,6 +176,7 @@ The CPU state established at the kernel entry point is specified in
 | [docs/memory-model.md](../../docs/memory-model.md) | Virtual address space layout the bootloader must establish |
 | [docs/capability-model.md](../../docs/capability-model.md) | Initial capabilities minted from `mmio_apertures` and memory-map regions |
 | [docs/device-management.md](../../docs/device-management.md) | How `devmgr` uses the resources the bootloader provides |
+| [docs/build-system.md](../../docs/build-system.md) | Bootloader target triples, `RUSTFLAGS`, and the RISC-V linker-script link argument |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---

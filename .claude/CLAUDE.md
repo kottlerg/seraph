@@ -166,8 +166,8 @@ truth for "how work is tracked and shipped" on this project.
      terminal pass marker MUST appear.
 - A change whose own diff makes a non-inert change to the CPU-count or
   memory surface [docs/testing.md](../docs/testing.md) "Coverage tiers"
-  names, or whose PR states a concurrency-fix purpose as that section
-  defines it, MUST additionally run the local host runs that section owes
+  names, or whose PR states a concurrency-fix purpose as that section's
+  Repeat count defines it, MUST additionally run the local host runs that section owes
   for it, at the heads and repeat counts it sets; any other change owes
   none, whatever directory it touches.
 - Host-side compilation, unit tests, and `cargo check` alone do not

@@ -116,7 +116,9 @@ discipline below has been applied end-to-end.
    come from `MAX_CPUS`, a literal standing in for the CPU count or a
    CPU-mask width, a fixed-width integer holding a set of CPUs, or an `as`
    cast of a CPU index or count to a type that cannot represent `MAX_CPUS`,
-   as a blocking finding: bucket Critical, `must_violation` true, citing
+   as a finding (it blocks when on the review surface, per
+   `docs/conventions.md` § Branch and PR Workflow): bucket Critical,
+   `must_violation` true, citing
    that section, class `standards` (`correctness` when the width defect
    misbehaves at a CPU count up to `MAX_CPUS`), and `introduced` set as
    the schema defines for the mode. Most PRs owe no boundary boot

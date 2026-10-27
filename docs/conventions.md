@@ -343,7 +343,8 @@ gives the PR-level linear view.
   HANGs or fails as that section allows, with the link to its record), or
   state that none is owed and why (that the PR's changes outside Markdown
   are all inert, or that its non-inert lines change neither surface that
-  section names and it states no concurrency-fix purpose).
+  section names and it states no concurrency-fix purpose as that section
+  defines it).
 
 ## CI Gating
 

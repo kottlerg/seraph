@@ -347,7 +347,7 @@ cells automatically; variants belong to the tiers below.
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
-| Local host runs | developer host, commands below | REQUIRED for PRs touching their trigger paths (SMP, per-CPU, IPI, scheduler-wakeup, boot, and memory-init code; see Trigger paths below), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
+| Local host runs | developer host, commands below | REQUIRED for PRs touching their trigger paths (the kernel and boot code; see Trigger paths below), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
 | Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | the riscv64 64- and 65-hart and x86_64 256-vCPU boundaries three times each and the memory variation once, whatever the release's PRs touched |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
@@ -359,29 +359,14 @@ binding the same way the
 [pre-merge review](conventions.md#branch-and-pr-workflow) is, with no CI
 surface.
 
-**Trigger paths.** The boundary CPU counts and the memory variation below are
-owed for a change, other than Markdown and comment lines, to:
-
-- SMP, per-CPU, and IPI code: `core/kernel/src/percpu.rs`,
-  `core/kernel/src/cpu_mask.rs`, `core/kernel/src/sync.rs`,
-  `core/kernel/src/mm/tlb_shootdown.rs`, and the arch modules for interrupts,
-  the IDT, AP bringup, the per-CPU GDT and TSS, per-CPU storage, the context
-  handoff, and halt and wake (`core/kernel/src/arch/*/interrupts.rs`,
-  `idt.rs`, `ap_trampoline.rs`, `gdt.rs`, `mod.rs`, `context.rs`, and
-  `cpu.rs`);
-- scheduler-wakeup code: `core/kernel/src/sched/`, `core/kernel/src/ipc/`,
-  `core/kernel/src/syscall/thread.rs`, the arch timer modules
-  (`core/kernel/src/arch/*/timer.rs`), and the object and thread teardown
-  wakes (`core/kernel/src/cap/object.rs`);
-- boot and memory-init code: `core/boot/` (its source and linker script),
-  `abi/boot-protocol/`, `abi/init-protocol/`, `core/kernel/src/main.rs`,
-  `core/kernel/src/validate.rs`, the initial capability minting
-  (`core/kernel/src/cap/mod.rs`), the memory subsystem
-  (`core/kernel/src/mm/`), and `core/kernel/linker/`.
-
-A change elsewhere owes none of them. The 512-vCPU and 128-hart boundaries
-below have their own trigger lists, and are owed for those whether or not the
-base runs are.
+**Trigger paths.** The boundary CPU counts and the memory variation below are owed for a change,
+other than Markdown and comment lines, under `core/kernel/src/`, `core/kernel/linker/`,
+`core/boot/`, `abi/boot-protocol/`, or `abi/init-protocol/`: the kernel, the bootloader, and the
+boot and init handover contracts, which hold every SMP, per-CPU, IPI, scheduler-wakeup, boot, and
+memory-init path. A change elsewhere owes none of them. The 512-vCPU and 128-hart boundaries below
+have their own trigger lists, and are owed for those whether or not the base runs are. Every trigger
+in this section is a file or a directory, which triggers as a whole; a parenthetical gives the
+reason, not the scope.
 
 ```sh
 # Boundary CPU counts, riscv64 (~70 s per passing run on a 16-core host;
@@ -402,26 +387,24 @@ cargo xtask run-parallel --arch x86_64 --cpus 256 --parallel 1 --runs 1 --timeou
 cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1 --timeout 300
 ```
 
-**Repeat count.** The boundary commands above run once (`--runs 1`). A PR that
-changes code in the scheduling, wake, and cross-CPU signalling mechanisms —
-`core/kernel/src/sched/`, `core/kernel/src/ipc/`, `core/kernel/src/sync.rs`,
-`core/kernel/src/percpu.rs`, `core/kernel/src/cpu_mask.rs`,
-`core/kernel/src/syscall/thread.rs`, `core/kernel/src/mm/tlb_shootdown.rs`,
-`core/kernel/src/cap/object.rs` (the teardown wakes and their `wake_in_flight`
-gate), or the arch interrupt, IDT, timer, context-handoff, and halt modules
-(`core/kernel/src/arch/*/interrupts.rs`, `idt.rs`, which routes the IPI
-vectors, `timer.rs`, `context.rs`, and `cpu.rs`) — MUST run the
-riscv64 64- and 65-hart and the x86_64 256-vCPU boundaries three times each
-(`--runs 3`): a race in those mechanisms can fail rarely enough that one run
-misses it. The memory variation and the narrower boundaries below run once.
+**Repeat count.** The boundary commands above run once (`--runs 1`). A PR that changes code in the
+scheduling, wake, and cross-CPU signalling mechanisms — `core/kernel/src/sched/`,
+`core/kernel/src/ipc/`, `core/kernel/src/sync.rs`, `core/kernel/src/percpu.rs`,
+`core/kernel/src/cpu_mask.rs`, `core/kernel/src/syscall/thread.rs`, `core/kernel/src/syscall/mod.rs`
+(the sleep park and its withdrawal), `core/kernel/src/mm/tlb_shootdown.rs`, the arch interrupt, IDT,
+timer, context-handoff, and halt modules (`core/kernel/src/arch/*/interrupts.rs`, `idt.rs`, which
+routes the IPI vectors, `timer.rs`, `context.rs`, and `cpu.rs`), or any other kernel file that holds
+a wake site (one that `git grep -l -E 'enqueue_and_wake|wake_in_flight' core/kernel/src` lists) —
+MUST run the riscv64 64- and 65-hart and the x86_64 256-vCPU boundaries three times each
+(`--runs 3`): a race in those mechanisms can fail rarely enough that one run misses it. The memory
+variation and the narrower boundaries below run once.
 
-PRs touching the surfaces that only matter above 256 CPUs — `core/kernel/src/mm/`,
-x86_64 AP bringup (`core/kernel/src/arch/x86_64/ap_trampoline.rs`,
-`core/kernel/src/arch/x86_64/gdt.rs`, the APIC/IPI paths in
-`core/kernel/src/arch/x86_64/interrupts.rs`), or per-CPU slab sizing
-(`sched::alloc_zeroed_slab` and its call sites) — MUST run the full-width x86_64
-boundary below, besides any base runs they owe. This trigger list is deliberately narrow;
-other SMP PRs stay on the 256-vCPU mandate above.
+PRs touching the surfaces that only matter above 256 CPUs — `core/kernel/src/mm/`, x86_64 AP bringup
+and the APIC/IPI paths (`core/kernel/src/arch/x86_64/ap_trampoline.rs`, `gdt.rs`, and
+`interrupts.rs`), or per-CPU slab sizing (every file that
+`git grep -l alloc_zeroed_slab core/kernel/src` lists, which defines `sched::alloc_zeroed_slab` or
+calls it) — MUST run the full-width x86_64 boundary below, besides any base runs they owe. This
+trigger list is deliberately narrow; other SMP PRs stay on the 256-vCPU mandate above.
 
 ```sh
 # MAX_CPUS boundary, x86_64 (~16 min per passing run measured on a 16-core KVM
@@ -476,9 +459,11 @@ it, whatever paths it touches. Source text a build embeds verbatim
 (`include_str!`, `include_bytes!`, `global_asm!` inputs) is build input, not
 comment or Markdown. The CI gate and the
 [pre-merge review](conventions.md#branch-and-pr-workflow) apply unchanged;
-the PR body MUST state the validated head and that the delta is
-documentation or comments only, and the pre-merge review's audit MUST check
-that against the diff.
+the PR body MUST carry what
+[conventions.md](conventions.md#pr-body-checklist-discipline) § PR-body checklist
+discipline requires (the validated head, that the delta is documentation or
+comments only, and that no local host run is owed, and why), and the
+pre-merge review's audit MUST check that against the diff.
 
 **Known boundaries**, established empirically (QEMU 11.0.1; update this
 list as the tracking Issues move):

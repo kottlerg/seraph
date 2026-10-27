@@ -174,7 +174,7 @@ truth for "how work is tracked and shipped" on this project.
   architectures); the pre-merge review still applies, and the PR body MUST
   carry what [docs/conventions.md](../docs/conventions.md) § PR-body
   checklist discipline requires (the validated head, the documentation-only
-  delta, and that no local host run is owed).
+  delta, and that no local host run is owed, and why).
 - `cargo xtask lint-docs` MUST pass on every change, documentation-only
   ones included (per [docs/conventions.md](../docs/conventions.md) § CI
   Gating; CI's `host-tests` job runs it, per

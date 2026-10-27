@@ -112,8 +112,9 @@ claims.
    owes (its Trigger paths list, the narrower boundaries' lists, and Repeat
    count) and when a run covers a head (When the runs are owed);
    `docs/conventions.md` § PR-body checklist discipline owns the report.
-   From the PR's own diff (`git diff $(git merge-base <head> origin/master)
-   <head>`, Markdown and comment lines aside), derive the runs owed and
+   After `git fetch origin`, from the PR's own diff (`git diff $(git
+   merge-base <head> origin/master) <head>`, Markdown and comment lines
+   aside), derive the runs owed and
    their repeat counts. The body's `## Validation` MUST report each owed run
    with its `--runs` count and the head it ran at, and the PR's own diff on
    that run's trigger paths MUST be the same at that head and at the PR

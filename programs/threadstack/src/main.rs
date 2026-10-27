@@ -7,7 +7,7 @@
 //!
 //! Spawned demand-paged (the system default; no opt-in needed), so threads this
 //! process spawns get a guarded demand-paged stack: a large lazily-grown
-//! usable region with an unregistered guard page below it. Two modes, by argv:
+//! usable region with an unregistered guard page below it. Three modes, by argv:
 //!
 //!   * `grow` — spawn a worker that recurses deep enough to fault in many
 //!     demand-paged stack pages (but stays inside the usable region), `join`
@@ -20,6 +20,14 @@
 //!     cleanly. If the overflow somehow survives, print `SURVIVED (BUG)` and
 //!     exit `SUCCESS` so the tester's "must be killed" assertion fails loudly
 //!     rather than the run hanging.
+//!   * `bigframe` — spawn a worker that runs and then parks, then a second
+//!     worker, whose stack the reservation arena places directly above the
+//!     first's, that calls a function whose single frame is larger than its
+//!     whole usable stack and writes only the frame's lowest byte. That byte
+//!     lies past the guard page, near the top of the first worker's
+//!     registered stack, so only the target's stack probes, touching each
+//!     page of the frame in turn, fault on the guard. Same verdict as
+//!     `guard`: the process must be killed.
 //!
 //! Idiomatic `std` only — no direct Seraph cap awareness. The demand-paged
 //! stack machinery lives entirely in `std::sys::thread` / `std::os::seraph`.
@@ -36,11 +44,20 @@ const FRAME_BYTES: usize = 4096;
 /// inside the default 2 MiB usable demand stack.
 const GROW_DEPTH: u64 = 200;
 
+/// `bigframe` frame size: the default 2 MiB (512-page) usable demand stack plus
+/// 4 pages, so the frame's lowest byte lies at least 3 pages below the one
+/// guard page, near the top of the stack reserved just below.
+const BIG_FRAME_BYTES: usize = (512 + 4) * 4096;
+
 fn main() -> ExitCode
 {
     if std::env::args().any(|a| a == "guard")
     {
         guard()
+    }
+    else if std::env::args().any(|a| a == "bigframe")
+    {
+        bigframe()
     }
     else
     {
@@ -124,6 +141,52 @@ fn guard() -> ExitCode
     // and procmgr tears this process down, so `join` never returns. Reaching
     // past it means the guard failed to fault — report it loudly.
     let _ = worker.join();
+    println!("SURVIVED (BUG)");
+    ExitCode::SUCCESS
+}
+
+/// Write and read back the lowest byte of a `BIG_FRAME_BYTES` stack frame,
+/// leaving the rest of it untouched, so only stack probes touch the pages in
+/// between. The buffer's address escapes through `black_box`, so the compiler
+/// must allocate the whole frame rather than the one byte used.
+#[inline(never)]
+fn big_frame() -> u8
+{
+    let mut buf = std::mem::MaybeUninit::<[u8; BIG_FRAME_BYTES]>::uninit();
+    let low = std::hint::black_box(buf.as_mut_ptr()).cast::<u8>();
+    // SAFETY: `low` points to the first byte of this frame's own buffer, valid
+    // for writes and, once written, for reads.
+    unsafe {
+        low.write_volatile(0x5A);
+        low.read_volatile()
+    }
+}
+
+fn bigframe() -> ExitCode
+{
+    println!("about to overflow");
+    let _ = std::io::stdout().flush();
+
+    // The parked worker's stack is reserved first, so the arena places the
+    // big-frame worker's stack (guard page lowest) directly above it. Waiting
+    // until the parked worker runs maps the top of its stack, and the page
+    // table covering it, so the big frame's write lands on a page memmgr backs
+    // without a fault rather than on a page table this address space has not
+    // funded.
+    let (ready_tx, ready) = std::sync::mpsc::channel::<()>();
+    let (release, parked) = std::sync::mpsc::channel::<()>();
+    let below = std::thread::spawn(move || {
+        let _ = ready_tx.send(());
+        let _ = parked.recv();
+    });
+    let _ = ready.recv();
+    let worker = std::thread::spawn(big_frame);
+    // The probes fault on the guard page and procmgr tears this process down,
+    // so `join` never returns. Reaching past it means the frame skipped the
+    // guard — report it loudly.
+    let _ = worker.join();
+    let _ = release.send(());
+    let _ = below.join();
     println!("SURVIVED (BUG)");
     ExitCode::SUCCESS
 }

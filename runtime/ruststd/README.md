@@ -34,7 +34,7 @@ ruststd/
     │   └── seraph.rs           # std::os::seraph surface (startup info, caps, cwd)
     └── sys/                    # std::sys::seraph backends, one directory per area
         ├── alloc/              # byte heap (GlobalAlloc for System)
-        ├── args/               # std::env::args — consumes argv_env::next_field
+        ├── args/               # std::env::args — consumes argv_env::{next_field,prev_field}
         ├── env/                # std::env::{var,vars,…} —
         │                         consumes argv_env::{next_field,split_key_value}
         ├── fs/                 # filesystem over the namespace protocol
@@ -110,23 +110,22 @@ touch lands in the guard page faults on an address the pager declines, and the f
 whole process, per [docs/fault-handling.md § Reply](../../docs/fault-handling.md#reply),
 [docs/process-lifecycle.md § Process Death](../../docs/process-lifecycle.md#process-death), and
 [Capability Model § "Kill process" pattern](../../docs/capability-model.md#kill-process-pattern).
-The userspace targets emit no stack probes, so a frame larger than one page can skip the guard
-and write into an adjacent registered region, such as another thread's stack, which memmgr
-backs without a fault ([#445](https://github.com/kottlerg/seraph/issues/445)). The usable
-size is the larger of the requested stack size (at least `DEFAULT_MIN_STACK_SIZE`, 64 KiB)
-and 512 pages (2 MiB). If the reservation, the page-table funding, or the registration fails,
-or the process is not demand-paged, the stack is instead an eager byte-heap allocation of the
-requested size (at least 64 KiB, rounded up to whole pages) with no guard page. `join` frees
-the stack once the thread has left user mode: a demand stack through
+The std userspace targets emit inline stack probes, so a frame larger than one page touches
+each of its pages in turn and faults on the guard page rather than skipping it into an adjacent
+registered region, such as another thread's stack, which memmgr would back without a fault. The
+usable size is the larger of the requested stack size (at least `DEFAULT_MIN_STACK_SIZE`, 64
+KiB) and 512 pages (2 MiB). If the reservation, the page-table funding, or the registration
+fails, or the process is not demand-paged, the stack is instead an eager byte-heap allocation
+of the requested size (at least 64 KiB, rounded up to whole pages) with no guard page. `join`
+frees the stack once the thread has left user mode: a demand stack through
 [`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region)
 and release of its reservation, a heap stack through `dealloc`. A detached thread's stack, or
 that of a joined thread whose join wait failed with an error other than `Interrupted` (its
-private completion notification gone), is freed the same way by the next spawn, join, or
-detach in the process after the kernel posts that thread's death (or at once by that detach
-or join, when the death post has already landed), or leaks until process exit
-when the reaper could not register the
-thread at spawn (no death queue, no free slot, or the observer bind failed) or the kernel
-dropped the death post because the process's death queue (128 entries) was full.
+private completion notification gone), is freed the same way by the next spawn, join, or detach
+in the process after the kernel posts that thread's death (or at once by that detach or join,
+when the death post has already landed), or leaks until process exit when the reaper could not
+register the thread at spawn (no death queue, no free slot, or the observer bind failed) or the
+kernel dropped the death post because the process's death queue (128 entries) was full.
 
 ### Bootstrap-cross-boundary VAs
 

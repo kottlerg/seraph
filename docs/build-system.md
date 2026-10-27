@@ -88,9 +88,12 @@ relocations that loaders place at a randomized base and whose
 
 The std-userspace triples (`x86_64-seraph.json`, `riscv64a23-seraph.json`)
 carry the same PIE treatment (plus `tls-model: local-exec`, keeping TLS
-access GOT-free so no non-`RELATIVE` relocations appear), relax the
-kernel-side soft-float discipline, and pin a hard-microarchitecture
-floor for userspace SIMD / Vector codegen:
+access GOT-free so no non-`RELATIVE` relocations appear), emit inline
+stack probes (`stack-probes: inline`, so a frame larger than one page
+touches each page in turn and faults on a thread stack's guard page
+instead of skipping it), relax the kernel-side soft-float discipline,
+and pin a hard-microarchitecture floor for userspace SIMD / Vector
+codegen:
 
 - `x86_64-seraph.json` — **x86-64-v3** psABI feature level: SSE2/3/SSSE3/
   SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT, CX16, LAHF/SAHF,

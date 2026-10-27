@@ -1132,8 +1132,7 @@ fn handle_write_memory_node_cap(
         return;
     }
 
-    // Validate the source memory cap: Memory cap with at least MAP|READ
-    // rights.
+    // Validate the source memory cap: Memory cap with at least MAP rights.
     let Ok(tag_rights) = syscall::cap_info(src_cap, syscall::CAP_INFO_TAG_RIGHTS)
     else
     {

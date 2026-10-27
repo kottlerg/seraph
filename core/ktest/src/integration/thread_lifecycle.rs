@@ -30,15 +30,11 @@ use syscall::{
     thread_set_priority, thread_start, thread_stop, thread_write_regs,
 };
 
+use crate::arch::IP_OFFSET;
 use crate::{ChildStack, TestContext, TestResult};
 
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
-
-#[cfg(target_arch = "x86_64")]
-const IP_OFFSET: usize = 120;
-#[cfg(target_arch = "riscv64")]
-const IP_OFFSET: usize = 248;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 

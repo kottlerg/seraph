@@ -535,6 +535,27 @@ The full user-mode register snapshot saved on the kernel stack at every privileg
 The layout is architecture-specific; these methods let shared `syscall/` and `sched/` code
 operate on frames without `#[cfg(target_arch)]`.
 
+Every entry from user mode at which the thread can be descheduled points the thread's
+`trap_frame` at the frame it built, so a thread descheduled from any such entry leaves
+`trap_frame` naming the frame it resumes from, the one `SYS_THREAD_READ_REGS` and
+`SYS_THREAD_WRITE_REGS` act on. On riscv64 every U-mode trap builds the
+frame in the slot just below the kernel stack top that `SYS_THREAD_CONFIGURE` initialises. On
+x86-64 the syscall entry builds it in that slot (the syscall dispatcher republishes it), while the
+interrupt and exception trampolines build it below the hardware iret words and the stub's two
+pushes and publish it through `idt::publish_user_frame`. The x86-64 entries that publish nothing
+deschedule nothing the thread resumes from: `#DF` and `#MC` (IST1, terminal), the NMI (IST2;
+terminal on a hardware NMI, returning on the watchdog backtrace ping), `#NM` (builds no frame), and
+the spurious vector 255 (`iretq` only).
+
+Several paths hold the published frame as a `&mut TrapFrame` across a point where the thread is
+descheduled: the syscall dispatcher hands one to each handler for the whole syscall, including while
+the thread is blocked in it, and on riscv64 `trap_dispatch` takes the frame as `&mut` for the whole
+trap (across preemption) and `redirect_user_fault` holds it across the fault block. Meanwhile
+another thread's `SYS_THREAD_READ_REGS` or `SYS_THREAD_WRITE_REGS` on a `Stopped` or fault-blocked
+thread reads or writes that frame, and riscv64's switch-out clears its FS/VS bits. That violates the
+`&mut`'s uniqueness; passing these paths a non-unique frame handle (as x86-64's trap entries already
+take `*mut TrapFrame`) is tracked by [#443](https://github.com/kottlerg/seraph/issues/443).
+
 ```rust
 pub struct TrapFrame { /* arch-specific layout */ }
 

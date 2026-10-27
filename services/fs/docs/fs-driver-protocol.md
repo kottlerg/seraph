@@ -83,8 +83,9 @@ reject with `NsError::PermissionDenied` otherwise.
 
 Used for short reads (≤ 504 bytes that fit within the current page);
 larger or page-straddling reads use
-[`FS_READ_MEMORY`](#label-7-fs_read_memory). The threshold is
-client-side policy, not server-enforced; see
+[`FS_READ_MEMORY`](#label-7-fs_read_memory). Which label a read uses is
+client-side policy: the server accepts either, and answers an inline
+request for more than 504 bytes with a short read of at most 504; see
 [Inline-vs-memory-cap crossover](#inline-vs-memory-cap-crossover-client-policy).
 
 **Request**
@@ -93,7 +94,7 @@ client-side policy, not server-enforced; see
 |---|---|
 | `label` | `2` |
 | `data[0]` | Byte offset |
-| `data[1]` | Maximum bytes to read (capped at the IPC inline ceiling, 512 bytes) |
+| `data[1]` | Maximum bytes to read; the server clamps it to 504 bytes (`(MSG_DATA_WORDS_MAX - 1) × 8`, the inline reply ceiling after the count word) |
 
 **Reply (success)**
 
@@ -189,8 +190,8 @@ memory cap  otherwise
 ```
 
 `READ_INLINE_THRESHOLD = 504` bytes. This is the FS_READ IPC payload
-ceiling — 63 data words × 8 bytes minus the 8-byte length prefix in
-word 0 (`MSG_DATA_WORDS_MAX` in `abi/syscall`). Above this size a
+ceiling — `MSG_DATA_WORDS_MAX` (64, in `abi/syscall`) data words × 8
+bytes, minus the 8-byte length prefix in word 0. Above this size a
 single inline reply cannot carry the bytes; below it the per-call cost
 is strictly cheaper than the memory-cap path on both supported architectures.
 
@@ -409,7 +410,8 @@ empty (size 0, no allocated cluster).
 
 **Errors**: `INVALID_BADGE`, `EXISTS` (the dispatch may currently
 surface `NO_SPACE` for duplicate names — to be tightened),
-`NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`.
+`NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`, `TOO_MANY_OPEN` (the
+driver's node table is full; the entry was created).
 
 ---
 
@@ -428,7 +430,16 @@ Unlink a file or empty directory. Badge = parent-directory cap with
 **Reply (success)**: `label = 0`, empty body.
 
 **Errors**: `NOT_FOUND`, `NOT_EMPTY` (directory has entries other
-than `.` and `..`), `IO_ERROR`, `PERMISSION_DENIED`.
+than `.` and `..`), `IO_ERROR`, `PERMISSION_DENIED`, `INVALID_BADGE`
+(the badge is not a directory node).
+
+`FS_REMOVE` is not atomic: an error reply can leave any of
+[`crash-safety.md`](../fat/docs/crash-safety.md)'s `FS_REMOVE` states, and
+the driver's cached copy of a sector whose write failed keeps the new bytes
+until a later write of that sector succeeds or the page is evicted. Once
+the cached view shows the entry deleted, the driver drops the entry's node,
+so caps held on it no longer name it
+([#447](https://github.com/kottlerg/seraph/issues/447)).
 
 ---
 
@@ -459,6 +470,16 @@ directory cap with `MUTATE_DIR`.
 | `data[1]` | Destination name length |
 | `bytes(2, &concat(src, dst))` | Source bytes immediately followed by destination bytes (no padding) starting at byte 16 |
 
+Both names share the data area after the two length words, so
+`data[0] + data[1]` MUST be at most `(MSG_DATA_WORDS_MAX - 2) * 8` =
+496 bytes. The bound is less than two names of the per-name maximum
+(`MAX_NAME_LEN`, 255 bytes, per
+[`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)):
+a pair of individually valid names can exceed it, and a client MUST NOT
+send such a pair. The server replies `IO_ERROR` to a zero length, or to
+lengths whose sum exceeds the name bytes the message carries after the two
+length words.
+
 **Reply (success)**: `label = 0`, empty body.
 
 Cross-directory rename is deferred: servers cannot introspect the
@@ -471,10 +492,18 @@ intent; not yet implemented). Tracked as
 
 `FS_RENAME` is not atomic — see
 [`services/fs/fat/docs/crash-safety.md`](../fat/docs/crash-safety.md)
-for the post-crash visible states.
+for the post-crash visible states. The server does not roll a failed rename
+back, so an error reply can leave any of those states too, with the same
+cached-sector caveat as `FS_REMOVE`; once the cached view shows the source
+deleted, the driver drops the source's node, on success and on error. Rollback
+of a failed rename is tracked in
+[#447](https://github.com/kottlerg/seraph/issues/447).
 
 **Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination
-occupied), `NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`.
+occupied; fatfs currently surfaces `NO_SPACE` for it, as for `FS_CREATE`,
+tracked in [#447](https://github.com/kottlerg/seraph/issues/447)),
+`NO_SPACE`, `IO_ERROR` (malformed name lengths, an invalid name),
+`PERMISSION_DENIED`, `INVALID_BADGE` (the badge is not a directory node).
 
 ---
 
@@ -527,8 +556,8 @@ words:
 
 A round with fewer than two caps, or not marked done, is a bootstrap
 failure and the driver exits. The log and procmgr endpoints are not
-part of this round; the driver takes them from `ProcessInfo` (exposed
-to `main` as `StartupInfo`), per
+part of this round; the driver takes them from `ProcessInfo` (read
+through `std::os::seraph::startup_info()`), per
 [abi/process-abi/README.md](../../../abi/process-abi/README.md)
 § ProcessInfo.
 

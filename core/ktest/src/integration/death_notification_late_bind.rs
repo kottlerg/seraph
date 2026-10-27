@@ -27,12 +27,10 @@
 //!      proving the process-exit syscall records the encoded code on the thread.
 
 use syscall::{
-    cap_delete, cap_info, event_queue_create, event_try_recv, process_exit,
-    thread_bind_notification, thread_exit, thread_sleep,
+    cap_delete, event_queue_create, event_try_recv, process_exit, thread_bind_notification,
+    thread_exit, thread_sleep,
 };
-use syscall_abi::{
-    CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, SyscallError, THREAD_STATE_EXITED, encode_exit_code,
-};
+use syscall_abi::{EXIT_FAULT_BASE, SyscallError, encode_exit_code};
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -40,12 +38,6 @@ use crate::{ChildStack, TestContext, TestResult};
 /// Sv39 user half), distinct from `fault_kills_thread`'s `WILD_VA` so the
 /// two never share a mapping.
 const WILD_VA: u64 = 0x3E_6000_0000;
-
-/// Fault vector recorded in `exit_reason` for a not-present store.
-#[cfg(target_arch = "x86_64")]
-const FAULT_VECTOR: u64 = 14; // #PF
-#[cfg(target_arch = "riscv64")]
-const FAULT_VECTOR: u64 = 15; // store/AMO page fault
 
 /// Distinct, non-zero correlators so a dropped or misrouted event surfaces as
 /// a wrong high word rather than a coincidental zero.
@@ -71,7 +63,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     late_bind_after_death(ctx, clean_exit_child, CORR_CLEAN, 0)?;
 
     // Scenario 2: fault, bind after death.
-    late_bind_after_death(ctx, fault_child, CORR_FAULT, EXIT_FAULT_BASE + FAULT_VECTOR)?;
+    late_bind_after_death(
+        ctx,
+        fault_child,
+        CORR_FAULT,
+        EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR,
+    )?;
 
     // Scenario 3: negative control — bind before start fires exactly once.
     bind_before_start_fires_once(ctx)?;
@@ -103,7 +100,7 @@ fn late_bind_after_death(
     crate::spawn::configure_and_start(&child, entry, stack_top, 0)
         .map_err(|_| "death_notification_late_bind: configure_and_start failed")?;
 
-    wait_until_exited(child.th)?;
+    crate::spawn::wait_until_exited(child.th, MAX_POLLS)?;
 
     // Bind a fresh queue onto the already-dead thread; the kernel delivers the
     // retained reason synchronously inside the bind syscall.
@@ -148,7 +145,7 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, clean_exit_child, stack_top, 0)
         .map_err(|_| "death_notification_late_bind: configure_and_start (control) failed")?;
 
-    wait_until_exited(child.th)?;
+    crate::spawn::wait_until_exited(child.th, MAX_POLLS)?;
 
     // The death walk posts asynchronously on the child's CPU; poll for it.
     let payload = poll_event(eq)?;
@@ -166,31 +163,6 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
     cap_delete(child.th).ok();
     cap_delete(child.cs).ok();
     Ok(())
-}
-
-/// Poll `cap_info(CAP_INFO_THREAD_STATE)` until the thread reports `Exited`.
-fn wait_until_exited(thread_cap: u32) -> TestResult
-{
-    let mut polls = 0;
-    loop
-    {
-        let packed = cap_info(thread_cap, CAP_INFO_THREAD_STATE)
-            .map_err(|_| "death_notification_late_bind: cap_info(THREAD_STATE) failed")?;
-        // cast_possible_truncation: the kernel packs an 8-bit state code in the
-        // high word and a 32-bit exit reason in the low word.
-        #[allow(clippy::cast_possible_truncation)]
-        let state = (packed >> 32) as u32;
-        if state == THREAD_STATE_EXITED
-        {
-            return Ok(());
-        }
-        polls += 1;
-        if polls >= MAX_POLLS
-        {
-            return Err("death_notification_late_bind: child never reached Exited");
-        }
-        thread_sleep(1).ok();
-    }
 }
 
 /// Bounded poll for a death event the child posts asynchronously on its own CPU.

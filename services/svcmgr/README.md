@@ -33,8 +33,8 @@ svcmgr/
 ├── Cargo.toml
 ├── README.md
 ├── src/
-│   ├── main.rs                    # _start, IPC dispatch, dispatch_deaths,
-│   │                              # initiate_graceful_shutdown
+│   ├── main.rs                    # main() (std runtime), IPC dispatch,
+│   │                              # dispatch_deaths, initiate_graceful_shutdown
 │   ├── service.rs                 # ServiceEntry, RestartRecipe, SvcmgrCaps,
 │   │                              # restart-policy constants
 │   ├── restart.rs                 # Shared spawn primitives
@@ -47,7 +47,8 @@ svcmgr/
 │   │   └── reconcile.rs           # PendingRegistration + reconcile_and_launch
 │   └── arch/                      # Per-arch halt() entry
 ├── svc-defs/                      # `svcmgr-defs` crate: host-tested `.svc`
-│                                  # Definition types and parser
+│                                  # Definition types, parser, and argv/env
+│                                  # wire-blob encoder (`build_blob`)
 └── docs/
     ├── ipc-interface.md           # handover endowment, HANDOVER_COMPLETE,
     │                              # PUBLISH_ENDPOINT / QUERY_ENDPOINT

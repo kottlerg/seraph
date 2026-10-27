@@ -80,12 +80,15 @@ truth for "how work is tracked and shipped" on this project.
   directly in parallel (single message, two `Agent` tool calls) with the
   PR number as scope, the open Issue list (`gh issue list --state open
   --limit 500 --json number,title`), the ledger path once one exists, and,
-  for a delta run, the `since` head; save the reviewer's findings
+  for a delta run, the `since` head and the merge bases at `since` and at
+  the head (`git merge-base <sha> origin/master` for each); save the
+  reviewer's findings
   (status `unverified`, since no refuter judged them, or `nit` for a nit
-  that cannot block), the recorded and dropped ones, the `verdict`, and
-  the head as `stats.head`, as `<mode>-<head>.json` in the workflow's
-  shape, so the ledger command reads a fallback run too, and apply the
-  same verdict handling.
+  that cannot block), the recorded and dropped ones, the ledger-flagged
+  ones its `Ledger (not re-raised)` heading lists as `ledgered`, the
+  `verdict`, and the head as `stats.head`, as `<mode>-<head>.json` in the
+  workflow's shape, so the ledger command reads a fallback run too, and
+  apply the same verdict handling.
 
   Before each run after the first (every `delta` run, and a `full` run
   once a record exists), build the ledger that section names from every
@@ -108,13 +111,32 @@ truth for "how work is tracked and shipped" on this project.
 
   Handle the run's findings as that section says, in one pass: fixes via
   commits; recorded findings via `gh issue edit` on the Issue the section
-  names, or `gh issue create` with the user's approval; after a
-  `NON-BLOCKING ISSUES ONLY` run, the run's surface findings recorded the
-  same way on the follow-up Issues the section defines; `AUDIT FAIL`
-  items via `gh pr edit`, `gh issue edit`, or commits; a contested
-  finding put to the user and resolved as the section says. Before
-  pushing a fix, for every fact it changes (a symbol, a constant, a rule
-  sentence, a state or section name) walk the `## Summarized By` lists
+  names; after a `NON-BLOCKING ISSUES ONLY` run, the run's surface
+  findings recorded the same way on the follow-up Issue of each finding's
+  scope, as the section defines it: the Issue the PR drains in that scope
+  when it drains one (the lowest-numbered when it drains several; its
+  body carries `Refs #N` for each), else the scope's rolling Issue, found
+  with `gh issue list --state open --limit 500 --search '"defects found
+  by review" in:title' --json number,title` and, when the scope has none,
+  filed with the user's approval as `gh issue create --milestone
+  <current> --label <subsystem> --label <class>`, the current milestone
+  being the one [docs/conventions.md](../docs/conventions.md) § Milestones
+  defines and the labels the ones its § Labels requires. Before recording a
+  finding, and after fixing one, search every open follow-up Issue of its
+  scope, rolling and earlier-pattern (`gh issue list --state open --limit 500
+  --search '"defects found by" in:title' --json number,title`, then the
+  titles beginning `<scope>:`), for an item stating it: a finding one holds
+  is recorded nowhere, and its fix ticks that item. A PR that fixes items on
+  a follow-up Issue ticks each there with `(fixed by PR #<M>)`, copies those
+  items, ticked, into its body's `## Acceptance`, and carries `Refs #N` in
+  its body, and `Fixes #N` only under that section's closing condition.
+  Before each run, an Issue the PR closes (by its body or a commit) whose
+  milestone is missing or not the current one gets the current one (`gh issue
+  edit <N> --milestone <current>`), which the audit checks. `AUDIT FAIL`
+  items via `gh pr edit`, `gh issue edit`, or commits; a contested finding
+  put to the user and resolved as the section says.
+  Before pushing a fix, for every fact it changes (a symbol, a constant, a
+  rule sentence, a state or section name) walk the `## Summarized By` lists
   ([docs/documentation-standards.md](../docs/documentation-standards.md)
   § Change propagation procedure owns that rule) and, as the assistant's
   mechanics, `git grep -n` the tracked tree for every other statement of
@@ -163,13 +185,13 @@ truth for "how work is tracked and shipped" on this project.
   when the reviewer verdict is `BLOCKING ISSUES` and otherwise recorded as
   that section says. Findings off the surface MUST be recorded in the same
   pass, never dropped: on the open Issue that already names the work, else
-  on the PR's follow-up Issue that section defines (filed with the user's
-  approval).
+  on the follow-up Issue of its scope that section defines (filed with the
+  user's approval).
 - "Out of scope", "follow-up", and similar deferrals MUST NOT be used to
   avoid mechanically reachable blocking work on the surface; a non-blocking
-  surface finding is deferred only by recording it on the PR's follow-up
-  Issue as [docs/conventions.md](../docs/conventions.md) § Branch and PR
-  Workflow allows.
+  surface finding is deferred only by recording it on the follow-up Issue
+  of its scope as [docs/conventions.md](../docs/conventions.md) § Branch
+  and PR Workflow allows.
 - Material scope expansions MUST be stated in one line and continued, not
   paused for permission.
 - Genuine deferrals (different review surface, or expansion too large to

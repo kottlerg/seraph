@@ -86,6 +86,28 @@ pub(crate) fn endpoint_slab() -> u32
     ENDPOINT_SLAB.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+// ── Thread start ─────────────────────────────────────────────────────────────
+
+/// Start `thread_cap`, retrying while the start returns `Interrupted`: init
+/// itself was stopped while the start waited for the target to settle, so
+/// nothing was started and a retry is safe.
+///
+/// # Errors
+/// Returns the first error other than `Interrupted`, as `syscall::thread_start`
+/// reports it.
+pub(crate) fn start_thread(thread_cap: u32) -> Result<(), i64>
+{
+    loop
+    {
+        match syscall::thread_start(thread_cap)
+        {
+            Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 =>
+            {}
+            other => return other,
+        }
+    }
+}
+
 // ── Cap descriptor helpers ───────────────────────────────────────────────────
 
 pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
@@ -660,7 +682,12 @@ fn run(info_ptr: u64) -> !
     // single reap-handoff route once every loader has copied the ELF.
 
     // Memmgr is now ingesting; start procmgr.
-    bootstrap::start_procmgr(&pm);
+    if bootstrap::start_procmgr(&pm).is_err()
+    {
+        logging::log("FATAL: cannot start procmgr");
+        syscall::thread_exit();
+    }
+    logging::log("procmgr started");
 
     // Serve procmgr's bootstrap round.
     //

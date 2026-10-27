@@ -22,10 +22,11 @@ Between memmgr and procmgr).
 procmgr/
 ├── Cargo.toml                  # Workspace member; std-using binary
 ├── README.md
-├── process-table/              # `procmgr-process-table` crate:
-│                                 pure host-tested table + badge logic
+├── process-table/              # `procmgr-process-table` crate: pure host-tested
+│                                 table + badge logic and the create-request
+│                                 argv/env blob decoder
 ├── src/
-│   ├── main.rs                 # _start() entry point, IPC dispatch loop
+│   ├── main.rs                 # main() (std runtime), IPC dispatch loop
 │   ├── loader.rs               # ELF load pipeline
 │   ├── process.rs              # Per-process state, kernel-object allocation
 │   ├── init_reap.rs            # Init-reap: reaps init after handover
@@ -169,17 +170,20 @@ Memory-cap allocation is not part of procmgr's interface; see
 ## Process Startup ABI
 
 When procmgr creates a new process, it populates a `ProcessInfo`
-handover struct at a well-known virtual address in the new process's
-address space. This struct tells the process where to find its initial
+handover struct in a read-only page it maps in the new process's address
+space, at a virtual address it chooses per process and delivers in the
+entry register. This struct tells the process where to find its initial
 capabilities, IPC buffer, memmgr endpoint, and startup context. The
 handover contract is defined in
 [`abi/process-abi`](../../abi/process-abi/README.md).
 
-procmgr is the sole producer of `ProcessInfo` for all non-init
-processes. Init and ktest use a different handover path
+procmgr produces `ProcessInfo` for every process except init's
+raw-bootstrap set, memmgr and procmgr, whose `ProcessInfo` init
+populates. Init and ktest use a different handover path
 (kernel-produced `InitInfo` from
-[`abi/init-protocol`](../../abi/init-protocol/README.md)) but share the
-same `main()` signature defined in `abi/process-abi`.
+[`abi/init-protocol`](../../abi/init-protocol/README.md)): each consumes
+`InitInfo` in its own `_start`, constructs no `StartupInfo`, and defines
+no `main()` of either shape `abi/process-abi` describes.
 
 ---
 

@@ -1,8 +1,8 @@
 # abi/process-abi
 
 Userspace process startup ABI: the binary contract between a process creator
-and the created process, plus the universal `main()` entry point convention for
-all Seraph userspace programs.
+and the created process, plus the `main()` entry point convention for the
+processes started through it.
 
 ---
 
@@ -10,33 +10,39 @@ all Seraph userspace programs.
 
 Process startup in Seraph has two layers:
 
-1. **Handover struct** — a `#[repr(C)]`, version-gated structure placed at a
-   well-known virtual address before the new process runs. The producer is
-   procmgr for all normal processes. The struct provides the process with its
-   initial capability layout, IPC buffer, and startup context.
+1. **Handover struct** — a `#[repr(C)]`, version-gated structure the creator
+   maps read-only before the new process runs, at a creator-chosen virtual
+   address it delivers in the entry register. procmgr produces it for every
+   process except memmgr and procmgr, whose `ProcessInfo` init populates. The
+   struct provides the process with its initial capability layout, IPC
+   buffer, and startup context.
 
-2. **`main()` convention** — the universal entry point signature. Every Seraph
-   userspace binary defines `main()`; `_start()` reads the handover struct,
-   constructs a `StartupInfo`, and calls `main()`. std-built services use an
-   idiomatic `fn main()` that reaches the caps via `std::os::seraph::startup_info()`.
-   procmgr, init, and ktest run on bespoke runtimes and take `&StartupInfo`
-   directly.
+2. **`main()` convention** — the entry point convention for a process started
+   from a `ProcessInfo` page: `_start()` reads the handover struct, builds a
+   Rust-native view of it, and enters `main()`. std-built services use an
+   idiomatic `fn main()` that reads std's own `std::os::seraph::StartupInfo`
+   through `std::os::seraph::startup_info()`. memmgr runs on a bespoke runtime
+   whose `_start` constructs this crate's `StartupInfo` and passes
+   `&StartupInfo` to its `main`. init and ktest consume `InitInfo` in their own
+   `_start` and define no `main()` of either shape (see
+   [`main()` Signature](#main-signature)).
 
-Both layers are defined in this crate. Init is a special case: its handover
-struct is `InitInfo` (from [`abi/init-protocol`](../init-protocol/README.md)),
-populated by the kernel rather than procmgr. Init's `_start()` converts
-`InitInfo` into `StartupInfo` before calling `main()`, so all processes —
-including init and ktest — share the same `main()` signature.
+This crate defines `ProcessInfo` and the memmgr runtime's `main(&StartupInfo) -> !` convention;
+the std-built convention and its `StartupInfo` type are defined by
+[`runtime/ruststd`](../../runtime/ruststd/README.md) (`std::os::seraph`). init and ktest sit
+outside both conventions: their handover struct is `InitInfo` (from
+[`abi/init-protocol`](../init-protocol/README.md)), populated by the kernel rather than
+procmgr, and each consumes it in its own `_start` without constructing a `StartupInfo` or
+calling a `main()`.
 
 ---
 
 ## ProcessInfo
 
-The procmgr-to-process handover struct. Placed by procmgr in a single read-only
-page at a virtual address procmgr chooses per-process (via `process-layout`) and
-delivers in the entry register (`rdi`/`a0`), analogous to how the kernel places
-`InitInfo` for init. The address is not a fixed ABI constant — the process reads
-it as the argument to `_start`.
+The creator-to-process handover struct. The creator (procmgr, or init for memmgr and procmgr) places
+it in a single read-only page at a virtual address it chooses per process (via `process-layout`) and
+delivers it in the entry register (`rdi`/`a0`), analogous to how the kernel places `InitInfo` for
+init. The address is not a fixed ABI constant — the process reads it as the argument to `_start`.
 
 The struct MUST be `#[repr(C)]` with stable layout. The process MUST check
 `version == PROCESS_ABI_VERSION` before accessing any other field.
@@ -60,7 +66,9 @@ field groups rather than mirroring every field, so the two cannot drift. As of
   `tls_template_memsz`, `tls_template_align`.
 - **argv / env blobs** — `args_offset`, `args_bytes`, `args_count`,
   `env_offset`, `env_bytes`, `env_count` (blobs are written into the same page
-  after the fixed struct, bounded by the page remainder).
+  after the fixed struct; their bounds are the create-request wire contract in
+  [procmgr's IPC interface](../../services/procmgr/docs/ipc-interface.md#label-1-create_process)
+  § CREATE_PROCESS).
 - **Namespace** — `system_root_cap`, `current_dir_cap`.
 - **Logging** — `log_send_cap` (deprecated; migrating to `service_registry_cap`).
 - **Main-thread layout** — `stack_top_vaddr`, `stack_pages`, `main_tls_vaddr`
@@ -104,37 +112,42 @@ protocol on `creator_endpoint_cap`, not through `ProcessInfo`.
 
 ## StartupInfo
 
-The struct passed to `main()`. This is a Rust-native type (NOT `#[repr(C)]`)
-providing ergonomic access to the handover data. It is constructed by `_start()`
-from either `ProcessInfo` (normal processes) or `InitInfo` (init/ktest).
+The Rust-native view of the handover data. It is NOT `#[repr(C)]`. Only
+memmgr's bespoke `_start` constructs `process_abi::StartupInfo`, from
+`ProcessInfo`, and passes `&StartupInfo` to memmgr's `main`. std's `_start`
+(`std::os::seraph::_start`, in `runtime/ruststd/src/os/seraph.rs`) builds its
+own same-purpose type, `std::os::seraph::StartupInfo`: a `#[stable]`-attributed
+superset that adds `sched_control_cap`, `initial_priority`, and `log_send_cap`,
+which std-built binaries read through `std::os::seraph::startup_info()`. init
+and ktest construct neither.
 
-The authoritative definition is [`src/lib.rs`](src/lib.rs) (`struct StartupInfo`);
-the std overlay carries a `#[stable]`-attributed mirror at
-`runtime/ruststd/src/os/seraph.rs`. It exposes the same groups as `ProcessInfo`
-(identity, service endpoints, stdio rings + notifications, TLS template,
-argv/env as resolved `&[u8]` slices, namespace, main-thread layout including
-`main_tls_vaddr`, and the v18 `pager_endpoint_cap` / `pager_badge`), with cap
-slots delivered as `u32` values
-and `args_blob` / `env_blob` resolved from the handover page into slices.
+The authoritative definition is [`src/lib.rs`](src/lib.rs) (`struct StartupInfo`).
+It carries the self caps (`self_thread`, `self_aspace`, `self_cspace`), the IPC
+buffer, the creator, procmgr, memmgr, and service-registry endpoints, the stdio
+rings and their notifications, the namespace caps, the TLS template, argv/env,
+the main-thread layout including `main_tls_vaddr`, and the v18
+`pager_endpoint_cap` / `pager_badge`. Cap slots are `u32` values, and
+`args_blob` / `env_blob` are `&[u8]` slices; memmgr's `_start`, the only
+constructor, leaves both empty, since init writes no argv or env for memmgr.
 
 Values are copied out of the handover page verbatim, so the struct does
-not borrow from it (except the argv/env slices, which point into the
-read-only handover page that lives for the process's lifetime).
+not borrow from it.
 
 ---
 
 ## main() Signature
 
-All Seraph userspace binaries MUST define `main` with the following signature:
+A binary on the bespoke `StartupInfo` runtime (memmgr) MUST define `main` with
+the following signature:
 
 ```rust
 fn main(startup: &StartupInfo) -> !
 ```
 
 `main()` receives a reference to the `StartupInfo` constructed by `_start()`.
-It MUST NOT return — processes terminate by calling `sys_thread_exit`. If
-`main()` could return, the `_start()` stub calls `sys_thread_exit(0)` as a
-safety net.
+It MUST NOT return — the process terminates by calling `sys_thread_exit`. A
+std-built binary defines an idiomatic `fn main()` instead and reaches the same
+data via `std::os::seraph::startup_info()`; init and ktest define neither.
 
 `_start()` is provided by three distinct runtimes, chosen by build profile:
 
@@ -154,9 +167,9 @@ safety net.
   `InitInfo` page address and delivers it in the entry register, as procmgr
   does for `ProcessInfo`.
 
-All variants produce the same `StartupInfo` shape and invoke `main()`,
-then call `sys_thread_exit` if `main()` returns (defensive — should not
-happen).
+The std variant builds `std::os::seraph::StartupInfo` and the memmgr variant
+this crate's `StartupInfo`, each from `ProcessInfo`; the init / ktest variant
+builds none and defines no `main()` of either shape.
 
 ---
 
@@ -164,20 +177,17 @@ happen).
 
 | | init-protocol | process-abi |
 |---|---|---|
-| Producer | Kernel (Phase 9) | procmgr |
+| Producer | Kernel (Phase 9) | procmgr (init for memmgr and procmgr) |
 | Consumer | init, ktest | All other processes |
 | Handover struct | `InitInfo` | `ProcessInfo` |
 | Page address | Kernel-chosen, delivered in entry register | Creator-chosen, delivered in entry register |
 | Contains platform-global state | Yes (all memory caps, all HW caps, firmware tables) | No |
 | Contains parent endpoint | No (init has no parent) | Yes |
-| `main()` signature | Same (`&StartupInfo`) | Same (`&StartupInfo`) |
+| `main()` | None (`_start` consumes `InitInfo` directly) | `fn main()` (std) or `fn main(&StartupInfo) -> !` (memmgr) |
 
 [Init-protocol](../init-protocol/README.md) is the kernel-to-init contract: it carries the
 full initial CSpace layout, including platform resources only init needs. Process-abi
 carries only what a single service or application requires.
-
-The `CapDescriptor` type SHOULD be shared between the two crates (via a common
-dependency or identical definition) to avoid divergence.
 
 ---
 

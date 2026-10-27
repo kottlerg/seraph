@@ -31,7 +31,7 @@ see there for the authoritative statement.
 |---|---|
 | `.cargo/` | Cargo configuration: the `cargo xtask` alias, the custom-target search path, and the workspace rustflags |
 | `.claude/` | Assistant operating instructions, agents, and workflows (outside the documentation hierarchy) |
-| `.github/` | CI workflows and Issue and PR templates (outside the documentation hierarchy) |
+| `.github/` | CI workflows, their scripts, and Issue and PR templates (outside the documentation hierarchy) |
 | [`abi/`](abi/README.md) | Stable cross-boundary contracts |
 | [`core/`](core/README.md) | Core OS: bootloader, kernel, and the kernel-validation harness (ktest) |
 | `docs/` | Architecture and design documentation |

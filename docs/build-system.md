@@ -380,34 +380,38 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs` and then `cargo xtask test`; the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, and runs one `run-parallel --parallel 1 --runs 1 --timeout 180` iteration; ktest cells then run `test-kaslr`, and usertest cells re-mirror the default boot (`mkdisk`) and run `test-terminal`, plus `test-vmgenid` on x86_64. |
-| `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run-parallel --parallel 2 --runs 20 --timeout 180`. |
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs` and then `cargo xtask test`; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, and runs one `run-parallel --parallel 1 --runs 1 --timeout 180` iteration; ktest cells then run `test-kaslr`, and usertest cells re-mirror the default boot (`mkdisk`) and run `test-terminal`, plus `test-vmgenid` on x86_64. |
+| `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run-parallel --parallel 2 --runs 20 --timeout 180`. |
+| `qemu-debs.yml` | `workflow_call` from `build-test.yml` and `burnin.yml` | One `qemu-debs` job downloads the QEMU and firmware packages into the cache entry the caller's booting jobs install from (below). |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
 
 The jobs that boot under QEMU (`validate` in `build-test.yml` and `burnin`
 in `burnin.yml`) install it and run on the pinned `ubuntu-26.04` runner
 image, whose archive ships `qemu-system-riscv64` in the `qemu-system-riscv`
-package (QEMU 10.2). The install list is each workflow's `QEMU_PACKAGES`,
-installed without recommends. A `qemu-debs` job in each of the two
-workflows, which every booting cell `needs:`, downloads the list's resolved
-`.deb` set once into an `actions/cache` entry keyed
-`qemu-debs-<ImageOS>-<ImageVersion>-<list hash>` (the runner image's
-version variables and a hash of `QEMU_PACKAGES`), and downloads nothing when
-the entry exists. When its fetch from the image's apt mirror fails or
-exceeds 120 s, it rewrites the apt sources, the image's
+package (QEMU 10.2). `.github/scripts/qemu-packages.sh` holds the install
+list and the apt flags (no recommends). Every booting cell `needs:` its
+workflow's `qemu-debs` job, which runs on the same pinned image because the
+downloaded set is resolved against that image's installed packages. The job
+downloads the list's resolved `.deb` set once into an `actions/cache` entry
+keyed `qemu-debs-<ImageOS>-<ImageVersion>-<script hash>` (the runner
+image's version variables and a hash of the script), and downloads nothing
+when the entry exists. A download whose fetch from the image's apt mirror
+fails or exceeds 120 s rewrites the apt sources, the image's
 `/etc/apt/apt-mirrors.txt` mirror list included, from
 `azure.archive.ubuntu.com` to `archive.ubuntu.com` and retries once. Each
-booting cell restores the entry by the key that job outputs and installs
-from it with apt's sources disabled, so it fetches nothing; it falls back to
-a network install only when the entry is absent or does not resolve against
-the cell's image. An entry saved on `master` is readable from every branch
-and tag, so both workflows and later runs share one entry per key. The pin,
-the install list and the cache key move together: the key derives from the
-other two, and the `qemu-debs` job runs on the same pinned image as the
-booting jobs because the downloaded set is resolved against that image's
-installed packages. The `build-image` job of `release.yml` boots nothing
-(its one `cargo xtask` command is `build`), so it installs no QEMU and runs
-on `ubuntu-latest`.
+booting cell restores the entry by the key the job outputs and installs from
+it with apt's sources disabled, so it fetches nothing. When that offline
+install fails, as when the entry is absent or the set does not resolve
+against the cell's image, the cell runs the same bounded download itself
+and installs offline from it. When the `qemu-debs` job fails, the booting
+cells are skipped and the run fails. An entry saved on `master` is readable
+from every branch and tag, so both workflows and later runs share one entry
+per key. The pin, the install list and the cache key move together: the key
+derives from the image version and the script, so a change to the list, the
+flags or the pinned image yields a new entry.
+
+The `build-image` job of `release.yml` boots nothing (its one `cargo xtask`
+command is `build`), so it installs no QEMU and runs on `ubuntu-latest`.
 
 `build-test.yml` cancels stacked runs on the same ref
 (`cancel-in-progress: true`). `burnin.yml` and `release.yml` do not

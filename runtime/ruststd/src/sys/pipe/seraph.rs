@@ -652,20 +652,13 @@ impl Pipe {
         true
     }
 
-    /// Diverging stub for upstream conversions that go through `From<Pipe>
-    /// for Stdio` on platforms where the type is uninhabited. Our `Pipe`
-    /// is inhabited; this branch is unreachable in practice — keep it
-    /// loud so any code path that does land here is obvious in the log.
-    pub fn diverge(&self) -> ! {
-        panic!("seraph pipe: diverge called on inhabited Pipe");
-    }
-}
-
-impl Drop for Pipe {
-    fn drop(&mut self) {
-        // Closer protocol: mark the ring closed, then send one final
-        // notification kick on the *opposite-direction* notification so the peer
-        // wakes from any blocking notification_wait and observes the flag.
+    /// Closer protocol: mark the ring closed, then send one final
+    /// notification kick on the *opposite-direction* notification so the
+    /// peer wakes from any blocking notification_wait and observes the flag.
+    /// Leaves the ring mapped and the caps held, so it is safe while other
+    /// threads still use this end; a later read or write on this end sees
+    /// the closed flag. Idempotent. `Drop` runs it before tearing down.
+    pub fn close(&self) {
         self.header().mark_closed();
         match self.role {
             Role::Reader =>
@@ -679,6 +672,20 @@ impl Drop for Pipe {
                 let _ = syscall::notification_send(self.data_notification, 1);
             }
         }
+    }
+
+    /// Diverging stub for upstream conversions that go through `From<Pipe>
+    /// for Stdio` on platforms where the type is uninhabited. Our `Pipe`
+    /// is inhabited; this branch is unreachable in practice — keep it
+    /// loud so any code path that does land here is obvious in the log.
+    pub fn diverge(&self) -> ! {
+        panic!("seraph pipe: diverge called on inhabited Pipe");
+    }
+}
+
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        self.close();
         // Unmap the ring page from this process's aspace.
         let _ = syscall::mem_unmap(self.aspace, self.ring_vaddr, 1);
         // Release this side's cap slots. The peer's Drop releases its

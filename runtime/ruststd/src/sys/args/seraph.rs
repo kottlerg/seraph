@@ -8,24 +8,27 @@
 //! spawn time, surfaced by `std::os::seraph::startup_info().args_blob`.
 //!
 //! The blob format is defined by the argv section comment above
-//! `ProcessInfo::args_offset` in `abi/process-abi/src/lib.rs`; the field walk
-//! is `argv_env::next_field`.
+//! `ProcessInfo::args_offset` in `abi/process-abi/src/lib.rs`; the field walks
+//! are `argv_env::next_field` and `argv_env::prev_field`.
 //!
-//! Invalid UTF-8 inside an argv entry makes that entry come out as its
-//! replacement-character form when iterating via `args()`; `args_os()`
-//! preserves the raw bytes. Callers that need to tolerate non-UTF-8 argv
-//! should use `args_os`.
+//! Each entry comes out of `args_os()` as its raw bytes, since an `OsString`
+//! on this target is a byte string; `args()` panics on an entry that is not
+//! valid UTF-8, per its std contract. Callers that need to tolerate
+//! non-UTF-8 argv should use `args_os`. Both iterators are double-ended and
+//! exact-size: the front and back walks consume disjoint entries.
 
-use argv_env::next_field;
+use argv_env::{next_field, prev_field};
 
 use crate::ffi::OsString;
 use crate::fmt;
 use crate::os::seraph::try_startup_info;
 
-/// Iterator returned by `env::args_os`.
+/// Iterator returned by `env::args_os`. Unconsumed entries lie in
+/// `blob[cursor..end]`, `remaining` of them.
 pub struct Args {
     blob: &'static [u8],
     cursor: usize,
+    end: usize,
     remaining: usize,
 }
 
@@ -37,20 +40,28 @@ pub fn args() -> Args {
         Some(s) => Args {
             blob: s.args_blob,
             cursor: 0,
+            end: s.args_blob.len(),
             remaining: s.args_count,
         },
-        None => Args { blob: &[], cursor: 0, remaining: 0 },
+        None => Args { blob: &[], cursor: 0, end: 0, remaining: 0 },
     }
+}
+
+/// An argv entry as an `OsString`, byte for byte.
+fn entry(field: &[u8]) -> OsString {
+    // SAFETY: this target's `OsStr` is the byte-string encoding, for which
+    // every byte sequence is a valid encoded `OsStr`.
+    unsafe { OsString::from_encoded_bytes_unchecked(field.to_vec()) }
 }
 
 impl fmt::Debug for Args {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Show the tail that still iterates — not the consumed prefix.
+        // Show the entries that still iterate — not the consumed ends.
         let mut list = f.debug_list();
         let mut cur = self.cursor;
         let mut left = self.remaining;
         while left > 0 {
-            let Some((field, next)) = next_field(self.blob, cur) else {
+            let Some((field, next)) = next_field(&self.blob[..self.end], cur) else {
                 break;
             };
             list.entry(&String::from_utf8_lossy(field));
@@ -68,12 +79,10 @@ impl Iterator for Args {
         if self.remaining == 0 {
             return None;
         }
-        let (field, next) = next_field(self.blob, self.cursor)?;
+        let (field, next) = next_field(&self.blob[..self.end], self.cursor)?;
         self.cursor = next;
         self.remaining -= 1;
-        // OsString on seraph is UTF-8 bytes; lossless for valid UTF-8,
-        // lossy substitution for ill-formed sequences at the boundary.
-        Some(OsString::from(String::from_utf8_lossy(field).into_owned()))
+        Some(entry(field))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -89,29 +98,12 @@ impl ExactSizeIterator for Args {
 
 impl DoubleEndedIterator for Args {
     fn next_back(&mut self) -> Option<OsString> {
-        // Walking the blob backwards requires re-scanning separators; we
-        // collect forward once on demand and pop. For the scale of argv
-        // (dozens of entries at most) this is not a hot path.
         if self.remaining == 0 {
             return None;
         }
-        let mut items: Vec<OsString> = Vec::with_capacity(self.remaining);
-        while let Some(x) = self.next() {
-            items.push(x);
-        }
-        let back = items.pop();
-        // Re-install the remaining forward iteration state by rebuilding
-        // `blob`/`cursor` would be awkward; the common usage of
-        // `next_back` is sort-of-rare in argv, and callers that mix
-        // directions materialise a Vec first. Drain instead: what we
-        // pushed into `items` is consumed by the caller, not us. Put the
-        // survivors back by re-seeding remaining.
-        self.remaining = items.len();
-        // We cannot reconstruct the blob cursor cleanly; subsequent
-        // forward `next()` would have to re-walk. Leave `cursor` at end
-        // so forward iteration stops (safe default). Callers that want
-        // full double-ended semantics can `collect::<Vec<_>>()` first.
-        self.cursor = self.blob.len();
-        back
+        let (field, start) = prev_field(self.blob, self.cursor, self.end)?;
+        self.end = start;
+        self.remaining -= 1;
+        Some(entry(field))
     }
 }

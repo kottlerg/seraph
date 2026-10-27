@@ -70,12 +70,29 @@ impl Arch
     }
 
     /// Rust target triple for the UEFI bootloader.
+    ///
+    /// `core/boot/build.rs` matches the riscv64 name exactly to decide
+    /// whether to pass the linker script; rename both together.
     pub fn boot_target_triple(self) -> &'static str
     {
         match self
         {
             Arch::X86_64 => "x86_64-unknown-uefi",
             Arch::Riscv64 => "riscv64imac-seraph-uefi",
+        }
+    }
+
+    /// `RUSTFLAGS` for the UEFI bootloader build and its lint pass.
+    ///
+    /// Set in place of every config-file `rustflags` and of an inherited
+    /// `RUSTFLAGS`, which the bootloader build replaces rather than extends;
+    /// `docs/build-system.md` § Custom Targets says why.
+    pub fn boot_rustflags(self) -> &'static str
+    {
+        match self
+        {
+            Arch::X86_64 => "-Zunstable-options",
+            Arch::Riscv64 => "-Zunstable-options -C jump-tables=no",
         }
     }
 

@@ -21,10 +21,10 @@ this PR fixes); tick items completed by this PR>
 - [ ] additional component-specific checks: <…>
 
 ## Validation
-<validated head; for a documentation-only or comment-only delta since it, say so; for each
-trigger path the diff touches (docs/testing.md § Coverage tiers), the local host runs made and the
-commit they ran at; for each behaviour-neutral change on a trigger path, name it and why no local
-host run is owed>
+<validated head; for a documentation-only or comment-only delta since it, say so; each local host
+run docs/testing.md § Coverage tiers owes, with its `--runs` count and the head it ran at, or that
+none is owed and why; each behaviour-neutral change on a trigger path, and why no local host run is
+owed for it>
 
 ## Notes
 <design tradeoffs; follow-ups filed as Issues; anything reviewers should see>

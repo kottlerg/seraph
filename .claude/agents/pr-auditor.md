@@ -108,24 +108,25 @@ claims.
    or when the body claims the whole PR is documentation-only and the PR
    diff is not.
 
-   Local host runs: `docs/testing.md` § Coverage tiers owns the trigger
-   paths, the runs each requires, and the behaviour-neutral categories
-   (its Behaviour-neutral changes paragraph); `docs/conventions.md`
-   § PR-body checklist discipline owns what the body reports. For each
-   change the PR diff makes on a trigger path, other than Markdown and
-   comment lines as defined above (build-embedded text counts as build
-   input), the body MUST report every local host run that section requires
-   for that path (the runs its narrow trigger lists add included), each
-   with the commit it ran at, or name the change and the behaviour-neutral
-   category it falls under, and the diff MUST bear that category out. Every
-   such change on that trigger path after a reported run's commit
-   (`git diff <run commit> <head>` on that path) MUST be behaviour-neutral
-   and named in the body. FAIL when a trigger-path change has neither, when
-   a trigger-path change not named behaviour-neutral lacks a reported run
-   that section requires for its path, when a reported run names no commit,
-   when a later change on that path is not named behaviour-neutral, or when
-   a change named behaviour-neutral falls under no category that paragraph
-   lists.
+   Local host runs: `docs/testing.md` § Coverage tiers owns which runs a PR
+   owes (its Trigger paths list, the narrower boundaries' lists, and Repeat
+   count), when a run covers a head (When the runs are owed), and the
+   behaviour-neutral categories (its Behaviour-neutral changes paragraph);
+   `docs/conventions.md` § PR-body checklist discipline owns the report.
+   From the PR's own diff
+   (`git diff $(git merge-base <head> origin/master) <head>`, Markdown and
+   comment lines aside; the parent fetches `origin` before the run, so read
+   `origin/master` as it is), derive the runs owed and their repeat counts.
+   A change the body names as behaviour-neutral owes no run, and the diff
+   MUST bear its category out. The body's `## Validation` MUST report each
+   owed run with its `--runs` count and the head it ran at, and the PR's own
+   diff on that run's trigger paths MUST be the same at that head and at the
+   PR head, behaviour-neutral changes aside; or, when none is owed, the body
+   MUST say so and why. FAIL when an owed run is missing, its count is below
+   the one that section requires, its head is absent or does not cover the
+   PR head, a "none owed" statement is absent or contradicted by the PR's
+   own diff, or a change named behaviour-neutral falls under no category
+   that paragraph lists.
 
 10. PR-body claims: the body's prose (Summary, Notes, and any section
     the template does not define) against the diff. Every file, argument,

@@ -22,8 +22,9 @@
 //! - Larger writes use `FS_WRITE_MEMORY`: one memmgr-allocated page
 //!   is mapped MAP_WRITABLE in the caller's address space, filled
 //!   chunk-by-chunk, and handed to the driver as a DMA source. The
-//!   driver returns the same Memory cap back to us in the reply so
-//!   the cap slot id is rebound across iterations.
+//!   driver returns the same Memory cap back to us in every reply so
+//!   the cap slot id is rebound across iterations; the page's run goes
+//!   back to memmgr once the write ends.
 //!
 //! ## Directory mutation
 //! `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME` operate against
@@ -832,7 +833,8 @@ fn release_split_parent(split: &SplitParent)
 
 /// Inline `FS_WRITE` of at most `WRITE_INLINE_THRESHOLD` bytes at
 /// `offset` against `file_cap`. Returns `bytes_written` reported by
-/// the server (may be short; callers iterate).
+/// the server (may be short; callers iterate), or `InvalidData` when the
+/// server reports more bytes than `payload` holds.
 fn write_inline(
     file_cap: u32,
     offset: u64,
@@ -853,14 +855,32 @@ fn write_inline(
     {
         return Err(map_fs_error(reply.label));
     }
-    Ok(reply.word(0) as usize)
+    let written = reply.word(0) as usize;
+    if written > payload.len()
+    {
+        return Err(io::const_error!(
+            io::ErrorKind::InvalidData,
+            "seraph fs: FS_WRITE reported more bytes than were sent",
+        ));
+    }
+    Ok(written)
 }
 
-/// Bulk write via `FS_WRITE_MEMORY`. Acquires one page-sized DMA
-/// source frame from memmgr, maps it MAP_WRITABLE, then loops chunks
-/// of at most `PAGE_SIZE` bytes through the frame and into the file.
-/// The server returns the source frame in the reply caps each
-/// round-trip, so the cap slot id is rebound on every iteration.
+/// Bulk write via `FS_WRITE_MEMORY`. Acquires one page-sized source
+/// frame from memmgr through [`slab_request_pages`], maps it
+/// MAP_WRITABLE, then loops chunks of at most `PAGE_SIZE` bytes through
+/// the frame and into the file. The request moves the frame's cap to the
+/// server, which returns it in the reply caps on every outcome, so the
+/// cap slot id is rebound from each reply, error replies included.
+///
+/// Returns `InvalidData` when the server reports more bytes written than
+/// the chunk held. On every exit the frame is unmapped and, while this
+/// side still holds its cap, the cap is deleted and its run returned to
+/// memmgr with [`slab_release_fresh`]; a frame whose cap the server kept
+/// stays accounted to this process, since the server may still map it.
+///
+/// [`slab_request_pages`]: crate::sys::alloc::seraph::slab_request_pages
+/// [`slab_release_fresh`]: crate::sys::alloc::seraph::slab_release_fresh
 fn write_memory_chunks(
     file_cap: u32,
     aspace: u32,
@@ -870,41 +890,35 @@ fn write_memory_chunks(
     ipc_buf: *mut u64,
 ) -> io::Result<usize>
 {
-    use ipc::{memmgr_errors, memmgr_labels};
+    use crate::sys::alloc::seraph::{slab_release_fresh, slab_request_pages};
 
-    // Acquire one single-page frame from memmgr.
-    let req = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
-        .word(0, 1)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(memmgr_ep, &req, ipc_buf) }
-        .map_err(|_| io::Error::other("seraph fs: memmgr REQUEST_MEMORY_CAPS ipc_call failed"))?;
-    if reply.label != memmgr_errors::SUCCESS
-    {
-        return Err(io::Error::other("seraph fs: memmgr REQUEST_MEMORY_CAPS failed"));
-    }
-    let mut memory_cap = *reply
-        .caps()
-        .first()
-        .ok_or_else(|| io::Error::other("seraph fs: memmgr returned no frame"))?;
+    let (frame_cap, _, frame_phys) = slab_request_pages(memmgr_ep, 1)
+        .ok_or_else(|| io::Error::other("seraph fs: memmgr REQUEST_MEMORY_CAPS failed"))?;
 
     // Reserve VA and map the frame MAP_WRITABLE.
     let range = crate::sys::reserve::reserve_pages(1).map_err(|_| {
-        let _ = syscall::cap_delete(memory_cap);
+        let _ = syscall::cap_delete(frame_cap);
+        slab_release_fresh(frame_phys);
         io::Error::other("seraph fs: reserve_pages failed for write frame")
     })?;
     let va = range.va_start();
-    if syscall::mem_map(memory_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
+    if syscall::mem_map(frame_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
     {
         crate::sys::reserve::unreserve_pages(range);
-        let _ = syscall::cap_delete(memory_cap);
+        let _ = syscall::cap_delete(frame_cap);
+        slab_release_fresh(frame_phys);
         return Err(io::Error::other("seraph fs: mem_map MAP_WRITABLE failed"));
     }
 
+    // `None` once the server has taken the cap without handing one back.
+    let mut memory_cap = Some(frame_cap);
     let mut total: usize = 0;
     let result: io::Result<()> = (|| {
         while total < payload.len()
         {
+            let cap = memory_cap.ok_or_else(|| {
+                io::Error::other("seraph fs: FS_WRITE_MEMORY reply missing memory cap")
+            })?;
             let chunk_len = (payload.len() - total).min(PAGE_SIZE_USIZE);
             // Copy this chunk to the frame.
             // SAFETY: VA is mapped MAP_WRITABLE for exactly one page;
@@ -921,21 +935,26 @@ fn write_memory_chunks(
                 .word(0, chunk_offset)
                 .word(1, chunk_len as u64)
                 .word(2, 0)
-                .cap(memory_cap)
+                .cap(cap)
                 .build();
             // SAFETY: ipc_buf is the registered IPC buffer.
             let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
                 .map_err(|_| io::Error::other("seraph fs: FS_WRITE_MEMORY ipc_call failed"))?;
+            // The server moves the source frame back in caps[0] on every
+            // outcome; the slot id may differ from the one we sent.
+            memory_cap = reply.caps().first().copied();
             if reply.label != fs_errors::SUCCESS
             {
                 return Err(map_fs_error(reply.label));
             }
-            // Server moves the source frame back in caps[0]; the slot
-            // id may differ from the one we sent.
-            memory_cap = *reply.caps().first().ok_or_else(|| {
-                io::Error::other("seraph fs: FS_WRITE_MEMORY reply missing memory cap")
-            })?;
             let n = reply.word(0) as usize;
+            if n > chunk_len
+            {
+                return Err(io::const_error!(
+                    io::ErrorKind::InvalidData,
+                    "seraph fs: FS_WRITE_MEMORY reported more bytes than were sent",
+                ));
+            }
             total += n;
             if n < chunk_len
             {
@@ -948,8 +967,12 @@ fn write_memory_chunks(
 
     // Tear down regardless of result.
     let _ = syscall::mem_unmap(aspace, va, 1);
-    let _ = syscall::cap_delete(memory_cap);
     crate::sys::reserve::unreserve_pages(range);
+    if let Some(cap) = memory_cap
+    {
+        let _ = syscall::cap_delete(cap);
+        slab_release_fresh(frame_phys);
+    }
 
     result.map(|()| total)
 }
@@ -1388,12 +1411,29 @@ impl File
         }
         let bytes_valid = reply.word(0) as usize;
         let memory_data_offset = reply.word(2) as usize;
-        let caps = reply.caps();
-        if bytes_valid == 0 || caps.is_empty()
+        let Some(&memory_cap) = reply.caps().first()
+        else
         {
             return Ok(0);
+        };
+        // The driver bounds the span by the page tail; the reply is wire
+        // input, so the client checks it before slicing its one mapped page.
+        let in_page = memory_data_offset
+            .checked_add(bytes_valid)
+            .is_some_and(|end| end <= PAGE_SIZE_USIZE);
+        if bytes_valid == 0 || !in_page
+        {
+            let _ = syscall::cap_delete(memory_cap);
+            self.release_frame(cookie);
+            if bytes_valid == 0
+            {
+                return Ok(0);
+            }
+            return Err(io::const_error!(
+                io::ErrorKind::InvalidData,
+                "seraph fs: FS_READ_MEMORY span exceeds its page",
+            ));
         }
-        let memory_cap = caps[0];
 
         let range = match crate::sys::reserve::reserve_pages(1)
         {
@@ -1428,8 +1468,8 @@ impl File
         );
 
         let copy_len = bytes_valid.min(buf.len());
-        // SAFETY: VA is mapped read-only for one page; the fs invariant
-        // is `memory_data_offset + bytes_valid <= PAGE_SIZE`.
+        // SAFETY: VA is mapped read-only for one page, and the `in_page`
+        // check above holds `memory_data_offset + bytes_valid <= PAGE_SIZE`.
         let src = unsafe {
             core::slice::from_raw_parts(
                 (va + memory_data_offset as u64) as *const u8,

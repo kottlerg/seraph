@@ -19,7 +19,8 @@
 //!
 //! The endpoint and the handler thread are created lazily on the first
 //! [`super::File::open`] call; until then the cost is one
-//! `OnceLock<ReleaseState>` load.
+//! `OnceLock` load. The state is published only once the handler thread
+//! is running, so a failed spawn is retried by the next call.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -53,8 +54,9 @@ pub(super) struct FileEntry
     pub mappings: Mutex<Vec<OutstandingMapping>>,
 }
 
-/// Process-wide release state. Created exactly once on the first
-/// [`super::File::open`] call; held forever for the process lifetime.
+/// Process-wide release state. Created on the first
+/// [`super::File::open`] call whose handler spawn succeeds; held forever
+/// for the process lifetime.
 pub(super) struct ReleaseState
 {
     /// Unbadged endpoint cap owned by this process; badged SENDs
@@ -68,14 +70,25 @@ pub(super) struct ReleaseState
     aspace: u32,
 }
 
-static STATE: OnceLock<ReleaseState> = OnceLock::new();
+/// Published only after the handler thread serving it has spawned.
+static STATE: OnceLock<Arc<ReleaseState>> = OnceLock::new();
+
+/// Serialises initialisers, so at most one endpoint and one handler
+/// thread are ever created.
+static INIT: Mutex<()> = Mutex::new(());
 
 /// Lazy-init: ensure the release endpoint exists and the handler thread
 /// is running. Returns the singleton state. Subsequent calls hit the
-/// `OnceLock` fast path.
+/// `OnceLock` fast path. A failed endpoint creation or handler spawn
+/// publishes nothing and deletes the endpoint, so the next call retries.
 pub(super) fn ensure_started() -> io::Result<&'static ReleaseState>
 {
-    if let Some(s) = STATE.get()
+    if let Some(s) = state()
+    {
+        return Ok(s);
+    }
+    let _init = INIT.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(s) = state()
     {
         return Ok(s);
     }
@@ -90,34 +103,22 @@ pub(super) fn ensure_started() -> io::Result<&'static ReleaseState>
     })
     .ok_or_else(|| io::Error::other("seraph fs: cap_create_endpoint (release) failed"))?;
 
-    // get_or_init runs the closure under a mutex, so only one
-    // initialiser publishes to STATE. If we lose the race, our endpoint
-    // becomes orphaned — drop it before returning.
-    let mut won = false;
-    let s = STATE.get_or_init(|| {
-        won = true;
-        ReleaseState {
-            release_ep,
-            registry: Mutex::new(BTreeMap::new()),
-            aspace,
-        }
+    let state = Arc::new(ReleaseState {
+        release_ep,
+        registry: Mutex::new(BTreeMap::new()),
+        aspace,
     });
-
-    if won
-    {
-        // Spawn the handler. Do this only on the winning path so we
-        // never run two handlers on the same endpoint.
-        thread::Builder::new()
-            .name("seraph-fs-release".into())
-            .spawn(handler_main)
-            .map_err(|_| io::Error::other("seraph fs: release-handler spawn failed"))?;
-    }
-    else
+    let handler_state = Arc::clone(&state);
+    if thread::Builder::new()
+        .name("seraph-fs-release".into())
+        .spawn(move || handler_main(&handler_state))
+        .is_err()
     {
         let _ = syscall::cap_delete(release_ep);
+        return Err(io::Error::other("seraph fs: release-handler spawn failed"));
     }
 
-    Ok(s)
+    Ok(&**STATE.get_or_init(|| state))
 }
 
 /// Read the singleton release state if it has been initialised. Used by
@@ -125,7 +126,7 @@ pub(super) fn ensure_started() -> io::Result<&'static ReleaseState>
 /// ran (e.g. failure during `OpenOptions` validation).
 pub(super) fn state() -> Option<&'static ReleaseState>
 {
-    STATE.get()
+    STATE.get().map(|s| &**s)
 }
 
 /// Unbadged endpoint cap the per-`File` SEND derivation hangs off.
@@ -237,13 +238,8 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     crate::os::seraph::log::__emit(core::format_args!("fs-release recv loop {msg} (err={err})"));
 }
 
-fn handler_main()
+fn handler_main(state: &ReleaseState)
 {
-    let state = match STATE.get()
-    {
-        Some(s) => s,
-        None => return,
-    };
     let ipc_buf = crate::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
     {

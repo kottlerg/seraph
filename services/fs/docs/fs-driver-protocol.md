@@ -114,9 +114,9 @@ request for more than 504 bytes with a short read of at most 504; see
 Memory-cap read. The driver returns a single-page Memory cap with
 attenuated rights (`MAP` only: read-only mapping authority) covering
 the cached page that contains the requested byte. The client maps the
-memory cap, reads up to
-`bytes_valid` bytes starting at `memory_data_offset`, then releases
-the page either synchronously after the read, by sending
+memory cap, reads up to `bytes_valid` bytes starting at
+`memory_data_offset`, then releases the page either synchronously
+after the read, by sending
 [`FS_RELEASE_MEMORY`](#client-to-driver-release) on the node cap, or
 in response to a driver-initiated
 [`FS_RELEASE_MEMORY`](#driver-to-client-release) arriving on the

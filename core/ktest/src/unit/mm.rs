@@ -13,7 +13,7 @@
 //!   `aspace_cap + 2` — RODATA segment Memory cap
 //!   `aspace_cap + 3` — BSS/DATA segment Memory cap
 //!
-//! Every segment cap carries full rights (`MAP|READ|WRITE|EXECUTE|RETYPE`): the
+//! Every segment cap carries full rights (`MAP|WRITE|EXECUTE|RETYPE`): the
 //! kernel mints all RAM frames uniformly so they flow into memmgr's pool as
 //! general RAM at init reap. Page-table protection (R/RW/RX) is applied at map
 //! time by `map_segment`, independent of cap rights.

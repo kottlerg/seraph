@@ -1163,7 +1163,8 @@ fn handle_write_memory_node_cap(
     // memmgr-issued memory caps carry RIGHTS_ALL (both WRITE and EXECUTE);
     // mem_map with MAP_READONLY (= 0) on such a cap derives both w and
     // x from the cap rights and trips the kernel's W^X check. Derive a
-    // sub-cap restricted to MAP_READ first; delete it after the unmap.
+    // sub-cap restricted to RIGHTS_MEM_MAP (no WRITE or EXECUTE) first;
+    // delete it after the unmap.
     let Ok(restricted_cap) = syscall::cap_derive(src_cap, RIGHTS_MEM_MAP)
     else
     {

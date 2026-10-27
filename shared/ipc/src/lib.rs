@@ -1193,8 +1193,8 @@ pub mod fs_labels
     /// the indicated page offset, `data[1]` = the same release cookie
     /// echoed back, `data[2]` = byte offset within the returned page
     /// where the file's content for the requested `offset` begins,
-    /// `caps[0]` = single-page Memory cap with `MAP|READ` rights
-    /// covering the cached file page.
+    /// `caps[0]` = single-page Memory cap with `MAP` rights (read-only
+    /// mapping authority) covering the cached file page.
     ///
     /// `bytes_valid` is bounded by file end, the current cluster
     /// boundary on the underlying filesystem, and the page tail
@@ -1236,7 +1236,7 @@ pub mod fs_labels
     /// `data[1]` = bytes to write from the page (`≤ PAGE_SIZE -
     /// memory_data_offset`), `data[2]` = byte offset within the source
     /// page where the data begins. `caps[0]` = source Memory cap with
-    /// at least `MAP|READ` rights, sized one page. Badge must carry the
+    /// at least `MAP` rights, sized one page. Badge must carry the
     /// `WRITE` namespace right.
     ///
     /// Reply (label `fs_errors::SUCCESS`): `data[0]` = `bytes_written`
@@ -1564,7 +1564,7 @@ pub mod blk_labels
     ///
     /// Request: `data[0]` = starting LBA, `data[1]` = sector count
     /// (`>= 1`; defaults to `1` if `data[1]` is absent). Caps: `caps[0]` =
-    /// source Memory cap (`MAP|READ`; the driver reads `count * 512` bytes
+    /// source Memory cap (`MAP` rights; the driver reads `count * 512` bytes
     /// starting at offset 0 of the page, packed contiguously). The page
     /// must be at least `count * 512` bytes; the driver rejects with
     /// `INVALID_MEMORY_CAP` otherwise. `caps[1]` is reserved for a future
@@ -2211,7 +2211,7 @@ pub mod blk_errors
     pub const REGISTER_REJECTED: u64 = 4;
     /// Memory cap rejected: `BLK_READ_INTO_MEMORY` target missing
     /// `MAP|WRITE` rights, `BLK_WRITE_FROM_MEMORY` source missing
-    /// `MAP|READ` rights, smaller than `count * 512` bytes, or absent;
+    /// `MAP` rights, smaller than `count * 512` bytes, or absent;
     /// also returned when `count` is 0 or `count * 512` exceeds `u32::MAX`.
     /// virtio-blk does not yet check the `count * 512` multiply for
     /// overflow: a `count` of 2^55 or more panics the driver under the dev

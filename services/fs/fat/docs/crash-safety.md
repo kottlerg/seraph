@@ -19,8 +19,8 @@ they may observe after an interrupted operation.
 | `FS_WRITE` (in-place) | data cluster sector | (a) old bytes; (b) new bytes. Single-sector RMW; partial sector writes never observed because the cache page is updated in place before the on-disk write. |
 | `FS_CREATE` | (none yet — first cluster allocated lazily by the first `FS_WRITE`) → directory entry | (a) no entry; (b) entry present with `first_cluster = 0`, `size = 0` |
 | `FS_MKDIR` | allocate cluster → zero-fill cluster → write "."/".." → directory entry | (a) no entry; (b) orphaned zeroed cluster; (c) orphaned cluster with "."/".." (looks like a stray empty directory by inode); (d) entry present pointing at the new cluster |
-| `FS_REMOVE` | dir entry → `0xE5`; LFN slots → `0xE5`; FAT chain → free | (a) entry present; (b) entry deleted, chain still linked → orphan cluster chain; (c) entry deleted, chain freed |
-| `FS_RENAME` | insert dest entry → mark src entry `0xE5` | (a) only src present; (b) **both** src and dst present (two names referring to the same cluster chain — readers see the file twice); (c) only dst present |
+| `FS_REMOVE` | LFN slots → `0xE5`; 8.3 entry → `0xE5`; FAT chain → free | (a) entry present; (b) LFN run deleted, 8.3 entry present (visible only under its short alias); (c) entry deleted, chain still linked → orphan cluster chain; (d) entry deleted, chain freed |
+| `FS_RENAME` | insert dest entry → mark src LFN slots, then src 8.3 entry, `0xE5` | (a) only src present; (b) **both** src and dst present (two names referring to the same cluster chain — readers see the file twice; with the src LFN run already deleted, src is visible only under its short alias); (c) only dst present |
 
 The FAT mirror copies (`num_fats == 2` on the default xtask-formatted
 image) are written in `0..num_fats` order. A crash between them
@@ -43,7 +43,7 @@ but reconciles to FAT 0.
   through it could corrupt unrelated data once those clusters are
   reused.
 
-* **Duplicate entry (rename window c)**: two directory entries with the
+* **Duplicate entry (rename window b)**: two directory entries with the
   same `first_cluster`. Reads via either entry behave correctly until
   the chain is mutated through one of them; subsequent reads via the
   other entry see the mutation. Removing one entry frees the chain

@@ -96,8 +96,8 @@ core/kernel/
 │   │   ├── health.rs           # NIST SP 800-90B health tests (RCT/APT)
 │   │   └── selftest.rs         # Boot-time power-on self-test
 │   ├── ipc/                    # IPC subsystem
-│   │   ├── mod.rs
-│   │   ├── endpoint.rs         # Endpoint object: wait queues, state machine
+│   │   ├── mod.rs              # Shared waiter queue (WaitQueue), claims, timed-park arming
+│   │   ├── endpoint.rs         # Endpoint object: send/recv queues, call/recv/reply rendezvous
 │   │   ├── notification.rs     # Notification object: atomic bitmask
 │   │   ├── event_queue.rs      # Event queue: ring buffer
 │   │   ├── fault.rs            # Fault redirection to a thread's fault handler
@@ -179,7 +179,10 @@ call `fill_bytes`; userspace draws from the same generators through
 
 IPC kernel objects: endpoints for synchronous call/reply, notifications for coalescing async
 notification, event queues for ordered async notification, and wait sets for
-multiplexed waiting. See [`docs/ipc-internals.md`](docs/ipc-internals.md).
+multiplexed waiting. Notifications, event queues, and wait sets (which hold at most one) queue
+their blocked waiters through `ipc::WaitQueue` in `mod.rs`, which also holds the shared waiter
+claims and timed-park arming.
+See [`docs/ipc-internals.md`](docs/ipc-internals.md).
 
 ### `sched/`
 
@@ -203,10 +206,8 @@ matches the syscall number to the subsystem handler.
 See [`docs/syscalls.md`](docs/syscalls.md). The audit classifying
 every cross-boundary output (syscall, IPC, fault, exit) for kernel-virtual-address
 disclosure is in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md);
-it records the open disclosures: the x86-64 fault-message `d2` present bit, the
-unpinned `SYS_THREAD_READ_REGS` trap-frame copy under a concurrent last-cap delete, and
-the x86-64 `#DB` exception frame (with its kernel RIP) and the `#DB` handler's stack,
-which a SYSCALL entered with RFLAGS.TF and AC set pushes to user memory
+it records the open disclosures: the x86-64 fault-message `d2` present bit and the
+unpinned `SYS_THREAD_READ_REGS` trap-frame copy under a concurrent last-cap delete
 ([#443](https://github.com/kottlerg/seraph/issues/443)); and the exposures through
 donated memory, bootloader-reclaimed frames, and mirrored console output
 ([#433](https://github.com/kottlerg/seraph/issues/433),

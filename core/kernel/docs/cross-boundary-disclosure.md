@@ -6,10 +6,7 @@ escapes to userspace — a prerequisite for kernel address-space layout
 randomization (KASLR). Known open disclosures: the x86-64 fault-message present
 bit ([#443](https://github.com/kottlerg/seraph/issues/443)), the unpinned
 `SYS_THREAD_READ_REGS` trap-frame copy under a concurrent last-cap delete
-([#443](https://github.com/kottlerg/seraph/issues/443)), the x86-64 `#DB` exception
-frame (with its kernel RIP) and the `#DB` handler's stack (kernel return addresses
-and pointers), pushed to user memory when ring 3 enters SYSCALL with RFLAGS.TF and
-AC set ([#443](https://github.com/kottlerg/seraph/issues/443)), kernel state in
+([#443](https://github.com/kottlerg/seraph/issues/443)), kernel state in
 donated memory that the donor can still map
 ([#433](https://github.com/kottlerg/seraph/issues/433)), mirrored console diagnostics
 ([#440](https://github.com/kottlerg/seraph/issues/440)), and unzeroed bootloader
@@ -24,8 +21,7 @@ kernel pointer, or value derived from one that reaches userspace defeats base
 randomization. This inventory audits the kernel's complete output surface and
 records, per surface, why it carries no kernel VA or, for each known open
 disclosure ([#443](https://github.com/kottlerg/seraph/issues/443), including the
-unpinned `SYS_THREAD_READ_REGS` trap-frame copy and the x86-64 `#DB` exception-frame
-and handler-stack push,
+unpinned `SYS_THREAD_READ_REGS` trap-frame copy,
 [#433](https://github.com/kottlerg/seraph/issues/433),
 [#439](https://github.com/kottlerg/seraph/issues/439),
 [#440](https://github.com/kottlerg/seraph/issues/440)), what it leaks. It is the
@@ -41,15 +37,11 @@ distinct, narrower concern handled in "Physical-address surfaces" below.
 Each surface is classified as one of:
 
 - **(a) kernel VA / pointer** — a kernel virtual address, kernel pointer, or value
-  derived from one. A leak. **Three found** among emitted values: the x86-64
-  fault-message `d2` present bit, the unpinned `SYS_THREAD_READ_REGS` trap-frame
+  derived from one. A leak. **Two found** among emitted values: the x86-64
+  fault-message `d2` present bit and the unpinned `SYS_THREAD_READ_REGS` trap-frame
   copy, which can hand freed or reused kernel memory to the caller (see the
-  fault-message note below), and the x86-64 `#DB` exception frame (with its kernel
-  RIP) and the `#DB` handler's stack (kernel return addresses and pointers), which
-  a SYSCALL entered with RFLAGS.TF and AC set pushes to user memory (see
-  `core/kernel/src/arch/x86_64/syscall.rs` § Entry contract)
-  ([#443](https://github.com/kottlerg/seraph/issues/443)); kernel state kept in donated memory is a
-  separate surface, below.
+  fault-message note below; [#443](https://github.com/kottlerg/seraph/issues/443));
+  kernel state kept in donated memory is a separate surface, below.
 - **(b) userspace VA** — an address in the caller's own (or a delegate's) address
   space. The caller already owns it; not a disclosure.
 - **(c) opaque / randomized** — a kernel-minted identifier that is unguessable
@@ -84,7 +76,6 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | Cap split / create / derive handlers → opaque cap handles | `mem::sys_memory_split`, `hw::sys_mmio_split`, `cap::sys_cap_derive` | c |
 | IPC `Message` label / badge / data[] / cap_slots[] | `ipc::message::Message`, `ipc::{read_ipc_buf, write_ipc_buf, write_cap_results}` | b/c |
 | Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge | `ipc::fault::FaultInfo`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for` | b/d; **a** on x86-64 ([#443](https://github.com/kottlerg/seraph/issues/443)) |
-| x86-64 `#DB` exception frame (kernel RIP) and `#DB` handler stack (kernel return addresses and pointers), pushed at the user RSP when ring 3 enters SYSCALL with RFLAGS.TF and AC set | `arch::x86_64::syscall::syscall_entry` (§ Entry contract), `SFMASK_CLEAR_IF` | **a** ([#443](https://github.com/kottlerg/seraph/issues/443)) |
 | Exit / death reason encoding + death payload `(correlator << 32) \| reason` | `syscall::encode_exit_code`, `EXIT_*` constants, `sched::post_one_death_event` | c/d |
 | Thread ID (random CSPRNG correlator for every thread but init, whose ID is the fixed value 1; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c/d |
 | `CSpaceId` (registry index, never returned to userspace); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |
@@ -219,31 +210,28 @@ or the direct map; see
 kernel-pointer console output is governed by the serial-only rule below; it must not be
 routed to any userspace-reachable IPC or log channel.
 
-**KASLR values are serial-only.** The randomized kernel image base, direct-map base,
-and slide, and any kernel virtual address derived from them (an image VA or a
-direct-map VA), are secrets whose disclosure defeats KASLR. `kprintln!` mirrors to the
-framebuffer, and although the kernel writes that framebuffer directly (not as a driver
-client), the framebuffer *memory* is later handed to the userspace framebuffer driver
-([docs/console-model.md](../../../docs/console-model.md) § The framebuffer driver as sole
-userspace framebuffer owner), which can read the pixels back — so a KASLR value printed
-via `kprintln!` becomes userspace-recoverable. These values must be emitted **only** via
-the serial-only sinks
-(`kprintln_serial!` / `console::serial_write_fmt`; on the panic and NMI paths the
-lock-bypassing `console::panic_write_fmt` and `kprintln_nmi!` /
-`console::nmi_write_fmt`), never `kprintln!`, and never through any IPC or log channel.
-The panic handler's backtrace and the x86-64 NMI backtrace print their kernel addresses
-through those two sinks. The Phase-1 KASLR report prints address-free status
-lines (one for the image, one for the direct map) via `kprintln!` and the slide/bases
-only via `kprintln_serial!`; the Phase-9
-init-thread report prints the thread id and priority on one `kprintln!` line and init's
-kernel stack top (a direct-map VA) on a separate `kprintln_serial!` line; the
-bootloader's console (which also mirrors to the framebuffer) prints only the opaque
-`kaslr_flags`. The `KERNEL EXCEPTION` dumps and the riscv64 `BUG: ecall return sepc`
-path print `rip`/`sepc` and register values via `kprintln!` and `fatal` halts only the
-faulting CPU, so on SMP they are userspace-recoverable, as is the non-fatal watchdog
+**KASLR values are serial-only.** The randomized kernel image base, direct-map base, and slide, and
+any kernel virtual address derived from them (an image VA or a direct-map VA), are secrets whose
+disclosure defeats KASLR. `kprintln!` mirrors to the framebuffer, and although the kernel writes
+that framebuffer directly (not as a driver client), the framebuffer *memory* is later handed to the
+userspace framebuffer driver ([docs/console-model.md](../../../docs/console-model.md) § The
+framebuffer driver as sole userspace framebuffer owner), which can read the pixels back — so a KASLR
+value printed via `kprintln!` becomes userspace-recoverable. These values must be emitted **only**
+via the serial-only sinks (`kprintln_serial!` / `console::serial_write_fmt`; on the panic and NMI
+paths the lock-bypassing `console::panic_write_fmt` and `kprintln_nmi!` / `console::nmi_write_fmt`),
+never `kprintln!`, and never through any IPC or log channel. The panic handler's backtrace and the
+x86-64 NMI backtrace print their kernel addresses through those two sinks. The Phase-1 KASLR report
+prints address-free status lines (one for the image, one for the direct map) via `kprintln!` and the
+slide/bases only via `kprintln_serial!`; the Phase-9 init-thread report prints the thread id and
+priority on one `kprintln!` line and init's kernel stack top (a direct-map VA) on a separate
+`kprintln_serial!` line; the watchdog dump's lock-wait line prints the lock kind via `kprintln!` and
+the lock word's address only via `kprintln_serial!`; the bootloader's console (which also mirrors to
+the framebuffer) prints only the opaque `kaslr_flags`. The `KERNEL EXCEPTION` dumps and the riscv64
+`BUG: ecall return sepc` path print `rip`/`sepc` and register values via `kprintln!` and `fatal`
+halts only the faulting CPU, so on SMP they are userspace-recoverable, as is the non-fatal watchdog
 dump's direct-map TCB and endpoint pointers; closing them is
-[#440](https://github.com/kottlerg/seraph/issues/440), which also records the other
-mirrored kernel-VA sites the review found.
+[#440](https://github.com/kottlerg/seraph/issues/440), which also records the other mirrored
+kernel-VA sites the review found.
 
 ## Maintaining this inventory
 

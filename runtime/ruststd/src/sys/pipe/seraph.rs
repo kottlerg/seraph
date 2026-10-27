@@ -38,6 +38,7 @@ use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::sys::reserve::{ReservedRange, reserve_pages, unreserve_pages};
 use shmem::{SharedBuffer, SpscHeader, SpscReader, SpscWriter};
+use syscall_abi::SyscallError;
 
 /// Ring data byte capacity. One 4 KiB page = 16-byte header + 4080 bytes
 /// data area; largest power of two ≤ 4080 is 2048.
@@ -533,11 +534,14 @@ impl Pipe {
                 return Ok(0);
             }
             // Block until writer kicks the data notification, peer closes,
-            // or the death bridge fires. A wait error means the notification
-            // cap itself is gone (teardown raced us); surface EOF rather
-            // than spin on a dead cap.
-            if syscall::notification_wait(self.data_notification).is_err() {
-                return Ok(0);
+            // or the death bridge fires. `Interrupted` (this thread was
+            // stopped and restarted) re-checks the ring. Any other wait error
+            // means the notification cap itself is gone (teardown raced us);
+            // surface EOF rather than spin on a dead cap.
+            match syscall::notification_wait(self.data_notification) {
+                Ok(_) => {}
+                Err(e) if e == SyscallError::Interrupted as i64 => {}
+                Err(_) => return Ok(0),
             }
         }
     }
@@ -615,14 +619,19 @@ impl Pipe {
                 return Ok(buf.len());
             }
             // Block until reader kicks the space notification, peer closes,
-            // or the death bridge fires. A wait error means the notification
-            // cap itself is gone; report the pipe as broken rather than
-            // spin on a dead cap.
-            if syscall::notification_wait(self.space_notification).is_err() {
-                return Err(io::const_error!(
-                    io::ErrorKind::BrokenPipe,
-                    "seraph pipe: space notification unavailable",
-                ));
+            // or the death bridge fires. `Interrupted` (this thread was
+            // stopped and restarted) re-checks the ring. Any other wait error
+            // means the notification cap itself is gone; report the pipe as
+            // broken rather than spin on a dead cap.
+            match syscall::notification_wait(self.space_notification) {
+                Ok(_) => {}
+                Err(e) if e == SyscallError::Interrupted as i64 => {}
+                Err(_) => {
+                    return Err(io::const_error!(
+                        io::ErrorKind::BrokenPipe,
+                        "seraph pipe: space notification unavailable",
+                    ));
+                }
             }
         }
     }

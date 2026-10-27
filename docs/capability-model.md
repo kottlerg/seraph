@@ -693,18 +693,33 @@ including the deleting thread itself, when it holds that last capability to its 
 `AddressSpace` (the delete then never returns to it). The process's resources are reclaimed as their
 capability reference counts reach zero. This path has known kernel memory-safety gaps, tracked in
 [#443](https://github.com/kottlerg/seraph/issues/443) (see
-[IPC Design](ipc-design.md#the-callreply-model) § The Call/Reply Model and
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
-§ Storage: Hybrid Two-Level Radix).
+§ Storage: Hybrid Two-Level Radix,
+[thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
+§ `dealloc_object(Thread)` Drain Protocol, step 11, and
+[syscalls.md](../core/kernel/docs/syscalls.md#sys_thread_stop-20) § `SYS_THREAD_STOP`).
 
-Beyond that stop, the kernel's role in death is *notification*. An
-`AddressSpace` carries a death-observer set (mirroring the per-thread death
-observers). On a terminal fault by any thread in the address space — no fault
-handler bound, or the handler replied `KILL` — the kernel posts the fault class
-(`EXIT_FAULT_BASE + vector`) to each bound observer and exits the faulting
-thread. procmgr binds such an observer at process creation, so a fatal fault on
-any thread — a worker, not just the main thread — drives procmgr's teardown of
-the whole process. Normal thread exit does not fire these observers.
+Beyond that stop, the kernel's role in death is *notification*. An `AddressSpace` carries a
+death-observer set (mirroring the per-thread death observers). A fault is terminal when:
+
+- no fault handler is bound;
+- the handler replies `KILL`;
+- the fault episode is cancelled: by destruction of the handler thread (deletion of its last
+  Thread capability), by destruction of the handler endpoint while the fault is still queued on it,
+  or by a later receive on the handler thread that passes its capability and headroom checks while
+  the fault reply is pending; or
+- the faulting thread is stopped before any reply claims the fault, which cancels the episode.
+
+On a terminal fault by any thread in the address space, the kernel posts the fault class
+(`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on riscv64) to each bound observer
+and exits the faulting thread. A stopped faulting thread is the exception in timing only: whether
+the stop cancelled the episode or a `KILL` reply had already claimed it, the terminal fault takes
+effect, and is posted, only if the thread is started again (see
+[Fault Handling](fault-handling.md#delivery-resume-and-kill)).
+
+procmgr binds such an observer at process creation, so a fatal fault on any thread — a worker, not
+just the main thread — drives procmgr's teardown of the whole process. Normal thread exit does not
+fire these observers.
 
 ---
 

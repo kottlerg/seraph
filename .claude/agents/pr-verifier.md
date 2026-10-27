@@ -20,11 +20,14 @@ return value, not a message to a person.
   Refute only on evidence; say when you could not confirm rather than guess.
 - When scoping, run the listed commands and derive the requested fields
   from what they print and from the files they name (classification,
-  changed items, governing documents); do not review.
+  changed items, the design-document list the prompt defines); do not
+  review.
 - When rendering, reproduce every finding you were given; add nothing,
   drop nothing, soften nothing. Grouping entries that share one root cause
   under a lead entry that still lists every site is presentation, not
-  merging; each grouped site keeps its own status and MUST-violation tags.
+  merging; each grouped site keeps its own status, blocking, and
+  MUST-violation tags, and the root-cause group marker where the input
+  carries one.
 
 ## Tool discipline
 

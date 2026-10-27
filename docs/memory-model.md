@@ -188,7 +188,9 @@ spaces still invalidates the right translation. Multi-page range invalidation ba
 per-address invalidations: on RISC-V the Svinval sequence (`sfence.w.inval`, a `sinval.vma`
 per page, `sfence.inval.ir`) pays the fence cost once per batch; on x86-64 the same surface
 degenerates to an `invlpg` loop. Spans larger than a small ceiling fall back to a full
-flush, which is cheaper than per-page invalidation at that size (see
+flush, which is cheaper than per-page invalidation at that size; on RISC-V a teardown that
+frees a page-table frame also takes the full flush whatever its size, since a VA-form fence
+need only invalidate leaf entries (see
 [memory-internals.md](../core/kernel/docs/memory-internals.md) § TLB Management). Cross-CPU
 invalidation uses the SMP shootdown protocol described in
 [memory-internals.md](../core/kernel/docs/memory-internals.md) § SMP TLB Shootdown.
@@ -203,13 +205,10 @@ On x86-64, SMEP (Supervisor Mode Execution Prevention) and SMAP (Supervisor Mode
 Access Prevention) are required by the platform baseline
 ([platform-requirements.md](platform-requirements.md)) and enabled unconditionally. SMEP
 prevents the kernel from executing userspace pages; SMAP prevents the kernel from reading or
-writing userspace memory except through designated safe copy routines. Together these
-mitigate a class of privilege escalation exploits. SMAP enforcement has a gap at every ring-3
-kernel entry: on SYSCALL, `IA32_SFMASK` does not clear RFLAGS.AC and the syscall entry stub
-runs no `clac`; on an interrupt or exception taken from ring 3, delivery does not clear AC and
-the IDT entry stubs run no `clac`. A user-set AC therefore leaves SMAP unenforced for explicit
-kernel accesses on that entry until the first user copy's `clac` clears it (a defect,
-[#443](https://github.com/kottlerg/seraph/issues/443)).
+writing userspace memory except through designated safe copy routines. Every kernel entry
+that runs kernel code clears RFLAGS.AC (SYSCALL's flag mask; `clac` in the interrupt and
+exception stubs; the spurious-interrupt stub runs only `iretq`), so a user-set AC cannot
+lift SMAP in ring 0. Together these mitigate a class of privilege escalation exploits.
 
 On RISC-V, S-mode can never execute from user (U=1) pages, and the kernel keeps
 `sstatus.SUM` clear except inside its user-copy routines, so supervisor loads and stores

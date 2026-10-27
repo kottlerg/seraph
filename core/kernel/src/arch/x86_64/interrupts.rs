@@ -77,8 +77,9 @@ const IST_STACK_SIZE: usize = 8192;
 
 /// BSP IST stacks, in BSS. The BSP installs these at Phase-5 init.
 ///
-/// Two stacks: IST1 for double-fault, IST2 for NMI. AP IST stacks live in the per-CPU slab
-/// allocated by [`crate::arch::x86_64::ap_trampoline::init_ap_ist_storage`].
+/// Two stacks: IST1 for double-fault and machine-check, IST2 for NMI. AP IST
+/// stacks live in the per-CPU slab allocated by
+/// [`crate::arch::x86_64::ap_trampoline::init_ap_ist_storage`].
 ///
 /// `static mut` is written only at single-threaded boot init.
 #[cfg(not(test))]

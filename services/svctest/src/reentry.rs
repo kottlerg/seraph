@@ -5,12 +5,14 @@
 
 //! argv-driven child-mode dispatch.
 //!
-//! Several phases respawn `/tests/svctest` with a single argv token to
-//! exercise child-side behaviour (namespace attenuation propagation,
-//! cwd-cap delivery, `/programs`-subtree attenuation). The child-mode
-//! function for each role lives in the phase module that spawns it;
-//! `dispatch` consults each module's `reentry_main(role)` so a new
-//! role is registered alongside its phase, not in a central switch.
+//! Several phases respawn `/tests/svctest` with a role token as argv[1]
+//! (some roles take further arguments after it, e.g. `blobs-fill-child`'s
+//! filler token) to exercise child-side behaviour: namespace and
+//! `/programs`-subtree attenuation, cwd-cap delivery, argv/env blob packing,
+//! exit-code propagation, and per-process randomness and ASLR divergence.
+//! The child-mode function for each role lives in the phase module that
+//! spawns it; `dispatch` consults each module's `reentry_main(role)` so a
+//! new role is registered alongside its phase, not in a central switch.
 //!
 //! A module's `reentry_main` diverges (`std::process::exit`) on a
 //! matching role and returns on a miss; `dispatch` cascades through

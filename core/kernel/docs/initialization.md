@@ -239,7 +239,7 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 
 ```
 1. Enable SMEP and SMAP in CR4 (fatal if CPUID lacks either; both are required and
-   already gated in Phase 1)
+   already gated in Phase 1) and clear CR4.FSGSBASE
 2. Enable XSAVE (x87 | SSE | AVX in XCR0) and set CR0.TS for lazy FPU/SIMD save-restore
 3. Construct and install the permanent GDT and the BSP's TSS:
    - Null descriptor (index 0)
@@ -259,14 +259,20 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    - Device IRQ vectors 33–55 (I/O APIC GSIs 0–22)
 5. Switch to x2APIC mode where CPUID advertises it, software-enable the BSP local APIC
    with every LVT masked, and mask every I/O APIC entry
-6. Configure SYSCALL/SYSRET: set EFER.SCE; write LSTAR, STAR, SFMASK (clears IF on entry)
+6. Configure SYSCALL/SYSRET: set EFER.SCE; write LSTAR, STAR, SFMASK (clears IF, TF, DF, AC,
+   NT and IOPL on entry)
 7. Configure the preemption timer at a fixed 1 ms period (`timer::init(1_000)`):
    TSC-deadline mode where CPUID advertises it, periodic APIC timer otherwise
 8. Enable interrupts (STI)
 ```
 
 The step-7 timer mode selection is specified in [arch-interface.md](arch-interface.md)
-§ `timer`.
+§ `timer`. SMEP and SMAP are required and enabled unconditionally, and SFMASK clears the
+user-controlled RFLAGS bits, AC among them, per
+[memory-model.md](../../../docs/memory-model.md) § Kernel Isolation — SMEP and SMAP. After
+step 5, the BSP's per-CPU install writes its per-CPU pointer to `IA32_GS_BASE` and 0 to
+`IA32_KERNEL_GS_BASE`; `swapgs` exchanges the two on every ring-3 entry and exit that runs
+kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
 
 ### RISC-V
 
@@ -593,7 +599,8 @@ calls `sched::enter()`.
    c. x86-64: `first_entry_to_user` composes the CR3 value (init's root, OR'd with its
       claimed PCID when tagging is enabled) and calls switch_and_enter_user(cr3, tf_ptr),
       which switches RSP to init's kernel stack, writes CR3, builds the iretq frame, and
-      executes iretq
+      executes cli; swapgs (user GS base active, per-CPU pointer parked in
+      IA32_KERNEL_GS_BASE); iretq
    d. RISC-V: `first_entry_to_user` activates init's address space (`AddressSpace::activate`:
       a satp write, ASID-tagged when tagging is enabled, with a flush only when the per-CPU
       generation check requires one), then calls return_to_user(tf_ptr), which restores

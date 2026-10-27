@@ -50,6 +50,43 @@ use syscall::{
 
 // ── Syscall dispatch ──────────────────────────────────────────────────────────
 
+/// Record a syscall's entry: the calling thread's `syscall_nr` stamp, this
+/// CPU's stamp for the softlockup watchdog, and the thread's `trap_frame`.
+///
+/// Every entry from user mode at which the thread can be descheduled
+/// publishes its live frame as the thread's `trap_frame` (see
+/// docs/arch-interface.md § `trap_frame`); an interrupt or exception taken
+/// since the last syscall may have pointed it at a frame lower on the stack.
+///
+/// # Safety
+/// Called from syscall entry with interrupts masked, with `frame` the live
+/// frame on the calling thread's kernel stack.
+#[cfg(not(test))]
+unsafe fn stamp_syscall_entry(nr: u64, frame: *mut TrapFrame)
+{
+    // Null-guarded like every handler's own check rather than asserted: the
+    // diagnostic stamp must never be the thing that faults.
+    // SAFETY: kernel context with the scheduler initialised and interrupts
+    // masked, so `current_tcb` reads this CPU's current thread.
+    let tcb = unsafe { current_tcb() };
+    crate::sched::note_cpu_syscall(nr);
+    if tcb.is_null()
+    {
+        return;
+    }
+    // SAFETY: tcb is the running thread's live TCB (checked non-null above),
+    // and the running thread alone writes its own `syscall_nr` and
+    // `trap_frame` after configuration.
+    unsafe {
+        (*tcb)
+            .syscall_nr
+            .store(nr, core::sync::atomic::Ordering::Relaxed);
+        (*tcb)
+            .trap_frame
+            .store(frame, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Syscall dispatcher: called from the arch-specific trap/syscall entry stub.
 ///
 /// Reads the syscall number from `tf`, invokes the handler, and writes the
@@ -62,23 +99,17 @@ use syscall::{
 #[cfg(not(test))]
 pub unsafe fn dispatch(tf: *mut TrapFrame)
 {
-    // SAFETY: caller guarantees tf is valid and exclusively accessible.
+    let frame = tf;
+    // SAFETY: caller guarantees tf is valid. The `&mut` is not exclusive for
+    // the whole call: while the thread blocks in a handler, other paths access
+    // the frame through the published `trap_frame`, a gap
+    // docs/arch-interface.md § `trap_frame` states and #443 tracks.
     let tf = unsafe { &mut *tf };
 
     let nr = tf.syscall_nr();
-    // SAFETY: syscall context on the caller's kernel stack with interrupts
-    // masked; `current` is the calling thread and stable here. Null-guarded
-    // like every handler's own check rather than asserted: the diagnostic
-    // stamp must never be the thing that faults.
-    unsafe {
-        let tcb = current_tcb();
-        if !tcb.is_null()
-        {
-            (*tcb)
-                .syscall_nr
-                .store(nr, core::sync::atomic::Ordering::Relaxed);
-        }
-    }
+    // SAFETY: syscall entry with interrupts masked, on the caller's kernel
+    // stack; `frame` is its live frame.
+    unsafe { stamp_syscall_entry(nr, frame) };
 
     let ret: Result<u64, SyscallError> = match nr
     {
@@ -199,10 +230,9 @@ fn sys_yield(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Marks the current thread as `Exited` and calls `schedule()` to switch
 /// to the next runnable thread. The exited thread is never re-enqueued.
 ///
-/// This stops only the calling thread. Its TCB, kernel stack, and `CSpace`
-/// entries are reclaimed by procmgr's cap-revoke teardown once it observes the
-/// death, when the last capability to the thread is deleted (see
-/// docs/process-lifecycle.md § Process Death).
+/// Its kernel stack and TCB are freed by `dealloc_object(Thread)` when its
+/// last capability is deleted (procmgr's cap-revoke teardown, for process
+/// threads).
 #[cfg(not(test))]
 fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -213,10 +243,12 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // Commit Exited under all-CPU scheduler.locks so a concurrent
         // dealloc on another CPU observes a coherent state and the local
         // schedule() below sees the Exited skip-bit. The reason (0 = clean
-        // exit) is written in the same hold. A refusal means a teardown
-        // already committed `EXIT_KILLED`; this path still posts its own
-        // reason below — no death walk posts `EXIT_KILLED` (see the ABI
-        // constant) — so only the retained value says killed.
+        // exit) is written in the same hold. A refusal means the thread was
+        // already torn down: an object-teardown stop recorded `EXIT_KILLED`,
+        // or a `dealloc_object(Thread)` committed `Exited`. This path still
+        // posts its own reason below (no death walk posts `EXIT_KILLED`; see
+        // the ABI constant), so after a teardown stop only the retained value
+        // says killed.
         // SAFETY: tcb validated non-null.
         let _ = unsafe { crate::sched::exit_under_all_locks(tcb, 0) };
 
@@ -268,9 +300,11 @@ fn sys_process_exit(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     if !tcb.is_null()
     {
         // Commit Exited under all-CPU scheduler.locks (see sys_exit); the
-        // reason is written in the same hold. A refusal means a teardown
-        // already committed `EXIT_KILLED`; the post below still carries
-        // this path's own reason (no death walk posts `EXIT_KILLED`).
+        // reason is written in the same hold. A refusal means the thread was
+        // already torn down: an object-teardown stop recorded `EXIT_KILLED`,
+        // or a `dealloc_object(Thread)` committed `Exited`. The post below
+        // still carries this path's own reason (no death walk posts
+        // `EXIT_KILLED`).
         // SAFETY: tcb validated non-null.
         let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
 
@@ -308,9 +342,7 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Ok(0);
     }
 
-    let tps = crate::arch::current::timer::ticks_per_second();
-    let now = crate::arch::current::timer::current_tick();
-    let deadline = now.saturating_add(ms.saturating_mul(tps) / 1000);
+    let deadline = crate::sched::sleep_deadline_after_ms(ms);
 
     // SAFETY: current_tcb() returns this CPU's running thread.
     let tcb = unsafe { current_tcb() };
@@ -323,10 +355,14 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 
-    // SAFETY: tcb validated non-null; sleep_deadline read by the timer path only
-    // after sleep_list_add below.
+    // Set before the park commit: from the commit on, a cancellation
+    // (`cancel_ipc_block` under sched_lock) can clear it, and the add below
+    // then refuses.
+    // SAFETY: tcb validated non-null.
     unsafe {
-        (*tcb).sleep_deadline = deadline;
+        (*tcb)
+            .sleep_deadline
+            .store(deadline, core::sync::atomic::Ordering::Relaxed);
     }
 
     // Commit Running→Blocked under the per-TCB sched_lock (the authoritative
@@ -349,9 +385,11 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             // Stray coalesced wake; no sleep-list entry was added and the
             // thread stays runnable — report the (zero-length) sleep done.
-            // SAFETY: tcb valid.
+            // SAFETY: tcb valid; never parked, so no canceller targets it.
             unsafe {
-                (*tcb).sleep_deadline = 0;
+                (*tcb)
+                    .sleep_deadline
+                    .store(0, core::sync::atomic::Ordering::Relaxed);
             }
             return Ok(0);
         }
@@ -364,43 +402,61 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // SAFETY: tcb valid; no sleep-list entry was added. schedule is
             // called from syscall context on a valid kernel stack.
             unsafe {
-                (*tcb).sleep_deadline = 0;
+                (*tcb)
+                    .sleep_deadline
+                    .store(0, core::sync::atomic::Ordering::Relaxed);
                 crate::sched::schedule(false);
             }
             return Err(SyscallError::Interrupted);
         }
     }
 
-    // Known defect (#443): the add does not re-check that the park is still
-    // armed; see core/kernel/docs/thread-lifecycle-and-sleep.md
-    // § `sys_thread_sleep` and the Plain-Sleep Path, invariant 3.
-    if crate::sched::sleep_list_add(tcb).is_err()
+    // SAFETY: tcb is this CPU's running thread.
+    match unsafe { crate::sched::sleep_list_add(tcb) }
     {
-        // Sleep list at capacity. Roll back the Blocked commit: sys_thread_sleep
-        // has no IPC source to fall back on; the only honest answer is to surface
-        // the failure to userspace. See core/kernel/docs/thread-lifecycle-and-sleep.md
-        // § Sleep List Invariants.
-        // A concurrent stop or teardown can commit Stopped or Exited between
-        // the Blocked commit and here (core/kernel/docs/thread-lifecycle-and-sleep.md
-        // § `sys_thread_sleep` and the Plain-Sleep Path), so Running is
-        // restored under sched_lock only if the thread is still Blocked.
-        // The successful commit_blocked above cleared context_saved = 0; this
-        // rollback leaves the thread Running with cs = 0, which is intentional
-        // and benign — cs = 0 truthfully means "live registers authoritative"
-        // for a still-`current`, never-switched-out thread, no path dispatches a
-        // not-linked `current` thread cross-CPU, and the next switch-out
-        // republishes cs = 1. Do NOT "restore" cs = 1 here.
-        // SAFETY: tcb valid; restoring before any schedule().
-        unsafe {
-            let saved = (*tcb).sched_lock.lock_raw();
-            if (*tcb).state == crate::sched::thread::ThreadState::Blocked
-            {
-                (*tcb).state = crate::sched::thread::ThreadState::Running;
-            }
-            (*tcb).sleep_deadline = 0;
-            (*tcb).sched_lock.unlock_raw(saved);
+        Ok(()) | Err(crate::sched::SleepAddError::Cancelled) =>
+        {
+            // Cancelled: a stop or teardown cancelled the park between the
+            // commit and the add, stamped it INTERRUPTED, and commits Stopped
+            // or Exited; schedule() below deschedules the thread and the
+            // resume takes that stamp.
         }
-        return Err(SyscallError::OutOfMemory);
+        Err(crate::sched::SleepAddError::Full) =>
+        {
+            // Sleep list at capacity: withdraw the park. sys_thread_sleep has
+            // no IPC source to fall back on, so the honest answer is to
+            // surface the failure (core/kernel/docs/thread-lifecycle-and-sleep.md
+            // § Sleep List Invariants). The withdrawal is the claim a cancel makes,
+            // sleep_list_remove under sched_lock, true while the deadline is
+            // still pending: winning it means no stop or teardown claimed the
+            // park, so restore Running and report OutOfMemory (a later stop
+            // commits over the restored Running). Losing it means one did and
+            // stamped the park INTERRUPTED; fall through to schedule() as the
+            // Ok path does, and the resume consumes the stamp.
+            // A won withdrawal leaves the thread Running with cs = 0 (the
+            // commit_blocked above cleared context_saved), which is
+            // intentional and benign: cs = 0 truthfully means "live registers
+            // authoritative" for a still-`current`, never-switched-out thread,
+            // no path dispatches a not-linked `current` thread cross-CPU, and
+            // the next switch-out republishes cs = 1. Do NOT "restore" cs = 1
+            // here.
+            // SAFETY: tcb valid; SLEEP_LIST_LOCK is a leaf under sched_lock;
+            // restoring before any schedule().
+            let withdrawn = unsafe {
+                let saved = (*tcb).sched_lock.lock_raw();
+                let won = crate::sched::sleep_list_remove(tcb);
+                if won && (*tcb).state == crate::sched::thread::ThreadState::Blocked
+                {
+                    (*tcb).state = crate::sched::thread::ThreadState::Running;
+                }
+                (*tcb).sched_lock.unlock_raw(saved);
+                won
+            };
+            if withdrawn
+            {
+                return Err(SyscallError::OutOfMemory);
+            }
+        }
     }
 
     // SAFETY: called from syscall handler on valid kernel stack.
@@ -408,10 +464,9 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         crate::sched::schedule(false);
     }
 
-    // On resume, either timer_tick's sleep-list claim woke us (success) or
-    // `cancel_ipc_block` stamped the park INTERRUPTED (unconditionally for a
-    // plain sleeper; see core/kernel/docs/thread-lifecycle-and-sleep.md
-    // § `sys_thread_sleep` and the Plain-Sleep Path).
+    // On resume, either timer_tick's sleep-list claim woke us (success) or a
+    // cancellation claim (`cancel_ipc_block`'s `sleep_list_remove` returning
+    // true) stamped the park INTERRUPTED.
     // SAFETY: tcb still valid after resume.
     if unsafe { crate::sched::thread::consume_park_interrupted(tcb) }
     {
@@ -558,10 +613,18 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg2 = caller-chosen `correlator` (opaque routing tag).
 ///
 /// On a terminal fault by any thread in the address space (no handler bound,
-/// or handler replied `KILL`), the kernel posts the terminal-fault reason
-/// (with the observer's correlator in the high 32 bits) to each bound
-/// observer. The kernel only notifies; it never enumerates or terminates
-/// threads, and normal `thread_exit` does NOT fire these observers.
+/// the handler replied `KILL`, or the fault episode was cancelled by
+/// destruction of the handler thread, by destruction of the handler endpoint
+/// while the fault is still queued on it, or by a later receive on the
+/// handler thread that passes its capability and headroom checks while the
+/// fault reply is pending; a stop of the faulting thread defers the terminal
+/// fault, cancelling the episode before any reply claims it or keeping a
+/// claimed `KILL`, and it takes effect, and is posted, only if the thread is
+/// started again; see docs/fault-handling.md § Delivery, Resume, and Kill),
+/// the kernel posts the terminal-fault reason (with the observer's correlator
+/// in the high 32 bits) to each bound observer. The kernel only notifies; it
+/// never enumerates or terminates threads, and normal `thread_exit` does NOT
+/// fire these observers.
 ///
 /// Binding onto an address space that has *already* terminal-faulted posts the
 /// retained fault reason to the `EventQueue` immediately (serialised on the
@@ -687,11 +750,16 @@ pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBl
 /// - Insufficient rights → [`SyscallError::InsufficientRights`].
 ///
 /// # Safety
-/// `cspace` must be null or the calling thread's own live `CSpace`, and the
-/// call must run in syscall context on that thread. The returned slot and the
-/// object it names are not pinned: a concurrent delete or revoke can free or
-/// recycle them while the caller still uses them (#443; see
-/// core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level Radix).
+/// `cspace` must be null or the `CSpace` bound to the calling (running)
+/// thread, and the caller must not park while it uses the returned slot:
+/// only for that `CSpace` does its refcount-0 teardown stop the caller and
+/// wait for it to leave every CPU before the slot pages are freed, which is
+/// what makes the `'static` borrow sound. The slot's contents may be
+/// recycled concurrently (the unlocked tag and generation checks narrow that
+/// race, they do not close it), and nothing pins the object the slot names
+/// past the lookup, so a caller that dereferences the object across a point
+/// where another thread may delete its last capability reads freed memory
+/// (#443 § Unpinned capability lookup).
 #[cfg(not(test))]
 pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     cspace: *mut crate::cap::cspace::CSpace,

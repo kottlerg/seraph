@@ -17,27 +17,22 @@
 //!   2. The parent polls the child's kernel-authoritative lifecycle state via
 //!      `cap_info(CAP_INFO_THREAD_STATE)` until it reports `Exited`.
 //!   3. The recorded exit reason must be `EXIT_FAULT_BASE + <fault vector>`
-//!      (`#PF` = 14 on x86-64; store/AMO page fault = 15 on RISC-V).
+//!      (`crate::arch::PAGE_FAULT_STORE_VECTOR`: `#PF` on x86-64, the
+//!      store/AMO page fault on RISC-V).
 //!
 //! Beyond confirming the kill path, the bounded poll guards against a
 //! mis-classification that would treat an unmapped address as spurious and
 //! retry forever: such a bug never reaches `Exited`, so the test fails on the
 //! poll bound rather than hanging.
 
-use syscall::{cap_delete, cap_info, thread_sleep};
-use syscall_abi::{CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, THREAD_STATE_EXITED};
+use syscall::cap_delete;
+use syscall_abi::EXIT_FAULT_BASE;
 
 use crate::{ChildStack, TestContext, TestResult};
 
 /// A user VA that no test maps — canonical in every paging mode (below the
 /// 2^38 Sv39 user half), well clear of every other test's mappings.
 const WILD_VA: u64 = 0x3E_0000_0000;
-
-/// Fault vector recorded in `exit_reason` for a not-present store.
-#[cfg(target_arch = "x86_64")]
-const FAULT_VECTOR: u64 = 14; // #PF
-#[cfg(target_arch = "riscv64")]
-const FAULT_VECTOR: u64 = 15; // store/AMO page fault
 
 /// Poll bound: at ~1 ms per `thread_sleep(1)`, ~2 s before declaring the child
 /// never faulted. Comfortably above any scheduling latency on a busy SMP run.
@@ -54,33 +49,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, fault_child, stack_top, 0)
         .map_err(|_| "integration::fault_kills_thread: configure_and_start failed")?;
 
-    let expected = EXIT_FAULT_BASE + FAULT_VECTOR;
-    let mut polls = 0;
-    loop
+    let expected = EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR;
+    let reason = crate::spawn::wait_until_exited(child.th, MAX_POLLS)?;
+    if reason != expected
     {
-        let packed = cap_info(child.th, CAP_INFO_THREAD_STATE)
-            .map_err(|_| "integration::fault_kills_thread: cap_info(THREAD_STATE) failed")?;
-        // cast_possible_truncation: `packed >> 32` is the `u32` state code the
-        // kernel places in the high word (`syscall_abi::CAP_INFO_THREAD_STATE`), so
-        // the cast is lossless.
-        #[allow(clippy::cast_possible_truncation)]
-        let state = (packed >> 32) as u32;
-        if state == THREAD_STATE_EXITED
-        {
-            let reason = packed & 0xFFFF_FFFF;
-            if reason != expected
-            {
-                return Err("integration::fault_kills_thread: wrong exit reason for fault");
-            }
-            break;
-        }
-
-        polls += 1;
-        if polls >= MAX_POLLS
-        {
-            return Err("integration::fault_kills_thread: child never faulted/exited");
-        }
-        thread_sleep(1).ok();
+        return Err("integration::fault_kills_thread: wrong exit reason for fault");
     }
 
     cap_delete(child.th).ok();

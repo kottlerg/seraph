@@ -6,8 +6,8 @@
 //! Tier 1 tests for hardware access syscalls.
 //!
 //! Covers: `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER`,
-//! `SYS_IRQ_ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT`,
-//! `SYS_SBI_CALL`.
+//! `SYS_IRQ_ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT`.
+//! The per-architecture `SYS_SBI_CALL` tests live behind `crate::arch`.
 //!
 //! Tests that require specific hardware capability types (`Mmio`, Interrupt,
 //! `IoPort`) scan the initial capability set for a matching cap. If none is
@@ -381,38 +381,6 @@ pub fn irq_split_wrong_tag_err(ctx: &TestContext) -> TestResult
     if err != Err(SyscallError::InvalidCapability as i64)
     {
         return Err("hw::irq_split_wrong_tag_err: did not return InvalidCapability");
-    }
-    Ok(())
-}
-
-// ── SYS_SBI_CALL ──────────────────────────────────────────────────────────────
-
-/// On RISC-V, `sbi_call(sbi_control_cap, EID=0x10, FID=0, …)` reads the SBI
-/// spec version. Verifies the call path: the kernel forwards to SBI and
-/// returns a plausible version (major in `0..=3`).
-#[cfg(target_arch = "riscv64")]
-pub fn sbi_call_get_spec_version(ctx: &TestContext) -> TestResult
-{
-    // EID_BASE = 0x10, FID_GET_SPEC_VERSION = 0 per the SBI base extension.
-    let version = syscall::sbi_call(ctx.sbi_control_cap, 0x10, 0, 0, 0, 0)
-        .map_err(|_| "hw::sbi_call_get_spec_version: sbi_call returned error")?;
-    let major = version >> 24;
-    if major > 3
-    {
-        return Err("hw::sbi_call_get_spec_version: implausible SBI major version");
-    }
-    Ok(())
-}
-
-/// On `x86_64`, `sbi_call` is unconditionally `NotSupported` regardless of
-/// arguments (the syscall is a RISC-V-only forwarder).
-#[cfg(target_arch = "x86_64")]
-pub fn sbi_call_not_supported_x86_64(_ctx: &TestContext) -> TestResult
-{
-    let err = syscall::sbi_call(0, 0, 0, 0, 0, 0);
-    if err != Err(SyscallError::NotSupported as i64)
-    {
-        return Err("hw::sbi_call_not_supported_x86_64: did not return NotSupported");
     }
     Ok(())
 }

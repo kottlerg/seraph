@@ -1334,7 +1334,14 @@ fn log_self_teardown(tcb: *mut crate::sched::thread::ThreadControlBlock, what: &
         return;
     }
     // SAFETY: tcb is valid here — about to be marked Exited, not yet freed.
-    let (tid, tf) = unsafe { ((*tcb).thread_id, (*tcb).trap_frame) };
+    let (tid, tf) = unsafe {
+        (
+            (*tcb).thread_id,
+            (*tcb)
+                .trap_frame
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    };
     if tf.is_null()
     {
         crate::kprintln!(
@@ -1556,6 +1563,11 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
 /// - Must NOT be called with `DERIVATION_LOCK` held: the `CSpaceObj` arm
 ///   takes that (non-recursive) lock for its batched derivation drain, and
 ///   the Memory arm takes the frame-allocator lock.
+/// - Must NOT be called with any IPC source, per-TCB `sched_lock`, per-CPU
+///   scheduler, or sleep-list lock held: the Thread, Notification, and
+///   `EventQueue` arms spin, with interrupts enabled, until work on other
+///   CPUs that takes those locks finishes (the Thread drain gates, and
+///   `sched::sleep_wakeups_quiesce`).
 ///
 /// # Cascade handling
 ///
@@ -2141,11 +2153,20 @@ unsafe fn dealloc_object_one(
                 // until here and is cleared on every enqueue_and_wake exit path.
                 if let Some(bound) = server_reply_wake
                 {
-                    // Null the claimed client's `blocked_on_object` (still naming this dying
-                    // server) under the client's sched_lock, before enqueue_and_wake and while
-                    // wake_in_flight still pins `bound`: the CLOSURE LEMMA of
-                    // core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership.
-                    // Only the client's
+                    // #317 predecessor-of-free null: clear the claimed client's
+                    // `blocked_on_object` (which still points at THIS dying server,
+                    // `tcb`) under the CLIENT's sched_lock, BEFORE enqueue_and_wake.
+                    // This is the strict predecessor of retype_free that the
+                    // cancel_ipc_block / dealloc(client) CLOSURE LEMMA
+                    // (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
+                    // Ownership) relies on: a withdrawer reading
+                    // `blocked_on == server` under the client sched_lock thereby
+                    // proves the server is not yet freed. It runs here, while `bound`
+                    // is still pinned by wake_in_flight = 1 (set at the claim above),
+                    // so the null is ordered before this server's free whichever arm
+                    // enqueue_and_wake takes: the pin release of its Exited arm lets
+                    // a concurrent dealloc(client) retype_free `bound`, and the
+                    // lemma's predecessor must already stand. Only the client's
                     // sched_lock is taken (the server's was released with the all-CPU
                     // locks above), so there is no two-TCB-sched_lock nesting.
                     // SAFETY: bound kept valid by wake_in_flight = 1 above.
@@ -2192,19 +2213,36 @@ unsafe fn dealloc_object_one(
                     unsafe { crate::sched::enqueue_and_wake(bound, bcpu) };
                 }
 
+                // Drop any sleep-list entry before the IPC unlink, so a timer pop
+                // that wins the race still sees the full binding. Outside the
+                // all-locks region (no sched.lock → SLEEP_LIST_LOCK edge). See
+                // docs/thread-lifecycle-and-sleep.md § `dealloc_object(Thread)`
+                // Drain Protocol, step 11.
+                // SAFETY: tcb is valid (not yet freed).
+                unsafe { crate::sched::sleep_list_remove(tcb) };
+
                 // Unlink this thread from any IPC object it's blocked on.
                 // Without this, a notification/endpoint/event_queue retains a
                 // dangling waiter pointer to the freed TCB. A subsequent
                 // notification_send would return that pointer, and the caller
                 // would enqueue_and_wake a freed TCB — use-after-free.
+                // The binding pair is read and cleared under tcb's sched_lock:
+                // the abort arm of a wake that claimed tcb before its Exited
+                // mark writes the same pair under that lock (see
+                // docs/scheduling-internals.md § Cross-CPU TCB Ownership). The
+                // source locks below are taken after it is released, never
+                // inside it.
                 // SAFETY: tcb is valid (not yet freed); blocked_on_object
                 // and ipc_state are always valid on an initialized TCB.
                 unsafe {
                     use crate::sched::thread::IpcThreadState;
+                    let sched_saved = (*tcb).sched_lock.lock_raw();
                     let blocked_obj = (*tcb).blocked_on_object;
+                    let bound_state = (*tcb).ipc_state;
+                    (*tcb).sched_lock.unlock_raw(sched_saved);
                     if !blocked_obj.is_null()
                     {
-                        match (*tcb).ipc_state
+                        match bound_state
                         {
                             IpcThreadState::BlockedOnNotification =>
                             {
@@ -2212,9 +2250,9 @@ unsafe fn dealloc_object_one(
                                     .cast::<crate::ipc::notification::NotificationState>();
                                 // SAFETY: sig is valid; lock serialises with notification_send.
                                 let saved = (*sig).lock.lock_raw();
-                                if (*sig).waiter == tcb
+                                if (*sig).waiters.remove(tcb)
                                 {
-                                    (*sig).waiter = core::ptr::null_mut();
+                                    (*sig).refresh_observer();
                                 }
                                 (*sig).lock.unlock_raw(saved);
                             }
@@ -2254,10 +2292,7 @@ unsafe fn dealloc_object_one(
                                     blocked_obj.cast::<crate::ipc::event_queue::EventQueueState>();
                                 // SAFETY: eq is valid; lock serialises with event_queue ops.
                                 let saved = (*eq).lock.lock_raw();
-                                if (*eq).waiter == tcb
-                                {
-                                    (*eq).waiter = core::ptr::null_mut();
-                                }
+                                (*eq).waiters.remove(tcb);
                                 (*eq).lock.unlock_raw(saved);
                             }
                             IpcThreadState::BlockedOnWaitSet =>
@@ -2265,10 +2300,7 @@ unsafe fn dealloc_object_one(
                                 let ws = blocked_obj.cast::<crate::ipc::wait_set::WaitSetState>();
                                 // SAFETY: ws is valid; lock serialises with waitset ops.
                                 let saved = (*ws).lock.lock_raw();
-                                if (*ws).waiter == tcb
-                                {
-                                    (*ws).waiter = core::ptr::null_mut();
-                                }
+                                (*ws).waiters.remove(tcb);
                                 (*ws).lock.unlock_raw(saved);
                             }
                             IpcThreadState::BlockedOnReply =>
@@ -2344,7 +2376,9 @@ unsafe fn dealloc_object_one(
                             IpcThreadState::None =>
                             {}
                         }
+                        let sched_saved = (*tcb).sched_lock.lock_raw();
                         (*tcb).blocked_on_object = core::ptr::null_mut();
+                        (*tcb).sched_lock.unlock_raw(sched_saved);
                     }
                 }
 
@@ -2373,24 +2407,6 @@ unsafe fn dealloc_object_one(
                     }
                 }
 
-                // Remove this thread from the global sleep list before the
-                // wake-in-flight gate below. A plain sleeper (sys_thread_sleep) or
-                // a timed IPC waiter sits on the list as a raw TCB pointer; freeing
-                // without removing it would let the next timer tick dereference the
-                // freed pointer in sleep_check_wakeups. The remove races that pop
-                // under SLEEP_LIST_LOCK: if we win, the entry is gone and no timer
-                // wake fires. If the timer already popped a plain-sleep (None)
-                // entry, it set wake_in_flight = 1 at pop (under the same lock); a
-                // timed notification/event-queue arm claims and sets the flag only
-                // under the source lock, so it either claimed before the step-11
-                // unlink above or finds the waiter cleared and skips, and the gate
-                // below waits for any claimed wake to commit before the free, except
-                // for the lifetime gaps #443 records. Placed OUTSIDE the all-locks
-                // region — no sched.lock → SLEEP_LIST_LOCK order edge (the timer
-                // takes SLEEP_LIST_LOCK first, then releases it before any
-                // sched_lock).
-                crate::sched::sleep_list_remove(tcb);
-
                 // Wake-in-flight gate (#160): a waker that popped this thread
                 // from a wait object (notification/endpoint/event_queue/wait_set)
                 // under that object's lock sets `wake_in_flight = 1` before
@@ -2399,8 +2415,7 @@ unsafe fn dealloc_object_one(
                 // such waker released it, so this load cannot miss the set.
                 // Spin until the in-flight wake commits, so `retype_free` below
                 // cannot free the TCB out from under the waker's pending
-                // `enqueue_and_wake` (the residual #117/#160 use-after-free),
-                // except for the lifetime gaps #443 records.
+                // `enqueue_and_wake` (the residual #117/#160 use-after-free).
                 // Interrupts enabled + preemption disabled, mirroring the
                 // `context_saved` gate above, so the spin does not block
                 // incoming IPIs (FPU flush / TLB shootdown).
@@ -2425,6 +2440,13 @@ unsafe fn dealloc_object_one(
                 // SAFETY: wake_saved_int from save_and_disable_interrupts above.
                 unsafe { crate::arch::current::cpu::restore_interrupts(wake_saved_int) };
                 crate::percpu::preempt_enable();
+
+                // A timer batch that popped this thread keeps its pointer, with no
+                // reference, until it finishes: wait it out before the free (its
+                // claim finds the waiter by address). See
+                // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants,
+                // invariant 9.
+                crate::sched::sleep_wakeups_quiesce();
 
                 // Release the per-thread IOPB to SEED if one was bound via
                 // `sys_ioport_bind` (x86-64 only). RISC-V threads never set this
@@ -2798,9 +2820,9 @@ unsafe fn dealloc_object_one(
                      refcount invariant broken"
                 );
 
-                // Drain blocked senders and receivers: senders resume INTERRUPTED (a
-                // queued fault sender KILL), receivers INTERRUPTED
-                // (core/kernel/docs/ipc-internals.md § Park Dispositions and Episodes).
+                // Drain blocked senders and receivers, each woken with its park
+                // stamped cancelled (INTERRUPTED; KILL for a queued faulter), so
+                // sys_ipc_call / sys_ipc_recv return Interrupted.
                 // SAFETY: state validated non-null. The drain runs under ep.lock:
                 // a concurrent dealloc(waiter) BlockedOnSend/Recv unlink takes the
                 // same lock, so it cannot mutate these queues or free a waiter
@@ -2972,45 +2994,28 @@ unsafe fn dealloc_object_one(
                      refcount invariant broken"
                 );
 
-                // Wake a blocked waiter with wakeup_value = 0 and no Interrupted stamp:
-                // its SYS_NOTIFICATION_WAIT returns success with no bits (#443).
-                // SAFETY: state validated non-null. Claim the waiter under sig.lock
-                // — the #160 discipline notification_send uses — so a concurrent
-                // dealloc(waiter) BlockedOnNotification unlink (which takes sig.lock
-                // and spins on wake_in_flight) cannot free the TCB before our
-                // enqueue_and_wake commits.
+                // Wake every blocked waiter with its park stamped Interrupted.
+                // Each is claimed under sig.lock, as notification_send claims
+                // (#160), and, as a multi-waiter drain, also woken under it
+                // (docs/scheduling-internals.md § Lock Hierarchy rule 5), so a
+                // concurrent dealloc(waiter) BlockedOnNotification unlink
+                // (which takes sig.lock and spins on wake_in_flight) cannot
+                // free a TCB before its enqueue_and_wake commits.
+                // SAFETY: state validated non-null; sig.lock held across the
+                // claims and wakes, with no scheduler or sleep-list lock held.
                 unsafe {
                     let sig = &mut *state;
                     let saved = sig.lock.lock_raw();
-                    let waiter = sig.waiter;
-                    if !waiter.is_null()
-                    {
-                        sig.waiter = core::ptr::null_mut();
-                        // wakeup_value=0 = drop semantics; state transitions
-                        // committed by enqueue_and_wake. Claim for wake under
-                        // sig.lock (#160); cleared by enqueue_and_wake.
-                        (*waiter).wakeup_value = 0;
-                        (*waiter)
-                            .wake_in_flight
-                            .store(1, core::sync::atomic::Ordering::Release);
-                        // A timed waiter is also on the sleep list; drop the
-                        // entry under sig.lock (the #117 remove-before-clear
-                        // order) so the timer can neither double-wake it nor
-                        // hijack a later unrelated park via the stale entry.
-                        // Mirrors notification_send's claim.
-                        if (*waiter).sleep_deadline != 0
-                        {
-                            crate::sched::sleep_list_remove(waiter);
-                            (*waiter).sleep_deadline = 0;
-                        }
-                    }
+                    crate::ipc::interrupt_all_waiters(&mut sig.waiters);
+                    sig.refresh_observer();
                     sig.lock.unlock_raw(saved);
-                    if !waiter.is_null()
-                    {
-                        let target_cpu = crate::sched::select_target_cpu(waiter);
-                        crate::sched::enqueue_and_wake(waiter, target_cpu);
-                    }
                 }
+
+                // A timer batch that popped a timed waiter of this notification
+                // before the claim above may still hold `state` from its pop
+                // snapshot (no reference); wait it out before the free.
+                // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
+                crate::sched::sleep_wakeups_quiesce();
             }
 
             debug_assert!(
@@ -3089,13 +3094,17 @@ unsafe fn dealloc_object_one(
                      refcount invariant broken"
                 );
 
-                // Wake any blocked waiter with a zero payload and no Interrupted stamp:
-                // its SYS_EVENT_RECV returns success with a payload of 0 that was never
-                // posted (#443). The inline
-                // ring is part of this slot and gets reclaimed below
-                // alongside the wrapper + state via `retype_free`.
+                // Wake every blocked waiter with its park stamped Interrupted.
+                // The inline ring is part of this slot and gets reclaimed
+                // below alongside the wrapper + state via `retype_free`.
                 // SAFETY: state non-null and live.
                 unsafe { crate::ipc::event_queue::event_queue_drop(state) };
+
+                // A timer batch that popped a timed waiter of this queue
+                // before the claim above may still hold `state` from its pop
+                // snapshot (no reference); wait it out before the free.
+                // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
+                crate::sched::sleep_wakeups_quiesce();
             }
 
             debug_assert!(

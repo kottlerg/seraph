@@ -56,7 +56,7 @@ use fat::{next_cluster, read_file_data};
 use file::{MAX_OPEN_FILES, OpenFile, OutstandingPage};
 use ipc::{IpcMessage, fs_labels, ns_labels};
 use namespace_protocol::{GateError, NamespaceRights, NodeId, NodeKind, gate, pack as pack_badge};
-use syscall_abi::{PAGE_SIZE, RIGHTS_MEM_MAP};
+use syscall_abi::{MSG_DATA_WORDS_MAX, PAGE_SIZE, RIGHTS_MEM_MAP};
 
 /// Monotonic counter for open-file slot identity. Starts at 1 (0 = unbadged).
 ///
@@ -476,7 +476,9 @@ fn handle_read_node_cap(
     }
 
     let offset = msg.word(0);
-    let max_len = msg.word(1);
+    // The reply carries the count in word 0, so the data fits in the
+    // remaining MSG_DATA_WORDS_MAX - 1 words.
+    let max_len = msg.word(1).min(((MSG_DATA_WORDS_MAX - 1) * 8) as u64);
 
     let mut out = [0u8; SECTOR_SIZE];
     let bytes_read = read_file_data(
@@ -1532,6 +1534,12 @@ fn handle_remove_node_cap(
         Ok(r) => r,
         Err(e) =>
         {
+            // A failed removal may already have marked the 8.3 slot; drop
+            // its node then too, as below.
+            if slot_deleted_in_cache(removed_loc, cache, block_dev, ipc_buf)
+            {
+                nodes.invalidate_for_loc(removed_loc);
+            }
             reply_err(fat_error_to_wire(e), ipc_buf);
             return;
         }
@@ -1539,6 +1547,7 @@ fn handle_remove_node_cap(
 
     if let Err(e) = free_entry_data(state, &removed, cache, block_dev, ipc_buf)
     {
+        nodes.invalidate_for_loc(removed_loc);
         reply_err(fat_error_to_wire(e), ipc_buf);
         return;
     }
@@ -1555,7 +1564,26 @@ fn handle_remove_node_cap(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+/// Whether the cached copy of the directory slot at `loc` carries the `0xE5`
+/// deleted marker. A cached node for a slot must be dropped once the cache
+/// shows it deleted, because a later `FS_CREATE` picks free slots from the
+/// same cached view and would otherwise dedupe to the stale `NodeId`. A
+/// sector that cannot be read counts as not deleted.
+fn slot_deleted_in_cache(
+    loc: dir::DirEntryLocation,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let mut buf = Box::new([0u8; SECTOR_SIZE]);
+    cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
+        && buf[loc.offset_in_sector] == 0xE5
+}
+
 /// `FS_RENAME`: rename an entry within a single directory.
+// too_many_lines: one request's sequential validation, lookup, and the
+// non-atomic insert-then-remove, whose order crash-safety.md documents.
 #[allow(clippy::too_many_lines)]
 fn handle_rename_node_cap(
     node_id: NodeId,
@@ -1576,14 +1604,20 @@ fn handle_rename_node_cap(
     let src_len = msg.word(0) as usize;
     let dst_len = msg.word(1) as usize;
     let data_bytes = msg.data_bytes();
-    let name_off = 16; // words 0,1 = lengths (16 bytes), names from word 2
-    if src_len == 0 || dst_len == 0 || data_bytes.len() < name_off + src_len + dst_len
+    let name_off: usize = 16; // words 0,1 = lengths (16 bytes), names from word 2
+    // Both lengths are client words: bound their sum without overflow
+    // before slicing.
+    let Some(name_end) = name_off
+        .checked_add(src_len)
+        .and_then(|end| end.checked_add(dst_len))
+        .filter(|&end| src_len != 0 && dst_len != 0 && end <= data_bytes.len())
+    else
     {
         reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
-    }
+    };
     let src_name = &data_bytes[name_off..name_off + src_len];
-    let dst_name = &data_bytes[name_off + src_len..name_off + src_len + dst_len];
+    let dst_name = &data_bytes[name_off + src_len..name_end];
 
     if namespace_protocol::validate_name(src_name).is_err()
         || namespace_protocol::validate_name(dst_name).is_err()
@@ -1634,6 +1668,14 @@ fn handle_rename_node_cap(
     }
     if let Err(e) = remove_entry(state, parent_cluster, src_name, cache, block_dev, ipc_buf)
     {
+        // No rollback: the destination stays inserted, so an error here can
+        // leave both names (fs-driver-protocol.md § Label 16; #447). A
+        // failed removal may already have marked the source's 8.3 slot;
+        // drop its node then, as on success.
+        if slot_deleted_in_cache(src_loc, cache, block_dev, ipc_buf)
+        {
+            nodes.invalidate_for_loc(src_loc);
+        }
         reply_err(fat_error_to_wire(e), ipc_buf);
         return;
     }

@@ -94,10 +94,10 @@ FreeBSD `pkg install edk2-qemu-x64`).
 **RISC-V** always uses TCG with edk2 UEFI firmware and OpenSBI (loaded
 automatically by QEMU's `virt` machine). Requires edk2 RISC-V firmware
 (`dnf install edk2-riscv64` / `apt install qemu-efi-riscv64`) and
-QEMU ≥ 8.0 (V extension); QEMU ≥ 9.1 unlocks the named `-cpu rva23s64`
-model (currently the runner uses the explicit feature string until the
-CI floor catches up; see [docs/build-system.md](../docs/build-system.md)
-§ QEMU and Firmware).
+QEMU ≥ 8.0 (V extension). `xtask` passes the explicit feature string on
+every riscv64 QEMU launch and every supported QEMU; the named `-cpu rva23s64` model
+is a superset that `xtask` does not expose (see
+[docs/build-system.md](../docs/build-system.md) § QEMU and Firmware).
 
 #### Attached devices
 

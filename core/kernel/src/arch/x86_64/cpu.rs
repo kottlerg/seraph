@@ -126,8 +126,8 @@ pub unsafe fn write_msr(msr: u32, val: u64)
 // inside the copy redirects to `__copy_user_fixup` (which executes `clac` and
 // returns a non-zero sentinel) instead of panicking. See `crate::uaccess` for
 // the typed `copy_to_user`/`copy_from_user` wrappers and `idt::page_fault_handler`
-// for the fixup hook. The DF=0 ABI invariant makes `rep movsb` copy forward;
-// syscall entry does not establish it (a known defect, #443; see `syscall.rs`).
+// for the fixup hook. Every kernel entry clears DF (SFMASK on SYSCALL, `cld`
+// in the IDT stubs), so `rep movsb` copies forward.
 #[cfg(not(test))]
 core::arch::global_asm!(
     ".section .text.copy_user, \"ax\"",
@@ -213,19 +213,27 @@ pub fn user_copy_fixup(pc: u64) -> Option<u64>
 
 // ── SMEP / SMAP ───────────────────────────────────────────────────────────────
 
+/// `CR4.FSGSBASE` (bit 16): enables the ring-3 `wrgsbase`/`wrfsbase`
+/// instructions.
+const CR4_FSGSBASE: u64 = 1 << 16;
+
 /// Enable Supervisor Mode Execution Prevention (SMEP) and Supervisor Mode
-/// Access Prevention (SMAP) by setting CR4 bits 20 and 21.
+/// Access Prevention (SMAP) by setting CR4 bits 20 and 21, and clear
+/// `CR4.FSGSBASE`, which firmware may have left set.
+///
+/// With FSGSBASE off, ring 3 can change its GS base only by loading a GDT
+/// selector, whose base is 0, so a user GS base is never a kernel-half address;
+/// the paranoid NMI/`#MC`/`#DF`/`#DB` entry (`idt.rs` `paranoid_entry_asm`)
+/// relies on that to tell the user GS base from the kernel's.
 ///
 /// Checks CPUID.07H:EBX bit 7 (SMEP) and bit 20 (SMAP). Halts with a fatal
 /// message if either feature is absent, because the security model requires
 /// both.
 ///
 /// # Safety
-/// Must execute at ring 0. On the BSP it runs from `interrupts::init` before the
-/// IDT is loaded, so a CR4 write fault there is not catchable; on each AP
-/// (`interrupts::init_ap`) the IDT is already loaded. Both features are required by
-/// [platform-requirements.md](../../../../../docs/platform-requirements.md) § x86-64
-/// Classification and are checked by `verify_baseline` before this runs on the BSP.
+/// Must execute at ring 0. The IDT need not be loaded: CPUID gates both bits
+/// this sets and `CR4.FSGSBASE` is only cleared, so the CR4 write cannot fault,
+/// and the BSP calls this before `idt::init`.
 // similar_names: smep_present and smap_present are distinct CPU security features.
 #[cfg(not(test))]
 #[allow(clippy::similar_names)]
@@ -247,7 +255,7 @@ pub unsafe fn enable_smep_smap()
     let cr4 = read_cr4();
     // SAFETY: CPUID confirmed both features are present; new CR4 value is valid.
     unsafe {
-        write_cr4(cr4 | (1 << 20) | (1 << 21));
+        write_cr4((cr4 & !CR4_FSGSBASE) | (1 << 20) | (1 << 21));
     }
 }
 
@@ -487,11 +495,17 @@ pub fn current_id() -> u32
 /// MSR address for `IA32_GS_BASE` — the canonical GS segment base.
 const IA32_GS_BASE: u32 = 0xC000_0101;
 
+/// MSR address for `IA32_KERNEL_GS_BASE` — the base `swapgs` exchanges with
+/// `IA32_GS_BASE`.
+const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
+
 /// Install `addr` as the per-CPU data pointer for the current CPU.
 ///
 /// Writes `addr` to `IA32_GS_BASE` (MSR `0xC000_0101`) so that
 /// GS-relative loads (`gs:[offset]`) reach the `PerCpuData` entry for
-/// this CPU. Must be called from Phase 5 (BSP) and `kernel_entry_ap`
+/// this CPU, and 0 to `IA32_KERNEL_GS_BASE`: the user GS base every ring-3
+/// entry and exit exchanges with the kernel's (`swapgs`; see `syscall.rs`
+/// § Entry contract). Must be called from Phase 5 (BSP) and `kernel_entry_ap`
 /// (each AP) before any GS-relative access occurs.
 ///
 /// # Safety
@@ -503,6 +517,7 @@ pub unsafe fn install_percpu(addr: u64)
     // SAFETY: IA32_GS_BASE is a valid MSR on all x86-64 CPUs; ring 0.
     unsafe {
         write_msr(IA32_GS_BASE, addr);
+        write_msr(IA32_KERNEL_GS_BASE, 0);
     }
 }
 

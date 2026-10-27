@@ -34,8 +34,7 @@
 //! ([`unmap_region_pooled`](AddressSpace::unmap_region_pooled)) is the exception:
 //! it holds `pt_lock` across its one coarse shootdown, so that no CPU can reuse a
 //! just-freed page-table frame before every TLB and paging-structure cache is
-//! clean (known defect, #443: a riscv64 ranged teardown leaves cached non-leaf
-//! entries in place). The protocol and the classification are defined in
+//! clean. The protocol and the classification are defined in
 //! `core/kernel/docs/memory-internals.md` § SMP TLB Shootdown. The only lock that
 //! nests under `pt_lock` is the PT-frame source: the wrapper's pool lock on the
 //! pooled path, the kernel page-table pool lock on the kernel-direct path. The
@@ -776,10 +775,8 @@ impl AddressSpace
     ///
     /// Drives `SYS_MEM_UNMAP` with `MEM_UNMAP_RECLAIM_PTS` (memmgr region
     /// teardown). Unlike the per-page [`unmap_page`](Self::unmap_page), it tears
-    /// the whole span down under a single `pt_lock` hold and a single coarse
-    /// shootdown. Known defect (#443): on riscv64 a span at or under
-    /// `RANGE_FLUSH_CEILING_PAGES` is invalidated per VA only, which leaves
-    /// cached non-leaf entries for the freed intermediate tables in place.
+    /// the whole span down under a single `pt_lock` hold and a single coarse TLB
+    /// + paging-structure-cache shootdown.
     ///
     /// `aso` MUST wrap *this* `AddressSpace`; `sys_mem_unmap` enforces this by
     /// resolving both from the same capability.
@@ -816,30 +813,34 @@ impl AddressSpace
         // (the per-VA `unmap_page` drops the lock first for throughput; here it
         // must stay held). A freed PT frame is poppable only via `alloc_pt_page`,
         // which runs under THIS `pt_lock`, so no other CPU reuses a just-freed
-        // frame until we release. A full flush, and on x86-64 a per-VA invlpg,
-        // also clears paging-structure-cache entries; the riscv64 per-VA range
-        // below does not (see the defect note that follows). The contended
-        // `pt_lock` path enables interrupts while spinning, so a remote CPU
-        // waiting on this lock still services and acks our IPI: no deadlock.
+        // frame until we release — by then every CPU's TLB + paging-structure
+        // cache is clean. The contended `pt_lock` path enables interrupts while
+        // spinning, so a remote CPU waiting on this lock still services and acks
+        // our IPI: no deadlock.
         // Initiator side of the tlb_gen / active_cpus Dekker exclusion (see
         // core/kernel/docs/memory-internals.md § SMP TLB Shootdown): bump tlb_gen
-        // and fence BEFORE snapshotting active_cpus, the same order as
-        // `shootdown_remote`; snapshotting first would leave a CPU that
-        // activates concurrently in neither cover. Spans at or under
-        // `RANGE_FLUSH_CEILING_PAGES` issue an untagged per-page range flush
-        // (batched: riscv64 Svinval bracket), larger spans a full flush.
-        // Known defect (#443): on riscv64 the per-VA form
-        // (`sinval.vma va, zero`) invalidates only cached leaf entries, so a
-        // hart can keep a cached non-leaf entry naming an intermediate table
-        // frame freed above after `pt_lock` is released and the frame is
-        // reused; x86-64 invlpg does clear the paging-structure caches.
+        // and fence BEFORE snapshotting active_cpus (the same order as
+        // `shootdown_remote`). This guarantees that for any CPU caching this
+        // space, either it is in the snapshot below (gets the IPI) or it observes
+        // the bumped tlb_gen on its next reactivation (flushes the tag then).
+        // Snapshotting first would leave a CPU that activates concurrently in
+        // neither cover. The same argument covers both invalidation shapes below:
+        // spans at or under `RANGE_FLUSH_CEILING_PAGES` issue an untagged
+        // per-page range flush (batched: riscv64 Svinval bracket), larger spans a
+        // full flush. The range form is used only when it also clears the
+        // paging-structure caches for any table frame the teardown freed: always
+        // where a per-VA invalidation drops them (`VA_INVAL_DROPS_TABLE_CACHES`,
+        // x86-64 `invlpg`), otherwise only when no table was freed. A RISC-V
+        // VA-form fence need only drop leaf entries, so a freed table frame there
+        // takes the full flush.
         if crate::mm::tag_allocator::tagging_enabled()
         {
             self.tlb_gen.fetch_add(1, Ordering::Release);
             core::sync::atomic::fence(Ordering::SeqCst);
         }
         let current = crate::arch::current::cpu::current_cpu() as usize;
-        let ranged = page_count <= crate::mm::tlb_shootdown::RANGE_FLUSH_CEILING_PAGES;
+        let ranged = page_count <= crate::mm::tlb_shootdown::RANGE_FLUSH_CEILING_PAGES
+            && (freed == 0 || crate::arch::current::paging::VA_INVAL_DROPS_TABLE_CACHES);
         // Only CPUs that run this AS cache its translations — the kernel edits
         // these page tables through the direct map, never by loading this root.
         // The caller is normally memmgr, which does not run the target AS, so
@@ -852,8 +853,8 @@ impl AddressSpace
                     inval_batch_begin, inval_batch_end, inval_page,
                 };
                 // SAFETY: ring 0 / S-mode; per-VA invalidations bracketed by
-                // the batch window; clears the TLB entries for every VA in the
-                // span (riscv64: leaf entries only; see the #443 note above).
+                // the batch window; clears TLB + PS-cache entries for every
+                // VA in the span.
                 unsafe {
                     inval_batch_begin();
                     for i in 0..page_count
@@ -877,8 +878,8 @@ impl AddressSpace
             {
                 // SAFETY: root_phys is a valid root; remote excludes current;
                 // preempt is held and pt_lock no-pop invariant holds; tag 0 is
-                // the untagged path (riscv64 targets clear leaf entries only;
-                // see the #443 note above).
+                // the untagged path (see the Dekker exclusion comment above for
+                // why that is sufficient here).
                 unsafe {
                     crate::mm::tlb_shootdown::shootdown_range(
                         self.root_phys,

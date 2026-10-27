@@ -14,8 +14,9 @@
 //! spec.
 
 use namespace_protocol::rights as ns_rights;
+use syscall_abi::MSG_DATA_WORDS_MAX;
 
-use super::{Definition, NamespaceShape, ProvidedName, RestartPolicy};
+use super::{Definition, NamespaceShape, ProvidedName, RestartPolicy, build_blob};
 
 /// Badge stamped on an `:auth` provider SEND — the universal
 /// verb-authority bit (`1 << 63`), shared by every `*_AUTHORITY`
@@ -53,6 +54,53 @@ pub enum ParseError
     /// A right name in `subtree:…:<rights>` was not one of the
     /// known tokens.
     BadRights(usize, String),
+    /// `argv` / `env` would not fit procmgr's `CREATE_FROM_FILE` message:
+    /// more than `u8::MAX` tokens or a packed blob over `ipc::ARGS_BLOB_MAX`
+    /// bytes on the key's line, or (line `0`) both blobs together over
+    /// `MSG_DATA_WORDS_MAX` words.
+    TooLarge(usize, &'static str),
+}
+
+/// Bound one `argv` / `env` token list against the `CREATE_FROM_FILE` wire
+/// format: the token count fits the label's 8-bit count field (else
+/// `too_many`) and the NUL-packed blob fits `ipc::ARGS_BLOB_MAX` (else
+/// `too_long`). Returns the blob's length in data words for the combined
+/// check in [`parse`]. These are the limits `std::process::Command` applies
+/// to its own spawns; svcmgr's launch path hands the packed words to an
+/// asserting message builder, so an oversize recipe must fail here, at parse
+/// time.
+fn check_blob(
+    lineno: usize,
+    tokens: &[String],
+    too_many: &'static str,
+    too_long: &'static str,
+) -> Result<usize, ParseError>
+{
+    if tokens.len() > usize::from(u8::MAX)
+    {
+        return Err(ParseError::TooLarge(lineno, too_many));
+    }
+    let (blob, _) = build_blob(tokens);
+    if blob.len() > ipc::ARGS_BLOB_MAX
+    {
+        return Err(ParseError::TooLarge(lineno, too_long));
+    }
+    Ok(blob.len().div_ceil(8))
+}
+
+/// Bound a `binary` or `subtree:<path>` value against `ipc::MAX_PATH_LEN`.
+/// svcmgr keeps both paths in fixed `MAX_PATH_LEN` buffers on the
+/// `ServiceEntry` it restarts from (see
+/// `services/svcmgr/docs/restart-protocol.md` § Recipe storage); a longer path
+/// would launch once from the recipe string and then restart along a
+/// truncated path, so the recipe is refused here instead.
+fn check_path_len(lineno: usize, path: &str, too_long: &'static str) -> Result<(), ParseError>
+{
+    if path.len() > ipc::MAX_PATH_LEN
+    {
+        return Err(ParseError::InvalidValue(lineno, too_long));
+    }
+    Ok(())
 }
 
 /// Parse a `priority = ` / `sched_max = ` value: a decimal priority level
@@ -78,9 +126,16 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 ///
 /// Returns a [`ParseError`] naming the offending line when the contents
 /// violate the grammar or a semantic rule: a missing `=`, an unknown or
-/// duplicated key, a missing mandatory key, a malformed value, or an
+/// duplicated key, a missing mandatory key, a malformed value, an
 /// inconsistent combination (`cwd` with `namespace = none`, `log_sink`
-/// with `seed`/`provides`, `sched_max` below `priority`).
+/// with `seed`/`provides`, `sched_max` below `priority`), a `binary` or
+/// subtree path over `ipc::MAX_PATH_LEN` ([`ParseError::InvalidValue`]), or
+/// `argv` / `env` that would not fit procmgr's `CREATE_FROM_FILE` message
+/// ([`ParseError::TooLarge`]).
+// too_many_lines: one pass over the `key = value` grammar whose per-key
+// `match` is a flat table of short arms sharing the duplicate-key and
+// mandatory-key bookkeeping locals; moving arms into helpers would thread
+// those locals through every helper without buying structural clarity.
 #[allow(clippy::too_many_lines)]
 pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
 {
@@ -96,6 +151,8 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut log_sink: Option<bool> = None;
     let mut priority: Option<u8> = None;
     let mut sched_max: Option<u8> = None;
+    let mut argv_words: usize = 0;
+    let mut env_words: usize = 0;
 
     let mut seen_argv = false;
     let mut seen_env = false;
@@ -130,6 +187,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 {
                     return Err(ParseError::InvalidValue(lineno, "binary must be absolute"));
                 }
+                check_path_len(lineno, value, "binary path exceeds MAX_PATH_LEN bytes")?;
                 binary = Some(value.to_owned());
             }
             "argv" =>
@@ -140,6 +198,22 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 }
                 seen_argv = true;
                 argv = value.split_whitespace().map(str::to_owned).collect();
+                // The blob is NUL-delimited, so an embedded NUL would split
+                // one token into two on the child's side while the label
+                // still carries the parser's count.
+                if argv.iter().any(|tok| tok.contains('\0'))
+                {
+                    return Err(ParseError::InvalidValue(
+                        lineno,
+                        "argv tokens must not contain NUL",
+                    ));
+                }
+                argv_words = check_blob(
+                    lineno,
+                    &argv,
+                    "argv has more than 255 tokens",
+                    "argv exceeds ARGS_BLOB_MAX bytes once NUL-packed",
+                )?;
             }
             "env" =>
             {
@@ -157,8 +231,21 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                             "env tokens must be KEY=VAL",
                         ));
                     }
+                    if tok.contains('\0')
+                    {
+                        return Err(ParseError::InvalidValue(
+                            lineno,
+                            "env tokens must not contain NUL",
+                        ));
+                    }
                     env.push(tok.to_owned());
                 }
+                env_words = check_blob(
+                    lineno,
+                    &env,
+                    "env has more than 255 tokens",
+                    "env exceeds ARGS_BLOB_MAX bytes once NUL-packed",
+                )?;
             }
             "restart" =>
             {
@@ -341,6 +428,17 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         return Err(ParseError::InvalidValue(0, "sched_max must be >= priority"));
     }
 
+    // The CREATE_FROM_FILE body is one file-size word, the argv words, one
+    // env-length word, and the env words; each blob fits ARGS_BLOB_MAX on
+    // its own, but two full blobs do not fit the message together.
+    if 1 + argv_words + 1 + env_words > MSG_DATA_WORDS_MAX
+    {
+        return Err(ParseError::TooLarge(
+            0,
+            "argv and env together exceed the CREATE_FROM_FILE message",
+        ));
+    }
+
     Ok(Definition {
         name: name.to_owned(),
         binary,
@@ -379,6 +477,11 @@ fn parse_namespace(lineno: usize, value: &str) -> Result<NamespaceShape, ParseEr
         {
             return Err(ParseError::BadNamespace(lineno, value.to_owned()));
         }
+        check_path_len(
+            lineno,
+            path,
+            "namespace subtree path exceeds MAX_PATH_LEN bytes",
+        )?;
         let rights = parse_rights(lineno, rights_str)?;
         return Ok(NamespaceShape::Subtree {
             path: path.to_owned(),
@@ -447,6 +550,7 @@ impl core::fmt::Display for ParseError
                 )
             }
             Self::BadRights(l, v) => write!(f, "line {l}: bad rights `{v}`"),
+            Self::TooLarge(l, why) => write!(f, "line {l}: {why} (CREATE_FROM_FILE wire limit)"),
         }
     }
 }
@@ -577,6 +681,138 @@ sched_max = 12\n";
         assert!(matches!(
             parse_with("priorty = 5\n"),
             Err(ParseError::UnknownKey(_, _))
+        ));
+    }
+
+    #[test]
+    fn startup_tokens_containing_nul_are_rejected()
+    {
+        // A NUL inside a token would add a string boundary to the packed
+        // blob without adding to the label's count; both keys refuse it.
+        assert!(matches!(
+            parse_with("argv = a\0b\n"),
+            Err(ParseError::InvalidValue(5, why)) if why.starts_with("argv tokens")
+        ));
+        assert!(matches!(
+            parse_with("env = K=v\0w\n"),
+            Err(ParseError::InvalidValue(5, why)) if why.starts_with("env tokens must not")
+        ));
+    }
+
+    /// An `argv` line with one token whose NUL-packed blob is `bytes` long.
+    fn argv_line(bytes: usize) -> String
+    {
+        format!("argv = {}\n", "a".repeat(bytes - 1))
+    }
+
+    /// An `env` line with one `K=...` token whose NUL-packed blob is `bytes`
+    /// long.
+    fn env_line(bytes: usize) -> String
+    {
+        format!("env = K={}\n", "v".repeat(bytes - 3))
+    }
+
+    /// Blob length that packs to half the data words left after the
+    /// file-size and env-length words: two of these fill the message exactly.
+    const HALF_BODY_BYTES: usize = (MSG_DATA_WORDS_MAX / 2 - 1) * 8;
+
+    #[test]
+    fn startup_blobs_at_the_wire_bounds_are_accepted()
+    {
+        let argv_full = parse_with(&argv_line(ipc::ARGS_BLOB_MAX)).expect("argv at ARGS_BLOB_MAX");
+        assert_eq!(build_blob(&argv_full.argv).0.len(), ipc::ARGS_BLOB_MAX);
+        let env_full = parse_with(&env_line(ipc::ARGS_BLOB_MAX)).expect("env at ARGS_BLOB_MAX");
+        assert_eq!(build_blob(&env_full.env).0.len(), ipc::ARGS_BLOB_MAX);
+        let both = format!(
+            "{}{}",
+            argv_line(HALF_BODY_BYTES),
+            env_line(HALF_BODY_BYTES)
+        );
+        parse_with(&both).expect("argv + env filling the message exactly");
+    }
+
+    #[test]
+    fn startup_blobs_over_the_wire_bounds_are_rejected()
+    {
+        assert!(matches!(
+            parse_with(&argv_line(ipc::ARGS_BLOB_MAX + 1)),
+            Err(ParseError::TooLarge(5, why)) if why.starts_with("argv exceeds")
+        ));
+        assert!(matches!(
+            parse_with(&env_line(ipc::ARGS_BLOB_MAX + 1)),
+            Err(ParseError::TooLarge(5, why)) if why.starts_with("env exceeds")
+        ));
+        // Each blob within ARGS_BLOB_MAX, together one word over the message.
+        let both = format!(
+            "{}{}",
+            argv_line(HALF_BODY_BYTES + 8),
+            env_line(HALF_BODY_BYTES)
+        );
+        assert!(matches!(
+            parse_with(&both),
+            Err(ParseError::TooLarge(0, why)) if why.starts_with("argv and env together")
+        ));
+    }
+
+    /// Recipe whose `binary` is an absolute path of exactly `len` bytes.
+    fn recipe_with_binary_len(len: usize) -> String
+    {
+        format!(
+            "binary = /{}\nrestart = never\ncritical = no\nnamespace = none\n",
+            "b".repeat(len - 1)
+        )
+    }
+
+    /// Recipe whose `namespace` is a subtree of an absolute path of exactly
+    /// `len` bytes.
+    fn recipe_with_subtree_len(len: usize) -> String
+    {
+        format!(
+            "binary = /services/x\nrestart = never\ncritical = no\n\
+             namespace = subtree:/{}:LOOKUP\n",
+            "s".repeat(len - 1)
+        )
+    }
+
+    #[test]
+    fn binary_path_is_bounded_by_max_path_len()
+    {
+        let at = parse("x", &recipe_with_binary_len(ipc::MAX_PATH_LEN)).expect("at MAX_PATH_LEN");
+        assert_eq!(at.binary.len(), ipc::MAX_PATH_LEN);
+        assert!(matches!(
+            parse("x", &recipe_with_binary_len(ipc::MAX_PATH_LEN + 1)),
+            Err(ParseError::InvalidValue(1, why)) if why.starts_with("binary path")
+        ));
+    }
+
+    #[test]
+    fn namespace_subtree_path_is_bounded_by_max_path_len()
+    {
+        let at = parse("x", &recipe_with_subtree_len(ipc::MAX_PATH_LEN)).expect("at MAX_PATH_LEN");
+        assert!(matches!(
+            at.namespace,
+            NamespaceShape::Subtree { ref path, .. } if path.len() == ipc::MAX_PATH_LEN
+        ));
+        assert!(matches!(
+            parse("x", &recipe_with_subtree_len(ipc::MAX_PATH_LEN + 1)),
+            Err(ParseError::InvalidValue(4, why)) if why.starts_with("namespace subtree path")
+        ));
+    }
+
+    #[test]
+    fn more_than_255_startup_tokens_are_rejected()
+    {
+        // 256 one-byte tokens: the count field overflows before the blob
+        // (512 bytes) is even considered.
+        let argv = format!("argv = {}\n", "a ".repeat(256));
+        assert!(matches!(
+            parse_with(&argv),
+            Err(ParseError::TooLarge(5, why)) if why.ends_with("255 tokens")
+        ));
+        let env = format!("env = {}\n", "k=v ".repeat(256));
+        assert!(matches!(
+            parse_with(&env),
+            Err(ParseError::TooLarge(5, why)) if why.ends_with("255 tokens")
         ));
     }
 }

@@ -17,7 +17,9 @@ permissions:
 
 jobs:
   burnin:
-    runs-on: ubuntu-latest
+    # Pinned with the install list below; see docs/build-system.md
+    # § Continuous Integration.
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -38,14 +40,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             qemu-system-x86 \
-            qemu-system-misc \
+            qemu-system-riscv \
             ovmf \
             qemu-efi-riscv64
 
       - name: Log QEMU versions
+        # A missing binary fails here rather than at the first boot. The
+        # version floor and the pinned image's QEMU are in
+        # docs/build-system.md § QEMU and Firmware and § Continuous Integration.
         run: |
-          qemu-system-x86_64 --version | head -n1
-          qemu-system-riscv64 --version | head -n1
+          qemu-system-x86_64 --version
+          qemu-system-riscv64 --version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master

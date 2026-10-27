@@ -19,6 +19,8 @@
 //!
 //! Files:
 //! - `thread_lifecycle.rs`       — full thread lifecycle end-to-end
+//! - `stop_read_regs_remote.rs` — a thread stopped while running on another CPU has its registers
+//!   read and rewritten as soon as the stop returns
 //! - `cap_transfer.rs`           — capability rights through an IPC endpoint round-trip
 //! - `cap_transfer_large.rs`     — IPC transfer of a cap with a multi-batch child list
 //! - `wait_concurrency.rs`       — wait set with simultaneous notification and queue sources
@@ -47,8 +49,18 @@
 //! - `aspace_fault_notification_late_bind.rs` — an aspace terminal-fault observer bound after the space already faulted still receives the retained reason
 //! - `ipc_call_interrupted_stop_start.rs` — a client stopped while parked in `ipc_call` (send-queued and awaiting-reply) restarts to `Interrupted`, never a stale reply (#361)
 //! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
-//! - `sbi_gating.rs`             — `SYS_SBI_CALL` extension gating: kernel-managed extensions and
-//!   SRST without `SBI_RESET` are rejected before forwarding (RISC-V; no-op on `x86_64`)
+//! - `destroyed_source_interrupts.rs` — every waiter on a notification, event queue, or wait set
+//!   destroyed under it returns `Interrupted`, never a fabricated success
+//! - `reply_binding_displaced.rs` — a server that receives again without replying releases the
+//!   caller its earlier receive bound: a released `ipc_call` returns `Interrupted` and the
+//!   released caller stops and restarts; a released fault-blocked thread is killed with the
+//!   fault exit reason; the later receive's caller gets its reply
+//! - `queued_waiters_fifo.rs` — threads waiting on one notification or event queue are woken in
+//!   arrival order, one per delivery, including after a timed waiter expires at the head or the
+//!   tail
+//! - Architecture-only scenarios live behind `crate::arch` (`run_integration`);
+//!   per-arch helpers and branches inside the scenarios above are still gated in
+//!   place (#460).
 
 pub mod aspace_fault_notification_late_bind;
 pub mod cap_delegation_chain;
@@ -58,6 +70,7 @@ pub mod cap_transfer;
 pub mod cap_transfer_large;
 pub mod cross_cspace_revoke_no_alias;
 pub mod death_notification_late_bind;
+pub mod destroyed_source_interrupts;
 pub mod fault_exception_no_handler_kills;
 pub mod fault_exception_redirect;
 pub mod fault_handler_declines_kills;
@@ -71,10 +84,12 @@ pub mod memory_lifecycle;
 pub mod multi_caller_ipc_fifo;
 pub mod park_interrupted_stop_start;
 pub mod priority_preemption;
+pub mod queued_waiters_fifo;
+pub mod reply_binding_displaced;
 pub mod retype_reclaim;
 pub mod retype_subpage_clobber;
-pub mod sbi_gating;
 pub mod shared_memory_two_aspaces;
+pub mod stop_read_regs_remote;
 pub mod thread_lifecycle;
 pub mod tlb_coherency;
 pub mod tlb_widen_retry;
@@ -87,9 +102,15 @@ use crate::run_integration_test;
 ///
 /// To add a new scenario: implement it in a new file in this directory, declare
 /// it with `pub mod` above, then add a `run_integration_test!` call here.
+// too_many_lines: run_all is a flat dispatch table; splitting it adds no clarity.
+#[allow(clippy::too_many_lines)]
 pub fn run_all(ctx: &TestContext)
 {
     run_integration_test!("integration::thread_lifecycle", thread_lifecycle::run(ctx));
+    run_integration_test!(
+        "integration::stop_read_regs_remote",
+        stop_read_regs_remote::run(ctx)
+    );
     run_integration_test!(
         "integration::death_notification_late_bind",
         death_notification_late_bind::run(ctx)
@@ -118,10 +139,22 @@ pub fn run_all(ctx: &TestContext)
         park_interrupted_stop_start::run(ctx)
     );
     run_integration_test!(
+        "integration::reply_binding_displaced",
+        reply_binding_displaced::run(ctx)
+    );
+    run_integration_test!(
+        "integration::destroyed_source_interrupts",
+        destroyed_source_interrupts::run(ctx)
+    );
+    run_integration_test!(
+        "integration::queued_waiters_fifo",
+        queued_waiters_fifo::run(ctx)
+    );
+    run_integration_test!(
         "integration::cap_delegation_chain",
         cap_delegation_chain::run(ctx)
     );
-    run_integration_test!("integration::sbi_gating", sbi_gating::run(ctx));
+    crate::arch::run_integration(ctx);
     run_integration_test!("integration::tlb_coherency", tlb_coherency::run(ctx));
     run_integration_test!("integration::retype_reclaim", retype_reclaim::run(ctx));
     run_integration_test!(

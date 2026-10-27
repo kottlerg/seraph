@@ -27,14 +27,14 @@
 //!
 //! STOPPER and STARTER are released at the same instant by a shared-memory
 //! barrier (the [`RELEASE`] `AtomicU32`), so the resume overlaps the drain.
-//! The resume also drives `sys_thread_start`'s `await_descheduled`
-//! resume-from-stop path (the #314/#293 drain) on every cycle where the stop
-//! commits first, a smoke check of that code.
+//! The resume also drives the drain in `sys_thread_start`'s settle loop
+//! (`start_under_all_locks`, the #314/#293 drain) on every cycle where the
+//! stop commits first, a smoke check of that code.
 //!
 //! This cell does **not** reproduce the #314/#293 cross-CPU double-dispatch: the
 //! resume force-links onto the victim's *own* CPU (`select_target_cpu` returns
-//! the hard-affinity / save-window-pinned CPU), and `sys_thread_start`'s
-//! `await_descheduled` drain closes the force-link-while-`current` window
+//! the hard-affinity / save-window-pinned CPU), and the all-CPU-locks
+//! discipline closes the force-link-while-`current` window
 //! (core/kernel/docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine).
 //! It targets the sibling liveness invariant of the stop drain instead.
 //!

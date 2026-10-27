@@ -16,8 +16,9 @@ claims.
 1. Read `.claude/CLAUDE.md` first, whether or not it was injected into
    your context. Sections that bind your audit specifically: "PR workflow
    operations", "Validation", "Completeness", and the project conventions
-   referenced from `docs/conventions.md` (PR body shape, `Closes #N`
-   semantics, Acceptance-checklist closure).
+   referenced from `docs/conventions.md` (PR body shape, `Closes #N` and
+   `Refs #N` semantics, the follow-up Issue closing condition,
+   Acceptance-checklist closure, § Milestones).
 
 2. Resolve scope from the parent's invocation: PR number, or current-branch
    PR via `gh pr view --json number,body,title,files`, or local feature
@@ -36,7 +37,29 @@ claims.
    either the diff delivers the criterion, or the issue was edited to
    drop the criterion with a one-line rationale. Report per-criterion as
    one of: `delivered` (cite `path:line` evidence), `dropped` (cite the
-   rationale text), or `not delivered, no rationale` (FAIL).
+   rationale text), or `not delivered, no rationale` (FAIL). Report an
+   Issue the PR closes whose milestone (`gh issue view <N> --json
+   milestone`) is missing or is not the current, lowest-versioned open
+   milestone as FAIL, per `docs/conventions.md` § Milestones. A
+   `Refs #N` is not a closure. For a `Refs #N` or `Fixes #N` naming a
+   follow-up Issue (title `<scope>: defects found by review`, or one
+   beginning with the earlier `<scope>: defects found by PR #<N>'s
+   review`), audit every item the PR body's `## Acceptance` copies from
+   it for `path:line` delivery evidence as for a closure; report as FAIL
+   such an item the diff does not deliver, one not ticked on the Issue
+   with `(fixed by PR #<this PR>)`, and an item ticked on the Issue with
+   that marker that the PR body does not copy. Report as FAIL an
+   unmarked `- [x]` item on the Issue whose file the diff touches and
+   that the diff delivers (a tick this PR made without its marker); on a
+   rolling Issue, whose ticks all carry a marker, report every unmarked
+   `- [x]` item as FAIL; list, without failing, an unmarked tick on an
+   earlier-pattern Issue whose file the diff touches but does not
+   deliver, since it may predate the marker.
+   A `Fixes #N` on a follow-up Issue is valid only under the closing
+   condition of `docs/conventions.md` § Branch and PR Workflow: no item
+   left open once the findings of the PR's last run are recorded; a drain
+   that leaves items open MUST say `Refs #N` instead. Report a `Fixes` on
+   such an Issue with open items as FAIL.
 
 6. Silent-deferral scan. The target notification is *intent to defer
    mechanically-reachable work this PR should have covered*, not in-code
@@ -49,12 +72,15 @@ claims.
    - Diff: surface only multi-word deferral phrases — `out of scope`,
      `follow-up`, `deferred to`, `for a future PR`, `for now`,
      `will come later`. Do **not** flag bare `TODO` tokens in the diff.
-   Per the Completeness rule in `.claude/CLAUDE.md`, mechanically
-   reachable work cannot be deferred; surface every hit matching the
-   criteria above. A hit is reconciled when the same text names the Issue
-   filed for the deferral under the Completeness rule, or when it is not a
-   deferral of this PR's work (a rule's wording, a quotation, a
-   description of past work).
+   Per the Completeness rule in `.claude/CLAUDE.md`, blocking work on the
+   review surface cannot be deferred, and a non-blocking surface finding
+   is recorded on the follow-up Issue of its scope only as
+   `docs/conventions.md` § Branch and PR Workflow allows; surface every
+   hit matching the criteria above. A hit is reconciled when the same text
+   names the Issue filed for the deferral under the Completeness rule (the
+   scope's follow-up Issue for a recorded non-blocking finding), or when
+   it is not a deferral of this PR's work (a rule's wording, a quotation,
+   a description of past work).
 
 7. Test-plan honesty: every `- [x]` under `## Test plan` in the PR body
    should have plausible basis (cited tool output, file presence, commit

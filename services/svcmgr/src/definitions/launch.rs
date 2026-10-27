@@ -14,7 +14,7 @@
 
 use ipc::{devmgr_labels, procmgr_labels};
 
-use super::{Definition, NamespaceShape, ProvidedName};
+use super::{Definition, NamespaceShape, ProvidedName, build_blob};
 use crate::REGISTRY_CAPACITY;
 use crate::registry_lookup_derived;
 use crate::restart::{
@@ -33,25 +33,6 @@ pub struct Launched
     /// stored on the `ServiceEntry` so restarts re-serve a fresh RECV on
     /// the same object. Zero for pure-consumer services.
     pub provided_endpoint: u32,
-}
-
-/// Build the NUL-separated, NUL-terminated wire blob procmgr's
-/// stack-envelope writer expects from a list of tokens. Returns
-/// `(blob, count)`. Empty input yields an empty blob with `count = 0`,
-/// matching the "no argv / no env" wire shape.
-pub(crate) fn build_blob(tokens: &[String]) -> (Vec<u8>, u32)
-{
-    if tokens.is_empty()
-    {
-        return (Vec::new(), 0);
-    }
-    let mut blob: Vec<u8> = Vec::with_capacity(tokens.iter().map(|t| t.len() + 1).sum());
-    for tok in tokens
-    {
-        blob.extend_from_slice(tok.as_bytes());
-        blob.push(0);
-    }
-    (blob, tokens.len() as u32)
 }
 
 /// Delete a set of cap slots, skipping the zero sentinel. Used on the
@@ -94,14 +75,26 @@ pub(crate) fn assemble_boot_caps(provided_recv: u32, seeds: Vec<u32>) -> Vec<u32
     caps
 }
 
+/// Which launch of the log-sink service [`mint_logd_boot_caps`] mints for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LaunchKind
+{
+    /// The reconciliation launch: init-logd is still alive to hand its
+    /// history over, so the round carries the `HANDOVER_PULL` SEND.
+    First,
+    /// A respawn after death: there is no init-logd left to pull from, so
+    /// the `HANDOVER_PULL` slot is `0`.
+    Restart,
+}
+
 /// Mint the four bootstrap caps real-logd expects, from the reserved
 /// log-sink sources svcmgr holds for the system's life:
 ///   * `[0]` master-log endpoint RECV (svcmgr's source stays valid, so a
 ///     fresh RECV reattaches each (re)launched logd to the same object that
 ///     every sender's `log_send_cap` targets);
 ///   * `[1]` a SEND on the same endpoint for the one-shot `HANDOVER_PULL`,
-///     present only on the first launch — a restart has no init-logd to pull
-///     from, so this is `0` and logd skips the history pull;
+///     present only for [`LaunchKind::First`] — a restart has no init-logd to
+///     pull from, so this is `0` and logd skips the history pull;
 ///   * `[2]` a `DEATH_EQ_AUTHORITY` `SEND|GRANT` on procmgr (logd registers sender
 ///     death-notifications for slot reclaim) — `SEND|GRANT` because that
 ///     registration transfers a cap;
@@ -111,7 +104,7 @@ pub(crate) fn assemble_boot_caps(provided_recv: u32, seeds: Vec<u32>) -> Vec<u32
 /// A source absent from the endowment yields `0` in its slot; logd then
 /// degrades on first use of that cap. The four slots are positional, so
 /// zeros are preserved (the round still carries `MSG_CAP_SLOTS_MAX` caps).
-pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, first_launch: bool) -> Vec<u32>
+pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, kind: LaunchKind) -> Vec<u32>
 {
     let recv = if ctx.master_log_source != 0
     {
@@ -121,7 +114,7 @@ pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, first_launch: bool) -> Vec<u
     {
         0
     };
-    let handover_send = if first_launch && ctx.master_log_source != 0
+    let handover_send = if kind == LaunchKind::First && ctx.master_log_source != 0
     {
         syscall::cap_derive(ctx.master_log_source, syscall::RIGHTS_EP_SEND).unwrap_or(0)
     }
@@ -335,7 +328,7 @@ pub fn launch(
     // `provides` nor `seed`, so it never enters the provider/seed path.
     let (provided_endpoint, boot_caps) = if def.log_sink
     {
-        (0, mint_logd_boot_caps(ctx, true))
+        (0, mint_logd_boot_caps(ctx, LaunchKind::First))
     }
     else
     {

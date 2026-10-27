@@ -210,7 +210,10 @@ brackets are no-ops and the per-page calls are `invlpg` / INVPCID. The single-VA
 primitives stay `sfence.vma` — for one address a bracket is three instructions instead of
 one. Region teardown (`unmap_region_pooled`) uses the window for spans up to
 `RANGE_FLUSH_CEILING_PAGES` (32) and the coarse full flush above that, where one working-set
-refill is cheaper than per-page walks.
+refill is cheaper than per-page walks. A span that frees an intermediate table takes the full
+flush on RISC-V whatever its size: a VA-form fence need only drop leaf entries, so it would
+leave a cached non-leaf entry naming the freed frame (`invlpg` drops the paging-structure
+caches, so x86-64 keeps the window; `paging::VA_INVAL_DROPS_TABLE_CACHES`).
 
 ### NAPOT Contiguity (RISC-V)
 
@@ -270,10 +273,7 @@ work: holding it across the IPI ack-wait would serialize every concurrent map/un
 on the address space behind cross-CPU latency. Region teardown (`unmap_region_pooled`) is
 the exception: it holds `pt_lock` across its one coarse shootdown so that no CPU can reuse
 a just-freed page-table frame before every TLB and paging-structure cache is clean; the
-contended `pt_lock` path enables interrupts, so a waiting CPU still acks the IPI. Known
-defect (#443): on RISC-V a ranged teardown (at most `RANGE_FLUSH_CEILING_PAGES`) invalidates
-per VA with `sinval.vma va, zero`, which covers only leaf entries, so a hart can keep a cached
-non-leaf entry naming a freed page-table frame.
+contended `pt_lock` path enables interrupts, so a waiting CPU still acks the IPI.
 
 The shootdown itself is lock-free — there is no global shootdown lock and no IPI
 payload. Each CPU owns a request slot. The initiator publishes `(root, virt, pages, tag)`

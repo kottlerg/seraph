@@ -5,7 +5,8 @@
 
 //! Shared QEMU argv construction and per-launch pflash cache for RISC-V.
 //!
-//! Both `run` and `run-parallel` produce QEMU command lines from the same
+//! Every command that launches QEMU (`run`, `run-parallel`, `test-kaslr`,
+//! `test-terminal`, `test-vmgenid`) produces its command line from the same
 //! source of truth (`build_qemu_argv`). Firmware discovery lives in
 //! `firmware::{find_ovmf_code, find_riscv_firmware}`; the padding +
 //! caching of RISC-V pflash images stays here in `prepare_riscv_firmware`.
@@ -285,8 +286,9 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     // that the kernel's boot gate refuses to run without (explicit `=on`
     // pins against QEMU default drift). RVA23 also mandates Zfa, Zfhmin,
     // Zihintntl, Zicond, Zimop, Zcmop, Zcb, Zvfhmin, Zvbb, Zvkt, Zkt — those
-    // land as QEMU coverage broadens. A future bump should switch to
-    // `-cpu rva23s64` once the floor QEMU version on CI hosts is >= 9.1.
+    // land as QEMU coverage broadens. Which QEMU versions this string targets,
+    // and why the named `-cpu rva23s64` model is not used, are specified in
+    // docs/build-system.md § QEMU and Firmware.
     //
     // The trailing satp-mode properties (`RiscvMmu::cpu_satp_props`) pin the
     // paging-mode ceiling the guest advertises via DTB `mmu-type`.

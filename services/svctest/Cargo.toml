@@ -15,6 +15,11 @@ namespace-protocol = { path = "../../shared/namespace-protocol" }
 process-abi = { workspace = true }
 process-layout = { path = "../../shared/process-layout" }
 syscall = { path = "../../shared/syscall" }
+# `MSG_DATA_WORDS_MAX`: the blob-size cells size argv/env against the
+# `CREATE_FROM_FILE` data area, the `fs_std` rename cell sizes its long
+# leaf names so two of them overflow the `FS_RENAME` data area, and the
+# `fs_ipc` request-bounds phase sizes the inline FS_READ reply ceiling.
+syscall-abi = { path = "../../abi/syscall" }
 shmem = { path = "../../shared/shmem" }
 
 [lints]

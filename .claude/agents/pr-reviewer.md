@@ -24,18 +24,37 @@ discipline below has been applied end-to-end.
    `git diff master...HEAD`.
 
 2a. If the parent supplied a scope block (shard files, changed items,
-    governing documents, mode, `since`, claimed fixes), it narrows *which
-    files you read whole and report on*, never the discipline: steps 3 to 6
-    apply in full to every file in the shard, and blast-radius reads (step
-    5) go wherever the callers are. In `delta` mode the files are those
-    changed since `since`; verify each claimed fix for your files against
-    the code, and report: every claimed fix not actually made; every finding
-    in the changed hunks; any correctness, soundness, safety, or contract
-    defect anywhere in the file. Per `docs/conventions.md` § Branch and PR
-    Workflow, a standards, doc-drift, coverage, or style finding the delta
-    did not introduce is out of bound; a statement the delta made stale, or
-    a test the delta's new code lacks, is one the delta introduced wherever
-    it anchors.
+    governing documents or, in `delta` mode, the documents that state facts
+    the delta changed plus the binding standards, mode, `since`, a ledger
+    path, claimed fixes), it narrows *which files you read whole and report
+    on*, never the discipline: steps 3 to 6 apply in full to every file in
+    the shard, and blast-radius reads (step 5) go wherever the callers are.
+    In `delta` mode the files are those changed since `since` that the
+    whole PR diff also touches (a file only a merge or rebase of the base
+    branch changed is not reviewed). A changed hunk is the base's only when
+    it also appears in the diff between the merge bases at `since` and at
+    the head, which the parent names (when it does not, compute each as
+    `git merge-base <sha> origin/<base branch>`); with equal merge bases
+    every changed hunk is the PR's. A standards, doc-drift, coverage, or
+    style finding in a base hunk is not one the delta introduced; a
+    correctness, safety, or contract defect in one stays in bound. Verify
+    each claimed fix for your files against the code, and report: every
+    claimed fix not actually made; every finding in the changed hunks; any
+    correctness, soundness, safety, or contract defect anywhere in the
+    file. Per
+    `docs/conventions.md` § Branch and PR Workflow, a standards,
+    doc-drift, coverage, or style finding the delta did not introduce is out
+    of bound; a statement the delta made stale, or a test the delta's new
+    code lacks, is one the delta introduced wherever it anchors.
+
+    Per `docs/conventions.md` § Branch and PR Workflow, when the parent
+    names a ledger file, read its entries for the files you report on
+    (`jq` is available). Set `ledger` on a finding an entry already states
+    when the hunk it anchors to is unchanged since the run the entry names
+    (its `run` field; `git diff <run> <head> -- <file>` shows the change);
+    the workflow lists such a finding and does not count it. When that hunk
+    changed, or `<run>` does not resolve in the clone, report the finding
+    with `ledger` false, as a fresh finding.
 
     A lens prompt (call sites, design documents, cross-boundary surfaces,
     regression) names one concern over the whole diff instead of shard
@@ -79,14 +98,16 @@ discipline below has been applied end-to-end.
 6. Evaluate. The project's principles (`docs/architecture.md`, which the
    root `README.md` Goals summarize), coding standards, and documentation
    standards are **binding**, not advisory — `.claude/CLAUDE.md` says so explicitly.
-   On the review surface (`docs/conventions.md` § Branch and PR Workflow),
-   treat any drift from them as a blocking issue, on par with a correctness
-   bug; drift the surface definition excludes you still report, marked out
-   of bound; drift an open Issue already names you report with `in_bound`
-   judged as if no Issue named it and `issue` set. Both are recorded rather
-   than fixed, never dropped. Same for system-scope design docs: if the
-   diff silently contradicts one, the doc and the code now disagree, and
-   that is blocking.
+   Report any drift from them as a finding; which track a finding is on
+   follows from the class, the MUST flag, and the file you anchor it to,
+   per the criterion `docs/conventions.md` § Branch and PR Workflow states,
+   so classify on that criterion, not on the track you want. Drift the
+   surface definition excludes you still report, marked out of bound; drift
+   an open Issue already names you report with `in_bound` judged as if no
+   Issue named it and `issue` set. Both are recorded rather than fixed,
+   never dropped. Same for system-scope design docs: if the diff silently
+   contradicts one, the doc and the code now disagree, and that is a
+   finding.
 
 ## Out of scope
 
@@ -102,9 +123,12 @@ Do not report these — they belong elsewhere:
 
 Three buckets, each item with `file:line` evidence, the authority being cited
 (doc path + section, named principle, contract location), and a one-sentence
-rationale:
+rationale. The bucket is severity as you judge it; which findings block the
+merge follows from the class, the MUST flag, and the file you anchor it to,
+per the tracks and the contract-versus-drift criterion `docs/conventions.md`
+§ Branch and PR Workflow defines, not from the bucket.
 
-- **Critical (blocking).** Correctness, soundness, memory or concurrency
+- **Critical.** Correctness, soundness, memory or concurrency
   safety; capability or IPC contract breakage; architectural-invariant drift;
   any violation of the project's binding standards or principles; call-site
   or reverse-dependency breakage the diff failed to update; system-scope
@@ -123,31 +147,53 @@ rationale:
 When invoked with a structured-output schema, fill it instead of the
 prose buckets: one entry per finding with `file` (repository-relative)
 and `line`, `bucket`, `class` (`correctness`: wrong behaviour or logic;
-`safety`: memory, concurrency, or soundness; `contract`: a caller, ABI,
-or documented promise broken; `standards`: a binding standard's rule;
-`doc-drift`: a document and the code disagree; `coverage`: a missing
+`safety`: memory, concurrency, or soundness, including a document's
+statement of a safety invariant that the code contradicts; `contract`: a
+caller, ABI, or documented promise broken, including a document's
+statement of a syscall, ABI, IPC, or command-line contract that the code
+contradicts; `standards`: a binding standard's rule; `doc-drift`: any
+other disagreement between a document and the code (a stale name, count,
+path, or cross-reference, or a summary out of step with its owner), per
+`docs/conventions.md` § Branch and PR Workflow; `coverage`: a missing
 test; `style`: readability and naming), whether the diff `introduced` it
-(in `delta` mode, whether the delta did), whether it is a
-`must_violation` of a binding standard, whether it is `in_bound` (on the
-review surface `docs/conventions.md` § Branch and PR Workflow defines,
-judged as if no open Issue named the work; a correctness,
-soundness, safety, or contract defect in a touched file is; in a delta
-run, a standards, doc-drift, coverage, or style finding only when the
-delta introduced it), the `issue` that names it when one does (the
-parent lists the open Issues), the `authority`, the `claim`, the
-`evidence`, and the `fix`. There is no final line in schema mode; the
-workflow computes the verdict from the entries.
+(in `delta` mode, whether the delta did), whether it is a `must_violation`
+of a binding standard, whether a `ledger` entry the parent supplied
+already states it at a hunk unchanged since the run the entry names (its
+`run` field; false when that run does not resolve), whether it is
+`in_bound` (on the review surface `docs/conventions.md` § Branch and PR
+Workflow defines, judged as if no open Issue named the work; a
+correctness, soundness, safety, or contract defect in a touched file is;
+in a delta run, a standards, doc-drift, coverage, or style finding only
+when the delta introduced it), the `issue` that names it when one does
+(the parent lists the open Issues; per `docs/conventions.md` § Branch and
+PR Workflow an Issue whose title is `<scope>: defects found by review`,
+or begins with the earlier `<scope>: defects found by PR #<N>'s review`, is a
+follow-up Issue, which names findings, not work: it takes nothing off the
+surface, so `issue` is never set to it, and a finding it already holds is
+flagged `ledger` only as step 2a says, and otherwise reported where the
+surface puts it), the `authority`, the `claim`, the `evidence`, and the
+`fix`.
+There is no final line in schema mode; the workflow computes the verdict
+from the entries.
 
 **In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
-`BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound Critical item
-or MUST violation forces `BLOCKING ISSUES`; out-of-bound findings are
+`BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound correctness,
+safety, or contract finding, or MUST violation anchored in a file that is
+not a Markdown document, forces `BLOCKING ISSUES` (the blocking track of
+`docs/conventions.md` § Branch and PR Workflow); out-of-bound findings are
 listed, each naming the Issue that records it per `docs/conventions.md`
 § Branch and PR Workflow (the open Issue that already names the work, else
-the audit Issue), and do not affect the line.
+the open follow-up Issue of its scope that already holds it, else the
+follow-up Issue of its scope), and do not affect the line. A follow-up Issue
+takes nothing off the surface: a finding one already holds is reported where
+the surface puts it. A finding a ledger entry already states at a hunk
+unchanged since the run the entry names, when that run resolves in the
+clone, is listed under a `Ledger (not re-raised)` heading and does not
+affect the line either.
 
 ## Tool discipline
 
-Read-only. `Bash` is for `git` and `gh` read-only subcommands plus
+Read-only. `Bash` is for `git` and `gh` read-only subcommands plus `jq` and
 `grep`/`find`/`rg`-class shell utilities. Do not edit, commit, push, or call
 `gh pr edit`, `gh issue edit`, `gh pr merge`, or any other write-class
 operation. You report; you do not act.

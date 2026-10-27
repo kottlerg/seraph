@@ -58,19 +58,13 @@ first touch faults, memmgr maps a frame and resumes. See
 
 Not yet implemented (this section is narrowed as each part lands):
 
-- **Active unbind/rebind cancellation.** Clearing or rebinding a handler governs *future*
-  faults; it does not yet actively cancel a fault already in flight on the affected thread.
-  An in-flight fault is still resolved by the handler's reply, handler-thread death, the
-  faulting thread being stopped or destroyed, or the handler endpoint being destroyed (all
-  implemented), except through the stale plain-sleep entry
-  ([#443](https://github.com/kottlerg/seraph/issues/443); see
-  [thread-lifecycle-and-sleep.md § `sys_thread_sleep` and the Plain-Sleep Path](../core/kernel/docs/thread-lifecycle-and-sleep.md#sys_thread_sleep-and-the-plain-sleep-path)).
-  The remaining trigger — the binding being cleared mid-fault — is the only
-  [Kill](#delivery-resume-and-kill) path not yet wired.
-- **Displaced fault binding.** A later receive on the handler thread while a fault reply is still
-  pending overwrites the handler's reply binding; the displaced fault-blocked thread is outside the
-  resolutions above ([IPC Design](ipc-design.md#the-callreply-model),
-  [#443](https://github.com/kottlerg/seraph/issues/443)).
+- **Active unbind/rebind cancellation.** Clearing or rebinding a handler governs *future* faults; it
+  does not yet actively cancel a fault already in flight on the affected thread. An in-flight fault
+  is still resolved by the handler's reply, the handler thread's destruction, a later receive on the
+  handler thread while the fault reply is pending (a receive that passes its capability and headroom
+  checks; [Liveness](#liveness) rule 2), the faulting thread being stopped or destroyed, or the
+  handler endpoint being destroyed (all implemented). The remaining trigger — the binding being
+  cleared mid-fault — is the only [Kill](#delivery-resume-and-kill) path not yet wired.
 
 ---
 
@@ -194,12 +188,18 @@ it resumes by re-executing its faulting instruction, not by returning a value.
   state preserved (or as modified by the handler; see below) and re-executes the faulting
   instruction. For a page fault whose handler has installed a satisfying mapping, the
   instruction now succeeds.
-- **Kill (cancellation).** If the binding is severed before a reply — the handler thread dies, the
-  binding is cleared (design intent; not yet implemented, #242), or the thread is stopped — the
-  faulting thread is killed, exactly as an unhandled fault. It is never resumed with a spurious
-  value. A faulting thread displaced by a later receive on its handler is outside this guarantee
-  ([IPC Design](ipc-design.md#the-callreply-model),
-  [#443](https://github.com/kottlerg/seraph/issues/443)).
+- **Kill (cancellation).** If the binding is severed before a reply — the handler thread is
+  destroyed (its last Thread capability deleted), the binding is cleared (design intent; not yet
+  implemented, #242), the handler thread receives again while the fault reply is still pending, with
+  a receive that passes its capability and headroom checks ([Liveness](#liveness) rule 2), or the
+  handler endpoint is destroyed while the fault is still queued on it ([Liveness](#liveness) rule 3)
+  — the faulting thread is killed, exactly as an unhandled fault. A stop of the faulting thread
+  before any reply claims the fault also cancels the episode, but kills nothing at once: it gives
+  the episode a kill outcome and leaves the thread `Stopped`; when next started, the thread is
+  killed as an unhandled fault. A stop after the handler's reply claimed the fault leaves that
+  reply's disposition: when next started, the thread resumes on a `FAULT_REPLY_RESUME` reply and is
+  killed on a `FAULT_REPLY_KILL` reply. Destroying it while stopped ends it as for any stopped
+  thread. A cancelled fault-blocked thread is never resumed.
 
 ### Modifying the faulting thread
 
@@ -231,10 +231,13 @@ The kernel ignores reply data words. The reply **label** conveys disposition:
    thread nor the endpoint is pinned while the binding is written (see
    [Fault-Handler Binding](#fault-handler-binding);
    [#443](https://github.com/kottlerg/seraph/issues/443)).
-2. Handler-thread death releases any fault-blocked thread awaiting that handler, killing it
-   (the [Kill](#delivery-resume-and-kill) path). A fault-blocked thread whose binding a later
-   receive on the handler overwrote is not released; this defect is tracked in
-   [#443](https://github.com/kottlerg/seraph/issues/443).
+2. Destruction of the handler thread (deletion of the last capability to its Thread object)
+   releases any fault-blocked thread awaiting that handler, killing it (the
+   [Kill](#delivery-resume-and-kill) path), as does a later receive on the handler thread while
+   the fault-blocked thread's reply is still pending (a receive that passes its capability and
+   headroom checks; see [IPC Design](ipc-design.md#the-callreply-model)). A handler thread that
+   only exits, or is stopped `Exited` by an object teardown, keeps its pending fault reply until
+   it is destroyed.
 3. A faulting thread blocked on a handler endpoint that has not yet received is released if
    that endpoint is destroyed.
 4. Handler death is a system-level failure. Clients block on their next fault until a
@@ -336,6 +339,7 @@ svcmgr service definitions carry no paging key; see
 [Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
 [SMP Scheduling and Locking Invariants](../core/kernel/docs/scheduling-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
+[core/ktest/README.md](../core/ktest/README.md),
 [Capability Model](capability-model.md), [IPC Design](ipc-design.md),
 [Process Lifecycle](process-lifecycle.md), [Userspace Memory Model](userspace-memory-model.md),
 [programs/demandpaged/README.md](../programs/demandpaged/README.md),

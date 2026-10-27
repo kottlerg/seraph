@@ -15,39 +15,24 @@
 //!     - bits [63:48] = 0x0010: SYSRET64 gives CS=(0x10+16)|3=0x23 (user),
 //!       SS=(0x10+8)|3=0x1B (user DS).
 //! - `IA32_LSTAR` — 64-bit entry point (`syscall_entry`).
-//! - `IA32_SFMASK` — clears RFLAGS.IF on entry, and no other RFLAGS bit (see
-//!   § Entry contract).
+//! - `IA32_SFMASK` — clears RFLAGS IF, TF, DF, AC, NT and IOPL on entry.
 //!
 //! ## Entry contract
-//! On SYSCALL: hardware saves RIP→RCX, RFLAGS→R11, applies SFMASK.
-//! It loads CS and SS from STAR; RSP, DS, ES, FS and GS are NOT changed by the
-//! hardware.
+//! On SYSCALL: hardware saves RIP→RCX, RFLAGS→R11, and clears the RFLAGS bits
+//! in SFMASK, so the kernel runs with IF, TF, DF and AC clear whatever the user
+//! set (AC clear keeps SMAP enforced; DF clear is the string-instruction
+//! direction `copy_user` relies on). It loads CS and SS from STAR; RSP, DS, ES,
+//! FS and GS are NOT changed by the hardware.
 //!
-//! SFMASK masks only IF, so the user's RFLAGS.AC, TF, DF, NT and IOPL reach
-//! ring 0 unchanged, and the stub executes neither `clac` nor `cld`. The
-//! resulting SMAP gap is defined in `docs/memory-model.md` § Kernel Isolation —
-//! SMEP and SMAP. A user-set TF raises `#DB` in ring 0 while the stub still
-//! runs on the user RSP (`#DB` has no IST); a user-set DF reverses
-//! compiler-generated string operations in kernel code and the `rep movsb` in
-//! `copy_user` (`cpu.rs`), so a user copy writes or reads kernel memory below
-//! the kernel-side buffer. This is a known defect (#443).
+//! The stub's first instruction is `swapgs`: while user code runs, the per-CPU
+//! pointer lives in `IA32_KERNEL_GS_BASE` and the active GS base is the user's,
+//! which a ring-3 segment load can change. After the swap the kernel's per-CPU
+//! base is active, and the exit path swaps back (with interrupts disabled)
+//! immediately before `sysretq`.
 //!
-//! The `#DB` exception-frame push at CPL 0 is an explicit supervisor-mode
-//! access, so AC governs it: Intel SDM Vol. 3A § 4.6 gives GDT, LDT, IDT and
-//! TSS accesses as its examples of implicit accesses, and a stack push during
-//! event delivery is not among them. A user-set TF therefore makes the push,
-//! and the `#DB` handler's stack, land where the user RSP points. A writable
-//! kernel address takes no fault, nor does a writable user page while AC is
-//! set; a non-canonical, unmapped or read-only (CR0.WP) RSP, or a user page
-//! with AC clear, faults to `#DF`. The SMAP gap is defined in
-//! `docs/memory-model.md` § Kernel Isolation — SMEP and SMAP, and the kernel
-//! RIP the frame discloses in `core/kernel/docs/cross-boundary-disclosure.md`
-//! § Classification. This is part of the same known defect (#443).
-//!
-//! The stub executes no `swapgs`: the kernel holds its per-CPU pointer in the
-//! GS base and never swaps it, so a ring-3 `mov gs` with the user selector
-//! reloads the GS base that the stub's `gs:[...]` accesses and every later
-//! per-CPU access use. This is a known defect (#443).
+//! A return RIP with any of bits 63:47 set is never returned to with `sysretq`,
+//! which would fault in ring 0 after the swap; the thread is terminated as for
+//! an unhandled user #GP.
 //!
 //! We save R11 (user RFLAGS) to `PerCpuData::scratch` (`gs:[24]`) immediately,
 //! use R11 to shuttle user RSP to `PerCpuData::user_rsp` (`gs:[16]`), switch to
@@ -70,9 +55,18 @@ const IA32_LSTAR: u32 = 0xC000_0082;
 const IA32_SFMASK: u32 = 0xC000_0084;
 
 const EFER_SCE: u64 = 1 << 0;
-/// SFMASK value: clears RFLAGS.IF only. AC, TF, DF, NT and IOPL are not
-/// masked, a known defect (#443; see the module § Entry contract).
-const SFMASK_CLEAR_IF: u64 = 1 << 9;
+
+const RFLAGS_TF: u64 = 1 << 8;
+const RFLAGS_IF: u64 = 1 << 9;
+const RFLAGS_DF: u64 = 1 << 10;
+const RFLAGS_IOPL: u64 = 3 << 12;
+const RFLAGS_NT: u64 = 1 << 14;
+const RFLAGS_AC: u64 = 1 << 18;
+
+/// RFLAGS bits SYSCALL clears on entry: interrupts stay off until the kernel
+/// enables them, and no user-set trap, direction, alignment-check (SMAP
+/// override), nested-task or I/O-privilege bit reaches ring 0.
+const SFMASK_VALUE: u64 = RFLAGS_IF | RFLAGS_TF | RFLAGS_DF | RFLAGS_AC | RFLAGS_NT | RFLAGS_IOPL;
 
 /// STAR value:
 /// - bits [47:32] = 0x0008: SYSCALL → CS=0x08 (kernel), SS=0x10.
@@ -112,21 +106,18 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 ///
 /// On SYSCALL hardware saves: RIP→RCX, RFLAGS→R11. Does NOT change RSP.
 /// This stub:
+/// 0. Swaps to the kernel GS base (`swapgs`).
 /// 1. Saves R11 (user RFLAGS) to `gs:[24]` (`PerCpuData::scratch`).
 /// 2. Saves user RSP (via R11) to `gs:[16]` (`PerCpuData::user_rsp`).
 /// 3. Switches to `gs:[8]` (`PerCpuData::kernel_rsp`).
 /// 4. Allocates a 168-byte [`TrapFrame`] on the kernel stack.
 /// 5. Saves all GPRs and CPU-state fields into the frame.
 /// 6. Calls `crate::syscall::dispatch`.
-/// 7. Restores registers and executes `sysretq`.
-///
-/// Steps 1 and 2 run on the user RSP, and no step clears RFLAGS.AC or DF, so
-/// the user's AC, TF and DF stay in effect in ring 0 (a known defect, #443;
-/// see the module § Entry contract).
+/// 7. Restores registers, disables interrupts, swaps back to the user GS base,
+///    and executes `sysretq`.
 ///
 /// GS-base must point to a valid `PerCpuData` (installed by `percpu::init_bsp`
-/// in Phase 5) before any user thread executes a SYSCALL. Ring 3 can reload
-/// it (a known defect, #443; see the module § Entry contract).
+/// in Phase 5) before any user thread executes a SYSCALL.
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry()
@@ -138,7 +129,8 @@ unsafe extern "C" fn syscall_entry()
     //
     // PerCpuData GS offsets: kernel_rsp=gs:[8], user_rsp=gs:[16], scratch=gs:[24]
     core::arch::naked_asm!(
-        // ── Phase 1: stack switch (use R11 as scratch, restore later) ─────
+        // ── Phase 1: kernel GS base, then stack switch ────────────────────
+        "swapgs",
         // Save user RFLAGS (R11) to PerCpuData::scratch before repurposing R11.
         "mov gs:[24], r11",
         // Use R11 to carry user RSP to PerCpuData::user_rsp, then switch stacks.
@@ -180,6 +172,13 @@ unsafe extern "C" fn syscall_entry()
         "call {dispatch}",
 
         // ── Phase 4: restore registers for sysretq ────────────────────────
+        // sysretq raises #GP in ring 0, on the user RSP and after the GS swap,
+        // when RCX is not canonical. A syscall from the last bytes of the user
+        // half returns to exactly such an address, so a return RIP with any of
+        // bits 63:47 set is terminated as a user #GP instead.
+        "mov rax, [rsp + 120]",
+        "shr rax, 47",
+        "jnz 3f",
         // sysretq: RIP←RCX, RFLAGS←R11, RSP stays as set.
         "mov rax, [rsp +   0]",     // return value (dispatch set tf.rax)
         "mov rbx, [rsp +   8]",
@@ -198,10 +197,24 @@ unsafe extern "C" fn syscall_entry()
         "mov r15, [rsp + 112]",
         // Switch to user RSP last (TrapFrame still on kernel stack until here).
         "mov rsp, [rsp + 136]",     // rsp = user RSP
-
+        // No interrupt may arrive between the swap and sysretq: its stub would
+        // see a ring-0 frame and run on the user GS base. sysretq restores the
+        // user's IF from R11.
+        "cli",
+        "swapgs",
         "sysretq",
 
+        // Non-canonical return RIP: terminate the thread as for an unhandled
+        // user #GP (vector 13). Diverges.
+        "3:",
+        "mov rdi, rsp",             // arg0 = *const TrapFrame (the user frame)
+        "mov esi, 13",              // arg1 = vector (#GP)
+        "xor edx, edx",             // arg2 = error_code
+        "call {terminate}",
+        "ud2",
+
         dispatch = sym crate::syscall::dispatch,
+        terminate = sym super::idt::common_exception_handler,
     );
 }
 
@@ -209,8 +222,7 @@ unsafe extern "C" fn syscall_entry()
 
 /// Configure the SYSCALL/SYSRET mechanism.
 ///
-/// Enables SYSCALL in EFER, programs STAR/LSTAR/SFMASK. SFMASK clears only
-/// RFLAGS.IF (a known defect, #443; see the module § Entry contract).
+/// Enables SYSCALL in EFER, programs STAR/LSTAR/SFMASK.
 ///
 /// # Safety
 /// Ring 0. GDT must have the Seraph layout before this call.
@@ -223,7 +235,7 @@ pub unsafe fn init()
         cpu::write_msr(IA32_EFER, efer | EFER_SCE);
         cpu::write_msr(IA32_STAR, STAR_VALUE);
         cpu::write_msr(IA32_LSTAR, syscall_entry as *const () as u64);
-        cpu::write_msr(IA32_SFMASK, SFMASK_CLEAR_IF);
+        cpu::write_msr(IA32_SFMASK, SFMASK_VALUE);
     }
 }
 
@@ -252,9 +264,10 @@ mod tests
     }
 
     #[test]
-    fn sfmask_clears_if_only()
+    fn sfmask_clears_every_user_controlled_privileged_flag()
     {
-        assert_eq!(SFMASK_CLEAR_IF, 1 << 9);
+        // IF (9), TF (8), DF (10), AC (18), NT (14), IOPL (12-13).
+        assert_eq!(SFMASK_VALUE, 0x0004_7700);
     }
 
     #[test]

@@ -12,7 +12,7 @@
 //! - Reads ≤ 504 bytes that fit within the current page use the
 //!   inline `FS_READ` path; payload bytes ride in the IPC buffer.
 //! - Larger reads use `FS_READ_MEMORY`: the driver returns a Memory cap
-//!   cap covering one cached page; we reserve VA, `mem_map` it
+//!   covering one cached page; we reserve VA, `mem_map` it
 //!   read-only, memcpy out, then proactively release the cache slot
 //!   via `FS_RELEASE_MEMORY` and tear the mapping down locally.
 //!
@@ -79,7 +79,7 @@ use crate::sys::{unsupported, unsupported_err};
 
 use ipc::{IpcMessage, fs_errors, fs_labels, ns_labels};
 use namespace_protocol::{NodeKind, NsError, validate_name};
-use syscall_abi::PAGE_SIZE;
+use syscall_abi::{MSG_DATA_WORDS_MAX, PAGE_SIZE};
 
 // `release_handler` lives in a sibling file (not a subdirectory),
 // because the upstream `library/std/src/sys/fs/` directory mixes
@@ -99,8 +99,9 @@ const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 /// that also fits within the current page goes inline; anything larger
 /// or page-straddling takes the frame path.
 ///
-/// 504 is the FS_READ IPC reply ceiling: 63 data words × 8 bytes minus
-/// the 8-byte length prefix in word 0 (`abi/syscall/MSG_DATA_WORDS_MAX`).
+/// 504 is the FS_READ IPC reply ceiling: 64 data words
+/// (`abi/syscall/MSG_DATA_WORDS_MAX`) × 8 bytes minus the 8-byte length
+/// prefix in word 0.
 /// At or below this size, a single FS_READ carries the bytes. The
 /// `fsbench` numbers in `services/fs/docs/fs-driver-protocol.md` show
 /// inline is roughly 2× cheaper per call on both x86_64 and riscv64,
@@ -111,8 +112,9 @@ const READ_INLINE_THRESHOLD: usize = 504;
 /// Per-call crossover threshold between the inline FS_WRITE path and
 /// the zero-copy FS_WRITE_MEMORY path. A `write()` of at most this many
 /// bytes goes inline; anything larger takes the frame path. Mirrors
-/// `READ_INLINE_THRESHOLD` for symmetry: 504 bytes = 63 data words ×
-/// 8 bytes − 8 bytes of length prefix in word 0.
+/// `READ_INLINE_THRESHOLD` for symmetry: 504 bytes = 64 data words
+/// (`MSG_DATA_WORDS_MAX`) × 8 bytes − the 8-byte file offset in word 0 (the
+/// payload length rides in label bits 16-31).
 const WRITE_INLINE_THRESHOLD: usize = 504;
 
 // ── Public type stubs ─────────────────────────────────────────────────────
@@ -1312,12 +1314,12 @@ impl File
 
         // Inline path: small reads or page-tail reads that don't cross a
         // page boundary. Threshold equals the FS_READ IPC payload
-        // ceiling: 63 data words × 8 bytes = 504, minus the 8-byte
-        // length prefix in word 0. Above this a single inline reply
-        // cannot carry the bytes; below this the per-call cost is
-        // strictly cheaper than the frame path on both x86_64 and
-        // riscv64 (≈ 2× factor; see fsbench numbers recorded in
-        // `services/fs/docs/fs-driver-protocol.md`).
+        // ceiling: 64 data words (`MSG_DATA_WORDS_MAX`) × 8 bytes = 512,
+        // minus the 8-byte length prefix in word 0 = 504. Above this a
+        // single inline reply cannot carry the bytes; below this the
+        // per-call cost is strictly cheaper than the frame path on both
+        // x86_64 and riscv64 (≈ 2× factor; see fsbench numbers recorded
+        // in `services/fs/docs/fs-driver-protocol.md`).
         let page_off = (pos % PAGE_SIZE) as usize;
         if want <= READ_INLINE_THRESHOLD && page_off + want <= PAGE_SIZE_USIZE
         {
@@ -1771,7 +1773,7 @@ pub fn readdir(path: &Path) -> io::Result<ReadDir>
 /// to a directory (use `rmdir` / `remove_dir_all` for those).
 pub fn unlink(path: &Path) -> io::Result<()>
 {
-    remove_leaf(path, /*expect_dir=*/ false)
+    remove_leaf(path, NodeKind::File)
 }
 
 /// Remove an empty directory. Returns `NotADirectory` if the leaf
@@ -1779,10 +1781,13 @@ pub fn unlink(path: &Path) -> io::Result<()>
 /// directory is non-empty.
 pub fn rmdir(path: &Path) -> io::Result<()>
 {
-    remove_leaf(path, /*expect_dir=*/ true)
+    remove_leaf(path, NodeKind::Dir)
 }
 
-fn remove_leaf(path: &Path, expect_dir: bool) -> io::Result<()>
+/// Remove the leaf of `path` after confirming it is an `expected` node.
+/// `unlink` and `rmdir` differ only in that expectation and in the std
+/// `ErrorKind` a mismatch maps to.
+fn remove_leaf(path: &Path, expected: NodeKind) -> io::Result<()>
 {
     let ipc_buf = crate::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
@@ -1810,23 +1815,21 @@ fn remove_leaf(path: &Path, expect_dir: bool) -> io::Result<()>
             return Err(e);
         }
     };
-    let kind_is_dir = matches!(walked.kind, NodeKind::Dir);
     let _ = syscall::cap_delete(walked.cap);
-    if expect_dir && !kind_is_dir
+    if walked.kind != expected
     {
         release_split_parent(&split);
-        return Err(io::const_error!(
-            io::ErrorKind::NotADirectory,
-            "seraph fs: target is not a directory",
-        ));
-    }
-    if !expect_dir && kind_is_dir
-    {
-        release_split_parent(&split);
-        return Err(io::const_error!(
-            io::ErrorKind::IsADirectory,
-            "seraph fs: target is a directory",
-        ));
+        return Err(match expected
+        {
+            NodeKind::Dir => io::const_error!(
+                io::ErrorKind::NotADirectory,
+                "seraph fs: target is not a directory",
+            ),
+            NodeKind::File => io::const_error!(
+                io::ErrorKind::IsADirectory,
+                "seraph fs: target is a directory",
+            ),
+        });
     }
 
     let label = fs_labels::FS_REMOVE | ((split.leaf.len() as u64) << 16);
@@ -1872,7 +1875,10 @@ pub fn mkdir(path: &Path) -> io::Result<()>
 /// Rename an entry within a single directory. Cross-directory rename
 /// is not supported on the wire (see `shared/ipc/src/lib.rs`
 /// `FS_RENAME` rustdoc) and is tracked separately; the PAL surfaces
-/// it as `InvalidInput`.
+/// it as `InvalidInput`. The two names share the request's data area
+/// after the two length words, so a pair whose combined length does not
+/// fit there is refused as `InvalidFilename` even though each name alone
+/// passes `validate_name`.
 pub fn rename(from: &Path, to: &Path) -> io::Result<()>
 {
     let ipc_buf = crate::os::seraph::current_ipc_buf();
@@ -1908,6 +1914,20 @@ pub fn rename(from: &Path, to: &Path) -> io::Result<()>
         return Err(io::const_error!(
             io::ErrorKind::InvalidInput,
             "seraph fs: cross-directory rename not supported",
+        ));
+    }
+
+    // The names pack contiguously from word 2, so their sum, not each
+    // name's own `validate_name` bound, decides whether the request fits
+    // the data area; refuse here rather than let the builder assert on
+    // caller-supplied lengths.
+    if src.leaf.len() + dst.leaf.len() > (MSG_DATA_WORDS_MAX - 2) * 8
+    {
+        release_split_parent(&src);
+        release_split_parent(&dst);
+        return Err(io::const_error!(
+            io::ErrorKind::InvalidFilename,
+            "seraph fs: rename source and target names together exceed the request size",
         ));
     }
 

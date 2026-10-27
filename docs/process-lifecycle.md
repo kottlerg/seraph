@@ -263,7 +263,9 @@ Two handover surfaces carry the parent-to-child contract:
 - **`InitInfo`** — kernel-populated, delivered to init at boot. Defined
   by [`abi/init-protocol`](../abi/init-protocol/). Carries the entire
   initial CSpace layout, including platform resources only init needs.
-- **`ProcessInfo`** — procmgr-populated for every other process.
+- **`ProcessInfo`** — procmgr-populated for every process except init's
+  raw-bootstrap set (memmgr and procmgr), whose `ProcessInfo` init
+  populates.
   Defined by [`abi/process-abi`](../abi/process-abi/). Carries only
   what a single service or application requires.
 
@@ -403,8 +405,11 @@ A process dies when:
 
 The kill-process pattern and the `CSpace`/`AddressSpace` teardown have known kernel memory-safety
 gaps, tracked in [#443](https://github.com/kottlerg/seraph/issues/443) (see
-[IPC Design](ipc-design.md#the-callreply-model) and
-[Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)).
+[Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
+§ Storage: Hybrid Two-Level Radix,
+[thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
+§ `dealloc_object(Thread)` Drain Protocol, step 11, and
+[syscalls.md](../core/kernel/docs/syscalls.md#sys_thread_stop-20) § `SYS_THREAD_STOP`).
 
 ### Exit reason
 
@@ -417,7 +422,7 @@ a fault or kill reason — defined once in `syscall_abi`:
 |---|---|---|
 | `0` (`EXIT_VOLUNTARY`) | Voluntary, clean | success — `sys_process_exit(0)`, `sys_thread_exit`, `ExitCode::SUCCESS` |
 | `1 ..= 0x0FFF` | Voluntary, code | `sys_process_exit(code)` via `encode_exit_code` (saturating); `std::process::exit(n)` / non-zero `ExitCode` |
-| `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector`) | Fault | unhandled CPU/VM fault; kernel-terminated |
+| `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on riscv64) | Fault | unhandled CPU/VM fault; kernel-terminated |
 | `0x2000` (`EXIT_KILLED`) | Killed | recorded by the kernel as the retained reason of a thread stopped by its `CSpace`/`AddressSpace` teardown (that stop posts no death event; an observer bound afterwards receives the retained reason through the bind); posted by userspace (`Child::kill`) |
 
 `sys_process_exit` records the encoded reason as the calling thread's exit reason and posts it to
@@ -493,18 +498,24 @@ Seraph does not implement `fork()` or copy-on-write. Process creation
 is always from-scratch via `CREATE_PROCESS` or `CREATE_FROM_FILE`; zero-copy
 buffer handoff between processes uses Memory-cap moves over IPC.
 
-Userspace fault handling is specified as the pager protocol in
-[Fault Handling](fault-handling.md). An unresolved fault is delivered to the
-thread's bound handler (memmgr, the default pager, unless the process was
-created `CREATE_PINNED`); a thread with no bound handler, or whose handler
-replies `KILL`, terminates, which surfaces through the normal process-death
-notification flow above.
+Userspace fault handling is specified as the pager protocol in [Fault Handling](fault-handling.md).
+An unresolved fault is delivered to the thread's bound handler (memmgr, the default pager, unless
+the process was created `CREATE_PINNED`); a thread with no bound handler, whose handler replies
+`KILL`, or whose fault episode is cancelled by destruction of the handler thread (deletion of its
+last Thread capability), destruction of the handler endpoint while the fault is still queued on it,
+or a later receive on the handler thread that passes its capability and headroom checks, terminates,
+which surfaces through the normal process-death notification flow above; a stop of the faulting
+thread defers that termination (before any reply claims the fault it cancels the episode; after a
+`KILL` reply has claimed it, that disposition stands), and the thread terminates that way, and
+observers are posted, only if it is started again (see
+[Fault Handling](fault-handling.md#delivery-resume-and-kill)).
 
 ---
 
 ## Summarized By
 
 [abi/init-protocol/README.md](../abi/init-protocol/README.md),
+[abi/process-abi/README.md](../abi/process-abi/README.md),
 [Memory Map Translation](../core/boot/docs/memory-map.md),
 [Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),

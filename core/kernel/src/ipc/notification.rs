@@ -6,26 +6,20 @@
 //! Notification IPC — bitmask-based async notification.
 //!
 //! A notification object holds a 64-bit bitmask. Senders OR bits into it;
-//! a single waiter reads-and-clears the bitmask. If the waiter finds
-//! zero bits set, it blocks until a sender delivers bits.
+//! a waiter reads-and-clears the bitmask. If the waiter finds zero bits set,
+//! it blocks until a sender delivers bits.
 //!
 //! # Blocking semantics
-//! The object has one waiter slot, and the kernel does not enforce a single
-//! waiter: a second `notification_wait` replaces the registered waiter, and
-//! neither a send nor its timeout then wakes the displaced one (#443). A waiter
-//! that finds bits already set returns them without blocking.
+//! Any number of threads may wait. They queue in arrival order
+//! ([`WaitQueue`](crate::ipc::WaitQueue)), and each delivery wakes the head
+//! waiter with every pending bit; a waiter is woken immediately if bits are
+//! already set when it calls wait. Destroying the notification wakes every
+//! waiter with `Interrupted`.
 //!
 //! # Thread safety
-//! `waiter`, `wait_set`, and `wait_set_member_idx` are mutated only under the
-//! per-object `lock`. `bits` and `has_observer` are atomics that
-//! `notification_send`'s fast path reads and writes without the lock, ordered
-//! by the `SeqCst` fence pair in
-//! `core/kernel/docs/scheduling-internals.md` § Atomic Ordering Invariants.
-//! Callers hold no lock.
-//!
-//! # Adding multi-waiter support
-//! Replace `waiter` with an intrusive queue of TCBs and wake all of them
-//! on notification delivery.
+//! `lock` serialises the waiter queue and the slow send/wait paths; `bits` and
+//! `has_observer` follow the lock-free Dekker protocol described on
+//! `has_observer`.
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
@@ -37,13 +31,16 @@ use crate::sched::thread::ThreadControlBlock;
 ///
 /// Constructed in place in a retype slot of a Memory capability. The `KernelObjectHeader` is
 /// NOT included here; it lives in `cap::object::NotificationObject`, which
-/// wraps this struct.
+/// wraps this struct. `lock` serialises every non-atomic field that changes
+/// after construction (the bare-field exception of docs/coding-standards.md
+/// § Concurrency).
 pub struct NotificationState
 {
     /// Pending notification bits. Senders OR into this; the waiter read-and-clears.
     pub bits: AtomicU64,
-    /// The single thread blocked waiting for a non-zero bitmask, or null.
-    pub waiter: *mut ThreadControlBlock,
+    /// Threads blocked waiting for a non-zero bitmask, in arrival order.
+    /// Protected by `lock`.
+    pub waiters: crate::ipc::WaitQueue,
     /// Opaque pointer to the `WaitSetState` this notification is registered with,
     /// or null if not in any wait set. Cast back to `*mut WaitSetState` only in
     /// `crate::ipc::wait_set::waitset_notify`.
@@ -65,13 +62,13 @@ pub struct NotificationState
     pub lock: crate::sync::Spinlock,
 }
 
-// SAFETY: `waiter`, `wait_set`, and `wait_set_member_idx` are accessed only
-// under `lock`; `bits` and `has_observer` are atomics ordered across CPUs by
-// the SeqCst fence pair in `notification_send` / `notification_wait`.
+// SAFETY: the waiter queue and the wait-set back-pointer fields are read and
+// written only under `lock`; `bits` and `has_observer` are atomics used under
+// the Dekker protocol documented on `has_observer`. Moving the state between
+// CPUs therefore exposes no unsynchronised write.
 unsafe impl Send for NotificationState {}
-// SAFETY: `waiter`, `wait_set`, and `wait_set_member_idx` are accessed only
-// under `lock`; `bits` and `has_observer` are atomics ordered across CPUs by
-// the SeqCst fence pair in `notification_send` / `notification_wait`.
+// SAFETY: as for Send: shared access touches the non-atomic fields only under
+// `lock`, and the lock-free fast path reads and writes only the atomics.
 unsafe impl Sync for NotificationState {}
 
 impl NotificationState
@@ -81,12 +78,22 @@ impl NotificationState
     {
         Self {
             bits: AtomicU64::new(0),
-            waiter: core::ptr::null_mut(),
+            waiters: crate::ipc::WaitQueue::new(),
             wait_set: core::ptr::null_mut(),
             wait_set_member_idx: 0,
             has_observer: AtomicU8::new(0),
             lock: crate::sync::Spinlock::new(),
         }
+    }
+
+    /// Republish `has_observer` after a change to the waiters or the wait-set
+    /// registration. Called with `lock` held.
+    pub fn refresh_observer(&self)
+    {
+        self.has_observer.store(
+            u8::from(!self.waiters.is_empty() || !self.wait_set.is_null()),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -94,11 +101,9 @@ impl NotificationState
 
 /// Deliver `bits` to `sig`.
 ///
-/// ORs the given bits into the notification bitmask. If a thread is blocked
-/// waiting and the swap finds non-zero bits, claims it: deposits the bits in
-/// its `wakeup_value`, clears `waiter`, and removes any sleep-list timeout.
-/// If the swap finds zero bits (a concurrent wait consumed them), the waiter
-/// is left in place.
+/// ORs the given bits into the notification bitmask. If threads are blocked
+/// waiting, claims the head waiter with every pending bit and removes it from
+/// the queue.
 ///
 /// Returns `Some(*mut TCB)` if a thread was woken (caller must enqueue it).
 ///
@@ -136,65 +141,42 @@ pub unsafe fn notification_send(
     // SAFETY: lock serialises wakeup; paired with unlock_raw below.
     let saved = unsafe { sig.lock.lock_raw() };
 
-    let result = if !sig.waiter.is_null()
+    let result = if !sig.waiters.is_empty()
     {
         // Swap all pending bits (including ours) to zero and deliver them.
         let delivered = sig.bits.swap(0, Ordering::Relaxed);
 
         if delivered == 0
         {
-            // A concurrent notification_wait or another sender's slow-path swap (each
-            // a locked swap) already consumed our bits; the current sig.waiter is a
-            // new waiter and must not be touched
-            // (see core/kernel/docs/ipc-internals.md § Send Path step 5b).
+            // A newly arriving notification_wait or a concurrent send
+            // already claimed our bits. The queued waiters were already
+            // waiting; do NOT touch them (delivering wakeup_value=0 would be
+            // a spurious wake, since 0-bit sends are rejected). See
+            // core/kernel/docs/ipc-internals.md § Send Path step 5b.
             None
         }
         else
         {
-            let waiter = sig.waiter;
-            sig.waiter = core::ptr::null_mut();
-            // Claim the waiter for wake before releasing sig.lock. A concurrent
-            // dealloc_object(Thread) takes sig.lock in its unlink path and then
-            // spins on this flag, so it cannot free `waiter` in the window
-            // between this pop and the caller's enqueue_and_wake. Cleared by
-            // enqueue_and_wake. See core/kernel/docs/scheduling-internals.md
-            // § Cross-CPU TCB Ownership.
-            // SAFETY: waiter is the valid TCB just dequeued from sig.waiter.
-            unsafe {
-                (*waiter).wake_in_flight.store(1, Ordering::Release);
-            }
-            sig.has_observer
-                .store(u8::from(!sig.wait_set.is_null()), Ordering::Relaxed);
-            // SAFETY: waiter is a valid TCB pointer placed here by notification_wait.
+            // SAFETY: sig.lock held.
+            let waiter = unsafe { sig.waiters.pop() };
+            // Claim the head waiter for wake before releasing sig.lock: a
+            // concurrent dealloc_object(Thread) takes sig.lock in its unlink
+            // path and then spins on wake_in_flight, so it cannot free `waiter`
+            // before the caller's enqueue_and_wake
+            // (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
+            // Ownership). A timed waiter's sleep-list entry goes with it
+            // (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
+            // Invariants, invariant 7).
+            // SAFETY: waiter is the valid TCB just removed from the queue under
+            // sig.lock.
             unsafe {
                 debug_assert!(
                     (*waiter).magic == crate::sched::thread::TCB_MAGIC,
                     "notification_send: waiter TCB magic corrupt — use-after-free?"
                 );
-                (*waiter).wakeup_value = delivered;
+                crate::ipc::claim_waiter(waiter, delivered);
             }
-            // If the waiter was registered with a `SYS_NOTIFICATION_WAIT` timeout, it
-            // is also on the sleep list; remove it under sig.lock so the timer path
-            // cannot double-wake it (lock order per
-            // core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants rule 1).
-            //
-            // ORDER (issue #117): call `sleep_list_remove` BEFORE clearing
-            // `sleep_deadline`. The timer path (`sleep_check_wakeups`) walks
-            // `SLEEP_LIST` under `SLEEP_LIST_LOCK` and considers an entry
-            // expired when `(*tcb).sleep_deadline <= now`. Clearing the
-            // deadline first creates a window where the entry is still on
-            // the list with `deadline == 0 <= now`, making the timer claim a
-            // wake that this `notification_send` is concurrently delivering →
-            // double-`enqueue_and_wake` of the waiter and a corrupted run
-            // queue (intrusive-list self-cycle).
-            // SAFETY: waiter is the TCB we just dequeued from sig.waiter.
-            unsafe {
-                if (*waiter).sleep_deadline != 0
-                {
-                    crate::sched::sleep_list_remove(waiter);
-                    (*waiter).sleep_deadline = 0;
-                }
-            }
+            sig.refresh_observer();
             Some(waiter)
         }
     }
@@ -221,9 +203,13 @@ pub unsafe fn notification_send(
 /// Wait for at least one bit in `sig` to be set.
 ///
 /// Reads and clears the bitmask atomically. If the result is non-zero,
-/// returns `Ok(bits)` immediately (no blocking). If zero, registers `caller`
-/// as the waiter and commits the park; a refused commit rolls the waiter back.
-/// Either way returns `Err(())` and the caller must then call the scheduler.
+/// returns `Ok(bits)` immediately (no blocking). If zero, stores `caller`
+/// at the tail of the waiters and commits the park; a refused commit dequeues
+/// the caller again. A committed timed wait (non-zero `deadline`) is armed on
+/// the sleep list in the same critical section. Either way returns `Err(())`,
+/// and the caller must then call the scheduler to yield the CPU. A timed wait
+/// that finds the sleep list full is withdrawn and returns `Ok(0)`, an
+/// immediate timeout.
 ///
 /// # Dekker ordering
 /// The waiter is registered and `has_observer` set before the bits swap; the
@@ -236,6 +222,7 @@ pub unsafe fn notification_send(
 pub unsafe fn notification_wait(
     sig: *mut NotificationState,
     caller: *mut ThreadControlBlock,
+    deadline: u64,
 ) -> Result<u64, ()>
 {
     // SAFETY: caller guarantees sig is valid.
@@ -244,7 +231,7 @@ pub unsafe fn notification_wait(
     // SAFETY: lock serialises send/wait; paired with unlock_raw below.
     let saved = unsafe { sig.lock.lock_raw() };
 
-    // Pre-clear context_saved before publishing the waiter slot; see
+    // Pre-clear context_saved before queueing the waiter; see
     // core/kernel/docs/scheduling-internals.md § Atomic Ordering Invariants
     // (`context_saved`) and § Cross-CPU TCB Ownership.
     // SAFETY: caller TCB is valid; context_saved is AtomicU32.
@@ -257,7 +244,8 @@ pub unsafe fn notification_wait(
     // Register the waiter and set has_observer before the bits swap (Dekker
     // wait half); see core/kernel/docs/scheduling-internals.md § Atomic Ordering
     // Invariants.
-    sig.waiter = caller;
+    // SAFETY: caller is a valid TCB on no queue; sig.lock held.
+    unsafe { sig.waiters.push(caller) };
     sig.has_observer.store(1, Ordering::Relaxed);
 
     // Dekker fence: pairs with the SeqCst fence in notification_send.
@@ -269,9 +257,9 @@ pub unsafe fn notification_wait(
     {
         // Bits were available — undo the waiter registration and restore
         // context_saved (thread never actually blocked).
-        sig.waiter = core::ptr::null_mut();
-        sig.has_observer
-            .store(u8::from(!sig.wait_set.is_null()), Ordering::Relaxed);
+        // SAFETY: caller was pushed above; sig.lock held throughout.
+        unsafe { sig.waiters.remove(caller) };
+        sig.refresh_observer();
         // SAFETY: caller TCB is valid; context_saved is AtomicU32.
         unsafe {
             (*caller)
@@ -294,12 +282,12 @@ pub unsafe fn notification_wait(
     };
     if committed != crate::sched::ParkCommit::Committed
     {
-        // Refused park; roll back the waiter slot (sig.lock held since publish).
+        // Refused park; dequeue the caller again (sig.lock held since publish).
         // Stamping per core/kernel/docs/ipc-internals.md § Park Dispositions and
         // Episodes (refused-commit rollbacks).
-        sig.waiter = core::ptr::null_mut();
-        sig.has_observer
-            .store(u8::from(!sig.wait_set.is_null()), Ordering::Relaxed);
+        // SAFETY: caller was pushed above; sig.lock held throughout.
+        unsafe { sig.waiters.remove(caller) };
+        sig.refresh_observer();
         if committed == crate::sched::ParkCommit::RefusedStop
         {
             // SAFETY: caller TCB is valid; episode owned per the above.
@@ -315,6 +303,26 @@ pub unsafe fn notification_wait(
             (*caller)
                 .context_saved
                 .store(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    else if deadline != 0
+    {
+        // SAFETY: caller committed Blocked; sig.lock held since the push.
+        let armed = unsafe { crate::ipc::arm_timed_park(caller, deadline, "notification_wait") };
+        if !armed
+        {
+            // Sleep list full: withdraw the park and report an immediate
+            // timeout (0 bits), so the wait never outlives its bound.
+            // sig.lock has held the caller queued since the push, so no
+            // waker or cancel claimed it.
+            // SAFETY: caller was pushed above; sig.lock held throughout.
+            unsafe {
+                sig.waiters.remove(caller);
+                sig.refresh_observer();
+                crate::sched::withdraw_uncontested_park(caller);
+                sig.lock.unlock_raw(saved);
+            }
+            return Ok(0);
         }
     }
 
@@ -338,7 +346,7 @@ mod tests
     {
         let s = NotificationState::new();
         assert_eq!(s.bits.load(Ordering::Relaxed), 0);
-        assert!(s.waiter.is_null());
+        assert!(s.waiters.is_empty());
         assert!(s.wait_set.is_null());
         assert_eq!(s.wait_set_member_idx, 0);
         assert_eq!(s.has_observer.load(Ordering::Relaxed), 0);

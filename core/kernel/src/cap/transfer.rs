@@ -334,7 +334,10 @@ unsafe fn drive_batch(mv: &CapMove, batches: &mut u32, backstop: u32) -> MoveSte
 /// is queued for this CPU's deferred reclaim (drained at the next syscall
 /// epilogue or idle loop) rather than torn down in place, and may be bound
 /// to the running thread (see capability-internals.md § Move). Every other
-/// type frees in place.
+/// type frees in place; a Notification or `EventQueue` may first wait for the
+/// timer's in-flight wakeup batch (`sched::sleep_wakeups_quiesce`), a bounded
+/// wait that needs only that no IPC, scheduler, or sleep-list lock is held,
+/// as at every call site.
 ///
 /// # Safety
 ///

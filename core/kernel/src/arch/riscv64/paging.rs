@@ -863,6 +863,13 @@ fn rv_walk_or_alloc_pooled(
     Ok(frame_pa)
 }
 
+/// Whether a per-VA invalidation ([`flush_page`], [`inval_page`]) also drops the
+/// cached non-leaf entries that name a freed intermediate table. False on
+/// RISC-V: an `sfence.vma`/`sinval.vma` with `rs1 != x0` is only required to
+/// invalidate leaf entries for that address, so freeing a table frame needs an
+/// `rs1 = x0` fence.
+pub const VA_INVAL_DROPS_TABLE_CACHES: bool = false;
+
 /// Flush the TLB entry for a single virtual address using `sfence.vma addr`.
 ///
 /// # Safety
@@ -1078,10 +1085,6 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 /// invalidates only leaf translations for that VA, so cached non-leaf entries
 /// pointing at a freed table survive it. The batched per-page window (up to
 /// `RANGE_FLUSH_CEILING_PAGES`) suffices only for a span that freed no table.
-/// Known defect (#443): the caller does not yet meet this requirement; it
-/// issues the per-page window for every span at or under
-/// `RANGE_FLUSH_CEILING_PAGES` whatever this returns, so a hart can keep a
-/// cached non-leaf entry naming a freed table after the frame is reused.
 ///
 /// # Safety
 /// `root_virt` must be the direct-map VA of a valid 4 KiB root frame, `aso`

@@ -10,10 +10,16 @@
 //! - `recv_queue`: servers blocked waiting for a caller to `call`.
 //!
 //! ## Protocol
-//! The call, receive, and reply paths (`endpoint_call`, `endpoint_recv`,
-//! `endpoint_reply`) are specified in core/kernel/docs/ipc-internals.md
-//! § Call Path (Sender), § Receive Path (Server), and § Reply Path; the
-//! call/reply model is docs/ipc-design.md § The Call/Reply Model.
+//! 1. Caller: `call(ep, msg)` — if a server is waiting → transfer message,
+//!    bind the caller into the server's `reply_tcb`, wake server, block caller
+//!    on reply. Otherwise → enqueue caller on `send_queue`.
+//! 2. Server: `recv(ep)` — first release any caller still bound from an
+//!    earlier receive that was never replied to (its call fails with
+//!    `Interrupted`; a fault-blocked caller is killed). Then, if a caller is
+//!    waiting → dequeue, transfer message, bind the caller into the server's
+//!    `reply_tcb`, return to server. Otherwise → block on `recv_queue`.
+//! 3. Server: `reply(msg)` — claim and clear `reply_tcb` by compare-exchange,
+//!    deliver the reply to the claimed caller, wake it.
 //!
 //! ## Reply capability
 //! The reply capability is the implicit, single-use caller binding that
@@ -29,7 +35,8 @@
 //! `ep.lock`. Callers enter with no scheduler lock held (lock order:
 //! core/kernel/docs/scheduling-internals.md § Lock Hierarchy). A server's `reply_tcb` is
 //! claimed by compare-exchange (`endpoint_reply`, cancel, teardown) or by an
-//! atomic swap (the `SYS_IPC_REPLY` failure path); the claim protocol is in
+//! atomic swap (the `SYS_IPC_REPLY` failure path and the release of an
+//! unreplied caller at receive entry); the claim protocol is in
 //! core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership, and the swap claim
 //! in core/kernel/docs/ipc-internals.md § Park Dispositions and Episodes.
 
@@ -41,7 +48,9 @@ use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
 /// Kernel state backing an Endpoint capability.
 ///
 /// The send/recv queues are intrusive singly-linked lists through `ipc_wait_next`
-/// in each TCB. Both queues have FIFO ordering.
+/// in each TCB. Both queues have FIFO ordering. `lock` serialises every
+/// non-atomic field that changes after construction (the bare-field
+/// exception of docs/coding-standards.md § Concurrency).
 pub struct EndpointState
 {
     /// Head of the blocked-senders queue (callers waiting for a receiver).
@@ -291,9 +300,9 @@ pub unsafe fn endpoint_call(
             (*server).ipc_msg = *msg;
             // Clear context_saved BEFORE the caller becomes wakeable. Every
             // reply-wake claimant reaches the caller through `reply_tcb`
-            // (endpoint_reply, the SYS_IPC_REPLY failure-path swap, dealloc_object(Thread)'s
-            // dying-server reply-bound wake, cancel_ipc_block, the sleep-list timer arm),
-            // Acquire-loading it.
+            // (endpoint_reply, dealloc's BlockedOnReply detach and server arm,
+            // cancel_ipc_block, the SYS_IPC_REPLY failure-path swap, and the
+            // receive-entry release_unreplied_caller swap), Acquire-loading it.
             // Ordering this Relaxed clear before the `reply_tcb` Release makes
             // the Release carry it, so no claimant can observe the stale
             // context_saved==1 left by the caller's previous switch-in and
@@ -313,10 +322,15 @@ pub unsafe fn endpoint_call(
             (*caller)
                 .wake_in_flight
                 .store(1, core::sync::atomic::Ordering::Release);
-            // Known defect (#443): this unconditional store overwrites any
-            // binding still pending on the server, stranding the displaced
-            // caller with wake_in_flight set and no claimant able to win its
-            // reply_tcb CAS.
+            // The server reached the recv queue through endpoint_recv, which
+            // released any binding it still held, so the slot is empty.
+            debug_assert!(
+                (*server)
+                    .reply_tcb
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .is_null(),
+                "endpoint_call: server already holds a reply binding"
+            );
             (*server)
                 .reply_tcb
                 .store(caller, core::sync::atomic::Ordering::Release);
@@ -403,13 +417,52 @@ pub unsafe fn endpoint_call(
     Err(())
 }
 
+/// Release the caller still bound to `server` by an earlier receive that was
+/// never replied to.
+///
+/// The swap of `reply_tcb` to null is the episode claim, competing as any
+/// reply-slot claim does with `cancel_ipc_block` and the
+/// `dealloc_object(Thread)` client and server arms. The other claimants
+/// cannot run meanwhile: `endpoint_reply`, the `SYS_IPC_REPLY` failure-path
+/// swap and `endpoint_recv`'s rebind rollback run on this thread, and
+/// `endpoint_call`'s rollback only while this server is parked. On a win the
+/// caller's call fails with `Interrupted`, or a fault-blocked caller is
+/// killed, and the caller is woken; the `wake_in_flight` pin set at bind
+/// keeps it alive until that wake clears it.
+///
+/// # Safety
+/// `server` must be the running thread's valid TCB. Call with no scheduler
+/// or endpoint lock held.
+#[cfg(not(test))]
+unsafe fn release_unreplied_caller(server: *mut ThreadControlBlock)
+{
+    // SAFETY: server valid per contract; reply_tcb is AtomicPtr.
+    let caller = unsafe {
+        (*server)
+            .reply_tcb
+            .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel)
+    };
+    if caller.is_null()
+    {
+        return;
+    }
+    // SAFETY: the swap won the caller's episode, and its wake_in_flight pin
+    // keeps the TCB allocated until enqueue_and_wake clears it.
+    unsafe {
+        crate::sched::thread::stamp_cancelled_deposit(caller, (*caller).in_fault_delivery);
+        let target_cpu = crate::sched::select_target_cpu(caller);
+        crate::sched::enqueue_and_wake(caller, target_cpu);
+    }
+}
+
 /// Attempt to receive on `ep` as `server`.
 ///
-/// Returns `Ok(caller, msg)` if a sender was waiting (server continues running;
-/// sender remains blocked on reply). Returns `Err(())` if no sender was available
-/// (the server is committed `BlockedOnRecv` on the recv queue, unless the park
-/// is refused, in which case it is unlinked and, on a stop-won refusal, its
-/// park is stamped INTERRUPTED).
+/// First releases a caller still bound from an earlier unreplied receive
+/// (`release_unreplied_caller`). Returns `Ok(caller, msg)` if a sender was
+/// waiting (server continues running; sender remains blocked on reply).
+/// Returns `Err(())` if no sender was available (the server is committed
+/// `BlockedOnRecv` on the recv queue, unless the park is refused, in which case
+/// it is unlinked and, on a stop-won refusal, its park is stamped INTERRUPTED).
 ///
 /// # Safety
 /// `ep` and `server` must be valid, and `server` must be the running thread.
@@ -420,6 +473,9 @@ pub unsafe fn endpoint_recv(
     server: *mut ThreadControlBlock,
 ) -> Result<(*mut ThreadControlBlock, Message), ()>
 {
+    // SAFETY: server is the running thread; no lock held (contract).
+    unsafe { release_unreplied_caller(server) };
+
     // SAFETY: ep validated by caller.
     let ep = unsafe { &mut *ep };
 
@@ -475,10 +531,15 @@ pub unsafe fn endpoint_recv(
             (*caller)
                 .wake_in_flight
                 .store(1, core::sync::atomic::Ordering::Release);
-            // Known defect (#443): this unconditional store overwrites any
-            // binding still pending on the server (a second recv without a
-            // reply), stranding the displaced caller with wake_in_flight set
-            // and no claimant able to win its reply_tcb CAS.
+            // Entry released any earlier binding, and a failed rebind below
+            // clears this one, so the slot is empty.
+            debug_assert!(
+                (*server)
+                    .reply_tcb
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .is_null(),
+                "endpoint_recv: server already holds a reply binding"
+            );
             (*server)
                 .reply_tcb
                 .store(caller, core::sync::atomic::Ordering::Release);
@@ -613,9 +674,8 @@ pub unsafe fn endpoint_reply(
     {
         return None;
     }
-    // CAS-claim the reply slot: `cancel_ipc_block`, the
-    // `dealloc_object_one(Thread)` reply-bound waker, and the timer
-    // `BlockedOnReply` arm in `sleep_check_wakeups` all CAS this slot
+    // CAS-claim the reply slot: `cancel_ipc_block` and the
+    // `dealloc_object_one(Thread)` client and server arms CAS this slot
     // independently of `ep.lock`. A plain load+store would let one of
     // them clear `reply_tcb` between our load and store while we still
     // proceed to wake `caller` — yielding two `enqueue_and_wake` calls
@@ -633,8 +693,8 @@ pub unsafe fn endpoint_reply(
             .is_err()
     }
     {
-        // A concurrent canceller / dealloc / timer already cleared the
-        // slot; they own the wake (and the client may already be
+        // A concurrent `cancel_ipc_block` or dealloc arm already cleared
+        // the slot; it owns the wake (and the client may already be
         // Stopped or Exited).
         return None;
     }

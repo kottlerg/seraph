@@ -587,10 +587,9 @@ pub fn remove_entry(
     ipc_buf: *mut u64,
 ) -> Result<RemovedEntry, FatError>
 {
-    let positions =
+    let (entry, scan) =
         locate_entry_with_lfn_run(state, parent_dir_cluster, name, cache, block_dev, ipc_buf)?;
-    let (entry, ref slots) = positions;
-    for slot in slots
+    for slot in scan.run()
     {
         mark_slot_deleted(*slot, cache, block_dev, ipc_buf)?;
     }
@@ -1387,7 +1386,8 @@ fn scan_sector_for_sfn(
 
 /// Locate an entry by name *and* the disk positions of its LFN run.
 /// Used by [`remove_entry`] so we can mark every LFN slot as deleted
-/// alongside the trailing 8.3 entry.
+/// alongside the trailing 8.3 entry. The returned scan's
+/// [`RemoveRunScan::run`] holds exactly the entry's slots.
 fn locate_entry_with_lfn_run(
     state: &mut FatState,
     parent_dir_cluster: u32,
@@ -1395,7 +1395,7 @@ fn locate_entry_with_lfn_run(
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
-) -> Result<(RemovedEntry, [DirEntryLocation; MAX_SLOT_RUN]), FatError>
+) -> Result<(RemovedEntry, RemoveRunScan<DirEntryLocation>), FatError>
 {
     let mut buf = Box::new([0u8; SECTOR_SIZE]);
     let mut scan = RemoveRunScan::new();
@@ -1421,12 +1421,7 @@ fn locate_entry_with_lfn_run(
                 {
                     return Err(FatError::Corrupt); // not found before EoD
                 }
-                let mut out = [DirEntryLocation {
-                    sector_lba: 0,
-                    offset_in_sector: 0,
-                }; MAX_SLOT_RUN];
-                out[..scan.run().len()].copy_from_slice(scan.run());
-                return Ok((entry, out));
+                return Ok((entry, scan));
             }
         }
         return Err(FatError::Corrupt);
@@ -1459,12 +1454,7 @@ fn locate_entry_with_lfn_run(
                 {
                     return Err(FatError::Corrupt);
                 }
-                let mut out = [DirEntryLocation {
-                    sector_lba: 0,
-                    offset_in_sector: 0,
-                }; MAX_SLOT_RUN];
-                out[..scan.run().len()].copy_from_slice(scan.run());
-                return Ok((entry, out));
+                return Ok((entry, scan));
             }
         }
         match next_cluster(state, cluster, cache, block_dev, ipc_buf)

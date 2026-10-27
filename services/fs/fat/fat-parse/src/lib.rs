@@ -1195,6 +1195,21 @@ mod tests
     }
 
     #[test]
+    fn remove_run_of_a_plain_8_3_entry_is_its_one_slot()
+    {
+        // The removal marks exactly the run deleted; any slot beyond the
+        // entry's own would overwrite an unrelated on-disk byte.
+        let mut other = [0u8; 32];
+        other[..11].copy_from_slice(b"OTHER   TXT");
+        other[11] = 0x20;
+        let mut entry = other;
+        entry[..11].copy_from_slice(b"FILE    TXT");
+        entry[26..28].copy_from_slice(&7u16.to_le_bytes());
+        let run = found_run(&[other, entry, [0u8; 32]], b"file.txt");
+        assert_eq!(run, vec![1]);
+    }
+
+    #[test]
     fn remove_by_long_name_covers_the_lfn_and_8_3_slots()
     {
         let sfn = b"LONGFI~1TXT";

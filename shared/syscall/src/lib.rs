@@ -94,7 +94,11 @@ unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64
     let ret: i64;
     let nr = nr as i64;
     // SAFETY: inline asm issues syscall instruction per x86-64 ABI; syscall number in rax,
-    // args in rdi/rsi; clobbers rcx/r11 as documented; no memory side effects (nostack).
+    // args in rdi/rsi; clobbers rcx/r11 as documented.
+    // The kernel may read or write user memory that pointer arguments or the registered
+    // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
+    // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
+    // stack.
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -128,7 +132,11 @@ unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64
     let ret: i64;
     let a0 = a0 as i64;
     // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
-    // args in a0/a1; no caller-saved registers clobbered beyond return; no memory side effects.
+    // args in a0/a1; no caller-saved registers clobbered beyond return.
+    // The kernel may read or write user memory that pointer arguments or the registered
+    // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
+    // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
+    // stack.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -159,7 +167,11 @@ unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
     let ret: i64;
     let nr = nr as i64;
     // SAFETY: inline asm issues syscall instruction per x86-64 ABI; syscall number in rax,
-    // args in rdi/rsi/rdx/r10; clobbers rcx/r11 as documented; no memory side effects (nostack).
+    // args in rdi/rsi/rdx/r10; clobbers rcx/r11 as documented.
+    // The kernel may read or write user memory that pointer arguments or the registered
+    // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
+    // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
+    // stack.
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -194,7 +206,11 @@ unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
     let ret: i64;
     let a0 = a0 as i64;
     // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
-    // args in a0-a3; no caller-saved registers clobbered beyond return; no memory side effects.
+    // args in a0-a3; no caller-saved registers clobbered beyond return.
+    // The kernel may read or write user memory that pointer arguments or the registered
+    // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
+    // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
+    // stack.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -227,7 +243,11 @@ unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
     let ret: i64;
     let nr = nr as i64;
     // SAFETY: inline asm issues syscall instruction per x86-64 ABI; syscall number in rax,
-    // args in rdi/rsi/rdx/r10/r8; clobbers rcx/r11 as documented; no memory side effects (nostack).
+    // args in rdi/rsi/rdx/r10/r8; clobbers rcx/r11 as documented.
+    // The kernel may read or write user memory that pointer arguments or the registered
+    // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
+    // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
+    // stack.
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -263,7 +283,11 @@ unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
     let ret: i64;
     let a0 = a0 as i64;
     // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
-    // args in a0-a4; no caller-saved registers clobbered beyond return; no memory side effects.
+    // args in a0-a4; no caller-saved registers clobbered beyond return.
+    // The kernel may read or write user memory that pointer arguments or the registered
+    // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
+    // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
+    // stack.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -297,7 +321,11 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
     let ret: i64;
     let nr = nr as i64;
     // SAFETY: inline asm issues syscall instruction per x86-64 ABI; syscall number in rax,
-    // args in rdi/rsi/rdx; clobbers rcx/r11 as documented; no memory side effects (nostack).
+    // args in rdi/rsi/rdx; clobbers rcx/r11 as documented.
+    // The kernel may read or write user memory that pointer arguments or the registered
+    // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
+    // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
+    // stack.
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -331,7 +359,11 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
     let ret: i64;
     let a0 = a0 as i64;
     // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
-    // args in a0-a2; no caller-saved registers clobbered beyond return; no memory side effects.
+    // args in a0-a2; no caller-saved registers clobbered beyond return.
+    // The kernel may read or write user memory that pointer arguments or the registered
+    // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
+    // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
+    // stack.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -620,7 +652,11 @@ unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64
     let ret: i64;
     let nr = nr as i64;
     // SAFETY: inline asm issues syscall instruction per x86-64 ABI; syscall number in rax,
-    // args in rdi/rsi/rdx/r10/r8/r9; clobbers rcx/r11 as documented; no memory side effects.
+    // args in rdi/rsi/rdx/r10/r8/r9; clobbers rcx/r11 as documented.
+    // The kernel may read or write user memory that pointer arguments or the registered
+    // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
+    // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
+    // stack.
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -657,7 +693,11 @@ unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64
     let ret: i64;
     let a0 = a0 as i64;
     // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
-    // args in a0-a5; no memory side effects.
+    // args in a0-a5; no caller-saved registers clobbered beyond return.
+    // The kernel may read or write user memory that pointer arguments or the registered
+    // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
+    // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
+    // stack.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -1595,6 +1635,12 @@ pub fn thread_configure_with_tls(
 ///
 /// The thread must have been configured via [`thread_configure`] first.
 ///
+/// A `Stopped` thread whose fault episode a stop cancelled before any reply
+/// claimed it, or whose handler's claiming reply was `FAULT_REPLY_KILL`, is
+/// not resumed: starting it kills it as an unhandled fault, which posts its
+/// death and address-space observers (docs/fault-handling.md § Delivery,
+/// Resume, and Kill).
+///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid
 /// (`InvalidCapability`) or lacks Control rights (`InsufficientRights`); if
@@ -1623,8 +1669,9 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 ///   intersection of this mask and the source cap's rights — pass `RIGHTS_ALL`
 ///   to copy with the same rights as the source.
 ///
-/// Returns the capability handle (slot index plus generation) in the destination
-/// `CSpace`.
+/// Returns the new capability's handle in the destination `CSpace` (slot
+/// index and generation, per docs/capability-model.md § Capability Handle
+/// Format).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
@@ -1815,11 +1862,13 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 /// invalid or stale, or an ancestor's revoke freed the capability while the
 /// move was in flight; `InsufficientRights` if the destination `CSpace` cap
 /// lacks Insert; `InvalidArgument` if `dest_index` is occupied or out of
-/// range; `OutOfMemory` if the destination's slot pool cannot back the slot
-/// (for a non-zero `dest_index`, every leaf up to that index must be
-/// backed; `QuotaExceeded` at the structural ceiling); `InvalidState` if a
-/// revoke or another move is in flight on the source, or the destination
-/// slot was freed mid-move (the source keeps the capability);
+/// range (including above `CAP_INDEX_MASK`); `OutOfMemory` if the
+/// destination's slot pool cannot back the slot (for a non-zero
+/// `dest_index`, every leaf up to that index must be backed;
+/// `QuotaExceeded` at the structural ceiling);
+/// `InvalidState` if a revoke, another move, or an IPC capability transfer
+/// is in flight on the source, or the destination slot was freed mid-move
+/// (the source keeps the capability);
 /// `Interrupted` if a concurrent deriver kept extending the child list past
 /// the kernel's batch backstop — the capability then lives in both slots,
 /// the destination a derived child of the source, and a `cap_revoke` on the
@@ -1853,27 +1902,43 @@ pub fn cap_move(src_cap: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u
 /// returns `InvalidCapability`; when the caller itself is bound to that
 /// `CSpace`, the caller is stopped and the call never returns.
 ///
-/// The kernel returns the inserted capability's handle (slot index plus
-/// generation), but this wrapper discards it and returns `Ok(())` (#443). The
-/// bare `dest_index` names the inserted capability only while the destination
-/// slot's generation is 0; once a recycle has advanced it, a later call that
-/// passes the bare `dest_index` fails with `InvalidCapability`.
+/// Returns the new capability's handle in the destination `CSpace`: its slot
+/// index is `dest_index` and its generation is the slot's current one, which
+/// advances each time the slot is recycled, so the handle, not the bare
+/// index, addresses the capability (docs/capability-model.md § Capability
+/// Handle Format).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
-/// lacks sufficient rights, `dest_index` is already occupied, or the
-/// destination `CSpace`'s slot pool cannot back every leaf up to
-/// `dest_index` (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
+/// lacks sufficient rights, `dest_index` is 0, already occupied, or out of
+/// range, including above `CAP_INDEX_MASK` (`InvalidArgument`; the wrapper
+/// returns it for 0 without a syscall), or the destination
+/// `CSpace`'s slot pool cannot back every leaf up to `dest_index`
+/// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
+/// `InvalidCapability` also covers a source a concurrent delete, move, or
+/// revoke freed before the copy was linked; `InvalidState` means a
+/// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
+/// source.
+// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
+// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
+// so it fits u32.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn cap_insert(
     src_slot: u32,
     dest_cspace_cap: u32,
     dest_index: u32,
     rights_mask: u64,
-) -> Result<(), i64>
+) -> Result<u32, i64>
 {
+    // The kernel reads a destination of 0 as "allocate a slot", which would
+    // place the copy elsewhere.
+    if dest_index == 0
+    {
+        return Err(SyscallError::InvalidArgument as i64);
+    }
     // SAFETY: syscall4 issues raw syscall instruction; all arguments are scalar u64 values
     // (source slot, dest CSpace cap, dest slot, rights mask); kernel validates and inserts cap
-    // at the caller-chosen slot.
+    // at the caller-chosen slot and returns its handle.
     let ret = unsafe {
         syscall4(
             SYS_CAP_COPY,
@@ -1883,7 +1948,7 @@ pub fn cap_insert(
             rights_mask,
         )
     };
-    if ret < 0 { Err(ret) } else { Ok(()) }
+    if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
 /// Query system information by `SystemInfoType` discriminant.
@@ -2269,6 +2334,24 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 /// known exceptions (#501) are listed in `core/kernel/docs/syscalls.md`
 /// § `SYS_THREAD_STOP`. A thread may stop itself (pass its own thread cap).
 ///
+/// If the thread is blocked on a fault, its fault episode is cancelled with a
+/// kill outcome, unless the handler's reply claimed it first, in which case
+/// that reply's outcome is kept; no syscall returns on the target, and the
+/// outcome takes effect at the next [`thread_start`], which kills the thread
+/// on a kill outcome and resumes its faulting instruction on
+/// `FAULT_REPLY_RESUME` (docs/fault-handling.md § Delivery, Resume, and
+/// Kill).
+///
+/// If the thread is running on another CPU, the call returns once that CPU
+/// has descheduled it and published its register save, or once an object
+/// teardown has made it `Exited`. A caller that is itself stopped while it
+/// waits returns at once when restarted if `thread_cap` no longer names the
+/// target with Control rights, even while the target still runs, and
+/// otherwise keeps waiting as above; [`thread_read_regs`] and
+/// [`thread_write_regs`] refuse such a target with `InvalidState` until it
+/// has left its CPU (`core/kernel/docs/syscalls.md`
+/// § `SYS_THREAD_STOP`).
+///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid or lacks
 /// Control rights, or `-15` (`InvalidState`) if the thread is not yet
@@ -2584,7 +2667,9 @@ pub fn thread_sleep(ms: u64) -> Result<(), i64>
 /// When the target thread exits (clean or fault), the kernel posts
 /// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
 /// `event_queue_cap`. Passing `correlator = 0` keeps the payload equal to
-/// the bare exit reason (low 32 bits): the pre-multi-bind behaviour.
+/// the bare exit reason (low 32 bits). If the thread has already exited, the
+/// kernel posts the retained reason to `event_queue_cap` at once and the call
+/// still succeeds.
 ///
 /// Multiple observers can be registered on the same thread — up to the
 /// kernel's per-TCB cap. Returns `SyscallError::OutOfMemory` (-8) if the
@@ -2621,24 +2706,31 @@ pub fn thread_bind_notification(
 
 /// Register a terminal-fault death-notification observer on an address space.
 ///
-/// When a thread in the target address space takes a *terminal* fault — any
-/// kill outcome of the fault protocol: no fault handler bound, a `KILL` reply,
-/// or a fault episode cancelled by destruction of the handler thread, by
-/// destruction of the handler endpoint while the fault is still queued on it,
-/// or by a later receive on the handler thread that passes its capability and
-/// headroom checks while the fault reply is pending; a stop of the faulting
-/// thread defers the terminal fault, cancelling the episode before any reply
-/// claims it or keeping a claimed `KILL`, and it takes effect, and is posted,
-/// only if the thread is started again (docs/fault-handling.md § Delivery,
-/// Resume, and Kill) — the kernel posts
-/// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
+/// When a thread in the target address space takes a *terminal* fault, the
+/// kernel posts `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
 /// `event_queue_cap`, where `exit_reason` is the fault class
 /// (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on
-/// riscv64). Normal `thread_exit` does NOT post to these
-/// observers. Passing `correlator = 0` keeps the payload equal to the bare
-/// fault class (low 32 bits). If the address space has already faulted
-/// terminally, the kernel posts the retained reason to `event_queue_cap` at
-/// once and the call still succeeds.
+/// riscv64). A terminal fault is any kill outcome of the fault protocol:
+///
+/// - no fault handler bound;
+/// - a `KILL` reply;
+/// - a fault episode cancelled by destruction of the handler thread;
+/// - a fault episode cancelled by destruction of the handler endpoint while
+///   the fault is still queued on it;
+/// - a fault episode cancelled by a later receive on the handler thread that
+///   passes its capability and headroom checks while the fault reply is
+///   pending.
+///
+/// A stop of the faulting thread defers the terminal fault: it cancels the
+/// episode before any reply claims it, or keeps a claimed `KILL`, and the
+/// fault takes effect, and is posted, only if the thread is started again
+/// (docs/fault-handling.md § Delivery, Resume, and Kill).
+///
+/// Normal `thread_exit` does NOT post to these observers. Passing
+/// `correlator = 0` keeps the payload equal to the bare fault class (low 32
+/// bits). If the address space has already faulted terminally, the kernel
+/// posts the retained reason to `event_queue_cap` at once and the call still
+/// succeeds.
 ///
 /// `aspace_cap` requires the `CONTROL` right; `event_queue_cap` requires the
 /// `POST` right. Multiple observers can be registered — up to the kernel's

@@ -142,8 +142,11 @@ pub fn copy(ctx: &TestContext) -> TestResult
 
 /// `cap_insert` places a copy at a caller-chosen slot index in another `CSpace`.
 ///
-/// Like `cap_copy` but the destination slot is explicit. We verify the source
-/// is unaffected (insert is a copy, not a move).
+/// Like `cap_copy` but the destination slot is explicit. We verify the returned
+/// handle names the requested slot, that a placement into a recycled slot of
+/// the caller's own `CSpace` returns a handle carrying the slot's new
+/// generation which addresses the copy while the old handle stays stale, and
+/// that the source is unaffected (insert is a copy, not a move).
 pub fn insert(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
@@ -151,8 +154,32 @@ pub fn insert(ctx: &TestContext) -> TestResult
     let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "create_cspace for insert test failed")?;
 
-    // Insert at slot 5 in dest_cs.
-    cap_insert(sig, dest_cs, 5, syscall::RIGHTS_ALL).map_err(|_| "cap_insert failed")?;
+    // Insert at slot 5 in dest_cs; the returned handle names that slot.
+    let handle =
+        cap_insert(sig, dest_cs, 5, syscall::RIGHTS_ALL).map_err(|_| "cap_insert failed")?;
+    if syscall_abi::cap_handle_index(handle) != 5
+    {
+        return Err("cap_insert handle does not name the requested slot");
+    }
+
+    let old = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for recycled-slot insert failed")?;
+    cap_delete(old).map_err(|_| "cap_delete before recycled-slot insert failed")?;
+    let index = syscall_abi::cap_handle_index(old);
+    let recycled = cap_insert(sig, ctx.cspace_cap, index, syscall::RIGHTS_ALL)
+        .map_err(|_| "cap_insert into recycled slot failed")?;
+    let stale_ok = notification_send(old, 0x1).is_ok();
+    let fresh_ok = notification_send(recycled, 0x1).is_ok();
+    cap_delete(recycled).map_err(|_| "cap_delete recycled insert failed")?;
+    if syscall_abi::cap_handle_index(recycled) != index
+        || syscall_abi::cap_handle_gen(recycled) == syscall_abi::cap_handle_gen(old)
+    {
+        return Err("cap_insert into recycled slot returned a stale-generation handle");
+    }
+    if stale_ok || !fresh_ok
+    {
+        return Err("cap_insert handle into recycled slot does not address the copy");
+    }
 
     // Source slot is preserved (insert = copy, not move).
     notification_send(sig, 0x1)
@@ -486,22 +513,20 @@ pub fn move_large_subtree(ctx: &TestContext) -> TestResult
         };
         let grandchild = grandchild.ok_or("move_large_subtree built no grandchild")?;
 
-        // Explicit mode targets a just-freed index; the kernel decodes the
-        // placement index from the stale handle without a generation check.
+        // Explicit mode targets a just-freed index.
         let dest_index = if explicit
         {
             let t = cap_create_notification(ctx.memory_base)
                 .map_err(|_| "create_notification (placement) failed")?;
             cap_delete(t).map_err(|_| "cap_delete (placement) failed")?;
-            t
+            syscall_abi::cap_handle_index(t)
         }
         else
         {
             0
         };
         let moved = cap_move(sig, ctx.cspace_cap, dest_index).map_err(|_| "cap_move failed")?;
-        if explicit
-            && syscall_abi::cap_handle_index(moved) != syscall_abi::cap_handle_index(dest_index)
+        if explicit && syscall_abi::cap_handle_index(moved) != dest_index
         {
             return Err("explicit cap_move landed at another index");
         }
@@ -628,7 +653,8 @@ pub fn delete_null_slot_ok(ctx: &TestContext) -> TestResult
 
 // ── SYS_CAP_COPY explicit slot negative (out of bounds) ──────────────────────
 
-/// `cap_insert` with a slot index beyond the destination `CSpace` capacity must fail.
+/// `cap_insert` with a slot index beyond the destination `CSpace` capacity, or
+/// outside the handle's index field, must fail.
 pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
@@ -644,8 +670,47 @@ pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
         return Err("cap_insert at out-of-bounds slot should fail");
     }
 
+    // The wrapper refuses index 0, which the kernel reads as "allocate a
+    // slot"; the kernel refuses an index above the handle's index field.
+    let invalid = SyscallError::InvalidArgument as i64;
+    let above_field = (syscall_abi::CAP_INDEX_MASK + 1) | 5;
+    if cap_insert(sig, dest_cs, 0, syscall::RIGHTS_ALL) != Err(invalid)
+        || cap_insert(sig, dest_cs, above_field, syscall::RIGHTS_ALL) != Err(invalid)
+    {
+        return Err("cap_insert with slot 0 or an index above CAP_INDEX_MASK should fail");
+    }
+
     cap_delete(sig).map_err(|_| "cap_delete sig after insert_oob test failed")?;
     cap_delete(dest_cs).map_err(|_| "cap_delete dest_cs after insert_oob test failed")?;
+    Ok(())
+}
+
+// ── SYS_CAP_MOVE explicit slot negative (out of bounds) ──────────────────────
+
+/// `cap_move` to an index with bits above the handle's index field must fail
+/// with `InvalidArgument`, not land in the slot its low bits name, and leave
+/// the source in place.
+pub fn move_out_of_bounds_err(ctx: &TestContext) -> TestResult
+{
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for move_oob test failed")?;
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4)
+        .map_err(|_| "create_cspace for move_oob test failed")?;
+
+    let above_field = (syscall_abi::CAP_INDEX_MASK + 1) | 5;
+    let moved = cap_move(sig, dest_cs, above_field);
+    let source_kept = notification_send(sig, 0x1).is_ok();
+
+    cap_delete(sig).ok();
+    cap_delete(dest_cs).map_err(|_| "cap_delete dest_cs after move_oob test failed")?;
+    if moved != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("cap_move to an index above CAP_INDEX_MASK should fail");
+    }
+    if !source_kept
+    {
+        return Err("refused cap_move left the source slot empty");
+    }
     Ok(())
 }
 

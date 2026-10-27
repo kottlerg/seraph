@@ -1375,7 +1375,7 @@ fn pre_grow_for_explicit_slot(
 /// otherwise the cap is placed at the caller-chosen index — init populates
 /// well-known slots in child `CSpaces` this way.
 ///
-/// Returns the destination capability handle (slot index plus generation).
+/// Returns the new capability's handle in the destination `CSpace`.
 #[cfg(not(test))]
 pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1385,9 +1385,14 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let src_handle = tf.arg(0) as u32;
     let src_idx = syscall::cap_handle_index(src_handle);
     let dest_cs_idx = tf.arg(1) as u32;
-    // Destination is a placement index (slot may be empty), not a live handle:
-    // decode the index, but do not generation-check it.
-    let dest_slot_idx = syscall::cap_handle_index(tf.arg(2) as u32);
+    // Destination is a placement index (slot may be empty), not a live handle,
+    // so it is not generation-checked; a value outside the handle's index
+    // field is out of range rather than truncated to a different slot.
+    let dest_slot_idx = match u32::try_from(tf.arg(2))
+    {
+        Ok(idx) if idx <= syscall::CAP_INDEX_MASK => idx,
+        _ => return Err(SyscallError::InvalidArgument),
+    };
     let rights_mask = Rights(tf.arg(3) as u32);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
@@ -2284,9 +2289,15 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let src_handle = tf.arg(0) as u32;
     let src_idx = syscall::cap_handle_index(src_handle);
     let dest_cs_idx = tf.arg(1) as u32;
-    // Destination is a placement index (slot may be empty), not a live handle:
-    // decode the index, but do not generation-check it. 0 = auto-allocate.
-    let dest_idx = syscall::cap_handle_index(tf.arg(2) as u32);
+    // Destination is a placement index (slot may be empty), not a live handle,
+    // so it is not generation-checked; a value outside the handle's index
+    // field is out of range rather than truncated to a different slot.
+    // 0 = auto-allocate.
+    let dest_idx = match u32::try_from(tf.arg(2))
+    {
+        Ok(idx) if idx <= syscall::CAP_INDEX_MASK => idx,
+        _ => return Err(SyscallError::InvalidArgument),
+    };
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };

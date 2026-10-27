@@ -20,10 +20,13 @@ covers it.
 ### Address Calculation
 
 ```
-offset = (bus << 20) | (device << 15) | (function << 12) + register
+offset = ((bus - start_bus) << 20) | (device << 15) | (function << 12) | register
 ```
 
-Each function occupies 4 KiB (one page). The bus range is the
+The offset is from the window's `phys_base`, the configuration space of
+`start_bus`; an MCFG entry's base address is where bus 0 would decode, so
+devmgr places the window `start_bus` MiB above it. Each function occupies
+4 KiB (one page). The bus range is the
 `EcamLocation`'s `start_bus` / `end_bus` fields: the MCFG entry's start and
 end bus numbers; for a DTB node, bus 0 through the last bus the `reg` size
 covers (capped at 255; a `reg` smaller than one bus yields no ECAM); for the

@@ -11,8 +11,9 @@
 //! * `caps[0]` = pwrmgr's own service endpoint (RECV; the SHUTDOWN/REBOOT
 //!   receive end). svcmgr holds the persistent source and publishes
 //!   `pwrmgr.shutdown` / `pwrmgr.deny` SENDs against it.
-//! * `caps[1]` = `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's
-//!   registry endpoint (from `pwrmgr.svc` `seed = devmgr.registry`).
+//! * `caps[1]` = `REGISTRY_QUERY_AUTHORITY | SHUTDOWN_DEVICE_AUTHORITY`-badged
+//!   SEND on devmgr's registry endpoint (from `pwrmgr.svc`
+//!   `seed = devmgr.shutdown`).
 //!
 //! pwrmgr owns no hardware caps directly. It acquires its shutdown
 //! actuator caps from devmgr "as if it were a device driver": the ACPI

@@ -24,7 +24,10 @@ pub mod dtb;
 #[derive(Clone, Copy, Debug)]
 pub struct EcamLocation
 {
+    /// Physical address of `start_bus`'s configuration space: the start of
+    /// the window.
     pub phys_base: u64,
+    /// Window size in bytes: 1 MiB per bus of `start_bus..=end_bus`.
     pub size: u64,
     /// Lowest PCI bus number covered by the ECAM.
     pub start_bus: u8,

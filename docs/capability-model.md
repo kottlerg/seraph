@@ -218,9 +218,8 @@ IoPort capabilities are not creatable at runtime. Init keeps the root and hands 
 derivation, and devmgr narrows it with `SYS_IOPORT_SPLIT` and gives each driver only its assigned
 port range (see
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md)). devmgr's
-`QUERY_SHUTDOWN_DEVICE` also serves a caller-chosen 2-port window plus the 8042 reset port to any
-`REGISTRY_QUERY_AUTHORITY` holder, not only pwrmgr
-([#446](https://github.com/kottlerg/seraph/issues/446)).
+`QUERY_SHUTDOWN_DEVICE` also serves the FADT's 2-port PM1a control window plus the 8042 reset
+port, only to a caller whose badge carries `SHUTDOWN_DEVICE_AUTHORITY` (pwrmgr).
 
 Revoking an IoPort capability removes port access from all threads it has
 been bound to; the kernel tracks bindings and updates each affected thread's IOPB
@@ -272,10 +271,9 @@ IRQ resources devmgr already brokers). The remaining sanctioned rights are carri
 cap and are unreachable after init's reap: **Dbcn** is thrown away by design (the userspace serial
 driver owns the console; forwarding the firmware console would bypass the console-ownership model),
 and **Cppc** / **Base** / **Pmu** are simply not needed by any current service. devmgr serves pwrmgr
-a derivation further narrowed to **Reset** only (system reset / reboot), and serves it to any
-`REGISTRY_QUERY_AUTHORITY` holder, not only pwrmgr
-([#446](https://github.com/kottlerg/seraph/issues/446)); **Suspend** is retained against a future
-power-management path but delegated to no one today. See
+a derivation further narrowed to **Reset** only (system reset / reboot), gated on the
+`SHUTDOWN_DEVICE_AUTHORITY` badge bit only pwrmgr's registry cap carries; **Suspend** is
+retained against a future power-management path but delegated to no one today. See
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md).
 
 **Gating-granularity decision.** Per-cap authority is encoded as rights bits, not

@@ -3,7 +3,7 @@
 
 // services/devmgr/firmware/src/acpi.rs
 
-//! Narrow ACPI walk: RSDP → XSDT → MCFG.
+//! Narrow ACPI walk: RSDP → XSDT → MCFG, plus the FADT's `PM1a_CNT_BLK`.
 //!
 //! Operates on byte-slice views of ACPI tables — the caller is responsible
 //! for mapping RSDP / XSDT pages into its address space first. No alloc.
@@ -16,6 +16,8 @@ use super::EcamLocation;
 // ── Layout constants ──────────────────────────────────────────────────
 
 const RSDP_SIG: &[u8; 8] = b"RSD PTR ";
+/// Bytes of an ACPI 2.0+ RSDP that [`rsdp_xsdt_phys`] reads.
+pub const RSDP_LEN: usize = 36;
 const RSDP_OFF_REVISION: usize = 15;
 const RSDP_OFF_XSDT: usize = 24;
 
@@ -24,6 +26,9 @@ const SDT_OFF_LENGTH: usize = 4;
 
 const MCFG_ENTRIES_OFF: usize = SDT_HDR_LEN + 8;
 const MCFG_ENTRY_SIZE: usize = 16;
+
+/// FADT `PM1a_CNT_BLK` (ACPI 6.x section 5.2.9): a 32-bit I/O port number.
+const FADT_OFF_PM1A_CNT_BLK: usize = 64;
 
 // ── Byte-read helpers ─────────────────────────────────────────────────
 
@@ -68,7 +73,7 @@ fn read_u64(buf: &[u8], off: usize) -> u64
 #[must_use]
 pub fn rsdp_xsdt_phys(rsdp_bytes: &[u8]) -> Option<u64>
 {
-    if rsdp_bytes.len() < 36 || &rsdp_bytes[..8] != RSDP_SIG
+    if rsdp_bytes.len() < RSDP_LEN || &rsdp_bytes[..8] != RSDP_SIG
     {
         return None;
     }
@@ -125,9 +130,34 @@ pub fn iter_xsdt_entries(xsdt_bytes: &[u8]) -> impl Iterator<Item = u64> + '_
     (0..entry_count).map(move |i| read_u64(xsdt_bytes, entries_off + i * 8))
 }
 
+// ── FADT → PM1a ────────────────────────────────────────────────────────
+
+/// Read the FADT's `PM1a_CNT_BLK` I/O port.
+///
+/// Returns `None` if the signature isn't `FACP`, the table (bounded by its
+/// reported length and the slice) does not reach the field, or the port is
+/// zero or wider than 16 bits.
+#[must_use]
+pub fn fadt_pm1a_cnt_blk(fadt_bytes: &[u8]) -> Option<u16>
+{
+    if sdt_signature(fadt_bytes) != *b"FACP"
+    {
+        return None;
+    }
+    let total_len = (sdt_length(fadt_bytes)? as usize).min(fadt_bytes.len());
+    if total_len < FADT_OFF_PM1A_CNT_BLK + 4
+    {
+        return None;
+    }
+    let port = u16::try_from(read_u32(fadt_bytes, FADT_OFF_PM1A_CNT_BLK)).ok()?;
+    if port == 0 { None } else { Some(port) }
+}
+
 // ── MCFG → ECAM ────────────────────────────────────────────────────────
 
-/// Extract the first MCFG allocation entry.
+/// Extract the first MCFG allocation entry. The entry's base address is
+/// where bus 0 would decode; the returned `phys_base` is the start of the
+/// window, at `start_bus`.
 ///
 /// Returns `None` if the signature isn't `MCFG`, no entry is present, or
 /// the entry has a zero base or an end bus below its start bus.
@@ -165,7 +195,7 @@ pub fn parse_mcfg_ecam(mcfg_bytes: &[u8]) -> Option<EcamLocation>
     let bus_count = u64::from(end_bus) - u64::from(start_bus) + 1;
     let size = bus_count * 256 * 4096;
     Some(EcamLocation {
-        phys_base: base,
+        phys_base: base + (u64::from(start_bus) << 20),
         size,
         start_bus,
         end_bus,
@@ -177,9 +207,9 @@ mod tests
 {
     use super::*;
 
-    fn rsdp(revision: u8, xsdt: u64) -> [u8; 36]
+    fn rsdp(revision: u8, xsdt: u64) -> [u8; RSDP_LEN]
     {
-        let mut b = [0u8; 36];
+        let mut b = [0u8; RSDP_LEN];
         b[..8].copy_from_slice(RSDP_SIG);
         b[RSDP_OFF_REVISION] = revision;
         b[RSDP_OFF_XSDT..RSDP_OFF_XSDT + 8].copy_from_slice(&xsdt.to_le_bytes());
@@ -276,6 +306,44 @@ mod tests
         assert_eq!(iter_xsdt_entries(&b).count(), 0);
     }
 
+    fn fadt(len: u32, pm1a: u32) -> Vec<u8>
+    {
+        let mut b = sdt(b"FACP", len);
+        if b.len() >= FADT_OFF_PM1A_CNT_BLK + 4
+        {
+            b[FADT_OFF_PM1A_CNT_BLK..FADT_OFF_PM1A_CNT_BLK + 4]
+                .copy_from_slice(&pm1a.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn fadt_yields_its_pm1a_control_port()
+    {
+        assert_eq!(fadt_pm1a_cnt_blk(&fadt(244, 0x604)), Some(0x604));
+    }
+
+    #[test]
+    fn non_fadt_table_yields_no_pm1a_port()
+    {
+        let mut b = fadt(244, 0x604);
+        b[..4].copy_from_slice(b"APIC");
+        assert_eq!(fadt_pm1a_cnt_blk(&b), None);
+    }
+
+    #[test]
+    fn fadt_too_short_for_the_field_yields_no_pm1a_port()
+    {
+        assert_eq!(fadt_pm1a_cnt_blk(&fadt(67, 0)), None);
+    }
+
+    #[test]
+    fn fadt_with_zero_or_wide_pm1a_port_yields_none()
+    {
+        assert_eq!(fadt_pm1a_cnt_blk(&fadt(244, 0)), None);
+        assert_eq!(fadt_pm1a_cnt_blk(&fadt(244, 0x1_0000)), None);
+    }
+
     #[test]
     fn mcfg_entry_yields_ecam_sized_by_its_bus_range()
     {
@@ -283,6 +351,16 @@ mod tests
         assert_eq!(
             (loc.phys_base, loc.size, loc.start_bus, loc.end_bus),
             (0xB000_0000, 256 << 20, 0, 255)
+        );
+    }
+
+    #[test]
+    fn mcfg_entry_starting_above_bus_zero_places_the_window_at_its_start_bus()
+    {
+        let loc = parse_mcfg_ecam(&mcfg(0xB000_0000, 2, 3)).unwrap();
+        assert_eq!(
+            (loc.phys_base, loc.size, loc.start_bus, loc.end_bus),
+            (0xB000_0000 + (2 << 20), 2 << 20, 2, 3)
         );
     }
 

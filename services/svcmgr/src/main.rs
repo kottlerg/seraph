@@ -36,9 +36,9 @@ use ipc::{IpcMessage, svcmgr_labels};
 use service::{MAX_SERVICES, RestartRecipe, ServiceEntry, bootstrap_caps};
 use std::os::seraph::{StartupInfo, startup_info};
 
-/// Global discovery registry size. Enough for a handful of top-level named
-/// endpoints (vfsd, logd, procmgr, …) plus slack.
-const REGISTRY_CAPACITY: usize = 8;
+/// Global discovery registry size. Enough for the well-known names svcmgr
+/// publishes itself and the providers' `provides` names, plus slack.
+const REGISTRY_CAPACITY: usize = 16;
 
 /// Maximum services init may pre-register before
 /// [`svcmgr_labels::HANDOVER_COMPLETE`] runs reconciliation. Sized to
@@ -230,33 +230,54 @@ fn publish_well_known(
         Err(_) => std::os::seraph::log!("derive svcmgr SEND failed"),
     }
 
-    // devmgr.registry — `REGISTRY_QUERY_AUTHORITY`-badged SEND minted from
-    // the endowed badge-0 `SEND|GRANT` source. The badge bit rides through
-    // `registry_lookup_derived`'s plain `cap_derive` to consumers.
-    if caps.devmgr_registry != 0
+    // devmgr.registry / devmgr.shutdown / devmgr.test — badged SENDs minted
+    // from the endowed badge-0 `SEND|GRANT` source. The badge bits ride
+    // through `registry_lookup_derived`'s plain `cap_derive` to consumers;
+    // only the seeding recipes (pwrmgr, svctest) receive the extra bits.
+    let query = ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY;
+    for (name, badge) in [
+        (ipc::published_names::DEVMGR_REGISTRY, query),
+        (
+            ipc::published_names::DEVMGR_SHUTDOWN,
+            query | ipc::devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY,
+        ),
+        (
+            ipc::published_names::DEVMGR_TEST,
+            query | ipc::devmgr_labels::ORPHAN_TEST_AUTHORITY,
+        ),
+    ]
     {
-        match syscall::cap_derive_badge(
-            caps.devmgr_registry,
-            syscall::RIGHTS_EP_SEND,
-            ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
-        )
-        {
-            Ok(send) =>
-            {
-                if registry
-                    .publish(ipc::published_names::DEVMGR_REGISTRY, send)
-                    .is_err()
-                {
-                    std::os::seraph::log!("publish devmgr.registry failed");
-                    let _ = syscall::cap_delete(send);
-                }
-            }
-            Err(_) => std::os::seraph::log!("derive devmgr.registry cap failed"),
-        }
+        publish_devmgr_registry_send(registry, caps.devmgr_registry, name, badge);
     }
-    else
+}
+
+/// Publish `name` as a `badge`-badged SEND minted from the endowed
+/// devmgr-registry `source`; logs and skips when the source is absent or
+/// the derive or publish fails.
+fn publish_devmgr_registry_send(
+    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    source: u32,
+    name: &[u8],
+    badge: u64,
+)
+{
+    let shown = core::str::from_utf8(name).unwrap_or("?");
+    if source == 0
     {
-        std::os::seraph::log!("no devmgr.registry source cap; not published");
+        std::os::seraph::log!("no devmgr-registry source cap; {shown} not published");
+        return;
+    }
+    match syscall::cap_derive_badge(source, syscall::RIGHTS_EP_SEND, badge)
+    {
+        Ok(send) =>
+        {
+            if registry.publish(name, send).is_err()
+            {
+                std::os::seraph::log!("publish {shown} failed");
+                let _ = syscall::cap_delete(send);
+            }
+        }
+        Err(_) => std::os::seraph::log!("derive {shown} cap failed"),
     }
 }
 

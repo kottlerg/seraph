@@ -44,7 +44,9 @@ kind in `data[0]`:
 | data[1] | `SVCMGR_LABELS_VERSION` (currently `5`) handshake |
 
 svcmgr mints the `devmgr.registry` publish cap
-(`REGISTRY_QUERY_AUTHORITY`) and the `SET_DRIVERS_DIR` cap
+(`REGISTRY_QUERY_AUTHORITY`), the `devmgr.shutdown` and `devmgr.test`
+publish caps (`REGISTRY_QUERY_AUTHORITY` plus `SHUTDOWN_DEVICE_AUTHORITY`
+or `ORPHAN_TEST_AUTHORITY`), and the `SET_DRIVERS_DIR` cap
 (`DRIVERS_DIR_AUTHORITY`) from caps[3]. A version mismatch in `data[1]`
 aborts bootstrap (svcmgr exits).
 
@@ -82,7 +84,8 @@ bind death-notification at endowment time — the matching `.svc`
 definition is paired at reconciliation, on
 [`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
 endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
-`svcmgr`, `devmgr.registry`) into its own registry and installs devmgr's
+`svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`) into its own
+registry and installs devmgr's
 `/services/drivers/` cap via `SET_DRIVERS_DIR`, before entering the event
 loop.
 
@@ -192,7 +195,7 @@ freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint.
 `svcmgr_labels::PUBLISH_AUTHORITY` is a verb-bit (the top bit of the
 caller's cap badge) gating `PUBLISH_ENDPOINT` for *external* publishers.
 svcmgr publishes the well-known names it owns (`rootfs.root`, `svcmgr`,
-`devmgr.registry`, and each provider's `provides` names) directly into
+the three `devmgr.*` names, and each provider's `provides` names) directly into
 its own registry, so those need no badge. The gate exists for a future
 external publisher — devmgr holds a `PUBLISH_AUTHORITY`-badged SEND from
 its bootstrap bundle, reserved for driver registrations. The SEND

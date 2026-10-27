@@ -987,8 +987,8 @@ pub struct SvcmgrEndowment
 /// rights) and the publish-role source caps: a `SEND` on the root
 /// filesystem namespace endpoint (svcmgr publishes it as `rootfs.root`) and
 /// a badge-0 `SEND|GRANT` source on devmgr's registry endpoint (svcmgr mints
-/// the `REGISTRY_QUERY_AUTHORITY` `devmgr.registry` publish cap and the
-/// `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from it). An absent source
+/// the `devmgr.registry` / `devmgr.shutdown` / `devmgr.test` publish caps and
+/// the `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from it). An absent source
 /// cap rides as a zero slot, which svcmgr tolerates.
 ///
 /// Each `SUBSTRATE` round then delivers one init-bootstrapped service's
@@ -1189,7 +1189,7 @@ pub fn phase3_svcmgr_handover(
     // carries that service's (name, thread_cap) for death-supervision
     // binding, and the terminal round carries the reserved log-sink sources.
     // svcmgr drains it all in `bootstrap_caps`, publishes the well-known
-    // names it owns (`rootfs.root` / `svcmgr` / `devmgr.registry`), installs
+    // names it owns (`rootfs.root` / `svcmgr` / the `devmgr.*` names), installs
     // devmgr's drivers dir, and reconciles `/config/svcmgr/services/` on
     // HANDOVER_COMPLETE — launching logd/timed/pwrmgr and acquiring their
     // caps for them.

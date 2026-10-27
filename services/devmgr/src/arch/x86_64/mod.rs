@@ -8,7 +8,7 @@
 use ipc::IpcMessage;
 
 use crate::caps::DevmgrCaps;
-use crate::reply_status;
+use crate::{locate_table_by_sig, reply_status, with_acpi_table};
 use firmware::EcamLocation;
 
 /// Arch-specific authority caps devmgr holds after bootstrap.
@@ -19,7 +19,7 @@ pub struct ArchCaps
     // per-driver narrow copies for ISA peripherals (CMOS RTC at ports
     // 0x70-0x71; COM1 at 0x3F8-0x3FF for serial) and, on
     // `QUERY_SHUTDOWN_DEVICE`, the PM1a + 8042-reset ports for pwrmgr.
-    ioport_root_cap: u32,
+    ioport_cap: u32,
 }
 
 impl ArchCaps
@@ -27,14 +27,14 @@ impl ArchCaps
     /// No authority held; filled by [`Self::absorb_shutdown_authority`].
     pub const fn empty() -> Self
     {
-        Self { ioport_root_cap: 0 }
+        Self { ioport_cap: 0 }
     }
 
     /// Store the `SVCMGR_BUNDLE` round's shutdown-authority cap: on x86-64,
     /// the full-rights `IoPort` derivation.
     pub fn absorb_shutdown_authority(&mut self, cap: u32)
     {
-        self.ioport_root_cap = cap;
+        self.ioport_cap = cap;
     }
 }
 
@@ -75,7 +75,7 @@ pub fn intx_fallback_gsi(_pin: u8, _dev: u8) -> Option<u32>
 /// cap or a derive or split fails.
 pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u32>
 {
-    ioport_carve(caps.arch.ioport_root_cap, 0x3F8, 8)
+    ioport_carve(caps.arch.ioport_cap, 0x3F8, 8)
 }
 
 /// Carve the platform RTC's hardware-authority cap: the legacy MC146818
@@ -85,33 +85,42 @@ pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u32>
 /// devmgr holds no `IoPort` cap or a derive or split fails.
 pub fn carve_rtc_authority(caps: &mut DevmgrCaps) -> Option<u32>
 {
-    ioport_carve(caps.arch.ioport_root_cap, 0x70, 2)
+    ioport_carve(caps.arch.ioport_cap, 0x70, 2)
 }
 
 /// Reply to an authorised, version-checked `QUERY_SHUTDOWN_DEVICE` with
 /// pwrmgr's shutdown actuator caps: a narrow `IoPort` over the
 /// caller-supplied `PM1a` control port (`msg` word 1) plus the 8042 reset
-/// port. Replies `NO_DEVICE` when either carve fails, including a word 1
-/// that is not a 16-bit port number.
+/// port. Replies `INVALID_REQUEST` when word 1 is not the FADT's
+/// `PM1a_CNT_BLK`, and `NO_DEVICE` when the FADT field cannot be read or
+/// either carve fails.
 pub fn reply_shutdown_device(caps: &DevmgrCaps, msg: &IpcMessage, ipc_buf: *mut u64)
 {
     // 8042 KBC command port — the 1-byte reset register pwrmgr pulses
-    // for reboot. The PM1a control port is FADT-derived, so pwrmgr
-    // computes it and passes it here; devmgr only carves.
+    // for reboot.
     const KBC_COMMAND_PORT: u16 = 0x64;
-    let Ok(pm1a) = u16::try_from(msg.word(1))
+    // pwrmgr computes the PM1a control port from the FADT; devmgr checks
+    // it against its own read of the same field so the request cannot
+    // name any other port.
+    let Some(pm1a) = locate_table_by_sig(caps, *b"FACP")
+        .and_then(|fadt| with_acpi_table(caps, fadt, firmware::acpi::fadt_pm1a_cnt_blk))
     else
     {
         reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
         return;
     };
-    let Some(pm1a_cap) = ioport_carve(caps.arch.ioport_root_cap, pm1a, 2)
+    if msg.word(1) != u64::from(pm1a)
+    {
+        reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+        return;
+    }
+    let Some(pm1a_cap) = ioport_carve(caps.arch.ioport_cap, pm1a, 2)
     else
     {
         reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
         return;
     };
-    let Some(kbc_cap) = ioport_carve(caps.arch.ioport_root_cap, KBC_COMMAND_PORT, 1)
+    let Some(kbc_cap) = ioport_carve(caps.arch.ioport_cap, KBC_COMMAND_PORT, 1)
     else
     {
         let _ = syscall::cap_delete(pm1a_cap);
@@ -131,19 +140,19 @@ pub fn reply_shutdown_device(caps: &DevmgrCaps, msg: &IpcMessage, ipc_buf: *mut 
 }
 
 /// Carve a narrow `IoPort` of `count` ports starting at `base` out of
-/// devmgr's full-rights `IoPort` cap via two `ioport_split` calls. Returns
-/// the narrow slot; the unused slabs are deleted, except that an
-/// overflowing `base + count` leaks the derived working cap (#446). `cap_derive`-copies the
-/// source so it stays intact for further carves. `root_cap` is that
-/// full-rights cap.
-fn ioport_carve(root_cap: u32, base: u16, count: u16) -> Option<u32>
+/// devmgr's full-rights `IoPort` cap (`source_cap`) via two `ioport_split`
+/// calls. Returns the narrow slot, or `None` when `source_cap` is zero,
+/// `base + count` overflows, or a derive or split fails; every unused slab
+/// is deleted. `cap_derive`-copies the source so it stays intact for
+/// further carves.
+fn ioport_carve(source_cap: u32, base: u16, count: u16) -> Option<u32>
 {
-    if root_cap == 0
+    if source_cap == 0
     {
         return None;
     }
-    let working = syscall::cap_derive(root_cap, syscall::RIGHTS_ALL).ok()?;
     let upper_split_at = base.checked_add(count)?;
+    let working = syscall::cap_derive(source_cap, syscall::RIGHTS_ALL).ok()?;
     let Ok((lower_unused, upper)) = syscall::ioport_split(working, base)
     else
     {

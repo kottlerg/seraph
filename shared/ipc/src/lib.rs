@@ -893,6 +893,19 @@ pub mod published_names
     /// with; the `REGISTRY_QUERY_AUTHORITY` badge bit is preserved
     /// through svcmgr's plain `cap_derive` in `registry_lookup_derived`.
     pub const DEVMGR_REGISTRY: &[u8] = b"devmgr.registry";
+
+    /// SEND on devmgr's registry endpoint badged
+    /// `REGISTRY_QUERY_AUTHORITY | SHUTDOWN_DEVICE_AUTHORITY`: the
+    /// `devmgr.registry` surface plus `QUERY_SHUTDOWN_DEVICE`. Seeded only
+    /// by pwrmgr, which acquires the platform shutdown actuators through it.
+    pub const DEVMGR_SHUTDOWN: &[u8] = b"devmgr.shutdown";
+
+    /// TODO(#165): remove with devmgr's test labels. SEND on devmgr's
+    /// registry endpoint badged
+    /// `REGISTRY_QUERY_AUTHORITY | ORPHAN_TEST_AUTHORITY`: the
+    /// `devmgr.registry` surface plus the `TEST_SPAWN_ORPHAN` /
+    /// `TEST_ORPHAN_RESULT` fault-injection shim. Seeded only by svctest.
+    pub const DEVMGR_TEST: &[u8] = b"devmgr.test";
 }
 
 pub const RTC_LABELS_VERSION: u32 = 1;
@@ -1313,7 +1326,7 @@ pub mod fs_labels
     pub const FS_TRUNCATE: u64 = 17;
 }
 
-pub const DEVMGR_LABELS_VERSION: u32 = 7;
+pub const DEVMGR_LABELS_VERSION: u32 = 8;
 /// IPC labels for the device manager (`devmgr`).
 pub mod devmgr_labels
 {
@@ -1430,14 +1443,15 @@ pub mod devmgr_labels
 
     /// Carve and serve the platform shutdown-actuator hardware caps.
     ///
-    /// devmgr is the hardware authority; it carves the exact ports the
-    /// power manager asks for and performs no shutdown logic. The caller
-    /// (`pwrmgr`) has already parsed the ACPI tables (served via
-    /// [`QUERY_ACPI_TABLE`]) and computed the `PM1a` control port it needs.
+    /// devmgr is the hardware authority; it carves the ports the power
+    /// manager needs and performs no shutdown logic. The caller (`pwrmgr`)
+    /// has already parsed the ACPI tables (served via [`QUERY_ACPI_TABLE`])
+    /// and computed the `PM1a` control port it needs; devmgr serves that
+    /// port only when it is the FADT's `PM1a_CNT_BLK`.
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
-    /// `data[1]` = the 16-bit `PM1a` control port (x86-64; ignored on RISC-V).
-    /// Caller's badge MUST carry [`REGISTRY_QUERY_AUTHORITY`]; the handler
+    /// `data[1]` = the `PM1a` control port (x86-64; ignored on RISC-V).
+    /// Caller's badge MUST carry [`SHUTDOWN_DEVICE_AUTHORITY`]; the handler
     /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
     /// Reply ([`super::devmgr_errors::SUCCESS`]):
@@ -1450,11 +1464,12 @@ pub mod devmgr_labels
     ///   `SbiControl` cap (SBI SRST authority).
     ///
     /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails,
-    /// `data[1]` does not fit in `u16` (x86-64), or the platform authority
-    /// cap is absent,
-    /// [`super::devmgr_errors::INVALID_REQUEST`] when the RISC-V Reset-only
-    /// derivation fails, and [`super::devmgr_errors::LABEL_VERSION_MISMATCH`]
-    /// when `data[0]` is not `DEVMGR_LABELS_VERSION`.
+    /// the FADT or its `PM1a_CNT_BLK` cannot be read (x86-64), or the
+    /// platform authority cap is absent,
+    /// [`super::devmgr_errors::INVALID_REQUEST`] when `data[1]` is not the
+    /// FADT's `PM1a_CNT_BLK` (x86-64) or the RISC-V Reset-only derivation
+    /// fails, and [`super::devmgr_errors::LABEL_VERSION_MISMATCH`] when
+    /// `data[0]` is not `DEVMGR_LABELS_VERSION`.
     pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 
     /// Query for the keyboard/input device endpoint.
@@ -1474,12 +1489,18 @@ pub mod devmgr_labels
     /// handler replies `SUCCESS` immediately (the forced-failure spawn does
     /// nested `ipc_call`s that would clobber the reply context), then forces a
     /// round-2 bootstrap failure and stashes the outcome for
-    /// [`TEST_ORPHAN_RESULT`].
+    /// [`TEST_ORPHAN_RESULT`]. Request: `data[0]` = caller's compiled
+    /// [`super::DEVMGR_LABELS_VERSION`]. Caller's badge MUST carry
+    /// [`ORPHAN_TEST_AUTHORITY`]; the handler replies
+    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise and
+    /// [`super::devmgr_errors::LABEL_VERSION_MISMATCH`] on a version
+    /// mismatch, without spawning.
     pub const TEST_SPAWN_ORPHAN: u64 = 9;
     /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
     /// label: report the last [`TEST_SPAWN_ORPHAN`] outcome in reply `data[0]`
     /// — `0` not run, `1` spawn failed as expected (unwind fired), `2`
-    /// unexpected success, `3` shim setup error.
+    /// unexpected success, `3` shim setup error. Request and gate as
+    /// [`TEST_SPAWN_ORPHAN`].
     pub const TEST_ORPHAN_RESULT: u64 = 10;
 
     /// Authority bit in the devmgr-registry-endpoint badge's high
@@ -1497,6 +1518,18 @@ pub mod devmgr_labels
     /// `SET_DRIVERS_DIR`. Disjoint position from
     /// [`REGISTRY_QUERY_AUTHORITY`].
     pub const DRIVERS_DIR_AUTHORITY: u64 = 1u64 << 62;
+    /// Authority bit gating [`QUERY_SHUTDOWN_DEVICE`]. svcmgr mints it,
+    /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
+    /// as [`crate::published_names::DEVMGR_SHUTDOWN`] (seeded by pwrmgr), so
+    /// a `devmgr.registry` holder cannot acquire the shutdown actuators.
+    /// Disjoint position from the other authority bits.
+    pub const SHUTDOWN_DEVICE_AUTHORITY: u64 = 1u64 << 61;
+    /// TODO(#165): remove with the test labels. Authority bit gating
+    /// [`TEST_SPAWN_ORPHAN`] and [`TEST_ORPHAN_RESULT`]. svcmgr mints it,
+    /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
+    /// as [`crate::published_names::DEVMGR_TEST`] (seeded by svctest).
+    /// Disjoint position from the other authority bits.
+    pub const ORPHAN_TEST_AUTHORITY: u64 = 1u64 << 60;
 }
 
 /// Device-info kind discriminants for [`devmgr_labels::QUERY_DEVICE_INFO`]

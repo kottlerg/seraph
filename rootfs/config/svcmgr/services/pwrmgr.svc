@@ -7,10 +7,11 @@
 #     consumers permitted to power the platform off.
 #   * pwrmgr.deny:deny    — a no-authority twin (sentinel token 1) that the
 #     SHUTDOWN/REBOOT gate rejects; svctest uses it to assert the deny path.
-# `seed = devmgr.registry` delivers the REGISTRY_QUERY_AUTHORITY-tokened
-# SEND on devmgr's registry that pwrmgr uses to acquire its shutdown
-# actuator caps (QUERY_ACPI_TABLE for the FADT/DSDT it parses, and
-# QUERY_SHUTDOWN_DEVICE for the carved PM1a + 8042 ports / SbiControl).
+# `seed = devmgr.shutdown` delivers the REGISTRY_QUERY_AUTHORITY |
+# SHUTDOWN_DEVICE_AUTHORITY-tokened SEND on devmgr's registry that pwrmgr
+# uses to acquire its shutdown actuator caps (QUERY_ACPI_TABLE for the
+# FADT/DSDT it parses, and QUERY_SHUTDOWN_DEVICE for the carved PM1a +
+# 8042 ports / SbiControl). pwrmgr is the only recipe seeding it.
 # pwrmgr owns no hardware caps directly — devmgr is the hardware authority.
 #
 # `restart = on_failure`: svcmgr re-creates pwrmgr from /services/pwrmgr and
@@ -26,4 +27,4 @@ restart   = on_failure
 critical  = no
 namespace = none
 provides  = pwrmgr.shutdown:auth pwrmgr.deny:deny
-seed      = devmgr.registry
+seed      = devmgr.shutdown

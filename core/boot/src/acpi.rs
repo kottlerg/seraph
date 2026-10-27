@@ -787,9 +787,11 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
                 let end_bus = read_u8(table, off + 11);
                 if base != 0
                 {
+                    // The MCFG base is where bus 0 would decode; the
+                    // window itself starts at `start_bus`.
                     let num_buses = u64::from(end_bus).saturating_sub(u64::from(start_bus)) + 1;
                     let ecam_size = num_buses * 256 * 4096;
-                    push!(base, ecam_size);
+                    push!(base + (u64::from(start_bus) << 20), ecam_size);
                     // PCI BAR windows. Real hardware advertises these
                     // through the host bridge's `_CRS`, which the
                     // bootloader does not evaluate (no AML interpreter).

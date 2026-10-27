@@ -165,9 +165,10 @@ yet implemented (#262), per
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md#supervision-hierarchy)
 § Supervision hierarchy). svcmgr — not init — then publishes the
 well-known names it owns into its own registry
-(`ipc::published_names::ROOTFS_ROOT`, `SVCMGR`, `DEVMGR_REGISTRY`, minted
-from the endowed sources) and installs devmgr's `/services/drivers/` cap
-via `devmgr_labels::SET_DRIVERS_DIR`.
+(`ipc::published_names::ROOTFS_ROOT`, `SVCMGR`, `DEVMGR_REGISTRY`,
+`DEVMGR_SHUTDOWN`, `DEVMGR_TEST`, minted from the endowed sources) and
+installs devmgr's `/services/drivers/` cap via
+`devmgr_labels::SET_DRIVERS_DIR`.
 The provider names (`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`) are
 published by svcmgr's provider path on each provider's launch. Recipes for
 all svcmgr-supervised services live on disk at

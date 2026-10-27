@@ -16,10 +16,12 @@
 //!     service endpoint (zero when pwrmgr is absent)
 //!   * `caps[2]`: SEND on pwrmgr's service endpoint without the
 //!     `SHUTDOWN_AUTHORITY` badge bit (zero when pwrmgr is absent)
-//!   * `caps[3]`: `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's
-//!     registry endpoint (zero when devmgr is absent). Drives the
-//!     `TEST_SPAWN_ORPHAN` fault-injection shim in the devmgr
-//!     orphan-teardown phase. TODO(#165): retire with that shim.
+//!   * `caps[3]`: `REGISTRY_QUERY_AUTHORITY | ORPHAN_TEST_AUTHORITY`-badged
+//!     SEND on devmgr's registry endpoint (`devmgr.test`; zero when devmgr
+//!     is absent). Drives the `TEST_SPAWN_ORPHAN` fault-injection shim in
+//!     the devmgr orphan-teardown phase and, lacking
+//!     `SHUTDOWN_DEVICE_AUTHORITY`, the `QUERY_SHUTDOWN_DEVICE` deny phase.
+//!     TODO(#165): retire with that shim.
 //!
 //! The launcher requests the round from `info.creator_endpoint`; if no
 //! creator endpoint is present (`== 0`), every slot stays zero and
@@ -37,9 +39,10 @@ pub struct Caps
     pub root_fs: u32,
     pub pwrmgr_auth: u32,
     pub pwrmgr_noauth: u32,
-    /// `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry
-    /// endpoint. TODO(#165): retire with the `TEST_SPAWN_ORPHAN` shim.
-    pub devmgr_registry: u32,
+    /// `REGISTRY_QUERY_AUTHORITY | ORPHAN_TEST_AUTHORITY`-badged SEND on
+    /// devmgr's registry endpoint (`devmgr.test`). TODO(#165): retire with
+    /// the `TEST_SPAWN_ORPHAN` shim.
+    pub devmgr_test: u32,
 }
 
 /// Drain the bootstrap round from `creator_endpoint` and pull caps out.
@@ -78,7 +81,7 @@ pub fn request() -> Caps
     }
     if round.cap_count >= 4
     {
-        caps.devmgr_registry = round.caps[3];
+        caps.devmgr_test = round.caps[3];
     }
 
     caps

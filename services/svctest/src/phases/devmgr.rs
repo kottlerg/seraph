@@ -3,9 +3,12 @@
 
 // services/svctest/src/phases/devmgr.rs
 
-//! devmgr surface — driver-spawn orphan teardown (#176).
+//! devmgr surface — `QUERY_SHUTDOWN_DEVICE` authority gate, and driver-spawn
+//! orphan teardown (#176).
 //!
-//! Drives devmgr's temporary `TEST_SPAWN_ORPHAN` shim to force a round-2
+//! The deny phase asserts that a registry cap carrying
+//! `REGISTRY_QUERY_AUTHORITY` but not `SHUTDOWN_DEVICE_AUTHORITY` cannot
+//! acquire the platform shutdown actuators. The teardown phase drives devmgr's temporary `TEST_SPAWN_ORPHAN` shim to force a round-2
 //! bootstrap failure in a fault-injection driver that hangs (never exits),
 //! then asserts both that devmgr reports the spawn failed and that the
 //! child's reserved pages return to memmgr's free pool. Free-pool recovery is
@@ -22,10 +25,52 @@ use crate::runner::Phase;
 
 pub fn phases() -> &'static [Phase]
 {
-    &[Phase {
-        name: "devmgr_orphan_teardown",
-        run: orphan_teardown_phase,
-    }]
+    &[
+        Phase {
+            name: "devmgr_shutdown_device_deny",
+            run: shutdown_device_deny_phase,
+        },
+        Phase {
+            name: "devmgr_orphan_teardown",
+            run: orphan_teardown_phase,
+        },
+    ]
+}
+
+/// A version-current request with the right label, sent on `devmgr.test`.
+fn versioned(label: u64) -> ipc::IpcMessage
+{
+    ipc::IpcMessage::builder(label)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .build()
+}
+
+fn shutdown_device_deny_phase(caps: &Caps)
+{
+    let devmgr = caps.devmgr_test;
+    assert!(
+        devmgr != 0,
+        "devmgr_shutdown_device_deny: no devmgr.test cap seeded"
+    );
+
+    let info = startup_info();
+    // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB).
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+
+    let req = versioned(ipc::devmgr_labels::QUERY_SHUTDOWN_DEVICE);
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(devmgr, &req, ipc_buf) }
+        .expect("QUERY_SHUTDOWN_DEVICE ipc_call failed");
+    assert_eq!(
+        reply.label,
+        ipc::devmgr_errors::UNAUTHORIZED,
+        "QUERY_SHUTDOWN_DEVICE without SHUTDOWN_DEVICE_AUTHORITY must reply UNAUTHORIZED"
+    );
+    assert!(
+        reply.caps().is_empty(),
+        "QUERY_SHUTDOWN_DEVICE deny must carry no cap"
+    );
 }
 
 /// Read memmgr's current free-pool total (`QUERY_POOL_STATUS` `data[3]`).
@@ -61,8 +106,8 @@ fn orphan_teardown_phase(caps: &Caps)
     // noise without masking a real leak.
     const CYCLES: u32 = 8;
 
-    let devmgr = caps.devmgr_registry;
-    assert!(devmgr != 0, "devmgr_orphan: no devmgr registry cap seeded");
+    let devmgr = caps.devmgr_test;
+    assert!(devmgr != 0, "devmgr_orphan: no devmgr.test cap seeded");
 
     let info = startup_info();
     // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB).
@@ -83,7 +128,7 @@ fn orphan_teardown_phase(caps: &Caps)
         // Trigger the forced-failure spawn. devmgr acks immediately, then runs
         // the spawn (which fails, unwinds, and DESTROYs the child) before it
         // services the result query below.
-        let trigger = ipc::IpcMessage::new(ipc::devmgr_labels::TEST_SPAWN_ORPHAN);
+        let trigger = versioned(ipc::devmgr_labels::TEST_SPAWN_ORPHAN);
         // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
         let ack = unsafe { ipc::ipc_call(devmgr, &trigger, ipc_buf) }
             .expect("TEST_SPAWN_ORPHAN ipc_call failed");
@@ -95,7 +140,7 @@ fn orphan_teardown_phase(caps: &Caps)
 
         // Serviced only after devmgr returns to its loop — i.e. after the spawn
         // and its synchronous teardown completed.
-        let query = ipc::IpcMessage::new(ipc::devmgr_labels::TEST_ORPHAN_RESULT);
+        let query = versioned(ipc::devmgr_labels::TEST_ORPHAN_RESULT);
         // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
         let res = unsafe { ipc::ipc_call(devmgr, &query, ipc_buf) }
             .expect("TEST_ORPHAN_RESULT ipc_call failed");

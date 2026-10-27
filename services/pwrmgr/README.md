@@ -60,8 +60,9 @@ Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
    (`SHUTDOWN_AUTHORITY`-badged) and `pwrmgr.deny` (a no-authority twin).
    The endpoint persists across restarts. Both behaviours are specified in
    [`provides`](../svcmgr/docs/service-definitions.md#provides).
-2. `seed = devmgr.registry` delivers a `REGISTRY_QUERY_AUTHORITY`-badged
-   SEND on devmgr's registry as bootstrap `cap[1]`, per
+2. `seed = devmgr.shutdown` delivers a `REGISTRY_QUERY_AUTHORITY |
+   SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry as bootstrap
+   `cap[1]` (pwrmgr is the only recipe seeding it), per
    [`seed`](../svcmgr/docs/service-definitions.md#seed). pwrmgr uses it to
    resolve its actuation state from devmgr (see Responsibilities). pwrmgr
    never holds a platform cap longer than it needs — the served ACPI Memory

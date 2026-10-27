@@ -131,9 +131,9 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     (full rights), plus the publish-role source caps: a `SEND` on the
     root filesystem's namespace endpoint (svcmgr publishes it as
     `rootfs.root`) and a badge-0 `SEND|GRANT` source on
-    `devmgr_registry_ep` (svcmgr mints the `REGISTRY_QUERY_AUTHORITY`
-    `devmgr.registry` publish cap and the `DRIVERS_DIR_AUTHORITY`
-    `SET_DRIVERS_DIR` cap from it; see
+    `devmgr_registry_ep` (svcmgr mints the `devmgr.registry`,
+    `devmgr.shutdown`, and `devmgr.test` publish caps and the
+    `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from it; see
     [Publish authority](../../svcmgr/docs/ipc-interface.md#publish-authority)). `data[1]` carries
     `SVCMGR_LABELS_VERSION`. An absent source rides as a zero slot.
   - **Rounds 2..N (`SUBSTRATE`)** — one `(name, thread_cap)` per
@@ -171,10 +171,15 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     from the endowed devmgr-registry source. Consumers needing to
     resolve a device driver themselves (`programs/terminal` →
     `QUERY_FRAMEBUFFER_DEVICE` / `QUERY_INPUT_DEVICE` / `QUERY_SERIAL_DEVICE`;
-    timed and pwrmgr → their devmgr queries; future: any non-init caller of
-    devmgr's discovery surface) seed this name. The badge bit survives
-    svcmgr's plain `cap_derive` in
-    `registry_lookup_derived`.
+    timed → `QUERY_RTC_DEVICE`; future: any non-init caller of devmgr's
+    discovery surface) seed this name. The badge bit survives svcmgr's
+    plain `cap_derive` in `registry_lookup_derived`.
+  - `devmgr.shutdown` — the same SEND with `SHUTDOWN_DEVICE_AUTHORITY`
+    added, gating `QUERY_SHUTDOWN_DEVICE`; pwrmgr is the only recipe
+    seeding it.
+  - `devmgr.test` — the same SEND with `ORPHAN_TEST_AUTHORITY` added,
+    gating devmgr's `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` shim
+    (TODO(#165)); svctest is the only recipe seeding it.
   - `SET_DRIVERS_DIR` — svcmgr walks its universal root to
     `/services/drivers/` at `LOOKUP | READ` and hands devmgr the subtree
     cap on a `DRIVERS_DIR_AUTHORITY`-badged copy of the

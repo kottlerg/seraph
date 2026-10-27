@@ -107,7 +107,8 @@ fn main() -> !
     let end_bus = ecam_loc.end_bus;
 
     let mut devices = [pci::PciDevice::empty(); pci::MAX_DEVICES];
-    // SAFETY: ecam_va is a valid ECAM mapping of (end_bus-start_bus+1) * 1 MiB.
+    // SAFETY: ecam_va maps `ecam_loc.size` = (end_bus - start_bus + 1) MiB
+    // from `ecam_loc.phys_base`, the configuration space of `start_bus`.
     let dev_count = unsafe { pci::pci_enumerate(ecam_va, start_bus, end_bus, &mut devices) };
     std::os::seraph::log!("PCI devices found: {:#x}", dev_count as u64);
 
@@ -124,14 +125,14 @@ fn main() -> !
     }
 
     // IRQ allocator state: consume devmgr's Interrupt range cap ascending.
-    let mut irq_root = IrqRootAllocator::new(caps.irq_range_cap);
+    let mut irq_range = IrqRangeAllocator::new(caps.irq_range_cap);
 
     // Carve the UART interrupt before any PCI device IRQ. The allocator is
     // monotonic (it discards lines below each isolate point), and the UART line
     // (`arch::current::UART_IRQ`) sits below the PCI GSI/PLIC range, so it must
     // be isolated first. Zero on failure: the serial driver then
     // degrades to client-side timeout polling for RX.
-    let uart_irq = irq_root.isolate_one(arch::current::UART_IRQ).unwrap_or(0);
+    let uart_irq = irq_range.isolate_one(arch::current::UART_IRQ).unwrap_or(0);
 
     // Generic device-info catalog: each entry carries a kind discriminant +
     // version + opaque payload bytes. virtio populates entries with kind
@@ -148,7 +149,7 @@ fn main() -> !
     let blk_driver_spawned = spawn_virtio_blk(
         &devices[..dev_count],
         &mut caps,
-        &mut irq_root,
+        &mut irq_range,
         blk_ep,
         ipc_buf,
         &mut catalog,
@@ -183,7 +184,7 @@ fn main() -> !
     let mut pending_input = enumerate_virtio_input(
         &devices[..dev_count],
         &mut caps,
-        &mut irq_root,
+        &mut irq_range,
         &mut catalog,
     );
     if pending_input.is_some()
@@ -643,12 +644,17 @@ fn main() -> !
                 }
             }
             // TODO(#165): remove with the devmgr enumeration redesign.
-            // Test-only fault injection for #176. The forced-failure spawn
-            // does nested `ipc_call`s that would clobber the implicit reply
-            // context, so ack first (mirroring SET_DRIVERS_DIR), then run the
-            // spawn and stash the outcome for TEST_ORPHAN_RESULT.
+            // Test-only fault injection for #176, gated on
+            // ORPHAN_TEST_AUTHORITY. The forced-failure spawn does nested
+            // `ipc_call`s that would clobber the implicit reply context, so
+            // ack first (mirroring SET_DRIVERS_DIR), then run the spawn and
+            // stash the outcome for TEST_ORPHAN_RESULT.
             ipc::devmgr_labels::TEST_SPAWN_ORPHAN =>
             {
+                if !test_label_admitted(&msg, badge, ipc_buf)
+                {
+                    continue;
+                }
                 let reply = IpcMessage::new(ipc::devmgr_errors::SUCCESS);
                 // SAFETY: ipc_buf is the registered IPC buffer.
                 let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -662,6 +668,10 @@ fn main() -> !
             // TODO(#165): report the stashed test-orphan outcome (no nested IPC).
             ipc::devmgr_labels::TEST_ORPHAN_RESULT =>
             {
+                if !test_label_admitted(&msg, badge, ipc_buf)
+                {
+                    continue;
+                }
                 let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
                     .word(0, orphan_test_result)
                     .build();
@@ -676,6 +686,25 @@ fn main() -> !
             }
         }
     }
+}
+
+/// TODO(#165): remove with the test labels. Admit a `TEST_SPAWN_ORPHAN` /
+/// `TEST_ORPHAN_RESULT` request: the badge carries `ORPHAN_TEST_AUTHORITY`
+/// and `data[0]` is `DEVMGR_LABELS_VERSION`. Otherwise reply the rejection
+/// and return `false`.
+fn test_label_admitted(msg: &IpcMessage, badge: u64, ipc_buf: *mut u64) -> bool
+{
+    if badge & ipc::devmgr_labels::ORPHAN_TEST_AUTHORITY == 0
+    {
+        reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+        return false;
+    }
+    if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+    {
+        reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+        return false;
+    }
+    true
 }
 
 // ── ECAM discovery ──────────────────────────────────────────────────────────
@@ -735,7 +764,8 @@ fn discover_ecam_acpi(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
 ///
 /// Shared by ECAM discovery and the [`devmgr_labels::QUERY_ACPI_TABLE`]
 /// broker so the RSDP → XSDT step exists exactly once. Returns `None` when
-/// no RSDP was delivered or the table is pre-ACPI-2.0.
+/// no RSDP was delivered, it straddles the end of its page, or the table is
+/// pre-ACPI-2.0.
 fn read_xsdt_phys(caps: &caps::DevmgrCaps) -> Option<u64>
 {
     if caps.rsdp_memory_cap == 0
@@ -743,8 +773,14 @@ fn read_xsdt_phys(caps: &caps::DevmgrCaps) -> Option<u64>
         return None;
     }
     // `rsdp_page_base` carries the exact RSDP physical address (see
-    // init-protocol v5 docs); the backing Memory cap covers the page.
+    // init-protocol v5 docs); the backing Memory cap covers that one page,
+    // so an RSDP straddling the page end is unreadable.
     let rsdp_page_offset = usize::try_from(caps.rsdp_page_base & 0xFFF).ok()?;
+    if rsdp_page_offset + firmware::acpi::RSDP_LEN > usize::try_from(PAGE_SIZE).ok()?
+    {
+        std::os::seraph::log!("RSDP straddles its page; ACPI unavailable");
+        return None;
+    }
     let range = reserve_pages(1).ok()?;
     let va = range.va_start();
     if syscall::mem_map(
@@ -760,9 +796,14 @@ fn read_xsdt_phys(caps: &caps::DevmgrCaps) -> Option<u64>
         unreserve_pages(range);
         return None;
     }
-    // SAFETY: one page mapped read-only above.
-    let rsdp_bytes =
-        unsafe { core::slice::from_raw_parts((va as *const u8).add(rsdp_page_offset), 36) };
+    // SAFETY: one page mapped read-only above; `rsdp_page_offset +
+    // RSDP_LEN` lies within it (checked before mapping).
+    let rsdp_bytes = unsafe {
+        core::slice::from_raw_parts(
+            (va as *const u8).add(rsdp_page_offset),
+            firmware::acpi::RSDP_LEN,
+        )
+    };
     let xsdt_phys = firmware::acpi::rsdp_xsdt_phys(rsdp_bytes);
     let _ = syscall::mem_unmap(caps.self_aspace, va, 1);
     unreserve_pages(range);
@@ -898,11 +939,15 @@ fn find_region_for(caps: &caps::DevmgrCaps, phys: u64) -> Option<(caps::AcpiRegi
     None
 }
 
-/// Read the 4-byte signature of the ACPI table at physical address
-/// `tbl_phys` by mapping the region that contains it. Returns `None` if no
-/// region covers the address or the header is unreadable. devmgr reads
-/// only the header signature here — never a table body.
-fn read_table_sig(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<[u8; 4]>
+/// Map the ACPI region containing the table at physical address `tbl_phys`
+/// read-only and run `read` on the bytes from the table's start to the end
+/// of the mapping (at most [`FIRMWARE_MAP_MAX_PAGES`]). Returns `None` if
+/// no region covers the address, the mapping fails, or `read` does.
+fn with_acpi_table<R>(
+    caps: &caps::DevmgrCaps,
+    tbl_phys: u64,
+    read: impl FnOnce(&[u8]) -> Option<R>,
+) -> Option<R>
 {
     let (region, off) = find_region_for(caps, tbl_phys)?;
     let region_pages = region.size.div_ceil(PAGE_SIZE);
@@ -923,11 +968,11 @@ fn read_table_sig(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<[u8; 4]>
         unreserve_pages(range);
         return None;
     }
-    let sig = if off + 4 <= span
+    let out = if off < span
     {
         // SAFETY: `span` bytes mapped read-only from `va`.
         let bytes = unsafe { core::slice::from_raw_parts(va as *const u8, span) };
-        Some(firmware::acpi::sdt_signature(&bytes[off..]))
+        read(&bytes[off..])
     }
     else
     {
@@ -935,7 +980,18 @@ fn read_table_sig(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<[u8; 4]>
     };
     let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
     unreserve_pages(range);
-    sig
+    out
+}
+
+/// Read the 4-byte signature of the ACPI table at physical address
+/// `tbl_phys`. Returns `None` if no region covers the address or the
+/// header is unreadable. devmgr reads only the header signature here —
+/// never a table body.
+fn read_table_sig(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<[u8; 4]>
+{
+    with_acpi_table(caps, tbl_phys, |table| {
+        (table.len() >= 4).then(|| firmware::acpi::sdt_signature(table))
+    })
 }
 
 /// Locate an ACPI table by 4-byte `sig` via an XSDT walk. Returns the
@@ -1023,11 +1079,12 @@ fn handle_query_acpi_table(caps: &caps::DevmgrCaps, msg: &IpcMessage, badge: u64
 }
 
 /// `QUERY_SHUTDOWN_DEVICE` handler: serve pwrmgr the platform shutdown
-/// actuator caps. devmgr carves exactly what is asked for and runs no
+/// actuator caps, gated on `SHUTDOWN_DEVICE_AUTHORITY`. devmgr runs no
 /// shutdown logic. x86-64: a narrow `IoPort` over the caller-supplied
-/// `PM1a` control port plus the 8042 reset port. RISC-V: a Reset-only
-/// `SbiControl` derivation. The caps are re-derived from devmgr's held
-/// caps on every call, so a pwrmgr restart re-acquires them cleanly.
+/// `PM1a` control port, served only when it is the FADT's `PM1a_CNT_BLK`,
+/// plus the 8042 reset port. RISC-V: a Reset-only `SbiControl` derivation.
+/// The caps are re-derived from devmgr's held caps on every call, so a
+/// pwrmgr restart re-acquires them cleanly.
 fn handle_query_shutdown_device(
     caps: &caps::DevmgrCaps,
     msg: &IpcMessage,
@@ -1035,7 +1092,7 @@ fn handle_query_shutdown_device(
     ipc_buf: *mut u64,
 )
 {
-    if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+    if badge & ipc::devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY == 0
     {
         reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
         return;
@@ -1059,7 +1116,7 @@ fn handle_query_shutdown_device(
 /// aperture in place via [`pci::split_bar_cap`].
 ///
 /// The lower-portion preservation is the difference from raw
-/// [`pci::split_bar_cap`]: that helper drops the lower portion (its
+/// [`pci::split_bar_cap`]: that helper releases the lower portion (its
 /// PCI-BAR caller doesn't need it — the gap is unused address space
 /// between BARs). For the framebuffer aperture we *do* care about
 /// preserving the surrounding range, since that range may host other
@@ -1130,21 +1187,21 @@ fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Option<u
 
 // ── Interrupt range allocator ───────────────────────────────────────────────
 
-struct IrqRootAllocator
+struct IrqRangeAllocator
 {
-    root_slot: u32,
+    range_slot: u32,
     next_start: u32,
     valid: bool,
 }
 
-impl IrqRootAllocator
+impl IrqRangeAllocator
 {
-    fn new(root_slot: u32) -> Self
+    fn new(range_slot: u32) -> Self
     {
         Self {
-            root_slot,
+            range_slot,
             next_start: 0,
-            valid: root_slot != 0,
+            valid: range_slot != 0,
         }
     }
 
@@ -1158,13 +1215,13 @@ impl IrqRootAllocator
         }
         if id > self.next_start
         {
-            let (prefix, after) = syscall::irq_split(self.root_slot, id).ok()?;
+            let (prefix, after) = syscall::irq_split(self.range_slot, id).ok()?;
             let _ = syscall::cap_delete(prefix);
-            self.root_slot = after;
+            self.range_slot = after;
             self.next_start = id;
         }
-        let (one, remainder) = syscall::irq_split(self.root_slot, id + 1).ok()?;
-        self.root_slot = remainder;
+        let (one, remainder) = syscall::irq_split(self.range_slot, id + 1).ok()?;
+        self.range_slot = remainder;
         self.next_start = id + 1;
         Some(one)
     }
@@ -1240,7 +1297,7 @@ pub struct DeviceCatalog<'a>
 fn spawn_virtio_blk(
     devices: &[pci::PciDevice],
     caps: &mut caps::DevmgrCaps,
-    irq_root: &mut IrqRootAllocator,
+    irq_range: &mut IrqRangeAllocator,
     blk_ep: u32,
     ipc_buf: *mut u64,
     catalog: &mut DeviceCatalog,
@@ -1305,7 +1362,7 @@ fn spawn_virtio_blk(
         let device_badge = (dev_idx as u64) + 1;
 
         let bar_info = find_virtio_bar_cap(pci_dev, caps);
-        let irq_cap = acquire_single_irq_cap(pci_dev, irq_root);
+        let irq_cap = acquire_single_irq_cap(pci_dev, irq_range);
 
         let config = spawn::DriverSpawnConfig {
             procmgr_ep: caps.procmgr_ep,
@@ -1336,11 +1393,13 @@ fn spawn_virtio_blk(
 }
 
 /// Split a single-IRQ `Interrupt` cap for a PCI device off devmgr's Interrupt range cap.
-fn acquire_single_irq_cap(pci_dev: &pci::PciDevice, irq_root: &mut IrqRootAllocator)
--> Option<u32>
+fn acquire_single_irq_cap(
+    pci_dev: &pci::PciDevice,
+    irq_range: &mut IrqRangeAllocator,
+) -> Option<u32>
 {
     let gsi = device_gsi(pci_dev)?;
-    let cap = irq_root.isolate_one(gsi);
+    let cap = irq_range.isolate_one(gsi);
     if cap.is_some()
     {
         std::os::seraph::log!("split single-IRQ cap for GSI {:#x}", u64::from(gsi));
@@ -1431,7 +1490,7 @@ struct PendingInputDevice
 fn enumerate_virtio_input(
     devices: &[pci::PciDevice],
     caps: &mut caps::DevmgrCaps,
-    irq_root: &mut IrqRootAllocator,
+    irq_range: &mut IrqRangeAllocator,
     catalog: &mut DeviceCatalog,
 ) -> Option<PendingInputDevice>
 {
@@ -1480,7 +1539,7 @@ fn enumerate_virtio_input(
             std::os::seraph::log!("virtio-input: BAR not covered by any aperture");
             return None;
         }
-        let irq_cap = acquire_single_irq_cap(pci_dev, irq_root);
+        let irq_cap = acquire_single_irq_cap(pci_dev, irq_range);
 
         return Some(PendingInputDevice {
             bar_cap: bar_info.0[0],

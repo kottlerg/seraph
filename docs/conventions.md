@@ -337,6 +337,9 @@ gives the PR-level linear view.
 - Every PR body MUST state the validated head in its `## Validation`
   section; for a documentation-only or comment-only delta since that head,
   it MUST say so (see [testing.md](testing.md#coverage-tiers)).
+- Every PR body MUST report, in its `## Validation` section, each local host
+  run [testing.md](testing.md#coverage-tiers) § Coverage tiers owes, with its
+  `--runs` count and the head it ran at, or state that none is owed and why.
 
 ## CI Gating
 

@@ -164,8 +164,8 @@ truth for "how work is tracked and shipped" on this project.
      terminal pass marker MUST appear.
 - Changes matching the trigger paths in
   [docs/testing.md](../docs/testing.md) "Coverage tiers" MUST additionally
-  run the local host runs defined there, at the repeat counts and heads that
-  section sets (once per PR; updating the branch from `master` owes none).
+  run the local host runs defined there, at the heads and repeat counts that
+  section sets.
 - Host-side compilation, unit tests, and `cargo check` alone do not
   satisfy this requirement.
 - A documentation-only or comment-only change, as

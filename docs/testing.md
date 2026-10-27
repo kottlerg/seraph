@@ -347,16 +347,37 @@ cells automatically; variants belong to the tiers below.
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
-| Local host runs | developer host, commands below | REQUIRED for PRs touching SMP, per-CPU, IPI, scheduler-wakeup, boot, or memory-init paths, once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | the boundary CPU counts three times each and the memory variation, whatever the release's PRs touched |
+| Local host runs | developer host, commands below | REQUIRED for PRs touching their trigger paths (SMP, per-CPU, IPI, scheduler-wakeup, boot, and memory-init code; see Trigger paths below), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
+| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | the riscv64 64- and 65-hart and x86_64 256-vCPU boundaries three times each and the memory variation once, whatever the release's PRs touched |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 65-vCPU guest is a ~16× thread oversubscription and a 512-vCPU guest is
 infeasible there. High `-smp` coverage is local by design, not an
-oversight. The runs below are procedurally REQUIRED for PRs touching the
-listed paths — binding the same way the
+oversight. The local host runs below are procedurally REQUIRED for PRs
+touching their trigger paths, and the release host runs for each tag —
+binding the same way the
 [pre-merge review](conventions.md#branch-and-pr-workflow) is, with no CI
 surface.
+
+**Trigger paths.** The boundary CPU counts and the memory variation below are
+owed for a change, other than Markdown and comment lines, to:
+
+- SMP, per-CPU, and IPI code: `core/kernel/src/percpu.rs`,
+  `core/kernel/src/cpu_mask.rs`, `core/kernel/src/sync.rs`,
+  `core/kernel/src/mm/tlb_shootdown.rs`, and the arch interrupt, IDT, and
+  AP-bringup modules (`core/kernel/src/arch/*/interrupts.rs`, `idt.rs`, and
+  `ap_trampoline.rs`);
+- scheduler-wakeup code: `core/kernel/src/sched/`, `core/kernel/src/ipc/`,
+  `core/kernel/src/syscall/thread.rs`, the arch timer modules
+  (`core/kernel/src/arch/*/timer.rs`), and `halt_until_interrupt` in
+  `core/kernel/src/arch/*/cpu.rs`;
+- boot and memory-init code: `core/boot/` (its source and linker script),
+  `abi/boot-protocol/`, `core/kernel/src/main.rs`,
+  `core/kernel/src/validate.rs`, `core/kernel/src/mm/init.rs`,
+  `core/kernel/src/mm/init_reloc.rs`, and `core/kernel/linker/`.
+
+A change elsewhere owes none of them. The narrower boundaries below add their
+own trigger paths.
 
 ```sh
 # Boundary CPU counts, riscv64 (~70 s per passing run on a 16-core host;
@@ -380,12 +401,13 @@ cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1
 **Repeat count.** The boundary commands above run once (`--runs 1`). A PR that
 changes code in the scheduling, wake, and cross-CPU signalling mechanisms —
 `core/kernel/src/sched/`, `core/kernel/src/ipc/`, `core/kernel/src/sync.rs`,
-`core/kernel/src/percpu.rs`, `core/kernel/src/syscall/thread.rs`,
-`core/kernel/src/mm/tlb_shootdown.rs`, or the arch interrupt and IPI modules
-(`core/kernel/src/arch/*/interrupts.rs`) — MUST run the riscv64 64- and 65-hart
-and the x86_64 256-vCPU boundaries three times each (`--runs 3`): a race in
-those mechanisms shows as a low-probability failure that one run can miss. The
-memory variation and the narrow boundaries below run once.
+`core/kernel/src/percpu.rs`, `core/kernel/src/cpu_mask.rs`,
+`core/kernel/src/syscall/thread.rs`, `core/kernel/src/mm/tlb_shootdown.rs`, the
+arch interrupt and IDT modules (`core/kernel/src/arch/*/interrupts.rs` and
+`idt.rs`, which route the IPI vectors), or `halt_until_interrupt` — MUST run the
+riscv64 64- and 65-hart and the x86_64 256-vCPU boundaries three times each
+(`--runs 3`): a race in those mechanisms can fail rarely enough that one run
+misses it. The memory variation and the narrower boundaries below run once.
 
 PRs touching the surfaces that only matter above 256 CPUs — `core/kernel/src/mm/`,
 x86_64 AP bringup (`core/kernel/src/arch/x86_64/ap_trampoline.rs`,
@@ -421,24 +443,24 @@ mandate above.
 cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800
 ```
 
-**When the runs are owed.** The local host runs are owed once per PR, at any head
-that covers the merge head. A run at head H covers a later head M when the PR's
-own diff on that run's trigger paths is the same at H and at M, Markdown and
-comment lines aside. The PR's own diff at a head is the diff from that head's
-merge base with `master` to the head (`git diff $(git merge-base <head> master)
-<head> -- <paths>`), so it excludes what a merge or rebase from `master` brings
-in. Updating the branch from `master` therefore owes no run: the commits it
-brings in ran their own PRs' host runs, and the release host runs exercise them
-together. A fix round that changes the PR's own code on a trigger path breaks
-the coverage of the runs that path triggers, and those runs are owed again at a
-head after it. The PR body reports each run with the head it ran at.
+**When the runs are owed.** Each local host run a PR owes MUST be run once, at a
+head that covers the merge head. A run at head H covers a later head M when the
+PR's own diff on that run's trigger paths is the same at H and at M, Markdown
+and comment lines aside. The PR's own diff at a head is the diff from that
+head's merge base with `master` to the head (`git diff $(git merge-base <head>
+master) <head> -- <paths>`), so it excludes what a merge or rebase from `master`
+brings in. An update from `master` that leaves the PR's own diff on the trigger
+paths unchanged therefore owes no run; one whose conflict resolution changes it
+does. A fix round that changes the PR's own code on a trigger path breaks the
+coverage of the runs that path triggers, and those runs MUST be run again at a
+head after it. The PR body MUST report each run it owes with its `--runs` count
+and the head it ran at, or state that none is owed and why.
 
-**Release host runs.** Before each tag (§ Release Production of
-[conventions.md](conventions.md#release-production), step 4), the maintainer runs
-the riscv64 64- and 65-hart and the x86_64 256-vCPU boundaries three times each
-(`--runs 3`) and the memory variation once, on the commit to be tagged. These
-runs give the races a single per-PR run can miss repeated exposure once per
-release. A failure blocks the tag and is filed as an Issue.
+**Release host runs.** Before each tag
+([conventions.md](conventions.md#release-production) § Release Production, step
+4), the maintainer MUST run the riscv64 64- and 65-hart and the x86_64 256-vCPU
+boundaries three times each (`--runs 3`) and the memory variation once, on the
+commit to be tagged. A failure blocks the tag and MUST be filed as an Issue.
 
 **Documentation-only and comment-only changes.** A diff that, Markdown
 aside, alters only comment lines in source files cannot change program

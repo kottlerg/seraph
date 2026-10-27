@@ -21,7 +21,9 @@ this PR fixes); tick items completed by this PR>
 - [ ] additional component-specific checks: <…>
 
 ## Validation
-<validated head; for a documentation-only or comment-only delta since it, say so>
+<validated head; for a documentation-only or comment-only delta since it, say so; each local host
+run docs/testing.md § Coverage tiers owes, with its `--runs` count and the head it ran at, or that
+none is owed and why>
 
 ## Notes
 <design tradeoffs; follow-ups filed as Issues; anything reviewers should see>

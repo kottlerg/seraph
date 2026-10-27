@@ -142,8 +142,10 @@ pub fn copy(ctx: &TestContext) -> TestResult
 /// `cap_insert` places a copy at a caller-chosen slot index in another `CSpace`.
 ///
 /// Like `cap_copy` but the destination slot is explicit. We verify the returned
-/// handle names the requested slot and the source is unaffected (insert is a
-/// copy, not a move).
+/// handle names the requested slot, that a placement into a recycled slot of
+/// the caller's own `CSpace` returns a handle carrying the slot's new
+/// generation which addresses the copy while the old handle stays stale, and
+/// that the source is unaffected (insert is a copy, not a move).
 pub fn insert(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
@@ -157,6 +159,25 @@ pub fn insert(ctx: &TestContext) -> TestResult
     if syscall_abi::cap_handle_index(handle) != 5
     {
         return Err("cap_insert handle does not name the requested slot");
+    }
+
+    let old = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for recycled-slot insert failed")?;
+    cap_delete(old).map_err(|_| "cap_delete before recycled-slot insert failed")?;
+    let index = syscall_abi::cap_handle_index(old);
+    let recycled = cap_insert(sig, ctx.cspace_cap, index, syscall::RIGHTS_ALL)
+        .map_err(|_| "cap_insert into recycled slot failed")?;
+    let stale_ok = notification_send(old, 0x1).is_ok();
+    let fresh_ok = notification_send(recycled, 0x1).is_ok();
+    cap_delete(recycled).map_err(|_| "cap_delete recycled insert failed")?;
+    if syscall_abi::cap_handle_index(recycled) != index
+        || syscall_abi::cap_handle_gen(recycled) == syscall_abi::cap_handle_gen(old)
+    {
+        return Err("cap_insert into recycled slot returned a stale-generation handle");
+    }
+    if stale_ok || !fresh_ok
+    {
+        return Err("cap_insert handle into recycled slot does not address the copy");
     }
 
     // Source slot is preserved (insert = copy, not move).
@@ -638,7 +659,8 @@ pub fn delete_null_slot_ok(ctx: &TestContext) -> TestResult
 
 // ── SYS_CAP_COPY explicit slot negative (out of bounds) ──────────────────────
 
-/// `cap_insert` with a slot index beyond the destination `CSpace` capacity must fail.
+/// `cap_insert` with a slot index beyond the destination `CSpace` capacity, or
+/// outside the handle's index field, must fail.
 pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
@@ -651,6 +673,15 @@ pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
     if err.is_ok()
     {
         return Err("cap_insert at out-of-bounds slot should fail");
+    }
+
+    // Index 0 and an index with bits above the handle's index field would
+    // decode to a kernel-chosen or a lower slot; the wrapper refuses both.
+    let invalid = SyscallError::InvalidArgument as i64;
+    if cap_insert(sig, dest_cs, 0, syscall::RIGHTS_ALL) != Err(invalid)
+        || cap_insert(sig, dest_cs, (1 << 24) | 5, syscall::RIGHTS_ALL) != Err(invalid)
+    {
+        return Err("cap_insert with slot 0 or an index above CAP_INDEX_MASK should fail");
     }
 
     cap_delete(sig).map_err(|_| "cap_delete sig after insert_oob test failed")?;

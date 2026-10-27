@@ -43,19 +43,20 @@ extern crate rustc_std_workspace_core as core;
 use core::prelude::rust_2024::*;
 
 use syscall_abi::{
-    MEM_UNMAP_RECLAIM_PTS, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_QUERY,
-    SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT,
-    SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD,
-    SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO,
-    SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND,
-    SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
-    SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE,
-    SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
-    SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
-    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
-    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
-    SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
-    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
+    CAP_INDEX_MASK, MEM_UNMAP_RECLAIM_PTS, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION,
+    SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE,
+    SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION,
+    SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
+    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST,
+    SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET,
+    SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT,
+    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
+    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL,
+    SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
+    SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
+    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT, SyscallError,
 };
 
 pub use syscall_abi::{
@@ -98,7 +99,7 @@ unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64
     // The kernel may read or write user memory that pointer arguments or the registered
     // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
     // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
-    // stack. The caller's `# Safety` obligations cover the memory the kernel accesses.
+    // stack.
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -136,7 +137,7 @@ unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64
     // The kernel may read or write user memory that pointer arguments or the registered
     // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
     // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
-    // stack. The caller's `# Safety` obligations cover the memory the kernel accesses.
+    // stack.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -171,7 +172,7 @@ unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
     // The kernel may read or write user memory that pointer arguments or the registered
     // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
     // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
-    // stack. The caller's `# Safety` obligations cover the memory the kernel accesses.
+    // stack.
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -210,7 +211,7 @@ unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
     // The kernel may read or write user memory that pointer arguments or the registered
     // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
     // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
-    // stack. The caller's `# Safety` obligations cover the memory the kernel accesses.
+    // stack.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -247,7 +248,7 @@ unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
     // The kernel may read or write user memory that pointer arguments or the registered
     // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
     // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
-    // stack. The caller's `# Safety` obligations cover the memory the kernel accesses.
+    // stack.
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -287,7 +288,7 @@ unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
     // The kernel may read or write user memory that pointer arguments or the registered
     // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
     // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
-    // stack. The caller's `# Safety` obligations cover the memory the kernel accesses.
+    // stack.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -325,7 +326,7 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
     // The kernel may read or write user memory that pointer arguments or the registered
     // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
     // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
-    // stack. The caller's `# Safety` obligations cover the memory the kernel accesses.
+    // stack.
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -363,7 +364,7 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
     // The kernel may read or write user memory that pointer arguments or the registered
     // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
     // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
-    // stack. The caller's `# Safety` obligations cover the memory the kernel accesses.
+    // stack.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -656,7 +657,7 @@ unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64
     // The kernel may read or write user memory that pointer arguments or the registered
     // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
     // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
-    // stack. The caller's `# Safety` obligations cover the memory the kernel accesses.
+    // stack.
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -697,7 +698,7 @@ unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64
     // The kernel may read or write user memory that pointer arguments or the registered
     // IPC buffer name, and may change the caller's mappings, so `nomem`/`readonly` are
     // deliberately omitted; `nostack` holds because the asm itself does not use the Rust
-    // stack. The caller's `# Safety` obligations cover the memory the kernel accesses.
+    // stack.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -1670,8 +1671,8 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 /// back a fresh slot (`OutOfMemory`; refill it with `cap_create_cspace` in
 /// augment mode; `QuotaExceeded` at the structural ceiling). `InvalidCapability`
 /// also covers a source a concurrent delete, move, or revoke freed before the
-/// copy was linked; `InvalidState` means a `cap_revoke` is in flight on the
-/// source.
+/// copy was linked; `InvalidState` means a `cap_revoke` or `cap_move` is in
+/// flight on the source.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1897,9 +1898,14 @@ pub fn cap_move(src_cap: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
-/// lacks sufficient rights, `dest_index` is already occupied, or the
-/// destination `CSpace`'s slot pool cannot back every leaf up to
-/// `dest_index` (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
+/// lacks sufficient rights, `dest_index` is already occupied or out of range
+/// (`InvalidArgument`, which the wrapper returns without a syscall for a
+/// `dest_index` of 0 or above `CAP_INDEX_MASK`), or the destination
+/// `CSpace`'s slot pool cannot back every leaf up to `dest_index`
+/// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
+/// `InvalidCapability` also covers a source a concurrent delete, move, or
+/// revoke freed before the copy was linked; `InvalidState` means a
+/// `cap_revoke` or `cap_move` is in flight on the source.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1911,6 +1917,12 @@ pub fn cap_insert(
     rights_mask: u64,
 ) -> Result<u32, i64>
 {
+    // The kernel decodes only the low `CAP_INDEX_BITS` of the destination and
+    // reads 0 as "allocate a slot", so either would place the copy elsewhere.
+    if dest_index == 0 || dest_index > CAP_INDEX_MASK
+    {
+        return Err(SyscallError::InvalidArgument as i64);
+    }
     // SAFETY: syscall4 issues raw syscall instruction; all arguments are scalar u64 values
     // (source slot, dest CSpace cap, dest slot, rights mask); kernel validates and inserts cap
     // at the caller-chosen slot and returns its handle.
@@ -2317,8 +2329,13 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 /// Kill).
 ///
 /// If the thread is running on another CPU, the call returns once that CPU
-/// has descheduled it and published its register save
-/// (`core/kernel/docs/syscalls.md` § `SYS_THREAD_STOP`).
+/// has descheduled it and published its register save, or once an object
+/// teardown has made it `Exited`. A caller that is itself stopped while it
+/// waits returns, once restarted, as soon as `thread_cap` no longer names the
+/// target with Control rights, even while the target still runs;
+/// [`thread_read_regs`] and [`thread_write_regs`] refuse such a target with
+/// `InvalidState` until it has left its CPU (`core/kernel/docs/syscalls.md`
+/// § `SYS_THREAD_STOP`).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid or lacks

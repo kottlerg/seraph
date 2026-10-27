@@ -95,8 +95,9 @@ svcmgr/
   [`restart::handle_death`](src/restart.rs); shared spawn primitives
   re-spawn the service from the recorded recipe. The `.svc` file is the
   single source of truth for both launch and restart — fixed fields on
-  `ServiceEntry`, the heap-backed argv/env/cwd/seed on a parallel
-  `RestartRecipe` — so a restart reproduces the first-launch surfaces
+  `ServiceEntry`, the argv/env/cwd/seed, log-sink flag, and scheduling
+  fields on a parallel `RestartRecipe` — so a restart reproduces the
+  first-launch surfaces
   ([docs/restart-protocol.md](docs/restart-protocol.md) § Recipe storage).
   Whether a service restarts is decided by its `restart` policy + budget
   alone; `critical` is orthogonal (see graceful shutdown below and

@@ -300,7 +300,7 @@ At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 
 | Definition | Pending registration | Outcome |
 |---|---|---|
-| present | present | **bind only** — bind death-notification on the endowed thread cap; record a `ServiceEntry` with the parsed recipe for restart use. |
+| present | present | **bind only** — bind death-notification on the endowed thread cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink flag, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
 | present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, `CONFIGURE_NAMESPACE` with the namespace+cwd, `START_PROCESS`, serve the seed bootstrap round. If `restart != never`, bind death-notification and record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 

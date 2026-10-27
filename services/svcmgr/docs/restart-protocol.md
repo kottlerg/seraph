@@ -125,9 +125,9 @@ identical across both code paths:
 The launch path is documented in
 [service-definitions.md](service-definitions.md#reconciliation). The
 `.svc` recipe is the single source of truth for both paths: the fixed
-fields are recorded on `ServiceEntry` and the heap-backed surfaces
-(argv / env / cwd / seed) on the parallel `RestartRecipe`, so a restart
-reproduces the first-launch spawn shape byte-for-byte. The binary path
+fields are recorded on `ServiceEntry` and the argv / env / cwd / seed,
+log-sink flag, and scheduling fields on the parallel `RestartRecipe`, so
+a restart reproduces the first-launch spawn shape byte-for-byte. The binary path
 is re-walked on every spawn, so a binary update on disk is picked up by
 the next restart without code changes.
 
@@ -159,10 +159,14 @@ correlator:
 | `env` | `env = ...` |
 | `cwd` | `cwd = ...` |
 | `seed` | `seed = ...` |
+| `log_sink` | `log_sink = ...` |
+| `priority` | `priority = ...` (`0` = unset) |
+| `sched_max` | `sched_max = ...` (`0` = unset) |
 
-`restart_process` replays all four on every respawn — argv/env into
-`CREATE_FROM_FILE`, cwd through `apply_namespace_policy`, and seeds
-re-resolved from the discovery registry — so a restarted child comes
+`restart_process` replays every field on every respawn — argv/env and the
+scheduling fields into `CREATE_FROM_FILE`, cwd through
+`apply_namespace_policy`, seeds re-resolved from the discovery registry,
+and `log_sink` selecting the log-sink round — so a restarted child comes
 back with the same surfaces first launch gave it.
 
 ---

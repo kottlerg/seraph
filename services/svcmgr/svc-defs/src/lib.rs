@@ -6,9 +6,11 @@
 //! Pure `.svc` service-definition types and parser for svcmgr.
 //!
 //! Holds the plain-data recipe record ([`Definition`] and its component
-//! enums), the `key = value` parser ([`parse`]), and the argv/env wire-blob
+//! enums), the `key = value` parser ([`parse`]), the argv/env wire-blob
 //! encoder ([`build_blob`]) the parser validates against procmgr's
-//! `CREATE_FROM_FILE` limits. Nothing here touches a syscall, IPC, or
+//! `CREATE_FROM_FILE` limits, and two decisions svcmgr applies at runtime:
+//! the rights of a recipe's `cwd` cap ([`cwd_rights`]) and the
+//! `HANDOVER_COMPLETE` gate ([`handover_permitted`]). Nothing here touches a syscall, IPC, or
 //! `std::os::seraph` surface, so the whole crate is host-reachable and
 //! host-tested — the `.svc` files are external input and their parser
 //! carries unit tests per
@@ -17,6 +19,31 @@
 //! stays in `svcmgr` (`definitions::launch` / `definitions::reconcile`).
 
 pub mod parse;
+
+use namespace_protocol::rights as ns_rights;
+
+/// Rights svcmgr requests when it walks a recipe's `cwd`: what a child needs
+/// for relative `std::fs` operations (`LOOKUP | READDIR | STAT | READ`),
+/// intersected with the subtree's rights mask under `namespace = subtree:`
+/// so the cwd cap never carries a right the namespace cap withholds.
+/// `subtree_rights` is `None` for a universal namespace.
+#[must_use]
+pub fn cwd_rights(subtree_rights: Option<u32>) -> u32
+{
+    let wanted = ns_rights::LOOKUP | ns_rights::READDIR | ns_rights::STAT | ns_rights::READ;
+    subtree_rights.map_or(wanted, |mask| wanted & mask)
+}
+
+/// Whether svcmgr honours a `HANDOVER_COMPLETE` from a caller whose cap
+/// carries `badge`, given whether an earlier call was honoured
+/// (`handover_done`): only the first call, and only through a SEND carrying
+/// the [`HANDOVER_AUTHORITY`](ipc::svcmgr_labels::HANDOVER_AUTHORITY) verb
+/// bit, which init alone mints.
+#[must_use]
+pub fn handover_permitted(badge: u64, handover_done: bool) -> bool
+{
+    badge & ipc::svcmgr_labels::HANDOVER_AUTHORITY != 0 && !handover_done
+}
 
 /// Build the NUL-separated, NUL-terminated wire blob procmgr's
 /// stack-envelope writer expects from a list of tokens. Returns
@@ -108,10 +135,11 @@ pub struct Definition
     /// alone decides whether/when to respawn.
     pub system_critical: bool,
     pub namespace: NamespaceShape,
-    /// Optional cwd path. Interpreted relative to the namespace root
-    /// installed via [`NamespaceShape`], or absolute against svcmgr's
-    /// universal root when `namespace = universal`. Forbidden when
-    /// `namespace = none` (parser rejects).
+    /// Optional cwd path, walked from svcmgr's universal root on launch and
+    /// restart. It must lie inside the namespace: under `namespace =
+    /// subtree:` the parser rejects a path outside the subtree, and under
+    /// `namespace = none` it rejects any `cwd`. See
+    /// `services/svcmgr/docs/service-definitions.md` § cwd.
     pub cwd: Option<String>,
     /// Published-registry names svcmgr resolves at launch time and
     /// injects positionally into the child's bootstrap round.
@@ -190,5 +218,39 @@ mod tests
     fn no_tokens_pack_to_the_empty_blob_and_zero_count()
     {
         assert_eq!(build_blob(&[]), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn cwd_rights_never_exceed_the_subtree_mask()
+    {
+        let wanted = ns_rights::LOOKUP | ns_rights::READDIR | ns_rights::STAT | ns_rights::READ;
+        assert_eq!(cwd_rights(None), wanted);
+        assert_eq!(cwd_rights(Some(ns_rights::LOOKUP)), ns_rights::LOOKUP);
+        assert_eq!(
+            cwd_rights(Some(ns_rights::LOOKUP | ns_rights::WRITE)),
+            ns_rights::LOOKUP
+        );
+    }
+
+    #[test]
+    fn handover_needs_the_authority_bit()
+    {
+        let auth = ipc::svcmgr_labels::HANDOVER_AUTHORITY;
+        assert!(handover_permitted(auth, false));
+        assert!(handover_permitted(auth | 0x10, false));
+        assert!(!handover_permitted(0, false));
+        assert!(!handover_permitted(
+            ipc::svcmgr_labels::PUBLISH_AUTHORITY,
+            false
+        ));
+    }
+
+    #[test]
+    fn handover_is_honoured_only_once()
+    {
+        assert!(!handover_permitted(
+            ipc::svcmgr_labels::HANDOVER_AUTHORITY,
+            true
+        ));
     }
 }

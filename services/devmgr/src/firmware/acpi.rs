@@ -90,7 +90,7 @@ pub fn sdt_length(sdt_header: &[u8]) -> Option<u32>
         return None;
     }
     let len = read_u32(sdt_header, SDT_OFF_LENGTH);
-    if len < SDT_HDR_LEN as u32
+    if (len as usize) < SDT_HDR_LEN
     {
         None
     }

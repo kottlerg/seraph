@@ -232,10 +232,10 @@ pub unsafe fn pci_enumerate(
 /// `ecam_va` must be a valid ECAM MMIO mapping.
 unsafe fn probe_bars(ecam_va: u64, dev: &mut PciDevice)
 {
-    let mut bar_idx: u16 = 0;
+    let mut bar_idx: u8 = 0;
     while bar_idx < 6
     {
-        let reg = 0x10 + bar_idx * 4;
+        let reg = 0x10 + u16::from(bar_idx) * 4;
         // SAFETY: ecam_va is valid.
         let orig = unsafe { ecam_read32(ecam_va, dev.bus, dev.dev, dev.func, reg) };
 
@@ -273,7 +273,7 @@ unsafe fn probe_bars(ecam_va: u64, dev: &mut PciDevice)
                     dev.bar_phys[dev.bar_count] = bar_base;
                     dev.bar_size[dev.bar_count] = bar_sz;
                     dev.bar_is_mmio[dev.bar_count] = true;
-                    dev.bar_pci_idx[dev.bar_count] = bar_idx as u8;
+                    dev.bar_pci_idx[dev.bar_count] = bar_idx;
                     dev.bar_count += 1;
                 }
                 bar_idx += 2; // Skip next BAR (upper 32 bits).
@@ -285,7 +285,7 @@ unsafe fn probe_bars(ecam_va: u64, dev: &mut PciDevice)
                 dev.bar_phys[dev.bar_count] = bar_base;
                 dev.bar_size[dev.bar_count] = bar_sz;
                 dev.bar_is_mmio[dev.bar_count] = true;
-                dev.bar_pci_idx[dev.bar_count] = bar_idx as u8;
+                dev.bar_pci_idx[dev.bar_count] = bar_idx;
                 dev.bar_count += 1;
             }
         }
@@ -300,7 +300,7 @@ unsafe fn probe_bars(ecam_va: u64, dev: &mut PciDevice)
                 dev.bar_phys[dev.bar_count] = bar_base;
                 dev.bar_size[dev.bar_count] = bar_sz;
                 dev.bar_is_mmio[dev.bar_count] = false;
-                dev.bar_pci_idx[dev.bar_count] = bar_idx as u8;
+                dev.bar_pci_idx[dev.bar_count] = bar_idx;
                 dev.bar_count += 1;
             }
         }

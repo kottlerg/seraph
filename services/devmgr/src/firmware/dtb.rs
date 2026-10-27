@@ -220,7 +220,7 @@ fn extract_reg(
                 }
                 // Infer bus range: size / (256 * 4096) buses, starting at 0.
                 let bus_count = size / (256 * 4096);
-                let end_bus = bus_count.saturating_sub(1).min(255) as u8;
+                let end_bus = u8::try_from(bus_count.saturating_sub(1)).unwrap_or(u8::MAX);
                 return Some(EcamLocation {
                     phys_base: base,
                     size,

@@ -13,10 +13,10 @@ devmgr/
 ├── README.md
 ├── src/
 │   ├── main.rs                     # Bootstrap, registry service loop, QUERY_* handlers
-│   ├── arch/                       # Arch-dispatch surface: platform-default ECAM
-│   │   ├── mod.rs                  # `arch::current` re-export (the cfg(target_arch) site)
-│   │   ├── x86_64/mod.rs           # No platform default; returns None
-│   │   └── riscv64/mod.rs          # QEMU virt ECAM window
+│   ├── arch/                       # Arch-dispatch surface: ECAM default, UART/RTC, shutdown
+│   │   ├── mod.rs                  # `arch::current` re-export (the only cfg(target_arch) site)
+│   │   ├── x86_64/mod.rs           # IoPort carves (COM1, CMOS, PM1a + 8042); no ECAM default
+│   │   └── riscv64/mod.rs          # QEMU virt windows (ECAM, NS16550, goldfish-RTC); SbiControl
 │   ├── caps.rs                     # Capability absorbers and device-info catalog
 │   ├── firmware/                   # ACPI / DTB parsing helpers
 │   ├── pci.rs                      # PCI ECAM enumeration + BAR splitting

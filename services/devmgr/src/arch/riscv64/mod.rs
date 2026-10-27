@@ -5,7 +5,37 @@
 
 //! RISC-V arch-dispatch surface for devmgr.
 
+use ipc::IpcMessage;
+
+use crate::caps::DevmgrCaps;
 use crate::firmware::EcamLocation;
+use crate::{carve_subrange, reply_status};
+
+/// Arch-specific authority caps devmgr holds after bootstrap.
+pub struct ArchCaps
+{
+    // Steady-state holder of the platform power-state SBI authority: a
+    // Reset + Suspend `SbiControl` cap from init, which is reaped. devmgr
+    // serves pwrmgr a Reset-only derivation on `QUERY_SHUTDOWN_DEVICE`;
+    // Suspend is held against a future path. devmgr itself never forwards
+    // an SBI call — it only holds and brokers the cap.
+    sbi_control_cap: u32,
+}
+
+impl ArchCaps
+{
+    pub const fn empty() -> Self
+    {
+        Self { sbi_control_cap: 0 }
+    }
+
+    /// Store the `SVCMGR_BUNDLE` round's shutdown-authority cap: on RISC-V,
+    /// the Reset + Suspend `SbiControl` derivation.
+    pub fn absorb_shutdown_authority(&mut self, cap: u32)
+    {
+        self.sbi_control_cap = cap;
+    }
+}
 
 /// Platform-default ECAM when neither ACPI MCFG nor a DTB exposes one.
 ///
@@ -30,4 +60,69 @@ pub fn platform_default_ecam() -> Option<EcamLocation>
         start_bus: 0,
         end_bus: 255,
     })
+}
+
+/// On-rootfs name of the platform RTC driver (QEMU `virt` goldfish-RTC),
+/// relative to the `/services/drivers/` subtree cap. Hardcoded pending
+/// #165 (manifest-driven discovery).
+pub const RTC_DRIVER_NAME: &[u8] = b"goldfish-rtc";
+
+/// PLIC source of the QEMU `virt` NS16550, the serial driver's UART.
+/// Platform-static and hardcoded on the same basis as
+/// [`carve_uart_authority`], pending the data-driven (ACPI/DTB)
+/// device-binding follow-up.
+pub const UART_IRQ: u32 = 10;
+
+/// Carve the NS16550 `Mmio` out of the aperture covering the UART
+/// MMIO window.
+///
+/// The window is the QEMU `virt` NS16550 at `[0x1000_0000, 0x1000_1000)` —
+/// a fixed part of the QEMU virt machine model, the same basis on which
+/// [`platform_default_ecam`] and the seeded goldfish-RTC aperture are
+/// identified. The bootloader independently discovers this base via ACPI
+/// SPCR for its early console; replacing this constant with forwarded
+/// SPCR/`_CRS` discovery is part of the data-driven device-binding
+/// follow-up.
+pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u32>
+{
+    carve_subrange(caps, 0x1000_0000, 0x1000)
+}
+
+/// Carve the platform RTC's hardware-authority cap: the QEMU `virt`
+/// goldfish-RTC page at `0x101000`. The base is platform-static and
+/// hardcoded pending #165, which replaces all such hardcoded per-driver
+/// knowledge with DTB `compatible = "google,goldfish-rtc"` driven
+/// discovery.
+pub fn carve_rtc_authority(caps: &mut DevmgrCaps) -> Option<u32>
+{
+    carve_subrange(caps, 0x0010_1000, 0x1000)
+}
+
+/// Reply to an authorised, version-checked `QUERY_SHUTDOWN_DEVICE` with
+/// pwrmgr's shutdown actuator cap: a Reset-only `SbiControl` derivation
+/// (`msg` is unused; the request carries no RISC-V parameter). Replies
+/// `NO_DEVICE` when devmgr holds no `SbiControl` cap and
+/// `INVALID_REQUEST` when the derivation fails.
+pub fn reply_shutdown_device(caps: &DevmgrCaps, _msg: &IpcMessage, ipc_buf: *mut u64)
+{
+    if caps.arch.sbi_control_cap == 0
+    {
+        reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
+        return;
+    }
+    // pwrmgr needs only system reset (SRST); attenuate to the minimum.
+    let Ok(sbi) = syscall::cap_derive(caps.arch.sbi_control_cap, syscall::RIGHTS_SBI_RESET)
+    else
+    {
+        reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+        return;
+    };
+    let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+        .cap(sbi)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    {
+        let _ = syscall::cap_delete(sbi);
+    }
 }

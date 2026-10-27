@@ -16,8 +16,6 @@
 //! and driver authority, and `docs/device-management.md` for the system-scope
 //! design.
 
-#![allow(clippy::cast_possible_truncation)]
-
 mod arch;
 mod caps;
 mod firmware;
@@ -34,6 +32,8 @@ use syscall_abi::PAGE_SIZE;
 /// hardware.
 const FIRMWARE_MAP_MAX_PAGES: u64 = 256;
 
+// The registry loop is one match over every label, each arm carrying its
+// own reply handling; splitting it would scatter the dispatch table.
 #[allow(clippy::too_many_lines)]
 fn main() -> !
 {
@@ -61,7 +61,8 @@ fn main() -> !
     );
 
     // Parse firmware to locate the PCI ECAM. ACPI wins when RSDP is
-    // present; DTB is the fallback.
+    // present; DTB is the fallback; the arch platform default (QEMU virt
+    // on riscv64, none on x86-64) is the last resort.
     let Some(ecam_loc) = discover_ecam(&caps)
     else
     {
@@ -131,7 +132,7 @@ fn main() -> !
     // (x86 ISA IRQ4 / riscv PLIC source 10) sits below the PCI GSI/PLIC range,
     // so it must be isolated first. Zero on failure: the serial driver then
     // degrades to client-side timeout polling for RX.
-    let uart_irq = carve_uart_irq(&mut irq_root).unwrap_or(0);
+    let uart_irq = irq_root.isolate_one(arch::current::UART_IRQ).unwrap_or(0);
 
     // Generic device-info catalog: each entry carries a kind discriminant +
     // version + opaque payload bytes. virtio populates entries with kind
@@ -603,7 +604,7 @@ fn main() -> !
             }
             ipc::devmgr_labels::QUERY_DEVICE_INFO =>
             {
-                let dev_idx = badge.wrapping_sub(1) as usize;
+                let dev_idx = usize::try_from(badge.wrapping_sub(1)).unwrap_or(usize::MAX);
                 if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
                 {
                     let reply = IpcMessage::new(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
@@ -744,7 +745,7 @@ fn read_xsdt_phys(caps: &caps::DevmgrCaps) -> Option<u64>
     }
     // `rsdp_page_base` carries the exact RSDP physical address (see
     // init-protocol v5 docs); the backing Memory cap covers the page.
-    let rsdp_page_offset = (caps.rsdp_page_base & 0xFFF) as usize;
+    let rsdp_page_offset = usize::try_from(caps.rsdp_page_base & 0xFFF).ok()?;
     let range = reserve_pages(1).ok()?;
     let va = range.va_start();
     if syscall::mem_map(
@@ -776,6 +777,7 @@ fn read_xsdt_entries(caps: &caps::DevmgrCaps, xsdt_phys: u64) -> Option<std::vec
     let (region, off) = find_region_for(caps, xsdt_phys)?;
     let region_pages = region.size.div_ceil(PAGE_SIZE);
     let map_pages = region_pages.min(FIRMWARE_MAP_MAX_PAGES);
+    let span = usize::try_from(map_pages * PAGE_SIZE).ok()?;
     let range = reserve_pages(map_pages).ok()?;
     let va = range.va_start();
     if syscall::mem_map(
@@ -792,8 +794,7 @@ fn read_xsdt_entries(caps: &caps::DevmgrCaps, xsdt_phys: u64) -> Option<std::vec
         return None;
     }
     // SAFETY: map_pages × PAGE_SIZE bytes mapped RO from `va`.
-    let region_bytes =
-        unsafe { core::slice::from_raw_parts(va as *const u8, (map_pages * PAGE_SIZE) as usize) };
+    let region_bytes = unsafe { core::slice::from_raw_parts(va as *const u8, span) };
     let mut entries = std::vec::Vec::new();
     if off + 36 <= region_bytes.len()
     {
@@ -819,6 +820,7 @@ fn read_mcfg_at(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<firmware::Ecam
     let (region, off) = find_region_for(caps, tbl_phys)?;
     let region_pages = region.size.div_ceil(PAGE_SIZE);
     let map_pages = region_pages.min(FIRMWARE_MAP_MAX_PAGES);
+    let span = usize::try_from(map_pages * PAGE_SIZE).ok()?;
     let range = reserve_pages(map_pages).ok()?;
     let va = range.va_start();
     if syscall::mem_map(
@@ -835,8 +837,7 @@ fn read_mcfg_at(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<firmware::Ecam
         return None;
     }
     // SAFETY: map_pages × PAGE_SIZE bytes mapped RO from `va`.
-    let region_bytes =
-        unsafe { core::slice::from_raw_parts(va as *const u8, (map_pages * PAGE_SIZE) as usize) };
+    let region_bytes = unsafe { core::slice::from_raw_parts(va as *const u8, span) };
     let mut ecam = None;
     if off + 36 <= region_bytes.len()
     {
@@ -857,6 +858,8 @@ fn discover_ecam_dtb(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
 {
     let dtb_pages = caps.dtb_size.div_ceil(PAGE_SIZE).max(1);
     let map_pages = dtb_pages.min(FIRMWARE_MAP_MAX_PAGES);
+    let span = usize::try_from(map_pages * PAGE_SIZE).ok()?;
+    let in_page_off = usize::try_from(caps.dtb_page_base & 0xFFF).ok()?;
     let range = reserve_pages(map_pages).ok()?;
     let va = range.va_start();
     if syscall::mem_map(
@@ -872,13 +875,9 @@ fn discover_ecam_dtb(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
         unreserve_pages(range);
         return None;
     }
-    let in_page_off = (caps.dtb_page_base & 0xFFF) as usize;
     // SAFETY: map_pages × PAGE_SIZE mapped RO from `va`.
     let blob_bytes = unsafe {
-        core::slice::from_raw_parts(
-            (va as *const u8).add(in_page_off),
-            (map_pages * PAGE_SIZE) as usize - in_page_off,
-        )
+        core::slice::from_raw_parts((va as *const u8).add(in_page_off), span - in_page_off)
     };
     let ecam = firmware::dtb::Fdt::new(blob_bytes).and_then(|fdt| fdt.find_pci_ecam());
     let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
@@ -894,7 +893,7 @@ fn find_region_for(caps: &caps::DevmgrCaps, phys: u64) -> Option<(caps::AcpiRegi
     {
         if phys >= r.base && phys < r.base + r.size
         {
-            return Some((*r, (phys - r.base) as usize));
+            return usize::try_from(phys - r.base).ok().map(|off| (*r, off));
         }
     }
     None
@@ -909,6 +908,7 @@ fn read_table_sig(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<[u8; 4]>
     let (region, off) = find_region_for(caps, tbl_phys)?;
     let region_pages = region.size.div_ceil(PAGE_SIZE);
     let map_pages = region_pages.min(FIRMWARE_MAP_MAX_PAGES);
+    let span = usize::try_from(map_pages * PAGE_SIZE).ok()?;
     let range = reserve_pages(map_pages).ok()?;
     let va = range.va_start();
     if syscall::mem_map(
@@ -924,7 +924,6 @@ fn read_table_sig(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<[u8; 4]>
         unreserve_pages(range);
         return None;
     }
-    let span = (map_pages * PAGE_SIZE) as usize;
     let sig = if off + 4 <= span
     {
         // SAFETY: `span` bytes mapped read-only from `va`.
@@ -968,7 +967,8 @@ fn locate_acpi_table(
     }
     else
     {
-        locate_table_by_sig(caps, (sig_word as u32).to_le_bytes())?
+        let [s0, s1, s2, s3, ..] = sig_word.to_le_bytes();
+        locate_table_by_sig(caps, [s0, s1, s2, s3])?
     };
     let (region, _off) = find_region_for(caps, table_phys)?;
     Some((region, table_phys))
@@ -1047,61 +1047,7 @@ fn handle_query_shutdown_device(
         return;
     }
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        // 8042 KBC command port — the 1-byte reset register pwrmgr pulses
-        // for reboot. The PM1a control port is FADT-derived, so pwrmgr
-        // computes it and passes it here; devmgr only carves.
-        const KBC_COMMAND_PORT: u16 = 0x64;
-        let pm1a = msg.word(1) as u16;
-        let Some(pm1a_cap) = ioport_carve(caps.ioport_root_cap, pm1a, 2)
-        else
-        {
-            reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
-            return;
-        };
-        let Some(kbc_cap) = ioport_carve(caps.ioport_root_cap, KBC_COMMAND_PORT, 1)
-        else
-        {
-            let _ = syscall::cap_delete(pm1a_cap);
-            reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
-            return;
-        };
-        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-            .cap(pm1a_cap)
-            .cap(kbc_cap)
-            .build();
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
-        {
-            let _ = syscall::cap_delete(pm1a_cap);
-            let _ = syscall::cap_delete(kbc_cap);
-        }
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    {
-        if caps.sbi_control_cap == 0
-        {
-            reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
-            return;
-        }
-        // pwrmgr needs only system reset (SRST); attenuate to the minimum.
-        let Ok(sbi) = syscall::cap_derive(caps.sbi_control_cap, syscall::RIGHTS_SBI_RESET)
-        else
-        {
-            reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
-            return;
-        };
-        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-            .cap(sbi)
-            .build();
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
-        {
-            let _ = syscall::cap_delete(sbi);
-        }
-    }
+    arch::current::reply_shutdown_device(caps, msg, ipc_buf);
 }
 
 // ── Aperture splitting helper ───────────────────────────────────────────────
@@ -1264,9 +1210,14 @@ impl DeviceInfoEntry
         {
             return false;
         }
+        let Ok(byte_len) = u32::try_from(bytes.len())
+        else
+        {
+            return false;
+        };
         self.kind = kind;
         self.version = version;
-        self.byte_len = bytes.len() as u32;
+        self.byte_len = byte_len;
         self.payload[..bytes.len()].copy_from_slice(bytes);
         for b in &mut self.payload[bytes.len()..]
         {
@@ -1650,7 +1601,7 @@ fn spawn_serial(caps: &mut caps::DevmgrCaps, uart_irq: u32, ipc_buf: *mut u64) -
         return (false, 0);
     }
 
-    let Some(hw_cap) = carve_uart_authority(caps)
+    let Some(hw_cap) = arch::current::carve_uart_authority(caps)
     else
     {
         std::os::seraph::log!("serial: failed to carve UART authority cap");
@@ -1830,20 +1781,17 @@ fn spawn_rtc_from_disk(
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
-    // Per-arch driver name, relative to the subtree cap. Hardcoded
-    // pending #165 (manifest-driven discovery).
-    #[cfg(target_arch = "x86_64")]
-    const RTC_NAME: &[u8] = b"cmos-rtc";
-    #[cfg(target_arch = "riscv64")]
-    const RTC_NAME: &[u8] = b"goldfish-rtc";
-
     // Request READ rights on the resolved file node. The cap svcmgr handed
     // us in SET_DRIVERS_DIR is already attenuated to LOOKUP|READ at the
     // /services/drivers/ subtree, so the namespace server will only ever
     // mint a file cap with at most those bits set.
     let requested_rights = u64::from(namespace_protocol::rights::READ);
-    let Some(walked) =
-        ns_client::walk_to_file(drivers_dir_cap, RTC_NAME, requested_rights, ipc_buf)
+    let Some(walked) = ns_client::walk_to_file(
+        drivers_dir_cap,
+        arch::current::RTC_DRIVER_NAME,
+        requested_rights,
+        ipc_buf,
+    )
     else
     {
         std::os::seraph::log!("rtc: walk_to_file failed (binary missing on rootfs)");
@@ -1860,7 +1808,7 @@ fn spawn_rtc_from_disk(
         return None;
     }
 
-    let Some(hw_cap) = carve_rtc_authority(caps)
+    let Some(hw_cap) = arch::current::carve_rtc_authority(caps)
     else
     {
         std::os::seraph::log!("rtc: failed to carve RTC authority cap");
@@ -1972,99 +1920,6 @@ fn test_spawn_orphan(
     // there is no live driver to keep it for, so release it.
     let _ = syscall::cap_delete(service_ep);
     Some(spawned)
-}
-
-/// Carve the COM1 `IoPort` (`0x3F8`..=`0x3FF`) out of devmgr's
-/// full-rights `IoPort` cap.
-#[cfg(target_arch = "x86_64")]
-fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
-{
-    ioport_carve(caps.ioport_root_cap, 0x3F8, 8)
-}
-
-/// Carve the platform RTC's hardware-authority cap out of devmgr's
-/// authority pool. The bases below are platform-static (legacy MC146818
-/// at ISA `0x70` on x86-64; QEMU virt goldfish-RTC at `0x101000` on
-/// RISC-V) and hardcoded here pending #165, which replaces all such
-/// hardcoded per-driver knowledge with ACPI `_HID` (`PNP0B00`) and DTB
-/// `compatible = "google,goldfish-rtc"` driven discovery — same forward
-/// link as on `carve_uart_authority` below.
-#[cfg(target_arch = "x86_64")]
-fn carve_rtc_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
-{
-    ioport_carve(caps.ioport_root_cap, 0x70, 2)
-}
-
-#[cfg(target_arch = "riscv64")]
-fn carve_rtc_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
-{
-    carve_subrange(caps, 0x0010_1000, 0x1000)
-}
-
-/// Carve the NS16550 `Mmio` out of the aperture covering the UART
-/// MMIO window.
-///
-/// The window is the QEMU `virt` NS16550 at `[0x1000_0000, 0x1000_1000)` —
-/// a fixed part of the QEMU virt machine model, the same basis on which
-/// [`arch::current::platform_default_ecam`] and the seeded goldfish-RTC
-/// aperture are
-/// identified. The bootloader independently discovers this base via ACPI
-/// SPCR for its early console; replacing this constant with forwarded
-/// SPCR/`_CRS` discovery is part of the data-driven device-binding follow-up.
-#[cfg(target_arch = "riscv64")]
-fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
-{
-    carve_subrange(caps, 0x1000_0000, 0x1000)
-}
-
-/// Isolate the UART interrupt cap from devmgr's IRQ range so the serial driver can
-/// route RX wakeups to its client. COM1 is ISA IRQ 4 on x86-64; the QEMU
-/// `virt` NS16550 is PLIC source 10. Both are platform-static and hardcoded on
-/// the same basis as the UART MMIO/IoPort above, pending the data-driven
-/// (ACPI/DTB) device-binding follow-up. Carve before the PCI device IRQs: the
-/// allocator is monotonic and the UART line is below the PCI GSI/PLIC range.
-#[cfg(target_arch = "x86_64")]
-fn carve_uart_irq(irq_root: &mut IrqRootAllocator) -> Option<u32>
-{
-    irq_root.isolate_one(4)
-}
-
-#[cfg(target_arch = "riscv64")]
-fn carve_uart_irq(irq_root: &mut IrqRootAllocator) -> Option<u32>
-{
-    irq_root.isolate_one(10)
-}
-
-/// Carve a narrow `IoPort` of `count` ports starting at `base` out of
-/// devmgr's full-rights `IoPort` cap via two `ioport_split` calls. Returns
-/// the narrow slot; the unused slabs are deleted, except that an
-/// overflowing `base + count` leaks the derived working cap (#446). `cap_derive`-copies the
-/// source so it stays intact for further carves. `root_cap` is that
-/// full-rights cap.
-#[cfg(target_arch = "x86_64")]
-fn ioport_carve(root_cap: u32, base: u16, count: u16) -> Option<u32>
-{
-    if root_cap == 0
-    {
-        return None;
-    }
-    let working = syscall::cap_derive(root_cap, syscall::RIGHTS_ALL).ok()?;
-    let upper_split_at = base.checked_add(count)?;
-    let Ok((lower_unused, upper)) = syscall::ioport_split(working, base)
-    else
-    {
-        let _ = syscall::cap_delete(working);
-        return None;
-    };
-    let _ = syscall::cap_delete(lower_unused);
-    let Ok((narrow, upper_unused)) = syscall::ioport_split(upper, upper_split_at)
-    else
-    {
-        let _ = syscall::cap_delete(upper);
-        return None;
-    };
-    let _ = syscall::cap_delete(upper_unused);
-    Some(narrow)
 }
 
 fn halt_loop() -> !

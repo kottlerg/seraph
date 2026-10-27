@@ -99,8 +99,9 @@ that message:
 
 Restarts are counted per service over its lifetime: the count has no
 window and is never reset. Once `service::MAX_RESTARTS` (currently `1`)
-restarts have run, the next death leaves the service degraded and not
-restarted automatically — see [restart-protocol.md](restart-protocol.md).
+restarts have run, the next death leaves the service permanently down —
+degraded, or a graceful shutdown for `critical = yes` (see
+[`critical`](#critical)) — see [restart-protocol.md](restart-protocol.md).
 
 ## `critical`
 
@@ -150,13 +151,15 @@ namespace = subtree:/data:LOOKUP+READDIR+STAT+READ+WRITE
 
 When set, svcmgr walks `<cwd>` from its own root with
 `LOOKUP+READDIR+STAT+READ` rights and passes the resulting directory
-cap as the child's `ProcessInfo.current_dir_cap`. The path must
-resolve inside the namespace. With `namespace = subtree:<path>:...`,
-a `cwd` that is neither `<path>` nor a path below it (compared by
-whole components, so `/data2` is outside `/data`) is a parser error;
-namespace servers reject `.` and `..` components, so an accepted path
-cannot walk back out. With `namespace = none`, `cwd` is a parser
-error.
+cap as the child's `ProcessInfo.current_dir_cap`; under
+`namespace = subtree:<path>:<rights>` it requests only those of the four
+rights that `<rights>` grants, so the cwd cap never exceeds the namespace
+cap. The path must resolve inside the namespace. With a subtree
+namespace, a `cwd` that is neither `<path>` nor a path below it
+(compared by whole components, so `/data2` is outside `/data`) is a
+parser error, as is a `cwd` whose `<rights>` lack `LOOKUP`; namespace
+servers reject `.` and `..` components, so an accepted path cannot walk
+back out. With `namespace = none`, `cwd` is a parser error.
 
 `std::env::current_dir()` returns `Unsupported` until a path string
 is recorded via `std::env::set_current_dir`; the cap and the
@@ -217,7 +220,7 @@ Well-known names are centralised in
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
 | `timed` | svcmgr (`timed.svc` provider) | un-badged SEND on timed's service endpoint (wall-clock) |
-| `svcmgr` | svcmgr (its own service endpoint) | un-badged SEND on svcmgr's own service endpoint |
+| `svcmgr` | svcmgr (its own service endpoint) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) |
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint |
 
 ## `provides`

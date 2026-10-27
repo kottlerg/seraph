@@ -180,7 +180,7 @@ via direct `QUERY_ENDPOINT` calls. The handover endowment and
 | Name | Source | Cap shape |
 |---|---|---|
 | `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on the root filesystem's namespace endpoint at its root directory |
-| `svcmgr` | svcmgr (its own service ep) | un-badged SEND on svcmgr's own service endpoint |
+| `svcmgr` | svcmgr (its own service ep) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) |
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
@@ -209,8 +209,9 @@ tree.
 
 Each `.svc` carries `restart = never | on_failure | always`. Restarts
 are counted per service over its lifetime (no window, no reset). Once
-`MAX_RESTARTS` (currently `1`) restarts have run, the service is marked
-degraded on its next death and not restarted automatically. See
+`MAX_RESTARTS` (currently `1`) restarts have run, the service's next
+death leaves it permanently down — degraded, or a graceful shutdown for
+`critical = yes`. See
 [docs/restart-protocol.md](docs/restart-protocol.md).
 
 ---

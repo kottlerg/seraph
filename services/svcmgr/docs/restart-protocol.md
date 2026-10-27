@@ -75,16 +75,15 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
      [`RestartRecipe`](../src/service.rs).
    * Re-apply the per-service namespace policy **and `cwd`** via
      [`apply_namespace_policy`](#shared-spawn-primitives).
+   * Start the child via [`start_process`](#shared-spawn-primitives)
+     (`START_PROCESS`).
    * Serve the restart bootstrap round, re-resolving the recipe's
-     `seed` names from the discovery registry in declaration order (or,
-     for init-endowed services with no seeds, re-deriving the stored
-     bundle caps).
+     `seed` names from the discovery registry in declaration order.
    * Rebind death-notification on the new thread cap using the same
      correlator so subsequent crashes route back to the same entry.
    * On success: increment `restart_count`, return `Restarted`.
-   * On failure: a child already created (failed bundle-cap or provider
-     RECV derive, `START_PROCESS`, bootstrap serve, or death rebind) is
-     destroyed via `DESTROY_PROCESS`, as first launch does; then route
+   * On failure: any failure after `CREATE_FROM_FILE` destroys the new
+     child via `DESTROY_PROCESS`, as first launch does; then route
      through `permanent_death_outcome`.
 
 `dispatch_deaths` reacts to `Unrecoverable` by calling

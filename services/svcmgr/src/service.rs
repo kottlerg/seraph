@@ -16,17 +16,10 @@ use crate::definitions::reconcile::PendingRegistration;
 /// Maximum number of monitored services.
 pub const MAX_SERVICES: usize = 16;
 
-/// Maximum number of extra named caps stored per service for restart.
-///
-/// Vestigial: the substrate services are endowed with only a thread cap
-/// (no extra bundle caps), and recipe-launched services replay their caps
-/// from `seed = ...` rather than a stored bundle. Kept as the restart
-/// path's no-recipe fallback slot; bounded at 1 until a concrete consumer
-/// appears.
-pub const MAX_BUNDLE_CAPS: usize = 1;
-
-/// Maximum restarts over a service's lifetime before it is marked
-/// degraded. `restart_count` is never reset, so the budget has no window.
+/// Maximum restarts over a service's lifetime; a death after the budget is
+/// spent leaves the service permanently down (see
+/// `services/svcmgr/docs/restart-protocol.md` § Decision tree).
+/// `restart_count` is never reset, so the budget has no window.
 pub const MAX_RESTARTS: u32 = 1;
 
 /// Restart policy: restart unconditionally on any exit.
@@ -64,12 +57,6 @@ pub struct ServiceEntry
     /// Length of `vfs_path` in bytes. Zero only for an empty slot: every
     /// reconciled entry carries its recipe's `binary` path.
     pub vfs_path_len: u8,
-    /// Extra named restart-bundle caps beyond the thread cap. Each
-    /// entry is re-derived and re-delivered over the bootstrap protocol
-    /// after a restart so the child comes back with its full cap set.
-    pub bundle: [registry::Entry; MAX_BUNDLE_CAPS],
-    /// Number of valid entries at the front of `bundle`.
-    pub bundle_count: u8,
     /// Restart policy (`POLICY_ALWAYS`, `POLICY_ON_FAILURE`, etc.).
     pub restart_policy: u8,
     /// Whether the system is viable without this service once it is
@@ -77,7 +64,8 @@ pub struct ServiceEntry
     /// unrecoverable death; `false` → the system continues degraded.
     /// Orthogonal to `restart_policy`, which alone decides respawn.
     pub system_critical: bool,
-    /// Number of restart attempts so far.
+    /// Number of successful restarts over the service's lifetime; never
+    /// reset.
     pub restart_count: u32,
     /// Whether this service is currently active.
     pub active: bool,
@@ -122,12 +110,6 @@ impl ServiceEntry
             provided_endpoint: 0,
             vfs_path: [0; ipc::MAX_PATH_LEN],
             vfs_path_len: 0,
-            bundle: [registry::Entry {
-                name: [0; registry::NAME_MAX],
-                name_len: 0,
-                cap: 0,
-            }; MAX_BUNDLE_CAPS],
-            bundle_count: 0,
             restart_policy: 0,
             system_critical: false,
             restart_count: 0,

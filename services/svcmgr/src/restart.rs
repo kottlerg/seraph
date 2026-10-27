@@ -12,16 +12,16 @@
 //! argv/env/cwd/seed surfaces, serves its bootstrap, and rebinds death
 //! notification.
 //!
-//! Bootstrap delivery re-resolves the recipe's `seed` caps (or, for
-//! init-registered services, re-derives the restart-bundle caps). log and
-//! procmgr endpoints arrive via `ProcessInfo`, so they are not part of the
-//! restart cap set.
+//! Bootstrap delivery re-resolves the recipe's `seed` caps (the log-sink
+//! service instead gets a round minted from the reserved log-sink sources).
+//! log and procmgr endpoints arrive via `ProcessInfo`, so they are not part
+//! of the restart cap set.
 
 use crate::REGISTRY_CAPACITY;
-use crate::definitions::build_blob;
 use crate::definitions::launch::{
     LaunchKind, assemble_boot_caps, delete_caps, mint_logd_boot_caps, resolve_seeds,
 };
+use crate::definitions::{build_blob, cwd_rights};
 use crate::service::{MAX_RESTARTS, POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
 use ipc::{IpcMessage, procmgr_labels};
 use syscall_abi::MSG_DATA_WORDS_MAX;
@@ -467,8 +467,8 @@ fn restart_process(
 }
 
 /// Assemble the restart bootstrap cap set for `svc`. Returns `None`, with
-/// every cap it derived released, when a bundle-cap or provider-RECV derive
-/// fails; the caller then destroys the new child.
+/// the resolved seeds released, when the provider-RECV derive fails; the
+/// caller then destroys the new child.
 ///
 /// The log-sink service (real-logd) gets a freshly-minted round from the
 /// reserved log-sink sources, with no `HANDOVER_PULL` SEND — init-logd is long
@@ -477,11 +477,10 @@ fn restart_process(
 /// the endpoint object, and svcmgr's reserved source kept it alive across the
 /// crash.
 ///
-/// Otherwise: a recipe declaring `seed = ...` re-resolves those seeds from the
-/// registry by name, in declaration order — byte-for-byte the positional set
-/// first launch delivered. The fallback to stored bundle caps is empty in
-/// practice (recipe-launched services carry seeds and no bundle; the
-/// init-endowed substrate carries only a thread cap). A `provides` service's
+/// Otherwise the recipe's `seed = ...` names are re-resolved from the
+/// registry, in declaration order — byte-for-byte the positional set first
+/// launch delivered (empty for a recipe with no seeds, such as the
+/// init-endowed substrate's). A `provides` service's
 /// own service-endpoint RECV leads as cap[0]; the endpoint persists on the
 /// entry, so a fresh RECV reattaches the restarted instance to the same object
 /// consumers already hold a SEND on. A missing RECV would shift the seeds down
@@ -501,31 +500,8 @@ fn restart_boot_caps(
 
     let restart_caps: Vec<u32> = match recipe
     {
-        Some(r) if !r.seed.is_empty() => resolve_seeds(&r.seed, svc.name_str(), registry),
-        _ =>
-        {
-            let mut caps: Vec<u32> = Vec::new();
-            for entry in &svc.bundle[..svc.bundle_count as usize]
-            {
-                if caps.len() >= syscall_abi::MSG_CAP_SLOTS_MAX
-                {
-                    break;
-                }
-                if entry.cap == 0
-                {
-                    continue;
-                }
-                let Ok(c) = syscall::cap_derive(entry.cap, syscall::RIGHTS_EP_SEND)
-                else
-                {
-                    std::os::seraph::log!("cannot derive bundle cap for restart");
-                    delete_caps(&caps);
-                    return None;
-                };
-                caps.push(c);
-            }
-            caps
-        }
+        Some(r) => resolve_seeds(&r.seed, svc.name_str(), registry),
+        None => Vec::new(),
     };
 
     let provided_recv = if svc.provided_endpoint != 0
@@ -692,10 +668,21 @@ pub fn apply_namespace_policy(
         }
     };
 
-    configure_namespace_caps(ns_cap, cwd, root_cap, process_handle, thread_cap, ctx)
+    let subtree_rights = (svc.ns_policy_kind == ipc::svcmgr_labels::NS_POLICY_SUBTREE)
+        .then_some(svc.ns_subtree_rights);
+    configure_namespace_caps(
+        ns_cap,
+        cwd,
+        cwd_rights(subtree_rights),
+        root_cap,
+        process_handle,
+        thread_cap,
+        ctx,
+    )
 }
 
-/// Walk the optional `cwd` against `root_cap`, then deliver the namespace
+/// Walk the optional `cwd` against `root_cap` requesting `cwd_rights`
+/// ([`cwd_rights`] of the namespace shape), then deliver the namespace
 /// cap (and the cwd cap, when present) to the suspended child via
 /// `CONFIGURE_NAMESPACE`. Shared by the restart path
 /// ([`apply_namespace_policy`]) and the launch path
@@ -706,24 +693,19 @@ pub fn apply_namespace_policy(
 pub(crate) fn configure_namespace_caps(
     ns_cap: u32,
     cwd: Option<&str>,
+    cwd_rights: u32,
     root_cap: u32,
     process_handle: u32,
     thread_cap: u32,
     ctx: &RestartCtx,
 ) -> bool
 {
-    // cwd: walk against svcmgr's root with lookup+readdir+stat+read — the
-    // minimum a child needs for relative file ops in std::fs. (Tighter
-    // confinement is the namespace cap's job; cwd shares the path-walk.)
+    // cwd is walked from svcmgr's universal root; the `.svc` parser keeps a
+    // subtree recipe's cwd inside the subtree, and `cwd_rights` keeps the cap
+    // within the subtree's rights (service-definitions.md § cwd).
     let cwd_cap = if let Some(cwd_path) = cwd
     {
-        let rights = u64::from(
-            namespace_protocol::rights::LOOKUP
-                | namespace_protocol::rights::READDIR
-                | namespace_protocol::rights::STAT
-                | namespace_protocol::rights::READ,
-        );
-        match std::os::seraph::namespace_lookup_dir(root_cap, cwd_path, rights)
+        match std::os::seraph::namespace_lookup_dir(root_cap, cwd_path, u64::from(cwd_rights))
         {
             Ok(c) => c,
             Err(e) =>

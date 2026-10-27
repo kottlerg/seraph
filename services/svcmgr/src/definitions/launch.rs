@@ -14,7 +14,7 @@
 
 use ipc::{devmgr_labels, procmgr_labels};
 
-use super::{Definition, NamespaceShape, ProvidedName, build_blob};
+use super::{Definition, NamespaceShape, ProvidedName, build_blob, cwd_rights};
 use crate::REGISTRY_CAPACITY;
 use crate::registry_lookup_derived;
 use crate::restart::{
@@ -497,9 +497,15 @@ fn configure_namespace(def: &Definition, created: &CreatedProcess, ctx: &Restart
 
     // cwd walk + CONFIGURE_NAMESPACE delivery + cap cleanup is shared
     // with the restart path so both paths install cwd identically.
+    let subtree_rights = match &def.namespace
+    {
+        NamespaceShape::Subtree { rights, .. } => Some(*rights),
+        _ => None,
+    };
     crate::restart::configure_namespace_caps(
         ns_cap,
         def.cwd.as_deref(),
+        cwd_rights(subtree_rights),
         root_cap,
         process_handle,
         thread_cap,

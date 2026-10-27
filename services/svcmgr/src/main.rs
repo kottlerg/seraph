@@ -208,8 +208,14 @@ fn publish_well_known(
         std::os::seraph::log!("no rootfs.root source cap; not published");
     }
 
-    // svcmgr — SEND on svcmgr's own service endpoint (crasher seeds it).
-    match syscall::cap_derive(caps.service_ep, syscall::RIGHTS_EP_SEND)
+    // svcmgr — SEND on svcmgr's own service endpoint (crasher seeds it),
+    // badged so no consumer holds an unbadged source it could re-badge with
+    // a verb bit.
+    match syscall::cap_derive_badge(
+        caps.service_ep,
+        syscall::RIGHTS_EP_SEND,
+        svcmgr_labels::PUBLISHED_SEND_BADGE,
+    )
     {
         Ok(send) =>
         {
@@ -456,7 +462,7 @@ fn dispatch_ipc(
     {
         svcmgr_labels::HANDOVER_COMPLETE =>
         {
-            if msg.badge != svcmgr_labels::HANDOVER_AUTHORITY || state.handover_done
+            if !definitions::handover_permitted(msg.badge, state.handover_done)
             {
                 let reply = IpcMessage::new(ipc::svcmgr_errors::UNAUTHORIZED);
                 // SAFETY: ipc_buf is the registered IPC buffer.

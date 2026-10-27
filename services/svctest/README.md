@@ -1,10 +1,10 @@
 # svctest
 
 Services-surface test harness. A std-built binary installed at `/tests/svctest` that exercises
-the services tier (procmgr, memmgr, vfsd and fatfs, devmgr, pwrmgr, timed), the kernel objects
-those services hand out, and the `ruststd` runtime layer end to end. `svcmgr` spawns it from the
-`svctest.svc` recipe, which lives in `/config/svcmgr/tests/` and runs only when staged into
-`/config/svcmgr/services/`, per [docs/testing.md § Gating](../../docs/testing.md#gating).
+the services tier (procmgr, memmgr, vfsd and fatfs, devmgr, svcmgr, pwrmgr, timed), the kernel
+objects those services hand out, and the `ruststd` runtime layer end to end. `svcmgr` spawns it
+from the `svctest.svc` recipe, which lives in `/config/svcmgr/tests/` and runs only when staged
+into `/config/svcmgr/services/`, per [docs/testing.md § Gating](../../docs/testing.md#gating).
 
 ---
 
@@ -42,7 +42,7 @@ services/svctest/
         ├── fs_ipc.rs          # Raw `FS_*` IPC against vfsd and fatfs
         ├── fs_std.rs          # `std::fs` over the FS IPC contract
         ├── pwrmgr.rs          # Shutdown cap-deny check and terminal shutdown
-        ├── svcmgr.rs          # `HANDOVER_COMPLETE` refused from a non-init caller
+        ├── svcmgr.rs          # svcmgr's handover and publish gates via the registry SEND
         └── timed.rs           # `SystemTime::now()` through svcmgr and timed
 ```
 
@@ -134,6 +134,7 @@ spawned by the `fs_crossover_bench` phase, reads the build-synthesised
 | [docs/testing.md](../../docs/testing.md) | Harness model, reporting marker, sysroot layout, gating, cross-harness conventions |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Process startup, `ProcessInfo` handover, process death |
 | [Service Definitions](../svcmgr/docs/service-definitions.md) | `.svc` recipe keys, including `seed` resolution |
+| [svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) | `HANDOVER_COMPLETE` and `PUBLISH_ENDPOINT` and their authority badges |
 | [services/pwrmgr/README.md](../pwrmgr/README.md) | pwrmgr `SHUTDOWN` and its authority badge |
 | [services/drivers/test-orphan/README.md](../drivers/test-orphan/README.md) | Fault-injection driver behind the orphan-teardown phase |
 

@@ -368,16 +368,21 @@ pub fn resolve_spawn_sched(
 /// - **equal to `reserved_low32`** — the init-reap correlator
 ///   (`INIT_REAP_CORRELATOR`), which `dispatch_death` routes to init teardown.
 ///
+/// and no bit of `verb_bits` may be set: the badge rides each child's
+/// registry SEND on svcmgr's endpoint (and its log SEND and process handle),
+/// where a verb bit (`ipc::VERB_BIT_MASK`) would grant the child an authority
+/// its servers reserve to trusted minters.
+///
 /// All are reachable under random badge minting; the old monotonic counter
 /// started at `LOG_BADGE_FIRST_CHILD` and so upheld the floor structurally.
 #[must_use]
-pub fn badge_is_acceptable(badge: u64, min_low: u64, reserved_low32: u32) -> bool
+pub fn badge_is_acceptable(badge: u64, min_low: u64, reserved_low32: u32, verb_bits: u64) -> bool
 {
     // The low-32 extraction is intentional: only the truncated u32 reaches
     // the correlator-bearing death-EQ API and the logd badge.
     #[allow(clippy::cast_possible_truncation)]
     let low = badge as u32;
-    u64::from(low) >= min_low && low != reserved_low32
+    u64::from(low) >= min_low && low != reserved_low32 && badge & verb_bits == 0
 }
 
 #[cfg(test)]
@@ -413,8 +418,8 @@ mod tests
         // A bare match and a high-bits-set u64 whose low word equals the
         // sentinel must both be rejected — proving the `as u32` narrowing
         // rather than a full-u64 compare. (Floor 16 = LOG_BADGE_FIRST_CHILD.)
-        assert!(!badge_is_acceptable(u64::from(u32::MAX), 16, u32::MAX));
-        assert!(!badge_is_acceptable(0x0000_0005_FFFF_FFFF, 16, u32::MAX));
+        assert!(!badge_is_acceptable(u64::from(u32::MAX), 16, u32::MAX, 0));
+        assert!(!badge_is_acceptable(0x0000_0005_FFFF_FFFF, 16, u32::MAX, 0));
     }
 
     #[test]
@@ -423,19 +428,46 @@ mod tests
         // The reserved log-badge / no-correlator range (low word 0..16) is
         // rejected regardless of the high word, so every minted badge carries
         // a routable correlator and never aliases a reserved logd slot.
-        assert!(!badge_is_acceptable(0, 16, u32::MAX));
-        assert!(!badge_is_acceptable(1, 16, u32::MAX));
-        assert!(!badge_is_acceptable(2, 16, u32::MAX));
-        assert!(!badge_is_acceptable(15, 16, u32::MAX));
-        assert!(!badge_is_acceptable(0x0000_0007_0000_000F, 16, u32::MAX));
+        assert!(!badge_is_acceptable(0, 16, u32::MAX, 0));
+        assert!(!badge_is_acceptable(1, 16, u32::MAX, 0));
+        assert!(!badge_is_acceptable(2, 16, u32::MAX, 0));
+        assert!(!badge_is_acceptable(15, 16, u32::MAX, 0));
+        assert!(!badge_is_acceptable(0x0000_0007_0000_000F, 16, u32::MAX, 0));
+    }
+
+    #[test]
+    fn badge_is_rejected_when_a_verb_bit_is_set()
+    {
+        // Bits 62 and 63 are svcmgr's HANDOVER_AUTHORITY / PUBLISH_AUTHORITY
+        // on the child's registry SEND; a low word that clears every other
+        // check must not save a badge carrying either.
+        let verbs = ipc::VERB_BIT_MASK;
+        assert!(!badge_is_acceptable(
+            0x8000_0000_0000_0010,
+            16,
+            u32::MAX,
+            verbs
+        ));
+        assert!(!badge_is_acceptable(
+            0x4000_0000_0000_0010,
+            16,
+            u32::MAX,
+            verbs
+        ));
+        assert!(badge_is_acceptable(
+            0x3FFF_FFFF_0000_0010,
+            16,
+            u32::MAX,
+            verbs
+        ));
     }
 
     #[test]
     fn badge_is_accepted_when_low_word_clears_floor_and_correlator()
     {
-        assert!(badge_is_acceptable(16, 16, u32::MAX));
+        assert!(badge_is_acceptable(16, 16, u32::MAX, 0));
         // High bits set, low word clears the floor and the sentinel: accepted.
-        assert!(badge_is_acceptable(0x0000_0001_0000_0010, 16, u32::MAX));
+        assert!(badge_is_acceptable(0x0000_0001_0000_0010, 16, u32::MAX, 0));
     }
 
     #[test]

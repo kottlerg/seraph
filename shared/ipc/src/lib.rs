@@ -785,19 +785,25 @@ pub mod svcmgr_labels
     /// crash-restart cycle.
     pub const NS_POLICY_SUBTREE: u8 = 2;
     /// Notification that init handover is complete. Honoured once, and
-    /// only from a caller whose badge equals [`HANDOVER_AUTHORITY`];
+    /// only from a caller whose badge carries [`HANDOVER_AUTHORITY`];
     /// svcmgr replies [`svcmgr_errors::UNAUTHORIZED`] to any other caller
     /// and to a repeat.
     pub const HANDOVER_COMPLETE: u64 = 2;
-    /// Badge on the SEND init derives to call [`HANDOVER_COMPLETE`]. svcmgr
-    /// compares the caller's badge to this value for equality rather than
-    /// testing it as a verb bit: no other SEND on svcmgr's endpoint carries
-    /// exactly this value. init's own and the published `svcmgr` SEND are
-    /// unbadged, devmgr's publish SEND carries [`PUBLISH_AUTHORITY`] alone,
-    /// and a per-process `service_registry_cap` badge, random in its high
-    /// bits, keeps its low 32 bits at or above
-    /// [`log_badges::LOG_BADGE_FIRST_CHILD`](crate::log_badges::LOG_BADGE_FIRST_CHILD).
+    /// Verb-bit authorising [`HANDOVER_COMPLETE`]. init alone mints it, on
+    /// a SEND it derives for the handover call and deletes after. Only
+    /// trusted minters hold an unbadged SEND on svcmgr's endpoint (init and
+    /// procmgr's per-child source), which is what keeps the bit theirs: every
+    /// other SEND on the endpoint is already badged (a badge is set once)
+    /// without it — devmgr's with [`PUBLISH_AUTHORITY`], the published
+    /// `svcmgr` name's with [`PUBLISHED_SEND_BADGE`], and each per-process
+    /// `service_registry_cap` with a process badge, which
+    /// [`VERB_BIT_MASK`](crate::VERB_BIT_MASK) keeps clear of verb bits.
     pub const HANDOVER_AUTHORITY: u64 = 1u64 << 62;
+    /// Badge on the SEND svcmgr publishes on its own endpoint under the
+    /// `svcmgr` name: a fixed value with no verb bit, so a consumer can
+    /// `QUERY_ENDPOINT` through it but cannot re-badge it to mint
+    /// [`HANDOVER_AUTHORITY`] or [`PUBLISH_AUTHORITY`].
+    pub const PUBLISHED_SEND_BADGE: u64 = 1;
     /// Publish a named endpoint into the discovery registry.
     ///
     /// Data words: `[name_len, name_words...]`. One cap attached = the
@@ -1879,6 +1885,13 @@ pub mod stream_labels
     pub const STREAM_REGISTER_NAME: u64 = 11;
 }
 
+/// Badge bits reserved for verb authority on every endpoint: each
+/// `*_AUTHORITY` constant in this crate is one of these bits. A minter that
+/// draws badges at random (procmgr's per-process badge) keeps them clear, so
+/// only a server's trusted minters set a verb bit (docs/capability-model.md
+/// § Verb-bit authority pattern).
+pub const VERB_BIT_MASK: u64 = (1u64 << 63) | (1u64 << 62);
+
 /// Reserved log-endpoint badges.
 ///
 /// Every badged SEND cap on the log endpoint carries a `u64` badge
@@ -2167,9 +2180,8 @@ pub mod svcmgr_errors
     /// revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
     /// Caller's badge lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
-    /// `PUBLISH_ENDPOINT` request, or is not exactly
-    /// [`svcmgr_labels::HANDOVER_AUTHORITY`] on a `HANDOVER_COMPLETE`, or the
-    /// handover has already run.
+    /// `PUBLISH_ENDPOINT` request or [`svcmgr_labels::HANDOVER_AUTHORITY`] on
+    /// a `HANDOVER_COMPLETE`, or the handover has already run.
     pub const UNAUTHORIZED: u64 = 8;
     /// Client-side: the underlying `ipc_call` returned `Err` (no reply
     /// from svcmgr, transport-level failure). Never emitted by svcmgr

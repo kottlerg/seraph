@@ -106,7 +106,8 @@ fn check_path_len(lineno: usize, path: &str, too_long: &'static str) -> Result<(
 /// Whether `cwd` names `subtree` itself or a directory below it, compared
 /// component-wise so `/data2` does not pass for `/data`. svcmgr walks `cwd`
 /// from its universal root, so this check is what keeps a subtree-confined
-/// child's working-directory cap inside its namespace. Namespace servers
+/// child's working-directory cap at a directory inside its namespace;
+/// [`crate::cwd_rights`] bounds that cap's rights. Namespace servers
 /// reject `.` and `..` components (docs/namespace-model.md), so a path that
 /// passes cannot walk back out.
 fn cwd_within_subtree(cwd: &str, subtree: &str) -> bool
@@ -143,7 +144,8 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// violate the grammar or a semantic rule: a missing `=`, an unknown or
 /// duplicated key, a missing mandatory key, a malformed value, an
 /// inconsistent combination (`cwd` with `namespace = none`, a `cwd` outside
-/// a `namespace = subtree:` path, `log_sink` with `seed`/`provides`, more
+/// a `namespace = subtree:` path or under one whose rights lack `LOOKUP`,
+/// `log_sink` with `seed`/`provides`, more
 /// `seed` names than the bootstrap caps left after a provider's RECV,
 /// `sched_max` below `priority`), a `binary` or
 /// subtree path over `ipc::MAX_PATH_LEN` ([`ParseError::InvalidValue`]), or
@@ -423,13 +425,24 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         ));
     }
 
-    if let (NamespaceShape::Subtree { path, .. }, Some(dir)) = (&namespace, &cwd)
-        && !cwd_within_subtree(dir, path)
+    if let (NamespaceShape::Subtree { path, rights }, Some(dir)) = (&namespace, &cwd)
     {
-        return Err(ParseError::InvalidValue(
-            0,
-            "cwd must be the namespace subtree path or a path below it",
-        ));
+        if !cwd_within_subtree(dir, path)
+        {
+            return Err(ParseError::InvalidValue(
+                0,
+                "cwd must be the namespace subtree path or a path below it",
+            ));
+        }
+        // The cwd cap takes only the subtree's rights (`cwd_rights`); without
+        // LOOKUP it could not resolve a relative path.
+        if rights & ns_rights::LOOKUP == 0
+        {
+            return Err(ParseError::InvalidValue(
+                0,
+                "cwd under a subtree namespace needs LOOKUP in the subtree rights",
+            ));
+        }
     }
 
     // One bootstrap round carries at most MSG_CAP_SLOTS_MAX caps, and a
@@ -852,6 +865,36 @@ sched_max = 12\n";
             let def = parse("x", &subtree_recipe_with_cwd(cwd)).expect("cwd inside subtree");
             assert_eq!(def.cwd.as_deref(), Some(cwd));
         }
+    }
+
+    #[test]
+    fn subtree_path_trailing_slash_is_normalised_for_the_cwd_check()
+    {
+        let recipe = |subtree: &str, cwd: &str| {
+            format!(
+                "binary = /services/x\nrestart = never\ncritical = no\n\
+                 namespace = subtree:{subtree}:LOOKUP\ncwd = {cwd}\n"
+            )
+        };
+        for (subtree, cwd) in [("/data/", "/data"), ("/data/", "/data/logs"), ("/", "/etc")]
+        {
+            parse("x", &recipe(subtree, cwd)).expect("cwd inside subtree");
+        }
+        assert!(matches!(
+            parse("x", &recipe("/data/", "/data2")),
+            Err(ParseError::InvalidValue(0, why)) if why.starts_with("cwd must be")
+        ));
+    }
+
+    #[test]
+    fn subtree_cwd_needs_lookup_in_the_subtree_rights()
+    {
+        let recipe = "binary = /services/x\nrestart = never\ncritical = no\n\
+                      namespace = subtree:/data:READ+STAT\ncwd = /data\n";
+        assert!(matches!(
+            parse("x", recipe),
+            Err(ParseError::InvalidValue(0, why)) if why.starts_with("cwd under a subtree")
+        ));
     }
 
     #[test]

@@ -1233,8 +1233,9 @@ pub fn phase3_svcmgr_handover(
     // while the underlying objects keep backing init's still-running threads.
     let reap_bound = register_init_reap_objects(procmgr_ep, info, init_logd_thread_cap, ipc_buf);
 
-    // svcmgr honours HANDOVER_COMPLETE only through a SEND badged exactly
-    // `HANDOVER_AUTHORITY`, so init derives one for the call and deletes it.
+    // svcmgr honours HANDOVER_COMPLETE only through a SEND carrying the
+    // `HANDOVER_AUTHORITY` verb-bit, so init derives one for the call and
+    // deletes it.
     let handover_msg = IpcMessage::new(svcmgr_labels::HANDOVER_COMPLETE);
     match syscall::cap_derive_badge(
         svcmgr_service_ep,

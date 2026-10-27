@@ -94,24 +94,29 @@ label field identifies the operation.
 ### Label 2: `HANDOVER_COMPLETE`
 
 Notifications that init has finished serving the handover endowment.
-svcmgr honours it once, and only from a caller whose badge equals
-`svcmgr_labels::HANDOVER_AUTHORITY` exactly: init derives a SEND with
-that badge for the call and deletes it after. Equality, not a verb-bit
-test, because the per-process SEND's badge is random in its high bits;
-no other SEND on the endpoint carries the value (see the constant's
-rustdoc in [`shared/ipc`](../../../shared/ipc/src/lib.rs)). Any other
-caller, and any repeat, gets `UNAUTHORIZED` and triggers nothing, so the
-per-process SEND stays usable for `QUERY_ENDPOINT` only. On the honoured
-call svcmgr replies `SUCCESS` immediately (so init can proceed to
-teardown), then runs
+svcmgr honours it once, and only from a caller whose badge carries the
+`svcmgr_labels::HANDOVER_AUTHORITY` verb-bit (bit 62): init derives a
+SEND with that badge for the call and deletes it after. Only svcmgr's
+trusted minters hold an unbadged SEND on the endpoint (init, and procmgr's
+per-child source), and every other SEND is already badged without the
+bit: devmgr's with `PUBLISH_AUTHORITY`, the published `svcmgr` name's with
+`svcmgr_labels::PUBLISHED_SEND_BADGE`, and each per-process
+`service_registry_cap` with a process badge procmgr keeps clear of verb
+bits (see [Capability Model](../../../docs/capability-model.md#verb-bit-authority-pattern)).
+Any other caller, and any repeat, gets `UNAUTHORIZED` and triggers
+nothing. The decision is `svcmgr_defs::handover_permitted`. On the
+honoured call svcmgr replies `SUCCESS` immediately (so init can proceed
+to teardown), then runs
 [`definitions::reconcile::reconcile_and_launch`](../src/definitions/reconcile.rs):
 
 1. Scan `/config/svcmgr/services/`, parse each `.svc` into a
    [`Definition`](../src/definitions/mod.rs).
 2. Reconcile against the pending-registration table (the substrate pairs
    parked from the endowment):
-   * **parked AND defined** — bind death-notification, record a
-     `ServiceEntry` with the parsed recipe.
+   * **parked AND defined** — bind death-notification, record the
+     recipe's fixed fields on the `ServiceEntry` and its argv/env/cwd/seed,
+     log-sink flag, and scheduling fields in the parallel `RestartRecipe`
+     table.
    * **defined only** — launch via [`definitions::launch`](../src/definitions/launch.rs).
    * **parked without definition** — log `registered without
      definition: <name>; refusing to bind`.
@@ -125,14 +130,14 @@ authoritative reconciliation table.
 | Field | Value |
 |---|---|
 | label | `2` |
-| badge | MUST equal `HANDOVER_AUTHORITY`; rejected with `UNAUTHORIZED` otherwise. |
+| badge | MUST carry `HANDOVER_AUTHORITY`; rejected with `UNAUTHORIZED` otherwise. |
 
 **Reply:**
 
 | label value | Meaning |
 |---|---|
 | `0` (`SUCCESS`) | Handover accepted; reconciliation runs after the reply. |
-| `UNAUTHORIZED` | Caller's badge is not `HANDOVER_AUTHORITY`, or the handover already ran. |
+| `UNAUTHORIZED` | Caller's badge lacks `HANDOVER_AUTHORITY`, or the handover already ran. |
 
 ### Label 3: `PUBLISH_ENDPOINT`
 
@@ -245,8 +250,9 @@ See [service-definitions.md](service-definitions.md#restart) for the
 | `POLICY_ALWAYS` | Restart on every exit |
 
 Restarts are counted per service over its lifetime (no window, no
-reset). Once `MAX_RESTARTS` restarts have run, the service is marked
-degraded on its next death and not restarted automatically — see
+reset). Once `MAX_RESTARTS` restarts have run, the service's next death
+leaves it permanently down — degraded, or a graceful shutdown for
+`critical = yes` — see
 [restart-protocol.md](restart-protocol.md).
 
 ---

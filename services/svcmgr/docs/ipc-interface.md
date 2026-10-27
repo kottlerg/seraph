@@ -13,8 +13,10 @@ svcmgr holds the Receive-side capability (delivered in the handover
 endowment) and multiplexes it with the shared death-notification
 EventQueue via a WaitSet.
 
-A SEND on the same endpoint (without the [`PUBLISH_AUTHORITY`](#publish-authority)
-verb bit) is delivered to every process via
+A SEND on the same endpoint (carrying neither the
+[`PUBLISH_AUTHORITY`](#publish-authority) nor the
+[`HANDOVER_AUTHORITY`](#label-2-handover_complete) verb bit) is delivered to
+every process via
 [`ProcessInfo.service_registry_cap`](../../../abi/process-abi/README.md#processinfo)
 so userspace consumers can
 `QUERY_ENDPOINT` for published names.
@@ -39,7 +41,7 @@ kind in `data[0]`:
 | caps[2] | SEND on the root filesystem's namespace endpoint (published as `rootfs.root`; `0` if init could not derive it) |
 | caps[3] | `SEND\|GRANT`, badge-0 source on devmgr's registry endpoint (`0` if absent) |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `4`) handshake |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `5`) handshake |
 
 svcmgr mints the `devmgr.registry` publish cap
 (`REGISTRY_QUERY_AUTHORITY`) and the `SET_DRIVERS_DIR` cap
@@ -93,16 +95,30 @@ label field identifies the operation.
 
 ### Label 2: `HANDOVER_COMPLETE`
 
-Notifications that init has finished serving the handover endowment. svcmgr
-replies `SUCCESS` immediately (so init can proceed to teardown), then runs
+Notifications that init has finished serving the handover endowment.
+svcmgr honours it once, and only from a caller whose badge carries the
+`svcmgr_labels::HANDOVER_AUTHORITY` verb-bit (bit 62): init derives a
+SEND with that badge for the call and deletes it after. Only svcmgr and
+its trusted minters hold an unbadged SEND on the endpoint (init, and
+procmgr's per-child source), and every other SEND is already badged without the
+bit: devmgr's with `PUBLISH_AUTHORITY`, the published `svcmgr` name's with
+`svcmgr_labels::PUBLISHED_SEND_BADGE`, and each per-process
+`service_registry_cap` with a process badge procmgr keeps clear of verb
+bits (see [Capability Model](../../../docs/capability-model.md#verb-bit-authority-pattern)).
+Any other caller, and any repeat, gets `UNAUTHORIZED` and triggers
+nothing. The decision is `svcmgr_defs::handover_permitted`. On the
+honoured call svcmgr replies `SUCCESS` immediately (so init can proceed
+to teardown), then runs
 [`definitions::reconcile::reconcile_and_launch`](../src/definitions/reconcile.rs):
 
 1. Scan `/config/svcmgr/services/`, parse each `.svc` into a
    [`Definition`](../src/definitions/mod.rs).
 2. Reconcile against the pending-registration table (the substrate pairs
    parked from the endowment):
-   * **parked AND defined** — bind death-notification, record a
-     `ServiceEntry` with the parsed recipe.
+   * **parked AND defined** — bind death-notification, record the
+     recipe's fixed fields on the `ServiceEntry` and its argv/env/cwd/seed,
+     log-sink flag, and scheduling fields in the parallel `RestartRecipe`
+     table.
    * **defined only** — launch via [`definitions::launch`](../src/definitions/launch.rs).
    * **parked without definition** — log `registered without
      definition: <name>; refusing to bind`.
@@ -116,12 +132,14 @@ authoritative reconciliation table.
 | Field | Value |
 |---|---|
 | label | `2` |
+| badge | MUST carry `HANDOVER_AUTHORITY`; rejected with `UNAUTHORIZED` otherwise. |
 
 **Reply:**
 
 | label value | Meaning |
 |---|---|
-| `0` (`SUCCESS`) | Always returned — reconciliation runs after the reply. |
+| `0` (`SUCCESS`) | Handover accepted; reconciliation runs after the reply. |
+| `UNAUTHORIZED` | Caller's badge lacks `HANDOVER_AUTHORITY`, or the handover already ran. |
 
 ### Label 3: `PUBLISH_ENDPOINT`
 
@@ -233,9 +251,10 @@ See [service-definitions.md](service-definitions.md#restart) for the
 | `POLICY_ON_FAILURE` | Restart only when `exit_reason >= EXIT_FAULT_BASE` |
 | `POLICY_ALWAYS` | Restart on every exit |
 
-Restart attempts are counted per service. After `MAX_RESTARTS`
-consecutive restarts the service is marked degraded and not
-restarted automatically — see
+Restarts are counted per service over its lifetime (no window, no
+reset). Once `MAX_RESTARTS` restarts have run, the service's next death
+leaves it permanently down — degraded, or a graceful shutdown for
+`critical = yes` — see
 [restart-protocol.md](restart-protocol.md).
 
 ---

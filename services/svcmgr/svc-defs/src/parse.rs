@@ -14,7 +14,7 @@
 //! spec.
 
 use namespace_protocol::rights as ns_rights;
-use syscall_abi::MSG_DATA_WORDS_MAX;
+use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 use super::{Definition, NamespaceShape, ProvidedName, RestartPolicy, build_blob};
 
@@ -103,6 +103,22 @@ fn check_path_len(lineno: usize, path: &str, too_long: &'static str) -> Result<(
     Ok(())
 }
 
+/// Whether `cwd` names `subtree` itself or a directory below it, compared
+/// component-wise so `/data2` does not pass for `/data`. svcmgr walks `cwd`
+/// from its universal root, so this check is what keeps a subtree-confined
+/// child's working-directory cap at a directory inside its namespace;
+/// [`crate::cwd_rights`] bounds that cap's rights. Namespace servers
+/// reject `.` and `..` components (docs/namespace-model.md), so a path that
+/// passes cannot walk back out.
+fn cwd_within_subtree(cwd: &str, subtree: &str) -> bool
+{
+    let root = subtree.trim_end_matches('/');
+    cwd == root
+        || cwd
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Parse a `priority = ` / `sched_max = ` value: a decimal priority level
 /// within the kernel's assignable userspace range
 /// `[PRIORITY_MIN, PRIORITY_MAX]`.
@@ -127,9 +143,13 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// Returns a [`ParseError`] naming the offending line when the contents
 /// violate the grammar or a semantic rule: a missing `=`, an unknown or
 /// duplicated key, a missing mandatory key, a malformed value, an
-/// inconsistent combination (`cwd` with `namespace = none`, `log_sink`
-/// with `seed`/`provides`, `sched_max` below `priority`), a `binary` or
-/// subtree path over `ipc::MAX_PATH_LEN` ([`ParseError::InvalidValue`]), or
+/// inconsistent combination (`cwd` with `namespace = none`, a `cwd` outside
+/// a `namespace = subtree:` path or under one whose rights lack `LOOKUP`,
+/// `log_sink` with `seed`/`provides`, more
+/// `seed` names than the bootstrap caps left after a provider's RECV,
+/// `sched_max` below `priority`), a `binary` or
+/// subtree path over `ipc::MAX_PATH_LEN` or with no path components
+/// ([`ParseError::InvalidValue`]), or
 /// `argv` / `env` that would not fit procmgr's `CREATE_FROM_FILE` message
 /// ([`ParseError::TooLarge`]).
 // too_many_lines: one pass over the `key = value` grammar whose per-key
@@ -406,6 +426,36 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         ));
     }
 
+    if let (NamespaceShape::Subtree { path, rights }, Some(dir)) = (&namespace, &cwd)
+    {
+        if !cwd_within_subtree(dir, path)
+        {
+            return Err(ParseError::InvalidValue(
+                0,
+                "cwd must be the namespace subtree path or a path below it",
+            ));
+        }
+        // The cwd cap takes only the subtree's rights (`cwd_rights`); without
+        // LOOKUP it could not resolve a relative path.
+        if rights & ns_rights::LOOKUP == 0
+        {
+            return Err(ParseError::InvalidValue(
+                0,
+                "cwd under a subtree namespace needs LOOKUP in the subtree rights",
+            ));
+        }
+    }
+
+    // One bootstrap round carries at most MSG_CAP_SLOTS_MAX caps, and a
+    // provider's own service-endpoint RECV takes cap[0] ahead of the seeds.
+    if seed.len() + usize::from(!provides.is_empty()) > MSG_CAP_SLOTS_MAX
+    {
+        return Err(ParseError::InvalidValue(
+            0,
+            "seed names (plus the provider RECV) exceed MSG_CAP_SLOTS_MAX bootstrap caps",
+        ));
+    }
+
     let log_sink = log_sink.unwrap_or(false);
     if log_sink && (!seed.is_empty() || !provides.is_empty())
     {
@@ -476,6 +526,16 @@ fn parse_namespace(lineno: usize, value: &str) -> Result<NamespaceShape, ParseEr
         if path.is_empty() || !path.starts_with('/')
         {
             return Err(ParseError::BadNamespace(lineno, value.to_owned()));
+        }
+        // A path with no components walks no NS_LOOKUP hop, so no namespace
+        // server attenuates the cap to `<rights>`: the child would get
+        // svcmgr's root at full rights.
+        if path.split('/').all(str::is_empty)
+        {
+            return Err(ParseError::InvalidValue(
+                lineno,
+                "namespace subtree path must name a directory below the root (use universal)",
+            ));
         }
         check_path_len(
             lineno,
@@ -797,6 +857,101 @@ sched_max = 12\n";
             parse("x", &recipe_with_subtree_len(ipc::MAX_PATH_LEN + 1)),
             Err(ParseError::InvalidValue(4, why)) if why.starts_with("namespace subtree path")
         ));
+    }
+
+    /// Recipe confined to `subtree:/data` with the given `cwd`.
+    fn subtree_recipe_with_cwd(cwd: &str) -> String
+    {
+        format!(
+            "binary = /services/x\nrestart = never\ncritical = no\n\
+             namespace = subtree:/data:LOOKUP\ncwd = {cwd}\n"
+        )
+    }
+
+    #[test]
+    fn subtree_cwd_at_or_below_the_subtree_is_accepted()
+    {
+        for cwd in ["/data", "/data/", "/data/logs"]
+        {
+            let def = parse("x", &subtree_recipe_with_cwd(cwd)).expect("cwd inside subtree");
+            assert_eq!(def.cwd.as_deref(), Some(cwd));
+        }
+    }
+
+    #[test]
+    fn subtree_path_trailing_slash_is_normalised_for_the_cwd_check()
+    {
+        let recipe = |subtree: &str, cwd: &str| {
+            format!(
+                "binary = /services/x\nrestart = never\ncritical = no\n\
+                 namespace = subtree:{subtree}:LOOKUP\ncwd = {cwd}\n"
+            )
+        };
+        for (subtree, cwd) in [("/data/", "/data"), ("/data/", "/data/logs")]
+        {
+            parse("x", &recipe(subtree, cwd)).expect("cwd inside subtree");
+        }
+        assert!(matches!(
+            parse("x", &recipe("/data/", "/data2")),
+            Err(ParseError::InvalidValue(0, why)) if why.starts_with("cwd must be")
+        ));
+    }
+
+    #[test]
+    fn subtree_path_with_no_components_is_rejected()
+    {
+        for path in ["/", "//"]
+        {
+            let recipe = format!(
+                "binary = /services/x\nrestart = never\ncritical = no\n\
+                 namespace = subtree:{path}:LOOKUP\n"
+            );
+            assert!(matches!(
+                parse("x", &recipe),
+                Err(ParseError::InvalidValue(4, why)) if why.starts_with("namespace subtree path must")
+            ));
+        }
+    }
+
+    #[test]
+    fn subtree_cwd_needs_lookup_in_the_subtree_rights()
+    {
+        let recipe = "binary = /services/x\nrestart = never\ncritical = no\n\
+                      namespace = subtree:/data:READ+STAT\ncwd = /data\n";
+        assert!(matches!(
+            parse("x", recipe),
+            Err(ParseError::InvalidValue(0, why)) if why.starts_with("cwd under a subtree")
+        ));
+    }
+
+    #[test]
+    fn subtree_cwd_outside_the_subtree_is_rejected()
+    {
+        // `/` would hand the child a cap on svcmgr's universal root;
+        // `/data2` shares the subtree's byte prefix but not its directory.
+        for cwd in ["/", "/etc", "/data2", "data"]
+        {
+            assert!(matches!(
+                parse("x", &subtree_recipe_with_cwd(cwd)),
+                Err(ParseError::InvalidValue(0, why)) if why.starts_with("cwd must be")
+            ));
+        }
+    }
+
+    #[test]
+    fn seeds_are_bounded_by_the_bootstrap_cap_slots_left_after_the_provider_recv()
+    {
+        let consumer = parse_with("seed = a b c d\n").expect("4 seeds fill a consumer round");
+        assert_eq!(consumer.seed.len(), MSG_CAP_SLOTS_MAX);
+        let provider = parse_with("provides = p\nseed = a b c\n").expect("RECV + 3 seeds");
+        assert_eq!(provider.seed.len(), MSG_CAP_SLOTS_MAX - 1);
+        for extra in ["seed = a b c d e\n", "provides = p\nseed = a b c d\n"]
+        {
+            assert!(matches!(
+                parse_with(extra),
+                Err(ParseError::InvalidValue(0, why)) if why.starts_with("seed names")
+            ));
+        }
     }
 
     #[test]

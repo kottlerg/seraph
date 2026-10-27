@@ -1233,12 +1233,28 @@ pub fn phase3_svcmgr_handover(
     // while the underlying objects keep backing init's still-running threads.
     let reap_bound = register_init_reap_objects(procmgr_ep, info, init_logd_thread_cap, ipc_buf);
 
+    // svcmgr honours HANDOVER_COMPLETE only through a SEND carrying the
+    // `HANDOVER_AUTHORITY` verb-bit, so init derives one for the call and
+    // deletes it.
     let handover_msg = IpcMessage::new(svcmgr_labels::HANDOVER_COMPLETE);
-    // SAFETY: ipc_buf is caller's registered IPC buffer.
-    match unsafe { ipc::ipc_call(svcmgr_service_ep, &handover_msg, ipc_buf) }
+    match syscall::cap_derive_badge(
+        svcmgr_service_ep,
+        syscall::RIGHTS_EP_SEND,
+        svcmgr_labels::HANDOVER_AUTHORITY,
+    )
     {
-        Ok(reply) if reply.label == 0 => log("phase 3: handover complete"),
-        _ => log("phase 3: handover failed"),
+        Ok(handover_send) =>
+        {
+            // SAFETY: ipc_buf is caller's registered IPC buffer.
+            let result = unsafe { ipc::ipc_call(handover_send, &handover_msg, ipc_buf) };
+            let _ = syscall::cap_delete(handover_send);
+            match result
+            {
+                Ok(reply) if reply.label == 0 => log("phase 3: handover complete"),
+                _ => log("phase 3: handover failed"),
+            }
+        }
+        Err(_) => log("phase 3: handover cap derive failed"),
     }
 
     // Reap-handoff (donation + arm): stream init's reclaimable Memory caps to

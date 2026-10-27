@@ -364,20 +364,24 @@ owed for a change, other than Markdown and comment lines, to:
 
 - SMP, per-CPU, and IPI code: `core/kernel/src/percpu.rs`,
   `core/kernel/src/cpu_mask.rs`, `core/kernel/src/sync.rs`,
-  `core/kernel/src/mm/tlb_shootdown.rs`, and the arch interrupt, IDT, and
-  AP-bringup modules (`core/kernel/src/arch/*/interrupts.rs`, `idt.rs`, and
-  `ap_trampoline.rs`);
+  `core/kernel/src/mm/tlb_shootdown.rs`, and the arch modules for interrupts,
+  the IDT, AP bringup, the per-CPU GDT and TSS, per-CPU storage, the context
+  handoff, and halt and wake (`core/kernel/src/arch/*/interrupts.rs`,
+  `idt.rs`, `ap_trampoline.rs`, `gdt.rs`, `mod.rs`, `context.rs`, and
+  `cpu.rs`);
 - scheduler-wakeup code: `core/kernel/src/sched/`, `core/kernel/src/ipc/`,
   `core/kernel/src/syscall/thread.rs`, the arch timer modules
-  (`core/kernel/src/arch/*/timer.rs`), and `halt_until_interrupt` in
-  `core/kernel/src/arch/*/cpu.rs`;
+  (`core/kernel/src/arch/*/timer.rs`), and the object and thread teardown
+  wakes (`core/kernel/src/cap/object.rs`);
 - boot and memory-init code: `core/boot/` (its source and linker script),
-  `abi/boot-protocol/`, `core/kernel/src/main.rs`,
-  `core/kernel/src/validate.rs`, `core/kernel/src/mm/init.rs`,
-  `core/kernel/src/mm/init_reloc.rs`, and `core/kernel/linker/`.
+  `abi/boot-protocol/`, `abi/init-protocol/`, `core/kernel/src/main.rs`,
+  `core/kernel/src/validate.rs`, the initial capability minting
+  (`core/kernel/src/cap/mod.rs`), the memory subsystem
+  (`core/kernel/src/mm/`), and `core/kernel/linker/`.
 
-A change elsewhere owes none of them. The narrower boundaries below add their
-own trigger paths.
+A change elsewhere owes none of them. The 512-vCPU and 128-hart boundaries
+below have their own trigger lists, and are owed for those whether or not the
+base runs are.
 
 ```sh
 # Boundary CPU counts, riscv64 (~70 s per passing run on a 16-core host;
@@ -402,9 +406,11 @@ cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1
 changes code in the scheduling, wake, and cross-CPU signalling mechanisms —
 `core/kernel/src/sched/`, `core/kernel/src/ipc/`, `core/kernel/src/sync.rs`,
 `core/kernel/src/percpu.rs`, `core/kernel/src/cpu_mask.rs`,
-`core/kernel/src/syscall/thread.rs`, `core/kernel/src/mm/tlb_shootdown.rs`, the
-arch interrupt and IDT modules (`core/kernel/src/arch/*/interrupts.rs` and
-`idt.rs`, which route the IPI vectors), or `halt_until_interrupt` — MUST run the
+`core/kernel/src/syscall/thread.rs`, `core/kernel/src/mm/tlb_shootdown.rs`,
+`core/kernel/src/cap/object.rs` (the teardown wakes and their `wake_in_flight`
+gate), or the arch interrupt, IDT, timer, context-handoff, and halt modules
+(`core/kernel/src/arch/*/interrupts.rs`, `idt.rs`, which routes the IPI
+vectors, `timer.rs`, `context.rs`, and `cpu.rs`) — MUST run the
 riscv64 64- and 65-hart and the x86_64 256-vCPU boundaries three times each
 (`--runs 3`): a race in those mechanisms can fail rarely enough that one run
 misses it. The memory variation and the narrower boundaries below run once.
@@ -413,8 +419,8 @@ PRs touching the surfaces that only matter above 256 CPUs — `core/kernel/src/m
 x86_64 AP bringup (`core/kernel/src/arch/x86_64/ap_trampoline.rs`,
 `core/kernel/src/arch/x86_64/gdt.rs`, the APIC/IPI paths in
 `core/kernel/src/arch/x86_64/interrupts.rs`), or per-CPU slab sizing
-(`sched::alloc_zeroed_slab` and its call sites) — MUST additionally run the
-full-width x86_64 boundary below. This trigger list is deliberately narrow;
+(`sched::alloc_zeroed_slab` and its call sites) — MUST run the full-width x86_64
+boundary below, besides any base runs they owe. This trigger list is deliberately narrow;
 other SMP PRs stay on the 256-vCPU mandate above.
 
 ```sh
@@ -429,8 +435,8 @@ cargo xtask run-parallel --arch x86_64 --cpus 512 --parallel 1 --runs 1 --timeou
 PRs touching the bootloader's kernel-placement path — `core/boot/src/elf.rs`
 (kernel ELF span allocation), `core/boot/src/uefi.rs` (UEFI page allocation),
 or the boot page-table builders (`core/boot/src/paging.rs`,
-`core/boot/src/arch/*/paging.rs`) — MUST additionally run the riscv64 128-hart
-boundary below. It is the riscv64 analogue of the full-width x86_64 run: the
+`core/boot/src/arch/*/paging.rs`) — MUST run the riscv64 128-hart boundary
+below, besides any base runs they owe. It is the riscv64 analogue of the full-width x86_64 run: the
 hart count at which hart-scaled firmware allocations once collided with the
 kernel image's load address ([#377](https://github.com/kottlerg/seraph/issues/377)).
 This trigger list is deliberately narrow; other SMP PRs stay on the 64/65-hart
@@ -443,18 +449,17 @@ mandate above.
 cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800
 ```
 
-**When the runs are owed.** Each local host run a PR owes MUST be run once, at a
-head that covers the merge head. A run at head H covers a later head M when the
-PR's own diff on that run's trigger paths is the same at H and at M, Markdown
-and comment lines aside. The PR's own diff at a head is the diff from that
-head's merge base with `master` to the head (`git diff $(git merge-base <head>
-master) <head> -- <paths>`), so it excludes what a merge or rebase from `master`
-brings in. An update from `master` that leaves the PR's own diff on the trigger
-paths unchanged therefore owes no run; one whose conflict resolution changes it
-does. A fix round that changes the PR's own code on a trigger path breaks the
-coverage of the runs that path triggers, and those runs MUST be run again at a
-head after it. The PR body MUST report each run it owes with its `--runs` count
-and the head it ran at, or state that none is owed and why.
+**When the runs are owed.** Each local host run a PR owes MUST pass, at its repeat count, at one
+head that covers the merge head. A run at head H covers a later head M when the PR's own diff on
+that run's trigger paths is the same at H and at M, Markdown and comment lines aside. The PR's own
+diff at a head is the diff from that head's merge base with the fetched `master` to the head (after
+`git fetch origin`, `git diff $(git merge-base <head> origin/master) <head> -- <paths>`), so it
+excludes what a merge or rebase from `master` brings in. An update from `master` that leaves the
+PR's own diff on the trigger paths unchanged therefore owes no run; one whose conflict resolution
+changes it does. A fix round that changes the PR's own code on a trigger path breaks the coverage of
+the runs that path triggers, and those runs MUST be run again at a head after it. The PR body MUST
+report each run it owes with its `--runs` count and the head it ran at, or state that none is owed
+and why.
 
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step

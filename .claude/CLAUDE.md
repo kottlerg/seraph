@@ -172,7 +172,9 @@ truth for "how work is tracked and shipped" on this project.
   [docs/testing.md](../docs/testing.md) "Coverage tiers" defines it,
   requires none of the runs above (the CI gate builds and boots both
   architectures); the pre-merge review still applies, and the PR body MUST
-  state the validated head and the documentation-only delta.
+  carry what [docs/conventions.md](../docs/conventions.md) § PR-body
+  checklist discipline requires (the validated head, the documentation-only
+  delta, and that no local host run is owed).
 - `cargo xtask lint-docs` MUST pass on every change, documentation-only
   ones included (per [docs/conventions.md](../docs/conventions.md) § CI
   Gating; CI's `host-tests` job runs it, per

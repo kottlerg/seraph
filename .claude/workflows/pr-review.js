@@ -16,12 +16,14 @@
 // only those on its blocking track (class correctness, safety, or contract, or
 // a MUST violation anchored outside Markdown) make it `BLOCKING ISSUES`.
 // Findings off the surface are recorded for the open Issue that already names
-// the work, else for the PR's follow-up Issue; those that share a file, class,
-// bucket, MUST flag, Issue, and authority are one root cause and are verified
-// once as a group. A run that names the ledger of the earlier runs' recorded,
-// dropped, and contested findings (required in a delta run) lists, and does
-// not count, a finding a reviewer flags as already in it at a hunk unchanged
-// since the run the entry names, when that run resolves in the clone.
+// the work, else for the follow-up Issue of their scope; those that share a
+// file, class, bucket, MUST flag, Issue, and authority are one root cause and
+// are verified once as a group. A follow-up Issue names findings, not work, so
+// naming one takes nothing off the surface. A run that names the ledger of the
+// earlier runs' recorded, dropped, and contested findings (required in a delta
+// run) lists, and does not count, a finding a reviewer flags as already in it
+// at a hunk unchanged since the run the entry names, when that run resolves in
+// the clone.
 // `.claude/CLAUDE.md` § PR workflow operations says when the assistant runs
 // this workflow, how it builds the ledger, and what it does with the result.
 //
@@ -38,13 +40,14 @@
 //                file); the design-docs lenses read only the documents that
 //                state facts the delta changed. `since` must resolve in this
 //                clone; it need not be an ancestor of the head, so an amended
-//                or rebased branch still works, at the cost of over-including
-//                files a rebase brought in.
+//                or rebased branch still works. Only files the PR diff also
+//                touches are reviewed, so files a merge or rebase of the base
+//                brought in are not.
 //   ledger       path of the ledger file `.claude/CLAUDE.md` § PR workflow
 //                operations builds; required in 'delta' mode and taken in
-//                every mode once one exists, so a full run after the PR's
-//                follow-up Issues exist lists what they hold. Reviewers read
-//                it with `jq`.
+//                every mode once one exists, so a full run after an earlier
+//                run recorded findings lists them. Reviewers read it with
+//                `jq`.
 //   mode 'scope' stops after Scope and returns the shard plan and sample
 //                prompts (one agent); with `since` it scopes as delta would.
 
@@ -127,14 +130,21 @@ const PATH_DESCRIPTION =
 const SCOPE_SCHEMA = {
     type: 'object',
     required: [
-        'head', 'base', 'repo_root', 'tree_at_head', 'since_reachable', 'pr_has_code', 'files',
-        'pr_files', 'open_issues', 'changed_items', 'design_docs', 'claimed_fixes',
+        'head', 'base', 'since_base', 'repo_root', 'tree_at_head', 'since_reachable',
+        'pr_has_code', 'files', 'pr_files', 'open_issues', 'changed_items', 'design_docs',
+        'claimed_fixes',
     ],
     properties: {
         head: { type: 'string', description: 'Full SHA of the PR head commit.' },
         base: {
             type: 'string',
             description: 'Full SHA of the merge base of the PR head and its base branch.',
+        },
+        since_base: {
+            type: 'string',
+            description:
+                'In delta mode, full SHA of the merge base of `since` and the base branch; ' +
+                'an empty string in every other mode.',
         },
         repo_root: {
             type: 'string',
@@ -170,8 +180,9 @@ const SCOPE_SCHEMA = {
             type: 'array',
             items: { type: 'string', description: PATH_DESCRIPTION },
             description:
-                'Every file the whole PR diff touches, whatever the mode (a delta after a rebase ' +
-                'can list files outside it).',
+                'Every file the whole PR diff touches, whatever the mode (the delta is limited ' +
+                'to these files, and the script filters on them as a backstop and for the ' +
+                'in-bound gate).',
         },
         open_issues: {
             type: 'array',
@@ -262,11 +273,13 @@ const FINDING_SCHEMA = {
             type: 'integer',
             description:
                 'The open Issue that already names this work, when one does (0 otherwise); ' +
-                'such a finding is recorded against that Issue, not fixed here. This pull ' +
-                'request\'s own follow-up Issues (title beginning `<scope>: defects found by ' +
-                'PR #<N>\'s review`) take nothing off its surface: a finding one already holds ' +
-                'is flagged `ledger` when a ledger is named, not placed on it ' +
-                '(docs/conventions.md § Branch and PR Workflow).',
+                'such a finding is recorded against that Issue, not fixed here. A follow-up ' +
+                'Issue (title `<scope>: defects found by review`, or one beginning with the ' +
+                'earlier `<scope>: defects found by PR #<N>\'s review`) names findings, not ' +
+                'work, and takes nothing off the surface: never name one here; a finding an ' +
+                'earlier run of this pull request recorded on one is flagged `ledger` only ' +
+                'under the `ledger` field\'s conditions (docs/conventions.md § Branch and PR ' +
+                'Workflow).',
         },
         authority: { type: 'string', description: 'Doc path and section, or contract location.' },
         claim: { type: 'string' },
@@ -394,7 +407,12 @@ const doc_line = (d) => '- ' + d
 
 phase('Scope')
 
-const DELTA_RANGE = DELTA ? SINCE + ' <head>' : null
+// The delta is the tree diff since..head limited to the files the whole PR diff
+// touches, so a file only a merge or rebase of the base changed is not in it. A
+// hunk the base brought into a PR file still is: by provenance, a delta hunk is
+// the base's only when it also appears in the diff between the merge bases at
+// `since` and at the head, and with equal merge bases every delta hunk is the PR's.
+const DELTA_RANGE = DELTA ? SINCE + ' <head> -- <every file the PR diff touches>' : null
 
 const SCOPE_PROMPT = [
     'Scope pull request #' + PR + ' for a sharded review.' +
@@ -406,20 +424,31 @@ const SCOPE_PROMPT = [
         '`gh issue list --state open --limit 500 --json number,title`.' +
         (DELTA
             ? ' Then run `git cat-file -e ' + SINCE + '^{commit}` (reachability), ' +
-                '`git diff --numstat ' + DELTA_RANGE + '` (a tree diff between the two ' +
-                'commits, valid whether or not ' + SINCE + ' is an ancestor of the head), and ' +
-                '`git log --format=%B ' + SINCE + '..<head>`.'
+                '`git merge-base ' + SINCE + ' origin/<baseRefName>` (since_base), ' +
+                '`git diff --numstat --no-renames ' + DELTA_RANGE + '` (the delta: a tree ' +
+                'diff between the two commits, valid whether or not ' + SINCE + ' is an ' +
+                'ancestor of the head, limited to the PR\'s own files, so a file only a merge ' +
+                'or rebase of the base changed is not in it), and `git log --format=%B ' +
+                SINCE + '..<head>`. A hunk of the delta is the base\'s only when it also ' +
+                'appears in `git diff <since_base> <base> -- <file>`; when the two merge bases ' +
+                'are equal, every delta hunk is the PR\'s. A base hunk counts toward the file ' +
+                'list and `changed`, but no criterion below treats it as a change the delta ' +
+                'made.'
             : ''),
     '',
     'Return, per the schema, with every path repository-relative exactly as git prints it:',
-    '- head: the PR head SHA; base: the merge base of the head and the base branch.',
+    '- head: the PR head SHA; base: the merge base of the head and the base branch; since_base: ' +
+        (DELTA ? 'the merge base of ' + SINCE + ' and the base branch.' : 'an empty string.'),
     '- repo_root: the absolute path of the working tree root.',
     '- tree_at_head: whether HEAD is the PR head and the tree is clean.',
     '- since_reachable: ' +
         (DELTA ? 'whether ' + SINCE + ' resolves to a commit.' : 'true (no `since` given).'),
     '- pr_has_code: whether the whole PR diff changes a file of kind code.',
     '- files: one entry per file in ' +
-        (DELTA ? 'the tree diff ' + DELTA_RANGE : 'the PR diff') +
+        (DELTA
+            ? 'the delta (every file it lists; the script drops, and logs, a file the ' +
+                'whole PR diff does not touch)'
+            : 'the PR diff') +
         ', with path; changed = added plus deleted lines; kind = code (Rust, assembly, ' +
         'linker scripts, build inputs, anything a build embeds), markdown, comment-only (only ' +
         'comment lines changed), rules (`.claude/` and `.github/`), or other.',
@@ -431,7 +460,8 @@ const SCOPE_PROMPT = [
     '- design_docs: ' +
         (DELTA
             ? 'the documents that state facts the delta changed: every Markdown document the ' +
-                'delta edits, and every tracked Markdown document (`git ls-files \'*.md\'`) ' +
+                'delta edits, and every tracked Markdown ' +
+                'document (`git ls-files \'*.md\'`) ' +
                 'whose text names a changed item, a constant, state, error, or section the ' +
                 'delta renamed or redefined, or a behaviour the delta changed (search for each ' +
                 'symbol and each distinctive phrase of the changed statements), and every ' +
@@ -474,6 +504,9 @@ if (DELTA && !scope.since_reachable) {
         error: 'since ' + SINCE + ' does not resolve in this clone; run mode full with the ledger.',
     }
 }
+if (DELTA && MODE !== 'scope' && !/^[0-9a-f]{40}$/.test(scope.since_base || '')) {
+    return { error: 'scope returned no since_base; base hunks cannot be told apart' }
+}
 
 // Every path the agents return joins by string equality below, so normalize
 // the forms an agent may emit despite the schema description.
@@ -500,6 +533,17 @@ if (DELTA && MODE !== 'scope' && pr_files.size === 0) {
 for (const i of scope.changed_items) i.file = normalize(i.file)
 for (const c of scope.claimed_fixes) c.file = normalize(c.file)
 scope.design_docs = scope.design_docs.map(normalize)
+// A delta reviews only the PR's own files: one a merge or rebase of the base
+// branch changed between `since` and the head is master's, not this PR's. The
+// numstat runs without rename detection, so a renamed file keeps its new path.
+// The scope agent lists only the PR's files, so this filter is a backstop that
+// logs what it drops; base hunks inside a PR file are told apart by provenance.
+if (DELTA && pr_files.size > 0) {
+    for (const f of scope.files) {
+        if (!pr_files.has(f.path)) log('delta: ' + f.path + ' is not in the PR diff; not reviewed')
+    }
+    scope.files = scope.files.filter((f) => pr_files.has(f.path))
+}
 
 const shards = shards_of(scope.files)
 const delta_paths = new Set(scope.files.map((f) => f.path))
@@ -521,7 +565,19 @@ const HEAD_LINE =
     'Scope: pull request #' + PR + ', mode ' + MODE + '. Merge base ' + scope.base + ', head ' +
     scope.head + '. The working tree is checked out at the head; `gh pr diff ' + PR +
     '` is the PR diff' +
-    (DELTA ? ' and `git diff ' + SINCE + ' ' + scope.head + '` is the delta' : '') + '.'
+    (DELTA
+        ? ' and `git diff ' + SINCE + ' ' + scope.head + ' -- <the PR diff\'s files>` is the ' +
+            'delta (a file only a merge or rebase of the base changed is not in it). A delta ' +
+            'hunk is the base\'s only when it also appears in `git diff ' + scope.since_base +
+            ' ' + scope.base + ' -- <file>`, the change between the merge bases at ' + SINCE +
+            ' and at the head' +
+            (scope.since_base === scope.base
+                ? '; here they are equal, so every delta hunk is the PR\'s'
+                : '') +
+            '. A standards, doc-drift, coverage, or style finding in a base hunk is not one ' +
+            'the delta introduced; a correctness, safety, or contract defect in one stays on ' +
+            'the surface, as in any touched file'
+        : '') + '.'
 
 const DELTA_NOTE = DELTA
     ? 'This is a re-review: the previous run reviewed head ' + SINCE + ', and the commits and ' +
@@ -544,21 +600,25 @@ const LENS_HEADER = [
 
 // Work an open Issue already names is off the surface of this PR; every
 // reviewer gets the list so it can set `issue` on such a finding.
-// This pull request's own follow-up Issues hold findings its earlier runs
-// recorded; they take nothing off its surface (docs/conventions.md § Branch
-// and PR Workflow), so a finding placed on one is kept where the surface puts it.
-const OWN_FOLLOW_UP = new RegExp("^[^:]+: defects found by PR #" + PR + "'s review")
-const own_follow_up = (n) => OWN_FOLLOW_UP.test(issue_title(n))
+// A follow-up Issue holds findings, not work; it takes nothing off any pull
+// request's surface (docs/conventions.md § Branch and PR Workflow), so a finding
+// placed on one is kept where the surface puts it. The second alternative
+// matches the per-PR titles filed before the rolling Issues.
+const FOLLOW_UP = /^[^:]+: defects found by (?:review|PR #\d+'s review)/
+const follow_up_issue = (n) => FOLLOW_UP.test(issue_title(n))
 
 const ISSUES_BLOCK = [
     'Open Issues (work one of them already names is off the review surface: set `issue` to ' +
         'its number on such a finding, reading the Issue body when its title matches the ' +
-        'area; 0 otherwise). An Issue whose title begins `<scope>: defects found by PR #' +
-        PR + '\'s review` is this pull request\'s own follow-up Issue: it takes nothing off ' +
-        'the surface, and a finding it already holds ' +
+        'area; 0 otherwise). An Issue whose title is `<scope>: defects found by review` (or, ' +
+        'from before the rolling Issues, begins `<scope>: defects found by PR #<N>\'s review`) ' +
+        'is a follow-up Issue: it names findings, not work, and takes nothing off the surface, ' +
+        'so never set `issue` to one; a finding it already holds ' +
         (LEDGER === null
             ? 'is reported where the surface puts it:'
-            : 'is flagged `ledger` instead:'),
+            : 'is flagged `ledger` only under the ledger rule below (an entry states it at a ' +
+                'hunk unchanged since the entry\'s run, and that run resolves in the clone), and ' +
+                'otherwise reported where the surface puts it:'),
     bullets(scope.open_issues, (i) => '- #' + i.number + ' ' + i.title),
 ].join('\n')
 
@@ -967,15 +1027,15 @@ function dedup(findings, source) {
     for (const f of findings) {
         f.file = normalize(f.file)
         // Work an open Issue already names is off the surface whatever its
-        // class; an Issue number that is not open, or this pull request's own
-        // follow-up Issue, is not a placement.
+        // class; an Issue number that is not open, or a follow-up Issue, is
+        // not a placement.
         if (f.issue && !open_issue_numbers.has(f.issue)) {
             log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
                 ', not an open Issue; kept on the surface')
             f.issue = 0
-        } else if (f.issue && own_follow_up(f.issue)) {
+        } else if (f.issue && follow_up_issue(f.issue)) {
             log(source + ': ' + f.file + ':' + f.line + ' names #' + f.issue +
-                ", this pull request's own follow-up Issue; kept where the surface puts it")
+                ', a follow-up Issue; kept where the surface puts it')
             f.issue = 0
         }
         // In a delta run a soft-class finding is on the surface only when the
@@ -1163,8 +1223,8 @@ const groups = all.filter((f) => f.group.length > 0)
 const dropped = all.filter((f) => f.status === 'dropped')
 const surviving = all.filter((f) => f.status !== 'dropped')
 // Findings on the review surface are fixed; findings off it are recorded for
-// the open Issue that already names the work, else for the PR's follow-up Issue, and do
-// not count toward the verdict.
+// the open Issue that already names the work, else for the follow-up Issue of
+// their scope, and do not count toward the verdict.
 const findings = surviving.filter((f) => f.in_bound)
 const recorded = surviving.filter((f) => !f.in_bound)
 const count = (status) => findings.filter((f) => f.status === status).length
@@ -1308,8 +1368,9 @@ const SYNTH_PROMPT = [
         '`## Dropped by verification`, `## Ledger (not re-raised)`, `## Audit`. The recorded ' +
         'section lists each off-surface ' +
         'finding with the same fields as the others, naming its `issue` when set; they are ' +
-        'appended to the open Issue that already names the work, else to the PR\'s follow-up ' +
-        'Issue, not ' +
+        'appended to the open Issue that already names the work, else to the follow-up ' +
+        'Issue of their scope unless an open follow-up Issue of that scope already holds ' +
+        'them (docs/conventions.md § Branch and PR Workflow), not ' +
         'fixed. Write `(none)` under an empty heading. Do not write verdict lines; the ' +
         'workflow appends them.',
     '',

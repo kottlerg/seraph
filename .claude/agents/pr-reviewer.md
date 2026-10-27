@@ -29,11 +29,20 @@ discipline below has been applied end-to-end.
     path, claimed fixes), it narrows *which files you read whole and report
     on*, never the discipline: steps 3 to 6 apply in full to every file in
     the shard, and blast-radius reads (step 5) go wherever the callers are.
-    In `delta` mode the files are those changed since `since`; verify each
-    claimed fix for your files against the code, and report: every claimed
-    fix not actually made; every finding in the changed hunks; any
+    In `delta` mode the files are those changed since `since` that the
+    whole PR diff also touches (a file only a merge or rebase of the base
+    branch changed is not reviewed). A changed hunk is the base's only when
+    it also appears in the diff between the merge bases at `since` and at
+    the head, which the parent names (when it does not, compute each as
+    `git merge-base <sha> origin/<base branch>`); with equal merge bases
+    every changed hunk is the PR's. A standards, doc-drift, coverage, or
+    style finding in a base hunk is not one the delta introduced; a
+    correctness, safety, or contract defect in one stays in bound. Verify
+    each claimed fix for your files against the code, and report: every
+    claimed fix not actually made; every finding in the changed hunks; any
     correctness, soundness, safety, or contract defect anywhere in the
-    file. Per `docs/conventions.md` § Branch and PR Workflow, a standards,
+    file. Per
+    `docs/conventions.md` § Branch and PR Workflow, a standards,
     doc-drift, coverage, or style finding the delta did not introduce is out
     of bound; a statement the delta made stale, or a test the delta's new
     code lacks, is one the delta introduced wherever it anchors.
@@ -157,26 +166,30 @@ correctness, soundness, safety, or contract defect in a touched file is;
 in a delta run, a standards, doc-drift, coverage, or style finding only
 when the delta introduced it), the `issue` that names it when one does
 (the parent lists the open Issues; per `docs/conventions.md` § Branch and
-PR Workflow an Issue whose title begins `<scope>: defects found by PR
-#<N>'s review` for the PR under review is its own follow-up Issue and takes
-nothing off the surface, so a finding it already holds is flagged `ledger`
-when the parent names a ledger and otherwise reported where the surface
-puts it), the `authority`, the `claim`, the `evidence`, and the `fix`.
+PR Workflow an Issue whose title is `<scope>: defects found by review`,
+or begins with the earlier `<scope>: defects found by PR #<N>'s review`, is a
+follow-up Issue, which names findings, not work: it takes nothing off the
+surface, so `issue` is never set to it, and a finding it already holds is
+flagged `ledger` only as step 2a says, and otherwise reported where the
+surface puts it), the `authority`, the `claim`, the `evidence`, and the
+`fix`.
 There is no final line in schema mode; the workflow computes the verdict
 from the entries.
 
 **In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
 `BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound correctness,
-safety, or contract finding, or MUST violation anchored in a file that is not
-a Markdown document, forces `BLOCKING ISSUES` (the blocking track of
+safety, or contract finding, or MUST violation anchored in a file that is
+not a Markdown document, forces `BLOCKING ISSUES` (the blocking track of
 `docs/conventions.md` § Branch and PR Workflow); out-of-bound findings are
 listed, each naming the Issue that records it per `docs/conventions.md`
 § Branch and PR Workflow (the open Issue that already names the work, else
-the PR's follow-up Issue), and do not affect the line; the PR's own
-follow-up Issues take nothing off the surface, and a finding one of them
-or a ledger entry already states, at a hunk unchanged since the run the
-entry names when that run resolves in the clone, is listed under a
-`Ledger (not re-raised)` heading and does not affect the line either.
+the open follow-up Issue of its scope that already holds it, else the
+follow-up Issue of its scope), and do not affect the line. A follow-up Issue
+takes nothing off the surface: a finding one already holds is reported where
+the surface puts it. A finding a ledger entry already states at a hunk
+unchanged since the run the entry names, when that run resolves in the
+clone, is listed under a `Ledger (not re-raised)` heading and does not
+affect the line either.
 
 ## Tool discipline
 

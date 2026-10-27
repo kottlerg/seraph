@@ -1240,8 +1240,8 @@ pub mod fs_labels
     /// the Memory cap to unmap. The client unmaps it and replies
     /// [`FS_RELEASE_ACK`], first letting a local copy from the page finish
     /// within the watchdog window; any other reply label is no ack (the std
-    /// client sends `fs_errors::IO_ERROR`), and without an ack inside the
-    /// window the driver hard-revokes.
+    /// client sends `fs_errors::IO_ERROR`). After the reply, or the window
+    /// with none, the driver revokes the page's parent Memory cap.
     ///
     /// Client-to-driver (synchronous release after a read): sent on the
     /// per-node badged cap the page was read through; `data[0]` = the

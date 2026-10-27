@@ -254,11 +254,11 @@ endpoint cap recorded in the node's `OpenFile` slot, taken from
 `caps[0]` of the [`FS_READ_MEMORY`](#label-7-fs_read_memory) that
 allocated the slot (per-node sharing, a defect tracked in
 [#447](https://github.com/kottlerg/seraph/issues/447)). Clients that
-delivered the SEND get the cooperative path; the driver waits up to
-100 ms for [`FS_RELEASE_ACK`](#label-9-fs_release_ack) before falling
-through to a hard `cap_revoke` of the parent Memory cap. Clients that
-omitted the SEND (opt-out) skip straight to the hard-revoke path on
-every eviction. See
+delivered the SEND get the cooperative path: the driver waits up to
+100 ms for [`FS_RELEASE_ACK`](#label-9-fs_release_ack), then
+`cap_revoke`s the parent Memory cap and deletes it whether or not the
+ack came. Clients that omitted the SEND (opt-out) skip straight to the
+revoke on every eviction. See
 [`runtime/ruststd/src/sys/fs/release_handler.rs`](../../../runtime/ruststd/src/sys/fs/release_handler.rs)
 for the receive-side state machine.
 
@@ -274,14 +274,17 @@ The client unmaps the matching Memory cap and replies with
 cookie among all its open files, since the release may arrive on the
 SEND of a file other than the one that read the page. If a local copy
 from the page is still in progress, the client holds its reply until
-the copy ends, within the window below; this covers a release the
-driver sends before its reply to the cookie's
-[`FS_READ_MEMORY`](#label-7-fs_read_memory) arrives. If the client does
-not acknowledge within the cooperative-release watchdog window
-(100 ms), the driver `cap_revoke`s the parent Memory cap. A reply with
-any other label is not an acknowledgement and takes the same revoke
-path; a client that cannot unmap the page, or whose copy outlasts the
-window, replies `IO_ERROR` (2).
+the copy ends, within the window below and once per cookie (a repeated
+release of a cookie whose wait ran out is refused at once); this covers
+a release the driver sends before its reply to the cookie's
+[`FS_READ_MEMORY`](#label-7-fs_read_memory) arrives. After the reply,
+or after the cooperative-release watchdog window (100 ms) with none,
+the driver revokes every cap derived from the parent Memory cap and
+deletes the parent. The ack tells the driver the client unmapped in
+time; without one, the revoke is what tears down a mapping the client
+still holds. A reply with any other label is not an acknowledgement; a
+client that cannot unmap the page, or whose copy outlasts the window,
+replies `IO_ERROR` (2).
 
 ### Client-to-driver release
 

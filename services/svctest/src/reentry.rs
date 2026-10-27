@@ -9,8 +9,9 @@
 //! (some roles take further arguments after it, e.g. `blobs-fill-child`'s
 //! filler token) to exercise child-side behaviour: namespace and
 //! `/programs`-subtree attenuation, cwd-cap delivery, argv/env blob packing,
-//! exit-code propagation, per-process randomness and ASLR divergence, and
-//! `Child` kill and drop teardown.
+//! exit-code propagation, per-process randomness and ASLR divergence,
+//! `Child` kill and drop teardown, and the fs release handler's cookie
+//! matching.
 //! The child-mode function for each role lives in the phase module that
 //! spawns it; `dispatch` consults each module's `reentry_main(role)` so a
 //! new role is registered alongside its phase, not in a central switch.
@@ -31,6 +32,7 @@ pub fn dispatch(role: &str)
 {
     phases::namespace::reentry_main(role);
     phases::procmgr::reentry_main(role);
+    phases::fs_std::reentry_main(role);
     phases::exit_code::reentry_main(role);
     phases::random::reentry_main(role);
 }

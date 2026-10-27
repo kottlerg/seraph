@@ -15,14 +15,15 @@
 //! whose badge the release carries: the driver records one release SEND per
 //! node, so a release for one `File`'s page can arrive on another `File`'s
 //! badge (services/fs/docs/fs-driver-protocol.md § Label 8). It waits out a
-//! local copy still reading the cookie's page, for at most [`READ_WAIT`],
-//! removes the matching outstanding mapping (race-safe against the local
+//! local copy still reading the cookie's page, for at most [`READ_WAIT`]
+//! once per cookie, removes the matching outstanding mapping (race-safe against the local
 //! read path's immediate-release cleanup), unmaps the page, drops the
 //! memory cap, and replies [`fs_labels::FS_RELEASE_ACK`]. The VA returns to
 //! the reservation arena only once the unmap succeeds (see
 //! [`discard_mapping`]). A failed unmap or a copy still running at the end
-//! of the wait is answered with [`fs_errors::IO_ERROR`], which the driver
-//! takes as no ack and follows with its hard `cap_revoke`.
+//! of the wait is answered with [`fs_errors::IO_ERROR`], no ack. The driver
+//! revokes the page's parent cap after every release, so holding the reply
+//! is what keeps the revoke from landing mid-copy or before the unmap.
 //!
 //! The endpoint and the handler thread are created lazily on the first
 //! [`super::File::open`] call; until then the cost is one
@@ -45,9 +46,11 @@ use crate::sys::reserve::ReservedRange;
 
 /// Longest the handler holds a release for a local copy of the cookie's page:
 /// the driver's cooperative-release window (fs-driver-protocol.md § Label 8),
-/// past which the driver revokes whatever the reply says. Bounding the wait
-/// keeps one driver's release from stalling the releases of every other
-/// `File` behind the single handler thread.
+/// past which the driver revokes whatever the reply says. Each cookie gets
+/// the wait once: a cookie whose wait ran out is in [`Outstanding::stalled`],
+/// and a repeated release of it is refused at once. A driver's hold on the
+/// single handler thread, which serves every `File`'s releases, is so
+/// bounded by its reads in flight.
 const READ_WAIT: Duration = Duration::from_millis(100);
 
 /// One outstanding cache-page mapping the local read path has obtained
@@ -81,6 +84,8 @@ struct Outstanding
     /// [`READ_WAIT`], until the read ends rather than ack a release whose
     /// page is still in use.
     reading: Vec<u64>,
+    /// Cookies still in `reading` whose release wait already ran out.
+    stalled: Vec<u64>,
 }
 
 /// Process-wide release state. Created on the first
@@ -190,6 +195,7 @@ pub(super) fn register(state: &ReleaseState, badge: u64) -> Arc<FileEntry>
         outstanding: Mutex::new(Outstanding {
             idle: Vec::new(),
             reading: Vec::new(),
+            stalled: Vec::new(),
         }),
         read_done: Condvar::new(),
     });
@@ -232,6 +238,10 @@ pub(super) fn end_read(entry: &FileEntry, cookie: u64, mapping: Option<Outstandi
     {
         out.reading.swap_remove(idx);
     }
+    if let Some(idx) = out.stalled.iter().position(|&c| c == cookie)
+    {
+        out.stalled.swap_remove(idx);
+    }
     if let Some(m) = mapping
     {
         out.idle.push(m);
@@ -256,7 +266,8 @@ enum Taken
     Mapping(OutstandingMapping),
     /// No mapping: released locally already, or its `File` closed.
     Absent,
-    /// A local copy of the page was still running when [`READ_WAIT`] ran out.
+    /// A local copy of the page was still running when [`READ_WAIT`] ran
+    /// out, now or on an earlier release of the cookie.
     Busy,
 }
 
@@ -277,17 +288,22 @@ fn find_entry(state: &ReleaseState, cookie: u64) -> Option<Arc<FileEntry>>
         .cloned()
 }
 
-/// Handler-side take: wait, up to [`READ_WAIT`], while a local read of
-/// `cookie` is in progress, then take its mapping.
+/// Handler-side take: wait, up to [`READ_WAIT`] and once per cookie, while
+/// a local read of `cookie` is in progress, then take its mapping.
 fn take_mapping_after_read(entry: &FileEntry, cookie: u64) -> Taken
 {
     let out = entry.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
+    if out.stalled.contains(&cookie)
+    {
+        return Taken::Busy;
+    }
     let (mut out, _) = entry
         .read_done
         .wait_timeout_while(out, READ_WAIT, |o| o.reading.contains(&cookie))
         .unwrap_or_else(PoisonError::into_inner);
     if out.reading.contains(&cookie)
     {
+        out.stalled.push(cookie);
         return Taken::Busy;
     }
     match out.idle.iter().position(|m| m.cookie == cookie)
@@ -397,8 +413,8 @@ fn handler_main(state: &ReleaseState)
             .map_or(Taken::Absent, |e| take_mapping_after_read(e.as_ref(), cookie));
 
         // A page this process cannot unmap, or one a copy is still reading,
-        // is not released: anything but FS_RELEASE_ACK sends the driver down
-        // its hard-revoke path, which tears the mapping down.
+        // is not acknowledged. The driver revokes after any reply, which
+        // tears down a mapping still in place.
         let released = match taken
         {
             Taken::Absent => true,

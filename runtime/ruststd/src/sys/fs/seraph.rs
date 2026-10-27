@@ -284,8 +284,10 @@ pub struct ReadDir
     dir_cap: u32,
     next_idx: u64,
     parent_path: PathBuf,
-    /// Set at `END_OF_DIR` or after any error `next` returns, which would
-    /// otherwise repeat on every later call.
+    /// Set at `END_OF_DIR` or after an error that would otherwise repeat on
+    /// every later call (no registered IPC buffer, an `NS_READDIR`
+    /// failure). A rejected entry name is an error for that entry alone;
+    /// the iteration continues past it.
     done: bool,
 }
 
@@ -1227,10 +1229,11 @@ pub struct File
     /// FS_READ_MEMORY, FS_WRITE, FS_WRITE_MEMORY, FS_TRUNCATE,
     /// FS_CLOSE, synchronous client-initiated FS_RELEASE_MEMORY).
     file_cap: u32,
-    /// Badge identifying this `File` for the release-handler dispatch.
-    /// Carried inside the per-process release endpoint so an inbound
-    /// `FS_RELEASE_MEMORY` from the driver routes to this `File`'s
-    /// outstanding-mappings registry.
+    /// Badge keying this `File`'s entry in the release-handler registry,
+    /// so `Drop` can unregister it; also the badge of `release_send`. A
+    /// driver `FS_RELEASE_MEMORY` is matched by cookie across every
+    /// registered `File`, not by the badge it arrives on: the driver keeps
+    /// one release SEND per node (fs-driver-protocol.md § Label 8).
     badge: u64,
     /// Badged SEND on the per-process release endpoint. We retain
     /// the parent in our CSpace; on Drop we delete it so any
@@ -1859,10 +1862,10 @@ impl Drop for File
         }
         let _ = syscall::cap_delete(self.file_cap);
 
-        // Drain the registry entry. After unregister, the handler
-        // thread cannot route any further FS_RELEASE_MEMORY to this
-        // File — a late forced release on our badge finds no entry
-        // and no-ops with an ack.
+        // Drain the registry entry. After unregister no release can reach
+        // this File's mappings: a later driver release for one of its
+        // cookies, on whichever badge, finds no entry and is acked without
+        // action.
         if let Some(state) = release_handler::state()
         {
             if let Some(entry) = release_handler::unregister(state, self.badge)

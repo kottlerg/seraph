@@ -10,13 +10,13 @@
 //! tables for a candidate, enqueues an [`EvictReq`], and replies
 //! `IO_ERROR`. The eviction worker pops the request, sends
 //! `FS_RELEASE_MEMORY` on the client's release endpoint, and waits
-//! up to [`RELEASE_TIMEOUT_MS`] for `FS_RELEASE_ACK`. On ack the
-//! cache slot is reclaimed cooperatively; on timeout the worker
-//! `cap_revoke`s the per-cookie ancestor cap and the client's
-//! mapping is torn down by the kernel — the client takes a
-//! `USERSPACE FAULT` on the next access. Either path then drops
-//! the ancestor cap, decrements the cache slot's refcount, and
-//! clears the per-file outstanding-page entry.
+//! up to [`RELEASE_TIMEOUT_MS`] for `FS_RELEASE_ACK`. Either way
+//! the worker then `cap_revoke`s the per-cookie ancestor cap, drops
+//! it, decrements the cache slot's refcount, and clears the per-file
+//! outstanding-page entry. An ack means the client has already
+//! unmapped the page; without one the revoke tears down the client's
+//! mapping, and the client takes a `USERSPACE FAULT` on its next
+//! access.
 //!
 //! The watchdog is fully userspace. `ipc_call` has no kernel-side
 //! timeout, so the worker spawns a child thread to issue the call

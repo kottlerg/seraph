@@ -1671,8 +1671,8 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 /// back a fresh slot (`OutOfMemory`; refill it with `cap_create_cspace` in
 /// augment mode; `QuotaExceeded` at the structural ceiling). `InvalidCapability`
 /// also covers a source a concurrent delete, move, or revoke freed before the
-/// copy was linked; `InvalidState` means a `cap_revoke` or `cap_move` is in
-/// flight on the source.
+/// copy was linked; `InvalidState` means a `cap_revoke`, `cap_move`, or IPC
+/// capability transfer is in flight on the source.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1852,11 +1852,13 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 /// invalid or stale, or an ancestor's revoke freed the capability while the
 /// move was in flight; `InsufficientRights` if the destination `CSpace` cap
 /// lacks Insert; `InvalidArgument` if `dest_index` is occupied or out of
-/// range; `OutOfMemory` if the destination's slot pool cannot back the slot
-/// (for a non-zero `dest_index`, every leaf up to that index must be
-/// backed; `QuotaExceeded` at the structural ceiling); `InvalidState` if a
-/// revoke or another move is in flight on the source, or the destination
-/// slot was freed mid-move (the source keeps the capability);
+/// range (the wrapper returns it without a syscall for a `dest_index` above
+/// `CAP_INDEX_MASK`); `OutOfMemory` if the destination's slot pool cannot
+/// back the slot (for a non-zero `dest_index`, every leaf up to that index
+/// must be backed; `QuotaExceeded` at the structural ceiling);
+/// `InvalidState` if a revoke, another move, or an IPC capability transfer
+/// is in flight on the source, or the destination slot was freed mid-move
+/// (the source keeps the capability);
 /// `Interrupted` if a concurrent deriver kept extending the child list past
 /// the kernel's batch backstop — the capability then lives in both slots,
 /// the destination a derived child of the source, and a `cap_revoke` on the
@@ -1867,6 +1869,12 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn cap_move(src_cap: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u32, i64>
 {
+    // The kernel decodes only the low `CAP_INDEX_BITS` of the destination, so
+    // a larger index would land in a lower slot or auto-allocate.
+    if dest_index > CAP_INDEX_MASK
+    {
+        return Err(SyscallError::InvalidArgument as i64);
+    }
     // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
     // (source slot, dest CSpace cap, dest index); kernel validates and moves cap, returns slot.
     let ret = unsafe {
@@ -1905,7 +1913,8 @@ pub fn cap_move(src_cap: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u
 /// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
 /// `InvalidCapability` also covers a source a concurrent delete, move, or
 /// revoke freed before the copy was linked; `InvalidState` means a
-/// `cap_revoke` or `cap_move` is in flight on the source.
+/// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
+/// source.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -2331,10 +2340,11 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 /// If the thread is running on another CPU, the call returns once that CPU
 /// has descheduled it and published its register save, or once an object
 /// teardown has made it `Exited`. A caller that is itself stopped while it
-/// waits returns, once restarted, as soon as `thread_cap` no longer names the
-/// target with Control rights, even while the target still runs;
-/// [`thread_read_regs`] and [`thread_write_regs`] refuse such a target with
-/// `InvalidState` until it has left its CPU (`core/kernel/docs/syscalls.md`
+/// waits returns at once when restarted if `thread_cap` no longer names the
+/// target with Control rights, even while the target still runs, and
+/// otherwise keeps waiting as above; [`thread_read_regs`] and
+/// [`thread_write_regs`] refuse such a target with `InvalidState` until it
+/// has left its CPU (`core/kernel/docs/syscalls.md`
 /// § `SYS_THREAD_STOP`).
 ///
 /// # Errors

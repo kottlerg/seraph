@@ -517,22 +517,20 @@ pub fn move_large_subtree(ctx: &TestContext) -> TestResult
         };
         let grandchild = grandchild.ok_or("move_large_subtree built no grandchild")?;
 
-        // Explicit mode targets a just-freed index; the kernel decodes the
-        // placement index from the stale handle without a generation check.
+        // Explicit mode targets a just-freed index.
         let dest_index = if explicit
         {
             let t = cap_create_notification(ctx.memory_base)
                 .map_err(|_| "create_notification (placement) failed")?;
             cap_delete(t).map_err(|_| "cap_delete (placement) failed")?;
-            t
+            syscall_abi::cap_handle_index(t)
         }
         else
         {
             0
         };
         let moved = cap_move(sig, ctx.cspace_cap, dest_index).map_err(|_| "cap_move failed")?;
-        if explicit
-            && syscall_abi::cap_handle_index(moved) != syscall_abi::cap_handle_index(dest_index)
+        if explicit && syscall_abi::cap_handle_index(moved) != dest_index
         {
             return Err("explicit cap_move landed at another index");
         }
@@ -660,7 +658,8 @@ pub fn delete_null_slot_ok(ctx: &TestContext) -> TestResult
 // ── SYS_CAP_COPY explicit slot negative (out of bounds) ──────────────────────
 
 /// `cap_insert` with a slot index beyond the destination `CSpace` capacity, or
-/// outside the handle's index field, must fail.
+/// outside the handle's index field, must fail; so must `cap_move` to an index
+/// outside that field.
 pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
@@ -678,10 +677,15 @@ pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
     // Index 0 and an index with bits above the handle's index field would
     // decode to a kernel-chosen or a lower slot; the wrapper refuses both.
     let invalid = SyscallError::InvalidArgument as i64;
+    let above_field = (syscall_abi::CAP_INDEX_MASK + 1) | 5;
     if cap_insert(sig, dest_cs, 0, syscall::RIGHTS_ALL) != Err(invalid)
-        || cap_insert(sig, dest_cs, (1 << 24) | 5, syscall::RIGHTS_ALL) != Err(invalid)
+        || cap_insert(sig, dest_cs, above_field, syscall::RIGHTS_ALL) != Err(invalid)
     {
         return Err("cap_insert with slot 0 or an index above CAP_INDEX_MASK should fail");
+    }
+    if cap_move(sig, dest_cs, above_field) != Err(invalid)
+    {
+        return Err("cap_move to an index above CAP_INDEX_MASK should fail");
     }
 
     cap_delete(sig).map_err(|_| "cap_delete sig after insert_oob test failed")?;

@@ -7,8 +7,8 @@ discovery, interrupt routing resolution, and device-to-driver matching.
 
 ## ECAM Configuration Space
 
-PCI Express Enhanced Configuration Access Mechanism (ECAM) maps the entire
-256-byte configuration space of each PCI function to a contiguous MMIO
+PCI Express Enhanced Configuration Access Mechanism (ECAM) maps the 4 KiB
+extended configuration space of each PCI function to a contiguous MMIO
 region. devmgr locates the ECAM itself as a `firmware::EcamLocation`
 (`phys_base`, `size`, `start_bus`, `end_bus`) from the ACPI MCFG table, else
 the Device Tree blob's `pci-host-ecam-generic` node, else the riscv64 QEMU
@@ -26,7 +26,8 @@ offset = (bus << 20) | (device << 15) | (function << 12) + register
 Each function occupies 4 KiB (one page). The bus range is the
 `EcamLocation`'s `start_bus` / `end_bus` fields: the MCFG entry's start and
 end bus numbers; for a DTB node, bus 0 through the last bus the `reg` size
-covers (capped at 255); for the platform default, 0..=255.
+covers (capped at 255; a `reg` smaller than one bus yields no ECAM); for the
+platform default, 0..=255.
 
 ### Scan Procedure
 

@@ -98,6 +98,21 @@ unsafe fn ecam_read32(ecam_va: u64, bus: u8, dev: u8, func: u8, reg: u16) -> u32
     unsafe { core::ptr::read_volatile((ecam_va + ecam_offset(bus, dev, func, reg)) as *const u32) }
 }
 
+/// Write a u16 to ECAM config space.
+///
+/// # Safety
+/// See [`ecam_read8`].
+unsafe fn ecam_write16(ecam_va: u64, bus: u8, dev: u8, func: u8, reg: u16, val: u16)
+{
+    // SAFETY: caller guarantees ecam_va + offset is within the MMIO mapping.
+    unsafe {
+        core::ptr::write_volatile(
+            (ecam_va + ecam_offset(bus, dev, func, reg)) as *mut u16,
+            val,
+        );
+    }
+}
+
 /// Write a u32 to ECAM config space.
 ///
 /// # Safety
@@ -226,11 +241,44 @@ pub unsafe fn pci_enumerate(
     count
 }
 
+/// PCI Command register offset and its I/O- and Memory-space decode enables.
+const PCI_COMMAND: u16 = 0x04;
+const PCI_COMMAND_DECODE: u16 = 0x3;
+
 /// Probe BAR registers for a type-0 PCI header device.
+///
+/// I/O and Memory decode are disabled for the probe, so the device never
+/// decodes at the all-ones sizing address, and restored afterwards.
 ///
 /// # Safety
 /// `ecam_va` must be a valid ECAM MMIO mapping.
 unsafe fn probe_bars(ecam_va: u64, dev: &mut PciDevice)
+{
+    // SAFETY: ecam_va is valid.
+    let command = unsafe { ecam_read16(ecam_va, dev.bus, dev.dev, dev.func, PCI_COMMAND) };
+    // SAFETY: ecam_va is valid; decode is off only for the probe below.
+    unsafe {
+        ecam_write16(
+            ecam_va,
+            dev.bus,
+            dev.dev,
+            dev.func,
+            PCI_COMMAND,
+            command & !PCI_COMMAND_DECODE,
+        );
+    }
+    // SAFETY: ecam_va is valid (caller guarantee).
+    unsafe { probe_bar_registers(ecam_va, dev) };
+    // SAFETY: ecam_va is valid; restores the original Command value.
+    unsafe { ecam_write16(ecam_va, dev.bus, dev.dev, dev.func, PCI_COMMAND, command) };
+}
+
+/// Size and record each BAR of a type-0 header. A 64-bit MMIO BAR is sized
+/// from both its registers.
+///
+/// # Safety
+/// `ecam_va` must be a valid ECAM MMIO mapping.
+unsafe fn probe_bar_registers(ecam_va: u64, dev: &mut PciDevice)
 {
     let mut bar_idx: u8 = 0;
     while bar_idx < 6
@@ -258,15 +306,22 @@ unsafe fn probe_bars(ecam_va: u64, dev: &mut PciDevice)
         if is_mmio
         {
             let mask = sized & !0xF;
-            let bar_sz = (!u64::from(mask)).wrapping_add(1) & 0xFFFF_FFFF;
-            let mut bar_base = u64::from(orig & !0xF);
+            let bar_base = u64::from(orig & !0xF);
 
             if is_64bit && bar_idx + 1 < 6
             {
                 let hi_reg = reg + 4;
                 // SAFETY: ecam_va is valid.
                 let hi_orig = unsafe { ecam_read32(ecam_va, dev.bus, dev.dev, dev.func, hi_reg) };
-                bar_base |= u64::from(hi_orig) << 32;
+                // SAFETY: ecam_va is valid; writing to the upper BAR to probe size.
+                unsafe { ecam_write32(ecam_va, dev.bus, dev.dev, dev.func, hi_reg, 0xFFFF_FFFF) };
+                // SAFETY: ecam_va is valid.
+                let hi_sized = unsafe { ecam_read32(ecam_va, dev.bus, dev.dev, dev.func, hi_reg) };
+                // SAFETY: ecam_va is valid; restoring the original upper BAR value.
+                unsafe { ecam_write32(ecam_va, dev.bus, dev.dev, dev.func, hi_reg, hi_orig) };
+                let mask64 = (u64::from(hi_sized) << 32) | u64::from(mask);
+                let bar_sz = (!mask64).wrapping_add(1);
+                let bar_base = bar_base | (u64::from(hi_orig) << 32);
 
                 if dev.bar_count < MAX_BARS
                 {
@@ -280,6 +335,7 @@ unsafe fn probe_bars(ecam_va: u64, dev: &mut PciDevice)
                 continue;
             }
 
+            let bar_sz = (!u64::from(mask)).wrapping_add(1) & 0xFFFF_FFFF;
             if dev.bar_count < MAX_BARS
             {
                 dev.bar_phys[dev.bar_count] = bar_base;

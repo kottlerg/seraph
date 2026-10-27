@@ -8,8 +8,8 @@
 use ipc::IpcMessage;
 
 use crate::caps::DevmgrCaps;
-use crate::firmware::EcamLocation;
 use crate::{carve_subrange, reply_status};
+use firmware::EcamLocation;
 
 /// Arch-specific authority caps devmgr holds after bootstrap.
 pub struct ArchCaps
@@ -24,6 +24,7 @@ pub struct ArchCaps
 
 impl ArchCaps
 {
+    /// No authority held; filled by [`Self::absorb_shutdown_authority`].
     pub const fn empty() -> Self
     {
         Self { sbi_control_cap: 0 }
@@ -69,9 +70,21 @@ pub const RTC_DRIVER_NAME: &[u8] = b"goldfish-rtc";
 
 /// PLIC source of the QEMU `virt` NS16550, the serial driver's UART.
 /// Platform-static and hardcoded on the same basis as
-/// [`carve_uart_authority`], pending the data-driven (ACPI/DTB)
-/// device-binding follow-up.
+/// [`carve_uart_authority`], pending #165 (data-driven device binding).
 pub const UART_IRQ: u32 = 10;
+
+/// GSI for a PCI function whose config-space IRQ line is unset, from its
+/// `INTx` pin and device number: the QEMU `virt` PCI host's swizzle onto
+/// PLIC sources 32..=35 (firmware leaves the IRQ line 0 there). Returns
+/// `None` for a pin outside `INTA`..=`INTD` (1..=4).
+pub fn intx_fallback_gsi(pin: u8, dev: u8) -> Option<u32>
+{
+    if (1..=4).contains(&pin)
+    {
+        return Some(32 + ((u32::from(pin) - 1 + u32::from(dev)) % 4));
+    }
+    None
+}
 
 /// Carve the NS16550 `Mmio` out of the aperture covering the UART
 /// MMIO window.
@@ -81,8 +94,8 @@ pub const UART_IRQ: u32 = 10;
 /// [`platform_default_ecam`] and the seeded goldfish-RTC aperture are
 /// identified. The bootloader independently discovers this base via ACPI
 /// SPCR for its early console; replacing this constant with forwarded
-/// SPCR/`_CRS` discovery is part of the data-driven device-binding
-/// follow-up.
+/// SPCR/`_CRS` discovery is #165. Returns `None` when no aperture covers
+/// the window or the split fails.
 pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u32>
 {
     carve_subrange(caps, 0x1000_0000, 0x1000)
@@ -92,7 +105,8 @@ pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u32>
 /// goldfish-RTC page at `0x101000`. The base is platform-static and
 /// hardcoded pending #165, which replaces all such hardcoded per-driver
 /// knowledge with DTB `compatible = "google,goldfish-rtc"` driven
-/// discovery.
+/// discovery. Returns `None` when no aperture covers the page or the split
+/// fails.
 pub fn carve_rtc_authority(caps: &mut DevmgrCaps) -> Option<u32>
 {
     carve_subrange(caps, 0x0010_1000, 0x1000)

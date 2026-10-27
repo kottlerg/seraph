@@ -18,7 +18,6 @@
 
 mod arch;
 mod caps;
-mod firmware;
 mod pci;
 mod spawn;
 
@@ -129,8 +128,8 @@ fn main() -> !
 
     // Carve the UART interrupt before any PCI device IRQ. The allocator is
     // monotonic (it discards lines below each isolate point), and the UART line
-    // (x86 ISA IRQ4 / riscv PLIC source 10) sits below the PCI GSI/PLIC range,
-    // so it must be isolated first. Zero on failure: the serial driver then
+    // (`arch::current::UART_IRQ`) sits below the PCI GSI/PLIC range, so it must
+    // be isolated first. Zero on failure: the serial driver then
     // degrades to client-side timeout polling for RX.
     let uart_irq = irq_root.isolate_one(arch::current::UART_IRQ).unwrap_or(0);
 
@@ -1353,22 +1352,16 @@ fn acquire_single_irq_cap(pci_dev: &pci::PciDevice, irq_root: &mut IrqRootAlloca
     cap
 }
 
-/// Compute the GSI for a PCI device.
-///
-/// x86-64: firmware programs PCI config IRQ line. RISC-V: firmware
-/// typically leaves it 0, so compute from `INTx` pin + device number via
-/// the standard PCI swizzling used by QEMU virt.
+/// Compute the GSI for a PCI device: the firmware-programmed config-space
+/// IRQ line when one is set, else the arch `INTx` routing fallback
+/// ([`arch::current::intx_fallback_gsi`]).
 fn device_gsi(pci_dev: &pci::PciDevice) -> Option<u32>
 {
     if pci_dev.irq_line != 0 && pci_dev.irq_line != 0xFF
     {
         return Some(u32::from(pci_dev.irq_line));
     }
-    if pci_dev.irq_pin >= 1 && pci_dev.irq_pin <= 4
-    {
-        return Some(32 + ((u32::from(pci_dev.irq_pin) - 1 + u32::from(pci_dev.dev)) % 4));
-    }
-    None
+    arch::current::intx_fallback_gsi(pci_dev.irq_pin, pci_dev.dev)
 }
 
 /// Find the BAR cap for the `VirtIO` device's primary register region.

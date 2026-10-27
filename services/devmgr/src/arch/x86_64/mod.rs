@@ -8,8 +8,8 @@
 use ipc::IpcMessage;
 
 use crate::caps::DevmgrCaps;
-use crate::firmware::EcamLocation;
 use crate::reply_status;
+use firmware::EcamLocation;
 
 /// Arch-specific authority caps devmgr holds after bootstrap.
 pub struct ArchCaps
@@ -24,6 +24,7 @@ pub struct ArchCaps
 
 impl ArchCaps
 {
+    /// No authority held; filled by [`Self::absorb_shutdown_authority`].
     pub const fn empty() -> Self
     {
         Self { ioport_root_cap: 0 }
@@ -54,12 +55,24 @@ pub fn platform_default_ecam() -> Option<EcamLocation>
 pub const RTC_DRIVER_NAME: &[u8] = b"cmos-rtc";
 
 /// ISA IRQ line of COM1, the serial driver's UART. Platform-static and
-/// hardcoded on the same basis as [`carve_uart_authority`], pending the
-/// data-driven (ACPI/DTB) device-binding follow-up.
+/// hardcoded on the same basis as [`carve_uart_authority`], pending #165
+/// (data-driven device binding).
 pub const UART_IRQ: u32 = 4;
 
+/// GSI for a PCI function whose config-space IRQ line is unset, from its
+/// `INTx` pin and device number.
+///
+/// Returns `None`: on x86-64 the firmware programs the IRQ line, and
+/// routing an unprogrammed `INTx` pin to a GSI needs the ACPI `_PRT`,
+/// which devmgr does not parse; there is no fixed swizzle to fall back to.
+pub fn intx_fallback_gsi(_pin: u8, _dev: u8) -> Option<u32>
+{
+    None
+}
+
 /// Carve the COM1 `IoPort` (`0x3F8`..=`0x3FF`) out of devmgr's
-/// full-rights `IoPort` cap.
+/// full-rights `IoPort` cap. Returns `None` when devmgr holds no `IoPort`
+/// cap or a derive or split fails.
 pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u32>
 {
     ioport_carve(caps.arch.ioport_root_cap, 0x3F8, 8)
@@ -68,7 +81,8 @@ pub fn carve_uart_authority(caps: &mut DevmgrCaps) -> Option<u32>
 /// Carve the platform RTC's hardware-authority cap: the legacy MC146818
 /// ports at ISA `0x70`..=`0x71`. The base is platform-static and hardcoded
 /// pending #165, which replaces all such hardcoded per-driver knowledge
-/// with ACPI `_HID` (`PNP0B00`) driven discovery.
+/// with ACPI `_HID` (`PNP0B00`) driven discovery. Returns `None` when
+/// devmgr holds no `IoPort` cap or a derive or split fails.
 pub fn carve_rtc_authority(caps: &mut DevmgrCaps) -> Option<u32>
 {
     ioport_carve(caps.arch.ioport_root_cap, 0x70, 2)

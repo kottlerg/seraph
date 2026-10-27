@@ -1436,7 +1436,7 @@ pub mod devmgr_labels
     /// [`QUERY_ACPI_TABLE`]) and computed the `PM1a` control port it needs.
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
-    /// `data[1]` = the `PM1a` control port (x86-64; ignored on RISC-V).
+    /// `data[1]` = the 16-bit `PM1a` control port (x86-64; ignored on RISC-V).
     /// Caller's badge MUST carry [`REGISTRY_QUERY_AUTHORITY`]; the handler
     /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
@@ -1449,8 +1449,9 @@ pub mod devmgr_labels
     /// - RISC-V: `caps[0]` = a Reset-only derivation of devmgr's
     ///   `SbiControl` cap (SBI SRST authority).
     ///
-    /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails or
-    /// the platform authority cap is absent,
+    /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails,
+    /// `data[1]` does not fit in `u16` (x86-64), or the platform authority
+    /// cap is absent,
     /// [`super::devmgr_errors::INVALID_REQUEST`] when the RISC-V Reset-only
     /// derivation fails, and [`super::devmgr_errors::LABEL_VERSION_MISMATCH`]
     /// when `data[0]` is not `DEVMGR_LABELS_VERSION`.

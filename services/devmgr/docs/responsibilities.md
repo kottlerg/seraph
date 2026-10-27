@@ -86,8 +86,8 @@ devmgr's responsibilities are:
   or a Reset-only `SbiControl` derivation on RISC-V. On every call the caps are
   re-derived from the `IoPort` / `SbiControl` caps devmgr holds, so nothing is consumed and a
   restarted pwrmgr re-acquires them cleanly; a request whose PM1a port plus
-  its width overflows `u16` leaks one devmgr slot, and devmgr takes the
-  PM1a port from the caller unchecked
+  its width overflows `u16` leaks one devmgr slot, and devmgr checks only
+  that the caller's PM1a port is a 16-bit port number, not that it is the FADT's
   ([#446](https://github.com/kottlerg/seraph/issues/446)). devmgr runs no shutdown logic;
   it brokers the hardware, pwrmgr interprets and actuates. Both are gated on
   `REGISTRY_QUERY_AUTHORITY` alone, so any holder of that badge, not only

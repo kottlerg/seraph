@@ -1,0 +1,46 @@
+name: qemu-debs
+
+# Called by build-test.yml and burnin.yml; see docs/build-system.md
+# § Continuous Integration.
+on:
+  workflow_call:
+    outputs:
+      key:
+        description: Cache key of the downloaded QEMU and firmware packages
+        value: ${{ jobs.qemu-debs.outputs.key }}
+
+jobs:
+  qemu-debs:
+    # Pinned with the booting jobs' image; see docs/build-system.md
+    # § Continuous Integration.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compute cache key
+        id: key
+        run: |
+          key=$(.github/scripts/qemu-packages.sh key)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Look up cached packages
+        id: cache
+        uses: actions/cache/restore@v6
+        with:
+          path: qemu-debs
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+
+      - name: Download QEMU and firmware packages
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: .github/scripts/qemu-packages.sh download qemu-debs
+
+      - name: Save packages
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: qemu-debs
+          key: ${{ steps.key.outputs.key }}

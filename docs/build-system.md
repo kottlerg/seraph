@@ -40,8 +40,8 @@ commitments).
 Setting `default-members = ["xtask"]` in the workspace root `Cargo.toml` means
 bare `cargo build` and `cargo run` operate only on the host-target xtask
 binary. Components targeting the kernel, bootloader, or std-userspace triples
-must be built via `cargo xtask build` so the correct custom target JSON,
-`-Zbuild-std` flags, and (for the bootloader) `RUSTFLAGS` are passed
+must be built via `cargo xtask build` so the correct custom target JSON and
+`-Zbuild-std` flags are passed and, for the bootloader, `RUSTFLAGS` is set
 (§ Custom Targets).
 
 [`abi/boot-protocol`](../abi/boot-protocol/README.md) is the source of truth for the boot

@@ -176,6 +176,7 @@ The CPU state established at the kernel entry point is specified in
 | [docs/memory-model.md](../../docs/memory-model.md) | Virtual address space layout the bootloader must establish |
 | [docs/capability-model.md](../../docs/capability-model.md) | Initial capabilities minted from `mmio_apertures` and memory-map regions |
 | [docs/device-management.md](../../docs/device-management.md) | How `devmgr` uses the resources the bootloader provides |
+| [docs/build-system.md](../../docs/build-system.md) | Bootloader target triples, `RUSTFLAGS`, and the RISC-V linker-script link argument |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---

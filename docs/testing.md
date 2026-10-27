@@ -347,7 +347,7 @@ cells automatically; variants belong to the tiers below.
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
-| Local host runs | developer host, commands below | REQUIRED for PRs touching their trigger paths (the kernel and boot code; see Trigger paths below), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
+| Local host runs | developer host, commands below | REQUIRED for PRs touching their trigger paths (code and build configuration that shape the kernel or bootloader image; see Trigger paths below), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
 | Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | the riscv64 64- and 65-hart and x86_64 256-vCPU boundaries three times each and the memory variation once, whatever the release's PRs touched |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
@@ -360,19 +360,22 @@ binding the same way the
 surface.
 
 **Trigger paths.** The boundary CPU counts and the memory variation below are owed for a change,
-other than Markdown and comment lines, to code that builds into the kernel or bootloader image: any
-file under `core/kernel/` or `core/boot/` (sources, build scripts, manifests, and linker scripts),
-and any file of an in-tree crate either one depends on, transitively, through a normal or build
-dependency (`cargo metadata` lists them; today `abi/boot-protocol`, `abi/init-protocol`,
-`abi/process-abi`, `abi/syscall`, `shared/elf`, `shared/font`, `shared/mmio`,
-`shared/process-layout`, and `shared/text`). These hold every SMP, per-CPU, IPI, scheduler-wakeup,
-boot, and memory-init path. A change elsewhere owes none of them. The 512-vCPU and 128-hart
-boundaries below are owed in addition to the base runs, for their own trigger lists, which lie
-inside these paths. Every trigger in this section is a file or a directory, which triggers as a
-whole; a parenthetical after a named path gives the reason and does not narrow it. A trigger set
-defined by `git grep -l` is the union of the files the grep lists at the PR head and at the head's
-merge base with `origin/master`, so a change that removes the last match from a file still
-triggers.
+other than Markdown and comment lines, to the code or build configuration that shapes the kernel or
+bootloader image: any file under `core/kernel/` or `core/boot/` (sources, build scripts, manifests,
+and linker scripts), and any file of an in-tree crate either one depends on, transitively, through a
+normal or build dependency (`cargo metadata` lists them; today `abi/boot-protocol`,
+`abi/init-protocol`, `abi/process-abi`, `abi/syscall`, `shared/elf`, `shared/font`, `shared/mmio`,
+`shared/process-layout`, and `shared/text`), and the build configuration that shapes those images:
+the kernel and bootloader target specs (`xtask/targets/x86_64-seraph-none.json`,
+`riscv64imac-seraph-none.json`, and `riscv64imac-seraph-uefi.json`), `.cargo/config.toml`, the root
+`Cargo.toml` (its profiles), `rust-toolchain.toml`, and `xtask/src/commands/build.rs` (which runs
+the kernel and bootloader builds). These hold every SMP, per-CPU, IPI, scheduler-wakeup, boot, and
+memory-init path. A change elsewhere owes none of them. The 512-vCPU and 128-hart boundaries below
+are owed in addition to the base runs, for their own trigger lists, which lie inside these paths.
+Every trigger in this section is a file or a directory, which triggers as a whole; a parenthetical
+after a named path gives the reason and does not narrow it. A trigger set defined by `git grep -l`
+is the union of the files the grep lists at the PR head and at the head's merge base with
+`origin/master`, so a change that removes the last match from a file still triggers.
 
 ```sh
 # Boundary CPU counts, riscv64 (~70 s per passing run on a 16-core host;

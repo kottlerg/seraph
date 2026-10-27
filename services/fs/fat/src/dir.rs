@@ -23,13 +23,14 @@ use crate::bpb::{FatState, FatType, SECTOR_SIZE};
 use crate::cache::PageCache;
 use crate::fat::next_cluster;
 
-// The pure 8.3/LFN decoders, checksum, case folding, and entry parse live in
-// the host-testable `fat_parse` crate; the directory search and mutation
-// engine below consumes them over block I/O.
+// The pure 8.3/LFN decoders, checksum, case folding, entry parse, and removal
+// slot-run scan live in the host-testable `fat_parse` crate; the directory
+// search and mutation engine below consumes them over block I/O.
 pub use fat_parse::{
     DirEntry, LfnAccum, MAX_LFN_CHARS, MAX_LFN_UTF8, lfn_checksum, name_matches, parse_dir_entry,
     to_upper,
 };
+use fat_parse::{MAX_SLOT_RUN, RemoveRunScan, RemoveStep};
 // ── Directory search ──────────────────────────────────────────────────────
 
 /// Search a directory's cluster chain for an entry matching `name`.
@@ -459,17 +460,13 @@ const LFN_LAST_FLAG: u8 = 0x40;
 /// this callers see [`FatError::NoSpace`] for the name; in practice
 /// tests never collide hard enough to exhaust the tail.
 const MAX_NUMERIC_TAIL: u8 = 6;
-/// Maximum LFN slots in one run (255 chars / 13 chars-per-slot = 20).
-/// Plus 1 for the trailing 8.3 entry is the upper bound on slot-run
-/// length we ever allocate.
-const MAX_SLOT_RUN: usize = 21;
 
 /// Physical location of a 32-byte directory entry on disk.
 ///
 /// Returned by [`insert_entry`] so dispatch can later patch the
 /// `first_cluster` and `size` fields via [`update_entry_metadata`]
 /// after a write extends the file.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct DirEntryLocation
 {
     pub sector_lba: u32,
@@ -1400,11 +1397,8 @@ fn locate_entry_with_lfn_run(
     ipc_buf: *mut u64,
 ) -> Result<(RemovedEntry, [DirEntryLocation; MAX_SLOT_RUN]), FatError>
 {
-    let entries_per_sector = SECTOR_SIZE / 32;
     let mut buf = Box::new([0u8; SECTOR_SIZE]);
-    let mut lfn = LfnAccum::new();
-    let mut lfn_run: [Option<DirEntryLocation>; MAX_SLOT_RUN] = [None; MAX_SLOT_RUN];
-    let mut lfn_run_len = 0usize;
+    let mut scan = RemoveRunScan::new();
 
     if parent_dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
@@ -1413,17 +1407,14 @@ fn locate_entry_with_lfn_run(
         let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(512);
         for s in 0..root_sectors
         {
-            if let Some((entry, run, run_len)) = scan_sector_for_remove(
+            if let Some(entry) = scan_sector_for_remove(
                 root_start + s,
                 name,
                 cache,
                 block_dev,
                 ipc_buf,
                 &mut buf,
-                entries_per_sector,
-                &mut lfn,
-                &mut lfn_run,
-                &mut lfn_run_len,
+                &mut scan,
             )?
             {
                 if entry.start_cluster == u32::MAX
@@ -1434,10 +1425,7 @@ fn locate_entry_with_lfn_run(
                     sector_lba: 0,
                     offset_in_sector: 0,
                 }; MAX_SLOT_RUN];
-                for i in 0..run_len
-                {
-                    out[i] = run[i].ok_or(FatError::Corrupt)?;
-                }
+                out[..scan.run().len()].copy_from_slice(scan.run());
                 return Ok((entry, out));
             }
         }
@@ -1457,17 +1445,14 @@ fn locate_entry_with_lfn_run(
         let base_sector = state.cluster_to_sector(cluster);
         for s in 0..u32::from(state.sectors_per_cluster)
         {
-            if let Some((entry, run, run_len)) = scan_sector_for_remove(
+            if let Some(entry) = scan_sector_for_remove(
                 base_sector + s,
                 name,
                 cache,
                 block_dev,
                 ipc_buf,
                 &mut buf,
-                entries_per_sector,
-                &mut lfn,
-                &mut lfn_run,
-                &mut lfn_run_len,
+                &mut scan,
             )?
             {
                 if entry.start_cluster == u32::MAX
@@ -1478,10 +1463,7 @@ fn locate_entry_with_lfn_run(
                     sector_lba: 0,
                     offset_in_sector: 0,
                 }; MAX_SLOT_RUN];
-                for i in 0..run_len
-                {
-                    out[i] = run[i].ok_or(FatError::Corrupt)?;
-                }
+                out[..scan.run().len()].copy_from_slice(scan.run());
                 return Ok((entry, out));
             }
         }
@@ -1494,16 +1476,10 @@ fn locate_entry_with_lfn_run(
 }
 
 /// Per-sector walk for [`locate_entry_with_lfn_run`]. Returns the
-/// matching entry and its full LFN-run + 8.3 slot positions, or `None`
-/// to continue. On end-of-directory, returns the sentinel
+/// matching entry, whose slots [`RemoveRunScan::run`] then lists, or
+/// `None` to continue. On end-of-directory, returns the sentinel
 /// [`RemovedEntry`] `start_cluster == u32::MAX` so the caller maps to
 /// `NotFound`.
-type RemoveScanHit = (
-    RemovedEntry,
-    [Option<DirEntryLocation>; MAX_SLOT_RUN],
-    usize,
-);
-#[allow(clippy::too_many_arguments)]
 fn scan_sector_for_remove(
     sector_lba: u32,
     name: &[u8],
@@ -1511,76 +1487,37 @@ fn scan_sector_for_remove(
     block_dev: u32,
     ipc_buf: *mut u64,
     buf: &mut [u8; SECTOR_SIZE],
-    entries_per_sector: usize,
-    lfn: &mut LfnAccum,
-    lfn_run: &mut [Option<DirEntryLocation>; MAX_SLOT_RUN],
-    lfn_run_len: &mut usize,
-) -> Result<Option<RemoveScanHit>, FatError>
+    scan: &mut RemoveRunScan<DirEntryLocation>,
+) -> Result<Option<RemovedEntry>, FatError>
 {
     if !cache.read_sector(u64::from(sector_lba), block_dev, buf, ipc_buf)
     {
         return Err(FatError::Io);
     }
-    for e in 0..entries_per_sector
+    for e in 0..SECTOR_SIZE / 32
     {
         let off = e * 32;
         let loc = DirEntryLocation {
             sector_lba,
             offset_in_sector: off,
         };
-        if buf[off] == 0x00
+        match scan.step(&buf[off..off + 32], loc, name)
         {
-            return Ok(Some((
-                RemovedEntry {
+            RemoveStep::Continue =>
+            {}
+            RemoveStep::EndOfDir =>
+            {
+                return Ok(Some(RemovedEntry {
                     start_cluster: u32::MAX,
-                },
-                *lfn_run,
-                *lfn_run_len,
-            )));
-        }
-        if buf[off] == 0xE5
-        {
-            lfn.reset();
-            *lfn_run_len = 0;
-            continue;
-        }
-        if buf[off + 11] == ATTR_LFN
-        {
-            lfn.add_lfn_entry(&buf[off..off + 32]);
-            if *lfn_run_len < MAX_SLOT_RUN
-            {
-                lfn_run[*lfn_run_len] = Some(loc);
-                *lfn_run_len += 1;
+                }));
             }
-            continue;
-        }
-        let raw = &buf[off..off + 32];
-        if let Some(entry) = parse_dir_entry(raw)
-        {
-            let lfn_match = lfn.validate(&entry.name) && lfn.matches(name);
-            let sfn_match = name_matches(&entry.name, name);
-            if lfn_match || sfn_match
+            RemoveStep::Found { cluster } =>
             {
-                let mut run = [None; MAX_SLOT_RUN];
-                let mut run_len = 0;
-                if lfn_match
-                {
-                    run[..*lfn_run_len].copy_from_slice(&lfn_run[..*lfn_run_len]);
-                    run_len = *lfn_run_len;
-                }
-                run[run_len] = Some(loc);
-                run_len += 1;
-                return Ok(Some((
-                    RemovedEntry {
-                        start_cluster: entry.cluster,
-                    },
-                    run,
-                    run_len,
-                )));
+                return Ok(Some(RemovedEntry {
+                    start_cluster: cluster,
+                }));
             }
         }
-        lfn.reset();
-        *lfn_run_len = 0;
     }
     Ok(None)
 }

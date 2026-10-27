@@ -11,11 +11,14 @@
 //! of the first [`fs_labels::FS_READ_MEMORY`] request for each opened
 //! file (see [`super::File::read_frame`]); from that point on the
 //! driver's eviction worker can route cooperative releases here. The
-//! handler removes the matching outstanding mapping from the
-//! per-`File` registry (race-safe against the local read path's
-//! immediate-release cleanup), unmaps the page, drops the memory cap,
-//! returns the VA to the reservation arena, and replies
-//! [`fs_labels::FS_RELEASE_ACK`].
+//! handler waits out a local copy still reading the cookie's page, removes
+//! the matching outstanding mapping from the per-`File` registry
+//! (race-safe against the local read path's immediate-release cleanup),
+//! unmaps the page, drops the memory cap, and replies
+//! [`fs_labels::FS_RELEASE_ACK`]. The VA returns to the reservation arena
+//! only once the unmap succeeds (see [`discard_mapping`]); a failed unmap
+//! is answered with label 0, which the driver takes as no ack and follows
+//! with its hard `cap_revoke`.
 //!
 //! The endpoint and the handler thread are created lazily on the first
 //! [`super::File::open`] call; until then the cost is one
@@ -26,7 +29,7 @@
 
 use crate::collections::BTreeMap;
 use crate::io;
-use crate::sync::{Arc, Mutex, OnceLock, PoisonError};
+use crate::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use crate::thread;
 use crate::vec::Vec;
 
@@ -47,11 +50,24 @@ pub(super) struct OutstandingMapping
 
 /// Per-`File` registration entry held by the release handler under its
 /// registry lock. `Arc`-cloned out of the registry by both the handler
-/// and the local read/drop paths; the small inner Vec holds the live
-/// outstanding mappings keyed by cookie.
+/// and the local read/drop paths.
 pub(super) struct FileEntry
 {
-    pub mappings: Mutex<Vec<OutstandingMapping>>,
+    outstanding: Mutex<Outstanding>,
+    /// Signalled whenever a cookie leaves [`Outstanding::reading`].
+    read_done: Condvar,
+}
+
+/// A `File`'s outstanding pages, keyed by cookie.
+struct Outstanding
+{
+    /// Mappings no local copy is reading; a release may take them.
+    idle: Vec<OutstandingMapping>,
+    /// Cookies of local reads between their `FS_READ_MEMORY` and the end
+    /// of their copy. The driver may send `FS_RELEASE_MEMORY` for such a
+    /// cookie before the page is even mapped; the handler waits until the
+    /// read ends rather than ack a release whose page is still in use.
+    reading: Vec<u64>,
 }
 
 /// Process-wide release state. Created on the first
@@ -158,7 +174,11 @@ pub(super) fn allocate_badge() -> Option<u64>
 pub(super) fn register(state: &ReleaseState, badge: u64) -> Arc<FileEntry>
 {
     let entry = Arc::new(FileEntry {
-        mappings: Mutex::new(Vec::new()),
+        outstanding: Mutex::new(Outstanding {
+            idle: Vec::new(),
+            reading: Vec::new(),
+        }),
+        read_done: Condvar::new(),
     });
     let mut reg = state
         .registry
@@ -180,22 +200,57 @@ pub(super) fn unregister(state: &ReleaseState, badge: u64) -> Option<Arc<FileEnt
     reg.remove(&badge)
 }
 
-/// Add an outstanding mapping to a `FileEntry`. Called by `File::read`
-/// after a successful `FS_READ_MEMORY` so a forced release can find it.
-pub(super) fn add_mapping(entry: &FileEntry, m: OutstandingMapping)
+/// Mark `cookie` as read in progress. Called by `File::read_frame` before
+/// its `FS_READ_MEMORY`, so a driver release of the cookie waits for the
+/// read to end. Every call is paired with one [`end_read`].
+pub(super) fn begin_read(entry: &FileEntry, cookie: u64)
 {
-    let mut maps = entry.mappings.lock().unwrap_or_else(PoisonError::into_inner);
-    maps.push(m);
+    let mut out = entry.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
+    out.reading.push(cookie);
 }
 
-/// Take a mapping by cookie. Returns `Some` to whichever of the local
+/// End the read of `cookie`, handing over its mapping if one was made, and
+/// wake a release waiting on it.
+pub(super) fn end_read(entry: &FileEntry, cookie: u64, mapping: Option<OutstandingMapping>)
+{
+    let mut out = entry.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(idx) = out.reading.iter().position(|&c| c == cookie)
+    {
+        out.reading.swap_remove(idx);
+    }
+    if let Some(m) = mapping
+    {
+        out.idle.push(m);
+    }
+    entry.read_done.notify_all();
+}
+
+/// Take an idle mapping by cookie. Returns `Some` to whichever of the local
 /// release path or the handler thread observes the entry first; the
 /// loser sees `None` and skips its cleanup. Idempotent.
-pub(super) fn take_mapping(entry: &FileEntry, cookie: u64) -> Option<OutstandingMapping>
+fn take_mapping(entry: &FileEntry, cookie: u64) -> Option<OutstandingMapping>
 {
-    let mut maps = entry.mappings.lock().unwrap_or_else(PoisonError::into_inner);
-    let idx = maps.iter().position(|m| m.cookie == cookie)?;
-    Some(maps.swap_remove(idx))
+    let mut out = entry.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
+    let idx = out.idle.iter().position(|m| m.cookie == cookie)?;
+    Some(out.idle.swap_remove(idx))
+}
+
+/// Handler-side take: wait while a local read of `cookie` is in progress,
+/// then take its mapping. The driver releases a cookie only after issuing
+/// its page, so what remains of the read is one page map and copy, short
+/// against the driver's release watchdog.
+fn take_mapping_after_read(entry: &FileEntry, cookie: u64) -> Option<OutstandingMapping>
+{
+    let mut out = entry.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
+    while out.reading.contains(&cookie)
+    {
+        out = entry
+            .read_done
+            .wait(out)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+    let idx = out.idle.iter().position(|m| m.cookie == cookie)?;
+    Some(out.idle.swap_remove(idx))
 }
 
 /// Drain every outstanding mapping at file-close time so `File::drop`
@@ -203,8 +258,8 @@ pub(super) fn take_mapping(entry: &FileEntry, cookie: u64) -> Option<Outstanding
 /// caller via [`unregister`].
 pub(super) fn drain_mappings(entry: &FileEntry) -> Vec<OutstandingMapping>
 {
-    let mut maps = entry.mappings.lock().unwrap_or_else(PoisonError::into_inner);
-    core::mem::take(&mut *maps)
+    let mut out = entry.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
+    core::mem::take(&mut out.idle)
 }
 
 /// Local cleanup of a single mapping by cookie. Called after a
@@ -214,19 +269,17 @@ pub(super) fn drain_mappings(entry: &FileEntry) -> Vec<OutstandingMapping>
 /// during a contended eviction), this is a no-op.
 pub(super) fn release_one_local(entry: &FileEntry, aspace: u32, cookie: u64)
 {
-    let Some(m) = take_mapping(entry, cookie)
-    else
+    if let Some(m) = take_mapping(entry, cookie)
     {
-        return;
-    };
-    discard_mapping(m, aspace);
+        discard_mapping(m, aspace);
+    }
 }
 
 /// Unmap an outstanding mapping and delete its cap. The VA returns to the
 /// reservation arena only once the unmap succeeds; a range still mapped
 /// stays reserved until this process exits, so no later reservation can
-/// land on the driver's page.
-pub(super) fn discard_mapping(m: OutstandingMapping, aspace: u32)
+/// land on the driver's page. Returns whether the unmap succeeded.
+pub(super) fn discard_mapping(m: OutstandingMapping, aspace: u32) -> bool
 {
     let unmapped = syscall::mem_unmap(aspace, m.range.va_start(), m.range.page_count()).is_ok();
     let _ = syscall::cap_delete(m.memory_cap);
@@ -234,6 +287,7 @@ pub(super) fn discard_mapping(m: OutstandingMapping, aspace: u32)
     {
         pal_reserve::unreserve_pages(m.range);
     }
+    unmapped
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
@@ -305,12 +359,15 @@ fn handler_main(state: &ReleaseState)
             reg.get(&badge).cloned()
         };
 
-        if let Some(entry) = entry
-        {
-            release_one_local(entry.as_ref(), state.aspace, cookie);
-        }
-
-        let reply = IpcMessage::new(fs_labels::FS_RELEASE_ACK);
+        // A page this process cannot unmap is not released: anything but
+        // FS_RELEASE_ACK sends the driver down its hard-revoke path, which
+        // tears the mapping down. A cookie with no mapping (already released
+        // locally, or a file since closed) has nothing left to unmap.
+        let released = entry
+            .and_then(|e| take_mapping_after_read(e.as_ref(), cookie))
+            .is_none_or(|m| discard_mapping(m, state.aspace));
+        let label = if released { fs_labels::FS_RELEASE_ACK } else { 0 };
+        let reply = IpcMessage::new(label);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
     }

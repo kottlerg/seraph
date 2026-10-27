@@ -284,6 +284,9 @@ pub struct ReadDir
     dir_cap: u32,
     next_idx: u64,
     parent_path: PathBuf,
+    /// Set at `END_OF_DIR` or after an `NS_READDIR` failure, which would
+    /// otherwise repeat on every later call.
+    done: bool,
 }
 
 impl Iterator for ReadDir
@@ -292,9 +295,14 @@ impl Iterator for ReadDir
 
     fn next(&mut self) -> Option<Self::Item>
     {
+        if self.done
+        {
+            return None;
+        }
         let ipc_buf = crate::os::seraph::current_ipc_buf();
         if ipc_buf.is_null()
         {
+            self.done = true;
             return Some(Err(io::Error::other("seraph fs: IPC buffer not registered")));
         }
         loop
@@ -302,8 +310,16 @@ impl Iterator for ReadDir
             let entry = match ns_readdir_one(self.dir_cap, self.next_idx, ipc_buf)
             {
                 Ok(Some(e)) => e,
-                Ok(None) => return None,
-                Err(e) => return Some(Err(e)),
+                Ok(None) =>
+                {
+                    self.done = true;
+                    return None;
+                }
+                Err(e) =>
+                {
+                    self.done = true;
+                    return Some(Err(e));
+                }
             };
             self.next_idx = self.next_idx.saturating_add(1);
 
@@ -343,6 +359,7 @@ impl fmt::Debug for ReadDir
             .field("dir_cap", &self.dir_cap)
             .field("next_idx", &self.next_idx)
             .field("parent_path", &self.parent_path)
+            .field("done", &self.done)
             .finish()
     }
 }
@@ -913,6 +930,45 @@ fn acquire_write_frame(aspace: u32, memmgr_ep: u32) -> io::Result<WriteFrame>
         return Err(io::Error::other(msg));
     }
     Ok(WriteFrame { cap, phys, range })
+}
+
+/// A cookie's read-in-progress mark in the release registry, from before
+/// its `FS_READ_MEMORY` until the local copy from the mapped page is done.
+/// A driver release of the cookie waits on the mark, so the page cannot be
+/// unmapped, or acked back to the driver, mid-copy. Dropping the mark ends
+/// the read on every early return.
+struct ReadMark<'a>
+{
+    entry: &'a FileEntry,
+    cookie: u64,
+    mapping: Option<OutstandingMapping>,
+}
+
+impl<'a> ReadMark<'a>
+{
+    fn begin(entry: &'a FileEntry, cookie: u64) -> Self
+    {
+        release_handler::begin_read(entry, cookie);
+        Self {
+            entry,
+            cookie,
+            mapping: None,
+        }
+    }
+
+    /// End the read, registering the page's mapping for release.
+    fn finish(mut self, mapping: OutstandingMapping)
+    {
+        self.mapping = Some(mapping);
+    }
+}
+
+impl Drop for ReadMark<'_>
+{
+    fn drop(&mut self)
+    {
+        release_handler::end_read(self.entry, self.cookie, self.mapping.take());
+    }
 }
 
 /// Tear a write frame down and return its run to memmgr: unmap it, revoke
@@ -1488,6 +1544,7 @@ impl File
         {
             return Err(io::Error::other("seraph fs: read cookie entropy draw failed"));
         };
+        let mark = ReadMark::begin(self.entry.as_ref(), cookie);
         // First FS_READ_MEMORY for this File carries the per-process
         // release-endpoint SEND in caps[0]; the driver records it on
         // the OpenFile slot's first allocation so the eviction worker
@@ -1523,19 +1580,6 @@ impl File
         let range = self.map_frame(memory_cap, cookie)?;
         let va = range.va_start();
 
-        // Register the mapping with the release handler before exposing
-        // it to the local copy: a forced release racing in must observe
-        // the entry so it can clean up if it wins. Local cleanup below
-        // wins via take_mapping if we ack first.
-        release_handler::add_mapping(
-            self.entry.as_ref(),
-            OutstandingMapping {
-                cookie,
-                range,
-                memory_cap,
-            },
-        );
-
         let copy_len = bytes_valid.min(buf.len());
         // SAFETY: VA is mapped read-only for one page, and
         // `checked_frame_reply` holds `memory_data_offset + bytes_valid <=
@@ -1547,6 +1591,13 @@ impl File
             )
         };
         buf[..copy_len].copy_from_slice(&src[..copy_len]);
+        // The copy is done: hand the mapping to the registry, where a driver
+        // release that waited on the read can now take it.
+        mark.finish(OutstandingMapping {
+            cookie,
+            range,
+            memory_cap,
+        });
         self.pos.fetch_add(copy_len as u64, Ordering::Relaxed);
 
         // Proactive release: synchronous FS_RELEASE_MEMORY on the file
@@ -1955,6 +2006,7 @@ pub fn readdir(path: &Path) -> io::Result<ReadDir>
         dir_cap: walked.dir_cap,
         next_idx: 0,
         parent_path: PathBuf::from(path_str),
+        done: false,
     })
 }
 

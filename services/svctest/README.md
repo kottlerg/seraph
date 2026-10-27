@@ -98,7 +98,8 @@ slot stays zero.
 
 Several phases respawn `/tests/svctest` with a role token as `argv[1]`. `main` hands the token
 to `reentry::dispatch`, which tries each owning module's `reentry_main`; a matching role runs
-its child body and exits, and an unmatched token falls through to the normal run.
+its child body and exits (`park-child` parks until its spawner tears it down), and an unmatched
+token falls through to the normal run.
 
 | Role                        | Owning module  | Spawned by                                  |
 |-----------------------------|----------------|---------------------------------------------|
@@ -106,6 +107,7 @@ its child body and exits, and an unmatched token falls through to the normal run
 | `programs-child`            | `namespace`    | `ns_programs_subtree` (`/programs` subtree) |
 | `cwd-child`                 | `procmgr`      | `command_cwd_inherit` (cwd-cap delivery)    |
 | `blobs-fill-child`          | `procmgr`      | `command_blobs_fill_message` (full message) |
+| `park-child`                | `procmgr`      | `command_from_spawned_thread` (kill, drop)  |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |
 | `random-diverge-child`      | `random`       | `random` (per-process hash seed)            |

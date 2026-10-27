@@ -272,7 +272,9 @@ for the receive-side state machine.
 The client unmaps the matching Memory cap and replies with
 [`FS_RELEASE_ACK`](#label-9-fs_release_ack). If the client does not
 acknowledge within the cooperative-release watchdog window (100 ms),
-the driver `cap_revoke`s the parent Memory cap.
+the driver `cap_revoke`s the parent Memory cap. A reply with any other
+label is not an acknowledgement and takes the same revoke path; a client
+that cannot unmap the page replies so.
 
 ### Client-to-driver release
 

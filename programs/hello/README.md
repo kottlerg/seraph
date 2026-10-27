@@ -59,6 +59,8 @@ spawn target:
   exit code `0`.
 - `stdio_file_unsupported_phase` expects a spawn with a `File` as stdout to fail with
   `Unsupported`.
+- `command_from_spawned_thread_phase` captures its output through `Command::output()` from a
+  spawned thread and expects a clean exit and non-empty stdout.
 - `pipes_phase` (`services/svctest/src/phases/pipes.rs`) captures its stdout through a pipe
   and through `Command::output()`, and expects bytes and a clean exit.
 

@@ -22,12 +22,13 @@
 //!   * Wait: syscall::event_recv(event_queue_cap) — blocks until kernel posts
 //!           the exit reason on thread exit, encoded as
 //!           docs/process-lifecycle.md § Exit reason defines.
-//!   * Kill: event_post(event_queue_cap, EXIT_KILLED), then
-//!           ipc_call(process_handle, DESTROY_PROCESS, 0, &[]) — procmgr
+//!   * Kill: ipc_call(process_handle, DESTROY_PROCESS, 0, &[]) — procmgr
 //!           revokes + deletes the child's kernel objects, a teardown that
-//!           posts nothing itself, so `wait` after `kill` reports
-//!           `EXIT_KILLED`, unless the child had already died and its own
-//!           exit reason, posted first, is reported.
+//!           posts nothing itself — then event_post(event_queue_cap,
+//!           EXIT_KILLED), so `wait` after `kill` reports `EXIT_KILLED`,
+//!           unless the child had already died and its own exit reason,
+//!           posted first, is reported. A failed teardown is returned as
+//!           the error and posts nothing.
 //!
 //! Stdio:
 //!   * `Stdio::Inherit` (default) / `Stdio::Null` — no pipe installed
@@ -435,7 +436,6 @@ impl Command {
         // observer on the child, so a terminal fault in *any* of the child's
         // threads (not just the main thread) posts the fault class to this
         // queue and `wait()` returns.
-        let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
         let death_eq = crate::sys::alloc::seraph::object_slab_retype(88, |slab| {
             syscall::event_queue_create(slab, 4).ok()
         })
@@ -496,9 +496,8 @@ impl Command {
         let msg = builder.word_count(total_words).build();
 
         // SAFETY: `ipc_ptr` is this thread's registered IPC buffer page.
-        // file_cap and death_relay
-        // ownership transfer to procmgr via the IPC; procmgr cap_deletes the
-        // file cap and binds-then-deletes the relay.
+        // file_cap and death_relay ownership transfer to procmgr via the IPC;
+        // procmgr cap_deletes the file cap and binds-then-deletes the relay.
         let reply = unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_ptr) }
             .map_err(|_| {
                 let _ = syscall::cap_delete(death_eq);
@@ -527,8 +526,7 @@ impl Command {
         if syscall::thread_bind_notification(thread_cap, death_eq, 0).is_err() {
             let _ = syscall::cap_delete(death_eq);
             let _ = syscall::cap_delete(thread_cap);
-            // SAFETY: `ipc_ptr` is this thread's registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+            destroy_child(process_handle);
             let _ = syscall::cap_delete(process_handle);
             return Err(io::Error::other("thread_bind_notification for child failed"));
         }
@@ -602,8 +600,7 @@ impl Command {
                     // protocol + unmap + cap_delete). Tear down the child.
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
-                    // SAFETY: ipc_ptr is this thread's registered IPC buffer.
-                    let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                    destroy_child(process_handle);
                     let _ = syscall::cap_delete(process_handle);
                     return Err(e);
                 }
@@ -683,8 +680,7 @@ impl Command {
                     );
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
-                    // SAFETY: ipc_ptr is this thread's registered IPC buffer.
-                    let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                    destroy_child(process_handle);
                     let _ = syscall::cap_delete(process_handle);
                     return Err(e);
                 }
@@ -770,8 +766,7 @@ impl Command {
                 );
                 let _ = syscall::cap_delete(death_eq);
                 let _ = syscall::cap_delete(thread_cap);
-                // SAFETY: `ipc_ptr` is this thread's registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                destroy_child(process_handle);
                 let _ = syscall::cap_delete(process_handle);
                 return Err(e);
             }
@@ -814,8 +809,7 @@ impl Command {
                     );
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
-                    // SAFETY: `ipc_ptr` is this thread's registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                    destroy_child(process_handle);
                     let _ = syscall::cap_delete(process_handle);
                     return Err(map_procmgr_error(reply.label));
                 }
@@ -834,8 +828,7 @@ impl Command {
                     );
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
-                    // SAFETY: `ipc_ptr` is this thread's registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                    destroy_child(process_handle);
                     let _ = syscall::cap_delete(process_handle);
                     return Err(io::Error::other("CONFIGURE_NAMESPACE syscall failed"));
                 }
@@ -1038,6 +1031,9 @@ impl Process {
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
+        if !destroy_child(self.process_handle) {
+            return Err(io::Error::other("Child::kill: DESTROY_PROCESS failed"));
+        }
         // Kernel posts to `death_notification` only on voluntary exit
         // (`SYS_THREAD_EXIT`) or fault — cap_revoke-driven teardown is
         // silent. Synthesize the event ourselves on `death_eq` so the
@@ -1046,7 +1042,6 @@ impl Process {
         // kernel fault range (0x1000..0x2000) so callers can tell apart
         // a user-initiated kill from a hardware fault.
         let _ = syscall::event_post(self.death_eq, EXIT_KILLED);
-        destroy_child(self.process_handle);
         Ok(())
     }
 

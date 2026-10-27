@@ -6,8 +6,9 @@
 //! procmgr / `std::process::Command` surface.
 //!
 //! Hosts the child-mode entries `cwd_child_main` (spawned by
-//! `command_cwd_inherit_phase`) and `blobs_fill_child_main` (spawned by
-//! `command_blobs_fill_message_phase`).
+//! `command_cwd_inherit_phase`), `blobs_fill_child_main` (spawned by
+//! `command_blobs_fill_message_phase`), and `park_child_main` (spawned by
+//! `command_from_spawned_thread_phase`).
 
 use std::os::seraph::startup_info;
 
@@ -77,6 +78,22 @@ pub fn reentry_main(role: &str)
     if role == BLOBS_FILL_ROLE
     {
         blobs_fill_child_main();
+    }
+    if role == PARK_ROLE
+    {
+        park_child_main();
+    }
+}
+
+/// argv[1] of a child that parks until it is torn down; the
+/// `command_from_spawned_thread` cells kill and drop it.
+const PARK_ROLE: &str = "park-child";
+
+fn park_child_main() -> !
+{
+    loop
+    {
+        std::thread::park();
     }
 }
 
@@ -382,10 +399,12 @@ pub fn command_non_utf8_refused_phase(_: &Caps)
 
 /// `Command::spawn`, `Child::kill`, and dropping an unwaited `Child` each
 /// call procmgr through the calling thread's IPC buffer, so all three must
-/// work from a spawned thread as from main.
+/// work from a spawned thread as from main. The kill and drop cells use an
+/// unpiped child, which has no death bridge to tear it down instead, and
+/// check through procmgr that the child is gone.
 pub fn command_from_spawned_thread_phase(_: &Caps)
 {
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     let spawner = std::thread::Builder::new()
         .name("command_spawner".into())
@@ -403,33 +422,63 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
                 "hello spawned from a thread produced no stdout"
             );
 
-            // stdiotest blocks on its piped stdin, so the kill and the drop
-            // below each land on a live child.
-            let mut child = Command::new("/programs/stdiotest")
-                .stdin(Stdio::piped())
+            let mut child = Command::new("/tests/svctest")
+                .arg(PARK_ROLE)
                 .spawn()
-                .expect("spawning stdiotest from a spawned thread failed");
+                .expect("spawning the park child to kill failed");
             child
                 .kill()
                 .expect("Child::kill from a spawned thread failed");
-            let status = child.wait().expect("wait on the killed stdiotest failed");
+            let status = child.wait().expect("wait on the killed park child failed");
             assert_eq!(
                 status.to_string(),
                 "killed",
                 "a killed child must report killed, got {status}"
             );
+            assert!(
+                !process_live(child.id()),
+                "Child::kill from a spawned thread left the child live"
+            );
 
-            let unwaited = Command::new("/programs/stdiotest")
-                .stdin(Stdio::piped())
+            let unwaited = Command::new("/tests/svctest")
+                .arg(PARK_ROLE)
                 .spawn()
-                .expect("spawning the unwaited stdiotest failed");
+                .expect("spawning the park child to drop failed");
+            let handle = syscall::cap_derive(unwaited.id(), syscall::RIGHTS_ALL)
+                .expect("copying the unwaited child's process handle failed");
             drop(unwaited);
+            let live = process_live(handle);
+            let _ = syscall::cap_delete(handle);
+            assert!(
+                !live,
+                "dropping an unwaited Child on a spawned thread left the child live"
+            );
         })
         .expect("command_from_spawned_thread spawn failed");
     spawner
         .join()
         .expect("command_from_spawned_thread child panicked");
     std::os::seraph::log!("command_from_spawned_thread phase passed");
+}
+
+/// Whether procmgr reports the process behind `handle` as `ALIVE` or
+/// `CREATED`, asked through the calling thread's IPC buffer. A failed call
+/// or a refusal, as on a handle procmgr has revoked, counts as not live.
+fn process_live(handle: u32) -> bool
+{
+    use ipc::procmgr_process_state::{ALIVE, CREATED};
+
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+    match unsafe { ipc::ipc_call(handle, &query, ipc_buf) }
+    {
+        Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS =>
+        {
+            matches!(reply.word(0), ALIVE | CREATED)
+        }
+        _ => false,
+    }
 }
 
 /// `file_size` word + 32 argv words + env header + 30 env words = 64: the

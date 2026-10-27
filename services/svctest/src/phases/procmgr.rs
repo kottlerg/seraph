@@ -67,8 +67,9 @@ pub fn command_phases() -> &'static [Phase]
 }
 
 /// Child-mode dispatch for argv tokens this module owns. Matching
-/// arms diverge via the child function's `std::process::exit`; on a
-/// miss control returns to the caller.
+/// arms diverge: each child function exits through `std::process::exit`,
+/// except `park-child`'s, which parks until its spawner tears it down. On
+/// a miss control returns to the caller.
 pub fn reentry_main(role: &str)
 {
     if role == "cwd-child"
@@ -404,6 +405,7 @@ pub fn command_non_utf8_refused_phase(_: &Caps)
 /// check through procmgr that the child is gone.
 pub fn command_from_spawned_thread_phase(_: &Caps)
 {
+    use ipc::procmgr_process_state::{EXITED, UNKNOWN};
     use std::process::Command;
 
     let spawner = std::thread::Builder::new()
@@ -435,9 +437,10 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
                 "killed",
                 "a killed child must report killed, got {status}"
             );
+            let state = process_state(child.id());
             assert!(
-                !process_live(child.id()),
-                "Child::kill from a spawned thread left the child live"
+                matches!(state, UNKNOWN | EXITED),
+                "Child::kill from a spawned thread left the child in state {state}"
             );
 
             let unwaited = Command::new("/tests/svctest")
@@ -447,11 +450,11 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
             let handle = syscall::cap_derive(unwaited.id(), syscall::RIGHTS_ALL)
                 .expect("copying the unwaited child's process handle failed");
             drop(unwaited);
-            let live = process_live(handle);
+            let state = process_state(handle);
             let _ = syscall::cap_delete(handle);
             assert!(
-                !live,
-                "dropping an unwaited Child on a spawned thread left the child live"
+                matches!(state, UNKNOWN | EXITED),
+                "dropping an unwaited Child on a spawned thread left the child in state {state}"
             );
         })
         .expect("command_from_spawned_thread spawn failed");
@@ -461,24 +464,24 @@ pub fn command_from_spawned_thread_phase(_: &Caps)
     std::os::seraph::log!("command_from_spawned_thread phase passed");
 }
 
-/// Whether procmgr reports the process behind `handle` as `ALIVE` or
-/// `CREATED`, asked through the calling thread's IPC buffer. A failed call
-/// or a refusal, as on a handle procmgr has revoked, counts as not live.
-fn process_live(handle: u32) -> bool
+/// The `procmgr_process_state` value procmgr reports for the process
+/// behind `handle`, asked through the calling thread's IPC buffer. After
+/// teardown procmgr still answers on the handle, with `UNKNOWN` (or
+/// `EXITED` while the badge is in its recent-exits ring), so a failed call
+/// or a refusal is a test failure, not a sign the process is gone.
+fn process_state(handle: u32) -> u64
 {
-    use ipc::procmgr_process_state::{ALIVE, CREATED};
-
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
     // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
-    match unsafe { ipc::ipc_call(handle, &query, ipc_buf) }
-    {
-        Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS =>
-        {
-            matches!(reply.word(0), ALIVE | CREATED)
-        }
-        _ => false,
-    }
+    let reply = unsafe { ipc::ipc_call(handle, &query, ipc_buf) }
+        .expect("QUERY_PROCESS on the child's process handle failed");
+    assert_eq!(
+        reply.label,
+        ipc::procmgr_errors::SUCCESS,
+        "QUERY_PROCESS refused the child's process handle"
+    );
+    reply.word(0)
 }
 
 /// `file_size` word + 32 argv words + env header + 30 env words = 64: the

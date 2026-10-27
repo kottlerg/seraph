@@ -40,8 +40,9 @@ fn main()
     // Re-entry hook: phases that respawn `/tests/svctest` with a role token
     // as argv[1] (some roles take further arguments after it) jump here.
     // The reentry module dispatches into the phase module that owns each
-    // role. A matching role's child main diverges (`std::process::exit`);
-    // on a miss control falls through to the parent test sequence.
+    // role. A matching role's child main diverges, by exiting or by parking
+    // until torn down; on a miss control falls through to the parent test
+    // sequence.
     let mut argv = std::env::args();
     let _self = argv.next();
     if let Some(role) = argv.next()

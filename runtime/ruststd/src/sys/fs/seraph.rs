@@ -284,7 +284,7 @@ pub struct ReadDir
     dir_cap: u32,
     next_idx: u64,
     parent_path: PathBuf,
-    /// Set at `END_OF_DIR` or after an `NS_READDIR` failure, which would
+    /// Set at `END_OF_DIR` or after any error `next` returns, which would
     /// otherwise repeat on every later call.
     done: bool,
 }
@@ -934,9 +934,10 @@ fn acquire_write_frame(aspace: u32, memmgr_ep: u32) -> io::Result<WriteFrame>
 
 /// A cookie's read-in-progress mark in the release registry, from before
 /// its `FS_READ_MEMORY` until the local copy from the mapped page is done.
-/// A driver release of the cookie waits on the mark, so the page cannot be
-/// unmapped, or acked back to the driver, mid-copy. Dropping the mark ends
-/// the read on every early return.
+/// A driver release of the cookie waits on the mark, up to the driver's
+/// release window, so the page is not unmapped, or acked back to the
+/// driver, mid-copy; a copy outlasting the window gets no ack, and the
+/// driver revokes. Dropping the mark ends the read on every early return.
 struct ReadMark<'a>
 {
     entry: &'a FileEntry,

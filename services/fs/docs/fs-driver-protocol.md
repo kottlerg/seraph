@@ -270,11 +270,18 @@ for the receive-side state machine.
 | `data[0]` | Release cookie identifying the Memory cap |
 
 The client unmaps the matching Memory cap and replies with
-[`FS_RELEASE_ACK`](#label-9-fs_release_ack). If the client does not
-acknowledge within the cooperative-release watchdog window (100 ms),
-the driver `cap_revoke`s the parent Memory cap. A reply with any other
-label is not an acknowledgement and takes the same revoke path; a client
-that cannot unmap the page replies so.
+[`FS_RELEASE_ACK`](#label-9-fs_release_ack). The client matches the
+cookie among all its open files, since the release may arrive on the
+SEND of a file other than the one that read the page. If a local copy
+from the page is still in progress, the client holds its reply until
+the copy ends, within the window below; this covers a release the
+driver sends before its reply to the cookie's
+[`FS_READ_MEMORY`](#label-7-fs_read_memory) arrives. If the client does
+not acknowledge within the cooperative-release watchdog window
+(100 ms), the driver `cap_revoke`s the parent Memory cap. A reply with
+any other label is not an acknowledgement and takes the same revoke
+path; a client that cannot unmap the page, or whose copy outlasts the
+window, replies `IO_ERROR` (2).
 
 ### Client-to-driver release
 

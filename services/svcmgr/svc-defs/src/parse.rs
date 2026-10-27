@@ -540,8 +540,9 @@ fn parse_namespace(lineno: usize, value: &str) -> Result<NamespaceShape, ParseEr
             return Err(ParseError::BadNamespace(lineno, value.to_owned()));
         }
         // A path with no components walks no NS_LOOKUP hop, so no namespace
-        // server attenuates the cap to `<rights>`: the child would get
-        // svcmgr's root at full rights.
+        // server attenuates the cap to `<rights>` (see `names_root`): the
+        // walk would fail for narrower rights or hand over the full root,
+        // which `universal` already names.
         if names_root(path)
         {
             return Err(ParseError::InvalidValue(

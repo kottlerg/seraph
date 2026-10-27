@@ -11,14 +11,18 @@
 //! of the first [`fs_labels::FS_READ_MEMORY`] request for each opened
 //! file (see [`super::File::read_frame`]); from that point on the
 //! driver's eviction worker can route cooperative releases here. The
-//! handler waits out a local copy still reading the cookie's page, removes
-//! the matching outstanding mapping from the per-`File` registry
-//! (race-safe against the local read path's immediate-release cleanup),
-//! unmaps the page, drops the memory cap, and replies
-//! [`fs_labels::FS_RELEASE_ACK`]. The VA returns to the reservation arena
-//! only once the unmap succeeds (see [`discard_mapping`]); a failed unmap
-//! is answered with label 0, which the driver takes as no ack and follows
-//! with its hard `cap_revoke`.
+//! handler finds the cookie among every registered `File`, not only the one
+//! whose badge the release carries: the driver records one release SEND per
+//! node, so a release for one `File`'s page can arrive on another `File`'s
+//! badge (services/fs/docs/fs-driver-protocol.md § Label 8). It waits out a
+//! local copy still reading the cookie's page, for at most [`READ_WAIT`],
+//! removes the matching outstanding mapping (race-safe against the local
+//! read path's immediate-release cleanup), unmaps the page, drops the
+//! memory cap, and replies [`fs_labels::FS_RELEASE_ACK`]. The VA returns to
+//! the reservation arena only once the unmap succeeds (see
+//! [`discard_mapping`]). A failed unmap or a copy still running at the end
+//! of the wait is answered with [`fs_errors::IO_ERROR`], which the driver
+//! takes as no ack and follows with its hard `cap_revoke`.
 //!
 //! The endpoint and the handler thread are created lazily on the first
 //! [`super::File::open`] call; until then the cost is one
@@ -31,12 +35,20 @@ use crate::collections::BTreeMap;
 use crate::io;
 use crate::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use crate::thread;
+use crate::time::Duration;
 use crate::vec::Vec;
 
-use ipc::{IpcMessage, fs_labels};
+use ipc::{IpcMessage, fs_errors, fs_labels};
 
 use crate::sys::reserve as pal_reserve;
 use crate::sys::reserve::ReservedRange;
+
+/// Longest the handler holds a release for a local copy of the cookie's page:
+/// the driver's cooperative-release window (fs-driver-protocol.md § Label 8),
+/// past which the driver revokes whatever the reply says. Bounding the wait
+/// keeps one driver's release from stalling the releases of every other
+/// `File` behind the single handler thread.
+const READ_WAIT: Duration = Duration::from_millis(100);
 
 /// One outstanding cache-page mapping the local read path has obtained
 /// from the fs driver via `FS_READ_MEMORY`. Carries everything the
@@ -65,8 +77,9 @@ struct Outstanding
     idle: Vec<OutstandingMapping>,
     /// Cookies of local reads between their `FS_READ_MEMORY` and the end
     /// of their copy. The driver may send `FS_RELEASE_MEMORY` for such a
-    /// cookie before the page is even mapped; the handler waits until the
-    /// read ends rather than ack a release whose page is still in use.
+    /// cookie before the page is even mapped; the handler waits, up to
+    /// [`READ_WAIT`], until the read ends rather than ack a release whose
+    /// page is still in use.
     reading: Vec<u64>,
 }
 
@@ -189,8 +202,8 @@ pub(super) fn register(state: &ReleaseState, badge: u64) -> Arc<FileEntry>
 }
 
 /// Remove a `File`'s registration. After this call the handler cannot
-/// dispatch any further releases to the file; subsequent
-/// `FS_RELEASE_MEMORY` arrivals look up an empty slot and ack-without-act.
+/// dispatch any further releases to the file; a later `FS_RELEASE_MEMORY`
+/// for one of its cookies finds no entry and is acked without action.
 pub(super) fn unregister(state: &ReleaseState, badge: u64) -> Option<Arc<FileEntry>>
 {
     let mut reg = state
@@ -201,8 +214,9 @@ pub(super) fn unregister(state: &ReleaseState, badge: u64) -> Option<Arc<FileEnt
 }
 
 /// Mark `cookie` as read in progress. Called by `File::read_frame` before
-/// its `FS_READ_MEMORY`, so a driver release of the cookie waits for the
-/// read to end. Every call is paired with one [`end_read`].
+/// its `FS_READ_MEMORY`, so a driver release of the cookie waits, up to
+/// [`READ_WAIT`], for the read to end. Every call is paired with one
+/// [`end_read`].
 pub(super) fn begin_read(entry: &FileEntry, cookie: u64)
 {
     let mut out = entry.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
@@ -210,7 +224,7 @@ pub(super) fn begin_read(entry: &FileEntry, cookie: u64)
 }
 
 /// End the read of `cookie`, handing over its mapping if one was made, and
-/// wake a release waiting on it.
+/// wake a release waiting on it. The handler thread is the only waiter.
 pub(super) fn end_read(entry: &FileEntry, cookie: u64, mapping: Option<OutstandingMapping>)
 {
     let mut out = entry.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
@@ -222,7 +236,7 @@ pub(super) fn end_read(entry: &FileEntry, cookie: u64, mapping: Option<Outstandi
     {
         out.idle.push(m);
     }
-    entry.read_done.notify_all();
+    entry.read_done.notify_one();
 }
 
 /// Take an idle mapping by cookie. Returns `Some` to whichever of the local
@@ -235,22 +249,52 @@ fn take_mapping(entry: &FileEntry, cookie: u64) -> Option<OutstandingMapping>
     Some(out.idle.swap_remove(idx))
 }
 
-/// Handler-side take: wait while a local read of `cookie` is in progress,
-/// then take its mapping. The driver releases a cookie only after issuing
-/// its page, so what remains of the read is one page map and copy, short
-/// against the driver's release watchdog.
-fn take_mapping_after_read(entry: &FileEntry, cookie: u64) -> Option<OutstandingMapping>
+/// What the handler's take found for a released cookie.
+enum Taken
 {
-    let mut out = entry.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
-    while out.reading.contains(&cookie)
+    /// The cookie's mapping, now the handler's to discard.
+    Mapping(OutstandingMapping),
+    /// No mapping: released locally already, or its `File` closed.
+    Absent,
+    /// A local copy of the page was still running when [`READ_WAIT`] ran out.
+    Busy,
+}
+
+/// The registered entry holding `cookie`, reading or idle, whichever `File`
+/// it belongs to. Cookies are random per read, so at most one entry holds
+/// one. Lock order: the registry, then an entry.
+fn find_entry(state: &ReleaseState, cookie: u64) -> Option<Arc<FileEntry>>
+{
+    let reg = state
+        .registry
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    reg.values()
+        .find(|e| {
+            let out = e.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
+            out.reading.contains(&cookie) || out.idle.iter().any(|m| m.cookie == cookie)
+        })
+        .cloned()
+}
+
+/// Handler-side take: wait, up to [`READ_WAIT`], while a local read of
+/// `cookie` is in progress, then take its mapping.
+fn take_mapping_after_read(entry: &FileEntry, cookie: u64) -> Taken
+{
+    let out = entry.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
+    let (mut out, _) = entry
+        .read_done
+        .wait_timeout_while(out, READ_WAIT, |o| o.reading.contains(&cookie))
+        .unwrap_or_else(PoisonError::into_inner);
+    if out.reading.contains(&cookie)
     {
-        out = entry
-            .read_done
-            .wait(out)
-            .unwrap_or_else(PoisonError::into_inner);
+        return Taken::Busy;
     }
-    let idx = out.idle.iter().position(|m| m.cookie == cookie)?;
-    Some(out.idle.swap_remove(idx))
+    match out.idle.iter().position(|m| m.cookie == cookie)
+    {
+        Some(idx) => Taken::Mapping(out.idle.swap_remove(idx)),
+        None => Taken::Absent,
+    }
 }
 
 /// Drain every outstanding mapping at file-close time so `File::drop`
@@ -345,28 +389,23 @@ fn handler_main(state: &ReleaseState)
             continue;
         }
 
-        let badge = msg.badge;
         let cookie = msg.word(0);
 
-        // Snapshot the FileEntry under the registry lock, then drop the
-        // lock before doing the unmap work — the local release path may
-        // need to register a fresh mapping concurrently.
-        let entry = {
-            let reg = state
-                .registry
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            reg.get(&badge).cloned()
-        };
+        // The registry lock is dropped before the wait and the unmap, so
+        // local reads keep registering mappings meanwhile.
+        let taken = find_entry(state, cookie)
+            .map_or(Taken::Absent, |e| take_mapping_after_read(e.as_ref(), cookie));
 
-        // A page this process cannot unmap is not released: anything but
-        // FS_RELEASE_ACK sends the driver down its hard-revoke path, which
-        // tears the mapping down. A cookie with no mapping (already released
-        // locally, or a file since closed) has nothing left to unmap.
-        let released = entry
-            .and_then(|e| take_mapping_after_read(e.as_ref(), cookie))
-            .is_none_or(|m| discard_mapping(m, state.aspace));
-        let label = if released { fs_labels::FS_RELEASE_ACK } else { 0 };
+        // A page this process cannot unmap, or one a copy is still reading,
+        // is not released: anything but FS_RELEASE_ACK sends the driver down
+        // its hard-revoke path, which tears the mapping down.
+        let released = match taken
+        {
+            Taken::Absent => true,
+            Taken::Mapping(m) => discard_mapping(m, state.aspace),
+            Taken::Busy => false,
+        };
+        let label = if released { fs_labels::FS_RELEASE_ACK } else { fs_errors::IO_ERROR };
         let reply = IpcMessage::new(label);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

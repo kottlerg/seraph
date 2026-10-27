@@ -1237,8 +1237,11 @@ pub mod fs_labels
     /// cap recorded in the node's open-file slot, taken from `caps[0]` of
     /// the [`FS_READ_MEMORY`] that allocated the slot (shared per node, not
     /// per client; tracked in #447); `data[0]` = the release cookie naming
-    /// the Memory cap to unmap. The client unmaps it and replies [`FS_RELEASE_ACK`];
-    /// without an ack inside the watchdog window the driver hard-revokes.
+    /// the Memory cap to unmap. The client unmaps it and replies
+    /// [`FS_RELEASE_ACK`], first letting a local copy from the page finish
+    /// within the watchdog window; any other reply label is no ack (the std
+    /// client sends `fs_errors::IO_ERROR`), and without an ack inside the
+    /// window the driver hard-revokes.
     ///
     /// Client-to-driver (synchronous release after a read): sent on the
     /// per-node badged cap the page was read through; `data[0]` = the

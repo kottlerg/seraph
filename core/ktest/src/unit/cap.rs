@@ -658,8 +658,7 @@ pub fn delete_null_slot_ok(ctx: &TestContext) -> TestResult
 // ── SYS_CAP_COPY explicit slot negative (out of bounds) ──────────────────────
 
 /// `cap_insert` with a slot index beyond the destination `CSpace` capacity, or
-/// outside the handle's index field, must fail; so must `cap_move` to an index
-/// outside that field.
+/// outside the handle's index field, must fail.
 pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
@@ -683,13 +682,38 @@ pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
     {
         return Err("cap_insert with slot 0 or an index above CAP_INDEX_MASK should fail");
     }
-    if cap_move(sig, dest_cs, above_field) != Err(invalid)
-    {
-        return Err("cap_move to an index above CAP_INDEX_MASK should fail");
-    }
 
     cap_delete(sig).map_err(|_| "cap_delete sig after insert_oob test failed")?;
     cap_delete(dest_cs).map_err(|_| "cap_delete dest_cs after insert_oob test failed")?;
+    Ok(())
+}
+
+// ── SYS_CAP_MOVE explicit slot negative (out of bounds) ──────────────────────
+
+/// `cap_move` to an index with bits above the handle's index field must fail:
+/// the kernel would decode it to a lower slot, so the wrapper refuses it and
+/// the source stays in place.
+pub fn move_out_of_bounds_err(ctx: &TestContext) -> TestResult
+{
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for move_oob test failed")?;
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4)
+        .map_err(|_| "create_cspace for move_oob test failed")?;
+
+    let above_field = (syscall_abi::CAP_INDEX_MASK + 1) | 5;
+    let moved = cap_move(sig, dest_cs, above_field);
+    let source_kept = notification_send(sig, 0x1).is_ok();
+
+    cap_delete(sig).ok();
+    cap_delete(dest_cs).map_err(|_| "cap_delete dest_cs after move_oob test failed")?;
+    if moved != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("cap_move to an index above CAP_INDEX_MASK should fail");
+    }
+    if !source_kept
+    {
+        return Err("refused cap_move left the source slot empty");
+    }
     Ok(())
 }
 

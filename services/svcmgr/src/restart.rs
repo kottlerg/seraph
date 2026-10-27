@@ -94,8 +94,9 @@ pub struct StartupBlobs<'a>
 /// backstop: the `.svc` parser already rejects such a recipe, and the check
 /// keeps an oversize blob from reaching the message builder's bound
 /// assertion. Every `None` arm releases the file and badged-creator caps it
-/// still holds. Caller is responsible for `CONFIGURE_NAMESPACE`, bootstrap
-/// delivery, and `START_PROCESS`.
+/// still holds, and the short-reply arm destroys the child procmgr created.
+/// Caller is responsible for `CONFIGURE_NAMESPACE`, bootstrap delivery, and
+/// `START_PROCESS`.
 ///
 /// `path` is interpreted relative to svcmgr's own `root_dir_cap`
 /// (universal), so callers pass paths exactly
@@ -214,7 +215,13 @@ pub fn walk_and_create_from_file(
     if reply_caps.len() < 2
     {
         std::os::seraph::log!("create: reply missing caps");
-        delete_caps(reply_caps);
+        // A label-0 reply means procmgr created the child; destroy it
+        // through whatever handle arrived. Slot 0 stands in for an absent
+        // thread cap.
+        if let Some(&process_handle) = reply_caps.first()
+        {
+            destroy_partial_child(process_handle, 0, ipc_buf);
+        }
         return None;
     }
     Some(CreatedProcess {

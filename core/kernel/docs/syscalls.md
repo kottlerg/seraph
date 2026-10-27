@@ -1905,8 +1905,8 @@ to it is stopped and the call never returns (see
 [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern).
 
 **Errors:** `InvalidCapability`, `InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC
-capability transfer is in flight on the source), `InsufficientRights` (dst CSpace lacks Insert), `InvalidArgument`
-(dst_slot occupied or out of range), `OutOfMemory` (slot-page pool exhausted),
+capability transfer is in flight on the source), `InsufficientRights` (dst CSpace lacks Insert),
+`InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool exhausted),
 `QuotaExceeded` (dst CSpace directory structurally full).
 
 ---

@@ -300,15 +300,19 @@ pub const SYS_IOPORT_BIND: u64 = 35;
 /// - `CSpace` → `(slot_capacity, slots_used, growth_budget_bytes)`
 /// - all other tags → `(tag, rights)` only
 ///
-/// Cannot fail except on null/invalid slot. Slot 36 was vacated by the
-/// `SYS_DMA_GRANT` removal (commit `704c1b4`).
+/// Fails with [`SyscallError::InvalidCapability`] on a null, invalid, or
+/// stale handle, and with [`SyscallError::InvalidArgument`] on an unknown
+/// selector or a tag-specific one whose owning tag does not match the slot
+/// (see arg1 below). Slot 36 was vacated by the `SYS_DMA_GRANT` removal
+/// (commit `704c1b4`).
 ///
 /// arg0 = slot index in the caller's `CSpace`.
 /// arg1 = field selector — one of the [`CAP_INFO_*`](CAP_INFO_TAG_RIGHTS)
 ///        constants below. The value returned in the primary register
 ///        depends on the selector. Field selectors that are tag-specific
-///        (every constant other than [`CAP_INFO_TAG_RIGHTS`]) require the
-///        slot's `CapTag` to match the field's owning tag; calls with a
+///        (every constant other than [`CAP_INFO_TAG_RIGHTS`] and the
+///        system-wide [`CAP_INFO_TLB_ELIDED`] and [`CAP_INFO_TLB_PERFORMED`])
+///        require the slot's `CapTag` to match the field's owning tag; calls with a
 ///        mismatched slot return [`SyscallError::InvalidArgument`].
 ///        Selectors not listed below also return
 ///        [`SyscallError::InvalidArgument`].

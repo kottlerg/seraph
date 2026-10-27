@@ -117,16 +117,18 @@ claims.
    (`git diff $(git merge-base <head> origin/master) <head>`, Markdown and
    comment lines aside; the parent fetches `origin` before the run, so read
    `origin/master` as it is), derive the runs owed and their repeat counts.
-   A change the body names as behaviour-neutral owes no run, and the diff
-   MUST bear its category out. The body's `## Validation` MUST report each
-   owed run with its `--runs` count and the head it ran at, and the PR's own
-   diff on that run's trigger paths MUST be the same at that head and at the
-   PR head, behaviour-neutral changes aside; or, when none is owed, the body
-   MUST say so and why. FAIL when an owed run is missing, its count is below
-   the one that section requires, its head is absent or does not cover the
-   PR head, a "none owed" statement is absent or contradicted by the PR's
-   own diff, or a change named behaviour-neutral falls under no category
-   that paragraph lists.
+   A behaviour-neutral change owes no run; the body MUST name each such
+   change and the category from that paragraph that makes it owe no run,
+   and the diff MUST bear that category out. The body's `## Validation`
+   MUST report each owed run with its `--runs` count and the head it ran
+   at, and the PR's own diff on that run's trigger paths MUST be the same
+   at that head and at the PR head, behaviour-neutral changes aside; or,
+   when none is owed, the body MUST say so and why. FAIL when an owed run
+   is missing, its count is below the one that section requires, its head
+   is absent or does not cover the PR head, a "none owed" statement is
+   absent or contradicted by the PR's own diff, a change named
+   behaviour-neutral states no category, or a change named
+   behaviour-neutral falls under no category that paragraph lists.
 
 10. PR-body claims: the body's prose (Summary, Notes, and any section
     the template does not define) against the diff. Every file, argument,

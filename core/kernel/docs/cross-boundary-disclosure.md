@@ -105,8 +105,10 @@ Notes on the non-obvious entries:
   stack pointer, kernel return address, or `CR3`/`satp`); the write path re-validates
   through `sanitize_for_user_resume`. `sys_thread_read_regs` does not pin the TCB it
   resolves through `lookup_cap`, so a sibling's concurrent delete or revoke of the last
-  Thread capability can free the thread slab while `copy_to_user` reads its trap frame,
-  and freed or reused kernel memory reaches the caller; closing it is
+  Thread capability can free the thread slab before or while `sched::with_held_frame`
+  takes its `sched_lock`, reads its state, and snapshots its trap frame into a kernel
+  stack buffer, and freed or reused kernel memory lands in the snapshot that
+  `copy_to_user` returns to the caller; closing it is
   [#443](https://github.com/kottlerg/seraph/issues/443).
 - **Thread IDs** are random per `sched::alloc_thread_id`, except init's, which is the
   fixed value 1 (class **d**) (issue #248;

@@ -14,7 +14,8 @@
 //! 1. **Tier 1** (`unit/`)        — exercises the kernel syscalls in isolation
 //!    (exceptions listed in `core/ktest/README.md` § Tier 1).
 //! 2. **Tier 2** (`integration/`) — cross-subsystem scenario tests.
-//! 3. **Tier S** (`stress/`)      — race and exhaustion cells with concurrent participants.
+//! 3. **Tier S** (`stress/`)      — stress tests: race conditions, resource exhaustion,
+//!    deep capability trees, and concurrent operations.
 //! 4. **Tier 3** (`bench/`)       — cycle-accurate benchmarks (`rdtsc` / `csrr cycle`).
 //!
 //! Results are printed to the serial console via hardware I/O and to the

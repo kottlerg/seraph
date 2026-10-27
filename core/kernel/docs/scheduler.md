@@ -601,7 +601,8 @@ Otherwise, by target state:
   Worst-case latency is therefore one time slice
   (`TIME_SLICE_TICKS` × tick period), not one tick.
 - **Blocked / Stopped / Created**: the new affinity takes effect on the
-  next wake via `select_target_cpu`; no migration work is needed.
+  next enqueue (a wake, or `SYS_THREAD_START` on start or resume) via
+  `select_target_cpu`; no migration work is needed.
 
 The syscall writes `cpu_affinity`, and reads `preferred_cpu` and `state`, without the target's
 `sched_lock`, so those accesses race other CPUs' scheduler paths

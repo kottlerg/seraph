@@ -2153,22 +2153,13 @@ unsafe fn dealloc_object_one(
                 // until here and is cleared on every enqueue_and_wake exit path.
                 if let Some(bound) = server_reply_wake
                 {
-                    // #317 predecessor-of-free null: clear the claimed client's
-                    // `blocked_on_object` (which still points at THIS dying server,
-                    // `tcb`) under the CLIENT's sched_lock, BEFORE enqueue_and_wake.
-                    // This is the strict predecessor of retype_free that the
-                    // cancel_ipc_block / dealloc(client) CLOSURE LEMMA
-                    // (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
-                    // Ownership) relies on: a withdrawer reading
-                    // `blocked_on == server` under the client sched_lock thereby
-                    // proves the server is not yet freed. It runs here, while `bound`
-                    // is still pinned by wake_in_flight = 1 (set at the claim above),
-                    // so the null is ordered before this server's free whichever arm
-                    // enqueue_and_wake takes: the pin release of its Exited arm lets
-                    // a concurrent dealloc(client) retype_free `bound`, and the
-                    // lemma's predecessor must already stand. Only the client's
-                    // sched_lock is taken (the server's was released with the all-CPU
-                    // locks above), so there is no two-TCB-sched_lock nesting.
+                    // Null the claimed client's `blocked_on_object` (still naming
+                    // this dying server) under the client's sched_lock, before
+                    // enqueue_and_wake and while wake_in_flight still pins `bound`:
+                    // the CLOSURE LEMMA of core/kernel/docs/scheduling-internals.md
+                    // § Cross-CPU TCB Ownership. Only the client's sched_lock is
+                    // taken (the server's was released with the all-CPU locks
+                    // above), so there is no two-TCB-sched_lock nesting.
                     // SAFETY: bound kept valid by wake_in_flight = 1 above.
                     unsafe {
                         let bs = (*bound).sched_lock.lock_raw();

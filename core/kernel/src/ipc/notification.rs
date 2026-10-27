@@ -205,11 +205,11 @@ pub unsafe fn notification_send(
 /// Reads and clears the bitmask atomically. If the result is non-zero,
 /// returns `Ok(bits)` immediately (no blocking). If zero, stores `caller`
 /// at the tail of the waiters and commits the park; a refused commit dequeues
-/// the caller again. A committed timed wait (non-zero `deadline`) is armed on
-/// the sleep list in the same critical section. Either way returns `Err(())`,
-/// and the caller must then call the scheduler to yield the CPU. A timed wait
-/// that finds the sleep list full is withdrawn and returns `Ok(0)`, an
-/// immediate timeout.
+/// the caller again. Either way returns `Err(())`, and the caller must then
+/// call the scheduler to yield the CPU. A committed timed wait (non-zero
+/// `deadline`) is armed on the sleep list in the same critical section; if
+/// the sleep list is full the park is withdrawn and the call returns `Ok(0)`,
+/// an immediate timeout.
 ///
 /// # Dekker ordering
 /// The waiter is registered and `has_observer` set before the bits swap; the

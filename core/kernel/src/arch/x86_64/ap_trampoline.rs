@@ -68,7 +68,7 @@ pub const TRAMP_PATCH_GDTR: usize = 0x40;
 /// +4  cpu_id:    u32   — logical CPU index for this AP
 /// +8  stack_top: u64   — kernel stack top (loaded into RSP before jumping)
 /// +16 entry_fn:  u64   — virtual address of kernel_entry_ap
-/// +24 ist1_top:  u64   — IST1 stack top (double-fault handler)
+/// +24 ist1_top:  u64   — IST1 stack top (double-fault and machine-check handlers)
 /// +32 ist2_top:  u64   — IST2 stack top (NMI handler)
 /// ```
 pub const TRAMP_PARAMS: usize = 0x68;
@@ -470,7 +470,7 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
 /// - `pml4_phys`: physical address of the kernel root page table.
 /// - `stack_top`: kernel stack top for this AP's idle thread.
 /// - `entry_fn`: virtual address of `kernel_entry_ap` to jump to.
-/// - `ist1_top`: IST1 stack top (double-fault).
+/// - `ist1_top`: IST1 stack top (double fault and machine check).
 /// - `ist2_top`: IST2 stack top (NMI).
 ///
 /// # Safety

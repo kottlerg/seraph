@@ -472,9 +472,10 @@ comment or Markdown. The CI gate and the
 the PR body MUST carry what
 [conventions.md](conventions.md#pr-body-checklist-discipline) § PR-body checklist
 discipline requires (the validated head, that the delta is documentation or
-comments only, and the local host runs the PR as a whole owes, each with its
-count and head, or that none is owed and why), and the pre-merge review's
-audit MUST check that against the diff.
+comments only, the local host runs the PR as a whole owes, each with its
+count and head, or that none is owed and why, and each behaviour-neutral
+change on a trigger path with why no run is owed for it), and the pre-merge
+review's audit MUST check that against the diff.
 
 **Behaviour-neutral changes.** The local host runs above exercise what the
 built code does. Besides Markdown and comment lines, only the kinds of change listed here
@@ -493,8 +494,9 @@ are behaviour-neutral, and only they leave a trigger path untouched:
 
 Any other change on a trigger path, including a code change believed
 equivalent, counts as touching it and owes that path's local host runs, at
-the heads When the runs are owed sets. A behaviour-neutral delta is exempt
-only from this section's local host runs: it MUST still pass the baseline
+the heads that the When the runs are owed paragraph above sets. A
+behaviour-neutral delta is exempt only from this section's local host runs:
+it MUST still pass the baseline
 validation (`cargo xtask build`, then a `cargo xtask run` boot of ktest or a
 staged harness to its `[<harness>] ALL TESTS PASSED` marker, per
 [Reporting marker](#reporting-marker), on both architectures) and the CI gate;

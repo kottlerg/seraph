@@ -110,10 +110,16 @@ impl ExtendedState
     }
 }
 
-// SAFETY: `area` is only dereferenced under the scheduler lock (eager
-// XSAVE in `switch_out_save`) or in the owning thread's trap-handler
-// context (`#NM` XRSTOR); raw pointer ownership is tracked explicitly
-// by the FPU save/restore code.
+// SAFETY: `area` is dereferenced only on the CPU that holds the owning
+// thread's live extended registers: the eager save in `switch_out_save`,
+// which `schedule()` calls with interrupts masked after dropping the
+// scheduler locks and before the `switch()` that publishes
+// `context_saved = 1` (Release); the `#NM` handler's save of a prior
+// `fpu_owner`; and the lazy restore in the owning thread's own FP trap
+// (`#NM` XRSTOR, or RISC-V `lazy_restore_fp_v`). The dispatching CPU's
+// Acquire of `context_saved` orders the save's writes before any other CPU
+// runs the thread; raw pointer ownership is tracked explicitly by the FPU
+// save/restore code.
 unsafe impl Send for ExtendedState {}
 
 // ── IpcThreadState ────────────────────────────────────────────────────────────
@@ -365,14 +371,16 @@ pub unsafe fn consume_park_interrupted(tcb: *mut ThreadControlBlock) -> bool
 /// # Safety invariant
 /// `run_queue_next`, `ipc_wait_next` and `ipc_wait_prev` are raw intrusive
 /// pointers, valid only while the TCB is linked on a run queue or an IPC wait
-/// queue respectively. `run_queue_next` is run-queue list structure, guarded
-/// by the TCB's `sched_lock` with the linking CPU's `PerCpuScheduler.lock`
-/// held beneath it; `ipc_wait_next`, `ipc_wait_prev` and the `ipc_wait_queue`
-/// tag are written under the lock of the IPC source whose queue links the
-/// TCB. Any source-lock holder may read the tag to test membership in its own
-/// queue (see [`crate::ipc::WaitQueue`]); the softlockup watchdog also reads
-/// it without a lock. See core/kernel/docs/scheduling-internals.md § Cross-CPU
-/// TCB Ownership.
+/// queue respectively. `run_queue_next` is run-queue list structure, written
+/// only under the linking CPU's `PerCpuScheduler.lock`, the one lock held on
+/// every write (a neighbour's link and `schedule()`'s dequeue of the next
+/// thread do not hold that TCB's `sched_lock`). `ipc_wait_next`,
+/// `ipc_wait_prev` and the `ipc_wait_queue` tag are written under the lock of
+/// the IPC source whose queue links the TCB. Any source-lock holder may read
+/// the tag to test membership in its own queue (see
+/// [`crate::ipc::WaitQueue`]); the softlockup watchdog also reads it without a
+/// lock. See core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
+/// Ownership.
 #[repr(C)]
 pub struct ThreadControlBlock
 {
@@ -422,10 +430,12 @@ pub struct ThreadControlBlock
     pub last_enqueue: Option<EnqueueBreadcrumb>,
 
     /// Authoritative serializer for this TCB's Scheduling field group (`state`,
-    /// `ipc_state`, `queued_on`, `run_queue_next`, `preferred_cpu`,
-    /// `blocked_on_object`, `wake_pending`, `park_seq`, `start_seq`), keyed on
-    /// the TCB itself rather than on whichever run queue links it. Its place in
-    /// the lock hierarchy and the ownership rules are specified in
+    /// `ipc_state`, `preferred_cpu`, `blocked_on_object`, `wake_pending`,
+    /// `park_seq`, `start_seq`), keyed on the TCB itself rather than on
+    /// whichever run queue links it. The group's run-queue list structure
+    /// (`queued_on`, `run_queue_next`) is serialised by the linking CPU's
+    /// `PerCpuScheduler.lock` instead. This lock's place in the lock hierarchy
+    /// and the ownership rules are specified in
     /// core/kernel/docs/scheduling-internals.md § Lock Hierarchy and § Cross-CPU
     /// TCB Ownership.
     pub sched_lock: crate::sync::Spinlock,

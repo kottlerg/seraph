@@ -12,27 +12,6 @@ On completion ktest emits the cross-harness marker
 
 ---
 
-## Source Layout
-
-```
-core/ktest/
-├── Cargo.toml
-└── src/
-    ├── main.rs                 # Entry point, TestContext, run_test!, tier dispatch, shutdown
-    ├── cmdline.rs              # KtestConfig::DEFAULT compile-time configuration
-    ├── spawn.rs                # Child-thread spawn helper, ArgBlock, exit/baseline polling
-    ├── frame_pool.rs           # Pool of single-page Memory caps handed out to tests
-    ├── framebuffer.rs          # Direct framebuffer output
-    ├── serial.rs               # Direct serial output
-    ├── ioport.rs               # Per-thread I/O port access (x86-64)
-    ├── acpi_shutdown.rs        # ACPI S5 shutdown (x86-64)
-    ├── sbi_shutdown.rs         # SBI SRST shutdown (RISC-V)
-    ├── unit/                   # Tier 1: per-syscall isolation tests
-    ├── integration/            # Tier 2: cross-subsystem scenario tests
-    ├── stress/                 # Tier S: stress and race tests
-    └── bench/                  # Tier 3: cycle-count benchmarks
-```
-
 ## Activating ktest
 
 Re-compose the bootloader bundle with ktest as the `init` entry:
@@ -52,7 +31,7 @@ authoring discipline.
 ## Source Layout
 
 ```
-ktest/
+core/ktest/
 ├── Cargo.toml              # Workspace member; no_std binary
 ├── README.md
 └── src/
@@ -73,7 +52,7 @@ ktest/
     │   └── riscv64/        # RISC-V entry points, constants, and arch-only tests
     ├── unit/               # Tier 1: per-syscall isolation tests, one file per surface
     ├── integration/        # Tier 2: cross-subsystem scenarios, one file per scenario
-    ├── stress/             # Tier S: race and exhaustion cells, one file per race
+    ├── stress/             # Tier S: stress tests, one file per race or resource invariant
     └── bench/              # Tier 3: cycle-count benchmarks, one file per surface
 ```
 

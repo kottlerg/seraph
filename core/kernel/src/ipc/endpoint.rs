@@ -10,16 +10,10 @@
 //! - `recv_queue`: servers blocked waiting for a caller to `call`.
 //!
 //! ## Protocol
-//! 1. Caller: `call(ep, msg)` — if a server is waiting → transfer message,
-//!    bind the caller into the server's `reply_tcb`, wake server, block caller
-//!    on reply. Otherwise → enqueue caller on `send_queue`.
-//! 2. Server: `recv(ep)` — first release any caller still bound from an
-//!    earlier receive that was never replied to (its call fails with
-//!    `Interrupted`; a fault-blocked caller is killed). Then, if a caller is
-//!    waiting → dequeue, transfer message, bind the caller into the server's
-//!    `reply_tcb`, return to server. Otherwise → block on `recv_queue`.
-//! 3. Server: `reply(msg)` — claim and clear `reply_tcb` by compare-exchange,
-//!    deliver the reply to the claimed caller, wake it.
+//! The call, receive, and reply paths (`endpoint_call`, `endpoint_recv`,
+//! `endpoint_reply`) are specified in core/kernel/docs/ipc-internals.md
+//! § Call Path (Sender), § Receive Path (Server), and § Reply Path; the
+//! call/reply model is docs/ipc-design.md § The Call/Reply Model.
 //!
 //! ## Reply capability
 //! The reply capability is the implicit, single-use caller binding that

@@ -853,8 +853,10 @@ impl AddressSpace
                     inval_batch_begin, inval_batch_end, inval_page,
                 };
                 // SAFETY: ring 0 / S-mode; per-VA invalidations bracketed by
-                // the batch window; clears TLB + PS-cache entries for every
-                // VA in the span.
+                // the batch window; clears the TLB entries for every VA in the
+                // span, and the paging-structure-cache entries too where
+                // `VA_INVAL_DROPS_TABLE_CACHES`; elsewhere `ranged` implies no
+                // table was freed.
                 unsafe {
                     inval_batch_begin();
                     for i in 0..page_count

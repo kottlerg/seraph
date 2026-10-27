@@ -220,16 +220,23 @@ const WATCHDOG_THRESHOLD_TICKS: u64 = 3_000; // ~3 s at the observed ~1 ms BSP t
 static LAST_NON_IDLE_TICK_PTR: core::sync::atomic::AtomicPtr<core::sync::atomic::AtomicU64> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
-/// Return CPU `cpu`'s last-non-idle-tick slot. Caller guarantees
-/// `cpu < CPU_COUNT` and that [`init_per_cpu_storage`] has run.
+/// Return CPU `cpu`'s last-non-idle-tick slot, or `None` before
+/// [`init_per_cpu_storage`] has published the slab or when `cpu` is not
+/// below `CPU_COUNT`.
 #[inline]
-fn last_non_idle_tick(cpu: usize) -> &'static core::sync::atomic::AtomicU64
+fn last_non_idle_tick(cpu: usize) -> Option<&'static core::sync::atomic::AtomicU64>
 {
     let base = LAST_NON_IDLE_TICK_PTR.load(core::sync::atomic::Ordering::Acquire);
-    debug_assert!(!base.is_null(), "last_non_idle_tick: not initialised");
-    // SAFETY: cpu < CPU_COUNT by caller contract; the slab covers CPU_COUNT
-    // AtomicU64 slots, each zero-initialised (a valid AtomicU64).
-    unsafe { &*base.add(cpu) }
+    // CPU_COUNT is stored before the Release that publishes `base`, so a
+    // non-null `base` observed by the Acquire above reads its final value.
+    if base.is_null() || cpu >= CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize
+    {
+        return None;
+    }
+    // SAFETY: base is non-null and cpu < CPU_COUNT; the slab covers CPU_COUNT
+    // AtomicU64 slots, each zero-initialised (a valid AtomicU64), and is
+    // never freed.
+    Some(unsafe { &*base.add(cpu) })
 }
 
 static WATCHDOG_TICK_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -767,7 +774,10 @@ pub fn check_lock_hold_preemptible(_kind: LockKind, _site: &core::panic::Locatio
 pub fn watchdog_mark_non_idle(cpu: usize)
 {
     let now = WATCHDOG_TICK_COUNTER.load(core::sync::atomic::Ordering::Relaxed);
-    last_non_idle_tick(cpu).store(now, core::sync::atomic::Ordering::Relaxed);
+    if let Some(slot) = last_non_idle_tick(cpu)
+    {
+        slot.store(now, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// BSP-only: tick the global counter and run the wedge detectors — the
@@ -800,7 +810,12 @@ fn watchdog_tick_and_check()
     // All CPUs must have last_dispatch older than threshold.
     for cpu in 0..cpu_count
     {
-        let last = last_non_idle_tick(cpu).load(core::sync::atomic::Ordering::Relaxed);
+        let Some(slot) = last_non_idle_tick(cpu)
+        else
+        {
+            return;
+        };
+        let last = slot.load(core::sync::atomic::Ordering::Relaxed);
         if now.saturating_sub(last) < WATCHDOG_THRESHOLD_TICKS
         {
             return;
@@ -1056,7 +1071,8 @@ fn watchdog_dump(reason: &str)
         let (cur_is_null, tid, state, ipc, blocked_on, prio, pref, last_tick, mask) = unsafe {
             let s = scheduler_for(cpu);
             let cur = s.current;
-            let lt = last_non_idle_tick(cpu).load(core::sync::atomic::Ordering::Relaxed);
+            let lt = last_non_idle_tick(cpu)
+                .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed));
             if cur.is_null()
             {
                 (
@@ -4368,24 +4384,10 @@ unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 /// Make a not-live thread `Ready` and link it on `target_cpu`'s run queue,
 /// waking that CPU if idle — the cross-CPU wake primitive (IPC, IRQ, timer).
 ///
-/// Acquires the per-TCB `sched_lock` (the authoritative serializer for the
-/// Scheduling field group) FIRST, then classifies `state` under it — the
-/// "enqueue requires not-live" gate that closes the cross-CPU double-link /
-/// double-dispatch class:
-/// - `Running`: the thread is live (mid-park, or a duplicate of a wake it
-///   already consumed). Record `wake_pending` and coalesce — never link a live
-///   thread; its `commit_blocked` sees the flag and refuses to park, delivering
-///   the payload the waker already deposited (see
-///   core/kernel/docs/sched-ipc-redesign.md § 2.1).
-/// - `Ready`: already linked; coalesce (a Ready coalesce is only ever a
-///   same-event duplicate, so dropping it is lost-wake-safe; do not set
-///   `wake_pending`).
-/// - `Stopped`/`Exited`: a concurrent stop/dealloc won; abort. This arm and
-///   the `Ready` arm clear the park binding (`ipc_state`, `blocked_on_object`)
-///   under `sched_lock`: the binding of a claimed park whose cancel lost the
-///   claim is this wake's to clear.
-/// - `Blocked`/`Created`: not live — make `Ready` and link under the target
-///   run-queue lock (`sched_lock` outer → run-queue lock inner).
+/// Acquires the per-TCB `sched_lock` first and classifies `state` under it, as
+/// specified in core/kernel/docs/scheduling-internals.md § Wake Protocol
+/// Invariants (producer side), which also orders the `wake_in_flight` clear
+/// against the `sched_lock` release on each arm.
 ///
 /// `target_cpu` is a placement hint (from `select_target_cpu`); exclusivity is
 /// decided by `state` under `sched_lock`, not by the CPU choice. Priority is
@@ -4393,12 +4395,7 @@ unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 /// its priority write, so the link serialises against a concurrent priority change.
 ///
 /// Every exit path clears `wake_in_flight` so a waiting `dealloc_object(Thread)`
-/// can proceed. On every arm but `Exited` the clear precedes the `sched_lock`
-/// release: once the lock drops, the thread can park again and a later claim
-/// re-pin it, which a delayed clear would erase, and the TCB cannot be freed
-/// before an `Exited` commit takes the lock. On the `Exited` arm the clear
-/// follows the release and is the waker's last touch of the TCB: the pin alone
-/// holds `retype_free` there, and an `Exited` thread is never claimed again.
+/// can proceed.
 ///
 /// # Safety
 /// - `tcb` must be a valid [`ThreadControlBlock`] pointer

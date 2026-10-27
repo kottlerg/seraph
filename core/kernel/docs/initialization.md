@@ -248,12 +248,13 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    - User data segment (DPL 3)
    - User code segment (64-bit, DPL 3)
    - TSS descriptor (per CPU)
-   - BSP TSS: RSP0 = the current kernel stack pointer; IST1 = double-fault stack,
-     IST2 = NMI stack (carved from BSS BSP_IST_STACKS)
+   - BSP TSS: RSP0 = the current kernel stack pointer; IST1 = double-fault and
+     machine-check stack, IST2 = NMI stack (carved from BSS BSP_IST_STACKS)
    Each AP installs its own GDT/TSS from the Phase 4 per-AP storage when it starts in
    Phase 8.
 4. Construct and install the IDT:
-   - Exception handlers for vectors 0–31 (double fault on IST1, NMI on IST2)
+   - Exception handlers for vectors 0–31 (double fault and machine check on IST1, NMI on
+     IST2)
    - APIC timer vector (32) and spurious vector (255)
    - TLB-shootdown (250) and wakeup (251) IPI vectors
    - Device IRQ vectors 33–55 (I/O APIC GSIs 0–22)

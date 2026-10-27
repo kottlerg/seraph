@@ -309,8 +309,11 @@ unsafe fn commit_stopped(
 /// thread's blocked syscall returns `Interrupted` and a fault-blocked thread
 /// is killed (see `core/kernel/docs/syscalls.md` § `SYS_THREAD_STOP`), unless
 /// a genuine waker, the sleep timer, or the target's own full-list withdrawal
-/// (a timed wait or sleep that found the sleep list full) claimed it first. A
-/// thread may stop itself (arg0 refers to the calling thread).
+/// (a timed wait or sleep that found the sleep list full) claimed it first.
+/// This does not hold when the target waits on an endpoint, notification,
+/// event queue, or wait set whose last capability is deleted concurrently
+/// (same section, #443). A thread may stop itself (arg0 refers to the calling
+/// thread).
 ///
 /// Returns 0 on success.
 ///

@@ -17,7 +17,7 @@
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, event_post,
     event_queue_create, event_recv, notification_send, notification_wait,
-    notification_wait_timeout, thread_exit, thread_sleep, wait_set_add, wait_set_create,
+    notification_wait_timeout, thread_exit, wait_set_add, wait_set_create,
     wait_set_remove, wait_set_wait,
 };
 use syscall_abi::SyscallError;
@@ -30,23 +30,30 @@ const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 // Child stack for the blocking_wait test.
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
-// Child stacks for occupied_wait_refused's parked waiter (0) and refused
-// waiter (1). The test deletes both children on every path, so a failed run
-// leaves no thread on either stack.
+// Child stacks for occupied_wait_refused's two waiters. The test deletes both
+// children on every path, so a failed run leaves no thread on either stack.
 static mut OCCUPIED_STACKS: [ChildStack; 2] = [ChildStack::ZERO; 2];
 
-/// `occupied_wait_refused`'s `done` bits: the parked waiter is about to park,
-/// and its wait's verdict; the refused waiter's verdict.
-const BIT_READY: u64 = 1 << 0;
+/// `occupied_wait_refused`'s `done` bits for waiter 0; waiter 1 reports the
+/// same verdicts shifted by [`WAITER_SHIFT`]. Each waiter waits once on the
+/// set and reports one verdict: refused with `InvalidState`, returned with the
+/// member's badge, or returned otherwise.
+const BIT_REFUSED: u64 = 1 << 0;
 const BIT_OK: u64 = 1 << 1;
 const BIT_BAD: u64 = 1 << 2;
-const BIT_REFUSED: u64 = 1 << 3;
-const BIT_NOT_REFUSED: u64 = 1 << 4;
+const WAITER_SHIFT: u32 = 3;
 const OCCUPIED_BADGE: u64 = 9;
-/// Settle after READY so the parked waiter provably parks, and after the
-/// refusal so a wake it caused is seen; bound on each report.
+/// After the refusal, how long to look for a wake it wrongly caused. A wrong
+/// wake arriving later is missed (the check fails closed: never a false FAIL).
 const SETTLE_SLEEP_MS: u64 = 20;
+/// Bound on each report.
 const REPORT_MS: u64 = 1000;
+
+/// Waiter `k`'s verdict bits.
+const fn waiter_bits(k: u32, bits: u64) -> u64
+{
+    bits << (k * WAITER_SHIFT)
+}
 
 // ── wait_set_add (notification, immediate wake) ────────────────────────────────────
 
@@ -169,13 +176,13 @@ struct Occupied
     ws: Option<u32>,
     sig: Option<u32>,
     done: Option<u32>,
-    parked: Option<crate::spawn::SpawnedChild>,
-    refused: Option<crate::spawn::SpawnedChild>,
+    waiters: [Option<crate::spawn::SpawnedChild>; 2],
 }
 
-/// While a child waits on a wait set, a second child's `wait_set_wait`
-/// returns `InvalidState` at once and the first child's wait is unaffected:
-/// it does not return, and a member fire still reaches it.
+/// Of two children waiting on one wait set, whichever enters second is refused
+/// with `InvalidState` at once, and the other's wait is unaffected: it does not
+/// return, and a member fire still reaches it. The refusal itself shows the
+/// other child is parked, so the test does not depend on which runs first.
 pub fn occupied_wait_refused(ctx: &TestContext) -> TestResult
 {
     let mut o = Occupied::default();
@@ -183,7 +190,7 @@ pub fn occupied_wait_refused(ctx: &TestContext) -> TestResult
     // Deleting a thread tears the child down wherever it is, so the stacks
     // are free even when the test failed with a child still parked.
     let mut ok = true;
-    for child in [o.parked, o.refused].iter().flatten()
+    for child in o.waiters.iter().flatten()
     {
         ok &= cap_delete(child.th).is_ok();
         ok &= cap_delete(child.cs).is_ok();
@@ -203,8 +210,8 @@ pub fn occupied_wait_refused(ctx: &TestContext) -> TestResult
     }
 }
 
-/// Create the set, its member, and `done`; park the first child on the set;
-/// have the second child's wait refused; then release the first child.
+/// Create the set, its member, and `done`; start both waiters; wait for one
+/// refusal; then fire the member and require the other waiter's badge.
 fn occupied_run(ctx: &TestContext, o: &mut Occupied) -> TestResult
 {
     let ws = *o.ws.insert(
@@ -220,32 +227,34 @@ fn occupied_run(ctx: &TestContext, o: &mut Occupied) -> TestResult
     );
     wait_set_add(ws, sig, OCCUPIED_BADGE).map_err(|_| "wait_set_add for occupied failed")?;
 
-    let parked = o
-        .parked
-        .insert(crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child for occupied failed")?);
-    start_occupied_child(parked, 0, occupied_waiter_entry, ws, done)?;
-    let mut acc = collect(done, 0, BIT_READY)?;
-    thread_sleep(SETTLE_SLEEP_MS).map_err(|_| "settle sleep for occupied failed")?;
-
-    let refused = o
-        .refused
-        .insert(crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child for occupied failed")?);
-    start_occupied_child(refused, 1, refused_waiter_entry, ws, done)?;
-    acc = collect(done, acc, BIT_REFUSED | BIT_NOT_REFUSED)?;
-    if acc & BIT_NOT_REFUSED != 0
+    let entries: [fn(u64) -> !; 2] = [occupied_waiter_0, occupied_waiter_1];
+    for (k, entry) in entries.into_iter().enumerate()
     {
-        return Err("a second wait_set_wait on an occupied set was not refused with InvalidState");
+        let spawned =
+            crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child for occupied failed")?;
+        let child = o.waiters[k].insert(spawned);
+        start_occupied_child(child, k, entry, ws, done)?;
     }
+
+    let refused_any = waiter_bits(0, BIT_REFUSED) | waiter_bits(1, BIT_REFUSED);
+    let returned_any = waiter_bits(0, BIT_OK | BIT_BAD) | waiter_bits(1, BIT_OK | BIT_BAD);
+    let mut acc = collect(done, 0, refused_any | returned_any)?;
     acc |= notification_wait_timeout(done, SETTLE_SLEEP_MS)
         .map_err(|_| "notification_wait_timeout on done for occupied failed")?;
-    if acc & (BIT_OK | BIT_BAD) != 0
+    if acc & returned_any != 0
     {
-        return Err("the parked wait set waiter returned before any member fired");
+        return Err("a wait set waiter returned before any member fired");
     }
+    let parked: u32 = match acc & refused_any
+    {
+        b if b == waiter_bits(0, BIT_REFUSED) => 1,
+        b if b == waiter_bits(1, BIT_REFUSED) => 0,
+        _ => return Err("both waits on the wait set were refused with InvalidState"),
+    };
 
     notification_send(sig, 0x1).map_err(|_| "notification_send for occupied failed")?;
-    acc = collect(done, acc, BIT_OK | BIT_BAD)?;
-    if acc & BIT_BAD != 0
+    acc = collect(done, acc, returned_any)?;
+    if acc & waiter_bits(parked, BIT_OK) == 0
     {
         return Err("the parked wait set waiter did not receive the member's badge");
     }
@@ -418,41 +427,30 @@ fn sender_entry(sig_slot: u64) -> !
     thread_exit()
 }
 
-/// Raise READY, wait once on the set, and report whether it returned the
-/// member's badge.
+/// Wait once on the occupied set and report waiter `k`'s verdict.
 // cast_possible_truncation: packed fields are 32-bit cap handles.
 #[allow(clippy::cast_possible_truncation)]
-fn occupied_waiter_entry(arg: u64) -> !
+fn occupied_waiter(arg: u64, k: u32) -> !
 {
     let (ws, done) = ((arg & 0xFFFF_FFFF) as u32, (arg >> 32) as u32);
-    notification_send(done, BIT_READY).ok();
-    let bit = if wait_set_wait(ws) == Ok(OCCUPIED_BADGE)
+    let bit = match wait_set_wait(ws)
     {
-        BIT_OK
-    }
-    else
-    {
-        BIT_BAD
+        Err(e) if e == SyscallError::InvalidState as i64 => BIT_REFUSED,
+        Ok(OCCUPIED_BADGE) => BIT_OK,
+        _ => BIT_BAD,
     };
-    notification_send(done, bit).ok();
+    notification_send(done, waiter_bits(k, bit)).ok();
     thread_exit()
 }
 
-/// Wait once on the occupied set and report whether the wait was refused
-/// with `InvalidState`.
-// cast_possible_truncation: packed fields are 32-bit cap handles.
-#[allow(clippy::cast_possible_truncation)]
-fn refused_waiter_entry(arg: u64) -> !
+/// Waiter 0's entry.
+fn occupied_waiter_0(arg: u64) -> !
 {
-    let (ws, done) = ((arg & 0xFFFF_FFFF) as u32, (arg >> 32) as u32);
-    let bit = if wait_set_wait(ws) == Err(SyscallError::InvalidState as i64)
-    {
-        BIT_REFUSED
-    }
-    else
-    {
-        BIT_NOT_REFUSED
-    };
-    notification_send(done, bit).ok();
-    thread_exit()
+    occupied_waiter(arg, 0)
+}
+
+/// Waiter 1's entry.
+fn occupied_waiter_1(arg: u64) -> !
+{
+    occupied_waiter(arg, 1)
 }

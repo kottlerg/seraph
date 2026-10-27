@@ -116,8 +116,9 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 /// 7. Restores registers, disables interrupts, swaps back to the user GS base,
 ///    and executes `sysretq`.
 ///
-/// GS-base must point to a valid `PerCpuData` (installed by `percpu::init_bsp`
-/// in Phase 5) before any user thread executes a SYSCALL.
+/// `IA32_KERNEL_GS_BASE` must hold this CPU's `PerCpuData` pointer while user
+/// code runs: installed in `IA32_GS_BASE` by `percpu::init_bsp` in Phase 5
+/// (`percpu::init_ap` on each AP) and parked by the exit `swapgs`.
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry()

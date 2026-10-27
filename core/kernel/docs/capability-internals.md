@@ -893,9 +893,12 @@ binding outside the process CSpace: the receiving thread's `reply_tcb` field, wh
 points at the caller when a call and a receive rendezvous — in `SYS_IPC_CALL` when the server is
 already waiting, in `SYS_IPC_RECV` when the caller is, or in kernel fault delivery
 (`core/kernel/src/ipc/fault.rs`), which takes the caller role. The kernel clears the binding when
-`SYS_IPC_REPLY` claims it by compare-exchange before waking the caller, at the thread's next
-`SYS_IPC_RECV` that passes its capability check and cap-slot pre-allocation, which releases the
-unreplied caller, or when a stop (`cancel_ipc_block`) or a teardown claims the bound caller (see
+`SYS_IPC_REPLY` claims it before waking the caller (by compare-exchange in `endpoint_reply` on
+delivery, or by `swap(null)` in `fail_reply_and_wake_caller` on its transfer-failure path), at the
+thread's next `SYS_IPC_RECV` that passes its capability check and cap-slot pre-allocation, which
+releases the unreplied caller, when a stop (`cancel_ipc_block`) or a teardown claims the bound
+caller, or when the rendezvous is rolled back because the caller's park commit was refused
+(`rollback_uncommitted_call`) (see
 [ipc-internals.md](ipc-internals.md) § Call Path (Sender), § Receive Path (Server), and § Reply
 Path, and
 [thread-lifecycle-and-sleep.md § BlockedOnReply Edge — Symmetry Rules](thread-lifecycle-and-sleep.md#blockedonreply-edge--symmetry-rules)).

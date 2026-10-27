@@ -1431,7 +1431,7 @@ takes effect immediately:
   latency is one time slice (see
   [scheduler.md](scheduler.md) § Active migration on affinity change).
 - A **Blocked / Stopped / Created** thread observes the new affinity on
-  its next wake.
+  its next enqueue (a wake, or `SYS_THREAD_START` on start or resume).
 
 If `cpu_id` names an offline CPU, the call fails with `InvalidArgument`.
 

@@ -717,7 +717,10 @@ pub fn namespace_lookup_file(root_cap: u32, path: &str) -> crate::io::Result<(u3
 /// `shared/namespace-protocol`. Used by spawners that walk-and-
 /// attenuate a subtree cap before installing it on a child via
 /// `CONFIGURE_NAMESPACE`. Callers wanting the full rights chain pass
-/// `0xFFFF`.
+/// `0xFFFF`. A path with no components (empty or `/`) names the anchor
+/// itself, which no hop narrows: it resolves to a copy of `root_cap` only
+/// when `requested_rights` includes every defined namespace right, and to
+/// `InvalidInput` otherwise.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn namespace_lookup_dir(
     root_cap: u32,

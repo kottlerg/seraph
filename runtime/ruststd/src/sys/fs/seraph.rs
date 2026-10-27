@@ -525,6 +525,15 @@ struct WalkedNode
 /// A path with no components (e.g. `"/"`) denotes the anchor directory
 /// itself: directory walks (`Dir`/`Any`) return an owned derived copy
 /// of `root_cap`; file walks reject it with `InvalidInput`.
+/// Every namespace right `namespace_protocol::rights` defines. A walk that
+/// requests all of them asks for whatever the anchor holds.
+const NS_DEFINED_RIGHTS: u64 = {
+    use namespace_protocol::rights::{
+        ADMIN, EXEC, LOOKUP, MUTATE_DIR, READ, READDIR, STAT, WRITE,
+    };
+    (LOOKUP | READDIR | STAT | READ | WRITE | EXEC | MUTATE_DIR | ADMIN) as u64
+};
+
 fn walk_components(
     root_cap: u32,
     path_str: &str,
@@ -546,15 +555,30 @@ fn walk_components(
         // so the caller's `cap_delete` bookkeeping is uniform with the
         // walked-child case — handing back the borrowed `root_cap`
         // would let a later release delete the anchor cap.
+        //
+        // The copy keeps the anchor's badge, and with it the anchor's
+        // namespace rights, which only the server narrows
+        // (docs/namespace-model.md § Namespace Rights). It is returned
+        // only to a caller that requests every defined right; a narrower
+        // request cannot be honoured without a hop. `cap_derive` takes the
+        // kernel's endpoint rights, not namespace rights.
         return match expect_kind
         {
             ExpectKind::File => Err(io::const_error!(
                 io::ErrorKind::InvalidInput,
                 "seraph fs: path resolves to no components",
             )),
+            ExpectKind::Dir | ExpectKind::Any
+                if requested_rights & NS_DEFINED_RIGHTS != NS_DEFINED_RIGHTS =>
+            {
+                Err(io::const_error!(
+                    io::ErrorKind::InvalidInput,
+                    "seraph fs: the anchor directory cannot be attenuated",
+                ))
+            }
             ExpectKind::Dir | ExpectKind::Any =>
             {
-                let dup = syscall::cap_derive(root_cap, requested_rights)
+                let dup = syscall::cap_derive(root_cap, syscall_abi::RIGHTS_EP_SEND)
                     .map_err(|_| {
                         io::Error::other("seraph fs: cap_derive of anchor dir failed")
                     })?;

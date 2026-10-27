@@ -347,7 +347,8 @@ cells automatically; variants belong to the tiers below.
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
-| Local host runs | developer host, commands below | REQUIRED for PRs touching SMP, per-CPU, IPI, scheduler-wakeup, boot, or memory-init paths | CPU-count and memory variations CI runners cannot reach |
+| Local host runs | developer host, commands below | REQUIRED for PRs touching SMP, per-CPU, IPI, scheduler-wakeup, boot, or memory-init paths, once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
+| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | the boundary CPU counts three times each and the memory variation, whatever the release's PRs touched |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 65-vCPU guest is a ~16× thread oversubscription and a 512-vCPU guest is
@@ -362,19 +363,29 @@ surface.
 # the 600 s budget is for HANG classification):
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64
-cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 3 --timeout 600
-cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 3 --timeout 600
+cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeout 600
+cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 1 --timeout 600
 
 # Boundary CPU counts, x86_64 (~330 s per passing run on a 16-core KVM
 # host — boot is seconds, but the stress tier runs at 16x vCPU
 # oversubscription; the 900 s budget is for HANG classification):
 cargo xtask build
 cargo xtask compose-bundle --harness ktest
-cargo xtask run-parallel --arch x86_64 --cpus 256 --parallel 1 --runs 3 --timeout 900
+cargo xtask run-parallel --arch x86_64 --cpus 256 --parallel 1 --runs 1 --timeout 900
 
 # Memory variation (either arch):
 cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1 --timeout 300
 ```
+
+**Repeat count.** The boundary commands above run once (`--runs 1`). A PR that
+changes code in the scheduling, wake, and cross-CPU signalling mechanisms —
+`core/kernel/src/sched/`, `core/kernel/src/ipc/`, `core/kernel/src/sync.rs`,
+`core/kernel/src/percpu.rs`, `core/kernel/src/syscall/thread.rs`,
+`core/kernel/src/mm/tlb_shootdown.rs`, or the arch interrupt and IPI modules
+(`core/kernel/src/arch/*/interrupts.rs`) — MUST run the riscv64 64- and 65-hart
+and the x86_64 256-vCPU boundaries three times each (`--runs 3`): a race in
+those mechanisms shows as a low-probability failure that one run can miss. The
+memory variation and the narrow boundaries below run once.
 
 PRs touching the surfaces that only matter above 256 CPUs — `core/kernel/src/mm/`,
 x86_64 AP bringup (`core/kernel/src/arch/x86_64/ap_trampoline.rs`,
@@ -409,6 +420,25 @@ mandate above.
 # classification):
 cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800
 ```
+
+**When the runs are owed.** The local host runs are owed once per PR, at any head
+that covers the merge head. A run at head H covers a later head M when the PR's
+own diff on that run's trigger paths is the same at H and at M, Markdown and
+comment lines aside. The PR's own diff at a head is the diff from that head's
+merge base with `master` to the head (`git diff $(git merge-base <head> master)
+<head> -- <paths>`), so it excludes what a merge or rebase from `master` brings
+in. Updating the branch from `master` therefore owes no run: the commits it
+brings in ran their own PRs' host runs, and the release host runs exercise them
+together. A fix round that changes the PR's own code on a trigger path breaks
+the coverage of the runs that path triggers, and those runs are owed again at a
+head after it. The PR body reports each run with the head it ran at.
+
+**Release host runs.** Before each tag (§ Release Production of
+[conventions.md](conventions.md#release-production), step 4), the maintainer runs
+the riscv64 64- and 65-hart and the x86_64 256-vCPU boundaries three times each
+(`--runs 3`) and the memory variation once, on the commit to be tagged. These
+runs give the races a single per-PR run can miss repeated exposure once per
+release. A failure blocks the tag and is filed as an Issue.
 
 **Documentation-only and comment-only changes.** A diff that, Markdown
 aside, alters only comment lines in source files cannot change program

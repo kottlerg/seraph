@@ -740,7 +740,7 @@ pub mod procmgr_process_state
     pub const EXITED: u64 = 3;
 }
 
-pub const SVCMGR_LABELS_VERSION: u32 = 4;
+pub const SVCMGR_LABELS_VERSION: u32 = 5;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -784,8 +784,20 @@ pub mod svcmgr_labels
     /// line in `/config/svcmgr/services/<name>.svc` so attenuation survives a
     /// crash-restart cycle.
     pub const NS_POLICY_SUBTREE: u8 = 2;
-    /// Notification that init handover is complete.
+    /// Notification that init handover is complete. Honoured once, and
+    /// only from a caller whose badge equals [`HANDOVER_AUTHORITY`];
+    /// svcmgr replies [`svcmgr_errors::UNAUTHORIZED`] to any other caller
+    /// and to a repeat.
     pub const HANDOVER_COMPLETE: u64 = 2;
+    /// Badge on the SEND init derives to call [`HANDOVER_COMPLETE`]. svcmgr
+    /// compares the caller's badge to this value for equality rather than
+    /// testing it as a verb bit: no other SEND on svcmgr's endpoint carries
+    /// exactly this value. init's own and the published `svcmgr` SEND are
+    /// unbadged, devmgr's publish SEND carries [`PUBLISH_AUTHORITY`] alone,
+    /// and a per-process `service_registry_cap` badge, random in its high
+    /// bits, keeps its low 32 bits at or above
+    /// [`log_badges::LOG_BADGE_FIRST_CHILD`](crate::log_badges::LOG_BADGE_FIRST_CHILD).
+    pub const HANDOVER_AUTHORITY: u64 = 1u64 << 62;
     /// Publish a named endpoint into the discovery registry.
     ///
     /// Data words: `[name_len, name_words...]`. One cap attached = the
@@ -2155,7 +2167,9 @@ pub mod svcmgr_errors
     /// revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
     /// Caller's badge lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
-    /// `PUBLISH_ENDPOINT` request.
+    /// `PUBLISH_ENDPOINT` request, or is not exactly
+    /// [`svcmgr_labels::HANDOVER_AUTHORITY`] on a `HANDOVER_COMPLETE`, or the
+    /// handover has already run.
     pub const UNAUTHORIZED: u64 = 8;
     /// Client-side: the underlying `ipc_call` returned `Err` (no reply
     /// from svcmgr, transport-level failure). Never emitted by svcmgr

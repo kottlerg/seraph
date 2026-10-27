@@ -57,8 +57,8 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 | `restart` | yes | One of `never`, `on_failure`, `always`. |
 | `critical` | yes | `yes` or `no`. Whether the system is viable without this service once it is permanently down. Orthogonal to `restart`. |
 | `namespace` | yes | One of `none`, `universal`, `subtree:<path>:<rights>`. |
-| `cwd` | no | Path interpreted relative to svcmgr's universal root. Forbidden when `namespace = none`. |
-| `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name; cap[i+1] for a `provides` service, see [`seed`](#seed)). |
+| `cwd` | no | Path interpreted relative to svcmgr's universal root; must lie inside the namespace (see [`cwd`](#cwd)). Forbidden when `namespace = none`. |
+| `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name; cap[i+1] for a `provides` service). At most `MSG_CAP_SLOTS_MAX` (4) names, or 3 for a `provides` service; see [`seed`](#seed). |
 | `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one badged SEND per entry into the discovery registry. See [`provides`](#provides). |
 | `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
 | `priority` | no | Priority level (`1..=30`) the service's initial thread is created at. Unset: procmgr's default (`sched_policy::DEFAULT_SPAWN_PRIORITY`, clamped to the band). See [`priority` / `sched_max`](#priority--sched_max). |
@@ -97,10 +97,10 @@ that message:
 | `on_failure` | Restart only on a fault exit (`exit_reason >= EXIT_FAULT_BASE`). Clean exits are treated as intentional. |
 | `always` | Restart on every exit, clean or faulty. Default for daemons that should never terminate during normal operation. |
 
-Restart attempts are counted per service. After
-`service::MAX_RESTARTS` (currently `1`) consecutive restarts in a
-short window, the service is marked degraded and not restarted
-automatically — see [restart-protocol.md](restart-protocol.md).
+Restarts are counted per service over its lifetime: the count has no
+window and is never reset. Once `service::MAX_RESTARTS` (currently `1`)
+restarts have run, the next death leaves the service degraded and not
+restarted automatically — see [restart-protocol.md](restart-protocol.md).
 
 ## `critical`
 
@@ -151,8 +151,12 @@ namespace = subtree:/data:LOOKUP+READDIR+STAT+READ+WRITE
 When set, svcmgr walks `<cwd>` from its own root with
 `LOOKUP+READDIR+STAT+READ` rights and passes the resulting directory
 cap as the child's `ProcessInfo.current_dir_cap`. The path must
-resolve inside the namespace. With `namespace = none`, `cwd` is a
-parser error.
+resolve inside the namespace. With `namespace = subtree:<path>:...`,
+a `cwd` that is neither `<path>` nor a path below it (compared by
+whole components, so `/data2` is outside `/data`) is a parser error;
+namespace servers reject `.` and `..` components, so an accepted path
+cannot walk back out. With `namespace = none`, `cwd` is a parser
+error.
 
 `std::env::current_dir()` returns `Unsupported` until a path string
 is recorded via `std::env::set_current_dir`; the cap and the
@@ -193,11 +197,10 @@ seed = rootfs.root pwrmgr.shutdown pwrmgr.deny
 ```
 
 becomes `caps = [rootfs_root_send, pwrmgr_shutdown_send,
-pwrmgr_deny_send]` on the child's `bootstrap::request_round`. The
-list is truncated to `MSG_CAP_SLOTS_MAX` (currently 4) entries, or one fewer
-for a `provides` service, whose provider RECV takes cap[0]. A recipe with
-more than 4 seeds is logged; a provider's dropped fourth seed is not
-([#451](https://github.com/kottlerg/seraph/issues/451)).
+pwrmgr_deny_send]` on the child's `bootstrap::request_round`. A
+bootstrap round carries at most `MSG_CAP_SLOTS_MAX` (currently 4) caps, and
+a `provides` service's provider RECV takes cap[0], so a recipe with more
+than 4 seeds, or more than 3 for a `provides` service, is a parser error.
 
 An unresolved name leaves slot `i` as `0`. Consumers that already tolerate `cap == 0 → skip`
 (e.g. svctest's pwrmgr phases, per
@@ -208,22 +211,22 @@ misconfiguration.
 Well-known names are centralised in
 [`ipc::published_names`](../../../shared/ipc/src/lib.rs):
 
-| Name | Publisher (today) | Cap shape |
+| Name | Publisher | Cap shape |
 |---|---|---|
-| `rootfs.root` | init Phase 3 | badged SEND on the root filesystem's namespace endpoint at its root directory (FS-driver-agnostic) |
+| `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on the root filesystem's namespace endpoint at its root directory (FS-driver-agnostic) |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
 | `timed` | svcmgr (`timed.svc` provider) | un-badged SEND on timed's service endpoint (wall-clock) |
-| `svcmgr` | init Phase 3 | un-badged SEND on svcmgr's own service endpoint |
-| `devmgr.registry` | init Phase 3 | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint |
+| `svcmgr` | svcmgr (its own service endpoint) | un-badged SEND on svcmgr's own service endpoint |
+| `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint |
 
 ## `provides`
 
 Declares the registry names a service's own endpoint is published under.
 svcmgr creates a service endpoint, serves its RECV as bootstrap `cap[0]`
 (ahead of the `seed` caps), and publishes one SEND per entry. If the RECV
-derive fails on a restart, svcmgr delivers the seeds shifted down into
-cap[0] ([#451](https://github.com/kottlerg/seraph/issues/451)). Providers
+derive fails, on first launch or on a restart, svcmgr destroys the new
+child instead of shifting the seeds down into cap[0]. Providers
 launch ahead of pure consumers during reconciliation, so a provided name
 is resolvable before any consumer queries it. The endpoint persists across
 restarts (svcmgr holds the source), so a cached client cap survives a

@@ -52,8 +52,9 @@ pub(crate) fn delete_caps(caps: &[u32])
 /// Assemble a child's bootstrap cap set: the provider service-endpoint
 /// RECV (`provided_recv`, cap[0]) ahead of the positional `seeds`, capped
 /// at `MSG_CAP_SLOTS_MAX`. A `provided_recv` of `0` (pure consumer) is
-/// skipped. Overflow seeds beyond the cap are deleted so they don't leak.
-/// Consumes `seeds`.
+/// skipped. The `.svc` parser bounds a recipe's seeds to the slots left
+/// after the RECV, so the cap is a backstop: an overflow seed is logged and
+/// deleted so it does not leak. Consumes `seeds`.
 pub(crate) fn assemble_boot_caps(provided_recv: u32, seeds: Vec<u32>) -> Vec<u32>
 {
     let mut caps: Vec<u32> = Vec::with_capacity(syscall_abi::MSG_CAP_SLOTS_MAX);
@@ -67,9 +68,13 @@ pub(crate) fn assemble_boot_caps(provided_recv: u32, seeds: Vec<u32>) -> Vec<u32
         {
             caps.push(c);
         }
-        else if c != 0
+        else
         {
-            let _ = syscall::cap_delete(c);
+            std::os::seraph::log!("bootstrap round full; dropping seed cap");
+            if c != 0
+            {
+                let _ = syscall::cap_delete(c);
+            }
         }
     }
     caps
@@ -262,8 +267,8 @@ fn assemble_provided_boot_caps(
 ///
 /// Returns `Some(Launched)` on success, with the child running and
 /// its bootstrap round delivered. Returns `None` if any step fails;
-/// in that case the partial child has been destroyed (where possible)
-/// and any resolved seed caps have been released.
+/// in that case the child has been destroyed and any resolved seed caps
+/// have been released.
 ///
 /// Seed caps that fail to resolve are passed through as slot `0`, so
 /// the child's bootstrap decoder sees a zero in that position. This
@@ -360,9 +365,15 @@ pub fn launch(
     if bootstrap_result.is_err()
     {
         std::os::seraph::log!("launch {}: bootstrap serve failed", def.name);
-        // Process is already started; can't unspawn. The child will
-        // observe an empty bootstrap and degrade per its own logic.
+        // The started child is blocked in its bootstrap request; destroy it
+        // rather than leave it waiting on a round that will not come.
         delete_caps(&boot_caps);
+        if provided_endpoint != 0
+        {
+            let _ = syscall::cap_delete(provided_endpoint);
+        }
+        destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
+        return None;
     }
 
     // Publish the provided name now that the endpoint exists, so consumers
@@ -379,7 +390,8 @@ pub fn launch(
 /// Resolve each `seed = ...` name to a derived `RIGHTS_EP_SEND` cap on
 /// the published endpoint. Unresolved names become `0` in their slot
 /// so positional ordering is preserved. Truncated to
-/// `MSG_CAP_SLOTS_MAX` (the bootstrap round's cap limit).
+/// `MSG_CAP_SLOTS_MAX` (the bootstrap round's cap limit), a backstop
+/// behind the `.svc` parser's seed bound.
 ///
 /// Shared by the launch path and the restart path (which passes the
 /// service's stored [`crate::service::RestartRecipe`] seeds), so a

@@ -86,13 +86,16 @@ pub struct StartupBlobs<'a>
 }
 
 /// Walk svcmgr's root for `path`, then call procmgr `CREATE_FROM_FILE`.
-/// Returns the freshly created (suspended) process, or `None` (logged) when
-/// the walk or the create fails, or when `blobs` would not fit the
-/// `CREATE_FROM_FILE` message (`MSG_DATA_WORDS_MAX` words) — the `.svc`
-/// parser already rejects such a recipe, so this is a backstop that keeps an
-/// oversize blob from reaching the message builder's bound assertion. Caller
-/// is responsible for `CONFIGURE_NAMESPACE`, bootstrap delivery, and
-/// `START_PROCESS`.
+/// Returns the freshly created (suspended) process, or `None` (each arm
+/// logged) when `blobs` would not fit the `CREATE_FROM_FILE` message
+/// (`MSG_DATA_WORDS_MAX` words), the bootstrap-badge mint fails, svcmgr has
+/// no root cap, the walk fails, or the create call fails in transport, in
+/// procmgr, or with a reply short of its two caps. The size check is a
+/// backstop: the `.svc` parser already rejects such a recipe, and the check
+/// keeps an oversize blob from reaching the message builder's bound
+/// assertion. Every `None` arm releases the file and badged-creator caps it
+/// still holds. Caller is responsible for `CONFIGURE_NAMESPACE`, bootstrap
+/// delivery, and `START_PROCESS`.
 ///
 /// `path` is interpreted relative to svcmgr's own `root_dir_cap`
 /// (universal), so callers pass paths exactly
@@ -136,7 +139,12 @@ pub fn walk_and_create_from_file(
         return None;
     }
 
-    let (child_badge, badged_creator) = mint_child_creator(bootstrap_ep)?;
+    let Some((child_badge, badged_creator)) = mint_child_creator(bootstrap_ep)
+    else
+    {
+        std::os::seraph::log!("create: bootstrap badge mint failed");
+        return None;
+    };
 
     let root_cap = std::os::seraph::root_dir_cap();
     if root_cap == 0
@@ -180,17 +188,33 @@ pub fn walk_and_create_from_file(
     }
     let create_msg = builder.cap(file_cap).cap(badged_creator).build();
 
+    // A failed call may leave `file_cap` and `badged_creator` in svcmgr's
+    // CSpace: a transport error, or a post-block refusal that delivers the
+    // request with zero caps and draws an error reply. Deleting a slot the
+    // kernel already transferred is a generation-checked no-op.
     // SAFETY: `ipc_buf` is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) }.ok()?;
+    let reply = match unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) }
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            std::os::seraph::log!("create: CREATE_FROM_FILE ipc failed (err={e})");
+            delete_caps(&[file_cap, badged_creator]);
+            return None;
+        }
+    };
     if reply.label != 0
     {
         std::os::seraph::log!("create: CREATE_FROM_FILE returned {:#x}", reply.label);
+        delete_caps(&[file_cap, badged_creator]);
+        delete_caps(reply.caps());
         return None;
     }
     let reply_caps = reply.caps();
     if reply_caps.len() < 2
     {
         std::os::seraph::log!("create: reply missing caps");
+        delete_caps(reply_caps);
         return None;
     }
     Some(CreatedProcess {
@@ -347,8 +371,10 @@ fn should_restart(svc: &ServiceEntry, exit_reason: u64) -> bool
     true
 }
 
-/// Create a new process via procmgr, serve bootstrap (log endpoint), start it,
-/// and rebind death notification. Returns `true` on success.
+/// Release the dead instance, create a new process via procmgr, start it,
+/// serve its bootstrap round, and rebind death notification. Returns `true`
+/// on success; on a failure after the create the new child is destroyed and
+/// `svc.process_handle` is zeroed.
 fn restart_process(
     svc: &mut ServiceEntry,
     ctx: &RestartCtx,
@@ -374,6 +400,13 @@ fn restart_process(
         let _ = syscall::cap_delete(svc.process_handle);
         svc.process_handle = 0;
     }
+    // Release svcmgr's reference to the dead instance's exited thread; for
+    // an init-spawned first instance it is svcmgr's only handle on it.
+    if svc.thread_cap != 0
+    {
+        let _ = syscall::cap_delete(svc.thread_cap);
+        svc.thread_cap = 0;
+    }
 
     let Some((process_handle, new_thread_cap, child_badge)) = create_process(svc, recipe, ctx)
     else
@@ -389,81 +422,12 @@ fn restart_process(
         return false;
     }
 
-    // Assemble the restart bootstrap cap set. The log-sink service (real-logd)
-    // gets a freshly-minted round from the reserved log-sink sources, with no
-    // `HANDOVER_PULL` SEND — init-logd is long gone by any restart, so the
-    // restarted logd skips the history pull and takes over the log endpoint
-    // directly. Senders are unaffected: their SENDs target the endpoint
-    // object, and svcmgr's reserved source kept it alive across the crash.
-    //
-    // Otherwise: a recipe declaring `seed = ...` re-resolves those seeds from
-    // the registry by name, in declaration order — byte-for-byte the
-    // positional set first launch delivered. The fallback to stored bundle
-    // caps is empty in practice (recipe-launched services carry seeds and no
-    // bundle; the init-endowed substrate carries only a thread cap). A
-    // `provides` service's own service-endpoint RECV leads as cap[0]; the
-    // endpoint persists on the entry, so a fresh RECV reattaches the restarted
-    // instance to the same object consumers already hold a SEND on.
-    let boot_caps: Vec<u32> = if matches!(recipe, Some(r) if r.log_sink)
-    {
-        mint_logd_boot_caps(ctx, LaunchKind::Restart)
-    }
+    let Some(boot_caps) = restart_boot_caps(svc, ctx, recipe, registry)
     else
     {
-        let restart_caps: Vec<u32> = match recipe
-        {
-            Some(r) if !r.seed.is_empty() => resolve_seeds(&r.seed, svc.name_str(), registry),
-            _ =>
-            {
-                let mut caps: Vec<u32> = Vec::new();
-                for i in 0..(svc.bundle_count as usize)
-                {
-                    if caps.len() >= syscall_abi::MSG_CAP_SLOTS_MAX
-                    {
-                        break;
-                    }
-                    let entry = &svc.bundle[i];
-                    if entry.cap == 0
-                    {
-                        continue;
-                    }
-                    let Ok(c) = syscall::cap_derive(entry.cap, syscall::RIGHTS_EP_SEND)
-                    else
-                    {
-                        std::os::seraph::log!("cannot derive bundle cap for restart");
-                        for &derived in &caps
-                        {
-                            if derived != 0
-                            {
-                                let _ = syscall::cap_delete(derived);
-                            }
-                        }
-                        let _ = syscall::cap_delete(new_thread_cap);
-                        return false;
-                    };
-                    caps.push(c);
-                }
-                caps
-            }
-        };
-
-        let provided_recv = if svc.provided_endpoint != 0
-        {
-            if let Ok(recv) = syscall::cap_derive(svc.provided_endpoint, syscall::RIGHTS_EP_RECEIVE)
-            {
-                recv
-            }
-            else
-            {
-                std::os::seraph::log!("restart: provider RECV derive failed");
-                0
-            }
-        }
-        else
-        {
-            0
-        };
-        assemble_boot_caps(provided_recv, restart_caps)
+        destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
+        svc.process_handle = 0;
+        return false;
     };
 
     // SAFETY: ctx.ipc_buf is the registered IPC buffer.
@@ -482,17 +446,104 @@ fn restart_process(
         std::os::seraph::log!("bootstrap serve failed");
         // serve_round MOVES caps on success; on failure they may or
         // may not have been consumed. Best-effort delete is safe
-        // (delete of an already-transferred slot is a no-op). Child
-        // is started; cannot destroy from here — it will exit on the
-        // receive-side failure and procmgr will reap.
+        // (delete of an already-transferred slot is a no-op). The
+        // started child is blocked in its bootstrap request, so it is
+        // destroyed rather than left waiting.
         delete_caps(&boot_caps);
-        let _ = syscall::cap_delete(new_thread_cap);
+        destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
+        svc.process_handle = 0;
         return false;
     }
 
     svc.bootstrap_badge = child_badge;
 
-    rebind_death_notification(svc, ctx.deaths_eq, new_thread_cap, correlator)
+    if !rebind_death_notification(svc, ctx.deaths_eq, new_thread_cap, correlator)
+    {
+        destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
+        svc.process_handle = 0;
+        return false;
+    }
+    true
+}
+
+/// Assemble the restart bootstrap cap set for `svc`. Returns `None`, with
+/// every cap it derived released, when a bundle-cap or provider-RECV derive
+/// fails; the caller then destroys the new child.
+///
+/// The log-sink service (real-logd) gets a freshly-minted round from the
+/// reserved log-sink sources, with no `HANDOVER_PULL` SEND — init-logd is long
+/// gone by any restart, so the restarted logd skips the history pull and takes
+/// over the log endpoint directly. Senders are unaffected: their SENDs target
+/// the endpoint object, and svcmgr's reserved source kept it alive across the
+/// crash.
+///
+/// Otherwise: a recipe declaring `seed = ...` re-resolves those seeds from the
+/// registry by name, in declaration order — byte-for-byte the positional set
+/// first launch delivered. The fallback to stored bundle caps is empty in
+/// practice (recipe-launched services carry seeds and no bundle; the
+/// init-endowed substrate carries only a thread cap). A `provides` service's
+/// own service-endpoint RECV leads as cap[0]; the endpoint persists on the
+/// entry, so a fresh RECV reattaches the restarted instance to the same object
+/// consumers already hold a SEND on. A missing RECV would shift the seeds down
+/// into cap[0], where the child expects its service RECV, so it fails the
+/// restart instead, as it fails first launch.
+fn restart_boot_caps(
+    svc: &ServiceEntry,
+    ctx: &RestartCtx,
+    recipe: Option<&RestartRecipe>,
+    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+) -> Option<Vec<u32>>
+{
+    if matches!(recipe, Some(r) if r.log_sink)
+    {
+        return Some(mint_logd_boot_caps(ctx, LaunchKind::Restart));
+    }
+
+    let restart_caps: Vec<u32> = match recipe
+    {
+        Some(r) if !r.seed.is_empty() => resolve_seeds(&r.seed, svc.name_str(), registry),
+        _ =>
+        {
+            let mut caps: Vec<u32> = Vec::new();
+            for entry in &svc.bundle[..svc.bundle_count as usize]
+            {
+                if caps.len() >= syscall_abi::MSG_CAP_SLOTS_MAX
+                {
+                    break;
+                }
+                if entry.cap == 0
+                {
+                    continue;
+                }
+                let Ok(c) = syscall::cap_derive(entry.cap, syscall::RIGHTS_EP_SEND)
+                else
+                {
+                    std::os::seraph::log!("cannot derive bundle cap for restart");
+                    delete_caps(&caps);
+                    return None;
+                };
+                caps.push(c);
+            }
+            caps
+        }
+    };
+
+    let provided_recv = if svc.provided_endpoint != 0
+    {
+        let Ok(recv) = syscall::cap_derive(svc.provided_endpoint, syscall::RIGHTS_EP_RECEIVE)
+        else
+        {
+            std::os::seraph::log!("restart: provider RECV derive failed");
+            delete_caps(&restart_caps);
+            return None;
+        };
+        recv
+    }
+    else
+    {
+        0
+    };
+    Some(assemble_boot_caps(provided_recv, restart_caps))
 }
 
 /// Spawn a fresh instance of `svc` via procmgr from its recorded

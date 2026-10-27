@@ -42,6 +42,7 @@ services/svctest/
         ├── fs_ipc.rs          # Raw `FS_*` IPC against vfsd and fatfs
         ├── fs_std.rs          # `std::fs` over the FS IPC contract
         ├── pwrmgr.rs          # Shutdown cap-deny check and terminal shutdown
+        ├── svcmgr.rs          # `HANDOVER_COMPLETE` refused from a non-init caller
         └── timed.rs           # `SystemTime::now()` through svcmgr and timed
 ```
 

@@ -205,7 +205,11 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   init's CSpace while the objects keep backing init's running threads.
   This round runs before `HANDOVER_COMPLETE` so procmgr's death
   observers are bound before real-logd can release init-logd.
-- Notification `HANDOVER_COMPLETE`. svcmgr scans `/config/svcmgr/services/`,
+- Notification `HANDOVER_COMPLETE`, called through a SEND badged
+  `svcmgr_labels::HANDOVER_AUTHORITY` that init derives for the call and
+  deletes after; svcmgr honours the label once, from that badge only (see
+  [Label 2](../../svcmgr/docs/ipc-interface.md#label-2-handover_complete)).
+  svcmgr scans `/config/svcmgr/services/`,
   reconciles the parked substrate against the recipes, and launches the
   defined-but-unparked services (`logd`, `timed`, `pwrmgr`, `terminal`,
   staged harnesses) from disk (see

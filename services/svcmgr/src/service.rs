@@ -25,13 +25,14 @@ pub const MAX_SERVICES: usize = 16;
 /// appears.
 pub const MAX_BUNDLE_CAPS: usize = 1;
 
-/// Maximum restart attempts before marking degraded.
+/// Maximum restarts over a service's lifetime before it is marked
+/// degraded. `restart_count` is never reset, so the budget has no window.
 pub const MAX_RESTARTS: u32 = 1;
 
 /// Restart policy: restart unconditionally on any exit.
 pub const POLICY_ALWAYS: u8 = 0;
 
-/// Restart policy: restart only on fault (nonzero exit reason).
+/// Restart policy: restart only on a fault exit (`exit_reason >= EXIT_FAULT_BASE`).
 pub const POLICY_ON_FAILURE: u8 = 1;
 
 /// Restart policy: never restart, even on fault. Used for one-shot

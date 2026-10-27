@@ -108,10 +108,11 @@ pub struct Definition
     /// alone decides whether/when to respawn.
     pub system_critical: bool,
     pub namespace: NamespaceShape,
-    /// Optional cwd path. Interpreted relative to the namespace root
-    /// installed via [`NamespaceShape`], or absolute against svcmgr's
-    /// universal root when `namespace = universal`. Forbidden when
-    /// `namespace = none` (parser rejects).
+    /// Optional cwd path, walked from svcmgr's universal root on launch and
+    /// restart. It must lie inside the namespace: under `namespace =
+    /// subtree:` the parser rejects a path outside the subtree, and under
+    /// `namespace = none` it rejects any `cwd`. See
+    /// `services/svcmgr/docs/service-definitions.md` § cwd.
     pub cwd: Option<String>,
     /// Published-registry names svcmgr resolves at launch time and
     /// injects positionally into the child's bootstrap round.

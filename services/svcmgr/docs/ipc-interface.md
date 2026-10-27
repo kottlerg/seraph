@@ -39,7 +39,7 @@ kind in `data[0]`:
 | caps[2] | SEND on the root filesystem's namespace endpoint (published as `rootfs.root`; `0` if init could not derive it) |
 | caps[3] | `SEND\|GRANT`, badge-0 source on devmgr's registry endpoint (`0` if absent) |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `4`) handshake |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `5`) handshake |
 
 svcmgr mints the `devmgr.registry` publish cap
 (`REGISTRY_QUERY_AUTHORITY`) and the `SET_DRIVERS_DIR` cap
@@ -93,8 +93,17 @@ label field identifies the operation.
 
 ### Label 2: `HANDOVER_COMPLETE`
 
-Notifications that init has finished serving the handover endowment. svcmgr
-replies `SUCCESS` immediately (so init can proceed to teardown), then runs
+Notifications that init has finished serving the handover endowment.
+svcmgr honours it once, and only from a caller whose badge equals
+`svcmgr_labels::HANDOVER_AUTHORITY` exactly: init derives a SEND with
+that badge for the call and deletes it after. Equality, not a verb-bit
+test, because the per-process SEND's badge is random in its high bits;
+no other SEND on the endpoint carries the value (see the constant's
+rustdoc in [`shared/ipc`](../../../shared/ipc/src/lib.rs)). Any other
+caller, and any repeat, gets `UNAUTHORIZED` and triggers nothing, so the
+per-process SEND stays usable for `QUERY_ENDPOINT` only. On the honoured
+call svcmgr replies `SUCCESS` immediately (so init can proceed to
+teardown), then runs
 [`definitions::reconcile::reconcile_and_launch`](../src/definitions/reconcile.rs):
 
 1. Scan `/config/svcmgr/services/`, parse each `.svc` into a
@@ -116,12 +125,14 @@ authoritative reconciliation table.
 | Field | Value |
 |---|---|
 | label | `2` |
+| badge | MUST equal `HANDOVER_AUTHORITY`; rejected with `UNAUTHORIZED` otherwise. |
 
 **Reply:**
 
 | label value | Meaning |
 |---|---|
-| `0` (`SUCCESS`) | Always returned — reconciliation runs after the reply. |
+| `0` (`SUCCESS`) | Handover accepted; reconciliation runs after the reply. |
+| `UNAUTHORIZED` | Caller's badge is not `HANDOVER_AUTHORITY`, or the handover already ran. |
 
 ### Label 3: `PUBLISH_ENDPOINT`
 
@@ -233,9 +244,9 @@ See [service-definitions.md](service-definitions.md#restart) for the
 | `POLICY_ON_FAILURE` | Restart only when `exit_reason >= EXIT_FAULT_BASE` |
 | `POLICY_ALWAYS` | Restart on every exit |
 
-Restart attempts are counted per service. After `MAX_RESTARTS`
-consecutive restarts the service is marked degraded and not
-restarted automatically — see
+Restarts are counted per service over its lifetime (no window, no
+reset). Once `MAX_RESTARTS` restarts have run, the service is marked
+degraded on its next death and not restarted automatically — see
 [restart-protocol.md](restart-protocol.md).
 
 ---

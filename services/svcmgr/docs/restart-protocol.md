@@ -67,6 +67,8 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
      instance's kernel objects. Init-spawned services start with
      `process_handle == 0`, so the first death cannot destroy;
      subsequent deaths can.
+   * Delete the dead instance's `thread_cap`, svcmgr's reference to the
+     exited thread.
    * Spawn a fresh instance via the shared primitive
      [`walk_and_create_from_file`](#shared-spawn-primitives) (VFS
      path), replaying the recipe's `argv` / `env` from the stored
@@ -80,7 +82,10 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
    * Rebind death-notification on the new thread cap using the same
      correlator so subsequent crashes route back to the same entry.
    * On success: increment `restart_count`, return `Restarted`.
-   * On failure: route through `permanent_death_outcome`.
+   * On failure: a child already created (failed bundle-cap or provider
+     RECV derive, `START_PROCESS`, bootstrap serve, or death rebind) is
+     destroyed via `DESTROY_PROCESS`, as first launch does; then route
+     through `permanent_death_outcome`.
 
 `dispatch_deaths` reacts to `Unrecoverable` by calling
 `initiate_graceful_shutdown`, which resolves

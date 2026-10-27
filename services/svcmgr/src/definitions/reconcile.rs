@@ -10,8 +10,9 @@
 //! Three outcomes per `.svc` file:
 //!
 //! 1. **Defined AND registered** — bind death-notification on the
-//!    registered thread cap and persist the parsed `Definition` on
-//!    the matching `ServiceEntry`.
+//!    registered thread cap, record the recipe's fixed fields on the
+//!    matching `ServiceEntry` and its argv/env/cwd/seed, log-sink flag,
+//!    and scheduling fields in the parallel `RestartRecipe` table.
 //! 2. **Defined only** — call [`super::launch::launch`] to spawn the
 //!    service, then (if `restart != never`) bind death-notification
 //!    and persist a `ServiceEntry`.

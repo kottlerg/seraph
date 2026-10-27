@@ -207,10 +207,10 @@ tree.
 
 ## Restart policy
 
-Each `.svc` carries `restart = never | on_failure | always`. Restart
-attempts are counted per service. After a configurable maximum
-(`MAX_RESTARTS`, currently `1`) in a short window, the service is
-marked degraded and not restarted automatically. See
+Each `.svc` carries `restart = never | on_failure | always`. Restarts
+are counted per service over its lifetime (no window, no reset). Once
+`MAX_RESTARTS` (currently `1`) restarts have run, the service is marked
+degraded on its next death and not restarted automatically. See
 [docs/restart-protocol.md](docs/restart-protocol.md).
 
 ---

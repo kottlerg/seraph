@@ -13,9 +13,8 @@
 //! caps to inject into its bootstrap round. A `log_sink = yes` recipe
 //! (the master log sink, real-logd) instead takes a svcmgr-minted
 //! bootstrap round from the reserved log-sink sources and declares
-//! neither `seed` nor `provides`. The same definition drives both
-//! first-launch (when init didn't bootstrap the service) and restart
-//! (when init did).
+//! neither `seed` nor `provides`. The same definition drives both first
+//! launch (for services init did not bootstrap) and every restart.
 //!
 //! The plain-data recipe types, the `.svc` parser, and the argv/env
 //! wire-blob encoder `build_blob` live in the host-tested `svcmgr-defs`
@@ -29,8 +28,10 @@
 //!    [`crate::service::bootstrap_caps`] populated from init's handover
 //!    endowment (one substrate `(name, thread_cap)` round each):
 //!    - **Defined AND parked**: bind death-notification on the endowed
-//!      thread cap and store the parsed `Definition` on the
-//!      `ServiceEntry` for restart use.
+//!      thread cap, record the recipe's fixed fields on the
+//!      `ServiceEntry` and its argv/env/cwd/seed, log-sink flag, and
+//!      scheduling fields in the parallel `RestartRecipe` table for
+//!      restart use.
 //!    - **Defined only**: launch the service via [`launch::launch`].
 //!    - **Parked without definition**: log a hard error and refuse to
 //!      bind — svcmgr has no recipe to restart it.

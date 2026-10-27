@@ -49,6 +49,7 @@ pub mod random;
 pub mod recv_guard;
 pub mod shmem;
 pub mod startup;
+pub mod svcmgr;
 pub mod threading;
 pub mod timed;
 
@@ -77,6 +78,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(startup::late());
     out.extend_from_slice(fs_ipc::relative_only());
     out.extend_from_slice(pwrmgr::deny_only());
+    out.extend_from_slice(svcmgr::phases());
     out.extend_from_slice(timed::phases());
     out.extend_from_slice(memmgr::identity());
     out

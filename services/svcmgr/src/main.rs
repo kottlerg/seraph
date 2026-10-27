@@ -8,8 +8,10 @@
 //! their restart policy.
 //!
 //! svcmgr is loaded from the root filesystem by init (via procmgr's
-//! `CREATE_PROCESS_FROM_VFS`). Init registers services via IPC, then sends
-//! `HANDOVER_COMPLETE` and exits. svcmgr runs for the lifetime of the system.
+//! `CREATE_FROM_FILE`). Init serves svcmgr its handover endowment
+//! over bootstrap rounds, then sends `HANDOVER_COMPLETE` through a
+//! `HANDOVER_AUTHORITY`-badged SEND and exits. svcmgr runs for the lifetime
+//! of the system.
 //!
 //! Every supervised service binds death notification onto the same
 //! `deaths_eq` with `correlator = service_index`. The wait set has two
@@ -110,6 +112,7 @@ fn main() -> !
         pending: [const { PendingRegistration::empty() }; MAX_PENDING_REGISTRATIONS],
         pending_count: 0,
         registry: registry::Registry::new(),
+        handover_done: false,
     };
 
     let Some(caps) = bootstrap_caps(info, ipc_buf, &mut state.pending, &mut state.pending_count)
@@ -356,6 +359,10 @@ pub struct SvcmgrState
     pub pending: [PendingRegistration; MAX_PENDING_REGISTRATIONS],
     pub pending_count: usize,
     pub registry: registry::Registry<REGISTRY_CAPACITY>,
+    /// Set by the one `HANDOVER_COMPLETE` svcmgr honours; a repeat is
+    /// rejected so reconciliation cannot launch a second instance of every
+    /// defined service.
+    pub handover_done: bool,
 }
 
 /// Main event loop: dispatches IPC registrations and death notifications.
@@ -449,6 +456,14 @@ fn dispatch_ipc(
     {
         svcmgr_labels::HANDOVER_COMPLETE =>
         {
+            if msg.badge != svcmgr_labels::HANDOVER_AUTHORITY || state.handover_done
+            {
+                let reply = IpcMessage::new(ipc::svcmgr_errors::UNAUTHORIZED);
+                // SAFETY: ipc_buf is the registered IPC buffer.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                return;
+            }
+            state.handover_done = true;
             // Reply BEFORE reconciliation: init's call returns and it
             // proceeds to teardown / thread_exit; svcmgr then runs the
             // (potentially slow) scan + launch path without holding

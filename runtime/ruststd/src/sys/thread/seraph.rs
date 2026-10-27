@@ -885,6 +885,15 @@ extern "C" fn thread_entry(arg: u64) -> ! {
     drop(args);
     rust_start();
 
+    // `guard::enable` is a no-op on this target, so this thread runs its
+    // `thread_local!` destructors and releases its `CURRENT` handle itself,
+    // as hermit's `thread_start` does. Both touch the TLS block, which
+    // `join` frees once the done signal arrives, so they come first.
+    // SAFETY: this is thread exit: the thread's Rust code has returned, so no
+    // reference to its TLS variables is live.
+    unsafe { crate::sys::thread_local::destructors::run() };
+    crate::rt::thread_cleanup();
+
     // `thread_exit` diverges without unwinding, so every local is dropped
     // above; only the plain cap slot crosses into the tail.
     let _ = syscall::notification_send(done_notification, 1);

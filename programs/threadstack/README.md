@@ -40,10 +40,10 @@ specifies, a demand-paged region above an unregistered guard page that `join` fr
 memmgr's
 [`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region).
 
-The worker thread recurses through `recurse`, and each level fills and sums a 4096-byte
-stack buffer, so the stack grows by about one page per level. The recursive call goes
-through a `black_box`'d function pointer so the optimiser cannot fold the recursion into a
-loop.
+In `grow` and `guard`, the worker thread recurses through `recurse`, and each level fills and
+sums a 4096-byte stack buffer, so the stack grows by about one page per level. The recursive
+call goes through a `black_box`'d function pointer so the optimiser cannot fold the recursion
+into a loop. `bigframe` uses one oversized frame instead, as § Modes describes.
 
 ---
 
@@ -56,7 +56,7 @@ equals `bigframe`; otherwise it is `grow`.
 |---|---|---|
 | `grow` | A worker recurses `GROW_DEPTH` (200) levels, inside the default 2 MiB usable stack, and is joined | `grow checksum <n>`, then `PASS`; exits `ExitCode::SUCCESS`. A panicked worker prints `grow worker panicked` and exits with code 3 |
 | `guard` | The main thread prints and flushes `about to overflow`, then a worker recurses without bound into the guard page | No clean exit: the guard fault is terminal and procmgr tears down the whole process. If `join` returns, prints `SURVIVED (BUG)` and exits `ExitCode::SUCCESS` so the tester fails |
-| `bigframe` | The main thread prints and flushes `about to overflow`, spawns a worker that signals it is running and then blocks on a channel, and waits for that signal, so the top of the worker's stack and the page table covering it are mapped. A second worker, whose stack the reservation arena places directly above the first's, calls a function with one frame of 516 pages (the 512-page default usable stack plus 4) and writes only the frame's lowest byte, which lies near the top of the first worker's registered stack, past the guard page. Only the target's stack probes, which touch each page of the frame in turn, reach the guard | No clean exit: the probe faults on the guard page and procmgr tears down the whole process. If `join` returns, prints `SURVIVED (BUG)` and exits `ExitCode::SUCCESS` so the tester fails |
+| `bigframe` | The main thread prints and flushes `about to overflow`, spawns a worker that signals it is running and then blocks on a channel, and waits for that signal, so the top of the worker's stack and the page table covering it are mapped. A second worker, whose stack the reservation arena places directly above the first's, calls a function with one frame of 516 pages (the 512-page default usable stack plus 4) and writes only the frame's lowest byte, which lies near the top of the first worker's registered stack, past the guard page. Only the stack probes that [ruststd § Spawned-thread stacks](../../runtime/ruststd/README.md#spawned-thread-stacks) describes reach the guard | No clean exit: the probe faults on the guard page and procmgr tears down the whole process. If `join` returns, prints `SURVIVED (BUG)` and exits `ExitCode::SUCCESS` so the tester fails |
 
 A terminal fault on a worker thread brings down the whole process because procmgr observes the
 address space's death, as

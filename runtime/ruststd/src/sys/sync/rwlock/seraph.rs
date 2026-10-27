@@ -9,18 +9,18 @@
 //!   * bit 31       — waiters bit (a thread has parked or is about to park on
 //!                    the lazy Notification, or one that did holds the lock).
 //!
-//! Blocking waiters share one Notification cap, whose waiters the kernel
-//! queues in arrival order; each `notification_send` wakes the longest
-//! waiting one, or leaves a pending bit for the next wait when none is
-//! queued. Wakes chain: every unlock that releases the lock with the
-//! waiters bit set does one `notification_send`, and a thread that enters a
-//! contended path acquires the lock with the waiters bit set, so its own
-//! unlock passes the wake on to the next waiter. A contender publishes the
-//! waiters bit with an RMW whose prior state it rechecks before parking, so
-//! an unlock between its failed acquire and the publication is never
-//! missed. The design serialises woken waiters and spends one spare wake
-//! once the queue drains; good enough until contention profiles force a
-//! richer queue.
+//! Blocking waiters share one Notification cap; a `notification_send` wakes
+//! at most one of them, or leaves bits a later wait returns, as
+//! core/kernel/docs/syscalls.md § `SYS_NOTIFICATION_SEND` defines.
+//! Wakes chain: every unlock that releases the lock with the waiters bit
+//! set clears the bit and does one `notification_send`, and a thread that
+//! enters a contended path acquires the lock with the waiters bit set, so
+//! its own unlock passes the wake on to the next waiter. A contender
+//! publishes the waiters bit with an RMW whose prior state it rechecks
+//! before parking, so an unlock between its failed acquire and the
+//! publication is never missed. The design serialises woken waiters and
+//! spends one spare wake once the queue drains; good enough until
+//! contention profiles force a richer queue.
 //!
 //! Readers and writers park on the same Notification, so a wake may pick
 //! either a reader or a writer. A waking reader that acquires a shared
@@ -59,20 +59,22 @@ impl RwLock {
         self.try_read_fast()
     }
 
+    /// Take a read lock unless a writer holds the lock or the reader count
+    /// is full. A failed CAS (another reader moved the count, or a spurious
+    /// failure) retries rather than reporting the lock held.
     #[inline]
     fn try_read_fast(&self) -> bool {
-        let cur = self.state.load(Relaxed);
-        if cur & WRITER_BIT != 0 {
-            return false;
+        let mut cur = self.state.load(Relaxed);
+        loop {
+            if !read_acquirable(cur) {
+                return false;
+            }
+            // Preserve the waiters bit if present; bump the reader count.
+            match self.state.compare_exchange_weak(cur, cur + 1, Acquire, Relaxed) {
+                Ok(_) => return true,
+                Err(now) => cur = now,
+            }
         }
-        let readers = cur & READER_MASK;
-        if readers >= MAX_READERS {
-            return false;
-        }
-        // Preserve the waiters bit if present; bump the reader count.
-        self.state
-            .compare_exchange_weak(cur, cur + 1, Acquire, Relaxed)
-            .is_ok()
     }
 
     #[cold]
@@ -99,14 +101,31 @@ impl RwLock {
 
     #[inline]
     pub fn write(&self) {
-        if self.state.compare_exchange(0, WRITER_BIT, Acquire, Relaxed).is_err() {
+        if !self.try_write() {
             self.write_contended();
         }
     }
 
+    /// Take the write lock unless a writer or reader holds it. The waiters
+    /// bit is preserved, so a lock that is free with the bit set is still
+    /// taken.
     #[inline]
     pub fn try_write(&self) -> bool {
-        self.state.compare_exchange(0, WRITER_BIT, Acquire, Relaxed).is_ok()
+        let mut cur = self.state.load(Relaxed);
+        loop {
+            if !write_acquirable(cur) {
+                return false;
+            }
+            match self.state.compare_exchange(
+                cur,
+                WRITER_BIT | (cur & WAITERS_BIT),
+                Acquire,
+                Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(now) => cur = now,
+            }
+        }
     }
 
     #[cold]
@@ -137,6 +156,10 @@ impl RwLock {
     pub unsafe fn read_unlock(&self) {
         let prev = self.state.fetch_sub(1, AcqRel);
         if (prev & READER_MASK) == 1 && (prev & WAITERS_BIT) != 0 {
+            // The last reader clears the bit as it passes the wake on, as
+            // `write_unlock` does; the woken waiter sets it again when it
+            // acquires. A state that moved meanwhile keeps the bit.
+            let _ = self.state.compare_exchange(WAITERS_BIT, 0, Relaxed, Relaxed);
             self.wake_one();
         }
     }

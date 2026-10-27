@@ -174,7 +174,11 @@ pub fn tls_macro_phase(_: &Caps)
 /// `JoinHandle::thread().unpark()` releases.
 pub fn thread_identity_phase(_: &Caps)
 {
+    // The child parks for at most `BOUND`; the unpark lands at about 50 ms,
+    // so a wake later than `WOKEN_BY` means the unpark was lost and the park
+    // ran out its timeout.
     const BOUND: Duration = Duration::from_secs(5);
+    const WOKEN_BY: Duration = Duration::from_secs(1);
 
     let released = Arc::new(AtomicBool::new(false));
     let child_released = released.clone();
@@ -215,7 +219,7 @@ pub fn thread_identity_phase(_: &Caps)
         "Builder name not visible"
     );
     assert!(
-        parked_for < BOUND,
+        parked_for < WOKEN_BY,
         "unpark through the handle did not wake the child's park"
     );
     std::os::seraph::log!(

@@ -35,16 +35,25 @@ pub struct Args {
 /// Construct an iterator over the argv blob recorded by `_start`. Returns
 /// an empty iterator when startup has not been installed (unreachable
 /// after the runtime init) or when no argv was provided.
+///
+/// The spawner's `args_count` is wire input: the iterator covers the first
+/// `args_count` fields the blob actually holds, so a count above the field
+/// count shrinks to it and a count below it ends the blob after that many
+/// fields, and both ends walk the same entries.
 pub fn args() -> Args {
-    match try_startup_info() {
-        Some(s) => Args {
-            blob: s.args_blob,
-            cursor: 0,
-            end: s.args_blob.len(),
-            remaining: s.args_count,
-        },
-        None => Args { blob: &[], cursor: 0, end: 0, remaining: 0 },
+    let Some(s) = try_startup_info() else {
+        return Args { blob: &[], cursor: 0, end: 0, remaining: 0 };
+    };
+    let mut end = 0;
+    let mut remaining = 0;
+    while remaining < s.args_count {
+        let Some((_, next)) = next_field(s.args_blob, end) else {
+            break;
+        };
+        end = next.min(s.args_blob.len());
+        remaining += 1;
     }
+    Args { blob: s.args_blob, cursor: 0, end, remaining }
 }
 
 /// An argv entry as an `OsString`, byte for byte.
@@ -79,7 +88,10 @@ impl Iterator for Args {
         if self.remaining == 0 {
             return None;
         }
-        let (field, next) = next_field(&self.blob[..self.end], self.cursor)?;
+        let Some((field, next)) = next_field(&self.blob[..self.end], self.cursor) else {
+            self.remaining = 0;
+            return None;
+        };
         self.cursor = next;
         self.remaining -= 1;
         Some(entry(field))
@@ -101,7 +113,10 @@ impl DoubleEndedIterator for Args {
         if self.remaining == 0 {
             return None;
         }
-        let (field, start) = prev_field(self.blob, self.cursor, self.end)?;
+        let Some((field, start)) = prev_field(self.blob, self.cursor, self.end) else {
+            self.remaining = 0;
+            return None;
+        };
         self.end = start;
         self.remaining -= 1;
         Some(entry(field))

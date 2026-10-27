@@ -19,11 +19,14 @@
 //! hold caps to all three objects (the same memory cap and both notifications
 //! are mapped/copied into both processes' CSpaces); read/write logic drives
 //! the appropriate notification direction. EOF/BrokenPipe is notified via
-//! the header's `closed` flag, set on Drop with one final notification kick
-//! so the surviving peer wakes and observes the flag. A reader returns EOF
+//! the header's `closed` flag, set by `Pipe::close` (which `Drop` and
+//! stdio's exit-path `close_all` run) with one final notification kick so
+//! the surviving peer wakes and observes the flag. A reader returns EOF
 //! only after a drain performed AFTER observing `closed` (or the bridge's
 //! `peer_dead`) comes back empty — the flags are Release-stored after the
-//! writer's last ring write, so flag-then-drain ordering cannot lose bytes.
+//! closing thread's last ring write, so flag-then-drain ordering cannot
+//! lose those bytes; bytes another thread writes after a concurrent close
+//! may go unseen.
 //!
 //! `pipe()` itself returns `Unsupported`: the symmetric upstream
 //! constructor doesn't fit our two-process model. `Command::spawn` and
@@ -173,7 +176,8 @@ pub struct PipeCaps {
 /// Read and write operations are non-blocking on partial progress and
 /// block (via `notification_wait`) only when the ring is empty (reader) or
 /// full (writer). EOF / BrokenPipe is observed via the ring header's
-/// `closed` flag, set by the peer's `Drop`, OR via the parent-side
+/// `closed` flag, set by the peer's `Pipe::close` (run by its `Drop` or by
+/// stdio's exit-path `close_all`), OR via the parent-side
 /// `peer_dead` flag set by the spawner's death-bridge thread on every
 /// child death (clean exit or fault). Readers drain the ring once more
 /// after observing either flag before reporting EOF.
@@ -194,7 +198,7 @@ pub struct Pipe {
     /// parent-side ends not yet attached to a spawn (the bridge sets
     /// it after the child is constructed). The bridge flips it on
     /// every child death — clean exit included — covering the case
-    /// where the peer never ran `Pipe::Drop` to mark the ring closed.
+    /// where the peer never ran `Pipe::close` to mark the ring closed.
     /// `read` treats it exactly like `closed`: EOF only once a drain
     /// performed after observing the flag comes back empty. `write`
     /// returns `BrokenPipe` on observing it.

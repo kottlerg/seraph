@@ -89,7 +89,7 @@ relocations that loaders place at a randomized base and whose
 The std-userspace triples (`x86_64-seraph.json`, `riscv64a23-seraph.json`)
 carry the same PIE treatment (plus `tls-model: local-exec`, keeping TLS
 access GOT-free so no non-`RELATIVE` relocations appear), emit inline
-stack probes (`stack-probes: inline`, so a frame larger than one page
+stack probes (`"stack-probes": {"kind": "inline"}`, so a frame larger than one page
 touches each page in turn and faults on a thread stack's guard page
 instead of skipping it), relax the kernel-side soft-float discipline,
 and pin a hard-microarchitecture floor for userspace SIMD / Vector

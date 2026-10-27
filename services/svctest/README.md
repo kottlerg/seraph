@@ -28,7 +28,7 @@ services/svctest/
         ├── mod.rs             # Ordered phase registry; one module per surface under test
         ├── startup.rs         # argv, env, stack envelope, TLS at entry; unset cwd path
         ├── memmgr.rs          # Heap allocator over memmgr; all-RAM-accounted identity
-        ├── threading.rs       # Threads, `thread_local!`, park/unpark, `RwLock`, `Condvar`
+        ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, `RwLock`, `Condvar`
         ├── procmgr.rs         # `std::process::Command` spawn, cwd, and error paths
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`

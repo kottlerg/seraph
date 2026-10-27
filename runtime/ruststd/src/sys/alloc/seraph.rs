@@ -301,15 +301,19 @@ impl Heap {
     /// memmgr's `REQUEST_MEMORY_CAPS` reply may carry up to
     /// `MSG_CAP_SLOTS_MAX = 4` Memory caps in best-effort mode, each
     /// covering one or more contiguous pages (layout checked by
-    /// [`grant_layout`]). We map each returned cap with its declared
-    /// `page_count` in a single `mem_map` call, advancing `start_va` by the
-    /// same number of pages.
+    /// [`ipc::memmgr_grant_layout`]). We map each returned cap with its
+    /// declared `page_count` in a single `mem_map` call, advancing `start_va`
+    /// by the same number of pages.
     ///
     /// On failure, every cap of the failing reply that is not mapped is
-    /// deleted and its run returned to memmgr ([`release_reply_caps`]), and
-    /// the pages mapped before the failure, by this reply or an earlier
-    /// round, are still added to the free list with `mapped_end` advanced
-    /// past them, so a later grow maps above them rather than over them.
+    /// deleted and its run returned to memmgr ([`release_reply_caps`]). A
+    /// cap whose map failed partway (`SYS_MEM_MAP` maps page by page and
+    /// rolls nothing back, core/kernel/docs/syscalls.md § SYS_MEM_MAP) is
+    /// unmapped first, and kept, still accounted to this process, if the
+    /// unmap fails. The pages mapped before the failure, by this reply or an
+    /// earlier round, are still added to the free list with `mapped_end`
+    /// advanced past them, so a later grow maps above them rather than over
+    /// them.
     fn grow_exact(&mut self, pages: u64, start_va: u64) -> bool {
         // Read the calling thread's registered IPC buffer from TLS. The
         // kernel services `ipc_call` by reading the payload from that
@@ -343,7 +347,7 @@ impl Heap {
                 break false;
             };
             let caps = reply.caps();
-            let Some((page_counts, bases)) = grant_layout(&reply) else {
+            let Some((page_counts, bases)) = ipc::memmgr_grant_layout(&reply) else {
                 release_reply_caps(self.memmgr_ep, ipc_buf, caps, &[], |_| false);
                 break false;
             };
@@ -351,19 +355,22 @@ impl Heap {
             // A cap covering more than the request still needs would map
             // past the window the caller sized, so it fails the round too.
             let mut kept = 0;
+            let mut keep_failed = false;
             for (&cap_slot, &pages_in_cap) in caps.iter().zip(page_counts) {
                 if pages_in_cap == 0 || pages_in_cap > pages - mapped {
                     break;
                 }
                 let va = start_va + mapped * PAGE_SIZE;
                 if !self.mem_map_with_augment_retry(cap_slot, va, pages_in_cap) {
+                    keep_failed = syscall::mem_unmap(self.self_aspace, va, pages_in_cap).is_err();
                     break;
                 }
                 mapped += pages_in_cap;
                 kept += 1;
             }
             if kept < caps.len() {
-                release_reply_caps(self.memmgr_ep, ipc_buf, caps, bases, |i| i < kept);
+                let keep = |i| i < kept || (keep_failed && i == kept);
+                release_reply_caps(self.memmgr_ep, ipc_buf, caps, bases, keep);
                 break false;
             }
         };
@@ -632,9 +639,10 @@ fn slab_round_to_class(bytes: u64) -> u64 {
 /// Every caller retypes from or maps exactly one cap, so the request sets
 /// `REQUIRE_CONTIGUOUS`: memmgr replies with one cap covering all `min_pages`
 /// or refuses with `OUT_OF_MEMORY_CONTIGUOUS`. The reply is still treated as
-/// wire input ([`grant_layout`]): the first returned cap whose declared page
-/// count covers `min_pages` is kept, and every other cap the reply carries is
-/// deleted and its run returned to memmgr (see [`release_reply_caps`]).
+/// wire input ([`ipc::memmgr_grant_layout`]): the first returned cap whose
+/// declared page count covers `min_pages` is kept, and every other cap the
+/// reply carries is deleted and its run returned to memmgr (see
+/// [`release_reply_caps`]).
 ///
 /// Returns `Some((slot, pages, phys))` on success. `phys` is the kept cap's
 /// physical base, which memmgr reports at `data[1 + count + i]`; the caller
@@ -645,7 +653,7 @@ fn slab_round_to_class(bytes: u64) -> u64 {
 ///
 /// Returns `None` on IPC failure, a memmgr error label, a `min_pages` that
 /// does not fit the request's 32-bit page-count field, a reply
-/// [`grant_layout`] refuses, or a reply none of whose caps covers
+/// [`ipc::memmgr_grant_layout`] refuses, or a reply none of whose caps covers
 /// `min_pages`. A refused reply's caps are deleted the same way as the
 /// unchosen caps of an accepted one.
 pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u64)> {
@@ -661,7 +669,7 @@ pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) }.ok()?;
     let caps = reply.caps();
-    let layout = grant_layout(&reply);
+    let layout = ipc::memmgr_grant_layout(&reply);
     let keep = layout.and_then(|(page_counts, _)| page_counts.iter().position(|&p| p >= min_pages));
     let bases = layout.map_or(&[][..], |(_, bases)| bases);
     release_reply_caps(memmgr_ep, ipc_buf, caps, bases, |i| keep == Some(i));
@@ -670,37 +678,15 @@ pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u
     Some((caps[i], page_counts[i], bases[i]))
 }
 
-/// Split a `REQUEST_MEMORY_CAPS` success reply into its page counts and phys
-/// bases, one of each per transferred cap: `data[1 + i]` and
-/// `data[1 + count + i]` for `i` below the declared `count` in `data[0]`
-/// (services/memmgr/docs/ipc-interface.md § Label 1).
-///
-/// The reply is wire input, so nothing is indexed until it passes these
-/// checks. Returns `None` for an error label, a reply with no data words, a
-/// declared count of zero or other than the number of caps transferred, or
-/// data words too few to cover the declared count; the phys words of such a
-/// reply sit at an offset its count does not establish, so no base is read.
-fn grant_layout(reply: &ipc::IpcMessage) -> Option<(&[u64], &[u64])> {
-    let words = reply.words();
-    let count = reply.caps().len();
-    let declared = *words.first()?;
-    // `count` is bounded by `MSG_CAP_SLOTS_MAX`, so `1 + 2 * count` cannot
-    // overflow.
-    if reply.label != 0 || count == 0 || declared != count as u64 || words.len() < 1 + 2 * count
-    {
-        return None;
-    }
-    Some((&words[1..=count], &words[1 + count..1 + 2 * count]))
-}
-
 /// Delete every cap a `REQUEST_MEMORY_CAPS` reply transferred except those
 /// `keep` selects by index, and return each deleted cap's run to memmgr's
 /// pool with one `RELEASE_MEMORY_CAPS` naming the phys base `bases` holds at
 /// the same index.
 ///
-/// `bases` is the reply's phys-base words as [`grant_layout`] split them, or
-/// empty for a reply it refused. A deleted cap without a base still has its
-/// slot freed, and its run stays accounted to this process until it dies.
+/// `bases` is the reply's phys-base words as [`ipc::memmgr_grant_layout`]
+/// split them, or empty for a reply it refused. A deleted cap without a base
+/// still has its slot freed, and its run stays accounted to this process
+/// until it dies.
 /// The release is best-effort: memmgr ignores a base that matches no
 /// outstanding grant, and a failed IPC leaves the runs accounted the same way.
 fn release_reply_caps(
@@ -1122,10 +1108,11 @@ unsafe impl GlobalAlloc for System {
             // under the lock are non-allocating (the IPC buffer is the
             // pre-registered page, not heap-backed), so there is no
             // re-entrant allocation here.
+            // A grow that failed partway still adds the pages it mapped to
+            // the free list, so the retry runs whatever `grow` returns.
             let want = layout.size().saturating_add(layout.align());
-            if heap.grow(want) {
-                ptr = heap.alloc(layout);
-            }
+            let _ = heap.grow(want);
+            ptr = heap.alloc(layout);
         }
         HEAP.lock.unlock();
         ptr

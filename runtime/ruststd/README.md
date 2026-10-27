@@ -110,22 +110,24 @@ touch lands in the guard page faults on an address the pager declines, and the f
 whole process, per [docs/fault-handling.md § Reply](../../docs/fault-handling.md#reply),
 [docs/process-lifecycle.md § Process Death](../../docs/process-lifecycle.md#process-death), and
 [Capability Model § "Kill process" pattern](../../docs/capability-model.md#kill-process-pattern).
-The std userspace targets emit inline stack probes, so a frame larger than one page touches
-each of its pages in turn and faults on the guard page rather than skipping it into an adjacent
-registered region, such as another thread's stack, which memmgr would back without a fault. The
-usable size is the larger of the requested stack size (at least `DEFAULT_MIN_STACK_SIZE`, 64
-KiB) and 512 pages (2 MiB). If the reservation, the page-table funding, or the registration
-fails, or the process is not demand-paged, the stack is instead an eager byte-heap allocation
-of the requested size (at least 64 KiB, rounded up to whole pages) with no guard page. `join`
-frees the stack once the thread has left user mode: a demand stack through
-[`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region)
-and release of its reservation, a heap stack through `dealloc`. A detached thread's stack, or
-that of a joined thread whose join wait failed with an error other than `Interrupted` (its
-private completion notification gone), is freed the same way by the next spawn, join, or detach
-in the process after the kernel posts that thread's death (or at once by that detach or join,
-when the death post has already landed), or leaks until process exit when the reaper could not
-register the thread at spawn (no death queue, no free slot, or the observer bind failed) or the
-kernel dropped the death post because the process's death queue (128 entries) was full.
+The std userspace targets emit inline stack probes
+([docs/build-system.md § Custom Targets](../../docs/build-system.md#custom-targets)), so a frame
+larger than one page touches each of its pages in turn and faults on the guard page rather than
+skipping it into an adjacent registered region, such as another thread's stack, which memmgr
+would back without a fault. The usable size is the larger of the requested stack size (at least
+`DEFAULT_MIN_STACK_SIZE`, 64 KiB) and 512 pages (2 MiB). If the reservation, the page-table
+funding, or the registration fails, or the process is not demand-paged, the stack is instead an
+eager byte-heap allocation of the requested size (at least 64 KiB, rounded up to whole pages)
+with no guard page. `join` frees the stack once the thread has left user mode: a demand stack
+through
+[`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region) and
+release of its reservation, a heap stack through `dealloc`. A detached thread's stack, or that
+of a joined thread whose join wait failed with an error other than `Interrupted` (its private
+completion notification gone), is freed the same way by the next spawn, join, or detach in the
+process after the kernel posts that thread's death (or at once by that detach or join, when the
+death post has already landed), or leaks until process exit when the reaper could not register
+the thread at spawn (no death queue, no free slot, or the observer bind failed) or the kernel
+dropped the death post because the process's death queue (128 entries) was full.
 
 ### Bootstrap-cross-boundary VAs
 
@@ -206,6 +208,7 @@ primitives.
 | Document | Content |
 |---|---|
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Three-surface VA model, frame-allocation contract |
+| [docs/build-system.md](../../docs/build-system.md) | Std userspace target specs, including the inline stack probes that reach a thread stack's guard page |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | ProcessInfo handover, `memmgr_endpoint_cap` discipline, process death |
 | [docs/fault-handling.md](../../docs/fault-handling.md) | Pager fault reply: `FAULT_REPLY_KILL` declines an unregistered guard-page fault, killing the faulting thread as an unhandled fault |
 | [docs/capability-model.md](../../docs/capability-model.md) | "Kill process" pattern: a terminal fault on any thread tears down the whole process |

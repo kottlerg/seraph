@@ -455,9 +455,11 @@ pub mod memmgr_labels
     /// * `data[0]` high 32 bits — `flags: u32` (see flag constants below).
     ///
     /// Reply (success): `data[0]` = `returned_cap_count: u32`;
-    /// `data[1+i]` = `page_count_for_cap_i: u32`; `caps[0..count]` = Memory
-    /// capabilities (MAP|WRITE rights). `sum(page_count_for_cap_i) ==
-    /// want_pages` for both contiguous and best-effort replies. Each reply
+    /// `data[1+i]` = `page_count_for_cap_i: u32`; `data[1+count+i]` =
+    /// `phys_base_for_cap_i: u64`; `caps[0..count]` = Memory capabilities
+    /// (MAP|WRITE rights); [`super::memmgr_grant_layout`] checks the shape.
+    /// `sum(page_count_for_cap_i) == want_pages` for both contiguous and
+    /// best-effort replies. Each reply
     /// cap MUST additionally carry `MemRights::RETYPE` so the caller can
     /// retype the memory into kernel objects via the `SYS_CAP_CREATE_*`
     /// syscalls; memmgr derives reply caps with `RIGHTS_ALL`, which
@@ -613,6 +615,34 @@ pub mod memmgr_labels
     /// `memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS`. Bit position 0 within
     /// the flags half of `data[0]`.
     pub const REQUIRE_CONTIGUOUS: u32 = 1 << 0;
+}
+
+/// Split a `memmgr_labels::REQUEST_MEMORY_CAPS` success reply into its page
+/// counts and phys bases, one of each per transferred cap: `data[1 + i]` and
+/// `data[1 + count + i]` for `i` below the declared `count` in `data[0]`
+/// (services/memmgr/docs/ipc-interface.md § Label 1).
+///
+/// The reply is wire input, so nothing is indexed until it passes these
+/// checks. Returns `None` for an error label, a reply with no data words, a
+/// declared count of zero or other than the number of caps transferred, or
+/// data words too few to cover the declared count; the phys words of such a
+/// reply sit at an offset its count does not establish, so no base is read.
+#[must_use]
+pub fn memmgr_grant_layout(reply: &IpcMessage) -> Option<(&[u64], &[u64])>
+{
+    let words = reply.words();
+    let count = reply.caps().len();
+    let declared = *words.first()?;
+    // `count` is bounded by `MSG_CAP_SLOTS_MAX`, so `1 + 2 * count` cannot
+    // overflow.
+    if reply.label != memmgr_errors::SUCCESS
+        || count == 0
+        || declared != count as u64
+        || words.len() < 1 + 2 * count
+    {
+        return None;
+    }
+    Some((&words[1..=count], &words[(1 + count)..=(2 * count)]))
 }
 
 /// Error replies from memmgr.
@@ -2695,6 +2725,66 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 mod tests
 {
     use super::*;
+
+    /// A `REQUEST_MEMORY_CAPS` reply with `label`, data `words`, and one
+    /// transferred cap per entry of `caps`.
+    fn grant_reply(label: u64, words: &[u64], caps: &[u32]) -> IpcMessage
+    {
+        let mut b = IpcMessage::builder(label).words(0, words);
+        for &c in caps
+        {
+            b = b.cap(c);
+        }
+        b.build()
+    }
+
+    #[test]
+    fn grant_layout_splits_page_counts_and_bases_per_cap()
+    {
+        let reply = grant_reply(0, &[2, 3, 5, 0x1000, 0x8000], &[11, 12]);
+        let (pages, bases) = memmgr_grant_layout(&reply).expect("well-formed reply");
+        assert_eq!(pages, &[3, 5]);
+        assert_eq!(bases, &[0x1000, 0x8000]);
+    }
+
+    #[test]
+    fn grant_layout_refuses_an_error_label()
+    {
+        let reply = grant_reply(
+            memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS,
+            &[1, 1, 0x1000],
+            &[11],
+        );
+        assert_eq!(memmgr_grant_layout(&reply), None);
+    }
+
+    #[test]
+    fn grant_layout_refuses_a_reply_without_data_words()
+    {
+        assert_eq!(memmgr_grant_layout(&grant_reply(0, &[], &[11])), None);
+    }
+
+    #[test]
+    fn grant_layout_refuses_a_zero_count()
+    {
+        assert_eq!(memmgr_grant_layout(&grant_reply(0, &[0], &[])), None);
+    }
+
+    #[test]
+    fn grant_layout_refuses_a_count_other_than_the_caps_transferred()
+    {
+        // Declaring more caps than arrived would put the phys words at an
+        // offset the transferred count does not establish.
+        let reply = grant_reply(0, &[2, 1, 1, 0x1000, 0x2000], &[11]);
+        assert_eq!(memmgr_grant_layout(&reply), None);
+    }
+
+    #[test]
+    fn grant_layout_refuses_words_too_few_for_the_count()
+    {
+        let reply = grant_reply(0, &[2, 1, 1, 0x1000], &[11, 12]);
+        assert_eq!(memmgr_grant_layout(&reply), None);
+    }
 
     #[test]
     fn packed_bytes_round_trip_through_data_bytes_with_zero_padding()

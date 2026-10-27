@@ -20,14 +20,14 @@
 //!   * Bind death: syscall::thread_bind_notification(thread_cap, event_queue_cap).
 //!   * Start: ipc_call(process_handle, START_PROCESS, 0, &[]).
 //!   * Wait: syscall::event_recv(event_queue_cap) — blocks until kernel posts
-//!           the exit reason on thread exit. Exit reason 0 = clean exit;
-//!           1..0x1000 = the `SYS_PROCESS_EXIT` code; 0x1000+vector = fault
-//!           exit; `EXIT_KILLED` = killed.
+//!           the exit reason on thread exit, encoded as
+//!           docs/process-lifecycle.md § Exit reason defines.
 //!   * Kill: event_post(event_queue_cap, EXIT_KILLED), then
 //!           ipc_call(process_handle, DESTROY_PROCESS, 0, &[]) — procmgr
 //!           revokes + deletes the child's kernel objects, a teardown that
 //!           posts nothing itself, so `wait` after `kill` reports
-//!           `EXIT_KILLED`.
+//!           `EXIT_KILLED`, unless the child had already died and its own
+//!           exit reason, posted first, is reported.
 //!
 //! Stdio:
 //!   * `Stdio::Inherit` (default) / `Stdio::Null` — no pipe installed
@@ -38,10 +38,10 @@
 //!     `ChildStdin` / `ChildStdout` / `ChildStderr`.
 //!
 //! Identity:
-//!   * `Process::id()` returns the slot index of the process-handle cap in the
-//!     caller's CSpace, unique only within that CSpace and only while the
-//!     handle is held. Not a POSIX pid — processes in Seraph are identified
-//!     by capability, not pid.
+//!   * `Process::id()` returns the process-handle cap's handle (its
+//!     generation-tagged slot) in the caller's CSpace, unique only within
+//!     that CSpace and only while the handle is held. Not a POSIX pid —
+//!     processes in Seraph are identified by capability, not pid.
 //!
 //! Argv/env:
 //!   * `Command::arg(...)` accumulates into `self.args`; `Command::env_mut()`
@@ -77,7 +77,7 @@ use ipc::{procmgr_errors, procmgr_labels};
 /// on a real death), so `u64::MAX` is unambiguous.
 const BRIDGE_SENTINEL_DROP: u64 = u64::MAX;
 
-use syscall::EXIT_KILLED;
+use syscall::{EXIT_FAULT_BASE, EXIT_KILLED};
 use syscall_abi::{MSG_DATA_WORDS_MAX, SyscallError};
 
 // ── Stdio ───────────────────────────────────────────────────────────────────
@@ -312,10 +312,17 @@ impl Command {
             io::Error::new(io::ErrorKind::InvalidInput, "Command program path must be UTF-8")
         })?;
 
-        // Pack argv (NUL-terminated UTF-8 concatenation of self.args).
+        // Pack argv (NUL-terminated UTF-8 concatenation of self.args). The
+        // process ABI defines the blob as UTF-8 strings, so a non-UTF-8
+        // argument is refused rather than passed through.
         let mut args_blob: Vec<u8> = Vec::new();
         for arg in &self.args {
-            let bytes = arg.as_encoded_bytes();
+            let bytes = arg
+                .to_str()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "argv entry is not UTF-8")
+                })?
+                .as_bytes();
             if bytes.iter().any(|&b| b == 0) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -333,12 +340,19 @@ impl Command {
         }
         let args_count: u32 = self.args.len() as u32;
 
-        // Pack env (NUL-terminated KEY=VALUE concatenation of CommandEnv.capture()).
+        // Pack env (NUL-terminated KEY=VALUE concatenation of CommandEnv.capture()),
+        // UTF-8 like argv.
         let mut env_blob: Vec<u8> = Vec::new();
         let mut env_count_usize: usize = 0;
         for (key, val) in self.env.capture() {
-            let key_bytes = key.as_encoded_bytes();
-            let val_bytes = val.as_encoded_bytes();
+            let (Some(key_str), Some(val_str)) = (key.to_str(), val.to_str()) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "env entry is not UTF-8",
+                ));
+            };
+            let key_bytes = key_str.as_bytes();
+            let val_bytes = val_str.as_bytes();
             if key_bytes.iter().any(|&b| b == 0 || b == b'=')
                 || val_bytes.iter().any(|&b| b == 0)
             {
@@ -1008,7 +1022,7 @@ pub struct Process {
 
 impl Process {
     pub fn id(&self) -> u32 {
-        // No POSIX pid on Seraph; the capability slot index uniquely
+        // No POSIX pid on Seraph; the process-handle cap's handle uniquely
         // identifies the process within this caller's CSpace.
         self.process_handle
     }
@@ -1247,20 +1261,21 @@ impl ExitStatus {
     }
 
     pub fn code(&self) -> Option<i32> {
-        // exit_reason is a voluntary exit code (`0` clean, or `1..0x1000` from
-        // `process::exit`/`ExitCode`) or a kernel fault encoding (`0x1000 +
-        // vector`). The voluntary code is the reason value itself, so widening
-        // to i32 yields it directly; callers distinguish "clean" via `.exit_ok()`
-        // and "fault" via the `>= 0x1000` range (see `Display`).
+        // exit_reason is encoded as docs/process-lifecycle.md § Exit reason
+        // defines: a voluntary code below `EXIT_FAULT_BASE`, a fault from
+        // `EXIT_FAULT_BASE` up to `EXIT_KILLED`, or `EXIT_KILLED`. A voluntary
+        // code is the reason value itself, so widening to i32 yields it
+        // directly; callers distinguish "clean" via `.exit_ok()` and the other
+        // classes by those ranges (see `Display`).
         Some(self.0 as i32)
     }
 }
 
 impl fmt::Display for ExitStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0 == 0 {
-            write!(f, "exit status: 0")
-        } else if self.0 >= 0x1000 {
+        if self.0 == EXIT_KILLED {
+            write!(f, "killed")
+        } else if self.0 >= EXIT_FAULT_BASE {
             write!(f, "fault exit: 0x{:x}", self.0)
         } else {
             write!(f, "exit status: {}", self.0)

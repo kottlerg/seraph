@@ -12,10 +12,10 @@
 //! just re-acquires the mutex and returns — the std layer's loop-condition
 //! recheck absorbs it.
 //!
-//! Every waiter parks on the one Notification, whose waiters the kernel
-//! queues in arrival order, each send waking the longest-waiting one.
-//! `notify_all` sends `WAKE_BURST` (16) times, so with more queued waiters
-//! than that the surplus stays parked until a later notify (or, for
+//! Every waiter parks on the one Notification, and a send wakes at most one
+//! of them, as core/kernel/docs/syscalls.md § `SYS_NOTIFICATION_SEND`
+//! defines. `notify_all` sends `WAKE_BURST` (16) times, so with more parked
+//! waiters than that the surplus stays parked until a later notify (or, for
 //! `wait_timeout`, its timeout); per-thread parking (#255) removes the bound.
 //!
 //! `wait_timeout` passes the millisecond timeout through `arg1` of

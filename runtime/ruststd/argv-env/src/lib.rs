@@ -190,6 +190,17 @@ mod tests
     }
 
     #[test]
+    fn prev_field_clamps_an_end_past_the_blob()
+    {
+        // An `end` beyond the blob reads as the blob's end rather than
+        // slicing out of bounds.
+        let blob = b"one\0two\0";
+        let (last, end) = prev_field(blob, 0, blob.len() + 3).expect("last field");
+        assert_eq!(last, b"two");
+        assert_eq!(end, 4);
+    }
+
+    #[test]
     fn prev_field_and_next_field_consume_disjoint_fields()
     {
         // Walking from both ends yields every field exactly once: the

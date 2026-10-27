@@ -360,13 +360,19 @@ binding the same way the
 surface.
 
 **Trigger paths.** The boundary CPU counts and the memory variation below are owed for a change,
-other than Markdown and comment lines, under `core/kernel/src/`, `core/kernel/linker/`,
-`core/boot/`, `abi/boot-protocol/`, or `abi/init-protocol/`: the kernel, the bootloader, and the
-boot and init handover contracts, which hold every SMP, per-CPU, IPI, scheduler-wakeup, boot, and
-memory-init path. A change elsewhere owes none of them. The 512-vCPU and 128-hart boundaries below
-have their own trigger lists, and are owed for those whether or not the base runs are. Every trigger
-in this section is a file or a directory, which triggers as a whole; a parenthetical gives the
-reason, not the scope.
+other than Markdown and comment lines, to code that builds into the kernel or bootloader image: any
+file under `core/kernel/` or `core/boot/` (sources, build scripts, manifests, and linker scripts),
+and any file of an in-tree crate either one depends on, transitively, through a normal or build
+dependency (`cargo metadata` lists them; today `abi/boot-protocol`, `abi/init-protocol`,
+`abi/process-abi`, `abi/syscall`, `shared/elf`, `shared/font`, `shared/mmio`,
+`shared/process-layout`, and `shared/text`). These hold every SMP, per-CPU, IPI, scheduler-wakeup,
+boot, and memory-init path. A change elsewhere owes none of them. The 512-vCPU and 128-hart
+boundaries below are owed in addition to the base runs, for their own trigger lists, which lie
+inside these paths. Every trigger in this section is a file or a directory, which triggers as a
+whole; a parenthetical after a named path gives the reason and does not narrow it. A trigger set
+defined by `git grep -l` is the union of the files the grep lists at the PR head and at the head's
+merge base with `origin/master`, so a change that removes the last match from a file still
+triggers.
 
 ```sh
 # Boundary CPU counts, riscv64 (~70 s per passing run on a 16-core host;
@@ -400,11 +406,11 @@ MUST run the riscv64 64- and 65-hart and the x86_64 256-vCPU boundaries three ti
 variation and the narrower boundaries below run once.
 
 PRs touching the surfaces that only matter above 256 CPUs — `core/kernel/src/mm/`, x86_64 AP bringup
-and the APIC/IPI paths (`core/kernel/src/arch/x86_64/ap_trampoline.rs`, `gdt.rs`, and
-`interrupts.rs`), or per-CPU slab sizing (every file that
+and the APIC/IPI paths (`core/kernel/src/arch/x86_64/ap_trampoline.rs`, `gdt.rs`, `idt.rs`, which
+holds the IPI receive stubs, and `interrupts.rs`), or per-CPU slab sizing (every file that
 `git grep -l alloc_zeroed_slab core/kernel/src` lists, which defines `sched::alloc_zeroed_slab` or
-calls it) — MUST run the full-width x86_64 boundary below, besides any base runs they owe. This
-trigger list is deliberately narrow; other SMP PRs stay on the 256-vCPU mandate above.
+calls it) — MUST also run the full-width x86_64 boundary below. This trigger list is deliberately
+narrow; other SMP PRs stay on the 256-vCPU mandate above.
 
 ```sh
 # MAX_CPUS boundary, x86_64 (~16 min per passing run measured on a 16-core KVM
@@ -415,15 +421,14 @@ trigger list is deliberately narrow; other SMP PRs stay on the 256-vCPU mandate 
 cargo xtask run-parallel --arch x86_64 --cpus 512 --parallel 1 --runs 1 --timeout 3600
 ```
 
-PRs touching the bootloader's kernel-placement path — `core/boot/src/elf.rs`
-(kernel ELF span allocation), `core/boot/src/uefi.rs` (UEFI page allocation),
-or the boot page-table builders (`core/boot/src/paging.rs`,
-`core/boot/src/arch/*/paging.rs`) — MUST run the riscv64 128-hart boundary
-below, besides any base runs they owe. It is the riscv64 analogue of the full-width x86_64 run: the
-hart count at which hart-scaled firmware allocations once collided with the
-kernel image's load address ([#377](https://github.com/kottlerg/seraph/issues/377)).
-This trigger list is deliberately narrow; other SMP PRs stay on the 64/65-hart
-mandate above.
+PRs touching the bootloader's kernel-placement path — `core/boot/src/elf.rs` (kernel ELF span
+allocation) and the ELF parser it uses (`shared/elf/`), `core/boot/src/uefi.rs` (UEFI page
+allocation), or the boot page-table builders (`core/boot/src/paging.rs`,
+`core/boot/src/arch/*/paging.rs`) — MUST also run the riscv64 128-hart boundary below. It is the
+riscv64 analogue of the full-width x86_64 run: the hart count at which hart-scaled firmware
+allocations once collided with the kernel image's load address
+([#377](https://github.com/kottlerg/seraph/issues/377)). This trigger list is deliberately narrow;
+other SMP PRs stay on the 64/65-hart mandate above.
 
 ```sh
 # Kernel-placement boundary, riscv64 (~475 s per passing run measured at 8x hart
@@ -462,8 +467,9 @@ comment or Markdown. The CI gate and the
 the PR body MUST carry what
 [conventions.md](conventions.md#pr-body-checklist-discipline) § PR-body checklist
 discipline requires (the validated head, that the delta is documentation or
-comments only, and that no local host run is owed, and why), and the
-pre-merge review's audit MUST check that against the diff.
+comments only, and the local host runs the PR as a whole owes, each with its
+count and head, or that none is owed and why), and the pre-merge review's
+audit MUST check that against the diff.
 
 **Known boundaries**, established empirically (QEMU 11.0.1; update this
 list as the tracking Issues move):

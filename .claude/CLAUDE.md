@@ -63,7 +63,9 @@ truth for "how work is tracked and shipped" on this project.
   owned by [docs/conventions.md](../docs/conventions.md) § Branch and PR
   Workflow; this section gives only the assistant's mechanics. The review
   is the saved `pr-review` workflow; this bullet is the maintainer's
-  standing request to run it:
+  standing request to run it, each run preceded by `git fetch origin` (the
+  auditor reads the PR's own diff against `origin/master` and does not
+  fetch):
   `Workflow({name: "pr-review", args: {pr: <N>, mode: "full"}})` for the
   first run on a PR (a later full run adds `ledger` once one exists), then
   `mode: "delta"` with `since` set to the head the previous run reviewed
@@ -174,7 +176,7 @@ truth for "how work is tracked and shipped" on this project.
   architectures); the pre-merge review still applies, and the PR body MUST
   carry what [docs/conventions.md](../docs/conventions.md) § PR-body
   checklist discipline requires (the validated head, the documentation-only
-  delta, and that no local host run is owed, and why).
+  delta, and the local host-run report).
 - `cargo xtask lint-docs` MUST pass on every change, documentation-only
   ones included (per [docs/conventions.md](../docs/conventions.md) § CI
   Gating; CI's `host-tests` job runs it, per

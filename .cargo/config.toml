@@ -18,15 +18,7 @@ json-target-spec = true
 [env]
 RUST_TARGET_PATH = { value = "xtask/targets", relative = true }
 
+# Bootloader flags are set by `cargo xtask` (`RUSTFLAGS`) and
+# core/boot/build.rs, not here; see docs/build-system.md § Custom Targets.
 [build]
 rustflags = ["-Zunstable-options"]
-
-# RISC-V UEFI bootloader link flags.
-# The linker script path is relative to the workspace root.
-# jump-tables=no avoids generating jump tables that UEFI can't relocate.
-[target.riscv64imac-seraph-uefi]
-rustflags = [
-    "-Zunstable-options",
-    "-C", "link-arg=-Tcore/boot/linker/riscv64-uefi.ld",
-    "-C", "jump-tables=no",
-]

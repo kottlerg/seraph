@@ -362,9 +362,10 @@ impl LfnAccum
             self.saw_last = true;
             self.chksum = chksum;
             self.last_seq = seq;
-            // Provisional length: seq*13 chars, trimmed downward when
+            // Provisional length: seq*13 chars capped at MAX_LFN_CHARS
+            // (a 20-slot run spans 260 positions), trimmed downward when
             // the first 0x0000 / 0xFFFF terminator is observed below.
-            self.len = (seq as usize) * 13;
+            self.len = (seq as usize * 13).min(MAX_LFN_CHARS);
         }
         else
         {
@@ -1089,6 +1090,24 @@ mod tests
         acc.add_lfn_entry(&entry);
         let mut out = [0u8; MAX_LFN_UTF8];
         assert!(acc.assemble_utf8(&mut out).is_none());
+    }
+
+    #[test]
+    fn lfn_run_of_maximum_length_assembles_all_255_chars()
+    {
+        // A 20-slot run spans 260 positions but holds at most 255 chars; the
+        // assembled name must stop at 255 rather than read past the buffer.
+        let sfn = b"AAAAAA~1   ";
+        let long = "a".repeat(MAX_LFN_CHARS);
+        let mut acc = LfnAccum::new();
+        for slot in &lfn_entry_slots(&long, sfn, lfn_checksum(sfn))[..20]
+        {
+            acc.add_lfn_entry(slot);
+        }
+        assert!(acc.validate(sfn));
+        let mut out = [0u8; MAX_LFN_UTF8];
+        assert_eq!(acc.assemble_utf8(&mut out), Some(MAX_LFN_CHARS));
+        assert!(acc.matches(long.as_bytes()));
     }
 
     /// Directory slots for `long` stored under the 8.3 name `sfn`: the LFN

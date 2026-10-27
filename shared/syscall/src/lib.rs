@@ -43,20 +43,19 @@ extern crate rustc_std_workspace_core as core;
 use core::prelude::rust_2024::*;
 
 use syscall_abi::{
-    CAP_INDEX_MASK, MEM_UNMAP_RECLAIM_PTS, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION,
-    SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE,
-    SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION,
-    SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
-    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST,
-    SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET,
-    SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT,
-    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
-    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL,
-    SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
-    SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
-    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
-    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
-    SYS_WAIT_SET_WAIT, SyscallError,
+    MEM_UNMAP_RECLAIM_PTS, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_QUERY,
+    SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT,
+    SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD,
+    SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO,
+    SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND,
+    SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
+    SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE,
+    SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
+    SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
+    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
+    SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
+    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
 };
 
 pub use syscall_abi::{
@@ -1852,10 +1851,10 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 /// invalid or stale, or an ancestor's revoke freed the capability while the
 /// move was in flight; `InsufficientRights` if the destination `CSpace` cap
 /// lacks Insert; `InvalidArgument` if `dest_index` is occupied or out of
-/// range (the wrapper returns it without a syscall for a `dest_index` above
-/// `CAP_INDEX_MASK`); `OutOfMemory` if the destination's slot pool cannot
-/// back the slot (for a non-zero `dest_index`, every leaf up to that index
-/// must be backed; `QuotaExceeded` at the structural ceiling);
+/// range (including above `CAP_INDEX_MASK`); `OutOfMemory` if the
+/// destination's slot pool cannot back the slot (for a non-zero
+/// `dest_index`, every leaf up to that index must be backed;
+/// `QuotaExceeded` at the structural ceiling);
 /// `InvalidState` if a revoke, another move, or an IPC capability transfer
 /// is in flight on the source, or the destination slot was freed mid-move
 /// (the source keeps the capability);
@@ -1869,12 +1868,6 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn cap_move(src_cap: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u32, i64>
 {
-    // The kernel decodes only the low `CAP_INDEX_BITS` of the destination, so
-    // a larger index would land in a lower slot or auto-allocate.
-    if dest_index > CAP_INDEX_MASK
-    {
-        return Err(SyscallError::InvalidArgument as i64);
-    }
     // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
     // (source slot, dest CSpace cap, dest index); kernel validates and moves cap, returns slot.
     let ret = unsafe {
@@ -1906,9 +1899,9 @@ pub fn cap_move(src_cap: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
-/// lacks sufficient rights, `dest_index` is already occupied or out of range
-/// (`InvalidArgument`, which the wrapper returns without a syscall for a
-/// `dest_index` of 0 or above `CAP_INDEX_MASK`), or the destination
+/// lacks sufficient rights, `dest_index` is 0, already occupied, or out of
+/// range, including above `CAP_INDEX_MASK` (`InvalidArgument`; the wrapper
+/// returns it for 0 without a syscall), or the destination
 /// `CSpace`'s slot pool cannot back every leaf up to `dest_index`
 /// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
 /// `InvalidCapability` also covers a source a concurrent delete, move, or
@@ -1926,9 +1919,9 @@ pub fn cap_insert(
     rights_mask: u64,
 ) -> Result<u32, i64>
 {
-    // The kernel decodes only the low `CAP_INDEX_BITS` of the destination and
-    // reads 0 as "allocate a slot", so either would place the copy elsewhere.
-    if dest_index == 0 || dest_index > CAP_INDEX_MASK
+    // The kernel reads a destination of 0 as "allocate a slot", which would
+    // place the copy elsewhere.
+    if dest_index == 0
     {
         return Err(SyscallError::InvalidArgument as i64);
     }

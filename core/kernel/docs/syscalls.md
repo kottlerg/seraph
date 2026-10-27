@@ -759,9 +759,8 @@ under the derivation lock: as for `SYS_CAP_DERIVE`.
 **Errors:** `InvalidArgument` (badge is zero or source already badged),
 `InvalidCapability` (source invalid, null, or freed meanwhile), `InvalidState` (a
 `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC capability transfer is in flight on the source),
-`OutOfMemory`
-(slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory
-structurally full).
+`OutOfMemory` (slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally
+full).
 
 ---
 

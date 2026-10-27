@@ -673,8 +673,8 @@ pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
         return Err("cap_insert at out-of-bounds slot should fail");
     }
 
-    // Index 0 and an index with bits above the handle's index field would
-    // decode to a kernel-chosen or a lower slot; the wrapper refuses both.
+    // The wrapper refuses index 0, which the kernel reads as "allocate a
+    // slot"; the kernel refuses an index above the handle's index field.
     let invalid = SyscallError::InvalidArgument as i64;
     let above_field = (syscall_abi::CAP_INDEX_MASK + 1) | 5;
     if cap_insert(sig, dest_cs, 0, syscall::RIGHTS_ALL) != Err(invalid)
@@ -690,9 +690,9 @@ pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
 
 // ── SYS_CAP_MOVE explicit slot negative (out of bounds) ──────────────────────
 
-/// `cap_move` to an index with bits above the handle's index field must fail:
-/// the kernel would decode it to a lower slot, so the wrapper refuses it and
-/// the source stays in place.
+/// `cap_move` to an index with bits above the handle's index field must fail
+/// with `InvalidArgument`, not land in the slot its low bits name, and leave
+/// the source in place.
 pub fn move_out_of_bounds_err(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)

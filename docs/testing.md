@@ -373,13 +373,13 @@ A PR whose changes outside Markdown are all inert owes no local host run. The su
 judged on the non-inert lines only.
 
 **Boundary surface.** The boundary set below is owed when, and only when, the PR's own diff (see
-When the runs are owed below) makes a non-inert change to the CPU-count surface, or the PR states a
-concurrency-fix purpose (see Repeat count below). The CPU-count surface is the code that fixes the
-CPU-count width, enumerates and brings up CPUs, sizes per-CPU storage, or signals across CPUs, and
-it is exactly what this paragraph lists. Code that only reads the booted CPU count (`CPU_COUNT`, a
-`cpu_count` argument) to iterate over CPUs is not on it; the rules of
-[coding-standards.md](coding-standards.md) § CPU-Count Width and the release host runs cover it.
-The surface is these files as a whole:
+When the runs are owed below) makes a non-inert change to the CPU-count surface; a stated
+concurrency-fix purpose owes three of its boundaries on its own (see Repeat count below). The
+CPU-count surface is the code that fixes the CPU-count width, enumerates and brings up CPUs, sizes
+per-CPU storage, or signals across CPUs, and it is exactly what this paragraph lists. Code that only
+reads the booted CPU count (`CPU_COUNT`, a `cpu_count` argument) to iterate over CPUs is not on it;
+the rules of [coding-standards.md](coding-standards.md) § CPU-Count Width and the release host runs
+cover it. The surface is these files as a whole:
 
 - `core/kernel/src/cpu_mask.rs` (the CPU mask type and its width);
 - `core/kernel/src/percpu.rs` (per-CPU data and its slabs);

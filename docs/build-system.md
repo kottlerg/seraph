@@ -387,9 +387,27 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 The jobs that boot under QEMU (`validate` in `build-test.yml` and `burnin`
 in `burnin.yml`) install it and run on the pinned `ubuntu-26.04` runner
 image, whose archive ships `qemu-system-riscv64` in the `qemu-system-riscv`
-package (QEMU 10.2); the pin and the install list move together. The
-`build-image` job of `release.yml` boots nothing (its one `cargo xtask`
-command is `build`), so it installs no QEMU and runs on `ubuntu-latest`.
+package (QEMU 10.2). The install list is each workflow's `QEMU_PACKAGES`,
+installed without recommends. A `qemu-debs` job in each of the two
+workflows, which every booting cell `needs:`, downloads the list's resolved
+`.deb` set once into an `actions/cache` entry keyed
+`qemu-debs-<ImageOS>-<ImageVersion>-<list hash>` (the runner image's
+version variables and a hash of `QEMU_PACKAGES`), and downloads nothing when
+the entry exists. When its fetch from the image's apt mirror fails or
+exceeds 120 s, it rewrites the apt sources, the image's
+`/etc/apt/apt-mirrors.txt` mirror list included, from
+`azure.archive.ubuntu.com` to `archive.ubuntu.com` and retries once. Each
+booting cell restores the entry by the key that job outputs and installs
+from it with apt's sources disabled, so it fetches nothing; it falls back to
+a network install only when the entry is absent or does not resolve against
+the cell's image. An entry saved on `master` is readable from every branch
+and tag, so both workflows and later runs share one entry per key. The pin,
+the install list and the cache key move together: the key derives from the
+other two, and the `qemu-debs` job runs on the same pinned image as the
+booting jobs because the downloaded set is resolved against that image's
+installed packages. The `build-image` job of `release.yml` boots nothing
+(its one `cargo xtask` command is `build`), so it installs no QEMU and runs
+on `ubuntu-latest`.
 
 `build-test.yml` cancels stacked runs on the same ref
 (`cancel-in-progress: true`). `burnin.yml` and `release.yml` do not

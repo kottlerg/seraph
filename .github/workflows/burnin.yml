@@ -15,10 +15,70 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # The QEMU and firmware install list. Moves with the runner-image pin and
+  # the qemu-debs cache key; see docs/build-system.md § Continuous Integration.
+  QEMU_PACKAGES: qemu-system-x86 qemu-system-riscv ovmf qemu-efi-riscv64
+
 jobs:
+  qemu-debs:
+    # Downloads the install list's packages once per runner image and install
+    # list, into a cache every booting cell restores. Pinned with the booting
+    # job's image; see docs/build-system.md § Continuous Integration.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - name: Compute cache key
+        id: key
+        run: |
+          : "${ImageOS:?}" "${ImageVersion:?}"
+          list_hash=$(printf '%s' "$QEMU_PACKAGES" | sha256sum | cut -c1-16)
+          echo "key=qemu-debs-$ImageOS-$ImageVersion-$list_hash" >> "$GITHUB_OUTPUT"
+
+      - name: Look up cached packages
+        id: cache
+        uses: actions/cache/restore@v6
+        with:
+          path: qemu-debs
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+
+      - name: Download QEMU and firmware packages
+        if: steps.cache.outputs.cache-hit != 'true'
+        # The image's mirror (azure.archive.ubuntu.com) can trickle the
+        # archives for many minutes; past 120 s the fetch is retried once
+        # against archive.ubuntu.com. The rewrite covers both the image's
+        # mirror list (/etc/apt/apt-mirrors.txt) and plain source URIs.
+        run: |
+          debs="$PWD/qemu-debs"
+          mkdir -p "$debs/partial"
+          fetch() {
+            sudo timeout "$1" sh -c "apt-get update && \
+              apt-get install -y --download-only --no-install-recommends \
+                -o Dir::Cache::Archives=$debs $QEMU_PACKAGES"
+          }
+          if ! fetch 120; then
+            echo "::warning::apt fetch from the image's mirror failed or exceeded 120 s; retrying on archive.ubuntu.com"
+            sudo grep -rlI 'azure\.archive\.ubuntu\.com' /etc/apt \
+              | xargs -r sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g'
+            fetch 1200
+          fi
+          sudo rm -rf "$debs/partial" "$debs/lock"
+          ls -l "$debs"/*.deb
+
+      - name: Save packages
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: qemu-debs
+          key: ${{ steps.key.outputs.key }}
+
   burnin:
-    # Pinned with the install list below; see docs/build-system.md
-    # § Continuous Integration.
+    # Pinned with the install list and the qemu-debs job; see
+    # docs/build-system.md § Continuous Integration.
+    needs: qemu-debs
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
@@ -35,14 +95,27 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Restore QEMU and firmware packages
+        uses: actions/cache/restore@v6
+        with:
+          path: qemu-debs
+          key: ${{ needs.qemu-debs.outputs.key }}
+
       - name: Install QEMU and firmware
+        # Offline from the qemu-debs job's packages: apt's sources are
+        # disabled, so a dependency missing from the set fails resolution
+        # instead of fetching. The network install runs only when the cache
+        # entry is absent or was resolved against a different image.
         run: |
+          if ls qemu-debs/*.deb > /dev/null 2>&1 &&
+             sudo apt-get install -y --no-install-recommends \
+               -o Dir::Etc::SourceList=/dev/null -o Dir::Etc::SourceParts=- \
+               ./qemu-debs/*.deb; then
+            exit 0
+          fi
+          echo "::warning::offline install from the qemu-debs cache failed; installing from the network"
           sudo apt-get update
-          sudo apt-get install -y \
-            qemu-system-x86 \
-            qemu-system-riscv \
-            ovmf \
-            qemu-efi-riscv64
+          sudo apt-get install -y --no-install-recommends $QEMU_PACKAGES
 
       - name: Log QEMU versions
         # A missing binary fails here rather than at the first boot. The

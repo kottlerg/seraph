@@ -20,11 +20,14 @@
 //!   * Bind death: syscall::thread_bind_notification(thread_cap, event_queue_cap).
 //!   * Start: ipc_call(process_handle, START_PROCESS, 0, &[]).
 //!   * Wait: syscall::event_recv(event_queue_cap) — blocks until kernel posts
-//!           the exit reason on thread exit. Exit reason 0 = clean
-//!           `SYS_THREAD_EXIT`; 0x1000+vector = fault exit.
-//!   * Kill: ipc_call(process_handle, DESTROY_PROCESS, 0, &[]) — procmgr
-//!           revokes + deletes the child's kernel objects; the bound
-//!           EventQueue is woken with exit reason 0.
+//!           the exit reason on thread exit. Exit reason 0 = clean exit;
+//!           1..0x1000 = the `SYS_PROCESS_EXIT` code; 0x1000+vector = fault
+//!           exit; `EXIT_KILLED` = killed.
+//!   * Kill: event_post(event_queue_cap, EXIT_KILLED), then
+//!           ipc_call(process_handle, DESTROY_PROCESS, 0, &[]) — procmgr
+//!           revokes + deletes the child's kernel objects, a teardown that
+//!           posts nothing itself, so `wait` after `kill` reports
+//!           `EXIT_KILLED`.
 //!
 //! Stdio:
 //!   * `Stdio::Inherit` (default) / `Stdio::Null` — no pipe installed
@@ -35,9 +38,10 @@
 //!     `ChildStdin` / `ChildStdout` / `ChildStderr`.
 //!
 //! Identity:
-//!   * `Process::id()` returns the low 32 bits of procmgr's internal process
-//!     badge (unique, monotonic, nonzero). Not a POSIX pid — processes in
-//!     Seraph are identified by capability, not pid.
+//!   * `Process::id()` returns the slot index of the process-handle cap in the
+//!     caller's CSpace, unique only within that CSpace and only while the
+//!     handle is held. Not a POSIX pid — processes in Seraph are identified
+//!     by capability, not pid.
 //!
 //! Argv/env:
 //!   * `Command::arg(...)` accumulates into `self.args`; `Command::env_mut()`

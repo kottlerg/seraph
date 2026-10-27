@@ -12,11 +12,18 @@
 //! just re-acquires the mutex and returns — the std layer's loop-condition
 //! recheck absorbs it.
 //!
+//! Every waiter parks on the one Notification, whose waiters the kernel
+//! queues in arrival order, each send waking the longest-waiting one.
+//! `notify_all` sends `WAKE_BURST` (16) times, so with more queued waiters
+//! than that the surplus stays parked until a later notify (or, for
+//! `wait_timeout`, its timeout); per-thread parking (#255) removes the bound.
+//!
 //! `wait_timeout` passes the millisecond timeout through `arg1` of
 //! `SYS_NOTIFICATION_WAIT`. A non-zero bit return means notification wake; a
 //! `0` return means the wait timed out, which the kernel also reports at once
-//! when its sleep list is full, so `wait_timeout` waits again for what is
-//! left of the duration and reports a timeout only once it has elapsed.
+//! when its sleep list is full, so `wait_timeout` yields, waits again for
+//! what is left of the duration, and reports a timeout only once it has
+//! elapsed.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -64,9 +71,11 @@ impl Condvar {
     /// duration of the wait and reacquired before returning.
     pub unsafe fn wait(&self, mutex: &Mutex) {
         let _before = self.gen_counter.load(Relaxed);
+        // Allocated before the unlock, so a notifier that takes the mutex
+        // after it sees the cap and sends.
+        let sig = ensure_notification(&self.notification);
         // SAFETY: contract inherited from caller.
         unsafe { mutex.unlock() };
-        let sig = ensure_notification(&self.notification);
         if sig != 0 {
             let _ = syscall::notification_wait(sig);
         } else {
@@ -80,13 +89,18 @@ impl Condvar {
     pub unsafe fn wait_timeout(&self, mutex: &Mutex, timeout: Duration) -> bool {
         let before = self.gen_counter.load(Relaxed);
         let start = Instant::now();
+        // Allocated before the unlock, as in `wait`.
+        let sig = ensure_notification(&self.notification);
         // SAFETY: contract inherited from caller.
         unsafe { mutex.unlock() };
-        let sig = ensure_notification(&self.notification);
         // A 0-bit return means the wait timed out, which the kernel reports
         // at once when its sleep list is full and up to a tick early
         // otherwise, so wait again for whatever of `timeout` is left: the
-        // result reports a timeout only once the duration has elapsed.
+        // result reports a timeout only once the duration has elapsed. A
+        // 0-bit return with more than a millisecond still left is the
+        // full-list refusal, so yield before waiting again, as
+        // `thread::sleep` does, to let the list drain rather than spin on
+        // the syscall.
         let mut woke = false;
         while sig != 0 && !woke && self.gen_counter.load(Relaxed) == before {
             let Some(left) = timeout.checked_sub(start.elapsed()).filter(|d| !d.is_zero()) else {
@@ -99,8 +113,13 @@ impl Condvar {
             // `Interrupted`) ends the wait early; it is reported as a
             // spurious wake, not a timeout, since the duration may not have
             // elapsed.
-            if !matches!(syscall::notification_wait_timeout(sig, ms), Ok(0)) {
-                woke = true;
+            match syscall::notification_wait_timeout(sig, ms) {
+                Ok(0) => {
+                    if timeout.saturating_sub(start.elapsed()) > Duration::from_millis(1) {
+                        crate::sys::thread::yield_now();
+                    }
+                }
+                _ => woke = true,
             }
         }
         // Without a notification cap, wait out the duration (or a notify).

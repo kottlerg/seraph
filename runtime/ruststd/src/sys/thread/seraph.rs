@@ -876,17 +876,18 @@ extern "C" fn thread_entry(arg: u64) -> ! {
     // Thread::new; consumed exactly once here.
     let init_box = unsafe { Box::from_raw(args.init) };
 
-    // NOTE: we deliberately bypass `ThreadInit::init()` because its
-    // internal `set_current(self.handle.clone())` rtaborts on the second
-    // caller, and with our `no_threads` thread_local mapping the CURRENT
-    // static is shared across threads (so the main thread already set
-    // it). Pull `rust_start` out and run it directly; the handle is
-    // dropped, which is fine — it is ref-counted and the JoinHandle
-    // keeps a clone.
-    let rust_start = init_box.rust_start;
+    // `init` installs this thread's handle as its native-TLS `CURRENT`
+    // (so `thread::current()` here is the `JoinHandle`'s thread) before
+    // any heap (de)allocation, then frees the `ThreadInit` box and returns
+    // the entry point.
+    let rust_start = init_box.init();
+    let done_notification = args.done_notification;
+    drop(args);
     rust_start();
 
-    let _ = syscall::notification_send(args.done_notification, 1);
+    // `thread_exit` diverges without unwinding, so every local is dropped
+    // above; only the plain cap slot crosses into the tail.
+    let _ = syscall::notification_send(done_notification, 1);
     syscall::thread_exit();
 }
 
@@ -910,19 +911,20 @@ pub fn set_name(_name: &CStr) {
 
 pub fn sleep(dur: Duration) {
     // `thread_sleep` can end before `dur` elapses: a stop and restart of this
-    // thread returns `Interrupted`, and a full kernel sleep list returns
-    // `OutOfMemory`. `sleep` cannot report either and must never sleep less
-    // than `dur`, so every error retries for whatever remains; an error other
-    // than `Interrupted` yields first so a full sleep list can drain rather
-    // than spinning on the syscall. The loop returns once the kernel
-    // completes a sleep, or once `dur` has elapsed across the retries.
+    // thread returns `Interrupted`, a full kernel sleep list returns
+    // `OutOfMemory`, and a park refused by a coalesced wake returns `Ok`
+    // without sleeping. `sleep` cannot report any of these and must never
+    // sleep less than `dur`, so every return, `Ok` included, retries for
+    // whatever remains; an error other than `Interrupted` yields first so a
+    // full sleep list can drain rather than spinning on the syscall. The loop
+    // returns only once `dur` has elapsed since the first call.
     let start = crate::time::Instant::now();
     let mut left = dur;
     loop {
         // Round up to whole ms so a sub-ms sleep (or remainder) still sleeps.
         let ms = u64::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
         match syscall::thread_sleep(ms) {
-            Ok(()) => return,
+            Ok(()) => {}
             Err(e) if e == SyscallError::Interrupted as i64 => {}
             Err(_) => yield_now(),
         }

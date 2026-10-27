@@ -651,7 +651,11 @@ pub(crate) fn fatal(msg: &str) -> !
 `wfi` on RISC-V).
 
 Secondary CPU failures after Phase 9 (user-mode entry) are handled by `fatal()` on
-that CPU only; the BSP and other CPUs continue.
+that CPU only; the BSP and other CPUs continue until one needs the halted CPU: it acks no
+further IPI, so the next TLB shootdown that names it ends in the IPI watchdog's `fatal`, and
+a stop or teardown of the thread it interrupted does not complete (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
+§ `dealloc_object(Thread)` Drain Protocol, invariant 3).
 
 ---
 

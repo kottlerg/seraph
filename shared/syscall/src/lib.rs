@@ -1982,7 +1982,8 @@ pub fn system_info(kind: u64) -> Result<u64, i64>
 
 /// Inspect a capability slot's runtime state.
 ///
-/// `slot` — capability slot index in the caller's `CSpace`.
+/// `slot` — capability handle (slot index plus generation) in the caller's
+/// `CSpace`; generation-checked.
 /// `field` — field selector (one of the `CAP_INFO_*` constants in
 /// `syscall_abi`). Each call returns a single `u64`. Userspace assembles
 /// a full picture by issuing repeated calls. The pattern mirrors
@@ -2009,9 +2010,10 @@ pub fn system_info(kind: u64) -> Result<u64, i64>
 #[inline]
 pub fn cap_info(slot: u32, field: u64) -> Result<u64, i64>
 {
-    // SAFETY: syscall2 issues raw syscall instruction; slot is cap index as u64,
+    // SAFETY: syscall2 issues raw syscall instruction; slot is a cap handle as u64,
     // field is one of the CAP_INFO_* selectors. The kernel performs all validation
-    // (slot bounds, tag match for tag-specific fields, selector recognition) and
+    // (slot bounds and generation, tag match for tag-specific fields, selector
+    // recognition) and
     // returns the requested field value.
     let ret = unsafe { syscall2(SYS_CAP_INFO, u64::from(slot), field) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }

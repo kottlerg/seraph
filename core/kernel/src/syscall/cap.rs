@@ -133,7 +133,7 @@ unsafe fn release_src_ref(object: core::ptr::NonNull<crate::cap::object::KernelO
 
 /// `SYS_CAP_CREATE_ENDPOINT` (7): retype a Memory cap into a new Endpoint.
 ///
-/// arg0 = Memory-cap slot index in the caller's `CSpace`. The Memory cap
+/// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked). The Memory cap
 /// MUST carry `MemRights::RETYPE` and have at least
 /// `dispatch_for(Endpoint, 0).raw_bytes` (80 B = 24 wrapper + 56
 /// `EndpointState`) of `available_bytes`.
@@ -258,7 +258,7 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_CAP_CREATE_NOTIFICATION` (8): retype a Memory cap into a new Notification.
 ///
-/// arg0 = Memory-cap slot index in the caller's `CSpace`. The Memory cap MUST
+/// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked). The Memory cap MUST
 /// carry `MemRights::RETYPE` and have at least `dispatch_for(Notification, 0).raw_bytes`
 /// of `available_bytes`.
 ///
@@ -897,10 +897,10 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_CAP_CREATE_THREAD` (10): create a new Thread object.
 ///
-/// arg0 = Memory cap index (must have RETYPE); supplies the 6-page Thread slot.
-/// arg1 = `AddressSpace` cap index (must have MAP).
-/// arg2 = `CSpace` cap index (must have INSERT).
-/// arg3 = `SchedControl` cap index, or 0.
+/// arg0 = Memory capability handle (generation-checked; must have RETYPE); supplies the 6-page Thread slot.
+/// arg1 = `AddressSpace` capability handle (generation-checked; must have MAP).
+/// arg2 = `CSpace` capability handle (generation-checked; must have INSERT).
+/// arg3 = `SchedControl` capability handle (generation-checked), or 0.
 /// arg4 = initial priority, or 0.
 ///
 /// Creation priority rules (floor without a `SchedControl` cap, band-checked
@@ -1555,7 +1555,7 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_CAP_DERIVE` (14): attenuate a capability within the caller's own `CSpace.`
 ///
-/// arg0 = source slot index (caller's `CSpace`).
+/// arg0 = source capability handle (caller's `CSpace`; generation-checked).
 /// arg1 = rights mask (intersected with the source rights; bits the source lacks are dropped).
 ///
 /// Creates a new slot in the caller's `CSpace` with the attenuated rights, wired
@@ -1663,7 +1663,7 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_CAP_DERIVE_BADGE` (48): derive a capability with a badge attached.
 ///
-/// arg0 = source slot index (caller's `CSpace`).
+/// arg0 = source capability handle (caller's `CSpace`; generation-checked).
 /// arg1 = rights mask (intersected with the source rights; bits the source lacks are dropped).
 /// arg2 = badge value (must be non-zero; source must have badge == 0).
 ///
@@ -1907,7 +1907,7 @@ unsafe fn resolve_delete_target(
 
 /// `SYS_CAP_DELETE` (31): delete a capability slot.
 ///
-/// arg0 = slot index in the caller's `CSpace.`
+/// arg0 = capability handle in the caller's `CSpace` (generation-checked).
 ///
 /// Reparents any children to the deleted slot's parent (preserving revocability
 /// from the grandparent), unlinks the slot from the derivation tree, clears it,
@@ -2041,7 +2041,7 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_CAP_REVOKE` (15): revoke all capabilities derived from a slot.
 ///
-/// arg0 = slot index in the caller's `CSpace.`
+/// arg0 = capability handle in the caller's `CSpace` (generation-checked).
 ///
 /// Walks and clears the entire descendant subtree of the target slot. The
 /// target slot itself is preserved. For each revoked capability, the kernel

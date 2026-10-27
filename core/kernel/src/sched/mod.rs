@@ -5885,8 +5885,10 @@ pub fn enter() -> !
     use crate::arch::current::trap_frame::TrapFrame;
 
     // Dequeue the highest-priority ready thread (init, at INIT_PRIORITY).
-    // SAFETY: single-threaded boot; BSP scheduler slot exclusively owned; tcb is
-    // validated non-null before dereference; state field is always valid.
+    // SAFETY: no other thread exists yet, and the idle APs reach CPU 0's queue
+    // only through the load balancer, whose imbalance threshold skips a queue that
+    // holds only init; tcb is validated non-null before dereference; state field
+    // is always valid.
     let init_tcb = unsafe {
         let sched = &mut *scheduler_ptr(0);
         let tcb = sched.dequeue_highest();

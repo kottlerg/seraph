@@ -371,6 +371,12 @@ unsafe fn apic_send_icr(dest: u32, cmd: u32)
 {
     if x2apic_enabled()
     {
+        // A WRMSR to an x2APIC register is not serializing (Intel SDM Vol. 3A
+        // § 11.12.3), so without this fence the IPI can reach its target before
+        // the caller's preceding request stores (a shootdown request, the
+        // NMI-backtrace count) are visible there.
+        // SAFETY: the fences only order memory accesses; no state changes.
+        unsafe { core::arch::asm!("mfence", "lfence", options(nostack, preserves_flags)) };
         // SAFETY: IA32_X2APIC_ICR is writable in x2APIC mode; ring 0.
         unsafe { cpu::write_msr(IA32_X2APIC_ICR, (u64::from(dest) << 32) | u64::from(cmd)) };
         return;

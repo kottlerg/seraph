@@ -1415,8 +1415,9 @@ unsafe fn kernel_entry_post_rebase(
         }
 
         // Enqueue init on the BSP scheduler at INIT_PRIORITY.
-        // SAFETY: scheduler initialized in Phase 8; single-threaded boot phase;
-        // BSP scheduler (index 0) exclusively accessed by boot thread.
+        // SAFETY: scheduler initialized in Phase 8. No other thread exists yet,
+        // and the idle APs reach CPU 0's queue only through the load balancer,
+        // whose imbalance threshold skips a queue that holds only init.
         unsafe {
             let sched = sched::scheduler_for(0);
             let linked = sched.enqueue(init_tcb, sched::INIT_PRIORITY);

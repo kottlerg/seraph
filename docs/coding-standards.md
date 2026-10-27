@@ -237,6 +237,25 @@ let value = unsafe { ptr.read() };
 
 ---
 
+### CPU-Count Width
+
+These rules bind the kernel and the bootloader (`core/kernel/`, `core/boot/`) and every in-tree
+crate either one depends on. They keep the CPU count a single definition, `MAX_CPUS`, so a width
+defect is visible in review rather than only in a boot at the boundary CPU counts
+([testing.md](testing.md#coverage-tiers) § Coverage tiers).
+
+- A structure with one entry or one bit per CPU MUST take its width from `MAX_CPUS`: an array
+  `[T; MAX_CPUS]`, a `CpuMask`, or a per-CPU slab the kernel's `alloc_zeroed_slab` sizes at the
+  boot CPU count. A literal (`64`, `256`, or any other) MUST NOT stand in for the CPU count or a
+  CPU-mask width, and a fixed-width integer (`u64`, `u128`) MUST NOT hold a set of CPUs.
+- A CPU index or CPU count MUST NOT be converted with `as` to an integer type that cannot
+  represent `MAX_CPUS` (an `as u8` truncates at 256 CPUs).
+- A fixed-width window an external interface defines (the SBI `hart_mask` and `hart_mask_base`
+  pair) is not a set of CPUs the kernel holds; the code filling it MUST reject or split an index
+  the window cannot hold.
+
+---
+
 ### Cross-Boundary Data Hygiene
 
 Kernel virtual addresses, kernel pointers, and any value derived from one — a

@@ -347,118 +347,159 @@ cells automatically; variants belong to the tiers below.
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
-| Local host runs | developer host, commands below | REQUIRED for PRs touching their trigger paths (code and build configuration that shape the kernel or bootloader image; see Trigger paths below), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
-| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | the riscv64 64- and 65-hart and x86_64 256-vCPU boundaries three times each and the memory variation once, whatever the release's PRs touched |
+| Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count or memory surface (see Boundary surface and Memory surface below), once per PR (see Repeat count and When the runs are owed below) | CPU-count and memory variations CI runners cannot reach |
+| Release host runs | maintainer host, commands below | before each tag, on the commit to be tagged | every boundary below (riscv64 64, 65, and 128 harts; x86_64 256 and 512 vCPUs) and the memory variation, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 65-vCPU guest is a ~16× thread oversubscription and a 512-vCPU guest is
 infeasible there. High `-smp` coverage is local by design, not an
 oversight. The local host runs below are procedurally REQUIRED for PRs
-touching their trigger paths, and the release host runs for each tag —
+that change their surfaces, and the release host runs for each tag —
 binding the same way the
 [pre-merge review](conventions.md#branch-and-pr-workflow) is, with no CI
 surface.
 
-**Trigger paths.** The boundary CPU counts and the memory variation below are owed for a change,
-other than Markdown and comment lines, to the code or build configuration that shapes the kernel or
-bootloader image: any file under `core/kernel/` or `core/boot/` (sources, build scripts, manifests,
-and linker scripts), and any file of an in-tree crate either one depends on, transitively, through a
-normal or build dependency (`cargo metadata` lists them; today `abi/boot-protocol`,
-`abi/init-protocol`, `abi/process-abi`, `abi/syscall`, `shared/elf`, `shared/font`, `shared/mmio`,
-`shared/process-layout`, and `shared/text`), and the build configuration that shapes those images:
-the target specs (`xtask/targets/`), `.cargo/config.toml`, the root `Cargo.toml` (its profiles),
-`rust-toolchain.toml`, and the xtask code the builds run through: `xtask/src/commands/build.rs` and
-every module it imports, transitively, through `crate::` paths (today `accel`, `arch`, `bundle`,
-`cli`, `context`, `disk`, `firmware`, `fs_compat`, `qemu`, `rust_src`, `sysroot`, and `util` under
-`xtask/src/`). The code holds every SMP, per-CPU, IPI, scheduler-wakeup, boot, and memory-init path;
-the build configuration decides how it compiles and boots. A change elsewhere owes none of them. The
-512-vCPU and 128-hart boundaries below are owed in addition to the base runs, for their own trigger
-lists, which lie inside these paths. Every trigger in this section is a file or a directory, which
-triggers as a whole; a parenthetical after a named path gives the reason and does not narrow it. A
-trigger set defined by `git grep -l` is the union of the files the grep lists at the PR head and at
-the head's merge base with `origin/master`, so a change that removes the last match from a file
-still triggers.
+**Inert changes.** A change that alters only the following cannot change behaviour at any CPU count
+or memory size, and owes no local host run, whatever file it is in:
+
+- Markdown, and comment lines in source files, build scripts, and linker scripts;
+- lint attributes: `#[allow(...)]`, `#[expect(...)]`, `#[warn(...)]`, `#[deny(...)]`, their inner
+  `#![...]` forms, and a `#[cfg_attr(<predicate>, <lint attribute>)]`;
+- code compiled only for host tests: a `#[cfg(test)]` module or item, or a `#[test]` function;
+- the deletion of an item nothing names at the PR head outside comments and Markdown
+  (`git grep -w <name> <head>` finds no other use).
+
+A PR whose changes outside Markdown are all inert owes no local host run. The surfaces below are
+judged on the non-inert lines only.
+
+**Boundary surface.** The boundary set below is owed when, and only when, the PR's own diff (see
+When the runs are owed below) makes a non-inert change to the CPU-count surface: the code whose
+behaviour or size depends on how many CPUs boot. The surface is these files as a whole:
+
+- `core/kernel/src/cpu_mask.rs` (the CPU mask type and its width);
+- `core/kernel/src/percpu.rs` (per-CPU data and its slabs);
+- `core/kernel/src/arch/x86_64/ap_trampoline.rs` and `core/kernel/src/arch/riscv64/ap_trampoline.rs`
+  (AP and hart bringup);
+- `core/kernel/src/mm/tlb_shootdown.rs` (the TLB-shootdown broadcast);
+
+and, in any other file, a changed line that names one of these items as a whole identifier, or that
+lies within one's definition (its attributes, signature, fields, or body):
+
+- CPU-count width: `MAX_CPUS`, `CpuMask`, `CPU_MASK_WORDS`;
+- per-CPU arrays and slabs: `alloc_zeroed_slab`, and every type the tree defines that is the element
+  type `T` of a `[T; MAX_CPUS]` or of an `alloc_zeroed_slab::<T>` call
+  (`git grep -n -E 'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists them), since a change to such a
+  type's fields changes the array or slab size;
+- AP and hart bringup: `start_ap`, `sbi_hart_start`, `kernel_entry_ap`, every `init_ap`, and the
+  `init_ap_*` per-CPU storage initialisers;
+- IPI send and receive: `send_wakeup_ipi`, `send_tlb_shootdown_ipi`, `send_init_ipi`, `send_sipi`,
+  `send_nmi_to`, `sbi_send_ipi_to`, `sbi_hart_mask`, `wait_for_ack`, `IpiWaitCtx`, the
+  `IPI_VECTOR_*` constants, the x86_64 `ipi_*` stubs and handlers in `idt.rs`, and the riscv64
+  `handle_software_interrupt`;
+- the TLB-shootdown broadcast: `shootdown`, `shootdown_range`, `service_shootdowns`,
+  `shootdown_remote`, and `needs_remote_shootdown`.
+
+The list is closed: a change anywhere else, however close to the scheduler or the SMP paths, owes no
+boundary run. A PR that adds an item whose behaviour or size depends on the CPU count and that names
+none of the items above MUST add it to this list. The commands below screen a diff for the surface;
+every line they print is a candidate, and it is on the surface when it is not inert and meets the
+definition above. The `@@` header names the top-level item a hunk falls in; a hunk inside a method
+or a nested module shows the `impl` or `mod` line instead, so a hunk in a file that defines a
+listed item is read against that item's span.
 
 ```sh
-# Boundary CPU counts, riscv64 (~70 s per passing run on a 16-core host;
-# the 600 s budget is for HANG classification):
+B=$(git merge-base <head> origin/master)
+git diff --stat "$B" <head> -- core/kernel/src/cpu_mask.rs core/kernel/src/percpu.rs \
+    core/kernel/src/mm/tlb_shootdown.rs 'core/kernel/src/arch/*/ap_trampoline.rs'
+S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|start_ap|sbi_hart_start|kernel_entry_ap'
+S="$S|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdown|init)_ipi|send_sipi|send_nmi_to"
+S="$S|sbi_send_ipi_to|sbi_hart_mask|wait_for_ack|IpiWaitCtx|IPI_VECTOR_[A-Z_]+"
+S="$S|ipi_[a-z_]+_(stub|handler)|handle_software_interrupt|shootdown(_range|_remote)?"
+S="$S|service_shootdowns|needs_remote_shootdown"
+git diff -U0 "$B" <head> -- . ':(exclude)*.md' | grep -E '^(@@|[-+][^-+])' | grep -w -E "$S"
+```
+
+The boundary set is every boundary CPU count below, each once (`--runs 1`, raised only as Repeat
+count says): riscv64 64, 65, and 128 harts, and x86_64 256 and 512 vCPUs.
+
+```sh
+# Boundary CPU counts, riscv64 (the 64- and 65-hart runs take ~70 s each
+# on a 16-core host, the 128-hart run ~475 s at 8x hart oversubscription;
+# the 600 s and 1800 s budgets are for HANG classification):
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64
 cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeout 600
 cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 1 --timeout 600
+cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800
 
-# Boundary CPU counts, x86_64 (~330 s per passing run on a 16-core KVM
-# host — boot is seconds, but the stress tier runs at 16x vCPU
-# oversubscription; the 900 s budget is for HANG classification):
+# Boundary CPU counts, x86_64 (the 256-vCPU run takes ~330 s on a 16-core
+# KVM host: boot is seconds, but the stress tier runs at 16x vCPU
+# oversubscription. The 512-vCPU run, the MAX_CPUS boundary, takes ~16 min
+# at 32x oversubscription, dominated by AP bringup and the broadcast/IPI
+# stress tests. The 900 s and 3600 s budgets are for HANG classification):
 cargo xtask build
 cargo xtask compose-bundle --harness ktest
 cargo xtask run-parallel --arch x86_64 --cpus 256 --parallel 1 --runs 1 --timeout 900
+cargo xtask run-parallel --arch x86_64 --cpus 512 --parallel 1 --runs 1 --timeout 3600
+```
+
+The 65-hart run is the first count past a 64-bit word; the 128-hart run is the count at which
+hart-scaled firmware allocations once collided with the kernel image's load address
+([#377](https://github.com/kottlerg/seraph/issues/377)); the 512-vCPU run is `MAX_CPUS`.
+
+**Memory surface.** The memory variation below is owed when, and only when, the PR's own diff makes
+a non-inert change to the code sized by the guest's RAM: `core/kernel/src/mm/buddy.rs` and
+`core/kernel/src/mm/init.rs` as a whole, and, in any other file, a changed line that names, or lies
+within the definition of, `translate_memory_map`, `drain_and_install_seed`, or
+`INIT_INFO_MAX_PAGES`. The screen works as the boundary one does:
+
+```sh
+git diff --stat "$B" <head> -- core/kernel/src/mm/buddy.rs core/kernel/src/mm/init.rs
+git diff -U0 "$B" <head> -- . ':(exclude)*.md' | grep -E '^(@@|[-+][^-+])' \
+    | grep -w -E 'translate_memory_map|drain_and_install_seed|INIT_INFO_MAX_PAGES'
 
 # Memory variation (either arch):
 cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1 --timeout 300
 ```
 
-**Repeat count.** The boundary commands above run once (`--runs 1`). A PR that changes code in the
-scheduling, wake, and cross-CPU signalling mechanisms — `core/kernel/src/sched/`,
-`core/kernel/src/ipc/`, `core/kernel/src/sync.rs`, `core/kernel/src/percpu.rs`,
-`core/kernel/src/cpu_mask.rs`, `core/kernel/src/syscall/thread.rs`, `core/kernel/src/syscall/mod.rs`
-(the sleep park and its withdrawal), `core/kernel/src/mm/tlb_shootdown.rs`, the arch interrupt, IDT,
-timer, context-handoff, and halt modules (`core/kernel/src/arch/*/interrupts.rs`, `idt.rs`, which
-routes the IPI vectors, `timer.rs`, `context.rs`, and `cpu.rs`), or any other kernel file that holds
-a wake site (one that `git grep -l -E 'enqueue_and_wake|wake_in_flight' core/kernel/src` lists) —
-MUST run the riscv64 64- and 65-hart and the x86_64 256-vCPU boundaries three times each
-(`--runs 3`): a race in those mechanisms can fail rarely enough that one run misses it. The memory
-variation and the narrower boundaries below run once.
-
-PRs touching the surfaces that only matter above 256 CPUs — `core/kernel/src/mm/`, x86_64 AP bringup
-and the APIC/IPI paths (`core/kernel/src/arch/x86_64/ap_trampoline.rs`, `gdt.rs`, `idt.rs`, which
-holds the IPI receive stubs, and `interrupts.rs`), or per-CPU slab sizing (every file that
-`git grep -l alloc_zeroed_slab core/kernel/src` lists, which defines `sched::alloc_zeroed_slab` or
-calls it) — MUST also run the full-width x86_64 boundary below. This trigger list is deliberately
-narrow; other SMP PRs stay on the 256-vCPU mandate above.
-
-```sh
-# MAX_CPUS boundary, x86_64 (~16 min per passing run measured on a 16-core KVM
-# host at 32x vCPU oversubscription, down from ~105 min before #380 made
-# thread_set_priority's locate-and-relocate O(1) in the common case; the
-# residual is dominated by 512-vCPU AP bringup and the broadcast/IPI stress
-# tests, not the priority walk. The 3600 s budget is for HANG classification):
-cargo xtask run-parallel --arch x86_64 --cpus 512 --parallel 1 --runs 1 --timeout 3600
-```
-
-PRs touching the bootloader's kernel-placement path — `core/boot/src/elf.rs` (kernel ELF span
-allocation) and the ELF parser it uses (`shared/elf/`), `core/boot/src/uefi.rs` (UEFI page
-allocation), or the boot page-table builders (`core/boot/src/paging.rs`,
-`core/boot/src/arch/*/paging.rs`) — MUST also run the riscv64 128-hart boundary below. It is the
-riscv64 analogue of the full-width x86_64 run: the hart count at which hart-scaled firmware
-allocations once collided with the kernel image's load address
-([#377](https://github.com/kottlerg/seraph/issues/377)). This trigger list is deliberately narrow;
-other SMP PRs stay on the 64/65-hart mandate above.
-
-```sh
-# Kernel-placement boundary, riscv64 (~475 s per passing run measured at 8x hart
-# oversubscription on a 16-core host; the 1800 s budget is for HANG
-# classification):
-cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800
-```
+**Repeat count.** Every owed run runs once (`--runs 1`). A PR whose body states that its purpose is
+the fix of a concurrency defect in the scheduling, wake, or cross-CPU signalling mechanisms owes the
+riscv64 64- and 65-hart and the x86_64 256-vCPU boundaries three times each (`--runs 3`), whether or
+not its diff changes the CPU-count surface: a race in those mechanisms can fail rarely enough that
+one run misses it. Its other owed runs stay at `--runs 1`. A change to those mechanisms' files
+without that stated purpose does not raise the count.
 
 **When the runs are owed.** Each local host run a PR owes MUST pass, at its repeat count, at one
-head that covers the merge head. A run at head H covers a later head M when the PR's own diff on
-that run's trigger paths is the same at H and at M, Markdown and comment lines aside. The PR's own
-diff at a head is the diff from that head's merge base with the fetched `master` to the head (after
-`git fetch origin`, `git diff $(git merge-base <head> origin/master) <head> -- <paths>`), so it
-excludes what a merge or rebase from `master` brings in. An update from `master` that leaves the
-PR's own diff on the trigger paths unchanged therefore owes no run; one whose conflict resolution
-changes it does. A fix round that changes the PR's own code on a trigger path breaks the coverage of
-the runs that path triggers, and those runs MUST be run again at a head after it. The PR body MUST
-report each run it owes with its `--runs` count and the head it ran at, or state that none is owed
-and why.
+head that covers the merge head. The PR's own diff at a head is the diff from that head's merge base
+with the fetched `master` to the head (after `git fetch origin`,
+`git diff $(git merge-base <head> origin/master) <head>`), so it excludes what a merge or rebase
+from `master` brings in. A run at head H covers a later head M when the PR's own diff makes the same
+non-inert changes to that run's surface at H and at M; for the runs the concurrency-fix purpose
+owes, that surface is every non-inert line of the PR's own diff. An update from `master` that leaves
+those changes as they were therefore owes no run; one whose conflict resolution alters them does. A
+fix round that alters them breaks the coverage of the runs that surface owes, and those runs MUST be
+run again at a head after it. The PR body MUST report each run it owes with its `--runs` count and
+the head it ran at, or state that none is owed and why (that its non-inert lines change neither
+surface, or that its changes outside Markdown are all inert).
+
+**Hangs at oversubscription.** A boundary run that HANGs (outlives its `--timeout` budget), or
+fails with a defect an open Issue for that boundary already names, on a PR whose own diff makes no
+non-inert change to the CPU-count surface is not the PR's defect: the preserved log is recorded on
+the open Issue for that boundary (today [#421](https://github.com/kottlerg/seraph/issues/421) for
+the x86_64 high-smp budget overruns and [#455](https://github.com/kottlerg/seraph/issues/455) for
+the 512-vCPU IPI watchdog), or on a new Issue when that boundary has none, and the run does not
+block the PR. The PR body reports such a
+run as HANG or FAIL with a link to that record. Any other failure, and any HANG or failure on a PR
+whose diff changes the surface, blocks the PR.
 
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
-4), the maintainer MUST run the riscv64 64- and 65-hart and the x86_64 256-vCPU
-boundaries three times each (`--runs 3`) and the memory variation once, on the
-commit to be tagged. A failure blocks the tag and MUST be filed as an Issue.
+4), the maintainer MUST run, on the commit to be tagged, the riscv64 64- and
+65-hart and the x86_64 256-vCPU boundaries three times each (`--runs 3`), the
+riscv64 128-hart and the x86_64 512-vCPU boundaries once each, and the memory
+variation once, so every tag boots at every CPU count the project supports. A
+failure blocks the tag, MUST be filed as an Issue, and is bisected over the
+release's PRs.
 
 **Documentation-only and comment-only changes.** A diff that, Markdown
 aside, alters only comment lines in source files cannot change program

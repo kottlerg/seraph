@@ -398,17 +398,17 @@ image's version variables and a hash of the script), and downloads nothing
 when the entry exists. A download whose fetch from the image's apt mirror
 fails or exceeds 120 s rewrites the apt sources, the image's
 `/etc/apt/apt-mirrors.txt` mirror list included, from
-`azure.archive.ubuntu.com` to `archive.ubuntu.com` and retries once. Each
-booting cell restores the entry by the key the job outputs and installs from
-it with apt's sources disabled, so it fetches nothing. When that offline
-install fails, as when the entry is absent or the set does not resolve
-against the cell's image, the cell runs the same bounded download itself
-and installs offline from it. When the `qemu-debs` job fails, the booting
-cells are skipped and the run fails. An entry saved on `master` is readable
-from every branch and tag, so both workflows and later runs share one entry
-per key. The pin, the install list and the cache key move together: the key
-derives from the image version and the script, so a change to the list, the
-flags or the pinned image yields a new entry.
+`azure.archive.ubuntu.com` to `archive.ubuntu.com` and retries once, bounded
+at 1200 s. Each booting cell restores the entry by the key the job outputs
+and installs from it with apt's sources disabled, so it fetches nothing.
+When that offline install fails, as when the entry is absent or the set does
+not resolve against the cell's image, the cell runs the same bounded
+download itself and installs offline from it. When the `qemu-debs` job
+fails, the booting cells are skipped and the run fails. An entry saved on
+`master` is readable from every branch and tag, so both workflows and later
+runs share one entry per key. The pin, the install list and the cache key
+move together: the key derives from the image version and the script, so a
+change to the list, the flags or the pinned image yields a new entry.
 
 The `build-image` job of `release.yml` boots nothing (its one `cargo xtask`
 command is `build`), so it installs no QEMU and runs on `ubuntu-latest`.

@@ -24,7 +24,7 @@ download()
     # Download-only under the timeout: killing apt mid-dpkg would leave the
     # package database half-configured.
     if ! sudo timeout 120 sh -c "$fetch"; then
-        echo "::warning::apt fetch from the image's mirror failed or exceeded 120 s; retrying on archive.ubuntu.com"
+        echo "::warning::mirror fetch failed or exceeded 120 s; retrying on archive.ubuntu.com"
         sudo grep -rlI 'azure\.archive\.ubuntu\.com' /etc/apt |
             xargs -r sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g'
         sudo timeout 1200 sh -c "$fetch"

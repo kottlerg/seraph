@@ -287,7 +287,8 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Like [`sys_exit`], this stops only the calling thread; sibling threads and
 /// the process's resources are torn down by procmgr (see
-/// docs/process-lifecycle.md § Process Death, including the #443 gaps).
+/// docs/process-lifecycle.md § Process Death, including the #501 and
+/// #502 gaps).
 #[cfg(not(test))]
 // cast_possible_truncation: arg0 carries a u32 exit code zero-extended to u64
 // by the `process_exit` wrapper; truncating back to u32 is the intended decode.
@@ -759,7 +760,7 @@ pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBl
 /// race, they do not close it), and nothing pins the object the slot names
 /// past the lookup, so a caller that dereferences the object across a point
 /// where another thread may delete its last capability reads freed memory
-/// (#443 § Unpinned capability lookup).
+/// (#502).
 #[cfg(not(test))]
 pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     cspace: *mut crate::cap::cspace::CSpace,
@@ -804,7 +805,7 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     // The unlocked tag/generation checks above narrow, but cannot close, the
     // race against this slot being freed or recycled concurrently.
     // `lookup_cap` takes no reference on the object, so it is not pinned while
-    // the caller uses it (#443; see core/kernel/docs/capability-internals.md
+    // the caller uses it (#502; see core/kernel/docs/capability-internals.md
     // § Storage: Hybrid Two-Level Radix).
     Ok(unsafe { &*(slot as *const _) })
 }

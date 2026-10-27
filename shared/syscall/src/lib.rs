@@ -2266,7 +2266,7 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 /// the thread is restarted, unless its wake was claimed first, or a timed
 /// wait or sleep that found the kernel's sleep list full withdrew itself
 /// first (it then returns its timeout or `OutOfMemory`). The kernel's
-/// known exceptions (#443) are listed in `core/kernel/docs/syscalls.md`
+/// known exceptions (#501) are listed in `core/kernel/docs/syscalls.md`
 /// § `SYS_THREAD_STOP`. A thread may stop itself (pass its own thread cap).
 ///
 /// # Errors
@@ -2318,10 +2318,10 @@ pub fn thread_set_priority(thread_cap: u32, priority: u8, sched_cap: u32) -> Res
 /// Running thread on another CPU is sent a reschedule IPI and moves at its
 /// next `schedule()` entry (worst case one time slice later); a blocked,
 /// stopped, or not-yet-started thread observes the new affinity on its next
-/// wake.
+/// enqueue (a wake, or `SYS_THREAD_START` on start or resume).
 ///
 /// See `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_AFFINITY` for known
-/// defects (#443).
+/// defects (#443, #502).
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` if the thread cap

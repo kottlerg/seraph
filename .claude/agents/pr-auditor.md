@@ -117,8 +117,9 @@ claims.
    (`git diff $(git merge-base <head> origin/master) <head>`, Markdown and
    comment lines aside; the parent fetches `origin` before the run, so read
    `origin/master` as it is), derive the runs owed and their repeat counts.
-   A behaviour-neutral change owes no run; the body MUST name each such
-   change and the category from that paragraph that makes it owe no run,
+   A behaviour-neutral change on a trigger path owes no run; the body MUST
+   name each such change and the category from that paragraph that makes
+   it owe no run,
    and the diff MUST bear that category out. The body's `## Validation`
    MUST report each owed run with its `--runs` count and the head it ran
    at, and the PR's own diff on that run's trigger paths MUST be the same

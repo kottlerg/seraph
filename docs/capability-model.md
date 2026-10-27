@@ -510,7 +510,7 @@ hazard. See [capability-internals.md](../core/kernel/docs/capability-internals.m
 so the object is not pinned while a holder's syscall still dereferences it — a known kernel
 memory-safety defect (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
-§ Storage: Hybrid Two-Level Radix, [#443](https://github.com/kottlerg/seraph/issues/443)).
+§ Storage: Hybrid Two-Level Radix, [#502](https://github.com/kottlerg/seraph/issues/502)).
 
 
 ---
@@ -692,7 +692,8 @@ before the object's storage is reclaimed, wherever those threads' own capabiliti
 including the deleting thread itself, when it holds that last capability to its own `CSpace` or
 `AddressSpace` (the delete then never returns to it). The process's resources are reclaimed as their
 capability reference counts reach zero. This path has known kernel memory-safety gaps, tracked in
-[#443](https://github.com/kottlerg/seraph/issues/443) (see
+[#501](https://github.com/kottlerg/seraph/issues/501) and
+[#502](https://github.com/kottlerg/seraph/issues/502) (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
 § Storage: Hybrid Two-Level Radix,
 [thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)

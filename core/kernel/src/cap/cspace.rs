@@ -170,7 +170,7 @@ const _: () = assert!(core::mem::size_of::<CSpaceDirPage>() == crate::mm::PAGE_S
 /// directory and leaf pointers are write-once and Release-published by
 /// [`grow`][Self::grow], so [`slot`][Self::slot] serves lock-free readers
 /// (`lookup_cap`, `cap_info`). `lookup_cap` takes no reference on the object,
-/// a known defect (#443). The full contract is in
+/// a known defect (#502). The full contract is in
 /// core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level Radix.
 pub struct CSpace
 {

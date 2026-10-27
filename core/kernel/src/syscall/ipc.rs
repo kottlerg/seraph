@@ -576,7 +576,7 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: ep_state was a live Endpoint at lookup, but `lookup_cap` takes
     // no reference, so the endpoint is not pinned across endpoint_call
     // (core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
-    // Radix, #443); tcb is the running thread (current_tcb above); no
+    // Radix, #502); tcb is the running thread (current_tcb above); no
     // scheduler lock and no ep.lock held.
     let result = unsafe {
         crate::ipc::endpoint::endpoint_call(
@@ -765,7 +765,7 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: ep_state was a live Endpoint at lookup, but `lookup_cap` takes
     // no reference, so the endpoint is not pinned across endpoint_recv
     // (core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
-    // Radix, #443); tcb is the running thread (current_tcb above); no
+    // Radix, #502); tcb is the running thread (current_tcb above); no
     // scheduler lock and no ep.lock held.
     let result = unsafe { crate::ipc::endpoint::endpoint_recv(ep_state, tcb) };
 
@@ -1930,7 +1930,7 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // resolved without pinning it, so a concurrent delete or ancestor revoke
     // can release it mid-call and this dec_ref can then drain the refcount
     // to zero; the debug_assert catches that, and the source is not
-    // reclaimed (known defect, #443; core/kernel/docs/ipc-internals.md
+    // reclaimed (known defect, #502; core/kernel/docs/ipc-internals.md
     // § Wait Set Add/Remove).
     //
     // SAFETY: source_ptr extracted from validated cap.

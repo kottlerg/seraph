@@ -608,7 +608,7 @@ The syscall writes `cpu_affinity`, and reads `preferred_cpu` and `state`, withou
 `sched_lock`, so those accesses race other CPUs' scheduler paths
 ([#443](https://github.com/kottlerg/seraph/issues/443)). `lookup_cap` does not pin the target
 Thread (see [capability-internals.md](capability-internals.md) § Storage: Hybrid Two-Level Radix
-and [#443](https://github.com/kottlerg/seraph/issues/443)). The outcomes above hold only absent
+and [#502](https://github.com/kottlerg/seraph/issues/502)). The outcomes above hold only absent
 those hazards.
 
 ### Soft Affinity

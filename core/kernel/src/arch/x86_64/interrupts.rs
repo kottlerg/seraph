@@ -748,7 +748,7 @@ pub fn unmask(_irq: u32) {}
 /// masked at the I/O APIC. The driver unmasks via `SYS_IRQ_ACK` once it has
 /// registered a handler.
 ///
-/// Known defect (#443): neither this function nor `sys_irq_register` checks
+/// Known defect (#500): neither this function nor `sys_irq_register` checks
 /// `irq` against the stubbed range. Only GSIs 0-22 (vectors 33-55) have IDT
 /// gates; GSIs 23-216 and 219-221 route to vectors with no gate, GSIs 217, 218
 /// and 222 land on the TLB-shootdown, wakeup and spurious vectors, and from GSI
@@ -758,7 +758,7 @@ pub fn unmask(_irq: u32) {}
 /// # Safety
 /// Must be called after Phase 5 init (IOAPIC initialised) with a valid GSI.
 // cast_possible_truncation: a GSI is < 256 (`ROOT_IRQ_COUNT`), so `irq as u8` is exact; the
-// vector add that follows is unchecked (#443, see above).
+// vector add that follows is unchecked (#500, see above).
 #[allow(clippy::cast_possible_truncation)]
 #[cfg(not(test))]
 pub unsafe fn route_device_irq(irq: u32)

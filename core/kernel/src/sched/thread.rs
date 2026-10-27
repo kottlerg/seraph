@@ -372,9 +372,10 @@ pub unsafe fn consume_park_interrupted(tcb: *mut ThreadControlBlock) -> bool
 /// `run_queue_next`, `ipc_wait_next` and `ipc_wait_prev` are raw intrusive
 /// pointers, valid only while the TCB is linked on a run queue or an IPC wait
 /// queue respectively. `run_queue_next` is run-queue list structure, written
-/// only under the linking CPU's `PerCpuScheduler.lock`, the one lock held on
-/// every write (a neighbour's link and `schedule()`'s dequeue of the next
-/// thread do not hold that TCB's `sched_lock`). `ipc_wait_next`,
+/// after boot only under the linking CPU's `PerCpuScheduler.lock`, the one lock
+/// held on every such write (a neighbour's link and `schedule()`'s dequeue of
+/// the next thread do not hold that TCB's `sched_lock`); boot's link and
+/// dequeue of init run single-threaded and hold neither. `ipc_wait_next`,
 /// `ipc_wait_prev` and the `ipc_wait_queue` tag are written under the lock of
 /// the IPC source whose queue links the TCB. Any source-lock holder may read
 /// the tag to test membership in its own queue (see

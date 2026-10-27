@@ -692,7 +692,7 @@ handler resolves the caller's source capability without pinning it (see
 so a concurrent delete or ancestor revoke can release that capability mid-call.
 This `dec_ref` can then drain the refcount to zero: a debug build asserts, and the
 source is not reclaimed. This is a known defect tracked in
-[#443](https://github.com/kottlerg/seraph/issues/443).
+[#502](https://github.com/kottlerg/seraph/issues/502).
 
 When the wait set itself is dropped (last cap released), `wait_set_drop`
 clears every member's back-pointer and `dec_ref`s each source's header; any

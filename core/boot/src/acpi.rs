@@ -649,7 +649,7 @@ pub(crate) const MADT_TYPE_LAPIC_OVERRIDE: u8 = 5;
 /// - Each MCFG ECAM window, plus a 32-bit and 64-bit PCI MMIO aperture
 ///   placed by a QEMU q35 / virt layout heuristic (ECAM-base-dependent).
 ///   The heuristic windows are not bounded by the memory map and can cover
-///   RAM (defect, #442).
+///   RAM (defect, #499).
 /// - The arch's platform defaults from
 ///   `crate::arch::current::default_pci_apertures` (empty on x86-64),
 ///   appended once the RSDP and XSDT validate.
@@ -816,7 +816,7 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
                     // window covers RAM once a guest has more than about
                     // 14 GiB. The `Mmio` cap init receives over such a
                     // window grants MAP and WRITE on that RAM, kernel-owned
-                    // frames included (defect, #442).
+                    // frames included (defect, #499).
                     let (lo_base, lo_size) = if base < 0x8000_0000
                     {
                         (0x4000_0000u64, 0x4000_0000u64)
@@ -863,7 +863,7 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
     // `derive_mmio_apertures`'s merge pass. Like the MCFG heuristic
     // windows, the defaults are not bounded by the memory map: the riscv64
     // 64-bit window `[16 GiB, 32 GiB)` covers RAM on a virt guest with
-    // more than about 14 GiB (defect, #442).
+    // more than about 14 GiB (defect, #499).
     for &(base, size) in crate::arch::current::default_pci_apertures()
     {
         push!(base, size);

@@ -875,7 +875,8 @@ Registry). **The stop includes the caller**: a thread deleting the last capabili
 `CSpace` or `AddressSpace` — directly, or because the deleted object's teardown cascades into it —
 is stopped by that delete and the call does not return; the object is reclaimed once the thread is
 off its CPU. This path has known kernel memory-safety gaps, tracked in
-[#443](https://github.com/kottlerg/seraph/issues/443) (see
+[#501](https://github.com/kottlerg/seraph/issues/501) and
+[#502](https://github.com/kottlerg/seraph/issues/502) (see
 [capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage: Hybrid
 Two-Level Radix and
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
@@ -1254,7 +1255,7 @@ as a waiter (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) 
 Cross-CPU Stop Protocol). This does not hold for a stop of a thread waiting on an endpoint (queued
 to send or receive), a notification, an event queue, or a wait set whose last capability is deleted
 concurrently: the cancel can lock the object after it is freed
-([#443](https://github.com/kottlerg/seraph/issues/443) § Source pointer held past its free). A
+([#501](https://github.com/kottlerg/seraph/issues/501)). A
 thread running on another CPU is marked `Stopped` under every CPU's scheduler lock, and the call
 returns once that CPU has descheduled it and published its register save, at its next slice expiry
 or the thread's own park or yield, or once an object teardown has committed `Exited` over it; the
@@ -1440,7 +1441,8 @@ target's `sched_lock`, so those accesses race other CPUs' scheduler paths, and t
 is not pinned for the call
 ([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage:
 Hybrid Two-Level Radix); the outcomes above hold only when neither race occurs (defects tracked in
-[#443](https://github.com/kottlerg/seraph/issues/443)).
+[#443](https://github.com/kottlerg/seraph/issues/443) and
+[#502](https://github.com/kottlerg/seraph/issues/502)).
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
@@ -1560,7 +1562,7 @@ or thread destruction releases it (see [fault-handling.md](../../../docs/fault-h
 Liveness). These reference and release statements hold only absent a race: the target Thread and
 the endpoint are not pinned for the call
 ([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage:
-Hybrid Two-Level Radix, [#443](https://github.com/kottlerg/seraph/issues/443)). Binding requires
+Hybrid Two-Level Radix, [#502](https://github.com/kottlerg/seraph/issues/502)). Binding requires
 only a valid `Endpoint` cap — `Control` on the thread is the authority; the endpoint cap merely
 names where the thread's faults are delivered. The kernel synthesizes fault delivery via the
 binding and distributes no send capability to the endpoint, so a handler that hands out no `SEND`

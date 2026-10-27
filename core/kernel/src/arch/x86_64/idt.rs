@@ -368,8 +368,9 @@ macro_rules! paranoid_exit_asm {
 ///
 /// If the fault originated in userspace (CPL != 0), the faulting thread is
 /// terminated and a death notification is posted (if bound). If the fault
-/// originated in the kernel, or is `#DF` or `#MC` from either ring,
-/// diagnostics are printed and the system halts.
+/// originated in the kernel, or is a hardware NMI, `#DF`, or `#MC` from either
+/// ring, diagnostics are printed and this CPU halts (`fatal`); the interrupted
+/// thread is not killed, and the other CPUs keep running.
 ///
 /// # Safety
 /// `tf` must point to a valid user-or-kernel [`TrapFrame`] on the current kernel
@@ -400,11 +401,13 @@ pub(super) unsafe extern "C" fn common_exception_handler(
         0
     };
 
-    // Check if the fault came from userspace (CPL 3) or kernel (CPL 0). #DF
-    // and #MC are aborts that halt the system whatever ring they interrupted:
-    // a machine check leaves MCG_STATUS.MCIP set (nothing here reads or
-    // clears it), and a second one while it is set shuts the processor down.
-    let is_userspace = (f.cs & 3) != 0 && vector != 8 && vector != 18;
+    // Check if the fault came from userspace (CPL 3) or kernel (CPL 0). A
+    // hardware NMI, #DF, and #MC take the fatal path whatever ring they
+    // interrupted: none is the interrupted thread's own fault to kill it for, a
+    // machine check leaves MCG_STATUS.MCIP set (nothing here reads or clears
+    // it, and a second one while it is set shuts the processor down), and each
+    // runs on an IST stack that the kill path's reschedule cannot leave.
+    let is_userspace = (f.cs & 3) != 0 && !matches!(vector, 2 | 8 | 18);
 
     // Disable interrupts before printing to prevent serial interleaving.
     // SAFETY: ring 0 context; this is a crash path.
@@ -509,7 +512,16 @@ pub(super) unsafe extern "C" fn common_exception_handler(
         crate::kprintln!("  rip={:#018x}  cr2={:#018x}", f.rip, cr2);
         crate::kprintln!("  cs={:#x}  rflags={:#018x}", f.cs, f.rflags,);
         dump_x86_regs_console(f);
-        fatal("unhandled kernel exception");
+        fatal(
+            if (f.cs & 3) != 0
+            {
+                "hardware NMI or abort taken from ring 3"
+            }
+            else
+            {
+                "unhandled kernel exception"
+            },
+        );
     }
 }
 
@@ -546,8 +558,8 @@ extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64
     }
     // #DF (8) and #MC (18) are non-restartable aborts; both run on the IST1 stack,
     // which is not re-entrant across the reschedule a redirect performs. They are
-    // never delivered to a fault handler, and common_exception_handler halts the
-    // system for both whatever ring they interrupted.
+    // never delivered to a fault handler, and common_exception_handler halts this
+    // CPU for both, whatever ring they interrupted.
     let redirectable = vector != 8 && vector != 18;
     if from_user && redirectable
     {
@@ -569,7 +581,8 @@ extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64
         }
     }
 
-    // Not resumed by a handler — kill (userspace) or fatal (kernel).
+    // Not resumed by a handler — kill (userspace) or fatal (kernel, or #DF/#MC
+    // from either ring).
     // SAFETY: tf valid; common_exception_handler never returns.
     unsafe {
         common_exception_handler(tf.cast_const(), vector, error_code);
@@ -1687,9 +1700,9 @@ pub unsafe fn init()
     set(15, isr15, 0);
     set(16, isr16, 0);
     set(17, isr17, 0);
-    // #MC shares IST1 with #DF: both halt the system from either ring, and an
-    // IST stack keeps a machine check in the SYSCALL entry window off the user
-    // RSP.
+    // #MC shares IST1 with #DF: both halt the faulting CPU from either ring,
+    // and an IST stack keeps a machine check in the SYSCALL entry window off
+    // the user RSP.
     set(18, isr18, 1);
     set(19, isr19, 0);
     set(20, isr20, 0);

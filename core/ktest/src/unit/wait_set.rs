@@ -43,8 +43,9 @@ const BIT_OK: u64 = 1 << 1;
 const BIT_BAD: u64 = 1 << 2;
 const WAITER_SHIFT: u32 = 3;
 const OCCUPIED_BADGE: u64 = 9;
-/// After the refusal, how long to look for a wake it wrongly caused. A wrong
-/// wake arriving later is missed (the check fails closed: never a false FAIL).
+/// After the refusal, how long to look for a wake it wrongly caused, so that
+/// such a wake fails under its own message; a wrong wake after this window
+/// still fails the final badge check.
 const SETTLE_SLEEP_MS: u64 = 20;
 /// Bound on each report.
 const REPORT_MS: u64 = 1000;

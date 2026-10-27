@@ -105,7 +105,7 @@ can free it directly. For a same-object derivation, as in the kill-process patte
 following the revoke that frees the object: a revoke keeps its target capability, so it never frees
 the target's own object, though it can free a descendant's. That a handler can dereference an
 object freed under it is a known kernel memory-safety defect tracked in
-[#443](https://github.com/kottlerg/seraph/issues/443).
+[#502](https://github.com/kottlerg/seraph/issues/502).
 
 **Slot 0** is always null. The leaf covering slot 0 exists once the CSpace
 has grown, but the slot is permanently locked to the null capability,
@@ -589,7 +589,8 @@ stopped — it deleted the last capability to its own `CSpace`, or a concurrent 
 nothing below runs now: the object is queued for off-CPU reclaim and the whole arm re-runs from the
 deferred drain once the thread has been scheduled away. The same discipline applies to an
 `AddressSpace` reaching refcount zero. This path has known kernel memory-safety gaps, tracked in
-[#443](https://github.com/kottlerg/seraph/issues/443) (see
+[#501](https://github.com/kottlerg/seraph/issues/501) and
+[#502](https://github.com/kottlerg/seraph/issues/502) (see
 [§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix),
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
 § `dealloc_object(Thread)` Drain Protocol, step 11, and
@@ -769,7 +770,7 @@ recycle slot indices, that freed index would then alias an unrelated live object
 
 Per-slot generation handles keep a stale handle from aliasing a recycled slot after a
 cross-`CSpace` revoke. A syscall already in flight on the object is not covered
-([#443](https://github.com/kottlerg/seraph/issues/443); see
+([#502](https://github.com/kottlerg/seraph/issues/502); see
 [§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix)). Both forms
 of cross-`CSpace` sharing keep a derivation edge across the boundary:
 
@@ -897,8 +898,9 @@ already waiting, in `SYS_IPC_RECV` when the caller is, or in kernel fault delive
 delivery, or by `swap(null)` in `fail_reply_and_wake_caller` on its transfer-failure path), at the
 thread's next `SYS_IPC_RECV` that passes its capability check and cap-slot pre-allocation, which
 releases the unreplied caller, when a stop (`cancel_ipc_block`) or a teardown claims the bound
-caller, or when the rendezvous is rolled back because the caller's park commit was refused
-(`rollback_uncommitted_call`) (see
+caller, or when the rendezvous is rolled back because the caller's park or rebind commit was
+refused (`rollback_uncommitted_call` in `endpoint_call`, or the rebind rollback in
+`endpoint_recv`) (see
 [ipc-internals.md](ipc-internals.md) § Call Path (Sender), § Receive Path (Server), and § Reply
 Path, and
 [thread-lifecycle-and-sleep.md § BlockedOnReply Edge — Symmetry Rules](thread-lifecycle-and-sleep.md#blockedonreply-edge--symmetry-rules)).

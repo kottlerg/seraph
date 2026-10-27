@@ -404,7 +404,8 @@ A process dies when:
 - An unhandled fault terminates its threads.
 
 The kill-process pattern and the `CSpace`/`AddressSpace` teardown have known kernel memory-safety
-gaps, tracked in [#443](https://github.com/kottlerg/seraph/issues/443) (see
+gaps, tracked in [#501](https://github.com/kottlerg/seraph/issues/501) and
+[#502](https://github.com/kottlerg/seraph/issues/502) (see
 [Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
 § Storage: Hybrid Two-Level Radix,
 [thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
@@ -434,8 +435,8 @@ for terminal faults), because doing so on every clean exit would dereference the
 procmgr had already been woken to reap it. The kernel only *notifies*; it does not enumerate or stop
 sibling threads at that point — they are stopped when procmgr's cap-revoke teardown below deletes
 the process's `CSpace` (every thread bound to it is stopped before its storage is reclaimed,
-wherever their thread caps are held, subject to the #443 gaps stated above) and reaped through
-their own thread caps.
+wherever their thread caps are held, subject to the #501 and #502 gaps stated above) and reaped
+through their own thread caps.
 `ExitStatus::success()`/`code()` decode the reason on the consumer side. This is a Seraph-native
 encoding, not POSIX: codes are not 8-bit `WEXITSTATUS`-truncated and faults are native fault
 classes, not signals. See [`core/kernel/docs/syscalls.md`](../core/kernel/docs/syscalls.md) §

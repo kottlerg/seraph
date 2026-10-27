@@ -312,7 +312,7 @@ unsafe fn commit_stopped(
 /// (a timed wait or sleep that found the sleep list full) claimed it first.
 /// This does not hold when the target waits on an endpoint, notification,
 /// event queue, or wait set whose last capability is deleted concurrently
-/// (same section, #443). A thread may stop itself (arg0 refers to the calling
+/// (same section, #501). A thread may stop itself (arg0 refers to the calling
 /// thread).
 ///
 /// Returns 0 on success.
@@ -787,8 +787,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 #[allow(clippy::cast_ptr_alignment)]
                 let ep = blocked_on.cast::<EndpointState>();
                 // SAFETY: blocked_on was the snapshotted binding to an EndpointState;
-                // nothing pins the source across the snapshot, a gap
-                // #443 § Source pointer held past its free records.
+                // nothing pins the source across the snapshot, a gap #501 records.
                 unsafe {
                     let saved = (*ep).lock.lock_raw();
                     unlinked = same_park(tcb)
@@ -852,8 +851,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 #[allow(clippy::cast_ptr_alignment)]
                 let ep = blocked_on.cast::<EndpointState>();
                 // SAFETY: blocked_on was the snapshotted binding to an EndpointState;
-                // nothing pins the source across the snapshot, a gap
-                // #443 § Source pointer held past its free records.
+                // nothing pins the source across the snapshot, a gap #501 records.
                 unsafe {
                     let saved = (*ep).lock.lock_raw();
                     // Claim = the recv-queue unlink under ep.lock (endpoint_call
@@ -991,8 +989,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 #[allow(clippy::cast_ptr_alignment)]
                 let sig = blocked_on.cast::<NotificationState>();
                 // SAFETY: blocked_on was the snapshotted binding to a NotificationState;
-                // nothing pins the source across the snapshot, a gap
-                // #443 § Source pointer held past its free records.
+                // nothing pins the source across the snapshot, a gap #501 records.
                 unsafe {
                     let saved = (*sig).lock.lock_raw();
                     // Claim = the removal from the waiter queue under sig.lock
@@ -1036,8 +1033,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 #[allow(clippy::cast_ptr_alignment)]
                 let eq = blocked_on.cast::<EventQueueState>();
                 // SAFETY: blocked_on was the snapshotted binding to an EventQueueState;
-                // nothing pins the source across the snapshot, a gap
-                // #443 § Source pointer held past its free records.
+                // nothing pins the source across the snapshot, a gap #501 records.
                 unsafe {
                     let saved = (*eq).lock.lock_raw();
                     // Claim = the removal from the waiter queue under eq.lock; a
@@ -1076,8 +1072,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
                 #[allow(clippy::cast_ptr_alignment)]
                 let ws = blocked_on.cast::<WaitSetState>();
                 // SAFETY: blocked_on was the snapshotted binding to a WaitSetState;
-                // nothing pins the source across the snapshot, a gap
-                // #443 § Source pointer held past its free records.
+                // nothing pins the source across the snapshot, a gap #501 records.
                 unsafe {
                     let saved = (*ws).lock.lock_raw();
                     // Claim = the removal from the waiter queue under ws.lock;
@@ -1143,7 +1138,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 /// destruction releases it. This holds only absent a race: `lookup_cap` takes
 /// no reference on the target Thread or the endpoint, so neither object is
 /// pinned for this call (`core/kernel/docs/capability-internals.md` § Storage:
-/// Hybrid Two-Level Radix, #443).
+/// Hybrid Two-Level Radix, #502).
 /// Binding requires only a valid `Endpoint` cap — `CONTROL` on the thread is
 /// the authority; the endpoint cap merely names where this thread's
 /// kernel-unresolvable faults are delivered.
@@ -1217,7 +1212,7 @@ pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallEr
         // SAFETY: new_ep was a live EndpointObject at lookup. `lookup_cap`
         // takes no reference on the object, so it is not pinned for this
         // block (`core/kernel/docs/capability-internals.md` § Storage: Hybrid
-        // Two-Level Radix, #443).
+        // Two-Level Radix, #502).
         unsafe { (*new_ep).header.inc_ref() };
     }
 
@@ -1226,7 +1221,7 @@ pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallEr
     // SAFETY: target_tcb was a live TCB at lookup; both fields are atomics safe
     // to write cross-thread. `lookup_cap` takes no reference on the object, so
     // it is not pinned for this block (`core/kernel/docs/capability-internals.md`
-    // § Storage: Hybrid Two-Level Radix, #443).
+    // § Storage: Hybrid Two-Level Radix, #502).
     let old_ep = unsafe {
         (*target_tcb).fault_badge.store(badge, Ordering::Release);
         (*target_tcb).fault_handler.swap(new_ep, Ordering::AcqRel)
@@ -1519,7 +1514,7 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// The handler takes no `sched_lock` and `lookup_cap` takes no reference on the
 /// target, so these outcomes hold only absent a concurrent free of the TCB or a
 /// racing scheduler path (`core/kernel/docs/syscalls.md` §
-/// `SYS_THREAD_SET_AFFINITY`, #443).
+/// `SYS_THREAD_SET_AFFINITY`, #443, #502).
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -1575,7 +1570,7 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: target_tcb was a live TCB at lookup. `lookup_cap` takes no
     // reference on the object, so it is not pinned for this block
     // (`core/kernel/docs/capability-internals.md` § Storage: Hybrid Two-Level
-    // Radix, #443), and the `cpu_affinity` write and the `preferred_cpu` /
+    // Radix, #502), and the `cpu_affinity` write and the `preferred_cpu` /
     // `state` reads are not serialised with other CPUs' scheduler paths
     // (`core/kernel/docs/syscalls.md` § SYS_THREAD_SET_AFFINITY, #443).
     unsafe {

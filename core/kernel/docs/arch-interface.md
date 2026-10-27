@@ -607,9 +607,9 @@ every U-mode trap builds the frame in the slot just below the kernel stack top t
 dispatcher republishes it), while the interrupt and exception trampolines build it below the
 hardware iret words and the stub's two pushes and publish it through `idt::publish_user_frame`. The
 x86-64 entries that publish nothing deschedule nothing the thread resumes from: `#DF` and `#MC`
-(IST1; they halt the system from either ring), the NMI (IST2; terminal on a hardware NMI, returning
-on the watchdog backtrace ping), `#NM` (builds no frame), and the spurious vector 255 (`iretq`
-only).
+(IST1; they halt the faulting CPU from either ring, never a thread kill), the NMI (IST2; terminal on
+a hardware NMI, returning on the watchdog backtrace ping), `#NM` (builds no frame), and the spurious
+vector 255 (`iretq` only).
 
 Several paths hold the published frame as a `&mut TrapFrame` across a point where the thread is
 descheduled: the syscall dispatcher hands one to each handler for the whole syscall, including while

@@ -1260,7 +1260,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// pinned for the window from the `dec_ref` here to the caller's next touch
 /// of the destination under `DERIVATION_LOCK`
 /// (`core/kernel/docs/capability-internals.md` § Storage: Hybrid Two-Level
-/// Radix, #443).
+/// Radix, #502).
 ///
 /// # Safety
 /// `dest_obj` must be the header of the live `CSpaceKernelObject` wrapping
@@ -1441,7 +1441,7 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: dest_obj was the live wrapper at lookup; no lock held.
         // `lookup_cap` takes no reference on the object, so it is not pinned
         // for this block (`core/kernel/docs/capability-internals.md`
-        // § Storage: Hybrid Two-Level Radix, #443).
+        // § Storage: Hybrid Two-Level Radix, #502).
         unsafe { pre_grow_holding_dest(dest_obj, dest_cs_ptr, dest_slot_idx)? };
     }
 
@@ -2346,7 +2346,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // SAFETY: dest_obj was the live wrapper at lookup; no lock held.
             // `lookup_cap` takes no reference on the object, so it is not pinned
             // for this block (`core/kernel/docs/capability-internals.md`
-            // § Storage: Hybrid Two-Level Radix, #443).
+            // § Storage: Hybrid Two-Level Radix, #502).
             unsafe { pre_grow_holding_dest(dest_obj, dest_cs_ptr, dest_idx)? };
             Some(idx)
         }
@@ -2778,7 +2778,7 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // SAFETY: target_tcb came from a Thread cap resolved without taking a
             // reference, so a sibling's concurrent delete of the last Thread cap can
             // free it before this read (`core/kernel/docs/capability-internals.md`
-            // § Storage: Hybrid Two-Level Radix, #443).
+            // § Storage: Hybrid Two-Level Radix, #502).
             let (state, exit_reason) = unsafe { ((*target_tcb).state, (*target_tcb).exit_reason) };
             // SAFETY: paired with lock_raw above.
             unsafe { sched.lock.unlock_raw(saved) };

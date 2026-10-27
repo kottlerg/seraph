@@ -294,14 +294,18 @@ pub const SYS_MMIO_MAP: u64 = 34;
 pub const SYS_IOPORT_BIND: u64 = 35;
 /// Capability: read-only inspection of a cap's runtime state.
 ///
-/// Returns a discriminated union keyed by `CapTag`:
-/// - `Memory` → `(size_bytes, available_bytes, has_retype_right)`
-/// - `AddressSpace` → `(pt_growth_budget_bytes)`
-/// - `CSpace` → `(slot_capacity, slots_used, growth_budget_bytes)`
-/// - all other tags → `(tag, rights)` only
+/// Returns one field per call, chosen by the selector in arg1:
+/// - any tag → `(tag, rights)`, and the system-wide TLB counters (elided and
+///   performed flushes)
+/// - `Memory` → `size_bytes`, `available_bytes`, `has_retype_right`, `phys_base`
+/// - `AddressSpace` → `pt_growth_budget_bytes`
+/// - `CSpace` → `slot_capacity`, `slots_used`, `growth_budget_bytes`
+/// - `Thread` → the packed lifecycle state and exit reason
+///   ([`CAP_INFO_THREAD_STATE`])
 ///
 /// Fails with [`SyscallError::InvalidCapability`] on a null, invalid, or
-/// stale handle, and with [`SyscallError::InvalidArgument`] on an unknown
+/// stale handle or when the referenced target object is gone, and with
+/// [`SyscallError::InvalidArgument`] on an unknown
 /// selector or a tag-specific one whose owning tag does not match the slot
 /// (see arg1 below). Slot 36 was vacated by the `SYS_DMA_GRANT` removal
 /// (commit `704c1b4`).

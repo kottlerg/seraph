@@ -471,11 +471,11 @@ comment or Markdown. The CI gate and the
 [pre-merge review](conventions.md#branch-and-pr-workflow) apply unchanged;
 the PR body MUST carry what
 [conventions.md](conventions.md#pr-body-checklist-discipline) § PR-body checklist
-discipline requires (the validated head, that the delta is documentation or
-comments only, the local host runs the PR as a whole owes, each with its
-count and head, or that none is owed and why, and each behaviour-neutral
-change on a trigger path with why no run is owed for it), and the pre-merge
-review's audit MUST check that against the diff.
+discipline requires (the validated head; that the delta is documentation or
+comments only; each local host run the PR as a whole owes, with its count and
+head, or that none is owed and why; and each behaviour-neutral change on a
+trigger path, with why no run is owed for it), and the pre-merge review's
+audit MUST check that against the diff.
 
 **Behaviour-neutral changes.** The local host runs above exercise what the
 built code does. Besides Markdown and comment lines, only the kinds of change listed here

@@ -17,8 +17,8 @@
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, event_post,
     event_queue_create, event_recv, notification_send, notification_wait,
-    notification_wait_timeout, thread_exit, wait_set_add, wait_set_create,
-    wait_set_remove, wait_set_wait,
+    notification_wait_timeout, thread_exit, wait_set_add, wait_set_create, wait_set_remove,
+    wait_set_wait,
 };
 use syscall_abi::SyscallError;
 

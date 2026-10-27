@@ -46,7 +46,11 @@ including register inspection and modification of a fault-blocked thread via
 no handler bound is still terminated, the behavior for all faults absent this mechanism. The
 x86-64 abort vectors (`#DF`, `#MC`) and a hardware NMI are the exception: they are never
 delivered to a handler and never terminate a thread; they halt the CPU they arrive on,
-whatever ring they interrupt.
+whatever ring they interrupt. The interrupted thread stays `current` on the halted CPU and
+no death event is posted for it; a stop or teardown of it does not complete, and the other
+CPUs run on until one needs the halted CPU (see
+[thread-lifecycle-and-sleep.md § Drain Protocol](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
+invariant 3).
 
 The demand-paging consumer is implemented: memmgr acts as the pager, procmgr binds it for
 every ordinary process it creates (demand paging is the default; a process opts out with the
@@ -84,14 +88,14 @@ own (e.g. an access to an unmapped page that is not a stale-TLB artifact), the k
 4. On reply, resumes the faulting thread, which re-executes the faulting instruction (or
    continues from a handler-modified instruction pointer).
 
-If the thread has **no** fault handler bound, the fault is terminal: the thread is killed
-with exit reason `EXIT_FAULT_BASE + <fault code>`, the behavior for all faults absent this
-mechanism. On x86-64, `#DF`, `#MC`, and a hardware NMI are not the thread's faults: they are
-never delivered to a handler, record no exit reason, and halt the CPU they arrive on whatever
-ring they interrupt. Voluntary exit codes occupy the disjoint range `[1, EXIT_FAULT_BASE)` below it
-(see [Process Lifecycle](process-lifecycle.md#exit-reason)), so a fault reason and a
-voluntary exit code can never alias; `ExitStatus::success()`/`code()` distinguish them
-without ambiguity.
+If the thread has **no** fault handler bound, the fault is terminal: the thread is killed with exit
+reason `EXIT_FAULT_BASE + <fault code>`, the behavior for all faults absent this mechanism. On
+x86-64, `#DF`, `#MC`, and a hardware NMI are not the thread's faults: they are never delivered to a
+handler, record no exit reason, and halt the CPU they arrive on whatever ring they interrupt,
+leaving the interrupted thread `current` there with no death event posted. Voluntary exit codes
+occupy the disjoint range `[1, EXIT_FAULT_BASE)` below it (see
+[Process Lifecycle](process-lifecycle.md#exit-reason)), so a fault reason and a voluntary exit code
+can never alias; `ExitStatus::success()`/`code()` distinguish them without ambiguity.
 
 Fault delivery reuses the synchronous IPC machinery of [IPC Design](ipc-design.md): the
 suspended thread occupies the same role as a caller blocked awaiting a reply, and the

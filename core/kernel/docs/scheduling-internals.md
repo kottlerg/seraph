@@ -1046,7 +1046,7 @@ phases keyed off the elapsed-microseconds delta from the start of the wait:
 |---|---|---|
 | A | 0 – 250 ms | Spin with `core::hint::spin_loop()` while `cond()` reports unacked. |
 | B | 250 – 750 ms | Call `ctx.resend()` once at the boundary, then continue spinning. Recovers from a dropped IPI under emulators with non-deterministic LAPIC delivery. |
-| C | 750 ms – 5 s | x86-64: set the per-CPU request flag returned by `nmi_backtrace_request(target_cpu)` and send a vector-2 NMI to that CPU; the target's dedicated NMI handler dumps its `TrapFrame` to serial so the eventual Phase-D panic is diagnosable. RISC-V: emit a single logged warning (no S-mode NMI surface; Phase C degrades to a warn). |
+| C | 750 ms – 5 s | x86-64: increment the per-CPU request count returned by `nmi_backtrace_request(target_cpu)` and send a vector-2 NMI to that CPU; the target's dedicated NMI handler dumps its `TrapFrame` to serial so the eventual Phase-D panic is diagnosable. RISC-V: emit a single logged warning (no S-mode NMI surface; Phase C degrades to a warn). |
 | D | > 5 s | Print `target_cpu`, `op_name`, `elapsed_ms` to serial, then `crate::fatal`. |
 
 `wait_for_ack` MUST be called with preemption disabled and `IF=1` / `sstatus.SIE=1` — the same
@@ -1074,12 +1074,20 @@ The x86-64 IDT registers a dedicated stub at vector 2 (IST=2 per the NMI ABI) th
 canonical `TrapFrame`, switches to the kernel GS base when the user base is active (decided from the
 sign bit of `IA32_GS_BASE`, not the saved CS, since an NMI can arrive between a ring-3 entry and its
 `swapgs`), and calls a returning handler; on return it disables interrupts, swaps back if it
-swapped, then writes back and `iretq`s. The handler reads the per-CPU request flag returned by
-`nmi_backtrace_request(cpu)`:
-- **Set** (watchdog-requested): dump the saved frame to serial and return; the stub's `iretq`
-  resumes the interrupted code.
-- **Clear** (real hardware NMI): tail-call `common_exception_handler` which never returns — the
-  stub's `iretq` tail is dead code in that case.
+swapped, then writes back and `iretq`s. Each Phase-C sender increments the per-CPU request count
+returned by `nmi_backtrace_request(cpu)` before it sends, and the handler takes one request per NMI
+(a decrement that refuses at 0):
+- **A request taken** (watchdog-requested): dump the saved frame to serial and return; the stub's
+  `iretq` resumes the interrupted code.
+- **None pending** (real hardware NMI): tail-call `common_exception_handler` which never returns —
+  the stub's `iretq` tail is dead code in that case.
+
+Several initiators can ping one target in the same window (each names the lowest-numbered CPU still
+pending), so a count, not a flag, keeps a later ping from reading as a hardware NMI once an earlier
+NMI has taken its request. The count errs toward the ping: a hardware NMI that arrives while a
+request is pending is dumped and resumed, and a ping NMI the CPU drops (one NMI is latched while the
+handler runs; further ones are lost, Intel SDM Vol. 3A § 6.7.1) leaves a request that the next NMI,
+of either kind, takes.
 
 NMI is not APIC-EOI'd; the handler does not call `acknowledge()`.
 

@@ -103,7 +103,7 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     // SAFETY: caller guarantees tf is valid. The `&mut` is not exclusive for
     // the whole call: while the thread blocks in a handler, other paths access
     // the frame through the published `trap_frame`, a gap
-    // docs/arch-interface.md § `trap_frame` states and #443 tracks.
+    // docs/arch-interface.md § `trap_frame` states and #514 tracks.
     let tf = unsafe { &mut *tf };
 
     let nr = tf.syscall_nr();

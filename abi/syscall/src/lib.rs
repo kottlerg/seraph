@@ -310,7 +310,7 @@ pub const SYS_IOPORT_BIND: u64 = 35;
 /// (see arg1 below). Slot 36 was vacated by the `SYS_DMA_GRANT` removal
 /// (commit `704c1b4`).
 ///
-/// arg0 = slot index in the caller's `CSpace`.
+/// arg0 = capability handle in the caller's `CSpace` (generation-checked).
 /// arg1 = field selector — one of the [`CAP_INFO_*`](CAP_INFO_TAG_RIGHTS)
 ///        constants below. The value returned in the primary register
 ///        depends on the selector. Field selectors that are tag-specific

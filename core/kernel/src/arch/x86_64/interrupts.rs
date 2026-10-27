@@ -309,23 +309,23 @@ pub const IPI_VECTOR_TLB_SHOOTDOWN: u8 = 250;
 /// IPI vector for waking idle CPUs.
 pub const IPI_VECTOR_WAKEUP: u8 = 251;
 
-/// Base pointer for the per-CPU `[AtomicBool; cpu_count]` NMI-backtrace request slab,
+/// Base pointer for the per-CPU `[AtomicU32; cpu_count]` NMI-backtrace request-count slab,
 /// allocated by [`init_nmi_backtrace_storage`] before AP bringup and read through
-/// [`nmi_backtrace_request`]. Sized to `cpu_count` rather than `MAX_CPUS`. The flag
+/// [`nmi_backtrace_request`]. Sized to `cpu_count` rather than `MAX_CPUS`. The count
 /// protocol is specified in core/kernel/docs/scheduling-internals.md
 /// § `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`.
 #[cfg(not(test))]
-static NMI_BACKTRACE_PTR: core::sync::atomic::AtomicPtr<core::sync::atomic::AtomicBool> =
+static NMI_BACKTRACE_PTR: core::sync::atomic::AtomicPtr<core::sync::atomic::AtomicU32> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 /// Allocate the per-CPU NMI-backtrace request slab sized to `cpu_count`,
-/// zero-filled (each `AtomicBool` starts `false`). Called from [`super::init_ap_percpu_storage`]
+/// zero-filled (each count starts at 0). Called from [`super::init_ap_percpu_storage`]
 /// (reached from `sched::init_per_cpu_storage` in Phase 4), before AP bringup.
 #[cfg(not(test))]
 pub fn init_nmi_backtrace_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
 {
-    let bytes = cpu_count * core::mem::size_of::<core::sync::atomic::AtomicBool>();
-    let ptr = crate::sched::alloc_zeroed_slab::<core::sync::atomic::AtomicBool>(
+    let bytes = cpu_count * core::mem::size_of::<core::sync::atomic::AtomicU32>();
+    let ptr = crate::sched::alloc_zeroed_slab::<core::sync::atomic::AtomicU32>(
         bytes,
         allocator,
         "NMI_BACKTRACE",
@@ -333,10 +333,10 @@ pub fn init_nmi_backtrace_storage(cpu_count: usize, allocator: &mut crate::mm::B
     NMI_BACKTRACE_PTR.store(ptr, core::sync::atomic::Ordering::Release);
 }
 
-/// Return CPU `cpu`'s NMI-backtrace request flag, or `None` if `cpu` is out of
+/// Return CPU `cpu`'s pending NMI-backtrace request count, or `None` if `cpu` is out of
 /// range or the slab is not yet allocated.
 #[cfg(not(test))]
-pub fn nmi_backtrace_request(cpu: usize) -> Option<&'static core::sync::atomic::AtomicBool>
+pub fn nmi_backtrace_request(cpu: usize) -> Option<&'static core::sync::atomic::AtomicU32>
 {
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     if cpu >= cpu_count
@@ -349,7 +349,7 @@ pub fn nmi_backtrace_request(cpu: usize) -> Option<&'static core::sync::atomic::
         return None;
     }
     // SAFETY: cpu < cpu_count; the slab covers cpu_count zero-initialised
-    // AtomicBool slots.
+    // AtomicU32 slots.
     Some(unsafe { &*base.add(cpu) })
 }
 
@@ -546,9 +546,9 @@ pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
         }
         if !nmi_sent && elapsed_ms >= 750
         {
-            if let Some(flag) = nmi_backtrace_request(ctx.target_cpu)
+            if let Some(pending) = nmi_backtrace_request(ctx.target_cpu)
             {
-                flag.store(true, core::sync::atomic::Ordering::Release);
+                pending.fetch_add(1, core::sync::atomic::Ordering::Release);
                 // SAFETY: target_cpu is an online CPU index; apic_id_for is
                 // read-only after init.
                 let apic_id = unsafe { crate::percpu::apic_id_for(ctx.target_cpu) };

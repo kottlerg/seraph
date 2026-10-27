@@ -2623,7 +2623,7 @@ pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_CAP_INFO` (36): read-only inspection of a capability slot's runtime state.
 ///
-/// arg0 = slot index in the caller's `CSpace`.
+/// arg0 = capability handle in the caller's `CSpace` (generation-checked).
 /// arg1 = field selector (one of `syscall::CAP_INFO_*`).
 ///
 /// Returns a single `u64`. Userspace assembles the full picture of a cap

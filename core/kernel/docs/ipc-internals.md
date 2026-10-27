@@ -174,7 +174,7 @@ syscall on either side. Nothing is allocated on the path.
 1. Peek caller_tcb = current_tcb.reply_tcb (Acquire load)
    (the reply capability is this caller binding, a per-thread field outside
    the CSpace; the peeked caller is read before the step-3 claim and is not
-   pinned, so a concurrent dealloc can free it first, #443)
+   pinned, so a concurrent dealloc can free it first, #513)
 2. Unless caller_tcb is BlockedOnFault (a fault reply, whose data words and
    caps the kernel ignores): read the data words and pre-validate the reply
    cap slots; when caps are attached, return InvalidCapability if no caller

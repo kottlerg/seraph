@@ -9,8 +9,9 @@
 //! - A 256-entry IDT in BSS.
 //! - Naked ISR stubs for exception vectors 0–31 (macro-generated).
 //! - Stubs for the APIC timer (vector 32) and spurious (vector 255).
-//! - A common terminal exception path that kills the faulting thread
-//!   (userspace fault) or prints diagnostics and halts (kernel fault).
+//! - A common terminal exception path that kills the faulting thread for a
+//!   userspace fault, and prints diagnostics and halts this CPU for a kernel
+//!   fault or for a hardware NMI, `#DF` or `#MC` from either ring.
 //!
 //! Every ring-3 entry at which a thread can be stopped (exception, `#PF`, and
 //! ring-3 IRQ; a ring-3 NMI is terminal or returns) builds the one canonical
@@ -370,7 +371,9 @@ macro_rules! paranoid_exit_asm {
 /// terminated and a death notification is posted (if bound). If the fault
 /// originated in the kernel, or is a hardware NMI, `#DF`, or `#MC` from either
 /// ring, diagnostics are printed and this CPU halts (`fatal`); the interrupted
-/// thread is not killed, and the other CPUs keep running.
+/// thread is not killed and stays `current` here. The other CPUs keep running
+/// until one needs this CPU: it acks no further IPI, so the next TLB shootdown
+/// that names it ends in the IPI watchdog's `fatal`.
 ///
 /// # Safety
 /// `tf` must point to a valid user-or-kernel [`TrapFrame`] on the current kernel
@@ -1541,9 +1544,11 @@ unsafe extern "C" fn ipi_nmi_backtrace_stub()
 }
 
 /// NMI body. Distinguishes a watchdog-requested backtrace from a real
-/// hardware NMI via the per-CPU `nmi_backtrace_request` flag; on a watchdog ping it
-/// dumps the saved frame to serial and returns (the stub's iretq
-/// resumes the interrupted code). On a real NMI it tail-calls
+/// hardware NMI via the per-CPU `nmi_backtrace_request` count: each NMI takes
+/// one pending request, so a ping that arrives after another sender's ping was
+/// taken is still a ping. On a watchdog ping it dumps the saved frame to serial
+/// and returns (the stub's iretq resumes the interrupted code). With no request
+/// pending (a real hardware NMI) it tail-calls
 /// `common_exception_handler` which never returns — the iretq tail of
 /// the stub is dead code in that case.
 ///
@@ -1552,8 +1557,15 @@ unsafe extern "C" fn ipi_nmi_backtrace_stub()
 extern "C" fn ipi_nmi_backtrace_handler(tf: *const TrapFrame, vector: u64, error_code: u64)
 {
     let cpu = super::cpu::current_cpu() as usize;
-    let requested = super::interrupts::nmi_backtrace_request(cpu)
-        .is_some_and(|flag| flag.swap(false, core::sync::atomic::Ordering::AcqRel));
+    let requested = super::interrupts::nmi_backtrace_request(cpu).is_some_and(|pending| {
+        pending
+            .fetch_update(
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+    });
     if !requested
     {
         // Real hardware NMI — defer to the standard fatal path.

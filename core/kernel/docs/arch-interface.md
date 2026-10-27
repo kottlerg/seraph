@@ -607,8 +607,9 @@ every U-mode trap builds the frame in the slot just below the kernel stack top t
 dispatcher republishes it), while the interrupt and exception trampolines build it below the
 hardware iret words and the stub's two pushes and publish it through `idt::publish_user_frame`. The
 x86-64 entries that publish nothing deschedule nothing the thread resumes from: `#DF` and `#MC`
-(IST1; they halt the faulting CPU from either ring, never a thread kill), the NMI (IST2; terminal on
-a hardware NMI, returning on the watchdog backtrace ping), `#NM` (builds no frame), and the spurious
+(IST1; they halt the faulting CPU from either ring, never a thread kill), the NMI (IST2; a hardware
+NMI halts the faulting CPU from either ring, never a thread kill; it returns on the watchdog
+backtrace ping), `#NM` (builds no frame), and the spurious
 vector 255 (`iretq` only).
 
 Several paths hold the published frame as a `&mut TrapFrame` across a point where the thread is
@@ -618,7 +619,7 @@ trap (across preemption) and `redirect_user_fault` holds it across the fault blo
 another thread's `SYS_THREAD_READ_REGS` or `SYS_THREAD_WRITE_REGS` on a `Stopped` or fault-blocked
 thread reads or writes that frame, and riscv64's switch-out clears its FS/VS bits. That violates the
 `&mut`'s uniqueness; passing these paths a non-unique frame handle (as x86-64's trap entries already
-take `*mut TrapFrame`) is tracked by [#443](https://github.com/kottlerg/seraph/issues/443).
+take `*mut TrapFrame`) is tracked by [#514](https://github.com/kottlerg/seraph/issues/514).
 
 ```rust
 pub struct TrapFrame { /* arch-specific layout */ }

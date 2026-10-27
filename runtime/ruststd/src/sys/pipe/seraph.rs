@@ -692,7 +692,7 @@ impl Drop for Pipe {
     fn drop(&mut self) {
         self.close();
         // Unmap the ring page from this process's aspace.
-        let _ = syscall::mem_unmap(self.aspace, self.ring_vaddr, 1);
+        let unmapped = syscall::mem_unmap(self.aspace, self.ring_vaddr, 1).is_ok();
         // Release this side's cap slots. The peer's Drop releases its
         // own copies; the underlying kernel objects free when refcount
         // hits zero.
@@ -704,6 +704,12 @@ impl Drop for Pipe {
         }
         if self.space_notification != 0 {
             let _ = syscall::cap_delete(self.space_notification);
+        }
+        // A ring page still mapped here must stay out of memmgr's pool and
+        // its VA out of the reservation arena: both stay held until this
+        // process exits.
+        if !unmapped {
+            return;
         }
         if let Some(reserved) = self.reserved_va.take() {
             unreserve_pages(reserved);

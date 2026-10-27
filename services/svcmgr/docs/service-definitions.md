@@ -153,8 +153,10 @@ When set, svcmgr walks `<cwd>` from its own root with
 cap as the child's `ProcessInfo.current_dir_cap`. The path must
 resolve inside the namespace. With `namespace = none`, `cwd` is a
 parser error. A `cwd` of `/` is a parser error too: it names svcmgr's
-root itself, and only a hop narrows rights
-([Namespace Model § Namespace Rights](../../../docs/namespace-model.md#namespace-rights)),
+root itself, and rights narrow only at an `NS_LOOKUP` hop, as
+[Namespace Model § Per-Entry Rights and Visibility](../../../docs/namespace-model.md#per-entry-rights-and-visibility)
+defines (a holder cannot re-badge its own cap, per
+[Capability Model § Badges](../../../docs/capability-model.md#badges)),
 so the walk cannot hand over the root with those rights.
 
 `std::env::current_dir()` returns `Unsupported` until a path string

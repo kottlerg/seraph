@@ -128,7 +128,8 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// violate the grammar or a semantic rule: a missing `=`, an unknown or
 /// duplicated key, a missing mandatory key, a malformed value, an
 /// inconsistent combination (`cwd` with `namespace = none`, `log_sink`
-/// with `seed`/`provides`, `sched_max` below `priority`), a `binary` or
+/// with `seed`/`provides`, `sched_max` below `priority`), a `cwd` naming
+/// the root or a `subtree:/` naming fewer than every right, a `binary` or
 /// subtree path over `ipc::MAX_PATH_LEN` ([`ParseError::InvalidValue`]), or
 /// `argv` / `env` that would not fit procmgr's `CREATE_FROM_FILE` message
 /// ([`ParseError::TooLarge`]).

@@ -977,9 +977,10 @@ enum ChunkError
 
 /// Bulk write via `FS_WRITE_MEMORY`: loop chunks of at most `PAGE_SIZE`
 /// bytes through a [`WriteFrame`] acquired for this write and into the
-/// file, then release the frame with [`release_write_frame`]. After a
-/// failed call the driver may still be copying from the frame, so it is
-/// left mapped and accounted to this process until it exits instead.
+/// file, then release the frame with [`release_write_frame`]. After an
+/// interrupted call ([`ChunkError::Call`]) the driver may still be copying
+/// from the frame, so it is left mapped and accounted to this process until
+/// it exits instead.
 ///
 /// Returns the bytes written. An error after some chunks reached the file
 /// returns their count instead, as a short write, so the caller's position
@@ -1614,8 +1615,7 @@ impl File
         {
             Some("seraph fs: page-table funding failed for read frame")
         }
-        else if syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READONLY)
-            .is_err()
+        else if syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READ).is_err()
         {
             Some("seraph fs: mem_map failed")
         }
@@ -2271,17 +2271,22 @@ fn drain_dir_recursive(dir_cap: u32, ipc_buf: *mut u64) -> io::Result<()>
             idx = idx.saturating_add(1);
             continue;
         }
+        // The name is wire input. Walked as a path, an empty or slash-only
+        // name would name `dir_cap` itself and recurse without end, and a
+        // name with a slash would drain another directory; only a single
+        // valid component names this entry.
+        if validate_name(&entry.name).is_err()
+        {
+            return Err(io::const_error!(
+                io::ErrorKind::InvalidData,
+                "seraph fs: NS_READDIR returned an invalid entry name",
+            ));
+        }
 
         if matches!(entry.kind, NodeKind::Dir)
         {
-            // A non-UTF-8 name cannot be walked by path; an empty stand-in
-            // would name `dir_cap` itself and recurse without end.
-            let leaf_str = core::str::from_utf8(&entry.name).map_err(|_| {
-                io::const_error!(
-                    io::ErrorKind::InvalidData,
-                    "seraph fs: directory entry name is not UTF-8",
-                )
-            })?;
+            // `validate_name` accepts only UTF-8.
+            let leaf_str = core::str::from_utf8(&entry.name).unwrap_or_default();
             let walked = walk_components(
                 dir_cap,
                 leaf_str,
@@ -2339,11 +2344,11 @@ fn ns_readdir_one(
     let name_len = reply.word(1) as usize;
     let bytes = reply.data_bytes();
     const NAME_OFF: usize = 16;
-    let end = NAME_OFF.saturating_add(name_len).min(bytes.len());
-    if end < NAME_OFF + name_len
+    let Some(end) = NAME_OFF.checked_add(name_len).filter(|&e| e <= bytes.len())
+    else
     {
         return Err(io::Error::other("seraph fs: NS_READDIR truncated name"));
-    }
+    };
     let kind = if kind_word == NodeKind::Dir as u64
     {
         NodeKind::Dir

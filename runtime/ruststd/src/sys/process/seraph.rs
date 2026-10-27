@@ -856,15 +856,19 @@ impl Command {
                 }
                 let _ = syscall::cap_delete(b.completion_notification);
             }
-            mark_spawn_failure_pipes(
-                child_stdin_pipe.as_deref(),
-                child_stdout_pipe.as_deref(),
-                child_stderr_pipe.as_deref(),
-            );
+            // An interrupted START_PROCESS may have started the child, so
+            // the rings count as never used only once the teardown has
+            // returned; otherwise their grants stay accounted to this
+            // process, as the death bridge leaves them.
+            if destroy_child(process_handle) {
+                mark_spawn_failure_pipes(
+                    child_stdin_pipe.as_deref(),
+                    child_stdout_pipe.as_deref(),
+                    child_stderr_pipe.as_deref(),
+                );
+            }
             let _ = syscall::cap_delete(death_eq);
             let _ = syscall::cap_delete(thread_cap);
-            // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
             let _ = syscall::cap_delete(process_handle);
             return Err(e);
         }

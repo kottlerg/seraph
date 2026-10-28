@@ -35,8 +35,21 @@ pub fn run(ctx: &TestContext) -> TestResult
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "fault_exception_no_handler_kills: spawn::new_child failed")?;
 
+    let result = start_and_check(&child);
+    // Deleting the thread stops it wherever it is, so a child that never
+    // died does not outlive the test on any exit path.
+    let reaped = [cap_delete(child.th), cap_delete(child.cs)]
+        .into_iter()
+        .collect::<Result<(), i64>>();
+    result?;
+    reaped.map_err(|_| "fault_exception_no_handler_kills: reap failed")
+}
+
+/// Start the faulting child and check that it exits with the fault reason.
+fn start_and_check(child: &crate::spawn::SpawnedChild) -> TestResult
+{
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start(&child, fault_child, stack_top, 0)
+    crate::spawn::configure_and_start(child, fault_child, stack_top, 0)
         .map_err(|_| "fault_exception_no_handler_kills: configure_and_start failed")?;
 
     let expected = EXIT_FAULT_BASE + crate::arch::ILLEGAL_INSTRUCTION_VECTOR;
@@ -45,15 +58,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         return Err("fault_exception_no_handler_kills: wrong exit reason");
     }
-
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
     Ok(())
 }
 
 /// Child entry: execute an illegal instruction with no fault handler bound,
 /// which the kernel resolves by terminating this thread.
-fn fault_child(_arg: u64) -> !
+extern "C" fn fault_child(_arg: u64) -> !
 {
     crate::arch::illegal_instruction()
 }

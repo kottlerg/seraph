@@ -15,7 +15,7 @@ use crate::{ChildStack, spawn};
 
 static mut BENCH_LIFECYCLE_STACK: ChildStack = ChildStack::ZERO;
 
-fn lifecycle_entry(done_slot: u64) -> !
+extern "C" fn lifecycle_entry(done_slot: u64) -> !
 {
     // cast_possible_truncation: done_slot is a kernel cap slot index < 2^32.
     #[allow(clippy::cast_possible_truncation)]
@@ -27,7 +27,6 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
 {
     // Use fewer iterations for this heavier benchmark.
     let n = iters.min(100);
-    let n64 = u64::from(n);
 
     let Ok(done) = cap_create_notification(ctx.memory_base)
     else
@@ -83,7 +82,6 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
     log_bench_header("thread_lifecycle", n);
     // The `checked_div(completed)` below guards against no successful
     // iteration, so a u64::MAX min is never logged.
-    let _ = n64;
     if let Some(mean) = total.checked_div(completed)
     {
         crate::log_u64("ktest: bench  cycles_min=", min);
@@ -101,7 +99,7 @@ static BENCH_CTXSWITCH_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic
 
 /// Child entry: ping-pong via `thread_yield` for `BENCH_CTXSWITCH_ITERS`
 /// iterations, then send on the `done_slot` notification and exit.
-fn ctxswitch_child_entry(done_slot: u64) -> !
+extern "C" fn ctxswitch_child_entry(done_slot: u64) -> !
 {
     let n = BENCH_CTXSWITCH_ITERS.load(core::sync::atomic::Ordering::Acquire);
     for _ in 0..n

@@ -14,7 +14,7 @@
 //! Call [`init`] once during early startup (after `InitInfo` is available, before
 //! any logging). After that, [`write_str`] and [`write_byte`] are available.
 
-use init_protocol::{CapDescriptor, CapType, InitInfo};
+use init_protocol::{CapType, InitInfo};
 
 /// Whether serial has been successfully initialised.
 ///
@@ -24,35 +24,13 @@ static mut SERIAL_READY: bool = false;
 
 // ── Cap discovery ────────────────────────────────────────────────────────────
 
-/// Read the `CapDescriptor` array from the `InitInfo` page.
-fn descriptors(info: &InitInfo) -> &[CapDescriptor]
-{
-    let base = core::ptr::from_ref::<InitInfo>(info).cast::<u8>();
-    // SAFETY: cap_descriptors_offset is set by the kernel to point within the
-    // same read-only page; the descriptor array contains cap_descriptor_count
-    // valid entries. The offset is aligned to CapDescriptor's alignment (the
-    // kernel writes it at size_of::<InitInfo>(), a multiple of InitInfo's
-    // 8-byte alignment from the page-aligned base, which satisfies
-    // CapDescriptor's 8-byte alignment (aux0: u64)).
-    // cast_ptr_alignment: the array starts size_of::<InitInfo>() (a multiple of
-    // 8) past the page-aligned InitInfo base, meeting CapDescriptor's 8-byte
-    // alignment.
-    #[allow(clippy::cast_ptr_alignment)]
-    unsafe {
-        let ptr = base
-            .add(info.cap_descriptors_offset as usize)
-            .cast::<CapDescriptor>();
-        core::slice::from_raw_parts(ptr, info.cap_descriptor_count as usize)
-    }
-}
-
 /// Scan the `CapDescriptor` array for a cap matching `wanted_type` and
 /// `wanted_aux0`. Returns the `CSpace` slot index if found.
 // dead_code: the only caller is the riscv64 Mmio lookup, so x86-64 builds never use it.
 #[allow(dead_code)]
 fn find_cap(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) -> Option<u32>
 {
-    for d in descriptors(info)
+    for d in crate::init_info::descriptors(info)
     {
         if d.cap_type == wanted_type && d.aux0 == wanted_aux0
         {

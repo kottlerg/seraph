@@ -45,7 +45,7 @@ static mut ELEVATED_STACK: ChildStack = ChildStack::ZERO;
 /// `done_slot` (low 32 bits).
 // cast_possible_truncation: slot indices are < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn hog_entry(arg: u64) -> !
+extern "C" fn hog_entry(arg: u64) -> !
 {
     let done_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_bit = arg >> 32;
@@ -69,7 +69,7 @@ fn hog_entry(arg: u64) -> !
 /// (low 32 bits) and exit.
 // cast_possible_truncation: slot indices are < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn elevated_entry(arg: u64) -> !
+extern "C" fn elevated_entry(arg: u64) -> !
 {
     let done_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_bit = arg >> 32;

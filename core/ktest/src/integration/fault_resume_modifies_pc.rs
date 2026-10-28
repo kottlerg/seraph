@@ -117,7 +117,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// Child entry: store to the reserved VA. The store faults; the handler
 /// redirects this thread to [`recovery_child`] instead of mapping, so the store
 /// never completes. The loop only satisfies `-> !`.
-fn fault_child(_arg: u64) -> !
+extern "C" fn fault_child(_arg: u64) -> !
 {
     let p = RESERVED_VA as *mut u64;
     // SAFETY: deliberately faulting — the handler resumes the thread at

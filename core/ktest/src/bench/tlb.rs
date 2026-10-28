@@ -76,7 +76,7 @@ static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// bit: notification bits coalesce (see docs/ipc-design.md § Notifications), so
 /// identical bits from N workers would wake the parent's `notification_wait` loop
 /// once and hang it on the second iteration.
-fn shootdown_spinner_entry(arg: u64) -> !
+extern "C" fn shootdown_spinner_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the bench published for this worker.
     let SpinnerArgs {
@@ -391,7 +391,7 @@ fn conc_map_fold(d: u64)
 /// Each worker sends its unique `1 << bit_index` on both `ready` and `done`;
 /// notification bits coalesce (see docs/ipc-design.md § Notifications), so
 /// identical bits from concurrent workers would hang the parent's wait loop.
-fn conc_worker_entry(arg: u64) -> !
+extern "C" fn conc_worker_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the bench published for this worker.
     let ConcArgs {

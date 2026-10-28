@@ -60,8 +60,11 @@ const BIT_C_READY: u64 = 1 << 6;
 const BIT_C_OK: u64 = 1 << 7;
 const BIT_C_BAD: u64 = 1 << 8;
 
-/// Settle after a caller's READY so its call provably reaches the send queue
-/// before the controller receives; bound on each report.
+/// Settle after a caller's READY so its call is, in practice, queued before
+/// the controller receives; the result does not depend on it, since the
+/// receive releases the bound caller at entry, whichever order the two take,
+/// and the label check names the caller the receive got. Bound on each
+/// report.
 const SETTLE_SLEEP_MS: u64 = 20;
 const REPORT_MS: u64 = 1000;
 
@@ -130,7 +133,7 @@ struct Caller
     ready: u64,
     ok: u64,
     bad: u64,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
 }
 
 const CALLER_A: Caller = Caller {
@@ -422,7 +425,7 @@ fn call(args: &CallerArgs) -> Option<Result<IpcMessage, i64>>
 
 /// Caller A: call, report whether the call returned `Interrupted`, then park
 /// on `park` for the controller's stop and restart.
-fn released_caller_entry(arg: u64) -> !
+extern "C" fn released_caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `start_caller` published for this caller.
     let args: CallerArgs = unsafe { spawn::child_args(arg) };
@@ -440,7 +443,7 @@ fn released_caller_entry(arg: u64) -> !
 
 /// Callers B and C: call, and report whether the reply carries
 /// [`REPLY_LABEL`].
-fn replied_caller_entry(arg: u64) -> !
+extern "C" fn replied_caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `start_caller` published for this caller.
     let args: CallerArgs = unsafe { spawn::child_args(arg) };
@@ -456,7 +459,7 @@ fn replied_caller_entry(arg: u64) -> !
 /// Faulter: store to the reserved VA. The store faults; the controller's
 /// second receive releases the fault binding, so the kernel kills this thread
 /// before the store returns. The loop only satisfies `-> !`.
-fn faulter_entry(_arg: u64) -> !
+extern "C" fn faulter_entry(_arg: u64) -> !
 {
     let p = RESERVED_VA as *mut u64;
     // SAFETY: deliberately faulting — the released fault episode kills this

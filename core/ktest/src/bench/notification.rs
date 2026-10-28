@@ -35,7 +35,7 @@ static PONG_ARGS: spawn::ArgBlock<PongArgs, 1> = spawn::ArgBlock::new(PongArgs {
     n: 0,
 });
 
-fn notification_pong_entry(arg: u64) -> !
+extern "C" fn notification_pong_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the bench published for this child.
     let PongArgs {

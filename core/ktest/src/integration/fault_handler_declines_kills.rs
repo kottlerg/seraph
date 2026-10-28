@@ -79,7 +79,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// Child entry: store to the reserved VA. The store faults; the handler declines
 /// (KILL), so the kernel terminates this thread before the store returns. The
 /// loop only satisfies `-> !` and is never reached.
-fn fault_child(_arg: u64) -> !
+extern "C" fn fault_child(_arg: u64) -> !
 {
     let p = RESERVED_VA as *mut u64;
     // SAFETY: deliberately faulting — the bound handler replies KILL, so the

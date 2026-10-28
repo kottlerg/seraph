@@ -270,7 +270,7 @@ fn decode(arg: u64) -> (u32, u32)
 /// Server: receive one caller (making it `BlockedOnReply`), announce the reply
 /// binding is armed, busy-spin briefly to stay live, then exit **without
 /// replying** — leaving the client parked on a server about to be deleted.
-fn server_entry(arg: u64) -> !
+extern "C" fn server_entry(arg: u64) -> !
 {
     let (ep_slot, done_slot) = decode(arg);
     // SAFETY: the server child of the current cycle is the sole user of
@@ -303,7 +303,7 @@ fn server_entry(arg: u64) -> !
 /// call returns when the server's dealloc wakes it; the deposited disposition
 /// MUST be `Interrupted` (the #361 contract) — anything else raises the bad
 /// bit the controller fails fast on.
-fn client_entry(arg: u64) -> !
+extern "C" fn client_entry(arg: u64) -> !
 {
     let (ep_slot, done_slot) = decode(arg);
     // SAFETY: the client child of the current cycle is the sole user of

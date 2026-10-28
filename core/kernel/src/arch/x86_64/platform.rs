@@ -58,8 +58,15 @@ pub fn lapic_base() -> u64
 /// `out.len()` must be ≥ 1.
 pub fn ioapics_into(out: &mut [IoApicEntry]) -> &[IoApicEntry]
 {
+    select_ioapics(&crate::platform::kernel_mmio(), out)
+}
+
+/// Selection behind [`ioapics_into`], taking the `KernelMmio` snapshot as a
+/// parameter so the host tests can drive both the discovered and the
+/// synthesised-default outcome.
+fn select_ioapics<'a>(km: &KernelMmio, out: &'a mut [IoApicEntry]) -> &'a [IoApicEntry]
+{
     debug_assert!(!out.is_empty());
-    let km = crate::platform::kernel_mmio();
     let count = (km.ioapic_count as usize).min(km.ioapics.len());
     if count == 0
     {
@@ -144,10 +151,49 @@ mod tests
     }
 
     #[test]
-    fn ioapics_into_synthesises_default_when_empty()
+    fn ioapics_synthesise_the_default_when_none_discovered()
     {
-        // Empty: asserts nothing and does not cover `ioapics_into`'s fallback
-        // (#460). No host test writes `KERNEL_MMIO_CELL`; `kernel_mmio()` reads
-        // `KernelMmio::zero()` here.
+        let km = km_zero();
+        let mut out = [IoApicEntry::default(); 4];
+        let got = select_ioapics(&km, &mut out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, 0);
+        assert_eq!(got[0].phys_base, DEFAULT_IOAPIC_BASE);
+        assert_eq!(got[0].gsi_base, 0);
+    }
+
+    #[test]
+    fn ioapics_copy_the_discovered_entries_up_to_the_buffer_length()
+    {
+        let mut km = km_zero();
+        km.ioapic_count = 3;
+        for (e, (id, phys_base, gsi_base)) in km.ioapics.iter_mut().zip([
+            (0, 0xFEC0_0000, 0),
+            (1, 0xFEC0_1000, 24),
+            (2, 0xFEC0_2000, 48),
+        ])
+        {
+            *e = IoApicEntry {
+                id,
+                phys_base,
+                gsi_base,
+            };
+        }
+        let mut out = [IoApicEntry::default(); 2];
+        let got = select_ioapics(&km, &mut out);
+        assert_eq!(got.len(), 2, "clamped to the buffer length");
+        assert_eq!(got[0].phys_base, 0xFEC0_0000);
+        assert_eq!(got[1].phys_base, 0xFEC0_1000);
+        assert_eq!(got[1].gsi_base, 24);
+    }
+
+    #[test]
+    fn ioapics_clamp_an_oversized_reported_count_to_the_table()
+    {
+        let mut km = km_zero();
+        km.ioapic_count = u32::try_from(km.ioapics.len()).unwrap() + 1;
+        let mut out = [IoApicEntry::default(); 2 * boot_protocol::MAX_IOAPICS];
+        let got = select_ioapics(&km, &mut out);
+        assert_eq!(got.len(), boot_protocol::MAX_IOAPICS);
     }
 }

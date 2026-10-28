@@ -715,102 +715,100 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
 /// and RISC-V (`sstatus.FS/VS` dirty-tracking + illegal-instruction trap).
 pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
 {
+    let cpus = system_info(SystemInfoType::CpuCount as u64)
+        .map_err(|_| "system_info(CpuCount) for preempt_isolation_cross_cpu failed")?;
+    if cpus < 2
     {
-        let cpus = system_info(SystemInfoType::CpuCount as u64)
-            .map_err(|_| "system_info(CpuCount) for preempt_isolation_cross_cpu failed")?;
-        if cpus < 2
-        {
-            crate::log("ktest: fpu::preempt_isolation_cross_cpu SKIP (requires SMP)");
-            return Ok(());
-        }
-
-        CROSS_MISMATCHES.store(0, Ordering::Release);
-        CROSS_OBSERVED_CPU.store(u32::MAX, Ordering::Release);
-
-        let sig_ready = cap_create_notification(ctx.memory_base)
-            .map_err(|_| "create_notification ready for preempt_isolation_cross_cpu failed")?;
-        let sig_resume = cap_create_notification(ctx.memory_base)
-            .map_err(|_| "create_notification resume for preempt_isolation_cross_cpu failed")?;
-        let sig_done = cap_create_notification(ctx.memory_base)
-            .map_err(|_| "create_notification done for preempt_isolation_cross_cpu failed")?;
-        let cs = cap_create_cspace(ctx.memory_base, 0, 4)
-            .map_err(|_| "create_cspace for preempt_isolation_cross_cpu failed")?;
-
-        let child_ready = cap_copy(sig_ready, cs, RIGHTS_NOTIFY)
-            .map_err(|_| "cap_copy ready for preempt_isolation_cross_cpu failed")?;
-        let child_resume = cap_copy(sig_resume, cs, RIGHTS_NOTIFY)
-            .map_err(|_| "cap_copy resume for preempt_isolation_cross_cpu failed")?;
-        let child_done = cap_copy(sig_done, cs, RIGHTS_NOTIFY)
-            .map_err(|_| "cap_copy done for preempt_isolation_cross_cpu failed")?;
-
-        CROSS_SIG_READY.store(child_ready, Ordering::Release);
-        CROSS_SIG_RESUME.store(child_resume, Ordering::Release);
-        CROSS_SIG_DONE.store(child_done, Ordering::Release);
-
-        let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
-            .map_err(|_| "cap_create_thread for preempt_isolation_cross_cpu failed")?;
-
-        // Pin to CPU 0 initially: the child must run and load its
-        // extended-state registers on CPU 0 before the migration step.
-        thread_set_affinity(th, 0)
-            .map_err(|_| "initial thread_set_affinity(0) for preempt_isolation_cross_cpu failed")?;
-
-        let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CROSS));
-        thread_configure(th, child_cross_entry as *const () as u64, stack_top, 0)
-            .map_err(|_| "thread_configure for preempt_isolation_cross_cpu failed")?;
-        thread_start(th).map_err(|_| "thread_start for preempt_isolation_cross_cpu failed")?;
-
-        // Wait for the child to load its extended-state registers on CPU 0 and
-        // signal ready.
-        // The parent blocks (yielding CPU 0) so the child can run; the child
-        // then loads PATTERN_A, briefly spins, signals ready, and blocks on
-        // sig_resume.
-        let _ = notification_wait(sig_ready)
-            .map_err(|_| "notification_wait ready for preempt_isolation_cross_cpu failed")?;
-
-        // Change affinity to CPU 1 while the child is Blocked. This just
-        // updates the affinity field; the migration happens at wake time.
-        thread_set_affinity(th, 1)
-            .map_err(|_| "thread_set_affinity(1) for preempt_isolation_cross_cpu failed")?;
-
-        // Wake the child. The wake path enqueues it on CPU 1's run queue; its
-        // extended state was saved into its TCB area when it switched out on
-        // CPU 0 and is restored on its first FP op on CPU 1 (see
-        // core/kernel/docs/scheduler.md § What Gets Saved and Restored).
-        notification_send(sig_resume, 0x1)
-            .map_err(|_| "notification_send resume for preempt_isolation_cross_cpu failed")?;
-
-        let _ = notification_wait(sig_done)
-            .map_err(|_| "notification_wait done for preempt_isolation_cross_cpu failed")?;
-
-        let mismatches = CROSS_MISMATCHES.load(Ordering::Acquire);
-        let observed_cpu = CROSS_OBSERVED_CPU.load(Ordering::Acquire);
-
-        cap_delete(th).map_err(|_| "cap_delete th after preempt_isolation_cross_cpu failed")?;
-        cap_delete(sig_ready)
-            .map_err(|_| "cap_delete sig_ready after preempt_isolation_cross_cpu failed")?;
-        cap_delete(sig_resume)
-            .map_err(|_| "cap_delete sig_resume after preempt_isolation_cross_cpu failed")?;
-        cap_delete(sig_done)
-            .map_err(|_| "cap_delete sig_done after preempt_isolation_cross_cpu failed")?;
-        cap_delete(cs).map_err(|_| "cap_delete cs after preempt_isolation_cross_cpu failed")?;
-
-        crate::log_u64(
-            "fpu::preempt_isolation_cross_cpu observed_cpu=",
-            u64::from(observed_cpu),
-        );
-        crate::log_u64("fpu::preempt_isolation_cross_cpu mismatches=", mismatches);
-        if mismatches != 0
-        {
-            return Err("cross-CPU child observed extended-state corruption after migration");
-        }
-        // The migration was either actually cross-CPU (observed != 0) or the
-        // scheduler kept the child on its original CPU. In either case, the
-        // FP state must be intact; no cross-CPU FPU coordination exists (see
-        // core/kernel/docs/scheduling-internals.md § IPI Taxonomy). We log the
-        // observed CPU for diagnostics but do not gate the test on it — the
-        // existing `thread::affinity_migrate_ready_queued` test already covers
-        // strict affinity enforcement.
-        Ok(())
+        crate::log("ktest: fpu::preempt_isolation_cross_cpu SKIP (requires SMP)");
+        return Ok(());
     }
+
+    CROSS_MISMATCHES.store(0, Ordering::Release);
+    CROSS_OBSERVED_CPU.store(u32::MAX, Ordering::Release);
+
+    let sig_ready = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification ready for preempt_isolation_cross_cpu failed")?;
+    let sig_resume = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification resume for preempt_isolation_cross_cpu failed")?;
+    let sig_done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification done for preempt_isolation_cross_cpu failed")?;
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4)
+        .map_err(|_| "create_cspace for preempt_isolation_cross_cpu failed")?;
+
+    let child_ready = cap_copy(sig_ready, cs, RIGHTS_NOTIFY)
+        .map_err(|_| "cap_copy ready for preempt_isolation_cross_cpu failed")?;
+    let child_resume = cap_copy(sig_resume, cs, RIGHTS_NOTIFY)
+        .map_err(|_| "cap_copy resume for preempt_isolation_cross_cpu failed")?;
+    let child_done = cap_copy(sig_done, cs, RIGHTS_NOTIFY)
+        .map_err(|_| "cap_copy done for preempt_isolation_cross_cpu failed")?;
+
+    CROSS_SIG_READY.store(child_ready, Ordering::Release);
+    CROSS_SIG_RESUME.store(child_resume, Ordering::Release);
+    CROSS_SIG_DONE.store(child_done, Ordering::Release);
+
+    let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
+        .map_err(|_| "cap_create_thread for preempt_isolation_cross_cpu failed")?;
+
+    // Pin to CPU 0 initially: the child must run and load its
+    // extended-state registers on CPU 0 before the migration step.
+    thread_set_affinity(th, 0)
+        .map_err(|_| "initial thread_set_affinity(0) for preempt_isolation_cross_cpu failed")?;
+
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CROSS));
+    thread_configure(th, child_cross_entry as *const () as u64, stack_top, 0)
+        .map_err(|_| "thread_configure for preempt_isolation_cross_cpu failed")?;
+    thread_start(th).map_err(|_| "thread_start for preempt_isolation_cross_cpu failed")?;
+
+    // Wait for the child to load its extended-state registers on CPU 0 and
+    // signal ready.
+    // The parent blocks (yielding CPU 0) so the child can run; the child
+    // then loads PATTERN_A, briefly spins, signals ready, and blocks on
+    // sig_resume.
+    let _ = notification_wait(sig_ready)
+        .map_err(|_| "notification_wait ready for preempt_isolation_cross_cpu failed")?;
+
+    // Change affinity to CPU 1 while the child is Blocked. This just
+    // updates the affinity field; the migration happens at wake time.
+    thread_set_affinity(th, 1)
+        .map_err(|_| "thread_set_affinity(1) for preempt_isolation_cross_cpu failed")?;
+
+    // Wake the child. The wake path enqueues it on CPU 1's run queue; its
+    // extended state was saved into its TCB area when it switched out on
+    // CPU 0 and is restored on its first FP op on CPU 1 (see
+    // core/kernel/docs/scheduler.md § What Gets Saved and Restored).
+    notification_send(sig_resume, 0x1)
+        .map_err(|_| "notification_send resume for preempt_isolation_cross_cpu failed")?;
+
+    let _ = notification_wait(sig_done)
+        .map_err(|_| "notification_wait done for preempt_isolation_cross_cpu failed")?;
+
+    let mismatches = CROSS_MISMATCHES.load(Ordering::Acquire);
+    let observed_cpu = CROSS_OBSERVED_CPU.load(Ordering::Acquire);
+
+    cap_delete(th).map_err(|_| "cap_delete th after preempt_isolation_cross_cpu failed")?;
+    cap_delete(sig_ready)
+        .map_err(|_| "cap_delete sig_ready after preempt_isolation_cross_cpu failed")?;
+    cap_delete(sig_resume)
+        .map_err(|_| "cap_delete sig_resume after preempt_isolation_cross_cpu failed")?;
+    cap_delete(sig_done)
+        .map_err(|_| "cap_delete sig_done after preempt_isolation_cross_cpu failed")?;
+    cap_delete(cs).map_err(|_| "cap_delete cs after preempt_isolation_cross_cpu failed")?;
+
+    crate::log_u64(
+        "fpu::preempt_isolation_cross_cpu observed_cpu=",
+        u64::from(observed_cpu),
+    );
+    crate::log_u64("fpu::preempt_isolation_cross_cpu mismatches=", mismatches);
+    if mismatches != 0
+    {
+        return Err("cross-CPU child observed extended-state corruption after migration");
+    }
+    // The migration was either actually cross-CPU (observed != 0) or the
+    // scheduler kept the child on its original CPU. In either case, the
+    // FP state must be intact; no cross-CPU FPU coordination exists (see
+    // core/kernel/docs/scheduling-internals.md § IPI Taxonomy). We log the
+    // observed CPU for diagnostics but do not gate the test on it — the
+    // existing `thread::affinity_migrate_ready_queued` test already covers
+    // strict affinity enforcement.
+    Ok(())
 }

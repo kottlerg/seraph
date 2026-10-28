@@ -3,7 +3,7 @@
 
 // programs/threadstack/tester/src/main.rs
 
-//! Per-program tester for `/programs/threadstack`. Spawns it in two modes
+//! Per-program tester for `/programs/threadstack`. Spawns it in three modes
 //! (demand-paged by the system default) and asserts, capability-natively
 //! (stdout marker is the verdict;
 //! the kernel's fault-class exit reason is corroborating mechanism only):
@@ -14,6 +14,9 @@
 //!     page; the process must NOT exit cleanly (the guard fault kills it and
 //!     procmgr tears the process down), must not print `SURVIVED`, and should
 //!     carry a fault-class exit reason (`>= EXIT_FAULT_BASE`).
+//!   * `bigframe` — a worker calls a function whose one frame is larger than
+//!     its usable stack and writes only the frame's lowest byte, past the
+//!     guard page; same verdict as `guard`, which only stack probes deliver.
 //!
 //! See [docs/testing.md](../../../docs/testing.md) for the protocol.
 
@@ -68,33 +71,39 @@ fn check_grow()
     }
 }
 
+/// Run an overflow `mode` (`guard` or `bigframe`), whose fixture must reach the
+/// overflow point and then be killed by the guard-page fault.
 // cast_sign_loss: ExitStatus::code() is i32, but exit reasons are non-negative
 // (clean 0, fault 0x1000+vector); the u64 cast preserves the value.
 #[allow(clippy::cast_sign_loss)]
-fn check_guard()
+fn check_overflow(mode: &str)
 {
-    let (out, status) = run("guard");
+    let (out, status) = run(mode);
     if out.lines().any(|l| l.trim() == "SURVIVED (BUG)")
     {
-        fail("guard page did not fault — overflow survived");
+        fail(&format!(
+            "{mode}: guard page did not fault — overflow survived"
+        ));
     }
     if !out.lines().any(|l| l.contains("about to overflow"))
     {
-        println!("[threadstack-tester] guard stdout: {out:?}");
-        fail("guard fixture never reached the overflow point");
+        println!("[threadstack-tester] {mode} stdout: {out:?}");
+        fail(&format!("{mode} fixture never reached the overflow point"));
     }
     if status.success()
     {
-        fail("guard overflow exited cleanly — must be killed");
+        fail(&format!("{mode} overflow exited cleanly — must be killed"));
     }
     // Corroborating mechanism: the death reason should be a fault class, not an
     // application exit code. Advisory — the primary verdict is the non-clean
     // exit plus the absence of SURVIVED.
-    let raw = status.code().expect("guard ExitStatus must carry a code") as u64;
+    let raw = status
+        .code()
+        .expect("overflow ExitStatus must carry a code") as u64;
     if raw < EXIT_FAULT_BASE
     {
         fail(&format!(
-            "guard death reason {raw:#x} is not a fault class (>= {EXIT_FAULT_BASE:#x})"
+            "{mode} death reason {raw:#x} is not a fault class (>= {EXIT_FAULT_BASE:#x})"
         ));
     }
 }
@@ -102,6 +111,7 @@ fn check_guard()
 fn main()
 {
     check_grow();
-    check_guard();
+    check_overflow("guard");
+    check_overflow("bigframe");
     println!("[threadstack-tester] PASS");
 }

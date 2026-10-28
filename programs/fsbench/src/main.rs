@@ -111,6 +111,22 @@ fn read_inline(f: &mut File, size: u64, buf: &mut [u8]) -> u64
     consumed
 }
 
+/// `f.read(buf)`, read again while it returns `Interrupted`: a frame-path
+/// read returns that, with the position unchanged, when std discarded a copy
+/// whose page the driver may have released during it.
+fn read_retrying(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize>
+{
+    loop
+    {
+        match f.read(buf)
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted =>
+            {}
+            r => return r,
+        }
+    }
+}
+
 /// Read `size` bytes from `f` starting at offset 0, passing a full
 /// `PAGE_SIZE` buffer so std picks the frame path (`want > 504`) on
 /// every call.
@@ -120,7 +136,7 @@ fn read_frame(f: &mut File, size: u64, buf: &mut [u8]) -> u64
     let mut consumed: u64 = 0;
     while consumed < size
     {
-        let n = f.read(buf).expect("frame read failed");
+        let n = read_retrying(f, buf).expect("frame read failed");
         if n == 0
         {
             break;
@@ -200,7 +216,7 @@ fn verify_fixture(f: &mut File)
     // the std-side policy picks the frame path.
     f.seek(SeekFrom::Start(4080))
         .expect("verify: seek 4080 failed");
-    let n = f.read(&mut buf).expect("verify: page-straddle read failed");
+    let n = read_retrying(f, &mut buf).expect("verify: page-straddle read failed");
     assert!(n > 0, "verify: page-straddle returned zero");
     let expected: u8 = 0xF0;
     assert_eq!(

@@ -55,9 +55,9 @@
 //! ever `BlockedOnReply`) would pass trivially. To rule that out, the server
 //! signals [`BIT_SERVER_ARMED`] *only after* `ipc_recv` succeeds — a
 //! successful recv is itself proof the client reached `BlockedOnReply` on this
-//! server. The controller waits for that bit every cycle and asserts it
-//! collected exactly one per armed cycle; a missing bit fails the test rather
-//! than passing vacuously. (The client's own wake is *not* required: whichever
+//! server. The controller waits for that bit every cycle, bounded, and a
+//! cycle whose bit does not arrive fails the test rather than passing
+//! vacuously. (The client's own wake is *not* required: whichever
 //! teardown wins, a stopped client stays `Stopped` and never runs its tail, so
 //! gating on a client-side bit would be racy. It signals [`BIT_CLIENT_WOKE`]
 //! best-effort only.)
@@ -68,10 +68,14 @@
 //! cores to race). Post-#317 the harness boots clean to
 //! `[ktest] ALL TESTS PASSED`. With a second stopper, the cell also requires
 //! every second stop to have finished before the cycle's cleanup, and some
-//! second stop to have returned `Ok`: the second stopper sometimes reached the
-//! client before it was stopped or gone, rather than always arriving late.
-//! Userspace cannot observe that the two cancels overlapped inside one
-//! client's `sched_lock` window, so that interleaving is reached
+//! second stop in a stop-first (A-first) cycle to have returned `Ok`. In
+//! those cycles the client stays reply-blocked until a stop cancels it (the
+//! controller's stop returns before its delete of the server), so an `Ok`
+//! there shows the second stopper's cancel reached a reply-blocked client,
+//! rather than always arriving late. In a delete-first (B-first) cycle an
+//! `Ok` can also stop a client the server's death already woke, so those are
+//! not counted. Userspace cannot observe that the two cancels overlapped
+//! inside one client's `sched_lock` window, so that interleaving is reached
 //! statistically across the cycles. Any use-after-free of the freed server TCB
 //! surfaces as a kernel magic-cookie debug-assert / `#PF` / double-enqueue
 //! panic that the harness reports as FAIL — it is raised by the kernel, not by
@@ -82,11 +86,11 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
-    notification_send, notification_wait, thread_exit, thread_set_affinity, thread_sleep,
-    thread_stop,
+    notification_send, thread_exit, thread_set_affinity, thread_sleep, thread_stop,
 };
 use syscall_abi::{RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, RIGHTS_THREAD_CONTROL, SystemInfoType};
 
+use crate::tally::await_report;
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 /// Number of stop-vs-free races to run. Tunable; 300 gives the cross-CPU
@@ -129,7 +133,9 @@ static STOPPER_GO: AtomicU32 = AtomicU32::new(0);
 /// Second stopper → controller: the cycle, counted from 1, whose stop it has
 /// returned from.
 static STOPPER_DONE: AtomicU32 = AtomicU32::new(0);
-/// Second stops that returned `Ok`.
+/// Second stops that returned `Ok` in a stop-first cycle, where the client
+/// is reply-blocked until a stop cancels it (see the module's § Pass
+/// criterion).
 static SECOND_STOPS_OK: AtomicU32 = AtomicU32::new(0);
 
 /// A page-aligned 4 KiB IPC buffer page (512 `u64` words, the same shape as
@@ -222,142 +228,206 @@ enum Stops
 }
 
 /// Run [`CYCLES`] races with the children placed per `place` and stopped by
-/// `stops`.
+/// `stops`. Every cycle must arm its race ([`one_cycle`] fails one that does
+/// not).
 fn cycles(ctx: &TestContext, place: Placement, stops: Stops) -> TestResult
 {
-    let second_stopper = stops == Stops::Double;
     STOPPER_GO.store(0, Ordering::Release);
     STOPPER_DONE.store(0, Ordering::Release);
     SECOND_STOPS_OK.store(0, Ordering::Release);
-
-    // Anti-vacuous accumulator: every cycle must arm the race exactly once.
-    let mut armed_cycles = 0usize;
 
     for cycle in 0..CYCLES
     {
         // CYCLES is a compile-time constant well below u32::MAX, so the narrow
         // cast is safe; try_from keeps clippy honest.
         let cycle_u32 = u32::try_from(cycle).unwrap_or(0);
-        let server_cpu = place.cpu(cycle_u32, 0);
-        // Different CPU from the server: the cancel-CAS and the dealloc-free
-        // must run on different cores to actually race (see `Placement`).
-        let client_cpu = place.cpu(cycle_u32, 1);
-
-        let ep = cap_create_endpoint(ctx.memory_base)
-            .map_err(|_| "stress::stop_reply_race: cap_create_endpoint failed")?;
-        let done = cap_create_notification(ctx.memory_base)
-            .map_err(|_| "stress::stop_reply_race: cap_create_notification failed")?;
-
-        // ── Client child: SEND|GRANT on ep, signal on done. ─────────────────
-        let client = spawn::new_child(ctx)
-            .map_err(|_| "stress::stop_reply_race: spawn::new_child client failed")?;
-        let client_ep = cap_copy(ep, client.cs, RIGHTS_EP_SEND_GRANT)
-            .map_err(|_| "stress::stop_reply_race: cap_copy client ep failed")?;
-        let client_done = cap_copy(done, client.cs, RIGHTS_SIGNAL)
-            .map_err(|_| "stress::stop_reply_race: cap_copy client done failed")?;
-        // arg packs ep_slot[31:0] | done_slot[63:32]; the child reads its own
-        // dedicated IPC buffer address from the static directly.
-        let client_arg = u64::from(client_ep) | (u64::from(client_done) << 32);
-        // SAFETY: stack index 1 is the client's; sequential cycles never alias.
-        let client_stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
-        spawn::configure_and_start_pinned(
-            &client,
-            client_entry,
-            client_stack,
-            client_arg,
-            client_cpu,
-        )
-        .map_err(|_| "stress::stop_reply_race: start client failed")?;
-
-        let stopper = if second_stopper
-        {
-            Some(spawn_stopper(
-                ctx,
-                client.th,
-                cycle_u32,
-                place.cpu(cycle_u32, 2),
-            )?)
-        }
-        else
-        {
-            None
-        };
-
-        // Let the client reach `ipc_call` and park on the endpoint send queue
-        // before the server receives it (the children run strictly below
-        // this thread's priority, so it must block).
-        let _ = thread_sleep(1);
-
-        // ── Server child: RECEIVE on ep, signal on done. ────────────────────
-        let server = spawn::new_child(ctx)
-            .map_err(|_| "stress::stop_reply_race: spawn::new_child server failed")?;
-        let server_ep = cap_copy(ep, server.cs, RIGHTS_EP_RECEIVE)
-            .map_err(|_| "stress::stop_reply_race: cap_copy server ep failed")?;
-        let server_done = cap_copy(done, server.cs, RIGHTS_SIGNAL)
-            .map_err(|_| "stress::stop_reply_race: cap_copy server done failed")?;
-        // arg packs ep_slot[31:0] | done_slot[63:32]; the child reads its own
-        // dedicated IPC buffer address from the static directly.
-        let server_arg = u64::from(server_ep) | (u64::from(server_done) << 32);
-        // SAFETY: stack index 0 is the server's; sequential cycles never alias.
-        let server_stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
-        spawn::configure_and_start_pinned(
-            &server,
-            server_entry,
-            server_stack,
-            server_arg,
-            server_cpu,
-        )
-        .map_err(|_| "stress::stop_reply_race: start server failed")?;
-
-        // Wait until the server has dequeued the client. The armed bit is
-        // raised only after `ipc_recv` returns, so its arrival proves the
-        // client is `BlockedOnReply` on this server — the live window in which
-        // `reply_tcb = client` and the server is about to be deleted.
-        let mut acc = 0u64;
-        while acc & BIT_SERVER_ARMED == 0
-        {
-            let bits = notification_wait(done)
-                .map_err(|_| "stress::stop_reply_race: notification_wait(armed) failed")?;
-            acc |= bits;
-        }
-        armed_cycles += 1;
-
-        // A little more wall time so the server has finished recv and exited
-        // without replying: its TCB stays allocated (Exited, `reply_tcb` still
-        // bound to the client) until the `cap_delete(server.th)` below.
-        let _ = thread_sleep(1);
-
-        race(cycle_u32, client.th, server.th, stopper)?;
-
-        // ── Per-cycle cleanup. ──────────────────────────────────────────────
-        //
-        // The client is now Stopped (if A won) or woken-and-exited (if B won);
-        // either way `cap_delete` reaps its TCB — the BlockedOnReply twin arm
-        // of dealloc(client) racing the same teardown. The server thread cap is
-        // already deleted above; drop the rest.
-        cap_delete(server.cs)
-            .map_err(|_| "stress::stop_reply_race: cap_delete server cs failed")?;
-        cap_delete(client.th)
-            .map_err(|_| "stress::stop_reply_race: cap_delete client th failed")?;
-        cap_delete(client.cs)
-            .map_err(|_| "stress::stop_reply_race: cap_delete client cs failed")?;
-        cap_delete(ep).map_err(|_| "stress::stop_reply_race: cap_delete ep failed")?;
-        cap_delete(done).map_err(|_| "stress::stop_reply_race: cap_delete done failed")?;
+        one_cycle(ctx, place, stops, cycle_u32)?;
     }
-
-    // Non-vacuous: the race armed on every cycle, so a clean boot reflects the
-    // stop-vs-free path actually executing, not a setup that silently no-op'd.
-    if armed_cycles != CYCLES
+    if stops == Stops::Double
     {
-        return Err("stress::stop_reply_race: race never armed on some cycle");
+        check_second_stops()?;
     }
-    if second_stopper && SECOND_STOPS_OK.load(Ordering::Acquire) == 0
+    Ok(())
+}
+
+/// One cycle's objects and children; [`reap_cycle`] deletes whichever exist.
+#[derive(Default)]
+struct CycleParts
+{
+    ep: Option<u32>,
+    done: Option<u32>,
+    client: Option<spawn::SpawnedChild>,
+    stopper: Option<spawn::SpawnedChild>,
+    server: Option<spawn::SpawnedChild>,
+    /// Whether [`race`] has deleted the server's Thread cap, as the race's
+    /// free.
+    server_th_deleted: bool,
+}
+
+/// One cycle: create the endpoint and `done`, start the client, the second
+/// stopper (if any) and the server, wait for the race to arm, race, and
+/// delete everything the cycle created on every path, so a failed cycle
+/// leaves no child running on its CPU or stack.
+fn one_cycle(ctx: &TestContext, place: Placement, stops: Stops, cycle: u32) -> TestResult
+{
+    let mut parts = CycleParts::default();
+    let result = arm_and_race(ctx, place, stops, cycle, &mut parts);
+    let reaped = reap_cycle(&parts);
+    result?;
+    reaped
+}
+
+/// The body of [`one_cycle`], recording each object and child in `parts` as
+/// soon as it exists.
+fn arm_and_race(
+    ctx: &TestContext,
+    place: Placement,
+    stops: Stops,
+    cycle: u32,
+    parts: &mut CycleParts,
+) -> TestResult
+{
+    let server_cpu = place.cpu(cycle, 0);
+    // Different CPU from the server: the cancel-CAS and the dealloc-free
+    // must run on different cores to actually race (see `Placement`).
+    let client_cpu = place.cpu(cycle, 1);
+
+    let ep = *parts.ep.insert(
+        cap_create_endpoint(ctx.memory_base)
+            .map_err(|_| "stress::stop_reply_race: cap_create_endpoint failed")?,
+    );
+    let done = *parts.done.insert(
+        cap_create_notification(ctx.memory_base)
+            .map_err(|_| "stress::stop_reply_race: cap_create_notification failed")?,
+    );
+
+    let client_th = spawn_client(ctx, ep, done, client_cpu, &mut parts.client)?;
+    if stops == Stops::Double
+    {
+        spawn_stopper(
+            ctx,
+            client_th,
+            cycle,
+            place.cpu(cycle, 2),
+            &mut parts.stopper,
+        )?;
+    }
+
+    // Let the client reach `ipc_call` and park on the endpoint send queue
+    // before the server receives it (the children run strictly below this
+    // thread's priority, so it must block). Any sleep outcome serves: the
+    // server receives the call whenever it is queued.
+    let _ = thread_sleep(1);
+
+    let server_th = spawn_server(ctx, ep, done, server_cpu, &mut parts.server)?;
+
+    // Wait until the server has dequeued the client. The armed bit is raised
+    // only after `ipc_recv` returns, so its arrival proves the client is
+    // `BlockedOnReply` on this server — the live window in which
+    // `reply_tcb = client` and the server is about to be deleted. A server
+    // that never receives fails the cycle (the race never armed) instead of
+    // hanging the run.
+    let mut acc = 0u64;
+    await_report(
+        done,
+        &mut acc,
+        BIT_SERVER_ARMED,
+        "stress::stop_reply_race: race never armed on some cycle",
+    )?;
+
+    // A little more wall time so the server has finished recv and exited
+    // without replying: its TCB stays allocated (Exited, `reply_tcb` still
+    // bound to the client) until `race` deletes its Thread cap. Any sleep
+    // outcome serves, as above.
+    let _ = thread_sleep(1);
+
+    race(
+        cycle,
+        client_th,
+        server_th,
+        &mut parts.server_th_deleted,
+        parts.stopper.is_some(),
+    )
+}
+
+/// Per-cycle cleanup, on every path. On the passing path the client is now
+/// Stopped (if A won) or woken-and-exited (if B won); either way `cap_delete`
+/// reaps its TCB — the `BlockedOnReply` twin arm of dealloc(client) racing
+/// the same teardown. Deleting a child's Thread cap stops it wherever it is,
+/// so on a failing path no child outlives the cycle. Returns the first
+/// delete that failed.
+fn reap_cycle(parts: &CycleParts) -> TestResult
+{
+    let mut deletes: [Option<(u32, &'static str)>; 8] = [None; 8];
+    if let Some(server) = &parts.server
+    {
+        if !parts.server_th_deleted
+        {
+            deletes[0] = Some((
+                server.th,
+                "stress::stop_reply_race: cap_delete server th failed",
+            ));
+        }
+        deletes[1] = Some((
+            server.cs,
+            "stress::stop_reply_race: cap_delete server cs failed",
+        ));
+    }
+    if let Some(stopper) = &parts.stopper
+    {
+        deletes[2] = Some((
+            stopper.th,
+            "stress::stop_reply_race: cap_delete stopper th failed",
+        ));
+        deletes[3] = Some((
+            stopper.cs,
+            "stress::stop_reply_race: cap_delete stopper cs failed",
+        ));
+    }
+    if let Some(client) = &parts.client
+    {
+        deletes[4] = Some((
+            client.th,
+            "stress::stop_reply_race: cap_delete client th failed",
+        ));
+        deletes[5] = Some((
+            client.cs,
+            "stress::stop_reply_race: cap_delete client cs failed",
+        ));
+    }
+    deletes[6] = parts
+        .ep
+        .map(|ep| (ep, "stress::stop_reply_race: cap_delete ep failed"));
+    deletes[7] = parts
+        .done
+        .map(|done| (done, "stress::stop_reply_race: cap_delete done failed"));
+    let mut result = Ok(());
+    for (cap, err) in deletes.into_iter().flatten()
+    {
+        if cap_delete(cap).is_err() && result.is_ok()
+        {
+            result = Err(err);
+        }
+    }
+    result
+}
+
+/// With a second stopper, some stop-first cycle's second stop must have
+/// committed on the reply-blocked client ([`SECOND_STOPS_OK`]).
+fn check_second_stops() -> TestResult
+{
+    let committed = SECOND_STOPS_OK.load(Ordering::Acquire);
+    crate::log_u64(
+        "ktest: stress::stop_reply_race stop-first second stops ok=",
+        u64::from(committed),
+    );
+    if committed == 0
     {
         return Err(
-            "stress::stop_reply_race: no second stop committed (the two-stop race never armed)",
+            "stress::stop_reply_race: no second stop committed on a reply-blocked client (the \
+             two-stop race never armed)",
         );
     }
-
     Ok(())
 }
 
@@ -368,61 +438,128 @@ fn cycles(ctx: &TestContext, place: Placement, stops: Stops) -> TestResult
 /// TCB. Client and server are pinned to different CPUs, so A's CAS and B's
 /// free execute on different cores; the issue order alternates by cycle
 /// parity to cover both interleavings. A second stopper, if any, is released
-/// first and races A with a second cancel, then is reaped once its stop
-/// returns.
+/// first and races A with a second cancel, and is waited out once its stop
+/// returns. Sets `server_th_deleted` once the server's Thread cap is deleted.
 fn race(
     cycle: u32,
     client_th: u32,
     server_th: u32,
-    stopper: Option<spawn::SpawnedChild>,
+    server_th_deleted: &mut bool,
+    second_stopper: bool,
 ) -> TestResult
 {
     STOPPER_GO.store(cycle + 1, Ordering::Release);
+    // The stop's outcome depends on which teardown reached the client first
+    // (`Ok`, `InvalidState`, or an error for a client already exited); the
+    // race, not its return, is what the cell exercises.
     if cycle.is_multiple_of(2)
     {
         let _ = thread_stop(client_th);
         cap_delete(server_th)
             .map_err(|_| "stress::stop_reply_race: cap_delete server th (A-first) failed")?;
+        *server_th_deleted = true;
     }
     else
     {
         cap_delete(server_th)
             .map_err(|_| "stress::stop_reply_race: cap_delete server th (B-first) failed")?;
+        *server_th_deleted = true;
+        // As above: any outcome of this stop is accepted.
         let _ = thread_stop(client_th);
     }
 
-    if let Some(stopper) = stopper
+    if second_stopper
     {
         await_stopper(cycle + 1)?;
-        cap_delete(stopper.th)
-            .map_err(|_| "stress::stop_reply_race: cap_delete stopper th failed")?;
-        cap_delete(stopper.cs)
-            .map_err(|_| "stress::stop_reply_race: cap_delete stopper cs failed")?;
     }
     Ok(())
 }
 
+/// Spawn the cycle's client on `cpu`, holding SEND|GRANT on `ep` and a
+/// signal copy of `done`, into `slot` (stored before anything can fail, so
+/// the cycle's reap deletes it). Returns its Thread cap.
+fn spawn_client(
+    ctx: &TestContext,
+    ep: u32,
+    done: u32,
+    cpu: u32,
+    slot: &mut Option<spawn::SpawnedChild>,
+) -> Result<u32, &'static str>
+{
+    let client = slot.insert(
+        spawn::new_child(ctx)
+            .map_err(|_| "stress::stop_reply_race: spawn::new_child client failed")?,
+    );
+    let client_ep = cap_copy(ep, client.cs, RIGHTS_EP_SEND_GRANT)
+        .map_err(|_| "stress::stop_reply_race: cap_copy client ep failed")?;
+    let client_done = cap_copy(done, client.cs, RIGHTS_SIGNAL)
+        .map_err(|_| "stress::stop_reply_race: cap_copy client done failed")?;
+    // arg packs ep_slot[31:0] | done_slot[63:32]; the child reads its own
+    // dedicated IPC buffer address from the static directly.
+    let arg = u64::from(client_ep) | (u64::from(client_done) << 32);
+    // SAFETY: stack index 1 is the client's; each cycle reaps its client
+    // before the next starts.
+    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
+    spawn::configure_and_start_pinned(client, client_entry, stack, arg, cpu)
+        .map_err(|_| "stress::stop_reply_race: start client failed")?;
+    Ok(client.th)
+}
+
+/// Spawn the cycle's server on `cpu`, holding RECEIVE on `ep` and a signal
+/// copy of `done`, into `slot` (stored before anything can fail, so the
+/// cycle's reap deletes it). Returns its Thread cap.
+fn spawn_server(
+    ctx: &TestContext,
+    ep: u32,
+    done: u32,
+    cpu: u32,
+    slot: &mut Option<spawn::SpawnedChild>,
+) -> Result<u32, &'static str>
+{
+    let server = slot.insert(
+        spawn::new_child(ctx)
+            .map_err(|_| "stress::stop_reply_race: spawn::new_child server failed")?,
+    );
+    let server_ep = cap_copy(ep, server.cs, RIGHTS_EP_RECEIVE)
+        .map_err(|_| "stress::stop_reply_race: cap_copy server ep failed")?;
+    let server_done = cap_copy(done, server.cs, RIGHTS_SIGNAL)
+        .map_err(|_| "stress::stop_reply_race: cap_copy server done failed")?;
+    // arg packs ep_slot[31:0] | done_slot[63:32]; the child reads its own
+    // dedicated IPC buffer address from the static directly.
+    let arg = u64::from(server_ep) | (u64::from(server_done) << 32);
+    // SAFETY: stack index 0 is the server's; each cycle reaps its server
+    // before the next starts.
+    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
+    spawn::configure_and_start_pinned(server, server_entry, stack, arg, cpu)
+        .map_err(|_| "stress::stop_reply_race: start server failed")?;
+    Ok(server.th)
+}
+
 /// Spawn the cycle's second stopper on `cpu`, distinct from the server's, the
 /// client's and the controller's (see `Placement`), holding a CONTROL copy of
-/// the client's Thread capability.
+/// the client's Thread capability, into `slot` (stored before anything can
+/// fail, so the cycle's reap deletes it).
 fn spawn_stopper(
     ctx: &TestContext,
     client_th: u32,
     cycle: u32,
     cpu: u32,
-) -> Result<spawn::SpawnedChild, &'static str>
+    slot: &mut Option<spawn::SpawnedChild>,
+) -> TestResult
 {
-    let stopper = spawn::new_child(ctx)
-        .map_err(|_| "stress::stop_reply_race: spawn::new_child stopper failed")?;
+    let stopper = slot.insert(
+        spawn::new_child(ctx)
+            .map_err(|_| "stress::stop_reply_race: spawn::new_child stopper failed")?,
+    );
     let target = cap_copy(client_th, stopper.cs, RIGHTS_THREAD_CONTROL)
         .map_err(|_| "stress::stop_reply_race: cap_copy stopper target failed")?;
     // arg packs target_slot[31:0] | cycle (from 1)[63:32].
     let arg = u64::from(target) | (u64::from(cycle + 1) << 32);
-    // SAFETY: stack index 2 is the stopper's; sequential cycles never alias.
+    // SAFETY: stack index 2 is the stopper's; each cycle reaps its stopper
+    // before the next starts.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[2]) });
-    spawn::configure_and_start_pinned(&stopper, stopper_entry, stack, arg, cpu)
-        .map_err(|_| "stress::stop_reply_race: start stopper failed")?;
-    Ok(stopper)
+    spawn::configure_and_start_pinned(stopper, stopper_entry, stack, arg, cpu)
+        .map_err(|_| "stress::stop_reply_race: start stopper failed")
 }
 
 /// Wait, bounded by [`STOPPER_WAIT_MS`], until the second stopper has
@@ -457,7 +594,7 @@ fn decode(arg: u64) -> (u32, u32)
 /// Server: receive one caller (making it `BlockedOnReply`), announce that the
 /// race is armed, busy-spin briefly to stay live, then exit **without
 /// replying** — leaving the client parked on a server about to be deleted.
-fn server_entry(arg: u64) -> !
+extern "C" fn server_entry(arg: u64) -> !
 {
     let (ep_slot, done_slot) = decode(arg);
     // SAFETY: the server child of the current cycle is the sole user of
@@ -492,7 +629,7 @@ fn server_entry(arg: u64) -> !
 // cast_possible_truncation: the target is a kernel cap slot index < 2^32 and
 // the cycle fits the high half.
 #[allow(clippy::cast_possible_truncation)]
-fn stopper_entry(arg: u64) -> !
+extern "C" fn stopper_entry(arg: u64) -> !
 {
     let target = (arg & 0xFFFF_FFFF) as u32;
     let round = (arg >> 32) as u32;
@@ -504,10 +641,14 @@ fn stopper_entry(arg: u64) -> !
     {
         core::hint::spin_loop();
     }
-    // Ok, InvalidState (the controller's stop reached the client first), or
-    // an error for a client already woken and exited: only the commit is
-    // tallied.
-    if thread_stop(target).is_ok()
+    // Ok: this stop reached the client first, or, in a delete-first cycle,
+    // stopped a client the server's death already woke and that has not yet
+    // exited. InvalidState: the controller's stop reached the client first.
+    // Another error: the client was already woken and exited. Only an Ok in a
+    // stop-first cycle (`race` stops before it deletes on even cycles, the
+    // odd rounds), where the client is reply-blocked until a stop cancels it,
+    // is tallied.
+    if thread_stop(target).is_ok() && round % 2 == 1
     {
         SECOND_STOPS_OK.fetch_add(1, Ordering::AcqRel);
     }
@@ -518,7 +659,7 @@ fn stopper_entry(arg: u64) -> !
 /// Client: call the endpoint (blocking `BlockedOnReply` on the server TCB). If
 /// the call returns at all (woken by the server's death rather than stopped),
 /// raise a best-effort woke bit. A stopped client never reaches this tail.
-fn client_entry(arg: u64) -> !
+extern "C" fn client_entry(arg: u64) -> !
 {
     let (ep_slot, done_slot) = decode(arg);
     // SAFETY: the client child of the current cycle is the sole user of

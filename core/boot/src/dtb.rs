@@ -223,12 +223,10 @@ impl Fdt
     /// Returns an empty slice if out of bounds.
     fn struct_slice(&self, off: u32, len: u32) -> &[u8]
     {
-        let end = match off.checked_add(len)
+        if off.checked_add(len).is_none_or(|e| e > self.size_struct)
         {
-            Some(e) if e <= self.size_struct => e,
-            _ => return &[],
-        };
-        let _ = end;
+            return &[];
+        }
         let addr = self.base + u64::from(self.off_struct) + u64::from(off);
         // SAFETY: bounds validated above; slice within struct block.
         unsafe { core::slice::from_raw_parts(addr as *const u8, len as usize) }

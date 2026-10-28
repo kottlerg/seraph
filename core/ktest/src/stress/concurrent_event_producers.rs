@@ -57,7 +57,7 @@ static PRODUCER_ARGS: spawn::ArgBlock<ProducerArgs, NUM_PRODUCERS> =
 /// producer id, then post done bit.
 ///
 /// `arg`: address of this producer's [`ProducerArgs`].
-fn producer_entry(arg: u64) -> !
+extern "C" fn producer_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this producer.
     let ProducerArgs {

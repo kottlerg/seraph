@@ -12,7 +12,7 @@
 //!
 //! Field coverage:
 //! - `CAP_INFO_TAG_RIGHTS` against several cap tags (`Memory`, `AddressSpace`,
-//!   `Notification`).
+//!   `Notification`, `CSpace`).
 //! - Creation-mint masks of every userspace-creatable type against the ABI's
 //!   per-type rights constants (`creation_masks_match_abi`).
 //! - `CAP_INFO_MEMORY_*` against a Memory cap.
@@ -346,7 +346,8 @@ fn bound_creation_masks(ctx: &TestContext) -> TestResult
 
 // ── CSpace-specific fields ───────────────────────────────────────────────────
 
-/// `CSpace` fields report the currently-backed capacity.
+/// `CSpace` fields report the currently-backed capacity, and the cap's tag
+/// is `CSpace`.
 ///
 /// A fresh `init_pages = 4` cspace (3 pool pages, none consumed) reports
 /// `capacity == 3 × 56`, `used == 0`, and `budget == 3` pages. Inserting
@@ -367,6 +368,14 @@ pub fn cspace_fields(ctx: &TestContext) -> TestResult
         cap_info(cs, CAP_INFO_CSPACE_USED).map_err(|_| "cap_info(cspace, CSPACE_USED) failed")?;
     let fresh_budget = cap_info(cs, CAP_INFO_CSPACE_BUDGET)
         .map_err(|_| "cap_info(cspace, CSPACE_BUDGET) failed")?;
+    let (tag, _) = unpack_tag_rights(
+        cap_info(cs, CAP_INFO_TAG_RIGHTS).map_err(|_| "cap_info(cspace, TAG_RIGHTS) failed")?,
+    );
+    if tag != TAG_CSPACE
+    {
+        cap_delete(cs).ok();
+        return Err("cap_info(cspace, TAG_RIGHTS) did not report the CSpace tag");
+    }
 
     // Populate one slot so the first slot page is drawn from the pool.
     let probe =
@@ -488,18 +497,3 @@ pub fn unknown_field_invalid_arg(ctx: &TestContext) -> TestResult
     }
     Ok(())
 }
-
-// CapTag values are kept aligned with the kernel; if the enum gains a new
-// variant the constants above need updating in lockstep.
-const _: () = {
-    // Restates each constant's literal; this does not check the values
-    // against core/kernel/src/cap/slot.rs `CapTag`, which is kept in sync by hand.
-    assert!(TAG_MEMORY == 1);
-    assert!(TAG_ADDRESS_SPACE == 2);
-    assert!(TAG_SIGNAL == 4);
-    assert!(TAG_CSPACE == 9);
-};
-
-// `TAG_CSPACE` is not read by any test; this item and the assertion block
-// above are its only references.
-const _: u8 = TAG_CSPACE;

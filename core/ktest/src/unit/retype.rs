@@ -134,8 +134,13 @@ fn install_stub(
 {
     let frame =
         crate::frame_pool::alloc().ok_or("retype::stub: frame_pool::alloc returned None")?;
-    mem_map(frame, ctx.aspace_cap, STUB_SCRATCH_VA, 0, 1, MAP_WRITABLE)
-        .map_err(|_| "retype::stub: scratch mem_map failed")?;
+    if mem_map(frame, ctx.aspace_cap, STUB_SCRATCH_VA, 0, 1, MAP_WRITABLE).is_err()
+    {
+        // SAFETY: `frame` came from `alloc` above and the failed map left it
+        // mapped nowhere.
+        unsafe { crate::frame_pool::free(frame) };
+        return Err("retype::stub: scratch mem_map failed");
+    }
     let mut bytes = [0u8; 32];
     let len = emit(&mut bytes);
     for (i, b) in bytes[..len].iter().enumerate()
@@ -143,10 +148,19 @@ fn install_stub(
         // SAFETY: STUB_SCRATCH_VA..+PAGE is mapped writable just above; i < 32.
         unsafe { (STUB_SCRATCH_VA as *mut u8).add(i).write_volatile(*b) };
     }
-    mem_unmap(ctx.aspace_cap, STUB_SCRATCH_VA, 1)
-        .map_err(|_| "retype::stub: scratch mem_unmap failed")?;
-    mem_map(frame, aspace, STUB_VA, 0, 1, MAP_EXECUTABLE)
-        .map_err(|_| "retype::stub: executable mem_map failed")?;
+    if mem_unmap(ctx.aspace_cap, STUB_SCRATCH_VA, 1).is_err()
+    {
+        // The frame is still mapped at STUB_SCRATCH_VA, and `free` requires
+        // it unmapped, so it stays allocated rather than re-enter the pool.
+        return Err("retype::stub: scratch mem_unmap failed");
+    }
+    if mem_map(frame, aspace, STUB_VA, 0, 1, MAP_EXECUTABLE).is_err()
+    {
+        // SAFETY: `frame` came from `alloc` above; the scratch mapping is
+        // gone and the failed map left it mapped nowhere.
+        unsafe { crate::frame_pool::free(frame) };
+        return Err("retype::stub: executable mem_map failed");
+    }
     Ok(frame)
 }
 
@@ -155,8 +169,6 @@ fn exited_reason(thread: u32, what: &'static str) -> Result<u64, &'static str>
 {
     let state = cap_info(thread, CAP_INFO_THREAD_STATE)
         .map_err(|_| "retype::aspace_stop: cap_info(thread state) failed")?;
-    // cast_possible_truncation: `>> 32` leaves the 32-bit state code, so the cast is exact.
-    #[allow(clippy::cast_possible_truncation)]
     if (state >> 32) as u32 != THREAD_STATE_EXITED
     {
         return Err(what);
@@ -320,7 +332,7 @@ pub fn aspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
         .map_err(|_| "retype::aspace_self_delete: memory did not return to baseline")
 }
 
-const SYS_OUT_OF_MEMORY: i64 = -8;
+const SYS_OUT_OF_MEMORY: i64 = syscall_abi::SyscallError::OutOfMemory as i64;
 
 /// Augment-mode on `cap_create_aspace` increases the target AS's PT
 /// growth budget without creating a new AS.
@@ -888,13 +900,12 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
         cap_delete(cspace).ok();
         return Err("retype::dir_survives: boundary augment failed");
     }
-    for i in 0..DIRECT_SLOTS
+    for _ in 0..DIRECT_SLOTS
     {
         if cap_copy(probe, cspace, 1).is_err()
         {
             cap_delete(probe).ok();
             cap_delete(cspace).ok();
-            let _ = i;
             return Err("retype::dir_survives: direct-region fill failed early");
         }
     }

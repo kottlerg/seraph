@@ -529,7 +529,7 @@ fn elapsed_us() -> Result<u64, &'static str>
 /// Helper: for each round the controller arms, report ready, spin until
 /// released, spin this side's delay, configure the round's thread to
 /// [`entry_b`], and report the result; exit once told to quit.
-fn helper_entry(_arg: u64) -> !
+extern "C" fn helper_entry(_arg: u64) -> !
 {
     let mut seen = 0u32;
     while let Some(seq) = next_round(seen)
@@ -605,13 +605,13 @@ fn classify(result: Result<(), i64>) -> u32
 }
 
 /// The first configure's entry: record the argument on [`A_TOP`]'s stack.
-fn entry_a(arg: u64) -> !
+extern "C" fn entry_a(arg: u64) -> !
 {
     ran(&RAN_A, &A_TOP, arg)
 }
 
 /// The racing configure's entry: record the argument on [`B_TOP`]'s stack.
-fn entry_b(arg: u64) -> !
+extern "C" fn entry_b(arg: u64) -> !
 {
     ran(&RAN_B, &B_TOP, arg)
 }

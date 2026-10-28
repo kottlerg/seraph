@@ -210,7 +210,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// * `p2c_slot` — parent-to-child Notification capability slot.
 // cast_possible_truncation: p2c_slot is a kernel cap slot index, guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn tlb_worker_thread(p2c_slot: u64) -> !
+extern "C" fn tlb_worker_thread(p2c_slot: u64) -> !
 {
     let p2c = p2c_slot as u32;
     // SAFETY: parent wrote CHILD_C2P_SLOT before thread_start; no concurrent writes.

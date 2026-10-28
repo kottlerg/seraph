@@ -159,7 +159,12 @@ namespace, a `cwd` that is neither `<path>` nor a path below it
 (compared by whole components, so `/data2` is outside `/data`) is a
 parser error, as is a `cwd` whose `<rights>` lack `LOOKUP`; namespace
 servers reject `.` and `..` components, so an accepted path cannot walk
-back out. With `namespace = none`, `cwd` is a parser error.
+back out. Under `namespace = universal`, a `cwd` of `/` is a parser
+error: it names svcmgr's root itself, and rights narrow only at an
+`NS_LOOKUP` hop, as
+[Namespace Model § Per-Entry Rights and Visibility](../../../docs/namespace-model.md#per-entry-rights-and-visibility)
+defines, so the walk cannot hand over the root with those rights. With
+`namespace = none`, `cwd` is a parser error.
 
 `std::env::current_dir()` returns `Unsupported` until a path string
 is recorded via `std::env::set_current_dir`; the cap and the

@@ -17,6 +17,9 @@
     "static-position-independent-executables": true,
     "plt-by-default": false,
     "has-thread-local": true,
+    "stack-probes": {
+        "kind": "inline"
+    },
     "tls-model": "local-exec",
     "code-model": "small",
     "relocation-model": "pic",

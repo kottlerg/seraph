@@ -112,12 +112,12 @@ request for more than 504 bytes with a short read of at most 504; see
 ## Label 7: `FS_READ_MEMORY`
 
 Memory-cap read. The driver returns a single-page Memory cap with
-attenuated rights (`MAP|READ`) covering the cached page that contains
-the requested byte. The client maps the memory cap, reads up to
-`bytes_valid` bytes starting at `memory_data_offset`, then releases
-the page either synchronously after the read, by sending
-[`FS_RELEASE_MEMORY`](#client-to-driver-release) on the node cap, or
-in response to a driver-initiated
+attenuated rights (`MAP` only: read-only mapping authority) covering
+the cached page that contains the requested byte. The client maps the
+memory cap, reads up to `bytes_valid` bytes starting at
+`memory_data_offset`, then releases the page either synchronously after
+the read, by sending [`FS_RELEASE_MEMORY`](#client-to-driver-release)
+on the node cap, or in response to a driver-initiated
 [`FS_RELEASE_MEMORY`](#driver-to-client-release) arriving on the
 per-process release endpoint.
 
@@ -167,7 +167,7 @@ outstanding pages on the file. This sharing is a defect, tracked in
 | `data[0]` | `bytes_valid` (zero on EOF) |
 | `data[1]` | Cookie echoed back |
 | `data[2]` | `memory_data_offset` |
-| `caps[0]` | Memory cap (`MAP|READ`, single page; omitted on EOF) |
+| `caps[0]` | Memory cap (`MAP` rights, single page; omitted on EOF) |
 
 **Reply (error)**: `label = NsError::*` or
 `fs_errors::BAD_MEMORY_OFFSET` (cookie zero).
@@ -378,7 +378,7 @@ crossover Issue tracks per-arch tuning.
 | `data[0]` | File byte offset |
 | `data[1]` | Bytes to write from the memory cap (`≤ PAGE_SIZE - memory_data_offset`) |
 | `data[2]` | Byte offset within the source memory cap where the data begins |
-| `caps[0]` | Source Memory cap (`MAP | READ` rights; one page) |
+| `caps[0]` | Source Memory cap (`MAP` rights, read-only mapping authority; one page) |
 
 **Reply (success)**: `label = 0`, `data[0]` = bytes_written,
 `caps[0]` = the source Memory cap moved back to the caller.

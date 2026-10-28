@@ -7,10 +7,12 @@
 //!
 //! Decodes the BIOS Parameter Block geometry and FAT directory entries
 //! (8.3 short names, long-file-name runs, case-insensitive matching) from raw
-//! sector bytes. This crate performs no I/O and holds no filesystem state: the
-//! `fatfs` service reads sectors over a block-device IPC, hands the bytes here,
-//! and keeps the geometry/cache/mutation engine on its side. Keeping the parse
-//! of untrusted on-disk structures pure and host-testable is the point — see
+//! sector bytes, and locates every slot an entry occupies for its removal
+//! ([`RemoveRunScan`]). This crate performs no I/O and holds no filesystem
+//! state: the `fatfs` service reads sectors over a block-device IPC, hands the
+//! bytes here, and keeps the geometry/cache/mutation engine on its side.
+//! Keeping the parse of untrusted on-disk structures pure and host-testable is
+//! the point — see
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
@@ -360,9 +362,10 @@ impl LfnAccum
             self.saw_last = true;
             self.chksum = chksum;
             self.last_seq = seq;
-            // Provisional length: seq*13 chars, trimmed downward when
+            // Provisional length: seq*13 chars capped at MAX_LFN_CHARS
+            // (a 20-slot run spans 260 positions), trimmed downward when
             // the first 0x0000 / 0xFFFF terminator is observed below.
-            self.len = (seq as usize) * 13;
+            self.len = (seq as usize * 13).min(MAX_LFN_CHARS);
         }
         else
         {
@@ -574,10 +577,11 @@ pub fn lfn_checksum(name: &[u8; 11]) -> u8
 
 /// Parse a single 32-byte FAT directory entry.
 ///
-/// Returns `None` for end-of-directory (`0x00`), deleted (`0xE5`),
-/// volume-label, and LFN entries (`attr=0x0F`). The returned
-/// [`DirEntry`] carries `lfn_len = 0`; callers that have accumulated
-/// an LFN run via [`LfnAccum`] populate `lfn` / `lfn_len` themselves.
+/// Returns `None` for end-of-directory (`0x00`), deleted (`0xE5`), LFN
+/// (`attr=0x0F`), and volume-label (`ATTR_VOLUME_ID`, attr bit `0x08`)
+/// entries. The returned [`DirEntry`] carries `lfn_len = 0`; callers that
+/// have accumulated an LFN run via [`LfnAccum`] populate `lfn` / `lfn_len`
+/// themselves.
 #[must_use]
 pub fn parse_dir_entry(raw: &[u8]) -> Option<DirEntry>
 {
@@ -589,7 +593,7 @@ pub fn parse_dir_entry(raw: &[u8]) -> Option<DirEntry>
     {
         return None;
     }
-    if raw[11] == 0x0F
+    if raw[11] == 0x0F || raw[11] & 0x08 != 0
     {
         return None;
     }
@@ -698,6 +702,139 @@ fn write_83_with_case(raw: &[u8; 11], nt_case: u8, out: &mut [u8]) -> usize
         }
     }
     pos
+}
+
+// ── Removal slot run ────────────────────────────────────────────────────────
+
+/// Maximum directory slots one entry occupies: a 20-slot LFN run
+/// (255 chars / 13 chars per slot) plus the trailing 8.3 entry.
+pub const MAX_SLOT_RUN: usize = MAX_LFN_CHARS.div_ceil(13) + 1;
+
+/// Outcome of feeding one directory slot to [`RemoveRunScan::step`].
+pub enum RemoveStep
+{
+    /// The slot did not end the scan.
+    Continue,
+    /// End-of-directory marker (`0x00`) reached without a match.
+    EndOfDir,
+    /// The 8.3 entry in this slot matched, by its long name or its short
+    /// alias; [`RemoveRunScan::run`] lists every slot it occupies.
+    Found
+    {
+        /// First cluster of the matched entry ([`DirEntry::cluster`]).
+        cluster: u32,
+    },
+}
+
+/// Slot-by-slot directory scan that locates an entry by name together with
+/// every slot it occupies, so a removal can mark them all deleted.
+///
+/// The entry's run includes its LFN slots whenever they validate against the
+/// 8.3 entry, whichever name matched: the Microsoft FAT specification deletes
+/// an LFN run with its 8.3 entry, so a removal by short alias leaves no
+/// orphan long name. LFN slots that do not validate (an orphaned earlier run,
+/// a checksum mismatch) are not part of the run. `L` is the caller's slot
+/// position; scan state carries across sector boundaries.
+pub struct RemoveRunScan<L>
+{
+    lfn: LfnAccum,
+    /// Positions of the LFN slots since the last run start (`0x40` flag);
+    /// after a match, the matched entry's run.
+    slots: [L; MAX_SLOT_RUN],
+    len: usize,
+}
+
+impl<L: Copy + Default> RemoveRunScan<L>
+{
+    /// An empty scan: no LFN run accumulated, no slot positions recorded.
+    #[must_use]
+    pub fn new() -> Self
+    {
+        Self {
+            lfn: LfnAccum::new(),
+            slots: [L::default(); MAX_SLOT_RUN],
+            len: 0,
+        }
+    }
+
+    fn reset(&mut self)
+    {
+        self.lfn.reset();
+        self.len = 0;
+    }
+
+    /// Every slot the entry the last [`RemoveStep::Found`] reported
+    /// occupies: its LFN slots in on-disk order, then the 8.3 slot.
+    /// Meaningful only after [`Self::step`] returns `Found`.
+    #[must_use]
+    pub fn run(&self) -> &[L]
+    {
+        &self.slots[..self.len]
+    }
+
+    /// Feed the directory slot `raw`, found at `loc`, to the scan for the
+    /// path component `name`.
+    ///
+    /// Returns [`RemoveStep::EndOfDir`] on an end-of-directory slot (`0x00`),
+    /// [`RemoveStep::Found`] when `raw` is an 8.3 entry that `name` matches by
+    /// its validated long name or its short alias (after which
+    /// [`Self::run`] lists the entry's slots), and [`RemoveStep::Continue`]
+    /// otherwise.
+    pub fn step(&mut self, raw: &[u8; 32], loc: L, name: &[u8]) -> RemoveStep
+    {
+        if raw[0] == 0x00
+        {
+            return RemoveStep::EndOfDir;
+        }
+        if raw[0] == 0xE5
+        {
+            self.reset();
+            return RemoveStep::Continue;
+        }
+        if raw[11] == 0x0F
+        {
+            // A run start discards the positions of any earlier slots, so a
+            // validated run's positions are exactly its own (at most 20).
+            if raw[0] & 0x40 != 0
+            {
+                self.len = 0;
+            }
+            self.lfn.add_lfn_entry(raw);
+            // The last slot stays free for the 8.3 entry.
+            if self.len < MAX_SLOT_RUN - 1
+            {
+                self.slots[self.len] = loc;
+                self.len += 1;
+            }
+            return RemoveStep::Continue;
+        }
+        if let Some(entry) = parse_dir_entry(raw)
+        {
+            let lfn_valid = self.lfn.validate(&entry.name);
+            if (lfn_valid && self.lfn.matches(name)) || name_matches(&entry.name, name)
+            {
+                if !lfn_valid
+                {
+                    self.len = 0;
+                }
+                self.slots[self.len] = loc;
+                self.len += 1;
+                return RemoveStep::Found {
+                    cluster: entry.cluster,
+                };
+            }
+        }
+        self.reset();
+        RemoveStep::Continue
+    }
+}
+
+impl<L: Copy + Default> Default for RemoveRunScan<L>
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -882,6 +1019,11 @@ mod tests
         lfn[0] = 0x41;
         lfn[11] = 0x0F; // LFN attr
         assert!(parse_dir_entry(&lfn).is_none());
+
+        let mut label = [0x20u8; 32];
+        label[..11].copy_from_slice(b"SERAPH     ");
+        label[11] = 0x08 | 0x20; // volume label, archive bit set
+        assert!(parse_dir_entry(&label).is_none());
     }
 
     #[test]
@@ -964,5 +1106,160 @@ mod tests
         acc.add_lfn_entry(&entry);
         let mut out = [0u8; MAX_LFN_UTF8];
         assert!(acc.assemble_utf8(&mut out).is_none());
+    }
+
+    #[test]
+    fn lfn_run_of_maximum_length_assembles_all_255_chars()
+    {
+        // A 20-slot run spans 260 positions but holds at most 255 chars; the
+        // assembled name must stop at 255 rather than read past the buffer.
+        let sfn = b"AAAAAA~1   ";
+        let long = "a".repeat(MAX_LFN_CHARS);
+        let mut acc = LfnAccum::new();
+        for slot in &lfn_entry_slots(&long, sfn, lfn_checksum(sfn))[..20]
+        {
+            acc.add_lfn_entry(slot);
+        }
+        assert!(acc.validate(sfn));
+        let mut out = [0u8; MAX_LFN_UTF8];
+        assert_eq!(acc.assemble_utf8(&mut out), Some(MAX_LFN_CHARS));
+        assert!(acc.matches(long.as_bytes()));
+    }
+
+    /// Directory slots for `long` stored under the 8.3 name `sfn`: the LFN
+    /// run in on-disk (reverse-sequence) order, then the 8.3 entry, every
+    /// LFN slot carrying `chksum`.
+    fn lfn_entry_slots(long: &str, sfn: &[u8; 11], chksum: u8) -> Vec<[u8; 32]>
+    {
+        let offsets: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+        let units: Vec<u16> = long.encode_utf16().collect();
+        let count = units.len().div_ceil(13);
+        let mut slots = Vec::new();
+        for seq in (1..=count).rev()
+        {
+            let mut slot = [0u8; 32];
+            slot[0] = u8::try_from(seq).expect("seq fits") | if seq == count { 0x40 } else { 0 };
+            slot[11] = 0x0F;
+            slot[13] = chksum;
+            for (i, &off) in offsets.iter().enumerate()
+            {
+                let ch = units.get((seq - 1) * 13 + i).copied().unwrap_or(0x0000);
+                slot[off..off + 2].copy_from_slice(&ch.to_le_bytes());
+            }
+            slots.push(slot);
+        }
+        let mut entry = [0u8; 32];
+        entry[..11].copy_from_slice(sfn);
+        entry[11] = 0x20;
+        entry[26..28].copy_from_slice(&7u16.to_le_bytes());
+        slots.push(entry);
+        slots
+    }
+
+    /// Feed `slots` (each located at its index) to a removal scan for `name`;
+    /// returns the step that ended the scan and the scan's run.
+    fn scan_for_remove(slots: &[[u8; 32]], name: &[u8]) -> (RemoveStep, Vec<usize>)
+    {
+        let mut scan = RemoveRunScan::new();
+        for (i, slot) in slots.iter().enumerate()
+        {
+            let step = scan.step(slot, i, name);
+            if !matches!(step, RemoveStep::Continue)
+            {
+                return (step, scan.run().to_vec());
+            }
+        }
+        (RemoveStep::Continue, Vec::new())
+    }
+
+    fn found_run(slots: &[[u8; 32]], name: &[u8]) -> Vec<usize>
+    {
+        let (step, run) = scan_for_remove(slots, name);
+        assert!(matches!(step, RemoveStep::Found { cluster: 7 }));
+        run
+    }
+
+    #[test]
+    fn remove_by_short_alias_covers_the_validated_lfn_slots()
+    {
+        // Removing by alias must delete the long name too, or its LFN slots
+        // stay live as an orphan run.
+        let sfn = b"LONGFI~1TXT";
+        let slots = lfn_entry_slots("LongFileName.txt", sfn, lfn_checksum(sfn));
+        let run = found_run(&slots, b"longfi~1.txt");
+        assert_eq!(run, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn remove_run_of_a_plain_8_3_entry_is_its_one_slot()
+    {
+        // The removal marks exactly the run deleted; any slot beyond the
+        // entry's own would overwrite an unrelated on-disk byte.
+        let mut other = [0u8; 32];
+        other[..11].copy_from_slice(b"OTHER   TXT");
+        other[11] = 0x20;
+        let mut entry = other;
+        entry[..11].copy_from_slice(b"FILE    TXT");
+        entry[26..28].copy_from_slice(&7u16.to_le_bytes());
+        let run = found_run(&[other, entry, [0u8; 32]], b"file.txt");
+        assert_eq!(run, vec![1]);
+    }
+
+    #[test]
+    fn remove_by_long_name_covers_the_lfn_and_8_3_slots()
+    {
+        let sfn = b"LONGFI~1TXT";
+        let slots = lfn_entry_slots("LongFileName.txt", sfn, lfn_checksum(sfn));
+        let run = found_run(&slots, b"longfilename.TXT");
+        assert_eq!(run, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn remove_run_excludes_lfn_slots_whose_checksum_mismatches()
+    {
+        // LFN slots that do not belong to the 8.3 entry are not deleted with it.
+        let sfn = b"LONGFI~1TXT";
+        let slots = lfn_entry_slots("LongFileName.txt", sfn, lfn_checksum(sfn) ^ 1);
+        let run = found_run(&slots, b"LONGFI~1.TXT");
+        assert_eq!(run, vec![2]);
+    }
+
+    #[test]
+    fn remove_run_excludes_lfn_slots_separated_by_a_deleted_slot()
+    {
+        let sfn = b"LONGFI~1TXT";
+        let mut slots = lfn_entry_slots("LongFileName.txt", sfn, lfn_checksum(sfn));
+        let mut deleted = [0u8; 32];
+        deleted[0] = 0xE5;
+        slots.insert(2, deleted);
+        let run = found_run(&slots, b"LONGFI~1.TXT");
+        assert_eq!(run, vec![3]);
+    }
+
+    #[test]
+    fn remove_run_drops_orphan_slots_before_a_maximum_length_run()
+    {
+        // An orphan slot ahead of a 20-slot run must neither join the run nor
+        // push the 8.3 slot past the end of it.
+        let sfn = b"AAAAAA~1   ";
+        let long = "a".repeat(MAX_LFN_CHARS);
+        let mut slots = lfn_entry_slots(&long, sfn, lfn_checksum(sfn));
+        let mut orphan = slots[0];
+        orphan[13] ^= 1;
+        slots.insert(0, orphan);
+        let run = found_run(&slots, b"AAAAAA~1");
+        assert_eq!(run, (1..=MAX_SLOT_RUN).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn remove_scan_stops_at_end_of_directory_without_a_match()
+    {
+        let sfn = b"OTHER   TXT";
+        let mut slots = lfn_entry_slots("Other file.txt", sfn, lfn_checksum(sfn));
+        slots.push([0u8; 32]);
+        assert!(matches!(
+            scan_for_remove(&slots, b"missing.txt").0,
+            RemoveStep::EndOfDir
+        ));
     }
 }

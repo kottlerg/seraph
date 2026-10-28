@@ -2212,11 +2212,8 @@ pub mod blk_errors
     /// Memory cap rejected: `BLK_READ_INTO_MEMORY` target missing
     /// `MAP|WRITE` rights, `BLK_WRITE_FROM_MEMORY` source missing
     /// `MAP` rights, smaller than `count * 512` bytes, or absent;
-    /// also returned when `count` is 0 or `count * 512` exceeds `u32::MAX`.
-    /// virtio-blk does not yet check the `count * 512` multiply for
-    /// overflow: a `count` of 2^55 or more panics the driver under the dev
-    /// profile (`overflow-checks = true`) and wraps in release instead of
-    /// returning this error (#454).
+    /// also returned when `count` is 0 or `count * 512` exceeds `u32::MAX`
+    /// (an overflowing multiply included).
     pub const INVALID_MEMORY_CAP: u64 = 5;
     /// Caller's compiled `BLK_LABELS_VERSION` does not match the receiver's.
     /// `REGISTER_PARTITION` is the handshake entry point and carries the

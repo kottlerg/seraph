@@ -603,14 +603,16 @@ fn handle_read_block_into_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
-    let data_len_bytes = sector_count * SECTOR_SIZE;
     // VirtIO descriptor length is u32; this also bounds total transfer
     // well below any plausible per-cap ask.
-    if data_len_bytes > u64::from(u32::MAX)
+    let Some(data_len_bytes) = sector_count
+        .checked_mul(SECTOR_SIZE)
+        .filter(|&n| n <= u64::from(u32::MAX))
+    else
     {
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
-    }
+    };
 
     // Validate the target cap: must be a Memory cap with MAP+WRITE rights and
     // at least `data_len_bytes` of capacity.
@@ -744,12 +746,14 @@ fn handle_write_block_from_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut 
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
-    let data_len_bytes = sector_count * SECTOR_SIZE;
-    if data_len_bytes > u64::from(u32::MAX)
+    let Some(data_len_bytes) = sector_count
+        .checked_mul(SECTOR_SIZE)
+        .filter(|&n| n <= u64::from(u32::MAX))
+    else
     {
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
-    }
+    };
 
     // Source memory cap must be a Memory cap with at least MAP rights
     // (read-only mapping authority: the device reads sector data out of

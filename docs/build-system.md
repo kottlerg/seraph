@@ -117,7 +117,9 @@ Its linker script, `core/boot/linker/riscv64-uefi.ld`, is passed by
 `core/boot/build.rs` as an absolute `-T` link argument, the way
 `core/kernel/build.rs` passes the kernel's, and `cargo xtask build` sets
 `RUSTFLAGS` for the bootloader build (`-Zunstable-options`, plus
-`-C jump-tables=no` on RISC-V, where UEFI cannot relocate jump tables).
+`-C jump-tables=no` on RISC-V, which the bootloader's relocation model does not depend on
+and which stays set until a riscv64 boot without it confirms it can be removed, per
+[riscv-uefi-boot.md § Build Pipeline](../core/boot/docs/riscv-uefi-boot.md#build-pipeline)).
 Cargo reads the `.cargo/config.toml` of the current directory and of every
 parent directory and joins their `rustflags` arrays, so a checkout nested
 under another (a worktree under `.claude/worktrees/`) receives a flag once

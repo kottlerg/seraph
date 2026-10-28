@@ -626,7 +626,7 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Yield CPU — the current thread is now Blocked.
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
-        crate::sched::schedule(false);
+        crate::sched::schedule(crate::sched::Requeue::IfRunnable);
     }
 
     // On resume: consume the disposition the episode's wake-claim winner
@@ -838,7 +838,7 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
-        crate::sched::schedule(false);
+        crate::sched::schedule(crate::sched::Requeue::IfRunnable);
     }
 
     // A cancellation claim (stop while parked, endpoint dealloc's recv-queue
@@ -1348,7 +1348,7 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Yield CPU.
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
-        crate::sched::schedule(false);
+        crate::sched::schedule(crate::sched::Requeue::IfRunnable);
     }
 
     // A cancellation claim (stop while parked, or a stop that won against the
@@ -1547,7 +1547,7 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Yield CPU.
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
-        crate::sched::schedule(false);
+        crate::sched::schedule(crate::sched::Requeue::IfRunnable);
     }
 
     // A cancellation claim stamped the episode INTERRUPTED; consume it before
@@ -2090,7 +2090,7 @@ pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
-        crate::sched::schedule(false);
+        crate::sched::schedule(crate::sched::Requeue::IfRunnable);
     }
 
     // A cancellation claim stamped the episode INTERRUPTED; consume it before

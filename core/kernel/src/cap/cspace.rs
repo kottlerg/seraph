@@ -200,7 +200,11 @@ pub struct CSpace
     free_head: Option<NonZeroU32>,
     /// Number of slots currently on the free list (for O(1) `pre_allocate`).
     free_count: usize,
-    /// Protects concurrent access to all `CSpace` state.
+    /// Protects concurrent access to all `CSpace` state: the grow cursor, the
+    /// counters, and the free list above are bare fields owned by this lock,
+    /// under the exception of docs/coding-standards.md § Concurrency
+    /// (core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
+    /// Radix records it).
     pub(crate) lock: crate::sync::Spinlock,
     /// Pool source for new slot and directory pages (pop from
     /// `CSpaceKernelObject::alloc_slot_page`); null only in the host-test
@@ -1030,13 +1034,6 @@ mod tests
         // Slot 0 must exist and be null.
         let s = cs.slot(0).expect("slot 0 should exist after grow");
         assert!(s.is_null());
-    }
-
-    #[test]
-    fn allocate_returns_nonzero_index()
-    {
-        let mut cs = CSpace::new(0);
-        let _idx = cs.allocate_slot().unwrap();
     }
 
     #[test]

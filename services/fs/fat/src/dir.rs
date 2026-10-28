@@ -454,8 +454,6 @@ const ATTR_ARCHIVE: u8 = 0x20;
 const ATTR_DIRECTORY: u8 = 0x10;
 /// 8.3 attribute byte for an LFN slot.
 const ATTR_LFN: u8 = 0x0F;
-/// Volume-label attribute bit (`ATTR_VOLUME_ID`); LFN slots carry it too.
-const ATTR_VOLUME_ID: u8 = 0x08;
 /// LFN sequence flag: `0x40` `OR`ed into the highest-seq slot marks
 /// "last entry in the LFN run" (per the FAT spec).
 const LFN_LAST_FLAG: u8 = 0x40;
@@ -654,28 +652,19 @@ pub fn directory_is_empty(
             }
             for e in 0..entries_per_sector
             {
-                let off = e * 32;
-                let first = buf[off];
-                if first == 0x00
+                let raw = &buf[e * 32..e * 32 + 32];
+                if raw[0] == 0x00
                 {
                     return Ok(true);
                 }
-                if first == 0xE5
+                // An entry is what readdir lists (parse_dir_entry skips
+                // deleted, LFN, and volume-label slots), less "." and "..".
+                if let Some(entry) = parse_dir_entry(raw)
+                    && entry.name != *b".          "
+                    && entry.name != *b"..         "
                 {
-                    continue;
+                    return Ok(false);
                 }
-                // LFN and volume-label slots are not entries, matching
-                // what readdir lists.
-                if buf[off + 11] & ATTR_VOLUME_ID != 0
-                {
-                    continue;
-                }
-                // Skip "." and "..".
-                if buf[off..off + 11] == *b".          " || buf[off..off + 11] == *b"..         "
-                {
-                    continue;
-                }
-                return Ok(false);
             }
         }
         match next_cluster(state, cluster, cache, block_dev, ipc_buf)

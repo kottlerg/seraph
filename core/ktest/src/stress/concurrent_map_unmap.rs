@@ -115,7 +115,7 @@ fn start_mappers(ctx: &TestContext, done: u32, iterations: u32, mappers: &mut Ma
 
     // Each child gets copies of its Memory cap and the aspace cap in its own
     // CSpace.
-    for i in 0..NUM_CHILDREN
+    for (i, va_slot) in VA_PER_CHILD.iter().enumerate()
     {
         let child =
             spawn::new_child(ctx).map_err(|_| "concurrent_map_unmap: spawn::new_child failed")?;
@@ -145,9 +145,9 @@ fn start_mappers(ctx: &TestContext, done: u32, iterations: u32, mappers: &mut Ma
             )
         };
 
-        // Publish this child's VA in VA_PER_CHILD[i]; the child recovers `i`
+        // Publish this child's VA in its VA_PER_CHILD slot; the child recovers `i`
         // from its done_bit (`trailing_zeros`).
-        VA_PER_CHILD[i].store(child_va(i), core::sync::atomic::Ordering::Release);
+        va_slot.store(child_va(i), core::sync::atomic::Ordering::Release);
 
         // SAFETY: Each child uses a distinct stack index.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });

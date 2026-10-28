@@ -185,7 +185,7 @@ fn churn_and_delete(
     // land on a CPU other than the controller's, which is the case of interest
     // (it is not guaranteed for every worker — the controller's own CPU may
     // coincide with a target, which is harmless).
-    for i in 0..NUM_WORKERS
+    for (i, reported_cpu) in WORKER_CPU.iter().enumerate()
     {
         let i_u32 = u32::try_from(i).unwrap_or(0);
         let target_cpu = (i_u32 + 1) % cpu_mod;
@@ -194,7 +194,7 @@ fn churn_and_delete(
         // wait below. Phase 1 left the workers spinning at levels 3 and 9;
         // at the top level of the cell this worker runs on its pinned CPU
         // whatever spins there, so it can report it.
-        WORKER_CPU[i].store(u32::MAX, Ordering::Release);
+        reported_cpu.store(u32::MAX, Ordering::Release);
         let _ = thread_set_priority(workers.threads[i], 11, ctx.sched_control_cap);
         let _ = thread_set_affinity(workers.threads[i], target_cpu);
         // Churn and delete the worker once it reports running on its pinned

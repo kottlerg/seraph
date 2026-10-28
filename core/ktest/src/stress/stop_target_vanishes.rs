@@ -126,6 +126,9 @@ const TARGET_STACK: usize = 1;
 /// count a loop (before its stop, and after its restart) and for the target
 /// to progress. A loop spans at most a few slice expiries; a wait that
 /// outlasts the bound fails the phase.
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const ROUND_WAIT_US: u64 = 1_000_000;
 
 /// Bound on the wait for both children to exit, in 1 ms polls.
@@ -591,7 +594,9 @@ fn restart(child: u32) -> Result<bool, &'static str>
 fn await_progress(counter: &AtomicU32, message: &'static str) -> TestResult
 {
     let before = counter.load(Ordering::Acquire);
-    if await_within(ROUND_WAIT_US, || counter.load(Ordering::Acquire) != before)?
+    if await_within(crate::scaled_bound(ROUND_WAIT_US), || {
+        counter.load(Ordering::Acquire) != before
+    })?
     {
         Ok(())
     }

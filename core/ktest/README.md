@@ -189,10 +189,10 @@ the shared `STRESS_STACKS`. `sleep_list_full` is the exception: a resource-exhau
 whose participant count is fixed by the kernel's `MAX_SLEEPING` (128), it counts with an atomic
 counter, takes one shared stack for its victims, and carries its own 128 × 8 KiB filler stacks.
 
-The knobs marked † below are attempt counts the cell makes in full up to 16 CPUs. Past 16 CPUs
-`stress::scaled_attempts` scales each by 16 / CPUs, down to a per-cell floor that keeps the
-cell's anti-vacuous checks met, and the cell's source states that floor's reason. The intent is a
-bounded wall time under oversubscription: a boot past 16 CPUs is a boundary run of
+The knobs marked † below are attempt counts the cell makes in full up to `UNSCALED_CPUS` (16)
+CPUs. Past it `stress::scaled_attempts` scales each by 16 / CPUs, down to a per-cell floor that
+keeps the cell's anti-vacuous checks met, and the cell's source states that floor's reason. The
+intent is a bounded wall time under oversubscription: a boot past 16 CPUs is a boundary run of
 [docs/testing.md § Coverage tiers](../../docs/testing.md#coverage-tiers), on a host with fewer
 cores than CPUs, where each attempt's wall time grows with the width. The defects those runs exist
 for (CPU bringup, CPU-mask widths, IPIs to high CPU indices) do not depend on attempt counts; a
@@ -202,6 +202,16 @@ pinned children over the CPUs (`cap_delete_reply_wake`, `stop_reply_race`, `stop
 step a scaled count's placements across the whole CPU range (`stress::rotation_slot`).
 `concurrent_ipc` logs the cycles it has done at most every 10 s, so a long run of it at a wide CPU
 count is not silent.
+
+For the same reason, a wall-clock bound or budget whose expiry fails a test, in any tier, applies
+through `scaled_bound` (`src/main.rs`): as written up to 16 CPUs, so the tight budgets the CI widths
+check are unchanged, and multiplied past it by the oversubscription factor the width implies (CPUs
+/ 16), by which each cross-CPU handoff slows, so the bound still separates a slow step from a stuck
+or wrong one. The stress cells' round, acknowledgement and report bounds, the preemption budget
+of `integration::priority_preemption`, the expiry and report bounds of
+`integration::queued_waiters_fifo`, and the migration polls of
+`thread::affinity_migrate_running` apply through it; a bound whose expiry only tallies a starved
+round does not.
 
 A controller waits for a child to reach a state by a notification bit the child sends on reaching
 it. For a state inside a blocking call (`ipc_call`, `ipc_recv`, a notification wait) or at an exit,
@@ -292,6 +302,10 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   `IoPort` caps carved by `ioport::bind_port_range` on `x86_64`).
 - `PASS_COUNT` / `FAIL_COUNT` — atomic counters updated by `run_test!`.
 - `log(msg)` / `log_u64(prefix, value)` — heap-free logging utilities.
+- `UNSCALED_CPUS` / `scaled_bound(base)` — the widest CPU count at which
+  ktest's attempt counts and wall-clock budgets apply as written, and a
+  failing bound stretched past it by the width's oversubscription factor
+  (see [Tier S](#tier-s--srcstress)).
 - `spawn::new_child(ctx)` / `spawn::new_child_at(ctx, sched_cap, priority)` /
   `configure_and_start(child, …)` / `configure_and_start_pinned(child, …)` —
   child-thread spawn helper wrapping the cspace + thread + configure + start

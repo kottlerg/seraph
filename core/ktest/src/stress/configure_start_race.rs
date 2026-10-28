@@ -101,6 +101,9 @@ const STACK_BYTES: u64 = core::mem::size_of::<ChildStack>() as u64;
 
 /// Bound on each of a round's waits on the helper, in microseconds: for it
 /// to report itself ready, and for its configure to return.
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const ROUND_WAIT_US: u64 = 1_000_000;
 
 /// Bound on the waits for a thread to exit, in 1 ms polls.
@@ -369,7 +372,9 @@ fn race(th: u32, seq: u32) -> Result<u32, &'static str>
 {
     TARGET.store(th, Ordering::Release);
     ARMED.store(seq, Ordering::Release);
-    if !await_within(ROUND_WAIT_US, || READY.load(Ordering::Acquire) == seq)?
+    if !await_within(crate::scaled_bound(ROUND_WAIT_US), || {
+        READY.load(Ordering::Acquire) == seq
+    })?
     {
         return Err("stress::configure_start_race: the helper never became ready");
     }
@@ -383,7 +388,9 @@ fn race(th: u32, seq: u32) -> Result<u32, &'static str>
     // helper may still be inside its configure; one the yield passes over
     // runs at the controller's next sleep.
     thread_yield().map_err(|_| "stress::configure_start_race: yield failed")?;
-    if !await_within(ROUND_WAIT_US, || DONE.load(Ordering::Acquire) == seq)?
+    if !await_within(crate::scaled_bound(ROUND_WAIT_US), || {
+        DONE.load(Ordering::Acquire) == seq
+    })?
     {
         return Err("stress::configure_start_race: the helper's configure never returned");
     }

@@ -147,6 +147,9 @@ const ENTRY_WAIT_US: u64 = 100_000;
 /// Bound on the controller's waits for the sender to acknowledge a pause,
 /// for the second stopper to finish a round's stop, and for either helper
 /// to exit, in microseconds.
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const ACK_WAIT_US: u64 = 2_000_000;
 
 /// Polls a bounded wait spins busily before it polls in 1 ms sleeps.
@@ -474,7 +477,9 @@ fn finish_helpers() -> TestResult
         ),
     ]
     {
-        if !await_within(ACK_WAIT_US, || exited.load(Ordering::Acquire) != 0)?
+        if !await_within(crate::scaled_bound(ACK_WAIT_US), || {
+            exited.load(Ordering::Acquire) != 0
+        })?
         {
             return Err(failed);
         }
@@ -521,12 +526,14 @@ fn round(ctx: &TestContext, phase: Phase, cycle: u32, seen: &mut Seen) -> TestRe
     let mut parts = RoundParts::default();
     let result = arm_and_stop(ctx, phase, cycle, &mut parts, seen);
     LIVE.store(0, Ordering::SeqCst);
-    let paused =
-        await_within(ACK_WAIT_US, || SENDER_BUSY.load(Ordering::SeqCst) == 0).and_then(|in_time| {
-            in_time
-                .then_some(())
-                .ok_or("stress::stop_claimed_delete: the sender did not pause")
-        });
+    let paused = await_within(crate::scaled_bound(ACK_WAIT_US), || {
+        SENDER_BUSY.load(Ordering::SeqCst) == 0
+    })
+    .and_then(|in_time| {
+        in_time
+            .then_some(())
+            .ok_or("stress::stop_claimed_delete: the sender did not pause")
+    });
     let released = release_round(&parts);
     result?;
     paused?;
@@ -603,7 +610,7 @@ fn stop(waiter: u32, stops: Stops, cycle: u32, seen: &mut Seen) -> TestResult
     WAITER.store(waiter, Ordering::Release);
     STOP_ARMED.store(cycle + 1, Ordering::Release);
     let own = thread_stop(waiter);
-    let acked = await_within(ACK_WAIT_US, || {
+    let acked = await_within(crate::scaled_bound(ACK_WAIT_US), || {
         STOPPER_DONE.load(Ordering::Acquire) == cycle + 1
     });
     match own

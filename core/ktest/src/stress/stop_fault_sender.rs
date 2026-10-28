@@ -123,6 +123,9 @@ const ROUND_WAIT_US: u64 = 100_000;
 /// which takes no blocking syscall; a handler whose receives fail meanwhile
 /// has already failed the cell (each failed receive is tallied), so the bound
 /// need not outlast its receive guard's backoff.
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const SYNC_WAIT_US: u64 = 1_000_000;
 
 /// Spins between a waiting controller's polls of the children's exits and
@@ -758,7 +761,7 @@ fn call_handler(parts: &Parts, label: u64) -> TestResult
                     "stress::stop_fault_sender: the syncer exited before its call returned",
                 );
             }
-            if elapsed_us()?.saturating_sub(start) > SYNC_WAIT_US
+            if elapsed_us()?.saturating_sub(start) > crate::scaled_bound(SYNC_WAIT_US)
             {
                 return Err("stress::stop_fault_sender: the handler did not answer a sync call");
             }

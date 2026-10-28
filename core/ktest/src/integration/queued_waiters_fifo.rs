@@ -54,7 +54,10 @@ const SECOND: u64 = 0x0B;
 /// to (wrongly) return.
 const SETTLE_SLEEP_MS: u64 = 20;
 /// A timed child's timeout; long enough for the other child to park behind
-/// or ahead of it first ([`head_expires`] checks that it did).
+/// or ahead of it first ([`head_expires`] checks that it did). Applied, like
+/// [`REPORT_MS`], through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs, where starting and settling a child takes
+/// longer.
 const EXPIRE_MS: u64 = 100;
 /// Slack [`head_expires`] leaves before waiter A's earliest expiry: the
 /// kernel rounds a deadline to its timer tick, so a wait can expire up to a
@@ -221,7 +224,12 @@ fn head_expires(p: &mut Phase, ctx: &TestContext) -> TestResult
     // A enters its wait after this, so its deadline lies at least EXPIRE_MS
     // (less a tick) past it.
     let before_a = elapsed_us()?;
-    p.start(ctx, Waiter::A, EXPIRE_MS, Expect::TimedOut)?;
+    p.start(
+        ctx,
+        Waiter::A,
+        crate::scaled_bound(EXPIRE_MS),
+        Expect::TimedOut,
+    )?;
     p.start(ctx, Waiter::B, 0, Expect::Delivery(FIRST))?;
     // A must still be queued ahead of B, or its expiry leaves an empty queue.
     // B's start returns once B's settle has passed, by which time B has, in
@@ -229,7 +237,7 @@ fn head_expires(p: &mut Phase, ctx: &TestContext) -> TestResult
     // if that time lies short of A's earliest deadline. A start too slow for
     // that, or an expiry A already reported, leaves the order unknown.
     let b_settled_ms = elapsed_us()?.saturating_sub(before_a) / 1000;
-    if p.returned(Waiter::A) || b_settled_ms + EXPIRE_SLACK_MS >= EXPIRE_MS
+    if p.returned(Waiter::A) || b_settled_ms + EXPIRE_SLACK_MS >= crate::scaled_bound(EXPIRE_MS)
     {
         return Err(INCONCLUSIVE);
     }
@@ -242,7 +250,12 @@ fn head_expires(p: &mut Phase, ctx: &TestContext) -> TestResult
 fn tail_expires(p: &mut Phase, ctx: &TestContext) -> TestResult
 {
     p.start(ctx, Waiter::A, 0, Expect::Delivery(FIRST))?;
-    p.start(ctx, Waiter::B, EXPIRE_MS, Expect::TimedOut)?;
+    p.start(
+        ctx,
+        Waiter::B,
+        crate::scaled_bound(EXPIRE_MS),
+        Expect::TimedOut,
+    )?;
     p.expect_returned(Waiter::B)?;
     p.expect_parked(Waiter::A)?;
     p.deliver(FIRST)?;
@@ -327,7 +340,7 @@ impl Phase
         let stack = ChildStack::top(unsafe { core::ptr::addr_of!(CHILD_STACKS[index]) });
         spawn::configure_and_start(child, child_entry, stack, arg)
             .map_err(|_| "integration::queued_waiters_fifo: start child failed")?;
-        if !self.collect(waiter.bits(BIT_READY), REPORT_MS)?
+        if !self.collect(waiter.bits(BIT_READY), crate::scaled_bound(REPORT_MS))?
         {
             return Err("integration::queued_waiters_fifo: a child never reported ready");
         }
@@ -356,7 +369,7 @@ impl Phase
     /// report bound.
     fn expect_returned(&mut self, waiter: Waiter) -> TestResult
     {
-        if !self.collect(waiter.bits(BITS_RETURNED), REPORT_MS)?
+        if !self.collect(waiter.bits(BITS_RETURNED), crate::scaled_bound(REPORT_MS))?
         {
             return Err(waiter.pick(
                 "integration::queued_waiters_fifo: waiter A did not return in time",

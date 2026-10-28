@@ -92,6 +92,9 @@ const RESULT_SPINS: u32 = 200_000;
 /// seen `FINISHED` reach the previous cycle, and between cycles the waiter
 /// only spins on `ACKED` and stores `TIMED`, so a longer absence is a waiter
 /// that is not being dispatched (or, on cycle 1, never started).
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const ENTER_TIMEOUT_US: u64 = 1_000_000;
 
 /// After the first release delivery, the controller sleeps this many 1 ms
@@ -336,7 +339,7 @@ fn late_delay(cycle: u32) -> TestResult
 /// [`ENTER_TIMEOUT_US`].
 fn await_timed_wait(cycle: u32) -> TestResult
 {
-    let until = elapsed_us()? + ENTER_TIMEOUT_US;
+    let until = elapsed_us()? + crate::scaled_bound(ENTER_TIMEOUT_US);
     while TIMED.load(Ordering::Acquire) != cycle
     {
         if elapsed_us()? >= until

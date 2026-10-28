@@ -86,12 +86,18 @@ const RESULT_SPINS: u32 = 200_000;
 /// Bound on the controller's wait for a peer's result, in microseconds;
 /// past it the peer is taken as blocked for good (a call whose server has
 /// exited, a park nothing wakes) and the race fails rather than hangs.
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const RESULT_WAIT_US: u64 = 2_000_000;
 
 /// Bound on the controller's wait for a peer to announce its next park, in
 /// microseconds. A live peer announces at once after the controller's
 /// acknowledgement; past the bound, or once the peer has exited, the race
 /// fails rather than hangs.
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const APPROACH_WAIT_US: u64 = 2_000_000;
 
 /// Spins between the controller's polls of the peer's exit and the clock
@@ -347,7 +353,8 @@ fn await_parking(peer: u32, cycle: u32) -> TestResult
     {
         spins = spins.wrapping_add(1);
         if spins.is_multiple_of(POLL_SPINS)
-            && (spawn::is_exited(peer)? || elapsed_us()?.saturating_sub(start) > APPROACH_WAIT_US)
+            && (spawn::is_exited(peer)?
+                || elapsed_us()?.saturating_sub(start) > crate::scaled_bound(APPROACH_WAIT_US))
         {
             return Err("stress::stop_park_race: the peer never approached its park");
         }
@@ -381,7 +388,7 @@ fn await_result(kind: Kind, source: Option<u32>, cycle: u32) -> TestResult
                 .map_err(|_| "stress::stop_park_race: rescue send failed")?;
             rescued = true;
         }
-        if elapsed_us()?.saturating_sub(start) > RESULT_WAIT_US
+        if elapsed_us()?.saturating_sub(start) > crate::scaled_bound(RESULT_WAIT_US)
         {
             return Err("stress::stop_park_race: the peer never reported its result");
         }

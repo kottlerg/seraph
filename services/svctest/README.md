@@ -29,7 +29,7 @@ services/svctest/
         ├── startup.rs         # argv, env, stack envelope, TLS at entry; unset cwd path
         ├── memmgr.rs          # Heap allocator over memmgr; all-RAM-accounted identity
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, `RwLock`, `Condvar`
-        ├── procmgr.rs         # `std::process::Command` spawn, cwd, and error paths
+        ├── procmgr.rs         # `std::process::Command` spawn, cwd, error paths; refused requests
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
@@ -117,6 +117,7 @@ token falls through to the normal run.
 | `cwd-child`                 | `procmgr`      | `command_cwd_inherit` (cwd-cap delivery)    |
 | `blobs-fill-child`          | `procmgr`      | `command_blobs_fill_message` (full message) |
 | `park-child`                | `procmgr`      | `command_from_spawned_thread` (kill, drop)  |
+| `undeliverable-reply-child` | `procmgr`      | `procmgr_refusals` (failed create reply)    |
 | `release-child`             | `fs_std`       | `std_release_matched_by_cookie` (fake fs)   |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |

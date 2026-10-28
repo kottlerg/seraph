@@ -17,12 +17,13 @@
 //!
 //! The handoff's state machine (`process_table::InitReap`, host-tested
 //! there) accepts the rounds and `INIT_TEARDOWN_DONE` only from an un-badged
-//! cap (init's, or svcmgr's mint source; see `docs/ipc-interface.md`
-//! § `REGISTER_INIT_TEARDOWN`), counts the two init-thread deaths, and reaps
-//! on the last one, whether or not `INIT_TEARDOWN_DONE` armed it (a
-//! threadless init can send nothing more). The handoff is one-shot: after
-//! the reap every request is refused. This module performs the syscalls and IPC around it,
-//! serialised under procmgr's single-threaded `service_ep` recv loop.
+//! cap (init's, or svcmgr's mint source; see
+//! `services/procmgr/docs/ipc-interface.md` § `REGISTER_INIT_TEARDOWN`),
+//! counts the two init-thread deaths, and reaps on the last one, whether or
+//! not `INIT_TEARDOWN_DONE` armed it (a threadless init can send nothing
+//! more). The handoff is one-shot: after the reap every request is refused.
+//! This module performs the syscalls and IPC around it, serialised under
+//! procmgr's single-threaded `service_ep` recv loop.
 //!
 //! init-logd outlives init's main thread until svcmgr-launched real-logd pulls
 //! its handover and releases it (`HANDOVER_RELEASE` → init-logd `thread_exit`).
@@ -187,8 +188,8 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
 
 /// Handle `INIT_TEARDOWN_DONE`: mark the handoff armed. Only an un-badged
 /// cap (init's, or svcmgr's mint source) is accepted, once, while the
-/// handoff is open. The message
-/// names no caps, so procmgr deletes any it moved, accepted or refused.
+/// handoff is open. The message names no caps, so procmgr deletes any it
+/// moved, accepted or refused.
 pub fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let mut guard = STATE.lock().expect("init-reap state poisoned");

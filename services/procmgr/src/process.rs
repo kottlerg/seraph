@@ -2056,8 +2056,9 @@ pub struct ElfLoadCtx
 /// read-only into a scratch VA, then memcpys the valid slice into the span.
 /// The memory cap is the caller's grandchild of fs's cache slot —
 /// `cap_delete` (via the `ScratchMapping` `owns_cap` slot) drops the
-/// caller's reference. fs holds the underlying cache-slot refcount until
-/// `FS_CLOSE` (pre-Phase-9) or until cooperative `FS_RELEASE_MEMORY` lands.
+/// caller's reference. After each copy it issues `FS_RELEASE_MEMORY` for the
+/// request's cookie, so fs drops its cache-slot refcount; `FS_CLOSE`
+/// reclaims any release that is lost.
 ///
 /// Returns `false` when the segment's file bytes could not all be copied: a
 /// failed or zero-byte `FS_READ_MEMORY`, a cache page that cannot be mapped,

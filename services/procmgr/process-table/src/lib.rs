@@ -13,11 +13,11 @@
 //! create requests ([`CreateBlobs`]), which parses client-controlled label
 //! fields and data words, the `CREATE_FROM_FILE` cap-layout split
 //! ([`split_create_from_file_caps`]), the bounds procmgr applies to fs-driver
-//! read replies ([`fs_reads`]), and the init-reap handoff state machine
-//! ([`InitReap`]). None of these touch a syscall, IPC, or
-//! `std::os::seraph` surface — the cap fields are slot *indices* (plain
-//! integers), never live capabilities, and the decoder reads a stack
-//! [`ipc::IpcMessage`] snapshot — so the whole crate is host-reachable and
+//! read replies and the `FS_READ_MEMORY` reply-cap split ([`fs_reads`]), and
+//! the init-reap handoff state machine ([`InitReap`]). None of these touch a
+//! syscall, IPC, or `std::os::seraph` surface — the cap fields are slot
+//! *indices* (plain integers), never live capabilities, and the decoder reads
+//! a stack [`ipc::IpcMessage`] snapshot — so the whole crate is host-reachable and
 //! host-tested. The syscall/IPC-bearing operations (pipe/namespace
 //! configuration, logd death-EQ binding, random process-badge minting, ELF
 //! load, the init-reap teardown, and process teardown) stay in `procmgr` and

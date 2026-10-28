@@ -12,6 +12,9 @@
 //! procmgr read past the buffer it staged or the page it mapped. These
 //! helpers clamp or reject such a reply before procmgr copies a byte (see
 //! `services/fs/docs/fs-driver-protocol.md` for what the driver promises).
+//! The driver also controls which caps a reply carries:
+//! [`read_memory_reply_caps`] splits an `FS_READ_MEMORY` reply's caps into
+//! the cache-page cap procmgr keeps and the surplus it deletes.
 
 use core::ops::Range;
 

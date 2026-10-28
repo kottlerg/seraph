@@ -106,7 +106,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         cspaces[i] = cs;
     }
 
-    // Collect done bits.
+    // Collect done bits. The loop exits only once every worker has reported:
+    // a worker that hits an internal Err exits without its bit and the parent
+    // stays blocked here, where the run's timeout reports the hang.
     let mut done_bits: u64 = 0;
     while done_bits & ALL_BITS != ALL_BITS
     {
@@ -132,19 +134,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         return Err("stress::retype_concurrent: available_bytes did not return to baseline");
     }
-
-    // The collect loop above exits only once every bit is set, so this check
-    // cannot fail: a worker that hits an internal Err exits without its bit and
-    // the parent stays blocked in that loop, where the run's timeout reports
-    // the hang.
-    if done_bits & ALL_BITS != ALL_BITS
-    {
-        return Err("stress::retype_concurrent: not every worker reported done");
-    }
     Ok(())
 }
 
-fn worker_entry(arg: u64) -> !
+extern "C" fn worker_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this worker.
     let WorkerArgs {

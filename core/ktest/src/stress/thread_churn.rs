@@ -5,24 +5,35 @@
 
 //! Stress test: rapid thread create/destroy cycles.
 //!
-//! Creates and destroys [`ITERATIONS`] threads sequentially, verifying that kernel
-//! resource cleanup (TCBs, `CSpace` refcounts) works correctly under churn.
+//! Creates and destroys [`ITERATIONS`] threads sequentially (fewer past 16
+//! CPUs, see [`super::scaled_attempts`]), verifying that kernel resource
+//! cleanup (TCBs, `CSpace` refcounts) works correctly under churn.
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait,
-    thread_exit,
+    system_info, thread_exit,
 };
+use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-const ITERATIONS: usize = 1000;
+const ITERATIONS: u32 = 1000;
+
+/// Fewest iterations at any width: the cell checks cleanup, not a race, so
+/// a few dozen create/destroy cycles still exercise every teardown path.
+const MIN_ITERATIONS: u32 = 64;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
+    let cpus = system_info(SystemInfoType::CpuCount as u64)
+        .map_err(|_| "thread_churn: system_info(CpuCount) failed")?;
+    // Each iteration's start and exit wake cross CPUs, whose cost grows with
+    // the width; the count shrinks with it.
+    let iterations = super::scaled_attempts(ITERATIONS, MIN_ITERATIONS, cpus);
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "thread_churn: create_notification failed")?;
 
-    for _i in 0..ITERATIONS
+    for _i in 0..iterations
     {
         let child = spawn::new_child(ctx).map_err(|_| "thread_churn: spawn::new_child failed")?;
         let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
@@ -50,7 +61,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 // cast_possible_truncation: done_slot is a kernel cap slot index < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn churn_entry(done_slot: u64) -> !
+extern "C" fn churn_entry(done_slot: u64) -> !
 {
     notification_send(done_slot as u32, 0x1).ok();
     thread_exit()

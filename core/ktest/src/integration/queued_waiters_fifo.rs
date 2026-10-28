@@ -13,7 +13,9 @@
 //!   1. **FIFO** — A parks, then B; the first delivery must reach A while B
 //!      stays parked, and the second must reach B.
 //!   2. **Head expires** — A parks with a short timeout, then B untimed; after
-//!      A's wait times out, a delivery must reach B.
+//!      A's wait times out, a delivery must reach B. A run in which B may
+//!      have queued only after A expired tests nothing and is run again, at
+//!      most twice.
 //!   3. **Tail expires** — A parks untimed, then B with a short timeout; after
 //!      B's wait times out, a delivery must reach A.
 //!
@@ -24,9 +26,9 @@
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, cap_revoke, event_post,
     event_queue_create, event_recv, event_recv_timeout, notification_send, notification_wait,
-    notification_wait_timeout, thread_exit, thread_sleep,
+    notification_wait_timeout, system_info, thread_exit, thread_sleep,
 };
-use syscall_abi::SyscallError;
+use syscall_abi::{SyscallError, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -47,14 +49,30 @@ const B_SHIFT: u32 = 3;
 const FIRST: u64 = 0x0A;
 const SECOND: u64 = 0x0B;
 
-/// Wall-clock settle after READY so a child provably reaches its park, and
-/// how long a parked child is given to (wrongly) return.
+/// Wall-clock settle after READY so a child has, in practice, reached its
+/// park (a fixed sleep cannot prove it), and how long a parked child is given
+/// to (wrongly) return.
 const SETTLE_SLEEP_MS: u64 = 20;
 /// A timed child's timeout; long enough for the other child to park behind
-/// or ahead of it first ([`head_expires`] checks that it did).
+/// or ahead of it first ([`head_expires`] checks that it did). Applied, like
+/// [`REPORT_MS`], through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs, where starting and settling a child takes
+/// longer.
 const EXPIRE_MS: u64 = 100;
+/// Slack [`head_expires`] leaves before waiter A's earliest expiry: the
+/// kernel rounds a deadline to its timer tick, so a wait can expire up to a
+/// tick before the scaled `EXPIRE_MS` of `ElapsedUs` have passed.
+const EXPIRE_SLACK_MS: u64 = 20;
 /// Bound on each controller wait for a child's report.
 const REPORT_MS: u64 = 1000;
+/// Runs of a phase that ended [`INCONCLUSIVE`] before the last, whose
+/// result stands.
+const RETRIES: u32 = 2;
+
+/// [`head_expires`]'s verdict when waiter B may have queued after waiter A
+/// expired: the phase did not test what it exists to test, and is run again.
+const INCONCLUSIVE: &str = "integration::queued_waiters_fifo: waiter B may have queued after \
+                            waiter A expired (raise EXPIRE_MS)";
 
 static mut CHILD_STACKS: [ChildStack; 2] = [ChildStack::ZERO; 2];
 
@@ -164,9 +182,25 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// Run `script` on a fresh object of `kind`, again on a fresh object up to
+/// [`RETRIES`] times while it ends [`INCONCLUSIVE`].
+fn run_phase(ctx: &TestContext, kind: Kind, script: Script) -> TestResult
+{
+    for _ in 0..RETRIES
+    {
+        match run_once(ctx, kind, script)
+        {
+            Err(e) if e == INCONCLUSIVE =>
+            {}
+            result => return result,
+        }
+    }
+    run_once(ctx, kind, script)
+}
+
 /// Run `script` on a fresh object of `kind`, then tear the phase down
 /// whatever the script returned.
-fn run_phase(ctx: &TestContext, kind: Kind, script: Script) -> TestResult
+fn run_once(ctx: &TestContext, kind: Kind, script: Script) -> TestResult
 {
     let mut phase = Phase::new(ctx, kind)?;
     let result = script(&mut phase, ctx);
@@ -187,15 +221,25 @@ fn fifo(p: &mut Phase, ctx: &TestContext) -> TestResult
 
 fn head_expires(p: &mut Phase, ctx: &TestContext) -> TestResult
 {
-    p.start(ctx, Waiter::A, EXPIRE_MS, Expect::TimedOut)?;
+    // A enters its wait after this, so its deadline lies at least the scaled EXPIRE_MS
+    // (less a tick) past it.
+    let before_a = elapsed_us()?;
+    p.start(
+        ctx,
+        Waiter::A,
+        crate::scaled_bound(EXPIRE_MS),
+        Expect::TimedOut,
+    )?;
     p.start(ctx, Waiter::B, 0, Expect::Delivery(FIRST))?;
     // A must still be queued ahead of B, or its expiry leaves an empty queue.
-    if p.returned(Waiter::A)
+    // B's start returns once B's settle has passed, by which time B has, in
+    // practice, parked (`SETTLE_SLEEP_MS`); A cannot have expired before then
+    // if that time lies short of A's earliest deadline. A start too slow for
+    // that, or an expiry A already reported, leaves the order unknown.
+    let b_settled_ms = elapsed_us()?.saturating_sub(before_a) / 1000;
+    if p.returned(Waiter::A) || b_settled_ms + EXPIRE_SLACK_MS >= crate::scaled_bound(EXPIRE_MS)
     {
-        return Err(
-            "integration::queued_waiters_fifo: waiter A expired before waiter B queued \
-             (raise EXPIRE_MS)",
-        );
+        return Err(INCONCLUSIVE);
     }
     p.expect_returned(Waiter::A)?;
     p.expect_parked(Waiter::B)?;
@@ -206,7 +250,12 @@ fn head_expires(p: &mut Phase, ctx: &TestContext) -> TestResult
 fn tail_expires(p: &mut Phase, ctx: &TestContext) -> TestResult
 {
     p.start(ctx, Waiter::A, 0, Expect::Delivery(FIRST))?;
-    p.start(ctx, Waiter::B, EXPIRE_MS, Expect::TimedOut)?;
+    p.start(
+        ctx,
+        Waiter::B,
+        crate::scaled_bound(EXPIRE_MS),
+        Expect::TimedOut,
+    )?;
     p.expect_returned(Waiter::B)?;
     p.expect_parked(Waiter::A)?;
     p.deliver(FIRST)?;
@@ -291,7 +340,7 @@ impl Phase
         let stack = ChildStack::top(unsafe { core::ptr::addr_of!(CHILD_STACKS[index]) });
         spawn::configure_and_start(child, child_entry, stack, arg)
             .map_err(|_| "integration::queued_waiters_fifo: start child failed")?;
-        if !self.collect(waiter.bits(BIT_READY), REPORT_MS)?
+        if !self.collect(waiter.bits(BIT_READY), crate::scaled_bound(REPORT_MS))?
         {
             return Err("integration::queued_waiters_fifo: a child never reported ready");
         }
@@ -320,7 +369,7 @@ impl Phase
     /// report bound.
     fn expect_returned(&mut self, waiter: Waiter) -> TestResult
     {
-        if !self.collect(waiter.bits(BITS_RETURNED), REPORT_MS)?
+        if !self.collect(waiter.bits(BITS_RETURNED), crate::scaled_bound(REPORT_MS))?
         {
             return Err(waiter.pick(
                 "integration::queued_waiters_fifo: waiter A did not return in time",
@@ -389,8 +438,16 @@ impl Phase
     }
 }
 
+/// Microseconds since boot, the clock [`head_expires`] times waiter B's
+/// start on.
+fn elapsed_us() -> Result<u64, &'static str>
+{
+    system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "integration::queued_waiters_fifo: system_info(ElapsedUs) failed")
+}
+
 /// Wait once on the object and report whether the result is the expected one.
-fn child_entry(arg: u64) -> !
+extern "C" fn child_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `Phase::start` published for this child.
     let ChildArgs {

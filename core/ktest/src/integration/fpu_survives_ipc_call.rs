@@ -60,7 +60,7 @@ static MISMATCHES: AtomicU64 = AtomicU64::new(0);
 static OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 
 #[cfg(target_arch = "x86_64")]
-fn child_entry(_arg: u64) -> !
+extern "C" fn child_entry(_arg: u64) -> !
 {
     // Register this thread's IPC buffer. For the empty round-trip used
     // here (`data_count=0`, `cap_count=0`) the kernel never reads or
@@ -173,7 +173,7 @@ fn child_entry(_arg: u64) -> !
 #[cfg(target_arch = "riscv64")]
 // 32 FP loads + ecall + 32 FP stores dominate the body.
 #[allow(clippy::too_many_lines)]
-fn child_entry(_arg: u64) -> !
+extern "C" fn child_entry(_arg: u64) -> !
 {
     // Register this thread's IPC buffer. See x86_64 sibling for rationale.
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;

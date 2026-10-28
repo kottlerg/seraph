@@ -142,20 +142,7 @@ pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
 /// Locate the root `IoPort` descriptor in `InitInfo`.
 fn find_root(info: &InitInfo) -> Option<(u32, u32, u32)>
 {
-    let base = core::ptr::from_ref::<InitInfo>(info).cast::<u8>();
-    // SAFETY: cap_descriptors_offset and _count are set by the kernel.
-    // cast_ptr_alignment: `cap_descriptors_offset` is `size_of::<InitInfo>()`,
-    // which abi/init-protocol asserts is a multiple of 8, the alignment
-    // `CapDescriptor` requires.
-    #[allow(clippy::cast_ptr_alignment)]
-    let descs = unsafe {
-        core::slice::from_raw_parts(
-            base.add(info.cap_descriptors_offset as usize)
-                .cast::<init_protocol::CapDescriptor>(),
-            info.cap_descriptor_count as usize,
-        )
-    };
-    for d in descs
+    for d in crate::init_info::descriptors(info)
     {
         if d.cap_type == CapType::IoPort
         {

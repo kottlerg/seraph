@@ -36,6 +36,7 @@ mod bench;
 mod cmdline;
 mod frame_pool;
 mod framebuffer;
+mod init_info;
 mod integration;
 mod serial;
 mod spawn;
@@ -301,7 +302,7 @@ fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
     }
 }
 
-fn run(info_ptr: u64) -> !
+extern "C" fn run(info_ptr: u64) -> !
 {
     // Read InitInfo from the kernel-mapped page.
     // SAFETY: info_ptr is a valid page-aligned virtual address mapped by the
@@ -460,7 +461,7 @@ fn run(info_ptr: u64) -> !
 /// Source: `SYS_SYSTEM_INFO(ElapsedUs)` — microseconds since kernel timer init.
 fn write_timestamp()
 {
-    let us = syscall::system_info(6).unwrap_or(0);
+    let us = elapsed_us();
     let sec = us / 1_000_000;
     let us_frac = us % 1_000_000;
 
@@ -636,6 +637,15 @@ pub fn log_version(prefix: &str, ver: u64)
     }
 }
 
+/// `SYS_SYSTEM_INFO(ElapsedUs)`, microseconds since kernel timer init; 0 if
+/// the query fails. A failed query prints a zero timestamp; in `wait_us` a
+/// failed sample cuts a running wait short (the elapsed difference wraps),
+/// and a clock that reads 0 throughout makes the wait never return.
+fn elapsed_us() -> u64
+{
+    syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0)
+}
+
 /// Wait for `secs` seconds using the kernel timer via `system_info(ElapsedUs)`.
 ///
 /// Sleeps between polls so the scheduler can run other threads.
@@ -650,16 +660,35 @@ fn wait_seconds(secs: u32)
 /// to them).
 fn wait_us(target_us: u64)
 {
-    let start = syscall::system_info(6).unwrap_or(0); // ElapsedUs = 6
+    let start = elapsed_us();
     loop
     {
-        let now = syscall::system_info(6).unwrap_or(0);
+        let now = elapsed_us();
         if now.wrapping_sub(start) >= target_us
         {
             break;
         }
         let _ = syscall::thread_sleep(1);
     }
+}
+
+/// The widest CPU count at which ktest's attempt counts and wall-clock
+/// budgets apply as written. Past it a boot is an oversubscribed boundary
+/// run, where every cross-CPU handoff waits for a host core, so an
+/// attempt's wall time and a step's latency grow with the width; see
+/// core/ktest/README.md § Tier S for the scaling rule and its intent.
+pub const UNSCALED_CPUS: u64 = 16;
+
+/// `base`, a wall-clock bound or budget whose expiry fails a test (in any
+/// unit), multiplied by the width's oversubscription factor `cpus /
+/// UNSCALED_CPUS` past [`UNSCALED_CPUS`] CPUs, so it still separates a slow
+/// step from a stuck or wrong one; `base` as written up to
+/// [`UNSCALED_CPUS`] CPUs, or when the CPU count cannot be read.
+#[must_use]
+pub fn scaled_bound(base: u64) -> u64
+{
+    let cpus = syscall::system_info(syscall_abi::SystemInfoType::CpuCount as u64).unwrap_or(1);
+    base.saturating_mul((cpus / UNSCALED_CPUS).max(1))
 }
 
 /// Spin forever. Used for fatal errors where ktest cannot continue.

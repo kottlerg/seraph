@@ -47,8 +47,8 @@ const WIDEN_VA: u64 = 0x1_5C00_0000;
 const SENTINEL: u64 = 0xCAFE_F00D;
 
 // Handshake phases. Parent and child advance this in lockstep through shared
-// memory; both busy-spin (the child must not yield, or its remote TLB entry is
-// flushed by the context switch).
+// memory. The child busy-spins (it must not yield, or the context switch
+// flushes its remote TLB entry); the parent polls in 1 ms sleeps.
 const PHASE_MAPPED: u32 = 1; // parent: page mapped read-only
 const PHASE_CACHED: u32 = 2; // child: read the page, TLB entry now cached
 const PHASE_WIDENED: u32 = 3; // parent: widened to read-write (shootdown elided)
@@ -231,7 +231,7 @@ fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, memory
 /// Child entry: cache a read-only TLB entry, wait for the parent's widen, then
 /// store through it. The store completes via the kernel's spurious-fault retry
 /// when a hardware TLB faults on the stale read-only entry.
-fn widen_child(_arg: u64) -> !
+extern "C" fn widen_child(_arg: u64) -> !
 {
     let p = WIDEN_VA as *mut u64;
 

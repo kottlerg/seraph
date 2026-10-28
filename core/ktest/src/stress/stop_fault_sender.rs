@@ -29,7 +29,8 @@
 //! handler on CPU 2 loops: spin a varying delay (so the faulter is usually
 //! queued before the receive), receive, map the page, reply `RESUME`, and
 //! count the reply if it returned `Ok`. The controller, pinned to CPU 0, runs
-//! [`CYCLES`] rounds: wait for a fault attempt in flight and for the handler's
+//! [`CYCLES`] rounds (fewer past 16 CPUs, see [`super::scaled_attempts`]):
+//! wait for a fault attempt in flight and for the handler's
 //! next receive entry, spin a varying phase (short on odd rounds, so stops
 //! cluster around the dequeue; long on even ones, so they also land after the
 //! reply), stop the faulter, restart it, and wait for it to complete the fault
@@ -79,6 +80,11 @@ const CELL: &str = "stress::stop_fault_sender";
 /// Stop/start rounds.
 const CYCLES: u32 = 1000;
 
+/// Fewest rounds at any width. A stop that lands in a fault the faulter then
+/// completes is the rarest outcome the cell requires, a few rounds in a
+/// hundred, so the floor keeps over a hundred rounds.
+const MIN_CYCLES: u32 = 128;
+
 /// The controller's, the faulter's, and the handler's CPUs. The syncer shares
 /// the faulter's: it runs only while no faulter does (after a death, and after
 /// the last faulter exited), and otherwise parks in its notification wait.
@@ -117,6 +123,9 @@ const ROUND_WAIT_US: u64 = 100_000;
 /// which takes no blocking syscall; a handler whose receives fail meanwhile
 /// has already failed the cell (each failed receive is tallied), so the bound
 /// need not outlast its receive guard's backoff.
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const SYNC_WAIT_US: u64 = 1_000_000;
 
 /// Spins between a waiting controller's polls of the children's exits and
@@ -262,7 +271,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_fault_sender: pin controller failed")?;
-    let result = with_parts(ctx);
+    // Each round's cross-CPU stop drain, fault delivery and respawn grow with
+    // the width; the count shrinks with it.
+    let result = with_parts(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus));
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_fault_sender: restore controller affinity failed");
     let tally = result?;
@@ -339,14 +350,14 @@ fn report(tally: &Tally) -> TestResult
     Ok(())
 }
 
-/// Create the endpoint, the page, and the children, run the rounds, end the
-/// children, and release everything whatever the outcome.
-fn with_parts(ctx: &TestContext) -> Result<Tally, &'static str>
+/// Create the endpoint, the page, and the children, run `cycles` rounds, end
+/// the children, and release everything whatever the outcome.
+fn with_parts(ctx: &TestContext, cycles: u32) -> Result<Tally, &'static str>
 {
     let mut parts = Parts::default();
     let result = setup(ctx, &mut parts).and_then(|()| {
         let mut tally = Tally::default();
-        let ran = rounds(ctx, &mut parts, &mut tally);
+        let ran = rounds(ctx, &mut parts, &mut tally, cycles);
         let ended = finish(&mut parts, &mut tally);
         ran?;
         ended?;
@@ -424,7 +435,7 @@ fn spawn_syncer(ctx: &TestContext, parts: &mut Parts, ep: u32) -> TestResult
 fn create_thread(
     ctx: &TestContext,
     slot: &mut Option<u32>,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
     stack: usize,
     arg: u64,
     cpu: u32,
@@ -482,10 +493,10 @@ fn await_handler_ready(handler: u32) -> TestResult
     Err("stress::stop_fault_sender: the handler never registered its IPC buffer")
 }
 
-/// Run [`CYCLES`] rounds, respawning the faulter after each death.
-fn rounds(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally) -> TestResult
+/// Run `cycles` rounds, respawning the faulter after each death.
+fn rounds(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally, cycles: u32) -> TestResult
 {
-    for cycle in 0..CYCLES
+    for cycle in 0..cycles
     {
         if parts.faulter.is_none()
         {
@@ -730,6 +741,7 @@ fn call_handler(parts: &Parts, label: u64) -> TestResult
     SYNC_REQUEST.store(label, Ordering::Release);
     notification_send(notif, 1)
         .map_err(|_| "stress::stop_fault_sender: the sync request send failed")?;
+    let bound = crate::scaled_bound(SYNC_WAIT_US);
     let start = elapsed_us()?;
     let mut spins = 0u32;
     while SYNCS_DONE.load(Ordering::Acquire) == before
@@ -750,7 +762,7 @@ fn call_handler(parts: &Parts, label: u64) -> TestResult
                     "stress::stop_fault_sender: the syncer exited before its call returned",
                 );
             }
-            if elapsed_us()?.saturating_sub(start) > SYNC_WAIT_US
+            if elapsed_us()?.saturating_sub(start) > bound
             {
                 return Err("stress::stop_fault_sender: the handler did not answer a sync call");
             }
@@ -848,7 +860,7 @@ fn release(ctx: &TestContext, parts: &Parts) -> TestResult
 /// page, unmap the page the handler mapped for it, and count the completion.
 // cast_possible_truncation: the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn faulter_entry(arg: u64) -> !
+extern "C" fn faulter_entry(arg: u64) -> !
 {
     let aspace = arg as u32;
     let page = RESERVED_VA as *mut u64;
@@ -875,7 +887,7 @@ fn faulter_entry(arg: u64) -> !
 /// echoed; the quit call is echoed and ends the loop. Anything else is
 /// tallied and echoed. A `RecvGuard` bounds the retries of a failed receive
 /// (docs/ipc-design.md § Receive-Failure Policy).
-fn handler_entry(arg: u64) -> !
+extern "C" fn handler_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `setup` published for the handler.
     let args: HandlerArgs = unsafe { spawn::child_args(arg) };
@@ -994,7 +1006,7 @@ fn service_fault(args: &HandlerArgs, buf: *mut u64)
 /// and the notification in its high half.
 // cast_possible_truncation: each half of the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn syncer_entry(arg: u64) -> !
+extern "C" fn syncer_entry(arg: u64) -> !
 {
     let ep = arg as u32;
     let notif = (arg >> 32) as u32;

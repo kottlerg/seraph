@@ -181,7 +181,7 @@ fn run_round(ctx: &TestContext, round: usize, order: Order) -> TestResult
 }
 
 /// `arg`: address of the child's [`ChildArgs`].
-fn child_entry(arg: u64) -> !
+extern "C" fn child_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run_round` published for this child.
     let ChildArgs {

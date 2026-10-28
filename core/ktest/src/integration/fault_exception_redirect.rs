@@ -132,7 +132,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// Child entry: execute an illegal instruction. The trap is redirected to the
 /// bound handler, which points this thread at [`recovery_child`] rather than
 /// resuming the faulting instruction, so control never returns here.
-fn fault_child(_arg: u64) -> !
+extern "C" fn fault_child(_arg: u64) -> !
 {
     crate::arch::illegal_instruction()
 }

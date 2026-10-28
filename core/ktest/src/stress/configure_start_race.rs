@@ -28,7 +28,8 @@
 //! ## How this exercises it
 //!
 //! A helper, pinned to CPU 1 in ktest's own `CSpace`, serves [`CYCLES`]
-//! rounds. Each round the controller, pinned to CPU 0, creates a thread in
+//! rounds (fewer past 16 CPUs, see [`super::scaled_attempts`]). Each round
+//! the controller, pinned to CPU 0, creates a thread in
 //! ktest's `CSpace`, configures it to enter [`entry_a`] on its own stress
 //! stack with argument [`tag`]`(round, A)`, pins it to CPU 2 (with 3+ CPUs,
 //! an idle CPU that dispatches it at once) or else to CPU 0 (dispatched at
@@ -77,6 +78,10 @@ const CELL: &str = "stress::configure_start_race";
 /// Rounds; each races one configure against one start of a fresh thread.
 const CYCLES: u32 = 200;
 
+/// Fewest rounds at any width: the delay sweep puts the start first on
+/// about half the rounds, so a few dozen rounds still see both outcomes.
+const MIN_CYCLES: u32 = 32;
+
 /// CPUs needed: one each for the controller and the helper.
 const MIN_CPUS: u64 = 2;
 
@@ -96,6 +101,9 @@ const STACK_BYTES: u64 = core::mem::size_of::<ChildStack>() as u64;
 
 /// Bound on each of a round's waits on the helper, in microseconds: for it
 /// to report itself ready, and for its configure to return.
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const ROUND_WAIT_US: u64 = 1_000_000;
 
 /// Bound on the waits for a thread to exit, in 1 ms polls.
@@ -170,7 +178,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     };
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::configure_start_race: pin controller failed")?;
-    let result = with_helper(ctx, target_cpu);
+    // Each round's thread creation, cross-CPU start and exit grow with the
+    // width; the count shrinks with it.
+    let cycles = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
+    let result = with_helper(ctx, target_cpu, cycles);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::configure_start_race: restore controller affinity failed");
     let tally = result?;
@@ -207,10 +218,10 @@ fn report(tally: &Tally) -> TestResult
 }
 
 /// Reset the cell's state, publish the entries' stacks, start the helper,
-/// run the rounds, end the helper, and delete it whatever the outcome (a
-/// deletion ends a thread wherever it is, so its stack is free for the next
-/// test even after a failed round).
-fn with_helper(ctx: &TestContext, target_cpu: u32) -> Result<Tally, &'static str>
+/// run `cycles` rounds, end the helper, and delete it whatever the outcome
+/// (a deletion ends a thread wherever it is, so its stack is free for the
+/// next test even after a failed round).
+fn with_helper(ctx: &TestContext, target_cpu: u32, cycles: u32) -> Result<Tally, &'static str>
 {
     for counter in [
         &QUIT,
@@ -234,7 +245,7 @@ fn with_helper(ctx: &TestContext, target_cpu: u32) -> Result<Tally, &'static str
     let mut helper = None;
     let result = start_helper(ctx, &mut helper).and_then(|th| {
         let mut tally = Tally::default();
-        let ran = rounds(ctx, target_cpu, &mut tally);
+        let ran = rounds(ctx, target_cpu, cycles, &mut tally);
         let ended = finish(th);
         ran?;
         ended?;
@@ -287,11 +298,11 @@ fn start_helper(ctx: &TestContext, slot: &mut Option<u32>) -> Result<u32, &'stat
     Ok(th)
 }
 
-/// Run [`CYCLES`] rounds, stopping at the first that fails, and count each
+/// Run `cycles` rounds, stopping at the first that fails, and count each
 /// outcome.
-fn rounds(ctx: &TestContext, target_cpu: u32, tally: &mut Tally) -> TestResult
+fn rounds(ctx: &TestContext, target_cpu: u32, cycles: u32, tally: &mut Tally) -> TestResult
 {
-    for seq in 1..=CYCLES
+    for seq in 1..=cycles
     {
         if round(ctx, seq, target_cpu)? == OUTCOME_CONFIGURED
         {
@@ -361,7 +372,9 @@ fn race(th: u32, seq: u32) -> Result<u32, &'static str>
 {
     TARGET.store(th, Ordering::Release);
     ARMED.store(seq, Ordering::Release);
-    if !await_within(ROUND_WAIT_US, || READY.load(Ordering::Acquire) == seq)?
+    if !await_within(crate::scaled_bound(ROUND_WAIT_US), || {
+        READY.load(Ordering::Acquire) == seq
+    })?
     {
         return Err("stress::configure_start_race: the helper never became ready");
     }
@@ -375,7 +388,9 @@ fn race(th: u32, seq: u32) -> Result<u32, &'static str>
     // helper may still be inside its configure; one the yield passes over
     // runs at the controller's next sleep.
     thread_yield().map_err(|_| "stress::configure_start_race: yield failed")?;
-    if !await_within(ROUND_WAIT_US, || DONE.load(Ordering::Acquire) == seq)?
+    if !await_within(crate::scaled_bound(ROUND_WAIT_US), || {
+        DONE.load(Ordering::Acquire) == seq
+    })?
     {
         return Err("stress::configure_start_race: the helper's configure never returned");
     }
@@ -529,7 +544,7 @@ fn elapsed_us() -> Result<u64, &'static str>
 /// Helper: for each round the controller arms, report ready, spin until
 /// released, spin this side's delay, configure the round's thread to
 /// [`entry_b`], and report the result; exit once told to quit.
-fn helper_entry(_arg: u64) -> !
+extern "C" fn helper_entry(_arg: u64) -> !
 {
     let mut seen = 0u32;
     while let Some(seq) = next_round(seen)
@@ -605,13 +620,13 @@ fn classify(result: Result<(), i64>) -> u32
 }
 
 /// The first configure's entry: record the argument on [`A_TOP`]'s stack.
-fn entry_a(arg: u64) -> !
+extern "C" fn entry_a(arg: u64) -> !
 {
     ran(&RAN_A, &A_TOP, arg)
 }
 
 /// The racing configure's entry: record the argument on [`B_TOP`]'s stack.
-fn entry_b(arg: u64) -> !
+extern "C" fn entry_b(arg: u64) -> !
 {
     ran(&RAN_B, &B_TOP, arg)
 }

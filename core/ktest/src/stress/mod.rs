@@ -77,6 +77,41 @@ const MAX_STRESS_THREADS: usize = 64;
 // Each test uses distinct indices.
 static mut STRESS_STACKS: [ChildStack; MAX_STRESS_THREADS] = [ChildStack::ZERO; MAX_STRESS_THREADS];
 
+/// The attempts a round-based cell makes on a `cpus`-CPU boot: `base` up to
+/// [`crate::UNSCALED_CPUS`] CPUs, and past it `base` scaled down by
+/// `UNSCALED_CPUS / cpus`, so the cell's wall time stays bounded under
+/// oversubscription. Never fewer than `floor` (the attempts the cell's
+/// anti-vacuous gates need at any width) nor more than `base`.
+fn scaled_attempts(base: u32, floor: u32, cpus: u64) -> u32
+{
+    if cpus <= crate::UNSCALED_CPUS
+    {
+        return base;
+    }
+    let scaled = u64::from(base) * crate::UNSCALED_CPUS / cpus;
+    u32::try_from(scaled).unwrap_or(base).max(floor).min(base)
+}
+
+/// The placement slot of `cycle`, out of `cycles`, for a cell that rotates
+/// its pinned children over `span` CPUs: with `cycles < span` the cycles'
+/// slots are spaced evenly over the whole span (`cycle * span / cycles`), so
+/// a cell whose scaled count is below the width still places children up to
+/// its highest CPU indices; with `cycles >= span` it is `cycle % span`.
+fn rotation_slot(cycle: u32, cycles: u32, span: u32) -> u32
+{
+    let span = span.max(1);
+    let slot = if cycles < span
+    {
+        u64::from(cycle) * u64::from(span) / u64::from(cycles.max(1)) % u64::from(span)
+    }
+    else
+    {
+        u64::from(cycle % span)
+    };
+    // slot < span, a u32.
+    u32::try_from(slot).unwrap_or(0)
+}
+
 /// Run all stress tests.
 pub fn run_all(ctx: &TestContext)
 {

@@ -37,7 +37,8 @@
 //! while it waited, is tallied but not required), and count a loop. Each
 //! child is the only stopper of the other, and each stop lands on a peer
 //! that is running, usually inside its own stop of the stopper. The
-//! controller, pinned to CPU 0, runs [`CYCLES`] rounds: restart both
+//! controller, pinned to CPU 0, runs [`CYCLES`] rounds (fewer past 16 CPUs,
+//! see [`super::scaled_attempts`]): restart both
 //! children (`Ok`, or `InvalidArgument` for one not stopped), wait, bounded
 //! by [`ROUND_WAIT_US`], for both to count another loop (a round that times
 //! out is tallied), and spin a varying delay. A pair that a mutual stop left
@@ -89,6 +90,10 @@ const CELL: &str = "stress::mutual_stop";
 
 /// Controller rounds.
 const CYCLES: u32 = 200;
+
+/// Fewest rounds at any width: a mutual stop leaves both children stopped
+/// on most rounds, so a few dozen rounds still witness one.
+const MIN_CYCLES: u32 = 32;
 
 /// The two children.
 const CHILDREN: usize = 2;
@@ -217,7 +222,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::mutual_stop: pin controller failed")?;
-    let result = with_children(ctx);
+    // Each round's cross-CPU stops and restarts grow with the width; the
+    // count shrinks with it.
+    let result = with_children(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus));
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::mutual_stop: restore controller affinity failed");
     let tally = result?;
@@ -299,15 +306,16 @@ fn log_tallies(tally: &Tally)
     );
 }
 
-/// Create and start the children, run the rounds, end the children, and
-/// delete both whatever the outcome (a deletion ends a thread wherever it
-/// is, so the stacks are free for the next test even after a failed round).
-fn with_children(ctx: &TestContext) -> Result<Tally, &'static str>
+/// Create and start the children, run `cycles` rounds, end the children,
+/// and delete both whatever the outcome (a deletion ends a thread wherever
+/// it is, so the stacks are free for the next test even after a failed
+/// round).
+fn with_children(ctx: &TestContext, cycles: u32) -> Result<Tally, &'static str>
 {
     let mut threads: [Option<u32>; CHILDREN] = [None, None];
     let result = start(ctx, &mut threads).and_then(|th| {
         let mut tally = Tally::default();
-        let ran = rounds(th, &mut tally);
+        let ran = rounds(th, cycles, &mut tally);
         let ended = finish(th, &mut tally);
         ran?;
         ended?;
@@ -373,12 +381,12 @@ fn start(
     Ok(th)
 }
 
-/// Run [`CYCLES`] rounds: restart both children, wait for both to count
+/// Run `cycles` rounds: restart both children, wait for both to count
 /// another loop, and spin a varying delay. Records the loops counted by
 /// the end.
-fn rounds(th: [u32; CHILDREN], tally: &mut Tally) -> TestResult
+fn rounds(th: [u32; CHILDREN], cycles: u32, tally: &mut Tally) -> TestResult
 {
-    for cycle in 0..CYCLES
+    for cycle in 0..cycles
     {
         let before = PROGRESS.each_ref().map(|p| p.load(Ordering::Acquire));
         let mut restarted = 0;
@@ -493,7 +501,7 @@ fn finish(th: [u32; CHILDREN], tally: &mut Tally) -> TestResult
 
 /// Child: once released, loop until told to quit: stop the peer, spin a
 /// varying delay, start the peer, count the loop.
-fn child_entry(arg: u64) -> !
+extern "C" fn child_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `start` published for this child.
     let ChildArgs { peer, index } = unsafe { spawn::child_args(arg) };

@@ -118,7 +118,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 // cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn sender_entry(sig_slot: u64) -> !
+extern "C" fn sender_entry(sig_slot: u64) -> !
 {
     notification_send(sig_slot as u32, 0xBEEF).ok();
     thread_exit()

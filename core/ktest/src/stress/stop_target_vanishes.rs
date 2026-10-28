@@ -44,7 +44,8 @@
 //! bad. B never parks, so each stop of it drains until B's slice expires,
 //! and A spends nearly all of its loop inside the drain.
 //!
-//! The controller, pinned to CPU 0, runs [`CYCLES`] rounds per phase: wait
+//! The controller, pinned to CPU 0, runs [`CYCLES`] rounds per phase (fewer
+//! past 16 CPUs, see [`super::scaled_attempts`]): wait
 //! until A counts a loop, spin a varying delay, and stop A, so most stops
 //! land while A drains B. It then classifies where the stop landed: it reads
 //! A's flag (A is off its CPU, and clears the flag only once its stop has
@@ -104,6 +105,11 @@ const CELL: &str = "stress::stop_target_vanishes";
 /// Rounds per phase; each stops the stopper mid-loop and vanishes its handle.
 const CYCLES: u32 = 200;
 
+/// Fewest rounds per phase at any width: nearly every stop lands in the
+/// stopper's drain, so a few dozen rounds still reach the vanish-and-restart
+/// interleaving.
+const MIN_CYCLES: u32 = 32;
+
 /// CPUs needed: one each for the controller, the stopper, and the target.
 const MIN_CPUS: u64 = 3;
 
@@ -120,6 +126,9 @@ const TARGET_STACK: usize = 1;
 /// count a loop (before its stop, and after its restart) and for the target
 /// to progress. A loop spans at most a few slice expiries; a wait that
 /// outlasts the bound fails the phase.
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const ROUND_WAIT_US: u64 = 1_000_000;
 
 /// Bound on the wait for both children to exit, in 1 ms polls.
@@ -221,15 +230,17 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_target_vanishes: pin controller failed")?;
-    let result = phases(ctx);
+    // Each round's cross-CPU stop drains, teardown and respawn grow with the
+    // width; the count shrinks with it.
+    let result = phases(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus));
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_target_vanishes: restore controller affinity failed");
     result?;
     restore
 }
 
-/// Run one phase per way of vanishing and check each.
-fn phases(ctx: &TestContext) -> TestResult
+/// Run one phase of `cycles` rounds per way of vanishing and check each.
+fn phases(ctx: &TestContext, cycles: u32) -> TestResult
 {
     for (kind, name) in [
         (
@@ -243,7 +254,7 @@ fn phases(ctx: &TestContext) -> TestResult
     ]
     {
         crate::log(name);
-        let seen = phase(ctx, kind)?;
+        let seen = phase(ctx, kind, cycles)?;
         report(&seen)?;
     }
     Ok(())
@@ -335,7 +346,7 @@ fn log_tallies(seen: &Seen)
 /// delete both whatever the outcome (a deletion ends a thread wherever it
 /// is, so the stacks are free for the next phase even after a failed
 /// round). Returns what the phase saw.
-fn phase(ctx: &TestContext, kind: Vanish) -> Result<Seen, &'static str>
+fn phase(ctx: &TestContext, kind: Vanish, cycles: u32) -> Result<Seen, &'static str>
 {
     for counter in [
         &QUIT,
@@ -363,7 +374,8 @@ fn phase(ctx: &TestContext, kind: Vanish) -> Result<Seen, &'static str>
     }
     let mut children = Children::default();
     let mut seen = Seen::default();
-    let ran = start(ctx, &mut children).and_then(|()| rounds(ctx, kind, &mut children, &mut seen));
+    let ran = start(ctx, &mut children)
+        .and_then(|()| rounds(ctx, (kind, cycles), &mut children, &mut seen));
     let ended = finish(&children);
     let released = release(&children);
     ran?;
@@ -412,7 +424,7 @@ fn spawn_target(ctx: &TestContext, children: &mut Children) -> TestResult
 fn create_thread(
     ctx: &TestContext,
     slot: &mut Option<u32>,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
     stack: usize,
     cpu: u32,
 ) -> Result<u32, &'static str>
@@ -432,11 +444,17 @@ fn create_thread(
     Ok(th)
 }
 
-/// Run [`CYCLES`] rounds, stopping at the first that fails. Records the
-/// loops the stopper had counted by the end.
-fn rounds(ctx: &TestContext, kind: Vanish, children: &mut Children, seen: &mut Seen) -> TestResult
+/// Run the `(vanish, cycles)` pair `plan`'s rounds, stopping at the first
+/// that fails. Records the loops the stopper had counted by the end.
+fn rounds(
+    ctx: &TestContext,
+    plan: (Vanish, u32),
+    children: &mut Children,
+    seen: &mut Seen,
+) -> TestResult
 {
-    for cycle in 0..CYCLES
+    let (kind, cycles) = plan;
+    for cycle in 0..cycles
     {
         stop_and_classify(cycle, children, seen)?;
         vanish_and_resume(ctx, kind, children, seen)?;
@@ -576,7 +594,9 @@ fn restart(child: u32) -> Result<bool, &'static str>
 fn await_progress(counter: &AtomicU32, message: &'static str) -> TestResult
 {
     let before = counter.load(Ordering::Acquire);
-    if await_within(ROUND_WAIT_US, || counter.load(Ordering::Acquire) != before)?
+    if await_within(crate::scaled_bound(ROUND_WAIT_US), || {
+        counter.load(Ordering::Acquire) != before
+    })?
     {
         Ok(())
     }
@@ -676,7 +696,7 @@ fn release(children: &Children) -> TestResult
 /// Stopper: loop until told to quit: stop the target, spin a varying delay,
 /// start the target, count the loop; after a call that finds the handle
 /// vanished, re-read the target's current handle.
-fn stopper_entry(_arg: u64) -> !
+extern "C" fn stopper_entry(_arg: u64) -> !
 {
     let mut target = TARGET_HANDLE.load(Ordering::Acquire);
     let mut loops = 0u32;
@@ -782,7 +802,7 @@ fn start_target(target: u32) -> bool
 /// Target: spin, counting progress, until told to quit and the stopper has
 /// quiesced (so no stop lands on this thread inside its exit). A delete
 /// round's target is torn down by its deletion and never reaches this exit.
-fn target_entry(_arg: u64) -> !
+extern "C" fn target_entry(_arg: u64) -> !
 {
     loop
     {

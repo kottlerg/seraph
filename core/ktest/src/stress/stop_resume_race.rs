@@ -45,8 +45,8 @@
 //! [`BIT_VICTIM_RUNNING`] only after it is executing, STOPPER/STARTER signal
 //! [`BIT_STOPPER_READY`]/[`BIT_STARTER_READY`] before parking on the barrier,
 //! and [`BIT_STOP_DONE`]/[`BIT_START_DONE`] after their syscalls return. The
-//! controller requires all five every cycle and asserts `armed_cycles ==
-//! CYCLES`. As with `stop_reply_race`, this proves the armable setup, not the
+//! controller requires all five every cycle and asserts that every cycle
+//! armed. As with `stop_reply_race`, this proves the armable setup, not the
 //! exact wedging sub-interleaving — a regression surfaces as a kernel hang
 //! (the stopper's `thread_stop` never returns, so `BIT_STOP_DONE` never
 //! arrives; the victim CPU keeps running the resumed spinner, so the harness
@@ -75,7 +75,12 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 
 /// Stop-vs-resume races to run. 256 gives the drain/resume overlap many chances
 /// across the CPU rotation while staying well under a second.
-const CYCLES: usize = 256;
+const CYCLES: u32 = 256;
+
+/// Fewest races at any width ([`super::scaled_attempts`]): the cell's gate
+/// holds on every cycle and a wedged drain hangs the run, so the floor only
+/// keeps the overlap tried across the rotation.
+const MIN_CYCLES: u32 = 32;
 
 /// Notification NOTIFY right — what a child needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
@@ -121,19 +126,20 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     }
     let cpu_mod = u32::try_from(cpus).unwrap_or(1).max(1);
+    // Each race's starts, stop drain and teardown cross CPUs, whose cost
+    // grows with the width; the count shrinks with it and the placements stay
+    // spread.
+    let cycles = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
 
     // Anti-vacuous accumulator: every cycle must arm the setup exactly once.
-    let mut armed_cycles = 0usize;
+    let mut armed_cycles = 0u32;
 
-    for cycle in 0..CYCLES
+    for cycle in 0..cycles
     {
-        // CYCLES is a compile-time constant well below u32::MAX; try_from keeps
-        // the narrow cast clippy-clean.
-        let cycle_u32 = u32::try_from(cycle).unwrap_or(0);
         // Distinct for cpus >= 3: offsets 0,1,2 never collide mod n.
-        let victim_cpu = cycle_u32 % cpu_mod;
-        let stop_cpu = (cycle_u32 + 1) % cpu_mod;
-        let start_cpu = (cycle_u32 + 2) % cpu_mod;
+        let victim_cpu = super::rotation_slot(cycle, cycles, cpu_mod);
+        let stop_cpu = (victim_cpu + 1) % cpu_mod;
+        let start_cpu = (victim_cpu + 2) % cpu_mod;
 
         // Arm the barrier closed before the racers can read it.
         RELEASE.store(0, Ordering::Release);
@@ -253,7 +259,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Non-vacuous: the setup armed on every cycle, so a clean boot reflects the
     // stop-vs-resume drain path actually executing, not a setup that no-op'd.
-    if armed_cycles != CYCLES
+    if armed_cycles != cycles
     {
         return Err("stress::stop_resume_race: race never armed on some cycle");
     }
@@ -268,7 +274,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// drains it or the controller `cap_delete`s it.
 // cast_possible_truncation: done is a kernel cap slot index < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn victim_entry(arg: u64) -> !
+extern "C" fn victim_entry(arg: u64) -> !
 {
     let done = (arg & 0xFFFF_FFFF) as u32;
     notification_send(done, BIT_VICTIM_RUNNING).ok();
@@ -282,7 +288,7 @@ fn victim_entry(arg: u64) -> !
 /// `Running` on another CPU — opening the cross-CPU drain the resume races.
 // cast_possible_truncation: cap slots are < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn stopper_entry(arg: u64) -> !
+extern "C" fn stopper_entry(arg: u64) -> !
 {
     let victim = (arg & 0xFFFF_FFFF) as u32;
     let done = (arg >> 32) as u32;
@@ -297,7 +303,7 @@ fn stopper_entry(arg: u64) -> !
 /// STOPPER — the resume that re-dispatches the victim mid-drain.
 // cast_possible_truncation: cap slots are < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn starter_entry(arg: u64) -> !
+extern "C" fn starter_entry(arg: u64) -> !
 {
     let victim = (arg & 0xFFFF_FFFF) as u32;
     let done = (arg >> 32) as u32;

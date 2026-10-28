@@ -146,7 +146,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 }
 
 /// Sibling: spin until `GO`, delete the original once, report the outcome.
-fn sibling_entry(arg: u64) -> !
+extern "C" fn sibling_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this sibling.
     let SiblingArgs { orig, done } = unsafe { child_args(arg) };

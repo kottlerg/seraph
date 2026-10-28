@@ -493,7 +493,7 @@ fn finish(th: [u32; CHILDREN], tally: &mut Tally) -> TestResult
 
 /// Child: once released, loop until told to quit: stop the peer, spin a
 /// varying delay, start the peer, count the loop.
-fn child_entry(arg: u64) -> !
+extern "C" fn child_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `start` published for this child.
     let ChildArgs { peer, index } = unsafe { spawn::child_args(arg) };

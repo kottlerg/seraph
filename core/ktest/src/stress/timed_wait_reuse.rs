@@ -25,9 +25,11 @@
 //! timed wait either at once or, in late rounds, after a busy-wait swept
 //! across the deadline (see [`LATE_MIN_US`]), so the delivery and the
 //! timer's claim race; it then releases the untimed wait with a second
-//! delivery if the waiter has not returned. The waiter runs on a third CPU
-//! when there is one, so it can re-park while CPU 0 is still between the pop
-//! and the claim.
+//! delivery if the waiter has not returned, repeated until it does (a
+//! notification release can coalesce with the first delivery into the timed
+//! wait), and drains any release the waiter left behind before the next
+//! cycle. The waiter runs on a third CPU when there is one, so it can re-park
+//! while CPU 0 is still between the pop and the claim.
 //!
 //! The test fails if a timed wait returns anything but a delivery or a
 //! timeout, if an untimed wait returns anything but a delivery, or if, for
@@ -46,7 +48,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, event_post, event_queue_create,
-    event_recv, event_recv_timeout, notification_send, notification_wait,
+    event_recv, event_recv_timeout, event_try_recv, notification_send, notification_wait,
     notification_wait_timeout, system_info, thread_exit, thread_set_affinity, thread_sleep,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
@@ -81,9 +83,10 @@ const RESULT_SPINS: u32 = 200_000;
 /// that is not being dispatched (or, on cycle 1, never started).
 const ENTER_TIMEOUT_US: u64 = 1_000_000;
 
-/// After the release delivery, the controller sleeps this many 1 ms steps for
-/// the waiter's results before failing the test: an untimed wait the release
-/// does not return is the hazard itself, seen from the controller's side.
+/// After the first release delivery, the controller sleeps this many 1 ms
+/// steps for the waiter's results, re-sending the release at each, before
+/// failing the test: an untimed wait the releases do not return is the hazard
+/// itself, seen from the controller's side.
 const RELEASE_SLEEPS: u32 = 1000;
 
 /// Waiter → controller handshake: the cycle whose timed wait the waiter is
@@ -256,13 +259,23 @@ fn cycles(sig: u32, eq: u32) -> Result<Tally, &'static str>
                 event_post(eq, value)
             }
         };
+        let drain = || {
+            if source == NOTIFICATION
+            {
+                drain_notification(sig)
+            }
+            else
+            {
+                drain_queue(eq)
+            }
+        };
         await_timed_wait(cycle)?;
         if late
         {
             late_delay(cycle)?;
         }
         deliver(1).map_err(|_| "stress::timed_wait_reuse: delivery failed")?;
-        await_results(cycle, deliver)?;
+        await_results(cycle, deliver, drain)?;
         let untimed = if UNTIMED_OK.load(Ordering::Acquire) != 0
         {
             UntimedOutcome::Delivered
@@ -318,11 +331,21 @@ fn await_timed_wait(cycle: u32) -> TestResult
     Ok(())
 }
 
-/// Wait for the waiter to publish `cycle`'s results, releasing its untimed
-/// wait with a second delivery if it has not returned after
-/// [`RESULT_SPINS`], and failing if it has still not returned after
-/// [`RELEASE_SLEEPS`] more 1 ms sleeps.
-fn await_results(cycle: u32, deliver: impl Fn(u64) -> Result<(), i64>) -> TestResult
+/// Wait for the waiter to publish `cycle`'s results. If it has not returned
+/// after [`RESULT_SPINS`], release its untimed wait with a second delivery,
+/// re-sent at each of up to [`RELEASE_SLEEPS`] 1 ms sleeps, and fail if it
+/// still has not returned. A notification release can coalesce with the
+/// first delivery while both are pending, so the timed wait takes both and
+/// that release wakes nothing; a re-send while the waiter is parked in its
+/// untimed wait reaches it. A queue already full of releases refuses more
+/// with `QueueFull` and still holds one for the waiter. Once the waiter has
+/// returned, `drain` removes any release it did not consume, so none feeds
+/// the source's next cycle.
+fn await_results(
+    cycle: u32,
+    deliver: impl Fn(u64) -> Result<(), i64>,
+    drain: impl Fn() -> TestResult,
+) -> TestResult
 {
     let mut spins = 0u32;
     let mut sleeps = 0u32;
@@ -335,11 +358,6 @@ fn await_results(cycle: u32, deliver: impl Fn(u64) -> Result<(), i64>) -> TestRe
             core::hint::spin_loop();
             continue;
         }
-        if !released
-        {
-            deliver(2).map_err(|_| "stress::timed_wait_reuse: release failed")?;
-            released = true;
-        }
         if sleeps >= RELEASE_SLEEPS
         {
             return Err(
@@ -347,10 +365,41 @@ fn await_results(cycle: u32, deliver: impl Fn(u64) -> Result<(), i64>) -> TestRe
                  the release",
             );
         }
+        match deliver(2)
+        {
+            Ok(()) => released = true,
+            Err(e) if e == SyscallError::QueueFull as i64 => released = true,
+            Err(_) => return Err("stress::timed_wait_reuse: release failed"),
+        }
         sleeps += 1;
-        let _ = thread_sleep(1);
+        thread_sleep(1).map_err(|_| "stress::timed_wait_reuse: release poll sleep failed")?;
     }
-    Ok(())
+    if released { drain() } else { Ok(()) }
+}
+
+/// Take any bits a release left pending on the notification. The wait
+/// returns pending bits at once, else times out after 1 ms; the controller
+/// is the only sender and has stopped sending, so nothing arrives later.
+fn drain_notification(sig: u32) -> TestResult
+{
+    notification_wait_timeout(sig, 1)
+        .map(|_| ())
+        .map_err(|_| "stress::timed_wait_reuse: drain notification failed")
+}
+
+/// Take every release left queued on the event queue.
+fn drain_queue(eq: u32) -> TestResult
+{
+    loop
+    {
+        match event_try_recv(eq)
+        {
+            Ok(_) =>
+            {}
+            Err(e) if e == SyscallError::WouldBlock as i64 => return Ok(()),
+            Err(_) => return Err("stress::timed_wait_reuse: drain event queue failed"),
+        }
+    }
 }
 
 /// Check one cycle's results; returns the timed outcome, `TIMED_DELIVERY` or
@@ -394,7 +443,7 @@ fn elapsed_us() -> Result<u64, &'static str>
 /// source; publishes how each ended.
 // cast_possible_truncation: packed fields are 32-bit cap handles.
 #[allow(clippy::cast_possible_truncation)]
-fn waiter_entry(arg: u64) -> !
+extern "C" fn waiter_entry(arg: u64) -> !
 {
     let sig = (arg & 0xFFFF_FFFF) as u32;
     let eq = (arg >> 32) as u32;

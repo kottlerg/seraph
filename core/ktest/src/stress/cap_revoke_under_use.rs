@@ -142,7 +142,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-fn sender_loop_entry(arg: u64) -> !
+extern "C" fn sender_loop_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this sender.
     let SenderArgs {

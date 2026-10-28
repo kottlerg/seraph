@@ -268,7 +268,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// drains it or the controller `cap_delete`s it.
 // cast_possible_truncation: done is a kernel cap slot index < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn victim_entry(arg: u64) -> !
+extern "C" fn victim_entry(arg: u64) -> !
 {
     let done = (arg & 0xFFFF_FFFF) as u32;
     notification_send(done, BIT_VICTIM_RUNNING).ok();
@@ -282,7 +282,7 @@ fn victim_entry(arg: u64) -> !
 /// `Running` on another CPU — opening the cross-CPU drain the resume races.
 // cast_possible_truncation: cap slots are < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn stopper_entry(arg: u64) -> !
+extern "C" fn stopper_entry(arg: u64) -> !
 {
     let victim = (arg & 0xFFFF_FFFF) as u32;
     let done = (arg >> 32) as u32;
@@ -297,7 +297,7 @@ fn stopper_entry(arg: u64) -> !
 /// STOPPER — the resume that re-dispatches the victim mid-drain.
 // cast_possible_truncation: cap slots are < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn starter_entry(arg: u64) -> !
+extern "C" fn starter_entry(arg: u64) -> !
 {
     let victim = (arg & 0xFFFF_FFFF) as u32;
     let done = (arg >> 32) as u32;

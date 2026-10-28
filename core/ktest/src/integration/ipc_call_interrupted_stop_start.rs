@@ -48,10 +48,11 @@ const BIT_P2_ARMED: u64 = 1 << 3;
 const BIT_P2_OK: u64 = 1 << 4;
 const BIT_P2_BAD: u64 = 1 << 5;
 
-/// Wall-clock settle after a client's READY signal so it provably reaches
-/// its park before the stop lands. A stop that lands pre-park stops a
-/// Running thread instead — the restart would then park with no canceller
-/// and hang to the watchdog, so generous slack is cheap insurance.
+/// Wall-clock settle after a client's READY signal so it has, in practice,
+/// reached its park before the stop lands (a fixed sleep cannot prove it). A
+/// stop that lands pre-park stops a Running thread instead — the restart
+/// would then park with no canceller and hang to the watchdog, so generous
+/// slack is cheap insurance.
 const SETTLE_SLEEP_MS: u64 = 20;
 
 static mut CLIENT_STACK: ChildStack = ChildStack::ZERO;
@@ -256,7 +257,7 @@ fn publish_client_args(ep: u32, done: u32, ready: u64, ok: u64, bad: u64) -> u64
 
 /// Client: optionally announce readiness, then `ipc_call`; raise the OK bit
 /// iff the call returns `Interrupted`, the BAD bit otherwise.
-fn client_entry(arg: u64) -> !
+extern "C" fn client_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `publish_client_args` published for this client.
     let ClientArgs {
@@ -289,7 +290,7 @@ fn client_entry(arg: u64) -> !
 
 /// Server: receive one caller (rebinding it to `BlockedOnReply`), announce the
 /// armed window, then park on `block` without ever replying.
-fn server_entry(arg: u64) -> !
+extern "C" fn server_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for the server.
     let ServerArgs { ep, done, block } = unsafe { spawn::child_args(arg) };

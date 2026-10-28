@@ -228,7 +228,7 @@ fn occupied_run(ctx: &TestContext, o: &mut Occupied) -> TestResult
     );
     wait_set_add(ws, sig, OCCUPIED_BADGE).map_err(|_| "wait_set_add for occupied failed")?;
 
-    let entries: [fn(u64) -> !; 2] = [occupied_waiter_0, occupied_waiter_1];
+    let entries: [extern "C" fn(u64) -> !; 2] = [occupied_waiter_0, occupied_waiter_1];
     for (k, entry) in entries.into_iter().enumerate()
     {
         let spawned =
@@ -267,7 +267,7 @@ fn occupied_run(ctx: &TestContext, o: &mut Occupied) -> TestResult
 fn start_occupied_child(
     child: &crate::spawn::SpawnedChild,
     stack: usize,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
     ws: u32,
     done: u32,
 ) -> TestResult
@@ -422,7 +422,7 @@ pub fn source_endpoint_pinned_by_member(ctx: &TestContext) -> TestResult
 
 // cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn sender_entry(sig_slot: u64) -> !
+extern "C" fn sender_entry(sig_slot: u64) -> !
 {
     notification_send(sig_slot as u32, 0xBEEF).ok();
     thread_exit()
@@ -445,13 +445,13 @@ fn occupied_waiter(arg: u64, k: u32) -> !
 }
 
 /// Waiter 0's entry.
-fn occupied_waiter_0(arg: u64) -> !
+extern "C" fn occupied_waiter_0(arg: u64) -> !
 {
     occupied_waiter(arg, 0)
 }
 
 /// Waiter 1's entry.
-fn occupied_waiter_1(arg: u64) -> !
+extern "C" fn occupied_waiter_1(arg: u64) -> !
 {
     occupied_waiter(arg, 1)
 }

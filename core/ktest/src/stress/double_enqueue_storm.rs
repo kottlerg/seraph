@@ -163,7 +163,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// controller tears the worker down with `cap_delete(Thread)` (Phase 2), so a
 /// clean exit handshake is unnecessary — a delete while parked is itself one of
 /// the raced teardown paths.
-fn worker_entry(notif_slot: u64) -> !
+extern "C" fn worker_entry(notif_slot: u64) -> !
 {
     // notification_wait returns on each wake; loop forever re-parking. A delete
     // while parked unblocks via the dealloc waiter-unlink rather than a return.

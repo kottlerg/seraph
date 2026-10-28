@@ -131,7 +131,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// Child entry: store to the reserved VA (faults; the pager backs it and
 /// resumes), read it back, and signal success. The trailing loop only satisfies
 /// the `-> !` signature; the harness reaps the child after the signal.
-fn fault_child(child_sig: u64) -> !
+extern "C" fn fault_child(child_sig: u64) -> !
 {
     let p = RESERVED_VA as *mut u64;
     // SAFETY: RESERVED_VA is unmapped on first touch; the bound pager maps a

@@ -88,7 +88,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// exactly once under `correlator`.
 fn late_bind_after_death(
     ctx: &TestContext,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
     correlator: u32,
     expected_reason: u64,
 ) -> TestResult
@@ -184,21 +184,21 @@ fn poll_event(eq: u32) -> Result<u64, &'static str>
 }
 
 /// Child: exit immediately and cleanly (exit reason `0`), no observer bound.
-fn clean_exit_child(_arg: u64) -> !
+extern "C" fn clean_exit_child(_arg: u64) -> !
 {
     thread_exit()
 }
 
 /// Child: exit the process voluntarily with `PROC_EXIT_CODE`; the kernel
 /// records `encode_exit_code(PROC_EXIT_CODE)` as the thread's exit reason.
-fn proc_exit_child(_arg: u64) -> !
+extern "C" fn proc_exit_child(_arg: u64) -> !
 {
     process_exit(PROC_EXIT_CODE)
 }
 
 /// Child: store to an unmapped address, killed by the kernel with exit reason
 /// `EXIT_FAULT_BASE + <vector>`. The trailing loop only satisfies `-> !`.
-fn fault_child(_arg: u64) -> !
+extern "C" fn fault_child(_arg: u64) -> !
 {
     let p = WILD_VA as *mut u64;
     // SAFETY: deliberately faulting — WILD_VA is unmapped, so this store raises

@@ -50,7 +50,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 // cast_possible_truncation: done_slot is a kernel cap slot index < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn churn_entry(done_slot: u64) -> !
+extern "C" fn churn_entry(done_slot: u64) -> !
 {
     notification_send(done_slot as u32, 0x1).ok();
     thread_exit()

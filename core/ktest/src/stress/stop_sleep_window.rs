@@ -30,19 +30,22 @@
 //! cells run them): a listed TCB with a zero deadline at the pop, a
 //! duplicate add, a popped binding that no timed park arms, and the
 //! wake-in-flight and run-queue single-link checks. The test itself fails
-//! if a sleep returned anything but `Ok` or `Interrupted`, or if no stop
-//! ever cancelled a sleep (the race never armed).
+//! if a sleep returned anything but `Ok` or `Interrupted`, if no stop ever
+//! cancelled a sleep (the race never armed), or if the sleeper does not
+//! report running, or leave its loop after the storm, within a bounded wait
+//! (a sleeper a restart left blocked for good).
 //!
 //! Needs **≥ 2 CPUs** (the stop must run concurrently with the sleep path).
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
-    cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait,
-    system_info, thread_exit, thread_set_affinity, thread_sleep, thread_start, thread_stop,
+    cap_copy, cap_create_notification, cap_delete, notification_send, system_info, thread_exit,
+    thread_set_affinity, thread_sleep, thread_start, thread_stop,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
+use crate::tally::await_report;
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 /// Stop/start pairs to issue against the sleeper.
@@ -138,11 +141,12 @@ fn start_and_storm(child: &spawn::SpawnedChild, done: u32) -> TestResult
         .map_err(|_| "stress::stop_sleep_window: start sleeper failed")?;
 
     let mut acc = 0u64;
-    while acc & BIT_RUNNING == 0
-    {
-        acc |= notification_wait(done)
-            .map_err(|_| "stress::stop_sleep_window: wait running failed")?;
-    }
+    await_report(
+        done,
+        &mut acc,
+        BIT_RUNNING,
+        "stress::stop_sleep_window: the sleeper never reported running",
+    )?;
 
     for cycle in 0..CYCLES
     {
@@ -157,20 +161,22 @@ fn start_and_storm(child: &spawn::SpawnedChild, done: u32) -> TestResult
     }
 
     QUIT.store(1, Ordering::Release);
-    while acc & BIT_EXITED == 0
-    {
-        acc |=
-            notification_wait(done).map_err(|_| "stress::stop_sleep_window: wait exit failed")?;
-    }
-    Ok(())
+    await_report(
+        done,
+        &mut acc,
+        BIT_EXITED,
+        "stress::stop_sleep_window: the sleeper never left its loop after QUIT",
+    )
 }
 
 /// Sleeper: `thread_sleep(1)` until told to quit, tallying each result.
 // cast_possible_truncation: the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn sleeper_entry(arg: u64) -> !
+extern "C" fn sleeper_entry(arg: u64) -> !
 {
     let done = arg as u32;
+    // A child has no other channel to report on; a failed send fails the
+    // controller's bounded wait for the bit.
     notification_send(done, BIT_RUNNING).ok();
     while QUIT.load(Ordering::Acquire) == 0
     {
@@ -184,6 +190,7 @@ fn sleeper_entry(arg: u64) -> !
             Err(_) => BAD.fetch_add(1, Ordering::Relaxed),
         };
     }
+    // As for BIT_RUNNING: a failed send fails the controller's bounded wait.
     notification_send(done, BIT_EXITED).ok();
     thread_exit()
 }

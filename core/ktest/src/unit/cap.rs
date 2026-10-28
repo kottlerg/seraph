@@ -1120,7 +1120,7 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
 /// Child for [`cspace_delete_stops_bound_thread`]: signal, then block on a
 /// notification nobody signals. Reaching the exit means the wait returned,
 /// which the test never expects.
-fn stop_blocked_child_entry(arg: u64) -> !
+extern "C" fn stop_blocked_child_entry(arg: u64) -> !
 {
     let ready_slot = (arg & 0xFFFF_FFFF) as u32;
     let block_slot = (arg >> 32) as u32;
@@ -1130,7 +1130,7 @@ fn stop_blocked_child_entry(arg: u64) -> !
 }
 
 /// Child for [`cspace_delete_stops_bound_thread`]: signal, then yield forever.
-fn stop_spinning_child_entry(arg: u64) -> !
+extern "C" fn stop_spinning_child_entry(arg: u64) -> !
 {
     let ready_slot = (arg & 0xFFFF_FFFF) as u32;
     notification_send(ready_slot, 0x1).ok();
@@ -1188,7 +1188,7 @@ pub fn cspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
 /// Child for [`cspace_self_delete_stops_caller`]: signal ready, then delete
 /// the last capability to its own `CSpace`. The delete never returns; the
 /// yield loop only satisfies the signature.
-fn self_delete_child_entry(arg: u64) -> !
+extern "C" fn self_delete_child_entry(arg: u64) -> !
 {
     let ready_slot = (arg & 0xFFFF_FFFF) as u32;
     let own_cs = (arg >> 32) as u32;
@@ -1203,7 +1203,7 @@ fn self_delete_child_entry(arg: u64) -> !
 /// Child for [`cspace_teardown_multibatch`]: derives `TEARDOWN_BATCH_DERIVES`
 /// SEND caps from its endpoint copy (building a wide dying child list),
 /// signals completion, and exits without cleaning up — teardown is the test.
-fn teardown_batch_child_entry(arg: u64) -> !
+extern "C" fn teardown_batch_child_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;

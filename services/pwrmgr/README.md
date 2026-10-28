@@ -150,7 +150,7 @@ between the two trees.
 | [shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) | Authoritative IPC label and error definitions (`pwrmgr_labels`, `pwrmgr_errors`, `devmgr_labels`) |
 | [services/devmgr/README.md](../devmgr/README.md) | Hardware + ACPI authority; the `QUERY_ACPI_TABLE` / `QUERY_SHUTDOWN_DEVICE` brokers pwrmgr acquires its caps through |
 | [services/svcmgr/README.md](../svcmgr/README.md) | Launcher + supervisor; the provider path that publishes `pwrmgr.shutdown` / `pwrmgr.deny` |
-| [services/svctest/README.md](../svctest/README.md) | Services-tier harness; seeds both pwrmgr caps, asserts the deny path, and requests the terminal shutdown |
+| [services/svctest/README.md](../svctest/README.md) | Services-tier harness; seeds `pwrmgr.shutdown`, resolves the public `pwrmgr.deny` through `QUERY_ENDPOINT`, asserts the deny path, and requests the terminal shutdown |
 
 ---
 

@@ -227,7 +227,21 @@ mod tests
     }
 
     #[test]
-    fn publish_rejects_zero_cap_bad_names_duplicates_and_a_full_table()
+    fn name_of_exactly_name_max_bytes_is_published_resolved_and_removed()
+    {
+        let name = [b'a'; NAME_MAX];
+        let mut r = Registry::<1>::new();
+        r.publish(&name, 7, Visibility::Public).unwrap();
+        assert_eq!(r.lookup(&name, Resolver::Query), Some(7));
+        assert_eq!(r.remove(&name), Some(7));
+        assert!(
+            r.publish(&[b'a'; NAME_MAX + 1], 8, Visibility::Public)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn publish_rejects_zero_cap_and_invalid_names()
     {
         let mut r = Registry::<2>::new();
         assert!(r.publish(b"a", 0, Visibility::Public).is_err());
@@ -236,10 +250,25 @@ mod tests
             r.publish(&[b'a'; NAME_MAX + 1], 1, Visibility::Public)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn publish_rejects_a_name_registered_at_either_visibility()
+    {
+        let mut r = Registry::<4>::new();
         r.publish(b"a", 1, Visibility::SeedOnly).unwrap();
         assert!(r.publish(b"a", 2, Visibility::Public).is_err());
         r.publish(b"b", 3, Visibility::Public).unwrap();
-        assert!(r.publish(b"c", 4, Visibility::Public).is_err());
+        assert!(r.publish(b"b", 4, Visibility::SeedOnly).is_err());
+    }
+
+    #[test]
+    fn publish_fails_when_the_table_is_full()
+    {
+        let mut r = Registry::<2>::new();
+        r.publish(b"a", 1, Visibility::Public).unwrap();
+        r.publish(b"b", 2, Visibility::SeedOnly).unwrap();
+        assert!(r.publish(b"c", 3, Visibility::Public).is_err());
     }
 
     #[test]

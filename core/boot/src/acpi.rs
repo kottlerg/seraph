@@ -854,7 +854,7 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
 /// base is where bus 0 would decode, so the window starts `start_bus` MiB
 /// above it and spans 1 MiB per bus through `end_bus`. Returns `None` for a
 /// zero base, an end bus below the start bus, or a window whose start or end
-/// overflows the physical address space, so a malformed entry is skipped.
+/// overflows a 64-bit physical address, so a malformed entry is skipped.
 fn mcfg_ecam_window(base: u64, start_bus: u8, end_bus: u8) -> Option<(u64, u64)>
 {
     if base == 0 || end_bus < start_bus
@@ -891,11 +891,26 @@ mod tests
     }
 
     #[test]
-    fn mcfg_window_rejects_zero_base_inverted_range_and_overflow()
+    fn mcfg_window_with_zero_base_is_skipped()
     {
         assert_eq!(mcfg_ecam_window(0, 0, 255), None);
+    }
+
+    #[test]
+    fn mcfg_window_with_end_bus_below_start_bus_is_skipped()
+    {
         assert_eq!(mcfg_ecam_window(0xB000_0000, 8, 7), None);
-        assert_eq!(mcfg_ecam_window(u64::MAX - (1 << 20), 1, 1), None);
+    }
+
+    #[test]
+    fn mcfg_window_whose_start_overflows_is_skipped()
+    {
+        assert_eq!(mcfg_ecam_window(u64::MAX - (1 << 20) + 1, 1, 1), None);
+    }
+
+    #[test]
+    fn mcfg_window_whose_end_overflows_is_skipped()
+    {
         assert_eq!(mcfg_ecam_window(u64::MAX - (1 << 20) + 2, 0, 0), None);
     }
 

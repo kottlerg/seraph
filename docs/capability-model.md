@@ -444,12 +444,14 @@ procmgr's random per-process badge, stamped on every SEND procmgr mints
 for a child (its procmgr, registry, and log SENDs) and on its process
 handle, is redrawn until none of them is set. An un-badged SEND on such an
 endpoint stays with the server and its trusted minters, since its holder
-could badge it with any verb-bit. A verb-bit cap svcmgr publishes by name
-is seed-only: its `QUERY_ENDPOINT` answers every process, so a queryable
-verb-bit cap would be ambient, and a seed-only name reaches only the
-recipes that seed it
+could badge it with any verb-bit. svcmgr's `QUERY_ENDPOINT` answers every
+process, so a queryable verb-bit cap would be ambient: a verb-bit cap
+svcmgr publishes itself (its well-known names and each provider's
+`provides` names) is seed-only, reaching only the recipes that seed it,
+and a name published through `PUBLISH_ENDPOINT` is always public, so an
+external publisher MUST NOT publish a verb-bit cap there
 ([services/svcmgr/docs/ipc-interface.md](../services/svcmgr/docs/ipc-interface.md)
-§ Label 4).
+§ Label 3 and § Label 4).
 
 ---
 

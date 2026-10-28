@@ -31,8 +31,9 @@ const HDR_OFF_DT_STRINGS: usize = 12;
 const HDR_SIZE_DT_STRUCT: usize = 36;
 const HDR_LEN: usize = 40;
 
-/// Deepest node nesting the cell-size tracking follows; a deeper ECAM node
-/// is not found.
+/// Deepest level (the root node is level 1) at which an ECAM node is found;
+/// the cell-size tracking follows nodes only to here, so a deeper ECAM node
+/// is skipped.
 const MAX_DEPTH: usize = 16;
 /// `#address-cells` / `#size-cells` a node's children inherit when the node
 /// does not set them (Device Tree Specification § 2.3.5).
@@ -128,16 +129,19 @@ impl<'a> Fdt<'a>
     /// address is the configuration space of the first bus. The bus range
     /// is the node's `bus-range` property, else bus 0 onward, clamped to the
     /// buses `reg` covers and to 255; the returned size is 1 MiB per bus of
-    /// that range. Returns `None` when no such node exists, it is nested
-    /// deeper than 16 levels, its parent's cell sizes are unsupported, its
-    /// `reg` is missing, short, or zero, it covers less than one bus, or its
-    /// `bus-range` is short, inverted, or starts above bus 255.
+    /// that range. An ECAM node more than 16 levels deep (the root node is
+    /// level 1) is skipped. Returns `None` when no such node exists within
+    /// that depth, the structure block closes more nodes than it opens, the
+    /// node's parent's cell sizes are unsupported, its `reg` is missing,
+    /// short, or zero, it covers less than one bus, or its `bus-range` is
+    /// short, inverted, or starts above bus 255.
     #[must_use]
     pub fn find_pci_ecam(&self) -> Option<EcamLocation>
     {
         let mut walker = FdtWalker::new(self);
         // `cells[d]`: the cell sizes the children of the node at depth `d`
-        // decode their `reg` in (the root node is depth 1).
+        // decode their `reg` in (the root node is depth 1). Tracked only for
+        // `d < MAX_DEPTH`; `depth` itself keeps counting past it.
         let mut cells = [DEFAULT_CELLS; MAX_DEPTH];
         let mut depth = 0usize;
 
@@ -148,24 +152,26 @@ impl<'a> Fdt<'a>
                 FdtEvent::BeginNode =>
                 {
                     depth += 1;
-                    if depth >= MAX_DEPTH
+                    if let Some(c) = cells.get_mut(depth)
                     {
-                        return None;
+                        *c = DEFAULT_CELLS;
                     }
-                    cells[depth] = DEFAULT_CELLS;
                 }
                 FdtEvent::EndNode => depth = depth.checked_sub(1)?,
                 FdtEvent::Prop { name, data } if depth > 0 =>
                 {
                     if name == b"#address-cells"
+                        && let Some(c) = cells.get_mut(depth)
                     {
-                        cells[depth].0 = be_u32(data, 0) as usize;
+                        c.0 = be_u32(data, 0) as usize;
                     }
                     else if name == b"#size-cells"
+                        && let Some(c) = cells.get_mut(depth)
                     {
-                        cells[depth].1 = be_u32(data, 0) as usize;
+                        c.1 = be_u32(data, 0) as usize;
                     }
-                    else if name == b"compatible"
+                    else if depth <= MAX_DEPTH
+                        && name == b"compatible"
                         && compatible_contains(data, b"pci-host-ecam-generic")
                     {
                         // Restart at this node and read its `reg` and
@@ -682,22 +688,77 @@ mod tests
         assert!(ecam(&blob).is_none());
     }
 
-    #[test]
-    fn ecam_node_nested_past_the_depth_limit_is_not_found()
+    /// An ECAM node at `depth` (the root node is depth 1) under wrapper
+    /// nodes, the innermost declaring `#size-cells = 2`.
+    fn nested_ecam(depth: usize) -> Vec<u8>
     {
         let mut b = Builder::new();
-        for _ in 0..MAX_DEPTH
+        for _ in 1..depth
         {
             b = b.begin("n");
         }
         b = b
+            .prop("#size-cells", &2u32.to_be_bytes())
+            .begin("pcie@30000000")
             .prop("compatible", ECAM)
-            .prop("reg", &reg(0x3000_0000, 16 << 20));
-        for _ in 0..MAX_DEPTH
+            .prop("reg", &reg(0x3000_0000, 16 << 20))
+            .end();
+        for _ in 1..depth
         {
             b = b.end();
         }
-        assert!(ecam(&b.finish()).is_none());
+        b.finish()
+    }
+
+    #[test]
+    fn ecam_node_at_the_depth_limit_is_found()
+    {
+        assert!(ecam(&nested_ecam(MAX_DEPTH)).is_some());
+    }
+
+    #[test]
+    fn ecam_node_past_the_depth_limit_is_skipped()
+    {
+        assert!(ecam(&nested_ecam(MAX_DEPTH + 1)).is_none());
+    }
+
+    #[test]
+    fn deep_subtree_before_a_shallow_ecam_node_does_not_hide_it()
+    {
+        let mut b = Builder::new().begin("");
+        for _ in 0..=MAX_DEPTH
+        {
+            b = b.begin("deep");
+        }
+        for _ in 0..=MAX_DEPTH
+        {
+            b = b.end();
+        }
+        let blob = b
+            .prop("#size-cells", &2u32.to_be_bytes())
+            .begin("pcie@30000000")
+            .prop("compatible", ECAM)
+            .prop("reg", &reg(0x3000_0000, 16 << 20))
+            .end()
+            .end()
+            .finish();
+        assert_eq!(ecam(&blob).unwrap().phys_base, 0x3000_0000);
+    }
+
+    #[test]
+    fn structure_closing_more_nodes_than_it_opens_yields_no_ecam()
+    {
+        let blob = Builder::new()
+            .end()
+            .begin("")
+            .prop("#size-cells", &2u32.to_be_bytes())
+            .begin("pcie@30000000")
+            .prop("compatible", ECAM)
+            .prop("reg", &reg(0x3000_0000, 16 << 20))
+            .end()
+            .end()
+            .finish();
+        assert!(ecam(&blob).is_none());
     }
 
     #[test]

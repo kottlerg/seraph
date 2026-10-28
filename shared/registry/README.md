@@ -7,8 +7,9 @@ capability-slot indices in its own CSpace. Storage is statically sized (`N` entr
 name match, with no prefix or glob matching.
 
 Each entry is published `Public` or `SeedOnly`. A lookup names its resolver: `Query` (a
-`QUERY_ENDPOINT` caller) sees only `Public` entries, and `Seed` (the supervisor's own seed
-resolution) sees both, so a `SeedOnly` name reaches only the recipes that seed it.
+`QUERY_ENDPOINT` caller) sees only `Public` entries, and `Seed` (the supervisor itself: its
+recipes' seed lists and its own lookups) sees both, so a `SeedOnly` name reaches only the
+recipes that seed it.
 
 `no_std` outside host tests, no dependencies.
 

@@ -225,12 +225,15 @@ impl DevmgrCaps
 // Round 2+ (variable, ≤4 caps, up to 10 data words)
 //   data[0] = round kind (APERTURE / ACPI_REGION / MODULE /
 //             FRAMEBUFFER_INFO / SVCMGR_BUNDLE)
-//   data[1] = count of caps in this round
-//   data[2..] = kind-specific payload:
-//     APERTURE / ACPI_REGION → (base, size) pairs per cap
-//     MODULE → one `module_kind` tag per cap
-//     FRAMEBUFFER_INFO → no caps; framebuffer geometry words
-//     SVCMGR_BUNDLE → two caps, no payload; the terminal round
+//   APERTURE / ACPI_REGION / MODULE / SVCMGR_BUNDLE:
+//     data[1] = count of caps in this round
+//     data[2..] = kind-specific payload:
+//       APERTURE / ACPI_REGION → (base, size) pairs per cap
+//       MODULE → one `module_kind` tag per cap
+//       SVCMGR_BUNDLE → no payload; one or two caps (publish, optional
+//         arch shutdown); the terminal round
+//   FRAMEBUFFER_INFO: zero caps; data[1] = physical_base,
+//     data[2] = width | height << 32, data[3] = stride | format << 32
 //   Terminal round has `done = true`.
 //
 // log_ep + procmgr_ep arrive via ProcessInfo / StartupInfo, not this protocol.

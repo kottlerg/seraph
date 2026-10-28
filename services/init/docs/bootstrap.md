@@ -180,10 +180,6 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   - `devmgr.test` — the same SEND with `ORPHAN_TEST_AUTHORITY` added,
     gating devmgr's `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` shim
     (TODO(#165)); svctest is the only recipe seeding it.
-
-  All three `devmgr.*` names are seed-only: svcmgr's `QUERY_ENDPOINT`
-  refuses them, so each badge reaches only the recipes that seed the name
-  ([svcmgr IPC interface § Label 4](../../svcmgr/docs/ipc-interface.md#label-4-query_endpoint)).
   - `SET_DRIVERS_DIR` — svcmgr walks its universal root to
     `/services/drivers/` at `LOOKUP | READ` and hands devmgr the subtree
     cap on a `DRIVERS_DIR_AUTHORITY`-badged copy of the
@@ -194,6 +190,10 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     [Driver binary sources](../../../docs/device-management.md#driver-binary-sources)). Best-effort:
     a failure leaves the system without a wallclock — timed degrades to
     `WALL_CLOCK_UNAVAILABLE` (see [timed](../../timed/README.md)).
+
+  All three `devmgr.*` names are seed-only: svcmgr's `QUERY_ENDPOINT`
+  refuses them, so each badge reaches only the recipes that seed the name
+  ([svcmgr IPC interface § Label 4](../../svcmgr/docs/ipc-interface.md#label-4-query_endpoint)).
 
   `pwrmgr.shutdown`, `pwrmgr.deny`, and `timed` are published by
   svcmgr's provider path on each provider's launch (see

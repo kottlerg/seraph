@@ -1115,13 +1115,11 @@ fn handle_query_shutdown_device(
 /// **upper** portion `[phys + size, ap_end)` updates the carved
 /// aperture in place via [`pci::split_bar_cap`].
 ///
-/// The lower-portion preservation is the difference from raw
-/// [`pci::split_bar_cap`]: that helper releases the lower portion (its
-/// PCI-BAR caller doesn't need it — the gap is unused address space
-/// between BARs). For the framebuffer aperture we *do* care about
-/// preserving the surrounding range, since that range may host other
-/// useful MMIO (e.g. the framebuffer lives below the ECAM in the
-/// same parent aperture on x86-64 QEMU+OVMF).
+/// The lower portion is split off here, before [`pci::split_bar_cap`]
+/// runs on a window already starting at `phys`, so it is preserved rather
+/// than released: the surrounding range may host other useful MMIO (e.g.
+/// the framebuffer lives below the ECAM in the same parent aperture on
+/// x86-64 QEMU+OVMF).
 fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Option<u32>
 {
     let mut found: Option<usize> = None;
@@ -1294,9 +1292,10 @@ pub struct DeviceCatalog<'a>
 }
 
 /// Find and spawn a `VirtIO` block device driver from the discovered devices.
-/// Returns `false` without spawning when no virtio-blk device or driver
-/// module is present, the catalog entry cannot be filled, or no single-IRQ
-/// cap can be split for the device (virtio-blk requires an IRQ).
+/// Returns `true` only when the driver completed its bootstrap; `false`
+/// when no virtio-blk device or virtio-blk driver module is present, the
+/// catalog entry cannot be filled, no single-IRQ cap can be split for the
+/// device (virtio-blk requires an IRQ), or the spawn fails.
 fn spawn_virtio_blk(
     devices: &[pci::PciDevice],
     caps: &mut caps::DevmgrCaps,
@@ -1307,10 +1306,11 @@ fn spawn_virtio_blk(
 ) -> bool
 {
     // Guard the boot module across every retained exit — no virtio device, no
-    // module delivered, or a catalog-serialisation failure — until it is handed
-    // to `spawn_driver`. A retained module cap is a live derivation child of
-    // init's donated pool-run source and pins that run unsplittable. Disarmed
-    // immediately before the spawn, which then owns the cap's lifecycle.
+    // module delivered, a catalog-serialisation failure, or no IRQ cap for the
+    // device — until it is handed to `spawn_driver`. A retained module cap is
+    // a live derivation child of init's donated pool-run source and pins that
+    // run unsplittable. Disarmed immediately before the spawn, which then owns
+    // the cap's lifecycle.
     let module_cap = caps.module_cap_for_kind(caps::module_kind::VIRTIO_BLK);
     let mut module_guard = spawn::ModuleCapGuard::new(module_cap);
 
@@ -1327,9 +1327,9 @@ fn spawn_virtio_blk(
             u64::from(pci_dev.irq_pin)
         );
 
-        if caps.driver_module_count == 0
+        if module_cap == 0
         {
-            std::os::seraph::log!("no driver modules available");
+            std::os::seraph::log!("no virtio-blk driver module available");
             return false;
         }
 
@@ -1397,9 +1397,12 @@ fn spawn_virtio_blk(
         // `spawn_driver` owns the module cap's lifecycle from here (guarded
         // internally: consumed by CREATE_PROCESS, or released on failure).
         module_guard.disarm();
-        spawn::spawn_driver(&config, ipc_buf);
-
-        return true;
+        let spawned = spawn::spawn_driver(&config, ipc_buf);
+        if !spawned
+        {
+            let _ = syscall::cap_delete(irq_cap);
+        }
+        return spawned;
     }
 
     // No virtio block device present: `module_guard` releases the module here.

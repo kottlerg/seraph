@@ -866,7 +866,9 @@ pub mod svcmgr_labels
 /// three `devmgr.*` names, and each provider name whose badge carries a
 /// verb bit ([`crate::VERB_BIT_MASK`]; today `pwrmgr.shutdown`) resolve
 /// only through a recipe's `seed = ...` line, and `QUERY_ENDPOINT` answers
-/// them `UNKNOWN_NAME`. `svcmgr`, `pwrmgr.deny`, and `timed` are public.
+/// them `UNKNOWN_NAME`. `svcmgr`, `pwrmgr.deny`, `timed`, and any name
+/// published through [`svcmgr_labels::PUBLISH_ENDPOINT`] are public
+/// (services/svcmgr/docs/ipc-interface.md § Label 4).
 pub mod published_names
 {
     /// Badged SEND on the root filesystem's namespace endpoint at
@@ -1523,8 +1525,8 @@ pub mod devmgr_labels
     /// Authority bit gating [`SET_DRIVERS_DIR`]. svcmgr mints a SEND
     /// cap carrying this bit from the devmgr-registry source cap init
     /// endows it with at handover; the `REGISTRY_QUERY_AUTHORITY`-only
-    /// copy svcmgr publishes as `devmgr.registry` (which other services
-    /// then look up) lacks this bit, so no looked-up consumer can call
+    /// copy svcmgr publishes seed-only as `devmgr.registry` (which recipes
+    /// seed) lacks this bit, so no seeding consumer can call
     /// `SET_DRIVERS_DIR`. Disjoint position from
     /// [`REGISTRY_QUERY_AUTHORITY`].
     pub const DRIVERS_DIR_AUTHORITY: u64 = 1u64 << 62;

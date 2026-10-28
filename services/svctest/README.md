@@ -66,8 +66,9 @@ or an IPC error, is logged and svctest exits, leaving the system idle.
 A failing phase panics through the std panic handler; svctest then never logs
 `ALL TESTS PASSED` and never requests shutdown. The `ns` phase (`caps[0]`), the pwrmgr
 cap-deny phase (the queried `pwrmgr.deny` cap), and the pwrmgr shutdown phase (`caps[1]`) log
-the skip and return when their cap is zero; the devmgr deny phases (`caps[2]`) and the
-orphan-teardown phase (`caps[3]`) instead fail their assertions.
+the skip and return when their cap is zero; the devmgr deny phases (`caps[2]`), the
+orphan-teardown phase (`caps[3]`), and the svcmgr seed-only phase (every seed, plus the public
+`svcmgr` and `pwrmgr.deny` names it resolves) instead fail their assertions.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, and env
 carries `SERAPH_TEST=1` and `SERAPH_MODE=boot`.
@@ -138,7 +139,7 @@ spawned by the `fs_crossover_bench` phase, reads the build-synthesised
 | [docs/testing.md](../../docs/testing.md) | Harness model, reporting marker, sysroot layout, gating, cross-harness conventions |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Process startup, `ProcessInfo` handover, process death |
 | [Service Definitions](../svcmgr/docs/service-definitions.md) | `.svc` recipe keys, including `seed` resolution |
-| [svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) | `HANDOVER_COMPLETE` and `PUBLISH_ENDPOINT` and their authority badges |
+| [svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) | `HANDOVER_COMPLETE` and `PUBLISH_ENDPOINT` and their authority badges; `QUERY_ENDPOINT` and its seed-only refusal |
 | [services/pwrmgr/README.md](../pwrmgr/README.md) | pwrmgr `SHUTDOWN` and its authority badge |
 | [services/drivers/test-orphan/README.md](../drivers/test-orphan/README.md) | Fault-injection driver behind the orphan-teardown phase |
 

@@ -206,7 +206,7 @@ a `provides` service's provider RECV takes cap[0], so a recipe with more
 than 4 seeds, or more than 3 for a `provides` service, is a parser error.
 
 An unresolved name leaves slot `i` as `0`. Consumers that already tolerate `cap == 0 → skip`
-(e.g. svctest's pwrmgr phases, per
+(e.g. svctest's `ns` and pwrmgr shutdown phases, per
 [services/svctest/README.md § Run Sequence](../../svctest/README.md#run-sequence))
 continue to work; consumers that don't fail on first use, which is the right surface for a real
 misconfiguration.

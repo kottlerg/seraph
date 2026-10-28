@@ -16,12 +16,12 @@ use ipc::{IpcMessage, procmgr_labels};
 /// boot-bundle modules (the bootstrap-essential drivers virtio-blk,
 /// serial, framebuffer) carry a procmgr Memory cap and use
 /// [`CreateSource::Module`]; non-essential drivers loaded from the rootfs
-/// (today: the per-arch RTC, walked by devmgr through its
+/// (today: the per-arch RTC and virtio-input, walked by devmgr through its
 /// `SET_DRIVERS_DIR` subtree cap) carry a vfsd file SEND cap plus a size
 /// hint and use [`CreateSource::File`]. The variant decides the procmgr
 /// request label and payload shape; the rest of [`spawn_simple_device`]
-/// — service-endpoint derivation, `START_PROCESS`, bootstrap rounds —
-/// is identical across both paths.
+/// and [`spawn_driver`] — service-endpoint derivation, `START_PROCESS`,
+/// bootstrap rounds — is identical across both sources.
 #[derive(Clone, Copy)]
 pub enum CreateSource
 {
@@ -202,8 +202,11 @@ pub struct DriverSpawnConfig<'a>
 /// used to derive a per-device badged send cap from `registry_ep` so the
 /// driver can query devmgr for its device configuration.
 ///
-/// Layout matches `drivers/virtio/blk/src/main.rs::bootstrap_caps`:
-///   Round 1 (3 caps): BAR MMIO, IRQ, driver service endpoint.
+/// Layout matches `services/drivers/virtio/blk/src/main.rs::bootstrap_caps`
+/// and the virtio-input driver's:
+///   Round 1: BAR MMIO, IRQ, driver service endpoint; or BAR MMIO and
+///     driver service endpoint when `irq_cap` is `None`, a shape only
+///     virtio-input decodes.
 ///   Round 2 (1 cap): devmgr query endpoint.
 ///
 /// log + procmgr endpoints arrive via `ProcessInfo`.

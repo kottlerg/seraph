@@ -161,7 +161,7 @@ pub fn fadt_pm1a_cnt_blk(fadt_bytes: &[u8]) -> Option<u16>
 ///
 /// Returns `None` if the signature isn't `MCFG`, no entry is present, or
 /// the entry has a zero base, an end bus below its start bus, or a window
-/// whose start or end overflows the physical address space.
+/// whose start or end overflows a 64-bit physical address.
 #[must_use]
 pub fn parse_mcfg_ecam(mcfg_bytes: &[u8]) -> Option<EcamLocation>
 {
@@ -406,9 +406,14 @@ mod tests
     }
 
     #[test]
-    fn mcfg_entry_whose_window_overflows_yields_no_ecam()
+    fn mcfg_entry_whose_window_start_overflows_yields_no_ecam()
     {
-        assert!(parse_mcfg_ecam(&mcfg(u64::MAX - (1 << 20), 1, 1)).is_none());
+        assert!(parse_mcfg_ecam(&mcfg(u64::MAX - (1 << 20) + 1, 1, 1)).is_none());
+    }
+
+    #[test]
+    fn mcfg_entry_whose_window_end_overflows_yields_no_ecam()
+    {
         assert!(parse_mcfg_ecam(&mcfg(u64::MAX - (1 << 20) + 2, 0, 0)).is_none());
     }
 }

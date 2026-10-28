@@ -23,7 +23,8 @@ pub mod dtb;
 pub mod pci;
 
 /// Location of the PCI ECAM configuration-space region discovered from
-/// MCFG (ACPI) or a `pci-host-ecam-generic` DTB node.
+/// MCFG (ACPI) or a `pci-host-ecam-generic` DTB node, or the arch platform
+/// default (riscv64 QEMU virt).
 #[derive(Clone, Copy, Debug)]
 pub struct EcamLocation
 {

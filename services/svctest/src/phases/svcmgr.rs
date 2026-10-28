@@ -162,11 +162,22 @@ fn svcmgr_published_send_badged_phase(_caps: &Caps)
 }
 
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
-/// name with `UNKNOWN_NAME` and no cap, though svctest's own seeds show the
-/// names are published, and resolves the public ones. A queryable
+/// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
+/// cap. svctest's own non-zero seeds show four of the refused names are
+/// published; `devmgr.shutdown`, which only pwrmgr seeds, is published by
+/// the same loop as `devmgr.registry` and `devmgr.test`. A queryable
 /// seed-only name would hand its authority to every process.
-fn svcmgr_seed_only_names_refused_phase(_caps: &Caps)
+fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
 {
+    for (cap, shown) in [
+        (caps.root_fs, "rootfs.root"),
+        (caps.pwrmgr_auth, "pwrmgr.shutdown"),
+        (caps.devmgr_registry, "devmgr.registry"),
+        (caps.devmgr_test, "devmgr.test"),
+    ]
+    {
+        assert_ne!(cap, 0, "svcmgr_seed_only_names_refused: no {shown} seed");
+    }
     let (registry_cap, ipc_buf) = registry_cap_and_buf("svcmgr_seed_only_names_refused");
     let query = |name: &[u8]| {
         let label = ipc::svcmgr_labels::QUERY_ENDPOINT | ((name.len() as u64) << 16);
@@ -196,10 +207,7 @@ fn svcmgr_seed_only_names_refused_phase(_caps: &Caps)
             "svcmgr QUERY_ENDPOINT({shown}) refusal must carry no cap"
         );
     }
-    for name in [
-        ipc::published_names::SVCMGR,
-        ipc::published_names::PWRMGR_DENY,
-    ]
+    for name in [ipc::published_names::SVCMGR, ipc::published_names::PWRMGR_DENY]
     {
         let reply = query(name);
         let shown = core::str::from_utf8(name).unwrap_or("?");
@@ -208,6 +216,11 @@ fn svcmgr_seed_only_names_refused_phase(_caps: &Caps)
             ipc::svcmgr_errors::SUCCESS,
             "svcmgr QUERY_ENDPOINT({shown}) must resolve (got {:#x})",
             reply.label
+        );
+        assert_eq!(
+            reply.caps().len(),
+            1,
+            "svcmgr QUERY_ENDPOINT({shown}) must carry one cap"
         );
         for &cap in reply.caps()
         {

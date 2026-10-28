@@ -648,9 +648,11 @@ via ACPI (x86_64) or SBI (riscv64) per `KtestConfig::DEFAULT.shutdown_policy`
 - **Critical class.** A harness MUST set `critical = no`. Harness death
   MUST NOT bring down the supervisor or trip the graceful-shutdown path.
 - **Capability seeding.** A harness depends only on seeds declared in
-  its `.svc` recipe. A test that needs a seed the bootstrap round did not
-  deliver MUST log the missing seed when it skips or fails, so failures
-  attributable to missing capabilities are diagnosable.
+  its `.svc` recipe and on public names it resolves through svcmgr's
+  `QUERY_ENDPOINT`. A test that needs a seed the bootstrap round did not
+  deliver, or a public name that did not resolve, MUST log the missing cap
+  when it skips or fails, so failures attributable to missing capabilities
+  are diagnosable.
 
 ---
 

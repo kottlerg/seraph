@@ -62,21 +62,26 @@ impl PciDevice
 // ── ECAM config space access ────────────────────────────────────────────────
 
 /// A mapped ECAM window: `va` is the configuration space of `start_bus`,
-/// and each later bus follows at 1 MiB strides.
+/// and each later bus through `end_bus` follows at 1 MiB strides.
 #[derive(Clone, Copy)]
 struct Ecam
 {
     va: u64,
     start_bus: u8,
+    end_bus: u8,
 }
 
 impl Ecam
 {
-    /// Virtual address of a BDF + register, or `None` when `bus` is below
-    /// `start_bus` or a field is out of range
+    /// Virtual address of a BDF + register, or `None` when `bus` lies
+    /// outside `start_bus..=end_bus` or a field is out of range
     /// ([`firmware::pci::config_offset`]).
     fn addr(self, bus: u8, dev: u8, func: u8, reg: u16) -> Option<u64>
     {
+        if bus > self.end_bus
+        {
+            return None;
+        }
         Some(self.va + firmware::pci::config_offset(self.start_bus, bus, dev, func, reg)?)
     }
 }
@@ -85,8 +90,8 @@ impl Ecam
 /// an address outside the window.
 ///
 /// # Safety
-/// `ecam` must describe a valid ECAM MMIO mapping, and every bus from
-/// `start_bus` through `bus` must lie within it.
+/// `ecam` must describe a valid ECAM MMIO mapping of every bus from its
+/// `start_bus` through its `end_bus`.
 unsafe fn ecam_read8(ecam: Ecam, bus: u8, dev: u8, func: u8, reg: u16) -> u8
 {
     let Some(addr) = ecam.addr(bus, dev, func, reg)
@@ -169,11 +174,6 @@ unsafe fn ecam_write32(ecam: Ecam, bus: u8, dev: u8, func: u8, reg: u16, val: u3
 /// # Safety
 /// `ecam_va` must be a valid ECAM MMIO mapping of buses
 /// `start_bus..=end_bus`, 1 MiB per bus, beginning with `start_bus`.
-// clippy::too_many_lines: pci_enumerate walks bus × device × function and
-// assembles each `PciDevice` inline from its config-space reads; a
-// per-function helper would thread the ECAM handle, the device count, and
-// the output array through every call for no reuse.
-#[allow(clippy::too_many_lines)]
 pub unsafe fn pci_enumerate(
     ecam_va: u64,
     start_bus: u8,
@@ -184,6 +184,7 @@ pub unsafe fn pci_enumerate(
     let ecam = Ecam {
         va: ecam_va,
         start_bus,
+        end_bus,
     };
     let mut count = 0;
 

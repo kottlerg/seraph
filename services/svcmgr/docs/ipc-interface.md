@@ -146,7 +146,10 @@ authoritative reconciliation table.
 
 ### Label 3: `PUBLISH_ENDPOINT`
 
-Insert a `name → cap` mapping into svcmgr's discovery registry.
+Insert a `name → cap` mapping into svcmgr's discovery registry. The name is
+public: svcmgr cannot read the delivered cap's badge, so any
+[`QUERY_ENDPOINT`](#label-4-query_endpoint) caller resolves it, and a
+publisher MUST NOT publish a verb-bit cap through this label.
 
 **Request:**
 
@@ -300,10 +303,12 @@ policy + budget):
 
 ## Summarized By
 
+[Capability Model](../../../docs/capability-model.md),
 [Device Management](../../../docs/device-management.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
 [services/svcmgr/README.md](../README.md),
+[services/svctest/README.md](../../svctest/README.md),
 [shared/registry-client/README.md](../../../shared/registry-client/README.md)

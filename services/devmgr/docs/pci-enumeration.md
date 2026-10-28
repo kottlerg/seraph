@@ -33,9 +33,9 @@ covers and to 255 (the `reg` is decoded in the parent's `#address-cells` /
 `#size-cells`, and its address is the configuration space of the first bus);
 for the platform default, 0..=255. The window's `size` is 1 MiB per bus of
 that range on every path. A table whose window is empty, inverted, or
-overflows the physical address space yields no ECAM. The offset arithmetic is
-`firmware::pci::config_offset`, which yields no address for a bus below
-`start_bus`; devmgr reads such an address as all-ones.
+overflows a 64-bit physical address yields no ECAM. The offset arithmetic is
+`firmware::pci::config_offset`; devmgr reads a bus outside
+`start_bus..=end_bus` as all-ones.
 
 ### Scan Procedure
 
@@ -81,8 +81,9 @@ VirtIO PCI devices use vendor ID `0x1AF4`. Device IDs:
 | `0x1012` | Transitional virtio-input |
 | `0x1052` | Modern virtio-input |
 
-devmgr matches discovered devices against its driver binaries (boot modules)
-by vendor and device ID; class-based matching is design intent (#165).
+devmgr matches discovered devices against its driver binaries by vendor and
+device ID: a boot module for virtio-blk, an on-disk driver for virtio-input.
+Class-based matching is design intent (#165).
 
 ---
 
@@ -90,11 +91,15 @@ by vendor and device ID; class-based matching is design intent (#165).
 
 For each matched device, devmgr:
 
-1. Splits the PCI MMIO window cap to carve per-BAR `Mmio` sub-caps.
+1. Carves an `Mmio` sub-cap for the device's VirtIO common-config BAR out of
+   the boot-provided MMIO aperture that covers it.
 2. Splits a single-IRQ `Interrupt` cap for the device's GSI (its
    firmware-programmed IRQ line, else the arch `INTx` fallback) off devmgr's
    Interrupt range cap.
-3. Requests procmgr to create the driver process (`CREATE_PROCESS`).
+3. Requests procmgr to create the driver process: `CREATE_PROCESS` for a
+   boot-module driver (virtio-blk, at enumeration) or `CREATE_FROM_FILE` for
+   an on-disk one (virtio-input, whose steps 3-5 run later, once
+   `SET_DRIVERS_DIR` delivers the drivers directory).
 4. Starts the driver (`START_PROCESS`).
 5. Serves the driver's bootstrap rounds over `ipc::bootstrap`: round 1
    carries the BAR `Mmio`, the IRQ, and the driver's service endpoint (BAR

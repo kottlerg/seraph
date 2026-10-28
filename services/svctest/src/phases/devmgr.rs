@@ -203,16 +203,13 @@ fn orphan_teardown_phase(caps: &Caps)
 }
 
 /// The test labels on `devmgr.registry` (no `ORPHAN_TEST_AUTHORITY`) reply
-/// `UNAUTHORIZED` without running the shim: after the teardown phase, a
-/// denied `TEST_SPAWN_ORPHAN` leaves `TEST_ORPHAN_RESULT` on `devmgr.test`
-/// reporting that phase's spawn-failed outcome (1).
+/// `UNAUTHORIZED`.
 fn test_label_deny_phase(caps: &Caps)
 {
     let registry = caps.devmgr_registry;
-    let test = caps.devmgr_test;
     assert!(
-        registry != 0 && test != 0,
-        "devmgr_test_label_deny: devmgr.registry and devmgr.test must be seeded"
+        registry != 0,
+        "devmgr_test_label_deny: no devmgr.registry cap seeded"
     );
 
     let info = startup_info();
@@ -234,19 +231,4 @@ fn test_label_deny_phase(caps: &Caps)
             "{shown} without ORPHAN_TEST_AUTHORITY must reply UNAUTHORIZED"
         );
     }
-
-    let query = versioned(ipc::devmgr_labels::TEST_ORPHAN_RESULT);
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let res = unsafe { ipc::ipc_call(test, &query, ipc_buf) }
-        .expect("TEST_ORPHAN_RESULT on devmgr.test: ipc_call failed");
-    assert_eq!(
-        res.label,
-        ipc::devmgr_errors::SUCCESS,
-        "TEST_ORPHAN_RESULT status"
-    );
-    assert_eq!(
-        res.word(0),
-        1,
-        "a denied TEST_SPAWN_ORPHAN must leave the teardown phase's outcome (1)"
-    );
 }

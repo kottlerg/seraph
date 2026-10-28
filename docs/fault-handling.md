@@ -55,7 +55,9 @@ invariant 3), a stop of it does not return through its drain until a teardown co
 over it (see
 [§ `sys_thread_stop` Cross-CPU Stop Protocol](../core/kernel/docs/thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol),
 invariant 3), and the other CPUs run on until one needs the halted CPU. A halt of the boot CPU
-also ends sleep-list servicing, which runs only there, so no timeout wakes on any CPU.
+also ends sleep-list servicing, which runs only there (see
+[§ Sleep List Invariants](../core/kernel/docs/thread-lifecycle-and-sleep.md#sleep-list-invariants),
+invariant 5), so no timeout wakes on any CPU.
 
 The demand-paging consumer is implemented: memmgr acts as the pager, procmgr binds it for
 every ordinary process it creates (demand paging is the default; a process opts out with the

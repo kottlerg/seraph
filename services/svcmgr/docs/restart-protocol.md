@@ -199,17 +199,20 @@ Supervision of those children by devmgr and vfsd is design intent; not yet
 implemented (#17, #262). None of those flow through the handover
 endowment.
 
-The set of services svcmgr currently binds or launches (per the shipped
-and staged `.svc` files). A `restart = never` service svcmgr launches
-(`svctest`, `usertest`, `terminal`) is launched one-shot: svcmgr binds no
-death notification for it and records no `ServiceEntry`
+The table below lists the services svcmgr currently binds or launches
+(per the shipped and staged `.svc` files). A `restart = never` service
+svcmgr launches (`svctest`, `usertest`, `terminal`) is launched one-shot:
+svcmgr binds no death notification for it and records no `ServiceEntry`
 ([service-definitions.md](service-definitions.md#reconciliation)).
 
 `svctest`, `usertest`, and `crasher` are test-tier fixtures: their recipes
 live in `/config/svcmgr/tests/` (svcmgr does not scan it) and are staged
 into `/config/svcmgr/services/` only for test boots — `crasher` is
 co-staged with `svctest` (per [testing.md](../../../docs/testing.md#gating)).
-The rest ship in `/config/svcmgr/services/` and load on every boot.
+The rest ship in `/config/svcmgr/services/` and load on every boot, except
+that the functional harness boots drop `terminal` (per
+[testing.md](../../../docs/testing.md#one-shutdown-invoking-harness-per-boot)
+§ One shutdown-invoking harness per boot, Test isolation).
 
 | Service | Source | Restart | Critical |
 |---|---|---|---|

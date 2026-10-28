@@ -9,8 +9,8 @@
 //! services launched by svcmgr post-handover go through exactly the
 //! same procmgr surface (`CREATE_FROM_FILE` → `CONFIGURE_NAMESPACE`
 //! → `START_PROCESS` → bootstrap round) that restart uses. Returns
-//! the freshly spawned child's thread cap so the caller can bind
-//! death-notification on it.
+//! the [`Launched`] handles; for a supervised launch [`launch`] binds
+//! death-notification itself, before `START_PROCESS`.
 
 use ipc::{devmgr_labels, procmgr_labels};
 use registry::{Resolver, Visibility};

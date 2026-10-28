@@ -586,9 +586,11 @@ fn create_process(
 }
 
 /// Apply the namespace policy recorded on `svc` to a freshly-created
-/// (suspended) child. Shared by the restart path and the post-handover
-/// launch path: both walk svcmgr's own `root_dir_cap` (universal after
-/// init's Phase-3 handover) to derive the child's namespace cap.
+/// (suspended) child. Restart's namespace resolver: it walks svcmgr's own
+/// `root_dir_cap` (universal after init's Phase-3 handover) to derive the
+/// child's namespace cap and feeds it to [`configure_namespace_caps`],
+/// which first launch reaches through `definitions::launch`'s own
+/// `configure_namespace`.
 ///
 /// * `NS_POLICY_NONE` → skip `CONFIGURE_NAMESPACE`; the child's
 ///   `system_root_cap` stays zero (`Unsupported` on absolute-path

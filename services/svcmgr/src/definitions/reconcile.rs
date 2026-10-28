@@ -14,8 +14,9 @@
 //!    matching `ServiceEntry` and its argv/env/cwd/seed, log-sink flag,
 //!    and scheduling fields in the parallel `RestartRecipe` table.
 //! 2. **Defined only** — call [`super::launch::launch`] to spawn the
-//!    service, then (if `restart != never`) bind death-notification
-//!    and persist a `ServiceEntry`.
+//!    service (it binds death-notification before `START_PROCESS` when
+//!    `restart != never`), then, for a supervised service, persist a
+//!    `ServiceEntry`.
 //! 3. **Registered without definition** — log a hard error and refuse
 //!    to bind. svcmgr cannot restart what it has no recipe for; this
 //!    is a configuration error.

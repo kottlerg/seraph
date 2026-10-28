@@ -41,7 +41,8 @@ svcmgr/
 │   │                              # restart-policy constants
 │   ├── restart.rs                 # Shared spawn primitives
 │   │                              # (walk_and_create_from_file, mint_child_creator,
-│   │                              # start_process, apply_namespace_policy),
+│   │                              # configure_namespace_caps, start_process),
+│   │                              # restart's apply_namespace_policy,
 │   │                              # death handling, DeathOutcome
 │   ├── definitions/
 │   │   ├── mod.rs                 # On-disk definitions; re-exports svc-defs

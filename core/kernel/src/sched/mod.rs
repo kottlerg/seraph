@@ -2042,7 +2042,7 @@ fn idle_thread_entry(_cpu_id: u64) -> !
                 if has_work
                 {
                     // SAFETY: scheduler context on a valid kernel stack;
-                    // requeue=true so the idle thread goes back in queue.
+                    // Requeue::Always so the idle thread goes back in queue.
                     unsafe {
                         schedule(Requeue::Always);
                     }
@@ -5822,7 +5822,7 @@ pub unsafe fn timer_tick()
         else
         {
             // SAFETY: schedule() re-acquires the lock and performs a context switch.
-            // requeue=true: thread was preempted and should go back in queue.
+            // Requeue::Always: thread was preempted and should go back in queue.
             unsafe { schedule(Requeue::Always) };
         }
     }

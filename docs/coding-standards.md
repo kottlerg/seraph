@@ -239,8 +239,8 @@ let value = unsafe { ptr.read() };
     records.
 
   Such a field MAY be a bare `T` when a rustdoc names that owner: the field's own for a
-  thread-control-block field, whose owners differ field by field; the object's for any other
-  object, whose lock-owned fields share its one lock.
+  thread-control-block field, whose owners differ field by field; for any other object, the
+  object's rustdoc, or the field's own, names the lock that owns it.
 - Prefer message passing over shared memory; shared memory is a deliberate optimisation,
   not the default.
 - Lock ordering MUST be documented and consistent. When acquiring multiple locks, always

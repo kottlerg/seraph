@@ -218,7 +218,7 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
 fn sys_yield(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     // SAFETY: called from syscall handler on a valid kernel stack.
-    // requeue=true: thread is voluntarily yielding but should remain runnable.
+    // Requeue::Always: thread is voluntarily yielding but should remain runnable.
     unsafe {
         crate::sched::schedule(crate::sched::Requeue::Always);
     }

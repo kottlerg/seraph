@@ -867,7 +867,7 @@ pub struct ThreadControlBlock
     /// Exit reason recorded by the kernel at the moment this thread became
     /// `Exited`, under the same all-locks hold as that commit
     /// (`exit_under_all_locks`, or `commit_cancelling_park` for object
-    /// teardown): by `sys_thread_exit` (clean exit, value `0`),
+    /// teardown): by `sys_exit` (`SYS_THREAD_EXIT`, clean exit, value `0`),
     /// by `sys_process_exit` (`encode_exit_code(arg0)`, a voluntary code in
     /// `[0, EXIT_FAULT_BASE)`), by the architecture fault handlers (value
     /// `EXIT_FAULT_BASE + vector`) before they call `post_death_notification`,
@@ -899,7 +899,9 @@ pub struct ThreadControlBlock
 
     // === FPU / SIMD / Vector extended state ===
     /// Per-thread XSAVE area pointer for the FPU/SIMD/V eager-save /
-    /// lazy-restore discipline (see [`ExtendedState`]).
+    /// lazy-restore discipline (see [`ExtendedState`]). The pointer is
+    /// immutable after construction (the Identity row); the area it names is
+    /// owned as [`ExtendedState`] describes.
     pub extended: ExtendedState,
 
     // === Diagnostic thread registry ===
@@ -918,6 +920,8 @@ pub struct ThreadControlBlock
 
     // === Use-after-free detection ===
     /// Magic cookie for use-after-free detection. Must be `TCB_MAGIC` when valid.
+    /// Immutable from construction until the `dealloc_object(Thread)` poison
+    /// (the Identity row).
     pub magic: u64,
 }
 

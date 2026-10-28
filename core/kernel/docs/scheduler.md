@@ -496,7 +496,7 @@ timer_tick():
         current.slice_remaining = TIME_SLICE_TICKS
         try_pull_balance(cpu)
         if preemption_disabled(): return      // see § Kernel-Mode Preemption Points
-        schedule(Requeue::Always)      // requeue at its level's tail, then dequeue_highest
+        schedule(Requeue::Always)             // requeue at its level's tail, then dequeue_highest
     else:
         try_pull_balance(cpu)
 ```

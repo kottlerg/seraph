@@ -217,9 +217,10 @@ pub struct PerCpuScheduler
     /// core/kernel/docs/scheduling-internals.md § Atomic Ordering Invariants.
     non_empty: AtomicU32,
 
-    /// Currently executing TCB on this CPU (non-null after `init`). Written
-    /// only by this CPU, under `lock` once the CPU schedules; read by any CPU,
-    /// under `lock` or as a lock-free snapshot that a later check re-decides.
+    /// Currently executing TCB on this CPU (non-null after `init`). Written by
+    /// `init` on the boot CPU before any CPU schedules, then only by this CPU,
+    /// under `lock`; read by any CPU, under `lock` or as a lock-free snapshot
+    /// that a later check re-decides.
     current: AtomicPtr<ThreadControlBlock>,
 
     /// Idle TCB for this CPU (non-null after `init`); written once by `init`
@@ -480,8 +481,9 @@ impl PerCpuScheduler
         self.idle.load(Ordering::Relaxed)
     }
 
-    /// Record `tcb` as the currently running thread on this CPU. Called only by
-    /// this CPU, under `lock` once the CPU schedules.
+    /// Record `tcb` as the currently running thread on this CPU. Called by
+    /// `init` on the boot CPU before any CPU schedules, then only by this CPU,
+    /// under `lock`.
     pub fn set_current(&self, tcb: *mut ThreadControlBlock)
     {
         self.current.store(tcb, Ordering::Relaxed);

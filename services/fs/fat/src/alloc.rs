@@ -411,8 +411,11 @@ pub fn free_cluster_chain(
 /// `u32::MAX` sentinel; the allocator falls back to scanning from
 /// cluster 2.
 ///
-/// Signature mismatches are logged and treated as "no usable hints";
-/// the allocator still operates from the FAT itself.
+/// A failed read or a signature mismatch is logged and treated as "no
+/// `FSInfo` sector": the hints stay at the sentinel and `fsinfo_sector`
+/// is reset to `u32::MAX`, so [`flush_fsinfo`] never writes hints into a
+/// sector that is not an `FSInfo` sector. The allocator still operates
+/// from the FAT itself.
 pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc_buf: *mut u64)
 {
     if !matches!(state.fat_type, FatType::Fat32) || state.fsinfo_sector == u32::MAX
@@ -423,6 +426,7 @@ pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc_
     if !cache.read_sector(u64::from(state.fsinfo_sector), block_dev, &mut buf, ipc_buf)
     {
         std::os::seraph::log!("`FSInfo` sector read failed; allocator falls back to FAT scan");
+        state.fsinfo_sector = u32::MAX;
         return;
     }
     let lead = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -433,6 +437,7 @@ pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc_
         std::os::seraph::log!(
             "`FSInfo` signature mismatch (lead={lead:#x} struct={structsig:#x} trail={trail:#x}); ignoring hints"
         );
+        state.fsinfo_sector = u32::MAX;
         return;
     }
     let free = u32::from_le_bytes([buf[488], buf[489], buf[490], buf[491]]);

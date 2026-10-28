@@ -141,7 +141,10 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
         }
         Err(fat_parse::BpbError::BadGeometry) =>
         {
-            std::os::seraph::log!("invalid BPB: data region or cluster count exceeds the FAT");
+            std::os::seraph::log!(
+                "invalid BPB: inconsistent geometry (no FAT copy or reserved sector, FAT32 root \
+                 outside the data region, or the data region or cluster count exceeds the FAT)"
+            );
             return false;
         }
     };

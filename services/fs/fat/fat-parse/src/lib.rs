@@ -47,10 +47,11 @@ pub enum BpbError
     UnsupportedSectorSize,
     /// The geometry is inconsistent: the volume has no FAT copy or no
     /// reserved sector (the FAT would overlay the boot sector), the data
-    /// region's start overflows a 32-bit sector number, or the volume has
+    /// region's start overflows a 32-bit sector number, the volume has
     /// more clusters than its FAT has entries for (or than FAT32's largest
     /// cluster number allows), so a cluster in the data region would have
-    /// no FAT entry, or one past the FAT.
+    /// no FAT entry, or one past the FAT, or a FAT32 root cluster lies
+    /// outside the data region.
     BadGeometry,
 }
 
@@ -59,9 +60,9 @@ pub enum BpbError
 /// Mirrors the fields the `fatfs` service copies into its `FatState`. The
 /// service owns the cached-FAT-sector and advisory-hint state; this struct
 /// carries only what the pure decode produces. `fsinfo_sector` is `Some` only
-/// for a FAT32 volume whose `FSInfo` field names a real sector (not the
-/// `0`/`0xFFFF` "absent" markers), so the caller assigns it conditionally and
-/// otherwise keeps its `u32::MAX` sentinel.
+/// for a FAT32 volume whose `FSInfo` field names a sector inside the reserved
+/// region (not the `0`/`0xFFFF` "absent" markers), so the caller assigns it
+/// conditionally and otherwise keeps its `u32::MAX` sentinel.
 pub struct BpbGeometry
 {
     pub bytes_per_sector: u16,
@@ -79,9 +80,11 @@ pub struct BpbGeometry
 
 /// Decode and validate the BIOS Parameter Block from sector 0.
 ///
-/// Validates the boot signature and the two divisor fields, then computes the
-/// data-region start, total cluster count, FAT variant (per the Microsoft
-/// FAT32 specification's `< 65525` rule), and — for FAT32 — the `FSInfo` sector.
+/// Validates the boot signature, the sector size, and the geometry (every
+/// check is listed under `# Errors`), computing on the way the data-region
+/// start, total cluster count, FAT variant (per the Microsoft FAT32
+/// specification's `< 65525` rule), and — for FAT32 — the `FSInfo` sector,
+/// which is `None` unless it names a sector inside the reserved region.
 ///
 /// # Errors
 /// Returns [`BpbError::BadSignature`] when bytes 510/511 are not `0x55 0xAA`,
@@ -89,8 +92,8 @@ pub struct BpbGeometry
 /// `sectors_per_cluster` is zero, [`BpbError::UnsupportedSectorSize`]
 /// when `bytes_per_sector` is non-zero but not [`SECTOR_SIZE`], or
 /// [`BpbError::BadGeometry`] when `num_fats` or `reserved_sectors` is zero,
-/// the data region's start overflows, or the FAT cannot hold an entry for
-/// every cluster.
+/// the data region's start overflows, the FAT cannot hold an entry for
+/// every cluster, or a FAT32 root cluster lies outside the data region.
 pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry, BpbError>
 {
     // Validate boot signature.
@@ -184,9 +187,12 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
         // FAT32 extended BPB: FSInfo sector LBA at offset 48 (2 bytes). A value
         // of 0 or 0xFFFF means "no FSInfo sector"; the caller holds the
         // u32::MAX sentinel in those cases so the allocator skips the load and
-        // falls back to a full FAT scan.
+        // falls back to a full FAT scan. The FSInfo sector lives in the
+        // reserved region; one named past it lies in a FAT copy or the data
+        // region, where writing the hints back would corrupt the volume, so
+        // it is treated as absent too.
         let fsinfo = u16::from_le_bytes([sector_data[48], sector_data[49]]);
-        let fsinfo_sector = if fsinfo != 0 && fsinfo != 0xFFFF
+        let fsinfo_sector = if fsinfo != 0 && fsinfo != 0xFFFF && fsinfo < reserved_sectors
         {
             Some(u32::from(fsinfo))
         }
@@ -198,6 +204,12 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
     };
 
     check_fat_capacity(fat_type, fat_size, bytes_per_sector, total_clusters)?;
+    // The FAT32 root directory is an ordinary cluster chain, so its first
+    // cluster must lie in the data region like any other.
+    if matches!(fat_type, FatType::Fat32) && !is_data_cluster(root_cluster, total_clusters)
+    {
+        return Err(BpbError::BadGeometry);
+    }
 
     Ok(BpbGeometry {
         bytes_per_sector,
@@ -1181,6 +1193,26 @@ mod tests
             parse_bpb_geometry(&marker),
             Err(BpbError::BadGeometry)
         ));
+    }
+
+    #[test]
+    fn parse_bpb_geometry_rejects_a_fat32_root_outside_the_data_region()
+    {
+        let root_one = bpb_sector(512, 1, 32, 2, 0, 0, 0, 300_000, 2400, 1, 1);
+        assert!(matches!(
+            parse_bpb_geometry(&root_one),
+            Err(BpbError::BadGeometry)
+        ));
+    }
+
+    #[test]
+    fn parse_bpb_geometry_treats_an_fsinfo_sector_past_the_reserved_region_as_absent()
+    {
+        // 32 reserved sectors: sector 32 is the first FAT sector.
+        let g = parse_bpb_geometry(&fat32_sector(32))
+            .ok()
+            .expect("valid FAT32");
+        assert_eq!(g.fsinfo_sector, None);
     }
 
     #[test]

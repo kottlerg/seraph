@@ -62,20 +62,59 @@ fn next_dir_cluster(
     chain_next(state, cluster, cache, block_dev, ipc_buf)
 }
 
+/// The first cluster of a clustered directory walk over `dir_cluster`.
+///
+/// Cluster 0 names the FAT16 fixed root, which callers walk separately
+/// before reaching here; the FAT32 root is reached by its own cluster
+/// number. A directory cluster outside the data region (0 or 1 on a
+/// clustered walk, or past the volume) comes from a corrupt directory
+/// entry, and `cluster_to_sector` would clamp it onto cluster 2, so the
+/// walk would read another directory in its place.
+///
+/// # Errors
+/// [`FatError::Corrupt`] when `dir_cluster` lies outside the data region.
+fn dir_start_cluster(state: &FatState, dir_cluster: u32) -> Result<u32, FatError>
+{
+    if state.is_data_cluster(dir_cluster)
+    {
+        Ok(dir_cluster)
+    }
+    else
+    {
+        std::os::seraph::log!(
+            "WARNING: directory walk from cluster {dir_cluster} outside data region"
+        );
+        Err(FatError::Corrupt)
+    }
+}
+
+/// How a scan of one directory sector ended.
+enum SectorScan<T>
+{
+    /// The slot sought was found.
+    Found(T),
+    /// The end-of-directory marker (`0x00`) was reached: no later slot,
+    /// in this sector or any after it, holds an entry.
+    EndOfDir,
+    /// The sector ended without either; the walk goes on.
+    Continue,
+}
+
 // ── Directory search ──────────────────────────────────────────────────────
 
 /// Search a directory's cluster chain for an entry matching `name`.
 ///
-/// Walks the cluster chain (or, for `dir_cluster == 0`, the FAT16
-/// fixed root or the FAT32 root chain) and matches against both LFN and 8.3 forms via
-/// [`scan_sector_for_name`]. Returns `Ok(None)` only when the whole
-/// directory was read and holds no such entry, so [`insert_entry`] can
-/// rely on it as an existence check.
+/// Walks the cluster chain (or, for `dir_cluster == 0` on FAT16, the
+/// fixed root) up to the end-of-directory marker and matches against
+/// both LFN and 8.3 forms via [`scan_sector_for_name`]. Returns
+/// `Ok(None)` only when the whole directory was read and holds no such
+/// entry, so [`insert_entry`] can rely on it as an existence check.
 ///
 /// # Errors
 /// [`FatError::Io`] when a directory or FAT sector cannot be read;
-/// [`FatError::Corrupt`] when the chain leaves the data region, reaches a
-/// bad-cluster marker, or has a cycle.
+/// [`FatError::Corrupt`] when the directory's first cluster or a link
+/// lies outside the data region, a link is a bad-cluster marker, or the
+/// chain has a cycle.
 pub fn find_in_directory(
     dir_cluster: u32,
     name: &[u8],
@@ -93,15 +132,7 @@ pub fn find_in_directory(
         return find_in_fat16_root(name, state, cache, block_dev, ipc_buf);
     }
 
-    // On FAT32 the root is an ordinary cluster chain; 0 names it.
-    let mut cluster = if dir_cluster == 0
-    {
-        state.root_cluster
-    }
-    else
-    {
-        dir_cluster
-    };
+    let mut cluster = dir_start_cluster(state, dir_cluster)?;
     let mut steps = 0;
     loop
     {
@@ -117,9 +148,12 @@ pub fn find_in_directory(
             {
                 return Err(FatError::Io);
             }
-            if let Some(entry) = scan_sector_for_name(&sector_buf, name, &mut lfn)
+            match scan_sector_for_name(&sector_buf, name, &mut lfn)
             {
-                return Ok(Some(entry));
+                SectorScan::Found(entry) => return Ok(Some(entry)),
+                SectorScan::EndOfDir => return Ok(None),
+                SectorScan::Continue =>
+                {}
             }
         }
 
@@ -157,9 +191,12 @@ fn find_in_fat16_root(
         {
             return Err(FatError::Io);
         }
-        if let Some(entry) = scan_sector_for_name(&sector_buf, name, &mut lfn)
+        match scan_sector_for_name(&sector_buf, name, &mut lfn)
         {
-            return Ok(Some(entry));
+            SectorScan::Found(entry) => return Ok(Some(entry)),
+            SectorScan::EndOfDir => return Ok(None),
+            SectorScan::Continue =>
+            {}
         }
     }
 
@@ -197,30 +234,27 @@ pub fn find_in_directory_with_location(
             {
                 return None;
             }
-            if let Some((entry, off)) =
-                scan_sector_for_name_with_offset(&sector_buf, name, &mut lfn, entries_per_sector)
+            match scan_sector_for_name_with_offset(&sector_buf, name, &mut lfn, entries_per_sector)
             {
-                return Some((
-                    entry,
-                    DirEntryLocation {
-                        sector_lba,
-                        offset_in_sector: off,
-                    },
-                ));
+                SectorScan::Found((entry, off)) =>
+                {
+                    return Some((
+                        entry,
+                        DirEntryLocation {
+                            sector_lba,
+                            offset_in_sector: off,
+                        },
+                    ));
+                }
+                SectorScan::EndOfDir => return None,
+                SectorScan::Continue =>
+                {}
             }
         }
         return None;
     }
 
-    // On FAT32 the root is an ordinary cluster chain; 0 names it.
-    let mut cluster = if dir_cluster == 0
-    {
-        state.root_cluster
-    }
-    else
-    {
-        dir_cluster
-    };
+    let mut cluster = dir_start_cluster(state, dir_cluster).ok()?;
     let mut steps = 0;
     loop
     {
@@ -232,16 +266,21 @@ pub fn find_in_directory_with_location(
             {
                 return None;
             }
-            if let Some((entry, off)) =
-                scan_sector_for_name_with_offset(&sector_buf, name, &mut lfn, entries_per_sector)
+            match scan_sector_for_name_with_offset(&sector_buf, name, &mut lfn, entries_per_sector)
             {
-                return Some((
-                    entry,
-                    DirEntryLocation {
-                        sector_lba,
-                        offset_in_sector: off,
-                    },
-                ));
+                SectorScan::Found((entry, off)) =>
+                {
+                    return Some((
+                        entry,
+                        DirEntryLocation {
+                            sector_lba,
+                            offset_in_sector: off,
+                        },
+                    ));
+                }
+                SectorScan::EndOfDir => return None,
+                SectorScan::Continue =>
+                {}
             }
         }
         cluster = next_dir_cluster(state, cluster, &mut steps, cache, block_dev, ipc_buf)
@@ -255,7 +294,7 @@ fn scan_sector_for_name_with_offset(
     name: &[u8],
     lfn: &mut LfnAccum,
     entries_per_sector: usize,
-) -> Option<(DirEntry, usize)>
+) -> SectorScan<(DirEntry, usize)>
 {
     for i in 0..entries_per_sector
     {
@@ -263,7 +302,7 @@ fn scan_sector_for_name_with_offset(
         let raw = &sector[offset..offset + 32];
         if raw[0] == 0x00
         {
-            return None;
+            return SectorScan::EndOfDir;
         }
         if raw[0] == 0xE5
         {
@@ -284,12 +323,12 @@ fn scan_sector_for_name_with_offset(
                 {
                     populate_lfn(&mut entry, lfn);
                 }
-                return Some((entry, offset));
+                return SectorScan::Found((entry, offset));
             }
         }
         lfn.reset();
     }
-    None
+    SectorScan::Continue
 }
 
 /// Scan a sector's 32-byte directory entries for a name match.
@@ -300,7 +339,7 @@ fn scan_sector_for_name(
     sector: &[u8; SECTOR_SIZE],
     name: &[u8],
     lfn: &mut LfnAccum,
-) -> Option<DirEntry>
+) -> SectorScan<DirEntry>
 {
     let entries_per_sector = SECTOR_SIZE / 32;
     for i in 0..entries_per_sector
@@ -309,7 +348,7 @@ fn scan_sector_for_name(
         let raw = &sector[offset..offset + 32];
         if raw[0] == 0x00
         {
-            return None;
+            return SectorScan::EndOfDir;
         }
         if raw[0] == 0xE5
         {
@@ -330,12 +369,12 @@ fn scan_sector_for_name(
                 {
                     populate_lfn(&mut entry, lfn);
                 }
-                return Some(entry);
+                return SectorScan::Found(entry);
             }
         }
         lfn.reset();
     }
-    None
+    SectorScan::Continue
 }
 
 /// Read a directory entry at a given index.
@@ -422,15 +461,7 @@ pub fn read_dir_entry_at_index(
         return None;
     }
 
-    // On FAT32 the root is an ordinary cluster chain; 0 names it.
-    let mut cluster = if dir_cluster == 0
-    {
-        state.root_cluster
-    }
-    else
-    {
-        dir_cluster
-    };
+    let mut cluster = dir_start_cluster(state, dir_cluster).ok()?;
     let mut steps = 0;
     loop
     {
@@ -731,8 +762,9 @@ pub fn update_entry_metadata(
 ///
 /// # Errors
 /// [`FatError::Io`] when a directory or FAT sector read fails;
-/// [`FatError::Corrupt`] when the directory's chain leaves the data
-/// region, reaches a bad-cluster marker, or has a cycle.
+/// [`FatError::Corrupt`] when the directory's first cluster or a link
+/// lies outside the data region, a link is a bad-cluster marker, or the
+/// chain has a cycle.
 pub fn directory_is_empty(
     state: &mut FatState,
     dir_cluster: u32,
@@ -744,7 +776,7 @@ pub fn directory_is_empty(
     let mut buf = Box::new([0u8; SECTOR_SIZE]);
     let entries_per_sector = SECTOR_SIZE / 32;
 
-    let mut cluster = dir_cluster;
+    let mut cluster = dir_start_cluster(state, dir_cluster)?;
     let mut steps = 0;
     loop
     {
@@ -884,14 +916,7 @@ fn find_free_slot_run(
     }
 
     // FAT32 clustered directory walk.
-    let mut cluster = if parent_dir_cluster == 0
-    {
-        state.root_cluster
-    }
-    else
-    {
-        parent_dir_cluster
-    };
+    let mut cluster = dir_start_cluster(state, parent_dir_cluster)?;
     let mut steps = 0;
     loop
     {
@@ -1290,25 +1315,18 @@ fn sfn_in_directory(
                 ipc_buf,
                 &mut buf,
                 entries_per_sector,
-            )
+            )?
             {
-                Some(true) => return Ok(true),
-                Some(false) =>
+                SectorScan::Found(()) => return Ok(true),
+                SectorScan::EndOfDir => return Ok(false),
+                SectorScan::Continue =>
                 {}
-                None => return Err(FatError::Io),
             }
         }
         return Ok(false);
     }
 
-    let mut cluster = if parent_dir_cluster == 0
-    {
-        state.root_cluster
-    }
-    else
-    {
-        parent_dir_cluster
-    };
+    let mut cluster = dir_start_cluster(state, parent_dir_cluster)?;
     let mut steps = 0;
     loop
     {
@@ -1323,12 +1341,12 @@ fn sfn_in_directory(
                 ipc_buf,
                 &mut buf,
                 entries_per_sector,
-            )
+            )?
             {
-                Some(true) => return Ok(true),
-                Some(false) =>
+                SectorScan::Found(()) => return Ok(true),
+                SectorScan::EndOfDir => return Ok(false),
+                SectorScan::Continue =>
                 {}
-                None => return Err(FatError::Io),
             }
         }
         match next_dir_cluster(state, cluster, &mut steps, cache, block_dev, ipc_buf)?
@@ -1339,9 +1357,10 @@ fn sfn_in_directory(
     }
 }
 
-/// Per-sector SFN match used by `sfn_in_directory`. Returns
-/// `Some(true)` on match, `Some(false)` to continue, `None` on I/O
-/// failure (cache acquire / read).
+/// Per-sector SFN match used by `sfn_in_directory`.
+///
+/// # Errors
+/// [`FatError::Io`] when the sector cannot be read.
 #[allow(clippy::too_many_arguments)]
 fn scan_sector_for_sfn(
     sector_lba: u32,
@@ -1351,18 +1370,18 @@ fn scan_sector_for_sfn(
     ipc_buf: *mut u64,
     buf: &mut [u8; SECTOR_SIZE],
     entries_per_sector: usize,
-) -> Option<bool>
+) -> Result<SectorScan<()>, FatError>
 {
     if !cache.read_sector(u64::from(sector_lba), block_dev, buf, ipc_buf)
     {
-        return None;
+        return Err(FatError::Io);
     }
     for e in 0..entries_per_sector
     {
         let off = e * 32;
         if buf[off] == 0x00
         {
-            return Some(false);
+            return Ok(SectorScan::EndOfDir);
         }
         if buf[off] == 0xE5 || buf[off + 11] == ATTR_LFN
         {
@@ -1370,10 +1389,10 @@ fn scan_sector_for_sfn(
         }
         if buf[off..off + 11] == *sfn
         {
-            return Some(true);
+            return Ok(SectorScan::Found(()));
         }
     }
-    Some(false)
+    Ok(SectorScan::Continue)
 }
 
 /// Locate an entry by name *and* the disk positions of its LFN run.
@@ -1419,14 +1438,7 @@ fn locate_entry_with_lfn_run(
         return Err(FatError::Corrupt);
     }
 
-    let mut cluster = if parent_dir_cluster == 0
-    {
-        state.root_cluster
-    }
-    else
-    {
-        parent_dir_cluster
-    };
+    let mut cluster = dir_start_cluster(state, parent_dir_cluster)?;
     let mut steps = 0;
     loop
     {

@@ -1140,7 +1140,9 @@ extern "C" fn stop_spinning_child_entry(arg: u64) -> !
     }
 }
 
-/// Poll bound for the self-delete child: ~2 s at 1 ms per poll.
+/// Poll bound for the self-delete child: ~2 s at 1 ms per poll. Applied
+/// through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs, where the child's CPU waits for a host core.
 const SELF_DELETE_MAX_POLLS: u32 = 2000;
 
 static mut SELF_DELETE_STACK: ChildStack = ChildStack::ZERO;
@@ -1174,15 +1176,20 @@ pub fn cspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
         .map_err(|_| "self_delete: configure_and_start failed")?;
     notification_wait(ready).map_err(|_| "self_delete: wait ready failed")?;
 
-    let reason = crate::spawn::wait_until_exited(child.th, SELF_DELETE_MAX_POLLS);
+    let reason =
+        crate::spawn::wait_until_exited(child.th, crate::scaled_polls(SELF_DELETE_MAX_POLLS));
     cap_delete(child.th).map_err(|_| "self_delete: cap_delete(thread) failed")?;
     cap_delete(ready).ok();
     if reason? != syscall_abi::EXIT_KILLED
     {
         return Err("self_delete: child's exit reason is not EXIT_KILLED");
     }
-    crate::spawn::wait_memory_baseline(ctx.memory_base, baseline, SELF_DELETE_MAX_POLLS)
-        .map_err(|_| "self_delete: memory did not return to baseline")
+    crate::spawn::wait_memory_baseline(
+        ctx.memory_base,
+        baseline,
+        crate::scaled_polls(SELF_DELETE_MAX_POLLS),
+    )
+    .map_err(|_| "self_delete: memory did not return to baseline")
 }
 
 /// Child for [`cspace_self_delete_stops_caller`]: signal ready, then delete

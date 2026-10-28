@@ -61,11 +61,16 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 /// Child busy-spin bound per wait (~1e9 iterations): seconds of headroom over
 /// the parent's sub-millisecond handshake, but finite so a dead parent cannot
-/// hang the child past harness teardown.
+/// hang the child past harness teardown. Applied through
+/// [`crate::scaled_bound`], which stretches it past [`crate::UNSCALED_CPUS`]
+/// CPUs, where the parent's CPU waits for a host core while the child spins;
+/// the parent passes the stretched bound as the child's argument.
 const SPIN_BOUND: u64 = 1_000_000_000;
 
 /// Parent poll bound: at ~1 ms per `thread_sleep(1)`, ~2 s before declaring the
 /// child stuck. Comfortably above any scheduling latency on a busy SMP run.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs, where the child's CPU waits for a host core.
 const MAX_POLLS: u32 = 2000;
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -101,7 +106,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    if crate::spawn::configure_and_start_pinned(&child, widen_child, stack_top, 0, 1).is_err()
+    if crate::spawn::configure_and_start_pinned(
+        &child,
+        widen_child,
+        stack_top,
+        crate::scaled_bound(SPIN_BOUND),
+        1,
+    )
+    .is_err()
     {
         cleanup(ctx, Some(&child), memory_cap);
         return Err("integration::tlb_widen_retry: configure_and_start_pinned failed");
@@ -155,6 +167,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// bound. A refused probe is its own failure, reported as such.
 fn await_cached(child: &crate::spawn::SpawnedChild) -> TestResult
 {
+    let bound = crate::scaled_polls(MAX_POLLS);
     let mut polls = 0;
     while PHASE.load(Ordering::Acquire) < PHASE_CACHED
     {
@@ -165,7 +178,7 @@ fn await_cached(child: &crate::spawn::SpawnedChild) -> TestResult
             return Err("integration::tlb_widen_retry: child exited before caching the mapping");
         }
         polls += 1;
-        if polls >= MAX_POLLS
+        if polls >= bound
         {
             return Err("integration::tlb_widen_retry: child never cached the mapping");
         }
@@ -180,6 +193,7 @@ fn await_cached(child: &crate::spawn::SpawnedChild) -> TestResult
 /// liveness probe is its own failure, not that verdict.
 fn await_written(child: &crate::spawn::SpawnedChild) -> TestResult
 {
+    let bound = crate::scaled_polls(MAX_POLLS);
     let mut polls = 0;
     while PHASE.load(Ordering::Acquire) < PHASE_WROTE
     {
@@ -190,7 +204,7 @@ fn await_written(child: &crate::spawn::SpawnedChild) -> TestResult
             return Err("integration::tlb_widen_retry: child killed writing widened mapping");
         }
         polls += 1;
-        if polls >= MAX_POLLS
+        if polls >= bound
         {
             return Err("integration::tlb_widen_retry: child never completed the write");
         }
@@ -208,11 +222,12 @@ fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, memory
         // The child sets PHASE_WROTE then thread_exit()s; wait for Exited so
         // cap_delete never races a still-running pinned thread (which can hang
         // the harness on a CPU with no other ready thread).
+        let bound = crate::scaled_polls(MAX_POLLS);
         let mut polls = 0;
         while !crate::spawn::is_exited(child.th).unwrap_or(true)
         {
             polls += 1;
-            if polls >= MAX_POLLS
+            if polls >= bound
             {
                 break;
             }
@@ -230,12 +245,13 @@ fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, memory
 
 /// Child entry: cache a read-only TLB entry, wait for the parent's widen, then
 /// store through it. The store completes via the kernel's spurious-fault retry
-/// when a hardware TLB faults on the stale read-only entry.
-extern "C" fn widen_child(_arg: u64) -> !
+/// when a hardware TLB faults on the stale read-only entry. `spin_bound` is the
+/// stretched [`SPIN_BOUND`] each wait spins at most.
+extern "C" fn widen_child(spin_bound: u64) -> !
 {
     let p = WIDEN_VA as *mut u64;
 
-    if !child_spin_until(PHASE_MAPPED)
+    if !child_spin_until(PHASE_MAPPED, spin_bound)
     {
         syscall::thread_exit();
     }
@@ -244,7 +260,7 @@ extern "C" fn widen_child(_arg: u64) -> !
     let _ = unsafe { p.read_volatile() };
     PHASE.store(PHASE_CACHED, Ordering::Release);
 
-    if !child_spin_until(PHASE_WIDENED)
+    if !child_spin_until(PHASE_WIDENED, spin_bound)
     {
         syscall::thread_exit();
     }
@@ -263,15 +279,15 @@ extern "C" fn widen_child(_arg: u64) -> !
 }
 
 /// Busy-wait (no syscall, so no context switch) until `PHASE` reaches `target`.
-/// Returns `false` if the bound is hit first.
-fn child_spin_until(target: u32) -> bool
+/// Returns `false` if `spin_bound` spins pass first.
+fn child_spin_until(target: u32, spin_bound: u64) -> bool
 {
     let mut spins = 0u64;
     while PHASE.load(Ordering::Acquire) < target
     {
         core::hint::spin_loop();
         spins += 1;
-        if spins >= SPIN_BOUND
+        if spins >= spin_bound
         {
             return false;
         }

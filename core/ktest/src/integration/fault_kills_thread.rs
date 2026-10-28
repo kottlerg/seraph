@@ -36,6 +36,8 @@ const WILD_VA: u64 = 0x3E_0000_0000;
 
 /// Poll bound: at ~1 ms per `thread_sleep(1)`, ~2 s before declaring the child
 /// never faulted. Comfortably above any scheduling latency on a busy SMP run.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs, where the child's CPU waits for a host core.
 const MAX_POLLS: u32 = 2000;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
@@ -50,7 +52,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::fault_kills_thread: configure_and_start failed")?;
 
     let expected = EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR;
-    let reason = crate::spawn::wait_until_exited(child.th, MAX_POLLS)?;
+    let reason = crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS))?;
     if reason != expected
     {
         return Err("integration::fault_kills_thread: wrong exit reason for fault");

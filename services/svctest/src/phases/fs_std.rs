@@ -457,7 +457,8 @@ type ReleaseReply = (u64, std::time::Duration);
 
 /// The std release handler matches a driver `FS_RELEASE_MEMORY` by cookie
 /// across every open `File`, waits out a read of the cookie's page for at
-/// most the driver's release window, and waits once per cookie. The phase
+/// most the driver's release window, waits once per cookie, and discards a
+/// read whose copy that wait outlasted. The phase
 /// serves a fake fs root to a `release-child`, which opens `/a` and `/b` and
 /// reads a page of each. While `/b`'s `FS_READ_MEMORY` is still unanswered,
 /// so its cookie is mid-read, the fake sends a release of that cookie on the
@@ -498,8 +499,9 @@ pub fn std_release_matched_by_cookie_phase(_: &Caps)
 
     assert!(
         status.success(),
-        "std_release_matched_by_cookie: release-child exited {status}; 0 = both reads \
-         refused, 1 = a read succeeded, 2 = an open failed"
+        "std_release_matched_by_cookie: release-child exited {status}; 1 = /a's read \
+         succeeded, 2 = an open failed, 3 = /b's stalled read did not return Interrupted, \
+         4 = /b's position moved"
     );
     let ((first, first_rtt), (repeat, repeat_rtt)) =
         probe.expect("std_release_matched_by_cookie: the fake fs saw no read of /b");
@@ -528,32 +530,49 @@ pub fn std_release_matched_by_cookie_phase(_: &Caps)
 }
 
 /// `release-child`: open `/a` and `/b` from the fake fs root its spawner
-/// delivered, then read a page of each. Exits before the `File`s drop, so
-/// the fake sees two `NS_LOOKUP`s and two `FS_READ_MEMORY`s and nothing
-/// else.
+/// delivered, then read a page of each. The fake refuses `/a`'s read and
+/// answers `/b`'s with a frame only after a release of its cookie has
+/// waited out the window, so `/b`'s copy is stalled and must be discarded:
+/// the read returns `Interrupted` and the position stays at 0. Exits before
+/// the `File`s drop. Exit codes: 0 as expected, 1 `/a`'s read succeeded,
+/// 2 an open failed, 3 `/b`'s read did not return `Interrupted`, 4 `/b`'s
+/// position moved.
 fn release_child_main() -> !
 {
-    use std::io::Read;
+    use std::io::{ErrorKind, Read, Seek};
 
     let open = |path| std::fs::File::open(path).unwrap_or_else(|_| std::process::exit(2));
     let mut a = open("/a");
     let mut b = open("/b");
     let mut buf = vec![0u8; 4096];
-    let read_a = a.read(&mut buf);
-    let read_b = b.read(&mut buf);
-    std::process::exit(i32::from(read_a.is_ok() || read_b.is_ok()));
+    if a.read(&mut buf).is_ok()
+    {
+        std::process::exit(1);
+    }
+    if !matches!(b.read(&mut buf), Err(e) if e.kind() == ErrorKind::Interrupted)
+    {
+        std::process::exit(3);
+    }
+    if !matches!(b.stream_position(), Ok(0))
+    {
+        std::process::exit(4);
+    }
+    std::process::exit(0);
 }
 
 /// Serve the fake fs on `ep` until the spawner's stop message: each
-/// `NS_LOOKUP` gets a file node SEND badged 1, 2, ... in order; each
-/// `FS_READ_MEMORY` is refused with `IO_ERROR`, after node 1's has handed
-/// over its release SEND and, for node 2's, after two releases of its
-/// cookie on node 1's release SEND. Returns those two releases' replies.
+/// `NS_LOOKUP` gets a file node SEND badged 1, 2, ... in order. Node 1's
+/// `FS_READ_MEMORY` hands over its release SEND and is refused with
+/// `IO_ERROR`. Node 2's is answered, after two releases of its cookie on
+/// node 1's release SEND, with a one-page frame (a read-only derivation of
+/// a page from memmgr). Anything else is refused. Returns the two
+/// releases' replies.
 fn fake_fs_serve(ep: u32) -> Option<(ReleaseReply, ReleaseReply)>
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let mut next_badge = 1;
     let mut a_release = 0;
+    let mut frame_page = 0;
     let mut probe = None;
     loop
     {
@@ -582,16 +601,28 @@ fn fake_fs_serve(ep: u32) -> Option<(ReleaseReply, ReleaseReply)>
             let release = msg.caps().first().copied().unwrap_or(0);
             match msg.badge
             {
-                1 => a_release = release,
+                1 =>
+                {
+                    a_release = release;
+                    ipc::IpcMessage::new(ipc::fs_errors::IO_ERROR)
+                }
                 2 =>
                 {
                     let _ = syscall::cap_delete(release);
-                    probe = Some(release_twice(a_release, msg.word(1)));
+                    let cookie = msg.word(1);
+                    probe = Some(release_twice(a_release, cookie));
+                    frame_page = fake_fs_page();
+                    let frame = syscall::cap_derive(frame_page, syscall::RIGHTS_MEM_MAP)
+                        .expect("fake fs: frame derive failed");
+                    ipc::IpcMessage::builder(ipc::fs_errors::SUCCESS)
+                        .word(0, FAKE_FS_FRAME_BYTES)
+                        .word(1, cookie)
+                        .word(2, 0)
+                        .cap(frame)
+                        .build()
                 }
-                _ =>
-                {}
+                _ => ipc::IpcMessage::new(ipc::fs_errors::IO_ERROR),
             }
-            ipc::IpcMessage::new(ipc::fs_errors::IO_ERROR)
         }
         else
         {
@@ -602,9 +633,35 @@ fn fake_fs_serve(ep: u32) -> Option<(ReleaseReply, ReleaseReply)>
         if msg.badge == FAKE_FS_STOP_BADGE
         {
             let _ = syscall::cap_delete(a_release);
+            let _ = syscall::cap_delete(frame_page);
             return probe;
         }
     }
+}
+
+/// Bytes of the fake fs's frame for `/b`.
+const FAKE_FS_FRAME_BYTES: u64 = 64;
+
+/// One page from memmgr for the fake fs's frame.
+fn fake_fs_page() -> u32
+{
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
+        .word(0, 1)
+        .build();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+    let grant = unsafe {
+        ipc::ipc_call(
+            std::os::seraph::startup_info().memmgr_endpoint,
+            &req,
+            ipc_buf,
+        )
+    }
+    .expect("fake fs: memmgr REQUEST_MEMORY_CAPS failed");
+    *grant
+        .caps()
+        .first()
+        .expect("fake fs: REQUEST_MEMORY_CAPS returned no cap")
 }
 
 /// Send `FS_RELEASE_MEMORY` for `cookie` on `release` twice, from a helper

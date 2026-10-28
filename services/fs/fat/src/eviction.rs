@@ -146,7 +146,7 @@ pub fn worker_loop(
         let outcome = match endpoint
         {
             Endpoint::Copy(cap) => cooperative_release(cap, req.cookie),
-            Endpoint::None => Release::NoEndpoint,
+            Endpoint::NoSend => Release::NoEndpoint,
             Endpoint::DeriveFailed => Release::DeriveFailed,
         };
         // Whichever path takes the entry out of the open-file table owns
@@ -316,7 +316,7 @@ enum Endpoint
     /// The worker's own derived copy of the client's release SEND.
     Copy(u32),
     /// The client delivered no release SEND.
-    None,
+    NoSend,
     /// The client delivered one, but the worker could not derive its copy.
     DeriveFailed,
 }
@@ -343,7 +343,7 @@ fn live_release_endpoint(
     }
     if file.release_endpoint_cap == 0
     {
-        return Some(Endpoint::None);
+        return Some(Endpoint::NoSend);
     }
     Some(
         syscall::cap_derive(file.release_endpoint_cap, syscall::RIGHTS_EP_SEND)

@@ -25,8 +25,11 @@
 //! any reply, or the window with none, the driver revokes the page's caps
 //! and may recycle the page; the revoke unmaps nothing. Holding the reply
 //! keeps that recycling from racing a copy that ends within the window. A
-//! copy that outlasts it can read the recycled page, and this process
-//! cannot tell (#516).
+//! copy still running when the handler's own wait runs out is marked
+//! stalled, and `File::read_frame` discards it. The handler's wait starts
+//! only when the release arrives, after the driver's window has begun, so a
+//! copy that ends between the two deadlines can read the recycled page
+//! undetected (#516).
 //!
 //! The endpoint and the handler thread are created lazily on the first
 //! [`super::File::open`] call; until then the cost is one
@@ -234,22 +237,30 @@ pub(super) fn begin_read(entry: &FileEntry, cookie: u64)
 
 /// End the read of `cookie`, handing over its mapping if one was made, and
 /// wake a release waiting on it. The handler thread is the only waiter.
-pub(super) fn end_read(entry: &FileEntry, cookie: u64, mapping: Option<OutstandingMapping>)
+/// Returns whether a driver release's wait for this read ran out first,
+/// which means the copy outlasted the driver's window.
+pub(super) fn end_read(entry: &FileEntry, cookie: u64, mapping: Option<OutstandingMapping>) -> bool
 {
     let mut out = entry.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(idx) = out.reading.iter().position(|&c| c == cookie)
     {
         out.reading.swap_remove(idx);
     }
-    if let Some(idx) = out.stalled.iter().position(|&c| c == cookie)
+    let stalled = match out.stalled.iter().position(|&c| c == cookie)
     {
-        out.stalled.swap_remove(idx);
-    }
+        Some(idx) =>
+        {
+            out.stalled.swap_remove(idx);
+            true
+        }
+        None => false,
+    };
     if let Some(m) = mapping
     {
         out.idle.push(m);
     }
     entry.read_done.notify_one();
+    stalled
 }
 
 /// Take an idle mapping by cookie. Returns `Some` to whichever of the local

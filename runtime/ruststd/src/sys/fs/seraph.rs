@@ -13,7 +13,7 @@
 //!   inline `FS_READ` path; payload bytes ride in the IPC buffer.
 //! - Larger reads use `FS_READ_MEMORY`: the driver returns a Memory cap
 //!   covering one cached page; we reserve VA, `mem_map` it
-//!   read-only, memcpy out, then proactively release the cache slot
+//!   read-only, copy out, then proactively release the cache slot
 //!   via `FS_RELEASE_MEMORY` and tear the mapping down locally.
 //!
 //! ## Write path
@@ -945,7 +945,7 @@ struct ReadMark<'a>
 {
     entry: &'a FileEntry,
     cookie: u64,
-    mapping: Option<OutstandingMapping>,
+    ended: bool,
 }
 
 impl<'a> ReadMark<'a>
@@ -956,14 +956,16 @@ impl<'a> ReadMark<'a>
         Self {
             entry,
             cookie,
-            mapping: None,
+            ended: false,
         }
     }
 
-    /// End the read, registering the page's mapping for release.
-    fn finish(mut self, mapping: OutstandingMapping)
+    /// End the read, registering the page's mapping for release. Returns
+    /// whether a driver release's wait for the read ran out during it.
+    fn finish(mut self, mapping: OutstandingMapping) -> bool
     {
-        self.mapping = Some(mapping);
+        self.ended = true;
+        release_handler::end_read(self.entry, self.cookie, Some(mapping))
     }
 }
 
@@ -971,7 +973,10 @@ impl Drop for ReadMark<'_>
 {
     fn drop(&mut self)
     {
-        release_handler::end_read(self.entry, self.cookie, self.mapping.take());
+        if !self.ended
+        {
+            release_handler::end_read(self.entry, self.cookie, None);
+        }
     }
 }
 
@@ -1599,18 +1604,19 @@ impl File
             // release off only within the driver's cooperative-release
             // window, and the driver's revoke unmaps nothing, so a copy that
             // outlasts the window can read the page after the driver
-            // recycles it (#516). Volatile reads make that a defined read of
-            // possibly foreign bytes rather than a data race.
+            // recycles it. Volatile reads make that a defined read of
+            // possibly foreign bytes rather than a data race; the copy is
+            // discarded below when it is known to have outlasted the window,
+            // and otherwise cannot be told apart (#516).
             *byte = unsafe { core::ptr::read_volatile(src.add(i)) };
         }
         // The copy is done: hand the mapping to the registry, where a driver
         // release that waited on the read can now take it.
-        mark.finish(OutstandingMapping {
+        let stalled = mark.finish(OutstandingMapping {
             cookie,
             range,
             memory_cap,
         });
-        self.pos.fetch_add(copy_len as u64, Ordering::Relaxed);
 
         // Proactive release: synchronous FS_RELEASE_MEMORY on the file
         // cap clears the fs-side outstanding entry and decrements the
@@ -1620,6 +1626,18 @@ impl File
         self.release_frame(cookie);
         release_handler::release_one_local(self.entry.as_ref(), self.aspace, cookie);
 
+        // A driver release whose wait ran out during the copy means the
+        // driver's window had passed, so the page may have been recycled:
+        // the bytes are not used, the position stays, and `Interrupted` asks
+        // the caller to read again.
+        if stalled
+        {
+            return Err(io::const_error!(
+                io::ErrorKind::Interrupted,
+                "seraph fs: read page released during the copy",
+            ));
+        }
+        self.pos.fetch_add(copy_len as u64, Ordering::Relaxed);
         Ok(copy_len)
     }
 

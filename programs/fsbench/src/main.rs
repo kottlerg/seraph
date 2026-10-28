@@ -120,7 +120,11 @@ fn read_frame(f: &mut File, size: u64, buf: &mut [u8]) -> u64
     let mut consumed: u64 = 0;
     while consumed < size
     {
-        let n = f.read(buf).expect("frame read failed");
+        let n = match f.read(buf)
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            r => r.expect("frame read failed"),
+        };
         if n == 0
         {
             break;

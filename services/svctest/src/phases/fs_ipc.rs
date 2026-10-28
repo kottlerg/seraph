@@ -585,7 +585,11 @@ pub fn fs_write_memory_phase(_: &Caps)
     let mut total = 0;
     while total < WRITE_LEN
     {
-        let n = f.read(&mut buf[total..]).expect("read wrtf.bin");
+        let n = match f.read(&mut buf[total..])
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            r => r.expect("read wrtf.bin"),
+        };
         assert!(n > 0, "short read at offset {total}");
         total += n;
     }

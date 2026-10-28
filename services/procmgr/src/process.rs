@@ -1701,11 +1701,7 @@ fn vfs_read_memory(
     // reply cap this call does not hand back is deleted, whatever the reply.
     let caps = reply.caps();
     let bytes_valid = reply.word(0) as usize;
-    let Some((&memory_cap, extra)) = caps.split_first()
-    else
-    {
-        return None;
-    };
+    let (&memory_cap, extra) = caps.split_first()?;
     crate::release_caps(extra);
     if reply.label != 0 || bytes_valid == 0
     {

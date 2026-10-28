@@ -288,7 +288,7 @@ fn start_child(
 }
 
 /// Accumulate `done` bits onto `acc` until any bit of `mask` is present,
-/// failing once a [`REPORT_MS`] wait passes with nothing new (a child that
+/// failing once a scaled [`REPORT_MS`] wait passes with nothing new (a child that
 /// never parked, or a waiter the destroy never woke).
 fn wait_for(done: u32, mut acc: u64, mask: u64) -> Result<u64, &'static str>
 {

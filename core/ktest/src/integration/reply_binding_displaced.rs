@@ -398,7 +398,7 @@ fn start_caller(
 }
 
 /// Accumulate `done` bits onto `acc` until any bit of `mask` is present,
-/// failing when a [`REPORT_MS`] wait passes with nothing new.
+/// failing when a scaled [`REPORT_MS`] wait passes with nothing new.
 fn wait_for(done: u32, mut acc: u64, mask: u64) -> Result<u64, &'static str>
 {
     while acc & mask == 0

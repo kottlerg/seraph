@@ -50,9 +50,9 @@ const CORR_PROC_EXIT: u32 = 0x4444;
 /// returns it verbatim.
 const PROC_EXIT_CODE: u32 = 0x0123;
 
-/// Poll bound: ~2 s at 1 ms/poll before declaring a child never reached
-/// `Exited` (a mis-classified fault would otherwise loop forever), and on the
-/// wait for its death event. Applied through [`crate::scaled_polls`], which
+/// Poll bound, ~2 s at 1 ms/poll, on each wait for a child to reach `Exited`
+/// (a mis-classified fault would otherwise loop forever) and on the wait for
+/// its death event. Applied through [`crate::scaled_polls`], which
 /// stretches it past [`crate::UNSCALED_CPUS`] CPUs, where the child's CPU
 /// waits for a host core.
 const MAX_POLLS: u32 = 2000;

@@ -222,10 +222,12 @@ the report bounds of `integration::cross_cspace_revoke_no_alias`,
 `integration::fault_handler_declines_kills`, `integration::aspace_fault_notification_late_bind`,
 `integration::death_notification_late_bind`, `integration::reply_binding_displaced`,
 `integration::syscall_rflags_hardening`, `cap::cspace_self_delete_stops_caller` and
-`retype::aspace_self_delete_stops_caller`; the phase polls of `integration::tlb_widen_retry`; the
-migration polls of `thread::affinity_migrate_running`, the report wait of
-`thread::affinity_migrate_ready_queued`, and the convergence polls of
-`thread::load_balancer_redistributes_skewed`. Every other bound applies as written.
+`retype::aspace_self_delete_stops_caller`; the phase polls, the child's spin bound and the
+cleanup exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and is
+stretched so its `cap_delete` does not race a still-running pinned child); the migration polls
+of `thread::affinity_migrate_running`, the report wait of `thread::affinity_migrate_ready_queued`,
+and the convergence polls of `thread::load_balancer_redistributes_skewed`. Every other bound
+applies as written.
 
 A controller waits for a child to reach a state by a notification bit the child sends on reaching
 it. For a state inside a blocking call (`ipc_call`, `ipc_recv`, a notification wait) or at an exit,

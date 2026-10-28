@@ -212,7 +212,7 @@ fn in_spin_code(ip: u64) -> bool
     .any(|start| (start..start.saturating_add(SPIN_CODE_BYTES)).contains(&ip))
 }
 
-/// Wait, for at most [`WAIT_US`], until `done` holds; fail with `stalled` if
+/// Wait, for at most the scaled [`WAIT_US`], until `done` holds; fail with `stalled` if
 /// it does not, or with the child's death if the child has exited (it never
 /// exits on its own, so an exit is a kill).
 fn await_child(child: &SpawnedChild, done: impl Fn() -> bool, stalled: &'static str) -> TestResult

@@ -104,6 +104,7 @@ const BALANCE_MAX_SPINNERS: usize = 8;
 /// [`crate::scaled_bound`], which stretches it past [`crate::UNSCALED_CPUS`]
 /// CPUs, where an idle CPU's balancer tick waits for a host core.
 const BALANCE_CONVERGE_POLLS: u64 = 250;
+
 /// Per-spinner observed CPU index. Indexed by spinner id (0..N). Used by
 /// the load-balancer tests. `u32::MAX` indicates "spinner has not run yet".
 static BALANCE_OBSERVED_CPU: [AtomicU32; BALANCE_MAX_SPINNERS] = [

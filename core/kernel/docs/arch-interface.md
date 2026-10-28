@@ -302,10 +302,11 @@ Classification and § riscv64 Classification.
 `writable`, `executable`, and `uncacheable`. `readable` is meaningful only on RISC-V (x86-64
 has no read-disable bit); `uncacheable` selects the device memory type explicitly on both
 architectures — PCD|PWT (strong UC) on x86-64, Svpbmt PBMT=IO on RISC-V — so MMIO
-attributes do not depend on platform PMAs. The kernel's own MMIO regions (the x86-64 xAPIC and
-I/O APIC pages) are the exception today: Phase 3 maps them write-back through the direct map,
-so their memory type comes from the firmware's MTRRs
-([#515](https://github.com/kottlerg/seraph/issues/515)). W^X is enforced at the memory syscall layer
+attributes do not depend on platform PMAs. The kernel's own MMIO regions are the exception
+today: Phase 3 maps them cacheable through the direct map, so the x86-64 xAPIC and I/O APIC
+pages take their memory type from the firmware's MTRRs
+([#515](https://github.com/kottlerg/seraph/issues/515)), and the riscv64 PLIC and UART take
+theirs from the platform PMAs (PBMT=PMA). W^X is enforced at the memory syscall layer
 (`syscall::mem` map/protect reject a writable-and-executable request with
 `SyscallError::WxViolation`; see [syscalls.md](syscalls.md) § Memory Syscalls); the arch
 mapping primitives require the caller to have already validated W^X.
@@ -734,8 +735,8 @@ pub fn gdt::permit_port_range_u32(iopb: &mut [u8; IOPB_SIZE], base: u32, count: 
 pub unsafe fn gdt::init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64);
 /// Virtual address of the BSP's static TSS (x86-64); 0 on RISC-V.
 pub fn gdt::bsp_tss_ptr() -> u64;
-/// Per-thread I/O Permission Bitmap size; the same value as the module-level
-/// `IOPB_SIZE` (8192 on x86-64; 0 on RISC-V).
+/// Per-thread I/O Permission Bitmap size, which the module-level `IOPB_SIZE`
+/// re-exports (8192 on x86-64; 0 on RISC-V).
 pub const gdt::IOPB_SIZE: usize;
 
 /// Install the exception vector on the current AP: x86-64 `lidt` of the shared

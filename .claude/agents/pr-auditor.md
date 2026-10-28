@@ -33,10 +33,11 @@ claims.
 5. Per-issue closure: extract every closing reference from the PR body
    and the commit messages, as `docs/conventions.md` § Commit and PR
    cross-references defines one: `close`, `fix`, or `resolve` in any
-   inflection or letter case, directly followed by `#N` with at most a
-   colon and whitespace between (a subject such as `fix #N items` closes
-   #N exactly as `Fixes #N` does; the `(fixed by PR #M)` marker is not a
-   closing reference). Report as FAIL a closing reference in a commit
+   inflection or letter case, directly followed by a reference to Issue N
+   (`#N`, `<owner>/<repo>#N`, or the Issue's URL) with at most a colon and
+   whitespace between (a subject such as `fix #N items` closes #N exactly
+   as `Fixes #N` does; the `(fixed by PR #M)` marker is not a closing
+   reference). Report as FAIL a closing reference in a commit
    message to an Issue the PR body does not close with `Fixes #N` or
    `Closes #N`, per that section. For each closed Issue, `gh issue view
    <N> --json body`. For every `- [ ]` under `## Acceptance` in the issue,

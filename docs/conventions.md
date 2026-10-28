@@ -111,11 +111,11 @@ a closed Issue settles on.
   `Closes #N` so the merge auto-closes the Issue. Manual `gh issue close` after the fact is a
   procedural miss, not a substitute.
 - A commit message or PR description MUST NOT put a GitHub closing keyword (`close`, `fix`, or
-  `resolve`, in any inflection or letter case) directly before an Issue reference `#N`, with at
-  most a colon and whitespace between them, unless it closes Issue N: GitHub closes the Issue when
-  that text reaches `master`, whatever words follow the reference. A keyword separated from `#N`
-  by other words, as in the `(fixed by PR #M)` marker of § Branch and PR Workflow, is not a
-  closing reference.
+  `resolve`, in any inflection or letter case) directly before a reference to Issue N (`#N`,
+  `<owner>/<repo>#N`, or the Issue's URL), with at most a colon and whitespace between them,
+  unless it closes Issue N: GitHub closes the Issue when that text reaches `master`, whatever words
+  follow the reference. A keyword separated from the reference by other words, as in the
+  `(fixed by PR #M)` marker of § Branch and PR Workflow, is not a closing reference.
 
 ### Acceptance checklist discipline
 
@@ -163,9 +163,9 @@ maintainer's acceptance of it, quoting the maintainer's words.
   them. Components and concrete what-changed text only.
 - `<summary>` MUST NOT include Issue references, task IDs, branch names, or other transient
   identifiers. Issue references belong in the body.
-- A merge commit is exempt from the rules of this section: git's default subject for a merge of
-  the base branch into a feature branch and GitHub's PR-merge subject both name branches, and
-  GitHub's also carries the PR number.
+- A merge commit is exempt from the Title rules: git's default subject for a merge of the base
+  branch into a feature branch and GitHub's PR-merge subject both name branches, and GitHub's also
+  carries the PR number.
 
 ### Body
 

@@ -16,7 +16,7 @@
 //!     active migration races the priority-change's locate-and-relocate
 //!     and exercises the cross-CPU outgoing re-enqueue branch under heavy
 //!     contention.
-//!   * **Phase 2** pins each worker to a remote CPU and yields so it runs
+//!   * **Phase 2** pins each worker to a remote CPU and sleeps so it runs
 //!     there, then does two rapid priority writes followed by
 //!     `cap_delete(Thread)` — the dealloc all-locks walk + drain protocol
 //!     race the priority-change in flight *and* a target that is `current`
@@ -26,7 +26,10 @@
 //! double-link, stale-link UAF, or magic-cookie corruption surfaces as a
 //! kernel debug-assert / panic that the harness reports as FAIL.
 
-use syscall::{cap_delete, thread_set_affinity, thread_set_priority, thread_sleep};
+use syscall::{
+    cap_copy, cap_create_notification, cap_delete, notification_send, thread_set_affinity,
+    thread_set_priority, thread_sleep,
+};
 use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -34,33 +37,81 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 const NUM_WORKERS: usize = 16;
 const CYCLES: usize = 200;
 
+/// The workers and how far the cell has got with them: `spawned` were
+/// started; those below `reaped` were deleted by Phase 2.
+struct Workers
+{
+    threads: [u32; NUM_WORKERS],
+    cspaces: [u32; NUM_WORKERS],
+    spawned: usize,
+    reaped: usize,
+}
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = syscall::system_info(SystemInfoType::CpuCount as u64)
         .map_err(|_| "stress::priority_dealloc_race: system_info(CpuCount) failed")?;
     let cpu_mod = u32::try_from(cpus).unwrap_or(1).max(1);
+    let running = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "stress::priority_dealloc_race: cap_create_notification failed")?;
 
-    let mut threads = [0u32; NUM_WORKERS];
-    let mut cspaces = [0u32; NUM_WORKERS];
+    let mut workers = Workers {
+        threads: [0; NUM_WORKERS],
+        cspaces: [0; NUM_WORKERS],
+        spawned: 0,
+        reaped: 0,
+    };
+    let result = spawn_workers(ctx, running, &mut workers)
+        .and_then(|()| churn_and_delete(ctx, cpu_mod, &mut workers));
+    // A failed phase leaves spinning workers that would starve the floor-
+    // priority children of every later cell; delete them on every path.
+    for i in workers.reaped..workers.spawned
+    {
+        let _ = cap_delete(workers.threads[i]);
+        let _ = cap_delete(workers.cspaces[i]);
+    }
+    let deleted = cap_delete(running);
+    result?;
+    deleted.map_err(|_| "stress::priority_dealloc_race: cap_delete running failed")?;
+    Ok(())
+}
 
+/// Start the workers, each reporting once on `running` that it has run, and
+/// wait until every one has (they are created at the floor, strictly below
+/// this thread) — priority placement only matters once they have been on a
+/// queue.
+fn spawn_workers(ctx: &TestContext, running: u32, workers: &mut Workers) -> TestResult
+{
     for i in 0..NUM_WORKERS
     {
         let child = spawn::new_child(ctx)
             .map_err(|_| "stress::priority_dealloc_race: spawn::new_child failed")?;
+        workers.threads[i] = child.th;
+        workers.cspaces[i] = child.cs;
+        workers.spawned = i + 1;
+        let child_running = cap_copy(running, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+            .map_err(|_| "stress::priority_dealloc_race: cap_copy running failed")?;
+        // arg packs running_slot[31:0] | worker index[63:32].
+        let arg = u64::from(child_running) | ((i as u64) << 32);
         // SAFETY: stress tests run sequentially; only this test uses these
         // STRESS_STACKS slots during its run.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        spawn::configure_and_start(&child, spinner_entry, stack_top, 0)
+        spawn::configure_and_start(&child, spinner_entry, stack_top, arg)
             .map_err(|_| "stress::priority_dealloc_race: configure_and_start failed")?;
-        threads[i] = child.th;
-        cspaces[i] = child.cs;
     }
+    let mut running_bits = 0u64;
+    crate::tally::await_all(
+        running,
+        &mut running_bits,
+        (1u64 << NUM_WORKERS) - 1,
+        "stress::priority_dealloc_race: a worker never ran",
+    )
+}
 
-    // Sleep so workers (created at the floor, strictly below this thread)
-    // reach Ready / Running before the contention phase — priority placement
-    // only matters once they have been on a queue.
-    let _ = thread_sleep(2);
-
+/// Phase 1 (priority churn with affinity flips) and Phase 2 (pin, churn and
+/// delete each worker), recording in `workers.reaped` the workers deleted.
+fn churn_and_delete(ctx: &TestContext, cpu_mod: u32, workers: &mut Workers) -> TestResult
+{
     // ── Phase 1: priority churn ± affinity flips. ────────────────────────
     //
     // Surface: an affinity-driven migration to a different CPU's
@@ -75,7 +126,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         // u32::MAX, so the narrow casts are safe; `try_from` keeps clippy
         // honest.
         let cycle_u32 = u32::try_from(cycle).unwrap_or(0);
-        for (i, &th) in threads.iter().enumerate()
+        for (i, &th) in workers.threads.iter().enumerate()
         {
             let prio: u8 = if (cycle + i) & 1 == 0 { 3 } else { 9 };
             let _ = thread_set_priority(th, prio, ctx.sched_control_cap);
@@ -113,24 +164,36 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let i_u32 = u32::try_from(i).unwrap_or(0);
         let target_cpu = (i_u32 + 1) % cpu_mod;
-        let _ = thread_set_affinity(threads[i], target_cpu);
+        let _ = thread_set_affinity(workers.threads[i], target_cpu);
         // Sleep so the pinned worker migrates to and starts running on the
         // remote CPU before we churn its priority and delete it (the remote
-        // CPU dispatches it on its own; the sleep supplies wall time).
+        // CPU dispatches it on its own; the sleep supplies wall time). The
+        // workers stay pure userspace spinners, with no state to report it:
+        // workers that report their CPU through syscalls wedge the kernel
+        // (#529).
         let _ = thread_sleep(1);
-        let _ = thread_set_priority(threads[i], 5, ctx.sched_control_cap);
-        let _ = thread_set_priority(threads[i], 11, ctx.sched_control_cap);
-        cap_delete(threads[i])
+        let _ = thread_set_priority(workers.threads[i], 5, ctx.sched_control_cap);
+        let _ = thread_set_priority(workers.threads[i], 11, ctx.sched_control_cap);
+        cap_delete(workers.threads[i])
             .map_err(|_| "stress::priority_dealloc_race: cap_delete thread failed")?;
-        cap_delete(cspaces[i])
+        workers.reaped = i + 1;
+        cap_delete(workers.cspaces[i])
             .map_err(|_| "stress::priority_dealloc_race: cap_delete cspace failed")?;
     }
-
     Ok(())
 }
 
-extern "C" fn spinner_entry(_arg: u64) -> !
+/// Report once on `running` (the low half of `arg`) with this worker's bit
+/// (the high half), then spin in pure userspace with no syscalls.
+// cast_possible_truncation: the low half is a 32-bit cap handle and the high
+// half a worker index below NUM_WORKERS.
+#[allow(clippy::cast_possible_truncation)]
+extern "C" fn spinner_entry(arg: u64) -> !
 {
+    let running = arg as u32;
+    let index = (arg >> 32) as u32;
+    // A failed send fails the controller's bounded wait for the bit.
+    notification_send(running, 1u64 << index).ok();
     loop
     {
         core::hint::spin_loop();

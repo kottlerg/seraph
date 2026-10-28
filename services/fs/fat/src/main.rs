@@ -278,7 +278,7 @@ fn service_loop(
             {
                 ipc::fs_errors::UNKNOWN_OPCODE
             };
-            refuse_keeping_no_caps(&msg, opcode, code, ipc_buf);
+            reply_dropping_caps(&msg, opcode, code, ipc_buf);
             continue;
         }
 
@@ -314,7 +314,7 @@ fn service_loop(
                     GateError::UnknownLabel => ipc::fs_errors::UNKNOWN_OPCODE,
                     GateError::PermissionDenied => ipc::fs_errors::PERMISSION_DENIED,
                 };
-                refuse_keeping_no_caps(&msg, opcode, code, ipc_buf);
+                reply_dropping_caps(&msg, opcode, code, ipc_buf);
                 continue;
             }
         };
@@ -706,12 +706,12 @@ fn handle_read_memory_node_cap(
     let Some(node) = nodes.get(node_id)
     else
     {
-        refuse_keeping_no_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
+        reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     if node.kind != NodeKind::File
     {
-        refuse_keeping_no_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
+        reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     }
 
@@ -720,7 +720,7 @@ fn handle_read_memory_node_cap(
         let Some(slot_idx) = file::alloc_slot(files)
         else
         {
-            refuse_keeping_no_caps(msg, opcode, ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
+            reply_dropping_caps(msg, opcode, ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
             return;
         };
         // Slot identity for the eviction worker's `find_by_badge`
@@ -776,14 +776,14 @@ fn handle_read_memory_node_cap(
     );
 }
 
-/// Reply `code` to a request the driver does not carry out (a rights-gate
-/// refusal, an unknown or unbadged label, an `FS_READ_MEMORY` refused before
-/// its slot records the SEND), holding none of the caps it carried: an
+/// Reply `code` holding none of the caps the request carried: an
 /// `FS_WRITE_MEMORY` source page goes back in the reply, as § Label 12
 /// promises in every outcome, and any other cap (an `FS_READ_MEMORY`
-/// release SEND) is deleted. `FS_MOUNT` replies through it too, since it
-/// carries no caps.
-fn refuse_keeping_no_caps(msg: &IpcMessage, opcode: u64, code: u64, ipc_buf: *mut u64)
+/// release SEND) is deleted. Used for every request the driver does not
+/// carry out (a rights-gate refusal, an unknown or unbadged label, an
+/// `FS_READ_MEMORY` refused before its slot records the SEND) and for
+/// `FS_MOUNT`, which carries no caps.
+fn reply_dropping_caps(msg: &IpcMessage, opcode: u64, code: u64, ipc_buf: *mut u64)
 {
     let mut builder = IpcMessage::builder(code);
     for &cap in msg.caps()

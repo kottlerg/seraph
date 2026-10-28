@@ -23,9 +23,10 @@
 //! (see [`discard_mapping`]). A failed unmap or a copy still running at the
 //! end of the wait is answered with [`fs_errors::IO_ERROR`], no ack. After
 //! any reply, or the window with none, the driver revokes the page's caps
-//! and may recycle the page; the revoke unmaps nothing (#516). Holding the
-//! reply keeps that recycling from racing a copy within the window; a copy
-//! that outlasts it is marked stalled, and `File::read_frame` discards it.
+//! and may recycle the page; the revoke unmaps nothing. Holding the reply
+//! keeps that recycling from racing a copy that ends within the window. A
+//! copy that outlasts it can read the recycled page, and this process
+//! cannot tell (#516).
 //!
 //! The endpoint and the handler thread are created lazily on the first
 //! [`super::File::open`] call; until then the cost is one
@@ -233,30 +234,22 @@ pub(super) fn begin_read(entry: &FileEntry, cookie: u64)
 
 /// End the read of `cookie`, handing over its mapping if one was made, and
 /// wake a release waiting on it. The handler thread is the only waiter.
-/// Returns whether a driver release's wait for this read ran out first, so
-/// the driver may have recycled the page during the copy.
-pub(super) fn end_read(entry: &FileEntry, cookie: u64, mapping: Option<OutstandingMapping>) -> bool
+pub(super) fn end_read(entry: &FileEntry, cookie: u64, mapping: Option<OutstandingMapping>)
 {
     let mut out = entry.outstanding.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(idx) = out.reading.iter().position(|&c| c == cookie)
     {
         out.reading.swap_remove(idx);
     }
-    let stalled = match out.stalled.iter().position(|&c| c == cookie)
+    if let Some(idx) = out.stalled.iter().position(|&c| c == cookie)
     {
-        Some(idx) =>
-        {
-            out.stalled.swap_remove(idx);
-            true
-        }
-        None => false,
-    };
+        out.stalled.swap_remove(idx);
+    }
     if let Some(m) = mapping
     {
         out.idle.push(m);
     }
     entry.read_done.notify_one();
-    stalled
 }
 
 /// Take an idle mapping by cookie. Returns `Some` to whichever of the local

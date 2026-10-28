@@ -835,7 +835,10 @@ Revoke all capabilities derived from a capability, across all processes.
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 Every descendant in the derivation tree is invalidated; the target capability
-itself is preserved. Underlying kernel objects are not freed unless a revoked
+itself is preserved. Mappings established through a revoked Memory, Mmio, or
+IoPort descendant are not removed (see
+[capability-model.md](../../../docs/capability-model.md) § Revocation; #516,
+#457). Underlying kernel objects are not freed unless a revoked
 capability was the last reference (see
 [capability-model.md](../../../docs/capability-model.md) § Revocation); such a teardown can fail
 to complete as `SYS_CAP_DELETE` describes for a thread left on a halted CPU. While the

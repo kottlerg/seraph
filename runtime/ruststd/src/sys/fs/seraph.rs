@@ -939,13 +939,13 @@ fn acquire_write_frame(aspace: u32, memmgr_ep: u32) -> io::Result<WriteFrame>
 /// A driver release of the cookie waits on the mark, up to the driver's
 /// release window, so the page is not unmapped, or acked back to the
 /// driver, mid-copy; a copy outlasting the window gets no ack, and the
-/// driver may recycle the page. Dropping the mark ends the read on every
-/// early return.
+/// driver may recycle the page (#516). Dropping the mark ends the read on
+/// every early return.
 struct ReadMark<'a>
 {
     entry: &'a FileEntry,
     cookie: u64,
-    ended: bool,
+    mapping: Option<OutstandingMapping>,
 }
 
 impl<'a> ReadMark<'a>
@@ -956,16 +956,14 @@ impl<'a> ReadMark<'a>
         Self {
             entry,
             cookie,
-            ended: false,
+            mapping: None,
         }
     }
 
-    /// End the read, registering the page's mapping for release. Returns
-    /// whether a driver release's wait for the read ran out during it.
-    fn finish(mut self, mapping: OutstandingMapping) -> bool
+    /// End the read, registering the page's mapping for release.
+    fn finish(mut self, mapping: OutstandingMapping)
     {
-        self.ended = true;
-        release_handler::end_read(self.entry, self.cookie, Some(mapping))
+        self.mapping = Some(mapping);
     }
 }
 
@@ -973,10 +971,7 @@ impl Drop for ReadMark<'_>
 {
     fn drop(&mut self)
     {
-        if !self.ended
-        {
-            release_handler::end_read(self.entry, self.cookie, None);
-        }
+        release_handler::end_read(self.entry, self.cookie, self.mapping.take());
     }
 }
 
@@ -1593,28 +1588,29 @@ impl File
         let va = range.va_start();
 
         let copy_len = bytes_valid.min(buf.len());
-        // SAFETY: VA is mapped read-only for one page, `checked_frame_reply`
-        // holds `memory_data_offset + bytes_valid <= PAGE_SIZE`, and
-        // `copy_len <= buf.len()`. The copy reads through a raw pointer, not
-        // a shared slice, because the page is the driver's: the `ReadMark`
-        // holds a driver release of it off only within the driver's
-        // cooperative-release window, and the driver's revoke does not unmap
-        // it, so a copy that outlasts the window can race the driver's
-        // recycling of the page (#516). Such a copy is discarded below.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (va + memory_data_offset as u64) as *const u8,
-                buf.as_mut_ptr(),
-                copy_len,
-            );
+        let src = (va + memory_data_offset as u64) as *const u8;
+        for (i, byte) in buf[..copy_len].iter_mut().enumerate()
+        {
+            // SAFETY: VA is mapped read-only for one page and
+            // `checked_frame_reply` holds `memory_data_offset + bytes_valid
+            // <= PAGE_SIZE`, so `src + i` lies in the mapped page for every
+            // `i < copy_len <= bytes_valid`. The page is the driver's and
+            // another process may write it: the `ReadMark` holds a driver
+            // release off only within the driver's cooperative-release
+            // window, and the driver's revoke unmaps nothing, so a copy that
+            // outlasts the window can read the page after the driver
+            // recycles it (#516). Volatile reads make that a defined read of
+            // possibly foreign bytes rather than a data race.
+            *byte = unsafe { core::ptr::read_volatile(src.add(i)) };
         }
         // The copy is done: hand the mapping to the registry, where a driver
         // release that waited on the read can now take it.
-        let stalled = mark.finish(OutstandingMapping {
+        mark.finish(OutstandingMapping {
             cookie,
             range,
             memory_cap,
         });
+        self.pos.fetch_add(copy_len as u64, Ordering::Relaxed);
 
         // Proactive release: synchronous FS_RELEASE_MEMORY on the file
         // cap clears the fs-side outstanding entry and decrements the
@@ -1624,17 +1620,6 @@ impl File
         self.release_frame(cookie);
         release_handler::release_one_local(self.entry.as_ref(), self.aspace, cookie);
 
-        // A driver release whose wait ran out during the copy may have been
-        // followed by the page's reuse, so the bytes are not trusted; the
-        // position stays, and `Interrupted` asks the caller to read again.
-        if stalled
-        {
-            return Err(io::const_error!(
-                io::ErrorKind::Interrupted,
-                "seraph fs: read page released during the copy",
-            ));
-        }
-        self.pos.fetch_add(copy_len as u64, Ordering::Relaxed);
         Ok(copy_len)
     }
 
@@ -1874,9 +1859,10 @@ impl Drop for File
         let ipc_buf = crate::os::seraph::current_ipc_buf();
         // FS_CLOSE: fs walks its outstanding-page table and revokes
         // every per-cookie ancestor cap, decrementing each cache-slot
-        // refcount. Any of our locally-mapped pages now point at a cap
-        // whose mapping has been torn down by the kernel revocation;
-        // we still need to mem_unmap the VA and free the slot.
+        // refcount. The revoke invalidates our derived caps but leaves
+        // their mappings in place, and fs may recycle the pages (#516),
+        // so each VA must still be unmapped, its reservation freed, and
+        // its cap deleted.
         if !ipc_buf.is_null()
         {
             let close = IpcMessage::new(fs_labels::FS_CLOSE);
@@ -1902,11 +1888,8 @@ impl Drop for File
             }
         }
 
-        // Drop the per-File badged SEND. fs's caps[0] copy survives
-        // until cap_delete on its slot; revoke would also kill it but
-        // we rely on fs's FS_CLOSE handler having already cleared its
-        // OpenFile entry, after which fs's slot is a dangling SEND
-        // that will be reaped on fs's CSpace cleanup at process death.
+        // Drop the per-File badged SEND. The driver's copy of it, if the
+        // driver recorded one, is deleted by its FS_CLOSE handler.
         let _ = syscall::cap_delete(self.release_send);
     }
 }

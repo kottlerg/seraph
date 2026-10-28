@@ -5,15 +5,18 @@
 
 //! Eviction worker for the FAT page cache.
 //!
-//! When `handle_read_memory` cannot acquire a cache slot (every slot
+//! When `read_memory_at_slot` cannot acquire a cache slot (every slot
 //! has `refcount > 0`), main scans the per-file outstanding-page
 //! tables for a candidate, enqueues an [`EvictReq`], and replies
-//! `IO_ERROR`. The eviction worker pops the request, sends
-//! `FS_RELEASE_MEMORY` on the client's release endpoint, and waits
-//! up to [`RELEASE_TIMEOUT_MS`] for `FS_RELEASE_ACK`. Either way
-//! the worker then takes the per-file outstanding-page entry and, if
-//! no other path has cleaned it up meanwhile (the client's synchronous
-//! release, or `FS_CLOSE`), `cap_revoke`s the per-cookie ancestor cap,
+//! `IO_ERROR`. The eviction worker pops the request and first checks
+//! that the page is still outstanding, skipping it if the client's
+//! synchronous release or `FS_CLOSE` already cleaned it up. When the
+//! client delivered a release SEND, the worker sends `FS_RELEASE_MEMORY`
+//! on its own derived copy of it and waits up to [`RELEASE_TIMEOUT_MS`]
+//! for `FS_RELEASE_ACK`; with no SEND, or when it cannot derive the copy
+//! or spawn the watchdog, it sends nothing. Either way the worker then
+//! takes the per-file outstanding-page entry and, if no other path has
+//! cleaned it up meanwhile, `cap_revoke`s the per-cookie ancestor cap,
 //! drops it, and decrements the cache slot's refcount. An ack means
 //! the client has already unmapped the page. The revoke invalidates
 //! the client's derived cap but unmaps nothing, and the released slot
@@ -140,13 +143,11 @@ pub fn worker_loop(
         {
             continue;
         };
-        let outcome = if endpoint != 0
+        let outcome = match endpoint
         {
-            cooperative_release(endpoint, req.cookie)
-        }
-        else
-        {
-            Release::NoEndpoint
+            Endpoint::Copy(cap) => cooperative_release(cap, req.cookie),
+            Endpoint::None => Release::NoEndpoint,
+            Endpoint::DeriveFailed => Release::DeriveFailed,
         };
         // Whichever path takes the entry out of the open-file table owns
         // the cleanup: revoke the ancestor (invalidates the client's derived
@@ -184,6 +185,7 @@ fn log_outcome(req: &EvictReq, outcome: Release, owned: bool)
     {
         Release::Acked => return,
         Release::NoEndpoint => "no release endpoint",
+        Release::DeriveFailed => "release SEND derive failed; no FS_RELEASE_MEMORY sent",
         Release::Refused(_) => "FS_RELEASE_MEMORY refused",
         Release::CallFailed => "FS_RELEASE_MEMORY call failed",
         Release::SpawnFailed => "release watchdog spawn failed; no FS_RELEASE_MEMORY sent",
@@ -231,6 +233,9 @@ enum Release
     SpawnFailed,
     /// The client delivered no release endpoint, so none was sent.
     NoEndpoint,
+    /// The worker could not derive its copy of the client's release SEND,
+    /// so none was sent.
+    DeriveFailed,
 }
 
 /// Send `FS_RELEASE_MEMORY` for `cookie` on `endpoint`, a derived copy of
@@ -305,13 +310,27 @@ fn cooperative_release(endpoint: u32, cookie: u64) -> Release
     *st.get_or_insert(Release::TimedOut)
 }
 
+/// The release SEND the worker sends a page's `FS_RELEASE_MEMORY` on.
+enum Endpoint
+{
+    /// The worker's own derived copy of the client's release SEND.
+    Copy(u32),
+    /// The client delivered no release SEND.
+    None,
+    /// The client delivered one, but the worker could not derive its copy.
+    DeriveFailed,
+}
+
 /// Under the open-file lock, check that `req`'s outstanding page is still
 /// in the table (same file, cookie, cache slot, and ancestor cap) and return
-/// a derived copy of its file's release SEND, or 0 when the client delivered
-/// none. The copy is the worker's own, so an `FS_CLOSE` that deletes the
-/// slot's SEND meanwhile cannot free or reuse the slot the worker calls on.
-/// `None` means the page was already cleaned up.
-fn live_release_endpoint(files: &Mutex<[OpenFile; MAX_OPEN_FILES]>, req: &EvictReq) -> Option<u32>
+/// a derived copy of its file's release SEND. The copy is the worker's own,
+/// so an `FS_CLOSE` that deletes the slot's SEND meanwhile cannot free or
+/// reuse the slot the worker calls on. `None` means the page was already
+/// cleaned up.
+fn live_release_endpoint(
+    files: &Mutex<[OpenFile; MAX_OPEN_FILES]>,
+    req: &EvictReq,
+) -> Option<Endpoint>
 {
     let files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
     let file = &files_g[find_by_badge(&files_g, req.file_badge)?];
@@ -324,9 +343,12 @@ fn live_release_endpoint(files: &Mutex<[OpenFile; MAX_OPEN_FILES]>, req: &EvictR
     }
     if file.release_endpoint_cap == 0
     {
-        return Some(0);
+        return Some(Endpoint::None);
     }
-    Some(syscall::cap_derive(file.release_endpoint_cap, syscall::RIGHTS_EP_SEND).unwrap_or(0))
+    Some(
+        syscall::cap_derive(file.release_endpoint_cap, syscall::RIGHTS_EP_SEND)
+            .map_or(Endpoint::DeriveFailed, Endpoint::Copy),
+    )
 }
 
 /// Take `req`'s outstanding-page entry out of the open-file table, under

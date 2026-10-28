@@ -109,27 +109,46 @@ claims.
    diff is not.
 
    Local host runs: `docs/testing.md` § Coverage tiers owns which runs a PR
-   owes (its Trigger paths list, the narrower boundaries' lists, and Repeat
-   count), when a run covers a head (When the runs are owed), and the
-   behaviour-neutral categories (its Behaviour-neutral changes paragraph);
+   owes (its Inert changes, Boundary surface, Memory surface, and Repeat
+   count paragraphs), when a run covers a head (When the runs are owed), and
+   when a HANG does not block (Hangs at oversubscription);
    `docs/conventions.md` § PR-body checklist discipline owns the report.
-   From the PR's own diff
-   (`git diff $(git merge-base <head> origin/master) <head>`, Markdown and
-   comment lines aside; the parent fetches `origin` before the run, so read
-   `origin/master` as it is), derive the runs owed and their repeat counts.
-   A behaviour-neutral change on a trigger path owes no run; the body MUST
-   name each such change and the category from that paragraph that makes
-   it owe no run,
-   and the diff MUST bear that category out. The body's `## Validation`
-   MUST report each owed run with its `--runs` count and the head it ran
-   at, and the PR's own diff on that run's trigger paths MUST be the same
-   at that head and at the PR head, behaviour-neutral changes aside; or,
-   when none is owed, the body MUST say so and why. FAIL when an owed run
-   is missing, its count is below the one that section requires, its head
-   is absent or does not cover the PR head, a "none owed" statement is
-   absent or contradicted by the PR's own diff, a change named
-   behaviour-neutral states no category, or a change named
-   behaviour-neutral falls under no category that paragraph lists.
+   Take the PR's own diff (`git diff $(git merge-base <head> origin/master)
+   <head>`; the parent fetches `origin` before the run, so read
+   `origin/master` as it is), set aside its inert lines as that section
+   defines them, and run that section's screen commands, reading each
+   candidate's hunk and each type or constant change as that section says.
+   The boundary set is owed only when a non-inert line meets the Boundary
+   surface definition, the memory variation only when one meets the Memory
+   surface definition, and the riscv64 64- and 65-hart and x86_64 256-vCPU
+   boundaries at `--runs 3` whenever the PR states a concurrency-fix purpose
+   as Repeat count defines it and has a non-inert line, whether or not a
+   line meets either surface. Outside those cases no run is owed: a
+   non-inert change to a file under `core/kernel/` or `core/boot/` that
+   meets neither surface owes none. A run's surface is the one that owes it,
+   as When the runs are owed defines it; for the runs a concurrency-fix
+   purpose owes, it is every non-inert line of the PR's own diff. The body's
+   `## Validation` MUST report each owed run with its `--runs` count, its
+   outcome, and the head it ran at, and the PR's own non-inert changes to
+   that run's surface MUST be the same at that head and at the PR head; or,
+   when none is owed, the body MUST say so and why. FAIL when an owed run is
+   missing, its count is below the one that section requires, its head is
+   absent or does not cover the PR head, or its outcome is missing or is
+   anything other than `PASS` (a `QEMU-CRASH` run is replaced by its re-run,
+   whose outcome stands); when a "none owed" statement is absent or
+   contradicted by the PR's own diff or a stated concurrency-fix purpose;
+   and, for a run the body reports that the PR does not owe, when it is a
+   memory variation that HANGs or fails, or a boundary run that HANGs or
+   fails and the body gives no link to its record on the open Issue for that
+   boundary, or that fails with a defect no open Issue for that boundary
+   names. A run the PR does not owe that passed is not a FAIL.
+
+   CPU-count width: a non-inert line the PR's own diff adds that introduces
+   a structure with one entry or one bit per CPU is on the Boundary surface
+   whatever file it is in, so it owes the boundary set; FAIL a "none owed"
+   statement on such a PR and cite the line. Whether that structure's width
+   meets `docs/coding-standards.md` § CPU-Count Width is code quality,
+   which pr-reviewer step 7 gates.
 
 10. PR-body claims: the body's prose (Summary, Notes, and any section
     the template does not define) against the diff. Every file, argument,

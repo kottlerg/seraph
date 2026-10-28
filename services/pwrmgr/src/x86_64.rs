@@ -22,6 +22,9 @@
 //! cap and pulses the keyboard-controller reset (port `0x64`, value
 //! `0xFE`) — the simplest reset path that works under QEMU q35 + OVMF.
 //!
+//! The table parsing itself is the pure `pwrmgr-acpi` crate; this module
+//! maps each table and hands it the mapped bytes.
+//!
 //! On any unrecoverable failure a routine falls through and the caller
 //! (`main`) replies `pwrmgr_errors::INVALID_REQUEST`.
 
@@ -33,10 +36,8 @@ use syscall_abi::MAP_READONLY;
 /// ACPI PM1 control register: `SLP_EN` bit (bit 13).
 const SLP_EN: u16 = 1 << 13;
 
-/// FADT field offsets (ACPI 6.x section 5.2.9).
-const FADT_OFF_DSDT: usize = 40;
-const FADT_OFF_PM1A_CNT_BLK: usize = 64;
-const FADT_OFF_X_DSDT: usize = 140;
+/// Page size of the table mappings.
+const PAGE_SIZE: u64 = 0x1000;
 
 /// Resolved shutdown actuation state. Acquired once at startup from
 /// devmgr; held for pwrmgr's lifetime. The two `IoPort` caps are
@@ -56,9 +57,18 @@ pub fn resolve(devmgr_registry: u32, self_aspace: u32, ipc_buf: *mut u64) -> Opt
 {
     let facp_sig = u64::from(u32::from_le_bytes(*b"FACP"));
     let fadt = query_acpi_table(devmgr_registry, facp_sig, 0, ipc_buf)?;
-    let (pm1a_port, dsdt_phys) = with_table_mapped(self_aspace, &fadt, |table_vaddr| {
-        Some(read_fadt_fields(table_vaddr))
-    })?;
+    let fields = with_table_mapped(self_aspace, &fadt, |mapped| {
+        acpi::table_bytes(mapped).and_then(acpi::parse_fadt)
+    });
+    let Some(acpi::FadtFields {
+        pm1a_cnt_blk: pm1a_port,
+        dsdt_phys,
+    }) = fields
+    else
+    {
+        std::os::seraph::log!("resolve failed (FADT unreadable or truncated)");
+        return None;
+    };
     if pm1a_port == 0
     {
         std::os::seraph::log!("resolve failed (PM1a_CNT_BLK is zero)");
@@ -66,11 +76,14 @@ pub fn resolve(devmgr_registry: u32, self_aspace: u32, ipc_buf: *mut u64) -> Opt
     }
 
     let dsdt = query_acpi_table(devmgr_registry, 0, dsdt_phys, ipc_buf)?;
-    let slp_typa = with_table_mapped(self_aspace, &dsdt, |dsdt_vaddr| {
-        // SAFETY: DSDT mapped read-only; offset 4 is the SDT length field.
-        let dsdt_len = unsafe { read_u32_at(dsdt_vaddr, 4) } as usize;
-        scan_dsdt_for_s5(dsdt_vaddr, dsdt_len)
-    })?;
+    let Some(slp_typa) = with_table_mapped(self_aspace, &dsdt, |mapped| {
+        acpi::table_bytes(mapped).and_then(acpi::find_s5_slp_typa)
+    })
+    else
+    {
+        std::os::seraph::log!("resolve failed (no \\_S5_ sleep type in the DSDT)");
+        return None;
+    };
 
     let reply = devmgr_call(
         devmgr_registry,
@@ -94,8 +107,10 @@ pub fn resolve(devmgr_registry: u32, self_aspace: u32, ipc_buf: *mut u64) -> Opt
     })
 }
 
-/// Attempt ACPI S5 shutdown. Logs and does not return on success; on
-/// failure logs and returns so the caller can reply with an error.
+/// Attempt ACPI S5 shutdown. Does not return on success; on failure,
+/// including a write the platform does not act on within
+/// [`crate::await_reset`]'s grace, logs and returns so the caller can reply
+/// with an error.
 pub fn shutdown(self_thread: u32, act: &Actuator)
 {
     if syscall::ioport_bind(self_thread, act.pm1a_ioport_cap).is_err()
@@ -115,10 +130,13 @@ pub fn shutdown(self_thread: u32, act: &Actuator)
             options(nomem, nostack),
         );
     }
-    halt();
+    crate::await_reset("shutdown");
 }
 
-/// Best-effort reboot via the 8042 KBC reset pulse.
+/// Best-effort reboot via the 8042 KBC reset pulse. Does not return on
+/// success; on failure, including a pulse the platform does not act on
+/// within [`crate::await_reset`]'s grace, logs and returns so the caller can
+/// reply with an error.
 pub fn reboot(self_thread: u32, act: &Actuator)
 {
     /// 8042 keyboard-controller command port (legacy CPU reset path).
@@ -141,20 +159,7 @@ pub fn reboot(self_thread: u32, act: &Actuator)
             options(nomem, nostack),
         );
     }
-    halt();
-}
-
-/// Halt after issuing a reset/poweroff write so no further output races
-/// the platform powering off.
-fn halt() -> !
-{
-    loop
-    {
-        // SAFETY: `pause` is non-privileged.
-        unsafe {
-            core::arch::asm!("pause", options(nomem, nostack));
-        }
-    }
+    crate::await_reset("reboot");
 }
 
 // ── devmgr ACPI-table acquisition ───────────────────────────────────────────
@@ -190,15 +195,26 @@ fn query_acpi_table(registry: u32, sig: u64, phys: u64, ipc_buf: *mut u64) -> Op
     })
 }
 
-/// Map the region behind a [`TableView`] read-only, hand the table's
-/// virtual address to `f`, then unmap, unreserve, and release the Memory cap
-/// cap. The cap is devmgr's to own; pwrmgr drops its copy after reading.
+/// Map the region behind a [`TableView`] read-only, hand `f` the bytes from
+/// the table's first byte to the end of the mapping, then unmap, unreserve,
+/// and release the Memory cap. The cap is devmgr's to own; pwrmgr drops its
+/// copy after reading, on every path.
+///
+/// `f` sees only the mapped extent, so a firmware length field it reads is
+/// checked against what is actually mapped. Returns `None` when the
+/// reservation or the mapping fails, when the table does not start inside
+/// the mapped region, or when `f` does.
 fn with_table_mapped<F, R>(self_aspace: u32, view: &TableView, f: F) -> Option<R>
 where
-    F: FnOnce(u64) -> Option<R>,
+    F: FnOnce(&[u8]) -> Option<R>,
 {
     let pages = pages_for(view.region_base, view.region_size);
-    let range = reserve_pages(pages).ok()?;
+    let Ok(range) = reserve_pages(pages)
+    else
+    {
+        let _ = syscall::cap_delete(view.memory_cap);
+        return None;
+    };
     let map_vaddr = range.va_start();
     let mapped = syscall::mem_map(
         view.memory_cap,
@@ -210,12 +226,19 @@ where
     );
     let out = if mapped.is_ok()
     {
-        // The memory cap maps from the page containing `region_base`; the table
-        // sits at `table_phys` within it.
-        let table_vaddr = map_vaddr + (view.table_phys - (view.region_base & !0xFFF));
-        let r = f(table_vaddr);
+        let out = table_extent(pages, view).and_then(|(offset, len)| {
+            // SAFETY: `map_vaddr` starts a read-only mapping of `pages`
+            // pages, in place until the `mem_unmap` below; `table_extent`
+            // bounds `[map_vaddr + offset, + len)` inside it, and `u8` has no
+            // alignment requirement. `f` takes the slice for any lifetime and
+            // its result `R` cannot borrow from it, so no reference to the
+            // bytes outlives the mapping.
+            let bytes =
+                unsafe { core::slice::from_raw_parts((map_vaddr + offset) as *const u8, len) };
+            f(bytes)
+        });
         let _ = syscall::mem_unmap(self_aspace, map_vaddr, pages);
-        r
+        out
     }
     else
     {
@@ -226,126 +249,27 @@ where
     out
 }
 
-/// Read `(PM1a_CNT_BLK, dsdt_phys)` from a mapped FADT.
-fn read_fadt_fields(table_vaddr: u64) -> (u16, u64)
+/// Offset of `view`'s table within a `pages`-page mapping of its region,
+/// and the number of mapped bytes from there to the mapping's end; `None`
+/// when the table does not start inside the mapping.
+///
+/// The Memory cap maps from the page containing `region_base`; the table
+/// sits at `table_phys` within that span.
+fn table_extent(pages: u64, view: &TableView) -> Option<(u64, usize)>
 {
-    // SAFETY: `table_vaddr` is in a region mapped read-only and sized to
-    // hold a full ACPI table header (FADT minimum is 244 bytes).
-    let pm1a = unsafe { read_u32_at(table_vaddr, FADT_OFF_PM1A_CNT_BLK) } as u16;
-    // SAFETY: same mapping.
-    let dsdt32 = unsafe { read_u32_at(table_vaddr, FADT_OFF_DSDT) };
-    // SAFETY: same mapping; X_DSDT at offset 140 fits inside a 244-byte FADT.
-    let dsdt64 = unsafe { read_u64_at(table_vaddr, FADT_OFF_X_DSDT) };
-    let dsdt_phys = if dsdt64 != 0
+    let mapped_len = pages.checked_mul(PAGE_SIZE)?;
+    let offset = view
+        .table_phys
+        .checked_sub(view.region_base & !(PAGE_SIZE - 1))?;
+    if offset >= mapped_len
     {
-        dsdt64
+        return None;
     }
-    else
-    {
-        u64::from(dsdt32)
-    };
-    (pm1a, dsdt_phys)
+    let len = usize::try_from(mapped_len - offset).ok()?;
+    Some((offset, len))
 }
 
 fn pages_for(phys: u64, size: u64) -> u64
 {
     ((phys & 0xFFF) + size).div_ceil(0x1000).max(1)
-}
-
-// ── DSDT scanning ───────────────────────────────────────────────────────────
-
-/// Scan the DSDT for the `\_S5_` AML object and extract `SLP_TYPa`.
-fn scan_dsdt_for_s5(dsdt_data: u64, dsdt_len: usize) -> Option<u16>
-{
-    if dsdt_len < 40
-    {
-        return None;
-    }
-    let s5_sig: [u8; 4] = [0x5F, 0x53, 0x35, 0x5F]; // "_S5_"
-    // SAFETY: `dsdt_data` is mapped for `dsdt_len` bytes.
-    let dsdt = unsafe { core::slice::from_raw_parts(dsdt_data as *const u8, dsdt_len) };
-
-    for i in 36..dsdt_len.saturating_sub(4)
-    {
-        if dsdt[i..i + 4] != s5_sig
-        {
-            continue;
-        }
-        // Encoding: [NameOp(0x08)] _S5_ PackageOp(0x12) PkgLength NumElements elem0...
-        let pkg_start = i + 4;
-        if pkg_start >= dsdt_len || dsdt[pkg_start] != 0x12
-        {
-            continue;
-        }
-        let pkg_len_start = pkg_start + 1;
-        if pkg_len_start >= dsdt_len
-        {
-            return None;
-        }
-        // PkgLength: lead byte bits [7:6] encode follow-byte count.
-        let lead = dsdt[pkg_len_start];
-        let follow_bytes = (lead >> 6) as usize;
-        let num_elements_off = pkg_len_start + 1 + follow_bytes;
-        if num_elements_off >= dsdt_len
-        {
-            return None;
-        }
-        // Skip NumElements, read first element (`SLP_TYPa`).
-        let first = num_elements_off + 1;
-        if first >= dsdt_len
-        {
-            return None;
-        }
-        return match dsdt[first]
-        {
-            0x0A if first + 1 < dsdt_len => Some(u16::from(dsdt[first + 1])),
-            0x0B if first + 2 < dsdt_len =>
-            {
-                Some(u16::from_le_bytes([dsdt[first + 1], dsdt[first + 2]]))
-            }
-            0x00 => Some(0),
-            0x01 => Some(1),
-            _ => None,
-        };
-    }
-    None
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Read a little-endian u32 at byte offset `off` from virtual address
-/// `vaddr`.
-///
-/// # Safety
-/// `vaddr` must be mapped and valid for at least `off + 4` bytes.
-unsafe fn read_u32_at(vaddr: u64, off: usize) -> u32
-{
-    // SAFETY: caller guarantees the read is in-bounds of a mapped region.
-    let p = unsafe { (vaddr as *const u8).add(off) };
-    // SAFETY: reading 4 consecutive bytes from a valid mapped address.
-    u32::from_le_bytes(unsafe { [*p, *p.add(1), *p.add(2), *p.add(3)] })
-}
-
-/// Read a little-endian u64 at byte offset `off` from virtual address
-/// `vaddr`.
-///
-/// # Safety
-/// `vaddr` must be mapped and valid for at least `off + 8` bytes.
-unsafe fn read_u64_at(vaddr: u64, off: usize) -> u64
-{
-    // SAFETY: caller guarantees the read is in-bounds of a mapped region.
-    let p = unsafe { (vaddr as *const u8).add(off) };
-    // SAFETY: reading 8 consecutive bytes from a valid mapped address.
-    u64::from_le_bytes(unsafe {
-        [
-            *p,
-            *p.add(1),
-            *p.add(2),
-            *p.add(3),
-            *p.add(4),
-            *p.add(5),
-            *p.add(6),
-            *p.add(7),
-        ]
-    })
 }

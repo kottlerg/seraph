@@ -10,10 +10,11 @@ Userspace power manager. Owns the platform shutdown and reboot path.
 pwrmgr/
 ├── Cargo.toml
 ├── README.md
+├── acpi/             # `pwrmgr-acpi` crate: pure host-tested FADT / DSDT parser
 └── src/
     ├── main.rs       # Entry, bootstrap, IPC dispatch loop, cap-gating
     ├── caps.rs       # svcmgr bootstrap + devmgr-query acquisition
-    ├── x86_64.rs     # ACPI S5 walk + PM1a write; 8042 KBC reboot
+    ├── x86_64.rs     # ACPI table mapping, PM1a S5 write; 8042 KBC reboot
     └── riscv64.rs    # SBI SRST shutdown + cold reboot
 ```
 
@@ -42,7 +43,9 @@ It exposes a small IPC surface (`shared/ipc/src/lib.rs::pwrmgr_labels`):
 
 - `SHUTDOWN` — power off the platform (ACPI S5 on x86-64, SBI SRST type 0
   on RISC-V). On the success path the platform powers off and no reply is
-  delivered. A reply only arrives on rejection or hardware-failure paths.
+  delivered. A reply only arrives on rejection or hardware-failure paths,
+  including a request the platform has not acted on one second after it
+  was issued.
 - `REBOOT` — cold reboot the platform (8042 KBC reset on x86-64, SBI SRST
   type 1 on RISC-V).
 

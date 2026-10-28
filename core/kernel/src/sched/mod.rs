@@ -4522,7 +4522,7 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
     };
 
     // SAFETY: both locks held; tcb is valid.
-    let linked = sched.enqueue(tcb, priority);
+    let linked = unsafe { sched.enqueue(tcb, priority) };
     if linked
     {
         // Retarget preferred_cpu only when this call created the link, so the

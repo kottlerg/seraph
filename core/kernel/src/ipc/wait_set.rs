@@ -262,7 +262,8 @@ impl WaitSetState
             let idx = self.ready_ring[self.ready_head as usize] as usize;
             // cast_possible_truncation: WAIT_SET_MAX_MEMBERS (16) fits in u8.
             #[allow(clippy::cast_possible_truncation)]
-            self.ready_head = (self.ready_head + 1) % WAIT_SET_MAX_MEMBERS as u8;
+            let next = (self.ready_head + 1) % WAIT_SET_MAX_MEMBERS as u8;
+            self.ready_head = next;
             let m = &self.members[idx];
             if m.is_occupied()
             {

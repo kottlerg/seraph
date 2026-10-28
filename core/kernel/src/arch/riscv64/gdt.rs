@@ -11,12 +11,9 @@
 //!
 //! `tss_ptr` in `PerCpuData` is unused on RISC-V; this returns 0.
 
-/// I/O Permission Bitmap size. Zero on RISC-V (no I/O port space).
-// dead_code: part of the shared arch surface; on riscv64 `gdt::IOPB_SIZE`
-// is referenced only by `syscall::hw::sys_ioport_bind` (non-test builds,
-// unreachable past its `HAS_IO_PORTS` gate) and by the IOPB stub
-// signatures in this file.
-#[allow(dead_code)]
+/// I/O Permission Bitmap size. Zero on RISC-V (no I/O port space): it types
+/// the `ThreadControlBlock::iopb` pointer (`*mut [u8; IOPB_SIZE]`) uniformly
+/// across arches, and RISC-V threads always leave that pointer null.
 pub const IOPB_SIZE: usize = 0;
 
 /// Return the BSP TSS pointer. On RISC-V this is always 0 — there is no TSS.

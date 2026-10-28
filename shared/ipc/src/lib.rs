@@ -1372,15 +1372,15 @@ pub mod fs_labels
     pub const FS_TRUNCATE: u64 = 17;
 }
 
-pub const DEVMGR_LABELS_VERSION: u32 = 8;
+pub const DEVMGR_LABELS_VERSION: u32 = 9;
 /// IPC labels for the device manager (`devmgr`).
 pub mod devmgr_labels
 {
     /// Query for a block device endpoint.
     ///
-    /// Mints a `MOUNT_AUTHORITY`-badged `SEND_GRANT` cap on
+    /// Mints a `MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` cap on
     /// `blk_ep` to the caller. Caller's badge must have
-    /// [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies
+    /// [`BLOCK_DEVICE_AUTHORITY`] set; the handler replies
     /// `UNAUTHORIZED` otherwise.
     pub const QUERY_BLOCK_DEVICE: u64 = 1;
     /// Query a device's startup-info payload from devmgr's catalog.
@@ -1400,11 +1400,12 @@ pub mod devmgr_labels
     pub const QUERY_DEVICE_INFO: u64 = 2;
     /// Query for the serial (UART) device endpoint.
     ///
-    /// Mints a `serial_labels::WRITE_AUTHORITY`-badged `SEND_GRANT`
-    /// cap on the serial driver's service endpoint to the caller.
+    /// Mints a `serial_labels::WRITE_AUTHORITY |
+    /// serial_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap on the
+    /// serial driver's service endpoint to the caller.
     /// Caller's badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the
     /// handler replies `UNAUTHORIZED` otherwise. Mirrors
-    /// [`QUERY_BLOCK_DEVICE`].
+    /// [`QUERY_BLOCK_DEVICE`]'s reply shape.
     pub const QUERY_SERIAL_DEVICE: u64 = 3;
     /// Query for the framebuffer device endpoint.
     ///
@@ -1486,7 +1487,10 @@ pub mod devmgr_labels
     /// table — never a table body. Replies
     /// [`super::devmgr_errors::NO_DEVICE`] when the table is not found,
     /// both `data[1]` and `data[2]` are zero, or `data[1]` has bits above
-    /// its low 32.
+    /// its low 32, [`super::devmgr_errors::INVALID_REQUEST`] when deriving
+    /// the reply's Memory cap from the region fails, and
+    /// [`super::devmgr_errors::LABEL_VERSION_MISMATCH`] when `data[0]` is
+    /// not `DEVMGR_LABELS_VERSION`.
     pub const QUERY_ACPI_TABLE: u64 = 7;
 
     /// Carve and serve the platform shutdown-actuator hardware caps.
@@ -1552,11 +1556,14 @@ pub mod devmgr_labels
     pub const TEST_ORPHAN_RESULT: u64 = 10;
 
     /// Authority bit in the devmgr-registry-endpoint badge's high
-    /// u64 bit. Set on caps minted for consumers permitted to call
-    /// [`QUERY_BLOCK_DEVICE`] (today: vfsd). Without it the handler
-    /// replies `UNAUTHORIZED`. Gating `QUERY_BLOCK_DEVICE` upstream of
-    /// virtio-blk closes the minter-side surface: `MOUNT_AUTHORITY`
-    /// caps are never issued to consumers devmgr did not authorise.
+    /// u64 bit, gating the device-endpoint queries ([`QUERY_SERIAL_DEVICE`],
+    /// [`QUERY_FRAMEBUFFER_DEVICE`], [`QUERY_RTC_DEVICE`],
+    /// [`QUERY_INPUT_DEVICE`]) and [`QUERY_ACPI_TABLE`]. Set on every
+    /// consumer query cap: svcmgr's `devmgr.*` publications, the SEND
+    /// svcmgr mints for logd at launch, and the SEND init hands vfsd (the
+    /// per-device SENDs drivers hold for [`QUERY_DEVICE_INFO`] lack it).
+    /// Without it those handlers reply `UNAUTHORIZED`. It does not admit
+    /// [`QUERY_BLOCK_DEVICE`], which [`BLOCK_DEVICE_AUTHORITY`] gates.
     pub const REGISTRY_QUERY_AUTHORITY: u64 = 1u64 << 63;
     /// Authority bit gating [`SET_DRIVERS_DIR`]. svcmgr mints a SEND
     /// cap carrying this bit from the devmgr-registry source cap init
@@ -1578,6 +1585,14 @@ pub mod devmgr_labels
     /// seed-only as [`crate::published_names::DEVMGR_TEST`], which svctest
     /// alone seeds. Disjoint position from the other authority bits.
     pub const ORPHAN_TEST_AUTHORITY: u64 = 1u64 << 60;
+    /// Authority bit gating [`QUERY_BLOCK_DEVICE`], whose reply is a
+    /// `MOUNT_AUTHORITY`-badged whole-disk cap. init mints it, beside
+    /// [`REGISTRY_QUERY_AUTHORITY`], only onto the registry SEND it hands
+    /// vfsd; svcmgr mints it onto none of its `devmgr.*` publications, so
+    /// no other process holds the bit. Gating upstream of virtio-blk keeps
+    /// `MOUNT_AUTHORITY` caps with the one consumer devmgr authorises.
+    /// Disjoint position from the other authority bits.
+    pub const BLOCK_DEVICE_AUTHORITY: u64 = 1u64 << 59;
 }
 
 /// Device-info kind discriminants for [`devmgr_labels::QUERY_DEVICE_INFO`]
@@ -1977,10 +1992,12 @@ pub mod stream_labels
 /// (docs/capability-model.md § Verb-bit authority pattern). Endpoints with no
 /// verb gate (bootstrap endpoints, memmgr, namespace node caps) do not
 /// reserve them.
-pub const VERB_BIT_MASK: u64 = (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60);
+pub const VERB_BIT_MASK: u64 =
+    (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60) | (1u64 << 59);
 const _: () = core::assert!(
     devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::ORPHAN_TEST_AUTHORITY & VERB_BIT_MASK != 0
+        && devmgr_labels::BLOCK_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
 );
 
 /// Reserved log-endpoint badges.
@@ -2227,7 +2244,7 @@ pub mod devmgr_errors
     /// Cap derivation failed, or invalid device index.
     pub const INVALID_REQUEST: u64 = 1;
     /// Caller's badge lacks the verb bit required by the handler
-    /// (e.g. `REGISTRY_QUERY_AUTHORITY` for `QUERY_BLOCK_DEVICE`).
+    /// (e.g. `BLOCK_DEVICE_AUTHORITY` for `QUERY_BLOCK_DEVICE`).
     pub const UNAUTHORIZED: u64 = 2;
     /// Caller's compiled `DEVMGR_LABELS_VERSION` does not match the receiver's.
     /// `QUERY_BLOCK_DEVICE` is the handshake entry point and carries the

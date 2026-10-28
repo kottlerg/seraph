@@ -804,14 +804,16 @@ pub fn create_vfsd_with_caps(
     {
         return None;
     };
-    // vfsd is the sole devmgr `QUERY_BLOCK_DEVICE` consumer today;
-    // tag its SEND with `REGISTRY_QUERY_AUTHORITY`, as every devmgr
-    // registry cap svcmgr publishes is, so devmgr's upstream gate admits
-    // the call. An unbadged copy is rejected at devmgr.
+    // vfsd is the sole devmgr `QUERY_BLOCK_DEVICE` consumer, and this is
+    // the only registry cap carrying `BLOCK_DEVICE_AUTHORITY`, the bit
+    // devmgr's gate on that label requires: the reply is whole-disk
+    // authority, which no svcmgr-published registry cap may obtain.
+    // `REGISTRY_QUERY_AUTHORITY` rides beside it, as on every consumer query
+    // cap.
     let Ok(registry_copy) = syscall::cap_derive_badge(
         spawn.registry_ep,
         syscall::RIGHTS_EP_SEND,
-        ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
+        ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY | ipc::devmgr_labels::BLOCK_DEVICE_AUTHORITY,
     )
     else
     {

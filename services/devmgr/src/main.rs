@@ -246,10 +246,14 @@ fn main() -> !
         {
             ipc::devmgr_labels::QUERY_BLOCK_DEVICE =>
             {
-                if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+                // The reply is whole-disk authority, so the gate is
+                // BLOCK_DEVICE_AUTHORITY, which only vfsd's init-minted
+                // registry cap carries, not the REGISTRY_QUERY_AUTHORITY
+                // every svcmgr-published registry cap carries.
+                if badge & ipc::devmgr_labels::BLOCK_DEVICE_AUTHORITY == 0
                 {
                     std::os::seraph::log!(
-                        "QUERY_BLOCK_DEVICE rejected: badge lacks REGISTRY_QUERY_AUTHORITY"
+                        "QUERY_BLOCK_DEVICE rejected: badge lacks BLOCK_DEVICE_AUTHORITY"
                     );
                     let reply = IpcMessage::new(ipc::devmgr_errors::UNAUTHORIZED);
                     // SAFETY: ipc_buf is the registered IPC buffer.

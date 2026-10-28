@@ -209,9 +209,9 @@ the CI widths check are unchanged, and multiplied past it by the oversubscriptio
 implies (CPUs / 16), by which each cross-CPU handoff slows, so the bound still separates a slow
 step from a stuck or wrong one. They are the report bound of `tally::await_report` and
 `tally::await_all`; the round bounds of `configure_start_race` and `stop_target_vanishes`; the
-acknowledgement, result, approach, sync, entry and CPU-report bounds of `stop_claimed_delete`,
-`stop_park_race`, `stop_fault_sender`, `timed_wait_reuse` and `priority_dealloc_race`; the
-preemption budget of `integration::priority_preemption`; the expiry and report bounds of
+acknowledgement, result, approach, sync and entry bounds of `stop_claimed_delete`,
+`stop_park_race`, `stop_fault_sender` and `timed_wait_reuse`; the preemption budget of
+`integration::priority_preemption`; the expiry and report bounds of
 `integration::queued_waiters_fifo`; and the migration polls of `thread::affinity_migrate_running`.
 Every other bound applies as written.
 

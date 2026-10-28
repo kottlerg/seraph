@@ -364,6 +364,12 @@ const ICR_NMI: u32 = 0x0000_4400;
 /// destination in the high dword. Callers serialise with [`wait_icr_idle`]
 /// (a no-op in x2APIC, which has no delivery-status bit).
 ///
+/// The caller's earlier stores (a shootdown request, the NMI-backtrace count)
+/// are visible to the target before the IPI arrives: the x2APIC MSR write is not
+/// serializing, so this function fences first ([`cpu::x2apic_wrmsr_fence`]),
+/// and in xAPIC mode the uncacheable MMIO store to the ICR is ordered after
+/// earlier stores already.
+///
 /// # Safety
 /// Ring 0; `dest` must be a valid APIC ID and `cmd` a valid ICR command word.
 #[cfg(not(test))]
@@ -371,12 +377,7 @@ unsafe fn apic_send_icr(dest: u32, cmd: u32)
 {
     if x2apic_enabled()
     {
-        // A WRMSR to an x2APIC register is not serializing (Intel SDM Vol. 3A
-        // § 11.12.3), so without this fence the IPI can reach its target before
-        // the caller's preceding request stores (a shootdown request, the
-        // NMI-backtrace count) are visible there.
-        // SAFETY: the fences only order memory accesses; no state changes.
-        unsafe { core::arch::asm!("mfence", "lfence", options(nostack, preserves_flags)) };
+        cpu::x2apic_wrmsr_fence();
         // SAFETY: IA32_X2APIC_ICR is writable in x2APIC mode; ring 0.
         unsafe { cpu::write_msr(IA32_X2APIC_ICR, (u64::from(dest) << 32) | u64::from(cmd)) };
         return;

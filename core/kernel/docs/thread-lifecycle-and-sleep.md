@@ -786,9 +786,10 @@ The handler then drains the target.
    interrupts disabled would block an inbound TLB-shootdown IPI targeted at this CPU and deadlock
    it. The spin terminates as soon as the remote deschedules the target and publishes its save, or
    an object teardown commits `Exited` over it (a start cannot commit while the target is `current`
-   anywhere). A target left `current` on a CPU that `fatal` halted is never descheduled, so a stop
-   of it returns only once a teardown commits `Exited` over it, and that teardown's drain scan
-   never ends ([invariant 3](#dealloc_objectthread-drain-protocol)).
+   anywhere). A target left `current` on a CPU that `fatal` halted is never descheduled, so the
+   drain ends only once a teardown commits `Exited` over it (a restarted stopper whose slot no
+   longer names the target leaves it without the drain, per invariant 1 below), and that
+   teardown's drain scan never ends ([invariant 3](#dealloc_objectthread-drain-protocol)).
 4. **A restart waits out an owed wake.** A waker that claimed the stopped park may still be between
    its claim and its `enqueue_and_wake`. Each pass of `sys_thread_start`'s settle loop
    (`start_under_all_locks`) reads `wake_in_flight` under the target's `sched_lock` (ordered after

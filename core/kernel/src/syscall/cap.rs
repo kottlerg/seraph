@@ -258,9 +258,9 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_CAP_CREATE_NOTIFICATION` (8): retype a Memory cap into a new Notification.
 ///
-/// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked). The Memory cap MUST
-/// carry `MemRights::RETYPE` and have at least `dispatch_for(Notification, 0).raw_bytes`
-/// of `available_bytes`.
+/// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked). The
+/// Memory cap MUST carry `MemRights::RETYPE` and have at least
+/// `dispatch_for(Notification, 0).raw_bytes` of `available_bytes`.
 ///
 /// On success, the wrapper + `NotificationState` are constructed in place inside
 /// the source Memory cap's region; a cap with `NOTIFY | WAIT` rights is
@@ -366,9 +366,11 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 /// `SYS_CAP_CREATE_ASPACE` (11): create a new `AddressSpace` object, or
 /// augment an existing one's PT growth budget.
 ///
-/// arg0 = source Memory-cap slot (must carry `MemRights::RETYPE`, with at least
-///        `init_pages * PAGE_SIZE` available bytes).
-/// arg1 = augment-target `AddressSpace` cap slot, or `0` to create new.
+/// arg0 = source Memory capability handle (generation-checked; must carry
+///        `MemRights::RETYPE`, with at least `init_pages * PAGE_SIZE` available
+///        bytes).
+/// arg1 = augment-target `AddressSpace` capability handle (generation-checked), or
+///        `0` to create new.
 /// arg2 = `init_pages`: number of PT pages to carve from the Memory cap.
 ///        Create-mode requires `init_pages >= 2` (one wrapper page + one
 ///        root PT page; the remainder seed the PT growth pool).
@@ -623,8 +625,10 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_CAP_CREATE_CSPACE` (12): retype a Memory cap into a new `CSpace`,
 /// or augment an existing one's slot-page growth budget.
 ///
-/// arg0 = source Memory-cap slot (must carry `MemRights::RETYPE`).
-/// arg1 = augment-target `CSpace` cap slot, or `0` to create new.
+/// arg0 = source Memory capability handle (generation-checked; must carry
+///        `MemRights::RETYPE`).
+/// arg1 = augment-target `CSpace` capability handle (generation-checked), or `0` to
+///        create new.
 /// arg2 = `init_pages`: number of pages to carve from the Memory cap.
 ///        Create-mode requires `init_pages >= 1` (one wrapper page; the
 ///        remainder seed the slot-page pool — `init_pages == 1` yields an
@@ -897,7 +901,8 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_CAP_CREATE_THREAD` (10): create a new Thread object.
 ///
-/// arg0 = Memory capability handle (generation-checked; must have RETYPE); supplies the 6-page Thread slot.
+/// arg0 = Memory capability handle (generation-checked; must have RETYPE);
+///        supplies the 6-page Thread slot.
 /// arg1 = `AddressSpace` capability handle (generation-checked; must have MAP).
 /// arg2 = `CSpace` capability handle (generation-checked; must have INSERT).
 /// arg3 = `SchedControl` capability handle (generation-checked), or 0.
@@ -2270,7 +2275,8 @@ fn dealloc_revoked(snapshot: &[Option<core::ptr::NonNull<crate::cap::object::Ker
 /// `SYS_CAP_MOVE` (25): move a capability to another `CSpace`.
 ///
 /// arg0 = source cap handle (caller's `CSpace`).
-/// arg1 = destination `CSpace` cap index (must have INSERT right).
+/// arg1 = destination `CSpace` capability handle (generation-checked; must have
+///        INSERT right).
 /// arg2 = destination slot index in the target `CSpace`, or 0 to auto-allocate.
 ///
 /// The source slot is cleared and the capability (with its full derivation
@@ -2408,7 +2414,8 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_CAP_CREATE_EVENT_Q` (9): retype a Memory cap into a new `EventQueue`.
 ///
-/// arg0 = Memory-cap slot (must carry `MemRights::RETYPE`).
+/// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked;
+///        must carry `MemRights::RETYPE`).
 /// arg1 = capacity (`1..=EVENT_QUEUE_MAX_CAPACITY`).
 ///
 /// Constructs the `EventQueueObject` wrapper, its `EventQueueState`, and the
@@ -2528,7 +2535,8 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
 
 /// `SYS_CAP_CREATE_WAIT_SET` (13): retype a Memory cap into a new `WaitSet`.
 ///
-/// arg0 = Memory-cap slot. The Memory cap MUST carry `MemRights::RETYPE` and have
+/// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked).
+/// The Memory cap MUST carry `MemRights::RETYPE` and have
 /// at least `dispatch_for(WaitSet, 0).raw_bytes` of `available_bytes`.
 #[cfg(not(test))]
 pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>

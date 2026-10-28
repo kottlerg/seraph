@@ -837,7 +837,8 @@ Revoke all capabilities derived from a capability, across all processes.
 Every descendant in the derivation tree is invalidated; the target capability
 itself is preserved. Underlying kernel objects are not freed unless a revoked
 capability was the last reference (see
-[capability-model.md](../../../docs/capability-model.md) § Revocation). While the
+[capability-model.md](../../../docs/capability-model.md) § Revocation); such a teardown can fail
+to complete as `SYS_CAP_DELETE` describes for a thread left on a halted CPU. While the
 revoke is in flight, `SYS_CAP_DELETE`, `SYS_CAP_MOVE`, `SYS_CAP_COPY`,
 `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`,
 and the range splits on the target slot (and IPC transfer of it) are refused with
@@ -872,8 +873,11 @@ threads never outlive either object (see [scheduling-internals.md](scheduling-in
 Registry). **The stop includes the caller**: a thread deleting the last capability to its own
 `CSpace` or `AddressSpace` — directly, or because the deleted object's teardown cascades into it —
 is stopped by that delete and the call does not return; the object is reclaimed once the thread is
-off its CPU. This path has known kernel memory-safety gaps, tracked in
-[#501](https://github.com/kottlerg/seraph/issues/501) and
+off its CPU. A teardown of a Thread left `current` on a CPU that `fatal` halted, or of a `CSpace`
+or `AddressSpace` with such a thread bound, never completes, so the call does not return (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
+§ `dealloc_object(Thread)` Drain Protocol, invariant 3). This path has known kernel memory-safety
+gaps, tracked in [#501](https://github.com/kottlerg/seraph/issues/501) and
 [#502](https://github.com/kottlerg/seraph/issues/502) (see
 [capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage: Hybrid
 Two-Level Radix and
@@ -1258,8 +1262,8 @@ thread running on another CPU is marked `Stopped` under every CPU's scheduler lo
 returns once that CPU has descheduled it and published its register save, at its next slice expiry
 or the thread's own park or yield, or once an object teardown has committed `Exited` over it; the
 inter-processor interrupt sent to that CPU only forces a trap. A thread left `current` on a CPU that
-`fatal` halted is never descheduled: a stop of it returns only once a teardown commits `Exited`
-over it, and that teardown never completes (see
+`fatal` halted is never descheduled: a stop of it does not return through the drain until a
+teardown commits `Exited` over it, and that teardown never completes (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
 § `dealloc_object(Thread)` Drain Protocol, invariant 3). A caller that is itself stopped while
 it waits deschedules in place; once restarted it re-resolves `thread_cap`, and its call completes

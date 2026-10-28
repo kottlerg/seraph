@@ -1088,9 +1088,11 @@ once an earlier ping's NMI has taken its request. `apic_send_icr` fences before 
 write, which is not serializing, so the increment is visible to the target before the NMI arrives.
 The count errs toward the ping: a hardware NMI that arrives while a request is pending takes it and
 is dumped and resumed, and the ping NMI that follows then finds none and halts the CPU, so the
-hardware NMI still ends in `fatal`, one NMI late and on the ping's frame; a ping NMI the CPU drops
-(one NMI is latched while the handler runs; further ones are lost, Intel SDM Vol. 3A § 6.7.1) leaves
-a request that the next NMI, of either kind, takes.
+hardware NMI still ends in `fatal`, one NMI late and on the ping's frame, unless a concurrent ping
+is dropped meanwhile, in which case the latched ping takes the remaining request and the hardware
+NMI is dumped and resumed; a ping NMI the CPU drops (one NMI is latched while the handler runs;
+further ones are lost, Intel SDM Vol. 3A § 6.7.1) leaves a request that the next NMI, of either
+kind, takes.
 
 NMI is not APIC-EOI'd; the handler does not call `acknowledge()`.
 
@@ -1543,6 +1545,7 @@ adds one lock acquire at thread create/destroy and a walk per `CSpace` or
 [Architecture Abstraction Layer](arch-interface.md),
 [Capability Subsystem Internals](capability-internals.md),
 [Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
+[Kernel Initialization Sequence](initialization.md),
 [IPC Subsystem Internals](ipc-internals.md),
 [SMP Scheduler/IPC Hotpath Redesign — per-TCB `sched_lock` (authoritative serializer)](sched-ipc-redesign.md),
 [Scheduler Internals](scheduler.md), [Syscall Interface Specification](syscalls.md),

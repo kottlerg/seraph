@@ -97,6 +97,24 @@ pub unsafe fn read_msr(msr: u32) -> u64
     (u64::from(hi) << 32) | u64::from(lo)
 }
 
+/// Order every earlier memory access ahead of a following x2APIC MSR write.
+///
+/// A WRMSR to an x2APIC register is not serializing (Intel SDM Vol. 3A
+/// § 11.12.3), so an IPI sent through the x2APIC ICR can reach its target
+/// before this CPU's earlier stores are visible there; `mfence; lfence`
+/// ahead of the write closes that gap.
+#[cfg(not(test))]
+pub fn x2apic_wrmsr_fence()
+{
+    // SAFETY: `mfence; lfence` order memory accesses and instruction execution
+    // only; they clobber no register or flag and need only SSE2, which every
+    // x86-64 CPU has. Without `nomem` the compiler also keeps earlier memory
+    // accesses ahead of the block.
+    unsafe {
+        core::arch::asm!("mfence", "lfence", options(nostack, preserves_flags));
+    }
+}
+
 /// Write `val` to model-specific register `msr`.
 ///
 /// # Safety

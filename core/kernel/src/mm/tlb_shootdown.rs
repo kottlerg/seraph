@@ -40,7 +40,10 @@
 //!
 //! - **Release** on the `root_phys`/`flush_va`/`pending_cpus` stores, followed
 //!   by a `SeqCst` fence, ensures remote CPUs see the request before the IPI
-//!   arrives (the SBI ecall that delivers a RISC-V IPI is not itself a fence).
+//!   arrives on RISC-V (the SBI ecall that delivers the IPI is not itself a
+//!   fence). On x86-64 that ordering comes from the IPI send:
+//!   `apic_send_icr` fences ahead of the non-serializing x2APIC ICR write, and
+//!   the xAPIC ICR is an uncacheable MMIO store ordered after earlier stores.
 //! - **Acquire** on a slot's `pending_cpus` (the handler's bit test, the
 //!   initiator's emptiness poll) pairs with that Release, so a CPU that sees its
 //!   bit also sees the matching root and VA.
@@ -291,8 +294,9 @@ pub unsafe fn shootdown_range(root_phys: u64, cpus: &CpuMask, virt: u64, pages: 
     let req = &TLB_REQUESTS[me];
 
     // Publish the request. Release ordering pairs with the Acquire bit test in
-    // service_shootdowns; the SeqCst fence below makes the stores globally
-    // visible before the IPI.
+    // service_shootdowns; the stores are globally visible before the IPI by
+    // the SeqCst fence below on RISC-V and by `apic_send_icr`'s ordering on
+    // x86-64.
     req.root_phys.store(root_phys, Ordering::Release);
     req.flush_va.store(virt, Ordering::Release);
     req.page_count.store(pages.max(1), Ordering::Release);
@@ -302,7 +306,9 @@ pub unsafe fn shootdown_range(root_phys: u64, cpus: &CpuMask, virt: u64, pages: 
     // Drain the store buffer so a remote handler cannot read a stale slot. On
     // RISC-V (RVWMO) the Release stores order this hart's writes but do not
     // force global visibility before the SBI ecall that sends the IPI (not a
-    // fence); the SeqCst fence does. On x86-64 (TSO) this is a no-op.
+    // fence); the SeqCst fence does. On x86-64 it is an `mfence`, but a WRMSR
+    // is not ordered by it alone; the x2APIC send path fences again itself
+    // (`apic_send_icr`).
     core::sync::atomic::fence(Ordering::SeqCst);
 
     // Helper: send IPIs to every CPU in `mask`.

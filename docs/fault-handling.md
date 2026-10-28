@@ -46,14 +46,15 @@ including register inspection and modification of a fault-blocked thread via
 no handler bound is still terminated, the behavior for all faults absent this mechanism. The
 x86-64 abort vectors (`#DF`, `#MC`) and a hardware NMI that finds no watchdog backtrace request
 pending (see
-[scheduling-internals.md](../core/kernel/docs/scheduling-internals.md#ipi_nmi_backtrace_stub--ipi_nmi_backtrace_handler))
+[scheduling-internals.md § `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`](../core/kernel/docs/scheduling-internals.md#ipi_nmi_backtrace_stub--ipi_nmi_backtrace_handler))
 are the exception: they are never delivered to a handler and never terminate a thread; they halt
 the CPU they arrive on, whatever ring they interrupt. The interrupted thread stays `current` on the
-halted CPU and no death event is posted for it; a teardown of it does not complete, a stop of it
-completes only once a teardown commits `Exited` over it, and the other CPUs run on until one needs
-the halted CPU (see
+halted CPU and no death event is posted for it; a teardown of it does not complete (see
 [thread-lifecycle-and-sleep.md § `dealloc_object(Thread)` Drain Protocol](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol),
-invariant 3).
+invariant 3), a stop of it does not return through its drain until a teardown commits `Exited`
+over it (see
+[§ `sys_thread_stop` Cross-CPU Stop Protocol](../core/kernel/docs/thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol),
+step 3), and the other CPUs run on until one needs the halted CPU.
 
 The demand-paging consumer is implemented: memmgr acts as the pager, procmgr binds it for
 every ordinary process it creates (demand paging is the default; a process opts out with the
@@ -94,12 +95,11 @@ own (e.g. an access to an unmapped page that is not a stale-TLB artifact), the k
 If the thread has **no** fault handler bound, the fault is terminal: the thread is killed with exit
 reason `EXIT_FAULT_BASE + <fault code>`, the behavior for all faults absent this mechanism. On
 x86-64, `#DF`, `#MC`, and a hardware NMI that finds no watchdog backtrace request pending are not
-the thread's faults: they are never delivered to a handler, record no exit reason, and halt the
-CPU they arrive on whatever ring they interrupt, leaving the interrupted thread `current` there
-with no death event posted. Voluntary exit codes
-occupy the disjoint range `[1, EXIT_FAULT_BASE)` below it (see
-[Process Lifecycle](process-lifecycle.md#exit-reason)), so a fault reason and a voluntary exit code
-can never alias; `ExitStatus::success()`/`code()` distinguish them without ambiguity.
+the thread's faults: they are never delivered to a handler, record no exit reason, and halt the CPU
+they arrive on whatever ring they interrupt, leaving the interrupted thread `current` there with no
+death event posted. Voluntary exit codes occupy the disjoint range `[1, EXIT_FAULT_BASE)` below it
+(see [Process Lifecycle](process-lifecycle.md#exit-reason)), so a fault reason and a voluntary exit
+code can never alias; `ExitStatus::success()`/`code()` distinguish them without ambiguity.
 
 Fault delivery reuses the synchronous IPC machinery of [IPC Design](ipc-design.md): the
 suspended thread occupies the same role as a caller blocked awaiting a reply, and the

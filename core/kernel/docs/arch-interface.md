@@ -302,7 +302,10 @@ Classification and § riscv64 Classification.
 `writable`, `executable`, and `uncacheable`. `readable` is meaningful only on RISC-V (x86-64
 has no read-disable bit); `uncacheable` selects the device memory type explicitly on both
 architectures — PCD|PWT (strong UC) on x86-64, Svpbmt PBMT=IO on RISC-V — so MMIO
-attributes do not depend on platform PMAs. W^X is enforced at the memory syscall layer
+attributes do not depend on platform PMAs. The kernel's own MMIO regions (the x86-64 xAPIC and
+I/O APIC pages) are the exception today: Phase 3 maps them write-back through the direct map,
+so their memory type comes from the firmware's MTRRs
+([#515](https://github.com/kottlerg/seraph/issues/515)). W^X is enforced at the memory syscall layer
 (`syscall::mem` map/protect reject a writable-and-executable request with
 `SyscallError::WxViolation`; see [syscalls.md](syscalls.md) § Memory Syscalls); the arch
 mapping primitives require the caller to have already validated W^X.

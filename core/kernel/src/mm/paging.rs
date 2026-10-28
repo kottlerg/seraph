@@ -503,6 +503,9 @@ pub fn init_kernel_page_tables(
         let page_mask = !(PAGE_SIZE as u64 - 1);
         let start = phys_base & page_mask;
         let end = (phys_base + size + PAGE_SIZE as u64 - 1) & page_mask;
+        // Write-back, like the large-page direct map that covers a region below
+        // the ceiling: the memory type of these device pages comes from the
+        // firmware's MTRRs (#515).
         let rw = PageFlags {
             readable: true,
             writable: true,

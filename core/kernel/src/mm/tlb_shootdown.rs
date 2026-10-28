@@ -43,7 +43,7 @@
 //!   arrives on RISC-V (the SBI ecall that delivers the IPI is not itself a
 //!   fence). On x86-64 that ordering comes from the IPI send:
 //!   `apic_send_icr` fences ahead of the non-serializing x2APIC ICR write, and
-//!   the xAPIC ICR is an uncacheable MMIO store ordered after earlier stores.
+//!   x86 store ordering keeps the xAPIC ICR store after earlier stores.
 //! - **Acquire** on a slot's `pending_cpus` (the handler's bit test, the
 //!   initiator's emptiness poll) pairs with that Release, so a CPU that sees its
 //!   bit also sees the matching root and VA.

@@ -2536,8 +2536,8 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
 /// `SYS_CAP_CREATE_WAIT_SET` (13): retype a Memory cap into a new `WaitSet`.
 ///
 /// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked).
-/// The Memory cap MUST carry `MemRights::RETYPE` and have
-/// at least `dispatch_for(WaitSet, 0).raw_bytes` of `available_bytes`.
+/// The Memory cap MUST carry `MemRights::RETYPE` and have at least
+/// `dispatch_for(WaitSet, 0).raw_bytes` of `available_bytes`.
 #[cfg(not(test))]
 pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {

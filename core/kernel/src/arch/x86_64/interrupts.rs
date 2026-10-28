@@ -367,8 +367,8 @@ const ICR_NMI: u32 = 0x0000_4400;
 /// The caller's earlier stores (a shootdown request, the NMI-backtrace count)
 /// are visible to the target before the IPI arrives: the x2APIC MSR write is not
 /// serializing, so this function fences first ([`cpu::x2apic_wrmsr_fence`]),
-/// and in xAPIC mode the uncacheable MMIO store to the ICR is ordered after
-/// earlier stores already.
+/// and in xAPIC mode the MMIO store to the ICR is ordered after earlier stores
+/// by x86 store ordering.
 ///
 /// # Safety
 /// Ring 0; `dest` must be a valid APIC ID and `cmd` a valid ICR command word.

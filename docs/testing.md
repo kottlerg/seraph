@@ -423,8 +423,8 @@ changed line that names one of these items as a whole identifier or lies within 
   `send_nmi_to`, `sbi_send_ipi_to`, `sbi_hart_mask`, `wait_for_ack`, `IpiWaitCtx`, the
   `IPI_VECTOR_*` constants, the x86_64 `ipi_*` stubs and handlers in `idt.rs`, the x86_64 ICR and
   x2APIC primitives and the mode and identity they set (`apic_send_icr`, `wait_icr_idle`,
-  `enable_x2apic_this_cpu`, `X2APIC_ENABLED`, `x2apic_supported`, `x2apic_enabled`, and
-  `lapic_id`), and the riscv64 `handle_software_interrupt`;
+  `enable_x2apic_this_cpu`, `X2APIC_ENABLED`, `x2apic_supported`, `x2apic_enabled`,
+  `x2apic_wrmsr_fence`, and `lapic_id`), and the riscv64 `handle_software_interrupt`;
 - the TLB-shootdown broadcast: `shootdown`, `shootdown_range`, `service_shootdowns`,
   `shootdown_remote`, and `needs_remote_shootdown`.
 
@@ -459,6 +459,7 @@ S="$S|sbi_hart_start|kernel_entry_ap|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdo
 S="$S|send_sipi|send_nmi_to|sbi_send_ipi_to|sbi_hart_mask|wait_for_ack|IpiWaitCtx"
 S="$S|IPI_VECTOR_[A-Z_]+|ipi_[a-z_]+_(stub|handler)|apic_send_icr|wait_icr_idle"
 S="$S|enable_x2apic_this_cpu|X2APIC_ENABLED|x2apic_supported|x2apic_enabled|lapic_id"
+S="$S|x2apic_wrmsr_fence"
 S="$S|handle_software_interrupt"
 S="$S|shootdown(_range|_remote)?|service_shootdowns|needs_remote_shootdown"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($S)\b"

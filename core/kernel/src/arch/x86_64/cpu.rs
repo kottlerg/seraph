@@ -5,10 +5,10 @@
 
 //! x86-64 CPU control primitives: CPUID, CR4 and MSR access, the fault-recoverable
 //! user-copy routine, SMEP/SMAP and PCID enablement, the boot-time baseline feature
-//! gate, per-CPU GS-base install and lookup, the kernel trap stack, and interrupt
-//! control and halt.
+//! gate, per-CPU GS-base install and lookup, the kernel trap stack, interrupt
+//! control and halt, and the fence ahead of an x2APIC MSR write.
 //!
-//! `current_stack_pointer`, the CR4/MSR accessors, `copy_user`, `user_copy_fixup`, the
+//! `current_stack_pointer`, the CR4/MSR accessors, `x2apic_wrmsr_fence`, `copy_user`, `user_copy_fixup`, the
 //! enable routines, `verify_baseline`, `install_percpu`, and the trap-stack and interrupt
 //! save/restore primitives are built only under `#[cfg(not(test))]` (`copy_user` and
 //! `verify_baseline` have host stubs). `cpuid`, `current_id`, `current_cpu` (which

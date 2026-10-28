@@ -400,7 +400,10 @@ thread that may itself be the queued thread or bound to the queued object. The d
 from a live thread's syscall return or the idle thread, so it is never one of the self-teardown's
 dead threads; a draining thread that is the queued `Thread` (or bound to a queued object) is
 caught by the arm's self net, which marks it `Exited`, re-queues the object, and returns, so the
-drain never re-enters the wedge it exists to avoid.
+drain never re-enters the wedge it exists to avoid. A queued object with a thread left `current`
+on a CPU that `fatal` halted is the exception: its teardown never completes, so the drain spins
+forever on the CPU that runs it (see
+[scheduling-internals.md](scheduling-internals.md#thread-registry) § Thread Registry).
 
 **Invariants the drain protocol MUST hold:**
 
@@ -788,7 +791,7 @@ The handler then drains the target.
    an object teardown commits `Exited` over it (a start cannot commit while the target is `current`
    anywhere). A target left `current` on a CPU that `fatal` halted is never descheduled, so the
    drain ends only once a teardown commits `Exited` over it (a restarted stopper whose slot no
-   longer names the target leaves it without the drain, per invariant 1 below), and that
+   longer names the target returns without re-entering the drain, per invariant 1), and that
    teardown's drain scan never ends ([invariant 3](#dealloc_objectthread-drain-protocol)).
 4. **A restart waits out an owed wake.** A waker that claimed the stopped park may still be between
    its claim and its `enqueue_and_wake`. Each pass of `sys_thread_start`'s settle loop

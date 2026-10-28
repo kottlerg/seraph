@@ -873,11 +873,14 @@ threads never outlive either object (see [scheduling-internals.md](scheduling-in
 Registry). **The stop includes the caller**: a thread deleting the last capability to its own
 `CSpace` or `AddressSpace` — directly, or because the deleted object's teardown cascades into it —
 is stopped by that delete and the call does not return; the object is reclaimed once the thread is
-off its CPU. A teardown of a Thread left `current` on a CPU that `fatal` halted, or of a `CSpace`
-or `AddressSpace` with such a thread bound, never completes, so the call does not return (see
+off its CPU. A teardown of a Thread left `current` on a CPU that `fatal` halted never completes
+(see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
-§ `dealloc_object(Thread)` Drain Protocol, invariant 3). This path has known kernel memory-safety
-gaps, tracked in [#501](https://github.com/kottlerg/seraph/issues/501) and
+§ `dealloc_object(Thread)` Drain Protocol, invariant 3), nor does one of a `CSpace` or
+`AddressSpace` with such a thread bound (see [scheduling-internals.md](scheduling-internals.md) §
+Thread Registry): the call does not return, or, when the deleter is itself stopped and the
+teardown is deferred, the deferred drain on its CPU never completes. This path has known kernel
+memory-safety gaps, tracked in [#501](https://github.com/kottlerg/seraph/issues/501) and
 [#502](https://github.com/kottlerg/seraph/issues/502) (see
 [capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage: Hybrid
 Two-Level Radix and

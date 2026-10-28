@@ -650,6 +650,11 @@ pub(crate) fn fatal(msg: &str) -> !
 `halt_loop` disables interrupts and halts the calling CPU permanently (`hlt` on x86-64,
 `wfi` on RISC-V).
 
+A `fatal()` on the BSP after Phase 9 also ends sleep-list servicing, which runs only on
+the BSP, so no timeout wakes on any CPU (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sleep-list-invariants)
+§ Sleep List Invariants).
+
 Secondary CPU failures after Phase 9 (user-mode entry) are handled by `fatal()` on
 that CPU only; the BSP and other CPUs continue until one needs the halted CPU: it acks no
 further IPI, so the next TLB shootdown that names it ends in the IPI watchdog's `fatal` (see

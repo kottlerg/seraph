@@ -1046,15 +1046,17 @@ pub fn cap_create_notification(memory_cap: u32) -> Result<u32, i64>
 /// Retype a Memory cap into a new `AddressSpace`, or augment an existing
 /// one's PT growth budget.
 ///
-/// `memory_cap` must carry `MemRights::RETYPE` and have at least
-/// `init_pages * PAGE_SIZE` of `available_bytes`. In create mode page 0 of
+/// `memory_cap`, a generation-checked capability handle, must carry
+/// `MemRights::RETYPE` and have at least `init_pages * PAGE_SIZE` of
+/// `available_bytes`. In create mode page 0 of
 /// the slab is the kernel wrapper page, page 1 the root PT, and pages
 /// `2..init_pages` seed the PT growth pool; `init_pages` must be `>= 2`.
 ///
 /// `augment_target` selects the mode:
 /// - `0` → create a new `AddressSpace`; returns the new capability handle
 ///   (slot index plus generation).
-/// - non-zero `AddressSpace` cap slot → augment that AS's PT growth pool
+/// - non-zero `AddressSpace` capability handle (generation-checked) → augment
+///   that AS's PT growth pool
 ///   with the `init_pages` carved pages (`init_pages >= 1`); returns `0`.
 ///   Once per record page of the kernel's donation bookkeeping, a donation
 ///   keeps its first page for that bookkeeping and seeds `init_pages - 1`,
@@ -1084,15 +1086,17 @@ pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 /// Retype a Memory cap into a new `CSpace`, or augment an existing one's
 /// slot-page growth budget.
 ///
-/// `memory_cap` must carry `MemRights::RETYPE` and have at least
-/// `init_pages * PAGE_SIZE` of `available_bytes`. In create mode the
+/// `memory_cap`, a generation-checked capability handle, must carry
+/// `MemRights::RETYPE` and have at least `init_pages * PAGE_SIZE` of
+/// `available_bytes`. In create mode the
 /// slab's page 0 is the kernel wrapper page; pages `1..init_pages` seed
 /// the slot-page pool (each backs 56 slots). `init_pages` must be `>= 1`.
 ///
 /// `augment_target`:
 /// - `0` → create new; returns the new capability handle (slot index plus
 ///   generation).
-/// - non-zero → augment that `CSpace`'s growth pool with the `init_pages`
+/// - non-zero `CSpace` capability handle (generation-checked) → augment that
+///   `CSpace`'s growth pool with the `init_pages`
 ///   carved pages; returns `0`. As for `cap_create_aspace`, once per record
 ///   page of the kernel's donation bookkeeping a donation seeds
 ///   `init_pages - 1`; read the budget back with `CAP_INFO_CSPACE_BUDGET`.
@@ -1774,7 +1778,10 @@ pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u
 /// Deleting the last capability to the caller's own `CSpace` or
 /// `AddressSpace` (directly, or through the teardown cascade) stops the
 /// caller: the call never returns. Deleting the caller's own Thread
-/// capability is refused instead.
+/// capability is refused instead. A teardown of a Thread left `current` on a
+/// CPU that `fatal` halted, or of a `CSpace` or `AddressSpace` with such a
+/// thread bound, never completes, so the call does not return
+/// (`core/kernel/docs/syscalls.md` § `SYS_CAP_DELETE`).
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` if the handle
@@ -1794,7 +1801,9 @@ pub fn cap_delete(slot: u32) -> Result<(), i64>
 
 /// Revoke all capabilities derived from a slot (`SYS_CAP_REVOKE`).
 ///
-/// Clears the entire descendant subtree; the root slot is preserved.
+/// Clears the entire descendant subtree; the root slot is preserved. A
+/// revoked capability that was an object's last reference tears the object
+/// down as [`cap_delete`] describes, including the case that never returns.
 ///
 /// # Errors
 /// - `InvalidCapability` (-2) — the handle names no live slot, or its

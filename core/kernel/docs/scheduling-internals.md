@@ -1493,7 +1493,9 @@ caller's has a bound thread as `current`. A
 bound thread found `current` but not `Exited` was bound after the walk (a
 `sys_cap_create_thread` whose unlocked cap lookup raced the object's last
 delete); the loop returns to phase 1 for it. The spin has no bound and warns
-once after 100 ms.
+once after 100 ms. It never ends while a bound thread is `current` on a CPU that
+`fatal` halted, which never schedules again; nor does `wait_until_aspace_inactive`
+for such a thread's address space.
 
 *The caller is itself stopped.* `stop_threads_bound_to` returns `true`, and
 skips the wait, when the running thread has been marked `Exited`: it was bound
@@ -1507,7 +1509,8 @@ this CPU's deferred-reclaim stack (`push_deferred_reclaim`, the #341 mechanism
 generalised to `CSpace` and `AddressSpace` objects) and returns, the syscall
 epilogue schedules the thread away, and `drain_deferred_reclaim` re-enters the
 teardown from a context bound to nothing queued there, where the bound threads
-are all already `Exited` and off-CPU.
+are all already `Exited` and off-CPU, except one left `current` on a CPU that
+`fatal` halted: the re-entry then spins forever on the CPU that drains it.
 
 *AddressSpace root free.* `current` changing hands is not enough for an
 `AddressSpace`: the CPU switching away clears its `active_cpus` bit and loads

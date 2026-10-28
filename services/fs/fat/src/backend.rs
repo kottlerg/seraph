@@ -244,6 +244,11 @@ impl<'a> FatfsBackend<'a>
         }
     }
 
+    /// The cluster of directory `dir`: the root sentinel for `NodeId(0)`,
+    /// else a directory node's cluster when it lies in the data region. A
+    /// subdirectory entry naming cluster 0 or another cluster outside the
+    /// data region is refused, since the walks would read the root (or
+    /// cluster 2) in its place.
     fn cluster_for(&self, dir: NodeId) -> Option<u32>
     {
         if dir.raw() == 0
@@ -251,7 +256,7 @@ impl<'a> FatfsBackend<'a>
             return Some(self.root_cluster_sentinel());
         }
         let node = self.nodes.get(dir)?;
-        if node.kind != NodeKind::Dir
+        if node.kind != NodeKind::Dir || !self.state.is_data_cluster(node.cluster)
         {
             return None;
         }
@@ -281,17 +286,8 @@ impl NamespaceBackend for FatfsBackend<'_>
         // surfaces the on-disk `DirEntryLocation` so the write-side
         // dispatch can patch metadata in place without re-scanning the
         // parent directory.
-        let dir_cluster_resolved = if dir_cluster == 0
-            && matches!(self.state.fat_type, FatType::Fat32)
-        {
-            self.state.root_cluster
-        }
-        else
-        {
-            dir_cluster
-        };
         let (entry, loc) = find_in_directory_with_location(
-            dir_cluster_resolved,
+            dir_cluster,
             name,
             self.state,
             self.cache,

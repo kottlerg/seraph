@@ -951,7 +951,7 @@ fn reply_err(code: u64, ipc_buf: *mut u64)
 /// Resolve a parent-dir `NodeId` to the directory's cluster number.
 /// `NodeId(0)` is the root; FAT16 returns the sentinel cluster 0, FAT32
 /// returns `state.root_cluster`. Non-root ids must be present in the
-/// table and refer to a directory.
+/// table and refer to a directory whose cluster lies in the data region.
 fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> Option<u32>
 {
     if node_id.raw() == 0
@@ -963,7 +963,11 @@ fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> 
         });
     }
     let node = nodes.get(node_id)?;
-    if node.kind != NodeKind::Dir
+    // A subdirectory's cluster comes from its directory entry. Cluster 0
+    // names the root (the FAT16 fixed root to the directory walks), so a
+    // subdirectory entry outside the data region would turn a cap on the
+    // subdirectory into one on the root.
+    if node.kind != NodeKind::Dir || !state.is_data_cluster(node.cluster)
     {
         return None;
     }

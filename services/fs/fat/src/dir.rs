@@ -606,9 +606,9 @@ pub struct RemovedEntry
 /// # Errors
 /// [`FatError::Exists`] when the directory already holds an entry of that
 /// name; [`FatError::Corrupt`] for an empty name or one longer than
-/// [`MAX_LFN_CHARS`], or when the directory's chain or the FAT is
-/// corrupt (a link outside the data region, a bad-cluster marker, or a
-/// cycle); [`FatError::NoSpace`] when no short-name alias or no free
+/// [`MAX_LFN_CHARS`], or when the directory's first cluster or a link
+/// lies outside the data region, a link is a bad-cluster marker, or the
+/// chain has a cycle; [`FatError::NoSpace`] when no short-name alias or no free
 /// slot run is left (see `find_free_slot_run`); [`FatError::Io`] when a
 /// directory or FAT sector read or write fails, possibly after some LFN
 /// slots were written.
@@ -701,8 +701,9 @@ pub fn insert_entry(
 ///
 /// # Errors
 /// [`FatError::Corrupt`] when no entry of that name is found before the
-/// end of the directory or of its cluster chain, or the chain leaves the
-/// data region, reaches a bad-cluster marker, or has a cycle;
+/// end of the directory or of its cluster chain, or when the directory's
+/// first cluster or a link lies outside the data region, a link is a
+/// bad-cluster marker, or the chain has a cycle;
 /// [`FatError::Io`] when a directory or FAT sector read or a deletion
 /// write fails, possibly after some of the entry's slots are already
 /// marked.
@@ -877,9 +878,9 @@ pub fn write_dot_entries(
 /// [`FatError::Io`] when a directory or FAT sector cannot be read or a
 /// new cluster cannot be zeroed; [`FatError::NoSpace`] when the FAT16 root
 /// area holds no such run or no free cluster remains to extend a FAT32
-/// directory; [`FatError::Corrupt`] when the directory's chain leaves the
-/// data region, reaches a bad-cluster marker, or has a cycle; any other
-/// error of [`allocate_cluster`].
+/// directory; [`FatError::Corrupt`] when the directory's first cluster or
+/// a link lies outside the data region, a link is a bad-cluster marker,
+/// or the chain has a cycle; any other error of [`allocate_cluster`].
 fn find_free_slot_run(
     state: &mut FatState,
     parent_dir_cluster: u32,

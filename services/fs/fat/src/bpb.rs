@@ -142,8 +142,9 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
         Err(fat_parse::BpbError::BadGeometry) =>
         {
             std::os::seraph::log!(
-                "invalid BPB: inconsistent geometry (no FAT copy or reserved sector, FAT32 root \
-                 outside the data region, or the data region or cluster count exceeds the FAT)"
+                "invalid BPB: inconsistent geometry (no FAT copy or reserved sector, data-region \
+                 start overflows, cluster count exceeds the FAT, or FAT32 root outside the data \
+                 region)"
             );
             return false;
         }
@@ -159,8 +160,9 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
     state.data_start_sector = geom.data_start_sector;
     state.total_clusters = geom.total_clusters;
     state.fat_type = geom.fat_type;
-    // FSInfo is set only for a FAT32 volume that names a real sector; otherwise
-    // the u32::MAX sentinel from FatState::new() stands.
+    // FSInfo is set only for a FAT32 volume that names a sector inside the
+    // reserved region; otherwise the u32::MAX sentinel from FatState::new()
+    // stands.
     if let Some(fsinfo) = geom.fsinfo_sector
     {
         state.fsinfo_sector = fsinfo;

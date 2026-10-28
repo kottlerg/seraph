@@ -49,4 +49,4 @@ pub unsafe fn load_iopb(_iopb: Option<&[u8; IOPB_SIZE]>) {}
 /// RISC-V has no I/O port space, so there is nothing to permit. Present so
 /// `sys_ioport_bind` compiles on both arches; the `HAS_IO_PORTS` gate makes
 /// this unreachable on RISC-V.
-pub fn permit_port_range_u32(_iopb: &mut [u8; IOPB_SIZE], _base: u32, _count: u32) {}
+pub fn permit_port_range(_iopb: &mut [u8; IOPB_SIZE], _base: u32, _count: u32) {}

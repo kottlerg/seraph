@@ -629,7 +629,7 @@ pub unsafe fn load_iopb(iopb: Option<&[u8; IOPB_SIZE]>)
 ///
 /// # Panics
 /// Panics in debug mode if `base + count > 65536`.
-pub fn permit_port_range_u32(iopb: &mut [u8; IOPB_SIZE], base: u32, count: u32)
+pub fn permit_port_range(iopb: &mut [u8; IOPB_SIZE], base: u32, count: u32)
 {
     if count == 0
     {
@@ -689,7 +689,7 @@ mod tests
     {
         let mut iopb = [0xFFu8; IOPB_SIZE];
         // Ports 3-10 span the tail of byte 0 and the head of byte 1.
-        permit_port_range_u32(&mut iopb, 3, 8);
+        permit_port_range(&mut iopb, 3, 8);
         assert_eq!(iopb[0], 0x07, "ports 0-2 stay denied, 3-7 permitted");
         assert_eq!(iopb[1], 0xF8, "ports 8-10 permitted, 11-15 stay denied");
         assert!(
@@ -702,7 +702,7 @@ mod tests
     fn permit_port_range_zero_count_is_nop()
     {
         let mut iopb = [0xFFu8; IOPB_SIZE];
-        permit_port_range_u32(&mut iopb, 100, 0);
+        permit_port_range(&mut iopb, 100, 0);
         assert!(iopb.iter().all(|&b| b == 0xFF));
     }
 
@@ -711,7 +711,7 @@ mod tests
     {
         let mut iopb = [0xFFu8; IOPB_SIZE];
         // Port 65535 is the last valid port.
-        permit_port_range_u32(&mut iopb, 65535, 1);
+        permit_port_range(&mut iopb, 65535, 1);
         assert_eq!(iopb[IOPB_SIZE - 1], 0xFF & !(1 << 7));
         assert!(iopb[..IOPB_SIZE - 1].iter().all(|&b| b == 0xFF));
     }
@@ -720,7 +720,7 @@ mod tests
     fn permit_port_range_covers_the_full_port_space()
     {
         let mut iopb = [0xFFu8; IOPB_SIZE];
-        permit_port_range_u32(&mut iopb, 0, 65536);
+        permit_port_range(&mut iopb, 0, 65536);
         assert!(iopb.iter().all(|&b| b == 0x00));
     }
 
@@ -728,8 +728,8 @@ mod tests
     fn permit_port_range_accumulates()
     {
         let mut iopb = [0xFFu8; IOPB_SIZE];
-        permit_port_range_u32(&mut iopb, 0, 4); // ports 0-3
-        permit_port_range_u32(&mut iopb, 4, 4); // ports 4-7
+        permit_port_range(&mut iopb, 0, 4); // ports 0-3
+        permit_port_range(&mut iopb, 4, 4); // ports 4-7
         assert_eq!(iopb[0], 0x00, "all 8 ports in byte 0 should be permitted");
     }
 

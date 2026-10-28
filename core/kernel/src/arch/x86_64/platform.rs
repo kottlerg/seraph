@@ -186,4 +186,14 @@ mod tests
         assert_eq!(got[1].phys_base, 0xFEC0_1000);
         assert_eq!(got[1].gsi_base, 24);
     }
+
+    #[test]
+    fn ioapics_clamp_an_oversized_reported_count_to_the_table()
+    {
+        let mut km = km_zero();
+        km.ioapic_count = u32::try_from(km.ioapics.len()).unwrap() + 1;
+        let mut out = [IoApicEntry::default(); 2 * boot_protocol::MAX_IOAPICS];
+        let got = select_ioapics(&km, &mut out);
+        assert_eq!(got.len(), boot_protocol::MAX_IOAPICS);
+    }
 }

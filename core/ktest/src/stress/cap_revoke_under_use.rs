@@ -71,42 +71,6 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "cap_revoke_under_use: ballast derive failed")?;
     }
 
-    // Spawn NUM_CHILDREN threads, each sending on its derived cap.
-    let mut threads = [0u32; NUM_CHILDREN];
-    let mut cspaces = [0u32; NUM_CHILDREN];
-    for i in 0..NUM_CHILDREN
-    {
-        let child =
-            spawn::new_child(ctx).map_err(|_| "cap_revoke_under_use: spawn::new_child failed")?;
-        let child_sig = cap_copy(derived[i], child.cs, RIGHTS_NOTIFY)
-            .map_err(|_| "cap_revoke_under_use: cap_copy sig failed")?;
-        let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
-            .map_err(|_| "cap_revoke_under_use: cap_copy done failed")?;
-        let child_sending = cap_copy(sending, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
-            .map_err(|_| "cap_revoke_under_use: cap_copy sending failed")?;
-
-        // SAFETY: child `i` has not been started yet; the block is reused
-        // only after every child has been reaped.
-        let arg = unsafe {
-            SENDER_ARGS.publish(
-                i,
-                SenderArgs {
-                    sig: child_sig,
-                    done: child_done,
-                    sending: child_sending,
-                    bit_index: i as u64,
-                },
-            )
-        };
-        // SAFETY: Each child uses a distinct stack index.
-        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        spawn::configure_and_start(&child, sender_loop_entry, stack_top, arg)
-            .map_err(|_| "cap_revoke_under_use: configure_and_start failed")?;
-
-        threads[i] = child.th;
-        cspaces[i] = child.cs;
-    }
-
     // Each child sends a unique bit on `sending` and on `done`. At
     // NUM_CHILDREN=64 the bitmask saturates the u64.
     let all_done: u64 = if NUM_CHILDREN >= 64
@@ -118,19 +82,41 @@ pub fn run(ctx: &TestContext) -> TestResult
         (1u64 << NUM_CHILDREN) - 1
     };
 
-    // Revoke once every child is sending (they sit strictly below this
+    // Spawn NUM_CHILDREN threads, each sending on its derived cap, then
+    // revoke once every child is sending (they sit strictly below this
     // thread's priority, so the bounded wait also cedes them this CPU).
-    let mut sending_bits = 0u64;
-    crate::tally::await_all(
-        sending,
-        &mut sending_bits,
-        all_done,
-        "cap_revoke_under_use: a child never started sending",
-    )?;
-
     // Revoke root — all derived caps become invalid. Children will start
     // getting errors on their sends and exit.
-    cap_revoke(root).map_err(|_| "cap_revoke_under_use: cap_revoke failed")?;
+    let mut senders = Senders {
+        threads: [0; NUM_CHILDREN],
+        cspaces: [0; NUM_CHILDREN],
+        spawned: 0,
+    };
+    let mut sending_bits = 0u64;
+    let revoked = start_senders(ctx, &derived, (done, sending), &mut senders)
+        .and_then(|()| {
+            crate::tally::await_all(
+                sending,
+                &mut sending_bits,
+                all_done,
+                "cap_revoke_under_use: a child never started sending",
+            )
+        })
+        .and_then(|()| cap_revoke(root).map_err(|_| "cap_revoke_under_use: cap_revoke failed"));
+    if let Err(e) = revoked
+    {
+        // Senders whose caps were not revoked loop forever; delete them so
+        // none spins on into the following cells.
+        for i in 0..senders.spawned
+        {
+            cap_delete(senders.threads[i]).ok();
+            cap_delete(senders.cspaces[i]).ok();
+        }
+        return Err(e);
+    }
+    let Senders {
+        threads, cspaces, ..
+    } = senders;
 
     // Wait for all children to report done.
     let mut done_bits: u64 = 0;
@@ -157,6 +143,60 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_delete(root).map_err(|_| "cap_revoke_under_use: root delete failed (marker leak?)")?;
     cap_delete(done).ok();
     cap_delete(sending).ok();
+    Ok(())
+}
+
+/// The senders' Thread and `CSpace` caps; the first `spawned` are live.
+struct Senders
+{
+    threads: [u32; NUM_CHILDREN],
+    cspaces: [u32; NUM_CHILDREN],
+    spawned: usize,
+}
+
+/// Start one sender per `derived` cap, each holding signal copies of the
+/// `(done, sending)` pair `reports`, recording each in `senders` as soon as
+/// it exists.
+fn start_senders(
+    ctx: &TestContext,
+    derived: &[u32; NUM_CHILDREN],
+    reports: (u32, u32),
+    senders: &mut Senders,
+) -> TestResult
+{
+    let (done, sending) = reports;
+    for (i, &derived_cap) in derived.iter().enumerate()
+    {
+        let child =
+            spawn::new_child(ctx).map_err(|_| "cap_revoke_under_use: spawn::new_child failed")?;
+        senders.threads[i] = child.th;
+        senders.cspaces[i] = child.cs;
+        senders.spawned = i + 1;
+        let child_sig = cap_copy(derived_cap, child.cs, RIGHTS_NOTIFY)
+            .map_err(|_| "cap_revoke_under_use: cap_copy sig failed")?;
+        let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+            .map_err(|_| "cap_revoke_under_use: cap_copy done failed")?;
+        let child_sending = cap_copy(sending, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+            .map_err(|_| "cap_revoke_under_use: cap_copy sending failed")?;
+
+        // SAFETY: child `i` has not been started yet; the block is reused
+        // only after every child has been reaped.
+        let arg = unsafe {
+            SENDER_ARGS.publish(
+                i,
+                SenderArgs {
+                    sig: child_sig,
+                    done: child_done,
+                    sending: child_sending,
+                    bit_index: i as u64,
+                },
+            )
+        };
+        // SAFETY: Each child uses a distinct stack index.
+        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
+        spawn::configure_and_start(&child, sender_loop_entry, stack_top, arg)
+            .map_err(|_| "cap_revoke_under_use: configure_and_start failed")?;
+    }
     Ok(())
 }
 

@@ -259,12 +259,25 @@ pub fn run(ctx: &TestContext) -> TestResult
         (1u64 << NUM_PAIRS) - 1
     };
     let mut ready_bits = 0u64;
-    crate::tally::await_all(
+    if let Err(e) = crate::tally::await_all(
         ready,
         &mut ready_bits,
         all_servers,
         "stress::load_balance_handoff_steal: a server never reached its receive",
-    )?;
+    )
+    {
+        // Delete the servers, so none is left on a stack the following
+        // cells reuse.
+        for j in 0..NUM_PAIRS
+        {
+            cap_delete(server_th[j]).ok();
+            cap_delete(server_cs[j]).ok();
+            cap_delete(eps[j]).ok();
+        }
+        cap_delete(ready).ok();
+        cap_delete(done).ok();
+        return Err(e);
+    }
 
     // ── Clients: UNPINNED (AFFINITY_ANY) so the balancer may steal them. ─────
     for i in 0..NUM_PAIRS

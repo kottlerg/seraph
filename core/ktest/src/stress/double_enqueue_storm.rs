@@ -150,12 +150,24 @@ pub fn run(ctx: &TestContext) -> TestResult
         (1u64 << NUM_WORKERS) - 1
     };
     let mut ready_bits = 0u64;
-    crate::tally::await_all(
+    if let Err(e) = crate::tally::await_all(
         ready,
         &mut ready_bits,
         all_workers,
         "stress::double_enqueue_storm: a worker never reached its park",
-    )?;
+    )
+    {
+        // Delete the workers, so none is left on a stack the following
+        // cells reuse.
+        for i in 0..NUM_WORKERS
+        {
+            cap_delete(threads[i]).ok();
+            cap_delete(cspaces[i]).ok();
+            cap_delete(p2c[i]).ok();
+        }
+        cap_delete(ready).ok();
+        return Err(e);
+    }
 
     // ── Phase 1: wake + priority churn ± affinity flips. ─────────────────────
     //

@@ -19,17 +19,72 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CHILDREN: usize = 16;
 
+/// The children's Thread and `CSpace` caps; the first `spawned` are live.
+struct Children
+{
+    threads: [u32; NUM_CHILDREN],
+    cspaces: [u32; NUM_CHILDREN],
+    spawned: usize,
+}
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let running = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_delete_running: cap_create_notification failed")?;
-    let mut threads = [0u32; NUM_CHILDREN];
-    let mut cspaces = [0u32; NUM_CHILDREN];
+    let mut children = Children {
+        threads: [0; NUM_CHILDREN],
+        cspaces: [0; NUM_CHILDREN],
+        spawned: 0,
+    };
 
+    // Delete once every child has run (they sit strictly below this
+    // thread's priority, so the bounded wait also cedes them this CPU).
+    // Without this the parent could win the race and delete every Thread
+    // cap before the scheduler ever picks them up, exercising only the
+    // "queue, never ran" branch.
+    let mut running_bits = 0u64;
+    let result = spawn_children(ctx, running, &mut children).and_then(|()| {
+        crate::tally::await_all(
+            running,
+            &mut running_bits,
+            (1u64 << NUM_CHILDREN) - 1,
+            "cap_delete_running: a child never ran",
+        )
+    });
+
+    // Delete each Thread cap while its child is mid-spin: the kernel's
+    // dealloc path is the system under test. A failed spawn or wait deletes
+    // the children it started the same way, so none spins on into the
+    // following cells.
+    let mut deleted = Ok(());
+    for i in 0..children.spawned
+    {
+        if cap_delete(children.threads[i]).is_err()
+        {
+            deleted = Err("cap_delete_running: cap_delete thread failed");
+        }
+        if cap_delete(children.cspaces[i]).is_err()
+        {
+            deleted = Err("cap_delete_running: cap_delete cspace failed");
+        }
+    }
+    let released = cap_delete(running);
+    result?;
+    deleted?;
+    released.map_err(|_| "cap_delete_running: cap_delete running failed")
+}
+
+/// Start every child, each reporting on its copy of `running`, recording each
+/// in `children` as soon as it exists.
+fn spawn_children(ctx: &TestContext, running: u32, children: &mut Children) -> TestResult
+{
     for i in 0..NUM_CHILDREN
     {
         let child =
             spawn::new_child(ctx).map_err(|_| "cap_delete_running: spawn::new_child failed")?;
+        children.threads[i] = child.th;
+        children.cspaces[i] = child.cs;
+        children.spawned = i + 1;
         let child_running = cap_copy(running, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "cap_delete_running: cap_copy running failed")?;
         // arg packs running_slot[31:0] | child index[63:32].
@@ -39,33 +94,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
         spawn::configure_and_start(&child, spinner_entry, stack_top, arg)
             .map_err(|_| "cap_delete_running: configure_and_start failed")?;
-
-        threads[i] = child.th;
-        cspaces[i] = child.cs;
     }
-
-    // Delete once every child has run (they sit strictly below this
-    // thread's priority, so the bounded wait also cedes them this CPU).
-    // Without this the parent could win the race and delete every Thread
-    // cap before the scheduler ever picks them up, exercising only the
-    // "queue, never ran" branch.
-    let mut running_bits = 0u64;
-    crate::tally::await_all(
-        running,
-        &mut running_bits,
-        (1u64 << NUM_CHILDREN) - 1,
-        "cap_delete_running: a child never ran",
-    )?;
-
-    // Delete each Thread cap while its child is mid-spin. The kernel's
-    // dealloc path is the system under test.
-    for i in 0..NUM_CHILDREN
-    {
-        cap_delete(threads[i]).map_err(|_| "cap_delete_running: cap_delete thread failed")?;
-        cap_delete(cspaces[i]).map_err(|_| "cap_delete_running: cap_delete cspace failed")?;
-    }
-    cap_delete(running).map_err(|_| "cap_delete_running: cap_delete running failed")?;
-
     Ok(())
 }
 

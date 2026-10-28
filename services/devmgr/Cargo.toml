@@ -11,6 +11,8 @@ test = false
 
 [dependencies]
 boot-protocol = { path = "../../abi/boot-protocol" }
+# ACPI / DTB table parsers, extracted so they are host-testable.
+firmware = { path = "firmware", package = "devmgr-firmware" }
 ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
 ns-client = { path = "../../shared/ns-client" }

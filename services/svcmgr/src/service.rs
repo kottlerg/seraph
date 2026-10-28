@@ -175,8 +175,10 @@ pub struct RestartRecipe
 //              svcmgr publishes as `rootfs.root` (0 if init could not
 //              derive it)
 //     caps[3]: SEND|GRANT (badge 0) source on devmgr's registry endpoint,
-//              from which svcmgr mints the `REGISTRY_QUERY_AUTHORITY`
-//              `devmgr.registry` publish cap and the
+//              from which svcmgr mints the `devmgr.registry`
+//              (`REGISTRY_QUERY_AUTHORITY`), `devmgr.shutdown` (adds
+//              `SHUTDOWN_DEVICE_AUTHORITY`), and `devmgr.test` (adds
+//              `ORPHAN_TEST_AUTHORITY`) publish caps and the
 //              `DRIVERS_DIR_AUTHORITY` SET_DRIVERS_DIR cap (0 if absent)
 //     data[1]: `SVCMGR_LABELS_VERSION` handshake
 //
@@ -221,9 +223,9 @@ pub struct SvcmgrCaps
     /// `rootfs.root`. Zero if init could not derive it.
     pub rootfs_root: u32,
     /// `SEND|GRANT`, badge-0 source on devmgr's registry endpoint. svcmgr
-    /// mints the `devmgr.registry` publish cap (`REGISTRY_QUERY_AUTHORITY`)
-    /// and the `SET_DRIVERS_DIR` cap (`DRIVERS_DIR_AUTHORITY`) from it.
-    /// Zero if absent.
+    /// mints the seed-only `devmgr.registry`, `devmgr.shutdown`, and
+    /// `devmgr.test` publish caps and the `SET_DRIVERS_DIR` cap
+    /// (`DRIVERS_DIR_AUTHORITY`) from it. Zero if absent.
     pub devmgr_registry: u32,
     /// Reserved master-log endpoint source (`RIGHTS_ALL`). svcmgr mints
     /// real-logd's master-log RECV from it on every (re)launch, and the

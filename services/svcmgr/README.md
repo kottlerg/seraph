@@ -12,11 +12,13 @@ one ([docs/service-definitions.md](docs/service-definitions.md) § Reconciliatio
 
 svcmgr also owns the system-wide discovery registry: it publishes the
 well-known names it owns (`rootfs.root`, `svcmgr`, `devmgr.registry`,
-and each provider's `provides` names like `pwrmgr.shutdown` / `timed`)
-into the registry itself — from the source caps init endows it with at
-handover, and from each provider's launch — and consumers resolve them
-via `QUERY_ENDPOINT` (or transparently through their `.svc` `seed = ...`
-line at launch time). The endowment and registry wire format are in
+`devmgr.shutdown`, `devmgr.test`, and each provider's `provides` names like
+`pwrmgr.shutdown` / `timed`) into the registry itself — from the source caps init endows it with at
+handover, and from each provider's launch. Consumers resolve any name
+through their `.svc` `seed = ...` line at launch time, and the public
+names (`svcmgr`, `pwrmgr.deny`, `timed`) also via `QUERY_ENDPOINT`; a
+name whose cap carries authority is seed-only, so `QUERY_ENDPOINT`
+answers it `UNKNOWN_NAME`. The endowment and registry wire format are in
 [docs/ipc-interface.md](docs/ipc-interface.md).
 
 A raw-syscall fallback that lets svcmgr recreate procmgr if procmgr
@@ -151,7 +153,7 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test
 ```
 
 Recognised keys: `binary` (required), `argv`, `env`, `restart`
@@ -169,25 +171,28 @@ in the host-tested `svc-defs` crate.
 ## Cap publication
 
 svcmgr publishes every well-known name into its own registry — there is
-no init-side `PUBLISH_ENDPOINT` traffic. The first three are published in
+no init-side `PUBLISH_ENDPOINT` traffic. The first five are published in
 `main()` right after the endowment is drained, from the source caps init
 endows svcmgr with at handover; the provider names are published on each
 provider's launch path from its `provides` line
 ([docs/service-definitions.md](docs/service-definitions.md) § `provides`). Names are
 FS-driver- and platform-agnostic by
-design; consumers resolve them through their `.svc` `seed = ...` lines or
-via direct `QUERY_ENDPOINT` calls. The handover endowment and
+design; consumers resolve them through their `.svc` `seed = ...` lines,
+and the public ones also via direct `QUERY_ENDPOINT` calls (the Query
+column). The handover endowment and
 `PUBLISH_ENDPOINT` / `QUERY_ENDPOINT` wire format are specified in
 [docs/ipc-interface.md](docs/ipc-interface.md).
 
-| Name | Source | Cap shape |
-|---|---|---|
-| `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on the root filesystem's namespace endpoint at its root directory |
-| `svcmgr` | svcmgr (its own service ep) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) |
-| `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint |
-| `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint |
-| `pwrmgr.deny` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
-| `timed` | svcmgr (`timed.svc` [provider](docs/service-definitions.md)) | SEND on timed's service endpoint |
+| Name | Source | Cap shape | Query |
+|---|---|---|---|
+| `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on the root filesystem's namespace endpoint at its root directory | no |
+| `svcmgr` | svcmgr (its own service ep) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) | yes |
+| `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
+| `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
+| `devmgr.test` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| ORPHAN_TEST_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by svctest only; TODO(#165)) | no |
+| `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint | no |
+| `pwrmgr.deny` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) | yes |
+| `timed` | svcmgr (`timed.svc` [provider](docs/service-definitions.md)) | SEND on timed's service endpoint | yes |
 
 Centralised name constants live in `ipc::published_names`.
 

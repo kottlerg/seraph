@@ -181,11 +181,11 @@ pub struct Definition
 /// One published name in a service's `provides = ...` list, with the
 /// badge svcmgr stamps on the SEND it publishes.
 ///
-/// The badge rides through publish → registry → `QUERY_ENDPOINT` lookup
-/// unchanged (`cap_derive` inherits a source cap's badge), so a consumer
-/// that resolves the name receives a SEND already carrying it. The verb
-/// the server gates on is `badge & (1 << 63)`, the universal
-/// verb-authority bit shared by every `*_AUTHORITY` constant.
+/// The badge rides through publish → registry → lookup unchanged
+/// (`cap_derive` inherits a source cap's badge), so a consumer that
+/// resolves the name receives a SEND already carrying it. The verb the
+/// server gates on is `badge & (1 << 63)`, the first verb bit; a name
+/// carrying it is seed-only (`QUERY_ENDPOINT` refuses it).
 #[derive(Clone, Debug)]
 pub struct ProvidedName
 {

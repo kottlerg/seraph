@@ -68,8 +68,8 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    completes leaves init-logd serving and init's memory caps held until
    shutdown (a benign hold, not a wedge).
    svcmgr publishes the well-known names it now owns (`rootfs.root`,
-   `svcmgr`, `devmgr.registry`) and installs devmgr's `/services/drivers/`
-   cap via `SET_DRIVERS_DIR` from the endowment (see
+   `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`) and installs
+   devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR` from the endowment (see
    [svcmgr IPC interface](../svcmgr/docs/ipc-interface.md)); it then
    launches the non-bootstrap services itself — `timed` and `pwrmgr`
    (providers), `terminal`, the staged test harnesses — and publishes their

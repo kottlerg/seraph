@@ -27,6 +27,10 @@ pub fn phases() -> &'static [Phase]
             name: "svcmgr_published_send_badged",
             run: svcmgr_published_send_badged_phase,
         },
+        Phase {
+            name: "svcmgr_seed_only_names_refused",
+            run: svcmgr_seed_only_names_refused_phase,
+        },
     ]
 }
 
@@ -155,4 +159,76 @@ fn svcmgr_published_send_badged_phase(_caps: &Caps)
         "PUBLISH_ENDPOINT through the published svcmgr SEND must reply UNAUTHORIZED (got {publish_label:#x})"
     );
     std::os::seraph::log!("svcmgr published-send phase passed (badged, no PUBLISH_AUTHORITY)");
+}
+
+/// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
+/// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
+/// cap. svctest's own non-zero seeds show four of the refused names are
+/// published; `devmgr.shutdown`, which only pwrmgr seeds, is published by
+/// the same loop as `devmgr.registry` and `devmgr.test`. A queryable
+/// seed-only name would hand its authority to every process.
+fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
+{
+    for (cap, shown) in [
+        (caps.root_fs, "rootfs.root"),
+        (caps.pwrmgr_auth, "pwrmgr.shutdown"),
+        (caps.devmgr_registry, "devmgr.registry"),
+        (caps.devmgr_test, "devmgr.test"),
+    ]
+    {
+        assert_ne!(cap, 0, "svcmgr_seed_only_names_refused: no {shown} seed");
+    }
+    let (registry_cap, ipc_buf) = registry_cap_and_buf("svcmgr_seed_only_names_refused");
+    let query = |name: &[u8]| {
+        let label = ipc::svcmgr_labels::QUERY_ENDPOINT | ((name.len() as u64) << 16);
+        let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        unsafe { ipc::ipc_call(registry_cap, &msg, ipc_buf) }
+            .expect("svcmgr QUERY_ENDPOINT ipc_call must return a reply")
+    };
+    for name in [
+        ipc::published_names::ROOTFS_ROOT,
+        ipc::published_names::PWRMGR_SHUTDOWN,
+        ipc::published_names::DEVMGR_REGISTRY,
+        ipc::published_names::DEVMGR_SHUTDOWN,
+        ipc::published_names::DEVMGR_TEST,
+    ]
+    {
+        let reply = query(name);
+        let shown = core::str::from_utf8(name).unwrap_or("?");
+        assert_eq!(
+            reply.label,
+            ipc::svcmgr_errors::UNKNOWN_NAME,
+            "svcmgr QUERY_ENDPOINT({shown}) must reply UNKNOWN_NAME (got {:#x})",
+            reply.label
+        );
+        assert!(
+            reply.caps().is_empty(),
+            "svcmgr QUERY_ENDPOINT({shown}) refusal must carry no cap"
+        );
+    }
+    for name in [
+        ipc::published_names::SVCMGR,
+        ipc::published_names::PWRMGR_DENY,
+    ]
+    {
+        let reply = query(name);
+        let shown = core::str::from_utf8(name).unwrap_or("?");
+        assert_eq!(
+            reply.label,
+            ipc::svcmgr_errors::SUCCESS,
+            "svcmgr QUERY_ENDPOINT({shown}) must resolve (got {:#x})",
+            reply.label
+        );
+        assert_eq!(
+            reply.caps().len(),
+            1,
+            "svcmgr QUERY_ENDPOINT({shown}) must carry one cap"
+        );
+        for &cap in reply.caps()
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+    }
+    std::os::seraph::log!("svcmgr seed-only phase passed (5 refused, 2 public resolved)");
 }

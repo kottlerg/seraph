@@ -61,7 +61,10 @@ the remaining ACPI tree via `BootInfo.acpi_rsdp`; see [firmware-parsing.md](firm
 Malformed tables are skipped, not fatal:
 - A bad XSDT length or a short read yields empty extractor output.
 - An MADT entry with an impossible length byte stops the walk early.
-- Unknown MADT / MCFG entry types are silently skipped.
+- Unknown MADT entry types are silently skipped.
+- An MCFG allocation entry with a zero base, an end bus below its start bus, or an ECAM
+  window whose start or end overflows a 64-bit physical address is skipped, along with its
+  derived PCI BAR windows.
 
 A warning is logged on hard failure; the bootloader proceeds with
 whatever it successfully extracted. The kernel falls back to its compile-time defaults

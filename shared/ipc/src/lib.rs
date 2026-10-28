@@ -846,7 +846,8 @@ pub mod svcmgr_labels
     /// bytes packed little-endian. `caps[0]` is the endpoint the name
     /// resolves to.
     pub const PUBLISH_ENDPOINT: u64 = 3;
-    /// Look up a named endpoint; reply transfers the cap if known.
+    /// Look up a named public endpoint; on success the reply carries a
+    /// freshly derived SEND cap.
     ///
     /// Label bits 16..31 carry `name_len`; data words from 0 carry the name
     /// bytes packed little-endian, as for [`PUBLISH_ENDPOINT`]

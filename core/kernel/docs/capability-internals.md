@@ -456,11 +456,11 @@ rely on the tag and generation checks described above.
 The source of a copy or derive, the parent of a memory split, and both caps of
 a memory merge are looked up unlocked, so each of those paths revalidates them
 under the write lock — same tag-bearing occupancy, same generation, same
-object, no revoke or move in flight — before touching the object or editing the tree.
-Every occupied→free transition holds the lock, so a slot that revalidates stays
-live (and stays the link's parent) for the rest of the hold. A slot freed
-meanwhile fails the call with `InvalidCapability` (a revoke or move in flight on it,
-`InvalidState`); the alternative — `link_child` dropping the link under a freed
+object, not pinned by an in-flight revoke, move, or IPC capability transfer — before touching
+the object or editing the tree. Every occupied→free transition holds the lock, so a slot that
+revalidates stays live (and stays the link's parent) for the rest of the hold. A slot freed
+meanwhile fails the call with `InvalidCapability` (a revoke, move, or IPC capability transfer
+in flight on it, `InvalidState`); the alternative — `link_child` dropping the link under a freed
 parent — would leave the new capability a derivation root outside every
 ancestor's revoke reach, and a merge would free a recycled tail index.
 
@@ -541,14 +541,13 @@ re-linked in O(1), the lock released between batches, and a
 `MAX_REPARENT_BATCHES` backstop against a concurrent deriver — because a
 slot can have been derived from up to the structural ceiling of every
 CSpace. The consumed slot is revalidated under the lock before every batch
-(tag and handle generation, no revoke or move in flight; after its first batch the delete
-also checks that the slot still holds the object it captured, and the splits check the
-looked-up object from the first hold, since their lookup ran without the lock): a
-concurrent revoke starting on it stops the delete with
-`InvalidState` and children already moved stay under the parent, a
-concurrent delete finishing it first turns the delete into a success and a
-split into `InvalidState` with both children rolled back. The split's own
-children are inserted and linked under the original's parent inside the
+(tag and handle generation, not pinned by an in-flight revoke, move, or IPC capability
+transfer; after its first batch the delete also checks that the slot still holds the object it
+captured, and the splits check the looked-up object from the first hold, since their lookup ran
+without the lock): a concurrent revoke starting on it stops the delete with `InvalidState` and
+children already moved stay under the parent, a concurrent delete finishing it first turns the
+delete into a success and a split into `InvalidState` with both children rolled back. The split's
+own children are inserted and linked under the original's parent inside the
 first hold, before any batch releases the lock, so they are never reachable
 but unlinked — a sibling's `SYS_CAP_MOVE` carries whatever derivation
 position it finds, and an unlinked child would leave the grantor's revoke

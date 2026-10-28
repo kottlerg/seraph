@@ -98,6 +98,13 @@ impl FatState
         fat_parse::cluster_to_sector(self.data_start_sector, self.sectors_per_cluster, cluster)
     }
 
+    /// Whether `cluster` lies in the data region,
+    /// `2 <= cluster < 2 + total_clusters` ([`fat_parse::is_data_cluster`]).
+    pub fn is_data_cluster(&self, cluster: u32) -> bool
+    {
+        fat_parse::is_data_cluster(cluster, self.total_clusters)
+    }
+
     /// Bytes per cluster.
     pub fn cluster_size(&self) -> u32
     {
@@ -110,7 +117,8 @@ impl FatState
 /// Decodes geometry via [`fat_parse::parse_bpb_geometry`], copies it into
 /// `state`, and emits the detection and geometry log lines the driver has
 /// always produced. Returns `false` after logging the reason on an invalid
-/// boot signature or a zero `bytes_per_sector` / `sectors_per_cluster`.
+/// boot signature, a zero `bytes_per_sector` / `sectors_per_cluster`, a
+/// sector size other than [`SECTOR_SIZE`], or an inconsistent geometry.
 pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
 {
     let geom = match fat_parse::parse_bpb_geometry(sector_data)
@@ -126,6 +134,20 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
             std::os::seraph::log!("invalid BPB: bytes_per_sector or sectors_per_cluster is zero");
             return false;
         }
+        Err(fat_parse::BpbError::UnsupportedSectorSize) =>
+        {
+            std::os::seraph::log!("unsupported BPB: bytes_per_sector is not {SECTOR_SIZE}");
+            return false;
+        }
+        Err(fat_parse::BpbError::BadGeometry) =>
+        {
+            std::os::seraph::log!(
+                "invalid BPB: inconsistent geometry (no FAT copy or reserved sector, data-region \
+                 start overflows, cluster count exceeds the FAT, or FAT32 root outside the data \
+                 region)"
+            );
+            return false;
+        }
     };
 
     state.bytes_per_sector = geom.bytes_per_sector;
@@ -138,8 +160,9 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
     state.data_start_sector = geom.data_start_sector;
     state.total_clusters = geom.total_clusters;
     state.fat_type = geom.fat_type;
-    // FSInfo is set only for a FAT32 volume that names a real sector; otherwise
-    // the u32::MAX sentinel from FatState::new() stands.
+    // FSInfo is set only for a FAT32 volume that names a sector inside the
+    // reserved region; otherwise the u32::MAX sentinel from FatState::new()
+    // stands.
     if let Some(fsinfo) = geom.fsinfo_sector
     {
         state.fsinfo_sector = fsinfo;

@@ -52,7 +52,7 @@ use dir::{
     update_entry_metadata, write_dot_entries,
 };
 use eviction::{EvictReq, EvictionState};
-use fat::{next_cluster, read_file_data};
+use fat::{chain_next, next_cluster, read_file_data};
 use file::{MAX_OPEN_FILES, OpenFile, OutstandingPage};
 use ipc::{IpcMessage, fs_labels, ns_labels};
 use namespace_protocol::{GateError, NamespaceRights, NodeId, NodeKind, gate, pack as pack_badge};
@@ -218,14 +218,17 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// - `FS_MOUNT` — unbadged (badge == 0); vfsd's BPB-validation probe.
 /// - `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` — namespace dispatch via
 ///   the protocol crate.
-/// - Per-node `FS_READ` / `FS_READ_MEMORY` / `FS_RELEASE_MEMORY` /
-///   `FS_CLOSE` — badge packs `(NodeId, NamespaceRights)`; the slot is
-///   resolved through `NodeTable` and the lazily-allocated `OpenFile`.
+/// - Per-node `FS_*` requests — badge packs `(NodeId, NamespaceRights)`
+///   and the node is resolved through `NodeTable`: the read side
+///   (`FS_READ`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, `FS_CLOSE`), the
+///   write side (`FS_WRITE`, `FS_WRITE_MEMORY`, `FS_TRUNCATE`), and
+///   directory mutation (`FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`,
+///   `FS_RENAME`).
 ///
 /// The open-file table is shared with the eviction worker via a
-/// `Mutex`; main acquires the lock once per request and holds it for
-/// the entire dispatch. The hot path is single-client and
-/// short-lived; lock contention with the worker is only material
+/// `Mutex`. Only `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE`
+/// use it; main takes the lock for those requests and holds it for the
+/// whole dispatch. Lock contention with the worker is only material
 /// during cache-pressure releases.
 #[allow(clippy::too_many_lines)]
 fn service_loop(
@@ -290,6 +293,9 @@ fn service_loop(
             ns_labels::NS_LOOKUP | ns_labels::NS_STAT | ns_labels::NS_READDIR
         )
         {
+            // No NS_* request carries a cap; any it does carry is deleted
+            // so a caller cannot fill fatfs's CSpace with them.
+            drop_caps(msg.caps());
             let mut backend = FatfsBackend::new(state, cache, caps.block_dev, ipc_buf, nodes);
             // SAFETY: ipc_buf is the registered IPC buffer page.
             unsafe {
@@ -318,6 +324,15 @@ fn service_loop(
                 continue;
             }
         };
+
+        // Only FS_READ_MEMORY (a release SEND) and FS_WRITE_MEMORY (the
+        // source page) take caps; their handlers keep, return, or delete
+        // each one. Every other label's caps are deleted here, so no cap a
+        // request carries stays in fatfs's CSpace.
+        if opcode != fs_labels::FS_READ_MEMORY && opcode != fs_labels::FS_WRITE_MEMORY
+        {
+            drop_caps(msg.caps());
+        }
 
         if opcode == fs_labels::FS_READ
         {
@@ -438,6 +453,16 @@ fn service_loop(
     }
 }
 
+/// Delete every cap in `caps` from fatfs's `CSpace`: caps a request carried
+/// that its handler neither records nor returns.
+fn drop_caps(caps: &[u32])
+{
+    for &cap in caps
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+}
+
 // ── Operation handlers ─────────────────────────────────────────────────────
 
 /// `FS_READ` against a node cap. Resolves `node_id` against the
@@ -476,7 +501,7 @@ fn handle_read_node_cap(
     let max_len = msg.word(1).min(((MSG_DATA_WORDS_MAX - 1) * 8) as u64);
 
     let mut out = [0u8; SECTOR_SIZE];
-    let bytes_read = read_file_data(
+    let bytes_read = match read_file_data(
         &fat::FileRead {
             start_cluster: node.cluster,
             file_size: node.size,
@@ -488,7 +513,15 @@ fn handle_read_node_cap(
         block_dev,
         ipc_buf,
         &mut out,
-    );
+    )
+    {
+        Ok(n) => n,
+        Err(e) =>
+        {
+            reply_err(fat_error_to_wire(e), ipc_buf);
+            return;
+        }
+    };
 
     let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .word(0, bytes_read as u64)
@@ -498,14 +531,17 @@ fn handle_read_node_cap(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// `FS_READ_MEMORY` body, parameterised by a pre-resolved `OpenFile`
-/// slot index. `handle_read_memory_node_cap` resolves the badge via
-/// `NodeTable.open_slot` (lazy-allocating on first call) and delegates
-/// here for the cluster walk, cache acquisition, two-step cap
-/// derivation, and outstanding-page tracking.
+/// `FS_READ_MEMORY` body, parameterised by the resolved node and its
+/// pre-resolved `OpenFile` slot index. `handle_read_memory_node_cap`
+/// resolves the badge via `NodeTable.open_slot` (lazy-allocating on first
+/// call) and delegates here for the cluster walk, cache acquisition,
+/// two-step cap derivation, and outstanding-page tracking. The file's size
+/// and first cluster come from `node`, the node table's current view, so a
+/// write or truncate through any cap on the node is seen at once.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn read_memory_at_slot(
     msg: &IpcMessage,
+    node: &backend::FatNode,
     idx: usize,
     state: &mut FatState,
     files: &mut [OpenFile; MAX_OPEN_FILES],
@@ -527,10 +563,7 @@ fn read_memory_at_slot(
         return;
     }
 
-    let (file_size, start_cluster) = {
-        let f = &files[idx];
-        (u64::from(f.file_size), f.start_cluster)
-    };
+    let file_size = u64::from(node.size);
 
     if offset >= file_size
     {
@@ -552,7 +585,16 @@ fn read_memory_at_slot(
     let sector_in_cluster = (offset_in_cluster / bytes_per_sector) as u32;
     let byte_in_sector = offset_in_cluster % bytes_per_sector;
 
-    let mut cluster = start_cluster;
+    // A non-empty file's first cluster comes from its directory entry,
+    // untrusted on-disk input; one outside the data region is corrupt.
+    if !state.is_data_cluster(node.cluster)
+    {
+        let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    }
+    let mut cluster = node.cluster;
     for _ in 0..cluster_idx
     {
         if let Some(c) = next_cluster(state, cluster, cache, block_dev, ipc_buf)
@@ -627,6 +669,7 @@ fn read_memory_at_slot(
         cookie,
         slot_idx,
         ancestor_cap: ancestor,
+        eviction_queued: false,
     };
     if !files[idx].track_outstanding(entry)
     {
@@ -660,20 +703,27 @@ fn read_memory_at_slot(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// Scan the open-file table for any outstanding cache page. Returns
-/// the first match as an [`EvictReq`]; `None` only if no file holds
-/// any outstanding page (in which case `acquire_page` failure is a
+/// Scan the open-file table for an outstanding cache page not yet queued
+/// for eviction, mark it queued, and return it as an [`EvictReq`], so
+/// repeated cache misses under pressure queue distinct pages rather than
+/// one page many times. `None` when every outstanding page is already
+/// queued, or none is outstanding (then `acquire_page` failure is a
 /// cache-state bug rather than client-held pressure).
-fn pick_eviction_candidate(files: &[OpenFile; MAX_OPEN_FILES]) -> Option<EvictReq>
+fn pick_eviction_candidate(files: &mut [OpenFile; MAX_OPEN_FILES]) -> Option<EvictReq>
 {
-    for file in files
+    for file in files.iter_mut()
     {
         if file.badge == 0
         {
             continue;
         }
-        if let Some(entry) = file.outstanding.iter().flatten().next()
+        if let Some(entry) = file
+            .outstanding
+            .iter_mut()
+            .flatten()
+            .find(|e| !e.eviction_queued)
         {
+            entry.eviction_queued = true;
             return Some(EvictReq {
                 file_badge: file.badge,
                 cookie: entry.cookie,
@@ -727,26 +777,10 @@ fn handle_read_memory_node_cap(
         // lookup. Never seen on the wire — node-cap requests resolve
         // through `FatNode.open_slot`.
         let badge = NEXT_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        // First FS_READ_MEMORY for a (client, node) pair MAY carry the
-        // client's per-process release-endpoint SEND in caps[0]. The
-        // kernel `transfer_caps` path moved it into our CSpace if
-        // present; record it on the slot so the eviction worker can
-        // route cooperative `FS_RELEASE_MEMORY` back to the client.
-        // A zero cap indicates an opt-out client; eviction skips the
-        // cooperative round-trip and revokes. Subsequent FS_READ_MEMORYs from
-        // the same client carry no caps. Only caps[0] is recorded; any
-        // further cap is deleted.
-        let release_endpoint_cap = msg.caps().first().copied().unwrap_or(0);
-        for &extra in msg.caps().iter().skip(1)
-        {
-            let _ = syscall::cap_delete(extra);
-        }
         files[slot_idx] = OpenFile {
             badge,
-            start_cluster: node.cluster,
-            file_size: node.size,
             outstanding: [None; file::MAX_OUTSTANDING],
-            release_endpoint_cap,
+            release_endpoint_cap: 0,
         };
         // Cast safe: slot_idx ≤ MAX_OPEN_FILES (8) ≪ u32::MAX.
         nodes.set_open_slot(node_id, slot_idx as u32);
@@ -754,18 +788,13 @@ fn handle_read_memory_node_cap(
     }
     else
     {
-        // The slot records the release SEND from the request that
-        // allocated it (per-node sharing, #447); a SEND this request
-        // carries is never recorded, so it is deleted.
-        for &cap in msg.caps()
-        {
-            let _ = syscall::cap_delete(cap);
-        }
         node.open_slot as usize
     };
+    record_release_send(&mut files[idx], msg.caps());
 
     read_memory_at_slot(
         msg,
+        &node,
         idx,
         state,
         files,
@@ -774,6 +803,24 @@ fn handle_read_memory_node_cap(
         ipc_buf,
         eviction,
     );
+}
+
+/// Record the release SEND an `FS_READ_MEMORY` carried in `caps[0]` on
+/// `file` when the slot holds none yet, and delete every other cap the
+/// request carried. The rule is services/fs/docs/fs-driver-protocol.md
+/// § Label 7's; `transfer_caps` has already moved each cap into fatfs's
+/// `CSpace`, so a cap not stored on the slot here would otherwise stay
+/// there for the driver's lifetime.
+fn record_release_send(file: &mut OpenFile, caps: &[u32])
+{
+    let mut rest = caps;
+    if file.release_endpoint_cap == 0
+        && let Some((&send, tail)) = caps.split_first()
+    {
+        file.release_endpoint_cap = send;
+        rest = tail;
+    }
+    drop_caps(rest);
 }
 
 /// Reply `code` holding none of the caps the request carried: an
@@ -862,10 +909,9 @@ fn handle_close_node_cap(
             let _ = syscall::cap_delete(entry.ancestor_cap);
             cache.release_slot(entry.slot_idx);
         }
-        // Drop the per-File release-endpoint SEND the client transferred
-        // on first FS_READ_MEMORY — leaving it in our CSpace would
-        // accumulate a stale SEND per opened file across the fs's
-        // lifetime.
+        // Drop the release SEND recorded on the slot; leaving it in our
+        // CSpace would accumulate a stale SEND per opened file across the
+        // fs's lifetime.
         if files[idx].release_endpoint_cap != 0
         {
             let _ = syscall::cap_delete(files[idx].release_endpoint_cap);
@@ -889,7 +935,9 @@ fn fat_error_to_wire(err: FatError) -> u64
         // don't distinguish, and "corrupt" without recovery state is
         // an I/O-level failure from their point of view.
         FatError::Io | FatError::Corrupt => ipc::fs_errors::IO_ERROR,
-        FatError::NoSpace => ipc::fs_errors::NO_SPACE,
+        // A FAT file cannot grow past u32::MAX bytes: no space for it.
+        FatError::NoSpace | FatError::FileTooLarge => ipc::fs_errors::NO_SPACE,
+        FatError::Exists => ipc::fs_errors::EXISTS,
     }
 }
 
@@ -902,33 +950,54 @@ fn reply_err(code: u64, ipc_buf: *mut u64)
 
 /// Resolve a parent-dir `NodeId` to the directory's cluster number.
 /// `NodeId(0)` is the root; FAT16 returns the sentinel cluster 0, FAT32
-/// returns `state.root_cluster`. Non-root ids must be present in the
-/// table and refer to a directory.
-fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> Option<u32>
+/// returns `state.root_cluster`.
+///
+/// # Errors
+/// The `fs_errors` code to reply: `INVALID_BADGE` when a non-root id is
+/// absent from the table or names a file; `IO_ERROR` when it names a
+/// directory whose cluster lies outside the data region. That cluster
+/// comes from a corrupt directory entry: cluster 0 would name the FAT16
+/// fixed root, so serving it would turn a cap on the subdirectory into
+/// one on the root.
+fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> Result<u32, u64>
 {
     if node_id.raw() == 0
     {
-        return Some(match state.fat_type
+        return Ok(match state.fat_type
         {
             bpb::FatType::Fat32 => state.root_cluster,
             bpb::FatType::Fat16 => 0,
         });
     }
-    let node = nodes.get(node_id)?;
-    if node.kind != NodeKind::Dir
+    let node = nodes
+        .get(node_id)
+        .filter(|n| n.kind == NodeKind::Dir)
+        .ok_or(ipc::fs_errors::INVALID_BADGE)?;
+    if !state.is_data_cluster(node.cluster)
     {
-        return None;
+        return Err(ipc::fs_errors::IO_ERROR);
     }
-    Some(node.cluster)
+    Ok(node.cluster)
 }
 
 /// Common cluster-walk-and-write engine used by `FS_WRITE` and
 /// `FS_WRITE_MEMORY`. Walks the file's cluster chain from `offset`,
 /// allocating new clusters as needed, and writes `data` sector-by-
 /// sector through [`PageCache::write_sector`] (read-modify-write
-/// applies for partial-sector writes). Returns the number of bytes
-/// successfully written plus the (possibly-updated) file's first
-/// cluster.
+/// applies for partial-sector writes). Returns the file's
+/// (possibly-updated) first cluster and its new size.
+///
+/// The chain is extended only at its end-of-chain marker: a failed FAT
+/// read or a corrupt link is an error, never a place to link a new
+/// cluster (which would cut the chain's tail off).
+///
+/// # Errors
+/// [`FatError::FileTooLarge`] when the write would end past `u32::MAX`
+/// bytes, the largest size a FAT directory entry records, checked before
+/// any cluster is allocated; [`FatError::Corrupt`] when the file's first
+/// cluster or a chain link lies outside the data region; otherwise the
+/// errors of [`allocate_cluster`] and [`FatError::Io`] for a failed FAT or
+/// data sector read or write.
 #[allow(clippy::too_many_arguments, clippy::single_match_else)]
 fn write_file_bytes(
     start_cluster: u32,
@@ -947,6 +1016,12 @@ fn write_file_bytes(
     {
         return Ok((start_cluster, file_size));
     }
+    // The client chooses `offset`: bound the end before the walk below
+    // allocates one cluster per index up to it.
+    let end = offset
+        .checked_add(data.len() as u64)
+        .and_then(|end| u32::try_from(end).ok())
+        .ok_or(FatError::FileTooLarge)?;
 
     // Bootstrap: if the file currently holds no chain (size 0 / cluster
     // 0), allocate the first cluster now.
@@ -954,6 +1029,12 @@ fn write_file_bytes(
     if chain_head < 2
     {
         chain_head = allocate_cluster(state, None, cache, block_dev, ipc_buf)?;
+    }
+    else if !state.is_data_cluster(chain_head)
+    {
+        // The first cluster comes from the directory entry, untrusted
+        // on-disk input.
+        return Err(FatError::Corrupt);
     }
 
     let mut cluster = chain_head;
@@ -969,7 +1050,7 @@ fn write_file_bytes(
     // orphaning the original tail.)
     for _ in 0..target_cluster_idx
     {
-        cluster = match next_cluster(state, cluster, cache, block_dev, ipc_buf)
+        cluster = match chain_next(state, cluster, cache, block_dev, ipc_buf)?
         {
             Some(c) => c,
             None => allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?,
@@ -1015,7 +1096,7 @@ fn write_file_bytes(
         let new_cluster_offset = cur_offset % cluster_size;
         if new_cluster_offset == 0 && written < data.len()
         {
-            cluster = match next_cluster(state, cluster, cache, block_dev, ipc_buf)
+            cluster = match chain_next(state, cluster, cache, block_dev, ipc_buf)?
             {
                 Some(c) => c,
                 None => allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?,
@@ -1023,10 +1104,8 @@ fn write_file_bytes(
         }
     }
 
-    // cast_possible_truncation: cur_offset bounded by sector-level
-    // arithmetic; FAT file_size field is u32.
-    #[allow(clippy::cast_possible_truncation)]
-    let new_size = file_size.max(cur_offset as u32);
+    debug_assert_eq!(cur_offset, u64::from(end));
+    let new_size = file_size.max(end);
     Ok((chain_head, new_size))
 }
 
@@ -1104,7 +1183,7 @@ fn handle_write_node_cap(
 /// `FS_WRITE_MEMORY`: caller supplies a source Memory cap; data lives
 /// at `memory_data_offset..memory_data_offset + byte_count` in the
 /// memory cap. The Memory cap is mapped into fatfs's address space at a
-/// process-static scratch VA, copied into a stack buffer, and the
+/// process-static scratch VA, copied into a heap buffer, and the
 /// scratch VA unmapped before the actual writes. The Memory cap is moved
 /// back to the caller in the reply.
 #[allow(clippy::too_many_lines)]
@@ -1119,6 +1198,9 @@ fn handle_write_memory_node_cap(
 )
 {
     let src_cap = msg.caps().first().copied().unwrap_or(0);
+    // Only the source page is part of the request; any further cap is
+    // deleted rather than kept.
+    drop_caps(msg.caps().get(1..).unwrap_or(&[]));
 
     let reply_with = |code: u64, ipc_buf: *mut u64| {
         let mut builder = IpcMessage::builder(code);
@@ -1377,11 +1459,14 @@ fn create_entry_common(
     ipc_buf: *mut u64,
 )
 {
-    let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
-    else
+    let parent_cluster = match resolve_dir_cluster(node_id, state, nodes)
     {
-        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
-        return;
+        Ok(cluster) => cluster,
+        Err(code) =>
+        {
+            reply_err(code, ipc_buf);
+            return;
+        }
     };
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
     let data_bytes = msg.data_bytes();
@@ -1509,11 +1594,14 @@ fn handle_remove_node_cap(
     ipc_buf: *mut u64,
 )
 {
-    let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
-    else
+    let parent_cluster = match resolve_dir_cluster(node_id, state, nodes)
     {
-        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
-        return;
+        Ok(cluster) => cluster,
+        Err(code) =>
+        {
+            reply_err(code, ipc_buf);
+            return;
+        }
     };
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
     let data_bytes = msg.data_bytes();
@@ -1623,11 +1711,14 @@ fn handle_rename_node_cap(
     ipc_buf: *mut u64,
 )
 {
-    let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
-    else
+    let parent_cluster = match resolve_dir_cluster(node_id, state, nodes)
     {
-        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
-        return;
+        Ok(cluster) => cluster,
+        Err(code) =>
+        {
+            reply_err(code, ipc_buf);
+            return;
+        }
     };
     let src_len = msg.word(0) as usize;
     let dst_len = msg.word(1) as usize;
@@ -1755,9 +1846,21 @@ fn handle_truncate_node_cap(
         return;
     }
 
-    // Capture the old chain head before clearing, then free it.
+    // Detach the chain before freeing it, as FS_REMOVE does: patch the
+    // directory entry and the node to first cluster 0, size 0, then free
+    // the old chain. A failed free then leaves only an orphan chain, never
+    // a live entry on freed clusters that a later allocation would hand to
+    // another file (services/fs/fat/docs/crash-safety.md).
     let old_cluster = node.cluster;
     let entry_loc = node.loc;
+
+    if entry_loc.sector_lba != 0
+        && let Err(e) = update_entry_metadata(entry_loc, 0, 0, cache, block_dev, ipc_buf)
+    {
+        reply_err(fat_error_to_wire(e), ipc_buf);
+        return;
+    }
+    nodes.update_size_and_cluster(node_id, 0, 0);
 
     if old_cluster >= 2
         && let Err(e) = alloc::free_cluster_chain(state, old_cluster, cache, block_dev, ipc_buf)
@@ -1765,16 +1868,6 @@ fn handle_truncate_node_cap(
         reply_err(fat_error_to_wire(e), ipc_buf);
         return;
     }
-
-    // Patch the directory entry: first cluster = 0, size = 0.
-    if entry_loc.sector_lba != 0
-        && let Err(e) = update_entry_metadata(entry_loc, 0, 0, cache, block_dev, ipc_buf)
-    {
-        reply_err(fat_error_to_wire(e), ipc_buf);
-        return;
-    }
-
-    nodes.update_size_and_cluster(node_id, 0, 0);
 
     let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
     // SAFETY: ipc_buf is the registered IPC buffer page.

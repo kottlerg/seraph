@@ -512,17 +512,6 @@ define_typed_rights! {
     }
 }
 
-/// Return `true` if `rights` has both `WRITE` and `EXECUTE` set.
-///
-/// Test-only predicate. The mapping paths (`sys_mem_map`, `sys_mem_protect`
-/// in core/kernel/src/syscall/mem.rs) enforce W^X inline and do not call it;
-/// the W^X rule is defined in docs/capability-model.md § Memory.
-#[cfg(test)]
-pub fn violates_wx(rights: Rights) -> bool
-{
-    rights.contains((MemRights::WRITE | MemRights::EXECUTE).erase())
-}
-
 // ── CapabilitySlot ────────────────────────────────────────────────────────────
 
 /// A single capability slot in a `CSpace` page.
@@ -727,8 +716,9 @@ impl CapabilitySlot
     /// is the list tail. Leaves `pad[1]` (the per-slot generation) untouched —
     /// `CSpace::free_slot` bumps it immediately before this call and the next
     /// allocation must observe the incremented value. Zeroes `pad[2]` — a
-    /// slot freed while a revoke or move had it pinned must not carry the
-    /// pin into its next occupant (see [`pinned`](Self::pinned)).
+    /// slot freed while a revoke, move, or IPC capability transfer had it
+    /// pinned must not carry the pin into its next occupant (see
+    /// [`pinned`](Self::pinned)).
     ///
     /// [`is_on_free_list`]: Self::is_on_free_list
     pub fn set_next_free(&mut self, next: Option<NonZeroU32>)
@@ -893,15 +883,6 @@ mod tests
         acc |= MemRights::WRITE;
         assert_eq!(acc, both);
         assert_eq!(MemRights::NONE.erase(), Rights::NONE);
-    }
-
-    // W^X predicate: true only when WRITE and EXECUTE are both present.
-    #[test]
-    fn violates_wx_requires_write_and_execute()
-    {
-        assert!(violates_wx((MemRights::WRITE | MemRights::EXECUTE).erase()));
-        assert!(!violates_wx(MemRights::WRITE.erase()));
-        assert!(!violates_wx(MemRights::EXECUTE.erase()));
     }
 
     #[test]

@@ -1039,7 +1039,7 @@ pub unsafe fn unmap_user_region_pooled(
 
 /// x86-64 implementation of [`crate::mm::paging::unmap_identity_page`].
 ///
-/// Walks the kernel PML4 from `phys_to_virt(kernel_pml4_pa())` down to the
+/// Walks the kernel PML4 from `phys_to_virt(kernel_root_table_pa())` down to the
 /// leaf PT covering `pa` and clears the leaf entry. Bails silently if any
 /// intermediate level is absent (the mapping was already torn down or
 /// never installed). Issues a local `invlpg`, then broadcasts a TLB
@@ -1050,9 +1050,9 @@ pub unsafe fn unmap_user_region_pooled(
 #[cfg(not(test))]
 pub unsafe fn unmap_identity_page(pa: u64)
 {
-    use crate::mm::paging::{kernel_pml4_pa, phys_to_virt};
+    use crate::mm::paging::{kernel_root_table_pa, phys_to_virt};
 
-    let root_pa = kernel_pml4_pa();
+    let root_pa = kernel_root_table_pa();
     if root_pa == 0
     {
         return;

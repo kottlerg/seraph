@@ -1242,14 +1242,10 @@ pub mod fs_labels
     /// Request: badge identifies the file (per-file cap), `data[0]` =
     /// byte offset (no alignment requirement), `data[1]` = client-chosen
     /// release cookie (must be non-zero). `caps[0]` = optional per-process
-    /// release-endpoint SEND, transferred only on the first
-    /// `FS_READ_MEMORY` for a given (client, file) pair; the driver
-    /// records it on the lazy `OpenFile` slot allocated at that point
-    /// so its eviction worker can route cooperative `FS_RELEASE_MEMORY`
-    /// back to the client. Subsequent `FS_READ_MEMORY`s for the same
-    /// pair carry no caps. Clients that opt out of cooperative release
-    /// omit the cap on every call; eviction then revokes without the
-    /// cooperative round-trip.
+    /// release-endpoint SEND for cooperative `FS_RELEASE_MEMORY`; which
+    /// request carries it, and which carried SEND the driver records, are
+    /// specified in services/fs/docs/fs-driver-protocol.md § Label 7
+    /// (the record is per node, not per client).
     /// Reply: `data[0]` = bytes valid in the returned page starting at
     /// the indicated page offset, `data[1]` = the same release cookie
     /// echoed back, `data[2]` = byte offset within the returned page
@@ -1265,9 +1261,9 @@ pub mod fs_labels
     /// Release of a previously-returned page, in either direction.
     ///
     /// Driver-to-client (cooperative eviction): sent on the release endpoint
-    /// cap recorded in the node's open-file slot, taken from `caps[0]` of
-    /// the [`FS_READ_MEMORY`] that allocated the slot (shared per node, not
-    /// per client; tracked in #447); `data[0]` = the release cookie naming
+    /// cap recorded in the node's open-file slot, the first one an
+    /// [`FS_READ_MEMORY`] reaching that slot carried (shared per node, not per
+    /// client; tracked in #530); `data[0]` = the release cookie naming
     /// the Memory cap to unmap. The client unmaps it and replies
     /// [`FS_RELEASE_ACK`], first letting a local copy from the page finish
     /// within the watchdog window; any other reply label is no ack (the std
@@ -2234,9 +2230,10 @@ pub mod fs_errors
     /// Mutation refused: the target name already exists in the parent
     /// directory (`FS_CREATE`, `FS_MKDIR`, `FS_RENAME` destination).
     pub const EXISTS: u64 = 9;
-    /// Mutation refused: the volume has no free cluster, or the parent
+    /// Mutation refused: the volume has no free cluster, the parent
     /// directory has no room for a new entry (FAT16 fixed root full;
-    /// FAT32 cluster-chain extension failed).
+    /// FAT32 cluster-chain extension failed), or a write would end past
+    /// the largest file size the filesystem records.
     pub const NO_SPACE: u64 = 10;
     /// `FS_REMOVE` refused: the target directory is non-empty.
     pub const NOT_EMPTY: u64 = 11;
@@ -2738,10 +2735,10 @@ impl IpcMessageBuilder
 /// caller has insufficient rights (`GRANT` missing on a cap-bearing call),
 /// a cap slot is stale or Null (`InvalidCapability`), a cap slot is
 /// repeated in the message (`InvalidArgument`), a cap slot is pinned by an
-/// in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE` (`InvalidState`), or the call is
-/// interrupted. Cap-slot problems are rejected before blocking; a refusal
-/// arising only afterwards delivers the message with zero caps (the
-/// caller keeps its capabilities).
+/// in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer
+/// (`InvalidState`), or the call is interrupted. Cap-slot problems are
+/// rejected before blocking; a refusal arising only afterwards delivers the
+/// message with zero caps (the caller keeps its capabilities).
 #[inline]
 pub unsafe fn ipc_call(ep: u32, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 {
@@ -2807,9 +2804,9 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// all-or-nothing with the reply. An `Err` return consumes the pending
 /// reply either way: when a caller was claimed it has already been woken
 /// with the synthetic `IPC_REPLY_TRANSFER_FAILED` label (a reply cap slot
-/// stale, repeated, pinned by an in-flight revoke or move, or unacceptable to its `CSpace`), and
-/// when none was pending there is nothing to wake — in both cases the
-/// reply must not be retried.
+/// stale, repeated, pinned by an in-flight revoke, move, or IPC capability
+/// transfer, or unacceptable to its `CSpace`), and when none was pending
+/// there is nothing to wake — in both cases the reply must not be retried.
 ///
 /// # Safety
 /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC buffer
@@ -2819,11 +2816,11 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// Returns a negative `i64` error code: `InvalidCapability` (no pending
 /// reply target, or a reply cap slot is stale or Null), `InvalidArgument`
 /// (a cap slot repeated in the reply), `InvalidState` (a reply cap slot is
-/// pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), or `QuotaExceeded` /
-/// `OutOfMemory` (the caller's `CSpace` cannot accept the reply caps). The
-/// reply never blocks, so it never returns `Interrupted`; the message's
-/// counts are within the kernel's maxima by construction (the kernel clamps
-/// larger ones rather than rejecting them).
+/// pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
+/// transfer), or `QuotaExceeded` / `OutOfMemory` (the caller's `CSpace`
+/// cannot accept the reply caps). The reply never blocks, so it never returns
+/// `Interrupted`; the message's counts are within the kernel's maxima by
+/// construction (the kernel clamps larger ones rather than rejecting them).
 #[inline]
 pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 {

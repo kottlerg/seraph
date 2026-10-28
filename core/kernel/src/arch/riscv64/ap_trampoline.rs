@@ -194,7 +194,7 @@ pub unsafe fn start_ap(
     stack_top: u64,
 ) -> bool
 {
-    let root_pa = crate::mm::paging::kernel_pml4_pa();
+    let root_pa = crate::mm::paging::kernel_root_table_pa();
     let satp = super::paging::make_kernel_satp(root_pa);
 
     // SAFETY: setup_trampoline called; direct map active.

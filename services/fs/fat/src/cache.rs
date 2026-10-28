@@ -374,9 +374,21 @@ impl PageCache
         self.next_seq.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// Drop one reference on slot `idx`. A release of an unreferenced slot
+    /// is an accounting bug elsewhere; it is refused (and logged) rather
+    /// than wrapping the count to `u32::MAX`, which would pin the slot
+    /// for good.
     fn release(&self, idx: usize)
     {
-        self.slots[idx].refcount.fetch_sub(1, Ordering::AcqRel);
+        let dropped =
+            self.slots[idx]
+                .refcount
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        debug_assert!(dropped.is_ok(), "cache slot {idx} released with refcount 0");
+        if dropped.is_err()
+        {
+            std::os::seraph::log!("WARNING: cache slot {idx} released with refcount 0");
+        }
     }
 }
 

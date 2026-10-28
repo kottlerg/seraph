@@ -23,7 +23,7 @@
 
 use crate::bpb::{FatState, FatType, SECTOR_SIZE};
 use crate::cache::PageCache;
-use crate::fat::next_cluster;
+use crate::fat::chain_next;
 
 /// Per-module error surface. Mapped to `fs_errors` wire codes at the
 /// dispatch boundary.
@@ -32,8 +32,13 @@ pub enum FatError
 {
     /// Block-device read or write failure, or cache-acquire failure.
     Io,
-    /// No free cluster remains on the volume.
+    /// No free cluster, directory slot run, or short-name alias remains.
     NoSpace,
+    /// A write would end past the largest size a FAT directory entry
+    /// records (`u32::MAX` bytes).
+    FileTooLarge,
+    /// The target name already exists in the parent directory.
+    Exists,
     /// FAT chain or directory entry violates an invariant we cannot
     /// recover from (e.g. cluster index past `total_clusters`).
     Corrupt,
@@ -70,7 +75,7 @@ const FSI_STRUCT_SIG: u32 = 0x6141_7272;
 const FSI_TRAIL_SIG: u32 = 0xAA55_0000;
 
 /// Compute the FAT-sector LBA and byte offset within that sector for
-/// the given cluster index. Mirrors the arithmetic in [`next_cluster`]
+/// the given cluster index. Mirrors the arithmetic in [`chain_next`]
 /// without duplicating its cache-lookup path.
 fn fat_entry_location(state: &FatState, cluster: u32) -> (u32, usize)
 {
@@ -336,9 +341,17 @@ fn found_is_bad(
 /// `FREE = 0` into each FAT entry. Returns the count of clusters
 /// freed.
 ///
-/// Stops on end-of-chain, bad-cluster sentinel, or
-/// [`next_cluster`] returning `None`. The `next_free_hint` is biased
+/// Stops at the end-of-chain marker. The `next_free_hint` is biased
 /// toward the freed range so subsequent allocations reuse the slots.
+/// Callers detach the chain from its directory entry first, so a failure
+/// partway leaves only an orphan chain tail
+/// (services/fs/fat/docs/crash-safety.md).
+///
+/// # Errors
+/// [`FatError::Corrupt`] when `start` or a link lies outside the data
+/// region or reaches a bad-cluster marker; [`FatError::Io`] when a FAT
+/// sector cannot be read or written. Clusters freed before the failure
+/// stay freed.
 pub fn free_cluster_chain(
     state: &mut FatState,
     start: u32,
@@ -355,7 +368,19 @@ pub fn free_cluster_chain(
     let mut freed = 0u32;
     loop
     {
-        let next = next_cluster(state, cluster, cache, block_dev, ipc_buf);
+        // Read the link before freeing: a cluster whose own entry is the
+        // bad-cluster marker, or names a cluster outside the data region,
+        // is left as it is, and a cycle stops at the first cluster it
+        // already freed (its entry now reads FREE).
+        let next = match chain_next(state, cluster, cache, block_dev, ipc_buf)
+        {
+            Ok(next) => next,
+            Err(e) =>
+            {
+                flush_fsinfo(state, cache, block_dev, ipc_buf);
+                return Err(e);
+            }
+        };
         update_fat_entry(state, cluster, FREE, cache, block_dev, ipc_buf)?;
         freed += 1;
         if state.free_count_hint != u32::MAX
@@ -370,8 +395,8 @@ pub fn free_cluster_chain(
         }
         match next
         {
-            Some(n) if n >= 2 && n < 2 + state.total_clusters => cluster = n,
-            _ => break,
+            Some(n) => cluster = n,
+            None => break,
         }
     }
     // Mirror allocate_cluster: persist the updated free-count and
@@ -386,8 +411,11 @@ pub fn free_cluster_chain(
 /// `u32::MAX` sentinel; the allocator falls back to scanning from
 /// cluster 2.
 ///
-/// Signature mismatches are logged and treated as "no usable hints";
-/// the allocator still operates from the FAT itself.
+/// A failed read or a signature mismatch is logged and treated as "no
+/// `FSInfo` sector": the hints stay at the sentinel and `fsinfo_sector`
+/// is reset to `u32::MAX`, so [`flush_fsinfo`] never writes hints into a
+/// sector that is not an `FSInfo` sector. The allocator still operates
+/// from the FAT itself.
 pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc_buf: *mut u64)
 {
     if !matches!(state.fat_type, FatType::Fat32) || state.fsinfo_sector == u32::MAX
@@ -398,6 +426,7 @@ pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc_
     if !cache.read_sector(u64::from(state.fsinfo_sector), block_dev, &mut buf, ipc_buf)
     {
         std::os::seraph::log!("`FSInfo` sector read failed; allocator falls back to FAT scan");
+        state.fsinfo_sector = u32::MAX;
         return;
     }
     let lead = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -408,6 +437,7 @@ pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc_
         std::os::seraph::log!(
             "`FSInfo` signature mismatch (lead={lead:#x} struct={structsig:#x} trail={trail:#x}); ignoring hints"
         );
+        state.fsinfo_sector = u32::MAX;
         return;
     }
     let free = u32::from_le_bytes([buf[488], buf[489], buf[490], buf[491]]);

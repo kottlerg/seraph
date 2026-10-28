@@ -24,8 +24,8 @@ Each filesystem implementation is a standalone userspace process. A
 driver is a namespace server: it serves the cap-native `NS_*`
 protocol against per-node badged SEND caps on its own endpoint (see
 [`shared/namespace-protocol/README.md`](../../shared/namespace-protocol/README.md) § Badge shape),
-plus the surviving fs-driver-specific labels (`FS_MOUNT`, `FS_READ`,
-`FS_READ_MEMORY` family, `FS_CLOSE`) specified in
+plus the fs-driver-specific `FS_*` labels (mount, read, write, and
+directory mutation) specified in
 [`docs/fs-driver-protocol.md`](docs/fs-driver-protocol.md). At mount
 time vfsd keeps the driver's unbadged namespace endpoint; each lookup
 that crosses the mount mints an attenuated node cap on that endpoint,

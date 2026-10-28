@@ -259,8 +259,7 @@ Independent of the feature classification, the kernel imposes fixed platform lim
 - **Maximum RAM** is approximately 248 GiB. The kernel's boot-time direct-map pool is a fixed-size
   table sized for that ceiling; a platform with more RAM is refused at boot
   (`core/kernel/src/mm/paging.rs`).
-- **CPU count** is at most `MAX_CPUS` (512,
-  [abi/boot-protocol/README.md](../abi/boot-protocol/README.md)); CPUs beyond it are not brought up.
+- **CPU count** is at most `boot_protocol::MAX_CPUS` (512); CPUs beyond it are not brought up.
 - **riscv64 vector length** is at most VLEN 512 (`MAX_VLENB`); a wider boot hart is refused at boot.
 
 ---

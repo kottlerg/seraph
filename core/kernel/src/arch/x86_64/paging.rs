@@ -1052,9 +1052,6 @@ pub unsafe fn unmap_identity_page(pa: u64)
 {
     use crate::mm::paging::{kernel_pml4_pa, phys_to_virt};
 
-    /// PS / large-page bit (bit 7 in PDPT / PD entries).
-    const LARGE_PAGE_BIT: u64 = 1 << 7;
-
     let root_pa = kernel_pml4_pa();
     if root_pa == 0
     {
@@ -1081,7 +1078,7 @@ pub unsafe fn unmap_identity_page(pa: u64)
     // A 1 GiB leaf at PDPT level means there is no PD/PT below; the caller
     // is asking us to clear a 4 KiB region inside a huge mapping, which we
     // refuse rather than corrupting the leaf's phys range.
-    if e.0 & LARGE_PAGE_BIT != 0
+    if e.0 & LARGE_PAGE != 0
     {
         return;
     }
@@ -1093,7 +1090,7 @@ pub unsafe fn unmap_identity_page(pa: u64)
         return;
     }
     // Same guard at PD level for 2 MiB leaves.
-    if e.0 & LARGE_PAGE_BIT != 0
+    if e.0 & LARGE_PAGE != 0
     {
         return;
     }

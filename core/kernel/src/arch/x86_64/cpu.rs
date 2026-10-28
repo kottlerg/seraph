@@ -8,12 +8,12 @@
 //! gate, per-CPU GS-base install and lookup, the kernel trap stack, interrupt
 //! control and halt, and the fence ahead of an x2APIC MSR write.
 //!
-//! `current_stack_pointer`, the CR4/MSR accessors, `x2apic_wrmsr_fence`, `copy_user`, `user_copy_fixup`, the
-//! enable routines, `verify_baseline`, `install_percpu`, and the trap-stack and interrupt
-//! save/restore primitives are built only under `#[cfg(not(test))]` (`copy_user` and
-//! `verify_baseline` have host stubs). `cpuid`, `current_id`, `current_cpu` (which
-//! returns 0 under test), `halt_until_interrupt`, `disable_interrupts`, and `halt_loop`
-//! are also built for host tests.
+//! `current_stack_pointer`, the CR4/MSR accessors, `x2apic_wrmsr_fence`, `copy_user`,
+//! `user_copy_fixup`, the enable routines, `verify_baseline`, `install_percpu`, and the
+//! trap-stack and interrupt save/restore primitives are built only under
+//! `#[cfg(not(test))]` (`copy_user` and `verify_baseline` have host stubs). `cpuid`,
+//! `current_id`, `current_cpu` (which returns 0 under test), `halt_until_interrupt`,
+//! `disable_interrupts`, and `halt_loop` are also built for host tests.
 
 // ── CPUID ─────────────────────────────────────────────────────────────────────
 

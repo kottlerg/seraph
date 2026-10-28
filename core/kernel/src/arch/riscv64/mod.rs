@@ -58,10 +58,9 @@ pub const HAS_SBI: bool = true;
 /// above panics (#443).
 pub const ROOT_IRQ_COUNT: u32 = 1024;
 
-/// Size of the I/O Permission Bitmap. Zero on RISC-V (no I/O port concept).
-/// Types the `ThreadControlBlock::iopb` pointer (`*mut [u8; IOPB_SIZE]`)
-/// uniformly across arches; RISC-V threads always leave it null.
-pub const IOPB_SIZE: usize = 0;
+/// Size of the I/O Permission Bitmap (re-exported from gdt for use in
+/// architecture-independent code such as `ThreadControlBlock`).
+pub use gdt::IOPB_SIZE;
 
 /// Forward a sanctioned SBI call to M-mode firmware, mapping any SBI error to a
 /// generic failure. Cap-rights enforcement happens in the neutral

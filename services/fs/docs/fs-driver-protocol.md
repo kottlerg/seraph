@@ -549,7 +549,8 @@ of a failed rename is tracked in
 [#447](https://github.com/kottlerg/seraph/issues/447).
 
 **Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination
-occupied), `NO_SPACE`, `IO_ERROR` (malformed name lengths, an invalid name),
+occupied), `NO_SPACE`, `IO_ERROR` (malformed name lengths, an invalid name, a
+failed block access, or a corrupt directory),
 `PERMISSION_DENIED`, `INVALID_BADGE` (the badge is not a directory node).
 
 ---

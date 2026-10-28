@@ -950,28 +950,34 @@ fn reply_err(code: u64, ipc_buf: *mut u64)
 
 /// Resolve a parent-dir `NodeId` to the directory's cluster number.
 /// `NodeId(0)` is the root; FAT16 returns the sentinel cluster 0, FAT32
-/// returns `state.root_cluster`. Non-root ids must be present in the
-/// table and refer to a directory whose cluster lies in the data region.
-fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> Option<u32>
+/// returns `state.root_cluster`.
+///
+/// # Errors
+/// The `fs_errors` code to reply: `INVALID_BADGE` when a non-root id is
+/// absent from the table or names a file; `IO_ERROR` when it names a
+/// directory whose cluster lies outside the data region. That cluster
+/// comes from a corrupt directory entry: cluster 0 would name the FAT16
+/// fixed root, so serving it would turn a cap on the subdirectory into
+/// one on the root.
+fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> Result<u32, u64>
 {
     if node_id.raw() == 0
     {
-        return Some(match state.fat_type
+        return Ok(match state.fat_type
         {
             bpb::FatType::Fat32 => state.root_cluster,
             bpb::FatType::Fat16 => 0,
         });
     }
-    let node = nodes.get(node_id)?;
-    // A subdirectory's cluster comes from its directory entry. Cluster 0
-    // names the root (the FAT16 fixed root to the directory walks), so a
-    // subdirectory entry outside the data region would turn a cap on the
-    // subdirectory into one on the root.
-    if node.kind != NodeKind::Dir || !state.is_data_cluster(node.cluster)
+    let node = nodes
+        .get(node_id)
+        .filter(|n| n.kind == NodeKind::Dir)
+        .ok_or(ipc::fs_errors::INVALID_BADGE)?;
+    if !state.is_data_cluster(node.cluster)
     {
-        return None;
+        return Err(ipc::fs_errors::IO_ERROR);
     }
-    Some(node.cluster)
+    Ok(node.cluster)
 }
 
 /// Common cluster-walk-and-write engine used by `FS_WRITE` and
@@ -1453,11 +1459,14 @@ fn create_entry_common(
     ipc_buf: *mut u64,
 )
 {
-    let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
-    else
+    let parent_cluster = match resolve_dir_cluster(node_id, state, nodes)
     {
-        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
-        return;
+        Ok(cluster) => cluster,
+        Err(code) =>
+        {
+            reply_err(code, ipc_buf);
+            return;
+        }
     };
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
     let data_bytes = msg.data_bytes();
@@ -1585,11 +1594,14 @@ fn handle_remove_node_cap(
     ipc_buf: *mut u64,
 )
 {
-    let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
-    else
+    let parent_cluster = match resolve_dir_cluster(node_id, state, nodes)
     {
-        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
-        return;
+        Ok(cluster) => cluster,
+        Err(code) =>
+        {
+            reply_err(code, ipc_buf);
+            return;
+        }
     };
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
     let data_bytes = msg.data_bytes();
@@ -1699,11 +1711,14 @@ fn handle_rename_node_cap(
     ipc_buf: *mut u64,
 )
 {
-    let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
-    else
+    let parent_cluster = match resolve_dir_cluster(node_id, state, nodes)
     {
-        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
-        return;
+        Ok(cluster) => cluster,
+        Err(code) =>
+        {
+            reply_err(code, ipc_buf);
+            return;
+        }
     };
     let src_len = msg.word(0) as usize;
     let dst_len = msg.word(1) as usize;

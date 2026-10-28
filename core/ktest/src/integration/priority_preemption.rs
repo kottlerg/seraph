@@ -42,6 +42,10 @@ const SPIN_ITERS: u64 = 50_000_000;
 /// thread waits for a host core before it can switch to the child.
 const PREEMPT_BUDGET_US: u64 = 100_000;
 
+/// 5 s windows the test waits, at most, for the hog to finish before
+/// deleting it wherever it is.
+const HOG_DRAIN_WINDOWS: u32 = 12;
+
 static mut HOG_STACK: ChildStack = ChildStack::ZERO;
 static mut ELEVATED_STACK: ChildStack = ChildStack::ZERO;
 
@@ -157,16 +161,19 @@ pub fn run(ctx: &TestContext) -> TestResult
         );
     }
 
-    // Drain the hog's done bit (it will finish eventually).
-    loop
+    // Let the hog finish before tearing it down, unless the wait above
+    // already took its done bit. The hog may take ~1 s to complete, longer
+    // on an oversubscribed boot; wait in 5 s windows, at most
+    // HOG_DRAIN_WINDOWS of them, after which the delete below stops it
+    // wherever it is.
+    let mut seen = bits;
+    for _ in 0..HOG_DRAIN_WINDOWS
     {
-        let bits = notification_wait_timeout(done, 5_000).unwrap_or(0);
-        if bits & 0x1 != 0
+        if seen & 0x1 != 0
         {
             break;
         }
-        // The hog may take ~1 s to complete; keep waiting in small windows
-        // rather than blocking forever.
+        seen |= notification_wait_timeout(done, 5_000).unwrap_or(0);
     }
 
     cap_delete(hog.th).ok();

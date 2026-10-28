@@ -203,15 +203,17 @@ step a scaled count's placements across the whole CPU range (`stress::rotation_s
 `concurrent_ipc` logs the cycles it has done at most every 10 s, so a long run of it at a wide CPU
 count is not silent.
 
-For the same reason, a wall-clock bound or budget whose expiry fails a test, in any tier, applies
-through `scaled_bound` (`src/main.rs`): as written up to 16 CPUs, so the tight budgets the CI widths
-check are unchanged, and multiplied past it by the oversubscription factor the width implies (CPUs
-/ 16), by which each cross-CPU handoff slows, so the bound still separates a slow step from a stuck
-or wrong one. The stress cells' round, acknowledgement and report bounds, the preemption budget
-of `integration::priority_preemption`, the expiry and report bounds of
-`integration::queued_waiters_fifo`, and the migration polls of
-`thread::affinity_migrate_running` apply through it; a bound whose expiry only tallies a starved
-round does not.
+For the same reason, the wall-clock bounds and budgets listed here, each of whose expiry fails a
+test, apply through `scaled_bound` (`src/main.rs`): as written up to 16 CPUs, so the tight budgets
+the CI widths check are unchanged, and multiplied past it by the oversubscription factor the width
+implies (CPUs / 16), by which each cross-CPU handoff slows, so the bound still separates a slow
+step from a stuck or wrong one. They are the report bound of `tally::await_report` and
+`tally::await_all`; the round bounds of `configure_start_race` and `stop_target_vanishes`; the
+acknowledgement, result, approach, sync, entry and CPU-report bounds of `stop_claimed_delete`,
+`stop_park_race`, `stop_fault_sender`, `timed_wait_reuse` and `priority_dealloc_race`; the
+preemption budget of `integration::priority_preemption`; the expiry and report bounds of
+`integration::queued_waiters_fifo`; and the migration polls of `thread::affinity_migrate_running`.
+Every other bound applies as written.
 
 A controller waits for a child to reach a state by a notification bit the child sends on reaching
 it. For a state inside a blocking call (`ipc_call`, `ipc_recv`, a notification wait) or at an exit,

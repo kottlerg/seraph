@@ -347,14 +347,14 @@ fn race_once(kind: Kind, peer: u32, source: Option<u32>, cycle: u32) -> Result<b
 /// announced in time, fails the race.
 fn await_parking(peer: u32, cycle: u32) -> TestResult
 {
+    let bound = crate::scaled_bound(APPROACH_WAIT_US);
     let start = elapsed_us()?;
     let mut spins = 0u32;
     while PARKING.load(Ordering::Acquire) != cycle
     {
         spins = spins.wrapping_add(1);
         if spins.is_multiple_of(POLL_SPINS)
-            && (spawn::is_exited(peer)?
-                || elapsed_us()?.saturating_sub(start) > crate::scaled_bound(APPROACH_WAIT_US))
+            && (spawn::is_exited(peer)? || elapsed_us()?.saturating_sub(start) > bound)
         {
             return Err("stress::stop_park_race: the peer never approached its park");
         }
@@ -369,6 +369,7 @@ fn await_parking(peer: u32, cycle: u32) -> TestResult
 /// `ElapsedUs` clock.
 fn await_result(kind: Kind, source: Option<u32>, cycle: u32) -> TestResult
 {
+    let bound = crate::scaled_bound(RESULT_WAIT_US);
     let start = elapsed_us()?;
     let mut spins = 0u32;
     let mut rescued = false;
@@ -388,7 +389,7 @@ fn await_result(kind: Kind, source: Option<u32>, cycle: u32) -> TestResult
                 .map_err(|_| "stress::stop_park_race: rescue send failed")?;
             rescued = true;
         }
-        if elapsed_us()?.saturating_sub(start) > crate::scaled_bound(RESULT_WAIT_US)
+        if elapsed_us()?.saturating_sub(start) > bound
         {
             return Err("stress::stop_park_race: the peer never reported its result");
         }

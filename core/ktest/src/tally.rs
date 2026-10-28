@@ -139,9 +139,10 @@ pub fn recv_diag(stage: RecvFailureStage, error: i64)
 }
 
 /// Each [`await_report`] or [`await_all`] waits in slices of this many
-/// milliseconds, at most [`REPORT_SLICES`] of them (5 s in all).
+/// milliseconds, at most [`REPORT_SLICES`] of them (5 s in all), the count
+/// applied through [`crate::scaled_bound`].
 const REPORT_SLICE_MS: u64 = 5;
-const REPORT_SLICES: u32 = 1000;
+const REPORT_SLICES: u64 = 1000;
 
 /// Accumulate the bits children send on `done` into `acc` until one of
 /// `mask` is present, failing with `err` once [`REPORT_SLICES`] slices pass
@@ -181,7 +182,7 @@ fn await_bits(
     err: &'static str,
 ) -> TestResult
 {
-    for _ in 0..REPORT_SLICES
+    for _ in 0..crate::scaled_bound(REPORT_SLICES)
     {
         if reached(*acc)
         {

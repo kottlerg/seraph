@@ -61,7 +61,7 @@ const SETTLE_SLEEP_MS: u64 = 20;
 const EXPIRE_MS: u64 = 100;
 /// Slack [`head_expires`] leaves before waiter A's earliest expiry: the
 /// kernel rounds a deadline to its timer tick, so a wait can expire up to a
-/// tick before `EXPIRE_MS` of `ElapsedUs` have passed.
+/// tick before the scaled `EXPIRE_MS` of `ElapsedUs` have passed.
 const EXPIRE_SLACK_MS: u64 = 20;
 /// Bound on each controller wait for a child's report.
 const REPORT_MS: u64 = 1000;
@@ -221,7 +221,7 @@ fn fifo(p: &mut Phase, ctx: &TestContext) -> TestResult
 
 fn head_expires(p: &mut Phase, ctx: &TestContext) -> TestResult
 {
-    // A enters its wait after this, so its deadline lies at least EXPIRE_MS
+    // A enters its wait after this, so its deadline lies at least the scaled EXPIRE_MS
     // (less a tick) past it.
     let before_a = elapsed_us()?;
     p.start(

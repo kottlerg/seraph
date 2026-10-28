@@ -176,12 +176,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         // receives first takes the call when it comes; the armed wait below
         // proves the client parked either way.
         let mut acc = 0u64;
-        while acc & BIT_CLIENT_CALLING == 0
-        {
-            let bits = notification_wait(done)
-                .map_err(|_| "stress::cap_delete_reply_wake: notification_wait(calling) failed")?;
-            acc |= bits;
-        }
+        crate::tally::await_report(
+            done,
+            &mut acc,
+            BIT_CLIENT_CALLING,
+            "stress::cap_delete_reply_wake: the client never reached its call",
+        )?;
 
         // ── Server child: RECEIVE on ep, signal on done. ────────────────────
         let server = spawn::new_child(ctx)

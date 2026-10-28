@@ -45,8 +45,8 @@ const CYCLES: usize = 200;
 const CPU_CHECK_SPINS: u32 = 4096;
 
 /// Bound on the controller's wait for a pinned worker to report its CPU, in
-/// slices of [`CPU_WAIT_SLICE_MS`].
-const CPU_WAIT_SLICES: u32 = 1000;
+/// slices of [`CPU_WAIT_SLICE_MS`]; applied through [`crate::scaled_bound`].
+const CPU_WAIT_SLICES: u64 = 1000;
 const CPU_WAIT_SLICE_MS: u64 = 5;
 
 /// The CPU each worker last saw itself on (`u32::MAX` before it first
@@ -189,9 +189,12 @@ fn churn_and_delete(
     {
         let i_u32 = u32::try_from(i).unwrap_or(0);
         let target_cpu = (i_u32 + 1) % cpu_mod;
-        // Phase 1 left the workers spinning at levels 3 and 9; at the top
-        // level of the cell this worker runs on its pinned CPU whatever
-        // spins there, so it can report it.
+        // Forget the CPU the worker reported in Phase 1, which may equal
+        // the target, so only a report it makes from here satisfies the
+        // wait below. Phase 1 left the workers spinning at levels 3 and 9;
+        // at the top level of the cell this worker runs on its pinned CPU
+        // whatever spins there, so it can report it.
+        WORKER_CPU[i].store(u32::MAX, Ordering::Release);
         let _ = thread_set_priority(workers.threads[i], 11, ctx.sched_control_cap);
         let _ = thread_set_affinity(workers.threads[i], target_cpu);
         // Churn and delete the worker once it reports running on its pinned
@@ -213,7 +216,7 @@ fn churn_and_delete(
 /// thread's CPU runs meanwhile.
 fn await_worker_on(moved: u32, index: usize, cpu: u32) -> TestResult
 {
-    for _ in 0..CPU_WAIT_SLICES
+    for _ in 0..crate::scaled_bound(CPU_WAIT_SLICES)
     {
         if WORKER_CPU[index].load(Ordering::Acquire) == cpu
         {

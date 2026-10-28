@@ -93,15 +93,21 @@ fn scaled_attempts(base: u32, floor: u32, cpus: u64) -> u32
 }
 
 /// The placement slot of `cycle`, out of `cycles`, for a cell that rotates
-/// its pinned children over `span` CPUs: consecutive cycles step by
-/// `span / cycles` slots (at least 1), so a cell whose scaled count is below
-/// the width still spreads its placements over every CPU index range. With
-/// `cycles >= span` it is `cycle % span`.
+/// its pinned children over `span` CPUs: with `cycles < span` the cycles'
+/// slots are spaced evenly over the whole span (`cycle * span / cycles`), so
+/// a cell whose scaled count is below the width still places children up to
+/// its highest CPU indices; with `cycles >= span` it is `cycle % span`.
 fn rotation_slot(cycle: u32, cycles: u32, span: u32) -> u32
 {
     let span = span.max(1);
-    let stride = (span / cycles.max(1)).max(1);
-    let slot = u64::from(cycle) * u64::from(stride) % u64::from(span);
+    let slot = if cycles < span
+    {
+        u64::from(cycle) * u64::from(span) / u64::from(cycles.max(1)) % u64::from(span)
+    }
+    else
+    {
+        u64::from(cycle % span)
+    };
     // slot < span, a u32.
     u32::try_from(slot).unwrap_or(0)
 }

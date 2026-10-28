@@ -741,6 +741,7 @@ fn call_handler(parts: &Parts, label: u64) -> TestResult
     SYNC_REQUEST.store(label, Ordering::Release);
     notification_send(notif, 1)
         .map_err(|_| "stress::stop_fault_sender: the sync request send failed")?;
+    let bound = crate::scaled_bound(SYNC_WAIT_US);
     let start = elapsed_us()?;
     let mut spins = 0u32;
     while SYNCS_DONE.load(Ordering::Acquire) == before
@@ -761,7 +762,7 @@ fn call_handler(parts: &Parts, label: u64) -> TestResult
                     "stress::stop_fault_sender: the syncer exited before its call returned",
                 );
             }
-            if elapsed_us()?.saturating_sub(start) > crate::scaled_bound(SYNC_WAIT_US)
+            if elapsed_us()?.saturating_sub(start) > bound
             {
                 return Err("stress::stop_fault_sender: the handler did not answer a sync call");
             }

@@ -154,7 +154,7 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
     // concurrent-stop rollback, already Stopped/Exited and not re-enqueued).
     // SAFETY: scheduler initialised; fault context.
     unsafe {
-        crate::sched::schedule(false);
+        crate::sched::schedule(crate::sched::Requeue::IfRunnable);
     }
 
     // Resumed. Read the disposition the wake-claim winner committed. Anything

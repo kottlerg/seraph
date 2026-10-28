@@ -138,9 +138,10 @@ impl ServiceEntry
 
 /// Heap-backed launch surfaces that don't fit the fixed-size
 /// [`ServiceEntry`] record but must be replayed on every restart so a
-/// respawned child comes back with the same argv/env/cwd/seed it got on
-/// first launch. Held in a table on `SvcmgrState` index-aligned with
-/// `services[]` via the death correlator (which is the table index).
+/// respawned child comes back with the same argv/env/cwd/seed, log-sink
+/// flag, and scheduling fields it got on first launch. Held in a table on
+/// `SvcmgrState` index-aligned with `services[]` via the death correlator
+/// (which is the table index).
 pub struct RestartRecipe
 {
     pub argv: Vec<String>,

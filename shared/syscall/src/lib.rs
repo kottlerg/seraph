@@ -418,24 +418,30 @@ pub fn cap_create_notification(memory_cap: u32) -> Result<u32, i64>
 ///
 /// `memory_cap`, a generation-checked capability handle, must carry
 /// `MemRights::RETYPE` and have at least `init_pages * PAGE_SIZE` of
-/// `available_bytes`. In create mode page 0 of
-/// the slab is the kernel wrapper page, page 1 the root PT, and pages
-/// `2..init_pages` seed the PT growth pool; `init_pages` must be `>= 2`.
+/// `available_bytes`. In create mode page 0 of the slab is the kernel wrapper
+/// page, page 1 the root PT, and pages `2..init_pages` seed the PT growth
+/// pool; `init_pages` must be `>= 2`.
 ///
 /// `augment_target` selects the mode:
 /// - `0` → create a new `AddressSpace`; returns the new capability handle
 ///   (slot index plus generation).
-/// - non-zero `AddressSpace` capability handle (generation-checked) → augment
-///   that AS's PT growth pool
-///   with the `init_pages` carved pages (`init_pages >= 1`); returns `0`.
-///   Once per record page of the kernel's donation bookkeeping, a donation
-///   keeps its first page for that bookkeeping and seeds `init_pages - 1`,
-///   so a one-page donation can leave the budget unchanged; read the budget
-///   back with `CAP_INFO_ASPACE_PT_BUDGET` rather than assuming the count.
+/// - non-zero `AddressSpace` capability handle (generation-checked, with Map
+///   rights) → augment that AS's PT growth pool with the `init_pages` carved
+///   pages (`init_pages >= 1`); returns `0`. Once per record page of the
+///   kernel's donation bookkeeping, a donation keeps its first page for that
+///   bookkeeping and seeds `init_pages - 1`, so a one-page donation can leave
+///   the budget unchanged; read the budget back with
+///   `CAP_INFO_ASPACE_PT_BUDGET` rather than assuming the count.
 ///
 /// # Errors
-/// Returns a negative `i64` error code on insufficient memory budget,
-/// invalid cap, or a full `CSpace`.
+/// Returns a negative `i64` error code, per `SYS_CAP_CREATE_ASPACE` in
+/// `core/kernel/docs/syscalls.md`: `InvalidArgument` if `init_pages` is 0,
+/// `init_pages * PAGE_SIZE` overflows, or create mode has `init_pages < 2`;
+/// `InvalidCapability` if either handle is invalid, stale, or names the wrong
+/// object type; `InsufficientRights` if `memory_cap` lacks Retype or the
+/// augment target lacks Map; `OutOfMemory` if `memory_cap`'s region or the
+/// caller's `CSpace` slot-page pool is exhausted; `QuotaExceeded` if the
+/// caller's `CSpace` directory is structurally full.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
@@ -458,15 +464,15 @@ pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 ///
 /// `memory_cap`, a generation-checked capability handle, must carry
 /// `MemRights::RETYPE` and have at least `init_pages * PAGE_SIZE` of
-/// `available_bytes`. In create mode the
-/// slab's page 0 is the kernel wrapper page; pages `1..init_pages` seed
-/// the slot-page pool (each backs 56 slots). `init_pages` must be `>= 1`.
+/// `available_bytes`. In create mode the slab's page 0 is the kernel wrapper
+/// page; pages `1..init_pages` seed the slot-page pool (each backs 56 slots).
+/// `init_pages` must be `>= 1`.
 ///
 /// `augment_target`:
 /// - `0` → create new; returns the new capability handle (slot index plus
 ///   generation).
-/// - non-zero `CSpace` capability handle (generation-checked) → augment that
-///   `CSpace`'s growth pool with the `init_pages`
+/// - non-zero `CSpace` capability handle (generation-checked, with Insert
+///   rights) → augment that `CSpace`'s growth pool with the `init_pages`
 ///   carved pages; returns `0`. As for `cap_create_aspace`, once per record
 ///   page of the kernel's donation bookkeeping a donation seeds
 ///   `init_pages - 1`; read the budget back with `CAP_INFO_CSPACE_BUDGET`.
@@ -476,10 +482,17 @@ pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 /// directory's structural ceiling.
 ///
 /// # Errors
-/// Returns a negative `i64` error code on insufficient memory budget or
-/// invalid cap. A later cap insert into the `CSpace` fails with
-/// `OutOfMemory` (-8) when the seeded pool is exhausted (refill via
-/// augment mode) and `QuotaExceeded` (-17) at the structural ceiling.
+/// Returns a negative `i64` error code, per `SYS_CAP_CREATE_CSPACE` in
+/// `core/kernel/docs/syscalls.md`: `InvalidArgument` if `init_pages` is 0 or
+/// `init_pages * PAGE_SIZE` overflows; `InvalidCapability` if either handle
+/// is invalid, stale, or names the wrong object type; `InsufficientRights` if
+/// `memory_cap` lacks Retype or the augment target lacks Insert;
+/// `OutOfMemory` if `memory_cap`'s region or the caller's `CSpace` slot-page
+/// pool is exhausted, or, in create mode, the kernel's 4096-entry `CSpace` id
+/// namespace is; `QuotaExceeded` if the caller's `CSpace` directory is
+/// structurally full. A later cap insert into the new `CSpace` fails with
+/// `OutOfMemory` (-8) when the seeded pool is exhausted (refill via augment
+/// mode) and `QuotaExceeded` (-17) at the structural ceiling.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_create_cspace(memory_cap: u32, augment_target: u32, init_pages: u64)
@@ -778,11 +791,12 @@ pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 /// is not page-aligned, or is out of range for the region.
 ///
 /// The split consumes the original under the derivation lock. `InvalidState`
-/// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
-/// in flight; `Interrupted` if a concurrent deriver extended its child list
-/// faster than the batched reparent could move it (retry); `OutOfMemory` if
-/// the caller's `CSpace` cannot back two more slots (`QuotaExceeded` at the
-/// structural ceiling).
+/// if a concurrent delete removed the original or a `SYS_CAP_REVOKE`,
+/// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
+/// `Interrupted` if a concurrent deriver extended its child list faster than
+/// the batched reparent could move it (retry); `OutOfMemory` if the caller's
+/// `CSpace` cannot back two more slots (`QuotaExceeded` at the structural
+/// ceiling).
 // cast_sign_loss: proven non-negative in Ok branch.
 // cast_possible_truncation: each returned handle is 32 bits (a 24-bit slot index
 // plus an 8-bit generation).
@@ -818,11 +832,12 @@ pub fn mmio_split(mmio_cap: u32, split_offset: u64) -> Result<(u32, u32), i64>
 /// falls outside the cap's range.
 ///
 /// The split consumes the original under the derivation lock. `InvalidState`
-/// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
-/// in flight; `Interrupted` if a concurrent deriver extended its child list
-/// faster than the batched reparent could move it (retry); `OutOfMemory` if
-/// the caller's `CSpace` cannot back two more slots (`QuotaExceeded` at the
-/// structural ceiling).
+/// if a concurrent delete removed the original or a `SYS_CAP_REVOKE`,
+/// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
+/// `Interrupted` if a concurrent deriver extended its child list faster than
+/// the batched reparent could move it (retry); `OutOfMemory` if the caller's
+/// `CSpace` cannot back two more slots (`QuotaExceeded` at the structural
+/// ceiling).
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -869,11 +884,12 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 /// architecture.
 ///
 /// The split consumes the original under the derivation lock. `InvalidState`
-/// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
-/// in flight; `Interrupted` if a concurrent deriver extended its child list
-/// faster than the batched reparent could move it (retry); `OutOfMemory` if
-/// the caller's `CSpace` cannot back two more slots (`QuotaExceeded` at the
-/// structural ceiling).
+/// if a concurrent delete removed the original or a `SYS_CAP_REVOKE`,
+/// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
+/// `Interrupted` if a concurrent deriver extended its child list faster than
+/// the batched reparent could move it (retry); `OutOfMemory` if the caller's
+/// `CSpace` cannot back two more slots (`QuotaExceeded` at the structural
+/// ceiling).
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -915,11 +931,12 @@ pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
 /// falls outside the cap's band.
 ///
 /// The split consumes the original under the derivation lock. `InvalidState`
-/// if a concurrent delete removed the original or a `SYS_CAP_REVOKE` on it is
-/// in flight; `Interrupted` if a concurrent deriver extended its child list
-/// faster than the batched reparent could move it (retry); `OutOfMemory` if
-/// the caller's `CSpace` cannot back two more slots (`QuotaExceeded` at the
-/// structural ceiling).
+/// if a concurrent delete removed the original or a `SYS_CAP_REVOKE`,
+/// `SYS_CAP_MOVE`, or IPC capability transfer on it is in flight;
+/// `Interrupted` if a concurrent deriver extended its child list faster than
+/// the batched reparent could move it (retry); `OutOfMemory` if the caller's
+/// `CSpace` cannot back two more slots (`QuotaExceeded` at the structural
+/// ceiling).
 // cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
@@ -1156,11 +1173,10 @@ pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` if the handle
 /// is out of range or carries a stale generation (deleting a Null slot
-/// succeeds);
-/// `InvalidState` if the slot names the caller's
-/// own thread or a `SYS_CAP_REVOKE` on it is in flight; `Interrupted` if a
-/// concurrent deriver extended the slot's child list faster than the
-/// batched reparent could move it (retry).
+/// succeeds); `InvalidState` if the slot names the caller's own thread or a
+/// `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer on it is in
+/// flight; `Interrupted` if a concurrent deriver extended the slot's child
+/// list faster than the batched reparent could move it (retry).
 pub fn cap_delete(slot: u32) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; slot is cap index as u64;
@@ -1173,14 +1189,15 @@ pub fn cap_delete(slot: u32) -> Result<(), i64>
 ///
 /// Clears the entire descendant subtree; the root slot is preserved. A
 /// revoked capability that was an object's last reference tears the object
-/// down as [`cap_delete`] describes, including the case that never returns.
+/// down as [`cap_delete`] describes, including the cases in which the call
+/// never returns.
 ///
 /// # Errors
 /// - `InvalidCapability` (-2) — the handle names no live slot, or its
 ///   generation is stale.
-/// - `InvalidState` (-15) — another revoke is already in flight on this
-///   slot, or the kernel found a corrupted derivation link (the revoke is
-///   incomplete).
+/// - `InvalidState` (-15) — another revoke, a move, or an IPC capability
+///   transfer is already in flight on this slot, or the kernel found a
+///   corrupted derivation link (the revoke is incomplete).
 /// - `Interrupted` (-16) — the kernel's liveness backstop tripped under
 ///   sustained concurrent derivation; everything revoked so far stays
 ///   revoked, and a retry continues (see [`cap_revoke_all`]).
@@ -1371,19 +1388,23 @@ pub fn system_info(kind: u64) -> Result<u64, i64>
 /// # Field semantics
 /// - `CAP_INFO_TAG_RIGHTS` is valid for any non-null slot and returns
 ///   `((tag as u8 as u64) << 32) | (rights as u32 as u64)`.
+/// - `CAP_INFO_TLB_ELIDED` and `CAP_INFO_TLB_PERFORMED` are system-wide
+///   counters: they accept any live slot, whatever its tag.
 /// - All other selectors are tag-specific:
 ///   - `CAP_INFO_MEMORY_*` require `CapTag::Memory`.
 ///   - `CAP_INFO_ASPACE_*` require `CapTag::AddressSpace`.
 ///   - `CAP_INFO_CSPACE_*` require `CapTag::CSpace`.
+///   - `CAP_INFO_THREAD_STATE` requires `CapTag::Thread`.
 ///
 /// Calling a tag-specific field on a slot whose tag does not match
 /// returns `SyscallError::InvalidArgument` (-5). Unknown selectors return
 /// the same error.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the slot is null/invalid
-/// (`InvalidCapability`) or the selector is unknown / mismatched
-/// (`InvalidArgument`).
+/// Returns a negative `i64` error code: `InvalidCapability` if the handle is
+/// null, out of range, or stale, the slot is empty, or the object the slot
+/// references is gone; `InvalidArgument` if the selector is unknown or
+/// requires a different capability tag.
 // cast_sign_loss: ret is proven non-negative in the Ok branch.
 #[allow(clippy::cast_sign_loss)]
 #[inline]

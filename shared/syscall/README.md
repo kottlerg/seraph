@@ -6,7 +6,10 @@ Thin `no_std` wrappers that issue the architecture-specific instruction
 (`SYSCALL` on x86-64, `ECALL` on RISC-V) and return the kernel result, per the
 [syscall specification](../../core/kernel/docs/syscalls.md). All
 syscall numbers, error codes, and constants come from [`abi/syscall/`](../../abi/syscall/README.md).
-This crate adds only the inline-assembly invocation layer.
+Beyond the inline-assembly invocation layer, a few wrappers do work in userspace: some reject an
+argument the kernel would misread without issuing the syscall (`cap_insert` returns
+`InvalidArgument` for a destination index of 0, which the kernel reads as "allocate a slot"),
+and some compose calls (`cap_revoke_all` retries `cap_revoke` while it reports `Interrupted`).
 
 No stability obligation. Not used by the kernel.
 

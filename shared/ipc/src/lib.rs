@@ -848,11 +848,13 @@ pub mod svcmgr_labels
     pub const PUBLISH_ENDPOINT: u64 = 3;
     /// Look up a named endpoint; reply transfers the cap if known.
     ///
-    /// Label bits 16..31 carry `name_len` (see `shared/ipc` `read_path`
-    /// pattern); data words from 0 carry the name. Reply attaches the cap on
-    /// success, or returns `svcmgr_errors::UNKNOWN_NAME` on miss and for a
-    /// seed-only name (one whose cap carries authority, which reaches only
-    /// the recipes seeding it; see [`crate::published_names`]).
+    /// Label bits 16..31 carry `name_len`; data words from 0 carry the name
+    /// bytes packed little-endian, as for [`PUBLISH_ENDPOINT`]
+    /// (`registry-client`'s `pack_name` is the reference encoder). Reply
+    /// attaches the cap on success, or returns `svcmgr_errors::UNKNOWN_NAME`
+    /// on miss and for a seed-only name (one whose cap carries authority,
+    /// which reaches only the recipes seeding it; see
+    /// [`crate::published_names`]).
     pub const QUERY_ENDPOINT: u64 = 4;
 
     /// Verb-bit carried by the caller's badge to authorise

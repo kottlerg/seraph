@@ -414,7 +414,8 @@ pub unsafe fn parse_hart_caps(rsdp_addr: u64) -> (u64, u64)
 /// Walk the ACPI MADT starting from `rsdp_addr` and collect CPU topology.
 ///
 /// Returns `(cpu_count, bsp_id, cpu_ids)`:
-/// - `cpu_count`: number of enabled CPUs (at most [`MAX_CPUS`]).
+/// - `cpu_count`: number of distinct enabled CPUs, the BSP counted once
+///   whether or not the MADT lists it (at most [`MAX_CPUS`]).
 /// - `bsp_id`: hardware identifier of the bootstrap processor, passed in by
 ///   the caller (LAPIC ID on x86-64 from CPUID; boot hart ID on RISC-V from
 ///   `EFI_RISCV_BOOT_PROTOCOL`).
@@ -503,8 +504,9 @@ pub unsafe fn parse_cpu_topology(rsdp_addr: u64, bsp_id: u32) -> (u32, u32, [u32
 /// Walk MADT entries to collect CPU hardware IDs (LAPIC, x2APIC, or RINTC).
 ///
 /// Returns `(cpu_count, bsp_id, cpu_ids)`. The BSP is placed at index 0,
-/// APs fill indices `1..cpu_count` in MADT order. Entries beyond
-/// [`MAX_CPUS`] are dropped with a diagnostic.
+/// APs fill indices `1..cpu_count` in MADT order, each distinct hardware ID
+/// once; `cpu_count` counts the BSP once whether or not the MADT lists it.
+/// Entries beyond [`MAX_CPUS`] are dropped with a diagnostic.
 fn parse_madt_topology(
     table: &[u8],
     bsp_id: u32,
@@ -537,15 +539,7 @@ fn parse_madt_topology(
                 let flags = read_u32(table, off + 4);
                 if (flags & 0x1 != 0) || (flags & 0x2 != 0)
                 {
-                    if all_count < MAX_CPUS
-                    {
-                        all_ids[all_count] = apic_id;
-                        all_count += 1;
-                    }
-                    else
-                    {
-                        truncated = true;
-                    }
+                    record_cpu_id(apic_id, &mut all_ids, &mut all_count, &mut truncated);
                 }
             }
             MADT_TYPE_LOCAL_X2APIC if entry_len >= 16 =>
@@ -559,15 +553,7 @@ fn parse_madt_topology(
                 let flags = read_u32(table, off + 8);
                 if (flags & 0x1 != 0) || (flags & 0x2 != 0)
                 {
-                    if all_count < MAX_CPUS
-                    {
-                        all_ids[all_count] = apic_id;
-                        all_count += 1;
-                    }
-                    else
-                    {
-                        truncated = true;
-                    }
+                    record_cpu_id(apic_id, &mut all_ids, &mut all_count, &mut truncated);
                 }
             }
             MADT_TYPE_RINTC if entry_len >= 20 =>
@@ -582,15 +568,7 @@ fn parse_madt_topology(
                 let hart_id = read_u64(table, off + 8) as u32;
                 if flags & 0x1 != 0
                 {
-                    if all_count < MAX_CPUS
-                    {
-                        all_ids[all_count] = hart_id;
-                        all_count += 1;
-                    }
-                    else
-                    {
-                        truncated = true;
-                    }
+                    record_cpu_id(hart_id, &mut all_ids, &mut all_count, &mut truncated);
                 }
             }
             _ =>
@@ -613,7 +591,9 @@ fn parse_madt_topology(
         return (1, bsp_id, cpu_ids);
     }
 
-    // Place BSP at index 0, APs at subsequent indices.
+    // Place BSP at index 0, APs at subsequent indices. The count is the
+    // number of slots filled, so the BSP counts once whether the MADT lists
+    // it or not, and `cpu_ids[1..cpu_count]` holds exactly the APs.
     let mut logical_idx: usize = 1;
     cpu_ids[0] = bsp_id;
     for &id in &all_ids[..all_count]
@@ -625,10 +605,31 @@ fn parse_madt_topology(
         }
     }
 
-    // all_count is at most MAX_CPUS (512), which fits in u32.
+    // logical_idx is at most MAX_CPUS (512), which fits in u32.
     #[allow(clippy::cast_possible_truncation)]
-    let cpu_count = (all_count as u32).min(MAX_CPUS as u32);
+    let cpu_count = logical_idx as u32;
     (cpu_count, bsp_id, cpu_ids)
+}
+
+/// Append one enabled CPU's hardware ID to the MADT collection, skipping an
+/// ID already collected (firmware may list a CPU in both a Local APIC and a
+/// Local x2APIC entry) so no CPU is counted or started twice. Sets
+/// `truncated` when the collection is full.
+fn record_cpu_id(id: u32, ids: &mut [u32; MAX_CPUS], count: &mut usize, truncated: &mut bool)
+{
+    if ids[..*count].contains(&id)
+    {
+        return;
+    }
+    if *count < MAX_CPUS
+    {
+        ids[*count] = id;
+        *count += 1;
+    }
+    else
+    {
+        *truncated = true;
+    }
 }
 
 // ── Aperture seeder ──────────────────────────────────────────────────────────
@@ -927,6 +928,112 @@ mod tests
     fn mcfg_window_whose_end_overflows_is_skipped()
     {
         assert_eq!(mcfg_ecam_window(u64::MAX - (1 << 20) + 2, 0, 0), None);
+    }
+
+    /// Build a synthetic MADT: SDT header, LAPIC address and flags, then the
+    /// given entries as `(type, apic_or_hart_id)` pairs, each enabled.
+    fn madt(entries: &[(u8, u32)]) -> Vec<u8>
+    {
+        let mut t = vec![0u8; MADT_ENTRIES_OFF];
+        t[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4].copy_from_slice(b"APIC");
+        for &(entry_type, id) in entries
+        {
+            match entry_type
+            {
+                MADT_TYPE_LAPIC =>
+                {
+                    t.extend_from_slice(&[MADT_TYPE_LAPIC, 8, 0, id as u8]);
+                    t.extend_from_slice(&1u32.to_le_bytes());
+                }
+                MADT_TYPE_LOCAL_X2APIC =>
+                {
+                    t.extend_from_slice(&[MADT_TYPE_LOCAL_X2APIC, 16, 0, 0]);
+                    t.extend_from_slice(&id.to_le_bytes());
+                    t.extend_from_slice(&1u32.to_le_bytes());
+                    t.extend_from_slice(&0u32.to_le_bytes());
+                }
+                _ =>
+                {
+                    let mut e = vec![MADT_TYPE_RINTC, 36, 1, 0];
+                    e.extend_from_slice(&1u32.to_le_bytes());
+                    e.extend_from_slice(&u64::from(id).to_le_bytes());
+                    e.resize(36, 0);
+                    t.extend_from_slice(&e);
+                }
+            }
+        }
+        let len = t.len() as u32;
+        t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&len.to_le_bytes());
+        t
+    }
+
+    /// Run `parse_madt_topology` as `parse_cpu_topology` calls it, with the
+    /// BSP already in slot 0 of the incoming array.
+    fn topology(entries: &[(u8, u32)], bsp_id: u32) -> (u32, Vec<u32>)
+    {
+        let mut seed = [0u32; MAX_CPUS];
+        seed[0] = bsp_id;
+        let (count, bsp, ids) = parse_madt_topology(&madt(entries), bsp_id, seed);
+        assert_eq!(bsp, bsp_id);
+        assert!(ids[count as usize..].iter().all(|&id| id == 0));
+        (count, ids[..count as usize].to_vec())
+    }
+
+    #[test]
+    fn madt_bsp_listed_first_places_aps_in_order()
+    {
+        let entries = [
+            (MADT_TYPE_LAPIC, 0),
+            (MADT_TYPE_LAPIC, 1),
+            (MADT_TYPE_LAPIC, 2),
+        ];
+        assert_eq!(topology(&entries, 0), (3, vec![0, 1, 2]));
+    }
+
+    #[test]
+    fn madt_bsp_listed_twice_is_counted_once()
+    {
+        let entries = [
+            (MADT_TYPE_LAPIC, 0),
+            (MADT_TYPE_LOCAL_X2APIC, 0),
+            (MADT_TYPE_LAPIC, 1),
+        ];
+        assert_eq!(topology(&entries, 0), (2, vec![0, 1]));
+    }
+
+    #[test]
+    fn madt_bsp_absent_keeps_every_ap()
+    {
+        let entries = [(MADT_TYPE_LAPIC, 1), (MADT_TYPE_LAPIC, 2)];
+        assert_eq!(topology(&entries, 0), (3, vec![0, 1, 2]));
+    }
+
+    #[test]
+    fn madt_duplicated_ap_is_listed_once()
+    {
+        let entries = [
+            (MADT_TYPE_LAPIC, 0),
+            (MADT_TYPE_LAPIC, 1),
+            (MADT_TYPE_LOCAL_X2APIC, 1),
+        ];
+        assert_eq!(topology(&entries, 0), (2, vec![0, 1]));
+    }
+
+    #[test]
+    fn madt_rintc_harts_follow_the_boot_hart()
+    {
+        let entries = [
+            (MADT_TYPE_RINTC, 0),
+            (MADT_TYPE_RINTC, 1),
+            (MADT_TYPE_RINTC, 2),
+        ];
+        assert_eq!(topology(&entries, 2), (3, vec![2, 0, 1]));
+    }
+
+    #[test]
+    fn madt_without_cpu_entries_falls_back_to_the_bsp()
+    {
+        assert_eq!(topology(&[], 7), (1, vec![7]));
     }
 
     /// Build a synthetic RHCT: SDT header + flags/timebase/node-count/offset

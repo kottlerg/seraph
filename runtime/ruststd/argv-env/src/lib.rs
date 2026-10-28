@@ -8,12 +8,14 @@
 //! procmgr writes the argv and env blobs into a process's read-only
 //! `ProcessInfo` page at spawn time: each is a concatenation of
 //! NUL-terminated UTF-8 strings (env entries are additionally `KEY=VALUE`).
-//! `std::sys::{args,env}::seraph` walk those blobs. This crate owns the two
-//! pure byte-slice walks they share — [`next_field`] (one NUL-terminated
-//! field) and [`split_key_value`] (a `KEY=VALUE` split on the first `=`) —
-//! so the parse of spawner-supplied bytes is host-testable rather than
-//! entangled with the overlay's `OsString` glue. The crate performs no I/O
-//! and touches only `core` slice operations — see
+//! `std::sys::{args,env}::seraph` walk those blobs. This crate owns the
+//! pure byte-slice walks they use — [`next_field`] and [`prev_field`] (one
+//! NUL-terminated field, from the front or the back), [`bounded_fields`]
+//! (the span of a declared field count), and [`split_key_value`] (a
+//! `KEY=VALUE` split on the first `=`) — so the
+//! parse of spawner-supplied bytes is host-testable rather than entangled
+//! with the overlay's `OsString` glue. The crate performs no I/O and
+//! touches only `core` slice operations — see
 //! [coding-standards.md](../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
@@ -48,6 +50,54 @@ pub fn next_field(blob: &[u8], cursor: usize) -> Option<(&[u8], usize)>
         None => blob.len(),
     };
     Some((&blob[cursor..end], end.saturating_add(1)))
+}
+
+/// Walk one NUL-terminated field of a blob backwards from `end`, the
+/// exclusive end of the part not yet consumed from the back, with `front` the
+/// cursor a forward walk has reached. Returns the field slice (exclusive of
+/// the NUL) and the new `end` (the field's first byte), or None when nothing
+/// remains between `front` and `end`.
+///
+/// A NUL at `end - 1` terminates the returned field. A final field with no
+/// terminating NUL is returned in full, as [`next_field`] returns it.
+#[must_use]
+pub fn prev_field(blob: &[u8], front: usize, end: usize) -> Option<(&[u8], usize)>
+{
+    let end = end.min(blob.len());
+    if front >= end
+    {
+        return None;
+    }
+    let field_end = if blob[end - 1] == 0 { end - 1 } else { end };
+    let start = match blob[front..field_end].iter().rposition(|&b| b == 0)
+    {
+        Some(off) => front + off + 1,
+        None => front,
+    };
+    Some((&blob[start..field_end], start))
+}
+
+/// Bound a blob to its first `count` fields, `count` being a spawner-supplied
+/// field count and so wire input. Returns `(end, fields)`: the exclusive end
+/// of those fields (clamped to the blob's length) and how many there are,
+/// which is less than `count` when the blob holds fewer. The fields in
+/// `blob[..end]` are exactly the first `fields` that [`next_field`] walks.
+#[must_use]
+pub fn bounded_fields(blob: &[u8], count: usize) -> (usize, usize)
+{
+    let mut end = 0;
+    let mut fields = 0;
+    while fields < count
+    {
+        let Some((_, next)) = next_field(blob, end)
+        else
+        {
+            break;
+        };
+        end = next.min(blob.len());
+        fields += 1;
+    }
+    (end, fields)
 }
 
 /// Split a `KEY=VALUE` entry on the FIRST `=`. None when there is no `=`.
@@ -124,6 +174,102 @@ mod tests
         assert_eq!(tail, b"tail");
         assert_eq!(next, blob.len() + 1);
         assert_eq!(next_field(blob, next), None);
+    }
+
+    #[test]
+    fn prev_field_walks_fields_from_the_back_then_stops()
+    {
+        // Each step returns the last remaining field and its start as the
+        // new end; once the end reaches the front, the walk returns None.
+        let blob = b"one\0two\0";
+        let (last, end) = prev_field(blob, 0, blob.len()).expect("last field");
+        assert_eq!(last, b"two");
+        assert_eq!(end, 4);
+        let (first, end) = prev_field(blob, 0, end).expect("first field");
+        assert_eq!(first, b"one");
+        assert_eq!(end, 0);
+        assert_eq!(prev_field(blob, 0, end), None);
+    }
+
+    #[test]
+    fn prev_field_returns_an_unterminated_tail_in_full()
+    {
+        let blob = b"head\0tail";
+        let (tail, end) = prev_field(blob, 0, blob.len()).expect("tail field");
+        assert_eq!(tail, b"tail");
+        assert_eq!(end, 5);
+    }
+
+    #[test]
+    fn prev_field_returns_empty_slice_for_adjacent_nul()
+    {
+        // A trailing empty field is returned as such, and the field before
+        // it stays reachable.
+        let blob = b"a\0\0";
+        let (empty, end) = prev_field(blob, 0, blob.len()).expect("empty field");
+        assert_eq!(empty, b"");
+        assert_eq!(end, 2);
+        let (a, _) = prev_field(blob, 0, end).expect("first field");
+        assert_eq!(a, b"a");
+    }
+
+    #[test]
+    fn prev_field_clamps_an_end_past_the_blob()
+    {
+        // An `end` beyond the blob reads as the blob's end rather than
+        // slicing out of bounds.
+        let blob = b"one\0two\0";
+        let (last, end) = prev_field(blob, 0, blob.len() + 3).expect("last field");
+        assert_eq!(last, b"two");
+        assert_eq!(end, 4);
+    }
+
+    #[test]
+    fn prev_field_and_next_field_consume_disjoint_fields()
+    {
+        // Walking from both ends yields every field exactly once: the
+        // backward walk stops at the forward cursor, not at the blob start.
+        let blob = b"a\0b\0c\0";
+        let (a, front) = next_field(blob, 0).expect("front field");
+        let (c, end) = prev_field(blob, front, blob.len()).expect("back field");
+        let (b, end) = prev_field(blob, front, end).expect("middle field");
+        assert_eq!((a, b, c), (&b"a"[..], &b"b"[..], &b"c"[..]));
+        assert_eq!(prev_field(blob, front, end), None);
+        assert_eq!(next_field(&blob[..end], front), None);
+    }
+
+    #[test]
+    fn bounded_fields_finds_no_fields_in_an_empty_blob()
+    {
+        assert_eq!(bounded_fields(b"", 3), (0, 0));
+    }
+
+    #[test]
+    fn bounded_fields_covers_every_field_for_an_exact_count()
+    {
+        let blob = b"a\0b\0c\0";
+        assert_eq!(bounded_fields(blob, 3), (blob.len(), 3));
+    }
+
+    #[test]
+    fn bounded_fields_shrinks_a_count_above_the_field_count()
+    {
+        // A declared count the blob cannot satisfy reports the fields it
+        // holds, including an unterminated tail, clamped to the blob.
+        let blob = b"a\0tail";
+        assert_eq!(bounded_fields(blob, 5), (blob.len(), 2));
+    }
+
+    #[test]
+    fn bounded_fields_ends_the_span_after_a_count_below_the_field_count()
+    {
+        // The back walk from the returned end then meets the front walk on
+        // the same fields.
+        let blob = b"a\0b\0c\0";
+        let (end, fields) = bounded_fields(blob, 2);
+        assert_eq!((end, fields), (4, 2));
+        let (last, _) = prev_field(blob, 0, end).expect("last bounded field");
+        assert_eq!(last, b"b");
     }
 
     #[test]

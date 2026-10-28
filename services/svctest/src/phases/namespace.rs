@@ -451,6 +451,16 @@ pub fn ns_programs_subtree_phase(_: &Caps)
             Err(e) => panic!("ns_programs_subtree: walk-attenuate /programs failed: {e}"),
         };
 
+    // "/" names the anchor itself, which no hop narrows: a narrowed request
+    // is refused rather than answered with the anchor's full rights.
+    let err = std::os::seraph::namespace_lookup_dir(root, "/", u64::from(programs_rights))
+        .expect_err("ns_programs_subtree: a narrowed walk of / must not return the anchor");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::InvalidInput,
+        "ns_programs_subtree: narrowed walk of / must be InvalidInput, got {err:?}"
+    );
+
     let mut cmd = std::process::Command::new("/tests/svctest");
     cmd.arg("programs-child");
     cmd.namespace_cap(programs_cap);

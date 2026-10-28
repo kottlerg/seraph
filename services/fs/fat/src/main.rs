@@ -255,31 +255,30 @@ fn service_loop(
 
         let opcode = msg.label & 0xFFFF;
 
-        // Unbadged service-level requests: FS_MOUNT only.
+        // Unbadged service-level requests: FS_MOUNT only. FS_MOUNT carries
+        // no caps, so none a request carried is kept.
         if msg.badge == 0
         {
-            let code = match opcode
+            let code = if opcode == fs_labels::FS_MOUNT
             {
-                fs_labels::FS_MOUNT =>
+                if msg.word(0) != u64::from(ipc::FS_LABELS_VERSION)
                 {
-                    if msg.word(0) != u64::from(ipc::FS_LABELS_VERSION)
-                    {
-                        ipc::fs_errors::LABEL_VERSION_MISMATCH
-                    }
-                    else if state.fat_size == 0
-                    {
-                        validate_bpb(caps, state, cache, ipc_buf)
-                    }
-                    else
-                    {
-                        ipc::fs_errors::SUCCESS
-                    }
+                    ipc::fs_errors::LABEL_VERSION_MISMATCH
                 }
-                _ => ipc::fs_errors::UNKNOWN_OPCODE,
+                else if state.fat_size == 0
+                {
+                    validate_bpb(caps, state, cache, ipc_buf)
+                }
+                else
+                {
+                    ipc::fs_errors::SUCCESS
+                }
+            }
+            else
+            {
+                ipc::fs_errors::UNKNOWN_OPCODE
             };
-            let reply = IpcMessage::new(code);
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            reply_dropping_caps(&msg, opcode, code, ipc_buf);
             continue;
         }
 
@@ -308,18 +307,14 @@ fn service_loop(
         let (node_id, parent_rights) = match gate(msg.label, msg.badge)
         {
             Ok(pair) => pair,
-            Err(GateError::UnknownLabel) =>
+            Err(err) =>
             {
-                let reply = IpcMessage::new(ipc::fs_errors::UNKNOWN_OPCODE);
-                // SAFETY: ipc_buf is the registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-                continue;
-            }
-            Err(GateError::PermissionDenied) =>
-            {
-                let reply = IpcMessage::new(ipc::fs_errors::PERMISSION_DENIED);
-                // SAFETY: ipc_buf is the registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                let code = match err
+                {
+                    GateError::UnknownLabel => ipc::fs_errors::UNKNOWN_OPCODE,
+                    GateError::PermissionDenied => ipc::fs_errors::PERMISSION_DENIED,
+                };
+                reply_dropping_caps(&msg, opcode, code, ipc_buf);
                 continue;
             }
         };
@@ -684,7 +679,6 @@ fn pick_eviction_candidate(files: &[OpenFile; MAX_OPEN_FILES]) -> Option<EvictRe
                 cookie: entry.cookie,
                 slot_idx: entry.slot_idx,
                 ancestor_cap: entry.ancestor_cap,
-                release_endpoint_cap: file.release_endpoint_cap,
             });
         }
     }
@@ -708,19 +702,16 @@ fn handle_read_memory_node_cap(
     eviction: &EvictionState,
 )
 {
+    let opcode = fs_labels::FS_READ_MEMORY;
     let Some(node) = nodes.get(node_id)
     else
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     if node.kind != NodeKind::File
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     }
 
@@ -729,9 +720,7 @@ fn handle_read_memory_node_cap(
         let Some(slot_idx) = file::alloc_slot(files)
         else
         {
-            let reply = IpcMessage::new(ipc::fs_errors::TOO_MANY_OPEN);
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            reply_dropping_caps(msg, opcode, ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
             return;
         };
         // Slot identity for the eviction worker's `find_by_badge`
@@ -743,10 +732,15 @@ fn handle_read_memory_node_cap(
         // kernel `transfer_caps` path moved it into our CSpace if
         // present; record it on the slot so the eviction worker can
         // route cooperative `FS_RELEASE_MEMORY` back to the client.
-        // A zero cap indicates an opt-out client; eviction falls back
-        // to the hard-revoke path. Subsequent FS_READ_MEMORYs from
-        // the same client carry no caps.
+        // A zero cap indicates an opt-out client; eviction skips the
+        // cooperative round-trip and revokes. Subsequent FS_READ_MEMORYs from
+        // the same client carry no caps. Only caps[0] is recorded; any
+        // further cap is deleted.
         let release_endpoint_cap = msg.caps().first().copied().unwrap_or(0);
+        for &extra in msg.caps().iter().skip(1)
+        {
+            let _ = syscall::cap_delete(extra);
+        }
         files[slot_idx] = OpenFile {
             badge,
             start_cluster: node.cluster,
@@ -760,6 +754,13 @@ fn handle_read_memory_node_cap(
     }
     else
     {
+        // The slot records the release SEND from the request that
+        // allocated it (per-node sharing, #447); a SEND this request
+        // carries is never recorded, so it is deleted.
+        for &cap in msg.caps()
+        {
+            let _ = syscall::cap_delete(cap);
+        }
         node.open_slot as usize
     };
 
@@ -773,6 +774,33 @@ fn handle_read_memory_node_cap(
         ipc_buf,
         eviction,
     );
+}
+
+/// Reply `code` holding none of the caps the request carried: an
+/// `FS_WRITE_MEMORY` source page goes back in the reply, as § Label 12
+/// promises in every outcome, and any other cap (an `FS_READ_MEMORY`
+/// release SEND) is deleted. Used for requests refused before any cap they
+/// carry is recorded or consumed (the dispatch loop's rights-gate and
+/// unknown or unbadged label refusals, and the `FS_READ_MEMORY` handler's
+/// refusals before its slot records the SEND) and for `FS_MOUNT`, which
+/// carries no caps.
+fn reply_dropping_caps(msg: &IpcMessage, opcode: u64, code: u64, ipc_buf: *mut u64)
+{
+    let mut builder = IpcMessage::builder(code);
+    for &cap in msg.caps()
+    {
+        if opcode == fs_labels::FS_WRITE_MEMORY
+        {
+            builder = builder.cap(cap);
+        }
+        else
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+    }
+    let reply = builder.build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
 /// `FS_RELEASE_MEMORY` against a node cap. Resolves the lazy

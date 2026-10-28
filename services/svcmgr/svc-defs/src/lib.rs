@@ -137,8 +137,10 @@ pub struct Definition
     pub namespace: NamespaceShape,
     /// Optional cwd path, walked from svcmgr's universal root on launch and
     /// restart. It must lie inside the namespace: under `namespace =
-    /// subtree:` the parser rejects a path outside the subtree, and under
-    /// `namespace = none` it rejects any `cwd`. See
+    /// subtree:` the parser rejects a path outside the subtree, under
+    /// `namespace = universal` it rejects the root itself (the cwd walk
+    /// cannot narrow it), and under `namespace = none` it rejects any
+    /// `cwd`. See
     /// `services/svcmgr/docs/service-definitions.md` § cwd.
     pub cwd: Option<String>,
     /// Published-registry names svcmgr resolves at launch time and

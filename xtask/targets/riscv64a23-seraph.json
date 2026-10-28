@@ -17,6 +17,9 @@
     "llvm-abiname": "lp64d",
     "max-atomic-width": 64,
     "has-thread-local": true,
+    "stack-probes": {
+        "kind": "inline"
+    },
     "tls-model": "local-exec",
     "position-independent-executables": true,
     "static-position-independent-executables": true,

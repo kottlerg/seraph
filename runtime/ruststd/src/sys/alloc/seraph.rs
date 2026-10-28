@@ -16,9 +16,9 @@
 //! Bootstrap is explicit: `_start` (`std::os::seraph`) calls
 //! `heap_bootstrap(memmgr_ep, self_aspace)` with
 //! `ProcessInfo.memmgr_endpoint_cap` before `main` whenever that cap is
-//! non-zero, and any later call is a no-op. An allocation before bootstrap
-//! returns a null pointer and the alloc crate aborts via
-//! `handle_alloc_error`.
+//! non-zero; a later call does no work and reports whether that first call
+//! installed the heap. An allocation before bootstrap returns a null
+//! pointer and the alloc crate aborts via `handle_alloc_error`.
 //!
 //! The IPC buffer pointer used by `grow` is read from the TLS slot
 //! populated in `_start` / the thread trampoline (see
@@ -35,7 +35,7 @@ use crate::cell::UnsafeCell;
 use crate::mem::{align_of, size_of};
 use crate::os::seraph::current_ipc_buf;
 use crate::ptr::{NonNull, null_mut};
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use ipc::memmgr_labels::{QUERY_POOL_STATUS, RELEASE_MEMORY_CAPS, REQUEST_MEMORY_CAPS};
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
@@ -163,21 +163,6 @@ impl Heap {
     }
 
     /// # Safety
-    /// `base..base+size` must be a writable, exclusively-owned region that
-    /// stays mapped for the process's lifetime.
-    unsafe fn init(&mut self, base: usize, size: usize) {
-        if size < NODE_SIZE {
-            return;
-        }
-        let node = base as *mut FreeNode;
-        unsafe {
-            (*node).size = size;
-            (*node).next = None;
-        }
-        self.head = NonNull::new(node);
-    }
-
-    /// # Safety
     /// `ptr..ptr+size` must be a freed allocation previously returned by `alloc`.
     unsafe fn insert(&mut self, ptr: usize, size: usize) {
         let mut cur = self.head;
@@ -277,10 +262,8 @@ impl Heap {
     /// Returns `true` if the heap grew by enough pages to cover
     /// `want_bytes`, `false` on any IPC / map failure or when the heap
     /// has reached its zone bound. A partial failure (some pages mapped,
-    /// then a later batch fails) leaves the successfully-mapped pages
-    /// outside the free list — effectively leaked address space until
-    /// a future successful grow. This keeps the failure path simple and
-    /// avoids a half-formed free-list node.
+    /// then a later batch fails) still adds the mapped pages to the free
+    /// list and advances `mapped_end` past them (see [`Self::grow_exact`]).
     ///
     /// # Safety
     /// Caller must hold the heap lock. IPC wrappers and `mem_map` are
@@ -317,18 +300,26 @@ impl Heap {
     ///
     /// memmgr's `REQUEST_MEMORY_CAPS` reply may carry up to
     /// `MSG_CAP_SLOTS_MAX = 4` Memory caps in best-effort mode, each
-    /// covering one or more contiguous pages. The reply layout:
-    /// `data[0]` = `returned_cap_count`; `data[1+i]` = `page_count_for_cap_i`;
-    /// `caps[0..count]` = Memory caps. We map each returned cap with its
-    /// declared `page_count` in a single `mem_map` call, advancing
-    /// `start_va` by the same number of pages.
+    /// covering one or more contiguous pages (layout checked by
+    /// [`ipc::memmgr_grant_layout`]). We map each returned cap with its
+    /// declared `page_count` in a single `mem_map` call, advancing `start_va`
+    /// by the same number of pages.
+    ///
+    /// On failure, every cap of the failing reply that is not mapped is
+    /// deleted and its run returned to memmgr ([`release_reply_caps`]). A
+    /// failed map can leave some of the cap's pages mapped, so that cap is
+    /// unmapped first, and kept, still accounted to this process, if the
+    /// unmap fails. The pages mapped before the failure, by this reply or an
+    /// earlier round, are still added to the free list with `mapped_end`
+    /// advanced past them, so a later grow maps above them rather than over
+    /// them.
     fn grow_exact(&mut self, pages: u64, start_va: u64) -> bool {
         // Read the calling thread's registered IPC buffer from TLS. The
         // kernel services `ipc_call` by reading the payload from that
         // thread's `tcb.ipc_buffer`; targeting any other VA silently
         // writes to the wrong page.
-        let ipc_buf_u64 = current_ipc_buf();
-        if ipc_buf_u64.is_null() {
+        let ipc_buf = current_ipc_buf();
+        if ipc_buf.is_null() {
             return false;
         }
         let mut mapped: u64 = 0;
@@ -337,54 +328,64 @@ impl Heap {
         // retry count so a misbehaving memmgr cannot wedge the caller.
         const MAX_ROUNDS: u32 = 16;
         let mut rounds: u32 = 0;
-        while mapped < pages {
+        let complete = loop {
+            if mapped >= pages {
+                break true;
+            }
             if rounds >= MAX_ROUNDS {
-                return false;
+                break false;
             }
             rounds += 1;
 
             let want = pages - mapped;
             // data[0] low half = want_pages, high half = flags (best-effort = 0).
             let msg = ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, want).build();
-            // SAFETY: ipc_buf_u64 is the current thread's kernel-registered,
+            // SAFETY: ipc_buf is the current thread's kernel-registered,
             // page-aligned IPC buffer.
-            let reply = match unsafe { ipc::ipc_call(self.memmgr_ep, &msg, ipc_buf_u64) } {
-                Ok(r) => r,
-                Err(_) => return false,
+            let Ok(reply) = (unsafe { ipc::ipc_call(self.memmgr_ep, &msg, ipc_buf) }) else {
+                break false;
             };
-            if reply.label != 0 {
-                return false;
-            }
+            let caps = reply.caps();
+            let Some((page_counts, bases)) = ipc::memmgr_grant_layout(&reply) else {
+                release_reply_caps(self.memmgr_ep, ipc_buf, caps, &[], |_| false);
+                break false;
+            };
 
-            let returned_count = reply.word(0) as usize;
-            let cap_slots = reply.caps();
-            if cap_slots.len() != returned_count || returned_count == 0 {
-                return false;
-            }
-
-            for (i, &cap_slot) in cap_slots.iter().take(returned_count).enumerate() {
-                let pages_in_cap = reply.word(1 + i);
-                if pages_in_cap == 0 {
-                    return false;
+            // A cap covering more than the request still needs would map
+            // past the window the caller sized, so it fails the round too.
+            let mut kept = 0;
+            let mut keep_failed = false;
+            for (&cap_slot, &pages_in_cap) in caps.iter().zip(page_counts) {
+                if pages_in_cap == 0 || pages_in_cap > pages - mapped {
+                    break;
                 }
                 let va = start_va + mapped * PAGE_SIZE;
                 if !self.mem_map_with_augment_retry(cap_slot, va, pages_in_cap) {
-                    return false;
+                    keep_failed = syscall::mem_unmap(self.self_aspace, va, pages_in_cap).is_err();
+                    break;
                 }
                 mapped += pages_in_cap;
+                kept += 1;
             }
-        }
+            if kept < caps.len() {
+                let keep = |i| i < kept || (keep_failed && i == kept);
+                release_reply_caps(self.memmgr_ep, ipc_buf, caps, bases, keep);
+                break false;
+            }
+        };
 
-        let region_bytes = (mapped * PAGE_SIZE) as usize;
-        let region_base = start_va as usize;
-        // SAFETY: region just mapped writable, exclusively owned, size is
-        // a page multiple (therefore NODE_ALIGN-aligned); base is
-        // page-aligned (therefore NODE_ALIGN-aligned). `insert` coalesces
-        // with an existing tail free block if adjacent, preserving the
-        // free-list invariant.
-        unsafe { self.insert(region_base, region_bytes) };
-        self.mapped_end = region_base + region_bytes;
-        true
+        if mapped != 0 {
+            let region_bytes = (mapped * PAGE_SIZE) as usize;
+            let region_base = start_va as usize;
+            // SAFETY: region just mapped writable, exclusively owned, size is
+            // a page multiple (therefore NODE_ALIGN-aligned); base is
+            // page-aligned (therefore NODE_ALIGN-aligned). `insert` coalesces
+            // with an existing tail free block if adjacent, preserving the
+            // free-list invariant.
+            unsafe { self.insert(region_base, region_bytes) };
+            self.mapped_end = region_base + region_bytes;
+        }
+        complete
     }
 
     /// `mem_map` wrapper that augments the AS's PT growth budget on
@@ -437,13 +438,21 @@ static HEAP: GlobalHeap = GlobalHeap {
     lock: SpinLock::new(),
 };
 
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// [`heap_bootstrap`] progress: unclaimed, claimed by the first call and
+/// running, or finished with the heap installed or not.
+static BOOTSTRAP: AtomicU8 = AtomicU8::new(BOOTSTRAP_UNCLAIMED);
+const BOOTSTRAP_UNCLAIMED: u8 = 0;
+const BOOTSTRAP_RUNNING: u8 = 1;
+const BOOTSTRAP_READY: u8 = 2;
+const BOOTSTRAP_FAILED: u8 = 3;
 
 // ── Bootstrap ───────────────────────────────────────────────────────────────
 
 /// Initialise the heap by requesting pages from memmgr and mapping them
-/// at a per-process drawn base (ASLR, #39). Idempotent — only the first
-/// call performs real work.
+/// at a per-process drawn base (ASLR, #39). Only the first call performs
+/// real work; every later call returns whether that first call installed
+/// the heap, so a failed bootstrap is permanent. A call made while the first
+/// is still running returns `false`.
 ///
 /// The IPC buffer used for the bootstrap round is taken from the calling
 /// thread's TLS slot ([`crate::os::seraph::current_ipc_buf`]). `_start`
@@ -452,20 +461,28 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 ///
 /// Returns `true` if the heap is usable after this call.
 pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
-    if INITIALIZED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return true;
+    if let Err(state) = BOOTSTRAP.compare_exchange(
+        BOOTSTRAP_UNCLAIMED,
+        BOOTSTRAP_RUNNING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        return state == BOOTSTRAP_READY;
     }
-    if memmgr_ep == 0 {
-        return false;
-    }
+    let ready = memmgr_ep != 0 && heap_install(memmgr_ep, self_aspace);
+    BOOTSTRAP.store(if ready { BOOTSTRAP_READY } else { BOOTSTRAP_FAILED }, Ordering::Release);
+    ready
+}
 
+/// Draw the heap base, record the heap's zone and caps, and map the initial
+/// `HEAP_INITIAL_PAGES` through [`Heap::grow_exact`]. On failure the heap is
+/// reset to its unbootstrapped state, so it serves no allocation; pages the
+/// failed attempt mapped stay mapped and accounted until the process exits.
+fn heap_install(memmgr_ep: u32, self_aspace: u32) -> bool {
     // The base draw happens before the allocator exists: the raw getrandom
     // wrapper is a registers-only syscall and must stay non-allocating, like
-    // the IPC wrappers below. A failed draw degrades to the deterministic
-    // default base (no log surface exists this early).
+    // the IPC wrappers `grow_exact` uses. A failed draw degrades to the
+    // deterministic default base (no log surface exists this early).
     let mut entropy = [0u8; 8];
     let heap_base = match syscall::getrandom(entropy.as_mut_ptr(), entropy.len()) {
         Ok(n) if n == entropy.len() as u64 => {
@@ -475,73 +492,25 @@ pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
         _ => HEAP_BASE_DEFAULT,
     };
 
-    let ipc_buf_u64 = current_ipc_buf();
-    if ipc_buf_u64.is_null() {
-        return false;
-    }
-
-    // Bounded retry: memmgr's best-effort reply may cover only a portion
-    // of the request when the pool is fragmented; loop until the full
-    // initial heap is mapped or memmgr stops making progress.
-    const MAX_ROUNDS: u32 = 16;
-    let mut mapped: u64 = 0;
-    let mut rounds: u32 = 0;
-    while mapped < HEAP_INITIAL_PAGES {
-        if rounds >= MAX_ROUNDS {
-            return false;
-        }
-        rounds += 1;
-
-        let want = HEAP_INITIAL_PAGES - mapped;
-        let msg = ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, want).build();
-        // SAFETY: ipc_buf_u64 is the registered, page-aligned buffer.
-        let reply = match unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf_u64) } {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
-        if reply.label != 0 {
-            return false;
-        }
-
-        let returned_count = reply.word(0) as usize;
-        let cap_slots = reply.caps();
-        if cap_slots.len() != returned_count || returned_count == 0 {
-            return false;
-        }
-
-        for (i, &cap_slot) in cap_slots.iter().take(returned_count).enumerate() {
-            let pages_in_cap = reply.word(1 + i);
-            if pages_in_cap == 0 {
-                return false;
-            }
-            let va = heap_base + mapped * PAGE_SIZE;
-            if syscall::mem_map(cap_slot, self_aspace, va, 0, pages_in_cap, MAP_WRITABLE).is_err()
-            {
-                return false;
-            }
-            mapped += pages_in_cap;
-        }
-    }
-
-    let base = heap_base as usize;
-    let size = (HEAP_INITIAL_PAGES as usize) * (PAGE_SIZE as usize);
     HEAP.lock.lock();
-    // SAFETY: freshly-mapped, exclusively-owned region; lock held.
-    unsafe {
-        let heap = &mut *HEAP.inner.get();
-        heap.init(base, size);
-        heap.mapped_end = base + size;
-        heap.max = base + HEAP_SPAN as usize;
-        heap.memmgr_ep = memmgr_ep;
-        heap.self_aspace = self_aspace;
+    // SAFETY: lock held; the heap is unbootstrapped, so no allocation holds
+    // a pointer into it.
+    let heap = unsafe { &mut *HEAP.inner.get() };
+    heap.mapped_end = heap_base as usize;
+    heap.max = (heap_base + HEAP_SPAN) as usize;
+    heap.memmgr_ep = memmgr_ep;
+    heap.self_aspace = self_aspace;
+    let ok = heap.grow_exact(HEAP_INITIAL_PAGES, heap_base);
+    if !ok {
+        *heap = Heap::new();
     }
     HEAP.lock.unlock();
-    true
+    ok
 }
 
 /// Returns `true` once `heap_bootstrap` has completed successfully.
 pub fn heap_is_initialized() -> bool {
-    INITIALIZED.load(Ordering::Acquire)
+    BOOTSTRAP.load(Ordering::Acquire) == BOOTSTRAP_READY
 }
 
 // ── Object slabs ────────────────────────────────────────────────────────────
@@ -669,23 +638,23 @@ fn slab_round_to_class(bytes: u64) -> u64 {
 /// Every caller retypes from or maps exactly one cap, so the request sets
 /// `REQUIRE_CONTIGUOUS`: memmgr replies with one cap covering all `min_pages`
 /// or refuses with `OUT_OF_MEMORY_CONTIGUOUS`. The reply is still treated as
-/// wire input: the first returned cap whose declared page count covers
-/// `min_pages` is kept, and every other cap the reply carries is deleted and
-/// its run returned to memmgr (see [`release_reply_caps`]).
+/// wire input ([`ipc::memmgr_grant_layout`]): the first returned cap whose
+/// declared page count covers `min_pages` is kept, and every other cap the
+/// reply carries is deleted and its run returned to memmgr (see
+/// [`release_reply_caps`]).
 ///
 /// Returns `Some((slot, pages, phys))` on success. `phys` is the kept cap's
-/// physical base, which memmgr reports at `data[1 + returned + i]`; the
-/// caller passes it to [`slab_release_fresh`] to return the run to memmgr's
-/// pool mid-life. Also used by the pipe machinery (`sys::pipe`) for ring
-/// pages, which need the phys base so the grant can be returned when the
-/// pipe ends its life.
+/// physical base, which memmgr reports at `data[1 + count + i]`; the caller
+/// passes it to [`slab_release_fresh`] to return the run to memmgr's pool
+/// mid-life. Also used by the pipe machinery (`sys::pipe`) for ring pages,
+/// which need the phys base so the grant can be returned when the pipe ends
+/// its life.
 ///
 /// Returns `None` on IPC failure, a memmgr error label, a `min_pages` that
-/// does not fit the request's 32-bit page-count field, a reply whose clamped
-/// count (the declared count bounded by the caps actually transferred) is
-/// zero, a reply whose data words do not cover that count, or a reply none of
-/// whose caps covers `min_pages`. A refused reply's caps are released the
-/// same way as the unchosen caps of an accepted one.
+/// does not fit the request's 32-bit page-count field, a reply
+/// [`ipc::memmgr_grant_layout`] refuses, or a reply none of whose caps covers
+/// `min_pages`. A refused reply's caps are deleted the same way as the
+/// unchosen caps of an accepted one.
 pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u64)> {
     let ipc_buf = current_ipc_buf();
     if ipc_buf.is_null() {
@@ -699,55 +668,44 @@ pub fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) }.ok()?;
     let caps = reply.caps();
-    let words = reply.words();
-    // The count is wire input: bound it by the caps actually transferred,
-    // then require the words actually delivered to cover one page count and
-    // one phys base per cap after the count word before either is indexed.
-    // An error reply defines no data layout, so its count is zero.
-    let returned = match words.first() {
-        Some(&count) if reply.label == 0 => (count as usize).min(caps.len()),
-        _ => 0,
-    };
-    let covered = returned != 0 && 1 + 2 * returned <= words.len();
-    // Reply layout: data[1+i] = page_count_i, data[1+returned+i] = phys_base_i.
-    let keep = if covered {
-        (0..returned).find(|&i| words[1 + i] >= min_pages)
-    } else {
-        None
-    };
-    release_reply_caps(memmgr_ep, ipc_buf, caps, words, returned, keep);
+    let layout = ipc::memmgr_grant_layout(&reply);
+    let keep = layout.and_then(|(page_counts, _)| page_counts.iter().position(|&p| p >= min_pages));
+    let bases = layout.map_or(&[][..], |(_, bases)| bases);
+    release_reply_caps(memmgr_ep, ipc_buf, caps, bases, |i| keep == Some(i));
+    let (page_counts, bases) = layout?;
     let i = keep?;
-    Some((caps[i], words[1 + i], words[1 + returned + i]))
+    Some((caps[i], page_counts[i], bases[i]))
 }
 
-/// Delete every cap a `REQUEST_MEMORY_CAPS` reply transferred except the one
-/// at index `keep`, and return each deleted cap's run to memmgr's pool with
-/// one `RELEASE_MEMORY_CAPS` naming the phys bases the reply reported.
+/// Delete every cap a `REQUEST_MEMORY_CAPS` reply transferred except those
+/// `keep` selects by index, and return each deleted cap's run to memmgr's
+/// pool with one `RELEASE_MEMORY_CAPS` naming the phys base `bases` holds at
+/// the same index.
 ///
-/// `returned` is the reply's clamped count. A cap at or past it, or one whose
-/// phys word the reply did not deliver, has no base to name: its slot is
-/// still freed, and its run stays accounted to this process until it dies.
+/// `bases` is the reply's phys-base words as [`ipc::memmgr_grant_layout`]
+/// split them, or empty for a reply it refused. A deleted cap without a base
+/// still has its slot freed, and its run stays accounted to this process
+/// until it dies.
 /// The release is best-effort: memmgr ignores a base that matches no
 /// outstanding grant, and a failed IPC leaves the runs accounted the same way.
 fn release_reply_caps(
     memmgr_ep: u32,
     ipc_buf: *mut u64,
     caps: &[u32],
-    words: &[u64],
-    returned: usize,
-    keep: Option<usize>,
+    bases: &[u64],
+    keep: impl Fn(usize) -> bool,
 ) {
-    let mut bases = [0u64; syscall_abi::MSG_CAP_SLOTS_MAX];
+    let mut released = [0u64; syscall_abi::MSG_CAP_SLOTS_MAX];
     let mut n = 0;
     for (i, &cap) in caps.iter().enumerate() {
-        if keep == Some(i) {
+        if keep(i) {
             continue;
         }
         let _ = syscall::cap_delete(cap);
         // `n` stays below `caps.len()`, which the kernel bounds by
         // `MSG_CAP_SLOTS_MAX`, so the store is in bounds.
-        if let Some(&base) = words.get(1 + returned + i).filter(|_| i < returned) {
-            bases[n] = base;
+        if let Some(&base) = bases.get(i) {
+            released[n] = base;
             n += 1;
         }
     }
@@ -756,7 +714,7 @@ fn release_reply_caps(
     }
     let msg = ipc::IpcMessage::builder(RELEASE_MEMORY_CAPS)
         .word(0, n as u64)
-        .words(1, &bases[..n])
+        .words(1, &released[..n])
         .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
     let _ = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) };
@@ -1149,10 +1107,11 @@ unsafe impl GlobalAlloc for System {
             // under the lock are non-allocating (the IPC buffer is the
             // pre-registered page, not heap-backed), so there is no
             // re-entrant allocation here.
+            // A grow that failed partway still adds the pages it mapped to
+            // the free list, so the retry runs whatever `grow` returns.
             let want = layout.size().saturating_add(layout.align());
-            if heap.grow(want) {
-                ptr = heap.alloc(layout);
-            }
+            let _ = heap.grow(want);
+            ptr = heap.alloc(layout);
         }
         HEAP.lock.unlock();
         ptr

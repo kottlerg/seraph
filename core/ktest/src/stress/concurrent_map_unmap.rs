@@ -6,23 +6,32 @@
 //! Stress test: concurrent memory map/unmap from multiple threads.
 //!
 //! `NUM_CHILDREN` threads each map and unmap a distinct VA range
-//! repeatedly, sharing the same address space. Exercises page table
-//! lock contention and TLB shootdown under load.
+//! `MAP_ITERATIONS` times (fewer past 16 CPUs, see
+//! [`super::scaled_attempts`]), sharing the same address space. Exercises
+//! page table lock contention and TLB shootdown under load.
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, mem_map, mem_unmap, notification_send,
-    notification_wait, thread_exit,
+    notification_wait, system_info, thread_exit,
 };
+use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CHILDREN: usize = 16;
-const MAP_ITERATIONS: usize = 1000;
+const MAP_ITERATIONS: u32 = 1000;
 
-// Each child owns one bit of the `done` word below bit 32 (bit 32 is the
-// error indicator), so the encoding holds for NUM_CHILDREN <= 32; this
-// assert admits up to 64.
-const _: () = assert!(NUM_CHILDREN <= 64);
+/// Fewest iterations per child at any width: every unmap broadcasts a
+/// shootdown to the CPUs running the address space, so a few dozen still
+/// contend the page-table lock and the shootdown from every child.
+const MIN_MAP_ITERATIONS: u32 = 64;
+
+/// A child's `done` bit is `1 << index`; [`ERROR_BIT`] above them all marks
+/// a child that failed.
+const ERROR_BIT: u64 = 1 << 32;
+
+// Every child's done bit must lie below the error bit.
+const _: () = assert!(NUM_CHILDREN <= 32);
 
 /// Per-child arguments, handed to `mapper_entry` by address.
 #[derive(Clone, Copy)]
@@ -32,6 +41,8 @@ struct MapperArgs
     memory: u32,
     aspace: u32,
     done_bit: u64,
+    /// Map/unmap iterations to run.
+    iterations: u32,
 }
 
 static MAPPER_ARGS: spawn::ArgBlock<MapperArgs, NUM_CHILDREN> = spawn::ArgBlock::new(MapperArgs {
@@ -39,6 +50,7 @@ static MAPPER_ARGS: spawn::ArgBlock<MapperArgs, NUM_CHILDREN> = spawn::ArgBlock:
     memory: 0,
     aspace: 0,
     done_bit: 0,
+    iterations: 0,
 });
 
 /// Base VA for stress mappings, well above normal test VAs.
@@ -46,40 +58,78 @@ const STRESS_MAP_BASE: u64 = 0x1_5000_0000;
 /// Spacing between each child's VA (16-page stride).
 const VA_STRIDE: u64 = 0x1_0000;
 
+/// The pool frames and children the cell holds: the first `allocated`
+/// frames and the first `spawned` children are live.
+struct Mappers
+{
+    frames: [u32; NUM_CHILDREN],
+    allocated: usize,
+    threads: [u32; NUM_CHILDREN],
+    cspaces: [u32; NUM_CHILDREN],
+    spawned: usize,
+}
+
+/// Child `index`'s stress VA.
+fn child_va(index: usize) -> u64
+{
+    STRESS_MAP_BASE + (index as u64) * VA_STRIDE
+}
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
+    let cpus = system_info(SystemInfoType::CpuCount as u64)
+        .map_err(|_| "concurrent_map_unmap: system_info(CpuCount) failed")?;
+    // Each unmap's shootdown reaches more CPUs, and costs more, with the
+    // width; the count shrinks with it.
+    let iterations = super::scaled_attempts(MAP_ITERATIONS, MIN_MAP_ITERATIONS, cpus);
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "concurrent_map_unmap: create done failed")?;
 
-    // Allocate frames from pool for each child. Every `?` early return
-    // below skips the cleanup at the end of `run`: it leaks the pool frames
-    // already allocated and, past the first spawn, leaves the children
-    // already started running with their threads and CSpaces (#444).
-    let mut memory_caps = [0u32; NUM_CHILDREN];
-    for memory_cap in &mut memory_caps
+    let mut mappers = Mappers {
+        frames: [0; NUM_CHILDREN],
+        allocated: 0,
+        threads: [0; NUM_CHILDREN],
+        cspaces: [0; NUM_CHILDREN],
+        spawned: 0,
+    };
+    let result =
+        start_mappers(ctx, done, iterations, &mut mappers).and_then(|()| await_mappers(done));
+    let released = release(ctx, &mappers);
+    cap_delete(done).ok();
+    result?;
+    released
+}
+
+/// Allocate one pool frame per child, then start each child on its own
+/// frame and VA, recording each frame and child in `mappers` as soon as it
+/// exists.
+fn start_mappers(ctx: &TestContext, done: u32, iterations: u32, mappers: &mut Mappers)
+-> TestResult
+{
+    for i in 0..NUM_CHILDREN
     {
-        *memory_cap =
+        mappers.frames[i] =
             crate::frame_pool::alloc().ok_or("concurrent_map_unmap: frame pool exhausted")?;
+        mappers.allocated = i + 1;
     }
 
-    // Spawn children. Each child gets copies of its Memory cap and the aspace
-    // cap in its own CSpace.
-    let mut threads = [0u32; NUM_CHILDREN];
-    let mut cspaces = [0u32; NUM_CHILDREN];
-    for i in 0..NUM_CHILDREN
+    // Each child gets copies of its Memory cap and the aspace cap in its own
+    // CSpace.
+    for (i, va_slot) in VA_PER_CHILD.iter().enumerate()
     {
         let child =
             spawn::new_child(ctx).map_err(|_| "concurrent_map_unmap: spawn::new_child failed")?;
+        mappers.threads[i] = child.th;
+        mappers.cspaces[i] = child.cs;
+        mappers.spawned = i + 1;
         let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "concurrent_map_unmap: cap_copy done failed")?;
         // Copy memory and aspace caps into child's CSpace with full rights.
-        let child_memory = cap_copy(memory_caps[i], child.cs, syscall::RIGHTS_ALL)
+        let child_memory = cap_copy(mappers.frames[i], child.cs, syscall::RIGHTS_ALL)
             .map_err(|_| "concurrent_map_unmap: cap_copy memory failed")?;
         let child_aspace = cap_copy(ctx.aspace_cap, child.cs, syscall::RIGHTS_ALL)
             .map_err(|_| "concurrent_map_unmap: cap_copy aspace failed")?;
 
-        let done_bit = 1u64 << i;
-        let va = STRESS_MAP_BASE + (i as u64) * VA_STRIDE;
         // SAFETY: child `i` has not been started yet; the block is reused
         // only after every child has been reaped.
         let arg = unsafe {
@@ -89,25 +139,27 @@ pub fn run(ctx: &TestContext) -> TestResult
                     done: child_done,
                     memory: child_memory,
                     aspace: child_aspace,
-                    done_bit,
+                    done_bit: 1u64 << i,
+                    iterations,
                 },
             )
         };
 
-        // Publish this child's VA in VA_PER_CHILD[i]; the child recovers `i`
+        // Publish this child's VA in its VA_PER_CHILD slot; the child recovers `i`
         // from its done_bit (`trailing_zeros`).
-        VA_PER_CHILD[i].store(va, core::sync::atomic::Ordering::Release);
+        va_slot.store(child_va(i), core::sync::atomic::Ordering::Release);
 
         // SAFETY: Each child uses a distinct stack index.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
         spawn::configure_and_start(&child, mapper_entry, stack_top, arg)
             .map_err(|_| "concurrent_map_unmap: configure_and_start failed")?;
-
-        threads[i] = child.th;
-        cspaces[i] = child.cs;
     }
+    Ok(())
+}
 
-    // Wait for all children. Each child sends a unique bit (1<<i).
+/// Wait for every child's done bit; fail if any child reported failure.
+fn await_mappers(done: u32) -> TestResult
+{
     let all_done = (1u64 << NUM_CHILDREN) - 1;
     let mut done_bits: u64 = 0;
     let mut child_failed = false;
@@ -116,35 +168,47 @@ pub fn run(ctx: &TestContext) -> TestResult
         let bits = notification_wait(done)
             .map_err(|_| "concurrent_map_unmap: notification_wait failed")?;
         done_bits |= bits;
-        // Bit 32 is the error indicator (well clear of done_bit range for
-        // NUM_CHILDREN up to 32).
-        if bits & (1 << 32) != 0
+        if bits & ERROR_BIT != 0
         {
             child_failed = true;
         }
     }
-
-    // Clean up.
-    for i in 0..NUM_CHILDREN
-    {
-        cap_delete(threads[i]).ok();
-        cap_delete(cspaces[i]).ok();
-        // SAFETY: `memory_caps` are from the pool. A child that reports
-        // success has unmapped its VA, so `frame_pool::free`'s unmapped
-        // precondition holds for its frame. A child that exits on a failed
-        // `aspace_query` or `mem_unmap` leaves its frame mapped at its stress
-        // VA, and nothing here unmaps it: on that path this free breaks the
-        // precondition and a later `alloc` can hand out a frame that is still
-        // mapped (#444). The test still fails via `child_failed`.
-        unsafe { crate::frame_pool::free(memory_caps[i]) };
-    }
-    cap_delete(done).ok();
-
     if child_failed
     {
         return Err("concurrent_map_unmap: child reported failure");
     }
     Ok(())
+}
+
+/// Delete every child started, then return each frame to the pool once its
+/// VA is unmapped: a child that failed may have left its frame mapped, and
+/// a frame still mapped stays out of the pool rather than being handed out
+/// again.
+fn release(ctx: &TestContext, mappers: &Mappers) -> TestResult
+{
+    for i in 0..mappers.spawned
+    {
+        cap_delete(mappers.threads[i]).ok();
+        cap_delete(mappers.cspaces[i]).ok();
+    }
+    let mut result = Ok(());
+    for i in 0..mappers.allocated
+    {
+        let va = child_va(i);
+        // A VA its child left unmapped refuses the unmap; either way the
+        // query below decides.
+        let _ = mem_unmap(ctx.aspace_cap, va, 1);
+        if syscall::aspace_query(ctx.aspace_cap, va).is_ok()
+        {
+            result = Err("concurrent_map_unmap: a child's VA stayed mapped");
+            continue;
+        }
+        // SAFETY: the frame came from the pool, every child that could map
+        // it was deleted above, and its only VA is unmapped (the query just
+        // failed), so `frame_pool::free`'s unmapped precondition holds.
+        unsafe { crate::frame_pool::free(mappers.frames[i]) };
+    }
+    result
 }
 
 /// Per-child VA, set by parent before starting each child.
@@ -161,18 +225,19 @@ extern "C" fn mapper_entry(arg: u64) -> !
         memory: memory_cap,
         aspace,
         done_bit,
+        iterations,
     } = unsafe { spawn::child_args(arg) };
 
     // Determine our child index from done_bit (1<<i → i).
     let child_idx = done_bit.trailing_zeros() as usize;
     let va = VA_PER_CHILD[child_idx].load(core::sync::atomic::Ordering::Acquire);
 
-    for _ in 0..MAP_ITERATIONS
+    for _ in 0..iterations
     {
         if mem_map(memory_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
         {
-            // Send done_bit | error indicator (bit 32).
-            notification_send(done_slot, done_bit | (1 << 32)).ok();
+            // Report the failure with the done bit.
+            notification_send(done_slot, done_bit | ERROR_BIT).ok();
             thread_exit();
         }
 
@@ -182,13 +247,13 @@ extern "C" fn mapper_entry(arg: u64) -> !
         // ktest's image (core/ktest/src/frame_pool.rs).
         if syscall::aspace_query(aspace, va).is_err()
         {
-            notification_send(done_slot, done_bit | (1 << 32)).ok();
+            notification_send(done_slot, done_bit | ERROR_BIT).ok();
             thread_exit();
         }
 
         if mem_unmap(aspace, va, 1).is_err()
         {
-            notification_send(done_slot, done_bit | (1 << 32)).ok();
+            notification_send(done_slot, done_bit | ERROR_BIT).ok();
             thread_exit();
         }
     }

@@ -45,6 +45,11 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// Thread-delete cycles (a third per wait kind).
 const CYCLES: u32 = 192;
 
+/// Fewest cycles at any width ([`super::scaled_attempts`]): the cell's
+/// tripwires are the kernel's, so the floor only keeps every wait kind
+/// deleted on both of its CPUs a few times.
+const MIN_CYCLES: u32 = 48;
+
 /// Waiter wait-loop timeout: short, so deadlines expire throughout a cycle.
 const WAIT_MS: u64 = 1;
 
@@ -79,8 +84,11 @@ fn cycles(ctx: &TestContext, cpus: u32) -> TestResult
         let _ = cap_delete(sig);
         return Err("stress::timed_waiter_thread_delete: create event queue failed");
     };
+    // Each cycle's waiter start and cross-CPU delete grow with the width; the
+    // count shrinks with it.
+    let count = super::scaled_attempts(CYCLES, MIN_CYCLES, u64::from(cpus));
     let mut result = Ok(());
-    for cycle in 0..CYCLES
+    for cycle in 0..count
     {
         result = one_cycle(ctx, cycle, cpus, sig, eq);
         if result.is_err()

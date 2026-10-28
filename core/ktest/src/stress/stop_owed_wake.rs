@@ -35,7 +35,8 @@
 //! A waiter loops `notification_wait` on one notification; a sender on CPU 0
 //! loops `notification_send` on it. The waiter runs on CPU 2, or shares CPU 0
 //! with the sender at 2 CPUs. The controller, pinned to CPU 1, stops and
-//! restarts the waiter [`CYCLES`] times, waiting after each restart until the
+//! restarts the waiter [`CYCLES`] times (fewer past 16 CPUs, see
+//! [`super::scaled_attempts`]), waiting after each restart until the
 //! waiter has run and entered a wait (bounded; a starved round is logged), then
 //! spinning a varying time, in two phases: alone, then while a starter on
 //! CPU 3 (a CPU no other participant uses) loops `thread_start` on the waiter.
@@ -78,6 +79,11 @@ const CELL: &str = "stress::stop_owed_wake";
 
 /// Stop/start rounds per phase.
 const CYCLES: u32 = 2000;
+
+/// Fewest rounds per phase at any width: most stops land on a parked waiter
+/// and the starter wins a fair share of the racing restarts, so a few dozen
+/// rounds still cancel waits and give the starter wins.
+const MIN_CYCLES: u32 = 64;
 
 /// Bound, in 1 ms sleeps, on the controller's polls for the starter to go
 /// idle and for every child to exit.
@@ -211,7 +217,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         Phases::AloneThenRacing => STARTER_CPU,
         Phases::AloneOnly => 0,
     };
-    let result = with_children(ctx, [waiter_cpu, 0, starter_cpu], phases);
+    // Each round's cross-CPU stop drain and restart grow with the width; the
+    // count shrinks with it.
+    let cycles = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
+    let result = with_children(ctx, [waiter_cpu, 0, starter_cpu], phases, cycles);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_owed_wake: restore controller affinity failed");
     let armed = result?;
@@ -286,12 +295,14 @@ fn check_race(race: &Race) -> TestResult
 }
 
 /// Create the notification and the children (the waiter, the sender, and the
-/// starter, on `cpus` in that order), run `phases`, and delete everything
-/// whatever the outcome. Returns the tallies the rounds saw.
+/// starter, on `cpus` in that order), run `phases` of `cycles` rounds each,
+/// and delete everything whatever the outcome. Returns the tallies the
+/// rounds saw.
 fn with_children(
     ctx: &TestContext,
     cpus: [u32; CHILDREN],
     phases: Phases,
+    cycles: u32,
 ) -> Result<Armed, &'static str>
 {
     let sig = cap_create_notification(ctx.memory_base)
@@ -303,7 +314,7 @@ fn with_children(
         {
             return Err("stress::stop_owed_wake: a child is missing");
         };
-        let ran = run_phases(waiter.th, starter.th, phases);
+        let ran = run_phases(waiter.th, starter.th, phases, cycles);
         QUIT.store(1, Ordering::Release);
         let exited = await_exit(sig);
         let armed = ran?;
@@ -373,10 +384,16 @@ fn start(
 /// Run the first phase (the controller alone), then, for
 /// [`Phases::AloneThenRacing`], the second (the starter racing every
 /// restart, and stopped and restarted by the controller every
-/// [`STARTER_STOP_PERIOD`] rounds); returns what they saw.
-fn run_phases(waiter_th: u32, starter_th: u32, phases: Phases) -> Result<Armed, &'static str>
+/// [`STARTER_STOP_PERIOD`] rounds), `cycles` rounds each; returns what they
+/// saw.
+fn run_phases(
+    waiter_th: u32,
+    starter_th: u32,
+    phases: Phases,
+    cycles: u32,
+) -> Result<Armed, &'static str>
 {
-    let alone_losses = rounds(waiter_th, None)?;
+    let alone_losses = rounds(waiter_th, None, cycles)?;
     if alone_losses != 0
     {
         crate::log_u64(
@@ -395,7 +412,7 @@ fn run_phases(waiter_th: u32, starter_th: u32, phases: Phases) -> Result<Armed, 
         Phases::AloneThenRacing =>
         {
             RACE.store(1, Ordering::SeqCst);
-            let raced = rounds(waiter_th, Some(starter_th));
+            let raced = rounds(waiter_th, Some(starter_th), cycles);
             // A failed round may have left the starter stopped; it must run
             // to leave its last start and to exit on QUIT.
             let resumed = ensure_started(starter_th);
@@ -417,15 +434,15 @@ fn run_phases(waiter_th: u32, starter_th: u32, phases: Phases) -> Result<Armed, 
     })
 }
 
-/// Stop and restart the waiter [`CYCLES`] times. With `starter_th`, every
+/// Stop and restart the waiter `cycles` times. With `starter_th`, every
 /// [`STARTER_STOP_PERIOD`] rounds also stop the starter right after the
 /// waiter, and restart it once the waiter's restart returns. Returns how many
 /// of the waiter's restarts returned `InvalidArgument` (lost to the
 /// starter's).
-fn rounds(waiter_th: u32, starter_th: Option<u32>) -> Result<u32, &'static str>
+fn rounds(waiter_th: u32, starter_th: Option<u32>, cycles: u32) -> Result<u32, &'static str>
 {
     let mut lost = 0;
-    for cycle in 0..CYCLES
+    for cycle in 0..cycles
     {
         stop(
             waiter_th,

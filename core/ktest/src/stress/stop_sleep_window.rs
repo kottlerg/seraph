@@ -24,7 +24,8 @@
 //!
 //! A sleeper pinned to CPU 0 — the CPU whose timer tick pops and claims
 //! expired sleepers — loops `thread_sleep(1)` and tallies each result. The
-//! controller, pinned to CPU 1, stops and restarts it [`CYCLES`] times with a
+//! controller, pinned to CPU 1, stops and restarts it [`CYCLES`] times (fewer
+//! past 16 CPUs, see [`super::scaled_attempts`]) with a
 //! varying spin between pairs, so stops also land between the timer's pop
 //! and its wake. The tripwires are the kernel's debug assertions (CI debug
 //! cells run them): a listed TCB with a zero deadline at the pop, a
@@ -50,6 +51,10 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 
 /// Stop/start pairs to issue against the sleeper.
 const CYCLES: u32 = 2000;
+
+/// Fewest pairs at any width: the sleeper spends most of its time asleep, so
+/// a few dozen stops already cancel sleeps and land around the timer's claim.
+const MIN_CYCLES: u32 = 64;
 
 /// Notification NOTIFY right — what a child needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
@@ -81,9 +86,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     INTERRUPTED.store(0, Ordering::Relaxed);
     BAD.store(0, Ordering::Relaxed);
 
+    // Each pair's cross-CPU stop drain grows with the width; the count
+    // shrinks with it.
+    let cycles = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
     thread_set_affinity(ctx.thread_cap, 1)
         .map_err(|_| "stress::stop_sleep_window: pin controller failed")?;
-    let result = with_sleeper(ctx);
+    let result = with_sleeper(ctx, cycles);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_sleep_window: restore controller affinity failed");
     result?;
@@ -108,9 +116,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Start the sleeper, run the stop/start storm, and always reap the sleeper
-/// and its notification, whatever the storm's outcome.
-fn with_sleeper(ctx: &TestContext) -> TestResult
+/// Start the sleeper, run a storm of `cycles` stop/start pairs, and always
+/// reap the sleeper and its notification, whatever the storm's outcome.
+fn with_sleeper(ctx: &TestContext, cycles: u32) -> TestResult
 {
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::stop_sleep_window: create done failed")?;
@@ -120,7 +128,7 @@ fn with_sleeper(ctx: &TestContext) -> TestResult
         let _ = cap_delete(done);
         return Err("stress::stop_sleep_window: spawn sleeper failed");
     };
-    let result = start_and_storm(&child, done);
+    let result = start_and_storm(&child, done, cycles);
     // Deleting the thread stops it wherever it is, so the shared stack is
     // free for the next test even when the storm failed.
     let reaped = [cap_delete(child.th), cap_delete(child.cs), cap_delete(done)]
@@ -130,7 +138,7 @@ fn with_sleeper(ctx: &TestContext) -> TestResult
     reaped.map_err(|_| "stress::stop_sleep_window: reap failed")
 }
 
-fn start_and_storm(child: &spawn::SpawnedChild, done: u32) -> TestResult
+fn start_and_storm(child: &spawn::SpawnedChild, done: u32, cycles: u32) -> TestResult
 {
     let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "stress::stop_sleep_window: cap_copy done failed")?;
@@ -148,7 +156,7 @@ fn start_and_storm(child: &spawn::SpawnedChild, done: u32) -> TestResult
         "stress::stop_sleep_window: the sleeper never reported running",
     )?;
 
-    for cycle in 0..CYCLES
+    for cycle in 0..cycles
     {
         // Vary the stop's phase against the sleep loop: 0 to 4095 spins
         // (a multiplicative hash of the cycle) before each pair.

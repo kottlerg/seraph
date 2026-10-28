@@ -42,7 +42,9 @@
 //! until every filler has started and a probe `thread_sleep(1)` of its own
 //! returns `OutOfMemory`, which proves every slot is held. A victim
 //! pinned to CPU 1 then loops `thread_sleep(1)` while the controller issues
-//! [`CYCLES`] stop/start pairs against it, each after a cycle-varying spin,
+//! [`CYCLES`] stop/start pairs against it (fewer past 16 CPUs, as for the
+//! timed-wait storm below; see [`super::scaled_attempts`]), each after a
+//! cycle-varying spin,
 //! so stops land before, inside and after the victim's commit-to-withdrawal
 //! window. With the list full no victim sleep can be listed, so every
 //! result must be `OutOfMemory` or `Interrupted`. The controller then stops
@@ -105,6 +107,20 @@ const WAIT_CYCLES: u32 = 1000;
 
 /// Stop/start pairs to issue against the victim.
 const CYCLES: u32 = 2000;
+
+/// Fewest pairs of each storm at any width: between two stops each victim
+/// loops many full-list waits or sleeps, so a few dozen pairs already meet
+/// the full list and land stops around its withdrawals.
+const MIN_WAIT_CYCLES: u32 = 32;
+const MIN_CYCLES: u32 = 64;
+
+/// The stop/start pairs of the timed-wait storm and of the sleep storm.
+#[derive(Clone, Copy)]
+struct Storms
+{
+    waits: u32,
+    sleeps: u32,
+}
 
 /// The controller's and the victim's CPUs.
 const CONTROLLER_CPU: u32 = 0;
@@ -186,7 +202,13 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::sleep_list_full: pin controller failed")?;
-    let result = with_fillers(ctx);
+    // Each pair's cross-CPU stop drain grows with the width; the counts
+    // shrink with it.
+    let storms = Storms {
+        waits: super::scaled_attempts(WAIT_CYCLES, MIN_WAIT_CYCLES, cpus),
+        sleeps: super::scaled_attempts(CYCLES, MIN_CYCLES, cpus),
+    };
+    let result = with_fillers(ctx, storms);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::sleep_list_full: restore controller affinity failed");
     result?;
@@ -215,7 +237,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// Fill the sleep list, check the timed waits, run the timed-wait storm and
 /// the sleep storm (each reaps its own victim), and delete every filler
 /// whatever the outcome.
-fn with_fillers(ctx: &TestContext) -> TestResult
+fn with_fillers(ctx: &TestContext, storms: Storms) -> TestResult
 {
     let cs = cap_create_cspace(ctx.memory_base, 0, 4)
         .map_err(|_| "stress::sleep_list_full: create filler cspace failed")?;
@@ -224,8 +246,8 @@ fn with_fillers(ctx: &TestContext) -> TestResult
     let mut result = spawn_fillers(ctx, cs, &mut fillers, &mut created)
         .and_then(|()| await_full())
         .and_then(|()| timed_waits_time_out(ctx))
-        .and_then(|()| timed_wait_storm(ctx))
-        .and_then(|()| with_victim(ctx, &fillers[..created]));
+        .and_then(|()| timed_wait_storm(ctx, storms.waits))
+        .and_then(|()| with_victim(ctx, &fillers[..created], storms.sleeps));
     // Deleting a filler removes its sleep entry if a failed storm left one.
     for &th in &fillers[..created]
     {
@@ -324,7 +346,7 @@ fn timed_waits_time_out(ctx: &TestContext) -> TestResult
 /// Spawn a victim looping a timed notification wait and a timed event
 /// receive on the full list, storm it with stop/start pairs, and reap it:
 /// every wait must return its timeout or `Interrupted`.
-fn timed_wait_storm(ctx: &TestContext) -> TestResult
+fn timed_wait_storm(ctx: &TestContext, cycles: u32) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::sleep_list_full: create storm notification failed")?;
@@ -337,7 +359,7 @@ fn timed_wait_storm(ctx: &TestContext) -> TestResult
     let result = spawn::new_child(ctx)
         .map_err(|_| "stress::sleep_list_full: spawn wait victim failed")
         .and_then(|child| {
-            let stormed = storm_waits(&child, sig, eq);
+            let stormed = storm_waits(&child, sig, eq, cycles);
             let reaped = [cap_delete(child.th), cap_delete(child.cs)]
                 .into_iter()
                 .collect::<Result<(), i64>>()
@@ -373,7 +395,9 @@ fn timed_wait_storm(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-fn storm_waits(child: &spawn::SpawnedChild, sig: u32, eq: u32) -> TestResult
+/// Start the timed-wait victim on `sig` and `eq` and issue `cycles`
+/// stop/start pairs against it.
+fn storm_waits(child: &spawn::SpawnedChild, sig: u32, eq: u32, cycles: u32) -> TestResult
 {
     let c_sig = cap_copy(sig, child.cs, RIGHTS_NTF_WAIT)
         .map_err(|_| "stress::sleep_list_full: cap_copy storm notification failed")?;
@@ -389,7 +413,7 @@ fn storm_waits(child: &spawn::SpawnedChild, sig: u32, eq: u32) -> TestResult
         &WAIT_RUNNING,
         "stress::sleep_list_full: the wait victim never ran",
     )?;
-    for cycle in 0..WAIT_CYCLES
+    for cycle in 0..cycles
     {
         for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 20)
         {
@@ -439,11 +463,11 @@ extern "C" fn wait_victim_entry(arg: u64) -> !
 
 /// Start the victim, storm it, cancel the fillers' sleeps by stopping the
 /// fillers, then let the victim sleep once more; always reap the victim.
-fn with_victim(ctx: &TestContext, fillers: &[u32]) -> TestResult
+fn with_victim(ctx: &TestContext, fillers: &[u32], cycles: u32) -> TestResult
 {
     let child =
         spawn::new_child(ctx).map_err(|_| "stress::sleep_list_full: spawn victim failed")?;
-    let result = storm(&child, fillers);
+    let result = storm(&child, fillers, cycles);
     let reaped = [cap_delete(child.th), cap_delete(child.cs)]
         .into_iter()
         .collect::<Result<(), i64>>();
@@ -451,7 +475,7 @@ fn with_victim(ctx: &TestContext, fillers: &[u32]) -> TestResult
     reaped.map_err(|_| "stress::sleep_list_full: reap victim failed")
 }
 
-fn storm(child: &spawn::SpawnedChild, fillers: &[u32]) -> TestResult
+fn storm(child: &spawn::SpawnedChild, fillers: &[u32], cycles: u32) -> TestResult
 {
     // SAFETY: stack index 0 is this cell's only STRESS_STACKS user; the
     // victim is deleted before this cell returns.
@@ -460,7 +484,7 @@ fn storm(child: &spawn::SpawnedChild, fillers: &[u32]) -> TestResult
         .map_err(|_| "stress::sleep_list_full: start victim failed")?;
     await_flag(&RUNNING, "stress::sleep_list_full: the victim never ran")?;
 
-    for cycle in 0..CYCLES
+    for cycle in 0..cycles
     {
         // Vary the stop's phase against the sleep loop: 0 to 4095 spins
         // (a multiplicative hash of the cycle) before each pair.

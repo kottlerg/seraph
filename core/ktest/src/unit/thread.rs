@@ -80,6 +80,12 @@ static mut STACK_BALANCE_SPINNERS: [ChildStack; BALANCE_MAX_SPINNERS] = [
 /// every iteration; the parent reads this to detect migration.
 static MIGRATE_OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 
+/// Bound, in 1 ms polls, on each of `affinity_migrate_running`'s waits for
+/// the spinner's CPU. Applied through [`crate::scaled_bound`], which
+/// stretches it past [`crate::UNSCALED_CPUS`] CPUs, where the spinner's
+/// vCPU waits for a host core before it runs or migrates.
+const MIGRATE_POLLS: u64 = 2_000;
+
 /// Tells the migration spinner to exit cleanly once the parent has
 /// observed the migration.
 static MIGRATE_SHOULD_EXIT: AtomicU32 = AtomicU32::new(0);
@@ -969,12 +975,13 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
     // between polls: T runs strictly below this thread's priority, so after
     // the migration below it can only run on a CPU this thread has vacated —
     // a yield would never cede to it.
+    let poll_bound = crate::scaled_bound(MIGRATE_POLLS);
     let mut polls: u32 = 0;
     while MIGRATE_OBSERVED_CPU.load(Ordering::Relaxed) != 1
     {
         syscall::thread_sleep(1).ok();
         polls = polls.saturating_add(1);
-        if polls > 2_000
+        if u64::from(polls) > poll_bound
         {
             MIGRATE_SHOULD_EXIT.store(1, Ordering::Relaxed);
             return Err("T never observed on CPU 1 before migration");
@@ -991,7 +998,7 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
     {
         syscall::thread_sleep(1).ok();
         polls = polls.saturating_add(1);
-        if polls > 2_000
+        if u64::from(polls) > poll_bound
         {
             MIGRATE_SHOULD_EXIT.store(1, Ordering::Relaxed);
             return Err("Running-thread migration did not land on CPU 0");

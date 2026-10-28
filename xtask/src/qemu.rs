@@ -393,9 +393,9 @@ pub fn prepare_riscv_firmware(ctx: &Context) -> Result<(PathBuf, PathBuf)>
 /// exists.
 ///
 /// Every launcher (`run`, `run-parallel`, and the `test-*` runners) is a
-/// pure runner — it refuses to launch QEMU if the sysroot is missing or
-/// stamped for the wrong architecture, pointing the caller at
-/// `cargo xtask build`.
+/// pure runner — it refuses to launch QEMU if the sysroot is missing
+/// (pointing the caller at `cargo xtask build`) or stamped for the wrong
+/// architecture (pointing the caller at `cargo xtask clean`).
 pub fn validate_sysroot_for_launch(ctx: &Context, arch: Arch) -> Result<()>
 {
     sysroot::check_arch(ctx, arch)?;

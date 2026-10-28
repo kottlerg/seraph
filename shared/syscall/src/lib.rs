@@ -410,9 +410,6 @@ pub fn cap_create_notification(memory_cap: u32) -> Result<u32, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Create a new `AddressSpace` object. Returns the new capability handle (slot
-/// index plus generation).
-///
 /// Retype a Memory cap into a new `AddressSpace`, or augment an existing
 /// one's PT growth budget.
 ///
@@ -442,6 +439,9 @@ pub fn cap_create_notification(memory_cap: u32) -> Result<u32, i64>
 /// augment target lacks Map; `OutOfMemory` if `memory_cap`'s region or the
 /// caller's `CSpace` slot-page pool is exhausted; `QuotaExceeded` if the
 /// caller's `CSpace` directory is structurally full.
+// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
+// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
+// so it fits u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
@@ -493,6 +493,9 @@ pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 /// structurally full. A later cap insert into the new `CSpace` fails with
 /// `OutOfMemory` (-8) when the seeded pool is exhausted (refill via augment
 /// mode) and `QuotaExceeded` (-17) at the structural ceiling.
+// cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
+// a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
+// so it fits u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_create_cspace(memory_cap: u32, augment_target: u32, init_pages: u64)

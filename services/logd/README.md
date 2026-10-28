@@ -69,8 +69,9 @@ targets; only the one-time init-logd history pull
   registers it with procmgr via `procmgr_labels::REGISTER_DEATH_EQ`
   (authorised by the `DEATH_EQ_AUTHORITY` badged `SEND|GRANT` cap svcmgr mints
   into logd's bootstrap round). Procmgr binds that EQ as an
-  additional death observer on every existing thread and on every
-  future spawn (see
+  additional death observer on the main thread of every existing
+  process and of every future spawn, so only a process's own exit
+  posts to it; a worker thread's exit does not (see
   [`services/procmgr/docs/ipc-interface.md`](../procmgr/docs/ipc-interface.md)).
   When a process exits, logd's EQ receives
   `(process_badge << 32) | exit_reason`; logd evicts the matching
@@ -88,6 +89,14 @@ targets; only the one-time init-logd history pull
 logd/
 ├── Cargo.toml                  # std-built workspace member
 ├── README.md
+├── codec/                      # logd-codec: no_std, host-tested
+│   └── src/
+│       ├── lib.rs
+│       ├── handover.rs         # handover wire contract, shared with
+│       │                       # init-logd: codes, chunk decoder,
+│       │                       # name-resend tracker
+│       └── bounded_str.rs      # BoundedStr: UTF-8-safe bounded
+│                               # formatter for self_log
 ├── docs/
 │   ├── handover-protocol.md    # init-logd → logd wire format
 │   └── ipc-interface.md        # IPC labels logd handles
@@ -95,7 +104,7 @@ logd/
     ├── main.rs                 # entry, bootstrap, event loop,
     │                           # driver-mediated serial + framebuffer
     │                           # emit, self_log
-    ├── handover.rs             # HANDOVER_PULL caller
+    ├── handover.rs             # HANDOVER_PULL / HANDOVER_RELEASE caller
     └── slot.rs                 # SlotTable: HashMap<badge, Slot>
                                 # with per-sender history ring
 ```

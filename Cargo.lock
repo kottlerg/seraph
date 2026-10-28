@@ -521,6 +521,7 @@ dependencies = [
  "elf",
  "init-protocol",
  "ipc",
+ "logd-codec",
  "namespace-protocol",
  "ns-client",
  "process-abi",
@@ -628,8 +629,16 @@ name = "logd"
 version = "0.1.1"
 dependencies = [
  "ipc",
+ "logd-codec",
  "syscall",
  "syscall-abi",
+]
+
+[[package]]
+name = "logd-codec"
+version = "0.1.1"
+dependencies = [
+ "ipc",
 ]
 
 [[package]]

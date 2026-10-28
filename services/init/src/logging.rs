@@ -31,9 +31,12 @@
 //! * **Handover (`HANDOVER_PULL` + `HANDOVER_RELEASE`):** real-logd,
 //!   once up, drains (badge table + history ring) via repeated
 //!   `log_labels::HANDOVER_PULL` calls on the same endpoint, then issues
-//!   a single `HANDOVER_RELEASE`. Init-logd breaks its loop and
-//!   `sys_thread_exit`s on the RELEASE — not on the drain's `DONE` — so a
-//!   dropped data chunk cannot leave it running and block procmgr's reap.
+//!   `HANDOVER_RELEASE`. Init-logd breaks its loop and `sys_thread_exit`s
+//!   on an acknowledged RELEASE — not on the drain's `DONE` — so a dropped
+//!   data chunk cannot leave it running and block procmgr's reap. A name
+//!   registered after its slot was sent defers the release (bounded) until
+//!   a further pull has carried it. The wire contract lives in
+//!   `logd_codec::handover` (`services/logd/codec`).
 
 use crate::PAGE_SIZE;
 use crate::arch;
@@ -42,6 +45,7 @@ use init_protocol::InitInfo;
 
 use ipc::log_labels::{HANDOVER_PULL, HANDOVER_RELEASE};
 use ipc::stream_labels::STREAM_BYTES;
+use logd_codec::handover::{self, NameResend};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 //
@@ -392,8 +396,8 @@ static HISTORY_HEAD: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomi
 /// dump) without scanning for sentinel values.
 static HISTORY_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Set when `HANDOVER_PULL` has replied its final chunk. The receive
-/// loop checks this on the next iteration and exits cleanly via
+/// Set when init-logd acknowledges real-logd's `HANDOVER_RELEASE`. The
+/// receive loop checks this on the next iteration and exits cleanly via
 /// `sys_thread_exit`, terminating the init-logd thread.
 static HANDOVER_COMPLETE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -423,12 +427,6 @@ fn history_push(slot: &SenderSlot)
     HISTORY_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Receive byte-stream messages from services and write them to the serial
-/// port, prefixing each line with the sender's `[name]` (extracted from the
-/// per-message kernel-delivered badge). Also services real-logd's
-/// `HANDOVER_PULL` data drain and its terminal `HANDOVER_RELEASE`; the
-/// latter sets `HANDOVER_COMPLETE`, and the next loop iteration
-/// self-terminates the thread.
 /// `RecvGuard` diagnostic hook. Init's serial sink is direct, so emit
 /// synthetic logd lines; the error code is dropped (the kernel's recv
 /// diagnostic carries the cause).
@@ -447,6 +445,12 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, _err: i64)
     }
 }
 
+/// Receive byte-stream messages from services and write them to the serial
+/// port, prefixing each line with the sender's `[name]` (extracted from the
+/// per-message kernel-delivered badge). Also services real-logd's
+/// `HANDOVER_PULL` data drain and its terminal `HANDOVER_RELEASE`; an
+/// acknowledged release sets `HANDOVER_COMPLETE`, and the next loop
+/// iteration self-terminates the thread.
 fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
 {
     let mut slots: [SenderSlot; MAX_SENDERS] = [SenderSlot::empty(); MAX_SENDERS];
@@ -456,6 +460,9 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
     let mut handover_cursor: u64 = 0;
     // Cursor into the slot table for staged HANDOVER_PULL replies.
     let mut handover_slot_idx: usize = 0;
+    // Slots whose name changed after the handover's slot pass began; the
+    // drain sends them again before it reports DONE or acks the release.
+    let mut name_resend: NameResend<MAX_SENDERS> = NameResend::new();
 
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
@@ -488,7 +495,11 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
         }
         else if label_id == ipc::stream_labels::STREAM_REGISTER_NAME
         {
-            register_sender_name(&mut slots, &mut next_evict, &recv, recv.badge, byte_len);
+            if let Some(slot_idx) =
+                register_sender_name(&mut slots, &mut next_evict, &recv, recv.badge, byte_len)
+            {
+                name_resend.note_name_change(slot_idx);
+            }
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
         }
@@ -498,17 +509,25 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
                 &slots,
                 &mut handover_cursor,
                 &mut handover_slot_idx,
+                &mut name_resend,
                 ipc_buf_raw,
             );
         }
         else if label_id == HANDOVER_RELEASE
         {
             // Real-logd's terminal release: the sole init-logd exit trigger,
-            // independent of the data drain's progress. Ack, set the flag; the
-            // next loop iteration self-terminates the thread.
+            // independent of the data drain's progress. A name that changed
+            // after its slot was sent defers it (a bounded number of times):
+            // real-logd pulls again and the drain sends that slot. Otherwise
+            // ack and set the flag; the next loop iteration self-terminates
+            // the thread.
+            let status = name_resend.release_status();
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
-            HANDOVER_COMPLETE.store(true, core::sync::atomic::Ordering::Release);
+            let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(status), ipc_buf_raw) };
+            if status == handover::RELEASE_ACK
+            {
+                HANDOVER_COMPLETE.store(true, core::sync::atomic::Ordering::Release);
+            }
         }
         else
         {
@@ -519,42 +538,18 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
     }
 }
 
-/// Reply codes for [`HANDOVER_PULL`].
-mod handover_reply
-{
-    /// More data follows; caller should make another `HANDOVER_PULL`
-    /// call.
-    pub const MORE: u64 = 0;
-    /// Final chunk; the caller has the complete state.
-    pub const DONE: u64 = 1;
-}
-
-/// Per-chunk payload kind in `word(0)` of `HANDOVER_PULL` replies.
-mod handover_kind
-{
-    /// `word(1)` = total history-entry count; `word(2)` = active slot
-    /// count. No further data words. Always the first chunk so the
-    /// caller can size its receiving buffers.
-    pub const HEADER: u64 = 1;
-    /// One slot entry. `word(1)` = badge, `word(2)` = name length in
-    /// bytes; following bytes (starting `data[3*8]` via `.bytes(3,
-    /// ...)`) carry the name payload.
-    pub const SLOT: u64 = 2;
-    /// One history line. `word(1)` = badge, `word(2)` = receipt
-    /// microseconds, `word(3)` = byte length, followed by inline name
-    /// bytes via `.bytes(4, ...)`.
-    pub const LINE: u64 = 3;
-}
-
 /// Stage one chunk of handover state into the reply. Cursor state
-/// (`hist_cursor`, `slot_idx`) advances across calls so each pull
-/// returns a fresh chunk. On the last entry, replies with `DONE`,
-/// meaning only "no more data" — the init-logd thread terminates on a
-/// separate [`HANDOVER_RELEASE`], not on this `DONE`.
+/// (`hist_cursor`, `slot_idx`, `name_resend`) advances across calls so
+/// each pull returns a fresh chunk: the header, every occupied slot, every
+/// slot whose name changed after the slot pass began, then the history
+/// lines. On the last entry, replies with `DONE`, meaning only "no more
+/// data" — the init-logd thread terminates on a separate acknowledged
+/// [`HANDOVER_RELEASE`], not on this `DONE`.
 fn handle_handover_pull(
     slots: &[SenderSlot; MAX_SENDERS],
     hist_cursor: &mut u64,
     slot_idx: &mut usize,
+    name_resend: &mut NameResend<MAX_SENDERS>,
     ipc_buf: *mut u64,
 )
 {
@@ -565,8 +560,8 @@ fn handle_handover_pull(
     {
         let total = HISTORY_TOTAL.load(Ordering::Acquire);
         let active = slots.iter().filter(|s| s.badge != 0).count() as u64;
-        let reply = ipc::IpcMessage::builder(handover_reply::MORE)
-            .word(0, handover_kind::HEADER)
+        let reply = ipc::IpcMessage::builder(handover::REPLY_MORE)
+            .word(0, handover::KIND_HEADER)
             .word(1, total)
             .word(2, active)
             .build();
@@ -575,29 +570,30 @@ fn handle_handover_pull(
         // Sentinel: bump cursor to mark "header sent". Real cursors
         // start at 1.
         *hist_cursor = 1;
+        // From here a name change can land behind the slot pass; record it
+        // so the drain sends that slot again.
+        name_resend.start();
         return;
     }
 
-    // Slot table.
+    // Slot table, then any slot whose name changed after the pass began.
     while *slot_idx < MAX_SENDERS
     {
         let slot = &slots[*slot_idx];
         *slot_idx += 1;
-        if slot.badge == 0
+        if slot.badge != 0
         {
-            continue;
+            reply_slot(slot, ipc_buf);
+            return;
         }
-        let name_len = slot.name_used.min(MAX_NAME_LEN);
-        let label = handover_reply::MORE | ((name_len as u64 & 0xFFFF) << 16);
-        let reply = ipc::IpcMessage::builder(label)
-            .word(0, handover_kind::SLOT)
-            .word(1, slot.badge)
-            .word(2, name_len as u64)
-            .bytes(3, &slot.name[..name_len])
-            .build();
-        // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
+    }
+    while let Some(i) = name_resend.take_next()
+    {
+        if slots[i].badge != 0
+        {
+            reply_slot(&slots[i], ipc_buf);
+            return;
+        }
     }
 
     // History ring.
@@ -627,13 +623,13 @@ fn handle_handover_pull(
         // a fully-initialised slot.
         let entry = unsafe { &HISTORY[read_idx] };
         let byte_len = entry.used as usize;
-        let label = handover_reply::MORE | ((byte_len as u64 & 0xFFFF) << 16);
+        let label = handover::REPLY_MORE | ((byte_len as u64 & 0xFFFF) << 16);
         let reply = ipc::IpcMessage::builder(label)
-            .word(0, handover_kind::LINE)
+            .word(0, handover::KIND_LINE)
             .word(1, entry.badge)
             .word(2, entry.us)
             .word(3, byte_len as u64)
-            .bytes(4, &entry.bytes[..byte_len])
+            .bytes(handover::LINE_BYTES_WORD, &entry.bytes[..byte_len])
             .build();
         // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -646,7 +642,22 @@ fn handle_handover_pull(
     // and the receive loop terminates on that. Decoupling termination from
     // the multi-chunk drain keeps a dropped data chunk from wedging
     // init-logd (which would block procmgr's reap of init's memory caps).
-    let reply = ipc::IpcMessage::new(handover_reply::DONE);
+    let reply = ipc::IpcMessage::new(handover::REPLY_DONE);
+    // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Reply one `SLOT` handover chunk carrying `slot`'s badge and display name.
+fn reply_slot(slot: &SenderSlot, ipc_buf: *mut u64)
+{
+    let name_len = slot.name_used.min(MAX_NAME_LEN);
+    let label = handover::REPLY_MORE | ((name_len as u64 & 0xFFFF) << 16);
+    let reply = ipc::IpcMessage::builder(label)
+        .word(0, handover::KIND_SLOT)
+        .word(1, slot.badge)
+        .word(2, name_len as u64)
+        .bytes(handover::SLOT_NAME_WORD, &slot.name[..name_len])
+        .build();
     // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
@@ -665,19 +676,23 @@ fn handle_handover_pull(
 ///   `[init-logd] badge=<N> registered name='<stored-name>'` line so the
 ///   full `badge → name` history is reconstructable from log output
 ///   alone.
+///
+/// Returns the index of the slot whose stored name changed, or `None` for a
+/// no-op (empty request or unchanged name), so the caller can schedule the
+/// slot to be sent again to real-logd if the handover is in progress.
 fn register_sender_name(
     slots: &mut [SenderSlot; MAX_SENDERS],
     next_evict: &mut usize,
     msg: &ipc::IpcMessage,
     badge: u64,
     byte_len: usize,
-)
+) -> Option<usize>
 {
     let bytes = msg.data_bytes();
     let requested_len = byte_len.min(bytes.len()).min(MAX_NAME_LEN);
     if requested_len == 0
     {
-        return;
+        return None;
     }
     let requested = &bytes[..requested_len];
 
@@ -687,7 +702,7 @@ fn register_sender_name(
     if slots[slot_idx].name_used == requested_len
         && &slots[slot_idx].name[..slots[slot_idx].name_used] == requested
     {
-        return;
+        return None;
     }
 
     // Free this badge's current name before resolving collisions, so a
@@ -702,6 +717,7 @@ fn register_sender_name(
     slots[slot_idx].name_used = stored_len;
 
     emit_registration_event(badge, &stored[..stored_len]);
+    Some(slot_idx)
 }
 
 /// Try the bare `requested` name first; if any other active slot

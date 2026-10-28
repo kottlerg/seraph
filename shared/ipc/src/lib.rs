@@ -1242,14 +1242,10 @@ pub mod fs_labels
     /// Request: badge identifies the file (per-file cap), `data[0]` =
     /// byte offset (no alignment requirement), `data[1]` = client-chosen
     /// release cookie (must be non-zero). `caps[0]` = optional per-process
-    /// release-endpoint SEND, transferred only on the first
-    /// `FS_READ_MEMORY` for a given (client, file) pair; the driver
-    /// records it on the lazy `OpenFile` slot allocated at that point
-    /// so its eviction worker can route cooperative `FS_RELEASE_MEMORY`
-    /// back to the client. Subsequent `FS_READ_MEMORY`s for the same
-    /// pair carry no caps. Clients that opt out of cooperative release
-    /// omit the cap on every call; eviction then revokes without the
-    /// cooperative round-trip.
+    /// release-endpoint SEND for cooperative `FS_RELEASE_MEMORY`; which
+    /// request carries it, and which carried SEND the driver records, are
+    /// specified in services/fs/docs/fs-driver-protocol.md § Label 7
+    /// (the record is per node, not per client).
     /// Reply: `data[0]` = bytes valid in the returned page starting at
     /// the indicated page offset, `data[1]` = the same release cookie
     /// echoed back, `data[2]` = byte offset within the returned page
@@ -1265,9 +1261,9 @@ pub mod fs_labels
     /// Release of a previously-returned page, in either direction.
     ///
     /// Driver-to-client (cooperative eviction): sent on the release endpoint
-    /// cap recorded in the node's open-file slot, taken from `caps[0]` of
-    /// the [`FS_READ_MEMORY`] that allocated the slot (shared per node, not
-    /// per client; tracked in #447); `data[0]` = the release cookie naming
+    /// cap recorded in the node's open-file slot, the first one an
+    /// [`FS_READ_MEMORY`] reaching that slot carried (shared per node, not per
+    /// client; tracked in #530); `data[0]` = the release cookie naming
     /// the Memory cap to unmap. The client unmaps it and replies
     /// [`FS_RELEASE_ACK`], first letting a local copy from the page finish
     /// within the watchdog window; any other reply label is no ack (the std
@@ -2238,9 +2234,10 @@ pub mod fs_errors
     /// Mutation refused: the target name already exists in the parent
     /// directory (`FS_CREATE`, `FS_MKDIR`, `FS_RENAME` destination).
     pub const EXISTS: u64 = 9;
-    /// Mutation refused: the volume has no free cluster, or the parent
+    /// Mutation refused: the volume has no free cluster, the parent
     /// directory has no room for a new entry (FAT16 fixed root full;
-    /// FAT32 cluster-chain extension failed).
+    /// FAT32 cluster-chain extension failed), or a write would end past
+    /// the largest file size the filesystem records.
     pub const NO_SPACE: u64 = 10;
     /// `FS_REMOVE` refused: the target directory is non-empty.
     pub const NOT_EMPTY: u64 = 11;

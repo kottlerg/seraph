@@ -67,7 +67,8 @@ its block device endpoint and reply success or a typed error.
 **Reply (error)**: `label = ipc::fs_errors::*`:
 `LABEL_VERSION_MISMATCH` when `data[0]` differs from the driver's
 `FS_LABELS_VERSION` (checked before the BPB is read), else e.g.
-`IO_ERROR`, or `NOT_FOUND` for a malformed BPB.
+`IO_ERROR`, or `NOT_FOUND` for a malformed BPB or one whose sector size
+is not 512 bytes (the only size the FAT driver reads).
 
 The block device endpoint arrives in the driver's bootstrap round;
 see [Bootstrap caps](#bootstrap-caps).
@@ -79,7 +80,7 @@ see [Bootstrap caps](#bootstrap-caps).
 Inline read against a per-node badged cap. The kernel delivers the
 node's `(NodeId, NamespaceRights)` badge to the driver via
 `ipc_recv.badge`; the driver MUST verify the `READ` rights bit and
-reject with `NsError::PermissionDenied` otherwise.
+reject with `fs_errors::PERMISSION_DENIED` otherwise.
 
 Used for short reads (≤ 504 bytes that fit within the current page);
 larger or page-straddling reads use
@@ -104,8 +105,12 @@ request for more than 504 bytes with a short read of at most 504; see
 | `data[0]` | Bytes actually read |
 | `data[1..]` | File data, packed little-endian |
 
-**Reply (error)**: `label = NsError::*` (`NotFound`,
-`PermissionDenied`, `IsADirectory`, `IoError`).
+A read at or past end of file succeeds with `data[0] = 0`.
+
+**Reply (error)**: `label = ipc::fs_errors::*`: `PERMISSION_DENIED`
+(the badge lacks `READ`), `INVALID_BADGE` (the badge names no node, or
+a directory), `IO_ERROR` (the file's cluster chain is corrupt or a
+block read failed).
 
 ---
 
@@ -139,25 +144,29 @@ sentinel).
 | `label` | `7` |
 | `data[0]` | Byte offset (any) |
 | `data[1]` | Release cookie (non-zero, client-chosen) |
-| `caps[0]` | Per-process release-endpoint SEND, transferred only on the first `FS_READ_MEMORY` for a given (client, file) pair (see below) |
+| `caps[0]` | Optional per-process release-endpoint SEND (see below) |
 
-The first `FS_READ_MEMORY` for a given (client, file) pair MAY carry
-the client's per-process release-endpoint SEND in `caps[0]`.
-Subsequent `FS_READ_MEMORY`s for the same pair carry no caps; clients
-that opt out of cooperative release omit the cap on every call,
-and eviction then revokes the page without the cooperative round-trip.
+A client that takes part in cooperative release sends its per-process
+release-endpoint SEND in `caps[0]` of an `FS_READ_MEMORY` for the file,
+and MAY repeat it on later `FS_READ_MEMORY` requests until one carrying
+it gets a success reply. Clients that opt out of cooperative release
+omit the cap on every call, and eviction then revokes the page without
+the cooperative round-trip. The driver deletes every carried SEND it
+does not record, and every cap beyond `caps[0]`.
 
 The driver keeps this read-side bookkeeping (outstanding pages and the
 recorded release endpoint) in a lazily-allocated `OpenFile` slot keyed
 by node, not by (client, file) pair. Every client that opens a file
 resolves to the same node and so shares that one slot. The driver
-records `caps[0]` only from the `FS_READ_MEMORY` that allocates the
-slot, so the eviction worker routes cooperative
+records the first release SEND carried by an `FS_READ_MEMORY` that
+reaches the node's slot (one refused before the slot exists has its
+SEND deleted), so the eviction worker routes cooperative
 [`FS_RELEASE_MEMORY`](#label-8-fs_release_memory) for any client's
-page to that first client, and a later client is in effect opted out.
+page to that client, and a later client is in effect opted out.
 One client's [`FS_CLOSE`](#label-3-fs_close) revokes every client's
-outstanding pages on the file. This sharing is a defect, tracked in
-[#447](https://github.com/kottlerg/seraph/issues/447).
+outstanding pages on the file. This sharing is a defect: the driver
+cannot tell the clients of one node apart, tracked in
+[#530](https://github.com/kottlerg/seraph/issues/530).
 
 **Reply (success)**
 
@@ -169,8 +178,13 @@ outstanding pages on the file. This sharing is a defect, tracked in
 | `data[2]` | `memory_data_offset` |
 | `caps[0]` | Memory cap (`MAP` rights, single page; omitted on EOF) |
 
-**Reply (error)**: `label = NsError::*` or
-`fs_errors::BAD_MEMORY_OFFSET` (cookie zero).
+**Reply (error)**: `label = ipc::fs_errors::*`: `PERMISSION_DENIED`
+(the badge lacks `READ`), `INVALID_BADGE` (the badge names no node, or
+a directory), `BAD_MEMORY_OFFSET` (cookie zero), `TOO_MANY_OPEN` (the
+driver's open-file table, or the node's outstanding-page table, is
+full), `IO_ERROR` (the file's cluster chain is corrupt, a block read
+failed, or every cache page is held; the client MAY retry, since the
+driver queues a held page for eviction).
 
 ---
 
@@ -250,10 +264,10 @@ synchronous release after a read.
 ### Driver-to-client release
 
 Sent by the driver's eviction worker on the per-process release
-endpoint cap recorded in the node's `OpenFile` slot, taken from
-`caps[0]` of the [`FS_READ_MEMORY`](#label-7-fs_read_memory) that
-allocated the slot (per-node sharing, a defect tracked in
-[#447](https://github.com/kottlerg/seraph/issues/447)). Clients that
+endpoint cap recorded in the node's `OpenFile` slot, the first one an
+[`FS_READ_MEMORY`](#label-7-fs_read_memory) reaching that slot carried
+(per-node sharing, a defect tracked in
+[#530](https://github.com/kottlerg/seraph/issues/530)). Clients that
 delivered the SEND get the cooperative path: the driver waits up to
 100 ms for [`FS_RELEASE_ACK`](#label-9-fs_release_ack), then
 `cap_revoke`s the parent Memory cap and deletes it whether or not the
@@ -351,7 +365,7 @@ allocated per-`OpenFile` slot, outstanding `FS_READ_MEMORY` pages,
 the recorded release endpoint). The slot is per node and shared by
 every client of the file, so one client's `FS_CLOSE` revokes every
 client's outstanding pages on it (a defect, tracked in
-[#447](https://github.com/kottlerg/seraph/issues/447); see
+[#530](https://github.com/kottlerg/seraph/issues/530); see
 [`FS_READ_MEMORY`](#label-7-fs_read_memory)). The kernel-side cap is
 **not** freed here — the holder still `cap_delete`s its node cap to
 drop the kernel reference.
@@ -388,7 +402,9 @@ Inline write to a file. Badge = file cap; the badge must carry the
 short on `NO_SPACE`; callers iterate.
 
 **Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `IO_ERROR`,
-`PERMISSION_DENIED`, `NO_SPACE`.
+`PERMISSION_DENIED`, `NO_SPACE` (no free cluster, or the write would end
+past `u32::MAX` bytes, the largest FAT file size; the driver refuses
+the latter before allocating).
 
 ---
 
@@ -420,7 +436,8 @@ it, past its reply: once the reply arrives the caller may return the
 page to memmgr's pool, which another process can then be granted.
 
 **Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `IO_ERROR`,
-`PERMISSION_DENIED`, `NO_SPACE`, `BAD_MEMORY_OFFSET`.
+`PERMISSION_DENIED`, `NO_SPACE` (as for [`FS_WRITE`](#label-4-fs_write)),
+`BAD_MEMORY_OFFSET`.
 
 ---
 
@@ -440,10 +457,10 @@ badge must carry the `MUTATE_DIR` namespace right.
 `caps[0]` = node cap for the newly-created file. The new file starts
 empty (size 0, no allocated cluster).
 
-**Errors**: `INVALID_BADGE`, `EXISTS` (the dispatch may currently
-surface `NO_SPACE` for duplicate names — to be tightened),
-`NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`, `TOO_MANY_OPEN` (the
-driver's node table is full; the entry was created).
+**Errors**: `INVALID_BADGE`, `EXISTS` (the directory already holds an
+entry of that name), `NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`,
+`TOO_MANY_OPEN` (the driver's node table is full; the entry was
+created).
 
 ---
 
@@ -532,9 +549,8 @@ of a failed rename is tracked in
 [#447](https://github.com/kottlerg/seraph/issues/447).
 
 **Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination
-occupied; fatfs currently surfaces `NO_SPACE` for it, as for `FS_CREATE`,
-tracked in [#447](https://github.com/kottlerg/seraph/issues/447)),
-`NO_SPACE`, `IO_ERROR` (malformed name lengths, an invalid name),
+occupied), `NO_SPACE`, `IO_ERROR` (malformed name lengths, an invalid name, a
+failed block access, or a corrupt directory),
 `PERMISSION_DENIED`, `INVALID_BADGE` (the badge is not a directory node).
 
 ---
@@ -555,11 +571,14 @@ Set a file's length. Badge = file cap with `WRITE`.
 v1 supports only `new_len == 0`; non-zero replies `IO_ERROR`. The
 wire shape is forward-compatible with later extend-with-zero-fill
 semantics, tracked by the `ruststd::fs` completeness-gaps issue. The
-truncate-to-zero path frees the entire FAT cluster chain
-and patches the directory entry's first-cluster + size fields to 0.
+truncate-to-zero path patches the directory entry's first-cluster and
+size fields to 0, then frees the old FAT cluster chain. An `IO_ERROR`
+from freeing the chain arrives after the patch: the file is already
+empty and its old clusters are orphaned, as
+[`crash-safety.md`](../fat/docs/crash-safety.md) states.
 
 **Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `PERMISSION_DENIED`,
-`IO_ERROR` (chain walk / `FSInfo` flush failure, or non-zero
+`IO_ERROR` (directory-entry write or chain walk failure, or non-zero
 `new_len` until the v2 extend path lands).
 
 ---

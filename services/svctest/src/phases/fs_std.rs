@@ -464,7 +464,9 @@ type ReleaseReply = (u64, std::time::Duration);
 /// so its cookie is mid-read, the fake sends a release of that cookie on the
 /// release SEND `/a`'s first read delivered, and then sends it again. Two
 /// distinct nodes stand in for the driver's per-node SEND sharing, under
-/// which a release can arrive on another `File`'s badge.
+/// which a release can arrive on another `File`'s badge. The fake refuses
+/// `/a`'s first read, which a driver may do before it records the SEND, so
+/// `/a`'s second read must carry a release SEND again.
 pub fn std_release_matched_by_cookie_phase(_: &Caps)
 {
     use std::os::seraph::process::CommandExt;
@@ -491,7 +493,7 @@ pub fn std_release_matched_by_cookie_phase(_: &Caps)
     // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
     unsafe { ipc::ipc_call(stop, &ipc::IpcMessage::new(0), ipc_buf) }
         .expect("std_release_matched_by_cookie: stopping the fake fs failed");
-    let probe = server
+    let (probe, a_retry_send) = server
         .join()
         .expect("std_release_matched_by_cookie: fake fs thread panicked");
     let _ = syscall::cap_delete(stop);
@@ -502,6 +504,12 @@ pub fn std_release_matched_by_cookie_phase(_: &Caps)
         "std_release_matched_by_cookie: release-child exited {status}; 1 = /a's read \
          succeeded, 2 = an open failed, 3 = /b's stalled read did not return Interrupted, \
          4 = /b's position moved"
+    );
+    assert_eq!(
+        a_retry_send,
+        Some(true),
+        "/a's read after a refused first read must carry a release SEND again (None: the \
+         fake saw no second read of /a)"
     );
     let ((first, first_rtt), (repeat, repeat_rtt)) =
         probe.expect("std_release_matched_by_cookie: the fake fs saw no read of /b");
@@ -530,11 +538,12 @@ pub fn std_release_matched_by_cookie_phase(_: &Caps)
 }
 
 /// `release-child`: open `/a` and `/b` from the fake fs root its spawner
-/// delivered, then read a page of each. The fake refuses `/a`'s read and
-/// answers `/b`'s with a frame only after a release of its cookie has
-/// waited out the window, so `/b`'s copy is stalled and must be discarded:
+/// delivered, then read a page of `/a` twice and of `/b` once. The fake
+/// refuses both of `/a`'s reads and answers `/b`'s with a frame only after a
+/// release of its cookie has waited out the window, so `/b`'s copy is
+/// stalled and must be discarded:
 /// the read returns `Interrupted` and the position stays at 0. Exits before
-/// the `File`s drop. Exit codes: 0 as expected, 1 `/a`'s read succeeded,
+/// the `File`s drop. Exit codes: 0 as expected, 1 a read of `/a` succeeded,
 /// 2 an open failed, 3 `/b`'s read did not return `Interrupted`, 4 `/b`'s
 /// position moved.
 fn release_child_main() -> !
@@ -545,7 +554,7 @@ fn release_child_main() -> !
     let mut a = open("/a");
     let mut b = open("/b");
     let mut buf = vec![0u8; 4096];
-    if a.read(&mut buf).is_ok()
+    if a.read(&mut buf).is_ok() || a.read(&mut buf).is_ok()
     {
         std::process::exit(1);
     }
@@ -562,16 +571,19 @@ fn release_child_main() -> !
 
 /// Serve the fake fs on `ep` until the spawner's stop message: each
 /// `NS_LOOKUP` gets a file node SEND badged 1, 2, ... in order. Node 1's
-/// `FS_READ_MEMORY` hands over its release SEND and is refused with
-/// `IO_ERROR`. Node 2's is answered, after two releases of its cookie on
-/// node 1's release SEND, with a one-page frame (a read-only derivation of
-/// a page from memmgr). Anything else is refused. Returns the two
-/// releases' replies.
-fn fake_fs_serve(ep: u32) -> Option<(ReleaseReply, ReleaseReply)>
+/// first `FS_READ_MEMORY` hands over its release SEND and is refused with
+/// `IO_ERROR`, as is its second, whose release SEND, if any, is deleted.
+/// Node 2's is answered, after two releases of its cookie on node 1's
+/// release SEND, with a one-page frame (a read-only derivation of a page
+/// from memmgr). Anything else is refused. Returns the two releases'
+/// replies, and whether node 1's second read carried a release SEND (`None`
+/// when there was no second read).
+fn fake_fs_serve(ep: u32) -> (Option<(ReleaseReply, ReleaseReply)>, Option<bool>)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let mut next_badge = 1;
     let mut a_release = 0;
+    let mut a_retry_send = None;
     let mut frame_page = 0;
     let mut probe = None;
     loop
@@ -585,8 +597,10 @@ fn fake_fs_serve(ep: u32) -> Option<(ReleaseReply, ReleaseReply)>
         }
         else if opcode == ipc::ns_labels::NS_LOOKUP
         {
-            // GRANT: the client's first FS_READ_MEMORY on a node transfers
-            // its release SEND in caps[0].
+            // GRANT: the client's FS_READ_MEMORY on a node carries a copy of
+            // its release SEND in caps[0] until a request carrying one
+            // succeeds; the fake keeps node 1's first copy and deletes the
+            // others.
             let node = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND_GRANT, next_badge)
                 .expect("fake fs: node SEND derive failed");
             next_badge += 1;
@@ -601,9 +615,18 @@ fn fake_fs_serve(ep: u32) -> Option<(ReleaseReply, ReleaseReply)>
             let release = msg.caps().first().copied().unwrap_or(0);
             match msg.badge
             {
-                1 =>
+                1 if a_release == 0 =>
                 {
                     a_release = release;
+                    ipc::IpcMessage::new(ipc::fs_errors::IO_ERROR)
+                }
+                1 =>
+                {
+                    if a_retry_send.is_none()
+                    {
+                        a_retry_send = Some(release != 0);
+                    }
+                    let _ = syscall::cap_delete(release);
                     ipc::IpcMessage::new(ipc::fs_errors::IO_ERROR)
                 }
                 2 =>
@@ -634,7 +657,7 @@ fn fake_fs_serve(ep: u32) -> Option<(ReleaseReply, ReleaseReply)>
         {
             let _ = syscall::cap_delete(a_release);
             let _ = syscall::cap_delete(frame_page);
-            return probe;
+            return (probe, a_retry_send);
         }
     }
 }

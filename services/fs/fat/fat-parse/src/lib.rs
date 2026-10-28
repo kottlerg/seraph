@@ -7,8 +7,10 @@
 //!
 //! Decodes the BIOS Parameter Block geometry and FAT directory entries
 //! (8.3 short names, long-file-name runs, case-insensitive matching) from raw
-//! sector bytes, and locates every slot an entry occupies for its removal
-//! ([`RemoveRunScan`]). This crate performs no I/O and holds no filesystem
+//! sector bytes, locates every slot an entry occupies for its removal
+//! ([`RemoveRunScan`]), finds a run of free slots for a new entry
+//! ([`FreeRunScan`]), and bounds cluster numbers to the data region
+//! ([`is_data_cluster`]). This crate performs no I/O and holds no filesystem
 //! state: the `fatfs` service reads sectors over a block-device IPC, hands the
 //! bytes here, and keeps the geometry/cache/mutation engine on its side.
 //! Keeping the parse of untrusted on-disk structures pure and host-testable is
@@ -38,6 +40,19 @@ pub enum BpbError
     /// `bytes_per_sector` or `sectors_per_cluster` is zero; either would
     /// divide-by-zero in the geometry computation.
     ZeroDivisor,
+    /// `bytes_per_sector` is not [`SECTOR_SIZE`]. The `fatfs` page cache,
+    /// FAT walker, and directory code all address 512-byte sectors, so a
+    /// volume with larger sectors (4Kn media) is refused rather than read
+    /// with mismatched offsets.
+    UnsupportedSectorSize,
+    /// The geometry is inconsistent: the volume has no FAT copy or no
+    /// reserved sector (the FAT would overlay the boot sector), the data
+    /// region's start overflows a 32-bit sector number, the volume has
+    /// more clusters than its FAT has entries for (or than FAT32's largest
+    /// cluster number allows), so a cluster in the data region would have
+    /// no FAT entry, or one past the FAT, or a FAT32 root cluster lies
+    /// outside the data region.
+    BadGeometry,
 }
 
 /// Geometry decoded from a FAT BPB (sector 0).
@@ -45,9 +60,9 @@ pub enum BpbError
 /// Mirrors the fields the `fatfs` service copies into its `FatState`. The
 /// service owns the cached-FAT-sector and advisory-hint state; this struct
 /// carries only what the pure decode produces. `fsinfo_sector` is `Some` only
-/// for a FAT32 volume whose `FSInfo` field names a real sector (not the
-/// `0`/`0xFFFF` "absent" markers), so the caller assigns it conditionally and
-/// otherwise keeps its `u32::MAX` sentinel.
+/// for a FAT32 volume whose `FSInfo` field names a sector inside the reserved
+/// region (not the `0`/`0xFFFF` "absent" markers), so the caller assigns it
+/// conditionally and otherwise keeps its `u32::MAX` sentinel.
 pub struct BpbGeometry
 {
     pub bytes_per_sector: u16,
@@ -65,14 +80,20 @@ pub struct BpbGeometry
 
 /// Decode and validate the BIOS Parameter Block from sector 0.
 ///
-/// Validates the boot signature and the two divisor fields, then computes the
-/// data-region start, total cluster count, FAT variant (per the Microsoft
-/// FAT32 specification's `< 65525` rule), and — for FAT32 — the `FSInfo` sector.
+/// Validates the boot signature, the sector size, and the geometry (every
+/// check is listed under `# Errors`), computing on the way the data-region
+/// start, total cluster count, FAT variant (per the Microsoft FAT32
+/// specification's `< 65525` rule), and — for FAT32 — the `FSInfo` sector,
+/// which is `None` unless it names a sector inside the reserved region.
 ///
 /// # Errors
 /// Returns [`BpbError::BadSignature`] when bytes 510/511 are not `0x55 0xAA`,
-/// or [`BpbError::ZeroDivisor`] when `bytes_per_sector` or
-/// `sectors_per_cluster` is zero.
+/// [`BpbError::ZeroDivisor`] when `bytes_per_sector` or
+/// `sectors_per_cluster` is zero, [`BpbError::UnsupportedSectorSize`]
+/// when `bytes_per_sector` is non-zero but not [`SECTOR_SIZE`], or
+/// [`BpbError::BadGeometry`] when `num_fats` or `reserved_sectors` is zero,
+/// the data region's start overflows, the FAT cannot hold an entry for
+/// every cluster, or a FAT32 root cluster lies outside the data region.
 pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry, BpbError>
 {
     // Validate boot signature.
@@ -91,6 +112,16 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
     if bytes_per_sector == 0 || sectors_per_cluster == 0
     {
         return Err(BpbError::ZeroDivisor);
+    }
+    if usize::from(bytes_per_sector) != SECTOR_SIZE
+    {
+        return Err(BpbError::UnsupportedSectorSize);
+    }
+    // The FAT starts after the reserved sectors, the boot sector among
+    // them, and every FAT write goes to each of the num_fats copies.
+    if num_fats == 0 || reserved_sectors == 0
+    {
+        return Err(BpbError::BadGeometry);
     }
 
     let total_sectors_16 = u16::from_le_bytes([sector_data[19], sector_data[20]]);
@@ -137,8 +168,11 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
     // Root directory sectors (FAT16 only).
     let root_dir_sectors = (u32::from(root_entry_count) * 32).div_ceil(u32::from(bytes_per_sector));
 
-    let data_start_sector =
-        u32::from(reserved_sectors) + u32::from(num_fats) * fat_size + root_dir_sectors;
+    let data_start_sector = u32::from(num_fats)
+        .checked_mul(fat_size)
+        .and_then(|fats| fats.checked_add(u32::from(reserved_sectors)))
+        .and_then(|start| start.checked_add(root_dir_sectors))
+        .ok_or(BpbError::BadGeometry)?;
 
     let data_sectors = total_sectors.saturating_sub(data_start_sector);
     let total_clusters = data_sectors / u32::from(sectors_per_cluster);
@@ -153,9 +187,12 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
         // FAT32 extended BPB: FSInfo sector LBA at offset 48 (2 bytes). A value
         // of 0 or 0xFFFF means "no FSInfo sector"; the caller holds the
         // u32::MAX sentinel in those cases so the allocator skips the load and
-        // falls back to a full FAT scan.
+        // falls back to a full FAT scan. The FSInfo sector lives in the
+        // reserved region; one named past it lies in a FAT copy or the data
+        // region, where writing the hints back would corrupt the volume, so
+        // it is treated as absent too.
         let fsinfo = u16::from_le_bytes([sector_data[48], sector_data[49]]);
-        let fsinfo_sector = if fsinfo != 0 && fsinfo != 0xFFFF
+        let fsinfo_sector = if fsinfo != 0 && fsinfo != 0xFFFF && fsinfo < reserved_sectors
         {
             Some(u32::from(fsinfo))
         }
@@ -165,6 +202,14 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
         };
         (FatType::Fat32, fsinfo_sector)
     };
+
+    check_fat_capacity(fat_type, fat_size, bytes_per_sector, total_clusters)?;
+    // The FAT32 root directory is an ordinary cluster chain, so its first
+    // cluster must lie in the data region like any other.
+    if matches!(fat_type, FatType::Fat32) && !is_data_cluster(root_cluster, total_clusters)
+    {
+        return Err(BpbError::BadGeometry);
+    }
 
     Ok(BpbGeometry {
         bytes_per_sector,
@@ -181,13 +226,44 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
     })
 }
 
+/// Refuse a cluster count the FAT cannot describe.
+///
+/// Every data cluster `2..2 + total_clusters` needs a FAT entry inside one
+/// FAT copy of `fat_size` sectors, and a FAT32 cluster number stops below
+/// the `0x0FFF_FFF7` bad-cluster marker. Past either bound a cluster number
+/// the driver accepts as in the data region would address a FAT entry past
+/// the FAT, or overflow the entry-offset arithmetic.
+fn check_fat_capacity(
+    fat_type: FatType,
+    fat_size: u32,
+    bytes_per_sector: u16,
+    total_clusters: u32,
+) -> Result<(), BpbError>
+{
+    let (entry_bytes, max_clusters) = match fat_type
+    {
+        FatType::Fat16 => (2u64, 0xFFF5u64),
+        FatType::Fat32 => (4u64, 0x0FFF_FFF5u64),
+    };
+    let fat_entries = u64::from(fat_size) * u64::from(bytes_per_sector) / entry_bytes;
+    let clusters = u64::from(total_clusters);
+    if clusters + 2 > fat_entries || clusters > max_clusters
+    {
+        return Err(BpbError::BadGeometry);
+    }
+    Ok(())
+}
+
 /// First sector of `cluster` within the data region.
 ///
 /// Clusters 0 and 1 are reserved by the FAT spec (0 = free-marker,
 /// 1 = reserved); valid data-region clusters start at 2. A reserved cluster
-/// clamps to `data_start_sector` rather than underflowing `cluster - 2`. The
-/// I/O caller is expected to filter reserved clusters and log the hit; this
-/// function only avoids the underflow.
+/// clamps to `data_start_sector` rather than underflowing `cluster - 2`, and
+/// a cluster too large for the arithmetic saturates to `u32::MAX`, past
+/// every partition bound, so the block driver refuses the access instead of
+/// a wrapped LBA reaching another part of the volume. The I/O caller is
+/// expected to filter clusters outside the data region ([`is_data_cluster`])
+/// and log the hit; this function only avoids the overflow.
 #[must_use]
 pub fn cluster_to_sector(data_start_sector: u32, sectors_per_cluster: u8, cluster: u32) -> u32
 {
@@ -195,7 +271,18 @@ pub fn cluster_to_sector(data_start_sector: u32, sectors_per_cluster: u8, cluste
     {
         return data_start_sector;
     }
-    data_start_sector + (cluster - 2) * u32::from(sectors_per_cluster)
+    data_start_sector.saturating_add((cluster - 2).saturating_mul(u32::from(sectors_per_cluster)))
+}
+
+/// Whether `cluster` names a cluster of the data region of a volume with
+/// `total_clusters` data clusters: `2 <= cluster < 2 + total_clusters`.
+///
+/// A cluster number read from the FAT or a directory entry is untrusted
+/// on-disk input; one outside this range is a corrupt chain or entry.
+#[must_use]
+pub fn is_data_cluster(cluster: u32, total_clusters: u32) -> bool
+{
+    cluster >= 2 && cluster - 2 < total_clusters
 }
 
 // ── Directory entry ─────────────────────────────────────────────────────────
@@ -305,6 +392,7 @@ pub struct LfnAccum
 
 impl LfnAccum
 {
+    /// An empty accumulator holding no run.
     #[must_use]
     pub const fn new() -> Self
     {
@@ -318,6 +406,7 @@ impl LfnAccum
         }
     }
 
+    /// Discard any in-flight run, returning the accumulator to its empty state.
     pub fn reset(&mut self)
     {
         self.len = 0;
@@ -639,6 +728,7 @@ pub fn name_matches(entry_name: &[u8; 11], component: &[u8]) -> bool
     *entry_name == padded
 }
 
+/// ASCII uppercase fold of one byte; non-ASCII-lowercase bytes pass through unchanged.
 #[must_use]
 pub fn to_upper(b: u8) -> u8
 {
@@ -837,6 +927,83 @@ impl<L: Copy + Default> Default for RemoveRunScan<L>
     }
 }
 
+// ── Insertion slot run ──────────────────────────────────────────────────────
+
+/// Slot-by-slot directory scan that finds a run of consecutive free slots
+/// for a new entry (its LFN slots plus its 8.3 slot).
+///
+/// A deleted slot (`0xE5`) is free; an end-of-directory slot (`0x00`) is free
+/// and, per the Microsoft FAT specification, so is every slot after it,
+/// whatever its bytes. A run therefore continues through the slots past the
+/// end-of-directory marker instead of stopping there, so the whole new entry
+/// lands before any reader's end of scan. Any other slot is in use and
+/// restarts the run. `L` is the caller's slot position; scan state carries
+/// across sector and cluster boundaries.
+pub struct FreeRunScan<L>
+{
+    slots: [L; MAX_SLOT_RUN],
+    len: usize,
+    count: usize,
+    past_end: bool,
+}
+
+impl<L: Copy + Default> FreeRunScan<L>
+{
+    /// A scan for a run of `count` free slots, clamped to `1..=MAX_SLOT_RUN`.
+    #[must_use]
+    pub fn new(count: usize) -> Self
+    {
+        Self {
+            slots: [L::default(); MAX_SLOT_RUN],
+            len: 0,
+            count: count.clamp(1, MAX_SLOT_RUN),
+            past_end: false,
+        }
+    }
+
+    /// Whether the scan has passed the directory's end-of-directory marker,
+    /// after which every slot is free and need not be read.
+    #[must_use]
+    pub fn past_end(&self) -> bool
+    {
+        self.past_end
+    }
+
+    /// The run found: `count` slot positions in on-disk order. Meaningful
+    /// only after [`Self::step`] returns `true`.
+    #[must_use]
+    pub fn run(&self) -> &[L]
+    {
+        &self.slots[..self.len]
+    }
+
+    /// Feed the slot at `loc` whose first byte is `first`; once the scan is
+    /// [past the end](Self::past_end) the byte is ignored. Returns `true`
+    /// when the run holds `count` slots; a step after that changes nothing
+    /// and returns `true` again.
+    pub fn step(&mut self, first: u8, loc: L) -> bool
+    {
+        if self.len >= self.count
+        {
+            return true;
+        }
+        if first == 0x00
+        {
+            self.past_end = true;
+        }
+        if self.past_end || first == 0xE5
+        {
+            self.slots[self.len] = loc;
+            self.len += 1;
+        }
+        else
+        {
+            self.len = 0;
+        }
+        self.len >= self.count
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -883,10 +1050,11 @@ mod tests
     }
 
     /// A FAT32 volume: large enough that total_clusters >= 65525.
-    /// data_start = 32 + 2*1000 = 2032; clusters = (300000-2032)/1 = 297968.
+    /// data_start = 32 + 2*2400 = 4832; clusters = (300000-4832)/1 = 295168,
+    /// within the 2400 * 128 = 307200 entries one FAT holds.
     fn fat32_sector(fsinfo: u16) -> [u8; SECTOR_SIZE]
     {
-        bpb_sector(512, 1, 32, 2, 0, 0, 0, 300_000, 1000, 2, fsinfo)
+        bpb_sector(512, 1, 32, 2, 0, 0, 0, 300_000, 2400, 2, fsinfo)
     }
 
     #[test]
@@ -936,9 +1104,9 @@ mod tests
             .ok()
             .expect("valid FAT32");
         assert!(matches!(g.fat_type, FatType::Fat32));
-        assert_eq!(g.total_clusters, 297_968);
+        assert_eq!(g.total_clusters, 295_168);
         // fat_size_16 == 0 falls back to fat_size_32.
-        assert_eq!(g.fat_size, 1000);
+        assert_eq!(g.fat_size, 2400);
         assert_eq!(g.root_cluster, 2);
         assert_eq!(g.fsinfo_sector, Some(1));
     }
@@ -964,6 +1132,128 @@ mod tests
         assert_eq!(cluster_to_sector(100, 8, 2), 100);
         // Cluster 3 is one cluster (8 sectors) further in.
         assert_eq!(cluster_to_sector(100, 8, 3), 108);
+    }
+
+    #[test]
+    fn parse_bpb_geometry_rejects_sectors_other_than_512_bytes()
+    {
+        // A 4Kn volume: the cache and FAT walker index 512-byte sectors.
+        let large = bpb_sector(4096, 1, 1, 2, 512, 8192, 20, 0, 0, 0, 0);
+        assert!(matches!(
+            parse_bpb_geometry(&large),
+            Err(BpbError::UnsupportedSectorSize)
+        ));
+    }
+
+    #[test]
+    fn parse_bpb_geometry_accepts_exactly_the_clusters_a_fat32_table_holds()
+    {
+        // A 600-sector FAT32 table holds 76800 entries: clusters 2..76800.
+        // data_start = 32 + 2*600 = 1232, one sector per cluster.
+        let full = bpb_sector(512, 1, 32, 2, 0, 0, 0, 1232 + 76_798, 600, 2, 0);
+        let g = parse_bpb_geometry(&full)
+            .ok()
+            .expect("FAT holds every cluster");
+        assert_eq!(g.total_clusters, 76_798);
+        let over = bpb_sector(512, 1, 32, 2, 0, 0, 0, 1232 + 76_799, 600, 2, 0);
+        assert!(matches!(
+            parse_bpb_geometry(&over),
+            Err(BpbError::BadGeometry)
+        ));
+    }
+
+    #[test]
+    fn parse_bpb_geometry_accepts_exactly_the_clusters_a_fat16_table_holds()
+    {
+        // A 20-sector FAT16 table holds 5120 entries: clusters 2..5120.
+        // data_start = 1 + 2*20 + 32 (512 root entries) = 73.
+        let full = bpb_sector(512, 1, 1, 2, 512, 73 + 5118, 20, 0, 0, 0, 0);
+        let g = parse_bpb_geometry(&full)
+            .ok()
+            .expect("FAT holds every cluster");
+        assert!(matches!(g.fat_type, FatType::Fat16));
+        assert_eq!(g.total_clusters, 5118);
+        let over = bpb_sector(512, 1, 1, 2, 512, 73 + 5119, 20, 0, 0, 0, 0);
+        assert!(matches!(
+            parse_bpb_geometry(&over),
+            Err(BpbError::BadGeometry)
+        ));
+    }
+
+    #[test]
+    fn parse_bpb_geometry_bounds_fat32_clusters_below_the_bad_cluster_marker()
+    {
+        // A FAT large enough for any count; data_start = 32 + 2*2097152.
+        let fat = 2_097_152;
+        let start = 32 + 2 * fat;
+        let last = bpb_sector(512, 1, 32, 2, 0, 0, 0, start + 0x0FFF_FFF5, fat, 2, 0);
+        assert!(parse_bpb_geometry(&last).is_ok());
+        let marker = bpb_sector(512, 1, 32, 2, 0, 0, 0, start + 0x0FFF_FFF6, fat, 2, 0);
+        assert!(matches!(
+            parse_bpb_geometry(&marker),
+            Err(BpbError::BadGeometry)
+        ));
+    }
+
+    #[test]
+    fn parse_bpb_geometry_rejects_a_fat32_root_outside_the_data_region()
+    {
+        let root_one = bpb_sector(512, 1, 32, 2, 0, 0, 0, 300_000, 2400, 1, 1);
+        assert!(matches!(
+            parse_bpb_geometry(&root_one),
+            Err(BpbError::BadGeometry)
+        ));
+    }
+
+    #[test]
+    fn parse_bpb_geometry_treats_an_fsinfo_sector_past_the_reserved_region_as_absent()
+    {
+        // 32 reserved sectors: sector 32 is the first FAT sector.
+        let g = parse_bpb_geometry(&fat32_sector(32))
+            .ok()
+            .expect("valid FAT32");
+        assert_eq!(g.fsinfo_sector, None);
+    }
+
+    #[test]
+    fn parse_bpb_geometry_rejects_zero_fats_or_reserved_sectors()
+    {
+        let no_fats = bpb_sector(512, 4, 1, 0, 512, 8192, 20, 0, 0, 0, 0);
+        assert!(matches!(
+            parse_bpb_geometry(&no_fats),
+            Err(BpbError::BadGeometry)
+        ));
+        let no_reserved = bpb_sector(512, 4, 0, 2, 512, 8192, 20, 0, 0, 0, 0);
+        assert!(matches!(
+            parse_bpb_geometry(&no_reserved),
+            Err(BpbError::BadGeometry)
+        ));
+    }
+
+    #[test]
+    fn parse_bpb_geometry_rejects_an_overflowing_data_start()
+    {
+        let huge_fat = bpb_sector(512, 1, 32, 2, 0, 0, 0, u32::MAX, u32::MAX, 2, 0);
+        assert!(matches!(
+            parse_bpb_geometry(&huge_fat),
+            Err(BpbError::BadGeometry)
+        ));
+    }
+
+    #[test]
+    fn cluster_to_sector_saturates_instead_of_overflowing()
+    {
+        // A corrupt 0x0FFF_FFF0 entry times 64 sectors per cluster overflows u32.
+        assert_eq!(cluster_to_sector(100, 64, 0x0FFF_FFF0), u32::MAX);
+    }
+
+    #[test]
+    fn is_data_cluster_bounds_the_data_region()
+    {
+        assert!(!is_data_cluster(1, 10));
+        assert!(is_data_cluster(2, 10));
+        assert!(is_data_cluster(11, 10));
+        assert!(!is_data_cluster(12, 10));
     }
 
     #[test]
@@ -1249,6 +1539,46 @@ mod tests
         slots.insert(0, orphan);
         let run = found_run(&slots, b"AAAAAA~1");
         assert_eq!(run, (1..=MAX_SLOT_RUN).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn free_run_continues_past_the_end_of_directory_marker()
+    {
+        // Two used entries, the 0x00 marker at slot 2, then stale bytes the
+        // specification declares free: a 3-slot run starts at the marker.
+        let mut scan = FreeRunScan::<usize>::new(3);
+        assert!(!scan.step(b'A', 0));
+        assert!(!scan.step(b'B', 1));
+        assert!(!scan.step(0x00, 2));
+        assert!(scan.past_end());
+        assert!(!scan.step(b'Z', 3));
+        assert!(scan.step(b'Q', 4));
+        assert_eq!(scan.run(), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn free_run_step_after_a_complete_run_keeps_the_run()
+    {
+        // A step past a full-length run must not index past the slot array.
+        let mut scan = FreeRunScan::<usize>::new(MAX_SLOT_RUN);
+        for i in 0..MAX_SLOT_RUN
+        {
+            scan.step(0xE5, i);
+        }
+        assert!(scan.step(0xE5, MAX_SLOT_RUN));
+        assert_eq!(scan.run().len(), MAX_SLOT_RUN);
+        assert_eq!(scan.run().last(), Some(&(MAX_SLOT_RUN - 1)));
+    }
+
+    #[test]
+    fn free_run_restarts_on_a_used_slot()
+    {
+        let mut scan = FreeRunScan::<usize>::new(2);
+        assert!(!scan.step(0xE5, 0));
+        assert!(!scan.step(b'A', 1));
+        assert!(!scan.step(0xE5, 2));
+        assert!(scan.step(0xE5, 3));
+        assert_eq!(scan.run(), &[2, 3]);
     }
 
     #[test]

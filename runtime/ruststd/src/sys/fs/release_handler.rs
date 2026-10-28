@@ -7,10 +7,11 @@
 //!
 //! The fs driver evicts cached pages by sending `FS_RELEASE_MEMORY` on
 //! a badged SEND derived from the per-process release endpoint owned
-//! by this module. The SEND is transferred to the driver in `caps[0]`
-//! of the first [`fs_labels::FS_READ_MEMORY`] request for each opened
-//! file (see [`super::File::read_frame`]); from that point on the
-//! driver's eviction worker can route cooperative releases here. The
+//! by this module. Copies of each opened file's SEND travel to the driver
+//! in `caps[0]` of its [`fs_labels::FS_READ_MEMORY`] requests until one
+//! is confirmed delivered (see [`super::File::read_frame`]); from the
+//! request that allocates the node's driver slot on, the driver's
+//! eviction worker can route cooperative releases here. The
 //! handler finds the cookie among every registered `File`, not only the one
 //! whose badge the release carries: the driver records one release SEND per
 //! node, so a release for one `File`'s page can arrive on another `File`'s

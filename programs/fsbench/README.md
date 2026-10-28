@@ -54,8 +54,9 @@ untimed warm-up iterations, then 256 timed ones. Each iteration seeks to offset 
 full size through as many `read` calls as the path's buffer needs: 144 inline or 16 memory-cap
 calls for 64 KiB. A memory-cap `read` that returns `Interrupted` (std discarded a copy whose page
 the driver may have released during it) is read again inside the same timed iteration, so such an
-iteration makes more than 16 calls and its cycles include them. Cycles come from `rdtsc` on x86_64
-and `csrr cycle` on riscv64. A timed iteration that reads fewer bytes than the size panics.
+iteration makes one more `read` call than the size needs for each retry, and its cycles include
+them. Cycles come from `rdtsc` on x86_64 and `csrr cycle` on riscv64. A timed iteration that
+reads fewer bytes than the size panics.
 
 ---
 

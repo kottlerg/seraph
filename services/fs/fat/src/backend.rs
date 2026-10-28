@@ -38,9 +38,10 @@ pub const MAX_NODES: usize = 128;
 /// Per-NodeId metadata captured at lookup time.
 ///
 /// `cluster` is the FAT start-cluster for files, or the directory
-/// cluster for directories (for FAT16 fixed-root, `cluster == 0`
-/// means the FAT16 fixed root; for files an empty FAT16 file also
-/// reports `cluster == 0`, but `kind` distinguishes).
+/// cluster for directories. The root is never a `FatNode` (it is
+/// `NodeId(0)`), so a directory node's cluster lies in the data region,
+/// and one outside it, from a corrupt entry, is refused when the node is
+/// used as a directory. Only an empty file reports `cluster == 0`.
 ///
 /// `open_slot` tracks a lazily-allocated [`crate::file::OpenFile`]
 /// when this node has fielded a `FS_READ_MEMORY` against its node cap.
@@ -244,18 +245,33 @@ impl<'a> FatfsBackend<'a>
         }
     }
 
-    fn cluster_for(&self, dir: NodeId) -> Option<u32>
+    /// The cluster of directory `dir`: the root sentinel for `NodeId(0)`,
+    /// else a directory node's cluster.
+    ///
+    /// # Errors
+    /// [`NsError::NotFound`] when `dir` is absent from the table (its entry
+    /// was removed or renamed); [`NsError::NotADirectory`] when it names a
+    /// file; [`NsError::IoError`] when it names a directory whose
+    /// cluster lies outside the data region. That cluster comes from a
+    /// corrupt directory entry: cluster 0 would name the FAT16 fixed root,
+    /// so serving it would turn a cap on the subdirectory into one on the
+    /// root.
+    fn cluster_for(&self, dir: NodeId) -> Result<u32, NsError>
     {
         if dir.raw() == 0
         {
-            return Some(self.root_cluster_sentinel());
+            return Ok(self.root_cluster_sentinel());
         }
-        let node = self.nodes.get(dir)?;
+        let node = self.nodes.get(dir).ok_or(NsError::NotFound)?;
         if node.kind != NodeKind::Dir
         {
-            return None;
+            return Err(NsError::NotADirectory);
         }
-        Some(node.cluster)
+        if !self.state.is_data_cluster(node.cluster)
+        {
+            return Err(NsError::IoError);
+        }
+        Ok(node.cluster)
     }
 
     fn entry_kind(entry: &DirEntry) -> NodeKind
@@ -275,23 +291,14 @@ impl NamespaceBackend for FatfsBackend<'_>
 {
     fn lookup(&mut self, dir: NodeId, name: &[u8]) -> Result<EntryView, NsError>
     {
-        let dir_cluster = self.cluster_for(dir).ok_or(NsError::NotADirectory)?;
+        let dir_cluster = self.cluster_for(dir)?;
 
         // Resolves a single component against `dir_cluster` and also
         // surfaces the on-disk `DirEntryLocation` so the write-side
         // dispatch can patch metadata in place without re-scanning the
         // parent directory.
-        let dir_cluster_resolved = if dir_cluster == 0
-            && matches!(self.state.fat_type, FatType::Fat32)
-        {
-            self.state.root_cluster
-        }
-        else
-        {
-            dir_cluster
-        };
         let (entry, loc) = find_in_directory_with_location(
-            dir_cluster_resolved,
+            dir_cluster,
             name,
             self.state,
             self.cache,
@@ -340,7 +347,7 @@ impl NamespaceBackend for FatfsBackend<'_>
 
     fn readdir_entry(&mut self, dir: NodeId, idx: u32) -> Result<Option<EntryName>, NsError>
     {
-        let dir_cluster = self.cluster_for(dir).ok_or(NsError::NotADirectory)?;
+        let dir_cluster = self.cluster_for(dir)?;
         let Some(entry) = read_dir_entry_at_index(
             dir_cluster,
             u64::from(idx),

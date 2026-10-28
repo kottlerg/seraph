@@ -234,8 +234,9 @@ unsafe fn stage_move(
 /// Must be called from syscall context with interrupts disabled and no lock
 /// held (`DERIVATION_LOCK`, a `CSpace` lock, an IPC source lock, a per-TCB
 /// `sched_lock`, a per-CPU scheduler lock, or the sleep-list lock): it takes
-/// `DERIVATION_LOCK` per batch and drops the freed source's reference through
-/// [`release_moved_object`], whose contract excludes those locks.
+/// `DERIVATION_LOCK` per batch and the source `CSpace` lock for the final
+/// free, and drops the freed source's reference through
+/// [`release_moved_object`], whose contract excludes the rest.
 pub fn move_cap_drive(mv: CapMove) -> MoveStep
 {
     use super::derivation::{DERIVATION_LOCK, MAX_REPARENT_BATCHES};

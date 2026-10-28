@@ -41,8 +41,7 @@ discipline below has been applied end-to-end.
     each claimed fix for your files against the code, and report: every
     claimed fix not actually made; every finding in the changed hunks; any
     correctness, soundness, safety, or contract defect anywhere in the
-    file. Per
-    `docs/conventions.md` § Branch and PR Workflow, a standards,
+    file. Per `docs/conventions.md` § Branch and PR Workflow, a standards,
     doc-drift, coverage, or style finding the delta did not introduce is out
     of bound; a statement the delta made stale, or a test the delta's new
     code lacks, is one the delta introduced wherever it anchors.
@@ -201,14 +200,15 @@ safety, or contract finding, or MUST violation anchored in a file that is
 not a Markdown document, forces `BLOCKING ISSUES` (the blocking track of
 `docs/conventions.md` § Branch and PR Workflow); out-of-bound findings are
 listed, each naming the Issue that records it per `docs/conventions.md`
-§ Branch and PR Workflow (the open Issue that already names the work, else
-the open follow-up Issue of its scope that already holds it, else the
-follow-up Issue of its scope), and do not affect the line. A follow-up Issue
-takes nothing off the surface: a finding one already holds is reported where
-the surface puts it. A finding a ledger entry already states at a hunk
-unchanged since the run the entry names, when that run resolves in the
-clone, is listed under a `Ledger (not re-raised)` heading and does not
-affect the line either.
+§ Branch and PR Workflow (the open follow-up Issue of its scope that
+already holds it, else the open Issue that already names the work, else the
+follow-up Issue the PR drains in that scope, the lowest-numbered when it
+drains several, else the follow-up Issue of its scope), and do not affect
+the line. A follow-up Issue takes nothing off the surface: a finding one
+already holds is reported where the surface puts it. A finding a ledger
+entry already states at a hunk unchanged since the run the entry names, when
+that run resolves in the clone, is listed under a `Ledger (not re-raised)`
+heading and does not affect the line either.
 
 ## Tool discipline
 

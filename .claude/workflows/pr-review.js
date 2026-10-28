@@ -16,14 +16,16 @@
 // only those on its blocking track (class correctness, safety, or contract, or
 // a MUST violation anchored outside Markdown) make it `BLOCKING ISSUES`.
 // Findings off the surface are recorded for the open Issue that already names
-// the work, else for the follow-up Issue of their scope; those that share a
-// file, class, bucket, MUST flag, Issue, and authority are one root cause and
-// are verified once as a group. A follow-up Issue names findings, not work, so
-// naming one takes nothing off the surface. A run that names the ledger of the
-// earlier runs' recorded, dropped, and contested findings (required in a delta
-// run) lists, and does not count, a finding a reviewer flags as already in it
-// at a hunk unchanged since the run the entry names, when that run resolves in
-// the clone.
+// the work, else for the follow-up Issue the PR drains in their scope (the
+// lowest-numbered when it drains several), else for the follow-up Issue of
+// their scope, unless an open follow-up Issue of that scope already holds
+// them; those that share a file, class, bucket, MUST flag, Issue, and
+// authority are one root cause and are verified once as a group. A follow-up
+// Issue names findings, not work, so naming one takes nothing off the surface.
+// A run that names the ledger of the earlier runs' recorded, dropped, and
+// contested findings (required in a delta run) lists, and does not count, a
+// finding a reviewer flags as already in it at a hunk unchanged since the run
+// the entry names, when that run resolves in the clone.
 // `.claude/CLAUDE.md` § PR workflow operations says when the assistant runs
 // this workflow, how it builds the ledger, and what it does with the result.
 //
@@ -460,8 +462,7 @@ const SCOPE_PROMPT = [
     '- design_docs: ' +
         (DELTA
             ? 'the documents that state facts the delta changed: every Markdown document the ' +
-                'delta edits, and every tracked Markdown ' +
-                'document (`git ls-files \'*.md\'`) ' +
+                'delta edits, and every tracked Markdown document (`git ls-files \'*.md\'`) ' +
                 'whose text names a changed item, a constant, state, error, or section the ' +
                 'delta renamed or redefined, or a behaviour the delta changed (search for each ' +
                 'symbol and each distinctive phrase of the changed statements), and every ' +
@@ -1223,8 +1224,10 @@ const groups = all.filter((f) => f.group.length > 0)
 const dropped = all.filter((f) => f.status === 'dropped')
 const surviving = all.filter((f) => f.status !== 'dropped')
 // Findings on the review surface are fixed; findings off it are recorded for
-// the open Issue that already names the work, else for the follow-up Issue of
-// their scope, and do not count toward the verdict.
+// the open Issue that already names the work, else for the follow-up Issue the
+// PR drains in their scope (the lowest-numbered when it drains several), else
+// for the follow-up Issue of their scope, unless an open follow-up Issue of
+// that scope already holds them, and do not count toward the verdict.
 const findings = surviving.filter((f) => f.in_bound)
 const recorded = surviving.filter((f) => !f.in_bound)
 const count = (status) => findings.filter((f) => f.status === status).length
@@ -1356,23 +1359,22 @@ const SYNTH_PROMPT = [
         'fix. Every bracketed note at the end of a finding\'s evidence (the script\'s ' +
         'placement, Issue-adoption, late-Issue, and unjudged-Issue notes) is rendered ' +
         'verbatim as its own line on the entry. For contested and unverified entries add ' +
-        'one line per verifier vote with its ' +
-        'lens, refuted flag, confidence, and evidence. The dropped section lists each dropped ' +
-        'finding in one line with the refuting evidence. The ledger section lists each ' +
-        'ledgered finding in one line: `file:line` (bucket, class) claim. The audit section ' +
-        'lists each audit section with its verdict and items. Keep each entry to its fields; ' +
-        'the full record is saved beside the report.',
+        'one line per verifier vote with its lens, refuted flag, confidence, and evidence. The ' +
+        'dropped section lists each dropped finding in one line with the refuting evidence. ' +
+        'The ledger section lists each ledgered finding in one line: `file:line` (bucket, ' +
+        'class) claim. The audit section lists each audit section with its verdict and items. ' +
+        'Keep each entry to its fields; the full record is saved beside the report.',
     '',
     'Headings, in this order: `# Pre-merge review: PR #' + PR + '`, `## Critical`, ' +
         '`## Should fix`, `## Nit`, `## Recorded for audit (off the review surface)`, ' +
         '`## Dropped by verification`, `## Ledger (not re-raised)`, `## Audit`. The recorded ' +
-        'section lists each off-surface ' +
-        'finding with the same fields as the others, naming its `issue` when set; they are ' +
-        'appended to the open Issue that already names the work, else to the follow-up ' +
-        'Issue of their scope unless an open follow-up Issue of that scope already holds ' +
-        'them (docs/conventions.md § Branch and PR Workflow), not ' +
-        'fixed. Write `(none)` under an empty heading. Do not write verdict lines; the ' +
-        'workflow appends them.',
+        'section lists each off-surface finding with the same fields as the others, naming ' +
+        'its `issue` when set; they are appended to the open Issue that already names the ' +
+        'work, else to the follow-up Issue the PR drains in their scope (the lowest-numbered ' +
+        'when it drains several), else to the follow-up Issue of their scope, unless an open ' +
+        'follow-up Issue of that scope already holds them (docs/conventions.md § Branch and ' +
+        'PR Workflow), not fixed. Write `(none)` under an empty heading. Do not write verdict ' +
+        'lines; the workflow appends them.',
     '',
     'Findings on the review surface (JSON):',
     JSON.stringify(findings.map(for_render), null, 1),

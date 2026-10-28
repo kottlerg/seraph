@@ -76,21 +76,20 @@ truth for "how work is tracked and shipped" on this project.
   `target/xtask/review/pr<N>/<mode>-<head>.md` and the whole returned
   object as `<mode>-<head>.json` beside it (the ledger command below reads
   its `verdict`, `stats`, `findings`, `recorded`, and `dropped`), and
-  surface both verdict lines to the user verbatim. If the
-  Workflow tool is unavailable (the directly invoked agents are then the
-  review, per that section), invoke `@pr-reviewer` and `@pr-auditor`
-  directly in parallel (single message, two `Agent` tool calls) with the
-  PR number as scope, the open Issue list (`gh issue list --state open
-  --limit 500 --json number,title`), the ledger path once one exists, and,
-  for a delta run, the `since` head and the merge bases at `since` and at
-  the head (`git merge-base <sha> origin/master` for each); save the
-  reviewer's findings
-  (status `unverified`, since no refuter judged them, or `nit` for a nit
-  that cannot block), the recorded and dropped ones, the ledger-flagged
-  ones its `Ledger (not re-raised)` heading lists as `ledgered`, the
-  `verdict`, and the head as `stats.head`, as `<mode>-<head>.json` in the
-  workflow's shape, so the ledger command reads a fallback run too, and
-  apply the same verdict handling.
+  surface both verdict lines to the user verbatim. If the Workflow tool is
+  unavailable (the directly invoked agents are then the review, per that
+  section), invoke `@pr-reviewer` and `@pr-auditor` directly in parallel
+  (single message, two `Agent` tool calls) with the PR number as scope,
+  the open Issue list (`gh issue list --state open --limit 500 --json
+  number,title`), the ledger path once one exists, and, for a delta run,
+  the `since` head and the merge bases at `since` and at the head
+  (`git merge-base <sha> origin/master` for each); save the reviewer's
+  findings (status `unverified`, since no refuter judged them, or `nit`
+  for a nit that cannot block), the recorded and dropped ones, the
+  ledger-flagged ones its `Ledger (not re-raised)` heading lists as
+  `ledgered`, the `verdict`, and the head as `stats.head`, as
+  `<mode>-<head>.json` in the workflow's shape, so the ledger command reads
+  a fallback run too, and apply the same verdict handling.
 
   Before each run after the first (every `delta` run, and a `full` run
   once a record exists), build the ledger that section names from every
@@ -192,8 +191,10 @@ truth for "how work is tracked and shipped" on this project.
   when the reviewer verdict is `BLOCKING ISSUES` and otherwise recorded as
   that section says. Findings off the surface MUST be recorded in the same
   pass, never dropped: on the open Issue that already names the work, else
-  on the follow-up Issue of its scope that section defines (filed with the
-  user's approval).
+  on the follow-up Issue the PR drains in its scope (the lowest-numbered
+  when it drains several), else on the follow-up Issue of its scope that
+  section defines (filed with the user's approval), unless an open
+  follow-up Issue of that scope already holds it.
 - "Out of scope", "follow-up", and similar deferrals MUST NOT be used to
   avoid mechanically reachable blocking work on the surface; a non-blocking
   surface finding is deferred only by recording it on the follow-up Issue

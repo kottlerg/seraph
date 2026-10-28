@@ -471,7 +471,7 @@ count says): riscv64 64, 65, and 128 harts, and x86_64 256 and 512 vCPUs.
 
 ```sh
 # Boundary CPU counts, riscv64 (the 64- and 65-hart runs take ~70 s each
-# on a 16-core host, the 128-hart run ~2 min at 8x hart oversubscription;
+# on a 16-core host, the 128-hart run ~2-3 min at 8x hart oversubscription;
 # the 600 s and 1800 s budgets are for HANG classification):
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64

@@ -186,7 +186,7 @@ const MAX_APERTURE_CAPS: usize = 32;
 const MAX_ACPI_REGION_CAPS: usize = 8;
 
 /// Collected hardware caps: init forwards raw firmware + MMIO surfaces
-/// to devmgr. Parsing (MCFG / DTB → ECAM, FADT → PM1a) lives in devmgr.
+/// to devmgr. Parsing (MCFG / DTB → ECAM, FADT → `PM1a`) lives in devmgr.
 struct HwCaps
 {
     /// Root `Interrupt` range cap. Zero if the kernel did not mint one.

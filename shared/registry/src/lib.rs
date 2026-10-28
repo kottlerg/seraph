@@ -195,7 +195,7 @@ impl<const N: usize> Default for Registry<N>
 #[cfg(test)]
 mod tests
 {
-    use super::{Registry, Resolver, Visibility, NAME_MAX};
+    use super::{NAME_MAX, Registry, Resolver, Visibility};
 
     #[test]
     fn public_entry_resolves_for_query_and_seed()
@@ -210,7 +210,8 @@ mod tests
     fn seed_only_entry_resolves_for_seed_but_not_query()
     {
         let mut r = Registry::<4>::new();
-        r.publish(b"devmgr.shutdown", 9, Visibility::SeedOnly).unwrap();
+        r.publish(b"devmgr.shutdown", 9, Visibility::SeedOnly)
+            .unwrap();
         assert_eq!(r.lookup(b"devmgr.shutdown", Resolver::Query), None);
         assert_eq!(r.lookup(b"devmgr.shutdown", Resolver::Seed), Some(9));
     }
@@ -231,7 +232,10 @@ mod tests
         let mut r = Registry::<2>::new();
         assert!(r.publish(b"a", 0, Visibility::Public).is_err());
         assert!(r.publish(b"", 1, Visibility::Public).is_err());
-        assert!(r.publish(&[b'a'; NAME_MAX + 1], 1, Visibility::Public).is_err());
+        assert!(
+            r.publish(&[b'a'; NAME_MAX + 1], 1, Visibility::Public)
+                .is_err()
+        );
         r.publish(b"a", 1, Visibility::SeedOnly).unwrap();
         assert!(r.publish(b"a", 2, Visibility::Public).is_err());
         r.publish(b"b", 3, Visibility::Public).unwrap();

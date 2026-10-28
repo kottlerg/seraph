@@ -53,14 +53,21 @@ pub struct Caps
     pub devmgr_test: u32,
 }
 
-/// Drain the bootstrap round from `creator_endpoint` and pull caps out.
+/// Drain the bootstrap round from `creator_endpoint` and pull caps out,
+/// then resolve `pwrmgr.deny`. The lookup follows the round: svcmgr serves
+/// no `QUERY_ENDPOINT` until it has served the round.
 pub fn request() -> Caps
 {
-    let mut caps = Caps {
-        pwrmgr_noauth: std::os::seraph::registry::lookup(ipc::published_names::PWRMGR_DENY)
-            .unwrap_or(0),
-        ..Caps::default()
-    };
+    let mut caps = request_round();
+    caps.pwrmgr_noauth =
+        std::os::seraph::registry::lookup(ipc::published_names::PWRMGR_DENY).unwrap_or(0);
+    caps
+}
+
+/// The seeded slots of the bootstrap round from `creator_endpoint`.
+fn request_round() -> Caps
+{
+    let mut caps = Caps::default();
 
     let info = startup_info();
     if info.creator_endpoint == 0

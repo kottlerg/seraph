@@ -74,7 +74,10 @@ mod tests
     fn config_offset_is_relative_to_start_bus()
     {
         assert_eq!(config_offset(4, 4, 0, 0, 0), Some(0));
-        assert_eq!(config_offset(4, 6, 1, 0, 4), Some((2 << 20) | (1 << 15) | 4));
+        assert_eq!(
+            config_offset(4, 6, 1, 0, 4),
+            Some((2 << 20) | (1 << 15) | 4)
+        );
     }
 
     #[test]

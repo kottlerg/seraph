@@ -603,9 +603,17 @@ mod tests
     #[test]
     fn ecam_bus_range_short_inverted_or_above_255_yields_no_ecam()
     {
-        for range in [bus_range(0, 1)[..4].to_vec(), bus_range(7, 4), bus_range(256, 300)]
+        for range in [
+            bus_range(0, 1)[..4].to_vec(),
+            bus_range(7, 4),
+            bus_range(256, 300),
+        ]
         {
-            let blob = ecam_tree_with(ECAM, &reg(0x3000_0000, 16 << 20), &[("bus-range", range.as_slice())]);
+            let blob = ecam_tree_with(
+                ECAM,
+                &reg(0x3000_0000, 16 << 20),
+                &[("bus-range", range.as_slice())],
+            );
             assert!(ecam(&blob).is_none());
         }
     }

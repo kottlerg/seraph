@@ -206,7 +206,9 @@ fn publish_provided(
         {
             Visibility::SeedOnly
         };
-        if registry.publish(p.name.as_bytes(), send, visibility).is_err()
+        if registry
+            .publish(p.name.as_bytes(), send, visibility)
+            .is_err()
         {
             std::os::seraph::log!("launch {svc_name}: publish {:?} failed", p.name);
             let _ = syscall::cap_delete(send);

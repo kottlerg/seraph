@@ -196,7 +196,10 @@ fn svcmgr_seed_only_names_refused_phase(_caps: &Caps)
             "svcmgr QUERY_ENDPOINT({shown}) refusal must carry no cap"
         );
     }
-    for name in [ipc::published_names::SVCMGR, ipc::published_names::PWRMGR_DENY]
+    for name in [
+        ipc::published_names::SVCMGR,
+        ipc::published_names::PWRMGR_DENY,
+    ]
     {
         let reply = query(name);
         let shown = core::str::from_utf8(name).unwrap_or("?");

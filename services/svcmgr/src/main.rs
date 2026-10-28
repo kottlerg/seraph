@@ -742,23 +742,22 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
         return;
     }
 
-    let shutdown_cap =
-        match registry_lookup_derived(
-            &mut state.registry,
-            ipc::published_names::PWRMGR_SHUTDOWN,
-            Resolver::Seed,
-        )
+    let shutdown_cap = match registry_lookup_derived(
+        &mut state.registry,
+        ipc::published_names::PWRMGR_SHUTDOWN,
+        Resolver::Seed,
+    )
+    {
+        Ok(c) => c,
+        Err(code) =>
         {
-            Ok(c) => c,
-            Err(code) =>
-            {
-                std::os::seraph::log!(
-                    "graceful shutdown: cannot resolve {} (code={code})",
-                    core::str::from_utf8(ipc::published_names::PWRMGR_SHUTDOWN).unwrap_or("?")
-                );
-                return;
-            }
-        };
+            std::os::seraph::log!(
+                "graceful shutdown: cannot resolve {} (code={code})",
+                core::str::from_utf8(ipc::published_names::PWRMGR_SHUTDOWN).unwrap_or("?")
+            );
+            return;
+        }
+    };
 
     let shutdown_msg = IpcMessage::new(ipc::pwrmgr_labels::SHUTDOWN);
     // SAFETY: `ctx.ipc_buf` is the registered IPC buffer.

@@ -7,7 +7,7 @@
 //!
 //! Receives raw firmware-access caps and an MMIO aperture list from init,
 //! plus a full-rights derivation of the root Interrupt range cap. Parsing
-//! (MCFG / DTB → ECAM, FADT → PM1a) happens later in the `devmgr-firmware`
+//! (MCFG / DTB → ECAM, FADT → `PM1a`) happens later in the `devmgr-firmware`
 //! crate; this module owns only the IPC handshake.
 
 use std::os::seraph::StartupInfo;

@@ -222,9 +222,10 @@ let value = unsafe { ptr.read() };
   the invariant. The exception is a kernel field whose owner a design document records: a
   thread-control-block field whose owner
   [scheduling-internals.md § Cross-CPU TCB Ownership](../core/kernel/docs/scheduling-internals.md#cross-cpu-tcb-ownership)
-  names (the TCB's own `sched_lock`, an IPC source's lock, or, for a field that table assigns
-  to it, the claim on the thread's park episode), and a field of an IPC object, a source or a
-  wait set, that the object's own `lock` serialises, as the object's § Object Structure in
+  names (the TCB's own `sched_lock`, the lock of the source or wait set the thread is parked on,
+  or, for a field that table assigns to it, the claim on the thread's park episode), and a field
+  of an IPC object, a source or a wait set, that the object's own `lock` serialises, as the
+  object's § Object Structure in
   [ipc-internals.md](../core/kernel/docs/ipc-internals.md) records. Such a field MAY be a bare
   `T` when a rustdoc names that owner: the field's own for a thread-control-block field, whose
   owners differ field by field; the object's for an IPC object, whose non-atomic fields share

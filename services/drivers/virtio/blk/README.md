@@ -134,7 +134,7 @@ read.
 | label | 4 |
 | data[0] | Starting LBA (relative to the caller badge's partition base) |
 | data[1] | Sector count (`>= 1`; defaults to `1` if absent) |
-| caps[0] | Source Memory cap, `MAP` rights, at least `count * 512` bytes |
+| caps[0] | Source Memory cap, `MAP | READ`, at least `count * 512` bytes |
 | caps[1] | Reserved (null today; future per-request release handle) |
 | caps[2] | Reserved IPC-shape slot (null today; future userspace-IOMMU grant) |
 
@@ -152,7 +152,7 @@ read.
 | 1 | `DeviceStatusIoerr` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
 | 2 | `DeviceStatusUnsupp` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
 | 3 | `OutOfBounds` | LBA outside the caller badge's partition range |
-| 5 | `InvalidMemoryCap` | Source Memory cap missing `MAP`, smaller than `count * 512`, or absent; or `count` is 0 or `count * 512` exceeds the u32 descriptor length |
+| 5 | `InvalidMemoryCap` | Source Memory cap missing `MAP|READ`, smaller than `count * 512`, or absent; or `count` is 0 or `count * 512` exceeds the u32 descriptor length |
 
 ---
 

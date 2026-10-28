@@ -603,16 +603,14 @@ fn handle_read_block_into_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
+    let data_len_bytes = sector_count * SECTOR_SIZE;
     // VirtIO descriptor length is u32; this also bounds total transfer
     // well below any plausible per-cap ask.
-    let Some(data_len_bytes) = sector_count
-        .checked_mul(SECTOR_SIZE)
-        .filter(|&n| u32::try_from(n).is_ok())
-    else
+    if data_len_bytes > u64::from(u32::MAX)
     {
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
-    };
+    }
 
     // Validate the target cap: must be a Memory cap with MAP+WRITE rights and
     // at least `data_len_bytes` of capacity.
@@ -701,7 +699,7 @@ fn handle_read_block_into_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
 /// Handle a `BLK_WRITE_FROM_MEMORY` request.
 ///
 /// Mirror of [`handle_read_block_into_memory`] with the data direction
-/// inverted. Reads `caps[0]` (source Memory cap, `MAP` rights) and DMAs
+/// inverted. Reads `caps[0]` (source Memory cap, `MAP|READ`) and DMAs
 /// `data[1]` consecutive sectors (default 1) starting at LBA `data[0]`
 /// out of the memory cap at offset 0, packed contiguously. The source Memory cap
 /// is moved back to the caller in `caps[0]` of the reply.
@@ -746,18 +744,16 @@ fn handle_write_block_from_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut 
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
-    let Some(data_len_bytes) = sector_count
-        .checked_mul(SECTOR_SIZE)
-        .filter(|&n| u32::try_from(n).is_ok())
-    else
+    let data_len_bytes = sector_count * SECTOR_SIZE;
+    if data_len_bytes > u64::from(u32::MAX)
     {
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
-    };
+    }
 
-    // Source memory cap must be a Memory cap with at least MAP rights
-    // (read-only mapping authority: the device reads sector data out of
-    // it) and large enough to cover the requested run.
+    // Source memory cap must be a Memory cap with at least MAP+READ rights
+    // (device reads sector data out of it) and large enough to cover the
+    // requested run.
     let Ok(tag_rights) = syscall::cap_info(source_cap, syscall::CAP_INFO_TAG_RIGHTS)
     else
     {

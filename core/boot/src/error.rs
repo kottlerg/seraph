@@ -218,6 +218,7 @@ mod tests
             BootError::WxViolation,
             BootError::OutOfMemory,
             BootError::ExitBootServicesFailed,
+            BootError::PagingModeUnsupported,
         ];
         for v in no_detail
         {

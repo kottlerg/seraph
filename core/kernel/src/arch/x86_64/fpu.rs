@@ -54,8 +54,6 @@
 //! FPU flush IPI is needed (core/kernel/docs/scheduling-internals.md § IPI
 //! Taxonomy).
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 // ── CR0 ───────────────────────────────────────────────────────────────────────
 
 /// CR0.TS bit (Task Switched).
@@ -144,28 +142,6 @@ const XCR0_SSE: u64 = 1 << 1;
 const XCR0_AVX: u64 = 1 << 2;
 const XCR0_V3: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX;
 
-/// XSAVE area size (bytes) reported by CPUID.0Dh:0.ECX: the size for every
-/// component the CPU supports, an upper bound on the size for the components
-/// enabled in XCR0 (CPUID.0Dh:0.EBX).
-///
-/// Written by [`enable_xsave`] on each CPU (last writer wins); zero before
-/// initialisation.
-static XSAVE_AREA_SIZE: AtomicUsize = AtomicUsize::new(0);
-
-/// Return the XSAVE area size reported by CPUID.0Dh:0.ECX: the size for every
-/// supported component, an upper bound on the size for the components enabled
-/// in XCR0 (CPUID.0Dh:0.EBX).
-///
-/// Returns 0 before [`enable_xsave`] has run on the BSP.
-// dead_code: no caller; the per-thread XSAVE area is a fixed PAGE_SIZE page
-// carved by `syscall::cap::sys_cap_create_thread` and, for init's thread, by
-// `kernel_entry_post_rebase`, neither of which consults this size.
-#[allow(dead_code)]
-pub fn xsave_area_size() -> usize
-{
-    XSAVE_AREA_SIZE.load(Ordering::Relaxed)
-}
-
 /// Write `val` to extended control register `xcr` via XSETBV.
 ///
 /// # Safety
@@ -196,9 +172,8 @@ unsafe fn xsetbv(xcr: u32, val: u64)
 /// Fatal if the CPU does not support XSAVE (CPUID.01H:ECX bit 26) — the kernel
 /// targets x86-64-v3 which requires it.
 ///
-/// After this returns, [`xsave_area_size`] reports an XSAVE area size large
-/// enough for every supported component (CPUID.0Dh:0.ECX), and [`cr0_set_ts`] /
-/// [`cr0_clear_ts`] can be used to arm and disarm the `#NM` lazy-trap discipline.
+/// After this returns, [`cr0_set_ts`] / [`cr0_clear_ts`] can be used to arm
+/// and disarm the `#NM` lazy-trap discipline.
 ///
 /// # Safety
 /// Must execute at ring 0 during per-CPU early init.
@@ -232,20 +207,13 @@ pub unsafe fn enable_xsave()
     unsafe {
         xsetbv(0, XCR0_V3);
     }
-
-    // Record the XSAVE area size. CPUID.0Dh:0.ECX is the size for every
-    // component the CPU supports (an upper bound on the XCR0-enabled size,
-    // which is EBX).
-    let (_eax, _ebx, ecx, _edx) = super::cpu::cpuid(0xD);
-    XSAVE_AREA_SIZE.store(ecx as usize, Ordering::Relaxed);
 }
 
 /// Save the live x87/SSE/AVX state of the executing CPU into `area`.
 ///
 /// `area` must be 64-byte aligned and point at a writable XSAVE buffer of
 /// at least the XCR0-enabled size (CPUID.0Dh:0.EBX) bytes, which XSAVE never
-/// writes past; [`xsave_area_size`] is an upper bound on that size, not the
-/// requirement. The component-mask passed in
+/// writes past. The component-mask passed in
 /// `EDX:EAX = 0xFFFF_FFFF_FFFF_FFFF` instructs XSAVE to write every
 /// component XCR0 currently enables; hardware intersects with XCR0, so
 /// the actual written set is exactly the OS-enabled components.

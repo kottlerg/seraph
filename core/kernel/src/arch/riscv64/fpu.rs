@@ -349,7 +349,7 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
     // switch-out from a U-mode trap (syscall, preemption, or fault block) still
     // has a live `&mut` to this frame in trap_dispatch / redirect_user_fault
     // (and the syscall dispatcher); that aliasing gap is stated in
-    // docs/arch-interface.md § `trap_frame` and tracked by #514.
+    // core/kernel/docs/arch-interface.md § `trap_frame` and tracked by #514.
     unsafe {
         let tf = (*tcb)
             .trap_frame
@@ -389,8 +389,11 @@ pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBl
 /// trapping instruction would re-trap forever).
 ///
 /// The V restore is skipped when [`vlenb`] is zero, which holds only before
-/// [`cache_vlenb`] runs at BSP init (a hart without V halts there; see
-/// `docs/platform-requirements.md` § riscv64 Classification).
+/// [`cache_vlenb`] runs at BSP init. Only the boot hart is probed: it halts
+/// there when it lacks V. A secondary hart is never probed, so one without V is
+/// not refused at boot; harts are assumed uniform, and on such a hart the first
+/// V restore here takes a supervisor illegal-instruction trap, which is fatal
+/// (docs/platform-requirements.md § Boot-Time Feature Gate).
 ///
 /// # Safety
 /// Must execute in supervisor mode from the illegal-instruction trap path.
@@ -451,7 +454,9 @@ static VLENB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new
 const MAX_VLENB: u64 = 64;
 
 /// Return the cached `vlenb`. Returns 0 only before [`cache_vlenb`] runs at
-/// boot; a hart without V halts in [`cache_vlenb`].
+/// BSP init. Only the boot hart is probed: it halts in [`cache_vlenb`] when it
+/// lacks V, and a secondary hart is never probed, so one without V is not
+/// refused at boot (docs/platform-requirements.md § Boot-Time Feature Gate).
 // dead_code fires only under `test`: `vlenb` is read only by the non-test `lazy_restore_fp_v`;
 // the `#[cfg(test)]` stub of `lazy_restore_fp_v` does not reference it.
 #[cfg_attr(test, allow(dead_code))]

@@ -9,25 +9,30 @@
 //! (some roles take further arguments after it, e.g. `blobs-fill-child`'s
 //! filler token) to exercise child-side behaviour: namespace and
 //! `/programs`-subtree attenuation, cwd-cap delivery, argv/env blob packing,
-//! exit-code propagation, and per-process randomness and ASLR divergence.
+//! exit-code propagation, per-process randomness and ASLR divergence,
+//! `Child` kill and drop teardown, and the fs release handler's cookie
+//! matching.
 //! The child-mode function for each role lives in the phase module that
 //! spawns it; `dispatch` consults each module's `reentry_main(role)` so a
 //! new role is registered alongside its phase, not in a central switch.
 //!
-//! A module's `reentry_main` diverges (`std::process::exit`) on a
-//! matching role and returns on a miss; `dispatch` cascades through
+//! A module's `reentry_main` diverges on a matching role, by exiting
+//! (`std::process::exit`) or, for `park-child`, by parking until its
+//! spawner tears it down, and returns on a miss; `dispatch` cascades through
 //! the modules and returns to its caller only when no module took
 //! control.
 
 use crate::phases;
 
 /// If any phase module's `reentry_main` matches `role`, control never
-/// returns (the child process exits via its exit-code convention).
+/// returns (the child exits by its exit-code convention, or parks until its
+/// spawner tears it down).
 /// Otherwise returns normally so the parent test sequence proceeds.
 pub fn dispatch(role: &str)
 {
     phases::namespace::reentry_main(role);
     phases::procmgr::reentry_main(role);
+    phases::fs_std::reentry_main(role);
     phases::exit_code::reentry_main(role);
     phases::random::reentry_main(role);
 }

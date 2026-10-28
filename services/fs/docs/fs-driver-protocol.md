@@ -145,7 +145,7 @@ The first `FS_READ_MEMORY` for a given (client, file) pair MAY carry
 the client's per-process release-endpoint SEND in `caps[0]`.
 Subsequent `FS_READ_MEMORY`s for the same pair carry no caps; clients
 that opt out of cooperative release omit the cap on every call,
-falling back to the eviction worker's hard-revoke path.
+and eviction then revokes the page without the cooperative round-trip.
 
 The driver keeps this read-side bookkeeping (outstanding pages and the
 recorded release endpoint) in a lazily-allocated `OpenFile` slot keyed
@@ -254,11 +254,14 @@ endpoint cap recorded in the node's `OpenFile` slot, taken from
 `caps[0]` of the [`FS_READ_MEMORY`](#label-7-fs_read_memory) that
 allocated the slot (per-node sharing, a defect tracked in
 [#447](https://github.com/kottlerg/seraph/issues/447)). Clients that
-delivered the SEND get the cooperative path; the driver waits up to
-100 ms for [`FS_RELEASE_ACK`](#label-9-fs_release_ack) before falling
-through to a hard `cap_revoke` of the parent Memory cap. Clients that
-omitted the SEND (opt-out) skip straight to the hard-revoke path on
-every eviction. See
+delivered the SEND get the cooperative path: the driver waits up to
+100 ms for [`FS_RELEASE_ACK`](#label-9-fs_release_ack), then
+`cap_revoke`s the parent Memory cap and deletes it whether or not the
+ack came. Clients that omitted the SEND (opt-out) skip straight to the
+revoke on every eviction, and so does a client whose SEND the driver
+cannot copy or whose watchdog it cannot start. The driver sends no
+release for a page the client's own release or `FS_CLOSE` has already
+removed from the open-file table. See
 [`runtime/ruststd/src/sys/fs/release_handler.rs`](../../../runtime/ruststd/src/sys/fs/release_handler.rs)
 for the receive-side state machine.
 
@@ -270,9 +273,32 @@ for the receive-side state machine.
 | `data[0]` | Release cookie identifying the Memory cap |
 
 The client unmaps the matching Memory cap and replies with
-[`FS_RELEASE_ACK`](#label-9-fs_release_ack). If the client does not
-acknowledge within the cooperative-release watchdog window (100 ms),
-the driver `cap_revoke`s the parent Memory cap.
+[`FS_RELEASE_ACK`](#label-9-fs_release_ack). The client matches the
+cookie among all its open files, since the release may arrive on the
+SEND of a file other than the one that read the page. If a local copy
+from the page is still in progress, the client holds its reply until
+the copy ends, within the window below and once per cookie (a repeated
+release of a cookie whose wait ran out is refused at once); this covers
+a release the driver sends before its reply to the cookie's
+[`FS_READ_MEMORY`](#label-7-fs_read_memory) arrives. After the reply,
+or after the cooperative-release watchdog window (100 ms) with none,
+the driver revokes every cap derived from the parent Memory cap,
+deletes the parent, and releases the page-cache slot, unless the
+client's [client-to-driver release](#client-to-driver-release) or
+[`FS_CLOSE`](#label-3-fs_close) has already done so: each page is
+cleaned up once, by whichever path removes it from the open-file
+table first. The ack tells the driver the client unmapped in time.
+The revoke invalidates the client's derived cap but removes no mapping
+([Capability Model § Revocation](../../../docs/capability-model.md#revocation)),
+and the released slot may be refilled with other data, so a client
+that has not unmapped the page by then can read what the cache loads
+there next; a client MUST unmap before it acks. A copy that outlasts
+the window can read the recycled page, and a client that starts its
+own wait only when the release arrives cannot detect every such copy
+([#516](https://github.com/kottlerg/seraph/issues/516)).
+A reply with any other label is not an
+acknowledgement; a client that cannot unmap the page, or whose copy
+outlasts the window, replies `IO_ERROR` (2).
 
 ### Client-to-driver release
 
@@ -304,8 +330,11 @@ badge carries no namespace rights.
 ## Label 9: `FS_RELEASE_ACK`
 
 Synchronous client-to-driver reply to
-[`FS_RELEASE_MEMORY`](#label-8-fs_release_memory). Empty body. The
-driver's outstanding-memory-cap refcount decrements on receipt.
+[`FS_RELEASE_MEMORY`](#label-8-fs_release_memory). Empty body. It
+tells the driver the client unmapped the page in time; the driver
+revokes the parent cap and drops its page-cache refcount after any
+reply, or after the window with none, per
+[§ Label 8](#label-8-fs_release_memory).
 
 **Reply**
 
@@ -385,7 +414,10 @@ crossover Issue tracks per-arch tuning.
 
 The driver mem-maps the source memory cap read-only into its own address
 space for the duration of the copy. The cap returns to the caller in
-every outcome (mirror of the read-memory ownership discipline).
+every outcome (mirror of the read-memory ownership discipline). The
+driver MUST NOT keep a mapping of the source page, or any capability to
+it, past its reply: once the reply arrives the caller may return the
+page to memmgr's pool, which another process can then be granted.
 
 **Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `IO_ERROR`,
 `PERMISSION_DENIED`, `NO_SPACE`, `BAD_MEMORY_OFFSET`.

@@ -16,7 +16,7 @@
 //!     `StartupInfo` stashed by `_start`. Services use these to obtain their
 //!     initial caps.
 //!   * `heap_bootstrap` / `heap_is_initialized` — allocator bring-up against
-//!     procmgr.
+//!     memmgr.
 //!   * `abort_thread` — placeholder thread terminator.
 
 // std requires every public item to carry a stability attribute. Everything
@@ -52,7 +52,9 @@ pub use process_abi::StackNote;
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 #[derive(Debug, Clone, Copy)]
 pub struct StartupInfo {
-    /// Virtual address of the pre-mapped IPC buffer page.
+    /// Virtual address of the main thread's pre-mapped IPC buffer page.
+    /// Every other thread registers its own; IPC from any thread goes
+    /// through [`current_ipc_buf`].
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub ipc_buffer: *mut u8,
     /// Cap slot of the SEND endpoint back to the creator, or 0 when absent.
@@ -512,7 +514,7 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
     // user's `fn main`, returning the `ExitCode`/`lang_start` value as `i32`.
     let code = unsafe { main(0, core::ptr::null()) };
 
-    // Tear down stdio pipes before exit so the close protocol fires
+    // Close stdio pipes before exit so the close protocol fires
     // (header `closed` flag + notification kick) and any parent blocked on
     // a read/write returns cleanly.
     pal_stdio::close_all();
@@ -535,11 +537,11 @@ static _START_REF: unsafe extern "C" fn(u64) -> ! = _start;
 
 // ── Public helpers surfaced on std::os::seraph ──────────────────────────────
 
-/// Initialise the process heap against procmgr.
+/// Initialise the process heap against memmgr.
 ///
-/// Must be called once, after the bootstrap IPC round that obtains
-/// `procmgr_ep`, before the first allocation through the `System`
-/// allocator. Idempotent — subsequent calls are no-ops.
+/// `_start` calls this before `main`, with `ProcessInfo.memmgr_endpoint_cap`
+/// as `memmgr_ep`, whenever that cap is non-zero. Only the first call does
+/// work; a later call returns whether that first call installed the heap.
 ///
 /// `self_aspace` is the process's own `AddressSpace` cap slot. The
 /// bootstrap IPC round uses the calling thread's registered IPC buffer
@@ -548,8 +550,8 @@ static _START_REF: unsafe extern "C" fn(u64) -> ! = _start;
 ///
 /// Returns `true` if the heap is usable after this call.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn heap_bootstrap(procmgr_ep: u32, self_aspace: u32) -> bool {
-    pal_alloc::heap_bootstrap(procmgr_ep, self_aspace)
+pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
+    pal_alloc::heap_bootstrap(memmgr_ep, self_aspace)
 }
 
 /// Returns `true` once `heap_bootstrap` has completed successfully.
@@ -717,7 +719,10 @@ pub fn namespace_lookup_file(root_cap: u32, path: &str) -> crate::io::Result<(u3
 /// `shared/namespace-protocol`. Used by spawners that walk-and-
 /// attenuate a subtree cap before installing it on a child via
 /// `CONFIGURE_NAMESPACE`. Callers wanting the full rights chain pass
-/// `0xFFFF`.
+/// `0xFFFF`. A path with no components (empty or `/`) names the anchor
+/// itself, which no hop narrows: it resolves to a copy of `root_cap` only
+/// when `requested_rights` includes every defined namespace right, and to
+/// `InvalidInput` otherwise.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn namespace_lookup_dir(
     root_cap: u32,

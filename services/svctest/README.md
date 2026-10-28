@@ -28,7 +28,7 @@ services/svctest/
         ├── mod.rs             # Ordered phase registry; one module per surface under test
         ├── startup.rs         # argv, env, stack envelope, TLS at entry; unset cwd path
         ├── memmgr.rs          # Heap allocator over memmgr; all-RAM-accounted identity
-        ├── threading.rs       # Threads, per-thread state, `thread_local!`, `Condvar`
+        ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, `RwLock`, `Condvar`
         ├── procmgr.rs         # `std::process::Command` spawn, cwd, and error paths
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
@@ -71,8 +71,9 @@ seed-only phase (every seed, plus the public `svcmgr` and `pwrmgr.deny` names it
 instead fail their assertions. The seed-only phase thus fails the run on a zero `caps[1]` before
 the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not reached.
 
-The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, and env
-carries `SERAPH_TEST=1` and `SERAPH_MODE=boot`.
+The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
+the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
+`SERAPH_MODE=boot`.
 
 ---
 
@@ -105,7 +106,8 @@ drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED` reply to `SHU
 
 Several phases respawn `/tests/svctest` with a role token as `argv[1]`. `main` hands the token
 to `reentry::dispatch`, which tries each owning module's `reentry_main`; a matching role runs
-its child body and exits, and an unmatched token falls through to the normal run.
+its child body and exits (`park-child` parks until its spawner tears it down), and an unmatched
+token falls through to the normal run.
 
 | Role                        | Owning module  | Spawned by                                  |
 |-----------------------------|----------------|---------------------------------------------|
@@ -113,6 +115,8 @@ its child body and exits, and an unmatched token falls through to the normal run
 | `programs-child`            | `namespace`    | `ns_programs_subtree` (`/programs` subtree) |
 | `cwd-child`                 | `procmgr`      | `command_cwd_inherit` (cwd-cap delivery)    |
 | `blobs-fill-child`          | `procmgr`      | `command_blobs_fill_message` (full message) |
+| `park-child`                | `procmgr`      | `command_from_spawned_thread` (kill, drop)  |
+| `release-child`             | `fs_std`       | `std_release_matched_by_cookie` (fake fs)   |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |
 | `random-diverge-child`      | `random`       | `random` (per-process hash seed)            |

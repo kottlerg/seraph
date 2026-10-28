@@ -77,6 +77,26 @@ pub fn args_phase(_: &Caps)
     );
     assert_eq!(collected[0], "svctest", "argv[0] mismatch");
     assert_eq!(collected[1], "run", "argv[1] mismatch");
+
+    // The back walk yields the same entries reversed, and the two ends
+    // consume disjoint entries with `len` exact throughout.
+    let reversed: Vec<String> = std::env::args().rev().collect();
+    assert_eq!(reversed, ["run", "svctest"], "args().rev() mismatch");
+    let mut both = std::env::args();
+    assert_eq!(
+        both.next_back().as_deref(),
+        Some("run"),
+        "next_back mismatch"
+    );
+    assert_eq!(both.len(), 1, "len after next_back");
+    assert_eq!(
+        both.next().as_deref(),
+        Some("svctest"),
+        "next after next_back"
+    );
+    assert_eq!(both.len(), 0, "len after both ends met");
+    assert_eq!(both.next(), None, "front walk crossed the back walk");
+    assert_eq!(both.next_back(), None, "back walk crossed the front walk");
     std::os::seraph::log!("args phase passed");
 }
 

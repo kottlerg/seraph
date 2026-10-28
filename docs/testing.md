@@ -370,7 +370,8 @@ or memory size, and owes no local host run, whatever file it is in:
   a trait-method implementation) that nothing names at the PR head outside comments and Markdown
   (`git grep -w <name> <head>` finds no other use) and that carries no attribute making it
   reachable without its name (`no_mangle`, `export_name`, `used`, `link_section`,
-  `global_allocator`, or `panic_handler`, in the plain or the `unsafe(...)` form).
+  `global_allocator`, or `panic_handler`, in any form: plain, `unsafe(...)`, or under
+  `cfg_attr`).
 
 A PR whose changes outside Markdown are all inert owes no local host run, whatever purpose it
 states. The surfaces below, and Repeat count, are judged on the non-inert lines only.
@@ -399,19 +400,22 @@ changed line that names one of these items as a whole identifier or lies within 
 - CPU-count width: `MAX_CPUS`, `CpuMask`, `CPU_MASK_WORDS`;
 - per-CPU storage: `alloc_zeroed_slab`, and the definition of every function that calls it (the
   per-CPU storage initialisers; a call to one is on the surface only when it names another listed
-  item, as a call to an `init_ap_*` initialiser does); `kernel_reserve_pages` (the CPU-scaled
-  kernel reserve); and the element types of the per-CPU arrays and slabs, today `PerCpuData`,
-  `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`, `TagState`,
-  `CpuRng`, `Acc`, `Sample`, and `TlbShootdownRequest`
-  (`git grep -n -E 'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and
-  also the single-slot entropy pool slab, which is not per-CPU). A change that alters an element
-  type's size is on the surface whether it edits the type's own fields or a type or constant the
-  element holds by value (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside
-  `PerCpuScheduler`, or `Prng` inside `CpuRng`), and so is a change to a constant that sizes a
-  per-CPU allocation (`KERNEL_STACK_PAGES` for the idle stacks);
-- CPU enumeration and bringup: `parse_cpu_topology`, `parse_madt_topology`, and `parse_cpu_count`
-  in the bootloader, and `start_ap`, `sbi_hart_start`, `kernel_entry_ap`, every `init_ap`, and the
-  `init_ap_*` per-CPU storage initialisers in the kernel;
+  item, as a call to an `init_ap_*` initialiser does); every `init_storage` and
+  `init_per_cpu_storage`, which take the boot CPU count and size per-CPU storage from it (a call to
+  one names it, so a change to the count it passes is on the surface); `kernel_reserve_pages` (the
+  CPU-scaled kernel reserve); and the element types of the per-CPU arrays and slabs, today
+  `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
+  `TagState`, `CpuRng`, `Acc`, `Sample`, and `TlbShootdownRequest` (`git grep -n -E
+  'alloc_zeroed_slab::<|; MAX_CPUS\]' <head>` lists the arrays and slabs, and also the single-slot
+  entropy pool slab, which is not per-CPU). A change that alters an element type's size is on the
+  surface whether it edits the type's own fields or a type or constant the element holds by value
+  (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or `Prng` inside
+  `CpuRng`), and so is a change to a constant that sizes a per-CPU allocation (`KERNEL_STACK_PAGES`
+  for the idle stacks);
+- CPU enumeration and bringup: `parse_cpu_topology`, `parse_madt_topology`, and `parse_cpu_count` in
+  the bootloader, and the kernel's boot CPU count (`boot_cpu_count`), `start_ap`, `sbi_hart_start`,
+  `kernel_entry_ap`, every `init_ap`, and the `init_ap_*` per-CPU storage initialisers in the
+  kernel;
 - IPI send and receive: `send_wakeup_ipi`, `send_tlb_shootdown_ipi`, `send_init_ipi`, `send_sipi`,
   `send_nmi_to`, `sbi_send_ipi_to`, `sbi_hart_mask`, `wait_for_ack`, `IpiWaitCtx`, the
   `IPI_VECTOR_*` constants, the x86_64 `ipi_*` stubs and handlers in `idt.rs`, the x86_64 ICR and
@@ -442,8 +446,9 @@ B=$(git merge-base <head> origin/master)
 git diff --stat "$B" <head> -- core/kernel/src/cpu_mask.rs core/kernel/src/percpu.rs \
     core/kernel/src/mm/tlb_shootdown.rs core/kernel/src/mm/tag_allocator.rs \
     'core/kernel/src/arch/*/ap_trampoline.rs'
-S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|kernel_reserve_pages|PerCpuData'
-S="$S|PerCpuScheduler|ThreadControlBlock|TssWithIopb|TagState|CpuRng|Prng|Acc|Sample"
+S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|init_storage|init_per_cpu_storage'
+S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
+S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample"
 S="$S|TlbShootdownRequest|parse_cpu_topology|parse_madt_topology|parse_cpu_count|start_ap"
 S="$S|sbi_hart_start|kernel_entry_ap|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdown|init)_ipi"
 S="$S|send_sipi|send_nmi_to|sbi_send_ipi_to|sbi_hart_mask|wait_for_ack|IpiWaitCtx"
@@ -513,10 +518,10 @@ elsewhere is not a concurrency-fix purpose, and a change to those mechanisms' fi
 stated purpose does not raise the count.
 
 **When the runs are owed.** Each local host run a PR owes MUST pass, at its repeat count, at one
-head that covers the merge head. Only a `PASS` outcome of `run-parallel`
-([xtask/README.md](../xtask/README.md)) passes; a `QEMU-CRASH` run, a crash of the host
-emulator, is run again, and the PR body links its preserved log; `OK` and `ERR` count as
-failures. The PR's own diff at a head is the diff from that head's merge base with the fetched
+head that covers the merge head. For every local and release host run, only a `PASS` outcome of
+`run-parallel` ([xtask/README.md](../xtask/README.md)) passes; a `QEMU-CRASH` run, a crash of the
+host emulator, is run again and the re-run's outcome stands; `OK` and `ERR` count as failures.
+The PR's own diff at a head is the diff from that head's merge base with the fetched
 `master` to the head (after `git fetch origin`,
 `git diff $(git merge-base <head> origin/master) <head>`), so it excludes what a merge or rebase
 from `master` brings in. A run's surface is the surface that owes it: the CPU-count surface for the
@@ -546,9 +551,9 @@ blocks the PR.
 4), the maintainer MUST run, on the commit to be tagged, the riscv64 64- and
 65-hart and the x86_64 256-vCPU boundaries three times each (`--runs 3`), the
 riscv64 128-hart and the x86_64 512-vCPU boundaries once each, and the memory
-variation once, so every tag boots at each boundary CPU count. A
-failure blocks the tag, MUST be filed as an Issue, and is bisected over the
-release's PRs.
+variation once, so every tag boots at each boundary CPU count. A run whose
+outcome is not a pass, as When the runs are owed classifies outcomes, blocks the
+tag, MUST be filed as an Issue, and is bisected over the release's PRs.
 
 **Documentation-only and comment-only changes.** A diff that, Markdown
 aside, alters only comment lines in source files cannot change program

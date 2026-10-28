@@ -132,17 +132,16 @@ claims.
    owed run with its `--runs` count and the head it ran at, and the PR's
    own non-inert changes to that run's surface MUST be the same at that head
    and at the PR head; or, when none is owed, the body MUST say so and why.
-   FAIL when an owed run is missing, its count is below the one that
-   section requires, its head is absent or does not cover the PR head, or
-   it is reported as HANG or FAIL; when a "none owed" statement is absent
-   or contradicted by the PR's own diff or a stated concurrency-fix
-   purpose; when a run counted as passing has an outcome other than `PASS`
-   (a `QEMU-CRASH` run counts only when it was run again and its log is
-   linked); and, for a run the body reports that the PR does not owe, when
-   it is a memory variation that HANGs or fails, or a boundary run that
-   HANGs or fails and the body gives no link to its record on the open
-   Issue for that boundary, or that fails with a defect no open Issue for
-   that boundary names. A run the PR does not owe that passed is not a
+   FAIL when an owed run is missing, its count is below the one that section
+   requires, its head is absent or does not cover the PR head, or its
+   reported outcome is anything other than `PASS` (a `QEMU-CRASH` run is
+   replaced by its re-run, whose outcome stands); when a "none owed"
+   statement is absent or contradicted by the PR's own diff or a stated
+   concurrency-fix purpose; and, for a run the body reports that the PR does
+   not owe, when it is a memory variation that HANGs or fails, or a boundary
+   run that HANGs or fails and the body gives no link to its record on the
+   open Issue for that boundary, or that fails with a defect no open Issue
+   for that boundary names. A run the PR does not owe that passed is not a
    FAIL.
 
    CPU-count width: a non-inert line the PR's own diff adds that introduces

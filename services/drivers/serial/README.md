@@ -47,7 +47,7 @@ not a service
 devmgr answers [`devmgr_labels::QUERY_SERIAL_DEVICE`] by minting
 a `SEND_GRANT` cap on the driver's service endpoint badged with
 [`serial_labels::WRITE_AUTHORITY`] | [`serial_labels::READ_AUTHORITY`],
-mirroring the `QUERY_BLOCK_DEVICE` flow. The caller's devmgr-registry badge
+mirroring the `QUERY_BLOCK_DEVICE` reply shape. The caller's devmgr-registry badge
 must carry `REGISTRY_QUERY_AUTHORITY`.
 
 The boot-phase ownership of console output (bootloader → kernel early console →

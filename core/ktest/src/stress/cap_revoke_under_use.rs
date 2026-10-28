@@ -5,9 +5,10 @@
 
 //! Stress test: revoke while derived capabilities are actively used.
 //!
-//! `NUM_CHILDREN` threads send on derived caps in a tight loop. The parent
-//! revokes the root cap mid-flight. Children detect errors and exit.
-//! Verifies no kernel panic or use-after-free occurs.
+//! `NUM_CHILDREN` threads send on derived caps in a tight loop. Once every
+//! child has reported that it is sending, the parent revokes the root cap
+//! mid-flight. Children detect errors and exit. Verifies no kernel panic or
+//! use-after-free occurs.
 //!
 //! `BALLAST_CHILDREN` extra derived caps pad the subtree past one revoke
 //! batch (`MAX_REVOKE_EDITS` in the kernel), so the revoke runs multi-batch
@@ -17,7 +18,7 @@
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, cap_derive, cap_revoke, notification_send,
-    notification_wait, thread_exit, thread_sleep,
+    notification_wait, thread_exit,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -32,12 +33,15 @@ struct SenderArgs
 {
     sig: u32,
     done: u32,
+    /// Signal copy of the parent's `sending` notification.
+    sending: u32,
     bit_index: u64,
 }
 
 static SENDER_ARGS: spawn::ArgBlock<SenderArgs, NUM_CHILDREN> = spawn::ArgBlock::new(SenderArgs {
     sig: 0,
     done: 0,
+    sending: 0,
     bit_index: 0,
 });
 
@@ -47,6 +51,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_revoke_under_use: create root failed")?;
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_revoke_under_use: create done failed")?;
+    let sending = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "cap_revoke_under_use: create sending failed")?;
 
     // Derive NUM_CHILDREN children from root.
     let mut derived = [0u32; NUM_CHILDREN];
@@ -76,6 +82,8 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "cap_revoke_under_use: cap_copy sig failed")?;
         let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "cap_revoke_under_use: cap_copy done failed")?;
+        let child_sending = cap_copy(sending, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+            .map_err(|_| "cap_revoke_under_use: cap_copy sending failed")?;
 
         // SAFETY: child `i` has not been started yet; the block is reused
         // only after every child has been reaped.
@@ -85,6 +93,7 @@ pub fn run(ctx: &TestContext) -> TestResult
                 SenderArgs {
                     sig: child_sig,
                     done: child_done,
+                    sending: child_sending,
                     bit_index: i as u64,
                 },
             )
@@ -98,16 +107,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         cspaces[i] = child.cs;
     }
 
-    // Let the children (strictly below this thread's priority) run for a
-    // while before revoking.
-    let _ = thread_sleep(2);
-
-    // Revoke root — all derived caps become invalid. Children will start
-    // getting errors on their sends and exit.
-    cap_revoke(root).map_err(|_| "cap_revoke_under_use: cap_revoke failed")?;
-
-    // Wait for all children to report done. Each child sends a unique bit.
-    // At NUM_CHILDREN=64 the bitmask saturates the u64.
+    // Each child sends a unique bit on `sending` and on `done`. At
+    // NUM_CHILDREN=64 the bitmask saturates the u64.
     let all_done: u64 = if NUM_CHILDREN >= 64
     {
         u64::MAX
@@ -116,6 +117,22 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         (1u64 << NUM_CHILDREN) - 1
     };
+
+    // Revoke once every child is sending (they sit strictly below this
+    // thread's priority, so the bounded wait also cedes them this CPU).
+    let mut sending_bits = 0u64;
+    crate::tally::await_all(
+        sending,
+        &mut sending_bits,
+        all_done,
+        "cap_revoke_under_use: a child never started sending",
+    )?;
+
+    // Revoke root — all derived caps become invalid. Children will start
+    // getting errors on their sends and exit.
+    cap_revoke(root).map_err(|_| "cap_revoke_under_use: cap_revoke failed")?;
+
+    // Wait for all children to report done.
     let mut done_bits: u64 = 0;
     while done_bits != all_done
     {
@@ -139,6 +156,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     cap_delete(root).map_err(|_| "cap_revoke_under_use: root delete failed (marker leak?)")?;
     cap_delete(done).ok();
+    cap_delete(sending).ok();
     Ok(())
 }
 
@@ -148,14 +166,24 @@ extern "C" fn sender_loop_entry(arg: u64) -> !
     let SenderArgs {
         sig: sig_slot,
         done: done_slot,
+        sending,
         bit_index,
     } = unsafe { spawn::child_args(arg) };
     let done_bit = 1u64 << bit_index;
 
-    // Send in a tight loop until the cap is revoked.
+    // Send in a tight loop until the cap is revoked, reporting once the
+    // first send is made (whatever its result; a failed report fails the
+    // parent's bounded wait for the bit).
+    let mut reported = false;
     loop
     {
-        if notification_send(sig_slot, 0x1).is_err()
+        let sent = notification_send(sig_slot, 0x1);
+        if !reported
+        {
+            notification_send(sending, done_bit).ok();
+            reported = true;
+        }
+        if sent.is_err()
         {
             break;
         }

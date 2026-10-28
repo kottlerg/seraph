@@ -61,6 +61,15 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// Stop/start races per wait kind.
 const CYCLES: u32 = 150;
 
+/// Fewest races per kind at any width: a stop cancels the park in a good
+/// share of the races of every kind, so a few dozen races still cancel some.
+const MIN_CYCLES: u32 = 32;
+
+/// The races per kind this boot runs: [`CYCLES`], fewer past 16 CPUs (see
+/// [`super::scaled_attempts`]). Set before any peer starts; the peers read
+/// it to know their last cycle.
+static ROUNDS: AtomicU32 = AtomicU32::new(CYCLES);
+
 /// Bits the controller's rescue send delivers to a notification peer.
 const RESCUE_BITS: u64 = 0x5A;
 
@@ -97,13 +106,13 @@ const RESULT_BAD: u32 = 3;
 
 /// Peer → controller handshake: the cycle the peer is about to park in, and
 /// the cycle whose result it has published in [`RESULT`]. Cycles count from
-/// 1; a peer exits after publishing cycle [`CYCLES`].
+/// 1; a peer exits after publishing cycle [`ROUNDS`].
 static PARKING: AtomicU32 = AtomicU32::new(0);
 static FINISHED: AtomicU32 = AtomicU32::new(0);
 static RESULT: AtomicU32 = AtomicU32::new(0);
 /// Controller → peer: the last cycle whose result the controller consumed. A
 /// peer starts cycle `n + 1` only after `ACKED == n`, and exits only after
-/// `ACKED == CYCLES`, so it never runs ahead of the race it is part of.
+/// `ACKED == ROUNDS`, so it never runs ahead of the race it is part of.
 static ACKED: AtomicU32 = AtomicU32::new(0);
 
 /// IPC buffers for the call peer and the server (one live user each).
@@ -132,6 +141,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         crate::log("ktest: stress::stop_park_race SKIP (need 2+ CPUs)");
         return Ok(());
     }
+    // Each race's cross-CPU stop drain and restart grow with the width; the
+    // count shrinks with it.
+    ROUNDS.store(
+        super::scaled_attempts(CYCLES, MIN_CYCLES, cpus),
+        Ordering::Release,
+    );
     thread_set_affinity(ctx.thread_cap, 0)
         .map_err(|_| "stress::stop_park_race: pin controller failed")?;
     let server_cpu = u32::try_from(2 % cpus).unwrap_or(0);
@@ -180,7 +195,7 @@ struct PhaseObjects
     server: Option<spawn::SpawnedChild>,
 }
 
-/// Run [`CYCLES`] stop/start races against one peer of `kind`; returns how
+/// Run [`ROUNDS`] stop/start races against one peer of `kind`; returns how
 /// many ended `Interrupted`. Everything the phase created is deleted on
 /// every path, the race's own error taking precedence.
 fn phase(ctx: &TestContext, kind: Kind, server_cpu: u32) -> Result<u64, &'static str>
@@ -197,7 +212,7 @@ fn phase(ctx: &TestContext, kind: Kind, server_cpu: u32) -> Result<u64, &'static
     let result = setup(ctx, kind, server_cpu, &mut objects, &mut peer).and_then(|()| {
         let peer_th = peer.as_ref().map_or(0, |p: &spawn::SpawnedChild| p.th);
         let mut interrupted = 0u64;
-        for cycle in 1..=CYCLES
+        for cycle in 1..=ROUNDS.load(Ordering::Acquire)
         {
             if race_once(kind, peer_th, objects.source, cycle)?
             {
@@ -386,7 +401,8 @@ fn elapsed_us() -> Result<u64, &'static str>
 /// Peer loop: announce each cycle's park, run it, classify and publish.
 fn peer_loop(mut park: impl FnMut() -> u32) -> !
 {
-    for cycle in 1..=CYCLES
+    let rounds = ROUNDS.load(Ordering::Acquire);
+    for cycle in 1..=rounds
     {
         while ACKED.load(Ordering::Acquire) != cycle - 1
         {
@@ -400,7 +416,7 @@ fn peer_loop(mut park: impl FnMut() -> u32) -> !
     // Exit only once the last race is over: a park that returned at once (a
     // rescue left pending by an earlier cycle) must not let the thread exit
     // before the controller's stop lands.
-    while ACKED.load(Ordering::Acquire) != CYCLES
+    while ACKED.load(Ordering::Acquire) != rounds
     {
         core::hint::spin_loop();
     }

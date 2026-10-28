@@ -39,8 +39,10 @@
 //! `stop_reply_race`/`stop_resume_race`) the guard proves the *armable setup*,
 //! not the exact stolen interleaving:
 //!   * **Churn volume** — clients fold completed round-trips into [`ROUNDTRIPS`];
-//!     the controller asserts `== NUM_PAIRS * ITERS` (every client completed
-//!     every round-trip ⇒ the mid-handoff transients were generated densely).
+//!     the controller asserts `== NUM_PAIRS` times the round-trips each client
+//!     issued ([`ITERS`], fewer past 16 CPUs: see
+//!     [`super::scaled_attempts`]), so every client completed every
+//!     round-trip ⇒ the mid-handoff transients were generated densely.
 //!   * **Cross-CPU migration of unpinned threads** — each client samples
 //!     `system_info(CurrentCpu)` and a client whose samples span ≥ 2 CPUs
 //!     provably migrated; the controller asserts [`MIGRATIONS`] `>= 1` (≥ 1
@@ -74,7 +76,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
-    notification_send, notification_wait, system_info, thread_exit, thread_sleep,
+    notification_send, notification_wait, system_info, thread_exit,
 };
 use syscall_abi::{RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, SystemInfoType};
 
@@ -92,11 +94,17 @@ const NUM_PAIRS: usize = 16;
 /// translation blocks never expose the still-`current` window), which the
 /// burn-in matrix repetition amplifies to near-certain detection, while the
 /// cell stays ~2–3 s on riscv64 TCG, well inside ktest's 180 s suite budget.
-const ITERS: usize = 16000;
+const ITERS: u32 = 16000;
+
+/// Fewest round-trips per client at any width ([`super::scaled_attempts`]):
+/// the widths the migration guard checks (up to [`MIGRATION_GUARD_MAX_CPUS`])
+/// keep at least half of [`ITERS`], and past them the floor keeps every
+/// client issuing round-trips long enough to be stolen mid-handoff.
+const MIN_ITERS: u32 = 1000;
 
 /// Sample `CurrentCpu` every this many round-trips (bounds the witness syscall
 /// overhead while still catching migrations across the run).
-const SAMPLE_EVERY: usize = 64;
+const SAMPLE_EVERY: u32 = 64;
 
 /// Widest guest for which the `migrations >= 1` guard is asserted: the bound of
 /// the one-hot `u32` CPU witness (`sample_cpu_bit` masks indices mod 32), and
@@ -141,11 +149,31 @@ struct ClientArgs
     done: u32,
     /// Client index: its IPC buffer and its `done` bit.
     idx: usize,
+    /// Round-trips to issue.
+    iters: u32,
 }
 
 static CLIENT_ARGS: spawn::ArgBlock<ClientArgs, NUM_PAIRS> = spawn::ArgBlock::new(ClientArgs {
     ep: 0,
     done: 0,
+    idx: 0,
+    iters: 0,
+});
+
+/// Per-server arguments, handed to `server_entry` by address.
+#[derive(Clone, Copy)]
+struct ServerArgs
+{
+    ep: u32,
+    /// Signal copy of the controller's `ready` notification.
+    ready: u32,
+    /// Server index: its `ready` bit; its IPC buffer is `NUM_PAIRS + idx`.
+    idx: usize,
+}
+
+static SERVER_ARGS: spawn::ArgBlock<ServerArgs, NUM_PAIRS> = spawn::ArgBlock::new(ServerArgs {
+    ep: 0,
+    ready: 0,
     idx: 0,
 });
 
@@ -168,7 +196,13 @@ pub fn run(ctx: &TestContext) -> TestResult
     OBSERVED_CPUS.store(0, Ordering::Relaxed);
     MIGRATIONS.store(0, Ordering::Relaxed);
 
+    // Every round-trip's cross-CPU reply grows costlier with the width; the
+    // count shrinks with it.
+    let iters = super::scaled_attempts(ITERS, MIN_ITERS, cpus);
+
     let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "stress::load_balance_handoff_steal: cap_create_notification failed")?;
+    let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::load_balance_handoff_steal: cap_create_notification failed")?;
 
     let mut server_th = [0u32; NUM_PAIRS];
@@ -178,7 +212,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut eps = [0u32; NUM_PAIRS];
 
     // ── Servers first: pinned round-robin, RECEIVE on a private endpoint. ────
-    // Spawned before clients so they reach `ipc_recv` and reply fast.
+    // Started, and reported entering `ipc_recv`, before the clients, so they
+    // reply fast.
     for j in 0..NUM_PAIRS
     {
         let ep = cap_create_endpoint(ctx.memory_base)
@@ -189,10 +224,19 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::load_balance_handoff_steal: spawn server failed")?;
         let server_ep = cap_copy(ep, server.cs, RIGHTS_EP_RECEIVE)
             .map_err(|_| "stress::load_balance_handoff_steal: cap_copy server ep failed")?;
-        // arg packs ep_slot[31:0] | buf_index[63:32]; servers use buffers
-        // [NUM_PAIRS, 2*NUM_PAIRS).
-        let buf_index = NUM_PAIRS + j;
-        let server_arg = u64::from(server_ep) | ((buf_index as u64) << 32);
+        let server_ready = cap_copy(ready, server.cs, RIGHTS_SIGNAL)
+            .map_err(|_| "stress::load_balance_handoff_steal: cap_copy server ready failed")?;
+        // SAFETY: server `j` has not been started yet; each is started once.
+        let server_arg = unsafe {
+            SERVER_ARGS.publish(
+                j,
+                ServerArgs {
+                    ep: server_ep,
+                    ready: server_ready,
+                    idx: j,
+                },
+            )
+        };
         // j < NUM_PAIRS <= u32::MAX; try_from keeps the narrow cast clippy-clean.
         let server_cpu = u32::try_from(j).unwrap_or(0) % cpu_mod;
         // SAFETY: server stacks occupy [NUM_PAIRS, 2*NUM_PAIRS); distinct per j.
@@ -204,7 +248,23 @@ pub fn run(ctx: &TestContext) -> TestResult
         server_cs[j] = server.cs;
     }
 
-    let _ = thread_sleep(2);
+    // Start the clients once every server is entering its first `ipc_recv`.
+    // A call that beats its server's receive queues and is received anyway.
+    let all_servers: u64 = if NUM_PAIRS >= 64
+    {
+        u64::MAX
+    }
+    else
+    {
+        (1u64 << NUM_PAIRS) - 1
+    };
+    let mut ready_bits = 0u64;
+    crate::tally::await_all(
+        ready,
+        &mut ready_bits,
+        all_servers,
+        "stress::load_balance_handoff_steal: a server never reached its receive",
+    )?;
 
     // ── Clients: UNPINNED (AFFINITY_ANY) so the balancer may steal them. ─────
     for i in 0..NUM_PAIRS
@@ -223,6 +283,7 @@ pub fn run(ctx: &TestContext) -> TestResult
                     ep: client_ep,
                     done: client_done,
                     idx: i,
+                    iters,
                 },
             )
         };
@@ -234,7 +295,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         client_cs[i] = client.cs;
     }
 
-    // Wait until every client has completed its ITERS round-trips and signaled.
+    // Wait until every client has completed its round-trips and signaled.
     let all_done: u64 = if NUM_PAIRS >= 64
     {
         u64::MAX
@@ -273,6 +334,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         cap_delete(ep).map_err(|_| "stress::load_balance_handoff_steal: cap_delete ep failed")?;
     }
     cap_delete(done).map_err(|_| "stress::load_balance_handoff_steal: cap_delete done failed")?;
+    cap_delete(ready).map_err(|_| "stress::load_balance_handoff_steal: cap_delete ready failed")?;
 
     // ── Anti-vacuous guard. ──────────────────────────────────────────────────
     let roundtrips = ROUNDTRIPS.load(Ordering::Relaxed);
@@ -291,7 +353,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         u64::from(migrations),
     );
 
-    let expected = u64::try_from(NUM_PAIRS).unwrap_or(0) * u64::try_from(ITERS).unwrap_or(0);
+    let expected = u64::try_from(NUM_PAIRS).unwrap_or(0) * u64::from(iters);
     if roundtrips != expected
     {
         return Err("stress::load_balance_handoff_steal: not all round-trips completed");
@@ -313,7 +375,12 @@ pub fn run(ctx: &TestContext) -> TestResult
 extern "C" fn client_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this client.
-    let ClientArgs { ep, done, idx } = unsafe { spawn::child_args(arg) };
+    let ClientArgs {
+        ep,
+        done,
+        idx,
+        iters,
+    } = unsafe { spawn::child_args(arg) };
     let done_bit = 1u64 << idx;
 
     // SAFETY: client `idx` is the sole user of IPC_BUFS[idx] this run.
@@ -327,7 +394,7 @@ extern "C" fn client_entry(arg: u64) -> !
     let msg = IpcMessage::new(0);
     let mut completed = 0u64;
     let mut cpu_mask = sample_cpu_bit();
-    for n in 0..ITERS
+    for n in 0..iters
     {
         // SAFETY: `buf` was registered as this thread's IPC buffer above.
         if unsafe { ipc::ipc_call(ep, &msg, buf) }.is_ok()
@@ -352,13 +419,12 @@ extern "C" fn client_entry(arg: u64) -> !
 
 /// Server: reply to every call on its private endpoint until torn down. Pinned
 /// round-robin so its reply tends to wake the client from a different CPU.
-// cast_possible_truncation: the low half is the ep slot, the high half the
-// buffer index.
-#[allow(clippy::cast_possible_truncation)]
+/// Reports on `ready` just before its first receive.
 extern "C" fn server_entry(arg: u64) -> !
 {
-    let ep = (arg & 0xFFFF_FFFF) as u32;
-    let buf_index = (arg >> 32) as usize;
+    // SAFETY: `arg` is the entry `run` published for this server.
+    let ServerArgs { ep, ready, idx } = unsafe { spawn::child_args(arg) };
+    let buf_index = NUM_PAIRS + idx;
 
     // SAFETY: server `buf_index` is the sole user of IPC_BUFS[buf_index] this run.
     let buf = unsafe { core::ptr::addr_of_mut!(IPC_BUFS[buf_index]) }.cast::<u64>();
@@ -368,6 +434,8 @@ extern "C" fn server_entry(arg: u64) -> !
     }
 
     let reply = IpcMessage::new(0);
+    // A failed send fails the controller's bounded wait for the bit.
+    notification_send(ready, 1u64 << idx).ok();
     loop
     {
         // SAFETY: `buf` was registered as this thread's IPC buffer above.

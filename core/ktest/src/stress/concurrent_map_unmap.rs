@@ -6,18 +6,25 @@
 //! Stress test: concurrent memory map/unmap from multiple threads.
 //!
 //! `NUM_CHILDREN` threads each map and unmap a distinct VA range
-//! repeatedly, sharing the same address space. Exercises page table
-//! lock contention and TLB shootdown under load.
+//! `MAP_ITERATIONS` times (fewer past 16 CPUs, see
+//! [`super::scaled_attempts`]), sharing the same address space. Exercises
+//! page table lock contention and TLB shootdown under load.
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, mem_map, mem_unmap, notification_send,
-    notification_wait, thread_exit,
+    notification_wait, system_info, thread_exit,
 };
+use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CHILDREN: usize = 16;
-const MAP_ITERATIONS: usize = 1000;
+const MAP_ITERATIONS: u32 = 1000;
+
+/// Fewest iterations per child at any width: every unmap broadcasts a
+/// shootdown to the CPUs running the address space, so a few dozen still
+/// contend the page-table lock and the shootdown from every child.
+const MIN_MAP_ITERATIONS: u32 = 64;
 
 // Each child owns one bit of the `done` word below bit 32 (bit 32 is the
 // error indicator), so the encoding holds for NUM_CHILDREN <= 32; this
@@ -32,6 +39,8 @@ struct MapperArgs
     memory: u32,
     aspace: u32,
     done_bit: u64,
+    /// Map/unmap iterations to run.
+    iterations: u32,
 }
 
 static MAPPER_ARGS: spawn::ArgBlock<MapperArgs, NUM_CHILDREN> = spawn::ArgBlock::new(MapperArgs {
@@ -39,6 +48,7 @@ static MAPPER_ARGS: spawn::ArgBlock<MapperArgs, NUM_CHILDREN> = spawn::ArgBlock:
     memory: 0,
     aspace: 0,
     done_bit: 0,
+    iterations: 0,
 });
 
 /// Base VA for stress mappings, well above normal test VAs.
@@ -48,6 +58,11 @@ const VA_STRIDE: u64 = 0x1_0000;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
+    let cpus = system_info(SystemInfoType::CpuCount as u64)
+        .map_err(|_| "concurrent_map_unmap: system_info(CpuCount) failed")?;
+    // Each unmap's shootdown reaches more CPUs, and costs more, with the
+    // width; the count shrinks with it.
+    let iterations = super::scaled_attempts(MAP_ITERATIONS, MIN_MAP_ITERATIONS, cpus);
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "concurrent_map_unmap: create done failed")?;
 
@@ -90,6 +105,7 @@ pub fn run(ctx: &TestContext) -> TestResult
                     memory: child_memory,
                     aspace: child_aspace,
                     done_bit,
+                    iterations,
                 },
             )
         };
@@ -161,13 +177,14 @@ extern "C" fn mapper_entry(arg: u64) -> !
         memory: memory_cap,
         aspace,
         done_bit,
+        iterations,
     } = unsafe { spawn::child_args(arg) };
 
     // Determine our child index from done_bit (1<<i → i).
     let child_idx = done_bit.trailing_zeros() as usize;
     let va = VA_PER_CHILD[child_idx].load(core::sync::atomic::Ordering::Acquire);
 
-    for _ in 0..MAP_ITERATIONS
+    for _ in 0..iterations
     {
         if mem_map(memory_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
         {

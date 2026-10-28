@@ -29,7 +29,8 @@
 //! handler on CPU 2 loops: spin a varying delay (so the faulter is usually
 //! queued before the receive), receive, map the page, reply `RESUME`, and
 //! count the reply if it returned `Ok`. The controller, pinned to CPU 0, runs
-//! [`CYCLES`] rounds: wait for a fault attempt in flight and for the handler's
+//! [`CYCLES`] rounds (fewer past 16 CPUs, see [`super::scaled_attempts`]):
+//! wait for a fault attempt in flight and for the handler's
 //! next receive entry, spin a varying phase (short on odd rounds, so stops
 //! cluster around the dequeue; long on even ones, so they also land after the
 //! reply), stop the faulter, restart it, and wait for it to complete the fault
@@ -78,6 +79,11 @@ const CELL: &str = "stress::stop_fault_sender";
 
 /// Stop/start rounds.
 const CYCLES: u32 = 1000;
+
+/// Fewest rounds at any width. A stop that lands in a fault the faulter then
+/// completes is the rarest outcome the cell requires, a few rounds in a
+/// hundred, so the floor keeps over a hundred rounds.
+const MIN_CYCLES: u32 = 128;
 
 /// The controller's, the faulter's, and the handler's CPUs. The syncer shares
 /// the faulter's: it runs only while no faulter does (after a death, and after
@@ -262,7 +268,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::stop_fault_sender: pin controller failed")?;
-    let result = with_parts(ctx);
+    // Each round's cross-CPU stop drain, fault delivery and respawn grow with
+    // the width; the count shrinks with it.
+    let result = with_parts(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus));
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_fault_sender: restore controller affinity failed");
     let tally = result?;
@@ -339,14 +347,14 @@ fn report(tally: &Tally) -> TestResult
     Ok(())
 }
 
-/// Create the endpoint, the page, and the children, run the rounds, end the
-/// children, and release everything whatever the outcome.
-fn with_parts(ctx: &TestContext) -> Result<Tally, &'static str>
+/// Create the endpoint, the page, and the children, run `cycles` rounds, end
+/// the children, and release everything whatever the outcome.
+fn with_parts(ctx: &TestContext, cycles: u32) -> Result<Tally, &'static str>
 {
     let mut parts = Parts::default();
     let result = setup(ctx, &mut parts).and_then(|()| {
         let mut tally = Tally::default();
-        let ran = rounds(ctx, &mut parts, &mut tally);
+        let ran = rounds(ctx, &mut parts, &mut tally, cycles);
         let ended = finish(&mut parts, &mut tally);
         ran?;
         ended?;
@@ -482,10 +490,10 @@ fn await_handler_ready(handler: u32) -> TestResult
     Err("stress::stop_fault_sender: the handler never registered its IPC buffer")
 }
 
-/// Run [`CYCLES`] rounds, respawning the faulter after each death.
-fn rounds(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally) -> TestResult
+/// Run `cycles` rounds, respawning the faulter after each death.
+fn rounds(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally, cycles: u32) -> TestResult
 {
-    for cycle in 0..CYCLES
+    for cycle in 0..cycles
     {
         if parts.faulter.is_none()
         {

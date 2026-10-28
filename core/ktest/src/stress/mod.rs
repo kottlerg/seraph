@@ -77,6 +77,44 @@ const MAX_STRESS_THREADS: usize = 64;
 // Each test uses distinct indices.
 static mut STRESS_STACKS: [ChildStack; MAX_STRESS_THREADS] = [ChildStack::ZERO; MAX_STRESS_THREADS];
 
+/// The widest CPU count at which a round-based cell makes its full number
+/// of attempts. Past it a boot is an oversubscribed boundary run, where
+/// every attempt hands work between CPUs whose host threads wait for a host
+/// core, so an attempt's wall time grows with the width. What such a run
+/// exists to reach (CPU bringup, CPU-mask widths, IPIs to high CPU indices)
+/// does not depend on how many attempts a cell makes, and a race that needs
+/// many attempts gets them at the narrower widths and from repeated runs.
+const FULL_ATTEMPTS_CPUS: u64 = 16;
+
+/// The attempts a round-based cell makes on a `cpus`-CPU boot: `base` up to
+/// [`FULL_ATTEMPTS_CPUS`] CPUs, and past it `base` scaled down by
+/// `FULL_ATTEMPTS_CPUS / cpus`, so the cell's wall time stays bounded under
+/// oversubscription. Never fewer than `floor` (the attempts the cell's
+/// anti-vacuous gates need at any width) nor more than `base`.
+fn scaled_attempts(base: u32, floor: u32, cpus: u64) -> u32
+{
+    if cpus <= FULL_ATTEMPTS_CPUS
+    {
+        return base;
+    }
+    let scaled = u64::from(base) * FULL_ATTEMPTS_CPUS / cpus;
+    u32::try_from(scaled).unwrap_or(base).max(floor).min(base)
+}
+
+/// The placement slot of `cycle`, out of `cycles`, for a cell that rotates
+/// its pinned children over `span` CPUs: consecutive cycles step by
+/// `span / cycles` slots (at least 1), so a cell whose scaled count is below
+/// the width still spreads its placements over every CPU index range. With
+/// `cycles >= span` it is `cycle % span`.
+fn rotation_slot(cycle: u32, cycles: u32, span: u32) -> u32
+{
+    let span = span.max(1);
+    let stride = (span / cycles.max(1)).max(1);
+    let slot = u64::from(cycle) * u64::from(stride) % u64::from(span);
+    // slot < span, a u32.
+    u32::try_from(slot).unwrap_or(0)
+}
+
 /// Run all stress tests.
 pub fn run_all(ctx: &TestContext)
 {

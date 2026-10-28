@@ -33,8 +33,10 @@
 //! Each cycle pins the client and server to **different** CPUs, so the dealloc
 //! (running on the controller's CPU) and the client's wake-enqueue (targeting
 //! the client's pinned CPU) cross cores — the cross-CPU wake path that strands
-//! the waiter. The server receives the client (arming `reply_tcb = client`),
-//! announces the armed window, then dies without replying. The controller then
+//! the waiter. The client reports that it is entering `ipc_call` before the
+//! controller starts the server, so the call is usually queued first. The
+//! server receives the client (arming `reply_tcb = client`), announces the
+//! armed window, then dies without replying. The controller then
 //! `cap_delete`s the server, which owes the client an `Interrupted` wake.
 //!
 //! ## Liveness gate (not just anti-vacuous)
@@ -48,7 +50,7 @@
 //! and the softlockup watchdog fires (its registry walk names the stranded
 //! `BlockedOnReply` client and the server it is parked on). The hang is raised
 //! by the kernel, not by a test assertion — `BIT_SERVER_ARMED` proves the race
-//! armed, and `woke_cycles == CYCLES` proves the liveness path actually ran on
+//! armed, and a wake on every cycle proves the liveness path actually ran on
 //! every cycle rather than passing vacuously.
 //!
 //! ## Pass criterion
@@ -60,7 +62,7 @@
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
-    notification_send, notification_wait, thread_exit, thread_sleep,
+    notification_send, notification_wait, thread_exit,
 };
 use syscall_abi::{RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, SyscallError, SystemInfoType};
 
@@ -68,7 +70,11 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 
 /// Reply-wake races to run. Higher than `stop_reply_race`'s 300: the lost wake
 /// is rarer than the #317 UAF, so give the cross-CPU strand many chances.
-const CYCLES: usize = 2000;
+const CYCLES: u32 = 2000;
+
+/// Fewest races at any width ([`super::scaled_attempts`]): the gates hold on
+/// every cycle, so the floor only keeps the cross-CPU strand tried often.
+const MIN_CYCLES: u32 = 64;
 
 /// Notification NOTIFY right — what a child needs to `notification_send`.
 const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
@@ -87,6 +93,10 @@ const BIT_CLIENT_WOKE: u64 = 1 << 1;
 /// stale `ipc_msg` bytes surfaced as a successful reply — the #361 clobber).
 /// Immediate FAIL with a named error instead of a watchdog hang.
 const BIT_CLIENT_BAD: u64 = 1 << 2;
+
+/// `done` bit the client raises immediately before its `ipc_call`, so the
+/// controller starts the server once the call is about to be queued.
+const BIT_CLIENT_CALLING: u64 = 1 << 3;
 
 /// Bound on the server's post-recv busy-spin, keeping the server TCB live for a
 /// short window after it signals armed so the `cap_delete` lands while the
@@ -118,22 +128,22 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     }
     let cpu_mod = u32::try_from(cpus).unwrap_or(1).max(1);
+    // Each race's starts, wakes and dealloc cross CPUs, whose cost grows with
+    // the width; the count shrinks with it and the placements stay spread.
+    let cycles = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
 
     // Anti-vacuous accumulators: every cycle must arm the reply binding and then
     // observe the client's wake.
-    let mut armed_cycles = 0usize;
-    let mut woke_cycles = 0usize;
+    let mut armed_cycles = 0u32;
+    let mut woke_cycles = 0u32;
 
-    for cycle in 0..CYCLES
+    for cycle in 0..cycles
     {
-        // CYCLES is a compile-time constant well below u32::MAX; try_from keeps
-        // the narrow cast clippy-clean.
-        let cycle_u32 = u32::try_from(cycle).unwrap_or(0);
-        let server_cpu = cycle_u32 % cpu_mod;
+        let server_cpu = super::rotation_slot(cycle, cycles, cpu_mod);
         // Different CPU from the server: the dealloc-free and the client's
         // wake-enqueue must run on different cores to exercise the cross-CPU
-        // strand. With cpus >= 2, `(cycle + 1) % cpus != cycle % cpus`.
-        let client_cpu = (cycle_u32 + 1) % cpu_mod;
+        // strand. With cpus >= 2, `(slot + 1) % cpus != slot`.
+        let client_cpu = (server_cpu + 1) % cpu_mod;
 
         let ep = cap_create_endpoint(ctx.memory_base)
             .map_err(|_| "stress::cap_delete_reply_wake: cap_create_endpoint failed")?;
@@ -161,10 +171,17 @@ pub fn run(ctx: &TestContext) -> TestResult
         )
         .map_err(|_| "stress::cap_delete_reply_wake: start client failed")?;
 
-        // Let the client reach `ipc_call` and park on the endpoint send queue
-        // before the server receives it (the children run strictly below
-        // this thread's priority, so it must block).
-        let _ = thread_sleep(1);
+        // Start the server once the client is entering `ipc_call`, so the
+        // call is usually queued before the server receives. A server that
+        // receives first takes the call when it comes; the armed wait below
+        // proves the client parked either way.
+        let mut acc = 0u64;
+        while acc & BIT_CLIENT_CALLING == 0
+        {
+            let bits = notification_wait(done)
+                .map_err(|_| "stress::cap_delete_reply_wake: notification_wait(calling) failed")?;
+            acc |= bits;
+        }
 
         // ── Server child: RECEIVE on ep, signal on done. ────────────────────
         let server = spawn::new_child(ctx)
@@ -189,7 +206,6 @@ pub fn run(ctx: &TestContext) -> TestResult
         // only after `ipc_recv` returns, so its arrival proves the client is
         // `BlockedOnReply` on this server — the live window in which
         // `reply_tcb = client` and the reply-wake is owed.
-        let mut acc = 0u64;
         while acc & BIT_SERVER_ARMED == 0
         {
             let bits = notification_wait(done)
@@ -240,12 +256,12 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Non-vacuous on both halves: every cycle armed the reply binding and then
     // observed the owed wake, so a clean boot reflects the dealloc reply-wake
-    // liveness path actually executing CYCLES times.
-    if armed_cycles != CYCLES
+    // liveness path actually executing on every cycle.
+    if armed_cycles != cycles
     {
         return Err("stress::cap_delete_reply_wake: reply binding never armed on some cycle");
     }
-    if woke_cycles != CYCLES
+    if woke_cycles != cycles
     {
         return Err("stress::cap_delete_reply_wake: client wake missing on some cycle");
     }
@@ -315,6 +331,7 @@ extern "C" fn client_entry(arg: u64) -> !
         thread_exit()
     }
 
+    notification_send(done_slot, BIT_CLIENT_CALLING).ok();
     // SAFETY: `buf` was registered as this thread's IPC buffer above.
     let bit = match unsafe { ipc::ipc_call(ep_slot, &IpcMessage::new(0), buf) }
     {

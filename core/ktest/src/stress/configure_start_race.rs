@@ -28,7 +28,8 @@
 //! ## How this exercises it
 //!
 //! A helper, pinned to CPU 1 in ktest's own `CSpace`, serves [`CYCLES`]
-//! rounds. Each round the controller, pinned to CPU 0, creates a thread in
+//! rounds (fewer past 16 CPUs, see [`super::scaled_attempts`]). Each round
+//! the controller, pinned to CPU 0, creates a thread in
 //! ktest's `CSpace`, configures it to enter [`entry_a`] on its own stress
 //! stack with argument [`tag`]`(round, A)`, pins it to CPU 2 (with 3+ CPUs,
 //! an idle CPU that dispatches it at once) or else to CPU 0 (dispatched at
@@ -76,6 +77,10 @@ const CELL: &str = "stress::configure_start_race";
 
 /// Rounds; each races one configure against one start of a fresh thread.
 const CYCLES: u32 = 200;
+
+/// Fewest rounds at any width: the delay sweep puts the start first on
+/// about half the rounds, so a few dozen rounds still see both outcomes.
+const MIN_CYCLES: u32 = 32;
 
 /// CPUs needed: one each for the controller and the helper.
 const MIN_CPUS: u64 = 2;
@@ -170,7 +175,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     };
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "stress::configure_start_race: pin controller failed")?;
-    let result = with_helper(ctx, target_cpu);
+    // Each round's thread creation, cross-CPU start and exit grow with the
+    // width; the count shrinks with it.
+    let cycles = super::scaled_attempts(CYCLES, MIN_CYCLES, cpus);
+    let result = with_helper(ctx, target_cpu, cycles);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::configure_start_race: restore controller affinity failed");
     let tally = result?;
@@ -207,10 +215,10 @@ fn report(tally: &Tally) -> TestResult
 }
 
 /// Reset the cell's state, publish the entries' stacks, start the helper,
-/// run the rounds, end the helper, and delete it whatever the outcome (a
-/// deletion ends a thread wherever it is, so its stack is free for the next
-/// test even after a failed round).
-fn with_helper(ctx: &TestContext, target_cpu: u32) -> Result<Tally, &'static str>
+/// run `cycles` rounds, end the helper, and delete it whatever the outcome
+/// (a deletion ends a thread wherever it is, so its stack is free for the
+/// next test even after a failed round).
+fn with_helper(ctx: &TestContext, target_cpu: u32, cycles: u32) -> Result<Tally, &'static str>
 {
     for counter in [
         &QUIT,
@@ -234,7 +242,7 @@ fn with_helper(ctx: &TestContext, target_cpu: u32) -> Result<Tally, &'static str
     let mut helper = None;
     let result = start_helper(ctx, &mut helper).and_then(|th| {
         let mut tally = Tally::default();
-        let ran = rounds(ctx, target_cpu, &mut tally);
+        let ran = rounds(ctx, target_cpu, cycles, &mut tally);
         let ended = finish(th);
         ran?;
         ended?;
@@ -287,11 +295,11 @@ fn start_helper(ctx: &TestContext, slot: &mut Option<u32>) -> Result<u32, &'stat
     Ok(th)
 }
 
-/// Run [`CYCLES`] rounds, stopping at the first that fails, and count each
+/// Run `cycles` rounds, stopping at the first that fails, and count each
 /// outcome.
-fn rounds(ctx: &TestContext, target_cpu: u32, tally: &mut Tally) -> TestResult
+fn rounds(ctx: &TestContext, target_cpu: u32, cycles: u32, tally: &mut Tally) -> TestResult
 {
-    for seq in 1..=CYCLES
+    for seq in 1..=cycles
     {
         if round(ctx, seq, target_cpu)? == OUTCOME_CONFIGURED
         {

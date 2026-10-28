@@ -10,13 +10,15 @@
 //! [`PageCache::read_sector`] directly; partition-scoping is enforced by
 //! the block driver per the per-badge bound vfsd registered at mount.
 
+use crate::alloc::FatError;
 use crate::bpb::{FatState, FatType, SECTOR_SIZE};
 use crate::cache::PageCache;
 
 /// Look up the next cluster in the FAT chain.
 ///
-/// Returns `Some(next)` for a valid next cluster, `None` for end-of-chain
-/// or bad cluster.
+/// Returns `Some(next)` for a valid next cluster, `None` for end-of-chain,
+/// a bad cluster, a FAT entry naming a cluster outside the data region,
+/// or a failed FAT-sector read.
 // clippy::too_many_lines: next_cluster resolves the on-disk FAT entry for
 // a cluster under FAT16 or FAT32. Both variants share the sector-lookup,
 // cache-check, and sector-load logic; they differ only in the entry-width
@@ -120,15 +122,17 @@ pub fn next_cluster(
         }
     };
 
-    // Clusters 0 and 1 are reserved; a FAT entry pointing at them
-    // means either the chain is corrupt or the FAT-sector read returned
-    // zeros (common failure mode for a racing block driver). Log loud
-    // and stop walking — silent return would mask the real problem.
-    if val < 2
+    // Clusters 0 and 1 are reserved, and a cluster at or past
+    // 2 + total_clusters lies outside the data region; a FAT entry
+    // naming either means the chain is corrupt or the FAT-sector read
+    // returned bad bytes. Log loud and stop walking: a silent return would
+    // mask the real problem, and an out-of-range cluster would address
+    // sectors outside the data region.
+    if !state.is_data_cluster(val)
     {
         std::os::seraph::log!(
-            "WARNING: FAT chain at cluster {cluster} points to reserved cluster \
-             {val} (fat_sector={fat_sector}, entry_offset={entry_offset}) \
+            "WARNING: FAT chain at cluster {cluster} points to cluster {val} outside \
+             the data region (fat_sector={fat_sector}, entry_offset={entry_offset}) \
              — possible block-read corruption"
         );
         return None;
@@ -151,7 +155,14 @@ pub struct FileRead
 /// Walks the cluster chain to find the correct cluster, reads the
 /// relevant sector, and extracts the requested bytes.
 ///
-/// Returns the number of bytes read (written to `out`).
+/// Returns the number of bytes read (written to `out`); 0 at or past
+/// end of file.
+///
+/// # Errors
+/// [`FatError::Corrupt`] when the file's start cluster lies outside the
+/// data region or its chain ends (or leaves the data region) before the
+/// cluster holding `offset`; [`FatError::Io`] when the data sector cannot
+/// be read.
 pub fn read_file_data(
     req: &FileRead,
     state: &mut FatState,
@@ -159,11 +170,15 @@ pub fn read_file_data(
     block_dev: u32,
     ipc_buf: *mut u64,
     out: &mut [u8; SECTOR_SIZE],
-) -> usize
+) -> Result<usize, FatError>
 {
     if req.offset >= u64::from(req.file_size)
     {
-        return 0; // Past EOF.
+        return Ok(0); // Past EOF.
+    }
+    if !state.is_data_cluster(req.start_cluster)
+    {
+        return Err(FatError::Corrupt);
     }
 
     let remaining = u64::from(req.file_size) - req.offset;
@@ -179,18 +194,15 @@ pub fn read_file_data(
     let mut cluster = req.start_cluster;
     for _ in 0..cluster_idx
     {
-        cluster = match next_cluster(state, cluster, cache, block_dev, ipc_buf)
-        {
-            Some(c) => c,
-            None => return 0, // Premature end of chain.
-        };
+        cluster =
+            next_cluster(state, cluster, cache, block_dev, ipc_buf).ok_or(FatError::Corrupt)?;
     }
 
     let sector = state.cluster_to_sector(cluster) + sector_in_cluster;
     let mut sector_buf = [0u8; SECTOR_SIZE];
     if !cache.read_sector(u64::from(sector), block_dev, &mut sector_buf, ipc_buf)
     {
-        return 0;
+        return Err(FatError::Io);
     }
 
     // Extract bytes from the sector.
@@ -198,5 +210,5 @@ pub fn read_file_data(
     let copy_len = to_read.min(available);
     out[..copy_len].copy_from_slice(&sector_buf[offset_in_sector..offset_in_sector + copy_len]);
 
-    copy_len
+    Ok(copy_len)
 }

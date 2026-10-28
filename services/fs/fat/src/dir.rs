@@ -30,7 +30,7 @@ pub use fat_parse::{
     DirEntry, LfnAccum, MAX_LFN_CHARS, MAX_LFN_UTF8, lfn_checksum, name_matches, parse_dir_entry,
     to_upper,
 };
-use fat_parse::{MAX_SLOT_RUN, RemoveRunScan, RemoveStep};
+use fat_parse::{FreeRunScan, RemoveRunScan, RemoveStep};
 // ── Directory search ──────────────────────────────────────────────────────
 
 /// Search a directory's cluster chain for an entry matching `name`.
@@ -276,9 +276,8 @@ fn scan_sector_for_name(
 
 /// Read a directory entry at a given index.
 ///
-/// Skips deleted, LFN, volume-label, and end-of-directory markers
-/// (the slots [`parse_dir_entry`] rejects); counts only valid 8.3
-/// entries. When a valid LFN run precedes the 8.3 entry,
+/// Skips deleted, LFN, and volume-label slots and counts only valid
+/// 8.3 entries; returns `None` at the end-of-directory marker. When a valid LFN run precedes the 8.3 entry,
 /// the assembled UTF-8 name is attached to the returned [`DirEntry`]
 /// for the readdir wire reply; otherwise callers fall back to the
 /// 8.3 form via [`DirEntry::write_display_name`].
@@ -496,6 +495,14 @@ pub struct RemovedEntry
 /// Returns the on-disk location of the placed 8.3 entry so dispatch
 /// can patch its `first_cluster` / `size` fields with
 /// [`update_entry_metadata`] once writes extend the file.
+///
+/// # Errors
+/// [`FatError::Exists`] when the directory already holds an entry of that
+/// name; [`FatError::Corrupt`] for an empty name or one longer than
+/// [`MAX_LFN_CHARS`]; [`FatError::NoSpace`] when no short-name alias or no
+/// free slot run is left (see `find_free_slot_run`); [`FatError::Io`] when
+/// a directory sector read or write fails, possibly after some LFN slots
+/// were written.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_entry(
     state: &mut FatState,
@@ -515,7 +522,7 @@ pub fn insert_entry(
     }
     if find_in_directory(parent_dir_cluster, name, state, cache, block_dev, ipc_buf).is_some()
     {
-        return Err(FatError::NoSpace); // EXISTS — mapped to wire code at dispatch
+        return Err(FatError::Exists);
     }
 
     let sfn = generate_sfn(state, parent_dir_cluster, name, cache, block_dev, ipc_buf)?;
@@ -532,7 +539,7 @@ pub fn insert_entry(
     };
     let total_slots = lfn_slot_count + 1;
 
-    let slots = find_free_slot_run(
+    let scan = find_free_slot_run(
         state,
         parent_dir_cluster,
         total_slots,
@@ -540,6 +547,7 @@ pub fn insert_entry(
         block_dev,
         ipc_buf,
     )?;
+    let slots = scan.run();
 
     // Emit LFN slots in reverse-seq order (high seq with LFN_LAST_FLAG
     // first on disk, seq counts down to 1). The slots iterator gives
@@ -574,11 +582,17 @@ pub fn insert_entry(
 /// Mark an existing directory entry (and any preceding LFN run) as
 /// deleted (`0xE5`).
 ///
-/// Returns the entry's `start_cluster`, `size`, and kind so the caller
-/// can free the data chain via [`free_cluster_chain`]. Directory
-/// removal additionally requires the directory be empty (no entries
-/// other than `.` and `..`); this is the caller's responsibility to
-/// validate before invoking this function.
+/// Returns the entry's `start_cluster` (0 for an empty file), which the
+/// caller passes to [`free_entry_data`]. Directory removal additionally
+/// requires the directory be empty (no entries other than `.` and `..`);
+/// this is the caller's responsibility to validate before invoking this
+/// function.
+///
+/// # Errors
+/// [`FatError::Corrupt`] when no entry of that name is found before the
+/// end of the directory or of its cluster chain; [`FatError::Io`] when a
+/// sector read or a deletion write fails, possibly after some of the
+/// entry's slots are already marked.
 pub fn remove_entry(
     state: &mut FatState,
     parent_dir_cluster: u32,
@@ -629,6 +643,12 @@ pub fn update_entry_metadata(
 /// Check whether a directory cluster chain contains any entries other
 /// than `.` and `..`. Used by `FS_REMOVE` to enforce the
 /// non-empty-directory rejection.
+///
+/// Returns `Ok(true)` when only `.`, `..`, deleted, LFN, or volume-label
+/// slots precede the end of the directory or of its chain.
+///
+/// # Errors
+/// [`FatError::Io`] when a sector read fails.
 pub fn directory_is_empty(
     state: &mut FatState,
     dir_cluster: u32,
@@ -726,11 +746,21 @@ pub fn write_dot_entries(
 
 // ── Mutation internals ────────────────────────────────────────────────────
 
-/// Walk the parent directory entry-by-entry; collect a run of
-/// `count` consecutive free (0x00 or 0xE5) slots. Free runs reset on
-/// any non-free slot, and end-of-directory (0x00) triggers extension
-/// when needed.
-#[allow(clippy::too_many_lines)]
+/// Find a run of `count` consecutive free slots in a directory for a new
+/// entry. [`FreeRunScan`] defines free: deleted slots, the end-of-directory
+/// slot, and every slot after it, so the run continues past the marker
+/// through the rest of the directory before the directory grows. The
+/// driver zeroes every directory cluster it allocates, as format tools do,
+/// so the slot after a run that crossed the marker still reads as end of
+/// directory. A FAT32 directory whose chain ends with the run still short
+/// is extended by a zeroed cluster linked after its last one, and the run
+/// continues into it; the FAT16 fixed root cannot grow.
+///
+/// # Errors
+/// [`FatError::Io`] when a directory sector cannot be read or a new
+/// cluster cannot be zeroed; [`FatError::NoSpace`] when the FAT16 root
+/// area holds no such run or no free cluster remains to extend a FAT32
+/// directory; any other error of [`allocate_cluster`].
 fn find_free_slot_run(
     state: &mut FatState,
     parent_dir_cluster: u32,
@@ -738,14 +768,9 @@ fn find_free_slot_run(
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
-) -> Result<[DirEntryLocation; MAX_SLOT_RUN], FatError>
+) -> Result<FreeRunScan<DirEntryLocation>, FatError>
 {
-    debug_assert!(count <= MAX_SLOT_RUN);
-
-    let mut run: [Option<DirEntryLocation>; MAX_SLOT_RUN] = [None; MAX_SLOT_RUN];
-    let mut run_len = 0usize;
-
-    let entries_per_sector = SECTOR_SIZE / 32;
+    let mut scan = FreeRunScan::new(count);
     let mut buf = Box::new([0u8; SECTOR_SIZE]);
 
     // FAT16 fixed root.
@@ -753,30 +778,20 @@ fn find_free_slot_run(
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(512);
+        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE as u32);
         for s in 0..root_sectors
         {
-            match scan_sector_free_run(
+            if scan_sector_free_run(
                 root_start + s,
-                count,
                 cache,
                 block_dev,
                 ipc_buf,
                 &mut buf,
-                entries_per_sector,
-                &mut run,
-                &mut run_len,
+                &mut scan,
             )?
             {
-                ScanStop::Done => return collect_run(&run, count),
-                ScanStop::EndOfDirectory => break,
-                ScanStop::Continue =>
-                {}
+                return Ok(scan);
             }
-        }
-        if run_len >= count
-        {
-            return collect_run(&run, count);
         }
         return Err(FatError::NoSpace);
     }
@@ -790,182 +805,66 @@ fn find_free_slot_run(
     {
         parent_dir_cluster
     };
-    let mut last_cluster = cluster;
     loop
     {
         let base_sector = state.cluster_to_sector(cluster);
-        let mut hit_eod = false;
         for s in 0..u32::from(state.sectors_per_cluster)
         {
-            match scan_sector_free_run(
+            if scan_sector_free_run(
                 base_sector + s,
-                count,
                 cache,
                 block_dev,
                 ipc_buf,
                 &mut buf,
-                entries_per_sector,
-                &mut run,
-                &mut run_len,
+                &mut scan,
             )?
             {
-                ScanStop::Done => return collect_run(&run, count),
-                ScanStop::EndOfDirectory =>
-                {
-                    hit_eod = true;
-                    break;
-                }
-                ScanStop::Continue =>
-                {}
+                return Ok(scan);
             }
         }
-        if hit_eod && run_len < count
+        cluster = if let Some(n) = next_cluster(state, cluster, cache, block_dev, ipc_buf)
         {
-            // EoD inside this cluster but run is still short — we need
-            // to either fill the rest of this cluster (next sectors are
-            // implicitly free too) or extend with a new cluster.
-            // Allocate-and-extend handles both: keep walking new
-            // clusters until run_len ≥ count.
-            let new_cluster =
-                allocate_cluster(state, Some(last_cluster), cache, block_dev, ipc_buf)?;
-            zero_cluster(state, new_cluster, cache, block_dev, ipc_buf)?;
-            // The new cluster's first sector at offset 0 continues the
-            // free run.
-            let new_base = state.cluster_to_sector(new_cluster);
-            for s in 0..u32::from(state.sectors_per_cluster)
-            {
-                for e in 0..entries_per_sector
-                {
-                    let loc = DirEntryLocation {
-                        sector_lba: new_base + s,
-                        offset_in_sector: e * 32,
-                    };
-                    run[run_len] = Some(loc);
-                    run_len += 1;
-                    if run_len >= count
-                    {
-                        return collect_run(&run, count);
-                    }
-                }
-            }
-            last_cluster = new_cluster;
-            cluster = new_cluster;
-            continue;
-        }
-        if let Some(n) = next_cluster(state, cluster, cache, block_dev, ipc_buf)
-        {
-            last_cluster = cluster;
-            cluster = n;
+            n
         }
         else
         {
-            // End of cluster chain without seeing 0x00 — every
-            // slot in this chain is used. Extend.
-            let new_cluster =
-                allocate_cluster(state, Some(last_cluster), cache, block_dev, ipc_buf)?;
+            let new_cluster = allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?;
             zero_cluster(state, new_cluster, cache, block_dev, ipc_buf)?;
-            let new_base = state.cluster_to_sector(new_cluster);
-            run_len = 0;
-            for s in 0..u32::from(state.sectors_per_cluster)
-            {
-                for e in 0..entries_per_sector
-                {
-                    let loc = DirEntryLocation {
-                        sector_lba: new_base + s,
-                        offset_in_sector: e * 32,
-                    };
-                    run[run_len] = Some(loc);
-                    run_len += 1;
-                    if run_len >= count
-                    {
-                        return collect_run(&run, count);
-                    }
-                }
-            }
-            last_cluster = new_cluster;
-            cluster = new_cluster;
-        }
+            new_cluster
+        };
     }
 }
 
-fn collect_run(
-    run: &[Option<DirEntryLocation>; MAX_SLOT_RUN],
-    count: usize,
-) -> Result<[DirEntryLocation; MAX_SLOT_RUN], FatError>
-{
-    let mut out = [DirEntryLocation {
-        sector_lba: 0,
-        offset_in_sector: 0,
-    }; MAX_SLOT_RUN];
-    for i in 0..count
-    {
-        out[i] = run[i].ok_or(FatError::Corrupt)?;
-    }
-    Ok(out)
-}
-
-enum ScanStop
-{
-    /// `count` consecutive free slots accumulated; caller can stop.
-    Done,
-    /// End-of-directory sentinel (`0x00`) encountered; caller decides
-    /// whether to extend (FAT32) or fail (FAT16 fixed root).
-    EndOfDirectory,
-    /// Sector finished without reaching either condition; caller
-    /// continues to the next sector.
-    Continue,
-}
-
-#[allow(clippy::too_many_arguments)]
+/// Feed every slot of the directory sector at `sector_lba` to `scan`,
+/// returning `true` once its run is complete. A sector past the
+/// end-of-directory marker is free throughout and is not read.
 fn scan_sector_free_run(
     sector_lba: u32,
-    count: usize,
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
     buf: &mut [u8; SECTOR_SIZE],
-    entries_per_sector: usize,
-    run: &mut [Option<DirEntryLocation>; MAX_SLOT_RUN],
-    run_len: &mut usize,
-) -> Result<ScanStop, FatError>
+    scan: &mut FreeRunScan<DirEntryLocation>,
+) -> Result<bool, FatError>
 {
-    if !cache.read_sector(u64::from(sector_lba), block_dev, buf, ipc_buf)
+    let read = !scan.past_end();
+    if read && !cache.read_sector(u64::from(sector_lba), block_dev, buf, ipc_buf)
     {
         return Err(FatError::Io);
     }
-    for e in 0..entries_per_sector
+    for off in (0..SECTOR_SIZE).step_by(32)
     {
-        let off = e * 32;
+        let first = if read { buf[off] } else { 0x00 };
         let loc = DirEntryLocation {
             sector_lba,
             offset_in_sector: off,
         };
-        let first = buf[off];
-        if first == 0x00
+        if scan.step(first, loc)
         {
-            run[*run_len] = Some(loc);
-            *run_len += 1;
-            if *run_len >= count
-            {
-                return Ok(ScanStop::Done);
-            }
-            return Ok(ScanStop::EndOfDirectory);
-        }
-        if first == 0xE5
-        {
-            run[*run_len] = Some(loc);
-            *run_len += 1;
-            if *run_len >= count
-            {
-                return Ok(ScanStop::Done);
-            }
-        }
-        else
-        {
-            *run_len = 0;
+            return Ok(true);
         }
     }
-    Ok(ScanStop::Continue)
+    Ok(false)
 }
 
 fn zero_cluster(

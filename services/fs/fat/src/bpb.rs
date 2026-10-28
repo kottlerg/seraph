@@ -98,6 +98,13 @@ impl FatState
         fat_parse::cluster_to_sector(self.data_start_sector, self.sectors_per_cluster, cluster)
     }
 
+    /// Whether `cluster` lies in the data region,
+    /// `2 <= cluster < 2 + total_clusters` ([`fat_parse::is_data_cluster`]).
+    pub fn is_data_cluster(&self, cluster: u32) -> bool
+    {
+        fat_parse::is_data_cluster(cluster, self.total_clusters)
+    }
+
     /// Bytes per cluster.
     pub fn cluster_size(&self) -> u32
     {
@@ -110,7 +117,8 @@ impl FatState
 /// Decodes geometry via [`fat_parse::parse_bpb_geometry`], copies it into
 /// `state`, and emits the detection and geometry log lines the driver has
 /// always produced. Returns `false` after logging the reason on an invalid
-/// boot signature or a zero `bytes_per_sector` / `sectors_per_cluster`.
+/// boot signature, a zero `bytes_per_sector` / `sectors_per_cluster`, or a
+/// sector size other than [`SECTOR_SIZE`].
 pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
 {
     let geom = match fat_parse::parse_bpb_geometry(sector_data)
@@ -124,6 +132,11 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
         Err(fat_parse::BpbError::ZeroDivisor) =>
         {
             std::os::seraph::log!("invalid BPB: bytes_per_sector or sectors_per_cluster is zero");
+            return false;
+        }
+        Err(fat_parse::BpbError::UnsupportedSectorSize) =>
+        {
+            std::os::seraph::log!("unsupported BPB: bytes_per_sector is not {SECTOR_SIZE}");
             return false;
         }
     };

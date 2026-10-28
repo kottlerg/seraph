@@ -86,6 +86,18 @@ pub fn phases_pre_relative() -> &'static [Phase]
             name: "fs_write_invariants",
             run: fs_write_invariants_phase,
         },
+        Phase {
+            name: "fs_long_name_insert",
+            run: fs_long_name_insert_phase,
+        },
+        Phase {
+            name: "fs_memory_read_tracks_size",
+            run: fs_memory_read_tracks_size_phase,
+        },
+        Phase {
+            name: "fs_write_size_bound",
+            run: fs_write_size_bound_phase,
+        },
     ]
 }
 
@@ -348,9 +360,16 @@ pub fn fs_create_remove_phase(_: &Caps)
     let _ = syscall::cap_delete(cap);
 
     let dup = fs_create(svctest, name, ipc_buf);
-    assert!(
-        dup.is_err(),
-        "duplicate FS_CREATE on existing name should fail"
+    assert_eq!(
+        dup.err(),
+        Some(ipc::fs_errors::EXISTS),
+        "duplicate FS_CREATE on an existing name must reply EXISTS"
+    );
+    let dup_dir = fs_mkdir(svctest, name, ipc_buf);
+    assert_eq!(
+        dup_dir.err(),
+        Some(ipc::fs_errors::EXISTS),
+        "FS_MKDIR on an existing name must reply EXISTS"
     );
 
     fs_remove(svctest, name, ipc_buf).expect("FS_REMOVE crt.bin failed");
@@ -434,6 +453,21 @@ pub fn fs_rename_phase(_: &Caps)
     assert_eq!(&got[..], payload, "rename preserved contents");
 
     let _ = syscall::cap_delete(dst_cap);
+
+    // Renaming onto an occupied name is refused, and both entries remain.
+    let (other, _) = fs_create(svctest, src, ipc_buf).expect("FS_CREATE ren_a again failed");
+    let _ = syscall::cap_delete(other);
+    assert_eq!(
+        fs_rename(svctest, src, dst, ipc_buf).err(),
+        Some(ipc::fs_errors::EXISTS),
+        "FS_RENAME onto an existing name must reply EXISTS"
+    );
+    let (kept, _kind, kept_size) =
+        ns_lookup(svctest, dst, 0xFFFF, ipc_buf).expect("dst survives the refused rename");
+    assert_eq!(kept_size, payload.len() as u64, "refused rename kept dst");
+    let _ = syscall::cap_delete(kept);
+    fs_remove(svctest, src, ipc_buf).expect("cleanup src");
+
     fs_remove(svctest, dst, ipc_buf).expect("cleanup dst");
     let _ = syscall::cap_delete(svctest);
     std::os::seraph::log!("fs_rename phase passed");
@@ -877,4 +911,163 @@ pub fn fs_open_relative_phase(_: &Caps)
     );
 
     std::os::seraph::log!("fs_open_relative phase passed");
+}
+
+/// A name that needs an LFN run, created in a fresh directory whose
+/// end-of-directory marker follows `.` and `..`: the whole run lands from the
+/// marker on, so lookup and readdir both find the new entry. fatfs once
+/// placed the run's first slot at the marker and the rest in a newly
+/// allocated cluster, past every reader's end of scan.
+pub fn fs_long_name_insert_phase(_: &Caps)
+{
+    let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
+    // page, so the u64 cast is aligned.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let svctest = svctest_dir_cap(ipc_buf);
+
+    let dname: &[u8] = b"lfnd";
+    // Not strict 8.3: two LFN slots and the 8.3 alias.
+    let name: &[u8] = b"long_name_file.txt";
+    let _ = fs_remove(svctest, dname, ipc_buf);
+    let (dir, _) = fs_mkdir(svctest, dname, ipc_buf).expect("FS_MKDIR lfnd failed");
+
+    let (cap, _) = fs_create(dir, name, ipc_buf).expect("FS_CREATE long name failed");
+    let _ = syscall::cap_delete(cap);
+
+    let (found, _kind, _size) =
+        ns_lookup(dir, name, 0xFFFF, ipc_buf).expect("NS_LOOKUP of the new long name failed");
+    let _ = syscall::cap_delete(found);
+    let mut listed = false;
+    let mut idx = 0;
+    while let Some((_kind, entry)) =
+        crate::ipc_util::ns::ns_readdir(dir, idx, ipc_buf).expect("NS_READDIR lfnd failed")
+    {
+        listed |= entry == name;
+        idx += 1;
+    }
+    assert!(listed, "NS_READDIR of lfnd does not list {name:?}");
+
+    fs_remove(dir, name, ipc_buf).expect("cleanup long name");
+    let _ = syscall::cap_delete(dir);
+    fs_remove(svctest, dname, ipc_buf).expect("cleanup lfnd");
+    let _ = syscall::cap_delete(svctest);
+    std::os::seraph::log!("fs_long_name_insert phase passed");
+}
+
+/// `FS_READ_MEMORY` on `cap` at `offset` with `cookie`, opting out of
+/// cooperative release. Returns `bytes_valid` after releasing the page it
+/// returned, if any.
+fn read_memory_bytes_valid(cap: u32, offset: u64, cookie: u64, ipc_buf: *mut u64) -> u64
+{
+    let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
+        .word(0, offset)
+        .word(1, cookie)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }.expect("FS_READ_MEMORY ipc_call");
+    assert_eq!(
+        reply.label,
+        ipc::fs_errors::SUCCESS,
+        "FS_READ_MEMORY at {offset} status"
+    );
+    if let Some(&page) = reply.caps().first()
+    {
+        let _ = syscall::cap_delete(page);
+        let release = ipc::IpcMessage::builder(ipc::fs_labels::FS_RELEASE_MEMORY)
+            .word(0, cookie)
+            .build();
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_call(cap, &release, ipc_buf) };
+    }
+    reply.word(0)
+}
+
+/// A memory-cap read sees the node's current size and chain: after an
+/// append it returns the appended bytes, and after a truncate to zero it
+/// reports end of file. fatfs once answered from the size and first cluster
+/// it recorded when the node's first `FS_READ_MEMORY` allocated its open-file
+/// slot, missing appends and reading the freed chain after a truncate.
+pub fn fs_memory_read_tracks_size_phase(_: &Caps)
+{
+    let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
+    // page, so the u64 cast is aligned.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let svctest = svctest_dir_cap(ipc_buf);
+
+    let name: &[u8] = b"mrsize.bin";
+    let _ = fs_remove(svctest, name, ipc_buf);
+    let (cap, _) = fs_create(svctest, name, ipc_buf).expect("FS_CREATE mrsize failed");
+
+    fs_write_inline(cap, 0, &[0x11; 8], ipc_buf).expect("FS_WRITE first 8 bytes");
+    assert_eq!(read_memory_bytes_valid(cap, 0, 1, ipc_buf), 8, "first read");
+
+    fs_write_inline(cap, 8, &[0x22; 100], ipc_buf).expect("FS_WRITE append");
+    assert_eq!(
+        read_memory_bytes_valid(cap, 8, 2, ipc_buf),
+        100,
+        "FS_READ_MEMORY after an append must see the appended bytes"
+    );
+
+    let truncate = ipc::IpcMessage::builder(ipc::fs_labels::FS_TRUNCATE)
+        .word(0, 0)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(cap, &truncate, ipc_buf) }.expect("FS_TRUNCATE ipc_call");
+    assert_eq!(reply.label, ipc::fs_errors::SUCCESS, "FS_TRUNCATE status");
+    assert_eq!(
+        read_memory_bytes_valid(cap, 0, 3, ipc_buf),
+        0,
+        "FS_READ_MEMORY after a truncate to zero must report end of file"
+    );
+
+    let close = ipc::IpcMessage::new(ipc::fs_labels::FS_CLOSE);
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_call(cap, &close, ipc_buf) };
+    let _ = syscall::cap_delete(cap);
+    fs_remove(svctest, name, ipc_buf).expect("cleanup mrsize");
+    let _ = syscall::cap_delete(svctest);
+    std::os::seraph::log!("fs_memory_read_tracks_size phase passed");
+}
+
+/// A write that would end past `u32::MAX` bytes, the largest size a FAT
+/// entry records, is refused with `NO_SPACE` before any cluster is
+/// allocated: the file stays empty and the volume keeps its free space, so a
+/// following ordinary write succeeds. fatfs once allocated one cluster per
+/// index up to the offset, filling the volume.
+pub fn fs_write_size_bound_phase(_: &Caps)
+{
+    let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
+    // page, so the u64 cast is aligned.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let svctest = svctest_dir_cap(ipc_buf);
+
+    let name: &[u8] = b"bigoff.bin";
+    let _ = fs_remove(svctest, name, ipc_buf);
+    let (cap, _) = fs_create(svctest, name, ipc_buf).expect("FS_CREATE bigoff failed");
+
+    for offset in [u64::from(u32::MAX) - 3, 1u64 << 32]
+    {
+        assert_eq!(
+            fs_write_inline(cap, offset, &[0x33; 8], ipc_buf).err(),
+            Some(ipc::fs_errors::NO_SPACE),
+            "FS_WRITE ending past u32::MAX at offset {offset:#x}"
+        );
+    }
+    let (size, _mtime, _kind) = crate::ipc_util::ns::ns_stat(cap, ipc_buf).expect("NS_STAT");
+    assert_eq!(size, 0, "a refused write left the file empty");
+
+    let payload = [0x44u8; 64];
+    let n = fs_write_inline(cap, 0, &payload, ipc_buf).expect("ordinary write after refusal");
+    assert_eq!(n, payload.len() as u64, "ordinary write after refusal");
+
+    let _ = syscall::cap_delete(cap);
+    fs_remove(svctest, name, ipc_buf).expect("cleanup bigoff");
+    let _ = syscall::cap_delete(svctest);
+    std::os::seraph::log!("fs_write_size_bound phase passed");
 }

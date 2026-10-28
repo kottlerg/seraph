@@ -7,8 +7,8 @@
 //!
 //! When `read_memory_at_slot` cannot acquire a cache slot (every slot
 //! has `refcount > 0`), main scans the per-file outstanding-page
-//! tables for a candidate, enqueues an [`EvictReq`], and replies
-//! `IO_ERROR`. The eviction worker pops the request and first checks
+//! tables for a page not already queued, marks it queued, enqueues an
+//! [`EvictReq`] for it, and replies `IO_ERROR`. The eviction worker pops the request and first checks
 //! that the page is still outstanding, skipping it if the client's
 //! synchronous release or `FS_CLOSE` already cleaned it up. When the
 //! client delivered a release SEND, the worker sends `FS_RELEASE_MEMORY`

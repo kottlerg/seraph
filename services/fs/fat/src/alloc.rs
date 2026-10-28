@@ -32,8 +32,13 @@ pub enum FatError
 {
     /// Block-device read or write failure, or cache-acquire failure.
     Io,
-    /// No free cluster remains on the volume.
+    /// No free cluster, directory slot run, or short-name alias remains.
     NoSpace,
+    /// A write would end past the largest size a FAT directory entry
+    /// records (`u32::MAX` bytes).
+    FileTooLarge,
+    /// The target name already exists in the parent directory.
+    Exists,
     /// FAT chain or directory entry violates an invariant we cannot
     /// recover from (e.g. cluster index past `total_clusters`).
     Corrupt,

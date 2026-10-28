@@ -38,6 +38,11 @@ pub enum BpbError
     /// `bytes_per_sector` or `sectors_per_cluster` is zero; either would
     /// divide-by-zero in the geometry computation.
     ZeroDivisor,
+    /// `bytes_per_sector` is not [`SECTOR_SIZE`]. The `fatfs` page cache,
+    /// FAT walker, and directory code all address 512-byte sectors, so a
+    /// volume with larger sectors (4Kn media) is refused rather than read
+    /// with mismatched offsets.
+    UnsupportedSectorSize,
 }
 
 /// Geometry decoded from a FAT BPB (sector 0).
@@ -71,8 +76,9 @@ pub struct BpbGeometry
 ///
 /// # Errors
 /// Returns [`BpbError::BadSignature`] when bytes 510/511 are not `0x55 0xAA`,
-/// or [`BpbError::ZeroDivisor`] when `bytes_per_sector` or
-/// `sectors_per_cluster` is zero.
+/// [`BpbError::ZeroDivisor`] when `bytes_per_sector` or
+/// `sectors_per_cluster` is zero, or [`BpbError::UnsupportedSectorSize`]
+/// when `bytes_per_sector` is non-zero but not [`SECTOR_SIZE`].
 pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry, BpbError>
 {
     // Validate boot signature.
@@ -91,6 +97,10 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
     if bytes_per_sector == 0 || sectors_per_cluster == 0
     {
         return Err(BpbError::ZeroDivisor);
+    }
+    if usize::from(bytes_per_sector) != SECTOR_SIZE
+    {
+        return Err(BpbError::UnsupportedSectorSize);
     }
 
     let total_sectors_16 = u16::from_le_bytes([sector_data[19], sector_data[20]]);
@@ -185,9 +195,12 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
 ///
 /// Clusters 0 and 1 are reserved by the FAT spec (0 = free-marker,
 /// 1 = reserved); valid data-region clusters start at 2. A reserved cluster
-/// clamps to `data_start_sector` rather than underflowing `cluster - 2`. The
-/// I/O caller is expected to filter reserved clusters and log the hit; this
-/// function only avoids the underflow.
+/// clamps to `data_start_sector` rather than underflowing `cluster - 2`, and
+/// a cluster too large for the arithmetic saturates to `u32::MAX`, past
+/// every partition bound, so the block driver refuses the access instead of
+/// a wrapped LBA reaching another part of the volume. The I/O caller is
+/// expected to filter clusters outside the data region ([`is_data_cluster`])
+/// and log the hit; this function only avoids the overflow.
 #[must_use]
 pub fn cluster_to_sector(data_start_sector: u32, sectors_per_cluster: u8, cluster: u32) -> u32
 {
@@ -195,7 +208,18 @@ pub fn cluster_to_sector(data_start_sector: u32, sectors_per_cluster: u8, cluste
     {
         return data_start_sector;
     }
-    data_start_sector + (cluster - 2) * u32::from(sectors_per_cluster)
+    data_start_sector.saturating_add((cluster - 2).saturating_mul(u32::from(sectors_per_cluster)))
+}
+
+/// Whether `cluster` names a cluster of the data region of a volume with
+/// `total_clusters` data clusters: `2 <= cluster < 2 + total_clusters`.
+///
+/// A cluster number read from the FAT or a directory entry is untrusted
+/// on-disk input; one outside this range is a corrupt chain or entry.
+#[must_use]
+pub fn is_data_cluster(cluster: u32, total_clusters: u32) -> bool
+{
+    cluster >= 2 && cluster - 2 < total_clusters
 }
 
 // ── Directory entry ─────────────────────────────────────────────────────────
@@ -305,6 +329,7 @@ pub struct LfnAccum
 
 impl LfnAccum
 {
+    /// An empty accumulator holding no run.
     #[must_use]
     pub const fn new() -> Self
     {
@@ -318,6 +343,7 @@ impl LfnAccum
         }
     }
 
+    /// Discard any in-flight run, returning the accumulator to its empty state.
     pub fn reset(&mut self)
     {
         self.len = 0;
@@ -639,6 +665,7 @@ pub fn name_matches(entry_name: &[u8; 11], component: &[u8]) -> bool
     *entry_name == padded
 }
 
+/// ASCII uppercase fold of one byte; non-ASCII-lowercase bytes pass through unchanged.
 #[must_use]
 pub fn to_upper(b: u8) -> u8
 {
@@ -837,6 +864,78 @@ impl<L: Copy + Default> Default for RemoveRunScan<L>
     }
 }
 
+// ── Insertion slot run ──────────────────────────────────────────────────────
+
+/// Slot-by-slot directory scan that finds a run of consecutive free slots
+/// for a new entry (its LFN slots plus its 8.3 slot).
+///
+/// A deleted slot (`0xE5`) is free; an end-of-directory slot (`0x00`) is free
+/// and, per the Microsoft FAT specification, so is every slot after it,
+/// whatever its bytes. A run therefore continues through the slots past the
+/// end-of-directory marker instead of stopping there, so the whole new entry
+/// lands before any reader's end of scan. Any other slot is in use and
+/// restarts the run. `L` is the caller's slot position; scan state carries
+/// across sector and cluster boundaries.
+pub struct FreeRunScan<L>
+{
+    slots: [L; MAX_SLOT_RUN],
+    len: usize,
+    count: usize,
+    past_end: bool,
+}
+
+impl<L: Copy + Default> FreeRunScan<L>
+{
+    /// A scan for a run of `count` free slots, clamped to `1..=MAX_SLOT_RUN`.
+    #[must_use]
+    pub fn new(count: usize) -> Self
+    {
+        Self {
+            slots: [L::default(); MAX_SLOT_RUN],
+            len: 0,
+            count: count.clamp(1, MAX_SLOT_RUN),
+            past_end: false,
+        }
+    }
+
+    /// Whether the scan has passed the directory's end-of-directory marker,
+    /// after which every slot is free and need not be read.
+    #[must_use]
+    pub fn past_end(&self) -> bool
+    {
+        self.past_end
+    }
+
+    /// The run found: `count` slot positions in on-disk order. Meaningful
+    /// only after [`Self::step`] returns `true`.
+    #[must_use]
+    pub fn run(&self) -> &[L]
+    {
+        &self.slots[..self.len]
+    }
+
+    /// Feed the slot at `loc` whose first byte is `first`; once the scan is
+    /// [past the end](Self::past_end) the byte is ignored. Returns `true`
+    /// when the run holds `count` slots.
+    pub fn step(&mut self, first: u8, loc: L) -> bool
+    {
+        if first == 0x00
+        {
+            self.past_end = true;
+        }
+        if self.past_end || first == 0xE5
+        {
+            self.slots[self.len] = loc;
+            self.len += 1;
+        }
+        else
+        {
+            self.len = 0;
+        }
+        self.len >= self.count
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -964,6 +1063,33 @@ mod tests
         assert_eq!(cluster_to_sector(100, 8, 2), 100);
         // Cluster 3 is one cluster (8 sectors) further in.
         assert_eq!(cluster_to_sector(100, 8, 3), 108);
+    }
+
+    #[test]
+    fn parse_bpb_geometry_rejects_sectors_other_than_512_bytes()
+    {
+        // A 4Kn volume: the cache and FAT walker index 512-byte sectors.
+        let large = bpb_sector(4096, 1, 1, 2, 512, 8192, 20, 0, 0, 0, 0);
+        assert!(matches!(
+            parse_bpb_geometry(&large),
+            Err(BpbError::UnsupportedSectorSize)
+        ));
+    }
+
+    #[test]
+    fn cluster_to_sector_saturates_instead_of_overflowing()
+    {
+        // A corrupt 0x0FFF_FFF0 entry times 64 sectors per cluster overflows u32.
+        assert_eq!(cluster_to_sector(100, 64, 0x0FFF_FFF0), u32::MAX);
+    }
+
+    #[test]
+    fn is_data_cluster_bounds_the_data_region()
+    {
+        assert!(!is_data_cluster(1, 10));
+        assert!(is_data_cluster(2, 10));
+        assert!(is_data_cluster(11, 10));
+        assert!(!is_data_cluster(12, 10));
     }
 
     #[test]
@@ -1249,6 +1375,32 @@ mod tests
         slots.insert(0, orphan);
         let run = found_run(&slots, b"AAAAAA~1");
         assert_eq!(run, (1..=MAX_SLOT_RUN).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn free_run_continues_past_the_end_of_directory_marker()
+    {
+        // Two used entries, the 0x00 marker at slot 2, then stale bytes the
+        // specification declares free: a 3-slot run starts at the marker.
+        let mut scan = FreeRunScan::<usize>::new(3);
+        assert!(!scan.step(b'A', 0));
+        assert!(!scan.step(b'B', 1));
+        assert!(!scan.step(0x00, 2));
+        assert!(scan.past_end());
+        assert!(!scan.step(b'Z', 3));
+        assert!(scan.step(b'Q', 4));
+        assert_eq!(scan.run(), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn free_run_restarts_on_a_used_slot()
+    {
+        let mut scan = FreeRunScan::<usize>::new(2);
+        assert!(!scan.step(0xE5, 0));
+        assert!(!scan.step(b'A', 1));
+        assert!(!scan.step(0xE5, 2));
+        assert!(scan.step(0xE5, 3));
+        assert_eq!(scan.run(), &[2, 3]);
     }
 
     #[test]

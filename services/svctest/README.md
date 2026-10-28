@@ -34,7 +34,7 @@ services/svctest/
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
-        ├── devmgr.rs          # QUERY_SHUTDOWN_DEVICE deny; orphan teardown via TEST_SPAWN_ORPHAN
+        ├── devmgr.rs          # Shutdown-device and test-label deny; `TEST_SPAWN_ORPHAN` teardown
         ├── pager.rs           # Demand paging: backed, declined, and pinned faults
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
@@ -42,7 +42,7 @@ services/svctest/
         ├── fs_ipc.rs          # Raw `FS_*` IPC against vfsd and fatfs
         ├── fs_std.rs          # `std::fs` over the FS IPC contract
         ├── pwrmgr.rs          # Shutdown cap-deny check and terminal shutdown
-        ├── svcmgr.rs          # Late handover refused; publish gate; badged `svcmgr` SEND
+        ├── svcmgr.rs          # Late handover refused; publish gate; badged SEND; seed-only names
         └── timed.rs           # `SystemTime::now()` through svcmgr and timed
 ```
 
@@ -65,9 +65,9 @@ or an IPC error, is logged and svctest exits, leaving the system idle.
 
 A failing phase panics through the std panic handler; svctest then never logs
 `ALL TESTS PASSED` and never requests shutdown. The `ns` phase (`caps[0]`), the pwrmgr
-cap-deny phase (`caps[2]`), and the pwrmgr shutdown phase (`caps[1]`) log the skip and return
-when their slot is zero; the devmgr shutdown-device deny and orphan-teardown phases
-(`caps[3]`) instead fail their assertions.
+cap-deny phase (the queried `pwrmgr.deny` cap), and the pwrmgr shutdown phase (`caps[1]`) log
+the skip and return when their cap is zero; the devmgr deny phases (`caps[2]`) and the
+orphan-teardown phase (`caps[3]`) instead fail their assertions.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, and env
 carries `SERAPH_TEST=1` and `SERAPH_MODE=boot`.
@@ -85,13 +85,16 @@ slot stays zero.
 |-----------|-------------------|----------------------------------------|
 | `caps[0]` | `rootfs.root`     | `ns` phase                             |
 | `caps[1]` | `pwrmgr.shutdown` | Authority cap for the final `SHUTDOWN` |
-| `caps[2]` | `pwrmgr.deny`     | Cap-deny phase                         |
-| `caps[3]` | `devmgr.test`     | devmgr deny and orphan-teardown phases |
+| `caps[2]` | `devmgr.registry` | devmgr deny phases                     |
+| `caps[3]` | `devmgr.test`     | devmgr orphan-teardown phase           |
 
-`caps[2]` drives the cap-deny phase, which requires an `UNAUTHORIZED` reply to `SHUTDOWN`.
-`caps[3]` exists for the devmgr orphan-teardown phase's `TEST_SPAWN_ORPHAN` shim
-(TODO(#165): retire with that shim); lacking `SHUTDOWN_DEVICE_AUTHORITY`, it also drives the
-deny phase, which requires an `UNAUTHORIZED` reply to `QUERY_SHUTDOWN_DEVICE`.
+`caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the devmgr deny phases, which
+require an `UNAUTHORIZED` reply to `QUERY_SHUTDOWN_DEVICE`, `TEST_SPAWN_ORPHAN`, and
+`TEST_ORPHAN_RESULT`. `caps[3]` exists for the orphan-teardown phase's `TEST_SPAWN_ORPHAN` shim
+(TODO(#165): retire with that shim). Every seed is seed-only in svcmgr's registry. The
+no-authority `pwrmgr.deny` cap is public, so svctest resolves it through `QUERY_ENDPOINT` on its
+per-process `service_registry_cap` and spends no seed slot on it; it drives the pwrmgr cap-deny
+phase, which requires an `UNAUTHORIZED` reply to `SHUTDOWN`.
 
 ---
 

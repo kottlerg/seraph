@@ -7,7 +7,6 @@ publish.workspace = true
 # no_std: fixed-capacity name→endpoint-cap registry used by supervisors
 # (svcmgr today; devmgr/vfsd when they need it) to answer QUERY_ENDPOINT.
 [lib]
-test = false
 doctest = false
 
 [dependencies]

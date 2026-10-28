@@ -388,10 +388,11 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
         return false;
     }
 
-    // Serve bootstrap round 1. With an IRQ: [bar, irq, service] (the original
-    // shape virtio-blk decodes). Without: [bar, service] — a null IRQ slot
-    // cannot be transferred, so it is omitted and the driver infers "no IRQ"
-    // from the 2-cap round and polls instead.
+    // Serve bootstrap round 1. With an IRQ: [bar, irq, service]. Without:
+    // [bar, service] — a null IRQ slot cannot be transferred, so it is
+    // omitted and the driver infers "no IRQ" from the 2-cap round and polls
+    // instead. Only virtio-input decodes the 2-cap shape; virtio-blk
+    // requires the IRQ, so its spawn site refuses to spawn without one.
     let round1_with_irq = [bar_copy, irq_copy, service_copy];
     let round1_no_irq = [bar_copy, service_copy];
     let round1_caps: &[u32] = if irq_copy != 0

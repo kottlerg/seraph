@@ -5,8 +5,8 @@
 
 //! Narrow DTB (flattened device tree) walker for devmgr.
 //!
-//! Finds the PCI host-ECAM node and returns its physical range. Follows the FDT v17 layout per the Device Tree
-//! Specification.
+//! Finds the PCI host-ECAM node and returns its physical range. Follows the
+//! FDT v17 layout per the Device Tree Specification.
 
 use super::EcamLocation;
 
@@ -29,6 +29,14 @@ const HDR_OFF_DT_STRINGS: usize = 12;
 // HDR_LAST_COMP_VERSION: usize = 24 (not checked — QEMU emits v17)
 // HDR_SIZE_DT_STRINGS: usize = 32 (unused here)
 const HDR_SIZE_DT_STRUCT: usize = 36;
+const HDR_LEN: usize = 40;
+
+/// Deepest node nesting the cell-size tracking follows; a deeper ECAM node
+/// is not found.
+const MAX_DEPTH: usize = 16;
+/// `#address-cells` / `#size-cells` a node's children inherit when the node
+/// does not set them (Device Tree Specification § 2.3.5).
+const DEFAULT_CELLS: (usize, usize) = (2, 1);
 
 fn be_u32(buf: &[u8], off: usize) -> u32
 {
@@ -69,12 +77,12 @@ pub struct Fdt<'a>
 impl<'a> Fdt<'a>
 {
     /// Validate the blob header and return a walker. Returns `None` for a
-    /// bad magic, a `totalsize` beyond the blob, or a structure block
-    /// beyond `totalsize`.
+    /// blob shorter than the 40-byte header, a bad magic, a `totalsize`
+    /// beyond the blob, or a structure block beyond `totalsize`.
     #[must_use]
     pub fn new(blob: &'a [u8]) -> Option<Self>
     {
-        if blob.len() < 40 || be_u32(blob, HDR_MAGIC) != FDT_MAGIC
+        if blob.len() < HDR_LEN || be_u32(blob, HDR_MAGIC) != FDT_MAGIC
         {
             return None;
         }
@@ -114,31 +122,61 @@ impl<'a> Fdt<'a>
     /// Search for the first PCI ECAM aperture defined by a
     /// `pci-host-ecam-generic` node (QEMU virt's PCI host).
     ///
-    /// Returns the ECAM location inferred from the node's `reg` property.
-    /// The `reg` property is one `(address, size)` pair in
-    /// `#address-cells` / `#size-cells` units from the parent (/soc).
-    /// QEMU virt's /soc has `#address-cells = 2`, `#size-cells = 2`, so
-    /// each is 8 bytes. Returns `None` when no such node exists, its `reg`
-    /// is missing, short, or zero, or it covers less than one bus.
+    /// The node's `reg` is one `(address, size)` pair in its parent's
+    /// `#address-cells` / `#size-cells` units (1 or 2 cells each; the
+    /// specification defaults of 2 and 1 when the parent sets none). Its
+    /// address is the configuration space of the first bus. The bus range
+    /// is the node's `bus-range` property, else bus 0 onward, clamped to the
+    /// buses `reg` covers and to 255; the returned size is 1 MiB per bus of
+    /// that range. Returns `None` when no such node exists, it is nested
+    /// deeper than 16 levels, its parent's cell sizes are unsupported, its
+    /// `reg` is missing, short, or zero, it covers less than one bus, or its
+    /// `bus-range` is short, inverted, or starts above bus 255.
     #[must_use]
     pub fn find_pci_ecam(&self) -> Option<EcamLocation>
     {
         let mut walker = FdtWalker::new(self);
-        // QEMU virt: root #address-cells=2, #size-cells=2.
-        let addr_cells = 2usize;
-        let size_cells = 2usize;
+        // `cells[d]`: the cell sizes the children of the node at depth `d`
+        // decode their `reg` in (the root node is depth 1).
+        let mut cells = [DEFAULT_CELLS; MAX_DEPTH];
+        let mut depth = 0usize;
 
         while let Some(event) = walker.next_event()
         {
-            if let FdtEvent::Prop { name, data } = event
-                && name == b"compatible"
-                && compatible_contains(data, b"pci-host-ecam-generic")
+            match event
             {
-                // Find the enclosing node's `reg` property. The walker's
-                // design yields properties in node order; we restart
-                // and scan this node once.
-                let node_start = walker.current_node_start?;
-                return extract_reg(self, node_start, addr_cells, size_cells);
+                FdtEvent::BeginNode =>
+                {
+                    depth += 1;
+                    if depth >= MAX_DEPTH
+                    {
+                        return None;
+                    }
+                    cells[depth] = DEFAULT_CELLS;
+                }
+                FdtEvent::EndNode => depth = depth.checked_sub(1)?,
+                FdtEvent::Prop { name, data } if depth > 0 =>
+                {
+                    if name == b"#address-cells"
+                    {
+                        cells[depth].0 = be_u32(data, 0) as usize;
+                    }
+                    else if name == b"#size-cells"
+                    {
+                        cells[depth].1 = be_u32(data, 0) as usize;
+                    }
+                    else if name == b"compatible"
+                        && compatible_contains(data, b"pci-host-ecam-generic")
+                    {
+                        // Restart at this node and read its `reg` and
+                        // `bus-range` in the parent's cell sizes.
+                        let node_start = walker.current_node_start?;
+                        let (addr_cells, size_cells) = cells[depth - 1];
+                        return extract_ecam(self, node_start, addr_cells, size_cells);
+                    }
+                }
+                FdtEvent::Prop { .. } =>
+                {}
             }
         }
         None
@@ -165,10 +203,23 @@ fn compatible_contains(data: &[u8], needle: &[u8]) -> bool
     false
 }
 
-/// Find the `reg` property of the node starting at `dt_struct` offset
-/// `node_start` and decode the first `(base, size)` pair in its parent's
-/// cell sizes.
-fn extract_reg(
+/// Read a 1- or 2-cell big-endian value at `off`; `None` for any other
+/// cell count.
+fn read_cells(data: &[u8], off: usize, cells: usize) -> Option<u64>
+{
+    match cells
+    {
+        1 => Some(u64::from(be_u32(data, off))),
+        2 => Some(be_u64(data, off)),
+        _ => None,
+    }
+}
+
+/// Decode the ECAM window of the node starting at `dt_struct` offset
+/// `node_start` from its `reg` (first pair, in the parent's
+/// `addr_cells` / `size_cells`) and optional `bus-range`, per
+/// [`Fdt::find_pci_ecam`].
+fn extract_ecam(
     fdt: &Fdt<'_>,
     node_start: usize,
     addr_cells: usize,
@@ -179,69 +230,71 @@ fn extract_reg(
     // Consume the BEGIN_NODE for `node_start` itself.
     walker.next_event()?;
     let mut depth = 1i32;
+    let mut reg: Option<(u64, u64)> = None;
+    let mut bus_range: Option<(u32, u32)> = None;
     while let Some(event) = walker.next_event()
     {
         match event
         {
-            FdtEvent::BeginNode =>
-            {
-                depth += 1;
-            }
+            FdtEvent::BeginNode => depth += 1,
             FdtEvent::EndNode =>
             {
                 depth -= 1;
                 if depth == 0
                 {
-                    return None;
+                    break;
                 }
             }
             FdtEvent::Prop { name, data } if depth == 1 && name == b"reg" =>
             {
-                let bytes_per_entry = (addr_cells + size_cells) * 4;
-                if data.len() < bytes_per_entry
+                if data.len() < (addr_cells + size_cells) * 4
                 {
                     return None;
                 }
-                let base = if addr_cells == 2
-                {
-                    be_u64(data, 0)
-                }
-                else
-                {
-                    u64::from(be_u32(data, 0))
-                };
-                let size = if size_cells == 2
-                {
-                    be_u64(data, addr_cells * 4)
-                }
-                else
-                {
-                    u64::from(be_u32(data, addr_cells * 4))
-                };
-                if base == 0 || size == 0
+                let base = read_cells(data, 0, addr_cells)?;
+                let size = read_cells(data, addr_cells * 4, size_cells)?;
+                reg = Some((base, size));
+            }
+            FdtEvent::Prop { name, data } if depth == 1 && name == b"bus-range" =>
+            {
+                if data.len() < 8
                 {
                     return None;
                 }
-                // Infer bus range: size / (256 * 4096) buses, starting at 0.
-                // A `reg` smaller than one bus covers no whole bus.
-                let bus_count = size / (256 * 4096);
-                if bus_count == 0
-                {
-                    return None;
-                }
-                let end_bus = u8::try_from(bus_count.saturating_sub(1)).unwrap_or(u8::MAX);
-                return Some(EcamLocation {
-                    phys_base: base,
-                    size,
-                    start_bus: 0,
-                    end_bus,
-                });
+                bus_range = Some((be_u32(data, 0), be_u32(data, 4)));
             }
             FdtEvent::Prop { .. } =>
             {}
         }
     }
-    None
+    let (base, size) = reg?;
+    if base == 0 || size == 0
+    {
+        return None;
+    }
+    // `reg` covers `size / 1 MiB` whole buses from the first bus; a `reg`
+    // smaller than one bus covers none.
+    let reg_buses = size >> 20;
+    if reg_buses == 0
+    {
+        return None;
+    }
+    let (first, last) = bus_range.unwrap_or((0, u32::MAX));
+    if last < first
+    {
+        return None;
+    }
+    let start_bus = u8::try_from(first).ok()?;
+    let covered_last = u64::from(first) + reg_buses - 1;
+    let end_bus = u8::try_from(u64::from(last).min(covered_last).min(255)).ok()?;
+    let bus_count = u64::from(end_bus) - u64::from(start_bus) + 1;
+    base.checked_add(bus_count << 20)?;
+    Some(EcamLocation {
+        phys_base: base,
+        size: bus_count << 20,
+        start_bus,
+        end_bus,
+    })
 }
 
 /// Events yielded by `FdtWalker::next_event`. Node names are not consumed
@@ -446,20 +499,39 @@ mod tests
         r
     }
 
-    /// `/soc/pcie` carrying `compatible` and `reg`.
-    fn ecam_tree(compatible: &[u8], reg_data: &[u8]) -> Vec<u8>
+    /// `/soc/pcie` carrying `compatible`, `reg`, and the `extra` properties,
+    /// under a `/soc` with `#address-cells = 2`, `#size-cells = 2` (QEMU
+    /// virt's).
+    fn ecam_tree_with(compatible: &[u8], reg_data: &[u8], extra: &[(&str, &[u8])]) -> Vec<u8>
     {
-        Builder::new()
+        let mut b = Builder::new()
             .begin("")
             .begin("soc")
+            .prop("#address-cells", &2u32.to_be_bytes())
+            .prop("#size-cells", &2u32.to_be_bytes())
             .begin("pcie@30000000")
             .prop("compatible", compatible)
-            .prop("reg", reg_data)
-            .end()
-            .end()
-            .end()
-            .finish()
+            .prop("reg", reg_data);
+        for &(name, data) in extra
+        {
+            b = b.prop(name, data);
+        }
+        b.end().end().end().finish()
     }
+
+    fn ecam_tree(compatible: &[u8], reg_data: &[u8]) -> Vec<u8>
+    {
+        ecam_tree_with(compatible, reg_data, &[])
+    }
+
+    fn bus_range(first: u32, last: u32) -> Vec<u8>
+    {
+        let mut r = first.to_be_bytes().to_vec();
+        r.extend_from_slice(&last.to_be_bytes());
+        r
+    }
+
+    const ECAM: &[u8] = b"pci-host-ecam-generic\0";
 
     fn ecam(blob: &[u8]) -> Option<EcamLocation>
     {
@@ -469,7 +541,7 @@ mod tests
     #[test]
     fn ecam_node_yields_its_reg_range_and_bus_count()
     {
-        let blob = ecam_tree(b"pci-host-ecam-generic\0", &reg(0x3000_0000, 16 << 20));
+        let blob = ecam_tree(ECAM, &reg(0x3000_0000, 16 << 20));
         let loc = ecam(&blob).unwrap();
         assert_eq!(
             (loc.phys_base, loc.size, loc.start_bus, loc.end_bus),
@@ -478,30 +550,159 @@ mod tests
     }
 
     #[test]
-    fn ecam_reg_covering_more_than_256_buses_caps_end_bus_at_255()
+    fn ecam_reg_covering_more_than_256_buses_caps_end_bus_and_size_at_255()
     {
-        let blob = ecam_tree(b"pci-host-ecam-generic\0", &reg(0x3000_0000, 512 << 20));
-        assert_eq!(ecam(&blob).unwrap().end_bus, 255);
+        let blob = ecam_tree(ECAM, &reg(0x3000_0000, 512 << 20));
+        let loc = ecam(&blob).unwrap();
+        assert_eq!((loc.end_bus, loc.size), (255, 256 << 20));
     }
 
     #[test]
     fn ecam_reg_of_exactly_one_bus_yields_bus_zero()
     {
-        let blob = ecam_tree(b"pci-host-ecam-generic\0", &reg(0x3000_0000, 1 << 20));
-        assert_eq!(ecam(&blob).unwrap().end_bus, 0);
+        let blob = ecam_tree(ECAM, &reg(0x3000_0000, 1 << 20));
+        let loc = ecam(&blob).unwrap();
+        assert_eq!((loc.end_bus, loc.size), (0, 1 << 20));
+    }
+
+    #[test]
+    fn ecam_size_is_whole_buses_of_a_ragged_reg()
+    {
+        let blob = ecam_tree(ECAM, &reg(0x3000_0000, (3 << 20) + 0x800));
+        let loc = ecam(&blob).unwrap();
+        assert_eq!((loc.end_bus, loc.size), (2, 3 << 20));
+    }
+
+    #[test]
+    fn ecam_bus_range_sets_start_and_end_bus()
+    {
+        let blob = ecam_tree_with(
+            ECAM,
+            &reg(0x3000_0000, 16 << 20),
+            &[("bus-range", bus_range(4, 7).as_slice())],
+        );
+        let loc = ecam(&blob).unwrap();
+        assert_eq!(
+            (loc.phys_base, loc.size, loc.start_bus, loc.end_bus),
+            (0x3000_0000, 4 << 20, 4, 7)
+        );
+    }
+
+    #[test]
+    fn ecam_bus_range_is_clamped_to_the_buses_reg_covers()
+    {
+        let blob = ecam_tree_with(
+            ECAM,
+            &reg(0x3000_0000, 2 << 20),
+            &[("bus-range", bus_range(8, 255).as_slice())],
+        );
+        let loc = ecam(&blob).unwrap();
+        assert_eq!((loc.start_bus, loc.end_bus, loc.size), (8, 9, 2 << 20));
+    }
+
+    #[test]
+    fn ecam_bus_range_short_inverted_or_above_255_yields_no_ecam()
+    {
+        for range in [bus_range(0, 1)[..4].to_vec(), bus_range(7, 4), bus_range(256, 300)]
+        {
+            let blob = ecam_tree_with(ECAM, &reg(0x3000_0000, 16 << 20), &[("bus-range", range.as_slice())]);
+            assert!(ecam(&blob).is_none());
+        }
+    }
+
+    #[test]
+    fn ecam_reg_with_zero_size_yields_no_ecam()
+    {
+        let blob = ecam_tree(ECAM, &reg(0x3000_0000, 0));
+        assert!(ecam(&blob).is_none());
+    }
+
+    #[test]
+    fn ecam_reg_whose_window_overflows_yields_no_ecam()
+    {
+        let blob = ecam_tree(ECAM, &reg(u64::MAX - (1 << 20) + 2, 1 << 20));
+        assert!(ecam(&blob).is_none());
+    }
+
+    #[test]
+    fn ecam_reg_is_decoded_in_one_cell_parent_units()
+    {
+        let mut reg1 = 0x3000_0000u32.to_be_bytes().to_vec();
+        reg1.extend_from_slice(&(16u32 << 20).to_be_bytes());
+        let blob = Builder::new()
+            .begin("")
+            .prop("#address-cells", &1u32.to_be_bytes())
+            .prop("#size-cells", &1u32.to_be_bytes())
+            .begin("pcie@30000000")
+            .prop("compatible", ECAM)
+            .prop("reg", &reg1)
+            .end()
+            .end()
+            .finish();
+        let loc = ecam(&blob).unwrap();
+        assert_eq!((loc.phys_base, loc.end_bus), (0x3000_0000, 15));
+    }
+
+    #[test]
+    fn ecam_reg_defaults_to_two_address_and_one_size_cells()
+    {
+        let mut reg21 = 0x3000_0000u64.to_be_bytes().to_vec();
+        reg21.extend_from_slice(&(16u32 << 20).to_be_bytes());
+        let blob = Builder::new()
+            .begin("")
+            .begin("pcie@30000000")
+            .prop("compatible", ECAM)
+            .prop("reg", &reg21)
+            .end()
+            .end()
+            .finish();
+        assert_eq!(ecam(&blob).unwrap().end_bus, 15);
+    }
+
+    #[test]
+    fn ecam_under_unsupported_cell_sizes_yields_no_ecam()
+    {
+        let blob = Builder::new()
+            .begin("")
+            .prop("#address-cells", &3u32.to_be_bytes())
+            .begin("pcie@30000000")
+            .prop("compatible", ECAM)
+            .prop("reg", &[0u8; 24])
+            .end()
+            .end()
+            .finish();
+        assert!(ecam(&blob).is_none());
+    }
+
+    #[test]
+    fn ecam_node_nested_past_the_depth_limit_is_not_found()
+    {
+        let mut b = Builder::new();
+        for _ in 0..MAX_DEPTH
+        {
+            b = b.begin("n");
+        }
+        b = b
+            .prop("compatible", ECAM)
+            .prop("reg", &reg(0x3000_0000, 16 << 20));
+        for _ in 0..MAX_DEPTH
+        {
+            b = b.end();
+        }
+        assert!(ecam(&b.finish()).is_none());
     }
 
     #[test]
     fn ecam_reg_smaller_than_one_bus_yields_no_ecam()
     {
-        let blob = ecam_tree(b"pci-host-ecam-generic\0", &reg(0x3000_0000, (1 << 20) - 1));
+        let blob = ecam_tree(ECAM, &reg(0x3000_0000, (1 << 20) - 1));
         assert!(ecam(&blob).is_none());
     }
 
     #[test]
     fn ecam_reg_with_zero_base_yields_no_ecam()
     {
-        let blob = ecam_tree(b"pci-host-ecam-generic\0", &reg(0, 16 << 20));
+        let blob = ecam_tree(ECAM, &reg(0, 16 << 20));
         assert!(ecam(&blob).is_none());
     }
 
@@ -553,6 +754,7 @@ mod tests
     {
         let blob = Builder::new()
             .begin("")
+            .prop("#size-cells", &2u32.to_be_bytes())
             .token(FDT_NOP)
             .begin("pcie@30000000")
             .token(FDT_NOP)
@@ -567,10 +769,10 @@ mod tests
     #[test]
     fn property_running_past_the_structure_block_ends_the_walk()
     {
-        let mut blob = ecam_tree(b"pci-host-ecam-generic\0", &reg(0x3000_0000, 16 << 20));
-        // The first property's length word follows the three BEGIN_NODE
-        // tokens and names ("", "soc", "pcie@30000000").
-        let len_off = 40 + 8 + 8 + 20 + 4;
+        let mut blob = ecam_tree(ECAM, &reg(0x3000_0000, 16 << 20));
+        // The first property's length word follows the two BEGIN_NODE
+        // tokens and names ("", "soc") and its FDT_PROP token.
+        let len_off = 40 + 8 + 8 + 4;
         blob[len_off..len_off + 4].copy_from_slice(&0x1000u32.to_be_bytes());
         assert!(ecam(&blob).is_none());
     }
@@ -578,7 +780,7 @@ mod tests
     #[test]
     fn header_with_bad_magic_is_rejected()
     {
-        let mut blob = ecam_tree(b"pci-host-ecam-generic\0", &reg(0x3000_0000, 16 << 20));
+        let mut blob = ecam_tree(ECAM, &reg(0x3000_0000, 16 << 20));
         blob[0] = 0;
         assert!(Fdt::new(&blob).is_none());
     }
@@ -586,17 +788,40 @@ mod tests
     #[test]
     fn header_with_totalsize_beyond_the_blob_is_rejected()
     {
-        let blob = ecam_tree(b"pci-host-ecam-generic\0", &reg(0x3000_0000, 16 << 20));
+        let blob = ecam_tree(ECAM, &reg(0x3000_0000, 16 << 20));
         assert!(Fdt::new(&blob[..blob.len() - 1]).is_none());
     }
 
     #[test]
     fn header_with_structure_block_beyond_totalsize_is_rejected()
     {
-        let mut blob = ecam_tree(b"pci-host-ecam-generic\0", &reg(0x3000_0000, 16 << 20));
+        let mut blob = ecam_tree(ECAM, &reg(0x3000_0000, 16 << 20));
         let size_struct = be_u32(&blob, HDR_SIZE_DT_STRUCT) + 0x100;
         blob[HDR_SIZE_DT_STRUCT..HDR_SIZE_DT_STRUCT + 4]
             .copy_from_slice(&size_struct.to_be_bytes());
         assert!(Fdt::new(&blob).is_none());
+    }
+
+    #[test]
+    fn property_header_running_past_the_structure_block_ends_the_walk()
+    {
+        // The structure block ends right after an FDT_PROP token, so its
+        // 8-byte length / name-offset header lies outside it.
+        let mut blob = Builder::new().begin("").token(FDT_PROP).finish();
+        let size_struct = 8 + 4;
+        blob[HDR_SIZE_DT_STRUCT..HDR_SIZE_DT_STRUCT + 4]
+            .copy_from_slice(&u32::try_from(size_struct).unwrap().to_be_bytes());
+        let fdt = Fdt::new(&blob).unwrap();
+        let mut walker = FdtWalker::new(&fdt);
+        assert!(matches!(walker.next_event(), Some(FdtEvent::BeginNode)));
+        assert!(walker.next_event().is_none());
+    }
+
+    #[test]
+    fn blob_shorter_than_the_header_is_rejected()
+    {
+        let blob = ecam_tree(ECAM, &reg(0x3000_0000, 16 << 20));
+        assert!(Fdt::new(&[]).is_none());
+        assert!(Fdt::new(&blob[..HDR_LEN - 1]).is_none());
     }
 }

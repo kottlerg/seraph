@@ -11,7 +11,7 @@ discovery, and driver binding.
 devmgr/
 ├── Cargo.toml
 ├── README.md
-├── firmware/                       # `devmgr-firmware` crate: host-tested ACPI / DTB parsers
+├── firmware/                       # `devmgr-firmware`: host-tested ACPI / DTB parsers, PCI math
 ├── src/
 │   ├── main.rs                     # Bootstrap, registry loop, QUERY_* handlers, device catalog
 │   ├── arch/                       # Arch dispatch: ECAM/INTx defaults, UART/RTC carves, shutdown

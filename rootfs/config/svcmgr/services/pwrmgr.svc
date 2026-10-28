@@ -4,7 +4,8 @@
 # svcmgr create pwrmgr's service endpoint, serve its RECV as bootstrap
 # cap[0], and publish two SENDs on it:
 #   * pwrmgr.shutdown:auth — SHUTDOWN_AUTHORITY-tokened (1 << 63), for
-#     consumers permitted to power the platform off.
+#     consumers permitted to power the platform off; seed-only, so only
+#     recipes that seed it hold it.
 #   * pwrmgr.deny:deny    — a no-authority twin (sentinel token 1) that the
 #     SHUTDOWN/REBOOT gate rejects; svctest uses it to assert the deny path.
 # `seed = devmgr.shutdown` delivers the REGISTRY_QUERY_AUTHORITY |

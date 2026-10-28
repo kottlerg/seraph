@@ -219,7 +219,8 @@ derivation, and devmgr narrows it with `SYS_IOPORT_SPLIT` and gives each driver 
 port range (see
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md)). devmgr's
 `QUERY_SHUTDOWN_DEVICE` also serves the FADT's 2-port PM1a control window plus the 8042 reset
-port, only to a caller whose badge carries `SHUTDOWN_DEVICE_AUTHORITY` (pwrmgr).
+port, only to a caller whose badge carries `SHUTDOWN_DEVICE_AUTHORITY`: the seed-only
+`devmgr.shutdown` cap, which pwrmgr alone seeds and svcmgr's `QUERY_ENDPOINT` refuses.
 
 Revoking an IoPort capability removes port access from all threads it has
 been bound to; the kernel tracks bindings and updates each affected thread's IOPB
@@ -272,8 +273,9 @@ cap and are unreachable after init's reap: **Dbcn** is thrown away by design (th
 driver owns the console; forwarding the firmware console would bypass the console-ownership model),
 and **Cppc** / **Base** / **Pmu** are simply not needed by any current service. devmgr serves pwrmgr
 a derivation further narrowed to **Reset** only (system reset / reboot), gated on the
-`SHUTDOWN_DEVICE_AUTHORITY` badge bit only pwrmgr's registry cap carries; **Suspend** is
-retained against a future power-management path but delegated to no one today. See
+`SHUTDOWN_DEVICE_AUTHORITY` badge bit that only pwrmgr's seed-only `devmgr.shutdown` cap
+carries; **Suspend** is retained against a future power-management path but delegated to no one
+today. See
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md).
 
 **Gating-granularity decision.** Per-cap authority is encoded as rights bits, not
@@ -435,14 +437,19 @@ mean only the server and its trusted minters can set
 the verb-bit; a holder of an unprivileged cap cannot re-derive an
 authority cap. The server's dispatcher checks
 `msg.badge & VERB_BIT != 0` before servicing the privileged label and
-replies `UNAUTHORIZED` otherwise. The verb-bits in use are bits 62 and 63
+replies `UNAUTHORIZED` otherwise. The verb-bits in use are bits 60 through 63
 (`ipc::VERB_BIT_MASK`). On an endpoint that gates labels this way, a
 minter that hands out badges carrying other information keeps them clear:
 procmgr's random per-process badge, stamped on every SEND procmgr mints
 for a child (its procmgr, registry, and log SENDs) and on its process
-handle, is redrawn until neither bit is set. An un-badged SEND on such an
+handle, is redrawn until none of them is set. An un-badged SEND on such an
 endpoint stays with the server and its trusted minters, since its holder
-could badge it with any verb-bit.
+could badge it with any verb-bit. A verb-bit cap svcmgr publishes by name
+is seed-only: its `QUERY_ENDPOINT` answers every process, so a queryable
+verb-bit cap would be ambient, and a seed-only name reaches only the
+recipes that seed it
+([services/svcmgr/docs/ipc-interface.md](../services/svcmgr/docs/ipc-interface.md)
+§ Label 4).
 
 ---
 

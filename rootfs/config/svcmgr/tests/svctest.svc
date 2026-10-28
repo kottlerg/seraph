@@ -1,13 +1,14 @@
 # /tests/svctest — services-surface test harness.
 #
 # One-shot: exits cleanly on completion; svcmgr never restarts it.
-# Seeds resolve through svcmgr's discovery registry: rootfs.root is
-# the FS-driver-agnostic root-mount cap; pwrmgr.shutdown/pwrmgr.deny
-# are the SHUTDOWN_AUTHORITY-tokened SEND and its no-auth twin;
-# devmgr.test is the REGISTRY_QUERY_AUTHORITY | ORPHAN_TEST_AUTHORITY
-# SEND that drives the devmgr orphan-teardown phase's TEST_SPAWN_ORPHAN
-# shim (TODO(#165)) and, lacking SHUTDOWN_DEVICE_AUTHORITY, the
-# QUERY_SHUTDOWN_DEVICE deny check.
+# Seeds resolve through svcmgr's discovery registry, each seed-only (no
+# QUERY_ENDPOINT reaches them): rootfs.root is the FS-driver-agnostic
+# root-mount cap; pwrmgr.shutdown is the SHUTDOWN_AUTHORITY-tokened SEND;
+# devmgr.registry is the REGISTRY_QUERY_AUTHORITY SEND the devmgr deny
+# phases send the gated labels on; devmgr.test is the
+# REGISTRY_QUERY_AUTHORITY | ORPHAN_TEST_AUTHORITY SEND that drives the
+# orphan-teardown phase's TEST_SPAWN_ORPHAN shim (TODO(#165)). svctest
+# resolves the public pwrmgr.deny no-auth twin itself via QUERY_ENDPOINT.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT
 # scan. To enable in a boot, copy this file into
@@ -22,4 +23,4 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny devmgr.test
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test

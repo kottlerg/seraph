@@ -79,19 +79,21 @@ devmgr's responsibilities are:
   owner of the ACPI Memory caps and the only service that walks the ACPI
   table tree (RSDP → XSDT). `QUERY_ACPI_TABLE` locates a table by
   signature or physical address and serves a read-only view of it (devmgr
-  reads only the directory and table headers to locate it, never a table
-  body). `QUERY_SHUTDOWN_DEVICE` carves the shutdown-actuator caps pwrmgr
+  reads only the directory and table headers to locate it).
+  `QUERY_SHUTDOWN_DEVICE` carves the shutdown-actuator caps pwrmgr
   needs — two narrow `IoPort` caps on x86-64, one over the PM1a control port
   and one over the 8042 reset port, or a Reset-only `SbiControl` derivation
   on RISC-V. pwrmgr names the PM1a port it computed from the FADT, and devmgr
-  serves it only when it equals the FADT's `PM1a_CNT_BLK`, the one table-body
-  field devmgr reads. On every call the caps are re-derived from the
+  serves it only when it equals the FADT's `PM1a_CNT_BLK`, which devmgr reads
+  itself (the only table-body field it reads beside the MCFG allocation entry
+  it locates the ECAM from). On every call the caps are re-derived from the
   `IoPort` / `SbiControl` caps devmgr holds, so nothing is consumed and a
   restarted pwrmgr re-acquires them cleanly. devmgr runs no shutdown logic;
   it brokers the hardware, pwrmgr interprets and actuates. `QUERY_ACPI_TABLE`
   is gated on `REGISTRY_QUERY_AUTHORITY`; `QUERY_SHUTDOWN_DEVICE` on
-  `SHUTDOWN_DEVICE_AUTHORITY`, which only the `devmgr.shutdown` cap pwrmgr
-  seeds carries.
+  `SHUTDOWN_DEVICE_AUTHORITY`, which only the `devmgr.shutdown` cap carries:
+  a seed-only name pwrmgr alone seeds, which svcmgr's `QUERY_ENDPOINT`
+  refuses.
 - **Handle hotplug** (design intent; not yet implemented) — on platforms that support it,
   receive hotplug notifications and dynamically spawn or terminate driver processes. See
   [`docs/hotplug.md`](hotplug.md).

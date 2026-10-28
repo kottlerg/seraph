@@ -19,7 +19,7 @@ A SEND on the same endpoint (carrying neither the
 every process via
 [`ProcessInfo.service_registry_cap`](../../../abi/process-abi/README.md#processinfo)
 so userspace consumers can
-`QUERY_ENDPOINT` for published names.
+`QUERY_ENDPOINT` for the public published names.
 
 ---
 
@@ -172,6 +172,16 @@ Insert a `name → cap` mapping into svcmgr's discovery registry.
 Look up a name in the discovery registry; reply transfers a
 freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint.
 
+Only public names resolve. A name whose cap carries authority is published
+seed-only and answers `UNKNOWN_NAME`, as an unknown name does: `rootfs.root`,
+the three `devmgr.*` names, and each provider name whose badge carries a verb
+bit (`ipc::VERB_BIT_MASK`; the `:auth` entries, today `pwrmgr.shutdown`). A
+seed-only name reaches a process only through a recipe's `seed = ...` line,
+which svcmgr resolves itself, so its authority stays with the recipes that
+seed it ([service-definitions.md § `seed`](service-definitions.md#seed)). The
+public names are `svcmgr`, `pwrmgr.deny`, `timed`, and any name published
+through [`PUBLISH_ENDPOINT`](#label-3-publish_endpoint).
+
 **Request:**
 
 | Field | Value |
@@ -184,7 +194,7 @@ freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint.
 | label value | Caps | Meaning |
 |---|---|---|
 | `0` (`SUCCESS`) | `[derived_send]` | Name resolved; cap transferred |
-| `UNKNOWN_NAME` | — | No mapping for `name` |
+| `UNKNOWN_NAME` | — | No mapping for `name`, or `name` is seed-only |
 | `INSUFFICIENT_CAPS` | — | Stored cap could not be derived (publisher gone); entry evicted |
 | `INVALID_NAME` | — | `name_len` is 0 or exceeds `registry::NAME_MAX` |
 

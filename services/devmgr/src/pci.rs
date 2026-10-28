@@ -72,71 +72,94 @@ struct Ecam
 
 impl Ecam
 {
-    /// Virtual address of a BDF + register. `bus` must be at least
-    /// `start_bus`.
-    fn addr(self, bus: u8, dev: u8, func: u8, reg: u16) -> u64
+    /// Virtual address of a BDF + register, or `None` when `bus` is below
+    /// `start_bus` or a field is out of range
+    /// ([`firmware::pci::config_offset`]).
+    fn addr(self, bus: u8, dev: u8, func: u8, reg: u16) -> Option<u64>
     {
-        self.va
-            + ((u64::from(bus - self.start_bus) << 20)
-                | (u64::from(dev) << 15)
-                | (u64::from(func) << 12)
-                | u64::from(reg))
+        Some(self.va + firmware::pci::config_offset(self.start_bus, bus, dev, func, reg)?)
     }
 }
 
-/// Read a u8 from ECAM config space.
+/// Read a u8 from ECAM config space; all-ones, as a master abort reads, for
+/// an address outside the window.
 ///
 /// # Safety
-/// `ecam` must describe a valid ECAM MMIO mapping, and the BDF + reg
-/// must lie within it.
+/// `ecam` must describe a valid ECAM MMIO mapping, and every bus from
+/// `start_bus` through `bus` must lie within it.
 unsafe fn ecam_read8(ecam: Ecam, bus: u8, dev: u8, func: u8, reg: u16) -> u8
 {
+    let Some(addr) = ecam.addr(bus, dev, func, reg)
+    else
+    {
+        return u8::MAX;
+    };
     // SAFETY: caller guarantees the BDF + reg lies within the ECAM mapping.
-    unsafe { core::ptr::read_volatile(ecam.addr(bus, dev, func, reg) as *const u8) }
+    unsafe { core::ptr::read_volatile(addr as *const u8) }
 }
 
-/// Read a u16 from ECAM config space.
+/// Read a u16 from ECAM config space; all-ones for an address outside the
+/// window.
 ///
 /// # Safety
 /// See [`ecam_read8`].
 unsafe fn ecam_read16(ecam: Ecam, bus: u8, dev: u8, func: u8, reg: u16) -> u16
 {
+    let Some(addr) = ecam.addr(bus, dev, func, reg)
+    else
+    {
+        return u16::MAX;
+    };
     // SAFETY: caller guarantees the BDF + reg lies within the ECAM mapping.
-    unsafe { core::ptr::read_volatile(ecam.addr(bus, dev, func, reg) as *const u16) }
+    unsafe { core::ptr::read_volatile(addr as *const u16) }
 }
 
-/// Read a u32 from ECAM config space.
+/// Read a u32 from ECAM config space; all-ones for an address outside the
+/// window.
 ///
 /// # Safety
 /// See [`ecam_read8`].
 unsafe fn ecam_read32(ecam: Ecam, bus: u8, dev: u8, func: u8, reg: u16) -> u32
 {
+    let Some(addr) = ecam.addr(bus, dev, func, reg)
+    else
+    {
+        return u32::MAX;
+    };
     // SAFETY: caller guarantees the BDF + reg lies within the ECAM mapping.
-    unsafe { core::ptr::read_volatile(ecam.addr(bus, dev, func, reg) as *const u32) }
+    unsafe { core::ptr::read_volatile(addr as *const u32) }
 }
 
-/// Write a u16 to ECAM config space.
+/// Write a u16 to ECAM config space; no-op for an address outside the
+/// window.
 ///
 /// # Safety
 /// See [`ecam_read8`].
 unsafe fn ecam_write16(ecam: Ecam, bus: u8, dev: u8, func: u8, reg: u16, val: u16)
 {
+    let Some(addr) = ecam.addr(bus, dev, func, reg)
+    else
+    {
+        return;
+    };
     // SAFETY: caller guarantees the BDF + reg lies within the ECAM mapping.
-    unsafe {
-        core::ptr::write_volatile(ecam.addr(bus, dev, func, reg) as *mut u16, val);
-    }
+    unsafe { core::ptr::write_volatile(addr as *mut u16, val) };
 }
 
-/// Write a u32 to ECAM config space.
+/// Write a u32 to ECAM config space; no-op for an address outside the
+/// window.
 ///
 /// # Safety
 /// See [`ecam_read8`].
 unsafe fn ecam_write32(ecam: Ecam, bus: u8, dev: u8, func: u8, reg: u16, val: u32)
 {
+    let Some(addr) = ecam.addr(bus, dev, func, reg)
+    else
+    {
+        return;
+    };
     // SAFETY: caller guarantees the BDF + reg lies within the ECAM mapping.
-    unsafe {
-        core::ptr::write_volatile(ecam.addr(bus, dev, func, reg) as *mut u32, val);
-    }
+    unsafe { core::ptr::write_volatile(addr as *mut u32, val) };
 }
 
 // ── PCI enumeration ─────────────────────────────────────────────────────────
@@ -146,17 +169,10 @@ unsafe fn ecam_write32(ecam: Ecam, bus: u8, dev: u8, func: u8, reg: u16, val: u3
 /// # Safety
 /// `ecam_va` must be a valid ECAM MMIO mapping of buses
 /// `start_bus..=end_bus`, 1 MiB per bus, beginning with `start_bus`.
-// clippy::too_many_lines: pci_enumerate walks bus × device × function ×
-// BAR with the size-probe protocol from PCI Local Bus Spec r3.0 §6.2.5.1
-// ("write 0xFFFFFFFF, read back, mask, restore"). The probe-and-restore
-// sequence must happen inside the same per-BAR scope as the later size
-// computation and 64-bit-BAR pairing because the restored original value
-// is read back out of `bar_phys[b]` in a subsequent iteration. Extracting
-// `probe_bar(cfg_va, idx, out) -> size` or `check_64bit_bar(...)` helpers
-// leaves the restore-plus-merge logic out-of-scope of the helper and
-// requires passing pci_dev's growing BAR-state arrays by &mut across
-// every call; the linear body lets each function's BAR loop own its own
-// four parallel arrays without lifetime-threading overhead.
+// clippy::too_many_lines: pci_enumerate walks bus × device × function and
+// assembles each `PciDevice` inline from its config-space reads; a
+// per-function helper would thread the ECAM handle, the device count, and
+// the output array through every call for no reuse.
 #[allow(clippy::too_many_lines)]
 pub unsafe fn pci_enumerate(
     ecam_va: u64,
@@ -260,33 +276,51 @@ pub unsafe fn pci_enumerate(
 /// PCI Command register offset and its I/O- and Memory-space decode enables.
 const PCI_COMMAND: u16 = 0x04;
 const PCI_COMMAND_DECODE: u16 = 0x3;
+/// Class-code register offsets (base class at 0x0B, subclass at 0x0A).
+const PCI_CLASS: u16 = 0x0B;
+const PCI_SUBCLASS: u16 = 0x0A;
 
 /// Probe BAR registers for a type-0 PCI header device.
 ///
 /// I/O and Memory decode are disabled for the probe, so the device never
-/// decodes at the all-ones sizing address, and restored afterwards.
+/// decodes at the all-ones sizing address, and restored afterwards; the
+/// Command register is written only when a decode bit was set. A host
+/// bridge (base class 0x06, subclass 0x00) keeps decode on, since turning
+/// it off can cut off resources the running system decodes through it.
 ///
 /// # Safety
 /// `ecam` must be a valid ECAM MMIO mapping.
 unsafe fn probe_bars(ecam: Ecam, dev: &mut PciDevice)
 {
     // SAFETY: ecam is valid.
+    let class = unsafe { ecam_read8(ecam, dev.bus, dev.dev, dev.func, PCI_CLASS) };
+    // SAFETY: ecam is valid.
+    let subclass = unsafe { ecam_read8(ecam, dev.bus, dev.dev, dev.func, PCI_SUBCLASS) };
+    let host_bridge = class == 0x06 && subclass == 0x00;
+    // SAFETY: ecam is valid.
     let command = unsafe { ecam_read16(ecam, dev.bus, dev.dev, dev.func, PCI_COMMAND) };
-    // SAFETY: ecam is valid; decode is off only for the probe below.
-    unsafe {
-        ecam_write16(
-            ecam,
-            dev.bus,
-            dev.dev,
-            dev.func,
-            PCI_COMMAND,
-            command & !PCI_COMMAND_DECODE,
-        );
+    let toggle = !host_bridge && command & PCI_COMMAND_DECODE != 0;
+    if toggle
+    {
+        // SAFETY: ecam is valid; decode is off only for the probe below.
+        unsafe {
+            ecam_write16(
+                ecam,
+                dev.bus,
+                dev.dev,
+                dev.func,
+                PCI_COMMAND,
+                command & !PCI_COMMAND_DECODE,
+            );
+        }
     }
     // SAFETY: ecam is valid (caller guarantee).
     unsafe { probe_bar_registers(ecam, dev) };
-    // SAFETY: ecam is valid; restores the original Command value.
-    unsafe { ecam_write16(ecam, dev.bus, dev.dev, dev.func, PCI_COMMAND, command) };
+    if toggle
+    {
+        // SAFETY: ecam is valid; restores the original Command value.
+        unsafe { ecam_write16(ecam, dev.bus, dev.dev, dev.func, PCI_COMMAND, command) };
+    }
 }
 
 /// Size and record each BAR of a type-0 header. A 64-bit MMIO BAR is sized
@@ -321,7 +355,6 @@ unsafe fn probe_bar_registers(ecam: Ecam, dev: &mut PciDevice)
 
         if is_mmio
         {
-            let mask = sized & !0xF;
             let bar_base = u64::from(orig & !0xF);
 
             if is_64bit && bar_idx + 1 < 6
@@ -335,8 +368,7 @@ unsafe fn probe_bar_registers(ecam: Ecam, dev: &mut PciDevice)
                 let hi_sized = unsafe { ecam_read32(ecam, dev.bus, dev.dev, dev.func, hi_reg) };
                 // SAFETY: ecam is valid; restoring the original upper BAR value.
                 unsafe { ecam_write32(ecam, dev.bus, dev.dev, dev.func, hi_reg, hi_orig) };
-                let mask64 = (u64::from(hi_sized) << 32) | u64::from(mask);
-                let bar_sz = (!mask64).wrapping_add(1);
+                let bar_sz = firmware::pci::mmio_bar_size(sized, Some(hi_sized));
                 let bar_base = bar_base | (u64::from(hi_orig) << 32);
 
                 if dev.bar_count < MAX_BARS
@@ -351,7 +383,7 @@ unsafe fn probe_bar_registers(ecam: Ecam, dev: &mut PciDevice)
                 continue;
             }
 
-            let bar_sz = (!u64::from(mask)).wrapping_add(1) & 0xFFFF_FFFF;
+            let bar_sz = firmware::pci::mmio_bar_size(sized, None);
             if dev.bar_count < MAX_BARS
             {
                 dev.bar_phys[dev.bar_count] = bar_base;
@@ -363,8 +395,7 @@ unsafe fn probe_bar_registers(ecam: Ecam, dev: &mut PciDevice)
         }
         else
         {
-            let mask = sized & !0x3;
-            let bar_sz = u64::from((!mask).wrapping_add(1) & 0xFFFF);
+            let bar_sz = firmware::pci::io_bar_size(sized);
             let bar_base = u64::from(orig & !0x3);
 
             if dev.bar_count < MAX_BARS
@@ -473,7 +504,9 @@ unsafe fn read_virtio_pci_caps(ecam: Ecam, dev: &mut PciDevice)
 ///
 /// Uses `mmio_split` to split at BAR boundaries. The window cap is consumed:
 /// any portion below the BAR is released (deleted), and the portion above
-/// it replaces the window in place. Returns the per-BAR cap slot.
+/// it replaces the window in place. Returns the per-BAR cap slot; on `None`
+/// the window describes the cap that remains (the original, or the portion
+/// from the BAR onward when only the second split failed).
 pub fn split_bar_cap(
     window_slot: &mut u32,
     window_base: &mut u64,
@@ -489,24 +522,17 @@ pub fn split_bar_cap(
 
     let offset_in_window = bar_phys - *window_base;
 
-    let working_slot;
-    let working_base;
-    let working_size;
-
     if offset_in_window > 0
     {
         let (lower, upper) = syscall::mmio_split(*window_slot, offset_in_window).ok()?;
         let _ = syscall::cap_delete(lower);
-        working_slot = upper;
-        working_base = *window_base + offset_in_window;
-        working_size = *window_size - offset_in_window;
+        *window_slot = upper;
+        *window_base += offset_in_window;
+        *window_size -= offset_in_window;
     }
-    else
-    {
-        working_slot = *window_slot;
-        working_base = *window_base;
-        working_size = *window_size;
-    }
+    let working_slot = *window_slot;
+    let working_base = *window_base;
+    let working_size = *window_size;
 
     if bar_size < working_size
     {

@@ -3,13 +3,15 @@
 
 // services/devmgr/firmware/src/lib.rs
 
-//! Firmware-table parsers for devmgr.
+//! Firmware-table parsers and PCI configuration-space arithmetic for devmgr.
 //!
 //! Narrow subset lifted from `core/boot/src/{acpi,dtb}.rs`. Walks ACPI tables
-//! (RSDP → XSDT → MCFG) and flattened device trees for the PCI ECAM
-//! location. The parsers read caller-mapped byte slices and touch no
-//! syscall, IPC, or `std::os::seraph` surface, so the crate is
-//! host-reachable and host-tested; devmgr maps the tables and drives them.
+//! (RSDP → XSDT → MCFG, plus the FADT's `PM1a_CNT_BLK` for the shutdown
+//! broker's check) and flattened device trees for the PCI ECAM location, and
+//! computes ECAM register offsets and BAR sizes. The functions read
+//! caller-mapped byte slices or values and touch no syscall, IPC, or
+//! `std::os::seraph` surface, so the crate is host-reachable and
+//! host-tested; devmgr maps the tables and config space and drives them.
 //! If another service needs the same walks, promote this to
 //! `shared/firmware`. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
@@ -18,6 +20,7 @@
 
 pub mod acpi;
 pub mod dtb;
+pub mod pci;
 
 /// Location of the PCI ECAM configuration-space region discovered from
 /// MCFG (ACPI) or a `pci-host-ecam-generic` DTB node.

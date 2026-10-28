@@ -641,8 +641,8 @@ via ACPI (x86_64) or SBI (riscv64) per `KtestConfig::DEFAULT.shutdown_policy`
 - **Completion behavior.** A harness MUST request `pwrmgr` shutdown when
   it finishes (pass or fail). This terminates the QEMU instance and lets
   CI move on. Harnesses launched as services obtain the shutdown
-  capability via the `pwrmgr.shutdown` and `pwrmgr.deny` seeds in their
-  `.svc` recipe.
+  capability via the seed-only `pwrmgr.shutdown` seed in their `.svc`
+  recipe.
 - **Restart policy.** A harness MUST set `restart = never` in its `.svc`
   recipe. Re-running on accidental exit corrupts CI semantics.
 - **Critical class.** A harness MUST set `critical = no`. Harness death

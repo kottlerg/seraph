@@ -6,7 +6,11 @@ capability-slot indices in its own CSpace. Storage is statically sized (`N` entr
 `NAME_MAX`-byte names) and the crate needs no allocator. A lookup requires a full bytewise
 name match, with no prefix or glob matching.
 
-`no_std`, no dependencies.
+Each entry is published `Public` or `SeedOnly`. A lookup names its resolver: `Query` (a
+`QUERY_ENDPOINT` caller) sees only `Public` entries, and `Seed` (the supervisor's own seed
+resolution) sees both, so a `SeedOnly` name reaches only the recipes that seed it.
+
+`no_std` outside host tests, no dependencies.
 
 ---
 
@@ -17,7 +21,7 @@ shared/registry/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── lib.rs                  # NAME_MAX, Entry, Registry<N>
+    └── lib.rs                  # NAME_MAX, Visibility, Resolver, Entry, Registry<N>; host tests
 ```
 
 ---

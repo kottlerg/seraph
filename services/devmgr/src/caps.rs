@@ -7,8 +7,8 @@
 //!
 //! Receives raw firmware-access caps and an MMIO aperture list from init,
 //! plus a full-rights derivation of the root Interrupt range cap. Parsing
-//! (MCFG / DTB → ECAM) happens later in the `devmgr-firmware` crate; this
-//! module owns only the IPC handshake.
+//! (MCFG / DTB → ECAM, FADT → PM1a) happens later in the `devmgr-firmware`
+//! crate; this module owns only the IPC handshake.
 
 use std::os::seraph::StartupInfo;
 
@@ -223,11 +223,14 @@ impl DevmgrCaps
 //   data[3] = dtb_size       (valid if DTB bit set)
 //
 // Round 2+ (variable, ≤4 caps, up to 10 data words)
-//   data[0] = round kind (APERTURE / ACPI_REGION / MODULE)
+//   data[0] = round kind (APERTURE / ACPI_REGION / MODULE /
+//             FRAMEBUFFER_INFO / SVCMGR_BUNDLE)
 //   data[1] = count of caps in this round
 //   data[2..] = kind-specific payload:
 //     APERTURE / ACPI_REGION → (base, size) pairs per cap
-//     MODULE → no payload
+//     MODULE → one `module_kind` tag per cap
+//     FRAMEBUFFER_INFO → no caps; framebuffer geometry words
+//     SVCMGR_BUNDLE → two caps, no payload; the terminal round
 //   Terminal round has `done = true`.
 //
 // log_ep + procmgr_ep arrive via ProcessInfo / StartupInfo, not this protocol.

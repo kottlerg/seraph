@@ -186,7 +186,7 @@ const MAX_APERTURE_CAPS: usize = 32;
 const MAX_ACPI_REGION_CAPS: usize = 8;
 
 /// Collected hardware caps: init forwards raw firmware + MMIO surfaces
-/// to devmgr. Parsing (MCFG → ECAM, MADT → GSI routing) lives in devmgr.
+/// to devmgr. Parsing (MCFG / DTB → ECAM, FADT → PM1a) lives in devmgr.
 struct HwCaps
 {
     /// Root `Interrupt` range cap. Zero if the kernel did not mint one.
@@ -805,9 +805,9 @@ pub fn create_vfsd_with_caps(
         return None;
     };
     // vfsd is the sole devmgr `QUERY_BLOCK_DEVICE` consumer today;
-    // tag its SEND with `REGISTRY_QUERY_AUTHORITY` so devmgr's
-    // upstream gate admits the call. Future registry consumers
-    // receive a copy without the bit and are rejected at devmgr.
+    // tag its SEND with `REGISTRY_QUERY_AUTHORITY`, as every devmgr
+    // registry cap svcmgr publishes is, so devmgr's upstream gate admits
+    // the call. An unbadged copy is rejected at devmgr.
     let Ok(registry_copy) = syscall::cap_derive_badge(
         spawn.registry_ep,
         syscall::RIGHTS_EP_SEND,

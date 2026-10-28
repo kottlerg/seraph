@@ -33,6 +33,7 @@ mod service;
 
 use definitions::reconcile::PendingRegistration;
 use ipc::{IpcMessage, svcmgr_labels};
+use registry::{Resolver, Visibility};
 use service::{MAX_SERVICES, RestartRecipe, ServiceEntry, bootstrap_caps};
 use std::os::seraph::{StartupInfo, startup_info};
 
@@ -192,11 +193,16 @@ fn publish_well_known(
 {
     // rootfs.root — SEND on the root filesystem's namespace endpoint,
     // endowed pre-derived by init. Published as-is; `registry_lookup_derived`
-    // re-derives a SEND per consumer and the badge survives.
+    // re-derives a SEND per consumer and the badge survives. Seed-only: the
+    // whole-filesystem namespace reaches only the recipes that seed it.
     if caps.rootfs_root != 0
     {
         if registry
-            .publish(ipc::published_names::ROOTFS_ROOT, caps.rootfs_root)
+            .publish(
+                ipc::published_names::ROOTFS_ROOT,
+                caps.rootfs_root,
+                Visibility::SeedOnly,
+            )
             .is_err()
         {
             std::os::seraph::log!("publish rootfs.root failed");
@@ -220,7 +226,7 @@ fn publish_well_known(
         Ok(send) =>
         {
             if registry
-                .publish(ipc::published_names::SVCMGR, send)
+                .publish(ipc::published_names::SVCMGR, send, Visibility::Public)
                 .is_err()
             {
                 std::os::seraph::log!("publish svcmgr failed");
@@ -232,8 +238,9 @@ fn publish_well_known(
 
     // devmgr.registry / devmgr.shutdown / devmgr.test — badged SENDs minted
     // from the endowed badge-0 `SEND|GRANT` source. The badge bits ride
-    // through `registry_lookup_derived`'s plain `cap_derive` to consumers;
-    // only the seeding recipes (pwrmgr, svctest) receive the extra bits.
+    // through `registry_lookup_derived`'s plain `cap_derive` to consumers.
+    // Each carries verb-bit authority, so each is seed-only: `QUERY_ENDPOINT`
+    // refuses it, and only the recipes that seed the name hold its bits.
     let query = ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY;
     for (name, badge) in [
         (ipc::published_names::DEVMGR_REGISTRY, query),
@@ -251,9 +258,9 @@ fn publish_well_known(
     }
 }
 
-/// Publish `name` as a `badge`-badged SEND minted from the endowed
-/// devmgr-registry `source`; logs and skips when the source is absent or
-/// the derive or publish fails.
+/// Publish `name` seed-only as a `badge`-badged SEND minted from the
+/// endowed devmgr-registry `source`; logs and skips when the source is
+/// absent or the derive or publish fails.
 fn publish_devmgr_registry_send(
     registry: &mut registry::Registry<REGISTRY_CAPACITY>,
     source: u32,
@@ -271,7 +278,7 @@ fn publish_devmgr_registry_send(
     {
         Ok(send) =>
         {
-            if registry.publish(name, send).is_err()
+            if registry.publish(name, send, Visibility::SeedOnly).is_err()
             {
                 std::os::seraph::log!("publish {shown} failed");
                 let _ = syscall::cap_delete(send);
@@ -578,7 +585,9 @@ fn handle_publish_endpoint(
         return ipc::svcmgr_errors::INSUFFICIENT_CAPS;
     }
     let name = read_tail_name_from_msg(msg, 0, name_len);
-    if registry.publish(&name[..name_len], delivered_cap).is_err()
+    if registry
+        .publish(&name[..name_len], delivered_cap, Visibility::Public)
+        .is_err()
     {
         return reject(ipc::svcmgr_errors::REGISTER_REJECTED);
     }
@@ -592,15 +601,17 @@ fn handle_publish_endpoint(
 /// `INSUFFICIENT_CAPS`. Returns a `svcmgr_errors::*` code on miss or
 /// derivation failure.
 ///
-/// Shared by `QUERY_ENDPOINT` (IPC) and the post-handover launch path
-/// (resolves each `.svc` `seed = ...` name into a cap to inject into
-/// the child's bootstrap round).
+/// Shared by `QUERY_ENDPOINT` (IPC, [`Resolver::Query`]: seed-only names
+/// answer `UNKNOWN_NAME`) and svcmgr's own resolution ([`Resolver::Seed`]:
+/// each `.svc` `seed = ...` name on the launch and restart paths, and the
+/// `pwrmgr.shutdown` cap of a graceful shutdown).
 pub(crate) fn registry_lookup_derived(
     registry: &mut registry::Registry<REGISTRY_CAPACITY>,
     name: &[u8],
+    resolver: Resolver,
 ) -> Result<u32, u64>
 {
-    let Some(cap) = registry.lookup(name)
+    let Some(cap) = registry.lookup(name, resolver)
     else
     {
         return Err(ipc::svcmgr_errors::UNKNOWN_NAME);
@@ -632,7 +643,7 @@ fn handle_query_endpoint(
         return;
     }
     let name = read_tail_name_from_msg(msg, 0, name_len);
-    match registry_lookup_derived(registry, &name[..name_len])
+    match registry_lookup_derived(registry, &name[..name_len], Resolver::Query)
     {
         Ok(derived) =>
         {
@@ -732,7 +743,11 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
     }
 
     let shutdown_cap =
-        match registry_lookup_derived(&mut state.registry, ipc::published_names::PWRMGR_SHUTDOWN)
+        match registry_lookup_derived(
+            &mut state.registry,
+            ipc::published_names::PWRMGR_SHUTDOWN,
+            Resolver::Seed,
+        )
         {
             Ok(c) => c,
             Err(code) =>

@@ -68,8 +68,8 @@ fn read_u64(buf: &[u8], off: usize) -> u64
 
 /// Read the XSDT physical address from the mapped RSDP slice.
 ///
-/// Returns `None` if the signature doesn't match or the ACPI revision
-/// is pre-2.0.
+/// Returns `None` if the slice is shorter than [`RSDP_LEN`], the signature
+/// doesn't match, the ACPI revision is pre-2.0, or the XSDT address is zero.
 #[must_use]
 pub fn rsdp_xsdt_phys(rsdp_bytes: &[u8]) -> Option<u64>
 {
@@ -160,7 +160,8 @@ pub fn fadt_pm1a_cnt_blk(fadt_bytes: &[u8]) -> Option<u16>
 /// window, at `start_bus`.
 ///
 /// Returns `None` if the signature isn't `MCFG`, no entry is present, or
-/// the entry has a zero base or an end bus below its start bus.
+/// the entry has a zero base, an end bus below its start bus, or a window
+/// whose start or end overflows the physical address space.
 #[must_use]
 pub fn parse_mcfg_ecam(mcfg_bytes: &[u8]) -> Option<EcamLocation>
 {
@@ -193,9 +194,11 @@ pub fn parse_mcfg_ecam(mcfg_bytes: &[u8]) -> Option<EcamLocation>
         return None;
     }
     let bus_count = u64::from(end_bus) - u64::from(start_bus) + 1;
-    let size = bus_count * 256 * 4096;
+    let size = bus_count << 20;
+    let phys_base = base.checked_add(u64::from(start_bus) << 20)?;
+    phys_base.checked_add(size)?;
     Some(EcamLocation {
-        phys_base: base + (u64::from(start_bus) << 20),
+        phys_base,
         size,
         start_bus,
         end_bus,
@@ -299,6 +302,17 @@ mod tests
     }
 
     #[test]
+    fn xsdt_entries_are_bounded_by_the_reported_length_inside_the_slice()
+    {
+        let mut b = sdt(b"XSDT", 36 + 16);
+        b[36..44].copy_from_slice(&0x1111u64.to_le_bytes());
+        b[44..52].copy_from_slice(&0x2222u64.to_le_bytes());
+        b[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&44u32.to_le_bytes());
+        let entries: Vec<u64> = iter_xsdt_entries(&b).collect();
+        assert_eq!(entries, [0x1111]);
+    }
+
+    #[test]
     fn xsdt_shorter_than_its_header_has_no_entries()
     {
         let mut b = sdt(b"XSDT", 36 + 8);
@@ -389,5 +403,12 @@ mod tests
     fn mcfg_entry_with_end_bus_below_start_bus_yields_no_ecam()
     {
         assert!(parse_mcfg_ecam(&mcfg(0xB000_0000, 4, 3)).is_none());
+    }
+
+    #[test]
+    fn mcfg_entry_whose_window_overflows_yields_no_ecam()
+    {
+        assert!(parse_mcfg_ecam(&mcfg(u64::MAX - (1 << 20), 1, 1)).is_none());
+        assert!(parse_mcfg_ecam(&mcfg(u64::MAX - (1 << 20) + 2, 0, 0)).is_none());
     }
 }

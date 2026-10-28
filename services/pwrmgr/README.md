@@ -69,10 +69,11 @@ Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
    caps are mapped read-only and dropped after parsing.
 3. Consumers permitted to power the platform off seed `pwrmgr.shutdown`
    (e.g. svctest, and svcmgr's own critical-service-death escalation); the
-   badge rides through the registry lookup unchanged
+   badge rides through the registry lookup unchanged, and the name is
+   seed-only, so `QUERY_ENDPOINT` does not hand it out
    ([`provides`](../svcmgr/docs/service-definitions.md#provides)). svctest
-   also seeds `pwrmgr.deny`, the negative-test twin, to assert the gate
-   rejects an unauthorised cap
+   also resolves the public `pwrmgr.deny`, the negative-test twin, to
+   assert the gate rejects an unauthorised cap
    ([`provides`](../svcmgr/docs/service-definitions.md#provides);
    [svctest Capabilities](../svctest/README.md#capabilities)).
 4. svctest, at the end of `main()` after `ALL TESTS PASSED`, sends

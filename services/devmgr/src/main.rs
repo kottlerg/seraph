@@ -1294,6 +1294,9 @@ pub struct DeviceCatalog<'a>
 }
 
 /// Find and spawn a `VirtIO` block device driver from the discovered devices.
+/// Returns `false` without spawning when no virtio-blk device or driver
+/// module is present, the catalog entry cannot be filled, or no single-IRQ
+/// cap can be split for the device (virtio-blk requires an IRQ).
 fn spawn_virtio_blk(
     devices: &[pci::PciDevice],
     caps: &mut caps::DevmgrCaps,
@@ -1330,6 +1333,16 @@ fn spawn_virtio_blk(
             return false;
         }
 
+        // virtio-blk requires an IRQ: it rejects the 2-cap no-IRQ round 1
+        // and exits, which would leave `spawn_driver` blocked serving round
+        // 2. Refuse the spawn instead.
+        let Some(irq_cap) = acquire_single_irq_cap(pci_dev, irq_range)
+        else
+        {
+            std::os::seraph::log!("virtio-blk: no IRQ cap for the device; not spawned");
+            return false;
+        };
+
         let dev_idx = *catalog.count;
         if dev_idx < catalog.entries.len()
         {
@@ -1341,6 +1354,7 @@ fn spawn_virtio_blk(
             if pci_dev.virtio_info.to_bytes(&mut buf).is_none()
             {
                 std::os::seraph::log!("virtio: to_bytes overflowed (catalog entry skipped)");
+                let _ = syscall::cap_delete(irq_cap);
                 return false;
             }
             if !catalog.entries[dev_idx].fill(
@@ -1350,6 +1364,7 @@ fn spawn_virtio_blk(
             )
             {
                 std::os::seraph::log!("virtio: catalog entry payload too large");
+                let _ = syscall::cap_delete(irq_cap);
                 return false;
             }
             *catalog.count += 1;
@@ -1362,7 +1377,6 @@ fn spawn_virtio_blk(
         let device_badge = (dev_idx as u64) + 1;
 
         let bar_info = find_virtio_bar_cap(pci_dev, caps);
-        let irq_cap = acquire_single_irq_cap(pci_dev, irq_range);
 
         let config = spawn::DriverSpawnConfig {
             procmgr_ep: caps.procmgr_ep,
@@ -1373,7 +1387,7 @@ fn spawn_virtio_blk(
                 bases: &bar_info.1[..bar_info.2],
                 sizes: &bar_info.3[..bar_info.2],
             },
-            irq_cap,
+            irq_cap: Some(irq_cap),
             service_ep: blk_ep,
             registry_ep: caps.registry_ep,
             device_badge,

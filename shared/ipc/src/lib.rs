@@ -815,16 +815,18 @@ pub mod svcmgr_labels
     ///
     /// Label bits 16..31 carry `name_len` (see `shared/ipc` `read_path`
     /// pattern); data words from 0 carry the name. Reply attaches the cap on
-    /// success, or returns `svcmgr_errors::UNKNOWN_NAME` on miss.
+    /// success, or returns `svcmgr_errors::UNKNOWN_NAME` on miss and for a
+    /// seed-only name (one whose cap carries authority, which reaches only
+    /// the recipes seeding it; see [`crate::published_names`]).
     pub const QUERY_ENDPOINT: u64 = 4;
 
     /// Verb-bit carried by the caller's badge to authorise
     /// [`PUBLISH_ENDPOINT`] by an *external* publisher (no per-publisher
     /// identity in the low bits today — server-side auth is binary: have
     /// the bit, or don't). svcmgr publishes the well-known names it owns
-    /// (`rootfs.root`, `svcmgr`, `devmgr.registry`, and each provider's
-    /// `provides` names) directly into its own registry, so those need no
-    /// badge. The gate exists for a future external publisher — devmgr
+    /// (`rootfs.root`, `svcmgr`, the three `devmgr.*` names, and each
+    /// provider's `provides` names) directly into its own registry, so those
+    /// need no badge. The gate exists for a future external publisher — devmgr
     /// holds a `PUBLISH_AUTHORITY`-badged SEND from its bootstrap bundle,
     /// reserved for driver registrations.
     ///
@@ -859,6 +861,12 @@ pub mod svcmgr_labels
 /// root filesystem from fatfs to e.g. ext4, or replacing pwrmgr's
 /// platform shutdown source, changes only the publisher's local
 /// derivation, not the published name nor any consumer.
+///
+/// A name whose cap carries authority is seed-only: `rootfs.root`, the
+/// three `devmgr.*` names, and each provider name whose badge carries a
+/// verb bit ([`crate::VERB_BIT_MASK`]; today `pwrmgr.shutdown`) resolve
+/// only through a recipe's `seed = ...` line, and `QUERY_ENDPOINT` answers
+/// them `UNKNOWN_NAME`. `svcmgr`, `pwrmgr.deny`, and `timed` are public.
 pub mod published_names
 {
     /// Badged SEND on the root filesystem's namespace endpoint at
@@ -867,8 +875,8 @@ pub mod published_names
     pub const ROOTFS_ROOT: &[u8] = b"rootfs.root";
 
     /// `pwrmgr_labels::SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's
-    /// service endpoint. Consumers needing power-off authority
-    /// resolve this name and call [`pwrmgr_labels::SHUTDOWN`] /
+    /// service endpoint. Seed-only: consumers needing power-off authority
+    /// seed this name and call [`pwrmgr_labels::SHUTDOWN`] /
     /// [`pwrmgr_labels::REBOOT`] through the returned cap.
     pub const PWRMGR_SHUTDOWN: &[u8] = b"pwrmgr.shutdown";
 
@@ -896,15 +904,17 @@ pub mod published_names
 
     /// SEND on devmgr's registry endpoint badged
     /// `REGISTRY_QUERY_AUTHORITY | SHUTDOWN_DEVICE_AUTHORITY`: the
-    /// `devmgr.registry` surface plus `QUERY_SHUTDOWN_DEVICE`. Seeded only
-    /// by pwrmgr, which acquires the platform shutdown actuators through it.
+    /// `devmgr.registry` surface plus `QUERY_SHUTDOWN_DEVICE`. Seed-only and
+    /// seeded only by pwrmgr, which acquires the platform shutdown actuators
+    /// through it.
     pub const DEVMGR_SHUTDOWN: &[u8] = b"devmgr.shutdown";
 
     /// TODO(#165): remove with devmgr's test labels. SEND on devmgr's
     /// registry endpoint badged
     /// `REGISTRY_QUERY_AUTHORITY | ORPHAN_TEST_AUTHORITY`: the
     /// `devmgr.registry` surface plus the `TEST_SPAWN_ORPHAN` /
-    /// `TEST_ORPHAN_RESULT` fault-injection shim. Seeded only by svctest.
+    /// `TEST_ORPHAN_RESULT` fault-injection shim. Seed-only and seeded only
+    /// by svctest.
     pub const DEVMGR_TEST: &[u8] = b"devmgr.test";
 }
 
@@ -1520,15 +1530,15 @@ pub mod devmgr_labels
     pub const DRIVERS_DIR_AUTHORITY: u64 = 1u64 << 62;
     /// Authority bit gating [`QUERY_SHUTDOWN_DEVICE`]. svcmgr mints it,
     /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
-    /// as [`crate::published_names::DEVMGR_SHUTDOWN`] (seeded by pwrmgr), so
-    /// a `devmgr.registry` holder cannot acquire the shutdown actuators.
-    /// Disjoint position from the other authority bits.
+    /// seed-only as [`crate::published_names::DEVMGR_SHUTDOWN`], which
+    /// pwrmgr alone seeds and `QUERY_ENDPOINT` refuses, so no other process
+    /// holds the bit. Disjoint position from the other authority bits.
     pub const SHUTDOWN_DEVICE_AUTHORITY: u64 = 1u64 << 61;
     /// TODO(#165): remove with the test labels. Authority bit gating
     /// [`TEST_SPAWN_ORPHAN`] and [`TEST_ORPHAN_RESULT`]. svcmgr mints it,
     /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
-    /// as [`crate::published_names::DEVMGR_TEST`] (seeded by svctest).
-    /// Disjoint position from the other authority bits.
+    /// seed-only as [`crate::published_names::DEVMGR_TEST`], which svctest
+    /// alone seeds. Disjoint position from the other authority bits.
     pub const ORPHAN_TEST_AUTHORITY: u64 = 1u64 << 60;
 }
 
@@ -1929,7 +1939,11 @@ pub mod stream_labels
 /// (docs/capability-model.md § Verb-bit authority pattern). Endpoints with no
 /// verb gate (bootstrap endpoints, memmgr, namespace node caps) do not
 /// reserve them.
-pub const VERB_BIT_MASK: u64 = (1u64 << 63) | (1u64 << 62);
+pub const VERB_BIT_MASK: u64 = (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60);
+const _: () = core::assert!(
+    devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
+        && devmgr_labels::ORPHAN_TEST_AUTHORITY & VERB_BIT_MASK != 0
+);
 
 /// Reserved log-endpoint badges.
 ///

@@ -44,7 +44,7 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test
 ```
 
 ## Keys
@@ -212,18 +212,21 @@ continue to work; consumers that don't fail on first use, which is the right sur
 misconfiguration.
 
 Well-known names are centralised in
-[`ipc::published_names`](../../../shared/ipc/src/lib.rs):
+[`ipc::published_names`](../../../shared/ipc/src/lib.rs). Every name
+resolves as a seed; only those marked in the Query column also resolve
+through `QUERY_ENDPOINT`, which refuses a seed-only name
+([ipc-interface.md § Label 4](ipc-interface.md#label-4-query_endpoint)):
 
-| Name | Publisher | Cap shape |
-|---|---|---|
-| `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on the root filesystem's namespace endpoint at its root directory (FS-driver-agnostic) |
-| `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint |
-| `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
-| `timed` | svcmgr (`timed.svc` provider) | un-badged SEND on timed's service endpoint (wall-clock) |
-| `svcmgr` | svcmgr (its own service endpoint) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) |
-| `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint |
-| `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) |
-| `devmgr.test` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| ORPHAN_TEST_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by svctest only; TODO(#165)) |
+| Name | Publisher | Cap shape | Query |
+|---|---|---|---|
+| `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on the root filesystem's namespace endpoint at its root directory (FS-driver-agnostic) | no |
+| `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint | no |
+| `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) | yes |
+| `timed` | svcmgr (`timed.svc` provider) | un-badged SEND on timed's service endpoint (wall-clock) | yes |
+| `svcmgr` | svcmgr (its own service endpoint) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) | yes |
+| `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
+| `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
+| `devmgr.test` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| ORPHAN_TEST_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by svctest only; TODO(#165)) | no |
 
 ## `provides`
 
@@ -238,13 +241,14 @@ restarts (svcmgr holds the source), so a cached client cap survives a
 crash-restart and no re-publish is needed.
 
 Each space-separated entry is `name[:auth|:deny]`; the suffix selects the
-badge svcmgr stamps on that name's SEND (the badge rides through a
-consumer's `QUERY_ENDPOINT` lookup unchanged):
+badge svcmgr stamps on that name's SEND (the badge rides through to a
+consumer unchanged), and a badge carrying a verb bit makes the name
+seed-only ([ipc-interface.md § Label 4](ipc-interface.md#label-4-query_endpoint)):
 
 | Suffix | Badge | Use |
 |---|---|---|
 | *(none)* | `0` (unbadged) | Plain SEND, for an endpoint whose server gates no label on a verb-bit: a consumer can badge an unbadged SEND itself ([Capability Model](../../../docs/capability-model.md#verb-bit-authority-pattern)). e.g. `timed`. |
-| `:auth` | `1 << 63` | The universal verb-authority bit shared by every `*_AUTHORITY` constant — the server's `badge & (1 << 63)` gate passes. e.g. `pwrmgr.shutdown:auth`. |
+| `:auth` | `1 << 63` | The first verb bit, the one a server's primary `*_AUTHORITY` gate tests — the server's `badge & (1 << 63)` gate passes. Seed-only: `QUERY_ENDPOINT` refuses the name. e.g. `pwrmgr.shutdown:auth`. |
 | `:deny` | `1` | Present so the cap resolves, but the authority gate fails. The negative-test twin. e.g. `pwrmgr.deny:deny`. |
 
 ```

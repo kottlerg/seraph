@@ -31,9 +31,9 @@ pub struct Bootstrap
 {
     /// pwrmgr's service endpoint (RECV). Zero if the round was empty.
     pub service_ep: u32,
-    /// `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry
-    /// endpoint. Zero if absent — the arch module then degrades to its
-    /// no-actuator path.
+    /// `REGISTRY_QUERY_AUTHORITY | SHUTDOWN_DEVICE_AUTHORITY`-badged SEND
+    /// on devmgr's registry endpoint (the `devmgr.shutdown` seed). Zero if
+    /// absent — the arch module then degrades to its no-actuator path.
     pub devmgr_registry: u32,
 }
 

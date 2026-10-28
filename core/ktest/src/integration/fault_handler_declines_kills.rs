@@ -31,6 +31,8 @@ const RESERVED_VA: u64 = 0x3E_5000_0000;
 const FAULT_BADGE: u64 = 0xC0FF_EE03;
 
 /// Poll bound: ~2 s at ~1 ms per `thread_sleep(1)` before declaring failure.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs, where the child's CPU waits for a host core.
 const MAX_POLLS: u32 = 2000;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
@@ -64,7 +66,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // The declined fault is terminal: the child must reach Exited with the
     // standard fault exit reason.
     let expected = EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR;
-    let reason = crate::spawn::wait_until_exited(child.th, MAX_POLLS)?;
+    let reason = crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS))?;
     if reason != expected
     {
         return Err("fault_handler_declines_kills: wrong exit reason after KILL");

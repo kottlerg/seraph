@@ -1224,12 +1224,10 @@ pub fn phase3_svcmgr_handover(
 
     // Bind procmgr's init-reap death observers on both init threads BEFORE the
     // svcmgr handover. svcmgr launches real-logd in response to
-    // HANDOVER_COMPLETE, and real-logd's HANDOVER_PULL releases init-logd; if
-    // the observer bind ran after that release it would land on an already
-    // -exited init-logd and silently lose the death — the kernel bind only
-    // appends an observer, it does not fire for a thread that has already
-    // exited — so the reap's death countdown would wait forever for an exit it
-    // already missed, and init would never be reaped. Transferring init's
+    // HANDOVER_COMPLETE, and real-logd's acknowledged HANDOVER_RELEASE (after
+    // its HANDOVER_PULL drain) releases init-logd; binding first keeps the
+    // reap's death countdown from depending on a bind that races init-logd's
+    // exit, so both deaths are observed and init is reaped. Transferring init's
     // kernel-object caps here is safe: svcmgr is already created and endowed
     // (the only consumer of init's own CSpace cap), and the cap handles move
     // while the underlying objects keep backing init's still-running threads.

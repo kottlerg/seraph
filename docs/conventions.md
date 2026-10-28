@@ -110,6 +110,9 @@ a closed Issue settles on.
 - Any commit or PR description that closes an Issue MUST reference it via `Fixes #N` /
   `Closes #N` so the merge auto-closes the Issue. Manual `gh issue close` after the fact is a
   procedural miss, not a substitute.
+- A commit message or PR description MUST NOT put a GitHub closing keyword (`close`, `fix`, or
+  `resolve`, in any inflection or letter case) before `#N` unless it closes Issue N: GitHub closes
+  the Issue when that text reaches `master`, whatever words follow the reference.
 
 ### Acceptance checklist discipline
 
@@ -152,14 +155,16 @@ were swept to use `svctest` where they meant the services-tier harness.
 - `<summary>` MUST NOT contain planning labels as
   [documentation-standards.md](documentation-standards.md) § Incomplete Work Markers defines
   them. Components and concrete what-changed text only.
-- `<summary>` MUST NOT include task IDs, branch names, or other transient identifiers. Issue
-  references belong in the body.
+- `<summary>` MUST NOT include Issue references, task IDs, branch names, or other transient
+  identifiers. Issue references belong in the body.
+- A merge commit is exempt from the rules of this section: git's default subject for a merge of
+  the base branch into a feature branch and GitHub's PR-merge subject both name branches.
 
 ### Body
 
 - Optional for trivial changes (typo fixes, single-line tweaks).
 - Expected for substantive changes: explain the why, not the what (the diff shows the what).
-- Wrap at ~72 columns.
+- SHOULD wrap at ~72 columns.
 - A commit (or its enclosing PR description) that closes an Issue MUST include `Fixes #N` /
   `Closes #N` so the merge auto-closes the Issue. Closing manually after the fact is a procedural
   miss, not a substitute.

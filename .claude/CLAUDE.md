@@ -53,6 +53,11 @@ truth for "how work is tracked and shipped" on this project.
 - All non-tag-driven work lands via a feature-branch PR per
   [docs/conventions.md](../docs/conventions.md); the assistant MUST NOT push directly
   to `master`.
+- Commit messages follow [docs/conventions.md](../docs/conventions.md) § Commit Messages
+  and § Commit and PR cross-references: an Issue reference goes in the body, never the
+  subject, and a GitHub closing keyword (`close`, `fix`, or `resolve` in any inflection,
+  followed by `#N`) appears in a commit message or PR body only for an Issue it closes,
+  since GitHub closes Issue N when that text reaches `master`.
 - After pushing a PR, the assistant MUST start watching its CI run via
   `gh pr checks <N> --watch` (or `gh run watch <run-id>`) as a backgrounded
   `Bash` invocation (`run_in_background: true`). Do not poll, do not sleep —

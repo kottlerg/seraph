@@ -12,7 +12,8 @@
 //! Locking. The `lock` field is a `crate::sync::Spinlock` that disables
 //! interrupts while held, preventing timer-driven deadlock. Acquire before
 //! any `enqueue`, `dequeue_highest`, `remove_from_queue`, `find_runnable`,
-//! or `set_current` call.
+//! or `set_current` call; the first four are `unsafe` with that contract,
+//! since every CPU reaches every scheduler through a shared reference.
 //!
 //! Cross-CPU migration goes through `sched::relocate_ready_thread`, called by
 //! `sched::migrate_ready_thread` (`sys_thread_set_affinity`) and
@@ -23,7 +24,8 @@
 
 use super::NUM_PRIORITY_LEVELS;
 use super::thread::ThreadControlBlock;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 // ── RunQueue ──────────────────────────────────────────────────────────────────
 
@@ -192,10 +194,20 @@ impl RunQueue
 // ── PerCpuScheduler ───────────────────────────────────────────────────────────
 
 /// Per-CPU scheduler state: priority run queues, current thread, and idle thread.
+///
+/// Every CPU reaches every scheduler through a shared reference
+/// (`sched::scheduler_for`), so no field is reached through a `&mut` that
+/// another CPU could alias. The run queues are the one non-atomic state: they
+/// sit in an `UnsafeCell` owned by [`lock`](Self::lock), under the exception of
+/// docs/coding-standards.md § Concurrency, and are reached only through the
+/// `unsafe` methods whose contract is that the caller holds `lock`
+/// (core/kernel/docs/scheduling-internals.md § Lock Hierarchy records the
+/// owner of each field). Every other field is atomic or the lock itself.
 pub struct PerCpuScheduler
 {
     /// One FIFO run queue per priority level (0 = lowest/idle, 31 = highest).
-    queues: [RunQueue; NUM_PRIORITY_LEVELS],
+    /// Owned by `lock`.
+    queues: UnsafeCell<[RunQueue; NUM_PRIORITY_LEVELS]>,
 
     /// Bitmask: bit N is set iff `queues[N]` is non-empty.
     /// Enables O(1) selection of the highest non-empty priority queue.
@@ -205,16 +217,20 @@ pub struct PerCpuScheduler
     /// core/kernel/docs/scheduling-internals.md § Atomic Ordering Invariants.
     non_empty: AtomicU32,
 
-    /// Currently executing TCB on this CPU (non-null after `init`).
-    pub current: *mut ThreadControlBlock,
+    /// Currently executing TCB on this CPU (non-null after `init`). Written
+    /// only by this CPU, under `lock` once the CPU schedules; read by any CPU,
+    /// under `lock` or as a lock-free snapshot that a later check re-decides.
+    current: AtomicPtr<ThreadControlBlock>,
 
-    /// Idle TCB for this CPU (non-null after `init`).
-    pub idle: *mut ThreadControlBlock,
+    /// Idle TCB for this CPU (non-null after `init`); written once by `init`
+    /// before the CPU schedules.
+    idle: AtomicPtr<ThreadControlBlock>,
 
-    /// Lock protecting this struct.
+    /// Lock protecting the run queues.
     ///
-    /// Acquire before any `enqueue`/`dequeue`/`set_current` operation.
-    /// The lock disables interrupts while held, preventing timer-driven deadlock.
+    /// Acquire before any `enqueue`/`dequeue_highest`/`remove_from_queue`/
+    /// `find_runnable` call. The lock disables interrupts while held,
+    /// preventing timer-driven deadlock.
     pub lock: crate::sync::Spinlock,
 
     /// Approximate load counter (number of threads linked on this CPU's run
@@ -224,14 +240,16 @@ pub struct PerCpuScheduler
     /// CPU count.
     load: AtomicU32,
 
-    /// Interrupt-flag word saved by `lock_raw` while this CPU's lock is held
-    /// as part of an all-CPU-locks operation (`set_state_under_all_locks`,
-    /// `relocate_ready_priority`'s walk fallback, `dealloc_object(Thread)`);
-    /// read back at the matching `unlock_raw`. Written only under this
-    /// scheduler's own lock, so
-    /// it needs no atomicity. Off-stack per the per-CPU-field idiom of
-    /// core/kernel/docs/scheduling-internals.md § Off-Stack Scratch for Ceiling-Sized Arrays.
-    pub saved_lock_flags: u64,
+    /// Interrupt-flag word saved by [`lock_saving_flags`](Self::lock_saving_flags)
+    /// while this CPU's lock is held as part of an all-CPU-locks operation
+    /// (`commit_state_under_all_locks`, `relocate_ready_priority`'s walk
+    /// fallback, `dealloc_object(Thread)`); read back by
+    /// [`unlock_saved_flags`](Self::unlock_saved_flags). Written and read only
+    /// by the holder of this scheduler's lock, so Relaxed suffices; atomic only
+    /// so a shared reference can reach it. Off-stack per the per-CPU-field idiom
+    /// of core/kernel/docs/scheduling-internals.md § Off-Stack Scratch for
+    /// Ceiling-Sized Arrays.
+    saved_lock_flags: AtomicU64,
 
     /// Head of this CPU's deferred reclaim stack (#341): objects whose free
     /// `crate::cap::object::push_deferred_reclaim` defers (its rustdoc lists the
@@ -240,18 +258,18 @@ pub struct PerCpuScheduler
     /// opaquely (`*mut u8`, really `*mut cap::object::KernelObjectHeader`) to
     /// avoid a sched→cap layering edge; the object module owns the cast and the
     /// per-type intrusive link field.
-    pub deferred_reclaim_head: core::sync::atomic::AtomicPtr<u8>,
+    pub deferred_reclaim_head: AtomicPtr<u8>,
 }
 
-// SAFETY: a scheduler's run queue is accessed under its `lock` once APs are
-// started (core/kernel/docs/initialization.md § Phase 8: Scheduler and SMP
-// Bringup); before that only the boot CPU touches the scheduler slab.
+// SAFETY: the run queues are reached only under `lock` (the `unsafe` methods'
+// contract; before APs start, core/kernel/docs/initialization.md § Phase 8:
+// Scheduler and SMP Bringup, only the boot CPU touches the scheduler slab);
+// every other field is atomic or the lock.
 unsafe impl Send for PerCpuScheduler {}
-// SAFETY: PerCpuScheduler is protected by lock and per-CPU isolation; no Sync violation.
+// SAFETY: as for `Send`: a shared reference reaches the `UnsafeCell` run queues
+// only through the lock-held `unsafe` methods.
 unsafe impl Sync for PerCpuScheduler {}
 
-// `PerCpuScheduler::new` builds `queues` by repeating the `const Q` item, which
-// needs no `Copy`; the `Copy`/`Clone` impls on `RunQueue` below are unused.
 impl PerCpuScheduler
 {
     /// Construct an uninitialized (zeroed) scheduler state.
@@ -259,24 +277,15 @@ impl PerCpuScheduler
     /// `init()` in `core/kernel/src/sched/mod.rs` populates `current` and `idle` before use.
     pub const fn new() -> Self
     {
-        // The 32-element array repeats the `const Q` item by hand.
-        // If NUM_PRIORITY_LEVELS changes, update this list accordingly.
-        // TODO: switch to `[const { RunQueue::new() }; NUM_PRIORITY_LEVELS]`;
-        // the kernel already compiles that syntax (e.g. `crate::irq`), so
-        // nothing blocks the switch.
-        const Q: RunQueue = RunQueue::new();
         Self {
-            queues: [
-                Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q, Q,
-                Q, Q, Q, Q,
-            ],
+            queues: UnsafeCell::new([const { RunQueue::new() }; NUM_PRIORITY_LEVELS]),
             non_empty: AtomicU32::new(0),
-            current: core::ptr::null_mut(),
-            idle: core::ptr::null_mut(),
+            current: AtomicPtr::new(core::ptr::null_mut()),
+            idle: AtomicPtr::new(core::ptr::null_mut()),
             lock: crate::sync::Spinlock::new(),
             load: AtomicU32::new(0),
-            saved_lock_flags: 0,
-            deferred_reclaim_head: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            saved_lock_flags: AtomicU64::new(0),
+            deferred_reclaim_head: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
@@ -298,9 +307,14 @@ impl PerCpuScheduler
     /// impossible (link preceded by a successful `remove_from_queue`, or the
     /// `!already_queued` denylist read under the TCB's held `sched_lock`)
     /// assert the result instead.
+    ///
+    /// # Safety
+    /// The caller holds `self.lock`, or is the single-threaded boot path that
+    /// links or dispatches init before any other CPU can reach this queue.
+    /// `tcb` is a valid TCB.
     #[must_use]
     #[track_caller]
-    pub fn enqueue(&mut self, tcb: *mut ThreadControlBlock, priority: u8) -> bool
+    pub unsafe fn enqueue(&self, tcb: *mut ThreadControlBlock, priority: u8) -> bool
     {
         let p = priority as usize;
         // Debug: detect use-after-free via magic cookie.
@@ -360,7 +374,10 @@ impl PerCpuScheduler
         }
 
         self.increment_load();
-        self.queues[p].enqueue(tcb);
+        // SAFETY: the caller holds `self.lock` (contract), so no other
+        // reference to the queues is live.
+        let queues = unsafe { &mut *self.queues.get() };
+        queues[p].enqueue(tcb);
         // Tag the link under the owning scheduler.lock so any subsequent enqueue
         // (this or another CPU) observes it via the guard above. `priority` is a
         // u8 in [0, NUM_PRIORITY_LEVELS), so the widening to i16 is lossless.
@@ -398,16 +415,23 @@ impl PerCpuScheduler
     /// Does not gate on `context_saved`, per
     /// `core/kernel/docs/scheduling-internals.md` § Cross-CPU TCB Ownership
     /// (`context_saved` protocol, step 11).
-    pub fn dequeue_highest(&mut self) -> *mut ThreadControlBlock
+    ///
+    /// # Safety
+    /// As for [`enqueue`](Self::enqueue): the caller holds `self.lock`, or is
+    /// the single-threaded boot dispatch of init.
+    pub unsafe fn dequeue_highest(&self) -> *mut ThreadControlBlock
     {
         let ne = self.non_empty.load(Ordering::Relaxed);
         if ne == 0
         {
-            return self.idle;
+            return self.idle();
         }
         // Highest set bit gives the highest non-empty priority level.
         let priority = 31 - ne.leading_zeros() as usize;
-        let Some(tcb) = self.queues[priority].dequeue()
+        // SAFETY: the caller holds `self.lock` (contract), so no other
+        // reference to the queues is live.
+        let queues = unsafe { &mut *self.queues.get() };
+        let Some(tcb) = queues[priority].dequeue()
         else
         {
             // Invariant: the `non_empty` bit is set iff the queue is
@@ -416,7 +440,7 @@ impl PerCpuScheduler
             debug_assert!(false, "non_empty bit set but queue {priority} is empty");
             self.non_empty
                 .fetch_and(!(1 << priority), Ordering::Relaxed);
-            return self.idle;
+            return self.idle();
         };
         // Debug: detect use-after-free via magic cookie.
         // SAFETY: tcb is from the run queue; magic field is always readable on valid TCB.
@@ -429,7 +453,7 @@ impl PerCpuScheduler
                 "dequeue: TCB magic corrupt at {tcb:?} (prio={priority}) — use-after-free?",
             );
         }
-        if self.queues[priority].is_empty()
+        if queues[priority].is_empty()
         {
             // Release: a later Acquire load that sees this bit cleared has
             // also seen the dequeue store above.
@@ -443,16 +467,61 @@ impl PerCpuScheduler
         tcb
     }
 
-    /// Record `tcb` as the idle thread for this CPU.
-    pub fn set_idle(&mut self, tcb: *mut ThreadControlBlock)
+    /// Record `tcb` as the idle thread for this CPU. Called once, by `init`,
+    /// before the CPU schedules.
+    pub fn set_idle(&self, tcb: *mut ThreadControlBlock)
     {
-        self.idle = tcb;
+        self.idle.store(tcb, Ordering::Relaxed);
     }
 
-    /// Record `tcb` as the currently running thread on this CPU.
-    pub fn set_current(&mut self, tcb: *mut ThreadControlBlock)
+    /// The idle thread for this CPU (null before `init`).
+    pub fn idle(&self) -> *mut ThreadControlBlock
     {
-        self.current = tcb;
+        self.idle.load(Ordering::Relaxed)
+    }
+
+    /// Record `tcb` as the currently running thread on this CPU. Called only by
+    /// this CPU, under `lock` once the CPU schedules.
+    pub fn set_current(&self, tcb: *mut ThreadControlBlock)
+    {
+        self.current.store(tcb, Ordering::Relaxed);
+    }
+
+    /// The thread running on this CPU (null before `init`). A read without
+    /// `lock` is a snapshot the caller re-decides or orders by another edge
+    /// (`context_saved`); see core/kernel/docs/scheduling-internals.md
+    /// § Lock Hierarchy.
+    pub fn current(&self) -> *mut ThreadControlBlock
+    {
+        self.current.load(Ordering::Relaxed)
+    }
+
+    /// Acquire `lock` as one CPU's share of an all-CPU-locks hold, parking the
+    /// saved interrupt-flag word in `saved_lock_flags` for
+    /// [`unlock_saved_flags`](Self::unlock_saved_flags).
+    ///
+    /// # Safety
+    /// As for `Spinlock::lock_raw`; the caller pairs it with
+    /// [`unlock_saved_flags`](Self::unlock_saved_flags) and takes the CPU locks
+    /// in ascending order (core/kernel/docs/scheduling-internals.md § Lock
+    /// Hierarchy, rule 4).
+    pub unsafe fn lock_saving_flags(&self)
+    {
+        // SAFETY: caller contract.
+        let flags = unsafe { self.lock.lock_raw() };
+        self.saved_lock_flags.store(flags, Ordering::Relaxed);
+    }
+
+    /// Release `lock` taken by [`lock_saving_flags`](Self::lock_saving_flags),
+    /// restoring the interrupt-flag word it saved.
+    ///
+    /// # Safety
+    /// The caller holds `lock` through [`lock_saving_flags`](Self::lock_saving_flags).
+    pub unsafe fn unlock_saved_flags(&self)
+    {
+        let flags = self.saved_lock_flags.load(Ordering::Relaxed);
+        // SAFETY: caller contract; `flags` is the word `lock_raw` returned.
+        unsafe { self.lock.unlock_raw(flags) };
     }
 
     /// Return `true` if any thread is ready to run (non-empty run queues).
@@ -475,7 +544,7 @@ impl PerCpuScheduler
 
     /// Remove `tcb` from its priority queue. No-op if not found.
     ///
-    /// Used by `dealloc_object(Thread)`, `set_state_under_all_locks`,
+    /// Used by `dealloc_object(Thread)`, `commit_state_under_all_locks`,
     /// `relocate_ready_priority`, and `relocate_ready_thread` (for
     /// `migrate_ready_thread` and `pull_unpinned_ready`) to relocate or destroy
     /// a queued thread. The
@@ -489,22 +558,26 @@ impl PerCpuScheduler
     /// with a follow-up `enqueue` on the same scheduler net-zero the load
     /// counter.
     ///
-    /// Caller must hold `self.lock`.
-    pub fn remove_from_queue(&mut self, tcb: *mut ThreadControlBlock, priority: u8) -> bool
+    /// # Safety
+    /// The caller holds `self.lock`; `tcb` is a valid TCB.
+    pub unsafe fn remove_from_queue(&self, tcb: *mut ThreadControlBlock, priority: u8) -> bool
     {
         let p = priority as usize;
         if p >= NUM_PRIORITY_LEVELS
         {
             return false;
         }
-        let removed = self.queues[p].remove(tcb);
+        // SAFETY: the caller holds `self.lock` (contract), so no other
+        // reference to the queues is live.
+        let queues = unsafe { &mut *self.queues.get() };
+        let removed = queues[p].remove(tcb);
         if removed
         {
             // Clear the single-link tag: the TCB is no longer on any queue.
             // SAFETY: tcb is a valid TCB; owning scheduler.lock held.
             unsafe { (*tcb).queued_on.store(-1, Ordering::Relaxed) };
             self.decrement_load();
-            if self.queues[p].is_empty()
+            if queues[p].is_empty()
             {
                 self.non_empty.fetch_and(!(1 << p), Ordering::Release);
             }
@@ -518,16 +591,20 @@ impl PerCpuScheduler
     /// Used by the cross-CPU load balancer to pick a migratable (unpinned)
     /// thread from a busier CPU's queue.
     ///
-    /// Caller MUST hold `self.lock`.
-    pub fn find_runnable<F>(&self, mut pred: F) -> Option<(*mut ThreadControlBlock, u8)>
+    /// # Safety
+    /// The caller holds `self.lock`.
+    pub unsafe fn find_runnable<F>(&self, mut pred: F) -> Option<(*mut ThreadControlBlock, u8)>
     where
         F: FnMut(*mut ThreadControlBlock) -> bool,
     {
+        // SAFETY: the caller holds `self.lock` (contract), so no `&mut` to the
+        // queues is live.
+        let queues = unsafe { &*self.queues.get() };
         let mut ne = self.non_empty.load(Ordering::Relaxed);
         while ne != 0
         {
             let priority = 31 - ne.leading_zeros() as usize;
-            if let Some(tcb) = self.queues[priority].find_first_where(&mut pred)
+            if let Some(tcb) = queues[priority].find_first_where(&mut pred)
             {
                 return Some((tcb, priority as u8));
             }
@@ -579,20 +656,6 @@ impl PerCpuScheduler
     }
 }
 
-// No code copies or clones a `RunQueue` (`PerCpuScheduler::new` repeats the
-// `const Q` item); these impls are not load-bearing.
-impl Copy for RunQueue {}
-// expl_impl_clone_on_copy: `clone` delegates to `Copy` (`*self`); a
-// `#[derive(Clone, Copy)]` would be equivalent, and no code clones a `RunQueue`.
-#[allow(clippy::expl_impl_clone_on_copy)]
-impl Clone for RunQueue
-{
-    fn clone(&self) -> Self
-    {
-        *self
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -618,12 +681,35 @@ mod tests
         Box::new(tcb)
     }
 
+    // Host tests are single-threaded and each scheduler belongs to one test, so
+    // the lock-held contract of the `unsafe` queue methods holds without the
+    // lock; these wrappers state that once.
+
+    #[track_caller]
+    fn enq(s: &PerCpuScheduler, tcb: *mut ThreadControlBlock, prio: u8) -> bool
+    {
+        // SAFETY: single-threaded test; tcb is a live boxed TCB.
+        unsafe { s.enqueue(tcb, prio) }
+    }
+
+    fn deq(s: &PerCpuScheduler) -> *mut ThreadControlBlock
+    {
+        // SAFETY: single-threaded test.
+        unsafe { s.dequeue_highest() }
+    }
+
+    fn rm(s: &PerCpuScheduler, tcb: *mut ThreadControlBlock, prio: u8) -> bool
+    {
+        // SAFETY: single-threaded test; tcb is a live boxed TCB.
+        unsafe { s.remove_from_queue(tcb, prio) }
+    }
+
     // ── RunQueue tests (exercised through PerCpuScheduler at priority 0) ──────
 
     #[test]
     fn enqueue_dequeue_fifo()
     {
-        let mut sched = PerCpuScheduler::new();
+        let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
         let mut b = make_tcb();
         let mut c = make_tcb();
@@ -631,49 +717,49 @@ mod tests
         let pb = &mut *b as *mut _;
         let pc = &mut *c as *mut _;
 
-        assert!(sched.enqueue(pa, 0));
-        assert!(sched.enqueue(pb, 0));
-        assert!(sched.enqueue(pc, 0));
+        assert!(enq(&sched, pa, 0));
+        assert!(enq(&sched, pb, 0));
+        assert!(enq(&sched, pc, 0));
 
         // idle must be set so the empty-queue dequeue returns a known pointer.
         sched.set_idle(pa);
 
-        assert_eq!(sched.dequeue_highest(), pa);
-        assert_eq!(sched.dequeue_highest(), pb);
-        assert_eq!(sched.dequeue_highest(), pc);
+        assert_eq!(deq(&sched), pa);
+        assert_eq!(deq(&sched), pb);
+        assert_eq!(deq(&sched), pc);
         // After emptying, next dequeue should return idle.
-        assert_eq!(sched.dequeue_highest(), pa);
+        assert_eq!(deq(&sched), pa);
     }
 
     #[test]
     fn dequeue_highest_empty_returns_idle()
     {
-        let mut sched = PerCpuScheduler::new();
+        let sched = PerCpuScheduler::new();
         let mut idle_tcb = make_tcb();
         let idle = &mut *idle_tcb as *mut _;
         sched.set_idle(idle);
-        assert_eq!(sched.dequeue_highest(), idle);
+        assert_eq!(deq(&sched), idle);
     }
 
     #[test]
     fn has_runnable_reflects_state()
     {
-        let mut sched = PerCpuScheduler::new();
+        let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
         let pa = &mut *a as *mut _;
 
         assert!(!sched.has_runnable());
-        assert!(sched.enqueue(pa, 5));
+        assert!(enq(&sched, pa, 5));
         assert!(sched.has_runnable());
         sched.set_idle(pa);
-        sched.dequeue_highest();
+        deq(&sched);
         assert!(!sched.has_runnable());
     }
 
     #[test]
     fn enqueue_sets_non_empty_bit()
     {
-        let mut sched = PerCpuScheduler::new();
+        let sched = PerCpuScheduler::new();
         // Distinct TCBs per priority: a single TCB linked at two priorities at
         // once is a double-link the single-link guard (`queued_on`) rejects.
         let mut a = make_tcb();
@@ -682,9 +768,9 @@ mod tests
         let pb = &mut *b as *mut _;
 
         assert_eq!(sched.non_empty.load(Ordering::Relaxed), 0);
-        assert!(sched.enqueue(pa, 7));
+        assert!(enq(&sched, pa, 7));
         assert_eq!(sched.non_empty.load(Ordering::Relaxed), 1 << 7);
-        assert!(sched.enqueue(pb, 15));
+        assert!(enq(&sched, pb, 15));
         assert_eq!(
             sched.non_empty.load(Ordering::Relaxed),
             (1 << 7) | (1 << 15)
@@ -694,7 +780,7 @@ mod tests
     #[test]
     fn dequeue_highest_selects_max_priority()
     {
-        let mut sched = PerCpuScheduler::new();
+        let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
         let mut b = make_tcb();
         let mut c = make_tcb();
@@ -703,27 +789,27 @@ mod tests
         let pc = &mut *c as *mut _;
 
         // Enqueue at priorities 0, 5, 15 — expect 15 first, then 5, then 0.
-        assert!(sched.enqueue(pa, 0));
-        assert!(sched.enqueue(pb, 5));
-        assert!(sched.enqueue(pc, 15));
+        assert!(enq(&sched, pa, 0));
+        assert!(enq(&sched, pb, 5));
+        assert!(enq(&sched, pc, 15));
         sched.set_idle(pa);
 
-        assert_eq!(sched.dequeue_highest(), pc);
-        assert_eq!(sched.dequeue_highest(), pb);
-        assert_eq!(sched.dequeue_highest(), pa);
+        assert_eq!(deq(&sched), pc);
+        assert_eq!(deq(&sched), pb);
+        assert_eq!(deq(&sched), pa);
     }
 
     #[test]
     fn dequeue_highest_clears_bit_when_queue_empties()
     {
-        let mut sched = PerCpuScheduler::new();
+        let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
         let pa = &mut *a as *mut _;
 
-        assert!(sched.enqueue(pa, 3));
+        assert!(enq(&sched, pa, 3));
         assert_ne!(sched.non_empty.load(Ordering::Relaxed) & (1 << 3), 0);
         sched.set_idle(pa);
-        sched.dequeue_highest();
+        deq(&sched);
         // Queue at priority 3 is now empty; bit must be cleared.
         assert_eq!(sched.non_empty.load(Ordering::Relaxed) & (1 << 3), 0);
     }
@@ -731,31 +817,31 @@ mod tests
     #[test]
     fn remove_from_queue_clears_bitmask()
     {
-        let mut sched = PerCpuScheduler::new();
+        let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
         let pa = &mut *a as *mut _;
 
-        assert!(sched.enqueue(pa, 10));
+        assert!(enq(&sched, pa, 10));
         assert_ne!(sched.non_empty.load(Ordering::Relaxed) & (1 << 10), 0);
-        sched.remove_from_queue(pa, 10);
+        rm(&sched, pa, 10);
         assert_eq!(sched.non_empty.load(Ordering::Relaxed) & (1 << 10), 0);
     }
 
     #[test]
     fn remove_not_present_is_noop()
     {
-        let mut sched = PerCpuScheduler::new();
+        let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
         let pa = &mut *a as *mut _;
         // remove on a TCB that was never enqueued must not panic.
-        sched.remove_from_queue(pa, 5);
+        rm(&sched, pa, 5);
         assert_eq!(sched.non_empty.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn remove_from_middle_preserves_order()
     {
-        let mut sched = PerCpuScheduler::new();
+        let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
         let mut b = make_tcb();
         let mut c = make_tcb();
@@ -763,38 +849,38 @@ mod tests
         let pb = &mut *b as *mut _;
         let pc = &mut *c as *mut _;
 
-        assert!(sched.enqueue(pa, 1));
-        assert!(sched.enqueue(pb, 1));
-        assert!(sched.enqueue(pc, 1));
+        assert!(enq(&sched, pa, 1));
+        assert!(enq(&sched, pb, 1));
+        assert!(enq(&sched, pc, 1));
         sched.set_idle(pa);
 
         // Remove the middle element; A and C should remain in order.
-        sched.remove_from_queue(pb, 1);
-        assert_eq!(sched.dequeue_highest(), pa);
-        assert_eq!(sched.dequeue_highest(), pc);
+        rm(&sched, pb, 1);
+        assert_eq!(deq(&sched), pa);
+        assert_eq!(deq(&sched), pc);
     }
 
     #[test]
     fn five_threads_same_priority_fifo_order()
     {
         // Enqueue 5 TCBs at the same priority and verify FIFO dequeue order.
-        let mut sched = PerCpuScheduler::new();
+        let sched = PerCpuScheduler::new();
         let mut tcbs: Vec<Box<ThreadControlBlock>> = (0..5).map(|_| make_tcb()).collect();
         let ptrs: Vec<*mut ThreadControlBlock> =
             tcbs.iter_mut().map(|t| &mut **t as *mut _).collect();
 
         for &p in &ptrs
         {
-            assert!(sched.enqueue(p, 7));
+            assert!(enq(&sched, p, 7));
         }
         sched.set_idle(ptrs[0]);
 
         for &expected in &ptrs
         {
-            assert_eq!(sched.dequeue_highest(), expected, "FIFO order violated");
+            assert_eq!(deq(&sched), expected, "FIFO order violated");
         }
         // Queue exhausted; returns idle.
-        assert_eq!(sched.dequeue_highest(), ptrs[0]);
+        assert_eq!(deq(&sched), ptrs[0]);
     }
 
     #[test]
@@ -802,7 +888,7 @@ mod tests
     {
         // Interleave P=5 and P=10 enqueues; every dequeue must return P=10 until
         // that queue is empty, then P=5 threads in their enqueue order.
-        let mut sched = PerCpuScheduler::new();
+        let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
         let mut b = make_tcb();
         let mut c = make_tcb();
@@ -812,18 +898,18 @@ mod tests
         let pc = &mut *c as *mut _;
         let pd = &mut *d as *mut _;
 
-        assert!(sched.enqueue(pa, 5));
-        assert!(sched.enqueue(pb, 10));
-        assert!(sched.enqueue(pc, 5));
-        assert!(sched.enqueue(pd, 10));
+        assert!(enq(&sched, pa, 5));
+        assert!(enq(&sched, pb, 10));
+        assert!(enq(&sched, pc, 5));
+        assert!(enq(&sched, pd, 10));
         sched.set_idle(pa);
 
         // P=10 threads come out first (FIFO within their priority).
-        assert_eq!(sched.dequeue_highest(), pb);
-        assert_eq!(sched.dequeue_highest(), pd);
+        assert_eq!(deq(&sched), pb);
+        assert_eq!(deq(&sched), pd);
         // Then P=5 threads in original enqueue order.
-        assert_eq!(sched.dequeue_highest(), pa);
-        assert_eq!(sched.dequeue_highest(), pc);
+        assert_eq!(deq(&sched), pa);
+        assert_eq!(deq(&sched), pc);
     }
 
     // The debug double-enqueue panic arm has no host test (host test builds
@@ -837,13 +923,13 @@ mod tests
     {
         // The set_priority / relocate shape: a successful remove clears
         // queued_on, so the follow-up enqueue must create the link.
-        let mut sched = PerCpuScheduler::new();
+        let sched = PerCpuScheduler::new();
         let mut a = make_tcb();
         let pa = &mut *a as *mut _;
 
-        assert!(sched.enqueue(pa, 4));
-        assert!(sched.remove_from_queue(pa, 4));
-        assert!(sched.enqueue(pa, 9));
+        assert!(enq(&sched, pa, 4));
+        assert!(rm(&sched, pa, 4));
+        assert!(enq(&sched, pa, 9));
         assert_ne!(sched.non_empty.load(Ordering::Relaxed) & (1 << 9), 0);
     }
 
@@ -866,23 +952,23 @@ mod tests
     /// located CPU re-link at `new` and (when located off the hint) refresh
     /// `preferred_cpu`. Returns the CPU it relocated on, or `None` if unlinked.
     fn locate_relocate(
-        scheds: &mut [PerCpuScheduler],
+        scheds: &[PerCpuScheduler],
         tcb: *mut ThreadControlBlock,
         old: u8,
         new: u8,
         hint: usize,
     ) -> Option<usize>
     {
-        if scheds[hint].remove_from_queue(tcb, old)
+        if rm(&scheds[hint], tcb, old)
         {
-            assert!(scheds[hint].enqueue(tcb, new));
+            assert!(enq(&scheds[hint], tcb, new));
             return Some(hint);
         }
         for cpu in 0..scheds.len()
         {
-            if scheds[cpu].remove_from_queue(tcb, old)
+            if rm(&scheds[cpu], tcb, old)
             {
-                assert!(scheds[cpu].enqueue(tcb, new));
+                assert!(enq(&scheds[cpu], tcb, new));
                 // SAFETY: tcb valid for the test's lifetime.
                 unsafe { (*tcb).preferred_cpu = cpu as u32 };
                 return Some(cpu);
@@ -894,13 +980,13 @@ mod tests
     #[test]
     fn relocate_hint_hit_relinks_at_new_priority()
     {
-        let mut scheds = [PerCpuScheduler::new(), PerCpuScheduler::new()];
+        let scheds = [PerCpuScheduler::new(), PerCpuScheduler::new()];
         let mut t = make_tcb();
         let pt = &mut *t as *mut _;
 
         // Linked on cpu 1 at prio 4; the hint names cpu 1 (the common case).
-        assert!(scheds[1].enqueue(pt, 4));
-        assert_eq!(locate_relocate(&mut scheds, pt, 4, 9, 1), Some(1));
+        assert!(enq(&scheds[1], pt, 4));
+        assert_eq!(locate_relocate(&scheds, pt, 4, 9, 1), Some(1));
         // Re-linked at the new priority on the same scheduler; cpu 0 untouched.
         assert_eq!(scheds[0].non_empty.load(Ordering::Relaxed), 0);
         assert_eq!(scheds[1].non_empty.load(Ordering::Relaxed), 1 << 9);
@@ -911,7 +997,7 @@ mod tests
     #[test]
     fn relocate_hint_miss_walk_locates_home_and_refreshes_hint()
     {
-        let mut scheds = [
+        let scheds = [
             PerCpuScheduler::new(),
             PerCpuScheduler::new(),
             PerCpuScheduler::new(),
@@ -921,8 +1007,8 @@ mod tests
 
         // Linked on cpu 2, but the (stale) hint names cpu 0: the hint remove
         // misses and the ascending walk must locate it on cpu 2.
-        assert!(scheds[2].enqueue(pt, 6));
-        assert_eq!(locate_relocate(&mut scheds, pt, 6, 3, 0), Some(2));
+        assert!(enq(&scheds[2], pt, 6));
+        assert_eq!(locate_relocate(&scheds, pt, 6, 3, 0), Some(2));
         // Relinked at new prio on cpu 2; cpus 0 and 1 untouched.
         assert_eq!(scheds[0].non_empty.load(Ordering::Relaxed), 0);
         assert_eq!(scheds[1].non_empty.load(Ordering::Relaxed), 0);
@@ -937,11 +1023,11 @@ mod tests
     {
         // The transient Ready-but-unlinked window: the thread is on no queue, so
         // both the hint and the walk miss and the relocate is a no-op.
-        let mut scheds = [PerCpuScheduler::new(), PerCpuScheduler::new()];
+        let scheds = [PerCpuScheduler::new(), PerCpuScheduler::new()];
         let mut t = make_tcb();
         let pt = &mut *t as *mut _;
 
-        assert_eq!(locate_relocate(&mut scheds, pt, 6, 3, 0), None);
+        assert_eq!(locate_relocate(&scheds, pt, 6, 3, 0), None);
         assert_eq!(scheds[0].non_empty.load(Ordering::Relaxed), 0);
         assert_eq!(scheds[1].non_empty.load(Ordering::Relaxed), 0);
     }

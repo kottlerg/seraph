@@ -253,7 +253,7 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 // preempt-disabled window made the timer skip its slice-expiry
                 // switch, and the syscall epilogue reschedules only an Exited
                 // thread. The restart resumes here.
-                crate::sched::schedule(false);
+                crate::sched::schedule(crate::sched::Requeue::IfRunnable);
                 return Err(SyscallError::Interrupted);
             }
         };
@@ -376,7 +376,7 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // Cancel any park (the stopped thread's blocked syscall returns
         // Interrupted on restart) and commit Stopped over it; a Ready target
         // is unlinked by the all-locks write, and a remote Running target by
-        // the drain below (its CPU's next slice-expiry schedule(true)). See
+        // the drain below (its CPU's next slice-expiry schedule(Requeue::Always)). See
         // core/kernel/docs/thread-lifecycle-and-sleep.md § `sys_thread_stop`
         // Cross-CPU Stop Protocol; an `Exited` target is refused (terminal).
         let running_on = commit_stopped(target_tcb)?;
@@ -384,7 +384,7 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // If stopping self (Running → Stopped): yield so another thread runs.
         if core::ptr::eq(target_tcb, caller_tcb)
         {
-            crate::sched::schedule(false);
+            crate::sched::schedule(crate::sched::Requeue::IfRunnable);
         }
         else if let Some(run_cpu) = running_on
         {
@@ -476,7 +476,7 @@ unsafe fn drain_remote_stopped(
         return;
     }
     // The IPI's trap snapshots the target's user registers; the remote CPU
-    // drops the Stopped target at its next slice-expiry schedule(true), whose
+    // drops the Stopped target at its next slice-expiry schedule(Requeue::Always), whose
     // trap leaves the snapshot sys_thread_read_regs reads once this drain
     // completes.
     // SAFETY: run_cpu < CPU_COUNT per contract.
@@ -507,7 +507,7 @@ unsafe fn drain_remote_stopped(
         // contract.
         let draining = unsafe {
             let s = sched_remote.lock.lock_raw();
-            let still_current = sched_remote.current == target_tcb;
+            let still_current = sched_remote.current() == target_tcb;
             let still_stopped = (*target_tcb).state == ThreadState::Stopped;
             sched_remote.lock.unlock_raw(s);
             // The drain also outlasts the switch-out's save: `current` moves
@@ -538,7 +538,7 @@ unsafe fn drain_remote_stopped(
             unsafe { crate::arch::current::cpu::restore_interrupts(drain_saved_int) };
             crate::percpu::preempt_enable();
             // SAFETY: the running thread deschedules itself with no lock held.
-            unsafe { crate::sched::schedule(false) };
+            unsafe { crate::sched::schedule(crate::sched::Requeue::IfRunnable) };
             // SAFETY: caller_cspace is the caller's CSpace per contract.
             if !unsafe { slot_names_thread(caller_cspace, thread_idx, target_tcb) }
             {
@@ -582,7 +582,7 @@ unsafe fn warn_slow_drain(
     // `current` and both TCBs' fields are read without their locks, a
     // diagnostic-only residual #440 records.
     let (tid, st, cur_tid) = unsafe {
-        let cur = crate::sched::scheduler_for(run_cpu).current;
+        let cur = crate::sched::scheduler_for(run_cpu).current();
         (
             (*target_tcb).thread_id,
             (*target_tcb).state,
@@ -655,7 +655,7 @@ unsafe fn slot_names_thread(
 /// longer reaches this client to null its binding before the free; a binding
 /// left naming the server past this hold would let a second canceller, or
 /// `dealloc_object(Thread)` of this client, pass its `blocked_on == server`
-/// re-read and CAS through a freed server (docs/scheduling-internals.md
+/// re-read and CAS through a freed server (core/kernel/docs/scheduling-internals.md
 /// § Lock Hierarchy rule 7).
 ///
 /// # Safety
@@ -682,14 +682,14 @@ unsafe fn clear_reply_binding(tcb: *mut crate::sched::thread::ThreadControlBlock
 /// stale wake deposit, and clears the thread's park binding, whatever state a
 /// concurrent stop or teardown commits over the claimed park meanwhile. A lost
 /// claim means another claimant owns the episode, its deposit stands, and
-/// rule 7 of docs/scheduling-internals.md § Lock Hierarchy names who retires
+/// rule 7 of core/kernel/docs/scheduling-internals.md § Lock Hierarchy names who retires
 /// the binding.
 ///
 /// [`PARK_DISPOSITION_INTERRUPTED`]: crate::sched::thread::PARK_DISPOSITION_INTERRUPTED
 ///
 /// A plain sleep is cancelled through `sleep_list_remove`, and a timed IPC
 /// wait's sleep-list entry is removed with its queue entry under the source
-/// lock (docs/thread-lifecycle-and-sleep.md § Sleep List Invariants).
+/// lock (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants).
 ///
 /// # Safety
 /// `tcb` must be a valid TCB. The caller MUST NOT hold the target's `sched_lock`
@@ -1099,7 +1099,7 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 
     // Clear the binding under sched_lock only if this cancel claimed the park.
     // On a lost claim the winner owns the episode and rule 7 names who retires
-    // the binding (docs/scheduling-internals.md § Lock Hierarchy); a waker may
+    // the binding (core/kernel/docs/scheduling-internals.md § Lock Hierarchy); a waker may
     // already have let the thread run and park again (every park commit
     // advances park_seq, and the caller's commit retries on a changed one).
     // Clearing here after a lost claim would race the winner's
@@ -1517,6 +1517,11 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_THREAD_SET_AFFINITY`, #443, #502).
 ///
 /// Returns 0 on success.
+///
+/// # Errors
+/// - `InvalidCapability`: no current thread, or arg0 names no Thread cap.
+/// - `InsufficientRights`: the cap lacks CONTROL.
+/// - `InvalidArgument`: `cpu_id` is neither `AFFINITY_ANY` nor an online CPU.
 #[cfg(not(test))]
 pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1651,6 +1656,16 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// The thread must be fault-blocked, or `Stopped` and descheduled
 /// (`sched::with_held_frame`). Copies the full `TrapFrame` to the caller's
 /// buffer. Returns the number of bytes written on success.
+///
+/// # Errors
+/// - `InvalidCapability`: no current thread, or arg0 names no Thread cap.
+/// - `InsufficientRights`: the cap lacks OBSERVE.
+/// - `InvalidState`: the thread is neither `Stopped` and descheduled nor
+///   fault-blocked.
+/// - `InvalidArgument`: the buffer is too small or null, or the thread has no
+///   register frame.
+/// - `InvalidAddress`: the buffer lies outside the user half or is not
+///   writable.
 #[cfg(not(test))]
 pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1764,6 +1779,16 @@ pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// (`sched::with_held_frame`). The kernel sanitizes the frame per architecture
 /// (`core/kernel/docs/arch-interface.md` § `trap_frame`) before writing; RISC-V
 /// applies `sstatus` as supplied (#443). Returns 0 on success.
+///
+/// # Errors
+/// - `InvalidCapability`: no current thread, or arg0 names no Thread cap.
+/// - `InsufficientRights`: the cap lacks CONTROL.
+/// - `InvalidState`: the thread is neither `Stopped` and descheduled nor
+///   fault-blocked.
+/// - `InvalidArgument`: the buffer is too small or null, the thread has no
+///   register frame, or the frame carries illegal register values.
+/// - `InvalidAddress`: the buffer lies outside the user half or is not
+///   readable.
 #[cfg(not(test))]
 pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {

@@ -17,7 +17,14 @@
 //! - `trap_frame`: pointer to the user register snapshot on the kernel stack.
 //! - `is_user`: true for user-mode threads.
 //! - `ipc_buffer`: virtual address of the per-thread IPC buffer page (0 = none).
-//! - `wakeup_value`: value delivered by a notification sender to an unblocked waiter.
+//! - `wakeup_value`: value deposited by the waker that claims this thread's IPC
+//!   wait (notification bits, event payload, wait-set badge, or 0 for a timeout
+//!   or drain).
+//!
+//! Each field that is neither atomic nor a lock names its owner in its rustdoc,
+//! as the bare-field exception of docs/coding-standards.md § Concurrency
+//! requires; the owners are recorded in core/kernel/docs/scheduling-internals.md
+//! § Cross-CPU TCB Ownership.
 
 use crate::arch::current::context::SavedState;
 
@@ -281,6 +288,56 @@ pub unsafe fn stamp_deposit_episode(tcb: *mut ThreadControlBlock)
     let _ = tcb;
 }
 
+/// The kind of park episode a cancellation tears down, which selects what
+/// [`stamp_cancelled_deposit`] stamps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ParkKind
+{
+    /// A `sys_ipc_call` (or other non-fault) park: its resume reads
+    /// `park_disposition`.
+    Call,
+    /// A fault-delivery park (`fault_dispatch`): its resume reads
+    /// `fault_outcome`.
+    Fault,
+}
+
+impl ParkKind
+{
+    /// The kind of a park whose blocking reason was `state`: a
+    /// `BlockedOnFault` park is a fault episode, any other a call episode.
+    pub fn of_blocked(state: IpcThreadState) -> Self
+    {
+        if state == IpcThreadState::BlockedOnFault
+        {
+            Self::Fault
+        }
+        else
+        {
+            Self::Call
+        }
+    }
+
+    /// The kind of `tcb`'s current park, read from its `in_fault_delivery`
+    /// flag: set for the whole of a fault-delivery park.
+    ///
+    /// # Safety
+    /// `tcb` is a valid TCB whose park claim the caller holds, the owner of
+    /// `in_fault_delivery` for a reader on another thread
+    /// (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership).
+    pub unsafe fn of_sender(tcb: *const ThreadControlBlock) -> Self
+    {
+        // SAFETY: caller contract.
+        if unsafe { (*tcb).in_fault_delivery }
+        {
+            Self::Fault
+        }
+        else
+        {
+            Self::Call
+        }
+    }
+}
+
 /// Stamp a cancelled (torn-down) park episode: a fault episode gets an
 /// explicit `FAULT_OUTCOME_KILL` plus the episode stamp (its disposition
 /// lives in `fault_outcome`); a call episode gets
@@ -290,21 +347,21 @@ pub unsafe fn stamp_deposit_episode(tcb: *mut ThreadControlBlock)
 /// # Safety
 /// Same exclusive-claim contract as [`stamp_park_deposit`].
 #[inline]
-pub unsafe fn stamp_cancelled_deposit(tcb: *mut ThreadControlBlock, is_fault: bool)
+pub unsafe fn stamp_cancelled_deposit(tcb: *mut ThreadControlBlock, kind: ParkKind)
 {
     // SAFETY: tcb valid and claim won per caller contract.
     unsafe {
-        if is_fault
+        match kind
         {
-            (*tcb).fault_outcome.store(
-                crate::ipc::fault::FAULT_OUTCOME_KILL,
-                core::sync::atomic::Ordering::Release,
-            );
-            stamp_deposit_episode(tcb);
-        }
-        else
-        {
-            stamp_park_deposit(tcb, PARK_DISPOSITION_INTERRUPTED);
+            ParkKind::Fault =>
+            {
+                (*tcb).fault_outcome.store(
+                    crate::ipc::fault::FAULT_OUTCOME_KILL,
+                    core::sync::atomic::Ordering::Release,
+                );
+                stamp_deposit_episode(tcb);
+            }
+            ParkKind::Call => stamp_park_deposit(tcb, PARK_DISPOSITION_INTERRUPTED),
         }
     }
 }
@@ -388,31 +445,42 @@ pub unsafe fn consume_park_interrupted(tcb: *mut ThreadControlBlock) -> bool
 pub struct ThreadControlBlock
 {
     // === Scheduling state ===
-    /// Current lifecycle state.
+    /// Current lifecycle state. Owned by [`sched_lock`](Self::sched_lock); the
+    /// lifecycle commits also hold every CPU's `scheduler.lock`, and the unlocked
+    /// reads the Scheduling row admits (monotone `Exited` probes and prechecks
+    /// re-decided under the commit's locks) are listed there.
     pub state: ThreadState,
 
     /// Scheduling priority; levels and their reservations per
-    /// core/kernel/docs/scheduler.md § Priority Levels.
+    /// core/kernel/docs/scheduler.md § Priority Levels. Owned by
+    /// [`sched_lock`](Self::sched_lock): `sys_thread_set_priority` writes it, and
+    /// every link reads it, under that lock.
     pub priority: u8,
 
     /// Remaining preemption timer ticks before this thread is descheduled.
+    /// Owned by the `scheduler.lock` of the CPU the thread is current on: only
+    /// that CPU's `timer_tick` writes it, under that lock.
     pub slice_remaining: u32,
 
     /// Hard CPU affinity (`AFFINITY_ANY` = `0xFFFF_FFFF` means no hard affinity).
     /// Honoured by `select_target_cpu` on enqueue, by the `schedule()`
     /// requeue site for an already-Running thread, and by
     /// `sys_thread_set_affinity` which actively migrates a Ready thread.
+    /// Owned by [`sched_lock`](Self::sched_lock); `sys_thread_set_affinity`'s
+    /// write without it is a known defect (#443).
     pub cpu_affinity: u32,
 
     /// Soft affinity: the CPU this thread was last linked or dispatched on (hint
     /// for `select_target_cpu` and the load balancer). Written by `schedule()` at
     /// dispatch and requeue, and retargeted by every call that creates a run-queue
     /// link (`enqueue_and_wake`, `enqueue_ready_thread`, `relocate_ready_thread`)
-    /// so it names the surviving link's CPU (#359).
+    /// so it names the surviving link's CPU (#359). Owned by
+    /// [`sched_lock`](Self::sched_lock), which each of those writers holds.
     pub preferred_cpu: u32,
 
     /// Intrusive run-queue link — next TCB at the same priority.
-    /// `None` when not on any run queue.
+    /// `None` when not on any run queue. Owned by the `scheduler.lock` of the
+    /// CPU whose queue links this TCB (see the struct-level invariant).
     pub run_queue_next: Option<*mut ThreadControlBlock>,
 
     /// Global single-link tag: the priority level this TCB is currently linked
@@ -457,7 +525,8 @@ pub struct ThreadControlBlock
     /// `commit_blocked_under_local_lock`. Diagnostic-only: the owed-wake
     /// detector ages `Blocked` threads against it (see
     /// core/kernel/docs/scheduling-internals.md § Softlockup Watchdog); never gates
-    /// control flow.
+    /// control flow. Owned by `sched_lock`; the watchdog's lock-free diagnostic
+    /// read is the residual #440 records.
     pub park_started_tick: u64,
 
     /// Park-binding generation: advanced under [`sched_lock`](Self::sched_lock)
@@ -466,7 +535,7 @@ pub struct ThreadControlBlock
     /// A stop or teardown snapshots it with `state`, cancels the park it saw,
     /// and commits only if it is unchanged, so it never writes `Stopped` or
     /// `Exited` over a live park: one it did not cancel was already claimed by
-    /// a waker or a concurrent cancel (docs/thread-lifecycle-and-sleep.md
+    /// a waker or a concurrent cancel (core/kernel/docs/thread-lifecycle-and-sleep.md
     /// § `sys_thread_stop` Cross-CPU Stop Protocol). The timer snapshots it at a
     /// sleep-list pop and claims only the park it popped (§ Sleep List
     /// Invariants). Atomic (Relaxed) because the timer reads it under
@@ -485,7 +554,11 @@ pub struct ThreadControlBlock
     pub start_seq: u32,
 
     // === IPC state ===
-    /// Current IPC blocking reason (None when not blocked on IPC).
+    /// Current IPC blocking reason (None when not blocked on IPC). Owned, with
+    /// [`blocked_on_object`](Self::blocked_on_object), by two locks: the park
+    /// commits and clears write the pair under [`sched_lock`](Self::sched_lock),
+    /// and the source lock matching the blocking reason arbitrates the waiter's
+    /// claim (the IPC blocking row of § Cross-CPU TCB Ownership).
     pub ipc_state: IpcThreadState,
 
     /// Inline message buffer for in-flight IPC data. Owned by the holder of
@@ -591,10 +664,14 @@ pub struct ThreadControlBlock
     pub in_fault_delivery: bool,
 
     // === Context ===
-    /// Whether this thread executes in user mode (ring 3 / U-mode).
+    /// Whether this thread executes in user mode (ring 3 / U-mode). Immutable
+    /// after construction (the Identity row).
     pub is_user: bool,
 
-    /// Architecture-specific saved kernel register state.
+    /// Architecture-specific saved kernel register state. Owned by the
+    /// `context_saved` protocol of the Context save/restore row: the CPU
+    /// switching the thread out writes it, and another CPU reads it only after
+    /// its Acquire of `context_saved`.
     pub saved_state: SavedState,
 
     /// Virtual address of the top of this thread's kernel stack.
@@ -602,7 +679,7 @@ pub struct ThreadControlBlock
     /// `arch::current::cpu::set_kernel_trap_stack` (TSS RSP0 and
     /// `PerCpuData::kernel_rsp` via `syscall::set_kernel_rsp` on x86-64;
     /// `PerCpuData::kernel_rsp` on RISC-V, where `sscratch` holds the per-CPU pointer);
-    /// a kernel thread publishes 0.
+    /// a kernel thread publishes 0. Immutable after construction.
     pub kernel_stack_top: u64,
 
     /// Pointer to the `TrapFrame` of the thread's last entry from user mode,
@@ -612,7 +689,7 @@ pub struct ThreadControlBlock
     /// `Created`), or by `sched::enter` for init, to the slot its first entry
     /// to user mode resumes from, and republished by every entry from user
     /// mode at which the thread can be descheduled (see
-    /// `docs/arch-interface.md` § `trap_frame`). The running thread is the only
+    /// `core/kernel/docs/arch-interface.md` § `trap_frame`). The running thread is the only
     /// writer after configuration; atomic so the cross-CPU load of
     /// `sys_thread_start`'s unlocked null check is race-free. Relaxed
     /// suffices: the register syscalls read it only after the switch-out's
@@ -629,10 +706,13 @@ pub struct ThreadControlBlock
     pub syscall_nr: core::sync::atomic::AtomicU64,
 
     // === Address space / capability references ===
-    /// Address space this thread executes in (null for kernel threads).
+    /// Address space this thread executes in (null for kernel threads). Set at
+    /// creation and read-only after it (the Address-space / capability row).
     pub address_space: *mut crate::mm::address_space::AddressSpace,
 
-    /// `CSpace` bound to this thread.
+    /// `CSpace` bound to this thread. Set at creation and read-only after it
+    /// (the Address-space / capability row), as are `cspace_id` and
+    /// `cspace_epoch`.
     pub cspace: *mut crate::cap::cspace::CSpace,
 
     /// Registry identity of `cspace`, stamped when it is bound: the id and
@@ -651,7 +731,8 @@ pub struct ThreadControlBlock
     /// Virtual address of the per-thread IPC buffer page (0 = not registered).
     ///
     /// Registered by `SYS_IPC_BUFFER_SET`. IPC data words are read from / written
-    /// to this page when `data_count > 0`.
+    /// to this page when `data_count > 0`. Owned by the thread itself: only its
+    /// own syscalls read or write it (the IPC buffer row).
     pub ipc_buffer: u64,
 
     /// Wakeup value delivered to this thread when its IPC wait is claimed.
@@ -659,8 +740,9 @@ pub struct ThreadControlBlock
     /// Owned by the source lock: the waker that claims the park writes it
     /// under that lock (`claim_waiter`: the bits `notification_send` acquired
     /// on the waiter's behalf, an event-queue payload, a wait-set member badge
-    /// from `waitset_notify`, or `0` from the sleep-list timer claim and from
-    /// a source's dealloc drain). The resuming syscall reads and then clears
+    /// from `waitset_notify` or `waitset_add`'s ready-at-add wake, or `0` from
+    /// the sleep-list timer claim and from a source's or wait set's dealloc
+    /// drain, `interrupt_all_waiters`). The resuming syscall reads and then clears
     /// it with no lock, before the thread can park again (the bare-field
     /// exception of docs/coding-standards.md § Concurrency).
     pub wakeup_value: u64,
@@ -685,6 +767,10 @@ pub struct ThreadControlBlock
     /// On context switch, if non-null, this bitmap is copied into the TSS
     /// IOPB region so `in`/`out` instructions work for this thread.
     ///
+    /// No lock owns it: `sys_ioport_bind` writes it while another CPU's
+    /// `schedule()` may read it, a known defect (#443; the Address-space /
+    /// capability row).
+    ///
     // TODO: When the IoPort cap a binding was made through is deleted (including
     // by revocation of an ancestor), the relevant bits must be re-denied in this
     // bitmap and reloaded into the TSS if this thread is currently running
@@ -703,7 +789,10 @@ pub struct ThreadControlBlock
     ///
     /// Set when entering any IPC-blocked state; cleared on wakeup. Used by
     /// `cancel_ipc_block` (`SYS_THREAD_STOP`) and `dealloc_object(Thread)` to
-    /// unlink the thread from the blocking object.
+    /// unlink the thread from the blocking object. Owned with
+    /// [`ipc_state`](Self::ipc_state): written under
+    /// [`sched_lock`](Self::sched_lock), and arbitrated under the source lock
+    /// matching `ipc_state`.
     pub blocked_on_object: *mut u8,
 
     // === Identity ===
@@ -765,9 +854,14 @@ pub struct ThreadControlBlock
     ///
     /// Multiple binders (e.g. procmgr auto-reap + svcmgr restart manager)
     /// can each install their own observer; all fire on death independently.
+    ///
+    /// Owned by [`sched_lock`](Self::sched_lock): `sys_thread_bind_notification`
+    /// appends under it and `post_death_notification` snapshots under it (the
+    /// Death observers row).
     pub death_observers: [DeathObserver; MAX_DEATH_OBSERVERS],
     /// Number of populated entries in `death_observers`
-    /// (`0..=MAX_DEATH_OBSERVERS`).
+    /// (`0..=MAX_DEATH_OBSERVERS`). Owned by [`sched_lock`](Self::sched_lock),
+    /// as `death_observers` is.
     pub death_observer_count: u8,
 
     /// Exit reason recorded by the kernel at the moment this thread became
@@ -785,6 +879,12 @@ pub struct ThreadControlBlock
     /// out-of-band by `sys_cap_info`'s `CAP_INFO_THREAD_STATE` selector so
     /// userspace process managers can answer "did this thread die, and with
     /// what reason?" without racing the userspace death-event drain.
+    ///
+    /// Owned by the all-locks hold of the `Exited` commit: every write holds
+    /// [`sched_lock`](Self::sched_lock) and every CPU's `scheduler.lock`, so a
+    /// reader holds either one of them (`CAP_INFO_THREAD_STATE` the local
+    /// CPU's `scheduler.lock`, `sys_thread_bind_notification` `sched_lock`; the
+    /// Death observers row).
     pub exit_reason: u64,
 
     // === Sleep ===
@@ -794,7 +894,7 @@ pub struct ThreadControlBlock
     /// timer pop or `sleep_list_remove`, together with the entry, or by the
     /// parker's own rollback of a deadline it never listed. Atomic because
     /// waker prechecks read it under a source lock, not that lock.
-    /// See docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
+    /// See core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
     pub sleep_deadline: core::sync::atomic::AtomicU64,
 
     // === FPU / SIMD / Vector extended state ===
@@ -810,8 +910,10 @@ pub struct ThreadControlBlock
     /// `Blocked` waiters the per-CPU `current` dump cannot reach (#351), and by
     /// object teardown (`stop_threads_bound_to`), to find every thread bound to a
     /// dying `CSpace` or `AddressSpace`. Never read on any scheduling hot path.
+    /// Owned by `THREAD_REGISTRY_LOCK` (the Registry row).
     pub registry_next: *mut ThreadControlBlock,
     /// Intrusive backward link; see [`registry_next`](Self::registry_next).
+    /// Owned by `THREAD_REGISTRY_LOCK`.
     pub registry_prev: *mut ThreadControlBlock,
 
     // === Use-after-free detection ===

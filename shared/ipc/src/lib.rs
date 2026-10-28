@@ -1400,8 +1400,9 @@ pub mod devmgr_labels
     pub const QUERY_DEVICE_INFO: u64 = 2;
     /// Query for the serial (UART) device endpoint.
     ///
-    /// Mints a `serial_labels::WRITE_AUTHORITY`-badged `SEND_GRANT`
-    /// cap on the serial driver's service endpoint to the caller.
+    /// Mints a `serial_labels::WRITE_AUTHORITY |
+    /// serial_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap on the
+    /// serial driver's service endpoint to the caller.
     /// Caller's badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the
     /// handler replies `UNAUTHORIZED` otherwise. Mirrors
     /// [`QUERY_BLOCK_DEVICE`]'s reply shape.
@@ -1561,9 +1562,8 @@ pub mod devmgr_labels
     /// consumer query cap: svcmgr's `devmgr.*` publications, the SEND
     /// svcmgr mints for logd at launch, and the SEND init hands vfsd (the
     /// per-device SENDs drivers hold for [`QUERY_DEVICE_INFO`] lack it).
-    /// Without it those handlers reply
-    /// `UNAUTHORIZED`. It does not admit [`QUERY_BLOCK_DEVICE`], which
-    /// [`BLOCK_DEVICE_AUTHORITY`] gates.
+    /// Without it those handlers reply `UNAUTHORIZED`. It does not admit
+    /// [`QUERY_BLOCK_DEVICE`], which [`BLOCK_DEVICE_AUTHORITY`] gates.
     pub const REGISTRY_QUERY_AUTHORITY: u64 = 1u64 << 63;
     /// Authority bit gating [`SET_DRIVERS_DIR`]. svcmgr mints a SEND
     /// cap carrying this bit from the devmgr-registry source cap init

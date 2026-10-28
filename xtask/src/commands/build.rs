@@ -509,6 +509,14 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
 
 // ── Bootloader (special-cased: RISC-V objcopy + dual install path) ────────────
 
+/// `RUSTFLAGS` for the UEFI bootloader build and its lint pass, on every
+/// architecture.
+///
+/// Set in place of every config-file `rustflags` and of an inherited
+/// `RUSTFLAGS`, which the bootloader build replaces rather than extends;
+/// `docs/build-system.md` § Custom Targets says why.
+const BOOT_RUSTFLAGS: &str = "-Zunstable-options";
+
 fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
 {
     step(&format!(
@@ -533,7 +541,7 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         flags.push("--release");
     }
 
-    let env = [("RUSTFLAGS", args.arch.boot_rustflags())];
+    let env = [("RUSTFLAGS", BOOT_RUSTFLAGS)];
     if !args.skip_lints
     {
         clippy_check_ext(ctx, &flags, &env, None)?;

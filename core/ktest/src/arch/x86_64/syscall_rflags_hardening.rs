@@ -30,6 +30,8 @@ use crate::{ChildStack, TestContext, TestResult};
 const DEBUG_VECTOR: u64 = 1;
 
 /// Poll bound: ~2 s at ~1 ms per poll before declaring failure.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs, where the child's CPU waits for a host core.
 const MAX_POLLS: u32 = 2000;
 
 /// Guard bytes on each side of the `SYS_GETRANDOM` destination.
@@ -117,7 +119,7 @@ fn run_child(
         .map_err(|_| "syscall_rflags_hardening: spawn::new_child failed")?;
     let reason = crate::spawn::configure_and_start(&child, entry, ChildStack::top(stack), 0)
         .map_err(|_| "syscall_rflags_hardening: configure_and_start failed")
-        .and_then(|()| crate::spawn::wait_until_exited(child.th, MAX_POLLS));
+        .and_then(|()| crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS)));
     cap_delete(child.th).ok();
     cap_delete(child.cs).ok();
     reason

@@ -58,6 +58,17 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// Timed-then-untimed rounds (half per source).
 const CYCLES: u32 = 400;
 
+/// Fewest rounds at any width. A quarter of the rounds are late rounds of
+/// one source, and a late delivery wins the race against the deadline on
+/// roughly a third of them, so the floor keeps a few dozen late rounds per
+/// source.
+const MIN_CYCLES: u32 = 128;
+
+/// The rounds this boot runs: [`CYCLES`], fewer past 16 CPUs (see
+/// [`super::scaled_attempts`]). Set before the waiter starts; the waiter
+/// reads it to know its last cycle.
+static ROUNDS: AtomicU32 = AtomicU32::new(CYCLES);
+
 /// The waiter's timed wait.
 const WAIT_MS: u64 = 1;
 
@@ -81,6 +92,9 @@ const RESULT_SPINS: u32 = 200_000;
 /// seen `FINISHED` reach the previous cycle, and between cycles the waiter
 /// only spins on `ACKED` and stores `TIMED`, so a longer absence is a waiter
 /// that is not being dispatched (or, on cycle 1, never started).
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const ENTER_TIMEOUT_US: u64 = 1_000_000;
 
 /// After the first release delivery, the controller sleeps this many 1 ms
@@ -137,6 +151,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     TIMED.store(0, Ordering::Release);
     FINISHED.store(0, Ordering::Release);
     ACKED.store(0, Ordering::Release);
+    // Each round's cross-CPU deliveries and wakes grow with the width; the
+    // count shrinks with it.
+    ROUNDS.store(
+        super::scaled_attempts(CYCLES, MIN_CYCLES, cpus),
+        Ordering::Release,
+    );
 
     thread_set_affinity(ctx.thread_cap, 1)
         .map_err(|_| "stress::timed_wait_reuse: pin controller failed")?;
@@ -245,7 +265,7 @@ fn start_waiter(
 fn cycles(sig: u32, eq: u32) -> Result<Tally, &'static str>
 {
     let mut tally = Tally::default();
-    for cycle in 1..=CYCLES
+    for cycle in 1..=ROUNDS.load(Ordering::Acquire)
     {
         let source = if cycle & 1 == 0 { NOTIFICATION } else { QUEUE };
         let late = cycle & 2 != 0;
@@ -319,7 +339,7 @@ fn late_delay(cycle: u32) -> TestResult
 /// [`ENTER_TIMEOUT_US`].
 fn await_timed_wait(cycle: u32) -> TestResult
 {
-    let until = elapsed_us()? + ENTER_TIMEOUT_US;
+    let until = elapsed_us()? + crate::scaled_bound(ENTER_TIMEOUT_US);
     while TIMED.load(Ordering::Acquire) != cycle
     {
         if elapsed_us()? >= until
@@ -447,7 +467,8 @@ extern "C" fn waiter_entry(arg: u64) -> !
 {
     let sig = (arg & 0xFFFF_FFFF) as u32;
     let eq = (arg >> 32) as u32;
-    for cycle in 1..=CYCLES
+    let rounds = ROUNDS.load(Ordering::Acquire);
+    for cycle in 1..=rounds
     {
         while ACKED.load(Ordering::Acquire) != cycle - 1
         {
@@ -478,7 +499,7 @@ extern "C" fn waiter_entry(arg: u64) -> !
         UNTIMED_OK.store(u32::from(untimed), Ordering::Release);
         FINISHED.store(cycle, Ordering::Release);
     }
-    while ACKED.load(Ordering::Acquire) != CYCLES
+    while ACKED.load(Ordering::Acquire) != rounds
     {
         core::hint::spin_loop();
     }

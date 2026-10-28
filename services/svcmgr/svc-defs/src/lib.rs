@@ -128,7 +128,8 @@ pub struct Definition
     pub env: Vec<String>,
     pub restart: RestartPolicy,
     /// Whether the system is viable without this service once it is
-    /// permanently down (restart not attempted, or budget exhausted).
+    /// permanently down (restart not attempted, budget exhausted, or
+    /// restart failed).
     /// `true` (`critical = yes`) → svcmgr issues `pwrmgr_labels::SHUTDOWN`
     /// on unrecoverable death; `false` (`critical = no`) → the system
     /// continues degraded. Orthogonal to [`Definition::restart`], which

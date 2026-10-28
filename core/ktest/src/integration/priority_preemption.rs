@@ -17,8 +17,9 @@
 //!
 //! Verification: the parent unblocks on B's "ran" notification well before A's
 //! spinner finishes. Slack: B must arrive within `PREEMPT_BUDGET_US` of wall
-//! time of being made runnable. Skipped if no `SchedControl` cap
-//! exists in the initial cap set (no elevation path).
+//! time of being made runnable, stretched past 16 CPUs by the width's
+//! oversubscription factor ([`crate::scaled_bound`]). Skipped if no
+//! `SchedControl` cap exists in the initial cap set (no elevation path).
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait_timeout,
@@ -35,8 +36,15 @@ const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 /// preemption, the hog dominates the CPU for tens of ms.
 const SPIN_ITERS: u64 = 50_000_000;
 
-/// Wall-time budget the elevated child has to arrive (µs).
+/// Wall-time budget the elevated child has to arrive (µs). Applied through
+/// [`crate::scaled_bound`]: tight as written up to
+/// [`crate::UNSCALED_CPUS`] CPUs, stretched past them, where CPU 0's host
+/// thread waits for a host core before it can switch to the child.
 const PREEMPT_BUDGET_US: u64 = 100_000;
+
+/// 5 s windows the test waits, at most, for the hog to finish before
+/// deleting it wherever it is.
+const HOG_DRAIN_WINDOWS: u32 = 12;
 
 static mut HOG_STACK: ChildStack = ChildStack::ZERO;
 static mut ELEVATED_STACK: ChildStack = ChildStack::ZERO;
@@ -115,6 +123,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let elevated_arg = u64::from(elevated_done) | (0x2u64 << 32);
     let elevated_stack = ChildStack::top(core::ptr::addr_of!(ELEVATED_STACK));
 
+    let budget_us = crate::scaled_bound(PREEMPT_BUDGET_US);
     let t_made_runnable = system_info(SystemInfoType::ElapsedUs as u64)
         .map_err(|_| "priority_preemption: system_info before configure failed")?;
     crate::spawn::configure_and_start_pinned(
@@ -128,7 +137,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Wait for either notification: elevated bit 0x2 means preemption succeeded,
     // hog bit 0x1 means the hog finished before being preempted (failure).
-    let bits = notification_wait_timeout(done, PREEMPT_BUDGET_US / 1000)
+    let bits = notification_wait_timeout(done, budget_us / 1000)
         .map_err(|_| "priority_preemption: notification_wait_timeout failed")?;
 
     let t_observed = system_info(SystemInfoType::ElapsedUs as u64)
@@ -144,7 +153,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         );
     }
 
-    if elapsed_us > PREEMPT_BUDGET_US
+    if elapsed_us > budget_us
     {
         crate::log_u64("priority_preemption: elapsed_us=", elapsed_us);
         return Err(
@@ -152,16 +161,19 @@ pub fn run(ctx: &TestContext) -> TestResult
         );
     }
 
-    // Drain the hog's done bit (it will finish eventually).
-    loop
+    // Let the hog finish before tearing it down, unless the wait above
+    // already took its done bit. The hog may take ~1 s to complete, longer
+    // on an oversubscribed boot; wait in 5 s windows, at most
+    // HOG_DRAIN_WINDOWS of them, after which the delete below stops it
+    // wherever it is.
+    let mut seen = bits;
+    for _ in 0..HOG_DRAIN_WINDOWS
     {
-        let bits = notification_wait_timeout(done, 5_000).unwrap_or(0);
-        if bits & 0x1 != 0
+        if seen & 0x1 != 0
         {
             break;
         }
-        // The hog may take ~1 s to complete; keep waiting in small windows
-        // rather than blocking forever.
+        seen |= notification_wait_timeout(done, 5_000).unwrap_or(0);
     }
 
     cap_delete(hog.th).ok();

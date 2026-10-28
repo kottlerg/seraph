@@ -221,13 +221,6 @@ Internally the pipeline runs in three steps:
    and xtask copies it to the UEFI fallback path `EFI/BOOT/BOOTRISCV64.EFI`, per
    [docs/build-system.md § Build Output: the Sysroot](../../../docs/build-system.md#build-output-the-sysroot).
 
-The bootloader's RISC-V `RUSTFLAGS` carry `-C jump-tables=no`
-([docs/build-system.md § Custom Targets](../../../docs/build-system.md#custom-targets)).
-The relocation model does not depend on it: a jump-table entry is either an offset relative to
-the table, which needs no relocation, or an absolute pointer, which the linker emits as an
-`R_RISCV_RELATIVE` entry that the self-relocation loop applies like any other in `.rodata` (see
-"Relocation: static-PIE self-relocation").
-
 The intermediate ELF is not a usable UEFI image — UEFI does not
 understand ELF headers — but its symbols carry the same image-relative addresses as the flat
 binary's layout (the flat binary itself has no symbol table), so GDB / LLDB can set symbolic
@@ -235,6 +228,14 @@ breakpoints from the ELF, offset by the runtime load bias, even though UEFI load
 binary. See [xtask/README.md](../../../xtask/README.md)
 for the authoritative command surface; the steps above are descriptive,
 not a manual recipe.
+
+The bootloader's RISC-V `RUSTFLAGS` carry `-C jump-tables=no`
+([docs/build-system.md § Custom Targets](../../../docs/build-system.md#custom-targets)).
+The relocation model does not depend on it: a jump-table entry is either an offset relative to
+the table, which needs no relocation, or an absolute pointer, which the linker emits as an
+`R_RISCV_RELATIVE` entry that the self-relocation loop applies like any other in `.rodata` (see
+"Relocation: static-PIE self-relocation"). The flag stays set until a riscv64 build and boot
+without it confirm it can be removed (issue #493).
 
 ---
 

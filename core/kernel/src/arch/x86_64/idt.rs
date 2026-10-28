@@ -47,8 +47,7 @@
 //!   `irq_dispatch` to cover it.
 //! - To change IST assignments: change the `ist` argument of that vector's
 //!   `set(vector, stub, ist)` call in `init()` and ensure the matching IST stack
-//!   is configured in the TSS. (The `ist = ...` argument of `isr_stub!` is not
-//!   used by its expansion.)
+//!   is configured in the TSS.
 
 // cast_possible_truncation: every narrowing cast here is bounded — the IDTR limit
 // (256 * 16 - 1 fits u16), the masked/shifted handler-offset splits in
@@ -468,18 +467,19 @@ pub(super) unsafe extern "C" fn common_exception_handler(
             // Commit Exited under all-CPU scheduler.locks so a concurrent
             // dealloc observes a coherent state. See
             // core/kernel/docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
-            // The reason (EXIT_FAULT_BASE + vector; EXIT_FAULT_BASE = 0x1000,
-            // matching syscall_abi::EXIT_FAULT_BASE) is written in the same
-            // hold. A refusal means a teardown already committed
-            // `EXIT_KILLED`; the posts below still carry the fault class (no
-            // death walk posts `EXIT_KILLED`).
+            // The reason (`EXIT_FAULT_BASE + vector`) is written in the same
+            // hold. A refusal means the thread is already `Exited` (an
+            // object-teardown stop recorded `EXIT_KILLED`, or a
+            // `dealloc_object(Thread)` committed `Exited`); the posts below
+            // still carry the fault class (no death walk posts `EXIT_KILLED`).
+            let reason = syscall::EXIT_FAULT_BASE + vector;
             // SAFETY: tcb validated non-null.
-            let _ = unsafe { crate::sched::exit_under_all_locks(tcb, 0x1000 + vector) };
+            let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
 
             // Post death notification if bound (exit_reason = EXIT_FAULT_BASE + vector).
             // SAFETY: tcb is valid; post_death_notification handles null check.
             unsafe {
-                crate::sched::post_death_notification(tcb, 0x1000 + vector);
+                crate::sched::post_death_notification(tcb, reason);
             }
 
             // Terminal fault (no handler bound, or a Kill outcome: the handler
@@ -491,14 +491,14 @@ pub(super) unsafe extern "C" fn common_exception_handler(
             // SAFETY: tcb validated non-null; address_space may be null for
             // kernel threads, which post_aspace_death_notification handles.
             unsafe {
-                crate::sched::post_aspace_death_notification((*tcb).address_space, 0x1000 + vector);
+                crate::sched::post_aspace_death_notification((*tcb).address_space, reason);
             }
         }
 
-        // SAFETY: schedule(false) context-switches away; the exited thread
+        // SAFETY: schedule(Requeue::IfRunnable) context-switches away; the exited thread
         // is never re-enqueued.
         unsafe {
-            crate::sched::schedule(false);
+            crate::sched::schedule(crate::sched::Requeue::IfRunnable);
         }
         crate::arch::current::cpu::halt_loop();
     }
@@ -703,7 +703,7 @@ fn dump_x86_regs_console(f: &TrapFrame)
 /// [rsp+16] rip / cs / rflags  — hardware
 /// ```
 macro_rules! isr_stub {
-    ($name:ident, $vector:expr, has_error_code = false, ist = $ist:expr) => {
+    ($name:ident, $vector:expr, has_error_code = false) => {
         #[cfg(not(test))]
         #[unsafe(naked)]
         unsafe extern "C" fn $name()
@@ -716,7 +716,7 @@ macro_rules! isr_stub {
             );
         }
     };
-    ($name:ident, $vector:expr, has_error_code = true, ist = $ist:expr) => {
+    ($name:ident, $vector:expr, has_error_code = true) => {
         #[cfg(not(test))]
         #[unsafe(naked)]
         unsafe extern "C" fn $name()
@@ -824,47 +824,47 @@ macro_rules! paranoid_isr_stub {
 // ── Exception stubs ───────────────────────────────────────────────────────────
 // Vectors with hardware error codes: 8, 10, 11, 12, 13, 14, 17, 21, 29, 30.
 
-isr_stub!(isr0, 0, has_error_code = false, ist = 0);
+isr_stub!(isr0, 0, has_error_code = false);
 paranoid_isr_stub!(isr1, 1, has_error_code = false); // #DB
 // NMI (vector 2) uses ipi_nmi_backtrace_stub instead of the generic
 // isr_stub! — see `ipi_nmi_backtrace_stub` below.
-isr_stub!(isr3, 3, has_error_code = false, ist = 0);
-isr_stub!(isr4, 4, has_error_code = false, ist = 0);
-isr_stub!(isr5, 5, has_error_code = false, ist = 0);
-isr_stub!(isr6, 6, has_error_code = false, ist = 0);
+isr_stub!(isr3, 3, has_error_code = false);
+isr_stub!(isr4, 4, has_error_code = false);
+isr_stub!(isr5, 5, has_error_code = false);
+isr_stub!(isr6, 6, has_error_code = false);
 // Vector 7 (#NM) has a dedicated handler — see `isr_nm` below.
 paranoid_isr_stub!(isr8, 8, has_error_code = true); // Double Fault — IST1
-isr_stub!(isr9, 9, has_error_code = false, ist = 0);
-isr_stub!(isr10, 10, has_error_code = true, ist = 0);
-isr_stub!(isr11, 11, has_error_code = true, ist = 0);
-isr_stub!(isr12, 12, has_error_code = true, ist = 0);
-isr_stub!(isr13, 13, has_error_code = true, ist = 0);
+isr_stub!(isr9, 9, has_error_code = false);
+isr_stub!(isr10, 10, has_error_code = true);
+isr_stub!(isr11, 11, has_error_code = true);
+isr_stub!(isr12, 12, has_error_code = true);
+isr_stub!(isr13, 13, has_error_code = true);
 // Vector 14 (#PF) has a dedicated stub — see `isr_page_fault` below — so a
 // spurious stale-TLB fault can be resolved and retried instead of killing.
-isr_stub!(isr15, 15, has_error_code = false, ist = 0);
-isr_stub!(isr16, 16, has_error_code = false, ist = 0);
-isr_stub!(isr17, 17, has_error_code = true, ist = 0);
+isr_stub!(isr15, 15, has_error_code = false);
+isr_stub!(isr16, 16, has_error_code = false);
+isr_stub!(isr17, 17, has_error_code = true);
 paranoid_isr_stub!(isr18, 18, has_error_code = false); // #MC
-isr_stub!(isr19, 19, has_error_code = false, ist = 0);
-isr_stub!(isr20, 20, has_error_code = false, ist = 0);
-isr_stub!(isr21, 21, has_error_code = true, ist = 0);
-isr_stub!(isr22, 22, has_error_code = false, ist = 0);
-isr_stub!(isr23, 23, has_error_code = false, ist = 0);
-isr_stub!(isr24, 24, has_error_code = false, ist = 0);
-isr_stub!(isr25, 25, has_error_code = false, ist = 0);
-isr_stub!(isr26, 26, has_error_code = false, ist = 0);
-isr_stub!(isr27, 27, has_error_code = false, ist = 0);
-isr_stub!(isr28, 28, has_error_code = false, ist = 0);
-isr_stub!(isr29, 29, has_error_code = true, ist = 0);
-isr_stub!(isr30, 30, has_error_code = true, ist = 0);
-isr_stub!(isr31, 31, has_error_code = false, ist = 0);
+isr_stub!(isr19, 19, has_error_code = false);
+isr_stub!(isr20, 20, has_error_code = false);
+isr_stub!(isr21, 21, has_error_code = true);
+isr_stub!(isr22, 22, has_error_code = false);
+isr_stub!(isr23, 23, has_error_code = false);
+isr_stub!(isr24, 24, has_error_code = false);
+isr_stub!(isr25, 25, has_error_code = false);
+isr_stub!(isr26, 26, has_error_code = false);
+isr_stub!(isr27, 27, has_error_code = false);
+isr_stub!(isr28, 28, has_error_code = false);
+isr_stub!(isr29, 29, has_error_code = true);
+isr_stub!(isr30, 30, has_error_code = true);
+isr_stub!(isr31, 31, has_error_code = false);
 
 // ── Shared IRQ trampoline ─────────────────────────────────────────────────────
 
 /// Point the current thread's `trap_frame` at `frame`, the live frame an
 /// interrupt or exception trampoline built on its kernel stack for an entry
 /// from user mode (the rule, and the entries that publish nothing, are in
-/// `docs/arch-interface.md` § `trap_frame`). After configuration the running
+/// `core/kernel/docs/arch-interface.md` § `trap_frame`). After configuration the running
 /// thread is the only writer; the register syscalls read the pointer only once
 /// the thread is off every CPU with its save published
 /// (`sched::with_held_frame`).
@@ -1824,16 +1824,21 @@ mod tests
 {
     use super::*;
 
+    /// A gate is encoded as a present ring-0 interrupt gate on `KERNEL_CS`
+    /// with the given IST index and a zero reserved word.
     #[test]
     fn idt_entry_new_present_interrupt_gate()
     {
-        let e = IdtEntry::new(0xDEAD_BEEF_1234_5678, 0, 0);
+        let e = IdtEntry::new(0xDEAD_BEEF_1234_5678, 3, 0);
         // Present bit (bit 7 of type_attr).
         assert!(e.type_attr & 0x80 != 0, "P not set");
         // Gate type = 0xE in low nibble.
         assert_eq!(e.type_attr & 0x0F, 0xE, "should be interrupt gate");
         // DPL = 0.
         assert_eq!((e.type_attr >> 5) & 3, 0);
+        assert_eq!(e.ist & 0x7, 3);
+        assert_eq!(e.selector, KERNEL_CS);
+        assert_eq!(e._reserved, 0);
     }
 
     #[test]
@@ -1844,26 +1849,5 @@ mod tests
         assert_eq!(e.offset_low as u64, handler & 0xFFFF);
         assert_eq!(e.offset_mid as u64, (handler >> 16) & 0xFFFF);
         assert_eq!(e.offset_high as u64, (handler >> 32) & 0xFFFF_FFFF);
-    }
-
-    #[test]
-    fn idt_entry_ist_stored()
-    {
-        let e = IdtEntry::new(0x1000, 3, 0);
-        assert_eq!(e.ist & 0x7, 3);
-    }
-
-    #[test]
-    fn idt_entry_selector_is_kernel_cs()
-    {
-        let e = IdtEntry::new(0x1000, 0, 0);
-        assert_eq!(e.selector, KERNEL_CS);
-    }
-
-    #[test]
-    fn idt_entry_reserved_is_zero()
-    {
-        let e = IdtEntry::new(0x1000, 0, 0);
-        assert_eq!(e._reserved, 0);
     }
 }

@@ -218,7 +218,7 @@ unsafe fn rollback_uncommitted_call(
         {
             crate::sched::thread::stamp_cancelled_deposit(
                 caller,
-                parked_state == IpcThreadState::BlockedOnFault,
+                crate::sched::thread::ParkKind::of_blocked(parked_state),
             );
             (*caller)
                 .wake_in_flight
@@ -395,7 +395,10 @@ pub unsafe fn endpoint_call(
             // ep.lock has been held continuously since the enqueue above, so
             // this teardown is the episode's sole owner: stamp so the stopped
             // caller's restart resumes via the disposition.
-            crate::sched::thread::stamp_cancelled_deposit(caller, (*caller).in_fault_delivery);
+            crate::sched::thread::stamp_cancelled_deposit(
+                caller,
+                crate::sched::thread::ParkKind::of_sender(caller),
+            );
             (*caller)
                 .context_saved
                 .store(1, core::sync::atomic::Ordering::Relaxed);
@@ -443,7 +446,10 @@ unsafe fn release_unreplied_caller(server: *mut ThreadControlBlock)
     // SAFETY: the swap won the caller's episode, and its wake_in_flight pin
     // keeps the TCB allocated until enqueue_and_wake clears it.
     unsafe {
-        crate::sched::thread::stamp_cancelled_deposit(caller, (*caller).in_fault_delivery);
+        crate::sched::thread::stamp_cancelled_deposit(
+            caller,
+            crate::sched::thread::ParkKind::of_sender(caller),
+        );
         let target_cpu = crate::sched::select_target_cpu(caller);
         crate::sched::enqueue_and_wake(caller, target_cpu);
     }
@@ -576,7 +582,7 @@ pub unsafe fn endpoint_recv(
                 // dealloc may free the TCB.
                 crate::sched::thread::stamp_cancelled_deposit(
                     caller,
-                    parked == IpcThreadState::BlockedOnFault,
+                    crate::sched::thread::ParkKind::of_blocked(parked),
                 );
                 (*caller)
                     .wake_in_flight

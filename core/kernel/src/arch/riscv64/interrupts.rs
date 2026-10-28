@@ -597,19 +597,20 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
             {
                 // Commit Exited under all-CPU scheduler.locks. See
                 // core/kernel/docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
-                // The reason (EXIT_FAULT_BASE + cause_code; EXIT_FAULT_BASE =
-                // 0x1000, matching syscall_abi::EXIT_FAULT_BASE) is written in
-                // the same hold. A refusal means a teardown already committed
-                // `EXIT_KILLED`; the posts below still carry the fault class
-                // (no death walk posts `EXIT_KILLED`).
+                // The reason (`EXIT_FAULT_BASE + cause_code`) is written in the
+                // same hold. A refusal means the thread is already `Exited` (an
+                // object-teardown stop recorded `EXIT_KILLED`, or a
+                // `dealloc_object(Thread)` committed `Exited`); the posts below
+                // still carry the fault class (no death walk posts `EXIT_KILLED`).
+                let reason = syscall::EXIT_FAULT_BASE + cause_code;
                 // SAFETY: tcb validated non-null.
-                let _ = unsafe { crate::sched::exit_under_all_locks(tcb, 0x1000 + cause_code) };
+                let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
 
                 // Post death notification if bound (exit_reason = EXIT_FAULT_BASE + cause_code).
                 // SAFETY: tcb validated non-null; exit_under_all_locks has marked it Exited and no
                 // sched_lock is held.
                 unsafe {
-                    crate::sched::post_death_notification(tcb, 0x1000 + cause_code);
+                    crate::sched::post_death_notification(tcb, reason);
                 }
 
                 // Terminal fault (no handler bound, or a Kill outcome: the handler
@@ -621,17 +622,14 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
                 // SAFETY: tcb validated non-null; address_space may be null for
                 // kernel threads, which post_aspace_death_notification handles.
                 unsafe {
-                    crate::sched::post_aspace_death_notification(
-                        (*tcb).address_space,
-                        0x1000 + cause_code,
-                    );
+                    crate::sched::post_aspace_death_notification((*tcb).address_space, reason);
                 }
             }
 
-            // SAFETY: schedule(false) context-switches away; the exited thread
+            // SAFETY: schedule(Requeue::IfRunnable) context-switches away; the exited thread
             // is never re-enqueued.
             unsafe {
-                crate::sched::schedule(false);
+                crate::sched::schedule(crate::sched::Requeue::IfRunnable);
             }
             // Unreachable for an exited thread, but guard against schedule returning.
             loop

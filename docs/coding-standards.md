@@ -219,17 +219,28 @@ let value = unsafe { ptr.read() };
 
 - Shared mutable state MUST be protected by an explicit synchronisation primitive. Use
   `Mutex<T>` rather than a bare `T` with a separate lock — the type system should enforce
-  the invariant. The exception is a kernel field whose owner a design document records: a
-  thread-control-block field whose owner
-  [scheduling-internals.md § Cross-CPU TCB Ownership](../core/kernel/docs/scheduling-internals.md#cross-cpu-tcb-ownership)
-  names (the TCB's own `sched_lock`, the lock of the source or wait set the thread is parked on,
-  or, for a field that table assigns to it, the claim on the thread's park episode), and a field
-  of an IPC object, a source or a wait set, that the object's own `lock` serialises, as the
-  object's § Object Structure in
-  [ipc-internals.md](../core/kernel/docs/ipc-internals.md) records. Such a field MAY be a bare
-  `T` when a rustdoc names that owner: the field's own for a thread-control-block field, whose
-  owners differ field by field; the object's for an IPC object, whose non-atomic fields share
-  its one `lock`.
+  the invariant. The exception is a kernel field whose owner a design document records:
+  - a thread-control-block field whose owner
+    [scheduling-internals.md § Cross-CPU TCB Ownership](../core/kernel/docs/scheduling-internals.md#cross-cpu-tcb-ownership)
+    names (the TCB's own `sched_lock`, a CPU's `scheduler.lock`, the all-locks hold of a lifecycle
+    commit, `THREAD_REGISTRY_LOCK`, the lock of the source or wait set the thread is parked on, or,
+    for a field that table assigns to it, the claim on the thread's park episode);
+  - a field of an IPC object, a source or a wait set, that the object's own `lock` serialises, as
+    the object's § Object Structure in [ipc-internals.md](../core/kernel/docs/ipc-internals.md)
+    records;
+  - a field of a per-CPU scheduler that its `lock` serialises, as
+    [scheduling-internals.md § Lock Hierarchy](../core/kernel/docs/scheduling-internals.md#lock-hierarchy)
+    records;
+  - a field of a `CSpace` that its spinlock serialises, as
+    [capability-internals.md § Storage: Hybrid Two-Level Radix](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
+    records;
+  - an address space's terminal-fault observer state, which its `death_lock` serialises, as
+    [memory-internals.md § Address Space Objects](../core/kernel/docs/memory-internals.md#address-space-objects-mmaddress_spacers)
+    records.
+
+  Such a field MAY be a bare `T` when a rustdoc names that owner: the field's own for a
+  thread-control-block field, whose owners differ field by field; the object's for any other
+  object, whose lock-owned fields share its one lock.
 - Prefer message passing over shared memory; shared memory is a deliberate optimisation,
   not the default.
 - Lock ordering MUST be documented and consistent. When acquiring multiple locks, always

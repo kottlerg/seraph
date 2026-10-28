@@ -227,26 +227,29 @@ pub struct AddressSpace
     /// `ThreadControlBlock::death_observers`). Semantics are defined in
     /// `docs/capability-model.md` § "Kill process" pattern and
     /// `core/kernel/docs/syscalls.md` § `SYS_ASPACE_BIND_NOTIFICATION`. Entries
-    /// past `death_observer_count` are invalid.
+    /// past `death_observer_count` are invalid. Owned by `death_lock`.
     death_observers:
         [crate::sched::thread::DeathObserver; crate::sched::thread::MAX_DEATH_OBSERVERS],
     /// Number of populated entries in `death_observers`
-    /// (`0..=MAX_DEATH_OBSERVERS`).
+    /// (`0..=MAX_DEATH_OBSERVERS`). Owned by `death_lock`.
     death_observer_count: u8,
     /// Serialises `death_observers`/`death_observer_count` and the retained
     /// terminal-fault state below against a concurrent bind
     /// (`sys_aspace_bind_notification`) and the terminal-fault post
     /// (`post_aspace_death_notification`) — the address-space analogue of a
     /// thread's `sched_lock` role for `ThreadControlBlock::death_observers`.
+    /// Those four fields are bare under the exception of
+    /// docs/coding-standards.md § Concurrency, with this lock as their owner
+    /// (core/kernel/docs/memory-internals.md § Address Space Objects).
     death_lock: crate::sync::Spinlock,
     /// Set when a thread in this address space takes a terminal fault. A later
     /// bind onto an already-faulted space delivers `terminal_fault_reason` to
     /// the new observer instead of dropping the event — the address-space
     /// analogue of retaining a thread's `exit_reason` past death. First fault
-    /// wins; subsequent faults do not overwrite.
+    /// wins; subsequent faults do not overwrite. Owned by `death_lock`.
     terminal_faulted: bool,
     /// Retained terminal-fault reason (`EXIT_FAULT_BASE + vector`), valid when
-    /// `terminal_faulted`.
+    /// `terminal_faulted`. Owned by `death_lock`.
     terminal_fault_reason: u64,
 }
 

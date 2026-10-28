@@ -40,10 +40,6 @@
 //! `cap::retype::dispatch_for(WaitSet)` declares (asserted below), or move
 //! the object to a larger retype bin.
 
-// cast_possible_truncation: member indices are bounded by WAIT_SET_MAX_MEMBERS (16),
-// which fits in u8. WAIT_SET_MAX_MEMBERS itself (usize) fits in u8. All truncations safe.
-#![allow(clippy::cast_possible_truncation)]
-
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 
 /// Maximum number of sources a wait set can monitor simultaneously.
@@ -245,6 +241,8 @@ impl WaitSetState
     #[inline]
     fn push_ready(&mut self, member_idx: u8)
     {
+        // cast_possible_truncation: WAIT_SET_MAX_MEMBERS (16) fits in u8.
+        #[allow(clippy::cast_possible_truncation)]
         let next = (self.ready_tail + 1) % WAIT_SET_MAX_MEMBERS as u8;
         if next != self.ready_head
         {
@@ -262,6 +260,8 @@ impl WaitSetState
         while self.has_ready()
         {
             let idx = self.ready_ring[self.ready_head as usize] as usize;
+            // cast_possible_truncation: WAIT_SET_MAX_MEMBERS (16) fits in u8.
+            #[allow(clippy::cast_possible_truncation)]
             self.ready_head = (self.ready_head + 1) % WAIT_SET_MAX_MEMBERS as u8;
             let m = &self.members[idx];
             if m.is_occupied()

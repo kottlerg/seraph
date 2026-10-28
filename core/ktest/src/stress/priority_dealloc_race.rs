@@ -16,9 +16,9 @@
 //!     active migration races the priority-change's locate-and-relocate
 //!     and exercises the cross-CPU outgoing re-enqueue branch under heavy
 //!     contention.
-//!   * **Phase 2** pins each worker to a remote CPU and waits until the
-//!     worker reports running there, then does two rapid priority writes
-//!     followed by
+//!   * **Phase 2** raises each worker to the cell's top level, pins it to a
+//!     remote CPU and waits until the worker reports running there, then
+//!     does two rapid priority writes followed by
 //!     `cap_delete(Thread)` — the dealloc all-locks walk + drain protocol
 //!     race the priority-change in flight *and* a target that is `current`
 //!     on another CPU (the #207 free-vs-`current`-read window).
@@ -54,6 +54,16 @@ const CPU_WAIT_SLICE_MS: u64 = 5;
 /// changes.
 static WORKER_CPU: [AtomicU32; NUM_WORKERS] = [const { AtomicU32::new(u32::MAX) }; NUM_WORKERS];
 
+/// The workers and how far the cell has got with them: `spawned` were
+/// started; those below `reaped` were deleted by Phase 2.
+struct Workers
+{
+    threads: [u32; NUM_WORKERS],
+    cspaces: [u32; NUM_WORKERS],
+    spawned: usize,
+    reaped: usize,
+}
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = syscall::system_info(SystemInfoType::CpuCount as u64)
@@ -66,13 +76,39 @@ pub fn run(ctx: &TestContext) -> TestResult
     let moved = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::priority_dealloc_race: cap_create_notification failed")?;
 
-    let mut threads = [0u32; NUM_WORKERS];
-    let mut cspaces = [0u32; NUM_WORKERS];
+    let mut workers = Workers {
+        threads: [0; NUM_WORKERS],
+        cspaces: [0; NUM_WORKERS],
+        spawned: 0,
+        reaped: 0,
+    };
+    let result = spawn_workers(ctx, moved, &mut workers)
+        .and_then(|()| churn_and_delete(ctx, moved, cpu_mod, &mut workers));
+    // A failed phase leaves spinning workers that would starve the floor-
+    // priority children of every later cell; delete them on every path.
+    for i in workers.reaped..workers.spawned
+    {
+        let _ = cap_delete(workers.threads[i]);
+        let _ = cap_delete(workers.cspaces[i]);
+    }
+    let deleted = cap_delete(moved);
+    result?;
+    deleted.map_err(|_| "stress::priority_dealloc_race: cap_delete moved failed")?;
+    Ok(())
+}
 
+/// Start the workers, each reporting its CPU on `moved`, and wait until
+/// every one has run (they are created at the floor, strictly below this
+/// thread) — priority placement only matters once they have been on a queue.
+fn spawn_workers(ctx: &TestContext, moved: u32, workers: &mut Workers) -> TestResult
+{
     for i in 0..NUM_WORKERS
     {
         let child = spawn::new_child(ctx)
             .map_err(|_| "stress::priority_dealloc_race: spawn::new_child failed")?;
+        workers.threads[i] = child.th;
+        workers.cspaces[i] = child.cs;
+        workers.spawned = i + 1;
         let child_moved = cap_copy(moved, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "stress::priority_dealloc_race: cap_copy moved failed")?;
         // arg packs moved_slot[31:0] | worker index[63:32].
@@ -82,21 +118,25 @@ pub fn run(ctx: &TestContext) -> TestResult
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
         spawn::configure_and_start(&child, spinner_entry, stack_top, arg)
             .map_err(|_| "stress::priority_dealloc_race: configure_and_start failed")?;
-        threads[i] = child.th;
-        cspaces[i] = child.cs;
     }
-
-    // Start the contention phase once every worker (created at the floor,
-    // strictly below this thread) has run — priority placement only matters
-    // once they have been on a queue.
     let mut moved_bits = 0u64;
     crate::tally::await_all(
         moved,
         &mut moved_bits,
         (1u64 << NUM_WORKERS) - 1,
         "stress::priority_dealloc_race: a worker never ran",
-    )?;
+    )
+}
 
+/// Phase 1 (priority churn with affinity flips) and Phase 2 (pin, churn and
+/// delete each worker), recording in `workers.reaped` the workers deleted.
+fn churn_and_delete(
+    ctx: &TestContext,
+    moved: u32,
+    cpu_mod: u32,
+    workers: &mut Workers,
+) -> TestResult
+{
     // ── Phase 1: priority churn ± affinity flips. ────────────────────────
     //
     // Surface: an affinity-driven migration to a different CPU's
@@ -111,7 +151,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         // u32::MAX, so the narrow casts are safe; `try_from` keeps clippy
         // honest.
         let cycle_u32 = u32::try_from(cycle).unwrap_or(0);
-        for (i, &th) in threads.iter().enumerate()
+        for (i, &th) in workers.threads.iter().enumerate()
         {
             let prio: u8 = if (cycle + i) & 1 == 0 { 3 } else { 9 };
             let _ = thread_set_priority(th, prio, ctx.sched_control_cap);
@@ -149,19 +189,22 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let i_u32 = u32::try_from(i).unwrap_or(0);
         let target_cpu = (i_u32 + 1) % cpu_mod;
-        let _ = thread_set_affinity(threads[i], target_cpu);
+        // Phase 1 left the workers spinning at levels 3 and 9; at the top
+        // level of the cell this worker runs on its pinned CPU whatever
+        // spins there, so it can report it.
+        let _ = thread_set_priority(workers.threads[i], 11, ctx.sched_control_cap);
+        let _ = thread_set_affinity(workers.threads[i], target_cpu);
         // Churn and delete the worker once it reports running on its pinned
         // CPU (the remote CPU dispatches it on its own).
         await_worker_on(moved, i, target_cpu)?;
-        let _ = thread_set_priority(threads[i], 5, ctx.sched_control_cap);
-        let _ = thread_set_priority(threads[i], 11, ctx.sched_control_cap);
-        cap_delete(threads[i])
+        let _ = thread_set_priority(workers.threads[i], 5, ctx.sched_control_cap);
+        let _ = thread_set_priority(workers.threads[i], 11, ctx.sched_control_cap);
+        cap_delete(workers.threads[i])
             .map_err(|_| "stress::priority_dealloc_race: cap_delete thread failed")?;
-        cap_delete(cspaces[i])
+        workers.reaped = i + 1;
+        cap_delete(workers.cspaces[i])
             .map_err(|_| "stress::priority_dealloc_race: cap_delete cspace failed")?;
     }
-    cap_delete(moved).map_err(|_| "stress::priority_dealloc_race: cap_delete moved failed")?;
-
     Ok(())
 }
 

@@ -320,7 +320,7 @@ pub fn wait_timeout_returns_bits_first(ctx: &TestContext) -> TestResult
 // cast_possible_truncation: sig_slot is a u32 capability handle the parent widened with
 // `u64::from`, so the cast is exact.
 #[allow(clippy::cast_possible_truncation)]
-fn sender_entry(sig_slot: u64) -> !
+extern "C" fn sender_entry(sig_slot: u64) -> !
 {
     notification_send(sig_slot as u32, 0xBEEF).ok();
     thread_exit()
@@ -331,7 +331,7 @@ fn sender_entry(sig_slot: u64) -> !
 // cast_possible_truncation: sig_slot is a u32 capability handle the parent widened with
 // `u64::from`, so the cast is exact.
 #[allow(clippy::cast_possible_truncation)]
-fn high_bit_sender_entry(sig_slot: u64) -> !
+extern "C" fn high_bit_sender_entry(sig_slot: u64) -> !
 {
     notification_send(sig_slot as u32, 1u64 << 63).ok();
     thread_exit()

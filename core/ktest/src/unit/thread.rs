@@ -514,7 +514,7 @@ pub fn sched_split_rollback_on_full_cspace(ctx: &TestContext) -> TestResult
 
 /// Child for [`sched_split_rollback_on_full_cspace`]; reports `0x1` on
 /// success, else a bit naming the first failed step.
-fn split_rollback_child_entry(arg: u64) -> !
+extern "C" fn split_rollback_child_entry(arg: u64) -> !
 {
     const OUT_OF_MEMORY: i64 = SyscallError::OutOfMemory as i64;
     let sched_slot = (arg & 0xFFFF_FFFF) as u32;
@@ -1291,7 +1291,7 @@ pub fn default_affinity_runs(ctx: &TestContext) -> TestResult
 /// bound to CPU 1 and confirms it ran by notifying back.
 // cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn affinity_sender_entry(sig_slot: u64) -> !
+extern "C" fn affinity_sender_entry(sig_slot: u64) -> !
 {
     notification_send(sig_slot as u32, 0xC1A1).ok();
     thread_exit()
@@ -1300,7 +1300,7 @@ fn affinity_sender_entry(sig_slot: u64) -> !
 /// Simple sender: sends 0xBEEF and exits.
 // cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn sender_entry(sig_slot: u64) -> !
+extern "C" fn sender_entry(sig_slot: u64) -> !
 {
     notification_send(sig_slot as u32, 0xBEEF).ok();
     thread_exit()
@@ -1314,7 +1314,7 @@ fn sender_entry(sig_slot: u64) -> !
 /// instead of returning from this `notification_wait`.
 // cast_possible_truncation: cap slot indices are guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn blocker_entry(arg: u64) -> !
+extern "C" fn blocker_entry(arg: u64) -> !
 {
     // arg packs (ready_slot << 32) | block_slot. Two distinct caps so the
     // child cannot self-deliver its own readiness send before the parent has
@@ -1348,7 +1348,7 @@ fn blocker_entry(arg: u64) -> !
 /// land on CPU 1" instead of as a timeout.
 // cast_possible_truncation: cap slot indices and CPU ids fit comfortably in u32.
 #[allow(clippy::cast_possible_truncation)]
-fn report_cpu_entry(sig_slot: u64) -> !
+extern "C" fn report_cpu_entry(sig_slot: u64) -> !
 {
     let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
     // `wrapping_shl` masks the shift count modulo the type width (64),
@@ -1367,7 +1367,7 @@ fn report_cpu_entry(sig_slot: u64) -> !
 /// spinner sends `0xC0FE` on its notification cap and exits.
 // cast_possible_truncation: spinner indices and cap slot indices fit in u32.
 #[allow(clippy::cast_possible_truncation)]
-fn balance_spinner_entry(arg: u64) -> !
+extern "C" fn balance_spinner_entry(arg: u64) -> !
 {
     let idx = (arg >> 32) as usize;
     let sig_slot = (arg & 0xFFFF_FFFF) as u32;
@@ -1397,7 +1397,7 @@ fn balance_spinner_entry(arg: u64) -> !
 /// the parent first so it can complete `notification_wait`.
 // cast_possible_truncation: cap slot indices and CPU ids fit comfortably in u32.
 #[allow(clippy::cast_possible_truncation)]
-fn migrate_spinner_entry(sig_slot: u64) -> !
+extern "C" fn migrate_spinner_entry(sig_slot: u64) -> !
 {
     loop
     {
@@ -1461,7 +1461,7 @@ static mut BIND_NOTIF_STACK: crate::ChildStack = crate::ChildStack::ZERO;
 
 /// Child that exits immediately so its bound `EventQueue` receives the
 /// thread-death payload.
-fn bind_notif_exit_entry(_arg: u64) -> !
+extern "C" fn bind_notif_exit_entry(_arg: u64) -> !
 {
     thread_exit()
 }

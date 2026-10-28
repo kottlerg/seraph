@@ -135,11 +135,13 @@ pub fn new_child_at(
 
 /// Configure `child` to enter `entry(arg)` on `stack_top` and start it.
 ///
-/// `entry` is a Rust-ABI `fn(u64) -> !`; its address is the entry point
-/// passed to `thread_configure`.
+/// `entry` is an `extern "C" fn(u64) -> !`, whose address is the entry point
+/// passed to `thread_configure`: the kernel enters a thread with its argument
+/// in the platform C convention's first argument register, so the entry must
+/// use that convention, not the unspecified Rust ABI.
 pub fn configure_and_start(
     child: &SpawnedChild,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
     stack_top: u64,
     arg: u64,
 ) -> Result<(), &'static str>
@@ -154,7 +156,7 @@ pub fn configure_and_start(
 /// `thread_set_affinity` before starting it.
 pub fn configure_and_start_pinned(
     child: &SpawnedChild,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
     stack_top: u64,
     arg: u64,
     cpu: u32,

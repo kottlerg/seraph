@@ -240,7 +240,7 @@ fn spawn_phase(
     done: u32,
     source: u32,
     source_rights: u64,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
 ) -> Result<spawn::SpawnedChild, &'static str>
 {
     let child = spawn::new_child(ctx)
@@ -344,7 +344,7 @@ fn unpack(arg: u64) -> (u32, u32)
 
 /// Phase 1 child: cancelled wait must return `Interrupted`; then a second,
 /// genuine wait must deliver `SANITY_BITS` verbatim.
-fn notif_entry(arg: u64) -> !
+extern "C" fn notif_entry(arg: u64) -> !
 {
     let (sig, done) = unpack(arg);
     notification_send(done, BIT_N_READY).ok();
@@ -368,7 +368,7 @@ fn notif_entry(arg: u64) -> !
 
 /// Phase 2 child: the cancelled timed wait must return `Interrupted` — not a
 /// 0-bits timeout, not a success.
-fn notif_timeout_entry(arg: u64) -> !
+extern "C" fn notif_timeout_entry(arg: u64) -> !
 {
     let (sig, done) = unpack(arg);
     notification_send(done, BIT_T_READY).ok();
@@ -382,7 +382,7 @@ fn notif_timeout_entry(arg: u64) -> !
 }
 
 /// Phase 3 child: cancelled blocking `event_recv` must return `Interrupted`.
-fn event_entry(arg: u64) -> !
+extern "C" fn event_entry(arg: u64) -> !
 {
     let (eq, done) = unpack(arg);
     notification_send(done, BIT_E_READY).ok();
@@ -397,7 +397,7 @@ fn event_entry(arg: u64) -> !
 
 /// Phase 4 child: cancelled `ipc_recv` must return `Interrupted` (pre-#363 it
 /// returned success and published a stale `ipc_msg` into the buffer).
-fn recv_entry(arg: u64) -> !
+extern "C" fn recv_entry(arg: u64) -> !
 {
     let (ep, done) = unpack(arg);
     // SAFETY: sole live user of CHILD_IPC_BUF (phases run sequentially).
@@ -418,7 +418,7 @@ fn recv_entry(arg: u64) -> !
 }
 
 /// Phase 5 child: cancelled `wait_set_wait` must return `Interrupted`.
-fn waitset_entry(arg: u64) -> !
+extern "C" fn waitset_entry(arg: u64) -> !
 {
     let (ws, done) = unpack(arg);
     notification_send(done, BIT_W_READY).ok();
@@ -432,7 +432,7 @@ fn waitset_entry(arg: u64) -> !
 }
 
 /// Phase 6 child: cancelled `thread_sleep` must return `Interrupted`.
-fn sleep_entry(arg: u64) -> !
+extern "C" fn sleep_entry(arg: u64) -> !
 {
     let (_, done) = unpack(arg);
     notification_send(done, BIT_S_READY).ok();

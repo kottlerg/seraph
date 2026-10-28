@@ -35,7 +35,7 @@ static CALLER_ARGS: spawn::ArgBlock<CallerArgs, 1> = spawn::ArgBlock::new(Caller
     n: 0,
 });
 
-fn ipc_caller_entry(arg: u64) -> !
+extern "C" fn ipc_caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the bench published for this child.
     let CallerArgs {

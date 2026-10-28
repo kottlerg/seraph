@@ -371,7 +371,7 @@ fn sources_of(parts: &Parts) -> Result<[u32; SOURCES], &'static str>
 fn create_thread(
     ctx: &TestContext,
     slot: &mut Option<u32>,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
     stack: usize,
     arg: u64,
     cpu: u32,
@@ -580,7 +580,7 @@ fn deliver(kind: Kind, source: u32, value: u64) -> Result<(), i64>
 
 /// Waiter: until told to quit, wait on A then on B, counting each entry
 /// and classifying each result.
-fn waiter_entry(arg: u64) -> !
+extern "C" fn waiter_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `setup` published for this phase's children.
     let ChildArgs { kind, sources } = unsafe { spawn::child_args(arg) };
@@ -615,7 +615,7 @@ fn waiter_entry(arg: u64) -> !
 
 /// Sender: until told to quit, serve each wait the waiter enters while
 /// [`SENDING`] is set; while it is clear, sleep, leaving the CPU to others.
-fn sender_entry(arg: u64) -> !
+extern "C" fn sender_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `setup` published for this phase's children.
     let ChildArgs { kind, sources } = unsafe { spawn::child_args(arg) };

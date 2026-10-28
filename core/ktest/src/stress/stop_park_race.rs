@@ -255,7 +255,7 @@ fn setup(
             .map_err(|_| "stress::stop_park_race: cap_copy peer source failed")?,
         None => 0,
     };
-    let entry: fn(u64) -> ! = match kind
+    let entry: extern "C" fn(u64) -> ! = match kind
     {
         Kind::Notification => notif_peer,
         Kind::Call => call_peer,
@@ -414,7 +414,7 @@ fn is_interrupted(e: i64) -> bool
 
 // cast_possible_truncation: the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn notif_peer(arg: u64) -> !
+extern "C" fn notif_peer(arg: u64) -> !
 {
     let sig = arg as u32;
     peer_loop(|| match notification_wait(sig)
@@ -427,7 +427,7 @@ fn notif_peer(arg: u64) -> !
 
 // cast_possible_truncation: the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn call_peer(arg: u64) -> !
+extern "C" fn call_peer(arg: u64) -> !
 {
     let ep = arg as u32;
     // SAFETY: sole live user of PEER_IPC_BUF (phases run sequentially).
@@ -447,7 +447,7 @@ fn call_peer(arg: u64) -> !
     })
 }
 
-fn sleep_peer(_arg: u64) -> !
+extern "C" fn sleep_peer(_arg: u64) -> !
 {
     peer_loop(|| match thread_sleep(SLEEP_MS)
     {
@@ -463,7 +463,7 @@ fn sleep_peer(_arg: u64) -> !
 /// failed receive (docs/ipc-design.md § Receive-Failure Policy).
 // cast_possible_truncation: the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn server_entry(arg: u64) -> !
+extern "C" fn server_entry(arg: u64) -> !
 {
     let ep = arg as u32;
     // SAFETY: sole live user of SERVER_IPC_BUF (phases run sequentially).

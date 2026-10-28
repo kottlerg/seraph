@@ -183,7 +183,7 @@ fn elapsed_us() -> u64
 // cast_possible_truncation: the argument is the child's p2c cap slot, which
 // `run` widened from a u32.
 #[allow(clippy::cast_possible_truncation)]
-fn worker_entry(p2c_slot: u64) -> !
+extern "C" fn worker_entry(p2c_slot: u64) -> !
 {
     // SAFETY: CHILD_C2P_SLOT written by parent before thread_start.
     let c2p = unsafe { CHILD_C2P_SLOT };

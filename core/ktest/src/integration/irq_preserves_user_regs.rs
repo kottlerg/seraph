@@ -148,7 +148,7 @@ fn spin_check(pat_ptr: *const u64, iters: u64) -> u64
     mism
 }
 
-fn spinner_entry(id: u64) -> !
+extern "C" fn spinner_entry(id: u64) -> !
 {
     let idx = usize::from(id & 1 != 0);
     let other = idx ^ 1;

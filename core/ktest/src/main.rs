@@ -302,7 +302,7 @@ fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
     }
 }
 
-fn run(info_ptr: u64) -> !
+extern "C" fn run(info_ptr: u64) -> !
 {
     // Read InitInfo from the kernel-mapped page.
     // SAFETY: info_ptr is a valid page-aligned virtual address mapped by the
@@ -638,7 +638,8 @@ pub fn log_version(prefix: &str, ver: u64)
 }
 
 /// `SYS_SYSTEM_INFO(ElapsedUs)`, microseconds since kernel timer init; 0 if
-/// the query fails, so a timestamp or a wait degrades rather than aborting.
+/// the query fails. A failing query prints a zero timestamp, and leaves
+/// `wait_us` polling until the clock answers again.
 fn elapsed_us() -> u64
 {
     syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0)

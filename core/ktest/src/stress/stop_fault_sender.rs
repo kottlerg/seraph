@@ -424,7 +424,7 @@ fn spawn_syncer(ctx: &TestContext, parts: &mut Parts, ep: u32) -> TestResult
 fn create_thread(
     ctx: &TestContext,
     slot: &mut Option<u32>,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
     stack: usize,
     arg: u64,
     cpu: u32,
@@ -848,7 +848,7 @@ fn release(ctx: &TestContext, parts: &Parts) -> TestResult
 /// page, unmap the page the handler mapped for it, and count the completion.
 // cast_possible_truncation: the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn faulter_entry(arg: u64) -> !
+extern "C" fn faulter_entry(arg: u64) -> !
 {
     let aspace = arg as u32;
     let page = RESERVED_VA as *mut u64;
@@ -875,7 +875,7 @@ fn faulter_entry(arg: u64) -> !
 /// echoed; the quit call is echoed and ends the loop. Anything else is
 /// tallied and echoed. A `RecvGuard` bounds the retries of a failed receive
 /// (docs/ipc-design.md § Receive-Failure Policy).
-fn handler_entry(arg: u64) -> !
+extern "C" fn handler_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `setup` published for the handler.
     let args: HandlerArgs = unsafe { spawn::child_args(arg) };
@@ -994,7 +994,7 @@ fn service_fault(args: &HandlerArgs, buf: *mut u64)
 /// and the notification in its high half.
 // cast_possible_truncation: each half of the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn syncer_entry(arg: u64) -> !
+extern "C" fn syncer_entry(arg: u64) -> !
 {
     let ep = arg as u32;
     let notif = (arg >> 32) as u32;

@@ -412,7 +412,7 @@ fn spawn_target(ctx: &TestContext, children: &mut Children) -> TestResult
 fn create_thread(
     ctx: &TestContext,
     slot: &mut Option<u32>,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
     stack: usize,
     cpu: u32,
 ) -> Result<u32, &'static str>
@@ -676,7 +676,7 @@ fn release(children: &Children) -> TestResult
 /// Stopper: loop until told to quit: stop the target, spin a varying delay,
 /// start the target, count the loop; after a call that finds the handle
 /// vanished, re-read the target's current handle.
-fn stopper_entry(_arg: u64) -> !
+extern "C" fn stopper_entry(_arg: u64) -> !
 {
     let mut target = TARGET_HANDLE.load(Ordering::Acquire);
     let mut loops = 0u32;
@@ -782,7 +782,7 @@ fn start_target(target: u32) -> bool
 /// Target: spin, counting progress, until told to quit and the stopper has
 /// quiesced (so no stop lands on this thread inside its exit). A delete
 /// round's target is torn down by its deletion and never reaches this exit.
-fn target_entry(_arg: u64) -> !
+extern "C" fn target_entry(_arg: u64) -> !
 {
     loop
     {

@@ -26,7 +26,7 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 /// in the low 32 bits of `arg`, then `notification_send` on `done_slot` (high 32 bits) and exit.
 // cast_possible_truncation: slot indices are < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn caller_entry(arg: u64) -> !
+extern "C" fn caller_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;

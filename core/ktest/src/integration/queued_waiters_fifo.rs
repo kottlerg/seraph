@@ -434,7 +434,7 @@ fn elapsed_us() -> Result<u64, &'static str>
 }
 
 /// Wait once on the object and report whether the result is the expected one.
-fn child_entry(arg: u64) -> !
+extern "C" fn child_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `Phase::start` published for this child.
     let ChildArgs {

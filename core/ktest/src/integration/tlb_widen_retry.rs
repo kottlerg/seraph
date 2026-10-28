@@ -231,7 +231,7 @@ fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, memory
 /// Child entry: cache a read-only TLB entry, wait for the parent's widen, then
 /// store through it. The store completes via the kernel's spurious-fault retry
 /// when a hardware TLB faults on the stale read-only entry.
-fn widen_child(_arg: u64) -> !
+extern "C" fn widen_child(_arg: u64) -> !
 {
     let p = WIDEN_VA as *mut u64;
 

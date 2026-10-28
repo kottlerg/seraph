@@ -15,7 +15,7 @@ use crate::{ChildStack, spawn};
 
 static mut BENCH_LIFECYCLE_STACK: ChildStack = ChildStack::ZERO;
 
-fn lifecycle_entry(done_slot: u64) -> !
+extern "C" fn lifecycle_entry(done_slot: u64) -> !
 {
     // cast_possible_truncation: done_slot is a kernel cap slot index < 2^32.
     #[allow(clippy::cast_possible_truncation)]
@@ -99,7 +99,7 @@ static BENCH_CTXSWITCH_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic
 
 /// Child entry: ping-pong via `thread_yield` for `BENCH_CTXSWITCH_ITERS`
 /// iterations, then send on the `done_slot` notification and exit.
-fn ctxswitch_child_entry(done_slot: u64) -> !
+extern "C" fn ctxswitch_child_entry(done_slot: u64) -> !
 {
     let n = BENCH_CTXSWITCH_ITERS.load(core::sync::atomic::Ordering::Acquire);
     for _ in 0..n

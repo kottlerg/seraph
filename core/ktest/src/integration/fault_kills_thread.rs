@@ -64,7 +64,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// Child entry: store to an unmapped address, which faults and is killed by the
 /// kernel before the store returns. The trailing loop only satisfies the `-> !`
 /// signature; it is never reached.
-fn fault_child(_arg: u64) -> !
+extern "C" fn fault_child(_arg: u64) -> !
 {
     let p = WILD_VA as *mut u64;
     // SAFETY: deliberately faulting — WILD_VA is unmapped, so this store raises

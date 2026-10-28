@@ -63,7 +63,7 @@ fn start_and_check(child: &crate::spawn::SpawnedChild) -> TestResult
 
 /// Child entry: execute an illegal instruction with no fault handler bound,
 /// which the kernel resolves by terminating this thread.
-fn fault_child(_arg: u64) -> !
+extern "C" fn fault_child(_arg: u64) -> !
 {
     crate::arch::illegal_instruction()
 }

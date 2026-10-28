@@ -424,7 +424,7 @@ fn start_helpers(ctx: &TestContext, helpers: &mut Helpers, arg: u64) -> TestResu
     for (slot, entry, stack, cpu, failed) in [
         (
             &mut helpers.sender,
-            sender_entry as fn(u64) -> !,
+            sender_entry as extern "C" fn(u64) -> !,
             SENDER_STACK,
             SENDER_CPU,
             "stress::stop_claimed_delete: start sender failed",
@@ -655,7 +655,7 @@ fn create_source(ctx: &TestContext, kind: Kind) -> Result<u32, &'static str>
 fn create_thread(
     ctx: &TestContext,
     slot: &mut Option<u32>,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
     stack: usize,
     arg: u64,
     cpu: u32,
@@ -735,7 +735,7 @@ fn deliver(kind: Kind, source: u32) -> Result<(), i64>
 /// Waiter: wait on the round's source until deleted, counting each entry
 /// and classifying each result. It is stopped and then deleted, never
 /// restarted, so it never leaves this loop on its own.
-fn waiter_entry(arg: u64) -> !
+extern "C" fn waiter_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `phase` published for this phase's children.
     let kind = unsafe { spawn::child_args::<Kind>(arg) };
@@ -767,7 +767,7 @@ fn waiter_entry(arg: u64) -> !
 
 /// Sender: until told to quit, serve each wait the round's waiter enters
 /// while [`LIVE`] is set; while it is clear, spin on its own CPU.
-fn sender_entry(arg: u64) -> !
+extern "C" fn sender_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `phase` published for this phase's children.
     let kind = unsafe { spawn::child_args::<Kind>(arg) };
@@ -822,7 +822,7 @@ fn serve(kind: Kind, entered: u32)
 /// `InvalidState`, a waiter the controller's stop reached first, accepted;
 /// anything else recorded as bad) and acknowledge the round. Between rounds
 /// it spins on its own CPU.
-fn stopper_entry(_arg: u64) -> !
+extern "C" fn stopper_entry(_arg: u64) -> !
 {
     let mut done = 0u32;
     while QUIT.load(Ordering::Acquire) == 0

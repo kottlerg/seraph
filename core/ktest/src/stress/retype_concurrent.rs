@@ -137,7 +137,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-fn worker_entry(arg: u64) -> !
+extern "C" fn worker_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this worker.
     let WorkerArgs {

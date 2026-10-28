@@ -180,7 +180,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// bit into the `done` notification when the reply arrives.
 ///
 /// `arg`: address of the caller's [`CallerArgs`].
-fn caller_entry(arg: u64) -> !
+extern "C" fn caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this caller.
     let CallerArgs {

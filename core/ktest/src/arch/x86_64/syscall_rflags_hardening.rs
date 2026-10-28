@@ -109,7 +109,7 @@ fn getrandom_with_df_set(dst: &mut [u8]) -> i64
 /// kernel reports it `Exited`. The child's caps are deleted on every path.
 fn run_child(
     ctx: &TestContext,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
     stack: *const ChildStack,
 ) -> Result<u64, &'static str>
 {
@@ -125,7 +125,7 @@ fn run_child(
 
 /// Phase 2 child: set TF, then yield. The single-step trap fires in ring 3 after
 /// `sysretq` restores TF, and with no handler bound the kernel kills the thread.
-fn tf_child(_arg: u64) -> !
+extern "C" fn tf_child(_arg: u64) -> !
 {
     yield_with_tf_set();
     loop
@@ -156,7 +156,7 @@ fn yield_with_tf_set()
 
 /// Phase 3 child: reload GS from the flat user data selector, yield, then exit
 /// normally.
-fn gs_child(_arg: u64) -> !
+extern "C" fn gs_child(_arg: u64) -> !
 {
     yield_with_user_gs_reloaded();
     syscall::thread_exit()

@@ -504,7 +504,7 @@ pub fn recv_unbadged_returns_zero(ctx: &TestContext) -> TestResult
 /// Child: calls the endpoint with label 0xCAFE, waits for reply, then signals.
 ///
 /// `arg`: bits[31:0] = `ep_slot`, bits[63:32] = `notify_slot` (in child's `CSpace`).
-fn caller_entry(arg: u64) -> !
+extern "C" fn caller_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let notify_slot = (arg >> 32) as u32;
@@ -546,7 +546,7 @@ fn caller_entry(arg: u64) -> !
 /// yet), then signals the result after the server replies.
 ///
 /// `arg`: bits[31:0] = `ep_slot`, bits[63:32] = `done_slot` (in child's `CSpace`).
-fn queued_caller_entry(arg: u64) -> !
+extern "C" fn queued_caller_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
@@ -581,7 +581,7 @@ fn queued_caller_entry(arg: u64) -> !
 /// message, then calls.
 ///
 /// `arg`: bits[31:0] = `ep_slot`, bits[63:32] = `done_slot`.
-fn data_caller_entry(arg: u64) -> !
+extern "C" fn data_caller_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
@@ -612,7 +612,7 @@ fn data_caller_entry(arg: u64) -> !
 /// Child for `call_with_cap_transfer`: creates a notification and transfers it via IPC.
 ///
 /// `arg`: address of the child's [`XferArgs`].
-fn cap_xfer_caller_entry(arg: u64) -> !
+extern "C" fn cap_xfer_caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the test published for this child.
     let XferArgs {
@@ -651,7 +651,7 @@ fn cap_xfer_caller_entry(arg: u64) -> !
 /// Child for `recv_delivers_badge`: calls endpoint with label 0xD00D.
 ///
 /// `arg`: bits[31:0] = `ep_slot`, bits[63:32] = `done_slot`.
-fn badge_caller_entry(arg: u64) -> !
+extern "C" fn badge_caller_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
@@ -759,7 +759,7 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
 
 /// Child for `recv_snapshot_survives_buffer_clobber`: calls with two known
 /// data words and exits.
-fn snapshot_caller_entry(arg: u64) -> !
+extern "C" fn snapshot_caller_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
@@ -909,7 +909,7 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
 /// buffer, fills its own `CSpace`, signals readiness, then issues an
 /// `ipc_call`. Reports `0xFA11` if the kernel-synthesised
 /// `IPC_REPLY_TRANSFER_FAILED` label arrives, `0xBAD` otherwise.
-fn reply_oom_caller_entry(arg: u64) -> !
+extern "C" fn reply_oom_caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the test published for this child.
     let ReplyOomArgs {
@@ -1114,7 +1114,7 @@ pub fn reply_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
 /// `reply_stale_cap_handle_rejected`: registers its IPC buffer and issues
 /// an `ipc_call`; reports `0xFA11` if the kernel-synthesised
 /// `IPC_REPLY_TRANSFER_FAILED` label arrives, `0xBAD` otherwise.
-fn dup_reply_caller_entry(arg: u64) -> !
+extern "C" fn dup_reply_caller_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
@@ -1299,7 +1299,7 @@ pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
 
 /// Child for `call_four_caps_transfer`: creates four notifications and
 /// sends all of them in one cap-bearing call, then signals completion.
-fn four_caps_caller_entry(arg: u64) -> !
+extern "C" fn four_caps_caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the test published for this child.
     let XferArgs {
@@ -1412,7 +1412,7 @@ pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
 /// Victim for `recv_oom_returns_cleanly`: fills its `CSpace` then issues
 /// `ipc_recv`. Reports `0xDEAD` if the syscall returns `OutOfMemory`,
 /// `0xBAD` otherwise.
-fn recv_oom_victim_entry(arg: u64) -> !
+extern "C" fn recv_oom_victim_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the test published for this victim.
     let XferArgs {

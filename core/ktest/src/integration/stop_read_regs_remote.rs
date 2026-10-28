@@ -285,7 +285,7 @@ fn release(child: &SpawnedChild) -> TestResult
 
 /// Child entry: spin forever in user mode, counting progress, with no
 /// syscall, so a stop always finds the child running on its CPU.
-fn spin_entry(_arg: u64) -> !
+extern "C" fn spin_entry(_arg: u64) -> !
 {
     loop
     {

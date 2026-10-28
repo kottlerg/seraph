@@ -42,7 +42,7 @@ use syscall::{
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
-use crate::tally::BadTally;
+use crate::tally::{BadTally, await_report};
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 /// This cell's log name.
@@ -66,12 +66,6 @@ const VERDICT: u64 = BIT_INTERRUPTED | BIT_GONE | BIT_BAD;
 
 /// Waiter wait-loop timeout: short, so deadlines expire throughout a cycle.
 const WAIT_MS: u64 = 1;
-
-/// Each controller wait for a waiter report waits in slices of this many
-/// milliseconds, at most [`REPORT_SLICES`] of them (5 s in all), so a report
-/// that never arrives fails the cell instead of hanging the run.
-const REPORT_SLICE_MS: u64 = 5;
-const REPORT_SLICES: u32 = 1000;
 
 /// Wait results outside the accepted set, with one of their result words.
 static BAD_WAITS: BadTally = BadTally::new();
@@ -137,7 +131,7 @@ fn cycles(ctx: &TestContext, cpus: u32) -> Result<u64, &'static str>
 /// interrupted.
 fn one_cycle(ctx: &TestContext, done: u32, cycle: u32, cpus: u32) -> Result<bool, &'static str>
 {
-    let (source, entry): (_, fn(u64) -> !) = if cycle & 1 == 1
+    let (source, entry): (_, extern "C" fn(u64) -> !) = if cycle & 1 == 1
     {
         (event_queue_create(ctx.memory_base, 4), queue_waiter)
     }
@@ -185,7 +179,7 @@ fn one_cycle(ctx: &TestContext, done: u32, cycle: u32, cpus: u32) -> Result<bool
 /// verdict bits.
 fn race(
     child: &spawn::SpawnedChild,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
     source: u32,
     done: u32,
     cycle: u32,
@@ -238,22 +232,6 @@ fn race(
     Ok(acc)
 }
 
-/// Accumulate `done` bits into `acc` until one of `mask` is present,
-/// failing with `err` once [`REPORT_SLICES`] slices pass without it.
-fn await_report(done: u32, acc: &mut u64, mask: u64, err: &'static str) -> TestResult
-{
-    for _ in 0..REPORT_SLICES
-    {
-        if *acc & mask != 0
-        {
-            return Ok(());
-        }
-        *acc |= notification_wait_timeout(done, REPORT_SLICE_MS)
-            .map_err(|_| "stress::timed_wait_source_delete: wait on done failed")?;
-    }
-    if *acc & mask != 0 { Ok(()) } else { Err(err) }
-}
-
 // cast_possible_truncation: packed fields are 32-bit cap handles.
 #[allow(clippy::cast_possible_truncation)]
 fn unpack(arg: u64) -> (u32, u32)
@@ -300,7 +278,7 @@ fn wait_loop(
     thread_exit()
 }
 
-fn notif_waiter(arg: u64) -> !
+extern "C" fn notif_waiter(arg: u64) -> !
 {
     let (sig, done) = unpack(arg);
     wait_loop(
@@ -310,7 +288,7 @@ fn notif_waiter(arg: u64) -> !
     )
 }
 
-fn queue_waiter(arg: u64) -> !
+extern "C" fn queue_waiter(arg: u64) -> !
 {
     let (eq, done) = unpack(arg);
     wait_loop(

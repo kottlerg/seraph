@@ -153,7 +153,7 @@ static VA_PER_CHILD: [core::sync::atomic::AtomicU64; NUM_CHILDREN] = {
     [const { core::sync::atomic::AtomicU64::new(0) }; NUM_CHILDREN]
 };
 
-fn mapper_entry(arg: u64) -> !
+extern "C" fn mapper_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this child.
     let MapperArgs {

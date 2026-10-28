@@ -339,7 +339,7 @@ fn start(
     children: &mut [Option<spawn::SpawnedChild>; CHILDREN],
 ) -> TestResult
 {
-    let entries: [fn(u64) -> !; CHILDREN] = [waiter_entry, sender_entry, starter_entry];
+    let entries: [extern "C" fn(u64) -> !; CHILDREN] = [waiter_entry, sender_entry, starter_entry];
     for (index, entry) in entries.into_iter().enumerate()
     {
         children[index] =
@@ -554,7 +554,7 @@ fn await_exit(sig: u32) -> TestResult
 /// Waiter: wait on the notification until told to quit, tallying results.
 // cast_possible_truncation: the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn waiter_entry(arg: u64) -> !
+extern "C" fn waiter_entry(arg: u64) -> !
 {
     let sig = arg as u32;
     while QUIT.load(Ordering::Acquire) == 0
@@ -586,7 +586,7 @@ fn waiter_entry(arg: u64) -> !
 /// Sender: deliver to the notification until told to quit.
 // cast_possible_truncation: the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn sender_entry(arg: u64) -> !
+extern "C" fn sender_entry(arg: u64) -> !
 {
     let sig = arg as u32;
     while QUIT.load(Ordering::Acquire) == 0
@@ -611,7 +611,7 @@ fn sender_entry(arg: u64) -> !
 /// the others.
 // cast_possible_truncation: the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn starter_entry(arg: u64) -> !
+extern "C" fn starter_entry(arg: u64) -> !
 {
     let waiter_th = arg as u32;
     while QUIT.load(Ordering::Acquire) == 0

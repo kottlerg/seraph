@@ -11,7 +11,8 @@
 //! in a [`BadTally`] the cell's report checks once the rounds are over; the
 //! tally is the channel through which a child's failure reaches the
 //! verdict. [`log_error`] prints a syscall error word the way the tallies
-//! record it, [`log_cell_u64`] prints a value under a cell's name, and
+//! record it, [`log_cell_u64`] prints a value under a cell's name,
+//! [`await_report`] is a cell's bounded wait for a child's report bits, and
 //! [`recv_diag`] is the diagnostic hook the cells' blocking receive loops
 //! hand their `RecvGuard`
 //! ([docs/ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure
@@ -134,4 +135,33 @@ pub fn recv_diag(stage: RecvFailureStage, error: i64)
         RecvFailureStage::Fatal => "ktest: blocking receive wedged, exiting; error=",
     };
     log_error(label, error);
+}
+
+/// Each [`await_report`] waits in slices of this many milliseconds, at most
+/// [`REPORT_SLICES`] of them (5 s in all).
+const REPORT_SLICE_MS: u64 = 5;
+const REPORT_SLICES: u32 = 1000;
+
+/// Accumulate the bits children send on `done` into `acc` until one of
+/// `mask` is present, failing with `err` once [`REPORT_SLICES`] slices pass
+/// without it, so a child that never reports fails the cell instead of
+/// hanging the run. A child has no channel but `done` to report on, so a
+/// report send it could not make surfaces here, as the timeout.
+///
+/// # Errors
+///
+/// `err` when the bound runs out; a fixed message when the wait on `done`
+/// itself fails.
+pub fn await_report(done: u32, acc: &mut u64, mask: u64, err: &'static str) -> TestResult
+{
+    for _ in 0..REPORT_SLICES
+    {
+        if *acc & mask != 0
+        {
+            return Ok(());
+        }
+        *acc |= syscall::notification_wait_timeout(done, REPORT_SLICE_MS)
+            .map_err(|_| "tally::await_report: wait on the report notification failed")?;
+    }
+    if *acc & mask != 0 { Ok(()) } else { Err(err) }
 }

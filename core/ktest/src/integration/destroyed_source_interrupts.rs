@@ -259,7 +259,7 @@ fn start_child(
         .map_err(|_| "integration::destroyed_source_interrupts: cap_copy source failed")?;
     let c_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "integration::destroyed_source_interrupts: cap_copy done failed")?;
-    let entry: fn(u64) -> ! = match source
+    let entry: extern "C" fn(u64) -> ! = match source
     {
         Source::Notification => notif_entry,
         Source::NotificationTimed => notif_timed_entry,
@@ -323,22 +323,22 @@ fn park_and_report(arg: u64, wait: fn(u32) -> Result<u64, i64>) -> !
     thread_exit()
 }
 
-fn notif_entry(arg: u64) -> !
+extern "C" fn notif_entry(arg: u64) -> !
 {
     park_and_report(arg, notification_wait)
 }
 
-fn notif_timed_entry(arg: u64) -> !
+extern "C" fn notif_timed_entry(arg: u64) -> !
 {
     park_and_report(arg, |sig| notification_wait_timeout(sig, PARK_FOREVER_MS))
 }
 
-fn event_entry(arg: u64) -> !
+extern "C" fn event_entry(arg: u64) -> !
 {
     park_and_report(arg, event_recv)
 }
 
-fn waitset_entry(arg: u64) -> !
+extern "C" fn waitset_entry(arg: u64) -> !
 {
     park_and_report(arg, wait_set_wait)
 }

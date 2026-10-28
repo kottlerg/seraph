@@ -443,7 +443,7 @@ fn elapsed_us() -> Result<u64, &'static str>
 /// source; publishes how each ended.
 // cast_possible_truncation: packed fields are 32-bit cap handles.
 #[allow(clippy::cast_possible_truncation)]
-fn waiter_entry(arg: u64) -> !
+extern "C" fn waiter_entry(arg: u64) -> !
 {
     let sig = (arg & 0xFFFF_FFFF) as u32;
     let eq = (arg >> 32) as u32;

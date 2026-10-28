@@ -102,7 +102,7 @@ mirroring the kernel's own source layout.
 | `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` (blocking, `try_recv`, timeout) |
 | `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT`, including a second concurrent `wait_set_wait` refused with `InvalidState`, as [docs/ipc-design.md § Waiting on Multiple Sources](../../docs/ipc-design.md#waiting-on-multiple-sources) defines |
 | `ipc.rs` | `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_BUFFER_SET` |
-| `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION`; `SYS_SCHED_SPLIT` |
+| `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION`; `SYS_SCHED_SPLIT`; the `SYS_CAP_CREATE_THREAD` priority arguments |
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
 | `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT` (`SYS_SBI_CALL` is under `src/arch/<arch>/`) |
 | `sysinfo.rs` | `SYS_SYSTEM_INFO` |
@@ -292,8 +292,10 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   the count and that result word under the cell's name) once the rounds are
   over. `tally::log_error(label, error)` logs a syscall error word,
   `tally::log_cell_u64(cell, suffix, value)` logs a value under a cell's
-  name (`suffix` starts with the separating space), and
-  `tally::recv_diag` is the diagnostic hook a cell's blocking receive loop
+  name (`suffix` starts with the separating space),
+  `tally::await_report(done, acc, mask, err)` waits, bounded, for a child's
+  report bits on `done` (a child that never reports fails the cell with
+  `err`), and `tally::recv_diag` is the diagnostic hook a cell's blocking receive loop
   hands its `ipc::recv_guard::RecvGuard`
   ([docs/ipc-design.md](../../docs/ipc-design.md) § Receive-Failure Policy).
 

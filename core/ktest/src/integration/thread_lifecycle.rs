@@ -139,7 +139,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 // cast_possible_truncation: cap slot indices are guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn blocker_entry(arg: u64) -> !
+extern "C" fn blocker_entry(arg: u64) -> !
 {
     let ready_slot = (arg >> 32) as u32;
     let block_slot = (arg & 0xFFFF_FFFF) as u32;

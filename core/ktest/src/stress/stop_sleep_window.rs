@@ -40,11 +40,12 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
-    cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait_timeout,
-    system_info, thread_exit, thread_set_affinity, thread_sleep, thread_start, thread_stop,
+    cap_copy, cap_create_notification, cap_delete, notification_send, system_info, thread_exit,
+    thread_set_affinity, thread_sleep, thread_start, thread_stop,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
+use crate::tally::await_report;
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 /// Stop/start pairs to issue against the sleeper.
@@ -57,12 +58,6 @@ const RIGHTS_SIGNAL: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 const BIT_RUNNING: u64 = 1 << 0;
 /// Sleeper raises this when it leaves its loop.
 const BIT_EXITED: u64 = 1 << 1;
-
-/// Each controller wait for a sleeper report waits in slices of this many
-/// milliseconds, at most [`WAIT_SLICES`] of them (5 s in all), so a sleeper
-/// left blocked for good fails the cell instead of hanging the run.
-const WAIT_SLICE_MS: u64 = 5;
-const WAIT_SLICES: u32 = 1000;
 
 /// Set by the controller to end the sleeper's loop.
 static QUIT: AtomicU32 = AtomicU32::new(0);
@@ -174,26 +169,10 @@ fn start_and_storm(child: &spawn::SpawnedChild, done: u32) -> TestResult
     )
 }
 
-/// Accumulate `done` bits into `acc` until `bit` is present, failing with
-/// `err` once [`WAIT_SLICES`] slices pass without it.
-fn await_report(done: u32, acc: &mut u64, bit: u64, err: &'static str) -> TestResult
-{
-    for _ in 0..WAIT_SLICES
-    {
-        if *acc & bit != 0
-        {
-            return Ok(());
-        }
-        *acc |= notification_wait_timeout(done, WAIT_SLICE_MS)
-            .map_err(|_| "stress::stop_sleep_window: wait on done failed")?;
-    }
-    if *acc & bit != 0 { Ok(()) } else { Err(err) }
-}
-
 /// Sleeper: `thread_sleep(1)` until told to quit, tallying each result.
 // cast_possible_truncation: the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn sleeper_entry(arg: u64) -> !
+extern "C" fn sleeper_entry(arg: u64) -> !
 {
     let done = arg as u32;
     // A child has no other channel to report on; a failed send fails the
@@ -211,6 +190,7 @@ fn sleeper_entry(arg: u64) -> !
             Err(_) => BAD.fetch_add(1, Ordering::Relaxed),
         };
     }
+    // As for BIT_RUNNING: a failed send fails the controller's bounded wait.
     notification_send(done, BIT_EXITED).ok();
     thread_exit()
 }

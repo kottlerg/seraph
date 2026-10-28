@@ -133,7 +133,7 @@ struct Caller
     ready: u64,
     ok: u64,
     bad: u64,
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
 }
 
 const CALLER_A: Caller = Caller {
@@ -425,7 +425,7 @@ fn call(args: &CallerArgs) -> Option<Result<IpcMessage, i64>>
 
 /// Caller A: call, report whether the call returned `Interrupted`, then park
 /// on `park` for the controller's stop and restart.
-fn released_caller_entry(arg: u64) -> !
+extern "C" fn released_caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `start_caller` published for this caller.
     let args: CallerArgs = unsafe { spawn::child_args(arg) };
@@ -443,7 +443,7 @@ fn released_caller_entry(arg: u64) -> !
 
 /// Callers B and C: call, and report whether the reply carries
 /// [`REPLY_LABEL`].
-fn replied_caller_entry(arg: u64) -> !
+extern "C" fn replied_caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `start_caller` published for this caller.
     let args: CallerArgs = unsafe { spawn::child_args(arg) };
@@ -459,7 +459,7 @@ fn replied_caller_entry(arg: u64) -> !
 /// Faulter: store to the reserved VA. The store faults; the controller's
 /// second receive releases the fault binding, so the kernel kills this thread
 /// before the store returns. The loop only satisfies `-> !`.
-fn faulter_entry(_arg: u64) -> !
+extern "C" fn faulter_entry(_arg: u64) -> !
 {
     let p = RESERVED_VA as *mut u64;
     // SAFETY: deliberately faulting — the released fault episode kills this

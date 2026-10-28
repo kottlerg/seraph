@@ -36,6 +36,7 @@ mod bench;
 mod cmdline;
 mod frame_pool;
 mod framebuffer;
+mod init_info;
 mod integration;
 mod serial;
 mod spawn;
@@ -460,7 +461,7 @@ fn run(info_ptr: u64) -> !
 /// Source: `SYS_SYSTEM_INFO(ElapsedUs)` — microseconds since kernel timer init.
 fn write_timestamp()
 {
-    let us = syscall::system_info(6).unwrap_or(0);
+    let us = elapsed_us();
     let sec = us / 1_000_000;
     let us_frac = us % 1_000_000;
 
@@ -636,6 +637,13 @@ pub fn log_version(prefix: &str, ver: u64)
     }
 }
 
+/// `SYS_SYSTEM_INFO(ElapsedUs)`, microseconds since kernel timer init; 0 if
+/// the query fails, so a timestamp or a wait degrades rather than aborting.
+fn elapsed_us() -> u64
+{
+    syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0)
+}
+
 /// Wait for `secs` seconds using the kernel timer via `system_info(ElapsedUs)`.
 ///
 /// Sleeps between polls so the scheduler can run other threads.
@@ -650,10 +658,10 @@ fn wait_seconds(secs: u32)
 /// to them).
 fn wait_us(target_us: u64)
 {
-    let start = syscall::system_info(6).unwrap_or(0); // ElapsedUs = 6
+    let start = elapsed_us();
     loop
     {
-        let now = syscall::system_info(6).unwrap_or(0);
+        let now = elapsed_us();
         if now.wrapping_sub(start) >= target_us
         {
             break;

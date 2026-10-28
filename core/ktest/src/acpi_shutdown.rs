@@ -125,7 +125,7 @@ fn locate_fadt_fields(info: &InitInfo) -> Option<(u16, u64)>
 /// `AcpiReclaimable` region caps and parse `\_S5_` for `SLP_TYPa`.
 fn locate_and_parse_dsdt(info: &InitInfo, dsdt_phys: u64) -> Option<u16>
 {
-    for d in descriptors(info)
+    for d in crate::init_info::descriptors(info)
     {
         if d.cap_type != CapType::Memory
         {
@@ -181,7 +181,7 @@ fn find_table_in_acpi_regions(
     map_vaddr: u64,
 ) -> Option<(u32, u64, u64, usize)>
 {
-    for d in descriptors(info)
+    for d in crate::init_info::descriptors(info)
     {
         if d.cap_type != CapType::Memory
         {
@@ -328,22 +328,6 @@ fn scan_dsdt_for_s5(dsdt_data: u64, dsdt_len: usize) -> Option<u16>
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Read the `CapDescriptor` array from the `InitInfo` page.
-fn descriptors(info: &InitInfo) -> &[init_protocol::CapDescriptor]
-{
-    let base = core::ptr::from_ref::<InitInfo>(info).cast::<u8>();
-    // SAFETY: cap_descriptors_offset is set by the kernel; the CapDescriptor
-    // array starts at sizeof(InitInfo) which is 8-byte aligned (padded).
-    #[allow(clippy::cast_ptr_alignment)]
-    unsafe {
-        core::slice::from_raw_parts(
-            base.add(info.cap_descriptors_offset as usize)
-                .cast::<init_protocol::CapDescriptor>(),
-            info.cap_descriptor_count as usize,
-        )
-    }
-}
 
 /// Read a little-endian u32 at byte offset `off` from virtual address `vaddr`.
 ///

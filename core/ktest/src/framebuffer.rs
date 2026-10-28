@@ -16,7 +16,7 @@
 //! (headless boot) or the covering aperture cannot be carved.
 
 use font::{GLYPH_HEIGHT, GLYPH_WIDTH};
-use init_protocol::{CapDescriptor, CapType, InitInfo};
+use init_protocol::{CapType, InitInfo};
 use text::{DecodeOutcome, Utf8Decoder};
 
 /// `U+FFFD` replacement character, rendered for any byte that does not
@@ -55,25 +55,6 @@ struct FbState
 
 // ── Cap discovery ────────────────────────────────────────────────────────────
 
-/// Get the `CapDescriptor` array from `InitInfo`.
-fn descriptors(info: &InitInfo) -> &[CapDescriptor]
-{
-    let base = core::ptr::from_ref::<InitInfo>(info).cast::<u8>();
-    // SAFETY: cap_descriptors_offset is set by the kernel to point within the
-    // same read-only InitInfo region; the descriptor array contains
-    // cap_descriptor_count valid entries.
-    // cast_ptr_alignment: `cap_descriptors_offset` is `size_of::<InitInfo>()`,
-    // which abi/init-protocol asserts is a multiple of 8, the alignment the
-    // `u64` fields of `CapDescriptor` require.
-    #[allow(clippy::cast_ptr_alignment)]
-    unsafe {
-        let ptr = base
-            .add(info.cap_descriptors_offset as usize)
-            .cast::<CapDescriptor>();
-        core::slice::from_raw_parts(ptr, info.cap_descriptor_count as usize)
-    }
-}
-
 /// Carve a cap for exactly `[phys, phys + size)` out of the MMIO aperture
 /// that contains it, returning the carved slot.
 ///
@@ -83,7 +64,7 @@ fn descriptors(info: &InitInfo) -> &[CapDescriptor]
 /// head. `phys` and `size` must be page-aligned.
 fn carve_framebuffer_cap(info: &InitInfo, phys: u64, size: u64) -> Option<u32>
 {
-    let covering = descriptors(info).iter().find(|d| {
+    let covering = crate::init_info::descriptors(info).iter().find(|d| {
         d.cap_type == CapType::Mmio && phys >= d.aux0 && phys + size <= d.aux0 + d.aux1
     })?;
 

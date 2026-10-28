@@ -323,8 +323,8 @@ pub fn run_all(ctx: &TestContext)
         notification::multiple_sends_before_wait_accumulate_bits(ctx)
     );
     run_test!(
-        "notification::send_zero_bits_is_noop",
-        notification::send_zero_bits_is_noop(ctx)
+        "notification::send_zero_bits_rejected",
+        notification::send_zero_bits_rejected(ctx)
     );
     run_test!(
         "notification::send_insufficient_rights",

@@ -148,7 +148,7 @@ pub fn multiple_sends_before_wait_accumulate_bits(ctx: &TestContext) -> TestResu
 /// [syscalls.md](../../../kernel/docs/syscalls.md) § `SYS_NOTIFICATION_SEND` (3)). Verifies:
 /// 1. `notification_send(sig, 0)` returns an error.
 /// 2. A subsequent non-zero send arrives intact (error did not corrupt state).
-pub fn send_zero_bits_is_noop(ctx: &TestContext) -> TestResult
+pub fn send_zero_bits_rejected(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for zero-send test failed")?;

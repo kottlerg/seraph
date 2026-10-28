@@ -320,7 +320,7 @@ pub fn aspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
         .map_err(|_| "retype::aspace_self_delete: memory did not return to baseline")
 }
 
-const SYS_OUT_OF_MEMORY: i64 = -8;
+const SYS_OUT_OF_MEMORY: i64 = syscall_abi::SyscallError::OutOfMemory as i64;
 
 /// Augment-mode on `cap_create_aspace` increases the target AS's PT
 /// growth budget without creating a new AS.
@@ -888,13 +888,12 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
         cap_delete(cspace).ok();
         return Err("retype::dir_survives: boundary augment failed");
     }
-    for i in 0..DIRECT_SLOTS
+    for _ in 0..DIRECT_SLOTS
     {
         if cap_copy(probe, cspace, 1).is_err()
         {
             cap_delete(probe).ok();
             cap_delete(cspace).ok();
-            let _ = i;
             return Err("retype::dir_survives: direct-region fill failed early");
         }
     }

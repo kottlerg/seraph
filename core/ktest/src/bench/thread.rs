@@ -27,7 +27,6 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
 {
     // Use fewer iterations for this heavier benchmark.
     let n = iters.min(100);
-    let n64 = u64::from(n);
 
     let Ok(done) = cap_create_notification(ctx.memory_base)
     else
@@ -83,7 +82,6 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
     log_bench_header("thread_lifecycle", n);
     // The `checked_div(completed)` below guards against no successful
     // iteration, so a u64::MAX min is never logged.
-    let _ = n64;
     if let Some(mean) = total.checked_div(completed)
     {
         crate::log_u64("ktest: bench  cycles_min=", min);

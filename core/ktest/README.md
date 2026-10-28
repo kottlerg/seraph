@@ -41,6 +41,7 @@ core/ktest/
     ├── serial.rs           # Direct serial output
     ├── framebuffer.rs      # Direct framebuffer output
     ├── frame_pool.rs       # Memory capability pool for tests that map memory
+    ├── init_info.rs        # The InitInfo capability-descriptor array, for initial-cap lookups
     ├── spawn.rs            # Child-thread spawn helpers, argument blocks, exit probes
     ├── tally.rs            # Failure tallies and receive-guard diagnostics for stress cells
     ├── ioport.rs           # Per-thread I/O port access (x86-64)

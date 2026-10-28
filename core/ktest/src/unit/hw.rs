@@ -107,19 +107,13 @@ pub fn irq_register_ack(ctx: &TestContext) -> TestResult
     let bound = scan_bound(ctx);
     for slot in 1..=bound
     {
-        match irq_register(slot, irq_sig)
+        // Any error (a slot of another type, most often) leaves the cap
+        // intact; keep scanning.
+        if irq_register(slot, irq_sig).is_ok()
         {
-            Err(e) if e == SyscallError::InvalidCapability as i64 =>
-            {}
-            Err(_) =>
-            {}
-            Ok(()) =>
-            {
-                irq_ack(slot).map_err(|_| "irq_ack failed")?;
-                syscall::cap_delete(irq_sig)
-                    .map_err(|_| "cap_delete irq_sig after irq test failed")?;
-                return Ok(());
-            }
+            irq_ack(slot).map_err(|_| "irq_ack failed")?;
+            syscall::cap_delete(irq_sig).map_err(|_| "cap_delete irq_sig after irq test failed")?;
+            return Ok(());
         }
     }
 
@@ -168,18 +162,13 @@ pub fn ioport_bind(ctx: &TestContext) -> TestResult
         let bound = scan_bound(ctx);
         for slot in 1u32..=bound
         {
-            match syscall::ioport_bind(th, slot)
+            // Any error (a slot of another type, most often) leaves the cap
+            // intact; keep scanning.
+            if syscall::ioport_bind(th, slot).is_ok()
             {
-                Err(e) if e == SyscallError::InvalidCapability as i64 =>
-                {}
-                Err(_) =>
-                {}
-                Ok(()) =>
-                {
-                    syscall::cap_delete(th).ok();
-                    syscall::cap_delete(cs).ok();
-                    return Ok(());
-                }
+                syscall::cap_delete(th).ok();
+                syscall::cap_delete(cs).ok();
+                return Ok(());
             }
         }
 

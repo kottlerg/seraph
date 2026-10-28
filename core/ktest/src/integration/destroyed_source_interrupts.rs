@@ -51,8 +51,8 @@ const MAX_CHILDREN: usize = 2;
 /// A timed wait that never elapses on its own within the test.
 const PARK_FOREVER_MS: u64 = 600_000;
 
-/// Wall-clock settle after READY so the child provably reaches its park
-/// before the source is destroyed (see `park_interrupted_stop_start`).
+/// Wall-clock settle after READY so the child has, in practice, reached its
+/// park before the source is destroyed (see `park_interrupted_stop_start`).
 const SETTLE_SLEEP_MS: u64 = 20;
 
 /// Bound on each controller wait for a child's report.

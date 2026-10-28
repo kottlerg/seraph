@@ -9,7 +9,8 @@
 //! `SYS_THREAD_YIELD`, `SYS_THREAD_EXIT`, `SYS_THREAD_READ_REGS`,
 //! `SYS_THREAD_WRITE_REGS`, `SYS_THREAD_SET_PRIORITY`,
 //! `SYS_THREAD_SET_AFFINITY`, `SYS_THREAD_SLEEP`,
-//! `SYS_THREAD_BIND_NOTIFICATION`.
+//! `SYS_THREAD_BIND_NOTIFICATION`, `SYS_SCHED_SPLIT`, and the priority
+//! arguments of `SYS_CAP_CREATE_THREAD`.
 //!
 //! `SYS_THREAD_EXIT` is exercised implicitly — every child thread entry
 //! function calls `thread_exit()`.
@@ -40,6 +41,12 @@ use crate::{ChildStack, TestContext, TestResult};
 // parent has registered as the waiter.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
+
+/// Register-file buffer size; holds the arch `TrapFrame`
+/// (`crate::arch::TRAP_FRAME_BYTES`) on every architecture, as the guard
+/// below checks.
+const BUF_SIZE: usize = 512;
+const _: () = assert!(BUF_SIZE as u64 >= TRAP_FRAME_BYTES);
 
 // Child stacks for started children, to avoid aliasing. A stack is reused
 // only after its previous child has exited on the passing path:
@@ -154,7 +161,6 @@ pub fn r#yield(_ctx: &TestContext) -> TestResult
 /// stable `TrapFrame`. The parent stops it and reads registers.
 pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 {
-    const BUF_SIZE: usize = 512; // Larger than any architecture's TrapFrame.
     let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (ready) for stop_read_regs failed")?;
     let block = cap_create_notification(ctx.memory_base)
@@ -271,7 +277,6 @@ pub fn start_self_invalid_argument(ctx: &TestContext) -> TestResult
 /// `phase2_entry`. On resume, phase2 reads `PHASE2_SIG` and sends 0x2.
 pub fn write_regs_resume(ctx: &TestContext) -> TestResult
 {
-    const BUF_SIZE: usize = 512;
     let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (ready) for write_regs_resume failed")?;
     let block = cap_create_notification(ctx.memory_base)
@@ -1032,9 +1037,6 @@ fn balance_spawn_spinners(
         // Initial pinning to `initial_cpu` forces the first enqueue there.
         // SAFETY: per-spinner stack slot, no aliasing.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(STACK_BALANCE_SPINNERS[i]) });
-        // cast_possible_truncation: `i` is below `BALANCE_MAX_SPINNERS` (8), so
-        // the cast is exact on any pointer width.
-        #[allow(clippy::cast_possible_truncation)]
         let arg = (i as u64) << 32 | u64::from(child_sig);
         crate::spawn::configure_and_start_pinned(
             &child,

@@ -86,10 +86,11 @@ const SANITY_BITS: u64 = 0x55;
 /// Parks that must never elapse on their own (the stop is the only exit).
 const PARK_FOREVER_MS: u64 = 600_000;
 
-/// Wall-clock settle after a child's READY signal so it provably reaches
-/// its park before the stop lands (see `drive`). A stop that lands pre-park
-/// stops a Running thread instead — the restart would then park with no
-/// canceller and hang to the watchdog, so generous slack is cheap insurance.
+/// Wall-clock settle after a child's READY signal so it has, in practice,
+/// reached its park before the stop lands (see `drive`; a fixed sleep cannot
+/// prove it). A stop that lands pre-park stops a Running thread instead — the
+/// restart would then park with no canceller and hang to the watchdog, so
+/// generous slack is cheap insurance.
 const SETTLE_SLEEP_MS: u64 = 20;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
@@ -265,7 +266,7 @@ fn spawn_phase(
 }
 
 /// One phase's stop/restart sequence: wait for the child's READY signal, let
-/// it provably reach its park, stop + restart it, then take its verdict.
+/// it settle into its park, stop + restart it, then take its verdict.
 fn drive(
     th: u32,
     done: u32,

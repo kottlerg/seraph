@@ -172,7 +172,8 @@ static WAITER: AtomicU32 = AtomicU32::new(0);
 static STOP_ARMED: AtomicU32 = AtomicU32::new(0);
 static STOPPER_DONE: AtomicU32 = AtomicU32::new(0);
 /// Waits the phase's waiters entered, and waits whose result they tallied;
-/// a stopped waiter leaves the difference at one.
+/// a stopped waiter adds one to the difference if it was stopped inside a
+/// wait, and zero if it was stopped between waits.
 static WAITS_ENTERED: AtomicU32 = AtomicU32::new(0);
 static WAITS_DONE: AtomicU32 = AtomicU32::new(0);
 /// Waits that returned the delivery, and waits that returned `Interrupted`

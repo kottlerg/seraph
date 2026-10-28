@@ -79,7 +79,8 @@ const CELL: &str = "stress::stop_owed_wake";
 /// Stop/start rounds per phase.
 const CYCLES: u32 = 2000;
 
-/// Bound on the controller's wait for every child to exit, in 1 ms sleeps.
+/// Bound, in 1 ms sleeps, on the controller's polls for the starter to go
+/// idle and for every child to exit.
 const EXIT_POLLS: u32 = 2000;
 
 /// The waiter, the sender, and the starter.

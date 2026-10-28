@@ -180,9 +180,6 @@ fn thread_state(thread: u32) -> Result<(u32, u64), &'static str>
 {
     let packed = syscall::cap_info(thread, syscall_abi::CAP_INFO_THREAD_STATE)
         .map_err(|_| "spawn::thread_state: cap_info(THREAD_STATE) failed")?;
-    // cast_possible_truncation: the u32 state code fills the high 32 bits, so
-    // `packed >> 32` fits in u32.
-    #[allow(clippy::cast_possible_truncation)]
     let state = (packed >> 32) as u32;
     Ok((state, packed & 0xFFFF_FFFF))
 }

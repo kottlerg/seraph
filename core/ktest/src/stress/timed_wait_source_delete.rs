@@ -28,19 +28,25 @@
 //! queue touched by the timer). The test itself fails if a wait returns
 //! anything but a timeout (`Ok(0)` for a notification, `WouldBlock` for a
 //! queue — nothing is ever sent or posted), `Interrupted` (destroyed under
-//! it), or `InvalidCapability` (its copy was gone before it re-armed), or if
-//! no destroy ever landed on a parked waiter (the race never armed).
+//! it), or `InvalidCapability` (its copy was gone before it re-armed), if
+//! no destroy ever landed on a parked waiter (the race never armed), or if
+//! the waiter does not report ready, or its verdict, within a bounded wait.
+//! A bad result is logged with its result word (a value, or an error word).
 //!
 //! Needs **≥ 2 CPUs** (the destroy must run concurrently with CPU 0's timer).
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, cap_revoke, event_queue_create,
-    event_recv_timeout, notification_send, notification_wait, notification_wait_timeout,
-    system_info, thread_exit, thread_set_affinity, thread_sleep,
+    event_recv_timeout, notification_send, notification_wait_timeout, system_info, thread_exit,
+    thread_set_affinity, thread_sleep,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
+use crate::tally::BadTally;
 use crate::{ChildStack, TestContext, TestResult, spawn};
+
+/// This cell's log name.
+const CELL: &str = "stress::timed_wait_source_delete";
 
 /// Source-destroy cycles (half notification, half event queue).
 const CYCLES: u32 = 200;
@@ -61,6 +67,15 @@ const VERDICT: u64 = BIT_INTERRUPTED | BIT_GONE | BIT_BAD;
 /// Waiter wait-loop timeout: short, so deadlines expire throughout a cycle.
 const WAIT_MS: u64 = 1;
 
+/// Each controller wait for a waiter report waits in slices of this many
+/// milliseconds, at most [`REPORT_SLICES`] of them (5 s in all), so a report
+/// that never arrives fails the cell instead of hanging the run.
+const REPORT_SLICE_MS: u64 = 5;
+const REPORT_SLICES: u32 = 1000;
+
+/// Wait results outside the accepted set, with one of their result words.
+static BAD_WAITS: BadTally = BadTally::new();
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)
@@ -70,6 +85,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         crate::log("ktest: stress::timed_wait_source_delete SKIP (need 2+ CPUs)");
         return Ok(());
     }
+    BAD_WAITS.reset();
     thread_set_affinity(ctx.thread_cap, 1)
         .map_err(|_| "stress::timed_wait_source_delete: pin controller failed")?;
     let result = cycles(ctx, u32::try_from(cpus).unwrap_or(2));
@@ -155,10 +171,11 @@ fn one_cycle(ctx: &TestContext, done: u32, cycle: u32, cpus: u32) -> Result<bool
     reaped.map_err(|_| "stress::timed_wait_source_delete: reap waiter failed")?;
     if acc & BIT_BAD != 0
     {
-        return Err(
+        BAD_WAITS.check(
+            CELL,
             "stress::timed_wait_source_delete: a timed wait on a destroyed source ended in \
              neither a timeout, Interrupted, nor InvalidCapability",
-        );
+        )?;
     }
     Ok(acc & BIT_INTERRUPTED != 0)
 }
@@ -195,11 +212,15 @@ fn race(
     .map_err(|_| "stress::timed_wait_source_delete: start waiter failed")?;
 
     let mut acc = 0u64;
-    while acc & BIT_READY == 0
-    {
-        acc |= notification_wait(done)
-            .map_err(|_| "stress::timed_wait_source_delete: wait ready failed")?;
-    }
+    await_report(
+        done,
+        &mut acc,
+        BIT_READY,
+        "stress::timed_wait_source_delete: the waiter never reported ready",
+    )?;
+    // Any outcome serves: the sleep only staggers the destroy around the
+    // waiter's deadlines, and the spin below varies it further (a sleep
+    // refused with `OutOfMemory` on a full sleep list destroys earlier).
     let _ = thread_sleep(WAIT_MS);
     for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 18)
     {
@@ -208,12 +229,29 @@ fn race(
     cap_revoke(source).map_err(|_| "stress::timed_wait_source_delete: revoke failed")?;
     cap_delete(source).map_err(|_| "stress::timed_wait_source_delete: delete failed")?;
 
-    while acc & VERDICT == 0
-    {
-        acc |= notification_wait(done)
-            .map_err(|_| "stress::timed_wait_source_delete: wait verdict failed")?;
-    }
+    await_report(
+        done,
+        &mut acc,
+        VERDICT,
+        "stress::timed_wait_source_delete: the waiter never reported its verdict",
+    )?;
     Ok(acc)
+}
+
+/// Accumulate `done` bits into `acc` until one of `mask` is present,
+/// failing with `err` once [`REPORT_SLICES`] slices pass without it.
+fn await_report(done: u32, acc: &mut u64, mask: u64, err: &'static str) -> TestResult
+{
+    for _ in 0..REPORT_SLICES
+    {
+        if *acc & mask != 0
+        {
+            return Ok(());
+        }
+        *acc |= notification_wait_timeout(done, REPORT_SLICE_MS)
+            .map_err(|_| "stress::timed_wait_source_delete: wait on done failed")?;
+    }
+    if *acc & mask != 0 { Ok(()) } else { Err(err) }
 }
 
 // cast_possible_truncation: packed fields are 32-bit cap handles.
@@ -231,6 +269,8 @@ fn wait_loop(
     timed_out: fn(Result<u64, i64>) -> bool,
 ) -> !
 {
+    // A child has no other channel to report on; a failed send fails the
+    // controller's bounded wait for the bit.
     notification_send(done, BIT_READY).ok();
     let bit = loop
     {
@@ -243,9 +283,19 @@ fn wait_loop(
         {
             Err(e) if e == SyscallError::Interrupted as i64 => BIT_INTERRUPTED,
             Err(e) if e == SyscallError::InvalidCapability as i64 => BIT_GONE,
-            _ => BIT_BAD,
+            Ok(value) =>
+            {
+                BAD_WAITS.record(value);
+                BIT_BAD
+            }
+            Err(e) =>
+            {
+                BAD_WAITS.record_error(e);
+                BIT_BAD
+            }
         };
     };
+    // As for BIT_READY: a failed send fails the controller's bounded wait.
     notification_send(done, bit).ok();
     thread_exit()
 }

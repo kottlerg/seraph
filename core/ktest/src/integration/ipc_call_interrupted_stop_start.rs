@@ -48,10 +48,11 @@ const BIT_P2_ARMED: u64 = 1 << 3;
 const BIT_P2_OK: u64 = 1 << 4;
 const BIT_P2_BAD: u64 = 1 << 5;
 
-/// Wall-clock settle after a client's READY signal so it provably reaches
-/// its park before the stop lands. A stop that lands pre-park stops a
-/// Running thread instead — the restart would then park with no canceller
-/// and hang to the watchdog, so generous slack is cheap insurance.
+/// Wall-clock settle after a client's READY signal so it has, in practice,
+/// reached its park before the stop lands (a fixed sleep cannot prove it). A
+/// stop that lands pre-park stops a Running thread instead — the restart
+/// would then park with no canceller and hang to the watchdog, so generous
+/// slack is cheap insurance.
 const SETTLE_SLEEP_MS: u64 = 20;
 
 static mut CLIENT_STACK: ChildStack = ChildStack::ZERO;

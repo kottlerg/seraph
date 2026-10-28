@@ -36,6 +36,12 @@ use crate::{ChildStack, TestContext, TestResult};
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
 
+/// Register-file buffer size; holds the arch `TrapFrame`
+/// (`crate::arch::TRAP_FRAME_BYTES`) on every architecture, as the guard
+/// below checks.
+const BUF: usize = 512;
+const _: () = assert!(BUF as u64 >= crate::arch::TRAP_FRAME_BYTES);
+
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 /// Cap slot for `phase2_entry` (see `PHASE2_SIG` in `core/ktest/src/unit/thread.rs`
@@ -44,7 +50,6 @@ static PHASE2_SIG: AtomicU32 = AtomicU32::new(0);
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    const BUF: usize = 512;
     // Two distinct notifications — child→parent readiness and child blocking
     // primitive — so the child cannot self-deliver its own readiness send
     // before the parent has registered as the waiter (race observed on SMP).

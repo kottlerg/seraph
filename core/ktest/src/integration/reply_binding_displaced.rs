@@ -60,8 +60,11 @@ const BIT_C_READY: u64 = 1 << 6;
 const BIT_C_OK: u64 = 1 << 7;
 const BIT_C_BAD: u64 = 1 << 8;
 
-/// Settle after a caller's READY so its call provably reaches the send queue
-/// before the controller receives; bound on each report.
+/// Settle after a caller's READY so its call is, in practice, queued before
+/// the controller receives; the result does not depend on it, since the
+/// receive releases the bound caller at entry, whichever order the two take,
+/// and the label check names the caller the receive got. Bound on each
+/// report.
 const SETTLE_SLEEP_MS: u64 = 20;
 const REPORT_MS: u64 = 1000;
 

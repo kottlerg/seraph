@@ -47,7 +47,9 @@ const OCCUPIED_BADGE: u64 = 9;
 /// such a wake fails under its own message; a wrong wake after this window
 /// still fails the final badge check.
 const SETTLE_SLEEP_MS: u64 = 20;
-/// Bound on each report.
+/// Bound on each report. Applied through [`crate::scaled_bound`], which
+/// stretches it past [`crate::UNSCALED_CPUS`] CPUs, where a waiter's CPU
+/// waits for a host core.
 const REPORT_MS: u64 = 1000;
 
 /// Waiter `k`'s verdict bits.
@@ -288,12 +290,12 @@ fn start_occupied_child(
 }
 
 /// Accumulate `done` bits onto `acc` until any bit of `mask` is present,
-/// failing when a [`REPORT_MS`] wait passes with nothing new.
+/// failing when a scaled [`REPORT_MS`] wait passes with nothing new.
 fn collect(done: u32, mut acc: u64, mask: u64) -> Result<u64, &'static str>
 {
     while acc & mask == 0
     {
-        let bits = notification_wait_timeout(done, REPORT_MS)
+        let bits = notification_wait_timeout(done, crate::scaled_bound(REPORT_MS))
             .map_err(|_| "notification_wait_timeout on done for occupied failed")?;
         if bits == 0
         {

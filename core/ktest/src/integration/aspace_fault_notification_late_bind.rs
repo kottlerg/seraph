@@ -36,6 +36,8 @@ const UNMAPPED_STACK: u64 = 0x3E_2000_8000;
 const CORR: u32 = 0x4444;
 
 /// Poll bound: ~2 s at 1 ms/poll before declaring the thread never faulted.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs, where the thread's CPU waits for a host core.
 const MAX_POLLS: u32 = 2000;
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -56,7 +58,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     thread_start(thread).map_err(|_| "aspace_fault_notification_late_bind: thread_start failed")?;
 
     // Poll until the thread is Exited; capture the kernel-recorded fault reason.
-    let fault_reason = crate::spawn::wait_until_exited(thread, MAX_POLLS)?;
+    let fault_reason = crate::spawn::wait_until_exited(thread, crate::scaled_polls(MAX_POLLS))?;
     // It must be a real terminal fault, not a clean exit (reason 0).
     if fault_reason < EXIT_FAULT_BASE
     {

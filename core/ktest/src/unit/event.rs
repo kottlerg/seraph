@@ -28,6 +28,11 @@ static mut TIMEOUT_ZERO_PAYLOAD_STACK: ChildStack = ChildStack::ZERO;
 static mut TIMEOUT_NONZERO_PAYLOAD_STACK: ChildStack = ChildStack::ZERO;
 static mut TIMEOUT_FOREVER_STACK: ChildStack = ChildStack::ZERO;
 
+/// Bound, in milliseconds, on the timeout tests' wait for their child's post.
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs, where the child's CPU waits for a host core.
+const POST_WAIT_MS: u64 = 1000;
+
 // ── SYS_CAP_CREATE_EVENT_Q ───────────────────────────────────────────────────
 
 /// `event_queue_create` returns a valid slot for a queue of the given capacity.
@@ -268,8 +273,8 @@ pub fn recv_timeout_payload_zero_wins(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, post_zero_after_sleep_entry, stack_top, child_arg)
         .map_err(|_| "configure_and_start failed")?;
 
-    // Wait up to 1 s for the child's post; 0 is the legitimate payload.
-    let payload = event_recv_timeout(eq, 1000)
+    // Wait, bounded, for the child's post; 0 is the legitimate payload.
+    let payload = event_recv_timeout(eq, crate::scaled_bound(POST_WAIT_MS))
         .map_err(|_| "event_recv_timeout with pending post returned an error (timeout misread?)")?;
     if payload != 0
     {
@@ -296,7 +301,8 @@ pub fn recv_timeout_payload_nonzero_wins(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, post_cafe_after_sleep_entry, stack_top, child_arg)
         .map_err(|_| "configure_and_start failed")?;
 
-    let payload = event_recv_timeout(eq, 1000).map_err(|_| "event_recv_timeout failed")?;
+    let payload = event_recv_timeout(eq, crate::scaled_bound(POST_WAIT_MS))
+        .map_err(|_| "event_recv_timeout failed")?;
     if payload != 0xCAFE
     {
         return Err("event_recv_timeout returned wrong payload (expected 0xCAFE)");

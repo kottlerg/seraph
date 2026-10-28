@@ -691,6 +691,15 @@ pub fn scaled_bound(base: u64) -> u64
     base.saturating_mul((cpus / UNSCALED_CPUS).max(1))
 }
 
+/// [`scaled_bound`] for a bound counted in 1 ms polls, the `u32` that
+/// [`spawn::wait_until_exited`] and [`spawn::wait_memory_baseline`] take:
+/// `base` stretched the same way, saturating at `u32::MAX`.
+#[must_use]
+pub fn scaled_polls(base: u32) -> u32
+{
+    u32::try_from(scaled_bound(u64::from(base))).unwrap_or(u32::MAX)
+}
+
 /// Spin forever. Used for fatal errors where ktest cannot continue.
 pub fn halt() -> !
 {

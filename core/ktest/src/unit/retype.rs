@@ -58,7 +58,9 @@ const STUB_SCRATCH_VA: u64 = 0x3E_6100_0000;
 const STUB_UNMAPPED_VA: u64 = 0x3E_6200_0000;
 /// Badge bound with the fault handler of the fault-blocked child.
 const FAULT_BADGE: u64 = 0xA5_7A5E;
-/// Poll bound: ~2 s at 1 ms per poll.
+/// Poll bound: ~2 s at 1 ms per poll. Applied through [`crate::scaled_polls`],
+/// which stretches it past [`crate::UNSCALED_CPUS`] CPUs, where the child's
+/// CPU waits for a host core.
 const MAX_POLLS: u32 = 2000;
 
 /// Encode `loop {}` into `buf`; returns the byte count.
@@ -319,7 +321,7 @@ pub fn aspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
     cap_delete(aspace).map_err(|_| "retype::aspace_self_delete: cap_delete(aspace) failed")?;
     thread_start(thread).map_err(|_| "retype::aspace_self_delete: thread_start failed")?;
 
-    let reason = crate::spawn::wait_until_exited(thread, MAX_POLLS);
+    let reason = crate::spawn::wait_until_exited(thread, crate::scaled_polls(MAX_POLLS));
     cap_delete(thread).map_err(|_| "retype::aspace_self_delete: cap_delete(thread) failed")?;
     cap_delete(cspace).map_err(|_| "retype::aspace_self_delete: cap_delete(cspace) failed")?;
     // SAFETY: the only mapping of `frame` went with the address space.
@@ -328,7 +330,7 @@ pub fn aspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
     {
         return Err("retype::aspace_self_delete: child's exit reason is not EXIT_KILLED");
     }
-    crate::spawn::wait_memory_baseline(memory, baseline, MAX_POLLS)
+    crate::spawn::wait_memory_baseline(memory, baseline, crate::scaled_polls(MAX_POLLS))
         .map_err(|_| "retype::aspace_self_delete: memory did not return to baseline")
 }
 

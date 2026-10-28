@@ -263,9 +263,10 @@ pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
 /// `QuotaExceeded` / `OutOfMemory` (the caller's `CSpace` cannot accept the
 /// reply caps). The reply never blocks, so it never returns `Interrupted`. A
 /// `data_count` above `MSG_DATA_WORDS_MAX` or a `cap_count` above
-/// `MSG_CAP_SLOTS_MAX` is clamped to the maximum, not rejected. An error consumes the pending reply: a
-/// caller that was pending has already been woken with the
-/// `IPC_REPLY_TRANSFER_FAILED` label, so the reply must not be retried.
+/// `MSG_CAP_SLOTS_MAX` is clamped to the maximum, not rejected. An error
+/// consumes the pending reply: a caller that was pending has already been
+/// woken with the `IPC_REPLY_TRANSFER_FAILED` label, so the reply must not be
+/// retried.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_reply(
@@ -360,9 +361,9 @@ pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 /// (slot index plus generation).
 ///
 /// `memory_cap` is the source Memory-cap slot; it MUST carry `RIGHTS_MEM_RETYPE`
-/// and have at least 88 B of `available_bytes` (the Endpoint wrapper plus
-/// state). Bytes are debited from the Memory cap and credited back when the
-/// Endpoint is destroyed.
+/// and have at least 128 B of `available_bytes` (the `BIN_128` size class the
+/// Endpoint wrapper plus state is debited as). Bytes are debited from the
+/// Memory cap and credited back when the Endpoint is destroyed.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
@@ -386,9 +387,9 @@ pub fn cap_create_endpoint(memory_cap: u32) -> Result<u32, i64>
 /// Retype a Memory cap into a new Notification. Returns the new capability
 /// handle (slot index plus generation).
 ///
-/// `memory_cap` MUST carry `RIGHTS_MEM_RETYPE` and have at least 120 B of
-/// `available_bytes`. Bytes are debited from the Memory cap and credited back
-/// when the Notification is destroyed.
+/// `memory_cap` MUST carry `RIGHTS_MEM_RETYPE` and have at least 128 B of
+/// `available_bytes` (the `BIN_128` size class debited). Bytes are debited
+/// from the Memory cap and credited back when the Notification is destroyed.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks

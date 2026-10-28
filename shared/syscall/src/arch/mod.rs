@@ -15,8 +15,8 @@
 //! # Safety
 //!
 //! Every wrapper is an `unsafe fn` with one contract: `nr` must be a syscall
-//! number the kernel defines, and the remaining arguments that call's arguments
-//! in the order `core/kernel/docs/syscalls.md` gives; a pointer argument must be
+//! number the kernel defines, and the remaining arguments must be that call's
+//! arguments, in the order `core/kernel/docs/syscalls.md` gives; a pointer argument must be
 //! valid for the access the call's contract specifies. The kernel ABI's
 //! register clobbers are declared in each wrapper's asm.
 

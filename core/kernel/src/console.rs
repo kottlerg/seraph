@@ -183,6 +183,10 @@ pub unsafe fn console_write_fmt(args: core::fmt::Arguments)
 /// A `fmt::Write` sink that writes bytes only to the serial port, inserting a
 /// CR before each LF. Shared by [`serial_write_fmt`], [`panic_write_fmt`], and
 /// [`nmi_write_fmt`], which differ only in how they claim `CONSOLE_LOCK`.
+///
+/// Construct it only after `console::init` has initialised the serial port
+/// (each of those writers requires that as its safety contract); writing
+/// through it is sound only then.
 #[cfg(not(test))]
 struct SerialWriter;
 
@@ -191,9 +195,9 @@ impl core::fmt::Write for SerialWriter
 {
     fn write_str(&mut self, s: &str) -> core::fmt::Result
     {
-        // SAFETY: every writer that constructs a `SerialWriter` requires, as its
-        // own safety contract, that `console::init` has initialised the serial
-        // port; writing a byte to an initialised port has no other precondition.
+        // SAFETY: a `SerialWriter` is constructed only after `console::init`
+        // (see the type's rustdoc); writing a byte to an initialised port has no
+        // other precondition.
         unsafe {
             for byte in s.bytes()
             {

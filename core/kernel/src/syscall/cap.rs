@@ -134,9 +134,9 @@ unsafe fn release_src_ref(object: core::ptr::NonNull<crate::cap::object::KernelO
 /// `SYS_CAP_CREATE_ENDPOINT` (7): retype a Memory cap into a new Endpoint.
 ///
 /// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked). The Memory cap
-/// MUST carry `MemRights::RETYPE` and have at least
+/// MUST carry `MemRights::RETYPE` and have at least the size class of
 /// `dispatch_for(Endpoint, 0).raw_bytes` (80 B = 24 wrapper + 56
-/// `EndpointState`) of `available_bytes`.
+/// `EndpointState`, debited as the 128 B `BIN_128` class) of `available_bytes`.
 ///
 /// On success, the wrapper + `EndpointState` are constructed in place inside
 /// the source Memory cap's region; a cap with `SEND | RECEIVE | GRANT` rights
@@ -259,8 +259,9 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_CAP_CREATE_NOTIFICATION` (8): retype a Memory cap into a new Notification.
 ///
 /// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked). The
-/// Memory cap MUST carry `MemRights::RETYPE` and have at least
-/// `dispatch_for(Notification, 0).raw_bytes` of `available_bytes`.
+/// Memory cap MUST carry `MemRights::RETYPE` and have at least the size class
+/// of `dispatch_for(Notification, 0).raw_bytes` (debited as the 128 B
+/// `BIN_128` class) of `available_bytes`.
 ///
 /// On success, the wrapper + `NotificationState` are constructed in place inside
 /// the source Memory cap's region; a cap with `NOTIFY | WAIT` rights is
@@ -2386,6 +2387,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
     crate::cap::DERIVATION_LOCK.write_unlock();
 
+    // Every lock is released here, as `move_cap_drive` requires.
     let step = match begun?
     {
         MoveStep::Pending(mv) => move_cap_drive(mv),

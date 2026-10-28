@@ -335,6 +335,7 @@ unsafe fn transfer_caps(
         // contract).
         unsafe { release_moved_object(*obj) };
     }
+    // Still no lock held, as `move_cap_drive` requires.
     for (i, mv) in pending.iter().enumerate()
     {
         if let Some(mv) = mv
@@ -494,9 +495,10 @@ unsafe fn consume_call_disposition(
 /// If `cap_count` > 0, the endpoint cap must have `EpRights::GRANT`. Capabilities
 /// at the specified slots are moved from the caller's `CSpace` to the server's
 /// `CSpace` all-or-nothing with the message: doomed transfers (duplicate,
-/// stale, or revoke- or move-pinned slots) are rejected before blocking; a refusal that
-/// arises only after the caller has blocked degrades to delivery with zero
-/// caps (the caller keeps its capabilities).
+/// stale, or slots pinned by an in-flight revoke, move, or IPC capability
+/// transfer) are rejected before blocking; a refusal that arises only after the
+/// caller has blocked degrades to delivery with zero caps (the caller keeps its
+/// capabilities).
 ///
 /// Blocks caller until a server replies. On return, label and data words are
 /// in the return registers and IPC buffer. Reply-direction cap handles are
@@ -957,10 +959,11 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
 ///
 /// Capabilities move from the server's `CSpace` to the caller's `CSpace`
 /// all-or-nothing with the reply; a transfer refused after the caller was
-/// claimed (stale, repeated, or revoke- or move-pinned reply slot) wakes the caller
-/// with the synthetic `IPC_REPLY_TRANSFER_FAILED` label and returns the
-/// error to the server. No GRANT right check: the server is trusted by
-/// virtue of holding RECEIVE on the endpoint.
+/// claimed (a reply slot stale, repeated, or pinned by an in-flight revoke,
+/// move, or IPC capability transfer) wakes the caller with the synthetic
+/// `IPC_REPLY_TRANSFER_FAILED` label and returns the error to the server. No
+/// GRANT right check: the server is trusted by virtue of holding RECEIVE on the
+/// endpoint.
 // too_many_lines: a single logical operation (validate + cap pre-alloc + reply
 // dispatch, with a fault-reply fast path); splitting would obscure the
 // all-or-nothing reply atomicity.

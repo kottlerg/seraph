@@ -3017,14 +3017,11 @@ unsafe fn dealloc_object_one(
             );
             // Wrapper + state are in-place inside the ancestor Memory cap's
             // region.
-            use crate::cap::retype::{dispatch_for, retype_free};
-            // dispatch_for always returns Some for Notification; the fallback
-            // mirrors its computed value (24 wrapper + NotificationState) so it
-            // cannot drift from the alloc-side size.
-            let raw_bytes = dispatch_for(ObjectType::Notification, 0).map_or(
-                24 + core::mem::size_of::<crate::ipc::notification::NotificationState>() as u64,
-                |e| e.raw_bytes,
-            );
+            use crate::cap::retype::{NOTIFICATION_RAW_BYTES, dispatch_for, retype_free};
+            // dispatch_for always returns Some for Notification; the fallback is
+            // the same constant its Notification arm returns.
+            let raw_bytes = dispatch_for(ObjectType::Notification, 0)
+                .map_or(NOTIFICATION_RAW_BYTES, |e| e.raw_bytes);
 
             // SAFETY: ancestor_ptr is non-null per debug_assert; the
             // MemoryObject is kept alive by the retype-time refcount lease.

@@ -542,14 +542,12 @@ re-linked in O(1), the lock released between batches, and a
 slot can have been derived from up to the structural ceiling of every
 CSpace. The consumed slot is revalidated under the lock before every batch
 (tag and handle generation, not pinned by an in-flight revoke, move, or IPC capability
-transfer; after its first batch the delete
-also checks that the slot still holds the object it captured, and the splits check the
-looked-up object from the first hold, since their lookup ran without the lock): a
-concurrent revoke starting on it stops the delete with
-`InvalidState` and children already moved stay under the parent, a
-concurrent delete finishing it first turns the delete into a success and a
-split into `InvalidState` with both children rolled back. The split's own
-children are inserted and linked under the original's parent inside the
+transfer; after its first batch the delete also checks that the slot still holds the object it
+captured, and the splits check the looked-up object from the first hold, since their lookup ran
+without the lock): a concurrent revoke starting on it stops the delete with `InvalidState` and
+children already moved stay under the parent, a concurrent delete finishing it first turns the
+delete into a success and a split into `InvalidState` with both children rolled back. The split's
+own children are inserted and linked under the original's parent inside the
 first hold, before any batch releases the lock, so they are never reachable
 but unlinked — a sibling's `SYS_CAP_MOVE` carries whatever derivation
 position it finds, and an unlinked child would leave the grantor's revoke

@@ -230,6 +230,12 @@ unsafe fn stage_move(
 /// per `DERIVATION_LOCK` hold, revalidating both slots before each. Never
 /// returns [`MoveStep::Pending`]; the source's object reference is
 /// released here.
+///
+/// Must be called from syscall context with interrupts disabled and no lock
+/// held (`DERIVATION_LOCK`, a `CSpace` lock, an IPC source lock, a per-TCB
+/// `sched_lock`, a per-CPU scheduler lock, or the sleep-list lock): it takes
+/// `DERIVATION_LOCK` per batch and drops the freed source's reference through
+/// [`release_moved_object`], whose contract excludes those locks.
 pub fn move_cap_drive(mv: CapMove) -> MoveStep
 {
     use super::derivation::{DERIVATION_LOCK, MAX_REPARENT_BATCHES};
@@ -251,8 +257,10 @@ pub fn move_cap_drive(mv: CapMove) -> MoveStep
             {
                 if let Some(obj) = release
                 {
-                    // SAFETY: the freed source slot's reference; the lock is
-                    // released and this is syscall context.
+                    // SAFETY: the freed source slot's reference;
+                    // `DERIVATION_LOCK` is released, and this function's
+                    // precondition (syscall context, interrupts disabled, no
+                    // lock held) covers `release_moved_object`'s contract.
                     unsafe { release_moved_object(obj) };
                 }
                 return MoveStep::Done {

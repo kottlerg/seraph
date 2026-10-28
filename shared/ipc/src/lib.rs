@@ -2794,9 +2794,8 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
 /// transfer), or `QuotaExceeded` / `OutOfMemory` (the caller's `CSpace`
 /// cannot accept the reply caps). The reply never blocks, so it never returns
-/// `Interrupted`; the message's
-/// counts are within the kernel's maxima by construction (the kernel clamps
-/// larger ones rather than rejecting them).
+/// `Interrupted`; the message's counts are within the kernel's maxima by
+/// construction (the kernel clamps larger ones rather than rejecting them).
 #[inline]
 pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 {

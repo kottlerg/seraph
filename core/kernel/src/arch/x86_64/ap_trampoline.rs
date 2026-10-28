@@ -499,8 +499,11 @@ pub unsafe fn setup_ap_params(
 
 /// Start one AP: carve its IST stacks from the per-CPU slab, write params, send INIT+SIPI.
 ///
-/// Returns `true` unconditionally — SIPI delivery success is detected via
-/// `APS_READY` after this call.
+/// Returns `true` whenever it returns — SIPI delivery success is detected via
+/// `APS_READY` after this call. Halts the boot through `fatal`, before any
+/// SIPI, when the kernel root page table lies above 4 GiB
+/// (`kernel_root_table_pa()` does not fit the PM32 stub's 32-bit
+/// `mov cr3, eax`; #443).
 ///
 /// # Parameters
 /// - `trampoline_pa`: physical address of the trampoline page (from `BootInfo`).

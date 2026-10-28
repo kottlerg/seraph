@@ -1724,8 +1724,8 @@ unsafe fn panic_context_dump()
         // (core/kernel/docs/arch-interface.md § `trap_frame`), so it is
         // reported as the user frame, with the registers a syscall would carry
         // its arguments in. A panic on an x86-64 entry that publishes none
-        // (`#NM`, the NMI) reads the last publishing entry's frame, which may
-        // be stale or overwritten.
+        // (`#NM`, the NMI, `#DF`, `#MC`) reads the last publishing entry's
+        // frame, which may be stale or overwritten.
         // SAFETY: a non-null trap_frame names a frame on this thread's kernel
         // stack, and this is that thread's own CPU; arg/instruction_pointer
         // are plain field reads of that frame, and `syscall_nr` is a Relaxed

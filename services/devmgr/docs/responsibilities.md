@@ -74,7 +74,12 @@ devmgr's responsibilities are:
   input drivers (`QUERY_FRAMEBUFFER_DEVICE` / `QUERY_INPUT_DEVICE`), timed
   resolves the platform RTC (`QUERY_RTC_DEVICE`), and netd (design intent; not
   yet implemented, #30). devmgr owns each driver's service endpoint and mints a
-  badged SEND on query.
+  badged SEND on query. `QUERY_BLOCK_DEVICE`, whose reply is the
+  `MOUNT_AUTHORITY`-badged whole-disk cap, is gated on `BLOCK_DEVICE_AUTHORITY`,
+  which only the registry cap init mints for vfsd carries. The serial,
+  framebuffer, RTC, and input queries are gated on `REGISTRY_QUERY_AUTHORITY`,
+  which every consumer query cap carries: svcmgr's `devmgr.*` publications,
+  the cap svcmgr mints for logd at launch, and vfsd's.
 - **Broker ACPI and shutdown hardware to pwrmgr** — devmgr is the sole
   owner of the ACPI Memory caps and the only service that walks the ACPI
   table tree (RSDP → XSDT). `QUERY_ACPI_TABLE` locates a table by
@@ -123,7 +128,7 @@ how devmgr uses them.
 
 | Capability | Rights | Purpose |
 |---|---|---|
-| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves every `QUERY_*` request (`QUERY_*_DEVICE`, `QUERY_DEVICE_INFO`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`) and `SET_DRIVERS_DIR` on it, and mints from it the badged SENDs drivers use for `QUERY_DEVICE_INFO` |
+| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves every `QUERY_*` request (`QUERY_*_DEVICE`, `QUERY_DEVICE_INFO`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`), `SET_DRIVERS_DIR`, and the test-only `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` labels the enumeration redesign removes (#165) on it, and mints from it the badged SENDs drivers use for `QUERY_DEVICE_INFO`. The test labels are gated on `ORPHAN_TEST_AUTHORITY`, which only the `devmgr.test` cap carries: a seed-only name svctest alone seeds |
 | Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers |
 | Interrupt (full-rights derivation of init's root IRQ range) | Notify | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps delegated to drivers |
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (CMOS, COM1) and pwrmgr's PM1a + 8042 reset ports |

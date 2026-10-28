@@ -15,24 +15,15 @@
 //! handover, so the reap waits for the later of the two deaths; reclaiming
 //! init's aspace/cspace while a thread still runs in them would fault it.
 //!
-//! State machine (single-threaded; serialised under procmgr's
-//! `service_ep` recv loop):
-//!
-//! ```text
-//! Empty
-//!   │  REGISTER_INIT_TEARDOWN  (first round; data[0] != 0)
-//!   ▼
-//! Collecting{aspace, cspace, main_thread, logd_thread, caps[..]}
-//!   │  REGISTER_INIT_TEARDOWN  (subsequent rounds; data[0] == 0)
-//!   ▼ (appends Memory caps to caps[..])
-//! Collecting
-//!   │  INIT_TEARDOWN_DONE
-//!   ▼
-//! Armed   (pending_deaths = 2; waiting for both threads' INIT_REAP_CORRELATOR
-//!          death events — run_reap counts down, reaping on the last.)
-//!   │
-//!   └─▼  dispatch_death sees correlator == INIT_REAP_CORRELATOR (×2)
-//!      Reaping (run_reap, last death) → do_reap
+//! The handoff's state machine (`process_table::InitReap`, host-tested
+//! there) accepts the rounds and `INIT_TEARDOWN_DONE` only from an un-badged
+//! cap (init's, or svcmgr's mint source; see
+//! `services/procmgr/docs/ipc-interface.md` § `REGISTER_INIT_TEARDOWN`),
+//! counts the two init-thread deaths, and reaps on the last one, whether or
+//! not `INIT_TEARDOWN_DONE` armed it (a threadless init can send nothing
+//! more). The handoff is one-shot: after the reap every request is refused.
+//! This module performs the syscalls and IPC around it, serialised under
+//! procmgr's single-threaded `service_ep` recv loop.
 //!
 //! init-logd outlives init's main thread until svcmgr-launched real-logd pulls
 //! its handover and releases it (`HANDOVER_RELEASE` → init-logd `thread_exit`).
@@ -41,6 +32,7 @@
 //! crashes mid-pull or never launches), init-logd serves on and init's memory
 //! caps stay held — a benign hold, not a wedge — until shutdown.
 //!
+//! ```text
 //! do_reap:
 //!   1. cap_delete(logd_thread)                — Exited
 //!   2. cap_delete(main_thread)
@@ -59,12 +51,13 @@
 // Procmgr runs single-threaded under its lone `service_ep` recv loop;
 // the `Mutex` here is only the `Sync` shell required for a `static`.
 // `expect` on `.lock()` therefore cannot fire in practice (no contention
-// → no poisoning), and a Vec inside `Option` avoids any unsafe statics.
+// → no poisoning), and a Vec inside the state avoids any unsafe statics.
 #![allow(clippy::expect_used)]
 
 use std::sync::Mutex;
 
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
+use process_table::{CapDisposition, DeathOutcome, InitReap, Refusal};
 use syscall_abi::MSG_CAP_SLOTS_MAX;
 
 /// Init's kernel-object and reclaim-Memory caps, accumulated across
@@ -82,193 +75,156 @@ pub struct InitReapState
     main_thread: u32,
     logd_thread: u32,
     donate_caps: Vec<u32>,
-    armed: bool,
-    /// Init threads still expected to exit before the reap runs. A process is
-    /// reapable only when threadless, so the teardown waits for both init
-    /// threads (main + init-logd) — `run_reap` decrements this per death event
-    /// and reaps on the last. init-logd outlives the main thread until the
-    /// svcmgr-launched real-logd pulls its handover and releases it.
-    pending_deaths: u8,
 }
 
-/// State machine slot. `None` until init's first
-/// `REGISTER_INIT_TEARDOWN`; populated and progressively filled by
-/// later rounds; transitions to `armed = true` on `INIT_TEARDOWN_DONE`.
-/// Cleared back to `None` after `run_reap` completes.
-static STATE: Mutex<Option<InitReapState>> = Mutex::new(None);
+/// The handoff: `Empty` until init's first `REGISTER_INIT_TEARDOWN`,
+/// `Collecting` while rounds arrive and the two init-thread deaths are
+/// counted, and `Reaped` (terminal) once `run_reap` has torn init down.
+static STATE: Mutex<InitReap<InitReapState>> = Mutex::new(InitReap::Empty);
+
+/// Reply to a refused handoff request and dispose of the caps it moved into
+/// procmgr's `CSpace` as `refusal` says.
+///
+/// A badged sender is not init: its caps are deleted and it gets
+/// `UNAUTHORIZED`. An un-badged sender gets `INVALID_ARGUMENT`, and its caps
+/// stay in procmgr's `CSpace` while they may still be init's live ones:
+///   * an `AddressSpace` cap would trip `dealloc_object`'s
+///     `active_cpu_mask == 0` assert — init's threads still run on it while
+///     this IPC is in flight;
+///   * a Memory cap would buddy-free pages that init's live address space
+///     still maps, the aliasing window the reap ordering exists to prevent.
+///
+/// Init observes the error reply and aborts its handoff, so those caps are a
+/// one-shot leak on a failure-only path. After the reap no init mapping is
+/// left, and the caps are deleted.
+fn refuse(refusal: Refusal, caps: &[u32], ipc_buf: *mut u64)
+{
+    let (code, disposition) = match refusal
+    {
+        Refusal::Unauthorized => (procmgr_errors::UNAUTHORIZED, CapDisposition::Release),
+        Refusal::Invalid(disposition) => (procmgr_errors::INVALID_ARGUMENT, disposition),
+    };
+    match disposition
+    {
+        CapDisposition::Release => crate::release_caps(caps),
+        CapDisposition::Keep =>
+        {
+            std::os::seraph::log!(
+                "init-reap: refusing a round; {} caps left in procmgr",
+                caps.len()
+            );
+        }
+    }
+    reply(ipc_buf, code);
+}
 
 /// Handle a `REGISTER_INIT_TEARDOWN` IPC.
 ///
 /// `data[0] != 0` marks the first round (carrying the 4 kernel-object
-/// caps); subsequent rounds carry only reclaimable Memory caps. On the
-/// first round, binds death-EQ observers on both init threads (main +
-/// init-logd) with `INIT_REAP_CORRELATOR` and arms `pending_deaths = 2`.
+/// caps); subsequent rounds carry only reclaimable Memory caps. Only an
+/// un-badged cap (`req.badge == 0`: init's, or svcmgr's mint source) is
+/// accepted, and only before the reap.
+/// On the first round, binds death-EQ observers on both init threads (main +
+/// init-logd) with `INIT_REAP_CORRELATOR`.
 pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
 {
     let caps = req.caps();
     let is_first = req.word(0) != 0;
     let mut guard = STATE.lock().expect("init-reap state poisoned");
 
-    // Shared invariant for the error arms below: caps the kernel just
-    // moved into procmgr's CSpace cannot be `cap_delete`d here.
-    //   * AddressSpace caps would trip `dealloc_object`'s
-    //     `active_cpu_mask == 0` assert — init's threads are still
-    //     running on that AS while this IPC is in flight.
-    //   * Memory caps (donation rounds) would buddy-free pages that
-    //     init's still-live AS has mapped, recreating the very
-    //     aliasing window the reap ordering exists to prevent.
-    // Init is the sole legitimate caller, all reject arms are
-    // unreachable in well-formed traffic, and on the reject path init
-    // observes the error reply and aborts. The orphaned caps are a
-    // one-shot leak on a failure-only path.
-
-    if is_first
+    if !is_first
     {
-        if guard.is_some()
+        match guard.donation(req.badge)
         {
-            std::os::seraph::log!(
-                "init-reap: duplicate first round; refusing (caps leaked in procmgr)"
-            );
-            reply(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
-            return;
+            Ok(state) =>
+            {
+                state.donate_caps.extend_from_slice(caps);
+                reply(ipc_buf, procmgr_errors::SUCCESS);
+            }
+            Err(refusal) => refuse(refusal, caps, ipc_buf),
         }
-        if caps.len() != 4
-        {
-            std::os::seraph::log!(
-                "init-reap: first round expected 4 caps, got {}; refusing (caps leaked in procmgr)",
-                caps.len(),
-            );
-            reply(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
-            return;
-        }
-        let aspace = caps[0];
-        let cspace = caps[1];
-        let main_thread = caps[2];
-        let logd_thread = caps[3];
-        // Bind a death-EQ observer on both init threads under the same
-        // correlator. Both are alive at this point (init's main is mid-handoff;
-        // init-logd is still serving the log endpoint), so neither bind lands
-        // on an already-exited thread. The reap waits for both.
-        if syscall::thread_bind_notification(
-            main_thread,
+        return;
+    }
+
+    if let Err(refusal) = guard.check_first_round(req.badge, caps.len())
+    {
+        refuse(refusal, caps, ipc_buf);
+        return;
+    }
+    let aspace = caps[0];
+    let cspace = caps[1];
+    let main_thread = caps[2];
+    let logd_thread = caps[3];
+    // Bind a death-EQ observer on both init threads under the same
+    // correlator. Both are alive at this point (init's main is mid-handoff;
+    // init-logd is still serving the log endpoint), so neither bind lands
+    // on an already-exited thread. The reap waits for both.
+    if syscall::thread_bind_notification(
+        main_thread,
+        death_eq,
+        procmgr_labels::INIT_REAP_CORRELATOR,
+    )
+    .is_err()
+        || syscall::thread_bind_notification(
+            logd_thread,
             death_eq,
             procmgr_labels::INIT_REAP_CORRELATOR,
         )
         .is_err()
-            || syscall::thread_bind_notification(
-                logd_thread,
-                death_eq,
-                procmgr_labels::INIT_REAP_CORRELATOR,
-            )
-            .is_err()
-        {
-            std::os::seraph::log!(
-                "init-reap: thread_bind_notification failed; refusing handoff (caps leaked in procmgr)"
-            );
-            reply(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
-            return;
-        }
-        *guard = Some(InitReapState {
-            aspace,
-            cspace,
-            main_thread,
-            logd_thread,
-            donate_caps: Vec::with_capacity(32),
-            armed: false,
-            pending_deaths: 2,
-        });
-        reply(ipc_buf, procmgr_errors::SUCCESS);
+    {
+        std::os::seraph::log!("init-reap: thread_bind_notification failed; refusing handoff");
+        refuse(Refusal::Invalid(CapDisposition::Keep), caps, ipc_buf);
         return;
     }
-
-    let Some(state) = guard.as_mut()
-    else
-    {
-        std::os::seraph::log!(
-            "init-reap: donation round without prior first round; refusing ({} caps leaked in procmgr)",
-            caps.len(),
-        );
-        reply(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
-        return;
-    };
-    for &slot in caps
-    {
-        state.donate_caps.push(slot);
-    }
+    guard.open(InitReapState {
+        aspace,
+        cspace,
+        main_thread,
+        logd_thread,
+        donate_caps: Vec::with_capacity(32),
+    });
     reply(ipc_buf, procmgr_errors::SUCCESS);
 }
 
-/// Handle `INIT_TEARDOWN_DONE`. Marks the state machine armed; the
-/// next death-EQ event with `INIT_REAP_CORRELATOR` triggers `run_reap`.
-///
-/// Rejects when state is `None` (no preceding first round) or when
-/// already armed (re-arm is meaningless and signals a malformed
-/// caller).
-pub fn handle_done(ipc_buf: *mut u64)
+/// Handle `INIT_TEARDOWN_DONE`: mark the handoff armed. Only an un-badged
+/// cap (init's, or svcmgr's mint source) is accepted, once, while the
+/// handoff is open. The message names no caps, so procmgr deletes any it
+/// moved, accepted or refused.
+pub fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let mut guard = STATE.lock().expect("init-reap state poisoned");
-    let Some(state) = guard.as_mut()
-    else
+    match guard.done(req.badge)
     {
-        std::os::seraph::log!("init-reap: DONE without prior first round; refusing");
-        reply(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
-        return;
-    };
-    if state.armed
-    {
-        std::os::seraph::log!("init-reap: DONE called while already armed; refusing");
-        reply(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
-        return;
+        Ok(()) =>
+        {
+            crate::release_caps(req.caps());
+            reply(ipc_buf, procmgr_errors::SUCCESS);
+        }
+        Err(refusal) => refuse(refusal, req.caps(), ipc_buf),
     }
-    state.armed = true;
-    reply(ipc_buf, procmgr_errors::SUCCESS);
 }
 
-/// Execute the reap once both init threads have exited (init is
-/// threadless). Called on each death-EQ event tagged with
-/// `INIT_REAP_CORRELATOR`; it decrements the expected-death count and runs
-/// the teardown only on the last. Idempotent: a state-less invocation
-/// (re-fire after we already reaped, or before arming) is a no-op.
+/// Count one init-thread death (a death-EQ event tagged with
+/// `INIT_REAP_CORRELATOR`) and execute the reap on the last one, once init is
+/// threadless, whether or not `INIT_TEARDOWN_DONE` armed the handoff: a
+/// threadless init can send no further round. A death with no open handoff
+/// (none opened, or the reap already ran) is a no-op.
 pub fn run_reap(memmgr_ep: u32, ipc_buf: *mut u64)
 {
-    let state = {
-        let mut guard = STATE.lock().expect("init-reap state poisoned");
-        let Some(s) = guard.as_mut()
-        else
-        {
-            return;
-        };
-        // Count the death as soon as it is observed, even before
-        // `INIT_TEARDOWN_DONE` arms the reap. The death-EQ observers are bound
-        // (first round) before the svcmgr handover can release init-logd, so
-        // init-logd's exit may fire while init is still streaming donation
-        // rounds — i.e. pre-arm. Dropping a pre-arm death would strand
-        // `pending_deaths` and the reap would never fire. Only the *execution*
-        // of the reap waits for `armed`: init must finish donating its
-        // reclaimable caps, and `do_reap` consumes the kernel-object caps that
-        // round delivers.
-        s.pending_deaths = s.pending_deaths.saturating_sub(1);
-        if s.pending_deaths > 0
+    let outcome = STATE.lock().expect("init-reap state poisoned").death();
+    match outcome
+    {
+        DeathOutcome::Ignored =>
+        {}
+        DeathOutcome::Pending(remaining) =>
         {
             std::os::seraph::log!(
                 "init-reap: an init thread exited; {} still running",
-                s.pending_deaths
+                remaining
             );
-            return;
         }
-        if !s.armed
-        {
-            // Both threads exited before arming. init's main thread sends
-            // `INIT_TEARDOWN_DONE` before its own `thread_exit`, so main's death
-            // is always post-arm and this branch is unreachable in well-formed
-            // teardown. If it is reached, the reap never runs: `handle_done`
-            // does not check `pending_deaths` (#449).
-            return;
-        }
-        guard.take().expect("init-reap state present")
-    };
-
-    do_reap(state, memmgr_ep, ipc_buf);
+        DeathOutcome::Reap(state) => do_reap(state, memmgr_ep, ipc_buf),
+    }
 }
 
 /// Tear init down once it is threadless: both threads `Exited` via the normal

@@ -17,9 +17,9 @@ use syscall_abi::PAGE_SIZE;
 
 /// RAII handle for a transient scratch mapping in procmgr's own aspace.
 ///
-/// `new` reserves a contiguous unmapped VA range, calls `mem_map` against
-/// `memory_cap` with the requested rights, and stores the range so `Drop`
-/// can mirror the cleanup. Forgets the range on map-failure (allocator
+/// [`ScratchMapping::map`] reserves a contiguous unmapped VA range, calls
+/// `mem_map` against `memory_cap` with the requested rights, and stores the
+/// range so `Drop` can mirror the cleanup. Forgets the range on map-failure (allocator
 /// only tracks VA — the failed map leaves no kernel-side state).
 pub struct ScratchMapping
 {
@@ -154,7 +154,8 @@ pub fn derive_memory_for_prot(memory_cap: u32, prot: u64) -> Option<u32>
 ///
 /// `fill` receives the zeroed writable span and writes the segment bytes and
 /// relocation values in (in-memory slice copy or VFS stream); it is
-/// infallible — a short read leaves the tail zeroed.
+/// infallible — a short read leaves the tail zeroed, and the
+/// `CREATE_FROM_FILE` caller then fails the spawn with `IO_ERROR`.
 ///
 /// `ro_range` is the image's read-only-after-relocation page range
 /// (`PT_GNU_RELRO`, biased and page-aligned): pages of this segment fully

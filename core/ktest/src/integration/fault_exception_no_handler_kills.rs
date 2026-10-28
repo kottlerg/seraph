@@ -26,6 +26,8 @@ use syscall_abi::EXIT_FAULT_BASE;
 use crate::{ChildStack, TestContext, TestResult};
 
 /// Poll bound: ~2 s at ~1 ms per `thread_sleep(1)` before declaring failure.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs, where the child's CPU waits for a host core.
 const MAX_POLLS: u32 = 2000;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
@@ -53,7 +55,7 @@ fn start_and_check(child: &crate::spawn::SpawnedChild) -> TestResult
         .map_err(|_| "fault_exception_no_handler_kills: configure_and_start failed")?;
 
     let expected = EXIT_FAULT_BASE + crate::arch::ILLEGAL_INSTRUCTION_VECTOR;
-    let reason = crate::spawn::wait_until_exited(child.th, MAX_POLLS)?;
+    let reason = crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS))?;
     if reason != expected
     {
         return Err("fault_exception_no_handler_kills: wrong exit reason");

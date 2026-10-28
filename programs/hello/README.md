@@ -61,6 +61,10 @@ spawn target:
   `Unsupported`.
 - `command_from_spawned_thread_phase` captures its output through `Command::output()` from a
   spawned thread and expects a clean exit and non-empty stdout.
+- `procmgr_refusals_phase` passes it as the file cap of raw `CREATE_FROM_FILE` requests (a
+  refused one, one whose child takes the `CONFIGURE_PIPE` cells, and, from the
+  `undeliverable-reply-child`, ones whose reply cannot be delivered), and spawns it to check
+  that procmgr still serves after the refusals.
 - `pipes_phase` (`services/svctest/src/phases/pipes.rs`) captures its stdout through a pipe
   and through `Command::output()`, and expects bytes and a clean exit.
 

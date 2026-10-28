@@ -416,6 +416,10 @@ fn dispatch_ipc(
     let label = req.label;
     let badge = req.badge;
 
+    // Every cap a request transfers has already moved into procmgr's
+    // CSpace. Each arm releases the caps its wire layout does not name, and
+    // every cap on a reject arm, so a padded or refused request cannot grow
+    // procmgr's CSpace (`docs/ipc-interface.md` § Capability Transfer).
     match label & 0xFFFF
     {
         procmgr_labels::CREATE_PROCESS =>
@@ -425,6 +429,7 @@ fn dispatch_ipc(
 
         procmgr_labels::START_PROCESS =>
         {
+            release_caps(req.caps());
             // Badge from ipc_recv identifies which process to start.
             let code = match process::start_process(badge, table, ctx.self_aspace)
             {
@@ -436,6 +441,7 @@ fn dispatch_ipc(
 
         procmgr_labels::DESTROY_PROCESS =>
         {
+            release_caps(req.caps());
             // Badge from ipc_recv identifies which process to destroy.
             process::destroy_process(badge, ctx.memmgr_ep, ipc_buf, table);
             reply_empty(ipc_buf, procmgr_errors::SUCCESS);
@@ -443,6 +449,7 @@ fn dispatch_ipc(
 
         procmgr_labels::QUERY_PROCESS =>
         {
+            release_caps(req.caps());
             // Badge identifies which process to query. Reply data:
             //   word 0 = state code (see `procmgr_process_state`)
             //   word 1 = exit_reason (only meaningful for `EXITED`)
@@ -482,12 +489,27 @@ fn dispatch_ipc(
 
         procmgr_labels::INIT_TEARDOWN_DONE =>
         {
-            init_reap::handle_done(ipc_buf);
+            init_reap::handle_done(&req, ipc_buf);
         }
 
         _ =>
         {
+            release_caps(req.caps());
             reply_empty(ipc_buf, procmgr_errors::UNKNOWN_OPCODE);
+        }
+    }
+}
+
+/// Delete each nonzero slot in `caps` from procmgr's `CSpace`: the caps a
+/// request transferred that its wire layout does not name, or every cap of a
+/// refused request.
+pub(crate) fn release_caps(caps: &[u32])
+{
+    for &slot in caps
+    {
+        if slot != 0
+        {
+            let _ = syscall::cap_delete(slot);
         }
     }
 }
@@ -505,19 +527,24 @@ fn dispatch_ipc(
 /// Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
 /// caller lacks the authority badge or a death EQ is already
 /// registered, `INVALID_ARGUMENT` if no cap (or a zero cap) arrives.
+/// Every refused request has its transferred caps deleted, and so do caps
+/// past `caps[0]`.
 fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
 {
+    let caps = req.caps();
     if req.badge != procmgr_labels::DEATH_EQ_AUTHORITY
     {
+        release_caps(caps);
         reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
         return;
     }
-    let Some(&logd_eq) = req.caps().first()
+    let Some((&logd_eq, extra)) = caps.split_first()
     else
     {
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };
+    release_caps(extra);
     if logd_eq == 0
     {
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
@@ -661,12 +688,14 @@ fn handle_configure_pipe(
     let caps = req.caps();
     if caps.len() < 3
     {
+        release_caps(caps);
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     }
     let memory_cap = caps[0];
     let data_notification = caps[1];
     let space_notification = caps[2];
+    release_caps(&caps[3..]);
 
     let code = match table.configure_pipe(
         badge,
@@ -681,13 +710,10 @@ fn handle_configure_pipe(
         Err(code) => code,
     };
 
-    // configure_pipe cap_copy'd each cap into the child's CSpace; drop
-    // procmgr-side slots so refcounts hit zero when both peers later
-    // release. Idempotent on zero. On the failure path the cap_copy may
-    // not have happened yet — cap_delete on a stale slot is a no-op.
-    let _ = syscall::cap_delete(memory_cap);
-    let _ = syscall::cap_delete(data_notification);
-    let _ = syscall::cap_delete(space_notification);
+    // On success configure_pipe cap_copy'd each cap into the child's
+    // CSpace; on failure it installed none. Either way procmgr's slots are
+    // dropped, so refcounts hit zero when both peers later release.
+    release_caps(&caps[..3]);
 
     reply_empty(ipc_buf, code);
 }
@@ -701,6 +727,8 @@ fn handle_configure_pipe(
 /// * `caps[0]` — root cap to deliver to the child at start (mandatory).
 /// * `caps[1]` — cwd cap to deliver to the child at start (optional;
 ///   absent leaves `current_dir_cap` zero in the child).
+///
+/// Caps past `caps[1]` are deleted.
 fn handle_configure_namespace(
     req: &IpcMessage,
     ipc_buf: *mut u64,
@@ -716,6 +744,7 @@ fn handle_configure_namespace(
     }
     let root_cap = caps[0];
     let cwd_cap = caps.get(1).copied().unwrap_or(0);
+    release_caps(caps.get(2..).unwrap_or(&[]));
     let code = match table.configure_namespace(badge, root_cap, cwd_cap)
     {
         Ok(()) => procmgr_errors::SUCCESS,
@@ -768,17 +797,34 @@ fn resolve_create_sched(
     Some(process::ChildSched { priority, band_max })
 }
 
-/// Reply with a successful process creation result.
+/// Reply with a successful process creation result, or destroy the child
+/// when the reply cannot deliver it.
 ///
-/// Reply caps: `[process_handle, thread]`.
-fn reply_create_result(result: &process::CreateResult, ipc_buf: *mut u64)
+/// Reply caps: `[process_handle, thread]`. The reply's cap transfer is
+/// all-or-nothing: when the caller's `CSpace` cannot take both caps (or the
+/// caller is gone), the caller resumes with `IPC_REPLY_TRANSFER_FAILED` and
+/// no caps, and both caps stay in procmgr's `CSpace`. No one then holds the
+/// handle that could start or destroy the suspended child, so procmgr deletes
+/// both caps and tears the child down as `DESTROY_PROCESS` does.
+fn reply_create_result(
+    result: &process::CreateResult,
+    ipc_buf: *mut u64,
+    memmgr_ep: u32,
+    table: &mut process::ProcessTable,
+)
 {
     let msg = IpcMessage::builder(procmgr_errors::SUCCESS)
         .cap(result.process_handle)
         .cap(result.thread_for_caller)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&msg, ipc_buf) };
+    if unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_err()
+    {
+        std::os::seraph::log!("procmgr: create reply undeliverable; destroying the child");
+        let _ = syscall::cap_delete(result.thread_for_caller);
+        let _ = syscall::cap_delete(result.process_handle);
+        process::destroy_process(result.badge, memmgr_ep, ipc_buf, table);
+    }
 }
 
 /// Handle `CREATE_PROCESS` — create a process from a boot module memory cap.
@@ -803,10 +849,10 @@ fn reply_create_result(result: &process::CreateResult, ipc_buf: *mut u64)
 ///   word `argv_words+1..`        = env blob, `env_bytes.div_ceil(8)` words
 ///                                  (only present when `env_count > 0`)
 ///
-/// Expects `caps = [module_memory, creator_endpoint?]`. Stdio pipe
-/// wiring is installed via separate `CONFIGURE_PIPE` IPCs (one per
-/// piped direction) on the returned badged `process_handle` between
-/// create and `START_PROCESS`; the create path itself stays
+/// Expects `caps = [module_memory, creator_endpoint?]`; caps past those two
+/// are deleted. Stdio pipe wiring is installed via separate `CONFIGURE_PIPE`
+/// IPCs (one per piped direction) on the returned badged `process_handle`
+/// between create and `START_PROCESS`; the create path itself stays
 /// stdio-agnostic.
 fn handle_create(
     req: &IpcMessage,
@@ -826,6 +872,7 @@ fn handle_create(
 
     let module_cap = caps[0];
     let creator_ep = if caps.len() >= 2 { caps[1] } else { 0 };
+    release_caps(caps.get(2..).unwrap_or(&[]));
 
     // Resolve the scheduling fields before any resource acquisition. The
     // transferred caps are procmgr's to release on the reject path.
@@ -851,13 +898,17 @@ fn handle_create(
     //   - copies the cap into the child's `ProcessInfo.memmgr_endpoint_cap`
     //     so the child's std heap-bootstrap can call `REQUEST_MEMORY_CAPS`; and
     //   - sends the badge in `PROCESS_DIED` at child teardown.
+    // The guard owns the registration until the child's table entry does:
+    // on a failed create it retires memmgr's record (PROCESS_DIED, which
+    // returns every page already billed to the child) and drops the slot.
     let (memmgr_send, memmgr_badge) = register_with_memmgr(ctx.memmgr_ep, ipc_buf);
+    let mms = process::MemmgrSendGuard::new(memmgr_send, memmgr_badge, ctx.memmgr_ep, ipc_buf);
 
     let universals = process::UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,
         log_send_source: ctx.log_ep,
-        memmgr_endpoint: memmgr_send,
-        memmgr_badge,
+        memmgr_endpoint: mms.cap(),
+        memmgr_badge: mms.badge(),
         registry_send_source: ctx.registry_ep,
         sched_baseline: ctx.sched_baseline,
         demand_paged: label & procmgr_labels::CREATE_PINNED == 0,
@@ -881,13 +932,19 @@ fn handle_create(
 
     // Procmgr's parent-side copy of the badged cap stays in procmgr's
     // CSpace as long as the child is alive: it's the channel procmgr
-    // uses to call `PROCESS_DIED` at teardown. The slot is recorded in
-    // ProcessEntry.memmgr_send_cap and dropped only after PROCESS_DIED.
-    // On create failure (no entry) it must be dropped immediately to
-    // avoid leaking the slot.
-    if result.is_none() && memmgr_send != 0
+    // uses to call `PROCESS_DIED` at teardown. On success the slot is
+    // recorded in ProcessEntry.memmgr_send_cap and dropped only after
+    // PROCESS_DIED. On create failure (no entry) the guard's drop sends
+    // PROCESS_DIED and deletes the slot; create_process has already
+    // released the child's kernel objects, so memmgr reclaims pages no
+    // kernel object still uses.
+    if result.is_some()
     {
-        let _ = syscall::cap_delete(memmgr_send);
+        let _ = mms.disarm();
+    }
+    else
+    {
+        drop(mms);
     }
 
     // Module cap disposition: the module cap is a borrowed derivation of the
@@ -909,7 +966,7 @@ fn handle_create(
         Some(result) =>
         {
             log_spawn_sched(sched);
-            reply_create_result(&result, ipc_buf);
+            reply_create_result(&result, ipc_buf, ctx.memmgr_ep, table);
         }
         None =>
         {
@@ -982,7 +1039,11 @@ pub struct ProcmgrCtx
 ///
 /// Wire layout: see [`procmgr_labels::CREATE_FROM_FILE`]. The caller has
 /// already walked its own namespace cap to the binary node; procmgr never
-/// touches the namespace tree on this path.
+/// touches the namespace tree on this path. procmgr owns every transferred
+/// cap: the file cap is `FS_CLOSE`d and deleted after the load, the creator
+/// endpoint is deleted once the child holds its own copy, the relay is
+/// consumed by `finalize_creation` on success, and every other cap, and every
+/// cap of a rejected request, is deleted here.
 fn handle_create_from_file(
     req: &IpcMessage,
     ipc_buf: *mut u64,
@@ -991,33 +1052,32 @@ fn handle_create_from_file(
 )
 {
     let label = req.label;
+    let all_caps = req.caps();
 
-    let caps = req.caps();
-    let file_cap = match caps.first().copied()
-    {
-        Some(c) if c != 0 => c,
-        _ =>
-        {
-            reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
-            return;
-        }
-    };
     // The death-relay POST cap, when present, is the LAST cap in the message
-    // (see `CREATE_DEATH_RELAY`). Peel it off the tail first so the
-    // `creator_endpoint` slot stays positionally fixed at caps[1].
-    let parent_relay_cap = if label & procmgr_labels::CREATE_DEATH_RELAY != 0
-    {
-        caps.last().copied().unwrap_or(0)
-    }
+    // (see `CREATE_DEATH_RELAY`), peeled off the tail so the
+    // `creator_endpoint` slot stays positionally fixed at caps[1]. A relay
+    // request whose only cap is the file cap is malformed: taking that cap
+    // as the relay too would release one slot twice.
+    let Some(caps) = process::split_create_from_file_caps(
+        all_caps,
+        label & procmgr_labels::CREATE_DEATH_RELAY != 0,
+    )
     else
     {
-        0
+        match all_caps.split_first()
+        {
+            Some((&file_cap, rest)) if file_cap != 0 =>
+            {
+                process::vfs_close(file_cap, ipc_buf);
+                release_caps(rest);
+            }
+            _ => release_caps(all_caps),
+        }
+        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        return;
     };
-    let creator_ep = match caps.get(1).copied()
-    {
-        Some(c) if c != parent_relay_cap => c,
-        _ => 0,
-    };
+    release_caps(caps.extra);
 
     // Resolve the scheduling fields before any resource acquisition. The
     // transferred caps are procmgr's to release on the reject path — the
@@ -1026,15 +1086,8 @@ fn handle_create_from_file(
     let Some(sched) = resolve_create_sched(label, req.badge, table)
     else
     {
-        process::vfs_close(file_cap, ipc_buf);
-        if creator_ep != 0
-        {
-            let _ = syscall::cap_delete(creator_ep);
-        }
-        if parent_relay_cap != 0
-        {
-            let _ = syscall::cap_delete(parent_relay_cap);
-        }
+        process::vfs_close(caps.file, ipc_buf);
+        release_caps(&[caps.creator, caps.relay]);
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };
@@ -1045,35 +1098,37 @@ fn handle_create_from_file(
 
     let result = process::create_process_from_file(
         ctx,
-        file_cap,
+        caps.file,
         file_size,
         table,
         ipc_buf,
-        creator_ep,
+        caps.creator,
         &blobs.args(),
         &blobs.env(),
         ctx.death_eq,
         label & procmgr_labels::CREATE_PINNED == 0,
-        parent_relay_cap,
+        caps.relay,
         sched,
     );
+
+    // The child holds its own copy of the creator endpoint (populate_child_info
+    // cap_copies it), so procmgr's slot is released on both arms, as
+    // handle_create does.
+    release_caps(&[caps.creator]);
 
     match result
     {
         Ok(result) =>
         {
             log_spawn_sched(sched);
-            reply_create_result(&result, ipc_buf);
+            reply_create_result(&result, ipc_buf, ctx.memmgr_ep, table);
         }
         Err(code) =>
         {
-            // The relay cap is consumed (bound + deleted) only on the
-            // success path inside `finalize_creation`; drop procmgr's copy
-            // here on any earlier failure so it does not leak.
-            if parent_relay_cap != 0
-            {
-                let _ = syscall::cap_delete(parent_relay_cap);
-            }
+            // `finalize_creation` consumes (binds + deletes) the relay cap
+            // only once the child's table entry exists, which every error
+            // return precedes; drop procmgr's copy here.
+            release_caps(&[caps.relay]);
             reply_empty(ipc_buf, code);
         }
     }

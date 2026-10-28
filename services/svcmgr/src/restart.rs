@@ -9,8 +9,9 @@
 //! policy + budget; `system_critical` decides only what happens once the
 //! service is permanently down (continue, or graceful shutdown). On restart
 //! svcmgr re-creates the process via procmgr, replays the recipe's
-//! argv/env/cwd/seed surfaces, serves its bootstrap, and rebinds death
-//! notification.
+//! argv/env/cwd/seed surfaces, its scheduling fields (`priority`,
+//! `sched_max`), and its log-sink flag, serves its bootstrap, and rebinds
+//! death notification.
 //!
 //! Bootstrap delivery re-resolves the recipe's `seed` caps (the log-sink
 //! service instead gets a round minted from the reserved log-sink sources).
@@ -37,7 +38,7 @@ pub enum DeathOutcome
     /// Service is marked inactive; system continues degraded.
     Degraded,
     /// Service was `system_critical` and svcmgr cannot recover it
-    /// (either `restart = never` or the restart budget is exhausted).
+    /// (restart not attempted, budget exhausted, or restart failed).
     /// Caller must initiate `pwrmgr_labels::SHUTDOWN`.
     Unrecoverable,
 }
@@ -95,6 +96,10 @@ pub struct StartupBlobs<'a>
 /// keeps an oversize blob from reaching the message builder's bound
 /// assertion. Every `None` arm releases the file and badged-creator caps it
 /// still holds, and the short-reply arm destroys the child procmgr created.
+/// An error reply carries no handle to destroy and needs none: when procmgr
+/// created the child but the reply's cap transfer into svcmgr's `CSpace`
+/// failed, svcmgr receives `IPC_REPLY_TRANSFER_FAILED` with zero caps, and
+/// procmgr destroys the child it could not hand over.
 /// Caller is responsible for `CONFIGURE_NAMESPACE`, bootstrap delivery, and
 /// `START_PROCESS`.
 ///
@@ -365,7 +370,7 @@ fn should_restart(svc: &ServiceEntry, exit_reason: u64) -> bool
 
     if svc.restart_count >= MAX_RESTARTS
     {
-        std::os::seraph::log!("max restarts reached, marking degraded");
+        std::os::seraph::log!("max restarts reached");
         return false;
     }
 
@@ -581,9 +586,11 @@ fn create_process(
 }
 
 /// Apply the namespace policy recorded on `svc` to a freshly-created
-/// (suspended) child. Shared by the restart path and the post-handover
-/// launch path: both walk svcmgr's own `root_dir_cap` (universal after
-/// init's Phase-3 handover) to derive the child's namespace cap.
+/// (suspended) child. Restart's namespace resolver: it walks svcmgr's own
+/// `root_dir_cap` (universal after init's Phase-3 handover) to derive the
+/// child's namespace cap and feeds it to [`configure_namespace_caps`],
+/// which first launch reaches through `definitions::launch`'s own
+/// `configure_namespace`.
 ///
 /// * `NS_POLICY_NONE` → skip `CONFIGURE_NAMESPACE`; the child's
 ///   `system_root_cap` stays zero (`Unsupported` on absolute-path

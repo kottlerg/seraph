@@ -58,6 +58,8 @@ const CHILD_CPU: u32 = 1;
 /// Bound on each wait for the child, in microseconds: for it to progress
 /// before a stop, and to record a redirect after a restart. Either takes at
 /// most a cross-CPU dispatch; a wait that outlasts the bound fails the test.
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs, where that dispatch waits for a host core.
 const WAIT_US: u64 = 1_000_000;
 
 /// Polls a bounded wait spins busily before it polls in 1 ms sleeps.
@@ -210,12 +212,12 @@ fn in_spin_code(ip: u64) -> bool
     .any(|start| (start..start.saturating_add(SPIN_CODE_BYTES)).contains(&ip))
 }
 
-/// Wait, for at most [`WAIT_US`], until `done` holds; fail with `stalled` if
+/// Wait, for at most the scaled [`WAIT_US`], until `done` holds; fail with `stalled` if
 /// it does not, or with the child's death if the child has exited (it never
 /// exits on its own, so an exit is a kill).
 fn await_child(child: &SpawnedChild, done: impl Fn() -> bool, stalled: &'static str) -> TestResult
 {
-    if await_within(WAIT_US, done)?
+    if await_within(crate::scaled_bound(WAIT_US), done)?
     {
         return Ok(());
     }

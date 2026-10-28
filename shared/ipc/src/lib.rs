@@ -1450,7 +1450,9 @@ pub mod devmgr_labels
     /// table at `table_phys - region_base`. devmgr reads only the
     /// directory (RSDP/XSDT) and table headers (signatures) to locate the
     /// table — never a table body. Replies
-    /// [`super::devmgr_errors::NO_DEVICE`] when the table is not found.
+    /// [`super::devmgr_errors::NO_DEVICE`] when the table is not found,
+    /// both `data[1]` and `data[2]` are zero, or `data[1]` has bits above
+    /// its low 32.
     pub const QUERY_ACPI_TABLE: u64 = 7;
 
     /// Carve and serve the platform shutdown-actuator hardware caps.

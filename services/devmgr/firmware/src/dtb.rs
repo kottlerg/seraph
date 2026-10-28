@@ -132,10 +132,10 @@ impl<'a> Fdt<'a>
     /// that range. An ECAM node more than 16 levels deep (the root node is
     /// level 1) is skipped. Returns `None` when no such node exists within
     /// that depth, the structure block closes more nodes than it has opened
-    /// before the ECAM node is reached, the
-    /// node's parent's cell sizes are unsupported, its `reg` is missing,
-    /// short, or zero, it covers less than one bus, or its `bus-range` is
-    /// short, inverted, or starts above bus 255.
+    /// before the ECAM node is reached, the node's parent's cell sizes are
+    /// unsupported, its `reg` is missing, short, or zero, it covers less
+    /// than one bus, or its `bus-range` is short, inverted, or starts above
+    /// bus 255.
     #[must_use]
     pub fn find_pci_ecam(&self) -> Option<EcamLocation>
     {

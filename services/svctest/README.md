@@ -64,11 +64,12 @@ the envelope `phase=<name> starting` / `phase=<name> passed`. After the last pha
 or an IPC error, is logged and svctest exits, leaving the system idle.
 
 A failing phase panics through the std panic handler; svctest then never logs
-`ALL TESTS PASSED` and never requests shutdown. The `ns` phase (`caps[0]`), the pwrmgr
-cap-deny phase (the queried `pwrmgr.deny` cap), and the pwrmgr shutdown phase (`caps[1]`) log
-the skip and return when their cap is zero; the devmgr deny phases (`caps[2]`), the
-orphan-teardown phase (`caps[3]`), and the svcmgr seed-only phase (every seed, plus the public
-`svcmgr` and `pwrmgr.deny` names it resolves) instead fail their assertions.
+`ALL TESTS PASSED` and never requests shutdown. The `ns` phase (`caps[0]`) and the pwrmgr
+cap-deny phase (the queried `pwrmgr.deny` cap) log the skip and return when their cap is zero;
+the devmgr deny phases (`caps[2]`), the orphan-teardown phase (`caps[3]`), and the svcmgr
+seed-only phase (every seed, plus the public `svcmgr` and `pwrmgr.deny` names it resolves)
+instead fail their assertions. The seed-only phase thus fails the run on a zero `caps[1]` before
+the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not reached.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, and env
 carries `SERAPH_TEST=1` and `SERAPH_MODE=boot`.

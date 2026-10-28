@@ -207,8 +207,8 @@ than 4 seeds, or more than 3 for a `provides` service, is a parser error.
 
 An unresolved name leaves slot `i` as `0`. Consumers that tolerate `cap == 0 → skip` continue to
 work; consumers that don't fail on first use, which is the right surface for a real
-misconfiguration. svctest does both: its `ns` and pwrmgr shutdown phases skip on a zero cap, and
-its svcmgr seed-only phase fails the run on any unresolved seed (per
+misconfiguration. svctest does both: its `ns` phase skips on a zero cap, and its svcmgr seed-only
+phase fails the run on any unresolved seed (per
 [services/svctest/README.md § Run Sequence](../../svctest/README.md#run-sequence)).
 
 Well-known names are centralised in

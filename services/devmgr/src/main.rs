@@ -1007,19 +1007,18 @@ fn locate_table_by_sig(caps: &caps::DevmgrCaps, sig: [u8; 4]) -> Option<u64>
 }
 
 /// Resolve an ACPI-table request to `(region, table_phys)`, per the
-/// `QUERY_ACPI_TABLE` contract: a non-zero signature in `sig_word`'s low
-/// 32 bits is found via the XSDT; a zero signature looks `phys` up directly
-/// (e.g. the DSDT, whose address the caller read from the FADT). Returns
-/// `None` when both are zero or the table is not found.
+/// `QUERY_ACPI_TABLE` contract: a zero `sig_word` looks `phys` up directly
+/// (e.g. the DSDT, whose address the caller read from the FADT); otherwise
+/// `sig_word` is a 4-byte signature found via the XSDT. Returns `None` when
+/// both are zero, `sig_word` has bits above its low 32, or the table is not
+/// found.
 fn locate_acpi_table(
     caps: &caps::DevmgrCaps,
     sig_word: u64,
     phys: u64,
 ) -> Option<(caps::AcpiRegion, u64)>
 {
-    let [s0, s1, s2, s3, ..] = sig_word.to_le_bytes();
-    let sig = [s0, s1, s2, s3];
-    let table_phys = if sig == [0; 4]
+    let table_phys = if sig_word == 0
     {
         if phys == 0
         {
@@ -1029,6 +1028,7 @@ fn locate_acpi_table(
     }
     else
     {
+        let sig = u32::try_from(sig_word).ok()?.to_le_bytes();
         locate_table_by_sig(caps, sig)?
     };
     let (region, _off) = find_region_for(caps, table_phys)?;

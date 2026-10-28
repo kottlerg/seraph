@@ -15,7 +15,7 @@
 
 use crate::pin::Pin;
 use crate::sync::atomic::AtomicU32;
-use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
 use crate::time::Duration;
 
 const EMPTY: u32 = 0;
@@ -42,16 +42,16 @@ impl Parker {
         if self.state.swap(EMPTY, Acquire) == NOTIFIED {
             return;
         }
+        // Allocate before publishing PARKED, so an `unpark` that sees PARKED
+        // finds the cap to send on.
         let sig = ensure_notification(&self.notification);
+        // Only this thread sets PARKED and only `unpark` sets NOTIFIED, so
+        // the state is EMPTY or NOTIFIED here.
+        if self.state.compare_exchange(EMPTY, PARKED, AcqRel, Acquire).is_err() {
+            self.state.store(EMPTY, Relaxed);
+            return;
+        }
         loop {
-            match self.state.compare_exchange(EMPTY, PARKED, AcqRel, Acquire) {
-                Ok(_) => {}
-                Err(NOTIFIED) => {
-                    let _ = self.state.compare_exchange(NOTIFIED, EMPTY, Acquire, Relaxed);
-                    return;
-                }
-                Err(_) => continue,
-            }
             if sig != 0 {
                 let _ = syscall::notification_wait(sig);
             } else {
@@ -60,7 +60,9 @@ impl Parker {
             if self.state.compare_exchange(NOTIFIED, EMPTY, Acquire, Relaxed).is_ok() {
                 return;
             }
-            // Spurious; loop around.
+            // Still PARKED: a spurious return, such as a bit an earlier
+            // `park_timeout` left pending, which this wait consumed. Wait
+            // again; PARKED stays published.
         }
     }
 
@@ -70,9 +72,14 @@ impl Parker {
         if self.state.swap(EMPTY, Acquire) == NOTIFIED {
             return;
         }
-        // Publish PARKED so a concurrent `unpark` sees we want the notification.
-        let _ = self.state.compare_exchange(EMPTY, PARKED, AcqRel, Acquire);
+        // Allocate before publishing PARKED, as `park` does.
         let sig = ensure_notification(&self.notification);
+        // An `unpark` that lands before PARKED is published leaves NOTIFIED:
+        // consume it and return at once rather than wait out `dur`.
+        if self.state.compare_exchange(EMPTY, PARKED, AcqRel, Acquire).is_err() {
+            self.state.store(EMPTY, Relaxed);
+            return;
+        }
         // Round the Duration to millisecond resolution. Guard against the
         // `timeout_ms == 0` special case: the syscall treats 0 as "block
         // indefinitely", which is the opposite of what `Duration::ZERO`
@@ -95,8 +102,10 @@ impl Parker {
 
     #[inline]
     pub fn unpark(self: Pin<&Self>) {
-        if self.state.swap(NOTIFIED, Release) == PARKED {
-            let sig = self.notification.load(Relaxed);
+        // Acquire pairs with the parker's PARKED publication, which follows
+        // its notification-cap store, so the load below sees the cap.
+        if self.state.swap(NOTIFIED, AcqRel) == PARKED {
+            let sig = self.notification.load(Acquire);
             if sig != 0 {
                 let _ = syscall::notification_send(sig, 1);
             }

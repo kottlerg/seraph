@@ -2025,7 +2025,10 @@ pub fn sbi_call(
 /// Sleep the calling thread for `ms` milliseconds.
 ///
 /// The thread is blocked and woken by the kernel's timer tick handler when
-/// the deadline expires.
+/// the deadline expires. A wake that coalesced before the sleep refuses the
+/// park, and the call returns `Ok` at once without sleeping, so a caller that
+/// needs the full duration re-checks elapsed time (core/kernel/docs/syscalls.md
+/// § `SYS_THREAD_SLEEP`).
 ///
 /// # Errors
 /// Returns `-16` (`Interrupted`) if the thread is stopped before or during

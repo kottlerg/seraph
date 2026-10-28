@@ -100,6 +100,12 @@ reap. Only firmware-table Memory caps (ACPI regions, RSDP, DTB)
 mint without `Retype` — mappable references to fixed-purpose memory that
 cannot be consumed for kernel-object creation.
 
+Revoking a Memory capability invalidates its descendants but does not unmap the
+pages they mapped: a mapping established through a revoked descendant stays in
+place until its address space unmaps it or is torn down, so a server that hands
+out a page and later revokes it cannot rely on the revoke to withdraw the
+client's access (#516).
+
 Init transfers RAM Memory caps (via the
 [derive-twice pattern](../core/kernel/docs/capability-internals.md#safe-delegation-the-derive-twice-pattern))
 to memmgr, which
@@ -508,10 +514,11 @@ slot itself is preserved — the revoker keeps its own capability and only withd
 delegated authority.
 
 After revocation, any process that held a derived capability can no longer use it
-(an established MMIO mapping or IoPort binding outlives it; see [Mmio](#mmio) and
-[IoPort](#ioport-x86-64-only)). The target's kernel object is not destroyed, because the
-preserved target slot still references it. A descendant that references a distinct
-object, such as a range-split child, frees that object when its last reference goes.
+(an established Memory mapping, MMIO mapping, or IoPort binding outlives it; see
+[Memory](#memory), [Mmio](#mmio), and [IoPort](#ioport-x86-64-only)). The target's
+kernel object is not destroyed, because the preserved target slot still references it.
+A descendant that references a distinct object, such as a range-split child, frees that
+object when its last reference goes.
 
 A descendant delivered to another CSpace — by **IPC transfer**, `SYS_CAP_MOVE`, or
 `SYS_CAP_COPY` — keeps its position in the derivation tree (see

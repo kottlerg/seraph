@@ -835,7 +835,11 @@ Revoke all capabilities derived from a capability, across all processes.
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 Every descendant in the derivation tree is invalidated; the target capability
-itself is preserved. Underlying kernel objects are not freed unless a revoked
+itself is preserved. Mappings established through a revoked Memory or Mmio
+descendant, and IoPort bindings made through a revoked IoPort descendant, are not
+withdrawn (see
+[capability-model.md](../../../docs/capability-model.md) § Revocation; #516,
+#457). Underlying kernel objects are not freed unless a revoked
 capability was the last reference (see
 [capability-model.md](../../../docs/capability-model.md) § Revocation); such a teardown can fail
 to complete as `SYS_CAP_DELETE` describes for a thread left on a halted CPU. While the
@@ -1608,7 +1612,11 @@ Block the calling thread for a bounded duration. The timer wakes it at the deadl
 |---|---|---|
 | 0 | `ms` | Sleep duration in milliseconds; `0` returns immediately |
 
-**Return:** `rax`/`a0`: 0 on wake; `SyscallError` on failure.
+**Return:** `rax`/`a0`: 0 on wake, and also 0 at once, without sleeping, when a
+pending coalesced wake refuses the park (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_sleep` and the
+Plain-Sleep Path), so a caller that needs the full duration re-checks elapsed time;
+`SyscallError` on failure.
 
 No capability is required — this syscall acts on the calling thread implicitly.
 

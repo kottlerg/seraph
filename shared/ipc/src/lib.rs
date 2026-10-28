@@ -455,13 +455,15 @@ pub mod memmgr_labels
     /// * `data[0]` high 32 bits — `flags: u32` (see flag constants below).
     ///
     /// Reply (success): `data[0]` = `returned_cap_count: u32`;
-    /// `data[1+i]` = `page_count_for_cap_i: u32`; `caps[0..count]` = Memory
-    /// capabilities (MAP|WRITE rights). `sum(page_count_for_cap_i) ==
-    /// want_pages` for both contiguous and best-effort replies. Each reply
-    /// cap MUST additionally carry `MemRights::RETYPE` so the caller can
-    /// retype the memory into kernel objects via the `SYS_CAP_CREATE_*`
-    /// syscalls; memmgr derives reply caps with `RIGHTS_ALL`, which
-    /// preserves the RETYPE bit stamped at boot by the kernel.
+    /// `data[1+i]` = `page_count_for_cap_i: u32`; `data[1+count+i]` =
+    /// `phys_base_for_cap_i: u64`; `caps[0..count]` = Memory capabilities
+    /// (MAP|WRITE rights); [`super::memmgr_grant_layout`] checks the shape.
+    /// `sum(page_count_for_cap_i) == want_pages` for both contiguous and
+    /// best-effort replies. Each reply cap MUST additionally carry
+    /// `MemRights::RETYPE` so the caller can retype the memory into kernel
+    /// objects via the `SYS_CAP_CREATE_*` syscalls; memmgr derives reply caps
+    /// with `RIGHTS_ALL`, which preserves the RETYPE bit stamped at boot by
+    /// the kernel.
     pub const REQUEST_MEMORY_CAPS: u64 = 1;
     /// Voluntarily return previously-granted Memory caps to the pool
     /// mid-life. Callable from any badged cap. The caller names each region
@@ -613,6 +615,34 @@ pub mod memmgr_labels
     /// `memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS`. Bit position 0 within
     /// the flags half of `data[0]`.
     pub const REQUIRE_CONTIGUOUS: u32 = 1 << 0;
+}
+
+/// Split a `memmgr_labels::REQUEST_MEMORY_CAPS` success reply into its page
+/// counts and phys bases, one of each per transferred cap: `data[1 + i]` and
+/// `data[1 + count + i]` for `i` below the declared `count` in `data[0]`
+/// (services/memmgr/docs/ipc-interface.md § Label 1).
+///
+/// The reply is wire input, so nothing is indexed until it passes these
+/// checks. Returns `None` for an error label, a reply with no data words, a
+/// declared count of zero or other than the number of caps transferred, or
+/// data words too few to cover the declared count; the phys words of such a
+/// reply sit at an offset its count does not establish, so no base is read.
+#[must_use]
+pub fn memmgr_grant_layout(reply: &IpcMessage) -> Option<(&[u64], &[u64])>
+{
+    let words = reply.words();
+    let count = reply.caps().len();
+    let declared = *words.first()?;
+    // `count` is bounded by `MSG_CAP_SLOTS_MAX`, so `1 + 2 * count` cannot
+    // overflow.
+    if reply.label != memmgr_errors::SUCCESS
+        || count == 0
+        || declared != count as u64
+        || words.len() < 1 + 2 * count
+    {
+        return None;
+    }
+    Some((&words[1..=count], &words[(1 + count)..=(2 * count)]))
 }
 
 /// Error replies from memmgr.
@@ -1213,7 +1243,8 @@ pub mod fs_labels
     /// so its eviction worker can route cooperative `FS_RELEASE_MEMORY`
     /// back to the client. Subsequent `FS_READ_MEMORY`s for the same
     /// pair carry no caps. Clients that opt out of cooperative release
-    /// omit the cap on every call; eviction falls back to hard-revoke.
+    /// omit the cap on every call; eviction then revokes without the
+    /// cooperative round-trip.
     /// Reply: `data[0]` = bytes valid in the returned page starting at
     /// the indicated page offset, `data[1]` = the same release cookie
     /// echoed back, `data[2]` = byte offset within the returned page
@@ -1232,8 +1263,11 @@ pub mod fs_labels
     /// cap recorded in the node's open-file slot, taken from `caps[0]` of
     /// the [`FS_READ_MEMORY`] that allocated the slot (shared per node, not
     /// per client; tracked in #447); `data[0]` = the release cookie naming
-    /// the Memory cap to unmap. The client unmaps it and replies [`FS_RELEASE_ACK`];
-    /// without an ack inside the watchdog window the driver hard-revokes.
+    /// the Memory cap to unmap. The client unmaps it and replies
+    /// [`FS_RELEASE_ACK`], first letting a local copy from the page finish
+    /// within the watchdog window; any other reply label is no ack (the std
+    /// client sends `fs_errors::IO_ERROR`). After the reply, or the window
+    /// with none, the driver revokes the page's parent Memory cap.
     ///
     /// Client-to-driver (synchronous release after a read): sent on the
     /// per-node badged cap the page was read through; `data[0]` = the
@@ -1612,7 +1646,7 @@ pub mod blk_labels
     ///
     /// Request: `data[0]` = starting LBA, `data[1]` = sector count
     /// (`>= 1`; defaults to `1` if `data[1]` is absent). Caps: `caps[0]` =
-    /// source Memory cap (`MAP|READ`; the driver reads `count * 512` bytes
+    /// source Memory cap (`MAP` rights; the driver reads `count * 512` bytes
     /// starting at offset 0 of the page, packed contiguously). The page
     /// must be at least `count * 512` bytes; the driver rejects with
     /// `INVALID_MEMORY_CAP` otherwise. `caps[1]` is reserved for a future
@@ -2263,7 +2297,7 @@ pub mod blk_errors
     pub const REGISTER_REJECTED: u64 = 4;
     /// Memory cap rejected: `BLK_READ_INTO_MEMORY` target missing
     /// `MAP|WRITE` rights, `BLK_WRITE_FROM_MEMORY` source missing
-    /// `MAP|READ` rights, smaller than `count * 512` bytes, or absent;
+    /// `MAP` rights, smaller than `count * 512` bytes, or absent;
     /// also returned when `count` is 0 or `count * 512` exceeds `u32::MAX`.
     /// virtio-blk does not yet check the `count * 512` multiply for
     /// overflow: a `count` of 2^55 or more panics the driver under the dev
@@ -2779,6 +2813,66 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 mod tests
 {
     use super::*;
+
+    /// A `REQUEST_MEMORY_CAPS` reply with `label`, data `words`, and one
+    /// transferred cap per entry of `caps`.
+    fn grant_reply(label: u64, words: &[u64], caps: &[u32]) -> IpcMessage
+    {
+        let mut b = IpcMessage::builder(label).words(0, words);
+        for &c in caps
+        {
+            b = b.cap(c);
+        }
+        b.build()
+    }
+
+    #[test]
+    fn grant_layout_splits_page_counts_and_bases_per_cap()
+    {
+        let reply = grant_reply(0, &[2, 3, 5, 0x1000, 0x8000], &[11, 12]);
+        let (pages, bases) = memmgr_grant_layout(&reply).expect("well-formed reply");
+        assert_eq!(pages, &[3, 5]);
+        assert_eq!(bases, &[0x1000, 0x8000]);
+    }
+
+    #[test]
+    fn grant_layout_refuses_an_error_label()
+    {
+        let reply = grant_reply(
+            memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS,
+            &[1, 1, 0x1000],
+            &[11],
+        );
+        assert_eq!(memmgr_grant_layout(&reply), None);
+    }
+
+    #[test]
+    fn grant_layout_refuses_a_reply_without_data_words()
+    {
+        assert_eq!(memmgr_grant_layout(&grant_reply(0, &[], &[11])), None);
+    }
+
+    #[test]
+    fn grant_layout_refuses_a_zero_count()
+    {
+        assert_eq!(memmgr_grant_layout(&grant_reply(0, &[0], &[])), None);
+    }
+
+    #[test]
+    fn grant_layout_refuses_a_count_other_than_the_caps_transferred()
+    {
+        // Declaring more caps than arrived would put the phys words at an
+        // offset the transferred count does not establish.
+        let reply = grant_reply(0, &[2, 1, 1, 0x1000, 0x2000], &[11]);
+        assert_eq!(memmgr_grant_layout(&reply), None);
+    }
+
+    #[test]
+    fn grant_layout_refuses_words_too_few_for_the_count()
+    {
+        let reply = grant_reply(0, &[2, 1, 1, 0x1000], &[11, 12]);
+        assert_eq!(memmgr_grant_layout(&reply), None);
+    }
 
     #[test]
     fn packed_bytes_round_trip_through_data_bytes_with_zero_padding()

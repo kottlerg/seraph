@@ -19,11 +19,14 @@
 //! hold caps to all three objects (the same memory cap and both notifications
 //! are mapped/copied into both processes' CSpaces); read/write logic drives
 //! the appropriate notification direction. EOF/BrokenPipe is notified via
-//! the header's `closed` flag, set on Drop with one final notification kick
-//! so the surviving peer wakes and observes the flag. A reader returns EOF
+//! the header's `closed` flag, set by `Pipe::close` (which `Drop` and
+//! stdio's exit-path `close_all` run) with one final notification kick so
+//! the surviving peer wakes and observes the flag. A reader returns EOF
 //! only after a drain performed AFTER observing `closed` (or the bridge's
 //! `peer_dead`) comes back empty — the flags are Release-stored after the
-//! writer's last ring write, so flag-then-drain ordering cannot lose bytes.
+//! closing thread's last ring write, so flag-then-drain ordering cannot
+//! lose those bytes; bytes another thread writes after a concurrent close
+//! may go unseen.
 //!
 //! `pipe()` itself returns `Unsupported`: the symmetric upstream
 //! constructor doesn't fit our two-process model. `Command::spawn` and
@@ -77,12 +80,15 @@ const RING_RELEASED: u8 = 4;
 ///
 /// Returning the page is safe only once neither side can write through
 /// it: the parent end must be dropped (unmapped, caps deleted) AND the
-/// child must be dead (its threads are stopped by death-post time; the
-/// child's mapping may outlive that until procmgr's teardown, which
-/// memmgr's release contract tolerates) or never wired. `Pipe::Drop`
-/// and the spawn's death-bridge thread each report their side's
-/// completion here; whichever observes the other side already done
-/// gets `true` back and sends the release.
+/// child must be torn down or never wired. A death post alone does not
+/// stop the child's other threads (docs/process-lifecycle.md § Exit
+/// reason), so the death bridge reports the death only after its
+/// `DESTROY_PROCESS` has returned, by which point procmgr has revoked the
+/// child's address space. `Pipe::Drop` and the death bridge each report
+/// their side's completion here; whichever observes the other side
+/// already done gets `true` back and sends the release. A parent end
+/// whose ring unmap fails never reports, so its grant stays accounted to
+/// the spawner until exit.
 pub struct RingRelease {
     phys: u64,
     state: AtomicU8,
@@ -173,7 +179,8 @@ pub struct PipeCaps {
 /// Read and write operations are non-blocking on partial progress and
 /// block (via `notification_wait`) only when the ring is empty (reader) or
 /// full (writer). EOF / BrokenPipe is observed via the ring header's
-/// `closed` flag, set by the peer's `Drop`, OR via the parent-side
+/// `closed` flag, set by the peer's `Pipe::close` (run by its `Drop` or by
+/// stdio's exit-path `close_all`), OR via the parent-side
 /// `peer_dead` flag set by the spawner's death-bridge thread on every
 /// child death (clean exit or fault). Readers drain the ring once more
 /// after observing either flag before reporting EOF.
@@ -194,7 +201,7 @@ pub struct Pipe {
     /// parent-side ends not yet attached to a spawn (the bridge sets
     /// it after the child is constructed). The bridge flips it on
     /// every child death — clean exit included — covering the case
-    /// where the peer never ran `Pipe::Drop` to mark the ring closed.
+    /// where the peer never ran `Pipe::close` to mark the ring closed.
     /// `read` treats it exactly like `closed`: EOF only once a drain
     /// performed after observing the flag comes back empty. `write`
     /// returns `BrokenPipe` on observing it.
@@ -310,10 +317,7 @@ impl Pipe {
         {
             Ok(s) => s,
             Err(e) => {
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
-                let _ = syscall::cap_delete(memory_cap);
-                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                unreserve_pages(reserved);
+                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
                 return Err(e);
             }
         };
@@ -325,10 +329,7 @@ impl Pipe {
             Ok(s) => s,
             Err(e) => {
                 let _ = syscall::cap_delete(data_notification);
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
-                let _ = syscall::cap_delete(memory_cap);
-                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                unreserve_pages(reserved);
+                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
                 return Err(e);
             }
         };
@@ -343,10 +344,7 @@ impl Pipe {
             Err(_) => {
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
-                let _ = syscall::cap_delete(memory_cap);
-                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                unreserve_pages(reserved);
+                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (memory handoff) failed",
                 ));
@@ -358,10 +356,7 @@ impl Pipe {
                 let _ = syscall::cap_delete(memory_handoff);
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
-                let _ = syscall::cap_delete(memory_cap);
-                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                unreserve_pages(reserved);
+                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (data handoff) failed",
                 ));
@@ -374,10 +369,7 @@ impl Pipe {
                 let _ = syscall::cap_delete(memory_handoff);
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
-                let _ = syscall::mem_unmap(aspace, parent_va, 1);
-                let _ = syscall::cap_delete(memory_cap);
-                crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
-                unreserve_pages(reserved);
+                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (space handoff) failed",
                 ));
@@ -458,8 +450,8 @@ impl Pipe {
         })
     }
 
-    /// Spawn-failure path: the child is being destroyed without ever
-    /// having run, but the release was already armed for the bridge,
+    /// Spawn-failure path: the child never ran, or its `DESTROY_PROCESS`
+    /// has returned, but the release was already armed for the bridge,
     /// which will exit via the drop sentinel without reporting a death.
     /// Report the peer dead here instead so this end's eventual `Drop`
     /// returns the ring grant.
@@ -511,12 +503,15 @@ impl Pipe {
         }
         loop {
             // Order matters: observe the EOF flags BEFORE draining the ring.
-            // Each flag is Release-stored after the writer's last ring write
-            // (`closed`: peer `Drop`; `peer_dead`: child death -> kernel
-            // death post -> bridge), so an empty drain performed after
-            // observing a set flag proves the ring is final-empty. The
-            // reverse order loses bytes the peer writes between the drain
-            // and the flag load.
+            // Each flag is Release-stored after the closing thread's last ring
+            // write (`closed`: the peer's `Pipe::close`, run by its `Drop` or
+            // stdio's `close_all`; `peer_dead`: child death -> kernel death
+            // post -> bridge), so a drain performed after observing a set
+            // flag sees every byte the closing thread wrote before the flag,
+            // and an empty one means none remain. The reverse
+            // order loses bytes the peer writes between the drain and the
+            // flag load. Bytes another thread writes after a concurrent
+            // close may go unseen (module doc).
             let eof = self.header().is_closed() || self.peer_dead();
             let mut reader = self.reader();
             let n = reader.read(buf);
@@ -652,20 +647,13 @@ impl Pipe {
         true
     }
 
-    /// Diverging stub for upstream conversions that go through `From<Pipe>
-    /// for Stdio` on platforms where the type is uninhabited. Our `Pipe`
-    /// is inhabited; this branch is unreachable in practice — keep it
-    /// loud so any code path that does land here is obvious in the log.
-    pub fn diverge(&self) -> ! {
-        panic!("seraph pipe: diverge called on inhabited Pipe");
-    }
-}
-
-impl Drop for Pipe {
-    fn drop(&mut self) {
-        // Closer protocol: mark the ring closed, then send one final
-        // notification kick on the *opposite-direction* notification so the peer
-        // wakes from any blocking notification_wait and observes the flag.
+    /// Closer protocol: mark the ring closed, then send one final
+    /// notification kick on the *opposite-direction* notification so the
+    /// peer wakes from any blocking notification_wait and observes the flag.
+    /// Leaves the ring mapped and the caps held, so it is safe while other
+    /// threads still use this end; a later read or write on this end sees
+    /// the closed flag. Idempotent. `Drop` runs it before tearing down.
+    pub fn close(&self) {
         self.header().mark_closed();
         match self.role {
             Role::Reader =>
@@ -679,8 +667,22 @@ impl Drop for Pipe {
                 let _ = syscall::notification_send(self.data_notification, 1);
             }
         }
+    }
+
+    /// Diverging stub for upstream conversions that go through `From<Pipe>
+    /// for Stdio` on platforms where the type is uninhabited. Our `Pipe`
+    /// is inhabited; this branch is unreachable in practice — keep it
+    /// loud so any code path that does land here is obvious in the log.
+    pub fn diverge(&self) -> ! {
+        panic!("seraph pipe: diverge called on inhabited Pipe");
+    }
+}
+
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        self.close();
         // Unmap the ring page from this process's aspace.
-        let _ = syscall::mem_unmap(self.aspace, self.ring_vaddr, 1);
+        let unmapped = syscall::mem_unmap(self.aspace, self.ring_vaddr, 1).is_ok();
         // Release this side's cap slots. The peer's Drop releases its
         // own copies; the underlying kernel objects free when refcount
         // hits zero.
@@ -693,6 +695,12 @@ impl Drop for Pipe {
         if self.space_notification != 0 {
             let _ = syscall::cap_delete(self.space_notification);
         }
+        // A ring page still mapped here must stay out of memmgr's pool and
+        // its VA out of the reservation arena: both stay held until this
+        // process exits.
+        if !unmapped {
+            return;
+        }
         if let Some(reserved) = self.reserved_va.take() {
             unreserve_pages(reserved);
         }
@@ -704,6 +712,19 @@ impl Drop for Pipe {
                 crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
             }
         }
+    }
+}
+
+/// Error-path teardown of a parent ring page mapped at `reserved` in
+/// `aspace`. The page returns to memmgr and its VA to the arena only once
+/// the unmap succeeds; a page still mapped stays held, with its VA, until
+/// this process exits, as in `Pipe::drop`.
+fn discard_mapped_ring(aspace: u32, memory_cap: u32, ring_phys: u64, reserved: ReservedRange) {
+    let unmapped = syscall::mem_unmap(aspace, reserved.va_start(), 1).is_ok();
+    let _ = syscall::cap_delete(memory_cap);
+    if unmapped {
+        crate::sys::alloc::seraph::slab_release_fresh(ring_phys);
+        unreserve_pages(reserved);
     }
 }
 

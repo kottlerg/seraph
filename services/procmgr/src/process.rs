@@ -165,11 +165,12 @@ pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
 // `procmgr-process-table` crate; the syscall/IPC-bearing operations below
 // stay in the service and drive its lookups. Re-exported so the
 // `process::{ProcessTable, ProcessEntry, RecentExits, MAX_PROCESSES}` paths
-// `main.rs` uses, and its `process::CreateBlobs::extract` call sites in the
-// two create handlers, resolve through this module.
+// `main.rs` uses, and its `process::CreateBlobs::extract` and
+// `process::split_create_from_file_caps` call sites in the create handlers,
+// resolve through this module.
 pub use process_table::{
     ChildArgs, ChildEnv, CreateBlobs, MAX_PROCESSES, ProcessEntry, ProcessTable, RecentExits,
-    badge_is_acceptable, resolve_spawn_sched,
+    badge_is_acceptable, resolve_spawn_sched, split_create_from_file_caps,
 };
 
 // ── Process table (impure operations) ─────────────────────────────────────────
@@ -217,15 +218,17 @@ impl TableExt for ProcessTable
     /// `<dir>_memory_cap` / `<dir>_data_notification_cap` /
     /// `<dir>_space_notification_cap` fields of the child's `ProcessInfo`.
     ///
-    /// Idempotent per direction before start; later calls overwrite the
-    /// previous triple for that direction. Different directions are
-    /// independent.
+    /// Each direction is configured at most once before start; different
+    /// directions are independent. Every check precedes the copies, and a
+    /// copy that fails revokes the copies already made, so a rejected call
+    /// installs nothing in the child. (procmgr has no syscall that deletes a
+    /// slot in another `CSpace`, so an installed triple cannot be replaced.)
     ///
     /// # Errors
     /// - `procmgr_errors::INVALID_BADGE` — no entry for `badge`.
     /// - `procmgr_errors::ALREADY_STARTED` — target is already running.
-    /// - `procmgr_errors::INVALID_ARGUMENT` — bad direction selector or
-    ///   any cap is zero.
+    /// - `procmgr_errors::INVALID_ARGUMENT` — bad direction selector, any
+    ///   cap is zero, or the direction is already configured.
     /// - `procmgr_errors::OUT_OF_MEMORY` — mapping / `cap_copy` failure.
     fn configure_pipe(
         &mut self,
@@ -238,6 +241,15 @@ impl TableExt for ProcessTable
     ) -> Result<(), u64>
     {
         if memory_cap == 0 || data_notification == 0 || space_notification == 0
+        {
+            return Err(procmgr_errors::INVALID_ARGUMENT);
+        }
+        if !matches!(
+            direction,
+            ipc::procmgr_labels::PIPE_DIR_STDIN
+                | ipc::procmgr_labels::PIPE_DIR_STDOUT
+                | ipc::procmgr_labels::PIPE_DIR_STDERR
+        )
         {
             return Err(procmgr_errors::INVALID_ARGUMENT);
         }
@@ -259,38 +271,41 @@ impl TableExt for ProcessTable
         // lives at offset 0 per the ABI.
         let pi = unsafe { process_abi::process_info_mut(scratch_va) };
 
-        let memory_slot = syscall::cap_copy(memory_cap, child_cspace, syscall::RIGHTS_MEM_MAP_RW)
-            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-        let data_slot = syscall::cap_copy(data_notification, child_cspace, syscall::RIGHTS_ALL)
-            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-        let space_slot = syscall::cap_copy(space_notification, child_cspace, syscall::RIGHTS_ALL)
-            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-
-        match direction
+        let fields = match direction
         {
-            ipc::procmgr_labels::PIPE_DIR_STDIN =>
-            {
-                pi.stdin_memory_cap = memory_slot;
-                pi.stdin_data_notification_cap = data_slot;
-                pi.stdin_space_notification_cap = space_slot;
-            }
-            ipc::procmgr_labels::PIPE_DIR_STDOUT =>
-            {
-                pi.stdout_memory_cap = memory_slot;
-                pi.stdout_data_notification_cap = data_slot;
-                pi.stdout_space_notification_cap = space_slot;
-            }
-            ipc::procmgr_labels::PIPE_DIR_STDERR =>
-            {
-                pi.stderr_memory_cap = memory_slot;
-                pi.stderr_data_notification_cap = data_slot;
-                pi.stderr_space_notification_cap = space_slot;
-            }
-            _ =>
-            {
-                return Err(procmgr_errors::INVALID_ARGUMENT);
-            }
+            ipc::procmgr_labels::PIPE_DIR_STDIN => (
+                &mut pi.stdin_memory_cap,
+                &mut pi.stdin_data_notification_cap,
+                &mut pi.stdin_space_notification_cap,
+            ),
+            ipc::procmgr_labels::PIPE_DIR_STDOUT => (
+                &mut pi.stdout_memory_cap,
+                &mut pi.stdout_data_notification_cap,
+                &mut pi.stdout_space_notification_cap,
+            ),
+            _ => (
+                &mut pi.stderr_memory_cap,
+                &mut pi.stderr_data_notification_cap,
+                &mut pi.stderr_space_notification_cap,
+            ),
+        };
+        if *fields.0 != 0
+        {
+            return Err(procmgr_errors::INVALID_ARGUMENT);
         }
+
+        let [memory_slot, data_slot, space_slot] = copy_all_into_child(
+            child_cspace,
+            [
+                (memory_cap, syscall::RIGHTS_MEM_MAP_RW),
+                (data_notification, syscall::RIGHTS_ALL),
+                (space_notification, syscall::RIGHTS_ALL),
+            ],
+        )
+        .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+        *fields.0 = memory_slot;
+        *fields.1 = data_slot;
+        *fields.2 = space_slot;
 
         Ok(())
     }
@@ -349,6 +364,55 @@ impl TableExt for ProcessTable
     }
 }
 
+/// Copy each `(cap, rights)` pair into `child_cspace`, all or none.
+///
+/// Each copy is made from a procmgr-side intermediate derived from the cap,
+/// so the child's copy descends from that intermediate alone. If a derive or
+/// copy fails, revoking the intermediates removes the copies already made
+/// from the child's `CSpace` (a revoke reaches descendants across the
+/// boundary, per `docs/capability-model.md` § Revocation) without touching
+/// any other descendant of the caller's caps. The intermediates are deleted
+/// either way; the child's copies outlive them.
+///
+/// Returns the child-side slots, or `None` with nothing installed.
+fn copy_all_into_child<const N: usize>(child_cspace: u32, caps: [(u32, u64); N])
+-> Option<[u32; N]>
+{
+    let mut intermediates = [0u32; N];
+    let mut slots = [0u32; N];
+    let mut complete = true;
+    for (i, &(cap, rights)) in caps.iter().enumerate()
+    {
+        let Ok(intermediate) = syscall::cap_derive(cap, rights)
+        else
+        {
+            complete = false;
+            break;
+        };
+        intermediates[i] = intermediate;
+        let Ok(slot) = syscall::cap_copy(intermediate, child_cspace, rights)
+        else
+        {
+            complete = false;
+            break;
+        };
+        slots[i] = slot;
+    }
+    for &intermediate in &intermediates
+    {
+        if intermediate == 0
+        {
+            continue;
+        }
+        if !complete
+        {
+            let _ = syscall::cap_revoke_all(intermediate);
+        }
+        let _ = syscall::cap_delete(intermediate);
+    }
+    complete.then_some(slots)
+}
+
 // ── Result type ─────────────────────────────────────────────────────────────
 
 /// Result of a successful process creation call.
@@ -358,6 +422,9 @@ pub struct CreateResult
     pub process_handle: u32,
     /// Derived Thread cap to transfer to caller (CONTROL right).
     pub thread_for_caller: u32,
+    /// The child's process badge (its table key), so a create whose reply
+    /// cannot be delivered can destroy the child.
+    pub badge: u64,
 }
 
 /// Resolved scheduling placement for a child, produced by
@@ -515,8 +582,12 @@ fn populate_child_info(
     layout: &ProcessLayout,
 ) -> Option<u32>
 {
-    let pi_memory = crate::memmgr_alloc_page(universals.memmgr_endpoint, ipc_buf)?;
-    let scratch = ScratchMapping::map(self_aspace, pi_memory, 1, syscall::MAP_WRITABLE)?;
+    // Guarded from allocation: every early `None` below deletes the slot.
+    let pi_memory = CapGuard::new(crate::memmgr_alloc_page(
+        universals.memmgr_endpoint,
+        ipc_buf,
+    )?);
+    let scratch = ScratchMapping::map(self_aspace, pi_memory.cap(), 1, syscall::MAP_WRITABLE)?;
     let scratch_va = scratch.va();
     // SAFETY: scratch_va mapped writable, one page.
     unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
@@ -560,16 +631,15 @@ fn populate_child_info(
     // `ProcessInfo`.
     let procmgr_ep_in_child = if universals.procmgr_endpoint != 0
     {
-        let badged = syscall::cap_derive_badge(
-            universals.procmgr_endpoint,
-            syscall::RIGHTS_EP_SEND_GRANT,
-            process_badge,
-        )
-        .ok()?;
-        let in_child =
-            syscall::cap_copy(badged, child_cspace, syscall::RIGHTS_EP_SEND_GRANT).ok()?;
-        let _ = syscall::cap_delete(badged);
-        in_child
+        let badged = CapGuard::new(
+            syscall::cap_derive_badge(
+                universals.procmgr_endpoint,
+                syscall::RIGHTS_EP_SEND_GRANT,
+                process_badge,
+            )
+            .ok()?,
+        );
+        syscall::cap_copy(badged.cap(), child_cspace, syscall::RIGHTS_EP_SEND_GRANT).ok()?
     }
     else
     {
@@ -586,16 +656,15 @@ fn populate_child_info(
     // self-reconciliation across the three views.
     let log_send_in_child = if universals.log_send_source != 0
     {
-        let proc_side = syscall::cap_derive_badge(
-            universals.log_send_source,
-            syscall::RIGHTS_EP_SEND,
-            process_badge,
-        )
-        .ok()?;
-        let child_side =
-            syscall::cap_copy(proc_side, child_cspace, syscall::RIGHTS_EP_SEND).ok()?;
-        let _ = syscall::cap_delete(proc_side);
-        child_side
+        let proc_side = CapGuard::new(
+            syscall::cap_derive_badge(
+                universals.log_send_source,
+                syscall::RIGHTS_EP_SEND,
+                process_badge,
+            )
+            .ok()?,
+        );
+        syscall::cap_copy(proc_side.cap(), child_cspace, syscall::RIGHTS_EP_SEND).ok()?
     }
     else
     {
@@ -610,20 +679,15 @@ fn populate_child_info(
     // `docs/capability-model.md` "verb-bit authority pattern".
     let registry_send_in_child = if universals.registry_send_source != 0
     {
-        let proc_side = syscall::cap_derive_badge(
-            universals.registry_send_source,
-            syscall::RIGHTS_EP_SEND,
-            process_badge,
-        )
-        .ok()?;
-        let Ok(child_side) = syscall::cap_copy(proc_side, child_cspace, syscall::RIGHTS_EP_SEND)
-        else
-        {
-            let _ = syscall::cap_delete(proc_side);
-            return None;
-        };
-        let _ = syscall::cap_delete(proc_side);
-        child_side
+        let proc_side = CapGuard::new(
+            syscall::cap_derive_badge(
+                universals.registry_send_source,
+                syscall::RIGHTS_EP_SEND,
+                process_badge,
+            )
+            .ok()?,
+        );
+        syscall::cap_copy(proc_side.cap(), child_cspace, syscall::RIGHTS_EP_SEND).ok()?
     }
     else
     {
@@ -652,18 +716,14 @@ fn populate_child_info(
         }
         else
         {
-            let own_copy =
-                syscall::cap_derive(universals.sched_baseline, syscall::RIGHTS_ALL).ok()?;
-            let Ok((low, high)) = syscall::sched_split(own_copy, sched.band_max + 1)
-            else
-            {
-                let _ = syscall::cap_delete(own_copy);
-                return None;
-            };
-            let child_slot = syscall::cap_copy(low, child_cspace, syscall::RIGHTS_ALL);
-            let _ = syscall::cap_delete(low);
-            let _ = syscall::cap_delete(high);
-            child_slot.ok()?
+            let own_copy = CapGuard::new(
+                syscall::cap_derive(universals.sched_baseline, syscall::RIGHTS_ALL).ok()?,
+            );
+            let (low, high) = syscall::sched_split(own_copy.cap(), sched.band_max + 1).ok()?;
+            // The split consumed `own_copy`; its two halves replace it.
+            let _ = own_copy.disarm();
+            let (low, _high) = (CapGuard::new(low), CapGuard::new(high));
+            syscall::cap_copy(low.cap(), child_cspace, syscall::RIGHTS_ALL).ok()?
         }
     }
     else
@@ -812,29 +872,31 @@ fn populate_child_info(
 
     drop(scratch);
 
-    let pi_ro = syscall::cap_derive(pi_memory, syscall::RIGHTS_MEM_MAP).ok()?;
-    syscall::mem_map(pi_ro, child_aspace, layout.process_info_va, 0, 1, 0).ok()?;
+    let pi_ro = CapGuard::new(syscall::cap_derive(pi_memory.cap(), syscall::RIGHTS_MEM_MAP).ok()?);
+    syscall::mem_map(pi_ro.cap(), child_aspace, layout.process_info_va, 0, 1, 0).ok()?;
     // pi_memory stays in procmgr's CSpace as the teardown handle (revoke
     // cascades to any descendants); the mapping doesn't need pi_ro to
-    // outlive this call.
-    let _ = syscall::cap_delete(pi_ro);
-
-    Some(pi_memory)
+    // outlive this call, so its guard deletes it on return.
+    Some(pi_memory.disarm())
 }
 
 /// Intermediate state returned by [`alloc_main_tls_memory`] — a memory cap
 /// mapped writable in procmgr's aspace at `scratch.va()` plus the layout
 /// numbers needed to populate it and to finalise the mapping into the
 /// child.
+///
+/// The memory cap is guarded: dropping the struct before
+/// [`finalize_main_tls`] succeeds unmaps the scratch view (`scratch` is
+/// declared first, so it drops first) and deletes the cap.
 struct MainTlsAlloc
 {
-    memory_cap: u32,
+    scratch: ScratchMapping,
+    memory: CapGuard,
     tls_base_offset: u64,
     tls_base_va: u64,
     /// Mapped base VA of the TLS block (the chosen `layout.tls_base`); the block
     /// is mapped here and `tls_base_va = tls_block_base + tls_base_offset`.
     tls_block_base: u64,
-    scratch: ScratchMapping,
 }
 
 impl MainTlsAlloc
@@ -872,19 +934,19 @@ fn alloc_main_tls_memory(
         return None;
     }
 
-    let tls_memory = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
-    let scratch = ScratchMapping::map(self_aspace, tls_memory, 1, syscall::MAP_WRITABLE)?;
+    let tls_memory = CapGuard::new(crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?);
+    let scratch = ScratchMapping::map(self_aspace, tls_memory.cap(), 1, syscall::MAP_WRITABLE)?;
     let scratch_va = scratch.va();
 
     // SAFETY: scratch_va is mapped writable for one page.
     unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
 
     Some(MainTlsAlloc {
-        memory_cap: tls_memory,
+        scratch,
+        memory: tls_memory,
         tls_base_offset,
         tls_base_va: layout.tls_base + tls_base_offset,
         tls_block_base: layout.tls_base,
-        scratch,
     })
 }
 
@@ -904,13 +966,13 @@ fn finalize_main_tls(alloc: MainTlsAlloc, _self_aspace: u32, child_aspace: u32) 
 
     drop(alloc.scratch);
 
-    let tls_rw = syscall::cap_derive(alloc.memory_cap, syscall::RIGHTS_MEM_MAP_RW).ok()?;
-    syscall::mem_map(tls_rw, child_aspace, alloc.tls_block_base, 0, 1, 0).ok()?;
-    // alloc.memory_cap stays as the teardown handle; tls_rw is transient.
-    let _ = syscall::cap_delete(tls_rw);
-
+    let tls_rw =
+        CapGuard::new(syscall::cap_derive(alloc.memory.cap(), syscall::RIGHTS_MEM_MAP_RW).ok()?);
+    syscall::mem_map(tls_rw.cap(), child_aspace, alloc.tls_block_base, 0, 1, 0).ok()?;
+    // The memory cap stays as the teardown handle; tls_rw is transient and
+    // its guard deletes it on return.
     Some(MainTls {
-        memory_cap: alloc.memory_cap,
+        memory_cap: alloc.memory.disarm(),
         base_va: alloc.tls_base_va,
     })
 }
@@ -987,42 +1049,25 @@ fn prepare_main_tls_from_vfs(
     {
         return Some(MainTls::default());
     }
+    if tls.filesz > PAGE_SIZE
+    {
+        return None;
+    }
     let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
     let scratch_va = alloc.scratch_va();
 
-    let mut read_pos: u64 = 0;
-    while read_pos < tls.filesz
-    {
-        let chunk = VFS_CHUNK_SIZE.min(tls.filesz - read_pos);
-        let mut buf = [0u8; VFS_CHUNK_SIZE as usize];
-        let bytes_read = vfs_read(
-            file_cap,
-            ipc_buf,
-            file_offset + read_pos,
-            chunk,
-            &mut buf[..chunk as usize],
-        )?;
-        if bytes_read == 0
-        {
-            return None;
-        }
-        let safe_len = (bytes_read as u64).min(tls.filesz - read_pos) as usize;
-        // SAFETY: scratch_va mapped writable; (read_pos + safe_len) <=
-        // tls.filesz <= PAGE_SIZE; `buf` holds `safe_len` bytes of payload.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                (scratch_va as *mut u8).add(read_pos as usize),
-                safe_len,
-            );
-        }
-        read_pos += safe_len as u64;
-    }
-
-    // SAFETY: the template region [0, filesz) was just streamed in and stays
-    // mapped writable until finalize drops the scratch mapping.
+    // SAFETY: scratch_va is mapped writable for one page and
+    // `tls.filesz <= PAGE_SIZE` was checked above; the mapping stays until
+    // finalize drops it, after the last use of `template`.
     let template =
         unsafe { core::slice::from_raw_parts_mut(scratch_va as *mut u8, tls.filesz as usize) };
+    // `vfs_read_exact` clamps every reply to the bytes it asked for, so an
+    // fs driver over-reporting `bytes_read` cannot stretch a copy past the
+    // template; a short template (end of file) fails the spawn.
+    if vfs_read_exact(file_cap, ipc_buf, file_offset, template)? != template.len()
+    {
+        return None;
+    }
     relocate(template);
     finalize_main_tls(alloc, self_aspace, child_aspace)
 }
@@ -1045,30 +1090,35 @@ fn map_child_stack_and_ipc(
     let stack_base = layout.stack_top - u64::from(stack_pages) * PAGE_SIZE;
     for i in 0..stack_pages
     {
-        let memory_cap = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
-        let rw = syscall::cap_derive(memory_cap, syscall::RIGHTS_MEM_MAP_RW).ok()?;
-        syscall::mem_map(
-            rw,
+        map_fresh_child_page(
             child_aspace,
+            child_memmgr_send,
+            ipc_buf,
             stack_base + u64::from(i) * PAGE_SIZE,
-            0,
-            1,
-            0,
-        )
-        .ok()?;
-        // Drop procmgr's transient slots; mapping owns no cap-refcount and
-        // memmgr's outer pins the memory cap until PROCESS_DIED.
-        let _ = syscall::cap_delete(rw);
-        let _ = syscall::cap_delete(memory_cap);
+        )?;
     }
+    map_fresh_child_page(
+        child_aspace,
+        child_memmgr_send,
+        ipc_buf,
+        layout.ipc_buffer_va,
+    )
+}
 
-    let ipc_memory = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
-    let ipc_rw = syscall::cap_derive(ipc_memory, syscall::RIGHTS_MEM_MAP_RW).ok()?;
-    syscall::mem_map(ipc_rw, child_aspace, layout.ipc_buffer_va, 0, 1, 0).ok()?;
-    let _ = syscall::cap_delete(ipc_rw);
-    let _ = syscall::cap_delete(ipc_memory);
-
-    Some(())
+/// Allocate one child-billed page and map it read-write into the child at
+/// `va`. procmgr's transient slots are dropped on every path: the mapping
+/// owns no cap reference, and memmgr's record pins the page until
+/// `PROCESS_DIED`.
+fn map_fresh_child_page(
+    child_aspace: u32,
+    child_memmgr_send: u32,
+    ipc_buf: *mut u64,
+    va: u64,
+) -> Option<()>
+{
+    let memory = CapGuard::new(crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?);
+    let rw = CapGuard::new(syscall::cap_derive(memory.cap(), syscall::RIGHTS_MEM_MAP_RW).ok()?);
+    syscall::mem_map(rw.cap(), child_aspace, va, 0, 1, 0).ok()
 }
 
 /// Determine protection flags for an ELF segment.
@@ -1136,34 +1186,19 @@ where
 }
 
 /// Fill `dst` from file offset `off` via bounded `FS_READ` chunks. Returns
-/// the number of bytes copied (short only at EOF).
+/// the number of bytes copied (short only at EOF), or `None` when a read
+/// fails.
 ///
 /// A single `FS_READ` may return fewer bytes than asked — fatfs stops at
 /// sector boundaries — so short reads continue the loop; only a zero read
-/// (end of file) stops it.
+/// (end of file) stops it. Every reply is clamped to the bytes requested
+/// ([`process_table::fs_reads::fill_exact`]), so a driver over-reporting its
+/// count cannot make procmgr copy past `dst`.
 fn vfs_read_exact(file_cap: u32, ipc_buf: *mut u64, off: u64, dst: &mut [u8]) -> Option<usize>
 {
-    let mut tmp = [0u8; VFS_CHUNK_SIZE as usize];
-    let mut total = 0usize;
-    while total < dst.len()
-    {
-        let want = (dst.len() - total).min(VFS_CHUNK_SIZE as usize);
-        let bytes_read = vfs_read(
-            file_cap,
-            ipc_buf,
-            off + total as u64,
-            want as u64,
-            &mut tmp[..want],
-        )?;
-        if bytes_read == 0
-        {
-            break;
-        }
-        let copy_len = bytes_read.min(want);
-        dst[total..total + copy_len].copy_from_slice(&tmp[..copy_len]);
-        total += copy_len;
-    }
-    Some(total)
+    process_table::fs_reads::fill_exact(dst, off, VFS_CHUNK_SIZE as usize, |at, window| {
+        vfs_read(file_cap, ipc_buf, at, window.len() as u64, window)
+    })
 }
 
 /// Derive caller-facing caps and record the process in the table.
@@ -1207,18 +1242,6 @@ fn finalize_creation(
     // fault both observers fire with the same correlator and `take_by_correlator`
     // reaps exactly once (the second event is a stale-correlator no-op).
     let _ = syscall::aspace_bind_notification(child_aspace, death_eq, correlator);
-
-    // If the spawner supplied a death-relay POST cap, bind it as a second
-    // address-space observer (correlator 0) so a terminal fault in any child
-    // thread posts the fault class straight to the spawner's death queue and
-    // `Child::wait()` returns. The kernel captures the EventQueue state at
-    // bind time, so procmgr drops its copy afterwards (mirrors how the
-    // main-thread death_eq binding leaves no procmgr-side ownership concern).
-    if parent_relay_cap != 0
-    {
-        let _ = syscall::aspace_bind_notification(child_aspace, parent_relay_cap, 0);
-        let _ = syscall::cap_delete(parent_relay_cap);
-    }
 
     // If logd has registered its own death EQ via REGISTER_DEATH_EQ,
     // bind it as a second observer with the same correlator (logd's
@@ -1269,6 +1292,20 @@ fn finalize_creation(
         return None;
     }
 
+    // If the spawner supplied a death-relay POST cap, bind it as a second
+    // address-space observer (correlator 0) so a terminal fault in any child
+    // thread posts the fault class straight to the spawner's death queue and
+    // `Child::wait()` returns. The kernel captures the EventQueue state at
+    // bind time, so procmgr drops its copy afterwards (mirrors how the
+    // main-thread death_eq binding leaves no procmgr-side ownership concern).
+    // Consumed only here, after the last failure return, so on every `None`
+    // the caller still owns the cap and releases it.
+    if parent_relay_cap != 0
+    {
+        let _ = syscall::aspace_bind_notification(child_aspace, parent_relay_cap, 0);
+        let _ = syscall::cap_delete(parent_relay_cap);
+    }
+
     // Demand-paged wiring (best-effort): delegate the child address space to
     // memmgr and bind the main thread's fault handler to it. A failure here
     // degrades to "no pager" (faults kill the thread) rather than failing an
@@ -1317,6 +1354,7 @@ fn finalize_creation(
     Some(CreateResult {
         process_handle,
         thread_for_caller,
+        badge,
     })
 }
 
@@ -1395,46 +1433,20 @@ fn create_process_from_bytes(
         .clamp(1, MAX_PROCESS_STACK_PAGES);
     let layout = choose_child_layout();
 
-    let aspace_slab = crate::memmgr_alloc_pages_contig(
+    // The child's kernel objects and per-child memory caps are guarded from
+    // creation: every `None` below releases them, and only a successful
+    // `finalize_creation` hands them to the table entry.
+    let child_objs = create_child_kernel_objects(
         universals.memmgr_endpoint,
-        crate::ASPACE_RETYPE_PAGES,
+        universals.sched_baseline,
+        sched.priority,
         ipc_buf,
     )?;
-    let child_aspace =
-        syscall::cap_create_aspace(aspace_slab, 0, crate::ASPACE_RETYPE_PAGES).ok()?;
-    let _ = syscall::cap_delete(aspace_slab);
-    let cspace_slab = crate::memmgr_alloc_pages_contig(
-        universals.memmgr_endpoint,
-        crate::CSPACE_RETYPE_PAGES,
-        ipc_buf,
-    )?;
-    let child_cspace =
-        syscall::cap_create_cspace(cspace_slab, 0, crate::CSPACE_RETYPE_PAGES).ok()?;
-    let _ = syscall::cap_delete(cspace_slab);
-    let thread_slab = crate::memmgr_alloc_pages_contig(
-        universals.memmgr_endpoint,
-        crate::THREAD_RETYPE_PAGES,
-        ipc_buf,
-    )?;
-    // Create the initial thread at its assigned level, under procmgr's own
-    // baseline authority. Without a baseline the child lands at the floor.
-    let (create_sched_cap, create_priority) = if universals.sched_baseline != 0
-    {
-        (universals.sched_baseline, sched.priority)
-    }
-    else
-    {
-        (0, 0)
-    };
-    let child_thread = syscall::cap_create_thread(
-        thread_slab,
-        child_aspace,
-        child_cspace,
-        create_sched_cap,
-        create_priority,
-    )
-    .ok()?;
-    let _ = syscall::cap_delete(thread_slab);
+    let (child_aspace, child_cspace, child_thread) = (
+        child_objs.aspace(),
+        child_objs.cspace(),
+        child_objs.thread(),
+    );
 
     let child_memmgr_send = universals.memmgr_endpoint;
 
@@ -1538,8 +1550,10 @@ fn create_process_from_bytes(
         MainTls::default()
     };
 
+    let main_tls_memory = CapGuard::new(main_tls.memory_cap);
+
     let process_badge = next_process_badge()?;
-    let pi_memory_cap = populate_child_info(
+    let pi_memory = CapGuard::new(populate_child_info(
         self_aspace,
         child_aspace,
         child_cspace,
@@ -1554,7 +1568,7 @@ fn create_process_from_bytes(
         process_badge,
         sched,
         &layout,
-    )?;
+    )?);
     map_child_stack_and_ipc(
         child_aspace,
         child_memmgr_send,
@@ -1563,11 +1577,13 @@ fn create_process_from_bytes(
         &layout,
     )?;
 
-    finalize_creation(
+    // The guards stay armed across `finalize_creation`, so its failure
+    // releases every resource; on success the table entry owns them.
+    let result = finalize_creation(
         child_aspace,
         child_cspace,
         child_thread,
-        pi_memory_cap,
+        pi_memory.cap(),
         entry,
         main_tls,
         table,
@@ -1584,7 +1600,11 @@ fn create_process_from_bytes(
         sched.band_max,
         ipc_buf,
         &layout,
-    )
+    )?;
+    let _ = child_objs.disarm();
+    let _ = pi_memory.disarm();
+    let _ = main_tls_memory.disarm();
+    Some(result)
 }
 
 /// Create a process from an ELF module memory cap (suspended).
@@ -1653,16 +1673,21 @@ fn next_memory_cookie() -> Option<u64>
 
 /// Issue `FS_READ_MEMORY` at byte `offset`.
 ///
-/// On success returns `(memory_cap, bytes_valid, memory_data_offset)` per
-/// `fs/docs/fs-driver-protocol.md`: the file's byte at `offset + i` for
+/// On success returns `(memory_cap, bytes_valid, memory_data_offset, cookie)`
+/// per `fs/docs/fs-driver-protocol.md`: the file's byte at `offset + i` for
 /// `i ∈ [0, bytes_valid)` lives in the returned memory cap at byte offset
-/// `memory_data_offset + i`. The memory cap is a per-call grandchild of the
-/// fs cache slot and is owned by the caller; `cap_delete` releases the
-/// caller's reference. Pre-Phase-9 the fs holds the underlying cache-slot
-/// refcount until `FS_CLOSE`; cooperative early release arrives with
-/// Phase 9's `FS_RELEASE_MEMORY`. `bytes_valid` is bounded by file end,
-/// cluster boundary, and memory-cap tail — callers must iterate from
-/// `offset + bytes_valid` to read past the boundary.
+/// `memory_data_offset + i`, and `cookie` names the request for the
+/// `FS_RELEASE_MEMORY` that drops the fs-side cache refcount once the caller
+/// has copied the bytes (`stream_segment_bytes` issues it; `FS_CLOSE` drops
+/// any the caller missed). The memory cap is a per-call grandchild of the fs
+/// cache slot and is owned by the caller; `cap_delete` releases the caller's
+/// reference. `bytes_valid` is bounded by file end, cluster boundary, and
+/// memory-cap tail — callers must iterate from `offset + bytes_valid` to read
+/// past the boundary.
+///
+/// The file cap is client-supplied, so its server is untrusted: every reply
+/// cap other than the returned one is deleted, and on a failed or empty reply
+/// every reply cap ([`process_table::fs_reads::read_memory_reply_caps`]).
 fn vfs_read_memory(
     file_cap: u32,
     ipc_buf: *mut u64,
@@ -1677,22 +1702,12 @@ fn vfs_read_memory(
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
-    if reply.label != 0
-    {
-        return None;
-    }
     let bytes_valid = reply.word(0) as usize;
-    if bytes_valid == 0
-    {
-        return None;
-    }
+    let (kept, surplus) =
+        process_table::fs_reads::read_memory_reply_caps(reply.label, bytes_valid, reply.caps());
+    crate::release_caps(surplus);
     let memory_data_offset = reply.word(2) as usize;
-    let caps = reply.caps();
-    if caps.is_empty()
-    {
-        return None;
-    }
-    Some((caps[0], bytes_valid, memory_data_offset, cookie))
+    Some((kept?, bytes_valid, memory_data_offset, cookie))
 }
 
 /// Read from an open file via its per-file capability.
@@ -1716,6 +1731,8 @@ fn vfs_read(
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
+    // FS_READ replies carry no caps; the untrusted server's are deleted.
+    crate::release_caps(reply.caps());
     if reply.label != 0
     {
         return None;
@@ -1737,7 +1754,11 @@ pub(crate) fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
 {
     let msg = IpcMessage::new(ipc::fs_labels::FS_CLOSE);
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) };
+    if let Ok(reply) = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
+    {
+        // FS_CLOSE replies carry no caps; the untrusted server's are deleted.
+        crate::release_caps(reply.caps());
+    }
     let _ = syscall::cap_delete(file_cap);
 }
 
@@ -1788,32 +1809,50 @@ impl Drop for FileCapGuard
     }
 }
 
-/// Holds a child-billed memmgr SEND cap and its memmgr-side badge. The pair
-/// is moved into `UniversalCaps` and then into the `ProcessEntry` on success.
-struct MemmgrSendGuard
+/// Holds a child-billed memmgr SEND cap and its memmgr-side badge from
+/// `REGISTER_PROCESS` until the child's table entry owns them.
+///
+/// While armed, dropping the guard retires the child's memmgr record: it
+/// sends `PROCESS_DIED` for the badge over procmgr's own memmgr endpoint, so
+/// memmgr returns every page already billed to the child (retype slabs,
+/// segment pages, the `ProcessInfo` and TLS pages) and frees the record,
+/// then deletes the SEND slot. Declare it before the child's other guards so
+/// it drops after them: memmgr then reclaims pages no kernel object or
+/// procmgr-held cap still uses.
+pub(crate) struct MemmgrSendGuard
 {
     cap: u32,
     badge: u64,
+    memmgr_ep: u32,
+    ipc_buf: *mut u64,
 }
 
 impl MemmgrSendGuard
 {
-    fn new(cap: u32, badge: u64) -> Self
+    /// Guard the `(cap, badge)` pair `register_with_memmgr` returned;
+    /// `memmgr_ep` is procmgr's own memmgr endpoint, the one `PROCESS_DIED`
+    /// is accepted on.
+    pub(crate) fn new(cap: u32, badge: u64, memmgr_ep: u32, ipc_buf: *mut u64) -> Self
     {
-        Self { cap, badge }
+        Self {
+            cap,
+            badge,
+            memmgr_ep,
+            ipc_buf,
+        }
     }
 
-    fn cap(&self) -> u32
+    pub(crate) fn cap(&self) -> u32
     {
         self.cap
     }
 
-    fn badge(&self) -> u64
+    pub(crate) fn badge(&self) -> u64
     {
         self.badge
     }
 
-    fn disarm(mut self) -> (u32, u64)
+    pub(crate) fn disarm(mut self) -> (u32, u64)
     {
         let p = (self.cap, self.badge);
         self.cap = 0;
@@ -1826,6 +1865,7 @@ impl Drop for MemmgrSendGuard
 {
     fn drop(&mut self)
     {
+        notify_memmgr_died(self.memmgr_ep, self.badge, self.ipc_buf);
         if self.cap != 0
         {
             let _ = syscall::cap_delete(self.cap);
@@ -1881,21 +1921,81 @@ impl ChildKernelObjects
 
 impl Drop for ChildKernelObjects
 {
+    /// Release the three objects as `teardown_entry` does: revoke each before
+    /// deleting it. Once `populate_child_info` has run, the child's `CSpace`
+    /// holds copies of all three (its own `CSpace` among them), and those
+    /// descendants would keep every object alive after a bare `cap_delete`.
     fn drop(&mut self)
     {
-        if self.thread != 0
+        for cap in [self.thread, self.cspace, self.aspace]
         {
-            let _ = syscall::cap_delete(self.thread);
-        }
-        if self.cspace != 0
-        {
-            let _ = syscall::cap_delete(self.cspace);
-        }
-        if self.aspace != 0
-        {
-            let _ = syscall::cap_delete(self.aspace);
+            if cap != 0
+            {
+                let _ = syscall::cap_revoke_all(cap);
+                let _ = syscall::cap_delete(cap);
+            }
         }
     }
+}
+
+/// Create a child's `AddressSpace`, `CSpace`, and initial `Thread` from
+/// child-billed retype slabs, the thread at `priority` under procmgr's
+/// baseline `SchedControl` (`sched_baseline`; zero creates it at the floor).
+///
+/// Every slab and kernel-object cap is guarded from the moment it exists,
+/// so a failure at any step leaves nothing in procmgr's `CSpace`; the
+/// returned guard owns the three kernel objects until disarmed.
+fn create_child_kernel_objects(
+    memmgr_send: u32,
+    sched_baseline: u32,
+    priority: u8,
+    ipc_buf: *mut u64,
+) -> Option<ChildKernelObjects>
+{
+    let slab = CapGuard::new(crate::memmgr_alloc_pages_contig(
+        memmgr_send,
+        crate::ASPACE_RETYPE_PAGES,
+        ipc_buf,
+    )?);
+    let aspace =
+        CapGuard::new(syscall::cap_create_aspace(slab.cap(), 0, crate::ASPACE_RETYPE_PAGES).ok()?);
+    // The retype keeps its own reference on the region; drop the slab slot.
+    drop(slab);
+    let slab = CapGuard::new(crate::memmgr_alloc_pages_contig(
+        memmgr_send,
+        crate::CSPACE_RETYPE_PAGES,
+        ipc_buf,
+    )?);
+    let cspace =
+        CapGuard::new(syscall::cap_create_cspace(slab.cap(), 0, crate::CSPACE_RETYPE_PAGES).ok()?);
+    drop(slab);
+    let slab = CapGuard::new(crate::memmgr_alloc_pages_contig(
+        memmgr_send,
+        crate::THREAD_RETYPE_PAGES,
+        ipc_buf,
+    )?);
+    let (sched_cap, create_priority) = if sched_baseline != 0
+    {
+        (sched_baseline, priority)
+    }
+    else
+    {
+        (0, 0)
+    };
+    let thread = syscall::cap_create_thread(
+        slab.cap(),
+        aspace.cap(),
+        cspace.cap(),
+        sched_cap,
+        create_priority,
+    )
+    .ok()?;
+    drop(slab);
+    Some(ChildKernelObjects::new(
+        aspace.disarm(),
+        cspace.disarm(),
+        thread,
+    ))
 }
 
 /// `cap_delete`s a single cap slot on drop unless disarmed. Zero on
@@ -1956,18 +2056,22 @@ pub struct ElfLoadCtx
 /// read-only into a scratch VA, then memcpys the valid slice into the span.
 /// The memory cap is the caller's grandchild of fs's cache slot —
 /// `cap_delete` (via the `ScratchMapping` `owns_cap` slot) drops the
-/// caller's reference. fs holds the underlying cache-slot refcount until
-/// `FS_CLOSE` (pre-Phase-9) or until cooperative `FS_RELEASE_MEMORY` lands.
+/// caller's reference. After each copy it issues `FS_RELEASE_MEMORY` for the
+/// request's cookie, so fs drops its cache-slot refcount; `FS_CLOSE`
+/// reclaims any release that is lost.
 ///
-/// Infallible by contract with the loader's `fill`: a failed read leaves the
-/// tail zeroed (the child then rejects at the applied-count check or crashes
-/// in a diagnosable way, matching the previous per-page behaviour).
+/// Returns `false` when the segment's file bytes could not all be copied: a
+/// failed or zero-byte `FS_READ_MEMORY`, a cache page that cannot be mapped,
+/// or a reply whose `memory_data_offset + bytes_valid` runs past the one page
+/// mapped. The loader's `fill` cannot fail, so the caller records the result
+/// and fails the spawn with `IO_ERROR` once the segment load returns; the
+/// tail left unfilled is never run.
 fn stream_segment_bytes(
     buf: &mut [u8],
     dest_offset: usize,
     seg: &elf::LoadSegment,
     ctx: &ElfLoadCtx,
-)
+) -> bool
 {
     let total = (seg.filesz.min(seg.memsz)) as usize;
     let mut copied = 0usize;
@@ -1979,7 +2083,7 @@ fn stream_segment_bytes(
             vfs_read_memory(ctx.file_cap, ctx.ipc_buf, cur)
         else
         {
-            return;
+            return false;
         };
 
         let Some(mut mapping) =
@@ -1988,26 +2092,37 @@ fn stream_segment_bytes(
         {
             let _ = syscall::cap_delete(memory_cap);
             vfs_release_memory(ctx.file_cap, ctx.ipc_buf, cookie);
-            return;
+            return false;
         };
         mapping.set_owns_cap(memory_cap);
 
-        let chunk_len = bytes_valid.min(total - copied);
+        // The offset and count come from the fs driver: refuse a range that
+        // leaves the single page mapped before building any slice over it.
+        let Some(range) = process_table::fs_reads::cache_page_range(
+            memory_data_offset,
+            bytes_valid,
+            PAGE_SIZE as usize,
+        )
+        else
+        {
+            drop(mapping);
+            vfs_release_memory(ctx.file_cap, ctx.ipc_buf, cookie);
+            return false;
+        };
+        let chunk_len = range.len().min(total - copied);
 
         // SAFETY: `mapping.va()` covers PAGE_SIZE bytes mapped read-only;
-        // `memory_data_offset + bytes_valid ≤ PAGE_SIZE` is a fatfs invariant
-        // and `chunk_len ≤ bytes_valid`.
+        // `cache_page_range` checked `range.start + range.len() <= PAGE_SIZE`,
+        // and `chunk_len <= range.len()`.
         let src = unsafe {
-            core::slice::from_raw_parts(
-                (mapping.va() as *const u8).add(memory_data_offset),
-                chunk_len,
-            )
+            core::slice::from_raw_parts((mapping.va() as *const u8).add(range.start), chunk_len)
         };
         buf[dest_offset + copied..dest_offset + copied + chunk_len].copy_from_slice(src);
         drop(mapping);
         vfs_release_memory(ctx.file_cap, ctx.ipc_buf, cookie);
         copied += chunk_len;
     }
+    true
 }
 
 /// Issue `FS_RELEASE_MEMORY` on the file-cap to drop the fs-side cache
@@ -2020,7 +2135,12 @@ fn vfs_release_memory(file_cap: u32, ipc_buf: *mut u64, cookie: u64)
         .word(0, cookie)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) };
+    if let Ok(reply) = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
+    {
+        // FS_RELEASE_MEMORY replies carry no caps; the untrusted server's
+        // are deleted.
+        crate::release_caps(reply.caps());
+    }
 }
 
 /// Create a process from a caller-supplied file cap.
@@ -2028,7 +2148,11 @@ fn vfs_release_memory(file_cap: u32, ipc_buf: *mut u64, cookie: u64)
 /// Reads only the ELF header page, then loads each segment page-by-page
 /// directly from the file cap into target memory caps. No intermediate file
 /// buffer. Procmgr `FS_CLOSE`s and `cap_delete`s `file_cap` before
-/// return regardless of outcome — ownership transfers in.
+/// return regardless of outcome — ownership transfers in. `creator_endpoint`
+/// is only copied into the child, so the caller still owns and releases it;
+/// `parent_relay_cap` is consumed only on `Ok`, so on `Err` the caller
+/// releases it. Every resource acquired for the child, including memmgr's
+/// record for it, is released on every `Err`.
 // clippy::too_many_lines: file-cap-based process creation is one transaction
 // that owns the lifetime of the ELF-header scratch memory cap, the child's kernel
 // objects, and the per-page streaming loop.
@@ -2070,7 +2194,7 @@ pub fn create_process_from_file(
     // subsequent allocations route through this cap so memmgr accounts
     // them to the child's record from the moment they leave the pool.
     let (mms_cap, mms_badge) = crate::register_with_memmgr(ctx.memmgr_ep, ipc_buf);
-    let mms = MemmgrSendGuard::new(mms_cap, mms_badge);
+    let mms = MemmgrSendGuard::new(mms_cap, mms_badge, ctx.memmgr_ep, ipc_buf);
     if mms.cap() == 0
     {
         return Err(procmgr_errors::OUT_OF_MEMORY);
@@ -2088,43 +2212,22 @@ pub fn create_process_from_file(
         })?;
     hdr_scratch.set_owns_cap(hdr_memory);
     let hdr_va = hdr_scratch.va();
-    // SAFETY: hdr_va mapped writable, one page.
-    unsafe { core::ptr::write_bytes(hdr_va as *mut u8, 0, PAGE_SIZE as usize) };
 
     // Read the first page (ELF header + program headers).
-    let hdr_size = file_size.min(PAGE_SIZE);
-    let mut offset: u64 = 0;
-    while offset < hdr_size
-    {
-        let chunk = VFS_CHUNK_SIZE.min(hdr_size - offset);
-        let mut buf = [0u8; VFS_CHUNK_SIZE as usize];
-        let bytes_read = vfs_read(
-            file_cap.cap(),
-            ipc_buf,
-            offset,
-            chunk,
-            &mut buf[..chunk as usize],
-        )
-        .ok_or(procmgr_errors::IO_ERROR)?;
-        if bytes_read == 0
-        {
-            break;
-        }
-        let safe_len = bytes_read.min(VFS_CHUNK_SIZE as usize);
-        // SAFETY: hdr_va mapped writable; `buf` holds `safe_len` bytes.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                (hdr_va as *mut u8).add(offset as usize),
-                safe_len,
-            );
-        }
-        offset += safe_len as u64;
-    }
+    let hdr_size = file_size.min(PAGE_SIZE) as usize;
+    // SAFETY: hdr_va is mapped writable for one page and
+    // `hdr_size <= PAGE_SIZE`; the mapping outlives every use of the slice
+    // (it is dropped only after the last use of `header_data` below).
+    let hdr_page = unsafe { core::slice::from_raw_parts_mut(hdr_va as *mut u8, hdr_size) };
+    hdr_page.fill(0);
+    // `vfs_read_exact` clamps each reply to the bytes it requested, so an fs
+    // driver over-reporting `bytes_read` cannot make procmgr write past the
+    // header page.
+    let header_len =
+        vfs_read_exact(file_cap.cap(), ipc_buf, 0, hdr_page).ok_or(procmgr_errors::IO_ERROR)?;
 
     // Parse ELF headers from the header page.
-    // SAFETY: hdr_va is mapped and contains `offset` bytes of file data.
-    let header_data = unsafe { core::slice::from_raw_parts(hdr_va as *const u8, offset as usize) };
+    let header_data: &[u8] = &hdr_page[..header_len];
     let machine = crate::arch::current::EXPECTED_ELF_MACHINE;
     let (ehdr, kind) =
         elf::validate_executable(header_data, machine).map_err(|_| procmgr_errors::INVALID_ELF)?;
@@ -2200,66 +2303,11 @@ pub fn create_process_from_file(
     .clamp(1, MAX_PROCESS_STACK_PAGES);
     let layout = choose_child_layout();
 
-    let aspace_slab =
-        crate::memmgr_alloc_pages_contig(mms.cap(), crate::ASPACE_RETYPE_PAGES, ipc_buf)
+    // The three child kernel-object caps, guarded from creation so
+    // subsequent `?` returns release them in the correct order.
+    let child_objs =
+        create_child_kernel_objects(mms.cap(), ctx.sched_baseline, sched.priority, ipc_buf)
             .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
-    let child_aspace = syscall::cap_create_aspace(aspace_slab, 0, crate::ASPACE_RETYPE_PAGES)
-        .map_err(|_| {
-            let _ = syscall::cap_delete(aspace_slab);
-            procmgr_errors::OUT_OF_MEMORY
-        })?;
-    let _ = syscall::cap_delete(aspace_slab);
-    let cspace_slab =
-        crate::memmgr_alloc_pages_contig(mms.cap(), crate::CSPACE_RETYPE_PAGES, ipc_buf)
-            .ok_or_else(|| {
-                let _ = syscall::cap_delete(child_aspace);
-                procmgr_errors::OUT_OF_MEMORY
-            })?;
-    let child_cspace = syscall::cap_create_cspace(cspace_slab, 0, crate::CSPACE_RETYPE_PAGES)
-        .map_err(|_| {
-            let _ = syscall::cap_delete(cspace_slab);
-            let _ = syscall::cap_delete(child_aspace);
-            procmgr_errors::OUT_OF_MEMORY
-        })?;
-    let _ = syscall::cap_delete(cspace_slab);
-    let thread_slab =
-        crate::memmgr_alloc_pages_contig(mms.cap(), crate::THREAD_RETYPE_PAGES, ipc_buf)
-            .ok_or_else(|| {
-                let _ = syscall::cap_delete(child_cspace);
-                let _ = syscall::cap_delete(child_aspace);
-                procmgr_errors::OUT_OF_MEMORY
-            })?;
-    // Create the initial thread at its assigned level, under procmgr's own
-    // baseline authority. Without a baseline the child lands at the floor.
-    let (create_sched_cap, create_priority) = if ctx.sched_baseline != 0
-    {
-        (ctx.sched_baseline, sched.priority)
-    }
-    else
-    {
-        (0, 0)
-    };
-    let child_thread = syscall::cap_create_thread(
-        thread_slab,
-        child_aspace,
-        child_cspace,
-        create_sched_cap,
-        create_priority,
-    )
-    .map_err(|_| {
-        let _ = syscall::cap_delete(thread_slab);
-        let _ = syscall::cap_delete(child_cspace);
-        let _ = syscall::cap_delete(child_aspace);
-        procmgr_errors::OUT_OF_MEMORY
-    })?;
-    let _ = syscall::cap_delete(thread_slab);
-
-    // All three child kernel-object caps are live; group them under a
-    // single guard so subsequent `?` returns release them in the correct
-    // order. Slab caps were consumed by `cap_create_*`; the post-create
-    // `cap_delete` of each slab is correct because `cap_create_*` keeps
-    // its own refcount on the underlying retyped region.
-    let child_objs = ChildKernelObjects::new(child_aspace, child_cspace, child_thread);
 
     // Stream each LOAD segment from VFS at segment granularity.
     let mut applied_relocs = 0u64;
@@ -2282,6 +2330,7 @@ pub fn create_process_from_file(
             ipc_buf,
             self_aspace,
         };
+        let mut streamed = true;
 
         loader::load_elf_segment_into_child(
             first_page,
@@ -2293,7 +2342,7 @@ pub fn create_process_from_file(
             mms.cap(),
             ipc_buf,
             |buf| {
-                stream_segment_bytes(buf, dest_offset, &seg, &load_ctx);
+                streamed = stream_segment_bytes(buf, dest_offset, &seg, &load_ctx);
                 // Writable segments only, matching the kernel's init
                 // applier: a target in text/rodata goes unapplied and the
                 // applied-count check below rejects the image.
@@ -2312,6 +2361,12 @@ pub fn create_process_from_file(
                 }
             },
         )?;
+        // A segment whose file bytes did not all arrive would run with a
+        // zeroed tail; the spawn fails instead.
+        if !streamed
+        {
+            return Err(procmgr_errors::IO_ERROR);
+        }
     }
     // Every pre-validated record must have landed in exactly one segment;
     // a shortfall means a target in a gap between segments or a lost read.
@@ -2608,11 +2663,11 @@ pub fn teardown_entry(entry: ProcessEntry, memmgr_ep: u32, ipc_buf: *mut u64)
 ///   pending and either the scratch mapping of the child's `ProcessInfo`
 ///   page or the `cap_copy` of an override cap into the child's `CSpace`
 ///   failed.
-/// - `3` — `thread_configure_with_tls` of the child's main thread failed.
-///   A raw value with no `procmgr_errors` constant.
-/// - `6` — `thread_start` of the child's main thread failed with an error
-///   other than `Interrupted`, which is retried. A raw value with no
-///   `procmgr_errors` constant.
+/// - `procmgr_errors::THREAD_CONFIGURE_FAILED` (3) —
+///   `thread_configure_with_tls` of the child's main thread failed.
+/// - `procmgr_errors::THREAD_START_FAILED` (6) — `thread_start` of the
+///   child's main thread failed with an error other than `Interrupted`,
+///   which is retried.
 pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u32) -> Result<(), u64>
 {
     let entry = table
@@ -2663,7 +2718,7 @@ pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u32) -> 
         entry.process_info_va,
         entry.tls_base_va,
     )
-    .map_err(|_| 3u64)?;
+    .map_err(|_| procmgr_errors::THREAD_CONFIGURE_FAILED)?;
 
     // `Interrupted` means procmgr's thread was stopped while the start waited
     // for the child's thread to settle; nothing was started, so the start is
@@ -2675,7 +2730,7 @@ pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u32) -> 
             Ok(()) => break,
             Err(e) if e == SyscallError::Interrupted as i64 =>
             {}
-            Err(_) => return Err(6),
+            Err(_) => return Err(procmgr_errors::THREAD_START_FAILED),
         }
     }
 

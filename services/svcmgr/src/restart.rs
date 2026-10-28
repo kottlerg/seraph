@@ -96,10 +96,10 @@ pub struct StartupBlobs<'a>
 /// keeps an oversize blob from reaching the message builder's bound
 /// assertion. Every `None` arm releases the file and badged-creator caps it
 /// still holds, and the short-reply arm destroys the child procmgr created.
-/// An error reply carries no handle to destroy: when procmgr created the
-/// child but the reply's cap transfer into svcmgr's `CSpace` failed, svcmgr
-/// receives `IPC_REPLY_TRANSFER_FAILED` with zero caps and the suspended
-/// child stays in procmgr's table (#506).
+/// An error reply carries no handle to destroy and needs none: when procmgr
+/// created the child but the reply's cap transfer into svcmgr's `CSpace`
+/// failed, svcmgr receives `IPC_REPLY_TRANSFER_FAILED` with zero caps, and
+/// procmgr destroys the child it could not hand over.
 /// Caller is responsible for `CONFIGURE_NAMESPACE`, bootstrap delivery, and
 /// `START_PROCESS`.
 ///

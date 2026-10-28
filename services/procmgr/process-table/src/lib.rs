@@ -3,29 +3,37 @@
 
 // services/procmgr/process-table/src/lib.rs
 
-//! Pure process-table, badge, recent-exit, and create-request blob logic for
-//! procmgr.
+//! Pure process-table, badge, recent-exit, request-shape, and init-reap logic
+//! for procmgr.
 //!
 //! Holds the plain-data process record ([`ProcessEntry`]), the fixed-size
 //! slot table ([`ProcessTable`]) with its insert/find/take/query operations,
 //! the recently-reaped ring ([`RecentExits`]), the pure badge-acceptance
-//! predicate ([`badge_is_acceptable`]), and the argv/env blob decoder for
+//! predicate ([`badge_is_acceptable`]), the argv/env blob decoder for
 //! create requests ([`CreateBlobs`]), which parses client-controlled label
-//! fields and data words. None of these touch a syscall, IPC, or
-//! `std::os::seraph` surface — the cap fields are slot *indices* (plain
-//! integers), never live capabilities, and the decoder reads a stack
-//! [`ipc::IpcMessage`] snapshot — so the whole crate is host-reachable and
+//! fields and data words, the `CREATE_FROM_FILE` cap-layout split
+//! ([`split_create_from_file_caps`]), the bounds procmgr applies to fs-driver
+//! read replies and the `FS_READ_MEMORY` reply-cap split ([`fs_reads`]), and
+//! the init-reap handoff state machine ([`InitReap`]). None of these touch a
+//! syscall, IPC, or `std::os::seraph` surface — the cap fields are slot
+//! *indices* (plain integers), never live capabilities, and the decoder reads
+//! a stack [`ipc::IpcMessage`] snapshot — so the whole crate is host-reachable and
 //! host-tested. The syscall/IPC-bearing operations (pipe/namespace
-//! configuration, logd death-EQ binding, the atomic badge counter, ELF load,
-//! and teardown) stay in `procmgr` and drive these lookups across the crate
-//! boundary. See
+//! configuration, logd death-EQ binding, random process-badge minting, ELF
+//! load, the init-reap teardown, and process teardown) stay in `procmgr` and
+//! drive this logic across the crate boundary. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
 
 pub mod create_blobs;
+pub mod fs_reads;
+pub mod init_reap;
+pub mod request_caps;
 
 pub use create_blobs::{ChildArgs, ChildEnv, CreateBlobs};
+pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal};
+pub use request_caps::{FileCreateCaps, split_create_from_file_caps};
 
 /// Maximum concurrent child processes procmgr tracks.
 ///
@@ -438,7 +446,7 @@ mod tests
     #[test]
     fn badge_is_rejected_when_a_verb_bit_is_set()
     {
-        // Bits 60..=63 are the verb bits (svcmgr's HANDOVER_AUTHORITY /
+        // Bits 59..=63 are the verb bits (svcmgr's HANDOVER_AUTHORITY /
         // PUBLISH_AUTHORITY on the child's registry SEND among them); a low
         // word that clears every other check must not save a badge carrying
         // any of them.
@@ -455,7 +463,7 @@ mod tests
             u32::MAX,
             verbs
         ));
-        for bit in [61, 60]
+        for bit in [61, 60, 59]
         {
             assert!(!badge_is_acceptable(
                 (1u64 << bit) | 0x10,
@@ -465,7 +473,7 @@ mod tests
             ));
         }
         assert!(badge_is_acceptable(
-            0x0FFF_FFFF_0000_0010,
+            0x07FF_FFFF_0000_0010,
             16,
             u32::MAX,
             verbs

@@ -282,9 +282,9 @@ fn assemble_provided_boot_caps(
 /// Returns `Some(Launched)` on success, with the child running and
 /// its bootstrap round delivered. Returns `None` if any step fails;
 /// in that case the child has been destroyed and any resolved seed caps
-/// have been released. The exception is a create whose reply caps never
-/// reach svcmgr (see [`walk_and_create_from_file`]): svcmgr holds no
-/// handle to destroy that child, which procmgr keeps suspended (#506).
+/// have been released; a create whose reply caps never reach svcmgr (see
+/// [`walk_and_create_from_file`]) leaves no child, since procmgr destroys
+/// a child whose create reply it cannot deliver.
 ///
 /// Seed caps that fail to resolve are passed through as slot `0`, so
 /// the child's bootstrap decoder sees a zero in that position. This

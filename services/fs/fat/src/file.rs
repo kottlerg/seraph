@@ -39,9 +39,17 @@ pub struct OutstandingPage
     /// parent cap stays untouched. Lives in the fs's `CSpace` until the
     /// outstanding entry is dropped.
     pub ancestor_cap: u32,
+    /// Set when the page has been queued for the eviction worker, so a
+    /// later cache miss picks another page instead of queueing this one
+    /// again. It is never cleared: the entry leaves the table when the
+    /// page is cleaned up.
+    pub eviction_queued: bool,
 }
 
 /// A single open file, identified by its capability badge.
+///
+/// The file's size and first cluster are not kept here: reads take them
+/// from the node table, which every write and truncate updates.
 pub struct OpenFile
 {
     /// Monotonic identity stamped on slot allocation (0 = unused slot).
@@ -50,17 +58,15 @@ pub struct OpenFile
     /// `FatNode.open_slot` on the cap-native path, so this badge does
     /// not appear on the wire.
     pub badge: u64,
-    pub start_cluster: u32,
-    pub file_size: u32,
     pub outstanding: [Option<OutstandingPage>; MAX_OUTSTANDING],
-    /// SEND cap on the client's release endpoint. Recorded from
-    /// `caps[0]` of the first `FS_READ_MEMORY` against this slot's
-    /// node cap; the eviction worker addresses cooperative
-    /// `FS_RELEASE_MEMORY` requests to it when reclaiming an
-    /// outstanding cache page. A zero cap indicates the client opted
-    /// out (no caps on the first memory-cap request); eviction skips
-    /// the cooperative round-trip and goes straight to the revoke.
-    /// Deleted from the fs's `CSpace` at `FS_CLOSE` time.
+    /// SEND cap on a client's release endpoint, recorded from `caps[0]`
+    /// of the first `FS_READ_MEMORY` reaching this slot that carries one
+    /// (services/fs/docs/fs-driver-protocol.md § Label 7); the eviction
+    /// worker addresses cooperative `FS_RELEASE_MEMORY` requests to it when
+    /// reclaiming an outstanding cache page. Zero while no request has
+    /// carried one; eviction then skips the cooperative round-trip and goes
+    /// straight to the revoke. Deleted from the fs's `CSpace` at
+    /// `FS_CLOSE` time.
     pub release_endpoint_cap: u32,
 }
 
@@ -70,8 +76,6 @@ impl OpenFile
     {
         Self {
             badge: 0,
-            start_cluster: 0,
-            file_size: 0,
             outstanding: [None; MAX_OUTSTANDING],
             release_endpoint_cap: 0,
         }

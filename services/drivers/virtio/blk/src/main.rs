@@ -607,7 +607,7 @@ fn handle_read_block_into_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
     // well below any plausible per-cap ask.
     let Some(data_len_bytes) = sector_count
         .checked_mul(SECTOR_SIZE)
-        .filter(|&n| n <= u64::from(u32::MAX))
+        .filter(|&n| u32::try_from(n).is_ok())
     else
     {
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
@@ -748,7 +748,7 @@ fn handle_write_block_from_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut 
     }
     let Some(data_len_bytes) = sector_count
         .checked_mul(SECTOR_SIZE)
-        .filter(|&n| n <= u64::from(u32::MAX))
+        .filter(|&n| u32::try_from(n).is_ok())
     else
     {
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);

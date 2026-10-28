@@ -93,8 +93,8 @@ slot stays zero.
 
 The svcmgr seed-only phase also reads every slot and fails when any is zero, as evidence that
 its name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the
-devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_SHUTDOWN_DEVICE`,
-`TEST_SPAWN_ORPHAN`, and `TEST_ORPHAN_RESULT`. `caps[3]` exists for the orphan-teardown phase's
+devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE`,
+`QUERY_SHUTDOWN_DEVICE`, `TEST_SPAWN_ORPHAN`, and `TEST_ORPHAN_RESULT`. `caps[3]` exists for the orphan-teardown phase's
 `TEST_SPAWN_ORPHAN` shim (TODO(#165): retire with that shim). Every seed is seed-only in
 svcmgr's registry. The no-authority `pwrmgr.deny` cap is public, so svctest resolves it through
 `QUERY_ENDPOINT` on its per-process `service_registry_cap` and spends no seed slot on it; it

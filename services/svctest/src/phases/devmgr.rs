@@ -3,13 +3,14 @@
 
 // services/svctest/src/phases/devmgr.rs
 
-//! devmgr surface — the `QUERY_SHUTDOWN_DEVICE` and test-label authority
-//! gates, and driver-spawn orphan teardown (#176).
+//! devmgr surface — the `QUERY_BLOCK_DEVICE`, `QUERY_SHUTDOWN_DEVICE`, and
+//! test-label authority gates, and driver-spawn orphan teardown (#176).
 //!
 //! The deny phases send the gated labels on `devmgr.registry`, a cap
-//! carrying `REGISTRY_QUERY_AUTHORITY` but neither `SHUTDOWN_DEVICE_AUTHORITY`
-//! nor `ORPHAN_TEST_AUTHORITY`, and assert `UNAUTHORIZED`: such a holder
-//! cannot acquire the platform shutdown actuators or drive the test shim.
+//! carrying `REGISTRY_QUERY_AUTHORITY` but none of `BLOCK_DEVICE_AUTHORITY`,
+//! `SHUTDOWN_DEVICE_AUTHORITY`, and `ORPHAN_TEST_AUTHORITY`, and assert
+//! `UNAUTHORIZED`: such a holder cannot acquire the whole-disk block cap or
+//! the platform shutdown actuators, or drive the test shim.
 //!
 //! The teardown phase drives devmgr's temporary `TEST_SPAWN_ORPHAN` shim to
 //! force a round-2 bootstrap failure in a fault-injection driver that hangs
@@ -29,6 +30,10 @@ use crate::runner::Phase;
 pub fn phases() -> &'static [Phase]
 {
     &[
+        Phase {
+            name: "devmgr_block_device_deny",
+            run: block_device_deny_phase,
+        },
         Phase {
             name: "devmgr_shutdown_device_deny",
             run: shutdown_device_deny_phase,
@@ -52,31 +57,46 @@ fn versioned(label: u64) -> ipc::IpcMessage
         .build()
 }
 
-fn shutdown_device_deny_phase(caps: &Caps)
+/// `label` sent on `devmgr.registry`, whose badge lacks the label's
+/// authority bit (`bit`), replies `UNAUTHORIZED` and carries no cap.
+fn assert_registry_denies(caps: &Caps, label: u64, shown: &str, bit: &str)
 {
     let devmgr = caps.devmgr_registry;
-    assert!(
-        devmgr != 0,
-        "devmgr_shutdown_device_deny: no devmgr.registry cap seeded"
-    );
+    assert!(devmgr != 0, "{shown} deny: no devmgr.registry cap seeded");
 
     let info = startup_info();
     // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB).
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let req = versioned(ipc::devmgr_labels::QUERY_SHUTDOWN_DEVICE);
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(devmgr, &req, ipc_buf) }
-        .expect("QUERY_SHUTDOWN_DEVICE ipc_call failed");
+    let reply = unsafe { ipc::ipc_call(devmgr, &versioned(label), ipc_buf) }
+        .unwrap_or_else(|_| panic!("{shown} ipc_call failed"));
     assert_eq!(
         reply.label,
         ipc::devmgr_errors::UNAUTHORIZED,
-        "QUERY_SHUTDOWN_DEVICE without SHUTDOWN_DEVICE_AUTHORITY must reply UNAUTHORIZED"
+        "{shown} without {bit} must reply UNAUTHORIZED"
     );
-    assert!(
-        reply.caps().is_empty(),
-        "QUERY_SHUTDOWN_DEVICE deny must carry no cap"
+    assert!(reply.caps().is_empty(), "{shown} deny must carry no cap");
+}
+
+fn block_device_deny_phase(caps: &Caps)
+{
+    assert_registry_denies(
+        caps,
+        ipc::devmgr_labels::QUERY_BLOCK_DEVICE,
+        "QUERY_BLOCK_DEVICE",
+        "BLOCK_DEVICE_AUTHORITY",
+    );
+}
+
+fn shutdown_device_deny_phase(caps: &Caps)
+{
+    assert_registry_denies(
+        caps,
+        ipc::devmgr_labels::QUERY_SHUTDOWN_DEVICE,
+        "QUERY_SHUTDOWN_DEVICE",
+        "SHUTDOWN_DEVICE_AUTHORITY",
     );
 }
 

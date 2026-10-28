@@ -75,12 +75,21 @@ fn touch(buf: &[u8; FRAME_BYTES]) -> u64
         .fold(0u64, |a, &x| a.wrapping_add(u64::from(x)))
 }
 
+/// Which way `recurse` moves `depth` at each level.
+#[derive(Clone, Copy)]
+enum Direction
+{
+    /// Count `depth` down to the real base case at 0 (bounded, used by `grow`).
+    Down,
+    /// Count `depth` up, never reaching the base case at runtime (used by
+    /// `guard` to overflow into the guard page).
+    Up,
+}
+
 /// Recurse, consuming one per-frame stack buffer per level so the stack grows
 /// page by page (each frame faults in its demand page on first touch).
 ///
-/// `down` selects the direction: true counts `depth` down to a real base case
-/// (bounded, used by `grow`); false counts *up*, never reaching the base case at
-/// runtime (used by `guard` to overflow into the guard page).
+/// `direction` selects whether the recursion ends (see [`Direction`]).
 ///
 /// The recursive call goes through a `black_box`'d function pointer, so the
 /// optimiser cannot recognise the self-recursion and collapse it into a
@@ -88,7 +97,7 @@ fn touch(buf: &[u8; FRAME_BYTES]) -> u64
 /// is constant, so the compiler proves every frame identical). The indirect
 /// call forces a genuine, stack-growing call chain.
 #[inline(never)]
-fn recurse(depth: u64, down: bool) -> u64
+fn recurse(depth: u64, direction: Direction) -> u64
 {
     let mut buf = [0u8; FRAME_BYTES];
     buf.fill(0xAB);
@@ -97,24 +106,21 @@ fn recurse(depth: u64, down: bool) -> u64
     {
         return sum;
     }
-    let next = if down
+    let next = match direction
     {
-        depth - 1
-    }
-    else
-    {
-        depth.wrapping_add(1)
+        Direction::Down => depth - 1,
+        Direction::Up => depth.wrapping_add(1),
     };
     // Coerce to a fn pointer first, THEN black_box the pointer value — a
     // black_box of the fn item (a ZST) leaves the callee statically known.
-    let f: fn(u64, bool) -> u64 = recurse;
+    let f: fn(u64, Direction) -> u64 = recurse;
     let f = std::hint::black_box(f);
-    sum.wrapping_add(f(next, down))
+    sum.wrapping_add(f(next, direction))
 }
 
 fn grow() -> ExitCode
 {
-    let worker = std::thread::spawn(|| recurse(GROW_DEPTH, true));
+    let worker = std::thread::spawn(|| recurse(GROW_DEPTH, Direction::Down));
     let Ok(checksum) = worker.join()
     else
     {
@@ -136,7 +142,7 @@ fn guard() -> ExitCode
 
     // Count up from 1; the `depth == 0` base case is never reached before the
     // stack overflows into the guard page.
-    let worker = std::thread::spawn(|| recurse(1, false));
+    let worker = std::thread::spawn(|| recurse(1, Direction::Up));
     // The worker recurses into the guard page and faults; the kernel kills it
     // and procmgr tears this process down, so `join` never returns. Reaching
     // past it means the guard failed to fault — report it loudly.

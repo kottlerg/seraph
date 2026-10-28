@@ -249,8 +249,9 @@ impl<'a> FatfsBackend<'a>
     /// else a directory node's cluster.
     ///
     /// # Errors
-    /// [`NsError::NotADirectory`] when `dir` is absent from the table or
-    /// names a file; [`NsError::IoError`] when it names a directory whose
+    /// [`NsError::NotFound`] when `dir` is absent from the table (its entry
+    /// was removed or renamed); [`NsError::NotADirectory`] when it names a
+    /// file; [`NsError::IoError`] when it names a directory whose
     /// cluster lies outside the data region. That cluster comes from a
     /// corrupt directory entry: cluster 0 would name the FAT16 fixed root,
     /// so serving it would turn a cap on the subdirectory into one on the
@@ -261,11 +262,11 @@ impl<'a> FatfsBackend<'a>
         {
             return Ok(self.root_cluster_sentinel());
         }
-        let node = self
-            .nodes
-            .get(dir)
-            .filter(|n| n.kind == NodeKind::Dir)
-            .ok_or(NsError::NotADirectory)?;
+        let node = self.nodes.get(dir).ok_or(NsError::NotFound)?;
+        if node.kind != NodeKind::Dir
+        {
+            return Err(NsError::NotADirectory);
+        }
         if !self.state.is_data_cluster(node.cluster)
         {
             return Err(NsError::IoError);

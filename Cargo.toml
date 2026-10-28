@@ -77,7 +77,7 @@ members = [
 ]
 
 # default-members limits bare `cargo build`/`cargo run` to xtask only.
-# Components targeting custom/embedded targets are built via build.sh.
+# Components targeting custom/embedded targets are built via `cargo xtask build`.
 default-members = ["xtask"]
 
 [workspace.package]

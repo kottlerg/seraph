@@ -4,9 +4,8 @@
 # `cargo xtask <command>` runs the xtask build runner.
 xtask = "run --package xtask --"
 
-#
-# build-std flags are passed explicitly by the build scripts rather than here,
-# to avoid applying them to host-target builds (e.g. cargo test).
+# build-std flags are passed explicitly by `cargo xtask build` rather than
+# here, to avoid applying them to host-target builds (e.g. cargo test).
 
 # Enable JSON target spec files and set the directory rustc searches for custom
 # target specs by triple name (e.g. --target x86_64-seraph-none resolves to

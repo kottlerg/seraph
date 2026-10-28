@@ -43,7 +43,11 @@ fault kinds: `SYS_THREAD_SET_FAULT_HANDLER`, the per-thread fault-handler bindin
 alignment, divide, …), and the [resume and kill](#delivery-resume-and-kill) state machine —
 including register inspection and modification of a fault-blocked thread via
 [`SYS_THREAD_READ_REGS`/`SYS_THREAD_WRITE_REGS`](capability-model.md#thread). A thread with
-no handler bound is still terminated, the behavior for all faults absent this mechanism. The
+no handler bound is still terminated, the behavior for all faults absent this mechanism. One
+x86-64 kernel check is terminal even with a handler bound: a syscall return RIP that is not
+canonical, which no user action can produce (the top user page is unmappable) and which the
+exit path kills as a user `#GP` without delivery, since no handler edit could make that return
+valid ([syscalls.md § Syscall Entry and Exit](../core/kernel/docs/syscalls.md#syscall-entry-and-exit)). The
 x86-64 abort vectors (`#DF`, `#MC`) and a hardware NMI that finds no watchdog backtrace request
 pending (see
 [scheduling-internals.md § `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`](../core/kernel/docs/scheduling-internals.md#ipi_nmi_backtrace_stub--ipi_nmi_backtrace_handler))
@@ -180,9 +184,10 @@ thread's behalf. Its format is a stable cross-boundary contract.
 - **Data words 1–3** — kind-specific:
   - `FAULT_KIND_VM`: faulting virtual address; access flags (bit 0 read, bit 1 write,
     bit 2 instruction fetch, bit 3 present-vs-not-present); faulting instruction pointer.
-    Bit 3 is set only on x86-64. On RISC-V it is always clear, because `scause` does not
-    encode presence, so a handler there MUST NOT read a clear bit 3 as not-present; it
-    inspects its own mappings instead.
+    Bit 3 is set only on x86-64, and only for a user-half faulting address (for a
+    kernel-half address it would disclose which kernel pages are mapped). On RISC-V it is
+    always clear, because `scause` does not encode presence, so a handler there MUST NOT
+    read a clear bit 3 as not-present; it inspects its own mappings instead.
   - `FAULT_KIND_EXCEPTION`: a **normalized exception code** (an architecture-neutral class —
     illegal instruction, breakpoint, alignment, divide, protection, … — so a handler
     dispatches without architecture knowledge; an unrecognized code is treated as the

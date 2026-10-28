@@ -3,8 +3,7 @@
 Enumerates every value the kernel emits across the user/kernel boundary and
 classifies it toward the goal that no kernel virtual address or kernel pointer
 escapes to userspace — a prerequisite for kernel address-space layout
-randomization (KASLR). Known open disclosures: the x86-64 fault-message present
-bit ([#443](https://github.com/kottlerg/seraph/issues/443)), the unpinned
+randomization (KASLR). Known open disclosures: the unpinned
 `SYS_THREAD_READ_REGS` trap-frame copy under a concurrent last-cap delete
 ([#502](https://github.com/kottlerg/seraph/issues/502)), kernel state in
 donated memory that the donor can still map
@@ -20,8 +19,7 @@ KASLR randomizes the kernel's virtual base. A single kernel virtual address (VA)
 kernel pointer, or value derived from one that reaches userspace defeats base
 randomization. This inventory audits the kernel's complete output surface and
 records, per surface, why it carries no kernel VA or, for each known open
-disclosure ([#443](https://github.com/kottlerg/seraph/issues/443),
-[#502](https://github.com/kottlerg/seraph/issues/502),
+disclosure ([#502](https://github.com/kottlerg/seraph/issues/502),
 [#433](https://github.com/kottlerg/seraph/issues/433),
 [#439](https://github.com/kottlerg/seraph/issues/439),
 [#440](https://github.com/kottlerg/seraph/issues/440)), what it leaks. It is the
@@ -37,9 +35,8 @@ distinct, narrower concern handled in "Physical-address surfaces" below.
 Each surface is classified as one of:
 
 - **(a) kernel VA / pointer** — a kernel virtual address, kernel pointer, or value
-  derived from one. A leak. **Two found** among emitted values: the x86-64
-  fault-message `d2` present bit ([#443](https://github.com/kottlerg/seraph/issues/443)) and the
-  unpinned `SYS_THREAD_READ_REGS` trap-frame copy, which can hand freed or reused kernel
+  derived from one. A leak. **One found** among emitted values: the unpinned
+  `SYS_THREAD_READ_REGS` trap-frame copy, which can hand freed or reused kernel
   memory to the caller (see the fault-message note below;
   [#502](https://github.com/kottlerg/seraph/issues/502));
   kernel state kept in donated memory is a separate surface, below.
@@ -76,7 +73,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `SYS_IPC_BUFFER_SET` → status only (validates user-half, page-aligned VA) | `syscall::sys_ipc_buffer_set` | (no output) |
 | Cap split / create / derive handlers → opaque cap handles | `mem::sys_memory_split`, `hw::sys_mmio_split`, `cap::sys_cap_derive` | c |
 | IPC `Message` label / badge / data[] / cap_slots[] | `ipc::message::Message`, `ipc::{read_ipc_buf, write_ipc_buf, write_cap_results}` | b/c |
-| Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge | `ipc::fault::FaultInfo`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for` | b/d; **a** on x86-64 ([#443](https://github.com/kottlerg/seraph/issues/443)) |
+| Fault message `kind` / `d1` / `d2` / `ip` (user VA or hardware code) + label / badge | `ipc::fault::FaultInfo`, `redirect_user_page_fault`, `redirect_user_exception`, `fault_info_for` | b/d |
 | Exit / death reason encoding + death payload `(correlator << 32) \| reason` | `syscall::encode_exit_code`, `EXIT_*` constants, `sched::post_one_death_event` | c/d |
 | Thread ID (random CSPRNG correlator for every thread but init, whose ID is the fixed value 1; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c/d |
 | `CSpaceId` (registry index, never returned to userspace); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |
@@ -96,13 +93,12 @@ Notes on the non-obvious entries:
   pointer from the `TrapFrame` in `ip`; for `FAULT_KIND_EXCEPTION`, a normalized
   exception code in `d1` and an architecture code (x86-64 error code, RISC-V `stval`)
   in `d2` ([docs/fault-handling.md](../../../docs/fault-handling.md) § Fault Message).
-  On x86-64, `d2` is a KASLR disclosure (class **a**): `redirect_user_page_fault` sets
-  `FAULT_ACCESS_PRESENT` from the hardware `#PF` P bit even when the user-chosen `CR2`
-  is a kernel-half address, and the kernel half is mapped supervisor-only in every user
-  address space, so a process bound as its own fault handler can probe whether a kernel
-  VA is mapped; closing it is [#443](https://github.com/kottlerg/seraph/issues/443).
-  RISC-V never sets the bit. No other word carries a kernel VA or a value derived from
-  one. The forwarded/readable `TrapFrame` holds only user-mode register state (no kernel
+  On x86-64, `FAULT_ACCESS_PRESENT` in `d2` copies the hardware `#PF` P bit only when
+  `CR2` is a user-half address (`page_fault_handler`): the kernel half is mapped
+  supervisor-only in every user address space, so for a kernel-half `CR2` the bit would
+  let a process bound as its own fault handler probe whether a kernel VA is mapped, and
+  it is reported clear there. RISC-V never sets the bit. No other word carries a kernel
+  VA or a value derived from one. The forwarded/readable `TrapFrame` holds only user-mode register state (no kernel
   stack pointer, kernel return address, or `CR3`/`satp`); the write path re-validates
   through `sanitize_for_user_resume`. `sys_thread_read_regs` does not pin the TCB it
   resolves through `lookup_cap`, so a sibling's concurrent delete or revoke of the last

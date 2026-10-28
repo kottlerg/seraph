@@ -927,7 +927,8 @@ pub const FAULT_ACCESS_WRITE: u64 = 1 << 1;
 /// `FAULT_KIND_VM` access flag: the access was an instruction fetch.
 pub const FAULT_ACCESS_EXEC: u64 = 1 << 2;
 /// `FAULT_KIND_VM` access flag: the page was present (protection violation)
-/// rather than not-present. Set only on x86-64; on RISC-V it is always clear
+/// rather than not-present. Set only on x86-64, and only for a user-half
+/// faulting address (a kernel-half one reports it clear); on RISC-V it is always clear
 /// because `scause` does not encode presence, so a handler there must not read
 /// a clear bit as not-present (it inspects its own mappings instead).
 pub const FAULT_ACCESS_PRESENT: u64 = 1 << 3;
@@ -982,6 +983,28 @@ pub const FAULT_REPLY_KILL: u64 = 1;
 /// `SYS_THREAD_SET_FAULT_HANDLER` accepts. Reserves the encoding for future
 /// per-class handlers.
 pub const FAULT_CLASS_ALL: u64 = !0u64;
+
+// ── Register file (SYS_THREAD_READ_REGS / SYS_THREAD_WRITE_REGS) ──────────────
+//
+// The buffer `SYS_THREAD_READ_REGS` fills and `SYS_THREAD_WRITE_REGS` reads is
+// the architecture's user register file: an array of `u64` fields in native
+// byte order. Its size and the offsets userspace edits are fixed here per
+// architecture (both are named on every target, so a consumer selects by its
+// own target); the kernel asserts its `TrapFrame` against them at compile time.
+
+/// x86-64 register-file size in bytes.
+pub const REGS_X86_64_SIZE: usize = 168;
+/// Byte offset of the instruction pointer (`rip`) in the x86-64 register file.
+pub const REGS_X86_64_IP_OFFSET: usize = 120;
+/// Byte offset of the stack pointer (`rsp`) in the x86-64 register file.
+pub const REGS_X86_64_SP_OFFSET: usize = 136;
+
+/// riscv64 register-file size in bytes.
+pub const REGS_RISCV64_SIZE: usize = 280;
+/// Byte offset of the instruction pointer (`sepc`) in the riscv64 register file.
+pub const REGS_RISCV64_IP_OFFSET: usize = 248;
+/// Byte offset of the stack pointer (`sp`, `x2`) in the riscv64 register file.
+pub const REGS_RISCV64_SP_OFFSET: usize = 8;
 
 // ── System info ───────────────────────────────────────────────────────────────
 

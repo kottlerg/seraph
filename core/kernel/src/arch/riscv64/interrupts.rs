@@ -9,7 +9,7 @@
 //! 1. Installs `trap_entry` in `stvec` (direct mode).
 //! 2. Clears `sstatus.SIE`, `sstatus.SPP`, `sstatus.SUM` for a clean initial state.
 //! 3. Enables `sie.SSIP` (IPIs), `sie.STIP` (timer), and `sie.SEIP` (external) bits.
-//! 4. Initialises the PLIC: sets all source priorities to 1 and the hart 0
+//! 4. Initialises the PLIC: sets all source priorities to 1 and the boot hart's
 //!    S-mode threshold to 0 (accept all above-threshold interrupts).
 //!
 //! The trap vector dispatches:
@@ -29,17 +29,30 @@
 //! `BootInfo.kernel_mmio.plic_base` (see [`super::platform::plic_base`]) and
 //! accessed via the direct map. Register offsets follow the RISC-V PLIC spec:
 //! - Priority registers: base + 4*source (sources `1..=PLIC_NUM_SOURCES`).
-//! - Enable registers:  base + 0x2080 + 4*word  (hart 0 S-mode context).
-//! - Threshold:         base + `0x20_1000`.
-//! - Claim/Complete:    base + `0x20_1004`.
+//! - Enable registers:  base + 0x2000 + 0x80*context + 4*word.
+//! - Threshold:         base + `0x20_0000` + 0x1000*context.
+//! - Claim/Complete:    the threshold register + 4.
+//!
+//! A hart's S-mode context is `hart*2 + 1`, numbered by the hardware hart id
+//! (`percpu::apic_id_for`), never by the kernel's logical CPU index: the boot hart
+//! need not be hart 0, and the two numberings differ wherever firmware enumerates
+//! harts sparsely.
+//!
+//! # Locking
+//! [`plic_enable`] and [`plic_disable`] read-modify-write a 32-source enable word of
+//! the BSP's context, and run on any hart (`SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`, the
+//! device-IRQ dispatch in interrupt context, and the Interrupt and Notification dealloc
+//! paths), so each holds `PLIC_LOCK`, a leaf lock taken with interrupts disabled,
+//! across its read and write; otherwise two updates to sources sharing a word could
+//! lose one. [`init`] and [`init_ap`] write only the boot hart's or their own hart's
+//! context before any IRQ is routed and take no lock; the claim and complete
+//! registers are per-context and need none.
 //!
 //! # Modification notes
 //! - Device IRQs need no per-device code here: `route_device_irq` enables (and masks) the
 //!   source on the BSP context, and `dispatch_external` forwards every claimed source to
 //!   `crate::irq::dispatch_device_irq`.
-//! - PLIC contexts are computed from `current_cpu()` (S-mode context = cpu*2 + 1), which
-//!   equals the hart-id numbering only where logical index and hart id coincide (#443);
-//!   device IRQs are enabled on the BSP context only (`BSP_S_CTX_ENABLE_BASE`).
+//! - Device IRQs are enabled on the BSP context only (`bsp_enable_base`).
 
 use super::trap_frame::TrapFrame;
 use crate::mm::paging::phys_to_virt;
@@ -49,52 +62,73 @@ use crate::mm::paging::phys_to_virt;
 /// PLIC priority register base: base + 4 * `source_id` (source 1..=127).
 const PLIC_PRIORITY_BASE: u64 = 0x0000;
 
-/// Compute the PLIC enable register base for the current hart's S-mode context.
-///
-/// PLIC context = `current_cpu() * 2 + 1`: the logical CPU index stands in for the hart id,
-/// which is correct only where the two coincide (#443).
-/// Enable base = PLIC base + 0x2000 + context * 0x80.
-///
-/// Used only for per-hart cleanup at boot. Runtime device-IRQ routing is
-/// pinned to the BSP (see [`BSP_S_CTX_ENABLE_BASE`]) so that enable/mask
-/// pairs on the same source always target the same context, and only that
-/// one hart takes the trap when the IRQ fires.
-fn plic_enable_base() -> u64
-{
-    let ctx = u64::from(super::cpu::current_cpu()) * 2 + 1;
-    0x2000 + ctx * 0x80
-}
-
-/// Compute the PLIC S-mode enable-bits base for the given hart.
+/// PLIC S-mode context of the hart with hardware id `hart`.
 ///
 /// Standard PLIC context numbering: M-mode = `hart*2`, S-mode = `hart*2+1`.
-/// Enable base = 0x2000 + context * 0x80.
-const fn plic_enable_base_for(hart: u32) -> u64
+const fn plic_s_context(hart: u32) -> u64
 {
-    0x2000 + (hart as u64 * 2 + 1) * 0x80
+    hart as u64 * 2 + 1
 }
 
-/// PLIC S-mode enable-bits base for hart 0, used as the BSP's context; this assumes the
-/// BSP is hart 0, which the boot protocol does not guarantee (#443).
+/// PLIC S-mode enable-bits base for the hart with hardware id `hart`:
+/// 0x2000 + context * 0x80.
+const fn plic_enable_base_for(hart: u32) -> u64
+{
+    0x2000 + plic_s_context(hart) * 0x80
+}
+
+/// PLIC S-mode threshold register offset for the hart with hardware id `hart`:
+/// 0x20_0000 + context * 0x1000. The claim/complete register follows at +4.
+const fn plic_threshold_offset_for(hart: u32) -> u64
+{
+    0x0020_0000 + plic_s_context(hart) * 0x1000
+}
+
+/// Hardware hart id of the BSP, whose S-mode context every device IRQ is routed to.
+///
+/// Written once by [`init`] (Phase 5, single-threaded, before any AP starts or any IRQ
+/// is routed) from `percpu::apic_id_for(0)`, and read-only afterwards.
+#[cfg(not(test))]
+static BSP_HART: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Serialises the enable-word read-modify-write of [`plic_enable`] and [`plic_disable`]
+/// (see the module doc's § Locking). A leaf lock: nothing is acquired while it is held.
+#[cfg(not(test))]
+static PLIC_LOCK: crate::sync::Spinlock = crate::sync::Spinlock::new();
+
+/// PLIC S-mode enable-bits base of the BSP's context.
 ///
 /// All device IRQs are routed to the BSP's S-mode context — a single known
 /// hart — so that only one hart takes the trap and there is no thundering-
 /// herd claim race between multiple harts for the same source.
-const BSP_S_CTX_ENABLE_BASE: u64 = plic_enable_base_for(0);
-
-/// Compute the PLIC threshold register offset for the S-mode context numbered by the
-/// current logical CPU index (`current_cpu() * 2 + 1`; equals this hart's context only
-/// where the logical index equals the hart id, #443).
-fn plic_threshold_offset() -> u64
+#[cfg(not(test))]
+fn bsp_enable_base() -> u64
 {
-    let ctx = u64::from(super::cpu::current_cpu()) * 2 + 1;
-    0x0020_0000 + ctx * 0x1000
+    plic_enable_base_for(BSP_HART.load(core::sync::atomic::Ordering::Relaxed))
 }
 
-/// Compute the PLIC claim/complete register offset for the current hart's S-mode context.
+/// Hardware hart id of the executing hart.
+#[cfg(not(test))]
+fn current_hart() -> u32
+{
+    let cpu = super::cpu::current_cpu() as usize;
+    // SAFETY: `current_cpu()` is this hart's logical index, below `CPU_COUNT`;
+    // `percpu::init_apic_ids` runs before Phase 5 (`kernel_entry`), ahead of every
+    // caller (`init_ap` and the external-interrupt claim and complete).
+    unsafe { crate::percpu::apic_id_for(cpu) }
+}
+
+/// Host-test stub: no hart identity exists off-target.
+#[cfg(test)]
+fn current_hart() -> u32
+{
+    0
+}
+
+/// PLIC claim/complete register offset for the executing hart's S-mode context.
 fn plic_claim_complete_offset() -> u64
 {
-    plic_threshold_offset() + 4
+    plic_threshold_offset_for(current_hart()) + 4
 }
 
 /// Conservative cap on the PLIC source number the kernel programs. The
@@ -102,6 +136,11 @@ fn plic_claim_complete_offset() -> u64
 /// exposes far fewer, and the boot-time priority and enable-word loops stay cheap at
 /// this bound.
 const PLIC_NUM_SOURCES: u32 = 127;
+
+// `SYS_IRQ_REGISTER` admits sources up to the arch-interface `MAX_IRQ_ID`; a
+// source above PLIC_NUM_SOURCES would be accepted and then silently left
+// unprogrammed by `plic_enable`.
+const _: () = assert!(super::MAX_IRQ_ID == PLIC_NUM_SOURCES);
 
 // ── PLIC access helpers ───────────────────────────────────────────────────────
 
@@ -804,26 +843,17 @@ unsafe fn redirect_user_fault(
 ///
 /// TODO: per-IRQ affinity. When the system grows multiple high-rate IRQ
 /// sources (additional block devices, a NIC, more than one virtio queue
-/// with per-queue MSI), concentrating all trap dispatch on hart 0 becomes
+/// with per-queue MSI), concentrating all trap dispatch on the BSP becomes
 /// a bottleneck. Replace this with a per-source hart selector — either
 /// round-robin at registration, user-supplied affinity, or a dynamic
 /// rebalancer. The downstream `dispatch_device_irq` path is already
-/// hart-agnostic (`acknowledge` uses `current_cpu`), so only the enable-bit
-/// placement here needs to change. Same TODO applies to
+/// hart-agnostic (`acknowledge` completes on the executing hart's context), so
+/// only the enable-bit placement here needs to change. Same TODO applies to
 /// `core/kernel/src/arch/x86_64/ioapic.rs` (`ioapic::route`).
 #[cfg(not(test))]
 pub fn plic_enable(source: u32)
 {
-    if source == 0 || source > PLIC_NUM_SOURCES
-    {
-        return;
-    }
-    let word_idx = source / 32;
-    let bit_idx = source % 32;
-    let offset = BSP_S_CTX_ENABLE_BASE + (u64::from(word_idx) * 4);
-    let current = plic_read(offset);
-    // SAFETY: direct map active; PLIC MMIO is accessible.
-    unsafe { plic_write(offset, current | (1 << bit_idx)) };
+    plic_update_enable_word(source, |word, bit| word | bit);
 }
 
 /// Disable PLIC `source` on the BSP's S-mode context.
@@ -834,16 +864,33 @@ pub fn plic_enable(source: u32)
 #[cfg(not(test))]
 pub fn plic_disable(source: u32)
 {
+    plic_update_enable_word(source, |word, bit| word & !bit);
+}
+
+/// Rewrite the BSP-context enable word holding PLIC `source` to
+/// `update(word, bit)`, where `bit` is the source's mask in that word, under
+/// `PLIC_LOCK` (module doc § Locking). A source outside `1..=PLIC_NUM_SOURCES`
+/// is ignored; `SYS_IRQ_REGISTER` refuses such an id.
+#[cfg(not(test))]
+fn plic_update_enable_word(source: u32, update: impl FnOnce(u32, u32) -> u32)
+{
     if source == 0 || source > PLIC_NUM_SOURCES
     {
         return;
     }
     let word_idx = source / 32;
-    let bit_idx = source % 32;
-    let offset = BSP_S_CTX_ENABLE_BASE + (u64::from(word_idx) * 4);
+    let bit = 1u32 << (source % 32);
+    let offset = bsp_enable_base() + (u64::from(word_idx) * 4);
+    // SAFETY: PLIC_LOCK is a leaf lock; lock_raw disables interrupts and is
+    // paired with unlock_raw below on the only path out.
+    let saved = unsafe { PLIC_LOCK.lock_raw() };
     let current = plic_read(offset);
-    // SAFETY: direct map active; PLIC MMIO is accessible.
-    unsafe { plic_write(offset, current & !(1 << bit_idx)) };
+    let updated = update(current, bit);
+    // SAFETY: direct map active; PLIC MMIO is accessible; `offset` is an enable
+    // word of the BSP's S-mode context.
+    unsafe { plic_write(offset, updated) };
+    // SAFETY: paired with lock_raw above.
+    unsafe { PLIC_LOCK.unlock_raw(saved) };
 }
 
 /// Mask (disable) PLIC source `irq`.
@@ -938,7 +985,9 @@ pub unsafe fn install_trap_vector() {}
 /// Initialise supervisor trap infrastructure for the BSP.
 ///
 /// # Safety
-/// Must execute in supervisor mode with the direct physical map active.
+/// Must execute in supervisor mode with the direct physical map active, once,
+/// on the BSP, after `percpu::init_apic_ids` (the BSP's PLIC context is that of
+/// its hart id, `percpu::apic_id_for(0)`).
 #[cfg(not(test))]
 pub unsafe fn init()
 {
@@ -1018,8 +1067,14 @@ pub unsafe fn init()
     // - Disable all source enables for BSP context (firmware may have enabled UART etc.).
     // - Set threshold to 0 for BSP S-mode context (accept all sources ≥ 1).
     //
-    // Uses hardcoded BSP context (hart 0 S-mode = context 1) because percpu
-    // data is not yet available at this point in Phase 5.
+    // The BSP's context is numbered by its hart id, which the boot protocol
+    // does not fix at 0 (`BootInfo.cpu_ids[0]`, copied into the per-CPU id slab
+    // before Phase 5). `current_cpu()` is not yet usable here (`tp` is installed
+    // after this function), so the id is read for logical CPU 0 directly.
+    // SAFETY: logical CPU 0 (the BSP) is below CPU_COUNT, and the caller ran
+    // percpu::init_apic_ids first.
+    let bsp_hart = unsafe { crate::percpu::apic_id_for(0) };
+    BSP_HART.store(bsp_hart, core::sync::atomic::Ordering::Relaxed);
     // SAFETY: direct map active; PLIC MMIO region accessible; plic_write performs
     // volatile stores to valid PLIC register offsets.
     unsafe {
@@ -1028,13 +1083,12 @@ pub unsafe fn init()
             plic_write(PLIC_PRIORITY_BASE + (u64::from(src) * 4), 1);
         }
         let enable_words = PLIC_NUM_SOURCES.div_ceil(32);
-        let bsp_enable_base = plic_enable_base_for(0);
+        let bsp_enable_base = plic_enable_base_for(bsp_hart);
         for w in 0..enable_words
         {
             plic_write(bsp_enable_base + u64::from(w) * 4, 0);
         }
-        // BSP context 1: threshold = 0x200000 + 1*0x1000 = 0x201000
-        plic_write(0x0020_1000, 0);
+        plic_write(plic_threshold_offset_for(bsp_hart), 0);
     }
 }
 
@@ -1090,12 +1144,15 @@ pub unsafe fn init_ap()
 
     // Set PLIC threshold to 0 for this hart's S-mode context and disable
     // all sources. Firmware may have left sources enabled (e.g. UART),
-    // which would cause unhandled interrupt storms on secondary harts.
+    // which would cause unhandled interrupt storms on secondary harts. The
+    // context is this hart's (by hart id); percpu::init_ap installed `tp`
+    // before this call, so current_cpu() is valid.
+    let hart = current_hart();
     // SAFETY: direct map active; PLIC MMIO accessible; per-hart context.
     unsafe {
-        plic_write(plic_threshold_offset(), 0);
+        plic_write(plic_threshold_offset_for(hart), 0);
         // Disable all source enable words for this hart's context.
-        let enable_base = plic_enable_base();
+        let enable_base = plic_enable_base_for(hart);
         let enable_words = PLIC_NUM_SOURCES.div_ceil(32);
         for w in 0..enable_words
         {
@@ -1466,15 +1523,15 @@ mod tests
     use super::*;
 
     #[test]
-    fn plic_threshold_offset()
+    fn plic_context_registers_follow_the_hart_id()
     {
-        assert_eq!(plic_threshold_offset(), 0x0020_1000);
-    }
-
-    #[test]
-    fn plic_claim_complete_offset()
-    {
-        assert_eq!(plic_claim_complete_offset(), 0x0020_1004);
+        // Hart 0: S-mode context 1.
+        assert_eq!(plic_enable_base_for(0), 0x2080);
+        assert_eq!(plic_threshold_offset_for(0), 0x0020_1000);
+        // Hart 3: S-mode context 7, so a boot hart other than 0 gets its own
+        // registers rather than hart 0's.
+        assert_eq!(plic_enable_base_for(3), 0x2000 + 7 * 0x80);
+        assert_eq!(plic_threshold_offset_for(3), 0x0020_0000 + 7 * 0x1000);
     }
 
     #[test]

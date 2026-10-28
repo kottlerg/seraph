@@ -29,18 +29,15 @@ pub const ARCH_NAME: &str = "riscv64";
 /// type when Phase 9 applies init's `.rela.dyn` fix-ups (`mm::init_reloc`).
 pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_RISCV;
 
-/// Maximum PLIC source number the kernel programs. Sources 1–`MAX_IRQ_ID`
-/// are usable; source 0 is reserved by the PLIC spec.
-///
-/// Part of the arch-interface contract; no current in-tree consumer.
-#[allow(dead_code)]
+/// Maximum PLIC source number the kernel programs (`interrupts::PLIC_NUM_SOURCES`).
+/// Sources 1–`MAX_IRQ_ID` are usable; source 0 is reserved by the PLIC spec.
+/// `SYS_IRQ_REGISTER` refuses an id outside them.
 pub const MAX_IRQ_ID: u32 = 127;
 
 /// Minimum valid PLIC source number. PLIC source 0 is reserved and never
 /// wired to a real device.
-///
-/// Part of the arch-interface contract; no current in-tree consumer.
-#[allow(dead_code)]
+// dead_code: host test builds compile out `sys_irq_register`, the only reader.
+#[cfg_attr(test, allow(dead_code))]
 pub const MIN_IRQ_ID: u32 = 1;
 
 /// RISC-V has no I/O port space: no root `IoPort` capability is minted and
@@ -52,10 +49,9 @@ pub const HAS_SBI: bool = true;
 
 /// Width of the root `Interrupt` range capability minted at Phase 7: the
 /// PLIC's 1024-entry id space (id 0 reserved, sources 1–1023); most platforms
-/// expose far fewer. The cap admits ids the kernel cannot route: `plic_enable`
-/// ignores a source above `PLIC_NUM_SOURCES` without error, and
-/// `irq::register` indexes a 256-entry table, so registering an id of 256 or
-/// above panics (#443).
+/// expose far fewer. The cap spans ids the kernel does not program; a split can
+/// name them, and `SYS_IRQ_REGISTER` refuses any outside
+/// `MIN_IRQ_ID..=MAX_IRQ_ID` with `InvalidArgument`.
 pub const ROOT_IRQ_COUNT: u32 = 1024;
 
 /// Size of the I/O Permission Bitmap (re-exported from gdt for use in

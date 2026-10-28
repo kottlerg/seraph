@@ -11,10 +11,11 @@
 //! 3. Add a dispatch arm to `core/kernel/src/syscall/mod.rs`.
 //! 4. Add a userspace wrapper to `shared/syscall/src/lib.rs`.
 
-// cast_possible_truncation: u64→u32/u8 casts keep the low bits of 64-bit
-// trap-frame args (cap indices, CPU IDs, priority levels, split points); bits
-// above the target width are discarded, not rejected, and validation runs on
-// the narrowed value. u64→usize casts are lossless (Seraph is 64-bit only).
+// cast_possible_truncation: u64→u32 casts keep the low 32 bits of 64-bit
+// trap-frame cap-handle args, whose ABI width is 32 bits. Value args with a
+// range contract (priority levels, split points, CPU IDs) are narrowed with
+// `try_from` and rejected when out of range. u64→usize casts are lossless
+// (Seraph is 64-bit only).
 #![allow(clippy::cast_possible_truncation)]
 
 use crate::arch::current::trap_frame::TrapFrame;
@@ -1275,7 +1276,9 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use syscall::PRIORITY_MAX;
 
     let thread_idx = tf.arg(0) as u32;
-    let priority = tf.arg(1) as u8;
+    // Validate the full 64-bit argument: a value above u8 is out of range, not
+    // its low byte.
+    let priority = u8::try_from(tf.arg(1)).map_err(|_| SyscallError::InvalidArgument)?;
     let sched_idx = tf.arg(2) as u32;
 
     // Validate priority range: 0 (idle) and 31 (reserved) are rejected.
@@ -1404,7 +1407,8 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::syscall::current_tcb;
 
     let sched_handle = tf.arg(0) as u32;
-    let split_at = tf.arg(1) as u8;
+    // A value above u8 cannot name a level; reject it rather than its low byte.
+    let split_at = u8::try_from(tf.arg(1)).map_err(|_| SyscallError::InvalidArgument)?;
     // arg2 reserved.
 
     // ── Capability lookup ─────────────────────────────────────────────────────
@@ -1511,10 +1515,11 @@ pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///   the next enqueue (`enqueue_and_wake` on wake, `sys_thread_start` on
 ///   start or resume), both routed via `select_target_cpu`.
 ///
-/// The handler takes no `sched_lock` and `lookup_cap` takes no reference on the
-/// target, so these outcomes hold only absent a concurrent free of the TCB or a
-/// racing scheduler path (`core/kernel/docs/syscalls.md` §
-/// `SYS_THREAD_SET_AFFINITY`, #443, #502).
+/// The affinity write, the `preferred_cpu` / `state` reads, and the action run
+/// under the target's `sched_lock`, and the IPI is sent after it is released.
+/// `lookup_cap` takes no reference on the target, so these outcomes hold only
+/// absent a concurrent free of the TCB (`core/kernel/docs/syscalls.md` §
+/// `SYS_THREAD_SET_AFFINITY`, #502).
 ///
 /// Returns 0 on success.
 ///
@@ -1528,12 +1533,13 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::object::ThreadObject;
     use crate::cap::slot::ThreadRights;
     use crate::sched::AFFINITY_ANY;
-    use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
     use core::sync::atomic::Ordering;
 
     let thread_idx = tf.arg(0) as u32;
-    let cpu_id = tf.arg(1) as u32;
+    // A value above u32 names no CPU and is not AFFINITY_ANY; reject it rather
+    // than its low word.
+    let cpu_id = u32::try_from(tf.arg(1)).map_err(|_| SyscallError::InvalidArgument)?;
 
     // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
     let caller_tcb = unsafe { current_tcb() };
@@ -1572,78 +1578,102 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     }
 
-    // SAFETY: target_tcb was a live TCB at lookup. `lookup_cap` takes no
-    // reference on the object, so it is not pinned for this block
-    // (`core/kernel/docs/capability-internals.md` § Storage: Hybrid Two-Level
-    // Radix, #502), and the `cpu_affinity` write and the `preferred_cpu` /
-    // `state` reads are not serialised with other CPUs' scheduler paths
-    // (`core/kernel/docs/syscalls.md` § SYS_THREAD_SET_AFFINITY, #443).
-    unsafe {
-        let old_cpu = (*target_tcb).preferred_cpu as usize;
+    // `cpu_affinity`, `preferred_cpu`, and `state` are in the Scheduling field
+    // group, whose serializer is the target's `sched_lock`
+    // (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership). Hold
+    // it across the affinity write, the reads, and the migration, so the load
+    // balancer's re-check and `schedule()`'s requeue (both under the same lock)
+    // see the write and the state cannot change under the decision. `lock_raw`
+    // disables interrupts, so no local timer-driven `schedule()` runs inside the
+    // section either. The IPI to the CPU that must act is sent after the unlock.
+    // SAFETY: target_tcb was a live TCB at lookup; `lookup_cap` takes no reference
+    // on the object, so it is not pinned for this call (#502). lock_raw is paired
+    // with the unlock_raw below.
+    let tcb_sched_saved = unsafe { (*target_tcb).sched_lock.lock_raw() };
 
-        // Pin preemption across the `cpu_affinity` write and the state-read + action
-        // that follows, as core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
-        // Ownership (`cpu_affinity` enforcement invariant, #116) requires. This
-        // function takes no `sched_lock`, so these accesses race other CPUs'
-        // scheduler paths (core/kernel/docs/syscalls.md § SYS_THREAD_SET_AFFINITY,
-        // #443).
-        crate::percpu::preempt_disable();
-        (*target_tcb).cpu_affinity = cpu_id;
+    // SAFETY: as above; every access is under the held sched_lock.
+    let prod_cpu = unsafe { set_affinity_locked(target_tcb, cpu_id) };
 
-        // No active migration when affinity is cleared (any-CPU): the load
-        // balancer or the next enqueue will place the thread.
-        if cpu_id == AFFINITY_ANY
-        {
-            crate::percpu::preempt_enable();
-            return Ok(0);
-        }
-        let new_cpu = cpu_id as usize;
-        if new_cpu == old_cpu
-        {
-            crate::percpu::preempt_enable();
-            return Ok(0);
-        }
+    // SAFETY: paired with the lock_raw above.
+    unsafe { (*target_tcb).sched_lock.unlock_raw(tcb_sched_saved) };
 
-        // preferred_cpu is only ever written with an in-range CPU index (by
-        // enqueue_and_wake, enqueue_ready_thread, schedule(), and the relocate /
-        // migrate paths). A value >= CPU_COUNT indicates a corrupted TCB, which we
-        // ignore here.
-        let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
-        if old_cpu >= cpu_count
-        {
-            crate::percpu::preempt_enable();
-            return Ok(0);
-        }
-
-        // Unlocked read; revalidated under-lock by migrate_ready_thread or
-        // tolerated as a spurious IPI in the Running case.
-        match (*target_tcb).state
-        {
-            ThreadState::Ready =>
-            {
-                // Best-effort: migrate_ready_thread re-checks state and
-                // location under both scheduler locks and bails on race.
-                let _ = crate::sched::migrate_ready_thread(target_tcb, old_cpu, new_cpu);
-            }
-            ThreadState::Running =>
-            {
-                // The Running thread's CPU sees the affinity change at its
-                // next schedule() entry (see core/kernel/src/sched/mod.rs schedule() re-enqueue
-                // path). The IPI does not itself call schedule(), so that entry comes at
-                // worst one time slice later.
-                crate::sched::set_reschedule_pending_for(old_cpu);
-                crate::sched::prod_remote_cpu(old_cpu);
-            }
-            _ =>
-            {
-                // Blocked / Stopped / Created / Exited: next enqueue routes
-                // via select_target_cpu which now sees the new affinity.
-            }
-        }
-        crate::percpu::preempt_enable();
+    if let Some(cpu) = prod_cpu
+    {
+        // SAFETY: set_affinity_locked returns only an online CPU index.
+        unsafe { crate::sched::prod_remote_cpu(cpu) };
     }
 
     Ok(0)
+}
+
+/// Write `cpu_id` into `tcb`'s `cpu_affinity` and act on it: migrate a `Ready`
+/// thread queued on another CPU, or flag the CPU running it for a reschedule.
+/// Returns the CPU to prod with the wakeup IPI once the caller releases
+/// `sched_lock`, if any.
+///
+/// # Safety
+/// `tcb` is a valid TCB whose `sched_lock` the caller holds, and no scheduler
+/// lock is held; `cpu_id` is `AFFINITY_ANY` or below `CPU_COUNT`.
+#[cfg(not(test))]
+unsafe fn set_affinity_locked(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    cpu_id: u32,
+) -> Option<usize>
+{
+    use crate::sched::AFFINITY_ANY;
+    use crate::sched::thread::ThreadState;
+
+    // SAFETY: tcb valid and its sched_lock held (caller contract).
+    let (old_cpu, state) = unsafe {
+        (*tcb).cpu_affinity = cpu_id;
+        ((*tcb).preferred_cpu as usize, (*tcb).state)
+    };
+
+    // No active migration when affinity is cleared (any-CPU): the load
+    // balancer or the next enqueue will place the thread.
+    let new_cpu = cpu_id as usize;
+    if cpu_id == AFFINITY_ANY || new_cpu == old_cpu
+    {
+        return None;
+    }
+
+    // preferred_cpu is only ever written with an in-range CPU index (by
+    // enqueue_and_wake, enqueue_ready_thread, schedule(), and the relocate /
+    // migrate paths). A value >= CPU_COUNT indicates a corrupted TCB, which we
+    // ignore here.
+    let cpu_count =
+        crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    if old_cpu >= cpu_count
+    {
+        return None;
+    }
+
+    match state
+    {
+        ThreadState::Ready =>
+        {
+            // migrate_ready_thread re-checks location under both run-queue
+            // locks and declines if the thread is no longer linked on old_cpu
+            // (a dequeue for dispatch already took it; `schedule()`'s
+            // cross-affinity arm moves it at its next requeue).
+            // SAFETY: tcb valid, its sched_lock held, no scheduler lock held;
+            // both CPUs < CPU_COUNT.
+            let moved = unsafe { crate::sched::migrate_ready_thread(tcb, old_cpu, new_cpu) };
+            moved.then_some(new_cpu)
+        }
+        ThreadState::Running =>
+        {
+            // The Running thread's CPU sees the affinity change at its
+            // next schedule() entry (see core/kernel/src/sched/mod.rs schedule() re-enqueue
+            // path). The IPI does not itself call schedule(), so that entry comes at
+            // worst one time slice later.
+            crate::sched::set_reschedule_pending_for(old_cpu);
+            Some(old_cpu)
+        }
+        // Blocked / Stopped / Created / Exited: next enqueue routes via
+        // select_target_cpu, which reads the new affinity under sched_lock.
+        _ => None,
+    }
 }
 
 /// `SYS_THREAD_READ_REGS` (39): read register state of a stopped or fault-blocked
@@ -1778,7 +1808,8 @@ pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// The thread must be fault-blocked, or `Stopped` and descheduled
 /// (`sched::with_held_frame`). The kernel sanitizes the frame per architecture
 /// (`core/kernel/docs/arch-interface.md` § `trap_frame`) before writing; RISC-V
-/// applies `sstatus` as supplied (#443). Returns 0 on success.
+/// replaces the supplied `sstatus` with the user-resume value. Returns 0 on
+/// success.
 ///
 /// # Errors
 /// - `InvalidCapability`: no current thread, or arg0 names no Thread cap.
@@ -1894,7 +1925,7 @@ pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// Validate and sanitize a user-supplied `TrapFrame` before writing it into a
 /// thread, per architecture (`core/kernel/docs/arch-interface.md` § `trap_frame`
-/// — `arch::current::trap_frame`); RISC-V applies `sstatus` as supplied (#443).
+/// — `arch::current::trap_frame`); RISC-V replaces the supplied `sstatus`.
 ///
 /// Mutates `regs` in place to force safe segment/flag values.
 ///

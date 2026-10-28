@@ -328,6 +328,25 @@ it observes the bumped `tlb_gen` on reactivation (and flushes the tag). Never ne
 the full-flush fallback (no tagging) the request carries `tag == 0` and the switch already
 flushed the outgoing space's entries, so a switched-away CPU has nothing stale.
 
+The initiator (`AddressSpace::shootdown_remote`) reads the space's `tag` before step 2,
+without the tag-pool lock, so an eviction can race it. The request is still correct.
+Eviction revokes a tag only from a space active on no CPU (`tag_allocator::claim`, under
+`TAG_POOL_LOCK`, revoke then `SeqCst` fence then the active-mask check, restoring the tag
+otherwise). So for a CPU `C` in the step-2 snapshot, the tag `T` the request carries is
+either the tag `C` runs the space under, and the flush is exact, or the space lost `T` to
+an eviction after the read, which needed the space inactive everywhere, so `C` activated
+it again after that eviction, under a fresh claim. Then: (1) the fresh claim stamps a new
+`tag_gen`, so `C`'s per-CPU generation check flushed the whole new tag at that activation,
+which came after the step-1 PTE edit, and every entry `C` caches under it was walked from
+the edited tables; (2) entries `C` still holds under `T` for this space are unreachable
+through this space, and any later load of `T` (by its next owner, or by this space under a
+new claim) carries a different `tag_gen` and flushes `T` first; (3) flushing `(T, va)` on
+`C` is at worst a redundant invalidation in another space. A read that lands in an
+aborted eviction's transient revoke sees `tag == 0`; the request then invalidates the
+target's loaded tag, which is this space's on every CPU still running it, and a CPU that
+switched away is covered by the `tlb_gen` bump above. No ordering of the read against the
+bump or the snapshot is therefore needed.
+
 ### Direct Physical Map Access
 
 The direct physical map is set up during Phase 3 of initialization

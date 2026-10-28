@@ -13,7 +13,9 @@
 //! interrupts while held, preventing timer-driven deadlock. Acquire before
 //! any `enqueue`, `dequeue_highest`, `remove_from_queue`, `find_runnable`,
 //! or `set_current` call; the first four are `unsafe` with that contract,
-//! since every CPU reaches every scheduler through a shared reference.
+//! since every CPU reaches every scheduler through a shared reference. The
+//! boot exception: `sched::init` and `sched::enter` call `set_current` without
+//! the lock, before the CPU concerned first schedules (see `set_current`).
 //!
 //! Cross-CPU migration goes through `sched::relocate_ready_thread`, called by
 //! `sched::migrate_ready_thread` (`sys_thread_set_affinity`) and
@@ -218,9 +220,10 @@ pub struct PerCpuScheduler
     non_empty: AtomicU32,
 
     /// Currently executing TCB on this CPU (non-null after `init`). Written by
-    /// `init` on the boot CPU before any CPU schedules, then only by this CPU,
-    /// under `lock`; read by any CPU, under `lock` or as a lock-free snapshot
-    /// that a later check re-decides.
+    /// `init` on the boot CPU before any CPU schedules, and by `sched::enter`
+    /// for CPU 0 without `lock` (its boot dispatch of init, before CPU 0 first
+    /// schedules), then only by this CPU, under `lock`; read by any CPU, under
+    /// `lock` or as a lock-free snapshot that a later check re-decides.
     current: AtomicPtr<ThreadControlBlock>,
 
     /// Idle TCB for this CPU (non-null after `init`); written once by `init`
@@ -482,8 +485,9 @@ impl PerCpuScheduler
     }
 
     /// Record `tcb` as the currently running thread on this CPU. Called by
-    /// `init` on the boot CPU before any CPU schedules, then only by this CPU,
-    /// under `lock`.
+    /// `init` on the boot CPU before any CPU schedules, and by `sched::enter`
+    /// for CPU 0 without `lock` (its boot dispatch of init, before CPU 0 first
+    /// schedules), then only by this CPU, under `lock`.
     pub fn set_current(&self, tcb: *mut ThreadControlBlock)
     {
         self.current.store(tcb, Ordering::Relaxed);
@@ -1032,5 +1036,33 @@ mod tests
         assert_eq!(locate_relocate(&scheds, pt, 6, 3, 0), None);
         assert_eq!(scheds[0].non_empty.load(Ordering::Relaxed), 0);
         assert_eq!(scheds[1].non_empty.load(Ordering::Relaxed), 0);
+    }
+
+    // Defect caught: a `lock_saving_flags` that does not take the CPU lock, or an
+    // `unlock_saved_flags` that does not release it, which would let two
+    // all-CPU-locks holders interleave or wedge the next one. (The interrupt-flag
+    // word itself is not observable on the host, where `lock_raw` returns 0.)
+    #[test]
+    fn lock_saving_flags_holds_the_lock_until_unlock_saved_flags()
+    {
+        let sched = PerCpuScheduler::new();
+        for _ in 0..2
+        {
+            // SAFETY: single-threaded test; paired with unlock_saved_flags below.
+            unsafe { sched.lock_saving_flags() };
+            // SAFETY: as above; a try on a held lock takes nothing.
+            assert!(unsafe { sched.lock.try_lock_raw() }.is_none());
+            // SAFETY: the lock is held through lock_saving_flags above.
+            unsafe { sched.unlock_saved_flags() };
+            // SAFETY: single-threaded test; the lock is free, so the try takes it,
+            // and unlock_raw releases it again.
+            let saved = unsafe { sched.lock.try_lock_raw() };
+            assert!(saved.is_some());
+            if let Some(flags) = saved
+            {
+                // SAFETY: paired with the try_lock_raw above.
+                unsafe { sched.lock.unlock_raw(flags) };
+            }
+        }
     }
 }

@@ -73,9 +73,13 @@ unsafe impl Sync for EventQueueState {}
 
 // `cap::retype::EVENT_QUEUE_STATE_BYTES` must match the actual size of
 // this struct — the retype slot layout depends on the constant when
-// computing where the inline ring starts. Update both sides together.
+// computing where the inline ring starts. Anchored to the constant itself, so
+// a change to either side alone fails to compile.
 const _: () = {
-    assert!(core::mem::size_of::<EventQueueState>() == 56);
+    assert!(
+        core::mem::size_of::<EventQueueState>()
+            == crate::cap::retype::EVENT_QUEUE_STATE_BYTES as usize
+    );
 };
 
 impl EventQueueState

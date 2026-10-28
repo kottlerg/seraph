@@ -218,6 +218,8 @@ overlap the kernel image window halts with
    GDT/TSS, IST stacks, and NMI-backtrace storage (`sched::init_storage`); then the
    entropy subsystem's per-CPU CSPRNGs, central pool, jitter accumulators, and
    self-test sample slab (`entropy::init_storage`)
+5. Copy `BootInfo.cpu_ids` into the APIC-ID slab (`percpu::init_apic_ids`), so Phase 5
+   can name the BSP by its hardware id (the riscv64 PLIC context)
 ```
 
 Retype-based kernel object memory, which replaces a kernel heap, is specified in
@@ -287,8 +289,9 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
      the V extension)
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
 4. Grant U-mode the cycle counter (scounteren.CY)
-5. Initialise the PLIC for the BSP context: priority 1 for every source, all enables
-   cleared, threshold 0
+5. Initialise the PLIC for the BSP's S-mode context, the one numbered by the BSP's hart
+   id (`BootInfo.cpu_ids[0]`, which need not be 0): priority 1 for every source, all
+   enables cleared, threshold 0
 6. Arm stimecmp (Sstc) for the initial tick, using the bootloader-discovered
    timebase; halts if Sstc or the timebase was not discovered
 7. Enable interrupts (set sstatus.SIE)

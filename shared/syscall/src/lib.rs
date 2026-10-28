@@ -1621,8 +1621,10 @@ pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 /// must call `irq_ack` after servicing each interrupt to re-enable delivery.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if either cap is invalid or the IRQ
-/// is already bound.
+/// Returns a negative `i64` error code if either cap is invalid or lacks
+/// Notify rights, or (`InvalidArgument`) if `irq_cap` covers more than one line
+/// or names an id the kernel cannot route (outside GSIs 0–255 on x86-64, PLIC
+/// sources 1–127 on RISC-V). A second registration of a line replaces the first.
 #[inline]
 pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
 {
@@ -1783,8 +1785,8 @@ pub fn thread_set_priority(thread_cap: u32, priority: u8, sched_cap: u32) -> Res
 /// stopped, or not-yet-started thread observes the new affinity on its next
 /// enqueue (a wake, or `SYS_THREAD_START` on start or resume).
 ///
-/// See `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_AFFINITY` for known
-/// defects (#443, #502).
+/// See `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_AFFINITY` for the known
+/// defect (#502).
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` if the thread cap
@@ -1883,8 +1885,8 @@ pub fn thread_read_regs(thread_cap: u32, buf: *mut u8, buf_size: usize) -> Resul
 /// reply. `buf` must contain a complete `TrapFrame`
 /// (`buf_size >= size_of::<TrapFrame>()`). The kernel sanitizes the frame per
 /// architecture before applying it (`core/kernel/docs/arch-interface.md`
-/// § `trap_frame` — `arch::current::trap_frame`); on RISC-V `sstatus` is
-/// applied as supplied (#443).
+/// § `trap_frame` — `arch::current::trap_frame`); on RISC-V the supplied
+/// `sstatus` is replaced with the user-resume value.
 ///
 /// # Safety
 /// `buf` must be valid for `buf_size` bytes of reads.
@@ -1901,7 +1903,7 @@ pub fn thread_write_regs(thread_cap: u32, buf: *const u8, buf_size: usize) -> Re
     // SAFETY: syscall3 issues raw syscall instruction; buf pointer cast to u64 for syscall ABI;
     // kernel validates thread cap and buf_size, accepts only a Stopped or fault-blocked target,
     // and sanitizes the frame per architecture (core/kernel/docs/arch-interface.md
-    // § `trap_frame`); on RISC-V `sstatus` is applied as supplied (#443).
+    // § `trap_frame`), on RISC-V replacing the supplied `sstatus`.
     let ret = unsafe {
         syscall3(
             SYS_THREAD_WRITE_REGS,

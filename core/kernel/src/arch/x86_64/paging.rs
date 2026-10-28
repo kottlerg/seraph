@@ -319,12 +319,20 @@ pub fn direct_map_base() -> u64
     DIRECT_MAP_BASE_VAL.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Exclusive upper bound of user-half virtual addresses (48-bit VAs,
-/// canonical lower half).
+/// Exclusive upper bound of user-accessible virtual addresses: the canonical
+/// lower half (48-bit VAs, `1 << 47`) less its top 4 KiB page.
+///
+/// The top page stays unmappable, as Linux's `TASK_SIZE_MAX` keeps it, so no
+/// user instruction can end at the canonical boundary: the hardware-saved
+/// return RIP of a ring-3 interrupt, trap, or `syscall` (the address after the
+/// last executed instruction) is then always canonical, and every ring-3
+/// `iretq` / `sysretq` is to a canonical RIP. A RIP of `1 << 47` would raise
+/// `#GP` in ring 0 after the exit's `swapgs` back to the user GS base, where
+/// the CS-keyed `#GP` stub would run kernel code on that base.
 #[inline]
 pub const fn user_va_top() -> u64
 {
-    1 << 47
+    (1 << 47) - 4096
 }
 
 /// Write CR3 without an explicit TLB flush.

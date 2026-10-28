@@ -2078,9 +2078,12 @@ fn idle_thread_entry(_cpu_id: u64) -> !
 ///
 /// # Safety
 /// Must be called exactly once, from the single boot thread, after Phase 3
-/// (page tables active) and Phase 4 (per-CPU storage and idle stacks allocated).
+/// (page tables active) and Phase 4 (per-CPU storage and idle stacks allocated),
+/// with the `cpu_count` [`init_storage`] sized the slabs for (`CPU_COUNT`): the
+/// body writes one idle TCB and scheduler entry per CPU into those slabs without
+/// a bounds check, and a second call would overwrite live idle TCBs.
 #[cfg(not(test))]
-pub fn init(cpu_count: u32) -> u32
+pub unsafe fn init(cpu_count: u32) -> u32
 {
     debug_assert_eq!(
         CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed),
@@ -2203,9 +2206,12 @@ pub fn init(cpu_count: u32) -> u32
 /// Halts via `crate::fatal` on buddy exhaustion.
 ///
 /// # Safety
-/// Single-threaded. Must be called exactly once.
+/// Must be called exactly once, from the single boot thread, after Phase 3 and
+/// before any reader of the per-CPU slabs runs (Phase 5 on), with `cpu_count`
+/// in `1..=MAX_CPUS`: a second call would republish fresh zeroed slabs under
+/// CPUs already dispatching through them.
 #[cfg(not(test))]
-pub fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
+pub unsafe fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
 {
     debug_assert_eq!(
         CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed),
@@ -2218,8 +2224,11 @@ pub fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
 }
 
 /// Test stub for `init_storage`.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
-pub fn init_storage(_cpu_count: u32, _allocator: &mut crate::mm::BuddyAllocator) {}
+pub unsafe fn init_storage(_cpu_count: u32, _allocator: &mut crate::mm::BuddyAllocator) {}
 
 #[cfg(not(test))]
 fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
@@ -2331,8 +2340,11 @@ pub(crate) fn alloc_zeroed_slab<T>(
 /// `kernel_entry` (in main.rs) is compiled in test mode even though it is
 /// never called; this stub satisfies the call site without requiring access to
 /// arch-specific types that are unavailable on the host.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
-pub fn init(_cpu_count: u32) -> u32
+pub unsafe fn init(_cpu_count: u32) -> u32
 {
     0
 }
@@ -2348,10 +2360,12 @@ pub fn init(_cpu_count: u32) -> u32
 /// This function never returns.
 ///
 /// # Safety
-/// Must be called exactly once per AP, from the AP being initialised, after
-/// per-CPU GDT, IDT, LAPIC, and SYSCALL have been set up.
+/// Must be called exactly once per AP, from the AP being initialised and on
+/// that AP's idle kernel stack, with `cpu_id` its logical index, after
+/// per-CPU GDT, IDT, LAPIC, and SYSCALL have been set up: the idle loop runs
+/// as the idle TCB `sched::init` built for `cpu_id`.
 #[cfg(not(test))]
-pub fn ap_enter(cpu_id: u32) -> !
+pub unsafe fn ap_enter(cpu_id: u32) -> !
 {
     // Idle loop: wait for interrupt. The idle TCB was created by sched::init();
     // The scheduler slot's `current` already points to it. Interrupts are enabled
@@ -3786,12 +3800,15 @@ pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
 /// change) when, under both scheduler locks, `tcb` is no longer `Ready`
 /// or no longer located on `src_cpu` — another CPU won the race.
 ///
-/// Lock discipline: both scheduler locks are acquired in **ascending
+/// Lock discipline: the caller holds `(*tcb).sched_lock` (outer), so the
+/// caller's own `cpu_affinity` write and state read and this move form one
+/// critical section; both scheduler locks are acquired here in **ascending
 /// CPU-id order** (`core/kernel/docs/scheduling-internals.md` § Lock Hierarchy
 /// rule 4) to prevent ABBA deadlock against the load balancer or any
 /// other multi-lock holder. The destination's `set_reschedule_pending`
-/// is published before the unlocks; the wake IPI is sent after both
-/// locks are released.
+/// is published before the unlocks. No IPI is sent: on a `true` return the
+/// caller prods `dst_cpu` (`prod_remote_cpu`) once it has released
+/// `sched_lock`.
 ///
 /// Used by:
 /// - `sys_thread_set_affinity` (active migration of an already-queued
@@ -3803,7 +3820,8 @@ pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
 /// # Safety
 /// - `tcb` must be a valid [`ThreadControlBlock`] pointer.
 /// - `src_cpu` and `dst_cpu` must be `< CPU_COUNT`.
-/// - Caller MUST NOT already hold either scheduler lock.
+/// - Caller MUST hold `(*tcb).sched_lock` and MUST NOT hold either scheduler
+///   lock.
 #[cfg(not(test))]
 pub unsafe fn migrate_ready_thread(
     tcb: *mut thread::ThreadControlBlock,
@@ -3843,15 +3861,13 @@ pub unsafe fn migrate_ready_thread(
     // SAFETY: as above.
     let hi_sched = unsafe { scheduler_for(hi) };
 
-    // Acquire the per-TCB sched_lock FIRST (outer), then both run-queue locks in
-    // ascending-CPU order (inner). sched_lock is the authoritative serializer for
-    // the Scheduling field group, so reading `state` under it is race-free even
-    // though `tcb` may currently be Running on a third CPU (its dispatch flip
-    // holds the same lock), and writing `preferred_cpu` under it keeps that field
-    // consistent with every other writer. Lock order: source IPC → sched_lock →
-    // per-CPU run-queue (core/kernel/docs/sched-ipc-redesign.md § 2).
-    // SAFETY: tcb valid by caller contract; lock_raw paired with unlock below.
-    let tcb_sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
+    // The caller holds the per-TCB sched_lock (outer); take both run-queue locks
+    // in ascending-CPU order (inner). sched_lock is the authoritative serializer
+    // for the Scheduling field group, so reading `state` under it is race-free
+    // even though `tcb` may currently be Running on a third CPU (its dispatch
+    // flip holds the same lock), and writing `preferred_cpu` under it keeps that
+    // field consistent with every other writer. Lock order: source IPC →
+    // sched_lock → per-CPU run-queue (core/kernel/docs/sched-ipc-redesign.md § 2).
     // SAFETY: lock_raw/unlock_raw paired below.
     let saved_lo = unsafe { lo_sched.lock.lock_raw() };
     // SAFETY: lo lock held; acquiring hi second satisfies ascending-CPU order.
@@ -3871,18 +3887,11 @@ pub unsafe fn migrate_ready_thread(
     // SAFETY: sched_lock + both run-queue locks held (ascending CPU order).
     let moved = unsafe { relocate_ready_thread(tcb, src_cpu, dst_cpu, priority) };
 
-    // SAFETY: paired above; release inner (hi, lo) then outer (sched_lock).
+    // SAFETY: paired above; release inner (hi) then lo. The caller's sched_lock
+    // stays held.
     unsafe {
         hi_sched.lock.unlock_raw(saved_hi);
         lo_sched.lock.unlock_raw(saved_lo);
-        (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
-    }
-
-    if moved
-    {
-        // Always-IPI per the wake-protocol invariant.
-        // SAFETY: dst_cpu validated < cpu_count above.
-        unsafe { wake_idle_cpu(dst_cpu) };
     }
 
     moved
@@ -3902,9 +3911,8 @@ pub unsafe fn migrate_ready_thread(
 ///   (#314/#293). `cs == 1` proves it switched out and is `current` nowhere.
 /// - hard `cpu_affinity` permits `dst_cpu`. `pull_unpinned_ready`'s
 ///   `find_runnable` predicate reads `cpu_affinity` advisorily under the run-queue
-///   lock; this re-read under `sched_lock` narrows the window in which a concurrent
-///   `sys_thread_set_affinity` pins the thread away from `dst_cpu`, but does not
-///   close it while that writer takes no `sched_lock` (#443).
+///   lock; this re-read under `sched_lock`, which `sys_thread_set_affinity` holds
+///   across its write, sees any re-pin that committed before the move.
 ///
 /// `remove_from_queue(src, priority)` is the authoritative "located on src at
 /// `priority`" check; it fails (benign no-op) if the thread moved or is in the
@@ -4359,9 +4367,8 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     // the level `remove_from_queue` needs, and the src run-queue lock held since
     // the predicate pins it against a concurrent `sys_thread_set_priority`. The
     // affinity gate inside `relocate_ready_thread` re-reads `cpu_affinity` under
-    // the candidate's `sched_lock`, narrowing the race with a
-    // `sys_thread_set_affinity` between the predicate and here; the race stays
-    // open while that writer takes no `sched_lock` (#443).
+    // the candidate's `sched_lock`, which `sys_thread_set_affinity` holds across
+    // its write, so a re-pin between the predicate and here refuses the move.
     // SAFETY: sched_lock + both run-queue locks held.
     let moved = unsafe { relocate_ready_thread(tcb, src_cpu, dst_cpu, priority) };
 
@@ -5263,6 +5270,14 @@ pub unsafe fn schedule(requeue: Requeue)
     // dealloc marks Exited under all-CPU locks before its not-current spin
     // blocks), it is now off-queue and drained — fall back to idle this cycle
     // (the next tick re-schedules).
+    //
+    // A dispatched `next`'s non-null IOPB is loaded into this CPU's TSS inside
+    // the same critical section: `SYS_IOPORT_BIND` installs and edits the bitmap
+    // under that `sched_lock` (core/kernel/docs/scheduling-internals.md §
+    // Cross-CPU TCB Ownership, Address-space / capability row). x86-64 only;
+    // `load_iopb` is a no-op on RISC-V, where `iopb` is always null.
+    #[cfg(not(test))]
+    let mut iopb_loaded = false;
     if !core::ptr::eq(next, sched.idle())
     {
         // SAFETY: next is a valid TCB; sched_lock paired with unlock below.
@@ -5294,6 +5309,18 @@ pub unsafe fn schedule(requeue: Requeue)
                     cpu,
                     tid
                 );
+            }
+            // SAFETY: under next.sched_lock, which serialises `iopb` and its
+            // bytes against SYS_IOPORT_BIND; the pointer is null or a live
+            // IOPB_SIZE block carved from SEED; interrupts are disabled.
+            #[cfg(not(test))]
+            unsafe {
+                let iopb_ptr = (*next).iopb;
+                if !iopb_ptr.is_null()
+                {
+                    crate::arch::current::gdt::load_iopb(Some(&*iopb_ptr));
+                    iopb_loaded = true;
+                }
             }
         }
         // SAFETY: paired with lock_raw above.
@@ -5412,22 +5439,14 @@ pub unsafe fn schedule(requeue: Requeue)
         }
     }
 
-    // Load the per-thread IOPB into the TSS (x86-64 only; `load_iopb` is a
-    // no-op on RISC-V, where `iopb` is always null). If the thread has no port
-    // bindings, fill the TSS IOPB with 0xFF (deny all).
-    // SAFETY: next is a valid TCB; iopb pointer is null or a valid [u8; IOPB_SIZE]
-    // carved from the SEED Memory cap.
+    // A `next` whose IOPB the dispatch flip did not load (idle, or a thread with
+    // no port bindings) runs with the TSS IOPB filled with 0xFF (deny all).
     #[cfg(not(test))]
-    unsafe {
-        let iopb_ptr = (*next).iopb;
-        if iopb_ptr.is_null()
-        {
-            crate::arch::current::gdt::load_iopb(None);
-        }
-        else
-        {
-            crate::arch::current::gdt::load_iopb(Some(&*iopb_ptr));
-        }
+    if !iopb_loaded
+    {
+        // SAFETY: interrupts are disabled (scheduler path); GS-base names this
+        // CPU's PerCpuData.
+        unsafe { crate::arch::current::gdt::load_iopb(None) };
     }
 
     // FPU context-switch hooks. Both arches use eager save on switch-out,
@@ -5898,8 +5917,12 @@ pub(crate) unsafe extern "C" fn user_thread_trampoline() -> !
 /// - Phase 4 (per-CPU storage allocated)
 /// - Phase 8 scheduler init
 /// - Phase 9 init TCB enqueued on BSP run queue
+///
+/// The body dequeues from CPU 0's scheduler without its lock, writes the init
+/// TCB's state, and builds a trap frame below its kernel stack top by raw
+/// pointer, all sound only in that once-only boot context.
 #[cfg(not(test))]
-pub fn enter() -> !
+pub unsafe fn enter() -> !
 {
     use crate::arch::current::trap_frame::TrapFrame;
 

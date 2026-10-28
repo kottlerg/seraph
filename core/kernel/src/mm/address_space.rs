@@ -343,10 +343,11 @@ impl AddressSpace
         // narrow). `self.tag` is read without the pool lock, before the tlb_gen
         // bump and the active-CPU snapshot below, and the caller need not be
         // running this space (cross-AS edits by procmgr / memmgr), so the read
-        // can race eviction. Whether a concurrent eviction and re-activation can
-        // make the request carry a revoked tag to a CPU in the snapshot is an
-        // open question recorded on #443 (core/kernel/docs/memory-internals.md
-        // § SMP TLB Shootdown).
+        // can race eviction. A revoked tag it carries is harmless: eviction
+        // needs the space inactive everywhere, so a CPU in the snapshot
+        // reactivated it under a fresh claim, which flushed that new tag after
+        // the PTE edit (proof: core/kernel/docs/memory-internals.md § SMP TLB
+        // Shootdown).
         let tag = self.tag.load(Ordering::Acquire);
 
         if crate::mm::tag_allocator::tagging_enabled()

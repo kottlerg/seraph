@@ -349,7 +349,7 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
     // switch-out from a U-mode trap (syscall, preemption, or fault block) still
     // has a live `&mut` to this frame in trap_dispatch / redirect_user_fault
     // (and the syscall dispatcher); that aliasing gap is stated in
-    // docs/arch-interface.md § `trap_frame` and tracked by #514.
+    // core/kernel/docs/arch-interface.md § `trap_frame` and tracked by #514.
     unsafe {
         let tf = (*tcb)
             .trap_frame

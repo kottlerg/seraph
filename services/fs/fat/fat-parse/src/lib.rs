@@ -189,22 +189,7 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
         (FatType::Fat32, fsinfo_sector)
     };
 
-    // Every data cluster 2..2 + total_clusters needs a FAT entry inside one
-    // FAT copy, and a FAT32 cluster number stops below the 0x0FFF_FFF7
-    // bad-cluster marker. Past either bound a cluster number the rest of the
-    // driver accepts as in the data region would address a FAT entry past
-    // the FAT, or overflow the entry-offset arithmetic.
-    let (entry_bytes, max_clusters) = match fat_type
-    {
-        FatType::Fat16 => (2u64, 0xFFF5u64),
-        FatType::Fat32 => (4u64, 0x0FFF_FFF5u64),
-    };
-    let fat_entries = u64::from(fat_size) * u64::from(bytes_per_sector) / entry_bytes;
-    let clusters = u64::from(total_clusters);
-    if clusters + 2 > fat_entries || clusters > max_clusters
-    {
-        return Err(BpbError::BadGeometry);
-    }
+    check_fat_capacity(fat_type, fat_size, bytes_per_sector, total_clusters)?;
 
     Ok(BpbGeometry {
         bytes_per_sector,
@@ -219,6 +204,34 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
         fat_type,
         fsinfo_sector,
     })
+}
+
+/// Refuse a cluster count the FAT cannot describe.
+///
+/// Every data cluster `2..2 + total_clusters` needs a FAT entry inside one
+/// FAT copy of `fat_size` sectors, and a FAT32 cluster number stops below
+/// the `0x0FFF_FFF7` bad-cluster marker. Past either bound a cluster number
+/// the driver accepts as in the data region would address a FAT entry past
+/// the FAT, or overflow the entry-offset arithmetic.
+fn check_fat_capacity(
+    fat_type: FatType,
+    fat_size: u32,
+    bytes_per_sector: u16,
+    total_clusters: u32,
+) -> Result<(), BpbError>
+{
+    let (entry_bytes, max_clusters) = match fat_type
+    {
+        FatType::Fat16 => (2u64, 0xFFF5u64),
+        FatType::Fat32 => (4u64, 0x0FFF_FFF5u64),
+    };
+    let fat_entries = u64::from(fat_size) * u64::from(bytes_per_sector) / entry_bytes;
+    let clusters = u64::from(total_clusters);
+    if clusters + 2 > fat_entries || clusters > max_clusters
+    {
+        return Err(BpbError::BadGeometry);
+    }
+    Ok(())
 }
 
 /// First sector of `cluster` within the data region.

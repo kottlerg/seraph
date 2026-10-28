@@ -10,8 +10,8 @@
 //! filler token) to exercise child-side behaviour: namespace and
 //! `/programs`-subtree attenuation, cwd-cap delivery, argv/env blob packing,
 //! exit-code propagation, per-process randomness and ASLR divergence,
-//! `Child` kill and drop teardown, and the fs release handler's cookie
-//! matching.
+//! `Child` kill and drop teardown, procmgr's teardown of a child whose create
+//! reply it cannot deliver, and the fs release handler's cookie matching.
 //! The child-mode function for each role lives in the phase module that
 //! spawns it; `dispatch` consults each module's `reentry_main(role)` so a
 //! new role is registered alongside its phase, not in a central switch.

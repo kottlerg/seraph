@@ -116,6 +116,7 @@ token falls through to the normal run.
 | `cwd-child`                 | `procmgr`      | `command_cwd_inherit` (cwd-cap delivery)    |
 | `blobs-fill-child`          | `procmgr`      | `command_blobs_fill_message` (full message) |
 | `park-child`                | `procmgr`      | `command_from_spawned_thread` (kill, drop)  |
+| `undeliverable-reply-child` | `procmgr`      | `procmgr_refusals` (failed create reply)    |
 | `release-child`             | `fs_std`       | `std_release_matched_by_cookie` (fake fs)   |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |

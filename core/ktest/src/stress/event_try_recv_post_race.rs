@@ -173,7 +173,7 @@ fn start_pinned_child(
     ctx: &TestContext,
     caps: [u32; 4],
     rights: [u64; 4],
-    entry: fn(u64) -> !,
+    entry: extern "C" fn(u64) -> !,
     stack_idx: usize,
     cpu: u32,
 ) -> Result<crate::spawn::SpawnedChild, &'static str>
@@ -325,7 +325,7 @@ fn decode(arg: u64) -> (u32, u32, u32, u32)
 /// brackets until the payload lands, then park on the gate notification (the
 /// second park that detonates a leaked link) and assert the queue is empty
 /// before acking the round.
-fn poller_entry(arg: u64) -> !
+extern "C" fn poller_entry(arg: u64) -> !
 {
     let (eq, gate, ack, done) = decode(arg);
     let wouldblock = SyscallError::WouldBlock as i64;
@@ -438,7 +438,7 @@ fn poller_entry(arg: u64) -> !
 /// POSTER: per round, wait for the poller's previous-round ack, publish the
 /// ticket, wait for the poller's `POLLING` handshake, post the payload inside
 /// the `POST_SEQ` bracket, and signal the gate.
-fn poster_entry(arg: u64) -> !
+extern "C" fn poster_entry(arg: u64) -> !
 {
     let (eq, gate, ack, done) = decode(arg);
 

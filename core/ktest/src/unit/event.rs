@@ -340,7 +340,7 @@ pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
 /// Child: blocks on `event_recv` then signals the received payload back.
 ///
 /// `arg`: bits[31:0] = `eq_slot`, bits[63:32] = `sync_slot` (in child's `CSpace`).
-fn recv_and_report_entry(arg: u64) -> !
+extern "C" fn recv_and_report_entry(arg: u64) -> !
 {
     let eq_slot = (arg & 0xFFFF_FFFF) as u32;
     let sync_slot = (arg >> 32) as u32;
@@ -361,7 +361,7 @@ fn recv_and_report_entry(arg: u64) -> !
 
 /// Child: sleeps ~10 ms then posts payload `0` (the legitimate-zero
 /// disambiguation case).
-fn post_zero_after_sleep_entry(arg: u64) -> !
+extern "C" fn post_zero_after_sleep_entry(arg: u64) -> !
 {
     let eq_slot = (arg & 0xFFFF_FFFF) as u32;
     let _ = thread_sleep(10);
@@ -370,7 +370,7 @@ fn post_zero_after_sleep_entry(arg: u64) -> !
 }
 
 /// Child: sleeps ~10 ms then posts payload `0xCAFE`.
-fn post_cafe_after_sleep_entry(arg: u64) -> !
+extern "C" fn post_cafe_after_sleep_entry(arg: u64) -> !
 {
     let eq_slot = (arg & 0xFFFF_FFFF) as u32;
     let _ = thread_sleep(10);
@@ -380,7 +380,7 @@ fn post_cafe_after_sleep_entry(arg: u64) -> !
 
 /// Child: sleeps ~10 ms then posts payload `0xBEEF` (used by the
 /// `arg1=0` "block forever" sentinel test).
-fn post_beef_after_sleep_entry(arg: u64) -> !
+extern "C" fn post_beef_after_sleep_entry(arg: u64) -> !
 {
     let eq_slot = (arg & 0xFFFF_FFFF) as u32;
     let _ = thread_sleep(10);

@@ -9,7 +9,8 @@
 //! `SYS_THREAD_YIELD`, `SYS_THREAD_EXIT`, `SYS_THREAD_READ_REGS`,
 //! `SYS_THREAD_WRITE_REGS`, `SYS_THREAD_SET_PRIORITY`,
 //! `SYS_THREAD_SET_AFFINITY`, `SYS_THREAD_SLEEP`,
-//! `SYS_THREAD_BIND_NOTIFICATION`.
+//! `SYS_THREAD_BIND_NOTIFICATION`, `SYS_SCHED_SPLIT`, and the priority
+//! arguments of `SYS_CAP_CREATE_THREAD`.
 //!
 //! `SYS_THREAD_EXIT` is exercised implicitly — every child thread entry
 //! function calls `thread_exit()`.
@@ -40,6 +41,12 @@ use crate::{ChildStack, TestContext, TestResult};
 // parent has registered as the waiter.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 const RIGHTS_WAIT: u64 = syscall_abi::RIGHTS_NTF_WAIT;
+
+/// Register-file buffer size; holds the arch `TrapFrame`
+/// (`crate::arch::TRAP_FRAME_BYTES`) on every architecture, as the guard
+/// below checks.
+const BUF_SIZE: usize = 512;
+const _: () = assert!(BUF_SIZE as u64 >= TRAP_FRAME_BYTES);
 
 // Child stacks for started children, to avoid aliasing. A stack is reused
 // only after its previous child has exited on the passing path:
@@ -154,7 +161,6 @@ pub fn r#yield(_ctx: &TestContext) -> TestResult
 /// stable `TrapFrame`. The parent stops it and reads registers.
 pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 {
-    const BUF_SIZE: usize = 512; // Larger than any architecture's TrapFrame.
     let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (ready) for stop_read_regs failed")?;
     let block = cap_create_notification(ctx.memory_base)
@@ -271,7 +277,6 @@ pub fn start_self_invalid_argument(ctx: &TestContext) -> TestResult
 /// `phase2_entry`. On resume, phase2 reads `PHASE2_SIG` and sends 0x2.
 pub fn write_regs_resume(ctx: &TestContext) -> TestResult
 {
-    const BUF_SIZE: usize = 512;
     let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (ready) for write_regs_resume failed")?;
     let block = cap_create_notification(ctx.memory_base)
@@ -509,7 +514,7 @@ pub fn sched_split_rollback_on_full_cspace(ctx: &TestContext) -> TestResult
 
 /// Child for [`sched_split_rollback_on_full_cspace`]; reports `0x1` on
 /// success, else a bit naming the first failed step.
-fn split_rollback_child_entry(arg: u64) -> !
+extern "C" fn split_rollback_child_entry(arg: u64) -> !
 {
     const OUT_OF_MEMORY: i64 = SyscallError::OutOfMemory as i64;
     let sched_slot = (arg & 0xFFFF_FFFF) as u32;
@@ -1032,9 +1037,6 @@ fn balance_spawn_spinners(
         // Initial pinning to `initial_cpu` forces the first enqueue there.
         // SAFETY: per-spinner stack slot, no aliasing.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(STACK_BALANCE_SPINNERS[i]) });
-        // cast_possible_truncation: `i` is below `BALANCE_MAX_SPINNERS` (8), so
-        // the cast is exact on any pointer width.
-        #[allow(clippy::cast_possible_truncation)]
         let arg = (i as u64) << 32 | u64::from(child_sig);
         crate::spawn::configure_and_start_pinned(
             &child,
@@ -1289,7 +1291,7 @@ pub fn default_affinity_runs(ctx: &TestContext) -> TestResult
 /// bound to CPU 1 and confirms it ran by notifying back.
 // cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn affinity_sender_entry(sig_slot: u64) -> !
+extern "C" fn affinity_sender_entry(sig_slot: u64) -> !
 {
     notification_send(sig_slot as u32, 0xC1A1).ok();
     thread_exit()
@@ -1298,7 +1300,7 @@ fn affinity_sender_entry(sig_slot: u64) -> !
 /// Simple sender: sends 0xBEEF and exits.
 // cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn sender_entry(sig_slot: u64) -> !
+extern "C" fn sender_entry(sig_slot: u64) -> !
 {
     notification_send(sig_slot as u32, 0xBEEF).ok();
     thread_exit()
@@ -1312,7 +1314,7 @@ fn sender_entry(sig_slot: u64) -> !
 /// instead of returning from this `notification_wait`.
 // cast_possible_truncation: cap slot indices are guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn blocker_entry(arg: u64) -> !
+extern "C" fn blocker_entry(arg: u64) -> !
 {
     // arg packs (ready_slot << 32) | block_slot. Two distinct caps so the
     // child cannot self-deliver its own readiness send before the parent has
@@ -1346,7 +1348,7 @@ fn blocker_entry(arg: u64) -> !
 /// land on CPU 1" instead of as a timeout.
 // cast_possible_truncation: cap slot indices and CPU ids fit comfortably in u32.
 #[allow(clippy::cast_possible_truncation)]
-fn report_cpu_entry(sig_slot: u64) -> !
+extern "C" fn report_cpu_entry(sig_slot: u64) -> !
 {
     let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
     // `wrapping_shl` masks the shift count modulo the type width (64),
@@ -1365,7 +1367,7 @@ fn report_cpu_entry(sig_slot: u64) -> !
 /// spinner sends `0xC0FE` on its notification cap and exits.
 // cast_possible_truncation: spinner indices and cap slot indices fit in u32.
 #[allow(clippy::cast_possible_truncation)]
-fn balance_spinner_entry(arg: u64) -> !
+extern "C" fn balance_spinner_entry(arg: u64) -> !
 {
     let idx = (arg >> 32) as usize;
     let sig_slot = (arg & 0xFFFF_FFFF) as u32;
@@ -1395,7 +1397,7 @@ fn balance_spinner_entry(arg: u64) -> !
 /// the parent first so it can complete `notification_wait`.
 // cast_possible_truncation: cap slot indices and CPU ids fit comfortably in u32.
 #[allow(clippy::cast_possible_truncation)]
-fn migrate_spinner_entry(sig_slot: u64) -> !
+extern "C" fn migrate_spinner_entry(sig_slot: u64) -> !
 {
     loop
     {
@@ -1459,7 +1461,7 @@ static mut BIND_NOTIF_STACK: crate::ChildStack = crate::ChildStack::ZERO;
 
 /// Child that exits immediately so its bound `EventQueue` receives the
 /// thread-death payload.
-fn bind_notif_exit_entry(_arg: u64) -> !
+extern "C" fn bind_notif_exit_entry(_arg: u64) -> !
 {
     thread_exit()
 }

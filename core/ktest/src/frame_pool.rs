@@ -49,7 +49,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use init_protocol::{CapDescriptor, CapType, InitInfo};
+use init_protocol::{CapType, InitInfo};
 
 /// Maximum frames in the pool.
 const POOL_SIZE: usize = 64;
@@ -57,30 +57,11 @@ const POOL_SIZE: usize = 64;
 /// Size of one page.
 const PAGE_SIZE: u64 = 0x1000;
 
-/// Read the `CapDescriptor` array from the `InitInfo` page.
-fn descriptors(info: &InitInfo) -> &[CapDescriptor]
-{
-    let base = core::ptr::from_ref::<InitInfo>(info).cast::<u8>();
-    // SAFETY: the kernel populates `cap_descriptors_offset` and
-    // `cap_descriptor_count` to describe a valid array inside the same
-    // read-only InitInfo region.
-    // cast_ptr_alignment: `cap_descriptors_offset` is `size_of::<InitInfo>()`,
-    // which abi/init-protocol asserts is a multiple of 8, the alignment the
-    // `u64` fields of `CapDescriptor` require.
-    #[allow(clippy::cast_ptr_alignment)]
-    unsafe {
-        let ptr = base
-            .add(info.cap_descriptors_offset as usize)
-            .cast::<CapDescriptor>();
-        core::slice::from_raw_parts(ptr, info.cap_descriptor_count as usize)
-    }
-}
-
 /// Return the byte size of the Memory cap occupying `slot`, or `None` if no
 /// Memory descriptor matches.
 fn find_frame_size(info: &InitInfo, slot: u32) -> Option<u64>
 {
-    for d in descriptors(info)
+    for d in crate::init_info::descriptors(info)
     {
         if d.slot == slot && d.cap_type == CapType::Memory
         {

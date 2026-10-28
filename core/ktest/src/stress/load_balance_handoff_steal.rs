@@ -310,7 +310,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 /// Client: tight `ipc_call` loop on a private endpoint, sampling its CPU to
 /// witness migration. Unpinned, so the balancer may steal it mid-handoff.
-fn client_entry(arg: u64) -> !
+extern "C" fn client_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this client.
     let ClientArgs { ep, done, idx } = unsafe { spawn::child_args(arg) };
@@ -355,7 +355,7 @@ fn client_entry(arg: u64) -> !
 // cast_possible_truncation: the low half is the ep slot, the high half the
 // buffer index.
 #[allow(clippy::cast_possible_truncation)]
-fn server_entry(arg: u64) -> !
+extern "C" fn server_entry(arg: u64) -> !
 {
     let ep = (arg & 0xFFFF_FFFF) as u32;
     let buf_index = (arg >> 32) as usize;

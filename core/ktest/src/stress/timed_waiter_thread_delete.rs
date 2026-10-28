@@ -129,7 +129,7 @@ fn one_cycle(ctx: &TestContext, cycle: u32, cpus: u32, sig: u32, eq: u32) -> Tes
 fn start_waiter(child: &spawn::SpawnedChild, cycle: u32, cpus: u32, sig: u32, eq: u32)
 -> TestResult
 {
-    let (entry, source): (fn(u64) -> !, u32) = match cycle % 3
+    let (entry, source): (extern "C" fn(u64) -> !, u32) = match cycle % 3
     {
         0 => (sleep_waiter, 0),
         1 => (notif_waiter, sig),
@@ -165,7 +165,7 @@ fn wait_loop(mut wait: impl FnMut()) -> !
     }
 }
 
-fn sleep_waiter(_arg: u64) -> !
+extern "C" fn sleep_waiter(_arg: u64) -> !
 {
     wait_loop(|| {
         let _ = thread_sleep(WAIT_MS);
@@ -174,7 +174,7 @@ fn sleep_waiter(_arg: u64) -> !
 
 // cast_possible_truncation: the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn notif_waiter(arg: u64) -> !
+extern "C" fn notif_waiter(arg: u64) -> !
 {
     let sig = arg as u32;
     wait_loop(|| {
@@ -184,7 +184,7 @@ fn notif_waiter(arg: u64) -> !
 
 // cast_possible_truncation: the argument is a 32-bit cap handle.
 #[allow(clippy::cast_possible_truncation)]
-fn queue_waiter(arg: u64) -> !
+extern "C" fn queue_waiter(arg: u64) -> !
 {
     let eq = arg as u32;
     wait_loop(|| {

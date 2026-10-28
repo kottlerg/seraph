@@ -204,7 +204,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 // ── Child thread ──────────────────────────────────────────────────────────────
 
 /// `arg`: address of the child's [`ChildArgs`].
-fn child_entry(arg: u64) -> !
+extern "C" fn child_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this child.
     let ChildArgs {

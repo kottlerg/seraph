@@ -55,7 +55,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-fn spinner_entry(_arg: u64) -> !
+extern "C" fn spinner_entry(_arg: u64) -> !
 {
     loop
     {

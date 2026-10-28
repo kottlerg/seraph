@@ -410,7 +410,7 @@ fn storm_waits(child: &spawn::SpawnedChild, sig: u32, eq: u32) -> TestResult
 /// receive on the full list until told to quit, tallying each result.
 // cast_possible_truncation: the halves are 32-bit cap handles.
 #[allow(clippy::cast_possible_truncation)]
-fn wait_victim_entry(arg: u64) -> !
+extern "C" fn wait_victim_entry(arg: u64) -> !
 {
     let sig = arg as u32;
     let eq = (arg >> 32) as u32;
@@ -507,7 +507,7 @@ fn await_flag(flag: &AtomicU32, err: &'static str) -> TestResult
 }
 
 /// Filler: count the first sleep's entry, then sleep until deleted.
-fn filler_entry(_arg: u64) -> !
+extern "C" fn filler_entry(_arg: u64) -> !
 {
     FILLED.fetch_add(1, Ordering::AcqRel);
     loop
@@ -520,7 +520,7 @@ fn filler_entry(_arg: u64) -> !
 /// and tallying results with QUIT clear throughout. A sleep that started with
 /// QUIT set must return `Ok`; one during which QUIT rose may still have
 /// started on the full list, so it or the next sleep must return `Ok`.
-fn victim_entry(_arg: u64) -> !
+extern "C" fn victim_entry(_arg: u64) -> !
 {
     RUNNING.store(1, Ordering::Release);
     let after = loop

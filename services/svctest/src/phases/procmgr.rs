@@ -63,6 +63,10 @@ pub fn command_phases() -> &'static [Phase]
             name: "stdio_file_unsupported",
             run: stdio_file_unsupported_phase,
         },
+        Phase {
+            name: "procmgr_refusals",
+            run: procmgr_refusals_phase,
+        },
     ]
 }
 
@@ -521,4 +525,111 @@ pub fn stdio_file_unsupported_phase(_: &Caps)
         "Stdio::from(File) spawn error must be Unsupported, got {err:?}"
     );
     std::os::seraph::log!("stdio_file_unsupported phase passed");
+}
+
+/// Rounds of each refused request in [`procmgr_refusals_phase`]: the phase
+/// repeats every request, as a client flooding procmgr would.
+const REFUSAL_ROUNDS: usize = 16;
+
+/// procmgr refuses requests whose sender or shape its wire contract does not
+/// admit, and deletes every cap they carried (see
+/// `services/procmgr/docs/ipc-interface.md` § Capability Transfer):
+/// `REGISTER_DEATH_EQ` from a sender without the `DEATH_EQ_AUTHORITY` badge,
+/// the init-reap labels (`REGISTER_INIT_TEARDOWN`, `INIT_TEARDOWN_DONE`) from
+/// any badged sender, an unknown opcode, and a `CREATE_FROM_FILE` that sets
+/// `CREATE_DEATH_RELAY` on a message whose only cap is the file cap. Each
+/// refused request carries caps. procmgr's slot count is not observable from
+/// a client, so each cell asserts the refusal reply, and a spawn afterwards
+/// shows procmgr still serves.
+pub fn procmgr_refusals_phase(_: &Caps)
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+
+    let info = startup_info();
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let procmgr = info.procmgr_endpoint;
+    // A cap to attach: a SEND copy of svctest's own procmgr cap, moved into
+    // procmgr's CSpace by the call.
+    let spare = || {
+        syscall::cap_derive(procmgr, syscall::RIGHTS_EP_SEND)
+            .expect("deriving a spare cap to attach failed")
+    };
+    let refused = |msg: &IpcMessage, want: u64, what: &str| {
+        // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(procmgr, msg, ipc_buf) }
+            .unwrap_or_else(|e| panic!("{what}: ipc_call failed ({e})"));
+        assert_eq!(reply.label, want, "{what}: procmgr replied {}", reply.label);
+    };
+
+    for _ in 0..REFUSAL_ROUNDS
+    {
+        refused(
+            &IpcMessage::builder(procmgr_labels::REGISTER_DEATH_EQ)
+                .cap(spare())
+                .build(),
+            procmgr_errors::UNAUTHORIZED,
+            "REGISTER_DEATH_EQ without DEATH_EQ_AUTHORITY",
+        );
+        refused(
+            &IpcMessage::builder(procmgr_labels::REGISTER_INIT_TEARDOWN)
+                .word(0, 1)
+                .cap(spare())
+                .cap(spare())
+                .cap(spare())
+                .cap(spare())
+                .build(),
+            procmgr_errors::UNAUTHORIZED,
+            "REGISTER_INIT_TEARDOWN first round from a badged sender",
+        );
+        refused(
+            &IpcMessage::builder(procmgr_labels::REGISTER_INIT_TEARDOWN)
+                .word(0, 0)
+                .cap(spare())
+                .build(),
+            procmgr_errors::UNAUTHORIZED,
+            "REGISTER_INIT_TEARDOWN donation round from a badged sender",
+        );
+        refused(
+            &IpcMessage::builder(procmgr_labels::INIT_TEARDOWN_DONE)
+                .cap(spare())
+                .build(),
+            procmgr_errors::UNAUTHORIZED,
+            "INIT_TEARDOWN_DONE from a badged sender",
+        );
+        refused(
+            &IpcMessage::builder(3).cap(spare()).build(),
+            procmgr_errors::UNKNOWN_OPCODE,
+            "unassigned label 3",
+        );
+    }
+
+    let root = std::os::seraph::root_dir_cap();
+    let (programs, _, _) = crate::ipc_util::ns::ns_lookup(root, b"programs", 0xFFFF, ipc_buf)
+        .expect("ns_lookup /programs failed");
+    for _ in 0..REFUSAL_ROUNDS
+    {
+        let (file, _, size) = crate::ipc_util::ns::ns_lookup(programs, b"hello", 0xFFFF, ipc_buf)
+            .expect("ns_lookup /programs/hello failed");
+        refused(
+            &IpcMessage::builder(
+                procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_DEATH_RELAY,
+            )
+            .word(0, size)
+            .cap(file)
+            .build(),
+            procmgr_errors::INVALID_ARGUMENT,
+            "CREATE_FROM_FILE with the relay flag and only the file cap",
+        );
+    }
+    let _ = syscall::cap_delete(programs);
+
+    let status = std::process::Command::new("/programs/hello")
+        .status()
+        .expect("spawn after the refused requests failed");
+    assert!(
+        status.success(),
+        "hello after the refused requests exited {status}"
+    );
+    std::os::seraph::log!("procmgr_refusals phase passed");
 }

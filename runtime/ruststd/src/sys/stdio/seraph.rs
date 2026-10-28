@@ -46,8 +46,11 @@ use crate::os::seraph::current_ipc_buf;
 
 struct StdioCell(UnsafeCell<[Option<Pipe>; 3]>);
 
-// SAFETY: written exactly once from `_start` before any other thread
-// runs; subsequent accesses go through the `STDIO_READY` Acquire load.
+// SAFETY: `stdio_init` writes the slots once, from `_start` before any
+// other thread runs and before `STDIO_READY` is set (Release); every later
+// access is a shared borrow taken after the `STDIO_READY` Acquire load,
+// and nothing writes or drops the slots again, so the `&'static Pipe`s
+// `pipe_for` hands out stay valid for the process lifetime.
 unsafe impl Sync for StdioCell {}
 
 static STDIO: StdioCell = StdioCell(UnsafeCell::new([None, None, None]));
@@ -250,24 +253,28 @@ pub fn is_ebadf(_err: &io::Error) -> bool {
     true
 }
 
-/// Tear down all stdio pipe ends. Called from the process-exit path
+/// Close all stdio pipe ends. Called from the process-exit path
 /// (`sys::exit::exit` and the post-`main` epilogue in `os::seraph::
 /// _start`) so the close protocol fires (header `closed = 1` + notification
 /// kick) before the kernel destroys this aspace and the parent's
 /// blocking read/write would otherwise hang. Idempotent — second call
 /// is a no-op.
+///
+/// Other threads may still hold a `&'static Pipe` from `pipe_for` and be
+/// inside a read or write, so the ends are only closed ([`Pipe::close`]),
+/// never dropped: the ring stays mapped and the caps held until the kernel
+/// tears the process down. A read or write already past `pipe_for` sees the
+/// closed flag; a later stdio call finds `STDIO_READY` clear and takes the
+/// no-pipe path.
 pub fn close_all() {
     if !STDIO_READY.swap(false, Ordering::AcqRel) {
         return;
     }
-    // SAFETY: STDIO_READY just toggled off; no concurrent reader past
-    // the Acquire load in `pipe_for`. Drop runs on each Pipe end and
-    // marks closed + sends one final notification kick to wake the peer.
-    unsafe {
-        let slots = &mut *STDIO.0.get();
-        drop(slots[IDX_STDIN].take());
-        drop(slots[IDX_STDOUT].take());
-        drop(slots[IDX_STDERR].take());
+    // SAFETY: a shared borrow, like `pipe_for`'s; nothing writes the slots
+    // after `stdio_init`.
+    let slots = unsafe { &*STDIO.0.get() };
+    for pipe in slots.iter().flatten() {
+        pipe.close();
     }
 }
 

@@ -1109,9 +1109,11 @@ fn apply_thread_local_overlay(rust_src: &Path) -> Result<()>
     // / `tp-relative` on RISC-V) against the per-thread block allocated
     // by procmgr (main thread) or `alloc_thread_tls` (spawned threads).
     //
-    // Only the `guard::enable` helper needs a seraph arm: seraph has no
-    // concept of "thread exit" visible to std (the kernel unwinds on
-    // `SYS_THREAD_EXIT`), so treat it as a no-op — matches hermit/xous.
+    // Only the `guard::enable` helper needs a seraph arm, a no-op: std's
+    // spawned-thread trampoline (`thread_entry` in
+    // runtime/ruststd/src/sys/thread/seraph.rs) runs the TLS destructors
+    // and `rt::thread_cleanup` itself before signalling join, as hermit's
+    // `thread_start` does.
     let mod_rs = rust_src.join("library/std/src/sys/thread_local/mod.rs");
     let orig =
         fs::read_to_string(&mod_rs).with_context(|| format!("reading {}", mod_rs.display()))?;

@@ -5,10 +5,15 @@
 
 //! Threading / per-thread state surface: Mutex+Arc multi-threading,
 //! per-thread stdio IPC buffer, per-thread allocator grows, the
-//! `thread_local!` macro, and `Condvar::wait_timeout`.
+//! `thread_local!` macro and its destructors at a spawned thread's exit, a
+//! spawned thread's identity and park/unpark through its handle, `RwLock`
+//! wakes for several queued readers and its non-blocking paths, and
+//! `Condvar::wait_timeout`.
 
 use std::cell::Cell;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,6 +38,18 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "tls_macro",
             run: tls_macro_phase,
+        },
+        Phase {
+            name: "thread_identity",
+            run: thread_identity_phase,
+        },
+        Phase {
+            name: "tls_destructors",
+            run: tls_destructors_phase,
+        },
+        Phase {
+            name: "rwlock_queued_readers",
+            run: rwlock_queued_readers_phase,
         },
         Phase {
             name: "timeout",
@@ -155,6 +172,141 @@ pub fn tls_macro_phase(_: &Caps)
     assert_eq!(got, 0xAAu32 + 0xBBu32, "child thread_local! sum mismatch");
     std::os::seraph::log!("thread_local! child sum={got:#018x}");
     std::os::seraph::log!("thread_local! macro phase passed");
+}
+
+/// A spawned thread's `thread::current()` is the thread its `JoinHandle`
+/// names: the same id, the `Builder` name, and the Parker that
+/// `JoinHandle::thread().unpark()` releases.
+pub fn thread_identity_phase(_: &Caps)
+{
+    // The child parks for at most `BOUND`; the unpark lands at about 50 ms,
+    // so a wake later than `WOKEN_BY` means the unpark was lost and the park
+    // ran out its timeout.
+    const BOUND: Duration = Duration::from_secs(5);
+    const WOKEN_BY: Duration = Duration::from_secs(1);
+
+    let released = Arc::new(AtomicBool::new(false));
+    let child_released = released.clone();
+    let handle = thread::Builder::new()
+        .name("svctest-identity".into())
+        .spawn(move || {
+            let me = thread::current();
+            let start = Instant::now();
+            // Park until the main thread's unpark through the handle lands;
+            // `park_timeout` bounds the wait so a lost unpark fails the
+            // phase instead of hanging it.
+            while !child_released.load(Ordering::Acquire)
+            {
+                let Some(left) = BOUND.checked_sub(start.elapsed())
+                else
+                {
+                    break;
+                };
+                thread::park_timeout(left);
+            }
+            (me.id(), me.name().map(String::from), start.elapsed())
+        })
+        .expect("thread_identity spawn failed");
+    let handle_id = handle.thread().id();
+
+    thread::sleep(Duration::from_millis(50));
+    released.store(true, Ordering::Release);
+    handle.thread().unpark();
+    let (child_id, child_name, parked_for) = handle.join().expect("thread_identity child panicked");
+
+    assert_eq!(
+        child_id, handle_id,
+        "child thread::current().id() differs from its handle's"
+    );
+    assert_eq!(
+        child_name.as_deref(),
+        Some("svctest-identity"),
+        "Builder name not visible"
+    );
+    assert!(
+        parked_for < WOKEN_BY,
+        "unpark through the handle did not wake the child's park"
+    );
+    std::os::seraph::log!(
+        "thread_identity: unparked after {:#x} us",
+        u64::try_from(parked_for.as_micros()).unwrap_or(u64::MAX)
+    );
+    std::os::seraph::log!("thread_identity phase passed");
+}
+
+/// A spawned thread's `thread_local!` destructors run when it exits, before
+/// `join` returns.
+pub fn tls_destructors_phase(_: &Caps)
+{
+    struct SetOnDrop(Arc<AtomicBool>);
+    impl Drop for SetOnDrop
+    {
+        fn drop(&mut self)
+        {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    std::thread_local! {
+        static GUARD: Cell<Option<SetOnDrop>> = const { Cell::new(None) };
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let flag = dropped.clone();
+    thread::spawn(move || GUARD.with(|g| g.set(Some(SetOnDrop(flag)))))
+        .join()
+        .expect("tls_destructors child panicked");
+    assert!(
+        dropped.load(Ordering::Acquire),
+        "a spawned thread's thread_local! value was not dropped at exit"
+    );
+    std::os::seraph::log!("tls_destructors phase passed");
+}
+
+/// Two readers queued behind a held write lock both acquire once it is
+/// released: each woken waiter passes the wake on, so none is stranded.
+pub fn rwlock_queued_readers_phase(_: &Caps)
+{
+    const READERS: usize = 2;
+    const BOUND: Duration = Duration::from_secs(5);
+
+    let lock = Arc::new(RwLock::new(0u32));
+    let (acquired, acquisitions) = mpsc::channel();
+    let write = lock.write().expect("rwlock poisoned");
+    let readers: Vec<_> = (0..READERS)
+        .map(|_| {
+            let lock = lock.clone();
+            let acquired = acquired.clone();
+            thread::spawn(move || {
+                let value = *lock.read().expect("rwlock poisoned");
+                let _ = acquired.send(value);
+            })
+        })
+        .collect();
+    // Let both readers reach the contended path and park behind the writer.
+    thread::sleep(Duration::from_millis(100));
+    drop(write);
+
+    for i in 0..READERS
+    {
+        let value = acquisitions
+            .recv_timeout(BOUND)
+            .unwrap_or_else(|_| panic!("queued reader {i} never acquired the read lock"));
+        assert_eq!(value, 0, "reader saw a value no writer stored");
+    }
+    for r in readers
+    {
+        r.join().expect("rwlock reader panicked");
+    }
+
+    // After contended readers and writer, the free lock must still be taken
+    // by the non-blocking paths.
+    let held = lock
+        .try_write()
+        .expect("try_write on a free lock after contended readers");
+    drop(held);
+    let shared = lock.try_read().expect("try_read on a free lock");
+    drop(shared);
+    std::os::seraph::log!("rwlock_queued_readers phase passed");
 }
 
 pub fn timeout_phase(_: &Caps)

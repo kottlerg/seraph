@@ -20,11 +20,15 @@
 //!   * Bind death: syscall::thread_bind_notification(thread_cap, event_queue_cap).
 //!   * Start: ipc_call(process_handle, START_PROCESS, 0, &[]).
 //!   * Wait: syscall::event_recv(event_queue_cap) — blocks until kernel posts
-//!           the exit reason on thread exit. Exit reason 0 = clean
-//!           `SYS_THREAD_EXIT`; 0x1000+vector = fault exit.
+//!           the exit reason on thread exit, encoded as
+//!           docs/process-lifecycle.md § Exit reason defines.
 //!   * Kill: ipc_call(process_handle, DESTROY_PROCESS, 0, &[]) — procmgr
-//!           revokes + deletes the child's kernel objects; the bound
-//!           EventQueue is woken with exit reason 0.
+//!           revokes + deletes the child's kernel objects, a teardown that
+//!           posts nothing itself — then event_post(event_queue_cap,
+//!           EXIT_KILLED), so `wait` after `kill` reports `EXIT_KILLED`,
+//!           unless the child had already died and its own exit reason,
+//!           posted first, is reported. A failed teardown is returned as
+//!           the error and posts nothing.
 //!
 //! Stdio:
 //!   * `Stdio::Inherit` (default) / `Stdio::Null` — no pipe installed
@@ -35,9 +39,10 @@
 //!     `ChildStdin` / `ChildStdout` / `ChildStderr`.
 //!
 //! Identity:
-//!   * `Process::id()` returns the low 32 bits of procmgr's internal process
-//!     badge (unique, monotonic, nonzero). Not a POSIX pid — processes in
-//!     Seraph are identified by capability, not pid.
+//!   * `Process::id()` returns the process-handle cap's handle (its
+//!     generation-tagged slot) in the caller's CSpace, unique only within
+//!     that CSpace and only while the handle is held. Not a POSIX pid —
+//!     processes in Seraph are identified by capability, not pid.
 //!
 //! Argv/env:
 //!   * `Command::arg(...)` accumulates into `self.args`; `Command::env_mut()`
@@ -73,7 +78,7 @@ use ipc::{procmgr_errors, procmgr_labels};
 /// on a real death), so `u64::MAX` is unambiguous.
 const BRIDGE_SENTINEL_DROP: u64 = u64::MAX;
 
-use syscall::EXIT_KILLED;
+use syscall::{EXIT_FAULT_BASE, EXIT_KILLED};
 use syscall_abi::{MSG_DATA_WORDS_MAX, SyscallError};
 
 // ── Stdio ───────────────────────────────────────────────────────────────────
@@ -308,10 +313,17 @@ impl Command {
             io::Error::new(io::ErrorKind::InvalidInput, "Command program path must be UTF-8")
         })?;
 
-        // Pack argv (NUL-terminated UTF-8 concatenation of self.args).
+        // Pack argv (NUL-terminated UTF-8 concatenation of self.args). The
+        // process ABI defines the blob as UTF-8 strings, so a non-UTF-8
+        // argument is refused rather than passed through.
         let mut args_blob: Vec<u8> = Vec::new();
         for arg in &self.args {
-            let bytes = arg.as_encoded_bytes();
+            let bytes = arg
+                .to_str()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "argv entry is not UTF-8")
+                })?
+                .as_bytes();
             if bytes.iter().any(|&b| b == 0) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -329,12 +341,19 @@ impl Command {
         }
         let args_count: u32 = self.args.len() as u32;
 
-        // Pack env (NUL-terminated KEY=VALUE concatenation of CommandEnv.capture()).
+        // Pack env (NUL-terminated KEY=VALUE concatenation of CommandEnv.capture()),
+        // UTF-8 like argv.
         let mut env_blob: Vec<u8> = Vec::new();
         let mut env_count_usize: usize = 0;
         for (key, val) in self.env.capture() {
-            let key_bytes = key.as_encoded_bytes();
-            let val_bytes = val.as_encoded_bytes();
+            let (Some(key_str), Some(val_str)) = (key.to_str(), val.to_str()) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "env entry is not UTF-8",
+                ));
+            };
+            let key_bytes = key_str.as_bytes();
+            let val_bytes = val_str.as_bytes();
             if key_bytes.iter().any(|&b| b == 0 || b == b'=')
                 || val_bytes.iter().any(|&b| b == 0)
             {
@@ -380,10 +399,15 @@ impl Command {
             ));
         }
 
-        // SAFETY: `info.ipc_buffer` is the kernel-registered IPC buffer for
-        // this thread, installed at `_start` time; page-aligned, u64-aligned,
-        // and mapped for the process lifetime.
-        let ipc_ptr = info.ipc_buffer as *mut u64;
+        // The calling thread's registered IPC buffer: `_start` installs the
+        // main thread's, and `thread_entry` each spawned thread's.
+        let ipc_ptr = crate::os::seraph::current_ipc_buf();
+        if ipc_ptr.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Command::spawn: calling thread has no registered IPC buffer",
+            ));
+        }
 
         // Walk the spawner's namespace cap to the binary node. The
         // resulting badged SEND on the owning fs driver's namespace
@@ -412,7 +436,6 @@ impl Command {
         // observer on the child, so a terminal fault in *any* of the child's
         // threads (not just the main thread) posts the fault class to this
         // queue and `wait()` returns.
-        let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
         let death_eq = crate::sys::alloc::seraph::object_slab_retype(88, |slab| {
             syscall::event_queue_create(slab, 4).ok()
         })
@@ -472,10 +495,9 @@ impl Command {
         let builder = builder.cap(death_relay);
         let msg = builder.word_count(total_words).build();
 
-        // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page for
-        // this thread, installed at `_start` time. file_cap and death_relay
-        // ownership transfer to procmgr via the IPC; procmgr cap_deletes the
-        // file cap and binds-then-deletes the relay.
+        // SAFETY: `ipc_ptr` is this thread's registered IPC buffer page.
+        // file_cap and death_relay ownership transfer to procmgr via the IPC;
+        // procmgr cap_deletes the file cap and binds-then-deletes the relay.
         let reply = unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_ptr) }
             .map_err(|_| {
                 let _ = syscall::cap_delete(death_eq);
@@ -504,8 +526,7 @@ impl Command {
         if syscall::thread_bind_notification(thread_cap, death_eq, 0).is_err() {
             let _ = syscall::cap_delete(death_eq);
             let _ = syscall::cap_delete(thread_cap);
-            // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+            destroy_child(process_handle);
             let _ = syscall::cap_delete(process_handle);
             return Err(io::Error::other("thread_bind_notification for child failed"));
         }
@@ -579,8 +600,7 @@ impl Command {
                     // protocol + unmap + cap_delete). Tear down the child.
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
-                    // SAFETY: ipc_ptr is the kernel-registered IPC buffer.
-                    let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                    destroy_child(process_handle);
                     let _ = syscall::cap_delete(process_handle);
                     return Err(e);
                 }
@@ -624,6 +644,7 @@ impl Command {
                 }
 
                 let handles = BridgeHandles {
+                    process_handle,
                     death_eq,
                     completion_notification,
                     pipe_notifications,
@@ -659,8 +680,7 @@ impl Command {
                     );
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
-                    // SAFETY: ipc_ptr is the kernel-registered IPC buffer.
-                    let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                    destroy_child(process_handle);
                     let _ = syscall::cap_delete(process_handle);
                     return Err(e);
                 }
@@ -746,8 +766,7 @@ impl Command {
                 );
                 let _ = syscall::cap_delete(death_eq);
                 let _ = syscall::cap_delete(thread_cap);
-                // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                destroy_child(process_handle);
                 let _ = syscall::cap_delete(process_handle);
                 return Err(e);
             }
@@ -765,7 +784,7 @@ impl Command {
                 ns_builder = ns_builder.cap(cwd_cap_to_send);
             }
             let ns_msg = ns_builder.build();
-            // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
+            // SAFETY: `ipc_ptr` is this thread's registered IPC buffer page.
             let ns_reply = unsafe { ipc::ipc_call(process_handle, &ns_msg, ipc_ptr) };
             // The caps were transferred by ipc_call regardless of the
             // reply label; clear our slot indices unconditionally.
@@ -790,8 +809,7 @@ impl Command {
                     );
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
-                    // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                    destroy_child(process_handle);
                     let _ = syscall::cap_delete(process_handle);
                     return Err(map_procmgr_error(reply.label));
                 }
@@ -810,8 +828,7 @@ impl Command {
                     );
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
-                    // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                    destroy_child(process_handle);
                     let _ = syscall::cap_delete(process_handle);
                     return Err(io::Error::other("CONFIGURE_NAMESPACE syscall failed"));
                 }
@@ -820,7 +837,7 @@ impl Command {
 
         // Kick the child off.
         let start_msg = ipc::IpcMessage::new(procmgr_labels::START_PROCESS);
-        // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
+        // SAFETY: `ipc_ptr` is this thread's registered IPC buffer page.
         let start_result = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_ptr) };
         let start_error = match &start_result {
             Ok(reply) if reply.label == procmgr_errors::SUCCESS => None,
@@ -837,15 +854,19 @@ impl Command {
                 }
                 let _ = syscall::cap_delete(b.completion_notification);
             }
-            mark_spawn_failure_pipes(
-                child_stdin_pipe.as_deref(),
-                child_stdout_pipe.as_deref(),
-                child_stderr_pipe.as_deref(),
-            );
+            // An interrupted START_PROCESS may have started the child, so
+            // the rings count as never used only once the teardown has
+            // returned; otherwise their grants stay accounted to this
+            // process, as the death bridge leaves them.
+            if destroy_child(process_handle) {
+                mark_spawn_failure_pipes(
+                    child_stdin_pipe.as_deref(),
+                    child_stdout_pipe.as_deref(),
+                    child_stderr_pipe.as_deref(),
+                );
+            }
             let _ = syscall::cap_delete(death_eq);
             let _ = syscall::cap_delete(thread_cap);
-            // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
             let _ = syscall::cap_delete(process_handle);
             return Err(e);
         }
@@ -868,10 +889,11 @@ impl Command {
 }
 
 /// Mark every parent-side pipe end's ring grant releasable on a
-/// spawn-failure path. The child is destroyed without ever running, but
-/// the releases were already armed for a bridge that exits via the drop
-/// sentinel without reporting a death; without this call the grants
-/// would strand in memmgr until the spawner exits.
+/// spawn-failure path. The caller guarantees that the child never ran or
+/// that its `DESTROY_PROCESS` has returned, so no child thread can touch
+/// the rings. The releases were already armed for a bridge that exits
+/// via the drop sentinel without reporting a death; without this call
+/// the grants would strand in memmgr until the spawner exits.
 fn mark_spawn_failure_pipes(
     stdin: Option<&crate::sys::pipe::seraph::Pipe>,
     stdout: Option<&crate::sys::pipe::seraph::Pipe>,
@@ -904,8 +926,7 @@ fn install_pipe(
         .cap(caps.data_notification)
         .cap(caps.space_notification)
         .build();
-    // SAFETY: `ipc_ptr` is the calling thread's kernel-registered IPC
-    // buffer (installed by `_start`).
+    // SAFETY: `ipc_ptr` is the calling thread's registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(process_handle, &cap_msg, ipc_ptr) }
         .map_err(|_| io::Error::other("CONFIGURE_PIPE syscall failed"))?;
     if reply.label != procmgr_errors::SUCCESS {
@@ -1004,12 +1025,15 @@ pub struct Process {
 
 impl Process {
     pub fn id(&self) -> u32 {
-        // No POSIX pid on Seraph; the capability slot index uniquely
+        // No POSIX pid on Seraph; the process-handle cap's handle uniquely
         // identifies the process within this caller's CSpace.
         self.process_handle
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
+        if !destroy_child(self.process_handle) {
+            return Err(io::Error::other("Child::kill: DESTROY_PROCESS failed"));
+        }
         // Kernel posts to `death_notification` only on voluntary exit
         // (`SYS_THREAD_EXIT`) or fault — cap_revoke-driven teardown is
         // silent. Synthesize the event ourselves on `death_eq` so the
@@ -1018,12 +1042,6 @@ impl Process {
         // kernel fault range (0x1000..0x2000) so callers can tell apart
         // a user-initiated kill from a hardware fault.
         let _ = syscall::event_post(self.death_eq, EXIT_KILLED);
-        if let Some(info) = crate::os::seraph::try_startup_info() {
-            let ipc_ptr = info.ipc_buffer as *mut u64;
-            let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
-            // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_call(self.process_handle, &destroy_msg, ipc_ptr) };
-        }
         Ok(())
     }
 
@@ -1083,8 +1101,9 @@ impl Process {
             if !b.peer_dead.load(Ordering::Acquire) {
                 return Ok(None);
             }
-            // The bridge's remaining work (pipe kicks, ring releases, the
-            // completion send) is bounded; join it before reporting.
+            // The bridge's remaining work (pipe kicks, the procmgr
+            // teardown call, ring releases, the completion send) is
+            // bounded; join it before reporting.
             if let Some(h) = b.handle.take() {
                 let _ = h.join();
             }
@@ -1120,12 +1139,7 @@ impl Drop for Process {
                     let _ = h.join();
                 }
             }
-            if let Some(info) = crate::os::seraph::try_startup_info() {
-                let ipc_ptr = info.ipc_buffer as *mut u64;
-                let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
-                // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_call(self.process_handle, &destroy_msg, ipc_ptr) };
-            }
+            destroy_child(self.process_handle);
         }
         if let Some(b) = self.bridge.as_ref() {
             let _ = syscall::cap_delete(b.completion_notification);
@@ -1150,10 +1164,15 @@ impl Drop for Process {
 //   * `notification_send` on each piped direction's data and space notifications,
 //     so any reader/writer currently parked in `notification_wait` wakes
 //     and re-checks the flag.
-//   * `RingRelease::on_peer_death` per piped direction — returns the
-//     direction's ring-page grant to memmgr when the parent end is
-//     already dropped; otherwise the parent's later `Pipe::Drop` sends
-//     the release. Exactly-once by the shared state machine.
+//   * `DESTROY_PROCESS` on the process handle, so the child's address
+//     space is gone before any ring page is returned.
+//   * `RingRelease::on_peer_death` per piped direction, only once that
+//     call succeeded — returns the direction's ring-page grant to memmgr
+//     when the parent end is already dropped; otherwise the parent's later
+//     `Pipe::Drop` sends the release, unless its ring unmap fails, which
+//     keeps the grant until exit. Exactly-once by the shared state
+//     machine. A failed teardown call reports no death, so the grants stay
+//     accounted to the spawner until it exits.
 //   * `exit_reason.store(reason)` + `notification_send(completion_notification)`
 //     — the rendezvous point `Process::wait` blocks on.
 //
@@ -1180,6 +1199,10 @@ struct PipeBridgeNotifications {
 }
 
 struct BridgeHandles {
+    /// Process handle the bridge sends `DESTROY_PROCESS` on before any ring
+    /// release. `Process` deletes it only after the bridge has finished:
+    /// `wait` and `try_wait` join the bridge, and `Drop` joins it first.
+    process_handle: u32,
     death_eq: u32,
     completion_notification: u32,
     pipe_notifications: [Option<PipeBridgeNotifications>; 3],
@@ -1212,20 +1235,48 @@ fn bridge_main(h: BridgeHandles) {
         let _ = syscall::notification_send(sig.data_notification, 1);
         let _ = syscall::notification_send(sig.space_notification, 1);
     }
-    // Report the child's death to each direction's ring-grant release
-    // state; send the release for ends the parent already dropped.
-    // Kicks first: waking blocked readers/writers must not wait on the
-    // memmgr round-trips below.
-    for sig in h.pipe_notifications.iter().flatten() {
-        if let Some(rr) = &sig.ring_release {
-            if rr.on_peer_death() {
-                crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
+    // The death post does not stop the child's other threads, which keep
+    // running until procmgr's teardown (docs/process-lifecycle.md § Exit
+    // reason), so a ring page is not yet safe to return. DESTROY_PROCESS
+    // replies once procmgr has revoked the child's address space
+    // (services/procmgr/docs/ipc-interface.md § Label 8), or at once for a
+    // child procmgr already reaped; after that no child thread can touch a
+    // ring. Without a successful reply the child's death is not reported
+    // to the ring-release state, so its grants stay accounted to this
+    // process until it exits. Kicks first: waking blocked readers/writers
+    // must not wait on the procmgr and memmgr round-trips here.
+    if destroy_child(h.process_handle) {
+        // Report the child's death to each direction's ring-grant release
+        // state; send the release for ends the parent already dropped.
+        for sig in h.pipe_notifications.iter().flatten() {
+            if let Some(rr) = &sig.ring_release {
+                if rr.on_peer_death() {
+                    crate::sys::alloc::seraph::slab_release_fresh(rr.phys());
+                }
             }
         }
     }
     // Raise the rendezvous notification last so a `wait` that wakes
     // observes `exit_reason` already published.
     let _ = syscall::notification_send(h.completion_notification, 1);
+}
+
+/// Send `DESTROY_PROCESS` on `process_handle`, retrying a call this thread's
+/// stop and restart interrupted, and report whether procmgr replied.
+fn destroy_child(process_handle: u32) -> bool {
+    let ipc_buf = crate::os::seraph::current_ipc_buf();
+    if ipc_buf.is_null() {
+        return false;
+    }
+    let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
+    loop {
+        // SAFETY: ipc_buf is this thread's kernel-registered IPC buffer.
+        match unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_buf) } {
+            Ok(_) => return true,
+            Err(e) if e == SyscallError::Interrupted as i64 => {}
+            Err(_) => return false,
+        }
+    }
 }
 
 // ── ExitStatus / ExitCode ───────────────────────────────────────────────────
@@ -1243,20 +1294,21 @@ impl ExitStatus {
     }
 
     pub fn code(&self) -> Option<i32> {
-        // exit_reason is a voluntary exit code (`0` clean, or `1..0x1000` from
-        // `process::exit`/`ExitCode`) or a kernel fault encoding (`0x1000 +
-        // vector`). The voluntary code is the reason value itself, so widening
-        // to i32 yields it directly; callers distinguish "clean" via `.exit_ok()`
-        // and "fault" via the `>= 0x1000` range (see `Display`).
+        // exit_reason is encoded as docs/process-lifecycle.md § Exit reason
+        // defines: a voluntary code below `EXIT_FAULT_BASE`, a fault from
+        // `EXIT_FAULT_BASE` up to `EXIT_KILLED`, or `EXIT_KILLED`. A voluntary
+        // code is the reason value itself, so widening to i32 yields it
+        // directly; callers distinguish "clean" via `.exit_ok()` and the other
+        // classes by those ranges (see `Display`).
         Some(self.0 as i32)
     }
 }
 
 impl fmt::Display for ExitStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0 == 0 {
-            write!(f, "exit status: 0")
-        } else if self.0 >= 0x1000 {
+        if self.0 == EXIT_KILLED {
+            write!(f, "killed")
+        } else if self.0 >= EXIT_FAULT_BASE {
             write!(f, "fault exit: 0x{:x}", self.0)
         } else {
             write!(f, "exit status: {}", self.0)

@@ -6,8 +6,9 @@
 //! procmgr / `std::process::Command` surface.
 //!
 //! Hosts the child-mode entries `cwd_child_main` (spawned by
-//! `command_cwd_inherit_phase`) and `blobs_fill_child_main` (spawned by
-//! `command_blobs_fill_message_phase`).
+//! `command_cwd_inherit_phase`), `blobs_fill_child_main` (spawned by
+//! `command_blobs_fill_message_phase`), and `park_child_main` (spawned by
+//! `command_from_spawned_thread_phase`).
 
 use std::os::seraph::startup_info;
 
@@ -51,6 +52,14 @@ pub fn command_phases() -> &'static [Phase]
             run: command_blobs_fill_message_phase,
         },
         Phase {
+            name: "command_non_utf8_refused",
+            run: command_non_utf8_refused_phase,
+        },
+        Phase {
+            name: "command_from_spawned_thread",
+            run: command_from_spawned_thread_phase,
+        },
+        Phase {
             name: "stdio_file_unsupported",
             run: stdio_file_unsupported_phase,
         },
@@ -58,8 +67,9 @@ pub fn command_phases() -> &'static [Phase]
 }
 
 /// Child-mode dispatch for argv tokens this module owns. Matching
-/// arms diverge via the child function's `std::process::exit`; on a
-/// miss control returns to the caller.
+/// arms diverge: each child function exits through `std::process::exit`,
+/// except `park-child`'s, which parks until its spawner tears it down. On
+/// a miss control returns to the caller.
 pub fn reentry_main(role: &str)
 {
     if role == "cwd-child"
@@ -69,6 +79,22 @@ pub fn reentry_main(role: &str)
     if role == BLOBS_FILL_ROLE
     {
         blobs_fill_child_main();
+    }
+    if role == PARK_ROLE
+    {
+        park_child_main();
+    }
+}
+
+/// argv[1] of a child that parks until it is torn down; the
+/// `command_from_spawned_thread` cells kill and drop it.
+const PARK_ROLE: &str = "park-child";
+
+fn park_child_main() -> !
+{
+    loop
+    {
+        std::thread::park();
     }
 }
 
@@ -337,6 +363,125 @@ pub fn command_blobs_over_message_phase(_: &Caps)
         "joint blob overflow must surface as ArgumentListTooLong, got {err:?}"
     );
     std::os::seraph::log!("command_blobs_over_message phase passed");
+}
+
+/// The process ABI defines argv and env as UTF-8 strings, so std refuses a
+/// non-UTF-8 argument or env value with `InvalidInput` before any child is
+/// created.
+pub fn command_non_utf8_refused_phase(_: &Caps)
+{
+    // SAFETY: safe Rust cannot build a non-UTF-8 `OsString` here, since
+    // `std::os::seraph` offers no `OsStringExt::from_vec`. This target's
+    // `OsStr` uses std's byte-string encoding, which accepts every byte
+    // sequence, so `[0xFF]` is a validly encoded `OsStr` on it.
+    let invalid = unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(vec![0xFF]) };
+
+    let err = std::process::Command::new(BLOB_FIXTURE)
+        .arg(&invalid)
+        .spawn()
+        .expect_err("a non-UTF-8 argument must not spawn");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::InvalidInput,
+        "a non-UTF-8 argument must surface as InvalidInput, got {err:?}"
+    );
+
+    let err = std::process::Command::new(BLOB_FIXTURE)
+        .env("SVCTEST_NON_UTF8", &invalid)
+        .spawn()
+        .expect_err("a non-UTF-8 env value must not spawn");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::InvalidInput,
+        "a non-UTF-8 env value must surface as InvalidInput, got {err:?}"
+    );
+    std::os::seraph::log!("command_non_utf8_refused phase passed");
+}
+
+/// `Command::spawn`, `Child::kill`, and dropping an unwaited `Child` each
+/// call procmgr through the calling thread's IPC buffer, so all three must
+/// work from a spawned thread as from main. The kill and drop cells use an
+/// unpiped child, which has no death bridge to tear it down instead, and
+/// check through procmgr that the child is gone.
+pub fn command_from_spawned_thread_phase(_: &Caps)
+{
+    use ipc::procmgr_process_state::{EXITED, UNKNOWN};
+    use std::process::Command;
+
+    let spawner = std::thread::Builder::new()
+        .name("command_spawner".into())
+        .spawn(|| {
+            let output = Command::new("/programs/hello")
+                .output()
+                .expect("Command::output from a spawned thread failed");
+            assert!(
+                output.status.success(),
+                "hello spawned from a thread did not exit cleanly: {}",
+                output.status
+            );
+            assert!(
+                !output.stdout.is_empty(),
+                "hello spawned from a thread produced no stdout"
+            );
+
+            let mut child = Command::new("/tests/svctest")
+                .arg(PARK_ROLE)
+                .spawn()
+                .expect("spawning the park child to kill failed");
+            child
+                .kill()
+                .expect("Child::kill from a spawned thread failed");
+            let status = child.wait().expect("wait on the killed park child failed");
+            assert_eq!(
+                status.to_string(),
+                "killed",
+                "a killed child must report killed, got {status}"
+            );
+            let state = process_state(child.id());
+            assert!(
+                matches!(state, UNKNOWN | EXITED),
+                "Child::kill from a spawned thread left the child in state {state}"
+            );
+
+            let unwaited = Command::new("/tests/svctest")
+                .arg(PARK_ROLE)
+                .spawn()
+                .expect("spawning the park child to drop failed");
+            let handle = syscall::cap_derive(unwaited.id(), syscall::RIGHTS_ALL)
+                .expect("copying the unwaited child's process handle failed");
+            drop(unwaited);
+            let state = process_state(handle);
+            let _ = syscall::cap_delete(handle);
+            assert!(
+                matches!(state, UNKNOWN | EXITED),
+                "dropping an unwaited Child on a spawned thread left the child in state {state}"
+            );
+        })
+        .expect("command_from_spawned_thread spawn failed");
+    spawner
+        .join()
+        .expect("command_from_spawned_thread child panicked");
+    std::os::seraph::log!("command_from_spawned_thread phase passed");
+}
+
+/// The `procmgr_process_state` value procmgr reports for the process
+/// behind `handle`, asked through the calling thread's IPC buffer. After
+/// teardown procmgr still answers on the handle, with `UNKNOWN` (or
+/// `EXITED` while the badge is in its recent-exits ring), so a failed call
+/// or a refusal is a test failure, not a sign the process is gone.
+fn process_state(handle: u32) -> u64
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(handle, &query, ipc_buf) }
+        .expect("QUERY_PROCESS on the child's process handle failed");
+    assert_eq!(
+        reply.label,
+        ipc::procmgr_errors::SUCCESS,
+        "QUERY_PROCESS refused the child's process handle"
+    );
+    reply.word(0)
 }
 
 /// `file_size` word + 32 argv words + env header + 30 env words = 64: the

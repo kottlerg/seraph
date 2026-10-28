@@ -14,8 +14,9 @@
 //!    matching `ServiceEntry` and its argv/env/cwd/seed, log-sink flag,
 //!    and scheduling fields in the parallel `RestartRecipe` table.
 //! 2. **Defined only** — call [`super::launch::launch`] to spawn the
-//!    service, then (if `restart != never`) bind death-notification
-//!    and persist a `ServiceEntry`.
+//!    service (it binds death-notification before `START_PROCESS` when
+//!    `restart != never`), then, for a supervised service, persist a
+//!    `ServiceEntry`.
 //! 3. **Registered without definition** — log a hard error and refuse
 //!    to bind. svcmgr cannot restart what it has no recipe for; this
 //!    is a configuration error.
@@ -209,10 +210,8 @@ fn handle_definition(
         // init-created service: svcmgr has no process_handle (init
         // didn't share it). First death cannot DESTROY_PROCESS — see
         // `restart::restart_process`. Bind happens after the fact (the
-        // thread has been running since its bootstrap spawn) — a death
-        // in that window is lost.
-        // Closing that race is kernel-protocol work; tracked as a
-        // follow-up.
+        // thread has been running since its bootstrap spawn); `bind_only`
+        // states why a death in that window is still delivered.
         bind_only(
             def,
             slot.thread_cap,
@@ -322,10 +321,10 @@ fn bind_only(
     *service_count += 1;
 }
 
-/// Clone the heap-backed launch surfaces from a parsed definition so the
-/// restart path can replay argv/env/cwd/seed byte-for-byte. The fixed
-/// fields (name/binary/policy/namespace) live on the `ServiceEntry`; this
-/// carries only what the fixed record cannot hold.
+/// Clone the launch surfaces the fixed record cannot hold from a parsed
+/// definition so the restart path can replay them: argv/env/cwd/seed
+/// byte-for-byte, the log-sink flag, and the scheduling fields. The fixed
+/// fields (name/binary/policy/namespace) live on the `ServiceEntry`.
 fn recipe_from(def: &Definition) -> RestartRecipe
 {
     RestartRecipe {

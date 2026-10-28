@@ -58,11 +58,14 @@ fn versioned(label: u64) -> ipc::IpcMessage
 }
 
 /// `label` sent on `devmgr.registry`, whose badge lacks the label's
-/// authority bit (`bit`), replies `UNAUTHORIZED` and carries no cap.
-fn assert_registry_denies(caps: &Caps, label: u64, shown: &str, bit: &str)
+/// authority bit (`bit_name`), replies `UNAUTHORIZED` and carries no cap.
+fn assert_registry_denies(caps: &Caps, label: u64, label_name: &str, bit_name: &str)
 {
     let devmgr = caps.devmgr_registry;
-    assert!(devmgr != 0, "{shown} deny: no devmgr.registry cap seeded");
+    assert!(
+        devmgr != 0,
+        "{label_name} deny: no devmgr.registry cap seeded"
+    );
 
     let info = startup_info();
     // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB).
@@ -71,13 +74,16 @@ fn assert_registry_denies(caps: &Caps, label: u64, shown: &str, bit: &str)
 
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(devmgr, &versioned(label), ipc_buf) }
-        .unwrap_or_else(|_| panic!("{shown} ipc_call failed"));
+        .unwrap_or_else(|_| panic!("{label_name} ipc_call failed"));
     assert_eq!(
         reply.label,
         ipc::devmgr_errors::UNAUTHORIZED,
-        "{shown} without {bit} must reply UNAUTHORIZED"
+        "{label_name} without {bit_name} must reply UNAUTHORIZED"
     );
-    assert!(reply.caps().is_empty(), "{shown} deny must carry no cap");
+    assert!(
+        reply.caps().is_empty(),
+        "{label_name} deny must carry no cap"
+    );
 }
 
 fn block_device_deny_phase(caps: &Caps)

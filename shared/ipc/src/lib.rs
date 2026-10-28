@@ -1558,8 +1558,10 @@ pub mod devmgr_labels
     /// u64 bit, gating the device-endpoint queries ([`QUERY_SERIAL_DEVICE`],
     /// [`QUERY_FRAMEBUFFER_DEVICE`], [`QUERY_RTC_DEVICE`],
     /// [`QUERY_INPUT_DEVICE`]) and [`QUERY_ACPI_TABLE`]. Set on every
-    /// registry SEND a consumer holds: svcmgr's `devmgr.*` publications
-    /// and the SEND init hands vfsd. Without it those handlers reply
+    /// consumer query cap: svcmgr's `devmgr.*` publications, the SEND
+    /// svcmgr mints for logd at launch, and the SEND init hands vfsd (the
+    /// per-device SENDs drivers hold for [`QUERY_DEVICE_INFO`] lack it).
+    /// Without it those handlers reply
     /// `UNAUTHORIZED`. It does not admit [`QUERY_BLOCK_DEVICE`], which
     /// [`BLOCK_DEVICE_AUTHORITY`] gates.
     pub const REGISTRY_QUERY_AUTHORITY: u64 = 1u64 << 63;

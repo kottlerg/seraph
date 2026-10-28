@@ -808,7 +808,8 @@ pub fn create_vfsd_with_caps(
     // the only registry cap carrying `BLOCK_DEVICE_AUTHORITY`, the bit
     // devmgr's gate on that label requires: the reply is whole-disk
     // authority, which no svcmgr-published registry cap may obtain.
-    // `REGISTRY_QUERY_AUTHORITY` rides beside it, as on every registry cap.
+    // `REGISTRY_QUERY_AUTHORITY` rides beside it, as on every consumer query
+    // cap.
     let Ok(registry_copy) = syscall::cap_derive_badge(
         spawn.registry_ep,
         syscall::RIGHTS_EP_SEND,

@@ -34,7 +34,7 @@ services/svctest/
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
-        ├── devmgr.rs          # Shutdown-device and test-label deny; `TEST_SPAWN_ORPHAN` teardown
+        ├── devmgr.rs          # Block, shutdown, test-label deny; `TEST_SPAWN_ORPHAN` teardown
         ├── pager.rs           # Demand paging: backed, declined, and pinned faults
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF

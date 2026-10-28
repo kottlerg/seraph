@@ -76,9 +76,10 @@ devmgr's responsibilities are:
   yet implemented, #30). devmgr owns each driver's service endpoint and mints a
   badged SEND on query. `QUERY_BLOCK_DEVICE`, whose reply is the
   `MOUNT_AUTHORITY`-badged whole-disk cap, is gated on `BLOCK_DEVICE_AUTHORITY`,
-  which only the registry cap init mints for vfsd carries; the other device
-  queries are gated on `REGISTRY_QUERY_AUTHORITY`, which every registry cap
-  carries.
+  which only the registry cap init mints for vfsd carries. The serial,
+  framebuffer, RTC, and input queries are gated on `REGISTRY_QUERY_AUTHORITY`,
+  which every consumer query cap carries: svcmgr's `devmgr.*` publications,
+  the cap svcmgr mints for logd at launch, and vfsd's.
 - **Broker ACPI and shutdown hardware to pwrmgr** — devmgr is the sole
   owner of the ACPI Memory caps and the only service that walks the ACPI
   table tree (RSDP → XSDT). `QUERY_ACPI_TABLE` locates a table by

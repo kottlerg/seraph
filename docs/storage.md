@@ -37,7 +37,8 @@ Four system-scope invariants govern the stack:
   on `REGISTER_PARTITION`; unbadged callers are rejected. vfsd is the
   sole holder of the whole-disk cap: devmgr mints it on
   `QUERY_BLOCK_DEVICE` only for a caller whose registry cap carries
-  `BLOCK_DEVICE_AUTHORITY`, which init sets on vfsd's alone.
+  `BLOCK_DEVICE_AUTHORITY`, which init sets on vfsd's registry cap
+  alone.
   Out-of-bounds LBAs are rejected by the block driver on every
   request. See
   [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).

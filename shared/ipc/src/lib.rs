@@ -121,8 +121,10 @@ pub mod procmgr_labels
     /// [`CREATE_DEATH_RELAY`] is set in the label; when present it is the
     /// LAST cap in the message (procmgr peels it off the tail, so the
     /// `creator_endpoint` slot stays positionally fixed regardless of
-    /// relay presence). Stdio pipes are installed via separate
-    /// [`CONFIGURE_PIPE`] calls between create and start.
+    /// relay presence), and it is a cap of its own: a relay request whose
+    /// only cap is `file_cap` is refused with `INVALID_ARGUMENT`. Stdio
+    /// pipes are installed via separate [`CONFIGURE_PIPE`] calls between
+    /// create and start.
     pub const CREATE_FROM_FILE: u64 = 13;
     /// Label flag (bit 16) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
     /// create the new process *pinned* — eager-mapped, with no system pager.
@@ -140,8 +142,9 @@ pub mod procmgr_labels
     pub const CREATE_PINNED: u64 = 1 << 16;
     /// Label flag (bit 17) for [`CREATE_FROM_FILE`]: the message carries a
     /// trailing death-relay POST-only `EventQueue` cap (the LAST cap in the
-    /// message). At finalize procmgr binds it as an `AddressSpace` death
-    /// observer (correlator 0) on the child so that a terminal fault in any
+    /// message, which then carries at least two caps). Once the child is
+    /// recorded, procmgr binds it as an `AddressSpace` death observer
+    /// (correlator 0) on the child so that a terminal fault in any
     /// of the child's threads posts the fault class straight to the
     /// spawner's own death queue, letting `Child::wait()` return. procmgr
     /// `cap_delete`s its copy after the bind (the kernel captured the
@@ -225,9 +228,10 @@ pub mod procmgr_labels
     ///
     /// Ordering: valid only between `CREATE_PROCESS` and `START_PROCESS`.
     /// Replies `ALREADY_STARTED` if the target is running.
-    /// `INVALID_BADGE` if the `process_handle` is unknown. Idempotent
-    /// per direction before start; later calls overwrite the previous
-    /// triple for that direction.
+    /// `INVALID_BADGE` if the `process_handle` is unknown. Each direction
+    /// is configured at most once: a second call for a configured
+    /// direction replies `INVALID_ARGUMENT`, and a refused call installs
+    /// nothing in the child.
     ///
     /// Spawners call this 0–3 times depending on which directions are
     /// piped. The 3 caps × 3 directions = 9 caps total exceeds
@@ -333,17 +337,18 @@ pub mod procmgr_labels
     ///
     /// Procmgr binds the death-EQ on both init threads (main and
     /// init-logd) with correlator `INIT_REAP_CORRELATOR` as part of the
-    /// first round, and reaps once both have exited. Each round replies
-    /// `procmgr_errors::SUCCESS`, or `INVALID_ARGUMENT` on the reject
-    /// arms in `services/procmgr/docs/ipc-interface.md`
-    /// § `REGISTER_INIT_TEARDOWN`.
+    /// first round, and reaps once both have exited. Only an un-badged
+    /// cap is accepted, and the handoff is one-shot. Each round replies
+    /// `procmgr_errors::SUCCESS`, `UNAUTHORIZED` from a badged sender, or
+    /// `INVALID_ARGUMENT` on the reject arms in
+    /// `services/procmgr/docs/ipc-interface.md` § `REGISTER_INIT_TEARDOWN`.
     pub const REGISTER_INIT_TEARDOWN: u64 = 15;
 
     /// Notification end of init's reap-handoff cap stream. After this call
     /// init has no caps left to transfer; procmgr's state machine
-    /// transitions to "armed", awaiting the death-EQ event. Init
-    /// calls `sys_thread_exit` immediately after this IPC replies. Replies
-    /// `INVALID_ARGUMENT` when no teardown is pending or the state machine
+    /// transitions to "armed". Init calls `sys_thread_exit` immediately
+    /// after this IPC replies. Replies `UNAUTHORIZED` from a badged sender,
+    /// and `INVALID_ARGUMENT` when no handoff is open or the state machine
     /// is already armed.
     pub const INIT_TEARDOWN_DONE: u64 = 16;
 
@@ -2141,10 +2146,16 @@ pub mod procmgr_errors
     pub const INVALID_ELF: u64 = 1;
     /// Out of memory during process creation.
     pub const OUT_OF_MEMORY: u64 = 2;
+    /// `START_PROCESS`: configuring the child's main thread
+    /// (`thread_configure_with_tls`) failed.
+    pub const THREAD_CONFIGURE_FAILED: u64 = 3;
     /// Process handle badge not found in process table.
     pub const INVALID_BADGE: u64 = 4;
     /// Attempt to start a process that was already started.
     pub const ALREADY_STARTED: u64 = 5;
+    /// `START_PROCESS`: starting the child's main thread (`thread_start`)
+    /// failed with an error other than `Interrupted`, which procmgr retries.
+    pub const THREAD_START_FAILED: u64 = 6;
     /// Invalid argument to an IPC request.
     pub const INVALID_ARGUMENT: u64 = 7;
     /// File not found while walking a namespace cap on the spawner side.
@@ -2727,10 +2738,10 @@ impl IpcMessageBuilder
 /// caller has insufficient rights (`GRANT` missing on a cap-bearing call),
 /// a cap slot is stale or Null (`InvalidCapability`), a cap slot is
 /// repeated in the message (`InvalidArgument`), a cap slot is pinned by an
-/// in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE` (`InvalidState`), or the call is
-/// interrupted. Cap-slot problems are rejected before blocking; a refusal
-/// arising only afterwards delivers the message with zero caps (the
-/// caller keeps its capabilities).
+/// in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer
+/// (`InvalidState`), or the call is interrupted. Cap-slot problems are
+/// rejected before blocking; a refusal arising only afterwards delivers the
+/// message with zero caps (the caller keeps its capabilities).
 #[inline]
 pub unsafe fn ipc_call(ep: u32, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 {
@@ -2796,9 +2807,9 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// all-or-nothing with the reply. An `Err` return consumes the pending
 /// reply either way: when a caller was claimed it has already been woken
 /// with the synthetic `IPC_REPLY_TRANSFER_FAILED` label (a reply cap slot
-/// stale, repeated, pinned by an in-flight revoke or move, or unacceptable to its `CSpace`), and
-/// when none was pending there is nothing to wake — in both cases the
-/// reply must not be retried.
+/// stale, repeated, pinned by an in-flight revoke, move, or IPC capability
+/// transfer, or unacceptable to its `CSpace`), and when none was pending
+/// there is nothing to wake — in both cases the reply must not be retried.
 ///
 /// # Safety
 /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC buffer
@@ -2808,11 +2819,11 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// Returns a negative `i64` error code: `InvalidCapability` (no pending
 /// reply target, or a reply cap slot is stale or Null), `InvalidArgument`
 /// (a cap slot repeated in the reply), `InvalidState` (a reply cap slot is
-/// pinned by an in-flight `SYS_CAP_REVOKE` or `SYS_CAP_MOVE`), or `QuotaExceeded` /
-/// `OutOfMemory` (the caller's `CSpace` cannot accept the reply caps). The
-/// reply never blocks, so it never returns `Interrupted`; the message's
-/// counts are within the kernel's maxima by construction (the kernel clamps
-/// larger ones rather than rejecting them).
+/// pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
+/// transfer), or `QuotaExceeded` / `OutOfMemory` (the caller's `CSpace`
+/// cannot accept the reply caps). The reply never blocks, so it never returns
+/// `Interrupted`; the message's counts are within the kernel's maxima by
+/// construction (the kernel clamps larger ones rather than rejecting them).
 #[inline]
 pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 {

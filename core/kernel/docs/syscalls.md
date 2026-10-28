@@ -1135,9 +1135,9 @@ original's derivation parent. The original `mmio_cap` is consumed.
 
 The original is revalidated under the derivation lock before it is consumed
 (see [capability-internals.md](capability-internals.md) § Revocation Algorithm):
-if a concurrent delete removed it, or a `SYS_CAP_REVOKE` or `SYS_CAP_MOVE` is in flight on it, the
-split fails with `InvalidState` and both children are rolled back. Its children
-are re-linked under its derivation parent in batches (lock released between
+if a concurrent delete removed it, or a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC capability
+transfer is in flight on it, the split fails with `InvalidState` and both children are rolled
+back. Its children are re-linked under its derivation parent in batches (lock released between
 them); a concurrent deriver extending that list faster than it is moved returns
 `Interrupted`. Both children are inserted and linked under the original's
 derivation parent in the first derivation-lock hold, so a concurrent move

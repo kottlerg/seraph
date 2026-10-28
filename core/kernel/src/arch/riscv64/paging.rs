@@ -1185,7 +1185,7 @@ unsafe fn unmap_span(
 
 /// RISC-V counterpart to [`crate::mm::paging::unmap_identity_page`].
 ///
-/// Walks the kernel root from `phys_to_virt(kernel_pml4_pa())` down to the
+/// Walks the kernel root from `phys_to_virt(kernel_root_table_pa())` down to the
 /// leaf covering `pa` and clears the leaf entry. Bails silently if any
 /// intermediate level is absent or is a large leaf (clearing inside one
 /// would corrupt unrelated memory). Issues a local `sfence.vma pa, x0`,
@@ -1216,9 +1216,9 @@ unsafe fn unmap_span(
 #[allow(clippy::similar_names)]
 pub unsafe fn unmap_identity_page(pa: u64)
 {
-    use crate::mm::paging::{kernel_pml4_pa, phys_to_virt};
+    use crate::mm::paging::{kernel_root_table_pa, phys_to_virt};
 
-    let root_pa = kernel_pml4_pa();
+    let root_pa = kernel_root_table_pa();
     if root_pa == 0
     {
         return;

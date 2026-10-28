@@ -769,8 +769,9 @@ pub unsafe fn ap_trampoline::setup_trampoline(trampoline_pa: u64);
 /// Start one AP (x86-64 INIT+SIPI; RISC-V SBI HSM `hart_start`). Every AP reads
 /// its parameters from the one block in the trampoline page, so APs start
 /// sequentially: the previous AP must be online (`APS_READY` observed) first.
-/// x86-64 always returns `true` (SIPI delivery is unacknowledged); RISC-V
-/// returns `false` when SBI rejects the request.
+/// x86-64 returns `true` whenever it returns (SIPI delivery is unacknowledged)
+/// and halts through `fatal` when the kernel root page table lies above 4 GiB;
+/// RISC-V returns `false` when SBI rejects the request.
 pub unsafe fn ap_trampoline::start_ap(
     trampoline_pa: u64,
     cpu_idx: u32,

@@ -40,15 +40,9 @@
 //! - To pass more per-AP arguments: extend the params area (0x68–0x8F) and
 //!   update the LM64 relay stub encoding and `setup_ap_params`.
 //! - If the trampoline binary changes, recompute byte offsets carefully and
-//!   update `TRAMP_PATCH_*` constants. The host-side tests check the template's
-//!   fixed bytes at hard-coded offsets; they do not reference the `TRAMP_PATCH_*`
-//!   constants, so a moved patch site is not caught by them.
-
-// cast_possible_truncation: the one site not covered by an item-level allow is
-// `kernel_pml4_pa() as u32` in `start_ap`, which feeds the trampoline's 32-bit
-// `mov cr3, eax`; the kernel root table sits in kernel BSS at the bootloader-chosen
-// physical base, and nothing in this module checks that it lies below 4 GiB.
-#![allow(clippy::cast_possible_truncation)]
+//!   update `TRAMP_PATCH_*` constants. The host-side test checks that the
+//!   operands the template's code fetches through agree with the `TRAMP_PATCH_*`
+//!   and `PARAM_*` offsets and with the GDT layout.
 
 // ── Trampoline byte offsets ───────────────────────────────────────────────────
 
@@ -330,6 +324,9 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
     t
 };
 
+// `setup_trampoline` copies the whole template into the one trampoline page.
+const _: () = assert!(TRAMPOLINE_TEMPLATE.len() <= 4096);
+
 // ── Helper: write a u32 at a byte offset within the direct-mapped trampoline ──
 
 /// Write a little-endian `u32` at byte `offset` from `tramp_virt`, a direct-map
@@ -502,8 +499,11 @@ pub unsafe fn setup_ap_params(
 
 /// Start one AP: carve its IST stacks from the per-CPU slab, write params, send INIT+SIPI.
 ///
-/// Returns `true` unconditionally — SIPI delivery success is detected via
-/// `APS_READY` after this call.
+/// Returns `true` whenever it returns — SIPI delivery success is detected via
+/// `APS_READY` after this call. Halts the boot through `fatal`, before any
+/// SIPI, when the kernel root page table lies above 4 GiB
+/// (`kernel_root_table_pa()` does not fit the PM32 stub's 32-bit
+/// `mov cr3, eax`; #443).
 ///
 /// # Parameters
 /// - `trampoline_pa`: physical address of the trampoline page (from `BootInfo`).
@@ -541,7 +541,14 @@ pub unsafe fn start_ap(
     let ist1_top = ist_base + 8192;
     let ist2_top = ist_base + 16384;
 
-    let pml4_pa = crate::mm::paging::kernel_pml4_pa() as u32;
+    // The PM32 stub loads CR3 with a 32-bit `mov cr3, eax`, so the kernel root
+    // table must lie below 4 GiB; the bootloader does not yet guarantee that
+    // (#443). Halt with a reason rather than start the AP on a truncated root.
+    let Ok(pml4_pa) = u32::try_from(crate::mm::paging::kernel_root_table_pa())
+    else
+    {
+        crate::fatal("smp: kernel root page table above 4 GiB; the AP CR3 load is 32-bit");
+    };
 
     // SAFETY: setup_trampoline called; direct map active.
     unsafe {
@@ -579,119 +586,87 @@ mod tests
 {
     use super::*;
 
-    #[test]
-    fn trampoline_template_size()
+    /// Read the little-endian `u16` at template offset `off`.
+    fn u16_at(off: usize) -> u16
     {
-        // Template must fit within one 4 KiB page.
-        assert!(TRAMPOLINE_TEMPLATE.len() <= 4096);
+        u16::from_le_bytes([TRAMPOLINE_TEMPLATE[off], TRAMPOLINE_TEMPLATE[off + 1]])
     }
 
-    #[test]
-    fn rm_code_starts_with_cli()
+    /// Read the little-endian `u32` at template offset `off`.
+    fn u32_at(off: usize) -> u32
     {
+        u32::from_le_bytes(TRAMPOLINE_TEMPLATE[off..off + 4].try_into().unwrap())
+    }
+
+    /// Selector of the GDT entry whose descriptor equals `desc`.
+    fn selector_of(desc: u64) -> u16
+    {
+        let off = (GDT..TRAMP_PARAMS)
+            .step_by(8)
+            .find(|&o| {
+                u64::from_le_bytes(TRAMPOLINE_TEMPLATE[o..o + 8].try_into().unwrap()) == desc
+            })
+            .expect("descriptor present in the trampoline GDT");
+        u16::try_from(off - GDT).unwrap()
+    }
+
+    /// Template offset of the trampoline GDT (the GDTR base `setup_trampoline`
+    /// patches is `AP_PAGE` plus this).
+    const GDT: usize = 0x48;
+
+    // The BSP patches the template at the `TRAMP_PATCH_*` and `PARAM_*` offsets,
+    // and the AP's code fetches its operands from fixed displacements and
+    // selectors; the two sides must agree, or the AP faults during bringup.
+    #[test]
+    fn template_fetch_operands_agree_with_patch_offsets_and_gdt()
+    {
+        // Real mode: `lgdt [0x0040]` and `jmp far [0x0020]` read the patch sites.
+        assert_eq!(usize::from(u16_at(9)), TRAMP_PATCH_GDTR);
+        assert_eq!(usize::from(u16_at(22)), TRAMP_PATCH_RM_FAR_JMP);
+        // GDTR limit covers exactly the GDT, which ends where the params begin.
         assert_eq!(
-            TRAMPOLINE_TEMPLATE[0], 0xFA,
-            "expected cli (0xFA) at offset 0"
+            usize::from(u16_at(TRAMP_PATCH_GDTR)),
+            TRAMP_PARAMS - GDT - 1
         );
-    }
 
-    #[test]
-    fn gdtr_limit_is_0x1f()
-    {
-        let limit = u16::from_le_bytes([TRAMPOLINE_TEMPLATE[0x40], TRAMPOLINE_TEMPLATE[0x41]]);
-        assert_eq!(limit, 0x001F, "GDTR limit must be 31 (4 entries × 8 − 1)");
-    }
+        // PM32: the data selector names GDT_DATA; `mov esp, imm32` puts its
+        // immediate at the stack patch site; CR3 comes from the PML4 param; the
+        // far jmp reads the LM64 target patch site.
+        assert_eq!(u16_at(0x92), selector_of(GDT_DATA));
+        assert_eq!(TRAMPOLINE_TEMPLATE[TRAMP_PATCH_PM32_STACK - 1], 0xBC);
+        assert_eq!(
+            usize::from(TRAMPOLINE_TEMPLATE[0xC3]),
+            TRAMP_PARAMS + PARAM_PML4
+        );
+        assert_eq!(
+            usize::try_from(u32_at(0xEB)).unwrap(),
+            TRAMP_PATCH_LM64_FAR_JMP
+        );
 
-    #[test]
-    fn gdt_null_is_zero()
-    {
-        let null = u64::from_le_bytes(TRAMPOLINE_TEMPLATE[0x48..0x50].try_into().unwrap());
-        assert_eq!(null, GDT_NULL);
-    }
-
-    #[test]
-    fn gdt_code32_descriptor()
-    {
-        let c32 = u64::from_le_bytes(TRAMPOLINE_TEMPLATE[0x50..0x58].try_into().unwrap());
-        assert_eq!(c32, GDT_CODE32);
-    }
-
-    #[test]
-    fn gdt_code64_descriptor()
-    {
-        let c64 = u64::from_le_bytes(TRAMPOLINE_TEMPLATE[0x58..0x60].try_into().unwrap());
-        assert_eq!(c64, GDT_CODE64);
-        // L bit (bit 53 of raw descriptor = bit 21 of high dword) must be set.
+        // LM64 far-jmp selector names the 64-bit code descriptor, which has L=1.
+        assert_eq!(
+            u16_at(TRAMP_PATCH_LM64_FAR_JMP + 4),
+            selector_of(GDT_CODE64)
+        );
         assert!(
-            c64 & (1 << 53) != 0,
-            "64-bit code segment must have L bit set"
+            GDT_CODE64 & (1 << 53) != 0,
+            "64-bit code segment must have L set"
         );
-    }
 
-    #[test]
-    fn gdt_data_descriptor()
-    {
-        let data = u64::from_le_bytes(TRAMPOLINE_TEMPLATE[0x60..0x68].try_into().unwrap());
-        assert_eq!(data, GDT_DATA);
-    }
-
-    #[test]
-    fn lm64_stub_starts_at_0x100()
-    {
-        // First byte of LM64 relay stub: REX.W prefix (0x48) of lea rbx, [rip-...]
-        assert_eq!(TRAMPOLINE_TEMPLATE[0x100], 0x48);
-        assert_eq!(TRAMPOLINE_TEMPLATE[0x101], 0x8D);
-        assert_eq!(TRAMPOLINE_TEMPLATE[0x102], 0x1D);
-    }
-
-    #[test]
-    fn lm64_rip_disp_is_minus_0x9f()
-    {
-        // Bytes [0x103..0x107]: disp32 = -0x9F = 0xFFFFFF61 (little-endian: 61 FF FF FF)
-        let disp = u32::from_le_bytes(TRAMPOLINE_TEMPLATE[0x103..0x107].try_into().unwrap());
-        assert_eq!(disp, 0xFFFFFF61u32);
-    }
-
-    #[test]
-    fn lm64_ends_with_jmp_rax()
-    {
-        // Last two bytes of the LM64 stub (at 0x11A–0x11B): FF E0 (jmp rax).
-        // Stub layout: 7+4+3+4+4+4+2 = 28 bytes starting at 0x100 → ends at 0x11B.
-        assert_eq!(TRAMPOLINE_TEMPLATE[0x11A], 0xFF);
-        assert_eq!(TRAMPOLINE_TEMPLATE[0x11B], 0xE0);
-    }
-
-    #[test]
-    fn lm64_selector_in_far_jmp_target()
-    {
-        // Bytes 0xFC–0xFD: u16 = 0x0010 (64-bit code segment selector)
-        let sel = u16::from_le_bytes([TRAMPOLINE_TEMPLATE[0xFC], TRAMPOLINE_TEMPLATE[0xFD]]);
-        assert_eq!(sel, 0x0010);
-    }
-
-    #[test]
-    fn pm32_mov_esp_opcode()
-    {
-        // `mov esp, imm32` is `BC imm32`. Opcode must be 0xBC at 0x9E.
+        // LM64 relay: `lea rbx, [rip+disp]` lands on the params block (RIP after
+        // the lea is 0x107), and each load reads its PARAM_* slot.
+        let disp = i32::from_le_bytes(TRAMPOLINE_TEMPLATE[0x103..0x107].try_into().unwrap());
         assert_eq!(
-            TRAMPOLINE_TEMPLATE[0x9E], 0xBC,
-            "expected mov esp opcode (BC) at 0x9E"
+            0x107 + i64::from(disp),
+            i64::try_from(TRAMP_PARAMS).unwrap()
         );
-    }
+        assert_eq!(usize::from(TRAMPOLINE_TEMPLATE[0x10A]), PARAM_STACK);
+        assert_eq!(usize::from(TRAMPOLINE_TEMPLATE[0x10D]), PARAM_CPU_ID);
+        assert_eq!(usize::from(TRAMPOLINE_TEMPLATE[0x111]), PARAM_IST1);
+        assert_eq!(usize::from(TRAMPOLINE_TEMPLATE[0x115]), PARAM_IST2);
+        assert_eq!(usize::from(TRAMPOLINE_TEMPLATE[0x119]), PARAM_ENTRY_FN);
 
-    #[test]
-    fn pm32_jmp_far_encoding()
-    {
-        // PM32 (95 bytes starting at 0x90) ends with `FF AB F8 00 00 00`
-        // (jmp far [ebx+0xF8]). Last 6 bytes at page offset 0x90+89 = 0xE9.
-        let end = &TRAMPOLINE_TEMPLATE[0xE9..0xEF];
-        assert_eq!(end, &[0xFF, 0xAB, 0xF8, 0x00, 0x00, 0x00]);
-    }
-
-    #[test]
-    fn tramp_param_offsets_fit_in_region()
-    {
-        // All params must lie within the 40-byte region [0x68..0x90).
+        // The params block ends before the PM32 entry the RM far jmp targets.
         assert!(TRAMP_PARAMS + PARAM_IST2 + 8 <= 0x90);
     }
 }

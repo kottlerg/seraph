@@ -5389,7 +5389,9 @@ pub unsafe fn schedule(requeue: Requeue)
         // runs again.
         if nxt_as.is_null() && !cur_as.is_null()
         {
-            crate::arch::current::paging::write_satp_no_fence(crate::mm::paging::kernel_pml4_pa());
+            crate::arch::current::paging::write_satp_no_fence(
+                crate::mm::paging::kernel_root_table_pa(),
+            );
         }
 
         // Case (a): full address space switch.

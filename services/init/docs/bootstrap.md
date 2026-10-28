@@ -241,9 +241,9 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   [procmgr IPC interface](../../procmgr/docs/ipc-interface.md)). Each
   init-thread death runs
   [`init_reap::run_reap`](../../procmgr/src/init_reap.rs), which counts
-  deaths down and tears init down on the second, once
-  `INIT_TEARDOWN_DONE` has armed the reap (normally init-logd's death,
-  after real-logd's `HANDOVER_RELEASE`): both Thread caps are deleted, init's `AddressSpace` is
+  deaths down and tears init down on the second (normally init-logd's
+  death, after real-logd's `HANDOVER_RELEASE`), armed by
+  `INIT_TEARDOWN_DONE` or not: both Thread caps are deleted, init's `AddressSpace` is
   revoked + deleted (its pool donations `retype_free`'d, user-page
   mappings vanish), the accumulated Memory caps are `DONATE_MEMORY_CAPS`'d to
   memmgr's pool, and procmgr's cap on init's `CSpace` is revoked +

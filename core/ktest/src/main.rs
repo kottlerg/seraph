@@ -638,8 +638,9 @@ pub fn log_version(prefix: &str, ver: u64)
 }
 
 /// `SYS_SYSTEM_INFO(ElapsedUs)`, microseconds since kernel timer init; 0 if
-/// the query fails. A failing query prints a zero timestamp, and leaves
-/// `wait_us` polling until the clock answers again.
+/// the query fails. A failed query prints a zero timestamp; in `wait_us` a
+/// failed sample cuts a running wait short (the elapsed difference wraps),
+/// and a clock that reads 0 throughout makes the wait never return.
 fn elapsed_us() -> u64
 {
     syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0)

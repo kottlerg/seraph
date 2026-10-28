@@ -152,6 +152,11 @@ pub struct AddressSpace
 }
 ```
 
+The terminal-fault observer state (`death_observers`, `death_observer_count`, `terminal_faulted`,
+`terminal_fault_reason`) changes and is read only under `death_lock`: the bind
+(`sys_aspace_bind_notification`) appends under it, and the terminal-fault post snapshots the
+observers and records the first fault under it before posting outside it.
+
 ### Lifecycle
 
 1. **Creation** (`SYS_CAP_CREATE_ASPACE`): carve a slab from the source

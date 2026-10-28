@@ -438,9 +438,10 @@ mod tests
     #[test]
     fn badge_is_rejected_when_a_verb_bit_is_set()
     {
-        // Bits 62 and 63 are svcmgr's HANDOVER_AUTHORITY / PUBLISH_AUTHORITY
-        // on the child's registry SEND; a low word that clears every other
-        // check must not save a badge carrying either.
+        // Bits 60..=63 are the verb bits (svcmgr's HANDOVER_AUTHORITY /
+        // PUBLISH_AUTHORITY on the child's registry SEND among them); a low
+        // word that clears every other check must not save a badge carrying
+        // any of them.
         let verbs = ipc::VERB_BIT_MASK;
         assert!(!badge_is_acceptable(
             0x8000_0000_0000_0010,
@@ -454,8 +455,17 @@ mod tests
             u32::MAX,
             verbs
         ));
+        for bit in [61, 60]
+        {
+            assert!(!badge_is_acceptable(
+                (1u64 << bit) | 0x10,
+                16,
+                u32::MAX,
+                verbs
+            ));
+        }
         assert!(badge_is_acceptable(
-            0x3FFF_FFFF_0000_0010,
+            0x0FFF_FFFF_0000_0010,
             16,
             u32::MAX,
             verbs

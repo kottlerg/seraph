@@ -70,8 +70,10 @@ Malformed tables are skipped, not fatal:
 - A bad XSDT length or a short read yields empty extractor output (for the CPU
   topology, the single-CPU fallback: `cpu_count = 1`, `cpu_ids[0] = bsp_id`).
 - An MADT entry with an impossible length byte stops the walk early.
-- Unknown MADT entry types are silently skipped; an MCFG allocation entry with a
-  zero base address is skipped.
+- Unknown MADT entry types are silently skipped.
+- An MCFG allocation entry with a zero base, an end bus below its start bus, or an ECAM
+  window whose start or end overflows a 64-bit physical address is skipped, along with its
+  derived PCI BAR windows.
 
 No diagnostic is logged for a malformed or absent table; the walker's
 only diagnostics report surplus MADT entries (more than `MAX_CPUS`

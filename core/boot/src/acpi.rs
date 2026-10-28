@@ -791,11 +791,9 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
                 let base = read_u64(table, off);
                 let start_bus = read_u8(table, off + 10);
                 let end_bus = read_u8(table, off + 11);
-                if base != 0
+                if let Some((ecam_base, ecam_size)) = mcfg_ecam_window(base, start_bus, end_bus)
                 {
-                    let num_buses = u64::from(end_bus).saturating_sub(u64::from(start_bus)) + 1;
-                    let ecam_size = num_buses * 256 * 4096;
-                    push!(base, ecam_size);
+                    push!(ecam_base, ecam_size);
                     // PCI BAR windows. Real hardware advertises these
                     // through the host bridge's `_CRS`, which the
                     // bootloader does not evaluate (no AML interpreter).
@@ -872,10 +870,69 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
     n
 }
 
+/// ECAM window `(phys_base, size)` of one MCFG allocation entry: the MCFG
+/// base is where bus 0 would decode, so the window starts `start_bus` MiB
+/// above it and spans 1 MiB per bus through `end_bus`. Returns `None` for a
+/// zero base, an end bus below the start bus, or a window whose start or end
+/// overflows a 64-bit physical address, so a malformed entry is skipped.
+fn mcfg_ecam_window(base: u64, start_bus: u8, end_bus: u8) -> Option<(u64, u64)>
+{
+    if base == 0 || end_bus < start_bus
+    {
+        return None;
+    }
+    let size = (u64::from(end_bus) - u64::from(start_bus) + 1) << 20;
+    let window = base.checked_add(u64::from(start_bus) << 20)?;
+    window.checked_add(size)?;
+    Some((window, size))
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn mcfg_window_from_bus_zero_starts_at_the_base()
+    {
+        assert_eq!(
+            mcfg_ecam_window(0xB000_0000, 0, 255),
+            Some((0xB000_0000, 256 << 20))
+        );
+    }
+
+    #[test]
+    fn mcfg_window_above_bus_zero_starts_at_its_start_bus()
+    {
+        assert_eq!(
+            mcfg_ecam_window(0xB000_0000, 4, 7),
+            Some((0xB000_0000 + (4 << 20), 4 << 20))
+        );
+    }
+
+    #[test]
+    fn mcfg_window_with_zero_base_is_skipped()
+    {
+        assert_eq!(mcfg_ecam_window(0, 0, 255), None);
+    }
+
+    #[test]
+    fn mcfg_window_with_end_bus_below_start_bus_is_skipped()
+    {
+        assert_eq!(mcfg_ecam_window(0xB000_0000, 8, 7), None);
+    }
+
+    #[test]
+    fn mcfg_window_whose_start_overflows_is_skipped()
+    {
+        assert_eq!(mcfg_ecam_window(u64::MAX - (1 << 20) + 1, 1, 1), None);
+    }
+
+    #[test]
+    fn mcfg_window_whose_end_overflows_is_skipped()
+    {
+        assert_eq!(mcfg_ecam_window(u64::MAX - (1 << 20) + 2, 0, 0), None);
+    }
 
     /// Build a synthetic RHCT: SDT header + flags/timebase/node-count/offset
     /// header, followed by the given nodes as `(type, payload)` pairs.

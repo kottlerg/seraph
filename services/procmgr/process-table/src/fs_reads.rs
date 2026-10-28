@@ -114,6 +114,14 @@ mod tests
     }
 
     #[test]
+    fn fill_exact_with_a_zero_chunk_issues_no_request()
+    {
+        let mut dst = [0u8; 4];
+        let got = fill_exact(&mut dst, 0, 0, |_, _| panic!("no request expected"));
+        assert_eq!(got, Some(0));
+    }
+
+    #[test]
     fn fill_exact_reports_a_failed_request()
     {
         let mut dst = [0u8; 10];

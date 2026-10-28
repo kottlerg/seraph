@@ -331,8 +331,11 @@ request's layout names it. procmgr deletes the caps a layout does not name
 (caps past the last named position, and every cap of a label that names none:
 `START_PROCESS`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `INIT_TEARDOWN_DONE`, and
 unknown opcodes), and every cap of a refused request, except the init-reap
-refusals that keep caps init may still be running on (§ `REGISTER_INIT_TEARDOWN`).
-A padded or refused request therefore cannot grow procmgr's CSpace.
+refusals of an un-badged sender that keep caps init may still be running on
+(§ `REGISTER_INIT_TEARDOWN`). A padded or refused request from any badged sender
+therefore cannot grow procmgr's CSpace. Replies to the calls procmgr makes on a
+caller-supplied file cap are treated the same way: procmgr deletes every reply
+cap it does not use.
 
 On a create reply, procmgr transfers a badged process handle endpoint (for
 subsequent per-process operations) and a derived copy of the child's `Thread`
@@ -389,11 +392,17 @@ Wire format:
 (`req.badge == 0`). Init holds one; the only other badge-0 holder is svcmgr,
 whose `procmgr_death_auth_source` is a mint source for real-logd's
 `DEATH_EQ_AUTHORITY` cap (see the
-[svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)). Every procmgr-spawned
-process holds a SEND badged with its process badge, so none of them can stage a
-handoff or hand procmgr caps to forward to memmgr's `DONATE_MEMORY_CAPS`. The
-handoff is one-shot: once the reap has run, every further round and
-`INIT_TEARDOWN_DONE` is refused.
+[svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)), a trusted minter.
+Every other process holds only SENDs on procmgr badged with a process badge (or
+a badge svcmgr mints from its source), so none of them can stage a handoff or
+hand procmgr caps to forward to memmgr's `DONATE_MEMORY_CAPS`. The handoff is
+one-shot: once the reap has run, every further round and `INIT_TEARDOWN_DONE`
+is refused. The gate is badge 0 rather than a verb bit
+([docs/capability-model.md](../../../docs/capability-model.md) § Verb-bit
+authority pattern) because the handoff's sender is init itself, which holds
+procmgr's un-badged endpoint from before any badge is minted; a verb bit would
+only add a badged cap for init to derive and for svcmgr's mint source to be
+able to forge.
 
 On the first round procmgr stores the kernel-object caps and binds a death-EQ
 observer on both init threads under the same correlator:

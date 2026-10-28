@@ -77,6 +77,8 @@ pub enum InitReap<T>
     /// The first round was accepted; donation rounds append to `held`.
     Collecting
     {
+        /// The caller's collected caps: the first round's kernel-object
+        /// caps and every donation round's Memory caps.
         held: T,
         /// `INIT_TEARDOWN_DONE` was received.
         armed: bool,
@@ -89,6 +91,7 @@ pub enum InitReap<T>
 
 impl<T> InitReap<T>
 {
+    /// An empty handoff: no first round accepted yet.
     #[must_use]
     pub const fn new() -> Self
     {
@@ -255,13 +258,18 @@ mod tests
     }
 
     #[test]
-    fn donation_before_the_first_round_is_refused_and_after_it_appends()
+    fn donation_before_the_first_round_is_refused()
     {
         let mut empty = InitReap::<u32>::new();
         assert_eq!(
             empty.donation(0).err(),
             Some(Refusal::Invalid(CapDisposition::Keep))
         );
+    }
+
+    #[test]
+    fn donation_into_an_open_handoff_reaches_the_reap()
+    {
         let mut m = opened();
         *m.donation(0).expect("open handoff accepts donations") += 1;
         assert_eq!(m.death(), DeathOutcome::Pending(1));

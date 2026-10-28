@@ -1697,22 +1697,23 @@ fn vfs_read_memory(
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
-    if reply.label != 0
+    // The file cap is client-supplied, so its server is untrusted: every
+    // reply cap this call does not hand back is deleted, whatever the reply.
+    let caps = reply.caps();
+    let bytes_valid = reply.word(0) as usize;
+    let Some((&memory_cap, extra)) = caps.split_first()
+    else
     {
         return None;
-    }
-    let bytes_valid = reply.word(0) as usize;
-    if bytes_valid == 0
+    };
+    crate::release_caps(extra);
+    if reply.label != 0 || bytes_valid == 0
     {
+        crate::release_caps(&[memory_cap]);
         return None;
     }
     let memory_data_offset = reply.word(2) as usize;
-    let caps = reply.caps();
-    if caps.is_empty()
-    {
-        return None;
-    }
-    Some((caps[0], bytes_valid, memory_data_offset, cookie))
+    Some((memory_cap, bytes_valid, memory_data_offset, cookie))
 }
 
 /// Read from an open file via its per-file capability.
@@ -1736,6 +1737,8 @@ fn vfs_read(
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
+    // FS_READ replies carry no caps; the untrusted server's are deleted.
+    crate::release_caps(reply.caps());
     if reply.label != 0
     {
         return None;
@@ -1757,7 +1760,11 @@ pub(crate) fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
 {
     let msg = IpcMessage::new(ipc::fs_labels::FS_CLOSE);
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) };
+    if let Ok(reply) = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
+    {
+        // FS_CLOSE replies carry no caps; the untrusted server's are deleted.
+        crate::release_caps(reply.caps());
+    }
     let _ = syscall::cap_delete(file_cap);
 }
 
@@ -1920,19 +1927,19 @@ impl ChildKernelObjects
 
 impl Drop for ChildKernelObjects
 {
+    /// Release the three objects as `teardown_entry` does: revoke each before
+    /// deleting it. Once `populate_child_info` has run, the child's `CSpace`
+    /// holds copies of all three (its own `CSpace` among them), and those
+    /// descendants would keep every object alive after a bare `cap_delete`.
     fn drop(&mut self)
     {
-        if self.thread != 0
+        for cap in [self.thread, self.cspace, self.aspace]
         {
-            let _ = syscall::cap_delete(self.thread);
-        }
-        if self.cspace != 0
-        {
-            let _ = syscall::cap_delete(self.cspace);
-        }
-        if self.aspace != 0
-        {
-            let _ = syscall::cap_delete(self.aspace);
+            if cap != 0
+            {
+                let _ = syscall::cap_revoke_all(cap);
+                let _ = syscall::cap_delete(cap);
+            }
         }
     }
 }
@@ -2133,7 +2140,12 @@ fn vfs_release_memory(file_cap: u32, ipc_buf: *mut u64, cookie: u64)
         .word(0, cookie)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) };
+    if let Ok(reply) = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
+    {
+        // FS_RELEASE_MEMORY replies carry no caps; the untrusted server's
+        // are deleted.
+        crate::release_caps(reply.caps());
+    }
 }
 
 /// Create a process from a caller-supplied file cap.

@@ -3,161 +3,255 @@
 
 // runtime/ruststd/src/sys/sync/condvar/seraph.rs
 
-//! Condvar built on a monotonically-incrementing generation counter and a
-//! lazily-allocated Notification cap. Mirrors the upstream
-//! `sync/condvar/futex.rs` design: waiters snapshot the counter before
-//! unlocking the mutex, then block; notifiers bump the counter (invalidating
-//! in-flight snapshots) and send on the notification. Because
-//! `notification_wait` has no address-compare, a waiter that wakes spuriously
-//! just re-acquires the mutex and returns — the std layer's loop-condition
-//! recheck absorbs it.
+//! Condvar built on a FIFO queue of waiters, each parked on its own `Thread`
+//! handle.
 //!
-//! Every waiter parks on the one Notification, and a send wakes at most one
-//! of them, as core/kernel/docs/syscalls.md § `SYS_NOTIFICATION_SEND`
-//! defines. `notify_all` sends `WAKE_BURST` (16) times, so with more parked
-//! waiters than that the surplus stays parked until a later notify (or, for
-//! `wait_timeout`, its timeout); per-thread parking (#255) removes the bound.
+//! A waiter links a node on its own stack into the queue, under the
+//! Condvar's internal `queue_lock`, before it unlocks the caller's mutex,
+//! then parks until a notifier marks the node. `notify_one` unlinks the
+//! oldest node and `notify_all` every node; for each, the notifier clones the
+//! node's `Thread`, sets its `notified` flag, and `unpark`s the clone. A notify
+//! that runs once the waiter has unlocked the mutex therefore finds the node
+//! linked, so no wake is lost. `park`/`unpark` run on the per-thread `Parker`
+//! (`sys::sync::thread_parking`), whose notification cap belongs to the parked
+//! thread alone, so each wake reaches exactly the waiter it names and
+//! `notify_all` wakes every queued waiter, however many there are.
 //!
-//! `wait_timeout` passes the millisecond timeout through `arg1` of
-//! `SYS_NOTIFICATION_WAIT`. A non-zero bit return means notification wake; a
-//! `0` return means the wait timed out, which the kernel also reports at once
-//! when its sleep list is full, so `wait_timeout` yields, waits again for
-//! what is left of the duration, and reports a timeout only once it has
-//! elapsed.
+//! A node leaves the queue in one of two ways, both under `queue_lock`: a
+//! notifier unlinks it and then sets `notified`, or a timed-out
+//! `wait_timeout` finds `notified` unset and unlinks itself. Holding the lock,
+//! the waiter's check of `notified` is therefore decisive: set means a
+//! notifier owns the wake, unset means the node is still linked. Once
+//! `notified` is set the notifier no longer touches the node, so the waiter
+//! may return and free it; the notifier wakes through its own clone of the
+//! `Thread`.
+//!
+//! A wake whose token the waiter did not consume (one that lands after a
+//! timed-out waiter has stopped parking) leaves the thread's park token
+//! set, so its next park returns at once; every park loop here, like
+//! `thread::park`'s own contract, treats that as spurious and rechecks.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use crate::sync::atomic::AtomicU32;
-use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+use crate::cell::{Cell, UnsafeCell};
+use crate::ptr;
+use crate::sync::atomic::AtomicBool;
+use crate::sync::atomic::Ordering::{Acquire, Release};
 use crate::sys::sync::Mutex;
+use crate::thread::{self, Thread};
 use crate::time::{Duration, Instant};
 
-const WAKE_BURST: u32 = 16;
+/// One waiting thread's queue node, on that thread's stack for the duration
+/// of its `wait` or `wait_timeout`.
+struct Waiter {
+    /// The waiting thread's handle; notifiers `unpark` a clone of it.
+    thread: Thread,
+    /// Set, with `Release`, by the notifier that unlinked this node, under
+    /// `queue_lock`; the waiter returns once it reads it set.
+    notified: AtomicBool,
+    /// Queue links, read and written only under `queue_lock`.
+    prev: Cell<*const Waiter>,
+    next: Cell<*const Waiter>,
+}
+
+impl Waiter {
+    fn for_current_thread() -> Self {
+        Self {
+            thread: thread::current_or_unnamed(),
+            notified: AtomicBool::new(false),
+            prev: Cell::new(ptr::null()),
+            next: Cell::new(ptr::null()),
+        }
+    }
+}
+
+/// Doubly-linked FIFO of the nodes of threads waiting on one Condvar.
+struct Queue {
+    head: *const Waiter,
+    tail: *const Waiter,
+}
+
+impl Queue {
+    /// Link `node` at the tail.
+    ///
+    /// # Safety
+    /// `node` must be unlinked and must stay valid until it is unlinked again.
+    unsafe fn push_back(&mut self, node: &Waiter) {
+        node.prev.set(self.tail);
+        node.next.set(ptr::null());
+        if self.tail.is_null() {
+            self.head = node;
+        } else {
+            // SAFETY: a linked node is valid until it is unlinked (this
+            // function's and `remove`'s contract), and `tail` is linked.
+            unsafe { (*self.tail).next.set(node) };
+        }
+        self.tail = node;
+    }
+
+    /// Unlink the oldest node and return it, or `None` when the queue is
+    /// empty. The returned node stays valid until its `notified` is set.
+    fn pop_front(&mut self) -> Option<*const Waiter> {
+        let node = self.head;
+        if node.is_null() {
+            return None;
+        }
+        // SAFETY: `node` is linked, so its waiter has not returned (it returns
+        // only after a notifier sets `notified` or after unlinking itself).
+        unsafe { self.remove(&*node) };
+        Some(node)
+    }
+
+    /// Unlink `node`.
+    ///
+    /// # Safety
+    /// `node` must be linked in this queue.
+    unsafe fn remove(&mut self, node: &Waiter) {
+        let prev = node.prev.get();
+        let next = node.next.get();
+        if prev.is_null() {
+            self.head = next;
+        } else {
+            // SAFETY: `prev` is linked and therefore valid.
+            unsafe { (*prev).next.set(next) };
+        }
+        if next.is_null() {
+            self.tail = prev;
+        } else {
+            // SAFETY: `next` is linked and therefore valid.
+            unsafe { (*next).prev.set(prev) };
+        }
+        node.prev.set(ptr::null());
+        node.next.set(ptr::null());
+    }
+}
 
 pub struct Condvar {
-    gen_counter: AtomicU32,
-    notification: AtomicU32,
+    /// Serialises every access to `queue` and to the nodes' links.
+    queue_lock: Mutex,
+    queue: UnsafeCell<Queue>,
 }
+
+// SAFETY: the raw node pointers in `queue` are read and written only under
+// `queue_lock`, and each points at a node its waiting thread keeps alive until
+// the node is unlinked or marked `notified` (see the module doc), so sharing
+// or moving the Condvar between threads cannot reach a freed node or race on
+// the links.
+unsafe impl Send for Condvar {}
+// SAFETY: as for `Send`.
+unsafe impl Sync for Condvar {}
 
 impl Condvar {
     #[inline]
     pub const fn new() -> Self {
-        Self { gen_counter: AtomicU32::new(0), notification: AtomicU32::new(0) }
+        Self {
+            queue_lock: Mutex::new(),
+            queue: UnsafeCell::new(Queue { head: ptr::null(), tail: ptr::null() }),
+        }
+    }
+
+    /// Run `f` on the queue with `queue_lock` held.
+    fn with_queue<R>(&self, f: impl FnOnce(&mut Queue) -> R) -> R {
+        self.queue_lock.lock();
+        // SAFETY: `queue_lock` is held, so this is the only reference to the
+        // queue until the unlock below.
+        let result = f(unsafe { &mut *self.queue.get() });
+        // SAFETY: this thread locked `queue_lock` above.
+        unsafe { self.queue_lock.unlock() };
+        result
     }
 
     pub fn notify_one(&self) {
-        self.gen_counter.fetch_add(1, Relaxed);
-        let sig = self.notification.load(Relaxed);
-        if sig != 0 {
-            let _ = syscall::notification_send(sig, 1);
-        }
+        self.with_queue(|queue| {
+            if let Some(node) = queue.pop_front() {
+                // SAFETY: `pop_front` just unlinked `node` under `queue_lock`
+                // and returns only a node whose `notified` is unset.
+                unsafe { wake(node) };
+            }
+        });
     }
 
     pub fn notify_all(&self) {
-        self.gen_counter.fetch_add(1, Relaxed);
-        let sig = self.notification.load(Relaxed);
-        if sig == 0 {
-            return;
-        }
-        for _ in 0..WAKE_BURST {
-            if syscall::notification_send(sig, 1).is_err() {
-                break;
+        self.with_queue(|queue| {
+            while let Some(node) = queue.pop_front() {
+                // SAFETY: as in `notify_one`.
+                unsafe { wake(node) };
             }
-        }
+        });
     }
 
     /// # Safety
     /// `mutex` must be held by the calling thread; it is unlocked for the
     /// duration of the wait and reacquired before returning.
     pub unsafe fn wait(&self, mutex: &Mutex) {
-        let _before = self.gen_counter.load(Relaxed);
-        // Allocated before the unlock, so a notifier that takes the mutex
-        // after it sees the cap and sends.
-        let sig = ensure_notification(&self.notification);
+        let node = Waiter::for_current_thread();
+        // SAFETY: `node` is fresh and outlives its link: this function returns
+        // only once a notifier has unlinked it and set `notified`.
+        self.with_queue(|queue| unsafe { queue.push_back(&node) });
         // SAFETY: contract inherited from caller.
         unsafe { mutex.unlock() };
-        if sig != 0 {
-            let _ = syscall::notification_wait(sig);
-        } else {
-            core::hint::spin_loop();
+        while !node.notified.load(Acquire) {
+            // SAFETY: `node.thread` is the calling thread's own handle.
+            unsafe { node.thread.park() };
         }
         mutex.lock();
     }
 
     /// # Safety
-    /// `mutex` must be held by the calling thread.
+    /// `mutex` must be held by the calling thread; it is unlocked for the
+    /// duration of the wait and reacquired before returning.
     pub unsafe fn wait_timeout(&self, mutex: &Mutex, timeout: Duration) -> bool {
-        let before = self.gen_counter.load(Relaxed);
         let start = Instant::now();
-        // Allocated before the unlock, as in `wait`.
-        let sig = ensure_notification(&self.notification);
+        let node = Waiter::for_current_thread();
+        // SAFETY: `node` is fresh and outlives its link: it is unlinked below,
+        // under `queue_lock`, unless a notifier unlinked it first.
+        self.with_queue(|queue| unsafe { queue.push_back(&node) });
         // SAFETY: contract inherited from caller.
         unsafe { mutex.unlock() };
-        // A 0-bit return means the wait timed out, which the kernel reports
-        // at once when its sleep list is full and up to a tick early
-        // otherwise, so wait again for whatever of `timeout` is left: the
-        // result reports a timeout only once the duration has elapsed. A
-        // 0-bit return with more than a millisecond still left is the
-        // full-list refusal, so yield before waiting again, as
-        // `thread::sleep` does, to let the list drain rather than spin on
-        // the syscall.
-        let mut woke = false;
-        while sig != 0 && !woke && self.gen_counter.load(Relaxed) == before {
+        while !node.notified.load(Acquire) {
             let Some(left) = timeout.checked_sub(start.elapsed()).filter(|d| !d.is_zero()) else {
                 break;
             };
-            // Round up to whole milliseconds: `0` to the syscall means
-            // "block indefinitely".
-            let ms = u64::try_from(left.as_micros().div_ceil(1000)).unwrap_or(u64::MAX).max(1);
-            // Non-zero bits are a notification wake. An error (a stop's
-            // `Interrupted`) ends the wait early; it is reported as a
-            // spurious wake, not a timeout, since the duration may not have
-            // elapsed.
-            match syscall::notification_wait_timeout(sig, ms) {
-                Ok(0) => {
-                    if timeout.saturating_sub(start.elapsed()) > Duration::from_millis(1) {
-                        crate::sys::thread::yield_now();
-                    }
-                }
-                _ => woke = true,
+            // SAFETY: `node.thread` is the calling thread's own handle.
+            unsafe { node.thread.park_timeout(left) };
+            // The kernel ends a timed wait at once when its sleep list is
+            // full; with more than a millisecond left, yield rather than spin
+            // on the syscall, as `thread::sleep` does.
+            if !node.notified.load(Acquire)
+                && timeout.saturating_sub(start.elapsed()) > Duration::from_millis(1)
+            {
+                crate::sys::thread::yield_now();
             }
         }
-        // Without a notification cap, wait out the duration (or a notify).
-        while sig == 0 && self.gen_counter.load(Relaxed) == before && start.elapsed() < timeout {
-            core::hint::spin_loop();
-        }
+        // Under `queue_lock` the flag is decisive: set means a notifier
+        // unlinked the node, unset means it is still linked.
+        let notified = self.with_queue(|queue| {
+            let notified = node.notified.load(Acquire);
+            if !notified {
+                // SAFETY: unset `notified` under the lock means the node is
+                // still linked in this queue.
+                unsafe { queue.remove(&node) };
+            }
+            notified
+        });
         mutex.lock();
-        // Contract: return `true` if we did NOT time out. A notification wake
-        // or an early end counts as "did not time out", and so does a moved
-        // generation counter (a notify whose edge merged with a timeout).
-        woke || self.gen_counter.load(Relaxed) != before
+        // Contract: return `true` if we did NOT time out.
+        notified
     }
 }
 
-impl Drop for Condvar {
-    fn drop(&mut self) {
-        let sig = *self.notification.get_mut();
-        if sig != 0 {
-            let _ = syscall::cap_delete(sig);
-        }
-    }
-}
-
-fn ensure_notification(slot: &AtomicU32) -> u32 {
-    let existing = slot.load(Acquire);
-    if existing != 0 {
-        return existing;
-    }
-    let Some(fresh) = crate::sys::alloc::seraph::object_slab_retype(120, |slab| {
-        syscall::cap_create_notification(slab).ok()
-    }) else {
-        return 0;
-    };
-    match slot.compare_exchange(0, fresh, AcqRel, Acquire) {
-        Ok(_) => fresh,
-        Err(other) => {
-            let _ = syscall::cap_delete(fresh);
-            other
-        }
-    }
+/// Wake the waiter of `node`. The `Thread` is cloned before `notified` is set,
+/// since the waiter may return and free the node as soon as it reads the flag.
+///
+/// # Safety
+/// `node` must be a node the caller has just unlinked under `queue_lock` and
+/// whose `notified` is unset, so its waiter is still in `wait` or
+/// `wait_timeout` and the node is valid until `notified` is set here.
+unsafe fn wake(node: *const Waiter) {
+    // SAFETY: the caller guarantees `node` is valid until `notified` is set,
+    // and nothing below reads it after that store.
+    let node = unsafe { &*node };
+    let thread = node.thread.clone();
+    node.notified.store(true, Release);
+    thread.unpark();
 }

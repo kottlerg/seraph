@@ -51,11 +51,11 @@
 //! to the driver via `caps[0]` of the first
 //! [`fs_labels::FS_READ_MEMORY`] request for that `File`. The driver
 //! records it on the file's `OpenFile` slot; its eviction worker
-//! uses it to issue cooperative [`fs_labels::FS_RELEASE_MEMORY`] back
-//! to us before falling through to hard-revoke. Files that never
-//! trigger a frame-read (only inline `FS_READ` / `FS_WRITE`) never
-//! deliver the cap and get the hard-revoke fallback; the cap is
-//! deleted in `Drop`.
+//! uses it to issue a cooperative [`fs_labels::FS_RELEASE_MEMORY`] back
+//! to us, then revokes the page's caps whether or not the reply is an
+//! ack. Files that never trigger a frame-read (only inline `FS_READ` /
+//! `FS_WRITE`) never deliver the cap and get the revoke without the
+//! cooperative step; the cap is deleted in `Drop`.
 //!
 //! ## Path anchoring
 //! Absolute paths walk from `root_dir_cap()`; relative paths walk
@@ -1552,8 +1552,9 @@ impl File
         // First FS_READ_MEMORY for this File carries the per-process
         // release-endpoint SEND in caps[0]; the driver records it on
         // the OpenFile slot's first allocation so the eviction worker
-        // can route cooperative FS_RELEASE_MEMORY back to us instead
-        // of hard-revoking the page. `swap` ensures only one concurrent
+        // can route a cooperative FS_RELEASE_MEMORY back to us, letting
+        // us unmap the page, or finish a copy from it, before its revoke.
+        // `swap` ensures only one concurrent
         // reader attempts the transfer — the kernel `transfer_caps`
         // path moves the cap out of our CSpace, leaving the source slot
         // null, so a second concurrent attempt would fail at kernel
@@ -1862,10 +1863,12 @@ impl Drop for File
         }
         let _ = syscall::cap_delete(self.file_cap);
 
-        // Drain the registry entry. After unregister no release can reach
-        // this File's mappings: a later driver release for one of its
-        // cookies, on whichever badge, finds no entry and is acked without
-        // action.
+        // Drain the registry entry. A driver release that arrives after
+        // unregister, on whichever badge, finds no entry and is acked
+        // without action. One already dispatched may take a mapping first
+        // and discard it itself; `drain_mappings` and the handler each
+        // take a mapping out of `idle` under its lock, so they split the
+        // mappings without overlap.
         if let Some(state) = release_handler::state()
         {
             if let Some(entry) = release_handler::unregister(state, self.badge)

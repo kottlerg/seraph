@@ -448,6 +448,10 @@ const FAKE_FS_STOP_BADGE: u64 = 0x5709;
 /// read at offset 0 takes the frame path.
 const FAKE_FS_FILE_SIZE: u64 = 8192;
 
+/// The std release handler's longest wait for a read of a released page:
+/// the driver's cooperative-release window (fs-driver-protocol.md § Label 8).
+const RELEASE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// A driver release's reply label and round-trip time.
 type ReleaseReply = (u64, std::time::Duration);
 
@@ -457,12 +461,12 @@ type ReleaseReply = (u64, std::time::Duration);
 /// serves a fake fs root to a `release-child`, which opens `/a` and `/b` and
 /// reads a page of each. While `/b`'s `FS_READ_MEMORY` is still unanswered,
 /// so its cookie is mid-read, the fake sends a release of that cookie on the
-/// release SEND `/a`'s first read delivered, as the fat driver does with
-/// its one SEND per node, and then sends it again.
+/// release SEND `/a`'s first read delivered, and then sends it again. Two
+/// distinct nodes stand in for the driver's per-node SEND sharing, under
+/// which a release can arrive on another `File`'s badge.
 pub fn std_release_matched_by_cookie_phase(_: &Caps)
 {
     use std::os::seraph::process::CommandExt;
-    use std::time::Duration;
 
     let ep =
         std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
@@ -506,7 +510,7 @@ pub fn std_release_matched_by_cookie_phase(_: &Caps)
          refused, not acked"
     );
     assert!(
-        first_rtt >= Duration::from_millis(100),
+        first_rtt >= RELEASE_WINDOW,
         "the release of a mid-read cookie returned after {first_rtt:?}, before the release \
          window"
     );
@@ -516,7 +520,7 @@ pub fn std_release_matched_by_cookie_phase(_: &Caps)
         "a repeated release of a stalled cookie must be refused"
     );
     assert!(
-        repeat_rtt * 2 < first_rtt,
+        repeat_rtt < RELEASE_WINDOW,
         "a repeated release of a stalled cookie waited again ({repeat_rtt:?} after \
          {first_rtt:?})"
     );

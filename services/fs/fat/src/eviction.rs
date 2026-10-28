@@ -36,9 +36,10 @@ use ipc::{IpcMessage, fs_labels};
 use crate::cache::PageCache;
 use crate::file::{MAX_OPEN_FILES, MAX_OUTSTANDING, OpenFile, find_by_badge};
 
-/// Cooperative release watchdog: the client must reply with
-/// `FS_RELEASE_ACK` within this many milliseconds, else the worker
-/// hard-revokes.
+/// Cooperative release watchdog: how long the worker waits for the
+/// client's reply before revoking the ancestor cap anyway. The worker
+/// revokes after a reply too; an `FS_RELEASE_ACK` only tells it the
+/// client unmapped in time.
 pub const RELEASE_TIMEOUT_MS: u64 = 100;
 
 /// Hard upper bound on queued eviction requests. At
@@ -146,7 +147,7 @@ pub fn worker_loop(
         if !acked
         {
             std::os::seraph::log!(
-                "FS_RELEASE_MEMORY timeout, hard-revoking parent cap (badge={}, slot={})",
+                "FS_RELEASE_MEMORY not acked (no reply in time, or a refusal); revoking parent cap (badge={}, slot={})",
                 req.file_badge,
                 req.slot_idx
             );

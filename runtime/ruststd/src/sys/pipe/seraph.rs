@@ -503,12 +503,14 @@ impl Pipe {
         }
         loop {
             // Order matters: observe the EOF flags BEFORE draining the ring.
-            // Each flag is Release-stored after the writer's last ring write
-            // (`closed`: peer `Drop`; `peer_dead`: child death -> kernel
-            // death post -> bridge), so an empty drain performed after
-            // observing a set flag proves the ring is final-empty. The
-            // reverse order loses bytes the peer writes between the drain
-            // and the flag load.
+            // Each flag is Release-stored after the closing thread's last ring
+            // write (`closed`: the peer's `Pipe::close`, run by its `Drop` or
+            // stdio's `close_all`; `peer_dead`: child death -> kernel death
+            // post -> bridge), so an empty drain performed after observing a
+            // set flag holds every byte written before the flag. The reverse
+            // order loses bytes the peer writes between the drain and the
+            // flag load. Bytes another thread writes after a concurrent
+            // close may go unseen (module doc).
             let eof = self.header().is_closed() || self.peer_dead();
             let mut reader = self.reader();
             let n = reader.read(buf);

@@ -316,8 +316,11 @@ badge carries no namespace rights.
 ## Label 9: `FS_RELEASE_ACK`
 
 Synchronous client-to-driver reply to
-[`FS_RELEASE_MEMORY`](#label-8-fs_release_memory). Empty body. The
-driver's outstanding-memory-cap refcount decrements on receipt.
+[`FS_RELEASE_MEMORY`](#label-8-fs_release_memory). Empty body. It
+tells the driver the client unmapped the page in time; the driver
+revokes the parent cap and drops its page-cache refcount after any
+reply, or after the window with none, per
+[§ Label 8](#label-8-fs_release_memory).
 
 **Reply**
 

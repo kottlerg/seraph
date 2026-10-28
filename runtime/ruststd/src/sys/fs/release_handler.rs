@@ -22,8 +22,10 @@
 //! the reservation arena only once the unmap succeeds (see
 //! [`discard_mapping`]). A failed unmap or a copy still running at the end
 //! of the wait is answered with [`fs_errors::IO_ERROR`], no ack. The driver
-//! revokes the page's parent cap after every release, so holding the reply
-//! is what keeps the revoke from landing mid-copy or before the unmap.
+//! revokes the page's parent cap after every release, so within its
+//! cooperative-release window holding the reply is what keeps the revoke
+//! from landing mid-copy or before the unmap; a copy that outlasts the
+//! window is torn down by the revoke regardless.
 //!
 //! The endpoint and the handler thread are created lazily on the first
 //! [`super::File::open`] call; until then the cost is one

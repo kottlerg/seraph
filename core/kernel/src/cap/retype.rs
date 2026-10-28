@@ -897,6 +897,12 @@ const _: () = assert!(
         == EVENT_QUEUE_WRAPPER_BYTES as usize
 );
 
+/// Raw bytes of a Notification retype slot: the 24 B `NotificationObject`
+/// wrapper plus `NotificationState` (a bin overflow is caught by the const
+/// assertion in core/kernel/src/ipc/notification.rs).
+pub const NOTIFICATION_RAW_BYTES: u64 =
+    24 + core::mem::size_of::<crate::ipc::notification::NotificationState>() as u64;
+
 /// `EventQueueState` body bytes, kept in sync with the struct in
 /// `core/kernel/src/ipc/event_queue.rs` (anchored by the const assertion
 /// in that module). Update both sides together.
@@ -939,12 +945,9 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             raw_bytes: 24 + core::mem::size_of::<crate::ipc::endpoint::EndpointState>() as u64,
             split: false,
         }),
-        // Notification: 24 wrapper + NotificationState (40 B) = 64 B, budgeted as
-        // the literal 120 → BIN_128. Unlike the Endpoint arm, the budget is not
-        // computed from size_of, and no const assertion pins wrapper +
-        // NotificationState within BIN_128 (#460).
+        // Notification: 24 wrapper + NotificationState → BIN_128.
         ObjectType::Notification => Some(DispatchEntry {
-            raw_bytes: 120,
+            raw_bytes: NOTIFICATION_RAW_BYTES,
             split: false,
         }),
         // WaitSet: 24 wrapper + 440 (the asserted upper bound on WaitSetState)

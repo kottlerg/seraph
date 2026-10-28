@@ -14,6 +14,11 @@
 //! - [`wait_set`]: multiplexed blocking on any combination of the above.
 //! - [`message`]: the `Message` struct carried by endpoint call/reply and
 //!   fault delivery.
+//!
+//! This module also defines [`WaitQueue`], the FIFO of threads parked on a
+//! notification, event queue, or wait set, and the claims every such source's
+//! waiters share: [`claim_waiter`], [`arm_timed_park`], and
+//! [`interrupt_all_waiters`].
 
 use crate::sched::thread::ThreadControlBlock;
 
@@ -211,7 +216,8 @@ impl WaitQueue
 /// lock, for a wake that deposits `value`: pin it (`wake_in_flight`, cleared
 /// by the caller's `enqueue_and_wake`), store `value` in `wakeup_value`, and
 /// remove a timed waiter's sleep-list entry in the same critical section
-/// (docs/thread-lifecycle-and-sleep.md § Sleep List Invariants, invariant 7).
+/// (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List Invariants,
+/// invariant 7).
 /// The removal from the queue is the episode claim; a cancelling claimer
 /// stamps the park afterwards.
 ///
@@ -246,8 +252,8 @@ static FULL_LIST_REPORTED: core::sync::atomic::AtomicBool =
 
 /// Arm the sleep-list entry of `tcb`'s just-committed timed park with
 /// `deadline`, under the source lock that has held `tcb` queued since its push,
-/// so no claim can have run yet (docs/thread-lifecycle-and-sleep.md § Sleep
-/// List Invariants, invariant 8). Returns `false`, with the deadline cleared,
+/// so no claim can have run yet (core/kernel/docs/thread-lifecycle-and-sleep.md
+/// § Sleep List Invariants, invariant 8). Returns `false`, with the deadline cleared,
 /// when the sleep list is full: the caller then dequeues the waiter, withdraws
 /// the park ([`crate::sched::withdraw_uncontested_park`]) and reports an
 /// immediate timeout, so a timed wait never waits past its bound. `wait`
@@ -295,8 +301,8 @@ pub(crate) unsafe fn arm_timed_park(tcb: *mut ThreadControlBlock, deadline: u64,
 
 /// Empty `queue` for the destruction of its source: pop every waiter, claim it
 /// ([`claim_waiter`], value 0), stamp its park `INTERRUPTED`, and wake it, all
-/// under the source lock (docs/scheduling-internals.md § Lock Hierarchy rule
-/// 5, the multi-waiter drain).
+/// under the source lock (core/kernel/docs/scheduling-internals.md § Lock
+/// Hierarchy rule 5, the multi-waiter drain).
 ///
 /// # Safety
 /// The caller holds the source lock that owns `queue`, and no scheduler or

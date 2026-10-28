@@ -810,11 +810,13 @@ pub struct BootInfo
     pub mmio_apertures: MmioApertureSlice,
 
     // ── SMP fields (added in protocol version 4) ──────────────────────────────
-    /// Number of logical CPUs present and usable.
+    /// Number of logical CPUs present and usable: the BSP in `cpu_ids[0]`
+    /// plus the APs in `cpu_ids[1..cpu_count]`, at most [`MAX_CPUS`].
     ///
-    /// On x86-64: count of enabled LAPIC entries from the ACPI MADT.
-    /// On RISC-V: count of enabled RINTC (MADT type 0x18) entries, or hart
-    /// count from the DTB if ACPI is absent.
+    /// The bootloader derives it from the ACPI MADT (enabled or
+    /// online-capable Local APIC / Local x2APIC entries on x86-64, enabled
+    /// RINTC entries on RISC-V) or, on RISC-V without ACPI, the DTB `/cpus`
+    /// harts, as `core/boot/docs/boot-flow.md` § Step 9 specifies.
     /// Always at least 1 (the BSP).
     pub cpu_count: u32,
 

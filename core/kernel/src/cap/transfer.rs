@@ -156,8 +156,9 @@ unsafe fn stage_move(
         {
             return Err(SyscallError::InvalidCapability);
         }
-        // A multi-batch revoke or move already in flight on this slot
-        // (see `CapabilitySlot::pinned`). Transient — retry once it ends.
+        // A multi-batch revoke, move, or IPC capability transfer already in
+        // flight on this slot (see `CapabilitySlot::pinned`). Transient —
+        // retry once it ends.
         if slot.pinned()
         {
             return Err(SyscallError::InvalidState);
@@ -229,6 +230,13 @@ unsafe fn stage_move(
 /// per `DERIVATION_LOCK` hold, revalidating both slots before each. Never
 /// returns [`MoveStep::Pending`]; the source's object reference is
 /// released here.
+///
+/// Must be called from syscall context with interrupts disabled and no lock
+/// held (`DERIVATION_LOCK`, a `CSpace` lock, an IPC source lock, a per-TCB
+/// `sched_lock`, a per-CPU scheduler lock, or the sleep-list lock): it takes
+/// `DERIVATION_LOCK` per batch and the source `CSpace` lock for the final
+/// free, and drops the freed source's reference through
+/// [`release_moved_object`], whose contract excludes the rest.
 pub fn move_cap_drive(mv: CapMove) -> MoveStep
 {
     use super::derivation::{DERIVATION_LOCK, MAX_REPARENT_BATCHES};
@@ -250,8 +258,10 @@ pub fn move_cap_drive(mv: CapMove) -> MoveStep
             {
                 if let Some(obj) = release
                 {
-                    // SAFETY: the freed source slot's reference; the lock is
-                    // released and this is syscall context.
+                    // SAFETY: the freed source slot's reference;
+                    // `DERIVATION_LOCK` is released, and this function's
+                    // precondition (syscall context, interrupts disabled, no
+                    // lock held) covers `release_moved_object`'s contract.
                     unsafe { release_moved_object(obj) };
                 }
                 return MoveStep::Done {
@@ -327,24 +337,28 @@ unsafe fn drive_batch(mv: &CapMove, batches: &mut u32, backstop: u32) -> MoveSte
 }
 
 /// Drop the object reference a freed source slot held; frees the object if
-/// that was the last reference. Must run outside `DERIVATION_LOCK` —
-/// `dealloc_object` may acquire the frame allocator and other inner locks.
+/// that was the last reference.
 ///
 /// A `Thread`, `CSpace`, or `AddressSpace` whose last reference goes here
 /// is queued for this CPU's deferred reclaim (drained at the next syscall
 /// epilogue or idle loop) rather than torn down in place, and may be bound
-/// to the running thread (see capability-internals.md § Move). Every other
-/// type frees in place; a Notification or `EventQueue` may first wait for the
-/// timer's in-flight wakeup batch (`sched::sleep_wakeups_quiesce`), a bounded
-/// wait that needs only that no IPC, scheduler, or sleep-list lock is held,
-/// as at every call site.
+/// to the running thread (see core/kernel/docs/capability-internals.md
+/// § Move). Every other type frees in place through `dealloc_object`, which
+/// may take `DERIVATION_LOCK` and the frame allocator, and for a Notification
+/// or `EventQueue` first waits for the timer's in-flight wakeup batch
+/// (`sched::sleep_wakeups_quiesce`), a bounded wait that completes only when
+/// no IPC, scheduler, or sleep-list lock is held; hence the lock
+/// preconditions below, which every call site meets.
 ///
 /// # Safety
 ///
-/// `obj` must carry an outstanding reference the caller owns — the one the
-/// freed source slot held, as reported by [`MoveStep::Done`]. Syscall
-/// context with interrupts disabled: the deferred-reclaim push needs a
-/// stable CPU index.
+/// - `obj` must carry an outstanding reference the caller owns — the one the
+///   freed source slot held, as reported by [`MoveStep::Done`].
+/// - Syscall context with interrupts disabled: the deferred-reclaim push
+///   needs a stable CPU index.
+/// - Must NOT be called with `DERIVATION_LOCK` held, nor with any IPC source,
+///   per-TCB `sched_lock`, per-CPU scheduler, or sleep-list lock held (the
+///   preconditions `dealloc_object` states).
 #[cfg(not(test))]
 pub unsafe fn release_moved_object(obj: NonNull<KernelObjectHeader>)
 {

@@ -939,11 +939,12 @@ pub fn slab_release_fresh(phys: u64) {
 
 /// Retype one kernel object out of the slab machinery.
 ///
-/// `min_bytes` is the raw byte cost of the upcoming retype (e.g. 88 for
-/// `Endpoint`, 120 for `Notification`); it is rounded up to the kernel's
-/// size class. `retype` is called at most once with a Memory-cap slot whose
-/// `available_bytes` covers the class and must perform exactly one
-/// `cap_create_*` syscall against that slot, returning `Some` on success.
+/// `min_bytes` is the raw byte cost of the upcoming retype (e.g. 80 for
+/// `Endpoint`, 64 for `Notification`); it is rounded up to the kernel's
+/// size class, so any value in the same class retypes alike. `retype` is
+/// called at most once with a Memory-cap slot whose `available_bytes` covers
+/// the class and must perform exactly one `cap_create_*` syscall against that
+/// slot, returning `Some` on success.
 ///
 /// # Closure contract
 ///

@@ -159,10 +159,10 @@ unsafe fn write_cap_results(buf: u64, cap_count: usize, handles: &[u32; MSG_CAP_
 // ── Capability transfer ───────────────────────────────────────────────────────
 
 /// Validate a set of transfer source slots: distinct, non-null, and not
-/// pinned by an in-flight revoke or move. The single authoritative predicate
-/// for every cap-transfer direction — `sys_ipc_call`'s and `sys_ipc_reply`'s
-/// fail-fast rejects on the running thread's own `CSpace`, and
-/// `transfer_caps`' validation under the locks it moves under. A refusal
+/// pinned by an in-flight revoke, move, or IPC capability transfer. The single
+/// authoritative predicate for every cap-transfer direction — `sys_ipc_call`'s
+/// and `sys_ipc_reply`'s fail-fast rejects on the running thread's own
+/// `CSpace`, and `transfer_caps`' validation under the locks it moves under. A refusal
 /// detected only after a caller has blocked degrades to zero-cap delivery
 /// without notifying the sender, which is why the call path must run this
 /// before parking.
@@ -205,8 +205,9 @@ fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), Syscal
 ///
 /// All-or-nothing at the start: if either `CSpace` is gone, any slot is
 /// null/invalid, repeated within the same message, pinned by an in-flight
-/// revoke or move (`CapabilitySlot::pinned`), or the destination is full
-/// (`pre_allocate` fails), returns an error and no caps are transferred.
+/// revoke, move, or IPC capability transfer (`CapabilitySlot::pinned`), or the
+/// destination is full (`pre_allocate` fails), returns an error and no caps are
+/// transferred.
 /// Validation, destination pre-allocation, and the first batch of every
 /// move run under one `DERIVATION_LOCK` hold with both `CSpace`s resolved
 /// through the registry from each TCB's `cspace_id`/`cspace_epoch`; moves
@@ -223,6 +224,10 @@ fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), Syscal
 /// `src_tcb` and `dst_tcb` must be valid TCBs for the duration of the call:
 /// the running thread, a sender parked `BlockedOnReply`, or a receiver
 /// pinned by `wake_in_flight`. Neither thread's `CSpace` needs to be held.
+/// Syscall context with interrupts disabled and no lock held: the locks are
+/// taken here, and a completed move's freed source reference is dropped
+/// through `release_moved_object`, whose contract excludes every lock it
+/// names.
 #[cfg(not(test))]
 unsafe fn transfer_caps(
     src_tcb: *mut crate::sched::thread::ThreadControlBlock,
@@ -324,9 +329,13 @@ unsafe fn transfer_caps(
 
     for obj in releases.iter().flatten()
     {
-        // SAFETY: each is a freed source slot's reference; syscall context.
+        // SAFETY: each is a freed source slot's reference; syscall context
+        // with no lock held (`DERIVATION_LOCK` and both `CSpace` locks were
+        // released above; the caller holds none, per this function's
+        // contract).
         unsafe { release_moved_object(*obj) };
     }
+    // Still no lock held, as `move_cap_drive` requires.
     for (i, mv) in pending.iter().enumerate()
     {
         if let Some(mv) = mv
@@ -357,13 +366,14 @@ unsafe fn transfer_caps(
 /// `cancel_ipc_block` / `dealloc_object(Thread)` can clear to null or free. The
 /// server pre-allocated worst-case headroom before blocking, so the move cannot
 /// OOM; on failure — reachable when a source cap goes stale or is pinned by an
-/// in-flight revoke or move between the send and this transfer — the message is
-/// delivered without caps (the sender keeps them; the transfer fails
-/// atomically) rather than stranding the already-parked caller.
+/// in-flight revoke, move, or IPC capability transfer between the send and this
+/// transfer — the message is delivered without caps (the sender keeps them; the
+/// transfer fails atomically) rather than stranding the already-parked caller.
 ///
 /// # Safety
 /// `caller_tcb` must be the running thread; `server_tcb` a valid TCB pinned by
-/// `wake_in_flight` and not yet enqueued.
+/// `wake_in_flight` and not yet enqueued. No lock may be held (the
+/// `transfer_caps` contract).
 #[cfg(not(test))]
 unsafe fn deliver_call_caps(
     caller_tcb: *mut crate::sched::thread::ThreadControlBlock,
@@ -377,7 +387,7 @@ unsafe fn deliver_call_caps(
     }
     let mut dst_handles = [0u32; MSG_CAP_SLOTS_MAX];
     // SAFETY: caller_tcb is the running caller; server_tcb a valid TCB
-    // pinned by wake_in_flight.
+    // pinned by wake_in_flight; this function's caller holds no lock.
     let transferred = unsafe {
         transfer_caps(
             caller_tcb,
@@ -485,9 +495,10 @@ unsafe fn consume_call_disposition(
 /// If `cap_count` > 0, the endpoint cap must have `EpRights::GRANT`. Capabilities
 /// at the specified slots are moved from the caller's `CSpace` to the server's
 /// `CSpace` all-or-nothing with the message: doomed transfers (duplicate,
-/// stale, or revoke- or move-pinned slots) are rejected before blocking; a refusal that
-/// arises only after the caller has blocked degrades to delivery with zero
-/// caps (the caller keeps its capabilities).
+/// stale, or slots pinned by an in-flight revoke, move, or IPC capability
+/// transfer) are rejected before blocking; a refusal that arises only after the
+/// caller has blocked degrades to delivery with zero caps (the caller keeps its
+/// capabilities).
 ///
 /// Blocks caller until a server replies. On return, label and data words are
 /// in the return registers and IPC buffer. Reply-direction cap handles are
@@ -596,7 +607,8 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // cancel/dealloc of the caller can clear to null or free). See
         // `deliver_call_caps`.
         // SAFETY: tcb is the running caller; woken_server is a valid TCB pinned
-        // by its wake_in_flight claim until the enqueue_and_wake below.
+        // by its wake_in_flight claim until the enqueue_and_wake below;
+        // endpoint_call released ep.lock, so no lock is held.
         unsafe {
             deliver_call_caps(tcb, woken_server, &msg);
         }
@@ -778,9 +790,9 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // Transfer caps from caller to server (if any). The pre_allocate
         // above makes a destination OOM unlikely but does not reserve the
         // headroom. A failure here (a source cap gone stale or pinned by an
-        // in-flight revoke or move, or a destination OOM) is post-commit —
-        // endpoint_recv already dequeued the sender and rebound it
-        // BlockedOnReply — so the message MUST still be delivered: degrade
+        // in-flight revoke, move, or IPC capability transfer, or a destination
+        // OOM) is post-commit — endpoint_recv already dequeued the sender and
+        // rebound it BlockedOnReply — so the message MUST still be delivered: degrade
         // to zero caps (the transfer fails atomically, so the sender keeps
         // its caps) rather than losing the consumed message and stranding
         // the sender, mirroring `deliver_call_caps`.
@@ -789,7 +801,8 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         if msg.cap_count > 0
         {
             // SAFETY: caller returned by endpoint_recv is a valid TCB parked
-            // BlockedOnReply; tcb is the running receiver.
+            // BlockedOnReply; tcb is the running receiver; endpoint_recv
+            // released ep.lock, so no lock is held.
             transferred = unsafe {
                 transfer_caps(
                     caller,
@@ -946,10 +959,11 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
 ///
 /// Capabilities move from the server's `CSpace` to the caller's `CSpace`
 /// all-or-nothing with the reply; a transfer refused after the caller was
-/// claimed (stale, repeated, or revoke- or move-pinned reply slot) wakes the caller
-/// with the synthetic `IPC_REPLY_TRANSFER_FAILED` label and returns the
-/// error to the server. No GRANT right check: the server is trusted by
-/// virtue of holding RECEIVE on the endpoint.
+/// claimed (a reply slot stale, repeated, or pinned by an in-flight revoke,
+/// move, or IPC capability transfer) wakes the caller with the synthetic
+/// `IPC_REPLY_TRANSFER_FAILED` label and returns the error to the server. No
+/// GRANT right check: the server is trusted by virtue of holding RECEIVE on the
+/// endpoint.
 // too_many_lines: a single logical operation (validate + cap pre-alloc + reply
 // dispatch, with a fault-reply fast path); splitting would obscure the
 // all-or-nothing reply atomicity.
@@ -1138,7 +1152,8 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             {
                 let mut dst_handles = [0u32; MSG_CAP_SLOTS_MAX];
                 // SAFETY: tcb is the running server; caller returned by
-                // endpoint_reply is a valid TCB parked BlockedOnReply.
+                // endpoint_reply is a valid TCB parked BlockedOnReply;
+                // endpoint_reply takes no lock, so none is held.
                 let transfer = unsafe {
                     transfer_caps(tcb, &msg.cap_slots[..cap_count], caller, &mut dst_handles)
                 };
@@ -1257,8 +1272,9 @@ pub fn sys_notification_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg0 = notification cap index (WAIT right).
 /// arg1 = `timeout_ms`. `0` blocks indefinitely. `> 0` blocks until bits
 ///        are delivered *or* `timeout_ms` milliseconds have elapsed (at once
-///        if the sleep list is full; docs/thread-lifecycle-and-sleep.md
-///        § Sleep List Invariants, invariant 4).
+///        if the sleep list is full;
+///        core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
+///        Invariants, invariant 4).
 ///
 /// On success returns `0` in rax/a0 and the bitmask in the secondary return
 /// register (rdx/a1). A notification wake always carries non-zero bits because
@@ -1433,8 +1449,8 @@ pub fn sys_event_post(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///          the scheduler.
 ///        - `1 .. u64::MAX-1` blocks until a post arrives or the timeout
 ///          elapses, whichever comes first (at once if the sleep list is
-///          full; docs/thread-lifecycle-and-sleep.md § Sleep List
-///          Invariants, invariant 4). On timeout returns `WouldBlock`
+///          full; core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep
+///          List Invariants, invariant 4). On timeout returns `WouldBlock`
 ///          (same code as the try-once-empty case — both mean "no payload
 ///          available").
 ///

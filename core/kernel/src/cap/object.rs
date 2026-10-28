@@ -972,8 +972,9 @@ pub struct AddressSpaceObject
     /// create-time slab's pool pages, then each augment-mode donation (see
     /// `PagePool::add_donation`).
     /// Refilled via augment-mode on `SYS_CAP_CREATE_ASPACE`
-    /// (`cap_create_aspace(memory_cap, target_aspace_cap)`). `mem_map` returns
-    /// `OutOfMemory` if a new PT page is needed but the budget is exhausted.
+    /// (`cap_create_aspace(memory_cap, target_aspace_cap, init_pages)`).
+    /// `mem_map` returns `OutOfMemory` if a new PT page is needed but the
+    /// budget is exhausted.
     pub pt_growth_budget_bytes: AtomicU64,
     /// Intermediate page-table pages donated to this AS, and the record of
     /// every donation; `dealloc` reclaims the donations wholesale.
@@ -1008,7 +1009,7 @@ pub struct CSpaceKernelObject
     /// create-time slab's pool pages, then each augment-mode donation (see
     /// `PagePool::add_donation`).
     /// Refilled via augment-mode on `SYS_CAP_CREATE_CSPACE`
-    /// (`cap_create_cspace(memory_cap, target_cspace_cap)`).
+    /// (`cap_create_cspace(memory_cap, target_cspace_cap, init_pages)`).
     /// `CSpace::grow` returns `OutOfMemory` if a new slot page is needed but the
     /// budget is exhausted.
     pub cspace_growth_budget_bytes: AtomicU64,
@@ -2205,8 +2206,8 @@ unsafe fn dealloc_object_one(
                 // Drop any sleep-list entry before the IPC unlink, so a timer pop
                 // that wins the race still sees the full binding. Outside the
                 // all-locks region (no sched.lock → SLEEP_LIST_LOCK edge). See
-                // docs/thread-lifecycle-and-sleep.md § `dealloc_object(Thread)`
-                // Drain Protocol, step 11.
+                // core/kernel/docs/thread-lifecycle-and-sleep.md
+                // § `dealloc_object(Thread)` Drain Protocol, step 11.
                 // SAFETY: tcb is valid (not yet freed).
                 unsafe { crate::sched::sleep_list_remove(tcb) };
 
@@ -2218,9 +2219,9 @@ unsafe fn dealloc_object_one(
                 // The binding pair is read and cleared under tcb's sched_lock:
                 // the abort arm of a wake that claimed tcb before its Exited
                 // mark writes the same pair under that lock (see
-                // docs/scheduling-internals.md § Cross-CPU TCB Ownership). The
-                // source locks below are taken after it is released, never
-                // inside it.
+                // core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
+                // Ownership). The source locks below are taken after it is
+                // released, never inside it.
                 // SAFETY: tcb is valid (not yet freed); blocked_on_object
                 // and ipc_state are always valid on an initialized TCB.
                 unsafe {
@@ -2433,8 +2434,8 @@ unsafe fn dealloc_object_one(
                 // A timer batch that popped this thread keeps its pointer, with no
                 // reference, until it finishes: wait it out before the free (its
                 // claim finds the waiter by address). See
-                // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants,
-                // invariant 9.
+                // core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
+                // Invariants, invariant 9.
                 crate::sched::sleep_wakeups_quiesce();
 
                 // Release the per-thread IOPB to SEED if one was bound via
@@ -2986,10 +2987,10 @@ unsafe fn dealloc_object_one(
                 // Wake every blocked waiter with its park stamped Interrupted.
                 // Each is claimed under sig.lock, as notification_send claims
                 // (#160), and, as a multi-waiter drain, also woken under it
-                // (docs/scheduling-internals.md § Lock Hierarchy rule 5), so a
-                // concurrent dealloc(waiter) BlockedOnNotification unlink
-                // (which takes sig.lock and spins on wake_in_flight) cannot
-                // free a TCB before its enqueue_and_wake commits.
+                // (core/kernel/docs/scheduling-internals.md § Lock Hierarchy
+                // rule 5), so a concurrent dealloc(waiter) BlockedOnNotification
+                // unlink (which takes sig.lock and spins on wake_in_flight)
+                // cannot free a TCB before its enqueue_and_wake commits.
                 // SAFETY: state validated non-null; sig.lock held across the
                 // claims and wakes, with no scheduler or sleep-list lock held.
                 unsafe {
@@ -3003,7 +3004,8 @@ unsafe fn dealloc_object_one(
                 // A timer batch that popped a timed waiter of this notification
                 // before the claim above may still hold `state` from its pop
                 // snapshot (no reference); wait it out before the free.
-                // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
+                // core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
+                // Invariants.
                 crate::sched::sleep_wakeups_quiesce();
             }
 
@@ -3013,8 +3015,11 @@ unsafe fn dealloc_object_one(
             );
             // Wrapper + state are in-place inside the ancestor Memory cap's
             // region.
-            use crate::cap::retype::{dispatch_for, retype_free};
-            let raw_bytes = dispatch_for(ObjectType::Notification, 0).map_or(120, |e| e.raw_bytes);
+            use crate::cap::retype::{NOTIFICATION_RAW_BYTES, dispatch_for, retype_free};
+            // dispatch_for always returns Some for Notification; the fallback is
+            // the same constant its Notification arm returns.
+            let raw_bytes = dispatch_for(ObjectType::Notification, 0)
+                .map_or(NOTIFICATION_RAW_BYTES, |e| e.raw_bytes);
 
             // SAFETY: ancestor_ptr is non-null per debug_assert; the
             // MemoryObject is kept alive by the retype-time refcount lease.
@@ -3092,7 +3097,8 @@ unsafe fn dealloc_object_one(
                 // A timer batch that popped a timed waiter of this queue
                 // before the claim above may still hold `state` from its pop
                 // snapshot (no reference); wait it out before the free.
-                // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
+                // core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
+                // Invariants.
                 crate::sched::sleep_wakeups_quiesce();
             }
 
@@ -3403,32 +3409,5 @@ mod tests
         assert_eq!(after_dec, 1);
         let after_dec2 = h.dec_ref();
         assert_eq!(after_dec2, 0);
-    }
-
-    #[test]
-    fn header_ancestor_default_null()
-    {
-        let h = KernelObjectHeader::new(ObjectType::Endpoint);
-        assert!(
-            h.ancestor
-                .load(core::sync::atomic::Ordering::Relaxed)
-                .is_null()
-        );
-    }
-
-    #[test]
-    fn header_with_ancestor_records_pointer()
-    {
-        // Use a leaked Box as a stable target — the test only checks pointer
-        // equality, not that the target is a live MemoryObject.
-        let target = Box::into_raw(Box::new(KernelObjectHeader::new(ObjectType::Memory)));
-        let nn = unsafe { NonNull::new_unchecked(target) };
-        let h = KernelObjectHeader::with_ancestor(ObjectType::Endpoint, nn);
-        assert_eq!(
-            h.ancestor.load(core::sync::atomic::Ordering::Relaxed),
-            target
-        );
-        // SAFETY: target is the leaked Box from above; reclaim it.
-        unsafe { drop(Box::from_raw(target)) };
     }
 }

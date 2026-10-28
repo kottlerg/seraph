@@ -741,11 +741,12 @@ pub fn namespace_lookup_dir(
 /// Retype one kernel object out of the runtime's object-slab machinery.
 ///
 /// `min_bytes` is the raw byte cost of the kernel object the caller is
-/// about to create (e.g. 88 for `Endpoint`, 120 for `Notification`); the
-/// runtime rounds up to the kernel's size-class granularity. `retype` is
-/// called at most once with a Memory-cap slot whose `available_bytes`
-/// covers that class and must perform exactly one `cap_create_*` syscall
-/// against the slot, returning `Some` on success.
+/// about to create (e.g. 80 for `Endpoint`, 64 for `Notification`); the
+/// runtime rounds up to the kernel's size-class granularity, so any value in
+/// the same class retypes alike. `retype` is called at most once with a
+/// Memory-cap slot whose `available_bytes` covers that class and must perform
+/// exactly one `cap_create_*` syscall against the slot, returning `Some` on
+/// success.
 ///
 /// # Closure contract
 ///

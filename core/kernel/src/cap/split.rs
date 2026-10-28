@@ -153,7 +153,8 @@ pub(crate) unsafe fn install_split_children(
             {
                 // Deleted or recycled meanwhile (consuming the slot would free an
                 // unrelated cap and release the original's object twice), or pinned
-                // by a revoke or move in flight (see `CapabilitySlot::pinned`).
+                // by a revoke, move, or IPC capability transfer in flight (see
+                // `CapabilitySlot::pinned`).
                 // SAFETY: as above.
                 unsafe { rollback_children(caller_cspace, cspace_id, child1, child2) };
                 return Err(SyscallError::InvalidState);
@@ -207,8 +208,8 @@ struct Original
 #[derive(Clone, Copy)]
 enum Revalidated
 {
-    /// Deleted, recycled, or pinned by a revoke or move in flight since the
-    /// lookup (`CapabilitySlot::pinned`).
+    /// Deleted, recycled, or pinned by a revoke, move, or IPC capability
+    /// transfer in flight since the lookup (`CapabilitySlot::pinned`).
     Gone,
     /// Still the cap that was looked up; its derivation parent (`None` for
     /// a root).
@@ -221,7 +222,8 @@ enum Revalidated
 impl Original
 {
     /// Whether `cspace`'s slot still holds this cap under the looked-up
-    /// generation with no revoke or move in flight (`CapabilitySlot::pinned`).
+    /// generation and is not pinned by a revoke, move, or IPC capability
+    /// transfer in flight (`CapabilitySlot::pinned`).
     ///
     /// # Safety
     ///

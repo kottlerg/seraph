@@ -94,10 +94,12 @@ is **not discoverable** at runtime:
 - EDK2 does not emit an ACPI entry for the Goldfish RTC (no
   standard `_HID`).
 
-The driver therefore depends on the bootloader unconditionally
-seeding `(0x101000, 0x1000)` as a platform aperture (mirroring the
-unconditional PCI-ECAM seed that exists for the same firmware-
-discovery reason; see `core/boot/src/arch/riscv64/mod.rs`). devmgr
+The driver therefore depends on the bootloader seeding
+`(0x101000, 0x1000)` as a platform-default aperture, which its ACPI
+walker appends whenever the RSDP and XSDT validate, MCFG present or
+absent (beside the PCI-ECAM default that exists for the same
+firmware-discovery reason; see
+[ACPI Parsing](../../../core/boot/docs/acpi.md#tables-consumed)). devmgr
 identifies this driver's region by matching the well-known base
 address `0x101000`, not by any discovery mechanism.
 

@@ -145,8 +145,9 @@ pub unsafe fn event_queue_post(
         let waiter = unsafe { eq.waiters.pop() };
         // Claim for wake under eq.lock: dealloc's BlockedOnEventQueue unlink
         // takes eq.lock and spins on wake_in_flight (#160); a timed waiter's
-        // sleep-list entry goes with it (docs/thread-lifecycle-and-sleep.md
-        // § Sleep List Invariants, invariant 7).
+        // sleep-list entry goes with it
+        // (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
+        // Invariants, invariant 7).
         // SAFETY: waiter is the valid TCB just removed from the queue.
         unsafe { crate::ipc::claim_waiter(waiter, payload) };
         // SAFETY: paired with lock_raw above.
@@ -356,10 +357,10 @@ pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
 
     // Claim every waiter under eq.lock, as event_queue_post claims (#160),
     // and, as a multi-waiter drain, wake it under the lock too
-    // (docs/scheduling-internals.md § Lock Hierarchy rule 5), so a concurrent
-    // dealloc(waiter) BlockedOnEventQueue unlink (which takes eq.lock and
-    // spins on wake_in_flight) cannot free a TCB before its enqueue_and_wake
-    // commits.
+    // (core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 5), so
+    // a concurrent dealloc(waiter) BlockedOnEventQueue unlink (which takes
+    // eq.lock and spins on wake_in_flight) cannot free a TCB before its
+    // enqueue_and_wake commits.
     // SAFETY: lock_raw paired with unlock_raw below.
     let saved = unsafe { eq.lock.lock_raw() };
     // SAFETY: eq.lock held; no scheduler or sleep-list lock held.

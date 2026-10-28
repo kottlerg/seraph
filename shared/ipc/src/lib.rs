@@ -1646,7 +1646,7 @@ pub mod blk_labels
     ///
     /// Request: `data[0]` = starting LBA, `data[1]` = sector count
     /// (`>= 1`; defaults to `1` if `data[1]` is absent). Caps: `caps[0]` =
-    /// source Memory cap (`MAP|READ`; the driver reads `count * 512` bytes
+    /// source Memory cap (`MAP` rights; the driver reads `count * 512` bytes
     /// starting at offset 0 of the page, packed contiguously). The page
     /// must be at least `count * 512` bytes; the driver rejects with
     /// `INVALID_MEMORY_CAP` otherwise. `caps[1]` is reserved for a future
@@ -2297,7 +2297,7 @@ pub mod blk_errors
     pub const REGISTER_REJECTED: u64 = 4;
     /// Memory cap rejected: `BLK_READ_INTO_MEMORY` target missing
     /// `MAP|WRITE` rights, `BLK_WRITE_FROM_MEMORY` source missing
-    /// `MAP|READ` rights, smaller than `count * 512` bytes, or absent;
+    /// `MAP` rights, smaller than `count * 512` bytes, or absent;
     /// also returned when `count` is 0 or `count * 512` exceeds `u32::MAX`.
     /// virtio-blk does not yet check the `count * 512` multiply for
     /// overflow: a `count` of 2^55 or more panics the driver under the dev

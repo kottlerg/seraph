@@ -577,11 +577,11 @@ pub fn lfn_checksum(name: &[u8; 11]) -> u8
 
 /// Parse a single 32-byte FAT directory entry.
 ///
-/// Returns `None` for end-of-directory (`0x00`), deleted (`0xE5`),
-/// LFN (`attr=0x0F`), and volume-label (`ATTR_VOLUME_ID`, attr bit `0x08`)
-/// entries. The returned
-/// [`DirEntry`] carries `lfn_len = 0`; callers that have accumulated
-/// an LFN run via [`LfnAccum`] populate `lfn` / `lfn_len` themselves.
+/// Returns `None` for end-of-directory (`0x00`), deleted (`0xE5`), LFN
+/// (`attr=0x0F`), and volume-label (`ATTR_VOLUME_ID`, attr bit `0x08`)
+/// entries. The returned [`DirEntry`] carries `lfn_len = 0`; callers that
+/// have accumulated an LFN run via [`LfnAccum`] populate `lfn` / `lfn_len`
+/// themselves.
 #[must_use]
 pub fn parse_dir_entry(raw: &[u8]) -> Option<DirEntry>
 {
@@ -780,11 +780,7 @@ impl<L: Copy + Default> RemoveRunScan<L>
     /// its validated long name or its short alias (after which
     /// [`Self::run`] lists the entry's slots), and [`RemoveStep::Continue`]
     /// otherwise.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `raw` is shorter than one 32-byte directory slot.
-    pub fn step(&mut self, raw: &[u8], loc: L, name: &[u8]) -> RemoveStep
+    pub fn step(&mut self, raw: &[u8; 32], loc: L, name: &[u8]) -> RemoveStep
     {
         if raw[0] == 0x00
         {

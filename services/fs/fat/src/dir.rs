@@ -276,8 +276,9 @@ fn scan_sector_for_name(
 
 /// Read a directory entry at a given index.
 ///
-/// Skips deleted, LFN, and end-of-directory markers; counts only
-/// valid 8.3 entries. When a valid LFN run precedes the 8.3 entry,
+/// Skips deleted, LFN, volume-label, and end-of-directory markers
+/// (the slots [`parse_dir_entry`] rejects); counts only valid 8.3
+/// entries. When a valid LFN run precedes the 8.3 entry,
 /// the assembled UTF-8 name is attached to the returned [`DirEntry`]
 /// for the readdir wire reply; otherwise callers fall back to the
 /// 8.3 form via [`DirEntry::write_display_name`].
@@ -453,6 +454,8 @@ const ATTR_ARCHIVE: u8 = 0x20;
 const ATTR_DIRECTORY: u8 = 0x10;
 /// 8.3 attribute byte for an LFN slot.
 const ATTR_LFN: u8 = 0x0F;
+/// Volume-label attribute bit (`ATTR_VOLUME_ID`); LFN slots carry it too.
+const ATTR_VOLUME_ID: u8 = 0x08;
 /// LFN sequence flag: `0x40` `OR`ed into the highest-seq slot marks
 /// "last entry in the LFN run" (per the FAT spec).
 const LFN_LAST_FLAG: u8 = 0x40;
@@ -661,7 +664,9 @@ pub fn directory_is_empty(
                 {
                     continue;
                 }
-                if buf[off + 11] == ATTR_LFN
+                // LFN and volume-label slots are not entries, matching
+                // what readdir lists.
+                if buf[off + 11] & ATTR_VOLUME_ID != 0
                 {
                     continue;
                 }
@@ -1485,14 +1490,14 @@ fn scan_sector_for_remove(
     {
         return Err(FatError::Io);
     }
-    for e in 0..SECTOR_SIZE / 32
+    let (slots, _) = buf.as_chunks::<32>();
+    for (e, raw) in slots.iter().enumerate()
     {
-        let off = e * 32;
         let loc = DirEntryLocation {
             sector_lba,
-            offset_in_sector: off,
+            offset_in_sector: e * 32,
         };
-        match scan.step(&buf[off..off + 32], loc, name)
+        match scan.step(raw, loc, name)
         {
             RemoveStep::Continue =>
             {}

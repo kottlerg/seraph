@@ -493,7 +493,7 @@ pub unsafe fn parse_cpu_topology(rsdp_addr: u64, bsp_id: u32) -> (u32, u32, [u32
             {
                 // SAFETY: table_len validated; firmware guarantees mapping.
                 let table = unsafe { phys_slice(table_addr, table_len) };
-                return parse_madt_topology(table, bsp_id, cpu_ids);
+                return parse_madt_topology(table, bsp_id);
             }
         }
     }
@@ -506,13 +506,28 @@ pub unsafe fn parse_cpu_topology(rsdp_addr: u64, bsp_id: u32) -> (u32, u32, [u32
 /// Returns `(cpu_count, bsp_id, cpu_ids)`. The BSP is placed at index 0,
 /// APs fill indices `1..cpu_count` in MADT order, each distinct hardware ID
 /// once; `cpu_count` counts the BSP once whether or not the MADT lists it.
-/// Entries beyond [`MAX_CPUS`] are dropped with a diagnostic.
-fn parse_madt_topology(
-    table: &[u8],
-    bsp_id: u32,
-    mut cpu_ids: [u32; MAX_CPUS],
-) -> (u32, u32, [u32; MAX_CPUS])
+/// CPUs beyond [`MAX_CPUS`] are dropped with a diagnostic.
+fn parse_madt_topology(table: &[u8], bsp_id: u32) -> (u32, u32, [u32; MAX_CPUS])
 {
+    let (cpu_count, cpu_ids, truncated) = madt_topology(table, bsp_id);
+    if truncated
+    {
+        bprintln!(
+            "[--------] boot: ACPI: MADT reported more than MAX_CPUS enabled CPUs; surplus dropped"
+        );
+    }
+    (cpu_count, bsp_id, cpu_ids)
+}
+
+/// The walk behind [`parse_madt_topology`], without the console output:
+/// returns `(cpu_count, cpu_ids, truncated)`, where `truncated` is set when a
+/// distinct enabled CPU found no slot, whether in the collection or when
+/// placed after the BSP.
+fn madt_topology(table: &[u8], bsp_id: u32) -> (u32, [u32; MAX_CPUS], bool)
+{
+    let mut cpu_ids = [0u32; MAX_CPUS];
+    cpu_ids[0] = bsp_id;
+
     // Collect all enabled IDs first, then place BSP at index 0.
     let mut all_ids = [0u32; MAX_CPUS];
     let mut all_count: usize = 0;
@@ -578,37 +593,38 @@ fn parse_madt_topology(
         off += entry_len;
     }
 
-    if truncated
-    {
-        bprintln!(
-            "[--------] boot: ACPI: MADT reported more than MAX_CPUS enabled CPUs; surplus dropped"
-        );
-    }
-
     if all_count == 0
     {
         // No processors found in MADT — single-CPU fallback.
-        return (1, bsp_id, cpu_ids);
+        return (1, cpu_ids, truncated);
     }
 
     // Place BSP at index 0, APs at subsequent indices. The count is the
     // number of slots filled, so the BSP counts once whether the MADT lists
     // it or not, and `cpu_ids[1..cpu_count]` holds exactly the APs.
     let mut logical_idx: usize = 1;
-    cpu_ids[0] = bsp_id;
     for &id in &all_ids[..all_count]
     {
-        if id != bsp_id && logical_idx < MAX_CPUS
+        if id == bsp_id
+        {
+            continue;
+        }
+        if logical_idx < MAX_CPUS
         {
             cpu_ids[logical_idx] = id;
             logical_idx += 1;
         }
+        else
+        {
+            // A full MADT that omits the BSP leaves one AP without a slot.
+            truncated = true;
+        }
     }
 
-    // logical_idx is at most MAX_CPUS (512), which fits in u32.
+    // logical_idx is at most MAX_CPUS, which fits in u32.
     #[allow(clippy::cast_possible_truncation)]
     let cpu_count = logical_idx as u32;
-    (cpu_count, bsp_id, cpu_ids)
+    (cpu_count, cpu_ids, truncated)
 }
 
 /// Append one enabled CPU's hardware ID to the MADT collection, skipping an
@@ -952,7 +968,7 @@ mod tests
                     t.extend_from_slice(&1u32.to_le_bytes());
                     t.extend_from_slice(&0u32.to_le_bytes());
                 }
-                _ =>
+                MADT_TYPE_RINTC =>
                 {
                     let mut e = vec![MADT_TYPE_RINTC, 36, 1, 0];
                     e.extend_from_slice(&1u32.to_le_bytes());
@@ -960,6 +976,7 @@ mod tests
                     e.resize(36, 0);
                     t.extend_from_slice(&e);
                 }
+                other => panic!("madt(): unsupported entry type {other}"),
             }
         }
         let len = t.len() as u32;
@@ -967,16 +984,20 @@ mod tests
         t
     }
 
-    /// Run `parse_madt_topology` as `parse_cpu_topology` calls it, with the
-    /// BSP already in slot 0 of the incoming array.
+    /// Run `madt_topology` over a synthetic MADT; returns the count, the
+    /// filled IDs, and the truncation flag.
+    fn topology_full(entries: &[(u8, u32)], bsp_id: u32) -> (u32, Vec<u32>, bool)
+    {
+        let (count, ids, truncated) = madt_topology(&madt(entries), bsp_id);
+        assert!(ids[count as usize..].iter().all(|&id| id == 0));
+        (count, ids[..count as usize].to_vec(), truncated)
+    }
+
     fn topology(entries: &[(u8, u32)], bsp_id: u32) -> (u32, Vec<u32>)
     {
-        let mut seed = [0u32; MAX_CPUS];
-        seed[0] = bsp_id;
-        let (count, bsp, ids) = parse_madt_topology(&madt(entries), bsp_id, seed);
-        assert_eq!(bsp, bsp_id);
-        assert!(ids[count as usize..].iter().all(|&id| id == 0));
-        (count, ids[..count as usize].to_vec())
+        let (count, ids, truncated) = topology_full(entries, bsp_id);
+        assert!(!truncated);
+        (count, ids)
     }
 
     #[test]
@@ -1034,6 +1055,36 @@ mod tests
     fn madt_without_cpu_entries_falls_back_to_the_bsp()
     {
         assert_eq!(topology(&[], 7), (1, vec![7]));
+    }
+
+    #[test]
+    fn madt_surplus_beyond_max_cpus_is_dropped_and_reported()
+    {
+        let max = MAX_CPUS as u32;
+        let entries: Vec<(u8, u32)> = (0..=max).map(|id| (MADT_TYPE_LOCAL_X2APIC, id)).collect();
+        let (count, ids, truncated) = topology_full(&entries, 0);
+        assert_eq!(count, max);
+        assert_eq!(ids, (0..max).collect::<Vec<u32>>());
+        assert!(truncated);
+    }
+
+    #[test]
+    fn madt_full_without_the_bsp_drops_one_ap_and_reports_it()
+    {
+        let max = MAX_CPUS as u32;
+        let entries: Vec<(u8, u32)> = (1..=max).map(|id| (MADT_TYPE_LOCAL_X2APIC, id)).collect();
+        let (count, ids, truncated) = topology_full(&entries, 0);
+        assert_eq!(count, max);
+        assert_eq!(ids, (0..max).collect::<Vec<u32>>());
+        assert!(truncated);
+    }
+
+    #[test]
+    fn madt_exactly_max_cpus_with_the_bsp_is_not_truncated()
+    {
+        let max = MAX_CPUS as u32;
+        let entries: Vec<(u8, u32)> = (0..max).map(|id| (MADT_TYPE_LOCAL_X2APIC, id)).collect();
+        assert_eq!(topology(&entries, 0), (max, (0..max).collect::<Vec<u32>>()));
     }
 
     /// Build a synthetic RHCT: SDT header + flags/timebase/node-count/offset

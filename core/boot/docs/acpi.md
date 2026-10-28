@@ -63,8 +63,8 @@ After the table walk, `parse_aperture_seed` appends the arch's platform-default 
 (`arch::current::default_mmio_apertures`) whenever the RSDP revision and the XSDT validate, MCFG
 present or absent. The list is empty on x86-64; on riscv64 it is the QEMU virt ECAM window, the
 32-bit and 64-bit PCI windows, and the ns16550a UART and Goldfish RTC register pages
-(`parse_aperture_seed` reads only MADT and MCFG, so no table seeds those two pages; the SPCR UART
-base feeds only `kernel_mmio`). Any overlap with the MCFG-derived seeds is collapsed by
+(`parse_aperture_seed` reads only MADT and MCFG, so no table seeds those two pages; the aperture
+seeder does not read SPCR). Any overlap with the MCFG-derived seeds is collapsed by
 `derive_mmio_apertures` (see [firmware-parsing.md](firmware-parsing.md) §"`mmio_apertures`
 construction"). Like the MCFG heuristic windows, the defaults are not bounded by the memory map: the
 riscv64 64-bit window `[16 GiB, 32 GiB)` covers RAM on a virt guest with more than about 14 GiB

@@ -229,10 +229,12 @@ binary. See [xtask/README.md](../../../xtask/README.md)
 for the authoritative command surface; the steps above are descriptive,
 not a manual recipe.
 
-The bootloader's `RUSTFLAGS` leave jump tables enabled. The relocation model needs no flag for them:
-a jump-table entry is either an offset relative to the table, which needs no relocation, or an
-absolute pointer, which the linker emits as an `R_RISCV_RELATIVE` entry that the self-relocation
-loop applies like any other in `.rodata` (see "Relocation: static-PIE self-relocation").
+The bootloader's `RUSTFLAGS` ([docs/build-system.md § Custom
+Targets](../../../docs/build-system.md#custom-targets)) carry no jump-table flag. The relocation
+model needs no flag for them: a jump-table entry is either an offset relative to the table, which
+needs no relocation, or an absolute pointer, which the linker emits as an `R_RISCV_RELATIVE` entry
+that the self-relocation loop applies like any other in `.rodata` (see "Relocation: static-PIE
+self-relocation").
 
 ---
 
@@ -275,4 +277,4 @@ for Seraph's specific binary layout.
 
 ## Summarized By
 
-[core/boot/README.md](../README.md), [Build System](../../../docs/build-system.md)
+[core/boot/README.md](../README.md)

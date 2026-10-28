@@ -6,13 +6,15 @@
 //! init-logd → real-logd handover wire contract.
 //!
 //! Both ends build against these definitions: init-logd
-//! (`services/init/src/logging.rs`) packs replies with them and tracks the
-//! names it must send again ([`NameResend`]); real-logd
+//! (`services/init/src/logging.rs`) packs replies with the `encode_*`
+//! functions, walks its history ring with [`next_history_seq`], and tracks
+//! the names it must send again ([`NameResend`]); real-logd
 //! (`services/logd/src/handover.rs`) decodes replies with [`decode`]. The
 //! wire format is specified in
-//! [handover-protocol.md](../../../docs/handover-protocol.md).
+//! [handover-protocol.md](../../docs/handover-protocol.md).
 
 use ipc::IpcMessage;
+use syscall_abi::MSG_DATA_WORDS_MAX;
 
 /// `HANDOVER_PULL` reply status: more chunks follow.
 pub const REPLY_MORE: u64 = 0;
@@ -113,6 +115,88 @@ pub fn decode(reply: &IpcMessage) -> Chunk<'_>
         }
         _ => Chunk::Skip,
     }
+}
+
+/// Encode the `HEADER` chunk: `total` history lines ever pushed and `active`
+/// occupied slots.
+#[must_use]
+pub fn encode_header(total: u64, active: u64) -> IpcMessage
+{
+    IpcMessage::builder(REPLY_MORE)
+        .word(0, KIND_HEADER)
+        .word(1, total)
+        .word(2, active)
+        .build()
+}
+
+/// Encode one `SLOT` chunk. A name longer than the message's payload area
+/// past [`SLOT_NAME_WORD`] is clipped to it, and the declared length (word 2
+/// and the label's upper bits) is the clipped length.
+#[must_use]
+pub fn encode_slot(badge: u64, name: &[u8]) -> IpcMessage
+{
+    let name = clip_to_payload(name, SLOT_NAME_WORD);
+    IpcMessage::builder(with_length(REPLY_MORE, name.len()))
+        .word(0, KIND_SLOT)
+        .word(1, badge)
+        .word(2, name.len() as u64)
+        .bytes(SLOT_NAME_WORD, name)
+        .build()
+}
+
+/// Encode one `LINE` chunk. Line bytes past the message's payload area after
+/// [`LINE_BYTES_WORD`] are clipped, and the declared length is the clipped
+/// length.
+#[must_use]
+pub fn encode_line(badge: u64, us: u64, line: &[u8]) -> IpcMessage
+{
+    let line = clip_to_payload(line, LINE_BYTES_WORD);
+    IpcMessage::builder(with_length(REPLY_MORE, line.len()))
+        .word(0, KIND_LINE)
+        .word(1, badge)
+        .word(2, us)
+        .word(3, line.len() as u64)
+        .bytes(LINE_BYTES_WORD, line)
+        .build()
+}
+
+/// Encode the terminal `DONE` reply (no data words).
+#[must_use]
+pub fn encode_done() -> IpcMessage
+{
+    IpcMessage::new(REPLY_DONE)
+}
+
+/// The next history-ring sequence number init-logd sends, or `None` when the
+/// drain has caught up.
+///
+/// Sequence numbers are absolute push counts: sequence `s` lives in ring slot
+/// `s % ring_len` until `ring_len` later pushes overwrite it, so with `total`
+/// lines ever pushed the live sequences are
+/// `total.saturating_sub(ring_len)..total`. `next` is the first sequence not
+/// yet sent. A sequence overwritten before it was sent is skipped, and lines
+/// pushed after the drain caught up are returned by a later call, so a
+/// deferred release's further drain carries them.
+#[must_use]
+pub fn next_history_seq(next: u64, total: u64, ring_len: u64) -> Option<u64>
+{
+    let seq = next.max(total.saturating_sub(ring_len));
+    (seq < total).then_some(seq)
+}
+
+/// `bytes`, clipped to the payload area from data word `start_word` to the
+/// end of the message.
+fn clip_to_payload(bytes: &[u8], start_word: usize) -> &[u8]
+{
+    let room = MSG_DATA_WORDS_MAX.saturating_sub(start_word) * 8;
+    &bytes[..bytes.len().min(room)]
+}
+
+/// `status` with an inline byte length packed into the label's upper bits
+/// (the stream-protocol convention).
+fn with_length(status: u64, len: usize) -> u64
+{
+    status | ((len as u64 & STATUS_MASK) << 16)
 }
 
 /// Whether a `HANDOVER_PULL` reply label carries [`REPLY_DONE`], ignoring the
@@ -228,7 +312,9 @@ mod tests
 {
     use super::*;
 
-    fn slot_reply(badge: u64, declared_len: u64, name: &[u8]) -> IpcMessage
+    /// A `SLOT` chunk whose declared length the test chooses freely, unlike
+    /// [`encode_slot`]'s (a malformed or hostile peer).
+    fn malformed_slot(badge: u64, declared_len: u64, name: &[u8]) -> IpcMessage
     {
         IpcMessage::builder(REPLY_MORE)
             .word(0, KIND_SLOT)
@@ -238,7 +324,8 @@ mod tests
             .build()
     }
 
-    fn line_reply(badge: u64, us: u64, declared_len: u64, line: &[u8]) -> IpcMessage
+    /// A `LINE` chunk with a freely chosen declared length.
+    fn malformed_line(badge: u64, us: u64, declared_len: u64, line: &[u8]) -> IpcMessage
     {
         IpcMessage::builder(REPLY_MORE)
             .word(0, KIND_LINE)
@@ -252,7 +339,8 @@ mod tests
     #[test]
     fn slot_chunk_round_trips_badge_and_name()
     {
-        let reply = slot_reply(0x1234, 7, b"svctest");
+        let reply = encode_slot(0x1234, b"svctest");
+        assert_eq!(reply.label >> 16, 7);
         assert_eq!(
             decode(&reply),
             Chunk::Slot {
@@ -265,7 +353,8 @@ mod tests
     #[test]
     fn line_chunk_round_trips_badge_timestamp_and_bytes()
     {
-        let reply = line_reply(9, 2_742_215, 11, b"phase=start");
+        let reply = encode_line(9, 2_742_215, b"phase=start");
+        assert_eq!(reply.label >> 16, 11);
         assert_eq!(
             decode(&reply),
             Chunk::Line {
@@ -277,10 +366,41 @@ mod tests
     }
 
     #[test]
+    fn header_chunk_round_trips()
+    {
+        let reply = encode_header(110, 14);
+        assert_eq!(decode(&reply), Chunk::Header);
+        assert_eq!((reply.word(1), reply.word(2)), (110, 14));
+        assert!(!is_done(reply.label));
+    }
+
+    #[test]
+    fn done_reply_ends_the_drain_and_carries_no_chunk()
+    {
+        let reply = encode_done();
+        assert!(is_done(reply.label));
+        assert_eq!(decode(&reply), Chunk::Skip);
+    }
+
+    #[test]
+    fn line_longer_than_the_payload_area_is_clipped_when_encoded()
+    {
+        let long = [b'x'; 600];
+        let reply = encode_line(1, 0, &long);
+        let Chunk::Line { bytes, .. } = decode(&reply)
+        else
+        {
+            panic!("expected a line chunk");
+        };
+        assert_eq!(bytes.len(), (MSG_DATA_WORDS_MAX - LINE_BYTES_WORD) * 8);
+        assert_eq!(reply.word(3), bytes.len() as u64);
+    }
+
+    #[test]
     fn slot_name_length_past_the_address_space_is_clipped_to_the_payload()
     {
         // `start + len` overflows usize for this declared length.
-        let reply = slot_reply(1, u64::MAX, b"init");
+        let reply = malformed_slot(1, u64::MAX, b"init");
         let Chunk::Slot { name, .. } = decode(&reply)
         else
         {
@@ -293,7 +413,7 @@ mod tests
     #[test]
     fn line_length_past_the_address_space_is_clipped_to_the_payload()
     {
-        let reply = line_reply(1, 0, u64::MAX - 3, b"ok");
+        let reply = malformed_line(1, 0, u64::MAX - 3, b"ok");
         let Chunk::Line { bytes, .. } = decode(&reply)
         else
         {
@@ -306,7 +426,7 @@ mod tests
     fn slot_chunk_without_payload_words_is_skipped()
     {
         // An empty name packs no payload word, so the message ends at word 3.
-        let reply = slot_reply(1, 0, b"");
+        let reply = encode_slot(1, b"");
         assert_eq!(decode(&reply), Chunk::Skip);
     }
 
@@ -322,6 +442,28 @@ mod tests
     {
         assert!(is_done(REPLY_DONE | (24 << 16)));
         assert!(!is_done(REPLY_MORE | (1 << 16)));
+    }
+
+    #[test]
+    fn history_seq_walks_an_unwrapped_ring_in_order()
+    {
+        assert_eq!(next_history_seq(0, 3, 4), Some(0));
+        assert_eq!(next_history_seq(2, 3, 4), Some(2));
+        assert_eq!(next_history_seq(3, 3, 4), None);
+    }
+
+    #[test]
+    fn history_seq_skips_lines_overwritten_before_they_were_sent()
+    {
+        // Ten pushes into a four-slot ring leave sequences 6..10 live.
+        assert_eq!(next_history_seq(1, 10, 4), Some(6));
+    }
+
+    #[test]
+    fn history_seq_returns_lines_pushed_after_the_drain_caught_up()
+    {
+        assert_eq!(next_history_seq(10, 10, 4), None);
+        assert_eq!(next_history_seq(10, 11, 4), Some(10));
     }
 
     #[test]

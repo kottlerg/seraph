@@ -11,6 +11,8 @@ publish.workspace = true
 # `IpcMessage`: the handover chunk decoder reads the reply snapshot directly,
 # so its bounds checks are host-tested.
 ipc = { path = "../../../shared/ipc" }
+# `MSG_DATA_WORDS_MAX`: the encoders clip a payload to the message's data area.
+syscall-abi = { path = "../../../abi/syscall" }
 
 [lints]
 workspace = true

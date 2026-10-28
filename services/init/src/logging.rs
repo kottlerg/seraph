@@ -553,27 +553,33 @@ fn handle_handover_pull(
     ipc_buf: *mut u64,
 )
 {
+    let reply = next_handover_chunk(slots, hist_cursor, slot_idx, name_resend);
+    // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Build the next `HANDOVER_PULL` reply chunk and advance the cursors past
+/// it, in the order [`handle_handover_pull`] documents.
+fn next_handover_chunk(
+    slots: &[SenderSlot; MAX_SENDERS],
+    hist_cursor: &mut u64,
+    slot_idx: &mut usize,
+    name_resend: &mut NameResend<MAX_SENDERS>,
+) -> ipc::IpcMessage
+{
     use core::sync::atomic::Ordering;
 
-    // First chunk: header.
-    if *hist_cursor == 0 && *slot_idx == 0
+    // First chunk: header. `hist_cursor` is 0 until it is sent, then one
+    // more than the next history sequence number to send.
+    if *hist_cursor == 0
     {
         let total = HISTORY_TOTAL.load(Ordering::Acquire);
         let active = slots.iter().filter(|s| s.badge != 0).count() as u64;
-        let reply = ipc::IpcMessage::builder(handover::REPLY_MORE)
-            .word(0, handover::KIND_HEADER)
-            .word(1, total)
-            .word(2, active)
-            .build();
-        // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        // Sentinel: bump cursor to mark "header sent". Real cursors
-        // start at 1.
         *hist_cursor = 1;
         // From here a name change can land behind the slot pass; record it
         // so the drain sends that slot again.
         name_resend.start();
-        return;
+        return handover::encode_header(total, active);
     }
 
     // Slot table, then any slot whose name changed after the pass began.
@@ -583,83 +589,44 @@ fn handle_handover_pull(
         *slot_idx += 1;
         if slot.badge != 0
         {
-            reply_slot(slot, ipc_buf);
-            return;
+            return slot_chunk(slot);
         }
     }
     while let Some(i) = name_resend.take_next()
     {
         if slots[i].badge != 0
         {
-            reply_slot(&slots[i], ipc_buf);
-            return;
+            return slot_chunk(&slots[i]);
         }
     }
 
-    // History ring.
+    // History ring, by absolute push sequence: a line overwritten before it
+    // was sent is skipped, and lines pushed after the drain caught up are
+    // sent by a later pull (a deferred release's further drain).
     let total = HISTORY_TOTAL.load(Ordering::Acquire);
-    let ring_full = total >= HISTORY_RING_LEN as u64;
-    let entries_to_send = if ring_full
+    if let Some(seq) = handover::next_history_seq(*hist_cursor - 1, total, HISTORY_RING_LEN as u64)
     {
-        HISTORY_RING_LEN as u64
-    }
-    else
-    {
-        total
-    };
-    let cursor_zero_based = *hist_cursor - 1;
-    if cursor_zero_based < entries_to_send
-    {
-        let i = cursor_zero_based as usize;
-        let read_idx = if ring_full
-        {
-            (HISTORY_HEAD.load(Ordering::Acquire) + i) % HISTORY_RING_LEN
-        }
-        else
-        {
-            i
-        };
-        // SAFETY: log thread is the only mutator of HISTORY; read of
-        // a fully-initialised slot.
-        let entry = unsafe { &HISTORY[read_idx] };
-        let byte_len = entry.used as usize;
-        let label = handover::REPLY_MORE | ((byte_len as u64 & 0xFFFF) << 16);
-        let reply = ipc::IpcMessage::builder(label)
-            .word(0, handover::KIND_LINE)
-            .word(1, entry.badge)
-            .word(2, entry.us)
-            .word(3, byte_len as u64)
-            .bytes(handover::LINE_BYTES_WORD, &entry.bytes[..byte_len])
-            .build();
-        // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        *hist_cursor += 1;
-        return;
+        *hist_cursor = seq + 2;
+        // SAFETY: the log thread is the only mutator of HISTORY, and sequence
+        // `seq` is live (pushed and not yet overwritten), so its slot is fully
+        // initialised.
+        let entry = unsafe { &HISTORY[(seq % HISTORY_RING_LEN as u64) as usize] };
+        return handover::encode_line(entry.badge, entry.us, &entry.bytes[..entry.used as usize]);
     }
 
-    // Drained. Final reply marks DONE — data only. The thread does NOT
-    // exit here: real-logd issues HANDOVER_RELEASE once its drain settles,
-    // and the receive loop terminates on that. Decoupling termination from
-    // the multi-chunk drain keeps a dropped data chunk from wedging
-    // init-logd (which would block procmgr's reap of init's memory caps).
-    let reply = ipc::IpcMessage::new(handover::REPLY_DONE);
-    // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    // Drained. Final reply marks DONE — data only. The thread does NOT exit
+    // here: real-logd issues HANDOVER_RELEASE once its drain settles, and the
+    // receive loop terminates on an acknowledged release. Decoupling
+    // termination from the multi-chunk drain keeps a dropped data chunk from
+    // wedging init-logd (which would block procmgr's reap of init's memory
+    // caps).
+    handover::encode_done()
 }
 
-/// Reply one `SLOT` handover chunk carrying `slot`'s badge and display name.
-fn reply_slot(slot: &SenderSlot, ipc_buf: *mut u64)
+/// The `SLOT` handover chunk carrying `slot`'s badge and display name.
+fn slot_chunk(slot: &SenderSlot) -> ipc::IpcMessage
 {
-    let name_len = slot.name_used.min(MAX_NAME_LEN);
-    let label = handover::REPLY_MORE | ((name_len as u64 & 0xFFFF) << 16);
-    let reply = ipc::IpcMessage::builder(label)
-        .word(0, handover::KIND_SLOT)
-        .word(1, slot.badge)
-        .word(2, name_len as u64)
-        .bytes(handover::SLOT_NAME_WORD, &slot.name[..name_len])
-        .build();
-    // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    handover::encode_slot(slot.badge, &slot.name[..slot.name_used.min(MAX_NAME_LEN)])
 }
 
 /// Record a display name for the sender identified by `badge`. Called

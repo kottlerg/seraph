@@ -71,11 +71,12 @@ pub unsafe fn transfer(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut Sl
 /// `ipc_buf` must be the calling thread's registered IPC buffer.
 unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut SlotTable)
 {
-    // Bound: 1 header + MAX_SENDERS slots + HISTORY_RING_LEN lines +
-    // 1 DONE. init-logd's HISTORY_RING_LEN is 512, MAX_SENDERS is 16
-    // — 1024 is comfortable headroom for both. A malformed reply
-    // sequence is unreachable in the in-tree init-logd; the bound is
-    // a defence against a future protocol drift.
+    // Bound on chunks per drain. A first drain sends 1 header + up to
+    // MAX_SENDERS (16) slots + up to HISTORY_RING_LEN (512) lines + 1
+    // DONE, about 530 chunks; slots resent after a rename and lines pushed
+    // during the drain add to that only while senders keep renaming or
+    // logging. 2048 leaves ample headroom for both, and also ends a
+    // malformed reply stream that never sends DONE.
     const MAX_ITERS: usize = 2048;
 
     for _ in 0..MAX_ITERS

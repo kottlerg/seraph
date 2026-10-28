@@ -118,8 +118,10 @@ name).
 ### `LINE` (3)
 
 One completed log line from init-logd's bounded history ring. Sent
-in FIFO order: oldest entry first when the ring has wrapped; index
-0 first when it has not.
+in FIFO order, by absolute push sequence: oldest live line first. A
+line the ring overwrites before it is sent is skipped, and lines
+pushed while the drain runs are sent after the ones before them,
+including by a further drain after a deferred release.
 
 | Word | Meaning |
 |---|---|
@@ -184,10 +186,11 @@ loop.
 ## Reference
 
 The wire contract — the reply, chunk-kind, and release-status codes,
-`MAX_RELEASE_DEFERRALS`, the receiver's chunk decoder, and the sender's
-record of names to send again — is defined once, in
+`MAX_RELEASE_DEFERRALS`, the sender's chunk encoders, history-ring
+sequencing, and record of names to send again, and the receiver's chunk
+decoder — is defined once, in
 [`services/logd/codec/src/handover.rs`](../codec/src/handover.rs)
-(`logd-codec`, host-tested). Both ends build against it:
+([`logd-codec`](../codec/README.md), host-tested). Both ends build against it:
 [`services/init/src/logging.rs`](../../init/src/logging.rs) (sender
 side) and [`services/logd/src/handover.rs`](../src/handover.rs)
 (receiver side).

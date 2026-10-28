@@ -6,8 +6,9 @@
 //! Pure handover-protocol and line-formatting logic for logd and init-logd.
 //!
 //! Holds the init-logd → real-logd handover wire contract ([`handover`]): its
-//! reply, chunk-kind, and release-status codes, the receiver's chunk decoder,
-//! and the sender's tracker of names that change after their slot was sent.
+//! reply, chunk-kind, and release-status codes, the sender's chunk encoders,
+//! history-ring sequencing, and tracker of names that change after their
+//! slot was sent, and the receiver's chunk decoder.
 //! Also holds [`BoundedStr`], the fixed-capacity formatter logd uses for its
 //! own diagnostics. None of this touches a syscall, IPC, or `std::os::seraph`
 //! surface — the decoder reads a stack [`ipc::IpcMessage`] snapshot — so the

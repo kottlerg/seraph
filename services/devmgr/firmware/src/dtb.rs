@@ -131,7 +131,8 @@ impl<'a> Fdt<'a>
     /// buses `reg` covers and to 255; the returned size is 1 MiB per bus of
     /// that range. An ECAM node more than 16 levels deep (the root node is
     /// level 1) is skipped. Returns `None` when no such node exists within
-    /// that depth, the structure block closes more nodes than it opens, the
+    /// that depth, the structure block closes more nodes than it has opened
+    /// before the ECAM node is reached, the
     /// node's parent's cell sizes are unsupported, its `reg` is missing,
     /// short, or zero, it covers less than one bus, or its `bus-range` is
     /// short, inverted, or starts above bus 255.
@@ -725,7 +726,9 @@ mod tests
     #[test]
     fn deep_subtree_before_a_shallow_ecam_node_does_not_hide_it()
     {
-        let mut b = Builder::new().begin("");
+        let mut b = Builder::new()
+            .begin("")
+            .prop("#size-cells", &2u32.to_be_bytes());
         for _ in 0..=MAX_DEPTH
         {
             b = b.begin("deep");
@@ -735,7 +738,6 @@ mod tests
             b = b.end();
         }
         let blob = b
-            .prop("#size-cells", &2u32.to_be_bytes())
             .begin("pcie@30000000")
             .prop("compatible", ECAM)
             .prop("reg", &reg(0x3000_0000, 16 << 20))

@@ -205,11 +205,11 @@ bootstrap round carries at most `MSG_CAP_SLOTS_MAX` (currently 4) caps, and
 a `provides` service's provider RECV takes cap[0], so a recipe with more
 than 4 seeds, or more than 3 for a `provides` service, is a parser error.
 
-An unresolved name leaves slot `i` as `0`. Consumers that already tolerate `cap == 0 → skip`
-(e.g. svctest's `ns` and pwrmgr shutdown phases, per
-[services/svctest/README.md § Run Sequence](../../svctest/README.md#run-sequence))
-continue to work; consumers that don't fail on first use, which is the right surface for a real
-misconfiguration.
+An unresolved name leaves slot `i` as `0`. Consumers that tolerate `cap == 0 → skip` continue to
+work; consumers that don't fail on first use, which is the right surface for a real
+misconfiguration. svctest does both: its `ns` and pwrmgr shutdown phases skip on a zero cap, and
+its svcmgr seed-only phase fails the run on any unresolved seed (per
+[services/svctest/README.md § Run Sequence](../../svctest/README.md#run-sequence)).
 
 Well-known names are centralised in
 [`ipc::published_names`](../../../shared/ipc/src/lib.rs). Every name

@@ -1006,24 +1006,30 @@ fn locate_table_by_sig(caps: &caps::DevmgrCaps, sig: [u8; 4]) -> Option<u64>
         .find(|&tbl_phys| read_table_sig(caps, tbl_phys) == Some(sig))
 }
 
-/// Resolve an ACPI-table request to `(region, table_phys)`. A non-zero
-/// `phys` is looked up directly (e.g. the DSDT, whose address the caller
-/// read from the FADT); otherwise `sig_word`'s low 32 bits are the table
-/// signature to find via the XSDT.
+/// Resolve an ACPI-table request to `(region, table_phys)`, per the
+/// `QUERY_ACPI_TABLE` contract: a non-zero signature in `sig_word`'s low
+/// 32 bits is found via the XSDT; a zero signature looks `phys` up directly
+/// (e.g. the DSDT, whose address the caller read from the FADT). Returns
+/// `None` when both are zero or the table is not found.
 fn locate_acpi_table(
     caps: &caps::DevmgrCaps,
     sig_word: u64,
     phys: u64,
 ) -> Option<(caps::AcpiRegion, u64)>
 {
-    let table_phys = if phys != 0
+    let [s0, s1, s2, s3, ..] = sig_word.to_le_bytes();
+    let sig = [s0, s1, s2, s3];
+    let table_phys = if sig == [0; 4]
     {
+        if phys == 0
+        {
+            return None;
+        }
         phys
     }
     else
     {
-        let [s0, s1, s2, s3, ..] = sig_word.to_le_bytes();
-        locate_table_by_sig(caps, [s0, s1, s2, s3])?
+        locate_table_by_sig(caps, sig)?
     };
     let (region, _off) = find_region_for(caps, table_phys)?;
     Some((region, table_phys))
@@ -1344,7 +1350,8 @@ fn spawn_virtio_blk(
         };
 
         let dev_idx = *catalog.count;
-        if dev_idx < catalog.entries.len()
+        let catalogued = dev_idx < catalog.entries.len();
+        if catalogued
         {
             // Serialise the virtio startup info into the generic
             // catalog entry. Devmgr stores the bytes opaquely; the
@@ -1400,7 +1407,17 @@ fn spawn_virtio_blk(
         let spawned = spawn::spawn_driver(&config, ipc_buf);
         if !spawned
         {
+            // No driver exists for the device: release its per-device caps
+            // and drop its catalog entry.
             let _ = syscall::cap_delete(irq_cap);
+            for &bar_cap in &bar_info.0[..bar_info.2]
+            {
+                let _ = syscall::cap_delete(bar_cap);
+            }
+            if catalogued
+            {
+                *catalog.count -= 1;
+            }
         }
         return spawned;
     }
@@ -1576,7 +1593,8 @@ fn enumerate_virtio_input(
 /// file-source PCI spawn path. Returns the freshly created service endpoint on
 /// success; the caller stores it for `QUERY_INPUT_DEVICE`. Mirrors
 /// [`spawn_rtc_from_disk`], but uses [`spawn::spawn_driver`] (BAR + IRQ +
-/// device-info) rather than the simple-device path.
+/// device-info) rather than the simple-device path. On failure it returns
+/// `None` and releases the stashed BAR and IRQ caps.
 fn spawn_virtio_input_from_disk(
     caps: &mut caps::DevmgrCaps,
     pending: &PendingInputDevice,
@@ -1590,6 +1608,7 @@ fn spawn_virtio_input_from_disk(
     else
     {
         std::os::seraph::log!("virtio-input: walk_to_file failed (binary missing on rootfs)");
+        release_pending_input(pending);
         return None;
     };
 
@@ -1600,6 +1619,7 @@ fn spawn_virtio_input_from_disk(
     {
         std::os::seraph::log!("virtio-input: failed to create service endpoint");
         let _ = syscall::cap_delete(walked.file_cap);
+        release_pending_input(pending);
         return None;
     }
 
@@ -1635,7 +1655,19 @@ fn spawn_virtio_input_from_disk(
     else
     {
         let _ = syscall::cap_delete(input_ep);
+        release_pending_input(pending);
         None
+    }
+}
+
+/// Release the BAR and IRQ caps stashed for a virtio-input device whose
+/// driver could not be spawned; the caller drops the stash.
+fn release_pending_input(pending: &PendingInputDevice)
+{
+    let _ = syscall::cap_delete(pending.bar_cap);
+    if let Some(irq) = pending.irq_cap
+    {
+        let _ = syscall::cap_delete(irq);
     }
 }
 

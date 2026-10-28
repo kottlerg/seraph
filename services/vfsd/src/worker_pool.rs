@@ -47,6 +47,12 @@ pub enum WorkOrder
 }
 
 /// Caps to deliver to one fatfs child during its bootstrap round.
+///
+/// Handing an order to the pool hands over its two caps: from then on the
+/// pool either delivers them to the child (the bootstrap round moves them
+/// out of vfsd's CSpace) or deletes them — [`submit_bootstrap`] when its
+/// table is full, the bootstrap worker when a round fails, and
+/// [`abandon_bootstrap`] when the order is withdrawn before its child asks.
 pub struct BootstrapOrder
 {
     /// Badge the child carries on its REQUEST; identifies which order to fill.
@@ -221,7 +227,9 @@ impl WorkerPool
         self.bootstrap_ep
     }
 
-    /// Submit a work order. Returns `None` if the relevant slot table is full.
+    /// Submit a work order. Returns `None` if the relevant slot table is
+    /// full, after deleting every cap the order carries, so a refused order
+    /// leaves nothing of it in vfsd's CSpace.
     pub fn submit(&self, order: WorkOrder) -> Option<WorkHandle>
     {
         match order
@@ -235,7 +243,15 @@ impl WorkerPool
                     .queue
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                let slot = q.iter_mut().find(|s| s.is_none())?;
+                let Some(slot) = q.iter_mut().find(|s| s.is_none())
+                else
+                {
+                    drop(q);
+                    let _ = syscall::cap_delete(c.file_cap);
+                    let _ = syscall::cap_delete(c.badged_creator);
+                    delete_bootstrap_caps(c.bootstrap.blk, c.bootstrap.service);
+                    return None;
+                };
                 *slot = Some(ActiveJob {
                     order: c,
                     completion: channel.clone(),
@@ -246,11 +262,21 @@ impl WorkerPool
             }
         }
     }
+
+    /// Withdraw a bootstrap order registered by [`Self::submit`]; see
+    /// [`abandon_bootstrap`].
+    pub fn abandon_bootstrap(&self, badge: u64, handle: WorkHandle) -> bool
+    {
+        abandon_bootstrap(&self.bootstrap_state, badge, handle)
+    }
 }
 
 /// Insert a bootstrap order into the shared state and return a `WorkHandle`
 /// to its completion channel. Used by `WorkerPool::submit` and directly by
 /// active workers preparing a bootstrap delivery before driving procmgr.
+///
+/// Returns `None` when every pending slot is occupied, after deleting the
+/// order's caps.
 pub fn submit_bootstrap(
     state: &Mutex<BootstrapState>,
     BootstrapOrder {
@@ -262,7 +288,13 @@ pub fn submit_bootstrap(
 {
     let channel = new_channel();
     let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
-    let slot = st.pending.iter_mut().find(|s| s.is_none())?;
+    let Some(slot) = st.pending.iter_mut().find(|s| s.is_none())
+    else
+    {
+        drop(st);
+        delete_bootstrap_caps(blk, service);
+        return None;
+    };
     *slot = Some(PendingBootstrap {
         badge,
         blk,
@@ -270,4 +302,47 @@ pub fn submit_bootstrap(
         channel: channel.clone(),
     });
     Some(WorkHandle { channel })
+}
+
+/// Withdraw the bootstrap order registered under `badge`, whose child will
+/// not be served (its creation or start failed, or its caller gave up), and
+/// report whether the child received the order's caps.
+///
+/// If the order is still pending, its slot is freed and its undelivered
+/// caps are deleted: `false`. Otherwise the bootstrap worker already took
+/// it for a child's REQUEST, and this waits on `handle` for that round's
+/// outcome: `true` if the caps reached the child, `false` if the round
+/// failed (the worker then deleted them). Either way no cap of the order
+/// remains in vfsd's CSpace once this returns.
+pub fn abandon_bootstrap(state: &Mutex<BootstrapState>, badge: u64, handle: WorkHandle) -> bool
+{
+    if let Some(pending) = take_pending_by_badge(state, badge)
+    {
+        delete_bootstrap_caps(pending.blk, pending.service);
+        return false;
+    }
+    handle.wait()
+}
+
+/// Find and remove a pending-bootstrap slot whose badge matches.
+pub fn take_pending_by_badge(state: &Mutex<BootstrapState>, badge: u64)
+-> Option<PendingBootstrap>
+{
+    let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
+    for slot in &mut st.pending
+    {
+        if let Some(p) = slot.as_ref()
+            && p.badge == badge
+        {
+            return slot.take();
+        }
+    }
+    None
+}
+
+/// Delete the two caps of a bootstrap order that never reached its child.
+pub fn delete_bootstrap_caps(blk: u32, service: u32)
+{
+    let _ = syscall::cap_delete(blk);
+    let _ = syscall::cap_delete(service);
 }

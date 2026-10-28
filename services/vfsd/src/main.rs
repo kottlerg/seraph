@@ -898,11 +898,17 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
     let path_src_start = 2 * 8;
     let path_src_end = (path_src_start + path_len).min(path_bytes.len());
     let copy_len = path_src_end.saturating_sub(path_src_start).min(path_len);
-    if copy_len > 0
+    if copy_len < path_len
     {
-        path_buf[..copy_len]
-            .copy_from_slice(&path_bytes[path_src_start..path_src_start + copy_len]);
+        // The data words carry fewer path bytes than `data[1]` claims; a
+        // shorter copy would mount a NUL-padded name.
+        std::os::seraph::log!("MOUNT: path shorter than its stated length");
+        let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+        return;
     }
+    path_buf[..path_len].copy_from_slice(&path_bytes[path_src_start..path_src_end]);
 
     let reply = match do_mount(rt, ipc_buf, role, &path_buf[..path_len])
     {
@@ -933,9 +939,10 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 /// and returns without mounting, leaving `mount_path` to resolve through
 /// the root-fs fall-through. On a match, runs the mount transaction and
 /// logs the outcome. Never fatal — distinct from the root self-mount,
-/// whose failure gates boot. Idempotent if invoked twice: the install
-/// against an already-terminal mount path is rejected by
-/// `root_backend::install_mount`.
+/// whose failure gates boot. Idempotent if invoked twice: a mount on an
+/// already-terminal mount path is rejected by
+/// [`VfsdRootBackend::can_install`] before any partition is registered or
+/// driver spawned.
 fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, type_guid: &[u8; 16], mount_path: &str)
 {
     let present = rt
@@ -1052,6 +1059,20 @@ fn do_mount_internal(
         "MOUNT: partition LBA={partition_lba:#018x} length={partition_len:#018x}"
     );
 
+    // Reject a mount the synthetic root would refuse (root already mounted,
+    // `path` already a mount point, an oversize component, or no free tree
+    // node) before registering a partition or spawning a driver for it.
+    let installable = rt
+        .root_backend
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .can_install(path);
+    if !installable
+    {
+        std::os::seraph::log!("MOUNT: mount point taken or synthetic-root table full");
+        return Err(ipc::vfsd_errors::TABLE_FULL);
+    }
+
     let Some(partition_ep) =
         derive_and_register_partition(rt, partition_lba, partition_len, ipc_buf)
     else
@@ -1075,7 +1096,9 @@ fn do_mount_internal(
         v
     };
 
-    let Some(driver_ep) = driver::spawn_fatfs_driver(
+    // `spawn_fatfs_driver` owns `partition_ep` from here: it is the child's
+    // on success and released on failure.
+    let Some(fatfs) = driver::spawn_fatfs_driver(
         &rt.caps,
         &rt.pool,
         partition_ep,
@@ -1089,6 +1112,7 @@ fn do_mount_internal(
         log_cap_delete("module_cap (spawn-fail)", module_cap_for_spawn);
         return Err(ipc::vfsd_errors::SPAWN_FAILED);
     };
+    let driver_ep = fatfs.send;
 
     // Root MOUNT succeeded — drop the boot module cap. The IPC has already
     // transferred a derived child to procmgr; this releases vfsd's outer slot.
@@ -1130,10 +1154,9 @@ fn do_mount_internal(
         else
         {
             std::os::seraph::log!("MOUNT: root fall-through cap derive failed");
-            log_cap_delete(
-                "caller_root_cap (derive-fail)",
-                caller_root_cap.unwrap_or(0),
-            );
+            // Revoking the endpoint also invalidates `caller_root_cap` and
+            // stops the driver, which nothing would reach otherwise.
+            driver::teardown_driver(fatfs.endpoint);
             return Err(ipc::vfsd_errors::IO_ERROR);
         };
         c
@@ -1157,12 +1180,12 @@ fn do_mount_internal(
     let Some(install_result) = install_result
     else
     {
-        std::os::seraph::log!("MOUNT: synthetic-root install full or oversized");
-        log_cap_delete("install_cap (install-full)", install_cap);
-        log_cap_delete(
-            "caller_root_cap (install-full)",
-            caller_root_cap.unwrap_or(0),
-        );
+        // A concurrent MOUNT took the mount point or the last tree node
+        // after the `can_install` check. Revoking the endpoint invalidates
+        // `install_cap` and `caller_root_cap` (both derive from it) and
+        // stops the driver nothing would reach.
+        std::os::seraph::log!("MOUNT: synthetic-root install full or mount point taken");
+        driver::teardown_driver(fatfs.endpoint);
         return Err(ipc::vfsd_errors::TABLE_FULL);
     };
 

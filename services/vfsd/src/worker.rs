@@ -20,8 +20,8 @@ use std::sync::{Mutex, PoisonError};
 use ipc::{IpcMessage, bootstrap, bootstrap_errors, procmgr_labels};
 
 use crate::worker_pool::{
-    ActiveJob, ActiveState, BootstrapState, Channel, CreateFromFileOrder, PendingBootstrap,
-    submit_bootstrap,
+    ActiveJob, ActiveState, BootstrapState, Channel, CreateFromFileOrder, abandon_bootstrap,
+    delete_bootstrap_caps, submit_bootstrap, take_pending_by_badge,
 };
 
 /// Bootstrap worker entry. Runs for the process lifetime; spawned by
@@ -66,6 +66,9 @@ pub fn bootstrap_loop(bootstrap_ep: u32, state: &Mutex<BootstrapState>) -> !
             let _ = unsafe { bootstrap::reply_error(bootstrap_errors::INVALID, ipc_buf) };
             if let Some(p) = pending
             {
+                // The order is spent undelivered; its caps are this
+                // worker's to release (see `BootstrapOrder`).
+                delete_bootstrap_caps(p.blk, p.service);
                 notification_channel(&p.channel, false);
             }
             continue;
@@ -82,6 +85,12 @@ pub fn bootstrap_loop(bootstrap_ep: u32, state: &Mutex<BootstrapState>) -> !
         let caps = [pending.blk, pending.service];
         // SAFETY: ipc_buf is the thread-registered IPC buffer page.
         let ok = unsafe { bootstrap::reply_round(true, &caps, &[], ipc_buf) }.is_ok();
+        if !ok
+        {
+            // A failed reply transfers no cap (the move is all-or-nothing),
+            // so both are still in vfsd's CSpace.
+            delete_bootstrap_caps(pending.blk, pending.service);
+        }
         notification_channel(&pending.channel, ok);
     }
 }
@@ -127,6 +136,10 @@ fn take_next_active_job(active: &ActiveState) -> ActiveJob
 
 /// Drive `CREATE_FROM_FILE` + `START_PROCESS` for one child, then wait for the
 /// bootstrap delivery the bootstrap worker performs in parallel.
+///
+/// Returns `true` once the child holds its bootstrap caps. On every `false`
+/// return the bootstrap order is withdrawn ([`abandon_bootstrap`]) and the
+/// process handle released, so no cap of the order is left in vfsd's CSpace.
 fn handle_create_from_file(
     order: CreateFromFileOrder,
     bootstrap_state: &Mutex<BootstrapState>,
@@ -140,11 +153,13 @@ fn handle_create_from_file(
         badged_creator,
         bootstrap,
     } = order;
+    let badge = bootstrap.badge;
 
     let Some(bootstrap_handle) = submit_bootstrap(bootstrap_state, bootstrap)
     else
     {
-        // No room in the bootstrap registry — drop the caps we own.
+        // No room in the bootstrap registry (`submit_bootstrap` released
+        // the order's caps) — drop the caps we still own.
         let _ = syscall::cap_delete(file_cap);
         let _ = syscall::cap_delete(badged_creator);
         return false;
@@ -169,7 +184,11 @@ fn handle_create_from_file(
     let Ok(create_reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
     {
+        // A failed call transfers no cap, so both are still ours.
         std::os::seraph::log!("active worker: CREATE_FROM_FILE ipc_call failed");
+        let _ = syscall::cap_delete(file_cap);
+        let _ = syscall::cap_delete(badged_creator);
+        abandon_bootstrap(bootstrap_state, badge, bootstrap_handle);
         return false;
     };
     if create_reply.label != 0
@@ -178,6 +197,7 @@ fn handle_create_from_file(
             "active worker: CREATE_FROM_FILE failed (code={})",
             create_reply.label
         );
+        abandon_bootstrap(bootstrap_state, badge, bootstrap_handle);
         return false;
     }
 
@@ -185,37 +205,18 @@ fn handle_create_from_file(
     else
     {
         std::os::seraph::log!("active worker: CREATE_FROM_FILE reply missing process handle");
+        abandon_bootstrap(bootstrap_state, badge, bootstrap_handle);
         return false;
     };
 
-    let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
-    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-    let start_ok = matches!(
-        unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) },
-        Ok(ref r) if r.label == 0
-    );
-    if !start_ok
+    if !crate::driver::start_and_release(process_handle, ipc_buf)
     {
         std::os::seraph::log!("active worker: START_PROCESS failed");
+        abandon_bootstrap(bootstrap_state, badge, bootstrap_handle);
         return false;
     }
 
     bootstrap_handle.wait()
-}
-
-/// Find and remove a pending-bootstrap slot whose badge matches.
-fn take_pending_by_badge(state: &Mutex<BootstrapState>, badge: u64) -> Option<PendingBootstrap>
-{
-    let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
-    for slot in &mut st.pending
-    {
-        if let Some(p) = slot.as_ref()
-            && p.badge == badge
-        {
-            return slot.take();
-        }
-    }
-    None
 }
 
 /// Write a result into a per-request channel and wake the waiter.

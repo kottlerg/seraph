@@ -33,13 +33,34 @@
 use ipc::{FS_LABELS_VERSION, IpcMessage, fs_labels, procmgr_labels};
 
 use crate::VfsdCaps;
-use crate::worker_pool::{BootstrapOrder, CreateFromFileOrder, WorkOrder, WorkerPool};
+use crate::worker_pool::{
+    BootstrapOrder, CreateFromFileOrder, WorkOrder, WorkerPool, delete_bootstrap_caps,
+};
 
-/// Spawn a fatfs driver instance for a partition and return its `SEND_GRANT`
-/// service endpoint. `module_cap` is non-zero only for the root mount; pass
-/// zero to use the post-boot path that resolves `/services/fs/fatfs` via vfsd's
-/// own held namespace cap (`system_root_cap`) and submits
-/// `CREATE_FROM_FILE` to procmgr.
+/// A started fatfs driver instance.
+pub struct FatfsDriver
+{
+    /// The driver's service endpoint as vfsd created it. Every cap on that
+    /// endpoint derives from this slot (the child's receive copy, [`Self::send`],
+    /// and the badged caps a mount mints from `send`), so [`teardown_driver`]
+    /// on it is the kill-the-server shape of `docs/namespace-model.md`
+    /// § Revocation.
+    pub endpoint: u32,
+    /// `SEND_GRANT` derivation of `endpoint`; the mount transaction probes
+    /// the driver and mints its badged caps through it.
+    pub send: u32,
+}
+
+/// Spawn a fatfs driver instance for a partition and return its endpoint
+/// pair. `module_cap` is non-zero only for the root mount; pass zero to use
+/// the post-boot path that resolves `/services/fs/fatfs` via vfsd's own held
+/// namespace cap (`system_root_cap`) and submits `CREATE_FROM_FILE` to
+/// procmgr.
+///
+/// Takes ownership of `partition_ep`: on success it is the child's, and on
+/// `None` it has been released along with every cap vfsd derived for the
+/// spawn, and any child that already started has had its service endpoint
+/// revoked. `module_cap` stays the caller's.
 pub fn spawn_fatfs_driver(
     caps: &VfsdCaps,
     pool: &WorkerPool,
@@ -47,22 +68,131 @@ pub fn spawn_fatfs_driver(
     module_cap: u32,
     system_root_cap: u32,
     ipc_buf: *mut u64,
-) -> Option<u32>
+) -> Option<FatfsDriver>
 {
     if caps.bootstrap_ep == 0
     {
         std::os::seraph::log!("spawn_fatfs: worker thread not initialised");
+        let _ = syscall::cap_delete(partition_ep);
         return None;
     }
 
-    // Create fatfs's service endpoint. fatfs receives service calls on
-    // this; vfsd holds a SEND_GRANT copy for the FS_MOUNT BPB-validation
-    // probe and for `cap_derive_badge`-ing the synthetic-root and
-    // caller-root caps in `do_mount`.
-    let driver_ep =
-        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())?;
-    let driver_ep_for_child = syscall::cap_derive(driver_ep, syscall::RIGHTS_ALL).ok()?;
-    let driver_send = syscall::cap_derive(driver_ep, syscall::RIGHTS_EP_SEND_GRANT).ok()?;
+    // Create fatfs's service endpoint. fatfs receives service calls on a
+    // RIGHTS_ALL derivation of it; vfsd keeps the original for teardown.
+    let Some(endpoint) =
+        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
+    else
+    {
+        let _ = syscall::cap_delete(partition_ep);
+        return None;
+    };
+
+    let started = start_driver(
+        caps,
+        pool,
+        endpoint,
+        partition_ep,
+        module_cap,
+        system_root_cap,
+        ipc_buf,
+    );
+    match started
+    {
+        Some(send) => Some(FatfsDriver { endpoint, send }),
+        None =>
+        {
+            teardown_driver(endpoint);
+            None
+        }
+    }
+}
+
+/// Revoke and delete a driver's service endpoint: every cap derived from
+/// it (the child's receive copy, vfsd's `SEND_GRANT`, and any badged cap
+/// minted from that) is invalidated, so a running driver loses its service
+/// endpoint and exits, and an unstarted spawn leaves nothing behind.
+pub fn teardown_driver(endpoint: u32)
+{
+    if let Err(code) = syscall::cap_revoke_all(endpoint)
+    {
+        std::os::seraph::log!("driver teardown: cap_revoke_all failed: code={code}");
+    }
+    if let Err(code) = syscall::cap_delete(endpoint)
+    {
+        std::os::seraph::log!("driver teardown: cap_delete failed: code={code}");
+    }
+}
+
+/// Spawn the driver behind `endpoint`, deliver its bootstrap caps, and
+/// probe it with `FS_MOUNT`. Returns the `SEND_GRANT` derivation of
+/// `endpoint` on success. On `None`, `partition_ep` and every cap not
+/// derived from `endpoint` are released; the caller revokes `endpoint` to
+/// release the rest.
+fn start_driver(
+    caps: &VfsdCaps,
+    pool: &WorkerPool,
+    endpoint: u32,
+    partition_ep: u32,
+    module_cap: u32,
+    system_root_cap: u32,
+    ipc_buf: *mut u64,
+) -> Option<u32>
+{
+    let Some((bootstrap, badged_creator)) = new_bootstrap_order(caps, endpoint, partition_ep)
+    else
+    {
+        let _ = syscall::cap_delete(partition_ep);
+        return None;
+    };
+
+    // Both paths release the order's caps and `badged_creator` on failure.
+    let spawned = if module_cap != 0
+    {
+        spawn_via_module(caps, pool, bootstrap, module_cap, badged_creator, ipc_buf)
+    }
+    else
+    {
+        spawn_via_vfs(caps, pool, bootstrap, badged_creator, system_root_cap)
+    };
+    if !spawned
+    {
+        return None;
+    }
+
+    // vfsd's SEND_GRANT copy carries the FS_MOUNT BPB-validation probe and
+    // the `cap_derive_badge`-ing of the synthetic-root and caller-root caps
+    // in `do_mount`.
+    let send = syscall::cap_derive(endpoint, syscall::RIGHTS_EP_SEND_GRANT).ok()?;
+
+    // Probe the driver with FS_MOUNT: fatfs validates the FS_LABELS_VERSION
+    // handshake and the BPB in its handler and replies with
+    // fs_errors::SUCCESS or an error label.
+    let mount_msg = IpcMessage::builder(fs_labels::FS_MOUNT)
+        .word(0, u64::from(FS_LABELS_VERSION))
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let mount_reply = unsafe { ipc::ipc_call(send, &mount_msg, ipc_buf) }.ok()?;
+    if mount_reply.label != 0
+    {
+        std::os::seraph::log!("fatfs FS_MOUNT probe failed (label={})", mount_reply.label);
+        return None;
+    }
+
+    std::os::seraph::log!("fatfs driver started");
+    Some(send)
+}
+
+/// Build the bootstrap order for one fatfs child and the badged creator
+/// endpoint it will REQUEST on. Returns `None` on any derivation or entropy
+/// failure; the caller still owns `partition_ep`, and any child endpoint
+/// derived here is released by revoking `endpoint`.
+fn new_bootstrap_order(
+    caps: &VfsdCaps,
+    endpoint: u32,
+    partition_ep: u32,
+) -> Option<(BootstrapOrder, u32)>
+{
+    let child_endpoint = syscall::cap_derive(endpoint, syscall::RIGHTS_ALL).ok()?;
 
     // Allocate a bootstrap badge — a random `u64` from the kernel entropy pool,
     // redrawn off the reserved `0` value (an unbadged SEND carries badge 0) — and
@@ -80,44 +210,42 @@ pub fn spawn_fatfs_driver(
     let bootstrap = BootstrapOrder {
         badge,
         blk: partition_ep,
-        service: driver_ep_for_child,
+        service: child_endpoint,
     };
+    Some((bootstrap, badged_creator))
+}
 
-    let spawn_ok = if module_cap != 0
+/// Start a process procmgr created, then release vfsd's handle on it.
+///
+/// vfsd never addresses a fatfs process after starting it (the driver is
+/// reached through its service endpoint and torn down by revoking it), so
+/// the handle is deleted on both outcomes. A process that fails to start is
+/// first destroyed (`DESTROY_PROCESS`) so procmgr does not keep it. Returns
+/// whether `START_PROCESS` succeeded.
+pub fn start_and_release(process_handle: u32, ipc_buf: *mut u64) -> bool
+{
+    let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
+    let started = matches!(
+        unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) },
+        Ok(ref r) if r.label == 0
+    );
+    if !started
     {
-        spawn_via_module(caps, pool, bootstrap, module_cap, badged_creator, ipc_buf)
+        let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
+        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_buf) };
     }
-    else
-    {
-        spawn_via_vfs(caps, pool, bootstrap, badged_creator, system_root_cap)
-    };
-
-    if !spawn_ok
-    {
-        return None;
-    }
-
-    // Probe the driver with FS_MOUNT: fatfs validates the FS_LABELS_VERSION
-    // handshake and the BPB in its handler and replies with
-    // fs_errors::SUCCESS or an error label.
-    let mount_msg = IpcMessage::builder(fs_labels::FS_MOUNT)
-        .word(0, u64::from(FS_LABELS_VERSION))
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let mount_reply = unsafe { ipc::ipc_call(driver_send, &mount_msg, ipc_buf) }.ok()?;
-    if mount_reply.label != 0
-    {
-        std::os::seraph::log!("fatfs FS_MOUNT probe failed (label={})", mount_reply.label);
-        return None;
-    }
-
-    std::os::seraph::log!("fatfs driver started");
-    Some(driver_send)
+    let _ = syscall::cap_delete(process_handle);
+    started
 }
 
 /// Boot-module spawn path: register the bootstrap order, then issue
 /// `CREATE_PROCESS` directly from main and `START_PROCESS`. Used for the
 /// root mount only; `/services/fs/fatfs` is not yet reachable when this runs.
+///
+/// Returns `true` once the child holds its bootstrap caps. On `false` no cap
+/// of `bootstrap` and no `badged_creator` is left in vfsd's CSpace.
 fn spawn_via_module(
     caps: &VfsdCaps,
     pool: &WorkerPool,
@@ -130,9 +258,13 @@ fn spawn_via_module(
     let Ok(module_copy) = syscall::cap_derive(module_cap, syscall::RIGHTS_ALL)
     else
     {
+        let _ = syscall::cap_delete(badged_creator);
+        delete_bootstrap_caps(bootstrap.blk, bootstrap.service);
         return false;
     };
 
+    let badge = bootstrap.badge;
+    // A refused order has its caps released by the pool.
     let Some(handle) = pool.submit(WorkOrder::Bootstrap(bootstrap))
     else
     {
@@ -157,32 +289,32 @@ fn spawn_via_module(
     let Ok(create_reply) = (unsafe { ipc::ipc_call(caps.procmgr_ep, &create_msg, ipc_buf) })
     else
     {
+        // A failed call transfers no cap, so both are still vfsd's.
         std::os::seraph::log!("fatfs CREATE_PROCESS ipc_call failed");
+        let _ = syscall::cap_delete(module_copy);
+        let _ = syscall::cap_delete(badged_creator);
+        pool.abandon_bootstrap(badge, handle);
         return false;
     };
     if create_reply.label != 0
     {
         std::os::seraph::log!("fatfs CREATE_PROCESS failed");
+        pool.abandon_bootstrap(badge, handle);
         return false;
     }
 
-    let reply_caps = create_reply.caps();
-    if reply_caps.is_empty()
+    let Some(&process_handle) = create_reply.caps().first()
+    else
     {
         std::os::seraph::log!("fatfs CREATE_PROCESS reply missing caps");
+        pool.abandon_bootstrap(badge, handle);
         return false;
-    }
-    let process_handle = reply_caps[0];
+    };
 
-    let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let start_ok = matches!(
-        unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) },
-        Ok(ref r) if r.label == 0
-    );
-    if !start_ok
+    if !start_and_release(process_handle, ipc_buf)
     {
         std::os::seraph::log!("fatfs START_PROCESS failed");
+        pool.abandon_bootstrap(badge, handle);
         return false;
     }
 
@@ -202,6 +334,9 @@ fn spawn_via_module(
 /// vfsd's own namespace dispatcher, so safe); the worker absorbs the
 /// procmgr round so a re-entry into vfsd's OPEN does not deadlock the
 /// caller's MOUNT reply path.
+///
+/// Returns `true` once the child holds its bootstrap caps. On `false` no cap
+/// of `bootstrap` and no `badged_creator` is left in vfsd's CSpace.
 fn spawn_via_vfs(
     caps: &VfsdCaps,
     pool: &WorkerPool,
@@ -218,10 +353,13 @@ fn spawn_via_vfs(
             {
                 std::os::seraph::log!("fatfs spawn: NS_LOOKUP /services/fs/fatfs failed: {e}");
                 let _ = syscall::cap_delete(badged_creator);
+                delete_bootstrap_caps(bootstrap.blk, bootstrap.service);
                 return false;
             }
         };
 
+    // A refused order has every cap it carries released by the pool, and
+    // the worker releases them on each of its failure returns.
     let Some(handle) = pool.submit(WorkOrder::CreateFromFile(CreateFromFileOrder {
         procmgr_ep: caps.procmgr_ep,
         file_cap,
@@ -231,8 +369,6 @@ fn spawn_via_vfs(
     }))
     else
     {
-        let _ = syscall::cap_delete(file_cap);
-        let _ = syscall::cap_delete(badged_creator);
         return false;
     };
 

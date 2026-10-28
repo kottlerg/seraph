@@ -183,100 +183,115 @@ impl VfsdRootBackend
     /// compute and store each intermediate's `fallthrough_cap` via
     /// [`Self::set_fallthrough_cap`].
     ///
-    /// Returns `None` on tree exhaustion, oversize component
-    /// (`> MAX_ENTRY_NAME`), attempting to mount on top of an
-    /// already-terminal node, or re-installing the root mount.
+    /// Returns `None`, leaving the tree unchanged, on tree exhaustion,
+    /// oversize component (`> MAX_ENTRY_NAME`), attempting to mount on
+    /// top of an already-terminal node, or re-installing the root mount
+    /// (see [`Self::can_install`]).
     pub fn install(&mut self, path: &[u8], cap: u32) -> Option<InstallResult>
     {
-        let stripped = path.strip_prefix(b"/").unwrap_or(path);
-        if stripped.is_empty()
-        {
-            if self.nodes[0].fallthrough_cap != 0
-            {
-                // Root is already mounted; reject rather than overwrite
-                // the cap and leak the running root fs driver.
-                return None;
-            }
-            self.nodes[0].fallthrough_cap = cap;
-            return Some(InstallResult::empty());
-        }
+        // Validate the whole path, and that the pool has a free node for
+        // every component the walk must create, before mutating anything.
+        self.plan_install(path)?;
 
-        // Count components; rejects oversize ones up front so the tree
-        // is never partially mutated on a failure.
-        let mut total = 0usize;
-        for component in stripped.split(|&b| b == b'/')
+        let mut components = path_components(path).peekable();
+        if components.peek().is_none()
         {
-            if component.is_empty()
-            {
-                continue;
-            }
-            if component.len() > MAX_ENTRY_NAME
-            {
-                return None;
-            }
-            total += 1;
-        }
-        if total == 0
-        {
-            // Path was something like `///` — treat as root.
-            if self.nodes[0].fallthrough_cap != 0
-            {
-                return None;
-            }
             self.nodes[0].fallthrough_cap = cap;
             return Some(InstallResult::empty());
         }
 
         let mut result = InstallResult::empty();
         let mut current: u32 = 0;
-        let mut i = 0;
-        for component in stripped.split(|&b| b == b'/')
+        while let Some(component) = components.next()
         {
-            if component.is_empty()
-            {
-                continue;
-            }
-            let is_last = i == total - 1;
-            i += 1;
-
+            let is_last = components.peek().is_none();
             if let Some(child) = self.find_child(current, component)
             {
                 if is_last
                 {
-                    if self.nodes[child as usize].terminal_endpoint != 0
-                    {
-                        // Path is already a mount point.
-                        return None;
-                    }
                     self.nodes[child as usize].terminal_endpoint = cap;
                 }
                 current = child;
+                continue;
             }
-            else
+            // `plan_install` counted a free node for this component.
+            let new_idx = self.alloc_slot()?;
+            let parent_first_child = self.nodes[current as usize].first_child;
+            let n = &mut self.nodes[new_idx as usize];
+            n.active = true;
+            n.parent = current;
+            n.name[..component.len()].copy_from_slice(component);
+            // cast_possible_truncation: `plan_install` bounded the
+            // component to MAX_ENTRY_NAME (64) bytes, which fits a u8.
+            #[allow(clippy::cast_possible_truncation)]
             {
-                let new_idx = self.alloc_slot()?;
-                let parent_first_child = self.nodes[current as usize].first_child;
-                let n = &mut self.nodes[new_idx as usize];
-                n.active = true;
-                n.parent = current;
-                n.name[..component.len()].copy_from_slice(component);
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    n.name_len = component.len() as u8;
-                }
-                n.first_child = NONE;
-                n.next_sibling = parent_first_child;
-                n.terminal_endpoint = if is_last { cap } else { 0 };
-                n.fallthrough_cap = 0;
-                self.nodes[current as usize].first_child = new_idx;
-                if !is_last && !result.push(new_idx)
-                {
-                    return None;
-                }
-                current = new_idx;
+                n.name_len = component.len() as u8;
             }
+            n.first_child = NONE;
+            n.next_sibling = parent_first_child;
+            n.terminal_endpoint = if is_last { cap } else { 0 };
+            n.fallthrough_cap = 0;
+            self.nodes[current as usize].first_child = new_idx;
+            // The pool has MAX_TREE_NODES - 1 allocatable nodes, so the
+            // MAX_TREE_NODES-entry result list cannot overflow.
+            if !is_last && !result.push(new_idx)
+            {
+                return None;
+            }
+            current = new_idx;
         }
         Some(result)
+    }
+
+    /// Whether [`Self::install`] would accept `path` against the current
+    /// tree: the root is not yet mounted (for `/`), no component exceeds
+    /// `MAX_ENTRY_NAME`, the final node is not already a mount point,
+    /// and the pool has a free node for every component that must be
+    /// created. The MOUNT path checks this before it registers a
+    /// partition or spawns a driver, so a mount `install` would reject
+    /// acquires nothing.
+    #[must_use]
+    pub fn can_install(&self, path: &[u8]) -> bool
+    {
+        self.plan_install(path).is_some()
+    }
+
+    /// Read-only walk behind [`Self::install`] and [`Self::can_install`]:
+    /// the number of tree nodes installing `path` would create, or `None`
+    /// when `install` must reject it.
+    fn plan_install(&self, path: &[u8]) -> Option<usize>
+    {
+        let mut components = path_components(path).peekable();
+        if components.peek().is_none()
+        {
+            // Root mount: reject a second one rather than overwrite the
+            // cap and leak the running root fs driver.
+            return (self.nodes[0].fallthrough_cap == 0).then_some(0);
+        }
+
+        // `existing` is the node the walk is at while every component so
+        // far names an existing node; once one does not, the rest are new.
+        let mut existing = Some(0u32);
+        let mut new_nodes = 0usize;
+        for component in components
+        {
+            if component.len() > MAX_ENTRY_NAME
+            {
+                return None;
+            }
+            existing = existing.and_then(|idx| self.find_child(idx, component));
+            if existing.is_none()
+            {
+                new_nodes += 1;
+            }
+        }
+        if let Some(last) = existing
+            && self.nodes[last as usize].terminal_endpoint != 0
+        {
+            // Path is already a mount point.
+            return None;
+        }
+        (new_nodes <= self.free_node_count()).then_some(new_nodes)
     }
 
     /// Set a synthetic intermediate's `fallthrough_cap`. Called by the
@@ -419,6 +434,12 @@ impl VfsdRootBackend
         count
     }
 
+    /// Number of inactive pool nodes `alloc_slot` can still hand out.
+    fn free_node_count(&self) -> usize
+    {
+        self.nodes.iter().skip(1).filter(|n| !n.active).count()
+    }
+
     fn alloc_slot(&self) -> Option<u32>
     {
         // Skip index 0 — that's the synthetic root.
@@ -453,6 +474,13 @@ impl VfsdRootBackend
         }
         None
     }
+}
+
+/// The non-empty `/`-separated components of a mount path; `/`, the empty
+/// path, and all-separator paths such as `///` yield none (the root).
+fn path_components(path: &[u8]) -> impl Iterator<Item = &[u8]>
+{
+    path.split(|&b| b == b'/').filter(|c| !c.is_empty())
 }
 
 impl NamespaceBackend for VfsdRootBackend

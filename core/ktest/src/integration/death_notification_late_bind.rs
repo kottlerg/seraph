@@ -51,7 +51,10 @@ const CORR_PROC_EXIT: u32 = 0x4444;
 const PROC_EXIT_CODE: u32 = 0x0123;
 
 /// Poll bound: ~2 s at 1 ms/poll before declaring a child never reached
-/// `Exited` (a mis-classified fault would otherwise loop forever).
+/// `Exited` (a mis-classified fault would otherwise loop forever), and on the
+/// wait for its death event. Applied through [`crate::scaled_polls`], which
+/// stretches it past [`crate::UNSCALED_CPUS`] CPUs, where the child's CPU
+/// waits for a host core.
 const MAX_POLLS: u32 = 2000;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
@@ -99,7 +102,7 @@ fn late_bind_after_death(
     crate::spawn::configure_and_start(&child, entry, stack_top, 0)
         .map_err(|_| "death_notification_late_bind: configure_and_start failed")?;
 
-    crate::spawn::wait_until_exited(child.th, MAX_POLLS)?;
+    crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS))?;
 
     // Bind a fresh queue onto the already-dead thread; the kernel delivers the
     // retained reason synchronously inside the bind syscall.
@@ -144,7 +147,7 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, clean_exit_child, stack_top, 0)
         .map_err(|_| "death_notification_late_bind: configure_and_start (control) failed")?;
 
-    crate::spawn::wait_until_exited(child.th, MAX_POLLS)?;
+    crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS))?;
 
     // The death walk posts asynchronously on the child's CPU; poll for it.
     let payload = poll_event(eq)?;
@@ -167,6 +170,7 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
 /// Bounded poll for a death event the child posts asynchronously on its own CPU.
 fn poll_event(eq: u32) -> Result<u64, &'static str>
 {
+    let bound = crate::scaled_polls(MAX_POLLS);
     let mut polls = 0;
     loop
     {
@@ -175,7 +179,7 @@ fn poll_event(eq: u32) -> Result<u64, &'static str>
             return Ok(payload);
         }
         polls += 1;
-        if polls >= MAX_POLLS
+        if polls >= bound
         {
             return Err("death_notification_late_bind: death event never arrived");
         }

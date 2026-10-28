@@ -204,16 +204,28 @@ step a scaled count's placements across the whole CPU range (`stress::rotation_s
 count is not silent.
 
 For the same reason, the wall-clock bounds and budgets listed here, each of whose expiry fails a
-test, apply through `scaled_bound` (`src/main.rs`): as written up to 16 CPUs, so the tight budgets
-the CI widths check are unchanged, and multiplied past it by the oversubscription factor the width
-implies (CPUs / 16), by which each cross-CPU handoff slows, so the bound still separates a slow
-step from a stuck or wrong one. They are the report bound of `tally::await_report` and
-`tally::await_all`; the round bounds of `configure_start_race` and `stop_target_vanishes`; the
-acknowledgement, result, approach, sync and entry bounds of `stop_claimed_delete`,
-`stop_park_race`, `stop_fault_sender` and `timed_wait_reuse`; the preemption budget of
-`integration::priority_preemption`; the expiry and report bounds of
-`integration::queued_waiters_fifo`; and the migration polls of `thread::affinity_migrate_running`.
-Every other bound applies as written.
+test, apply through `scaled_bound` (`src/main.rs`), or through `scaled_polls` for a `u32` count of
+1 ms polls: as written up to 16 CPUs, so the tight budgets the CI widths check are unchanged, and
+multiplied past it by the oversubscription factor the width implies (CPUs / 16), by which each
+cross-CPU handoff slows, so the bound still separates a slow step from a stuck or wrong one. They
+are the report bound of `tally::await_report` and `tally::await_all`; the round bounds of
+`configure_start_race` and `stop_target_vanishes`; the acknowledgement, result, approach, sync and
+entry bounds of `stop_claimed_delete`, `stop_park_race`, `stop_fault_sender` and
+`timed_wait_reuse`; the preemption budget of `integration::priority_preemption`; the expiry and
+report bounds of `integration::queued_waiters_fifo`; the observation window and finish wait of
+`integration::irq_preserves_user_regs`; the child waits of `integration::stop_read_regs_remote`;
+the report bounds of `integration::cross_cspace_revoke_no_alias`,
+`integration::reply_binding_displaced`, `integration::destroyed_source_interrupts` and
+`wait_set::occupied_wait_refused`; the post waits of `event::recv_timeout_payload_zero_wins` and
+`event::recv_timeout_payload_nonzero_wins`; the exit, event and memory polls of
+`integration::fault_kills_thread`, `integration::fault_exception_no_handler_kills`,
+`integration::fault_handler_declines_kills`, `integration::aspace_fault_notification_late_bind`,
+`integration::death_notification_late_bind`, `integration::reply_binding_displaced`,
+`integration::syscall_rflags_hardening`, `cap::cspace_self_delete_stops_caller` and
+`retype::aspace_self_delete_stops_caller`; the phase polls of `integration::tlb_widen_retry`; the
+migration polls of `thread::affinity_migrate_running`, the report wait of
+`thread::affinity_migrate_ready_queued`, and the convergence polls of
+`thread::load_balancer_redistributes_skewed`. Every other bound applies as written.
 
 A controller waits for a child to reach a state by a notification bit the child sends on reaching
 it. For a state inside a blocking call (`ipc_call`, `ipc_recv`, a notification wait) or at an exit,
@@ -308,9 +320,10 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   `IoPort` caps carved by `ioport::bind_port_range` on `x86_64`).
 - `PASS_COUNT` / `FAIL_COUNT` — atomic counters updated by `run_test!`.
 - `log(msg)` / `log_u64(prefix, value)` — heap-free logging utilities.
-- `UNSCALED_CPUS` / `scaled_bound(base)` — the widest CPU count at which
-  ktest's attempt counts and wall-clock budgets apply as written, and a
-  failing bound stretched past it by the width's oversubscription factor
+- `UNSCALED_CPUS` / `scaled_bound(base)` / `scaled_polls(base)` — the
+  widest CPU count at which ktest's attempt counts and wall-clock budgets
+  apply as written, and a failing bound (a `u32` poll count, for
+  `scaled_polls`) stretched past it by the width's oversubscription factor
   (see [Tier S](#tier-s--srcstress)).
 - `spawn::new_child(ctx)` / `spawn::new_child_at(ctx, sched_cap, priority)` /
   `configure_and_start(child, …)` / `configure_and_start_pinned(child, …)` —

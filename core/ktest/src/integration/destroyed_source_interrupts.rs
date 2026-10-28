@@ -55,7 +55,9 @@ const PARK_FOREVER_MS: u64 = 600_000;
 /// park before the source is destroyed (see `park_interrupted_stop_start`).
 const SETTLE_SLEEP_MS: u64 = 20;
 
-/// Bound on each controller wait for a child's report.
+/// Bound on each controller wait for a child's report. Applied through
+/// [`crate::scaled_bound`], which stretches it past [`crate::UNSCALED_CPUS`]
+/// CPUs, where a child's CPU waits for a host core.
 const REPORT_MS: u64 = 1000;
 
 static mut CHILD_STACKS: [ChildStack; MAX_CHILDREN] = [ChildStack::ZERO; MAX_CHILDREN];
@@ -292,7 +294,7 @@ fn wait_for(done: u32, mut acc: u64, mask: u64) -> Result<u64, &'static str>
 {
     while acc & mask == 0
     {
-        let bits = notification_wait_timeout(done, REPORT_MS).map_err(
+        let bits = notification_wait_timeout(done, crate::scaled_bound(REPORT_MS)).map_err(
             |_| "integration::destroyed_source_interrupts: notification_wait_timeout failed",
         )?;
         if bits == 0

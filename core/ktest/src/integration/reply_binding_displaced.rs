@@ -63,12 +63,16 @@ const BIT_C_BAD: u64 = 1 << 8;
 /// Settle after a caller's READY so its call is, in practice, queued before
 /// the controller receives; the result does not depend on it, since the
 /// receive releases the bound caller at entry, whichever order the two take,
-/// and the label check names the caller the receive got. Bound on each
-/// report.
+/// and the label check names the caller the receive got.
 const SETTLE_SLEEP_MS: u64 = 20;
+
+/// Bound on each report. Applied through [`crate::scaled_bound`], which
+/// stretches it past [`crate::UNSCALED_CPUS`] CPUs, where a child's CPU waits
+/// for a host core.
 const REPORT_MS: u64 = 1000;
 
 /// Bound on the wait for the released faulter to exit, in 1 ms polls.
+/// Applied through [`crate::scaled_polls`], which stretches it the same way.
 const EXIT_POLLS: u32 = 2000;
 
 /// Unmapped user VA the faulter stores to; canonical in every paging mode
@@ -295,7 +299,7 @@ fn displace_fault(ctx: &TestContext, parts: &mut Parts, objects: &Objects, acc: 
     }
 
     let acc = call_and_receive(ctx, parts, objects, &CALLER_C, acc)?;
-    let reason = spawn::wait_until_exited(fault_th, EXIT_POLLS)
+    let reason = spawn::wait_until_exited(fault_th, crate::scaled_polls(EXIT_POLLS))
         .map_err(|_| "integration::reply_binding_displaced: the released faulter never exited")?;
     if reason != EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR
     {
@@ -399,7 +403,7 @@ fn wait_for(done: u32, mut acc: u64, mask: u64) -> Result<u64, &'static str>
 {
     while acc & mask == 0
     {
-        let bits = notification_wait_timeout(done, REPORT_MS)
+        let bits = notification_wait_timeout(done, crate::scaled_bound(REPORT_MS))
             .map_err(|_| "integration::reply_binding_displaced: wait on done failed")?;
         if bits == 0
         {

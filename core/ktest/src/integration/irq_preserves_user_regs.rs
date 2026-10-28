@@ -37,8 +37,16 @@ const CHUNK_ITERS: u64 = 200_000;
 /// host-speed-dependent iteration count) guarantees the spin spans many timer
 /// periods, so the two same-CPU spinners are repeatedly preempted and interleaved
 /// — otherwise a fast host could run the whole spin inside one quantum and never
-/// exercise the IRQ frame path.
+/// exercise the IRQ frame path. Applied through [`crate::scaled_bound`], which
+/// stretches it past [`crate::UNSCALED_CPUS`] CPUs, where CPU 0's vCPU waits
+/// for a host core and the window could otherwise elapse before the spinners
+/// interleave.
 const TIME_BUDGET_US: u64 = 100_000; // 100 ms
+
+/// Bound on the parent's wait for both spinners to finish, in milliseconds.
+/// Applied through [`crate::scaled_bound`], like [`TIME_BUDGET_US`], which it
+/// must outlast.
+const DONE_WAIT_MS: u64 = 30_000;
 
 /// Backstop chunk cap so the loop terminates even if `ElapsedUs` never advances.
 const MAX_CHUNKS: u64 = 5_000;
@@ -154,6 +162,7 @@ extern "C" fn spinner_entry(id: u64) -> !
     let other = idx ^ 1;
     // PATTERN is a read-only static; the index is 0 or 1.
     let pat_ptr = core::ptr::addr_of!(PATTERN[idx]);
+    let budget_us = crate::scaled_bound(TIME_BUDGET_US);
     let start_us = system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(0);
     let mut c: u64 = 0;
     while c < MAX_CHUNKS
@@ -173,7 +182,7 @@ extern "C" fn spinner_entry(id: u64) -> !
             PREEMPT_OBSERVED.store(1, Ordering::Release);
         }
         let now = system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(u64::MAX);
-        if now.saturating_sub(start_us) >= TIME_BUDGET_US
+        if now.saturating_sub(start_us) >= budget_us
         {
             break;
         }
@@ -207,8 +216,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Sleep-poll for both spinners to finish. Sleeping yields CPU 0 so the
     // spinners run; the bound avoids hanging the suite if a spinner wedges.
+    let done_wait_ms = crate::scaled_bound(DONE_WAIT_MS);
     let mut waited_ms = 0u64;
-    while DONE.load(Ordering::Acquire) < 2 && waited_ms < 30_000
+    while DONE.load(Ordering::Acquire) < 2 && waited_ms < done_wait_ms
     {
         let _ = thread_sleep(10); // 10 ms
         waited_ms += 10;

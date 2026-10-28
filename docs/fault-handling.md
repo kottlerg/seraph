@@ -47,8 +47,9 @@ no handler bound is still terminated, the behavior for all faults absent this me
 x86-64 kernel check is terminal even with a handler bound: a syscall return RIP that is not
 canonical, which no user action can produce (the top user page is unmappable) and which the
 exit path kills as a user `#GP` without delivery, since no handler edit could make that return
-valid ([syscalls.md § Syscall Entry and Exit](../core/kernel/docs/syscalls.md#syscall-entry-and-exit)). The
-x86-64 abort vectors (`#DF`, `#MC`) and a hardware NMI that finds no watchdog backtrace request
+valid (see
+[syscalls.md § Syscall Entry and Exit](../core/kernel/docs/syscalls.md#syscall-entry-and-exit)).
+The x86-64 abort vectors (`#DF`, `#MC`) and a hardware NMI that finds no watchdog backtrace request
 pending (see
 [scheduling-internals.md § `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`](../core/kernel/docs/scheduling-internals.md#ipi_nmi_backtrace_stub--ipi_nmi_backtrace_handler))
 are the exception: they are never delivered to a handler and never terminate a thread; they halt

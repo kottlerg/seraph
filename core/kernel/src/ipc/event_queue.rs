@@ -77,8 +77,8 @@ unsafe impl Sync for EventQueueState {}
 // a change to either side alone fails to compile.
 const _: () = {
     assert!(
-        core::mem::size_of::<EventQueueState>()
-            == crate::cap::retype::EVENT_QUEUE_STATE_BYTES as usize
+        core::mem::size_of::<EventQueueState>() as u64
+            == crate::cap::retype::EVENT_QUEUE_STATE_BYTES
     );
 };
 

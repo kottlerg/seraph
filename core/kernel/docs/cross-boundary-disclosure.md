@@ -98,10 +98,11 @@ Notes on the non-obvious entries:
   supervisor-only in every user address space, so for a kernel-half `CR2` the bit would
   let a process bound as its own fault handler probe whether a kernel VA is mapped, and
   it is reported clear there. RISC-V never sets the bit. No other word carries a kernel
-  VA or a value derived from one. The forwarded/readable `TrapFrame` holds only user-mode register state (no kernel
-  stack pointer, kernel return address, or `CR3`/`satp`); the write path re-validates
-  through `sanitize_for_user_resume`. `sys_thread_read_regs` does not pin the TCB it
-  resolves through `lookup_cap`, so a sibling's concurrent delete or revoke of the last
+  VA or a value derived from one. The forwarded/readable `TrapFrame` holds only user-mode
+  register state (no kernel stack pointer, kernel return address, or `CR3`/`satp`); the
+  write path re-validates through `sanitize_for_user_resume`. `sys_thread_read_regs` does
+  not pin the TCB it resolves through `lookup_cap`, so a sibling's concurrent delete or
+  revoke of the last
   Thread capability can free the thread slab before or while `sched::with_held_frame`
   takes its `sched_lock`, reads its state, and snapshots its trap frame into a kernel
   stack buffer, and freed or reused kernel memory lands in the snapshot that

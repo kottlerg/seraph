@@ -80,12 +80,8 @@ const SOURCE_WRAPPER_BYTES: usize = 24;
 // the subtraction inside the wrapper. Anchor the constant to all three wrappers.
 const _: () = {
     assert!(SOURCE_WRAPPER_BYTES == core::mem::size_of::<crate::cap::object::EndpointObject>());
-    assert!(
-        SOURCE_WRAPPER_BYTES == core::mem::size_of::<crate::cap::object::NotificationObject>()
-    );
-    assert!(
-        SOURCE_WRAPPER_BYTES == core::mem::size_of::<crate::cap::object::EventQueueObject>()
-    );
+    assert!(SOURCE_WRAPPER_BYTES == core::mem::size_of::<crate::cap::object::NotificationObject>());
+    assert!(SOURCE_WRAPPER_BYTES == core::mem::size_of::<crate::cap::object::EventQueueObject>());
 };
 
 /// Derive the `KernelObjectHeader` pointer from a registered source state

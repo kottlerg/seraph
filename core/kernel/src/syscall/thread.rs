@@ -1641,8 +1641,7 @@ unsafe fn set_affinity_locked(
     // enqueue_and_wake, enqueue_ready_thread, schedule(), and the relocate /
     // migrate paths). A value >= CPU_COUNT indicates a corrupted TCB, which we
     // ignore here.
-    let cpu_count =
-        crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     if old_cpu >= cpu_count
     {
         return None;

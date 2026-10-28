@@ -147,7 +147,7 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // The root Interrupt cap spans the controller's whole id space
     // (`ROOT_IRQ_COUNT`), which on riscv64 exceeds both the sources the kernel
     // programs and the routing table; refuse an id the kernel cannot route.
-    if irq_id < crate::arch::current::MIN_IRQ_ID || irq_id > crate::arch::current::MAX_IRQ_ID
+    if !(crate::arch::current::MIN_IRQ_ID..=crate::arch::current::MAX_IRQ_ID).contains(&irq_id)
     {
         return Err(SyscallError::InvalidArgument);
     }

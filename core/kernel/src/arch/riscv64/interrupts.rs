@@ -78,7 +78,7 @@ const fn plic_enable_base_for(hart: u32) -> u64
 }
 
 /// PLIC S-mode threshold register offset for the hart with hardware id `hart`:
-/// 0x20_0000 + context * 0x1000. The claim/complete register follows at +4.
+/// `0x20_0000 + context * 0x1000`. The claim/complete register follows at +4.
 const fn plic_threshold_offset_for(hart: u32) -> u64
 {
     0x0020_0000 + plic_s_context(hart) * 0x1000

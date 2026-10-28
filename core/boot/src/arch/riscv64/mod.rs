@@ -186,12 +186,14 @@ pub unsafe fn allocate_ap_trampoline(bs: *mut EfiBootServices) -> Option<u64>
 /// PCI windows, plus the ns16550a UART register page at `0x1000_0000` and
 /// the Goldfish RTC register page at `0x101000`.
 ///
-/// Seeded unconditionally because EDK2 on the seraph boot path neither
-/// re-publishes the DTB via a UEFI configuration table nor emits ACPI
-/// entries for these regions, so neither
+/// Appended by [`crate::acpi::parse_aperture_seed`] whenever the RSDP and
+/// XSDT validate, MCFG present or absent, because EDK2 on the seraph boot
+/// path neither re-publishes the DTB via a UEFI configuration table nor
+/// emits ACPI entries for these regions, so neither
 /// [`crate::dtb::parse_aperture_seed`] nor MCFG / `_HID` walks can
-/// discover them at runtime. Merged with anything firmware does happen
-/// to publish in [`crate::memory_map::derive_mmio_apertures`].
+/// discover them at runtime (`core/boot/docs/acpi.md` § Tables Consumed).
+/// Merged with anything firmware does happen to publish in
+/// [`crate::memory_map::derive_mmio_apertures`].
 ///
 /// The UART and Goldfish RTC entries each cover one 4 KiB page so devmgr
 /// can carve an `Mmio` for the platform driver (see

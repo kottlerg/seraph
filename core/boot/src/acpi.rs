@@ -849,19 +849,16 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
         }
     }
 
-    // Per-arch platform-default PCI apertures.
-    //
-    // Some firmware builds publish ACPI without an MCFG table (e.g. the
-    // EDK2 shipped with Ubuntu's `qemu-efi-riscv64` package, observed on
-    // CI). When MCFG is absent the loop above produces no PCI apertures,
-    // but devmgr still needs a frame covering ECAM. Append the
-    // arch-defined defaults whenever the RSDP and XSDT validate (the early
-    // returns above skip them when ACPI is absent or malformed); any
-    // overlap with MCFG-derived entries is collapsed by
-    // `derive_mmio_apertures`'s merge pass. Like the MCFG heuristic
-    // windows, the defaults are not bounded by the memory map: the riscv64
-    // 64-bit window `[16 GiB, 32 GiB)` covers RAM on a virt guest with
-    // more than about 14 GiB (defect, #499).
+    // Per-arch platform-default MMIO apertures, appended whenever the RSDP
+    // and XSDT validate (the early returns above skip them when ACPI is
+    // absent or malformed). Some firmware builds publish ACPI without an
+    // MCFG table (e.g. the EDK2 shipped with Ubuntu's `qemu-efi-riscv64`
+    // package, observed on CI), so the loop above yields no ECAM frame for
+    // devmgr; on QEMU virt the defaults also cover the ns16550a UART and
+    // Goldfish RTC register pages, which no table this walker reads names.
+    // What the defaults cover, how `derive_mmio_apertures` collapses their
+    // overlap with MCFG seeds, and their unbounded-by-memory-map defect
+    // (#499) are in core/boot/docs/acpi.md § Tables Consumed.
     for &(base, size) in crate::arch::current::default_pci_apertures()
     {
         push!(base, size);

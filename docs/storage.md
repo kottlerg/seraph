@@ -34,10 +34,10 @@ Four system-scope invariants govern the stack:
   block driver serves only badged callers: vfsd holds a
   `MOUNT_AUTHORITY`-badged whole-disk cap minted by devmgr, and fs
   drivers hold partition-identity-badged caps the block driver mints
-  on `REGISTER_PARTITION`; unbadged callers are rejected. vfsd as the
-  sole holder of the whole-disk cap is design intent; not yet
-  implemented: devmgr mints it on `QUERY_BLOCK_DEVICE` for any caller
-  whose registry cap carries `REGISTRY_QUERY_AUTHORITY` (#446).
+  on `REGISTER_PARTITION`; unbadged callers are rejected. vfsd is the
+  sole holder of the whole-disk cap: devmgr mints it on
+  `QUERY_BLOCK_DEVICE` only for a caller whose registry cap carries
+  `BLOCK_DEVICE_AUTHORITY`, which init sets on vfsd's alone.
   Out-of-bounds LBAs are rejected by the block driver on every
   request. See
   [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
@@ -84,10 +84,10 @@ Distribution". Badge semantics, derivation, and revocation are owned by
 
 `REGISTER_PARTITION` is rejected unless the caller's badge carries
 `MOUNT_AUTHORITY`: only the holder of the devmgr-minted whole-disk cap
-can mint a partition binding. That vfsd is the only such holder is
-design intent; not yet implemented: devmgr mints the whole-disk cap on
-`QUERY_BLOCK_DEVICE` for any caller whose registry cap carries
-`REGISTRY_QUERY_AUTHORITY`, including vfsd's (#446). The block driver
+can mint a partition binding. vfsd is the only such holder: devmgr
+mints the whole-disk cap on `QUERY_BLOCK_DEVICE` only for a caller
+whose registry cap carries `BLOCK_DEVICE_AUTHORITY`, which init sets on
+vfsd's registry cap alone. The block driver
 enforces the LBA bound on every read and write against the caller's
 badge. See
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
@@ -197,7 +197,7 @@ The contract between fs drivers and the block driver has three
 elements:
 
 - **Two-tier endpoint.** Whole-disk `MOUNT_AUTHORITY`-badged (vfsd
-  only: design intent; not yet implemented, #446) versus
+  only) versus
   per-partition badged (fs drivers); unbadged callers
   are rejected. The block driver distinguishes by the
   kernel-supplied caller badge.

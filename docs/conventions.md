@@ -339,7 +339,12 @@ gives the PR-level linear view.
   it MUST say so (see [testing.md](testing.md#coverage-tiers)).
 - Every PR body MUST report, in its `## Validation` section, each local host
   run [testing.md](testing.md#coverage-tiers) § Coverage tiers owes, with its
-  `--runs` count and the head it ran at, or state that none is owed and why.
+  `--runs` count, its outcome, and the head it ran at (a run the PR does not
+  owe that HANGs or fails as that section allows, with the link to its
+  record), or state that none is owed and why (that the PR's changes outside
+  Markdown are all inert, or that its non-inert lines change neither surface
+  that section names and it states no concurrency-fix purpose as that section
+  defines it).
 
 ## CI Gating
 
@@ -360,7 +365,10 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
 3. Land both changes on `master` through the normal PR workflow. The tag MUST
    point at a commit that contains them.
 4. Run the release host runs ([testing.md](testing.md#coverage-tiers)
-   § Coverage tiers) on that commit. When they pass, tag it and push the tag:
+   § Coverage tiers) on that commit: the riscv64 64- and 65-hart and the
+   x86_64 256-vCPU boundaries three times each, the riscv64 128-hart and the
+   x86_64 512-vCPU boundaries once each, and the memory variation once. When
+   they pass, tag it and push the tag:
    `git tag v<X>.<Y>.<Z> && git push origin v<X>.<Y>.<Z>`.
 5. The tag push triggers `release.yml` and `burnin.yml`. The `preflight` job in
    `release.yml` aborts the run before any image is built if the workspace

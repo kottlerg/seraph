@@ -164,10 +164,12 @@ truth for "how work is tracked and shipped" on this project.
   2. `cargo xtask run` (a pure runner; it does not build) MUST then boot
      ktest or userspace services under QEMU and the chosen mode's
      terminal pass marker MUST appear.
-- Changes matching the trigger paths in
-  [docs/testing.md](../docs/testing.md) "Coverage tiers" MUST additionally
-  run the local host runs defined there, at the heads and repeat counts that
-  section sets.
+- A change whose own diff makes a non-inert change to the CPU-count or
+  memory surface [docs/testing.md](../docs/testing.md) "Coverage tiers"
+  names, or whose PR states a concurrency-fix purpose as that section's
+  Repeat count defines it, MUST additionally run the local host runs that section owes
+  for it, at the heads and repeat counts it sets; any other change owes
+  none, whatever directory it touches.
 - Host-side compilation, unit tests, and `cargo check` alone do not
   satisfy this requirement.
 - A documentation-only or comment-only change, as

@@ -368,7 +368,19 @@ pub fn free_cluster_chain(
     let mut freed = 0u32;
     loop
     {
-        let next = chain_next(state, cluster, cache, block_dev, ipc_buf);
+        // Read the link before freeing: a cluster whose own entry is the
+        // bad-cluster marker, or names a cluster outside the data region,
+        // is left as it is, and a cycle stops at the first cluster it
+        // already freed (its entry now reads FREE).
+        let next = match chain_next(state, cluster, cache, block_dev, ipc_buf)
+        {
+            Ok(next) => next,
+            Err(e) =>
+            {
+                flush_fsinfo(state, cache, block_dev, ipc_buf);
+                return Err(e);
+            }
+        };
         update_fat_entry(state, cluster, FREE, cache, block_dev, ipc_buf)?;
         freed += 1;
         if state.free_count_hint != u32::MAX
@@ -383,13 +395,8 @@ pub fn free_cluster_chain(
         }
         match next
         {
-            Ok(Some(n)) => cluster = n,
-            Ok(None) => break,
-            Err(e) =>
-            {
-                flush_fsinfo(state, cache, block_dev, ipc_buf);
-                return Err(e);
-            }
+            Some(n) => cluster = n,
+            None => break,
         }
     }
     // Mirror allocate_cluster: persist the updated free-count and

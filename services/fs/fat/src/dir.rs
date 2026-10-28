@@ -32,6 +32,8 @@ pub use fat_parse::{
 };
 use fat_parse::{FreeRunScan, RemoveRunScan, RemoveStep};
 
+// ── Chain walking ─────────────────────────────────────────────────────────
+
 /// Step a directory walk from `cluster` to the next cluster of its chain.
 ///
 /// `steps` counts the clusters the walk has left. A chain longer than the
@@ -59,12 +61,13 @@ fn next_dir_cluster(
     }
     chain_next(state, cluster, cache, block_dev, ipc_buf)
 }
+
 // ── Directory search ──────────────────────────────────────────────────────
 
 /// Search a directory's cluster chain for an entry matching `name`.
 ///
 /// Walks the cluster chain (or, for `dir_cluster == 0`, the FAT16
-/// fixed root) and matches against both LFN and 8.3 forms via
+/// fixed root or the FAT32 root chain) and matches against both LFN and 8.3 forms via
 /// [`scan_sector_for_name`]. Returns `Ok(None)` only when the whole
 /// directory was read and holds no such entry, so [`insert_entry`] can
 /// rely on it as an existence check.
@@ -85,12 +88,20 @@ pub fn find_in_directory(
     let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
     let mut lfn = LfnAccum::new();
 
-    if dir_cluster == 0
+    if dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
         return find_in_fat16_root(name, state, cache, block_dev, ipc_buf);
     }
 
-    let mut cluster = dir_cluster;
+    // On FAT32 the root is an ordinary cluster chain; 0 names it.
+    let mut cluster = if dir_cluster == 0
+    {
+        state.root_cluster
+    }
+    else
+    {
+        dir_cluster
+    };
     let mut steps = 0;
     loop
     {
@@ -155,9 +166,12 @@ fn find_in_fat16_root(
     Ok(None)
 }
 
-/// As [`find_in_directory`] but also returns the on-disk location of
+/// Like [`find_in_directory`], but also returns the on-disk location of
 /// the matching 8.3 entry, used by callers that intend to patch the
-/// entry's metadata fields (`size`, `first_cluster`) later.
+/// entry's metadata fields (`size`, `first_cluster`) later. `None`
+/// covers a failed directory or FAT read and a corrupt or cyclic chain
+/// as well as an absent name, so its callers reply `NOT_FOUND` in each
+/// case.
 pub fn find_in_directory_with_location(
     dir_cluster: u32,
     name: &[u8],
@@ -171,7 +185,7 @@ pub fn find_in_directory_with_location(
     let mut lfn = LfnAccum::new();
     let entries_per_sector = SECTOR_SIZE / 32;
 
-    if dir_cluster == 0
+    if dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
@@ -198,7 +212,15 @@ pub fn find_in_directory_with_location(
         return None;
     }
 
-    let mut cluster = dir_cluster;
+    // On FAT32 the root is an ordinary cluster chain; 0 names it.
+    let mut cluster = if dir_cluster == 0
+    {
+        state.root_cluster
+    }
+    else
+    {
+        dir_cluster
+    };
     let mut steps = 0;
     loop
     {
@@ -347,7 +369,7 @@ pub fn read_dir_entry_at_index(
     let entries_per_sector = SECTOR_SIZE / 32;
     let mut current_idx: u64 = 0;
 
-    if dir_cluster == 0
+    if dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
@@ -400,7 +422,15 @@ pub fn read_dir_entry_at_index(
         return None;
     }
 
-    let mut cluster = dir_cluster;
+    // On FAT32 the root is an ordinary cluster chain; 0 names it.
+    let mut cluster = if dir_cluster == 0
+    {
+        state.root_cluster
+    }
+    else
+    {
+        dir_cluster
+    };
     let mut steps = 0;
     loop
     {
@@ -545,11 +575,12 @@ pub struct RemovedEntry
 /// # Errors
 /// [`FatError::Exists`] when the directory already holds an entry of that
 /// name; [`FatError::Corrupt`] for an empty name or one longer than
-/// [`MAX_LFN_CHARS`], or when the directory's chain or the FAT is corrupt
-/// (a link outside the data region, a bad-cluster marker, or a cycle); [`FatError::NoSpace`] when
-/// no short-name alias or no free slot run is left (see
-/// `find_free_slot_run`); [`FatError::Io`] when a directory or FAT sector
-/// read or write fails, possibly after some LFN slots were written.
+/// [`MAX_LFN_CHARS`], or when the directory's chain or the FAT is
+/// corrupt (a link outside the data region, a bad-cluster marker, or a
+/// cycle); [`FatError::NoSpace`] when no short-name alias or no free
+/// slot run is left (see `find_free_slot_run`); [`FatError::Io`] when a
+/// directory or FAT sector read or write fails, possibly after some LFN
+/// slots were written.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_entry(
     state: &mut FatState,

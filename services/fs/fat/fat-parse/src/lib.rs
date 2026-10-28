@@ -45,11 +45,12 @@ pub enum BpbError
     /// volume with larger sectors (4Kn media) is refused rather than read
     /// with mismatched offsets.
     UnsupportedSectorSize,
-    /// The geometry is inconsistent: the data region's start overflows a
-    /// 32-bit sector number, or the volume has more clusters than its FAT
-    /// has entries for (or than FAT32's largest cluster number allows), so
-    /// a cluster in the data region would have no FAT entry, or one past
-    /// the FAT.
+    /// The geometry is inconsistent: the volume has no FAT copy or no
+    /// reserved sector (the FAT would overlay the boot sector), the data
+    /// region's start overflows a 32-bit sector number, or the volume has
+    /// more clusters than its FAT has entries for (or than FAT32's largest
+    /// cluster number allows), so a cluster in the data region would have
+    /// no FAT entry, or one past the FAT.
     BadGeometry,
 }
 
@@ -87,8 +88,9 @@ pub struct BpbGeometry
 /// [`BpbError::ZeroDivisor`] when `bytes_per_sector` or
 /// `sectors_per_cluster` is zero, [`BpbError::UnsupportedSectorSize`]
 /// when `bytes_per_sector` is non-zero but not [`SECTOR_SIZE`], or
-/// [`BpbError::BadGeometry`] when the data region's start overflows or the
-/// FAT cannot hold an entry for every cluster.
+/// [`BpbError::BadGeometry`] when `num_fats` or `reserved_sectors` is zero,
+/// the data region's start overflows, or the FAT cannot hold an entry for
+/// every cluster.
 pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry, BpbError>
 {
     // Validate boot signature.
@@ -111,6 +113,12 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
     if usize::from(bytes_per_sector) != SECTOR_SIZE
     {
         return Err(BpbError::UnsupportedSectorSize);
+    }
+    // The FAT starts after the reserved sectors, the boot sector among
+    // them, and every FAT write goes to each of the num_fats copies.
+    if num_fats == 0 || reserved_sectors == 0
+    {
+        return Err(BpbError::BadGeometry);
     }
 
     let total_sectors_16 = u16::from_le_bytes([sector_data[19], sector_data[20]]);
@@ -1126,13 +1134,66 @@ mod tests
     }
 
     #[test]
-    fn parse_bpb_geometry_rejects_more_clusters_than_the_fat_holds()
+    fn parse_bpb_geometry_accepts_exactly_the_clusters_a_fat32_table_holds()
     {
-        // 300000 sectors of one cluster each, but a 100-sector FAT32 table
-        // holds only 12800 entries.
-        let short_fat = bpb_sector(512, 1, 32, 2, 0, 0, 0, 300_000, 100, 2, 0);
+        // A 600-sector FAT32 table holds 76800 entries: clusters 2..76800.
+        // data_start = 32 + 2*600 = 1232, one sector per cluster.
+        let full = bpb_sector(512, 1, 32, 2, 0, 0, 0, 1232 + 76_798, 600, 2, 0);
+        let g = parse_bpb_geometry(&full)
+            .ok()
+            .expect("FAT holds every cluster");
+        assert_eq!(g.total_clusters, 76_798);
+        let over = bpb_sector(512, 1, 32, 2, 0, 0, 0, 1232 + 76_799, 600, 2, 0);
         assert!(matches!(
-            parse_bpb_geometry(&short_fat),
+            parse_bpb_geometry(&over),
+            Err(BpbError::BadGeometry)
+        ));
+    }
+
+    #[test]
+    fn parse_bpb_geometry_accepts_exactly_the_clusters_a_fat16_table_holds()
+    {
+        // A 20-sector FAT16 table holds 5120 entries: clusters 2..5120.
+        // data_start = 1 + 2*20 + 32 (512 root entries) = 73.
+        let full = bpb_sector(512, 1, 1, 2, 512, 73 + 5118, 20, 0, 0, 0, 0);
+        let g = parse_bpb_geometry(&full)
+            .ok()
+            .expect("FAT holds every cluster");
+        assert!(matches!(g.fat_type, FatType::Fat16));
+        assert_eq!(g.total_clusters, 5118);
+        let over = bpb_sector(512, 1, 1, 2, 512, 73 + 5119, 20, 0, 0, 0, 0);
+        assert!(matches!(
+            parse_bpb_geometry(&over),
+            Err(BpbError::BadGeometry)
+        ));
+    }
+
+    #[test]
+    fn parse_bpb_geometry_bounds_fat32_clusters_below_the_bad_cluster_marker()
+    {
+        // A FAT large enough for any count; data_start = 32 + 2*2097152.
+        let fat = 2_097_152;
+        let start = 32 + 2 * fat;
+        let last = bpb_sector(512, 1, 32, 2, 0, 0, 0, start + 0x0FFF_FFF5, fat, 2, 0);
+        assert!(parse_bpb_geometry(&last).is_ok());
+        let marker = bpb_sector(512, 1, 32, 2, 0, 0, 0, start + 0x0FFF_FFF6, fat, 2, 0);
+        assert!(matches!(
+            parse_bpb_geometry(&marker),
+            Err(BpbError::BadGeometry)
+        ));
+    }
+
+    #[test]
+    fn parse_bpb_geometry_rejects_zero_fats_or_reserved_sectors()
+    {
+        let no_fats = bpb_sector(512, 4, 1, 0, 512, 8192, 20, 0, 0, 0, 0);
+        assert!(matches!(
+            parse_bpb_geometry(&no_fats),
+            Err(BpbError::BadGeometry)
+        ));
+        let no_reserved = bpb_sector(512, 4, 0, 2, 512, 8192, 20, 0, 0, 0, 0);
+        assert!(matches!(
+            parse_bpb_geometry(&no_reserved),
             Err(BpbError::BadGeometry)
         ));
     }

@@ -164,7 +164,9 @@ impl Condvar {
     pub fn notify_one(&self) {
         self.with_queue(|queue| {
             if let Some(node) = queue.pop_front() {
-                wake(node);
+                // SAFETY: `pop_front` just unlinked `node` under `queue_lock`
+                // and returns only a node whose `notified` is unset.
+                unsafe { wake(node) };
             }
         });
     }
@@ -172,7 +174,8 @@ impl Condvar {
     pub fn notify_all(&self) {
         self.with_queue(|queue| {
             while let Some(node) = queue.pop_front() {
-                wake(node);
+                // SAFETY: as in `notify_one`.
+                unsafe { wake(node) };
             }
         });
     }
@@ -237,12 +240,16 @@ impl Condvar {
     }
 }
 
-/// Wake the waiter of `node`, which the caller has just unlinked under
-/// `queue_lock`. The `Thread` is cloned before `notified` is set, since the
-/// waiter may return and free the node as soon as it reads the flag.
-fn wake(node: *const Waiter) {
-    // SAFETY: `node` was linked until the caller unlinked it, and its waiter
-    // does not return before `notified` is set below.
+/// Wake the waiter of `node`. The `Thread` is cloned before `notified` is set,
+/// since the waiter may return and free the node as soon as it reads the flag.
+///
+/// # Safety
+/// `node` must be a node the caller has just unlinked under `queue_lock` and
+/// whose `notified` is unset, so its waiter is still in `wait` or
+/// `wait_timeout` and the node is valid until `notified` is set here.
+unsafe fn wake(node: *const Waiter) {
+    // SAFETY: the caller guarantees `node` is valid until `notified` is set,
+    // and nothing below reads it after that store.
     let node = unsafe { &*node };
     let thread = node.thread.clone();
     node.notified.store(true, Release);

@@ -8,7 +8,8 @@
 //! `thread_local!` macro and its destructors at a spawned thread's exit, a
 //! spawned thread's identity and park/unpark through its handle, `RwLock`
 //! wakes for several queued readers and its non-blocking paths, `Condvar`
-//! `notify_all` and `Once` completion waking every queued waiter, and
+//! `notify_all` and `Once` completion waking every queued waiter, a timed
+//! `Condvar` waiter leaving the middle of the queue, and
 //! `Condvar::wait_timeout`.
 
 use std::cell::Cell;
@@ -59,6 +60,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "once_waiter_fanout",
             run: once_waiter_fanout_phase,
+        },
+        Phase {
+            name: "condvar_timed_middle_waiter",
+            run: condvar_timed_middle_waiter_phase,
         },
         Phase {
             name: "timeout",
@@ -433,8 +438,11 @@ pub fn once_waiter_fanout_phase(_: &Caps)
             .recv_timeout(FANOUT_BOUND)
             .expect("once_waiter_fanout: a waiter never started");
     }
-    // Let every waiter reach the `Once` and queue behind the initialiser.
-    thread::sleep(Duration::from_millis(100));
+    // Let every waiter reach the `Once` and queue behind the initialiser. No
+    // API shows a waiter queued, so this is a wait, not a check: a waiter that
+    // has not reached the `Once` by the release finds it complete, which
+    // weakens the phase on a very slow host rather than failing it.
+    thread::sleep(Duration::from_millis(300));
     let _ = release.send(());
 
     for i in 0..FANOUT_WAITERS
@@ -457,6 +465,106 @@ pub fn once_waiter_fanout_phase(_: &Caps)
         w.join().expect("once waiter panicked");
     }
     std::os::seraph::log!("once_waiter_fanout phase passed");
+}
+
+/// Shared state of `condvar_timed_middle_waiter`: threads that have queued on
+/// the condvar, and wake tokens the main thread has handed out.
+#[derive(Default)]
+struct MiddleWaiterState
+{
+    queued: usize,
+    tokens: usize,
+}
+
+/// Wait until `queued` threads have queued on `cv`, failing after
+/// `FANOUT_BOUND`. A waiter counts itself under the lock before it waits, and
+/// the wait queues it before unlocking, so the count covers queued waiters only.
+fn await_queued(shared: &(Mutex<MiddleWaiterState>, Condvar), queued: usize)
+{
+    let start = Instant::now();
+    while shared.0.lock().expect("mutex poisoned").queued < queued
+    {
+        assert!(
+            start.elapsed() < FANOUT_BOUND,
+            "condvar_timed_middle_waiter: {queued} waiters never queued"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A `wait_timeout` waiter queued between untimed waiters times out and
+/// leaves the queue from its middle, and one `notify_one` per untimed waiter
+/// then wakes each of them: none is lost to a broken link.
+pub fn condvar_timed_middle_waiter_phase(_: &Caps)
+{
+    const UNTIMED_AFTER: usize = 2;
+    const TIMED_WAIT: Duration = Duration::from_secs(2);
+
+    let shared = Arc::new((Mutex::new(MiddleWaiterState::default()), Condvar::new()));
+    let (woke, wakes) = mpsc::channel();
+    let untimed = |shared: Arc<(Mutex<MiddleWaiterState>, Condvar)>, woke: mpsc::Sender<()>| {
+        thread::spawn(move || {
+            let (lock, cv) = &*shared;
+            let mut state = lock.lock().expect("mutex poisoned");
+            state.queued += 1;
+            let mut state = cv
+                .wait_while(state, |s| s.tokens == 0)
+                .expect("mutex poisoned");
+            state.tokens -= 1;
+            drop(state);
+            let _ = woke.send(());
+        })
+    };
+
+    // Queue order: one untimed waiter, the timed one, then the rest untimed.
+    let mut waiters = vec![untimed(shared.clone(), woke.clone())];
+    await_queued(&shared, 1);
+    let (timed_tx, timed_rx) = mpsc::channel();
+    let timed = {
+        let shared = shared.clone();
+        thread::spawn(move || {
+            let (lock, cv) = &*shared;
+            let mut state = lock.lock().expect("mutex poisoned");
+            state.queued += 1;
+            let (state, result) = cv
+                .wait_timeout_while(state, TIMED_WAIT, |s| s.tokens == 0)
+                .expect("mutex poisoned");
+            drop(state);
+            let _ = timed_tx.send(result.timed_out());
+        })
+    };
+    await_queued(&shared, 2);
+    for _ in 0..UNTIMED_AFTER
+    {
+        waiters.push(untimed(shared.clone(), woke.clone()));
+    }
+    await_queued(&shared, 2 + UNTIMED_AFTER);
+    assert!(
+        timed_rx.try_recv().is_err(),
+        "condvar_timed_middle_waiter: the timed waiter expired before the later waiters \
+         queued, so it did not leave the queue's middle"
+    );
+
+    let timed_out = timed_rx
+        .recv_timeout(TIMED_WAIT + FANOUT_BOUND)
+        .expect("condvar_timed_middle_waiter: the timed waiter never returned");
+    assert!(timed_out, "the timed waiter was woken with no notify");
+    timed.join().expect("condvar timed waiter panicked");
+
+    let (lock, cv) = &*shared;
+    for i in 0..waiters.len()
+    {
+        lock.lock().expect("mutex poisoned").tokens += 1;
+        cv.notify_one();
+        wakes.recv_timeout(FANOUT_BOUND).unwrap_or_else(|_| {
+            panic!("notify_one {i} woke no waiter after the timed waiter left the queue")
+        });
+    }
+    for w in waiters
+    {
+        w.join().expect("condvar untimed waiter panicked");
+    }
+    std::os::seraph::log!("condvar_timed_middle_waiter phase passed");
 }
 
 pub fn timeout_phase(_: &Caps)

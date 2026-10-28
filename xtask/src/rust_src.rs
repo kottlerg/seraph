@@ -1230,7 +1230,7 @@ fn apply_sync_once_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
         "sync/once/mod.rs",
         "    any(\n        windows,\n        target_family = \"unix\",\n        all(target_vendor = \"fortanix\", target_env = \"sgx\"),\n        target_os = \"solid_asp3\",\n        target_os = \"xous\",\n    ) => {\n        mod queue;\n        pub use queue::{Once, OnceState};\n    }\n",
         "    any(\n        windows,\n        target_family = \"unix\",\n        all(target_vendor = \"fortanix\", target_env = \"sgx\"),\n        target_os = \"solid_asp3\",\n        target_os = \"xous\",\n    ) => {\n        mod queue;\n        pub use queue::{Once, OnceState};\n    }\n    \
-         // seraph-overlay: seraph once via Notification caps\n    \
+         // seraph-overlay: seraph once is upstream queue.rs (per-thread parking)\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          pub use seraph::{Once, OnceState};\n    }\n",
     )
@@ -1250,7 +1250,7 @@ fn apply_sync_condvar_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()
         "sync/condvar/mod.rs",
         "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::Condvar;\n    }\n",
         "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::Condvar;\n    }\n    \
-         // seraph-overlay: seraph condvar via Notification caps\n    \
+         // seraph-overlay: seraph condvar via per-waiter thread parking\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          pub use seraph::Condvar;\n    }\n",
     )

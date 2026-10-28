@@ -27,7 +27,7 @@ discipline below has been applied end-to-end.
     governing documents or, in `delta` mode, the documents that state facts
     the delta changed plus the binding standards, mode, `since`, a ledger
     path, claimed fixes), it narrows *which files you read whole and report
-    on*, never the discipline: steps 3 to 6 apply in full to every file in
+    on*, never the discipline: steps 3 to 7 apply in full to every file in
     the shard, and blast-radius reads (step 5) go wherever the callers are.
     In `delta` mode the files are those changed since `since` that the
     whole PR diff also touches (a file only a merge or rebase of the base
@@ -58,7 +58,7 @@ discipline below has been applied end-to-end.
 
     A lens prompt (call sites, design documents, cross-boundary surfaces,
     regression) names one concern over the whole diff instead of shard
-    files: apply steps 3 to 6 to what the lens names, report only within
+    files: apply steps 3 to 7 to what the lens names, report only within
     that concern, and leave the rest to the shard reviewers.
 
     When the parent supplies no open-Issue list, run
@@ -108,6 +108,25 @@ discipline below has been applied end-to-end.
    never dropped. Same for system-scope design docs: if the diff silently
    contradicts one, the doc and the code now disagree, and that is a
    finding.
+
+7. CPU-count width. For every line the diff adds under `core/kernel/`,
+   `core/boot/`, or an in-tree crate either one depends on, check the rules
+   of `docs/coding-standards.md` § CPU-Count Width. Report each line that
+   introduces a structure with one entry or bit per CPU whose width does not
+   come from `MAX_CPUS`, a literal standing in for the CPU count or a
+   CPU-mask width, a fixed-width integer holding a set of CPUs, an `as`
+   cast of a CPU index or count to a type that cannot represent `MAX_CPUS`,
+   or code filling a fixed-width window an external interface defines that
+   neither rejects nor splits a CPU index the window cannot hold,
+   as a finding (it blocks when on the review surface, per
+   `docs/conventions.md` § Branch and PR Workflow): bucket Critical,
+   `must_violation` true, citing
+   that section, class `standards` (`correctness` when the width defect
+   misbehaves at a CPU count up to `MAX_CPUS`), and `introduced` set as
+   the schema defines for the mode. Most PRs owe no boundary boot
+   (`docs/testing.md` § Coverage tiers), so this check is the gate for that
+   defect class; do not discount a finding because a boot at the boundary
+   CPU counts would catch it.
 
 ## Out of scope
 

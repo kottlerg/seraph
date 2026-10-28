@@ -60,10 +60,11 @@ The XSDT pointer at RSDP offset 24 is the authoritative table root; the
 | SSDT | `"SSDT"` | Every architecture where an RSDP is present, Step 9: `BootInfo.vmgenid_paddr`, the non-zero, 4 KiB-aligned `VGIA` named-DWORD value plus the 40-byte GUID offset; an SSDT whose OEM table ID starts with `VMGENID` is preferred, otherwise the first SSDT carrying the pattern. No AML is evaluated. |
 
 After the table walk, `parse_aperture_seed` appends the arch's platform-default apertures
-(`arch::current::default_pci_apertures`) whenever the RSDP revision and the XSDT validate, MCFG
+(`arch::current::default_mmio_apertures`) whenever the RSDP revision and the XSDT validate, MCFG
 present or absent. The list is empty on x86-64; on riscv64 it is the QEMU virt ECAM window, the
-32-bit and 64-bit PCI windows, and the ns16550a UART and Goldfish RTC register pages (no table the
-walker reads names those two pages). Any overlap with the MCFG-derived seeds is collapsed by
+32-bit and 64-bit PCI windows, and the ns16550a UART and Goldfish RTC register pages
+(`parse_aperture_seed` reads only MADT and MCFG, so no table seeds those two pages; the SPCR UART
+base feeds only `kernel_mmio`). Any overlap with the MCFG-derived seeds is collapsed by
 `derive_mmio_apertures` (see [firmware-parsing.md](firmware-parsing.md) §"`mmio_apertures`
 construction"). Like the MCFG heuristic windows, the defaults are not bounded by the memory map: the
 riscv64 64-bit window `[16 GiB, 32 GiB)` covers RAM on a virt guest with more than about 14 GiB
@@ -118,5 +119,5 @@ left it zero and ORs in further `hart_caps` bits) halts the kernel at Phase 5 (s
 
 ## Summarized By
 
-[Early Console](console.md), [Firmware Parsing](firmware-parsing.md),
+[Boot Flow](boot-flow.md), [Early Console](console.md), [Firmware Parsing](firmware-parsing.md),
 [services/drivers/goldfish-rtc/README.md](../../../services/drivers/goldfish-rtc/README.md)

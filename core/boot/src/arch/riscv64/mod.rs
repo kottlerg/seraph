@@ -186,21 +186,20 @@ pub unsafe fn allocate_ap_trampoline(bs: *mut EfiBootServices) -> Option<u64>
 /// PCI windows, plus the ns16550a UART register page at `0x1000_0000` and
 /// the Goldfish RTC register page at `0x101000`.
 ///
-/// Appended by [`crate::acpi::parse_aperture_seed`] whenever the RSDP and
-/// XSDT validate, MCFG present or absent, because EDK2 on the seraph boot
-/// path neither re-publishes the DTB via a UEFI configuration table nor
-/// emits ACPI entries for these regions, so neither
-/// [`crate::dtb::parse_aperture_seed`] nor MCFG / `_HID` walks can
-/// discover them at runtime (`core/boot/docs/acpi.md` § Tables Consumed).
-/// Merged with anything firmware does happen to publish in
-/// [`crate::memory_map::derive_mmio_apertures`].
+/// Fixed rather than discovered: EDK2 on the seraph boot path does not
+/// re-publish the DTB via a UEFI configuration table, so
+/// [`crate::dtb::parse_aperture_seed`] sees no DTB; some firmware builds
+/// publish no MCFG; and no table the ACPI aperture seeder reads (MADT,
+/// MCFG) names the UART or Goldfish RTC page. When
+/// [`crate::acpi::parse_aperture_seed`] appends these is specified in
+/// `core/boot/docs/acpi.md` § Tables Consumed.
 ///
 /// The UART and Goldfish RTC entries each cover one 4 KiB page so devmgr
 /// can carve an `Mmio` for the platform driver (see
 /// `services/devmgr/docs/responsibilities.md` § Responsibilities); the
 /// kernel's own retained UART access is described in
 /// `docs/console-model.md` § Ownership across the boot lifecycle.
-pub fn default_pci_apertures() -> &'static [(u64, u64)]
+pub fn default_mmio_apertures() -> &'static [(u64, u64)]
 {
     const ENTRIES: &[(u64, u64)] = &[
         (0x1000_0000, 0x1000),

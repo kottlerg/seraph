@@ -127,13 +127,13 @@ the kernel's own consumption:
   nodes, plus the riscv64 hart facts (`timebase_freq`, `hart_caps`).
   Extracted into `BootInfo` in step 9.
 
-A third extraction, run in step 9, produces **seed entries** for `mmio_apertures` —
-coarse `{phys_base, size}` regions the kernel mints as `Mmio` capabilities. The seed
-covers LAPIC / IOAPIC / PLIC / CLINT / UART / ECAM / BAR windows / `virtio,mmio`
-transports from the firmware tables, the arch-default PCI apertures the ACPI seeder
-appends, and the GOP framebuffer, and is merged there with the UEFI memory map's
-`MemoryMappedIO` regions (firmware-parsing.md §
-[`mmio_apertures` construction](firmware-parsing.md#mmio_apertures-construction)).
+A third extraction, run in step 9, produces **seed entries** for `mmio_apertures` — coarse
+`{phys_base, size}` regions the kernel mints as `Mmio` capabilities. The seed covers LAPIC / IOAPIC
+/ PLIC / CLINT / UART / ECAM / BAR windows / `virtio,mmio` transports from the firmware tables, the
+arch's platform-default MMIO apertures the ACPI seeder appends ([acpi.md](acpi.md) § Tables
+Consumed), and the GOP framebuffer, and is merged there with the UEFI memory map's `MemoryMappedIO`
+regions (firmware-parsing.md § [`mmio_apertures`
+construction](firmware-parsing.md#mmio_apertures-construction)).
 
 On RISC-V the paging mode is negotiated here, from the DTB `mmu-type` claim and
 a `satp` probe, before step 6 fixes the table hierarchy depth (see

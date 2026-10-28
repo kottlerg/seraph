@@ -651,7 +651,7 @@ pub(crate) const MADT_TYPE_LAPIC_OVERRIDE: u8 = 5;
 ///   The heuristic windows are not bounded by the memory map and can cover
 ///   RAM (defect, #499).
 /// - The arch's platform defaults from
-///   `crate::arch::current::default_pci_apertures` (empty on x86-64),
+///   `crate::arch::current::default_mmio_apertures` (empty on x86-64),
 ///   appended once the RSDP and XSDT validate.
 ///
 /// Callable unconditionally on every supported architecture; a zero
@@ -849,17 +849,15 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
         }
     }
 
-    // Per-arch platform-default MMIO apertures, appended whenever the RSDP
-    // and XSDT validate (the early returns above skip them when ACPI is
-    // absent or malformed). Some firmware builds publish ACPI without an
-    // MCFG table (e.g. the EDK2 shipped with Ubuntu's `qemu-efi-riscv64`
-    // package, observed on CI), so the loop above yields no ECAM frame for
-    // devmgr; on QEMU virt the defaults also cover the ns16550a UART and
-    // Goldfish RTC register pages, which no table this walker reads names.
-    // What the defaults cover, how `derive_mmio_apertures` collapses their
-    // overlap with MCFG seeds, and their unbounded-by-memory-map defect
-    // (#499) are in core/boot/docs/acpi.md § Tables Consumed.
-    for &(base, size) in crate::arch::current::default_pci_apertures()
+    // Per-arch platform-default MMIO apertures; the early returns above
+    // skip them when ACPI is absent or malformed. They exist because some
+    // firmware builds publish ACPI without an MCFG table (e.g. the EDK2
+    // shipped with Ubuntu's `qemu-efi-riscv64` package, observed on CI),
+    // leaving devmgr no ECAM frame, and because no table this walker reads
+    // names the riscv64 UART and Goldfish RTC pages. What the defaults
+    // cover and how they merge is in core/boot/docs/acpi.md § Tables
+    // Consumed.
+    for &(base, size) in crate::arch::current::default_mmio_apertures()
     {
         push!(base, size);
     }

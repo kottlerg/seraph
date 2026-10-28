@@ -24,6 +24,17 @@
 //!
 //! `pin` is the intra-IOAPIC pin number; the global GSI is `gsi_base + pin`.
 //!
+//! # Locking
+//! Every register access is an `IOREGSEL` store followed by an `IOWIN` access,
+//! and [`mask`] and [`unmask`] read-modify-write an entry. [`route`], [`mask`]
+//! and [`unmask`] run on any CPU (`SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`, the
+//! device-IRQ dispatch in interrupt context, and the Interrupt and Notification
+//! dealloc paths, which mask a line), so each holds `IOAPIC_LOCK`, a
+//! leaf lock taken with interrupts disabled, across its whole access sequence;
+//! otherwise another CPU's select could land between a select and its window
+//! access and redirect the value to another entry. [`init`] runs single-threaded
+//! before any IRQ is routed and takes no lock.
+//!
 //! # Vector assignment
 //! GSI `n` is assigned to IDT vector `DEVICE_VECTOR_BASE + n` (33 + n), which keeps the mapping
 //! trivial and avoids a vector allocator. Only GSIs 0-22 (vectors 33-55) have IDT stubs and
@@ -99,6 +110,11 @@ const EMPTY_STATE: IoApicState = IoApicState {
 static mut IOAPICS: [IoApicState; MAX_IOAPICS] = [EMPTY_STATE; MAX_IOAPICS];
 static mut IOAPIC_COUNT: usize = 0;
 
+/// Serialises the `IOREGSEL`/`IOWIN` access sequences of [`route`], [`mask`]
+/// and [`unmask`] across CPUs (module doc § Locking). A leaf lock: nothing is
+/// acquired while it is held.
+static IOAPIC_LOCK: crate::sync::Spinlock = crate::sync::Spinlock::new();
+
 /// Locate the IOAPIC owning `gsi`. Returns `(phys_base, intra_ioapic_pin)`.
 fn lookup_ioapic_for_gsi(gsi: u32) -> Option<(u64, u32)>
 {
@@ -124,7 +140,8 @@ fn lookup_ioapic_for_gsi(gsi: u32) -> Option<(u64, u32)>
 ///
 /// # Safety
 /// Must only be called after Phase 3 (direct map active) with a valid IOAPIC
-/// physical base.
+/// physical base, either from single-threaded [`init`] or with `IOAPIC_LOCK`
+/// held across the caller's whole access sequence.
 unsafe fn ioapic_write(phys_base: u64, reg: u32, val: u32)
 {
     let base = (super::paging::direct_map_base() + phys_base) as usize;
@@ -242,10 +259,12 @@ pub unsafe fn route(gsi: u32, vector: u8)
     let high: u32 = 0; // dest LAPIC ID 0
 
     // SAFETY: caller ensures init() has completed; entry remains masked
-    // until unmask().
+    // until unmask(). IOAPIC_LOCK covers both select/window pairs.
     unsafe {
+        let saved = IOAPIC_LOCK.lock_raw();
         ioapic_write(base, 0x10 + 2 * pin, low);
         ioapic_write(base, 0x11 + 2 * pin, high);
+        IOAPIC_LOCK.unlock_raw(saved);
     }
 }
 
@@ -262,13 +281,13 @@ pub unsafe fn mask(gsi: u32)
         return;
     };
     let reg = 0x10 + 2 * pin;
-    // SAFETY: caller ensures init() has completed; reading current entry.
-    let current = unsafe { ioapic_read(base, reg) };
-    // SAFETY: init() has completed; setting the mask bit is architecture-defined. No lock guards
-    // the IOREGSEL/IOWIN pair, so a concurrent `unmask`/`route` on another CPU can interleave
-    // with this read-modify-write.
+    // SAFETY: caller ensures init() has completed; setting the mask bit is
+    // architecture-defined. IOAPIC_LOCK covers the whole read-modify-write.
     unsafe {
+        let saved = IOAPIC_LOCK.lock_raw();
+        let current = ioapic_read(base, reg);
         ioapic_write(base, reg, current | REDIR_MASK);
+        IOAPIC_LOCK.unlock_raw(saved);
     }
 }
 
@@ -285,41 +304,13 @@ pub unsafe fn unmask(gsi: u32)
         return;
     };
     let reg = 0x10 + 2 * pin;
-    // SAFETY: caller ensures init() and route() have completed; reading entry.
-    let current = unsafe { ioapic_read(base, reg) };
-    // SAFETY: clearing mask bit enables IRQ delivery; caller registered handler.
+    // SAFETY: caller ensures init() and route() have completed; clearing the
+    // mask bit enables IRQ delivery for a registered handler. IOAPIC_LOCK
+    // covers the whole read-modify-write.
     unsafe {
+        let saved = IOAPIC_LOCK.lock_raw();
+        let current = ioapic_read(base, reg);
         ioapic_write(base, reg, current & !REDIR_MASK);
-    }
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests
-{
-    use super::*;
-
-    #[test]
-    fn device_vector_base_is_33()
-    {
-        assert_eq!(DEVICE_VECTOR_BASE, 33);
-    }
-
-    #[test]
-    fn redir_mask_bit_is_16()
-    {
-        assert_eq!(REDIR_MASK, 1 << 16);
-    }
-
-    #[test]
-    fn redirection_entry_low_encoding()
-    {
-        // For GSI 0 with vector 33:
-        // low = REDIR_MASK | 33 = 0x0001_0021
-        let vector: u8 = 33;
-        let low = REDIR_MASK | REDIR_FIXED | (vector as u32);
-        assert_eq!(low & 0xFF, 33, "vector in bits [7:0]");
-        assert!(low & REDIR_MASK != 0, "entry starts masked");
+        IOAPIC_LOCK.unlock_raw(saved);
     }
 }

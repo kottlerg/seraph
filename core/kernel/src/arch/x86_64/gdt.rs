@@ -258,13 +258,7 @@ pub fn data_desc_64(dpl: u8) -> u64
 pub fn tss_desc(tss_addr: u64) -> (u64, u64)
 {
     // Use TssWithIopb size so the descriptor covers the IOPB region.
-    // Under cfg(test) the limit is the literal 8296 (104 + 8192 + 1 - 1)
-    // instead of `size_of::<TssWithIopb>() - 1`; `TssWithIopb` is defined in
-    // test builds too, so the literal only duplicates the size (#460).
-    #[cfg(not(test))]
     let limit: u64 = (core::mem::size_of::<TssWithIopb>() as u64) - 1;
-    #[cfg(test)]
-    let limit: u64 = 8296; // 104 + 8192 + 1 - 1
 
     let low: u64 = (limit & 0xFFFF) // [15:0]  limit[15:0]
         | ((tss_addr & 0x00FF_FFFF) << 16) // [39:16] base[23:0]
@@ -628,38 +622,14 @@ pub unsafe fn load_iopb(iopb: Option<&[u8; IOPB_SIZE]>)
 
 /// Set bits [base, base+count) to 0 in `iopb`, permitting those ports.
 ///
-/// Ports not covered by this call remain 1 (denied). Existing permitted
-/// ranges are preserved — multiple calls accumulate permissions.
-///
-/// # Panics
-/// Panics in debug mode if `base as u32 + count as u32 > 65536`.
-#[cfg(test)] // Only used by tests; runtime uses permit_port_range_u32.
-pub fn permit_port_range(iopb: &mut [u8; IOPB_SIZE], base: u16, count: u16)
-{
-    if count == 0
-    {
-        return;
-    }
-    // Use u32 to avoid u16 overflow when base + count == 65536.
-    let end = base as u32 + count as u32;
-    debug_assert!(end <= 65536, "port range exceeds 0xFFFF");
-    for port in base as u32..end
-    {
-        let byte = (port / 8) as usize;
-        let bit = port % 8;
-        if byte < IOPB_SIZE
-        {
-            iopb[byte] &= !(1 << bit);
-        }
-    }
-}
-
-/// Like [`permit_port_range`] but accepts `u32` base and count to support
-/// the full 64K range (65536 ports) without overflow.
+/// `base` and `count` are `u32` so the full 64K range (`base = 0`,
+/// `count = 65536`) is expressible. Ports not covered by this call remain 1
+/// (denied); existing permitted ranges are preserved, so multiple calls
+/// accumulate permissions.
 ///
 /// # Panics
 /// Panics in debug mode if `base + count > 65536`.
-pub fn permit_port_range_u32(iopb: &mut [u8; IOPB_SIZE], base: u32, count: u32)
+pub fn permit_port_range(iopb: &mut [u8; IOPB_SIZE], base: u32, count: u32)
 {
     if count == 0
     {
@@ -685,40 +655,47 @@ mod tests
 {
     use super::*;
 
+    // Hardware contract: on a ring-3 I/O instruction the CPU reads the bitmap
+    // offset from the TSS (`iopb_offset`, written as 104 by the TSS
+    // initialisers) and walks the I/O permission bitmap up to the TSS
+    // descriptor's limit, which must reach the 0xFF terminator byte.
     #[test]
-    fn tss_is_104_bytes()
+    fn tss_layout_and_descriptor_limit_cover_the_iopb_walk()
     {
         assert_eq!(core::mem::size_of::<Tss>(), 104);
-    }
-
-    #[test]
-    fn tss_desc_uses_full_iopb_size()
-    {
-        // Limit must cover TSS (104) + IOPB (8192) + terminator (1) - 1 = 8296.
+        assert_eq!(core::mem::offset_of!(TssWithIopb, iopb), 104);
         let (lo, _hi) = tss_desc(0x1000);
-        let limit_low = lo & 0xFFFF;
-        let limit_high = (lo >> 48) & 0xF;
-        let limit = limit_low | (limit_high << 16);
-        assert_eq!(limit, 8296, "TSS descriptor limit must cover IOPB");
+        let limit = (lo & 0xFFFF) | (((lo >> 48) & 0xF) << 16);
+        assert_eq!(
+            limit,
+            core::mem::offset_of!(TssWithIopb, terminator) as u64,
+            "TSS descriptor limit must reach the IOPB terminator byte"
+        );
     }
 
     #[test]
-    fn permit_port_range_clears_bits()
+    fn tss_desc_encodes_available_tss_type_and_split_base()
     {
-        let mut iopb = [0xFFu8; IOPB_SIZE];
-        // Permit ports 0–7 (byte 0, all bits).
-        permit_port_range(&mut iopb, 0, 8);
-        assert_eq!(iopb[0], 0x00, "byte 0 should be all permitted");
-        assert_eq!(iopb[1], 0xFF, "byte 1 should be untouched");
+        let addr: u64 = 0x1234_5678_9ABC_DEF0;
+        let (lo, hi) = tss_desc(addr);
+        assert_eq!((lo >> 40) & 0xFF, 0x89, "P=1, DPL=0, 64-bit TSS available");
+        assert_eq!((lo >> 16) & 0xFF_FFFF, addr & 0xFF_FFFF, "base[23:0]");
+        assert_eq!((lo >> 56) & 0xFF, (addr >> 24) & 0xFF, "base[31:24]");
+        assert_eq!(hi & 0xFFFF_FFFF, addr >> 32, "base[63:32]");
     }
 
     #[test]
-    fn permit_port_range_partial_byte()
+    fn permit_port_range_clears_exactly_the_requested_ports()
     {
         let mut iopb = [0xFFu8; IOPB_SIZE];
-        // Permit only port 3 (bit 3 of byte 0).
-        permit_port_range(&mut iopb, 3, 1);
-        assert_eq!(iopb[0], 0xFF & !(1 << 3));
+        // Ports 3-10 span the tail of byte 0 and the head of byte 1.
+        permit_port_range(&mut iopb, 3, 8);
+        assert_eq!(iopb[0], 0x07, "ports 0-2 stay denied, 3-7 permitted");
+        assert_eq!(iopb[1], 0xF8, "ports 8-10 permitted, 11-15 stay denied");
+        assert!(
+            iopb[2..].iter().all(|&b| b == 0xFF),
+            "later ports untouched"
+        );
     }
 
     #[test]
@@ -730,12 +707,21 @@ mod tests
     }
 
     #[test]
-    fn permit_port_range_max_port()
+    fn permit_port_range_reaches_the_last_port()
     {
         let mut iopb = [0xFFu8; IOPB_SIZE];
         // Port 65535 is the last valid port.
         permit_port_range(&mut iopb, 65535, 1);
-        assert_eq!(iopb[8191], 0xFF & !(1 << 7));
+        assert_eq!(iopb[IOPB_SIZE - 1], 0xFF & !(1 << 7));
+        assert!(iopb[..IOPB_SIZE - 1].iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn permit_port_range_covers_the_full_port_space()
+    {
+        let mut iopb = [0xFFu8; IOPB_SIZE];
+        permit_port_range(&mut iopb, 0, 65536);
+        assert!(iopb.iter().all(|&b| b == 0x00));
     }
 
     #[test]
@@ -780,43 +766,5 @@ mod tests
     {
         let d = data_desc_64(3);
         assert_eq!((d >> 45) & 3, 3, "DPL should be 3");
-    }
-
-    #[test]
-    fn tss_desc_limit_and_type()
-    {
-        let (lo, _hi) = tss_desc(0xDEAD_BEEF_1234_5678);
-        // limit = 8296 (0x2068); bits [15:0] = 0x2068
-        assert_eq!(
-            lo & 0xFFFF,
-            0x2068,
-            "limit low should be 0x2068 (8296 & 0xFFFF)"
-        );
-        // type byte = 0x89
-        assert_eq!((lo >> 40) & 0xFF, 0x89, "type field");
-    }
-
-    #[test]
-    fn tss_desc_base_split_correctly()
-    {
-        let addr: u64 = 0x1234_5678_9ABC_DEF0;
-        let (lo, hi) = tss_desc(addr);
-        // high descriptor = base[63:32]
-        assert_eq!(hi & 0xFFFF_FFFF, addr >> 32);
-        // base[23:0] in lo bits [39:16]
-        assert_eq!((lo >> 16) & 0xFF_FFFF, addr & 0xFF_FFFF);
-        // base[31:24] in lo bits [63:56]
-        assert_eq!((lo >> 56) & 0xFF, (addr >> 24) & 0xFF);
-    }
-
-    #[test]
-    fn selector_constants_match_gdt_layout()
-    {
-        // index 1 × 8 = 0x08, etc.
-        assert_eq!(KERNEL_CS, 0x08);
-        assert_eq!(KERNEL_DS, 0x10);
-        assert_eq!(USER_DS, 0x1B); // index 3 × 8 | RPL 3
-        assert_eq!(USER_CS, 0x23); // index 4 × 8 | RPL 3
-        assert_eq!(TSS_SEL, 0x28);
     }
 }

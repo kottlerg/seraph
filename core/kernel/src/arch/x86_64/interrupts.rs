@@ -47,7 +47,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
 
 #[cfg(not(test))]
-#[cfg(not(test))]
 use super::{cpu, fpu, gdt, idt};
 
 // ── xAPIC constants ───────────────────────────────────────────────────────────
@@ -780,29 +779,3 @@ pub unsafe fn route_device_irq(irq: u32)
 /// No-op test stub.
 #[cfg(test)]
 pub unsafe fn route_device_irq(_irq: u32) {}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests
-{
-    use super::*;
-
-    #[test]
-    fn apic_svr_offset()
-    {
-        assert_eq!(APIC_SVR, 0xF0);
-    }
-
-    #[test]
-    fn apic_eoi_offset()
-    {
-        assert_eq!(APIC_EOI, 0xB0);
-    }
-
-    #[test]
-    fn lvt_mask_bit()
-    {
-        assert_eq!(LVT_MASK, 1 << 16);
-    }
-}

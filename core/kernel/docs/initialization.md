@@ -652,10 +652,15 @@ pub(crate) fn fatal(msg: &str) -> !
 `halt_loop` disables interrupts and halts the calling CPU permanently (`hlt` on x86-64,
 `wfi` on RISC-V).
 
-A `fatal()` on the BSP after Phase 9 also ends sleep-list servicing, which runs only on
-the BSP, so no timeout wakes on any CPU (see
-[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sleep-list-invariants)
-§ Sleep List Invariants).
+A `fatal()` on the BSP after Phase 9 also ends sleep-list servicing and the BSP-hosted
+watchdog detectors (all-idle softlockup, owed-wake, AP silence), which run only on the BSP,
+so no timeout wakes on any CPU. On a multi-CPU system an AP's BSP-heartbeat check
+(`bsp_stall_check`) then reports the halted BSP as a stalled heartbeat once its grace window
+elapses, unless a TLB shootdown is pending: the check defers to one, and a shootdown naming the
+halted BSP ends in the IPI watchdog's `fatal` instead (described below)
+(see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sleep-list-invariants)
+§ Sleep List Invariants and [scheduling-internals.md](scheduling-internals.md#softlockup-watchdog)
+§ Softlockup Watchdog).
 
 Secondary CPU failures after Phase 9 (user-mode entry) are handled by `fatal()` on
 that CPU only; the BSP and other CPUs continue until one needs the halted CPU: it acks no

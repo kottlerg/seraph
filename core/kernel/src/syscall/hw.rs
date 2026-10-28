@@ -448,7 +448,7 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         };
         // SAFETY: iopb is non-null after the allocation above; target_tcb validated.
         unsafe {
-            gdt::permit_port_range_u32(
+            gdt::permit_port_range(
                 &mut *(*target_tcb).iopb,
                 u32::from(port_base),
                 effective_size,

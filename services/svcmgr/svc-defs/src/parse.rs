@@ -143,8 +143,9 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// Returns a [`ParseError`] naming the offending line when the contents
 /// violate the grammar or a semantic rule: a missing `=`, an unknown or
 /// duplicated key, a missing mandatory key, a malformed value, an
-/// inconsistent combination (`cwd` with `namespace = none`, a `cwd` outside
-/// a `namespace = subtree:` path or under one whose rights lack `LOOKUP`,
+/// inconsistent combination (`cwd` with `namespace = none`, a `cwd` of the
+/// root under `namespace = universal`, a `cwd` outside a
+/// `namespace = subtree:` path or under one whose rights lack `LOOKUP`,
 /// `log_sink` with `seed`/`provides`, more
 /// `seed` names than the bootstrap caps left after a provider's RECV,
 /// `sched_max` below `priority`), a `binary` or
@@ -418,32 +419,43 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let system_critical = system_critical.ok_or(ParseError::MissingKey("critical"))?;
     let namespace = namespace.ok_or(ParseError::MissingKey("namespace"))?;
 
-    if matches!(namespace, NamespaceShape::None) && cwd.is_some()
+    match (&namespace, &cwd)
     {
-        return Err(ParseError::InvalidValue(
-            0,
-            "cwd is forbidden when namespace = none",
-        ));
-    }
-
-    if let (NamespaceShape::Subtree { path, rights }, Some(dir)) = (&namespace, &cwd)
-    {
-        if !cwd_within_subtree(dir, path)
+        (NamespaceShape::None, Some(_)) =>
         {
             return Err(ParseError::InvalidValue(
                 0,
-                "cwd must be the namespace subtree path or a path below it",
+                "cwd is forbidden when namespace = none",
             ));
         }
-        // The cwd cap takes only the subtree's rights (`cwd_rights`); without
-        // LOOKUP it could not resolve a relative path.
-        if rights & ns_rights::LOOKUP == 0
+        (NamespaceShape::Universal, Some(dir)) if names_root(dir) =>
         {
             return Err(ParseError::InvalidValue(
                 0,
-                "cwd under a subtree namespace needs LOOKUP in the subtree rights",
+                "cwd must not be the root: the cwd walk cannot narrow it",
             ));
         }
+        (NamespaceShape::Subtree { path, rights }, Some(dir)) =>
+        {
+            if !cwd_within_subtree(dir, path)
+            {
+                return Err(ParseError::InvalidValue(
+                    0,
+                    "cwd must be the namespace subtree path or a path below it",
+                ));
+            }
+            // The cwd cap takes only the subtree's rights (`cwd_rights`);
+            // without LOOKUP it could not resolve a relative path.
+            if rights & ns_rights::LOOKUP == 0
+            {
+                return Err(ParseError::InvalidValue(
+                    0,
+                    "cwd under a subtree namespace needs LOOKUP in the subtree rights",
+                ));
+            }
+        }
+        _ =>
+        {}
     }
 
     // One bootstrap round carries at most MSG_CAP_SLOTS_MAX caps, and a
@@ -528,9 +540,10 @@ fn parse_namespace(lineno: usize, value: &str) -> Result<NamespaceShape, ParseEr
             return Err(ParseError::BadNamespace(lineno, value.to_owned()));
         }
         // A path with no components walks no NS_LOOKUP hop, so no namespace
-        // server attenuates the cap to `<rights>`: the child would get
-        // svcmgr's root at full rights.
-        if path.split('/').all(str::is_empty)
+        // server attenuates the cap to `<rights>` (see `names_root`): the
+        // walk would fail for narrower rights or hand over the full root,
+        // which `universal` already names.
+        if names_root(path)
         {
             return Err(ParseError::InvalidValue(
                 lineno,
@@ -549,6 +562,14 @@ fn parse_namespace(lineno: usize, value: &str) -> Result<NamespaceShape, ParseEr
         });
     }
     Err(ParseError::BadNamespace(lineno, value.to_owned()))
+}
+
+/// A path with no components names the walk's anchor, the root, which
+/// `std::os::seraph::namespace_lookup_dir` returns only for a request of
+/// every right: no hop narrows it.
+fn names_root(path: &str) -> bool
+{
+    path.split('/').all(str::is_empty)
 }
 
 /// Parse a `+`-joined list of named rights tokens (LOOKUP, STAT, …)
@@ -950,6 +971,22 @@ sched_max = 12\n";
             assert!(matches!(
                 parse_with(extra),
                 Err(ParseError::InvalidValue(0, why)) if why.starts_with("seed names")
+            ));
+        }
+    }
+
+    #[test]
+    fn cwd_of_the_root_under_universal_is_rejected()
+    {
+        for cwd in ["/", "//"]
+        {
+            let recipe = format!(
+                "binary = /services/x\nrestart = never\ncritical = no\n\
+                 namespace = universal\ncwd = {cwd}\n"
+            );
+            assert!(matches!(
+                parse("x", &recipe),
+                Err(ParseError::InvalidValue(0, why)) if why.starts_with("cwd must not be the root")
             ));
         }
     }

@@ -13,17 +13,17 @@
 //!   inline `FS_READ` path; payload bytes ride in the IPC buffer.
 //! - Larger reads use `FS_READ_MEMORY`: the driver returns a Memory cap
 //!   covering one cached page; we reserve VA, `mem_map` it
-//!   read-only, memcpy out, then proactively release the cache slot
+//!   read-only, copy out, then proactively release the cache slot
 //!   via `FS_RELEASE_MEMORY` and tear the mapping down locally.
 //!
 //! ## Write path
 //! - Writes ≤ 504 bytes use the inline `FS_WRITE` path with the
 //!   payload riding in the IPC buffer.
-//! - Larger writes use `FS_WRITE_MEMORY`: one memmgr-allocated page
-//!   is mapped MAP_WRITABLE in the caller's address space, filled
-//!   chunk-by-chunk, and handed to the driver as a DMA source. The
-//!   driver returns the same Memory cap back to us in the reply so
-//!   the cap slot id is rebound across iterations.
+//! - Larger writes use `FS_WRITE_MEMORY`: one memmgr-allocated page per
+//!   write is mapped MAP_WRITABLE in the caller's address space, filled
+//!   chunk-by-chunk, and lent to the driver as a DMA source through a
+//!   `MAP`-only derivation per chunk; the page's run goes back to memmgr
+//!   once the write ends (see `release_write_frame`).
 //!
 //! ## Directory mutation
 //! `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME` operate against
@@ -51,11 +51,11 @@
 //! to the driver via `caps[0]` of the first
 //! [`fs_labels::FS_READ_MEMORY`] request for that `File`. The driver
 //! records it on the file's `OpenFile` slot; its eviction worker
-//! uses it to issue cooperative [`fs_labels::FS_RELEASE_MEMORY`] back
-//! to us before falling through to hard-revoke. Files that never
-//! trigger a frame-read (only inline `FS_READ` / `FS_WRITE`) never
-//! deliver the cap and get the hard-revoke fallback; the cap is
-//! deleted in `Drop`.
+//! uses it to issue a cooperative [`fs_labels::FS_RELEASE_MEMORY`] back
+//! to us, then revokes the page's caps whether or not the reply is an
+//! ack. Files that never trigger a frame-read (only inline `FS_READ` /
+//! `FS_WRITE`) never deliver the cap and get the revoke without the
+//! cooperative step; the cap is deleted in `Drop`.
 //!
 //! ## Path anchoring
 //! Absolute paths walk from `root_dir_cap()`; relative paths walk
@@ -284,6 +284,11 @@ pub struct ReadDir
     dir_cap: u32,
     next_idx: u64,
     parent_path: PathBuf,
+    /// Set at `END_OF_DIR` or after an error that would otherwise repeat on
+    /// every later call (no registered IPC buffer, an `NS_READDIR`
+    /// failure). A rejected entry name is an error for that entry alone;
+    /// the iteration continues past it.
+    done: bool,
 }
 
 impl Iterator for ReadDir
@@ -292,74 +297,56 @@ impl Iterator for ReadDir
 
     fn next(&mut self) -> Option<Self::Item>
     {
+        if self.done
+        {
+            return None;
+        }
         let ipc_buf = crate::os::seraph::current_ipc_buf();
         if ipc_buf.is_null()
         {
+            self.done = true;
             return Some(Err(io::Error::other("seraph fs: IPC buffer not registered")));
         }
         loop
         {
-            let msg = IpcMessage::builder(ns_labels::NS_READDIR)
-                .word(0, self.next_idx)
-                .build();
-            // SAFETY: ipc_buf is the registered IPC buffer.
-            let reply = match unsafe { ipc::ipc_call(self.dir_cap, &msg, ipc_buf) }
+            let entry = match ns_readdir_one(self.dir_cap, self.next_idx, ipc_buf)
             {
-                Ok(r) => r,
-                Err(_) =>
+                Ok(Some(e)) => e,
+                Ok(None) =>
                 {
-                    return Some(Err(io::Error::other(
-                        "seraph fs: NS_READDIR ipc_call failed",
-                    )));
+                    self.done = true;
+                    return None;
+                }
+                Err(e) =>
+                {
+                    self.done = true;
+                    return Some(Err(e));
                 }
             };
-            if reply.label == fs_labels::END_OF_DIR
-            {
-                return None;
-            }
-            if reply.label != 0
-            {
-                return Some(Err(ns_error_to_io(reply.label)));
-            }
-
-            let kind_word = reply.word(0);
-            let name_len = reply.word(1) as usize;
-            let bytes = reply.data_bytes();
-            const NAME_OFF: usize = 16; // words 0,1 = kind + name_len
-            let end = NAME_OFF.saturating_add(name_len).min(bytes.len());
-            if end < NAME_OFF + name_len
-            {
-                return Some(Err(io::Error::other(
-                    "seraph fs: NS_READDIR truncated name",
-                )));
-            }
-            let name_bytes = &bytes[NAME_OFF..end];
-
             self.next_idx = self.next_idx.saturating_add(1);
 
             // Filter the FAT-surfaced `.` / `..` entries. Std iterates
             // children, not the dir-self / dir-parent pseudo-entries.
-            if name_bytes == b"." || name_bytes == b".."
+            if entry.name == b"." || entry.name == b".."
             {
                 continue;
             }
 
-            let kind = if kind_word == NodeKind::Dir as u64
+            // The name is wire input. `DirEntry::path` joins it onto the
+            // parent, so only a single valid component names this entry; an
+            // empty name or one with a slash would name another node.
+            if validate_name(&entry.name).is_err()
             {
-                NodeKind::Dir
+                return Some(Err(io::const_error!(
+                    io::ErrorKind::InvalidData,
+                    "seraph fs: NS_READDIR returned an invalid entry name",
+                )));
             }
-            else
-            {
-                NodeKind::File
-            };
-            let name = OsString::from(
-                core::str::from_utf8(name_bytes)
-                    .unwrap_or("<non-utf8>")
-                    .to_owned(),
-            );
+            // `validate_name` accepts only UTF-8.
+            let name = OsString::from(core::str::from_utf8(&entry.name).unwrap_or_default());
             return Some(Ok(DirEntry {
                 name,
-                kind,
+                kind: entry.kind,
                 parent_path: self.parent_path.clone(),
             }));
         }
@@ -374,6 +361,7 @@ impl fmt::Debug for ReadDir
             .field("dir_cap", &self.dir_cap)
             .field("next_idx", &self.next_idx)
             .field("parent_path", &self.parent_path)
+            .field("done", &self.done)
             .finish()
     }
 }
@@ -515,6 +503,15 @@ struct WalkedNode
     kind: NodeKind,
 }
 
+/// Every namespace right `namespace_protocol::rights` defines. A walk that
+/// requests all of them asks for whatever the anchor holds.
+const NS_DEFINED_RIGHTS: u64 = {
+    use namespace_protocol::rights::{
+        ADMIN, EXEC, LOOKUP, MUTATE_DIR, READ, READDIR, STAT, WRITE,
+    };
+    (LOOKUP | READDIR | STAT | READ | WRITE | EXEC | MUTATE_DIR | ADMIN) as u64
+};
+
 /// Internal kind-parameterised walk shared by [`walk_path_to_file`] and
 /// [`walk_path_to_dir`]. `requested_rights` is the mask sent on every
 /// hop; the namespace server intersects it against parent rights and
@@ -523,8 +520,10 @@ struct WalkedNode
 /// target rights mask directly.
 ///
 /// A path with no components (e.g. `"/"`) denotes the anchor directory
-/// itself: directory walks (`Dir`/`Any`) return an owned derived copy
-/// of `root_cap`; file walks reject it with `InvalidInput`.
+/// itself: directory walks (`Dir`/`Any`) return an owned `SEND` copy of
+/// `root_cap` when `requested_rights` includes every right in
+/// [`NS_DEFINED_RIGHTS`], and `InvalidInput` otherwise, since no hop
+/// narrows the anchor; file walks reject it with `InvalidInput`.
 fn walk_components(
     root_cap: u32,
     path_str: &str,
@@ -546,15 +545,30 @@ fn walk_components(
         // so the caller's `cap_delete` bookkeeping is uniform with the
         // walked-child case — handing back the borrowed `root_cap`
         // would let a later release delete the anchor cap.
+        //
+        // The copy keeps the anchor's badge, and with it the anchor's
+        // namespace rights, which only the server narrows
+        // (docs/namespace-model.md § Namespace Rights). It is returned
+        // only to a caller that requests every defined right; a narrower
+        // request cannot be honoured without a hop. `cap_derive` takes the
+        // kernel's endpoint rights, not namespace rights.
         return match expect_kind
         {
             ExpectKind::File => Err(io::const_error!(
                 io::ErrorKind::InvalidInput,
                 "seraph fs: path resolves to no components",
             )),
+            ExpectKind::Dir | ExpectKind::Any
+                if requested_rights & NS_DEFINED_RIGHTS != NS_DEFINED_RIGHTS =>
+            {
+                Err(io::const_error!(
+                    io::ErrorKind::InvalidInput,
+                    "seraph fs: the anchor directory cannot be attenuated",
+                ))
+            }
             ExpectKind::Dir | ExpectKind::Any =>
             {
-                let dup = syscall::cap_derive(root_cap, requested_rights)
+                let dup = syscall::cap_derive(root_cap, syscall_abi::RIGHTS_EP_SEND)
                     .map_err(|_| {
                         io::Error::other("seraph fs: cap_derive of anchor dir failed")
                     })?;
@@ -832,7 +846,8 @@ fn release_split_parent(split: &SplitParent)
 
 /// Inline `FS_WRITE` of at most `WRITE_INLINE_THRESHOLD` bytes at
 /// `offset` against `file_cap`. Returns `bytes_written` reported by
-/// the server (may be short; callers iterate).
+/// the server (may be short; callers iterate), or `InvalidData` when the
+/// server reports more bytes than `payload` holds.
 fn write_inline(
     file_cap: u32,
     offset: u64,
@@ -853,14 +868,157 @@ fn write_inline(
     {
         return Err(map_fs_error(reply.label));
     }
-    Ok(reply.word(0) as usize)
+    let written = reply.word(0) as usize;
+    if written > payload.len()
+    {
+        return Err(io::const_error!(
+            io::ErrorKind::InvalidData,
+            "seraph fs: FS_WRITE reported more bytes than were sent",
+        ));
+    }
+    Ok(written)
 }
 
-/// Bulk write via `FS_WRITE_MEMORY`. Acquires one page-sized DMA
-/// source frame from memmgr, maps it MAP_WRITABLE, then loops chunks
-/// of at most `PAGE_SIZE` bytes through the frame and into the file.
-/// The server returns the source frame in the reply caps each
-/// round-trip, so the cap slot id is rebound on every iteration.
+/// One write's source frame: a page from memmgr, mapped writable at a
+/// reserved VA for the length of the write.
+struct WriteFrame
+{
+    cap: u32,
+    phys: u64,
+    range: crate::sys::reserve::ReservedRange,
+}
+
+impl WriteFrame
+{
+    fn va(&self) -> u64
+    {
+        self.range.va_start()
+    }
+}
+
+/// Request a source frame from memmgr, fund this address space's page
+/// tables for it, and map it. A frame that fails to map was never shown to
+/// a driver, so its cap is deleted and its run returned.
+fn acquire_write_frame(aspace: u32, memmgr_ep: u32) -> io::Result<WriteFrame>
+{
+    use crate::sys::alloc::seraph::{
+        fund_aspace_pt_budget, slab_release_fresh, slab_request_pages,
+    };
+
+    let (cap, _, phys) = slab_request_pages(memmgr_ep, 1)
+        .ok_or_else(|| io::Error::other("seraph fs: memmgr REQUEST_MEMORY_CAPS failed"))?;
+    let range = crate::sys::reserve::reserve_pages(1).map_err(|_| {
+        let _ = syscall::cap_delete(cap);
+        slab_release_fresh(phys);
+        io::Error::other("seraph fs: reserve_pages failed for write frame")
+    })?;
+    let failure = if !fund_aspace_pt_budget(aspace, 1)
+    {
+        Some("seraph fs: page-table funding failed for write frame")
+    }
+    else if syscall::mem_map(cap, aspace, range.va_start(), 0, 1, syscall::MAP_WRITABLE).is_err()
+    {
+        Some("seraph fs: mem_map MAP_WRITABLE failed")
+    }
+    else
+    {
+        None
+    };
+    if let Some(msg) = failure
+    {
+        crate::sys::reserve::unreserve_pages(range);
+        let _ = syscall::cap_delete(cap);
+        slab_release_fresh(phys);
+        return Err(io::Error::other(msg));
+    }
+    Ok(WriteFrame { cap, phys, range })
+}
+
+/// A cookie's read-in-progress mark in the release registry, from before
+/// its `FS_READ_MEMORY` until the local copy from the mapped page is done.
+/// A driver release of the cookie waits on the mark, up to the driver's
+/// release window, so the page is not unmapped, or acked back to the
+/// driver, mid-copy; a copy outlasting the window gets no ack, and the
+/// driver may recycle the page (#516). Dropping the mark ends the read on
+/// every early return.
+struct ReadMark<'a>
+{
+    entry: &'a FileEntry,
+    cookie: u64,
+    ended: bool,
+}
+
+impl<'a> ReadMark<'a>
+{
+    fn begin(entry: &'a FileEntry, cookie: u64) -> Self
+    {
+        release_handler::begin_read(entry, cookie);
+        Self {
+            entry,
+            cookie,
+            ended: false,
+        }
+    }
+
+    /// End the read, registering the page's mapping for release. Returns
+    /// whether a driver release's wait for the read ran out during it.
+    fn finish(mut self, mapping: OutstandingMapping) -> bool
+    {
+        self.ended = true;
+        release_handler::end_read(self.entry, self.cookie, Some(mapping))
+    }
+}
+
+impl Drop for ReadMark<'_>
+{
+    fn drop(&mut self)
+    {
+        if !self.ended
+        {
+            release_handler::end_read(self.entry, self.cookie, None);
+        }
+    }
+}
+
+/// Tear a write frame down and return its run to memmgr: unmap it, revoke
+/// the derivations lent to the driver, delete the cap, and release the run
+/// by its phys base. The release relies on the driver holding no mapping
+/// of the frame past the copy, which services/fs/docs/fs-driver-protocol.md
+/// § Label 12 requires of it; revocation withdraws a derivation the driver
+/// kept but not a mapping it made. A frame whose unmap fails stays mapped,
+/// reserved, and accounted to this process until it exits.
+fn release_write_frame(frame: WriteFrame, aspace: u32)
+{
+    if syscall::mem_unmap(aspace, frame.va(), 1).is_err()
+    {
+        return;
+    }
+    crate::sys::reserve::unreserve_pages(frame.range);
+    let _ = syscall::cap_revoke(frame.cap);
+    let _ = syscall::cap_delete(frame.cap);
+    crate::sys::alloc::seraph::slab_release_fresh(frame.phys);
+}
+
+/// How one `FS_WRITE_MEMORY` chunk failed.
+enum ChunkError
+{
+    /// The call was interrupted after it blocked, possibly after the driver
+    /// received it, so the driver may still copy from the frame.
+    Call(io::Error),
+    /// The frame was not lent, or the driver replied: the frame is idle.
+    Settled(io::Error),
+}
+
+/// Bulk write via `FS_WRITE_MEMORY`: loop chunks of at most `PAGE_SIZE`
+/// bytes through a [`WriteFrame`] acquired for this write and into the
+/// file, then release the frame with [`release_write_frame`]. After an
+/// interrupted call ([`ChunkError::Call`]) the driver may still be copying
+/// from the frame, so it is left mapped and accounted to this process until
+/// it exits instead.
+///
+/// Returns the bytes written. An error after some chunks reached the file
+/// returns their count instead, as a short write, so the caller's position
+/// stays in step with the file; the error recurs on the next call.
 fn write_memory_chunks(
     file_cap: u32,
     aspace: u32,
@@ -870,88 +1028,122 @@ fn write_memory_chunks(
     ipc_buf: *mut u64,
 ) -> io::Result<usize>
 {
-    use ipc::{memmgr_errors, memmgr_labels};
-
-    // Acquire one single-page frame from memmgr.
-    let req = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
-        .word(0, 1)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(memmgr_ep, &req, ipc_buf) }
-        .map_err(|_| io::Error::other("seraph fs: memmgr REQUEST_MEMORY_CAPS ipc_call failed"))?;
-    if reply.label != memmgr_errors::SUCCESS
-    {
-        return Err(io::Error::other("seraph fs: memmgr REQUEST_MEMORY_CAPS failed"));
-    }
-    let mut memory_cap = *reply
-        .caps()
-        .first()
-        .ok_or_else(|| io::Error::other("seraph fs: memmgr returned no frame"))?;
-
-    // Reserve VA and map the frame MAP_WRITABLE.
-    let range = crate::sys::reserve::reserve_pages(1).map_err(|_| {
-        let _ = syscall::cap_delete(memory_cap);
-        io::Error::other("seraph fs: reserve_pages failed for write frame")
-    })?;
-    let va = range.va_start();
-    if syscall::mem_map(memory_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
-    {
-        crate::sys::reserve::unreserve_pages(range);
-        let _ = syscall::cap_delete(memory_cap);
-        return Err(io::Error::other("seraph fs: mem_map MAP_WRITABLE failed"));
-    }
-
+    let frame = acquire_write_frame(aspace, memmgr_ep)?;
     let mut total: usize = 0;
-    let result: io::Result<()> = (|| {
-        while total < payload.len()
+    let mut error = None;
+    let mut frame_idle = true;
+    while total < payload.len()
+    {
+        let chunk = &payload[total..(payload.len().min(total + PAGE_SIZE_USIZE))];
+        let chunk_offset = base_offset.saturating_add(total as u64);
+        match write_frame_chunk(file_cap, &frame, chunk_offset, chunk, ipc_buf)
         {
-            let chunk_len = (payload.len() - total).min(PAGE_SIZE_USIZE);
-            // Copy this chunk to the frame.
-            // SAFETY: VA is mapped MAP_WRITABLE for exactly one page;
-            // chunk_len ≤ PAGE_SIZE.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    payload.as_ptr().add(total),
-                    va as *mut u8,
-                    chunk_len,
-                );
-            }
-            let chunk_offset = base_offset.saturating_add(total as u64);
-            let msg = IpcMessage::builder(fs_labels::FS_WRITE_MEMORY)
-                .word(0, chunk_offset)
-                .word(1, chunk_len as u64)
-                .word(2, 0)
-                .cap(memory_cap)
-                .build();
-            // SAFETY: ipc_buf is the registered IPC buffer.
-            let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
-                .map_err(|_| io::Error::other("seraph fs: FS_WRITE_MEMORY ipc_call failed"))?;
-            if reply.label != fs_errors::SUCCESS
+            Ok(n) =>
             {
-                return Err(map_fs_error(reply.label));
+                total += n;
+                if n < chunk.len()
+                {
+                    // Short write — let the caller (`write_all`) iterate.
+                    break;
+                }
             }
-            // Server moves the source frame back in caps[0]; the slot
-            // id may differ from the one we sent.
-            memory_cap = *reply.caps().first().ok_or_else(|| {
-                io::Error::other("seraph fs: FS_WRITE_MEMORY reply missing memory cap")
-            })?;
-            let n = reply.word(0) as usize;
-            total += n;
-            if n < chunk_len
+            Err(ChunkError::Settled(e)) =>
             {
-                // Short write — let the caller (`write_all`) iterate.
+                error = Some(e);
+                break;
+            }
+            Err(ChunkError::Call(e)) =>
+            {
+                frame_idle = false;
+                error = Some(e);
                 break;
             }
         }
-        Ok(())
-    })();
+    }
+    if frame_idle
+    {
+        release_write_frame(frame, aspace);
+    }
+    match error
+    {
+        Some(e) if total == 0 => Err(e),
+        _ => Ok(total),
+    }
+}
 
-    // Tear down regardless of result.
-    let _ = syscall::mem_unmap(aspace, va, 1);
-    let _ = syscall::cap_delete(memory_cap);
-    crate::sys::reserve::unreserve_pages(range);
-
-    result.map(|()| total)
+/// Copy `chunk` into `frame`, zero the rest of the page, and send one
+/// `FS_WRITE_MEMORY` for it.
+///
+/// The driver receives a `MAP`-only derivation of the frame cap, never the
+/// frame cap itself, and returns it as services/fs/docs/fs-driver-protocol.md
+/// § Label 12 requires. Every cap the reply carries is deleted, and so is
+/// the derivation's handle: a handle the request moved away is stale and its
+/// delete fails harmlessly, as docs/capability-model.md § Capability Handle
+/// Format defines, while one the kernel left here is freed.
+///
+/// Returns the bytes written, or `InvalidData` when the driver reports more
+/// than `chunk` holds.
+fn write_frame_chunk(
+    file_cap: u32,
+    frame: &WriteFrame,
+    offset: u64,
+    chunk: &[u8],
+    ipc_buf: *mut u64,
+) -> Result<usize, ChunkError>
+{
+    // SAFETY: the frame is mapped writable for one page at `frame.va()` and
+    // used by this write alone; `chunk.len() <= PAGE_SIZE`.
+    unsafe {
+        let va = frame.va() as *mut u8;
+        core::ptr::copy_nonoverlapping(chunk.as_ptr(), va, chunk.len());
+        core::ptr::write_bytes(va.add(chunk.len()), 0, PAGE_SIZE_USIZE - chunk.len());
+    }
+    let lent = syscall::cap_derive(frame.cap, syscall_abi::RIGHTS_MEM_MAP).map_err(|_| {
+        ChunkError::Settled(io::Error::other("seraph fs: cap_derive of write frame failed"))
+    })?;
+    let msg = IpcMessage::builder(fs_labels::FS_WRITE_MEMORY)
+        .word(0, offset)
+        .word(1, chunk.len() as u64)
+        .word(2, 0)
+        .cap(lent)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) };
+    if let Ok(r) = &reply
+    {
+        for &cap in r.caps()
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+    }
+    let _ = syscall::cap_delete(lent);
+    // `Interrupted` is the one error an `ipc_call` can return after the
+    // driver received the message; every other one is a refusal before the
+    // call blocked (`ipc::ipc_call` # Errors).
+    let reply = reply.map_err(|e| {
+        let err = io::Error::other("seraph fs: FS_WRITE_MEMORY ipc_call failed");
+        if e == syscall_abi::SyscallError::Interrupted as i64
+        {
+            ChunkError::Call(err)
+        }
+        else
+        {
+            ChunkError::Settled(err)
+        }
+    })?;
+    if reply.label != fs_errors::SUCCESS
+    {
+        return Err(ChunkError::Settled(map_fs_error(reply.label)));
+    }
+    let n = reply.word(0) as usize;
+    if n > chunk.len()
+    {
+        return Err(ChunkError::Settled(io::const_error!(
+            io::ErrorKind::InvalidData,
+            "seraph fs: FS_WRITE_MEMORY reported more bytes than were sent",
+        )));
+    }
+    Ok(n)
 }
 
 /// Send `FS_TRUNCATE(0)` against `file_cap`. v1 only supports the
@@ -1043,10 +1235,11 @@ pub struct File
     /// FS_READ_MEMORY, FS_WRITE, FS_WRITE_MEMORY, FS_TRUNCATE,
     /// FS_CLOSE, synchronous client-initiated FS_RELEASE_MEMORY).
     file_cap: u32,
-    /// Badge identifying this `File` for the release-handler dispatch.
-    /// Carried inside the per-process release endpoint so an inbound
-    /// `FS_RELEASE_MEMORY` from the driver routes to this `File`'s
-    /// outstanding-mappings registry.
+    /// Badge keying this `File`'s entry in the release-handler registry,
+    /// so `Drop` can unregister it; also the badge of `release_send`. A
+    /// driver `FS_RELEASE_MEMORY` is matched by cookie across every
+    /// registered `File`, not by the badge it arrives on: the driver keeps
+    /// one release SEND per node (fs-driver-protocol.md § Label 8).
     badge: u64,
     /// Badged SEND on the per-process release endpoint. We retain
     /// the parent in our CSpace; on Drop we delete it so any
@@ -1361,11 +1554,14 @@ impl File
         {
             return Err(io::Error::other("seraph fs: read cookie entropy draw failed"));
         };
+        let mark = ReadMark::begin(self.entry.as_ref(), cookie);
         // First FS_READ_MEMORY for this File carries the per-process
         // release-endpoint SEND in caps[0]; the driver records it on
         // the OpenFile slot's first allocation so the eviction worker
-        // can route cooperative FS_RELEASE_MEMORY back to us instead
-        // of hard-revoking the page. `swap` ensures only one concurrent
+        // can route a cooperative FS_RELEASE_MEMORY back to us, letting
+        // us unmap the page, or finish a copy from it, before its revoke,
+        // within the driver's cooperative-release window (release_handler).
+        // `swap` ensures only one concurrent
         // reader attempts the transfer — the kernel `transfer_caps`
         // path moves the cap out of our CSpace, leaving the source slot
         // null, so a second concurrent attempt would fail at kernel
@@ -1386,15 +1582,74 @@ impl File
         {
             return Err(map_fs_error(reply.label));
         }
-        let bytes_valid = reply.word(0) as usize;
-        let memory_data_offset = reply.word(2) as usize;
-        let caps = reply.caps();
-        if bytes_valid == 0 || caps.is_empty()
+        let Some((memory_cap, memory_data_offset, bytes_valid)) =
+            self.checked_frame_reply(&reply, cookie)?
+        else
         {
             return Ok(0);
-        }
-        let memory_cap = caps[0];
+        };
 
+        let range = self.map_frame(memory_cap, cookie)?;
+        let va = range.va_start();
+
+        let copy_len = bytes_valid.min(buf.len());
+        let src = (va + memory_data_offset as u64) as *const u8;
+        for (i, byte) in buf[..copy_len].iter_mut().enumerate()
+        {
+            // SAFETY: VA is mapped read-only for one page and
+            // `checked_frame_reply` holds `memory_data_offset + bytes_valid
+            // <= PAGE_SIZE`, so `src + i` lies in the mapped page for every
+            // `i < copy_len <= bytes_valid`. The page is the driver's and
+            // another process may write it: the `ReadMark` holds a driver
+            // release off only within the driver's cooperative-release
+            // window, and the driver's revoke unmaps nothing, so a copy that
+            // outlasts the window can read the page after the driver
+            // recycles it. Volatile reads make that a defined read of
+            // possibly foreign bytes rather than a data race; the copy is
+            // discarded below when it is known to have outlasted the window,
+            // and otherwise cannot be told apart (#516).
+            *byte = unsafe { core::ptr::read_volatile(src.add(i)) };
+        }
+        // The copy is done: hand the mapping to the registry, where a driver
+        // release that waited on the read can now take it.
+        let stalled = mark.finish(OutstandingMapping {
+            cookie,
+            range,
+            memory_cap,
+        });
+
+        // Proactive release: synchronous FS_RELEASE_MEMORY on the file
+        // cap clears the fs-side outstanding entry and decrements the
+        // cache slot's refcount. After ack we own the local cleanup
+        // (take_mapping is no-op if the handler thread already grabbed
+        // it via a forced-release race).
+        self.release_frame(cookie);
+        release_handler::release_one_local(self.entry.as_ref(), self.aspace, cookie);
+
+        // A driver release whose wait ran out during the copy means the
+        // driver's window had passed, so the page may have been recycled:
+        // the bytes are not used, the position stays, and `Interrupted` asks
+        // the caller to read again.
+        if stalled
+        {
+            return Err(io::const_error!(
+                io::ErrorKind::Interrupted,
+                "seraph fs: read page released during the copy",
+            ));
+        }
+        self.pos.fetch_add(copy_len as u64, Ordering::Relaxed);
+        Ok(copy_len)
+    }
+
+    /// Reserve a page, fund this address space's page tables for it, and map
+    /// the read frame `memory_cap` read-only there. On failure the frame cap
+    /// is deleted and `cookie` released.
+    fn map_frame(
+        &self,
+        memory_cap: u32,
+        cookie: u64,
+    ) -> io::Result<crate::sys::reserve::ReservedRange>
+    {
         let range = match crate::sys::reserve::reserve_pages(1)
         {
             Ok(r) => r,
@@ -1406,48 +1661,69 @@ impl File
             }
         };
         let va = range.va_start();
-        if syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READONLY).is_err()
+        let failure = if !crate::sys::alloc::seraph::fund_aspace_pt_budget(self.aspace, 1)
+        {
+            Some("seraph fs: page-table funding failed for read frame")
+        }
+        else if syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READ).is_err()
+        {
+            Some("seraph fs: mem_map failed")
+        }
+        else
+        {
+            None
+        };
+        if let Some(msg) = failure
         {
             crate::sys::reserve::unreserve_pages(range);
             let _ = syscall::cap_delete(memory_cap);
             self.release_frame(cookie);
-            return Err(io::Error::other("seraph fs: mem_map failed"));
+            return Err(io::Error::other(msg));
         }
+        Ok(range)
+    }
 
-        // Register the mapping with the release handler before exposing
-        // it to the local copy: a forced release racing in must observe
-        // the entry so it can clean up if it wins. Local cleanup below
-        // wins via take_mapping if we ack first.
-        release_handler::add_mapping(
-            self.entry.as_ref(),
-            OutstandingMapping {
-                cookie,
-                range,
-                memory_cap,
-            },
-        );
-
-        let copy_len = bytes_valid.min(buf.len());
-        // SAFETY: VA is mapped read-only for one page; the fs invariant
-        // is `memory_data_offset + bytes_valid <= PAGE_SIZE`.
-        let src = unsafe {
-            core::slice::from_raw_parts(
-                (va + memory_data_offset as u64) as *const u8,
-                bytes_valid,
-            )
-        };
-        buf[..copy_len].copy_from_slice(&src[..copy_len]);
-        self.pos.fetch_add(copy_len as u64, Ordering::Relaxed);
-
-        // Proactive release: synchronous FS_RELEASE_MEMORY on the file
-        // cap clears the fs-side outstanding entry and decrements the
-        // cache slot's refcount. After ack we own the local cleanup
-        // (take_mapping is no-op if the handler thread already grabbed
-        // it via a forced-release race).
+    /// Validate an `FS_READ_MEMORY` success reply as wire input before the
+    /// client maps or slices anything. Returns the frame cap, the data offset
+    /// in it, and the valid byte count; `None` for end of file (no bytes and
+    /// no cap); or `InvalidData` for bytes without a cap, or a span the driver
+    /// should have bounded by the page tail (services/fs/docs/fs-driver-protocol.md
+    /// § Label 7) that runs past the one page the client maps. Every outcome
+    /// but the first deletes the reply's cap and releases `cookie`.
+    fn checked_frame_reply(
+        &self,
+        reply: &IpcMessage,
+        cookie: u64,
+    ) -> io::Result<Option<(u32, usize, usize)>>
+    {
+        let bytes_valid = reply.word(0) as usize;
+        let memory_data_offset = reply.word(2) as usize;
+        let memory_cap = reply.caps().first().copied();
+        let in_page = memory_data_offset
+            .checked_add(bytes_valid)
+            .is_some_and(|end| end <= PAGE_SIZE_USIZE);
+        match memory_cap
+        {
+            Some(cap) if bytes_valid != 0 && in_page =>
+            {
+                return Ok(Some((cap, memory_data_offset, bytes_valid)));
+            }
+            Some(cap) =>
+            {
+                let _ = syscall::cap_delete(cap);
+            }
+            None =>
+            {}
+        }
         self.release_frame(cookie);
-        release_handler::release_one_local(self.entry.as_ref(), self.aspace, cookie);
-
-        Ok(copy_len)
+        if bytes_valid == 0
+        {
+            return Ok(None);
+        }
+        Err(io::const_error!(
+            io::ErrorKind::InvalidData,
+            "seraph fs: FS_READ_MEMORY reply carries no frame or a span past its page",
+        ))
     }
 
     fn release_frame(&self, cookie: u64)
@@ -1601,9 +1877,10 @@ impl Drop for File
         let ipc_buf = crate::os::seraph::current_ipc_buf();
         // FS_CLOSE: fs walks its outstanding-page table and revokes
         // every per-cookie ancestor cap, decrementing each cache-slot
-        // refcount. Any of our locally-mapped pages now point at a cap
-        // whose mapping has been torn down by the kernel revocation;
-        // we still need to mem_unmap the VA and free the slot.
+        // refcount. The revoke invalidates our derived caps but leaves
+        // their mappings in place, and fs may recycle the pages (#516),
+        // so each VA must still be unmapped, its reservation freed, and
+        // its cap deleted.
         if !ipc_buf.is_null()
         {
             let close = IpcMessage::new(fs_labels::FS_CLOSE);
@@ -1612,32 +1889,25 @@ impl Drop for File
         }
         let _ = syscall::cap_delete(self.file_cap);
 
-        // Drain the registry entry. After unregister, the handler
-        // thread cannot route any further FS_RELEASE_MEMORY to this
-        // File — a late forced release on our badge finds no entry
-        // and no-ops with an ack.
+        // Drain the registry entry. A driver release that arrives after
+        // unregister, on whichever badge, finds no entry and is acked
+        // without action. One already dispatched may take a mapping first
+        // and discard it itself; `drain_mappings` and the handler each
+        // take a mapping out of `idle` under its lock, so they split the
+        // mappings without overlap.
         if let Some(state) = release_handler::state()
         {
             if let Some(entry) = release_handler::unregister(state, self.badge)
             {
                 for m in release_handler::drain_mappings(entry.as_ref())
                 {
-                    let _ = syscall::mem_unmap(
-                        self.aspace,
-                        m.range.va_start(),
-                        m.range.page_count(),
-                    );
-                    let _ = syscall::cap_delete(m.memory_cap);
-                    crate::sys::reserve::unreserve_pages(m.range);
+                    release_handler::discard_mapping(m, self.aspace);
                 }
             }
         }
 
-        // Drop the per-File badged SEND. fs's caps[0] copy survives
-        // until cap_delete on its slot; revoke would also kill it but
-        // we rely on fs's FS_CLOSE handler having already cleared its
-        // OpenFile entry, after which fs's slot is a dangling SEND
-        // that will be reaped on fs's CSpace cleanup at process death.
+        // Drop the per-File badged SEND. The driver's copy of it, if the
+        // driver recorded one, is deleted by its FS_CLOSE handler.
         let _ = syscall::cap_delete(self.release_send);
     }
 }
@@ -1766,6 +2036,7 @@ pub fn readdir(path: &Path) -> io::Result<ReadDir>
         dir_cap: walked.dir_cap,
         next_idx: 0,
         parent_path: PathBuf::from(path_str),
+        done: false,
     })
 }
 
@@ -2045,10 +2316,22 @@ fn drain_dir_recursive(dir_cap: u32, ipc_buf: *mut u64) -> io::Result<()>
             idx = idx.saturating_add(1);
             continue;
         }
+        // The name is wire input. Walked as a path, an empty or slash-only
+        // name would name `dir_cap` itself and recurse without end, and a
+        // name with a slash would drain another directory; only a single
+        // valid component names this entry.
+        if validate_name(&entry.name).is_err()
+        {
+            return Err(io::const_error!(
+                io::ErrorKind::InvalidData,
+                "seraph fs: NS_READDIR returned an invalid entry name",
+            ));
+        }
 
         if matches!(entry.kind, NodeKind::Dir)
         {
-            let leaf_str = core::str::from_utf8(&entry.name).unwrap_or("");
+            // `validate_name` accepts only UTF-8.
+            let leaf_str = core::str::from_utf8(&entry.name).unwrap_or_default();
             let walked = walk_components(
                 dir_cap,
                 leaf_str,
@@ -2106,11 +2389,11 @@ fn ns_readdir_one(
     let name_len = reply.word(1) as usize;
     let bytes = reply.data_bytes();
     const NAME_OFF: usize = 16;
-    let end = NAME_OFF.saturating_add(name_len).min(bytes.len());
-    if end < NAME_OFF + name_len
+    let Some(end) = NAME_OFF.checked_add(name_len).filter(|&e| e <= bytes.len())
+    else
     {
         return Err(io::Error::other("seraph fs: NS_READDIR truncated name"));
-    }
+    };
     let kind = if kind_word == NodeKind::Dir as u64
     {
         NodeKind::Dir

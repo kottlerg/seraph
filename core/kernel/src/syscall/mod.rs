@@ -55,8 +55,9 @@ use syscall::{
 ///
 /// Every entry from user mode at which the thread can be descheduled
 /// publishes its live frame as the thread's `trap_frame` (see
-/// docs/arch-interface.md § `trap_frame`); an interrupt or exception taken
-/// since the last syscall may have pointed it at a frame lower on the stack.
+/// core/kernel/docs/arch-interface.md § `trap_frame`); an interrupt or
+/// exception taken since the last syscall may have pointed it at a frame
+/// lower on the stack.
 ///
 /// # Safety
 /// Called from syscall entry with interrupts masked, with `frame` the live
@@ -103,7 +104,8 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     // SAFETY: caller guarantees tf is valid. The `&mut` is not exclusive for
     // the whole call: while the thread blocks in a handler, other paths access
     // the frame through the published `trap_frame`, a gap
-    // docs/arch-interface.md § `trap_frame` states and #514 tracks.
+    // core/kernel/docs/arch-interface.md § `trap_frame` states and #514
+    // tracks.
     let tf = unsafe { &mut *tf };
 
     let nr = tf.syscall_nr();

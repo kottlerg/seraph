@@ -541,7 +541,7 @@ pub unsafe fn start_ap(
     // The PM32 stub loads CR3 with a 32-bit `mov cr3, eax`, so the kernel root
     // table must lie below 4 GiB; the bootloader does not yet guarantee that
     // (#443). Halt with a reason rather than start the AP on a truncated root.
-    let Ok(pml4_pa) = u32::try_from(crate::mm::paging::kernel_pml4_pa())
+    let Ok(pml4_pa) = u32::try_from(crate::mm::paging::kernel_root_table_pa())
     else
     {
         crate::fatal("smp: kernel root page table above 4 GiB; the AP CR3 load is 32-bit");

@@ -56,7 +56,7 @@ use super::PAGE_SIZE;
 #[cfg(not(test))]
 use crate::arch::current::paging as arch_paging;
 
-// ── Kernel PML4 physical address ──────────────────────────────────────────────
+// ── Kernel root page table physical address ───────────────────────────────────
 
 /// Physical address of the kernel's root page table (PML4 on x86-64, the
 /// negotiated-mode root on RISC-V).
@@ -64,20 +64,20 @@ use crate::arch::current::paging as arch_paging;
 /// Set once during Phase 3 by `init_kernel_page_tables`. APs load this into CR3
 /// (x86-64) or `satp` (RISC-V) during the SMP startup sequence.
 #[cfg(not(test))]
-static KERNEL_PML4_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static KERNEL_ROOT_TABLE_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Return the physical address of the kernel root page table.
 ///
 /// Returns 0 until `init_kernel_page_tables` completes (Phase 3).
 #[cfg(not(test))]
-pub fn kernel_pml4_pa() -> u64
+pub fn kernel_root_table_pa() -> u64
 {
-    KERNEL_PML4_PA.load(core::sync::atomic::Ordering::Relaxed)
+    KERNEL_ROOT_TABLE_PA.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Test stub.
 #[cfg(test)]
-pub fn kernel_pml4_pa() -> u64
+pub fn kernel_root_table_pa() -> u64
 {
     0
 }
@@ -420,7 +420,7 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), PagingError>
     }
 
     // Save the root page table physical address so APs can load it during startup.
-    KERNEL_PML4_PA.store(root_pa, core::sync::atomic::Ordering::Relaxed);
+    KERNEL_ROOT_TABLE_PA.store(root_pa, core::sync::atomic::Ordering::Relaxed);
 
     // Compute the highest physical address to determine direct map extent.
     let max_phys = compute_max_physical_address(info);

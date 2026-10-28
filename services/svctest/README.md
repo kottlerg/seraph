@@ -29,12 +29,12 @@ services/svctest/
         ├── startup.rs         # argv, env, stack envelope, TLS at entry; unset cwd path
         ├── memmgr.rs          # Heap allocator over memmgr; all-RAM-accounted identity
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, `RwLock`, `Condvar`
-        ├── procmgr.rs         # `std::process::Command` spawn, cwd, and error paths
+        ├── procmgr.rs         # `std::process::Command` spawn, cwd, error paths; refused requests
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
-        ├── devmgr.rs          # Shutdown-device and test-label deny; `TEST_SPAWN_ORPHAN` teardown
+        ├── devmgr.rs          # Block, shutdown, test-label deny; `TEST_SPAWN_ORPHAN` teardown
         ├── pager.rs           # Demand paging: backed, declined, and pinned faults
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
@@ -93,12 +93,13 @@ slot stays zero.
 
 The svcmgr seed-only phase also reads every slot and fails when any is zero, as evidence that
 its name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the
-devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_SHUTDOWN_DEVICE`,
-`TEST_SPAWN_ORPHAN`, and `TEST_ORPHAN_RESULT`. `caps[3]` exists for the orphan-teardown phase's
-`TEST_SPAWN_ORPHAN` shim (TODO(#165): retire with that shim). Every seed is seed-only in
-svcmgr's registry. The no-authority `pwrmgr.deny` cap is public, so svctest resolves it through
-`QUERY_ENDPOINT` on its per-process `service_registry_cap` and spends no seed slot on it; it
-drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED` reply to `SHUTDOWN`.
+devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE`,
+`QUERY_SHUTDOWN_DEVICE`, `TEST_SPAWN_ORPHAN`, and `TEST_ORPHAN_RESULT`. `caps[3]` exists for
+the orphan-teardown phase's `TEST_SPAWN_ORPHAN` shim (TODO(#165): retire with that shim).
+Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is public, so
+svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap` and spends
+no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED` reply
+to `SHUTDOWN`.
 
 ---
 
@@ -116,6 +117,7 @@ token falls through to the normal run.
 | `cwd-child`                 | `procmgr`      | `command_cwd_inherit` (cwd-cap delivery)    |
 | `blobs-fill-child`          | `procmgr`      | `command_blobs_fill_message` (full message) |
 | `park-child`                | `procmgr`      | `command_from_spawned_thread` (kill, drop)  |
+| `undeliverable-reply-child` | `procmgr`      | `procmgr_refusals` (failed create reply)    |
 | `release-child`             | `fs_std`       | `std_release_matched_by_cookie` (fake fs)   |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |

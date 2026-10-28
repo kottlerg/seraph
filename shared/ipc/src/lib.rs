@@ -121,8 +121,10 @@ pub mod procmgr_labels
     /// [`CREATE_DEATH_RELAY`] is set in the label; when present it is the
     /// LAST cap in the message (procmgr peels it off the tail, so the
     /// `creator_endpoint` slot stays positionally fixed regardless of
-    /// relay presence). Stdio pipes are installed via separate
-    /// [`CONFIGURE_PIPE`] calls between create and start.
+    /// relay presence), and it is a cap of its own: a relay request whose
+    /// only cap is `file_cap` is refused with `INVALID_ARGUMENT`. Stdio
+    /// pipes are installed via separate [`CONFIGURE_PIPE`] calls between
+    /// create and start.
     pub const CREATE_FROM_FILE: u64 = 13;
     /// Label flag (bit 16) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
     /// create the new process *pinned* — eager-mapped, with no system pager.
@@ -140,8 +142,9 @@ pub mod procmgr_labels
     pub const CREATE_PINNED: u64 = 1 << 16;
     /// Label flag (bit 17) for [`CREATE_FROM_FILE`]: the message carries a
     /// trailing death-relay POST-only `EventQueue` cap (the LAST cap in the
-    /// message). At finalize procmgr binds it as an `AddressSpace` death
-    /// observer (correlator 0) on the child so that a terminal fault in any
+    /// message, which then carries at least two caps). Once the child is
+    /// recorded, procmgr binds it as an `AddressSpace` death observer
+    /// (correlator 0) on the child so that a terminal fault in any
     /// of the child's threads posts the fault class straight to the
     /// spawner's own death queue, letting `Child::wait()` return. procmgr
     /// `cap_delete`s its copy after the bind (the kernel captured the
@@ -225,9 +228,10 @@ pub mod procmgr_labels
     ///
     /// Ordering: valid only between `CREATE_PROCESS` and `START_PROCESS`.
     /// Replies `ALREADY_STARTED` if the target is running.
-    /// `INVALID_BADGE` if the `process_handle` is unknown. Idempotent
-    /// per direction before start; later calls overwrite the previous
-    /// triple for that direction.
+    /// `INVALID_BADGE` if the `process_handle` is unknown. Each direction
+    /// is configured at most once: a second call for a configured
+    /// direction replies `INVALID_ARGUMENT`, and a refused call installs
+    /// nothing in the child.
     ///
     /// Spawners call this 0–3 times depending on which directions are
     /// piped. The 3 caps × 3 directions = 9 caps total exceeds
@@ -333,17 +337,18 @@ pub mod procmgr_labels
     ///
     /// Procmgr binds the death-EQ on both init threads (main and
     /// init-logd) with correlator `INIT_REAP_CORRELATOR` as part of the
-    /// first round, and reaps once both have exited. Each round replies
-    /// `procmgr_errors::SUCCESS`, or `INVALID_ARGUMENT` on the reject
-    /// arms in `services/procmgr/docs/ipc-interface.md`
-    /// § `REGISTER_INIT_TEARDOWN`.
+    /// first round, and reaps once both have exited. Only an un-badged
+    /// cap is accepted, and the handoff is one-shot. Each round replies
+    /// `procmgr_errors::SUCCESS`, `UNAUTHORIZED` from a badged sender, or
+    /// `INVALID_ARGUMENT` on the reject arms in
+    /// `services/procmgr/docs/ipc-interface.md` § `REGISTER_INIT_TEARDOWN`.
     pub const REGISTER_INIT_TEARDOWN: u64 = 15;
 
     /// Notification end of init's reap-handoff cap stream. After this call
     /// init has no caps left to transfer; procmgr's state machine
-    /// transitions to "armed", awaiting the death-EQ event. Init
-    /// calls `sys_thread_exit` immediately after this IPC replies. Replies
-    /// `INVALID_ARGUMENT` when no teardown is pending or the state machine
+    /// transitions to "armed". Init calls `sys_thread_exit` immediately
+    /// after this IPC replies. Replies `UNAUTHORIZED` from a badged sender,
+    /// and `INVALID_ARGUMENT` when no handoff is open or the state machine
     /// is already armed.
     pub const INIT_TEARDOWN_DONE: u64 = 16;
 
@@ -1368,15 +1373,15 @@ pub mod fs_labels
     pub const FS_TRUNCATE: u64 = 17;
 }
 
-pub const DEVMGR_LABELS_VERSION: u32 = 8;
+pub const DEVMGR_LABELS_VERSION: u32 = 9;
 /// IPC labels for the device manager (`devmgr`).
 pub mod devmgr_labels
 {
     /// Query for a block device endpoint.
     ///
-    /// Mints a `MOUNT_AUTHORITY`-badged `SEND_GRANT` cap on
+    /// Mints a `MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` cap on
     /// `blk_ep` to the caller. Caller's badge must have
-    /// [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies
+    /// [`BLOCK_DEVICE_AUTHORITY`] set; the handler replies
     /// `UNAUTHORIZED` otherwise.
     pub const QUERY_BLOCK_DEVICE: u64 = 1;
     /// Query a device's startup-info payload from devmgr's catalog.
@@ -1396,11 +1401,12 @@ pub mod devmgr_labels
     pub const QUERY_DEVICE_INFO: u64 = 2;
     /// Query for the serial (UART) device endpoint.
     ///
-    /// Mints a `serial_labels::WRITE_AUTHORITY`-badged `SEND_GRANT`
-    /// cap on the serial driver's service endpoint to the caller.
+    /// Mints a `serial_labels::WRITE_AUTHORITY |
+    /// serial_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap on the
+    /// serial driver's service endpoint to the caller.
     /// Caller's badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the
     /// handler replies `UNAUTHORIZED` otherwise. Mirrors
-    /// [`QUERY_BLOCK_DEVICE`].
+    /// [`QUERY_BLOCK_DEVICE`]'s reply shape.
     pub const QUERY_SERIAL_DEVICE: u64 = 3;
     /// Query for the framebuffer device endpoint.
     ///
@@ -1482,7 +1488,10 @@ pub mod devmgr_labels
     /// table — never a table body. Replies
     /// [`super::devmgr_errors::NO_DEVICE`] when the table is not found,
     /// both `data[1]` and `data[2]` are zero, or `data[1]` has bits above
-    /// its low 32.
+    /// its low 32, [`super::devmgr_errors::INVALID_REQUEST`] when deriving
+    /// the reply's Memory cap from the region fails, and
+    /// [`super::devmgr_errors::LABEL_VERSION_MISMATCH`] when `data[0]` is
+    /// not `DEVMGR_LABELS_VERSION`.
     pub const QUERY_ACPI_TABLE: u64 = 7;
 
     /// Carve and serve the platform shutdown-actuator hardware caps.
@@ -1548,11 +1557,14 @@ pub mod devmgr_labels
     pub const TEST_ORPHAN_RESULT: u64 = 10;
 
     /// Authority bit in the devmgr-registry-endpoint badge's high
-    /// u64 bit. Set on caps minted for consumers permitted to call
-    /// [`QUERY_BLOCK_DEVICE`] (today: vfsd). Without it the handler
-    /// replies `UNAUTHORIZED`. Gating `QUERY_BLOCK_DEVICE` upstream of
-    /// virtio-blk closes the minter-side surface: `MOUNT_AUTHORITY`
-    /// caps are never issued to consumers devmgr did not authorise.
+    /// u64 bit, gating the device-endpoint queries ([`QUERY_SERIAL_DEVICE`],
+    /// [`QUERY_FRAMEBUFFER_DEVICE`], [`QUERY_RTC_DEVICE`],
+    /// [`QUERY_INPUT_DEVICE`]) and [`QUERY_ACPI_TABLE`]. Set on every
+    /// consumer query cap: svcmgr's `devmgr.*` publications, the SEND
+    /// svcmgr mints for logd at launch, and the SEND init hands vfsd (the
+    /// per-device SENDs drivers hold for [`QUERY_DEVICE_INFO`] lack it).
+    /// Without it those handlers reply `UNAUTHORIZED`. It does not admit
+    /// [`QUERY_BLOCK_DEVICE`], which [`BLOCK_DEVICE_AUTHORITY`] gates.
     pub const REGISTRY_QUERY_AUTHORITY: u64 = 1u64 << 63;
     /// Authority bit gating [`SET_DRIVERS_DIR`]. svcmgr mints a SEND
     /// cap carrying this bit from the devmgr-registry source cap init
@@ -1574,6 +1586,14 @@ pub mod devmgr_labels
     /// seed-only as [`crate::published_names::DEVMGR_TEST`], which svctest
     /// alone seeds. Disjoint position from the other authority bits.
     pub const ORPHAN_TEST_AUTHORITY: u64 = 1u64 << 60;
+    /// Authority bit gating [`QUERY_BLOCK_DEVICE`], whose reply is a
+    /// `MOUNT_AUTHORITY`-badged whole-disk cap. init mints it, beside
+    /// [`REGISTRY_QUERY_AUTHORITY`], only onto the registry SEND it hands
+    /// vfsd; svcmgr mints it onto none of its `devmgr.*` publications, so
+    /// no other process holds the bit. Gating upstream of virtio-blk keeps
+    /// `MOUNT_AUTHORITY` caps with the one consumer devmgr authorises.
+    /// Disjoint position from the other authority bits.
+    pub const BLOCK_DEVICE_AUTHORITY: u64 = 1u64 << 59;
 }
 
 /// Device-info kind discriminants for [`devmgr_labels::QUERY_DEVICE_INFO`]
@@ -1973,10 +1993,12 @@ pub mod stream_labels
 /// (docs/capability-model.md § Verb-bit authority pattern). Endpoints with no
 /// verb gate (bootstrap endpoints, memmgr, namespace node caps) do not
 /// reserve them.
-pub const VERB_BIT_MASK: u64 = (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60);
+pub const VERB_BIT_MASK: u64 =
+    (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60) | (1u64 << 59);
 const _: () = core::assert!(
     devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::ORPHAN_TEST_AUTHORITY & VERB_BIT_MASK != 0
+        && devmgr_labels::BLOCK_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
 );
 
 /// Reserved log-endpoint badges.
@@ -2120,10 +2142,16 @@ pub mod procmgr_errors
     pub const INVALID_ELF: u64 = 1;
     /// Out of memory during process creation.
     pub const OUT_OF_MEMORY: u64 = 2;
+    /// `START_PROCESS`: configuring the child's main thread
+    /// (`thread_configure_with_tls`) failed.
+    pub const THREAD_CONFIGURE_FAILED: u64 = 3;
     /// Process handle badge not found in process table.
     pub const INVALID_BADGE: u64 = 4;
     /// Attempt to start a process that was already started.
     pub const ALREADY_STARTED: u64 = 5;
+    /// `START_PROCESS`: starting the child's main thread (`thread_start`)
+    /// failed with an error other than `Interrupted`, which procmgr retries.
+    pub const THREAD_START_FAILED: u64 = 6;
     /// Invalid argument to an IPC request.
     pub const INVALID_ARGUMENT: u64 = 7;
     /// File not found while walking a namespace cap on the spawner side.
@@ -2224,7 +2252,7 @@ pub mod devmgr_errors
     /// Cap derivation failed, or invalid device index.
     pub const INVALID_REQUEST: u64 = 1;
     /// Caller's badge lacks the verb bit required by the handler
-    /// (e.g. `REGISTRY_QUERY_AUTHORITY` for `QUERY_BLOCK_DEVICE`).
+    /// (e.g. `BLOCK_DEVICE_AUTHORITY` for `QUERY_BLOCK_DEVICE`).
     pub const UNAUTHORIZED: u64 = 2;
     /// Caller's compiled `DEVMGR_LABELS_VERSION` does not match the receiver's.
     /// `QUERY_BLOCK_DEVICE` is the handshake entry point and carries the

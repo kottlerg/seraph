@@ -7,8 +7,9 @@
 //!
 //! Hosts the child-mode entries `cwd_child_main` (spawned by
 //! `command_cwd_inherit_phase`), `blobs_fill_child_main` (spawned by
-//! `command_blobs_fill_message_phase`), and `park_child_main` (spawned by
-//! `command_from_spawned_thread_phase`).
+//! `command_blobs_fill_message_phase`), `park_child_main` (spawned by
+//! `command_from_spawned_thread_phase`), and `undeliverable_reply_child_main`
+//! (spawned by `procmgr_refusals_phase`).
 
 use std::os::seraph::startup_info;
 
@@ -26,8 +27,8 @@ pub fn spawn_only() -> &'static [Phase]
     }]
 }
 
-/// `command_*` and `stdio_file_unsupported` run after the namespace
-/// cluster has established attenuation invariants.
+/// `command_*`, `stdio_file_unsupported`, and `procmgr_refusals` run after
+/// the namespace cluster has established attenuation invariants.
 pub fn command_phases() -> &'static [Phase]
 {
     &[
@@ -63,6 +64,10 @@ pub fn command_phases() -> &'static [Phase]
             name: "stdio_file_unsupported",
             run: stdio_file_unsupported_phase,
         },
+        Phase {
+            name: "procmgr_refusals",
+            run: procmgr_refusals_phase,
+        },
     ]
 }
 
@@ -83,6 +88,10 @@ pub fn reentry_main(role: &str)
     if role == PARK_ROLE
     {
         park_child_main();
+    }
+    if role == UNDELIVERABLE_ROLE
+    {
+        undeliverable_reply_child_main();
     }
 }
 
@@ -521,4 +530,294 @@ pub fn stdio_file_unsupported_phase(_: &Caps)
         "Stdio::from(File) spawn error must be Unsupported, got {err:?}"
     );
     std::os::seraph::log!("stdio_file_unsupported phase passed");
+}
+
+/// Rounds of each refused request in [`procmgr_refusals_phase`]: the phase
+/// repeats every request, as a client flooding procmgr would.
+const REFUSAL_ROUNDS: usize = 16;
+
+/// A cap to attach to a request: a SEND copy of svctest's own procmgr cap,
+/// which the call moves into procmgr's `CSpace`.
+fn spare_cap() -> u32
+{
+    syscall::cap_derive(startup_info().procmgr_endpoint, syscall::RIGHTS_EP_SEND)
+        .expect("deriving a spare cap to attach failed")
+}
+
+/// Call `target` with `msg` and assert procmgr replies `want`.
+fn expect_reply(target: u32, msg: &ipc::IpcMessage, want: u64, what: &str)
+{
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(target, msg, std::os::seraph::current_ipc_buf()) }
+        .unwrap_or_else(|e| panic!("{what}: ipc_call failed ({e})"));
+    assert_eq!(reply.label, want, "{what}: procmgr replied {}", reply.label);
+}
+
+/// Look up `/programs/hello` and return `(file_cap, size)`.
+fn hello_file() -> (u32, u64)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let root = std::os::seraph::root_dir_cap();
+    let (programs, _, _) = crate::ipc_util::ns::ns_lookup(root, b"programs", 0xFFFF, ipc_buf)
+        .expect("ns_lookup /programs failed");
+    let (file, _, size) = crate::ipc_util::ns::ns_lookup(programs, b"hello", 0xFFFF, ipc_buf)
+        .expect("ns_lookup /programs/hello failed");
+    let _ = syscall::cap_delete(programs);
+    (file, size)
+}
+
+/// procmgr refuses requests whose sender or shape its wire contract does not
+/// admit, and deletes every cap they carried (see
+/// `services/procmgr/docs/ipc-interface.md` § Capability Transfer):
+/// `REGISTER_DEATH_EQ` from a sender without the `DEATH_EQ_AUTHORITY` badge,
+/// the init-reap labels (`REGISTER_INIT_TEARDOWN`, `INIT_TEARDOWN_DONE`) from
+/// any badged sender, an unknown opcode, a `CREATE_FROM_FILE` that sets
+/// `CREATE_DEATH_RELAY` on a message whose only cap is the file cap, and a
+/// `CONFIGURE_PIPE` with an unknown direction or for a direction already
+/// configured. Each refused request carries caps. procmgr's slot count is not
+/// observable from a client, so each cell asserts the refusal reply, and a
+/// spawn afterwards shows procmgr still serves. The phase then checks that
+/// procmgr destroys a child whose create reply it cannot deliver
+/// ([`undeliverable_reply_child_main`]).
+pub fn procmgr_refusals_phase(_: &Caps)
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+
+    let procmgr = startup_info().procmgr_endpoint;
+    for _ in 0..REFUSAL_ROUNDS
+    {
+        expect_reply(
+            procmgr,
+            &IpcMessage::builder(procmgr_labels::REGISTER_DEATH_EQ)
+                .cap(spare_cap())
+                .build(),
+            procmgr_errors::UNAUTHORIZED,
+            "REGISTER_DEATH_EQ without DEATH_EQ_AUTHORITY",
+        );
+        expect_reply(
+            procmgr,
+            &IpcMessage::builder(procmgr_labels::REGISTER_INIT_TEARDOWN)
+                .word(0, 1)
+                .cap(spare_cap())
+                .cap(spare_cap())
+                .cap(spare_cap())
+                .cap(spare_cap())
+                .build(),
+            procmgr_errors::UNAUTHORIZED,
+            "REGISTER_INIT_TEARDOWN first round from a badged sender",
+        );
+        expect_reply(
+            procmgr,
+            &IpcMessage::builder(procmgr_labels::REGISTER_INIT_TEARDOWN)
+                .word(0, 0)
+                .cap(spare_cap())
+                .build(),
+            procmgr_errors::UNAUTHORIZED,
+            "REGISTER_INIT_TEARDOWN donation round from a badged sender",
+        );
+        expect_reply(
+            procmgr,
+            &IpcMessage::builder(procmgr_labels::INIT_TEARDOWN_DONE)
+                .cap(spare_cap())
+                .build(),
+            procmgr_errors::UNAUTHORIZED,
+            "INIT_TEARDOWN_DONE from a badged sender",
+        );
+        expect_reply(
+            procmgr,
+            &IpcMessage::builder(3).cap(spare_cap()).build(),
+            procmgr_errors::UNKNOWN_OPCODE,
+            "unassigned label 3",
+        );
+        let (file, size) = hello_file();
+        expect_reply(
+            procmgr,
+            &IpcMessage::builder(
+                procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_DEATH_RELAY,
+            )
+            .word(0, size)
+            .cap(file)
+            .build(),
+            procmgr_errors::INVALID_ARGUMENT,
+            "CREATE_FROM_FILE with the relay flag and only the file cap",
+        );
+    }
+
+    configure_pipe_refusals();
+
+    let status = std::process::Command::new("/programs/hello")
+        .status()
+        .expect("spawn after the refused requests failed");
+    assert!(
+        status.success(),
+        "hello after the refused requests exited {status}"
+    );
+
+    let status = std::process::Command::new("/tests/svctest")
+        .arg(UNDELIVERABLE_ROLE)
+        .status()
+        .expect("spawning the undeliverable-reply child failed");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "undeliverable-reply child exit {status}: {UNDELIVERABLE_LOOKUP_FAILED}=lookup failed, \
+         {UNDELIVERABLE_REPLY_DELIVERED}=create reply delivered or not refused, \
+         {UNDELIVERABLE_POOL_QUERY_FAILED}=pool query failed, \
+         {UNDELIVERABLE_NEVER_RECLAIMED}=the child's pages were never reclaimed, \
+         {UNDELIVERABLE_CALL_FAILED}=the create call failed"
+    );
+    std::os::seraph::log!("procmgr_refusals phase passed");
+}
+
+/// `CONFIGURE_PIPE` cells on a child created (and never started) through raw
+/// `CREATE_FROM_FILE`: an unknown direction is refused, the first stdout
+/// configuration succeeds, and a second one for stdout is refused, since an
+/// installed triple cannot be replaced. procmgr does not check the caps'
+/// types, so spare caps stand in for the shmem page and notifications.
+fn configure_pipe_refusals()
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+
+    let (file, size) = hello_file();
+    let create = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
+        .word(0, size)
+        .cap(file)
+        .build();
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let reply = unsafe {
+        ipc::ipc_call(
+            startup_info().procmgr_endpoint,
+            &create,
+            std::os::seraph::current_ipc_buf(),
+        )
+    }
+    .expect("raw CREATE_FROM_FILE call failed");
+    assert_eq!(
+        reply.label,
+        procmgr_errors::SUCCESS,
+        "raw CREATE_FROM_FILE refused"
+    );
+    let (handle, thread) = match reply.caps()
+    {
+        &[handle, thread] => (handle, thread),
+        other => panic!("CREATE_FROM_FILE replied {} caps", other.len()),
+    };
+    let pipe = |direction: u64| {
+        IpcMessage::builder(procmgr_labels::CONFIGURE_PIPE)
+            .word(0, direction)
+            .word(1, 0)
+            .cap(spare_cap())
+            .cap(spare_cap())
+            .cap(spare_cap())
+            .build()
+    };
+    expect_reply(
+        handle,
+        &pipe(7),
+        procmgr_errors::INVALID_ARGUMENT,
+        "CONFIGURE_PIPE with an unknown direction",
+    );
+    expect_reply(
+        handle,
+        &pipe(procmgr_labels::PIPE_DIR_STDOUT),
+        procmgr_errors::SUCCESS,
+        "first CONFIGURE_PIPE for stdout",
+    );
+    expect_reply(
+        handle,
+        &pipe(procmgr_labels::PIPE_DIR_STDOUT),
+        procmgr_errors::INVALID_ARGUMENT,
+        "second CONFIGURE_PIPE for stdout",
+    );
+    expect_reply(
+        handle,
+        &IpcMessage::new(procmgr_labels::DESTROY_PROCESS),
+        procmgr_errors::SUCCESS,
+        "DESTROY_PROCESS of the never-started child",
+    );
+    let _ = syscall::cap_delete(thread);
+    let _ = syscall::cap_delete(handle);
+}
+
+/// argv[1] of the child that checks procmgr destroys a child whose create
+/// reply it cannot deliver; see [`undeliverable_reply_child_main`].
+const UNDELIVERABLE_ROLE: &str = "undeliverable-reply-child";
+/// Exit code: a namespace lookup failed.
+const UNDELIVERABLE_LOOKUP_FAILED: i32 = 2;
+/// Exit code: the create reply reached the child, or procmgr refused the
+/// create, instead of the reply transfer failing.
+const UNDELIVERABLE_REPLY_DELIVERED: i32 = 3;
+/// Exit code: a `QUERY_POOL_STATUS` call to memmgr failed.
+const UNDELIVERABLE_POOL_QUERY_FAILED: i32 = 4;
+/// Exit code: memmgr's free pool never returned to its level before the
+/// create, in any window, so the created child's pages stayed accounted.
+const UNDELIVERABLE_NEVER_RECLAIMED: i32 = 5;
+/// Exit code: the `CREATE_FROM_FILE` call itself failed.
+const UNDELIVERABLE_CALL_FAILED: i32 = 6;
+/// Sample windows the child retries: memmgr's free-pool size is system-wide,
+/// and other processes (crasher shares the boot) can move it inside one.
+const UNDELIVERABLE_WINDOWS: u32 = 8;
+/// Pool queries per window while procmgr's teardown of the created child
+/// reaches memmgr.
+const UNDELIVERABLE_POLLS: u32 = 256;
+
+/// Child role: exhaust this process's `CSpace` so procmgr's two-cap create
+/// reply cannot land, issue `CREATE_FROM_FILE`, and check that the reply
+/// transfer fails and that procmgr then destroys the child it created —
+/// memmgr's free pool returns to its level before the create, which it does
+/// not while the suspended child holds its pages. Runs without heap
+/// allocation after the exhaustion, since a heap refill needs a free slot.
+fn undeliverable_reply_child_main() -> !
+{
+    use ipc::{IpcMessage, procmgr_labels};
+
+    let info = startup_info();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let lookup = |dir: u32, name: &[u8]| {
+        crate::ipc_util::ns::ns_lookup(dir, name, 0xFFFF, ipc_buf)
+            .unwrap_or_else(|_| std::process::exit(UNDELIVERABLE_LOOKUP_FAILED))
+    };
+    let (programs, _, _) = lookup(std::os::seraph::root_dir_cap(), b"programs");
+    let (mut file, _, size) = lookup(programs, b"hello");
+
+    // Fill every free slot. The create call then moves the file cap out,
+    // freeing one slot, and the reply's two caps cannot both land.
+    while syscall::cap_derive(info.procmgr_endpoint, syscall::RIGHTS_EP_SEND).is_ok()
+    {}
+
+    for window in 0..UNDELIVERABLE_WINDOWS
+    {
+        if window > 0
+        {
+            // The slot the previous create freed takes the new file cap.
+            file = lookup(programs, b"hello").0;
+        }
+        let Some(before) = std::os::seraph::memmgr_pool_free_bytes()
+        else
+        {
+            std::process::exit(UNDELIVERABLE_POOL_QUERY_FAILED);
+        };
+        let create = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
+            .word(0, size)
+            .cap(file)
+            .build();
+        // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
+        match unsafe { ipc::ipc_call(info.procmgr_endpoint, &create, ipc_buf) }
+        {
+            Ok(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED =>
+            {}
+            Ok(_) => std::process::exit(UNDELIVERABLE_REPLY_DELIVERED),
+            Err(_) => std::process::exit(UNDELIVERABLE_CALL_FAILED),
+        }
+        for _ in 0..UNDELIVERABLE_POLLS
+        {
+            match std::os::seraph::memmgr_pool_free_bytes()
+            {
+                Some(now) if now == before => std::process::exit(0),
+                Some(_) => std::thread::yield_now(),
+                None => std::process::exit(UNDELIVERABLE_POOL_QUERY_FAILED),
+            }
+        }
+    }
+    std::process::exit(UNDELIVERABLE_NEVER_RECLAIMED);
 }

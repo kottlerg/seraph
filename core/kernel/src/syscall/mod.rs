@@ -196,7 +196,7 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
         }
         if crate::sched::running_thread_stopped(this_cpu)
         {
-            crate::sched::schedule(false);
+            crate::sched::schedule(crate::sched::Requeue::IfRunnable);
             crate::arch::current::cpu::halt_loop();
         }
         let tcb = current_tcb();
@@ -218,9 +218,9 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
 fn sys_yield(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     // SAFETY: called from syscall handler on a valid kernel stack.
-    // requeue=true: thread is voluntarily yielding but should remain runnable.
+    // Requeue::Always: thread is voluntarily yielding but should remain runnable.
     unsafe {
-        crate::sched::schedule(true);
+        crate::sched::schedule(crate::sched::Requeue::Always);
     }
     Ok(0)
 }
@@ -262,7 +262,7 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // re-enqueued.
     // SAFETY: called from syscall handler on a valid kernel stack.
     unsafe {
-        crate::sched::schedule(false);
+        crate::sched::schedule(crate::sched::Requeue::IfRunnable);
     }
     // schedule() returns here if the same thread is re-selected (shouldn't
     // happen for an Exited thread, but halt as a safety net).
@@ -321,7 +321,7 @@ fn sys_process_exit(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // re-enqueued.
     // SAFETY: called from syscall handler on a valid kernel stack.
     unsafe {
-        crate::sched::schedule(false);
+        crate::sched::schedule(crate::sched::Requeue::IfRunnable);
     }
     // schedule() returns here if the same thread is re-selected (shouldn't
     // happen for an Exited thread, but halt as a safety net).
@@ -406,7 +406,7 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 (*tcb)
                     .sleep_deadline
                     .store(0, core::sync::atomic::Ordering::Relaxed);
-                crate::sched::schedule(false);
+                crate::sched::schedule(crate::sched::Requeue::IfRunnable);
             }
             return Err(SyscallError::Interrupted);
         }
@@ -462,7 +462,7 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: called from syscall handler on valid kernel stack.
     unsafe {
-        crate::sched::schedule(false);
+        crate::sched::schedule(crate::sched::Requeue::IfRunnable);
     }
 
     // On resume, either timer_tick's sleep-list claim woke us (success) or a
@@ -726,7 +726,7 @@ pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBl
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
     // SAFETY: SCHEDULERS[cpu] is initialised for all online CPUs; per-CPU data indexed by CPU ID.
-    unsafe { crate::sched::scheduler_for(cpu).current }
+    unsafe { crate::sched::scheduler_for(cpu).current() }
 }
 
 /// Look up a capability slot in a `CSpace` by user handle.

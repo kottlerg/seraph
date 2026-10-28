@@ -23,7 +23,7 @@
 
 use crate::bpb::{FatState, FatType, SECTOR_SIZE};
 use crate::cache::PageCache;
-use crate::fat::next_cluster;
+use crate::fat::chain_next;
 
 /// Per-module error surface. Mapped to `fs_errors` wire codes at the
 /// dispatch boundary.
@@ -75,7 +75,7 @@ const FSI_STRUCT_SIG: u32 = 0x6141_7272;
 const FSI_TRAIL_SIG: u32 = 0xAA55_0000;
 
 /// Compute the FAT-sector LBA and byte offset within that sector for
-/// the given cluster index. Mirrors the arithmetic in [`next_cluster`]
+/// the given cluster index. Mirrors the arithmetic in [`chain_next`]
 /// without duplicating its cache-lookup path.
 fn fat_entry_location(state: &FatState, cluster: u32) -> (u32, usize)
 {
@@ -341,9 +341,17 @@ fn found_is_bad(
 /// `FREE = 0` into each FAT entry. Returns the count of clusters
 /// freed.
 ///
-/// Stops on end-of-chain, bad-cluster sentinel, or
-/// [`next_cluster`] returning `None`. The `next_free_hint` is biased
+/// Stops at the end-of-chain marker. The `next_free_hint` is biased
 /// toward the freed range so subsequent allocations reuse the slots.
+/// Callers detach the chain from its directory entry first, so a failure
+/// partway leaves only an orphan chain tail
+/// (services/fs/fat/docs/crash-safety.md).
+///
+/// # Errors
+/// [`FatError::Corrupt`] when `start` or a link lies outside the data
+/// region or reaches a bad-cluster marker; [`FatError::Io`] when a FAT
+/// sector cannot be read or written. Clusters freed before the failure
+/// stay freed.
 pub fn free_cluster_chain(
     state: &mut FatState,
     start: u32,
@@ -360,7 +368,7 @@ pub fn free_cluster_chain(
     let mut freed = 0u32;
     loop
     {
-        let next = next_cluster(state, cluster, cache, block_dev, ipc_buf);
+        let next = chain_next(state, cluster, cache, block_dev, ipc_buf);
         update_fat_entry(state, cluster, FREE, cache, block_dev, ipc_buf)?;
         freed += 1;
         if state.free_count_hint != u32::MAX
@@ -375,8 +383,13 @@ pub fn free_cluster_chain(
         }
         match next
         {
-            Some(n) if n >= 2 && n < 2 + state.total_clusters => cluster = n,
-            _ => break,
+            Ok(Some(n)) => cluster = n,
+            Ok(None) => break,
+            Err(e) =>
+            {
+                flush_fsinfo(state, cache, block_dev, ipc_buf);
+                return Err(e);
+            }
         }
     }
     // Mirror allocate_cluster: persist the updated free-count and

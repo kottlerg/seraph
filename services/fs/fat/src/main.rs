@@ -1827,9 +1827,21 @@ fn handle_truncate_node_cap(
         return;
     }
 
-    // Capture the old chain head before clearing, then free it.
+    // Detach the chain before freeing it, as FS_REMOVE does: patch the
+    // directory entry and the node to first cluster 0, size 0, then free
+    // the old chain. A failed free then leaves only an orphan chain, never
+    // a live entry on freed clusters that a later allocation would hand to
+    // another file (services/fs/fat/docs/crash-safety.md).
     let old_cluster = node.cluster;
     let entry_loc = node.loc;
+
+    if entry_loc.sector_lba != 0
+        && let Err(e) = update_entry_metadata(entry_loc, 0, 0, cache, block_dev, ipc_buf)
+    {
+        reply_err(fat_error_to_wire(e), ipc_buf);
+        return;
+    }
+    nodes.update_size_and_cluster(node_id, 0, 0);
 
     if old_cluster >= 2
         && let Err(e) = alloc::free_cluster_chain(state, old_cluster, cache, block_dev, ipc_buf)
@@ -1837,16 +1849,6 @@ fn handle_truncate_node_cap(
         reply_err(fat_error_to_wire(e), ipc_buf);
         return;
     }
-
-    // Patch the directory entry: first cluster = 0, size = 0.
-    if entry_loc.sector_lba != 0
-        && let Err(e) = update_entry_metadata(entry_loc, 0, 0, cache, block_dev, ipc_buf)
-    {
-        reply_err(fat_error_to_wire(e), ipc_buf);
-        return;
-    }
-
-    nodes.update_size_and_cluster(node_id, 0, 0);
 
     let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
     // SAFETY: ipc_buf is the registered IPC buffer page.

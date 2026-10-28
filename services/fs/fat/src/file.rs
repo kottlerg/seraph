@@ -60,7 +60,7 @@ pub struct OpenFile
     pub badge: u64,
     pub outstanding: [Option<OutstandingPage>; MAX_OUTSTANDING],
     /// SEND cap on a client's release endpoint, recorded from `caps[0]`
-    /// of the first `FS_READ_MEMORY` on this slot's node that carries one
+    /// of the first `FS_READ_MEMORY` reaching this slot that carries one
     /// (services/fs/docs/fs-driver-protocol.md § Label 7); the eviction
     /// worker addresses cooperative `FS_RELEASE_MEMORY` requests to it when
     /// reclaiming an outstanding cache page. Zero while no request has

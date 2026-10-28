@@ -1085,8 +1085,8 @@ pub fn fs_write_size_bound_phase(_: &Caps)
 pub fn fs_carried_caps_dropped_phase(_: &Caps)
 {
     // Well past fatfs's whole CSpace: procmgr seeds a child CSpace with
-    // CSPACE_RETYPE_PAGES (7) slot pages of 56 slots, and fatfs never
-    // augments it.
+    // CSPACE_RETYPE_PAGES (7) pages, the first the CSpace's own wrapper, so
+    // six slot pages of 56 slots (335 usable), and fatfs never augments it.
     const REQUESTS: usize = 1024;
 
     let info = startup_info();

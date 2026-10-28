@@ -570,11 +570,14 @@ Set a file's length. Badge = file cap with `WRITE`.
 v1 supports only `new_len == 0`; non-zero replies `IO_ERROR`. The
 wire shape is forward-compatible with later extend-with-zero-fill
 semantics, tracked by the `ruststd::fs` completeness-gaps issue. The
-truncate-to-zero path frees the entire FAT cluster chain
-and patches the directory entry's first-cluster + size fields to 0.
+truncate-to-zero path patches the directory entry's first-cluster and
+size fields to 0, then frees the old FAT cluster chain. An `IO_ERROR`
+from freeing the chain arrives after the patch: the file is already
+empty and its old clusters are orphaned, as
+[`crash-safety.md`](../fat/docs/crash-safety.md) states.
 
 **Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `PERMISSION_DENIED`,
-`IO_ERROR` (chain walk / `FSInfo` flush failure, or non-zero
+`IO_ERROR` (directory-entry write or chain walk failure, or non-zero
 `new_len` until the v2 extend path lands).
 
 ---

@@ -10,7 +10,7 @@ Seraph FAT16 / FAT32 filesystem driver, one process per mount.
 fat/
 ├── Cargo.toml
 ├── README.md
-├── fat-parse/                  # `fatfs-parse`: pure host-tested BPB/dir decoders, slot-run scans
+├── fat-parse/                  # `fatfs-parse`: BPB/dir decoders, slot scans, cluster bounds
 ├── docs/
 │   └── crash-safety.md         # Per-op write ordering and post-crash visible states
 └── src/

@@ -86,12 +86,25 @@ static MIGRATE_OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 /// vCPU waits for a host core before it runs or migrates.
 const MIGRATE_POLLS: u64 = 2_000;
 
+/// Bound, in milliseconds, on `affinity_migrate_ready_queued`'s wait for the
+/// migrated child's report. Applied through [`crate::scaled_bound`], which
+/// stretches it past [`crate::UNSCALED_CPUS`] CPUs, where CPU 1 waits for a
+/// host core before it runs the child.
+const READY_MIGRATE_REPORT_MS: u64 = 5_000;
+
 /// Tells the migration spinner to exit cleanly once the parent has
 /// observed the migration.
 static MIGRATE_SHOULD_EXIT: AtomicU32 = AtomicU32::new(0);
 
 /// Capacity of the load-balancer spinner arrays.
 const BALANCE_MAX_SPINNERS: usize = 8;
+
+/// Bound, in 4 ms sleeps, on `load_balancer_redistributes_skewed`'s wait for
+/// the balancer to move a spinner off CPU 0. Applied through
+/// [`crate::scaled_bound`], which stretches it past [`crate::UNSCALED_CPUS`]
+/// CPUs, where an idle CPU's balancer tick waits for a host core.
+const BALANCE_CONVERGE_POLLS: u64 = 250;
+
 /// Per-spinner observed CPU index. Indexed by spinner id (0..N). Used by
 /// the load-balancer tests. `u32::MAX` indicates "spinner has not run yet".
 static BALANCE_OBSERVED_CPU: [AtomicU32; BALANCE_MAX_SPINNERS] = [
@@ -913,8 +926,8 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
     // the modulo-64 shift semantics), so a `cpu == 0` report from a stale-CPU
     // run is delivered and fails as a wrong-CPU result rather than looking like
     // the timeout; a zero-bit send would be rejected by `notification_send`.
-    // The 5 s timeout catches any missed wake.
-    let bits = notification_wait_timeout(sig, 5_000)
+    // The bounded wait catches any missed wake.
+    let bits = notification_wait_timeout(sig, crate::scaled_bound(READY_MIGRATE_REPORT_MS))
         .map_err(|_| "notification_wait for affinity_migrate_ready_queued failed")?;
     if bits == 0
     {
@@ -1120,11 +1133,12 @@ pub fn load_balancer_redistributes_skewed(ctx: &TestContext) -> TestResult
     // queue, leaving the spinners and the idle CPUs' per-tick pull balancer
     // (core/kernel/docs/scheduler.md § Load Balancing) unimpeded.
     //
-    // 250 × 4 ms = 1 s total budget, ample for an idle CPU's heaviest-CPU
-    // scan to pull a spinner while keeping the test fast in the common case
-    // (PASS fires on the first observed migration).
+    // BALANCE_CONVERGE_POLLS × 4 ms = 1 s total budget up to UNSCALED_CPUS
+    // CPUs, ample for an idle CPU's heaviest-CPU scan to pull a spinner while
+    // keeping the test fast in the common case (PASS fires on the first
+    // observed migration).
     let mut converged = false;
-    for _ in 0..250
+    for _ in 0..crate::scaled_bound(BALANCE_CONVERGE_POLLS)
     {
         let seen_other_cpu = BALANCE_OBSERVED_CPU.iter().take(n).any(|slot| {
             let obs = slot.load(Ordering::Relaxed);

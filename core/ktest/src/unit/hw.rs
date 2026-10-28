@@ -23,7 +23,9 @@ use syscall_abi::SyscallError;
 
 use crate::{TestContext, TestResult};
 
-/// Test virtual address for MMIO mapping. 1.25 GiB — above ktest's load address.
+/// Test virtual address for MMIO mapping: 5.25 GiB, in the gap between the
+/// byte-heap zone and the reservation arena, below every `process_layout`
+/// window (ktest's PIE image loads in `IMAGE_WINDOW`).
 const MMIO_TEST_VA: u64 = 0x1_5000_0000;
 
 /// Upper bound for a slot scan over the test's own `CSpace`: its backed
@@ -228,9 +230,10 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
     // consumes the cap.
     //
     // The scan bound is the cspace's backed capacity (queried at runtime
-    // via `cap_info`) so post-init carve products from `ioport::init`
-    // — which land at slot indices above `aspace_cap` — are always
-    // reachable, regardless of how the cspace has grown.
+    // via `cap_info`) so carve products from `ioport::bind_port_range`
+    // (which splits the wide cap `ioport::init` records) — which land at
+    // slot indices above `aspace_cap` — are always reachable, regardless of
+    // how the cspace has grown.
     #[cfg(target_arch = "x86_64")]
     {
         let bound = scan_bound(ctx);
@@ -338,16 +341,18 @@ pub fn mmio_split_wrong_tag_err(ctx: &TestContext) -> TestResult
 
 // ── SYS_IRQ_SPLIT ─────────────────────────────────────────────────────────────
 
-/// `irq_split` on the first Interrupt-range cap with `count > 1` returns two
-/// disjoint children. Skipped if no suitable cap exists.
+/// `irq_split` at IRQ id 1 on the first Interrupt-range cap whose range
+/// strictly contains it (start 0, `count > 1`) returns two disjoint
+/// children. Skipped if no such cap exists.
 pub fn irq_split_carves(ctx: &TestContext) -> TestResult
 {
     let bound = scan_bound(ctx);
 
     for slot in 1u32..=bound
     {
-        // Probe: split at base+1. Wrong-tag and unsplittable-range responses
-        // both leave the cap intact.
+        // Probe: split at IRQ id 1 (`split_at` is absolute), which only a cap
+        // starting at IRQ 0 with count > 1 accepts. Wrong-tag and out-of-range
+        // responses both leave the cap intact.
         match irq_split(slot, 1)
         {
             Err(_) =>

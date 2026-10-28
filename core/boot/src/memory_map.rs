@@ -68,12 +68,8 @@ pub unsafe fn translate_memory_map(
 
 /// Translate a UEFI `EFI_MEMORY_TYPE` value to the boot protocol's [`MemoryType`].
 ///
-/// Per `boot/docs/uefi-environment.md`:
-/// - `EfiConventionalMemory`, `EfiBootServicesCode/Data` → `Usable` (reclaimable)
-/// - `EfiLoaderCode/Data` → `Loaded` (in-use by bootloader)
-/// - `EfiACPIReclaimMemory` → `AcpiReclaimable`
-/// - `EfiPersistentMemory` → `Persistent`
-/// - All other types → `Reserved`
+/// The mapping is defined in `core/boot/docs/memory-map.md`
+/// § UEFI Memory Type → `MemoryType`.
 fn translate_memory_type(uefi_type: u32) -> MemoryType
 {
     match uefi_type
@@ -89,28 +85,22 @@ fn translate_memory_type(uefi_type: u32) -> MemoryType
 
         EFI_PERSISTENT_MEMORY => MemoryType::Persistent,
 
-        // EfiRuntimeServicesCode/Data, EfiACPIMemoryNVS, EfiMemoryMappedIO,
-        // EfiMemoryMappedIOPortSpace, and all unrecognised types are Reserved.
+        // Every other type is Reserved, per core/boot/docs/memory-map.md
+        // § UEFI Memory Type → `MemoryType`.
         _ => MemoryType::Reserved,
     }
 }
 
 // ── MMIO aperture derivation ─────────────────────────────────────────────────
 
-/// Derive the coarse MMIO aperture array from the raw UEFI memory map.
+/// Derive the coarse MMIO aperture array from the raw UEFI memory map and
+/// the caller-supplied firmware and framebuffer seeds (`seed`), following
+/// `core/boot/docs/firmware-parsing.md` § `mmio_apertures` construction.
+/// Writes at most `MAX_APERTURES` entries to `out` and returns the number
+/// written; surplus is dropped with a diagnostic.
 ///
-/// Iterates all UEFI memory descriptors, collects those classified as
-/// `EfiMemoryMappedIO` or `EfiMemoryMappedIOPortSpace` into a scratch
-/// buffer, merges any additional firmware-advertised apertures supplied
-/// by `seed` (e.g. MCFG ECAM extents on x86-64, `/soc` bus ranges on
-/// RISC-V), sorts the result by base address, and merges adjacent or
-/// overlapping entries. Writes at most `MAX_APERTURES` entries to
-/// `out`. Returns the number of entries written; surplus is dropped
-/// with a diagnostic.
-///
-/// Apertures are coarse by design: per-device granularity is left to
-/// userspace (`devmgr`), which re-walks ACPI or DTB from the raw
-/// passthrough addresses already in `BootInfo`.
+/// Apertures are coarse by design; see `docs/device-management.md`
+/// § Raw Firmware Passthrough for where device-level discovery happens.
 ///
 /// # Safety
 /// `uefi_map.buffer_phys` must be the UEFI raw map buffer from the most
@@ -132,6 +122,7 @@ pub unsafe fn derive_mmio_apertures(
         size: 0,
     }; SCRATCH];
     let mut n: usize = 0;
+    let mut dropped = false;
 
     // Collect MMIO-class descriptors from the UEFI map.
     let mut offset: usize = 0;
@@ -149,13 +140,20 @@ pub unsafe fn derive_mmio_apertures(
 
         let is_mmio = desc.memory_type == EFI_MEMORY_MAPPED_IO
             || desc.memory_type == EFI_MEMORY_MAPPED_IO_PORT_SPACE;
-        if is_mmio && n < SCRATCH
+        if is_mmio
         {
-            buf[n] = MmioAperture {
-                phys_base: desc.physical_start,
-                size: desc.number_of_pages * 4096,
-            };
-            n += 1;
+            if n < SCRATCH
+            {
+                buf[n] = MmioAperture {
+                    phys_base: desc.physical_start,
+                    size: desc.number_of_pages * 4096,
+                };
+                n += 1;
+            }
+            else
+            {
+                dropped = true;
+            }
         }
     }
 
@@ -170,6 +168,10 @@ pub unsafe fn derive_mmio_apertures(
         {
             buf[n] = *s;
             n += 1;
+        }
+        else
+        {
+            dropped = true;
         }
     }
 
@@ -214,12 +216,18 @@ pub unsafe fn derive_mmio_apertures(
             };
             out_count += 1;
         }
+        else
+        {
+            dropped = true;
+        }
         i = j;
     }
 
-    if out_count >= out.len()
+    if dropped
     {
-        bprintln!("[--------] boot: MMIO apertures: > MAX_APERTURES after merge; truncated");
+        bprintln!(
+            "[--------] boot: MMIO apertures: entries dropped (scratch buffer or MAX_APERTURES cap)"
+        );
     }
 
     out_count
@@ -232,14 +240,17 @@ mod tests
 {
     use core::mem::size_of;
 
-    use super::{insertion_sort_memory_map, translate_memory_map, translate_memory_type};
+    use super::{
+        derive_mmio_apertures, insertion_sort_memory_map, translate_memory_map,
+        translate_memory_type,
+    };
     use crate::uefi::{
         EFI_ACPI_MEMORY_NVS, EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE,
         EFI_BOOT_SERVICES_DATA, EFI_CONVENTIONAL_MEMORY, EFI_LOADER_CODE, EFI_LOADER_DATA,
         EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE, EFI_PERSISTENT_MEMORY,
         EFI_RUNTIME_SERVICES_CODE, EFI_RUNTIME_SERVICES_DATA, EfiMemoryDescriptor, MemoryMapResult,
     };
-    use boot_protocol::{MemoryMapEntry, MemoryType};
+    use boot_protocol::{MAX_APERTURES, MemoryMapEntry, MemoryType, MmioAperture};
 
     // ── translate_memory_type ─────────────────────────────────────────────────
 
@@ -418,7 +429,7 @@ mod tests
 
     // ── translate_memory_map ──────────────────────────────────────────────────
 
-    /// Construct a single-descriptor UEFI memory map buffer, run
+    /// Construct a UEFI memory map buffer from `descs`, run
     /// `translate_memory_map`, and return the translated entries.
     fn run_translate(descs: &[EfiMemoryDescriptor], max_entries: usize) -> Vec<MemoryMapEntry>
     {
@@ -524,7 +535,8 @@ mod tests
         let stride = size_of::<EfiMemoryDescriptor>() + 8;
         // Allocate one stride-sized slot, zeroed, then write the descriptor at
         // the start of that slot. The trailing 8 bytes remain zero (padding).
-        let mut buf = vec![0u8; stride];
+        // `u64` storage gives the buffer the descriptor's 8-byte alignment.
+        let mut buf = vec![0u64; stride / 8];
         let desc = EfiMemoryDescriptor {
             memory_type: EFI_PERSISTENT_MEMORY,
             physical_start: 0x4000,
@@ -532,10 +544,9 @@ mod tests
             number_of_pages: 4,
             attribute: 0,
         };
-        // SAFETY: buf has stride >= size_of::<EfiMemoryDescriptor>() bytes and
-        // is properly aligned (Vec<u8> for a struct starting with u32 is fine on
-        // x86-64/aarch64 where u32 alignment <= 8). We write one descriptor.
-        unsafe { core::ptr::write(buf.as_mut_ptr() as *mut EfiMemoryDescriptor, desc) };
+        // SAFETY: buf holds stride >= size_of::<EfiMemoryDescriptor>() bytes and,
+        // as `u64` storage, is 8-byte aligned, which EfiMemoryDescriptor needs.
+        unsafe { core::ptr::write(buf.as_mut_ptr().cast::<EfiMemoryDescriptor>(), desc) };
         let uefi_map = MemoryMapResult {
             buffer_phys: buf.as_ptr() as u64,
             buffer_size: stride,
@@ -555,12 +566,96 @@ mod tests
         assert_eq!(out[0].physical_base, 0x4000);
         assert_eq!(out[0].size, 4 * 4096);
     }
+
+    // ── derive_mmio_apertures ─────────────────────────────────────────────────
+
+    fn mmio_desc(physical_start: u64, number_of_pages: u64) -> EfiMemoryDescriptor
+    {
+        EfiMemoryDescriptor {
+            memory_type: EFI_MEMORY_MAPPED_IO,
+            physical_start,
+            virtual_start: 0,
+            number_of_pages,
+            attribute: 0,
+        }
+    }
+
+    /// Run `derive_mmio_apertures` over `descs` and `seed`; return the output.
+    fn run_derive(descs: &[EfiMemoryDescriptor], seed: &[MmioAperture]) -> Vec<MmioAperture>
+    {
+        let stride = size_of::<EfiMemoryDescriptor>();
+        let uefi_map = MemoryMapResult {
+            buffer_phys: descs.as_ptr() as u64,
+            buffer_size: descs.len() * stride,
+            map_size: descs.len() * stride,
+            map_key: 0,
+            descriptor_size: stride,
+        };
+        let mut out = [MmioAperture {
+            phys_base: 0,
+            size: 0,
+        }; MAX_APERTURES];
+        // SAFETY: `descs` is a live, aligned descriptor array covering `map_size`.
+        let n = unsafe { derive_mmio_apertures(&uefi_map, seed, &mut out) };
+        out[..n].to_vec()
+    }
+
+    #[test]
+    fn overlapping_and_adjacent_apertures_merge()
+    {
+        let descs = [mmio_desc(0x1000_0000, 1), mmio_desc(0x1000_1000, 1)];
+        let seed = [MmioAperture {
+            phys_base: 0x1000_0800,
+            size: 0x1000,
+        }];
+        let out = run_derive(&descs, &seed);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].phys_base, 0x1000_0000);
+        assert_eq!(out[0].size, 0x2000);
+    }
+
+    #[test]
+    fn zero_size_seed_is_ignored()
+    {
+        let seed = [MmioAperture {
+            phys_base: 0x2000_0000,
+            size: 0,
+        }];
+        assert!(run_derive(&[], &seed).is_empty());
+    }
+
+    #[test]
+    fn exactly_max_apertures_disjoint_are_all_kept()
+    {
+        let descs: Vec<_> = (0..MAX_APERTURES as u64)
+            .map(|i| mmio_desc(0x1000_0000 + i * 0x10_0000, 1))
+            .collect();
+        let out = run_derive(&descs, &[]);
+        assert_eq!(out.len(), MAX_APERTURES);
+    }
+
+    #[test]
+    fn surplus_over_max_apertures_keeps_the_lowest_bases()
+    {
+        // Listed highest first, so the cap must apply after the sort.
+        let descs: Vec<_> = (0..=MAX_APERTURES as u64)
+            .rev()
+            .map(|i| mmio_desc(0x1000_0000 + i * 0x10_0000, 1))
+            .collect();
+        let out = run_derive(&descs, &[]);
+        assert_eq!(out.len(), MAX_APERTURES);
+        assert_eq!(out[0].phys_base, 0x1000_0000);
+        assert_eq!(
+            out[MAX_APERTURES - 1].phys_base,
+            0x1000_0000 + (MAX_APERTURES as u64 - 1) * 0x10_0000
+        );
+    }
 }
 
 /// Sort `MemoryMapEntry` elements in `[0..count)` by `physical_base` ascending.
 ///
-/// Uses insertion sort — O(n²) worst case, but n is always small (< 700) and
-/// the UEFI memory map is often already nearly sorted by the firmware.
+/// Uses an in-place insertion sort; see `core/boot/docs/memory-map.md`
+/// § Sort Algorithm for why the algorithm class is acceptable.
 ///
 /// # Safety
 /// `entries` must point to an allocation of at least `count` valid, initialised

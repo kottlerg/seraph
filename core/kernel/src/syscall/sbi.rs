@@ -5,14 +5,11 @@
 
 //! `SYS_SBI_CALL` (44): forward an SBI call to M-mode firmware.
 //!
-//! RISC-V only. The kernel forwards an SBI call only for a fixed set of
-//! sanctioned extensions, each gated by a per-extension `SbiControl` right.
-//! [`sbi_required_right`] maps an extension ID to the right it requires; an
-//! extension with no entry is one the kernel manages internally
-//! (TIME/IPI/RFENCE/HSM) and is never forwardable, regardless of cap. Every
-//! other extension is sanctioned and forwarded only if the caller's `SbiControl`
-//! cap carries the required right; whether any consumer holds such a cap is
-//! userspace policy. See `docs/capability-model.md`.
+//! RISC-V only. The kernel forwards an SBI call only for the sanctioned
+//! extensions listed in [`sbi_required_right`], each gated by its `SbiControl`
+//! right; every other extension ID, including the kernel-managed
+//! TIME/IPI/RFENCE/HSM, is rejected with `InvalidArgument` regardless of cap.
+//! See docs/capability-model.md § `SbiControl` (RISC-V only), Kernel floor.
 //!
 //! On x86-64, this syscall returns `SyscallError::NotSupported`.
 //!
@@ -25,8 +22,9 @@
 //! - arg5: SBI a2 argument
 //!
 //! # Returns
-//! On success: SBI return value (sbiret.value). SBI error code is packed
-//! into the secondary return register (rdx on x86-64, a1 on RISC-V).
+//! On success: the SBI return value (`sbiret.value`). A non-zero SBI error is
+//! reported as `SyscallError::NotSupported`; no secondary return register is
+//! written. See core/kernel/docs/syscalls.md § `SYS_SBI_CALL` (44).
 
 use crate::arch::current::trap_frame::TrapFrame;
 
@@ -59,12 +57,11 @@ const SBI_EXT_PMU: u64 = 0x0050_4D55;
 
 /// Map an SBI extension ID to the `SbiControl` right required to forward it.
 ///
-/// `None` means the extension is the kernel's to manage internally
-/// (TIME/IPI/RFENCE/HSM) and is never forwardable from userspace regardless of
-/// cap. Every other extension is sanctioned with a right; whether any consumer
-/// receives a cap bearing that right is userspace cap-distribution policy.
-/// Adding a sanctioned extension is one entry here plus one `SbiRights` bit in
-/// `abi/syscall` / `cap::slot`.
+/// `None` means the extension is unsanctioned: every EID outside this table,
+/// including the kernel-managed TIME/IPI/RFENCE/HSM, is rejected by the caller
+/// with `InvalidArgument` regardless of cap. Adding a sanctioned extension is
+/// one entry here, one `RIGHTS_SBI_*` constant in `abi/syscall`, and one
+/// `SbiRights` bit in `cap::slot`.
 #[cfg(not(test))]
 fn sbi_required_right(extension: u64) -> Option<crate::cap::slot::SbiRights>
 {
@@ -93,7 +90,9 @@ pub fn sys_sbi_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::NotSupported);
     }
 
-    #[allow(clippy::cast_possible_truncation)] // CSpace slot indices are u32.
+    // cast_possible_truncation: cap handles are u32 by ABI contract; the
+    // truncation discards any upper bits a caller sets.
+    #[allow(clippy::cast_possible_truncation)]
     let sbi_cap_idx = tf.arg(0) as u32;
     let extension = tf.arg(1);
     let function = tf.arg(2);

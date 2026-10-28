@@ -9,26 +9,30 @@
 //! CPUs and performing map/unmap operations that trigger inter-processor
 //! interrupts (IPIs) for TLB invalidation. A second phase repeats the cycles
 //! with `mem_unmap_reclaim` (the `MEM_UNMAP_RECLAIM_PTS` path), which frees the
-//! now-empty intermediate page table back to the AS pool and issues one coarse
-//! full-flush shootdown *while holding `pt_lock`* — a distinct path from the
-//! per-VA shootdown above.
+//! now-empty intermediate page table back to the AS pool and issues one
+//! shootdown for the span *while holding `pt_lock`* (a per-page range flush at
+//! this one-page span; see
+//! [core/kernel/docs/memory-internals.md](../../../kernel/docs/memory-internals.md)
+//! § TLB Management) — a distinct path from the per-VA shootdown above.
 //!
 //! ktest threads run in user mode, so a stale-TLB access the shootdown failed
-//! to flush would surface as a page fault. The kernel retries only faults the
-//! live tables already satisfy; an access to an entry that should have been
-//! invalidated terminates the thread (the kill path is covered by
+//! to flush would surface as a page fault that the spurious-fault retry cannot
+//! resolve ([core/kernel/docs/memory-internals.md](../../../kernel/docs/memory-internals.md)
+//! § SMP TLB Shootdown), terminating the thread (the kill path is covered by
 //! `integration::fault_kills_thread`). This test does not construct such a
 //! window — it verifies that:
 //!
 //! 1. Repeated map/unmap cycles across CPUs complete without deadlock — for
-//!    both the per-VA and the coarse pool-reclaiming shootdown paths.
+//!    both the per-VA and the pool-reclaiming shootdown paths.
 //! 2. Threads on different CPUs read back the sentinel from newly mapped
 //!    memory, including after a same-VA remap whose intermediate page table was
 //!    reclaimed and re-allocated from the pool.
 //! 3. The shootdown protocol doesn't panic or corrupt kernel state.
 //!
-//! This validates Phase E.4's TLB shootdown IPI mechanism indirectly by
-//! confirming the protocol operates correctly under concurrent access.
+//! This validates the kernel's TLB shootdown IPI mechanism
+//! ([core/kernel/docs/memory-internals.md](../../../kernel/docs/memory-internals.md)
+//! § SMP TLB Shootdown) indirectly by confirming the protocol operates correctly
+//! under concurrent access.
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, mem_map, mem_unmap, mem_unmap_reclaim,
@@ -67,8 +71,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── 2. Set up two notifications for parent-child coordination. ─────────────────
     //
-    // Fix B1: use separate notifications for each direction to prevent bit
-    // accumulation across directions (parent→child vs child→parent).
+    // Separate notifications for each direction prevent bit accumulation
+    // across directions (parent→child vs child→parent).
     let p2c = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::tlb_coherency: cap_create_notification (p2c) failed")?;
     let c2p = cap_create_notification(ctx.memory_base)
@@ -118,7 +122,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Phase 0 uses per-page `mem_unmap` (single-VA shootdown). Phase 1 uses
     // `mem_unmap_reclaim` (the MEM_UNMAP_RECLAIM_PTS path): it frees the
     // now-empty intermediate page table back to the AS pool and issues one
-    // coarse full-flush shootdown *while holding pt_lock*. The next cycle
+    // shootdown for the span *while holding pt_lock* (a per-page range flush
+    // for this one-page span). The next cycle
     // remaps the same VA, re-allocating an intermediate table (often the same
     // frame) from the pool. A broken shootdown would panic, deadlock, fault the
     // child, or read the wrong frame.
@@ -177,7 +182,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         }
     }
 
-    // ── 5. Notification child to exit on p2c. ──────────────────────────────────────
+    // ── 5. Notify the child to exit on p2c. ──────────────────────────────────────
     notification_send(p2c, 0x80)
         .map_err(|_| "integration::tlb_coherency: notification_send (exit) failed")?;
 
@@ -196,8 +201,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 /// Child thread entry point.
 ///
-/// Runs on CPU 1. Waits for parent to map pages, accesses them to cache TLB
-/// entries, then waits for parent to unmap (which triggers TLB shootdown).
+/// Runs on CPU 1. Signals readiness, then on each 0x2 notification reads
+/// `SENTINEL` at `TEST_VA` (loading the TLB entry the parent's next unmap must
+/// shoot down) and acks 0x4 on a match or 0x10 on a wrong frame; exits on 0x80.
 ///
 /// # Arguments
 ///
@@ -210,7 +216,7 @@ fn tlb_worker_thread(p2c_slot: u64) -> !
     // SAFETY: parent wrote CHILD_C2P_SLOT before thread_start; no concurrent writes.
     let c2p = unsafe { CHILD_C2P_SLOT };
 
-    // Notification parent on c2p: we're ready.
+    // Notify the parent on c2p: we're ready.
     notification_send(c2p, 0x1).ok();
 
     while let Ok(bits) = notification_wait(p2c)

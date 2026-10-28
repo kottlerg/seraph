@@ -5,7 +5,8 @@
 
 //! Integration: a same-`CSpace` stale cap handle fails closed (#349).
 //!
-//! Per-slot generation is the mechanism that closes the stale-slot alias class.
+//! Exercises the per-slot generation check of `docs/capability-model.md`
+//! § Capability Handle Format.
 //! This is the same-`CSpace` counterpart to `cross_cspace_revoke_no_alias`: a
 //! handle reused within one `CSpace` after its slot is freed and recycled.
 //! Create a notification, delete it (freeing and generation-bumping the slot),
@@ -38,7 +39,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // alias window.
     if cap_handle_index(stale) != cap_handle_index(fresh)
     {
-        // Slot not reused (e.g. cspace grew); not a failure of the fix, but the
+        // Slot not reused (e.g. cspace grew); not a generation-check failure, but the
         // scenario was not exercised. Clean up and report so the gap is visible.
         cap_delete(fresh).ok();
         return Err("cap_generation_stale_handle: freed slot was not recycled (index differs)");

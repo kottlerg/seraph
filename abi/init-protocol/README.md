@@ -35,4 +35,5 @@ procmgr. Authoritative description of the userspace boot order lives in
 
 ## Summarized By
 
-[abi/process-abi/README.md](../process-abi/README.md)
+[abi/process-abi/README.md](../process-abi/README.md),
+[Capability Subsystem Internals](../../core/kernel/docs/capability-internals.md)

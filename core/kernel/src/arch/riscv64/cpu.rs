@@ -66,10 +66,11 @@ pub fn current_stack_pointer() -> u64
 
 /// Return the current hart ID.
 ///
-/// Phase 5: only the BSP is running; returns 0.
-/// Future: read `mhartid` via SBI `sbi_get_marchid` or from the boot-info
-/// structure when SMP is brought up.
-#[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+/// Currently returns the constant 0 on every hart, not the hart ID that
+/// `core/kernel/docs/arch-interface.md` § cpu promises; nothing calls it (#443).
+// Part of the arch-dispatch surface in core/kernel/docs/arch-interface.md § cpu;
+// no kernel code calls it yet.
+#[allow(dead_code)]
 pub fn current_id() -> u32
 {
     0
@@ -87,7 +88,7 @@ pub fn current_id() -> u32
 /// on the `ecall`). The remaining required features are asserted where each is
 /// safely detectable: the Vector extension at `fpu::cache_vlenb`, and the
 /// ASID-tagged TLB at `paging::enable_tagged_tlb`. See
-/// [platform-requirements.md](../../../../docs/platform-requirements.md).
+/// `docs/platform-requirements.md` § Boot-Time Feature Gate.
 ///
 /// # Safety
 /// Must execute in supervisor mode during early boot, after the console is live
@@ -123,8 +124,8 @@ pub unsafe fn verify_baseline() {}
 /// writes a test `satp` with all ASID bits set (preserving MODE and PPN), reads
 /// it back, restores the original `satp`, and issues `sfence.vma` to discard
 /// any translation cached under the transient ASID. Returns the count of
-/// implemented ASID bits; `0` means ASIDs are unsupported and the kernel falls
-/// back to full-flush context switches.
+/// implemented ASID bits; `0` means ASIDs are unsupported, which
+/// `paging::enable_tagged_tlb` refuses as a platform-baseline violation.
 ///
 /// # Safety
 /// Must execute in S-mode with `satp` already holding a valid root (Phase 5
@@ -225,7 +226,8 @@ pub fn current_cpu() -> u32
 
 /// Set the kernel stack pointer used when a trap fires from U-mode.
 ///
-/// On RISC-V, `sscratch` holds `&PER_CPU[cpu_id]` (not the stack pointer)
+/// On RISC-V, `sscratch` holds the per-CPU pointer (`per_cpu_ptr(cpu_id)`, the
+/// kernel `tp` value) while in U-mode and 0 in S-mode, not the stack pointer,
 /// so `trap_entry` can recover the per-CPU pointer on U-mode entry.  The
 /// actual kernel stack top is stored in `PerCpuData::kernel_rsp` (offset 8
 /// from `tp`), from which `trap_entry` loads it when switching stacks.
@@ -253,13 +255,11 @@ pub unsafe fn set_kernel_trap_stack(stack_top: u64)
 
 // ── User-copy primitive (fault-recoverable) ───────────────────────────────────
 
-// `copy_user` is the sole sanctioned path for kernel access to user memory. It
-// owns the SUM access window (sstatus.SUM, bit 18) and is covered by the trap
-// dispatcher's user-copy fixup: a fault on an unmapped or read-only user span
-// inside the copy redirects to `__copy_user_fixup` (which clears SUM and returns
-// a non-zero sentinel) instead of panicking. See `crate::uaccess` for the typed
-// `copy_to_user`/`copy_from_user` wrappers and `interrupts::trap_dispatch` for
-// the fixup hook.
+// `copy_user` implements the user-copy contract in core/kernel/docs/arch-interface.md
+// § cpu: it opens and closes the SUM window (sstatus.SUM, bit 18), and a fault inside
+// the copy redirects to `__copy_user_fixup` (which clears SUM and returns a non-zero
+// sentinel). See `crate::uaccess` for the typed wrappers and
+// `interrupts::trap_dispatch` for the fixup hook.
 #[cfg(not(test))]
 core::arch::global_asm!(
     ".section .text.copy_user, \"ax\"",
@@ -385,9 +385,8 @@ pub unsafe fn save_and_disable_interrupts() -> u64
 
 /// Restore the interrupt-enable state saved by [`save_and_disable_interrupts`].
 ///
-/// Writes `sstatus.SIE` to the saved value whatever its current state, so a
-/// caller that enabled interrupts inside the window (a preempt-disabled
-/// wait) returns to the saved state too. Matches the x86-64 `popfq` restore.
+/// Sets or clears `sstatus.SIE` from `saved`, per the restore contract in
+/// `core/kernel/docs/arch-interface.md` § cpu.
 ///
 /// # Safety
 /// Must execute in supervisor mode. `saved` must be a value returned by

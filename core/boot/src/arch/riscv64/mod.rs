@@ -10,8 +10,8 @@
 
 // Hand-crafted PE/COFF header for RISC-V UEFI builds. LLVM has no PE/COFF
 // backend for RISC-V, so we prepend this header and convert with
-// llvm-objcopy. See boot/src/arch/riscv64/header.S and
-// boot/linker/riscv64-uefi.ld. The assembly is emitted at crate top-level
+// llvm-objcopy. See core/boot/src/arch/riscv64/header.S and
+// core/boot/linker/riscv64-uefi.ld. The assembly is emitted at crate top-level
 // regardless of where the `global_asm!` invocation lives; placing it inside
 // this arch module keeps `#[cfg(target_arch)]` discipline clean.
 core::arch::global_asm!(include_str!("header.S"));
@@ -90,7 +90,8 @@ pub fn default_direct_map_base() -> u64
 /// Both sources are consulted because UEFI RISC-V firmware may publish
 /// either (or both) of [`crate::uefi::EFI_ACPI_20_TABLE_GUID`] and
 /// [`crate::uefi::EFI_DTB_TABLE_GUID`]. Fields neither source populates
-/// stay zero; the kernel falls back to its compiled-in defaults.
+/// stay zero; the kernel's response to each zero field is in
+/// `core/boot/docs/boot-flow.md` § Step 9: Populate `BootInfo`.
 ///
 /// # Safety
 /// `firmware.acpi_rsdp` and `firmware.device_tree`, when non-zero, must
@@ -182,7 +183,8 @@ pub unsafe fn allocate_ap_trampoline(bs: *mut EfiBootServices) -> Option<u64>
 }
 
 /// QEMU virt RISC-V default MMIO apertures: PCI ECAM + 32-bit + 64-bit
-/// PCI windows, plus the Goldfish RTC register page at `0x101000`.
+/// PCI windows, plus the ns16550a UART register page at `0x1000_0000` and
+/// the Goldfish RTC register page at `0x101000`.
 ///
 /// Seeded unconditionally because EDK2 on the seraph boot path neither
 /// re-publishes the DTB via a UEFI configuration table nor emits ACPI
@@ -191,13 +193,11 @@ pub unsafe fn allocate_ap_trampoline(bs: *mut EfiBootServices) -> Option<u64>
 /// discover them at runtime. Merged with anything firmware does happen
 /// to publish in [`crate::memory_map::derive_mmio_apertures`].
 ///
-/// The Goldfish RTC entry covers a single 4 KiB page; devmgr identifies
-/// it by base address (`0x101000` is part of the QEMU `virt` machine
-/// model contract) and spawns the `goldfish-rtc` driver on it. The
-/// NS16550 UART entry (`0x1000_0000`) is seeded on the same basis so
-/// devmgr can carve an `Mmio` for the userspace serial driver; the
-/// kernel retains its own direct mapping of the same UART for the panic
-/// console.
+/// The UART and Goldfish RTC entries each cover one 4 KiB page so devmgr
+/// can carve an `Mmio` for the platform driver (see
+/// `services/devmgr/docs/responsibilities.md` § Responsibilities); the
+/// kernel's own retained UART access is described in
+/// `docs/console-model.md` § Ownership across the boot lifecycle.
 pub fn default_pci_apertures() -> &'static [(u64, u64)]
 {
     const ENTRIES: &[(u64, u64)] = &[

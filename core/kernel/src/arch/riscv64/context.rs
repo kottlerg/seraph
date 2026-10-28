@@ -119,12 +119,11 @@ pub fn align_initial_stack(sp: u64) -> u64
 /// `_is_user`  — unused; user-mode entry uses `return_to_user`.
 pub fn new_state(entry: u64, stack_top: u64, arg: u64, _is_user: bool) -> SavedState
 {
-    // switch() does not save/restore sstatus. SIE is managed by schedule()'s
-    // lock_raw (disables) and restore_interrupts_from (re-enables after switch).
+    // switch() does not save or restore sstatus, so SIE stays masked across the
+    // first switch into a new thread; where each kind of thread re-enables
+    // interrupts is specified in core/kernel/docs/scheduling-internals.md
+    // § Cross-CPU TCB Ownership (issue #160).
     // SPP and SPIE are hardware-managed: set on trap entry, consumed by sret.
-    // Interrupts are enabled later:
-    //   - User threads: sret in return_to_user sets SIE ← SPIE (=1).
-    //   - Idle thread:  explicitly calls interrupts::enable() in its entry.
 
     SavedState {
         ra: entry,
@@ -149,12 +148,8 @@ pub fn new_state(entry: u64, stack_top: u64, arg: u64, _is_user: bool) -> SavedS
 /// `save_flag` must be a valid `*const AtomicU32` (the current thread's
 /// `context_saved` field) or null (initial boot switch).
 ///
-/// The `*save_flag = 1` publication MUST happen AFTER `ld sp, 0(a1)` (the sp
-/// swap to next's kstack). Publishing before the sp swap would let a peer hart
-/// observe `context_saved == 1`, dispatch the outgoing TCB, and execute its
-/// own sp restore onto the same outgoing kstack while this hart is still on
-/// it. See `core/kernel/docs/scheduling-internals.md` § Cross-CPU TCB
-/// Ownership (issue #117 / #133).
+/// The `*save_flag = 1` publication follows the `ld sp, 0(a1)` sp swap, per
+/// `core/kernel/docs/scheduling-internals.md` § Cross-CPU TCB Ownership (issue #133).
 #[cfg(not(test))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch(
@@ -166,7 +161,9 @@ pub unsafe extern "C" fn switch(
     // a0 = current (*mut SavedState)
     // a1 = next (*const SavedState)
     // a2 = save_flag (*const AtomicU32) — context_saved flag on current TCB
-    // SAFETY: switch_context preserves ABI; both pointers valid; stack/frame pointers valid.
+    // SAFETY: `switch` saves and restores every callee-saved register the ABI requires;
+    // the caller guarantees `current` and `next` are valid, aligned `SavedState`
+    // pointers and `save_flag` is a valid `AtomicU32` or null.
     core::arch::naked_asm!(
         // Drain prior memory ops on this hart before the SavedState
         // save block. The outgoing thread's user-mode writes (and any
@@ -199,16 +196,9 @@ pub unsafe extern "C" fn switch(
         "sd s10,   96(a0)",
         "sd s11,  104(a0)",
         // ── Restore next thread from *a1 ──────────────────────────────────
-        // #117 / #133 ordering invariant: `*save_flag = 1` MUST happen AFTER
-        // `ld sp, 0(a1)` (the sp swap below). Publishing earlier lets a peer
-        // hart that observes `context_saved == 1` and dequeues `current`
-        // execute its own sp restore from `saved_state.sp` (still the
-        // OUTGOING sp) onto the same outgoing kstack while this hart is
-        // still pre-`ld sp` — two harts then push/pop on a shared kstack.
-        // Window (a) from the x86_64 fix does not apply on RISC-V because
-        // `switch()` does not restore `sstatus` and SIE stays masked across
-        // the swap, so no trap iretq frame is in flight; only window (b) is
-        // closed here.
+        // `*save_flag = 1` (below) stays after `ld sp, 0(a1)`, per
+        // core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership
+        // (RISC-V analogue, issue #133).
         "ld ra,     8(a1)", // return address (or entry function)
         "ld sp,     0(a1)", // sp swap — now on next's kstack
         "ld s0,    16(a1)",
@@ -224,7 +214,7 @@ pub unsafe extern "C" fn switch(
         "ld s10,   96(a1)",
         "ld s11,  104(a1)",
         "ld a0,   112(a1)", // argument for first-entry threads
-        // ── Notification save complete (Release) ────────────────────────────────
+        // ── Publish context_saved (Release) ───────────────────────────────
         // Set context_saved = 1 so a remote CPU spinning in schedule() can
         // proceed to load this thread's SavedState. The Release fence
         // ensures all prior stores (the register saves above) are globally
@@ -250,8 +240,10 @@ pub unsafe extern "C" fn switch(
 /// (claims a tag and loads it, generation-checked) when tagging is enabled, so
 /// init does not run its first quantum untagged.
 ///
-/// `sscratch` must be set to `kernel_stack_top` before this call so that the
-/// trap entry can switch stacks on the first U-mode trap.
+/// [`set_kernel_trap_stack`](super::cpu::set_kernel_trap_stack) must have been
+/// called with the thread's kernel stack top before this call, so the trap entry
+/// can load it from `PerCpuData::kernel_rsp` on the first U-mode trap;
+/// `return_to_user` arms `sscratch` with the per-CPU pointer.
 ///
 /// # Safety
 /// `aspace` must be a valid `AddressSpace` already marked active on this CPU
@@ -290,7 +282,7 @@ pub unsafe fn first_entry_to_user(
 pub unsafe extern "C" fn return_to_user(tf: *const super::trap_frame::TrapFrame) -> !
 {
     // a0 = tf (*const TrapFrame)
-    // TrapFrame field offsets (trap_frame.rs):
+    // TrapFrame field offsets (`super::trap_frame::TrapFrame`):
     //   ra(x1)=0, sp(x2)=8, gp(x3)=16, tp(x4)=24,
     //   t0=32, t1=40, t2=48, s0=56, s1=64,
     //   a0=72, a1=80, a2=88, a3=96, a4=104, a5=112, a6=120, a7=128,

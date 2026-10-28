@@ -5,37 +5,17 @@
 
 //! TLB shootdown protocol for cross-CPU page table invalidation.
 //!
-//! When a CPU rewrites a leaf page-table entry in a way that could strand a
-//! dangerous stale TLB entry on other CPUs sharing the address space — an
-//! unmap, a permission narrowing, or a frame replacement — those CPUs must
-//! invalidate their cached translation. Fresh maps and permission widenings
-//! issue no shootdown: any stale entry only triggers a spurious fault the
-//! page-fault handler resolves by re-walking the live PTE. The caller
-//! classifies each rewrite ([`MapOutcome`](crate::mm::paging::MapOutcome)) and
-//! enters this module only for the synchronous cases. This module implements
-//! that protocol using IPIs.
+//! The caller classifies each leaf rewrite
+//! ([`MapOutcome`](crate::mm::paging::MapOutcome)) and enters this module only
+//! for the synchronous cases, per `core/kernel/docs/memory-internals.md` § SMP TLB
+//! Shootdown. This module implements that protocol using IPIs.
 //!
 //! # Protocol
 //!
-//! Each CPU owns one request slot in `TLB_REQUESTS`, indexed by its logical CPU
-//! id. A CPU blocks until its own shootdown completes, so it has at most one
-//! outstanding request — the slot is never shared between concurrent shootdowns
-//! and needs no lock.
-//!
-//! 1. The initiating CPU writes the target root, the virtual address (and
-//!    page count, for range requests), and the set of CPUs that must
-//!    acknowledge into *its own* slot.
-//! 2. It sends TLB shootdown IPIs to those CPUs.
-//! 3. Each target CPU ([`service_shootdowns`]) scans every slot; for any slot
-//!    whose `pending_cpus` still contains its bit, it flushes the requested VA
-//!    or range and clears its bit. Range flushes from all matched slots share
-//!    one arch batched-invalidation window (riscv64 Svinval), and every ack is
-//!    deferred until that window closes.
-//! 4. The initiator spins until its own slot's `pending_cpus` becomes empty.
-//!
-//! There is no global serialization: initiators on different CPUs touch
-//! different slots, so concurrent shootdowns — even on the same address space —
-//! proceed in parallel.
+//! The protocol is defined in `core/kernel/docs/memory-internals.md` § SMP TLB
+//! Shootdown. Each CPU owns one request slot in `TLB_REQUESTS`, indexed by its
+//! logical CPU id; [`shootdown_range`] is the initiator side and
+//! [`service_shootdowns`] the target side.
 //!
 //! # The acknowledgement bit is the liveness badge
 //!
@@ -60,7 +40,10 @@
 //!
 //! - **Release** on the `root_phys`/`flush_va`/`pending_cpus` stores, followed
 //!   by a `SeqCst` fence, ensures remote CPUs see the request before the IPI
-//!   arrives (the SBI ecall that delivers a RISC-V IPI is not itself a fence).
+//!   arrives on RISC-V (the SBI ecall that delivers the IPI is not itself a
+//!   fence). On x86-64 that ordering comes from the IPI send:
+//!   `apic_send_icr` fences ahead of the non-serializing x2APIC ICR write, and
+//!   x86 store ordering keeps the xAPIC ICR store after earlier stores.
 //! - **Acquire** on a slot's `pending_cpus` (the handler's bit test, the
 //!   initiator's emptiness poll) pairs with that Release, so a CPU that sees its
 //!   bit also sees the matching root and VA.
@@ -94,7 +77,8 @@ struct TlbShootdownRequest
     /// Number of consecutive 4 KiB pages to invalidate starting at
     /// `flush_va` (ignored on the full-flush sentinel path). A count above
     /// 1 makes the handler use the arch batched-invalidation window
-    /// (riscv64 Svinval; a plain `invlpg` loop on x86-64).
+    /// (riscv64 Svinval; on x86-64 a per-page `invlpg`, or INVPCID for a tagged
+    /// request).
     page_count: AtomicU64,
 
     /// Hardware address-space tag (PCID / ASID) the invalidation targets, or `0`
@@ -126,10 +110,8 @@ impl TlbShootdownRequest
 
 /// One request slot per logical CPU, indexed by initiator CPU id.
 ///
-/// ~80 bytes per slot; sized to `MAX_CPUS` so it needs no runtime allocation
-/// and is available from the first shootdown onward (including boot-time
-/// identity-map teardown, which runs before the buddy-backed per-CPU storage is
-/// guaranteed).
+/// ~96 bytes per slot; a static sized to `MAX_CPUS`, so it needs no runtime
+/// allocation and is available from the first shootdown onward.
 static TLB_REQUESTS: [TlbShootdownRequest; MAX_CPUS] =
     [const { TlbShootdownRequest::new() }; MAX_CPUS];
 
@@ -158,14 +140,10 @@ pub fn any_pending() -> bool
 /// batched-invalidation window (riscv64 Svinval bracket), so a service pass
 /// that finds several queued ranges pays the two window fences once.
 ///
-/// Acknowledgement bits are cleared only after the batch window closes: a
-/// queued `sinval.vma` is not architecturally complete until
-/// `inval_batch_end`'s `sfence.inval.ir` retires, so acking earlier would let
-/// the initiator proceed against a translation this CPU can still use.
-/// Full-flush and single-page acks are deferred to the same point — a pure
-/// (bounded) delay that keeps one ack path. A pending bit set in an
-/// already-scanned slot after the scan is handled by the initiator's resend
-/// ladder, exactly as before.
+/// Acknowledgement bits are cleared only after the batch window closes, for
+/// every request kind (`core/kernel/docs/memory-internals.md` § SMP TLB
+/// Shootdown). A pending bit set in an already-scanned slot after the scan is
+/// handled by the initiator's resend ladder.
 ///
 /// # Safety
 /// Must run in IPI-handler context on the CPU identified by `my_cpu`
@@ -257,8 +235,6 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
 ///
 /// # Contract / Safety
 /// As [`shootdown_range`].
-// Used by AddressSpace::map_page, unmap_page, protect_page.
-#[allow(dead_code)]
 pub unsafe fn shootdown(root_phys: u64, cpus: &CpuMask, virt: u64, tag: u16)
 {
     // SAFETY: contract propagates verbatim.
@@ -318,8 +294,9 @@ pub unsafe fn shootdown_range(root_phys: u64, cpus: &CpuMask, virt: u64, pages: 
     let req = &TLB_REQUESTS[me];
 
     // Publish the request. Release ordering pairs with the Acquire bit test in
-    // service_shootdowns; the SeqCst fence below makes the stores globally
-    // visible before the IPI.
+    // service_shootdowns; the stores are globally visible before the IPI by
+    // the SeqCst fence below on RISC-V and by `apic_send_icr`'s ordering on
+    // x86-64.
     req.root_phys.store(root_phys, Ordering::Release);
     req.flush_va.store(virt, Ordering::Release);
     req.page_count.store(pages.max(1), Ordering::Release);
@@ -329,7 +306,9 @@ pub unsafe fn shootdown_range(root_phys: u64, cpus: &CpuMask, virt: u64, pages: 
     // Drain the store buffer so a remote handler cannot read a stale slot. On
     // RISC-V (RVWMO) the Release stores order this hart's writes but do not
     // force global visibility before the SBI ecall that sends the IPI (not a
-    // fence); the SeqCst fence does. On x86-64 (TSO) this is a no-op.
+    // fence); the SeqCst fence does. On x86-64 it is an `mfence`, but a WRMSR
+    // is not ordered by it alone; the x2APIC send path fences again itself
+    // (`apic_send_icr`).
     core::sync::atomic::fence(Ordering::SeqCst);
 
     // Helper: send IPIs to every CPU in `mask`.
@@ -352,7 +331,7 @@ pub unsafe fn shootdown_range(root_phys: u64, cpus: &CpuMask, virt: u64, pages: 
 
     // TSC-bounded ack wait with re-send + NMI-backtrace escalation. See
     // arch::current::interrupts::wait_for_ack and the IPI Watchdog Ladder
-    // subsection in docs/scheduling-internals.md. The resend closure re-fires
+    // section in core/kernel/docs/scheduling-internals.md. The resend closure re-fires
     // only to CPUs whose bit is still set in our slot, so a dropped IPI recovers
     // without retransmitting to acks-in-flight. target_cpu is the lowest-numbered
     // target; it drives the Phase-C NMI backtrace and Phase-D panic message only.

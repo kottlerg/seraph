@@ -6,10 +6,9 @@
 //! Memory management syscall handlers.
 //!
 //! # Adding new memory syscalls
-//! 1. Add a new `pub fn sys_mem_*` in this file.
-//! 2. Add the syscall constant import to `syscall/mod.rs`.
-//! 3. Add a dispatch arm to `syscall/mod.rs`.
-//! 4. Add a userspace wrapper to `shared/syscall/src/lib.rs`.
+//! Follow `core/kernel/src/syscall/mod.rs` (module docs, "Adding new syscalls"), placing
+//! the handler here as a `pub fn sys_mem_*` / `sys_memory_*`, then add a userspace wrapper
+//! to `shared/syscall/src/lib.rs`.
 
 // cast_possible_truncation: u64→u32/usize casts extract cap indices and sizes
 // from 64-bit trap frame args. Seraph is 64-bit only; all values fit in the target type.
@@ -20,19 +19,7 @@ use syscall::SyscallError;
 
 /// `SYS_MEM_MAP` (16): map a Memory cap's pages into a user address space.
 ///
-/// arg0 = Memory cap index (must have MAP right; WRITE/EXECUTE determine page perms).
-/// arg1 = `AddressSpace` cap index (must have MAP right).
-/// arg2 = virtual address of the first page to map (must be page-aligned, user range).
-/// arg3 = offset into the Memory cap region in pages (0 = start of region).
-/// arg4 = number of pages to map.
-/// arg5 = protection bits (bit 1 = WRITE, bit 2 = EXECUTE; bit 0 = READ, no
-///         effect on permissions but makes a read-only request nonzero and
-///         thus explicit). If zero, permissions are derived from the Memory
-///         cap's rights. If nonzero, WRITE/EXECUTE must each be a subset of
-///         the cap's rights. W^X is enforced: WRITE and EXECUTE may not both
-///         be set.
-///
-/// Returns 0 on success.
+/// Arguments, return, and errors: `core/kernel/docs/syscalls.md` § `SYS_MEM_MAP` (16).
 #[cfg(not(test))]
 // too_many_lines: single validation pass over cap rights, prot bits, and address
 // range; splitting would require threading shared state through helpers.
@@ -60,7 +47,7 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidAddress);
     }
 
-    // Virtual address must be in the user half (< canonical kernel boundary).
+    // Virtual address must be in the user half (< `user_va_top()`).
     if virt_base >= crate::mm::user_va_top()
     {
         return Err(SyscallError::InvalidAddress);
@@ -103,9 +90,9 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let memory_slot = unsafe { super::lookup_cap(caller_cspace, memory_idx, MemRights::MAP) }?;
     let memory_obj_nn = memory_slot.object.ok_or(SyscallError::InvalidCapability)?;
-    // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
     // SAFETY: tag confirmed Memory; pointer remains valid for the whole syscall
     // (cap held by caller's CSpace; refcount > 0).
+    // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
     #[allow(clippy::cast_ptr_alignment)]
     let memory_ref = unsafe { &*(memory_obj_nn.as_ptr().cast::<MemoryObject>()) };
 
@@ -131,11 +118,8 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidArgument);
     }
 
-    // Determine page permissions. If prot_bits is nonzero, use explicit
-    // permissions (must be a subset of the Memory cap's rights). If zero,
-    // derive from the cap's rights directly. Callers that hold a cap with
-    // both WRITE and EXECUTE must use a derived sub-cap (or explicit
-    // prot_bits) to avoid the W^X check below.
+    // Determine page permissions per `core/kernel/docs/syscalls.md`
+    // § `SYS_MEM_MAP` (16), prot_bits.
     let (writable, executable) = if prot_bits != 0
     {
         let w = (prot_bits & syscall::MAP_WRITABLE) != 0;
@@ -157,7 +141,7 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             memory_rights.contains(MemRights::EXECUTE.erase()),
         )
     };
-    // W^X is enforced at mapping time: no page may be both writable and executable.
+    // W^X (docs/capability-model.md § Memory).
     if writable && executable
     {
         return Err(SyscallError::WxViolation);
@@ -182,10 +166,8 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (as_inner, aso)
     };
 
-    // Choose the PT-page source. An AS that recorded its create-time
-    // donation pulls intermediate PT pages from its own growth pool; one
-    // without falls back to the kernel PT pool (`kernel_pt_pool`) via
-    // `map_page`.
+    // Choose the PT-page source by whether the AS records a create-time
+    // donation (`core/kernel/docs/memory-internals.md` § Page Table Node Ownership).
     // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
     let pooled = unsafe { (*aso_raw).pt_pool.has_create_donation() };
 
@@ -228,20 +210,9 @@ pub fn sys_mem_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_MEM_UNMAP` (17): remove page mappings from a user address space.
 ///
-/// arg0 = `AddressSpace` cap index (must have MAP right).
-/// arg1 = virtual address of the first page to unmap (page-aligned, user range).
-/// arg2 = number of pages to unmap (non-zero).
-/// arg3 = flags. `MEM_UNMAP_RECLAIM_PTS` additionally reclaims each now-empty
-///        intermediate page table the cleared span leaves to the address
-///        space's growth pool (one coarse TLB + paging-structure-cache
-///        shootdown); otherwise only leaf PTEs are cleared, with a per-page
-///        shootdown.
-///
-/// Unmapping a page that is not mapped is a no-op (not an error).
-/// Returns 0 on success.
-///
-/// Without `MEM_UNMAP_RECLAIM_PTS`, intermediate page table frames are not
-/// reclaimed; full teardown happens when the address space object is destroyed.
+/// Arguments, flags, return, and errors: `core/kernel/docs/syscalls.md` § `SYS_MEM_UNMAP` (17);
+/// page-table reclaim: `core/kernel/docs/memory-internals.md` § Page Table Node Ownership.
+/// Unmapping a page that is not mapped is a no-op.
 #[cfg(not(test))]
 pub fn sys_mem_unmap(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -342,17 +313,7 @@ pub fn sys_mem_unmap(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_MEM_PROTECT` (18): change permission flags on existing page mappings.
 ///
-/// arg0 = Memory cap index (must have MAP right; authorises the new permissions).
-/// arg1 = `AddressSpace` cap index (must have MAP right).
-/// arg2 = virtual address of the first page (page-aligned, user range).
-/// arg3 = number of pages (non-zero).
-/// arg4 = new protection bits: bit 1 = WRITE, bit 2 = EXECUTE (matches Rights layout).
-///
-/// The new permissions must be a subset of the Memory cap's rights. W^X is
-/// enforced: WRITE and EXECUTE may not both be set. Protecting a page that
-/// is not mapped returns `InvalidAddress`.
-///
-/// Returns 0 on success.
+/// Arguments, return, and errors: `core/kernel/docs/syscalls.md` § `SYS_MEM_PROTECT` (18).
 #[cfg(not(test))]
 pub fn sys_mem_protect(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -481,25 +442,8 @@ pub fn sys_mem_protect(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_MEMORY_SPLIT` (33): carve a virgin tail off a Memory cap.
 ///
-/// arg0 = Memory cap index (must have MAP right).
-/// arg1 = split offset in bytes (page-aligned; > 0 and < cap size; must be
-///        at or above the cap's highest live retype offset, page-aligned).
-/// arg2 = reserved (ignored).
-///
-/// The parent cap stays in its slot; its `size` shrinks to `split_offset`
-/// and its `available_bytes` debits by `(orig_size - split_offset)` (when
-/// the cap carries `MemRights::RETYPE`). A new child cap covering
-/// `[base + split_offset, base + orig_size)` is inserted in the caller's
-/// `CSpace` and linked as a derivation child of the parent's existing
-/// derivation parent — making it a co-equal sibling of the (now shrunken)
-/// parent in the derivation tree.
-///
-/// Live retypes against the parent always sit below `bump_offset`; any
-/// `split_offset >= round_up(bump_offset, PAGE_SIZE)` is therefore safe —
-/// the new tail is virgin (no live descendants). Smaller offsets are
-/// refused.
-///
-/// Returns the new tail-cap slot on success.
+/// Arguments, semantics, return, and errors: `core/kernel/docs/syscalls.md`
+/// § `SYS_MEMORY_SPLIT` (33). The bump bound is read with `retype::current_bump`.
 // too_many_lines: one locked pass — pin, snapshot, validate, mint, insert,
 // link, mutate in place — that would otherwise thread the held locks
 // through helpers.
@@ -556,9 +500,8 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // ── Acquire locks (DERIVATION outer, frame-write inner) ──────────────────
     DERIVATION_LOCK.write_lock();
-    // The parent was resolved unlocked: pin it under the lock before its
-    // object is touched (a concurrent delete of its last cap would have freed
-    // the object) and before the tail is linked beside it.
+    // Pin the unlocked-resolved parent under the lock
+    // (`core/kernel/docs/capability-internals.md` § Global Derivation Lock).
     // SAFETY: caller_cspace validated non-null; DERIVATION_LOCK held.
     if let Err(e) = unsafe {
         super::cap::revalidate_src_under_lock(caller_cspace, memory_handle, parent_obj_nn)
@@ -567,9 +510,9 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         DERIVATION_LOCK.write_unlock();
         return Err(e);
     }
-    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
     // SAFETY: tag confirmed Memory; the slot is pinned under DERIVATION_LOCK,
     // so the object is live for the rest of the hold.
+    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
     #[allow(clippy::cast_ptr_alignment)]
     let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<MemoryObject>()) };
     parent_ref.write_lock();
@@ -627,18 +570,19 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // ── Mint tail MemoryObject ─────────────────────────────────────────────────
     //
-    // The wrapper body lives in the kernel SEED Memory cap; on tail
-    // dealloc, two independent reclaims fire: `owns_memory` returns the
-    // tail's region to the buddy, and `header.ancestor=SEED` returns the
-    // wrapper bytes via `retype_free`.
+    // The wrapper body lives in the kernel SEED Memory cap; `header.ancestor`
+    // = SEED returns the wrapper bytes via `retype_free` on dealloc. The tail
+    // inherits `owns_memory`, and after handoff the buddy is sealed, so
+    // destroying such a tail frees into a sealed buddy (`core/kernel/src/mm/buddy.rs`
+    // § Post-handoff sealing); the insert-failure path below does so (#443).
     let tail_ptr = retype::alloc_in_seed(MemoryObject {
         header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
         base: parent_phys + split_offset,
         size: tail_size,
         available_bytes: core::sync::atomic::AtomicU64::new(tail_avail),
-        // Tail inherits the parent's ownership flag. On dealloc each half
-        // buddy-frees its own (now disjoint) range; together they cover the
-        // original allocation.
+        // Tail inherits the parent's ownership flag so the two halves together
+        // carry the original range's `owns_memory` accounting (the buddy is
+        // sealed after handoff; see `core/kernel/src/mm/buddy.rs`).
         owns_memory: core::sync::atomic::AtomicBool::new(parent_owns),
         allocator: crate::cap::retype::RetypeAllocator::new_inline(),
         lock: core::sync::atomic::AtomicU32::new(0),
@@ -649,8 +593,8 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     })?;
 
     // Insert under cspace.lock to keep the freelist/tag invariant against a
-    // concurrent SYS_CAP_CREATE_* on the same cspace. Lock order:
-    // DERIVATION_LOCK → parent MemoryObject lock → cspace.lock.
+    // concurrent SYS_CAP_CREATE_* on the same cspace (lock order:
+    // `core/kernel/docs/scheduling-internals.md` § Lock Hierarchy).
     // `insert_cap_slot_and_handle` mints the returned handle in the same hold.
     // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
@@ -734,26 +678,8 @@ pub fn sys_memory_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_MEMORY_MERGE` (50): absorb a virgin tail Memory cap back into its parent.
 ///
-/// arg0 = parent Memory cap index (must have MAP right; physically-lower half).
-///        Stays valid; its `size` grows to cover the absorbed tail's region.
-/// arg1 = tail Memory cap index (must have MAP right; physically-upper half).
-///        Consumed; its slot is freed.
-/// arg2 = reserved (ignored).
-///
-/// Inverse of [`sys_memory_split`] under Option D. Both caps must:
-/// - Be physically contiguous (`parent.base + parent.size == tail.base`).
-/// - Carry identical rights.
-/// - Agree on `owns_memory`.
-/// - Be siblings under the same derivation parent.
-/// - Have no derivation children of their own.
-/// - The tail must be virgin (no live retypes): its allocator bump cursor is
-///   at the base (`current_bump == 0`) and `available_bytes == size` for
-///   retypable caps (`== 0` for non-retypable caps, which trivially satisfy
-///   this). `retype_free`'s drain-reset restores `bump == 0` once the last
-///   retyped object is freed, so a fully-drained tail is mergeable again.
-///
-/// Returns 0 on success. The parent's slot index is unchanged; the tail's
-/// slot is returned to the caller's `CSpace` free list.
+/// Inverse of [`sys_memory_split`]. Arguments, return, preconditions, and errors:
+/// `core/kernel/docs/syscalls.md` § `SYS_MEMORY_MERGE` (50).
 // too_many_lines: one locked pass — pin, snapshot, validate, unlink, mutate,
 // free — over two objects under three locks that would otherwise be
 // threaded through helpers.
@@ -810,15 +736,13 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let merged_rights = parent_slot.rights;
     let merged_retypable = merged_rights.contains(MemRights::RETYPE.erase());
 
-    // ── Acquire locks (DERIVATION outer; per-cap write locks inner, in a
-    // fixed order by MemoryObject pointer — DERIVATION_LOCK already excludes
-    // a concurrent merge, so the order is defence, not deadlock avoidance) ──
+    // ── Acquire locks (order: `core/kernel/docs/scheduling-internals.md`
+    // § Lock Hierarchy; DERIVATION_LOCK already excludes a concurrent merge,
+    // so the pointer order is defence, not deadlock avoidance) ──
     DERIVATION_LOCK.write_lock();
 
-    // Both caps were resolved unlocked: pin them under the lock before their
-    // objects are touched (a concurrent delete of either's last cap would
-    // have freed the object) and before the tail is unlinked and its slot
-    // freed (a recycled tail index would free an unrelated live cap).
+    // Pin both unlocked-resolved caps under the lock
+    // (`core/kernel/docs/capability-internals.md` § Global Derivation Lock).
     // SAFETY: caller_cspace validated non-null; DERIVATION_LOCK held.
     let pinned = unsafe {
         super::cap::revalidate_src_under_lock(caller_cspace, parent_handle, parent_obj_nn).and_then(
@@ -830,13 +754,13 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         DERIVATION_LOCK.write_unlock();
         return Err(e);
     }
-    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
     // SAFETY: tag confirmed Memory; the slot is pinned under DERIVATION_LOCK,
     // so the object is live for the rest of the hold.
+    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
     #[allow(clippy::cast_ptr_alignment)]
     let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<MemoryObject>()) };
-    // cast_ptr_alignment: as above.
     // SAFETY: as for parent_ref.
+    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
     #[allow(clippy::cast_ptr_alignment)]
     let tail_ref = unsafe { &*(tail_obj_nn.as_ptr().cast::<MemoryObject>()) };
 
@@ -980,8 +904,8 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         .store(false, core::sync::atomic::Ordering::Release);
 
     // Free the tail slot under cspace.lock so the freelist mutation cannot
-    // tear against a concurrent SYS_CAP_CREATE_* on the same cspace. Lock
-    // order: DERIVATION_LOCK → tail/parent locks → cspace.lock.
+    // tear against a concurrent SYS_CAP_CREATE_* on the same cspace (lock
+    // order: `core/kernel/docs/scheduling-internals.md` § Lock Hierarchy).
     // SAFETY: caller_cspace validated; tail_idx within CSpace bounds.
     unsafe {
         let saved = (*caller_cspace).lock.lock_raw();

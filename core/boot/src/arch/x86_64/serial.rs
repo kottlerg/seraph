@@ -26,7 +26,7 @@ pub unsafe fn serial_init()
         outb(COM1 + 1, 0x00); // divisor high byte = 0
         outb(COM1 + 3, 0x03); // DLAB = 0, 8 bits, no parity, 1 stop (8N1)
         outb(COM1 + 2, 0xC7); // enable FIFO, clear, 14-byte threshold
-        outb(COM1 + 4, 0x0B); // DTR + RTS + OUT2 (enable IRQs on modem)
+        outb(COM1 + 4, 0x0B); // DTR + RTS + OUT2 (gates UART IRQ line; IER keeps all sources off)
     }
 }
 

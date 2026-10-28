@@ -14,7 +14,7 @@ The IPC subsystem comprises four kernel object types:
 
 ---
 
-## Endpoint (`ipc/endpoint.rs`)
+## Endpoint (`core/kernel/src/ipc/endpoint.rs`)
 
 ### Object Structure
 
@@ -68,7 +68,8 @@ one set of links suffices). No separate allocation. Threads are served in arriva
 
 ```
 1. Resolve endpoint_cap → verify Send rights
-2. Validate message arguments (data_count, cap_slots)
+2. Read the data words from the sender's IPC buffer page (data_count > 0),
+   pre-validate the cap slots, open the park episode (open_call_episode)
 3. Acquire endpoint lock
 4. if the recv queue is non-empty:
    // Fast path: receiver is already waiting
@@ -85,7 +86,8 @@ one set of links suffices). No separate allocation. Threads are served in arriva
       BlockedOnFault, recv_tcb); on a refusal, roll the binding back
       (rollback_uncommitted_call)
    e. Release endpoint lock
-   f. Transfer capability slots (see capability-internals.md)
+   f. Transfer capability slots in the caller's context (deliver_call_caps; a
+      refusal delivers zero caps; see capability-internals.md)
    g. enqueue_and_wake(recv_tcb) on its selected CPU
    h. Call the scheduler whether the park committed or was refused (a
       refused park that left the thread runnable is requeued), then
@@ -126,8 +128,8 @@ syscall on either side. Nothing is allocated on the path.
 
 ```
 1. Resolve endpoint_cap → verify Receive rights, and pre-allocate the
-   worst-case cap-slot headroom in the server's CSpace; a failure returns
-   here and leaves any earlier binding in place
+   worst-case cap-slot headroom in the server's CSpace (a failure returns
+   here and leaves any earlier binding in place); open the park episode
 2. Release an unreplied caller (release_unreplied_caller, no lock held):
    swap current_tcb.reply_tcb to null; if it held a caller bound by an
    earlier receive the server never replied to, stamp that caller's call
@@ -172,7 +174,7 @@ syscall on either side. Nothing is allocated on the path.
 1. Peek caller_tcb = current_tcb.reply_tcb (Acquire load)
    (the reply capability is this caller binding, a per-thread field outside
    the CSpace; the peeked caller is read before the step-3 claim and is not
-   pinned, so a concurrent dealloc can free it first, #443)
+   pinned, so a concurrent dealloc can free it first, #513)
 2. Unless caller_tcb is BlockedOnFault (a fault reply, whose data words and
    caps the kernel ignores): read the data words and pre-validate the reply
    cap slots; when caps are attached, return InvalidCapability if no caller
@@ -214,8 +216,10 @@ exclusively owns its wake fields, so the reset cannot race a deposit. `fault_dis
 episode the same way next to its `fault_outcome = Pending` reset.
 
 **Claim-then-stamp rule.** A site may stamp the episode only after winning
-the episode's exclusive wake claim. Per the DEPOSIT model (rule 8 /
-[sched-ipc-redesign.md](sched-ipc-redesign.md) § 2.1) every deposit now carries a disposition;
+the episode's exclusive wake claim. Per the DEPOSIT model
+([scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 8 /
+[sched-ipc-redesign.md](sched-ipc-redesign.md) § 2.1) every call/fault-episode deposit carries
+a disposition, while the non-call surfaces stamp only on cancellation (below);
 the resume remains deposit-read, never re-check. Stamps are Release-ordered after
 the payload write; the resume's Acquire load orders the payload reads after
 it. The wake chain (stamp → `enqueue_and_wake`'s `sched_lock`/run-queue
@@ -262,8 +266,8 @@ than RESUME, a PENDING left by an unstamped wake included, kills the thread
 
 **Resume (non-call parks — fail-open).** Each non-call parking syscall
 consumes the disposition via `consume_park_interrupted` before reading its
-wake deposit: INTERRUPTED returns `Interrupted` without touching
-`wakeup_value`/`timed_out`/`ipc_msg` (clearing the per-surface leftovers);
+wake deposit: INTERRUPTED returns `Interrupted` without reading
+`wakeup_value`/`timed_out`/`ipc_msg` (it clears the per-surface leftovers instead);
 NONE proceeds on the normal deposit-read path. Fail-open is required, not a
 convenience: genuine wakers for these surfaces do not stamp, because a
 coalesced wake-before-park deposit (`ParkCommit::RefusedWake`) has no
@@ -292,7 +296,7 @@ parks the caller through `schedule`; the reply path returns to the server.
 
 ---
 
-## Notification (`ipc/notification.rs`)
+## Notification (`core/kernel/src/ipc/notification.rs`)
 
 ### Object Structure
 
@@ -353,8 +357,9 @@ pub struct NotificationState
 7. else: release; return None                  // observer disappeared
 ```
 
-The atomic OR in step 1 is the only operation on the hot path when no waiter is
-present. Setting an already-set bit is idempotent — this is the defined coalescing
+Steps 1-3 (the OR, the SeqCst fence, and the `has_observer` load) are the only
+operations on the hot path when no waiter or wait set is registered.
+Setting an already-set bit is idempotent — this is the defined coalescing
 behaviour (per [docs/ipc-design.md § Notifications](../../../docs/ipc-design.md#notifications)).
 
 ### Wait Path
@@ -362,7 +367,7 @@ behaviour (per [docs/ipc-design.md § Notifications](../../../docs/ipc-design.md
 `SYS_NOTIFICATION_WAIT`:
 
 ```
-1. Acquire sig.lock; context_saved = 0
+1. Open the park episode; acquire sig.lock; context_saved = 0
 2. waiters.push(current_tcb) (the tail); has_observer = 1
 3. SeqCst fence (Dekker pair with notification_send)
 4. acquired = bits.swap(0, Ordering::Relaxed)
@@ -397,7 +402,7 @@ bit-63-set bitmasks with negative-Err codes.
 
 ---
 
-## Event Queue (`ipc/event_queue.rs`)
+## Event Queue (`core/kernel/src/ipc/event_queue.rs`)
 
 ### Object Structure
 
@@ -420,10 +425,10 @@ pub struct EventQueueState
     /// the lock; every mutation is under `lock`.
     pub count: AtomicU32,
 
-    /// Write index (producer position, modulo capacity).
+    /// Write index (producer position, modulo capacity + 1).
     pub write_idx: u32,
 
-    /// Read index (consumer position, modulo capacity).
+    /// Read index (consumer position, modulo capacity + 1).
     pub read_idx: u32,
 
     /// Receivers blocked in SYS_EVENT_RECV, in arrival order.
@@ -438,11 +443,15 @@ pub struct EventQueueState
 
 When the user requests capacity N, the kernel reserves a ring buffer of N+1
 entries laid out **inline within the same retype slot** that holds the
-`EventQueueState` (see the typed-memory cap design and
-[scheduling-internals.md](scheduling-internals.md)). The one-slot gap between
-`write_idx` and `read_idx` (used to distinguish full from empty) is internal;
-the user observes exactly N usable slots. The ring is reclaimed wholesale with
-the wrapper on `dealloc_object(EventQueue)`.
+`EventQueueState` (layout: `cap::retype::event_queue_raw_bytes` and
+`EVENT_QUEUE_RING_OFFSET`; see
+[memory-internals.md § Kernel Object Memory](memory-internals.md#kernel-object-memory-capretypers)).
+Full and empty are detected from `count` (also the lockless wait-set readiness
+witness), not from the gap between `write_idx` and `read_idx`. Both indices
+advance modulo N+1, so every slot is written in rotation, but at most N slots
+are occupied at any time (the extra slot is never needed for full/empty
+detection) and the user observes exactly N usable slots. The ring is reclaimed
+wholesale with the wrapper on `dealloc_object(EventQueue)`.
 
 ### Post Path
 
@@ -456,7 +465,7 @@ the wrapper on `dealloc_object(EventQueue)`.
    b. claim_waiter(tcb, payload): wake_in_flight = 1,
       tcb.wakeup_value = payload, and if tcb.sleep_deadline != 0
       sleep_list_remove(tcb) (clears the deadline with the entry)
-   c. Release eq.lock
+   c. Release eq.lock; return the woken tcb (ring untouched)
    d. Syscall handler: select_target_cpu + enqueue_and_wake(tcb)
 3. if count >= capacity:
    Release eq.lock; return QueueFull
@@ -465,9 +474,10 @@ the wrapper on `dealloc_object(EventQueue)`.
 6. Release eq.lock
 ```
 
-The ring has `capacity + 1` slots internally (one-slot-gap full detection);
-the user observes exactly N usable slots as requested. `count` tracks
-occupancy and doubles as the lockless wait-set level-readiness witness.
+The ring has `capacity + 1` slots internally; full and empty are detected from
+`count`, not the index gap, and the user observes exactly N usable slots as
+requested. `count` tracks occupancy and doubles as the lockless wait-set
+level-readiness witness.
 
 ### Recv Path
 
@@ -521,7 +531,7 @@ path — sequential, not nested, so no cycle.
 
 ---
 
-## Wait Set (`ipc/wait_set.rs`)
+## Wait Set (`core/kernel/src/ipc/wait_set.rs`)
 
 ### Object Structure
 
@@ -581,11 +591,12 @@ the 16-slot member array is 384 B and `WaitSetState` (at most 440 B) fits,
 with its 24 B `WaitSetObject` wrapper, in the 512 B retype bin; `wait_set.rs`
 asserts both sizes at compile time.
 
-The arrays are fixed-capacity because the kernel runs no allocator (see
+The arrays are fixed-capacity because the kernel runs no heap (see
 § Kernel Object Memory in
 [memory-internals.md](memory-internals.md#kernel-object-memory-capretypers)): a
 wait set's membership storage is part of the object carved at creation, and
-`waitset_notify`, under the source object lock, only walks it. A full wait set
+`waitset_notify`, under the source object lock, touches only the member it is given and
+allocates nothing. A full wait set
 refuses `SYS_WAIT_SET_ADD` with `InvalidArgument`, per
 [syscalls.md § `SYS_WAIT_SET_ADD`](syscalls.md#sys_wait_set_add-26).
 
@@ -621,8 +632,8 @@ waitset_notify(wait_set, member_idx):
    c. Release lock; return members[member_idx].badge
 3. Level-readiness self-heal: for each member, if source_is_ready(source)
    right now, Release lock and return its badge.
-4. else:
-   a. waiters.push(current_tcb)
+4. else, still under the lock:
+   a. context_saved = 0; waiters.push(current_tcb)
    b. commit_blocked_under_local_lock(current_tcb, BlockedOnWaitSet, ws);
       on a refusal, remove current_tcb from waiters, and stamp INTERRUPTED
       if the refusal was a stop (RefusedStop)
@@ -645,11 +656,16 @@ it here would acquire `source.lock` while holding `ws.lock`, inverting the
 `source.lock → ws.lock` order `waitset_notify` uses (it runs under the source
 lock and acquires `ws.lock`) and deadlocking (rule 2 of
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)).
-Because the read is lockless, each source's readiness signal MUST be an atomic
-that the self-heal reads with `Acquire`, paired with `Release` mutations under
-the source lock — otherwise a weak-memory target (riscv64) can observe a stale
-not-ready and strand a queued sender/event whose enqueue fired no edge notify
-(lost wakeup). The readiness signals are: `NotificationState::bits`
+Because the read is lockless, each source's readiness signal is an atomic that the
+self-heal reads with `Acquire`. `EventQueueState::count` and
+`EndpointState::send_nonempty` MUST be mutated with `Release` under the source lock,
+and the `Acquire` load pairs with those stores. Without that pairing, a weak-memory
+target (riscv64) can observe a stale not-ready and strand a queued sender or event
+whose enqueue fired no edge notify (lost wakeup). `NotificationState::bits` is the
+exception. `notification_send` sets it with a lock-free `Relaxed` `fetch_or` that
+the SeqCst Dekker fence pair orders against `notification_wait`, so the self-heal's
+`Acquire` load of `bits` has no `Release` partner (`bits` carries no dependent
+payload). The readiness signals are: `NotificationState::bits`
 (`AtomicU64`), `EventQueueState::count` (`AtomicU32`), and
 `EndpointState::send_nonempty` (`AtomicU32`, a shadow of `send_head != null`
 republished under `ep.lock` at every send-queue mutation); their pairings are tabulated in
@@ -658,19 +674,25 @@ Invariants.
 
 ### Wait Set Add/Remove
 
-`SYS_WAIT_SET_ADD` acquires the wait set lock, appends a new `WaitSetMember`,
-registers the wait set back-pointer on the source object, and `inc_ref`s the
-source's `KernelObjectHeader` — wait-set membership is a +1 cap-level
-reference on the source. The source object must be modified atomically to
-avoid lost readiness notifications — if the source is already ready at add
-time, the wait set is immediately notified.
+`SYS_WAIT_SET_ADD` holds the source object's lock across the whole registration.
+Under it, `waitset_add` takes the wait set lock (inner) and fills the first vacant
+`WaitSetMember` slot. The handler then registers the wait set back-pointer on the
+source object and `inc_ref`s the source's `KernelObjectHeader`: wait-set membership
+is a +1 cap-level reference on the source. Holding the source lock makes the
+registration atomic from the source's side, so no readiness notification is lost.
+If the source is already ready at add time, `waitset_add` queues the member and
+wakes any waiter immediately.
 
 `SYS_WAIT_SET_REMOVE` acquires both the wait set lock and the source object lock,
 removes the member, clears the back-pointer, and `dec_ref`s the source's
 `KernelObjectHeader` to release the +1 held by membership. The lock pairing
 prevents a concurrent notification from referencing a removed member. The
-caller still holds a cap to the source while issuing the syscall, so this
-`dec_ref` cannot drain the refcount to zero.
+handler resolves the caller's source capability without pinning it (see
+[capability-internals.md § Storage: Hybrid Two-Level Radix](capability-internals.md#storage-hybrid-two-level-radix)),
+so a concurrent delete or ancestor revoke can release that capability mid-call.
+This `dec_ref` can then drain the refcount to zero: a debug build asserts, and the
+source is not reclaimed. This is a known defect tracked in
+[#502](https://github.com/kottlerg/seraph/issues/502).
 
 When the wait set itself is dropped (last cap released), `wait_set_drop`
 clears every member's back-pointer and `dec_ref`s each source's header; any
@@ -718,21 +740,23 @@ The wake-one primitives invoke `enqueue_and_wake` after releasing their source I
 `waitset_notify` and `waitset_add`'s ready-at-add wake release `ws.lock` but wake while the
 notifying or registering source's lock is still held. The multi-waiter drains — the endpoint
 dealloc drain and the Notification, EventQueue, and WaitSet destroy wakes
-(`interrupt_all_waiters`) — hold the source lock across their walks. All are per
-[§ Lock Hierarchy rule 5](scheduling-internals.md#lock-hierarchy).
+(`interrupt_all_waiters`) — hold the source lock across their walks. All are per rule 5 of
+[scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy).
 
 ### Lock-Free Notification Fast Path
 
-Notification delivery (OR bits) uses an atomic operation and avoids acquiring the waiter
-lock in the common case of no waiter. Only after the atomic OR, if a waiter is
-suspected, is the lock acquired. This makes the notification send path essentially one
-atomic instruction in the no-waiter case.
+Notification delivery (OR bits) avoids acquiring `lock` when no observer is
+registered. `notification_send` performs a `Relaxed` `fetch_or`, the SeqCst Dekker
+fence, and a `Relaxed` load of `has_observer`. It takes `lock` only when
+`has_observer` is non-zero (a waiter or a wait set is registered). The no-observer
+send path is therefore one atomic read-modify-write, one fence, and one load
+(§ Send Path steps 1-3).
 
 ---
 
 ## IPC Scheduling Interaction
 
-The IPC paths interact with the scheduler only through its park and wake primitives:
+The IPC paths interact with the scheduler through its park and wake primitives:
 `commit_blocked_under_local_lock` to park, `commit_reply_rebind_under_local_lock` to rebind an
 already parked sender to its reply, `withdraw_uncontested_park` to un-commit a timed park the full
 sleep list refused, `select_target_cpu` and `enqueue_and_wake` to wake, `schedule` to switch away,
@@ -741,7 +765,12 @@ un-commit is the sanctioned exception that rule 8 of
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)
 makes for a park no waker can have claimed; its rules are
 [thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants),
-invariant 4. The scheduler itself does not need to know about IPC.
+invariant 4. The IPC paths also use the `sched::thread` park-episode helpers `open_park_episode`,
+`stamp_park_deposit`, `stamp_cancelled_deposit` and `consume_park_interrupted` (see § Park
+Dispositions and Episodes). The dependency is not one-way: the scheduler's timer path
+`sleep_check_wakeups` dispatches on `IpcThreadState` and claims timed notification and
+event-queue waiters under the source lock, and `post_one_death_event` posts death payloads
+through `event_queue_post`.
 
 The scheduler's preemption timer does not interrupt the IPC fast path. Syscall entry
 masks interrupts, and every IPC object lock is an IRQ-disabling

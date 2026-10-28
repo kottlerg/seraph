@@ -239,13 +239,15 @@ pub const SYS_THREAD_EXIT: u64 = 22;
 pub const SYS_THREAD_CONFIGURE: u64 = 23;
 /// Capability: copy a slot into another `CSpace`.
 ///
-/// arg0 = source slot index (caller's `CSpace`).
-/// arg1 = destination `CSpace` cap index (must have INSERT right).
+/// arg0 = source capability handle (caller's `CSpace`; generation-checked).
+/// arg1 = destination `CSpace` capability handle (must have INSERT right).
 /// arg2 = destination slot index, or `0` to let the kernel allocate a free slot
 ///        (slot 0 is permanently null, so it is a safe "kernel picks" sentinel).
-/// arg3 = rights mask (subset of source rights).
+///        This is the only bare placement index; it is not generation-checked.
+/// arg3 = rights mask; the effective rights are `rights_mask & source rights`
+///        (bits the source lacks are dropped, not rejected).
 ///
-/// Returns the destination slot index.
+/// Returns the destination capability handle (slot index plus generation).
 pub const SYS_CAP_COPY: u64 = 24;
 /// Capability: move a slot (destroying the source).
 pub const SYS_CAP_MOVE: u64 = 25;
@@ -292,21 +294,29 @@ pub const SYS_MMIO_MAP: u64 = 34;
 pub const SYS_IOPORT_BIND: u64 = 35;
 /// Capability: read-only inspection of a cap's runtime state.
 ///
-/// Returns a discriminated union keyed by `CapTag`:
-/// - `Memory` → `(size_bytes, available_bytes, has_retype_right)`
-/// - `AddressSpace` → `(pt_growth_budget_bytes)`
-/// - `CSpace` → `(slot_capacity, slots_used, growth_budget_bytes)`
-/// - all other tags → `(tag, rights)` only
+/// Returns one field per call, chosen by the selector in arg1:
+/// - any tag → `(tag, rights)`, and the system-wide TLB counters (elided and
+///   performed flushes)
+/// - `Memory` → `size_bytes`, `available_bytes`, `has_retype_right`, `phys_base`
+/// - `AddressSpace` → `pt_growth_budget_bytes`
+/// - `CSpace` → `slot_capacity`, `slots_used`, `growth_budget_bytes`
+/// - `Thread` → the packed lifecycle state and exit reason
+///   ([`CAP_INFO_THREAD_STATE`])
 ///
-/// Cannot fail except on null/invalid slot. Slot 36 was vacated by the
-/// `SYS_DMA_GRANT` removal (commit `704c1b4`).
+/// Fails with [`SyscallError::InvalidCapability`] on a null, invalid, or
+/// stale handle or when the referenced target object is gone, and with
+/// [`SyscallError::InvalidArgument`] on an unknown
+/// selector or a tag-specific one whose owning tag does not match the slot
+/// (see arg1 below). Slot 36 was vacated by the `SYS_DMA_GRANT` removal
+/// (commit `704c1b4`).
 ///
-/// arg0 = slot index in the caller's `CSpace`.
+/// arg0 = capability handle in the caller's `CSpace` (generation-checked).
 /// arg1 = field selector — one of the [`CAP_INFO_*`](CAP_INFO_TAG_RIGHTS)
 ///        constants below. The value returned in the primary register
 ///        depends on the selector. Field selectors that are tag-specific
-///        (every constant other than [`CAP_INFO_TAG_RIGHTS`]) require the
-///        slot's `CapTag` to match the field's owning tag; calls with a
+///        (every constant other than [`CAP_INFO_TAG_RIGHTS`] and the
+///        system-wide [`CAP_INFO_TLB_ELIDED`] and [`CAP_INFO_TLB_PERFORMED`])
+///        require the slot's `CapTag` to match the field's owning tag; calls with a
 ///        mismatched slot return [`SyscallError::InvalidArgument`].
 ///        Selectors not listed below also return
 ///        [`SyscallError::InvalidArgument`].

@@ -3,32 +3,15 @@
 This document specifies the cross-cutting invariants for thread lifecycle transitions
 (`sys_thread_start` (first start and resume), `sys_thread_stop`, `sys_exit` / `sys_process_exit`,
 and `dealloc_object(Thread)`), the global sleep list (`SLEEP_LIST` + `SLEEP_LIST_LOCK`), and the
-timer-driven wakeup arbitration in `sleep_check_wakeups`. It is sibling to
-[scheduling-internals.md](scheduling-internals.md) and binds the same authority for the surfaces
-below; cross-cutting concurrency rules established there (lock hierarchy, cross-CPU TCB ownership,
-wake protocol) MUST hold here.
-
-This document is the authoritative reference consulted before any change that touches:
-- `core/kernel/src/sched/mod.rs` — `sleep_list_add`, `sleep_list_remove`, `sleep_check_wakeups`,
-  `sleep_wakeups_quiesce`, `sleep_deadline_after_ms`, `withdraw_uncontested_park` (called by
-  `notification_wait` and `event_queue_recv` when `arm_timed_park` finds the list full),
-  `commit_cancelling_park`, `start_under_all_locks`, `with_held_frame`, `post_death_notification`.
-- `core/kernel/src/syscall/{thread,mod}.rs` — `sys_thread_configure`, `sys_thread_start`,
-  `sys_thread_stop`, `sys_thread_read_regs`, `sys_thread_write_regs`, `sys_thread_set_priority`,
-  `sys_exit`, `sys_process_exit`, `sys_thread_sleep`, `cancel_ipc_block`.
-- `core/kernel/src/cap/object.rs` — the `ObjectType::Thread` arm of `dealloc_object_one`, and the
-  sleep-list removal and timer quiesce in its Notification and EventQueue arms.
-- `core/kernel/src/ipc/mod.rs` — `WaitQueue`, `arm_timed_park` (called by `notification_wait`
-  and `event_queue_recv`), and the waiter claims that drop a sleep-list entry: `claim_waiter`
-  (called by `notification_send`, `event_queue_post`, `waitset_notify`, `waitset_add`, the timer's
-  timed-wait arms, and `interrupt_all_waiters`) and `interrupt_all_waiters` (called by the
-  Notification dealloc arm, `event_queue_drop`, and `wait_set_drop`).
-- The fault handlers in `core/kernel/src/arch/{x86_64/idt.rs,riscv64/interrupts.rs}` that drive
-  thread-fault exits.
+timer-driven wakeup arbitration in `sleep_check_wakeups`.
 
 ---
 
 ## Document Boundary
+
+This document is a sibling of [scheduling-internals.md](scheduling-internals.md) and binds the
+same authority for the surfaces below; cross-cutting concurrency rules established there (lock
+hierarchy, cross-CPU TCB ownership, wake protocol) MUST hold here.
 
 Cross-cutting concerns owned by [scheduling-internals.md](scheduling-internals.md) — lock hierarchy,
 the global wake protocol, IPI taxonomy, BSP boot transient, atomic-ordering invariants, the
@@ -39,7 +22,7 @@ invariants.
 | Doc | Owns |
 |---|---|
 | [scheduling-internals.md](scheduling-internals.md) | Lock hierarchy, cross-CPU TCB ownership table, wake protocol, BSP boot transient, IPI taxonomy, atomic ordering pairings. |
-| **This document** | Sleep-list invariants, capacity, and BSP-servicing model (including the timed-source quiesce); `timed_out` cross-CPU protocol; `sys_thread_start` / `sys_thread_stop` / `sys_exit` / `sys_process_exit` state-machine table and the stop protocol (`commit_cancelling_park`); `dealloc_object(Thread)` cross-CPU drain protocol; `BlockedOnReply` edge between client cancel and server dealloc. |
+| **This document** | Sleep-list invariants, capacity, and BSP-servicing model (including the timed-source quiesce); `timed_out` cross-CPU protocol; `sys_thread_start` / `sys_thread_stop` / `sys_exit` / `sys_process_exit` state-machine table and the stop protocol (`commit_cancelling_park`); `dealloc_object(Thread)` cross-CPU drain protocol; the `BlockedOnReply` reply-slot claim protocol (every publisher and claimant of `reply_tcb`). |
 | [scheduler.md](scheduler.md) | Scheduling algorithm (priority, FIFO, slice, affinity, idle role). |
 | [ipc-internals.md](ipc-internals.md) | IPC primitive object layouts and syscall paths. |
 
@@ -47,20 +30,35 @@ invariants.
 
 ## Surface
 
-In scope:
+In scope (this document is the authoritative reference consulted before any change that
+touches these):
 
-- `core/kernel/src/sched/mod.rs` — sleep list, timer quiesce, `withdraw_uncontested_park`,
-  `commit_cancelling_park`, `start_under_all_locks`, `with_held_frame`, and
-  `post_death_notification`.
+- `core/kernel/src/sched/mod.rs` — `sleep_list_add`, `sleep_list_remove`, `sleep_check_wakeups`,
+  `sleep_wakeups_quiesce`, `sleep_deadline_after_ms`, `withdraw_uncontested_park` (called by
+  `notification_wait` and `event_queue_recv` when `arm_timed_park` finds the list full),
+  `commit_cancelling_park`, `start_under_all_locks`, `with_held_frame`, `post_death_notification`,
+  `set_state_under_all_locks`, `exit_under_all_locks`, `wait_until_off_cpu` (drain steps 8-9),
+  `stop_threads_bound_to`, `select_target_cpu_excluding`, `prod_remote_cpu`.
 - `core/kernel/src/sched/thread.rs` — `ThreadState`, `IpcThreadState`, TCB.
-- `core/kernel/src/syscall/{thread,mod}.rs` — lifecycle and register-access syscalls and
-  `cancel_ipc_block`.
-- `core/kernel/src/cap/object.rs` — `ObjectType::Thread` arm of `dealloc_object_one`; the sleep-list
-  removal and timer quiesce of the Notification and EventQueue arms.
-- `core/kernel/src/ipc/mod.rs` — `WaitQueue`, `claim_waiter`, `interrupt_all_waiters`,
-  `arm_timed_park`.
+- `core/kernel/src/syscall/{thread,mod}.rs` — `sys_thread_configure`, `sys_thread_start`,
+  `sys_thread_stop`, `sys_thread_read_regs`, `sys_thread_write_regs`, `sys_thread_set_priority`,
+  `sys_thread_set_affinity`, `sys_exit`, `sys_process_exit`, `sys_thread_sleep`,
+  `cancel_ipc_block`, and the self-teardown epilogue of `syscall::dispatch`.
+- `core/kernel/src/syscall/ipc.rs` — `sys_notification_wait`, `sys_event_recv`, `sys_ipc_reply`,
+  `fail_reply_and_wake_caller`.
+- `core/kernel/src/ipc/mod.rs` — `WaitQueue`, `arm_timed_park` (called by `notification_wait`
+  and `event_queue_recv`), and the waiter claims that drop a sleep-list entry: `claim_waiter`
+  (called by `notification_send`, `event_queue_post`, `waitset_notify`, `waitset_add`, the timer's
+  timed-wait arms, and `interrupt_all_waiters`) and `interrupt_all_waiters` (called by the
+  Notification dealloc arm, `event_queue_drop`, and `wait_set_drop`).
 - `core/kernel/src/ipc/{notification,event_queue,wait_set}.rs` — the claimers that call them.
-- `core/kernel/src/arch/{x86_64/idt.rs,riscv64/interrupts.rs}` — fault → Exited transition.
+- `core/kernel/src/ipc/endpoint.rs` — `endpoint_call`, `endpoint_recv`, `endpoint_reply`
+  (`reply_tcb` publish and claim).
+- `core/kernel/src/cap/object.rs` — the `ObjectType::Thread` arm of `dealloc_object_one`,
+  `push_deferred_reclaim`, `drain_deferred_reclaim` (§ Self-teardown), and the sleep-list removal
+  and timer quiesce in its Notification and EventQueue arms.
+- The fault handlers in `core/kernel/src/arch/{x86_64/idt.rs,riscv64/interrupts.rs}` that drive
+  thread-fault exits (fault → `Exited` transition).
 
 ---
 
@@ -214,27 +212,29 @@ the handler uses for the target's `state` write.
 |---|---|---|---|---|
 | `sys_cap_create_thread` | (uninit) | `Created` | calling CPU | none — TCB not yet visible to schedulers; written in-place during construction. |
 | `sys_thread_configure` | `Created` | `Created` | calling CPU | does NOT touch `state`; mutates the initial frame, `trap_frame` and `saved_state.fs_base`. Target MUST be `Created`, decided under its `sched_lock` and held across the writes, so a concurrent `sys_thread_start`'s commit (which takes that lock) lands wholly before (configure is refused) or after them. |
-| `sys_thread_start` (first start) | `Created` | `Ready` | calling CPU | Refused for the caller itself (`InvalidArgument`). `start_under_all_locks(target, caller)`: a settle loop that, while the target is `Created` or `Stopped`, waits until it is `current` on no CPU (prodding the CPU still running it), its save is published (`context_saved == 1`; a never-dispatched `Created` thread is `current` nowhere and saved, so this passes at once) and no wake is owed, then commits `Ready`, advancing the TCB's `start_seq`, only if the all-CPU locks still show all three (`start_ready_to_link`), and otherwise takes another pass — a concurrent start and stop can run, park, and stop it again between a pass and the commit. Each pass ends the start when the target is no longer `Created`/`Stopped` (`InvalidArgument`), and a pass that must wait ends it when the caller itself has been stopped (read under the caller's `sched_lock`; the caller deschedules in place, as a self-stop does, and sees `Interrupted` on restart), so the loop never waits on a running thread or blocks its caller's stop. Then `enqueue_ready_thread(target_cpu, start_seq)`. Neither the all-locks commit nor the link overwrites an `Exited` mark a concurrent `dealloc_object(Thread)` committed; nothing pins the TCB between the two lock holds ([#443](https://github.com/kottlerg/seraph/issues/443) § Unpinned capability lookup). `enqueue_ready_thread` (not `enqueue_and_wake`) is used because the gated wake would coalesce an already-`Ready` thread and silently drop the link (see [scheduling-internals.md § ThreadState Transitions](scheduling-internals.md#threadstate-transitions)). The syscall's state precheck runs without a lock, so the commit re-checks the state under the locks: it refuses a target that is no longer `Created` or `Stopped` (`StateCommit::RefusedState` — a concurrent start resumed it, and it may since have parked, so a `Ready` overwrite would put a thread still on a wait queue on a run queue too) or that is `Exited` (`StateCommit::RefusedExited` — an object teardown or an exit on another CPU ended it), and the link refuses an `Exited` target (`ReadyLink::Exited`); the syscall then returns `InvalidArgument` and nothing is linked. Between two stops, at most one start commits: each commit advances `start_seq`, and a later start commits only after a stop has made the thread `Stopped` again. The commit and the link are separate lock holds, so the link is made only if the thread is still `Ready` at the commit's `start_seq`: a stop between them (and any restart, which links the thread itself) supersedes the start (`ReadyLink::Superseded`), which links nothing and returns success — it took effect and was stopped. |
+| `sys_thread_start` (first start) | `Created` | `Ready` | calling CPU | Refused for the caller itself (`InvalidArgument`). `start_under_all_locks(target, caller)`: a settle loop that, while the target is `Created` or `Stopped`, waits until it is `current` on no CPU (prodding the CPU still running it), its save is published (`context_saved == 1`; a never-dispatched `Created` thread is `current` nowhere and saved, so this passes at once) and no wake is owed, then commits `Ready`, advancing the TCB's `start_seq`, only if the all-CPU locks still show all three (`start_ready_to_link`), and otherwise takes another pass — a concurrent start and stop can run, park, and stop it again between a pass and the commit. Each pass ends the start when the target is no longer `Created`/`Stopped` (`InvalidArgument`), and a pass that must wait ends it when the caller itself has been stopped (read under the caller's `sched_lock`; the caller deschedules in place, as a self-stop does, and sees `Interrupted` on restart), so the loop never waits on a running thread or blocks its caller's stop. Then `enqueue_ready_thread(target_cpu, start_seq)`. Neither the all-locks commit nor the link overwrites an `Exited` mark a concurrent `dealloc_object(Thread)` committed; nothing pins the TCB between the two lock holds ([#502](https://github.com/kottlerg/seraph/issues/502)). `enqueue_ready_thread` (not `enqueue_and_wake`) is used because the gated wake would coalesce an already-`Ready` thread and silently drop the link (see [scheduling-internals.md § ThreadState Transitions](scheduling-internals.md#threadstate-transitions)). The syscall's state precheck runs without a lock, so the commit re-checks the state under the locks: it refuses a target that is no longer `Created` or `Stopped` (`StateCommit::RefusedState` — a concurrent start resumed it, and it may since have parked, so a `Ready` overwrite would put a thread still on a wait queue on a run queue too) or that is `Exited` (`StateCommit::RefusedExited` — an object teardown or an exit on another CPU ended it), and the link refuses an `Exited` target (`ReadyLink::Exited`); the syscall then returns `InvalidArgument` and nothing is linked. Between two stops, at most one start commits: each commit advances `start_seq`, and a later start commits only after a stop has made the thread `Stopped` again. The commit and the link are separate lock holds, so the link is made only if the thread is still `Ready` at the commit's `start_seq`: a stop between them (and any restart, which links the thread itself) supersedes the start (`ReadyLink::Superseded`), which links nothing and returns success — it took effect and was stopped. |
 | `sys_thread_start` (resume from stop) | `Stopped` | `Ready` | calling CPU | Same as first-start, but the settle loop's drain is load-bearing here: a thread stopped while Running may still be `current`/executing on a remote CPU, and a waker that claimed its stopped park may still owe it a wake. The loop waits for both while the target is still `Stopped` (a state `schedule()`'s requeue denylist rejects, so the owning CPU deschedules it without re-linking), and only then commits `Ready` and force-links it — otherwise `enqueue_ready_thread` would dispatch a still-live thread on a second CPU (the cross-CPU double-dispatch of #314/#293), or the late wake would link a later park (see [`sys_thread_stop` Cross-CPU Stop Protocol](#sys_thread_stop-cross-cpu-stop-protocol), invariant 4). The kernel uses `sys_thread_start` for both first-start and resume; this overload is intentional and `Stopped → Ready` is a permitted transition. |
-| `sys_thread_stop` (running self) | `Running` | `Stopped` | calling CPU = running CPU | `commit_cancelling_park(target, Stopped, None)`, then `schedule(false)` immediately yields. The skip-loop in `schedule()` never re-enqueues a `Stopped` TCB. |
+| `sys_thread_stop` (running self) | `Running` | `Stopped` | calling CPU = running CPU | `commit_cancelling_park(target, Stopped, None)`, then `schedule(false)` immediately yields. `schedule()`'s requeue arm never re-enqueues a `Stopped` current thread. |
 | `sys_thread_stop` (running remote) | `Running` | `Stopped` | calling CPU ≠ running CPU | `commit_cancelling_park(target, Stopped, None)` returns `StateCommit::Committed(Some(run_cpu))`; the syscall handler then calls `prod_remote_cpu(run_cpu)` (sends a wakeup IPI whose trap snapshots the target's registers; the remote CPU drops the `Stopped` target at the next slice-expiry `schedule(true)` it performs with preemption enabled, or at the target's own park or yield) and bounded-spins until `sched_remote.current != target_tcb` and the target's `context_saved` is set (`current` moves off the target before `switch()` publishes its save), or the target is no longer `Stopped` (an object teardown committed `Exited` over it; a start cannot commit while the target is `current` anywhere). A drain pass that must wait reads the stopper's own state under its `sched_lock`; a stopper that is itself `Stopped` (a peer stopping its stopper) or `Exited` deschedules in place and, when restarted, re-enters the drain only if its capability slot still names the target with Control rights, otherwise returning at once ([Cross-CPU Stop Protocol](#sys_thread_stop-cross-cpu-stop-protocol) step 4), so two threads stopping each other both end `Stopped`. The drain is what gives `sys_thread_read_regs` a fresh `trap_frame`: a drained call returns only once the target has left its CPU through a trap, so the snapshot is never the stale one from the target's previous kernel entry ([Cross-CPU Stop Protocol](#sys_thread_stop-cross-cpu-stop-protocol) invariant 1 states where this does not hold). |
 | `sys_thread_stop` (Ready, on a run queue) | `Ready` | `Stopped` | calling CPU | `commit_cancelling_park(target, Stopped, None)`, whose all-locks commit removes the entry from every run queue inside the locked region; the `schedule()` skip-loop is only defence-in-depth. A target `current` on no CPU at the commit may still be finishing its switch out on the CPU it just left: the call waits (`await_stopped_save`, interrupts enabled; spin site `stop:save`) until its `context_saved` is set or a teardown commits `Exited`. |
 | `sys_thread_stop` (Blocked) | `Blocked` | `Stopped` | calling CPU | `commit_cancelling_park(target, Stopped, None)`: `cancel_ipc_block(target)` (acquires the source IPC lock matching `tcb.ipc_state` and unlinks the waiter), then the all-locks commit, retried while the target's `park_seq` changed (see [`sys_thread_stop` Cross-CPU Stop Protocol](#sys_thread_stop-cross-cpu-stop-protocol)). A target that parks after an unlocked `Running` or `Ready` read takes this row too. A target `current` on no CPU at the commit may still be finishing its switch out on the CPU it just left: the call waits (`await_stopped_save`, interrupts enabled; spin site `stop:save`) until its `context_saved` is set or a teardown commits `Exited`. |
 | `sys_thread_stop` (Created or Exited or Stopped) | `*` | `*` | calling CPU | n/a — returns `InvalidState`. No state write. An `Exited` target observed only at the locked commit (the thread died between the unlocked precheck and the commit) is refused there with the same `InvalidState`. |
 | `sys_thread_set_priority` | `*` | `*` (priority changed) | calling CPU | Holds `(*tcb).sched_lock` across the `state` read and the `(*tcb).priority` write, and — when the target is `Ready` — relocates the queue entry via `sched::relocate_ready_priority`: lock the single `preferred_cpu`-hinted CPU's `scheduler.lock` and verify membership with `remove_from_queue` (O(1) locks), falling back on a miss to the ascending all-CPU walk. `remove_from_queue`'s boolean identifies the home CPU; the re-enqueue lands at the new priority on the located scheduler. The held `sched_lock` serialises with `dealloc_object(Thread)`, `migrate_ready_thread`, and `set_state_under_all_locks`. |
-| `sys_thread_set_affinity` | `*` | `*` | calling CPU | Does NOT touch `state`; writes `cpu_affinity`. When the new affinity names a CPU other than the target's `preferred_cpu`, an unlocked `state` read picks the action: a `Ready` target is migrated at once (`migrate_ready_thread`); a `Running` target's CPU has reschedule-pending set and is prodded (`set_reschedule_pending_for`, `prod_remote_cpu`), so its next `schedule()` routes the thread cross-CPU; a `Blocked`, `Stopped` or `Created` target observes the affinity on its next enqueue. Clearing affinity (`AFFINITY_ANY`) migrates nothing. The syscall's `cpu_affinity` write and its `preferred_cpu` / `state` reads take no `sched_lock` (the Ready arm's `migrate_ready_thread` re-checks `state` under the target's `sched_lock` and both scheduler locks, and bails on a race), so they race other CPUs' scheduler paths, and the target is not pinned for the call, so these outcomes hold only when neither race occurs ([syscalls.md § `SYS_THREAD_SET_AFFINITY`](syscalls.md#sys_thread_set_affinity-38); defects tracked in [#443](https://github.com/kottlerg/seraph/issues/443)). |
+| `sys_thread_set_affinity` | `*` | `*` | calling CPU | Does NOT touch `state`; writes `cpu_affinity`. When the new affinity names a CPU other than the target's `preferred_cpu`, an unlocked `state` read picks the action: a `Ready` target is migrated at once (`migrate_ready_thread`); a `Running` target's CPU has reschedule-pending set and is prodded (`set_reschedule_pending_for`, `prod_remote_cpu`), so its next `schedule()` routes the thread cross-CPU; a `Blocked`, `Stopped` or `Created` target observes the affinity on its next enqueue. Clearing affinity (`AFFINITY_ANY`) migrates nothing. The syscall's `cpu_affinity` write and its `preferred_cpu` / `state` reads take no `sched_lock` (the Ready arm's `migrate_ready_thread` re-checks `state` under the target's `sched_lock` and both scheduler locks, and bails on a race), so they race other CPUs' scheduler paths, and the target is not pinned for the call, so these outcomes hold only when neither race occurs ([syscalls.md § `SYS_THREAD_SET_AFFINITY`](syscalls.md#sys_thread_set_affinity-38); defects tracked in [#443](https://github.com/kottlerg/seraph/issues/443) and [#502](https://github.com/kottlerg/seraph/issues/502)). |
 | `sys_thread_read_regs` | `Stopped`, or `Blocked` (`BlockedOnFault`) | unchanged | calling CPU | `sched::with_held_frame`: under the target's `sched_lock`, the target, `Stopped` or fault-blocked, must be `current` on no CPU with its save published; a `Stopped` target not yet settled is refused (`InvalidState`) and a fault-blocked one still switching out is waited for (outside every lock, interrupts enabled, preemption disabled; spin site `regs:settle`). The frame is snapshotted under the lock and copied to the caller's buffer after it. No scheduler-state mutation. |
 | `sys_thread_write_regs` | `Stopped`, or `Blocked` (`BlockedOnFault`) | unchanged | calling CPU | Copies and validates the user `TrapFrame`, then writes it through `sched::with_held_frame` (as for `sys_thread_read_regs`), so the target, `Stopped` or fault-blocked, is off every CPU with its save published for the write. |
 | `sys_exit` (self) | `*` | `Exited` | running CPU = current CPU | `exit_under_all_locks(self, reason)` (the `Exited` commit with the exit reason in the same all-locks hold), then `post_death_notification`, then `schedule(false)`. The all-locks write ensures any peer-CPU `schedule()` reading `state` under its own sched.lock sees `Exited` and refuses to re-enqueue. |
 | `sys_process_exit` (self) | `*` | `Exited` | running CPU = current CPU | `exit_under_all_locks(self, encode_exit_code(code))`, then `post_death_notification`, then `schedule(false)`, as for `sys_exit`; it makes no address-space death post. A refusal means the thread was already torn down: an object-teardown stop recorded `EXIT_KILLED`, or a `dealloc_object(Thread)` committed `Exited`; the post still carries this path's own reason. |
-| arch fault handler (page fault, GP fault, etc.) | `*` | `Exited` | trapping CPU = current CPU | As for `sys_exit`, with reason `EXIT_FAULT_BASE + vector` (x86-64) or `EXIT_FAULT_BASE + cause` (riscv64), plus a `post_aspace_death_notification` to the address-space observers before `schedule(false)`. |
-| `dealloc_object(Thread)` (caller ≠ tcb) | `*` | `Exited` | calling CPU (refcount → 0) | Acquires every CPU's scheduler.lock in ascending order, writes `state = Exited`, walks `remove_from_queue` for every CPU, releases all. After release: unconditionally scans every CPU until none has `sched.current == tcb`, then unconditionally on `tcb.context_saved == 1`, then proceeds to source-IPC unlink + free. See Drain Protocol below. |
+| arch fault handler (page fault, GP fault, etc.) | `*` | `Exited` | trapping CPU = current CPU | As for `sys_exit`, with reason `EXIT_FAULT_BASE + vector` (x86-64) or `EXIT_FAULT_BASE + cause` (riscv64), plus a `post_aspace_death_notification` to the address-space observers before `schedule(false)`. Not on x86-64 `#DF`, `#MC`, or a hardware NMI that finds no watchdog backtrace request pending: those halt the trapping CPU whatever ring they interrupt and commit no transition. |
+| `dealloc_object(Thread)` (caller ≠ tcb) | `*` | `Exited` | calling CPU (refcount → 0) | Acquires `(*tcb).sched_lock` (outer), then every CPU's scheduler.lock in ascending order, writes `state = Exited`, walks `remove_from_queue` for every CPU, releases all. After release: unconditionally scans every CPU until none has `sched.current == tcb`, then unconditionally on `tcb.context_saved == 1`, then the reply-bound client wake, sleep-list removal, source-IPC unlink, fault-handler release, wake-in-flight gate and timer quiesce, registry unlink, and free. See Drain Protocol below. |
 | `dealloc_object(Thread)` (caller == tcb, self-teardown) | `Running` | `Exited` | calling CPU = running CPU | A thread deleting the last capability to its own `Thread` object cannot run the post-release scan (its CPU's `current == tcb` never clears from within the spin). Marks Exited + drains run queues only, queues the object on this CPU's deferred-reclaim stack, and returns; the syscall epilogue reschedules and the free completes off-CPU. See [Self-teardown](#self-teardown-the-caller-is-the-freed-thread) below. |
 | `dealloc_object(CSpaceObj)` / `dealloc_object(AddressSpace)` — bound-thread stop (`stop_threads_bound_to`) | `*` | `Exited` | calling CPU (object refcount → 0) | For every registered thread bound to the dying object: `commit_cancelling_park(tcb, Exited, Some(EXIT_KILLED))` — `cancel_ipc_block` if `Blocked`, then the `Exited` commit with `EXIT_KILLED` recorded in the same all-locks hold, retried while `park_seq` changed (a commit refused because the thread exited on its own meanwhile writes neither, and that thread still posts its own reason — no death walk posts `EXIT_KILLED`; an observer bound after the stop receives it through the bind); running CPUs are prodded after the registry lock is released and the caller spins until no other CPU has a bound thread as `current` (and, for an `AddressSpace`, until `active_cpus` is empty). The thread is stopped, not freed: its object waits for its own last cap. If the caller's own thread is stopped — bound here, or by a concurrent teardown — nothing is freed: the object goes onto this CPU's deferred-reclaim stack (as in the self-teardown row) and the epilogue schedules the thread away. See [scheduling-internals.md § Thread Registry](scheduling-internals.md#thread-registry). |
 
 **Why the all-CPU lock acquire in `dealloc_object(Thread)`:**
 
-`preferred_cpu` is updated by `enqueue_and_wake` under the target CPU's scheduler.lock. Between a
+`preferred_cpu` is in the Scheduling field group serialised by `(*tcb).sched_lock`:
+`enqueue_and_wake` and `enqueue_ready_thread` retarget it under `sched_lock` with the target
+run-queue lock inner, and `schedule()`'s dispatch flip writes it under `next.sched_lock`. Between a
 reader of `preferred_cpu` and the lock acquisition, a concurrent `enqueue_and_wake` on another CPU
 can move the TCB. Locking only `preferred_cpu`'s scheduler then walking that one queue is racy: the
 TCB may have been re-enqueued elsewhere. The current implementation locks every CPU's scheduler.lock
@@ -256,7 +256,8 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
 stated explicitly.
 
 ```
-1. Acquire every CPU's scheduler.lock in ascending CPU order.
+1. Acquire (*tcb).sched_lock (outermost), then every CPU's scheduler.lock in
+   ascending CPU order.
 2. Read tcb.priority INSIDE the all-locks region. This read is serialised
    against sys_thread_set_priority's priority write by (*tcb).sched_lock —
    held outer here and the lock that writer takes — not by the CPU locks.
@@ -264,22 +265,23 @@ stated explicitly.
 4. For each CPU in 0..cpu_count: scheduler_for(cpu).remove_from_queue(tcb, prio).
 5. Server-side BlockedOnReply check: if (*tcb).reply_tcb is non-null,
    compare_exchange(bound, null, AcqRel, Acquire) to claim the binding, then
+   set (*bound).wake_in_flight = 1 (pinning the client until the wake), then
    DEPOSIT only the resume disposition (park_disposition = INTERRUPTED for a
-   syscall caller, or fault_outcome = Kill for a fault-blocked client) and leave
-   the client BLOCKED. The client's Scheduling-group fields (state/ipc_state/
-   blocked_on) are NOT written here — they are written only by the gated
-   enqueue_and_wake (step 10) under the CLIENT's own sched_lock, never under the
+   syscall caller, or fault_outcome = Kill plus the episode stamp for a
+   fault-blocked client) and leave the client BLOCKED. The client's
+   state/ipc_state are NOT written here — only the gated enqueue_and_wake
+   (step 10) writes them, under the CLIENT's own sched_lock, never under the
    server's locks (pre-setting state = Ready here was the #284 residual: a
    concurrent dealloc(client) marking the client Exited under its sched_lock
    raced the unsynchronised Ready write). The wake's target CPU is NOT computed
    here either; it is recomputed at the wake site (step 10). The actual
-   enqueue_and_wake happens AFTER step 7 because it would deadlock against
-   the held scheduler.locks.
+   enqueue_and_wake happens in step 10, after step 7, because it would
+   deadlock against the held scheduler.locks.
 6. No in-region `current` snapshot is required: the post-release gate (step 8)
    scans every CPU unconditionally, so reclamation does not depend on an
    all-locks `running_on` reading (which names at most one CPU and can be stale
    the instant the locks drop).
-7. Release every scheduler.lock in descending order.
+7. Release every scheduler.lock in descending order, then (*tcb).sched_lock.
 8. `current`-anywhere gate (UNCONDITIONAL): scan every CPU, each under its own
    scheduler.lock; if some CPU has `scheduler_for(cpu).current == tcb`, spin on
    that CPU's lock until it switches away, then re-scan. Proceed only when a
@@ -309,17 +311,20 @@ stated explicitly.
     wait or waiter queue. Known gap: nothing pins the source here, and a waker that
     claimed tcb before its Exited mark leaves the binding set until its wake
     lands (`enqueue_and_wake`'s abort arm clears it), so a concurrent last-cap
-    delete can free the source first (#443 § Source pointer held past its
-    free). Branches:
+    delete can free the source first (#501). Branches:
       - BlockedOnSend / BlockedOnRecv: ep.lock; unlink_from_wait_queue.
       - BlockedOnNotification: sig.lock; remove tcb from the waiter queue.
       - BlockedOnEventQueue: eq.lock; remove tcb from the waiter queue.
       - BlockedOnWaitSet: ws.lock; remove tcb from the waiter queue.
       - BlockedOnReply: blocked_on_object is the *server* TCB; mirror
-                        cancel_ipc_block — compare_exchange
-                        (*server).reply_tcb from tcb to null with AcqRel /
-                        Acquire so the server's next endpoint_reply finds
-                        no caller and returns None.
+                        cancel_ipc_block — under tcb's own sched_lock,
+                        re-read blocked_on_object == server (the #317
+                        closure lemma pins the server alive), then
+                        compare_exchange (*server).reply_tcb from tcb to
+                        null with AcqRel / Acquire so the server's next
+                        endpoint_reply finds no caller and returns None; on
+                        a win clear tcb.wake_in_flight (no reply wake will
+                        fire).
       - BlockedOnFault: blocked_on_object is the *handler* (server) TCB;
                         identical to BlockedOnReply — compare_exchange
                         (*handler).reply_tcb from tcb to null so a later
@@ -354,7 +359,9 @@ stated explicitly.
 Steps 8-9 assume the dealloc caller is a *different* thread than `tcb`: the
 `current`-anywhere scan waits for whichever CPU runs `tcb` to switch away. When
 the caller **is** `tcb` — a thread that deletes the last capability to its own
-`Thread` object via `SYS_CAP_DELETE` or `SYS_CAP_REVOKE` — the running CPU's
+`Thread` object via `SYS_CAP_REVOKE` (`SYS_CAP_DELETE` refuses a self thread-cap delete with
+`InvalidState` before the dec-ref), or whose own object a batched move queued for deferred
+reclaim (`cap::transfer::release_moved_object`) — the running CPU's
 `current == tcb` can never clear from within the scan (the spin holds preemption
 disabled, so the thread never reschedules). Running steps 8-19 inline would wedge
 that CPU (#341).
@@ -377,7 +384,8 @@ that CPU (#341).
 - **Off-CPU completion:** `drain_deferred_reclaim` — called from the syscall
   epilogue of the *next* live thread on this CPU, and from the idle loop — pops
   the object and re-enters `dealloc_object`. The thread is now off-CPU, so the
-  self check is false and steps 5-19 run normally: step 8's scan finds no CPU
+  self check is false and the full protocol (steps 1-19) runs: steps 1-4 re-commit the
+  already-set `Exited` harmlessly, step 8's scan finds no CPU
   running `tcb` on the first pass and step 9's `context_saved` gate is already
   satisfied. Any server-side reply-bound client (steps 5/10/11) is woken here.
 
@@ -386,9 +394,16 @@ found the running thread itself stopped (see
 [scheduling-internals.md § Thread Registry](scheduling-internals.md#thread-registry)); the drain
 re-enters their arms the same way.
 
-The drain runs only from contexts that are provably not one of the queued dead
-threads (a live thread's syscall return, or the idle thread), so it can never
-re-enter the wedge it exists to avoid.
+The stack also receives `Thread`, `CSpace`, and `AddressSpace` objects whose last reference a
+batched capability move dropped (`cap::transfer::release_moved_object`), pushed from a live
+thread that may itself be the queued thread or bound to the queued object. The drain runs only
+from a live thread's syscall return or the idle thread, so it is never one of the self-teardown's
+dead threads; a draining thread that is the queued `Thread` (or bound to a queued object) is
+caught by the arm's self net, which marks it `Exited`, re-queues the object, and returns, so the
+drain never re-enters the wedge it exists to avoid. A queued object with a thread left `current`
+on a CPU that `fatal` halted is the exception: its teardown never completes, so the drain spins
+forever on the CPU that runs it (see
+[scheduling-internals.md](scheduling-internals.md#thread-registry) § Thread Registry).
 
 **Invariants the drain protocol MUST hold:**
 
@@ -402,16 +417,20 @@ re-enter the wedge it exists to avoid.
    `state ∈ {Exited, Stopped}`. `enqueue_and_wake` performs the same check before enqueueing (see
    [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 9).
 
-3. **Step 8's `current`-anywhere scan is bounded.** A TCB is `current` on at most one CPU at a time.
-   That CPU is mid-`schedule()`; once it sets `current = next_tcb` (which happens *before* the arch
-   switch on both arches — `release_lock_only` runs in Rust before `switch()`), the inner spin
-   exits. After it switches away no CPU can re-install tcb (it is `Exited` and unlinked from every
-   run queue), so the next full scan is clean and the loop terminates. The scan does not rely on the
-   all-locks `running_on` snapshot, which names at most one CPU and may be stale once the locks
-   drop. This bound holds only when the dealloc caller is a *different* thread than `tcb`: the
-   running CPU reaches `schedule()` and switches away. When the caller *is* `tcb` (self-teardown),
-   it never reaches `schedule()` from within the spin, so steps 8-19 are skipped inline and deferred
-   off-CPU instead — see [Self-teardown](#self-teardown-the-caller-is-the-freed-thread).
+3. **Step 8's `current`-anywhere scan is bounded, unless the thread is `current` on a halted CPU.**
+   A TCB is `current` on at most one CPU at a time. That CPU is mid-`schedule()`; once it sets
+   `current = next_tcb` (which happens *before* the arch switch on both arches — `release_lock_only`
+   runs in Rust before `switch()`), the inner spin exits. After it switches away no CPU can
+   re-install tcb (it is `Exited` and unlinked from every run queue), so the next full scan is clean
+   and the loop terminates. The one exception is a CPU that `fatal` halted, for example on a kernel
+   fault, an IPI-watchdog Phase-D timeout, or an x86-64 hardware NMI, `#DF` or `#MC` from either
+   ring: it never runs `schedule()` again, so the thread it interrupted stays `current`
+   there and a scan for that thread never ends. The scan does not rely on the all-locks `running_on`
+   snapshot, which names at most one CPU and may be stale once the locks drop. This bound holds only
+   when the dealloc caller is a *different* thread than `tcb`: the running CPU reaches `schedule()`
+   and switches away. When the caller *is* `tcb` (self-teardown), it never reaches `schedule()` from
+   within the spin, so steps 8-19 are skipped inline and deferred off-CPU instead — see
+   [Self-teardown](#self-teardown-the-caller-is-the-freed-thread).
 
 4. **No `fpu_owner` sweep is needed after eager save (#108).** The `#NM` handler only ever installs
    the currently Running thread on its CPU as `fpu_owner`. `switch_out_save` clears the slot on
@@ -439,7 +458,10 @@ re-enter the wedge it exists to avoid.
    lock release), and step 9 is what waits for that save. New TCBs initialise `context_saved = 1`,
    so the wait is bounded for threads that never ran.
 
-6. **Step 11's source-IPC unlink MUST acquire the source's lock for every variant.** This is the
+6. **Step 11's source-IPC unlink MUST acquire the source's lock for every lock-guarded variant**
+   (`ep.lock`, `sig.lock`, `eq.lock`, `ws.lock`); the `BlockedOnReply` / `BlockedOnFault` arms
+   instead hold the dying client's `sched_lock` across the `blocked_on_object` re-read and the
+   `reply_tcb` CAS, exactly as `cancel_ipc_block` does. This is the
    symmetry rule with `cancel_ipc_block`: both clear IPC-blocking field-group writes from a
    non-owning CPU and MUST hold the matching source lock.
 
@@ -480,9 +502,9 @@ the handler is the "server" — so every actor below applies to fault delivery a
 only by `ipc_state` at the wake site. The following actors can mutate this slot from different lock
 domains:
 
-1. **Server in `endpoint_call`** — sets `reply_tcb = caller` under `ep.lock` by a Release `store`
-   into an empty slot (actor 8 released any earlier binding when the server entered the receive
-   that queued it; the store debug-asserts the slot is null). If the
+1. **Caller in `endpoint_call`** — sets the dequeued server's `reply_tcb = caller` under `ep.lock`
+   by a Release `store` into an empty slot (actor 8 released any earlier binding when the server
+   entered the receive that queued it; the store debug-asserts the slot is null). If the
    caller's park commit is refused (a concurrent stop or exit, or a coalesced wake),
    `rollback_uncommitted_call` rolls the binding back under the same `ep.lock` —
    `compare_exchange(caller, null)` on `reply_tcb`; on a win it stamps a cancelled deposit
@@ -503,8 +525,10 @@ domains:
    under the client's per-TCB `sched_lock` — not a per-CPU scheduler.lock and not `ep.lock`. The
    lock is held across a re-read of the client's `blocked_on_object` and the CAS; a dying server
    nulls a claimed client's `blocked_on_object` under that same `sched_lock` before it is freed, so
-   observing `blocked_on_object == server` under the lock pins the server alive for the CAS. On a
-   CAS win the cancel clears the client's `(ipc_state, blocked_on_object)` binding in the same
+   observing `blocked_on_object == server` under the lock pins the server alive for the CAS (the
+   CLOSURE LEMMA of
+   [scheduling-internals.md § Cross-CPU TCB Ownership](scheduling-internals.md#cross-cpu-tcb-ownership)).
+   On a CAS win the cancel clears the client's `(ipc_state, blocked_on_object)` binding in the same
    `sched_lock` hold: the server's `reply_tcb` is now null, so its dealloc (actor 6) no longer
    reaches this client, and a binding left naming the server would let a second canceller, or the
    client's own `dealloc_object(Thread)`, pass the re-read after the server is freed (see
@@ -573,11 +597,13 @@ racing actors.
    that mark). Otherwise a caller dying mid-rebind lets dealloc read a stale `BlockedOnSend` state,
    take the `BlockedOnSend` unlink arm, and never clear the server's `reply_tcb` — a dangling
    binding that a later `endpoint_reply` fires against the freed-or-reused slot: use-after-free if
-   freed (`syscall/ipc.rs` magic assert), double-enqueue if reused-and-queued (the slot is woken
-   twice — closed structurally by the `queued_on` single-link tag at the enqueue chokepoint; see
-   [scheduling-internals.md](scheduling-internals.md) § Enqueue-chokepoint enforcement), or
-   TCB-field corruption if reused-and-running (the residual #284 `#GP` / corrupt `iopb`). On a
-   failed commit `endpoint_recv` rolls the binding back and skips the dead sender.
+   freed (`core/kernel/src/syscall/ipc.rs` magic assert), double-enqueue if reused-and-queued (the
+   slot is woken twice — closed structurally by the `queued_on` single-link tag at the enqueue
+   chokepoint; see
+   [scheduling-internals.md § ThreadState Transitions](scheduling-internals.md#threadstate-transitions)
+   (Enqueue-chokepoint enforcement)), or TCB-field corruption if reused-and-running (the residual
+   #284 `#GP` / corrupt `iopb`). On a failed commit `endpoint_recv` rolls the binding back and
+   skips the dead sender.
 
 ---
 
@@ -590,13 +616,13 @@ invariants common with the global wake protocol (`RESCHEDULE_PENDING`, `non_empt
 
 | Atomic / field | Set ordering | Read ordering | Pairing rationale |
 |---|---|---|---|
-| `tcb.timed_out` (bool, plain field) | non-atomic store under `eq.lock` (timer arm) | non-atomic load by resuming syscall on the same CPU | Single-writer per park (eq.lock excludes any concurrent payload-delivery write); reader is local CPU after `schedule()` returns. No atomic required because the source IPC lock provides mutual exclusion at the write side and the `Blocked → Ready` transition under that same lock provides the happens-before edge to the reader. |
+| `tcb.timed_out` (bool, plain field) | non-atomic store under `eq.lock` (timer `BlockedOnEventQueue` arm); cleared by the resuming syscall | non-atomic load by resuming syscall on the same CPU | Single-writer per park (eq.lock excludes any concurrent payload-delivery write); reader is local CPU after `schedule()` returns. No atomic required because the source IPC lock provides mutual exclusion at the write side and the `Blocked → Ready` commit, which `enqueue_and_wake` makes under the waiter's `sched_lock` and the run-queue lock after `eq.lock` is released, provides the happens-before edge to the reader through the run-queue Release / dispatch Acquire pairing. |
 | `tcb.sleep_deadline` (`AtomicU64`) | Relaxed store of the deadline by the parker before `sleep_list_add` (plain sleep: before the park commit; timed IPC wait: under the source lock); Relaxed store or `swap` of 0 only under `SLEEP_LIST_LOCK` (timer pop, `sleep_list_remove`), except a parker's own rollback of a deadline it never listed | Relaxed loads: under `SLEEP_LIST_LOCK` (pop, add, remove — the load-bearing observations); under the source lock (waker prechecks, Sleep List Invariant 7); lock-free by the softlockup watchdog (diagnostic) | The locks order every load-bearing access; the atomic type only makes the source-lock prechecks, which race the pop's clear, well defined. A precheck that reads a stale non-zero value calls a `sleep_list_remove` that finds nothing. |
 | `tcb.park_seq` (`AtomicU32`) | Relaxed `fetch_add` under `(*tcb).sched_lock` by every commit that publishes a `Blocked` binding (`commit_blocked_under_local_lock`, `commit_reply_rebind_under_local_lock`); the IPC parks commit under their source lock too | Relaxed loads: under `(*tcb).sched_lock` (`commit_cancelling_park`'s snapshot, and the commit's re-read inside the all-locks hold); under `SLEEP_LIST_LOCK` (the timer pop's snapshot, while the popped park is still committed); under the source lock (the timer's notification and event-queue claim, Sleep List Invariant 6; `cancel_ipc_block`'s source-arm claim gate in all five source arms, Lock Hierarchy rule 7 of scheduling-internals.md) | Each reader holds a lock that orders it against the writes it compares: `sched_lock` for the stop protocol (`commit_cancelling_park`, and `cancel_ipc_block`'s own entry snapshot and tail re-read), and for the timer claim and the cancel's source-arm gate the source lock under which the waiter-queue entry and the park commit of the same park (or its `commit_reply_rebind_under_local_lock` rebind) are published. |
 | `TIMER_DISPATCH_SEQ` (`AtomicU64`) | Relaxed `fetch_add` to odd under `SLEEP_LIST_LOCK` by a pop that took an entry; Release `fetch_add` to even after that batch's last claim | Acquire load under `SLEEP_LIST_LOCK`, then Acquire loads in the spin, by `sleep_wakeups_quiesce` | The lock orders the quiescer after the pops it must wait for; the Release/Acquire pair orders the batch's last access to the popped source or TCB before the quiescer's free, whether the quiescer returns at once or after the spin (Sleep List Invariant 9). |
-| `tcb.state` (enum, plain field) | non-atomic store under either every CPU's scheduler.lock (`set_state_under_all_locks`) or the TCB's own `(*tcb).sched_lock` (`commit_blocked_under_local_lock` and `enqueue_and_wake`) | non-atomic load by any CPU's scheduler under its own scheduler.lock | The state field is in the Scheduling field group per [scheduling-internals.md § Cross-CPU TCB Ownership](scheduling-internals.md#cross-cpu-tcb-ownership). The all-locks vs single-CPU split exists because `Stopped`/`Exited` writes must be visible to *every* CPU's `schedule()` skip-check, while routine `Ready ↔ Running` and `Running ↔ Blocked` writes only need to coordinate with the local scheduler that owns the run-queue link. |
-| `tcb.priority` (u8, plain field) | non-atomic store by `sys_thread_set_priority` under `(*tcb).sched_lock` | non-atomic loads, each under the TCB's own `(*tcb).sched_lock`: `dealloc_object(Thread)` and `set_state_under_all_locks` (sched_lock held outer of their all-locks region), `migrate_ready_thread`, `enqueue_and_wake`, `enqueue_ready_thread`, and `schedule()`'s requeue arm | `(*tcb).sched_lock` is the serializer: every reader and writer of this field holds it. `schedule()`'s dispatch path deliberately does NOT read `(*next).priority` (it would race the store without `next.sched_lock`); it dispatches by run-queue index, which `dequeue_highest` already validated. After the store, `sys_thread_set_priority` relocates the Ready TCB's queue entry to the new priority (`relocate_ready_priority`, under the run-queue lock); the brief link-at-old / `priority`-new window inside the `sched_lock` region is benign because consumers dispatch by queue index, not by this field. |
-| `tcb.reply_tcb` (`AtomicPtr<TCB>`) | Release on the `endpoint_call` / `endpoint_recv` publish store under ep.lock (into an empty slot: `release_unreplied_caller` cleared it at receive entry); AcqRel on `compare_exchange` from the commit-failure rollback (under ep.lock) and from `endpoint_reply`, cancel, client-dealloc, and server-dealloc paths (no ep.lock); AcqRel on the `swap` of `fail_reply_and_wake_caller` and `release_unreplied_caller` (no lock) | Acquire on `endpoint_reply`'s pre-CAS load (no lock); Acquire on the server-dealloc snapshot under all sched.locks; Acquire on `sys_ipc_reply`'s fault-reply and cap-pre-allocation peeks (no lock), which read before any claim and dereference the loaded caller unpinned (#443); Relaxed on the softlockup watchdog's diagnostic load (`watchdog_decode_blocked_on`) | Every claim is an atomic read-modify-write that observes the bound client. The `compare_exchange` clears the slot only when it still references the claimant's expected TCB, so two concurrent claimants cannot clear a third unrelated client's binding; both `swap`s are safe because only the slot-owning server performs them, while no publisher can install a different caller during its `SYS_IPC_REPLY` or at its `SYS_IPC_RECV` entry (per the Symmetry rule). The publish is a plain store, not a claim, into a slot actor 8 emptied at receive entry, so it never overwrites a binding (debug-asserted). The Release publish pairs with each claimant's Acquire. |
+| `tcb.state` (enum, plain field) | non-atomic store under the TCB's own `(*tcb).sched_lock`, except `sched::enter`'s boot dispatch of init, which holds no lock (no other thread exists yet, and the idle APs reach CPU 0's scheduler only through the load balancer, which never touches init's `state`): alone in `commit_blocked_under_local_lock`, `withdraw_uncontested_park`, `enqueue_and_wake`, `enqueue_ready_thread`, `schedule()`'s requeue and dispatch flips, and the `sys_thread_sleep` capacity rollback; held outer of every CPU's scheduler.lock in `set_state_under_all_locks`, `start_under_all_locks`, `exit_under_all_locks`, `commit_cancelling_park` and `dealloc_object(Thread)`'s inline `Exited` write | under `(*tcb).sched_lock` (dispatch flip, commits, wakes); `schedule()`'s dequeue skip-loop and `sys_thread_stop`'s drain spin confirm `Stopped`/`Exited` under a CPU's run-queue lock | The state field is in the Scheduling field group per [scheduling-internals.md § Cross-CPU TCB Ownership](scheduling-internals.md#cross-cpu-tcb-ownership). `(*tcb).sched_lock` serializes every store after boot. The additional all-CPU-locks hold on `Stopped`/`Exited` writes is what makes those states visible to every CPU's run-queue-locked skip check. |
+| `tcb.priority` (u8, plain field) | non-atomic store by `sys_thread_set_priority` under `(*tcb).sched_lock` | non-atomic loads, each under the TCB's own `(*tcb).sched_lock`: `dealloc_object(Thread)` and `set_state_under_all_locks` (sched_lock held outer of their all-locks region), `migrate_ready_thread`, `enqueue_and_wake`, `enqueue_ready_thread`, and `schedule()`'s requeue arm | `(*tcb).sched_lock` is the serializer: every writer and every functional reader of this field holds it; only `watchdog_dump`'s diagnostic reads race it, benignly. `schedule()`'s dispatch path deliberately does NOT read `(*next).priority` (it would race the store without `next.sched_lock`); it dispatches by run-queue index, which `dequeue_highest` already validated. After the store, `sys_thread_set_priority` relocates the Ready TCB's queue entry to the new priority (`relocate_ready_priority`, under the run-queue lock); the brief link-at-old / `priority`-new window inside the `sched_lock` region is benign because consumers dispatch by queue index, not by this field. |
+| `tcb.reply_tcb` (`AtomicPtr<TCB>`) | Release on the `endpoint_call` / `endpoint_recv` publish store under ep.lock (into an empty slot: `release_unreplied_caller` cleared it at receive entry); AcqRel on `compare_exchange` from the commit-failure rollback (under ep.lock) and from `endpoint_reply`, cancel, client-dealloc, and server-dealloc paths (no ep.lock); AcqRel on the `swap` of `fail_reply_and_wake_caller` and `release_unreplied_caller` (no lock) | Acquire on `endpoint_reply`'s pre-CAS load (no lock); Acquire on the server-dealloc snapshot under all sched.locks; Acquire on `sys_ipc_reply`'s fault-reply and cap-pre-allocation peeks (no lock), which read before any claim and dereference the loaded caller unpinned (#513); Relaxed on the softlockup watchdog's diagnostic load (`watchdog_decode_blocked_on`) | Every claim is an atomic read-modify-write that observes the bound client. The `compare_exchange` clears the slot only when it still references the claimant's expected TCB, so two concurrent claimants cannot clear a third unrelated client's binding; both `swap`s are safe because only the slot-owning server performs them, while no publisher can install a different caller during its `SYS_IPC_REPLY` or at its `SYS_IPC_RECV` entry (per the Symmetry rule). The publish is a plain store, not a claim, into a slot actor 8 emptied at receive entry, so it never overwrites a binding (debug-asserted). The Release publish pairs with each claimant's Acquire. |
 
 ---
 
@@ -605,8 +631,8 @@ invariants common with the global wake protocol (`RESCHEDULE_PENDING`, `non_empt
 `sys_thread_sleep` is the simplest sleeper: no IPC source, only the timer. Sequence:
 
 ```
-1. deadline = sleep_deadline_after_ms(ms) (never 0).
-2. (*tcb).sleep_deadline = deadline.
+1. If ms == 0 return Ok(0); deadline = sleep_deadline_after_ms(ms) (never 0).
+2. open_park_episode(tcb); (*tcb).sleep_deadline = deadline.
 3. commit_blocked_under_local_lock(tcb, None, null): state = Blocked under
    sched_lock (a refusal rolls back the deadline and returns: RefusedWake →
    Ok(0), RefusedStop → deschedule, then Interrupted).
@@ -699,9 +725,9 @@ The handler then drains the target.
    and the waker's later `enqueue_and_wake` aborts on `Stopped`, clearing the park binding it owns
    and leaving the deposit for the resume (invariant 4). Until that wake lands the `Stopped` thread
    still carries the binding; `dealloc_object(Thread)` waits out the pin before it frees the thread,
-   but its drain step 11 reads the binding first (#443 § Source pointer held past its free).
+   but its drain step 11 reads the binding first (#501).
 3. **Self-stop fast path.** If the target is the calling thread, call `schedule(false)` immediately.
-   The skip-loop in `schedule()` never re-enqueues a `Stopped` TCB.
+   `schedule()`'s requeue arm never re-enqueues a `Stopped` current thread.
 4. **Cross-CPU drain.** If `running_on = Some(run_cpu)` and `run_cpu != current_cpu`:
    - `prod_remote_cpu(run_cpu)` — sends a wakeup IPI. Its handler does no work
      ([scheduling-internals.md § IPI Taxonomy](scheduling-internals.md#ipi-taxonomy)): the trap it
@@ -711,14 +737,15 @@ The handler then drains the target.
      resets the slice) or at the target's own park or yield, whose trap leaves the snapshot
      `sys_thread_read_regs` reads once the drain below completes.
    - Bounded spin until `sched_remote.current != target_tcb` and the target's `context_saved` is
-     set, **or** the target is no longer `Stopped`. The remote CPU's `schedule()` drains the
-     `Stopped` target via the skip-loop and switches to either the next ready thread or its idle
-     TCB; `current` moves off the target before `switch()` publishes its save, so the spin waits for
-     both and exits once that switch completes. The state re-check (read under `sched_remote.lock`,
-     alongside `current`) covers the other exit: an object teardown (`stop_threads_bound_to`,
-     `dealloc_object`) can commit `Exited` over the target while it is still `current` there, and
-     the drain bails so it does not wait on a thread the teardown will reap. A start cannot move the
-     target off `Stopped` meanwhile: its commit requires the target to be `current` on no CPU.
+     set, **or** the target is no longer `Stopped`. The remote CPU's `schedule()` declines to
+     requeue the `Stopped` target (requeue denylist) and switches to either the next ready thread or
+     its idle TCB; `current` moves off the target before `switch()` publishes its save, so the spin
+     waits for both and exits once that switch completes. The state re-check (read under
+     `sched_remote.lock`, alongside `current`) covers the other exit: an object teardown
+     (`stop_threads_bound_to`, `dealloc_object`) can commit `Exited` over the target while it is
+     still `current` there, and the drain bails so it does not wait on a thread the teardown will
+     reap. A start cannot move the target off `Stopped` meanwhile: its commit requires the target to
+     be `current` on no CPU.
    - Each pass that must wait also reads the stopper's own `state` under its `sched_lock`, which
      every `Stopped`/`Exited` commit holds. A stopper that has itself been stopped (a peer holding
      its Control cap stopping it back, or an object teardown) leaves the spin envelope and calls
@@ -762,7 +789,10 @@ The handler then drains the target.
    interrupts disabled would block an inbound TLB-shootdown IPI targeted at this CPU and deadlock
    it. The spin terminates as soon as the remote deschedules the target and publishes its save, or
    an object teardown commits `Exited` over it (a start cannot commit while the target is `current`
-   anywhere).
+   anywhere). A target left `current` on a CPU that `fatal` halted is never descheduled, so the
+   drain ends only once a teardown commits `Exited` over it (a restarted stopper whose slot no
+   longer names the target returns without re-entering the drain, per invariant 1), and that
+   teardown's drain scan never ends ([invariant 3](#dealloc_objectthread-drain-protocol)).
 4. **A restart waits out an owed wake.** A waker that claimed the stopped park may still be between
    its claim and its `enqueue_and_wake`. Each pass of `sys_thread_start`'s settle loop
    (`start_under_all_locks`) reads `wake_in_flight` under the target's `sched_lock` (ordered after
@@ -787,11 +817,12 @@ The handler then drains the target.
 ## Summarized By
 
 [Capability Subsystem Internals](capability-internals.md),
-[IPC Subsystem Internals](ipc-internals.md),
+[Kernel Initialization Sequence](initialization.md), [IPC Subsystem Internals](ipc-internals.md),
 [SMP Scheduler/IPC Hotpath Redesign — per-TCB `sched_lock` (authoritative serializer)](sched-ipc-redesign.md),
 [Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
 [core/ktest/README.md](../../ktest/README.md),
 [Capability Model](../../../docs/capability-model.md),
+[Fault Handling](../../../docs/fault-handling.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md)

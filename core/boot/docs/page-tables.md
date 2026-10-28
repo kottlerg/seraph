@@ -27,7 +27,9 @@ bootloader *builds*, described in later sections — is:
   `InitImage` segments, the kernel segments' physical frames, the kernel ELF file buffer,
   the bundle blob (every boot module body), the framebuffer when present, and the UART
   MMIO page on RISC-V, so the kernel can read them using physical addresses before its
-  own direct-physical map is established.
+  own direct-physical map is established. An `InitImage` segment whose `p_vaddr` in-page offset
+  plus its size crosses one more page boundary than its size alone has its last page left unmapped
+  (defect, [#442](https://github.com/kottlerg/seraph/issues/442)).
 - The handoff trampoline's page or pages are identity-mapped read-execute, so execution
   continues across the root-table switch.
 - Nothing else is mapped; an access outside these ranges faults. The ACPI RSDP and the
@@ -67,9 +69,9 @@ resolves.
 non-executable permissions, and switches the stack pointer to it in the
 [handoff sequence](kernel-handoff.md#handoff-sequence) before jumping to the kernel.
 
-The UEFI firmware's own page tables (before `ExitBootServices`) already contain a
-full 1:1 mapping of physical memory. After `ExitBootServices`, those page tables are
-no longer in use; the bootloader installs its own minimal tables.
+The firmware's own translation (a 1:1 mapping of physical memory under UEFI) stays active
+across `ExitBootServices`, and step 9 runs under it; the bootloader's minimal tables replace
+it only when the handoff trampoline writes `CR3` or `satp`.
 
 ---
 
@@ -77,32 +79,37 @@ no longer in use; the bootloader installs its own minimal tables.
 
 Within the bootloader, page table construction is separated into an arch-neutral
 interface and architecture-specific implementations. The trait, its error type,
-and the permission-flags record are defined in [`boot/src/paging.rs`](../src/paging.rs)
-and re-used by each arch implementation without duplication.
+and the permission-flags record are defined in
+[`core/boot/src/paging.rs`](../src/paging.rs) and re-used by each arch implementation
+without duplication.
 
-The trait exposes three operations: allocate a fresh root table, map a
-virtual range onto a physical range with requested permissions, and
-return the root's physical address (the value written to `CR3` on x86-64
-or encoded into the `satp` PPN on RISC-V). All page table frames are
+The trait exposes four operations: allocate a fresh root table, map a
+virtual range onto a physical range with requested permissions, return
+the root's physical address (the value written to `CR3` on x86-64 or
+encoded into the `satp` PPN on RISC-V), and list every frame the builder
+allocated (`allocated_frames`, § Page Table Frame Tracking). All page table frames are
 obtained from UEFI `AllocatePages`; no allocation occurs after
 `ExitBootServices`.
 
 Permissions carry only *writable* and *executable* booleans. Every
-mapping is implicitly readable — the architectures have no way to mark
-a present page unreadable while keeping it present — so a dedicated
-`readable` flag would be dead weight. W^X is rejected at the trait
+mapping is implicitly readable — x86-64 cannot mark a present page
+unreadable, and the RISC-V builder sets R on every leaf — so a dedicated
+`readable` flag would carry no information. W^X is rejected at the trait
 contract: any call requesting both `writable` and `executable` returns
-an error without modifying any table. This check is redundant with the
-ELF loading check in [elf-loading.md](elf-loading.md), but both sites
-enforce W^X independently to prevent a single failure mode from being
-missed.
+an error without modifying any table. For the kernel image this is the
+only W^X check: kernel segments have no load-time check. Init segments
+are checked once, at load time by `init_segment_flags`
+([elf-loading.md](elf-loading.md#load-segment-processing)), and are
+identity-mapped read-write, non-executable here, so their ELF flags
+never reach `map`.
 
 Intermediate-frame allocation failures and W^X violations are the only
 two map-error variants; both are fatal. The arch implementations live
-in [`boot/src/arch/x86_64/paging.rs`](../src/arch/x86_64/paging.rs) and
-[`boot/src/arch/riscv64/paging.rs`](../src/arch/riscv64/paging.rs);
-[`boot/src/paging.rs`](../src/paging.rs) re-exports the active
-architecture's implementation.
+in [`core/boot/src/arch/x86_64/paging.rs`](../src/arch/x86_64/paging.rs) and
+[`core/boot/src/arch/riscv64/paging.rs`](../src/arch/riscv64/paging.rs);
+[`core/boot/src/arch/mod.rs`](../src/arch/mod.rs) selects the active
+architecture's module as `arch::current`, whose `mod.rs` re-exports its
+`BootPageTable`.
 
 ---
 
@@ -123,8 +130,8 @@ Virtual address bits:
 ```
 
 The root table (PML4) occupies one 4 KiB frame. Each entry is a 64-bit value. Present
-entries in PML4 and PML3 point to the next-level table's physical frame. PML1 entries
-(PTEs) point to the final 4 KiB data frame.
+entries in PML4, PML3, and PML2 point to the next-level table's physical frame. PML1
+entries (PTEs) point to the final 4 KiB data frame.
 
 ### PTE Format
 
@@ -148,7 +155,8 @@ Permission mapping:
 | Readable + Writable | 1 | 1 (NX) |
 | Readable + Executable | 0 (read-only) | 0 (executable) |
 
-W^X: the combination Writable=1 and NX=0 is never written; `map` returns
+W^X: no leaf PTE is written with Writable=1 and NX=0 (intermediate entries are present +
+writable with NX=0, leaving the permission to the leaf); `map` returns
 `MapError::WxViolation` before any table is modified.
 
 ### Intermediate Table Allocation
@@ -161,12 +169,14 @@ an absent entry regardless of other bits.
 ### Activation
 
 Activation writes the root PML4's physical address to `CR3`. The write
-flushes all non-global TLB entries; because the bootloader never sets
-the Global bit (`G=0` in every PTE), the flush is complete. Interrupts
+flushes all non-global TLB entries; the bootloader sets no Global bit
+(`G=0` in every PTE), so none of its translations is global, and the
+trampoline does not toggle `CR4.PGE`, so a global entry left by the
+firmware's tables is not flushed by this write. Interrupts
 are disabled at activation time; the required mappings are all present
 before `CR3` is written. See
-[`boot/src/arch/x86_64/paging.rs`](../src/arch/x86_64/paging.rs) for the
-asm and the full SAFETY justification.
+[`core/boot/src/arch/x86_64/handoff.rs`](../src/arch/x86_64/handoff.rs)
+(`_handoff_trampoline`, `perform_handoff`) for the asm and its SAFETY justification.
 
 ---
 
@@ -178,7 +188,8 @@ The paging mode is selected at boot, before the tables are built. The boot
 CPU's DTB `mmu-type` property names the candidate (`riscv,sv39` /
 `riscv,sv48` / `riscv,sv57`; the widest advertised across enabled CPU nodes
 is used when the boot hart's node is silent, and Sv57 — the widest supported
-mode — when no DTB is published). A `satp` write-probe confirms the
+mode — when no DTB is published or no enabled CPU node advertises `mmu-type`).
+A `satp` write-probe confirms the
 candidate: the RISC-V Privileged ISA specifies that a `satp` write selecting
 an unimplemented MODE has no effect, so a readback that retains the prior
 value falls the candidate back to the next-narrower mode. Probe failure
@@ -213,10 +224,11 @@ Bit 2    (W):   Writable
 Bit 3    (X):   Executable
 Bit 4    (U):   User-accessible (0 for all bootloader mappings — S-mode only)
 Bit 5    (G):   Global (0; not used by the bootloader)
-Bit 6    (A):   Accessed (initialised to 1 to avoid access-flag faults on hardware
+Bit 6    (A):   Accessed (initialised to 1 in every leaf PTE, 0 in non-leaf PTEs, to avoid
+                access-flag faults on hardware
                 that does not set A/D bits in hardware and would fault instead)
 Bit 7    (D):   Dirty (initialised to 1 for writable pages; same rationale as A)
-Bits 10:8 (RSW): Reserved for software; set to 0
+Bits 9:8 (RSW): Reserved for software; set to 0
 Bits 53:10 (PPN): Physical page number (physical address >> 12)
 Bits 63:54: Reserved; must be 0
 ```
@@ -246,8 +258,8 @@ Sv39, 9 = Sv48, 10 = Sv57), `ASID = 0`, and `PPN = root_phys >> 12`, writes
 it via `csrw satp`, then issues `sfence.vma` to flush stale TLB entries
 before the new translation takes effect. All mappings required for
 continued execution are present before `satp` is written. See
-[`boot/src/arch/riscv64/paging.rs`](../src/arch/riscv64/paging.rs) for
-the asm and the full SAFETY justification.
+[`core/boot/src/arch/riscv64/handoff.rs`](../src/arch/riscv64/handoff.rs)
+(`perform_handoff`, `_handoff_trampoline`) for the asm and its SAFETY justification.
 
 ASID 0 is used for the bootloader's tables. The kernel keeps ASID 0 for its own root: in
 [Phase 3](../../kernel/docs/initialization.md#phase-3-kernel-page-tables) its untagged
@@ -262,14 +274,16 @@ and [TLB Management](../../../docs/memory-model.md#tlb-management)).
 
 W^X is checked at two levels:
 
-1. **ELF loading** ([elf-loading.md](elf-loading.md)) — any segment with `PF_W | PF_X`
-   is fatal before any frame is allocated.
+1. **ELF loading** ([elf-loading.md](elf-loading.md#load-segment-processing)) — an init
+   segment with `PF_W | PF_X` is rejected by `init_segment_flags` before any frame is
+   allocated for it; kernel segments have no load-time check.
 2. **Page table mapping** — the `map` function rejects `PageFlags { writable: true,
-   executable: true }` with `MapError::WxViolation`.
+   executable: true }` with `MapError::WxViolation`. This is the only check on kernel
+   segments, which reach it after their span has been allocated and copied.
 
-Both checks are present because ELF loading and page table construction are separate
-steps, and a violation at either point is equally dangerous. A writable+executable
-mapping that reaches the kernel is a security defect, not just a policy violation.
+Each image is checked at exactly one site: init at load time, the kernel at map time.
+A writable+executable mapping that reaches the kernel is a security defect, not just a
+policy violation.
 
 ---
 

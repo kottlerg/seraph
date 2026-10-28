@@ -239,9 +239,10 @@ pub struct BootPageTable
     /// UEFI boot services pointer for frame allocation.
     bs: *mut crate::uefi::EfiBootServices,
     /// Physical addresses of every frame allocated for this builder's tables
-    /// (root + every intermediate frame). Recorded in `BootInfo.reclaim_ranges`
-    /// so the kernel can reclaim them once Phase 3 has installed its own
-    /// page tables.
+    /// (root + every intermediate frame). Recorded in `BootInfo.reclaim_ranges`;
+    /// their reclamation is described in
+    /// [`core/boot/docs/page-tables.md`](../../../docs/page-tables.md)
+    /// § Page Table Frame Tracking.
     frame_log: [u64; FRAME_LOG_CAP],
     /// Number of valid entries in [`Self::frame_log`].
     frame_log_len: usize,

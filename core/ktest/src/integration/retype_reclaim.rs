@@ -5,14 +5,12 @@
 
 //! Integration: end-to-end auto-reclaim of every retyped kernel-object type.
 //!
-//! For each of the seven retypable `ObjectType` variants, mints a kernel
+//! For each of the seven retypable kernel-object `ObjectType` variants (every
+//! retypable variant except `Memory`), mints a kernel
 //! object from a dedicated Memory cap and asserts that destroying it returns
 //! the source cap's `available_bytes` ledger to the pre-mint value. This is
-//! the userspace-visible invariant relied on for process-death reclaim
-//! correctness — when a child dies, every kernel object it created against
-//! memmgr-derived inner caps cascades back through
-//! `KernelObjectHeader.ancestor` and credits bytes to the source
-//! `MemoryObject`.
+//! the userspace-visible face of the auto-reclaim rule in
+//! [capability-model.md](../../../../docs/capability-model.md) § Auto-reclaim.
 //!
 //! Object types covered:
 //! - `Endpoint`     (sub-page, in-place)
@@ -27,8 +25,8 @@
 //!
 //! Every retype runs against `ctx.memory_base`. The baseline is the cap's
 //! `available_bytes` before the first mint; every mint-then-delete pair
-//! must return the cap to it, since a retype debits exactly its class-
-//! rounded cost and the matching free credits exactly that.
+//! must return the cap to it (the ledger rule in
+//! [capability-model.md](../../../../docs/capability-model.md) § Available-bytes ledger).
 
 use syscall::{
     cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,

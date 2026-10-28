@@ -1,12 +1,17 @@
 # SMP Scheduler/IPC Hotpath Redesign — per-TCB `sched_lock` (authoritative serializer)
 
-Status: IMPLEMENTED in #292. This document is the design rationale for the
-structural fix to the recurring cross-CPU TCB-lifecycle race class behind #116
-#117 #128 #144 #160 #207 #225 #244 #282 #289 #284. The authoritative,
-binding invariants live in [scheduling-internals.md](scheduling-internals.md);
-this document records WHY the per-TCB `sched_lock` design was chosen and HOW it
-was migrated, and is retained for the code comments that cite its rationale
-sections (`§2`, `§2.1`).
+Design rationale and migration record for the per-TCB `sched_lock` redesign (#292) that
+closed the cross-CPU TCB-lifecycle race class.
+
+---
+
+## Status
+
+IMPLEMENTED in #292, the structural fix to the recurring cross-CPU TCB-lifecycle race class
+behind #116 #117 #128 #144 #160 #207 #225 #244 #282 #289 #284. The authoritative, binding
+invariants live in [scheduling-internals.md](scheduling-internals.md); this document records
+WHY the per-TCB `sched_lock` design was chosen and HOW it was migrated, and is retained for
+the code comments that cite its rationale sections (`§1`, `§2`, `§2.1`, `§3`).
 
 ## 0. History — why this is the SECOND design in this doc
 
@@ -25,12 +30,12 @@ requeue-from-state path and the cross-CPU `queued_on` Relaxed read → double-li
 `running_on` was a *third* positional signal layered onto machinery that already
 routes by `preferred_cpu`/`queued_on`/`sched.current`; under load they disagree
 and the disagreements race. (Note: the audit's *actual* `running_on` design,
-scored[3], used **defer-and-replay**, not owner-route — it never links a live
+`running_on`+defer, used **defer-and-replay**, not owner-route — it never links a live
 thread. The deviation was the defect, not `running_on` itself.)
 
 Lesson, and the reason for this design: a minimal layered signal cannot kill the
-class because it does not establish a **single authority**. The audit's #1-scored
-design does exactly that.
+class because it does not establish a **single authority**. The audit's per-TCB
+`sched_lock` design does exactly that.
 
 ### 0.1 Decision: per-TCB `sched_lock` over `running_on`-with-defer (final-state merits)
 
@@ -38,11 +43,11 @@ After the owner-route failure we evaluated the two remaining `running_on`-family
 options against per-TCB `sched_lock`, on end-state architecture only (ignoring
 migration effort). Decision: **per-TCB `sched_lock`** (this document's design).
 
-Evidence (audit adversarial per-design panel; `scored[]` totals out of 21):
-- `scored[0]` per-TCB `sched_lock`: **19** (correctness 7, simplicity 6, completeness 6).
-- `scored[3]` `running_on`+**defer**: **13** (correctness **4**, simplicity 3.5, completeness 5.5)
+Evidence (audit adversarial per-design panel; panel totals out of 21):
+- per-TCB `sched_lock`: **19** (correctness 7, simplicity 6, completeness 6).
+- `running_on`+**defer**: **13** (correctness **4**, simplicity 3.5, completeness 5.5)
   — the lowest of all four designs.
-- (`scored[1]` home_cpu+inbox 19.5, `scored[2]` park_claim epoch 19.5 — slightly
+- (home_cpu+inbox 19.5, park_claim epoch 19.5 — slightly
   higher panel scores but more bespoke/lock-free schemes that perpetuate the
   "subtle invariant easy to miss on a new transition" pattern that caused the
   plague; `sched_lock` is the standard, obviously-correct per-object authority and
@@ -83,8 +88,8 @@ the documented owner-token-CAS fallback (§5).
 
 ## 1. The class, and the model defect
 
-Before this redesign, `scheduling-internals.md` § Cross-CPU TCB Ownership made the
-owning lock of a TCB's Scheduling field group "the `scheduler.lock` of whichever
+Before this redesign, [scheduling-internals.md](scheduling-internals.md) § Cross-CPU TCB
+Ownership made the owning lock of a TCB's Scheduling field group "the `scheduler.lock` of whichever
 CPU's run queue currently links the TCB" — a lock **selected by reading the very
 fields it guards**. Two CPUs could therefore pick two different locks for one TCB
 at the same instant. No single lock serialized `{state, ipc_state, queued_on,
@@ -99,7 +104,7 @@ Three structural roots (CI-proven for #284):
 - (c) cross-CPU enqueues of one thread take *different* per-CPU locks →
   unserialized.
 
-## 2. Chosen design — one `sched_lock` per TCB (audit scored[0])
+## 2. Chosen design — one `sched_lock` per TCB
 
 Add one IRQ-disabling ticket `Spinlock` per TCB, `sched_lock`, as the **single
 authoritative serializer** for that TCB's entire Scheduling field group, keyed on
@@ -131,9 +136,8 @@ wake-decision now contend for the SAME per-TCB lock. Add `wake_pending: bool` to
 the Scheduling group. A waker that finds `state==Running` sets `wake_pending=true`
 under `sched_lock` and aborts the link. `commit_blocked_under_local_lock`, before
 writing `Blocked`, re-reads `wake_pending` under `sched_lock`; if set, it
-**refuses to park** (returns `ParkCommit::RefusedWake`; the thread stays
-runnable) — the wake-before-park
-refuse-to-park semantic, now lock-serialized instead of
+**refuses to park** (returns `ParkCommit::RefusedWake`; the thread stays runnable) — the
+wake-before-park refuse-to-park semantic, now lock-serialized instead of
 schedule()-timing-dependent. No wake is lost. The binding rules are
 [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy (the park commit) and
 § Wake Protocol Invariants (the `Running` arm).
@@ -153,7 +157,8 @@ which the `enqueue_and_wake` gate and its callers preserve:
 1. Every `enqueue_and_wake` caller deposits its payload BEFORE calling
    `enqueue_and_wake`. So `wake_pending` set ⇒ payload already deposited — no
    spurious-zero/garbage wake. (`wake_pending` is set inside `enqueue_and_wake`,
-   strictly after the upstream deposit under the source lock.)
+   strictly after the upstream deposit — made under the source lock, or, for the reply
+   wake, after the `reply_tcb` CAS win.)
 2. In each IPC primitive both refusals dequeue the waiter and restore
    `context_saved`, and the thread then passes through `schedule()`, which
    REQUEUES a runnable thread
@@ -174,11 +179,18 @@ which the `enqueue_and_wake` gate and its callers preserve:
    (binding rule: [scheduling-internals.md](scheduling-internals.md) § Lock
    Hierarchy).
 
-`wake_pending` is only reachable for wakers NOT serialized with the parker by a
-source lock — the IPC reply / cross-path races behind #284/#289. Source-lock-
-serialized parkers (notification/event/waitset; and the ep-serialized reply)
-always take order (ii): the parker commits `Blocked` under the source lock
-before any waker can run `enqueue_and_wake`, so they never set `wake_pending`.
+`wake_pending` is set only by a waker that finds its target `Running`, which a waker
+serialized with the parker by the source lock never does: the source-lock-serialized
+parkers (notification/event/waitset, and the endpoint send/recv queues) commit `Blocked`
+under the source lock before any waker can claim them. The reply wake takes no source lock
+(its claimants win the `reply_tcb` CAS; [scheduling-internals.md](scheduling-internals.md)
+§ Lock Hierarchy rule 5). `endpoint_reply` reaches the binding only after the caller's
+`Blocked` commit under `ep.lock`, but the dying-server reply-bound wake in
+`dealloc_object(Thread)` does not take `ep.lock`: it can claim `reply_tcb` between
+`endpoint_call`'s `reply_tcb` publish and its park commit, find the caller still
+`Running`, and set `wake_pending`. The caller's commit then returns `RefusedWake` and
+`endpoint_call` rolls the call back. That wake is the one current waker that reaches the
+`Running` arm.
 
 **Why a `Ready` coalesce can always be dropped (the linchpin for
 `enqueue_and_wake`'s `Ready` arm).** The register-waiter → `commit_blocked` sequence runs entirely
@@ -192,8 +204,8 @@ Therefore a thread a waker observes as `Ready` is ALWAYS an already-woken thread
 duplicate — never a wake-before-park case ([scheduling-internals.md](scheduling-internals.md)
 § Lock Hierarchy). Dropping it loses nothing, and there
 is no "preempted-mid-registration" window that would require `wake_pending` on
-the `Ready` arm. (`Running` keeps `wake_pending` purely as the belt-and-
-suspenders net for any future waker that is not source-lock-serialized.)
+the `Ready` arm. (`Running` keeps `wake_pending` as the net for a waker that is not
+source-lock-serialized, today the dying-server reply-bound wake above.)
 
 ## 3. What the implementation does (the migration, ordered as it landed)
 
@@ -202,17 +214,21 @@ buildable-and-bootable changes. The description below records the final shape of
 each change; the binding statement of the resulting invariants is
 [scheduling-internals.md](scheduling-internals.md).
 
-- **`Spinlock::try_lock_raw`** (`sync.rs`) — a CAS try-acquire returning `None`
-  on contention. It exists for the `pull_unpinned_ready` back-off (the one site
-  that needs `sched_lock` after a run-queue lock, the inverse of the canonical
-  order). It landed together with that sole consumer plus a host unit test, not
-  ahead of it (an unused `pub fn` would have stood as a `dead_code` warning).
+- **`Spinlock::try_lock_raw`** (`core/kernel/src/sync.rs`) — a CAS try-acquire returning
+  `None` on contention. It was added for the `pull_unpinned_ready` back-off (the one site
+  that needs `sched_lock` after a run-queue lock, the inverse of the canonical order) and
+  landed together with that consumer plus a host unit test, not ahead of it (an unused
+  `pub fn` would have stood as a `dead_code` warning). It has since gained other
+  non-blocking callers: the pull's own run-queue locks, `THREAD_REGISTRY_LOCK`, the
+  entropy `POOL_LOCK`, and the watchdog's `SLEEP_LIST_LOCK` read.
 
 - **`sched_lock: Spinlock` and `wake_pending: bool`** are TCB fields in the
-  `=== Scheduling state ===` group (with the later `park_seq` and `start_seq`), initialised
-  (`Spinlock::new()`, `wake_pending = false`) at every ctor site (idle in `mod.rs`, init in
-  `main.rs`, create-thread in `cap.rs`, host `make_tcb` in `run_queue.rs`; a zeroed ticket lock is
-  already unlocked). These are additive — adding them alone is no behavior change.
+  `=== Scheduling state ===` group (followed by the diagnostic `park_started_tick` and the
+  later `park_seq` and `start_seq`), initialised (`Spinlock::new()`, `wake_pending = false`)
+  at every ctor site (idle in `core/kernel/src/sched/mod.rs` `init`, init in
+  `core/kernel/src/main.rs`, create-thread in `core/kernel/src/syscall/cap.rs`, host
+  `make_tcb` in `core/kernel/src/sched/run_queue.rs`; a zeroed ticket lock is already
+  unlocked). These are additive — adding them alone is no behavior change.
 
 - **`commit_blocked_under_local_lock` / `commit_reply_rebind_under_local_lock`** acquire
   `(*tcb).sched_lock` (not the CPU lock). The park commit consults `wake_pending` and refuses to
@@ -248,9 +264,10 @@ each change; the binding statement of the resulting invariants is
     `wake_pending` here would risk a spurious refuse-to-park on the thread's
     NEXT block.
   - `Blocked|Created` → link: acquire the target run-queue lock (`sched_lock`
-    outer → CPU lock inner), set `Ready`/`ipc_state`/`preferred_cpu`, clear
-    `wake_pending` (defensive), `sched.enqueue` (the `queued_on` guard intact),
-    reschedule-pending, clear `wake_in_flight`, release the CPU lock, release
+    outer → CPU lock inner), set `Ready`/`ipc_state = None`/`blocked_on_object = null`,
+    clear `wake_pending` (defensive), `sched.enqueue` (the `queued_on` guard intact), set
+    `preferred_cpu` only when the enqueue created the link (#359), reschedule-pending,
+    clear `wake_in_flight`, release the CPU lock, release
     `sched_lock`, then `wake_idle_cpu` (never IPI under `sched_lock`).
 
   Because the gate coalesces `Ready`, a caller that *deliberately* sets
@@ -345,10 +362,12 @@ each change; the binding statement of the resulting invariants is
   `sched_lock` hold of their `reply_tcb` CAS win); on a lost claim the party
   that won clears it, as
   [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)
-  rule 7 lists (closing finding D, stale-binding).
+  rule 7 lists (closing the stale-binding race).
   `sys_thread_set_priority` — missed by the first lifecycle pass — was likewise
-  wrapped `sched_lock`-first (it reads `state` and mutates `queued_on` under the
-  all-CPU locks, an unserialized Scheduling-group writer otherwise).
+  wrapped `sched_lock`-first (it reads `state` and writes `priority` under `sched_lock`,
+  then relinks the queue entry via `relocate_ready_priority`, which locks the
+  `preferred_cpu`-hinted CPU's run queue and falls back to the ascending all-CPU walk on a
+  miss; an unserialized Scheduling-group writer otherwise).
 
 - **Scaffolding retained, not removed.** `queued_on` (#244), `wake_in_flight`
   (#160), `reply_tcb` (#289), and `context_saved` (#117/#207/#144) are all kept —
@@ -356,25 +375,25 @@ each change; the binding statement of the resulting invariants is
   save-window pin is retained as a cross-CPU-spin-avoidance cache hint (it is a
   placement hint only, never an exclusivity mechanism).
 
-## 4. Teardown co-fixes (audit findings B/C/E; D folded into the straggler pass)
+## 4. Teardown co-fixes
 
 These race fixes are independent of the lock and landed in the same migration
 (each a verified-reachable race):
-- **B (dealloc double-wakes):** the IPC dealloc arms claim each waiter (set
+- **Dealloc double-wakes:** the IPC dealloc arms claim each waiter (set
   `wake_in_flight`) under the source lock before `enqueue_and_wake` — the
   discipline `notification_send`/`event_queue_post` already use. With multi-waiter
-  queues, the Notification dealloc arm in `cap/object.rs`, `event_queue_drop`, and
-  `wait_set_drop` drain every waiter through `interrupt_all_waiters`, which claims
-  each, stamps its park `Interrupted`, and wakes it while still holding the source
-  lock (`sig`/`eq`/`ws`). (`event_queue_drop`'s old "under eq.lock" comment was a
-  lie — no lock was held; it now takes `eq.lock`.) The endpoint dealloc drain
-  likewise holds `ep.lock` across its per-waiter `enqueue_and_wake` walk. Both are
-  sound because `source lock → sched_lock → run-queue` is the canonical order;
+  queues, the Notification dealloc arm in `core/kernel/src/cap/object.rs`,
+  `event_queue_drop`, and `wait_set_drop` drain every waiter through
+  `interrupt_all_waiters`, which claims each, stamps its park `Interrupted`, and wakes it
+  while still holding the source lock (`sig`/`eq`/`ws`). (`event_queue_drop`'s old "under
+  eq.lock" comment was a lie — no lock was held; it now takes `eq.lock`.) The endpoint
+  dealloc drain likewise holds `ep.lock` across its per-waiter `enqueue_and_wake` walk.
+  Both are sound because `source lock → sched_lock → run-queue` is the canonical order;
   [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy rule 5.
-- **C (sleep-list UAF/lost-wake):** `dealloc_object(Thread)` calls
+- **Sleep-list UAF/lost-wake:** `dealloc_object(Thread)` calls
   `sleep_list_remove(tcb)` before free (no such call existed before — a killed
   plain sleeper left a dangling pointer the next timer tick dereferenced), placed
-  OUTSIDE the all-locks region (no `sched.lock`→`SLEEP_LIST` order edge). And
+  OUTSIDE the all-locks region (no `sched.lock`→`SLEEP_LIST_LOCK` order edge). And
   `sleep_check_wakeups` SNAPSHOTS `(ipc_state, blocked_on)` under
   `SLEEP_LIST_LOCK` at pop (the `ExpiredWaiter` struct), claiming a plain sleeper
   with `wake_in_flight = 1` there so dealloc's existing gate covers an
@@ -385,8 +404,8 @@ These race fixes are independent of the lock and landed in the same migration
   The IPC arms' pop-time source and TCB pointers also need a lifetime gate:
   the timer-batch quiesce (`sleep_wakeups_quiesce`), which the Notification,
   EventQueue and Thread dealloc arms pass before freeing (Sleep List Invariant 9).
-- **E (stop vs shootdown):** `sys_thread_stop`'s cross-CPU drain spin
-  (`syscall/thread.rs`) ran at IF=0 and could deadlock against an in-flight TLB
+- **Stop vs shootdown:** `sys_thread_stop`'s cross-CPU drain spin
+  (`core/kernel/src/syscall/thread.rs`) ran at IF=0 and could deadlock against an in-flight TLB
   shootdown; it now runs under `preempt_disable` + IF-enabled (the #207 pattern
   dealloc's UAF gate uses; [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md)
   § `sys_thread_stop` Cross-CPU Stop Protocol).
@@ -434,25 +453,18 @@ Plus host `cargo xtask test`. The additive changes gated on the pass marker; the
 `schedule()`/lifecycle and teardown co-fixes gated on the full matrix + the ×200
 cell.
 
-## 7. Known residual (separate surface)
+## 7. Residuals closed after this redesign
 
-Historical: the race below was closed after this redesign by the CLOSURE LEMMA
-(scheduling-internals.md § Cross-CPU TCB Ownership; `cancel_ipc_block` re-reads
-`blocked_on_object` under the client's `sched_lock`, which a dying server nulls
-before it is freed), and #317 is closed. The paragraph records what the redesign
-left open at the time.
-
-One race is acknowledged but deliberately NOT closed by this redesign, because it
-is a different review surface (the rare STOP path, not thread-churn) and needs a
-server-lifetime mechanism this work does not introduce: `cancel_ipc_block(bound)`
-CAS-dereferences the server's `reply_tcb` after snapshotting `blocked_on =
-server`; a `dealloc(server)` that frees the server while `cancel` stalls past the
-free is a latent use-after-free. This redesign does not widen it materially (the
-reply-binding clear moved only within the dealloc path, still well before the
-server free) but does not close it. It is tracked as issue #317 and needs a
-refcount/epoch on the server's lifetime to fix. The lower-frequency cross-CPU
-lost-wake / torn-context tail that survived this redesign's burn-in is tracked in
-issue #314 (with #316).
+The redesign left one race open: `cancel_ipc_block(bound)` CAS-dereferenced the server's
+`reply_tcb` after snapshotting `blocked_on = server`, so a `dealloc(server)` that freed the
+server while `cancel` stalled was a latent use-after-free (#317). #317 is closed by the
+CLOSURE LEMMA ([scheduling-internals.md](scheduling-internals.md) § Cross-CPU TCB
+Ownership): the CAS now runs under the client's `sched_lock`, gated by a
+`blocked_on_object == server` re-read, and `dealloc_object(Thread)` on the server nulls a
+claimed client's `blocked_on_object` under that same lock before the free
+([scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy rule 7). The
+lower-frequency cross-CPU lost-wake / torn-context tail that survived this redesign's
+burn-in (#314, with #316) is also closed.
 
 ---
 

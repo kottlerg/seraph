@@ -146,6 +146,7 @@ unsafe fn spin_and_check(pattern: u64) -> u64
 }
 
 #[cfg(target_arch = "riscv64")]
+// too_many_lines: 32 F loads, 32 V broadcasts, and 64 register stores dominate the body.
 #[allow(clippy::too_many_lines)]
 unsafe fn spin_and_check(pattern: u64) -> u64
 {
@@ -360,7 +361,7 @@ unsafe fn spin_and_check(pattern: u64) -> u64
 /// architecturally addressable extended-state register, spin long enough
 /// to be preempted many times, and capture the live registers afterward.
 /// Both captures must equal the child's own pattern — any mismatch
-/// indicates the lazy save/restore path leaked state across the context
+/// indicates the eager-save / lazy-restore path leaked state across the context
 /// switch.
 pub fn preempt_isolation(ctx: &TestContext) -> TestResult
 {
@@ -442,10 +443,10 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
 
 /// Per-thread stack for the cross-CPU child.
 static mut STACK_CROSS: ChildStack = ChildStack::ZERO;
-/// Notification indices passed into the cross-CPU child by index (the child's
-/// cspace cap is published here so the inline-asm syscall sites can read
-/// them without crossing a Rust function boundary that would clobber the
-/// FP register file).
+/// Slot indices, in the cross-CPU child's `CSpace`, of its ready, resume, and
+/// done notification caps. The child loads ready and resume before its
+/// inline-asm block (so no Rust call runs between the FP load and the
+/// capture) and done after it.
 static CROSS_SIG_READY: AtomicU32 = AtomicU32::new(0);
 static CROSS_SIG_RESUME: AtomicU32 = AtomicU32::new(0);
 static CROSS_SIG_DONE: AtomicU32 = AtomicU32::new(0);
@@ -462,14 +463,11 @@ static CROSS_OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 /// back to a stack buffer.
 ///
 /// The entire load → block → capture sequence runs inside a single inline-
-/// asm block so no intervening Rust call clobbers FP state. The syscall ABI
-/// is embedded directly: the kernel preserves the live FP register file
-/// across the block because (a) the kernel itself is soft-float and (b) the
-/// FPU discipline keeps the child as `fpu_owner` of its current CPU until
-/// either another thread takes a lazy-restore trap or the child itself
-/// context-switches out (at which point `switch_out_save` saves the live
-/// regs into the TCB area before the publish that lets the destination CPU
-/// see the thread Ready).
+/// asm block so no intervening Rust call clobbers FP state; the syscall ABI
+/// is embedded directly. The kernel is soft-float, and it saves and restores
+/// the live extended state across the block as
+/// `core/kernel/docs/scheduler.md` § What Gets Saved and Restored and
+/// `core/kernel/docs/scheduling-internals.md` § IPI Taxonomy specify.
 #[cfg(target_arch = "x86_64")]
 extern "C" fn child_cross_entry(_arg: u64) -> !
 {
@@ -483,11 +481,11 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
     let spin: u64 = 50_000;
 
     // SAFETY: inline asm loads pat128 into xmm0..xmm15, issues two raw
-    // syscalls (SIGNAL_SEND, SIGNAL_WAIT) preserving the live FP register
-    // file across both, then stores xmm0..xmm15 into buf. All operands
-    // have matching lifetimes; rcx/r11 are syscall-clobber-only. rdx is
-    // clobbered by SIGNAL_WAIT's secondary-return write (the kernel writes
-    // the acquired bitmask into rdx via `set_ipc_return`).
+    // syscalls (SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT) preserving the
+    // live FP register file across both, then stores xmm0..xmm15 into buf. All
+    // operands have matching lifetimes; rcx/r11 are syscall-clobber-only. rdx
+    // is clobbered by SYS_NOTIFICATION_WAIT's secondary-return write (the kernel
+    // writes the acquired bitmask into rdx via `set_ipc_return`).
     unsafe {
         core::arch::asm!(
             "vmovdqu xmm0,  [{p}]",
@@ -572,10 +570,11 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
 ///
 /// Same shape as the x86-64 sibling. ecall uses a7 as the syscall number
 /// and a0..a2 as args; the kernel is soft-float so the FP register file
-/// survives the syscall under the discipline described in the doc comment
-/// on `preempt_isolation_cross_cpu`.
+/// survives the syscall per `core/kernel/docs/scheduler.md` § What Gets
+/// Saved and Restored.
 #[cfg(target_arch = "riscv64")]
-#[allow(clippy::too_many_lines)] // 32 FP loads + 32 FP stores dominate the body.
+// too_many_lines: 32 FP loads + 32 FP stores dominate the body.
+#[allow(clippy::too_many_lines)]
 extern "C" fn child_cross_entry(_arg: u64) -> !
 {
     let pattern: u64 = PATTERN_A;
@@ -584,11 +583,11 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
     let sig_resume = CROSS_SIG_RESUME.load(Ordering::Acquire);
     let spin: u64 = 50_000;
 
-    // SAFETY: inline asm loads pattern into f0..f31, issues SIGNAL_SEND
-    // (a7=3) then SIGNAL_WAIT (a7=4) preserving the live FP register
-    // file across both, then stores f0..f31 into buf. The .option arch
-    // directive locally enables the D extension even though the kernel
-    // target is RV64IMAC; the trap-and-restore path will have made FS
+    // SAFETY: inline asm loads pattern into f0..f31, issues
+    // SYS_NOTIFICATION_SEND (a7=3) then SYS_NOTIFICATION_WAIT (a7=4) preserving
+    // the live FP register file across both, then stores f0..f31 into buf.
+    // The .option arch directive locally enables the D extension even
+    // though the kernel target is RV64IMAC; the trap-and-restore path will have made FS
     // Dirty by the time these stores execute post-migration.
     unsafe {
         core::arch::asm!(
@@ -629,16 +628,16 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
             "2:",
             "addi {it}, {it}, -1",
             "bnez {it}, 2b",
-            // SIGNAL_SEND(sig_ready, 0x1): a7=3, a0=sig_ready, a1=1.
+            // SYS_NOTIFICATION_SEND(sig_ready, 0x1): a7=3, a0=sig_ready, a1=1.
             "li a7, 3",
             "mv a0, {sig_ready}",
             "li a1, 1",
             "ecall",
-            // SIGNAL_WAIT(sig_resume, 0): a7=4, a0=sig_resume, a1=0 (no
+            // SYS_NOTIFICATION_WAIT(sig_resume, 0): a7=4, a0=sig_resume, a1=0 (no
             // timeout). MUST zero a1 explicitly — the kernel reads
             // tf.arg(1) as `timeout_ms` (sys_notification_wait in
             // core/kernel/src/syscall/ipc.rs), and the previous
-            // SIGNAL_SEND left a1=1 in the register file. Without this
+            // SYS_NOTIFICATION_SEND left a1=1 in the register file. Without this
             // store the wait runs with a 1 ms timeout and the test
             // races past the migration step it claims to validate.
             "li a7, 4",
@@ -705,12 +704,12 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
     thread_exit();
 }
 
-/// Cross-CPU FPU-migration correctness: a thread that became `fpu_owner`
-/// on CPU 0, blocked, then was woken with affinity changed to CPU 1, must
-/// observe its register file intact post-migration. After issue #108,
-/// this is guaranteed by eager XSAVE on switch-out (the source CPU's
-/// `switch_out_save` persists the live regs into the TCB area before the
-/// scheduler lock release that publishes the thread's Ready state).
+/// Cross-CPU FPU-migration correctness: a thread that loaded its
+/// extended-state registers on CPU 0, blocked, then was woken with affinity
+/// changed to CPU 1, must observe its register file intact post-migration.
+/// The kernel discipline that guarantees this is specified in
+/// `core/kernel/docs/scheduler.md` § What Gets Saved and Restored and
+/// `core/kernel/docs/scheduling-internals.md` § IPI Taxonomy.
 ///
 /// Requires SMP; skips on UP. Runs on both x86-64 (XSAVE/XRSTOR + `#NM`)
 /// and RISC-V (`sstatus.FS/VS` dirty-tracking + illegal-instruction trap).
@@ -751,8 +750,8 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
         let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
             .map_err(|_| "cap_create_thread for preempt_isolation_cross_cpu failed")?;
 
-        // Pin to CPU 0 initially: child must run and become CPU 0's
-        // `fpu_owner` before the migration step.
+        // Pin to CPU 0 initially: the child must run and load its
+        // extended-state registers on CPU 0 before the migration step.
         thread_set_affinity(th, 0)
             .map_err(|_| "initial thread_set_affinity(0) for preempt_isolation_cross_cpu failed")?;
 
@@ -761,7 +760,8 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
             .map_err(|_| "thread_configure for preempt_isolation_cross_cpu failed")?;
         thread_start(th).map_err(|_| "thread_start for preempt_isolation_cross_cpu failed")?;
 
-        // Wait for the child to become `fpu_owner` on CPU 0 and notification ready.
+        // Wait for the child to load its extended-state registers on CPU 0 and
+        // signal ready.
         // The parent blocks (yielding CPU 0) so the child can run; the child
         // then loads PATTERN_A, briefly spins, signals ready, and blocks on
         // sig_resume.
@@ -773,13 +773,10 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
         thread_set_affinity(th, 1)
             .map_err(|_| "thread_set_affinity(1) for preempt_isolation_cross_cpu failed")?;
 
-        // Wake the child. The wake path calls `enqueue_and_wake(target=1)`,
-        // which simply enqueues the child on CPU 1's run queue: CPU 0's
-        // earlier `switch_out_save` (when the child blocked on sig_resume)
-        // already XSAVE'd the live regs into the child's TCB area. The
-        // child then runs on CPU 1; the first FP op (the capture vmovdqu)
-        // traps to `#NM`, which XRSTORs the area into CPU 1's hardware
-        // before the store executes.
+        // Wake the child. The wake path enqueues it on CPU 1's run queue; its
+        // extended state was saved into its TCB area when it switched out on
+        // CPU 0 and is restored on its first FP op on CPU 1 (see
+        // core/kernel/docs/scheduler.md § What Gets Saved and Restored).
         notification_send(sig_resume, 0x1)
             .map_err(|_| "notification_send resume for preempt_isolation_cross_cpu failed")?;
 
@@ -809,13 +806,11 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
         }
         // The migration was either actually cross-CPU (observed != 0) or the
         // scheduler kept the child on its original CPU. In either case, the
-        // FP state must be intact. The flush IPI path is exercised when the
-        // wake target differs from the thread's prior `preferred_cpu`; this
-        // can happen via affinity-driven `select_target_cpu` or via
-        // load-balance pull on the destination. We log the observed CPU for
-        // diagnostics but do not gate the test on it — the existing
-        // `thread::affinity_migrate_ready_queued` test already covers strict
-        // affinity enforcement.
+        // FP state must be intact; no cross-CPU FPU coordination exists (see
+        // core/kernel/docs/scheduling-internals.md § IPI Taxonomy). We log the
+        // observed CPU for diagnostics but do not gate the test on it — the
+        // existing `thread::affinity_migrate_ready_queued` test already covers
+        // strict affinity enforcement.
         Ok(())
     }
 }

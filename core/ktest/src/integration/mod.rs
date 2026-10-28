@@ -24,7 +24,8 @@
 //! - `cap_transfer.rs`           — capability rights through an IPC endpoint round-trip
 //! - `cap_transfer_large.rs`     — IPC transfer of a cap with a multi-batch child list
 //! - `wait_concurrency.rs`       — wait set with simultaneous notification and queue sources
-//! - `memory_lifecycle.rs`       — memory split → map → protect → unmap with state checks
+//! - `memory_lifecycle.rs`       — pool-frame map → protect → unmap with `aspace_query`
+//!   state checks
 //! - `multi_caller_ipc_fifo.rs`  — endpoint send-queue FIFO ordering with three concurrent callers
 //! - `cap_delegation_chain.rs`   — multi-level rights attenuation and cascaded revocation
 //! - `tlb_coherency.rs`          — map/unmap cycles across CPUs exercising TLB shootdown

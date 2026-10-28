@@ -6,10 +6,10 @@
 //! Central entropy pool.
 //!
 //! A single forward-secure sponge that accumulates entropy from every source
-//! (hardware RNG, jitter, boot-info) and hands seed material to the per-CPU
-//! generators. Guarded by a leaf spinlock: it is never taken at interrupt time
-//! (interrupt-time jitter lands in a per-CPU buffer and is folded in off the
-//! interrupt path), and the lock is never held across a blocking operation.
+//! (firmware boot seed, hardware RNG, timing jitter, and the VMGENID GUID
+//! where present) and hands seed material to the per-CPU generators. Guarded
+//! by a leaf spinlock; its locking and non-exposure invariants are specified
+//! in `core/kernel/docs/entropy.md` § Central pool and multi-source mixing.
 //!
 //! The raw pool is never exposed: callers absorb into it or draw *seed* bytes,
 //! and consumer-facing output comes only from the per-CPU generators.

@@ -26,7 +26,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     for _ in 0..ITERATIONS
     {
         // 4 init_pages (wrapper page + 3 pool pages), matching
-        // `unit/cap.rs::insert_out_of_bounds_err`'s sizing.
+        // `core/ktest/src/unit/cap.rs` `insert_out_of_bounds_err`'s sizing.
         let cs = cap_create_cspace(ctx.memory_base, 0, 4)
             .map_err(|_| "cspace_recycle: cap_create_cspace failed (namespace exhausted?)")?;
         cap_delete(cs).map_err(|_| "cspace_recycle: cap_delete failed")?;

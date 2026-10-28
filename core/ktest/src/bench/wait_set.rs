@@ -12,7 +12,7 @@ use syscall::{
 
 use super::{cycles_now, log_bench_header};
 
-// Thin wrapper — same as in unit/cap.rs.
+// Thin wrapper — same as `cap_create_wait_set` in core/ktest/src/unit/cap.rs.
 fn cap_create_wait_set(memory_cap: u32) -> Result<u32, i64>
 {
     syscall::wait_set_create(memory_cap)
@@ -20,8 +20,8 @@ fn cap_create_wait_set(memory_cap: u32) -> Result<u32, i64>
 
 pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
 {
-    // Cap this benchmark at 100 iterations; wait set create/delete involves
-    // heap allocations that fragment under high churn.
+    // Cap this benchmark at 100 iterations; each cycle retypes a wait set out
+    // of `ctx.memory_base` and frees it on `cap_delete`.
     let n = u64::from(iters.min(100));
 
     let Ok(sig) = cap_create_notification(ctx.memory_base)

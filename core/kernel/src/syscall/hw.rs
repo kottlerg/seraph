@@ -16,13 +16,16 @@
 //!   (`x86_64` only).
 //!
 //! # Adding new hardware syscalls
-//! 1. Add a new `pub fn sys_hw_*` in this file.
-//! 2. Import the constant in `syscall/mod.rs`.
-//! 3. Add a dispatch arm in `syscall/mod.rs`.
-//! 4. Add a userspace wrapper in `shared/syscall/src/lib.rs`.
+//! 1. Define the `SYS_*` number in `abi/syscall/src/lib.rs`.
+//! 2. Add a new `pub fn sys_*` handler in this file.
+//! 3. Import the constant in `core/kernel/src/syscall/mod.rs`.
+//! 4. Add a dispatch arm in `core/kernel/src/syscall/mod.rs`.
+//! 5. Add a userspace wrapper in `shared/syscall/src/lib.rs`.
 
-// cast_possible_truncation: capability slot indices extracted from 64-bit trap frame
-// registers are always u32-range values. Seraph runs on 64-bit only; no truncation occurs.
+// cast_possible_truncation: user-supplied u64 trap-frame args are narrowed to the
+// ABI's u32 capability handles and IRQ ids, keeping the low 32 bits (upper bits
+// are discarded). The remaining narrowings (u64->usize on 64-bit targets, the
+// IoPort u32->u16 halves) are lossless or range-checked beside the cast.
 #![allow(clippy::cast_possible_truncation)]
 
 use crate::arch::current::trap_frame::TrapFrame;
@@ -49,7 +52,8 @@ pub fn sys_irq_ack(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let irq_cap_idx = tf.arg(0) as u32;
 
-    // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+    // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
+    // CPU's current thread.
     let tcb = unsafe { current_tcb() };
     if tcb.is_null()
     {
@@ -58,7 +62,8 @@ pub fn sys_irq_ack(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb validated non-null; cspace set at thread creation.
     let cspace = unsafe { (*tcb).cspace };
 
-    // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+    // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
+    // rejects a null cspace and checks tag and rights.
     let irq_slot = unsafe { super::lookup_cap(cspace, irq_cap_idx, IrqRights::NOTIFY) }?;
     let irq_id = {
         let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -112,7 +117,8 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let irq_cap_idx = tf.arg(0) as u32;
     let sig_cap_idx = tf.arg(1) as u32;
 
-    // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+    // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
+    // CPU's current thread.
     let tcb = unsafe { current_tcb() };
     if tcb.is_null()
     {
@@ -122,7 +128,8 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let cspace = unsafe { (*tcb).cspace };
 
     // Resolve Interrupt cap.
-    // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+    // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
+    // rejects a null cspace and checks tag and rights.
     let irq_slot = unsafe { super::lookup_cap(cspace, irq_cap_idx, IrqRights::NOTIFY) }?;
     let irq_id = {
         let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -139,7 +146,8 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     };
 
     // Resolve Notification cap.
-    // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+    // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
+    // rejects a null cspace and checks tag and rights.
     let sig_slot = unsafe { super::lookup_cap(cspace, sig_cap_idx, NtfRights::NOTIFY) }?;
     let sig_state = {
         let obj = sig_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -187,17 +195,17 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg0 = `AddressSpace` cap index (must have MAP right).
 /// arg1 = `Mmio` cap index (must have MAP right).
 /// arg2 = virtual base address (page-aligned, user half).
-/// arg3 = flags (bit 1 = WRITE; executable mappings are always rejected).
+/// arg3 = flags (reserved; ignored). Writability comes from the `Mmio` cap's
+/// WRITE right; mappings are never executable.
 ///
 /// All pages are mapped with `uncacheable = true` (PCD|PWT on `x86_64`,
 /// Svpbmt PBMT=IO on RISC-V — see [`PageFlags`]).
 ///
-/// Intermediate page-table pages are drawn from the target AS's own PT
-/// growth pool: every address space the boot or a service creates records
-/// its create-time donation, and one without would fall back to the kernel
-/// page-table pool. Callers mapping a region larger than the AS's spare PT
-/// budget must augment it first via `cap_create_aspace` augment-mode, else
-/// the map fails with `OutOfMemory` rather than drawing on the reserve.
+/// Intermediate page-table pages come from the target AS's PT growth pool;
+/// the map fails with `OutOfMemory` when that pool is exhausted, so a caller
+/// mapping a large region augments it first via `SYS_CAP_CREATE_ASPACE`
+/// augment-mode (see `core/kernel/docs/memory-internals.md` § Page Table
+/// Node Ownership).
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -221,7 +229,8 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidAddress);
     }
 
-    // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+    // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
+    // CPU's current thread.
     let tcb = unsafe { current_tcb() };
     if tcb.is_null()
     {
@@ -231,7 +240,8 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let cspace = unsafe { (*tcb).cspace };
 
     // Resolve Mmio cap.
-    // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+    // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
+    // rejects a null cspace and checks tag and rights.
     let mmio_slot = unsafe { super::lookup_cap(cspace, mmio_idx, MmioRights::MAP) }?;
     let (mmio_phys, mmio_size) = {
         let obj = mmio_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -259,7 +269,8 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // Resolve AddressSpace cap.
-    // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+    // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
+    // rejects a null cspace and checks tag and rights.
     let as_slot = unsafe { super::lookup_cap(cspace, aspace_idx, AsRights::MAP) }?;
     let (as_ptr, aso_raw) = {
         let obj = as_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -333,7 +344,8 @@ pub fn sys_mmio_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// On first bind, an 8 KiB per-thread IOPB bitmap is carved from the SEED
 /// Memory cap and all ports are denied (0xFF). The requested range bits are
 /// then cleared (0 = allowed). On context switch the bitmap is copied into
-/// the TSS IOPB region.
+/// the TSS IOPB region. The allocate-and-edit takes no lock on the target, so
+/// concurrent binds on one thread from different CPUs race (Issue #443).
 ///
 /// On RISC-V: always returns `NotSupported` (no I/O port concept).
 ///
@@ -356,7 +368,8 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let thread_idx = tf.arg(0) as u32;
         let ioport_idx = tf.arg(1) as u32;
 
-        // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+        // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
+        // CPU's current thread.
         let caller_tcb = unsafe { current_tcb() };
         if caller_tcb.is_null()
         {
@@ -366,7 +379,8 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let cspace = unsafe { (*caller_tcb).cspace };
 
         // Resolve Thread cap.
-        // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+        // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
+        // rejects a null cspace and checks tag and rights.
         let th_slot = unsafe { super::lookup_cap(cspace, thread_idx, ThreadRights::CONTROL) }?;
         let target_tcb = {
             let obj = th_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -383,7 +397,8 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
 
         // Resolve IoPort cap.
-        // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+        // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
+        // rejects a null cspace and checks tag and rights.
         let port_slot = unsafe { super::lookup_cap(cspace, ioport_idx, IoPortRights::USE) }?;
         let (port_base, port_size) = {
             let obj = port_slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -397,14 +412,23 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // Allocate per-thread IOPB on first bind. Sourced from the kernel
         // SEED Memory cap; freed back to SEED on thread dealloc via the
         // Thread arm of `dealloc_object`.
-        // SAFETY: target_tcb validated non-null; iopb field always valid.
+        // The null check, the install, and the bit edits below take no lock
+        // on the target. Two binds on the same target from different CPUs can
+        // both see null and both allocate; the later store overwrites the
+        // earlier one, leaking a SEED scratch block and dropping the permits
+        // of a bind that returned Ok (defect, Issue #443).
+        // SAFETY: target_tcb validated non-null; iopb is null or a pointer
+        // installed by a prior bind. The read is unsynchronized (Issue #443).
         if unsafe { (*target_tcb).iopb.is_null() }
         {
             let raw = crate::cap::retype::alloc_seed_scratch(gdt::IOPB_SIZE as u64)?;
             // SAFETY: raw points at a freshly-carved IOPB-sized block in
-            // SEED's region; not aliased; we own it for the IOPB's lifetime.
+            // SEED's region, not aliased. The unlocked store can overwrite a
+            // block a concurrent bind installed (Issue #443).
             unsafe {
                 core::ptr::write_bytes(raw, 0xFFu8, gdt::IOPB_SIZE);
+                // cast_ptr_alignment: `[u8; IOPB_SIZE]` has alignment 1, so any
+                // byte pointer from alloc_seed_scratch is suitably aligned.
                 #[allow(clippy::cast_ptr_alignment)]
                 {
                     (*target_tcb).iopb = raw.cast::<[u8; gdt::IOPB_SIZE]>();
@@ -457,7 +481,7 @@ pub fn sys_ioport_bind(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// arg0 = `Mmio` cap index (must have MAP right).
 /// arg1 = split offset in bytes (page-aligned; must be > 0 and < region size).
-/// arg2 = reserved (must be 0).
+/// arg2 = reserved (ignored).
 ///
 /// Consumes the original cap and creates two new `Mmio` caps with the same
 /// rights and flags, covering `[base, base+split_offset)` and
@@ -499,7 +523,8 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // ── Capability lookup ─────────────────────────────────────────────────────
 
-    // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+    // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
+    // CPU's current thread.
     let tcb = unsafe { current_tcb() };
     if tcb.is_null()
     {
@@ -517,6 +542,8 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let slot = unsafe { super::lookup_cap(caller_cspace, mmio_handle, MmioRights::MAP) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Mmio; pointer is valid MmioObject.
+        // cast_ptr_alignment: the MmioObject is constructed in place at a
+        // size-class-aligned retype offset.
         #[allow(clippy::cast_ptr_alignment)]
         let mo = unsafe { &*(obj_ptr.as_ptr().cast::<MmioObject>()) };
         // SAFETY: caller_cspace validated non-null; id() reads discriminator.
@@ -632,7 +659,8 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // ── Capability lookup ─────────────────────────────────────────────────────
 
-    // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+    // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
+    // CPU's current thread.
     let tcb = unsafe { current_tcb() };
     if tcb.is_null()
     {
@@ -650,6 +678,8 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let slot = unsafe { super::lookup_cap(caller_cspace, irq_handle, IrqRights::NOTIFY) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Interrupt; pointer is valid InterruptObject.
+        // cast_ptr_alignment: the InterruptObject is constructed in place at a
+        // size-class-aligned retype offset.
         #[allow(clippy::cast_ptr_alignment)]
         let io = unsafe { &*(obj_ptr.as_ptr().cast::<InterruptObject>()) };
         // SAFETY: caller_cspace validated non-null; id() reads discriminator.
@@ -778,7 +808,8 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         // ── Capability lookup ────────────────────────────────────────────────
 
-        // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+        // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
+        // CPU's current thread.
         let tcb = unsafe { current_tcb() };
         if tcb.is_null()
         {
@@ -796,6 +827,8 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             let slot = unsafe { super::lookup_cap(caller_cspace, port_handle, IoPortRights::USE) }?;
             let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
             // SAFETY: tag confirmed IoPort; pointer is valid IoPortObject.
+            // cast_ptr_alignment: the IoPortObject is constructed in place at a
+            // size-class-aligned retype offset.
             #[allow(clippy::cast_ptr_alignment)]
             let po = unsafe { &*(obj_ptr.as_ptr().cast::<IoPortObject>()) };
             // SAFETY: caller_cspace validated non-null; id() reads discriminator.
@@ -806,7 +839,7 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // ── Validation ───────────────────────────────────────────────────────
 
         // size == 0 encodes the full 64K range; matches sys_ioport_bind's
-        // effective_size handling at the top of this file.
+        // effective_size handling.
         let effective_size: u32 = if size_u16 == 0
         {
             65536

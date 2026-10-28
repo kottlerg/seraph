@@ -17,14 +17,21 @@ here; detailed implementation is in the referenced document.
 ### Step 1: UEFI Protocol Discovery
 
 `efi_main` receives an `EFI_HANDLE image_handle` and a pointer to the UEFI system
-table. The first act is to locate the protocols needed for the rest of the boot:
+table. Before step 1, `efi_main` discovers the serial UART (`arch::current::pre_serial_init`;
+a no-op on x86-64) and initializes the serial console. Step 1 then locates the protocols
+needed for the rest of the boot: it opens the loaded-image and file-system protocols,
+then connects every controller so firmware binds drivers such as virtio-gpu to GOP, and
+only then queries GOP:
 
 - `EFI_LOADED_IMAGE_PROTOCOL` — to find the device handle for the boot volume
 - `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` — to open the EFI System Partition filesystem
 - `EFI_GRAPHICS_OUTPUT_PROTOCOL` — to record the framebuffer, if present
 
-Protocol handles are resolved via `BootServices->HandleProtocol` and
-`BootServices->LocateProtocol`. Failure to locate a required protocol is fatal.
+`EFI_LOADED_IMAGE_PROTOCOL` is opened with `BootServices->OpenProtocol` on the image
+handle, `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` with `BootServices->HandleProtocol` on the device
+handle, and GOP handles are enumerated with `BootServices->LocateHandleBuffer` and opened
+with `HandleProtocol`. Failure to locate either of the first two is fatal; an absent GOP
+is not.
 
 Detail: [uefi-environment.md](uefi-environment.md)
 
@@ -35,11 +42,12 @@ the entire file into one UEFI page allocation. The bundle wire format is
 defined by [`abi/boot-protocol::bundle`](../../../abi/boot-protocol/src/bundle.rs):
 a little-endian header (`SRPHBNDL` magic + version + entry count) followed
 by `entry_count` × `BundleEntryHeader { name, offset, size }` and per-
-entry bodies at 4096-byte aligned offsets. Header validation rejects bad
-magic / version / out-of-bounds offsets / misaligned bodies as
-`BootError::InvalidBundle`; a missing file (`EFI_NOT_FOUND`) is
-`BootError::BundleMissing` — the bundle is load-bearing for every boot
-because init lives inside it.
+entry bodies at 4096-byte aligned offsets. Step 2 rejects only an empty
+file (`BootError::InvalidBundle`); header validation (`bundle::parse_header`,
+at the start of step 4) rejects bad magic / version / out-of-bounds offsets /
+misaligned bodies as `BootError::InvalidBundle`; a file that cannot be opened
+(`EFI_NOT_FOUND` included) is `BootError::FileNotFound` — the bundle is
+load-bearing for every boot because init lives inside it.
 
 The kernel ELF and the bootloader EFI binary itself remain loose files
 on the ESP. Only `\EFI\seraph\kernel`, `\EFI\seraph\bootstrap.bundle`,
@@ -60,8 +68,9 @@ pre-located and validated here (`RELATIVE`-only, every target inside the
 load span) so a later step can apply it. (An `ET_EXEC` kernel is still
 accepted and pinned to slide 0.)
 
-W^X is enforced during loading: any ELF segment requesting both writable
-and executable permissions is a fatal error.
+A kernel segment requesting both writable and executable permissions is not
+rejected here: it is fatal (`BootError::WxViolation`) when step 6 maps it
+([elf-loading.md § LOAD Segment Processing](elf-loading.md#load-segment-processing)).
 
 Detail: [elf-loading.md](elf-loading.md)
 
@@ -86,11 +95,10 @@ bootloader synthesises a
 record directly — there is no per-module allocation or copy because the
 bundle bodies are already 4096-byte aligned within the bundle allocation.
 The bootloader does not inspect module content; what each module does
-and in what order init spawns them is init's concern, and after
-init-protocol v7 init identifies modules by `BootModule.name` rather
-than ordinal position. Typical modules: procmgr, memmgr, devmgr, vfsd,
-virtio-blk, serial, framebuffer, fatfs (the authoritative list is
-`xtask/src/bundle.rs::MODULES`).
+and in what order init spawns them is init's concern
+([elf-loading.md § Boot Module Loading](elf-loading.md#boot-module-loading)). Typical
+modules: procmgr, memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer,
+fatfs (the authoritative list is `xtask/src/bundle.rs::MODULES`).
 
 Only the whole bundle allocation is identity-mapped; module bodies are
 slices of it (see step 6).
@@ -111,20 +119,21 @@ opaque physical addresses (`BootInfo.acpi_rsdp`, `BootInfo.device_tree`); see
 The bootloader extracts two narrow views from the tables discovered here for
 the kernel's own consumption:
 
-- **CPU topology** — MADT `LocalApic` / `RINTC` entries (ACPI) and `/cpus`
-  nodes (DTB) populate `BootInfo.cpu_count`, `bsp_id`, and `cpu_ids`.
+- **CPU topology** — MADT Local APIC / Local x2APIC / `RINTC` entries (ACPI)
+  and `/cpus` nodes (DTB) populate `BootInfo.cpu_count`, `bsp_id`, and `cpu_ids`.
   Derived here in step 5 and written into `BootInfo` in step 9.
 - **`kernel_mmio`** — arch-specific MMIO bases: LAPIC / IOAPIC on x86-64
   (from MADT), PLIC (MADT) / UART (SPCR) on RISC-V, or DTB compatible
   nodes, plus the riscv64 hart facts (`timebase_freq`, `hart_caps`).
   Extracted into `BootInfo` in step 9.
 
-A third extraction produces **seed entries** for `mmio_apertures` —
-coarse `{phys_base, size}` regions the kernel mints as `Mmio`
-capabilities. The seed covers LAPIC / IOAPIC / PLIC / ECAM / BAR
-windows / `virtio,mmio` transports from the firmware tables, plus the GOP
-framebuffer, and is merged with the UEFI memory map's `MemoryMappedIO`
-regions in step 9.
+A third extraction, run in step 9, produces **seed entries** for `mmio_apertures` —
+coarse `{phys_base, size}` regions the kernel mints as `Mmio` capabilities. The seed
+covers LAPIC / IOAPIC / PLIC / CLINT / UART / ECAM / BAR windows / `virtio,mmio`
+transports from the firmware tables, the arch-default PCI apertures the ACPI seeder
+appends, and the GOP framebuffer, and is merged there with the UEFI memory map's
+`MemoryMappedIO` regions (firmware-parsing.md §
+[`mmio_apertures` construction](firmware-parsing.md#mmio_apertures-construction)).
 
 On RISC-V the paging mode is negotiated here, from the DTB `mmu-type` claim and
 a `satp` probe, before step 6 fixes the table hierarchy depth (see
@@ -145,15 +154,15 @@ reported in `BootInfo.ap_trampoline_page`. The below-1 MiB allocation is describ
 The bootloader draws **conditioned early-boot entropy** from UEFI
 `EFI_RNG_PROTOCOL` (`GetRNG`, default algorithm) while boot services are live: a
 32-byte pool seed recorded in `BootInfo.boot_entropy_seed` / `boot_entropy_len`,
-and an independent 16-byte KASLR word (kept separate so neither reveals the other)
-for the image slide and direct-map base. It narrows the kernel's boot-time entropy
-hole before any early consumer draws randomness. The protocol is backed by RDRAND
+and an independent 16-byte KASLR draw (two 64-bit words, kept separate so neither
+reveals the other) for the image slide and direct-map base. It narrows the kernel's
+boot-time entropy hole before any early consumer draws randomness. The protocol is backed by RDRAND
 on x86-64 OVMF and by the firmware's `VirtioRngDxe` driver binding the
 `virtio-rng-pci` device on both arches (the mechanism that gives riscv64 a boot
 seed at all, since its EDK2 exposes no RNG on its own and hands the bootloader ACPI
 rather than a DTB). A DTB `/chosen/rng-seed` reader is a secondary fallback for
 firmware that delivers a DTB: a draw of at least 24 bytes is split, the first 16
-bytes to the KASLR word and the rest to the pool seed, and a shorter draw feeds the
+bytes to the KASLR words and the rest to the pool seed, and a shorter draw feeds the
 pool alone; the property is scrubbed from the blob in place ([dtb.md](dtb.md)). A
 firmware pool draw that succeeds while the separate KASLR draw fails keeps the
 32-byte pool seed and leaves the KASLR entropy absent. When neither source yields
@@ -189,7 +198,7 @@ allocated from UEFI before `ExitBootServices`. The tables map:
 - A read-execute identity map of the handoff trampoline's page or pages, so execution
   continues across the root-table switch
 
-W^X is verified during construction: no PTE has both writable and executable bits.
+W^X is verified during construction: no leaf PTE has both writable and executable permissions.
 
 Detail: [page-tables.md](page-tables.md)
 
@@ -197,9 +206,9 @@ Detail: [page-tables.md](page-tables.md)
 
 The UEFI memory map is queried immediately before `ExitBootServices`. Every UEFI
 allocation performed after the previous query invalidates the map key; this final
-query must be the last allocation-generating action before the exit call. The map is
-translated from UEFI memory types to the `MemoryType` values defined in the boot
-protocol and sorted by `physical_base`, per the policy in
+query must be the last allocation-generating action before the exit call. The raw map
+stays in its buffer; step 9 translates it from UEFI memory types to the `MemoryType`
+values defined in the boot protocol and sorts it by `physical_base`, per the policy in
 [memory-map.md](memory-map.md).
 
 Detail: [uefi-environment.md](uefi-environment.md)
@@ -218,39 +227,40 @@ Detail: [uefi-environment.md](uefi-environment.md)
 ### Step 9: Populate BootInfo
 
 `BootInfo` is populated in-place in a physical memory region allocated before step 8.
-Pointer and resource-address fields hold physical addresses; the only virtual addresses
-are the KASLR-biased `kernel_virtual_base` and `direct_map_base`, which the kernel
-scrubs from this donated page after consuming them. The `version` field is set to
+Pointer and resource-address fields hold physical addresses; `init_image` carries init's
+unbiased link virtual addresses, and the only kernel virtual addresses are the
+KASLR-biased `kernel_virtual_base` and `direct_map_base`, which the kernel scrubs from
+this donated page after consuming them. The `version` field is set to
 `BOOT_PROTOCOL_VERSION` (currently `14`). Fields are populated as follows:
 
 | Field | Source |
 |---|---|
 | `version` | `BOOT_PROTOCOL_VERSION` constant from `boot-protocol` crate |
-| `memory_map` | Translated UEFI memory map from step 7 |
+| `memory_map` | UEFI memory map from step 7 (as re-queried by any step 8 retry), translated and sorted here |
 | `kernel_physical_base` | Physical address of kernel LOAD segments from step 3 |
 | `kernel_virtual_base` | KASLR-biased kernel image virtual base (link base + slide from step 5d) |
 | `kernel_size` | Total span of kernel ELF LOAD segments from step 3 |
 | `init_image` | Pre-parsed init ELF segments and entry point from step 4 |
-| `modules` | Physical base and size of each additional boot module from step 4; empty if none configured |
+| `modules` | Name, physical base, and size of each non-`init` bundle entry from step 4; empty (null `entries`, zero `count`) if none |
 | `framebuffer` | GOP framebuffer from step 1 (zeroed if GOP is absent) |
 | `acpi_rsdp` | Physical address of ACPI RSDP from step 5; zero if GUID absent |
 | `device_tree` | Physical address of DTB from step 5; zero if GUID absent |
-| `kernel_mmio` | Arch-specific MMIO bases and riscv64 hart facts, extracted from the firmware tables discovered in step 5 and written here in step 9 (see `firmware-parsing.md`). MMIO bases the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults; a zero riscv64 `timebase_freq` or missing `hart_caps` bit is fatal at kernel Phase 5. |
+| `kernel_mmio` | Arch-specific MMIO bases and riscv64 hart facts, extracted from the firmware tables discovered in step 5 and written here in step 9 (see [firmware-parsing.md](firmware-parsing.md)). MMIO bases the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults; a zero riscv64 `timebase_freq` or missing `hart_caps` bit is fatal at kernel [Phase 5](../../kernel/docs/initialization.md#phase-5-architecture-hardware-initialisation). |
 | `mmio_apertures` | Coarse `{phys_base, size}` array assembled in step 9 (UEFI MMIO regions merged with the firmware-table and framebuffer seeds). Empty if no MMIO regions were reported. |
-| `cpu_count` | Enabled LAPIC count from MADT (x86-64) or enabled RINTC / DTB hart count (RISC-V); always ≥ 1 |
+| `cpu_count` | Count of enabled or online-capable Local APIC / Local x2APIC entries from MADT (x86-64), capped at `MAX_CPUS`, or enabled RINTC / DTB hart count (RISC-V); always ≥ 1 |
 | `bsp_id` | APIC ID of the BSP (x86-64) or boot hart ID from `EFI_RISCV_BOOT_PROTOCOL` (RISC-V) |
 | `cpu_ids` | Per-CPU hardware identifiers; `cpu_ids[0] == bsp_id`; entries beyond `cpu_count` are zero |
 | `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed; the kernel then halts at Phase 8 when more than one CPU is listed ([initialization.md § Phase 8](../../kernel/docs/initialization.md)). |
-| `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the reclaim-array page itself, the AP trampoline page), `page_table.allocated_frames()` (the bootloader's transient page-table frames), and per-gap carve-outs over the bundle allocation — the header + entry table + leading pad, the init ELF source body (no longer needed after `load_init` copied segments out), and any inter-module or trailing slack pages. Module bodies are skipped here because `cap::mint_module_memory_caps` already mints Memory caps over them; pushing them again would double-register pages in the buddy ledger. Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_memory_caps` inside `populate_cspace`. |
-| `boot_entropy_seed` | Conditioned entropy seed for the pool, drawn from `EFI_RNG_PROTOCOL` (or a DTB `/chosen/rng-seed` fallback) in step 5c; valid for `boot_entropy_len` bytes, remainder zero. Absorbed into the kernel entropy pool at Phase 5 ([entropy.md](../../kernel/docs/entropy.md)). The separate KASLR entropy word never appears in `BootInfo`. |
+| `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the reclaim-array page itself, the AP trampoline page), `page_table.allocated_frames()` (the bootloader's transient page-table frames), and per-gap carve-outs over the bundle allocation — the header + entry table + leading pad, the init ELF source body (no longer needed after `load_init` copied segments out), and any inter-module or trailing slack pages. Module bodies are skipped here because `cap::mint_module_memory_caps` already mints Memory caps over them; pushing them again would double-register pages in the buddy ledger. Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_memory_caps`, which `cap::init_capability_system` calls in Phase 7 after `populate_cspace` returns ([initialization.md § Phase 7](../../kernel/docs/initialization.md#phase-7-capability-system)). |
+| `boot_entropy_seed` | Conditioned entropy seed for the pool, drawn from `EFI_RNG_PROTOCOL` (or a DTB `/chosen/rng-seed` fallback) in step 5c; valid for `boot_entropy_len` bytes, remainder zero. Absorbed into the kernel entropy pool at Phase 5 ([entropy.md](../../kernel/docs/entropy.md)). The separate KASLR entropy words never appear in `BootInfo`. |
 | `boot_entropy_len` | Valid leading byte count of `boot_entropy_seed`; zero when neither source yields a seed, in which case the kernel seeds from its remaining sources. |
 | `vmgenid_paddr` | Physical address of the 16-byte ACPI VMGENID GUID (QEMU VMGENID SSDT scan in step 9, run wherever an RSDP is present; only x86-64 QEMU wires the device today; see [firmware-parsing.md](firmware-parsing.md)); zero when absent. |
 | `direct_map_base` | KASLR-chosen direct-map virtual base — a 1 GiB-aligned base at or above the paging mode's kernel-half floor, chosen in step 9 from the KASLR entropy and the final memory map. A KASLR secret; the kernel scrubs it at Phase 5, after its Phase-3 consumers have run. |
 | `kaslr_flags` | `KASLR_*` status bits: which layout dimensions were randomized, the entropy source, and any skip reason (knob / window-limited); `KASLR_IMAGE_RANDOMIZED` marks a slide drawn from entropy whichever slot it selected, so an `ET_EXEC` image with entropy carries its source bits with that bit clear. Zero means an entirely un-randomized layout. |
 
-All arrays pointed to by `BootInfo` fields reside in physical memory that the UEFI
-memory map marks as `Loaded` or `Usable`, ensuring they survive until the kernel
-reclaims or remaps them ([memory-map.md](memory-map.md)).
+All arrays pointed to by `BootInfo` fields reside in bootloader `EfiLoaderData`
+allocations, which the translated memory map marks as `Loaded`, ensuring they survive
+until the kernel reclaims or remaps them ([memory-map.md](memory-map.md)).
 
 ### Step 10: Kernel Handoff
 
@@ -276,7 +286,7 @@ reclaim before reading all fields. In practice this means placing it in a range 
 memory map marks as `Loaded`, which the kernel treats as in-use until it explicitly
 chooses to reclaim it ([memory-map.md](memory-map.md)).
 
-Slices within `BootInfo` (`memory_map`, `modules`, `mmio_apertures`) point to
+Slices within `BootInfo` (`memory_map`, `modules`, `mmio_apertures`, `reclaim_ranges`) point to
 separately allocated physical regions. These regions must also remain readable until
 the kernel has consumed them.
 
@@ -285,9 +295,10 @@ the kernel has consumed them.
 ## Summarized By
 
 [core/boot/README.md](../README.md), [ACPI Parsing](acpi.md), [Early Console](console.md),
-[ELF Loading](elf-loading.md), [Firmware Parsing](firmware-parsing.md),
-[Memory Map Translation](memory-map.md), [Page Tables](page-tables.md),
-[UEFI Environment](uefi-environment.md), [Kernel Entropy Subsystem](../../kernel/docs/entropy.md),
+[Device Tree Parsing](dtb.md), [ELF Loading](elf-loading.md),
+[Firmware Parsing](firmware-parsing.md), [Memory Map Translation](memory-map.md),
+[Page Tables](page-tables.md), [UEFI Environment](uefi-environment.md),
+[Kernel Entropy Subsystem](../../kernel/docs/entropy.md),
 [Kernel Initialization Sequence](../../kernel/docs/initialization.md),
 [Architecture Overview](../../../docs/architecture.md),
 [System Bootstrap](../../../docs/bootstrap.md), [xtask/README.md](../../../xtask/README.md)

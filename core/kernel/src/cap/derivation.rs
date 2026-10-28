@@ -6,11 +6,16 @@
 //! Global derivation tree lock and tree manipulation.
 //!
 //! The derivation tree tracks parent/child relationships between capability
-//! slots across all `CSpaces.` All mutations require the write lock; traversals
-//! require the read lock.
+//! slots across all `CSpace`s. Every walk and edit holds the write lock;
+//! the read side is unused (core/kernel/docs/capability-internals.md
+//! § Global Derivation Lock).
 //!
-//! The lock is spin-based: sufficient for single-threaded boot and
-//! forward-compatible with SMP — no changes to call sites when SMP is added.
+//! The lock is a global spin reader-writer lock that serialises
+//! derivation-tree edits across CPUs; the contexts that take it and its
+//! place in the lock order are defined in
+//! core/kernel/docs/capability-internals.md § Global Derivation Lock.
+//!
+//! Design: [capability-internals.md](../../docs/capability-internals.md) § Derivation Tree.
 //!
 //! ## State encoding
 //!
@@ -26,17 +31,18 @@
 //! - `deriv_next_sibling` / `deriv_prev_sibling`: intrusive doubly-linked list
 //!   of slots derived from the same parent
 //!
-//! When `tag == Null`, `deriv_parent` and `deriv_first_child` are repurposed
-//! for the free list (successor and predecessor); do not read derivation
-//! fields on Null slots — every derivation-field access here resolves
-//! through the occupancy gate in `resolve_slot_mut`. (`unlink_free_collect`
-//! reaches its slot directly for the free itself, on an id the revoke walk
-//! has already gated.)
+//! On a Null slot the derivation fields hold free-list state
+//! (core/kernel/docs/capability-internals.md § Free Slot Tracking); do not
+//! read derivation fields on Null slots — every derivation-field access here
+//! resolves through the occupancy gate in `resolve_slot_mut`.
+//! (`unlink_free_collect` reaches its slot directly for the free itself, on
+//! an id the revoke walk has already gated.)
 //!
 //! ## Adding new operations
 //!
 //! All functions here assume `DERIVATION_LOCK` write lock is held by the caller.
-//! Resolve `SlotIds` via [`crate::cap::lookup_cspace`].
+//! Resolve `SlotId`s via `resolve_slot_mut`, which applies the occupancy
+//! gate on top of [`crate::cap::lookup_cspace`].
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -48,9 +54,11 @@ const WRITE_LOCKED: u32 = u32::MAX;
 
 /// Shared derivation tree lock.
 ///
-/// Acquire before reading or modifying any slot's `deriv_*` fields across
-/// `CSpace` boundaries. Within a single `CSpace`, the `CSpace`'s own lock (future
-/// phases) is sufficient.
+/// Acquire for writing before reading or modifying the `deriv_*` fields of
+/// any occupied slot, in any `CSpace`; the `CSpace` spinlock guards slot
+/// occupancy and the free list instead (see the lock-domain split on
+/// `CSpace` and core/kernel/docs/capability-internals.md § Global Derivation
+/// Lock).
 pub static DERIVATION_LOCK: DerivationLock = DerivationLock::new();
 
 /// Spin-based reader/writer lock protecting the capability derivation tree.
@@ -109,10 +117,13 @@ impl DerivationLock
     ///
     /// Multiple readers may hold the lock simultaneously. Blocks writers.
     ///
-    /// Currently unused: all derivation operations take an exclusive write
-    /// lock. Read-locking is reserved for SMP — concurrent cap-lookup
-    /// traversals (read-only) will share this lock instead of serialising.
-    #[allow(dead_code)]
+    /// Unused outside the host tests: every derivation path takes the write
+    /// lock, and lock-free readers resolve one slot by handle without
+    /// traversing the tree (core/kernel/docs/capability-internals.md § Global
+    /// Derivation Lock).
+    // dead_code: only the host tests take the read side and no kernel path
+    // does, so the lint fires in non-test kernel builds alone.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn read_lock(&self)
     {
         loop
@@ -132,7 +143,9 @@ impl DerivationLock
     }
 
     /// Release a shared read lock previously acquired with [`read_lock`].
-    #[allow(dead_code)]
+    // dead_code: only the host tests take the read side and no kernel path
+    // does, so the lint fires in non-test kernel builds alone.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn read_unlock(&self)
     {
         self.state.fetch_sub(1, Ordering::Release);
@@ -224,15 +237,13 @@ pub(crate) unsafe fn resolve_slot_mut(
     let cs = unsafe { &mut *cs_ptr };
     let slot = cs.slot_mut(id.index.get())?;
     // Occupancy gate: a Null slot is not a derivation node — its `deriv_*`
-    // fields are free-list state (successor in `deriv_parent`, predecessor
-    // in `deriv_first_child`), which a derivation-side write would corrupt
+    // fields are free-list state (core/kernel/docs/capability-internals.md
+    // § Free Slot Tracking), which a derivation-side write would corrupt
     // into handing out an occupied slot. A stale `SlotId` naming a freed
-    // slot (e.g. `link_child` after an unlocked source resolution raced a
-    // concurrent delete) resolves to `None` and the caller skips the edit.
-    // The gate is stable under `DERIVATION_LOCK`: every occupied-to-free
-    // transition happens with the lock held (delete, revoke's
-    // `unlink_free_collect`, the teardown drain, the split consume/rollback
-    // paths, and the memory-merge tail release).
+    // slot resolves to `None` and the caller skips the edit. The gate is
+    // stable under `DERIVATION_LOCK` because every occupied-to-free
+    // transition holds it (core/kernel/docs/capability-internals.md § Global
+    // Derivation Lock).
     if slot.is_null()
     {
         return None;
@@ -375,15 +386,12 @@ pub unsafe fn unlink_node(node: SlotId)
 }
 
 /// Maximum children re-linked per [`reparent_children`] call — the batch
-/// size for `SYS_CAP_DELETE` and the range splits, which move a consumed
-/// slot's children under its parent. Same bound and rationale as
-/// [`MAX_REVOKE_EDITS`]: any slot can have been derived from up to the
-/// structural ceiling of every `CSpace`, and that walk must not hold the
-/// derivation lock end to end. The one walk that does is a range split's
-/// rollback of a child it inserted in the same call (`split.rs`,
-/// `rollback_child`): it covers only what a sibling derived from that child
-/// inside one lock-release window, nothing can extend the list under the
-/// lock, and it must complete atomically with the child's free.
+/// size for `SYS_CAP_DELETE` and the range splits (a consumed slot's
+/// children move under its parent) and for `SYS_CAP_MOVE` and IPC transfer
+/// (the source's children move under the destination). The bound and its
+/// rationale are defined in core/kernel/docs/capability-internals.md
+/// § Revocation Algorithm and § Move. The one walk that holds the lock end
+/// to end is `split::rollback_child`, whose rustdoc gives the reason.
 pub const MAX_REPARENT_EDITS: usize = MAX_REVOKE_EDITS;
 
 /// Liveness backstop for the callers' [`reparent_children`] loops: more
@@ -398,8 +406,10 @@ pub const MAX_REPARENT_BATCHES: u32 = 1 << 20;
 /// left, `false` when the budget ran out with children remaining — the
 /// caller releases `DERIVATION_LOCK`, revalidates `node`, and calls again.
 ///
-/// Used by `SYS_CAP_DELETE` and the range splits so grandchildren remain
-/// revocable by the grandparent after the intermediate slot is consumed.
+/// Used by `SYS_CAP_DELETE` and the range splits, so grandchildren remain
+/// revocable by the grandparent after the intermediate slot is consumed,
+/// and by `SYS_CAP_MOVE` and IPC transfer to migrate the source's children
+/// under the destination (core/kernel/docs/capability-internals.md § Move).
 /// Each child is detached into a clean derivation root by [`unlink_node`]
 /// and then re-linked by [`link_child`], which is all-or-nothing: a
 /// `new_parent` that fails to resolve leaves the child a root rather than
@@ -488,11 +498,12 @@ pub enum BatchStatus
     /// releasing the lock, deallocating the collected objects, and
     /// revalidating the root.
     MoreWork,
-    /// A derivation link failed to resolve — genuine corruption, or the
-    /// narrow teardown self-race the pre-unregister drain documents (the
-    /// dying process wiring a link during its own drain window). The
-    /// dangling chain was truncated for containment; the
-    /// caller must surface an error rather than report a clean revoke.
+    /// A derivation link failed to resolve — genuine corruption, or a foreign
+    /// sender's capability transfer that committed into a dying `CSpace`
+    /// before its receiver was stopped (core/kernel/docs/capability-internals.md
+    /// § Revocation Algorithm). The dangling chain was truncated for
+    /// containment; the caller must surface an error rather than report a
+    /// clean revoke.
     DeadLink,
 }
 
@@ -501,29 +512,11 @@ pub enum BatchStatus
 /// `dec_ref`/deallocate outside the lock, and how the batch ended.
 ///
 /// The root slot itself is NOT touched. On [`BatchStatus::MoreWork`] the
-/// caller must call again (re-acquiring the lock and revalidating the root
-/// in between); such a call performed exactly [`MAX_REVOKE_EDITS`] edits,
-/// and clearing a subtree of N nodes needs at most 2N edits in total (each
-/// node is hoisted at most once and freed exactly once), so repeated calls
-/// terminate against any fixed subtree in O(N) total work. Nodes derived
-/// concurrently between batches are still cleared, because the walk only
-/// ever operates on root's current child list.
-///
-/// Each edit acts on the head `H` of root's child list in O(1):
-///
-/// - `H` has a child: unlink that child and re-link it directly under root
-///   (a *hoist* — it becomes the new list head, ahead of `H`).
-/// - `H` is childless: unlink it, free its slot, collect its object.
-///
-/// Hoisting flattens the subtree in place: while a multi-batch revoke is in
-/// flight, surviving descendants may temporarily appear as direct children
-/// of root. They remain descendants of root and of every ancestor above it,
-/// so ancestor revocation reach is preserved; intermediate parent→child
-/// edges inside the subtree are destroyed as the flattening proceeds, which
-/// is why the syscall pins the root against delete/move for the whole
-/// multi-batch operation (see `CapabilitySlot::pinned`) — an
-/// abandoned half-flattened subtree would otherwise permanently outlive the
-/// intermediate holders' revocation authority.
+/// caller must call again, re-acquiring the lock and revalidating the root
+/// in between. The edit algorithm, its O(N) termination bound, and why the
+/// syscall pins the root across batches (`CapabilitySlot::pinned`) are
+/// defined in core/kernel/docs/capability-internals.md § Revocation
+/// Algorithm.
 ///
 /// The returned slice borrows from [`REVOKE_OBJECTS`]; the caller must
 /// finish consuming it before any other call. The `DERIVATION_LOCK` held
@@ -532,14 +525,10 @@ pub enum BatchStatus
 /// # Safety
 ///
 /// Caller must hold `DERIVATION_LOCK` write lock. Derivation links
-/// reachable from a live slot resolve — `drain_dying_cspace_batch` unlinks
-/// every dying slot from the forest before a `CSpace` unregisters, save
-/// for the narrow teardown self-race window it documents (the dying
-/// process wiring a link during its own drain). A link that fails to
-/// resolve — vanished `CSpace`, or a Null slot still chained into the tree
-/// (every free unlinks first under this lock, so that is corruption) — is
-/// contained either way: the walk truncates the chain hanging from it,
-/// logs it, and reports [`BatchStatus::DeadLink`].
+/// reachable from a live slot resolve, save for the dead-link sources
+/// core/kernel/docs/capability-internals.md § Revocation Algorithm names; a
+/// link that fails to resolve is contained: the walk truncates the chain
+/// hanging from it, logs it, and reports [`BatchStatus::DeadLink`].
 pub unsafe fn revoke_subtree_batch(
     root: SlotId,
 ) -> (&'static [Option<NonNull<KernelObjectHeader>>], BatchStatus)
@@ -620,12 +609,12 @@ pub unsafe fn revoke_subtree_batch(
 /// Cutting the whole chain is the tightest containment available: the dead
 /// node's sibling links lived in storage reclaimed with its `CSpace`, so
 /// the rest of the chain cannot be located to splice past it. Any live
-/// nodes chained behind the dead link are abandoned — which is why the
-/// revoke walk reports [`BatchStatus::DeadLink`] and its syscall surfaces
-/// an error instead of claiming a clean revoke; the reparent walk has no
-/// status to report and completes with the chain abandoned, and its
-/// callers then free `owner` — `SYS_CAP_DELETE` and the range splits the
-/// slot, the teardown drain the whole owning `CSpace`.
+/// nodes chained behind the dead link are abandoned. How each walk
+/// reports and recovers from this — the revoke walk's `DeadLink` error, the
+/// reparent walk (delete, the range splits, and move) completing before its
+/// caller frees `owner`, and the teardown drain cutting through its own
+/// head pop — is defined in core/kernel/docs/capability-internals.md
+/// § Revocation Algorithm.
 ///
 /// An abandoned node keeps its `deriv_parent` (naming `owner`) and sibling
 /// links, so it is outside every ancestor's revoke reach from here on, and
@@ -672,7 +661,8 @@ unsafe fn unlink_free_collect(id: SlotId) -> Option<NonNull<KernelObjectHeader>>
 
     // Take cspace.lock around the slot read + free_slot so the freelist
     // mutation cannot tear against a concurrent SYS_CAP_CREATE_* on the
-    // same cspace. Lock order: DERIVATION_LOCK → cspace.lock.
+    // same cspace; it nests inside DERIVATION_LOCK
+    // (core/kernel/docs/scheduling-internals.md § Lock Hierarchy).
     // SAFETY: cspace registry lookup validated; CSpace pointer lives as
     // long as the registry entry; lock_raw/unlock_raw paired.
     let saved = unsafe { (*cs_ptr).lock.lock_raw() };

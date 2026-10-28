@@ -13,9 +13,10 @@
 //! `BlockedOnReply` with `blocked_on_object = server TCB` and the server records
 //! `reply_tcb = client`. If the server is then torn down without replying,
 //! `cap_delete(server)` → `dealloc_object(Thread)` is the sole path that
-//! releases the orphaned client: it CAS-claims `reply_tcb`, deposits an
-//! `Interrupted` disposition, and *defers* the client's wake past the all-CPU
-//! locks region through the gated `enqueue_and_wake` (see
+//! releases the orphaned client, by the deferred reply-wake defined in
+//! [thread-lifecycle-and-sleep.md](../../../kernel/docs/thread-lifecycle-and-sleep.md)
+//! § `dealloc_object(Thread)` Drain Protocol (steps 5 and 10) and
+//! § `BlockedOnReply` Edge — Symmetry Rules (actor 6; implemented in
 //! `core/kernel/src/cap/object.rs`, the Thread arm's `server_reply_wake`). The
 //! server's own `thread_exit` does **not** wake the client — only the dealloc
 //! does.

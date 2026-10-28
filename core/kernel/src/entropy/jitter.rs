@@ -5,8 +5,10 @@
 
 //! Per-CPU jitter entropy accumulator.
 //!
-//! Timing jitter is the always-available entropy source and the *only* source
-//! on platforms without a hardware RNG (riscv64 under default firmware). Each
+//! Timing jitter is the always-available entropy source and the only
+//! runtime source on platforms without a hardware RNG (riscv64, where any
+//! firmware boot seed is absorbed at boot only; see
+//! [entropy.md](../../docs/entropy.md) § Sources and graceful degradation). Each
 //! CPU folds cycle-counter samples — taken at distinct event classes (per-tick,
 //! per-IRQ) — into a small per-CPU buffer at interrupt time: allocation-free
 //! and lock-free, as required of interrupt context. The buffer is folded into
@@ -44,7 +46,8 @@ struct Acc
 
 static ACC_PTR: AtomicPtr<Acc> = AtomicPtr::new(core::ptr::null_mut());
 
-/// Allocate the per-CPU accumulator slab. Called once from `init_storage`.
+/// Allocate the per-CPU accumulator slab. Called once from
+/// `entropy::init_storage` (Phase 4).
 pub fn init_storage(cpu_count: usize, allocator: &mut BuddyAllocator)
 {
     let bytes = cpu_count * core::mem::size_of::<Acc>();

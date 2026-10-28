@@ -3,11 +3,9 @@
 
 // core/kernel/src/arch/mod.rs
 
-//! Architecture dispatch module.
-//!
-//! This is the **only** file in the kernel permitted to contain
-//! `#[cfg(target_arch)]` guards. All other modules access architecture-specific
-//! functionality through the `arch::current` re-export.
+//! Architecture dispatch module: selects the active architecture's module as
+//! `current` (see `docs/coding-standards.md` § C. Architecture Invariants and
+//! `core/kernel/docs/arch-interface.md`).
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]

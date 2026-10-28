@@ -15,21 +15,17 @@
 //! and stop every thread bound to a dying `CSpace` or `AddressSpace`
 //! (`sched::stop_threads_bound_to`).
 //!
-//! [`THREAD_REGISTRY_LOCK`] is never taken under a `sched_lock`, a run-queue
-//! lock, an IPC-source lock, or `SLEEP_LIST_LOCK`; the teardown walk takes
-//! all of those under it (`cancel_ipc_block` takes the source lock, then
-//! `SLEEP_LIST_LOCK` alone for a timed waiter), so the only lock-order edges
-//! it adds are registry → IPC source → `sched_lock` → run-queue locks and
-//! registry → `SLEEP_LIST_LOCK`. The lock is held with interrupts disabled
-//! and must not be held while waiting for another CPU to make progress: a
-//! CPU spinning on it inside [`register`] cannot deschedule.
+//! [`THREAD_REGISTRY_LOCK`] sits above every IPC-source, `SLEEP_LIST_LOCK`,
+//! `sched_lock`, and run-queue lock; its ordering and the rule that it is never
+//! held while waiting on another CPU's progress are specified in
+//! core/kernel/docs/scheduling-internals.md § Lock Hierarchy, rule 3.
 //!
 //! Neither walk is length-bounded — a registry holds as many threads as
 //! memory backs. A list corrupted into a cycle is detected by a
 //! tortoise-and-hare probe: the watchdog walk stops there (it is already
 //! inside a fatal stall dump), the teardown walk halts the kernel, since a
 //! thread it cannot enumerate could still be running on the object being
-//! freed. See docs/scheduling-internals.md § Thread Registry.
+//! freed. See core/kernel/docs/scheduling-internals.md § Thread Registry.
 
 #![cfg(not(test))]
 

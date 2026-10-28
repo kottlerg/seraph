@@ -222,9 +222,10 @@ port range (see
 port, only to a caller whose badge carries `SHUTDOWN_DEVICE_AUTHORITY`: the seed-only
 `devmgr.shutdown` cap, which pwrmgr alone seeds and svcmgr's `QUERY_ENDPOINT` refuses.
 
-Revoking an IoPort capability removes port access from all threads it has
-been bound to; the kernel tracks bindings and updates each affected thread's IOPB
-in the TSS on revocation (design intent; not yet implemented — `SYS_IOPORT_BIND`
+Revoking an IoPort capability is intended to remove port access from every thread
+bound through its descendants (the revoked capability itself is preserved, per
+[Revocation](#revocation)); the kernel tracking bindings and updating each affected
+thread's IOPB in the TSS on revocation is design intent (not yet implemented — `SYS_IOPORT_BIND`
 records no binding and revocation does not withdraw bound IOPB access, #457).
 
 ### SbiControl (RISC-V only)
@@ -523,7 +524,7 @@ hazard. See [capability-internals.md](../core/kernel/docs/capability-internals.m
 so the object is not pinned while a holder's syscall still dereferences it — a known kernel
 memory-safety defect (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
-§ Storage: Hybrid Two-Level Radix, [#443](https://github.com/kottlerg/seraph/issues/443)).
+§ Storage: Hybrid Two-Level Radix, [#502](https://github.com/kottlerg/seraph/issues/502)).
 
 
 ---
@@ -705,7 +706,8 @@ before the object's storage is reclaimed, wherever those threads' own capabiliti
 including the deleting thread itself, when it holds that last capability to its own `CSpace` or
 `AddressSpace` (the delete then never returns to it). The process's resources are reclaimed as their
 capability reference counts reach zero. This path has known kernel memory-safety gaps, tracked in
-[#443](https://github.com/kottlerg/seraph/issues/443) (see
+[#501](https://github.com/kottlerg/seraph/issues/501) and
+[#502](https://github.com/kottlerg/seraph/issues/502) (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
 § Storage: Hybrid Two-Level Radix,
 [thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
@@ -752,6 +754,7 @@ The kernel does not provide:
 ## Summarized By
 
 [abi/process-abi/README.md](../abi/process-abi/README.md),
+[Firmware Parsing](../core/boot/docs/firmware-parsing.md),
 [Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Scheduler Internals](../core/kernel/docs/scheduler.md),

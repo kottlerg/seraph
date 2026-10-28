@@ -70,8 +70,8 @@ pub fn trampoline_page_range() -> (u64, u64)
 /// loads the `BootInfo` argument, and jumps to the kernel entry point.
 ///
 /// The trampoline page must be identity-mapped RX in the new page tables
-/// before calling this function (see [`trampoline_page_range`] and the
-/// caller in `main.rs`).
+/// before calling this function (see [`trampoline_page_range`] and
+/// `install_handoff_trampoline_mapping` in `core/boot/src/main.rs`).
 ///
 /// `_boot_hart_id` is unused on x86-64 (RISC-V-only concept); accepted for
 /// API symmetry with the RISC-V handoff.

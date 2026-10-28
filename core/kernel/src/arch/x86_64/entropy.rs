@@ -8,8 +8,8 @@
 //! Hardware RNG via RDSEED (a conditioned seed, preferred for seeding a
 //! CSPRNG) with an RDRAND fallback, gated on CPUID support; plus the raw cycle
 //! counter (TSC) used for jitter sampling. Part of the `arch::current` entropy
-//! contract; the RISC-V counterpart in `arch/riscv64/entropy.rs` exposes the
-//! same signatures.
+//! contract; the RISC-V counterpart in `core/kernel/src/arch/riscv64/entropy.rs`
+//! exposes the same signatures.
 
 use super::cpu::cpuid;
 

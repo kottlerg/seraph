@@ -10,10 +10,11 @@
 //! lock is held.
 //!
 //! # Interface
-//! Use `lock_raw` / `unlock_raw` exclusively. RAII guard support is intentionally
-//! omitted: all current lock sites acquire the lock via `lock_raw` so that the
-//! borrow of the containing struct ends before other fields are mutated inside the
-//! critical section.
+//! Acquire with `lock_raw` (or `try_lock_raw` to take a lock out of order) and
+//! release with `unlock_raw` (or `release_lock_only` then `restore_interrupts_from`
+//! where interrupts must stay disabled past the release). RAII guard support is
+//! intentionally omitted so that the borrow of the containing struct ends before
+//! other fields are mutated inside the critical section.
 //!
 //! # Adding new primitives
 //! Place reader-writer locks, semaphores, etc. as additional `pub mod` entries
@@ -108,9 +109,10 @@ impl Spinlock
     /// caller. Returns `None`, with interrupt state left unchanged, if the lock
     /// was contended. Never blocks.
     ///
-    /// Lets a caller acquire a lock out of the canonical lock order without
+    /// Lets a caller acquire a lock out of the canonical order
+    /// (`core/kernel/docs/scheduling-internals.md` § Lock Hierarchy) without
     /// deadlock risk: a `None` return means a canonical holder is in flight, so
-    /// the caller backs off rather than waiting (which would close an ABBA cycle).
+    /// the caller backs off rather than waiting.
     ///
     /// # Safety
     /// On `Some`, the returned `u64` must be passed verbatim to `unlock_raw`.

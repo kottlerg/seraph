@@ -16,8 +16,8 @@
 //! - Child B (elevated priority, 20): signals "ran" immediately and exits.
 //!
 //! Verification: the parent unblocks on B's "ran" notification well before A's
-//! spinner finishes. Slack: B should arrive within ~5 timer ticks worth
-//! of wall time of being made runnable. Skipped if no `SchedControl` cap
+//! spinner finishes. Slack: B must arrive within `PREEMPT_BUDGET_US` of wall
+//! time of being made runnable. Skipped if no `SchedControl` cap
 //! exists in the initial cap set (no elevation path).
 
 use syscall::{
@@ -41,8 +41,8 @@ const PREEMPT_BUDGET_US: u64 = 100_000;
 static mut HOG_STACK: ChildStack = ChildStack::ZERO;
 static mut ELEVATED_STACK: ChildStack = ChildStack::ZERO;
 
-/// Hog: spin `SPIN_ITERS` times and post `done_bit` (low 32 bits) on
-/// `done_slot` (high 32 bits).
+/// Hog: spin `SPIN_ITERS` times and post `done_bit` (high 32 bits) on
+/// `done_slot` (low 32 bits).
 // cast_possible_truncation: slot indices are < 2^32.
 #[allow(clippy::cast_possible_truncation)]
 fn hog_entry(arg: u64) -> !
@@ -65,8 +65,8 @@ fn hog_entry(arg: u64) -> !
     thread_exit();
 }
 
-/// Elevated: immediately post `done_bit` (low 32 bits) on `done_slot`
-/// (high 32 bits) and exit.
+/// Elevated: immediately post `done_bit` (high 32 bits) on `done_slot`
+/// (low 32 bits) and exit.
 // cast_possible_truncation: slot indices are < 2^32.
 #[allow(clippy::cast_possible_truncation)]
 fn elevated_entry(arg: u64) -> !

@@ -43,7 +43,19 @@ fault kinds: `SYS_THREAD_SET_FAULT_HANDLER`, the per-thread fault-handler bindin
 alignment, divide, …), and the [resume and kill](#delivery-resume-and-kill) state machine —
 including register inspection and modification of a fault-blocked thread via
 [`SYS_THREAD_READ_REGS`/`SYS_THREAD_WRITE_REGS`](capability-model.md#thread). A thread with
-no handler bound is still terminated, the behavior for all faults absent this mechanism.
+no handler bound is still terminated, the behavior for all faults absent this mechanism. The
+x86-64 abort vectors (`#DF`, `#MC`) and a hardware NMI that finds no watchdog backtrace request
+pending (see
+[scheduling-internals.md § `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`](../core/kernel/docs/scheduling-internals.md#ipi_nmi_backtrace_stub--ipi_nmi_backtrace_handler))
+are the exception: they are never delivered to a handler and never terminate a thread; they halt
+the CPU they arrive on, whatever ring they interrupt. The interrupted thread stays `current` on the
+halted CPU and no death event is posted for it; a teardown of it does not complete (see
+[thread-lifecycle-and-sleep.md § `dealloc_object(Thread)` Drain Protocol](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol),
+invariant 3), a stop of it does not return through its drain until a teardown commits `Exited`
+over it (see
+[§ `sys_thread_stop` Cross-CPU Stop Protocol](../core/kernel/docs/thread-lifecycle-and-sleep.md#sys_thread_stop-cross-cpu-stop-protocol),
+invariant 3), and the other CPUs run on until one needs the halted CPU. A halt of the boot CPU
+also ends sleep-list servicing, which runs only there, so no timeout wakes on any CPU.
 
 The demand-paging consumer is implemented: memmgr acts as the pager, procmgr binds it for
 every ordinary process it creates (demand paging is the default; a process opts out with the
@@ -81,12 +93,14 @@ own (e.g. an access to an unmapped page that is not a stale-TLB artifact), the k
 4. On reply, resumes the faulting thread, which re-executes the faulting instruction (or
    continues from a handler-modified instruction pointer).
 
-If the thread has **no** fault handler bound, the fault is terminal: the thread is killed
-with exit reason `EXIT_FAULT_BASE + <fault code>`, the behavior for all faults absent this
-mechanism. Voluntary exit codes occupy the disjoint range `[1, EXIT_FAULT_BASE)` below it
-(see [Process Lifecycle](process-lifecycle.md#exit-reason)), so a fault reason and a
-voluntary exit code can never alias; `ExitStatus::success()`/`code()` distinguish them
-without ambiguity.
+If the thread has **no** fault handler bound, the fault is terminal: the thread is killed with exit
+reason `EXIT_FAULT_BASE + <fault code>`, the behavior for all faults absent this mechanism. On
+x86-64, `#DF`, `#MC`, and a hardware NMI that finds no watchdog backtrace request pending are not
+the thread's faults: they are never delivered to a handler, record no exit reason, and halt the CPU
+they arrive on whatever ring they interrupt, leaving the interrupted thread `current` there with no
+death event posted. Voluntary exit codes occupy the disjoint range `[1, EXIT_FAULT_BASE)` below it
+(see [Process Lifecycle](process-lifecycle.md#exit-reason)), so a fault reason and a voluntary exit
+code can never alias; `ExitStatus::success()`/`code()` distinguish them without ambiguity.
 
 Fault delivery reuses the synchronous IPC machinery of [IPC Design](ipc-design.md): the
 suspended thread occupies the same role as a caller blocked awaiting a reply, and the
@@ -109,7 +123,7 @@ capability type. The binding is per-thread kernel state: the bound endpoint and 
   Binding takes a reference on the endpoint object for the lifetime of the binding (see
   [Liveness](#liveness)); unbinding releases it. Neither the thread lookup nor the endpoint
   lookup takes a reference on its object, so neither object is pinned while the binding is
-  written (a known defect tracked in [#443](https://github.com/kottlerg/seraph/issues/443); see
+  written (a known defect tracked in [#502](https://github.com/kottlerg/seraph/issues/502); see
   [capability-internals.md § Storage: Hybrid Two-Level Radix](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)).
 - `badge` is a caller-chosen value delivered as the fault message badge. It identifies the
   faulting thread (or its process) to the handler only if no other binder can reach the
@@ -230,7 +244,7 @@ The kernel ignores reply data words. The reply **label** conveys disposition:
    rebind, or thread destruction. This holds only once the reference is taken: neither the
    thread nor the endpoint is pinned while the binding is written (see
    [Fault-Handler Binding](#fault-handler-binding);
-   [#443](https://github.com/kottlerg/seraph/issues/443)).
+   [#502](https://github.com/kottlerg/seraph/issues/502)).
 2. Destruction of the handler thread (deletion of the last capability to its Thread object)
    releases any fault-blocked thread awaiting that handler, killing it (the
    [Kill](#delivery-resume-and-kill) path), as does a later receive on the handler thread while

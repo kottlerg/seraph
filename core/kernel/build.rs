@@ -7,9 +7,12 @@
 
 fn main()
 {
-    // SAFETY: Cargo guarantees these environment variables exist during build
+    // unwrap_used: Cargo sets TARGET for every build script; its absence is a
+    // toolchain bug, not a runtime condition.
     #[allow(clippy::unwrap_used)]
     let target = std::env::var("TARGET").unwrap();
+    // unwrap_used: Cargo sets CARGO_MANIFEST_DIR for every build script; its
+    // absence is a toolchain bug, not a runtime condition.
     #[allow(clippy::unwrap_used)]
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
 

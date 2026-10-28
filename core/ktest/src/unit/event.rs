@@ -7,8 +7,10 @@
 //!
 //! Covers: `SYS_CAP_CREATE_EVENT_Q`, `SYS_EVENT_POST`, `SYS_EVENT_RECV`.
 //!
-//! All tests are single-threaded — `event_post` is non-blocking and `event_recv`
-//! blocks only when the queue is empty. We pre-fill queues before receiving.
+//! `event_post` is non-blocking and `event_recv` blocks only when the queue is
+//! empty. Most tests are single-threaded and pre-fill the queue before
+//! receiving; the blocking-path and timeout tests start a child thread that
+//! receives or posts while the queue is empty.
 
 use syscall::{
     cap_copy, cap_create_notification, cap_delete, event_post, event_queue_create, event_recv,
@@ -97,8 +99,8 @@ pub fn queue_full_err(ctx: &TestContext) -> TestResult
 /// `event_recv` on an empty queue blocks; a subsequent `event_post` wakes it.
 ///
 /// A child thread calls `event_recv` on an initially empty queue. The main
-/// thread yields once to let the child block, then posts 0x42. The child
-/// verifies the received payload and reports it back via a notification.
+/// thread sleeps to let the child block, then posts 0x42. The child sends the
+/// received payload back via a notification and the main thread checks it.
 pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
 {
     let eq = event_queue_create(ctx.memory_base, 4).map_err(|_| "event_queue_create failed")?;
@@ -258,7 +260,8 @@ pub fn recv_timeout_payload_zero_wins(ctx: &TestContext) -> TestResult
         .map_err(|_| "event_queue_create for zero-payload test failed")?;
     let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
-    // Encode the post payload as 0; the child will sleep ~10 ms, then post 0.
+    // The child's entry sleeps ~10 ms, then posts payload 0; arg carries only
+    // its queue slot.
     let child_arg = u64::from(child_eq);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_ZERO_PAYLOAD_STACK));

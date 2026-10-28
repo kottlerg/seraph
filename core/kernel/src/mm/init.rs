@@ -5,8 +5,9 @@
 
 //! Physical memory initialization.
 //!
-//! Parses the boot-time memory map from [`BootInfo`], subtracts all reserved
-//! regions (kernel image, init segments, boot modules, `BootInfo` struct), and
+//! Parses the boot-time memory map from [`BootInfo`], subtracts the boot
+//! payload's frames (kernel image, init segments, boot modules, `BootInfo`
+//! struct, AP trampoline page, DTB blob), and
 //! populates a caller-supplied [`BuddyAllocator`] with the surviving ranges.
 //!
 //! The allocator is passed by mutable reference rather than returned by value
@@ -99,10 +100,10 @@ pub fn system_ram_bytes() -> u64
 
 /// Print the physical memory map from the bootloader to the serial console.
 ///
-/// Iterates all entries in `info.memory_map`, printing address range, size in
-/// KiB, and memory type for each entry. Prints a summary line with usable and
-/// total RAM in MiB at the end. Records the DRAM total for
-/// [`system_ram_bytes`].
+/// Prints one line per run of contiguous same-type entries (address range,
+/// size in KiB, type), then a DRAM summary broken down by type in scaled
+/// units (KiB/MiB/GiB), plus persistent and MMIO lines when non-zero.
+/// Records the DRAM total for [`system_ram_bytes`].
 ///
 /// Must be called before Phase 3 activates the kernel page tables; the
 /// `memory_map.entries` pointer is a physical address covered by the
@@ -279,14 +280,16 @@ fn memory_type_name(ty: MemoryType) -> &'static str
 /// typically small; 64 entries is generous for real hardware.
 const MAX_RANGES: usize = 64;
 
-/// Maximum exclusion regions. One per: kernel, `BootInfo`, each init segment
-/// (up to 8), plus up to 16 boot modules — 32 is comfortably sufficient.
+/// Maximum exclusion regions: kernel, `BootInfo`, each init segment (up to
+/// `INIT_MAX_SEGMENTS`, 8), up to 16 boot modules, the AP trampoline page,
+/// and the DTB blob — 28 at most, so 32 is sufficient.
 const MAX_EXCL: usize = 32;
 
 /// Populate `alloc` with usable physical frames derived from `info`.
 ///
 /// Filters for [`MemoryType::Usable`] entries, subtracts the kernel image,
-/// init segments, boot modules, and the `BootInfo` struct itself, then feeds
+/// init segments, boot modules, the `BootInfo` struct, the AP trampoline
+/// page, and the DTB blob, then feeds
 /// the surviving page-aligned sub-ranges to `alloc`.
 ///
 /// Calls [`crate::fatal`] and halts if no usable memory survives.
@@ -380,11 +383,12 @@ fn collect_usable_ranges(info: &BootInfo) -> RangeList<MAX_RANGES>
 /// Exclusion boundaries are rounded outward (start down, end up) to page
 /// granularity so no live data sits on a partially-excluded page.
 ///
-/// The `BootInfo` and AP-trampoline guards below are belt-and-suspenders
-/// against the `EfiBootServicesData → Usable` mis-typing risk noted at the
-/// trampoline guard's own comment. The authoritative reclamation mechanism
-/// for bootloader scratch pages is `BootInfo.reclaim_ranges`, consumed by
-/// `cap::mint_reclaim_memory_caps` during Phase 7.
+/// The `BootInfo` and AP-trampoline exclusions are redundant guards: the
+/// bootloader allocates both as `EfiLoaderData`, which the memory map reports
+/// as `Loaded`, so neither lies in a `Usable` range. The authoritative
+/// reclamation mechanism for bootloader scratch pages is
+/// `BootInfo.reclaim_ranges` (`core/kernel/docs/initialization.md` § Phase 7:
+/// Capability System).
 fn collect_exclusions(info: &BootInfo) -> RangeList<MAX_EXCL>
 {
     let mut excl = RangeList::new();
@@ -429,10 +433,11 @@ fn collect_exclusions(info: &BootInfo) -> RangeList<MAX_EXCL>
         boot_info_addr + size_of::<BootInfo>() as u64,
     );
 
-    // AP SIPI trampoline page (x86-64 SMP). Reported as Usable by the bootloader
-    // (EfiBootServicesData → Usable), so without this exclusion the buddy
-    // allocator would hand it out for IST stacks or per-CPU storage, zeroing
-    // the trampoline code that the BSP writes there during AP startup.
+    // AP trampoline page (SIPI on x86-64, SBI HSM hart_start on riscv64). The
+    // bootloader allocates it as EfiLoaderData, so the memory map reports it as
+    // `Loaded` and it never lies in a `Usable` range; this exclusion is a guard.
+    // The page is reclaimed in Phase 8 (core/kernel/docs/initialization.md
+    // § Phase 8: Scheduler and SMP Bringup).
     if info.ap_trampoline_page != 0
     {
         add(
@@ -456,22 +461,27 @@ fn collect_exclusions(info: &BootInfo) -> RangeList<MAX_EXCL>
 
 /// Read the `totalsize` field of a flattened device tree blob.
 ///
-/// Returns `None` if the magic does not match or the reported size is
-/// implausible. Size is clamped to `DTB_MAX_SIZE` to bound the Memory cap.
+/// Returns `None` if the magic does not match or the reported size is zero
+/// or exceeds `DTB_MAX_SIZE`; the caller then excludes nothing for the blob.
+/// The Phase-7 DTB Memory cap is sized by `cap::read_dtb_totalsize`.
 fn read_dtb_totalsize(phys: u64) -> Option<u64>
 {
     /// FDT magic in big-endian: bytes `d0 0d fe ed`.
     const FDT_MAGIC: u32 = 0xd00d_feed;
-    /// Safety clamp on the DTB blob size — 64 KiB is far above any realistic
-    /// DTB; bounds the exclusion on malformed firmware.
+    /// Largest accepted DTB `totalsize` (64 KiB, far above any realistic DTB);
+    /// a larger value is rejected and no exclusion is added, not clamped.
     const DTB_MAX_SIZE: u64 = 64 * 1024;
 
-    // `phys` is a bootloader-provided identity-mapped physical address
-    // during Phase 2 (before page tables are rewritten in Phase 3). The
-    // first 8 bytes of an FDT blob are magic + totalsize by spec.
+    // `phys` is the firmware's DTB physical address. The bootloader's initial
+    // tables do not map the device tree (core/boot/docs/page-tables.md
+    // § Contract at Kernel Entry), so this Phase-2 read is not covered by the
+    // boot identity map. The first 8 bytes of an FDT blob are magic +
+    // totalsize by spec.
     let ptr = phys as *const u8;
-    // SAFETY: identity-mapped physical address; FDT header is defined by
-    // the FDT spec to occupy the first bytes of the blob.
+    // SAFETY: requires `phys` to be mapped here; the bootloader does not
+    // identity-map the device tree (core/boot/docs/page-tables.md § Contract
+    // at Kernel Entry), so this precondition is not established in Phase 2.
+    // The FDT header occupies the first bytes of the blob by spec.
     let magic_bytes = unsafe { core::ptr::read_volatile(ptr.cast::<[u8; 4]>()) };
     let magic = u32::from_be_bytes(magic_bytes);
     if magic != FDT_MAGIC
@@ -528,8 +538,9 @@ fn add_surviving_subranges(
         if start < end
         {
             // SAFETY: These ranges are usable RAM not occupied by any live data,
-            // confirmed by the exclusion subtraction above. The bootloader's
-            // identity map covers them at this point in boot.
+            // confirmed by the exclusion subtraction above. `add_region` records the
+            // addresses only and never accesses the pages (free RAM is not
+            // identity-mapped; core/boot/docs/page-tables.md § What Gets Mapped).
             unsafe { alloc.add_region(start, end) };
         }
     }

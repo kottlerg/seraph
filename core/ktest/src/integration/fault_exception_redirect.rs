@@ -21,8 +21,9 @@
 //!   3. The child resumes in the recovery routine — never re-executing the
 //!      illegal instruction — and signals success.
 //!
-//! A mechanism that only routed page faults would leave the child killed before
-//! any fault message arrived, tripping the bounded `notification_wait`.
+//! A mechanism that only routed page faults would kill the child without
+//! sending a fault message, leaving the harness blocked in the unbounded
+//! `ipc_recv`, so the run hangs rather than passing.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 

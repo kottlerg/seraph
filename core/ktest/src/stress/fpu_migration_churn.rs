@@ -16,10 +16,11 @@
 //! 5. Child resumes (potentially on CPU 1), captures register file,
 //!    asserts no mismatch.
 //!
-//! The single-cycle version of this test (in `unit/fpu.rs`) catches the
-//! commit-`bd22687` regression on cold caches; this stress version
-//! exercises ~100 cycles to widen the race window for any residual
-//! eager-save / lazy-restore inconsistency under load.
+//! The single-cycle version of this test (`preempt_isolation_cross_cpu` in
+//! `core/ktest/src/unit/fpu.rs`) guards the eager-save migration fix for
+//! #108 on cold caches; this stress version exercises ~100 cycles to widen
+//! the race window for any residual eager-save / lazy-restore inconsistency
+//! under load.
 //!
 //! Skipped when `cpu_count < 2` (UP boot has nothing to migrate across).
 

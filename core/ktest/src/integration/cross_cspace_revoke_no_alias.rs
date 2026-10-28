@@ -13,9 +13,11 @@
 //! With bare slot-index handles the freed index was recycled (LIFO) onto an
 //! unrelated live object and the recipient's handle silently aliased it (#341
 //! was one instance, delivered via an IPC **reply**, which is why this test uses
-//! the reply direction). Per-slot generation closes the class: freeing the slot
-//! bumps its generation, so the recipient's now-stale handle fails
-//! `InvalidCapability` instead of aliasing whatever later occupies the index.
+//! the reply direction). The per-slot handle generation closes the class (see
+//! `docs/capability-model.md` § Capability Handle Format and § Revocation, and
+//! `core/kernel/docs/capability-internals.md` § Per-Slot Generation): the
+//! recipient's now-stale handle must fail `InvalidCapability` instead of
+//! aliasing whatever later occupies the index.
 //!
 //! Scenario:
 //!   1. Parent creates `target` (the derive source), `ep`, `go`/`report` (the
@@ -33,9 +35,9 @@
 //!      while the fresh handle to K still works. The child reports the verdict on
 //!      `report`.
 //!
-//! This asserts the generation-only model: the test depends on the cross-`CSpace`
-//! edge being preserved (so the revoke frees the recipient's slot) and on the
-//! stale handle then failing closed.
+//! The test depends on the cross-`CSpace` derivation edge being preserved (so
+//! the revoke frees the recipient's slot) and on the stale handle then failing
+//! closed.
 
 use ipc::IpcMessage;
 use syscall::{

@@ -209,10 +209,8 @@ fn handle_definition(
         // init-created service: svcmgr has no process_handle (init
         // didn't share it). First death cannot DESTROY_PROCESS — see
         // `restart::restart_process`. Bind happens after the fact (the
-        // thread has been running since its bootstrap spawn) — a death
-        // in that window is lost.
-        // Closing that race is kernel-protocol work; tracked as a
-        // follow-up.
+        // thread has been running since its bootstrap spawn); `bind_only`
+        // states why a death in that window is still delivered.
         bind_only(
             def,
             slot.thread_cap,
@@ -322,10 +320,10 @@ fn bind_only(
     *service_count += 1;
 }
 
-/// Clone the heap-backed launch surfaces from a parsed definition so the
-/// restart path can replay argv/env/cwd/seed byte-for-byte. The fixed
-/// fields (name/binary/policy/namespace) live on the `ServiceEntry`; this
-/// carries only what the fixed record cannot hold.
+/// Clone the launch surfaces the fixed record cannot hold from a parsed
+/// definition so the restart path can replay them: argv/env/cwd/seed
+/// byte-for-byte, the log-sink flag, and the scheduling fields. The fixed
+/// fields (name/binary/policy/namespace) live on the `ServiceEntry`.
 fn recipe_from(def: &Definition) -> RestartRecipe
 {
     RestartRecipe {

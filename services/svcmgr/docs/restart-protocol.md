@@ -49,8 +49,8 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
      [service-definitions.md](service-definitions.md#restart)).
    * `POLICY_ALWAYS` → restart unconditionally.
    * The restart-count budget (`MAX_RESTARTS`, currently `1`) is
-     enforced here; an exhausted budget reports "max restarts reached,
-     marking degraded" and returns false.
+     enforced here; an exhausted budget reports "max restarts reached"
+     and returns false (`permanent_death_outcome` then logs the outcome).
    * A missing restart source (`vfs_path_len == 0`) reports
      "no restart source" and returns false.
 2. **Restart not permitted** → mark service inactive; route to
@@ -84,7 +84,12 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
    * On success: increment `restart_count`, return `Restarted`.
    * On failure: any failure after `CREATE_FROM_FILE` destroys the new
      child via `DESTROY_PROCESS`, as first launch does; then route
-     through `permanent_death_outcome`.
+     through `permanent_death_outcome`. The exception is a create whose
+     reply caps never reach svcmgr: when the reply's cap transfer into
+     svcmgr's CSpace fails, svcmgr receives `IPC_REPLY_TRANSFER_FAILED`
+     with no process handle, so it cannot destroy the child procmgr
+     created, which stays suspended in procmgr's table, on first launch
+     and on restart alike (#506).
 
 `dispatch_deaths` reacts to `Unrecoverable` by calling
 `initiate_graceful_shutdown`, which resolves
@@ -101,7 +106,7 @@ state and returns (see
 
 First-launch ([`definitions::launch`](../src/definitions/launch.rs))
 and restart ([`restart::create_process`](../src/restart.rs)) share
-the same procmgr-side primitives so a service's spawn shape is
+the procmgr-side primitives below so a service's spawn shape is
 identical across both code paths:
 
 * [`mint_child_creator`](../src/restart.rs) — allocate a fresh
@@ -115,11 +120,17 @@ identical across both code paths:
   whose packed layout exceeds `MSG_DATA_WORDS_MAX`, a backstop behind the
   parser's `TooLarge` rejection; on restart that `None` fails the attempt
   and is routed through `permanent_death_outcome`.
-* [`apply_namespace_policy`](../src/restart.rs) — resolve the namespace
-  cap for `NS_POLICY_NONE` / `_UNIVERSAL` / `_SUBTREE`, then hand it (and
-  the optional `cwd` cap) to the shared `configure_namespace_caps`. Both
-  paths install `cwd` identically; restart pulls it from the
-  `RestartRecipe`.
+* [`configure_namespace_caps`](../src/restart.rs) — walk the optional
+  `cwd` from svcmgr's universal root, then install the namespace cap and
+  the `cwd` cap on the child via `procmgr_labels::CONFIGURE_NAMESPACE`.
+  Each path resolves the namespace cap itself and feeds it in: launch
+  from the parsed `Definition` (`definitions::launch`'s
+  `configure_namespace`), restart through
+  [`apply_namespace_policy`](../src/restart.rs), which resolves it for
+  `NS_POLICY_UNIVERSAL` / `_SUBTREE` from the `ServiceEntry` and takes
+  `cwd` from the `RestartRecipe`. Both paths install `cwd` identically,
+  and neither sends `CONFIGURE_NAMESPACE` for a `namespace = none`
+  service.
 * [`start_process`](../src/restart.rs) — `procmgr_labels::START_PROCESS`.
 
 The launch path is documented in
@@ -127,7 +138,9 @@ The launch path is documented in
 `.svc` recipe is the single source of truth for both paths: the fixed
 fields are recorded on `ServiceEntry` and the argv / env / cwd / seed,
 log-sink flag, and scheduling fields on the parallel `RestartRecipe`, so
-a restart reproduces the first-launch spawn shape byte-for-byte. The binary path
+a restart reproduces the first-launch spawn shape byte-for-byte, except the
+log-sink round, whose history-pull SEND is `0` on a restart (per
+[service-definitions.md](service-definitions.md#log_sink)). The binary path
 is re-walked on every spawn, so a binary update on disk is picked up by
 the next restart without code changes.
 
@@ -169,7 +182,8 @@ correlator:
 scheduling fields into `CREATE_FROM_FILE`, cwd through
 `apply_namespace_policy`, seeds re-resolved from the discovery registry,
 and `log_sink` selecting the log-sink round — so a restarted child comes
-back with the same surfaces first launch gave it.
+back with the same surfaces first launch gave it, the log-sink round's
+history-pull SEND aside.
 
 ---
 
@@ -185,18 +199,22 @@ Supervision of those children by devmgr and vfsd is design intent; not yet
 implemented (#17, #262). None of those flow through the handover
 endowment.
 
-The set of services svcmgr currently supervises (per the shipped
-`.svc` files):
+The set of services svcmgr currently binds or launches (per the shipped
+and staged `.svc` files). A `restart = never` service svcmgr launches
+(`svctest`, `usertest`, `terminal`) is launched one-shot: svcmgr binds no
+death notification for it and records no `ServiceEntry`
+([service-definitions.md](service-definitions.md#reconciliation)).
 
-`svctest` and `crasher` are test-tier fixtures: their recipes live in
-`/config/svcmgr/tests/` (svcmgr does not scan it) and are staged into
-`/config/svcmgr/services/` only for test boots — `crasher` is co-staged
-with `svctest` (per [testing.md](../../../docs/testing.md#gating)).
+`svctest`, `usertest`, and `crasher` are test-tier fixtures: their recipes
+live in `/config/svcmgr/tests/` (svcmgr does not scan it) and are staged
+into `/config/svcmgr/services/` only for test boots — `crasher` is
+co-staged with `svctest` (per [testing.md](../../../docs/testing.md#gating)).
 The rest ship in `/config/svcmgr/services/` and load on every boot.
 
 | Service | Source | Restart | Critical |
 |---|---|---|---|
 | `svctest` | svcmgr-launched (test-tier, staged) | `never` | `no` |
+| `usertest` | svcmgr-launched (test-tier, staged) | `never` | `no` |
 | `crasher` | svcmgr-launched (test-tier, staged) | `always` | `no` |
 | `memmgr` | init-endowed (bind only) | `never` | `yes` |
 | `procmgr` | init-endowed (bind only) | `never` | `yes` |
@@ -205,6 +223,7 @@ The rest ship in `/config/svcmgr/services/` and load on every boot.
 | `logd` | svcmgr-launched (log sink) | `on_failure` | `yes` |
 | `timed` | svcmgr-launched (provider) | `on_failure` | `no` |
 | `pwrmgr` | svcmgr-launched (provider) | `on_failure` | `no` |
+| `terminal` | svcmgr-launched | `never` | `no` |
 
 Restart paths for the init-endowed (bind-only) substrate set are
 aspirational today: each was spawned with arch-/firmware-authority caps

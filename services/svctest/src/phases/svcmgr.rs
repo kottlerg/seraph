@@ -4,7 +4,8 @@
 // services/svctest/src/phases/svcmgr.rs
 
 //! svcmgr service surface: the authority gates on its service endpoint, as
-//! reached through svctest's per-process `service_registry_cap`.
+//! reached through svctest's per-process `service_registry_cap` and through
+//! the SEND svcmgr publishes under `svcmgr`.
 
 use std::os::seraph::startup_info;
 

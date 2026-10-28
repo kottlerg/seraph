@@ -88,8 +88,9 @@ svcmgr/
   [docs/service-definitions.md](docs/service-definitions.md) § Reconciliation.
 - **Launch** — for `defined only` services, spawn via the shared
   primitives in [`restart.rs`](src/restart.rs)
-  (`walk_and_create_from_file`, `apply_namespace_policy`,
-  `start_process`) and serve the seed bootstrap round
+  (`walk_and_create_from_file`, `configure_namespace_caps`,
+  `start_process`) and serve the seed bootstrap round; only restart
+  resolves the namespace through `apply_namespace_policy`
   ([docs/restart-protocol.md](docs/restart-protocol.md) § Shared spawn primitives).
 - **Health monitoring** — bind every supervised service's main
   thread to one shared `deaths_eq` with `correlator =
@@ -112,7 +113,7 @@ svcmgr/
   the lookup, served on the per-process SEND seeded into
   `ProcessInfo.service_registry_cap` ([docs/ipc-interface.md](docs/ipc-interface.md) § Messages).
 - **Graceful shutdown** — when a `critical = yes` service is permanently
-  down (restart not attempted or budget exhausted), resolve
+  down (restart not attempted, budget exhausted, or restart failed), resolve
   `ipc::published_names::PWRMGR_SHUTDOWN` from the registry and issue
   `pwrmgr_labels::SHUTDOWN` ([docs/restart-protocol.md](docs/restart-protocol.md) § Decision tree).
 
@@ -204,10 +205,11 @@ Centralised name constants live in `ipc::published_names`.
 governs only what happens once a service is permanently down, not
 whether it restarts ([docs/service-definitions.md](docs/service-definitions.md)
 § `critical`). A `critical = yes` service triggers a graceful
-shutdown via pwrmgr on permanent death (restart not attempted, or budget
-exhausted); a `critical = no` service is logged and the system continues
-degraded. Edge case: pwrmgr itself cannot trigger shutdown on its own
-death (the shutdown source is gone); svcmgr logs the degraded state. See
+shutdown via pwrmgr on permanent death (restart not attempted, budget
+exhausted, or restart failed); a `critical = no` service is logged and
+the system continues degraded. Edge case: pwrmgr itself cannot trigger
+shutdown on its own death (the shutdown source is gone); svcmgr logs the
+degraded state. See
 [docs/restart-protocol.md](docs/restart-protocol.md) for the decision
 tree.
 

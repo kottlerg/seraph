@@ -27,8 +27,9 @@
 //! # Locking
 //! Every register access is an `IOREGSEL` store followed by an `IOWIN` access,
 //! and [`mask`] and [`unmask`] read-modify-write an entry. [`route`], [`mask`]
-//! and [`unmask`] run on any CPU (`SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`, and the
-//! device-IRQ dispatch in interrupt context), so each holds `IOAPIC_LOCK`, a
+//! and [`unmask`] run on any CPU (`SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`, the
+//! device-IRQ dispatch in interrupt context, and the Interrupt and Notification
+//! dealloc paths, which mask a line), so each holds `IOAPIC_LOCK`, a
 //! leaf lock taken with interrupts disabled, across its whole access sequence;
 //! otherwise another CPU's select could land between a select and its window
 //! access and redirect the value to another entry. [`init`] runs single-threaded

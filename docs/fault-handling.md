@@ -58,7 +58,9 @@ invariant 3), and the other CPUs run on until one needs the halted CPU. A halt o
 also ends sleep-list servicing and the BSP-hosted watchdog detectors, which run only there (see
 [§ Sleep List Invariants](../core/kernel/docs/thread-lifecycle-and-sleep.md#sleep-list-invariants),
 invariant 5), so no timeout wakes on any CPU; on a multi-CPU system an AP's BSP-heartbeat check
-then reports the halted boot CPU once its grace window elapses (see
+then reports the halted boot CPU once its grace window elapses, unless a TLB shootdown is
+pending, which the check defers to (a shootdown naming the halted boot CPU ends in the IPI
+watchdog's `fatal` instead; see
 [§ Softlockup Watchdog](../core/kernel/docs/scheduling-internals.md#softlockup-watchdog)).
 
 The demand-paging consumer is implemented: memmgr acts as the pager, procmgr binds it for

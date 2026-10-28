@@ -654,7 +654,9 @@ A `fatal()` on the BSP after Phase 9 also ends sleep-list servicing and the BSP-
 watchdog detectors (all-idle softlockup, owed-wake, AP silence), which run only on the BSP,
 so no timeout wakes on any CPU. On a multi-CPU system an AP's BSP-heartbeat check
 (`bsp_stall_check`) then reports the halted BSP as a stalled heartbeat once its grace window
-elapses (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sleep-list-invariants)
+elapses, unless a TLB shootdown is pending: the check defers to one, and a shootdown naming the
+halted BSP ends in the IPI watchdog's `fatal` instead (described below)
+(see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#sleep-list-invariants)
 § Sleep List Invariants and [scheduling-internals.md](scheduling-internals.md#softlockup-watchdog)
 § Softlockup Watchdog).
 

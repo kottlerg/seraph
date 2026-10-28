@@ -18,7 +18,7 @@
 //! the client has already unmapped the page. The revoke invalidates
 //! the client's derived cap but unmaps nothing, and the released slot
 //! may be refilled with other data, so a client that never unmapped
-//! keeps reading whatever the cache loads there next.
+//! keeps reading whatever the cache loads there next (#516).
 //!
 //! The watchdog is fully userspace. `ipc_call` has no kernel-side
 //! timeout, so the worker spawns a child thread to issue the call

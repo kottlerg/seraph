@@ -1600,7 +1600,7 @@ impl File
         // holds a driver release of it off only within the driver's
         // cooperative-release window, and the driver's revoke does not unmap
         // it, so a copy that outlasts the window can race the driver's
-        // recycling of the page. Such a copy is discarded below.
+        // recycling of the page (#516). Such a copy is discarded below.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 (va + memory_data_offset as u64) as *const u8,

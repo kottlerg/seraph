@@ -23,9 +23,9 @@
 //! (see [`discard_mapping`]). A failed unmap or a copy still running at the
 //! end of the wait is answered with [`fs_errors::IO_ERROR`], no ack. After
 //! any reply, or the window with none, the driver revokes the page's caps
-//! and may recycle the page; the revoke unmaps nothing. Holding the reply
-//! keeps that recycling from racing a copy within the window; a copy that
-//! outlasts it is marked stalled, and `File::read_frame` discards it.
+//! and may recycle the page; the revoke unmaps nothing (#516). Holding the
+//! reply keeps that recycling from racing a copy within the window; a copy
+//! that outlasts it is marked stalled, and `File::read_frame` discards it.
 //!
 //! The endpoint and the handler thread are created lazily on the first
 //! [`super::File::open`] call; until then the cost is one

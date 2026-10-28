@@ -284,11 +284,15 @@ deletes the parent, and releases the page-cache slot, unless the
 client's [client-to-driver release](#client-to-driver-release) or
 [`FS_CLOSE`](#label-3-fs_close) has already done so: each page is
 cleaned up once, by whichever path removes it from the open-file
-table first. The ack tells the driver the client unmapped in
-time; without one, the revoke is what tears down a mapping the client
-still holds. A reply with any other label is not an acknowledgement; a
-client that cannot unmap the page, or whose copy outlasts the window,
-replies `IO_ERROR` (2).
+table first. The ack tells the driver the client unmapped in time.
+The revoke invalidates the client's derived cap but removes no mapping
+([Capability Model § Revocation](../../../docs/capability-model.md#revocation)),
+and the released slot may be refilled with other data, so a client
+that has not unmapped the page by then can read what the cache loads
+there next; a client MUST unmap before it acks and MUST NOT trust a
+copy that outlasts the window. A reply with any other label is not an
+acknowledgement; a client that cannot unmap the page, or whose copy
+outlasts the window, replies `IO_ERROR` (2).
 
 ### Client-to-driver release
 

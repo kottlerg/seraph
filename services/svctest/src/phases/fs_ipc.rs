@@ -671,6 +671,48 @@ pub fn fs_write_invariants_phase(_: &Caps)
             "expected PERMISSION_DENIED; got {write_err}"
         );
 
+        // A refused FS_WRITE_MEMORY hands its source page back
+        // (fs-driver-protocol.md § Label 12: in every outcome).
+        let req = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
+            .word(0, 1)
+            .build();
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        let grant = unsafe { ipc::ipc_call(info.memmgr_endpoint, &req, ipc_buf) }
+            .expect("memmgr REQUEST_MEMORY_CAPS ipc_call failed");
+        let page = *grant
+            .caps()
+            .first()
+            .expect("REQUEST_MEMORY_CAPS returned no cap");
+        let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_WRITE_MEMORY)
+            .word(0, 0)
+            .word(1, 1)
+            .word(2, 0)
+            .cap(page)
+            .build();
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(child_cap, &msg, ipc_buf) }
+            .expect("FS_WRITE_MEMORY ipc_call failed");
+        assert_eq!(
+            reply.label,
+            ipc::fs_errors::PERMISSION_DENIED,
+            "FS_WRITE_MEMORY on a rights-attenuated cap: expected PERMISSION_DENIED"
+        );
+        let returned = reply.caps();
+        assert_eq!(
+            returned.len(),
+            1,
+            "a refused FS_WRITE_MEMORY must return its source cap"
+        );
+        let tag = syscall::cap_info(returned[0], syscall::CAP_INFO_TAG_RIGHTS)
+            .map(|tr| u8::try_from(tr >> 32).unwrap_or(0))
+            .expect("cap_info on the returned source cap failed");
+        assert_eq!(
+            tag,
+            syscall::CAP_TAG_MEMORY,
+            "the cap a refused FS_WRITE_MEMORY returns must be the Memory cap"
+        );
+        let _ = syscall::cap_delete(returned[0]);
+
         let _ = syscall::cap_delete(child_cap);
         let _ = syscall::cap_delete(parent_attenuated);
         let _ = fs_remove(svctest_full, scratch_name, ipc_buf);

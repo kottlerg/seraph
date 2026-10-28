@@ -939,12 +939,13 @@ fn acquire_write_frame(aspace: u32, memmgr_ep: u32) -> io::Result<WriteFrame>
 /// A driver release of the cookie waits on the mark, up to the driver's
 /// release window, so the page is not unmapped, or acked back to the
 /// driver, mid-copy; a copy outlasting the window gets no ack, and the
-/// driver revokes. Dropping the mark ends the read on every early return.
+/// driver may recycle the page. Dropping the mark ends the read on every
+/// early return.
 struct ReadMark<'a>
 {
     entry: &'a FileEntry,
     cookie: u64,
-    mapping: Option<OutstandingMapping>,
+    ended: bool,
 }
 
 impl<'a> ReadMark<'a>
@@ -955,14 +956,16 @@ impl<'a> ReadMark<'a>
         Self {
             entry,
             cookie,
-            mapping: None,
+            ended: false,
         }
     }
 
-    /// End the read, registering the page's mapping for release.
-    fn finish(mut self, mapping: OutstandingMapping)
+    /// End the read, registering the page's mapping for release. Returns
+    /// whether a driver release's wait for the read ran out during it.
+    fn finish(mut self, mapping: OutstandingMapping) -> bool
     {
-        self.mapping = Some(mapping);
+        self.ended = true;
+        release_handler::end_read(self.entry, self.cookie, Some(mapping))
     }
 }
 
@@ -970,7 +973,10 @@ impl Drop for ReadMark<'_>
 {
     fn drop(&mut self)
     {
-        release_handler::end_read(self.entry, self.cookie, self.mapping.take());
+        if !self.ended
+        {
+            release_handler::end_read(self.entry, self.cookie, None);
+        }
     }
 }
 
@@ -1587,28 +1593,28 @@ impl File
         let va = range.va_start();
 
         let copy_len = bytes_valid.min(buf.len());
-        // SAFETY: VA is mapped read-only for one page, and
-        // `checked_frame_reply` holds `memory_data_offset + bytes_valid <=
-        // PAGE_SIZE`. The `ReadMark` holds a driver release of the page off
-        // only within the driver's cooperative-release window; a copy that
-        // outlasts it is revoked mid-copy and faults this thread (a fault,
-        // not a read of other memory: the VA stays reserved). #31 tracks a
-        // revocation model that does not fault the client.
-        let src = unsafe {
-            core::slice::from_raw_parts(
+        // SAFETY: VA is mapped read-only for one page, `checked_frame_reply`
+        // holds `memory_data_offset + bytes_valid <= PAGE_SIZE`, and
+        // `copy_len <= buf.len()`. The copy reads through a raw pointer, not
+        // a shared slice, because the page is the driver's: the `ReadMark`
+        // holds a driver release of it off only within the driver's
+        // cooperative-release window, and the driver's revoke does not unmap
+        // it, so a copy that outlasts the window can race the driver's
+        // recycling of the page. Such a copy is discarded below.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
                 (va + memory_data_offset as u64) as *const u8,
-                bytes_valid,
-            )
-        };
-        buf[..copy_len].copy_from_slice(&src[..copy_len]);
+                buf.as_mut_ptr(),
+                copy_len,
+            );
+        }
         // The copy is done: hand the mapping to the registry, where a driver
         // release that waited on the read can now take it.
-        mark.finish(OutstandingMapping {
+        let stalled = mark.finish(OutstandingMapping {
             cookie,
             range,
             memory_cap,
         });
-        self.pos.fetch_add(copy_len as u64, Ordering::Relaxed);
 
         // Proactive release: synchronous FS_RELEASE_MEMORY on the file
         // cap clears the fs-side outstanding entry and decrements the
@@ -1618,6 +1624,17 @@ impl File
         self.release_frame(cookie);
         release_handler::release_one_local(self.entry.as_ref(), self.aspace, cookie);
 
+        // A driver release whose wait ran out during the copy may have been
+        // followed by the page's reuse, so the bytes are not trusted; the
+        // position stays, and `Interrupted` asks the caller to read again.
+        if stalled
+        {
+            return Err(io::const_error!(
+                io::ErrorKind::Interrupted,
+                "seraph fs: read page released during the copy",
+            ));
+        }
+        self.pos.fetch_add(copy_len as u64, Ordering::Relaxed);
         Ok(copy_len)
     }
 

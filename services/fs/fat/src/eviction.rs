@@ -15,9 +15,10 @@
 //! no other path has cleaned it up meanwhile (the client's synchronous
 //! release, or `FS_CLOSE`), `cap_revoke`s the per-cookie ancestor cap,
 //! drops it, and decrements the cache slot's refcount. An ack means
-//! the client has already unmapped the page; without one the revoke
-//! tears down the client's mapping, and the client takes a
-//! `USERSPACE FAULT` on its next access.
+//! the client has already unmapped the page. The revoke invalidates
+//! the client's derived cap but unmaps nothing, and the released slot
+//! may be refilled with other data, so a client that never unmapped
+//! keeps reading whatever the cache loads there next.
 //!
 //! The watchdog is fully userspace. `ipc_call` has no kernel-side
 //! timeout, so the worker spawns a child thread to issue the call
@@ -49,9 +50,10 @@ pub const RELEASE_TIMEOUT_MS: u64 = 100;
 /// matches, so the queue cannot overflow under correct accounting.
 const MAX_PENDING_EVICTIONS: usize = MAX_OPEN_FILES * MAX_OUTSTANDING;
 
-/// One queued eviction. Carries everything the worker needs to
-/// drive the cooperative round-trip and the cleanup that follows
-/// without touching the open-file table for read.
+/// One queued eviction: the outstanding page as it stood when queued.
+/// The worker checks it against the open-file table before the
+/// cooperative round-trip and again before the cleanup, since the main
+/// thread may have cleaned the page up meanwhile.
 #[derive(Clone, Copy)]
 pub struct EvictReq
 {
@@ -68,11 +70,6 @@ pub struct EvictReq
     /// Per-cookie ancestor cap derived under the cache slot's
     /// memory cap. Revoking it kills only the caller's child cap.
     pub ancestor_cap: u32,
-    /// SEND cap on the client's release endpoint, addressed by
-    /// `FS_RELEASE_MEMORY`. Zero means the client did not provide
-    /// one, in which case the worker skips the cooperative round-trip
-    /// and goes straight to the revoke.
-    pub release_endpoint_cap: u32,
 }
 
 pub struct EvictionState
@@ -135,53 +132,34 @@ pub fn worker_loop(
     loop
     {
         let req = pop_blocking(&state);
-        let outcome = if req.release_endpoint_cap != 0
+        // The client's synchronous FS_RELEASE_MEMORY and FS_CLOSE clean an
+        // outstanding page up on the main thread, before or during the
+        // cooperative round-trip. A page already gone is skipped.
+        let Some(endpoint) = live_release_endpoint(&files, &req)
+        else
         {
-            cooperative_release(&req)
+            continue;
+        };
+        let outcome = if endpoint != 0
+        {
+            cooperative_release(endpoint, req.cookie)
         }
         else
         {
             Release::NoEndpoint
         };
-        match outcome
-        {
-            Release::Acked =>
-            {}
-            Release::NoEndpoint => std::os::seraph::log!(
-                "no release endpoint; revoking parent cap (badge={}, slot={})",
-                req.file_badge,
-                req.slot_idx
-            ),
-            Release::Refused(label) => std::os::seraph::log!(
-                "FS_RELEASE_MEMORY refused (label={}); revoking parent cap (badge={}, slot={})",
-                label,
-                req.file_badge,
-                req.slot_idx
-            ),
-            Release::CallFailed => std::os::seraph::log!(
-                "FS_RELEASE_MEMORY call failed; revoking parent cap (badge={}, slot={})",
-                req.file_badge,
-                req.slot_idx
-            ),
-            Release::TimedOut => std::os::seraph::log!(
-                "FS_RELEASE_MEMORY timeout; revoking parent cap (badge={}, slot={})",
-                req.file_badge,
-                req.slot_idx
-            ),
-        }
-        // The client's synchronous FS_RELEASE_MEMORY and FS_CLOSE clean an
-        // outstanding page up on the main thread, and may do so while the
-        // worker waits on the cooperative round-trip. Whichever path takes
-        // the entry out of the open-file table owns the cleanup: revoke the
-        // ancestor (kills the client's derived child cap and tears down its
-        // mapping), delete it from fs's CSpace, and drop the cache-slot
+        // Whichever path takes the entry out of the open-file table owns
+        // the cleanup: revoke the ancestor (invalidates the client's derived
+        // child cap), delete it from fs's CSpace, and drop the cache-slot
         // refcount, once.
-        if take_outstanding(&files, &req)
+        let owned = take_outstanding(&files, &req);
+        if owned
         {
             let _ = syscall::cap_revoke_all(req.ancestor_cap);
             let _ = syscall::cap_delete(req.ancestor_cap);
             cache.release_slot(req.slot_idx);
         }
+        log_outcome(&req, outcome, owned);
     }
 }
 
@@ -198,6 +176,45 @@ fn pop_blocking(state: &EvictionState) -> EvictReq
     }
 }
 
+/// Log a non-ack release outcome, and whether the worker revoked the page
+/// or found it already cleaned up by the client's release or `FS_CLOSE`.
+fn log_outcome(req: &EvictReq, outcome: Release, owned: bool)
+{
+    let what = match outcome
+    {
+        Release::Acked => return,
+        Release::NoEndpoint => "no release endpoint",
+        Release::Refused(_) => "FS_RELEASE_MEMORY refused",
+        Release::CallFailed => "FS_RELEASE_MEMORY call failed",
+        Release::SpawnFailed => "release watchdog spawn failed; no FS_RELEASE_MEMORY sent",
+        Release::TimedOut => "FS_RELEASE_MEMORY timeout",
+    };
+    let label = if let Release::Refused(l) = outcome
+    {
+        l
+    }
+    else
+    {
+        0
+    };
+    let action = if owned
+    {
+        "revoked parent cap"
+    }
+    else
+    {
+        "page already released"
+    };
+    std::os::seraph::log!(
+        "{} (label={}); {} (badge={}, slot={})",
+        what,
+        label,
+        action,
+        req.file_badge,
+        req.slot_idx
+    );
+}
+
 /// How a cooperative release round-trip ended.
 #[derive(Clone, Copy)]
 enum Release
@@ -210,11 +227,14 @@ enum Release
     CallFailed,
     /// No reply within `RELEASE_TIMEOUT_MS`.
     TimedOut,
+    /// The watchdog thread could not be spawned, so nothing was sent.
+    SpawnFailed,
     /// The client delivered no release endpoint, so none was sent.
     NoEndpoint,
 }
 
-/// Send `FS_RELEASE_MEMORY` to the client and wait up to
+/// Send `FS_RELEASE_MEMORY` for `cookie` on `endpoint`, a derived copy of
+/// the client's release SEND that this call consumes, and wait up to
 /// `RELEASE_TIMEOUT_MS` for its reply.
 ///
 /// `ipc_call` has no kernel-side timeout, so the synchronous IPC
@@ -225,14 +245,13 @@ enum Release
 /// its own write. A truly hung client leaks the child thread,
 /// which is the documented cost of cooperative release without
 /// a kernel-side IPC-cancellation primitive.
-fn cooperative_release(req: &EvictReq) -> Release
+fn cooperative_release(endpoint: u32, cookie: u64) -> Release
 {
     let chan: Arc<(Mutex<Option<Release>>, Condvar)> = Arc::new((Mutex::new(None), Condvar::new()));
     let chan_child = chan.clone();
-    let ep = req.release_endpoint_cap;
-    let cookie = req.cookie;
+    let ep = endpoint;
 
-    let _spawn = thread::Builder::new()
+    let spawned = thread::Builder::new()
         .name("fatfs-release-watchdog".into())
         .spawn(move || {
             let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -242,6 +261,7 @@ fn cooperative_release(req: &EvictReq) -> Release
             // SAFETY: `ipc_buf` is the registered IPC buffer for this
             // thread (set in `std::thread`'s entry trampoline).
             let result = unsafe { ipc::ipc_call(ep, &msg, ipc_buf) };
+            let _ = syscall::cap_delete(ep);
             let outcome = match result
             {
                 Ok(reply) if reply.label == fs_labels::FS_RELEASE_ACK => Release::Acked,
@@ -256,6 +276,11 @@ fn cooperative_release(req: &EvictReq) -> Release
             }
             chan_child.1.notify_all();
         });
+    if spawned.is_err()
+    {
+        let _ = syscall::cap_delete(ep);
+        return Release::SpawnFailed;
+    }
 
     let timeout = Duration::from_millis(RELEASE_TIMEOUT_MS);
     let mut st = chan.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -278,6 +303,30 @@ fn cooperative_release(req: &EvictReq) -> Release
     // Mark as given up so a late child reply skips its write rather than
     // racing the parent's cleanup.
     *st.get_or_insert(Release::TimedOut)
+}
+
+/// Under the open-file lock, check that `req`'s outstanding page is still
+/// in the table (same file, cookie, cache slot, and ancestor cap) and return
+/// a derived copy of its file's release SEND, or 0 when the client delivered
+/// none. The copy is the worker's own, so an `FS_CLOSE` that deletes the
+/// slot's SEND meanwhile cannot free or reuse the slot the worker calls on.
+/// `None` means the page was already cleaned up.
+fn live_release_endpoint(files: &Mutex<[OpenFile; MAX_OPEN_FILES]>, req: &EvictReq) -> Option<u32>
+{
+    let files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
+    let file = &files_g[find_by_badge(&files_g, req.file_badge)?];
+    let present = file.outstanding.iter().flatten().any(|e| {
+        e.cookie == req.cookie && e.slot_idx == req.slot_idx && e.ancestor_cap == req.ancestor_cap
+    });
+    if !present
+    {
+        return None;
+    }
+    if file.release_endpoint_cap == 0
+    {
+        return Some(0);
+    }
+    Some(syscall::cap_derive(file.release_endpoint_cap, syscall::RIGHTS_EP_SEND).unwrap_or(0))
 }
 
 /// Take `req`'s outstanding-page entry out of the open-file table, under

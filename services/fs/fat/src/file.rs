@@ -60,8 +60,7 @@ pub struct OpenFile
     /// outstanding cache page. A zero cap indicates the client opted
     /// out (no caps on the first memory-cap request); eviction skips
     /// the cooperative round-trip and goes straight to the revoke.
-    /// Deleted from the
-    /// fs's `CSpace` at `FS_CLOSE` time.
+    /// Deleted from the fs's `CSpace` at `FS_CLOSE` time.
     pub release_endpoint_cap: u32,
 }
 

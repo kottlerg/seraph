@@ -255,31 +255,30 @@ fn service_loop(
 
         let opcode = msg.label & 0xFFFF;
 
-        // Unbadged service-level requests: FS_MOUNT only.
+        // Unbadged service-level requests: FS_MOUNT only. FS_MOUNT carries
+        // no caps, so none a request carried is kept.
         if msg.badge == 0
         {
-            let code = match opcode
+            let code = if opcode == fs_labels::FS_MOUNT
             {
-                fs_labels::FS_MOUNT =>
+                if msg.word(0) != u64::from(ipc::FS_LABELS_VERSION)
                 {
-                    if msg.word(0) != u64::from(ipc::FS_LABELS_VERSION)
-                    {
-                        ipc::fs_errors::LABEL_VERSION_MISMATCH
-                    }
-                    else if state.fat_size == 0
-                    {
-                        validate_bpb(caps, state, cache, ipc_buf)
-                    }
-                    else
-                    {
-                        ipc::fs_errors::SUCCESS
-                    }
+                    ipc::fs_errors::LABEL_VERSION_MISMATCH
                 }
-                _ => ipc::fs_errors::UNKNOWN_OPCODE,
+                else if state.fat_size == 0
+                {
+                    validate_bpb(caps, state, cache, ipc_buf)
+                }
+                else
+                {
+                    ipc::fs_errors::SUCCESS
+                }
+            }
+            else
+            {
+                ipc::fs_errors::UNKNOWN_OPCODE
             };
-            let reply = IpcMessage::new(code);
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            refuse_keeping_no_caps(&msg, opcode, code, ipc_buf);
             continue;
         }
 
@@ -680,7 +679,6 @@ fn pick_eviction_candidate(files: &[OpenFile; MAX_OPEN_FILES]) -> Option<EvictRe
                 cookie: entry.cookie,
                 slot_idx: entry.slot_idx,
                 ancestor_cap: entry.ancestor_cap,
-                release_endpoint_cap: file.release_endpoint_cap,
             });
         }
     }
@@ -704,19 +702,16 @@ fn handle_read_memory_node_cap(
     eviction: &EvictionState,
 )
 {
+    let opcode = fs_labels::FS_READ_MEMORY;
     let Some(node) = nodes.get(node_id)
     else
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        refuse_keeping_no_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     if node.kind != NodeKind::File
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        refuse_keeping_no_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     }
 
@@ -725,9 +720,7 @@ fn handle_read_memory_node_cap(
         let Some(slot_idx) = file::alloc_slot(files)
         else
         {
-            let reply = IpcMessage::new(ipc::fs_errors::TOO_MANY_OPEN);
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            refuse_keeping_no_caps(msg, opcode, ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
             return;
         };
         // Slot identity for the eviction worker's `find_by_badge`
@@ -741,8 +734,13 @@ fn handle_read_memory_node_cap(
         // route cooperative `FS_RELEASE_MEMORY` back to the client.
         // A zero cap indicates an opt-out client; eviction skips the
         // cooperative round-trip and revokes. Subsequent FS_READ_MEMORYs from
-        // the same client carry no caps.
+        // the same client carry no caps. Only caps[0] is recorded; any
+        // further cap is deleted.
         let release_endpoint_cap = msg.caps().first().copied().unwrap_or(0);
+        for &extra in msg.caps().iter().skip(1)
+        {
+            let _ = syscall::cap_delete(extra);
+        }
         files[slot_idx] = OpenFile {
             badge,
             start_cluster: node.cluster,
@@ -756,6 +754,13 @@ fn handle_read_memory_node_cap(
     }
     else
     {
+        // The slot records the release SEND from the request that
+        // allocated it (per-node sharing, #447); a SEND this request
+        // carries is never recorded, so it is deleted.
+        for &cap in msg.caps()
+        {
+            let _ = syscall::cap_delete(cap);
+        }
         node.open_slot as usize
     };
 
@@ -771,10 +776,13 @@ fn handle_read_memory_node_cap(
     );
 }
 
-/// Reply `code` to a request the rights gate refused, holding none of the
-/// caps it carried: an `FS_WRITE_MEMORY` source page goes back in the
-/// reply, as § Label 12 promises in every outcome, and any other cap (an
-/// `FS_READ_MEMORY` release SEND) is deleted.
+/// Reply `code` to a request the driver does not carry out (a rights-gate
+/// refusal, an unknown or unbadged label, an `FS_READ_MEMORY` refused before
+/// its slot records the SEND), holding none of the caps it carried: an
+/// `FS_WRITE_MEMORY` source page goes back in the reply, as § Label 12
+/// promises in every outcome, and any other cap (an `FS_READ_MEMORY`
+/// release SEND) is deleted. `FS_MOUNT` replies through it too, since it
+/// carries no caps.
 fn refuse_keeping_no_caps(msg: &IpcMessage, opcode: u64, code: u64, ipc_buf: *mut u64)
 {
     let mut builder = IpcMessage::builder(code);

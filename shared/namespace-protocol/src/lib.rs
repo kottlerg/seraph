@@ -175,15 +175,15 @@ pub struct EntryView
 
 /// Reply payload returned by [`NamespaceBackend::read_memory`].
 ///
-/// `memory_cap` is a single-page Memory cap with `MAP|READ` rights
-/// covering the cached file page. The cookie value echoes the
+/// `memory_cap` is a single-page Memory cap with `MAP` rights
+/// (read-only mapping authority) covering the cached file page. The cookie value echoes the
 /// caller-supplied request cookie unchanged. `bytes_valid` is bounded
 /// by file end, the current backend cluster boundary, and the page
 /// tail.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct MemoryReply
 {
-    /// Single-page Memory cap (`MAP|READ`) covering the cached page.
+    /// Single-page Memory cap (`MAP` rights) covering the cached page.
     pub memory_cap: u32,
     /// Bytes of valid file content starting at `memory_data_offset`.
     pub bytes_valid: u32,

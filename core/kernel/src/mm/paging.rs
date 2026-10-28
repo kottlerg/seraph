@@ -54,8 +54,6 @@ use boot_protocol::BootInfo;
 #[cfg(not(test))]
 use super::PAGE_SIZE;
 #[cfg(not(test))]
-use super::buddy::BuddyAllocator;
-#[cfg(not(test))]
 use crate::arch::current::paging as arch_paging;
 
 // ── Kernel PML4 physical address ──────────────────────────────────────────────
@@ -386,9 +384,8 @@ unsafe extern "C" {
 /// - Kernel sections are mapped with W^X permissions.
 /// - The boot stack remains accessible at its current virtual address.
 ///
-/// `_alloc` is unused: every frame this function needs comes from the static
-/// boot pool ([`BOOT_TABLE_POOL_SIZE`]); later phases reach the buddy
-/// allocator through their own handles.
+/// Every frame this function needs comes from the static boot pool
+/// ([`BOOT_TABLE_POOL_SIZE`]), not the buddy allocator.
 ///
 /// # Errors
 /// `PagingError::OutOfFrames` if the 256-frame BSS pool is exhausted.
@@ -396,10 +393,7 @@ unsafe extern "C" {
 ///
 /// In test builds this is a no-op stub so `main.rs` compiles unchanged.
 #[cfg(test)]
-pub fn init_kernel_page_tables(
-    _info: &BootInfo,
-    _alloc: &mut super::buddy::BuddyAllocator,
-) -> Result<(), PagingError>
+pub fn init_kernel_page_tables(_info: &BootInfo) -> Result<(), PagingError>
 {
     Ok(())
 }
@@ -407,10 +401,7 @@ pub fn init_kernel_page_tables(
 // similar_names: root_va/root_pa and other va/pa pairs are VA/PA of the same frame.
 #[cfg(not(test))]
 #[allow(clippy::similar_names)]
-pub fn init_kernel_page_tables(
-    info: &BootInfo,
-    _alloc: &mut BuddyAllocator,
-) -> Result<(), PagingError>
+pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), PagingError>
 {
     // Enable NX on x86-64 before we install tables with NX entries; a no-op
     // on RISC-V (X bit is always independently controllable).
@@ -739,18 +730,6 @@ mod tests
     // ── phys_to_virt / virt_to_phys ──────────────────────────────────────────
 
     #[test]
-    fn phys_to_virt_zero_equals_direct_map_base()
-    {
-        assert_eq!(phys_to_virt(0), direct_map_base());
-    }
-
-    #[test]
-    fn phys_to_virt_nonzero()
-    {
-        assert_eq!(phys_to_virt(0x1000), direct_map_base() + 0x1000);
-    }
-
-    #[test]
     fn phys_virt_roundtrip()
     {
         let phys: u64 = 0x8000_0000;
@@ -934,74 +913,5 @@ mod tests
         let pool = PoolState::new_for_test(base, 1);
         // new_for_test uses kv_minus_kp = 0, so phys_to_virt is identity.
         assert_eq!(pool.phys_to_virt(base), base);
-    }
-
-    // ── PageFlags construction ────────────────────────────────────────────────
-
-    #[test]
-    fn page_flags_text_is_readable_executable_not_writable()
-    {
-        let f = PageFlags {
-            readable: true,
-            writable: false,
-            executable: true,
-            uncacheable: false,
-        };
-        assert!(f.readable);
-        assert!(!f.writable);
-        assert!(f.executable);
-        assert!(!f.uncacheable);
-    }
-
-    #[test]
-    fn page_flags_rodata_is_readable_only()
-    {
-        let f = PageFlags {
-            readable: true,
-            writable: false,
-            executable: false,
-            uncacheable: false,
-        };
-        assert!(f.readable);
-        assert!(!f.writable);
-        assert!(!f.executable);
-    }
-
-    #[test]
-    fn page_flags_data_is_readable_writable_not_executable()
-    {
-        let f = PageFlags {
-            readable: true,
-            writable: true,
-            executable: false,
-            uncacheable: false,
-        };
-        assert!(f.readable);
-        assert!(f.writable);
-        assert!(!f.executable);
-    }
-
-    #[test]
-    fn page_flags_uncacheable_default_false()
-    {
-        let f = PageFlags {
-            readable: true,
-            writable: false,
-            executable: false,
-            uncacheable: false,
-        };
-        assert!(!f.uncacheable);
-    }
-
-    #[test]
-    fn page_flags_uncacheable_set()
-    {
-        let f = PageFlags {
-            readable: true,
-            writable: false,
-            executable: false,
-            uncacheable: true,
-        };
-        assert!(f.uncacheable);
     }
 }

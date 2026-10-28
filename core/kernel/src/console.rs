@@ -180,6 +180,34 @@ pub unsafe fn console_write_fmt(args: core::fmt::Arguments)
     CONSOLE_LOCK.store(false, Ordering::Release);
 }
 
+/// A `fmt::Write` sink that writes bytes only to the serial port, inserting a
+/// CR before each LF. Shared by [`serial_write_fmt`], [`panic_write_fmt`], and
+/// [`nmi_write_fmt`], which differ only in how they claim `CONSOLE_LOCK`.
+#[cfg(not(test))]
+struct SerialWriter;
+
+#[cfg(not(test))]
+impl core::fmt::Write for SerialWriter
+{
+    fn write_str(&mut self, s: &str) -> core::fmt::Result
+    {
+        // SAFETY: every writer that constructs a `SerialWriter` requires, as its
+        // own safety contract, that `console::init` has initialised the serial
+        // port; writing a byte to an initialised port has no other precondition.
+        unsafe {
+            for byte in s.bytes()
+            {
+                if byte == b'\n'
+                {
+                    serial_write_byte(b'\r');
+                }
+                serial_write_byte(byte);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Write a formatted string to the serial port only.
 ///
 /// Acquires `CONSOLE_LOCK` as `console_write_fmt` does (spin-waits, does not
@@ -194,26 +222,6 @@ pub unsafe fn console_write_fmt(args: core::fmt::Arguments)
 pub unsafe fn serial_write_fmt(args: core::fmt::Arguments)
 {
     use core::fmt::Write;
-
-    struct SerialWriter;
-    impl core::fmt::Write for SerialWriter
-    {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result
-        {
-            // SAFETY: serial was initialised by console::init.
-            unsafe {
-                for byte in s.bytes()
-                {
-                    if byte == b'\n'
-                    {
-                        serial_write_byte(b'\r');
-                    }
-                    serial_write_byte(byte);
-                }
-            }
-            Ok(())
-        }
-    }
 
     while CONSOLE_LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -248,27 +256,6 @@ pub unsafe fn panic_write_fmt(args: core::fmt::Arguments)
 {
     use core::fmt::Write;
 
-    /// A `fmt::Write` sink that writes bytes only to the serial port.
-    struct SerialWriter;
-    impl core::fmt::Write for SerialWriter
-    {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result
-        {
-            // SAFETY: serial was initialised by console::init before any kprint! use.
-            unsafe {
-                for byte in s.bytes()
-                {
-                    if byte == b'\n'
-                    {
-                        serial_write_byte(b'\r');
-                    }
-                    serial_write_byte(byte);
-                }
-            }
-            Ok(())
-        }
-    }
-
     // Force-claim: store true unconditionally. Stops other CPUs from writing
     // (best-effort) without risking a spin-wait deadlock on re-entrant panics.
     CONSOLE_LOCK.store(true, Ordering::Relaxed);
@@ -299,26 +286,6 @@ pub unsafe fn panic_write_fmt(args: core::fmt::Arguments)
 pub unsafe fn nmi_write_fmt(args: core::fmt::Arguments)
 {
     use core::fmt::Write;
-
-    struct SerialWriter;
-    impl core::fmt::Write for SerialWriter
-    {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result
-        {
-            // SAFETY: serial was initialised by console::init before any kprint! use.
-            unsafe {
-                for byte in s.bytes()
-                {
-                    if byte == b'\n'
-                    {
-                        serial_write_byte(b'\r');
-                    }
-                    serial_write_byte(byte);
-                }
-            }
-            Ok(())
-        }
-    }
 
     // Atomic swap: take the lock (forcibly), remember the prior state.
     let prior = CONSOLE_LOCK.swap(true, Ordering::Acquire);

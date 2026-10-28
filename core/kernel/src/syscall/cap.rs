@@ -82,8 +82,8 @@ unsafe fn resolve_src_cap(
 /// # Errors
 ///
 /// `InvalidCapability` when the slot no longer holds the resolved cap;
-/// `InvalidState` when a revoke or move is in flight on it (transient — retry
-/// after that operation completes).
+/// `InvalidState` when the slot is pinned by an in-flight revoke, move, or IPC
+/// capability transfer (transient — retry after that operation completes).
 ///
 /// # Safety
 ///
@@ -1889,7 +1889,8 @@ unsafe fn resolve_delete_target(
             {
                 return Err(Ok(0));
             }
-            // A revoke or move is mid-flight on this slot (`CapabilitySlot::pinned`;
+            // A revoke, move, or IPC capability transfer is mid-flight on this
+            // slot (`CapabilitySlot::pinned`;
             // `core/kernel/docs/capability-internals.md` § Revocation Algorithm).
             // Transient — retry after the operation completes.
             if slot.pinned()
@@ -2056,9 +2057,9 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// - `InvalidCapability` — the handle names no live slot, or its generation
 ///   is stale.
-/// - `InvalidState` — another revoke, or a move, is already in flight on this slot; or a
-///   corrupted derivation link was found (the dangling chain was truncated
-///   and the revoke is incomplete).
+/// - `InvalidState` — another revoke, a move, or an IPC capability transfer is
+///   already in flight on this slot; or a corrupted derivation link was found
+///   (the dangling chain was truncated and the revoke is incomplete).
 /// - `Interrupted` — the liveness backstop tripped: sustained concurrent
 ///   derivation kept extending the subtree past `MAX_REVOKE_BATCHES`
 ///   batches. Everything revoked so far stays revoked; retry to continue.
@@ -2141,9 +2142,9 @@ pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         if first_batch
         {
-            // A pin already set means another thread's revoke or move is
-            // in flight on this slot; refuse rather than interleave two
-            // pin lifetimes on one slot.
+            // A pin already set means another thread's revoke, move, or IPC
+            // capability transfer is in flight on this slot; refuse rather
+            // than interleave two pin lifetimes on one slot.
             // SAFETY: caller_cspace validated; marker accessed only under
             // DERIVATION_LOCK.
             let already = unsafe {
@@ -2396,7 +2397,9 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             if let Some(obj) = release
             {
-                // SAFETY: the freed source slot's reference; syscall context.
+                // SAFETY: the freed source slot's reference; syscall context
+                // with no lock held (`DERIVATION_LOCK` and both `CSpace` locks
+                // were released above).
                 unsafe { release_moved_object(obj) };
             }
             Ok(u64::from(handle))

@@ -939,12 +939,12 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             raw_bytes: 24 + core::mem::size_of::<crate::ipc::endpoint::EndpointState>() as u64,
             split: false,
         }),
-        // Notification: 24 wrapper + NotificationState (40 B) = 64 B, budgeted as
-        // the literal 120 → BIN_128. Unlike the Endpoint arm, the budget is not
-        // computed from size_of, and no const assertion pins wrapper +
-        // NotificationState within BIN_128 (#460).
+        // Notification: 24 wrapper + NotificationState → BIN_128. Computed from
+        // size_of, as the Endpoint arm is (a bin-overflow is caught by the
+        // const-assert in notification.rs).
         ObjectType::Notification => Some(DispatchEntry {
-            raw_bytes: 120,
+            raw_bytes: 24
+                + core::mem::size_of::<crate::ipc::notification::NotificationState>() as u64,
             split: false,
         }),
         // WaitSet: 24 wrapper + 440 (the asserted upper bound on WaitSetState)

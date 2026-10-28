@@ -60,7 +60,8 @@ one set of links suffices). No separate allocation. Threads are served in arriva
   list through `tcb.ipc_wait_next` and `tcb.ipc_wait_prev` storing only its tail (the head is the
   tail's successor), so it is pointer-sized. Each queued TCB's `ipc_wait_queue` tag names the
   queue, so push, pop, removal of any waiter, and the membership test are O(1) and touch only the
-  TCBs they link or unlink. A wait set holds at most one waiter (§ Wait Path).
+  TCBs they link or unlink. A wait set holds at most one waiter (§ Wait Set, Wait Path
+  step 1).
 
 ### Call Path (Sender)
 

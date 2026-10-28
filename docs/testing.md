@@ -381,9 +381,9 @@ When the runs are owed below) makes a non-inert change to the CPU-count surface;
 concurrency-fix purpose owes three of its boundaries on its own (see Repeat count below). The
 CPU-count surface is the code that fixes the CPU-count width, enumerates and brings up CPUs, sizes
 per-CPU storage, or signals across CPUs, and it is exactly what this paragraph lists. Code that only
-reads the booted CPU count (`CPU_COUNT`, a `cpu_count` argument) to iterate over CPUs is not on it;
-the rules of [coding-standards.md](coding-standards.md) § CPU-Count Width and the release host runs
-cover it. The surface is these files as a whole:
+reads `CPU_COUNT` or a `cpu_count` argument to iterate over CPUs, naming no listed item, is not on
+it; the rules of [coding-standards.md](coding-standards.md) § CPU-Count Width and the release host
+runs cover it. The surface is these files as a whole:
 
 - `core/kernel/src/cpu_mask.rs` (the CPU mask type and its width);
 - `core/kernel/src/percpu.rs` (per-CPU data and its slabs);
@@ -412,10 +412,11 @@ changed line that names one of these items as a whole identifier or lies within 
   (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or `Prng` inside
   `CpuRng`), and so is a change to a constant that sizes a per-CPU allocation (`KERNEL_STACK_PAGES`
   for the idle stacks);
-- CPU enumeration and bringup: `parse_cpu_topology`, `parse_madt_topology`, and `parse_cpu_count` in
-  the bootloader, and the kernel's boot CPU count (`boot_cpu_count`), `start_ap`, `sbi_hart_start`,
-  `kernel_entry_ap`, every `init_ap`, and the `init_ap_*` per-CPU storage initialisers in the
-  kernel;
+- CPU enumeration and bringup: `parse_cpu_topology`, `parse_madt_topology`, `parse_cpu_count`, and
+  `CpuTopology` in the bootloader, and a changed line that reads a `CpuTopology` field into, or
+  writes, the `BootInfo` `cpu_count` or `cpu_ids`; the kernel's boot CPU count (`boot_cpu_count`),
+  `start_ap`, `sbi_hart_start`, `kernel_entry_ap`, every `init_ap`, and the `init_ap_*` per-CPU
+  storage initialisers in the kernel;
 - IPI send and receive: `send_wakeup_ipi`, `send_tlb_shootdown_ipi`, `send_init_ipi`, `send_sipi`,
   `send_nmi_to`, `sbi_send_ipi_to`, `sbi_hart_mask`, `wait_for_ack`, `IpiWaitCtx`, the
   `IPI_VECTOR_*` constants, the x86_64 `ipi_*` stubs and handlers in `idt.rs`, the x86_64 ICR and
@@ -448,8 +449,8 @@ git diff --stat "$B" <head> -- core/kernel/src/cpu_mask.rs core/kernel/src/percp
     'core/kernel/src/arch/*/ap_trampoline.rs'
 S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|init_storage|init_per_cpu_storage'
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
-S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample"
-S="$S|TlbShootdownRequest|parse_cpu_topology|parse_madt_topology|parse_cpu_count|start_ap"
+S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|TlbShootdownRequest|CpuTopology"
+S="$S|parse_cpu_topology|parse_madt_topology|parse_cpu_count|start_ap"
 S="$S|sbi_hart_start|kernel_entry_ap|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdown|init)_ipi"
 S="$S|send_sipi|send_nmi_to|sbi_send_ipi_to|sbi_hart_mask|wait_for_ack|IpiWaitCtx"
 S="$S|IPI_VECTOR_[A-Z_]+|ipi_[a-z_]+_(stub|handler)|apic_send_icr|wait_icr_idle"
@@ -520,20 +521,20 @@ stated purpose does not raise the count.
 **When the runs are owed.** Each local host run a PR owes MUST pass, at its repeat count, at one
 head that covers the merge head. For every local and release host run, only a `PASS` outcome of
 `run-parallel` ([xtask/README.md](../xtask/README.md)) passes; a `QEMU-CRASH` run, a crash of the
-host emulator, is run again and the re-run's outcome stands; `OK` and `ERR` count as failures.
-The PR's own diff at a head is the diff from that head's merge base with the fetched
-`master` to the head (after `git fetch origin`,
-`git diff $(git merge-base <head> origin/master) <head>`), so it excludes what a merge or rebase
-from `master` brings in. A run's surface is the surface that owes it: the CPU-count surface for the
-boundary set, the memory surface for the memory variation, and, for the runs a concurrency-fix
-purpose owes, every non-inert line of the PR's own diff. A run at head H covers a later head M when
-the PR's own diff makes the same non-inert changes to that run's surface at H and at M. An update
-from `master` that leaves those changes as they were therefore owes no run; one whose conflict
-resolution alters them does. A fix round that alters them breaks the coverage of the runs that
-surface owes, and those runs MUST be run again at a head after it. The PR body MUST report each run
-it owes with its `--runs` count and the head it ran at, or state that none is owed and why: that
-its changes outside Markdown are all inert, or that its non-inert lines change neither surface and
-it states no concurrency-fix purpose as Repeat count defines it.
+host emulator, is run again and the re-run's outcome stands; `OK` and `ERR` count as failures. The
+PR's own diff at a head is the diff from that head's merge base with the fetched `master` to the
+head (after `git fetch origin`, `git diff $(git merge-base <head> origin/master) <head>`), so it
+excludes what a merge or rebase from `master` brings in. A run's surface is the surface that owes
+it: the CPU-count surface for the boundary set, the memory surface for the memory variation, and,
+for the runs a concurrency-fix purpose owes, every non-inert line of the PR's own diff. A run at
+head H covers a later head M when the PR's own diff makes the same non-inert changes to that run's
+surface at H and at M. An update from `master` that leaves those changes as they were therefore owes
+no run; one whose conflict resolution alters them does. A fix round that alters them breaks the
+coverage of the runs that surface owes, and those runs MUST be run again at a head after it. The PR
+body MUST report each run it owes with its `--runs` count, its outcome, and the head it ran at, or
+state that none is owed and why: that its changes outside Markdown are all inert, or that its
+non-inert lines change neither surface and it states no concurrency-fix purpose as Repeat count
+defines it.
 
 **Hangs at oversubscription.** A boundary run the PR does not owe, that is, one whose surface the
 PR's own diff does not change, that HANGs (outlives its `--timeout` budget) or fails with a defect

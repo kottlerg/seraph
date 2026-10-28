@@ -10,8 +10,9 @@ packing them onto one is design intent, not yet implemented
 
 The scheduler interacts with two subsystems:
 
-- **IPC** — IPC interacts with the scheduler only through its park, un-commit and wake
-  primitives and performs no direct context switch (see
+- **IPC** — IPC parks and wakes threads through the scheduler's park, un-commit, wake and
+  park-episode primitives and performs no direct context switch; the scheduler's timer path and
+  death notification in turn call into IPC objects (see
   [ipc-internals.md § IPC Scheduling Interaction](ipc-internals.md#ipc-scheduling-interaction))
 - **Architecture layer** — context save/restore and the preemption timer are implemented
   by the arch-dispatch surface defined in [arch-interface.md](arch-interface.md)
@@ -486,6 +487,8 @@ the configured periodic interval on each CPU. The tick handler, `timer_tick`, ru
 
 ```
 timer_tick():
+    if cpu == 0:                              // BSP only
+        sleep_check_wakeups(); watchdog_tick_and_check()
     if current.slice_remaining == 0:          // idle thread
         try_pull_balance(cpu); return
     current.slice_remaining -= 1
@@ -493,10 +496,14 @@ timer_tick():
         current.slice_remaining = TIME_SLICE_TICKS
         try_pull_balance(cpu)
         if preemption_disabled(): return      // see § Kernel-Mode Preemption Points
-        schedule(requeue_current = true)      // requeue at its level's tail, then dequeue_highest
+        schedule(Requeue::Always)             // requeue at its level's tail, then dequeue_highest
     else:
         try_pull_balance(cpu)
 ```
+
+Only CPU 0's tick services the sleep list (`sleep_check_wakeups`) and runs the softlockup
+watchdog (`watchdog_tick_and_check`), so no other CPU's tick wakes a timed-out sleeper (see
+[thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants)).
 
 On slice expiry the current thread goes back to the tail of its priority's FIFO, and
 `dequeue_highest` picks the next thread. If no other thread at its priority or higher is
@@ -526,7 +533,7 @@ Each CPU has one idle thread (priority 0) that runs when no other thread is read
 Each iteration of `idle_thread_entry` first drains this CPU's deferred-reclaim queue
 (`cap::object::drain_deferred_reclaim`) with interrupts enabled. It then masks interrupts
 and checks `take_reschedule_pending` and `has_runnable` together. If either is set, it
-re-enables interrupts and calls `schedule(true)` when the run queue has work, then loops.
+re-enables interrupts and calls `schedule(Requeue::Always)` when the run queue has work, then loops.
 Otherwise it halts through the atomic enable-and-halt `arch::current::cpu::halt_until_interrupt`.
 Masking before the check means a wake IPI that lands between the check and the halt stays
 pending and ends the halt. The protocol is specified in
@@ -537,7 +544,7 @@ The timer never preempts the idle thread. Its `slice_remaining` is fixed at 0, a
 `timer_tick` returns before the decrement for a zero slice; the check keys on the zero
 slice, not on priority 0. Because its time slice is permanently zero, the timer never
 deschedules it inside a teardown wait. The idle thread yields voluntarily via
-`schedule(true)` when its run queue has work.
+`schedule(Requeue::Always)` when its run queue has work.
 
 ---
 

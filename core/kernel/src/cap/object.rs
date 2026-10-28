@@ -1526,7 +1526,7 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
     let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
     // SAFETY: this_cpu < MAX_CPUS; `current` is written only by this CPU at
     // dispatch, and per contract we are that running thread.
-    let cur = unsafe { crate::sched::scheduler_for(this_cpu).current };
+    let cur = unsafe { crate::sched::scheduler_for(this_cpu).current() };
     // Tripwire for the contract above: the caller observed its own `Exited`
     // state under the scheduler lock, so the read here is stable.
     // SAFETY: cur is this CPU's `current`, valid while installed.
@@ -1960,7 +1960,7 @@ unsafe fn dealloc_object_one(
                 // own CPU's `current` needs no lock — only this CPU writes it at
                 // dispatch, and we are that running thread.
                 let is_self = core::ptr::eq(tcb, unsafe {
-                    crate::sched::scheduler_for(this_cpu).current
+                    crate::sched::scheduler_for(this_cpu).current()
                 });
                 if is_self
                 {
@@ -2026,8 +2026,7 @@ unsafe fn dealloc_object_one(
                     // word is stashed in its own scheduler (under that lock).
                     for cpu in 0..cpu_count
                     {
-                        let s = crate::sched::scheduler_for(cpu);
-                        s.saved_lock_flags = s.lock.lock_raw();
+                        crate::sched::scheduler_for(cpu).lock_saving_flags();
                     }
 
                     // Read priority inside the all-locks region. This dealloc and
@@ -2122,8 +2121,7 @@ unsafe fn dealloc_object_one(
                     // tcb.sched_lock).
                     for cpu in (0..cpu_count).rev()
                     {
-                        let s = crate::sched::scheduler_for(cpu);
-                        s.lock.unlock_raw(s.saved_lock_flags);
+                        crate::sched::scheduler_for(cpu).unlock_saved_flags();
                     }
                     (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
 
@@ -2845,7 +2843,7 @@ unsafe fn dealloc_object_one(
                         // (fault-handling.md § Liveness rule 3).
                         crate::sched::thread::stamp_cancelled_deposit(
                             tcb,
-                            (*tcb).in_fault_delivery,
+                            crate::sched::thread::ParkKind::of_sender(tcb),
                         );
                         // Claim for wake under ep.lock (#160). Cleared by
                         // enqueue_and_wake.

@@ -145,7 +145,7 @@ The first `FS_READ_MEMORY` for a given (client, file) pair MAY carry
 the client's per-process release-endpoint SEND in `caps[0]`.
 Subsequent `FS_READ_MEMORY`s for the same pair carry no caps; clients
 that opt out of cooperative release omit the cap on every call,
-falling back to the eviction worker's hard-revoke path.
+and eviction then revokes the page without the cooperative round-trip.
 
 The driver keeps this read-side bookkeeping (outstanding pages and the
 recorded release endpoint) in a lazily-allocated `OpenFile` slot keyed
@@ -279,8 +279,12 @@ release of a cookie whose wait ran out is refused at once); this covers
 a release the driver sends before its reply to the cookie's
 [`FS_READ_MEMORY`](#label-7-fs_read_memory) arrives. After the reply,
 or after the cooperative-release watchdog window (100 ms) with none,
-the driver revokes every cap derived from the parent Memory cap and
-deletes the parent. The ack tells the driver the client unmapped in
+the driver revokes every cap derived from the parent Memory cap,
+deletes the parent, and releases the page-cache slot, unless the
+client's [client-to-driver release](#client-to-driver-release) or
+[`FS_CLOSE`](#label-3-fs_close) has already done so: each page is
+cleaned up once, by whichever path removes it from the open-file
+table first. The ack tells the driver the client unmapped in
 time; without one, the revoke is what tears down a mapping the client
 still holds. A reply with any other label is not an acknowledgement; a
 client that cannot unmap the page, or whose copy outlasts the window,

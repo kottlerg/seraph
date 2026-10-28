@@ -1553,7 +1553,8 @@ impl File
         // release-endpoint SEND in caps[0]; the driver records it on
         // the OpenFile slot's first allocation so the eviction worker
         // can route a cooperative FS_RELEASE_MEMORY back to us, letting
-        // us unmap the page, or finish a copy from it, before its revoke.
+        // us unmap the page, or finish a copy from it, before its revoke,
+        // within the driver's cooperative-release window (release_handler).
         // `swap` ensures only one concurrent
         // reader attempts the transfer — the kernel `transfer_caps`
         // path moves the cap out of our CSpace, leaving the source slot
@@ -1588,7 +1589,11 @@ impl File
         let copy_len = bytes_valid.min(buf.len());
         // SAFETY: VA is mapped read-only for one page, and
         // `checked_frame_reply` holds `memory_data_offset + bytes_valid <=
-        // PAGE_SIZE`.
+        // PAGE_SIZE`. The `ReadMark` holds a driver release of the page off
+        // only within the driver's cooperative-release window; a copy that
+        // outlasts it is revoked mid-copy and faults this thread (a fault,
+        // not a read of other memory: the VA stays reserved). #31 tracks a
+        // revocation model that does not fault the client.
         let src = unsafe {
             core::slice::from_raw_parts(
                 (va + memory_data_offset as u64) as *const u8,

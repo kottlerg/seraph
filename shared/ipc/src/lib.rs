@@ -1218,7 +1218,8 @@ pub mod fs_labels
     /// so its eviction worker can route cooperative `FS_RELEASE_MEMORY`
     /// back to the client. Subsequent `FS_READ_MEMORY`s for the same
     /// pair carry no caps. Clients that opt out of cooperative release
-    /// omit the cap on every call; eviction falls back to hard-revoke.
+    /// omit the cap on every call; eviction then revokes without the
+    /// cooperative round-trip.
     /// Reply: `data[0]` = bytes valid in the returned page starting at
     /// the indicated page offset, `data[1]` = the same release cookie
     /// echoed back, `data[2]` = byte offset within the returned page

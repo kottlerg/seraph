@@ -11,12 +11,13 @@
 //! `IO_ERROR`. The eviction worker pops the request, sends
 //! `FS_RELEASE_MEMORY` on the client's release endpoint, and waits
 //! up to [`RELEASE_TIMEOUT_MS`] for `FS_RELEASE_ACK`. Either way
-//! the worker then `cap_revoke`s the per-cookie ancestor cap, drops
-//! it, decrements the cache slot's refcount, and clears the per-file
-//! outstanding-page entry. An ack means the client has already
-//! unmapped the page; without one the revoke tears down the client's
-//! mapping, and the client takes a `USERSPACE FAULT` on its next
-//! access.
+//! the worker then takes the per-file outstanding-page entry and, if
+//! no other path has cleaned it up meanwhile (the client's synchronous
+//! release, or `FS_CLOSE`), `cap_revoke`s the per-cookie ancestor cap,
+//! drops it, and decrements the cache slot's refcount. An ack means
+//! the client has already unmapped the page; without one the revoke
+//! tears down the client's mapping, and the client takes a
+//! `USERSPACE FAULT` on its next access.
 //!
 //! The watchdog is fully userspace. `ipc_call` has no kernel-side
 //! timeout, so the worker spawns a child thread to issue the call
@@ -69,7 +70,8 @@ pub struct EvictReq
     pub ancestor_cap: u32,
     /// SEND cap on the client's release endpoint, addressed by
     /// `FS_RELEASE_MEMORY`. Zero means the client did not provide
-    /// one, in which case the worker skips straight to hard-revoke.
+    /// one, in which case the worker skips the cooperative round-trip
+    /// and goes straight to the revoke.
     pub release_endpoint_cap: u32,
 }
 
@@ -133,35 +135,53 @@ pub fn worker_loop(
     loop
     {
         let req = pop_blocking(&state);
-        let acked = if req.release_endpoint_cap != 0
+        let outcome = if req.release_endpoint_cap != 0
         {
             cooperative_release(&req)
         }
         else
         {
-            // No client release endpoint — go straight to
-            // hard-revoke. Plan-documented "skip cooperative"
-            // path for clients that elected not to participate.
-            false
+            Release::NoEndpoint
         };
-        if !acked
+        match outcome
         {
-            std::os::seraph::log!(
-                "FS_RELEASE_MEMORY not acked (no reply in time, or a refusal); revoking parent cap (badge={}, slot={})",
+            Release::Acked =>
+            {}
+            Release::NoEndpoint => std::os::seraph::log!(
+                "no release endpoint; revoking parent cap (badge={}, slot={})",
                 req.file_badge,
                 req.slot_idx
-            );
+            ),
+            Release::Refused(label) => std::os::seraph::log!(
+                "FS_RELEASE_MEMORY refused (label={}); revoking parent cap (badge={}, slot={})",
+                label,
+                req.file_badge,
+                req.slot_idx
+            ),
+            Release::CallFailed => std::os::seraph::log!(
+                "FS_RELEASE_MEMORY call failed; revoking parent cap (badge={}, slot={})",
+                req.file_badge,
+                req.slot_idx
+            ),
+            Release::TimedOut => std::os::seraph::log!(
+                "FS_RELEASE_MEMORY timeout; revoking parent cap (badge={}, slot={})",
+                req.file_badge,
+                req.slot_idx
+            ),
         }
-        // Cleanup is identical for cooperative and forced paths:
-        // revoke the ancestor (kills the client's derived child
-        // cap and tears down its mapping), delete the ancestor
-        // from fs's CSpace, drop the cache-slot refcount, and
-        // clear the per-file outstanding-page entry so a later
-        // close does not double-decrement.
-        let _ = syscall::cap_revoke_all(req.ancestor_cap);
-        let _ = syscall::cap_delete(req.ancestor_cap);
-        cache.release_slot(req.slot_idx);
-        clear_outstanding(&files, req.file_badge, req.cookie);
+        // The client's synchronous FS_RELEASE_MEMORY and FS_CLOSE clean an
+        // outstanding page up on the main thread, and may do so while the
+        // worker waits on the cooperative round-trip. Whichever path takes
+        // the entry out of the open-file table owns the cleanup: revoke the
+        // ancestor (kills the client's derived child cap and tears down its
+        // mapping), delete it from fs's CSpace, and drop the cache-slot
+        // refcount, once.
+        if take_outstanding(&files, &req)
+        {
+            let _ = syscall::cap_revoke_all(req.ancestor_cap);
+            let _ = syscall::cap_delete(req.ancestor_cap);
+            cache.release_slot(req.slot_idx);
+        }
     }
 }
 
@@ -178,9 +198,24 @@ fn pop_blocking(state: &EvictionState) -> EvictReq
     }
 }
 
+/// How a cooperative release round-trip ended.
+#[derive(Clone, Copy)]
+enum Release
+{
+    /// The client replied `FS_RELEASE_ACK` in time: it has unmapped the page.
+    Acked,
+    /// The client replied in time with another label.
+    Refused(u64),
+    /// The `ipc_call` to the client's release endpoint failed.
+    CallFailed,
+    /// No reply within `RELEASE_TIMEOUT_MS`.
+    TimedOut,
+    /// The client delivered no release endpoint, so none was sent.
+    NoEndpoint,
+}
+
 /// Send `FS_RELEASE_MEMORY` to the client and wait up to
-/// `RELEASE_TIMEOUT_MS` for the ack. Returns `true` iff the
-/// client replied with `FS_RELEASE_ACK` in time.
+/// `RELEASE_TIMEOUT_MS` for its reply.
 ///
 /// `ipc_call` has no kernel-side timeout, so the synchronous IPC
 /// runs on a child thread and the parent waits with
@@ -190,9 +225,9 @@ fn pop_blocking(state: &EvictionState) -> EvictReq
 /// its own write. A truly hung client leaks the child thread,
 /// which is the documented cost of cooperative release without
 /// a kernel-side IPC-cancellation primitive.
-fn cooperative_release(req: &EvictReq) -> bool
+fn cooperative_release(req: &EvictReq) -> Release
 {
-    let chan: Arc<(Mutex<Option<bool>>, Condvar)> = Arc::new((Mutex::new(None), Condvar::new()));
+    let chan: Arc<(Mutex<Option<Release>>, Condvar)> = Arc::new((Mutex::new(None), Condvar::new()));
     let chan_child = chan.clone();
     let ep = req.release_endpoint_cap;
     let cookie = req.cookie;
@@ -207,12 +242,17 @@ fn cooperative_release(req: &EvictReq) -> bool
             // SAFETY: `ipc_buf` is the registered IPC buffer for this
             // thread (set in `std::thread`'s entry trampoline).
             let result = unsafe { ipc::ipc_call(ep, &msg, ipc_buf) };
-            let acked = matches!(&result, Ok(reply) if reply.label == fs_labels::FS_RELEASE_ACK);
+            let outcome = match result
+            {
+                Ok(reply) if reply.label == fs_labels::FS_RELEASE_ACK => Release::Acked,
+                Ok(reply) => Release::Refused(reply.label),
+                Err(_) => Release::CallFailed,
+            };
 
             let mut st = chan_child.0.lock().unwrap_or_else(PoisonError::into_inner);
             if st.is_none()
             {
-                *st = Some(acked);
+                *st = Some(outcome);
             }
             chan_child.1.notify_all();
         });
@@ -235,31 +275,34 @@ fn cooperative_release(req: &EvictReq) -> bool
             break;
         }
     }
-    let acked = matches!(*st, Some(true));
-    if st.is_none()
-    {
-        // Mark as given up so a late child reply skips its write
-        // rather than racing the parent's cleanup.
-        *st = Some(false);
-    }
-    acked
+    // Mark as given up so a late child reply skips its write rather than
+    // racing the parent's cleanup.
+    *st.get_or_insert(Release::TimedOut)
 }
 
-fn clear_outstanding(files: &Mutex<[OpenFile; MAX_OPEN_FILES]>, file_badge: u64, cookie: u64)
+/// Take `req`'s outstanding-page entry out of the open-file table, under
+/// the table lock the main thread's release and close paths hold. Returns
+/// whether the entry was still there (same file, cookie, cache slot, and
+/// ancestor cap), in which case the caller owns its cleanup; `false` means
+/// another path already cleaned it up.
+fn take_outstanding(files: &Mutex<[OpenFile; MAX_OPEN_FILES]>, req: &EvictReq) -> bool
 {
     let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some(idx) = find_by_badge(&files_g, file_badge)
+    let Some(idx) = find_by_badge(&files_g, req.file_badge)
     else
     {
-        return;
+        return false;
     };
     for slot in &mut files_g[idx].outstanding
     {
         if let Some(entry) = slot
-            && entry.cookie == cookie
+            && entry.cookie == req.cookie
+            && entry.slot_idx == req.slot_idx
+            && entry.ancestor_cap == req.ancestor_cap
         {
             *slot = None;
-            break;
+            return true;
         }
     }
+    false
 }

@@ -308,18 +308,14 @@ fn service_loop(
         let (node_id, parent_rights) = match gate(msg.label, msg.badge)
         {
             Ok(pair) => pair,
-            Err(GateError::UnknownLabel) =>
+            Err(err) =>
             {
-                let reply = IpcMessage::new(ipc::fs_errors::UNKNOWN_OPCODE);
-                // SAFETY: ipc_buf is the registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-                continue;
-            }
-            Err(GateError::PermissionDenied) =>
-            {
-                let reply = IpcMessage::new(ipc::fs_errors::PERMISSION_DENIED);
-                // SAFETY: ipc_buf is the registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                let code = match err
+                {
+                    GateError::UnknownLabel => ipc::fs_errors::UNKNOWN_OPCODE,
+                    GateError::PermissionDenied => ipc::fs_errors::PERMISSION_DENIED,
+                };
+                refuse_keeping_no_caps(&msg, opcode, code, ipc_buf);
                 continue;
             }
         };
@@ -743,8 +739,8 @@ fn handle_read_memory_node_cap(
         // kernel `transfer_caps` path moved it into our CSpace if
         // present; record it on the slot so the eviction worker can
         // route cooperative `FS_RELEASE_MEMORY` back to the client.
-        // A zero cap indicates an opt-out client; eviction falls back
-        // to the hard-revoke path. Subsequent FS_READ_MEMORYs from
+        // A zero cap indicates an opt-out client; eviction skips the
+        // cooperative round-trip and revokes. Subsequent FS_READ_MEMORYs from
         // the same client carry no caps.
         let release_endpoint_cap = msg.caps().first().copied().unwrap_or(0);
         files[slot_idx] = OpenFile {
@@ -773,6 +769,29 @@ fn handle_read_memory_node_cap(
         ipc_buf,
         eviction,
     );
+}
+
+/// Reply `code` to a request the rights gate refused, holding none of the
+/// caps it carried: an `FS_WRITE_MEMORY` source page goes back in the
+/// reply, as § Label 12 promises in every outcome, and any other cap (an
+/// `FS_READ_MEMORY` release SEND) is deleted.
+fn refuse_keeping_no_caps(msg: &IpcMessage, opcode: u64, code: u64, ipc_buf: *mut u64)
+{
+    let mut builder = IpcMessage::builder(code);
+    for &cap in msg.caps()
+    {
+        if opcode == fs_labels::FS_WRITE_MEMORY
+        {
+            builder = builder.cap(cap);
+        }
+        else
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+    }
+    let reply = builder.build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
 /// `FS_RELEASE_MEMORY` against a node cap. Resolves the lazy

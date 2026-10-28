@@ -58,8 +58,9 @@ pub struct OpenFile
     /// node cap; the eviction worker addresses cooperative
     /// `FS_RELEASE_MEMORY` requests to it when reclaiming an
     /// outstanding cache page. A zero cap indicates the client opted
-    /// out (no caps on the first memory-cap request); eviction falls
-    /// straight through to the hard-revoke path. Deleted from the
+    /// out (no caps on the first memory-cap request); eviction skips
+    /// the cooperative round-trip and goes straight to the revoke.
+    /// Deleted from the
     /// fs's `CSpace` at `FS_CLOSE` time.
     pub release_endpoint_cap: u32,
 }

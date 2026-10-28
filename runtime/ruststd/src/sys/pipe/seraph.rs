@@ -506,8 +506,9 @@ impl Pipe {
             // Each flag is Release-stored after the closing thread's last ring
             // write (`closed`: the peer's `Pipe::close`, run by its `Drop` or
             // stdio's `close_all`; `peer_dead`: child death -> kernel death
-            // post -> bridge), so an empty drain performed after observing a
-            // set flag holds every byte written before the flag. The reverse
+            // post -> bridge), so a drain performed after observing a set
+            // flag sees every byte the closing thread wrote before the flag,
+            // and an empty one means none remain. The reverse
             // order loses bytes the peer writes between the drain and the
             // flag load. Bytes another thread writes after a concurrent
             // close may go unseen (module doc).

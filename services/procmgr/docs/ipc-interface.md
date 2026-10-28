@@ -29,7 +29,8 @@ create call returns); procmgr identifies the target process by the badge
 `ipc_recv` delivers. Labels 14–16 are specified in § `REGISTER_DEATH_EQ`,
 § `REGISTER_INIT_TEARDOWN`, and § `INIT_TEARDOWN_DONE` below. Labels 3–7 and 10
 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
-other unknown opcode.
+other unknown opcode, and deletes the caps such a request carried (see
+§ Capability Transfer).
 
 Memory-cap allocation is owned by memmgr, not procmgr, per
 [docs/process-lifecycle.md](../../../docs/process-lifecycle.md)
@@ -67,7 +68,10 @@ never reads past the data area: an `args_bytes` over 256 degrades env along
 with argv (the env header position derives from it), an env header word beyond
 the delivered word count degrades env to empty, and blob bytes declared beyond
 the delivered words read as zero. procmgr deletes its copies of cap[0] and
-cap[1] whether creation succeeds or fails.
+cap[1] whether creation succeeds or fails, and deletes any further cap. A
+failed creation releases everything procmgr acquired for the child, including
+the child's memmgr record: procmgr sends memmgr `PROCESS_DIED` for it, so the
+pages already allocated to the child return to memmgr's pool.
 
 **Reply (success):**
 
@@ -81,6 +85,13 @@ The process handle is a badged endpoint capability. The caller uses it for the
 per-process operations — the badge identifies the process without a forgeable
 PID. The `Thread` cap allows the caller to bind death notifications or
 stop/configure the thread.
+
+The reply's cap transfer is all-or-nothing
+([docs/ipc-design.md](../../../docs/ipc-design.md#message-format) § Message Format). When the
+caller's `CSpace` cannot take both caps (or the caller is gone), the caller
+resumes with `IPC_REPLY_TRANSFER_FAILED` and no caps. procmgr then deletes both
+caps and destroys the suspended child as `DESTROY_PROCESS` does, since no one
+holds a handle to it.
 
 **Reply (error):**
 
@@ -168,12 +179,10 @@ embedded in the endpoint capability.
 | Code | Name | Meaning |
 |---|---|---|
 | 2 | `OUT_OF_MEMORY` | Installing the namespace caps in the child failed |
-| 3 | (none) | `thread_configure_with_tls` failed |
+| 3 | `THREAD_CONFIGURE_FAILED` | `thread_configure_with_tls` failed |
 | 4 | `INVALID_BADGE` | No process with the given badge exists |
 | 5 | `ALREADY_STARTED` | Process was already started |
-| 6 | (none) | `thread_start` failed with an error other than `Interrupted`, which procmgr retries |
-
-Codes 3 and 6 are raw values with no `procmgr_errors` constant.
+| 6 | `THREAD_START_FAILED` | `thread_start` failed with an error other than `Interrupted`, which procmgr retries |
 
 ### Label 8: `DESTROY_PROCESS`
 
@@ -223,15 +232,16 @@ child. Sent on the process handle.
 procmgr copies each cap into the child's CSpace and writes the slots into the
 direction's `<dir>_memory_cap`, `<dir>_data_notification_cap`, and
 `<dir>_space_notification_cap` fields of the child's `ProcessInfo`, then deletes
-its own copies on success and on every failure but one: when fewer than three
-caps are attached, procmgr replies `INVALID_ARGUMENT` without deleting the
-attached caps, which stay in procmgr's CSpace (#449). A spawner calls this
-once per piped direction; a later call for the same direction overwrites the
-earlier one.
+its own copies. It deletes every cap the request carried on success and on
+every failure, including caps past cap[2]. Every check precedes the copies, and
+a copy that fails revokes the copies already made, so a refused call installs
+nothing in the child. A spawner calls this once per piped direction. A second
+call for a direction already configured is refused, since procmgr cannot remove
+the earlier triple from the child's CSpace.
 
 **Error codes:** 2 `OUT_OF_MEMORY` (mapping or `cap_copy` failed), 4
 `INVALID_BADGE`, 5 `ALREADY_STARTED`, 7 `INVALID_ARGUMENT` (fewer than three
-caps, a zero cap, or an unknown direction).
+caps, a zero cap, an unknown direction, or a direction already configured).
 
 ### Label 12: `CONFIGURE_NAMESPACE`
 
@@ -250,7 +260,8 @@ only path that installs `ProcessInfo.system_root_cap` and
 
 procmgr stores the caps, deletes any previously installed pair, and copies
 them into the child's CSpace at `START_PROCESS`. It does not validate cap shape.
-procmgr consumes the transferred caps on success and failure alike.
+procmgr consumes the transferred caps on success and failure alike, and deletes
+any cap past cap[1].
 
 **Error codes:** 4 `INVALID_BADGE`, 5 `ALREADY_STARTED`, 7 `INVALID_ARGUMENT`
 (no cap in cap[0]).
@@ -277,15 +288,20 @@ against that cap and never holds a namespace cap of its own. Loading, the
 | last cap | When `CREATE_DEATH_RELAY` is set: POST-only `EventQueue` cap |
 
 procmgr `FS_CLOSE`s and deletes the file cap after the load, whether it
-succeeds or fails. When present, the death-relay cap is the last cap in the
-message, so the creator-endpoint slot stays at cap[1]. At finalize procmgr binds
-it as an `AddressSpace` death observer (correlator 0) on the child, so a
-terminal fault in any of the child's threads posts the fault class to the
-spawner's own death queue, then deletes its copy. `CREATE_PROCESS` ignores
-bit 17.
+succeeds or fails, and deletes its copy of the creator endpoint and any cap the
+layout does not name. When present, the death-relay cap is the last cap in the
+message, so the creator-endpoint slot stays at cap[1]; it is a cap of its own,
+so a request that sets `CREATE_DEATH_RELAY` carries at least two caps, and one
+whose only cap is the file cap is refused with `INVALID_ARGUMENT`. Once the
+child is recorded, procmgr binds the relay as an `AddressSpace` death observer
+(correlator 0) on the child, so a terminal fault in any of the child's threads
+posts the fault class to the spawner's own death queue, then deletes its copy;
+a failed creation deletes it unbound. `CREATE_PROCESS` ignores bit 17.
 
 **Reply (success):** as for `CREATE_PROCESS` (cap[0] process handle, cap[1]
-child `Thread` cap).
+child `Thread` cap), including the destruction of a child whose reply caps
+cannot be delivered. A failed creation releases what procmgr acquired for the
+child, its memmgr record included, as for `CREATE_PROCESS`.
 
 **Error codes:**
 
@@ -293,8 +309,8 @@ child `Thread` cap).
 |---|---|---|
 | 1 | `INVALID_ELF` | `file_size` is zero, or ELF validation or relocation failed |
 | 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed |
-| 7 | `INVALID_ARGUMENT` | No file cap, reserved label bits `[28..32]` set, or the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band) |
-| 10 | `IO_ERROR` | `FS_READ` against the file cap failed; detecting a failed or zero-byte `FS_READ_MEMORY` mid-segment is design intent; not yet implemented (#449): today the segment tail stays zeroed and creation succeeds |
+| 7 | `INVALID_ARGUMENT` | No file cap, `CREATE_DEATH_RELAY` set with only the file cap, reserved label bits `[28..32]` set, or the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band) |
+| 10 | `IO_ERROR` | An `FS_READ` of the ELF header against the file cap failed, or a segment's file bytes did not all arrive: an `FS_READ_MEMORY` failed or returned zero bytes, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | Mapping failed during segment load |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
 
@@ -309,6 +325,14 @@ CSpace atomically with the message delivery, per
 § Capability Semantics in IPC.
 procmgr consumes the cap during
 process creation and does not return it.
+
+Every cap a request transfers lands in procmgr's CSpace, whether or not the
+request's layout names it. procmgr deletes the caps a layout does not name
+(caps past the last named position, and every cap of a label that names none:
+`START_PROCESS`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `INIT_TEARDOWN_DONE`, and
+unknown opcodes), and every cap of a refused request, except the init-reap
+refusals that keep caps init may still be running on (§ `REGISTER_INIT_TEARDOWN`).
+A padded or refused request therefore cannot grow procmgr's CSpace.
 
 On a create reply, procmgr transfers a badged process handle endpoint (for
 subsequent per-process operations) and a derived copy of the child's `Thread`
@@ -339,9 +363,8 @@ Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
 caller lacks `DEATH_EQ_AUTHORITY` or a death EQ is already registered,
 `INVALID_ARGUMENT` if no cap was transferred. Registration is first-wins:
 procmgr deletes the cap a second registration transfers and keeps the first,
-so a restarted logd receives no death events. A request refused for a missing
-`DEATH_EQ_AUTHORITY` badge keeps its transferred cap in procmgr's CSpace
-([#449](https://github.com/kottlerg/seraph/issues/449)).
+so a restarted logd receives no death events. procmgr deletes every cap a
+refused request carried, and any cap past `caps[0]`.
 
 logd derives a `POST`-only copy from its `RECV+POST` event queue
 before sending — the kernel's cap-transfer moves the sent cap into
@@ -362,19 +385,33 @@ Wire format:
 | `data[0]` | `1` on the first round (carrying kernel-object caps); `0` on subsequent donation rounds |
 | `caps[0..]` | Round 1: 4 kernel-object caps (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) — MOVED out of init's CSpace via IPC cap-transfer. Subsequent rounds: 1-4 reclaimable Memory caps per round (every reclaimable Memory cap init solely owns; the set is in [docs/process-lifecycle.md](../../../docs/process-lifecycle.md#init-reap) § Init reap). |
 
+**Gate.** Labels 15 and 16 are accepted only on an un-badged cap
+(`req.badge == 0`). Init holds one; the only other badge-0 holder is svcmgr,
+whose `procmgr_death_auth_source` is a mint source for real-logd's
+`DEATH_EQ_AUTHORITY` cap (see the
+[svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)). Every procmgr-spawned
+process holds a SEND badged with its process badge, so none of them can stage a
+handoff or hand procmgr caps to forward to memmgr's `DONATE_MEMORY_CAPS`. The
+handoff is one-shot: once the reap has run, every further round and
+`INIT_TEARDOWN_DONE` is refused.
+
 On the first round procmgr stores the kernel-object caps and binds a death-EQ
 observer on both init threads under the same correlator:
 `syscall::thread_bind_notification(main_thread, death_eq, procmgr_labels::INIT_REAP_CORRELATOR)`
-and the same call on `logd_thread`, expecting two deaths (`pending_deaths = 2`); the
-reap runs only after the second death. Either bind failing rejects the round with
-`INVALID_ARGUMENT`. Subsequent rounds append to the donation Memory cap list.
-`INIT_TEARDOWN_DONE` (label 16, no caps, no data words) closes the stream and arms
-the state machine.
+and the same call on `logd_thread`, expecting two deaths; the reap runs on the
+second death. Either bind failing rejects the round with `INVALID_ARGUMENT`.
+Subsequent rounds append to the donation Memory cap list. `INIT_TEARDOWN_DONE`
+(label 16, no caps, no data words) closes the stream and arms the state machine.
 
-Reply: `procmgr_errors::SUCCESS` on accept, `INVALID_ARGUMENT` when a first round arrives while an
-unreaped teardown is pending, a first round carries other than 4 caps, either death-EQ bind fails,
-or a donation round arrives while no teardown is pending. The pending teardown is cleared once the
-reap runs. The caps a rejected round moved into procmgr's CSpace stay there.
+Reply: `procmgr_errors::SUCCESS` on accept; `UNAUTHORIZED` from a badged sender;
+`INVALID_ARGUMENT` when a first round arrives while a handoff is open or after
+the reap, a first round carries other than 4 caps, either death-EQ bind fails,
+or a donation round arrives before the first round or after the reap. procmgr
+deletes the caps of a badged sender's round, and of any round refused after the
+reap. The caps of an un-badged round refused before the reap stay in procmgr's
+CSpace: they may be init's live `AddressSpace` or Memory
+caps, which procmgr cannot delete while init's threads run on them or its
+address space maps them.
 
 ## INIT_TEARDOWN_DONE — end-of-stream notification
 
@@ -385,16 +422,18 @@ Wire format:
 | label | `procmgr_labels::INIT_TEARDOWN_DONE` (16) |
 | caps | none |
 
-Procmgr replies `SUCCESS` then arms the state machine, or `INVALID_ARGUMENT`
-when no teardown is pending or the state machine is already armed. Init proceeds
-to `sys_thread_exit` immediately (per
+Procmgr replies `SUCCESS` then arms the state machine, `UNAUTHORIZED` from a
+badged sender, or `INVALID_ARGUMENT` when no handoff is open (none yet, or the
+reap ran) or the state machine is already armed; it deletes any cap the message
+carried. Init proceeds to `sys_thread_exit` immediately (per
 [services/init/docs/bootstrap.md](../../init/docs/bootstrap.md#handover) § Handover).
 Each death-EQ event with
 `INIT_REAP_CORRELATOR` (reserved `u32::MAX`) calls
-[`init_reap::run_reap`](../src/init_reap.rs), which counts the death (also one
-observed before `INIT_TEARDOWN_DONE` arms the reap) and, on the second, executes
-the six-step teardown (Threads → AddressSpace → DONATE_MEMORY_CAPS → drop procmgr's CSpace
-reference → log).
+[`init_reap::run_reap`](../src/init_reap.rs), which counts the death and, on the
+second, executes the six-step teardown (Threads → AddressSpace →
+DONATE_MEMORY_CAPS → drop procmgr's CSpace reference → log), whether or not
+`INIT_TEARDOWN_DONE` has armed the reap: a threadless init can send no further
+round.
 init-logd normally exits last, once real-logd's `HANDOVER_RELEASE` releases it;
 procmgr never force-stops it. If the handover never completes, init-logd serves on
 and init's caps stay held until shutdown — a benign hold, not a wedge (see the

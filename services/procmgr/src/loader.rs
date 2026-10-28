@@ -17,9 +17,9 @@ use syscall_abi::PAGE_SIZE;
 
 /// RAII handle for a transient scratch mapping in procmgr's own aspace.
 ///
-/// `new` reserves a contiguous unmapped VA range, calls `mem_map` against
-/// `memory_cap` with the requested rights, and stores the range so `Drop`
-/// can mirror the cleanup. Forgets the range on map-failure (allocator
+/// [`ScratchMapping::map`] reserves a contiguous unmapped VA range, calls
+/// `mem_map` against `memory_cap` with the requested rights, and stores the
+/// range so `Drop` can mirror the cleanup. Forgets the range on map-failure (allocator
 /// only tracks VA — the failed map leaves no kernel-side state).
 pub struct ScratchMapping
 {

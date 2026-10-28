@@ -23,8 +23,10 @@ procmgr/
 ├── Cargo.toml                  # Workspace member; std-using binary
 ├── README.md
 ├── process-table/              # `procmgr-process-table` crate: pure host-tested
-│                                 table + badge logic and the create-request
-│                                 argv/env blob decoder
+│                                 table + badge logic, the create-request
+│                                 argv/env blob decoder and cap split, the
+│                                 fs-reply bounds, and the init-reap state
+│                                 machine
 ├── src/
 │   ├── main.rs                 # main() (std runtime), IPC dispatch loop
 │   ├── loader.rs               # ELF load pipeline
@@ -86,7 +88,8 @@ procmgr/
 ## Init reap
 
 Procmgr accepts init's `REGISTER_INIT_TEARDOWN` handoff during init's Handover stage
-([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover). The first round, before
+([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover), once, and only on an
+un-badged cap, so no procmgr-spawned process can stage one. The first round, before
 init signals `HANDOVER_COMPLETE`, carries init's own `AddressSpace` / `CSpace` / `Thread` caps, so
 procmgr's death observers are bound before real-logd can release init-logd; later rounds carry every
 reclaimable Memory cap, and `INIT_TEARDOWN_DONE` ends the handoff. Procmgr binds a death-EQ observer

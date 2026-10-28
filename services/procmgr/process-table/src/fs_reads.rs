@@ -51,6 +51,25 @@ where
     Some(total)
 }
 
+/// Split the caps of an `FS_READ_MEMORY` reply into the one procmgr keeps
+/// and the ones it deletes.
+///
+/// A successful reply (`label == 0`, `bytes_valid > 0`) hands procmgr the
+/// cache page's Memory cap at `caps[0]`; every other cap, and on any other
+/// reply every cap, is surplus the untrusted server attached and procmgr
+/// deletes. Returns `(kept, surplus)`: `kept` is `None` when the reply is not
+/// a usable success (failure label, zero bytes, or no cap).
+#[must_use]
+pub fn read_memory_reply_caps(label: u64, bytes_valid: usize, caps: &[u32])
+-> (Option<u32>, &[u32])
+{
+    match caps.split_first()
+    {
+        Some((&memory_cap, extra)) if label == 0 && bytes_valid > 0 => (Some(memory_cap), extra),
+        _ => (None, caps),
+    }
+}
+
 /// The byte range of a mapped cache page an `FS_READ_MEMORY` reply names:
 /// `bytes_valid` bytes starting `data_offset` bytes into the page.
 ///
@@ -126,6 +145,25 @@ mod tests
     {
         let mut dst = [0u8; 10];
         assert_eq!(fill_exact(&mut dst, 0, 4, |_, _| None), None);
+    }
+
+    #[test]
+    fn read_memory_reply_keeps_the_first_cap_of_a_success_and_drops_the_rest()
+    {
+        assert_eq!(
+            read_memory_reply_caps(0, 64, &[5, 6, 7]),
+            (Some(5), &[6, 7][..])
+        );
+        assert_eq!(read_memory_reply_caps(0, 64, &[5]), (Some(5), &[][..]));
+    }
+
+    #[test]
+    fn read_memory_reply_drops_every_cap_of_a_failed_or_empty_reply()
+    {
+        // Failure label, zero bytes, and no cap at all: nothing is kept.
+        assert_eq!(read_memory_reply_caps(3, 64, &[5, 6]), (None, &[5, 6][..]));
+        assert_eq!(read_memory_reply_caps(0, 0, &[5]), (None, &[5][..]));
+        assert_eq!(read_memory_reply_caps(0, 64, &[]), (None, &[][..]));
     }
 
     #[test]

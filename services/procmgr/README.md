@@ -90,10 +90,10 @@ procmgr/
 Procmgr accepts init's `REGISTER_INIT_TEARDOWN` handoff during init's Handover stage
 ([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover), once, and only on an
 un-badged cap, which only init and svcmgr (holding it as a mint source) have; no other process
-can stage one. The first round, before
-init signals `HANDOVER_COMPLETE`, carries init's own `AddressSpace` / `CSpace` / `Thread` caps, so
-procmgr's death observers are bound before real-logd can release init-logd; later rounds carry every
-reclaimable Memory cap, and `INIT_TEARDOWN_DONE` ends the handoff. Procmgr binds a death-EQ observer
+can stage one. The first round, before init signals `HANDOVER_COMPLETE`, carries init's own
+`AddressSpace` / `CSpace` / `Thread` caps, so procmgr's death observers are bound before real-logd
+can release init-logd; later rounds carry every reclaimable Memory cap, and `INIT_TEARDOWN_DONE`
+ends the handoff. Procmgr binds a death-EQ observer
 on **both** init threads (main + init-logd) with `INIT_REAP_CORRELATOR` and reaps once both have
 exited — init-logd outlives main until the svcmgr-launched real-logd releases it via
 `HANDOVER_RELEASE` (see [logd handover protocol](../logd/docs/handover-protocol.md)). The reap is

@@ -536,14 +536,6 @@ pub fn stdio_file_unsupported_phase(_: &Caps)
 /// repeats every request, as a client flooding procmgr would.
 const REFUSAL_ROUNDS: usize = 16;
 
-/// The calling thread's IPC buffer, as svctest's main thread registered it.
-fn main_ipc_buf() -> *mut u64
-{
-    // cast_ptr_alignment: the IPC buffer page is 4 KiB-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    startup_info().ipc_buffer.cast::<u64>()
-}
-
 /// A cap to attach to a request: a SEND copy of svctest's own procmgr cap,
 /// which the call moves into procmgr's `CSpace`.
 fn spare_cap() -> u32
@@ -555,8 +547,8 @@ fn spare_cap() -> u32
 /// Call `target` with `msg` and assert procmgr replies `want`.
 fn expect_reply(target: u32, msg: &ipc::IpcMessage, want: u64, what: &str)
 {
-    // SAFETY: `main_ipc_buf` is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(target, msg, main_ipc_buf()) }
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(target, msg, std::os::seraph::current_ipc_buf()) }
         .unwrap_or_else(|e| panic!("{what}: ipc_call failed ({e})"));
     assert_eq!(reply.label, want, "{what}: procmgr replied {}", reply.label);
 }
@@ -564,7 +556,7 @@ fn expect_reply(target: u32, msg: &ipc::IpcMessage, want: u64, what: &str)
 /// Look up `/programs/hello` and return `(file_cap, size)`.
 fn hello_file() -> (u32, u64)
 {
-    let ipc_buf = main_ipc_buf();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let root = std::os::seraph::root_dir_cap();
     let (programs, _, _) = crate::ipc_util::ns::ns_lookup(root, b"programs", 0xFFFF, ipc_buf)
         .expect("ns_lookup /programs failed");
@@ -671,7 +663,8 @@ pub fn procmgr_refusals_phase(_: &Caps)
         "undeliverable-reply child exit {status}: {UNDELIVERABLE_LOOKUP_FAILED}=lookup failed, \
          {UNDELIVERABLE_REPLY_DELIVERED}=create reply delivered or not refused, \
          {UNDELIVERABLE_POOL_QUERY_FAILED}=pool query failed, \
-         {UNDELIVERABLE_NEVER_RECLAIMED}=the child's pages were never reclaimed"
+         {UNDELIVERABLE_NEVER_RECLAIMED}=the child's pages were never reclaimed, \
+         {UNDELIVERABLE_CALL_FAILED}=the create call failed"
     );
     std::os::seraph::log!("procmgr_refusals phase passed");
 }
@@ -690,9 +683,15 @@ fn configure_pipe_refusals()
         .word(0, size)
         .cap(file)
         .build();
-    // SAFETY: `main_ipc_buf` is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(startup_info().procmgr_endpoint, &create, main_ipc_buf()) }
-        .expect("raw CREATE_FROM_FILE call failed");
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let reply = unsafe {
+        ipc::ipc_call(
+            startup_info().procmgr_endpoint,
+            &create,
+            std::os::seraph::current_ipc_buf(),
+        )
+    }
+    .expect("raw CREATE_FROM_FILE call failed");
     assert_eq!(
         reply.label,
         procmgr_errors::SUCCESS,
@@ -753,6 +752,8 @@ const UNDELIVERABLE_POOL_QUERY_FAILED: i32 = 4;
 /// Exit code: memmgr's free pool never returned to its level before the
 /// create, in any window, so the created child's pages stayed accounted.
 const UNDELIVERABLE_NEVER_RECLAIMED: i32 = 5;
+/// Exit code: the `CREATE_FROM_FILE` call itself failed.
+const UNDELIVERABLE_CALL_FAILED: i32 = 6;
 /// Sample windows the child retries: memmgr's free-pool size is system-wide,
 /// and other processes (crasher shares the boot) can move it inside one.
 const UNDELIVERABLE_WINDOWS: u32 = 8;
@@ -771,7 +772,7 @@ fn undeliverable_reply_child_main() -> !
     use ipc::{IpcMessage, procmgr_labels};
 
     let info = startup_info();
-    let ipc_buf = main_ipc_buf();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let lookup = |dir: u32, name: &[u8]| {
         crate::ipc_util::ns::ns_lookup(dir, name, 0xFFFF, ipc_buf)
             .unwrap_or_else(|_| std::process::exit(UNDELIVERABLE_LOOKUP_FAILED))
@@ -805,7 +806,8 @@ fn undeliverable_reply_child_main() -> !
         {
             Ok(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED =>
             {}
-            _ => std::process::exit(UNDELIVERABLE_REPLY_DELIVERED),
+            Ok(_) => std::process::exit(UNDELIVERABLE_REPLY_DELIVERED),
+            Err(_) => std::process::exit(UNDELIVERABLE_CALL_FAILED),
         }
         for _ in 0..UNDELIVERABLE_POLLS
         {

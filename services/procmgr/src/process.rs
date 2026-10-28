@@ -1673,16 +1673,21 @@ fn next_memory_cookie() -> Option<u64>
 
 /// Issue `FS_READ_MEMORY` at byte `offset`.
 ///
-/// On success returns `(memory_cap, bytes_valid, memory_data_offset)` per
-/// `fs/docs/fs-driver-protocol.md`: the file's byte at `offset + i` for
+/// On success returns `(memory_cap, bytes_valid, memory_data_offset, cookie)`
+/// per `fs/docs/fs-driver-protocol.md`: the file's byte at `offset + i` for
 /// `i ∈ [0, bytes_valid)` lives in the returned memory cap at byte offset
-/// `memory_data_offset + i`. The memory cap is a per-call grandchild of the
-/// fs cache slot and is owned by the caller; `cap_delete` releases the
-/// caller's reference. Pre-Phase-9 the fs holds the underlying cache-slot
-/// refcount until `FS_CLOSE`; cooperative early release arrives with
-/// Phase 9's `FS_RELEASE_MEMORY`. `bytes_valid` is bounded by file end,
-/// cluster boundary, and memory-cap tail — callers must iterate from
-/// `offset + bytes_valid` to read past the boundary.
+/// `memory_data_offset + i`, and `cookie` names the request for the
+/// `FS_RELEASE_MEMORY` that drops the fs-side cache refcount once the caller
+/// has copied the bytes (`stream_segment_bytes` issues it; `FS_CLOSE` drops
+/// any the caller missed). The memory cap is a per-call grandchild of the fs
+/// cache slot and is owned by the caller; `cap_delete` releases the caller's
+/// reference. `bytes_valid` is bounded by file end, cluster boundary, and
+/// memory-cap tail — callers must iterate from `offset + bytes_valid` to read
+/// past the boundary.
+///
+/// The file cap is client-supplied, so its server is untrusted: every reply
+/// cap other than the returned one is deleted, and on a failed or empty reply
+/// every reply cap ([`process_table::fs_reads::read_memory_reply_caps`]).
 fn vfs_read_memory(
     file_cap: u32,
     ipc_buf: *mut u64,
@@ -1697,19 +1702,12 @@ fn vfs_read_memory(
 
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
-    // The file cap is client-supplied, so its server is untrusted: every
-    // reply cap this call does not hand back is deleted, whatever the reply.
-    let caps = reply.caps();
     let bytes_valid = reply.word(0) as usize;
-    let (&memory_cap, extra) = caps.split_first()?;
-    crate::release_caps(extra);
-    if reply.label != 0 || bytes_valid == 0
-    {
-        crate::release_caps(&[memory_cap]);
-        return None;
-    }
+    let (kept, surplus) =
+        process_table::fs_reads::read_memory_reply_caps(reply.label, bytes_valid, reply.caps());
+    crate::release_caps(surplus);
     let memory_data_offset = reply.word(2) as usize;
-    Some((memory_cap, bytes_valid, memory_data_offset, cookie))
+    Some((kept?, bytes_valid, memory_data_offset, cookie))
 }
 
 /// Read from an open file via its per-file capability.

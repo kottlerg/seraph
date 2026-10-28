@@ -16,11 +16,12 @@
 //! init's aspace/cspace while a thread still runs in them would fault it.
 //!
 //! The handoff's state machine (`process_table::InitReap`, host-tested
-//! there) accepts the rounds and `INIT_TEARDOWN_DONE` only from init's
-//! un-badged cap, counts the two init-thread deaths, and reaps on the last
-//! one, whether or not `INIT_TEARDOWN_DONE` armed it (a threadless init can
-//! send nothing more). The handoff is one-shot: after the reap every request
-//! is refused. This module performs the syscalls and IPC around it,
+//! there) accepts the rounds and `INIT_TEARDOWN_DONE` only from an un-badged
+//! cap (init's, or svcmgr's mint source; see `docs/ipc-interface.md`
+//! § `REGISTER_INIT_TEARDOWN`), counts the two init-thread deaths, and reaps
+//! on the last one, whether or not `INIT_TEARDOWN_DONE` armed it (a
+//! threadless init can send nothing more). The handoff is one-shot: after
+//! the reap every request is refused. This module performs the syscalls and IPC around it,
 //! serialised under procmgr's single-threaded `service_ep` recv loop.
 //!
 //! init-logd outlives init's main thread until svcmgr-launched real-logd pulls
@@ -119,8 +120,9 @@ fn refuse(refusal: Refusal, caps: &[u32], ipc_buf: *mut u64)
 /// Handle a `REGISTER_INIT_TEARDOWN` IPC.
 ///
 /// `data[0] != 0` marks the first round (carrying the 4 kernel-object
-/// caps); subsequent rounds carry only reclaimable Memory caps. Only init's
-/// un-badged cap (`req.badge == 0`) is accepted, and only before the reap.
+/// caps); subsequent rounds carry only reclaimable Memory caps. Only an
+/// un-badged cap (`req.badge == 0`: init's, or svcmgr's mint source) is
+/// accepted, and only before the reap.
 /// On the first round, binds death-EQ observers on both init threads (main +
 /// init-logd) with `INIT_REAP_CORRELATOR`.
 pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
@@ -183,8 +185,9 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
     reply(ipc_buf, procmgr_errors::SUCCESS);
 }
 
-/// Handle `INIT_TEARDOWN_DONE`: mark the handoff armed. Only init's
-/// un-badged cap is accepted, once, while the handoff is open. The message
+/// Handle `INIT_TEARDOWN_DONE`: mark the handoff armed. Only an un-badged
+/// cap (init's, or svcmgr's mint source) is accepted, once, while the
+/// handoff is open. The message
 /// names no caps, so procmgr deletes any it moved, accepted or refused.
 pub fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
 {

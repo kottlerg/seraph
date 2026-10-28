@@ -68,6 +68,8 @@ const ALIAS_BITS: u64 = 0xA1;
 const FRESH_BITS: u64 = 0xF5;
 
 // Generous bound: the child only needs a few syscalls after the `go` signal.
+// Applied through `crate::scaled_bound`, which stretches it past
+// `crate::UNSCALED_CPUS` CPUs, where the child's CPU waits for a host core.
 const REPORT_TIMEOUT_MS: u64 = 1000;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
@@ -160,7 +162,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     notification_send(go, u64::from(recycled))
         .map_err(|_| "cross_cspace_revoke_no_alias: notification_send (go) failed")?;
 
-    let verdict = notification_wait_timeout(report, REPORT_TIMEOUT_MS)
+    let verdict = notification_wait_timeout(report, crate::scaled_bound(REPORT_TIMEOUT_MS))
         .map_err(|_| "cross_cspace_revoke_no_alias: notification_wait_timeout (report) failed")?;
     let outcome = match verdict
     {

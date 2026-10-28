@@ -8,9 +8,9 @@
 //! Mirrors restart's spawn primitives ([`crate::restart`]) so that
 //! services launched by svcmgr post-handover go through exactly the
 //! same procmgr surface (`CREATE_FROM_FILE` → `CONFIGURE_NAMESPACE`
-//! → bootstrap round → `START_PROCESS`) that restart uses. Returns
-//! the freshly spawned child's thread cap so the caller can bind
-//! death-notification on it.
+//! → `START_PROCESS` → bootstrap round) that restart uses. Returns
+//! the [`Launched`] handles; for a supervised launch [`launch`] binds
+//! death-notification itself, before `START_PROCESS`.
 
 use ipc::{devmgr_labels, procmgr_labels};
 use registry::{Resolver, Visibility};
@@ -282,7 +282,9 @@ fn assemble_provided_boot_caps(
 /// Returns `Some(Launched)` on success, with the child running and
 /// its bootstrap round delivered. Returns `None` if any step fails;
 /// in that case the child has been destroyed and any resolved seed caps
-/// have been released.
+/// have been released. The exception is a create whose reply caps never
+/// reach svcmgr (see [`walk_and_create_from_file`]): svcmgr holds no
+/// handle to destroy that child, which procmgr keeps suspended (#506).
 ///
 /// Seed caps that fail to resolve are passed through as slot `0`, so
 /// the child's bootstrap decoder sees a zero in that position. This

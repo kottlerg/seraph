@@ -21,7 +21,7 @@
 use crate::alloc::{FatError, allocate_cluster, free_cluster_chain};
 use crate::bpb::{FatState, FatType, SECTOR_SIZE};
 use crate::cache::PageCache;
-use crate::fat::next_cluster;
+use crate::fat::{chain_next, next_cluster};
 
 // The pure 8.3/LFN decoders, checksum, case folding, entry parse, and removal
 // slot-run scan live in the host-testable `fat_parse` crate; the directory
@@ -92,7 +92,7 @@ fn find_in_fat16_root(
 ) -> Option<DirEntry>
 {
     let root_start = u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-    let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(512);
+    let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE as u32);
     let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
     let mut lfn = LfnAccum::new();
 
@@ -136,7 +136,7 @@ pub fn find_in_directory_with_location(
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(512);
+        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE as u32);
         for s in 0..root_sectors
         {
             let sector_lba = root_start + s;
@@ -277,10 +277,11 @@ fn scan_sector_for_name(
 /// Read a directory entry at a given index.
 ///
 /// Skips deleted, LFN, and volume-label slots and counts only valid
-/// 8.3 entries; returns `None` at the end-of-directory marker. When a valid LFN run precedes the 8.3 entry,
-/// the assembled UTF-8 name is attached to the returned [`DirEntry`]
-/// for the readdir wire reply; otherwise callers fall back to the
-/// 8.3 form via [`DirEntry::write_display_name`].
+/// 8.3 entries; returns `None` at the end-of-directory marker. When a
+/// valid LFN run precedes the 8.3 entry, the assembled UTF-8 name is
+/// attached to the returned [`DirEntry`] for the readdir wire reply;
+/// otherwise callers fall back to the 8.3 form via
+/// [`DirEntry::write_display_name`].
 // clippy::too_many_lines: read_dir_entry_at_index folds two iteration
 // shapes — FAT16 fixed root (contiguous sectors) and FAT32 clustered
 // directory (cluster-chain walk) — into one procedure because they
@@ -308,7 +309,7 @@ pub fn read_dir_entry_at_index(
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(512);
+        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE as u32);
 
         for s in 0..root_sectors
         {
@@ -499,10 +500,11 @@ pub struct RemovedEntry
 /// # Errors
 /// [`FatError::Exists`] when the directory already holds an entry of that
 /// name; [`FatError::Corrupt`] for an empty name or one longer than
-/// [`MAX_LFN_CHARS`]; [`FatError::NoSpace`] when no short-name alias or no
-/// free slot run is left (see `find_free_slot_run`); [`FatError::Io`] when
-/// a directory sector read or write fails, possibly after some LFN slots
-/// were written.
+/// [`MAX_LFN_CHARS`], or when the directory's chain or the FAT is corrupt
+/// (found while extending a FAT32 directory); [`FatError::NoSpace`] when
+/// no short-name alias or no free slot run is left (see
+/// `find_free_slot_run`); [`FatError::Io`] when a directory or FAT sector
+/// read or write fails, possibly after some LFN slots were written.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_entry(
     state: &mut FatState,
@@ -648,7 +650,9 @@ pub fn update_entry_metadata(
 /// slots precede the end of the directory or of its chain.
 ///
 /// # Errors
-/// [`FatError::Io`] when a sector read fails.
+/// [`FatError::Io`] when a directory or FAT sector read fails;
+/// [`FatError::Corrupt`] when the directory's chain leaves the data
+/// region or reaches a bad-cluster marker.
 pub fn directory_is_empty(
     state: &mut FatState,
     dir_cluster: u32,
@@ -687,7 +691,7 @@ pub fn directory_is_empty(
                 }
             }
         }
-        match next_cluster(state, cluster, cache, block_dev, ipc_buf)
+        match chain_next(state, cluster, cache, block_dev, ipc_buf)?
         {
             Some(n) => cluster = n,
             None => return Ok(true),
@@ -757,10 +761,12 @@ pub fn write_dot_entries(
 /// continues into it; the FAT16 fixed root cannot grow.
 ///
 /// # Errors
-/// [`FatError::Io`] when a directory sector cannot be read or a new
-/// cluster cannot be zeroed; [`FatError::NoSpace`] when the FAT16 root
+/// [`FatError::Io`] when a directory or FAT sector cannot be read or a
+/// new cluster cannot be zeroed; [`FatError::NoSpace`] when the FAT16 root
 /// area holds no such run or no free cluster remains to extend a FAT32
-/// directory; any other error of [`allocate_cluster`].
+/// directory; [`FatError::Corrupt`] when the directory's chain leaves the
+/// data region or reaches a bad-cluster marker; any other error of
+/// [`allocate_cluster`].
 fn find_free_slot_run(
     state: &mut FatState,
     parent_dir_cluster: u32,
@@ -822,7 +828,9 @@ fn find_free_slot_run(
                 return Ok(scan);
             }
         }
-        cluster = if let Some(n) = next_cluster(state, cluster, cache, block_dev, ipc_buf)
+        // Extend only at the end-of-chain marker; a failed FAT read or a
+        // corrupt link is an error, not a place to cut the chain.
+        cluster = if let Some(n) = chain_next(state, cluster, cache, block_dev, ipc_buf)?
         {
             n
         }
@@ -1185,7 +1193,7 @@ fn find_in_directory_by_sfn(
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(512);
+        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE as u32);
         for s in 0..root_sectors
         {
             match scan_sector_for_sfn(
@@ -1297,7 +1305,7 @@ fn locate_entry_with_lfn_run(
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(512);
+        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE as u32);
         for s in 0..root_sectors
         {
             if let Some(entry) = scan_sector_for_remove(

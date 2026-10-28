@@ -98,6 +98,10 @@ pub fn phases_pre_relative() -> &'static [Phase]
             name: "fs_write_size_bound",
             run: fs_write_size_bound_phase,
         },
+        Phase {
+            name: "fs_carried_caps_dropped",
+            run: fs_carried_caps_dropped_phase,
+        },
     ]
 }
 
@@ -1070,4 +1074,71 @@ pub fn fs_write_size_bound_phase(_: &Caps)
     fs_remove(svctest, name, ipc_buf).expect("cleanup bigoff");
     let _ = syscall::cap_delete(svctest);
     std::os::seraph::log!("fs_write_size_bound phase passed");
+}
+
+/// fatfs keeps no cap an accepted request carries unless the label records
+/// or returns it: after more `NS_STAT` and `FS_READ` requests, each
+/// carrying a cap, than fatfs's `CSpace` could hold if it kept them, the
+/// driver still mints node caps (`NS_LOOKUP`) and page caps
+/// (`FS_READ_MEMORY`). fatfs once kept every such cap, so a client could
+/// fill its `CSpace` and break every later cap derivation.
+pub fn fs_carried_caps_dropped_phase(_: &Caps)
+{
+    // Well past fatfs's whole CSpace: procmgr seeds a child CSpace with
+    // CSPACE_RETYPE_PAGES (7) slot pages of 56 slots, and fatfs never
+    // augments it.
+    const REQUESTS: usize = 1024;
+
+    let info = startup_info();
+    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
+    // page, so the u64 cast is aligned.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let svctest = svctest_dir_cap(ipc_buf);
+
+    let name: &[u8] = b"capdrop.bin";
+    let _ = fs_remove(svctest, name, ipc_buf);
+    let (cap, _) = fs_create(svctest, name, ipc_buf).expect("FS_CREATE capdrop failed");
+    fs_write_inline(cap, 0, b"carried caps", ipc_buf).expect("FS_WRITE capdrop failed");
+
+    for i in 0..REQUESTS
+    {
+        let extra =
+            syscall::cap_derive(cap, syscall::RIGHTS_EP_SEND).expect("derive a cap to carry");
+        let msg = if i % 2 == 0
+        {
+            ipc::IpcMessage::builder(ipc::ns_labels::NS_STAT)
+                .cap(extra)
+                .build()
+        }
+        else
+        {
+            ipc::IpcMessage::builder(ipc::fs_labels::FS_READ)
+                .word(0, 0)
+                .word(1, 8)
+                .cap(extra)
+                .build()
+        };
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }
+            .expect("a request carrying a cap: ipc_call failed");
+        assert_eq!(reply.label, 0, "request {i} carrying a cap: status");
+    }
+
+    let (looked_up, _kind, _size) = ns_lookup(svctest, name, 0xFFFF, ipc_buf)
+        .expect("NS_LOOKUP after carried caps: fatfs could not mint a node cap");
+    let _ = syscall::cap_delete(looked_up);
+    assert_eq!(
+        read_memory_bytes_valid(cap, 0, 7, ipc_buf),
+        12,
+        "FS_READ_MEMORY after carried caps"
+    );
+
+    let close = ipc::IpcMessage::new(ipc::fs_labels::FS_CLOSE);
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_call(cap, &close, ipc_buf) };
+    let _ = syscall::cap_delete(cap);
+    fs_remove(svctest, name, ipc_buf).expect("cleanup capdrop");
+    let _ = syscall::cap_delete(svctest);
+    std::os::seraph::log!("fs_carried_caps_dropped phase passed");
 }

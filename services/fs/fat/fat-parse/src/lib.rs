@@ -7,8 +7,10 @@
 //!
 //! Decodes the BIOS Parameter Block geometry and FAT directory entries
 //! (8.3 short names, long-file-name runs, case-insensitive matching) from raw
-//! sector bytes, and locates every slot an entry occupies for its removal
-//! ([`RemoveRunScan`]). This crate performs no I/O and holds no filesystem
+//! sector bytes, locates every slot an entry occupies for its removal
+//! ([`RemoveRunScan`]), finds a run of free slots for a new entry
+//! ([`FreeRunScan`]), and bounds cluster numbers to the data region
+//! ([`is_data_cluster`]). This crate performs no I/O and holds no filesystem
 //! state: the `fatfs` service reads sectors over a block-device IPC, hands the
 //! bytes here, and keeps the geometry/cache/mutation engine on its side.
 //! Keeping the parse of untrusted on-disk structures pure and host-testable is
@@ -916,9 +918,14 @@ impl<L: Copy + Default> FreeRunScan<L>
 
     /// Feed the slot at `loc` whose first byte is `first`; once the scan is
     /// [past the end](Self::past_end) the byte is ignored. Returns `true`
-    /// when the run holds `count` slots.
+    /// when the run holds `count` slots; a step after that changes nothing
+    /// and returns `true` again.
     pub fn step(&mut self, first: u8, loc: L) -> bool
     {
+        if self.len >= self.count
+        {
+            return true;
+        }
         if first == 0x00
         {
             self.past_end = true;
@@ -1390,6 +1397,20 @@ mod tests
         assert!(!scan.step(b'Z', 3));
         assert!(scan.step(b'Q', 4));
         assert_eq!(scan.run(), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn free_run_step_after_a_complete_run_keeps_the_run()
+    {
+        // A step past a full-length run must not index past the slot array.
+        let mut scan = FreeRunScan::<usize>::new(MAX_SLOT_RUN);
+        for i in 0..MAX_SLOT_RUN
+        {
+            scan.step(0xE5, i);
+        }
+        assert!(scan.step(0xE5, MAX_SLOT_RUN));
+        assert_eq!(scan.run().len(), MAX_SLOT_RUN);
+        assert_eq!(scan.run().last(), Some(&(MAX_SLOT_RUN - 1)));
     }
 
     #[test]

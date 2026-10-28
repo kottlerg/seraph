@@ -158,8 +158,9 @@ The driver keeps this read-side bookkeeping (outstanding pages and the
 recorded release endpoint) in a lazily-allocated `OpenFile` slot keyed
 by node, not by (client, file) pair. Every client that opens a file
 resolves to the same node and so shares that one slot. The driver
-records the first release SEND any `FS_READ_MEMORY` on the node
-carries, so the eviction worker routes cooperative
+records the first release SEND carried by an `FS_READ_MEMORY` that
+reaches the node's slot (one refused before the slot exists has its
+SEND deleted), so the eviction worker routes cooperative
 [`FS_RELEASE_MEMORY`](#label-8-fs_release_memory) for any client's
 page to that client, and a later client is in effect opted out.
 One client's [`FS_CLOSE`](#label-3-fs_close) revokes every client's
@@ -264,7 +265,7 @@ synchronous release after a read.
 
 Sent by the driver's eviction worker on the per-process release
 endpoint cap recorded in the node's `OpenFile` slot, the first one an
-[`FS_READ_MEMORY`](#label-7-fs_read_memory) on the node carried
+[`FS_READ_MEMORY`](#label-7-fs_read_memory) reaching that slot carried
 (per-node sharing, a defect tracked in
 [#530](https://github.com/kottlerg/seraph/issues/530)). Clients that
 delivered the SEND get the cooperative path: the driver waits up to

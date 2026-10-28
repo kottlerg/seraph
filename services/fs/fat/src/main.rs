@@ -52,7 +52,7 @@ use dir::{
     update_entry_metadata, write_dot_entries,
 };
 use eviction::{EvictReq, EvictionState};
-use fat::{next_cluster, read_file_data};
+use fat::{chain_next, next_cluster, read_file_data};
 use file::{MAX_OPEN_FILES, OpenFile, OutstandingPage};
 use ipc::{IpcMessage, fs_labels, ns_labels};
 use namespace_protocol::{GateError, NamespaceRights, NodeId, NodeKind, gate, pack as pack_badge};
@@ -218,14 +218,17 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// - `FS_MOUNT` — unbadged (badge == 0); vfsd's BPB-validation probe.
 /// - `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` — namespace dispatch via
 ///   the protocol crate.
-/// - Per-node `FS_READ` / `FS_READ_MEMORY` / `FS_RELEASE_MEMORY` /
-///   `FS_CLOSE` — badge packs `(NodeId, NamespaceRights)`; the slot is
-///   resolved through `NodeTable` and the lazily-allocated `OpenFile`.
+/// - Per-node `FS_*` requests — badge packs `(NodeId, NamespaceRights)`
+///   and the node is resolved through `NodeTable`: the read side
+///   (`FS_READ`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, `FS_CLOSE`), the
+///   write side (`FS_WRITE`, `FS_WRITE_MEMORY`, `FS_TRUNCATE`), and
+///   directory mutation (`FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`,
+///   `FS_RENAME`).
 ///
 /// The open-file table is shared with the eviction worker via a
-/// `Mutex`; main acquires the lock once per request and holds it for
-/// the entire dispatch. The hot path is single-client and
-/// short-lived; lock contention with the worker is only material
+/// `Mutex`. Only `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE`
+/// use it; main takes the lock for those requests and holds it for the
+/// whole dispatch. Lock contention with the worker is only material
 /// during cache-pressure releases.
 #[allow(clippy::too_many_lines)]
 fn service_loop(
@@ -974,11 +977,17 @@ fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> 
 /// applies for partial-sector writes). Returns the file's
 /// (possibly-updated) first cluster and its new size.
 ///
+/// The chain is extended only at its end-of-chain marker: a failed FAT
+/// read or a corrupt link is an error, never a place to link a new
+/// cluster (which would cut the chain's tail off).
+///
 /// # Errors
 /// [`FatError::FileTooLarge`] when the write would end past `u32::MAX`
 /// bytes, the largest size a FAT directory entry records, checked before
-/// any cluster is allocated; otherwise the errors of [`allocate_cluster`]
-/// and [`FatError::Io`] for a failed sector read or write.
+/// any cluster is allocated; [`FatError::Corrupt`] when the file's first
+/// cluster or a chain link lies outside the data region; otherwise the
+/// errors of [`allocate_cluster`] and [`FatError::Io`] for a failed FAT or
+/// data sector read or write.
 #[allow(clippy::too_many_arguments, clippy::single_match_else)]
 fn write_file_bytes(
     start_cluster: u32,
@@ -1011,6 +1020,12 @@ fn write_file_bytes(
     {
         chain_head = allocate_cluster(state, None, cache, block_dev, ipc_buf)?;
     }
+    else if !state.is_data_cluster(chain_head)
+    {
+        // The first cluster comes from the directory entry, untrusted
+        // on-disk input.
+        return Err(FatError::Corrupt);
+    }
 
     let mut cluster = chain_head;
     let target_cluster_idx = offset / cluster_size;
@@ -1025,7 +1040,7 @@ fn write_file_bytes(
     // orphaning the original tail.)
     for _ in 0..target_cluster_idx
     {
-        cluster = match next_cluster(state, cluster, cache, block_dev, ipc_buf)
+        cluster = match chain_next(state, cluster, cache, block_dev, ipc_buf)?
         {
             Some(c) => c,
             None => allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?,
@@ -1071,7 +1086,7 @@ fn write_file_bytes(
         let new_cluster_offset = cur_offset % cluster_size;
         if new_cluster_offset == 0 && written < data.len()
         {
-            cluster = match next_cluster(state, cluster, cache, block_dev, ipc_buf)
+            cluster = match chain_next(state, cluster, cache, block_dev, ipc_buf)?
             {
                 Some(c) => c,
                 None => allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?,

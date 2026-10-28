@@ -14,12 +14,34 @@ use crate::alloc::FatError;
 use crate::bpb::{FatState, FatType, SECTOR_SIZE};
 use crate::cache::PageCache;
 
+/// Look up the next cluster in the FAT chain, for a reader: `None` for
+/// every way the chain cannot continue (end of chain, or any error
+/// [`chain_next`] reports). A caller that extends or rewrites the chain
+/// MUST use [`chain_next`] instead, which tells end of chain apart from a
+/// failure.
+pub fn next_cluster(
+    state: &mut FatState,
+    cluster: u32,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+) -> Option<u32>
+{
+    chain_next(state, cluster, cache, block_dev, ipc_buf)
+        .ok()
+        .flatten()
+}
+
 /// Look up the next cluster in the FAT chain.
 ///
-/// Returns `Some(next)` for a valid next cluster, `None` for end-of-chain,
-/// a bad cluster, a FAT entry naming a cluster outside the data region,
-/// or a failed FAT-sector read.
-// clippy::too_many_lines: next_cluster resolves the on-disk FAT entry for
+/// Returns `Ok(Some(next))` for a valid next cluster and `Ok(None)` at the
+/// end-of-chain marker.
+///
+/// # Errors
+/// [`FatError::Corrupt`] when `cluster` lies outside the data region, or
+/// its FAT entry is the bad-cluster marker or names a cluster outside the
+/// data region; [`FatError::Io`] when the FAT sector cannot be read.
+// clippy::too_many_lines: chain_next resolves the on-disk FAT entry for
 // a cluster under FAT16 or FAT32. Both variants share the sector-lookup,
 // cache-check, and sector-load logic; they differ only in the entry-width
 // arithmetic and the end-of-chain sentinel. Extracting two parallel
@@ -31,21 +53,22 @@ use crate::cache::PageCache;
 // Justification: FAT16/FAT32 branches share structure but differ in entry
 // widths and end-of-chain markers; extracting sub-functions would obscure
 // the symmetry.
-pub fn next_cluster(
+pub fn chain_next(
     state: &mut FatState,
     cluster: u32,
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
-) -> Option<u32>
+) -> Result<Option<u32>, FatError>
 {
-    // Clusters 0 and 1 are reserved by the FAT spec and never valid as a
-    // chain continuation. Noisy-return rather than panic so the upstream
-    // read failure (the usual cause) is visible.
-    if cluster < 2
+    // A cluster outside the data region (reserved 0 and 1, or one a corrupt
+    // entry named) has no FAT entry to read, and its entry offset could
+    // overflow. Noisy-return rather than panic so the upstream cause is
+    // visible.
+    if !state.is_data_cluster(cluster)
     {
-        std::os::seraph::log!("WARNING: next_cluster called with reserved cluster {cluster}");
-        return None;
+        std::os::seraph::log!("WARNING: chain walk reached cluster {cluster} outside data region");
+        return Err(FatError::Corrupt);
     }
 
     let (fat_offset, fat_sector, entry_offset) = match state.fat_type
@@ -79,7 +102,7 @@ pub fn next_cluster(
             ipc_buf,
         )
         {
-            return None;
+            return Err(FatError::Io);
         }
         state.cached_fat_sector = fat_sector;
     }
@@ -94,11 +117,11 @@ pub fn next_cluster(
             ]);
             if raw >= 0xFFF8
             {
-                return None; // End of chain.
+                return Ok(None); // End of chain.
             }
             if raw == 0xFFF7
             {
-                return None; // Bad cluster.
+                return Err(FatError::Corrupt); // Bad cluster in a chain.
             }
             u32::from(raw)
         }
@@ -112,11 +135,11 @@ pub fn next_cluster(
             ]) & 0x0FFF_FFFF;
             if raw >= 0x0FFF_FFF8
             {
-                return None; // End of chain.
+                return Ok(None); // End of chain.
             }
             if raw == 0x0FFF_FFF7
             {
-                return None; // Bad cluster.
+                return Err(FatError::Corrupt); // Bad cluster in a chain.
             }
             raw
         }
@@ -135,10 +158,10 @@ pub fn next_cluster(
              the data region (fat_sector={fat_sector}, entry_offset={entry_offset}) \
              — possible block-read corruption"
         );
-        return None;
+        return Err(FatError::Corrupt);
     }
 
-    Some(val)
+    Ok(Some(val))
 }
 
 /// Byte-range location within a file, used by `read_file_data`.
@@ -161,8 +184,8 @@ pub struct FileRead
 /// # Errors
 /// [`FatError::Corrupt`] when the file's start cluster lies outside the
 /// data region or its chain ends (or leaves the data region) before the
-/// cluster holding `offset`; [`FatError::Io`] when the data sector cannot
-/// be read.
+/// cluster holding `offset`; [`FatError::Io`] when a FAT or data sector
+/// cannot be read.
 pub fn read_file_data(
     req: &FileRead,
     state: &mut FatState,
@@ -195,7 +218,7 @@ pub fn read_file_data(
     for _ in 0..cluster_idx
     {
         cluster =
-            next_cluster(state, cluster, cache, block_dev, ipc_buf).ok_or(FatError::Corrupt)?;
+            chain_next(state, cluster, cache, block_dev, ipc_buf)?.ok_or(FatError::Corrupt)?;
     }
 
     let sector = state.cluster_to_sector(cluster) + sector_in_cluster;

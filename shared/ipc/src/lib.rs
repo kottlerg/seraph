@@ -1257,7 +1257,7 @@ pub mod fs_labels
     ///
     /// Driver-to-client (cooperative eviction): sent on the release endpoint
     /// cap recorded in the node's open-file slot, the first one an
-    /// [`FS_READ_MEMORY`] on the node carried (shared per node, not per
+    /// [`FS_READ_MEMORY`] reaching that slot carried (shared per node, not per
     /// client; tracked in #530); `data[0]` = the release cookie naming
     /// the Memory cap to unmap. The client unmaps it and replies
     /// [`FS_RELEASE_ACK`], first letting a local copy from the page finish

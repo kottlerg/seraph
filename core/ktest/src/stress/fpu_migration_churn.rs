@@ -18,9 +18,9 @@
 //!
 //! The single-cycle version of this test (`preempt_isolation_cross_cpu` in
 //! `core/ktest/src/unit/fpu.rs`) guards the eager-save migration fix for
-//! #108 on cold caches; this stress version exercises ~100 cycles to widen
-//! the race window for any residual eager-save / lazy-restore inconsistency
-//! under load.
+//! #108 on cold caches; this stress version exercises ~100 cycles (fewer
+//! past 16 CPUs, see [`super::scaled_attempts`]) to widen the race window
+//! for any residual eager-save / lazy-restore inconsistency under load.
 //!
 //! Skipped when `cpu_count < 2` (UP boot has nothing to migrate across).
 
@@ -29,6 +29,10 @@ use syscall_abi::SystemInfoType;
 use crate::{TestContext, TestResult};
 
 const CYCLES: u32 = 100;
+
+/// Fewest cycles at any width: every cycle migrates an FPU owner, so a few
+/// dozen still churn the eager-save and lazy-restore paths.
+const MIN_CYCLES: u32 = 32;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -40,7 +44,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    for i in 0..CYCLES
+    // Each cycle's spawn, cross-CPU wake and migration grow with the width;
+    // the count shrinks with it.
+    for i in 0..super::scaled_attempts(CYCLES, MIN_CYCLES, cpus)
     {
         crate::unit::fpu::preempt_isolation_cross_cpu(ctx).map_err(|_| {
             // Log which iteration failed so failures are bisectable on the

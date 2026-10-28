@@ -672,6 +672,25 @@ fn wait_us(target_us: u64)
     }
 }
 
+/// The widest CPU count at which ktest's attempt counts and wall-clock
+/// budgets apply as written. Past it a boot is an oversubscribed boundary
+/// run, where every cross-CPU handoff waits for a host core, so an
+/// attempt's wall time and a step's latency grow with the width; see
+/// core/ktest/README.md § Tier S for the scaling rule and its intent.
+pub const UNSCALED_CPUS: u64 = 16;
+
+/// `base`, a wall-clock bound or budget whose expiry fails a test (in any
+/// unit), multiplied by the width's oversubscription factor `cpus /
+/// UNSCALED_CPUS` past [`UNSCALED_CPUS`] CPUs, so it still separates a slow
+/// step from a stuck or wrong one; `base` as written up to
+/// [`UNSCALED_CPUS`] CPUs, or when the CPU count cannot be read.
+#[must_use]
+pub fn scaled_bound(base: u64) -> u64
+{
+    let cpus = syscall::system_info(syscall_abi::SystemInfoType::CpuCount as u64).unwrap_or(1);
+    base.saturating_mul((cpus / UNSCALED_CPUS).max(1))
+}
+
 /// Spin forever. Used for fatal errors where ktest cannot continue.
 pub fn halt() -> !
 {

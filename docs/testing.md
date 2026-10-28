@@ -471,7 +471,7 @@ count says): riscv64 64, 65, and 128 harts, and x86_64 256 and 512 vCPUs.
 
 ```sh
 # Boundary CPU counts, riscv64 (the 64- and 65-hart runs take ~70 s each
-# on a 16-core host, the 128-hart run ~475 s at 8x hart oversubscription;
+# on a 16-core host, the 128-hart run ~2-3 min at 8x hart oversubscription;
 # the 600 s and 1800 s budgets are for HANG classification):
 cargo xtask build --arch riscv64
 cargo xtask compose-bundle --harness ktest --arch riscv64
@@ -479,11 +479,11 @@ cargo xtask run-parallel --arch riscv64 --cpus 64 --parallel 1 --runs 1 --timeou
 cargo xtask run-parallel --arch riscv64 --cpus 65 --parallel 1 --runs 1 --timeout 600
 cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeout 1800
 
-# Boundary CPU counts, x86_64 (the 256-vCPU run takes ~330 s on a 16-core
-# KVM host: boot is seconds, but the stress tier runs at 16x vCPU
-# oversubscription. The 512-vCPU run, the MAX_CPUS boundary, takes ~16 min
-# at 32x oversubscription, dominated by AP bringup and the broadcast/IPI
-# stress tests. The 900 s and 3600 s budgets are for HANG classification):
+# Boundary CPU counts, x86_64 (the 256-vCPU run takes ~2 min on a 16-core
+# KVM host at 16x vCPU oversubscription. The 512-vCPU run, the MAX_CPUS
+# boundary, takes ~28 min at 32x, where every cross-CPU step waits for a
+# host core and the stress tier takes about three quarters of the run. The
+# 900 s and 3600 s budgets are for HANG classification):
 cargo xtask build
 cargo xtask compose-bundle --harness ktest
 cargo xtask run-parallel --arch x86_64 --cpus 256 --parallel 1 --runs 1 --timeout 900
@@ -493,6 +493,11 @@ cargo xtask run-parallel --arch x86_64 --cpus 512 --parallel 1 --runs 1 --timeou
 The 65-hart run is the first count past a 64-bit word; the 128-hart run is the count at which
 hart-scaled firmware allocations once collided with the kernel image's load address
 ([#377](https://github.com/kottlerg/seraph/issues/377)); the 512-vCPU run is `MAX_CPUS`.
+
+Past 16 CPUs ktest scales its round-based stress cells' attempt counts, and stretches the
+wall-clock bounds [core/ktest/README.md § Tier S](../core/ktest/README.md#tier-s--srcstress) lists,
+by the oversubscription factor the width implies, so the boundary runs stay inside their budgets
+while the CI widths keep the full counts and tight budgets.
 
 **Memory surface.** The memory variation below is owed when, and only when, the PR's own diff makes
 a non-inert change to the memory surface: the code that sizes or maps physical memory by the
@@ -598,7 +603,7 @@ list as the tracking Issues move):
   tolerates any firmware layout; `validate_kernel_layout` enforces the
   [relocation invariants](../core/boot/docs/elf-loading.md#elf-validation) (single
   offset, alignment, non-overlap, entry-in-image) at load time. 128 harts now
-  boots clean (3×, ~475 s/run at 8× hart oversubscription on a 16-core host).
+  boots clean at 8× hart oversubscription on a 16-core host (the boundary run above).
   The residual ceiling is upstream and pre-bootloader: at 192, 256, and 512
   harts under TCG the edk2 firmware emits
   no serial output at all (192: nothing in 60 min; 256/512: nothing in 20/30

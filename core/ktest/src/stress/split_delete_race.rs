@@ -11,10 +11,11 @@
 //! child list is wider than one reparent batch (`MAX_REPARENT_EDITS`), so
 //! the split releases the derivation lock between batches and the delete
 //! can land before the split starts (`InvalidCapability`), between two
-//! batches (`InvalidState`: both children rolled back after at least one
-//! released hold — the arm no deterministic input reaches), or after the
-//! split consumed the original (an idempotent no-op on the freed slot, or
-//! `InvalidCapability` once the slot is recycled). The split's result
+//! batches (`InvalidState`, the rolled-back outcome
+//! `core/kernel/docs/capability-internals.md` § Revocation Algorithm specifies;
+//! no deterministic input reaches it), or after the split consumed the original
+//! (an idempotent no-op on the freed slot, or `InvalidCapability` once the slot
+//! is recycled). The split's result
 //! classifies the cycle, and a failed split requires the delete to have
 //! landed; every outcome must leave the forest consistent, the children
 //! deletable, and the slot count at its baseline. The per-outcome counts

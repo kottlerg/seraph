@@ -10,6 +10,8 @@ On completion ktest emits the cross-harness marker
 [docs/testing.md](../../docs/testing.md). CI scrapes the substring
 `ALL TESTS PASSED` from the boot log.
 
+---
+
 ## Activating ktest
 
 Re-compose the bootloader bundle with ktest as the `init` entry:
@@ -20,15 +22,16 @@ cargo xtask run
 ```
 
 Restore the default-init harness with `cargo xtask compose-bundle
---harness init` (or any subsequent `cargo xtask build`, which always
-re-authors the default-init bundle). See
+--harness init` (or any subsequent full `cargo xtask build`, which
+re-authors the default-init bundle; a `--component` build leaves the
+bundle unchanged). See
 [`xtask/README.md`](../../xtask/README.md) for the bundle-vs-mkdisk
 authoring discipline.
 
 ## Source Layout
 
 ```
-ktest/
+core/ktest/
 ├── Cargo.toml              # Workspace member; no_std binary
 ├── README.md
 └── src/
@@ -49,7 +52,7 @@ ktest/
     │   └── riscv64/        # RISC-V entry points, constants, and arch-only tests
     ├── unit/               # Tier 1: per-syscall isolation tests, one file per surface
     ├── integration/        # Tier 2: cross-subsystem scenarios, one file per scenario
-    ├── stress/             # Tier S: race and exhaustion cells, one file per race
+    ├── stress/             # Tier S: stress tests, one file per race or resource invariant
     └── bench/              # Tier 3: cycle-count benchmarks, one file per surface
 ```
 
@@ -77,23 +80,27 @@ items elsewhere in ktest, are still gated in place with `#[cfg(target_arch)]`;
 
 ### Tier 1 — `src/unit/`
 
-Per-syscall isolation tests. Every kernel syscall has at least one positive-path
+Per-syscall isolation tests. Every kernel syscall except `SYS_ASPACE_BIND_NOTIFICATION`,
+`SYS_PROCESS_EXIT`, and `SYS_THREAD_SET_FAULT_HANDLER` has at least one positive-path
 test and the most important negative paths (wrong rights, invalid arguments,
-wrong object state). Files are grouped by kernel subsystem, mirroring the
-kernel's own source layout.
+wrong object state). Those three are exercised in Tier 2, by
+`aspace_fault_notification_late_bind.rs`, by `death_notification_late_bind.rs`, and by
+`fault_pager_roundtrip.rs`, `fault_resume_modifies_pc.rs`, `fault_handler_declines_kills.rs`,
+and `fault_exception_redirect.rs` respectively. Files are grouped by kernel subsystem,
+mirroring the kernel's own source layout.
 
 | File | Syscalls / behaviour exercised |
 |---|---|
-| `cap.rs` | `SYS_CAP_CREATE_*`, `CAP_COPY`, `CAP_MOVE`, `CAP_INSERT`, `CAP_DERIVE`, `CAP_DERIVE_BADGE`, `CAP_REVOKE`, `CAP_DELETE` |
+| `cap.rs` | `SYS_CAP_CREATE_*`, `SYS_CAP_COPY` (incl. the `cap_insert` explicit-slot form), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_CAP_REVOKE`, `SYS_CAP_DELETE` |
 | `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, type-specific fields) |
 | `retype.rs` | Retype primitive: augmentation and donation spill, PT walk budget, kernel PT pool |
-| `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_MEMORY_SPLIT`, `SYS_ASPACE_QUERY` |
-| `entropy.rs` | `SYS_GETRANDOM`, including an unmapped or read-only buffer refused with `InvalidAddress` |
+| `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, `SYS_ASPACE_QUERY` |
+| `entropy.rs` | `SYS_GETRANDOM`, including an unmapped or read-only buffer refused with `InvalidAddress` and an over-maximum length refused with `InvalidArgument` |
 | `notification.rs` | `SYS_NOTIFICATION_SEND`, `SYS_NOTIFICATION_WAIT` (blocking and `notification_wait_timeout`) |
 | `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` (blocking, `try_recv`, timeout) |
 | `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT`, including a second concurrent `wait_set_wait` refused with `InvalidState`, as [docs/ipc-design.md § Waiting on Multiple Sources](../../docs/ipc-design.md#waiting-on-multiple-sources) defines |
 | `ipc.rs` | `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_BUFFER_SET` |
-| `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION` |
+| `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION`; `SYS_SCHED_SPLIT` |
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
 | `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT` (`SYS_SBI_CALL` is under `src/arch/<arch>/`) |
 | `sysinfo.rs` | `SYS_SYSTEM_INFO` |
@@ -125,7 +132,7 @@ concurrent notification and queue events.
 | `cap_transfer.rs` | Cap rights flow through an IPC endpoint round-trip |
 | `cap_transfer_large.rs` | IPC transfer of a cap with a multi-batch child list, both directions |
 | `wait_concurrency.rs` | Wait set with concurrent notification + queue sources |
-| `memory_lifecycle.rs` | Memory split → map → protect → unmap with aspace\_query at each step |
+| `memory_lifecycle.rs` | Pool-frame map → protect → unmap, with `aspace_query` after the map and after the unmap |
 | `multi_caller_ipc_fifo.rs` | Three concurrent IPC callers verify FIFO send-queue ordering ([docs/ipc-design.md § Endpoints](../../docs/ipc-design.md#endpoints)) |
 | `ipc_call_interrupted_stop_start.rs` | A client stopped while parked in `ipc_call` and then restarted returns `Interrupted`, never a stale reply (#361) |
 | `park_interrupted_stop_start.rs` | A thread stopped while parked in any non-call blocking syscall and then restarted returns `Interrupted`, never a stale wake deposit (#363) |
@@ -185,7 +192,7 @@ counter, takes one shared stack for its victims, and carries its own 128 × 8 Ki
 | `cap_tree_deep.rs` | 8-level derivation chain with cascading revocation | `CHAIN_DEPTH=8`, `PASSES=500` |
 | `cspace_recycle.rs` | Repeated `CSpace` create+delete past the live-count bound (free-list recycling) | `ITERATIONS=10_000` |
 | `event_queue_fill_drain.rs` | Fill/drain cycles on a capacity-8 queue (ring buffer wrap-around) | `CAPACITY=8`, `CYCLES=2000` |
-| `idle_wake_race.rs` | Race wake of an idle CPU with concurrent ready-queue entry under affinity migration (≥ 2 CPUs) | `ITERATIONS=50_000` |
+| `idle_wake_race.rs` | Worker pinned to CPU 1 parks in `notification_wait`; `ITERATIONS` notification round trips from CPU 0 exercise the cross-CPU idle-wake / wake-IPI path (≥ 2 CPUs) | `ITERATIONS=50_000` |
 | `thread_churn.rs` | Rapid thread create/destroy cycles (TCB and CSpace cleanup) | `ITERATIONS=1000` |
 | `cap_delete_running.rs` | Delete capabilities while child threads actively spin | `NUM_CHILDREN=16` |
 | `cap_delete_reply_wake.rs` | `cap_delete` of a server a client is `BlockedOnReply` on must wake that client (#351, the dealloc deferred reply-wake liveness invariant) (≥ 2 CPUs) | `CYCLES=2000` |
@@ -220,10 +227,11 @@ counter, takes one shared stack for its victims, and carries its own 128 × 8 Ki
 ### Tier 3 — `src/bench/`
 
 Cycle-accurate benchmarks using `rdtsc` (x86-64) or `csrr cycle` (RISC-V).
-Each benchmark lives in its own file under `bench/`, mirroring
+Each kernel surface measured has its own file under `bench/` (a file may hold several
+benchmarks), mirroring
 `unit/`'s one-file-per-surface rule (`bench/{null,ipc,notification,cap,mm,
-thread,event,wait_set,tlb}.rs`). Each benchmark logs min/mean/max
-cycle counts; no PASS/FAIL verdict.
+thread,event,wait_set,tlb}.rs`). Benchmarks log min/mean/max cycle counts
+(`context_switch` logs cycles per switch); none produces a PASS/FAIL verdict.
 
 | Benchmark | What it measures |
 |---|---|
@@ -238,6 +246,7 @@ cycle counts; no PASS/FAIL verdict.
 | `event_post_recv` | `event_post` + `event_recv` on a pre-created queue |
 | `wait_set_cycle` | Wait set create → add → wait → remove → delete |
 | `tlb_shootdown_unmap` | `mem_unmap` cost when ktest's aspace is `current` on every CPU (spinners pinned per CPU); logs `cpus=N` |
+| `tlb_shootdown_concurrent` | Every pinned worker is a concurrent `mem_map` + `mem_unmap` initiator; logs `cpus=N`, `conc_workers=`, and fresh-map and unmap cycle stats |
 
 ## Test infrastructure
 
@@ -262,8 +271,9 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
 - `spawn::new_child(ctx)` / `spawn::new_child_at(ctx, sched_cap, priority)` /
   `configure_and_start(child, …)` / `configure_and_start_pinned(child, …)` —
   child-thread spawn helper wrapping the cspace + thread + configure + start
-  sequence that ~25 sites duplicated; `new_child` creates the thread at the
-  floor priority, `new_child_at` at `priority` under `sched_cap`'s band.
+  sequence each spawning test would otherwise repeat; `new_child` creates the
+  thread at the floor priority, `new_child_at` at `priority` under
+  `sched_cap`'s band.
 - `spawn::ArgBlock` / `spawn::child_args` — per-test static argument
   entries a child receives by address. A child's single `u64` argument
   holds at most two 32-bit capability handles (as halves); anything more
@@ -293,7 +303,8 @@ knobs live in `KtestConfig::DEFAULT` in [`src/cmdline.rs`](src/cmdline.rs) and a
 compile time. To flip them, edit the constant, rebuild ktest
 (`cargo xtask build --component ktest`), then re-compose the bundle
 (`cargo xtask compose-bundle --harness ktest`, per [§ Activating ktest](#activating-ktest))
-before `cargo xtask run`; a single-component build does not re-compose the bundle, so whatever
+before `cargo xtask run`; a single-component build does not re-compose the bundle (per
+[xtask/README.md](../../xtask/README.md) § `cargo xtask compose-bundle`), so whatever
 bundle was last composed (the previous ktest binary, or default init after a full build) boots
 until it is re-composed.
 
@@ -315,8 +326,10 @@ ShutdownPolicy::Never` and rebuild and re-compose as above.
 ### Shutdown
 
 `ShutdownPolicy::Always` shuts down regardless of test outcome.
-`ShutdownPolicy::Pass` shuts down only if all tests passed; halts otherwise.
-`ShutdownPolicy::Never` halts in place after printing results.
+`ShutdownPolicy::Pass` shuts down only if all tests passed; otherwise the harness thread
+exits (`thread_exit`) and the system idles. `ShutdownPolicy::Never` exits the harness thread
+after printing results, leaving the system idle with QEMU open. A shutdown attempt that fails
+also falls through to `thread_exit`.
 
 On x86-64 shutdown uses ACPI S5 (parsed from FADT/DSDT in userspace).
 On RISC-V shutdown uses SBI SRST via the `SYS_SBI_CALL` syscall.
@@ -335,7 +348,9 @@ before recompiling is how a narrower-scope run is produced.
 |---|---|
 | [docs/testing.md](../../docs/testing.md) | Tier taxonomy, the `[ktest]` marker, sysroot layout, and gating |
 | [docs/build-system.md](../../docs/build-system.md) | Toolchain, the sysroot, and the `cargo xtask` commands that build and boot ktest |
+| [xtask/README.md](../../xtask/README.md) | `compose-bundle` harness selection and bundle-vs-mkdisk authoring |
 | [docs/bootstrap.md](../../docs/bootstrap.md) | The kernel's init handover ktest receives in place of init |
+| [core/boot/README.md](../boot/README.md) | Boot protocol that loads ktest as init; no kernel command line |
 | [abi/init-protocol/README.md](../../abi/init-protocol/README.md) | `InitInfo`: the page and initial capability set ktest reads at `_start` |
 | [core/kernel/docs/syscalls.md](../kernel/docs/syscalls.md) | The syscall surface Tier 1 exercises, with each call's errors |
 | [core/kernel/docs/thread-lifecycle-and-sleep.md](../kernel/docs/thread-lifecycle-and-sleep.md) | The stop protocol and park semantics the stop and sleep stress cells race |

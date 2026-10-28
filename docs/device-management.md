@@ -10,10 +10,11 @@ enumeration, binding, and policy live in `devmgr`.
 
 The kernel consumes `BootInfo.mmio_apertures` during Phase 7 of
 initialization and mints one `Mmio` capability per entry; on RISC-V it mints one more for
-the console UART range `BootInfo.kernel_mmio` names, which lies outside every aperture.
+the console UART range `BootInfo.kernel_mmio` names, which may also lie inside an aperture.
 These apertures, the arch-specific `BootInfo.kernel_mmio`, and the framebuffer description
-are the only device descriptors the bootloader produces. Firmware parsing (ACPI / DTB table
-walking) is a userspace concern; the kernel's TCB contains no parser.
+are the only device descriptors the bootloader produces. Device-level firmware parsing
+(enumerating devices from ACPI / DTB) is a userspace concern, and the kernel contains no
+parser.
 
 The kernel mints these capabilities in
 [`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md) § Phase 7:
@@ -181,19 +182,19 @@ devmgr loads driver binaries from one of two places:
   framebuffer) ship in the bundle and arrive as Memory caps in devmgr's
   MODULE bootstrap round. devmgr spawns them via
   `procmgr_labels::CREATE_PROCESS` during initial enumeration.
-- **On-disk rootfs** — non-essentials (the per-arch RTC and the
-  [virtio-input keyboard driver](../services/drivers/virtio/input/README.md)) live at
-  `/services/drivers/` and are loaded via `procmgr_labels::CREATE_FROM_FILE`. The test-only
-  `test-orphan` binary also lives there; devmgr spawns it only on
-  `devmgr_labels::TEST_SPAWN_ORPHAN`. virtio-input is PCI-enumerated during the initial scan — its
-  BAR/IRQ caps are carved and stashed then — but its spawn is deferred to this path, since a
-  keyboard is not on the read-the-disk critical path. A PCI device that shares an `INTx` line may
-  get no private IRQ cap; such a driver is delivered a 2-cap bootstrap round (BAR + service, no IRQ)
-  and polls its queue. Post-handover, svcmgr walks its universal root to `/services/drivers/` and
-  hands devmgr that subtree cap via `devmgr_labels::SET_DRIVERS_DIR` (gated by
-  `DRIVERS_DIR_AUTHORITY`, minted from the devmgr-registry source init endows svcmgr with; sent at
-  `LOOKUP | READ` rights only — devmgr cannot reach outside the drivers subtree). The handshake is
-  specified in [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md) and
+- **On-disk rootfs** — non-essentials (the per-arch RTC and the [virtio-input keyboard
+  driver](../services/drivers/virtio/input/README.md)) live at `/services/drivers/` and are loaded
+  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-orphan` binary also lives there;
+  devmgr spawns it only on `devmgr_labels::TEST_SPAWN_ORPHAN` (gated on `ORPHAN_TEST_AUTHORITY`).
+  virtio-input is PCI-enumerated during the initial scan — its BAR/IRQ caps are carved and stashed
+  then — but its spawn is deferred to this path, since a keyboard is not on the read-the-disk
+  critical path. A PCI device that shares an `INTx` line may get no private IRQ cap; such a driver
+  is delivered a 2-cap bootstrap round (BAR + service, no IRQ) and polls its queue. Post-handover,
+  svcmgr walks its universal root to `/services/drivers/` and hands devmgr that subtree cap via
+  `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from the
+  devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ` rights only — devmgr
+  cannot reach outside the drivers subtree). The handshake is specified in
+  [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md) and
   [`services/svcmgr/docs/ipc-interface.md`](../services/svcmgr/docs/ipc-interface.md). Devmgr
   replies SUCCESS before doing any spawn work so svcmgr never blocks on driver bring-up; the actual
   walk + `CREATE_FROM_FILE` + bootstrap rounds run after `ipc_reply` and before devmgr returns to
@@ -202,8 +203,8 @@ devmgr loads driver binaries from one of two places:
   `QUERY_RTC_DEVICE` / `QUERY_INPUT_DEVICE` calls and clients ([timed](../services/timed/README.md)
   degrades to its no-RTC path; the terminal, today's only `QUERY_INPUT_DEVICE` consumer, logs and
   exits). Keeping non-essentials out of the boot bundle keeps the ESP-loaded image to what the
-  system needs before the rootfs is mounted, so on-disk loading is preferred for anything not on
-  the read-the-disk-in-the-first-place critical path.
+  system needs before the rootfs is mounted, so on-disk loading is preferred for anything not on the
+  read-the-disk-in-the-first-place critical path.
 
 Storage-side cap delegation downstream of devmgr (whole-disk
 endpoint → vfsd → partition-scoped endpoint → fs driver) is

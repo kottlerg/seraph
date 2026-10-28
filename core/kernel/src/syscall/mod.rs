@@ -10,9 +10,8 @@
 //! number, calls the appropriate handler, and writes the return value back.
 //!
 //! # Syscall ABI
-//! - x86-64: number in `rax`; args in `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9`;
-//!   return value in `rax`.
-//! - RISC-V: number in `a7`; args in `a0`–`a5`; return value in `a0`.
+//! The registers carrying the syscall number, arguments, and return value are
+//! defined in core/kernel/docs/syscalls.md § Calling Convention.
 //!
 //! # Adding new syscalls
 //! 1. Add the constant to `abi/syscall/src/lib.rs`.
@@ -48,11 +47,6 @@ use syscall::{
     SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
     SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT,
 };
-
-// ── TrapFrame accessor shims ──────────────────────────────────────────────────
-// `TrapFrame::syscall_nr`, `::set_return`, and `::arg` are defined as methods
-// on `TrapFrame` in each arch's `trap_frame.rs`. Callers (ipc.rs etc.) use
-// `tf.arg(n)` directly.
 
 // ── Syscall dispatch ──────────────────────────────────────────────────────────
 
@@ -109,7 +103,7 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
     // SAFETY: caller guarantees tf is valid. The `&mut` is not exclusive for
     // the whole call: while the thread blocks in a handler, other paths access
     // the frame through the published `trap_frame`, a gap
-    // docs/arch-interface.md § `trap_frame` states and #443 tracks.
+    // docs/arch-interface.md § `trap_frame` states and #514 tracks.
     let tf = unsafe { &mut *tf };
 
     let nr = tf.syscall_nr();
@@ -186,18 +180,11 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
 
     tf.set_return(ret_val);
 
-    // Self-teardown epilogue (#341). A handler may have deleted the last
-    // capability to the running thread's own Thread object, CSpace, or
-    // AddressSpace (SYS_CAP_DELETE / SYS_CAP_REVOKE, directly or through a
-    // teardown cascade), or a concurrent teardown may have stopped this
-    // thread while the handler ran: either way it is `Exited` in place and
-    // must never return to userspace. A live thread first drains objects
-    // deferred earlier on this CPU, from a context where their dead threads
-    // are provably off-CPU. The drain's CSpace/AddressSpace arms wait on
-    // other CPUs with interrupts enabled, so a teardown can stop this thread
-    // meanwhile: the `Exited` check runs after the drain as well. An `Exited`
-    // thread reschedules away; any object whose free it deferred is reclaimed
-    // by the next drain on this CPU.
+    // Self-teardown epilogue (#341): a live thread drains this CPU's
+    // deferred-reclaim stack; a thread found `Exited` (before or after the drain)
+    // reschedules away and never returns to userspace. Protocol and invariants:
+    // core/kernel/docs/thread-lifecycle-and-sleep.md § Self-teardown (the caller
+    // is the freed thread).
     // SAFETY: syscall context on the caller's kernel stack with interrupts
     // disabled (the drain re-enables them only with preemption disabled), so
     // this CPU and its `current` are stable across both checks.
@@ -225,8 +212,8 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
 // ── Thread syscall handlers ───────────────────────────────────────────────────
 
 /// `SYS_THREAD_YIELD` (21): voluntarily yield the CPU.
-// unnecessary_wraps: all dispatch arms must return Result<u64, SyscallError>; signature is fixed.
 #[cfg(not(test))]
+// unnecessary_wraps: all dispatch arms must return Result<u64, SyscallError>; signature is fixed.
 #[allow(clippy::unnecessary_wraps)]
 fn sys_yield(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -289,20 +276,19 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// posts it to the calling thread's death observers — a parent that bound the
 /// main thread (so `ExitStatus::code()` carries it) and procmgr's per-thread
 /// observer (which reaps the process). Structurally identical to [`sys_exit`]
-/// but with a non-zero reason; in particular it schedules away immediately
+/// but with the encoded caller-supplied reason (zero for `exit(0)`); in
+/// particular it schedules away immediately
 /// after the post, with no further dereference of the thread or its address
 /// space, so it cannot race procmgr's cap-revoke teardown.
 ///
-/// It does NOT post to the address-space death-observer surface (reserved for
-/// terminal faults): doing so on every clean exit dereferences the address
-/// space after the thread post has already woken procmgr to reap, and procmgr's
-/// teardown can unmap the dying process while this thread is still on-CPU. The
-/// thread observer alone covers the single-threaded process model; whole-process
-/// exit from a non-main thread is not yet modelled.
+/// It does NOT post to the address-space death-observer surface, which is
+/// reserved for terminal faults (rationale: docs/process-lifecycle.md § Exit
+/// reason). Whole-process exit from a non-main thread is not yet modelled.
 ///
-/// Like [`sys_exit`], this stops only the calling thread; sibling threads are
-/// reaped by procmgr's cap-revoke teardown once it observes the death. Full
-/// resource cleanup is procmgr-driven and not performed here.
+/// Like [`sys_exit`], this stops only the calling thread; sibling threads and
+/// the process's resources are torn down by procmgr (see
+/// docs/process-lifecycle.md § Process Death, including the #501 and
+/// #502 gaps).
 #[cfg(not(test))]
 // cast_possible_truncation: arg0 carries a u32 exit code zero-extended to u64
 // by the `process_exit` wrapper; truncating back to u32 is the intended decode.
@@ -440,8 +426,8 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             // Sleep list at capacity: withdraw the park. sys_thread_sleep has
             // no IPC source to fall back on, so the honest answer is to
-            // surface the failure (docs/thread-lifecycle-and-sleep.md § Sleep
-            // List Invariants). The withdrawal is the claim a cancel makes,
+            // surface the failure (core/kernel/docs/thread-lifecycle-and-sleep.md
+            // § Sleep List Invariants). The withdrawal is the claim a cancel makes,
             // sleep_list_remove under sched_lock, true while the deadline is
             // still pending: winning it means no stop or teardown claimed the
             // park, so restore Running and report OutOfMemory (a later stop
@@ -502,7 +488,7 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// When the target thread exits or faults, the kernel posts
 /// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to the bound
 /// `EventQueue`. Passing `correlator = 0` makes the payload equal to the
-/// exit reason (the pre-multi-bind behaviour).
+/// exit reason.
 ///
 /// Binding onto a thread that has *already* exited posts the retained
 /// `exit_reason` to the `EventQueue` immediately. The bind serialises on the
@@ -516,6 +502,8 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// per-thread observer array is full (only reachable while the thread is
 /// still live — a bind onto an already-exited thread consumes no slot).
 #[cfg(not(test))]
+// cast_possible_truncation: cap handles and the correlator are u32 by ABI
+// contract; the truncation discards any upper bits a caller sets.
 #[allow(clippy::cast_possible_truncation)]
 fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -634,9 +622,10 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// fault, cancelling the episode before any reply claims it or keeping a
 /// claimed `KILL`, and it takes effect, and is posted, only if the thread is
 /// started again; see docs/fault-handling.md § Delivery, Resume, and Kill),
-/// the kernel posts the fault class to each bound observer. The kernel only
-/// notifies; it never enumerates or terminates threads, and normal
-/// `thread_exit` does NOT fire these observers.
+/// the kernel posts the terminal-fault reason (with the observer's correlator
+/// in the high 32 bits) to each bound observer. The kernel only notifies; it
+/// never enumerates or terminates threads, and normal `thread_exit` does NOT
+/// fire these observers.
 ///
 /// Binding onto an address space that has *already* terminal-faulted posts the
 /// retained fault reason to the `EventQueue` immediately (serialised on the
@@ -644,6 +633,8 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// not miss the fault. Returns `OutOfMemory` if the per-address-space observer
 /// array is full (only reachable before the first fault).
 #[cfg(not(test))]
+// cast_possible_truncation: cap handles and the correlator are u32 by ABI
+// contract; the truncation discards any upper bits a caller sets.
 #[allow(clippy::cast_possible_truncation)]
 fn sys_aspace_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -742,9 +733,10 @@ pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBl
 ///
 /// `handle` is the encoded value userspace passes: slot index in the low
 /// [`syscall::CAP_INDEX_BITS`] bits, per-slot generation in the high bits. This
-/// is the single chokepoint for resolving a user-supplied handle; raw-index
-/// resolvers in `cap.rs` (`cap_copy`/`derive`/`delete`/`revoke`/`move`/`info`)
-/// must decode and generation-check themselves.
+/// is the single chokepoint for resolving a user-supplied handle; the
+/// raw-resolution handlers in `cap.rs`, `mem.rs`, and `ipc.rs` must decode and
+/// generation-check themselves (see core/kernel/docs/capability-internals.md
+/// § Per-Slot Generation).
 ///
 /// The expected slot tag is fixed by the required-rights argument's type:
 /// `required_rights: TypedRights<K>` selects `K::TAG`, so a rights constant of
@@ -768,7 +760,7 @@ pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBl
 /// race, they do not close it), and nothing pins the object the slot names
 /// past the lookup, so a caller that dereferences the object across a point
 /// where another thread may delete its last capability reads freed memory
-/// (#443 § Unpinned capability lookup).
+/// (#502).
 #[cfg(not(test))]
 pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     cspace: *mut crate::cap::cspace::CSpace,
@@ -813,7 +805,7 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     // The unlocked tag/generation checks above narrow, but cannot close, the
     // race against this slot being freed or recycled concurrently.
     // `lookup_cap` takes no reference on the object, so it is not pinned while
-    // the caller uses it (#443; see core/kernel/docs/capability-internals.md
+    // the caller uses it (#502; see core/kernel/docs/capability-internals.md
     // § Storage: Hybrid Two-Level Radix).
     Ok(unsafe { &*(slot as *const _) })
 }
@@ -851,9 +843,8 @@ fn sys_ipc_buffer_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
-// Host unit test for the kernel-owned exit-code encoding. Lives here because
-// the ABI crate that defines `encode_exit_code` builds `no_std` with
-// `test = false`; the kernel is the encoder's authority and runs host tests.
+// Host unit tests for the exit-code encoding (`syscall::encode_exit_code`)
+// that `sys_process_exit` applies to the caller's exit code.
 #[cfg(test)]
 mod exit_code_tests
 {

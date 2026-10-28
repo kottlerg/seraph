@@ -12,7 +12,8 @@
 //! - [`notification`]: bitmask-based asynchronous notification (OR bits / wait).
 //! - [`event_queue`]: ordered, non-coalescing ring buffer with queued receivers.
 //! - [`wait_set`]: multiplexed blocking on any combination of the above.
-//! - [`message`]: the `Message` struct transferred through both mechanisms.
+//! - [`message`]: the `Message` struct carried by endpoint call/reply and
+//!   fault delivery.
 
 use crate::sched::thread::ThreadControlBlock;
 

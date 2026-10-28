@@ -29,6 +29,8 @@ const NUM_PRODUCERS: usize = 4;
 /// Messages per producer.
 const MESSAGES_PER_PRODUCER: u32 = 64;
 /// Total messages across all producers.
+// cast_possible_truncation: NUM_PRODUCERS is a compile-time constant (4), so the
+// usize-to-u32 cast cannot truncate.
 #[allow(clippy::cast_possible_truncation)]
 const TOTAL_MESSAGES: u32 = NUM_PRODUCERS as u32 * MESSAGES_PER_PRODUCER;
 
@@ -123,10 +125,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let payload =
             event_recv(eq).map_err(|_| "concurrent_event_producers: event_recv failed")?;
-        // cast_possible_truncation: low nibbles are bounded by NUM_PRODUCERS
-        // and MESSAGES_PER_PRODUCER which both fit in usize easily.
+        // cast_possible_truncation: masked to the 4-bit producer-id field before the cast.
         #[allow(clippy::cast_possible_truncation)]
         let producer_id = (payload & 0xF) as usize;
+        // cast_possible_truncation: masked to the 8-bit seq field (bits[11:4]) before the cast.
         #[allow(clippy::cast_possible_truncation)]
         let seq = ((payload >> 4) & 0xFF) as usize;
         if producer_id >= NUM_PRODUCERS

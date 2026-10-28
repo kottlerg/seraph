@@ -5,10 +5,11 @@
 
 //! x86-64 trap/syscall frame — full user-mode register snapshot.
 //!
-//! [`TrapFrame`] is pushed onto the kernel stack by `syscall_entry` (for
-//! `SYSCALL`-initiated entries) and by the CPU + IDT stubs (for exceptions
-//! and hardware interrupts). The field order matches the push sequence in
-//! `syscall_entry` — see that file for the exact assembly layout.
+//! [`TrapFrame`] is built on the kernel stack by `syscall_entry`
+//! (`core/kernel/src/arch/x86_64/syscall.rs`, for `SYSCALL`-initiated entries)
+//! and by `tf_build_asm` (`core/kernel/src/arch/x86_64/idt.rs`, for exceptions
+//! and ring-3 interrupts). Both reserve 168 bytes with `sub rsp, 168` and fill
+//! each field with an explicit `mov` at the offsets below.
 //!
 //! ## Layout (168 bytes)
 //!
@@ -36,28 +37,22 @@
 //! offset 160: fs_base (user FS.base MSR — thread-local pointer)
 //! ```
 //!
-//! The `syscall_entry` assembly pushes `fs_base` first (highest address) and
-//! `rax` last (lowest address). After all pushes RSP points at `rax`, which
-//! is the address passed to `syscall_dispatch` as the `TrapFrame` pointer.
+//! After `syscall_entry` reserves the frame (`sub rsp, 168`), RSP points at
+//! `rax` (offset 0), which is the address passed to `crate::syscall::dispatch`
+//! as the `TrapFrame` pointer.
 //!
 //! ## Syscall argument mapping (x86-64)
 //!
-//! | Field   | Role when used as syscall |
-//! |---------|--------------------------|
-//! | `rax`   | Syscall number           |
-//! | `rdi`   | Argument 0               |
-//! | `rsi`   | Argument 1               |
-//! | `rdx`   | Argument 2               |
-//! | `r10`   | Argument 3               |
-//! | `r8`    | Argument 4               |
-//! | `r9`    | Argument 5               |
+//! Register roles are defined in [syscalls.md](../../../docs/syscalls.md)
+//! § Calling Convention; [`TrapFrame::arg`] and [`TrapFrame::syscall_nr`]
+//! read them from the frame.
 //!
-//! `rcx` and `r11` are clobbered by `SYSCALL`; they carry `rip`/`rflags`
-//! and are stored in the dedicated `rip`/`rflags` fields rather than the
-//! `rcx`/`r11` GPR slots. Userspace wrappers must not rely on `rcx`/`r11`
-//! being preserved across a syscall.
+//! `syscall_entry` stores the `SYSCALL`-clobbered `rcx`/`r11` in both their
+//! GPR slots and the dedicated `rip`/`rflags` fields; `sysretq` returns
+//! through the `rip`/`rflags` fields.
 
-// cast_sign_loss: i64→u64 register interpretation; sign semantics are intentional (SYSRET RIP).
+// cast_sign_loss: `set_return` stores the i64 syscall result into rax as raw
+// u64 bits; the sign reinterpretation is intentional.
 // cast_lossless: u16→u64 segment register widening.
 #![allow(clippy::cast_sign_loss, clippy::cast_lossless)]
 
@@ -65,12 +60,13 @@
 /// kernel entry (syscall, exception, or interrupt from ring-3).
 ///
 /// `#[repr(C)]` with size 168 bytes and 8-byte alignment. Field offsets
-/// must match the `syscall_entry` push order; do not reorder fields.
+/// must match the offsets `syscall_entry` (`syscall.rs`) and
+/// `tf_build_asm`/`tf_resume_asm` (`idt.rs`) store and load; do not reorder fields.
 #[repr(C)]
 pub struct TrapFrame
 {
     // ── General-purpose registers ─────────────────────────────────────────
-    // Pushed LAST in syscall_entry; lowest virtual addresses in the frame.
+    // Offsets 0-112: lowest virtual addresses in the frame.
     /// rax — syscall number on entry; primary return value on exit.
     pub rax: u64,
     pub rbx: u64,
@@ -91,12 +87,13 @@ pub struct TrapFrame
     pub r15: u64,
 
     // ── CPU-state fields ──────────────────────────────────────────────────
-    // Pushed FIRST in syscall_entry; highest virtual addresses in the frame.
+    // Offsets 120-160: highest virtual addresses in the frame.
     /// User-mode instruction pointer (= rcx on SYSCALL entry; = RIP in interrupt frame).
     pub rip: u64,
     /// User-mode RFLAGS (= r11 on SYSCALL entry).
     pub rflags: u64,
-    /// User-mode stack pointer (saved from a per-CPU scratch location).
+    /// User-mode stack pointer (from `PerCpuData::user_rsp` on SYSCALL entry;
+    /// from the hardware interrupt frame on exception/IRQ entry).
     pub rsp: u64,
     /// User code segment selector (e.g. 0x23 = `USER_CS`, ring 3).
     pub cs: u64,
@@ -233,9 +230,9 @@ impl TrapFrame
         self.cs = super::gdt::USER_CS as u64;
         self.ss = super::gdt::USER_DS as u64;
 
-        // rflags: must have IF (bit 9) set. Clear IOPL (bits 12-13), VM (bit
-        // 17), VIF (bit 19), VIP (bit 20) — none of which should be set in
-        // user mode. Bit 1 (reserved) must be 1 per the x86 spec.
+        // rflags: force IF (bit 9) and reserved bit 1 on. Clear IOPL (bits 12-13),
+        // NT (bit 14), reserved bit 15, RF (bit 16), VM (bit 17), and VIP (bit 20).
+        // AC (bit 18) and VIF (bit 19) are not cleared by this mask.
         self.rflags = (self.rflags | 0x202) & !0x0013_F000;
         Ok(())
     }

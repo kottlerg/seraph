@@ -165,9 +165,10 @@ yet implemented (#262), per
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md#supervision-hierarchy)
 § Supervision hierarchy). svcmgr — not init — then publishes the
 well-known names it owns into its own registry
-(`ipc::published_names::ROOTFS_ROOT`, `SVCMGR`, `DEVMGR_REGISTRY`, minted
-from the endowed sources) and installs devmgr's `/services/drivers/` cap
-via `devmgr_labels::SET_DRIVERS_DIR`.
+(`ipc::published_names::ROOTFS_ROOT`, `SVCMGR`, `DEVMGR_REGISTRY`,
+`DEVMGR_SHUTDOWN`, `DEVMGR_TEST`, minted from the endowed sources) and
+installs devmgr's `/services/drivers/` cap via
+`devmgr_labels::SET_DRIVERS_DIR`.
 The provider names (`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`) are
 published by svcmgr's provider path on each provider's launch. Recipes for
 all svcmgr-supervised services live on disk at
@@ -404,7 +405,8 @@ A process dies when:
 - An unhandled fault terminates its threads.
 
 The kill-process pattern and the `CSpace`/`AddressSpace` teardown have known kernel memory-safety
-gaps, tracked in [#443](https://github.com/kottlerg/seraph/issues/443) (see
+gaps, tracked in [#501](https://github.com/kottlerg/seraph/issues/501) and
+[#502](https://github.com/kottlerg/seraph/issues/502) (see
 [Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
 § Storage: Hybrid Two-Level Radix,
 [thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
@@ -434,8 +436,8 @@ for terminal faults), because doing so on every clean exit would dereference the
 procmgr had already been woken to reap it. The kernel only *notifies*; it does not enumerate or stop
 sibling threads at that point — they are stopped when procmgr's cap-revoke teardown below deletes
 the process's `CSpace` (every thread bound to it is stopped before its storage is reclaimed,
-wherever their thread caps are held, subject to the #443 gaps stated above) and reaped through
-their own thread caps.
+wherever their thread caps are held, subject to the #501 and #502 gaps stated above) and reaped
+through their own thread caps.
 `ExitStatus::success()`/`code()` decode the reason on the consumer side. This is a Seraph-native
 encoding, not POSIX: codes are not 8-bit `WEXITSTATUS`-truncated and faults are native fault
 classes, not signals. See [`core/kernel/docs/syscalls.md`](../core/kernel/docs/syscalls.md) §

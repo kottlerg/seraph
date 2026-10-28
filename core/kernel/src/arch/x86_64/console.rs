@@ -15,8 +15,8 @@ const COM1: u16 = 0x3F8;
 /// Physical base address of the serial device.
 ///
 /// Always 0 on x86-64 because COM1 is I/O-mapped (no physical MMIO address).
-/// The top-level console module checks this to decide whether `rebase_serial`
-/// is meaningful after Phase 3.
+/// `core/kernel/src/main.rs` checks this after the Phase 3 page-table switch and
+/// calls `rebase_serial` only when it is non-zero.
 #[must_use]
 pub fn uart_phys_base() -> u64
 {
@@ -25,7 +25,8 @@ pub fn uart_phys_base() -> u64
 
 /// No-op on x86-64: COM1 is accessed via I/O ports, not MMIO.
 ///
-/// Present to satisfy the cross-architecture call site in `main.rs`.
+/// Present so the cross-architecture call site in `core/kernel/src/main.rs` compiles;
+/// that site calls it only when `uart_phys_base` is non-zero, so on x86-64 it is never called.
 ///
 /// # Safety
 /// No preconditions; always safe to call.

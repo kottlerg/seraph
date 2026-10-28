@@ -218,13 +218,14 @@ IoPort capabilities are not creatable at runtime. Init keeps the root and hands 
 derivation, and devmgr narrows it with `SYS_IOPORT_SPLIT` and gives each driver only its assigned
 port range (see
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md)). devmgr's
-`QUERY_SHUTDOWN_DEVICE` also serves a caller-chosen 2-port window plus the 8042 reset port to any
-`REGISTRY_QUERY_AUTHORITY` holder, not only pwrmgr
-([#446](https://github.com/kottlerg/seraph/issues/446)).
+`QUERY_SHUTDOWN_DEVICE` also serves the FADT's 2-port PM1a control window plus the 8042 reset
+port, only to a caller whose badge carries `SHUTDOWN_DEVICE_AUTHORITY`: the seed-only
+`devmgr.shutdown` cap, which pwrmgr alone seeds and svcmgr's `QUERY_ENDPOINT` refuses.
 
-Revoking an IoPort capability removes port access from all threads it has
-been bound to; the kernel tracks bindings and updates each affected thread's IOPB
-in the TSS on revocation (design intent; not yet implemented — `SYS_IOPORT_BIND`
+Revoking an IoPort capability is intended to remove port access from every thread
+bound through its descendants (the revoked capability itself is preserved, per
+[Revocation](#revocation)); the kernel tracking bindings and updating each affected
+thread's IOPB in the TSS on revocation is design intent (not yet implemented — `SYS_IOPORT_BIND`
 records no binding and revocation does not withdraw bound IOPB access, #457).
 
 ### SbiControl (RISC-V only)
@@ -272,10 +273,10 @@ IRQ resources devmgr already brokers). The remaining sanctioned rights are carri
 cap and are unreachable after init's reap: **Dbcn** is thrown away by design (the userspace serial
 driver owns the console; forwarding the firmware console would bypass the console-ownership model),
 and **Cppc** / **Base** / **Pmu** are simply not needed by any current service. devmgr serves pwrmgr
-a derivation further narrowed to **Reset** only (system reset / reboot), and serves it to any
-`REGISTRY_QUERY_AUTHORITY` holder, not only pwrmgr
-([#446](https://github.com/kottlerg/seraph/issues/446)); **Suspend** is retained against a future
-power-management path but delegated to no one today. See
+a derivation further narrowed to **Reset** only (system reset / reboot), gated on the
+`SHUTDOWN_DEVICE_AUTHORITY` badge bit that only pwrmgr's seed-only `devmgr.shutdown` cap
+carries; **Suspend** is retained against a future power-management path but delegated to no one
+today. See
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md).
 
 **Gating-granularity decision.** Per-cap authority is encoded as rights bits, not
@@ -437,14 +438,21 @@ mean only the server and its trusted minters can set
 the verb-bit; a holder of an unprivileged cap cannot re-derive an
 authority cap. The server's dispatcher checks
 `msg.badge & VERB_BIT != 0` before servicing the privileged label and
-replies `UNAUTHORIZED` otherwise. The verb-bits in use are bits 62 and 63
+replies `UNAUTHORIZED` otherwise. The verb-bits in use are bits 60 through 63
 (`ipc::VERB_BIT_MASK`). On an endpoint that gates labels this way, a
 minter that hands out badges carrying other information keeps them clear:
 procmgr's random per-process badge, stamped on every SEND procmgr mints
 for a child (its procmgr, registry, and log SENDs) and on its process
-handle, is redrawn until neither bit is set. An un-badged SEND on such an
+handle, is redrawn until none of them is set. An un-badged SEND on such an
 endpoint stays with the server and its trusted minters, since its holder
-could badge it with any verb-bit.
+could badge it with any verb-bit. svcmgr's `QUERY_ENDPOINT` answers every
+process, so a queryable verb-bit cap would be ambient: a verb-bit cap
+svcmgr publishes itself (its well-known names and each provider's
+`provides` names) is seed-only, reaching only the recipes that seed it,
+and a name published through `PUBLISH_ENDPOINT` is always public, so an
+external publisher MUST NOT publish a verb-bit cap there
+([services/svcmgr/docs/ipc-interface.md](../services/svcmgr/docs/ipc-interface.md)
+§ Label 3 and § Label 4).
 
 ---
 
@@ -516,7 +524,7 @@ hazard. See [capability-internals.md](../core/kernel/docs/capability-internals.m
 so the object is not pinned while a holder's syscall still dereferences it — a known kernel
 memory-safety defect (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
-§ Storage: Hybrid Two-Level Radix, [#443](https://github.com/kottlerg/seraph/issues/443)).
+§ Storage: Hybrid Two-Level Radix, [#502](https://github.com/kottlerg/seraph/issues/502)).
 
 
 ---
@@ -698,7 +706,8 @@ before the object's storage is reclaimed, wherever those threads' own capabiliti
 including the deleting thread itself, when it holds that last capability to its own `CSpace` or
 `AddressSpace` (the delete then never returns to it). The process's resources are reclaimed as their
 capability reference counts reach zero. This path has known kernel memory-safety gaps, tracked in
-[#443](https://github.com/kottlerg/seraph/issues/443) (see
+[#501](https://github.com/kottlerg/seraph/issues/501) and
+[#502](https://github.com/kottlerg/seraph/issues/502) (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
 § Storage: Hybrid Two-Level Radix,
 [thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
@@ -745,6 +754,7 @@ The kernel does not provide:
 ## Summarized By
 
 [abi/process-abi/README.md](../abi/process-abi/README.md),
+[Firmware Parsing](../core/boot/docs/firmware-parsing.md),
 [Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Scheduler Internals](../core/kernel/docs/scheduler.md),

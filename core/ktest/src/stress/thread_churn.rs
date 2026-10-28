@@ -5,7 +5,7 @@
 
 //! Stress test: rapid thread create/destroy cycles.
 //!
-//! Creates and destroys 20 threads sequentially, verifying that kernel
+//! Creates and destroys [`ITERATIONS`] threads sequentially, verifying that kernel
 //! resource cleanup (TCBs, `CSpace` refcounts) works correctly under churn.
 
 use syscall::{

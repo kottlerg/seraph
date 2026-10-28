@@ -6,13 +6,12 @@
 //! Integration: a death observer bound *after* the thread has already died
 //! still receives the retained exit reason.
 //!
-//! The kernel records a thread's `exit_reason` when it becomes `Exited` and
-//! retains it on the TCB. `SYS_THREAD_BIND_NOTIFICATION` serialises on the
-//! thread's `sched_lock`: a bind onto an already-`Exited` thread re-delivers
-//! that retained reason to the newly-bound `EventQueue` instead of walking an
-//! empty observer set and dropping the event. This is the bind-after-start
-//! window a supervisor (svcmgr) hits when it binds a service init had already
-//! started (#106 Window 2).
+//! A bind onto an already-`Exited` thread delivers the retained exit reason to
+//! the newly bound `EventQueue` (see `core/kernel/docs/scheduling-internals.md`
+//! § Process-Death and Parked-Thread Protocol and `core/kernel/docs/syscalls.md`
+//! § `SYS_THREAD_BIND_NOTIFICATION` (47)). This is the bind-after-start window
+//! a supervisor (svcmgr) hits when it binds a service init had already started
+//! (#106 Window 2).
 //!
 //! Four scenarios, all on the real exit/fault paths:
 //!   1. A child exits cleanly with no observer bound; a later bind delivers
@@ -20,8 +19,8 @@
 //!   2. A child faults with no observer bound; a later bind delivers the
 //!      retained fault reason (`EXIT_FAULT_BASE + <vector>`).
 //!   3. Negative control: an observer bound *before* start still fires
-//!      exactly once — guarding the pre-existing path against a double-post
-//!      from the new retained-delivery branch.
+//!      exactly once — guarding the append path against a double-post
+//!      from the retained-delivery branch.
 //!   4. A child voluntarily exits via `SYS_PROCESS_EXIT(code)` with no observer
 //!      bound; a later bind delivers the retained `encode_exit_code(code)`,
 //!      proving the process-exit syscall records the encoded code on the thread.

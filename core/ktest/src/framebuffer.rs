@@ -26,7 +26,9 @@ const REPLACEMENT_CODEPOINT: u32 = 0xFFFD;
 /// VA where the framebuffer pixel memory is mapped.
 const FB_VA: u64 = 0x1000_1000;
 
-/// Framebuffer state. All fields are set once during `init` and read-only after.
+/// Framebuffer state. The geometry fields (`ready`, `base`, `stride`, `max_cols`,
+/// `max_rows`) are set once during `init`; the cursor (`col`, `row`) and
+/// `decoder` change on every write.
 // SAFETY: ktest is single-threaded on the framebuffer output path.
 static mut STATE: FbState = FbState {
     ready: false,
@@ -58,10 +60,11 @@ fn descriptors(info: &InitInfo) -> &[CapDescriptor]
 {
     let base = core::ptr::from_ref::<InitInfo>(info).cast::<u8>();
     // SAFETY: cap_descriptors_offset is set by the kernel to point within the
-    // same read-only page; the descriptor array contains cap_descriptor_count
-    // valid entries.
-    // cast_ptr_alignment: InitInfo is 4-byte aligned; CapDescriptor follows at
-    // a 4-byte-aligned offset.
+    // same read-only InitInfo region; the descriptor array contains
+    // cap_descriptor_count valid entries.
+    // cast_ptr_alignment: `cap_descriptors_offset` is `size_of::<InitInfo>()`,
+    // which abi/init-protocol asserts is a multiple of 8, the alignment the
+    // `u64` fields of `CapDescriptor` require.
     #[allow(clippy::cast_ptr_alignment)]
     unsafe {
         let ptr = base
@@ -74,10 +77,10 @@ fn descriptors(info: &InitInfo) -> &[CapDescriptor]
 /// Carve a cap for exactly `[phys, phys + size)` out of the MMIO aperture
 /// that contains it, returning the carved slot.
 ///
-/// Mirrors devmgr's `carve_subrange`: the covering aperture is found by
-/// range containment, any prefix below `phys` is split off and discarded,
-/// then the `size`-byte head is split from the remainder. `phys` and
-/// `size` must be page-aligned.
+/// Finds the covering aperture by range containment, as devmgr's
+/// `carve_subrange` does, but unlike it discards both the prefix below `phys`
+/// and any remainder above `phys + size`, keeping only the `size`-byte
+/// head. `phys` and `size` must be page-aligned.
 fn carve_framebuffer_cap(info: &InitInfo, phys: u64, size: u64) -> Option<u32>
 {
     let covering = descriptors(info).iter().find(|d| {
@@ -97,8 +100,9 @@ fn carve_framebuffer_cap(info: &InitInfo, phys: u64, size: u64) -> Option<u32>
     }
 
     // `cap` now starts at `phys`. Split off the framebuffer-sized head and
-    // discard any upper remainder. A split error means the region is
-    // already exactly `size`, so use the cap as-is.
+    // discard any upper remainder. Any split error is treated as the region
+    // already being exactly `size`, and the cap is used as-is; the error code
+    // is not inspected.
     match syscall::mmio_split(cap, size)
     {
         Ok((head, rest)) =>

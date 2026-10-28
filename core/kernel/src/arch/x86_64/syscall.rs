@@ -3,7 +3,9 @@
 
 // core/kernel/src/arch/x86_64/syscall.rs
 
-//! SYSCALL/SYSRET MSR setup and entry stub for x86-64 (Phase 9).
+//! SYSCALL/SYSRET MSR setup and entry stub for x86-64 (configured on the BSP in
+//! Phase 5 and on each AP during Phase 8 bring-up; see
+//! [initialization.md](../../../docs/initialization.md) § Phase 5 and § Phase 8).
 //!
 //! Configures the MSRs required by the SYSCALL instruction:
 //!
@@ -19,8 +21,8 @@
 //! On SYSCALL: hardware saves RIP→RCX, RFLAGS→R11, and clears the RFLAGS bits
 //! in SFMASK, so the kernel runs with IF, TF, DF and AC clear whatever the user
 //! set (AC clear keeps SMAP enforced; DF clear is the string-instruction
-//! direction `copy_user` relies on). RSP and segment registers are NOT changed
-//! by the hardware.
+//! direction `copy_user` relies on). It loads CS and SS from STAR; RSP, DS, ES,
+//! FS and GS are NOT changed by the hardware.
 //!
 //! The stub's first instruction is `swapgs`: while user code runs, the per-CPU
 //! pointer lives in `IA32_KERNEL_GS_BASE` and the active GS base is the user's,
@@ -100,7 +102,7 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 
 // ── syscall_entry ─────────────────────────────────────────────────────────────
 
-/// SYSCALL entry stub (Phase 9).
+/// SYSCALL entry stub (installed in `IA32_LSTAR` by [`init`]).
 ///
 /// On SYSCALL hardware saves: RIP→RCX, RFLAGS→R11. Does NOT change RSP.
 /// This stub:
@@ -114,8 +116,9 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 /// 7. Restores registers, disables interrupts, swaps back to the user GS base,
 ///    and executes `sysretq`.
 ///
-/// GS-base must point to a valid `PerCpuData` (installed by `percpu::init_bsp`
-/// in Phase 5) before any user thread executes a SYSCALL.
+/// `IA32_KERNEL_GS_BASE` must hold this CPU's `PerCpuData` pointer while user
+/// code runs: installed in `IA32_GS_BASE` by `percpu::init_bsp` in Phase 5
+/// (`percpu::init_ap` on each AP) and parked by the exit `swapgs`.
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry()
@@ -163,7 +166,7 @@ unsafe extern "C" fn syscall_entry()
         "mov [rsp + 136], r11",     // rsp    = user RSP
         "mov qword ptr [rsp + 144], 0x23", // cs = USER_CS
         "mov qword ptr [rsp + 152], 0x1b", // ss = USER_DS
-        "mov qword ptr [rsp + 160], 0",    // fs_base (Phase 9: zero)
+        "mov qword ptr [rsp + 160], 0",    // fs_base: unused (TLS base is SavedState.fs_base)
 
         // ── Phase 3: dispatch ─────────────────────────────────────────────
         "mov rdi, rsp",             // arg0 = *mut TrapFrame

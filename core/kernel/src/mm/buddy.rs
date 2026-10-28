@@ -10,9 +10,8 @@
 //! # Design
 //!
 //! Free block metadata is stored in a fixed-size internal pool of index-linked
-//! list nodes. This avoids writing into the free physical pages themselves,
-//! which is necessary because the bootloader only identity-maps specific
-//! regions (`BootInfo`, modules, stack, memory map buffer) — not all usable RAM.
+//! list nodes rather than in the free pages; see
+//! core/kernel/docs/memory-internals.md § Data Structures.
 //!
 //! Each order maintains a singly-linked list of free block addresses. Links are
 //! pool slot indices (u16, 1-indexed). Slot 0 is the list/pool sentinel (NONE).
@@ -26,20 +25,17 @@
 //!
 //! # Capacity
 //!
-//! `POOL_SIZE` is the maximum number of simultaneously tracked free blocks
-//! across all orders. The current value handles ~32 GiB of RAM. Increase it
-//! (or transition to in-page node storage after Phase 3 establishes page
-//! tables) for larger systems.
+//! `POOL_SIZE` bounds the simultaneously tracked free blocks across all
+//! orders; its capacity is specified in core/kernel/docs/memory-internals.md
+//! § Data Structures. Exhausting it halts the boot (see `push_block`).
 //!
 //! # Post-handoff sealing
 //!
-//! The buddy is a boot-time allocator only. Phase 7 ([`crate::cap`]) drains
-//! every page into userspace Memory caps (`drain_for_usercaps(0, …)`), then
-//! [`seal`][BuddyAllocator::seal]s the allocator. memmgr is the sole dynamic
-//! memory authority thereafter; the buddy neither allocates (its free list is
-//! empty) nor should receive frees. A post-seal [`free_range`][BuddyAllocator::free_range]
-//! means an `owns_memory` Memory cap was destroyed after handoff — RAM leaked
-//! into an allocator nothing draws from — and trips a `debug_assert`.
+//! Phase 7 drains every page into userspace Memory caps
+//! (`drain_for_usercaps(0, …)`) and then [`seal`][BuddyAllocator::seal]s the
+//! allocator; a post-seal [`free_range`][BuddyAllocator::free_range] trips a
+//! `debug_assert`. The ownership rule is specified in
+//! docs/userspace-memory-model.md § Ownership Boundaries.
 
 // cast_possible_truncation: u64→usize and usize→u16 casts bounded by physical address ranges.
 // large_stack_arrays: BuddyAllocator is placed in .bss as a static; the large arrays are
@@ -49,13 +45,9 @@
 /// Size of a single physical page in bytes.
 pub const PAGE_SIZE: usize = 4096;
 
-/// Maximum allocation order. Order N spans 2^N pages (4 KiB..8 MiB).
-///
-/// Sized so the largest per-CPU boot slab at `boot_protocol::MAX_CPUS`
-/// (`AP_IST_STACKS`, 512 × 16 KiB = 8 MiB) fits one block — `alloc_zeroed_slab`
-/// rounds every slab to a single power-of-two block. Compile-time asserts at
-/// the consumer sites ([`crate::arch::x86_64::ap_trampoline`],
-/// [`crate::arch::x86_64::gdt`]) enforce the envelope.
+/// Maximum allocation order. Order N spans 2^N pages (4 KiB..8 MiB). Its
+/// sizing envelope is specified in core/kernel/docs/memory-internals.md
+/// § Data Structures.
 pub const MAX_ORDER: usize = 11;
 
 /// Number of order levels (0 through `MAX_ORDER` inclusive).
@@ -89,11 +81,11 @@ pub struct BuddyAllocator
     pool_init: bool,
     /// Total number of free 4 KiB pages across all orders.
     free_pages: usize,
-    /// Total number of 4 KiB pages ever added via `add_region`. Fixed at boot.
+    /// Total number of 4 KiB pages added via `add_region` or
+    /// `register_owned_range`. Fixed at boot.
     total_pages: usize,
-    /// Set once the Phase-7 drain has handed all RAM to userspace
-    /// ([`seal`][Self::seal]). After this the buddy is a sealed boot
-    /// artifact: nothing allocates from it and nothing should free into it.
+    /// Set by [`seal`][Self::seal] after the Phase-7 drain
+    /// (docs/userspace-memory-model.md § Ownership Boundaries).
     /// [`free_range`][Self::free_range] trips on a post-seal free.
     ///
     /// Read only by the `free_range` `debug_assert`, so it is write-only in a
@@ -141,13 +133,8 @@ impl BuddyAllocator
         );
         debug_assert!(end.is_multiple_of(PAGE_SIZE as u64), "end not page-aligned");
 
-        // Reserve physical frame 0. The PT- and CSpace-pool intrusive free
-        // lists ([`AddressSpaceObject`]/[`CSpaceKernelObject`]) use a physical
-        // address of 0 as the "list empty" sentinel, so a pool frame at phys 0
-        // is indistinguishable from an empty pool. Firmware can legitimately
-        // mark `[0, PAGE_SIZE)` usable; admitting it lets a pool chunk that
-        // happens to cover frame 0 silently zero its own list head. Excluding
-        // the zero page (one frame) keeps it out of every pool.
+        // Reserve physical frame 0, the page-table and CSpace pool empty-list
+        // sentinel; see docs/memory-model.md § Buddy Allocator.
         let start = start.max(PAGE_SIZE as u64);
 
         if start >= end
@@ -212,7 +199,10 @@ impl BuddyAllocator
     /// # Safety
     ///
     /// The caller must guarantee that:
-    /// - `addr` was previously returned by [`alloc`][Self::alloc] with the same `order`.
+    /// - Every page of the `2^order` block at `addr` was allocated from this
+    ///   buddy (by [`alloc`][Self::alloc] or
+    ///   [`drain_for_usercaps`][Self::drain_for_usercaps], alone or as part of a
+    ///   larger such block) and none of it is on a free list.
     /// - The block is no longer accessed by any code.
     /// - `addr` is [`PAGE_SIZE`]-aligned.
     pub unsafe fn free(&mut self, addr: u64, order: usize)
@@ -250,12 +240,12 @@ impl BuddyAllocator
 
     /// Seal the allocator after the Phase-7 drain.
     ///
-    /// Records that all RAM has been handed to userspace and the buddy is now
-    /// a sealed boot artifact. Subsequent [`free_range`][Self::free_range]
-    /// calls trip a `debug_assert`: post-handoff the only owner of buddy-backed
-    /// RAM is memmgr, which holds its `owns_memory` Memory caps permanently, so
-    /// a free here is an accounting violation. Called once, at the end of the
-    /// drain, while the free list is empty.
+    /// Subsequent [`free_range`][Self::free_range] calls trip a `debug_assert`;
+    /// the post-handoff ownership rule is in docs/userspace-memory-model.md
+    /// § Ownership Boundaries. Called once, at the end of the drain, while the
+    /// free list is empty.
+    // dead_code: the sole caller, `cap::drain_and_install_seed`, is
+    // `cfg(not(test))`, so host test builds never call `seal`.
     #[cfg_attr(test, allow(dead_code))]
     pub fn seal(&mut self)
     {
@@ -265,11 +255,11 @@ impl BuddyAllocator
     /// Register `size_bytes / PAGE_SIZE` pages as managed but not currently
     /// free.
     ///
-    /// Used at boot for owned regions whose pages live outside the free
-    /// list but may later be returned via [`free_range`][Self::free_range]
-    /// — e.g., boot-module Memory caps minted with `owns_memory = true`.
-    /// Bumping `total_pages` keeps the `free / total` memory-pressure
-    /// ratio well-defined if those pages are eventually reclaimed.
+    /// Used at boot for owned regions whose pages live outside the free list —
+    /// boot-module, init-segment, and reclaim Memory caps minted with
+    /// `owns_memory = true` — so `total_pages` records every page the boot
+    /// ledger accounts. These caps route to memmgr and are not returned after
+    /// the seal (docs/userspace-memory-model.md § Ownership Boundaries).
     ///
     /// # Safety
     ///
@@ -306,13 +296,10 @@ impl BuddyAllocator
     {
         debug_assert!(base.is_multiple_of(PAGE_SIZE as u64));
         debug_assert!(size_bytes.is_multiple_of(PAGE_SIZE as u64));
-        // The sole runtime caller is `dealloc_object`'s Memory arm, reached
-        // only for an `owns_memory` cap at its last reference. Every such cap
-        // is minted at or after the Phase-7 drain and routes to memmgr, which
-        // never destroys it — so post-seal this path is unreachable on a
-        // correct system. A trip here is a leak into the sealed buddy; the
-        // identity check (svctest) catches the same fault later via the drop
-        // in memmgr's `pool_total`.
+        // The sole runtime caller is `dealloc_object_one`'s Memory arm, reached
+        // only for an `owns_memory` cap at its last reference. Post-seal this path
+        // is unreachable on a correct system (docs/userspace-memory-model.md
+        // § Ownership Boundaries); a trip here is a leak into the sealed buddy.
         debug_assert!(
             !self.sealed,
             "post-handoff buddy free — owns_memory cap destroyed after handoff (accounting violation)"
@@ -330,9 +317,8 @@ impl BuddyAllocator
         }
     }
 
-    /// Total number of 4 KiB pages ever added via [`add_region`][Self::add_region].
-    ///
-    /// Fixed after boot. Use `free_page_count / total_page_count` for memory pressure.
+    /// Total number of 4 KiB pages added via [`add_region`][Self::add_region] or
+    /// [`register_owned_range`][Self::register_owned_range]. Fixed after boot.
     pub fn total_page_count(&self) -> usize
     {
         self.total_pages
@@ -383,14 +369,15 @@ impl BuddyAllocator
 
     /// Push a free block address onto the head of the free list for `order`.
     ///
-    /// Silently drops the block if the pool is exhausted (see `POOL_SIZE`).
+    /// Halts the boot if the pool is exhausted (see `POOL_SIZE`): the kernel
+    /// prints `[buddy] POOL EXHAUSTED` and spins; host test builds drop the block.
     fn push_block(&mut self, order: usize, addr: u64)
     {
         self.init_pool();
         let Some(slot) = self.pool_alloc()
         else
         {
-            // Pool exhausted. This physical region is lost from the allocator.
+            // Pool exhausted: halt the boot (host tests drop the block instead).
             // Increase POOL_SIZE if this occurs.
             #[cfg(not(test))]
             crate::kprintln!(
@@ -427,15 +414,15 @@ impl BuddyAllocator
         Some(addr)
     }
 
-    /// Drain free blocks for userspace Memory caps, keeping at least
-    /// `reserve_pages` pages for kernel-internal use (page tables, the SEED
-    /// reserve, stacks).
+    /// Drain free blocks for userspace Memory caps, leaving at least
+    /// `reserve_pages` pages in the buddy.
     ///
     /// Pops blocks from highest order downward, writing `(physical_address, order)`
     /// pairs into `out`. Returns the number of entries written.
     ///
-    /// Called once during Phase 7 to partition physical memory between the kernel
-    /// buddy allocator and userspace Memory capabilities.
+    /// Called once during Phase 7 with `reserve_pages == 0`, emptying the buddy;
+    /// the kernel reserves are taken before the drain
+    /// (core/kernel/docs/initialization.md § Phase 7: Capability System).
     pub fn drain_for_usercaps(&mut self, reserve_pages: usize, out: &mut [(u64, usize)]) -> usize
     {
         let mut count = 0;

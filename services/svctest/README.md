@@ -34,7 +34,7 @@ services/svctest/
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
-        ├── devmgr.rs          # Driver-spawn orphan teardown via `TEST_SPAWN_ORPHAN`
+        ├── devmgr.rs          # Shutdown-device and test-label deny; `TEST_SPAWN_ORPHAN` teardown
         ├── pager.rs           # Demand paging: backed, declined, and pinned faults
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
@@ -42,7 +42,7 @@ services/svctest/
         ├── fs_ipc.rs          # Raw `FS_*` IPC against vfsd and fatfs
         ├── fs_std.rs          # `std::fs` over the FS IPC contract
         ├── pwrmgr.rs          # Shutdown cap-deny check and terminal shutdown
-        ├── svcmgr.rs          # Late handover refused; publish gate; badged `svcmgr` SEND
+        ├── svcmgr.rs          # Late handover refused; publish gate; badged SEND; seed-only names
         └── timed.rs           # `SystemTime::now()` through svcmgr and timed
 ```
 
@@ -64,10 +64,12 @@ the envelope `phase=<name> starting` / `phase=<name> passed`. After the last pha
 or an IPC error, is logged and svctest exits, leaving the system idle.
 
 A failing phase panics through the std panic handler; svctest then never logs
-`ALL TESTS PASSED` and never requests shutdown. The `ns` phase (`caps[0]`), the pwrmgr
-cap-deny phase (`caps[2]`), and the pwrmgr shutdown phase (`caps[1]`) log the skip and return
-when their slot is zero; the devmgr orphan-teardown phase (`caps[3]`) instead fails its
-assertion.
+`ALL TESTS PASSED` and never requests shutdown. The `ns` phase (`caps[0]`) and the pwrmgr
+cap-deny phase (the queried `pwrmgr.deny` cap) log the skip and return when their cap is zero;
+the devmgr deny phases (`caps[2]`), the orphan-teardown phase (`caps[3]`), and the svcmgr
+seed-only phase (every seed, plus the public `svcmgr` and `pwrmgr.deny` names it resolves)
+instead fail their assertions. The seed-only phase thus fails the run on a zero `caps[1]` before
+the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not reached.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
@@ -86,12 +88,17 @@ slot stays zero.
 |-----------|-------------------|----------------------------------------|
 | `caps[0]` | `rootfs.root`     | `ns` phase                             |
 | `caps[1]` | `pwrmgr.shutdown` | Authority cap for the final `SHUTDOWN` |
-| `caps[2]` | `pwrmgr.deny`     | Cap-deny phase                         |
-| `caps[3]` | `devmgr.registry` | devmgr orphan-teardown phase           |
+| `caps[2]` | `devmgr.registry` | devmgr deny phases                     |
+| `caps[3]` | `devmgr.test`     | devmgr orphan-teardown phase           |
 
-`caps[2]` drives the cap-deny phase, which requires an `UNAUTHORIZED` reply to `SHUTDOWN`.
-`caps[3]` exists only for the devmgr orphan-teardown phase's `TEST_SPAWN_ORPHAN` shim
-(TODO(#165): retire with that shim).
+The svcmgr seed-only phase also reads every slot and fails when any is zero, as evidence that
+its name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the
+devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_SHUTDOWN_DEVICE`,
+`TEST_SPAWN_ORPHAN`, and `TEST_ORPHAN_RESULT`. `caps[3]` exists for the orphan-teardown phase's
+`TEST_SPAWN_ORPHAN` shim (TODO(#165): retire with that shim). Every seed is seed-only in
+svcmgr's registry. The no-authority `pwrmgr.deny` cap is public, so svctest resolves it through
+`QUERY_ENDPOINT` on its per-process `service_registry_cap` and spends no seed slot on it; it
+drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED` reply to `SHUTDOWN`.
 
 ---
 
@@ -121,9 +128,9 @@ token falls through to the normal run.
 
 Phases spawn these programs from `/programs/`: `hello` (procmgr, pipes), `stdiotest` and
 `pipefault` (pipes), `stackoverflow` and `relrofault` (process faults), `capexhaust`
-(recv guard), `demandpaged` (pager), and `fsbench` (FS IPC). The devmgr phase has devmgr spawn
-the [`test-orphan`](../drivers/test-orphan/README.md) driver. The FS, namespace, and procmgr
-phases read `/data/test.txt`; the FS phases also read the build-synthesised
+(recv guard), `demandpaged` (pager), and `fsbench` (FS IPC). The devmgr orphan-teardown
+phase has devmgr spawn the [`test-orphan`](../drivers/test-orphan/README.md) driver. The FS,
+namespace, and procmgr phases read `/data/test.txt`; the FS phases also read the build-synthesised
 `/data/svctest/large.bin` and write their scratch files under `/data/svctest/`; and `fsbench`,
 spawned by the `fs_crossover_bench` phase, reads the build-synthesised
 `/data/svctest/bench.bin`. The sysroot placement of all of these is listed in
@@ -138,7 +145,7 @@ spawned by the `fs_crossover_bench` phase, reads the build-synthesised
 | [docs/testing.md](../../docs/testing.md) | Harness model, reporting marker, sysroot layout, gating, cross-harness conventions |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Process startup, `ProcessInfo` handover, process death |
 | [Service Definitions](../svcmgr/docs/service-definitions.md) | `.svc` recipe keys, including `seed` resolution |
-| [svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) | `HANDOVER_COMPLETE` and `PUBLISH_ENDPOINT` and their authority badges |
+| [svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) | `HANDOVER_COMPLETE` and `PUBLISH_ENDPOINT` and their authority badges; `QUERY_ENDPOINT` and its seed-only refusal |
 | [services/pwrmgr/README.md](../pwrmgr/README.md) | pwrmgr `SHUTDOWN` and its authority badge |
 | [services/drivers/test-orphan/README.md](../drivers/test-orphan/README.md) | Fault-injection driver behind the orphan-teardown phase |
 

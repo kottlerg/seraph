@@ -10,24 +10,30 @@
 //! - Up to [`MSG_DATA_WORDS_MAX`] data words (u64 values).
 //! - Up to [`MSG_CAP_SLOTS_MAX`] capability slot indices (u32 values).
 //!
-//! Messages are always copied by value through the kernel; no shared memory
-//! is involved for the inline data (an optional IPC buffer in shared memory
-//! handles larger payloads, deferred to a future phase).
+//! The kernel copies a `Message` by value. Its data words are read from the
+//! sender's per-thread IPC buffer page (registered via `SYS_IPC_BUFFER_SET`)
+//! and written to the receiver's; no memory is shared between the threads.
+//! Bulk data travels as a shared memory capability (`docs/ipc-design.md`
+//! § Message Format and § Large Data Transfers).
 
 use syscall::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
-/// An IPC message transferred between threads via an [`Endpoint`] or reply.
+/// An IPC message transferred between threads by an endpoint call
+/// ([`EndpointState`](crate::ipc::endpoint::EndpointState)) or reply.
 ///
 /// # Adding message fields
-/// Increase the `data` or `cap_slots` array bounds (also update the ABI
-/// constants in `abi/syscall/src/lib.rs`) and update all construction sites.
+/// `data` and `cap_slots` are sized by `MSG_DATA_WORDS_MAX` /
+/// `MSG_CAP_SLOTS_MAX` in `abi/syscall/src/lib.rs`; raise those constants and
+/// audit the marshalling in `core/kernel/src/syscall/ipc.rs`. A new field also
+/// needs every construction site updated.
 #[derive(Clone, Copy, Debug)]
 pub struct Message
 {
     /// Operation tag — caller-defined; not interpreted by the kernel.
     pub label: u64,
     /// Badge from the sender's endpoint capability slot. Zero if unbadged.
-    /// Set by `sys_ipc_call` from the caller's endpoint cap; delivered to the
+    /// Set by `sys_ipc_call` from the caller's endpoint cap, or by
+    /// `fault_dispatch` from the faulting thread's `fault_badge`; delivered to the
     /// receiver via the third return register of `ipc_recv`.
     pub badge: u64,
     /// Inline data words.

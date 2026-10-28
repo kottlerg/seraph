@@ -845,16 +845,18 @@ pub mod svcmgr_labels
     ///
     /// Label bits 16..31 carry `name_len` (see `shared/ipc` `read_path`
     /// pattern); data words from 0 carry the name. Reply attaches the cap on
-    /// success, or returns `svcmgr_errors::UNKNOWN_NAME` on miss.
+    /// success, or returns `svcmgr_errors::UNKNOWN_NAME` on miss and for a
+    /// seed-only name (one whose cap carries authority, which reaches only
+    /// the recipes seeding it; see [`crate::published_names`]).
     pub const QUERY_ENDPOINT: u64 = 4;
 
     /// Verb-bit carried by the caller's badge to authorise
     /// [`PUBLISH_ENDPOINT`] by an *external* publisher (no per-publisher
     /// identity in the low bits today — server-side auth is binary: have
     /// the bit, or don't). svcmgr publishes the well-known names it owns
-    /// (`rootfs.root`, `svcmgr`, `devmgr.registry`, and each provider's
-    /// `provides` names) directly into its own registry, so those need no
-    /// badge. The gate exists for a future external publisher — devmgr
+    /// (`rootfs.root`, `svcmgr`, the three `devmgr.*` names, and each
+    /// provider's `provides` names) directly into its own registry, so those
+    /// need no badge. The gate exists for a future external publisher — devmgr
     /// holds a `PUBLISH_AUTHORITY`-badged SEND from its bootstrap bundle,
     /// reserved for driver registrations.
     ///
@@ -889,6 +891,14 @@ pub mod svcmgr_labels
 /// root filesystem from fatfs to e.g. ext4, or replacing pwrmgr's
 /// platform shutdown source, changes only the publisher's local
 /// derivation, not the published name nor any consumer.
+///
+/// A name whose cap carries authority is seed-only: `rootfs.root`, the
+/// three `devmgr.*` names, and each provider name whose badge carries a
+/// verb bit ([`crate::VERB_BIT_MASK`]; today `pwrmgr.shutdown`) resolve
+/// only through a recipe's `seed = ...` line, and `QUERY_ENDPOINT` answers
+/// them `UNKNOWN_NAME`. `svcmgr`, `pwrmgr.deny`, `timed`, and any name
+/// published through [`svcmgr_labels::PUBLISH_ENDPOINT`] are public
+/// (services/svcmgr/docs/ipc-interface.md § Label 4).
 pub mod published_names
 {
     /// Badged SEND on the root filesystem's namespace endpoint at
@@ -897,8 +907,8 @@ pub mod published_names
     pub const ROOTFS_ROOT: &[u8] = b"rootfs.root";
 
     /// `pwrmgr_labels::SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's
-    /// service endpoint. Consumers needing power-off authority
-    /// resolve this name and call [`pwrmgr_labels::SHUTDOWN`] /
+    /// service endpoint. Seed-only: consumers needing power-off authority
+    /// seed this name and call [`pwrmgr_labels::SHUTDOWN`] /
     /// [`pwrmgr_labels::REBOOT`] through the returned cap.
     pub const PWRMGR_SHUTDOWN: &[u8] = b"pwrmgr.shutdown";
 
@@ -923,6 +933,21 @@ pub mod published_names
     /// with; the `REGISTRY_QUERY_AUTHORITY` badge bit is preserved
     /// through svcmgr's plain `cap_derive` in `registry_lookup_derived`.
     pub const DEVMGR_REGISTRY: &[u8] = b"devmgr.registry";
+
+    /// SEND on devmgr's registry endpoint badged
+    /// `REGISTRY_QUERY_AUTHORITY | SHUTDOWN_DEVICE_AUTHORITY`: the
+    /// `devmgr.registry` surface plus `QUERY_SHUTDOWN_DEVICE`. Seed-only and
+    /// seeded only by pwrmgr, which acquires the platform shutdown actuators
+    /// through it.
+    pub const DEVMGR_SHUTDOWN: &[u8] = b"devmgr.shutdown";
+
+    /// TODO(#165): remove with devmgr's test labels. SEND on devmgr's
+    /// registry endpoint badged
+    /// `REGISTRY_QUERY_AUTHORITY | ORPHAN_TEST_AUTHORITY`: the
+    /// `devmgr.registry` surface plus the `TEST_SPAWN_ORPHAN` /
+    /// `TEST_ORPHAN_RESULT` fault-injection shim. Seed-only and seeded only
+    /// by svctest.
+    pub const DEVMGR_TEST: &[u8] = b"devmgr.test";
 }
 
 pub const RTC_LABELS_VERSION: u32 = 1;
@@ -1347,7 +1372,7 @@ pub mod fs_labels
     pub const FS_TRUNCATE: u64 = 17;
 }
 
-pub const DEVMGR_LABELS_VERSION: u32 = 7;
+pub const DEVMGR_LABELS_VERSION: u32 = 8;
 /// IPC labels for the device manager (`devmgr`).
 pub mod devmgr_labels
 {
@@ -1459,19 +1484,22 @@ pub mod devmgr_labels
     /// table at `table_phys - region_base`. devmgr reads only the
     /// directory (RSDP/XSDT) and table headers (signatures) to locate the
     /// table — never a table body. Replies
-    /// [`super::devmgr_errors::NO_DEVICE`] when the table is not found.
+    /// [`super::devmgr_errors::NO_DEVICE`] when the table is not found,
+    /// both `data[1]` and `data[2]` are zero, or `data[1]` has bits above
+    /// its low 32.
     pub const QUERY_ACPI_TABLE: u64 = 7;
 
     /// Carve and serve the platform shutdown-actuator hardware caps.
     ///
-    /// devmgr is the hardware authority; it carves the exact ports the
-    /// power manager asks for and performs no shutdown logic. The caller
-    /// (`pwrmgr`) has already parsed the ACPI tables (served via
-    /// [`QUERY_ACPI_TABLE`]) and computed the `PM1a` control port it needs.
+    /// devmgr is the hardware authority; it carves the ports the power
+    /// manager needs and performs no shutdown logic. The caller (`pwrmgr`)
+    /// has already parsed the ACPI tables (served via [`QUERY_ACPI_TABLE`])
+    /// and computed the `PM1a` control port it needs; devmgr serves that
+    /// port only when it is the FADT's `PM1a_CNT_BLK`.
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
     /// `data[1]` = the `PM1a` control port (x86-64; ignored on RISC-V).
-    /// Caller's badge MUST carry [`REGISTRY_QUERY_AUTHORITY`]; the handler
+    /// Caller's badge MUST carry [`SHUTDOWN_DEVICE_AUTHORITY`]; the handler
     /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
     /// Reply ([`super::devmgr_errors::SUCCESS`]):
@@ -1483,11 +1511,13 @@ pub mod devmgr_labels
     /// - RISC-V: `caps[0]` = a Reset-only derivation of devmgr's
     ///   `SbiControl` cap (SBI SRST authority).
     ///
-    /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails or
-    /// the platform authority cap is absent,
-    /// [`super::devmgr_errors::INVALID_REQUEST`] when the RISC-V Reset-only
-    /// derivation fails, and [`super::devmgr_errors::LABEL_VERSION_MISMATCH`]
-    /// when `data[0]` is not `DEVMGR_LABELS_VERSION`.
+    /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails,
+    /// the FADT or its `PM1a_CNT_BLK` cannot be read (x86-64), or the
+    /// platform authority cap is absent,
+    /// [`super::devmgr_errors::INVALID_REQUEST`] when `data[1]` is not the
+    /// FADT's `PM1a_CNT_BLK` (x86-64) or the RISC-V Reset-only derivation
+    /// fails, and [`super::devmgr_errors::LABEL_VERSION_MISMATCH`] when
+    /// `data[0]` is not `DEVMGR_LABELS_VERSION`.
     pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 
     /// Query for the keyboard/input device endpoint.
@@ -1507,12 +1537,18 @@ pub mod devmgr_labels
     /// handler replies `SUCCESS` immediately (the forced-failure spawn does
     /// nested `ipc_call`s that would clobber the reply context), then forces a
     /// round-2 bootstrap failure and stashes the outcome for
-    /// [`TEST_ORPHAN_RESULT`].
+    /// [`TEST_ORPHAN_RESULT`]. Request: `data[0]` = caller's compiled
+    /// [`super::DEVMGR_LABELS_VERSION`]. Caller's badge MUST carry
+    /// [`ORPHAN_TEST_AUTHORITY`]; the handler replies
+    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise and
+    /// [`super::devmgr_errors::LABEL_VERSION_MISMATCH`] on a version
+    /// mismatch, without spawning.
     pub const TEST_SPAWN_ORPHAN: u64 = 9;
     /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
     /// label: report the last [`TEST_SPAWN_ORPHAN`] outcome in reply `data[0]`
     /// — `0` not run, `1` spawn failed as expected (unwind fired), `2`
-    /// unexpected success, `3` shim setup error.
+    /// unexpected success, `3` shim setup error. Request and gate as
+    /// [`TEST_SPAWN_ORPHAN`].
     pub const TEST_ORPHAN_RESULT: u64 = 10;
 
     /// Authority bit in the devmgr-registry-endpoint badge's high
@@ -1525,11 +1561,23 @@ pub mod devmgr_labels
     /// Authority bit gating [`SET_DRIVERS_DIR`]. svcmgr mints a SEND
     /// cap carrying this bit from the devmgr-registry source cap init
     /// endows it with at handover; the `REGISTRY_QUERY_AUTHORITY`-only
-    /// copy svcmgr publishes as `devmgr.registry` (which other services
-    /// then look up) lacks this bit, so no looked-up consumer can call
+    /// copy svcmgr publishes seed-only as `devmgr.registry` (which recipes
+    /// seed) lacks this bit, so no seeding consumer can call
     /// `SET_DRIVERS_DIR`. Disjoint position from
     /// [`REGISTRY_QUERY_AUTHORITY`].
     pub const DRIVERS_DIR_AUTHORITY: u64 = 1u64 << 62;
+    /// Authority bit gating [`QUERY_SHUTDOWN_DEVICE`]. svcmgr mints it,
+    /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
+    /// seed-only as [`crate::published_names::DEVMGR_SHUTDOWN`], which
+    /// pwrmgr alone seeds and `QUERY_ENDPOINT` refuses, so no other process
+    /// holds the bit. Disjoint position from the other authority bits.
+    pub const SHUTDOWN_DEVICE_AUTHORITY: u64 = 1u64 << 61;
+    /// TODO(#165): remove with the test labels. Authority bit gating
+    /// [`TEST_SPAWN_ORPHAN`] and [`TEST_ORPHAN_RESULT`]. svcmgr mints it,
+    /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
+    /// seed-only as [`crate::published_names::DEVMGR_TEST`], which svctest
+    /// alone seeds. Disjoint position from the other authority bits.
+    pub const ORPHAN_TEST_AUTHORITY: u64 = 1u64 << 60;
 }
 
 /// Device-info kind discriminants for [`devmgr_labels::QUERY_DEVICE_INFO`]
@@ -1929,7 +1977,11 @@ pub mod stream_labels
 /// (docs/capability-model.md § Verb-bit authority pattern). Endpoints with no
 /// verb gate (bootstrap endpoints, memmgr, namespace node caps) do not
 /// reserve them.
-pub const VERB_BIT_MASK: u64 = (1u64 << 63) | (1u64 << 62);
+pub const VERB_BIT_MASK: u64 = (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60);
+const _: () = core::assert!(
+    devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
+        && devmgr_labels::ORPHAN_TEST_AUTHORITY & VERB_BIT_MASK != 0
+);
 
 /// Reserved log-endpoint badges.
 ///

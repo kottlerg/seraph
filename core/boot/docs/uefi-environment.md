@@ -14,12 +14,15 @@ acquisition, `ExitBootServices`, and error handling.
 
 | Protocol | Handle method | Purpose | Required |
 |---|---|---|---|
-| `EFI_LOADED_IMAGE_PROTOCOL` | `HandleProtocol(image_handle)` | Obtain device handle for the boot volume | Yes |
+| `EFI_LOADED_IMAGE_PROTOCOL` | `OpenProtocol(image_handle, BY_HANDLE_PROTOCOL)` | Obtain device handle for the boot volume | Yes |
 | `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` | `HandleProtocol(device_handle)` | Open the ESP root directory | Yes |
 | `EFI_GRAPHICS_OUTPUT_PROTOCOL` | `LocateHandleBuffer(ByProtocol)` | Select a fixed mode; record framebuffer address, dimensions, format | No |
 | `EFI_GET_MEMORY_MAP` | `BootServices->GetMemoryMap` | Query physical memory layout | Yes |
 | `EFI_ALLOCATE_PAGES` | `BootServices->AllocatePages` | Allocate physical memory for all loaded data | Yes |
-| `EFI_CONFIGURATION_TABLE` | `SystemTable->ConfigurationTable` | Locate ACPI RSDP or Device Tree blob | Arch-specific |
+| `EFI_CONFIGURATION_TABLE` | `SystemTable->ConfigurationTable` | Locate the ACPI RSDP and/or Device Tree blob (both GUIDs searched on both architectures) | No (each table optional) |
+| `EFI_RNG_PROTOCOL` | `LocateProtocol` | Draw the 32-byte entropy-pool seed and an independent 16-byte KASLR draw (two words; step 5c) | No |
+| `EFI_RISCV_BOOT_PROTOCOL` | `LocateProtocol` | Read the boot hart ID (RISC-V only; 0 when absent) | No |
+| All handles | `LocateHandleBuffer(AllHandles)` + `ConnectController` | Bind drivers (e.g. virtio-gpu to GOP) not auto-connected during BDS, before the GOP query | No |
 
 `EFI_GRAPHICS_OUTPUT_PROTOCOL` is optional — its absence is handled gracefully by
 zeroing the `framebuffer.physical_base` field in `BootInfo`. A headless system or a
@@ -27,16 +30,17 @@ virtual machine without a GOP framebuffer is a valid configuration.
 
 When GOP is present, the bootloader requests a fixed 1280x720 mode via `SetMode`
 before recording the active mode for handoff (`TARGET_FB_WIDTH` /
-`TARGET_FB_HEIGHT` in [`boot/src/uefi.rs`](../src/uefi.rs)). Both architectures
+`TARGET_FB_HEIGHT` in [`core/boot/src/uefi.rs`](../src/uefi.rs)). Both architectures
 acquire the framebuffer through this same GOP path, so the fixed request yields a
 consistent framebuffer size across x86-64 and RISC-V rather than one dependent on
 per-firmware or per-QEMU defaults. The request is best-effort: if the firmware's
 GOP does not offer the target mode, the active mode is left unchanged.
 
-`EFI_CONFIGURATION_TABLE` entries are needed for firmware table parsing: on x86-64
-the ACPI `EFI_ACPI_20_TABLE_GUID` entry locates the RSDP; on RISC-V the
-`EFI_DTB_TABLE_GUID` entry locates the Device Tree blob. The parsing itself is specified in
-[firmware-parsing.md](firmware-parsing.md).
+`EFI_CONFIGURATION_TABLE` entries are needed for firmware table parsing: the bootloader
+searches the table for both `EFI_ACPI_20_TABLE_GUID` (ACPI RSDP) and `EFI_DTB_TABLE_GUID`
+(Device Tree blob) on both architectures and records whichever the firmware installs; x86-64
+and QEMU+EDK2 RISC-V publish ACPI, and DTB-only RISC-V firmware publishes the FDT. The
+parsing itself is specified in [firmware-parsing.md](firmware-parsing.md).
 
 ---
 
@@ -48,17 +52,19 @@ The EFI System Partition is accessed as follows:
 1. image_handle → EFI_LOADED_IMAGE_PROTOCOL → DeviceHandle
 2. DeviceHandle → EFI_SIMPLE_FILE_SYSTEM_PROTOCOL
 3. SimpleFileSystem->OpenVolume() → root EFI_FILE_PROTOCOL handle
-4. root->Open("\EFI\seraph\kernel") → kernel file handle (hardcoded path)
-5. root->Open("\EFI\seraph\bootstrap.bundle") → bundle file handle (hardcoded path)
+4. root->Open("\EFI\seraph\bootstrap.bundle") → bundle file handle (step 2)
+5. root->Open("\EFI\seraph\kernel") → kernel file handle (step 3)
+6. root->Open("\EFI\seraph\nokaslr") → presence probe only; the handle is closed at once (step 5d)
 ```
 
 All files are opened as read-only. Sizes are determined via `EFI_FILE_INFO` before
 reading. Files are read into physical memory allocated by `AllocatePages`; see
 [elf-loading.md](elf-loading.md) for how segment placement works.
 
-The bootloader carries only two ESP path constants —
-`\EFI\seraph\kernel` and `\EFI\seraph\bootstrap.bundle` — both
-hardcoded in [`boot/src/main.rs`](../src/main.rs). There is no on-disk
+The bootloader carries three ESP path constants — `\EFI\seraph\kernel`,
+`\EFI\seraph\bootstrap.bundle`, and the presence-only KASLR override knob
+`\EFI\seraph\nokaslr` — all hardcoded in [`core/boot/src/main.rs`](../src/main.rs) (see
+[elf-loading.md](elf-loading.md) § File Paths). There is no on-disk
 boot configuration file; the bundle is the single composed artifact
 that carries init plus every userspace module the system needs (see
 [elf-loading.md](elf-loading.md) for how its entries are loaded). The
@@ -69,16 +75,18 @@ bundle format itself is specified in
 
 ## Memory Allocation Strategy
 
-All allocation before `ExitBootServices` goes through `AllocatePages`. Two allocation
-modes are used:
+All bootloader-owned allocation before `ExitBootServices` goes through `AllocatePages`. Two
+allocation modes are used:
 
 **`AllocateAnyPages`** — the firmware selects a free physical page range. Used for
-everything whose absolute address does not matter: the kernel image span, init image
-segments, boot-module buffers, page-table frames, the `BootInfo` structure, the
-`MmioAperture` array, the memory map buffer, and the `MemoryMapEntry` array. The kernel
-image is placed as one contiguous span and its base recorded in
-`BootInfo.kernel_physical_base`, so kernel placement tolerates any firmware memory
-layout; see [elf-loading.md](elf-loading.md) for the placement sequence.
+everything whose absolute address does not matter: the bundle buffer (boot modules are
+referenced in place inside it), the kernel file buffer and kernel image span, init image
+segments, page-table frames (and, on RISC-V, the paging-mode probe root and the AP trampoline
+page), the `BootInfo` page, the module descriptor array, the `MemoryMapEntry` array, the
+`MmioAperture` array, the kernel stack, the reclaim-range array, and the memory map buffer.
+The kernel image is placed as one contiguous span and its base recorded in
+`BootInfo.kernel_physical_base`, so kernel placement tolerates any firmware memory layout; see
+[elf-loading.md](elf-loading.md) for the placement sequence.
 
 **`AllocateMaxAddress`** — the firmware selects a free range with a physical base at or
 below a bound. Used only by the x86-64 AP-startup trampoline, whose SIPI vector must
@@ -89,8 +97,10 @@ All allocation uses memory type `EfiLoaderData`. UEFI memory map entries for
 notifying to the kernel that these regions are in use and must not be reused until
 explicitly reclaimed; [memory-map.md](memory-map.md) owns the full translation policy.
 
-There is no deallocation path before `ExitBootServices`. Memory is allocated once
-and used; the bootloader does not implement a heap. UEFI boot services terminate
+The bootloader never frees its own `AllocatePages` allocations; the only deallocation
+before `ExitBootServices` is `FreePool` on the pool buffers firmware returns from
+`LocateHandleBuffer` and GOP `QueryMode`. Memory is allocated once and used; the bootloader
+does not implement a heap. UEFI boot services terminate
 before any reclamation would be relevant.
 
 ---
@@ -117,9 +127,11 @@ The acquisition sequence:
    Note: this allocation itself invalidates any prior map key.
 3. Call GetMemoryMap(buf_size, buf_addr, &map_key, &desc_size, &desc_version)
    to fill the buffer. The map_key from this call is the correct one to use.
-4. Translate entries: UEFI memory types → MemoryType (see translation table below).
-5. Sort entries by physical_base ascending.
 ```
+
+Translation into `MemoryType` and the ascending sort by `physical_base` run after
+`ExitBootServices`, in step 9 (`translate_memory_map`, `insertion_sort_memory_map`), per the
+policy in [memory-map.md](memory-map.md).
 
 The buffer allocation in step 2 increases the map size by at least one entry (the new
 `EfiLoaderData` region). The buffer must be sized to accommodate this; the bootloader
@@ -184,22 +196,32 @@ The bootloader performs no allocation-dependent operations after `ExitBootServic
 
 ## Error Handling Strategy
 
-All errors in the bootloader are fatal. There is no recovery path, no retry beyond
-the bounded `ExitBootServices` retry loop described above, and no fallback
-configuration.
+Every `BootError` that reaches `efi_main` is fatal. Two sites consume a `BootError` instead of
+returning it: a failed open of `\EFI\seraph\nokaslr` reads as an absent knob
+([boot-flow.md § Step 5d](boot-flow.md#step-5d-apply-the-kaslr-slide)), and a failed
+AP-trampoline allocation is logged as a warning and records zero
+([boot-flow.md § Step 5b](boot-flow.md#step-5b-allocate-the-ap-trampoline-page)). Optional
+resources degrade instead of failing: an absent GOP leaves the system headless, and an absent or
+failing entropy source falls back as
+[boot-flow.md § Step 5c](boot-flow.md#step-5c-boot-entropy-seed) describes. There is no recovery
+path for a `BootError` that reaches `efi_main`, no retry beyond the bounded `ExitBootServices`
+retry loop described above, and no fallback configuration.
 
 ### BootError Type
 
-All fallible functions in the bootloader return `Result<T, BootError>`,
-defined in [`boot/src/error.rs`](../src/error.rs). The variant set covers
+Every fatal error returned through `Result` is a `BootError` (`Result<T, BootError>`),
+defined in [`core/boot/src/error.rs`](../src/error.rs). The variant set covers
 protocol-location failure, UEFI status-code propagation, ESP file-not-found,
 ELF validation failure, W^X violation, allocation failure, `ExitBootServices`
-failure after the bounded retry loop, and bundle parse/validation failure
-(`InvalidBundle`); the source is the authority on the variant list and payloads.
+failure after the bounded retry loop, bundle parse/validation failure (`InvalidBundle`),
+and, on RISC-V, no supported paging mode passing the satp probe (`PagingModeUnsupported`);
+the source is the authority on the variant list and payloads.
 
-The top-level `efi_main` propagates errors to a single fatal handler that
-reports the error and halts. There is no recovery path and no retry beyond
-the bounded `ExitBootServices` retry loop described above.
+The top-level `efi_main` propagates every `BootError` to a single fatal handler
+(`error::fatal_error`) that reports the error and halts. Two halts bypass it: a
+`reclaim_ranges` overflow in step 9 prints
+`[--------] boot: FATAL: reclaim_ranges overflow (bump MAX_RECLAIM_RANGES)` and spins in
+place, and a panic prints `SERAPH BOOT PANIC: <panic info>` from the panic handler.
 
 ### Error Reporting
 

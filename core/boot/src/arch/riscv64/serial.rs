@@ -65,7 +65,8 @@ pub unsafe fn discover_uart(st: *mut EfiSystemTable)
         // SAFETY: rsdp obtained from UEFI config table; identity-mapped during boot.
         if let Some(base) = unsafe { find_spcr_base(rsdp_ptr as u64) }
         {
-            // SAFETY: single-threaded boot phase; no concurrent access to static mut.
+            // SAFETY: single-threaded boot phase; no concurrent access to static mut;
+            // usize is 64-bit on all supported UEFI targets; no truncation.
             #[allow(clippy::cast_possible_truncation)]
             unsafe {
                 UART_BASE_ADDR = base as usize;

@@ -6,20 +6,20 @@
 //! Tier 2 integration: FPU register file survives a raw `SYS_IPC_CALL`
 //! round-trip across CPU migration.
 //!
-//! Mirrors `unit/fpu.rs::preempt_isolation_cross_cpu` but substitutes the
-//! notification rendezvous for an IPC call/reply. The child issues `SYS_IPC_CALL`
-//! directly via inline asm so no Rust function boundary clobbers the live
-//! FP register file between "load pattern" and "capture pattern
-//! post-migration"; this is the only ktest call site that exercises the
-//! `SYS_IPC_CALL` register ABI without going through `shared/ipc`'s
-//! wrappers.
+//! Mirrors `core/ktest/src/unit/fpu.rs::preempt_isolation_cross_cpu` but
+//! substitutes an IPC call/reply for the notification rendezvous. The
+//! child issues `SYS_IPC_CALL` directly via inline asm so no Rust function
+//! boundary clobbers the live FP register file between "load pattern" and
+//! "capture pattern post-migration"; this is the only ktest call site that
+//! exercises the `SYS_IPC_CALL` register ABI without going through
+//! `shared/ipc`'s wrappers.
 //!
 //! Coverage: the kernel's eager-save / lazy-restore path is already
-//! exercised by `unit/fpu.rs::preempt_isolation_cross_cpu` via the notification
-//! rendezvous. This file adds the IPC-dispatch path — `sys_ipc_call`'s
-//! endpoint-block branch into the scheduler, and `sys_ipc_reply`'s wake —
-//! so a future IPC fast-path optimisation that skipped `switch_out_save`
-//! would surface here. Requires SMP; skips on UP.
+//! exercised by `core/ktest/src/unit/fpu.rs::preempt_isolation_cross_cpu`
+//! via the notification rendezvous. This file adds the IPC-dispatch path —
+//! `sys_ipc_call`'s endpoint-block branch into the scheduler, and
+//! `sys_ipc_reply`'s wake — so a future IPC fast-path optimisation that
+//! skipped `switch_out_save` would surface here. Requires SMP; skips on UP.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -33,7 +33,7 @@ use syscall_abi::SystemInfoType;
 use crate::{ChildStack, TestContext, TestResult, spawn};
 use syscall_abi::RIGHTS_EP_SEND_GRANT;
 
-/// Notification NOTIFY right — covers both `notification_send` and `notification_wait`.
+/// Notification NOTIFY right — the child only signals `done` via `notification_send`.
 const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;
 
 /// 64-bit pattern loaded into every FP register before the call.
@@ -45,7 +45,7 @@ const REPLY_LABEL: u64 = 0xBEEF;
 
 /// Spin between FP load and `SYS_IPC_CALL` so timer ticks fire while the
 /// child is `fpu_owner` on the source CPU. Same sizing rationale as the
-/// cross-CPU notification test in `unit/fpu.rs`.
+/// cross-CPU notification test in `core/ktest/src/unit/fpu.rs`.
 const SPIN_ITERS: u64 = 50_000;
 
 static mut STACK: ChildStack = ChildStack::ZERO;
@@ -53,7 +53,7 @@ static mut STACK: ChildStack = ChildStack::ZERO;
 // Resources are published to the child via statics rather than the entry
 // argument so the inline-asm block can load them without depending on any
 // register the kernel-side entry-frame setup may not preserve. Matches the
-// publishing scheme in `unit/fpu.rs::preempt_isolation_cross_cpu`.
+// publishing scheme in `core/ktest/src/unit/fpu.rs::preempt_isolation_cross_cpu`.
 static CHILD_EP: AtomicU32 = AtomicU32::new(0);
 static CHILD_DONE: AtomicU32 = AtomicU32::new(0);
 static MISMATCHES: AtomicU64 = AtomicU64::new(0);
@@ -171,7 +171,8 @@ fn child_entry(_arg: u64) -> !
 }
 
 #[cfg(target_arch = "riscv64")]
-#[allow(clippy::too_many_lines)] // 32 FP loads + ecall + 32 FP stores dominate the body.
+// 32 FP loads + ecall + 32 FP stores dominate the body.
+#[allow(clippy::too_many_lines)]
 fn child_entry(_arg: u64) -> !
 {
     // Register this thread's IPC buffer. See x86_64 sibling for rationale.
@@ -190,10 +191,10 @@ fn child_entry(_arg: u64) -> !
     // (a7=0, a0..a5 carry args; a5 declared clobbered so the allocator
     // never assigns it to a generic operand) preserving the live FP
     // register file across it, then captures f0..f31 back to `buf`.
-    // `.option arch, +d` locally enables the D extension because the
-    // kernel target is RV64IMAC. a0/a1/a2 are written by the kernel as
-    // (ret, reply_label, reply_word_count) via `set_ipc_call_return` and
-    // are discarded.
+    // `.option arch, +d` locally enables the D extension because ktest's
+    // low-level userspace target (`riscv64imac-seraph-lowuser`) is RV64IMAC.
+    // a0/a1/a2 are written by the kernel as (ret, reply_label,
+    // reply_word_count) via `set_ipc_call_return` and are discarded.
     unsafe {
         core::arch::asm!(
             ".option push",
@@ -352,9 +353,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("fpu_survives_ipc_call: ipc_recv returned wrong label");
     }
 
-    // Flip child affinity to CPU 1 while it's blocked in BlockedSendRecv
-    // awaiting reply. Mirrors the affinity flip in
-    // unit/fpu.rs::preempt_isolation_cross_cpu.
+    // Flip child affinity to CPU 1 while it is `BlockedOnReply` awaiting the
+    // reply. Mirrors the affinity flip in
+    // core/ktest/src/unit/fpu.rs::preempt_isolation_cross_cpu.
     thread_set_affinity(child.th, 1)
         .map_err(|_| "fpu_survives_ipc_call: thread_set_affinity(1) failed")?;
 
@@ -386,9 +387,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         return Err("FP register file corrupted across SYS_IPC_CALL round-trip");
     }
-    // Diagnostic only — do not gate on `observed_cpu`. The scheduler may
-    // keep the child on its original CPU; the FP-state invariant must
-    // hold either way. Same rationale as
-    // unit/fpu.rs::preempt_isolation_cross_cpu.
+    // Diagnostic only — do not gate on `observed_cpu`: this test checks FP
+    // state, which must be intact whichever CPU the child resumes on. The
+    // flip above applies on wake through `select_target_cpu` (the Blocked
+    // path), and no test gates on the CPU that path lands on; the
+    // Ready-queued and Running migration paths are gated, by
+    // core/ktest/src/unit/thread.rs::affinity_migrate_ready_queued and
+    // ::affinity_migrate_running.
     Ok(())
 }

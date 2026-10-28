@@ -16,8 +16,8 @@
 //!   donation counts past the wrapper's inline records (the record pages
 //!   the kernel carves from the donations themselves).
 //! - **PT-budget exhaustion** — repeated `mem_map` against a freshly
-//!   created `AddressSpace` whose initial growth budget covers only its
-//!   root PT and one pool page eventually returns `OutOfMemory` from the
+//!   created `AddressSpace` whose initial growth budget covers only two
+//!   pool pages eventually returns `OutOfMemory` from the
 //!   intermediate-PT allocation. Exercises the
 //!   `pt_growth_budget_bytes`-zero failure path on both arches.
 //! - **Deep PT walk** — mapping into a wide VA range forces the per-AS
@@ -155,7 +155,7 @@ fn exited_reason(thread: u32, what: &'static str) -> Result<u64, &'static str>
 {
     let state = cap_info(thread, CAP_INFO_THREAD_STATE)
         .map_err(|_| "retype::aspace_stop: cap_info(thread state) failed")?;
-    // cast_possible_truncation: 8-bit state in the high word.
+    // cast_possible_truncation: `>> 32` leaves the 32-bit state code, so the cast is exact.
     #[allow(clippy::cast_possible_truncation)]
     if (state >> 32) as u32 != THREAD_STATE_EXITED
     {
@@ -165,8 +165,9 @@ fn exited_reason(thread: u32, what: &'static str) -> Result<u64, &'static str>
 }
 
 /// Deleting the last capability to an `AddressSpace` stops every thread
-/// bound to it before its root page table is reclaimed, and records
-/// `EXIT_KILLED` as each one's exit reason. Three bound threads, each in a
+/// bound to it with `EXIT_KILLED` (see
+/// [thread-lifecycle-and-sleep.md](../../../kernel/docs/thread-lifecycle-and-sleep.md)
+/// § Lifecycle State Machine). Three bound threads, each in a
 /// dedicated address space and deleted from under it:
 ///
 /// - a thread created there and never started (`Created`);
@@ -430,9 +431,10 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;
 
-    // 32 pool pages covers ≥ 4 mappings spread across distinct
-    // intermediate PT regions (each fresh region needs 2-4 intermediate PT
-    // pages depending on arch, paging mode, and sharing).
+    // A 32-page slab (30 pool pages after the wrapper and root PT) covers
+    // ≥ 4 mappings spread across distinct intermediate PT regions (each fresh
+    // region needs 2-4 intermediate PT pages depending on arch, paging mode,
+    // and sharing).
     let aspace = cap_create_aspace(memory, 0, 32)
         .map_err(|_| "retype::deep_pt: cap_create_aspace failed")?;
 
@@ -471,7 +473,7 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
     let memory = ctx.memory_base;
 
     // Slab: page 0 = wrapper, page 1 = root PT, pages 2..8 = 6 pool pages —
-    // ample for the 3 intermediate PTs a single fresh mapping needs.
+    // ample for the two to four intermediate tables a single fresh mapping needs.
     let aspace = cap_create_aspace(memory, 0, 8)
         .map_err(|_| "retype::region_reclaim: cap_create_aspace failed")?;
 
@@ -479,7 +481,7 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
         .map_err(|_| "retype::region_reclaim: cap_info(budget0) failed")?;
 
     // Map one page at a fresh 2 MiB-aligned VA: allocates the full intermediate
-    // chain (3 pages) from the pool.
+    // chain (one table per non-root level) from the pool.
     if mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE).is_err()
     {
         cap_delete(aspace).ok();
@@ -493,8 +495,8 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
         return Err("retype::region_reclaim: mapping did not consume PT budget");
     }
 
-    // Reclaiming unmap: clears the leaf, empties PT→PD→PDPT, returns all three
-    // to the pool and credits the budget.
+    // Reclaiming unmap: clears the leaf, empties every intermediate table on the
+    // chain, returns them all to the pool and credits the budget.
     if mem_unmap_reclaim(aspace, TEST_VA_BASE, 1).is_err()
     {
         cap_delete(aspace).ok();
@@ -530,8 +532,9 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
 /// are mapped; reclaiming-unmap of each returns its intermediate tables, so the
 /// budget recovers to its pre-burst value instead of staying depressed until
 /// address-space death. This is the #273 peak-concurrency retention case: the
-/// 1 GiB stride gives every region its own PD+PT under a shared PDPT, and the
-/// final unmap empties and frees the PDPT too — a full round-trip to baseline.
+/// 1 GiB stride gives every region its own tables below the level-2 slot, under
+/// whatever upper-level tables the paging mode shares, and the final unmap empties
+/// and frees those shared tables too — a full round-trip to baseline.
 pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestResult
 {
     const N: u64 = 6;
@@ -539,7 +542,8 @@ pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestR
 
     let memory = ctx.memory_base;
 
-    // Generous pool: 1 PDPT + N*(PD+PT) intermediate pages plus slack.
+    // Generous pool: N regions' per-region intermediate tables plus any shared
+    // upper-level tables, with slack.
     let aspace = cap_create_aspace(memory, 0, 64)
         .map_err(|_| "retype::concurrent_regions: cap_create_aspace failed")?;
 
@@ -587,8 +591,8 @@ pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestR
 }
 
 /// `CSpace::grow` consumes pool pages as slots are inserted past the
-/// first slot page's capacity. `slots_used` advances and `growth_budget`
-/// drops in step.
+/// first slot page's capacity. `CAP_INFO_CSPACE_USED` advances and
+/// `CAP_INFO_CSPACE_BUDGET` drops in step.
 pub fn cspace_grow_consumes_pool(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;
@@ -937,9 +941,10 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
     }
 }
 
-/// Donations are unbounded in count: the wrapper's sixteen inline donation
-/// records spill into record pages carved from the donations themselves
-/// (one page per `RECORDS_PER_PAGE` further donations). Two hundred
+/// Donations are unbounded in count: past the wrapper's inline records they
+/// spill into record pages carved from the donations themselves (see
+/// [capability-internals.md](../../../kernel/docs/capability-internals.md)
+/// § Donation Records). Two hundred
 /// donations of one page each cross the inline limit and one full record page,
 /// so exactly two donations supply a record page and seed nothing; every
 /// other page is usable, and the wholesale delete returns all of them to

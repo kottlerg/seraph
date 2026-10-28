@@ -4,10 +4,10 @@ Invariants for the bootloader's early debug-output path across both serial
 and framebuffer backends.
 
 Implementations:
-- Dual-backend writer: [`boot/src/console.rs`](../src/console.rs).
-- Framebuffer backend: [`boot/src/framebuffer.rs`](../src/framebuffer.rs).
-- Serial backend (x86-64): [`boot/src/arch/x86_64/serial.rs`](../src/arch/x86_64/serial.rs).
-- Serial backend (RISC-V): [`boot/src/arch/riscv64/serial.rs`](../src/arch/riscv64/serial.rs).
+- Dual-backend writer: [`core/boot/src/console.rs`](../src/console.rs).
+- Framebuffer backend: [`core/boot/src/framebuffer.rs`](../src/framebuffer.rs).
+- Serial backend (x86-64): [`core/boot/src/arch/x86_64/serial.rs`](../src/arch/x86_64/serial.rs).
+- Serial backend (RISC-V): [`core/boot/src/arch/riscv64/serial.rs`](../src/arch/riscv64/serial.rs).
 - Bitmap font (framebuffer): [`shared/font/`](../../../shared/font/).
 
 ---
@@ -15,7 +15,9 @@ Implementations:
 ## Scope
 
 The early console is a *pre-kernel* debug surface. Both backends exist solely
-to surface diagnostics before `ExitBootServices`; neither survives handoff.
+to surface bootloader diagnostics up to kernel handoff, including the step 9
+and step 10 lines and any fatal message emitted after `ExitBootServices`;
+neither survives handoff.
 The kernel has its own console arrangements and takes nothing from the
 bootloader's console state.
 
@@ -34,9 +36,10 @@ out to every backend that is live:
 - **Framebuffer** — available only when UEFI's Graphics Output Protocol
   (GOP) reported a linear pixel buffer in Step 1 of the boot sequence.
 
-Early messages (protocol lookup, bundle load) occur before GOP is
-queried and land on serial only; this is the intended fallback on headless
-systems.
+Output emitted before the Step 1 GOP query (the Step 1 progress line, and
+any loaded-image or ESP lookup failure) lands on serial only; on headless
+systems, where GOP is absent, all output stays serial-only, which is the
+intended fallback.
 
 ---
 
@@ -97,7 +100,12 @@ result feeds both the on-screen early-boot messages and the
 
 ### Glyph Rendering
 
-The font is the `9×20` bitmap array exposed by
+The writer decodes its byte stream as UTF-8 (`text::Utf8Decoder`) and
+resolves each codepoint to one or more glyph bitmaps through
+`text::render_codepoint` (dispatch order owned by
+[`shared/text/README.md`](../../../shared/text/README.md)), drawing from
+both the base table and the `FONT_9X20_EXT` extension glyphs. The base
+font is the `9×20` bitmap array exposed by
 [`shared/font/`](../../../shared/font/): 256 glyphs stored in one flat
 `[u16; 5120]` array (20 scanlines per glyph), with `FONT_9X20[N * 20 + R]`
 yielding scanline `R` of glyph `N`. Bits 15–7 of each scanline are the 9
@@ -116,10 +124,12 @@ edges are left unused.
 ### Pixel Formats
 
 Only `PixelFormat::Rgbx8` and `Bgrx8` are supported. Both are 32-bit
-per pixel with 8 bits of RGB and an unused alpha/padding byte; they
+per pixel with 8 bits per colour channel and an unused padding byte; they
 differ only in channel order. These two cover every UEFI implementation
-encountered on target hardware. Unrecognised pixel formats are not
-rendered (the writer is constructed but writes to it are no-ops).
+encountered on target hardware. A GOP mode whose format maps to neither
+(including a `PixelBitMask` mode whose masks match neither layout) is
+skipped by `query_gop`; when no GOP handle qualifies,
+`BootInfo.framebuffer` is zeroed and no framebuffer writer is constructed.
 
 `stride` is bytes per row and may exceed `width * 4` on some firmware
 implementations; the writer uses `stride` as the row advance, not
@@ -130,7 +140,9 @@ implementations; the writer uses `stride` as the row advance, not
 The framebuffer physical base, width, height, stride, and pixel format
 are recorded in `BootInfo.framebuffer`. The bootloader does not
 transfer any ownership of the framebuffer — it records what UEFI told
-it and stops touching the memory at `ExitBootServices`. Post-handoff,
+it and keeps rendering its own diagnostics there until kernel handoff
+(the post-`ExitBootServices` step 9 and step 10 lines included), then
+stops touching the memory. Post-handoff,
 any userspace service that is granted the framebuffer MMIO capability
 is free to take over; whether an early-boot display service exists at
 all is a userspace policy decision, not a bootloader concern.

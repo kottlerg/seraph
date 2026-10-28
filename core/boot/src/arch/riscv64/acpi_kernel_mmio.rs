@@ -14,17 +14,19 @@
 //! earlier pass (currently: none; reserved for future higher-authority
 //! sources) wins; `hart_caps` bits are only ever set, never cleared.
 //!
-//! The generic ACPI primitives (RSDP/XSDT validation, byte readers,
-//! SPCR and RHCT walkers) live in [`crate::acpi`]; only the
-//! RISC-V-specific interpretation of MADT entries and the UART size
-//! convention live here.
+//! The generic ACPI primitives (RSDP/XSDT validation, byte readers, the
+//! RHCT walker) live in [`crate::acpi`]; the SPCR walker lives in
+//! [`super::acpi_spcr`]. Only the RISC-V-specific interpretation of MADT
+//! entries and the UART size convention live here.
 
 use super::acpi_spcr::find_spcr_base;
 use crate::acpi::{MADT_ENTRIES_OFF, MADT_TYPE_PLIC, find_acpi_table, read_u8, read_u32, read_u64};
 use boot_protocol::KernelMmio;
 
-/// Conventional ns16550a register-file size. SPCR does not specify a
-/// region size; DTB (if subsequently run) does and overrides this.
+/// Conventional ns16550a register-file size. SPCR carries no region size; a
+/// later DTB pass does not replace this value, because it fills only fields
+/// ACPI left zero (per `core/boot/docs/firmware-parsing.md`
+/// [§ Architecture Dispatch](../../../docs/firmware-parsing.md#architecture-dispatch)).
 const NS16550A_MMIO_SIZE: u64 = 0x100;
 
 /// Populate the arch-specific `kernel_mmio` fields for RISC-V from ACPI.

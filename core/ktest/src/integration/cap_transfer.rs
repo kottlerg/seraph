@@ -9,13 +9,15 @@
 //! synchronous IPC call. A child thread:
 //!   1. Calls an endpoint, passing a notification cap in `cap_slots[0]`.
 //!   2. Waits for the server (ktest) to reply.
-//!   3. After the reply, verifies its original cap slot is now null (the kernel
-//!      moved the cap to the server's `CSpace` on transfer).
-//!   4. Notifications the result back to the server via a separate sync notification.
+//!   3. After the reply, verifies its original cap slot is now null (IPC transfer moves
+//!      the cap; see [capability-model.md](../../../../docs/capability-model.md) § Transfer).
+//!   4. Reports the result back to the server by `notification_send` on a separate sync
+//!      notification.
 //!
 //! The server:
 //!   1. Receives the call.
-//!   2. Reads the transferred cap from the IPC buffer via `IpcMessage::from_ipc_buf`.
+//!   2. Reads the transferred cap from the message `ipc::ipc_recv` returns
+//!      (`IpcMessage::caps`).
 //!   3. Verifies the transferred cap is usable (`notification_send` works).
 //!   4. Replies to the child.
 //!   5. Waits for the child's post-transfer verification result.
@@ -180,7 +182,7 @@ fn child_entry(arg: u64) -> !
     }
 
     // Call the endpoint, passing test_sig in cap_slots[0].
-    // The kernel moves test_sig to the server's CSpace on transfer.
+    // IPC transfer moves test_sig (docs/capability-model.md § Transfer).
     let msg = IpcMessage::builder(0).cap(test_sig_slot).build();
     // SAFETY: buf_addr was registered as this thread's IPC buffer above.
     if unsafe { ipc::ipc_call(ep_slot, &msg, buf_addr as *mut u64) }.is_err()

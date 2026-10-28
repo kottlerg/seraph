@@ -18,9 +18,9 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 use super::{Definition, NamespaceShape, ProvidedName, RestartPolicy, build_blob};
 
-/// Badge stamped on an `:auth` provider SEND — the universal
-/// verb-authority bit (`1 << 63`), shared by every `*_AUTHORITY`
-/// constant the various services gate on.
+/// Badge stamped on an `:auth` provider SEND — the first verb bit
+/// (`1 << 63`), the one a server's primary `*_AUTHORITY` gate tests; a
+/// provider name carrying it is published seed-only.
 const PROVIDES_AUTH_BADGE: u64 = 1 << 63;
 /// Badge stamped on a `:deny` provider SEND — present so the cap
 /// resolves, but lacking the authority bit, so the server's

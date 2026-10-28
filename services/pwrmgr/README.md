@@ -60,18 +60,20 @@ Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
    (`SHUTDOWN_AUTHORITY`-badged) and `pwrmgr.deny` (a no-authority twin).
    The endpoint persists across restarts. Both behaviours are specified in
    [`provides`](../svcmgr/docs/service-definitions.md#provides).
-2. `seed = devmgr.registry` delivers a `REGISTRY_QUERY_AUTHORITY`-badged
-   SEND on devmgr's registry as bootstrap `cap[1]`, per
+2. `seed = devmgr.shutdown` delivers a `REGISTRY_QUERY_AUTHORITY |
+   SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry as bootstrap
+   `cap[1]` (pwrmgr is the only recipe seeding it), per
    [`seed`](../svcmgr/docs/service-definitions.md#seed). pwrmgr uses it to
    resolve its actuation state from devmgr (see Responsibilities). pwrmgr
    never holds a platform cap longer than it needs — the served ACPI Memory
    caps are mapped read-only and dropped after parsing.
 3. Consumers permitted to power the platform off seed `pwrmgr.shutdown`
    (e.g. svctest, and svcmgr's own critical-service-death escalation); the
-   badge rides through the registry lookup unchanged
+   badge rides through the registry lookup unchanged, and the name is
+   seed-only, so `QUERY_ENDPOINT` does not hand it out
    ([`provides`](../svcmgr/docs/service-definitions.md#provides)). svctest
-   also seeds `pwrmgr.deny`, the negative-test twin, to assert the gate
-   rejects an unauthorised cap
+   also resolves the public `pwrmgr.deny`, the negative-test twin, to
+   assert the gate rejects an unauthorised cap
    ([`provides`](../svcmgr/docs/service-definitions.md#provides);
    [svctest Capabilities](../svctest/README.md#capabilities)).
 4. svctest, at the end of `main()` after `ALL TESTS PASSED`, sends
@@ -148,7 +150,7 @@ between the two trees.
 | [shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) | Authoritative IPC label and error definitions (`pwrmgr_labels`, `pwrmgr_errors`, `devmgr_labels`) |
 | [services/devmgr/README.md](../devmgr/README.md) | Hardware + ACPI authority; the `QUERY_ACPI_TABLE` / `QUERY_SHUTDOWN_DEVICE` brokers pwrmgr acquires its caps through |
 | [services/svcmgr/README.md](../svcmgr/README.md) | Launcher + supervisor; the provider path that publishes `pwrmgr.shutdown` / `pwrmgr.deny` |
-| [services/svctest/README.md](../svctest/README.md) | Services-tier harness; seeds both pwrmgr caps, asserts the deny path, and requests the terminal shutdown |
+| [services/svctest/README.md](../svctest/README.md) | Services-tier harness; seeds `pwrmgr.shutdown`, resolves the public `pwrmgr.deny` through `QUERY_ENDPOINT`, asserts the deny path, and requests the terminal shutdown |
 
 ---
 

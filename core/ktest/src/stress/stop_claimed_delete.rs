@@ -21,11 +21,11 @@
 //! a `Stopped` thread with a dangling pointer to its source: deleting the
 //! source's last capability frees the source, and deleting the thread's last
 //! capability makes `dealloc_object(Thread)`'s drain lock the freed source
-//! through that binding (#443 § Source pointer held past its free). The
-//! abort arm clears the binding under the thread's `sched_lock`, so the
-//! later deletes find nothing to unlink (`enqueue_and_wake` in
-//! core/kernel/src/sched/mod.rs; core/kernel/docs/thread-lifecycle-and-sleep.md
-//! § `sys_thread_stop` Cross-CPU Stop Protocol, step 2).
+//! through that binding (#501). The abort arm clears the binding under the
+//! thread's `sched_lock`, so the later deletes find nothing to unlink
+//! (`enqueue_and_wake` in core/kernel/src/sched/mod.rs;
+//! core/kernel/docs/thread-lifecycle-and-sleep.md § `sys_thread_stop`
+//! Cross-CPU Stop Protocol, step 2).
 //!
 //! The cancel that wins its claim has a sibling hazard in its own tail.
 //! `cancel_ipc_block` (core/kernel/src/syscall/thread.rs) claims the park

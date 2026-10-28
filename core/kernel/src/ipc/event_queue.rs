@@ -11,8 +11,9 @@
 //! ([`WaitQueue`](crate::ipc::WaitQueue)) and each post wakes the head.
 //!
 //! # Capacity
-//! The ring has `capacity + 1` slots internally (one-slot-gap full-detection).
-//! The user-visible capacity is the value passed to `SYS_CAP_CREATE_EVENT_Q`.
+//! The ring has `capacity + 1` slots internally; full and empty are detected
+//! from `count`, not the index gap. The user-visible capacity is the value
+//! passed to `SYS_CAP_CREATE_EVENT_Q`.
 //!
 //! # Thread safety
 //! All operations serialise internally on `eq.lock`; callers must not hold it.
@@ -24,10 +25,10 @@ use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 /// Kernel state backing an `EventQueue` capability.
 ///
 /// The ring buffer body lives inline in the same retype slot — directly
-/// after this struct, at the offset returned by
-/// `cap::retype::dispatch_for(EventQueue, capacity)`. `capacity` is the
-/// user-visible max entry count; the ring has `capacity + 1` slots to
-/// distinguish full from empty using the one-slot-gap strategy. The ring
+/// after this struct, at `cap::retype::EVENT_QUEUE_RING_OFFSET` (the slot size
+/// comes from `cap::retype::dispatch_for(EventQueue, capacity)`). `capacity` is the
+/// user-visible max entry count; the ring has `capacity + 1` slots, and full
+/// and empty are detected from `count`. The ring
 /// pointer is set at construction by `EventQueueState::new` and remains
 /// stable for the lifetime of the cap; reclaim is uniform with the rest
 /// of the slot via `retype_free` against the source `Memory` cap. `lock`
@@ -41,13 +42,9 @@ pub struct EventQueueState
     pub ring: *mut u64,
     /// User-visible capacity (max concurrent entries).
     pub capacity: u32,
-    /// Current number of entries in the ring. Atomic so the wait-set
-    /// level-readiness self-heal (`wait_set::source_is_ready`) can observe it
-    /// with `Acquire` ordering without taking `lock` — the source lock cannot
-    /// be acquired there (it would invert the `source.lock → ws.lock` order
-    /// `waitset_notify` takes, deadlocking). All mutations occur under `lock`;
-    /// the `Release` stores below pair with that Acquire load so a level-ready
-    /// queue is never missed on weak-memory targets (#285-adjacent). Mirrors
+    /// Current number of entries in the ring: the lockless readiness signal that
+    /// `wait_set::source_is_ready` reads, mutated only under `lock` with Release
+    /// ordering (core/kernel/docs/ipc-internals.md § Wait Path). Mirrors
     /// `NotificationState::bits`.
     pub count: core::sync::atomic::AtomicU32,
     /// Write index into `ring` (next slot to write).
@@ -120,14 +117,10 @@ impl EventQueueState
 /// - If the queue is full, returns `Err(())`.
 ///   Syscall handler maps this to `SyscallError::QueueFull`.
 ///
-/// Between this function's waiter claim (head waiter dequeued, payload deposited,
-/// `wake_in_flight = 1`) and the caller's post-unlock `enqueue_and_wake`, the
-/// wake is half-complete and owned exclusively by the in-flight waker. Code
-/// executing *as the claimed thread* in that window (it is still live,
-/// mid-park) has exactly one legal continuation: fall through to `schedule()`.
-/// Consuming the deposited payload and returning to user mode is forbidden —
-/// it strands the waker's run-queue link (#352). See
-/// docs/scheduling-internals.md § Lock Hierarchy rule 5.
+/// Between this function's waiter claim and the caller's post-unlock
+/// `enqueue_and_wake`, the wake is half-complete and owned by the in-flight
+/// waker; the claimed thread's only legal continuation is defined in
+/// core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 5.
 ///
 /// # Safety
 /// `eq` must be a valid pointer; acquires `eq.lock` internally — the caller
@@ -282,7 +275,8 @@ pub unsafe fn event_queue_recv(
     // SAFETY: caller is a valid TCB on no queue; eq.lock held.
     unsafe { eq.waiters.push(caller) };
     let blocked_on = core::ptr::addr_of_mut!(*eq).cast::<u8>();
-    // SAFETY: caller is a valid TCB; eq.lock excludes other waiter writes.
+    // SAFETY: caller is the current CPU's running thread (sys_event_recv passes
+    // the current TCB); eq.lock excludes other waiter writes.
     let committed = unsafe {
         crate::sched::commit_blocked_under_local_lock(
             caller,

@@ -8,13 +8,13 @@
 //! Provides `init_serial()`, `init_framebuffer()`, and `console_write_fmt()` /
 //! `console_write_str()` used by the `bprint!`/`bprintln!` macros. Output goes
 //! to both the serial port and the framebuffer (when available). All state is
-//! static; the bootloader is single-threaded and never runs concurrent code.
+//! static and unlocked; see `core/boot/docs/console.md` § Scope.
 
 use crate::arch::current::serial::{serial_init, serial_write_byte};
 use crate::framebuffer::FramebufferWriter;
 use boot_protocol::FramebufferInfo;
 
-/// Static console state. Single-threaded bootloader: no locking required.
+/// Static console state; unlocked (see `core/boot/docs/console.md` § Scope).
 static mut CONSOLE: Console = Console {
     serial_ready: false,
     fb: None,
@@ -71,7 +71,9 @@ pub unsafe fn init_framebuffer(fb: &FramebufferInfo)
 /// before each `\n` on the serial path so terminals show correct line endings.
 ///
 /// # Safety
-/// Backends must have been initialized before calling this function.
+/// Must be called only from the single boot thread (no concurrent access to
+/// `CONSOLE`). Backends need not be initialized: output to a backend that is
+/// not live is dropped (the `unsafe` qualifier is stale, #442).
 pub unsafe fn console_write_str(s: &str)
 {
     // SAFETY: CONSOLE is only accessed from the single boot thread.
@@ -125,11 +127,13 @@ impl core::fmt::Write for ConsoleWriter
 
 /// Render `core::fmt` arguments to both console backends.
 ///
-/// Backs the `bprint!`/`bprintln!` macros. The bootloader is a static-PIE whose
-/// absolute pointers are fixed up at entry, so `core::fmt` formatting (which
-/// dispatches through vtables and fn-pointer tables) is safe here. Output before
-/// `init_serial`/`init_framebuffer` is silently dropped, so this function is
-/// safe to call at any point.
+/// Backs the `bprint!`/`bprintln!` macros. `core::fmt` dispatches through
+/// vtables and fn-pointer tables, which are valid because the image's absolute
+/// pointers are fixed up before any Rust code runs: by the UEFI PE loader on
+/// x86-64, and by the `_start` self-relocation on RISC-V (see
+/// `core/boot/docs/riscv-uefi-boot.md` § Relocation: static-PIE self-relocation).
+/// Output before `init_serial`/`init_framebuffer` is silently dropped, so this
+/// function is safe to call at any point.
 pub fn console_write_fmt(args: core::fmt::Arguments)
 {
     use core::fmt::Write;
@@ -155,14 +159,14 @@ macro_rules! bprint {
 #[macro_export]
 macro_rules! bprintln {
     () => {{
-        // SAFETY: console is initialized before any macro usage.
+        // SAFETY: single-threaded bootloader; output before init is dropped.
         unsafe {
             $crate::console::console_write_str("\r\n");
         }
     }};
     ($($arg:tt)*) => {{
         $crate::console::console_write_fmt(::core::format_args!($($arg)*));
-        // SAFETY: console is initialized before any macro usage.
+        // SAFETY: single-threaded bootloader; output before init is dropped.
         unsafe {
             $crate::console::console_write_str("\r\n");
         }

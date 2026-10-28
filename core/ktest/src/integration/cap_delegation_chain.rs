@@ -49,8 +49,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_delegation_chain: cap_derive level1 failed")?;
 
     // ── Level 2: derive from level1, requesting NOTIFY+WAIT ──────────────────
-    // The kernel must clamp to level1's rights (NOTIFY only); WAIT must be
-    // stripped because level1 does not carry it.
+    // The derived rights are masked by level1's (core/kernel/docs/syscalls.md
+    // § `SYS_CAP_DERIVE`), so level2 must hold NOTIFY only.
     let level2 = cap_derive(level1, RIGHTS_NOTIFY_WAIT)
         .map_err(|_| "cap_delegation_chain: cap_derive level2 failed")?;
 
@@ -87,9 +87,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── Cascaded revocation: revoke root → level1 and level2 both invalid ────
     //
-    // cap_revoke invalidates all *descendants* of the revoked cap. The revoked
-    // cap itself (root) remains valid — revocation is an operation on children,
-    // not self-destruction. Delete root explicitly after verifying the cascade.
+    // cap_revoke invalidates the target's descendants and preserves the target
+    // (docs/capability-model.md § Revocation), so root stays valid; delete it
+    // explicitly after verifying the cascade.
     crate::log("cap_delegation_chain: revoking root");
     cap_revoke(root).map_err(|_| "cap_delegation_chain: cap_revoke root failed")?;
 

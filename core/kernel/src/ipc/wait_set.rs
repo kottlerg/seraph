@@ -25,23 +25,20 @@
 //! returns `InvalidArgument` if the source's `wait_set` pointer is non-null.
 //!
 //! # Lifetime — wait-set membership refcount
-//! Each `WaitSetMember` holds a +1 cap-level reference on its source's
-//! `KernelObjectHeader` (Endpoint / Notification / `EventQueue`). The +1 is taken in
-//! `sys_wait_set_add` after the back-pointer is published, and released in
-//! `sys_wait_set_remove` and in `wait_set_drop`. Source state is therefore
-//! pinned alive for as long as any member references it; the dealloc arms
-//! in `cap::object::dealloc_object_one` only need to `debug_assert` that the
-//! `wait_set` back-pointer is null on entry (the invariant follows). See
-//! [`source_header`] for the helper that maps a member's `source_ptr` to the
-//! wrapper header that carries the refcount.
+//! Each member holds a +1 reference on its source's `KernelObjectHeader`, per
+//! core/kernel/docs/capability-internals.md § Kernel Object Reference Counting
+//! and core/kernel/docs/ipc-internals.md § Wait Set Add/Remove. See
+//! [`source_header`] for the member-to-header mapping.
 //!
 //! # Thread safety
 //! Every operation serialises on the set's own `lock`; a notifying source's
 //! lock is outer to it (see [`WaitSetState::lock`]).
 //!
 //! # Extending member capacity
-//! Increase `WAIT_SET_MAX_MEMBERS` and the fixed-size arrays. `WAIT_SET_MAX_MEMBERS`
-//! must fit in a u8 index.
+//! The arrays are sized by `WAIT_SET_MAX_MEMBERS`, which must fit in a u8
+//! index. A larger value must keep `WaitSetState` within the budget
+//! `cap::retype::dispatch_for(WaitSet)` declares (asserted below), or move
+//! the object to a larger retype bin.
 
 // cast_possible_truncation: member indices are bounded by WAIT_SET_MAX_MEMBERS (16),
 // which fits in u8. WAIT_SET_MAX_MEMBERS itself (usize) fits in u8. All truncations safe.
@@ -172,19 +169,14 @@ pub struct WaitSetState
     /// and the read/write pointers. Acquired by `waitset_wait`, `waitset_notify`,
     /// `waitset_add`, `waitset_remove`, and `wait_set_drop`.
     ///
-    /// Lock order: `<source>.lock` (Notification/Endpoint/EventQueue) is OUTER,
-    /// `WaitSetState.lock` is INNER. `notification_send` already holds `sig.lock`
-    /// when it calls into `waitset_notify`; the registration and removal
-    /// paths in `sys_wait_set_add` / `sys_wait_set_remove` take the
-    /// source's lock before calling `waitset_add` / `waitset_remove`.
-    /// `wait_set_drop` clears every source's back-pointer first (under
-    /// each source's own lock) and only then takes its own lock, so no
-    /// nesting reverses the order.
+    /// Lock order: `<source>.lock` OUTER, `WaitSetState.lock` INNER, per
+    /// core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 2;
+    /// `wait_set_drop` clears source back-pointers before taking this lock.
     ///
     /// Source liveness during member dispatch is now guaranteed by the
     /// membership refcount (see module docs); the lock-order discipline
     /// continues to govern back-pointer consistency and the side channels
-    /// between `notification_send`/`event_post`/`endpoint_call` and
+    /// between `notification_send`/`event_queue_post`/`endpoint_call` and
     /// `waitset_notify`.
     pub lock: crate::sync::Spinlock,
     /// Registered members. A slot with `source_ptr.is_null()` is vacant.
@@ -247,11 +239,9 @@ impl WaitSetState
 
     /// Push `member_idx` onto the ready ring.
     ///
-    /// If the ring is full (all slots occupied with stale entries the consumer
-    /// hasn't popped), the push is silently dropped — the source remains
-    /// registered but its notification is lost until the consumer calls wait
-    /// again. This is safe in the single-CPU boot model where consumers drain
-    /// the ring promptly.
+    /// A push to a full ring (`WAIT_SET_MAX_MEMBERS - 1` pending entries) is
+    /// dropped; the lost edge is recovered by `waitset_wait`'s level-readiness
+    /// walk, per core/kernel/docs/ipc-internals.md § Multiple Ready Sources.
     #[inline]
     fn push_ready(&mut self, member_idx: u8)
     {
@@ -288,8 +278,9 @@ impl WaitSetState
 
 /// Notify the wait set that member `member_idx` is ready.
 ///
-/// Called from source objects (`notification_send`, `endpoint_call`, `event_queue_post`)
-/// when they transition from not-ready to ready.
+/// Called from `endpoint_call` and `event_queue_post` on their empty→non-empty
+/// transitions, and from `notification_send` on every send that finds no
+/// blocked waiter while a wait set is registered.
 ///
 /// If a thread is blocked in `waitset_wait`, it is woken immediately.
 /// Otherwise the member index is pushed to the ready ring for the next caller.
@@ -303,9 +294,9 @@ impl WaitSetState
 pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
 {
     // SAFETY: caller guarantees ws_opaque is a valid *mut WaitSetState.
-    // cast_ptr_alignment: WaitSetState now lives at the start of a retype
-    // slot whose alignment is the slot's natural 8 B; `*mut TCB` is the
-    // largest field and aligns to 8.
+    // cast_ptr_alignment: WaitSetState lives 24 B (the WaitSetObject wrapper)
+    // past an 8-aligned retype slot base, so it is 8-aligned, which covers its
+    // largest field alignment (`*mut ThreadControlBlock`, `u64`).
     #[allow(clippy::cast_ptr_alignment)]
     let ws = unsafe { &mut *ws_opaque.cast::<WaitSetState>() };
 
@@ -321,7 +312,7 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
     }
 
     // Snapshot under ws.lock, release, then enqueue_and_wake — see
-    // docs/scheduling-internals.md § Lock Hierarchy rule 5.
+    // core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 5.
     let badge = {
         let m = &ws.members[member_idx as usize];
         if m.is_occupied() { m.badge } else { 0 }
@@ -361,7 +352,11 @@ pub enum WaitSetPending
 ///   `Err(WaitSetPending::Occupied)` without parking: a wait set takes one
 ///   waiter (any number of member sources).
 /// - If the ready ring is non-empty, pops and returns `Ok(badge)` without blocking.
-/// - If empty, makes `caller` the waiter and returns `Err(WaitSetPending::Parked)`.
+/// - Else, if a registered member's source is level-ready, returns
+///   `Ok(badge)` for it without blocking (core/kernel/docs/ipc-internals.md
+///   § Wait Path, Wait Set, step 3).
+/// - Otherwise makes `caller` the waiter, commits the park (a refused commit
+///   rolls the waiter back), and returns `Err(WaitSetPending::Parked)`.
 ///   The syscall handler calls `schedule()`, then reads `caller.wakeup_value`.
 ///
 /// # Safety
@@ -394,15 +389,9 @@ pub unsafe fn waitset_wait(
         return Ok(badge);
     }
 
-    // Level-state self-heal. Source notifications are edge-triggered:
-    // `endpoint_call` fires `waitset_notify` only on the empty→non-empty
-    // send-queue transition, and `event_queue_post` only on the
-    // empty→non-empty count transition. A second event arriving while a
-    // first is still queued does NOT fire a notify, and would otherwise
-    // be invisible to a consumer that processes one item per wakeup and
-    // returns here. Walk the registered members and return the first
-    // source that is level-ready right now; symmetric with the level
-    // check already performed in `waitset_add`.
+    // Level-state self-heal: return the first member whose source is
+    // level-ready now; see core/kernel/docs/ipc-internals.md § Wait Path
+    // (Wait Set) step 3.
     for idx in 0..ws.members.len()
     {
         let m = &ws.members[idx];
@@ -426,7 +415,8 @@ pub unsafe fn waitset_wait(
     // Nothing ready — block caller.
     //
     // Clear context_saved before making the thread visible as a waiter.
-    // See notification.rs notification_wait for the full rationale.
+    // See core/kernel/docs/scheduling-internals.md § Atomic Ordering
+    // Invariants (`context_saved`).
     // SAFETY: caller is a valid TCB; context_saved is AtomicU32.
     unsafe {
         (*caller)
@@ -446,10 +436,9 @@ pub unsafe fn waitset_wait(
     };
     if committed != crate::sched::ParkCommit::Committed
     {
-        // Refused park; dequeue the caller again. ws.lock has been held
-        // across publish/commit/rollback, so the rollback owns the episode.
-        // A stop-won refusal stamps INTERRUPTED; a coalesced-wake refusal
-        // leaves the deposit for the resume to deliver.
+        // Refused park; dequeue the caller again (ws.lock held since publish).
+        // Stamping per core/kernel/docs/ipc-internals.md § Park Dispositions
+        // and Episodes (refused-commit rollbacks).
         // SAFETY: caller was pushed above; ws.lock held throughout.
         unsafe { ws.waiters.remove(caller) };
         if committed == crate::sched::ParkCommit::RefusedStop
@@ -525,7 +514,7 @@ pub unsafe fn waitset_add(
         #[allow(clippy::cast_possible_truncation)]
         ws.push_ready(idx as u8);
         // Snapshot the wake; enqueue_and_wake runs after unlock per
-        // docs/scheduling-internals.md § Lock Hierarchy rule 5.
+        // core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 5.
         if !ws.waiters.is_empty()
         {
             // SAFETY: ws.lock held; claim the head waiter for wake (#160).
@@ -627,11 +616,11 @@ pub unsafe fn wait_set_drop(
     // ws_state at this point.
     let ws_ref = unsafe { &mut *ws };
 
-    // Step 1: clear back-pointers under each source's own lock so no
-    // concurrent notification_send / event_post / endpoint_call can call back
-    // into waitset_notify after this point. We snapshot member info into
-    // a stack array first because we cannot hold ws.lock while taking
-    // source locks (that would invert the lock order).
+    // Snapshot the occupied members without ws.lock: the back-pointer clears
+    // below take each source's lock, and holding ws.lock across them would
+    // invert the source.lock → ws.lock order. Once cleared, no concurrent
+    // notification_send / event_queue_post / endpoint_call can reach
+    // waitset_notify for this wait set.
     let mut snap: [Option<(*mut u8, WaitSetSourceTag)>; WAIT_SET_MAX_MEMBERS] =
         [None; WAIT_SET_MAX_MEMBERS];
     for (i, slot) in ws_ref.members.iter().enumerate()
@@ -672,8 +661,8 @@ pub unsafe fn wait_set_drop(
         }
     }
 
-    // Step 2: under ws.lock, claim and wake the blocked waiter with its park
-    // stamped INTERRUPTED (the destroyed wait set cancels the wait;
+    // Under ws.lock, claim and wake the blocked waiter with its park stamped
+    // INTERRUPTED (the destroyed wait set cancels the wait;
     // `SYS_WAIT_SET_WAIT` returns Interrupted).
     // SAFETY: lock owned by ws; matched unlock_raw below.
     let saved = unsafe { ws_ref.lock.lock_raw() };
@@ -699,22 +688,19 @@ pub unsafe fn wait_set_drop(
 unsafe fn source_is_ready(source_ptr: *mut u8, tag: WaitSetSourceTag) -> bool
 {
     use core::sync::atomic::Ordering;
-    // cast_ptr_alignment: each source_ptr addresses a ConcreteType constructed in
-    // place at a size-class-aligned retype offset, so it is aligned to
-    // align_of::<ConcreteType>(). The casts below restore that type.
+    // cast_ptr_alignment: each source_ptr addresses a ConcreteType constructed
+    // 24 B (the wrapper size) past a size-class-aligned retype slot base, so it
+    // is 8-aligned, which covers align_of::<ConcreteType>(). The casts below
+    // restore that type.
     #[allow(clippy::cast_ptr_alignment)]
     match tag
     {
         WaitSetSourceTag::Endpoint =>
         {
             let ep = source_ptr.cast::<crate::ipc::endpoint::EndpointState>();
-            // Acquire-load the atomic send-queue-non-empty shadow rather than the
-            // plain `send_head` pointer: this runs without `ep.lock` (taking it
-            // would invert the `ep.lock → ws.lock` order and deadlock), so a
-            // plain read could observe a stale empty on weak-memory targets and
-            // strand a queued sender whose enqueue fired no edge notify. The
-            // shadow is Release-stored under `ep.lock` at every `send_head`
-            // mutation. SAFETY: ep is a valid EndpointState.
+            // Lockless Acquire-load of the `send_nonempty` shadow, per
+            // core/kernel/docs/scheduling-internals.md § Atomic Ordering
+            // Invariants. SAFETY: ep is a valid EndpointState.
             unsafe { (*ep).send_nonempty.load(Ordering::Acquire) != 0 }
         }
         WaitSetSourceTag::Notification =>
@@ -738,7 +724,7 @@ unsafe fn source_is_ready(source_ptr: *mut u8, tag: WaitSetSourceTag) -> bool
 /// Clear the back-pointer on a source so it stops notifying this wait set.
 ///
 /// Acquires the source's own lock to serialise against any concurrent
-/// `notification_send` / `event_post` / `endpoint_call` that is reading
+/// `notification_send` / `event_queue_post` / `endpoint_call` that is reading
 /// `source.wait_set` to dispatch a notification. Without this lock the
 /// reader could see a non-null pointer, then release its read of the
 /// pointer's target after we've torn down the wait set — UAF.
@@ -747,9 +733,10 @@ unsafe fn source_is_ready(source_ptr: *mut u8, tag: WaitSetSourceTag) -> bool
 /// `source_ptr` must be a valid pointer to the appropriate state struct.
 unsafe fn clear_source_backpointer(source_ptr: *mut u8, tag: WaitSetSourceTag)
 {
-    // cast_ptr_alignment: each source_ptr addresses a ConcreteType constructed in
-    // place at a size-class-aligned retype offset, so it is aligned to
-    // align_of::<ConcreteType>(). The casts below restore that type.
+    // cast_ptr_alignment: each source_ptr addresses a ConcreteType constructed
+    // 24 B (the wrapper size) past a size-class-aligned retype slot base, so it
+    // is 8-aligned, which covers align_of::<ConcreteType>(). The casts below
+    // restore that type.
     #[allow(clippy::cast_ptr_alignment)]
     match tag
     {

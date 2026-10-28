@@ -987,7 +987,8 @@ pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
     if ret < 0 { Err(ret) } else { Ok(bits) }
 }
 
-/// Retype a Memory cap into a new Endpoint. Returns the `CSpace` slot index.
+/// Retype a Memory cap into a new Endpoint. Returns the new capability handle
+/// (slot index plus generation).
 ///
 /// `memory_cap` is the source Memory-cap slot; it MUST carry `RIGHTS_MEM_RETYPE`
 /// and have at least 88 B of `available_bytes` (the Endpoint wrapper plus
@@ -1007,12 +1008,14 @@ pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 pub fn cap_create_endpoint(memory_cap: u32) -> Result<u32, i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; no pointer arguments;
-    // kernel retypes the Memory-cap region and returns the new slot index.
+    // kernel retypes the Memory-cap region and returns the new capability handle (slot index
+    // plus generation).
     let ret = unsafe { syscall2(SYS_CAP_CREATE_ENDPOINT, u64::from(memory_cap), 0) };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Retype a Memory cap into a new Notification. Returns the `CSpace` slot index.
+/// Retype a Memory cap into a new Notification. Returns the new capability
+/// handle (slot index plus generation).
 ///
 /// `memory_cap` MUST carry `RIGHTS_MEM_RETYPE` and have at least 120 B of
 /// `available_bytes`. Bytes are debited from the Memory cap and credited back
@@ -1031,24 +1034,29 @@ pub fn cap_create_endpoint(memory_cap: u32) -> Result<u32, i64>
 pub fn cap_create_notification(memory_cap: u32) -> Result<u32, i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; no pointer arguments;
-    // kernel retypes the Memory-cap region and returns the new slot index.
+    // kernel retypes the Memory-cap region and returns the new capability handle (slot index
+    // plus generation).
     let ret = unsafe { syscall2(SYS_CAP_CREATE_NOTIFICATION, u64::from(memory_cap), 0) };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Create a new `AddressSpace` object. Returns the `CSpace` slot index.
+/// Create a new `AddressSpace` object. Returns the new capability handle (slot
+/// index plus generation).
 ///
 /// Retype a Memory cap into a new `AddressSpace`, or augment an existing
 /// one's PT growth budget.
 ///
-/// `memory_cap` must carry `MemRights::RETYPE` and have at least
-/// `init_pages * PAGE_SIZE` of `available_bytes`. In create mode page 0 of
+/// `memory_cap`, a generation-checked capability handle, must carry
+/// `MemRights::RETYPE` and have at least `init_pages * PAGE_SIZE` of
+/// `available_bytes`. In create mode page 0 of
 /// the slab is the kernel wrapper page, page 1 the root PT, and pages
 /// `2..init_pages` seed the PT growth pool; `init_pages` must be `>= 2`.
 ///
 /// `augment_target` selects the mode:
-/// - `0` → create a new `AddressSpace`; returns the new cap slot index.
-/// - non-zero `AddressSpace` cap slot → augment that AS's PT growth pool
+/// - `0` → create a new `AddressSpace`; returns the new capability handle
+///   (slot index plus generation).
+/// - non-zero `AddressSpace` capability handle (generation-checked) → augment
+///   that AS's PT growth pool
 ///   with the `init_pages` carved pages (`init_pages >= 1`); returns `0`.
 ///   Once per record page of the kernel's donation bookkeeping, a donation
 ///   keeps its first page for that bookkeeping and seeds `init_pages - 1`,
@@ -1078,14 +1086,17 @@ pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 /// Retype a Memory cap into a new `CSpace`, or augment an existing one's
 /// slot-page growth budget.
 ///
-/// `memory_cap` must carry `MemRights::RETYPE` and have at least
-/// `init_pages * PAGE_SIZE` of `available_bytes`. In create mode the
+/// `memory_cap`, a generation-checked capability handle, must carry
+/// `MemRights::RETYPE` and have at least `init_pages * PAGE_SIZE` of
+/// `available_bytes`. In create mode the
 /// slab's page 0 is the kernel wrapper page; pages `1..init_pages` seed
 /// the slot-page pool (each backs 56 slots). `init_pages` must be `>= 1`.
 ///
 /// `augment_target`:
-/// - `0` → create new; returns the new cap slot index.
-/// - non-zero → augment that `CSpace`'s growth pool with the `init_pages`
+/// - `0` → create new; returns the new capability handle (slot index plus
+///   generation).
+/// - non-zero `CSpace` capability handle (generation-checked) → augment that
+///   `CSpace`'s growth pool with the `init_pages`
 ///   carved pages; returns `0`. As for `cap_create_aspace`, once per record
 ///   page of the kernel's donation bookkeeping a donation seeds
 ///   `init_pages - 1`; read the budget back with `CAP_INFO_CSPACE_BUDGET`.
@@ -1139,7 +1150,8 @@ pub fn raw_cap_create_cspace(
 }
 
 /// Retype a Memory cap into a new Thread bound to `aspace_cap` and
-/// `cspace_cap`. Returns the `CSpace` slot index of the new Thread cap.
+/// `cspace_cap`. Returns the new Thread capability handle (slot index plus
+/// generation).
 ///
 /// `memory_cap` must carry `MemRights::RETYPE` and have at least 6 pages of
 /// `available_bytes` (4 kstack pages, 1 page for the wrapper and TCB,
@@ -1325,23 +1337,24 @@ pub fn mem_protect(
 /// `split_offset` and its `available_bytes` debits accordingly. A new
 /// child cap covering `[base + split_offset, base + orig_size)` is
 /// inserted in the caller's `CSpace` as a derivation sibling of the
-/// parent. Returns the new tail slot index.
+/// parent. Returns the tail's capability handle (slot index plus generation).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid,
 /// `split_offset` is not page-aligned, is out of range, lands inside
 /// the cap's bump region, or the parent has derivation children.
 /// `InvalidCapability` also covers a parent a concurrent delete freed
-/// before the tail was linked; `InvalidState` means a `cap_revoke` is in
-/// flight on the parent.
+/// before the tail was linked; `InvalidState` means a `cap_revoke`,
+/// `cap_move`, or IPC capability transfer is in flight on the parent.
 // cast_sign_loss: proven non-negative in Ok branch.
-// cast_possible_truncation: returned value is a 32-bit slot index.
+// cast_possible_truncation: returned value is a cap handle — a 24-bit slot index plus an
+// 8-bit generation — so it fits u32.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
 pub fn memory_split(memory_cap: u32, split_offset: u64) -> Result<u32, i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; memory_cap is cap index as u64, split_offset
-    // is byte offset; kernel validates cap and offset, returns the new tail slot.
+    // is byte offset; kernel validates cap and offset, returns the tail's cap handle.
     let ret = unsafe { syscall3(SYS_MEMORY_SPLIT, u64::from(memory_cap), split_offset, 0) };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
@@ -1366,8 +1379,8 @@ pub fn memory_split(memory_cap: u32, split_offset: u64) -> Result<u32, i64>
 /// # Errors
 /// Returns a negative `i64` error code if the caps fail validation.
 /// `InvalidCapability` also covers a cap a concurrent delete freed before
-/// the merge took the derivation lock; `InvalidState` means a `cap_revoke`
-/// is in flight on either cap.
+/// the merge took the derivation lock; `InvalidState` means a `cap_revoke`,
+/// `cap_move`, or IPC capability transfer is in flight on either cap.
 #[inline]
 pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 {
@@ -1699,14 +1712,15 @@ pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result
 /// Creates a new slot in the caller's `CSpace` with `rights_mask & src_rights`.
 /// The new slot is a derivation child of the source.
 ///
-/// Returns the new slot index.
+/// Returns the new capability handle (slot index plus generation).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid or the
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
 /// structural ceiling). `InvalidCapability` also covers a source a concurrent
 /// delete, move, or revoke freed before the new slot was linked;
-/// `InvalidState` means a `cap_revoke` is in flight on the source.
+/// `InvalidState` means a `cap_revoke`, `cap_move`, or IPC capability
+/// transfer is in flight on the source.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1714,7 +1728,7 @@ pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result
 pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; src_slot is cap index as u64, rights_mask
-    // is bitmask; kernel validates cap, creates attenuated derivative, returns new slot.
+    // is bitmask; kernel validates cap, creates attenuated derivative, returns its cap handle.
     let ret = unsafe { syscall2(SYS_CAP_DERIVE, u64::from(src_slot), rights_mask) };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
@@ -1734,7 +1748,8 @@ pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 /// back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
 /// `InvalidCapability` also covers a source a concurrent delete, move, or
 /// revoke freed before the new slot was linked; `InvalidState` means a
-/// `cap_revoke` is in flight on the source.
+/// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
+/// source.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1763,7 +1778,10 @@ pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u
 /// Deleting the last capability to the caller's own `CSpace` or
 /// `AddressSpace` (directly, or through the teardown cascade) stops the
 /// caller: the call never returns. Deleting the caller's own Thread
-/// capability is refused instead.
+/// capability is refused instead. A teardown of a Thread left `current` on a
+/// CPU that `fatal` halted, or of a `CSpace` or `AddressSpace` with such a
+/// thread bound, never completes, so the call does not return
+/// (`core/kernel/docs/syscalls.md` § `SYS_CAP_DELETE`).
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` if the handle
@@ -1783,7 +1801,9 @@ pub fn cap_delete(slot: u32) -> Result<(), i64>
 
 /// Revoke all capabilities derived from a slot (`SYS_CAP_REVOKE`).
 ///
-/// Clears the entire descendant subtree; the root slot is preserved.
+/// Clears the entire descendant subtree; the root slot is preserved. A
+/// revoked capability that was an object's last reference tears the object
+/// down as [`cap_delete`] describes, including the case that never returns.
 ///
 /// # Errors
 /// - `InvalidCapability` (-2) — the handle names no live slot, or its
@@ -1971,7 +1991,8 @@ pub fn system_info(kind: u64) -> Result<u64, i64>
 
 /// Inspect a capability slot's runtime state.
 ///
-/// `slot` — capability slot index in the caller's `CSpace`.
+/// `slot` — capability handle (slot index plus generation) in the caller's
+/// `CSpace`; generation-checked.
 /// `field` — field selector (one of the `CAP_INFO_*` constants in
 /// `syscall_abi`). Each call returns a single `u64`. Userspace assembles
 /// a full picture by issuing repeated calls. The pattern mirrors
@@ -1998,10 +2019,10 @@ pub fn system_info(kind: u64) -> Result<u64, i64>
 #[inline]
 pub fn cap_info(slot: u32, field: u64) -> Result<u64, i64>
 {
-    // SAFETY: syscall2 issues raw syscall instruction; slot is cap index as u64,
+    // SAFETY: syscall2 issues raw syscall instruction; slot is a cap handle as u64,
     // field is one of the CAP_INFO_* selectors. The kernel performs all validation
-    // (slot bounds, tag match for tag-specific fields, selector recognition) and
-    // returns the requested field value.
+    // (slot bounds and generation, tag match for tag-specific fields, selector
+    // recognition) and returns the requested field value.
     let ret = unsafe { syscall2(SYS_CAP_INFO, u64::from(slot), field) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
@@ -2266,7 +2287,8 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 /// Map `mmio_cap` into `aspace_cap` at virtual address `virt`.
 ///
 /// - `virt` must be page-aligned and in the user address range.
-/// - `flags` bit 1 (`0x2`) makes the mapping writable; executable is always denied.
+/// - `flags` is reserved and ignored; the mapping is writable iff `mmio_cap`
+///   carries the Write right, and never executable.
 /// - All pages are mapped uncacheable (PCD|PWT on `x86_64`, Svpbmt
 ///   PBMT=IO on `riscv64`).
 ///
@@ -2319,7 +2341,7 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 /// the thread is restarted, unless its wake was claimed first, or a timed
 /// wait or sleep that found the kernel's sleep list full withdrew itself
 /// first (it then returns its timeout or `OutOfMemory`). The kernel's
-/// known exceptions (#443) are listed in `core/kernel/docs/syscalls.md`
+/// known exceptions (#501) are listed in `core/kernel/docs/syscalls.md`
 /// § `SYS_THREAD_STOP`. A thread may stop itself (pass its own thread cap).
 ///
 /// If the thread is blocked on a fault, its fault episode is cancelled with a
@@ -2389,10 +2411,10 @@ pub fn thread_set_priority(thread_cap: u32, priority: u8, sched_cap: u32) -> Res
 /// Running thread on another CPU is sent a reschedule IPI and moves at its
 /// next `schedule()` entry (worst case one time slice later); a blocked,
 /// stopped, or not-yet-started thread observes the new affinity on its next
-/// wake.
+/// enqueue (a wake, or `SYS_THREAD_START` on start or resume).
 ///
 /// See `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_AFFINITY` for known
-/// defects (#443).
+/// defects (#443, #502).
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` if the thread cap
@@ -2452,25 +2474,28 @@ pub fn thread_set_fault_handler(
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Copy the register state of a stopped thread into `buf`.
+/// Copy the register state of a stopped or fault-blocked thread into `buf`.
 ///
-/// The thread must be in `Stopped` state. `buf` must be at least
-/// `size_of::<TrapFrame>()` bytes (architecture-defined). Returns the number
-/// of bytes written on success.
+/// The thread must be `Stopped` or fault-blocked awaiting a fault-handler
+/// reply. `buf` must be at least `size_of::<TrapFrame>()` bytes
+/// (architecture-defined). Returns the number of bytes written on success.
 ///
 /// # Safety
 /// `buf` must be valid for `buf_size` bytes of writes.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid, the
-/// thread is not stopped, or `buf_size` is too small.
+/// thread is neither stopped nor fault-blocked (`InvalidState`), `buf_size` is
+/// too small or `buf` is null (`InvalidArgument`), or `buf` is not wholly in
+/// the user half or not mapped writable (`InvalidAddress`).
 // cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
 #[allow(clippy::cast_sign_loss)]
 #[inline]
 pub fn thread_read_regs(thread_cap: u32, buf: *mut u8, buf_size: usize) -> Result<u64, i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; buf pointer cast to u64 for syscall ABI;
-    // kernel validates thread cap, checks buf_size, writes TrapFrame only if thread stopped.
+    // kernel validates thread cap, checks buf_size, writes TrapFrame only if the thread is
+    // Stopped or fault-blocked.
     let ret = unsafe {
         syscall3(
             SYS_THREAD_READ_REGS,
@@ -2482,23 +2507,31 @@ pub fn thread_read_regs(thread_cap: u32, buf: *mut u8, buf_size: usize) -> Resul
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
-/// Write register state from `buf` into a stopped thread.
+/// Write register state from `buf` into a stopped or fault-blocked thread.
 ///
-/// The thread must be in `Stopped` state. `buf` must contain a complete
-/// `TrapFrame` (`buf_size >= size_of::<TrapFrame>()`). The kernel validates
-/// that no privilege bits are set before applying the registers.
+/// The thread must be `Stopped` or fault-blocked awaiting a fault-handler
+/// reply. `buf` must contain a complete `TrapFrame`
+/// (`buf_size >= size_of::<TrapFrame>()`). The kernel sanitizes the frame per
+/// architecture before applying it (`core/kernel/docs/arch-interface.md`
+/// § `trap_frame` — `arch::current::trap_frame`); on RISC-V `sstatus` is
+/// applied as supplied (#443).
 ///
 /// # Safety
 /// `buf` must be valid for `buf_size` bytes of reads.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid, the
-/// thread is not stopped, `buf_size` is too small, or privilege bits are set.
+/// thread is neither stopped nor fault-blocked (`InvalidState`), `buf_size` is
+/// too small, `buf` is null, or the instruction pointer (on x86-64, also the
+/// stack pointer) is not a user address (`InvalidArgument`), or `buf` is not
+/// wholly in the user half or not mapped readable (`InvalidAddress`).
 #[inline]
 pub fn thread_write_regs(thread_cap: u32, buf: *const u8, buf_size: usize) -> Result<(), i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; buf pointer cast to u64 for syscall ABI;
-    // kernel validates thread cap, checks buf_size, reads TrapFrame only if thread stopped and privileges cleared.
+    // kernel validates thread cap and buf_size, accepts only a Stopped or fault-blocked target,
+    // and sanitizes the frame per architecture (core/kernel/docs/arch-interface.md
+    // § `trap_frame`); on RISC-V `sstatus` is applied as supplied (#443).
     let ret = unsafe {
         syscall3(
             SYS_THREAD_WRITE_REGS,

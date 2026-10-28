@@ -144,7 +144,8 @@ pub fn multiple_sends_before_wait_accumulate_bits(ctx: &TestContext) -> TestResu
 
 /// `notification_send` with zero bits returns an error; notification state is unaffected.
 ///
-/// The kernel rejects zero-bit sends (no-op sends are not valid). Verifies:
+/// The kernel rejects zero-bit sends with `InvalidArgument` (see
+/// [syscalls.md](../../../kernel/docs/syscalls.md) § `SYS_NOTIFICATION_SEND` (3)). Verifies:
 /// 1. `notification_send(sig, 0)` returns an error.
 /// 2. A subsequent non-zero send arrives intact (error did not corrupt state).
 pub fn send_zero_bits_is_noop(ctx: &TestContext) -> TestResult
@@ -245,7 +246,7 @@ pub fn wait_high_bit_roundtrip(ctx: &TestContext) -> TestResult
         return Err("notification_wait did not round-trip bit 63 (regression on #127)");
     }
 
-    // All bits set — covers any bit-by-bit truncation in the new path.
+    // All bits set — covers any truncation in the secondary-register bitmask return.
     notification_send(sig, u64::MAX).map_err(|_| "notification_send(u64::MAX) failed")?;
     let bits =
         notification_wait(sig).map_err(|_| "notification_wait after send(u64::MAX) failed")?;
@@ -316,7 +317,8 @@ pub fn wait_timeout_returns_bits_first(ctx: &TestContext) -> TestResult
 // ── Child thread entry ────────────────────────────────────────────────────────
 
 /// Child thread: sends 0xBEEF on `sig_slot` then exits.
-// cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
+// cast_possible_truncation: sig_slot is a u32 capability handle the parent widened with
+// `u64::from`, so the cast is exact.
 #[allow(clippy::cast_possible_truncation)]
 fn sender_entry(sig_slot: u64) -> !
 {
@@ -326,7 +328,8 @@ fn sender_entry(sig_slot: u64) -> !
 
 /// Child thread: sends `1u64 << 63` on `sig_slot` then exits. Used by
 /// `wait_high_bit_parked_wakeup` to drive the post-resume return path.
-// cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
+// cast_possible_truncation: sig_slot is a u32 capability handle the parent widened with
+// `u64::from`, so the cast is exact.
 #[allow(clippy::cast_possible_truncation)]
 fn high_bit_sender_entry(sig_slot: u64) -> !
 {

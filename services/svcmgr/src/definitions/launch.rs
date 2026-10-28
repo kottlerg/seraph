@@ -13,6 +13,7 @@
 //! death-notification on it.
 
 use ipc::{devmgr_labels, procmgr_labels};
+use registry::{Resolver, Visibility};
 
 use super::{Definition, NamespaceShape, ProvidedName, build_blob, cwd_rights};
 use crate::REGISTRY_CAPACITY;
@@ -161,7 +162,8 @@ pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, kind: LaunchKind) -> Vec<u32
 /// resolve them. Each name's SEND is stamped with its
 /// [`ProvidedName::badge`] (`cap_derive_badge` when non-zero, plain
 /// `cap_derive` for a bare entry); the badge rides through to a
-/// consumer's `QUERY_ENDPOINT` lookup unchanged. The endpoint persists on
+/// consumer unchanged. A name whose badge carries a verb bit is published
+/// seed-only, so `QUERY_ENDPOINT` refuses it. The endpoint persists on
 /// the `ServiceEntry`, so the SENDs stay valid across restarts. No-op for
 /// a pure consumer (`provided_endpoint == 0`) or an empty list.
 fn publish_provided(
@@ -194,7 +196,19 @@ fn publish_provided(
             );
             continue;
         };
-        if registry.publish(p.name.as_bytes(), send).is_err()
+        // An entry whose badge carries a verb bit (`:auth`) is authority;
+        // only the recipes seeding it may hold it.
+        let visibility = if p.badge & ipc::VERB_BIT_MASK == 0
+        {
+            Visibility::Public
+        }
+        else
+        {
+            Visibility::SeedOnly
+        };
+        if registry
+            .publish(p.name.as_bytes(), send, visibility)
+            .is_err()
         {
             std::os::seraph::log!("launch {svc_name}: publish {:?} failed", p.name);
             let _ = syscall::cap_delete(send);
@@ -407,7 +421,7 @@ pub(crate) fn resolve_seeds(
     let mut caps: Vec<u32> = Vec::with_capacity(seed.len().min(cap_max));
     for name in seed.iter().take(cap_max)
     {
-        match registry_lookup_derived(registry, name.as_bytes())
+        match registry_lookup_derived(registry, name.as_bytes(), Resolver::Seed)
         {
             Ok(cap) => caps.push(cap),
             Err(code) =>

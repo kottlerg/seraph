@@ -350,6 +350,7 @@ contains the faulting page (up to `DEMAND_CHUNK_PAGES` pages; see
 ## Summarized By
 
 [abi/init-protocol/README.md](../abi/init-protocol/README.md),
+[Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
 [Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Architecture Overview](architecture.md), [Capability Model](capability-model.md),

@@ -20,6 +20,8 @@
 /// value (then rebuilding ktest and recomposing the ktest bundle) is the
 /// supported operator escape hatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// dead_code: `Pass` and `Never` are the operator-configurable surface;
+// `KtestConfig::DEFAULT` constructs only `Always`.
 #[allow(dead_code)]
 pub enum ShutdownPolicy
 {
@@ -27,11 +29,13 @@ pub enum ShutdownPolicy
     Always,
     /// Shut down only if all tests passed.
     Pass,
-    /// Never shut down (halt in place).
+    /// Never shut down; the harness thread exits after printing results.
     Never,
 }
 
 /// ktest configuration. Baked in at compile time.
+// struct_excessive_bools: the four `run_*` fields are independent per-tier toggles,
+// not an encoded state.
 #[allow(clippy::struct_excessive_bools)]
 pub struct KtestConfig
 {

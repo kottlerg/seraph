@@ -390,8 +390,10 @@ pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBl
 ///
 /// The V restore is skipped when [`vlenb`] is zero, which holds only before
 /// [`cache_vlenb`] runs at BSP init. Only the boot hart is probed: it halts
-/// there when it lacks V, and a secondary hart is never probed, so one without
-/// V does not halt (docs/platform-requirements.md § Boot-Time Feature Gate).
+/// there when it lacks V. A secondary hart is never probed, so one without V is
+/// not refused at boot; harts are assumed uniform, and on such a hart the first
+/// V restore here takes a supervisor illegal-instruction trap, which is fatal
+/// (docs/platform-requirements.md § Boot-Time Feature Gate).
 ///
 /// # Safety
 /// Must execute in supervisor mode from the illegal-instruction trap path.
@@ -453,8 +455,8 @@ const MAX_VLENB: u64 = 64;
 
 /// Return the cached `vlenb`. Returns 0 only before [`cache_vlenb`] runs at
 /// BSP init. Only the boot hart is probed: it halts in [`cache_vlenb`] when it
-/// lacks V, and a secondary hart is never probed (docs/platform-requirements.md
-/// § Boot-Time Feature Gate).
+/// lacks V, and a secondary hart is never probed, so one without V is not
+/// refused at boot (docs/platform-requirements.md § Boot-Time Feature Gate).
 // dead_code fires only under `test`: `vlenb` is read only by the non-test `lazy_restore_fp_v`;
 // the `#[cfg(test)]` stub of `lazy_restore_fp_v` does not reference it.
 #[cfg_attr(test, allow(dead_code))]

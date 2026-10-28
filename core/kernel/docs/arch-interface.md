@@ -303,8 +303,8 @@ Classification and § riscv64 Classification.
 has no read-disable bit); `uncacheable` selects the device memory type explicitly on both
 architectures — PCD|PWT (strong UC) on x86-64, Svpbmt PBMT=IO on RISC-V — so MMIO
 attributes do not depend on platform PMAs. The kernel's own MMIO regions are the exception
-today: Phase 3 maps them cacheable through the direct map, so the x86-64 xAPIC and I/O APIC
-pages take their memory type from the firmware's MTRRs
+today: Phase 3 maps them through the direct map without `uncacheable`, so the x86-64 xAPIC
+and I/O APIC pages take their memory type from the firmware's MTRRs
 ([#515](https://github.com/kottlerg/seraph/issues/515)), and the riscv64 PLIC and UART take
 theirs from the platform PMAs (PBMT=PMA). W^X is enforced at the memory syscall layer
 (`syscall::mem` map/protect reject a writable-and-executable request with
@@ -720,7 +720,7 @@ The `SYS_SBI_CALL` handler's rights check and `HAS_SBI` gate are specified in
 
 These items in otherwise arch-private submodules are also contract surface, because
 architecture-neutral code calls them:
-`gdt::{load_iopb, permit_port_range_u32, init_ap, bsp_tss_ptr, IOPB_SIZE}`,
+`gdt::{load_iopb, permit_port_range, init_ap, bsp_tss_ptr, IOPB_SIZE}`,
 `platform::{console_mmio, uart_base_for_boot_info, collect_mmio_direct_map_regions}`,
 `fpu::{switch_out_save, switch_in_restore}`, `idt::load`, and
 `ap_trampoline::{setup_trampoline, start_ap}` (the `gdt` items are stubs on RISC-V); the rest
@@ -730,7 +730,7 @@ of those modules is arch-private:
 /// Load a thread's IOPB into the TSS, or clear it (x86-64); no-op on RISC-V.
 pub unsafe fn gdt::load_iopb(iopb: Option<&[u8; IOPB_SIZE]>);
 /// Permit an I/O port range in a thread's IOPB (x86-64); no-op on RISC-V.
-pub fn gdt::permit_port_range_u32(iopb: &mut [u8; IOPB_SIZE], base: u32, count: u32);
+pub fn gdt::permit_port_range(iopb: &mut [u8; IOPB_SIZE], base: u32, count: u32);
 /// Load a per-CPU GDT and TSS on an AP (x86-64); no-op on RISC-V.
 pub unsafe fn gdt::init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64);
 /// Virtual address of the BSP's static TSS (x86-64); 0 on RISC-V.

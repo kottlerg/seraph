@@ -84,12 +84,12 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
    * On success: increment `restart_count`, return `Restarted`.
    * On failure: any failure after `CREATE_FROM_FILE` destroys the new
      child via `DESTROY_PROCESS`, as first launch does; then route
-     through `permanent_death_outcome`. The exception is a create whose
-     reply caps never reach svcmgr: when the reply's cap transfer into
+     through `permanent_death_outcome`. A create whose reply caps never
+     reach svcmgr needs no destroy: when the reply's cap transfer into
      svcmgr's CSpace fails, svcmgr receives `IPC_REPLY_TRANSFER_FAILED`
-     with no process handle, so it cannot destroy the child procmgr
-     created, which stays suspended in procmgr's table, on first launch
-     and on restart alike (#506).
+     with no process handle, and procmgr destroys the child it created
+     (see the [procmgr IPC interface](../../procmgr/docs/ipc-interface.md)
+     § Label 1), on first launch and on restart alike.
 
 `dispatch_deaths` reacts to `Unrecoverable` by calling
 `initiate_graceful_shutdown`, which resolves

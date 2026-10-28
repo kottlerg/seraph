@@ -21,11 +21,3 @@
 /// # Safety
 /// No-op; always safe to call.
 pub unsafe fn init() {}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests
-{
-    // init() is a no-op; no tests needed.
-}

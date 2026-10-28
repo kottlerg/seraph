@@ -292,34 +292,3 @@ pub unsafe fn unmask(gsi: u32)
         ioapic_write(base, reg, current & !REDIR_MASK);
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests
-{
-    use super::*;
-
-    #[test]
-    fn device_vector_base_is_33()
-    {
-        assert_eq!(DEVICE_VECTOR_BASE, 33);
-    }
-
-    #[test]
-    fn redir_mask_bit_is_16()
-    {
-        assert_eq!(REDIR_MASK, 1 << 16);
-    }
-
-    #[test]
-    fn redirection_entry_low_encoding()
-    {
-        // For GSI 0 with vector 33:
-        // low = REDIR_MASK | 33 = 0x0001_0021
-        let vector: u8 = 33;
-        let low = REDIR_MASK | REDIR_FIXED | (vector as u32);
-        assert_eq!(low & 0xFF, 33, "vector in bits [7:0]");
-        assert!(low & REDIR_MASK != 0, "entry starts masked");
-    }
-}

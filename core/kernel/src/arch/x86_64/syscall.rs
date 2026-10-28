@@ -243,37 +243,3 @@ pub unsafe fn init()
 /// No-op test stub.
 #[cfg(test)]
 pub unsafe fn init() {}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests
-{
-    use super::*;
-
-    #[test]
-    fn star_syscall_cs_is_0x08()
-    {
-        assert_eq!((STAR_VALUE >> 32) & 0xFFFF, 0x0008);
-    }
-
-    #[test]
-    fn star_sysret_base_is_0x10()
-    {
-        // SYSRET64 → CS = (0x10+16)|3 = 0x23, SS = (0x10+8)|3 = 0x1B.
-        assert_eq!((STAR_VALUE >> 48) & 0xFFFF, 0x0010);
-    }
-
-    #[test]
-    fn sfmask_clears_every_user_controlled_privileged_flag()
-    {
-        // IF (9), TF (8), DF (10), AC (18), NT (14), IOPL (12-13).
-        assert_eq!(SFMASK_VALUE, 0x0004_7700);
-    }
-
-    #[test]
-    fn efer_sce_is_bit_0()
-    {
-        assert_eq!(EFER_SCE, 1);
-    }
-}

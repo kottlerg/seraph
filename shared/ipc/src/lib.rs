@@ -1224,8 +1224,8 @@ pub mod fs_labels
     /// the indicated page offset, `data[1]` = the same release cookie
     /// echoed back, `data[2]` = byte offset within the returned page
     /// where the file's content for the requested `offset` begins,
-    /// `caps[0]` = single-page Memory cap with `MAP|READ` rights
-    /// covering the cached file page.
+    /// `caps[0]` = single-page Memory cap with `MAP` rights (read-only
+    /// mapping authority) covering the cached file page.
     ///
     /// `bytes_valid` is bounded by file end, the current cluster
     /// boundary on the underlying filesystem, and the page tail
@@ -1270,7 +1270,7 @@ pub mod fs_labels
     /// `data[1]` = bytes to write from the page (`≤ PAGE_SIZE -
     /// memory_data_offset`), `data[2]` = byte offset within the source
     /// page where the data begins. `caps[0]` = source Memory cap with
-    /// at least `MAP|READ` rights, sized one page. Badge must carry the
+    /// at least `MAP` rights, sized one page. Badge must carry the
     /// `WRITE` namespace right.
     ///
     /// Reply (label `fs_errors::SUCCESS`): `data[0]` = `bytes_written`

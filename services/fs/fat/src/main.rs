@@ -779,10 +779,11 @@ fn handle_read_memory_node_cap(
 /// Reply `code` holding none of the caps the request carried: an
 /// `FS_WRITE_MEMORY` source page goes back in the reply, as § Label 12
 /// promises in every outcome, and any other cap (an `FS_READ_MEMORY`
-/// release SEND) is deleted. Used for the requests the driver refuses before
-/// any handler runs (a rights-gate refusal, an unknown or unbadged label, an
-/// `FS_READ_MEMORY` refused before its slot records the SEND) and for
-/// `FS_MOUNT`, which carries no caps.
+/// release SEND) is deleted. Used for requests refused before any cap they
+/// carry is recorded or consumed (the dispatch loop's rights-gate and
+/// unknown or unbadged label refusals, and the `FS_READ_MEMORY` handler's
+/// refusals before its slot records the SEND) and for `FS_MOUNT`, which
+/// carries no caps.
 fn reply_dropping_caps(msg: &IpcMessage, opcode: u64, code: u64, ipc_buf: *mut u64)
 {
     let mut builder = IpcMessage::builder(code);

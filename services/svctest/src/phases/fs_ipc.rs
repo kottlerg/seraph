@@ -14,6 +14,24 @@ use crate::ipc_util::fs::{
 use crate::ipc_util::ns::ns_lookup;
 use crate::runner::Phase;
 
+/// `f.read(buf)`, read again while it returns `Interrupted`: a frame-path
+/// read returns that, with the position unchanged, when std discarded a copy
+/// whose page the driver may have released during it.
+fn read_retrying(f: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize>
+{
+    use std::io::Read;
+
+    loop
+    {
+        match f.read(buf)
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted =>
+            {}
+            r => return r,
+        }
+    }
+}
+
 /// All FS-IPC phases EXCEPT `fs_open_relative_phase` (which installs
 /// a process-global `current_dir_cap` and must therefore run after
 /// every other phase that exercises the same fs).
@@ -123,8 +141,6 @@ pub fn fs_open_phase(_: &Caps)
 
 pub fn fs_release_on_close_phase(_: &Caps)
 {
-    use std::io::Read;
-
     let path = "/data/svctest/large.bin";
 
     for iter in 0..8u32
@@ -133,8 +149,7 @@ pub fn fs_release_on_close_phase(_: &Caps)
             .unwrap_or_else(|e| panic!("fs_release_on_close: open #{iter} failed: {e}"));
 
         let mut buf = vec![0u8; 4096];
-        let n = f
-            .read(&mut buf)
+        let n = read_retrying(&mut f, &mut buf)
             .unwrap_or_else(|e| panic!("fs_release_on_close: read #{iter} failed: {e}"));
         assert!(
             n > 0,
@@ -506,8 +521,6 @@ pub fn fs_request_bounds_phase(_: &Caps)
 
 pub fn fs_write_memory_phase(_: &Caps)
 {
-    use std::io::Read;
-
     use syscall::MAP_WRITABLE;
 
     const WRITE_LEN: usize = 2048;
@@ -585,11 +598,7 @@ pub fn fs_write_memory_phase(_: &Caps)
     let mut total = 0;
     while total < WRITE_LEN
     {
-        let n = match f.read(&mut buf[total..])
-        {
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            r => r.expect("read wrtf.bin"),
-        };
+        let n = read_retrying(&mut f, &mut buf[total..]).expect("read wrtf.bin");
         assert!(n > 0, "short read at offset {total}");
         total += n;
     }

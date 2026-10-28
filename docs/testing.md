@@ -481,7 +481,7 @@ cargo xtask run-parallel --arch riscv64 --cpus 128 --parallel 1 --runs 1 --timeo
 
 # Boundary CPU counts, x86_64 (the 256-vCPU run takes ~2 min on a 16-core
 # KVM host at 16x vCPU oversubscription. The 512-vCPU run, the MAX_CPUS
-# boundary, takes ~27 min at 32x, where every cross-CPU step waits for a
+# boundary, takes ~28 min at 32x, where every cross-CPU step waits for a
 # host core and the stress tier takes about three quarters of the run. The
 # 900 s and 3600 s budgets are for HANG classification):
 cargo xtask build

@@ -168,7 +168,9 @@ fn churn_and_delete(ctx: &TestContext, cpu_mod: u32, workers: &mut Workers) -> T
         // Sleep so the pinned worker migrates to and starts running on the
         // remote CPU before we churn its priority and delete it (the remote
         // CPU dispatches it on its own; the sleep supplies wall time). The
-        // workers stay pure userspace spinners, with no state to report it.
+        // workers stay pure userspace spinners, with no state to report it:
+        // workers that report their CPU through syscalls wedge the kernel
+        // (#529).
         let _ = thread_sleep(1);
         let _ = thread_set_priority(workers.threads[i], 5, ctx.sched_control_cap);
         let _ = thread_set_priority(workers.threads[i], 11, ctx.sched_control_cap);

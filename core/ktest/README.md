@@ -221,7 +221,11 @@ the child sends just before the call or the exit, and a cell that needs the call
 rest of that window by an observable effect (the server's receive of the call) or a bounded probe
 (`spawn::is_exited`); elsewhere a wake or call that beats the park is consumed by it. Children run
 below the harness's priority and so run on the harness's CPU only while the harness blocks: these
-waits block, bounded, rather than spin or sleep a fixed time.
+waits block, bounded, rather than spin or sleep a fixed time. One state barrier stays a fixed
+sleep: `priority_dealloc_race` waits 1 ms for each worker it pins in Phase 2 to run on its new
+CPU, because its workers stay pure userspace spinners with no way to report it; workers that report
+their CPU through syscalls wedge the kernel
+([#529](https://github.com/kottlerg/seraph/issues/529)).
 
 | File | Scenario | Knobs |
 |---|---|---|

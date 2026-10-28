@@ -145,10 +145,11 @@ const REPORT_SLICE_MS: u64 = 5;
 const REPORT_SLICES: u64 = 1000;
 
 /// Accumulate the bits children send on `done` into `acc` until one of
-/// `mask` is present, failing with `err` once [`REPORT_SLICES`] slices pass
-/// without it, so a child that never reports fails the cell instead of
-/// hanging the run. A child has no channel but `done` to report on, so a
-/// report send it could not make surfaces here, as the timeout.
+/// `mask` is present, failing with `err` once [`REPORT_SLICES`] slices
+/// (through [`crate::scaled_bound`]) pass without it, so a child that never
+/// reports fails the cell instead of hanging the run. A child has no channel
+/// but `done` to report on, so a report send it could not make surfaces
+/// here, as the timeout.
 ///
 /// # Errors
 ///
@@ -173,8 +174,8 @@ pub fn await_all(done: u32, acc: &mut u64, mask: u64, err: &'static str) -> Test
 }
 
 /// Accumulate `done`'s bits into `acc` until `reached` holds of them, in at
-/// most [`REPORT_SLICES`] slices; the bound [`await_report`] and
-/// [`await_all`] share.
+/// most [`REPORT_SLICES`] slices through [`crate::scaled_bound`]; the bound
+/// [`await_report`] and [`await_all`] share.
 fn await_bits(
     done: u32,
     acc: &mut u64,

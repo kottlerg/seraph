@@ -16,14 +16,16 @@
 // only those on its blocking track (class correctness, safety, or contract, or
 // a MUST violation anchored outside Markdown) make it `BLOCKING ISSUES`.
 // Findings off the surface are recorded for the open Issue that already names
-// the work, else for the follow-up Issue of their scope; those that share a
-// file, class, bucket, MUST flag, Issue, and authority are one root cause and
-// are verified once as a group. A follow-up Issue names findings, not work, so
-// naming one takes nothing off the surface. A run that names the ledger of the
-// earlier runs' recorded, dropped, and contested findings (required in a delta
-// run) lists, and does not count, a finding a reviewer flags as already in it
-// at a hunk unchanged since the run the entry names, when that run resolves in
-// the clone.
+// the work, else for the follow-up Issue the PR drains in their scope (the
+// lowest-numbered when it drains several), else for the follow-up Issue of
+// their scope, unless an open follow-up Issue of that scope already holds
+// them; those that share a file, class, bucket, MUST flag, Issue, and
+// authority are one root cause and are verified once as a group. A follow-up
+// Issue names findings, not work, so naming one takes nothing off the surface.
+// A run that names the ledger of the earlier runs' recorded, dropped, and
+// contested findings (required in a delta run) lists, and does not count, a
+// finding a reviewer flags as already in it at a hunk unchanged since the run
+// the entry names, when that run resolves in the clone.
 // `.claude/CLAUDE.md` § PR workflow operations says when the assistant runs
 // this workflow, how it builds the ledger, and what it does with the result.
 //
@@ -460,8 +462,7 @@ const SCOPE_PROMPT = [
     '- design_docs: ' +
         (DELTA
             ? 'the documents that state facts the delta changed: every Markdown document the ' +
-                'delta edits, and every tracked Markdown ' +
-                'document (`git ls-files \'*.md\'`) ' +
+                'delta edits, and every tracked Markdown document (`git ls-files \'*.md\'`) ' +
                 'whose text names a changed item, a constant, state, error, or section the ' +
                 'delta renamed or redefined, or a behaviour the delta changed (search for each ' +
                 'symbol and each distinctive phrase of the changed statements), and every ' +
@@ -473,14 +474,14 @@ const SCOPE_PROMPT = [
             : 'the documents that govern the touched areas, found by walking the scope ' +
                 'order `docs/documentation-standards.md` § Document Hierarchy defines: system ' +
                 'scope (the top-level `docs/*.md`), component scope (`<component>/README.md`), ' +
-                'and design-authority scope (`<component>/docs/*.md`). ' +
-                'Also list `docs/releases/README.md` with the system-scope documents: the ' +
-                'standard places it in no scope, and its § Backlinks and Change Propagation ' +
-                'release-notes exception calls it an ordinary authoritative document. ' +
-                'Also list the root `README.md` and ' +
-                'the touched component\'s grouping `README.md` (`<group>/README.md` for the ' +
-                'top-level group directory the component sits in) as routing documents, not ' +
-                'authorities; include every document the diff itself edits. ') +
+                'and design-authority scope (`<component>/docs/*.md`). Also list ' +
+                '`docs/releases/README.md` with the system-scope documents: the standard places ' +
+                'it in no scope, and its § Backlinks and Change Propagation release-notes ' +
+                'exception calls it an ordinary authoritative document. Also list the root ' +
+                '`README.md` and the touched component\'s grouping `README.md` ' +
+                '(`<group>/README.md` for the top-level group directory the component sits in) ' +
+                'as routing documents, not authorities; include every document the diff itself ' +
+                'edits. ') +
         'List only paths `git ls-files` prints: a document you cannot confirm exists at the ' +
         'head is left out, since a lens reads what it is given.',
     '- claimed_fixes: ' +
@@ -1222,9 +1223,12 @@ const all = results.flatMap((r) => r.findings)
 const groups = all.filter((f) => f.group.length > 0)
 const dropped = all.filter((f) => f.status === 'dropped')
 const surviving = all.filter((f) => f.status !== 'dropped')
-// Findings on the review surface are fixed; findings off it are recorded for
-// the open Issue that already names the work, else for the follow-up Issue of
-// their scope, and do not count toward the verdict.
+// Findings on the review surface count toward the verdict; findings off it do
+// not, and are recorded, not fixed, for the open Issue that already names the
+// work, else for the follow-up Issue the PR drains in their scope (the
+// lowest-numbered when it drains several), else for the follow-up Issue of
+// their scope, unless an open follow-up Issue of that scope already holds them
+// (docs/conventions.md § Branch and PR Workflow).
 const findings = surviving.filter((f) => f.in_bound)
 const recorded = surviving.filter((f) => !f.in_bound)
 const count = (status) => findings.filter((f) => f.status === status).length
@@ -1341,38 +1345,35 @@ const SYNTH_PROMPT = [
     '',
     'Rules: every finding on the review surface appears exactly once under its bucket, and ' +
         'every recorded finding exactly once under the Recorded section with its bucket named ' +
-        'in the entry, each with its status tag; ' +
-        'do not drop, add, merge, re-rank, or soften a finding. You may order entries within ' +
-        'a bucket by file and group entries that share one root cause under one lead entry ' +
-        'that still lists every file:line, each site with its own status, blocking, and ' +
-        'MUST-violation ' +
-        'tags. Each entry: `file:line` [status] claim, with ' +
-        '`(blocking)` after the status when blocking is true, since such an entry on the ' +
-        'review surface blocks the merge whatever its bucket, and `(MUST violation)` after it ' +
-        'when must_violation is true; in the Recorded section `file:line` [status] (bucket) ' +
-        'claim, with `[group of N]` after the status of an entry whose group_size is N, and ' +
-        'with `[verified with file:line]` on an entry whose group_lead is set. Authority: ' +
-        'the cited authority. Rationale: one sentence from the evidence. Fix: the proposed ' +
-        'fix. Every bracketed note at the end of a finding\'s evidence (the script\'s ' +
-        'placement, Issue-adoption, late-Issue, and unjudged-Issue notes) is rendered ' +
-        'verbatim as its own line on the entry. For contested and unverified entries add ' +
-        'one line per verifier vote with its ' +
-        'lens, refuted flag, confidence, and evidence. The dropped section lists each dropped ' +
-        'finding in one line with the refuting evidence. The ledger section lists each ' +
-        'ledgered finding in one line: `file:line` (bucket, class) claim. The audit section ' +
-        'lists each audit section with its verdict and items. Keep each entry to its fields; ' +
-        'the full record is saved beside the report.',
+        'in the entry, each with its status tag; do not drop, add, merge, re-rank, or soften a ' +
+        'finding. You may order entries within a bucket by file and group entries that share ' +
+        'one root cause under one lead entry that still lists every file:line, each site with ' +
+        'its own status, blocking, and MUST-violation tags. Each entry: `file:line` [status] ' +
+        'claim, with `(blocking)` after the status when blocking is true, since such an entry ' +
+        'on the review surface blocks the merge whatever its bucket, and `(MUST violation)` ' +
+        'after it when must_violation is true; in the Recorded section `file:line` [status] ' +
+        '(bucket) claim, with `[group of N]` after the status of an entry whose group_size is ' +
+        'N, and with `[verified with file:line]` on an entry whose group_lead is set. ' +
+        'Authority: the cited authority. Rationale: one sentence from the evidence. Fix: the ' +
+        'proposed fix. Every bracketed note at the end of a finding\'s evidence (the script\'s ' +
+        'placement, Issue-adoption, late-Issue, and unjudged-Issue notes) is rendered verbatim ' +
+        'as its own line on the entry. For contested and unverified entries add one line per ' +
+        'verifier vote with its lens, refuted flag, confidence, and evidence. The dropped ' +
+        'section lists each dropped finding in one line with the refuting evidence. The ledger ' +
+        'section lists each ledgered finding in one line: `file:line` (bucket, class) claim. ' +
+        'The audit section lists each audit section with its verdict and items. Keep each entry ' +
+        'to its fields; the full record is saved beside the report.',
     '',
     'Headings, in this order: `# Pre-merge review: PR #' + PR + '`, `## Critical`, ' +
         '`## Should fix`, `## Nit`, `## Recorded for audit (off the review surface)`, ' +
         '`## Dropped by verification`, `## Ledger (not re-raised)`, `## Audit`. The recorded ' +
-        'section lists each off-surface ' +
-        'finding with the same fields as the others, naming its `issue` when set; they are ' +
-        'appended to the open Issue that already names the work, else to the follow-up ' +
-        'Issue of their scope unless an open follow-up Issue of that scope already holds ' +
-        'them (docs/conventions.md § Branch and PR Workflow), not ' +
-        'fixed. Write `(none)` under an empty heading. Do not write verdict lines; the ' +
-        'workflow appends them.',
+        'section lists each off-surface finding with the same fields as the others, naming ' +
+        'its `issue` when set; they are appended to the open Issue that already names the ' +
+        'work, else to the follow-up Issue the PR drains in their scope (the lowest-numbered ' +
+        'when it drains several), else to the follow-up Issue of their scope, unless an open ' +
+        'follow-up Issue of that scope already holds them (docs/conventions.md § Branch and ' +
+        'PR Workflow), not fixed. Write `(none)` under an empty heading. Do not write verdict ' +
+        'lines; the workflow appends them.',
     '',
     'Findings on the review surface (JSON):',
     JSON.stringify(findings.map(for_render), null, 1),

@@ -381,9 +381,10 @@ When the runs are owed below) makes a non-inert change to the CPU-count surface;
 concurrency-fix purpose owes three of its boundaries on its own (see Repeat count below). The
 CPU-count surface is the code that fixes the CPU-count width, enumerates and brings up CPUs, sizes
 per-CPU storage, or signals across CPUs, and it is exactly what this paragraph lists. Code that only
-reads `CPU_COUNT` or a `cpu_count` argument to iterate over CPUs, naming no listed item, is not on
-it; the rules of [coding-standards.md](coding-standards.md) § CPU-Count Width and the release host
-runs cover it. The surface is these files as a whole:
+reads `CPU_COUNT` or a `cpu_count` argument to iterate over CPUs is not on it unless it lies in a
+whole-surface file, names a listed item, or lies within one's definition; the rules of
+[coding-standards.md](coding-standards.md) § CPU-Count Width and the release host runs cover it. The
+surface is these files as a whole:
 
 - `core/kernel/src/cpu_mask.rs` (the CPU mask type and its width);
 - `core/kernel/src/percpu.rs` (per-CPU data and its slabs);
@@ -412,11 +413,12 @@ changed line that names one of these items as a whole identifier or lies within 
   (for example `RunQueue` and `NUM_PRIORITY_LEVELS` inside `PerCpuScheduler`, or `Prng` inside
   `CpuRng`), and so is a change to a constant that sizes a per-CPU allocation (`KERNEL_STACK_PAGES`
   for the idle stacks);
-- CPU enumeration and bringup: `parse_cpu_topology`, `parse_madt_topology`, `parse_cpu_count`, and
-  `CpuTopology` in the bootloader, and a changed line that reads a `CpuTopology` field into, or
-  writes, the `BootInfo` `cpu_count` or `cpu_ids`; the kernel's boot CPU count (`boot_cpu_count`),
-  `start_ap`, `sbi_hart_start`, `kernel_entry_ap`, every `init_ap`, and the `init_ap_*` per-CPU
-  storage initialisers in the kernel;
+- CPU enumeration and bringup: in the bootloader, `parse_cpu_topology`, `parse_madt_topology`,
+  `parse_cpu_count`, `step5_discover_cpu_topology`, `single_cpu_topology`, `CpuTopology`, and the
+  handoff of the count and the CPU ids into `BootInfo` (`cpus.count` and `cpus.cpu_ids`); in the
+  kernel, the boot CPU count and ids (`info.cpu_count`, `info.cpu_ids`, `boot_cpu_count`, and
+  `boot_cpu_ids`), `start_ap`, `sbi_hart_start`, `kernel_entry_ap`, every `init_ap`, and the
+  `init_ap_*` per-CPU storage initialisers in the kernel;
 - IPI send and receive: `send_wakeup_ipi`, `send_tlb_shootdown_ipi`, `send_init_ipi`, `send_sipi`,
   `send_nmi_to`, `sbi_send_ipi_to`, `sbi_hart_mask`, `wait_for_ack`, `IpiWaitCtx`, the
   `IPI_VECTOR_*` constants, the x86_64 `ipi_*` stubs and handlers in `idt.rs`, the x86_64 ICR and
@@ -450,7 +452,9 @@ git diff --stat "$B" <head> -- core/kernel/src/cpu_mask.rs core/kernel/src/percp
 S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|init_storage|init_per_cpu_storage'
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|TlbShootdownRequest|CpuTopology"
-S="$S|parse_cpu_topology|parse_madt_topology|parse_cpu_count|start_ap"
+S="$S|parse_cpu_topology|parse_madt_topology|parse_cpu_count|step5_discover_cpu_topology"
+S="$S|single_cpu_topology|cpus\.count|cpus\.cpu_ids|info\.cpu_count|info\.cpu_ids|boot_cpu_ids"
+S="$S|start_ap"
 S="$S|sbi_hart_start|kernel_entry_ap|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdown|init)_ipi"
 S="$S|send_sipi|send_nmi_to|sbi_send_ipi_to|sbi_hart_mask|wait_for_ack|IpiWaitCtx"
 S="$S|IPI_VECTOR_[A-Z_]+|ipi_[a-z_]+_(stub|handler)|apic_send_icr|wait_icr_idle"
@@ -569,7 +573,7 @@ the PR body MUST carry what
 [conventions.md](conventions.md#pr-body-checklist-discipline) § PR-body checklist
 discipline requires (the validated head, that the delta is documentation or
 comments only, and the local host runs the PR as a whole owes, each with its
-count and head, or that none is owed and why), and the pre-merge review's
+count, its outcome, and its head, or that none is owed and why), and the pre-merge review's
 audit MUST check that against the diff.
 
 **Known boundaries**, established empirically (QEMU 11.0.1; update this

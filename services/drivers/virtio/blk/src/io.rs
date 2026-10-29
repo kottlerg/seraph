@@ -18,6 +18,7 @@
 
 use std::time::{Duration, Instant};
 
+use virtio_blk::IoOutcome;
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::SplitVirtqueue;
 
@@ -131,9 +132,9 @@ impl IoLayout
         unsafe { core::ptr::write_volatile(self.status_va() as *mut u8, 0xFF) };
     }
 
-    /// Read the device status byte after request completion.
-    ///
-    /// Returns 0 on success, non-zero on device error.
+    /// Read the device status byte after request completion: a `VirtIO`
+    /// status (`VIRTIO_BLK_S_*`), or the 0xFF sentinel `prepare` wrote when
+    /// the device wrote none.
     pub fn read_status(&self) -> u8
     {
         // SAFETY: status_va is within the mapped data page.
@@ -157,7 +158,16 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(50);
 /// over the expected wake and three orders under [`REQUEST_TIMEOUT`].
 const IRQ_WAIT_TIMEOUT_MS: u64 = 50;
 
-/// Submit a read or write request and wait for completion via IRQ notification.
+/// Submit a read or write request and wait for its completion via IRQ
+/// notification, returning how the request ended.
+///
+/// [`IoOutcome::Completed`] carries the status byte of the completion of the
+/// submitted chain. [`IoOutcome::NotQueued`] means the chain never reached
+/// the device. [`IoOutcome::Lost`] means no completion of the submitted chain
+/// arrived within [`REQUEST_TIMEOUT`], or the used ring published one the
+/// virtqueue refused or one naming another chain: the request may still be
+/// in flight, and the caller must quiesce the device before it gives the data
+/// segment's Memory cap back.
 ///
 /// `data_phys` is the physical address of the caller-supplied memory cap's
 /// data segment (offset 0 of the memory cap per the `BLK_READ_INTO_MEMORY` /
@@ -188,7 +198,7 @@ pub fn submit_and_wait(
     queue_notify_off: u16,
     irq_notification: u32,
     irq_cap: u32,
-) -> bool
+) -> IoOutcome
 {
     layout.prepare(dir, sector);
 
@@ -197,10 +207,10 @@ pub fn submit_and_wait(
         IoDirection::Read => layout.read_chain(data_phys, data_len),
         IoDirection::Write => layout.write_chain(data_phys, data_len),
     };
-    let Some(_head) = vq.add_chain(&chain)
+    let Some(head) = vq.add_chain(&chain)
     else
     {
-        return false;
+        return IoOutcome::NotQueued;
     };
 
     // VirtIO 1.2 §2.9.3 "Driver Notifications": a full memory barrier is
@@ -235,11 +245,11 @@ pub fn submit_and_wait(
         // makes the driver tolerant of those lost IRQs.
         for _ in 0..100_000u32
         {
-            if vq.poll_used().is_some()
+            if let Some(outcome) = completion(vq, head, layout)
             {
                 let _ = transport.read_isr();
                 let _ = syscall::irq_ack(irq_cap);
-                return layout.read_status() == 0;
+                return outcome;
             }
             core::hint::spin_loop();
         }
@@ -255,12 +265,30 @@ pub fn submit_and_wait(
         let _ = transport.read_isr();
         let _ = syscall::irq_ack(irq_cap);
 
-        if vq.poll_used().is_some()
+        if let Some(outcome) = completion(vq, head, layout)
         {
-            return layout.read_status() == 0;
+            return outcome;
         }
     }
 
-    // Device did not complete within bound — treat as I/O error.
-    false
+    // No completion within the bound: the request may still be in flight.
+    IoOutcome::Lost
+}
+
+/// Poll the used ring once for the completion of the chain at `head`.
+///
+/// `None` while the device has published nothing. The driver keeps one
+/// request outstanding, so any published element other than a valid
+/// completion of `head` (one the virtqueue refuses, or one naming another
+/// chain) is a device fault and ends the request as [`IoOutcome::Lost`].
+fn completion(vq: &mut SplitVirtqueue, head: u16, layout: &IoLayout) -> Option<IoOutcome>
+{
+    match vq.poll_used()
+    {
+        Ok(None) => None,
+        Ok(Some((done, _len))) if done == head => Some(IoOutcome::Completed {
+            status: layout.read_status(),
+        }),
+        Ok(Some(_)) | Err(_) => Some(IoOutcome::Lost),
+    }
 }

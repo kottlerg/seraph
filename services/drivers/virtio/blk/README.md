@@ -13,7 +13,8 @@ virtio/blk/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    ├── main.rs                # Driver entry, IPC service loop, partition table
+    ├── lib.rs                 # Transfer-length bound, outcome-to-reply mapping (host-tested)
+    ├── main.rs                # Driver entry, IPC service loop, partition table, fail-stop
     └── io.rs                  # IoLayout (header + status DMA), descriptor chain submission
 ```
 
@@ -101,6 +102,7 @@ page, packed contiguously; the rest of the page is unspecified.
 | 2 | `DeviceStatusUnsupp` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
 | 3 | `OutOfBounds` | LBA outside the caller badge's partition range |
 | 5 | `InvalidMemoryCap` | Target Memory cap missing `MAP|WRITE`, smaller than `count * 512`, or absent; or `count` is 0 or `count * 512` exceeds the u32 descriptor length |
+| 7 | `DeviceFault` | No usable completion: the request could not be queued, the device wrote a status outside `VirtIO`'s set, or the device lost the request (timeout or malformed completion); after a lost request, every later request (see DMA Discipline) |
 
 #### Reserved cap slots and the IOMMU forward-compat shape
 
@@ -153,6 +155,7 @@ read.
 | 2 | `DeviceStatusUnsupp` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
 | 3 | `OutOfBounds` | LBA outside the caller badge's partition range |
 | 5 | `InvalidMemoryCap` | Source Memory cap missing `MAP`, smaller than `count * 512`, or absent; or `count` is 0 or `count * 512` exceeds the u32 descriptor length |
+| 7 | `DeviceFault` | No usable completion: the request could not be queued, the device wrote a status outside `VirtIO`'s set, or the device lost the request (timeout or malformed completion); after a lost request, every later request (see DMA Discipline) |
 
 ---
 
@@ -164,8 +167,25 @@ write is the caller-supplied Memory cap: the driver queries `phys_base` via
 `cap_info` without mapping the memory cap into its own address space (the
 device DMAs to or from the physical address; the driver never touches
 the data), then programs the descriptor chain to point at `phys_base`.
-The Memory cap is moved back to the caller in the reply on every
-outcome, so it never accumulates in the driver's `CSpace`.
+The Memory cap is moved back to the caller in every reply, so it never
+accumulates in the driver's `CSpace`.
+
+The driver keeps one request in flight and waits for the completion of
+that chain, polling and parking on the IRQ notification, for at most
+50 seconds. A request the device loses, by timing out or by publishing a
+used-ring element the virtqueue refuses (an id heading no outstanding
+chain, or a corrupted chain) or one naming another chain, may still be
+in flight, so its Memory cap cannot go back while the device can still
+DMA into or out of it. The driver resets the device first: once the
+reset is acknowledged, the device no longer accesses the virtqueue or
+the buffers it describes (`VirtIO` 1.2 §2.4.1). It then replies
+`DeviceFault` with the cap moved back, and fails stop: every later read
+or write is answered `DeviceFault` with its cap moved back, so clients
+see an error rather than block on an endpoint nobody serves. A device
+that does not acknowledge the reset within a bounded poll may still be
+transferring, so the driver logs and exits without replying; the cap is
+destroyed with the driver's `CSpace` instead of returning to a caller
+who could reuse the memory.
 
 The notify-after-avail-update memory-ordering pair (release fence on the
 producer, the device's implicit load-acquire on the doorbell MMIO)

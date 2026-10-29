@@ -316,6 +316,12 @@ fn setup_virtqueue(
             queue_size,
         )
     };
+    let Some(vq) = vq
+    else
+    {
+        std::os::seraph::log!("device offers no usable eventq (queue size {queue_size})");
+        syscall::thread_exit();
+    };
 
     (vq, queue_notify_off)
 }

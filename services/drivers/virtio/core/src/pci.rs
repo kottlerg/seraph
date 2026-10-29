@@ -243,6 +243,30 @@ impl PciTransport
         }
     }
 
+    /// Reset the device, polling the status register at most `max_polls`
+    /// times for the reset to complete.
+    ///
+    /// Returns `true` once the status reads 0. From then on the device does
+    /// not access the virtqueues or the buffers they describe until the
+    /// driver re-initialises it (`VirtIO` 1.2 §2.4.1), so a driver can use a
+    /// `true` return to quiesce DMA it can no longer track. Returns `false`
+    /// when the status never reads 0 within the bound: the device has not
+    /// confirmed the reset and may still be accessing driver memory.
+    #[must_use]
+    pub fn try_reset(&self, max_polls: u32) -> bool
+    {
+        self.set_status(0);
+        for _ in 0..max_polls
+        {
+            if self.get_status() == 0
+            {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        false
+    }
+
     /// Run the standard feature negotiation sequence.
     ///
     /// Reads device features, calls `negotiate` to select driver features,

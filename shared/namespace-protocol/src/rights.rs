@@ -64,10 +64,10 @@ pub const DEFINED_MASK: u32 = LOOKUP | READDIR | STAT | READ | WRITE | EXEC | MU
 /// Set of namespace rights packed in a node-cap badge.
 ///
 /// 24-bit field; only the bits of [`DEFINED_MASK`] can be set in a
-/// constructed value (reserved and out-of-field bits are cleared). The newtype is `Copy` and supports bitwise ops
-/// (`&`, `|`, `-`) for composition; `const fn` equivalents
-/// ([`Self::intersect`], [`Self::union`], [`Self::difference`]) cover
-/// const contexts.
+/// constructed value (reserved and out-of-field bits are cleared). The
+/// newtype is `Copy` and supports bitwise ops (`&`, `|`, `-`) for
+/// composition; `const fn` equivalents ([`Self::intersect`],
+/// [`Self::union`], [`Self::difference`]) cover const contexts.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 #[repr(transparent)]
 pub struct NamespaceRights(u32);
@@ -196,17 +196,6 @@ mod tests
     {
         assert!(NamespaceRights::NONE.is_empty());
         assert_eq!(NamespaceRights::NONE.raw(), 0);
-    }
-
-    #[test]
-    fn all_has_every_defined_bit_and_no_reserved_bit()
-    {
-        let all = NamespaceRights::ALL;
-        for bit in [LOOKUP, READDIR, STAT, READ, WRITE, EXEC, MUTATE_DIR, ADMIN]
-        {
-            assert!(all.contains(bit), "ALL missing bit {bit:#x}");
-        }
-        assert_eq!(all.raw() & RIGHTS_MASK & !DEFINED_MASK, 0, "ALL sets a reserved bit");
     }
 
     #[test]

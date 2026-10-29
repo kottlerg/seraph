@@ -264,24 +264,16 @@ pub fn fs_rights_attenuation_phase(_: &Caps)
 
     let _ = syscall::cap_delete(stat_cap);
 
-    let (empty_cap, _kind, _) = ns_lookup(data_cap, b"test.txt", 0, ipc_buf)
-        .expect("fs_rights_attenuation: NS_LOOKUP /data/test.txt (empty) failed");
-    let release_msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_RELEASE_MEMORY)
-        .word(0, 1)
-        .build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let release_reply = unsafe { ipc::ipc_call(empty_cap, &release_msg, ipc_buf) }
-        .expect("fs_rights_attenuation: FS_RELEASE_MEMORY ipc_call failed");
-    assert_eq!(
-        release_reply.label,
-        ipc::fs_errors::PERMISSION_DENIED,
-        "fs_rights_attenuation: FS_RELEASE_MEMORY on empty-rights cap returned {} (expected \
-         PERMISSION_DENIED={})",
-        release_reply.label,
-        ipc::fs_errors::PERMISSION_DENIED,
+    // A lookup whose composed rights are empty mints no cap: a cap with no
+    // rights could do nothing (shared/namespace-protocol README § NS_LOOKUP).
+    let empty = ns_lookup(data_cap, b"test.txt", 0, ipc_buf);
+    let denied = namespace_protocol::NsError::PermissionDenied.as_label();
+    assert!(
+        matches!(empty, Err(code) if code == denied),
+        "fs_rights_attenuation: NS_LOOKUP /data/test.txt with empty rights returned {empty:?} \
+         (expected Err(PermissionDenied={denied}))",
     );
-    std::os::seraph::log!("fs_rights_attenuation: FS_RELEASE_MEMORY rejected on empty-rights cap");
-    let _ = syscall::cap_delete(empty_cap);
+    std::os::seraph::log!("fs_rights_attenuation: empty-rights NS_LOOKUP refused");
 
     let (full_cap, _kind, _) = ns_lookup(data_cap, b"test.txt", 0xFFFF, ipc_buf)
         .expect("fs_rights_attenuation: NS_LOOKUP /data/test.txt (full) failed");

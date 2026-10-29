@@ -374,6 +374,14 @@ impl NamespaceBackend for FatfsBackend<'_>
             .map_or(Err(NsError::IoError), |name| Ok(Some(name)))
     }
 
+    fn may_hide_entries(&mut self, _dir: NodeId) -> bool
+    {
+        // FAT stores no visibility rights: every entry's `visible_requires` is NONE
+        // (see `lookup` and `readdir_entry`), so `NS_READDIR` can index the
+        // directory directly.
+        false
+    }
+
     fn stat(&mut self, node: NodeId) -> Result<NodeStat, NsError>
     {
         if node.raw() == 0

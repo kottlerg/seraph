@@ -95,8 +95,8 @@ pub fn gate(label: u64, badge: u64) -> Result<(NodeId, NamespaceRights), GateErr
 ///
 /// # Wire impact
 ///
-/// The `0xFFFF` sentinel is replaced by an explicit 24-bit mask on
-/// the forwarded message. Semantically identical — every receiver
+/// The `0xFFFF` sentinel is replaced by an explicit rights mask
+/// (defined bits only) on the forwarded message. Semantically identical — every receiver
 /// already decodes raw rights bits the same way — and no protocol
 /// version change is required.
 #[must_use]

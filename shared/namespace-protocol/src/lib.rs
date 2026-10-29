@@ -232,6 +232,17 @@ pub trait NamespaceBackend
     /// Returns [`NsError`] variants for backend-defined failures.
     fn readdir_entry(&mut self, dir: NodeId, idx: u32) -> Result<Option<EntryName>, NsError>;
 
+    /// Whether any entry of `dir` may carry a non-empty
+    /// `visible_requires`. A backend returns `false` only when no entry
+    /// of `dir` is hidden from any caller; `NS_READDIR` then serves index
+    /// `idx` with one [`Self::readdir_entry`] call instead of scanning
+    /// the directory from index 0 to skip hidden entries. The default,
+    /// `true`, is always correct.
+    fn may_hide_entries(&mut self, _dir: NodeId) -> bool
+    {
+        true
+    }
+
     /// Return attribute snapshot for `node` (file or directory).
     ///
     /// # Errors
@@ -329,9 +340,9 @@ pub unsafe fn dispatch_request<B: NamespaceBackend>(
 
 /// Decode an `NS_LOOKUP` request's `caller_requested` word into a
 /// [`NamespaceRights`] mask. The `0xFFFF` sentinel means "everything
-/// I'm allowed"; any other value has its low [`RIGHTS_BITS`] bits
-/// interpreted directly, with reserved bits beyond [`RIGHTS_MASK`]
-/// stripped.
+/// I'm allowed"; any other value is taken as a rights mask with every
+/// bit outside [`rights::DEFINED_MASK`] (reserved and out-of-field)
+/// cleared.
 ///
 /// Shared between [`handle_lookup`] and
 /// [`gate::compose_forward_lookup_rights`] so the two paths cannot
@@ -527,8 +538,11 @@ fn handle_readdir<B: NamespaceBackend>(backend: &mut B, msg: &ipc::IpcMessage) -
 /// Hidden entries (those whose `visible_requires` `rights` does not
 /// contain) are skipped without contributing to the index, so the
 /// client's index counts visible entries only and hidden and absent
-/// entries are indistinguishable. The scan restarts at backend index 0
-/// on every request, so a full listing costs O(n²) backend calls.
+/// entries are indistinguishable. When the backend reports that `dir`
+/// hides nothing ([`NamespaceBackend::may_hide_entries`]), backend and
+/// visible indices coincide and `idx` is served directly; otherwise the
+/// scan restarts at backend index 0 on every request, so a full listing
+/// costs O(n²) backend calls.
 fn nth_visible_entry<B: NamespaceBackend>(
     backend: &mut B,
     dir: NodeId,
@@ -536,6 +550,21 @@ fn nth_visible_entry<B: NamespaceBackend>(
     idx: u32,
 ) -> Result<Option<EntryName>, NsError>
 {
+    if !backend.may_hide_entries(dir)
+    {
+        match backend.readdir_entry(dir, idx)?
+        {
+            None => return Ok(None),
+            Some(entry) if rights.contains(entry.visible_requires.raw()) =>
+            {
+                return Ok(Some(entry));
+            }
+            // A hidden entry contradicts the backend's report; the scan
+            // below still enforces the filter.
+            Some(_) =>
+            {}
+        }
+    }
     let mut visible = 0u32;
     let mut backend_idx = 0u32;
     loop
@@ -633,13 +662,11 @@ mod tests
     }
 
     #[test]
-    fn lookup_refuses_empty_composed_rights_on_a_nonzero_node()
+    fn lookup_refuses_empty_composed_rights()
     {
-        // Before the fix only node 0 with empty rights (a zero badge) was
-        // refused; any other node was minted a cap that could do nothing.
+        // A cap with no rights can do nothing, so none is minted.
         let parent = NamespaceRights::from_raw(rights::LOOKUP);
-        let mut e = entry(rights::READ, 0);
-        e.target = EntryTarget::Local(NodeId::new(7).unwrap());
+        let e = entry(rights::READ, 0);
         assert_eq!(
             compose_lookup_rights(parent, &e, NamespaceRights::ALL),
             Err(NsError::PermissionDenied)
@@ -651,6 +678,10 @@ mod tests
     struct ListDir
     {
         entries: &'static [(&'static [u8], u32)],
+        /// Backend index at which `readdir_entry` fails with `IoError`.
+        fail_at: Option<u32>,
+        /// Value `may_hide_entries` reports.
+        hides: bool,
     }
 
     impl NamespaceBackend for ListDir
@@ -662,9 +693,18 @@ mod tests
 
         fn readdir_entry(&mut self, _dir: NodeId, idx: u32) -> Result<Option<EntryName>, NsError>
         {
+            if self.fail_at == Some(idx)
+            {
+                return Err(NsError::IoError);
+            }
             Ok(self.entries.get(idx as usize).map(|&(name, vis)| {
                 EntryName::new(name, NodeKind::File, NamespaceRights::from_raw(vis)).unwrap()
             }))
+        }
+
+        fn may_hide_entries(&mut self, _dir: NodeId) -> bool
+        {
+            self.hides
         }
 
         fn stat(&mut self, _node: NodeId) -> Result<NodeStat, NsError>
@@ -704,7 +744,11 @@ mod tests
     /// `expected`, in order, and then reaches end-of-directory.
     fn assert_listing(rights: u32, expected: &[&[u8]])
     {
-        let mut dir = ListDir { entries: MIXED_DIR };
+        let mut dir = ListDir {
+            entries: MIXED_DIR,
+            fail_at: None,
+            hides: true,
+        };
         let r = NamespaceRights::from_raw(rights);
         for (i, want) in (0u32..).zip(expected)
         {
@@ -725,5 +769,71 @@ mod tests
     fn readdir_lists_hidden_entries_to_a_caller_holding_their_rights()
     {
         assert_listing(rights::READDIR | rights::ADMIN, &[b"a", b"secret", b"b"]);
+    }
+
+    #[test]
+    fn readdir_propagates_a_backend_error_met_while_skipping()
+    {
+        // The failing entry sits at backend index 1, the hidden one: a
+        // caller without ADMIN asking for visible index 1 scans through it.
+        let mut dir = ListDir {
+            entries: MIXED_DIR,
+            fail_at: Some(1),
+            hides: true,
+        };
+        let r = NamespaceRights::from_raw(rights::READDIR);
+        assert_eq!(nth_visible_entry(&mut dir, NodeId::ROOT, r, 1), Err(NsError::IoError));
+    }
+
+    #[test]
+    fn readdir_rescans_when_a_backend_reporting_no_hidden_entries_returns_one()
+    {
+        // A backend that claims to hide nothing but returns a hidden entry
+        // must not leak it: the filter still applies.
+        let mut dir = ListDir {
+            entries: MIXED_DIR,
+            fail_at: None,
+            hides: false,
+        };
+        let r = NamespaceRights::from_raw(rights::READDIR);
+        let got = nth_visible_entry(&mut dir, NodeId::ROOT, r, 1).unwrap().unwrap();
+        assert_eq!(got.as_bytes(), b"b");
+    }
+
+    #[test]
+    fn readdir_serves_backend_index_directly_when_nothing_is_hidden()
+    {
+        // With `may_hide_entries` false the requested index is the backend
+        // index: index 2 is backend entry 2 with no scan from 0.
+        let mut dir = ListDir {
+            entries: MIXED_DIR,
+            fail_at: Some(0),
+            hides: false,
+        };
+        let r = NamespaceRights::from_raw(rights::READDIR);
+        let got = nth_visible_entry(&mut dir, NodeId::ROOT, r, 2).unwrap().unwrap();
+        assert_eq!(got.as_bytes(), b"b");
+    }
+
+    #[test]
+    fn readdir_index_beyond_u32_is_end_of_directory()
+    {
+        let mut dir = ListDir {
+            entries: MIXED_DIR,
+            fail_at: None,
+            hides: true,
+        };
+        let badge = pack(NodeId::ROOT, NamespaceRights::from_raw(rights::READDIR));
+        let mut msg = ipc::IpcMessage::builder(ipc::ns_labels::NS_READDIR)
+            .word(0, u64::from(u32::MAX) + 1)
+            .build();
+        msg.badge = badge;
+        assert_eq!(handle_readdir(&mut dir, &msg).label, ipc::fs_labels::END_OF_DIR);
+
+        let mut first = ipc::IpcMessage::builder(ipc::ns_labels::NS_READDIR).word(0, 0).build();
+        first.badge = badge;
+        let reply = handle_readdir(&mut dir, &first);
+        assert_eq!(reply.label, 0);
+        assert_eq!(&reply.data_bytes()[16..17], b"a");
     }
 }

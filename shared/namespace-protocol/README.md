@@ -105,6 +105,8 @@ The server MUST:
 5. Compute returned rights as
    `parent_rights ∩ entry.max_rights ∩ caller_requested`
    ([docs/namespace-model.md](../../docs/namespace-model.md) § Per-Entry Rights and Visibility).
+   Reject with `PermissionDenied` if the returned rights are empty,
+   whatever the entry's node: a cap with no rights can do nothing.
 6. Mint the child cap carrying the returned rights via
    `cap_derive_badge`: for [`EntryTarget::Local`], on the server's own
    namespace endpoint at the entry's `NodeId`; for
@@ -239,7 +241,7 @@ this through the intersection at step 5 of `NS_LOOKUP`.
 | Code | Variant | Meaning |
 |---:|---|---|
 | 1 | `NotFound` | Name absent or hidden by visibility |
-| 2 | `PermissionDenied` | Caller's badge lacks the required right |
+| 2 | `PermissionDenied` | Caller's badge lacks the required right, or an `NS_LOOKUP` would mint a cap with no rights |
 | 3 | `NotADirectory` | Operation requires a directory; node is a file |
 | 4 | `IsADirectory` | Operation requires a file; node is a directory |
 | 5 | `InvalidName` | Name failed [`validate_name`] |
@@ -268,6 +270,7 @@ filtering — backends never re-implement those checks.
 |---|---|
 | `lookup` | `NS_LOOKUP` |
 | `readdir_entry` | `NS_READDIR` |
+| `may_hide_entries` | `NS_READDIR`: `false` (no entry of the directory is hidden) lets the crate index the directory directly instead of scanning past hidden entries; defaults to `true` |
 | `stat` | `NS_STAT` |
 | `read_inline` | future `NS_READ` |
 | `read_memory` | future `NS_READ_MEMORY` |

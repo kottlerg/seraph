@@ -572,6 +572,14 @@ impl NamespaceBackend for VfsdRootBackend
         Ok(None)
     }
 
+    fn may_hide_entries(&mut self, _dir: NodeId) -> bool
+    {
+        // No synthetic node is hidden: every entry's `visible_requires` is NONE
+        // (see `lookup` and `readdir_entry`), so `NS_READDIR` can index the
+        // directory directly.
+        false
+    }
+
     fn stat(&mut self, node: NodeId) -> Result<NodeStat, NsError>
     {
         if self.resolve(node).is_none()

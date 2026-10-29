@@ -68,7 +68,8 @@ log line itself (see [`main.rs`](../src/main.rs)).
   iteration — or `label = RELEASE_PENDING (1)`, by which init-logd defers
   the release and keeps serving (see
   [Name changes during the drain](#name-changes-during-the-drain)).
-  Real-logd retries a release whose call fails until one is delivered.
+  Real-logd retries a release whose call fails, up to `MAX_RETRIES` (64)
+  attempts, until one is delivered (see [Termination](#termination)).
 
 The reply label's upper 16 bits (`(byte_len << 16)`) carry the
 inline byte length on `SLOT` and `LINE` chunk kinds, matching the

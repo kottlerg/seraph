@@ -386,9 +386,11 @@ impl SenderSlot
 static mut HISTORY: [HistoryLine; HISTORY_RING_LEN] = [HistoryLine::empty(); HISTORY_RING_LEN];
 
 /// Write cursor: the push sequence number of the next line, which lands in
-/// slot `HISTORY_HEAD % HISTORY_RING_LEN`. `history_push` advances it and
-/// [`HISTORY_TOTAL`] together, so the two are always equal; the handover
-/// reads sequence `s` from `HISTORY[s % HISTORY_RING_LEN]` on that basis.
+/// slot `HISTORY_HEAD % HISTORY_RING_LEN`. `history_push` advances it before
+/// writing the slot and [`HISTORY_TOTAL`] after, both on the log thread, which
+/// also runs the handover; so the two are equal whenever the handover reads
+/// them, and it reads sequence `s` from `HISTORY[s % HISTORY_RING_LEN]` for
+/// every `s < HISTORY_TOTAL` still live.
 static HISTORY_HEAD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Total lines ever pushed (monotonic, never reset): the exclusive upper

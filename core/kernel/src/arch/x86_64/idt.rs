@@ -295,10 +295,12 @@ macro_rules! entry_swapgs_asm {
 /// does not fault: every ring-3 return carries a canonical user RIP and RSP
 /// (`sys_thread_configure` rejects a non-user entry or stack,
 /// `SYS_THREAD_WRITE_REGS` sanitizes the frame via
-/// `TrapFrame::sanitize_for_user_resume`, and `syscall_entry` diverts a
-/// non-canonical return RIP to a user `#GP` instead of `sysretq`) and kernel-set
-/// CS and SS selectors. So no stub can enter with a ring-0 frame on the user GS
-/// base.
+/// `TrapFrame::sanitize_for_user_resume`, the RIP the hardware saves on a ring-3
+/// interrupt or trap is canonical because `paging::user_va_top` keeps the top
+/// user page unmappable, so no user instruction ends at the canonical boundary,
+/// and `syscall_entry` diverts a non-canonical return RIP to a user `#GP`
+/// instead of `sysretq`) and kernel-set CS and SS selectors. So no stub can
+/// enter with a ring-0 frame on the user GS base.
 #[cfg(not(test))]
 macro_rules! exit_swapgs_asm {
     ($cs:literal) => {
@@ -1135,7 +1137,8 @@ extern "C" fn nm_handler()
     crate::percpu::preempt_disable();
 
     let cpu = super::cpu::current_cpu() as usize;
-    let owner_slot = crate::percpu::fpu_owner_for(cpu);
+    // SAFETY: `cpu` is the executing CPU's logical index, below CPU_COUNT.
+    let owner_slot = unsafe { crate::percpu::fpu_owner_for(cpu) };
     // Read the prior owner (if any) so we can save its live regs
     // before XRSTOR'ing this thread's area. The atomic swap is
     // simpler than load-then-store but is not load-bearing for
@@ -1299,7 +1302,13 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
         let handler_bound = !tcb.is_null() && unsafe { crate::ipc::fault::has_handler(tcb) };
         if handler_bound
         {
-            let present = error_code & ERR_PRESENT != 0;
+            // The hardware P bit is reported only for a user-half CR2. The
+            // kernel half is mapped supervisor-only in every address space, so
+            // for a kernel-half CR2 the bit would tell a process acting as its
+            // own fault handler which kernel VAs are mapped, defeating KASLR
+            // (core/kernel/docs/cross-boundary-disclosure.md § Surface inventory,
+            // fault messages).
+            let present = error_code & ERR_PRESENT != 0 && cr2 < crate::mm::user_va_top();
             // SAFETY: tf is the live TrapFrame; the redirect points the TCB at it
             // for the block and returns whether to resume.
             if unsafe { redirect_user_page_fault(tcb, tf, cr2, write, instr, present) }

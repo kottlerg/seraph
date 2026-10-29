@@ -76,6 +76,15 @@ pub struct TrapFrame
     pub sstatus: u64,
 }
 
+// ABI contract: `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` copy this struct
+// as the user register file, whose size and IP/SP offsets `abi/syscall`
+// publishes; userspace edits the frame at those offsets.
+const _: () = {
+    assert!(core::mem::size_of::<TrapFrame>() == syscall::REGS_RISCV64_SIZE);
+    assert!(core::mem::offset_of!(TrapFrame, sepc) == syscall::REGS_RISCV64_IP_OFFSET);
+    assert!(core::mem::offset_of!(TrapFrame, sp) == syscall::REGS_RISCV64_SP_OFFSET);
+};
+
 // ── Syscall / IPC accessors ───────────────────────────────────────────────────
 
 impl TrapFrame
@@ -184,10 +193,18 @@ impl TrapFrame
     }
 
     /// Validate and sanitize a user-supplied register snapshot before it is
-    /// resumed in user mode: reject a non-user `sepc` and clear the
-    /// kernel-internal trap-cause fields. `sstatus` is left as supplied, and
-    /// the `trap_entry` epilogue restores it, so a supplied SPP or SUM bit
-    /// reaches hardware when a fault-blocked thread resumes (#443).
+    /// resumed in user mode: reject a non-user `sepc`, clear the
+    /// kernel-internal trap-cause fields, and replace `sstatus` with the value
+    /// `return_to_user` gives a first entry (SPIE set, every other field clear).
+    ///
+    /// The `trap_entry` epilogue restores `sstatus` from the frame before
+    /// `sret`, and no `sstatus` field is the user's to choose: a supplied SPP
+    /// would `sret` to S-mode at a user `sepc`, SUM or MXR would widen the
+    /// kernel's own access to user pages, and an FS or VS other than Off would
+    /// skip the lazy-restore trap and run the thread on whatever F/V registers
+    /// the hart holds. A thread whose frame is written is switched out, so its
+    /// own FS/VS are already Off and its saved F/V state is restored on first
+    /// use.
     ///
     /// Returns `Err(())` if `sepc` is not a user address; the caller maps this
     /// to `SyscallError::InvalidArgument`.
@@ -207,9 +224,16 @@ impl TrapFrame
         // spurious fault handling on resume.
         self.scause = 0;
         self.stval = 0;
+        self.sstatus = SSTATUS_USER_RESUME;
         Ok(())
     }
 }
+
+/// The `sstatus` a user thread resumes with: SPIE (bit 5) set so `sret`
+/// enables interrupts, SPP (bit 8) clear so it returns to U-mode, and SIE,
+/// SUM, MXR, FS, and VS clear. The value `return_to_user` writes for a first
+/// entry.
+const SSTATUS_USER_RESUME: u64 = 1 << 5;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -231,5 +255,19 @@ mod tests
         assert_eq!(offset_of!(TrapFrame, sepc), 248);
         assert_eq!(offset_of!(TrapFrame, scause), 256);
         assert_eq!(offset_of!(TrapFrame, stval), 264);
+    }
+
+    // Defect caught: a WRITE_REGS frame carrying SPP, SUM, MXR, or a live FS/VS
+    // reaching hardware through the trap epilogue's `sstatus` restore.
+    #[test]
+    fn sanitize_replaces_supplied_sstatus_with_the_user_resume_value()
+    {
+        // SAFETY: TrapFrame is a plain struct of u64 fields; all-zero is valid.
+        let mut tf: TrapFrame = unsafe { core::mem::zeroed() };
+        tf.sepc = 0x1000;
+        // SIE | SPP | SUM | MXR | FS = Dirty | VS = Dirty, SPIE clear.
+        tf.sstatus = (1 << 1) | (1 << 8) | (1 << 18) | (1 << 19) | (0x3 << 13) | (0x3 << 9);
+        assert_eq!(tf.sanitize_for_user_resume(), Ok(()));
+        assert_eq!(tf.sstatus, 1 << 5);
     }
 }

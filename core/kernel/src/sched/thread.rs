@@ -466,8 +466,8 @@ pub struct ThreadControlBlock
     /// Honoured by `select_target_cpu` on enqueue, by the `schedule()`
     /// requeue site for an already-Running thread, and by
     /// `sys_thread_set_affinity` which actively migrates a Ready thread.
-    /// Owned by [`sched_lock`](Self::sched_lock); `sys_thread_set_affinity`'s
-    /// write without it is a known defect (#443).
+    /// Owned by [`sched_lock`](Self::sched_lock), under which
+    /// `sys_thread_set_affinity` writes it.
     pub cpu_affinity: u32,
 
     /// Soft affinity: the CPU this thread was last linked or dispatched on (hint
@@ -767,9 +767,11 @@ pub struct ThreadControlBlock
     /// On context switch, if non-null, this bitmap is copied into the TSS
     /// IOPB region so `in`/`out` instructions work for this thread.
     ///
-    /// No lock owns it: `sys_ioport_bind` writes it while another CPU's
-    /// `schedule()` may read it, a known defect (#443; the Address-space /
-    /// capability row).
+    /// Owned, pointer and bytes, by this TCB's `sched_lock`: `sys_ioport_bind`
+    /// installs and edits it, and `schedule()`'s dispatch flip loads it into a
+    /// TSS, under that lock; `dealloc_object(Thread)` frees it once the thread
+    /// is off every CPU (core/kernel/docs/scheduling-internals.md § Cross-CPU
+    /// TCB Ownership, the Address-space / capability row).
     ///
     // TODO: When the IoPort cap a binding was made through is deleted (including
     // by revocation of an ancestor), the relevant bits must be re-denied in this

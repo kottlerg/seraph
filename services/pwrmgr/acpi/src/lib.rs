@@ -38,7 +38,7 @@ const AML_WORD_PREFIX: u8 = 0x0B;
 #[derive(Debug, PartialEq, Eq)]
 pub struct FadtFields
 {
-    /// I/O port of the PM1a control register block.
+    /// I/O port of the `PM1a` control register block.
     pub pm1a_cnt_blk: u16,
     /// Physical address of the DSDT: `X_DSDT` when the table carries a
     /// non-zero one, else the 32-bit `DSDT` field.

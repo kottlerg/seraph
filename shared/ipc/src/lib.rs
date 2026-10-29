@@ -2037,7 +2037,7 @@ pub mod log_badges
     pub const LOG_BADGE_FIRST_CHILD: u64 = 16;
 }
 
-pub const LOG_LABELS_VERSION: u32 = 1;
+pub const LOG_LABELS_VERSION: u32 = 2;
 /// IPC labels for the system log endpoint's legacy discovery interface
 /// and the one-shot init-logd → real-logd handover.
 ///
@@ -2046,59 +2046,64 @@ pub const LOG_LABELS_VERSION: u32 = 1;
 /// labels are spoken on caps that mediate cap acquisition or state
 /// transfer.
 ///
-/// New std-built spawns post-pivot receive a pre-installed badged
-/// SEND cap in `ProcessInfo.log_send_cap` and never call
-/// [`GET_LOG_CAP`]. The label remains for pre-pivot live writers that
-/// acquired their badged caps under it; the receive handler stays in
-/// init-logd and real-logd until those callers are migrated.
+/// Every process receives a pre-installed badged SEND cap in
+/// `ProcessInfo.log_send_cap` (init derives its own) and never calls
+/// [`GET_LOG_CAP`]; the label is reserved, not served.
 pub mod log_labels
 {
-    /// Legacy discovery: request a freshly-minted badged SEND cap on
-    /// the log endpoint.
+    /// Legacy discovery label, reserved and not served.
     ///
-    /// Wire format: `word(0) = LOG_LABELS_VERSION` (mismatch → reply
-    /// code 3). Reply: one cap (a badged SEND on the log endpoint
-    /// whose badge uniquely identifies this caller) plus
-    /// `word(0) = status` (zero on success). Callers cache the
-    /// returned cap process-globally.
-    ///
-    /// The receiver mints the badge (counter-allocated by init-logd
-    /// or real-logd). Badges are unforgeable identities; display
-    /// names registered later via `STREAM_REGISTER_NAME` are mutable
-    /// labels bound to that identity.
+    /// Formerly requested a freshly minted badged SEND cap on the log
+    /// endpoint (`word(0) = LOG_LABELS_VERSION`). No caller issues it:
+    /// every process's badged cap arrives pre-installed in
+    /// `ProcessInfo.log_send_cap`. Init-logd and real-logd answer it
+    /// with an empty reply carrying no cap, so an out-of-tree caller
+    /// fails closed (see `services/logd/docs/ipc-interface.md`).
     pub const GET_LOG_CAP: u64 = 12;
 
-    /// One-shot handover: real-logd pulls init-logd's captured state.
+    /// Handover drain: real-logd pulls init-logd's captured state.
     ///
-    /// Sent by real-logd on a dedicated handover endpoint that init
-    /// hands it during bootstrap. Init-logd, on receipt, drains any
-    /// pending sends from the log endpoint's queue, then replies with
-    /// one or more chunks carrying:
+    /// Sent by real-logd, one chunk per call, on the single-use SEND cap
+    /// on the master log endpoint that svcmgr mints it for its first
+    /// launch (bootstrap `cap[1]`); init-logd still holds the endpoint's
+    /// RECV and serves every other sender between pulls. The replies
+    /// carry, in order:
     ///
+    /// * A header — the total history-line count and the active slot
+    ///   count.
     /// * The badge table — for every active sender badge init-logd
-    ///   has seen, the `(badge, display_name)` pair.
-    /// * The captured-history ring — all complete lines init-logd has
-    ///   buffered since boot, attributed by badge and timestamped at
-    ///   the original receipt instant.
-    /// * The next-badge counter (init-logd's
-    ///   `INIT_DISCOVERY_NEXT_BADGE` value at the moment of handover)
-    ///   so real-logd's `GET_LOG_CAP` handler can continue the same
-    ///   sequence for any further legacy callers.
+    ///   has seen, the `(badge, display_name)` pair, and again for each
+    ///   slot whose name changed after the table was sent.
+    /// * The captured-history ring — the complete lines init-logd still
+    ///   holds, oldest first, attributed by badge and timestamped at the
+    ///   original receipt instant.
     ///
     /// Wire encoding is documented in
-    /// `services/logd/docs/handover-protocol.md`. The data drain
-    /// (`MORE`/`DONE` chunks) only transfers state; init-logd's thread
-    /// terminates on [`HANDOVER_RELEASE`], not on the `DONE` chunk.
+    /// `services/logd/docs/handover-protocol.md` and defined in
+    /// `logd-codec` (`services/logd/codec`). The data drain (`MORE`/`DONE`
+    /// chunks) only transfers state; init-logd's thread terminates on an
+    /// acknowledged [`HANDOVER_RELEASE`], not on the `DONE` chunk.
     pub const HANDOVER_PULL: u64 = 13;
 
-    /// One-shot terminal release: real-logd tells init-logd to exit.
+    /// Terminal release: real-logd tells init-logd to exit.
     ///
-    /// Sent by real-logd on the same single-use SEND cap, exactly once,
-    /// after its [`HANDOVER_PULL`] drain settles (whether the drain ran
-    /// to `DONE`, aborted on an IPC error, or hit its iteration cap).
-    /// Real-logd retries until the call is acknowledged. Init-logd, on
-    /// receipt, sets its handover-complete flag, replies an empty ack,
-    /// and `sys_thread_exit`s on its next loop iteration.
+    /// Sent by real-logd on the same single-use SEND cap after its
+    /// [`HANDOVER_PULL`] drain settles (whether the drain ran to `DONE`,
+    /// aborted on an IPC error, or hit its iteration cap); a call that
+    /// fails is retried a bounded number of times until one is delivered
+    /// (see `services/logd/docs/handover-protocol.md` § Termination).
+    /// Init-logd replies with a status in the label:
+    ///
+    /// * `RELEASE_ACK` (0) — it sets its handover-complete flag and
+    ///   `sys_thread_exit`s on its next loop iteration.
+    /// * `RELEASE_PENDING` (1) — a display name changed after its slot was
+    ///   sent; init-logd keeps serving, and real-logd drains again with
+    ///   [`HANDOVER_PULL`] before it repeats the release. Init-logd defers
+    ///   a bounded number of times (`MAX_RELEASE_DEFERRALS`) and then
+    ///   acknowledges.
+    ///
+    /// See `services/logd/docs/handover-protocol.md` § Name changes during
+    /// the drain.
     ///
     /// Decoupling termination from the multi-chunk data drain keeps a
     /// dropped data chunk (a kernel IPC rendezvous race on the shared,

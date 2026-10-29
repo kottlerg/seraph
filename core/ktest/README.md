@@ -150,6 +150,8 @@ concurrent notification and queue events.
 | `cap_delegation_chain.rs` | Multi-level rights attenuation and cascaded revocation |
 | `tlb_coherency.rs` | Map/unmap cycles across CPUs to exercise TLB shootdown, then the same with `mem_unmap_reclaim` |
 | `retype_reclaim.rs` | Auto-reclaim invariant for every retypable kernel object |
+| `mem_map_retyped_refused.rs` | `mem_map` refuses, with `InvalidArgument`, the pages a Memory cap has retyped into a `CSpace`, and maps the page past its retype cursor ([docs/capability-model.md § Typed Memory](../../docs/capability-model.md#typed-memory)) |
+| `cspace_nested_teardown.rs` | Deleting the root of a 256-deep chain of nested `CSpace`s, each held only by its predecessor's slot, reclaims every one in bounded kernel stack ([core/kernel/docs/capability-internals.md § Teardown](../kernel/docs/capability-internals.md#teardown)) |
 | `retype_subpage_clobber.rs` | The retype sub-page allocator never dereferences a free-list link clobbered through a userspace mapping of the cap region |
 | `priority_preemption.rs` | Higher-priority runnable thread preempts a CPU-bound lower-priority spinner within a wall-clock budget |
 | `shared_memory_two_aspaces.rs` | One Memory cap mapped into two `AddressSpace` caps; `aspace_query` returns identical phys backing in both |

@@ -92,13 +92,17 @@ fn check(ctx: &TestContext, held: u32) -> TestResult
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     READS.store(0, Ordering::Relaxed);
     let cpus = system_info(SystemInfoType::CpuCount as u64).unwrap_or(1);
-    let started = if cpus >= 2
-    {
-        crate::spawn::configure_and_start_pinned(&child, reader, stack_top, 0, 1)
-    }
-    else
-    {
-        crate::spawn::configure_and_start(&child, reader, stack_top, 0)
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`, on
+    // which no other live thread runs (`ChildStack`'s rule).
+    let started = unsafe {
+        if cpus >= 2
+        {
+            crate::spawn::configure_and_start_pinned(&child, reader, stack_top, 0, 1)
+        }
+        else
+        {
+            crate::spawn::configure_and_start(&child, reader, stack_top, 0)
+        }
     };
     if started.is_err()
     {

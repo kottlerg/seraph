@@ -323,6 +323,7 @@ policy + budget):
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
+[services/svcmgr/endowment/README.md](../endowment/README.md),
 [services/svcmgr/README.md](../README.md),
 [services/svctest/README.md](../../svctest/README.md),
 [shared/registry/README.md](../../../shared/registry/README.md),

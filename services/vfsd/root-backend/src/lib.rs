@@ -70,18 +70,18 @@ const NONE: u32 = u32::MAX;
 #[derive(Copy, Clone)]
 struct TreeNode
 {
-    pub name: [u8; MAX_ENTRY_NAME],
-    pub name_len: u8,
-    pub parent: u32,
-    pub first_child: u32,
-    pub next_sibling: u32,
+    name: [u8; MAX_ENTRY_NAME],
+    name_len: u8,
+    parent: u32,
+    first_child: u32,
+    next_sibling: u32,
     /// Unbadged SEND on the mounted driver's namespace endpoint,
     /// captured at MOUNT time. Non-zero on terminal (mount-point)
     /// nodes, zero on synthetic intermediates. Each `NS_LOOKUP` that
     /// crosses this mount mints a freshly-attenuated badged SEND from
     /// it (see `EntryTarget::External`); the endpoint is held here and
     /// never handed out directly.
-    pub terminal_endpoint: u32,
+    terminal_endpoint: u32,
     /// Badged SEND on the root mount's namespace endpoint addressing
     /// the directory at the path corresponding to this node, used to
     /// forward unmatched `NS_LOOKUP` requests so root-fs entries
@@ -89,8 +89,8 @@ struct TreeNode
     /// such fall-through is available (the path does not exist in the
     /// root filesystem, or the root mount has not been installed yet).
     /// On `NodeId::ROOT` this field carries the root mount cap.
-    pub fallthrough_cap: u32,
-    pub active: bool,
+    fallthrough_cap: u32,
+    active: bool,
 }
 
 impl TreeNode
@@ -129,8 +129,8 @@ pub struct VfsdRootBackend
 /// after walking the root mount component-by-component.
 pub struct InstallResult
 {
-    pub new_intermediates: [u32; MAX_TREE_NODES],
-    pub new_intermediates_len: usize,
+    new_intermediates: [u32; MAX_TREE_NODES],
+    new_intermediates_len: usize,
 }
 
 impl InstallResult
@@ -695,5 +695,123 @@ mod tests
         assert!(b.can_install(b"/a"));
         assert!(b.install(b"/a", CAP).is_some());
         assert!(!b.can_install(b"/a"));
+    }
+
+    /// Pool index of the intermediate `/a` an install of `/a/b` creates.
+    fn intermediate_a(b: &mut VfsdRootBackend) -> u32
+    {
+        let result = b.install(b"/a/b", CAP).expect("install fits");
+        result.as_slice()[0]
+    }
+
+    #[test]
+    fn lookup_of_a_mount_point_crosses_to_the_peer_root()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", CAP).is_some());
+        let view = b.lookup(NodeId::ROOT, b"esp").expect("mount point found");
+        assert_eq!(
+            view.target,
+            EntryTarget::External {
+                endpoint: CAP,
+                node: NodeId::ROOT,
+            }
+        );
+    }
+
+    #[test]
+    fn lookup_of_an_intermediate_stays_on_the_synthetic_root()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        let view = b.lookup(NodeId::ROOT, b"a").expect("intermediate found");
+        assert_eq!(
+            view.target,
+            EntryTarget::Local(NodeId::from_raw_truncated(u64::from(a)))
+        );
+    }
+
+    #[test]
+    fn lookup_of_a_missing_name_is_not_found()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", CAP).is_some());
+        assert_eq!(
+            b.lookup(NodeId::ROOT, b"data").err(),
+            Some(NsError::NotFound)
+        );
+    }
+
+    #[test]
+    fn lookup_in_an_unresolvable_directory_is_not_a_directory()
+    {
+        let mut b = VfsdRootBackend::new();
+        let inactive = NodeId::from_raw_truncated(5);
+        assert_eq!(b.lookup(inactive, b"x").err(), Some(NsError::NotADirectory));
+    }
+
+    #[test]
+    fn readdir_lists_each_child_then_ends()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", CAP).is_some());
+        assert!(b.install(b"/data", CAP).is_some());
+        let mut names = Vec::new();
+        for i in 0..2
+        {
+            let entry = b.readdir_entry(NodeId::ROOT, i).expect("root resolves");
+            names.push(entry.expect("entry present").as_bytes().to_vec());
+        }
+        names.sort();
+        assert_eq!(names, vec![b"data".to_vec(), b"esp".to_vec()]);
+        assert_eq!(b.readdir_entry(NodeId::ROOT, 2), Ok(None));
+    }
+
+    #[test]
+    fn readdir_of_an_unresolvable_directory_is_not_a_directory()
+    {
+        let mut b = VfsdRootBackend::new();
+        let out_of_range = NodeId::from_raw_truncated(MAX_TREE_NODES as u64);
+        assert_eq!(
+            b.readdir_entry(out_of_range, 0),
+            Err(NsError::NotADirectory)
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_out_of_range_and_inactive_nodes()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        assert_eq!(b.resolve(NodeId::from_raw_truncated(u64::from(a))), Some(a));
+        assert_eq!(
+            b.resolve(NodeId::from_raw_truncated(MAX_TREE_NODES as u64)),
+            None
+        );
+        assert_eq!(b.resolve(NodeId::from_raw_truncated(30)), None);
+    }
+
+    #[test]
+    fn path_of_rejects_a_short_buffer_and_an_inactive_node()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        assert_eq!(b.path_of(a, &mut [0u8; 1]), None);
+        assert_eq!(b.path_of(0, &mut []), None);
+        assert_eq!(b.path_of(30, &mut [0u8; 64]), None);
+        let mut buf = [0u8; 64];
+        assert_eq!(b.path_of(0, &mut buf), Some(1));
+        assert_eq!(buf[0], b'/');
+    }
+
+    #[test]
+    fn set_fallthrough_cap_applies_only_to_an_active_node()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        b.set_fallthrough_cap(a, CAP);
+        assert_eq!(b.fallthrough_of(a), CAP);
+        b.set_fallthrough_cap(30, CAP);
+        assert_eq!(b.fallthrough_of(30), 0);
     }
 }

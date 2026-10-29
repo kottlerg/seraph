@@ -2107,10 +2107,12 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         });
         // Full rights so the cap can flow through the donation chain into
         // memmgr's pool (memmgr-issued reply caps must carry RETYPE for
-        // userspace to retype into kernel objects). Loaders (init,
-        // procmgr) map with `MAP_READONLY` for defence-in-depth on the
-        // ELF source — read-only at the page-table level despite the
-        // cap allowing WRITE.
+        // userspace to retype into kernel objects). The loaders (init,
+        // procmgr) never map this cap: each derives a MAP-only child
+        // (`RIGHTS_MEM_MAP`) and maps that with prot 0 (`MAP_READONLY`),
+        // which takes the permissions from the mapped cap's rights, so the
+        // ELF source is read-only at the page-table level because the child
+        // lacks WRITE and EXECUTE.
         let slot = insert_or_fatal(
             cspace,
             MemRights::MAP | MemRights::WRITE | MemRights::EXECUTE | MemRights::RETYPE,

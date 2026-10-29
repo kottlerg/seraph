@@ -18,7 +18,8 @@
 //! Every wrapper is an `unsafe fn` with one contract: `nr` must be a syscall
 //! number the kernel defines, and the remaining arguments must be that call's
 //! arguments, in the order `core/kernel/docs/syscalls.md` gives; a pointer argument must be
-//! valid for the access the call's contract specifies. The kernel ABI's
+//! valid for the access the call's contract specifies. The exception is `syscall3_any`,
+//! which accepts any `nr` and arguments under its own `# Safety`. The kernel ABI's
 //! register clobbers are declared in each wrapper's asm.
 
 #[cfg(target_arch = "x86_64")]

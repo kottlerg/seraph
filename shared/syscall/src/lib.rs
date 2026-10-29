@@ -89,21 +89,28 @@ use arch::current::{
 ///
 /// For harness tests of the kernel's own argument validation, which must hand
 /// it register values no typed wrapper can express (a priority above 255, a
-/// CPU id above `u32::MAX`). Everything else uses the typed wrappers. Every
-/// register the kernel can write on return is declared clobbered, so the call
-/// is sound for any `nr`, including those that return values in argument
-/// registers (`SYS_SCHED_SPLIT`, the IPC calls).
+/// CPU id above `u32::MAX`). Everything else uses the typed wrappers. No
+/// register the kernel can write on return is assumed preserved, including the
+/// argument registers that carry secondary returns (`SYS_SCHED_SPLIT`, the IPC
+/// calls).
 ///
 /// # Safety
-/// The kernel receives the arguments unchecked by this crate: any argument the
-/// syscall treats as a user pointer must name memory valid for the access the
-/// kernel makes through it.
+/// The kernel receives the arguments unchecked by this crate, and the caller
+/// answers for the call's effects on its own memory: any argument the syscall
+/// treats as a user pointer must name memory valid for the access the kernel
+/// makes through it, and the syscall's other memory effects (the registered IPC
+/// buffer the IPC calls read and write, the caller's own mappings and
+/// capabilities a memory or capability call changes) must not invalidate live
+/// Rust data. `nr` need not be a defined syscall: an undefined number returns
+/// `UnknownSyscall` in the primary return register and changes nothing else.
 #[inline]
 #[must_use]
 pub unsafe fn raw_syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 {
-    // SAFETY: caller contract covers the pointer arguments; syscall3_any declares
-    // every register the kernel can write on return as clobbered.
+    // SAFETY: the caller contract covers the pointer arguments and the call's
+    // other memory effects; `syscall3_any` accepts any `nr` and arguments (its
+    // `# Safety`) and declares every register the kernel can write on return as
+    // clobbered.
     unsafe { syscall3_any(nr, a0, a1, a2) }
 }
 

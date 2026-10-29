@@ -109,6 +109,8 @@ pub fn churn_phase(_: &Caps)
         let mut v: Vec<u8> = Vec::with_capacity(size / 2 + 1);
         for b in 0..size
         {
+            // cast_possible_truncation: the mask keeps the low byte, so the
+            // cast to u8 drops nothing.
             #[allow(clippy::cast_possible_truncation)]
             v.push((b & 0xFF) as u8);
         }
@@ -126,6 +128,8 @@ pub fn churn_phase(_: &Caps)
     std::os::seraph::log!("churn phase passed ({ITERS} iters)");
 }
 
+// cast_possible_truncation: every cast to u8 in the phase takes an index
+// masked to its low byte or a counter below 8, so none drops a bit.
 #[allow(clippy::cast_possible_truncation)]
 pub fn alloc_grow_phase(_: &Caps)
 {

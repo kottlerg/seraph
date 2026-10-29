@@ -84,7 +84,7 @@ pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, iters: u32)
     }
 }
 
-/// Benchmark: alternate `mem_protect(MAP_READONLY)` and
+/// Benchmark: alternate `mem_protect(MAP_READ)` (read-only) and
 /// `mem_protect(MAP_WRITABLE)` on a pre-mapped page. Measures the cost of one round-trip permission
 /// flip — relevant for any future mmap-like userspace API.
 pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
@@ -128,13 +128,7 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
         // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
         if unsafe {
-            syscall::mem_protect(
-                memory_cap,
-                ctx.aspace_cap,
-                BENCH_VA,
-                1,
-                syscall::MAP_READONLY,
-            )
+            syscall::mem_protect(memory_cap, ctx.aspace_cap, BENCH_VA, 1, syscall::MAP_READ)
         }
         .is_err()
         {

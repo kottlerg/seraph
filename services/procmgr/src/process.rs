@@ -1182,7 +1182,7 @@ fn segment_prot(seg: &elf::LoadSegment) -> u64
     }
     else
     {
-        syscall::MAP_READONLY
+        syscall::MAP_READ
     }
 }
 
@@ -2155,7 +2155,7 @@ fn stream_segment_bytes(
         };
 
         let Some(mut mapping) =
-            ScratchMapping::map(ctx.self_aspace, memory_cap, 1, syscall::MAP_READONLY)
+            ScratchMapping::map(ctx.self_aspace, memory_cap, 1, syscall::MAP_FROM_CAP)
         else
         {
             let _ = syscall::cap_delete(memory_cap);

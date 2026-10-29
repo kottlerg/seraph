@@ -1495,7 +1495,7 @@ pub mod devmgr_labels
     ///
     /// Reply ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = a derived
     /// **read-only-intended** Memory cap on the ACPI region containing the
-    /// table (the caller maps it `MAP_READONLY`); `data[0]` = region
+    /// table (the caller maps it read-only); `data[0]` = region
     /// physical base, `data[1]` = region size in bytes, `data[2]` = the
     /// table's physical address. The caller maps the region and reads the
     /// table at `table_phys - region_base`. devmgr reads only the

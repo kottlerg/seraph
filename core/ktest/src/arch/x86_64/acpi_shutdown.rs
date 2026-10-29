@@ -167,7 +167,7 @@ fn locate_and_parse_dsdt(info: &InitInfo, dsdt_phys: u64) -> Option<u16>
                 vaddr,
                 0,
                 pages,
-                syscall::MAP_READONLY,
+                syscall::MAP_FROM_CAP,
             )
         }
         .is_err()
@@ -242,7 +242,7 @@ fn find_table_in_acpi_regions(
                 map_vaddr,
                 0,
                 pages,
-                syscall::MAP_READONLY,
+                syscall::MAP_FROM_CAP,
             )
         }
         .is_err()

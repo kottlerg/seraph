@@ -115,7 +115,7 @@ pub fn map_module(module_memory_cap: u32, self_aspace: u32) -> Option<(ScratchMa
     while pages > 0
     {
         if let Some(mut scratch) =
-            ScratchMapping::map(self_aspace, module_ro, pages, syscall::MAP_READONLY)
+            ScratchMapping::map(self_aspace, module_ro, pages, syscall::MAP_FROM_CAP)
         {
             scratch.set_owns_cap(module_ro);
             return Some((scratch, pages));
@@ -309,7 +309,7 @@ pub(crate) unsafe fn load_elf_segment_into_child(
             Some((ro_start, ro_end))
                 if page_vaddr >= ro_start && page_vaddr + PAGE_SIZE <= ro_end =>
             {
-                syscall::MAP_READONLY
+                syscall::MAP_READ
             }
             _ => prot,
         };

@@ -56,4 +56,5 @@ shared/syscall/
 ## Summarized By
 
 [Syscall Interface Specification](../../core/kernel/docs/syscalls.md),
-[Build System](../../docs/build-system.md)
+[Build System](../../docs/build-system.md),
+[runtime/ruststd/README.md](../../runtime/ruststd/README.md)

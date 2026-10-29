@@ -335,12 +335,14 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
 
     // Overwrite instruction pointer to redirect child to phase2_entry.
     let phase2_ptr = phase2_entry as *const () as u64;
-    reg_buf[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&phase2_ptr.to_le_bytes());
+    crate::spawn::redirect_to_entry(&mut reg_buf[..], phase2_ptr);
 
-    // SAFETY: the frame was read from this stopped child, so its stack pointer
-    // stays on the child's own `ChildStack`; its IP is set to `phase2_entry`,
+    // SAFETY: the frame was read from this child, so its stack pointer lies on
+    // the child's own `ChildStack`; `redirect_to_entry` pointed it at `phase2_entry`,
     // an `extern "C"` entry that never returns and needs nothing of the
-    // abandoned frame, so the child resumes on code and a stack it owns.
+    // abandoned frame, with the stack pointer moved down to the entry ABI's
+    // alignment on that same stack, so the child resumes on code and a stack
+    // it owns.
     unsafe { thread_write_regs(child.th, &reg_buf[..BUF_SIZE]) }
         .map_err(|_| "thread_write_regs failed")?;
 
@@ -1577,7 +1579,7 @@ extern "C" fn migrate_spinner_entry(sig_slot: u64) -> !
 /// Entered after the parent rewrites this thread's instruction pointer via
 /// `thread_write_regs`. See the `PHASE2_SIG` doc comment for why the cap is
 /// passed via a static rather than as a register argument.
-fn phase2_entry() -> !
+extern "C" fn phase2_entry(_arg: u64) -> !
 {
     let sig = PHASE2_SIG.load(Ordering::Acquire);
     notification_send(sig, 0x2).ok();

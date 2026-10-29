@@ -68,7 +68,7 @@ use syscall_abi::{
     SystemInfoType,
 };
 
-use crate::arch::{ARG1_OFFSET, IP_OFFSET, SYSCALL_NR_OFFSET};
+use crate::arch::{ARG1_OFFSET, SYSCALL_NR_OFFSET};
 use crate::spawn::SpawnedChild;
 use crate::tally::{BadTally, await_report, log_error};
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -332,13 +332,15 @@ fn edit_and_restart(child: &SpawnedChild, round: u32, regs: &mut [u8; BUF]) -> T
     ROUND.store(round, Ordering::Release);
     KIND.store(kind_of(round + 1), Ordering::Release);
     let target = redirected_entry as *const () as u64;
-    regs[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&target.to_le_bytes());
+    crate::spawn::redirect_to_entry(&mut regs[..], target);
     let token = TOKEN_TAG | u64::from(round);
     regs[ARG1_OFFSET..ARG1_OFFSET + 8].copy_from_slice(&token.to_le_bytes());
-    // SAFETY: the frame was read from this stopped child, so its stack pointer
-    // stays on the child's own `ChildStack`; its IP is set to `redirected_entry`,
+    // SAFETY: the frame was read from this child, so its stack pointer lies on
+    // the child's own `ChildStack`; `redirect_to_entry` pointed it at `redirected_entry`,
     // an `extern "C"` entry that never returns and needs nothing of the
-    // abandoned frame, so the child resumes on code and a stack it owns.
+    // abandoned frame, with the stack pointer moved down to the entry ABI's
+    // alignment on that same stack, so the child resumes on code and a stack
+    // it owns.
     unsafe { thread_write_regs(child.th, &regs[..BUF]) }.map_err(|e| {
         log_error(
             "ktest: integration::write_regs_blocked_syscall thread_write_regs error=",

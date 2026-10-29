@@ -184,6 +184,26 @@ pub unsafe fn configure_and_start_pinned(
     Ok(())
 }
 
+/// Point the register file `regs`, read from a stopped or fault-blocked
+/// child, at the `extern "C"` entry at `entry`: the instruction pointer
+/// becomes `entry` and the stack pointer moves down, on the child's own stack,
+/// to the alignment the entry ABI expects (`arch::entry_stack_pointer`). A
+/// child resumed with the frame then runs `entry` as if called, with the
+/// frame's other registers as its arguments.
+///
+/// Panics if `regs` is shorter than the register file.
+pub fn redirect_to_entry(regs: &mut [u8], entry: u64)
+{
+    use crate::arch::{IP_OFFSET, SP_OFFSET, entry_stack_pointer};
+    let sp = u64::from_le_bytes(
+        regs[SP_OFFSET..SP_OFFSET + 8]
+            .try_into()
+            .unwrap_or([0u8; 8]),
+    );
+    regs[SP_OFFSET..SP_OFFSET + 8].copy_from_slice(&entry_stack_pointer(sp).to_le_bytes());
+    regs[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&entry.to_le_bytes());
+}
+
 /// One `cap_info(CAP_INFO_THREAD_STATE)` on `thread`, decoded into its
 /// `(state, exit_reason)` pair: the `THREAD_STATE_*` code from the high word
 /// and the retained exit reason from the low word, read together under one

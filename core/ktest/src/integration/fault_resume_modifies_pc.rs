@@ -99,11 +99,13 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Redirect the instruction pointer to the recovery routine and resume.
     let recovery_ptr = recovery_child as *const () as u64;
-    reg_buf[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&recovery_ptr.to_le_bytes());
-    // SAFETY: the frame was read from this stopped child, so its stack pointer
-    // stays on the child's own `ChildStack`; its IP is set to `recovery_child`,
+    crate::spawn::redirect_to_entry(&mut reg_buf[..], recovery_ptr);
+    // SAFETY: the frame was read from this child, so its stack pointer lies on
+    // the child's own `ChildStack`; `redirect_to_entry` pointed it at `recovery_child`,
     // an `extern "C"` entry that never returns and needs nothing of the
-    // abandoned frame, so the child resumes on code and a stack it owns.
+    // abandoned frame, with the stack pointer moved down to the entry ABI's
+    // alignment on that same stack, so the child resumes on code and a stack
+    // it owns.
     unsafe { thread_write_regs(child.th, &reg_buf[..BUF]) }
         .map_err(|_| "fault_resume_modifies_pc: thread_write_regs failed")?;
 
@@ -139,7 +141,7 @@ extern "C" fn fault_child(_arg: u64) -> !
 
 /// Recovery routine the handler redirects the faulting thread into. Signals
 /// success through the stashed notification cap.
-fn recovery_child() -> !
+extern "C" fn recovery_child(_arg: u64) -> !
 {
     syscall::notification_send(RECOVERY_SIG.load(Ordering::Acquire), 1).ok();
     loop

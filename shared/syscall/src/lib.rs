@@ -673,8 +673,11 @@ pub fn cap_create_thread(
 /// of the span `[virt, virt + page_count * 4096)` may hold a live Rust object
 /// or the registered IPC buffer page of any of its threads: the call replaces
 /// whatever the span maps, changing those bytes outside the compiler's
-/// knowledge. A call on another address space, or one the kernel refuses,
-/// changes nothing the calling program runs on.
+/// knowledge. A call on another address space changes nothing the calling
+/// program runs on, and neither does a refusal other than `OutOfMemory`: the
+/// kernel checks every argument before it maps a page, but maps page by page
+/// and returns `OutOfMemory` with the pages before the failing one already
+/// mapped, so the contract covers the whole span even for a call that fails.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,
@@ -1092,6 +1095,9 @@ pub fn sched_split(sched_cap: u32, split_at: u8) -> Result<(u32, u32), i64>
 /// `tls_base == 0` (no TLS); use [`thread_configure_with_tls`] when the
 /// thread needs a preset thread-local-storage pointer.
 ///
+/// # Safety
+/// The contract of [`thread_configure_with_tls`], with `tls_base` 0.
+///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` if the thread cap
 /// is invalid, `InsufficientRights` if it lacks Control rights, or
@@ -1099,9 +1105,6 @@ pub fn sched_split(sched_cap: u32, split_at: u8) -> Result<(u32, u32), i64>
 /// above the user VA top, or `stack_ptr`, as passed or after rounding to the
 /// entry ABI's stack alignment, is above it (`core/kernel/docs/arch-interface.md`
 /// § `context` gives each architecture's `align_initial_stack`).
-///
-/// # Safety
-/// The contract of [`thread_configure_with_tls`], with `tls_base` 0.
 #[inline]
 pub unsafe fn thread_configure(
     thread_cap: u32,
@@ -1120,14 +1123,6 @@ pub unsafe fn thread_configure(
 /// `tls_base` is loaded into `IA32_FS_BASE` (x86-64) or `tp` (RISC-V) when
 /// the thread first runs. Pass `0` for a thread that does not use TLS.
 ///
-/// # Errors
-/// Returns a negative `i64` error code: `InvalidCapability` if the thread cap
-/// is invalid, `InsufficientRights` if it lacks Control rights, or
-/// `InvalidArgument` if the thread is not in `Created` state, `entry` or
-/// `tls_base` is at or above the user VA top, or `stack_ptr`, as passed or
-/// after rounding to the entry ABI's stack alignment, is above it (see
-/// [`thread_configure`]).
-///
 /// # Safety
 /// When the thread is bound to the calling program's own address space, the
 /// thread, once started, runs on what these arguments name, so:
@@ -1143,6 +1138,14 @@ pub unsafe fn thread_configure(
 ///
 /// A thread bound to another address space touches none of the calling
 /// program's memory, and a call the kernel refuses configures nothing.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability` if the thread cap
+/// is invalid, `InsufficientRights` if it lacks Control rights, or
+/// `InvalidArgument` if the thread is not in `Created` state, `entry` or
+/// `tls_base` is at or above the user VA top, or `stack_ptr`, as passed or
+/// after rounding to the entry ABI's stack alignment, is above it (see
+/// [`thread_configure`]).
 #[inline]
 pub unsafe fn thread_configure_with_tls(
     thread_cap: u32,

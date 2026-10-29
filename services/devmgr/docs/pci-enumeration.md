@@ -92,7 +92,11 @@ Class-based matching is design intent (#165).
 For each matched device, devmgr:
 
 1. Carves an `Mmio` sub-cap for the device's VirtIO common-config BAR out of
-   the boot-provided MMIO aperture that covers it.
+   the boot-provided MMIO aperture that covers it, spanning the BAR's first
+   `bar_aperture_pages` pages at most (the reach of its VirtIO capability
+   structures). The driver reserves that many pages of VA for the BAR, and
+   `SYS_MMIO_MAP` maps a cap's whole region, so a larger cap would map past
+   the driver's reservation.
 2. Splits a single-IRQ `Interrupt` cap for the device's GSI (its
    firmware-programmed IRQ line, else the arch `INTx` fallback) off devmgr's
    Interrupt range cap.

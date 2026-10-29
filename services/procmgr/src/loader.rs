@@ -83,8 +83,9 @@ impl Drop for ScratchMapping
         {
             let va = range.va_start();
             // SAFETY: the span is this mapping's own reservation; a slice over
-            // it is built by unsafe code from `va()`, whose contract bounds it
-            // by this mapping's lifetime, so none is live in Drop.
+            // it exists only where a `from_raw_parts` call site builds one from
+            // `va()`, and each such site's SAFETY comment bounds the slice by
+            // the mapping's lifetime, so none is live in Drop.
             let _ = unsafe { syscall::mem_unmap(self.self_aspace, va, self.pages) };
             unreserve_pages(range);
         }

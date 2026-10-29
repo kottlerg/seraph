@@ -227,7 +227,7 @@ unsafe fn unmap_range(aspace: u32, vaddr: u64, count: u32)
 
 /// Fixed in-memory header at the start of an SPSC shared region.
 ///
-/// Two atomic indices plus a u32 `capacity` (byte buffer length, must be a
+/// Two atomic indices plus an atomic `capacity` (byte buffer length, must be a
 /// power of two) and a `closed` flag used by pipe peers to signal EOF.
 /// The byte buffer follows immediately after this struct, at offset
 /// [`SpscHeader::SIZE`].
@@ -241,7 +241,11 @@ pub struct SpscHeader
     /// Written by the writer, read by the reader.
     pub tail: AtomicU32,
     /// Capacity of the byte buffer. Power of two.
-    pub capacity: u32,
+    ///
+    /// Atomic because it lies in memory the peer can write: each end reads it
+    /// only to compare against the capacity it mapped (see
+    /// [`SpscWriter::from_raw`]), never to size an access.
+    pub capacity: AtomicU32,
     /// Closer flag: set to 1 (Release) by whichever peer drops first
     /// (writer drop → reader sees EOF; reader drop → writer sees
     /// `BrokenPipe`). Read by the surviving peer (Acquire) after a
@@ -270,7 +274,7 @@ impl SpscHeader
         unsafe {
             (*ptr).head.store(0, Ordering::Relaxed);
             (*ptr).tail.store(0, Ordering::Relaxed);
-            core::ptr::write(&raw mut (*ptr).capacity, capacity);
+            (*ptr).capacity.store(capacity, Ordering::Relaxed);
             (*ptr).closed.store(0, Ordering::Relaxed);
         }
     }
@@ -356,7 +360,7 @@ pub unsafe fn spsc_pair<'a>(
 ///
 /// The capacity comes from the caller, who knows the size it mapped. The
 /// header's `capacity` field lies in memory the peer can write, so it is read
-/// once, volatile, and only compared: it never sizes an access.
+/// once, atomically, and only compared: it never sizes an access.
 ///
 /// # Safety
 /// `region_vaddr` must point at a mapped, readable, 4-byte aligned
@@ -369,8 +373,8 @@ unsafe fn checked_mask(region_vaddr: u64, capacity: u32) -> Option<u32>
     }
     let header = region_vaddr as *const SpscHeader;
     // SAFETY: the caller's contract makes the header readable and aligned;
-    // `&raw const` takes the field's address without forming a reference.
-    let shared = unsafe { core::ptr::read_volatile(&raw const (*header).capacity) };
+    // the field is atomic, so a concurrent peer write is no data race.
+    let shared = unsafe { (*header).capacity.load(Ordering::Acquire) };
     (shared == capacity).then_some(capacity - 1)
 }
 
@@ -527,12 +531,12 @@ mod tests
             header: SpscHeader {
                 head: AtomicU32::new(0),
                 tail: AtomicU32::new(0),
-                capacity: 0,
+                capacity: AtomicU32::new(0),
                 closed: AtomicU32::new(0),
             },
             body: [0; CAP as usize],
         });
-        r.header.capacity = header_capacity;
+        r.header.capacity.store(header_capacity, Ordering::Relaxed);
         r
     }
 

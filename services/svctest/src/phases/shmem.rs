@@ -34,7 +34,7 @@ pub fn shmem_phase(_: &Caps)
         header: SpscHeader {
             head: core::sync::atomic::AtomicU32::new(0),
             tail: core::sync::atomic::AtomicU32::new(0),
-            capacity: CAP as u32,
+            capacity: core::sync::atomic::AtomicU32::new(CAP as u32),
             closed: core::sync::atomic::AtomicU32::new(0),
         },
         body: [0u8; CAP],

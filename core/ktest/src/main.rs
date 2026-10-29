@@ -222,8 +222,12 @@ pub struct TestContext
 /// Each test file that needs a child thread declares its own static stack so
 /// stacks never alias across concurrent (or sequential) test boundaries. A
 /// stack is handed to one thread at a time: a test starts a child on it only
-/// once the stack's previous child has exited (or never started), which is
-/// what `spawn::configure_and_start`'s contract asks of the caller.
+/// once the stack's previous child has exited or never started, which is
+/// what `spawn::configure_and_start`'s contract asks of the caller. Every
+/// test reaps its children before it returns `Ok`; the rule is therefore
+/// guaranteed for the stacks of passing tests only. A test that returns `Err`
+/// early can leave a child alive, and a later reuse of its stack is outside
+/// the rule; ktest's run has then already failed.
 // Field is CPU stack memory; only the hardware stack pointer accesses it, not Rust code.
 #[allow(dead_code)]
 #[repr(align(16))]
@@ -265,7 +269,8 @@ pub(crate) static mut IPC_BUF: IpcBuf = IpcBuf([0u64; 512]);
 /// Declare one per concurrently running child as a `static mut` (or an array
 /// of them), as for [`ChildStack`], and have the child register it with
 /// `ipc_buffer_set` before its first IPC. A page serves one thread at a time:
-/// a child registers it only once the page's previous user has exited.
+/// a child registers it only once the page's previous user has exited, with
+/// the same passing-tests scope as the [`ChildStack`] rule.
 #[repr(C, align(4096))]
 pub struct IpcPage([u64; 512]);
 

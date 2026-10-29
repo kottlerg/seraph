@@ -110,8 +110,9 @@ std::os::seraph::unreserve_pages(range);
 
 `mem_map`, `mem_unmap`, and `mmio_map` are `unsafe fn`: on the caller's own address space they
 change the memory behind a span, so the caller states why no live Rust object or registered IPC
-page lies in it (the `# Safety` sections in `shared/syscall`). A fresh reservation discharges that
-by construction.
+page lies in it (the `# Safety` sections the
+[`shared/syscall` README](../../shared/syscall/README.md) summarizes). A fresh reservation
+discharges that by construction.
 
 Mapping a foreign Memory cap into a retype-backed `AddressSpace` first funds
 that AS's page-table growth budget: `fund_aspace_pt_budget(self_aspace, n)`

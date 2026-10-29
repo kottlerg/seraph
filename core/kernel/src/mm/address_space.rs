@@ -778,6 +778,137 @@ impl AddressSpace
         crate::percpu::preempt_enable();
     }
 
+    /// Unmap each of the `page_count` pages from `virt_base` that still maps
+    /// the matching page of the physical span from `phys_base`, leaving any
+    /// page the user has since unmapped or remapped to other memory in place,
+    /// then invalidate the span's TLB entries on every CPU that runs this
+    /// address space. Returns the number of pages unmapped.
+    ///
+    /// Withdraws a `SYS_MMIO_MAP` mapping when its `Mmio` object is freed
+    /// (`MmioObject::withdraw_mappings`). Intermediate page tables stay, as with
+    /// [`unmap_page`](Self::unmap_page). The span takes one invalidation, per
+    /// page up to `RANGE_FLUSH_CEILING_PAGES` and a full flush above, issued
+    /// after `pt_lock` is released; the unmapped frames are device memory the
+    /// kernel never reallocates, so no reuse waits on the shootdown.
+    ///
+    /// # Safety
+    /// The span `[virt_base, virt_base + page_count * PAGE_SIZE)` must lie in
+    /// the user half and `virt_base` must be page-aligned.
+    #[cfg(not(test))]
+    pub unsafe fn unmap_region_if_phys(
+        &self,
+        virt_base: u64,
+        page_count: usize,
+        phys_base: u64,
+    ) -> usize
+    {
+        use crate::arch::current::paging::{translate_user_page, unmap_user_page};
+        use crate::mm::PAGE_SIZE;
+
+        if page_count == 0
+        {
+            return 0;
+        }
+
+        crate::percpu::preempt_disable();
+        self.pt_lock();
+        let mut unmapped = 0;
+        for i in 0..page_count
+        {
+            let virt = virt_base + (i * PAGE_SIZE) as u64;
+            let phys = phys_base + (i * PAGE_SIZE) as u64;
+            // SAFETY: root_virt is valid; virt is in user range (caller's
+            // contract); pt_lock is held, so the translation and the unmap see
+            // the same entry.
+            unsafe {
+                if translate_user_page(self.root_virt, virt).is_some_and(|(p, _)| p == phys)
+                {
+                    unmap_user_page(self.root_virt, virt);
+                    unmapped += 1;
+                }
+            }
+        }
+        self.pt_unlock();
+        if unmapped != 0
+        {
+            self.invalidate_unmapped_span(virt_base, page_count);
+        }
+        crate::percpu::preempt_enable();
+        unmapped
+    }
+
+    /// Invalidate the TLB entries of `[virt_base, + page_count pages)` on this
+    /// CPU, if it runs this address space, and on every other CPU that does,
+    /// after leaf entries in the span were cleared without freeing a page
+    /// table. Per page up to `RANGE_FLUSH_CEILING_PAGES`, a full flush above.
+    ///
+    /// Must run with preemption disabled.
+    #[cfg(not(test))]
+    fn invalidate_unmapped_span(&self, virt_base: u64, page_count: usize)
+    {
+        use crate::arch::current::paging::{
+            flush_tlb_all, inval_batch_begin, inval_batch_end, inval_page,
+        };
+
+        // Initiator side of the tlb_gen / active_cpus Dekker exclusion, as in
+        // `shootdown_remote` (core/kernel/docs/memory-internals.md § SMP TLB
+        // Shootdown).
+        if crate::mm::tag_allocator::tagging_enabled()
+        {
+            self.tlb_gen.fetch_add(1, Ordering::Release);
+            core::sync::atomic::fence(Ordering::SeqCst);
+        }
+        let ranged = page_count <= crate::mm::tlb_shootdown::RANGE_FLUSH_CEILING_PAGES;
+        let current = crate::arch::current::cpu::current_cpu() as usize;
+        if self.active_cpus.test_cpu(current, Ordering::Acquire)
+        {
+            // SAFETY: ring 0 / S-mode; the per-VA invalidations are bracketed
+            // by the batch window; no page table was freed, so leaf
+            // invalidation suffices.
+            unsafe {
+                if ranged
+                {
+                    inval_batch_begin();
+                    for i in 0..page_count
+                    {
+                        inval_page(virt_base + (i * crate::mm::PAGE_SIZE) as u64);
+                    }
+                    inval_batch_end();
+                }
+                else
+                {
+                    flush_tlb_all();
+                }
+            }
+        }
+        let mut remote = self.active_cpu_mask();
+        remote.clear(current);
+        if remote.is_empty()
+        {
+            return;
+        }
+        // SAFETY: root_phys is a valid root; remote excludes current;
+        // preemption is disabled (contract). Tag 0 is the untagged path, and
+        // the full-flush sentinel ignores the tag, both correct cross-AS (see
+        // the Dekker exclusion above).
+        unsafe {
+            if ranged
+            {
+                crate::mm::tlb_shootdown::shootdown_range(
+                    self.root_phys,
+                    &remote,
+                    virt_base,
+                    page_count as u64,
+                    0,
+                );
+            }
+            else
+            {
+                crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote, u64::MAX, 0);
+            }
+        }
+    }
+
     /// Unmap `page_count` pages from `[virt_base, ..)` and reclaim every
     /// intermediate page table the cleared span leaves empty back to `aso`'s
     /// growth pool (crediting `pt_growth_budget_bytes`). Returns the number of

@@ -57,7 +57,7 @@ pub use syscall_abi::{
     CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
     CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, CAP_TAG_MEMORY,
     EXIT_FAULT_BASE, EXIT_KILLED, EXIT_VOLUNTARY, IPC_REPLY_TRANSFER_FAILED, MAP_EXECUTABLE,
-    MAP_READ, MAP_READONLY, MAP_WRITABLE, MAX_GETRANDOM_LEN, RIGHTS_ALL, RIGHTS_AS_CONTROL,
+    MAP_FROM_CAP, MAP_READ, MAP_WRITABLE, MAX_GETRANDOM_LEN, RIGHTS_ALL, RIGHTS_AS_CONTROL,
     RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_CS_ALL, RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE,
     RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE, RIGHTS_EP_GRANT, RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND,
     RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST, RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE, RIGHTS_IRQ_NOTIFY,
@@ -666,7 +666,10 @@ pub fn cap_create_thread(
 ///   permissions are derived from the Memory cap's rights directly.
 ///
 /// W^X is enforced: WRITE and EXECUTE may not both be set. A page already
-/// mapped in the span is remapped to the new frame.
+/// mapped in the span is remapped to the new frame. The range may not reach
+/// bytes the Memory cap has retyped into kernel objects: it must start at or
+/// above the cap's page-rounded retype cursor (`core/kernel/docs/syscalls.md`
+/// § `SYS_MEM_MAP`).
 ///
 /// # Safety
 /// When `aspace_cap` names the calling program's own address space, no page
@@ -682,7 +685,8 @@ pub fn cap_create_thread(
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,
 /// non-canonical, or the range leaves the user half), `InvalidArgument`
-/// (zero page count, overflow, or the range runs past the memory region),
+/// (zero page count, overflow, the range runs past the memory region, or
+/// `offset_pages` lies below the retype cursor),
 /// `InvalidCapability`, `InsufficientRights` (requested permissions exceed
 /// the cap's rights), `WxViolation`, or `OutOfMemory` (page-table
 /// allocation).
@@ -905,6 +909,16 @@ pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 /// two capability handles: the lower covers `[base, base+split_offset)` and
 /// the upper `[base+split_offset, end)`.
 ///
+/// Consuming the original frees its object, which unmaps every [`mmio_map`]
+/// mapping made through it, with TLB shootdown, before the call returns
+/// (or, when a concurrent syscall still pins the object, when that syscall
+/// releases it); a caller that needs the region mapped maps it again through
+/// a child (`core/kernel/docs/syscalls.md` § `SYS_MMIO_SPLIT`). A mapping in
+/// the caller's own address space is withdrawn although its Rust code may
+/// still reference it; this wrapper stays a safe function, and making it
+/// `unsafe` for that case is recorded on
+/// [#558](https://github.com/kottlerg/seraph/issues/558).
+///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid
 /// (`InvalidCapability`) or lacks Map (`InsufficientRights`), or
@@ -997,7 +1011,10 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 /// values outside that range with `InvalidArgument` before loading the cap.
 /// The original cap is consumed on success; both children inherit the
 /// parent's rights. Returns `(lower_handle, upper_handle)`, two capability
-/// handles.
+/// handles. Consuming the original withdraws every [`ioport_bind`] binding
+/// made through it, from every bound thread on every CPU (the caller
+/// included); bind a child to keep the port access
+/// (`core/kernel/docs/syscalls.md` § `SYS_IOPORT_SPLIT`).
 ///
 /// On RISC-V: always returns `NotSupported`.
 ///
@@ -1214,13 +1231,18 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 ///
 /// Returns the new capability's handle in the destination `CSpace` (slot
 /// index and generation, per docs/capability-model.md § Capability Handle
-/// Format).
+/// Format). The copy of an `Mmio` or `IoPort` capability references a fresh
+/// object over the same range, so mappings and port bindings made through it
+/// are withdrawn when it goes (docs/capability-model.md § Mmio).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
 /// lacks sufficient rights, or the destination `CSpace`'s slot pool cannot
 /// back a fresh slot (`OutOfMemory`; refill it with `cap_create_cspace` in
-/// augment mode; `QuotaExceeded` at the structural ceiling). `InvalidCapability`
+/// augment mode; `QuotaExceeded` at the structural ceiling). For an `Mmio` or
+/// `IoPort` source, `QuotaExceeded` also means its range already has 64 live
+/// copies, and `OutOfMemory` that the kernel's SEED reserve cannot back the
+/// fresh object. `InvalidCapability`
 /// also covers a source a concurrent delete, move, or revoke freed before the
 /// copy was linked; `InvalidState` means a `cap_revoke`, `cap_move`, or IPC
 /// capability transfer is in flight on the source.
@@ -1249,14 +1271,18 @@ pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result
 /// Attenuate a capability within the caller's own `CSpace` (`SYS_CAP_DERIVE`).
 ///
 /// Creates a new slot in the caller's `CSpace` with `rights_mask & src_rights`.
-/// The new slot is a derivation child of the source.
+/// The new slot is a derivation child of the source; for an `Mmio` or `IoPort`
+/// source it references a fresh object over the same range, as for
+/// [`cap_copy`].
 ///
 /// Returns the new capability handle (slot index plus generation).
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid or the
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
-/// structural ceiling). `InvalidCapability` also covers a source a concurrent
+/// structural ceiling), or, for an `Mmio` or `IoPort` source, as for
+/// [`cap_copy`] (`QuotaExceeded` past 64 live copies of the range,
+/// `OutOfMemory` when SEED cannot back the object). `InvalidCapability` also covers a source a concurrent
 /// delete, move, or revoke freed before the new slot was linked;
 /// `InvalidState` means a `cap_revoke`, `cap_move`, or IPC capability
 /// transfer is in flight on the source.
@@ -1284,7 +1310,8 @@ pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid, the badge
 /// is zero, the source already has a badge, or the `CSpace`'s slot pool cannot
-/// back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
+/// back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the structural ceiling),
+/// or, for an `Mmio` or `IoPort` source, as for [`cap_copy`].
 /// `InvalidCapability` also covers a source a concurrent delete, move, or
 /// revoke freed before the new slot was linked; `InvalidState` means a
 /// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
@@ -1318,7 +1345,10 @@ pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u
 /// `AddressSpace` (directly, or through the teardown cascade) stops the
 /// caller: the call never returns (or, when another thread's syscall still
 /// pins the object, returns, and the stop follows when that syscall
-/// releases it). Deleting the caller's own Thread
+/// releases it; likewise when an `Mmio` capability's object records a mapping
+/// into that `AddressSpace`, the stop following when that object is freed).
+/// Deleting an `Mmio` or `IoPort` capability unmaps the mappings and withdraws
+/// the port bindings made through it. Deleting the caller's own Thread
 /// capability is refused instead. A teardown of a Thread left `current` on a
 /// CPU that `fatal` halted, or of a `CSpace` or `AddressSpace` with such a
 /// thread bound, never completes, so the call does not return
@@ -1845,18 +1875,23 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 ///   carries the Write right, and never executable.
 /// - All pages are mapped uncacheable (PCD|PWT on `x86_64`, Svpbmt
 ///   PBMT=IO on `riscv64`).
+/// - The mapping lasts while `mmio_cap` does: deleting it, consuming it with a
+///   split, or revoking an ancestor of it unmaps the mapping
+///   (`core/kernel/docs/syscalls.md` § `SYS_MMIO_MAP`).
+///
+/// # Safety
+/// The contract of [`mem_map`], for the span the MMIO region covers at
+/// `virt`.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned or
 /// non-canonical, or the range leaves the user half), `InvalidCapability`,
 /// `InsufficientRights` (a cap lacks Map), `InvalidArgument` (MMIO region
-/// size zero, unaligned, or overflowing), or `OutOfMemory` (page-table
-/// growth pool exhausted; refill with [`cap_create_aspace`] in augment
-/// mode).
-///
-/// # Safety
-/// The contract of [`mem_map`], for the span the MMIO region covers at
-/// `virt`.
+/// size zero, unaligned, or overflowing), `QuotaExceeded` (the cap's object
+/// already records 4 other mappings), or `OutOfMemory` (page-table growth
+/// pool exhausted; refill with [`cap_create_aspace`] in augment mode). An
+/// `OutOfMemory` failure keeps the mapping's record and the pages already
+/// mapped; a retry at the same `virt` reuses the record.
 #[inline]
 pub unsafe fn mmio_map(aspace_cap: u32, mmio_cap: u32, virt: u64, flags: u64) -> Result<(), i64>
 {
@@ -1880,10 +1915,15 @@ pub unsafe fn mmio_map(aspace_cap: u32, mmio_cap: u32, virt: u64, flags: u64) ->
 ///
 /// On RISC-V this always returns an error (`NotSupported`).
 ///
+/// The binding lasts while `ioport_cap` does: deleting it, consuming it with a
+/// split, or revoking an ancestor of it withdraws the binding
+/// (`core/kernel/docs/syscalls.md` § `SYS_IOPORT_BIND`).
+///
 /// # Errors
 /// Returns a negative `i64` error code: `NotSupported` (RISC-V),
-/// `InvalidCapability`, `InsufficientRights` (a cap lacks Control/Use), or
-/// `OutOfMemory` (IOPB allocation).
+/// `InvalidCapability`, `InsufficientRights` (a cap lacks Control/Use),
+/// `QuotaExceeded` (the thread already records 16 bindings through other
+/// caps), or `OutOfMemory` (binding-table allocation).
 #[inline]
 pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 {

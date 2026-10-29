@@ -242,12 +242,20 @@ fn write_byte(byte: u8)
                 // Copy the decoder out by value (it is `Copy`) so no
                 // reference to the `static mut` is formed, then write it back.
                 let mut decoder = STATE.decoder;
-                let outcome = decoder.push(byte);
+                let mut outcome = decoder.push(byte);
+                if outcome == DecodeOutcome::Truncated
+                {
+                    draw_codepoint(REPLACEMENT_CODEPOINT);
+                    outcome = decoder.push(byte);
+                }
                 STATE.decoder = decoder;
                 match outcome
                 {
                     DecodeOutcome::Codepoint(cp) => draw_codepoint(cp),
-                    DecodeOutcome::Invalid => draw_codepoint(REPLACEMENT_CODEPOINT),
+                    DecodeOutcome::Invalid | DecodeOutcome::Truncated =>
+                    {
+                        draw_codepoint(REPLACEMENT_CODEPOINT);
+                    }
                     DecodeOutcome::NeedMore =>
                     {}
                 }

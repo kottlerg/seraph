@@ -496,7 +496,9 @@ unsafe fn kernel_entry_post_rebase(
         // the BootInfo page is a Phase-7 reclaim range donated to userspace
         // (core/kernel/docs/cross-boundary-disclosure.md § Kernel state in donated
         // memory). All Phase-3 consumers of the two bases have run; later phases
-        // read only layout-free BootInfo fields.
+        // read only layout-free BootInfo fields. Phase 9's reclaim scrub zeroes
+        // the whole page again before init runs; this earlier scrub keeps the
+        // secrets from outliving their last consumer.
         // SAFETY: as above. Volatile stores so the scrub of this donated page
         // cannot be elided as a dead store.
         unsafe {
@@ -621,8 +623,10 @@ unsafe fn kernel_entry_post_rebase(
     entropy::selftest::run(cpu_count as usize);
 
     // With every AP executing at kernel virtual addresses, retire the low-VA
-    // identity mapping at `trampoline_pa` (TLB shootdown), zero the page, and
-    // mint its late-reclaim Memory cap (core/kernel/docs/initialization.md § Phase 8).
+    // identity mapping at `trampoline_pa` (TLB shootdown) and mint its
+    // late-reclaim Memory cap (core/kernel/docs/initialization.md § Phase 8). Its
+    // parameter block, which carried kernel VAs, is zeroed with every other
+    // reclaim range by `cap::scrub_reclaim_ranges` in Phase 9.
     #[cfg(not(test))]
     if trampoline_pa != 0
     {
@@ -632,18 +636,6 @@ unsafe fn kernel_entry_post_rebase(
         // harts during the call (the riscv64 implementation's precondition).
         unsafe {
             mm::paging::unmap_identity_page(trampoline_pa);
-        }
-        // Zero the page before its late-reclaim cap is minted; its parameter
-        // block carried kernel VAs (core/kernel/docs/initialization.md § Phase 8).
-        let page = mm::paging::phys_to_virt(trampoline_pa) as *mut u8;
-        // SAFETY: direct map covers the page; no AP is inside it (the started
-        // count observed above) and its identity mapping is gone. Volatile so
-        // the scrub of a page never read again by the kernel is not elided.
-        unsafe {
-            for i in 0..mm::PAGE_SIZE
-            {
-                core::ptr::write_volatile(page.add(i), 0);
-            }
         }
         // Re-resolve `BootInfo` through the direct physical map; Phase 3 left
         // no identity mapping of it. (Phase 7's `cap::init_capability_system`
@@ -1421,6 +1413,15 @@ unsafe fn kernel_entry_post_rebase(
             (*init_tcb).cspace_id = id;
             (*init_tcb).cspace_epoch = cap::registry_epoch(id);
         }
+
+        // Zero every bootloader reclaim range before init can run: the last
+        // kernel read of the BootInfo page (the framebuffer above) and of the
+        // reclaim array is behind this point, and the caps Phase 7 and 8 minted
+        // over the ranges reach userspace once init is enqueued
+        // (core/kernel/docs/initialization.md § Phase 9).
+        // SAFETY: single-threaded Phase 9; nothing reads a recorded range after
+        // this call, and init is not yet enqueued.
+        unsafe { cap::scrub_reclaim_ranges(boot_info_phys) };
 
         // Enqueue init on the BSP scheduler at INIT_PRIORITY.
         // SAFETY: scheduler initialized in Phase 8. No other thread exists yet,

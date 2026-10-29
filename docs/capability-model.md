@@ -183,10 +183,26 @@ memory-mapped I/O. Rights:
 Without this capability a process cannot map physical addresses — it cannot
 name hardware it has not been granted access to.
 
-Revoking an Mmio capability blocks new `SYS_MMIO_MAP` calls through its descendants but
-does not unmap mappings already established through them; the kernel unmapping every
-mapping made through those descendants on revocation is design intent (not yet
-implemented — `SYS_MMIO_MAP` records no mapping, #457).
+Every Mmio capability references an object of its own: a copy or derivation of one
+(`SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`) references a fresh object over
+the same range, and the object records each `SYS_MMIO_MAP` mapping made through the
+capability. When the capability goes — deleted, consumed by a split, or revoked through an
+ancestor — its object is freed and every mapping made through it is unmapped, with TLB
+shootdown, before the deleting or revoking call returns, unless a concurrent syscall still
+holds the object (any syscall naming the capability pins it), in which case all of its
+mappings are unmapped when that syscall releases it. A page the address space has since
+remapped to other memory is left alone. The revoked capability itself is preserved (see
+[Revocation](#revocation)), so mappings made through it remain. Each recorded mapping holds
+a reference on its address space, so an address space an Mmio capability's object has mapped
+into outlives its own last capability until that Mmio object is freed. A range's copies are
+bounded: at most 64 copies of one boot-minted or split capability's range are live at once,
+and a further copy returns `QuotaExceeded`.
+
+Deleting, revoking, or splitting an Mmio capability whose mapping lies in the caller's own
+address space therefore withdraws memory the caller's code may still reference, as unmapping
+it would; the userspace wrappers for those calls (`cap_delete`, `cap_revoke`, `mmio_split`)
+stay safe functions, and making them `unsafe` for this case is recorded on
+[#558](https://github.com/kottlerg/seraph/issues/558).
 
 ### Thread
 
@@ -228,11 +244,17 @@ port range (see
 port, only to a caller whose badge carries `SHUTDOWN_DEVICE_AUTHORITY`: the seed-only
 `devmgr.shutdown` cap, which pwrmgr alone seeds and svcmgr's `QUERY_ENDPOINT` refuses.
 
-Revoking an IoPort capability is intended to remove port access from every thread
-bound through its descendants (the revoked capability itself is preserved, per
-[Revocation](#revocation)); the kernel tracking bindings and updating each affected
-thread's IOPB in the TSS on revocation is design intent (not yet implemented — `SYS_IOPORT_BIND`
-records no binding and revocation does not withdraw bound IOPB access, #457).
+Every IoPort capability references an object of its own, as for [Mmio](#mmio): a copy or
+derivation references a fresh object over the same range, bounded the same way. Each thread
+records its bindings against the objects they were made through. When an IoPort capability
+goes — deleted, consumed by a split, or revoked through an ancestor — the kernel withdraws
+every binding made through it from every bound thread, rebuilding each thread's I/O
+permission bitmap from the bindings that remain, so a port another live binding grants stays
+permitted. Before the deleting or revoking call returns, every CPU's TSS bitmap is
+invalidated, so a bound thread running on another CPU reloads its current bitmap at its next
+port access and a withdrawn port faults. As for Mmio, while a concurrent syscall holds the
+object, its bindings are withdrawn when that syscall releases it. The revoked capability
+itself is preserved (see [Revocation](#revocation)), so bindings made through it remain.
 
 ### SbiControl (RISC-V only)
 
@@ -355,7 +377,8 @@ source are dropped, never granted.
 
 Capabilities may be derived: a new capability slot is created referencing the same
 underlying object, with equal or fewer rights. The original is retained. Both slots
-now reference the object independently.
+now reference the object independently. An Mmio or IoPort capability is the exception: its
+derivation or copy references a fresh object over the same range (see [Mmio](#mmio)).
 
 The kernel maintains a **derivation tree** tracking parent/child relationships between
 capability slots across all processes, enabling correct revocation.
@@ -513,9 +536,10 @@ invalidates all capabilities derived from the target, in all processes. The targ
 slot itself is preserved — the revoker keeps its own capability and only withdraws
 delegated authority.
 
-After revocation, any process that held a derived capability can no longer use it
-(an established Memory mapping, MMIO mapping, or IoPort binding outlives it; see
-[Memory](#memory), [Mmio](#mmio), and [IoPort](#ioport-x86-64-only)). The target's
+After revocation, any process that held a derived capability can no longer use it.
+MMIO mappings and IoPort bindings made through a revoked descendant are withdrawn (see
+[Mmio](#mmio) and [IoPort](#ioport-x86-64-only)); an established Memory mapping outlives
+it (see [Memory](#memory)). The target's
 kernel object is not destroyed, because the preserved target slot still references it.
 A descendant that references a distinct object, such as a range-split child, frees that
 object when its last reference goes.
@@ -573,7 +597,18 @@ not outlive all references to them.
 Every kernel object's backing storage is accounted to a specific Memory
 capability. There is no ambient kernel pool from which a process can
 draw kernel-object memory; a process can only create kernel objects
-against Memory caps it holds with `Retype` rights.
+against Memory caps it holds with `Retype` rights. The exceptions are
+the objects the kernel carves from its own SEED reserve on a process's
+behalf: range-split children, Mmio and IoPort copies (bounded per range
+lineage, see [Mmio](#mmio)), and per-thread port-binding tables.
+
+A Memory capability cannot map bytes it has retyped into kernel objects. Retype carves a cap's
+region upward from its first byte, so every live kernel object retyped from it lies below its
+retype bump cursor, and `mem_map` refuses any range that starts below that cursor, rounded up to
+a page (the same bound `SYS_MEMORY_SPLIT` applies), so kernel state carved from donated memory
+(slot pages, page tables, wrapper and page-pool record pages) is never reachable through a
+mapping made afterwards. The converse order, a retype into pages the cap already maps, is not
+yet refused ([#577](https://github.com/kottlerg/seraph/issues/577)).
 
 ### Available-bytes ledger
 
@@ -679,8 +714,8 @@ The kernel mints these during Phases 7–9 of
 (Phase 8 mints the late-reclaim cap over the AP trampoline page).
 
 - Memory capabilities for all usable physical memory
-- Mmio capabilities (Map | Write), one per `BootInfo.mmio_apertures` entry, plus one
-  over the kernel console UART on RISC-V
+- Mmio capabilities (Map | Write), one per `BootInfo.mmio_apertures` entry Phase 6 validates,
+  plus one over the kernel console UART on RISC-V
 - One root Interrupt range capability covering every valid IRQ id on the architecture
 - Map-only Memory capabilities over each `AcpiReclaimable` memory-map region, the page
   holding `BootInfo.acpi_rsdp`, and the `BootInfo.device_tree` blob, allowing userspace
@@ -712,7 +747,9 @@ bound to: when the last capability to either object is deleted, every thread bou
 before the object's storage is reclaimed, wherever those threads' own capabilities are held —
 including the deleting thread itself, when it holds that last capability to its own `CSpace` or
 `AddressSpace` (the delete then never returns to it, unless another thread's syscall still pins the
-object, in which case the stop follows when that syscall releases it). The process's resources are
+object, in which case the stop follows when that syscall releases it, or an Mmio capability's object
+records a mapping into that `AddressSpace`, in which case the stop follows when that Mmio object is
+freed; see [Mmio](#mmio)). The process's resources are
 reclaimed as their capability reference counts reach zero; an object another thread's syscall is
 still using is freed only once that syscall is done with it (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)

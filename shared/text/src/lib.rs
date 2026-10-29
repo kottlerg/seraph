@@ -26,7 +26,7 @@
 //! [`Utf8Decoder`] and resolves the same glyph set through
 //! [`render_codepoint`].
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 pub mod cp437;
 pub mod ext;

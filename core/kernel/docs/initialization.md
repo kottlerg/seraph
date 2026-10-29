@@ -148,8 +148,10 @@ has no heap (see Phase 4).
    - Map [0, max RAM address) rounded up to 2 MiB — the top of every Usable, Loaded,
      AcpiReclaimable, and Persistent entry, holes included (boot_protocol::max_ram_address)
      — at direct_map_base() + phys
-   - Use 2 MiB large pages (megapages on RISC-V); 1 GiB gigapages are not used
-   - Permissions: readable, writable, not executable
+   - Use 2 MiB large pages (megapages on RISC-V); 1 GiB gigapages are not used, except that a
+     2 MiB chunk holding an arch kernel MMIO page (xAPIC or I/O APIC on x86-64) is mapped as
+     4 KiB pages, the MMIO pages uncacheable
+   - Permissions: readable, writable, not executable; write-back except those MMIO pages
    direct_map_base() is the runtime KASLR-chosen base from BootInfo — a
    1 GiB-aligned base at or above the paging mode's kernel-half floor
    (0xFFFF800000000000 on x86-64 / Sv48), published by init_paging_mode
@@ -160,8 +162,9 @@ has no heap (see Phase 4).
 5. Map the remaining boot-time windows: a 64 KiB identity window (VA == PA) around the boot
    stack pointer, used until the stack is rebased onto the direct map right after
    activation; the framebuffer at direct_map_base() + phys when it lies above the RAM
-   ceiling; the arch kernel MMIO regions above that ceiling (xAPIC and I/O APIC on x86-64;
-   none on RISC-V); and the AP trampoline page as a 4 KiB RWX identity page, retired in
+   ceiling; the arch kernel MMIO regions above that ceiling, uncacheable (xAPIC and I/O APIC
+   on x86-64; none on RISC-V, whose PLIC and UART take their memory type from the platform
+   PMAs); and the AP trampoline page as a 4 KiB RWX identity page, retired in
    Phase 8. BootInfo and boot modules are not mapped: after activation the kernel reaches
    them through the direct map.
 6. Install the new page table:
@@ -343,6 +346,11 @@ Validates `mmio_apertures` before Phase 7 mints capabilities from it
    - Verify phys_base is page-aligned; skip with warning if not.
    - Verify size > 0 and size is page-aligned; skip with warning if not.
    - Verify phys_base + size does not wrap u64; skip with warning if not.
+   - Reject an entry that intersects a memory-map region of type Usable, Loaded,
+     AcpiReclaimable, or Persistent: skip it with a warning naming the region. A
+     compliant bootloader never emits one (abi/boot-protocol § Contract for a
+     compliant bootloader); an Mmio cap over RAM would let its holder map and
+     write frames outside Memory-cap accounting.
    - Accept at most MAX_MMIO_APERTURES (64) valid entries; any further valid entry is
      dropped and counted.
 5. Emit: "mmio apertures: N validated (M skipped)", or "mmio apertures: N validated
@@ -353,7 +361,7 @@ Validates `mmio_apertures` before Phase 7 mints capabilities from it
 "FATAL: Phase 6: mmio_apertures.entries is null with non-zero count"; an entries slice not
 wholly inside Usable/Loaded memory halts with
 "FATAL: Phase 6: mmio_apertures slice falls outside Usable/Loaded memory". Individual bad
-entries: emit a warning and skip.
+entries (malformed, or intersecting RAM): emit a warning and skip; each counts as skipped.
 
 **Completion criterion:** The validated aperture list is available to
 Phase 7.
@@ -366,7 +374,11 @@ Phase 7.
 1. Reserve init's Phase 9 backing (the InitInfo block and INIT_STACK_PAGES stack frames)
    and seed the kernel page-table pool from the pristine buddy, then drain the remaining
    buddy RAM, seal the buddy, and install SEED_MEMORY over the front SEED_RESERVE_BYTES of
-   the largest drained block (`cap::drain_and_install_seed`)
+   the largest drained block (`cap::drain_and_install_seed`). Every drained extent exposed
+   to userspace (each drained block, and the seed block's tail past the reserve) is zeroed
+   through the direct map before step 3 mints it: free RAM still holds what firmware and
+   the bootloader left there, the UEFI stack among it. The "Phase 7: drained" line reports
+   the time the zeroing took
 2. Boot-retype the root CSpace from SEED_MEMORY (`boot_retype_cspace`, ROOT_CSPACE_INIT_PAGES
    pages: one wrapper page plus a slot-page pool holding at least
    ROOT_CSPACE_INIT_SLOT_CAPACITY = 1536 slots) and register it as CSpace id 0:
@@ -417,6 +429,9 @@ Phase 7.
      to it.
    - Ranges flagged `RECLAIM_FLAG_LATE` are skipped here and minted in
      Phase 8 (see Late-Reclaim below).
+   - The ranges keep their contents here: the kernel reads the `BootInfo` page and
+     the reclaim array through Phase 9, and Phase 9 zeroes every recorded range
+     before init is enqueued (`cap::scrub_reclaim_ranges`).
 5. Record the root CSpace pointer in a global for use in Phase 9
 6. Emit: "capability system initialised, N slots populated"
 ```
@@ -474,9 +489,10 @@ The scratch pages and bundle layout are described in
    a sample from its generator during bringup, and the BSP now checks per-CPU
    independence and basic sanity, printing PASS/FAIL.
 6. Tear down the low-VA identity mapping at the trampoline PA via
-   mm::paging::unmap_identity_page (TLB shootdown to all other CPUs), then
-   zero the page through the direct map: its parameter block carried the
-   AP entry point and idle-stack VAs, which would reveal the layout.
+   mm::paging::unmap_identity_page (TLB shootdown to all other CPUs). The
+   page's parameter block carried the AP entry point and idle-stack VAs,
+   which would reveal the layout; Phase 9 zeroes it with every other
+   reclaim range before init runs.
 7. Mint a late-reclaim Memory cap over the trampoline page via
    cap::mint_late_reclaim_memory_caps; the descriptor lands in
    cspace_layout so init sees the cap through the standard CSpace
@@ -599,8 +615,14 @@ calls `sched::enter()`.
       itself, then patch both slots into InitInfo
    f. cspace: take the root CSpace pointer with `cap::take_root_cspace` (which clears
       ROOT_CSPACE) and store it, with its id and registry epoch, in the init TCB
-6. Enqueue the init TCB on the BSP's run queue at INIT_PRIORITY
-7. Call sched::enter() — does not return:
+6. Zero every `BootInfo.reclaim_ranges` entry, late-flagged ones included, through the
+   direct map (`cap::scrub_reclaim_ranges`), so no page the bootloader wrote reaches init
+   with its contents intact: its transient page tables encode the slid kernel layout. The
+   last kernel read of the `BootInfo` page (the framebuffer geometry for InitInfo in step
+   3c) precedes it. Entries are read by value and the pages holding the reclaim array are
+   zeroed last. Emit: "reclaim scrub: zeroed N pages over M ranges"
+7. Enqueue the init TCB on the BSP's run queue at INIT_PRIORITY
+8. Call sched::enter() — does not return:
    a. Dequeue the highest-priority ready thread (init)
    b. Build an initial user-mode TrapFrame on init's kernel stack:
       rip/sepc=entry_point, rsp/sp=chosen init stack top, cs=USER_CS, ss=USER_DS,
@@ -637,7 +659,9 @@ the reap-time donation of the segment, InitInfo, and stack pages in
 
 **Failure mode:** Allocation failure halts with a diagnostic message identifying the
 failed step. Invalid init_image (zero segment_count or zero entry_point) halts with
-"Phase 9: init image missing or has no entry point".
+"Phase 9: init image missing or has no entry point". A `reclaim_ranges` count above
+`MAX_RECLAIM_RANGES` halts at step 6 with
+"Phase 9: reclaim_ranges count exceeds MAX_RECLAIM_RANGES".
 
 **Completion criterion:** Init is executing in user mode (ring-3 / U-mode).
 
@@ -690,10 +714,10 @@ through its drain until a teardown commits `Exited` over it (see
 | 3 | Kernel page tables + direct map | Halt: BOOT_TABLE_POOL exhausted; direct map would overlap the kernel image window |
 | 4 | Typed-memory cap surface; per-CPU storage | Halt: per-CPU storage allocation failed |
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
-| 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; bad entries skipped, entries beyond MAX_MMIO_APERTURES dropped |
+| 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped, entries beyond MAX_MMIO_APERTURES dropped |
 | 7 | Capability system + root CSpace | Halt: OOM |
 | 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace). A started CPU that never announces itself, or an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window), leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged); an entropy self-test FAIL is printed and the boot continues |
-| 9 | Init creation + scheduler entry (user mode) | Halt: invalid InitImage or OOM |
+| 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 
 ---
 

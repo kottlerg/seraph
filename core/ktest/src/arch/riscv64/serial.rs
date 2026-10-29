@@ -10,7 +10,7 @@
 use init_protocol::{CapType, InitInfo};
 
 /// QEMU virt UART physical address.
-const UART_PHYS: u64 = 0x1000_0000;
+pub const UART_PHYS: u64 = 0x1000_0000;
 
 /// Virtual address where the UART MMIO page is mapped.
 ///

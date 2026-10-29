@@ -801,7 +801,7 @@ fn read_xsdt_phys(caps: &caps::DevmgrCaps) -> Option<u64>
             va,
             0,
             1,
-            syscall_abi::MAP_READONLY,
+            syscall_abi::MAP_FROM_CAP,
         )
     };
     if mapped.is_err()
@@ -844,7 +844,7 @@ fn read_xsdt_entries(caps: &caps::DevmgrCaps, xsdt_phys: u64) -> Option<std::vec
             va,
             0,
             map_pages,
-            syscall_abi::MAP_READONLY,
+            syscall_abi::MAP_FROM_CAP,
         )
     };
     if mapped.is_err()
@@ -893,7 +893,7 @@ fn read_mcfg_at(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<firmware::Ecam
             va,
             0,
             map_pages,
-            syscall_abi::MAP_READONLY,
+            syscall_abi::MAP_FROM_CAP,
         )
     };
     if mapped.is_err()
@@ -938,7 +938,7 @@ fn discover_ecam_dtb(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
             va,
             0,
             map_pages,
-            syscall_abi::MAP_READONLY,
+            syscall_abi::MAP_FROM_CAP,
         )
     };
     if mapped.is_err()
@@ -997,7 +997,7 @@ fn with_acpi_table<R>(
             va,
             0,
             map_pages,
-            syscall_abi::MAP_READONLY,
+            syscall_abi::MAP_FROM_CAP,
         )
     };
     if mapped.is_err()
@@ -1646,8 +1646,12 @@ fn spawn_virtio_input_from_disk(
 ) -> Option<u32>
 {
     let requested_rights = u64::from(namespace_protocol::rights::READ);
-    let Some(walked) =
+    // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
+    // registered at startup), passed down unchanged.
+    let walked = unsafe {
         ns_client::walk_to_file(drivers_dir_cap, b"virtio-input", requested_rights, ipc_buf)
+    };
+    let Some(walked) = walked
     else
     {
         std::os::seraph::log!("virtio-input: walk_to_file failed (binary missing on rootfs)");
@@ -1930,12 +1934,16 @@ fn spawn_rtc_from_disk(
     // /services/drivers/ subtree, so the namespace server will only ever
     // mint a file cap with at most those bits set.
     let requested_rights = u64::from(namespace_protocol::rights::READ);
-    let Some(walked) = ns_client::walk_to_file(
-        drivers_dir_cap,
-        arch::current::RTC_DRIVER_NAME,
-        requested_rights,
-        ipc_buf,
-    )
+    // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
+    // registered at startup), passed down unchanged.
+    let Some(walked) = (unsafe {
+        ns_client::walk_to_file(
+            drivers_dir_cap,
+            arch::current::RTC_DRIVER_NAME,
+            requested_rights,
+            ipc_buf,
+        )
+    })
     else
     {
         std::os::seraph::log!("rtc: walk_to_file failed (binary missing on rootfs)");
@@ -2009,8 +2017,11 @@ fn test_spawn_orphan(
     const QUERY_BADGE: u64 = 0x7E57;
 
     let requested_rights = u64::from(namespace_protocol::rights::READ);
-    let walked =
-        ns_client::walk_to_file(drivers_dir_cap, b"test-orphan", requested_rights, ipc_buf)?;
+    // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
+    // registered at startup), passed down unchanged.
+    let walked = unsafe {
+        ns_client::walk_to_file(drivers_dir_cap, b"test-orphan", requested_rights, ipc_buf)
+    }?;
 
     // Throwaway service + hw endpoints handed to the child in round 1. Ownership
     // of `hw_cap` transfers to `spawn_simple_device` (moved into the child or

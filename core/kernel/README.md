@@ -80,6 +80,7 @@ core/kernel/
 │   │   ├── cspace.rs           # CSpace: slot storage, lookup, growth
 │   │   ├── slot.rs             # Capability slot representation and rights
 │   │   ├── derivation.rs       # Derivation tree, revocation algorithm
+│   │   ├── ioport_bindings.rs  # Per-thread I/O-port binding table and its withdrawal
 │   │   ├── object.rs           # Kernel object headers and wrappers, page pools, teardown
 │   │   ├── retype.rs           # Memory-cap retype allocator (object carving)
 │   │   ├── split.rs            # Shared tail of the range-cap split syscalls
@@ -160,7 +161,9 @@ The capability subsystem. `cspace.rs` implements per-process capability spaces.
 `slot.rs` defines the in-memory representation of a capability slot and its rights
 bitmask. `derivation.rs` maintains the global derivation tree used for revocation.
 `object.rs` defines the kernel object headers and wrappers, the page pools that back
-address-space page tables and CSpace slot pages, and their allocation and teardown;
+address-space page tables and CSpace slot pages, and their allocation and teardown, including
+the withdrawal of the MMIO mappings an Mmio object records; `ioport_bindings.rs` records each
+thread's I/O-port bindings and withdraws those made through a freed IoPort object;
 `retype.rs` is the allocator that carves kernel objects out of Memory-cap
 backing; `split.rs` is the tail shared by the range-capability split syscalls;
 `transfer.rs` moves a capability, with its derived children, to another slot in
@@ -207,9 +210,8 @@ See [`docs/syscalls.md`](docs/syscalls.md). The audit classifying
 every cross-boundary output (syscall, IPC, fault, exit) for kernel-virtual-address
 disclosure is in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md);
 it records the open disclosures: the exposures through
-donated memory, bootloader-reclaimed frames, and mirrored console output
-([#433](https://github.com/kottlerg/seraph/issues/433),
-[#439](https://github.com/kottlerg/seraph/issues/439),
+donated memory and mirrored console output
+([#577](https://github.com/kottlerg/seraph/issues/577),
 [#440](https://github.com/kottlerg/seraph/issues/440)).
 
 ---

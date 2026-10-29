@@ -110,6 +110,7 @@ mirroring the kernel's own source layout.
 | `sysinfo.rs` | `SYS_SYSTEM_INFO` |
 | `crypto.rs` | Shared `crypto` crate known-answer tests (SHA-512, Ed25519 verify) run on-target (not a syscall surface) |
 | `init_layout.rs` | Kernel init-bootstrap ASLR draws: the `InitInfo` VA, init stack, and PIE image base lie in their windows |
+| `boot_reclaim.rs` | Every reclaimable Memory cap over a bootloader reclaim range (page-table frames, `BootInfo`, descriptor arrays, bundle non-module pages, AP trampoline) reads as zero through `SYS_MEM_MAP`, a single-page cap among them, and so does every frame-pool frame of drained RAM (not a syscall surface; runs first) |
 
 Adding a new syscall means adding a section in the appropriate file here.
 
@@ -150,6 +151,10 @@ concurrent notification and queue events.
 | `cap_delegation_chain.rs` | Multi-level rights attenuation and cascaded revocation |
 | `tlb_coherency.rs` | Map/unmap cycles across CPUs to exercise TLB shootdown, then the same with `mem_unmap_reclaim` |
 | `retype_reclaim.rs` | Auto-reclaim invariant for every retypable kernel object |
+| `mmio_revoke_unmaps.rs` | Revoking an `Mmio` cap unmaps, with TLB shootdown, the mapping made through its descendant while a reader on another CPU uses it; the reader's next load faults ([docs/capability-model.md § Mmio](../../docs/capability-model.md#mmio)) |
+| `range_copy_lineage.rs` | A range-capability lineage root (an `IoPort` split on x86-64, an `Mmio` split on riscv64) admits exactly 64 live copies, derived from it or from a copy; deleting the root keeps the copies counted, and deleting a copy frees its place ([core/kernel/docs/capability-internals.md § Copies and Lineages](../kernel/docs/capability-internals.md#copies-and-lineages)) |
+| `mem_map_retyped_refused.rs` | `mem_map` refuses, with `InvalidArgument`, the pages a Memory cap has retyped into a `CSpace`, and maps the page past its retype cursor ([docs/capability-model.md § Typed Memory](../../docs/capability-model.md#typed-memory)) |
+| `cspace_nested_teardown.rs` | Deleting the root of a 256-deep chain of nested `CSpace`s, each held only by its predecessor's slot, reclaims every one in bounded kernel stack ([core/kernel/docs/capability-internals.md § Teardown](../kernel/docs/capability-internals.md#teardown)) |
 | `retype_subpage_clobber.rs` | The retype sub-page allocator never dereferences a free-list link clobbered through a userspace mapping of the cap region |
 | `priority_preemption.rs` | Higher-priority runnable thread preempts a CPU-bound lower-priority spinner within a wall-clock budget |
 | `shared_memory_two_aspaces.rs` | One Memory cap mapped into two `AddressSpace` caps; `aspace_query` returns identical phys backing in both |
@@ -175,7 +180,9 @@ a SYSCALL, and that a syscall made with AC set completes its user copy and retur
 left AC set in ring 0); `src/arch/x86_64/page_fault_present_bit.rs` checks that a fault handler's
 `#PF` message carries `FAULT_ACCESS_PRESENT` for a store to a read-only user page and never for a
 load from the top GiB of the kernel image window (the lower GiB can hold direct-map leaves the
-kernel's spurious-fault walk misreads, #563). On RISC-V, `src/arch/riscv64/sbi_gating.rs` checks
+kernel's spurious-fault walk misreads, #563); `src/arch/x86_64/ioport_revoke.rs` checks that
+revoking an `IoPort` cap withdraws the port access bound through its descendant from a reader on
+another CPU, whose next port read raises `#GP`. On RISC-V, `src/arch/riscv64/sbi_gating.rs` checks
 that `SYS_SBI_CALL` refuses kernel-reserved SBI extensions and sanctioned ones the cap lacks the
 right for.
 
@@ -236,7 +243,8 @@ event and memory polls of `integration::fault_kills_thread`,
 `integration::fault_exception_no_handler_kills`, `integration::fault_handler_declines_kills`,
 `integration::aspace_fault_notification_late_bind`, `integration::death_notification_late_bind`,
 `integration::reply_binding_displaced`, `integration::syscall_rflags_hardening`,
-`integration::page_fault_present_bit`, `cap::cspace_self_delete_stops_caller` and
+`integration::page_fault_present_bit`, `integration::mmio_revoke_unmaps`,
+`integration::ioport_revoke`, `cap::cspace_self_delete_stops_caller` and
 `retype::aspace_self_delete_stops_caller`; the phase polls, the child's spin bound and the cleanup
 exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and is stretched so its
 `cap_delete` does not race a still-running pinned child); the migration polls of
@@ -323,7 +331,7 @@ thread,event,wait_set,tlb}.rs`). Benchmarks log min/mean/max cycle counts
 | `notification_roundtrip` | Notification ping-pong between two threads, per-iteration |
 | `cap_create_delete` | `cap_create_notification` + `cap_delete` cycle |
 | `mem_map_unmap` | `mem_map` + `mem_unmap` cycle |
-| `mem_protect_pair` | `mem_protect(READONLY)` + `mem_protect(WRITABLE)` round trip |
+| `mem_protect_pair` | `mem_protect(READ)` + `mem_protect(WRITABLE)` round trip |
 | `thread_lifecycle` | Full thread create → start → exit → cleanup |
 | `context_switch` | Parent/child `thread_yield` ping-pong on one CPU; reports cycles per switch |
 | `event_post_recv` | `event_post` + `event_recv` on a pre-created queue |

@@ -38,6 +38,7 @@ use alloc::boxed::Box;
 
 pub mod cspace;
 pub mod derivation;
+pub mod ioport_bindings;
 pub mod object;
 pub mod retype;
 pub mod slot;
@@ -778,8 +779,10 @@ pub(crate) fn init_stack_phys(i: usize) -> u64
 
 /// Drain user-cap RAM from the buddy and install [`SEED_MEMORY`] over the
 /// largest drained block, reserving its first [`SEED_RESERVE_BYTES`] for
-/// kernel-internal cap-identity storage. Returns the per-block
-/// (base, size) records ready for `populate_cspace` to mint Memory caps.
+/// kernel-internal cap-identity storage. Zeroes every user-exposed extent
+/// (each drained block, and the seed block's tail past the reserve) through the
+/// direct map, and returns the per-block (base, size) records ready for
+/// `populate_cspace` to mint Memory caps.
 ///
 /// Before draining, reserves init's Phase-9 backing (the `InitInfo` block and
 /// user stack) and seeds [`crate::mm::kernel_pt_pool`] from the pristine buddy,
@@ -863,11 +866,12 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
     unsafe { install_seed_memory(seed_block_base) };
 
     let mut drained_pages: usize = 0;
+    let zero_start_us = crate::arch::current::timer::elapsed_us().unwrap_or(0);
     for (i, &(addr, order)) in order_buf[..block_count].iter().enumerate()
     {
         let block_size = (BUDDY_PAGE_SIZE << order) as u64;
         drained_pages += 1usize << order;
-        out[i] = if i == seed_idx
+        let (base, size) = if i == seed_idx
         {
             // Seed-tail: front SEED_RESERVE_BYTES go to the SEED's pool
             // (kernel-internal); the remainder is exposed as a virgin RAM
@@ -881,7 +885,20 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
         {
             (addr, block_size)
         };
+        // Zero the user-exposed extent before it is minted: free RAM still
+        // holds whatever firmware and the bootloader left in it, the UEFI
+        // stack with the slid kernel layout among it
+        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel state in
+        // donated memory).
+        // SAFETY: the extent is a free buddy block (or the seed block's tail)
+        // just drained, so nothing references it; the direct map covers all
+        // RAM since Phase 3; single-threaded Phase 7.
+        unsafe { core::ptr::write_bytes(phys_to_virt(base) as *mut u8, 0, size as usize) };
+        out[i] = (base, size);
     }
+    let zero_us = crate::arch::current::timer::elapsed_us()
+        .unwrap_or(0)
+        .saturating_sub(zero_start_us);
 
     // Coalesce physically-adjacent drained blocks into the fewest contiguous
     // extents so the per-block Memory-cap / CapDescriptor fan-out tracks
@@ -891,10 +908,11 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
     let coalesced = coalesce_ram_blocks(&mut out[..block_count]);
 
     crate::kprintln!(
-        "Phase 7: drained {} pages across {} blocks, coalesced to {} contiguous \
-         regions; seed reserve {} KiB",
+        "Phase 7: drained {} pages across {} blocks (zeroed in {} us), coalesced to {} \
+         contiguous regions; seed reserve {} KiB",
         drained_pages,
         block_count,
+        zero_us,
         coalesced,
         SEED_RESERVE_BYTES / 1024,
     );
@@ -1642,13 +1660,7 @@ fn populate_cspace(
 
     if let Some((uart_base, uart_size)) = crate::arch::current::platform::console_mmio()
     {
-        let ptr = mint_phase7_body(MmioObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::Mmio, seed_header_nn()),
-            base: uart_base,
-            size: uart_size,
-            flags: 0,
-            _pad: 0,
-        });
+        let ptr = mint_phase7_body(MmioObject::new_root(uart_base, uart_size, 0));
         let slot = insert_or_fatal(
             cspace,
             MmioRights::MAP | MmioRights::WRITE,
@@ -1674,13 +1686,7 @@ fn populate_cspace(
 
     for ap in mmio_apertures
     {
-        let ptr = mint_phase7_body(MmioObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::Mmio, seed_header_nn()),
-            base: ap.phys_base,
-            size: ap.size,
-            flags: 0,
-            _pad: 0,
-        });
+        let ptr = mint_phase7_body(MmioObject::new_root(ap.phys_base, ap.size, 0));
         let slot = insert_or_fatal(
             cspace,
             MmioRights::MAP | MmioRights::WRITE,
@@ -1920,12 +1926,8 @@ fn populate_cspace(
     // subdivides and delegates sub-ranges to services as needed.
     if crate::arch::current::HAS_IO_PORTS
     {
-        let ptr = mint_phase7_body(IoPortObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::IoPort, seed_header_nn()),
-            base: 0,
-            size: 0, // 0 means 0x10000 (full range; u16 cannot hold 65536)
-            _pad: 0,
-        });
+        // Size 0 means 0x10000 (the full range; u16 cannot hold 65536).
+        let ptr = mint_phase7_body(IoPortObject::new_root(0, 0));
         let ioport_root_slot = insert_or_fatal(
             cspace,
             IoPortRights::USE,
@@ -2110,7 +2112,7 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         // memmgr's pool (memmgr-issued reply caps must carry RETYPE for
         // userspace to retype into kernel objects). The loaders (init,
         // procmgr) never map this cap: each derives a MAP-only child
-        // (`RIGHTS_MEM_MAP`) and maps that with prot 0 (`MAP_READONLY`),
+        // (`RIGHTS_MEM_MAP`) and maps that with prot 0 (`MAP_FROM_CAP`),
         // which takes the permissions from the mapped cap's rights, so the
         // ELF source is read-only at the page-table level because the child
         // lacks WRITE and EXECUTE.
@@ -2173,8 +2175,9 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 /// today).
 ///
 /// Symmetric to [`mint_module_memory_caps`]; runs immediately after it.
-/// The kernel MUST NOT dereference any address inside a recorded
-/// non-late range after this function returns.
+/// The minted pages keep their contents until [`scrub_reclaim_ranges`]
+/// zeroes every recorded range in Phase 9, before init can run; the kernel
+/// MUST NOT dereference an address inside a recorded range after that scrub.
 ///
 /// Appends one [`CapDescriptor`] entry per reclaimed range; init walks
 /// the descriptor table to discover the caps. There is no dedicated
@@ -2217,6 +2220,11 @@ pub(crate) fn mint_late_reclaim_memory_caps(
 /// clear, `true` mints only entries with the LATE flag set. `label`
 /// prefixes the diagnostic line so the two passes are distinguishable
 /// in the boot log.
+///
+/// The pass mints over the ranges as the bootloader left them; the kernel
+/// still reads the `BootInfo` page and the reclaim array through Phase 9, so
+/// the contents are cleared later, by [`scrub_reclaim_ranges`] right before
+/// init is enqueued, not here.
 // Linear Phase-7 sequence: per-range overlap check, owned-range
 // registration, MemoryObject mint, descriptor push. The debug-only
 // overlap assertion adds ~25 lines without a natural extraction point.
@@ -2385,6 +2393,167 @@ fn mint_reclaim_pass(
     let _ = (total_before, pages_total, label);
 }
 
+/// Pages the reclaim array can span: at most [`boot_protocol::MAX_RECLAIM_RANGES`]
+/// entries fill one page, and an array whose base is not page-aligned reaches
+/// into one more.
+#[cfg(not(test))]
+const RECLAIM_ARRAY_MAX_SPAN_PAGES: usize = (boot_protocol::MAX_RECLAIM_RANGES
+    * core::mem::size_of::<boot_protocol::ReclaimRange>())
+.div_ceil(crate::mm::PAGE_SIZE)
+    + 1;
+
+/// Zero every range `BootInfo.reclaim_ranges` records, late-flagged entries
+/// included, through the direct map, so no page the bootloader wrote (its
+/// transient page tables, which encode the slid kernel layout, the `BootInfo`
+/// page, the descriptor arrays, the bundle's non-module pages, and the AP
+/// trampoline page) reaches userspace with its contents intact
+/// (`core/kernel/docs/cross-boundary-disclosure.md` § Kernel state in donated
+/// memory).
+///
+/// The slice header is read by value from the `BootInfo` page and each entry
+/// by value from the reclaim array, so no reference into a page outlives the
+/// read that precedes its zeroing; the pages holding the reclaim array are
+/// zeroed last, after every entry has been read. Calls [`crate::fatal`] when
+/// the entry count exceeds [`boot_protocol::MAX_RECLAIM_RANGES`], the bound
+/// the one-page reclaim array sets.
+///
+/// # Safety
+/// Single-threaded Phase 9, after the last kernel read of the `BootInfo`
+/// page and of every recorded range, and before init is enqueued: nothing
+/// reads a recorded range after this call, and no userspace thread can yet
+/// reach the caps minted over them. `boot_info_phys` was validated in
+/// Phase 0; the direct map covers all RAM since Phase 3.
+#[cfg(not(test))]
+pub(crate) unsafe fn scrub_reclaim_ranges(boot_info_phys: u64)
+{
+    use boot_protocol::{MAX_RECLAIM_RANGES, ReclaimRange};
+
+    let page = crate::mm::PAGE_SIZE as u64;
+    let info = phys_to_virt(boot_info_phys) as *const BootInfo;
+    // SAFETY: the BootInfo page is mapped through the direct map (caller
+    // contract); the slice header is copied out and no reference is formed.
+    let slice = unsafe { core::ptr::addr_of!((*info).reclaim_ranges).read() };
+    let count = slice.count as usize;
+    if count == 0 || slice.entries.is_null()
+    {
+        return;
+    }
+    if count > MAX_RECLAIM_RANGES
+    {
+        crate::fatal("Phase 9: reclaim_ranges count exceeds MAX_RECLAIM_RANGES");
+    }
+
+    let array_phys = slice.entries as u64;
+    let span_lo = array_phys & !(page - 1);
+    let span_hi =
+        (array_phys + (count * core::mem::size_of::<ReclaimRange>()) as u64).next_multiple_of(page);
+    let mut span_covered = [false; RECLAIM_ARRAY_MAX_SPAN_PAGES];
+    let entries = phys_to_virt(array_phys) as *const ReclaimRange;
+    let mut pages: u64 = 0;
+
+    for i in 0..count
+    {
+        // SAFETY: i < count, within the bootloader-recorded array, which the
+        // loop never zeroes (pages of [span_lo, span_hi) are deferred below).
+        let range = unsafe { entries.add(i).read_unaligned() };
+        // SAFETY: a recorded range, which nothing reads after this call
+        // (caller contract).
+        pages += unsafe { scrub_outside_span(range, span_lo, span_hi, &mut span_covered) };
+    }
+
+    // SAFETY: every entry was read in the loop above, so nothing reads the
+    // reclaim array's pages again.
+    unsafe { zero_covered_span_pages(span_lo, span_covered) };
+
+    crate::kprintln!("reclaim scrub: zeroed {pages} pages over {count} ranges");
+}
+
+/// Zero the pages of one reclaim `range` that lie outside the reclaim-array
+/// span `[span_lo, span_hi)`, mark the span pages it covers in
+/// `span_covered` (indexed from `span_lo`) for [`zero_covered_span_pages`],
+/// and return its page count.
+///
+/// # Safety
+/// `range` is a recorded reclaim range that nothing reads afterwards, and the
+/// span is at most `span_covered.len()` pages.
+#[cfg(not(test))]
+unsafe fn scrub_outside_span(
+    range: boot_protocol::ReclaimRange,
+    span_lo: u64,
+    span_hi: u64,
+    span_covered: &mut [bool; RECLAIM_ARRAY_MAX_SPAN_PAGES],
+) -> u64
+{
+    let page = crate::mm::PAGE_SIZE as u64;
+    if range.page_count == 0
+    {
+        return 0;
+    }
+    let lo = range.phys_base & !(page - 1);
+    let hi = lo + u64::from(range.page_count) * page;
+    let (outside, inside) = split_around_span(lo, hi, span_lo, span_hi);
+    for (start, end) in outside
+    {
+        // SAFETY: part of `range` (caller contract), disjoint from the span.
+        unsafe { zero_phys(start, end - start) };
+    }
+    let mut p = inside.0;
+    while p < inside.1
+    {
+        span_covered[((p - span_lo) / page) as usize] = true;
+        p += page;
+    }
+    u64::from(range.page_count)
+}
+
+/// Zero each reclaim-array span page, from `span_lo`, that `span_covered`
+/// marks as recorded.
+///
+/// # Safety
+/// No reclaim entry is read after this call.
+#[cfg(not(test))]
+unsafe fn zero_covered_span_pages(span_lo: u64, span_covered: [bool; RECLAIM_ARRAY_MAX_SPAN_PAGES])
+{
+    let page = crate::mm::PAGE_SIZE as u64;
+    for (k, covered) in span_covered.into_iter().enumerate()
+    {
+        if covered
+        {
+            // SAFETY: a recorded page of the reclaim array (caller contract).
+            unsafe { zero_phys(span_lo + k as u64 * page, page) };
+        }
+    }
+}
+
+/// Split the page range `[lo, hi)` around the span `[span_lo, span_hi)`:
+/// returns the parts below and above the span (each possibly empty) and the
+/// part inside it (possibly empty, as `start >= end`).
+fn split_around_span(lo: u64, hi: u64, span_lo: u64, span_hi: u64)
+-> ([(u64, u64); 2], (u64, u64))
+{
+    let below = (lo, hi.min(span_lo).max(lo));
+    let above = (lo.max(span_hi).min(hi), hi);
+    let inside = (lo.max(span_lo), hi.min(span_hi));
+    let inside = if inside.0 < inside.1 { inside } else { (0, 0) };
+    ([below, above], inside)
+}
+
+/// Zero `len` bytes of physical memory at `base` through the direct map.
+///
+/// # Safety
+/// `[base, base + len)` is RAM the direct map covers, and nothing holds a
+/// reference into it.
+#[cfg(not(test))]
+unsafe fn zero_phys(base: u64, len: u64)
+{
+    if len == 0
+    {
+        return;
+    }
+    // SAFETY: per the function's contract.
+    unsafe { core::ptr::write_bytes(phys_to_virt(base) as *mut u8, 0, len as usize) };
+}
+
 /// Cast `Box<T>` to `NonNull<KernelObjectHeader>` by leaking the box.
 ///
 /// Used only by the test build's `mint_phase7_body` arm and by the test
@@ -2510,6 +2679,35 @@ mod tests
         let count = coalesce_ram_blocks(&mut blocks);
         blocks.truncate(count);
         (count, blocks)
+    }
+
+    // ── split_around_span (reclaim scrub) ─────────────────────────────────────
+
+    #[test]
+    fn range_disjoint_from_span_stays_wholly_outside()
+    {
+        let (outside, inside) = split_around_span(0x1000, 0x3000, 0x8000, 0x9000);
+        assert_eq!(outside, [(0x1000, 0x3000), (0x3000, 0x3000)]);
+        assert_eq!(inside, (0, 0));
+        let (outside, inside) = split_around_span(0xA000, 0xC000, 0x8000, 0x9000);
+        assert_eq!(outside, [(0xA000, 0xA000), (0xA000, 0xC000)]);
+        assert_eq!(inside, (0, 0));
+    }
+
+    #[test]
+    fn range_containing_span_splits_into_three()
+    {
+        let (outside, inside) = split_around_span(0x7000, 0xB000, 0x8000, 0x9000);
+        assert_eq!(outside, [(0x7000, 0x8000), (0x9000, 0xB000)]);
+        assert_eq!(inside, (0x8000, 0x9000));
+    }
+
+    #[test]
+    fn range_equal_to_span_is_wholly_deferred()
+    {
+        let (outside, inside) = split_around_span(0x8000, 0x9000, 0x8000, 0x9000);
+        assert!(outside.iter().all(|&(a, b)| a >= b));
+        assert_eq!(inside, (0x8000, 0x9000));
     }
 
     #[test]

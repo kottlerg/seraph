@@ -10,6 +10,7 @@
 //! [core/ktest/README.md](../../README.md) § Tier 1 — `src/unit/`; how
 //! architecture-specific tests are dispatched is in its § Test structure.
 
+pub mod boot_reclaim;
 pub mod cap;
 pub mod cap_info;
 pub mod crypto;
@@ -37,6 +38,16 @@ use crate::run_test;
 #[allow(clippy::too_many_lines)]
 pub fn run_all(ctx: &TestContext)
 {
+    // ── Boot handover state (first, before any test maps memory) ──────────────
+    run_test!(
+        "boot_reclaim::reclaimed_bootloader_pages_are_zero",
+        boot_reclaim::reclaimed_bootloader_pages_are_zero(ctx)
+    );
+    run_test!(
+        "boot_reclaim::drained_ram_frames_are_zero",
+        boot_reclaim::drained_ram_frames_are_zero(ctx)
+    );
+
     // ── Capability syscalls ───────────────────────────────────────────────────
     run_test!("cap::create_notification", cap::create_notification(ctx));
     run_test!("cap::create_endpoint", cap::create_endpoint(ctx));

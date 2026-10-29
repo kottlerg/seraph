@@ -28,6 +28,8 @@
 //!   one
 //! - `page_fault_present_bit.rs` — a `#PF` fault message reports the present
 //!   bit only for a user-half address
+//! - `ioport_revoke.rs` — revoking an `IoPort` cap withdraws the port access
+//!   bound through its descendant from a reader on another CPU
 
 mod acpi_shutdown;
 pub mod callee_saved;
@@ -35,6 +37,7 @@ pub mod code_stub;
 mod configure_wrapped_stack;
 pub mod fpu;
 mod ioport;
+mod ioport_revoke;
 mod ioport_syscalls;
 mod page_fault_present_bit;
 mod sbi_call;
@@ -53,6 +56,19 @@ pub const PAGE_FAULT_STORE_VECTOR: u64 = 14;
 /// Exception vector an illegal instruction faults with (`#UD`), as recorded
 /// in `EXIT_FAULT_BASE + <vector>` when the fault kills the thread.
 pub const ILLEGAL_INSTRUCTION_VECTOR: u64 = 6;
+
+/// Exception vector a not-present user load faults with (`#PF`), as recorded
+/// in `EXIT_FAULT_BASE + <vector>` when the fault kills the thread.
+pub const PAGE_FAULT_LOAD_VECTOR: u64 = 14;
+
+/// Physical base of an MMIO register page that a test may read without side
+/// effects: the I/O APIC at QEMU's default base, a page of its own among the
+/// MMIO apertures init receives. Its IOREGSEL register, at
+/// [`MMIO_PROBE_OFFSET`], reads back the selector.
+pub const MMIO_PROBE_PHYS: u64 = 0xFEC0_0000;
+
+/// Byte offset of the side-effect-free register in the [`MMIO_PROBE_PHYS`] page.
+pub const MMIO_PROBE_OFFSET: usize = 0;
 
 /// Size of the register file `thread_read_regs` returns (the kernel
 /// `TrapFrame`), as the ABI publishes it.
@@ -110,6 +126,18 @@ pub fn illegal_instruction() -> !
             core::arch::asm!("ud2", options(nomem, nostack, preserves_flags));
         }
     }
+}
+
+/// A fresh range-capability lineage root for `integration::range_copy_lineage`:
+/// an `IoPort` cap for two otherwise unused ports, split off the wide cap.
+///
+/// Carves move upward through the wide cap, so this carve of 0x4E0 must run
+/// after `integration::ioport_revoke` carves 0x4D0 (`integration::run_all`
+/// runs `crate::arch::run_integration` before `range_copy_lineage`);
+/// reordering them turns that case into a SKIP.
+pub fn fresh_range_root(_ctx: &TestContext) -> Option<u32>
+{
+    ioport::carve_port_range(0x4E0, 2)
 }
 
 /// Seed the I/O port subdivider ([`ioport::init`]) from the root `IoPort` cap
@@ -181,4 +209,5 @@ pub fn run_integration(ctx: &TestContext)
         "integration::page_fault_present_bit",
         page_fault_present_bit::run(ctx)
     );
+    crate::run_integration_test!("integration::ioport_revoke", ioport_revoke::run(ctx));
 }

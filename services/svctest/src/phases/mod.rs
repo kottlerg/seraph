@@ -20,7 +20,8 @@
 //!
 //! 1. [`startup`] first — argv/env/stack/TLS bring-up before anything
 //!    else touches them.
-//! 2. [`fs_ipc`] and [`fs_std`] near the end (but before [`pwrmgr`]).
+//! 2. [`fs_ipc`], [`fs_std`], and [`fs_faults`] near the end (but before
+//!    [`pwrmgr`]).
 //! 3. `fs_open_relative_phase` last inside [`fs_ipc`]: it installs a
 //!    process-global `current_dir_cap` whose cap-derivation pressure
 //!    on TCG-emulated arches affects subsequent phases.
@@ -36,6 +37,7 @@ use crate::runner::Phase;
 
 pub mod devmgr;
 pub mod exit_code;
+pub mod fs_faults;
 pub mod fs_ipc;
 pub mod fs_std;
 pub mod memmgr;
@@ -73,6 +75,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(namespace::early());
     out.extend_from_slice(fs_ipc::phases_pre_relative());
     out.extend_from_slice(fs_std::phases());
+    out.extend_from_slice(fs_faults::phases());
     out.extend_from_slice(namespace::late());
     out.extend_from_slice(procmgr::command_phases());
     out.extend_from_slice(startup::late());

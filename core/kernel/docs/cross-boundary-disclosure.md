@@ -3,11 +3,10 @@
 Enumerates every value the kernel emits across the user/kernel boundary and
 classifies it toward the goal that no kernel virtual address or kernel pointer
 escapes to userspace — a prerequisite for kernel address-space layout
-randomization (KASLR). Known open disclosures: kernel state in
-donated memory that the donor can still map
-([#433](https://github.com/kottlerg/seraph/issues/433)), mirrored console diagnostics
-([#440](https://github.com/kottlerg/seraph/issues/440)), and unzeroed bootloader
-frames ([#439](https://github.com/kottlerg/seraph/issues/439)).
+randomization (KASLR). Known open disclosures: kernel state retyped into
+donated memory the donor had already mapped
+([#577](https://github.com/kottlerg/seraph/issues/577)) and mirrored console diagnostics
+([#440](https://github.com/kottlerg/seraph/issues/440)).
 
 ---
 
@@ -17,8 +16,7 @@ KASLR randomizes the kernel's virtual base. A single kernel virtual address (VA)
 kernel pointer, or value derived from one that reaches userspace defeats base
 randomization. This inventory audits the kernel's complete output surface and
 records, per surface, why it carries no kernel VA or, for each known open
-disclosure ([#433](https://github.com/kottlerg/seraph/issues/433),
-[#439](https://github.com/kottlerg/seraph/issues/439),
+disclosure ([#577](https://github.com/kottlerg/seraph/issues/577),
 [#440](https://github.com/kottlerg/seraph/issues/440)), what it leaks. It is the
 standing reference the coding-standards rule "Cross-Boundary Data Hygiene"
 ([docs/coding-standards.md](../../../docs/coding-standards.md)) requires every new
@@ -166,23 +164,34 @@ slabs (the kernel stack with its saved kernel pointers and return addresses,
 the TCB, and the extended-state save area), and the sub-page bodies of
 endpoints, notifications, wait sets, and event queues (which hold TCB and
 source-object pointers) — plus the retype allocator's free-list links (offsets
-into the region, not addresses). The holder of the donating capability is
-trusted not to map what it has retyped away; the kernel does not yet enforce
-that boundary ([#433](https://github.com/kottlerg/seraph/issues/433)). Until
-it does, the claim that no kernel object state in donated memory reaches
-userspace holds only under that trust.
+into the region, not addresses). The donating capability cannot map what it
+has retyped away: `SYS_MEM_MAP` refuses a range below its retype bump cursor
+([docs/capability-model.md § Typed Memory](../../../docs/capability-model.md#typed-memory)).
+The converse order is open: a retype into pages the holder already maps puts
+kernel state behind a live user mapping
+([#577](https://github.com/kottlerg/seraph/issues/577)). Until that closes,
+the claim that no kernel object state in donated memory reaches userspace
+holds only for a donor that maps none of the region it retypes from.
 
 Memory the bootloader used is a related surface, whether it is donated
 through `reclaim_ranges` or returned by the memory map as usable and drained
-at Phase 7. The `BootInfo` page is scrubbed of the seed and the two KASLR
-bases in Phase 5, and the AP trampoline page is zeroed in Phase 8 before its
-late-reclaim cap is minted, because its parameter block carried the AP entry
-point and idle-stack VAs ([initialization.md](initialization.md) § Phase 5
-and § Phase 8). The bootloader's transient page-table frames (a
-`reclaim_ranges` entry) and the UEFI stack it ran on (BootServicesData,
-drained at Phase 7) still reach userspace unzeroed and encode the slid
-layout; closing that is
-[#439](https://github.com/kottlerg/seraph/issues/439).
+at Phase 7. The kernel zeroes both before init runs, so neither bootloader
+scratch nor firmware leftovers reach userspace with their contents intact
+(boot modules, firmware tables, and init's image reach it by design). Phase 7 zeroes every drained
+extent it mints to userspace (`cap::drain_and_install_seed`). That covers the UEFI
+stack the bootloader ran on, `EfiBootServicesData` holding the slid kernel image
+addresses and the KASLR locals at handoff. Phase 9 zeroes every `reclaim_ranges`
+entry right before init is enqueued (`cap::scrub_reclaim_ranges`). That covers the
+transient page-table frames, whose populated entry indices encode the slid kernel
+VA; the `BootInfo` page and the descriptor arrays; the bundle's non-module pages;
+and the AP trampoline page, whose parameter block carried the AP entry point and
+idle-stack VAs ([initialization.md](initialization.md) § Phase 7 and § Phase 9).
+Two earlier scrubs remain as defence in depth: Phase 5 clears the seed and the
+two KASLR bases from the `BootInfo` page once consumed, and the bootloader
+clears its own copies of the entropy words. Init's segment allocations are
+zeroed whole by the bootloader before the image is copied in
+([core/boot/docs/elf-loading.md](../../boot/docs/elf-loading.md) § Init ELF
+Loading).
 
 ## Kernel console diagnostics
 

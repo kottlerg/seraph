@@ -271,11 +271,11 @@ accidental edits.
 Filesystem drivers (`fs/fat`, future `fs/ext4`, future `tmpfs`) and
 composing servers (`vfsd`'s synthetic root) embed this crate: they implement
 `NamespaceBackend` over their storage layer, and the crate owns every
-security-relevant code path. The
-trait's methods are called by `dispatch_request` after the crate
-has performed name validation and rights composition, and the crate
-filters by visibility what `lookup` and `readdir_entry` return — backends
-never re-implement those checks.
+security-relevant code path. `dispatch_request` decodes each request and
+runs the caller-rights checks (and, for `NS_LOOKUP`, the name validation)
+before it calls a trait method; it then filters what `lookup` and
+`readdir_entry` return by visibility and, for a lookup, composes the minted
+cap's rights. Backends never re-implement those checks.
 
 | Method | Called from |
 |---|---|

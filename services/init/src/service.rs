@@ -80,7 +80,9 @@ fn configure_child_namespace(
 
     let cwd_cap = if let Some((path, rights)) = cwd
     {
-        let Some(c) = walk::walk_to_dir(system_root_cap, path, rights, ipc_buf)
+        // SAFETY: `ipc_buf` is init's main-thread IPC buffer (`INIT_IPC_BUF_VA`,
+        // registered in `run`), passed down unchanged.
+        let Some(c) = (unsafe { walk::walk_to_dir(system_root_cap, path, rights, ipc_buf) })
         else
         {
             log("phase 3: cwd walk for child failed");
@@ -909,7 +911,10 @@ pub fn create_svcmgr_from_file(
     ipc_buf: *mut u64,
 ) -> Option<(u32, u64)>
 {
-    let walked = walk::walk_to_file(system_root_cap, b"/services/svcmgr", 0xFFFF, ipc_buf)?;
+    // SAFETY: `ipc_buf` is init's main-thread IPC buffer (`INIT_IPC_BUF_VA`,
+    // registered in `run`), passed down unchanged.
+    let walked =
+        unsafe { walk::walk_to_file(system_root_cap, b"/services/svcmgr", 0xFFFF, ipc_buf) }?;
 
     let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
 

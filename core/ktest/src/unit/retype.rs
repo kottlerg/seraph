@@ -126,6 +126,33 @@ fn exited_reason(thread: u32, what: &'static str) -> Result<u64, &'static str>
     Ok(state & 0xFFFF_FFFF)
 }
 
+/// A frame-pool cap a test maps in place of its retyped Memory cap. The test
+/// returns it with [`ScratchFrame::release`] once the address space it mapped
+/// the frame into is destroyed; a failure path that returns before that
+/// release leaks the frame.
+struct ScratchFrame(u32);
+
+impl ScratchFrame
+{
+    fn alloc() -> Result<Self, &'static str>
+    {
+        crate::frame_pool::alloc()
+            .map(Self)
+            .ok_or("retype: frame pool exhausted")
+    }
+
+    /// Return the frame to the pool.
+    ///
+    /// # Safety
+    /// No address space may still map the frame.
+    unsafe fn release(self)
+    {
+        // SAFETY: the cap came from frame_pool::alloc; the caller guarantees
+        // nothing maps it.
+        unsafe { crate::frame_pool::free(self.0) };
+    }
+}
+
 /// Deleting the last capability to an `AddressSpace` stops every thread
 /// bound to it with `EXIT_KILLED` (see
 /// [thread-lifecycle-and-sleep.md](../../../kernel/docs/thread-lifecycle-and-sleep.md)
@@ -358,6 +385,10 @@ pub fn cspace_augment_grows_budget(ctx: &TestContext) -> TestResult
 pub fn pt_budget_exhaustion_returns_oom(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;
+    // The mapped pages come from a frame-pool cap: `mem_map` refuses the
+    // region of `memory` that the retypes below consume.
+    let scratch = ScratchFrame::alloc()?;
+    let frame = scratch.0;
 
     // Slab layout: page 0 = wrapper, page 1 = root PT, pages 2..4 = 2
     // pool pages — enough to allocate a few intermediate PT pages but
@@ -374,7 +405,7 @@ pub fn pt_budget_exhaustion_returns_oom(ctx: &TestContext) -> TestResult
         let va = TEST_VA_BASE + i * 0x4000_0000; // 1 GiB stride
         // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
-        match unsafe { mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE) }
+        match unsafe { mem_map(frame, aspace, va, 0, 1, MAP_WRITABLE) }
         {
             Ok(()) =>
             {}
@@ -388,6 +419,8 @@ pub fn pt_budget_exhaustion_returns_oom(ctx: &TestContext) -> TestResult
     }
 
     cap_delete(aspace).ok();
+    // SAFETY: the address space the frame was mapped into is destroyed.
+    unsafe { scratch.release() };
 
     if !got_oom
     {
@@ -402,6 +435,10 @@ pub fn pt_budget_exhaustion_returns_oom(ctx: &TestContext) -> TestResult
 pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;
+    // The mapped pages come from a frame-pool cap: `mem_map` refuses the
+    // region of `memory` that the retypes below consume.
+    let scratch = ScratchFrame::alloc()?;
+    let frame = scratch.0;
 
     // A 32-page slab (30 pool pages after the wrapper and root PT) covers
     // ≥ 4 mappings spread across distinct intermediate PT regions (each fresh
@@ -417,7 +454,7 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
         let va = TEST_VA_BASE + i as u64 * stride;
         // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
-        if unsafe { mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE) }.is_err()
+        if unsafe { mem_map(frame, aspace, va, 0, 1, MAP_WRITABLE) }.is_err()
         {
             cap_delete(aspace).ok();
             return Err("retype::deep_pt: mem_map failed despite ample budget");
@@ -434,6 +471,8 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
     }
 
     cap_delete(aspace).ok();
+    // SAFETY: the address space the frame was mapped into is destroyed.
+    unsafe { scratch.release() };
     Ok(())
 }
 
@@ -447,6 +486,10 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
 pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;
+    // The mapped pages come from a frame-pool cap: `mem_map` refuses the
+    // region of `memory` that the retypes below consume.
+    let scratch = ScratchFrame::alloc()?;
+    let frame = scratch.0;
 
     // Slab: page 0 = wrapper, page 1 = root PT, pages 2..8 = 6 pool pages —
     // ample for the two to four intermediate tables a single fresh mapping needs.
@@ -460,7 +503,7 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
     // chain (one table per non-root level) from the pool.
     // SAFETY: `TEST_VA_BASE` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.
-    if unsafe { mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE) }.is_err()
+    if unsafe { mem_map(frame, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE) }.is_err()
     {
         cap_delete(aspace).ok();
         return Err("retype::region_reclaim: initial mem_map failed");
@@ -499,7 +542,7 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
     // chain from the pool), then tear it down again.
     // SAFETY: `TEST_VA_BASE` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.
-    if unsafe { mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE) }.is_err()
+    if unsafe { mem_map(frame, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE) }.is_err()
     {
         cap_delete(aspace).ok();
         return Err("retype::region_reclaim: remap after reclaim failed");
@@ -509,6 +552,8 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
     unsafe { mem_unmap_reclaim(aspace, TEST_VA_BASE, 1) }.ok();
 
     cap_delete(aspace).ok();
+    // SAFETY: the address space the frame was mapped into is destroyed.
+    unsafe { scratch.release() };
     Ok(())
 }
 
@@ -525,6 +570,10 @@ pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestR
     const STRIDE: u64 = 0x4000_0000; // 1 GiB — distinct level-2 slot per region.
 
     let memory = ctx.memory_base;
+    // The mapped pages come from a frame-pool cap: `mem_map` refuses the
+    // region of `memory` that the retypes below consume.
+    let scratch = ScratchFrame::alloc()?;
+    let frame = scratch.0;
 
     // Generous pool: N regions' per-region intermediate tables plus any shared
     // upper-level tables, with slack.
@@ -540,7 +589,7 @@ pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestR
         let va = TEST_VA_BASE + i * STRIDE;
         // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
         // span holds no Rust object or IPC page of ktest.
-        if unsafe { mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE) }.is_err()
+        if unsafe { mem_map(frame, aspace, va, 0, 1, MAP_WRITABLE) }.is_err()
         {
             cap_delete(aspace).ok();
             return Err("retype::concurrent_regions: mem_map failed");
@@ -570,6 +619,8 @@ pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestR
         .map_err(|_| "retype::concurrent_regions: cap_info(after) failed")?;
 
     cap_delete(aspace).ok();
+    // SAFETY: the address space the frame was mapped into is destroyed.
+    unsafe { scratch.release() };
 
     if after != baseline
     {
@@ -1065,6 +1116,10 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     const REGIONS: u64 = 12;
     const REGION_STRIDE: u64 = 0x4000_0000;
     let memory = ctx.memory_base;
+    // The mapped pages come from a frame-pool cap: `mem_map` refuses the
+    // region of `memory` that the retypes below consume.
+    let scratch = ScratchFrame::alloc()?;
+    let frame = scratch.0;
 
     let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
         .map_err(|_| "retype::aspace_augment_many: cap_info(baseline) failed")?;
@@ -1094,7 +1149,7 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
         // span holds no Rust object or IPC page of ktest.
         if unsafe {
             mem_map(
-                memory,
+                frame,
                 aspace,
                 TEST_VA_BASE + i * REGION_STRIDE,
                 0,
@@ -1126,6 +1181,8 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     let after_reclaim = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET);
 
     cap_delete(aspace).ok();
+    // SAFETY: the address space the frame was mapped into is destroyed.
+    unsafe { scratch.release() };
     let after_reclaim =
         after_reclaim.map_err(|_| "retype::aspace_augment_many: cap_info(after reclaim) failed")?;
     let after = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)

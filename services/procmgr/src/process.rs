@@ -880,7 +880,17 @@ unsafe fn populate_child_info(
     let pi_ro = CapGuard::new(syscall::cap_derive(pi_memory.cap(), syscall::RIGHTS_MEM_MAP).ok()?);
     // SAFETY: the caller's contract: `child_aspace` is a child's address
     // space, never procmgr's own, so the map changes nothing procmgr runs on.
-    unsafe { syscall::mem_map(pi_ro.cap(), child_aspace, layout.process_info_va, 0, 1, 0) }.ok()?;
+    unsafe {
+        syscall::mem_map(
+            pi_ro.cap(),
+            child_aspace,
+            layout.process_info_va,
+            0,
+            1,
+            syscall::MAP_FROM_CAP,
+        )
+    }
+    .ok()?;
     // pi_memory stays in procmgr's CSpace as the teardown handle (revoke
     // cascades to any descendants); the mapping doesn't need pi_ro to
     // outlive this call, so its guard deletes it on return.
@@ -986,7 +996,17 @@ unsafe fn finalize_main_tls(
         CapGuard::new(syscall::cap_derive(alloc.memory.cap(), syscall::RIGHTS_MEM_MAP_RW).ok()?);
     // SAFETY: the caller's contract: `child_aspace` is a child's address
     // space, never procmgr's own, so the map changes nothing procmgr runs on.
-    unsafe { syscall::mem_map(tls_rw.cap(), child_aspace, alloc.tls_block_base, 0, 1, 0) }.ok()?;
+    unsafe {
+        syscall::mem_map(
+            tls_rw.cap(),
+            child_aspace,
+            alloc.tls_block_base,
+            0,
+            1,
+            syscall::MAP_FROM_CAP,
+        )
+    }
+    .ok()?;
     // The memory cap stays as the teardown handle; tls_rw is transient and
     // its guard deletes it on return.
     Some(MainTls {
@@ -1166,7 +1186,7 @@ unsafe fn map_fresh_child_page(
     let rw = CapGuard::new(syscall::cap_derive(memory.cap(), syscall::RIGHTS_MEM_MAP_RW).ok()?);
     // SAFETY: the caller's contract: `child_aspace` is a child's address
     // space, never procmgr's own, so the map changes nothing procmgr runs on.
-    unsafe { syscall::mem_map(rw.cap(), child_aspace, va, 0, 1, 0) }.ok()
+    unsafe { syscall::mem_map(rw.cap(), child_aspace, va, 0, 1, syscall::MAP_FROM_CAP) }.ok()
 }
 
 /// Determine protection flags for an ELF segment.
@@ -1182,7 +1202,7 @@ fn segment_prot(seg: &elf::LoadSegment) -> u64
     }
     else
     {
-        syscall::MAP_READONLY
+        syscall::MAP_READ
     }
 }
 
@@ -1431,6 +1451,8 @@ fn create_process_from_bytes(
 {
     let machine = crate::arch::current::EXPECTED_ELF_MACHINE;
     let (ehdr, kind) = elf::validate_executable(module_bytes, machine).ok()?;
+    // `validate_executable` returns the header decoded; the parsers borrow it.
+    let ehdr = &ehdr;
     let bias = match kind
     {
         elf::ElfKind::Exec => 0,
@@ -1474,6 +1496,7 @@ fn create_process_from_bytes(
     // PT_GNU_RELRO (biased, page-rounded): fully-covered pages of writable
     // segments are mapped read-only after relocation.
     let ro_range = elf::relro_span(ehdr, module_bytes)
+        .ok()?
         .map(|(va, sz)| ((va + bias) & !0xFFF, (va + bias + sz + 0xFFF) & !0xFFF));
 
     let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
@@ -2155,7 +2178,7 @@ fn stream_segment_bytes(
         };
 
         let Some(mut mapping) =
-            ScratchMapping::map(ctx.self_aspace, memory_cap, 1, syscall::MAP_READONLY)
+            ScratchMapping::map(ctx.self_aspace, memory_cap, 1, syscall::MAP_FROM_CAP)
         else
         {
             let _ = syscall::cap_delete(memory_cap);
@@ -2300,6 +2323,8 @@ pub fn create_process_from_file(
     let machine = crate::arch::current::EXPECTED_ELF_MACHINE;
     let (ehdr, kind) =
         elf::validate_executable(header_data, machine).map_err(|_| procmgr_errors::INVALID_ELF)?;
+    // `validate_executable` returns the header decoded; the parsers borrow it.
+    let ehdr = &ehdr;
     let bias = match kind
     {
         elf::ElfKind::Exec => 0,
@@ -2359,6 +2384,7 @@ pub fn create_process_from_file(
     // PT_GNU_RELRO (biased, page-rounded): fully-covered pages of writable
     // segments are mapped read-only after relocation.
     let ro_range = elf::relro_span(ehdr, header_data)
+        .map_err(|_| procmgr_errors::INVALID_ELF)?
         .map(|(va, sz)| ((va + bias) & !0xFFF, (va + bias + sz + 0xFFF) & !0xFFF));
 
     // Parse the optional stack-size note. Section headers and the note

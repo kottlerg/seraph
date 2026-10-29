@@ -56,7 +56,8 @@ Kernel space is divided into regions:
 
 The physical memory direct map gives the kernel a virtual address for every physical
 page. The RAM portion is mapped with 2 MiB large pages; a framebuffer or kernel MMIO
-region above the RAM ceiling gets 4 KiB pages.
+region above the RAM ceiling gets 4 KiB pages, and so does a 2 MiB chunk below it that holds a
+kernel MMIO page, so that page can be mapped uncacheable.
 
 Both the kernel image base and the direct-map base are randomized at boot behind
 the boot-entropy source (KASLR,
@@ -242,7 +243,10 @@ init's CSpace by the kernel-initialisation reclaim-minting steps. See
 [`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md)
 Phase 7 (standard reclaim mint) and Phase 8 (`RECLAIM_FLAG_LATE`
 late-mint for the AP trampoline page) for the authoritative
-mechanism.
+mechanism. Neither bootloader scratch nor firmware leftovers reach userspace
+with their contents intact: Phase 9 zeroes every recorded range before init
+runs, and Phase 7 zeroes every page of free RAM it drains into Memory caps,
+the UEFI stack the bootloader ran on among them.
 
 ### Buddy Allocator
 

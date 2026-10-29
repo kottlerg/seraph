@@ -51,7 +51,8 @@ maintainer when it comes up:
    report; if the host is idle with no active grant and a queued request exists, grant the
    next one. Call `ListAgents` and compare it against the worker ids the record lists as
    active; a worker that is not listed, whose last report was not its gate and whose worktree
-   is gone (`git worktree list`), is dead: log it and respawn it with its plan and every answer
+   is gone (`git worktree list`), is dead: log it, send it the stand-down message and end its
+   task where the harness allows (§ Spawn), and respawn it with its plan and every answer
    already given folded into the prompt. A worker that is not listed, whose last report was not
    its gate and that awaits no answer or grant, but whose worktree remains, is sent a message
    asking for a status report. Also check whether any PR at its gate (clean verdicts, CI green)
@@ -74,7 +75,10 @@ the record lists it as active until the worker's last PR merges or a respawn rep
 A respawn prompt also carries the dead worker's classified item list, its mechanism choices and
 every answer already given, marked as decisions already made, so the new worker neither
 re-plans nor re-asks, and names the dead worker's branch and PR when either exists, for the new
-worker to continue on.
+worker to continue on. Before or with the respawn, send the replaced worker a stand-down
+message (its PR and branch now belong to the new worker; it edits, commits and pushes nothing
+further, per `.claude/agents/worker.md` § Reporting), and end that worker's task where the
+harness allows, so a worker presumed dead that resumes does not push over its replacement.
 
 ## Host token
 
@@ -137,6 +141,14 @@ decision, or a case with no clearly best option waits for the maintainer.
   default the maintainer may set: one fix round when a finding is a comment or document that
   states a falsehood, when the fix is comment-only and a later round is owed anyway, or when
   recording would need a new Issue for a one-line change; otherwise merge with the record.
+  Standing, by the maintainer's ruling of 2026-10-30 ("If you are confident that it won't cause
+  broad process issues going forwards, then I can approve that those nits after a ready to
+  merge will go on the rolling issue for that scope.", then "approved" to the orchestrator's
+  precise statement of it): a run whose findings are all nits takes no fix round;
+  the worker records them on the scope's follow-up Issue (the Issue the PR drains in that
+  scope, else the rolling Issue, as docs/conventions.md § Branch and PR Workflow defines it)
+  and reports the gate, except that a PR draining a follow-up Issue of that scope records its
+  nits-only findings there and fixes them in the same PR, ticking each `(fixed by PR #<M>)`.
 - A reviewer's finding that a worker contests, or that the worker cannot fix within its scope
   (a pre-existing code defect in a file a documentation-only PR touches, for instance), is put
   to the maintainer with the worker's and your recommendation. A finding is never waived or
@@ -153,7 +165,9 @@ decision, or a case with no clearly best option waits for the maintainer.
   recording, or asks for the rewrite.
 - A history rewrite (a commit subject over 72 columns, a wrong keyword) is yours only on the
   maintainer's instruction: rebuild the chain with identical trees (`git commit-tree -S`),
-  check `git diff --quiet <old> <new>`, push with `--force-with-lease`, and record it.
+  check `git diff --quiet <old> <new>`, push with the lease pinned to the old head
+  (`git push --force-with-lease=<branch>:<old> origin <new>:refs/heads/<branch>`, which refuses
+  whenever the remote branch is not at `<old>`), and record it.
 - `.claude/CLAUDE.md` edits need the maintainer's own words. A worker whose change has a copy
   there reports it and holds its push; you carry the copy to the maintainer, who applies it or
   authorizes the worker in their own words, which you pass on verbatim.

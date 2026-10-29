@@ -89,7 +89,8 @@ the real virtio-input driver over QMP) and a serial round (the same sequence
 written to the guest UART via QEMU's bidirectional `-serial stdio`). Each round
 asserts the echoed input and the relayed child output appear on the serial
 stream. It runs as a boot in the `usertest` cell. See
-[docs/testing.md](../../docs/testing.md).
+[xtask/README.md](../../xtask/README.md#cargo-xtask-test-terminal) for the command and
+[docs/testing.md](../../docs/testing.md#interactive-input-test-terminal) for the test.
 
 [#29]: https://github.com/kottlerg/seraph/issues/29
 [#66]: https://github.com/kottlerg/seraph/issues/66

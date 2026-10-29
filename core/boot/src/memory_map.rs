@@ -227,7 +227,9 @@ fn descriptor_range(d: &EfiMemoryDescriptor) -> (u64, u64)
 /// differently before the merge:
 ///
 /// - `seed` holds windows the firmware or the framebuffer names (interrupt
-///   controllers, UARTs, ECAM, DTB nodes, the GOP framebuffer): every
+///   controllers, UARTs, ECAM, DTB nodes, the GOP framebuffer), or that the
+///   arch defaults fix at a platform-defined register address
+///   (`crate::arch::current::default_mmio_apertures`): every
 ///   RAM-class and firmware-exclusive range of the map
 ///   ([`excluded_from_apertures`]) is subtracted, and `EfiReservedMemoryType`
 ///   is kept, since firmware reports such windows as Reserved.

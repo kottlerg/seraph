@@ -121,18 +121,22 @@ Apertures are coarse but **not indiscriminate**. No aperture covers RAM or
 firmware-exclusive state. Step 1 collects only MMIO descriptors, and step 2
 clips each seed by its class:
 
-- **Named seeds** are windows a firmware table, the DTB, or GOP names as a device's
-  registers or frame buffer, or that the arch defaults fix at a platform-defined
-  register address (`default_mmio_apertures`: on riscv64 the QEMU virt ECAM, UART,
-  and RTC windows): LAPIC, IOAPIC, PLIC, ECAM, UART, RTC, `virtio,mmio` and other
-  DTB nodes, and the framebuffer. Every range of
-  the RAM-class types (`EfiConventionalMemory`, `EfiBootServicesCode`,
-  `EfiBootServicesData`, `EfiLoaderCode`, `EfiLoaderData`, `EfiACPIReclaimMemory`,
-  `EfiPersistentMemory`) and of the firmware-exclusive types
-  (`EfiRuntimeServicesCode`, `EfiRuntimeServicesData`, `EfiACPIMemoryNVS`) is
-  subtracted. `EfiReservedMemoryType` is not, because firmware reports the GOP
-  framebuffer and some interrupt-controller and ECAM windows as Reserved, and a
-  named seed covers such a range only where the device it names lives.
+- **Named seeds** are LAPIC, IOAPIC, PLIC, ECAM, UART, RTC, `virtio,mmio` and other
+  DTB nodes, and the framebuffer. They are windows a firmware table, the DTB, or GOP
+  names as a device's registers or frame buffer, or that the arch defaults fix at a
+  platform-defined register address (`default_mmio_apertures`).
+  - Every range of the RAM-class types (`EfiConventionalMemory`, `EfiBootServicesCode`,
+    `EfiBootServicesData`, `EfiLoaderCode`, `EfiLoaderData`, `EfiACPIReclaimMemory`,
+    `EfiPersistentMemory`) and of the firmware-exclusive types (`EfiRuntimeServicesCode`,
+    `EfiRuntimeServicesData`, `EfiACPIMemoryNVS`) is subtracted.
+  - `EfiReservedMemoryType` is not subtracted: firmware reports the GOP framebuffer and
+    some interrupt-controller and ECAM windows as Reserved, and a named seed covers such a
+    range only where the device it names lives.
+  - The riscv64 defaults are the QEMU virt ECAM, UART, and RTC windows. The bootloader does
+    not identify the platform, so it appends them on every riscv64 boot whose ACPI
+    validates. They hold only on QEMU virt, the one riscv64 platform it is built for. On any
+    other platform those addresses name no device, and Reserved memory under them stays in
+    an aperture.
 - **Heuristic windows** are the MCFG-derived 32-bit and 64-bit PCI BAR windows and the
   riscv64 default PCI windows (`default_pci_windows`), placed by a QEMU layout
   heuristic rather than named by firmware. Every range the memory map describes,

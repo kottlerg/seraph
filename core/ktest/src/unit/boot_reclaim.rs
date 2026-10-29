@@ -51,7 +51,8 @@ fn is_named_memory_cap(info: &InitInfo, slot: u32) -> bool
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProbeError
 {
-    /// `mem_map` refused the window; nothing is mapped.
+    /// The window was not mapped: `mem_map` refused it, or its byte count
+    /// overflows `usize`.
     Map,
     /// `mem_unmap` failed; the window stays mapped at [`PROBE_VA`].
     Unmap,
@@ -63,7 +64,7 @@ impl ProbeError
     {
         match self
         {
-            Self::Map => "probe mem_map failed",
+            Self::Map => "probe window was not mapped",
             Self::Unmap => "probe mem_unmap failed",
         }
     }

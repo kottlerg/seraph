@@ -2407,7 +2407,10 @@ fn mint_reclaim_pass(
 /// entries fill one page, and an array whose base is not page-aligned reaches
 /// into one more.
 #[cfg(not(test))]
-const RECLAIM_ARRAY_MAX_SPAN_PAGES: usize = 2;
+const RECLAIM_ARRAY_MAX_SPAN_PAGES: usize = (boot_protocol::MAX_RECLAIM_RANGES
+    * core::mem::size_of::<boot_protocol::ReclaimRange>())
+.div_ceil(crate::mm::PAGE_SIZE)
+    + 1;
 
 /// Zero every range `BootInfo.reclaim_ranges` records, late-flagged entries
 /// included, through the direct map, so no page the bootloader wrote (its

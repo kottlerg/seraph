@@ -126,6 +126,8 @@ impl EvictionState
 /// `EvictionState` and open-file table alive for as long as it
 /// runs (i.e. for the lifetime of the fs process); main hands
 /// over its clones at spawn.
+// needless_pass_by_value: the worker owns its `Arc` clones on purpose (see
+// above); borrowing them would let the main thread's drop end their lifetime.
 #[allow(clippy::needless_pass_by_value)]
 pub fn worker_loop(
     state: Arc<EvictionState>,

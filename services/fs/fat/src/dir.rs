@@ -32,6 +32,11 @@ pub use fat_parse::{
 };
 use fat_parse::{FreeRunScan, RemoveRunScan, RemoveStep};
 
+/// [`SECTOR_SIZE`] as a `u32`, for sector arithmetic on FAT's 32-bit fields.
+// cast_possible_truncation: SECTOR_SIZE is 512.
+#[allow(clippy::cast_possible_truncation)]
+const SECTOR_SIZE_U32: u32 = SECTOR_SIZE as u32;
+
 // ── Chain walking ─────────────────────────────────────────────────────────
 
 /// Step a directory walk from `cluster` to the next cluster of its chain.
@@ -176,7 +181,7 @@ fn find_in_fat16_root(
 ) -> Result<Option<DirEntry>, FatError>
 {
     let root_start = u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-    let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE as u32);
+    let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE_U32);
     let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
     let mut lfn = LfnAccum::new();
 
@@ -226,7 +231,7 @@ pub fn find_in_directory_with_location(
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE as u32);
+        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE_U32);
         for s in 0..root_sectors
         {
             let sector_lba = root_start + s;
@@ -412,7 +417,7 @@ pub fn read_dir_entry_at_index(
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE as u32);
+        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE_U32);
 
         for s in 0..root_sectors
         {
@@ -612,6 +617,10 @@ pub struct RemovedEntry
 /// slot run is left (see `find_free_slot_run`); [`FatError::Io`] when a
 /// directory or FAT sector read or write fails, possibly after some LFN
 /// slots were written.
+// too_many_arguments: the parent directory, the new entry's name, kind, first
+// cluster, and size, and the driver state the insert writes through (FAT
+// state, cache, block device, IPC buffer); each caller supplies a different
+// mix, so no shared struct would fit them.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_entry(
     state: &mut FatState,
@@ -742,10 +751,11 @@ pub fn update_entry_metadata(
         return Err(FatError::Io);
     }
     let off = loc.offset_in_sector;
-    let cluster_hi = ((new_first_cluster >> 16) & 0xFFFF) as u16;
-    let cluster_lo = (new_first_cluster & 0xFFFF) as u16;
-    buf[off + 20..off + 22].copy_from_slice(&cluster_hi.to_le_bytes());
-    buf[off + 26..off + 28].copy_from_slice(&cluster_lo.to_le_bytes());
+    // DIR_FstClusHI holds the high half of the little-endian cluster number,
+    // DIR_FstClusLO the low half.
+    let cluster = new_first_cluster.to_le_bytes();
+    buf[off + 20..off + 22].copy_from_slice(&cluster[2..4]);
+    buf[off + 26..off + 28].copy_from_slice(&cluster[0..2]);
     buf[off + 28..off + 32].copy_from_slice(&new_size.to_le_bytes());
     if !cache.write_sector(u64::from(loc.sector_lba), block_dev, &buf, ipc_buf)
     {
@@ -898,7 +908,7 @@ fn find_free_slot_run(
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE as u32);
+        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE_U32);
         for s in 0..root_sectors
         {
             if scan_sector_free_run(
@@ -1052,11 +1062,12 @@ fn pack_83_entry(name: &[u8; 11], attr: u8, cluster: u32, size: u32) -> [u8; 32]
     e[11] = attr;
     // bytes 12 (DIR_NTRes) through 19 (creation timestamps): all zero
     // for v0.1.0; timestamp support filed as a follow-up.
-    let cluster_hi = ((cluster >> 16) & 0xFFFF) as u16;
-    let cluster_lo = (cluster & 0xFFFF) as u16;
-    e[20..22].copy_from_slice(&cluster_hi.to_le_bytes());
+    // DIR_FstClusHI holds the high half of the little-endian cluster number,
+    // DIR_FstClusLO the low half.
+    let cluster_bytes = cluster.to_le_bytes();
+    e[20..22].copy_from_slice(&cluster_bytes[2..4]);
     // bytes 22-25: last-write timestamps (zero).
-    e[26..28].copy_from_slice(&cluster_lo.to_le_bytes());
+    e[26..28].copy_from_slice(&cluster_bytes[0..2]);
     e[28..32].copy_from_slice(&size.to_le_bytes());
     e
 }
@@ -1305,7 +1316,7 @@ fn sfn_in_directory(
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE as u32);
+        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE_U32);
         for s in 0..root_sectors
         {
             match scan_sector_for_sfn(
@@ -1362,7 +1373,6 @@ fn sfn_in_directory(
 ///
 /// # Errors
 /// [`FatError::Io`] when the sector cannot be read.
-#[allow(clippy::too_many_arguments)]
 fn scan_sector_for_sfn(
     sector_lba: u32,
     sfn: &[u8; 11],
@@ -1416,7 +1426,7 @@ fn locate_entry_with_lfn_run(
     {
         let root_start =
             u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
-        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE as u32);
+        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(SECTOR_SIZE_U32);
         for s in 0..root_sectors
         {
             if let Some(entry) = scan_sector_for_remove(

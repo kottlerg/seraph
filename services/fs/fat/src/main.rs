@@ -29,8 +29,6 @@
 //! Crash window discussion lives in
 //! `services/fs/fat/docs/crash-safety.md`.
 
-#![allow(clippy::cast_possible_truncation)]
-
 mod alloc;
 mod backend;
 mod bpb;
@@ -57,6 +55,11 @@ use file::{MAX_OPEN_FILES, OpenFile, OutstandingPage};
 use ipc::{IpcMessage, fs_labels, ns_labels};
 use namespace_protocol::{GateError, NamespaceRights, NodeId, NodeKind, gate, pack as pack_badge};
 use syscall_abi::{MSG_DATA_WORDS_MAX, PAGE_SIZE, RIGHTS_MEM_MAP};
+
+/// [`PAGE_SIZE`] as a `usize`, for buffer and offset arithmetic.
+// cast_possible_truncation: PAGE_SIZE is 4096.
+#[allow(clippy::cast_possible_truncation)]
+const PAGE_BYTES: usize = PAGE_SIZE as usize;
 
 /// Monotonic counter for open-file slot identity. Starts at 1 (0 = unbadged).
 ///
@@ -230,6 +233,9 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// use it; main takes the lock for those requests and holds it for the
 /// whole dispatch. Lock contention with the worker is only material
 /// during cache-pressure releases.
+// too_many_lines: the loop is one dispatch over every label the driver serves,
+// each arm a call into its handler; splitting it would scatter the dispatch
+// table across functions.
 #[allow(clippy::too_many_lines)]
 fn service_loop(
     caps: &FatCaps,
@@ -538,6 +544,11 @@ fn handle_read_node_cap(
 /// two-step cap derivation, and outstanding-page tracking. The file's size
 /// and first cluster come from `node`, the node table's current view, so a
 /// write or truncate through any cap on the node is seen at once.
+// too_many_arguments: the request, its node and open-file slot, and each piece
+// of driver state the memory-cap read touches (FAT state, slot table, cache,
+// block device, IPC buffer, eviction state). too_many_lines: the read is one
+// sequence (validate, resolve the sector, pin a cache page, mint and record
+// the cap, reply) whose steps share the slot state.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn read_memory_at_slot(
     msg: &IpcMessage,
@@ -582,6 +593,9 @@ fn read_memory_at_slot(
     let bytes_per_sector = u64::from(state.bytes_per_sector);
     let cluster_idx = offset / cluster_size;
     let offset_in_cluster = offset % cluster_size;
+    // cast_possible_truncation: the quotient is below the cluster's
+    // sector count, a `u8` BPB field.
+    #[allow(clippy::cast_possible_truncation)]
     let sector_in_cluster = (offset_in_cluster / bytes_per_sector) as u32;
     let byte_in_sector = offset_in_cluster % bytes_per_sector;
 
@@ -739,6 +753,9 @@ fn pick_eviction_candidate(files: &mut [OpenFile; MAX_OPEN_FILES]) -> Option<Evi
 /// [`OpenFile`] slot bound to the node on first call (recorded into
 /// [`backend::FatNode::open_slot`]) and delegates to
 /// [`read_memory_at_slot`]. The slot is reaped at `FS_CLOSE`.
+// too_many_arguments: the request and node, plus the driver state
+// `read_memory_at_slot` needs, which this handler forwards after binding the
+// node's open-file slot.
 #[allow(clippy::too_many_arguments)]
 fn handle_read_memory_node_cap(
     node_id: NodeId,
@@ -782,7 +799,8 @@ fn handle_read_memory_node_cap(
             outstanding: [None; file::MAX_OUTSTANDING],
             release_endpoint_cap: 0,
         };
-        // Cast safe: slot_idx ≤ MAX_OPEN_FILES (8) ≪ u32::MAX.
+        // cast_possible_truncation: slot_idx < MAX_OPEN_FILES (8).
+        #[allow(clippy::cast_possible_truncation)]
         nodes.set_open_slot(node_id, slot_idx as u32);
         slot_idx
     }
@@ -998,6 +1016,11 @@ fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> 
 /// cluster or a chain link lies outside the data region; otherwise the
 /// errors of [`allocate_cluster`] and [`FatError::Io`] for a failed FAT or
 /// data sector read or write.
+// too_many_arguments: the engine takes the file's extent, the write, and the
+// driver state it writes through (FAT state, cache, block device, IPC
+// buffer), shared by two callers with different request shapes.
+// single_match_else: each chain step names both outcomes of `chain_next`
+// (the next cluster, or end of chain to extend), which `if let` would hide.
 #[allow(clippy::too_many_arguments, clippy::single_match_else)]
 fn write_file_bytes(
     start_cluster: u32,
@@ -1062,11 +1085,16 @@ fn write_file_bytes(
     while written < data.len()
     {
         let cluster_byte_offset = cur_offset % cluster_size;
+        // cast_possible_truncation: the quotient is below the cluster's
+        // sector count, a `u8` BPB field.
+        #[allow(clippy::cast_possible_truncation)]
         let sector_in_cluster = (cluster_byte_offset / bps) as u32;
+        // cast_possible_truncation: the remainder is below `bps`, a `u16`.
+        #[allow(clippy::cast_possible_truncation)]
         let byte_in_sector = (cluster_byte_offset % bps) as usize;
         let sector_lba = state.cluster_to_sector(cluster) + sector_in_cluster;
 
-        let bytes_avail_in_sector = (bps as usize) - byte_in_sector;
+        let bytes_avail_in_sector = usize::from(state.bytes_per_sector) - byte_in_sector;
         let bytes_to_write = bytes_avail_in_sector.min(data.len() - written);
 
         // Read-modify-write the sector unless we are writing the full
@@ -1186,6 +1214,9 @@ fn handle_write_node_cap(
 /// process-static scratch VA, copied into a heap buffer, and the
 /// scratch VA unmapped before the actual writes. The Memory cap is moved
 /// back to the caller in the reply.
+// too_many_lines: the memory-cap write is one sequence (validate the request
+// and the carried cap, map it, copy, unmap, write, patch the entry, reply)
+// whose every exit returns the carried cap to the caller in its reply.
 #[allow(clippy::too_many_lines)]
 fn handle_write_memory_node_cap(
     node_id: NodeId,
@@ -1231,9 +1262,11 @@ fn handle_write_memory_node_cap(
     }
 
     let offset = msg.word(0);
-    let byte_count = msg.word(1) as usize;
-    let memory_data_offset = msg.word(2) as usize;
-    let page_size = PAGE_SIZE as usize;
+    // cast_possible_truncation: fatfs builds only for 64-bit targets, where
+    // `usize` holds every `u64`; both values are range-checked below.
+    #[allow(clippy::cast_possible_truncation)]
+    let (byte_count, memory_data_offset) = (msg.word(1) as usize, msg.word(2) as usize);
+    let page_size = PAGE_BYTES;
     if byte_count == 0
         || memory_data_offset >= page_size
         || byte_count > page_size - memory_data_offset
@@ -1249,6 +1282,10 @@ fn handle_write_memory_node_cap(
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     };
+    // cast_possible_truncation: `CAP_INFO_TAG_RIGHTS` packs the `CapTag` byte
+    // above the 32 rights bits (abi/syscall), so the low byte of the shifted
+    // value is the tag.
+    #[allow(clippy::cast_possible_truncation)]
     let tag = (tag_rights >> 32) as u8;
     let cap_rights = tag_rights & 0xFFFF_FFFF;
     if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY)
@@ -1299,7 +1336,7 @@ fn handle_write_memory_node_cap(
     // Heap-allocated: a 4 KiB on-stack buffer would push the
     // FS_WRITE_MEMORY path past the default 32 KiB stack envelope
     // once it cascades into `write_file_bytes → insert_entry → …`.
-    let mut buf = Box::new([0u8; PAGE_SIZE as usize]);
+    let mut buf = Box::new([0u8; PAGE_BYTES]);
     // SAFETY: va just mapped MAP_READONLY for one page; bounds checked
     // above.
     unsafe {
@@ -1395,6 +1432,8 @@ fn self_aspace_cap() -> Option<u32>
 /// cap (must carry `MUTATE_DIR`). `label[16..32]` = name length, name
 /// from word 0. `parent_rights` is the caller's effective rights on
 /// the parent dir; the returned child cap is attenuated by it.
+// too_many_arguments: a thin entry point that forwards the request and the
+// driver state to `create_entry_common` with the file kind.
 #[allow(clippy::too_many_arguments)]
 fn handle_create_node_cap(
     node_id: NodeId,
@@ -1421,6 +1460,8 @@ fn handle_create_node_cap(
 }
 
 /// `FS_MKDIR`: create a new directory in a directory.
+// too_many_arguments: a thin entry point that forwards the request and the
+// driver state to `create_entry_common` with the directory kind.
 #[allow(clippy::too_many_arguments)]
 fn handle_mkdir_node_cap(
     node_id: NodeId,
@@ -1446,6 +1487,10 @@ fn handle_mkdir_node_cap(
     );
 }
 
+// too_many_arguments: the request, the parent node and its rights, the entry
+// kind, and the driver state creation writes through. too_many_lines: creation
+// is one sequence (validate the name, refuse a taken one, allocate, insert the
+// entry, mint the child cap, reply) whose failure exits undo what came before.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn create_entry_common(
     node_id: NodeId,
@@ -1720,8 +1765,10 @@ fn handle_rename_node_cap(
             return;
         }
     };
-    let src_len = msg.word(0) as usize;
-    let dst_len = msg.word(1) as usize;
+    // cast_possible_truncation: fatfs builds only for 64-bit targets, where
+    // `usize` holds every `u64`; both lengths are bounded below.
+    #[allow(clippy::cast_possible_truncation)]
+    let (src_len, dst_len) = (msg.word(0) as usize, msg.word(1) as usize);
     let data_bytes = msg.data_bytes();
     let name_off: usize = 16; // words 0,1 = lengths (16 bytes), names from word 2
     // Both lengths are client words: bound their sum without overflow

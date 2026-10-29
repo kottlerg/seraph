@@ -175,6 +175,9 @@ pub fn update_fat_entry(
         {
             FatType::Fat16 =>
             {
+                // cast_possible_truncation: a FAT16 entry is 16 bits wide, so
+                // keeping the low half of `value` is the encoding.
+                #[allow(clippy::cast_possible_truncation)]
                 let bytes = (value as u16).to_le_bytes();
                 sector_buf[ent_off] = bytes[0];
                 sector_buf[ent_off + 1] = bytes[1];

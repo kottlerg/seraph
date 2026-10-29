@@ -196,14 +196,15 @@ extern "C" fn caller_entry(arg: u64) -> !
     } = unsafe { spawn::child_args(arg) };
     let done_bit = 1u64 << bit_index;
 
+    // cast_possible_truncation: `bit_index` is below `NUM_CALLERS`.
+    #[allow(clippy::cast_possible_truncation)]
+    let page = bit_index as usize;
     // SAFETY: takes the element's raw address without forming a reference to
     // the `static mut`.
-    let buf_addr = crate::IpcPage::addr(unsafe {
-        core::ptr::addr_of_mut!(CALLER_IPC_PAGES[bit_index as usize])
-    });
-    // SAFETY: `CALLER_IPC_PAGES[bit_index as usize]` is this caller's own IPC page, used by one thread at a time
-    // (`IpcPage`'s rule); no Rust object lives in it, and the child
-    // reaches it only through the raw `buf_addr` pointer.
+    let buf_addr = crate::IpcPage::addr(unsafe { core::ptr::addr_of_mut!(CALLER_IPC_PAGES[page]) });
+    // SAFETY: `CALLER_IPC_PAGES[page]` is this caller's own IPC page, used by one
+    // thread at a time (`IpcPage`'s rule); no Rust object lives in it, and the
+    // child reaches it only through the raw `buf_addr` pointer.
     if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, done_bit).ok();

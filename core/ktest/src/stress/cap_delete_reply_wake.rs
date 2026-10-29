@@ -118,6 +118,10 @@ static mut SERVER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 // own IPC syscalls (kernel-synchronous), never aliased across cycles.
 static mut CLIENT_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
+// too_many_lines: one stress cell's setup, cycle loop, and teardown; the two
+// child starts' `unsafe` wrappers push it past the limit, and splitting would
+// thread each cycle's caps and stacks through helpers.
+#[allow(clippy::too_many_lines)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = syscall::system_info(SystemInfoType::CpuCount as u64)

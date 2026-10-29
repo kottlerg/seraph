@@ -450,51 +450,40 @@ unsafe fn place_main_tls(
     }
 
     let tls_base_va = tls_base + tls_base_offset;
+    let populate = |scratch_va: u64| {
+        // SAFETY: scratch_va is mapped writable and zeroed; the copy
+        // length is bounded by the tls_block_layout fit check above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                module_bytes[tdata_start..tdata_end].as_ptr(),
+                scratch_va as *mut u8,
+                seg.filesz as usize,
+            );
+        }
+        if let Some(t) = rela
+        {
+            let table = &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
+            // SAFETY: the template region [0, filesz) was just populated
+            // and stays mapped writable for the rest of this closure.
+            let template = unsafe {
+                core::slice::from_raw_parts_mut(scratch_va as *mut u8, seg.filesz as usize)
+            };
+            let _ = elf::apply_relative_relocs(
+                table,
+                arch::current::EXPECTED_ELF_MACHINE,
+                bias,
+                seg.vaddr,
+                template,
+            );
+        }
+        // SAFETY: scratch_va is mapped writable; the block fits one page.
+        unsafe {
+            process_abi::tls_install_tcb(scratch_va as *mut u8, tls_base_offset, tls_base_va);
+        }
+    };
     // SAFETY: the caller's contract: `target_aspace` is a child's address space,
     // never init's own.
-    unsafe {
-        arena.place_page(
-            target_aspace,
-            tls_base,
-            syscall::MAP_WRITABLE,
-            |scratch_va| {
-                // SAFETY: scratch_va is mapped writable and zeroed; the copy
-                // length is bounded by the tls_block_layout fit check above.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        module_bytes[tdata_start..tdata_end].as_ptr(),
-                        scratch_va as *mut u8,
-                        seg.filesz as usize,
-                    );
-                }
-                if let Some(t) = rela
-                {
-                    let table =
-                        &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
-                    // SAFETY: the template region [0, filesz) was just populated
-                    // and stays mapped writable for the rest of this closure.
-                    let template = unsafe {
-                        core::slice::from_raw_parts_mut(scratch_va as *mut u8, seg.filesz as usize)
-                    };
-                    let _ = elf::apply_relative_relocs(
-                        table,
-                        arch::current::EXPECTED_ELF_MACHINE,
-                        bias,
-                        seg.vaddr,
-                        template,
-                    );
-                }
-                // SAFETY: scratch_va is mapped writable; the block fits one page.
-                unsafe {
-                    process_abi::tls_install_tcb(
-                        scratch_va as *mut u8,
-                        tls_base_offset,
-                        tls_base_va,
-                    );
-                }
-            },
-        )
-    }?;
+    unsafe { arena.place_page(target_aspace, tls_base, syscall::MAP_WRITABLE, populate) }?;
 
     Some((tls_base_va, meta))
 }
@@ -731,6 +720,38 @@ unsafe fn populate_memmgr_info(
     let mm_sched_in_mm =
         syscall::cap_copy(caps.sched_baseline, caps.cspace, syscall::RIGHTS_ALL).ok()?;
 
+    let populate = |scratch_va: u64| {
+        // SAFETY: scratch_va is mapped writable and zeroed, one page.
+        let pi = unsafe { process_abi::process_info_mut(scratch_va) };
+        pi.version = PROCESS_ABI_VERSION;
+        pi.self_thread_cap = mm_thread_in_mm;
+        pi.self_aspace_cap = mm_aspace_in_mm;
+        pi.self_cspace_cap = mm_cspace_in_mm;
+        pi.sched_control_cap = mm_sched_in_mm;
+        pi.initial_priority = ipc::sched_policy::MEMMGR_PRIORITY;
+        pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
+        pi.creator_endpoint_cap = caps.creator_endpoint_slot;
+        pi.procmgr_endpoint_cap = 0;
+        pi.memmgr_endpoint_cap = 0;
+        pi.stdin_memory_cap = 0;
+        pi.stdout_memory_cap = 0;
+        pi.stderr_memory_cap = 0;
+        pi.log_send_cap = 0;
+        pi.stdin_data_notification_cap = 0;
+        pi.stdin_space_notification_cap = 0;
+        pi.stdout_data_notification_cap = 0;
+        pi.stdout_space_notification_cap = 0;
+        pi.stderr_data_notification_cap = 0;
+        pi.stderr_space_notification_cap = 0;
+        pi.stack_top_vaddr = layout.stack_top;
+        pi.stack_pages = stack_pages;
+        // memmgr's bespoke `_start` configures no TLS.
+        pi.main_tls_vaddr = 0;
+        // Infrastructure is never demand-paged (would recurse on its own
+        // faults); leave the pager unbound.
+        pi.pager_endpoint_cap = 0;
+        pi.pager_badge = 0;
+    };
     // SAFETY: the caller's contract: `target_aspace` is a child's address space,
     // never init's own.
     unsafe {
@@ -738,38 +759,7 @@ unsafe fn populate_memmgr_info(
             target_aspace,
             layout.process_info_va,
             syscall::MAP_READ,
-            |scratch_va| {
-                // SAFETY: scratch_va is mapped writable and zeroed, one page.
-                let pi = unsafe { process_abi::process_info_mut(scratch_va) };
-                pi.version = PROCESS_ABI_VERSION;
-                pi.self_thread_cap = mm_thread_in_mm;
-                pi.self_aspace_cap = mm_aspace_in_mm;
-                pi.self_cspace_cap = mm_cspace_in_mm;
-                pi.sched_control_cap = mm_sched_in_mm;
-                pi.initial_priority = ipc::sched_policy::MEMMGR_PRIORITY;
-                pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
-                pi.creator_endpoint_cap = caps.creator_endpoint_slot;
-                pi.procmgr_endpoint_cap = 0;
-                pi.memmgr_endpoint_cap = 0;
-                pi.stdin_memory_cap = 0;
-                pi.stdout_memory_cap = 0;
-                pi.stderr_memory_cap = 0;
-                pi.log_send_cap = 0;
-                pi.stdin_data_notification_cap = 0;
-                pi.stdin_space_notification_cap = 0;
-                pi.stdout_data_notification_cap = 0;
-                pi.stdout_space_notification_cap = 0;
-                pi.stderr_data_notification_cap = 0;
-                pi.stderr_space_notification_cap = 0;
-                pi.stack_top_vaddr = layout.stack_top;
-                pi.stack_pages = stack_pages;
-                // memmgr's bespoke `_start` configures no TLS.
-                pi.main_tls_vaddr = 0;
-                // Infrastructure is never demand-paged (would recurse on its own
-                // faults); leave the pager unbound.
-                pi.pager_endpoint_cap = 0;
-                pi.pager_badge = 0;
-            },
+            populate,
         )
     }?;
 
@@ -1374,6 +1364,56 @@ unsafe fn populate_procmgr_info(
     let pm_sched_in_pm =
         syscall::cap_copy(caps.sched_baseline, caps.cspace, syscall::RIGHTS_ALL).ok()?;
 
+    let populate = |scratch_va: u64| {
+        // SAFETY: scratch_va is mapped writable and zeroed, one page.
+        let pi = unsafe { process_abi::process_info_mut(scratch_va) };
+        pi.version = PROCESS_ABI_VERSION;
+        pi.self_thread_cap = pm_thread_in_pm;
+        pi.self_aspace_cap = pm_aspace_in_pm;
+        pi.self_cspace_cap = pm_cspace_in_pm;
+        pi.sched_control_cap = pm_sched_in_pm;
+        pi.initial_priority = ipc::sched_policy::PROCMGR_PRIORITY;
+        pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
+        pi.creator_endpoint_cap = caps.creator_endpoint_slot;
+        // procmgr has no procmgr above it; leave zero.
+        pi.procmgr_endpoint_cap = 0;
+        pi.memmgr_endpoint_cap = caps.memmgr_endpoint_slot;
+        pi.stdin_memory_cap = 0;
+        pi.stdout_memory_cap = 0;
+        pi.stderr_memory_cap = 0;
+        // Procmgr's own `seraph::log!` surface. The slot holds a badged
+        // SEND cap on the log endpoint with badge `LOG_BADGE_PROCMGR`,
+        // derived by init via `cap_derive_badge`. Procmgr's std `_start`
+        // installs it via `::log::install_badged_cap`. The un-badged
+        // SEND procmgr uses to derive per-child badged caps is separate
+        // (delivered via procmgr's bootstrap round).
+        pi.log_send_cap = caps.log_send_slot;
+        pi.stdin_data_notification_cap = 0;
+        pi.stdin_space_notification_cap = 0;
+        pi.stdout_data_notification_cap = 0;
+        pi.stdout_space_notification_cap = 0;
+        pi.stderr_data_notification_cap = 0;
+        pi.stderr_space_notification_cap = 0;
+        pi.tls_template_vaddr = caps.tls.vaddr;
+        pi.tls_template_filesz = caps.tls.filesz;
+        pi.tls_template_memsz = caps.tls.memsz;
+        pi.tls_template_align = caps.tls.align;
+        pi.stack_top_vaddr = layout.stack_top;
+        pi.stack_pages = stack_pages;
+        // TLS block base, or zero when procmgr's image carries no PT_TLS.
+        pi.main_tls_vaddr = if caps.tls.memsz != 0
+        {
+            layout.tls_base
+        }
+        else
+        {
+            0
+        };
+        // Infrastructure is never demand-paged (would recurse on its own
+        // faults); leave the pager unbound.
+        pi.pager_endpoint_cap = 0;
+        pi.pager_badge = 0;
+    };
     // SAFETY: the caller's contract: `target_aspace` is a child's address space,
     // never init's own.
     unsafe {
@@ -1381,56 +1421,7 @@ unsafe fn populate_procmgr_info(
             target_aspace,
             layout.process_info_va,
             syscall::MAP_READ,
-            |scratch_va| {
-                // SAFETY: scratch_va is mapped writable and zeroed, one page.
-                let pi = unsafe { process_abi::process_info_mut(scratch_va) };
-                pi.version = PROCESS_ABI_VERSION;
-                pi.self_thread_cap = pm_thread_in_pm;
-                pi.self_aspace_cap = pm_aspace_in_pm;
-                pi.self_cspace_cap = pm_cspace_in_pm;
-                pi.sched_control_cap = pm_sched_in_pm;
-                pi.initial_priority = ipc::sched_policy::PROCMGR_PRIORITY;
-                pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
-                pi.creator_endpoint_cap = caps.creator_endpoint_slot;
-                // procmgr has no procmgr above it; leave zero.
-                pi.procmgr_endpoint_cap = 0;
-                pi.memmgr_endpoint_cap = caps.memmgr_endpoint_slot;
-                pi.stdin_memory_cap = 0;
-                pi.stdout_memory_cap = 0;
-                pi.stderr_memory_cap = 0;
-                // Procmgr's own `seraph::log!` surface. The slot holds a badged
-                // SEND cap on the log endpoint with badge `LOG_BADGE_PROCMGR`,
-                // derived by init via `cap_derive_badge`. Procmgr's std `_start`
-                // installs it via `::log::install_badged_cap`. The un-badged
-                // SEND procmgr uses to derive per-child badged caps is separate
-                // (delivered via procmgr's bootstrap round).
-                pi.log_send_cap = caps.log_send_slot;
-                pi.stdin_data_notification_cap = 0;
-                pi.stdin_space_notification_cap = 0;
-                pi.stdout_data_notification_cap = 0;
-                pi.stdout_space_notification_cap = 0;
-                pi.stderr_data_notification_cap = 0;
-                pi.stderr_space_notification_cap = 0;
-                pi.tls_template_vaddr = caps.tls.vaddr;
-                pi.tls_template_filesz = caps.tls.filesz;
-                pi.tls_template_memsz = caps.tls.memsz;
-                pi.tls_template_align = caps.tls.align;
-                pi.stack_top_vaddr = layout.stack_top;
-                pi.stack_pages = stack_pages;
-                // TLS block base, or zero when procmgr's image carries no PT_TLS.
-                pi.main_tls_vaddr = if caps.tls.memsz != 0
-                {
-                    layout.tls_base
-                }
-                else
-                {
-                    0
-                };
-                // Infrastructure is never demand-paged (would recurse on its own
-                // faults); leave the pager unbound.
-                pi.pager_endpoint_cap = 0;
-                pi.pager_badge = 0;
-            },
+            populate,
         )
     }?;
 

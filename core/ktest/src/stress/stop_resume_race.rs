@@ -112,6 +112,10 @@ const ALL_DONE: u64 = BIT_STOP_DONE | BIT_START_DONE;
 /// controller flips it to 1 to release STOPPER and STARTER at the same instant.
 static RELEASE: AtomicU32 = AtomicU32::new(0);
 
+// too_many_lines: one stress cell's setup, cycle loop, and teardown; the three
+// child starts' `unsafe` wrappers push it past the limit, and splitting would
+// thread each cycle's caps and stacks through helpers.
+#[allow(clippy::too_many_lines)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)

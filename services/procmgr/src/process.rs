@@ -2428,7 +2428,8 @@ pub fn create_process_from_file(
                                 vfs_read_exact(load_ctx.file_cap, load_ctx.ipc_buf, off, dst)
                             },
                             |r| {
-                                applied_relocs += elf::apply_reloc_in_span(r, bias, seg.vaddr, span)
+                                applied_relocs +=
+                                    elf::apply_reloc_in_span(r, bias, seg.vaddr, span);
                             },
                         );
                     }

@@ -250,12 +250,13 @@ fn arena_grow(pool: &mut FreePool) -> bool
     let (self_aspace, page_idx, arena_base) =
         unsafe { (ARENA_SELF_ASPACE, ARENA_PAGES, ARENA_BASE_VA) };
     let va = arena_base + u64::from(page_idx) * PAGE_SIZE;
-    // SAFETY: `va` is the arena's next unmapped page, in memmgr's private
-    // arena zone below `META_ARENA_CEILING`, which only `arena_grow` maps and
-    // where no image, stack, or IPC page lies (the zone map above).
-    if va >= META_ARENA_CEILING
-        || unsafe { syscall::mem_map(outer, self_aspace, va, 0, 1, MAP_READ | MAP_WRITABLE) }
-            .is_err()
+    let mapped = va < META_ARENA_CEILING && {
+        // SAFETY: `va` is the arena's next unmapped page, in memmgr's private
+        // arena zone below `META_ARENA_CEILING`, which only `arena_grow` maps
+        // and where no image, stack, or IPC page lies (the zone map above).
+        unsafe { syscall::mem_map(outer, self_aspace, va, 0, 1, MAP_READ | MAP_WRITABLE) }.is_ok()
+    };
+    if !mapped
     {
         // Return the unusable frame to the pool; it stays owned and counted.
         let _ = pool.push(FreeRun {

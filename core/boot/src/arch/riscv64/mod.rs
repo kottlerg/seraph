@@ -5,8 +5,9 @@
 
 //! RISC-V 64-bit architecture module for the bootloader.
 //!
-//! Exports arch-specific constants, the kernel handoff function, and
-//! pre-serial-init / boot-hart-ID discovery helpers.
+//! Exports arch-specific constants, the kernel handoff function, the kernel
+//! image and AP trampoline allocation hooks, and pre-serial-init /
+//! boot-hart-ID discovery helpers.
 
 // Hand-crafted PE/COFF header for RISC-V UEFI builds. LLVM has no PE/COFF
 // backend for RISC-V, so we prepend this header and convert with
@@ -26,6 +27,7 @@ pub use handoff::{perform_handoff, trampoline_page_range};
 pub use paging::{BootPageTable, negotiate_paging};
 
 use crate::elf::EM_RISCV;
+use crate::error::BootError;
 use crate::firmware::FirmwareInfo;
 use crate::uefi::{
     EFI_SUCCESS, EfiBootServices, EfiGuid, EfiStatus, EfiSystemTable, allocate_pages,
@@ -180,6 +182,25 @@ pub unsafe fn allocate_ap_trampoline(bs: *mut EfiBootServices) -> Option<u64>
 {
     // SAFETY: bs is valid per the caller's contract.
     unsafe { allocate_pages(bs, 1).ok() }
+}
+
+/// Allocate the `pages`-page span the kernel image is loaded into, at any
+/// free physical base.
+///
+/// RISC-V places no bound on the image: `satp` holds a 44-bit root PPN and
+/// SBI `HART_START` takes a full-width entry address, so placement tolerates
+/// any firmware memory layout.
+///
+/// # Errors
+/// `BootError::OutOfMemory` when no free span of `pages` pages exists.
+///
+/// # Safety
+/// `bs` must be valid UEFI boot services; call before `ExitBootServices`.
+pub unsafe fn allocate_kernel_span(bs: *mut EfiBootServices, pages: usize)
+-> Result<u64, BootError>
+{
+    // SAFETY: bs is valid per the caller's contract.
+    unsafe { allocate_pages(bs, pages) }
 }
 
 /// QEMU virt RISC-V default MMIO apertures: PCI ECAM + 32-bit + 64-bit

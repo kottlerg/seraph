@@ -21,8 +21,13 @@ neither survives handoff.
 The kernel has its own console arrangements and takes nothing from the
 bootloader's console state.
 
-The bootloader is single-threaded and never preempts itself, so the shared
-console state needs no locking.
+The bootloader is single-threaded and never preempts itself, so nothing contends
+for the console. Its one re-entry is the panic handler printing a panic raised
+inside a console write. The framebuffer state therefore sits in a cell that
+holds a busy flag beside the state and hands the state out only while the flag
+is held, a try-lock on the one boot thread: a re-entered write finds it busy
+and goes to serial only, leaving the framebuffer state to the interrupted outer
+write.
 
 ---
 

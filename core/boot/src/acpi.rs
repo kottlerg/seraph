@@ -18,8 +18,10 @@
 //! # Surface
 //! - [`parse_cpu_topology`]: MADT walk producing `BootInfo.cpu_count` and
 //!   `BootInfo.cpu_ids`.
-//! - [`parse_aperture_seed`]: MADT + MCFG walk producing MMIO aperture
-//!   seeds fed into [`super::memory_map::derive_mmio_apertures`].
+//! - [`parse_aperture_seed`]: MADT + MCFG walk, plus the arch's
+//!   platform-default MMIO apertures (`core/boot/docs/acpi.md` § Tables
+//!   Consumed), producing MMIO aperture seeds fed into
+//!   [`super::memory_map::derive_mmio_apertures`].
 //! - [`parse_hart_caps`]: RHCT walk (RISC-V, ACPI 6.5+) producing the
 //!   `time` CSR frequency and the `HART_CAP_*` bits every hart advertises.
 //! - [`parse_vmgenid_paddr`]: SSDT walk (QEMU VMGENID) producing the
@@ -513,7 +515,8 @@ fn parse_madt_topology(table: &[u8], bsp_id: u32) -> (u32, u32, [u32; MAX_CPUS])
     if truncated
     {
         bprintln!(
-            "[--------] boot: ACPI: MADT reported more than MAX_CPUS enabled CPUs; surplus dropped"
+            "[--------] boot: ACPI: MADT reported more than MAX_CPUS enabled CPUs (BSP \
+             included); surplus dropped"
         );
     }
     (cpu_count, bsp_id, cpu_ids)
@@ -599,32 +602,11 @@ fn madt_topology(table: &[u8], bsp_id: u32) -> (u32, [u32; MAX_CPUS], bool)
         return (1, cpu_ids, truncated);
     }
 
-    // Place BSP at index 0, APs at subsequent indices. The count is the
-    // number of slots filled, so the BSP counts once whether the MADT lists
-    // it or not, and `cpu_ids[1..cpu_count]` holds exactly the APs.
-    let mut logical_idx: usize = 1;
-    for &id in &all_ids[..all_count]
-    {
-        if id == bsp_id
-        {
-            continue;
-        }
-        if logical_idx < MAX_CPUS
-        {
-            cpu_ids[logical_idx] = id;
-            logical_idx += 1;
-        }
-        else
-        {
-            // A full MADT that omits the BSP leaves one AP without a slot.
-            truncated = true;
-        }
-    }
-
-    // logical_idx is at most MAX_CPUS, which fits in u32.
-    #[allow(clippy::cast_possible_truncation)]
-    let cpu_count = logical_idx as u32;
-    (cpu_count, cpu_ids, truncated)
+    // Place BSP at index 0, APs after it; a full MADT that omits the BSP
+    // leaves one AP without a slot, which `place_cpu_ids` reports.
+    let (cpu_count, cpu_ids, placement_truncated) =
+        crate::firmware::place_cpu_ids(bsp_id, &all_ids[..all_count]);
+    (cpu_count, cpu_ids, truncated || placement_truncated)
 }
 
 /// Append one enabled CPU's hardware ID to the MADT collection, skipping an

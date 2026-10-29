@@ -8,7 +8,8 @@
 //! Defines the per-arch hooks the arch-neutral boot flow calls:
 //! [`EXPECTED_ELF_MACHINE`]; CPU identification via CPUID
 //! ([`bsp_hardware_id`], [`max_phys_addr_bits`]); AP trampoline reservation
-//! below 1 MiB ([`allocate_ap_trampoline`]); paging and handoff hooks
+//! below 1 MiB ([`allocate_ap_trampoline`]); kernel image placement below
+//! 4 GiB ([`allocate_kernel_span`]); paging and handoff hooks
 //! ([`negotiate_paging`], [`default_direct_map_base`], re-exported
 //! [`BootPageTable`], [`perform_handoff`], [`trampoline_page_range`]);
 //! firmware MMIO population ([`populate_kernel_mmio`]); and stubs, each
@@ -28,6 +29,7 @@ pub use handoff::{perform_handoff, trampoline_page_range};
 pub use paging::BootPageTable;
 
 use crate::elf::EM_X86_64;
+use crate::error::BootError;
 use crate::firmware::FirmwareInfo;
 use crate::uefi::{EfiBootServices, EfiSystemTable, allocate_pages_max_addr};
 use boot_protocol::KernelMmio;
@@ -48,6 +50,30 @@ pub unsafe fn allocate_ap_trampoline(bs: *mut EfiBootServices) -> Option<u64>
 {
     // SAFETY: bs is valid per the caller's contract.
     unsafe { allocate_pages_max_addr(bs, 0xFFFFF, 1).ok() }
+}
+
+/// Highest physical address the kernel image span may reach on x86-64.
+const KERNEL_SPAN_MAX_PHYS: u64 = 0xFFFF_FFFF;
+
+/// Allocate the `pages`-page span the kernel image is loaded into, lying
+/// wholly below 4 GiB.
+///
+/// The kernel's root page table lives in the image's BSS, and an AP leaves
+/// real mode through 32-bit protected mode, where the trampoline loads that
+/// table into CR3 with a 32-bit move; a root table above 4 GiB cannot be
+/// named there (`abi/boot-protocol` `BootInfo.kernel_physical_base`).
+///
+/// # Errors
+/// `BootError::OutOfMemory` when no free span of `pages` pages exists below
+/// 4 GiB.
+///
+/// # Safety
+/// `bs` must be valid UEFI boot services; call before `ExitBootServices`.
+pub unsafe fn allocate_kernel_span(bs: *mut EfiBootServices, pages: usize)
+-> Result<u64, BootError>
+{
+    // SAFETY: bs is valid per the caller's contract.
+    unsafe { allocate_pages_max_addr(bs, KERNEL_SPAN_MAX_PHYS, pages) }
 }
 
 /// No-op on x86-64: COM1 sits at the fixed I/O port `0x3F8`, so there is no

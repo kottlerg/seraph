@@ -42,8 +42,10 @@ impl FramebufferWriter
 {
     /// Construct a `FramebufferWriter` from a `FramebufferInfo`.
     ///
-    /// Returns `None` if `fb.physical_base == 0` (no framebuffer available).
-    /// Clears the screen to black on success.
+    /// Returns `None` if `fb.physical_base == 0` (no framebuffer available) or
+    /// the framebuffer is narrower or shorter than one glyph cell, since the
+    /// cursor, wrap, and scroll arithmetic assume at least one row and one
+    /// column. Clears the screen to black on success.
     ///
     /// # Safety
     /// `fb.physical_base` must be a valid, writable framebuffer region of at
@@ -57,6 +59,10 @@ impl FramebufferWriter
 
         let max_cols = fb.width / GLYPH_WIDTH;
         let max_rows = fb.height / GLYPH_HEIGHT;
+        if max_cols == 0 || max_rows == 0
+        {
+            return None;
+        }
 
         let mut writer = FramebufferWriter {
             base: fb.physical_base as *mut u8,
@@ -274,5 +280,53 @@ impl FramebufferWriter
 
         // Park cursor on the last row.
         self.row = self.max_rows - 1;
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    fn info(base: &mut [u8], width: u32, height: u32) -> FramebufferInfo
+    {
+        FramebufferInfo {
+            physical_base: base.as_mut_ptr() as u64,
+            width,
+            height,
+            stride: width * 4,
+            pixel_format: PixelFormat::Bgrx8,
+        }
+    }
+
+    /// A framebuffer shorter than one glyph row has no row to scroll, so it
+    /// must be treated as absent rather than underflowing in `scroll`.
+    #[test]
+    fn framebuffer_shorter_than_a_glyph_is_absent()
+    {
+        let mut pixels = vec![0u8; (GLYPH_WIDTH * 4 * (GLYPH_HEIGHT - 1)) as usize];
+        let fb = info(&mut pixels, GLYPH_WIDTH, GLYPH_HEIGHT - 1);
+        // SAFETY: `pixels` backs `stride * height` writable bytes.
+        assert!(unsafe { FramebufferWriter::new(&fb) }.is_none());
+    }
+
+    /// A framebuffer narrower than one glyph column has no cell to draw in.
+    #[test]
+    fn framebuffer_narrower_than_a_glyph_is_absent()
+    {
+        let mut pixels = vec![0u8; ((GLYPH_WIDTH - 1) * 4 * GLYPH_HEIGHT) as usize];
+        let fb = info(&mut pixels, GLYPH_WIDTH - 1, GLYPH_HEIGHT);
+        // SAFETY: `pixels` backs `stride * height` writable bytes.
+        assert!(unsafe { FramebufferWriter::new(&fb) }.is_none());
+    }
+
+    /// A framebuffer of exactly one glyph cell is usable: one row, one column.
+    #[test]
+    fn framebuffer_of_one_glyph_cell_is_present()
+    {
+        let mut pixels = vec![0u8; (GLYPH_WIDTH * 4 * GLYPH_HEIGHT) as usize];
+        let fb = info(&mut pixels, GLYPH_WIDTH, GLYPH_HEIGHT);
+        // SAFETY: `pixels` backs `stride * height` writable bytes.
+        assert!(unsafe { FramebufferWriter::new(&fb) }.is_some());
     }
 }

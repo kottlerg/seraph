@@ -600,8 +600,9 @@ list as the tracking Issues move):
   loading the kernel ELF, because the bootloader requested the image at a fixed
   `p_paddr` (`0x80200000`) that hart-scaled firmware allocations had already
   claimed — independent of guest memory size. The kernel image is now placed as
-  one contiguous span allocated anywhere (`AllocateAnyPages`), so loading
-  tolerates any firmware layout; `validate_kernel_layout` enforces the
+  one contiguous span allocated anywhere (`AllocateAnyPages`; on x86_64, anywhere
+  below 4 GiB with `AllocateMaxAddress`), so loading tolerates any firmware layout;
+  `validate_kernel_layout` enforces the
   [relocation invariants](../core/boot/docs/elf-loading.md#elf-validation) (single
   offset, alignment, non-overlap, entry-in-image) at load time. 128 harts now
   boots clean at 8× hart oversubscription on a 16-core host (the boundary run above).

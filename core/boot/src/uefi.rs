@@ -588,6 +588,19 @@ pub unsafe fn open_file(
     Ok(file)
 }
 
+/// Byte length of [`FileInfoBuf`]: an `EfiFileInfo` plus room for a short
+/// UTF-16 file name.
+const FILE_INFO_BUF_LEN: usize = core::mem::size_of::<EfiFileInfo>() + 256;
+
+/// Receive buffer for `GetInfo(EFI_FILE_INFO_ID)`, aligned so its filled
+/// `EfiFileInfo` prefix can be read in place through an aligned pointer.
+#[repr(C, align(8))]
+struct FileInfoBuf([u8; FILE_INFO_BUF_LEN]);
+
+// `file_size` reads the `EfiFileInfo` prefix through a pointer to the buffer,
+// which is sound only while the buffer is at least as aligned as the struct.
+const _: () = assert!(core::mem::align_of::<FileInfoBuf>() >= core::mem::align_of::<EfiFileInfo>());
+
 /// Query the file size in bytes using `EFI_FILE_INFO`.
 ///
 /// # Safety
@@ -612,15 +625,15 @@ pub unsafe fn file_size(file: *mut EfiFileProtocol) -> Result<u64, BootError>
     }
 
     // Stack-allocate a buffer large enough for EfiFileInfo plus a short name.
-    let mut buf = [0u8; core::mem::size_of::<EfiFileInfo>() + 256];
-    let mut buf_size = buf.len();
-    // SAFETY: buf is correctly sized; file is valid.
+    let mut buf = FileInfoBuf([0u8; FILE_INFO_BUF_LEN]);
+    let mut buf_size = FILE_INFO_BUF_LEN;
+    // SAFETY: buf is FILE_INFO_BUF_LEN writable bytes; file is valid.
     let status = unsafe {
         ((*file).get_info)(
             file,
             core::ptr::addr_of!(EFI_FILE_INFO_ID),
             core::ptr::addr_of_mut!(buf_size),
-            buf.as_mut_ptr().cast::<core::ffi::c_void>(),
+            core::ptr::from_mut(&mut buf).cast::<core::ffi::c_void>(),
         )
     };
     if status != EFI_SUCCESS
@@ -628,13 +641,12 @@ pub unsafe fn file_size(file: *mut EfiFileProtocol) -> Result<u64, BootError>
         return Err(BootError::UefiError(status));
     }
 
-    // SAFETY: (unsound, #442) `get_info` filled `buf` with an `EfiFileInfo`
-    // prefix, but `buf` is a `[u8; N]` with alignment 1, so this reference is
-    // misaligned (undefined behaviour) whenever the stack slot is not 8-aligned.
-    // cast_ptr_alignment: the lint flags that real misalignment; it is suppressed
-    // pending the fix tracked in #442, not because the rule is inapplicable.
-    #[allow(clippy::cast_ptr_alignment)]
-    let info = unsafe { &*(buf.as_ptr().cast::<EfiFileInfo>()) };
+    // SAFETY: `get_info` succeeded, so `buf` starts with a filled
+    // `EfiFileInfo`, whose plain-integer fields are valid for any bytes. The
+    // pointer is aligned for `EfiFileInfo` because `FileInfoBuf` carries at
+    // least its alignment (the const assertion on `FileInfoBuf`), and the
+    // buffer is larger than `EfiFileInfo`, so the read stays in bounds.
+    let info = unsafe { &*core::ptr::from_ref(&buf).cast::<EfiFileInfo>() };
     Ok(info.file_size)
 }
 
@@ -689,22 +701,24 @@ pub unsafe fn allocate_pages(bs: *mut EfiBootServices, count: usize) -> Result<u
     Ok(addr)
 }
 
-/// Allocate `count` pages at or below `max_phys` physical address.
+/// Allocate `count` pages lying wholly at or below the `max_phys` physical
+/// address.
 ///
 /// Uses `AllocateMaxAddress` UEFI policy: the allocator picks any available
-/// pages with physical base ≤ `max_phys`. The firmware's `Memory` argument is
-/// in-out: it is seeded with `max_phys`, and on success it holds the allocated
-/// physical base, which this function returns.
+/// range whose uppermost address is ≤ `max_phys`. The firmware's `Memory`
+/// argument is in-out: it is seeded with `max_phys`, and on success it holds
+/// the allocated physical base, which this function returns.
 ///
-/// This is the arch-neutral UEFI wrapper. The only current caller is
-/// x86-64's `arch::current::allocate_ap_trampoline`, whose SIPI-vector
-/// constraint requires a frame below 1 MiB; the helper is not gated on
-/// architecture because `AllocateMaxAddress` is part of the UEFI spec on
-/// every supported platform.
+/// This is the arch-neutral UEFI wrapper. Its callers are x86-64's
+/// `arch::current::allocate_ap_trampoline`, whose SIPI-vector constraint
+/// requires a frame below 1 MiB, and x86-64's
+/// `arch::current::allocate_kernel_span`, which keeps the kernel image below
+/// 4 GiB; the helper is not gated on architecture because
+/// `AllocateMaxAddress` is part of the UEFI spec on every supported platform.
 ///
 /// # Safety
 /// `bs` must be valid boot services.
-// Used only by x86-64 `arch::current::allocate_ap_trampoline`; dead on riscv64.
+// Used only by the x86-64 `arch::current` allocation hooks; dead on riscv64.
 #[allow(dead_code)]
 pub unsafe fn allocate_pages_max_addr(
     bs: *mut EfiBootServices,
@@ -727,6 +741,27 @@ pub unsafe fn allocate_pages_max_addr(
         return Err(BootError::OutOfMemory);
     }
     Ok(addr)
+}
+
+/// Return `count` pages at `phys` to the firmware with `FreePages`.
+///
+/// # Errors
+/// `BootError::UefiError` carrying the status when the firmware rejects the
+/// call (the range was not allocated by `AllocatePages`, or is misaligned).
+///
+/// # Safety
+/// `bs` must be valid boot services (before `ExitBootServices`). The range
+/// must be one this bootloader allocated and must not be accessed again.
+pub unsafe fn free_pages(bs: *mut EfiBootServices, phys: u64, count: usize)
+-> Result<(), BootError>
+{
+    // SAFETY: bs is valid; the range is an allocation the caller owns.
+    let status = unsafe { ((*bs).free_pages)(phys, count) };
+    if status != EFI_SUCCESS
+    {
+        return Err(BootError::UefiError(status));
+    }
+    Ok(())
 }
 
 /// Query the UEFI memory map into a freshly allocated buffer sized with 16

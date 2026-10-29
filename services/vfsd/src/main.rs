@@ -348,11 +348,12 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// re-entry via `FS_READ` while loading a driver from the now-mounted
 /// root) does not deadlock.
 ///
-/// Concurrency invariants. `MOUNT` routes into `do_mount` (and
-/// `do_mount` calls itself recursively for the ESP auto-mount), which
+/// Concurrency invariants. `MOUNT` routes into `do_mount`, and a
+/// successful root `MOUNT` then auto-mounts `/esp` and `/data` through
+/// `auto_mount_role`; all of them reach `do_mount_internal`, which
 /// mutates shared runtime state under the `VfsdRuntime` mutexes:
-/// - `rt.boot_module_cap` — Mutex; swapped to zero on the first
-///   successful mount.
+/// - `rt.boot_module_cap` — Mutex; swapped to zero by the first mount
+///   that reaches the driver spawn, whether or not it succeeds.
 /// - `rt.root_backend` — Mutex; the synthetic-root tree's only
 ///   mutator. `VfsdRootBackend::can_install` and
 ///   `VfsdRootBackend::install` reject an already-terminal entry, so
@@ -550,7 +551,6 @@ fn try_forward_lookup_fallthrough(
         Err(GateError::PermissionDenied | GateError::UnknownLabel) => return false,
     };
     // Cast is range-safe: name_len lives in bits 16..32 of the label.
-    #[allow(clippy::cast_possible_truncation)]
     let name_len = ((recv.label >> 16) & 0xFFFF) as usize;
     let data_bytes = recv.data_bytes();
     if name_len == 0 || data_bytes.len() < 8 + name_len

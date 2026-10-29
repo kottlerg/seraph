@@ -792,13 +792,19 @@ mod tests
     }
 
     #[test]
-    fn path_of_rejects_a_short_buffer_an_inactive_node_and_an_index_past_the_pool()
+    fn path_of_rejects_a_short_buffer_and_an_inactive_node()
     {
         let mut b = VfsdRootBackend::new();
         let a = intermediate_a(&mut b);
         assert_eq!(b.path_of(a, &mut [0u8; 1]), None);
         assert_eq!(b.path_of(0, &mut []), None);
         assert_eq!(b.path_of(30, &mut [0u8; 64]), None);
+    }
+
+    #[test]
+    fn path_of_an_index_past_the_pool_is_none()
+    {
+        let b = VfsdRootBackend::new();
         assert_eq!(b.path_of(MAX_TREE_NODES as u32, &mut [0u8; 64]), None);
     }
 

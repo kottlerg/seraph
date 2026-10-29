@@ -22,9 +22,9 @@
 //!
 //! Both paths route the per-child cap delivery through the bootstrap worker
 //! so the main thread's `reply_tcb` is never clobbered while servicing the
-//! caller's MOUNT. After the worker signals delivery, main sends a
-//! one-word `FS_MOUNT` (word 0 carries `FS_LABELS_VERSION`, the label-set
-//! handshake) to the new driver as a BPB-validation probe.
+//! caller's MOUNT. After the worker signals delivery, main sends
+//! `FS_MOUNT` (request layout in `services/fs/docs/fs-driver-protocol.md`
+//! § Label 10: `FS_MOUNT`) to the new driver as a BPB-validation probe.
 //!
 //! The `partition_ep` passed in is a badged SEND cap on virtio-blk's service
 //! endpoint, already registered with virtio-blk against a specific LBA range.

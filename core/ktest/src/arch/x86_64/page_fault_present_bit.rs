@@ -25,7 +25,9 @@
 //!      in the top GiB (about half of KASLR boots) some probe lands on a mapped
 //!      supervisor page whose fault has P = 1, and a kernel that passed the bit
 //!      through fails the test; on the other boots every probe finds an unmapped
-//!      page and this half cannot fail, which CI's many boots per change cover.
+//!      page and this half cannot fail. CI boots x86-64 ktest twice per change
+//!      (debug and release), so it exercises this half in about three runs of
+//!      four until #563's fix lets the probes cover the whole window.
 //!
 //! The probes do not locate a mapped kernel VA with `SIDT`/`SGDT`, which ring 3
 //! can still execute while `CR4.UMIP` is clear (#560): that disclosure is a

@@ -153,10 +153,10 @@ fn getrandom_with_ac_set(dst: &mut [u8]) -> (i64, u64)
     let rflags: u64;
     // SAFETY: `dst` is a live, writable buffer of `dst.len()` bytes. AC is set
     // through the stack image of RFLAGS (`stac` is ring-0 only) and cleared the
-    // same way before the block ends; between the two only the syscall and
-    // three aligned 8-byte stack accesses (the `pushfq`, the `mov` that reads
-    // RFLAGS back, and the `and` that clears AC) run, so no user access can
-    // take an alignment check.
+    // same way before the block ends; while it is set only the syscall and
+    // four aligned stack accesses run (the `pushfq`, the `mov` that reads
+    // RFLAGS back, the dword `and` that clears AC in the stack image, and the
+    // `popfq` load), so no user access can take an alignment check.
     // Registers: rax carries the syscall number in and the result out; rdi and
     // rsi carry the arguments; SYSCALL clobbers rcx and r11; `flags` receives
     // RFLAGS after the syscall. pushfq/popfq use the stack.

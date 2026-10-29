@@ -133,16 +133,14 @@ pub fn memory_fields(_ctx: &TestContext) -> TestResult
     let memory_cap =
         crate::frame_pool::alloc().ok_or("cap_info::memory_fields: frame pool exhausted")?;
 
-    let size = cap_info(memory_cap, CAP_INFO_MEMORY_SIZE)
-        .map_err(|_| "cap_info(memory_cap, MEMORY_SIZE) failed")?;
-    let available = cap_info(memory_cap, CAP_INFO_MEMORY_AVAILABLE)
-        .map_err(|_| "cap_info(memory_cap, MEMORY_AVAILABLE) failed")?;
-    let has_retype = cap_info(memory_cap, CAP_INFO_MEMORY_HAS_RETYPE)
-        .map_err(|_| "cap_info(memory_cap, MEMORY_HAS_RETYPE) failed")?;
+    // Every read of the cap happens before it goes back to the pool.
+    let reads = read_memory_fields(memory_cap);
 
-    // SAFETY: alloc() returned the cap; pool is single-threaded for tests.
+    // SAFETY: alloc() returned the cap and it was never mapped; the reads above
+    // are its last use. The pool is single-threaded for tests.
     unsafe { crate::frame_pool::free(memory_cap) };
 
+    let (size, available, has_retype, tag_rights) = reads?;
     if size == 0
     {
         return Err("cap_info(memory_cap, MEMORY_SIZE) returned 0");
@@ -157,15 +155,28 @@ pub fn memory_fields(_ctx: &TestContext) -> TestResult
     }
 
     // Cross-check the boolean against the rights bitmask via TAG_RIGHTS.
-    let value = cap_info(memory_cap, CAP_INFO_TAG_RIGHTS)
-        .map_err(|_| "cap_info(memory_cap, TAG_RIGHTS) failed")?;
-    let (_tag, rights) = unpack_tag_rights(value);
+    let (_tag, rights) = unpack_tag_rights(tag_rights);
     let expected = u64::from((rights & RIGHTS_RETYPE_BIT) != 0);
     if has_retype != expected
     {
         return Err("MEMORY_HAS_RETYPE disagrees with TAG_RIGHTS bitmask");
     }
     Ok(())
+}
+
+/// Read `memory_cap`'s size, available bytes, has-retype flag, and packed
+/// tag-and-rights word, in that order.
+fn read_memory_fields(memory_cap: u32) -> Result<(u64, u64, u64, u64), &'static str>
+{
+    let size = cap_info(memory_cap, CAP_INFO_MEMORY_SIZE)
+        .map_err(|_| "cap_info(memory_cap, MEMORY_SIZE) failed")?;
+    let available = cap_info(memory_cap, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "cap_info(memory_cap, MEMORY_AVAILABLE) failed")?;
+    let has_retype = cap_info(memory_cap, CAP_INFO_MEMORY_HAS_RETYPE)
+        .map_err(|_| "cap_info(memory_cap, MEMORY_HAS_RETYPE) failed")?;
+    let tag_rights = cap_info(memory_cap, CAP_INFO_TAG_RIGHTS)
+        .map_err(|_| "cap_info(memory_cap, TAG_RIGHTS) failed")?;
+    Ok((size, available, has_retype, tag_rights))
 }
 
 /// RAM Memory caps minted by the kernel at boot carry the `RETYPE` right.

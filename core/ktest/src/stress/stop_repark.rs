@@ -118,10 +118,14 @@ const ENTRY_WAIT_US: u64 = 100_000;
 const ENTRY_SPINS: u32 = 100_000;
 
 /// Bound on the controller's deliveries after the rounds, in 1 ms polls.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const FINAL_POLLS: u32 = 2000;
 
 /// Bound on the waits for the sender to pause and for both children to
 /// exit, in 1 ms polls.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const EXIT_POLLS: u32 = 2000;
 
 /// Set by the controller once a phase's rounds and final check are done;
@@ -469,7 +473,7 @@ fn await_entry(entered: u32) -> bool
 fn pause_sender() -> TestResult
 {
     SENDING.store(0, Ordering::SeqCst);
-    for _ in 0..EXIT_POLLS
+    for _ in 0..crate::scaled_polls(EXIT_POLLS)
     {
         if SENDER_BUSY.load(Ordering::SeqCst) == 0
         {
@@ -486,7 +490,7 @@ fn pause_sender() -> TestResult
 fn final_check(kind: Kind, sources: [u32; SOURCES]) -> TestResult
 {
     let base = DELIVERED.each_ref().map(|d| d.load(Ordering::Acquire));
-    for _ in 0..FINAL_POLLS
+    for _ in 0..crate::scaled_polls(FINAL_POLLS)
     {
         let mut done = true;
         for (index, &source) in sources.iter().enumerate()
@@ -525,7 +529,7 @@ fn final_check(kind: Kind, sources: [u32; SOURCES]) -> TestResult
 fn finish(kind: Kind, sources: [u32; SOURCES]) -> TestResult
 {
     QUIT.store(1, Ordering::Release);
-    for _ in 0..EXIT_POLLS
+    for _ in 0..crate::scaled_polls(EXIT_POLLS)
     {
         if EXITED.load(Ordering::Acquire) as usize == CHILDREN
         {

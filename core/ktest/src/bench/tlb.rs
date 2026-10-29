@@ -177,8 +177,12 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
                 },
             )
         };
-        if spawn::configure_and_start_pinned(&child, shootdown_spinner_entry, stack_top, arg, cpu)
-            .is_err()
+        // SAFETY: the stack is `SHOOTDOWN_STACKS[i]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        if unsafe {
+            spawn::configure_and_start_pinned(&child, shootdown_spinner_entry, stack_top, arg, cpu)
+        }
+        .is_err()
         {
             cap_delete(child.th).ok();
             cap_delete(child.cs).ok();
@@ -219,21 +223,27 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 
     for _ in 0..n
     {
-        if syscall::mem_map(
-            memory_cap,
-            ctx.aspace_cap,
-            BENCH_VA,
-            0,
-            1,
-            syscall::MAP_WRITABLE,
-        )
+        // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe {
+            syscall::mem_map(
+                memory_cap,
+                ctx.aspace_cap,
+                BENCH_VA,
+                0,
+                1,
+                syscall::MAP_WRITABLE,
+            )
+        }
         .is_err()
         {
             break;
         }
         // Measure the unmap — that's the path that issues the shootdown IPI.
         let t0 = cycles_now();
-        let unmapped = syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1).is_ok();
+        // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        let unmapped = unsafe { syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1) }.is_ok();
         let t1 = cycles_now();
         if !unmapped
         {
@@ -450,7 +460,9 @@ extern "C" fn conc_worker_entry(arg: u64) -> !
         // Time the map — a Fresh rewrite (the VA is unmapped at loop top); see
         // core/kernel/docs/memory-internals.md § SMP TLB Shootdown.
         let m0 = cycles_now();
-        let mr = syscall::mem_map(memory, aspace, va, 0, 1, syscall::MAP_WRITABLE);
+        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        let mr = unsafe { syscall::mem_map(memory, aspace, va, 0, 1, syscall::MAP_WRITABLE) };
         let m1 = cycles_now();
         if mr.is_err()
         {
@@ -460,7 +472,9 @@ extern "C" fn conc_worker_entry(arg: u64) -> !
         conc_map_fold(m1.saturating_sub(m0));
         // Time the unmap — the path that issues the shootdown IPI volley.
         let t0 = cycles_now();
-        let r = syscall::mem_unmap(aspace, va, 1);
+        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        let r = unsafe { syscall::mem_unmap(aspace, va, 1) };
         let t1 = cycles_now();
         if r.is_err()
         {
@@ -592,8 +606,12 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
                 },
             )
         };
-        if spawn::configure_and_start_pinned(&child, conc_worker_entry, stack_top, arg, cpu)
-            .is_err()
+        // SAFETY: the stack is `CONC_STACKS[i]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        if unsafe {
+            spawn::configure_and_start_pinned(&child, conc_worker_entry, stack_top, arg, cpu)
+        }
+        .is_err()
         {
             cap_delete(child.th).ok();
             cap_delete(child.cs).ok();
@@ -628,7 +646,9 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         // for frames whose worker never spawned. A frame whose unmap fails
         // stays out of the pool rather than alias the next test's mapping.
         let va = CONC_VA_BASE + (i as u64) * CONC_VA_STRIDE;
-        if syscall::mem_unmap(ctx.aspace_cap, va, 1).is_ok()
+        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe { syscall::mem_unmap(ctx.aspace_cap, va, 1) }.is_ok()
         {
             // SAFETY: frame is from the pool and its mapping was just removed.
             unsafe { crate::frame_pool::free(*fr) };

@@ -102,7 +102,9 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let frame = crate::frame_pool::alloc().ok_or("page_fault_present_bit: frame pool exhausted")?;
-    if mem_map(frame, ctx.aspace_cap, RO_VA, 0, 1, MAP_READ).is_err()
+    // SAFETY: `RO_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe { mem_map(frame, ctx.aspace_cap, RO_VA, 0, 1, MAP_READ) }.is_err()
     {
         // SAFETY: `frame` came from the pool and the map failed, so it is mapped
         // nowhere.
@@ -112,7 +114,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     let result = handle_child(ctx);
 
-    if mem_unmap(ctx.aspace_cap, RO_VA, 1).is_ok()
+    // SAFETY: `RO_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe { mem_unmap(ctx.aspace_cap, RO_VA, 1) }.is_ok()
     {
         // SAFETY: `frame` came from the pool and its only mapping was just
         // removed; the child that touched it has exited or been deleted.
@@ -139,7 +143,9 @@ fn handle_child(ctx: &TestContext) -> TestResult
         .map_err(|_| "page_fault_present_bit: thread_set_fault_handler failed")
         .and_then(|()| {
             let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-            crate::spawn::configure_and_start(&child, probe_child, stack_top, 0)
+            // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+            // on which no other live thread runs (`ChildStack`'s rule).
+            unsafe { crate::spawn::configure_and_start(&child, probe_child, stack_top, 0) }
                 .map_err(|_| "page_fault_present_bit: configure_and_start failed")
         })
         .and_then(|()| expect_fault(ctx, ep, child.th, RO_VA, Access::UserStore))
@@ -235,10 +241,13 @@ fn expect_fault(ctx: &TestContext, ep: u32, child_th: u32, va: u64, access: Acce
     }
 
     let mut regs = [0u8; BUF];
-    thread_read_regs(child_th, regs.as_mut_ptr(), BUF)
+    thread_read_regs(child_th, &mut regs[..BUF])
         .map_err(|_| "page_fault_present_bit: thread_read_regs failed")?;
     regs[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&(ip + 2).to_le_bytes());
-    thread_write_regs(child_th, regs.as_ptr(), BUF)
+    // SAFETY: the frame was read from this fault-blocked child and only its IP
+    // moves, past the two-byte probe instruction to the next one in the same
+    // function, on the child's own stack.
+    unsafe { thread_write_regs(child_th, &regs[..BUF]) }
         .map_err(|_| "page_fault_present_bit: thread_write_regs failed")?;
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
     unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_RESUME), ctx.ipc_buf) }

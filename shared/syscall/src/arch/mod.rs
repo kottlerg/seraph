@@ -17,10 +17,27 @@
 //!
 //! Every wrapper is an `unsafe fn` with one contract: `nr` must be a syscall
 //! number the kernel defines, and the remaining arguments must be that call's
-//! arguments, in the order `core/kernel/docs/syscalls.md` gives; a pointer argument must be
-//! valid for the access the call's contract specifies. The exception is `syscall3_any`,
-//! which accepts any `nr` and arguments under its own `# Safety`. The kernel ABI's
-//! register clobbers are declared in each wrapper's asm.
+//! arguments, in the order `core/kernel/docs/syscalls.md` gives. Beyond that, the
+//! call's effects on memory must leave every live Rust object intact:
+//!
+//! - a pointer argument must be valid for the access the call's contract specifies;
+//! - a call that reads or writes the calling thread's registered IPC buffer page
+//!   (`SYS_IPC_CALL` reads it for the request and writes it with the reply,
+//!   `SYS_IPC_RECV` writes it, `SYS_IPC_REPLY` reads it) must hold no Rust
+//!   reference into that page across the call; the page is the one
+//!   `crate::ipc_buffer_set` registered under its own `# Safety`;
+//! - a call that changes mappings of the caller's own address space
+//!   (`SYS_MEM_MAP`, `SYS_MEM_UNMAP`, `SYS_MEM_PROTECT`, `SYS_MMIO_MAP`) must
+//!   change none that a live Rust object or the registered IPC buffer page
+//!   occupies;
+//! - a call that sets the entry state of a thread of the caller's own address
+//!   space (`SYS_THREAD_CONFIGURE`, `SYS_THREAD_WRITE_REGS`) must start or
+//!   resume it only on code, a stack, and a TLS block the program dedicates to
+//!   that thread.
+//!
+//! The exception is `syscall3_any`, which accepts any `nr` and arguments under
+//! its own `# Safety`. The kernel ABI's register clobbers are declared in each
+//! wrapper's asm.
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]

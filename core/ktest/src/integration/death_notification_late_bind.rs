@@ -99,7 +99,9 @@ fn late_bind_after_death(
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "death_notification_late_bind: spawn::new_child failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start(&child, entry, stack_top, 0)
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, entry, stack_top, 0) }
         .map_err(|_| "death_notification_late_bind: configure_and_start failed")?;
 
     crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS))?;
@@ -144,7 +146,9 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
         .map_err(|_| "death_notification_late_bind: bind before start failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start(&child, clean_exit_child, stack_top, 0)
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, clean_exit_child, stack_top, 0) }
         .map_err(|_| "death_notification_late_bind: configure_and_start (control) failed")?;
 
     crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS))?;

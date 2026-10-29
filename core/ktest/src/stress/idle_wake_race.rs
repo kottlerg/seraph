@@ -93,13 +93,17 @@ pub fn run(ctx: &TestContext) -> TestResult
     unsafe { CHILD_C2P_SLOT = child_c2p };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start_pinned(
-        &child,
-        worker_entry,
-        stack_top,
-        u64::from(child_p2c),
-        1,
-    )
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start_pinned(
+            &child,
+            worker_entry,
+            stack_top,
+            u64::from(child_p2c),
+            1,
+        )
+    }
     .map_err(|_| "stress::idle_wake_race: configure_and_start_pinned failed")?;
 
     // Wait, bounded, for the worker to reach its notification_wait loop.

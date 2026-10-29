@@ -573,7 +573,9 @@ pub fn fs_write_memory_phase(_: &Caps)
 
     let range = std::os::seraph::reserve_pages(1).expect("reserve_pages");
     let va = range.va_start();
-    syscall::mem_map(memory_cap, info.self_aspace, va, 0, 1, MAP_WRITABLE)
+    // SAFETY: `range` is a fresh page reservation from the per-process arena,
+    // owned here: VA no Rust object or IPC page occupies.
+    unsafe { syscall::mem_map(memory_cap, info.self_aspace, va, 0, 1, MAP_WRITABLE) }
         .expect("mem_map memory cap failed");
 
     // SAFETY: va just mapped MAP_WRITABLE for one page; WRITE_LEN ≤ PAGE_SIZE.
@@ -607,7 +609,9 @@ pub fn fs_write_memory_phase(_: &Caps)
         .expect("FS_WRITE_MEMORY returned no cap");
     let _ = syscall::cap_delete(returned);
 
-    let _ = syscall::mem_unmap(info.self_aspace, va, 1);
+    // SAFETY: `va` is this phase's reserved page, written only through raw
+    // pointers above; no Rust reference into it is live.
+    let _ = unsafe { syscall::mem_unmap(info.self_aspace, va, 1) };
     let _ = syscall::cap_delete(file_cap);
 
     let mut f = std::fs::File::open("/data/svctest/wrtf.bin").expect("open wrtf.bin");

@@ -440,7 +440,10 @@ fn create_thread(
     // are deleted before the next phase's are created, and a delete round's
     // target is deleted (ended wherever it was) before its successor is.
     let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack]) });
-    thread_configure(th, entry as *const () as u64, top, 0)
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe { thread_configure(th, entry as *const () as u64, top, 0) }
         .map_err(|_| "stress::stop_target_vanishes: thread_configure failed")?;
     thread_set_affinity(th, cpu).map_err(|_| "stress::stop_target_vanishes: pin thread failed")?;
     Ok(th)

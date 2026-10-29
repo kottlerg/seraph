@@ -300,10 +300,17 @@ impl MemoryAlloc
 
     /// Allocate a page, map it writable at `va` in `aspace`, zero it, and
     /// return the memory cap.
-    pub(crate) fn alloc_zero_page(&mut self, aspace: u32, va: u64) -> Option<u32>
+    ///
+    /// # Safety
+    /// `aspace` must be init's own address space (the zeroing writes through
+    /// `va` here), and the page at `va` must be unmapped and hold no Rust
+    /// object or registered IPC page.
+    pub(crate) unsafe fn alloc_zero_page(&mut self, aspace: u32, va: u64) -> Option<u32>
     {
         let cap = self.alloc_page()?;
-        syscall::mem_map(cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).ok()?;
+        // SAFETY: the caller's contract: `va` is an unmapped page of init's
+        // own address space with nothing in it.
+        unsafe { syscall::mem_map(cap, aspace, va, 0, 1, syscall::MAP_WRITABLE) }.ok()?;
         // SAFETY: va is mapped writable and covers one page.
         unsafe {
             core::ptr::write_bytes(va as *mut u8, 0, PAGE_SIZE as usize);
@@ -414,19 +421,26 @@ fn run(info_ptr: u64) -> !
 
     // Offset-map init's IPC buffer from the arena (zeroed by `place_page`) and
     // register it.
-    if init_arena
-        .place_page(
+    // SAFETY: INIT_IPC_BUF_VA is a fixed page of init's private VA plan
+    // (below the kernel-chosen windows of `process-layout`), which only this
+    // once-run step maps.
+    let placed = unsafe {
+        init_arena.place_page(
             info.aspace_cap,
             INIT_IPC_BUF_VA,
             syscall::MAP_WRITABLE,
             |_| {},
         )
-        .is_none()
+    };
+    if placed.is_none()
     {
         logging::log("init: FATAL: cannot place IPC buffer page");
         syscall::thread_exit();
     }
-    if syscall::ipc_buffer_set(INIT_IPC_BUF_VA).is_err()
+    // SAFETY: INIT_IPC_BUF_VA is the page placed above for the main thread
+    // alone; no Rust object lives in it, and init reaches it only through the
+    // raw `ipc_buf` pointer.
+    if unsafe { syscall::ipc_buffer_set(INIT_IPC_BUF_VA) }.is_err()
     {
         logging::log("init: FATAL: ipc_buffer_set failed");
         syscall::thread_exit();
@@ -493,7 +507,10 @@ fn run(info_ptr: u64) -> !
     // death-EQ on both init threads and reclaims the init-logd TCB once init
     // is threadless (init-logd outlives main until real-logd's handover).
     let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPort).unwrap_or(0);
-    let init_logd_thread_cap = logging::spawn_log_thread(info, &mut init_arena, log_ep, ioport_cap);
+    // SAFETY: `run` executes once, on init's main thread, and this is its only
+    // `spawn_log_thread` call.
+    let init_logd_thread_cap =
+        unsafe { logging::spawn_log_thread(info, &mut init_arena, log_ep, ioport_cap) };
 
     // Badged SEND on the log endpoint for init's own `log()` lines so
     // they appear under `[init]`. `LOG_BADGE_INIT` (= 1) is reserved
@@ -585,7 +602,11 @@ fn run(info_ptr: u64) -> !
     // enters the dispatch loop before procmgr starts (procmgr's std
     // `_start` calls `heap_bootstrap` which calls memmgr's
     // `REQUEST_MEMORY_CAPS`, so memmgr must be live first).
-    let Some(phys_table_memory) = alloc.alloc_zero_page(info.aspace_cap, TEMP_MAP_BASE)
+    // SAFETY: `info.aspace_cap` is init's own address space, and
+    // TEMP_MAP_BASE starts init's scratch region, unmapped again once the
+    // memmgr and procmgr module loads finished above.
+    let Some(phys_table_memory) =
+        (unsafe { alloc.alloc_zero_page(info.aspace_cap, TEMP_MAP_BASE) })
     else
     {
         logging::log("FATAL: phys-table page alloc failed");
@@ -614,7 +635,9 @@ fn run(info_ptr: u64) -> !
     let phys_dst = TEMP_MAP_BASE as *mut u64;
     // SAFETY: phys_dst points at the one mapped 4 KiB page.
     unsafe { bootstrap::write_memmgr_aux_memory(phys_dst, info, &mm_final) };
-    let _ = syscall::mem_unmap(info.aspace_cap, TEMP_MAP_BASE, 1);
+    // SAFETY: the phys-table scratch page, written above only through the raw
+    // `phys_dst` pointer; no Rust reference into it is live.
+    let _ = unsafe { syscall::mem_unmap(info.aspace_cap, TEMP_MAP_BASE, 1) };
     let Ok(phys_table_ro_cap) = syscall::cap_derive(phys_table_memory, syscall::RIGHTS_MEM_MAP)
     else
     {

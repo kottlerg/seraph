@@ -30,8 +30,17 @@ static UART_BASE: AtomicU64 = AtomicU64::new(0);
 /// receive-data interrupt when `enable_rx_irq` is set. The reservation lives
 /// for the process's lifetime. `self_thread` is unused on RISC-V. Returns
 /// `false` if reservation or mapping fails.
-pub fn serial_init(_self_thread: u32, self_aspace: u32, mmio_cap: u32, enable_rx_irq: bool)
--> bool
+///
+/// # Safety
+/// `self_aspace` must be this process's own address space and `mmio_cap`
+/// must name an `Mmio` region of one page, so the whole-region mapping
+/// stays inside the one-page reservation (`syscall::mmio_map`'s contract).
+pub unsafe fn serial_init(
+    _self_thread: u32,
+    self_aspace: u32,
+    mmio_cap: u32,
+    enable_rx_irq: bool,
+) -> bool
 {
     let Ok(range) = reserve_pages(1)
     else
@@ -43,7 +52,11 @@ pub fn serial_init(_self_thread: u32, self_aspace: u32, mmio_cap: u32, enable_rx
     {
         return false;
     }
-    if syscall::mmio_map(self_aspace, mmio_cap, base_va, 0).is_err()
+    // SAFETY: `range` is a fresh one-page reservation from the per-process
+    // arena, owned for the process's lifetime, and the caller's contract
+    // bounds the region to one page, so the whole-region mapping stays
+    // inside it: VA no Rust object or IPC page occupies.
+    if unsafe { syscall::mmio_map(self_aspace, mmio_cap, base_va, 0) }.is_err()
     {
         return false;
     }

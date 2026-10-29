@@ -68,13 +68,17 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     df_is_clear_in_kernel()?;
 
-    let tf_reason = run_child(ctx, tf_child, core::ptr::addr_of!(TF_STACK))?;
+    // SAFETY: TF_STACK is this test's own `ChildStack`, used by this child
+    // alone (`ChildStack`'s rule).
+    let tf_reason = unsafe { run_child(ctx, tf_child, core::ptr::addr_of!(TF_STACK)) }?;
     if tf_reason != EXIT_FAULT_BASE + DEBUG_VECTOR
     {
         return Err("syscall_rflags_hardening: TF child did not die on its own #DB");
     }
 
-    let gs_reason = run_child(ctx, gs_child, core::ptr::addr_of!(GS_STACK))?;
+    // SAFETY: GS_STACK is this test's own `ChildStack`, used by this child
+    // alone (`ChildStack`'s rule).
+    let gs_reason = unsafe { run_child(ctx, gs_child, core::ptr::addr_of!(GS_STACK)) }?;
     if gs_reason >= EXIT_FAULT_BASE
     {
         return Err("syscall_rflags_hardening: GS child faulted");
@@ -187,7 +191,11 @@ fn getrandom_with_ac_set(dst: &mut [u8]) -> (i64, u64)
 
 /// Start `entry` on a fresh child thread and return its exit reason once the
 /// kernel reports it `Exited`. The child's caps are deleted on every path.
-fn run_child(
+///
+/// # Safety
+/// `stack` must point at a `ChildStack` no other live thread runs on (the
+/// contract of `spawn::configure_and_start`).
+unsafe fn run_child(
     ctx: &TestContext,
     entry: extern "C" fn(u64) -> !,
     stack: *const ChildStack,
@@ -195,9 +203,13 @@ fn run_child(
 {
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "syscall_rflags_hardening: spawn::new_child failed")?;
-    let reason = crate::spawn::configure_and_start(&child, entry, ChildStack::top(stack), 0)
-        .map_err(|_| "syscall_rflags_hardening: configure_and_start failed")
-        .and_then(|()| crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS)));
+    // SAFETY: the caller's contract dedicates `stack` to this child.
+    let reason =
+        unsafe { crate::spawn::configure_and_start(&child, entry, ChildStack::top(stack), 0) }
+            .map_err(|_| "syscall_rflags_hardening: configure_and_start failed")
+            .and_then(|()| {
+                crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS))
+            });
     cap_delete(child.th).ok();
     cap_delete(child.cs).ok();
     reason

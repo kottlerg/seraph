@@ -931,8 +931,12 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(TEARDOWN_BATCH_STACK));
-    crate::spawn::configure_and_start(&child, teardown_batch_child_entry, stack_top, child_arg)
-        .map_err(|_| "teardown_batch: configure_and_start failed")?;
+    // SAFETY: the stack is `TEARDOWN_BATCH_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, teardown_batch_child_entry, stack_top, child_arg)
+    }
+    .map_err(|_| "teardown_batch: configure_and_start failed")?;
 
     let bits = notification_wait(done).map_err(|_| "teardown_batch: notification_wait failed")?;
     if bits != 0x1
@@ -1047,7 +1051,9 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
         .map_err(|_| "stop_bound: cap_copy block failed")?;
     let arg = u64::from(child_ready) | (u64::from(child_block) << 32);
     let stack_top = ChildStack::top(core::ptr::addr_of!(STOP_BLOCKED_STACK));
-    crate::spawn::configure_and_start(&child, stop_blocked_child_entry, stack_top, arg)
+    // SAFETY: the stack is `STOP_BLOCKED_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, stop_blocked_child_entry, stack_top, arg) }
         .map_err(|_| "stop_bound: configure_and_start (blocked) failed")?;
     notification_wait(ready).map_err(|_| "stop_bound: wait ready failed")?;
 
@@ -1082,12 +1088,16 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
     let child_ready = cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "stop_bound: cap_copy ready (spin) failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(STOP_SPINNING_STACK));
-    crate::spawn::configure_and_start(
-        &child,
-        stop_spinning_child_entry,
-        stack_top,
-        u64::from(child_ready),
-    )
+    // SAFETY: the stack is `STOP_SPINNING_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(
+            &child,
+            stop_spinning_child_entry,
+            stack_top,
+            u64::from(child_ready),
+        )
+    }
     .map_err(|_| "stop_bound: configure_and_start (spin) failed")?;
     notification_wait(ready).map_err(|_| "stop_bound: wait ready (spin) failed")?;
 
@@ -1172,7 +1182,9 @@ pub fn cspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
 
     let arg = u64::from(child_ready) | (u64::from(own_cs) << 32);
     let stack_top = ChildStack::top(core::ptr::addr_of!(SELF_DELETE_STACK));
-    crate::spawn::configure_and_start(&child, self_delete_child_entry, stack_top, arg)
+    // SAFETY: the stack is `SELF_DELETE_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, self_delete_child_entry, stack_top, arg) }
         .map_err(|_| "self_delete: configure_and_start failed")?;
     notification_wait(ready).map_err(|_| "self_delete: wait ready failed")?;
 

@@ -151,7 +151,9 @@ fn start_mappers(ctx: &TestContext, done: u32, iterations: u32, mappers: &mut Ma
 
         // SAFETY: Each child uses a distinct stack index.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        spawn::configure_and_start(&child, mapper_entry, stack_top, arg)
+        // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe { spawn::configure_and_start(&child, mapper_entry, stack_top, arg) }
             .map_err(|_| "concurrent_map_unmap: configure_and_start failed")?;
     }
     Ok(())
@@ -197,7 +199,9 @@ fn release(ctx: &TestContext, mappers: &Mappers) -> TestResult
         let va = child_va(i);
         // A VA its child left unmapped refuses the unmap; either way the
         // query below decides.
-        let _ = mem_unmap(ctx.aspace_cap, va, 1);
+        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        let _ = unsafe { mem_unmap(ctx.aspace_cap, va, 1) };
         if syscall::aspace_query(ctx.aspace_cap, va).is_ok()
         {
             result = Err("concurrent_map_unmap: a child's VA stayed mapped");
@@ -234,7 +238,9 @@ extern "C" fn mapper_entry(arg: u64) -> !
 
     for _ in 0..iterations
     {
-        if mem_map(memory_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
+        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe { mem_map(memory_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE) }.is_err()
         {
             // Report the failure with the done bit.
             notification_send(done_slot, done_bit | ERROR_BIT).ok();
@@ -251,7 +257,9 @@ extern "C" fn mapper_entry(arg: u64) -> !
             thread_exit();
         }
 
-        if mem_unmap(aspace, va, 1).is_err()
+        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe { mem_unmap(aspace, va, 1) }.is_err()
         {
             notification_send(done_slot, done_bit | ERROR_BIT).ok();
             thread_exit();

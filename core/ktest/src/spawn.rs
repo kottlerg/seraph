@@ -139,14 +139,23 @@ pub fn new_child_at(
 /// passed to `thread_configure`: the kernel enters a thread with its argument
 /// in the platform C convention's first argument register, so the entry must
 /// use that convention, not the unspecified Rust ABI.
-pub fn configure_and_start(
+///
+/// # Safety
+/// `stack_top` must top a stack (a `ChildStack`, as `ChildStack::top` gives
+/// it) that no other live thread uses and none will until this child exits:
+/// every ktest child runs in ktest's own address space, so this is the
+/// contract of `syscall::thread_configure` (the entry ABI holds by `entry`'s
+/// type).
+pub unsafe fn configure_and_start(
     child: &SpawnedChild,
     entry: extern "C" fn(u64) -> !,
     stack_top: u64,
     arg: u64,
 ) -> Result<(), &'static str>
 {
-    thread_configure(child.th, entry as *const () as u64, stack_top, arg)
+    // SAFETY: `entry` is an `extern "C" fn(u64) -> !` and the caller's
+    // contract dedicates `stack_top`'s stack to this child.
+    unsafe { thread_configure(child.th, entry as *const () as u64, stack_top, arg) }
         .map_err(|_| "spawn::configure_and_start: thread_configure failed")?;
     thread_start(child.th).map_err(|_| "spawn::configure_and_start: thread_start failed")?;
     Ok(())
@@ -154,7 +163,10 @@ pub fn configure_and_start(
 
 /// Like [`configure_and_start`] but pins the child to `cpu` via
 /// `thread_set_affinity` before starting it.
-pub fn configure_and_start_pinned(
+///
+/// # Safety
+/// The contract of [`configure_and_start`].
+pub unsafe fn configure_and_start_pinned(
     child: &SpawnedChild,
     entry: extern "C" fn(u64) -> !,
     stack_top: u64,
@@ -162,12 +174,32 @@ pub fn configure_and_start_pinned(
     cpu: u32,
 ) -> Result<(), &'static str>
 {
-    thread_configure(child.th, entry as *const () as u64, stack_top, arg)
+    // SAFETY: `entry` is an `extern "C" fn(u64) -> !` and the caller's
+    // contract dedicates `stack_top`'s stack to this child.
+    unsafe { thread_configure(child.th, entry as *const () as u64, stack_top, arg) }
         .map_err(|_| "spawn::configure_and_start_pinned: thread_configure failed")?;
     thread_set_affinity(child.th, cpu)
         .map_err(|_| "spawn::configure_and_start_pinned: thread_set_affinity failed")?;
     thread_start(child.th).map_err(|_| "spawn::configure_and_start_pinned: thread_start failed")?;
     Ok(())
+}
+
+/// Point the register file `regs`, read from a stopped or fault-blocked
+/// child, at the `extern "C"` entry at `entry`: the instruction pointer
+/// becomes `entry` and the stack pointer moves down, on the child's own stack,
+/// to the alignment the entry ABI expects (`arch::entry_stack_pointer`). A
+/// child resumed with the frame then runs `entry` as if called, with the
+/// frame's other registers as its arguments.
+///
+/// Panics if `regs` is shorter than the register file.
+pub fn redirect_to_entry(regs: &mut [u8], entry: u64)
+{
+    use crate::arch::{IP_OFFSET, SP_OFFSET, entry_stack_pointer};
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&regs[SP_OFFSET..SP_OFFSET + 8]);
+    let sp = u64::from_le_bytes(word);
+    regs[SP_OFFSET..SP_OFFSET + 8].copy_from_slice(&entry_stack_pointer(sp).to_le_bytes());
+    regs[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&entry.to_le_bytes());
 }
 
 /// One `cap_info(CAP_INFO_THREAD_STATE)` on `thread`, decoded into its

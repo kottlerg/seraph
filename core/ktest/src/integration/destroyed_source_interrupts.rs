@@ -283,7 +283,9 @@ fn start_child(
     };
     // SAFETY: stack `index` is this child's; reaped before the next phase.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(CHILD_STACKS[index]) });
-    spawn::configure_and_start(child, entry, stack, arg)
+    // SAFETY: the stack is `CHILD_STACKS[index]`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start(child, entry, stack, arg) }
         .map_err(|_| "integration::destroyed_source_interrupts: start child failed")
 }
 

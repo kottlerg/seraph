@@ -40,11 +40,15 @@ pub fn run(ctx: &TestContext) -> TestResult
         .ok_or("shared_memory_two_aspaces: frame_pool::alloc returned None")?;
 
     // Map into ktest's aspace.
-    mem_map(memory_cap, ctx.aspace_cap, VA_A, 0, 1, MAP_WRITABLE)
+    // SAFETY: `VA_A` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    unsafe { mem_map(memory_cap, ctx.aspace_cap, VA_A, 0, 1, MAP_WRITABLE) }
         .map_err(|_| "shared_memory_two_aspaces: mem_map (aspace A) failed")?;
 
     // Map the same Memory cap into the new aspace at a different VA.
-    mem_map(memory_cap, aspace_b, VA_B, 0, 1, MAP_WRITABLE)
+    // SAFETY: `aspace_b` is an address space this test created, not ktest's
+    // own, so the call changes nothing ktest runs on.
+    unsafe { mem_map(memory_cap, aspace_b, VA_B, 0, 1, MAP_WRITABLE) }
         .map_err(|_| "shared_memory_two_aspaces: mem_map (aspace B) failed")?;
 
     // Both queries must return the same physical address — the kernel-side
@@ -63,9 +67,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // Cleanup: unmap from both aspaces before returning the cap to the pool.
-    mem_unmap(ctx.aspace_cap, VA_A, 1)
+    // SAFETY: `VA_A` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    unsafe { mem_unmap(ctx.aspace_cap, VA_A, 1) }
         .map_err(|_| "shared_memory_two_aspaces: mem_unmap (A) failed")?;
-    mem_unmap(aspace_b, VA_B, 1).map_err(|_| "shared_memory_two_aspaces: mem_unmap (B) failed")?;
+    // SAFETY: `aspace_b` is an address space this test created, not ktest's
+    // own, so the call changes nothing ktest runs on.
+    unsafe { mem_unmap(aspace_b, VA_B, 1) }
+        .map_err(|_| "shared_memory_two_aspaces: mem_unmap (B) failed")?;
 
     // SAFETY: memory_cap is from pool and now unmapped from both aspaces.
     unsafe { crate::frame_pool::free(memory_cap) };

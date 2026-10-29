@@ -361,7 +361,17 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   child-thread spawn helper wrapping the cspace + thread + configure + start
   sequence each spawning test would otherwise repeat; `new_child` creates the
   thread at the floor priority, `new_child_at` at `priority` under
-  `sched_cap`'s band.
+  `sched_cap`'s band. The two `configure_and_start` helpers are `unsafe fn`:
+  the caller states that the stack it passes runs no other live thread.
+- `ChildStack` / `IpcPage` — a child's static 16 KiB stack and page-aligned
+  IPC buffer page, each declared per test and handed to one thread at a time
+  (the rule in their rustdoc, which covers passing tests).
+- `spawn::redirect_to_entry(regs, entry)` — points a register file read
+  from a stopped or fault-blocked child at an `extern "C"` entry, with the stack pointer
+  aligned for the entry ABI, for the `thread_write_regs` redirect tests.
+- `SCRATCH_LOW_BASE` and the crate docs' § Scratch VAs — the VA bands tests
+  map, unmap, and reprotect pages of ktest's own address space in, which hold
+  none of ktest's own memory; the SAFETY comments of those calls cite them.
 - `spawn::ArgBlock` / `spawn::child_args` — per-test static argument
   entries a child receives by address. A child's single `u64` argument
   holds at most two 32-bit capability handles (as halves); anything more

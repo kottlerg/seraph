@@ -78,7 +78,9 @@ fn install_stub(
 {
     let frame =
         crate::frame_pool::alloc().ok_or("retype::stub: frame_pool::alloc returned None")?;
-    if mem_map(frame, ctx.aspace_cap, STUB_SCRATCH_VA, 0, 1, MAP_WRITABLE).is_err()
+    // SAFETY: `STUB_SCRATCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe { mem_map(frame, ctx.aspace_cap, STUB_SCRATCH_VA, 0, 1, MAP_WRITABLE) }.is_err()
     {
         // SAFETY: `frame` came from `alloc` above and the failed map left it
         // mapped nowhere.
@@ -92,13 +94,17 @@ fn install_stub(
         // SAFETY: STUB_SCRATCH_VA..+PAGE is mapped writable just above; i < 32.
         unsafe { (STUB_SCRATCH_VA as *mut u8).add(i).write_volatile(*b) };
     }
-    if mem_unmap(ctx.aspace_cap, STUB_SCRATCH_VA, 1).is_err()
+    // SAFETY: `STUB_SCRATCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe { mem_unmap(ctx.aspace_cap, STUB_SCRATCH_VA, 1) }.is_err()
     {
         // The frame is still mapped at STUB_SCRATCH_VA, and `free` requires
         // it unmapped, so it stays allocated rather than re-enter the pool.
         return Err("retype::stub: scratch mem_unmap failed");
     }
-    if mem_map(frame, aspace, STUB_VA, 0, 1, MAP_EXECUTABLE).is_err()
+    // SAFETY: `STUB_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe { mem_map(frame, aspace, STUB_VA, 0, 1, MAP_EXECUTABLE) }.is_err()
     {
         // SAFETY: `frame` came from `alloc` above; the scratch mapping is
         // gone and the failed map left it mapped nowhere.
@@ -169,7 +175,9 @@ pub fn aspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
     let thread = cap_create_thread(memory, aspace, cspace, 0, 0)
         .map_err(|_| "retype::aspace_stop: cap_create_thread (spin) failed")?;
     // The stub never touches its stack; any VA will do.
-    thread_configure(thread, STUB_VA, STUB_VA + 0x800, 0)
+    // SAFETY: the thread is bound to the `aspace` this test created, not
+    // ktest's own, so its entry state touches nothing ktest runs on.
+    unsafe { thread_configure(thread, STUB_VA, STUB_VA + 0x800, 0) }
         .map_err(|_| "retype::aspace_stop: thread_configure (spin) failed")?;
     thread_start(thread).map_err(|_| "retype::aspace_stop: thread_start (spin) failed")?;
     // Give the child a chance to be dispatched (on a single-CPU guest this
@@ -200,7 +208,9 @@ pub fn aspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
         .map_err(|_| "retype::aspace_stop: cap_create_thread (fault) failed")?;
     thread_set_fault_handler(thread, ep, FAULT_BADGE, FAULT_CLASS_ALL)
         .map_err(|_| "retype::aspace_stop: thread_set_fault_handler failed")?;
-    thread_configure(thread, STUB_UNMAPPED_VA, STUB_UNMAPPED_VA + 0x800, 0)
+    // SAFETY: the thread is bound to the `aspace` this test created, not
+    // ktest's own, so its entry state touches nothing ktest runs on.
+    unsafe { thread_configure(thread, STUB_UNMAPPED_VA, STUB_UNMAPPED_VA + 0x800, 0) }
         .map_err(|_| "retype::aspace_stop: thread_configure (fault) failed")?;
     thread_start(thread).map_err(|_| "retype::aspace_stop: thread_start (fault) failed")?;
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
@@ -259,7 +269,9 @@ pub fn aspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
     })?;
     let thread = cap_create_thread(memory, aspace, cspace, 0, 0)
         .map_err(|_| "retype::aspace_self_delete: cap_create_thread failed")?;
-    thread_configure(thread, STUB_VA, STUB_VA + 0x800, 0)
+    // SAFETY: the thread is bound to the `aspace` this test created, not
+    // ktest's own, so its entry state touches nothing ktest runs on.
+    unsafe { thread_configure(thread, STUB_VA, STUB_VA + 0x800, 0) }
         .map_err(|_| "retype::aspace_self_delete: thread_configure failed")?;
     // Drop ktest's capability first, so the child's delete is the last one.
     cap_delete(aspace).map_err(|_| "retype::aspace_self_delete: cap_delete(aspace) failed")?;
@@ -360,7 +372,9 @@ pub fn pt_budget_exhaustion_returns_oom(ctx: &TestContext) -> TestResult
     for i in 0..16u64
     {
         let va = TEST_VA_BASE + i * 0x4000_0000; // 1 GiB stride
-        match mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE)
+        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        match unsafe { mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE) }
         {
             Ok(()) =>
             {}
@@ -401,7 +415,9 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
     for i in 0..mappings
     {
         let va = TEST_VA_BASE + i as u64 * stride;
-        if mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE).is_err()
+        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe { mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE) }.is_err()
         {
             cap_delete(aspace).ok();
             return Err("retype::deep_pt: mem_map failed despite ample budget");
@@ -412,7 +428,9 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
     for i in 0..mappings
     {
         let va = TEST_VA_BASE + i as u64 * stride;
-        mem_unmap(aspace, va, 1).ok();
+        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        unsafe { mem_unmap(aspace, va, 1) }.ok();
     }
 
     cap_delete(aspace).ok();
@@ -440,7 +458,9 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
 
     // Map one page at a fresh 2 MiB-aligned VA: allocates the full intermediate
     // chain (one table per non-root level) from the pool.
-    if mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE).is_err()
+    // SAFETY: `TEST_VA_BASE` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe { mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE) }.is_err()
     {
         cap_delete(aspace).ok();
         return Err("retype::region_reclaim: initial mem_map failed");
@@ -455,7 +475,9 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
 
     // Reclaiming unmap: clears the leaf, empties every intermediate table on the
     // chain, returns them all to the pool and credits the budget.
-    if mem_unmap_reclaim(aspace, TEST_VA_BASE, 1).is_err()
+    // SAFETY: `TEST_VA_BASE` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe { mem_unmap_reclaim(aspace, TEST_VA_BASE, 1) }.is_err()
     {
         cap_delete(aspace).ok();
         return Err("retype::region_reclaim: mem_unmap_reclaim failed");
@@ -475,12 +497,16 @@ pub fn region_unmap_reclaims_pt_budget(ctx: &TestContext) -> TestResult
 
     // The returned pages are reusable: remap the same VA (re-allocates the
     // chain from the pool), then tear it down again.
-    if mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE).is_err()
+    // SAFETY: `TEST_VA_BASE` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe { mem_map(memory, aspace, TEST_VA_BASE, 0, 1, MAP_WRITABLE) }.is_err()
     {
         cap_delete(aspace).ok();
         return Err("retype::region_reclaim: remap after reclaim failed");
     }
-    mem_unmap_reclaim(aspace, TEST_VA_BASE, 1).ok();
+    // SAFETY: `TEST_VA_BASE` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    unsafe { mem_unmap_reclaim(aspace, TEST_VA_BASE, 1) }.ok();
 
     cap_delete(aspace).ok();
     Ok(())
@@ -512,7 +538,9 @@ pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestR
     for i in 0..N
     {
         let va = TEST_VA_BASE + i * STRIDE;
-        if mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE).is_err()
+        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe { mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE) }.is_err()
         {
             cap_delete(aspace).ok();
             return Err("retype::concurrent_regions: mem_map failed");
@@ -530,7 +558,9 @@ pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestR
     for i in 0..N
     {
         let va = TEST_VA_BASE + i * STRIDE;
-        if mem_unmap_reclaim(aspace, va, 1).is_err()
+        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe { mem_unmap_reclaim(aspace, va, 1) }.is_err()
         {
             cap_delete(aspace).ok();
             return Err("retype::concurrent_regions: mem_unmap_reclaim failed");
@@ -1060,14 +1090,18 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     let mut map_failures = 0u32;
     for i in 0..REGIONS
     {
-        if mem_map(
-            memory,
-            aspace,
-            TEST_VA_BASE + i * REGION_STRIDE,
-            0,
-            1,
-            MAP_WRITABLE,
-        )
+        // SAFETY: `TEST_VA_BASE + i * REGION_STRIDE` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe {
+            mem_map(
+                memory,
+                aspace,
+                TEST_VA_BASE + i * REGION_STRIDE,
+                0,
+                1,
+                MAP_WRITABLE,
+            )
+        }
         .is_err()
         {
             map_failures += 1;
@@ -1082,7 +1116,9 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     let mut reclaim_failures = 0u32;
     for i in 0..REGIONS
     {
-        if mem_unmap_reclaim(aspace, TEST_VA_BASE + i * REGION_STRIDE, 1).is_err()
+        // SAFETY: `TEST_VA_BASE + i * REGION_STRIDE` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe { mem_unmap_reclaim(aspace, TEST_VA_BASE + i * REGION_STRIDE, 1) }.is_err()
         {
             reclaim_failures += 1;
         }

@@ -5,8 +5,9 @@ Shared IPC helpers for Seraph userspace: the stack-owned `IpcMessage` snapshot t
 scratch at the syscall boundary, the generic bootstrap protocol, the `RecvGuard`
 receive-failure policy for blocking receive loops, the per-service IPC label and
 error-code modules, the shared policy tables (`sched_policy`, `published_names`, `log_badges`),
-the `keysym` codes and event packing, the `memmgr_bootstrap` and `device_info_kind` constants,
-and reply-shape decoders (today `memmgr_grant_layout`).
+the `keysym` codes and event packing, the `memmgr_bootstrap`, `device_info_kind`, and
+`procmgr_process_state` constants, the crate-level limits and masks (`VERB_BIT_MASK`,
+`MAX_PATH_LEN`, `ARGS_BLOB_MAX`), and reply-shape decoders (today `memmgr_grant_layout`).
 
 `no_std`; builds inside std's dependency graph through the `rustc-dep-of-std` feature.
 

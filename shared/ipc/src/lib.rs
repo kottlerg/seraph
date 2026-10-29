@@ -82,8 +82,8 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //                             ProcessInfo.log_send_cap (init derives its
 //                             own), not via a handshake
 
-/// Wire-protocol version of [`procmgr_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const PROCMGR_LABELS_VERSION: u32 = 3;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
@@ -410,8 +410,8 @@ pub mod sched_policy
     pub const SVCMGR_PRIORITY: u8 = 21;
 }
 
-/// Wire-protocol version of [`memmgr_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const MEMMGR_LABELS_VERSION: u32 = 5;
 /// IPC labels for the memory manager (`memmgr`).
 ///
@@ -467,12 +467,8 @@ pub mod memmgr_labels
     /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` if the caller's
     /// badge is unknown.
     pub const RELEASE_MEMORY_CAPS: u64 = 2;
-    /// Procmgr-only: register a new process. Request `data[0]` = caller's
-    /// compiled [`super::MEMMGR_LABELS_VERSION`]. memmgr allocates a
-    /// per-process tracking entry and replies with the new badge in
-    /// `data[0]` and a badged SEND cap on its endpoint in `caps[0]`, which
-    /// procmgr installs in the new process's `ProcessInfo.memmgr_endpoint_cap`.
-    /// Specified in `services/memmgr/docs/ipc-interface.md` § Label 3:
+    /// Procmgr-only: register a new process and receive the badged SEND cap
+    /// procmgr installs in its `ProcessInfo.memmgr_endpoint_cap`. Specified in `services/memmgr/docs/ipc-interface.md` § Label 3:
     /// `REGISTER_PROCESS`.
     pub const REGISTER_PROCESS: u64 = 3;
     /// Procmgr-only: notify process death. `data[0]` carries the dead process's
@@ -756,8 +752,8 @@ pub mod procmgr_process_state
     pub const EXITED: u64 = 3;
 }
 
-/// Wire-protocol version of [`svcmgr_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const SVCMGR_LABELS_VERSION: u32 = 5;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
@@ -765,12 +761,13 @@ pub mod svcmgr_labels
     // The services init started before svcmgr existed (memmgr, procmgr,
     // devmgr, vfsd) are handed to svcmgr over init's bootstrap-round
     // endowment, not a dedicated label (svcmgr launches logd itself, from
-    // its recipe): round 1
-    // carries svcmgr's own endpoints plus the source caps it needs for
-    // its publish role (`rootfs.root` SEND, devmgr-registry `SEND|GRANT`
-    // source) and `SVCMGR_LABELS_VERSION` in `data[1]`; each subsequent
-    // round carries one `(name, thread_cap)` pair svcmgr parks in its
-    // pending-registration table. On `HANDOVER_COMPLETE` svcmgr
+    // its recipe). Round 1 carries svcmgr's own endpoints plus the source
+    // caps it needs for its publish role (`rootfs.root` SEND,
+    // devmgr-registry `SEND|GRANT` source) and `SVCMGR_LABELS_VERSION` in
+    // `data[1]`; each `SUBSTRATE` round carries one `(name, thread_cap)`
+    // pair svcmgr parks in its pending-registration table; a final
+    // `LOGD_SOURCES` round carries the master-log and procmgr death-auth
+    // sources svcmgr launches logd with. On `HANDOVER_COMPLETE` svcmgr
     // reconciles every parked name against `/config/svcmgr/services/`:
     // a parked name with a definition is bound and supervised using the
     // on-disk recipe; a defined name not parked is launched by svcmgr
@@ -946,8 +943,8 @@ pub mod published_names
     pub const DEVMGR_TEST: &[u8] = b"devmgr.test";
 }
 
-/// Wire-protocol version of [`rtc_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`rtc_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const RTC_LABELS_VERSION: u32 = 1;
 /// IPC labels for RTC chip drivers (`services/drivers/cmos`,
 /// `services/drivers/goldfish-rtc`, and future per-board chip drivers).
@@ -1031,8 +1028,8 @@ pub mod rtc_errors
     pub const UNAUTHORIZED: u64 = 4;
 }
 
-/// Wire-protocol version of [`timed_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`timed_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const TIMED_LABELS_VERSION: u32 = 1;
 /// IPC labels for the wall-clock service (`services/timed`).
 ///
@@ -1072,8 +1069,8 @@ pub mod timed_errors
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
 }
 
-/// Wire-protocol version of [`pwrmgr_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`pwrmgr_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const PWRMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the power manager (`pwrmgr`).
 ///
@@ -1133,8 +1130,8 @@ pub mod pwrmgr_errors
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
 
-/// Wire-protocol version of [`vfsd_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`vfsd_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const VFSD_LABELS_VERSION: u32 = 1;
 /// IPC labels for the VFS daemon (`vfsd`).
 pub mod vfsd_labels
@@ -1167,8 +1164,8 @@ pub mod vfsd_labels
     pub const SEED_AUTHORITY: u64 = 1u64 << 62;
 }
 
-/// Wire-protocol version of [`ns_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`ns_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const NS_LABELS_VERSION: u32 = 1;
 /// IPC labels for the namespace protocol (cap-as-namespace surface).
 ///
@@ -1218,8 +1215,8 @@ pub mod ns_labels
     pub const NS_READDIR: u64 = 22;
 }
 
-/// Wire-protocol version of [`fs_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`fs_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const FS_LABELS_VERSION: u32 = 3;
 /// IPC labels for filesystem drivers (FAT, ext4, etc.).
 pub mod fs_labels
@@ -1295,8 +1292,7 @@ pub mod fs_labels
     /// Client acknowledgement of [`FS_RELEASE_MEMORY`]: synchronous reply,
     /// empty body.
     pub const FS_RELEASE_ACK: u64 = 9;
-    /// Mount-time probe from vfsd. Request `data[0]` = caller's compiled
-    /// [`super::FS_LABELS_VERSION`]. Specified in
+    /// Mount-time probe from vfsd. Specified in
     /// `services/fs/docs/fs-driver-protocol.md` § Label 10: `FS_MOUNT`.
     pub const FS_MOUNT: u64 = 10;
     /// Write file content from a caller-supplied source Memory cap.
@@ -1377,8 +1373,8 @@ pub mod fs_labels
     pub const FS_TRUNCATE: u64 = 17;
 }
 
-/// Wire-protocol version of [`devmgr_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const DEVMGR_LABELS_VERSION: u32 = 9;
 /// IPC labels for the device manager (`devmgr`).
 ///
@@ -1550,8 +1546,9 @@ pub mod devmgr_labels
     /// the input driver's service endpoint to the caller. Caller's badge
     /// must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies
     /// `UNAUTHORIZED` otherwise. Like [`QUERY_RTC_DEVICE`], it replies
-    /// `NO_DEVICE` until the on-disk driver is spawned and for the rest of
-    /// the boot if that spawn failed. The verb
+    /// `NO_DEVICE` until the on-disk driver is spawned, and for the rest of
+    /// the boot if no input device was enumerated or the spawn failed;
+    /// `INVALID_REQUEST` when the derivation fails. The verb
     /// is transport-agnostic: any keyboard backend (virtio-input today,
     /// USB HID / PS-2 later) registers this one slot, so consumers never
     /// learn the transport. Value 11 — 9 and 10 are the TODO(#165) test
@@ -1631,8 +1628,8 @@ pub mod device_info_kind
     pub const FRAMEBUFFER: u32 = 2;
 }
 
-/// Wire-protocol version of [`blk_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`blk_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const BLK_LABELS_VERSION: u32 = 2;
 /// IPC labels for block device drivers.
 pub mod blk_labels
@@ -1653,8 +1650,7 @@ pub mod blk_labels
     /// Register a partition range, receiving back a badged SEND cap
     /// scoped to that partition.
     ///
-    /// Caller's badge must have [`MOUNT_AUTHORITY`] set. Data words:
-    /// `[BLK_LABELS_VERSION, base_lba, length_lba]`. The driver derives
+    /// Caller's badge must have [`MOUNT_AUTHORITY`] set. The driver derives
     /// the partition cap itself because [`MOUNT_AUTHORITY`] caps are
     /// badged and the kernel rejects re-badging of a badged source.
     /// Specified, with its replies, in
@@ -1698,8 +1694,8 @@ pub mod blk_labels
     pub const BLK_WRITE_FROM_MEMORY: u64 = 4;
 }
 
-/// Wire-protocol version of [`serial_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`serial_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const SERIAL_LABELS_VERSION: u32 = 2;
 /// IPC labels for the serial (UART) device driver (`services/drivers/serial`).
 ///
@@ -1788,8 +1784,8 @@ pub mod serial_errors
     pub const UNAUTHORIZED: u64 = 5;
 }
 
-/// Wire-protocol version of [`fb_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`fb_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const FB_LABELS_VERSION: u32 = 2;
 /// IPC labels for the framebuffer device driver
 /// (`services/drivers/framebuffer`).
@@ -1865,8 +1861,8 @@ pub mod fb_errors
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
 }
 
-/// Wire-protocol version of [`input_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`input_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const INPUT_LABELS_VERSION: u32 = 1;
 /// IPC labels for the keyboard/input device driver
 /// (`services/drivers/virtio/input` today; future USB / PS-2 backends reuse
@@ -2013,8 +2009,8 @@ pub mod keysym
     }
 }
 
-/// Wire-protocol version of [`stream_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`stream_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const STREAM_LABELS_VERSION: u32 = 1;
 /// IPC labels for byte-stream endpoints (stdin/stdout/stderr backing).
 ///
@@ -2093,8 +2089,8 @@ pub mod log_badges
     pub const LOG_BADGE_FIRST_CHILD: u64 = 16;
 }
 
-/// Wire-protocol version of [`log_labels`]; bumped and checked as the
-/// block comment above the label modules describes.
+/// Wire-protocol version of [`log_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
 pub const LOG_LABELS_VERSION: u32 = 2;
 /// IPC labels for the system log endpoint's legacy discovery interface
 /// and the one-shot init-logd → real-logd handover.

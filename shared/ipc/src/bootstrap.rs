@@ -8,8 +8,8 @@
 //! A child reaches its creator through `creator_endpoint_cap` (in
 //! `process_abi::ProcessInfo`, beside the other caps the handover page
 //! carries). The child calls [`request_round`] in a loop on that cap; the
-//! creator serves
-//! each request with [`reply_round`] or [`reply_error`], transferring up to
+//! creator serves each request with [`reply_round`] or [`reply_error`],
+//! transferring up to
 //! `MSG_CAP_SLOTS_MAX` caps plus payload words per round. When the creator
 //! sets the `done` flag, the child stops.
 //!

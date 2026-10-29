@@ -5,7 +5,7 @@
 
 //! RISC-V serial I/O via a memory-mapped NS16550 UART.
 //!
-//! The driver maps the `Mmio` cap devmgr delegated (the ACPI-SPCR
+//! The driver maps the `Mmio` cap devmgr delegated (the platform-static
 //! UART base; `0x10000000` on QEMU virt) into its own address space, then
 //! writes the transmit register and drains the receive register after polling
 //! the line status register. Registers are byte-addressed (reg-shift 0),

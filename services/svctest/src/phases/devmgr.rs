@@ -227,26 +227,16 @@ fn orphan_teardown_phase(caps: &Caps)
 /// `UNAUTHORIZED`.
 fn test_label_deny_phase(caps: &Caps)
 {
-    let registry = caps.devmgr_registry;
-    assert!(
-        registry != 0,
-        "devmgr_test_label_deny: no devmgr.registry cap seeded"
+    assert_registry_denies(
+        caps,
+        ipc::devmgr_labels::TEST_SPAWN_ORPHAN,
+        "TEST_SPAWN_ORPHAN",
+        "ORPHAN_TEST_AUTHORITY",
     );
-
-    let ipc_buf = std::os::seraph::current_ipc_buf();
-
-    for (label, shown) in [
-        (ipc::devmgr_labels::TEST_SPAWN_ORPHAN, "TEST_SPAWN_ORPHAN"),
-        (ipc::devmgr_labels::TEST_ORPHAN_RESULT, "TEST_ORPHAN_RESULT"),
-    ]
-    {
-        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-        let reply = unsafe { ipc::ipc_call(registry, &versioned(label), ipc_buf) }
-            .unwrap_or_else(|_| panic!("{shown} on devmgr.registry: ipc_call failed"));
-        assert_eq!(
-            reply.label,
-            ipc::devmgr_errors::UNAUTHORIZED,
-            "{shown} without ORPHAN_TEST_AUTHORITY must reply UNAUTHORIZED"
-        );
-    }
+    assert_registry_denies(
+        caps,
+        ipc::devmgr_labels::TEST_ORPHAN_RESULT,
+        "TEST_ORPHAN_RESULT",
+        "ORPHAN_TEST_AUTHORITY",
+    );
 }

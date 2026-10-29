@@ -26,13 +26,13 @@ use boot_protocol::BootInfo;
 
 /// Spinlock protecting `CONSOLE`. Acquired by every `console_write_fmt` and
 /// `serial_write_fmt` call so concurrent writes from multiple CPUs (SMP) do not
-/// race on the framebuffer cursor position. Uses a plain `AtomicBool`
-/// (test-and-set) rather than the ticket `Spinlock`, so acquiring it does not
-/// disable interrupts, and process-context code can hold it with interrupts
-/// enabled. Interrupt-context callers spin on it the same way: `timer_tick`
-/// prints through `kprintln!` (the vmgenid log, the BSP stall check, and the
-/// softlockup watchdog dump). A tick that prints on a CPU whose interrupted
-/// code holds the lock spins forever on it; this is a known defect (#443).
+/// race on the framebuffer cursor position. A plain `AtomicBool`
+/// (test-and-set) rather than the ticket `Spinlock`, so the crash and NMI paths
+/// below can claim it without queueing. Both acquiring writers disable
+/// interrupts before they spin and restore them only after the release, so the
+/// lock is never held with interrupts enabled: an interrupt-context print
+/// (`timer_tick`'s vmgenid log, BSP stall check, and softlockup watchdog dump)
+/// cannot interrupt a holder on its own CPU and spin on it forever.
 ///
 /// Two non-acquiring exceptions exist for crash and NMI paths where
 /// spin-waiting would deadlock against a halted or interrupted lock-
@@ -156,8 +156,8 @@ pub unsafe fn rebase_framebuffer(fb_phys: u64)
 ///
 /// Serialised via `CONSOLE_LOCK` so concurrent calls from multiple CPUs
 /// (after SMP bringup) do not race on the framebuffer cursor state.
-/// Each call acquires the lock, writes, then releases, without disabling
-/// interrupts; see `CONSOLE_LOCK` for the interrupt-context deadlock (#443).
+/// Each call disables interrupts, acquires the lock, writes, releases, and
+/// restores the caller's interrupt state (see `CONSOLE_LOCK`).
 ///
 /// # Safety
 /// `console::init` must have been called before this function.
@@ -165,18 +165,62 @@ pub unsafe fn console_write_fmt(args: core::fmt::Arguments)
 {
     use core::fmt::Write;
 
-    // Acquire spin-lock (test-and-set, non-disabling).
+    let saved = console_lock_acquire();
+
+    // SAFETY: we hold CONSOLE_LOCK; no other CPU is in this block.
+    let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
+    let _ = console.write_fmt(args);
+
+    console_lock_release(saved);
+}
+
+/// Disable interrupts, then spin until `CONSOLE_LOCK` is claimed. Returns the
+/// saved interrupt state for [`console_lock_release`].
+///
+/// Interrupts go off before the spin so the lock is never held, or waited on,
+/// with interrupts enabled (see `CONSOLE_LOCK`).
+#[cfg(not(test))]
+fn console_lock_acquire() -> u64
+{
+    // SAFETY: kernel context; the saved state is restored by
+    // console_lock_release on the same CPU.
+    let saved = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
     while CONSOLE_LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
         core::hint::spin_loop();
     }
+    saved
+}
 
-    // SAFETY: we hold CONSOLE_LOCK; no other CPU is in this block.
-    let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
-    let _ = console.write_fmt(args);
+/// Release `CONSOLE_LOCK`, then restore the interrupt state
+/// [`console_lock_acquire`] saved.
+#[cfg(not(test))]
+fn console_lock_release(saved: u64)
+{
+    CONSOLE_LOCK.store(false, Ordering::Release);
+    // SAFETY: `saved` came from console_lock_acquire on this CPU.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved) };
+}
 
+/// Host-test variant: no interrupts exist off-target.
+#[cfg(test)]
+fn console_lock_acquire() -> u64
+{
+    while CONSOLE_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    0
+}
+
+/// Host-test variant: no interrupts exist off-target.
+#[cfg(test)]
+fn console_lock_release(_saved: u64)
+{
     CONSOLE_LOCK.store(false, Ordering::Release);
 }
 
@@ -214,8 +258,8 @@ impl core::fmt::Write for SerialWriter
 
 /// Write a formatted string to the serial port only.
 ///
-/// Acquires `CONSOLE_LOCK` as `console_write_fmt` does (spin-waits, does not
-/// disable interrupts; see `CONSOLE_LOCK` for #443) but writes only to serial,
+/// Acquires `CONSOLE_LOCK` as `console_write_fmt` does (interrupts disabled
+/// across the spin and the hold; see `CONSOLE_LOCK`) but writes only to serial,
 /// skipping the framebuffer. This is the serial-only sink behind `kprintln_serial!`, used
 /// for kernel virtual addresses, KASLR-derived values, and userspace fault diagnostics;
 /// see `core/kernel/docs/cross-boundary-disclosure.md` § Kernel console diagnostics.
@@ -227,16 +271,11 @@ pub unsafe fn serial_write_fmt(args: core::fmt::Arguments)
 {
     use core::fmt::Write;
 
-    while CONSOLE_LOCK
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
+    let saved = console_lock_acquire();
 
     let _ = SerialWriter.write_fmt(args);
 
-    CONSOLE_LOCK.store(false, Ordering::Release);
+    console_lock_release(saved);
 }
 
 /// No-op stub for test builds.

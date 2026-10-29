@@ -388,7 +388,10 @@ unsafe fn kernel_entry_post_rebase(
     // sized to boot_cpu_count. Must precede Phase 5: timer::init arms the BSP
     // timer, and timer_tick reads the scheduler slab via CPU_COUNT +
     // SCHEDULERS_PTR.
-    sched::init_storage(boot_cpu_count, allocator);
+    // SAFETY: the single boot thread, once, after Phase 3 (the slabs come from
+    // the live buddy and are reached through the direct map) and before any
+    // reader of the slabs runs (Phase 5 on).
+    unsafe { sched::init_storage(boot_cpu_count, allocator) };
 
     // Allocate entropy subsystem storage (per-CPU CSPRNGs, jitter accumulators,
     // self-test samples, and the central pool) from the buddy allocator,
@@ -396,6 +399,17 @@ unsafe fn kernel_entry_post_rebase(
     // user-cap drain, while the buddy still holds large contiguous blocks.
     #[cfg(not(test))]
     entropy::init_storage(boot_cpu_count, allocator);
+
+    // Initialize the CPU-to-hardware-id mapping (wakeup and shootdown IPI
+    // targets, and the riscv64 PLIC context of each hart). Before Phase 5:
+    // riscv64 `interrupts::init` routes the PLIC to the BSP's hart id.
+    #[cfg(not(test))]
+    // SAFETY: single-threaded boot; boot_cpu_ids copied from BootInfo above;
+    // init_storage allocated the id slab; init_apic_ids writes it once before
+    // SMP is active.
+    unsafe {
+        percpu::init_apic_ids(&boot_cpu_ids);
+    }
 
     // ── Phase 5: architecture hardware initialization ─────────────────────────
     kprintln!("Phase 5: Architecture Hardware Initialisation");
@@ -493,14 +507,6 @@ unsafe fn kernel_entry_post_rebase(
         }
     }
 
-    // Initialize the CPU-to-APIC-ID mapping for wakeup IPIs.
-    #[cfg(not(test))]
-    // SAFETY: single-threaded boot; boot_cpu_ids copied from BootInfo above;
-    // init_apic_ids writes CPU_APIC_IDS once before SMP is active.
-    unsafe {
-        percpu::init_apic_ids(&boot_cpu_ids);
-    }
-
     // ── Phase 6: platform resource validation ─────────────────────────────────
     // Validate mmio_apertures from BootInfo before Phase 7 mints caps from
     // them. (kernel_mmio was cached in Phase 4 so Phase 5 arch init can
@@ -528,7 +534,9 @@ unsafe fn kernel_entry_post_rebase(
     // in the per-CPU storage allocated in Phase 4, so AP startup can call
     // sched::ap_enter without allocating.
     kprintln!("Phase 8: Scheduler and SMP Bringup");
-    let cpu_count = sched::init(boot_cpu_count);
+    // SAFETY: the single boot thread, once, after Phases 3 and 4;
+    // boot_cpu_count is the count init_storage sized the slabs for.
+    let cpu_count = unsafe { sched::init(boot_cpu_count) };
     kprintln!(
         "scheduler initialised, {} CPU{}",
         cpu_count,
@@ -1454,7 +1462,10 @@ unsafe fn kernel_entry_post_rebase(
 
         // Hand off to the scheduler. Never returns. APs are already
         // idle (Phase 8 brought them online).
-        sched::enter();
+        // SAFETY: the single boot thread, once, at the end of Phase 9: page
+        // tables (Phase 3), per-CPU storage (Phase 4), and the scheduler
+        // (Phase 8) are up, and init's TCB is enqueued on CPU 0 above.
+        unsafe { sched::enter() };
     }
 
     // Test-mode divergence: kernel_entry is never called in host tests, but
@@ -1567,7 +1578,10 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     APS_READY.fetch_add(1, Ordering::Release);
 
     // 8. Enter idle loop (never returns).
-    sched::ap_enter(cpu_id)
+    // SAFETY: once, on this AP and its idle stack (installed by the trampoline),
+    // with its logical index cpu_id, after steps 1-6 set up its GDT/TSS, IDT,
+    // interrupt controller, and syscall entry.
+    unsafe { sched::ap_enter(cpu_id) }
 }
 
 /// Emit a fatal error message and halt.

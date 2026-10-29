@@ -572,9 +572,10 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     //
     // The wrapper body lives in the kernel SEED Memory cap; `header.ancestor`
     // = SEED returns the wrapper bytes via `retype_free` on dealloc. The tail
-    // inherits `owns_memory`, and after handoff the buddy is sealed, so
-    // destroying such a tail frees into a sealed buddy (`core/kernel/src/mm/buddy.rs`
-    // § Post-handoff sealing); the insert-failure path below does so (#443).
+    // inherits `owns_memory` once it is inserted; the insert-failure path below
+    // clears the flag before destroying it, since the parent still covers the
+    // range and, after handoff, the buddy is sealed (`core/kernel/src/mm/buddy.rs`
+    // § Post-handoff sealing).
     let tail_ptr = retype::alloc_in_seed(MemoryObject {
         header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
         base: parent_phys + split_offset,
@@ -609,6 +610,18 @@ pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Ok(inserted) => inserted,
         Err(e) =>
         {
+            // The parent still covers the tail's range, so the tail owns none of
+            // it: clear the inherited flag so the dealloc returns only the
+            // wrapper bytes to SEED and frees nothing into the buddy.
+            // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
+            // SAFETY: tail_ptr is the MemoryObject minted above (header at offset
+            // 0), uninserted and reachable from no other thread.
+            #[allow(clippy::cast_ptr_alignment)]
+            unsafe {
+                (*tail_ptr.as_ptr().cast::<MemoryObject>())
+                    .owns_memory
+                    .store(false, core::sync::atomic::Ordering::Release);
+            }
             // SAFETY: tail_ptr just allocated; refcount is 1 with no other
             // holders.
             unsafe { crate::cap::object::dealloc_object(tail_ptr) };

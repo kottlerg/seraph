@@ -42,6 +42,7 @@ use crate::PAGE_SIZE;
 use crate::arch;
 use crate::bootstrap::BootArena;
 use init_protocol::InitInfo;
+use init_sender_table::{LINE_BUF_SIZE, SenderSlot, SenderTable};
 
 use ipc::log_labels::{HANDOVER_PULL, HANDOVER_RELEASE};
 use ipc::stream_labels::STREAM_BYTES;
@@ -66,17 +67,13 @@ pub(crate) const LOG_THREAD_STACK_PAGES: u64 = 4;
 /// Max bytes per IPC chunk. Must match `MSG_DATA_WORDS_MAX * 8` from `syscall_abi`.
 const STREAM_CHUNK_SIZE: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 
-/// Per-sender line-buffer size in the log receiver. Lines longer than this
-/// are flushed without a trailing newline.
-const LINE_BUF_SIZE: usize = 256;
-
 /// Maximum number of distinct sender badges the log receiver tracks at once.
-const MAX_SENDERS: usize = 16;
-
-/// Maximum per-slot display-name length in bytes. Sized for typical
-/// contextual names like `"fatfs /some/deeply/nested/mount"`. Longer names
-/// are truncated.
-const MAX_NAME_LEN: usize = 48;
+/// Every process that logs before real-logd takes over the endpoint holds a
+/// slot (boots peak at about 15), and each registers its name once, so a
+/// table smaller than that count evicts named senders, which then log as
+/// `[?]` for the rest of the boot. Twice the observed peak leaves room for
+/// new boot-time services.
+const MAX_SENDERS: usize = 32;
 
 /// Number of completed log lines retained in the handover ring. Sized
 /// so the pre-mount window — every line emitted between boot and Phase
@@ -351,32 +348,12 @@ extern "C" fn log_thread_entry(arg: u64) -> !
 
 // ── Log receive loop ─────────────────────────────────────────────────────────
 
-/// Per-sender state: the sender's badge (opaque u64 identity), the display
-/// name registered via `STREAM_REGISTER_NAME`, and the bytes accumulated
-/// since the last newline.
-#[derive(Clone, Copy)]
-struct SenderSlot
-{
-    badge: u64,
-    name: [u8; MAX_NAME_LEN],
-    name_used: usize,
-    buf: [u8; LINE_BUF_SIZE],
-    used: usize,
-}
-
-impl SenderSlot
-{
-    const fn empty() -> Self
-    {
-        Self {
-            badge: 0,
-            name: [0u8; MAX_NAME_LEN],
-            name_used: 0,
-            buf: [0u8; LINE_BUF_SIZE],
-            used: 0,
-        }
-    }
-}
+/// Per-sender state, keyed by the kernel-delivered badge: the display name
+/// registered via `STREAM_REGISTER_NAME` and the bytes accumulated since the
+/// last newline. Too large for the log thread's 16 KiB stack (about 10 KiB
+/// at [`MAX_SENDERS`]), so it sits in init's BSS like [`HISTORY`]. The log
+/// thread is its only user; `log_receive_loop` takes the one reference to it.
+static mut SENDERS: SenderTable<MAX_SENDERS> = SenderTable::new();
 
 /// Bounded ring of completed log lines, written on every `flush_line`
 /// for handover to real-logd. Wraps FIFO; oldest entry dropped on
@@ -411,7 +388,8 @@ fn history_push(slot: &SenderSlot)
 {
     use core::sync::atomic::Ordering;
 
-    if slot.used == 0
+    let line = slot.line();
+    if line.is_empty()
     {
         return;
     }
@@ -421,10 +399,10 @@ fn history_push(slot: &SenderSlot)
     // per call.
     unsafe {
         let entry = &mut HISTORY[head];
-        entry.badge = slot.badge;
+        entry.badge = slot.badge();
         entry.us = us;
-        let n = slot.used.min(LINE_BUF_SIZE);
-        entry.bytes[..n].copy_from_slice(&slot.buf[..n]);
+        let n = line.len().min(LINE_BUF_SIZE);
+        entry.bytes[..n].copy_from_slice(&line[..n]);
         entry.used = n as u16;
     }
     HISTORY_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -456,9 +434,9 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, _err: i64)
 /// iteration self-terminates the thread.
 fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
 {
-    let mut slots: [SenderSlot; MAX_SENDERS] = [SenderSlot::empty(); MAX_SENDERS];
-    // Round-robin pointer used to evict when all slots are in use.
-    let mut next_evict: usize = 0;
+    // SAFETY: the log thread runs this loop once and never returns from it,
+    // and nothing else names SENDERS, so this is the only reference to it.
+    let senders = unsafe { &mut *core::ptr::addr_of_mut!(SENDERS) };
     // Handover cursor: 0 until the HANDOVER_PULL header is sent, then one
     // more than the next history push sequence to send.
     let mut handover_cursor: u64 = 0;
@@ -493,14 +471,13 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
         let byte_len = ((recv.label >> 16) & 0xFFFF) as usize;
         if label_id == STREAM_BYTES
         {
-            consume_bytes(&mut slots, &mut next_evict, &recv, recv.badge, byte_len);
+            consume_bytes(senders, &recv, recv.badge, byte_len);
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
         }
         else if label_id == ipc::stream_labels::STREAM_REGISTER_NAME
         {
-            if let Some(slot_idx) =
-                register_sender_name(&mut slots, &mut next_evict, &recv, recv.badge, byte_len)
+            if let Some(slot_idx) = register_sender_name(senders, &recv, recv.badge, byte_len)
             {
                 name_resend.note_name_change(slot_idx);
             }
@@ -510,7 +487,7 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
         else if label_id == HANDOVER_PULL
         {
             handle_handover_pull(
-                &slots,
+                senders.slots(),
                 &mut handover_cursor,
                 &mut handover_slot_idx,
                 &mut name_resend,
@@ -578,7 +555,7 @@ fn next_handover_chunk(
     if *hist_cursor == 0
     {
         let total = HISTORY_TOTAL.load(Ordering::Acquire);
-        let active = slots.iter().filter(|s| s.badge != 0).count() as u64;
+        let active = slots.iter().filter(|s| s.badge() != 0).count() as u64;
         *hist_cursor = 1;
         // From here a name change can land behind the slot pass; record it
         // so the drain sends that slot again.
@@ -591,14 +568,14 @@ fn next_handover_chunk(
     {
         let slot = &slots[*slot_idx];
         *slot_idx += 1;
-        if slot.badge != 0
+        if slot.badge() != 0
         {
             return slot_chunk(slot);
         }
     }
     while let Some(i) = name_resend.take_next()
     {
-        if slots[i].badge != 0
+        if slots[i].badge() != 0
         {
             return slot_chunk(&slots[i]);
         }
@@ -630,16 +607,17 @@ fn next_handover_chunk(
 /// The `SLOT` handover chunk carrying `slot`'s badge and display name.
 fn slot_chunk(slot: &SenderSlot) -> ipc::IpcMessage
 {
-    handover::encode_slot(slot.badge, &slot.name[..slot.name_used.min(MAX_NAME_LEN)])
+    handover::encode_slot(slot.badge(), slot.name())
 }
 
 /// Record a display name for the sender identified by `badge`. Called
 /// from `log_receive_loop` when a `STREAM_REGISTER_NAME` message
-/// arrives. Implements the roadmap collision-suffix policy:
+/// arrives. The name is stored under the collision-suffix policy of
+/// [`SenderTable::register_name`]:
 ///
 /// * Re-registration by the same badge with its own current name is a
 ///   silent no-op (no map mutation, no synthetic line).
-/// * Otherwise the sender's previous name slot is freed first, then the
+/// * Otherwise the sender's previous name is freed first, then the
 ///   requested name is resolved against the rest of the table — if
 ///   another active badge holds the bare name, the applicant is stored
 ///   as `name.2`, `name.3`, …; the first free suffix wins.
@@ -652,123 +630,17 @@ fn slot_chunk(slot: &SenderSlot) -> ipc::IpcMessage
 /// no-op (empty request or unchanged name), so the caller can schedule the
 /// slot to be sent again to real-logd if the handover is in progress.
 fn register_sender_name(
-    slots: &mut [SenderSlot; MAX_SENDERS],
-    next_evict: &mut usize,
+    senders: &mut SenderTable<MAX_SENDERS>,
     msg: &ipc::IpcMessage,
     badge: u64,
     byte_len: usize,
 ) -> Option<usize>
 {
     let bytes = msg.data_bytes();
-    let requested_len = byte_len.min(bytes.len()).min(MAX_NAME_LEN);
-    if requested_len == 0
-    {
-        return None;
-    }
-    let requested = &bytes[..requested_len];
-
-    let slot_idx = find_or_alloc_slot(slots, next_evict, badge);
-
-    // Same badge, same current name — silent no-op.
-    if slots[slot_idx].name_used == requested_len
-        && &slots[slot_idx].name[..slots[slot_idx].name_used] == requested
-    {
-        return None;
-    }
-
-    // Free this badge's current name before resolving collisions, so a
-    // rename liberates the previous slot for the new applicant.
-    slots[slot_idx].name_used = 0;
-    slots[slot_idx].name = [0u8; MAX_NAME_LEN];
-
-    let mut stored = [0u8; MAX_NAME_LEN];
-    let stored_len = resolve_unique_name(slots, requested, &mut stored);
-
-    slots[slot_idx].name[..stored_len].copy_from_slice(&stored[..stored_len]);
-    slots[slot_idx].name_used = stored_len;
-
-    emit_registration_event(badge, &stored[..stored_len]);
+    let requested = &bytes[..byte_len.min(bytes.len())];
+    let slot_idx = senders.register_name(badge, requested)?;
+    emit_registration_event(badge, senders.slots()[slot_idx].name());
     Some(slot_idx)
-}
-
-/// Try the bare `requested` name first; if any other active slot
-/// already holds that exact name, append `.2`, `.3`, … until a free
-/// candidate is found. Writes the chosen bytes into `out` and returns
-/// the byte count. If every suffix collides the bare name is returned
-/// (collision is preserved rather than dropped — the synthetic line
-/// will still reflect what was stored).
-fn resolve_unique_name(
-    slots: &[SenderSlot; MAX_SENDERS],
-    requested: &[u8],
-    out: &mut [u8; MAX_NAME_LEN],
-) -> usize
-{
-    if !name_in_use(slots, requested)
-    {
-        let n = requested.len().min(out.len());
-        out[..n].copy_from_slice(&requested[..n]);
-        return n;
-    }
-    let max_suffix = (MAX_SENDERS as u32) + 1;
-    let mut suffix: u32 = 2;
-    while suffix <= max_suffix
-    {
-        let n = compose_suffixed(requested, suffix, out);
-        if !name_in_use(slots, &out[..n])
-        {
-            return n;
-        }
-        suffix += 1;
-    }
-    let n = requested.len().min(out.len());
-    out[..n].copy_from_slice(&requested[..n]);
-    n
-}
-
-/// Return `true` if any active slot already stores `name` verbatim.
-fn name_in_use(slots: &[SenderSlot; MAX_SENDERS], name: &[u8]) -> bool
-{
-    slots
-        .iter()
-        .any(|s| s.badge != 0 && s.name_used == name.len() && &s.name[..s.name_used] == name)
-}
-
-/// Write `name` followed by `.<n>` into `out`, return the total byte
-/// count. Truncates if the composed form exceeds [`MAX_NAME_LEN`].
-fn compose_suffixed(name: &[u8], n: u32, out: &mut [u8; MAX_NAME_LEN]) -> usize
-{
-    let copy_len = name.len().min(out.len());
-    out[..copy_len].copy_from_slice(&name[..copy_len]);
-    let mut idx = copy_len;
-    if idx < out.len()
-    {
-        out[idx] = b'.';
-        idx += 1;
-    }
-    let mut digits = [0u8; 10];
-    let mut dlen = 0;
-    let mut value = n;
-    if value == 0
-    {
-        digits[0] = b'0';
-        dlen = 1;
-    }
-    else
-    {
-        while value > 0 && dlen < digits.len()
-        {
-            digits[dlen] = b'0' + (value % 10) as u8;
-            dlen += 1;
-            value /= 10;
-        }
-    }
-    while dlen > 0 && idx < out.len()
-    {
-        dlen -= 1;
-        out[idx] = digits[dlen];
-        idx += 1;
-    }
-    idx
 }
 
 /// Emit a synthetic registration-event line attributed to the receiver
@@ -888,9 +760,10 @@ fn flush_synthetic_logd_line(payload: &[u8])
 
 /// Append `byte_len` bytes from the IPC buffer onto the slot for `badge`,
 /// flushing complete lines (`\n`-terminated) to the serial port as `[name] <line>\r\n`.
+/// A sender new to a full table takes an evicted slot
+/// ([`SenderTable::find_or_alloc`]), whose partial line is dropped.
 fn consume_bytes(
-    slots: &mut [SenderSlot; MAX_SENDERS],
-    next_evict: &mut usize,
+    senders: &mut SenderTable<MAX_SENDERS>,
     msg: &ipc::IpcMessage,
     badge: u64,
     byte_len: usize,
@@ -901,65 +774,19 @@ fn consume_bytes(
     let copy_len = len.min(bytes.len());
     let mut tmp = [0u8; STREAM_CHUNK_SIZE];
     tmp[..copy_len].copy_from_slice(&bytes[..copy_len]);
-    let len = copy_len;
 
-    let slot_idx = find_or_alloc_slot(slots, next_evict, badge);
-    for &b in &tmp[..len]
+    let slot_idx = senders.find_or_alloc(badge);
+    let slot = senders.slot_mut(slot_idx);
+    for &b in &tmp[..copy_len]
     {
-        if b == b'\n'
+        // A newline ends the line; a full buffer is flushed too, to keep the
+        // prefix visible.
+        if b == b'\n' || slot.push_byte(b)
         {
-            flush_line(&slots[slot_idx]);
-            slots[slot_idx].used = 0;
-        }
-        else if slots[slot_idx].used < LINE_BUF_SIZE
-        {
-            let used = slots[slot_idx].used;
-            slots[slot_idx].buf[used] = b;
-            slots[slot_idx].used += 1;
-            // Buffer full — flush to keep the prefix visible.
-            if slots[slot_idx].used == LINE_BUF_SIZE
-            {
-                flush_line(&slots[slot_idx]);
-                slots[slot_idx].used = 0;
-            }
+            flush_line(slot);
+            slot.clear_line();
         }
     }
-}
-
-/// Find the slot for `badge`, or claim a free one. If all slots are used,
-/// evict the round-robin victim (its partial line is dropped).
-fn find_or_alloc_slot(
-    slots: &mut [SenderSlot; MAX_SENDERS],
-    next_evict: &mut usize,
-    badge: u64,
-) -> usize
-{
-    for (i, s) in slots.iter().enumerate()
-    {
-        if s.badge == badge && s.badge != 0
-        {
-            return i;
-        }
-    }
-    for (i, s) in slots.iter_mut().enumerate()
-    {
-        if s.badge == 0
-        {
-            s.badge = badge;
-            s.used = 0;
-            return i;
-        }
-    }
-    // Eviction. Clear the prior occupant's name so the new owner does not
-    // inherit it — otherwise unregistered byte writes would render under the
-    // evicted sender's display name.
-    let victim = *next_evict % MAX_SENDERS;
-    *next_evict = (victim + 1) % MAX_SENDERS;
-    slots[victim].badge = badge;
-    slots[victim].used = 0;
-    slots[victim].name = [0u8; MAX_NAME_LEN];
-    slots[victim].name_used = 0;
-    victim
 }
 
 /// Emit `[sec.usfrac] [name] <buffered bytes>\r\n` to the serial port,
@@ -987,13 +814,13 @@ fn flush_line(slot: &SenderSlot)
 
     // ── Name: [<registered name>] or [?] ───────────────────────────────
     arch::current::serial_write_byte(b'[');
-    if slot.name_used == 0
+    if slot.name().is_empty()
     {
         arch::current::serial_write_byte(b'?');
     }
     else
     {
-        for &b in &slot.name[..slot.name_used]
+        for &b in slot.name()
         {
             arch::current::serial_write_byte(b);
         }
@@ -1001,7 +828,7 @@ fn flush_line(slot: &SenderSlot)
     arch::current::serial_write_byte(b']');
     arch::current::serial_write_byte(b' ');
 
-    for &b in &slot.buf[..slot.used]
+    for &b in slot.line()
     {
         if b == b'\n'
         {

@@ -28,7 +28,7 @@
 // `shared/ipc`, etc.
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
-#![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
+#![cfg_attr(not(any(feature = "rustc-dep-of-std", test)), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
 
 // Without `#![no_std]`, the prelude is implicit. With `no_core`, it is
@@ -71,22 +71,23 @@ pub fn registry_cap() -> u32
 }
 
 /// Pack `name` into IPC data words (little-endian-by-byte; byte `i`
-/// occupies bits `(i%8)*8..(i%8)*8+8` of word `i/8`). Returns the
-/// number of words consumed; matches `svcmgr::read_tail_name_from_msg`.
-///
-/// `out` MUST be zeroed by the caller: the bytes are ORed into it.
-///
-/// # Panics
-///
-/// Panics when `name` is longer than [`NAME_MAX`] (#558).
+/// occupies bits `(i%8)*8..(i%8)*8+8` of word `i/8`), overwriting all of
+/// `out`. Returns the number of words consumed, or `None` (leaving `out`
+/// zeroed) when `name` is longer than [`NAME_MAX`]; matches
+/// `svcmgr::read_tail_name_from_msg`.
 #[must_use]
-pub fn pack_name(name: &[u8], out: &mut [u64; NAME_WORDS]) -> usize
+pub fn pack_name(name: &[u8], out: &mut [u64; NAME_WORDS]) -> Option<usize>
 {
+    *out = [0; NAME_WORDS];
+    if name.len() > NAME_MAX
+    {
+        return None;
+    }
     for (i, &b) in name.iter().enumerate()
     {
         out[i / 8] |= u64::from(b) << ((i % 8) * 8);
     }
-    name.len().div_ceil(8)
+    Some(name.len().div_ceil(8))
 }
 
 /// Look up `name` in svcmgr's discovery registry. Returns `Some(cap)`
@@ -106,7 +107,7 @@ pub unsafe fn lookup(name: &[u8], ipc_buf: *mut u64) -> Option<u32>
         return None;
     }
     let mut words = [0u64; NAME_WORDS];
-    let word_count = pack_name(name, &mut words);
+    let word_count = pack_name(name, &mut words)?;
 
     let mut builder =
         IpcMessage::builder(svcmgr_labels::QUERY_ENDPOINT | ((name.len() as u64) << 16));
@@ -125,49 +126,24 @@ pub unsafe fn lookup(name: &[u8], ipc_buf: *mut u64) -> Option<u32>
     reply.caps().first().copied().filter(|&c| c != 0)
 }
 
-/// Publish `(name, send_cap)` in svcmgr's discovery registry. Requires
-/// the caller's `registry_cap` to be stamped with the
-/// `PUBLISH_AUTHORITY` verb-bit; svcmgr will reject otherwise with
-/// `UNAUTHORIZED`. The per-process cap procmgr seeds never carries it, so
-/// nothing calls this today (#558).
-///
-/// Returns the svcmgr status code (`SUCCESS` = 0), or one synthesised
-/// locally without IPC: `UNAUTHORIZED` when no registry cap is installed,
-/// `INVALID_NAME` for an empty or over-long name or a zero `send_cap`, and
-/// `IPC_FAILED` when the call itself fails.
-///
-/// # Safety
-/// `ipc_buf` must point at the registered IPC buffer page for this
-/// thread.
-#[must_use]
-pub unsafe fn publish(name: &[u8], send_cap: u32, ipc_buf: *mut u64) -> u64
+#[cfg(test)]
+mod tests
 {
-    let registry = REGISTRY_CAP.load(Ordering::Acquire);
-    if registry == 0
-    {
-        return svcmgr_errors::UNAUTHORIZED;
-    }
-    if name.is_empty() || name.len() > NAME_MAX || send_cap == 0
-    {
-        return svcmgr_errors::INVALID_NAME;
-    }
-    let mut words = [0u64; NAME_WORDS];
-    let word_count = pack_name(name, &mut words);
+    use super::*;
 
-    let mut builder =
-        IpcMessage::builder(svcmgr_labels::PUBLISH_ENDPOINT | ((name.len() as u64) << 16))
-            .cap(send_cap);
-    for (i, &w) in words.iter().take(word_count).enumerate()
+    #[test]
+    fn pack_name_refuses_a_name_past_name_max()
     {
-        builder = builder.word(i, w);
+        let mut out = [0u64; NAME_WORDS];
+        assert_eq!(pack_name(&[b'a'; NAME_MAX + 1], &mut out), None);
+        assert_eq!(out, [0; NAME_WORDS]);
     }
-    let request = builder.build();
 
-    // SAFETY: ipc_buf is the caller-supplied registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(registry, &request, ipc_buf) })
-    else
+    #[test]
+    fn pack_name_overwrites_a_dirty_buffer()
     {
-        return svcmgr_errors::IPC_FAILED;
-    };
-    reply.label
+        let mut out = [u64::MAX; NAME_WORDS];
+        assert_eq!(pack_name(b"timed", &mut out), Some(1));
+        assert_eq!(out, [u64::from_le_bytes(*b"timed\0\0\0"), 0]);
+    }
 }

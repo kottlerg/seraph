@@ -493,14 +493,16 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
             info.self_aspace_cap,
         );
         if !ok {
-            ::log::emit(
+            // SAFETY: `_start` registered `info.ipc_buffer_vaddr` and
+            // installed it as `current_ipc_buf` above.
+            unsafe { ::log::emit(
                 current_ipc_buf(),
                 format_args!(
                     "std::os::seraph: FATAL: heap_bootstrap failed (memmgr_ep={}); \
                      likely memmgr frame-pool exhaustion — aborting",
                     info.memmgr_endpoint_cap,
                 ),
-            );
+            ) };
             syscall::process_exit(STARTUP_FAIL_HEAP);
         }
         // Wire the object-slab refill path against the same memmgr endpoint.
@@ -993,7 +995,10 @@ pub mod log {
     pub fn register_name(name: &[u8]) {
         let buf = current_ipc_buf();
         let cap = ::log::ensure_badged_cap(buf);
-        ::log::register_name(cap, buf, name);
+        // SAFETY: `current_ipc_buf` is null or this thread's registered IPC
+        // buffer page (`_start` and the spawn trampoline set it after
+        // registering).
+        unsafe { ::log::register_name(cap, buf, name) };
     }
 
     /// Macro entry point. Resolves the calling thread's IPC buffer and
@@ -1003,7 +1008,10 @@ pub mod log {
     #[doc(hidden)]
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn __emit(args: core::fmt::Arguments<'_>) {
-        ::log::emit(current_ipc_buf(), args);
+        // SAFETY: `current_ipc_buf` is null or this thread's registered IPC
+        // buffer page (`_start` and the spawn trampoline set it after
+        // registering).
+        unsafe { ::log::emit(current_ipc_buf(), args) };
     }
 }
 

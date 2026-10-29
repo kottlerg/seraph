@@ -24,29 +24,6 @@
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
 #![cfg_attr(not(any(feature = "rustc-dep-of-std", test)), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
-// Clippy pedantic concessions for this small helper crate:
-// - from_raw constructors are documented as unsafe via `# Safety` and
-//   return types that hold raw pointers; clippy flags ctor methods that
-//   "might deref a raw ptr" but they are all already `unsafe fn`.
-// - Index-based loops are natural for the byte-ring math; iterator form
-//   reads worse here.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::missing_panics_doc,
-    clippy::needless_range_loop,
-    clippy::needless_lifetimes,
-    clippy::elidable_lifetime_names,
-    clippy::single_match_else,
-    clippy::manual_memcpy,
-    clippy::must_use_candidate,
-    clippy::missing_safety_doc,
-    clippy::not_unsafe_ptr_arg_deref,
-    clippy::unused_self,
-    clippy::pub_underscore_fields,
-    clippy::used_underscore_binding,
-    clippy::used_underscore_items,
-    clippy::manual_let_else
-)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;

@@ -1846,6 +1846,10 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 /// - All pages are mapped uncacheable (PCD|PWT on `x86_64`, Svpbmt
 ///   PBMT=IO on `riscv64`).
 ///
+/// # Safety
+/// The contract of [`mem_map`], for the span the MMIO region covers at
+/// `virt`.
+///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned or
 /// non-canonical, or the range leaves the user half), `InvalidCapability`,
@@ -1853,10 +1857,6 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 /// size zero, unaligned, or overflowing), or `OutOfMemory` (page-table
 /// growth pool exhausted; refill with [`cap_create_aspace`] in augment
 /// mode).
-///
-/// # Safety
-/// The contract of [`mem_map`], for the span the MMIO region covers at
-/// `virt`.
 #[inline]
 pub unsafe fn mmio_map(aspace_cap: u32, mmio_cap: u32, virt: u64, flags: u64) -> Result<(), i64>
 {

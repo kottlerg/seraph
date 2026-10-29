@@ -128,6 +128,13 @@ pub fn illegal_instruction() -> !
     }
 }
 
+/// A fresh range-capability lineage root for `integration::range_copy_lineage`:
+/// an `IoPort` cap for two otherwise unused ports, split off the wide cap.
+pub fn fresh_range_root(_ctx: &TestContext) -> Option<u32>
+{
+    ioport::carve_port_range(0x4E0, 2)
+}
+
 /// Seed the I/O port subdivider ([`ioport::init`]) from the root `IoPort` cap
 /// in `info`. Called once from `main::run`, before [`serial`] and [`shutdown`]
 /// carve their ports.

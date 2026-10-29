@@ -6,26 +6,25 @@
 //! Integration (x86-64): revoking an `IoPort` capability withdraws the port
 //! access bound through its descendants, from a thread running on another CPU.
 //!
-//! Carves `held`, an `IoPort` capability covering port 0x80 (the POST
-//! diagnostic port, which reads without side effect), out of a copy of
-//! whichever live `IoPort` capability covers it, derives `granted` from
-//! `held`, and binds `granted` to a child thread. The child, on another CPU
-//! when there is one, reads the port in a loop, so that CPU's TSS holds the
-//! permitting bitmap. Revoking `held` frees `granted`, whose teardown
-//! withdraws the binding and invalidates every CPU's TSS bitmap before the
-//! revoke returns
+//! Carves `held`, an `IoPort` capability for the first ELCR port (0x4D0, the
+//! 8259 edge/level control register, which reads without side effect), out of
+//! ktest's wide `IoPort` capability, derives `granted` from `held`, and binds
+//! `granted` to a child thread. The child, on another CPU when there is one,
+//! reads the port in a loop, so that CPU's TSS holds the permitting bitmap.
+//! Revoking `held` frees `granted`, whose teardown withdraws the binding and
+//! invalidates every CPU's TSS bitmap before the revoke returns
 //! ([docs/capability-model.md § `IoPort`](../../../../../docs/capability-model.md#ioport-x86-64-only)):
 //! the child's next read raises `#GP` and kills it.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use syscall::{cap_delete, cap_derive, cap_revoke, ioport_bind, ioport_split, system_info};
+use syscall::{cap_delete, cap_derive, cap_revoke, ioport_bind, system_info};
 use syscall_abi::{EXIT_FAULT_BASE, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult};
 
-/// The port the child reads.
-const PORT: u16 = 0x80;
+/// The port the child reads: the 8259 ELCR for IRQs 0-7.
+const PORT: u16 = 0x4D0;
 
 /// `#GP`, the vector a denied port access faults with.
 const GP_VECTOR: u64 = 13;
@@ -40,45 +39,15 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let Some(held) = carve_port_cap(ctx)
+    let Some(held) = super::ioport::carve_port_range(PORT, 1)
     else
     {
-        crate::log("ktest: integration::ioport_revoke SKIP (no IoPort cap covers port 0x80)");
+        crate::log("ktest: integration::ioport_revoke SKIP (cannot carve port 0x4D0)");
         return Ok(());
     };
     let result = check(ctx, held);
     cap_delete(held).ok();
     result
-}
-
-/// A fresh `IoPort` capability whose range starts at or below [`PORT`] and
-/// ends just past it, split from a copy of a live capability that covers it;
-/// the capability copied is left as it was.
-fn carve_port_cap(ctx: &TestContext) -> Option<u32>
-{
-    for slot in 1..=crate::unit::hw::scan_bound(ctx)
-    {
-        // A copy of ktest's own Thread cap could not be deleted again (a thread
-        // cannot delete a capability to itself); every other copy can.
-        if slot == ctx.thread_cap
-        {
-            continue;
-        }
-        let Ok(copy) = cap_derive(slot, syscall::RIGHTS_ALL)
-        else
-        {
-            continue;
-        };
-        // A copy of any other type, or of an IoPort range that does not cover
-        // [PORT, PORT + 1] with room past it, refuses the split and is dropped.
-        if let Ok((low, high)) = ioport_split(copy, PORT + 1)
-        {
-            cap_delete(high).ok();
-            return Some(low);
-        }
-        cap_delete(copy).ok();
-    }
-    None
 }
 
 fn check(ctx: &TestContext, held: u32) -> TestResult

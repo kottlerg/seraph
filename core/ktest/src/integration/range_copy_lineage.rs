@@ -6,9 +6,10 @@
 //! Integration: the copy limit of a range-capability lineage, and the root's
 //! lifetime under live copies.
 //!
-//! Splits a fresh lineage root off a copy of an `Mmio` aperture capability,
-//! then derives [`COPY_LIMIT`] copies of it and checks that one more is
-//! refused with `QuotaExceeded`, whether derived from the root or from a copy
+//! Takes a fresh lineage root (`crate::arch::fresh_range_root`: an `IoPort`
+//! split on x86-64, an `Mmio` split on riscv64), then derives [`COPY_LIMIT`]
+//! copies of it and checks that one more is refused with `QuotaExceeded`,
+//! whether derived from the root or from a copy
 //! ([core/kernel/docs/capability-internals.md § Copies and
 //! Lineages](../../../kernel/docs/capability-internals.md#copies-and-lineages)).
 //! Deleting the root while its copies live keeps the limit counting the copies
@@ -17,8 +18,7 @@
 //! fault or as a later SEED exhaustion rather than here, so the test keeps the
 //! lineage's whole life inside one run.
 
-use init_protocol::{CapType, InitInfo};
-use syscall::{cap_delete, cap_derive, mmio_split};
+use syscall::{cap_delete, cap_derive};
 use syscall_abi::SyscallError;
 
 use crate::{TestContext, TestResult};
@@ -26,14 +26,12 @@ use crate::{TestContext, TestResult};
 /// The kernel's `RANGE_COPY_LIMIT`: live copies one lineage admits.
 const COPY_LIMIT: usize = 64;
 
-const PAGE: u64 = 0x1000;
-
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let Some(root) = fresh_root(ctx)
+    let Some(root) = crate::arch::fresh_range_root(ctx)
     else
     {
-        crate::log("ktest: integration::range_copy_lineage SKIP (no splittable Mmio cap)");
+        crate::log("ktest: integration::range_copy_lineage SKIP (no fresh range root)");
         return Ok(());
     };
 
@@ -46,35 +44,6 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     cap_delete(root).ok();
     result
-}
-
-/// A lineage root of its own: the low page split off a copy of an `Mmio`
-/// capability of at least two pages, the high part deleted.
-fn fresh_root(ctx: &TestContext) -> Option<u32>
-{
-    // SAFETY: the kernel maps the read-only InitInfo page at init_info_va for
-    // ktest's lifetime.
-    let info = unsafe { &*(ctx.init_info_va as *const InitInfo) };
-    for d in crate::init_info::descriptors(info)
-    {
-        if d.cap_type != CapType::Mmio || d.aux1 < 2 * PAGE
-        {
-            continue;
-        }
-        // A slot an earlier test consumed refuses the derive.
-        let Ok(copy) = cap_derive(d.slot, syscall::RIGHTS_ALL)
-        else
-        {
-            continue;
-        };
-        if let Ok((low, high)) = mmio_split(copy, PAGE)
-        {
-            cap_delete(high).ok();
-            return Some(low);
-        }
-        cap_delete(copy).ok();
-    }
-    None
 }
 
 fn check(root: u32, copies: &mut [u32; COPY_LIMIT], made: &mut usize) -> TestResult

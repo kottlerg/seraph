@@ -35,6 +35,35 @@ use init_protocol::InitInfo;
 
 use crate::TestContext;
 
+/// A fresh range-capability lineage root for `integration::range_copy_lineage`:
+/// the low page split off a copy of a live `Mmio` cap of at least two pages
+/// (riscv64 has no I/O ports). Every slot is tried by index; a copy of
+/// another type, or of a one-page `Mmio`, refuses the split and is deleted.
+pub fn fresh_range_root(ctx: &TestContext) -> Option<u32>
+{
+    for slot in 1..=crate::unit::hw::scan_bound(ctx)
+    {
+        // A copy of ktest's own Thread cap could not be deleted again (a thread
+        // cannot delete a capability to itself).
+        if slot == ctx.thread_cap
+        {
+            continue;
+        }
+        let Ok(copy) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
+        else
+        {
+            continue;
+        };
+        if let Ok((low, high)) = syscall::mmio_split(copy, 0x1000)
+        {
+            syscall::cap_delete(high).ok();
+            return Some(low);
+        }
+        syscall::cap_delete(copy).ok();
+    }
+    None
+}
+
 /// Exception cause a not-present user store faults with (store/AMO page
 /// fault), as recorded in `EXIT_FAULT_BASE + <vector>` when the fault kills
 /// the thread.

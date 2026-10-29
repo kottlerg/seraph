@@ -120,7 +120,8 @@ namespace-protocol crate executes this uniformly for every backend; see
 §`NS_LOOKUP` for the wire-level dispatch.
 
 `NS_READDIR` applies the same visibility filter: entries hidden from
-this caller are skipped. Hidden entries do not appear in enumeration.
+this caller are skipped without contributing to the entry index, and
+hidden entries do not appear in enumeration.
 
 This composition is what gives the namespace its security properties:
 
@@ -129,7 +130,7 @@ This composition is what gives the namespace its security properties:
 - A directory invisible to unprivileged callers is expressed by setting
   `visible_requires` to require a rights bit (e.g., `ADMIN`) the
   unprivileged caller does not hold. Such an entry does not appear in
-  readdir and lookup returns `NsError::NotFound`.
+  readdir, and lookup returns `NsError::NotFound`.
 - Higher rights to a node are obtainable only from a separately
   delivered capability, minted at the source by a holder of the higher
   rights. The two capabilities name the same node with different

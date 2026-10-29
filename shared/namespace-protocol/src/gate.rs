@@ -89,16 +89,16 @@ pub fn gate(label: u64, badge: u64) -> Result<(NodeId, NamespaceRights), GateErr
 /// caller holding an attenuated cap on the intermediary can obtain a
 /// child cap whose rights exceed its parent's, violating the
 /// monotonic-attenuation invariant in `docs/namespace-model.md`
-/// § "Walking". Pre-intersecting the request body restores the
+/// § Principles. Pre-intersecting the request body restores the
 /// invariant; the receiver still applies its own
 /// `entry.max_rights` ceiling on top.
 ///
 /// # Wire impact
 ///
 /// The `0xFFFF` sentinel is replaced by an explicit rights mask
-/// (defined bits only) on the forwarded message. Semantically identical — every receiver
-/// already decodes raw rights bits the same way — and no protocol
-/// version change is required.
+/// (defined bits only) on the forwarded message. Semantically
+/// identical — every receiver already decodes raw rights bits the same
+/// way — and no protocol version change is required.
 #[must_use]
 pub fn compose_forward_lookup_rights(recv_badge: u64, recv_word0: u64) -> u32
 {

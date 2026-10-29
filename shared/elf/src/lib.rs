@@ -3,19 +3,19 @@
 
 // shared/elf/src/lib.rs
 
-//! Shared ELF64 parsing crate for Seraph userspace components.
+//! Shared ELF64 parsing crate for the bootloader, kernel, and userspace loaders.
 //!
 //! Provides validation, header parsing, `PT_LOAD` segment enumeration, and
 //! `.rela.dyn` relocation-table extraction for ELF64 executables — both
 //! fixed-address `ET_EXEC` images and position-independent `ET_DYN` images
 //! (loaded at a caller-chosen bias with `RELATIVE` relocations applied).
-//! Used by init (to load memmgr and procmgr from boot modules), by procmgr
-//! (to load all subsequent processes), and by the kernel (Phase 9 relocation
-//! of a PIE init via `mm/init_reloc`).
+//! Consumers are listed in `shared/elf/README.md`.
 //!
-//! This crate is `no_std` and performs no allocation or I/O. All functions
-//! operate on a byte slice representing the raw ELF image (or, for the
-//! `*_metadata` variants, its header page plus a caller-supplied reader).
+//! This crate is `no_std` and performs no allocation or I/O. Functions operate
+//! on a byte slice holding the raw ELF image; the `*_metadata` variants need
+//! only the header page plus the declared file size, and `rela_table_metadata`
+//! and `parse_stack_note_streaming` fetch further bytes through a
+//! caller-supplied reader.
 
 #![cfg_attr(not(test), no_std)]
 // cast_possible_truncation: this crate targets 64-bit only (x86-64, riscv64);
@@ -129,9 +129,10 @@ pub enum ElfError
     Not64Bit,
     /// Not little-endian (`ELFDATA2LSB`).
     NotLittleEndian,
-    /// ELF version is not `EV_CURRENT`.
+    /// ELF version (`e_ident[EI_VERSION]`) is not `EV_CURRENT`.
     BadVersion,
-    /// Not a static executable (`ET_EXEC`).
+    /// `e_type` is not an accepted executable type: `ET_EXEC` for [`validate`];
+    /// `ET_EXEC` or `ET_DYN` for [`validate_executable`].
     NotExecutable,
     /// Machine type does not match the expected architecture.
     WrongMachine,
@@ -170,13 +171,14 @@ pub struct Elf64Ehdr
     pub e_type: u16,
     /// Target machine architecture.
     pub e_machine: u16,
-    /// ELF format version; must equal `EV_CURRENT`.
+    /// ELF format version (not checked; `e_ident[EI_VERSION]` is).
     pub e_version: u32,
     /// Virtual address of the program entry point.
     pub e_entry: u64,
     /// File offset of the program header table.
     pub e_phoff: u64,
-    /// File offset of the section header table (unused).
+    /// File offset of the section header table (read only by the stack-note
+    /// parsers).
     pub e_shoff: u64,
     /// Processor-specific flags.
     pub e_flags: u32,
@@ -186,11 +188,13 @@ pub struct Elf64Ehdr
     pub e_phentsize: u16,
     /// Number of program header entries.
     pub e_phnum: u16,
-    /// Size of one section header entry in bytes (unused).
+    /// Size of one section header entry in bytes (read only by the stack-note
+    /// parsers).
     pub e_shentsize: u16,
-    /// Number of section header entries (unused).
+    /// Number of section header entries (read only by the stack-note parsers).
     pub e_shnum: u16,
-    /// Index of the section name string table entry (unused).
+    /// Index of the section name string table entry (read only by the
+    /// stack-note parsers).
     pub e_shstrndx: u16,
 }
 
@@ -293,14 +297,19 @@ pub enum ElfKind
 /// Validate an ELF64 header and return a typed reference.
 ///
 /// Checks: minimum size, magic, class (64-bit), data encoding (little-endian),
-/// version, type (`ET_EXEC`), machine, program header entry size, and program
-/// header count. Kernel-image loading is `ET_EXEC`-only and uses this;
-/// userspace loaders use [`validate_executable`], which also accepts
-/// `ET_DYN`.
+/// version, type (`ET_EXEC`), machine, program header entry size, program
+/// header count, and program header table bounds. Accepts only `ET_EXEC`; no
+/// in-tree loader uses it (they use [`validate_executable`], which also
+/// accepts `ET_DYN`).
 ///
 /// # Errors
 ///
-/// Returns an [`ElfError`] variant for each failed check.
+/// Returns, for the first failed check: [`ElfError::TooSmall`],
+/// [`ElfError::BadMagic`], [`ElfError::Not64Bit`],
+/// [`ElfError::NotLittleEndian`], [`ElfError::BadVersion`],
+/// [`ElfError::NotExecutable`], [`ElfError::WrongMachine`],
+/// [`ElfError::BadPhentsize`], [`ElfError::NoSegments`], or
+/// [`ElfError::PhdrTableOverflow`].
 pub fn validate(data: &[u8], expected_machine: u16) -> Result<&Elf64Ehdr, ElfError>
 {
     let ehdr = validate_ident(data)?;
@@ -321,7 +330,7 @@ pub fn validate(data: &[u8], expected_machine: u16) -> Result<&Elf64Ehdr, ElfErr
 ///
 /// # Errors
 ///
-/// Returns an [`ElfError`] variant for each failed check.
+/// The same variants as [`validate`], for the first failed check.
 pub fn validate_executable(
     data: &[u8],
     expected_machine: u16,
@@ -349,8 +358,8 @@ fn validate_ident(data: &[u8]) -> Result<&Elf64Ehdr, ElfError>
     }
 
     // SAFETY: length check above guarantees data is large enough for Elf64Ehdr.
-    // cast_ptr_alignment: ELF files from the bootloader are loaded at
-    // page-aligned physical addresses; the u8 slice spans that region.
+    // cast_ptr_alignment: assumes the caller's slice is 8-byte aligned; this is
+    // not enforced (#558).
     #[allow(clippy::cast_ptr_alignment)]
     let ehdr = unsafe { &*data.as_ptr().cast::<Elf64Ehdr>() };
 
@@ -437,9 +446,11 @@ impl Iterator for LoadSegmentIter<'_>
             let offset = self.phdr_base + self.index * size_of::<Elf64Phdr>();
             self.index += 1;
 
-            // SAFETY: validate() confirmed the entire program header table
-            // fits within data. Each entry is at a known offset.
-            // cast_ptr_alignment: see validate() — ELF data is page-aligned.
+            // SAFETY: the validator (`validate_tail`) confirmed the entire
+            // program header table fits within data. Each entry is at a known
+            // offset.
+            // cast_ptr_alignment: assumes `data` and `e_phoff` are 8-byte
+            // aligned; not enforced (#558).
             #[allow(clippy::cast_ptr_alignment)]
             let phdr = unsafe { &*self.data.as_ptr().add(offset).cast::<Elf64Phdr>() };
 
@@ -473,8 +484,8 @@ impl Iterator for LoadSegmentIter<'_>
 
 /// Return an iterator over `PT_LOAD` segments in a validated ELF image.
 ///
-/// `ehdr` must have been returned by a successful [`validate`] call on `data`.
-/// The iterator yields one [`LoadSegment`] per `PT_LOAD` program header,
+/// `ehdr` must have been returned by a successful [`validate`] or
+/// [`validate_executable`] call on `data`. The iterator yields one [`LoadSegment`] per `PT_LOAD` program header,
 /// skipping all other segment types.
 ///
 /// # Errors
@@ -519,9 +530,11 @@ impl Iterator for LoadSegmentMetaIter<'_>
             let offset = self.phdr_base + self.index * size_of::<Elf64Phdr>();
             self.index += 1;
 
-            // SAFETY: validate() confirmed the entire program header table
-            // fits within header_data. Each entry is at a known offset.
-            // cast_ptr_alignment: see validate() — ELF data is page-aligned.
+            // SAFETY: the validator (`validate_tail`) confirmed the entire
+            // program header table fits within header_data. Each entry is at a
+            // known offset.
+            // cast_ptr_alignment: assumes `header_data` and `e_phoff` are 8-byte
+            // aligned; not enforced (#558).
             #[allow(clippy::cast_ptr_alignment)]
             let phdr = unsafe { &*self.header_data.as_ptr().add(offset).cast::<Elf64Phdr>() };
 
@@ -555,8 +568,8 @@ impl Iterator for LoadSegmentMetaIter<'_>
 
 /// Return an iterator over `PT_LOAD` segments from the ELF header page only.
 ///
-/// `ehdr` must have been returned by a successful [`validate`] call on
-/// `header_data`. Segment file bounds are checked against `file_size`
+/// `ehdr` must have been returned by a successful [`validate`] or
+/// [`validate_executable`] call on `header_data`. Segment file bounds are checked against `file_size`
 /// rather than the buffer length, allowing the caller to hold only the
 /// first page of the ELF file.
 ///
@@ -604,8 +617,10 @@ pub fn tls_segment(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<TlsSegment>, 
     for i in 0..phdr_count
     {
         let offset = phdr_base + i * size_of::<Elf64Phdr>();
-        // SAFETY: validate() confirmed the phdr table fits within data.
-        // cast_ptr_alignment: ELF data is page-aligned (see validate()).
+        // SAFETY: the validator (`validate_tail`) confirmed the phdr table
+        // fits within data.
+        // cast_ptr_alignment: assumes `data` and `e_phoff` are 8-byte aligned;
+        // not enforced (#558).
         #[allow(clippy::cast_ptr_alignment)]
         let phdr = unsafe { &*data.as_ptr().add(offset).cast::<Elf64Phdr>() };
 
@@ -670,7 +685,8 @@ struct Elf64Shdr
 /// malformed (wrong name, wrong type, wrong descsz). Loaders should
 /// treat `None` as "use default."
 ///
-/// `ehdr` must come from a successful [`validate`] on `data`. Walks the
+/// `ehdr` must come from a successful [`validate`] or [`validate_executable`]
+/// on `data`. Walks the
 /// section header table; the descriptor is read directly from the byte
 /// slice without allocating.
 #[must_use]
@@ -844,8 +860,8 @@ fn read_shdr(data: &[u8], shoff: usize, shentsize: usize, idx: usize) -> Option<
     {
         return None;
     }
-    // SAFETY: bounds-checked above. cast_ptr_alignment: we read fields one
-    // at a time below to avoid any alignment requirement on `data`.
+    // Bounds-checked above; `decode_shdr` reads fields byte-wise, so `data`
+    // needs no alignment.
     let bytes = &data[offset..end];
     Some(decode_shdr(bytes))
 }
@@ -960,8 +976,10 @@ pub fn tls_segment_metadata(
     for i in 0..phdr_count
     {
         let offset = phdr_base + i * size_of::<Elf64Phdr>();
-        // SAFETY: validate() confirmed the phdr table fits within header_data.
-        // cast_ptr_alignment: ELF data is page-aligned (see validate()).
+        // SAFETY: the validator (`validate_tail`) confirmed the phdr table
+        // fits within header_data.
+        // cast_ptr_alignment: assumes `header_data` and `e_phoff` are 8-byte
+        // aligned; not enforced (#558).
         #[allow(clippy::cast_ptr_alignment)]
         let phdr = unsafe { &*header_data.as_ptr().add(offset).cast::<Elf64Phdr>() };
 
@@ -1666,7 +1684,7 @@ mod tests
         let img = build_image(ET_DYN, &std_dynamic());
         let (_, kind) = valid_executable(&img);
         assert_eq!(kind, ElfKind::Dyn);
-        // The kernel-image path stays ET_EXEC-only.
+        // `validate` accepts only ET_EXEC.
         assert_eq!(
             validate(&img, MACHINE).map(|_| ()),
             Err(ElfError::NotExecutable)

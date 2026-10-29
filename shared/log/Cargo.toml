@@ -4,10 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# no_std: the system log macro (`seraph::log!`) and its supporting wire-
-# format helpers. Used directly by init (no_std) and re-exported through
-# the std overlay so std-built services reach it as
-# `std::os::seraph::log!` / `std::os::seraph::log::{acquire, register_name}`.
+# no_std: wire-format helpers and the process-global log-cap cache behind
+# the std overlay's `seraph::log!` macro. Its only consumer is std, which
+# re-exports it so std-built services reach it through `std::os::seraph`.
 [lib]
 test = false
 doctest = false

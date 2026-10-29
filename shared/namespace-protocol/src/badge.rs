@@ -10,17 +10,8 @@
 //! owns the layout. This module is the single point at which that layout
 //! is defined.
 //!
-//! Layout (`u64`, little-endian conceptual):
-//!
-//! ```text
-//! bits  0..40  : node_id (server-private inode identifier; unique
-//!                within this server's lifetime)
-//! bits 40..64  : rights bits (see [`crate::rights`])
-//! ```
-//!
-//! 40 bits of `node_id` provide ≈ 1.1 trillion distinct nodes per server.
-//! 24 bits of rights cover the eight defined namespace rights with
-//! sixteen reserved for future expansion.
+//! The layout is specified in `shared/namespace-protocol/README.md`
+//! § Badge shape.
 
 // Under `rustc-dep-of-std` the crate root is `no_core` and the usual
 // prelude is not auto-imported into submodules. Mirrors the
@@ -41,8 +32,8 @@ pub const NODE_ID_MASK: u64 = (1u64 << NODE_ID_BITS) - 1;
 /// of a node-cap badge.
 ///
 /// `NodeId(0)` is reserved as "the root of this server's namespace" by
-/// convention; backends MAY assign it any meaning they wish, but the
-/// crate emits root caps with badge bits 0..40 = 0 by default.
+/// convention; backends MAY assign it any meaning they wish, but servers
+/// conventionally mint root caps at `NodeId::ROOT`.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 #[repr(transparent)]
 pub struct NodeId(u64);

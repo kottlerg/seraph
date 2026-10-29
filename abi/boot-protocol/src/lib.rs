@@ -10,7 +10,9 @@
 //! source is the authoritative layout specification; this module-level
 //! comment is an index, not the contract.
 //!
-//! All types are `#[repr(C)]` with stable layout. The [`BOOT_PROTOCOL_VERSION`]
+//! Structs are `#[repr(C)]` and enums carry a fixed-width integer repr
+//! (`#[repr(u32)]` for every enum `BootInfo` carries), all with stable
+//! layout. The [`BOOT_PROTOCOL_VERSION`]
 //! constant must match between the bootloader and kernel; the kernel halts at
 //! entry if the versions differ.
 //!
@@ -464,10 +466,12 @@ pub const FRAMEBUFFER_INFO_VERSION: u32 = 1;
 // ── Kernel MMIO (arch-specific) ──────────────────────────────────────────────
 //
 // `KernelMmio` carries the small set of platform facts the kernel itself
-// reads during its own operation (interrupts, timer). It is **not** a
-// capability surface — the kernel consumes it directly and does not mint
-// caps from it. The `mmio_apertures` slice below is the capability-minting
-// surface.
+// reads during its own operation (interrupts, timer). It is not a general
+// capability surface — the kernel consumes it directly; the one exception
+// is RISC-V, where the kernel mints a single `Mmio` cap over the console
+// UART range (`uart_base`/`uart_size`), which may also lie inside an
+// aperture (docs/device-management.md). The `mmio_apertures` slice below is
+// the capability-minting surface.
 //
 // Shape is arch-specific: each arch's fields are the values that arch's
 // kernel actually uses.
@@ -499,7 +503,7 @@ pub const MAX_IOAPICS: usize = 8;
 
 /// Kernel-facing MMIO bases on x86-64.
 ///
-/// Fields are what `kernel/src/arch/x86_64/` needs to reach the interrupt
+/// Fields are what `core/kernel/src/arch/x86_64/` needs to reach the interrupt
 /// controllers today. The COM1 UART is I/O-port-mapped (not MMIO) and is
 /// not included.
 #[cfg(target_arch = "x86_64")]
@@ -543,7 +547,7 @@ impl KernelMmio
 /// two non-MMIO hart facts (`timebase_freq`, `hart_caps`) the kernel's own
 /// initialization consumes before any userspace exists.
 ///
-/// Fields are what `kernel/src/arch/riscv64/` needs today. CLINT is not
+/// Fields are what `core/kernel/src/arch/riscv64/` needs today. CLINT is not
 /// included because S-mode arms the timer through the Sstc `stimecmp` CSR,
 /// not CLINT MMIO.
 #[cfg(target_arch = "riscv64")]
@@ -623,8 +627,8 @@ impl KernelMmio
 ///
 /// Each entry is a region from which the kernel mints exactly one
 /// `Mmio` capability (MAP | WRITE) and hands it to init. Userspace
-/// narrows these to per-device ranges via `mmio_split` (not in this
-/// protocol revision) and distributes them to drivers. Apertures are
+/// narrows these to per-device ranges via `SYS_MMIO_SPLIT` and distributes
+/// them to drivers. Apertures are
 /// intentionally coarse; device-level enumeration is `devmgr`'s job from
 /// ACPI / DTB passthrough.
 #[repr(C)]
@@ -671,11 +675,14 @@ unsafe impl Sync for MmioApertureSlice {}
 /// scratch use and which becomes reclaim-safe once the kernel's Phase-7
 /// capability system has consumed it.
 ///
-/// The kernel walks the [`ReclaimSlice`] in [`BootInfo`] inside
-/// `populate_cspace`, mints one reclaimable `MemoryObject` cap per range, and
-/// inserts each into the root `CSpace` so the cap reaches userspace through
-/// the standard `CapDescriptor` path. Once `populate_cspace` returns, the
-/// kernel MUST NOT dereference any address inside a recorded range.
+/// The kernel walks the [`ReclaimSlice`] in [`BootInfo`] in
+/// `cap::mint_reclaim_memory_caps`, which `init_capability_system` calls after
+/// `populate_cspace` (Phase 7), mints one reclaimable `MemoryObject` cap per
+/// range, and inserts each into the root `CSpace` so the cap reaches
+/// userspace through the standard `CapDescriptor` path; entries flagged
+/// [`RECLAIM_FLAG_LATE`] are minted by `mint_late_reclaim_memory_caps` at the
+/// end of Phase 8. The kernel MUST NOT dereference a recorded range once the
+/// cap minted over it can reach userspace (Phase 9).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReclaimRange
@@ -737,8 +744,11 @@ unsafe impl Sync for ReclaimSlice {}
 /// Boot information structure populated by the bootloader and passed to the
 /// kernel entry point.
 ///
-/// All pointer and address fields hold **physical addresses**. The kernel
-/// converts them via its direct physical map once paging is fully established.
+/// All pointer and resource-address fields hold **physical addresses**; the
+/// exceptions are `kernel_virtual_base` and `direct_map_base` (kernel virtual
+/// addresses) and the link VAs in `init_image`. The kernel converts the
+/// physical ones via its direct physical map once paging is fully
+/// established.
 ///
 /// The `version` field must equal [`BOOT_PROTOCOL_VERSION`]; the kernel halts
 /// if it does not.
@@ -799,8 +809,10 @@ pub struct BootInfo
 
     /// Arch-specific platform facts the kernel itself consumes.
     ///
-    /// Not a capability surface. The kernel reads these values directly
-    /// during its own initialisation (interrupt controller, timer). Fields
+    /// Not a general capability surface (on RISC-V the kernel mints one
+    /// `Mmio` cap over the console UART range; see the `KernelMmio` section
+    /// comment). The kernel reads these values directly during its own
+    /// initialisation (interrupt controller, timer). Fields
     /// not populated by the bootloader are zero; per-field docs on
     /// [`KernelMmio`] state whether the kernel falls back to a compiled-in
     /// default or refuses to boot.
@@ -827,7 +839,8 @@ pub struct BootInfo
 
     /// Hardware identifier of the bootstrap processor (BSP).
     ///
-    /// On x86-64: APIC ID of the BSP (read from CPUID.01H:EBX[31:24]).
+    /// On x86-64: APIC ID of the BSP (the x2APIC ID from CPUID leaf 0x0B
+    /// when available, else CPUID.01H:EBX[31:24]).
     /// On RISC-V: hart ID of the booting hart (from `EFI_RISCV_BOOT_PROTOCOL`).
     pub bsp_id: u32,
 
@@ -836,7 +849,7 @@ pub struct BootInfo
     /// `cpu_ids[0]` is always the BSP (`bsp_id`). `cpu_ids[1..cpu_count]` are
     /// the APs in discovery order. Entries beyond `cpu_count` are zero.
     ///
-    /// On x86-64: APIC IDs (LAPIC `ApicId` field from ACPI MADT).
+    /// On x86-64: LAPIC / x2APIC IDs from the ACPI MADT.
     /// On RISC-V: hart IDs.
     ///
     /// The fixed array length is [`MAX_CPUS`] (512), chosen to cover
@@ -859,19 +872,17 @@ pub struct BootInfo
     ///   physical address for the entry point, so no placement constraint
     ///   applies beyond page alignment.
     ///
-    /// Zero if the bootloader could not reserve a trampoline page; the kernel
-    /// then halts at Phase 8 when more than one CPU is listed, since every
-    /// listed CPU is assumed online from there on.
+    /// Zero if the bootloader could not reserve a trampoline page; the
+    /// kernel's response is in `core/kernel/docs/initialization.md` § Phase 8.
     pub ap_trampoline_page: u64,
 
     // ── Reclaimable scratch (added in protocol version 7) ─────────────────────
     /// Bootloader scratch ranges the kernel reclaims into the cap surface
-    /// inside `populate_cspace`. The slice's backing array lives in its
-    /// own dedicated 4 KiB scratch page; that page is itself one of the
-    /// recorded entries, so the kernel reclaims it last. Reading or
-    /// writing any address in a recorded range after the Phase-7 cap
-    /// system has been initialised is undefined behaviour from the
-    /// kernel's perspective.
+    /// (see [`ReclaimRange`] for when each is minted). The slice's backing
+    /// array lives in its own dedicated 4 KiB scratch page; that page is
+    /// itself one of the recorded entries, so the kernel reclaims it last.
+    /// The kernel MUST NOT read or write a recorded range once the cap
+    /// minted over it can reach userspace (Phase 9).
     pub reclaim_ranges: ReclaimSlice,
 
     // ── Boot entropy seed (added in protocol version 9) ───────────────────────

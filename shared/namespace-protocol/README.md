@@ -2,11 +2,7 @@
 
 Wire-format specification, name validation, rights composition, and
 per-request dispatch (`dispatch_request`) that every Seraph namespace
-server calls from its own receive loop. Filesystem drivers (`fs/fat`,
-future `fs/ext4`, future `tmpfs`) and composing servers (`vfsd`'s
-synthetic root) embed this crate; they implement [`NamespaceBackend`]
-for their storage layer and the crate owns every security-relevant
-code path.
+server calls from its own receive loop.
 
 ---
 
@@ -26,10 +22,10 @@ README implements it.
 
 ## Wire labels
 
-All requests and replies follow the [`ipc::IpcMessage`] shape: a 64-bit
+All requests and replies follow the `ipc::IpcMessage` shape: a 64-bit
 label, an inline data buffer of up to 64 `u64` words, and up to four
 capability slots ([docs/ipc-design.md](../../docs/ipc-design.md)
-§ Message Format). Numeric label values live in [`ipc::ns_labels`] in
+§ Message Format). Numeric label values live in `ipc::ns_labels` in
 `shared/ipc`.
 
 | Opcode | Label | Direction | Purpose |
@@ -41,7 +37,7 @@ capability slots ([docs/ipc-design.md](../../docs/ipc-design.md)
 Label bits 0..16 carry the opcode; bits 16..32 carry an opcode-defined
 header (today: name length for `NS_LOOKUP`); bits 32..64 are zero.
 
-Error replies use the matching [`NsError`] discriminant value as the
+Error replies use the matching `NsError` discriminant value as the
 reply label; success replies use label `0`.
 
 ---
@@ -55,11 +51,13 @@ it on every request. Layout (low-to-high):
 
 | Bits | Field | Meaning |
 |---:|---|---|
-| 0..40 | `node_id` | Server-private inode identifier ([`NodeId`]) |
-| 40..64 | `rights` | 24-bit [`NamespaceRights`] mask |
+| 0..40 | `node_id` | Server-private inode identifier (`NodeId`) |
+| 40..64 | `rights` | 24-bit `NamespaceRights` mask |
 
-`node_id == 0` is conventionally the server's root directory. [`pack`]
-and [`unpack`] are the canonical conversions. Backends that need more
+`node_id == 0` is conventionally the server's root directory. `pack` is
+the public encoder; a server decodes a badged request through `gate`
+(§ Rights gate below), which also applies the operation's rights
+requirement. Backends that need more
 than 2^40 distinct nodes per server lifetime MUST split into multiple
 servers; the protocol does not provide badge expansion.
 
@@ -87,17 +85,17 @@ badge.
 | `label` | `0` |
 | `data[0]` | Entry kind: `0 = File`, `1 = Dir` |
 | `data[1]` | Cached size hint in bytes (zero for directories) |
-| `caps[0]` | Badged SEND on the owning server's namespace endpoint |
+| `caps[0]` | Badged SEND on the owning server's namespace endpoint (with GRANT, for a local entry and across a mount alike) |
 
-**Reply (error)** — label is the matching [`NsError`] code (no caps).
+**Reply (error)** — label is the matching `NsError` code (no caps).
 
 The server MUST:
 
 1. Reject with `PermissionDenied` if the caller's badge lacks the
    `LOOKUP` rights bit.
 2. Reject with `InvalidName` if the requested name fails
-   [`validate_name`].
-3. Resolve `(parent_node, name)` via [`NamespaceBackend::lookup`].
+   `validate_name`.
+3. Resolve `(parent_node, name)` via `NamespaceBackend::lookup`.
 4. Reject with `NotFound` for hidden entries per the rule
    `parent_rights & entry.visible_requires == entry.visible_requires`.
    Hidden and absent MUST be indistinguishable to the caller
@@ -108,9 +106,9 @@ The server MUST:
    Reject with `PermissionDenied` if the returned rights are empty,
    whatever the entry's node: a cap with no rights can do nothing.
 6. Mint the child cap carrying the returned rights via
-   `cap_derive_badge`: for [`EntryTarget::Local`], on the server's own
+   `cap_derive_badge`: for `EntryTarget::Local`, on the server's own
    namespace endpoint at the entry's `NodeId`; for
-   [`EntryTarget::External`] (mount points and other cross-server
+   `EntryTarget::External` (mount points and other cross-server
    entries), on the peer server's namespace endpoint at the peer node.
    External mints afresh from the peer's *unbadged* endpoint — rather
    than copying a stored cap — because the kernel forbids re-badging an
@@ -118,7 +116,7 @@ The server MUST:
    § Badges), so attenuation can only cross the boundary by a fresh mint
    ([docs/namespace-model.md](../../docs/namespace-model.md) § Cross-server entries).
 
-The dispatch crate's [`dispatch_request`] enforces all of the above;
+The dispatch crate's `dispatch_request` enforces all of the above;
 backends own only the storage lookup.
 
 ---
@@ -143,7 +141,7 @@ Attribute snapshot for the node addressed by the caller's badge.
 | `data[1]` | `mtime_us` (best-effort; zero on backends that do not track) |
 | `data[2]` | Kind: `0 = File`, `1 = Dir` |
 
-**Reply (error)** — label is the matching [`NsError`] code.
+**Reply (error)** — label is the matching `NsError` code.
 
 The server MUST reject with `PermissionDenied` if the caller's badge
 lacks the `STAT` rights bit.
@@ -155,8 +153,8 @@ lacks the `STAT` rights bit.
 Enumerate one directory entry by zero-based index. Clients iterate by
 incrementing the index until the reply label is `END_OF_DIR`. Hidden
 entries (per the visibility rule above and [docs/namespace-model.md](../../docs/namespace-model.md)
-§ Per-Entry Rights and Visibility) MUST be skipped without
-contributing to the index.
+§ Per-Entry Rights and Visibility) MUST be skipped without contributing to
+the index.
 
 **Request**
 
@@ -179,7 +177,7 @@ contributing to the index.
 fs-driver surface to keep one end-of-iteration sentinel across the
 two protocols.
 
-**Reply (error)** — label is the matching [`NsError`] code.
+**Reply (error)** — label is the matching `NsError` code.
 
 The server MUST reject with `PermissionDenied` if the caller's badge
 lacks the `READDIR` rights bit.
@@ -191,10 +189,10 @@ to obtain a node cap for an entry of interest.
 
 ## Names
 
-A name accepted by `NS_LOOKUP` MUST satisfy [`validate_name`]:
+A name accepted by `NS_LOOKUP` MUST satisfy `validate_name`:
 
 - UTF-8 encoded.
-- Length 1..=255 bytes ([`MAX_NAME_LEN`]).
+- Length 1..=255 bytes (`MAX_NAME_LEN`).
 - MUST NOT contain `/` (0x2F) or `\0` (0x00).
 - MUST NOT be `.` or `..`.
 
@@ -221,7 +219,7 @@ bits are defined; sixteen are reserved.
 | 2 | `STAT` | `NS_STAT` |
 | 3 | `READ` | `FS_READ` / `FS_READ_MEMORY` (file) |
 | 4 | `WRITE` | `FS_WRITE` / `FS_WRITE_MEMORY` / `FS_TRUNCATE` (file) |
-| 5 | `EXEC` | File is executable; consumed by ELF loaders |
+| 5 | `EXEC` | File is executable (design intent; not yet implemented: no loader tests it) |
 | 6 | `MUTATE_DIR` | `FS_CREATE` / `FS_REMOVE` / `FS_MKDIR` / `FS_RENAME` (directory) |
 | 7 | `ADMIN` | Visibility-gating bit |
 | 8..23 | — | Reserved; MUST be zero on derive, ignored on read |
@@ -232,11 +230,20 @@ server. Rights MUST narrow on every walk ([docs/namespace-model.md](../../docs/n
 § Namespace Rights); the dispatch crate enforces
 this through the intersection at step 5 of `NS_LOOKUP`.
 
+### Rights gate
+
+`gate(label, badge)` is the only public path from a badged request to its `NodeId` and rights.
+It looks the opcode up in the crate's per-label table, applies the requirement in the table above
+(`FS_RELEASE_MEMORY` and `FS_CLOSE` require only a non-empty rights mask), and returns
+`GateError::UnknownLabel` for an opcode the table does not list or `GateError::PermissionDenied`
+when the badge lacks the requirement. Unbadged service-level labels (`FS_MOUNT`) are dispatched
+outside it.
+
 ---
 
 ## Errors
 
-[`NsError`] discriminants are stable wire codes:
+`NsError` discriminants are stable wire codes:
 
 | Code | Variant | Meaning |
 |---:|---|---|
@@ -244,9 +251,9 @@ this through the intersection at step 5 of `NS_LOOKUP`.
 | 2 | `PermissionDenied` | Caller's badge lacks the required right, or an `NS_LOOKUP` would mint a cap with no rights |
 | 3 | `NotADirectory` | Operation requires a directory; node is a file |
 | 4 | `IsADirectory` | Operation requires a file; node is a directory |
-| 5 | `InvalidName` | Name failed [`validate_name`] |
+| 5 | `InvalidName` | Name failed `validate_name` |
 | 6 | `InvalidOffset` | Read past EOF |
-| 7 | `InvalidMemoryCap` | `NS_READ_MEMORY` reply target Memory-cap shape wrong |
+| 7 | `InvalidMemoryCap` | `FS_READ_MEMORY` reply target Memory-cap shape wrong |
 | 8 | `InvalidCookie` | Memory-cap cookie zero or duplicate |
 | 9 | `Evicted` | Page referenced by a held cookie has been evicted |
 | 10 | `IoError` | Backend storage failed |
@@ -261,39 +268,65 @@ accidental edits.
 
 ## Backend trait
 
-Servers implement [`NamespaceBackend`] over their storage layer. The
-trait's methods are called by [`dispatch_request`] after the crate
-has performed name validation, rights composition, and visibility
-filtering — backends never re-implement those checks.
+Filesystem drivers (`fs/fat`, future `fs/ext4`, future `tmpfs`) and
+composing servers (`vfsd`'s synthetic root) embed this crate: they implement
+`NamespaceBackend` over their storage layer, and the crate owns every
+security-relevant code path. The
+trait's methods are called by `dispatch_request` after the crate
+has performed name validation, rights composition, and (for `NS_LOOKUP`)
+visibility filtering — backends never re-implement those checks.
 
 | Method | Called from |
 |---|---|
 | `lookup` | `NS_LOOKUP` |
 | `readdir_entry` | `NS_READDIR` |
-| `may_hide_entries` | `NS_READDIR`: `false` (no entry of the directory is hidden) lets the crate index the directory directly instead of scanning past hidden entries; defaults to `true` |
+| `may_hide_entries` | `NS_READDIR` |
 | `stat` | `NS_STAT` |
-| `read_inline` | future `NS_READ` |
-| `read_memory` | future `NS_READ_MEMORY` |
-| `release_memory` | future `NS_RELEASE_MEMORY` |
-| `close` | future `NS_CLOSE` (best-effort cleanup hint) |
+| `read_inline` | not called; reserved for an `NS_READ` label (design intent; not yet implemented) |
+| `read_memory` | not called; reserved for an `NS_READ_MEMORY` label (design intent; not yet implemented) |
+| `release_memory` | not called; reserved for an `NS_RELEASE_MEMORY` label (design intent; not yet implemented) |
+| `close` | not called; reserved for an `NS_CLOSE` label, a best-effort cleanup hint (design intent; not yet implemented) |
 
-Memory-cap reads continue to use the [`ipc::fs_labels::FS_READ_MEMORY`]
+`may_hide_entries` (default `true`) reports whether any entry of a
+directory may be hidden. When it returns `false`, `NS_READDIR` serves the
+client's index with one `readdir_entry` call; otherwise the crate scans
+the directory from index 0 on each request, skipping hidden entries.
+
+Memory-cap reads continue to use the `ipc::fs_labels::FS_READ_MEMORY`
 surface today; they are documented in
 [`services/fs/docs/fs-driver-protocol.md`](../../services/fs/docs/fs-driver-protocol.md).
-Migration of the read surface to `NS_*` labels is a follow-up phase.
+Migrating the read surface to `NS_*` labels is design intent; not yet implemented.
 
 ---
 
 ## Composing servers
 
 A server MAY return entries whose target lies on a different server's
-namespace endpoint ([`EntryTarget::External`]). `NS_LOOKUP` mints a
+namespace endpoint (`EntryTarget::External`). `NS_LOOKUP` mints a
 fresh cap on that peer endpoint carrying the composed rights
 (`parent_rights ∩ entry.max_rights ∩ caller_requested`), and subsequent
 operations bypass the composing server ([docs/namespace-model.md](../../docs/namespace-model.md)
 § Cross-server entries). This is how filesystem mounting works:
 [`services/vfsd/docs/namespace-composition.md`](../../services/vfsd/docs/namespace-composition.md)
 describes vfsd's synthetic-root composition in detail.
+
+---
+
+## Source Layout
+
+```
+namespace-protocol/
+├── Cargo.toml
+├── README.md
+└── src/
+    ├── lib.rs      # NodeKind, NodeStat, EntryName, EntryTarget, EntryView, MemoryReply,
+    │               #   NamespaceBackend, dispatch_request
+    ├── badge.rs    # NodeId and badge packing (pack)
+    ├── gate.rs     # gate, GateError, compose_forward_lookup_rights, the per-label table
+    ├── name.rs     # validate_name, MAX_NAME_LEN
+    ├── rights.rs   # NamespaceRights and the bit constants
+    └── wire.rs     # NsError wire codes
+```
 
 ---
 

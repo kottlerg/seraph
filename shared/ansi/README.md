@@ -23,11 +23,11 @@ ansi/
 | Item | Purpose |
 |---|---|
 | `AnsiParser` | Stateful `Ground → Esc → Csi` machine. One per output stream; carries partial-sequence and colour state across `feed` calls so a sequence may straddle payload boundaries. |
-| `AnsiParser::feed(bytes, sink)` | Drives the bytes, invoking `sink` with each `Event` in stream order. |
+| `AnsiParser::feed(bytes, sink)` | Drives the bytes, invoking `sink` with each `Event` in stream order. `sink` returns whether the event was delivered; the return is used only for `Attrs` dedup. |
 | `Event::Text(&[u8])` | A run of literal output bytes (no escapes), borrowing the input slice — no allocation. |
-| `Event::Attrs([u8;3], [u8;3])` | A foreground/background 24-bit RGB change, resolved at an `ESC[…m` boundary and emitted only when it differs from the last pair. |
+| `Event::Attrs([u8;3], [u8;3])` | A foreground/background 24-bit RGB change, resolved at an `ESC[…m` boundary and emitted only when it differs from the last pair the sink accepted (a failed delivery is offered again at the next change). |
 
-## Scope (issue #175)
+## Scope
 
 Recognised SGR codes: foreground `30..=37` / `90..=97`, background
 `40..=47` / `100..=107`, `0` reset, `1` bold (promotes a base colour to its
@@ -35,8 +35,9 @@ bright variant), `22` normal intensity, `39` / `49` default fg / bg. Every
 other SGR code — italic, underline, blink, reverse — is silently ignored,
 as are the `38` / `48` 256-colour / truecolour introducers together with
 their `5;<n>` / `2;<r>;<g>;<b>` operands. Non-`m` CSI
-sequences (cursor movement, erase) and non-CSI escapes are swallowed, not
-rendered as literal glyphs.
+sequences (cursor movement, erase) are swallowed, not rendered as literal
+glyphs. For a non-CSI escape only the `ESC` is dropped: the byte after it
+starts a new text run, so `ESC c` renders `c`.
 
 The 16 → RGB mapping (Windows 10 console / Campbell palette; index 0 and 15
 pinned to pure black / white so unstyled text matches the pre-colour default)
@@ -49,7 +50,7 @@ client reuses the same wire without inheriting ANSI's colour vocabulary.
 
 | Consumer | Use |
 |---|---|
-| `programs/terminal` | Holds one `AnsiParser` in its output sink; the framebuffer path emits `FB_SET_ATTRS` on `Event::Attrs` and `FB_WRITE_BYTES` on `Event::Text`. The serial mirror is fed the raw bytes (ANSI passes through unchanged). |
+| [`programs/terminal`](../../programs/terminal/README.md) | Holds one `AnsiParser` in its output sink; the framebuffer path emits `FB_SET_ATTRS` on `Event::Attrs` and `FB_WRITE_BYTES` on `Event::Text`. The serial mirror is fed the raw bytes (ANSI passes through unchanged). |
 
 ---
 

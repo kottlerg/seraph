@@ -1,6 +1,12 @@
 # shared/shmem
 
-Shared-memory byte transport for Seraph userspace, in two layers. `SharedBuffer` maps Memory
+Shared-memory byte transport for Seraph userspace, in two layers.
+
+---
+
+## Overview
+
+`SharedBuffer` maps Memory
 caps received from a peer contiguously at a chosen VA (`SharedBuffer::attach`, at most
 `MAX_PAGES` = 4 pages); the granting side owns allocation and release of the backing pages.
 `SpscHeader`, `SpscWriter`, and `SpscReader` form a single-producer, single-consumer byte ring

@@ -2,6 +2,10 @@
 
 Per-process bootstrap virtual-address layout for Seraph process creators.
 
+---
+
+## Overview
+
 `no_std`, no allocation, no I/O; depends only on `process-abi` (for stack policy
 bounds). Owns the choice of where a new process's four bootstrap surfaces are
 placed — the `ProcessInfo` handover page, the main-thread stack, the main-thread
@@ -51,13 +55,27 @@ resolved by the creator (see [abi/process-abi/README.md](../../abi/process-abi/R
 
 ---
 
+## Source Layout
+
+```
+process-layout/
+├── Cargo.toml
+├── README.md
+└── src/
+    └── lib.rs      # ProcessLayout, choose_process_layout, VaWindow and the per-surface
+                    #   windows, image-bias placement, DEFAULT_* fallbacks, const-asserted
+                    #   zone disjointness, host tests
+```
+
+---
+
 ## Relevant Design Documents
 
 | Document | Content |
 |---|---|
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Three-surface VA model; "Bootstrap Cross-Boundary VAs"; zone map |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Handover discipline; `ProcessInfo`/`InitInfo` fields |
-| [abi/process-abi/](../../abi/process-abi/) | `ProcessInfo` handover struct that records the chosen VAs |
+| [abi/process-abi/README.md](../../abi/process-abi/README.md) | `ProcessInfo` handover struct that records the chosen VAs |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---

@@ -7,13 +7,14 @@
 //!
 //! This crate owns the security-relevant code path that every namespace
 //! server runs: IPC dispatch, name validation, rights composition,
-//! per-entry visibility filtering, and node-cap minting via
-//! `cap_derive_badge`. Storage backends — fatfs, future ext4, tmpfs,
-//! vfsd's synthetic root — implement [`NamespaceBackend`], own their
-//! own `ipc_recv` loop on their namespace endpoint, and route each
-//! `NS_*` request through [`dispatch_request`]. They do not
-//! re-implement namespace semantics or access checks. The model is
-//! documented in `docs/namespace-model.md`.
+//! per-entry visibility filtering at `NS_LOOKUP` and `NS_READDIR`, and
+//! node-cap minting via `cap_derive_badge`. Storage backends — fatfs,
+//! future ext4, tmpfs, vfsd's synthetic root — implement
+//! [`NamespaceBackend`], own their own `ipc_recv` loop on their
+//! namespace endpoint, and route each `NS_*` request through
+//! [`dispatch_request`]. They do not re-implement namespace semantics
+//! or access checks. The model is documented in
+//! `docs/namespace-model.md`.
 
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
@@ -48,9 +49,11 @@ pub use wire::NsError;
 #[repr(u64)]
 pub enum NodeKind
 {
-    /// A regular file. Permits `NS_READ`, `NS_READ_MEMORY`, `NS_STAT`.
+    /// A regular file: `NS_STAT` and the `FS_*` file labels (see
+    /// `shared/namespace-protocol/README.md` § Rights).
     File = 0,
-    /// A directory. Permits `NS_LOOKUP`, `NS_READDIR`, `NS_STAT`.
+    /// A directory: `NS_LOOKUP`, `NS_READDIR`, `NS_STAT`, and the
+    /// `MUTATE_DIR` labels.
     Dir = 1,
 }
 
@@ -74,8 +77,8 @@ pub struct NodeStat
 /// One entry in a directory, as surfaced by `NS_READDIR`.
 ///
 /// The name is carried inline as a fixed-capacity byte buffer so that
-/// the iteration can be no-alloc on the backend side. Names are
-/// validated by [`validate_name`] before serving.
+/// the iteration can be no-alloc on the backend side. Names are not
+/// validated server-side; clients validate the names they receive.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct EntryName
 {
@@ -126,11 +129,9 @@ impl EntryName
 ///
 /// `Local` entries are minted on this server's namespace endpoint via
 /// `cap_derive_badge` against the entry's stored [`NodeId`] (the common
-/// case). `External` entries return a pre-installed cap on a different
-/// server's namespace endpoint via `cap_copy` (the mount-point case).
-/// The composing backend stores `External` entries when boot-time
-/// mount composition installs a child filesystem's root cap into a
-/// parent directory.
+/// case). `External` entries mint a fresh badged SEND via
+/// `cap_derive_badge` on the peer's stored unbadged namespace endpoint
+/// (the mount-point case).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum EntryTarget
 {
@@ -207,7 +208,8 @@ pub struct MemoryReply
 /// Storage backend trait implemented by every namespace server.
 ///
 /// [`dispatch_request`] calls these methods after running the
-/// protocol's wire decode, rights / visibility / name checks, and
+/// protocol's wire decode, rights / name checks (and, for `NS_LOOKUP`,
+/// visibility), and
 /// child-cap minting; backends own only their storage layer and never
 /// the wire surface or the access-control checks.
 pub trait NamespaceBackend
@@ -221,11 +223,13 @@ pub trait NamespaceBackend
     /// (storage I/O, malformed on-disk metadata, …).
     fn lookup(&mut self, dir: NodeId, name: &[u8]) -> Result<EntryView, NsError>;
 
-    /// Return the entry at zero-based index `idx` within `dir`, hidden
-    /// entries included. The crate iterates by incrementing `idx` until
-    /// the backend returns `Ok(None)`, notifying end-of-directory, and
-    /// itself skips the entries whose `visible_requires` the caller
-    /// lacks.
+    /// Return the entry at zero-based backend index `idx` within `dir`,
+    /// hidden entries included; `Ok(None)` past the last entry produces
+    /// `END_OF_DIR`. When [`Self::may_hide_entries`] is `false`, `NS_READDIR`
+    /// calls this once with the client-supplied index, which must then
+    /// equal the visible index; otherwise it scans from index 0 per
+    /// request and itself skips the entries whose `visible_requires` the
+    /// caller lacks.
     ///
     /// # Errors
     ///
@@ -427,17 +431,17 @@ fn handle_lookup<B: NamespaceBackend>(
         EntryTarget::External { endpoint, node } =>
         {
             // Mount-boundary crossing: mint a fresh badged SEND on the
-            // peer server's endpoint carrying the composed rights —
-            // exactly as the `Local` arm does on this server's own
-            // endpoint. Deriving the badge from the (unbadged) peer
-            // endpoint, rather than copying a pre-badged mount cap, is
-            // what lets attenuation cross the mount: the kernel forbids
-            // re-badging an already-badged cap (`SYS_CAP_DERIVE_BADGE`
-            // rejects a badged source), so a stored badged cap could
-            // only ever be copied at its original full rights. GRANT is
-            // carried for the same reason as in the `Local` arm: a node
-            // cap across a mount must still be able to attach caps (the
-            // release-endpoint SEND of `FS_READ_MEMORY`) to its requests.
+            // peer server's endpoint carrying the composed rights, as the
+            // `Local` arm does on this server's own endpoint. Deriving the
+            // badge from the (unbadged) peer endpoint, rather than copying
+            // a pre-badged mount cap, is what lets attenuation cross the
+            // mount: the kernel forbids re-badging an already-badged cap
+            // (`SYS_CAP_DERIVE_BADGE` rejects a badged source), so a
+            // stored badged cap could only ever be copied at its original
+            // full rights. GRANT is carried for the same reason as in the
+            // `Local` arm: a node cap across a mount must still be able to
+            // attach caps (the release-endpoint SEND of `FS_READ_MEMORY`)
+            // to its requests.
             let badge = pack(node, returned_rights);
             match syscall::cap_derive_badge(endpoint, syscall_abi::RIGHTS_EP_SEND_GRANT, badge)
             {
@@ -752,11 +756,17 @@ mod tests
         let r = NamespaceRights::from_raw(rights);
         for (i, want) in (0u32..).zip(expected)
         {
-            let got = nth_visible_entry(&mut dir, NodeId::ROOT, r, i).unwrap().unwrap();
+            let got = nth_visible_entry(&mut dir, NodeId::ROOT, r, i)
+                .unwrap()
+                .unwrap();
             assert_eq!(got.as_bytes(), *want, "visible index {i}");
         }
         let past = u32::try_from(expected.len()).unwrap();
-        assert!(nth_visible_entry(&mut dir, NodeId::ROOT, r, past).unwrap().is_none());
+        assert!(
+            nth_visible_entry(&mut dir, NodeId::ROOT, r, past)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -782,7 +792,10 @@ mod tests
             hides: true,
         };
         let r = NamespaceRights::from_raw(rights::READDIR);
-        assert_eq!(nth_visible_entry(&mut dir, NodeId::ROOT, r, 1), Err(NsError::IoError));
+        assert_eq!(
+            nth_visible_entry(&mut dir, NodeId::ROOT, r, 1),
+            Err(NsError::IoError)
+        );
     }
 
     #[test]
@@ -796,7 +809,9 @@ mod tests
             hides: false,
         };
         let r = NamespaceRights::from_raw(rights::READDIR);
-        let got = nth_visible_entry(&mut dir, NodeId::ROOT, r, 1).unwrap().unwrap();
+        let got = nth_visible_entry(&mut dir, NodeId::ROOT, r, 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(got.as_bytes(), b"b");
     }
 
@@ -811,7 +826,9 @@ mod tests
             hides: false,
         };
         let r = NamespaceRights::from_raw(rights::READDIR);
-        let got = nth_visible_entry(&mut dir, NodeId::ROOT, r, 2).unwrap().unwrap();
+        let got = nth_visible_entry(&mut dir, NodeId::ROOT, r, 2)
+            .unwrap()
+            .unwrap();
         assert_eq!(got.as_bytes(), b"b");
     }
 
@@ -828,12 +845,45 @@ mod tests
             .word(0, u64::from(u32::MAX) + 1)
             .build();
         msg.badge = badge;
-        assert_eq!(handle_readdir(&mut dir, &msg).label, ipc::fs_labels::END_OF_DIR);
+        assert_eq!(
+            handle_readdir(&mut dir, &msg).label,
+            ipc::fs_labels::END_OF_DIR
+        );
 
-        let mut first = ipc::IpcMessage::builder(ipc::ns_labels::NS_READDIR).word(0, 0).build();
+        // In-range control: the same request with index 0 is served, so
+        // END_OF_DIR above comes from the range check, not the handler.
+        let mut first = ipc::IpcMessage::builder(ipc::ns_labels::NS_READDIR)
+            .word(0, 0)
+            .build();
         first.badge = badge;
-        let reply = handle_readdir(&mut dir, &first);
-        assert_eq!(reply.label, 0);
-        assert_eq!(&reply.data_bytes()[16..17], b"a");
+        assert_eq!(handle_readdir(&mut dir, &first).label, 0);
+    }
+
+    #[test]
+    fn readdir_direct_path_reports_end_of_directory_without_scanning()
+    {
+        // `fail_at: Some(0)` proves no scan from index 0 happens.
+        let mut dir = ListDir {
+            entries: MIXED_DIR,
+            fail_at: Some(0),
+            hides: false,
+        };
+        let r = NamespaceRights::from_raw(rights::READDIR);
+        assert_eq!(nth_visible_entry(&mut dir, NodeId::ROOT, r, 3), Ok(None));
+    }
+
+    #[test]
+    fn readdir_direct_path_propagates_a_backend_error()
+    {
+        let mut dir = ListDir {
+            entries: MIXED_DIR,
+            fail_at: Some(2),
+            hides: false,
+        };
+        let r = NamespaceRights::from_raw(rights::READDIR);
+        assert_eq!(
+            nth_visible_entry(&mut dir, NodeId::ROOT, r, 2),
+            Err(NsError::IoError)
+        );
     }
 }

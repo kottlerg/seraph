@@ -6,27 +6,14 @@
 //! Syscall ABI definitions — single source of truth.
 //!
 //! This crate defines the binary interface between userspace and the kernel.
-//! See `core/kernel/docs/syscalls.md` for the full specification.
-//!
-//! # Register conventions
-//!
-//! **x86-64** (`SYSCALL`/`SYSRET`):
-//! - `rax` — syscall number (in); return value (out; negative = error)
-//! - `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` — arguments 0–5
-//! - `rcx` clobbered by `SYSCALL` (holds return address); not an arg register
-//! - `r11` clobbered by `SYSCALL` (holds saved rflags); not an arg register
-//! - `rdx` — secondary return value (e.g. word count from `ipc_recv`)
-//!
-//! **RISC-V** (`ECALL`):
-//! - `a7` — syscall number
-//! - `a0`–`a5` — arguments 0–5
-//! - `a0` — primary return value (negative = error)
-//! - `a1` — secondary return value
+//! See `core/kernel/docs/syscalls.md` for the full specification; register
+//! conventions are in its § Calling Convention.
 //!
 //! # Rules
 //! - No std; builds in `no_std`.
 //! - No inline assembly.
-//! - All cross-boundary types are `#[repr(C)]` with stable layout.
+//! - Each cross-boundary type carries an explicit stable repr (`#[repr(C)]`
+//!   structs, fixed-width integer-repr enums).
 //! - No dependencies outside `core`.
 
 // When pulled into std's dep graph via build-std (feature
@@ -52,8 +39,8 @@ use core::prelude::rust_2024::*;
 
 /// Userspace page size in bytes. The kernel maps and unmaps memory at this
 /// granularity; `mem_map`'s `offset_pages` and `page_count` arguments are
-/// scaled by this constant. Both supported architectures (x86-64 and RISC-V
-/// RV64GC under Sv48) use 4 KiB base pages.
+/// scaled by this constant. Both supported architectures use 4 KiB base pages
+/// in every paging mode.
 pub const PAGE_SIZE: u64 = 0x1000;
 
 // ── Capability handle encoding ────────────────────────────────────────────────
@@ -160,48 +147,13 @@ pub const SYS_IPC_REPLY: u64 = 1;
 pub const SYS_IPC_RECV: u64 = 2;
 /// Notification: send (OR bits into notification object).
 pub const SYS_NOTIFICATION_SEND: u64 = 3;
-/// Notification: wait (read-and-clear; blocks if zero).
-///
-/// arg0 = notification cap index (WAIT right). arg1 = `timeout_ms`: `0` means
-/// block indefinitely (the only behaviour before the timeout extension);
-/// `> 0` means block until bits are delivered *or* `timeout_ms`
-/// milliseconds have elapsed, whichever comes first; if the kernel's sleep
-/// list is full when the wait parks, it times out at once.
-///
-/// On success returns `0` in the primary return register and the bitmask
-/// in the secondary register (rdx / a1). A notification wake always carries
-/// non-zero bits, because `notification_send` rejects zero-bit sends. A `0`
-/// bitmask with a `0` status means the wait timed out: its timeout elapsed,
-/// or it found the sleep list full and returned at once. A stop of the
-/// caller, or the destruction of the notification under it, returns
-/// `Interrupted`. Several threads may wait; they queue in arrival order and
-/// each delivery wakes the longest-waiting one with every pending bit (a
-/// wait that enters while bits are pending takes them at once).
-/// The split avoids aliasing bit-63-set bitmasks with the dispatcher's
-/// negative-Err encoding — the full 64-bit bitmask range is usable. Same
-/// register layout as `SYS_EVENT_RECV`.
+/// Notification: wait (read-and-clear; blocks if zero, with an optional
+/// timeout). See `core/kernel/docs/syscalls.md` § `SYS_NOTIFICATION_WAIT` (4).
 pub const SYS_NOTIFICATION_WAIT: u64 = 4;
 /// `EventQueue`: post an entry.
 pub const SYS_EVENT_POST: u64 = 5;
-/// `EventQueue`: receive an entry.
-///
-/// arg0 = event queue cap index (RECV right). arg1 = `timeout_ms`:
-/// - `0` blocks indefinitely until a post arrives.
-/// - `u64::MAX` is non-blocking try-once: returns `WouldBlock` immediately
-///   if the queue is empty.
-/// - `1 ..= u64::MAX-1` blocks until a post arrives or the timeout
-///   elapses, whichever comes first (at once if the kernel's sleep list is
-///   full when the wait parks). On timeout returns `WouldBlock`
-///   (same code as the try-once-empty case — both mean "no payload
-///   available"; the caller already knows which mode it asked for).
-///
-/// On success returns `0` plus the payload in the secondary return
-/// register. A stop of the caller, or the destruction of the queue under
-/// it, returns `Interrupted`. Blocked receivers queue in arrival order and
-/// each post wakes the longest-waiting one. Sentinel layout matches
-/// `SYS_NOTIFICATION_WAIT` (`0` = forever), but event-queue payloads may be
-/// any `u64` including 0, so the kernel uses an out-of-band `tcb.timed_out`
-/// marker instead of an in-band sentinel on the payload register.
+/// `EventQueue`: receive an entry (blocking, try-once, or with a timeout).
+/// See `core/kernel/docs/syscalls.md` § `SYS_EVENT_RECV` (6).
 pub const SYS_EVENT_RECV: u64 = 6;
 /// Capability: create an `Endpoint` object.
 pub const SYS_CAP_CREATE_ENDPOINT: u64 = 7;
@@ -233,21 +185,12 @@ pub const SYS_THREAD_START: u64 = 19;
 pub const SYS_THREAD_STOP: u64 = 20;
 /// Thread: yield the CPU.
 pub const SYS_THREAD_YIELD: u64 = 21;
-/// Thread: exit and free TCB.
+/// Thread: exit the calling thread.
 pub const SYS_THREAD_EXIT: u64 = 22;
-/// Thread: configure (set entry, stack, arg).
+/// Thread: configure (set entry, stack, arg, TLS base).
 pub const SYS_THREAD_CONFIGURE: u64 = 23;
-/// Capability: copy a slot into another `CSpace`.
-///
-/// arg0 = source capability handle (caller's `CSpace`; generation-checked).
-/// arg1 = destination `CSpace` capability handle (must have INSERT right).
-/// arg2 = destination slot index, or `0` to let the kernel allocate a free slot
-///        (slot 0 is permanently null, so it is a safe "kernel picks" sentinel).
-///        This is the only bare placement index; it is not generation-checked.
-/// arg3 = rights mask; the effective rights are `rights_mask & source rights`
-///        (bits the source lacks are dropped, not rejected).
-///
-/// Returns the destination capability handle (slot index plus generation).
+/// Capability: copy a slot into another `CSpace`, at a chosen slot or one the
+/// kernel allocates. See `core/kernel/docs/syscalls.md` § `SYS_CAP_COPY` (24).
 pub const SYS_CAP_COPY: u64 = 24;
 /// Capability: move a slot (destroying the source).
 pub const SYS_CAP_MOVE: u64 = 25;
@@ -264,62 +207,19 @@ pub const SYS_IRQ_ACK: u64 = 29;
 pub const SYS_IRQ_REGISTER: u64 = 30;
 /// Capability: delete a slot.
 pub const SYS_CAP_DELETE: u64 = 31;
-/// Thread: bind (or clear) the per-thread fault-handler endpoint.
-///
-/// Reuses the slot vacated by `SYS_CAP_INSERT` (merged into `SYS_CAP_COPY`'s
-/// dest-slot arg), the same way `SYS_CAP_INFO` reclaimed the `SYS_DMA_GRANT`
-/// slot.
-///
-/// arg0 = Thread cap index (must have CONTROL) — selects the thread whose
-///        handler is set.
-/// arg1 = Endpoint cap index, or `0` to **unbind**. Must refer to an
-///        `Endpoint`. The binding takes a reference on the endpoint object
-///        for its lifetime.
-/// arg2 = `badge` — caller-chosen value delivered as the fault message badge.
-///        It identifies the faulting thread/process to the handler only if
-///        no other binder can reach the endpoint, or if the handler's badges
-///        are secret (see [`FAULT_LABEL`] and `docs/fault-handling.md`
-///        § Security). Opaque to the kernel.
-/// arg3 = `fault_class_mask` — selects which fault classes this handler
-///        covers. v1 accepts only [`FAULT_CLASS_ALL`]; the argument reserves
-///        the encoding for future per-class handlers without a new syscall.
-///
-/// See [Fault Handling](../../../docs/fault-handling.md) for the protocol.
+/// Thread: bind (or clear) the per-thread fault-handler endpoint. See
+/// `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_FAULT_HANDLER` (32) and
+/// [Fault Handling](../../../docs/fault-handling.md) for the protocol.
 pub const SYS_THREAD_SET_FAULT_HANDLER: u64 = 32;
 /// Memory: split a large Memory cap into smaller ones.
 pub const SYS_MEMORY_SPLIT: u64 = 33;
 /// Memory: map an MMIO region.
 pub const SYS_MMIO_MAP: u64 = 34;
-/// I/O: bind an `IoPort` to the calling thread.
+/// I/O: bind an `IoPort` cap to a thread (x86-64 only).
 pub const SYS_IOPORT_BIND: u64 = 35;
-/// Capability: read-only inspection of a cap's runtime state.
-///
-/// Returns one field per call, chosen by the selector in arg1:
-/// - any tag → `(tag, rights)`, and the system-wide TLB counters (elided and
-///   performed flushes)
-/// - `Memory` → `size_bytes`, `available_bytes`, `has_retype_right`, `phys_base`
-/// - `AddressSpace` → `pt_growth_budget_bytes`
-/// - `CSpace` → `slot_capacity`, `slots_used`, `growth_budget_bytes`
-/// - `Thread` → the packed lifecycle state and exit reason
-///   ([`CAP_INFO_THREAD_STATE`])
-///
-/// Fails with [`SyscallError::InvalidCapability`] on a null, invalid, or
-/// stale handle or when the referenced target object is gone, and with
-/// [`SyscallError::InvalidArgument`] on an unknown
-/// selector or a tag-specific one whose owning tag does not match the slot
-/// (see arg1 below). Slot 36 was vacated by the `SYS_DMA_GRANT` removal
-/// (commit `704c1b4`).
-///
-/// arg0 = capability handle in the caller's `CSpace` (generation-checked).
-/// arg1 = field selector — one of the [`CAP_INFO_*`](CAP_INFO_TAG_RIGHTS)
-///        constants below. The value returned in the primary register
-///        depends on the selector. Field selectors that are tag-specific
-///        (every constant other than [`CAP_INFO_TAG_RIGHTS`] and the
-///        system-wide [`CAP_INFO_TLB_ELIDED`] and [`CAP_INFO_TLB_PERFORMED`])
-///        require the slot's `CapTag` to match the field's owning tag; calls with a
-///        mismatched slot return [`SyscallError::InvalidArgument`].
-///        Selectors not listed below also return
-///        [`SyscallError::InvalidArgument`].
+/// Capability: read-only inspection of a cap's runtime state, one field per
+/// call, chosen by one of the [`CAP_INFO_*`](CAP_INFO_TAG_RIGHTS) selectors
+/// below. See `core/kernel/docs/syscalls.md` § `SYS_CAP_INFO` (36).
 pub const SYS_CAP_INFO: u64 = 36;
 
 // ── SYS_CAP_INFO field selectors ──────────────────────────────────────────────
@@ -438,6 +338,8 @@ pub const CAP_INFO_TLB_PERFORMED: u64 = 11;
 
 /// `CapTag::Memory` discriminant.
 pub const CAP_TAG_MEMORY: u8 = 1;
+
+// ── Syscall numbers (continued) ──────────────────────────────────────────────
 /// Thread: set scheduling priority.
 pub const SYS_THREAD_SET_PRIORITY: u64 = 37;
 /// Thread: set CPU affinity.
@@ -474,13 +376,9 @@ pub const SYS_SCHED_SPLIT: u64 = 52;
 pub const SYS_ASPACE_BIND_NOTIFICATION: u64 = 53;
 /// Exit the whole process with a caller-chosen exit code.
 pub const SYS_PROCESS_EXIT: u64 = 54;
-/// Fill a user buffer with CSPRNG-quality bytes from the kernel entropy pool.
-///
-/// Ambient (requires no capability), like `SYS_SYSTEM_INFO`. arg0 = user buffer
-/// VA, arg1 = length in bytes (`<= MAX_GETRANDOM_LEN`). Returns the number of
-/// bytes written (always equal to the requested length on success — the kernel
-/// never blocks for entropy once the pool is seeded, which happens before any
-/// userspace process runs). See `core/kernel/docs/entropy.md`.
+/// Fill a user buffer with CSPRNG-quality bytes from the kernel entropy pool
+/// (ambient; no capability). See `core/kernel/docs/syscalls.md` § `SYS_GETRANDOM` (55) and
+/// `core/kernel/docs/entropy.md`.
 pub const SYS_GETRANDOM: u64 = 55;
 
 // ── getrandom constants ───────────────────────────────────────────────────────
@@ -504,7 +402,8 @@ pub enum SyscallError
 {
     /// Syscall number is not valid.
     UnknownSyscall = -1,
-    /// Capability slot index is out of range or slot is null.
+    /// Capability slot index is out of range, the slot is null, or the
+    /// handle's generation is stale.
     InvalidCapability = -2,
     /// Caller does not hold sufficient rights for this operation.
     InsufficientRights = -3,
@@ -514,7 +413,7 @@ pub enum SyscallError
     InvalidArgument = -5,
     /// The operation would block but the caller requested non-blocking mode.
     WouldBlock = -6,
-    /// The target thread or object has already exited / been destroyed.
+    /// Reserved; not returned by the current kernel.
     ObjectGone = -7,
     /// No memory available to satisfy the request.
     OutOfMemory = -8,
@@ -522,9 +421,9 @@ pub enum SyscallError
     NotSupported = -9,
     /// The capability rights bitmask violates the W^X constraint.
     WxViolation = -10,
-    /// The message is too large for the destination.
+    /// Reserved; not returned by the current kernel.
     MsgTooLarge = -11,
-    /// Deadlock would occur (IPC cycle detected).
+    /// Reserved; not returned by the current kernel.
     Deadlock = -12,
     /// Event queue is full; post would be lost.
     QueueFull = -13,
@@ -604,9 +503,12 @@ pub const MAP_WRITABLE: u64 = 0x2;
 /// (`RIGHTS_MEM_EXECUTE`).
 pub const MAP_EXECUTABLE: u64 = 0x4;
 
-/// Mapping protection: read-only (no WRITE, no EXECUTE).
+/// Mapping protection value `0`.
 ///
-/// Passed as `prot_bits` to `SYS_MEM_MAP`; equivalent to 0 but more explicit.
+/// Passed as `prot_bits` to `SYS_MEM_MAP`, it does not request read-only: the
+/// kernel derives the permissions from the Memory cap's rights, so a cap with
+/// WRITE maps read-write. `SYS_MEM_PROTECT` treats `0` as read-only. Use
+/// [`MAP_READ`] to force a read-only mapping (#559).
 pub const MAP_READONLY: u64 = 0;
 
 /// Mapping protection: explicit read-only. Bit 0.
@@ -867,7 +769,7 @@ pub const EXIT_KILLED: u64 = 0x2000;
 /// Saturating (never masking) guarantees a non-zero code can never alias to
 /// `0`/success — unlike POSIX 8-bit truncation, where `exit(256)` becomes `0`.
 /// The 12-bit ceiling is deliberate: it slots codes below the established fault
-/// range, and tier-3 verdicts are binary while shell codes are `0..=255`, both
+/// range, and test-harness verdicts are binary while shell codes are `0..=255`, both
 /// well inside the range.
 #[must_use]
 pub const fn encode_exit_code(code: u32) -> u64

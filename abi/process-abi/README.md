@@ -214,9 +214,9 @@ emit identical bytes; the std re-export simply lets std-using binaries
 declare a stack size without an extra Cargo dep on `process-abi`.
 
 `MAX_PROCESS_STACK_PAGES` is a loader-side hard cap (256 pages = 1 MiB)
-that catches a corrupt or hostile note. memmgr's existing per-process
-quota remains the actual policy gate on the resulting `REQUEST_MEMORY_CAPS`
-calls.
+that catches a corrupt or hostile note. The pool's available RAM is the remaining gate on the
+resulting `REQUEST_MEMORY_CAPS` calls; memmgr enforces no per-process quota (see
+[services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § Non-Goals).
 
 The on-disk shape is read by `elf::parse_stack_note` (full-bytes path,
 used by init) and `elf::parse_stack_note_streaming` (header-page +

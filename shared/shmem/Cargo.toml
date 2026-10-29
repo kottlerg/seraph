@@ -15,8 +15,8 @@ doctest = false
 [dependencies]
 syscall = { path = "../syscall" }
 syscall-abi = { path = "../../abi/syscall" }
-# When std lists this crate as a dep (Phase 3 of the logging/stdio
-# split — see ruststd/src/sys/pipe/seraph.rs), build-std activates
+# When std lists this crate as a dep (`runtime/ruststd/src/sys/pipe/seraph.rs`
+# uses it), build-std activates
 # `rustc-dep-of-std` and forwards the feature to our workspace deps,
 # so `use core::…` resolves against the build-std core facade. Same
 # pattern as shared/log, shared/ipc, abi/syscall, shared/syscall.

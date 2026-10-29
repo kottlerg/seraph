@@ -1,6 +1,12 @@
 # shared/registry-client
 
-Client-side helper for the svcmgr name-to-cap discovery registry. Each process's
+Client-side helper for the svcmgr name-to-cap discovery registry.
+
+---
+
+## Overview
+
+Each process's
 `process_abi::ProcessInfo` carries at most one registry cap, the `service_registry_cap` procmgr
 seeds (per [abi/process-abi/README.md](../../abi/process-abi/README.md)); this crate caches
 that one cap. `install_registry_cap` stores it in a process-global atomic once in `_start`, and
@@ -9,7 +15,8 @@ through every API. `pack_name` packs a name of at most `NAME_MAX` = 16 bytes int
 payload words. Lookups are reentrant; svcmgr derives a fresh SEND on every lookup (per
 [services/svcmgr/docs/ipc-interface.md](../../services/svcmgr/docs/ipc-interface.md) § Label 4:
 `QUERY_ENDPOINT`), and callers cache the returned cap themselves. `publish` issues
-`PUBLISH_ENDPOINT` and succeeds only when the cached cap is stamped with `PUBLISH_AUTHORITY`.
+`PUBLISH_ENDPOINT` and succeeds only when the cached cap is stamped with `PUBLISH_AUTHORITY`,
+which the per-process cap procmgr seeds never is, so it has no caller (#558).
 
 `no_std`; builds inside std's dependency graph through the `rustc-dep-of-std` feature.
 

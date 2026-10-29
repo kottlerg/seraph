@@ -1,6 +1,7 @@
 # shared/mmio
 
-Architecture-specific MMIO ordering barriers for device drivers. Callers use
+Architecture-specific MMIO ordering barriers for device drivers and the kernel's own MMIO
+accesses. Callers use
 `dma_to_mmio_barrier` (prior DMA-memory writes before a following MMIO write, e.g. a doorbell),
 `mmio_to_mmio_barrier` (MMIO writes the device must observe in program order), and
 `mmio_to_dma_barrier` (an MMIO status read before a following read of the memory it gates). The

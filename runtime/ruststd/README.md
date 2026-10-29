@@ -49,6 +49,27 @@ ruststd/
 
 ---
 
+## Process Entry and `StartupInfo`
+
+A std-built binary's ELF entry is `std::os::seraph::_start` (`src/os/seraph.rs`). It takes the
+address of the read-only `ProcessInfo` page from the entry register and exits with a voluntary
+startup-failure code (`STARTUP_FAIL_BAD_ABI`) when the page's version is not
+`PROCESS_ABI_VERSION`. It then registers the IPC buffer, builds `std::os::seraph::StartupInfo` from
+the page, wires stdio, the log and service-registry caps, and the namespace caps, and, when the page
+carries a memmgr endpoint, bootstraps the heap against memmgr (exiting with `STARTUP_FAIL_HEAP` if
+that fails). Last it runs the rustc-synthesised `main`, which drives `std::rt::lang_start` and the
+binary's idiomatic `fn main()`; when `main` returns, `_start` closes the stdio pipes and exits the
+process with its return code.
+
+`std::os::seraph::StartupInfo` is std's own type, not a re-export of `process_abi::StartupInfo`
+(which only memmgr's bespoke runtime constructs); a binary reads it through
+`std::os::seraph::startup_info()`, or `try_startup_info()` where `_start` may not have run. It
+carries the fields of the process-abi type plus three that `ProcessInfo` delivers and that type
+omits: `sched_control_cap`, `initial_priority`, and `log_send_cap`. The `ProcessInfo` layout and
+its version gating are defined in [abi/process-abi/README.md](../../abi/process-abi/README.md).
+
+---
+
 ## VA Management Surfaces
 
 `std::sys::seraph` is the per-process owner of virtual-address policy. It
@@ -213,7 +234,7 @@ primitives.
 | [docs/fault-handling.md](../../docs/fault-handling.md) | Pager fault reply: `FAULT_REPLY_KILL` declines an unregistered guard-page fault, killing the faulting thread as an unhandled fault |
 | [docs/capability-model.md](../../docs/capability-model.md) | "Kill process" pattern: a terminal fault on any thread tears down the whole process |
 | [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | Wire shape of `REQUEST_MEMORY_CAPS`/`RELEASE_MEMORY_CAPS`, `REGISTER_REGION`/`UNREGISTER_REGION` |
-| [abi/process-abi/README.md](../../abi/process-abi/README.md) | `ProcessInfo`, `StartupInfo`, `main()` signature |
+| [abi/process-abi/README.md](../../abi/process-abi/README.md) | `ProcessInfo` layout and version gating |
 
 ---
 

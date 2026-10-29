@@ -103,14 +103,15 @@ claims.
    section — a planning label ("step X", "phase Y", "tier N", "stage M",
    "round N", or any label that only a planning conversation can resolve;
    the name of a step in a sequence a document defines permanently is not
-   a label), an Issue reference (`#N`, with or without a closing keyword:
-   `fix #N items` is an Issue reference, not a task ID), a task ID, or a
-   branch name — is a FAIL, as is a closing reference step 5 fails. A
-   departure from a SHOULD rule (a subject over 72 characters, a body not
-   wrapped at ~72 columns) is a FAIL unless the PR body records the
-   maintainer's acceptance of it, quoting the maintainer's words, which
-   § Commit Messages makes an accepted departure: report such an item as
-   `accepted`, citing that quotation, and it does not fail the section.
+   a label), an Issue reference (`#N`, `<owner>/<repo>#N`, or the Issue's
+   URL, with or without a closing keyword: `fix #N items` is an Issue
+   reference, not a task ID), a task ID, or a branch name — is a FAIL, as
+   is a closing reference step 5 fails. A departure from a SHOULD rule (a
+   subject over 72 characters, a body not wrapped at ~72 columns) is a
+   FAIL unless the PR body records the maintainer's acceptance of it,
+   quoting the maintainer's words, which § Commit Messages makes an
+   accepted departure: report such an item as `accepted`, citing that
+   quotation, and it does not fail the section.
 
 9. Validation claim: the PR body's `## Validation` section states the
    validated head X. X MUST be the PR head, or else X MUST be the merge base

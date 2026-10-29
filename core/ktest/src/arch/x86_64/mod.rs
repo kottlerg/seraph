@@ -36,6 +36,16 @@ pub const TRAP_FRAME_BYTES: u64 = 168;
 /// the field a register-file edit redirects.
 pub const IP_OFFSET: usize = 120;
 
+/// Byte offset of the syscall-number register (`rax`) in the kernel
+/// `TrapFrame`: it holds the number of the syscall a thread is blocked in
+/// until the dispatcher writes the return value on the way out.
+pub const SYSCALL_NR_OFFSET: usize = 0;
+
+/// Byte offset of the second argument register (`rsi`) in the kernel
+/// `TrapFrame`: restored on the syscall return and written by no syscall's
+/// return values.
+pub const ARG1_OFFSET: usize = 32;
+
 /// Execute an instruction defined to be illegal (`ud2`), so the calling
 /// thread takes an illegal-instruction trap here. Never returns: with no
 /// fault handler bound the kernel kills the thread in the trap, and a handler

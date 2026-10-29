@@ -23,6 +23,6 @@ mod current;
 mod current;
 
 pub use current::{
-    ILLEGAL_INSTRUCTION_VECTOR, IP_OFFSET, PAGE_FAULT_STORE_VECTOR, TRAP_FRAME_BYTES,
-    illegal_instruction, run_integration, run_unit,
+    ARG1_OFFSET, ILLEGAL_INSTRUCTION_VECTOR, IP_OFFSET, PAGE_FAULT_STORE_VECTOR, SYSCALL_NR_OFFSET,
+    TRAP_FRAME_BYTES, illegal_instruction, run_integration, run_unit,
 };

@@ -94,6 +94,7 @@ pub mod thread_lifecycle;
 pub mod tlb_coherency;
 pub mod tlb_widen_retry;
 pub mod wait_concurrency;
+pub mod write_regs_blocked_syscall;
 
 use crate::TestContext;
 use crate::run_integration_test;
@@ -214,4 +215,8 @@ pub fn run_all(ctx: &TestContext)
         irq_preserves_user_regs::run(ctx)
     );
     run_integration_test!("integration::tlb_widen_retry", tlb_widen_retry::run(ctx));
+    run_integration_test!(
+        "integration::write_regs_blocked_syscall",
+        write_regs_blocked_syscall::run(ctx)
+    );
 }

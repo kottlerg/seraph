@@ -610,8 +610,9 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
 /// Read the current bump offset against `memory`.
 ///
 /// Used by `sys_memory_split` to reject a split offset below the page-rounded
-/// bump (live retypes occupy `[0, bump)`), and by `sys_memory_merge` to require
-/// a virgin tail; see `core/kernel/docs/syscalls.md` § `SYS_MEMORY_SPLIT` (33).
+/// bump (live retypes occupy `[0, bump)`), by `sys_mem_map` to reject a mapping
+/// that starts below it, and by `sys_memory_merge` to require a virgin tail; see
+/// `core/kernel/docs/syscalls.md` § `SYS_MEMORY_SPLIT` (33) and § `SYS_MEM_MAP` (16).
 ///
 /// # Safety
 ///

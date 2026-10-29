@@ -106,7 +106,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     crate::log("cap_transfer: child thread created");
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    thread_configure(th, child_entry as *const () as u64, stack_top, child_arg)
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe { thread_configure(th, child_entry as *const () as u64, stack_top, child_arg) }
         .map_err(|_| "integration::cap_transfer: thread_configure failed")?;
     crate::log("cap_transfer: thread configured");
     thread_start(th).map_err(|_| "integration::cap_transfer: thread_start failed")?;
@@ -163,6 +166,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 // ── Child thread ──────────────────────────────────────────────────────────────
 
+/// IPC page of the [`child_entry`] child.
+static mut CHILD_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
 /// `arg`: address of the child's [`ChildArgs`].
 extern "C" fn child_entry(arg: u64) -> !
 {
@@ -173,9 +179,11 @@ extern "C" fn child_entry(arg: u64) -> !
         sync_sig: sync_sig_slot,
     } = unsafe { child_args(arg) };
 
-    // Register the shared IPC buffer for this child thread.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(CHILD_IPC_PAGE));
+    // SAFETY: `CHILD_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(sync_sig_slot, 0xBAD).ok();
         thread_exit()

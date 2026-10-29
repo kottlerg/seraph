@@ -10,13 +10,13 @@
 use init_protocol::{CapType, InitInfo};
 
 /// QEMU virt UART physical address.
-const UART_PHYS: u64 = 0x1000_0000;
+pub const UART_PHYS: u64 = 0x1000_0000;
 
 /// Virtual address where the UART MMIO page is mapped.
 ///
 /// Below the randomized heap zone (which starts at `0x4000_0000`) and
 /// distinct from every other ktest fixed VA.
-const SERIAL_VA: u64 = 0x3000_0000;
+pub(crate) const SERIAL_VA: u64 = 0x3000_0000;
 
 /// Current UART virtual base (set after `mmio_map`).
 // SAFETY: ktest is single-threaded on the serial path.
@@ -36,13 +36,23 @@ const LSR: usize = 5;
 /// Must be called once, from the main thread, after `InitInfo` is mapped.
 pub unsafe fn init(info: &InitInfo, aspace_cap: u32, _thread_cap: u32) -> bool
 {
-    let Some(slot) = find_uart_cap(info)
+    let Some((slot, size)) = find_uart_cap(info)
     else
     {
         return false; // no UART Mmio cap — serial stays uninitialised
     };
+    // The whole region is mapped from SERIAL_VA, so it must end below the
+    // low scratch band (crate docs § Scratch VAs).
+    if size > crate::SCRATCH_LOW_BASE - SERIAL_VA
+    {
+        return false;
+    }
 
-    if syscall::mmio_map(aspace_cap, slot, SERIAL_VA, 0).is_err()
+    // SAFETY: `aspace_cap` is ktest's own address space; the span from
+    // SERIAL_VA ends below the low scratch band (checked above), in a range
+    // no other ktest mapping and no Rust object uses, and this once-only call
+    // is its sole mapper.
+    if unsafe { syscall::mmio_map(aspace_cap, slot, SERIAL_VA, 0) }.is_err()
     {
         return false;
     }
@@ -55,14 +65,14 @@ pub unsafe fn init(info: &InitInfo, aspace_cap: u32, _thread_cap: u32) -> bool
     true
 }
 
-/// The `CSpace` slot of the `Mmio` cap whose base is the UART, if `InitInfo`
-/// carries one.
-fn find_uart_cap(info: &InitInfo) -> Option<u32>
+/// The `CSpace` slot and byte size of the `Mmio` cap whose base is the UART,
+/// if `InitInfo` carries one.
+fn find_uart_cap(info: &InitInfo) -> Option<(u32, u64)>
 {
     crate::init_info::descriptors(info)
         .iter()
         .find(|d| d.cap_type == CapType::Mmio && d.aux0 == UART_PHYS)
-        .map(|d| d.slot)
+        .map(|d| (d.slot, d.aux1))
 }
 
 /// Program the 16550 UART to 8N1 (minimal re-init; QEMU pre-configures it).

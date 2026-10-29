@@ -8,11 +8,14 @@
 //! cap region.
 //!
 //! A freed sub-page slot's first 8 bytes hold its bin's next-offset link, and
-//! those bytes live inline in the Memory cap's backing region — which a holder can
-//! map writable via `sys_mem_map`. This test seeds bin 0's free list with one
-//! freed slot (offset 0) while keeping a second object live so the list is not
-//! reset by a full drain, then clobbers that slot's link cell — the successor
-//! pointer of the list head — through a writable mapping with a bogus
+//! those bytes live inline in the Memory cap's backing region. `sys_mem_map`
+//! refuses a range below the retype cursor, but a mapping made before the
+//! retypes stays live over them (the converse order,
+//! [#577](https://github.com/kottlerg/seraph/issues/577)). This test maps the
+//! region's first page writable while it is still virgin, seeds bin 0's free
+//! list with one freed slot (offset 0) while keeping a second object live so
+//! the list is not reset by a full drain, then clobbers that slot's link cell —
+//! the successor pointer of the list head — through the mapping with a bogus
 //! out-of-range value, and drives another sub-page retype. The allocator pops
 //! the still-valid head (offset 0), reads the clobbered successor, rejects it
 //! (bounds/alignment guard), and truncates the list to empty — returning the
@@ -43,6 +46,13 @@ pub fn run(ctx: &TestContext) -> TestResult
     let memory_cap =
         crate::frame_pool::alloc().ok_or("integration::retype_subpage_clobber: pool exhausted")?;
 
+    // Map the cap region's first page writable before any retype: a mapping
+    // made after them is refused.
+    // SAFETY: `CLOBBER_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    unsafe { mem_map(memory_cap, ctx.aspace_cap, CLOBBER_VA, 0, 1, MAP_WRITABLE) }
+        .map_err(|_| "integration::retype_subpage_clobber: mem_map failed")?;
+
     // Two sub-page (BIN_128) retypes: `a` lands at offset 0 of the virgin
     // cap region, `b` above it. Freeing `a` while `b` stays live pushes offset 0
     // onto bin 0's free list (a list push, not a bump rollback, and not a full
@@ -53,14 +63,14 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::retype_subpage_clobber: cap_create_endpoint b failed")?;
     cap_delete(a).map_err(|_| "integration::retype_subpage_clobber: cap_delete a failed")?;
 
-    // Map the cap region's first page writable and clobber the freed slot's
-    // link cell (offset 0) exactly as an aliasing writer would, then unmap.
-    mem_map(memory_cap, ctx.aspace_cap, CLOBBER_VA, 0, 1, MAP_WRITABLE)
-        .map_err(|_| "integration::retype_subpage_clobber: mem_map failed")?;
-    // SAFETY: CLOBBER_VA..+8 is mapped writable just above and exclusively
+    // Clobber the freed slot's link cell (offset 0) through the earlier
+    // mapping exactly as an aliasing writer would, then unmap.
+    // SAFETY: CLOBBER_VA..+8 is mapped writable above and exclusively
     // owned by this thread for the duration of the write.
     unsafe { core::ptr::write_volatile(CLOBBER_VA as *mut u64, POISON) };
-    mem_unmap(ctx.aspace_cap, CLOBBER_VA, 1)
+    // SAFETY: `CLOBBER_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    unsafe { mem_unmap(ctx.aspace_cap, CLOBBER_VA, 1) }
         .map_err(|_| "integration::retype_subpage_clobber: mem_unmap failed")?;
 
     // Drive another sub-page retype. The allocator pops the valid head

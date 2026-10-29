@@ -60,6 +60,9 @@ static CHILD_DONE: AtomicU32 = AtomicU32::new(0);
 static MISMATCHES: AtomicU64 = AtomicU64::new(0);
 static OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 
+/// IPC page of the [`child_entry`] child.
+static mut CHILD_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
 /// Child entry: register the IPC buffer, then load `PATTERN` into the FP
 /// register file, issue `SYS_IPC_CALL`, and capture the registers after the
 /// reply, through `crate::arch::fpu::ipc_call_capture`, whose one inline-asm
@@ -72,8 +75,11 @@ extern "C" fn child_entry(_arg: u64) -> !
     // later grows data words and matches the buffer-registered ktest
     // invariant. Done before the FP-preserving block so any FP clobber
     // here is irrelevant.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(CHILD_IPC_PAGE));
+    // SAFETY: `CHILD_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { ipc_buffer_set(buf_addr) }.is_err()
     {
         thread_exit();
     }
@@ -123,7 +129,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK));
     // Pin to CPU 0 initially: the child must run there long enough to
     // become `fpu_owner` on CPU 0 before it blocks in SYS_IPC_CALL.
-    spawn::configure_and_start_pinned(&child, child_entry, stack_top, 0, 0)
+    // SAFETY: the stack is `STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(&child, child_entry, stack_top, 0, 0) }
         .map_err(|_| "fpu_survives_ipc_call: configure_and_start_pinned failed")?;
 
     // Wait for the child's call. `ipc_recv` blocks the harness thread

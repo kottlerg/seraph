@@ -1315,15 +1315,20 @@ fn handle_write_memory_node_cap(
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     };
-    if syscall::mem_map(
-        restricted_cap,
-        self_aspace,
-        va,
-        0,
-        1,
-        syscall_abi::MAP_READONLY,
-    )
-    .is_err()
+    // SAFETY: `va` is the page `write_memory_va` reserved from the
+    // per-process arena for this handler alone, which runs only on the
+    // dispatch thread; nothing else maps it and no Rust object lies in it.
+    let mapped = unsafe {
+        syscall::mem_map(
+            restricted_cap,
+            self_aspace,
+            va,
+            0,
+            1,
+            syscall_abi::MAP_READONLY,
+        )
+    };
+    if mapped.is_err()
     {
         let _ = syscall::cap_delete(restricted_cap);
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
@@ -1343,7 +1348,9 @@ fn handle_write_memory_node_cap(
             byte_count,
         );
     }
-    let _ = syscall::mem_unmap(self_aspace, va, 1);
+    // SAFETY: the same reserved page, read above only through a raw copy; no
+    // Rust reference into it is live.
+    let _ = unsafe { syscall::mem_unmap(self_aspace, va, 1) };
     // Drop the rights-restricted sub-cap we derived to satisfy W^X
     // at mem_map. The original src_cap is unaffected and returns to
     // the caller in the reply.

@@ -145,7 +145,9 @@ fn start_and_storm(child: &spawn::SpawnedChild, done: u32, cycles: u32) -> TestR
     // SAFETY: stack index 0 is this test's only child; stress tests run
     // sequentially and the child is deleted before this test returns.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
-    spawn::configure_and_start_pinned(child, sleeper_entry, stack, u64::from(c_done), 0)
+    // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(child, sleeper_entry, stack, u64::from(c_done), 0) }
         .map_err(|_| "stress::stop_sleep_window: start sleeper failed")?;
 
     let mut acc = 0u64;

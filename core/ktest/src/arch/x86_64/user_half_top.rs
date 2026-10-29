@@ -31,12 +31,16 @@ pub fn top_page_unmappable(ctx: &TestContext) -> TestResult
 {
     let frame = crate::frame_pool::alloc().ok_or("user_half_top: frame pool exhausted")?;
 
-    let top = mem_map(frame, ctx.aspace_cap, TOP_USER_PAGE, 0, 1, MAP_WRITABLE);
+    // SAFETY: `TOP_USER_PAGE` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    let top = unsafe { mem_map(frame, ctx.aspace_cap, TOP_USER_PAGE, 0, 1, MAP_WRITABLE) };
     if top.is_ok()
     {
         // The frame is now mapped at the top page: unmap before returning it
         // to the pool, and keep it if the unmap fails.
-        if mem_unmap(ctx.aspace_cap, TOP_USER_PAGE, 1).is_ok()
+        // SAFETY: `TOP_USER_PAGE` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe { mem_unmap(ctx.aspace_cap, TOP_USER_PAGE, 1) }.is_ok()
         {
             // SAFETY: `frame` came from the pool and its only mapping was just
             // removed.
@@ -45,15 +49,22 @@ pub fn top_page_unmappable(ctx: &TestContext) -> TestResult
         return Err("user_half_top: mem_map of the top user page succeeded");
     }
 
-    let below = mem_map(
-        frame,
-        ctx.aspace_cap,
-        HIGHEST_MAPPABLE_PAGE,
-        0,
-        1,
-        MAP_WRITABLE,
-    );
-    let unmapped = below.is_err() || mem_unmap(ctx.aspace_cap, HIGHEST_MAPPABLE_PAGE, 1).is_ok();
+    // SAFETY: `HIGHEST_MAPPABLE_PAGE` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    let below = unsafe {
+        mem_map(
+            frame,
+            ctx.aspace_cap,
+            HIGHEST_MAPPABLE_PAGE,
+            0,
+            1,
+            MAP_WRITABLE,
+        )
+    };
+    // SAFETY: `HIGHEST_MAPPABLE_PAGE` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    let unmapped =
+        below.is_err() || unsafe { mem_unmap(ctx.aspace_cap, HIGHEST_MAPPABLE_PAGE, 1) }.is_ok();
     if unmapped
     {
         // SAFETY: `frame` came from the pool and is mapped nowhere: the top-page

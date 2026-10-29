@@ -237,8 +237,18 @@ fn ipc_log(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
 /// The cap survives init-logd's `sys_thread_exit` — the kernel marks the
 /// TCB Exited but does not reclaim it until `cap_delete` drops the cap's
 /// last reference.
-pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, ioport_cap: u32)
--> u32
+///
+/// # Safety
+/// Called at most once, on init's main thread: it maps the log thread's stack
+/// and IPC page at the fixed `LOG_THREAD_STACK_VA` and `LOG_THREAD_IPC_BUF_VA`
+/// in init's own address space and starts the thread on them, so a second
+/// call would remap a running thread's memory.
+pub unsafe fn spawn_log_thread(
+    info: &InitInfo,
+    arena: &mut BootArena,
+    log_ep: u32,
+    ioport_cap: u32,
+) -> u32
 {
     // Offset-map the log thread's stack pages from init's arena into init's
     // address space, writable (W^X: not executable). `place_page` maps the
@@ -246,14 +256,18 @@ pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, iop
     // derived child cap is needed.
     for i in 0..LOG_THREAD_STACK_PAGES
     {
-        if arena
-            .place_page(
+        // SAFETY: the log-thread stack pages are fixed VAs of init's private
+        // plan (below the kernel-chosen windows of `process-layout`), which
+        // only this once-only call maps.
+        let placed = unsafe {
+            arena.place_page(
                 info.aspace_cap,
                 LOG_THREAD_STACK_VA + i * PAGE_SIZE,
                 syscall::MAP_WRITABLE,
                 |_| {},
             )
-            .is_none()
+        };
+        if placed.is_none()
         {
             log("init: FATAL: cannot place log thread stack");
             syscall::thread_exit();
@@ -261,14 +275,17 @@ pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, iop
     }
 
     // Offset-map the log thread's IPC buffer (zeroed by `place_page`).
-    if arena
-        .place_page(
+    // SAFETY: LOG_THREAD_IPC_BUF_VA is a fixed page of init's private plan,
+    // which only this once-only call maps.
+    let placed = unsafe {
+        arena.place_page(
             info.aspace_cap,
             LOG_THREAD_IPC_BUF_VA,
             syscall::MAP_WRITABLE,
             |_| {},
         )
-        .is_none()
+    };
+    if placed.is_none()
     {
         log("init: FATAL: cannot place log thread IPC buffer");
         syscall::thread_exit();
@@ -305,13 +322,18 @@ pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, iop
     // Pack log_ep (u32) into the arg passed to the thread.
     let arg = u64::from(log_ep);
 
-    if syscall::thread_configure(
-        thread_cap,
-        log_thread_entry as *const () as u64,
-        stack_top,
-        arg,
-    )
-    .is_err()
+    // SAFETY: `log_thread_entry` is an `extern "C" fn(u64) -> !`; `stack_top`
+    // tops the stack pages placed above for this thread alone, which nothing
+    // else uses for the thread's life; no TLS block is set.
+    let configured = unsafe {
+        syscall::thread_configure(
+            thread_cap,
+            log_thread_entry as *const () as u64,
+            stack_top,
+            arg,
+        )
+    };
+    if configured.is_err()
     {
         log("init: FATAL: cannot configure log thread");
         syscall::thread_exit();
@@ -331,7 +353,10 @@ pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, iop
 extern "C" fn log_thread_entry(arg: u64) -> !
 {
     // Register this thread's IPC buffer.
-    if syscall::ipc_buffer_set(LOG_THREAD_IPC_BUF_VA).is_err()
+    // SAFETY: LOG_THREAD_IPC_BUF_VA is the page `spawn_log_thread` placed for
+    // this thread alone; no Rust object lives in it, and the thread reaches
+    // it only through the raw `ipc_buf` pointer below.
+    if unsafe { syscall::ipc_buffer_set(LOG_THREAD_IPC_BUF_VA) }.is_err()
     {
         serial_log("init: log thread: ipc_buffer_set failed");
         syscall::thread_exit();

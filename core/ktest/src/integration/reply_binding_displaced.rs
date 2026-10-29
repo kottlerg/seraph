@@ -277,7 +277,9 @@ fn displace_fault(ctx: &TestContext, parts: &mut Parts, objects: &Objects, acc: 
     // The faulter stack belongs to this test's faulter, deleted before this
     // test returns.
     let stack = ChildStack::top(core::ptr::addr_of!(FAULTER_STACK));
-    spawn::configure_and_start(faulter, faulter_entry, stack, 0)
+    // SAFETY: the stack is `FAULTER_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start(faulter, faulter_entry, stack, 0) }
         .map_err(|_| "integration::reply_binding_displaced: start faulter failed")?;
     let fault_th = faulter.th;
 
@@ -393,7 +395,9 @@ fn start_caller(
     };
     // SAFETY: stack `caller.index` belongs to this caller (see above).
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(CALLER_STACKS[caller.index]) });
-    spawn::configure_and_start(child, caller.entry, stack, arg)
+    // SAFETY: the stack is `CALLER_STACKS[caller.index]`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start(child, caller.entry, stack, arg) }
         .map_err(|_| "integration::reply_binding_displaced: start caller failed")
 }
 
@@ -421,7 +425,10 @@ fn call(args: &CallerArgs) -> Option<Result<IpcMessage, i64>>
 {
     // SAFETY: buffer `index` belongs to this caller alone.
     let buf = unsafe { core::ptr::addr_of_mut!(CALLER_IPC_BUFS[args.index]) }.cast::<u64>();
-    ipc_buffer_set(buf as u64).ok()?;
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    unsafe { ipc_buffer_set(buf as u64) }.ok()?;
     notification_send(args.done, args.ready).ok();
     // SAFETY: `buf` was registered as this thread's IPC buffer above.
     Some(unsafe { ipc::ipc_call(args.ep, &IpcMessage::new(args.label), buf) })

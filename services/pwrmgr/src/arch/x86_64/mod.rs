@@ -258,14 +258,19 @@ where
         return None;
     };
     let map_vaddr = range.va_start();
-    let mapped = syscall::mem_map(
-        view.memory_cap,
-        self_aspace,
-        map_vaddr,
-        0,
-        geometry.pages,
-        MAP_READONLY,
-    );
+    // SAFETY: `range` is a fresh reservation of `geometry.pages` pages from
+    // the per-process arena, owned here: VA no Rust object or IPC page
+    // occupies.
+    let mapped = unsafe {
+        syscall::mem_map(
+            view.memory_cap,
+            self_aspace,
+            map_vaddr,
+            0,
+            geometry.pages,
+            MAP_READONLY,
+        )
+    };
     let out = if mapped.is_ok()
     {
         // SAFETY: `map_vaddr` starts a read-only mapping of `geometry.pages`
@@ -278,7 +283,10 @@ where
             core::slice::from_raw_parts((map_vaddr + geometry.offset) as *const u8, geometry.len)
         };
         let out = f(bytes);
-        let _ = syscall::mem_unmap(self_aspace, map_vaddr, geometry.pages);
+        // SAFETY: `bytes`, the only reference into the mapping, is dead once
+        // `f` returns (its result cannot borrow from it), and the span is
+        // this call's own reservation.
+        let _ = unsafe { syscall::mem_unmap(self_aspace, map_vaddr, geometry.pages) };
         out
     }
     else

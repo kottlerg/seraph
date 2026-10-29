@@ -120,8 +120,12 @@ pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
     let child_arg = u64::from(child_eq) | (u64::from(child_sync) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK));
-    crate::spawn::configure_and_start(&child, recv_and_report_entry, stack_top, child_arg)
-        .map_err(|_| "configure_and_start failed")?;
+    // SAFETY: the stack is `RECV_BLOCKS_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, recv_and_report_entry, stack_top, child_arg)
+    }
+    .map_err(|_| "configure_and_start failed")?;
 
     // Sleep so the child (created at the floor priority, strictly below
     // this thread's INIT_PRIORITY) runs and blocks on event_recv (queue is
@@ -270,8 +274,12 @@ pub fn recv_timeout_payload_zero_wins(ctx: &TestContext) -> TestResult
     let child_arg = u64::from(child_eq);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_ZERO_PAYLOAD_STACK));
-    crate::spawn::configure_and_start(&child, post_zero_after_sleep_entry, stack_top, child_arg)
-        .map_err(|_| "configure_and_start failed")?;
+    // SAFETY: the stack is `TIMEOUT_ZERO_PAYLOAD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, post_zero_after_sleep_entry, stack_top, child_arg)
+    }
+    .map_err(|_| "configure_and_start failed")?;
 
     // Wait, bounded, for the child's post; 0 is the legitimate payload.
     let payload = event_recv_timeout(eq, crate::scaled_bound(POST_WAIT_MS))
@@ -298,8 +306,12 @@ pub fn recv_timeout_payload_nonzero_wins(ctx: &TestContext) -> TestResult
     let child_arg = u64::from(child_eq);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_NONZERO_PAYLOAD_STACK));
-    crate::spawn::configure_and_start(&child, post_cafe_after_sleep_entry, stack_top, child_arg)
-        .map_err(|_| "configure_and_start failed")?;
+    // SAFETY: the stack is `TIMEOUT_NONZERO_PAYLOAD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, post_cafe_after_sleep_entry, stack_top, child_arg)
+    }
+    .map_err(|_| "configure_and_start failed")?;
 
     let payload = event_recv_timeout(eq, crate::scaled_bound(POST_WAIT_MS))
         .map_err(|_| "event_recv_timeout failed")?;
@@ -325,8 +337,12 @@ pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
     let child_arg = u64::from(child_eq);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_FOREVER_STACK));
-    crate::spawn::configure_and_start(&child, post_beef_after_sleep_entry, stack_top, child_arg)
-        .map_err(|_| "configure_and_start failed")?;
+    // SAFETY: the stack is `TIMEOUT_FOREVER_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, post_beef_after_sleep_entry, stack_top, child_arg)
+    }
+    .map_err(|_| "configure_and_start failed")?;
 
     let payload = event_recv_timeout(eq, 0)
         .map_err(|_| "event_recv_timeout(eq, 0) returned error (forever-block sentinel broken)")?;

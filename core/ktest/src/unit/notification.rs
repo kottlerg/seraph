@@ -55,8 +55,12 @@ pub fn send_wait_blocking(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy notification into child CSpace failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
-        .map_err(|_| "configure_and_start for blocking-wait test failed")?;
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
+    }
+    .map_err(|_| "configure_and_start for blocking-wait test failed")?;
 
     // Block until the child sends.
     let bits = notification_wait(sig).map_err(|_| "notification_wait (blocking) failed")?;
@@ -274,12 +278,16 @@ pub fn wait_high_bit_parked_wakeup(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy notification into child CSpace failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(HIGH_BIT_CHILD_STACK));
-    crate::spawn::configure_and_start(
-        &child,
-        high_bit_sender_entry,
-        stack_top,
-        u64::from(child_sig),
-    )
+    // SAFETY: the stack is `HIGH_BIT_CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(
+            &child,
+            high_bit_sender_entry,
+            stack_top,
+            u64::from(child_sig),
+        )
+    }
     .map_err(|_| "configure_and_start for wait_high_bit_parked_wakeup failed")?;
 
     let bits = notification_wait(sig).map_err(|_| "notification_wait (parked) failed")?;

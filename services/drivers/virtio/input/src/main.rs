@@ -248,15 +248,20 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
         syscall::thread_exit();
     };
     let ring_va = ring_range.va_start();
-    if syscall::mem_map(
-        ring_memory,
-        caps.self_aspace,
-        ring_va,
-        0,
-        ring_pages,
-        syscall::MAP_READONLY | syscall::MAP_WRITABLE,
-    )
-    .is_err()
+    // SAFETY: `ring_range` is a fresh reservation from the per-process arena,
+    // owned here for the mapping's life: VA no Rust object or IPC page
+    // occupies.
+    let mapped = unsafe {
+        syscall::mem_map(
+            ring_memory,
+            caps.self_aspace,
+            ring_va,
+            0,
+            ring_pages,
+            syscall::MAP_READONLY | syscall::MAP_WRITABLE,
+        )
+    };
+    if mapped.is_err()
     {
         std::os::seraph::log!("ring mem_map failed");
         syscall::thread_exit();
@@ -346,15 +351,20 @@ fn setup_event_buffers(caps: &DriverCaps, buf_count: u16, ipc_buf: *mut u64) -> 
         syscall::thread_exit();
     };
     let va = range.va_start();
-    if syscall::mem_map(
-        mem,
-        caps.self_aspace,
-        va,
-        0,
-        1,
-        syscall::MAP_READONLY | syscall::MAP_WRITABLE,
-    )
-    .is_err()
+    // SAFETY: `range` is a fresh reservation from the per-process arena,
+    // owned here for the mapping's life: VA no Rust object or IPC page
+    // occupies.
+    let mapped = unsafe {
+        syscall::mem_map(
+            mem,
+            caps.self_aspace,
+            va,
+            0,
+            1,
+            syscall::MAP_READONLY | syscall::MAP_WRITABLE,
+        )
+    };
+    if mapped.is_err()
     {
         std::os::seraph::log!("event buffer mem_map failed");
         syscall::thread_exit();
@@ -534,7 +544,12 @@ fn main() -> !
         std::os::seraph::log!("BAR PT-budget funding failed");
         syscall::thread_exit();
     }
-    if syscall::mmio_map(caps.self_aspace, caps.bar_mmio_slot, bar_va, 0).is_err()
+    // SAFETY: `bar_range` is a fresh reservation of `bar_pages` pages from
+    // the per-process arena, owned for the driver's lifetime, and devmgr
+    // carves the BAR cap to at most the same `bar_aperture_pages`
+    // (`find_virtio_bar_cap`), so the whole-region mapping stays inside it:
+    // VA no Rust object or IPC page occupies.
+    if unsafe { syscall::mmio_map(caps.self_aspace, caps.bar_mmio_slot, bar_va, 0) }.is_err()
     {
         std::os::seraph::log!("BAR mmio_map failed");
         syscall::thread_exit();

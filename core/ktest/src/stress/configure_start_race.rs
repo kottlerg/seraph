@@ -287,12 +287,17 @@ fn start_helper(ctx: &TestContext, slot: &mut Option<u32>) -> Result<u32, &'stat
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::configure_start_race: create helper failed")?,
     );
-    thread_configure(
-        th,
-        helper_entry as *const () as u64,
-        stack_top(HELPER_STACK),
-        0,
-    )
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe {
+        thread_configure(
+            th,
+            helper_entry as *const () as u64,
+            stack_top(HELPER_STACK),
+            0,
+        )
+    }
     .map_err(|_| "stress::configure_start_race: configure helper failed")?;
     thread_set_affinity(th, HELPER_CPU)
         .map_err(|_| "stress::configure_start_race: pin helper failed")?;
@@ -355,12 +360,17 @@ fn create_target(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::configure_start_race: create thread failed")?,
     );
-    thread_configure(
-        th,
-        entry_a as *const () as u64,
-        A_TOP.load(Ordering::Acquire),
-        tag(seq, WHICH_A),
-    )
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe {
+        thread_configure(
+            th,
+            entry_a as *const () as u64,
+            A_TOP.load(Ordering::Acquire),
+            tag(seq, WHICH_A),
+        )
+    }
     .map_err(|_| "stress::configure_start_race: first configure failed")?;
     thread_set_affinity(th, target_cpu)
         .map_err(|_| "stress::configure_start_race: pin thread failed")?;
@@ -558,12 +568,17 @@ extern "C" fn helper_entry(_arg: u64) -> !
             break;
         }
         spin(skews(seq).1);
-        let result = thread_configure(
-            TARGET.load(Ordering::Acquire),
-            entry_b as *const () as u64,
-            B_TOP.load(Ordering::Acquire),
-            tag(seq, WHICH_B),
-        );
+        // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+        // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+        // rule, as noted where the stack is chosen).
+        let result = unsafe {
+            thread_configure(
+                TARGET.load(Ordering::Acquire),
+                entry_b as *const () as u64,
+                B_TOP.load(Ordering::Acquire),
+                tag(seq, WHICH_B),
+            )
+        };
         OUTCOME.store(classify(result), Ordering::Release);
         DONE.store(seq, Ordering::Release);
     }

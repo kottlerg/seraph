@@ -33,9 +33,11 @@
 //!
 //! // In a test:
 //! let frame = frame_pool::alloc().ok_or("frame pool exhausted")?;
-//! mem_map(frame, aspace_cap, va, 0, 1, syscall::MAP_WRITABLE)?;
+//! // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs).
+//! unsafe { mem_map(frame, aspace_cap, va, 0, 1, syscall::MAP_WRITABLE)? };
 //! // ... test logic ...
-//! mem_unmap(aspace_cap, va, 1)?;
+//! // SAFETY: no Rust reference into the page is live any more.
+//! unsafe { mem_unmap(aspace_cap, va, 1)? };
 //! unsafe { frame_pool::free(frame) };
 //! ```
 //!
@@ -361,21 +363,39 @@ impl FrameGuard
         self.memory_cap
     }
 
-    /// Map the frame at the given virtual address.
+    /// Map the frame at the given virtual address. The guard's drop unmaps it.
+    ///
+    /// # Safety
+    ///
+    /// When the guard's address space is ktest's own, `va` must be a scratch
+    /// VA (crate docs § Scratch VAs): the page there must hold no live Rust
+    /// object or registered IPC page from this call until the guard drops,
+    /// and every Rust reference a test forms into the page must end before
+    /// the drop (the contracts of `syscall::mem_map` and `syscall::mem_unmap`).
     ///
     /// # Errors
     ///
-    /// Returns the syscall error code if `mem_map` fails.
-    pub fn map(&mut self, va: u64) -> Result<(), i64>
+    /// Returns `InvalidState` when the guard is already mapped (a second
+    /// mapping would escape the drop's unmap), else the syscall error code if
+    /// `mem_map` fails.
+    pub unsafe fn map(&mut self, va: u64) -> Result<(), i64>
     {
-        syscall::mem_map(
-            self.memory_cap,
-            self.aspace_cap,
-            va,
-            0,
-            1,
-            syscall::MAP_WRITABLE,
-        )?;
+        if self.mapped_va.is_some()
+        {
+            return Err(syscall_abi::SyscallError::InvalidState as i64);
+        }
+        // SAFETY: the caller's contract keeps `va` off live Rust objects and
+        // IPC pages.
+        unsafe {
+            syscall::mem_map(
+                self.memory_cap,
+                self.aspace_cap,
+                va,
+                0,
+                1,
+                syscall::MAP_WRITABLE,
+            )
+        }?;
         self.mapped_va = Some(va);
         Ok(())
     }
@@ -387,9 +407,11 @@ impl Drop for FrameGuard
     {
         // Unmap if mapped. A frame whose unmap fails stays out of the pool
         // rather than alias the next test's mapping.
+        // SAFETY: `map`'s contract keeps the page the guard's own until now,
+        // with every Rust reference into it ended.
         let unmap_failed = self
             .mapped_va
-            .is_some_and(|va| syscall::mem_unmap(self.aspace_cap, va, 1).is_err());
+            .is_some_and(|va| unsafe { syscall::mem_unmap(self.aspace_cap, va, 1) }.is_err());
         if unmap_failed
         {
             crate::log("ktest: frame_pool: FrameGuard unmap failed; frame not returned");

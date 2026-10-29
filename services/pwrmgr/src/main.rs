@@ -18,15 +18,8 @@
 //! See `services/pwrmgr/README.md` for the design and future-scope
 //! sketch.
 
+mod arch;
 mod caps;
-
-#[cfg(target_arch = "x86_64")]
-#[path = "x86_64.rs"]
-mod arch;
-
-#[cfg(target_arch = "riscv64")]
-#[path = "riscv64.rs"]
-mod arch;
 
 use ipc::{IpcMessage, pwrmgr_errors, pwrmgr_labels};
 use std::os::seraph::startup_info;
@@ -64,7 +57,7 @@ fn main() -> !
     // Acquire the actuation state from devmgr. `None` means the platform
     // caps could not be resolved; pwrmgr still serves so callers get a
     // clean error rather than a hung ipc_call.
-    let actuator = arch::resolve(bootstrap.devmgr_registry, info.self_aspace, ipc_buf);
+    let actuator = arch::current::resolve(bootstrap.devmgr_registry, info.self_aspace, ipc_buf);
     if actuator.is_some()
     {
         std::os::seraph::log!("ready");
@@ -104,7 +97,7 @@ fn main() -> !
                 std::os::seraph::log!("SHUTDOWN requested");
                 if let Some(act) = &actuator
                 {
-                    arch::shutdown(self_thread, act);
+                    arch::current::shutdown(self_thread, act);
                 }
                 // Reached here → no actuator or shutdown failed. Reply so
                 // the caller does not hang on its ipc_call.
@@ -120,7 +113,7 @@ fn main() -> !
                 std::os::seraph::log!("REBOOT requested");
                 if let Some(act) = &actuator
                 {
-                    arch::reboot(self_thread, act);
+                    arch::current::reboot(self_thread, act);
                 }
                 reject(pwrmgr_errors::INVALID_REQUEST, ipc_buf);
             }

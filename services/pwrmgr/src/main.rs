@@ -18,9 +18,6 @@
 //! See `services/pwrmgr/README.md` for the design and future-scope
 //! sketch.
 
-// cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
-#![allow(clippy::cast_possible_truncation)]
-
 mod caps;
 
 #[cfg(target_arch = "x86_64")]
@@ -33,6 +30,13 @@ mod arch;
 
 use ipc::{IpcMessage, pwrmgr_errors, pwrmgr_labels};
 use std::os::seraph::startup_info;
+use std::time::Duration;
+
+/// How long pwrmgr waits after a power-off or reset request returns before
+/// treating it as failed. A platform that acts on the request stops
+/// executing well within this (QEMU at once); the wait keeps the error
+/// reply from racing a reset that lands shortly after the request returns.
+const RESET_GRACE: Duration = Duration::from_secs(1);
 
 fn main() -> !
 {
@@ -123,6 +127,17 @@ fn main() -> !
             _ => reject(pwrmgr_errors::UNKNOWN_OPCODE, ipc_buf),
         }
     }
+}
+
+/// Wait out [`RESET_GRACE`] after a power-off or reset request (`op`) that
+/// returned, then log that it did not take effect. The arch routine then
+/// returns, and `main` replies `pwrmgr_errors::INVALID_REQUEST`, so the
+/// caller is answered whenever the platform keeps running. Blocks in
+/// `thread_sleep`, which is legal in user mode on every architecture.
+pub(crate) fn await_reset(op: &str)
+{
+    std::thread::sleep(RESET_GRACE);
+    std::os::seraph::log!("{op} did not take effect");
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,

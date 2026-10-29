@@ -24,7 +24,8 @@ cmos/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── main.rs            # Driver entry, IPC service loop, CMOS read sequence
+    ├── lib.rs             # CMOS register snapshot (bounded UIP wait; host-tested)
+    └── main.rs            # Driver entry, IPC service loop, port I/O, decode
 ```
 
 ---
@@ -66,7 +67,11 @@ CMOS is the legacy IBM-AT real-time clock at ISA I/O ports `0x70`
 (index) and `0x71` (data). The driver waits for the
 update-in-progress bit (Status A, register `0x0A`, bit 7) to clear,
 reads seconds/minutes/hours/day/month/year, then re-reads and
-compares to guard against an update tick mid-read.
+compares to guard against an update tick mid-read. Every wait is
+bounded: an attempt whose update-in-progress bit does not clear within
+`UIP_POLL_LIMIT` polls fails, and when none of `MAX_ATTEMPTS` attempts
+yields a consistent reading the driver replies `READ_FAILED` rather
+than spinning on a stuck bit.
 
 Status B (register `0x0B`) reports BCD vs binary mode (bit 2: 1 =
 binary, 0 = BCD) and 12-hour vs 24-hour mode (bit 1: 1 = 24-hour);

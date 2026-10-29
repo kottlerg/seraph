@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+# Host-testable logic (bins are test = false).
+[lib]
+name = "cmos_rtc"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cmos-rtc"
 path = "src/main.rs"

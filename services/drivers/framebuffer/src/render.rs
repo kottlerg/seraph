@@ -40,9 +40,17 @@ pub struct FramebufferWriter
 impl FramebufferWriter
 {
     /// Construct a `FramebufferWriter` over the mapped framebuffer at
-    /// `base`. Returns `None` if `fb.physical_base == 0` (no framebuffer
-    /// present); the userspace driver is not spawned in that case so
-    /// this branch is defensive. Clears the screen to black on success.
+    /// `base`. Clears the screen to black on success.
+    ///
+    /// Returns `None` if `fb.physical_base == 0` (no framebuffer present;
+    /// devmgr does not spawn the driver then, so this branch is defensive),
+    /// or if the geometry cannot hold the writer's arithmetic: `width` or
+    /// `height` smaller than one glyph cell, or `stride` narrower than
+    /// `width` pixels of 4 bytes. The geometry is copied verbatim from the
+    /// firmware's GOP mode, so it is checked here rather than trusted. A
+    /// writer that exists therefore has at least one glyph row and column,
+    /// and every pixel it addresses (`row < height`, `byte < width * 4`)
+    /// lies inside `stride * height` bytes.
     ///
     /// # Safety
     /// `base` must be a writable mapping of at least `fb.stride *
@@ -50,6 +58,9 @@ impl FramebufferWriter
     pub unsafe fn new(base: *mut u8, fb: &FramebufferInfo) -> Option<Self>
     {
         if fb.physical_base == 0
+            || fb.width < GLYPH_WIDTH
+            || fb.height < GLYPH_HEIGHT
+            || u64::from(fb.stride) < u64::from(fb.width) * 4
         {
             return None;
         }
@@ -164,8 +175,10 @@ impl FramebufferWriter
                 let px = (pixel_x as usize + col_idx) * 4;
                 let offset = row_base + px;
 
-                // SAFETY: pixel is within the framebuffer; offset is bounded
-                // by stride * height (caller ensures valid mapping).
+                // SAFETY: col < max_cols and row < max_rows, so scan_y <
+                // max_rows * GLYPH_HEIGHT <= height and px + 4 <= max_cols *
+                // GLYPH_WIDTH * 4 <= width * 4 <= stride (both checked in
+                // `new`); the offset is inside the stride * height mapping.
                 unsafe {
                     let p = self.base.add(offset);
                     core::ptr::write_volatile(p, b0);
@@ -193,13 +206,14 @@ impl FramebufferWriter
     unsafe fn clear(&mut self)
     {
         let [b0, b1, b2, b3] = self.pixel_bytes(self.bg);
-        // RGBX/BGRX is 4 bytes per pixel, so `stride * height` is a multiple of
-        // 4; the `/ 4` therefore drops no visible pixels.
-        let pixels = (self.stride * self.height) as usize / 4;
+        // Computed in usize: a u32 `stride * height` overflows for large
+        // modes. RGBX/BGRX is 4 bytes per pixel, so the `/ 4` drops no
+        // visible pixel (the remainder is stride padding).
+        let pixels = self.stride as usize * self.height as usize / 4;
         let mut p = self.base;
         for _ in 0..pixels
         {
-            // SAFETY: p is within the framebuffer allocation; pixels * 4 <= stride * height.
+            // SAFETY: p is within the framebuffer mapping; pixels * 4 <= stride * height.
             unsafe {
                 core::ptr::write_volatile(p, b0);
                 core::ptr::write_volatile(p.add(1), b1);
@@ -220,12 +234,15 @@ impl FramebufferWriter
     /// Framebuffer pointer must be valid.
     unsafe fn scroll(&mut self)
     {
-        let row_bytes = (GLYPH_HEIGHT * self.stride) as usize;
+        let row_bytes = GLYPH_HEIGHT as usize * self.stride as usize;
+        // max_rows >= 1 (`new` rejects height < GLYPH_HEIGHT), so the
+        // `total_rows - 1` and `max_rows - 1` below cannot underflow.
         let total_rows = self.max_rows as usize;
 
         // Copy rows 1..total_rows → 0..total_rows-1.
-        // SAFETY: src and dst are both within the framebuffer allocation; the
-        // copy is a single forward memmove of (total_rows-1)*row_bytes bytes.
+        // SAFETY: total_rows * row_bytes <= height * stride (max_rows =
+        // height / GLYPH_HEIGHT), so src, dst, and the (total_rows-1)*row_bytes
+        // byte memmove all lie inside the framebuffer mapping.
         unsafe {
             core::ptr::copy(
                 self.base.add(row_bytes),
@@ -271,5 +288,69 @@ impl FramebufferWriter
 
         // Park cursor on the last row.
         self.row = self.max_rows - 1;
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    fn info(width: u32, height: u32, stride: u32) -> FramebufferInfo
+    {
+        FramebufferInfo {
+            physical_base: 0x8000_0000,
+            width,
+            height,
+            stride,
+            pixel_format: PixelFormat::Bgrx8,
+        }
+    }
+
+    /// Construct a writer over a heap buffer of exactly `stride * height`
+    /// bytes, the mapping size the driver reserves.
+    fn writer(fb: &FramebufferInfo, buf: &mut Vec<u8>) -> Option<FramebufferWriter>
+    {
+        buf.resize(fb.stride as usize * fb.height as usize, 0xEE);
+        // SAFETY: buf is a writable allocation of stride * height bytes that
+        // outlives the writer in every test.
+        unsafe { FramebufferWriter::new(buf.as_mut_ptr(), fb) }
+    }
+
+    #[test]
+    fn new_rejects_geometry_smaller_than_one_glyph_cell()
+    {
+        let mut buf = Vec::new();
+        // One pixel short of a glyph cell in each dimension: max_rows or
+        // max_cols would be 0 and scroll's `max_rows - 1` would underflow.
+        assert!(writer(&info(GLYPH_WIDTH - 1, 100, 400), &mut buf).is_none());
+        assert!(writer(&info(100, GLYPH_HEIGHT - 1, 400), &mut buf).is_none());
+    }
+
+    #[test]
+    fn new_rejects_stride_narrower_than_the_pixel_row()
+    {
+        let mut buf = Vec::new();
+        // A blit addresses width * 4 bytes per scanline; a shorter stride
+        // would run each glyph row into the next scanline and past the end.
+        assert!(writer(&info(100, 100, 100 * 4 - 4), &mut buf).is_none());
+        assert!(writer(&info(100, 100, 100 * 4), &mut buf).is_some());
+    }
+
+    #[test]
+    fn smallest_accepted_geometry_renders_and_scrolls_within_its_buffer()
+    {
+        // One glyph cell exactly: the blit fills the only column, which
+        // wraps to a newline, which scrolls the only row.
+        let fb = info(GLYPH_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH * 4);
+        let mut buf = Vec::new();
+        let mut w = writer(&fb, &mut buf).expect("one-cell geometry is valid");
+        // The clear in `new` covered every byte: no 0xEE fill survives.
+        assert!(buf.iter().all(|&b| b == 0));
+        let lit = [0xFFFFu16; GLYPH_HEIGHT as usize];
+        // SAFETY: the writer's buffer is alive and exactly stride * height.
+        unsafe { w.draw_glyph_bitmap(&lit) };
+        // The scroll cleared the only row to the black background again.
+        assert!(buf.iter().all(|&b| b == 0));
     }
 }

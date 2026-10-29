@@ -13,6 +13,7 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
+use cmos_rtc::{CmosFields, CmosRegs};
 use ipc::{IpcMessage, rtc_errors, rtc_labels};
 use std::os::seraph::startup_info;
 
@@ -21,17 +22,8 @@ use std::os::seraph::startup_info;
 const CMOS_INDEX: u16 = 0x70;
 const CMOS_DATA: u16 = 0x71;
 
-const REG_SECONDS: u8 = 0x00;
-const REG_MINUTES: u8 = 0x02;
-const REG_HOURS: u8 = 0x04;
-const REG_DAY: u8 = 0x07;
-const REG_MONTH: u8 = 0x08;
-const REG_YEAR: u8 = 0x09;
-const REG_STATUS_A: u8 = 0x0A;
-const REG_STATUS_B: u8 = 0x0B;
-const REG_CENTURY: u8 = 0x32;
-
-const STATUS_A_UIP: u8 = 0x80;
+// Register numbers and the snapshot protocol live in the crate's library
+// (`cmos_rtc`); the decode bits below are this binary's.
 const STATUS_B_BINARY: u8 = 0x04;
 const STATUS_B_24H: u8 = 0x02;
 const HOUR_PM_BIT: u8 = 0x80;
@@ -101,37 +93,18 @@ fn cmos_read(reg: u8) -> u8
     }
 }
 
-fn cmos_uip() -> bool
+/// [`CmosRegs`] over the CMOS index/data ports bound to this thread.
+struct PortRegs;
+
+impl CmosRegs for PortRegs
 {
-    cmos_read(REG_STATUS_A) & STATUS_A_UIP != 0
+    fn read(&mut self, reg: u8) -> u8
+    {
+        cmos_read(reg)
+    }
 }
 
 // ── Raw → calendar fields ───────────────────────────────────────────────────
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct CmosFields
-{
-    sec: u8,
-    min: u8,
-    hour: u8,
-    day: u8,
-    month: u8,
-    year: u8,
-    century: u8,
-}
-
-fn read_cmos_fields() -> CmosFields
-{
-    CmosFields {
-        sec: cmos_read(REG_SECONDS),
-        min: cmos_read(REG_MINUTES),
-        hour: cmos_read(REG_HOURS),
-        day: cmos_read(REG_DAY),
-        month: cmos_read(REG_MONTH),
-        year: cmos_read(REG_YEAR),
-        century: cmos_read(REG_CENTURY),
-    }
-}
 
 fn bcd_to_bin(v: u8) -> u8
 {
@@ -201,33 +174,13 @@ fn decode(raw: CmosFields, status_b: u8) -> Calendar
     }
 }
 
-/// Snapshot CMOS, retrying if the update-in-progress bit fires
-/// mid-read or if two consecutive snapshots disagree. Bounded retry
-/// loop — if hardware never settles within `MAX_ATTEMPTS` the call
-/// returns `None` and the caller replies `READ_FAILED`.
+/// Read and decode the CMOS clock. `None` when [`cmos_rtc::snapshot`]
+/// finds no consistent reading within its bounded attempts (a stuck
+/// update-in-progress bit included); the caller replies `READ_FAILED`.
 fn snapshot_cmos() -> Option<Calendar>
 {
-    const MAX_ATTEMPTS: u32 = 16;
-
-    for _ in 0..MAX_ATTEMPTS
-    {
-        while cmos_uip()
-        {
-            core::hint::spin_loop();
-        }
-        let first = read_cmos_fields();
-        if cmos_uip()
-        {
-            continue;
-        }
-        let second = read_cmos_fields();
-        if first == second
-        {
-            let status_b = cmos_read(REG_STATUS_B);
-            return Some(decode(first, status_b));
-        }
-    }
-    None
+    let (fields, status_b) = cmos_rtc::snapshot(&mut PortRegs)?;
+    Some(decode(fields, status_b))
 }
 
 // ── Civil-date arithmetic ─────────────────────────────────────────────────

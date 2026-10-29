@@ -14,7 +14,8 @@
 //! Module layout (see [`phases`] docstring for the durable rule):
 //!
 //! * [`bootstrap`] — typed `Caps` from the creator-endpoint round.
-//! * [`runner`] — `Phase` struct + uniform log envelope.
+//! * [`runner`] — `Phase` struct + uniform log envelope; the failure
+//!   panic hook and the run's terminal marker.
 //! * [`reentry`] — argv-driven child-mode dispatch into the phase
 //!   modules that own each role.
 //! * [`ipc_util`] — raw-IPC helpers shared across phases.
@@ -50,14 +51,19 @@ fn main()
         reentry::dispatch(&role);
     }
 
+    // Parent run only (a matching role above never returns), and before the
+    // bootstrap round, so a failure there also logs the fail marker.
+    runner::install_failure_hook();
+
     let caps = bootstrap::request();
+    runner::arm_failure_shutdown(&caps);
 
     std::os::seraph::log!("starting");
 
     let phases = phases::all();
     runner::run_all(&phases, &caps);
 
-    std::os::seraph::log!("ALL TESTS PASSED");
+    runner::report_pass();
 
     phases::pwrmgr::pwrmgr_shutdown_phase(&caps);
 }

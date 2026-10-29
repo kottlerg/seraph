@@ -17,7 +17,7 @@ services/svctest/
 └── src/
     ├── main.rs                # Child-mode check, bootstrap, phase run, pass marker, shutdown
     ├── bootstrap.rs           # Decodes the creator-endpoint bootstrap round into `Caps`
-    ├── runner.rs              # `Phase` type and the per-phase log envelope
+    ├── runner.rs              # `Phase` type, per-phase log envelope, failure hook, markers
     ├── reentry.rs             # argv-role dispatch into each phase module's child mode
     ├── ipc_util/
     │   ├── mod.rs             # Raw-IPC helpers shared across phase modules
@@ -56,20 +56,29 @@ identity last).
 ## Run Sequence
 
 `main` registers the log name `svctest`, so every line carries the `[svctest]` prefix. It then
-requests the bootstrap round, logs `starting`, and runs each registered phase in order inside
+installs the failure panic hook, requests the bootstrap round, hands the hook the
+authority-badged pwrmgr cap, logs `starting`, and runs each registered phase in order inside
 the envelope `phase=<name> starting` / `phase=<name> passed`. After the last phase it logs
 `ALL TESTS PASSED`, the marker defined in
 [docs/testing.md § Reporting marker](../../docs/testing.md#reporting-marker), and sends
 `SHUTDOWN` on the authority-badged pwrmgr cap. On success the platform powers off; a reply,
 or an IPC error, is logged and svctest exits, leaving the system idle.
 
-A failing phase panics through the std panic handler; svctest then never logs
-`ALL TESTS PASSED` and never requests shutdown. The `ns` phase (`caps[0]`) and the pwrmgr
-cap-deny phase (the queried `pwrmgr.deny` cap) log the skip and return when their cap is zero;
-the devmgr deny phases (`caps[2]`), the orphan-teardown phase (`caps[3]`), and the svcmgr
-seed-only phase (every seed, plus the public `svcmgr` and `pwrmgr.deny` names it resolves)
-instead fail their assertions. The seed-only phase thus fails the run on a zero `caps[1]` before
-the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not reached.
+A failing phase panics. svctest's targets abort on panic, so nothing unwinds to the runner.
+Instead, the panic hook `runner::install_failure_hook` installs runs after std's default hook
+prints the panic: it logs `SOME TESTS FAILED`, the failure marker of
+[docs/testing.md § Reporting marker](../../docs/testing.md#reporting-marker), and sends the
+same `SHUTDOWN`, so a failed run also ends in a power-off. The hook covers a failure in the
+bootstrap round too, and a panic on any thread of the parent run; child modes keep std's
+default hook. Whichever path claims the marker first logs it, so a run logs exactly one.
+
+The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.deny` cap) log the
+skip and return when their cap is zero; the devmgr deny phases (`caps[2]`), the orphan-teardown
+phase (`caps[3]`), and the svcmgr seed-only phase (every seed, plus the public `svcmgr` and
+`pwrmgr.deny` names it resolves) instead fail their assertions. The seed-only phase thus fails
+the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
+zero-cap skip is not reached; the hook's `SHUTDOWN` is then skipped for the same zero cap, and
+the run ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and

@@ -141,9 +141,14 @@ decision, or a case with no clearly best option waits for the maintainer.
   default the maintainer may set: one fix round when a finding is a comment or document that
   states a falsehood, when the fix is comment-only and a later round is owed anyway, or when
   recording would need a new Issue for a one-line change; otherwise merge with the record.
-  Standing, by the maintainer's ruling: a run whose findings are all nits takes no fix round;
-  the worker records them on the scope's rolling Issue and reports the gate, and a PR draining
-  that rolling Issue fixes its own nits-only findings in place instead.
+  Standing, by the maintainer's ruling of 2026-10-30 ("If you are confident that it won't cause
+  broad process issues going forwards, then I can approve that those nits after a ready to
+  merge will go on the rolling issue for that scope.", then "approved" to the orchestrator's
+  precise statement of it): a run whose findings are all nits takes no fix round;
+  the worker records them on the scope's follow-up Issue (the Issue the PR drains in that
+  scope, else the rolling Issue, as docs/conventions.md § Branch and PR Workflow defines it)
+  and reports the gate, except that a PR draining a follow-up Issue of that scope records its
+  nits-only findings there and fixes them in the same PR, ticking each `(fixed by PR #<M>)`.
 - A reviewer's finding that a worker contests, or that the worker cannot fix within its scope
   (a pre-existing code defect in a file a documentation-only PR touches, for instance), is put
   to the maintainer with the worker's and your recommendation. A finding is never waived or

@@ -173,7 +173,10 @@ the ledger). Save records under `target/xtask/review/pr<N>/`. Push and open the 
 - `NON-BLOCKING ISSUES ONLY`: record every surface finding on the follow-up Issue of its scope
   first (docs/conventions.md § Branch and PR Workflow requires it before the merge prompt),
   then report and wait; take no fix round on your own. The decision between the merge and one
-  more round is the maintainer's; a fix round that lands ticks the recorded items.
+  more round is the maintainer's; a fix round that lands ticks the recorded items. The one
+  exception is the maintainer's standing ruling in `.claude/skills/orchestrate/SKILL.md`
+  § Rulings: a PR that drains a follow-up Issue of the scope fixes a nits-only run's findings,
+  recorded there, in the same PR.
 - `AUDIT FAIL`: fix each item (`gh pr edit`, `gh issue edit`, or a commit) and re-run the audit.
 - A contested finding is put to the maintainer (through the orchestrator when orchestrated); on
   the surface it resolves in this PR as that section says. A correctness, soundness, safety or

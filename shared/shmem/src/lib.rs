@@ -97,16 +97,13 @@ impl SharedBuffer
         }
         for i in 0..pages
         {
-            let rw = match syscall::cap_derive(memory_caps[i as usize], syscall::RIGHTS_MEM_MAP_RW)
+            let Ok(rw) = syscall::cap_derive(memory_caps[i as usize], syscall::RIGHTS_MEM_MAP_RW)
+            else
             {
-                Ok(c) => c,
-                Err(_) =>
-                {
-                    // SAFETY: pages `0..i` were mapped by this call, inside the
-                    // span the caller's contract dedicates.
-                    unsafe { unmap_range(aspace, vaddr, i) };
-                    return Err(ShmemError::MapFailed);
-                }
+                // SAFETY: pages `0..i` were mapped by this call, inside the
+                // span the caller's contract dedicates.
+                unsafe { unmap_range(aspace, vaddr, i) };
+                return Err(ShmemError::MapFailed);
             };
             // SAFETY: page `i` lies in the span the caller's contract keeps
             // off live Rust objects and registered IPC pages.
@@ -147,9 +144,12 @@ impl SharedBuffer
 
     /// Total size in bytes.
     #[must_use]
+    // cast_possible_truncation: userspace targets 64-bit only, so `usize`
+    // holds every `u64` byte count; the product is at most `MAX_PAGES` pages.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn size(&self) -> usize
     {
-        (self.page_count as usize) * (PAGE_SIZE as usize)
+        (u64::from(self.page_count) * PAGE_SIZE) as usize
     }
 
     /// Number of pages.
@@ -240,6 +240,9 @@ impl SpscHeader
     /// Initialise a fresh header at `ptr` with `capacity` bytes of ring
     /// storage. `capacity` must be a non-zero power of two.
     ///
+    /// # Panics
+    /// Panics if `capacity` is not a non-zero power of two.
+    ///
     /// # Safety
     /// `ptr` must be valid, writable, and aligned for `SpscHeader` (4 bytes).
     /// The caller is the unique initialiser of the header; no other thread
@@ -295,9 +298,9 @@ pub struct SpscReader<'a>
 // the raw pointers point into that shared region. Send across threads in
 // one process is fine because all reads/writes through the raw pointers
 // go through the atomic indices in the header.
-unsafe impl<'a> Send for SpscWriter<'a> {}
+unsafe impl Send for SpscWriter<'_> {}
 // SAFETY: same rationale as `SpscWriter`.
-unsafe impl<'a> Send for SpscReader<'a> {}
+unsafe impl Send for SpscReader<'_> {}
 
 /// Construct a `(SpscWriter, SpscReader)` pair over a pre-initialised
 /// shared region.
@@ -318,6 +321,7 @@ unsafe impl<'a> Send for SpscReader<'a> {}
 /// and writable and 4-byte aligned, its header initialised by
 /// [`SpscHeader::init`], and the region must stay mapped and valid for `'a`.
 /// Only one `SpscWriter` and one `SpscReader` may exist at a time for it.
+#[must_use]
 pub unsafe fn spsc_pair<'a>(
     region_vaddr: u64,
     capacity: u32,
@@ -355,7 +359,7 @@ unsafe fn checked_mask(region_vaddr: u64, capacity: u32) -> Option<u32>
     (shared == capacity).then_some(capacity - 1)
 }
 
-impl<'a> SpscWriter<'a>
+impl SpscWriter<'_>
 {
     /// Wrap a pre-initialised shared region as a writer.
     ///
@@ -369,6 +373,7 @@ impl<'a> SpscWriter<'a>
     /// `capacity` body bytes) must be mapped readable and writable and 4-byte
     /// aligned, and must stay mapped and valid for `'a`. Only one writer may
     /// exist at a time.
+    #[must_use]
     pub unsafe fn from_raw(region_vaddr: u64, capacity: u32) -> Option<Self>
     {
         // SAFETY: caller contract: the header is mapped, readable and aligned.
@@ -389,25 +394,27 @@ impl<'a> SpscWriter<'a>
         let capacity = self.mask + 1;
         let head = self.header.head.load(Ordering::Acquire);
         let tail = self.header.tail.load(Ordering::Relaxed);
+        // The peer writes `head`; saturate so a value past the ring's bounds
+        // reads as a full ring rather than underflowing.
         let used = tail.wrapping_sub(head);
-        let free = capacity - used;
+        let free = capacity.saturating_sub(used);
         if free == 0
         {
             return 0;
         }
-        let n = core::cmp::min(data.len(), free as usize);
-        for i in 0..n
+        let n = free.min(u32::try_from(data.len()).unwrap_or(u32::MAX));
+        for (offset, &byte) in (0..n).zip(data)
         {
-            let slot = (tail.wrapping_add(i as u32)) & self.mask;
+            let slot = tail.wrapping_add(offset) & self.mask;
             // SAFETY: slot < capacity; buf..buf+capacity is the ring body.
             unsafe {
-                *self.buf.add(slot as usize) = data[i];
+                *self.buf.add(slot as usize) = byte;
             }
         }
         self.header
             .tail
-            .store(tail.wrapping_add(n as u32), Ordering::Release);
-        n
+            .store(tail.wrapping_add(n), Ordering::Release);
+        n as usize
     }
 
     /// How many bytes are currently in the ring (from this writer's view).
@@ -427,7 +434,7 @@ impl<'a> SpscWriter<'a>
     }
 }
 
-impl<'a> SpscReader<'a>
+impl SpscReader<'_>
 {
     /// Wrap a pre-initialised shared region as a reader.
     ///
@@ -438,6 +445,7 @@ impl<'a> SpscReader<'a>
     /// `capacity` body bytes) must be mapped readable and writable and 4-byte
     /// aligned, and must stay mapped and valid for `'a`. Only one reader may
     /// exist at a time.
+    #[must_use]
     pub unsafe fn from_raw(region_vaddr: u64, capacity: u32) -> Option<Self>
     {
         // SAFETY: caller contract: the header is mapped, readable and aligned.
@@ -457,24 +465,26 @@ impl<'a> SpscReader<'a>
     {
         let head = self.header.head.load(Ordering::Relaxed);
         let tail = self.header.tail.load(Ordering::Acquire);
-        let used = tail.wrapping_sub(head);
+        // The peer writes `tail`; clamp so a value past the ring's bounds
+        // reads as a full ring rather than reading slots more than once.
+        let used = tail.wrapping_sub(head).min(self.mask + 1);
         if used == 0
         {
             return 0;
         }
-        let n = core::cmp::min(dst.len(), used as usize);
-        for i in 0..n
+        let n = used.min(u32::try_from(dst.len()).unwrap_or(u32::MAX));
+        for (offset, out) in (0..n).zip(dst.iter_mut())
         {
-            let slot = (head.wrapping_add(i as u32)) & self.mask;
+            let slot = head.wrapping_add(offset) & self.mask;
             // SAFETY: slot < capacity; buf..buf+capacity is the ring body.
             unsafe {
-                dst[i] = *self.buf.add(slot as usize);
+                *out = *self.buf.add(slot as usize);
             }
         }
         self.header
             .head
-            .store(head.wrapping_add(n as u32), Ordering::Release);
-        n
+            .store(head.wrapping_add(n), Ordering::Release);
+        n as usize
     }
 
     /// Whether the ring currently has any bytes to consume.
@@ -559,5 +569,22 @@ mod tests
         assert_eq!(rd.read(&mut out), CAP as usize);
         assert!(out.iter().all(|&b| b == 0xAB));
         assert!(rd.is_empty());
+    }
+
+    #[test]
+    fn ring_indices_a_peer_corrupted_stay_within_one_capacity()
+    {
+        // A peer that pushes `tail` more than a capacity past `head` must
+        // not make the writer underflow its free count or the reader take
+        // more than one ring's worth of bytes.
+        let mut r = region(CAP);
+        r.header.tail.store(CAP * 3, Ordering::Relaxed);
+        let va = &raw mut *r as u64;
+        // SAFETY: `r` is a live, aligned header plus `CAP` body bytes and
+        // outlives both halves.
+        let (mut w, mut rd) = unsafe { spsc_pair(va, CAP) }.expect("matching capacity");
+        assert_eq!(w.write(&[1, 2, 3]), 0);
+        let mut out = [0u8; CAP as usize * 2];
+        assert_eq!(rd.read(&mut out), CAP as usize);
     }
 }

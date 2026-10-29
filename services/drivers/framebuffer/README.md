@@ -21,8 +21,9 @@ framebuffer/
 ├── Cargo.toml
 ├── README.md
 └── src/
+    ├── lib.rs                   # Library root exposing render (host-tested)
     ├── main.rs                  # Driver entry, bootstrap, write service loop
-    ├── render.rs                # FramebufferWriter (cursor + glyph blit + scroll)
+    ├── render.rs                # FramebufferWriter (geometry checks, cursor, glyph blit, scroll)
     └── arch/
         ├── mod.rs               # #[cfg(target_arch)] dispatch
         ├── x86_64/mod.rs        # reserve VA + fund PT budget + mmio_map the linear framebuffer

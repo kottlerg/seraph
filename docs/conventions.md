@@ -110,12 +110,14 @@ a closed Issue settles on.
 - Any commit or PR description that closes an Issue MUST reference it via `Fixes #N` /
   `Closes #N` so the merge auto-closes the Issue. Manual `gh issue close` after the fact is a
   procedural miss, not a substitute.
-- A commit message or PR description MUST NOT put a GitHub closing keyword (`close`, `fix`, or
-  `resolve`, in any inflection or letter case) directly before a reference to Issue N (`#N`,
-  `<owner>/<repo>#N`, or the Issue's URL), with at most a colon and whitespace between them,
-  unless it closes Issue N: GitHub closes the Issue when that text reaches `master`, whatever words
-  follow the reference. A keyword separated from the reference by other words, as in the
-  `(fixed by PR #M)` marker of § Branch and PR Workflow, is not a closing reference.
+- A commit message or PR description MUST NOT put a GitHub closing keyword (`close`, `closes`,
+  `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, or `resolved`, in any letter case)
+  directly before a reference to Issue N (`#N`, `<owner>/<repo>#N`, or the Issue's URL), with at
+  most a colon and whitespace between them, unless it closes Issue N: GitHub closes the Issue when
+  that text reaches `master`, whatever words follow the reference. Other forms of those verbs
+  (`closing`, `fixing`, `resolving`) are not closing keywords. A keyword separated from the
+  reference by other words, as in the `(fixed by PR #M)` marker of § Branch and PR Workflow, is
+  not a closing reference.
 
 ### Acceptance checklist discipline
 

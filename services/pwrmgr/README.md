@@ -42,12 +42,14 @@ a device driver":
 It exposes a small IPC surface (`shared/ipc/src/lib.rs::pwrmgr_labels`):
 
 - `SHUTDOWN` — power off the platform (ACPI S5 on x86-64, SBI SRST type 0
-  on RISC-V). On the success path the platform powers off and no reply is
-  delivered. A reply only arrives on rejection or hardware-failure paths,
-  including a request the platform has not acted on one second after it
-  was issued.
+  on RISC-V).
 - `REBOOT` — cold reboot the platform (8042 KBC reset on x86-64, SBI SRST
   type 1 on RISC-V).
+
+For both labels, on the success path the platform powers off or resets and
+no reply is delivered. A reply only arrives on rejection or hardware-failure
+paths (`pwrmgr_errors::INVALID_REQUEST`), including a request the platform
+has not acted on one second after it was issued.
 
 Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
 `1<<63`). Calls without the bit reply `pwrmgr_errors::UNAUTHORIZED`.

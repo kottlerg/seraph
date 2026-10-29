@@ -18,9 +18,6 @@
 //! See `services/pwrmgr/README.md` for the design and future-scope
 //! sketch.
 
-// cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
-#![allow(clippy::cast_possible_truncation)]
-
 mod caps;
 
 #[cfg(target_arch = "x86_64")]

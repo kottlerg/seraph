@@ -416,8 +416,10 @@ impl OwnFatfs
     {
         let ipc_buf = std::os::seraph::current_ipc_buf();
         let block_ep = new_endpoint();
+        // GRANT: every block request carries the Memory cap it fills or
+        // drains, as virtio-blk's partition caps allow.
         let block_client =
-            syscall::cap_derive_badge(block_ep, syscall::RIGHTS_EP_SEND, BLOCK_CLIENT_BADGE)
+            syscall::cap_derive_badge(block_ep, syscall::RIGHTS_EP_SEND_GRANT, BLOCK_CLIENT_BADGE)
                 .expect("fs_block_faults: block SEND derive failed");
         let block_stop =
             syscall::cap_derive_badge(block_ep, syscall::RIGHTS_EP_SEND, ramdisk::STOP_BADGE)

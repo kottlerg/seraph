@@ -85,7 +85,7 @@ badge.
 | `label` | `0` |
 | `data[0]` | Entry kind: `0 = File`, `1 = Dir` |
 | `data[1]` | Cached size hint in bytes (zero for directories) |
-| `caps[0]` | Badged SEND on the owning server's namespace endpoint (with GRANT for a local entry; SEND-only across a mount) |
+| `caps[0]` | Badged SEND on the owning server's namespace endpoint (with GRANT, for a local entry and across a mount alike) |
 
 **Reply (error)** — label is the matching `NsError` code (no caps).
 
@@ -103,6 +103,8 @@ The server MUST:
 5. Compute returned rights as
    `parent_rights ∩ entry.max_rights ∩ caller_requested`
    ([docs/namespace-model.md](../../docs/namespace-model.md) § Per-Entry Rights and Visibility).
+   Reject with `PermissionDenied` if the returned rights are empty,
+   whatever the entry's node: a cap with no rights can do nothing.
 6. Mint the child cap carrying the returned rights via
    `cap_derive_badge`: for `EntryTarget::Local`, on the server's own
    namespace endpoint at the entry's `NodeId`; for
@@ -149,11 +151,10 @@ lacks the `STAT` rights bit.
 ## NS_READDIR
 
 Enumerate one directory entry by zero-based index. Clients iterate by
-incrementing the index until the reply label is `END_OF_DIR`. Skipping hidden
+incrementing the index until the reply label is `END_OF_DIR`. Hidden
 entries (per the visibility rule above and [docs/namespace-model.md](../../docs/namespace-model.md)
-§ Per-Entry Rights and Visibility) without contributing to the index is
-design intent; not yet implemented: the dispatch checks only the `READDIR`
-right ([#558](https://github.com/kottlerg/seraph/issues/558)).
+§ Per-Entry Rights and Visibility) MUST be skipped without contributing to
+the index.
 
 **Request**
 
@@ -247,7 +248,7 @@ outside it.
 | Code | Variant | Meaning |
 |---:|---|---|
 | 1 | `NotFound` | Name absent or hidden by visibility |
-| 2 | `PermissionDenied` | Caller's badge lacks the required right |
+| 2 | `PermissionDenied` | Caller's badge lacks the required right, or an `NS_LOOKUP` would mint a cap with no rights |
 | 3 | `NotADirectory` | Operation requires a directory; node is a file |
 | 4 | `IsADirectory` | Operation requires a file; node is a directory |
 | 5 | `InvalidName` | Name failed `validate_name` |
@@ -272,18 +273,27 @@ composing servers (`vfsd`'s synthetic root) embed this crate: they implement
 `NamespaceBackend` over their storage layer, and the crate owns every
 security-relevant code path. The
 trait's methods are called by `dispatch_request` after the crate
-has performed name validation, rights composition, and (for `NS_LOOKUP`)
-visibility filtering — backends never re-implement those checks.
+has performed name validation and rights composition, and the crate
+filters by visibility what `lookup` and `readdir_entry` return — backends
+never re-implement those checks.
 
 | Method | Called from |
 |---|---|
 | `lookup` | `NS_LOOKUP` |
 | `readdir_entry` | `NS_READDIR` |
+| `may_hide_entries` | `NS_READDIR` |
 | `stat` | `NS_STAT` |
 | `read_inline` | not called; reserved for an `NS_READ` label (design intent; not yet implemented) |
 | `read_memory` | not called; reserved for an `NS_READ_MEMORY` label (design intent; not yet implemented) |
 | `release_memory` | not called; reserved for an `NS_RELEASE_MEMORY` label (design intent; not yet implemented) |
 | `close` | not called; reserved for an `NS_CLOSE` label, a best-effort cleanup hint (design intent; not yet implemented) |
+
+`may_hide_entries` (default `true`) reports whether any entry of a
+directory may be hidden. When it returns `false`, `NS_READDIR` serves the
+client's index with one `readdir_entry` call; otherwise the crate scans
+the directory from index 0 on each request, skipping hidden entries. A
+hidden entry returned on the direct path makes the crate fall back to that
+filtered scan, so a wrong `false` cannot reveal a hidden name.
 
 Memory-cap reads continue to use the `ipc::fs_labels::FS_READ_MEMORY`
 surface today; they are documented in

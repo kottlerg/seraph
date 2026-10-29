@@ -109,8 +109,7 @@ endpoint; see [Cross-server entries](#cross-server-entries)) and `kind`:
 - `max_rights` — the ceiling on rights any child capability minted for
   this entry MAY carry. Independent of the parent directory's rights.
 - `visible_requires` — the rights the caller's directory capability
-  MUST hold for this entry to be visible at lookup or readdir (the readdir
-  half is design intent; not yet implemented, see below).
+  MUST hold for this entry to be visible at lookup or readdir.
 
 On `NS_LOOKUP`, the returned child rights equal
 `parent_rights ∩ entry.max_rights ∩ caller_requested_rights`; entries
@@ -121,11 +120,8 @@ namespace-protocol crate executes this uniformly for every backend; see
 §`NS_LOOKUP` for the wire-level dispatch.
 
 `NS_READDIR` applies the same visibility filter: entries hidden from
-this caller are skipped, and hidden entries do not appear in enumeration.
-This filter is design intent; not yet implemented: `NS_READDIR` checks only
-the caller's `READDIR` right ([#558](https://github.com/kottlerg/seraph/issues/558)),
-which every backend's entries satisfy today because none sets a
-`visible_requires`.
+this caller are skipped without contributing to the entry index, and
+hidden entries do not appear in enumeration.
 
 This composition is what gives the namespace its security properties:
 
@@ -133,8 +129,8 @@ This composition is what gives the namespace its security properties:
   the entry's `max_rights` accordingly, not by per-file owner overrides.
 - A directory invisible to unprivileged callers is expressed by setting
   `visible_requires` to require a rights bit (e.g., `ADMIN`) the
-  unprivileged caller does not hold. Lookup of such an entry returns
-  `NsError::NotFound`; its omission from readdir is design intent (above).
+  unprivileged caller does not hold. Such an entry does not appear in
+  readdir, and lookup returns `NsError::NotFound`.
 - Higher rights to a node are obtainable only from a separately
   delivered capability, minted at the source by a holder of the higher
   rights. The two capabilities name the same node with different
@@ -199,8 +195,7 @@ A namespace server is any process that implements the
 crate ([shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md))
 owns per-message dispatch (`dispatch_request`), the per-label rights
 gate (`gate`), name validation, rights composition, visibility
-filtering at lookup (at readdir it is design intent, as above), and capability
-minting; each backend runs its own receive
+filtering, and capability minting; each backend runs its own receive
 loop and owns only its storage layer.
 
 This isolates the security-relevant code in a single place. Adding a

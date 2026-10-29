@@ -152,16 +152,15 @@ mod tests
     }
 
     #[test]
-    fn unpack_preserves_reserved_rights_bits()
+    fn unpack_strips_reserved_rights_bits()
     {
-        // Bits 8..23 of the rights field are reserved for future
-        // expansion. Reserved bits set in a packed badge MUST round-
-        // trip through unpack: future protocol revisions assigning
-        // these bits MUST NOT be silently stripped by an older decoder.
-        let reserved = NamespaceRights::from_raw(1 << 23);
-        let badge = pack(NodeId::ROOT, reserved);
+        // Bits 8..23 of the rights field are reserved: they MUST be
+        // zero on derive and are ignored on read, so a badge carrying
+        // one (set by a peer that minted it outside this crate) decodes
+        // to the defined bits alone and cannot flow into a derived cap.
+        let badge = (u64::from(LOOKUP | (1 << 23))) << NODE_ID_BITS;
         let (_, r) = unpack(badge);
-        assert_eq!(r, reserved);
+        assert_eq!(r, NamespaceRights::from_raw(LOOKUP));
     }
 
     #[test]

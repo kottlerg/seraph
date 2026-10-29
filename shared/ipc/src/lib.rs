@@ -1176,11 +1176,11 @@ pub const NS_LABELS_VERSION: u32 = 1;
 /// terminator.
 ///
 /// Protocol semantics, including caller-rights checks, name validation,
-/// per-entry visibility (enforced at `NS_LOOKUP`; at `NS_READDIR` design
-/// intent, not yet implemented), and child-cap minting, are owned by the
-/// `namespace-protocol` crate's `dispatch_request` function; backends
-/// implement the `NamespaceBackend` trait, run their own receive loop,
-/// and route each `NS_*` message through `dispatch_request` for reply.
+/// per-entry visibility (at `NS_LOOKUP` and `NS_READDIR`), and child-cap
+/// minting, are owned by the `namespace-protocol` crate's
+/// `dispatch_request` function; backends implement the
+/// `NamespaceBackend` trait, run their own receive loop, and route each
+/// `NS_*` message through `dispatch_request` for reply.
 pub mod ns_labels
 {
     /// Walk one path component within a directory cap.

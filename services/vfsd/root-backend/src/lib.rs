@@ -557,9 +557,12 @@ impl NamespaceBackend for VfsdRootBackend
             {
                 if visible == idx
                 {
+                    // Matches the NONE `lookup` reports: no synthetic
+                    // node is hidden.
                     return Ok(EntryName::new(
                         &n.name[..usize::from(n.name_len)],
                         NodeKind::Dir,
+                        NamespaceRights::NONE,
                     ));
                 }
                 visible += 1;
@@ -567,6 +570,14 @@ impl NamespaceBackend for VfsdRootBackend
             cur = n.next_sibling;
         }
         Ok(None)
+    }
+
+    fn may_hide_entries(&mut self, _dir: NodeId) -> bool
+    {
+        // No synthetic node is hidden: every entry's `visible_requires` is NONE
+        // (see `lookup` and `readdir_entry`), so `NS_READDIR` can index the
+        // directory directly.
+        false
     }
 
     fn stat(&mut self, node: NodeId) -> Result<NodeStat, NsError>

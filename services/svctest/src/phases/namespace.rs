@@ -117,6 +117,9 @@ fn programs_child_main() -> !
     }
 }
 
+// too_many_lines: one sequence of namespace-protocol checks (lookup, stat,
+// readdir, case-insensitive lookup, not-found, rights denial) that share the
+// `/programs` cap the first lookup returns until the phase's final delete.
 #[allow(clippy::too_many_lines)]
 pub fn ns_phase(caps: &Caps)
 {

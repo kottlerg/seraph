@@ -14,9 +14,9 @@ that one cap. `install_registry_cap` stores it in a process-global atomic once i
 through every API. `pack_name` packs a name of at most `NAME_MAX` = 16 bytes into `NAME_WORDS`
 payload words. Lookups are reentrant; svcmgr derives a fresh SEND on every lookup (per
 [services/svcmgr/docs/ipc-interface.md](../../services/svcmgr/docs/ipc-interface.md) § Label 4:
-`QUERY_ENDPOINT`), and callers cache the returned cap themselves. `publish` issues
-`PUBLISH_ENDPOINT` and succeeds only when the cached cap is stamped with `PUBLISH_AUTHORITY`,
-which the per-process cap procmgr seeds never is, so it has no caller (#558).
+`QUERY_ENDPOINT`), and callers cache the returned cap themselves. There is no publish helper:
+`PUBLISH_ENDPOINT` succeeds only for a cap stamped with `PUBLISH_AUTHORITY`, which the
+per-process cap procmgr seeds never is.
 
 `no_std`; builds inside std's dependency graph through the `rustc-dep-of-std` feature.
 
@@ -29,7 +29,7 @@ shared/registry-client/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── lib.rs                  # Cap cache, pack_name, lookup, publish
+    └── lib.rs                  # Cap cache, pack_name, lookup
 ```
 
 ---

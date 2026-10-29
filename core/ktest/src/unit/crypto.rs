@@ -22,7 +22,7 @@ pub fn sha512_kats(_ctx: &TestContext) -> TestResult
 
 /// Ed25519 verification known-answer tests: RFC 8032 §7.1 positive vectors
 /// plus tamper negatives (flipped signature/message, wrong key, non-canonical
-/// S, invalid public key).
+/// S, invalid public key, and the two non-canonical public-key encodings).
 pub fn ed25519_kats(_ctx: &TestContext) -> TestResult
 {
     crypto::run_ed25519_kats()

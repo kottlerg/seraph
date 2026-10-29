@@ -468,7 +468,8 @@ pub mod memmgr_labels
     /// badge is unknown.
     pub const RELEASE_MEMORY_CAPS: u64 = 2;
     /// Procmgr-only: register a new process and receive the badged SEND cap
-    /// procmgr installs in its `ProcessInfo.memmgr_endpoint_cap`. Specified in `services/memmgr/docs/ipc-interface.md` § Label 3:
+    /// procmgr installs in the new process's `ProcessInfo.memmgr_endpoint_cap`.
+    /// Specified in `services/memmgr/docs/ipc-interface.md` § Label 3:
     /// `REGISTER_PROCESS`.
     pub const REGISTER_PROCESS: u64 = 3;
     /// Procmgr-only: notify process death. `data[0]` carries the dead process's
@@ -2379,9 +2380,9 @@ pub mod svcmgr_errors
     /// a `HANDOVER_COMPLETE`, or the handover has already run.
     pub const UNAUTHORIZED: u64 = 8;
     /// Client-side: the underlying `ipc_call` returned `Err` (no reply
-    /// from svcmgr, transport-level failure). Never emitted by svcmgr
-    /// itself — synthesised by `registry-client` to give callers a
-    /// uniform status surface.
+    /// from svcmgr, transport-level failure), for a client that reports it
+    /// in the svcmgr status space. Never emitted by svcmgr itself; no
+    /// in-tree client synthesises it.
     pub const IPC_FAILED: u64 = 9;
     /// Unknown opcode on svcmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;

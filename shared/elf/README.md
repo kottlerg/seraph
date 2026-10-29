@@ -11,7 +11,11 @@ stack-note extraction, load-span computation, the `PT_GNU_RELRO` span (`relro_sp
 `RELATIVE` records for a loader to apply at a chosen load bias. Non-`RELATIVE` relocation formats
 are rejected, never skipped. Does not allocate or perform I/O; the `*_metadata` variants need only
 the ELF header page plus the declared file size, and `rela_table_metadata` and
-`parse_stack_note_streaming` fetch further bytes through a caller-supplied reader.
+`parse_stack_note_streaming` fetch further bytes through a caller-supplied reader. Headers are
+decoded byte-wise, the file header returned by value, and every header read is bounds-checked
+against the data it is given, so an image needs no alignment and a header paired with data it was
+not validated against yields an error (the stack-note parsers, whose result is optional, read it
+as no note), not an out-of-bounds read.
 
 Used by the bootloader (validates and loads the kernel and init images, enumerates their
 `PT_LOAD` segments, and validates and applies the kernel's `RELATIVE` relocations, per

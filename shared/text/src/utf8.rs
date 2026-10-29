@@ -11,9 +11,13 @@
 //! sequence completes or an invalid byte forces a reset.
 //!
 //! Rejects surrogates (`U+D800..=U+DFFF`), overlong encodings, and
-//! codepoints above `U+10FFFF`. On any error the trigger byte is
-//! consumed and the decoder resets; the consumer is expected to render
-//! one `U+FFFD` per `Invalid` outcome and continue.
+//! codepoints above `U+10FFFF`. A byte that cannot start a sequence is
+//! consumed as `Invalid`. A byte that cannot continue the sequence in
+//! flight returns `Truncated`: the truncated prefix is one ill-formed
+//! subsequence, and the byte itself is pushed again, so an ASCII byte
+//! interrupting a sequence is still decoded (Unicode § 3.9, U+FFFD
+//! substitution of maximal subparts). The consumer renders one `U+FFFD`
+//! per `Invalid` or `Truncated` outcome and continues.
 
 /// Outcome of pushing one byte into a [`Utf8Decoder`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,9 +25,15 @@ pub enum DecodeOutcome
 {
     /// A complete codepoint has been assembled.
     Codepoint(u32),
-    /// The pushed byte does not extend a valid UTF-8 sequence. The
-    /// decoder has been reset; the consumer should emit `U+FFFD`.
+    /// The pushed byte cannot start a UTF-8 sequence. It is consumed; the
+    /// consumer should emit `U+FFFD`.
     Invalid,
+    /// The pushed byte cannot continue the sequence in flight, which ends
+    /// there as one ill-formed subsequence. The decoder has reset without
+    /// consuming the byte: the consumer emits `U+FFFD` for the truncated
+    /// sequence, then pushes the same byte again (from the reset state a push
+    /// never returns `Truncated`).
+    Truncated,
     /// The byte is a valid prefix or continuation; more bytes required.
     NeedMore,
 }
@@ -80,7 +90,7 @@ impl Utf8Decoder
         if byte & 0xC0 != 0x80
         {
             self.reset();
-            return DecodeOutcome::Invalid;
+            return DecodeOutcome::Truncated;
         }
 
         // RFC 3629 well-formedness checks on the 2nd byte of a multi-
@@ -100,7 +110,7 @@ impl Utf8Decoder
             if !ok
             {
                 self.reset();
-                return DecodeOutcome::Invalid;
+                return DecodeOutcome::Truncated;
             }
         }
 
@@ -166,5 +176,63 @@ fn assemble(bytes: &[u8]) -> u32
                 | u32::from(bytes[3] & 0x3F)
         }
         _ => 0xFFFD,
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// Decode `bytes` as a consumer does, re-pushing on `Truncated`.
+    fn decode(bytes: &[u8]) -> Vec<u32>
+    {
+        let mut d = Utf8Decoder::new();
+        let mut out = Vec::new();
+        for &b in bytes
+        {
+            let mut outcome = d.push(b);
+            if outcome == DecodeOutcome::Truncated
+            {
+                out.push(0xFFFD);
+                outcome = d.push(b);
+            }
+            match outcome
+            {
+                DecodeOutcome::Codepoint(cp) => out.push(cp),
+                DecodeOutcome::Invalid | DecodeOutcome::Truncated => out.push(0xFFFD),
+                DecodeOutcome::NeedMore =>
+                {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn an_ascii_byte_interrupting_a_sequence_is_still_decoded()
+    {
+        // `E2` opens a three-byte sequence; `A` cuts it short.
+        assert_eq!(decode(&[0xE2, b'A']), [0xFFFD, u32::from(b'A')]);
+    }
+
+    #[test]
+    fn a_lead_byte_interrupting_a_sequence_starts_the_next_one()
+    {
+        // `E2 82` is cut short by `C3 A9` (U+00E9).
+        assert_eq!(decode(&[0xE2, 0x82, 0xC3, 0xA9]), [0xFFFD, 0xE9]);
+    }
+
+    #[test]
+    fn a_disallowed_second_byte_is_reprocessed_on_its_own()
+    {
+        // `E0 80` is overlong: `E0` alone is the ill-formed subpart, and the
+        // stray continuation `80` is a second one.
+        assert_eq!(decode(&[0xE0, 0x80]), [0xFFFD, 0xFFFD]);
+    }
+
+    #[test]
+    fn a_byte_that_cannot_lead_is_consumed_as_invalid()
+    {
+        assert_eq!(decode(&[0xFF, b'B']), [0xFFFD, u32::from(b'B')]);
     }
 }

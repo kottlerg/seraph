@@ -10,7 +10,6 @@ publish.workspace = true
 # `shared/log` cap-install pattern: cache the per-process registry cap
 # once, then expose `lookup(name, ipc_buf)`.
 [lib]
-test = false
 doctest = false
 
 [dependencies]

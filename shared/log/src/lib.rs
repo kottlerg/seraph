@@ -25,9 +25,6 @@
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
-// cast_possible_truncation: userspace targets 64-bit only; u64/usize conversions
-// are lossless. u32 casts on capability slot indices are bounded by CSpace capacity.
-#![allow(clippy::cast_possible_truncation)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
@@ -59,7 +56,7 @@ const STACK_BUF_LEN: usize = CHUNK_SIZE;
 /// Badged SEND cap on the log endpoint, pre-installed at process
 /// startup via [`install_badged_cap`]. Zero when no logger is
 /// reachable (a process spawned before the log endpoint exists);
-/// [`emit`] drops in that case (asserting in debug builds).
+/// [`emit`] drops in that case.
 static BADGEED_CAP: AtomicU32 = AtomicU32::new(0);
 
 /// Pre-install a badged SEND cap on the log endpoint. Called by
@@ -84,7 +81,12 @@ pub fn ensure_badged_cap(_ipc_buf: *mut u64) -> u32
 /// across IPC calls when the payload exceeds [`CHUNK_SIZE`]; the receiver
 /// concatenates per-call bytes in order. Silently drops on a zero `cap`,
 /// null `ipc_buf`, empty `bytes`, or mid-chunk IPC failure.
-pub fn write_bytes(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
+///
+/// # Safety
+/// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
+/// buffer page as registered via `syscall::ipc_buffer_set` (the contract of
+/// `ipc::ipc_call`).
+pub unsafe fn write_bytes(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
 {
     if cap == 0 || ipc_buf.is_null() || bytes.is_empty()
     {
@@ -98,8 +100,8 @@ pub fn write_bytes(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
         let msg = IpcMessage::builder(label)
             .bytes(0, &bytes[offset..offset + chunk_len])
             .build();
-        // SAFETY: ipc_buf is the calling thread's registered IPC buffer
-        // (caller's invariant — same as ruststd's stdio path).
+        // SAFETY: ipc_buf is non-null (checked above), so the caller's
+        // contract makes it this thread's registered IPC buffer page.
         if unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }.is_err()
         {
             return;
@@ -112,7 +114,12 @@ pub fn write_bytes(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
 /// [`CHUNK_SIZE`] are truncated. The receiver stores the name for the
 /// sender's badge, truncating it at its per-slot limit
 /// (`services/logd/docs/ipc-interface.md` § `stream_labels::STREAM_REGISTER_NAME`).
-pub fn register_name(cap: u32, ipc_buf: *mut u64, name: &[u8])
+///
+/// # Safety
+/// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
+/// buffer page as registered via `syscall::ipc_buffer_set` (the contract of
+/// `ipc::ipc_call`).
+pub unsafe fn register_name(cap: u32, ipc_buf: *mut u64, name: &[u8])
 {
     if cap == 0 || ipc_buf.is_null() || name.is_empty()
     {
@@ -121,7 +128,8 @@ pub fn register_name(cap: u32, ipc_buf: *mut u64, name: &[u8])
     let len = name.len().min(CHUNK_SIZE);
     let label = STREAM_REGISTER_NAME | ((len as u64 & 0xFFFF) << 16);
     let msg = IpcMessage::builder(label).bytes(0, &name[..len]).build();
-    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+    // SAFETY: ipc_buf is non-null (checked above), so the caller's contract
+    // makes it this thread's registered IPC buffer page.
     let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
 }
 
@@ -130,7 +138,12 @@ pub fn register_name(cap: u32, ipc_buf: *mut u64, name: &[u8])
 /// safe to call from heap-independent paths (panic handlers,
 /// pre-bootstrap diagnostics). Messages exceeding the buffer are
 /// silently truncated.
-pub fn write_args(cap: u32, ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
+///
+/// # Safety
+/// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
+/// buffer page as registered via `syscall::ipc_buffer_set` (the contract of
+/// `ipc::ipc_call`).
+pub unsafe fn write_args(cap: u32, ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
 {
     use core::fmt::Write;
 
@@ -170,26 +183,26 @@ pub fn write_args(cap: u32, ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
         buf.data[buf.used] = b'\n';
         buf.used += 1;
     }
-    write_bytes(cap, ipc_buf, &buf.data[..buf.used]);
+    // SAFETY: the caller's contract covers `ipc_buf`.
+    unsafe { write_bytes(cap, ipc_buf, &buf.data[..buf.used]) };
 }
 
 /// One-shot emit: format `args` and send on the pre-installed badged
-/// SEND cap. Drops when no cap is installed (a process spawned before the
-/// log endpoint existed); debug builds assert instead (#558).
-pub fn emit(ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
+/// SEND cap. Drops, in every build, when no cap is installed: a process
+/// spawned before the log endpoint existed, or one given no log cap, logs
+/// nowhere.
+///
+/// # Safety
+/// `ipc_buf` must be null or point to the calling thread's 4 KiB-aligned IPC
+/// buffer page as registered via `syscall::ipc_buffer_set` (the contract of
+/// `ipc::ipc_call`).
+pub unsafe fn emit(ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
 {
     let cap = ensure_badged_cap(ipc_buf);
     if cap == 0
     {
-        // Reaching here means the binary linked `seraph::log!` but
-        // received no pre-installed badged cap. Binaries that never call
-        // `log!` never reach this function (dead-code-eliminated). Loud
-        // in debug; silent drop in release.
-        debug_assert!(
-            false,
-            "seraph::log! invoked but no log cap was installed at startup",
-        );
         return;
     }
-    write_args(cap, ipc_buf, args);
+    // SAFETY: the caller's contract covers `ipc_buf`.
+    unsafe { write_args(cap, ipc_buf, args) };
 }

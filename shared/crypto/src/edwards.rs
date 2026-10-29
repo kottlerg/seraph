@@ -106,13 +106,18 @@ pub(crate) fn scalar_mul_base(s: &[u8; 32]) -> Point
 
 /// Decompress a 32-byte public key into the **negated** point `-A`.
 ///
-/// Returns `None` if the bytes do not decode to a curve point. Returning the
-/// negation directly lets the verifier compute `[S]B + [k](-A)` in one
-/// addition. Follows RFC 8032 §5.1.3 for the square-root recovery, with the
-/// sign condition inverted to select `-A`, but omits its canonical-encoding
-/// checks (y < p; x = 0 with the sign bit set), as `TweetNaCl` does (#558).
+/// Returns `None` if the bytes are not the canonical encoding of a curve
+/// point. Returning the negation directly lets the verifier compute
+/// `[S]B + [k](-A)` in one addition. Follows RFC 8032 §5.1.3, with the sign
+/// condition inverted to select `-A`: a y coordinate at or above p (step 1),
+/// a y with no square root (step 3), and x = 0 with the sign bit set (step 4)
+/// are refused.
 pub(crate) fn decompress_neg(pk: &[u8; 32]) -> Option<Point>
 {
+    if !y_is_canonical(pk)
+    {
+        return None;
+    }
     let mut r: Point = [GF0, GF0, GF1, GF0];
     field::unpack(&mut r[1], pk);
 
@@ -168,6 +173,12 @@ pub(crate) fn decompress_neg(pk: &[u8; 32]) -> Option<Point>
         return None;
     }
 
+    // RFC 8032 §5.1.3 step 4: x = 0 has only the encoding with sign bit 0.
+    if field::eq(&r[0], &GF0) && pk[31] >> 7 == 1
+    {
+        return None;
+    }
+
     // Select the sign giving -A: negate when the parity already matches the
     // encoded sign bit (the inverse of the standard decompression rule).
     if field::parity(&r[0]) == (pk[31] >> 7)
@@ -180,6 +191,16 @@ pub(crate) fn decompress_neg(pk: &[u8; 32]) -> Option<Point>
     field::mul(&mut tt, &r[0], &r[1]);
     r[3] = tt;
     Some(r)
+}
+
+/// Whether the y coordinate `pk` encodes (its low 255 bits, little-endian) is
+/// below p = 2^255 - 19, as RFC 8032 §5.1.3 step 1 requires. Every y at or
+/// above p has bytes 1..=30 all `0xFF`, byte 31 (sign bit masked) `0x7F`, and
+/// byte 0 at least `0xED`.
+fn y_is_canonical(pk: &[u8; 32]) -> bool
+{
+    let top_is_max = pk[31] & 0x7F == 0x7F && pk[1..31].iter().all(|&b| b == 0xFF);
+    !(top_is_max && pk[0] >= 0xED)
 }
 
 /// Encode a point as its 32-byte little-endian compressed form.

@@ -182,13 +182,25 @@ fn handle_request(
                         decoder.reset();
                         writer.backspace();
                     }
-                    _ => match decoder.push(b)
+                    _ =>
                     {
-                        DecodeOutcome::Codepoint(cp) => render_at(writer, cp),
-                        DecodeOutcome::Invalid => render_at(writer, REPLACEMENT_CODEPOINT),
-                        DecodeOutcome::NeedMore =>
-                        {}
-                    },
+                        let mut outcome = decoder.push(b);
+                        if outcome == DecodeOutcome::Truncated
+                        {
+                            render_at(writer, REPLACEMENT_CODEPOINT);
+                            outcome = decoder.push(b);
+                        }
+                        match outcome
+                        {
+                            DecodeOutcome::Codepoint(cp) => render_at(writer, cp),
+                            DecodeOutcome::Invalid | DecodeOutcome::Truncated =>
+                            {
+                                render_at(writer, REPLACEMENT_CODEPOINT);
+                            }
+                            DecodeOutcome::NeedMore =>
+                            {}
+                        }
+                    }
                 }
             }
         }

@@ -208,10 +208,10 @@ pub struct MemoryReply
 /// Storage backend trait implemented by every namespace server.
 ///
 /// [`dispatch_request`] calls these methods after running the
-/// protocol's wire decode, rights / name checks (and, for `NS_LOOKUP`,
-/// visibility), and
-/// child-cap minting; backends own only their storage layer and never
-/// the wire surface or the access-control checks.
+/// protocol's wire decode and rights / name checks, filters what
+/// `lookup` and `readdir_entry` return by visibility, and mints child
+/// caps; backends own only their storage layer and never the wire
+/// surface or the access-control checks.
 pub trait NamespaceBackend
 {
     /// Look up `name` within the directory identified by `dir`.
@@ -227,7 +227,8 @@ pub trait NamespaceBackend
     /// hidden entries included; `Ok(None)` past the last entry produces
     /// `END_OF_DIR`. When [`Self::may_hide_entries`] is `false`, `NS_READDIR`
     /// calls this once with the client-supplied index, which must then
-    /// equal the visible index; otherwise it scans from index 0 per
+    /// equal the visible index (a hidden entry returned there makes the
+    /// crate fall back to the scan); otherwise it scans from index 0 per
     /// request and itself skips the entries whose `visible_requires` the
     /// caller lacks.
     ///
@@ -851,7 +852,8 @@ mod tests
         );
 
         // In-range control: the same request with index 0 is served, so
-        // END_OF_DIR above comes from the range check, not the handler.
+        // END_OF_DIR above comes from the range check, not from an empty
+        // directory or a refused badge.
         let mut first = ipc::IpcMessage::builder(ipc::ns_labels::NS_READDIR)
             .word(0, 0)
             .build();

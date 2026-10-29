@@ -273,8 +273,9 @@ composing servers (`vfsd`'s synthetic root) embed this crate: they implement
 `NamespaceBackend` over their storage layer, and the crate owns every
 security-relevant code path. The
 trait's methods are called by `dispatch_request` after the crate
-has performed name validation, rights composition, and (for `NS_LOOKUP`)
-visibility filtering — backends never re-implement those checks.
+has performed name validation and rights composition, and the crate
+filters by visibility what `lookup` and `readdir_entry` return — backends
+never re-implement those checks.
 
 | Method | Called from |
 |---|---|
@@ -290,7 +291,9 @@ visibility filtering — backends never re-implement those checks.
 `may_hide_entries` (default `true`) reports whether any entry of a
 directory may be hidden. When it returns `false`, `NS_READDIR` serves the
 client's index with one `readdir_entry` call; otherwise the crate scans
-the directory from index 0 on each request, skipping hidden entries.
+the directory from index 0 on each request, skipping hidden entries. A
+hidden entry returned on the direct path makes the crate fall back to that
+filtered scan, so a wrong `false` cannot reveal a hidden name.
 
 Memory-cap reads continue to use the `ipc::fs_labels::FS_READ_MEMORY`
 surface today; they are documented in

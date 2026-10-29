@@ -18,14 +18,16 @@
 //!
 //! ## Worker shutdown contract
 //!
-//! The workers must terminate cleanly before the bench's `cap_delete`
-//! cleanup, otherwise `cap_delete` of a still-running pinned thread
-//! on a CPU with no other ready threads races a kernel preemption
-//! point — observed to hang the harness past the CI per-run watchdog
-//! on both `x86_64` and `riscv64` in release mode.
+//! The workers are asked to leave their loop before the bench's
+//! `cap_delete` cleanup: `cap_delete` of a pinned thread still running
+//! the bench loop, on a CPU with no other ready threads, was observed to
+//! race a kernel preemption point and hang the harness past the CI
+//! per-run watchdog on both `x86_64` and `riscv64` in release mode.
 //!
-//! The fix here is cooperative: workers check `EXIT_REQUESTED` between
-//! yields and call `thread_exit` themselves. By the time the parent
+//! The mitigation is cooperative, and it narrows that window rather than
+//! closing it: workers check `EXIT_REQUESTED` between yields and call
+//! `thread_exit` themselves, so a deleted worker is at most finishing its
+//! last two syscalls (the done send and the exit). By the time the parent
 //! calls `cap_delete`, every worker has sent its done bit and is about to
 //! exit (it may not yet be Exited: the bit precedes `thread_exit`), or
 //! failed to report within the parent's bounded wait (logged); either may

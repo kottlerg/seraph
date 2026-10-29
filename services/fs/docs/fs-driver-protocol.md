@@ -13,6 +13,13 @@ this document covers the labels that remain fs-driver-specific:
   read protocol with cooperative release.
 - `FS_CLOSE` — release driver-side per-node bookkeeping; the holder
   still `cap_delete`s its node cap to drop the kernel reference.
+- `FS_WRITE` / `FS_WRITE_MEMORY` — inline and memory-cap writes on a
+  per-node badged cap.
+- `FS_CREATE` / `FS_MKDIR` — create a file or an empty directory in a
+  directory.
+- `FS_REMOVE` — unlink a file or empty directory.
+- `FS_RENAME` — rename an entry within one directory.
+- `FS_TRUNCATE` — set a file's length.
 - `END_OF_DIR` — readdir terminator, reused by `NS_READDIR`.
 
 A driver runs as a separate process. After `FS_MOUNT` succeeds, the
@@ -24,7 +31,9 @@ driver dispatches incoming requests by their badge shape:
   request (badge layout per
   [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
   § Badge shape). Per-node opcodes (`NS_*`, `FS_READ`, `FS_READ_MEMORY`,
-  `FS_RELEASE_MEMORY`, `FS_CLOSE`) are dispatched by label.
+  `FS_RELEASE_MEMORY`, `FS_CLOSE`, `FS_WRITE`, `FS_WRITE_MEMORY`,
+  `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`, `FS_TRUNCATE`) are
+  dispatched by label.
 
 ---
 

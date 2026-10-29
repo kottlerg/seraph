@@ -390,8 +390,22 @@ pub fn fs_mkdir_phase(_: &Caps)
     let entry0 = crate::ipc_util::ns::ns_readdir(dir_cap, 0, ipc_buf).expect("NS_READDIR 0");
     assert!(entry0.is_some(), "newly-mkdir'd directory must have ./..");
 
-    let _ = syscall::cap_delete(dir_cap);
+    // A cap kept across the directory's removal names a node that left the
+    // driver's table: lookups and readdirs through it reply NotFound, not
+    // NotADirectory.
     fs_remove(svctest, dname, ipc_buf).expect("FS_REMOVE mkd (empty) failed");
+    let not_found = namespace_protocol::NsError::NotFound.as_label();
+    assert_eq!(
+        crate::ipc_util::ns::ns_readdir(dir_cap, 0, ipc_buf).err(),
+        Some(not_found),
+        "NS_READDIR on a removed directory's cap"
+    );
+    assert_eq!(
+        ns_lookup(dir_cap, b"x", 0xFFFF, ipc_buf).err(),
+        Some(not_found),
+        "NS_LOOKUP on a removed directory's cap"
+    );
+    let _ = syscall::cap_delete(dir_cap);
 
     let (dir_cap2, _) = fs_mkdir(svctest, dname, ipc_buf).expect("FS_MKDIR mkd retry");
     let (inner, _) = fs_create(dir_cap2, b"in.bin", ipc_buf).expect("FS_CREATE inside dir failed");

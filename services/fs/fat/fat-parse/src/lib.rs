@@ -1010,6 +1010,8 @@ mod tests
     use super::*;
 
     /// Build a BPB sector 0 with a valid boot signature and the given fields.
+    // too_many_arguments: one argument per BPB field the tests vary, so each
+    // test states the geometry it exercises in one call.
     #[allow(clippy::too_many_arguments)]
     fn bpb_sector(
         bytes_per_sector: u16,

@@ -2,36 +2,40 @@
 
 Binary boot protocol contract between the bootloader and the kernel.
 
+---
+
+## Overview
+
 Defines `BootInfo` and all associated types passed from the bootloader to the
 kernel entry point. Includes the `BOOT_PROTOCOL_VERSION` constant; the kernel
 halts at entry if the bootloader's version does not match (see
 [core/kernel/docs/initialization.md](../../core/kernel/docs/initialization.md)
 § Phase 0: Entry Validation).
 
-**Constraints:** `no_std`, `#[repr(C)]` for all types, no dependencies outside
-`core`. Changes that alter `BootInfo` layout or the CPU entry contract MUST
-increment `BOOT_PROTOCOL_VERSION`.
+**Constraints:** `no_std`, `#[repr(C)]` for every struct and `#[repr(u32)]` for every
+enum `BootInfo` carries, no dependencies outside `core`. Changes that alter `BootInfo`
+layout or the CPU entry contract MUST increment `BOOT_PROTOCOL_VERSION`.
 
 The crate source itself ([`src/lib.rs`](src/lib.rs)) is the authoritative
 layout specification — type fields, discriminants, doc-comment invariants,
 and version-history rationale all live there, not duplicated in markdown.
-This README covers only what the source cannot: the third-party-bootloader
-policy and the high-level responsibilities required of any compliant
-bootloader.
+Beyond the crate's structure, this README covers only what the source cannot: the
+third-party-bootloader policy and the high-level responsibilities required of any
+compliant bootloader.
 
 The compile-time view of what each phase of boot establishes, and the
 sequence of steps the reference bootloader takes, is documented at the
-component level in [`boot/docs/`](../../core/boot/docs/) — particularly
-[`boot/docs/kernel-handoff.md`](../../core/boot/docs/kernel-handoff.md) for the
+component level in [`core/boot/docs/`](../../core/boot/docs/) — particularly
+[`core/boot/docs/kernel-handoff.md`](../../core/boot/docs/kernel-handoff.md) for the
 CPU-state contract at entry, and
-[`boot/docs/boot-flow.md`](../../core/boot/docs/boot-flow.md) for the ten-step
+[`core/boot/docs/boot-flow.md`](../../core/boot/docs/boot-flow.md) for the ten-step
 sequence.
 
 ---
 
 ## Compliant Bootloader
 
-The Seraph bootloader in [`boot/`](../../core/boot/) is the **reference
+The Seraph bootloader in [`core/boot/`](../../core/boot/README.md) is the **reference
 implementation**. Any compliant bootloader that satisfies the contract
 defined by this crate — the `BootInfo` layout, the
 `BOOT_PROTOCOL_VERSION` check, and the CPU/memory state at kernel entry
@@ -59,7 +63,7 @@ A compliant bootloader MUST, before jumping to the kernel entry point:
 - Guarantee that the `BootInfo` structure and all referenced data
   remain mapped and readable at kernel entry.
 - Establish the CPU state documented in
-  [`boot/docs/kernel-handoff.md`](../../core/boot/docs/kernel-handoff.md)
+  [`core/boot/docs/kernel-handoff.md`](../../core/boot/docs/kernel-handoff.md)
   for the target architecture.
 
 A compliant bootloader MUST NOT:
@@ -69,6 +73,36 @@ A compliant bootloader MUST NOT:
   headers.
 - Include in `BootInfo.mmio_apertures` any region that is inaccessible
   or reserved for firmware's exclusive use.
+
+---
+
+## Source Layout
+
+```
+boot-protocol/
+├── Cargo.toml
+├── README.md
+└── src/
+    ├── lib.rs           # BootInfo and its types, BOOT_PROTOCOL_VERSION, MAX_CPUS, the
+    │                    #   KernelMmio and HART_CAP_* facts, KASLR_* flags
+    ├── bundle.rs        # bootstrap.bundle wire format (header, entries, INIT_ENTRY_NAME)
+    ├── layout.rs        # direct-map layout arithmetic both bootloader and kernel use
+    ├── riscv_paging.rs  # RISC-V paging-mode constants and satp encoding
+    └── role_guids.rs    # GPT partition type GUIDs for role-based discovery
+```
+
+---
+
+## Relevant Design Documents
+
+| Document | Content |
+|---|---|
+| [core/boot/docs/kernel-handoff.md](../../core/boot/docs/kernel-handoff.md) | CPU and memory state at kernel entry |
+| [core/boot/docs/boot-flow.md](../../core/boot/docs/boot-flow.md) | Reference bootloader's steps, including `BootInfo` population |
+| [core/kernel/docs/initialization.md](../../core/kernel/docs/initialization.md) | Phase 0 entry validation of `BootInfo` |
+| [docs/bootstrap.md](../../docs/bootstrap.md) | Boot lifecycle: the bootloader loading the bundle `bundle.rs` encodes and handing over `BootInfo` |
+| [docs/memory-model.md](../../docs/memory-model.md) | Kernel virtual layout (direct map, KASLR), W^X enforcement, boot-time memory map |
+| [docs/storage.md](../../docs/storage.md) | GPT role-GUID discovery, whose partition type GUIDs `role_guids.rs` defines |
 
 ---
 

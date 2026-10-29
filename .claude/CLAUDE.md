@@ -55,9 +55,10 @@ truth for "how work is tracked and shipped" on this project.
   to `master`.
 - Commit messages follow [docs/conventions.md](../docs/conventions.md) § Commit Messages
   and § Commit and PR cross-references: an Issue reference goes in the body, never the
-  subject (merge commits aside), and a GitHub closing keyword (`close`, `fix`, or
-  `resolve` in any inflection or letter case, directly followed by `#N`,
-  `<owner>/<repo>#N`, or the Issue's URL, with at most a colon and whitespace between)
+  subject (merge commits aside), and a GitHub closing keyword (`close`, `closes`,
+  `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, or `resolved`, in any letter
+  case, directly followed by `#N`, `<owner>/<repo>#N`, or the Issue's URL, with at most
+  a colon and whitespace between)
   appears in a commit message or PR body only for an Issue it closes, since GitHub closes
   Issue N when that text reaches `master`.
 - After pushing a PR, the assistant MUST start watching its CI run via

@@ -86,9 +86,9 @@ const MIGRATE_TIMEOUT: Duration = Duration::from_mins(2);
 /// Dropping a `Guest` kills QEMU, reaps it, and joins the reader, so every
 /// exit path of [`run`], an early `?` return included, releases the
 /// process and the raw disk image's write lock it holds; `std::process::Child`
-/// does not kill on drop, and an orphaned source QEMU would block boot B's
-/// open of the image. The error paths therefore return without an explicit
-/// shutdown.
+/// does not kill on drop, and an orphaned QEMU would hold that lock past the
+/// run, blocking the next boot that opens the image. The error paths
+/// therefore return without an explicit shutdown.
 struct Guest
 {
     child: Child,

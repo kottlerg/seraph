@@ -201,9 +201,8 @@ pub unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
     let a0 = a0 as i64;
     // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
     // args in a0-a4; reads secondary return from a1 (inout). a2 is inout-to-discard
-    // because `SYS_IPC_CALL` writes `reply_word_count` into a2 via
-    // `set_ipc_call_return`; this wrapper does not consume it, but LLVM must not
-    // assume a2 is preserved.
+    // defensively: the kernel's IPC return path writes it (`SYS_IPC_CALL` itself
+    // goes through `syscall6_ret3`), and LLVM must not assume it preserved.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -221,7 +220,7 @@ pub unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
 
 /// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary, quaternary).
 ///
-/// Used by `ipc_recv` to retrieve `(ret, label, badge, word_count)`.
+/// Used by `raw_ipc_recv` to retrieve `(ret, label, badge, word_count)`.
 ///
 /// # Safety
 ///

@@ -264,7 +264,7 @@ Memory caps into its pool. See
 Two handover surfaces carry the parent-to-child contract:
 
 - **`InitInfo`** — kernel-populated, delivered to init at boot. Defined
-  by [`abi/init-protocol`](../abi/init-protocol/). Carries the entire
+  by [`abi/init-protocol`](../abi/init-protocol/README.md). Carries the entire
   initial CSpace layout, including platform resources only init needs.
 - **`ProcessInfo`** — procmgr-populated for every process except init's
   raw-bootstrap set (memmgr and procmgr), whose `ProcessInfo` init

@@ -50,19 +50,20 @@
 //! # Why these are free on `x86_64`
 //!
 //! `x86_64` TSO orders all stores from one core in program order, and MMIO
-//! mappings created via `SYS_MMIO_MAP` are strongly uncacheable (PCD|PWT),
-//! which forces serialised access. Each of the barriers in this crate
+//! mappings created via `SYS_MMIO_MAP` are strong-uncacheable (see
+//! `core/kernel/docs/syscalls.md` § `SYS_MMIO_MAP`), which forces serialised
+//! access. Each of the barriers in this crate
 //! compiles to nothing on `x86_64`; the API exists so arch-neutral driver
 //! code can call the barrier unconditionally and pay no cost on TSO
 //! architectures.
 //!
 //! # Adding a new architecture
 //!
-//! Create `src/arch/<name>.rs` implementing all three barriers, then add a
-//! `#[cfg(target_arch = "<name>")]` arm to `src/arch/mod.rs`. Every
-//! architecture MUST implement all three functions; if a given barrier is a
-//! no-op on the new arch, implement it as an empty function with a comment
-//! explaining which hardware property makes it unnecessary.
+//! Create `src/arch/<name>/mod.rs` implementing all three barriers and add a
+//! `#[cfg(target_arch = "<name>")] #[path = "<name>/mod.rs"] pub mod current;`
+//! arm to `src/arch/mod.rs`, following `docs/coding-standards.md` § C
+//! (every architecture implements the full surface; a no-op's rustdoc says
+//! why).
 
 #![no_std]
 

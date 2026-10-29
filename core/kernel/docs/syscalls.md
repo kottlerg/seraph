@@ -6,9 +6,9 @@ specifications, error codes, and atomicity guarantees.
 
 **Code counterparts:**
 - [`abi/syscall/`](../../../abi/syscall/README.md) — `SYS_*` constants, `SyscallError`
-  enum, scheduling and message constants. This is the binary contract: `#[repr(C)]`,
-  `no_std`, no deps outside `core`. Both the kernel and userspace depend on it. Changes
-  here are ABI breaks.
+  enum, scheduling and message constants. This is the binary contract: explicit stable
+  reprs (`#[repr(C)]` structs, integer-repr enums), `no_std`, no deps outside `core`. Both
+  the kernel and userspace depend on it. Changes here are ABI breaks.
 - [`shared/syscall/`](../../../shared/syscall/README.md) — Rust wrapper functions for
   userspace. Thin inline-asm wrappers around the abi constants. No stability
   obligation; internal code reuse only.
@@ -200,7 +200,8 @@ pub enum SyscallError
 {
     /// Syscall number is not valid.
     UnknownSyscall = -1,
-    /// Capability slot index is out of range or slot is null.
+    /// Capability slot index is out of range, the slot is null, or the
+    /// handle's generation is stale.
     InvalidCapability = -2,
     /// Caller does not hold sufficient rights for this operation.
     InsufficientRights = -3,
@@ -210,7 +211,7 @@ pub enum SyscallError
     InvalidArgument = -5,
     /// The operation would block but the caller requested non-blocking mode.
     WouldBlock = -6,
-    /// The target thread or object has already exited / been destroyed.
+    /// Reserved; not returned by the current kernel.
     ObjectGone = -7,
     /// No memory available to satisfy the request.
     OutOfMemory = -8,
@@ -218,9 +219,9 @@ pub enum SyscallError
     NotSupported = -9,
     /// The capability rights bitmask violates the W^X constraint.
     WxViolation = -10,
-    /// The message is too large for the destination.
+    /// Reserved; not returned by the current kernel.
     MsgTooLarge = -11,
-    /// Deadlock would occur (IPC cycle detected).
+    /// Reserved; not returned by the current kernel.
     Deadlock = -12,
     /// Event queue is full; post would be lost.
     QueueFull = -13,

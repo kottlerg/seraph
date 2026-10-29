@@ -10,7 +10,7 @@
 //! [`process_abi::ProcessInfo`] at spawn. This crate caches that cap in
 //! a process-global atomic so callers can issue `QUERY_ENDPOINT` without
 //! threading it through every API surface (mirrors the
-//! [`shared/log`] cap-install pattern).
+//! `shared/log` cap-install pattern).
 //!
 //! Concurrency: the install is single-writer (set once in `_start`
 //! before any other thread is alive); `lookup` is reentrant and
@@ -45,9 +45,8 @@ use ipc::{IpcMessage, svcmgr_errors, svcmgr_labels};
 
 /// Maximum registered-name length in bytes. Source of truth lives in
 /// `shared/registry::NAME_MAX`; this constant must be kept in sync with
-/// it. Inlined rather than imported because `registry` is a server-side
-/// crate that pulls additional cspace-storage helpers, none of which
-/// clients need.
+/// it. Inlined rather than imported because `registry` does not build
+/// inside std's dependency graph (it has no `rustc-dep-of-std` feature).
 pub const NAME_MAX: usize = 16;
 
 /// Word-count of the on-wire name buffer (8 bytes per u64 word).
@@ -74,6 +73,12 @@ pub fn registry_cap() -> u32
 /// Pack `name` into IPC data words (little-endian-by-byte; byte `i`
 /// occupies bits `(i%8)*8..(i%8)*8+8` of word `i/8`). Returns the
 /// number of words consumed; matches `svcmgr::read_tail_name_from_msg`.
+///
+/// `out` MUST be zeroed by the caller: the bytes are ORed into it.
+///
+/// # Panics
+///
+/// Panics when `name` is longer than [`NAME_MAX`] (#558).
 #[must_use]
 pub fn pack_name(name: &[u8], out: &mut [u64; NAME_WORDS]) -> usize
 {
@@ -123,7 +128,13 @@ pub unsafe fn lookup(name: &[u8], ipc_buf: *mut u64) -> Option<u32>
 /// Publish `(name, send_cap)` in svcmgr's discovery registry. Requires
 /// the caller's `registry_cap` to be stamped with the
 /// `PUBLISH_AUTHORITY` verb-bit; svcmgr will reject otherwise with
-/// `UNAUTHORIZED`. Returns the svcmgr status code (`SUCCESS` = 0).
+/// `UNAUTHORIZED`. The per-process cap procmgr seeds never carries it, so
+/// nothing calls this today (#558).
+///
+/// Returns the svcmgr status code (`SUCCESS` = 0), or one synthesised
+/// locally without IPC: `UNAUTHORIZED` when no registry cap is installed,
+/// `INVALID_NAME` for an empty or over-long name or a zero `send_cap`, and
+/// `IPC_FAILED` when the call itself fails.
 ///
 /// # Safety
 /// `ipc_buf` must point at the registered IPC buffer page for this

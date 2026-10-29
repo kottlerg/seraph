@@ -311,4 +311,5 @@ policy + budget):
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
 [services/svcmgr/README.md](../README.md),
 [services/svctest/README.md](../../svctest/README.md),
+[shared/registry/README.md](../../../shared/registry/README.md),
 [shared/registry-client/README.md](../../../shared/registry-client/README.md)

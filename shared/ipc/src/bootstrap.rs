@@ -5,10 +5,11 @@
 
 //! Bootstrap IPC protocol — child-side and creator-side primitives.
 //!
-//! Every userspace process starts with exactly one cap installed beyond the
-//! self-caps: `creator_endpoint_cap` (in `process_abi::ProcessInfo`). The
-//! child calls [`request_round`] in a loop on that cap; the creator serves
-//! each request with [`reply_round`] or [`reply_error`], transferring up to
+//! A child reaches its creator through `creator_endpoint_cap` (in
+//! `process_abi::ProcessInfo`, beside the other caps the handover page
+//! carries). The child calls [`request_round`] in a loop on that cap; the
+//! creator serves each request with [`reply_round`] or [`reply_error`],
+//! transferring up to
 //! `MSG_CAP_SLOTS_MAX` caps plus payload words per round. When the creator
 //! sets the `done` flag, the child stops.
 //!
@@ -46,10 +47,10 @@ pub const DONE: u64 = 1;
 /// data words delivered in this round. Subsequent IPC cannot clobber it.
 pub struct BootstrapRound
 {
-    /// Child-CSpace slot indices of received caps. Only the first
-    /// `cap_count` entries are valid.
+    /// Capability handles of the received caps in the child's `CSpace`. Only
+    /// the first `cap_count` entries are valid.
     pub caps: [u32; MSG_CAP_SLOTS_MAX],
-    /// Number of valid cap indices in `caps`.
+    /// Number of valid handles in `caps`.
     pub cap_count: usize,
     /// Owned data words delivered with this round. Only the first
     /// `data_words` entries are valid.
@@ -104,8 +105,11 @@ pub const fn unpack_data_words(label: u64) -> usize
 /// `ipc_buf` must point to the caller thread's registered IPC buffer page.
 ///
 /// # Errors
-/// * `Err(code)` where `code` is [`bootstrap_errors::NO_CHILD`],
-///   [`bootstrap_errors::EXHAUSTED`], or [`bootstrap_errors::INVALID`].
+/// * `Err(code)` with the low byte of any reply label other than
+///   [`MORE`] / [`DONE`]: the creator's [`bootstrap_errors::NO_CHILD`],
+///   [`bootstrap_errors::EXHAUSTED`], or [`bootstrap_errors::INVALID`], or
+///   `0xFF` when the kernel's reply-cap transfer failed
+///   (`IPC_REPLY_TRANSFER_FAILED`).
 /// * `Err(bootstrap_errors::INVALID)` if the underlying IPC fails.
 pub unsafe fn request_round(creator_ep: u32, ipc_buf: *mut u64) -> Result<BootstrapRound, u64>
 {
@@ -143,13 +147,17 @@ pub unsafe fn request_round(creator_ep: u32, ipc_buf: *mut u64) -> Result<Bootst
 
 // ── Creator side ────────────────────────────────────────────────────────────
 
-/// Reply to a pending `BOOTSTRAP_REQUEST` with the next round.
+/// Reply to a pending [`REQUEST`] with the next round. Caps past
+/// `MSG_CAP_SLOTS_MAX` are silently dropped.
 ///
 /// # Safety
 /// `ipc_buf` must point to the caller thread's registered IPC buffer page.
 ///
 /// # Errors
 /// Returns a negative kernel error code from the underlying IPC.
+///
+/// # Panics
+/// Panics when `data` is longer than `MSG_DATA_WORDS_MAX` words.
 pub unsafe fn reply_round(
     done: bool,
     cap_slots: &[u32],
@@ -173,7 +181,7 @@ pub unsafe fn reply_round(
     unsafe { crate::ipc_reply(&msg, ipc_buf) }
 }
 
-/// Reply to a pending `BOOTSTRAP_REQUEST` with an error code.
+/// Reply to a pending [`REQUEST`] with an error code.
 ///
 /// # Safety
 /// `ipc_buf` must point to the caller thread's registered IPC buffer page.
@@ -190,7 +198,7 @@ pub unsafe fn reply_error(code: u64, ipc_buf: *mut u64) -> Result<(), i64>
 /// Receive one bootstrap request, verify the sender's badge, and reply
 /// with the given round.
 ///
-/// Blocks until a `BOOTSTRAP_REQUEST` arrives on `bootstrap_ep`. If the badge
+/// Blocks until a [`REQUEST`] arrives on `bootstrap_ep`. If the badge
 /// embedded in the received cap does not match `expected_badge`, replies with
 /// [`bootstrap_errors::NO_CHILD`] and returns `Err`. If the label is not
 /// [`REQUEST`], replies with [`bootstrap_errors::INVALID`] and returns `Err`.

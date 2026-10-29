@@ -203,6 +203,7 @@ that procmgr will install in the new process's
 | Field | Value |
 |---|---|
 | label | 3 |
+| data[0] | Caller's `MEMMGR_LABELS_VERSION` |
 
 The badge of the requesting endpoint identifies procmgr; memmgr verifies
 this and rejects the call otherwise. memmgr mints a fresh badge for the
@@ -232,7 +233,8 @@ the eventual `PROCESS_DIED`.
 | Code | Name | Meaning |
 |---|---|---|
 | 5 | `Unauthorized` | Caller is not procmgr |
-| 6 | `TooManyProcesses` | Per-process table at static cap |
+| 6 | `TooManyProcesses` | The tracking table could not take a new entry, the badge draw failed, or the reply cap could not be derived |
+| 7 | `LabelVersionMismatch` | `data[0]` is not memmgr's `MEMMGR_LABELS_VERSION` |
 
 ### Label 4: `PROCESS_DIED`
 

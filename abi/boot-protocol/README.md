@@ -16,16 +16,17 @@ halts at entry if the bootloader's version does not match (see
 enum `BootInfo` carries, no dependencies outside `core`. Changes that alter `BootInfo`
 layout or the CPU entry contract MUST increment `BOOT_PROTOCOL_VERSION`.
 
-The crate source itself ([`src/lib.rs`](src/lib.rs)) is the authoritative
-layout specification — type fields, discriminants, doc-comment invariants,
-and version-history rationale all live there, not duplicated in markdown.
+The crate source under `src/` is the authoritative specification — `lib.rs` for
+the `BootInfo` layout and the sibling modules for the bundle, layout-arithmetic, paging, and
+GUID contracts (see Source Layout); type fields, discriminants, doc-comment invariants, and
+version-history rationale all live there, not duplicated in markdown.
 Beyond the crate's structure, this README covers only what the source cannot: the
 third-party-bootloader policy and the high-level responsibilities required of any
 compliant bootloader.
 
-The compile-time view of what each phase of boot establishes, and the
-sequence of steps the reference bootloader takes, is documented at the
-component level in [`core/boot/docs/`](../../core/boot/docs/) — particularly
+What each bootloader step establishes, and the sequence of steps the
+reference bootloader takes, is documented at the component level in
+[`core/boot/docs/`](../../core/boot/docs/) — particularly
 [`core/boot/docs/kernel-handoff.md`](../../core/boot/docs/kernel-handoff.md) for the
 CPU-state contract at entry, and
 [`core/boot/docs/boot-flow.md`](../../core/boot/docs/boot-flow.md) for the ten-step
@@ -109,6 +110,8 @@ boot-protocol/
 ## Summarized By
 
 [core/boot/README.md](../../core/boot/README.md),
+[Boot Flow](../../core/boot/docs/boot-flow.md),
 [Firmware Parsing](../../core/boot/docs/firmware-parsing.md),
 [Kernel Handoff Contract](../../core/boot/docs/kernel-handoff.md),
-[Build System](../../docs/build-system.md)
+[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md),
+[Build System](../../docs/build-system.md), [Memory Model](../../docs/memory-model.md)

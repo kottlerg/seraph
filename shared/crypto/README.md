@@ -5,11 +5,12 @@ signature verification.
 
 `no_std`, no allocation, no external dependencies. Provides a vetted hash and a
 verify-only signature primitive usable by the bootloader/loader and userspace
-services. Does no I/O and holds no keys.
+services. Does no I/O and holds no keys. Today its only dependent is ktest, which
+runs the known-answer tests on target.
 
-The crate is the reusable primitive that the per-binary signing chain of trust
-(#124) builds on; #124 owns key management, the `.seraph.sig` ELF section, and
-xtask signing, and is the consumer of `ed25519_verify`.
+The per-binary signing chain of trust (#124), which will own key management, the
+`.seraph.sig` ELF section, and xtask signing, and will consume `ed25519_verify`, is
+design intent; not yet implemented.
 
 ---
 
@@ -19,8 +20,10 @@ xtask signing, and is the consumer of `ed25519_verify`.
 |---|---|
 | `sha512(&[u8]) -> [u8; 64]` | One-shot SHA-512 (FIPS 180-4). |
 | `Sha512` (`new`/`update`/`finalize`) | Incremental SHA-512, so large inputs (e.g. module bodies) hash without being buffered whole. |
-| `ed25519_verify(&[u8;32], &[u8], &[u8;64]) -> Result<(), VerifyError>` | RFC 8032 Ed25519 verification. Verify-only; no signing or key generation. |
+| `ed25519_verify(&[u8;32], &[u8], &[u8;64]) -> Result<(), VerifyError>` | Ed25519 verification per RFC 8032, except that public-key decoding accepts the non-canonical encodings `TweetNaCl` accepts (a y coordinate ≥ p, or x = 0 with the sign bit set); the RFC's canonical checks are recorded on #558. Verify-only; no signing or key generation. |
 | `VerifyError` | `BadPublicKey`, `NonCanonicalS`, `Mismatch`. |
+| `sha512::DIGEST_LEN` | SHA-512 digest length in bytes (64). |
+| `run_sha512_kats()` / `run_ed25519_kats()` `-> Result<(), &'static str>` | Known-answer-test drivers shared by the host tests and ktest. |
 
 ### Design notes
 
@@ -71,7 +74,6 @@ shared/crypto/
 
 | Document | Content |
 |---|---|
-| [docs/capability-model.md](../../docs/capability-model.md) | System security model the signing chain layers onto |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---

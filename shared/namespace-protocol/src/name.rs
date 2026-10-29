@@ -5,17 +5,8 @@
 
 //! Name validation for `NS_LOOKUP` / `NS_READDIR`.
 //!
-//! Path resolution is client-side. A name accepted by `NS_LOOKUP` is a
-//! single component:
-//!
-//! - UTF-8 encoded.
-//! - Length 1..=255 bytes.
-//! - MUST NOT contain `/` (0x2F) or `\0` (0x00).
-//! - MUST NOT be `.` or `..`.
-//!
-//! Backends MAY further restrict (reserved words, on-disk encoding
-//! limits, case-sensitivity rules); such restrictions surface as
-//! `NotFound` or `InvalidName` per the namespace protocol.
+//! The name rules are specified in `shared/namespace-protocol/README.md`
+//! § Names.
 
 // Under `rustc-dep-of-std` the crate root is `no_core` and the usual
 // prelude is not auto-imported into submodules. Mirrors the

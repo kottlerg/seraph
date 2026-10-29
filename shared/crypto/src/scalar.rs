@@ -60,8 +60,9 @@ pub(crate) fn reduce_512(h: &[u8; 64]) -> [u8; 32]
     r
 }
 
-/// Barrett-style folding of the high half into the low half, then two
-/// conditional subtractions of L. Operates in signed radix-2^8 limbs.
+/// Reduce mod L the `TweetNaCl` `modL` way: fold each high byte down by
+/// subtracting the matching multiple of L, then subtract the residual quotient
+/// multiples of L twice. Operates in signed radix-2^8 limbs.
 fn mod_l(r: &mut [u8; 32], x: &mut [i64; 64])
 {
     let mut i = 63usize;

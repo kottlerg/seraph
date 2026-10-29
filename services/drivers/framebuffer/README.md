@@ -83,7 +83,8 @@ The driver feeds each byte to its `text::Utf8Decoder`:
   (`font::FONT_9X20_EXT`) → ASCII fallback (multi-byte substitutes such
   as `©` → `(C)`) → `U+FFFD` replacement glyph (slot 0 of the extension
   table).
-* Invalid UTF-8 emits one `U+FFFD` glyph and resets the decoder.
+* Invalid UTF-8 emits one `U+FFFD` glyph per ill-formed subsequence and resets the decoder; a
+  byte that cuts a sequence short is then decoded on its own.
 
 A multi-byte sequence may straddle two `FB_WRITE_BYTES` calls; partial
 state is held in the driver's decoder until the sequence completes.

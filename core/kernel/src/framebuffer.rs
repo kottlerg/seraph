@@ -131,10 +131,19 @@ impl FramebufferWriter
             }
             _ =>
             {
-                let cp = match self.decoder.push(byte)
+                let mut outcome = self.decoder.push(byte);
+                if outcome == DecodeOutcome::Truncated
+                {
+                    // SAFETY: framebuffer is valid; cursor is bounded by max_cols/max_rows.
+                    unsafe {
+                        self.draw_codepoint(REPLACEMENT_CODEPOINT);
+                    }
+                    outcome = self.decoder.push(byte);
+                }
+                let cp = match outcome
                 {
                     DecodeOutcome::Codepoint(cp) => cp,
-                    DecodeOutcome::Invalid => REPLACEMENT_CODEPOINT,
+                    DecodeOutcome::Invalid | DecodeOutcome::Truncated => REPLACEMENT_CODEPOINT,
                     DecodeOutcome::NeedMore => return,
                 };
                 // SAFETY: framebuffer is valid; cursor is bounded by max_cols/max_rows.

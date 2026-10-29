@@ -1037,8 +1037,10 @@ pub struct SvcmgrEndowment
 /// `CAPS` round an empty terminal round ([`end_endowment`]) lets svcmgr
 /// leave its round loop and exit; after a failed `SUBSTRATE` round the real
 /// terminal `LOGD_SOURCES` round follows, and svcmgr runs without the
-/// remaining substrates. Any other failure has already woken svcmgr with an
-/// error (it exits) or left its state unknown, so init receives nothing
+/// remaining substrates. A `NO_CHILD` failure of the terminal round itself
+/// leaves svcmgr blocked in its round loop with nothing more from init, and
+/// init skips the handover. Any other failure has already woken svcmgr with
+/// an error (it exits) or left its state unknown, so init receives nothing
 /// further.
 ///
 /// Returns whether svcmgr holds its endowment through a delivered terminal

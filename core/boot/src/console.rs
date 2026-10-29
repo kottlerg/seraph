@@ -99,7 +99,11 @@ pub unsafe fn init_framebuffer(fb: &FramebufferInfo)
     // SAFETY: FramebufferWriter::new requires a valid framebuffer; caller ensures this.
     let writer = unsafe { FramebufferWriter::new(fb) };
     // Called from step 1, never inside a console write, so the cell is free.
-    let _ = CONSOLE.try_with(|console| console.fb = writer);
+    let installed = CONSOLE.try_with(|console| console.fb = writer);
+    debug_assert!(
+        installed.is_some(),
+        "init_framebuffer ran inside a console write"
+    );
 }
 
 /// Write a string to both serial and framebuffer backends.
@@ -208,4 +212,35 @@ macro_rules! bprintln {
         $crate::console::console_write_fmt(::core::format_args!($($arg)*));
         $crate::console::console_write_str("\r\n");
     }};
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    fn cell() -> ConsoleCell
+    {
+        ConsoleCell {
+            busy: AtomicBool::new(false),
+            state: UnsafeCell::new(Console { fb: None }),
+        }
+    }
+
+    /// A call made while another holds the cell (panic re-entry) is turned
+    /// away without running, and the cell is free again once the outer call
+    /// returns.
+    #[test]
+    fn nested_call_is_turned_away_and_the_cell_is_released_after()
+    {
+        let console = cell();
+        let mut inner_ran = false;
+        let outer = console.try_with(|_| {
+            let inner = console.try_with(|_| inner_ran = true);
+            assert!(inner.is_none());
+        });
+        assert!(outer.is_some());
+        assert!(!inner_ran);
+        assert_eq!(console.try_with(|_| 7), Some(7));
+    }
 }

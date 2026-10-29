@@ -200,23 +200,7 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
     }
     else
     {
-        // FAT32 extended BPB: FSInfo sector LBA at offset 48 (2 bytes). A value
-        // of 0 or 0xFFFF means "no FSInfo sector"; the caller holds the
-        // u32::MAX sentinel in those cases so the allocator skips the load and
-        // falls back to a full FAT scan. The FSInfo sector lives in the
-        // reserved region; one named past it lies in a FAT copy or the data
-        // region, where writing the hints back would corrupt the volume, so
-        // it is treated as absent too.
-        let fsinfo = u16::from_le_bytes([sector_data[48], sector_data[49]]);
-        let fsinfo_sector = if fsinfo != 0 && fsinfo != 0xFFFF && fsinfo < reserved_sectors
-        {
-            Some(u32::from(fsinfo))
-        }
-        else
-        {
-            None
-        };
-        (FatType::Fat32, fsinfo_sector)
+        (FatType::Fat32, fsinfo_sector(sector_data, reserved_sectors))
     };
 
     check_fat_capacity(fat_type, fat_size, bytes_per_sector, total_clusters)?;
@@ -240,6 +224,21 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
         fat_type,
         fsinfo_sector,
     })
+}
+
+/// The FAT32 `FSInfo` sector a BPB names, or `None` when it names none.
+///
+/// The extended BPB holds the sector's LBA at offset 48 (2 bytes). A value
+/// of 0 or 0xFFFF means "no `FSInfo` sector"; the caller holds the
+/// `u32::MAX` sentinel in those cases so the allocator skips the load and
+/// falls back to a full FAT scan. The `FSInfo` sector lives in the reserved
+/// region; one named past it lies in a FAT copy or the data region, where
+/// writing the hints back would corrupt the volume, so it is treated as
+/// absent too.
+fn fsinfo_sector(sector_data: &[u8; SECTOR_SIZE], reserved_sectors: u16) -> Option<u32>
+{
+    let fsinfo = u16::from_le_bytes([sector_data[48], sector_data[49]]);
+    (fsinfo != 0 && fsinfo != 0xFFFF && fsinfo < reserved_sectors).then_some(u32::from(fsinfo))
 }
 
 /// Refuse a cluster count the FAT cannot describe.

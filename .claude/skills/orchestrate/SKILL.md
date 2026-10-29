@@ -52,8 +52,9 @@ maintainer when it comes up:
    next one. Call `ListAgents` and compare it against the worker ids the record lists as
    active; a worker that is not listed, whose last report was not its gate and whose worktree
    is gone (`git worktree list`), is dead: log it and respawn it with its plan and every answer
-   already given folded into the prompt. A worker that is not listed but whose worktree remains
-   is resumed with a message. Also check whether any PR at its gate (clean verdicts, CI green)
+   already given folded into the prompt. A worker that is not listed, whose last report was not
+   its gate and that awaits no answer or grant, but whose worktree remains, is sent a message
+   asking for a status report. Also check whether any PR at its gate (clean verdicts, CI green)
    is waiting on a merge. Do nothing else." Cancel it when the batch ends.
 
 ## Spawn
@@ -66,9 +67,9 @@ prompt of this shape; nothing in it repeats the agent file:
 > maintainer changed for this batch, and any Issue-specific decision already made>.
 
 A documentation-only scope may run on `model: sonnet`; everything that compiles stays on the
-agent file's default. Record the agent id and the scope in the record file; the id is the
-address for every later message, and the record lists it as active until the worker's last PR
-merges or a respawn replaces it.
+agent file's default. Record the agent id, the scope, the branch, the worktree path and, once
+opened, the PR number in the record file; the id is the address for every later message, and
+the record lists it as active until the worker's last PR merges or a respawn replaces it.
 
 A respawn prompt also carries the dead worker's classified item list, its mechanism choices and
 every answer already given, marked as decisions already made, so the new worker neither

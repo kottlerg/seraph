@@ -41,6 +41,9 @@ services/svctest/
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
         ├── fs_ipc.rs          # Raw `FS_*` IPC against vfsd and fatfs
         ├── fs_std.rs          # `std::fs` over the FS IPC contract
+        ├── fs_faults/
+        │   ├── mod.rs         # Own fatfs under block faults: failed writes, removes, renames
+        │   └── ramdisk.rs     # RAM FAT16 volume and block server with armed faults
         ├── pwrmgr.rs          # Shutdown cap-deny check and terminal shutdown
         ├── svcmgr.rs          # Late handover refused; publish gate; badged SEND; seed-only names
         └── timed.rs           # `SystemTime::now()` through svcmgr and timed
@@ -149,11 +152,13 @@ token falls through to the normal run.
 Phases spawn these programs from `/programs/`: `hello` (procmgr, pipes), `stdiotest` and
 `pipefault` (pipes), `stackoverflow` and `relrofault` (process faults), `capexhaust`
 (recv guard), `demandpaged` (pager), and `fsbench` (FS IPC). The devmgr orphan-teardown
-phase has devmgr spawn the [`test-orphan`](../drivers/test-orphan/README.md) driver. The FS,
-namespace, and procmgr phases read `/data/test.txt`; the FS phases also read the build-synthesised
-`/data/svctest/large.bin` and write their scratch files under `/data/svctest/`; and `fsbench`,
-spawned by the `fs_crossover_bench` phase, reads the build-synthesised
-`/data/svctest/bench.bin`. The sysroot placement of all of these is listed in
+phase has devmgr spawn the [`test-orphan`](../drivers/test-orphan/README.md) driver. The
+`fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
+delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it
+down with `DESTROY_PROCESS`. The FS, namespace, and procmgr phases read `/data/test.txt`; the FS
+phases also read the build-synthesised `/data/svctest/large.bin` and write their scratch files
+under `/data/svctest/`; and `fsbench`, spawned by the `fs_crossover_bench` phase, reads the
+build-synthesised `/data/svctest/bench.bin`. The sysroot placement of all of these is listed in
 [docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout).
 
 ---

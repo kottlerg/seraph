@@ -41,18 +41,6 @@ pub fn next_cluster(
 /// [`FatError::Corrupt`] when `cluster` lies outside the data region, or
 /// its FAT entry is the bad-cluster marker or names a cluster outside the
 /// data region; [`FatError::Io`] when the FAT sector cannot be read.
-// clippy::too_many_lines: chain_next resolves the on-disk FAT entry for
-// a cluster under FAT16 or FAT32. Both variants share the sector-lookup,
-// cache-check, and sector-load logic; they differ only in the entry-width
-// arithmetic and the end-of-chain sentinel. Extracting two parallel
-// helpers duplicates the cache path; extracting a "load FAT sector"
-// helper that returns `&[u8]` would then require every caller to repeat
-// the entry-width branch. The branches are short and sit right where the
-// shared state is constructed.
-#[allow(clippy::too_many_lines)]
-// Justification: FAT16/FAT32 branches share structure but differ in entry
-// widths and end-of-chain markers; extracting sub-functions would obscure
-// the symmetry.
 pub fn chain_next(
     state: &mut FatState,
     cluster: u32,

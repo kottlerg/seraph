@@ -337,56 +337,25 @@ unsafe fn drive_batch(mv: &CapMove, batches: &mut u32, backstop: u32) -> MoveSte
 }
 
 /// Drop the object reference a freed source slot held; frees the object if
-/// that was the last reference.
-///
-/// A `Thread`, `CSpace`, or `AddressSpace` whose last reference goes here
-/// is queued for this CPU's deferred reclaim (drained at the next syscall
-/// epilogue or idle loop) rather than torn down in place, and may be bound
-/// to the running thread (see core/kernel/docs/capability-internals.md
-/// § Move). Every other type frees in place through `dealloc_object`, which
-/// may take `DERIVATION_LOCK` and the frame allocator, and for a Notification
-/// or `EventQueue` first waits for the timer's in-flight wakeup batch
-/// (`sched::sleep_wakeups_quiesce`), a bounded wait that completes only when
-/// no IPC, scheduler, or sleep-list lock is held; hence the lock
-/// preconditions below, which every call site meets.
+/// that was the last reference, through
+/// [`release_ref`](super::object::release_ref), which states where each type
+/// is freed. The source slot's object may be bound to the running thread
+/// (see core/kernel/docs/capability-internals.md § Move), which is why the
+/// `Thread`, `CSpace`, and `AddressSpace` frees are deferred there.
 ///
 /// # Safety
 ///
 /// - `obj` must carry an outstanding reference the caller owns — the one the
 ///   freed source slot held, as reported by [`MoveStep::Done`].
-/// - Syscall context with interrupts disabled: the deferred-reclaim push
-///   needs a stable CPU index.
-/// - Must NOT be called with `DERIVATION_LOCK` held, nor with any IPC source,
-///   per-TCB `sched_lock`, per-CPU scheduler, or sleep-list lock held (the
-///   preconditions `dealloc_object` states).
+/// - The remaining preconditions are `release_ref`'s: syscall context with
+///   interrupts disabled, and no `DERIVATION_LOCK`, IPC source, per-TCB
+///   `sched_lock`, per-CPU scheduler, or sleep-list lock held.
 #[cfg(not(test))]
 pub unsafe fn release_moved_object(obj: NonNull<KernelObjectHeader>)
 {
-    use super::object::{ObjectType, dealloc_object, push_deferred_reclaim};
-
-    // SAFETY: obj was a live capability object when the move began and the
-    // freed source slot's reference is still outstanding.
-    if unsafe { obj.as_ref().dec_ref() } != 0
-    {
-        return;
-    }
-    // SAFETY: refcount reached 0; no slot references the object.
-    match unsafe { obj.as_ref().obj_type }
-    {
-        ObjectType::Thread | ObjectType::CSpaceObj | ObjectType::AddressSpace =>
-        {
-            let cpu = crate::arch::current::cpu::current_cpu() as usize;
-            // SAFETY: refcount 0, exclusively owned, a linkable type;
-            // syscall context with interrupts disabled, so the CPU index
-            // is stable.
-            unsafe { push_deferred_reclaim(cpu, obj) };
-        }
-        _ =>
-        {
-            // SAFETY: refcount 0; no other references exist.
-            unsafe { dealloc_object(obj) };
-        }
-    }
+    // SAFETY: forwarded caller contract; the freed source slot's reference
+    // is the one released.
+    unsafe { super::object::release_ref(obj) };
 }
 
 /// Host-test variant: the harness leaks its objects, so only the count is

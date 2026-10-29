@@ -52,6 +52,15 @@ pub const TRAP_FRAME_BYTES: u64 = syscall_abi::REGS_RISCV64_SIZE as u64;
 /// field a register-file edit redirects.
 pub const IP_OFFSET: usize = syscall_abi::REGS_RISCV64_IP_OFFSET;
 
+/// Byte offset of the syscall-number register (`a7`) in the kernel
+/// `TrapFrame`: it holds the number of the syscall a thread is blocked in, and
+/// no syscall return writes it.
+pub const SYSCALL_NR_OFFSET: usize = 128;
+
+/// Byte offset of the second argument register (`a1`) in the kernel
+/// `TrapFrame`: written only by a successful syscall's secondary return.
+pub const ARG1_OFFSET: usize = 80;
+
 /// Execute an instruction defined to be illegal (`unimp`), so the calling
 /// thread takes an illegal-instruction trap here. Never returns: with no
 /// fault handler bound the kernel kills the thread in the trap, and a handler

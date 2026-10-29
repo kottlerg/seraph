@@ -484,14 +484,28 @@ unsafe fn clear_sip_ssip()
 /// Main trap dispatch routine.
 ///
 /// Called with interrupts disabled (sstatus.SIE is cleared on trap entry).
+///
+/// `frame` is the live frame `trap_entry` built on this hart's kernel stack.
+/// It is held as a raw pointer, and each access derives a reference for that
+/// access alone: the trap can block or be switched out (a syscall, a fault
+/// delivery, a timer-tick preemption), during which other paths access the
+/// same frame through the thread's published `trap_frame`
+/// (`SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS`, the FS/VS clear in
+/// `fpu::switch_out_save`), so no reference may live across those points
+/// (core/kernel/docs/arch-interface.md § `trap_frame`).
 #[cfg(not(test))]
 // too_many_lines: the single scause dispatch (interrupt, syscall, user fault,
 // kernel fault) stays one function so the trap-frame ownership and SIE
 // discipline read in one place.
 #[allow(clippy::too_many_lines)]
-extern "C" fn trap_dispatch(frame: &mut TrapFrame)
+extern "C" fn trap_dispatch(frame: *mut TrapFrame)
 {
-    let scause = frame.scause;
+    // SAFETY: trap_entry passes this hart's live, valid frame; these reads
+    // end here, before anything can block (the same holds for every frame
+    // access in this function: each is a single read or write, or a call that
+    // cannot block).
+    let (scause, sstatus_at_entry, stval) =
+        unsafe { ((*frame).scause, (*frame).sstatus, (*frame).stval) };
     let is_interrupt = scause >> 63 != 0;
     let cause_code = scause & !(1u64 << 63);
 
@@ -523,18 +537,16 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
             }
             _ =>
             {
-                crate::kprintln!(
-                    "unknown interrupt: scause={:#x} sepc={:#x}",
-                    scause,
-                    frame.sepc
-                );
+                // SAFETY: a single read of the live frame (see the top).
+                let sepc = unsafe { (*frame).sepc };
+                crate::kprintln!("unknown interrupt: scause={:#x} sepc={:#x}", scause, sepc);
                 crate::fatal("unhandled interrupt");
             }
         }
     }
     else if cause_code == 2
-        && (frame.sstatus & (1 << 8)) == 0
-        && super::fpu::is_fp_or_v_opcode(frame.stval)
+        && (sstatus_at_entry & (1 << 8)) == 0
+        && super::fpu::is_fp_or_v_opcode(stval)
     {
         // U-mode illegal-instruction trap on an F/D/V opcode: lazy enable
         // by promoting sstatus.FS / sstatus.VS from Off to Initial, then
@@ -559,27 +571,33 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
             }
         };
         // SAFETY: ring-0 trap context; lazy_restore_fp_v handles the null
-        // area branch internally (no restore, just FS/VS promotion).
+        // area branch internally (no restore, just FS/VS promotion). The
+        // frame reference lives only for the call, which cannot block.
         unsafe {
-            super::fpu::lazy_restore_fp_v(area, frame);
+            super::fpu::lazy_restore_fp_v(area, &mut *frame);
         }
     }
     else if cause_code == 8
     {
         // U-mode ecall: dispatch via the kernel syscall table.
-        let sepc_before = frame.sepc;
+        // SAFETY: a single read of the live frame (see the top).
+        let sepc_before = unsafe { (*frame).sepc };
         // SAFETY: frame is a valid TrapFrame on the kernel stack; trap_entry constructed
         // it with correct layout; pointer passed to syscall dispatcher.
         unsafe {
-            crate::syscall::dispatch(core::ptr::from_mut(frame));
+            crate::syscall::dispatch(frame);
         }
         // Advance sepc past the ecall instruction ONLY if dispatch did
         // not modify sepc. SYS_THREAD_WRITE_REGS may redirect a blocked
         // thread to a new instruction pointer; in that case sepc is
-        // already the target address and must not be incremented.
-        if frame.sepc == sepc_before
-        {
-            frame.sepc += 4;
+        // already the target address and must not be incremented. The
+        // frame is re-read after the dispatch, which may have blocked.
+        // SAFETY: single accesses of the live frame (see the top).
+        unsafe {
+            if (*frame).sepc == sepc_before
+            {
+                (*frame).sepc += 4;
+            }
         }
     }
     else
@@ -607,12 +625,12 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
             let instr = cause_code == 12;
             // SAFETY: S-mode; the faulting hart's satp is still active (no
             // context switch since trap entry — SIE is clear).
-            if unsafe { super::paging::user_fault_is_spurious(frame.stval, write, instr) }
+            if unsafe { super::paging::user_fault_is_spurious(stval, write, instr) }
             {
                 // SAFETY: S-mode; drops the stale TLB entry so the retried
                 // instruction re-walks the now-satisfying mapping.
                 unsafe {
-                    super::paging::flush_page(frame.stval);
+                    super::paging::flush_page(stval);
                 }
                 return;
             }
@@ -636,7 +654,9 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
             let handler_bound = !tcb.is_null() && unsafe { crate::ipc::fault::has_handler(tcb) };
             if handler_bound
             {
-                let info = fault_info_for(cause_code, frame);
+                // SAFETY: the shared reference lives only for the call, which
+                // reads the frame and cannot block.
+                let info = fault_info_for(cause_code, unsafe { &*frame });
                 // SAFETY: frame is the live trap frame on this kernel stack; the
                 // redirect points trap_frame at it for the handler's reg access
                 // and returns whether to resume.
@@ -664,8 +684,12 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
                 riscv_exception_name(cause_code),
                 scause
             );
-            crate::kprintln_serial!("  sepc={:#018x}  stval={:#018x}", frame.sepc, frame.stval);
-            dump_riscv_regs(frame);
+            // SAFETY: the shared reference lives only for these reads and the
+            // dump, none of which can block; a declined fault delivery that
+            // blocked has already returned.
+            let live = unsafe { &*frame };
+            crate::kprintln_serial!("  sepc={:#018x}  stval={:#018x}", live.sepc, live.stval);
+            dump_riscv_regs(live);
 
             if !tcb.is_null()
             {
@@ -720,11 +744,16 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
             // store=15, instruction=12) whose sepc lies in the `copy_user` faultable
             // region is an unmapped or read-only user buffer. Redirect to the fixup
             // — which clears SUM and returns an error sentinel — instead of
-            // panicking.
+            // panicking. An S-mode trap is taken by the kernel thread itself, so
+            // no other path reaches this frame; the reference lives for the
+            // trap's remaining, non-blocking work.
+            // SAFETY: frame is the live frame (see the top); nothing below
+            // blocks before `fatal` or the return.
+            let live = unsafe { &mut *frame };
             if matches!(cause_code, 12 | 13 | 15)
-                && let Some(fixup) = super::cpu::user_copy_fixup(frame.sepc)
+                && let Some(fixup) = super::cpu::user_copy_fixup(live.sepc)
             {
-                frame.sepc = fixup;
+                live.sepc = fixup;
                 return;
             }
 
@@ -734,9 +763,9 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
                 riscv_exception_name(cause_code),
                 scause
             );
-            crate::kprintln!("  sepc={:#x}  stval={:#x}", frame.sepc, frame.stval);
+            crate::kprintln!("  sepc={:#x}  stval={:#x}", live.sepc, live.stval);
             crate::kprintln!("  sstatus={:#x}  satp={:#x}", sstatus_val, satp_val);
-            dump_riscv_regs_console(frame);
+            dump_riscv_regs_console(live);
             crate::fatal("unhandled kernel exception");
         }
     }
@@ -746,15 +775,19 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
     // address here means the TrapFrame was corrupted — sret would jump
     // to kernel text in U-mode and immediately instruction-page-fault.
     // Bit-63 test: the kernel half has bit 63 set in every paging mode,
-    // and no user sepc can (user_va_top <= 1 << 56).
-    if frame.scause == 8 && frame.sepc >> 63 != 0
+    // and no user sepc can (user_va_top <= 1 << 56). The frame is re-read
+    // here, after whatever blocking the trap did.
+    // SAFETY: the shared reference lives only for these reads, which cannot
+    // block.
+    let live = unsafe { &*frame };
+    if live.scause == 8 && live.sepc >> 63 != 0
     {
         crate::kprintln!(
             "BUG: ecall return sepc={:#x} in kernel range on cpu {}",
-            frame.sepc,
+            live.sepc,
             super::cpu::current_cpu()
         );
-        crate::kprintln!("  ra={:#x} sp={:#x} a7={:#x}", frame.ra, frame.sp, frame.a7);
+        crate::kprintln!("  ra={:#x} sp={:#x} a7={:#x}", live.ra, live.sp, live.a7);
         crate::fatal("TrapFrame sepc corruption");
     }
 }
@@ -823,7 +856,9 @@ fn normalize_riscv_exception(cause: u64) -> u64
 /// needed: `(*tcb).trap_frame` is pointed at the live trap `frame` for the
 /// duration of the block, so the handler's `SYS_THREAD_READ_REGS` /
 /// `SYS_THREAD_WRITE_REGS` read and edit the faulting registers in place, and
-/// `sret` restores the same frame on resume.
+/// `sret` restores the same frame on resume. `frame` is a raw pointer, and this
+/// function forms no reference to it: the handler's edits land while this
+/// thread blocks inside `fault_dispatch`.
 ///
 /// # Safety
 /// `tcb` is the current user thread and has a bound handler; `frame` is the live
@@ -831,7 +866,7 @@ fn normalize_riscv_exception(cause: u64) -> u64
 #[cfg(not(test))]
 unsafe fn redirect_user_fault(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
-    frame: &mut TrapFrame,
+    frame: *mut TrapFrame,
     info: &crate::ipc::fault::FaultInfo,
 ) -> bool
 {
@@ -846,10 +881,9 @@ unsafe fn redirect_user_fault(
     // SAFETY: tcb valid; trap_frame is the pointer the register syscalls read
     // while this thread is BlockedOnFault.
     unsafe {
-        (*tcb).trap_frame.store(
-            core::ptr::from_mut(frame),
-            core::sync::atomic::Ordering::Relaxed,
-        );
+        (*tcb)
+            .trap_frame
+            .store(frame, core::sync::atomic::Ordering::Relaxed);
     }
 
     // SAFETY: handler bound; trap_frame points at the live frame; no lock held.

@@ -6,7 +6,7 @@
 //! Stress: stop a waiter while a sender's delivery is claiming its park,
 //! alone and then racing a second stop, then delete the source and the
 //! stopped waiter, in that order, so a `Stopped` thread whose park binding a
-//! lost cancel left for its waker, or a won cancel's tail left behind, is
+//! lost cancel left for its waker, or a won cancel left behind, is
 //! torn down after the source it is bound to.
 //!
 //! ## The hazard
@@ -21,30 +21,30 @@
 //! a `Stopped` thread with a dangling pointer to its source: deleting the
 //! source's last capability frees the source, and deleting the thread's last
 //! capability makes `dealloc_object(Thread)`'s drain lock the freed source
-//! through that binding (#501). The abort arm clears the binding under the
+//! through that binding. The abort arm clears the binding under the
 //! thread's `sched_lock`, so the later deletes find nothing to unlink
 //! (`enqueue_and_wake` in core/kernel/src/sched/mod.rs;
 //! core/kernel/docs/thread-lifecycle-and-sleep.md § `sys_thread_stop`
 //! Cross-CPU Stop Protocol, step 2).
 //!
-//! The cancel that wins its claim has a sibling hazard in its own tail.
-//! `cancel_ipc_block` (core/kernel/src/syscall/thread.rs) claims the park
-//! under the source's lock and, on a won claim, clears the binding in its
-//! tail. A tail that cleared it only while the thread was still `Blocked`
-//! would let a second stop, or an object teardown, that commits `Stopped` or
-//! `Exited` between the claim and the tail leave the binding on a thread no
-//! waker will ever reach, and the thread's delete walks the freed source
-//! through it just the same. The tail clears a won claim's binding whatever
-//! state another commit wrote meanwhile.
+//! The cancel that wins its claim has a sibling hazard. `cancel_ipc_block`
+//! (core/kernel/src/syscall/thread.rs) claims the park under the source's
+//! lock, held together with the thread's `sched_lock`
+//! (`ipc::lock_bound_source`), and clears a won claim's binding inside that
+//! same hold. A clear made later, and only while the thread was still
+//! `Blocked`, would let a second stop, or an object teardown, that commits
+//! `Stopped` or `Exited` between the claim and the clear leave the binding on
+//! a thread no waker will ever reach, and the thread's delete would walk the
+//! freed source through it just the same.
 //!
 //! The claim itself must take only the park the stop snapshotted. The
 //! sender may claim that park and the waiter loop into a fresh wait on the
 //! same source before the cancel takes the source lock. A cancel that
-//! removed the fresh park would find the tail's `park_seq` test failing, and
-//! the retried pass nothing left to claim, so the stop would commit
-//! `Stopped` over a binding to a source the waiter is no longer queued on.
-//! The cancel removes the waiter only while its `park_seq` equals the
-//! snapshot, so the retry claims and clears the fresh park instead.
+//! removed the fresh park would claim a park its stop never saw, and the
+//! stop would commit `Stopped` over a binding to a source the waiter is no
+//! longer queued on. The cancel re-reads the binding, `park_seq` included,
+//! under the thread's `sched_lock` and claims only while it still names the
+//! snapshotted park, so the retry claims and clears the fresh park instead.
 //!
 //! ## How this exercises it
 //!

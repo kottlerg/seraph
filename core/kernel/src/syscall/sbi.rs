@@ -26,6 +26,10 @@
 //! reported as `SyscallError::NotSupported`; no secondary return register is
 //! written. See core/kernel/docs/syscalls.md § `SYS_SBI_CALL` (44).
 
+#[cfg(not(test))]
+use super::UserFrame;
+// The host-test stubs keep the arch frame type in their signatures.
+#[cfg(test)]
 use crate::arch::current::trap_frame::TrapFrame;
 
 #[cfg(not(test))]
@@ -80,7 +84,7 @@ fn sbi_required_right(extension: u64) -> Option<crate::cap::slot::SbiRights>
 
 /// `SYS_SBI_CALL` handler — RISC-V implementation.
 #[cfg(not(test))]
-pub fn sys_sbi_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_sbi_call(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::syscall::current_tcb;
 

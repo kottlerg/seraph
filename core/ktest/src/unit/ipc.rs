@@ -1147,7 +1147,7 @@ extern "C" fn dup_reply_caller_entry(arg: u64) -> !
 /// Exercises the generation-mismatch branch of the reply direction's
 /// pre-validation — a distinct rejection cause from the duplicate-index
 /// branch `reply_duplicate_cap_slot_rejected` covers, routed through the
-/// same `fail_reply_and_wake_caller` wake.
+/// same post-claim `deposit_transfer_failed_reply` wake.
 pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)

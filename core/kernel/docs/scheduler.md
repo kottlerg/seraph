@@ -613,10 +613,9 @@ Otherwise, by target state:
 
 The syscall writes `cpu_affinity`, reads `preferred_cpu` and `state`, and performs the
 migration under the target's `sched_lock`, and prods the acting CPU after releasing it.
-`lookup_cap` does not pin the target Thread (see
-[capability-internals.md](capability-internals.md) § Storage: Hybrid Two-Level Radix and
-[#502](https://github.com/kottlerg/seraph/issues/502)), so the outcomes above hold only absent
-a concurrent free of the target.
+`lookup_cap` pins the target Thread for the call (see
+[capability-internals.md](capability-internals.md) § Storage: Hybrid Two-Level Radix), so a
+concurrent delete of its last capability frees it only after the call returns.
 
 ### Soft Affinity
 

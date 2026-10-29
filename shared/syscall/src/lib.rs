@@ -1225,7 +1225,9 @@ pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u
 ///
 /// Deleting the last capability to the caller's own `CSpace` or
 /// `AddressSpace` (directly, or through the teardown cascade) stops the
-/// caller: the call never returns. Deleting the caller's own Thread
+/// caller: the call never returns (or, when another thread's syscall still
+/// pins the object, returns, and the stop follows when that syscall
+/// releases it). Deleting the caller's own Thread
 /// capability is refused instead. A teardown of a Thread left `current` on a
 /// CPU that `fatal` halted, or of a `CSpace` or `AddressSpace` with such a
 /// thread bound, never completes, so the call does not return
@@ -1806,9 +1808,9 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 /// the stop is in progress, the blocking syscall returns `Interrupted` once
 /// the thread is restarted, unless its wake was claimed first, or a timed
 /// wait or sleep that found the kernel's sleep list full withdrew itself
-/// first (it then returns its timeout or `OutOfMemory`). The kernel's
-/// known exceptions (#501) are listed in `core/kernel/docs/syscalls.md`
-/// § `SYS_THREAD_STOP`. A thread may stop itself (pass its own thread cap).
+/// first (it then returns its timeout or `OutOfMemory`); the full contract is
+/// in `core/kernel/docs/syscalls.md` § `SYS_THREAD_STOP`. A thread may stop
+/// itself (pass its own thread cap).
 ///
 /// If the thread is blocked on a fault, its fault episode is cancelled with a
 /// kill outcome, unless the handler's reply claimed it first, in which case
@@ -1820,7 +1822,10 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 ///
 /// If the thread is running on another CPU, the call returns once that CPU
 /// has descheduled it and published its register save, or once an object
-/// teardown has made it `Exited`. A caller that is itself stopped while it
+/// teardown, or the target's own exit, has made it `Exited` (a stop landing
+/// inside the target's exit returns `Ok`, and the exit commits `Exited` over
+/// it, so a later [`thread_start`] returns `InvalidArgument`). A caller that is
+/// itself stopped while it
 /// waits returns at once when restarted if `thread_cap` no longer names the
 /// target with Control rights, even while the target still runs, and
 /// otherwise keeps waiting as above; [`thread_read_regs`] and
@@ -1879,8 +1884,8 @@ pub fn thread_set_priority(thread_cap: u32, priority: u8, sched_cap: u32) -> Res
 /// stopped, or not-yet-started thread observes the new affinity on its next
 /// enqueue (a wake, or `SYS_THREAD_START` on start or resume).
 ///
-/// See `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_AFFINITY` for the known
-/// defect (#502).
+/// See `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_AFFINITY` for the
+/// call's full contract.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` if the thread cap

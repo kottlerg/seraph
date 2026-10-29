@@ -28,6 +28,7 @@ mod concurrent_ipc;
 mod concurrent_map_unmap;
 mod concurrent_notification;
 mod configure_start_race;
+mod copy_source_delete;
 mod cspace_recycle;
 mod double_enqueue_storm;
 mod event_queue_fill_drain;
@@ -37,6 +38,7 @@ mod idle_wake_race;
 mod load_balance_handoff_steal;
 mod mutual_stop;
 mod priority_dealloc_race;
+mod reply_caller_delete;
 mod retype_concurrent;
 mod sleep_list_full;
 mod split_delete_race;
@@ -48,7 +50,9 @@ mod stop_repark;
 mod stop_reply_race;
 mod stop_resume_race;
 mod stop_sleep_window;
+mod stop_source_delete;
 mod stop_target_vanishes;
+mod thread_cap_delete_under_use;
 mod thread_churn;
 mod timed_wait_reuse;
 mod timed_wait_source_delete;
@@ -117,6 +121,7 @@ pub fn run_all(ctx: &TestContext)
 {
     run_integration_test!("stress::cap_tree_deep", cap_tree_deep::run(ctx));
     run_integration_test!("stress::cspace_recycle", cspace_recycle::run(ctx));
+    run_integration_test!("stress::copy_source_delete", copy_source_delete::run(ctx));
     run_integration_test!(
         "stress::event_queue_fill_drain",
         event_queue_fill_drain::run(ctx)
@@ -149,6 +154,12 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "stress::stop_target_vanishes",
         stop_target_vanishes::run(ctx)
+    );
+    run_integration_test!("stress::stop_source_delete", stop_source_delete::run(ctx));
+    run_integration_test!("stress::reply_caller_delete", reply_caller_delete::run(ctx));
+    run_integration_test!(
+        "stress::thread_cap_delete_under_use",
+        thread_cap_delete_under_use::run(ctx)
     );
     run_integration_test!(
         "stress::timed_wait_source_delete",

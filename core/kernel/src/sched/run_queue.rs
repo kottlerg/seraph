@@ -257,7 +257,7 @@ pub struct PerCpuScheduler
 
     /// Head of this CPU's deferred reclaim stack (#341): objects whose free
     /// `crate::cap::object::push_deferred_reclaim` defers (its rustdoc lists the
-    /// producers: self-teardowns and `cap::transfer::release_moved_object`),
+    /// producers: self-teardowns and `cap::object::release_ref`),
     /// completed later by `crate::cap::object::drain_deferred_reclaim`. Typed
     /// opaquely (`*mut u8`, really `*mut cap::object::KernelObjectHeader`) to
     /// avoid a sched→cap layering edge; the object module owns the cast and the

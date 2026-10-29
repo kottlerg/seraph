@@ -333,6 +333,177 @@ pub(crate) unsafe fn interrupt_all_waiters(queue: &mut WaitQueue)
     }
 }
 
+/// A parked thread's source lock held together with that thread's
+/// `sched_lock`, as [`lock_bound_source`] returns them. [`Self::unlock`]
+/// releases both.
+#[cfg(not(test))]
+pub(crate) struct BoundSource
+{
+    source_lock: *const crate::sync::Spinlock,
+    source_saved: u64,
+    tcb: *mut ThreadControlBlock,
+    sched_saved: u64,
+}
+
+#[cfg(not(test))]
+impl BoundSource
+{
+    /// Release the source lock, then the thread's `sched_lock`, in the reverse
+    /// of their acquisition so each restores the interrupt state it saved.
+    ///
+    /// # Safety
+    /// `self` came from [`lock_bound_source`], and both locks are still held.
+    pub(crate) unsafe fn unlock(self)
+    {
+        // SAFETY: both locks are held (caller contract); each unlock_raw is
+        // paired with the acquisition in lock_bound_source.
+        unsafe {
+            (*self.source_lock).unlock_raw(self.source_saved);
+            (*self.tcb).sched_lock.unlock_raw(self.sched_saved);
+        }
+    }
+}
+
+/// Lock the IPC source that `tcb`'s park binding names, provided the binding
+/// is still `(ipc_state, blocked_on)` — and, with `park_seq`, still that
+/// park — holding `tcb`'s `sched_lock` from the re-read through the source
+/// acquisition. Returns both locks held, or `None`, holding none, when the
+/// binding no longer matches: the park was claimed or ended, and its claimant
+/// owns the binding's retirement.
+///
+/// The binding is the only path a canceller or a dying thread's drain has to
+/// the source, and nothing pins the source through it. A binding observed
+/// under the bound thread's `sched_lock` names a source that is not yet freed,
+/// for as long as that lock is held: a source's teardown claims each queued
+/// waiter in its drain, and the claim's `enqueue_and_wake` nulls the binding
+/// under the waiter's `sched_lock` before the source is freed; and a waker
+/// that claimed the thread and released the source lock before its
+/// `enqueue_and_wake` keeps the source alive until that wake nulls the
+/// binding — a syscall through its pin ([`crate::syscall::PinnedCap`]), the
+/// sleep timer through `sched::sleep_wakeups_quiesce`, `waitset_notify` through
+/// the notifying source's lock that the wait set's teardown must take, and a
+/// canceller or a drain through the `sched_lock` it holds across its claim
+/// and its binding clear, and `endpoint_recv`'s refused reply rebind through
+/// the same hold (`sched::commit_reply_rebind_under_local_lock`). The wakers
+/// that hold no such guarantee are open defects: device IRQ delivery (#561),
+/// fault delivery (#538), and the death post (#539). The source lock is taken
+/// under the `sched_lock`,
+/// the inverse of the canonical order (core/kernel/docs/scheduling-internals.md
+/// § Lock Hierarchy), so it is only try-locked: on contention both locks are
+/// dropped and the re-read repeats, letting a holder that wants this thread's
+/// `sched_lock` (a drain's or a waker's `enqueue_and_wake`) finish.
+///
+/// `ipc_state` must be a source-blocking state: `BlockedOnSend` or
+/// `BlockedOnRecv` (an `EndpointState`), `BlockedOnNotification`,
+/// `BlockedOnEventQueue`, or `BlockedOnWaitSet`; any other returns `None`.
+///
+/// # Safety
+/// `tcb` must be a valid TCB. The caller must hold no IPC source lock, no
+/// `sched_lock`, no per-CPU scheduler lock, and not `SLEEP_LIST_LOCK`; it MAY
+/// hold `THREAD_REGISTRY_LOCK`, which orders before all of them.
+#[cfg(not(test))]
+pub(crate) unsafe fn lock_bound_source(
+    tcb: *mut ThreadControlBlock,
+    ipc_state: crate::sched::thread::IpcThreadState,
+    blocked_on: *mut u8,
+    park_seq: Option<u32>,
+) -> Option<BoundSource>
+{
+    if blocked_on.is_null()
+    {
+        return None;
+    }
+    loop
+    {
+        // SAFETY: tcb is valid (contract); lock_raw is paired with an
+        // unlock_raw on every path, or handed to the returned BoundSource.
+        let sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
+        // SAFETY: the binding pair and park_seq are read under sched_lock,
+        // which serialises their writers.
+        let bound = unsafe {
+            (*tcb).ipc_state == ipc_state
+                && core::ptr::eq((*tcb).blocked_on_object, blocked_on)
+                && park_seq.is_none_or(|seq| {
+                    (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed) == seq
+                })
+        };
+        let source_lock = if bound
+        {
+            // SAFETY: the binding names blocked_on under the held sched_lock,
+            // so the source is not yet freed (see above).
+            unsafe { source_lock_of(ipc_state, blocked_on) }
+        }
+        else
+        {
+            None
+        };
+        let Some(source_lock) = source_lock
+        else
+        {
+            // SAFETY: paired with the lock_raw above.
+            unsafe { (*tcb).sched_lock.unlock_raw(sched_saved) };
+            return None;
+        };
+        // SAFETY: source_lock is the live source's lock (bound, above).
+        if let Some(source_saved) = unsafe { (*source_lock).try_lock_raw() }
+        {
+            return Some(BoundSource {
+                source_lock,
+                source_saved,
+                tcb,
+                sched_saved,
+            });
+        }
+        // Contended: back off with neither lock held, so a holder of the
+        // source lock that needs this thread's sched_lock can finish.
+        // SAFETY: paired with the lock_raw above.
+        unsafe { (*tcb).sched_lock.unlock_raw(sched_saved) };
+        for _ in 0..64
+        {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// The lock of the source state `blocked_on` points at, typed by the
+/// source-blocking `ipc_state`; `None` for any other state.
+///
+/// # Safety
+/// `blocked_on` must point at a live source state of the type `ipc_state`
+/// names. Only the lock field's address is computed; nothing is read.
+// cast_ptr_alignment: blocked_on_object stores a type-erased pointer to the
+// source state ipc_state names, whose allocation guarantees its alignment.
+#[allow(clippy::cast_ptr_alignment)]
+#[cfg(not(test))]
+unsafe fn source_lock_of(
+    ipc_state: crate::sched::thread::IpcThreadState,
+    blocked_on: *mut u8,
+) -> Option<*const crate::sync::Spinlock>
+{
+    use crate::sched::thread::IpcThreadState;
+
+    // SAFETY: blocked_on points at a live state of the named type (contract),
+    // so each field projection stays in bounds of that allocation.
+    unsafe {
+        match ipc_state
+        {
+            IpcThreadState::BlockedOnSend | IpcThreadState::BlockedOnRecv => Some(
+                core::ptr::addr_of!((*blocked_on.cast::<endpoint::EndpointState>()).lock),
+            ),
+            IpcThreadState::BlockedOnNotification => Some(core::ptr::addr_of!(
+                (*blocked_on.cast::<notification::NotificationState>()).lock
+            )),
+            IpcThreadState::BlockedOnEventQueue => Some(core::ptr::addr_of!(
+                (*blocked_on.cast::<event_queue::EventQueueState>()).lock
+            )),
+            IpcThreadState::BlockedOnWaitSet => Some(core::ptr::addr_of!(
+                (*blocked_on.cast::<wait_set::WaitSetState>()).lock
+            )),
+            _ => None,
+        }
+    }
+}
+
 pub mod endpoint;
 pub mod event_queue;
 pub mod fault;

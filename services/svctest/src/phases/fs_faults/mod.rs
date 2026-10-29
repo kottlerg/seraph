@@ -290,7 +290,7 @@ fn write_dropped_leaves_cache_unchanged(fs: &OwnFatfs, disk: &SharedDisk)
     let (dir, lba) = fs.case_dir(disk, b"W1");
     let file = create_with_content(dir, b"W1.BIN");
     let data_lba = RamDisk::cluster_lba(first_entry_cluster(disk, lba));
-    let new: Vec<u8> = CONTENT.iter().map(|b| b.to_ascii_uppercase()).collect();
+    let new: Vec<u8> = CONTENT.iter().map(u8::to_ascii_uppercase).collect();
 
     lock(disk).arm(data_lba, 0, Fault::DropWrite);
     let got = fs_write_inline(file, 0, &new, ipc_buf);

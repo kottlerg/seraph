@@ -49,10 +49,9 @@
 
 use boot_protocol::BootInfo;
 
+use super::PAGE_SIZE;
 // Production-only imports (linker symbols and arch paging are unavailable
 // when running unit tests on the host).
-#[cfg(not(test))]
-use super::PAGE_SIZE;
 #[cfg(not(test))]
 use crate::arch::current::paging as arch_paging;
 
@@ -216,7 +215,8 @@ impl MapOutcome
 /// Number of 4 KiB frames in the static boot table pool.
 ///
 /// 256 frames = 1 MiB of BSS. Supports direct-mapping up to ≈ 248 GiB of RAM
-/// (1 PML4 + 1 PDPT + 248 PDs) plus 6 frames for the kernel image and stack.
+/// (1 PML4 + 1 PDPT + 248 PDs) plus 6 frames for the kernel image and stack,
+/// less one page table per 2 MiB direct-map chunk split for kernel MMIO.
 /// Increase this constant to support larger systems; rebuild is required.
 pub const BOOT_TABLE_POOL_SIZE: usize = 256;
 
@@ -330,6 +330,29 @@ impl PoolState
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Whether `[base, base + len)` overlaps any `(base, size)` region in `regions`.
+fn span_overlaps_regions(base: u64, len: u64, regions: &[(u64, u64)]) -> bool
+{
+    let end = base.saturating_add(len);
+    regions
+        .iter()
+        .any(|&(r_base, r_size)| r_base < end && base < r_base.saturating_add(r_size))
+}
+
+/// Flags of the direct-map page at `phys`: read-write, never executable, and
+/// uncacheable exactly when the page overlaps one of the kernel's own MMIO
+/// `regions`, so their memory type never depends on the firmware's MTRRs
+/// (`core/kernel/docs/arch-interface.md` § `paging`).
+fn direct_map_page_flags(phys: u64, regions: &[(u64, u64)]) -> PageFlags
+{
+    PageFlags {
+        readable: true,
+        writable: true,
+        executable: false,
+        uncacheable: span_overlaps_regions(phys, PAGE_SIZE as u64, regions),
+    }
+}
 
 /// Scan the memory map for the highest `physical_base + size` across all
 /// RAM-backed entries.
@@ -448,19 +471,38 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), PagingError>
         }
     }
 
+    // Kernel-internal MMIO regions (xAPIC + I/O APIC bases on x86-64; none on
+    // RISC-V, whose PLIC and UART take their device memory type from the
+    // platform PMAs). Bases come from `BootInfo.kernel_mmio` directly because
+    // `crate::platform::capture_kernel_mmio` does not run until Phase 4.
+    let mut mmio_regions = [(0u64, 0u64); 16];
+    let mmio_count = crate::arch::current::platform::collect_mmio_direct_map_regions(
+        &info.kernel_mmio,
+        &mut mmio_regions,
+    );
+    let mmio_regions = &mmio_regions[..mmio_count];
+
     // ── Direct physical map ───────────────────────────────────────────────────
     // Map [0, max_phys_rounded) at the direct-map base using 2 MiB large
-    // pages. The framebuffer MMIO (if above max_phys) is handled separately
-    // below.
-    let rw = PageFlags {
-        readable: true,
-        writable: true,
-        executable: false,
-        uncacheable: false,
-    };
+    // pages, except a 2 MiB chunk holding a kernel MMIO page: that chunk is
+    // mapped as 4 KiB pages so the MMIO pages can be uncacheable while the
+    // rest stay write-back (`direct_map_page_flags`). The framebuffer MMIO
+    // (if above max_phys) is handled separately below.
     let mut phys: u64 = 0;
     while phys < max_phys_rounded
     {
+        if span_overlaps_regions(phys, LARGE_PAGE_SIZE, mmio_regions)
+        {
+            let chunk_end = phys + LARGE_PAGE_SIZE;
+            while phys < chunk_end
+            {
+                let flags = direct_map_page_flags(phys, mmio_regions);
+                arch_paging::map_page(root_va, dm_base + phys, phys, flags, &mut pool)?;
+                phys += PAGE_SIZE as u64;
+            }
+            continue;
+        }
+        let rw = direct_map_page_flags(phys, &[]);
         arch_paging::map_large_page(root_va, dm_base + phys, phys, rw, &mut pool)?;
         phys += LARGE_PAGE_SIZE;
     }
@@ -474,39 +516,23 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), PagingError>
     // ── Framebuffer (only if above direct map range) ──────────────────────────
     map_framebuffer_if_needed(root_va, info, max_phys_rounded, &mut pool)?;
 
-    // ── Architecture-specific MMIO regions ────────────────────────────────────
-    // Ask the arch layer which kernel-internal MMIO regions need to be mapped
-    // (xAPIC + I/O APIC bases on x86-64; nothing on RISC-V, where the PLIC and
-    // UART sit below the RAM ceiling and are covered by the large-page direct
-    // map). Bases come from `BootInfo.kernel_mmio` directly because
-    // `crate::platform::capture_kernel_mmio` does not run until Phase 4.
-    let mut mmio_regions = [(0u64, 0u64); 16];
-    let mmio_count = crate::arch::current::platform::collect_mmio_direct_map_regions(
-        &info.kernel_mmio,
-        &mut mmio_regions,
-    );
-    for &(phys_base, size) in &mmio_regions[..mmio_count]
+    // ── Kernel MMIO above the RAM ceiling ─────────────────────────────────────
+    // A region below the ceiling was mapped uncacheable by the direct-map loop
+    // above; one above it gets its own uncacheable 4 KiB pages here.
+    for &(phys_base, size) in mmio_regions
     {
         if phys_base < max_phys_rounded
         {
-            continue; // already covered by the large-page direct map
+            continue; // mapped by the direct-map loop
         }
         let page_mask = !(PAGE_SIZE as u64 - 1);
         let start = phys_base & page_mask;
         let end = (phys_base + size + PAGE_SIZE as u64 - 1) & page_mask;
-        // Write-back, like the large-page direct map that covers a region below
-        // the ceiling: the memory type of these device pages comes from the
-        // firmware's MTRRs (#515).
-        let rw = PageFlags {
-            readable: true,
-            writable: true,
-            executable: false,
-            uncacheable: false,
-        };
         let mut phys = start;
         while phys < end
         {
-            arch_paging::map_page(root_va, dm_base + phys, phys, rw, &mut pool)?;
+            let flags = direct_map_page_flags(phys, mmio_regions);
+            arch_paging::map_page(root_va, dm_base + phys, phys, flags, &mut pool)?;
             phys += PAGE_SIZE as u64;
         }
     }
@@ -726,6 +752,46 @@ mod tests
 {
     use super::*;
     use boot_protocol::{MemoryMapEntry, MemoryMapSlice, MemoryType};
+
+    // ── Kernel MMIO in the direct map ────────────────────────────────────────
+
+    /// The xAPIC page at its architectural default, below a >4 GiB RAM ceiling.
+    const LAPIC: (u64, u64) = (0xFEE0_0000, 0x1000);
+
+    #[test]
+    fn direct_map_marks_exactly_the_kernel_mmio_pages_uncacheable()
+    {
+        let regions = [LAPIC];
+        assert!(direct_map_page_flags(LAPIC.0, &regions).uncacheable);
+        assert!(!direct_map_page_flags(LAPIC.0 - 0x1000, &regions).uncacheable);
+        assert!(!direct_map_page_flags(LAPIC.0 + 0x1000, &regions).uncacheable);
+        let wb = direct_map_page_flags(LAPIC.0, &[]);
+        assert!(wb.writable && !wb.executable && !wb.uncacheable);
+    }
+
+    #[test]
+    fn only_the_large_page_chunk_holding_kernel_mmio_is_split()
+    {
+        let regions = [LAPIC];
+        let chunk = LAPIC.0 & !(LARGE_PAGE_SIZE - 1);
+        assert!(span_overlaps_regions(chunk, LARGE_PAGE_SIZE, &regions));
+        assert!(!span_overlaps_regions(
+            chunk - LARGE_PAGE_SIZE,
+            LARGE_PAGE_SIZE,
+            &regions
+        ));
+        assert!(!span_overlaps_regions(
+            chunk + LARGE_PAGE_SIZE,
+            LARGE_PAGE_SIZE,
+            &regions
+        ));
+        // A region ending exactly where a chunk begins does not overlap it.
+        assert!(!span_overlaps_regions(
+            0x20_0000,
+            LARGE_PAGE_SIZE,
+            &[(0x1F_F000, 0x1000)]
+        ));
+    }
 
     // ── phys_to_virt / virt_to_phys ──────────────────────────────────────────
 

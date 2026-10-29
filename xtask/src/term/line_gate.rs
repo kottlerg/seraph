@@ -243,8 +243,8 @@ mod tests
     #[test]
     fn marker_without_newline_does_not_open_gate()
     {
-        // Marker present but the line never terminates: gate must not
-        // open. (Caller's responsibility to ensure newlines arrive.)
+        // Marker present but the line is unterminated and below
+        // `MAX_LINE_BYTES`: the gate must not open yet.
         let input = b"[--------] boot: no newline yet";
         assert_eq!(run(input), b"");
     }

@@ -9,10 +9,10 @@
 //! `input-send-event` (interactive-input test), `migrate` + `query-migrate`
 //! and `quit` (snapshot-resume test).
 //!
-//! Hand-rolled (no JSON dependency): the messages are built by `format!`
-//! from fixed templates, the one caller-supplied free-form string (the
-//! migrate URI) JSON-escaped by `json_string`, and responses are matched
-//! by substring. QMP messages are newline-delimited JSON.
+//! Hand-rolled (no JSON dependency): the messages are fixed strings or
+//! `format!` templates, the one free-form value (the migrate URI)
+//! JSON-escaped by `json_string`, and responses are matched by substring.
+//! QMP messages are newline-delimited JSON.
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};

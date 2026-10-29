@@ -46,12 +46,14 @@
 //! one sequence is not idiomatic and is safer to discard wholesale than
 //! to attempt to rewrite.
 //!
-//! Interrupted sequences: an `ESC` inside an escape sequence cancels it,
-//! as it does in a terminal. The buffered bytes are dropped and the
-//! `ESC` starts a fresh sequence, screened on its own, so a blocklisted
-//! sequence cannot reach the tty nested inside another (`ESC ESC c`,
-//! `ESC [ ESC c`, `ESC ] 4;x ESC c`). An OSC whose `ESC` is not followed
-//! by `\` is unterminated and is dropped the same way.
+//! Interrupted sequences: an `ESC` inside an escape sequence ends it.
+//! The buffered bytes are dropped and the `ESC` starts a fresh sequence,
+//! screened on its own, so a blocklisted sequence cannot reach the tty
+//! nested inside another (`ESC ESC c`, `ESC [ ESC c`, `ESC ] 4;x ESC c`).
+//! For an `ESC` or a CSI this matches the terminal, which cancels the
+//! interrupted sequence too. An OSC whose `ESC` is not followed by `\` is
+//! unterminated; a terminal may still dispatch it, but the filter drops
+//! it, since a malformed OSC is safer discarded than emitted.
 //!
 //! The filter is a pure byte-stream parser — no I/O beyond the wrapped
 //! writer, no platform code, no allocation beyond a small reusable
@@ -164,11 +166,12 @@ impl<W: Write> FilterWriter<W>
     }
 
     /// Drop the in-progress sequence and start a fresh one at the `ESC`
-    /// that interrupted it. A terminal treats an `ESC` inside a sequence
-    /// the same way (it cancels the sequence and begins a new escape), so
-    /// the dropped bytes would not take effect there either; and the new
-    /// sequence is screened on its own instead of being emitted inside the
-    /// old one (`ESC [ ESC c` would otherwise reach the tty as a RIS).
+    /// that interrupted it, so the new sequence is screened on its own
+    /// instead of being emitted inside the old one (`ESC [ ESC c` would
+    /// otherwise reach the tty as a RIS). For an `ESC` or a CSI the
+    /// terminal cancels the interrupted sequence too, so nothing it would
+    /// act on is lost; an interrupted OSC, which a terminal may dispatch,
+    /// is dropped on purpose as malformed (see the module docs).
     fn restart_at_esc(&mut self)
     {
         self.pending.clear();

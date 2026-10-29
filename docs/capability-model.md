@@ -198,10 +198,10 @@ into outlives its own last capability until that Mmio object is freed. A range's
 bounded: at most 64 copies of one boot-minted or split capability's range are live at once,
 and a further copy returns `QuotaExceeded`.
 
-Deleting or revoking an Mmio capability whose mapping lies in the caller's own address
-space therefore withdraws memory the caller's code may still reference, as unmapping it
-would; the userspace wrappers for those calls stay safe functions, and making them `unsafe`
-for this case is recorded on
+Deleting, revoking, or splitting an Mmio capability whose mapping lies in the caller's own
+address space therefore withdraws memory the caller's code may still reference, as unmapping
+it would; the userspace wrappers for those calls (`cap_delete`, `cap_revoke`, `mmio_split`)
+stay safe functions, and making them `unsafe` for this case is recorded on
 [#558](https://github.com/kottlerg/seraph/issues/558).
 
 ### Thread

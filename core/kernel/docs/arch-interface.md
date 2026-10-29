@@ -734,7 +734,9 @@ pub unsafe fn gdt::load_iopb(iopb: Option<&[u8; IOPB_SIZE]>);
 /// Permit an I/O port range in a thread's IOPB (x86-64); no-op on RISC-V.
 pub fn gdt::permit_port_range(iopb: &mut [u8; IOPB_SIZE], base: u32, count: u32);
 /// Make every CPU reload its TSS IOPB before its next ring-3 port access, after a
-/// thread's bitmap lost ports (x86-64); no-op on RISC-V.
+/// thread's bitmap changed while it may be running on another CPU (an IoPort
+/// binding withdrawn, or a bind of a thread other than the caller) (x86-64);
+/// no-op on RISC-V.
 pub fn gdt::invalidate_all_iopbs();
 /// Load a per-CPU GDT and TSS on an AP (x86-64); no-op on RISC-V.
 pub unsafe fn gdt::init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64);

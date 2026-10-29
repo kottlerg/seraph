@@ -651,9 +651,11 @@ unsafe fn iopb_offset_of<'a>(tss: *mut TssWithIopb) -> &'a core::sync::atomic::A
 /// If `iopb` is `Some`, the bitmap is copied from the thread's per-thread IOPB.
 /// If `None`, the bitmap is filled with 0xFF (all ports denied).
 ///
-/// Called on every context switch (with `None` when the incoming thread has
-/// no port bindings), by the I/O-port bind syscall when it binds the calling
-/// thread, and by [`reload_invalidated_iopb`].
+/// Called on every context switch: for an incoming non-idle thread under its
+/// `sched_lock`, in the hold that marks it running (with `None` when it has
+/// no port bindings), and with `None` for the idle thread, which runs no
+/// ring-3 code. Also called by the I/O-port bind syscall when it binds the
+/// calling thread, and by [`reload_invalidated_iopb`].
 ///
 /// # Safety
 /// Must be called with interrupts disabled or from a single-CPU context.
@@ -687,8 +689,11 @@ pub unsafe fn load_iopb(iopb: Option<&[u8; IOPB_SIZE]>)
 /// `iopb_offset` to [`IOPB_OFFSET_INVALID`], so the next port access on each
 /// raises `#GP`, whose handler reloads the running thread's current bitmap
 /// ([`reload_invalidated_iopb`]) and retries the instruction. A CPU that
-/// context-switches in the meantime loads its incoming thread's bitmap under
-/// that thread's `sched_lock` and marks it current, which is equally fresh.
+/// context-switches in the meantime loads its incoming thread's bitmap (the
+/// all-denied one for a thread with no bindings) under that thread's
+/// `sched_lock` and marks it current, which is equally fresh; only the idle
+/// thread, which runs no ring-3 code, gets its all-denied bitmap outside a
+/// thread lock.
 /// The trailing fence makes the stores visible to every CPU before this
 /// returns, so no port access after the return reads a stale bitmap.
 #[cfg(not(test))]

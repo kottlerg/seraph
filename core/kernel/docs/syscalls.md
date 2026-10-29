@@ -1132,12 +1132,15 @@ MMIO mappings are never executable, and mapping writability is derived from the
 attribute unconditionally.
 
 The `mmio_cap`'s object records the mapping, holding a reference on the address space, before
-any page is mapped. When the object is freed, because `mmio_cap` (or the copy it is) was deleted
-or revoked through an ancestor, every recorded mapping is unmapped with TLB shootdown, except a
+any page is mapped. When the object is freed, because `mmio_cap` (or the copy it is) was deleted,
+consumed by a split, or revoked through an ancestor, every recorded mapping is unmapped with TLB
+shootdown, except a
 page the address space has since remapped to other memory (see
 [capability-model.md](../../../docs/capability-model.md) § Mmio). One object records at most
 `MMIO_MAX_MAPPINGS` (4) mappings; mapping it again at the same `virt` of the same address space
-reuses its record.
+reuses its record. A call that fails with `OutOfMemory` after the record is taken keeps the
+record and the pages it mapped (both go when the object is freed); a retry at the same `virt`
+reuses the record.
 
 **Capability requirements:** `aspace_cap` (Map), `mmio_cap` (Map).
 
@@ -1152,7 +1155,8 @@ failure).
 ### `SYS_MMIO_SPLIT` (45)
 
 Split an MMIO region capability into two non-overlapping child capabilities at a
-page-aligned byte offset. The original capability is consumed.
+page-aligned byte offset. The original capability is consumed, which frees its object and
+unmaps every mapping made through it as § `SYS_MMIO_MAP` describes.
 
 **Arguments:**
 
@@ -1169,7 +1173,10 @@ page-aligned byte offset. The original capability is consumed.
   success
 
 Both children inherit the original's rights and flags and are reparented to the
-original's derivation parent. The original `mmio_cap` is consumed.
+original's derivation parent. The original `mmio_cap` is consumed: its object is freed, so every
+`SYS_MMIO_MAP` mapping made through it is unmapped, with TLB shootdown, before the call returns
+(unless a concurrent syscall pins the object, then when that syscall releases it). A caller that
+needs the region mapped maps it again through a child.
 
 **Capability requirement:** `mmio_cap` must have Map rights.
 
@@ -1915,7 +1922,8 @@ structurally full).
 ### `SYS_IOPORT_SPLIT` (51)
 
 Split an IoPort capability into two non-overlapping child capabilities at a port number.
-The original capability is consumed.
+The original capability is consumed, which withdraws every binding made through it as
+§ `SYS_IOPORT_BIND` describes.
 
 **x86-64 only.** On RISC-V this syscall returns `NotSupported`.
 
@@ -1934,7 +1942,10 @@ The original capability is consumed.
   success
 
 Both children inherit the original's rights and are reparented to the original's
-derivation parent. The original `ioport_cap` is consumed.
+derivation parent. The original `ioport_cap` is consumed: every binding made through it is
+withdrawn from every bound thread (the caller included), its bitmap rebuilt and every CPU's TSS
+IOPB invalidated, before the call returns (unless a concurrent syscall pins the object, then when
+that syscall releases it). A caller that needs the ports binds a child afterwards.
 
 **Capability requirement:** `ioport_cap` must have Use rights.
 

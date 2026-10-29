@@ -132,9 +132,9 @@ pub fn illegal_instruction() -> !
 /// an `IoPort` cap for two otherwise unused ports, split off the wide cap.
 ///
 /// Carves move upward through the wide cap, so this carve of 0x4E0 must run
-/// after `integration::ioport_revoke` carves 0x4D0 (the integration order
-/// runs the arch scenarios first); reordering them turns that case into a
-/// SKIP.
+/// after `integration::ioport_revoke` carves 0x4D0 (`integration::run_all`
+/// runs `crate::arch::run_integration` before `range_copy_lineage`);
+/// reordering them turns that case into a SKIP.
 pub fn fresh_range_root(_ctx: &TestContext) -> Option<u32>
 {
     ioport::carve_port_range(0x4E0, 2)

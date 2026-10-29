@@ -909,6 +909,16 @@ pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 /// two capability handles: the lower covers `[base, base+split_offset)` and
 /// the upper `[base+split_offset, end)`.
 ///
+/// Consuming the original frees its object, which unmaps every [`mmio_map`]
+/// mapping made through it, with TLB shootdown, before the call returns
+/// (or, when a concurrent syscall still pins the object, when that syscall
+/// releases it); a caller that needs the region mapped maps it again through
+/// a child (`core/kernel/docs/syscalls.md` § `SYS_MMIO_SPLIT`). A mapping in
+/// the caller's own address space is withdrawn although its Rust code may
+/// still reference it; this wrapper stays a safe function, and making it
+/// `unsafe` for that case is recorded on
+/// [#558](https://github.com/kottlerg/seraph/issues/558).
+///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid
 /// (`InvalidCapability`) or lacks Map (`InsufficientRights`), or
@@ -1001,7 +1011,10 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 /// values outside that range with `InvalidArgument` before loading the cap.
 /// The original cap is consumed on success; both children inherit the
 /// parent's rights. Returns `(lower_handle, upper_handle)`, two capability
-/// handles.
+/// handles. Consuming the original withdraws every [`ioport_bind`] binding
+/// made through it, from every bound thread on every CPU (the caller
+/// included); bind a child to keep the port access
+/// (`core/kernel/docs/syscalls.md` § `SYS_IOPORT_SPLIT`).
 ///
 /// On RISC-V: always returns `NotSupported`.
 ///
@@ -1862,9 +1875,9 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 ///   carries the Write right, and never executable.
 /// - All pages are mapped uncacheable (PCD|PWT on `x86_64`, Svpbmt
 ///   PBMT=IO on `riscv64`).
-/// - The mapping lasts while `mmio_cap` does: deleting it, or revoking an
-///   ancestor of it, unmaps the mapping (`core/kernel/docs/syscalls.md`
-///   § `SYS_MMIO_MAP`).
+/// - The mapping lasts while `mmio_cap` does: deleting it, consuming it with a
+///   split, or revoking an ancestor of it unmaps the mapping
+///   (`core/kernel/docs/syscalls.md` § `SYS_MMIO_MAP`).
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned or
@@ -1872,7 +1885,9 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 /// `InsufficientRights` (a cap lacks Map), `InvalidArgument` (MMIO region
 /// size zero, unaligned, or overflowing), `QuotaExceeded` (the cap's object
 /// already records 4 other mappings), or `OutOfMemory` (page-table growth
-/// pool exhausted; refill with [`cap_create_aspace`] in augment mode).
+/// pool exhausted; refill with [`cap_create_aspace`] in augment mode). An
+/// `OutOfMemory` failure keeps the mapping's record and the pages already
+/// mapped; a retry at the same `virt` reuses the record.
 ///
 /// # Safety
 /// The contract of [`mem_map`], for the span the MMIO region covers at

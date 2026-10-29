@@ -1277,9 +1277,9 @@ pub struct AddressSpaceObject
     /// ([`drain_deferred_reclaim`]). Non-null only while this object sits on
     /// that stack: the thread that dropped its last capability was itself
     /// bound to it (or was stopped by a concurrent teardown while freeing
-    /// it), or `release_ref` dropped its last reference (a syscall pin, or a
-    /// batched capability move's freed source), so the free completes
-    /// off-CPU. Written only by the owning CPU.
+    /// it), or `release_ref` dropped its last reference (a syscall pin, a
+    /// batched capability move's freed source, or an Mmio object's mapping
+    /// record), so the free completes off-CPU. Written only by the owning CPU.
     pub deferred_next: *mut KernelObjectHeader,
 }
 

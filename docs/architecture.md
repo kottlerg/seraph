@@ -142,8 +142,11 @@ Three of the kernel's object types make up what userspace calls a process:
 - **Thread** — a schedulable unit of execution with a saved register state, a priority,
   and bindings to an AddressSpace, a CSpace, and an IPC buffer.
 - **AddressSpace** — a virtual address space with a page table root and a set of frame mappings.
-  When the last capability to an AddressSpace (or a CSpace) is deleted, every thread bound to it is
-  stopped (see [capability-model.md](capability-model.md#kill-process-pattern)).
+  When the last capability to an AddressSpace (or a CSpace) is deleted and the object is freed,
+  every thread bound to it is stopped (see
+  [capability-model.md](capability-model.md#kill-process-pattern)); an AddressSpace an Mmio
+  capability's object records a mapping into is freed only when that Mmio object is freed (see
+  [capability-model.md](capability-model.md#mmio)).
 - **CSpace** — a capability space: a growable array of capability slots that a thread
   uses to name kernel objects.
 
@@ -184,15 +187,15 @@ and init looks each module up by name there.
 
 Device drivers run as unprivileged userspace processes. No driver code executes in
 kernel space. Hardware access is granted explicitly via capabilities and is fully
-revocable: deleting or revoking the capability an MMIO mapping or a port binding was made
-through withdraws it.
+revocable: deleting the capability an MMIO mapping or a port binding was made through,
+consuming it with a split, or revoking an ancestor of it withdraws it.
 
 **MMIO**
 Physical MMIO regions are mapped into a driver’s address space under capability
 control. Once mapped, drivers access registers directly without kernel mediation.
 Revoking an Mmio capability unmaps, with TLB shootdown, every mapping made through its
-descendants, before the revoke returns unless a concurrent syscall still holds a descendant
-(then when that syscall releases it); the revoked capability itself is preserved, so
+descendants before the revoke returns (a descendant a concurrent syscall still holds has its
+mappings unmapped when that syscall releases it); the revoked capability itself is preserved, so
 mappings made through it remain (see [capability-model.md](capability-model.md#mmio)).
 
 **Port I/O (x86‑64 only)**

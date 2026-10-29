@@ -69,8 +69,13 @@ pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
 
 /// Carve an `IoPort` cap covering exactly `[port, port + count)` out of the
 /// wide cap, store the residual (if any) as the new wide cap, and return the
-/// carved cap: a lineage root of its own, split from the wide cap. A request
-/// whose range falls outside the residual wide cap fails.
+/// carved cap: a lineage root of its own, split from the wide cap.
+///
+/// Returns `None` when `count` is 0, when the range falls outside the residual
+/// wide cap, or when an `ioport_split` fails. A failure at the second split
+/// (the one at `port + count`) comes after the first has consumed the old wide
+/// cap: the prefix cap for `[base, port)` stays in the `CSpace` and the wide
+/// cap is left narrowed to `[port, end)`.
 pub fn carve_port_range(port: u16, count: u16) -> Option<u32>
 {
     if count == 0

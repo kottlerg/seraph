@@ -2004,15 +2004,18 @@ fn idle_thread_entry(_cpu_id: u64) -> !
             let cpu = crate::arch::current::cpu::current_cpu() as usize;
 
             // Reclaim the objects queued on this CPU (#341): threads that
-            // self-deleted (marked Exited, queued for off-CPU reclaim) and
-            // the last references a syscall pin or a batched capability move
-            // dropped (`cap::object::release_ref`), whose `CSpace` or
-            // `AddressSpace` may still have live bound threads that the
-            // teardown stops here. The idle thread is a safe context: never
-            // one of the queued dead threads, bound to nothing, and — its
-            // time slice permanently zero — never descheduled inside the
-            // teardown's cross-CPU waits. Done with interrupts enabled,
-            // before the halt-decision masking below.
+            // self-deleted (marked Exited, queued for off-CPU reclaim), the
+            // last references a syscall pin or a batched capability move
+            // dropped, and the `AddressSpace` an Mmio object's mapping record
+            // held, released by that object's teardown
+            // (`MmioObject::withdraw_mappings`; all through
+            // `cap::object::release_ref`), whose `CSpace` or `AddressSpace`
+            // may still have live bound threads that the teardown stops here.
+            // The idle thread is a safe context: never one of the queued dead
+            // threads, bound to nothing, and — its time slice permanently
+            // zero — never descheduled inside the teardown's cross-CPU waits.
+            // Done with interrupts enabled, before the halt-decision masking
+            // below.
             // SAFETY: idle context on a valid kernel stack.
             unsafe { crate::cap::object::drain_deferred_reclaim(cpu) };
 
@@ -5294,11 +5297,14 @@ pub unsafe fn schedule(requeue: Requeue)
     // blocks), it is now off-queue and drained — fall back to idle this cycle
     // (the next tick re-schedules).
     //
-    // A dispatched `next`'s non-null IOPB is loaded into this CPU's TSS inside
-    // the same critical section: `SYS_IOPORT_BIND` installs and edits the bitmap
-    // under that `sched_lock` (core/kernel/docs/scheduling-internals.md §
-    // Cross-CPU TCB Ownership, Address-space / capability row). x86-64 only;
-    // `load_iopb` is a no-op on RISC-V, where `iopb` is always null.
+    // A dispatched `next`'s IOPB (its own bitmap, or the all-denied one when
+    // `iopb` is null) is loaded into this CPU's TSS inside the same critical
+    // section: `SYS_IOPORT_BIND` installs and edits the bitmap under that
+    // `sched_lock` (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
+    // Ownership, Address-space / capability row), so an
+    // `invalidate_all_iopbs` that a remote bind or withdrawal issues after
+    // this load is never overwritten by it. x86-64 only; `load_iopb` is a
+    // no-op on RISC-V, where `iopb` is always null.
     #[cfg(not(test))]
     let mut iopb_loaded = false;
     if !core::ptr::eq(next, sched.idle())
@@ -5339,11 +5345,8 @@ pub unsafe fn schedule(requeue: Requeue)
             #[cfg(not(test))]
             unsafe {
                 let iopb_ptr = (*next).iopb;
-                if !iopb_ptr.is_null()
-                {
-                    crate::arch::current::gdt::load_iopb(Some(&*iopb_ptr));
-                    iopb_loaded = true;
-                }
+                crate::arch::current::gdt::load_iopb(iopb_ptr.as_ref());
+                iopb_loaded = true;
             }
         }
         // SAFETY: paired with lock_raw above.
@@ -5462,8 +5465,10 @@ pub unsafe fn schedule(requeue: Requeue)
         }
     }
 
-    // A `next` whose IOPB the dispatch flip did not load (idle, or a thread with
-    // no port bindings) runs with the TSS IOPB filled with 0xFF (deny all).
+    // An idle `next` (dispatched as idle, or the fallback above), whose IOPB
+    // the dispatch flip did not load, runs with the TSS IOPB filled with 0xFF
+    // (deny all). Idle runs no ring-3 code, and the switch to the next user
+    // thread reloads the bitmap under that thread's `sched_lock`.
     #[cfg(not(test))]
     if !iopb_loaded
     {

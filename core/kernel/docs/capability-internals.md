@@ -215,9 +215,11 @@ The walk costs one `retype_free` per donation, holds no lock across records (eac
 its ancestor's locks, the Memory object's read lock and its retype-allocator lock, so unlike a
 `CSpace`'s derivation drain it is not batched), and runs to completion in whichever context drops
 the last reference: the deleting syscall, with interrupts masked on that CPU; or, when the owner is
-handed to the per-CPU deferred-reclaim stack — a thread deleting an object it is itself bound to, or
-the batched capability move releasing any `CSpace` or `AddressSpace` — the next syscall epilogue on
-that CPU, with interrupts masked, or the idle thread's drain, with interrupts enabled
+handed to the per-CPU deferred-reclaim stack (a thread deleting an object it is itself bound to, a
+syscall pin or a batched capability move dropping the last reference, or an Mmio object's mapping
+record releasing the address space at that object's teardown; the producer list is
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Self-teardown) — the next syscall
+epilogue on that CPU, with interrupts masked, or the idle thread's drain, with interrupts enabled
 ([scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy, "Bare spin locks"). So an
 owner's teardown latency scales with how finely it donated, and can land on an unrelated thread's
 syscall: the same memory donated as single pages costs one return per page. The standard runtime's
@@ -493,7 +495,7 @@ record unfilled. The object's dealloc arm runs `withdraw_mappings`: for each rec
 `AddressSpace::unmap_region_if_phys` clears, under `pt_lock`, each leaf that still maps the matching
 device page (a page the user has since remapped to other memory is left alone), then issues one TLB
 invalidation for the span on every CPU that runs the space, after the lock is released; the device
-frames are never reallocated, so nothing waits on the shootdown. The record's address-space
+frames are never reallocated, so no frame reuse waits on the shootdown. The record's address-space
 reference is then released through `release_ref`, so an address space it was the last reference to
 goes to this CPU's deferred reclaim, as for a syscall pin: an Mmio object can be freed in place
 inside IPC delivery, where an address-space teardown must not run.
@@ -520,10 +522,14 @@ the revoke raises `#GP`. The `#GP` handler (`gdt::reload_invalidated_iopb`) sees
 offset, reloads the running thread's current bitmap under its `sched_lock`, restores the
 offset, and retries the instruction: a port the thread still holds succeeds, one it lost
 faults again and is handled as a genuine `#GP`. A context switch loads its incoming
-thread's bitmap and restores the offset itself. A CPU's TSS is written only by that CPU,
-except for the offset, which `TssWithIopb`'s 2-byte alignment lets another CPU store
-atomically; any interleaving of a remote invalidation with a local reload leaves the CPU
-either invalidated or running a bitmap loaded under its thread's lock after the rebuild.
+thread's bitmap (the all-denied one for a thread with no bindings) and restores the offset
+itself, under that thread's `sched_lock` in the hold that marks it running, so a remote
+bind's or withdrawal's invalidation is never overwritten by a stale load; only a switch to the
+idle thread, which runs no ring-3 code, loads the all-denied bitmap outside a thread lock. A
+CPU's TSS is written only by that CPU, except for the offset, which `TssWithIopb`'s 2-byte
+alignment lets another CPU store atomically; any interleaving of a remote invalidation with a
+local reload leaves the CPU either invalidated or running a bitmap loaded under its thread's lock
+after the rebuild.
 
 ---
 

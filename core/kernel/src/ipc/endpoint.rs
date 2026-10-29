@@ -645,13 +645,17 @@ pub unsafe fn endpoint_recv(
     Err(())
 }
 
-/// Reply to the thread stored in `server.reply_tcb` with `msg`.
+/// Claim the caller bound in `server.reply_tcb` for a reply.
 ///
 /// Claims the reply binding (CAS `server.reply_tcb` from the bound caller to
-/// null) and stages `msg` in the caller's `ipc_msg`. Returns the claimed
-/// caller; the CAS win makes the syscall layer the episode's sole depositor,
-/// so it MUST finish the deposit (cap results), stamp the disposition (REPLY,
-/// or `fault_outcome` and the episode for a `BlockedOnFault` caller), and then
+/// null) and returns the claimed caller, before anything reads it: the claim
+/// is what keeps the caller live, because its `wake_in_flight` pin, set when
+/// its park published the binding, now waits for this claimant's wake, and a
+/// `dealloc_object(Thread)` of the caller waits for that pin before it frees
+/// the TCB. The CAS win makes the syscall layer the episode's sole depositor,
+/// so it MUST stage the reply (or the `IPC_REPLY_TRANSFER_FAILED` sentinel)
+/// in the caller's `ipc_msg`, stamp the disposition (REPLY, or
+/// `fault_outcome` and the episode for a `BlockedOnFault` caller), and then
 /// wake it with `enqueue_and_wake`. Returns `None` if no binding exists or a
 /// concurrent claimant won.
 ///
@@ -659,10 +663,7 @@ pub unsafe fn endpoint_recv(
 /// `server` must be the calling thread's valid TCB. Call with no scheduler or
 /// endpoint lock held.
 #[cfg(not(test))]
-pub unsafe fn endpoint_reply(
-    server: *mut ThreadControlBlock,
-    msg: &Message,
-) -> Option<*mut ThreadControlBlock>
+pub unsafe fn endpoint_reply(server: *mut ThreadControlBlock) -> Option<*mut ThreadControlBlock>
 {
     // SAFETY: server validated by syscall layer; reply_tcb field always valid in TCB.
     let caller = unsafe {
@@ -699,16 +700,13 @@ pub unsafe fn endpoint_reply(
         return None;
     }
 
-    // SAFETY: caller stored by endpoint_call/recv. State transitions
-    // committed by enqueue_and_wake at the call site. `caller.wake_in_flight`
-    // was set to 1 when the caller became BlockedOnReply (in endpoint_call /
-    // endpoint_recv, before publishing `reply_tcb`); enqueue_and_wake clears it
-    // once the wake commits. We won the reply_tcb CAS above, so no other
-    // claimant (dealloc / cancel) will touch the caller. See
-    // core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership.
-    unsafe {
-        (*caller).ipc_msg = *msg;
-    }
+    // `caller.wake_in_flight` was set to 1 when the caller became
+    // BlockedOnReply or BlockedOnFault (in endpoint_call / endpoint_recv,
+    // before publishing `reply_tcb`); the claimant's enqueue_and_wake clears
+    // it once the wake commits. We won the reply_tcb CAS above, so no other
+    // claimant (dealloc / cancel) touches the caller, and its dealloc waits
+    // for that wake. See core/kernel/docs/scheduling-internals.md § Cross-CPU
+    // TCB Ownership.
     Some(caller)
 }
 

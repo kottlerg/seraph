@@ -25,6 +25,10 @@
 // defined as u32 and always fit. No truncation occurs in practice.
 #![allow(clippy::cast_possible_truncation)]
 
+#[cfg(not(test))]
+use super::UserFrame;
+// The host-test stubs keep the arch frame type in their signatures.
+#[cfg(test)]
 use crate::arch::current::trap_frame::TrapFrame;
 use syscall::SyscallError;
 
@@ -145,7 +149,7 @@ unsafe fn release_src_ref(object: core::ptr::NonNull<crate::cap::object::KernelO
 /// On `dec_ref → 0`, auto-reclaim returns the bytes to the source Memory cap
 /// via [`crate::cap::object::dealloc_object`] consulting `header.ancestor`.
 #[cfg(not(test))]
-pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{EndpointObject, KernelObjectHeader, MemoryObject, ObjectType};
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
@@ -270,7 +274,7 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Auto-reclaim (`dec_ref → 0`) consults `header.ancestor` and credits bytes
 /// back to the source Memory cap.
 #[cfg(not(test))]
-pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_create_notification(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{KernelObjectHeader, MemoryObject, NotificationObject, ObjectType};
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
@@ -402,7 +406,7 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 // too_many_lines: create and augment modes share the source-cap resolution
 // and carve; each mode's construction and rollback read in sequence.
 #[allow(clippy::too_many_lines)]
-pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{
         AddressSpaceObject, KernelObjectHeader, MemoryObject, ObjectType, PagePool,
@@ -655,7 +659,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // too_many_lines: create and augment modes share the source-cap resolution
 // and carve; each failure arm's rollback reads beside its step.
 #[allow(clippy::too_many_lines)]
-pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::alloc_cspace_id;
     use crate::cap::cspace::CSpace;
@@ -919,7 +923,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // too_many_lines: the TCB is constructed field by field in place, and the
 // registration, revalidation, and rollback must stay in one sequence.
 #[allow(clippy::too_many_lines)]
-pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::arch::current::trap_frame::TrapFrame as ArchTF;
     use crate::cap::object::{
@@ -1190,15 +1194,16 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: thread_obj_ptr is in-place; header at offset 0.
     let nonnull = unsafe { NonNull::new_unchecked(thread_obj_ptr.cast::<KernelObjectHeader>()) };
 
-    // Revalidate both bindings now that the registry can find this TCB. A
-    // teardown of either object that ran between the lookups above and
-    // `register` walked a registry without this thread and may already have
-    // reclaimed the storage the TCB names. The last capability to the object
-    // is gone in that case, so a lookup that still resolves to the object
-    // snapshotted above (the pointer bound into the TCB, not the slot, which
-    // could have been recycled through a full generation cycle) proves it
-    // outlived the registration — and any teardown starting now finds this
-    // thread in the walk (docs/capability-model.md § "Kill process" pattern;
+    // Revalidate both bindings now that the registry can find this TCB. The
+    // lookups above pin both objects, so neither teardown can run before
+    // `register`; but if the last capability to either went meanwhile, its
+    // teardown runs when this syscall drops the pin, after the registration.
+    // A lookup that still resolves to the object snapshotted above (the
+    // pointer bound into the TCB, not the slot, which could have been recycled
+    // through a full generation cycle) proves a capability to it outlived the
+    // registration, so the thread is not created bound to an object nothing
+    // names any more; any teardown starting now finds this thread in the walk
+    // (docs/capability-model.md § "Kill process" pattern;
     // core/kernel/docs/scheduling-internals.md § Thread Registry).
     // SAFETY: caller_cspace validated non-null above.
     let bound = unsafe {
@@ -1252,46 +1257,6 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             Err(e)
         }
     }
-}
-
-/// Pre-grow `dest_cs_ptr` for `dest_idx` while holding a reference on the
-/// destination's wrapper (`dest_obj`): the pre-grow's holds are preemptible
-/// and the caller's destination lookup takes no reference, so without one a
-/// concurrent delete of the last capability to the destination could
-/// reclaim the wrapper under the walk. If that delete happens meanwhile, the
-/// reference dropped here is the last: the destination's teardown runs here
-/// and the caller gets `InvalidCapability`.
-///
-/// Residual: `lookup_cap` takes no reference on the object, so it is not
-/// pinned for the window from the `dec_ref` here to the caller's next touch
-/// of the destination under `DERIVATION_LOCK`
-/// (`core/kernel/docs/capability-internals.md` § Storage: Hybrid Two-Level
-/// Radix, #502).
-///
-/// # Safety
-/// `dest_obj` must be the header of the live `CSpaceKernelObject` wrapping
-/// `dest_cs_ptr`; no scheduler, IPC-source, registry, or derivation lock
-/// may be held (the teardown takes them).
-#[cfg(not(test))]
-unsafe fn pre_grow_holding_dest(
-    dest_obj: core::ptr::NonNull<crate::cap::object::KernelObjectHeader>,
-    dest_cs_ptr: *mut crate::cap::cspace::CSpace,
-    dest_idx: u32,
-) -> Result<(), SyscallError>
-{
-    // SAFETY: dest_obj is a live header per the caller contract.
-    unsafe { dest_obj.as_ref().inc_ref() };
-    let grown = pre_grow_for_explicit_slot(dest_cs_ptr, dest_idx);
-    // SAFETY: matches the inc_ref above.
-    let remaining = unsafe { dest_obj.as_ref().dec_ref() };
-    if remaining == 0
-    {
-        // SAFETY: refcount reached zero here; no slot references the object
-        // and no conflicting lock is held (caller contract).
-        unsafe { crate::cap::object::dealloc_object(dest_obj) };
-        return Err(SyscallError::InvalidCapability);
-    }
-    grown
 }
 
 /// Leaves materialised per `CSpace`-lock hold while pre-growing for an
@@ -1383,7 +1348,7 @@ fn pre_grow_for_explicit_slot(
 ///
 /// Returns the new capability's handle in the destination `CSpace`.
 #[cfg(not(test))]
-pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::CSpaceKernelObject;
     use crate::cap::slot::Rights;
@@ -1444,16 +1409,12 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Pre-grow for an explicit destination before the inc_ref and the
     // destination lock: bounded holds, budget fast-fail, nothing to roll
-    // back on failure. The destination wrapper is held across it.
+    // back on failure. `dest_cs_slot` pins the destination wrapper across it,
+    // so a concurrent delete of the destination's last capability frees the
+    // wrapper only after this syscall drops the pin.
     if dest_slot_idx != 0
     {
-        // May run the destination's teardown if its last capability went
-        // meanwhile (see pre_grow_holding_dest).
-        // SAFETY: dest_obj was the live wrapper at lookup; no lock held.
-        // `lookup_cap` takes no reference on the object, so it is not pinned
-        // for this block (`core/kernel/docs/capability-internals.md`
-        // § Storage: Hybrid Two-Level Radix, #502).
-        unsafe { pre_grow_holding_dest(dest_obj, dest_cs_ptr, dest_slot_idx)? };
+        pre_grow_for_explicit_slot(dest_cs_ptr, dest_slot_idx)?;
     }
 
     // Resolve the source only now, after the pre-grow's preemptible lock
@@ -1570,7 +1531,7 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Returns the new cap handle.
 #[cfg(not(test))]
-pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::Rights;
 
@@ -1680,7 +1641,7 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Returns the new cap handle.
 #[cfg(not(test))]
-pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::Rights;
 
@@ -1926,7 +1887,7 @@ unsafe fn resolve_delete_target(
 ///
 /// Idempotent: deleting a Null slot returns success.
 #[cfg(not(test))]
-pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_delete(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let slot_handle = tf.arg(0) as u32;
     let slot_idx = syscall::cap_handle_index(slot_handle);
@@ -2065,7 +2026,7 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///   derivation kept extending the subtree past `MAX_REVOKE_BATCHES`
 ///   batches. Everything revoked so far stays revoked; retry to continue.
 #[cfg(not(test))]
-pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_revoke(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let slot_handle = tf.arg(0) as u32;
     let slot_idx = syscall::cap_handle_index(slot_handle);
@@ -2289,7 +2250,7 @@ fn dealloc_revoked(snapshot: &[Option<core::ptr::NonNull<crate::cap::object::Ker
 ///
 /// Returns the destination cap handle.
 #[cfg(not(test))]
-pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_move(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::CSpaceKernelObject;
     use crate::cap::transfer::{MoveStep, move_cap_begin, move_cap_drive, release_moved_object};
@@ -2359,14 +2320,9 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             // Pre-grow for the explicit destination before the heavyweight
             // locks: bounded holds, budget fast-fail (see
-            // pre_grow_for_explicit_slot), the destination wrapper held
-            // across it. May run the destination's teardown if its last
-            // capability went meanwhile (see pre_grow_holding_dest).
-            // SAFETY: dest_obj was the live wrapper at lookup; no lock held.
-            // `lookup_cap` takes no reference on the object, so it is not pinned
-            // for this block (`core/kernel/docs/capability-internals.md`
-            // § Storage: Hybrid Two-Level Radix, #502).
-            unsafe { pre_grow_holding_dest(dest_obj, dest_cs_ptr, dest_idx)? };
+            // pre_grow_for_explicit_slot), the destination wrapper pinned
+            // across it by `dest_cs_slot`.
+            pre_grow_for_explicit_slot(dest_cs_ptr, dest_idx)?;
             Some(idx)
         }
     };
@@ -2428,7 +2384,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// with `POST | RECV` rights into the caller's `CSpace`, and returns the new
 /// cap handle.
 #[cfg(not(test))]
-pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{EventQueueObject, KernelObjectHeader, MemoryObject, ObjectType};
     use crate::cap::retype::{EVENT_QUEUE_RING_OFFSET, dispatch_for, retype_allocate, retype_free};
@@ -2544,7 +2500,7 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
 /// The Memory cap MUST carry `MemRights::RETYPE` and have at least
 /// `dispatch_for(WaitSet, 0).raw_bytes` of `available_bytes`.
 #[cfg(not(test))]
-pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType, WaitSetObject};
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
@@ -2655,7 +2611,7 @@ pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // shape for this read-only inquiry handler. Splitting it adds only indirection.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
-pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use core::sync::atomic::Ordering;
 
@@ -2672,7 +2628,6 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::sched::thread::ThreadState;
 
     let slot_handle = tf.arg(0) as u32;
-    let slot_idx = syscall::cap_handle_index(slot_handle);
     let field = tf.arg(1);
 
     // Resolve the caller's CSpace via its TCB.
@@ -2689,21 +2644,12 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Snapshot the slot's tag, rights, and object pointer. cap_info is a
-    // read-only inquiry: holding the slot is sufficient — no per-field rights
-    // check is required.
-    // SAFETY: caller_cspace validated non-null above.
-    let cs = unsafe { &*caller_cspace };
-    let slot = cs.slot(slot_idx).ok_or(SyscallError::InvalidCapability)?;
-    if slot.tag == CapTag::Null
-    {
-        return Err(SyscallError::InvalidCapability);
-    }
-    // Reject a stale handle to a recycled slot (#349).
-    if slot.generation() != syscall::cap_handle_gen(slot_handle)
-    {
-        return Err(SyscallError::InvalidCapability);
-    }
+    // Snapshot the slot's tag, rights, and object pointer, and pin the object
+    // for the inquiry (a stale handle to a recycled slot is refused, #349).
+    // cap_info is a read-only inquiry: holding the slot is sufficient — no
+    // per-field rights check is required.
+    // SAFETY: caller_cspace is the running thread's bound CSpace; no lock held.
+    let slot = unsafe { super::pin_slot(caller_cspace, slot_handle) }?;
     let tag = slot.tag;
     let rights = slot.rights;
     let obj = slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -2799,10 +2745,9 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             let sched = unsafe { crate::sched::scheduler_for(cpu) };
             // SAFETY: lock_raw / unlock_raw paired below.
             let saved = unsafe { sched.lock.lock_raw() };
-            // SAFETY: target_tcb came from a Thread cap resolved without taking a
-            // reference, so a sibling's concurrent delete of the last Thread cap can
-            // free it before this read (`core/kernel/docs/capability-internals.md`
-            // § Storage: Hybrid Two-Level Radix, #502).
+            // SAFETY: target_tcb is the TCB of the Thread object `slot` pins
+            // for the call, so a sibling's concurrent delete of the last Thread
+            // cap cannot free it before this read.
             let (state, exit_reason) = unsafe { ((*target_tcb).state, (*target_tcb).exit_reason) };
             // SAFETY: paired with lock_raw above.
             unsafe { sched.lock.unlock_raw(saved) };

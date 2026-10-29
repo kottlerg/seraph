@@ -578,13 +578,16 @@ pub struct CapabilitySlot
 
 // SAFETY: CapabilitySlot holds NonNull pointers to kernel objects. Writers
 // are serialised by two lock domains: slot occupancy by the CSpace spinlock,
-// derivation links by DERIVATION_LOCK. `lookup_cap` and `cap_info` read slots
-// lock-free; the tag and generation checks narrow, but do not close, the race
-// against a concurrent free (#502; see core/kernel/docs/capability-internals.md
-// § Storage: Hybrid Two-Level Radix).
+// derivation links by DERIVATION_LOCK. A syscall that uses the object a slot
+// names reads the slot under the CSpace spinlock and pins the object there
+// (`syscall::pin_slot`); the remaining lock-free readers — the
+// capability-tree syscalls' first resolution and the transfer pre-validation
+// — dereference no object until they revalidate the slot under
+// DERIVATION_LOCK (see
+// core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level Radix).
 unsafe impl Send for CapabilitySlot {}
-// SAFETY: see the Send impl above; shared access follows the same lock domains
-// and the same unclosed lock-free-reader race (#502).
+// SAFETY: see the Send impl above; shared access follows the same lock
+// domains.
 unsafe impl Sync for CapabilitySlot {}
 
 // The 72-byte size is what lets `L2_SIZE` (56) slots fit a 4 KiB `CSpacePage`

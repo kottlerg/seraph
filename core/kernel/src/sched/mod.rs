@@ -2005,8 +2005,8 @@ fn idle_thread_entry(_cpu_id: u64) -> !
 
             // Reclaim the objects queued on this CPU (#341): threads that
             // self-deleted (marked Exited, queued for off-CPU reclaim) and
-            // the last references a batched capability move dropped
-            // (`cap::transfer::release_moved_object`), whose `CSpace` or
+            // the last references a syscall pin or a batched capability move
+            // dropped (`cap::object::release_ref`), whose `CSpace` or
             // `AddressSpace` may still have live bound threads that the
             // teardown stops here. The idle thread is a safe context: never
             // one of the queued dead threads, bound to nothing, and — its

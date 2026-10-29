@@ -14,6 +14,10 @@
 // from 64-bit trap frame args. Seraph is 64-bit only; all values fit in the target type.
 #![allow(clippy::cast_possible_truncation)]
 
+#[cfg(not(test))]
+use super::UserFrame;
+// The host-test stubs keep the arch frame type in their signatures.
+#[cfg(test)]
 use crate::arch::current::trap_frame::TrapFrame;
 use syscall::SyscallError;
 
@@ -24,7 +28,7 @@ use syscall::SyscallError;
 // too_many_lines: single validation pass over cap rights, prot bits, and address
 // range; splitting would require threading shared state through helpers.
 #[allow(clippy::too_many_lines)]
-pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{AddressSpaceObject, MemoryObject};
     use crate::cap::slot::{AsRights, MemRights};
@@ -214,7 +218,7 @@ pub fn sys_mem_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// page-table reclaim: `core/kernel/docs/memory-internals.md` § Page Table Node Ownership.
 /// Unmapping a page that is not mapped is a no-op.
 #[cfg(not(test))]
-pub fn sys_mem_unmap(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_mem_unmap(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::AddressSpaceObject;
     use crate::cap::slot::AsRights;
@@ -315,7 +319,7 @@ pub fn sys_mem_unmap(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Arguments, return, and errors: `core/kernel/docs/syscalls.md` § `SYS_MEM_PROTECT` (18).
 #[cfg(not(test))]
-pub fn sys_mem_protect(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_mem_protect(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::AddressSpaceObject;
     use crate::cap::slot::{AsRights, MemRights};
@@ -449,7 +453,7 @@ pub fn sys_mem_protect(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // through helpers.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
-pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::derivation::{DERIVATION_LOCK, link_child};
     use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
@@ -698,7 +702,7 @@ pub fn sys_memory_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // threaded through helpers.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
-pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::derivation::{DERIVATION_LOCK, unlink_node};
     use crate::cap::object::{MemoryObject, dealloc_object};
@@ -930,7 +934,8 @@ pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // dealloc_object, which may itself acquire other locks).
     release_locks();
 
-    // SAFETY: tail_obj_nn from lookup_cap; object valid (ref > 0 at lookup).
+    // SAFETY: tail_obj_nn is the object `tail_slot` pins, so this release
+    // cannot be its last reference while the pin lives.
     let remaining = unsafe { (*tail_obj_nn.as_ptr()).dec_ref() };
     if remaining == 0
     {

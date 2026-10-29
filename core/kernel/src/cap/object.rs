@@ -503,8 +503,9 @@ pub struct ThreadObject
     /// Intrusive link for the per-CPU deferred self-teardown reclaim stack
     /// ([`drain_deferred_reclaim`]). Non-null only while this object sits on
     /// that stack — between the push (a self-teardown of the running thread's
-    /// own `Thread` object, or `cap::transfer::release_moved_object` dropping
-    /// its last reference) and the off-CPU completion of that free. Null otherwise.
+    /// own `Thread` object, or `release_ref` dropping its last reference: a
+    /// syscall pin, or a moved capability's freed source) and the off-CPU
+    /// completion of that free. Null otherwise.
     /// Written only by the owning CPU.
     pub deferred_next: *mut KernelObjectHeader,
 }
@@ -983,8 +984,8 @@ pub struct AddressSpaceObject
     /// ([`drain_deferred_reclaim`]). Non-null only while this object sits on
     /// that stack: the thread that dropped its last capability was itself
     /// bound to it (or was stopped by a concurrent teardown while freeing
-    /// it), or a batched capability move dropped its last reference
-    /// (`cap::transfer::release_moved_object`), so the free completes
+    /// it), or `release_ref` dropped its last reference (a syscall pin, or a
+    /// batched capability move's freed source), so the free completes
     /// off-CPU. Written only by the owning CPU.
     pub deferred_next: *mut KernelObjectHeader,
 }
@@ -1390,6 +1391,63 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
     }
 }
 
+/// Release one reference on `obj` that the caller owns, and free the object
+/// if it was the last.
+///
+/// The release half of every kernel-internal owner that is not a slot freed
+/// under the derivation lock: a syscall's pin ([`crate::syscall::PinnedCap`])
+/// and the reference a moved capability's freed source slot held
+/// (`cap::transfer::release_moved_object`). Either may name an object bound to
+/// the running thread, so a `Thread`, `CSpace`, or `AddressSpace` whose last
+/// reference goes here is queued for this CPU's deferred reclaim (drained at
+/// the next syscall epilogue or idle loop) rather than torn down in place.
+/// Every other type frees in place through [`dealloc_object`], which may take
+/// `DERIVATION_LOCK` and the frame allocator and, for a Notification, an
+/// `EventQueue`, or an Endpoint, wakes the waiters it drains (the running
+/// thread among them, when it is parked on the object it released), and for a
+/// Notification or `EventQueue` first waits for the timer's in-flight wakeup
+/// batch (`sched::sleep_wakeups_quiesce`), a bounded wait that completes only
+/// when no IPC, scheduler, or sleep-list lock is held; hence the lock
+/// preconditions below.
+///
+/// # Safety
+///
+/// - `obj` must carry an outstanding reference the caller owns, which this
+///   call consumes.
+/// - Syscall context with interrupts disabled: the deferred-reclaim push
+///   needs a stable CPU index.
+/// - Must NOT be called with `DERIVATION_LOCK` held, nor with any IPC source,
+///   per-TCB `sched_lock`, per-CPU scheduler, or sleep-list lock held (the
+///   preconditions `dealloc_object` states).
+#[cfg(not(test))]
+pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
+{
+    // SAFETY: the caller owns an outstanding reference on obj, so it is live
+    // until this decrement.
+    if unsafe { obj.as_ref().dec_ref() } != 0
+    {
+        return;
+    }
+    // SAFETY: refcount reached 0; nothing else references the object.
+    match unsafe { obj.as_ref().obj_type }
+    {
+        ObjectType::Thread | ObjectType::CSpaceObj | ObjectType::AddressSpace =>
+        {
+            let cpu = crate::arch::current::cpu::current_cpu() as usize;
+            // SAFETY: refcount 0, exclusively owned, a linkable type;
+            // syscall context with interrupts disabled, so the CPU index
+            // is stable.
+            unsafe { push_deferred_reclaim(cpu, obj) };
+        }
+        _ =>
+        {
+            // SAFETY: refcount 0; no other references exist; no lock held
+            // (contract).
+            unsafe { dealloc_object(obj) };
+        }
+    }
+}
+
 /// Push an object whose free must not complete here onto this CPU's
 /// deferred-reclaim stack.
 ///
@@ -1402,18 +1460,18 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// the arm marks the thread `Exited`, pushes the object here, and returns;
 /// the syscall epilogue then `schedule()`s away and
 /// [`drain_deferred_reclaim`] completes the free from a context that is
-/// provably not a bound thread. Second, a batched capability move whose
-/// freed source slot held the last reference to a `Thread`, `CSpace`, or
-/// `AddressSpace` (`cap::transfer::release_moved_object`) pushes it from a
-/// live thread — possibly one bound to it, and possibly from inside IPC
-/// delivery, where a teardown's bound-thread stop and cross-CPU waits must
-/// not run.
+/// provably not a bound thread. Second, [`release_ref`] pushes a `Thread`,
+/// `CSpace`, or `AddressSpace` whose last reference it drops — a batched
+/// capability move's freed source slot (`cap::transfer::release_moved_object`)
+/// or a syscall's pin — from a live thread: possibly one bound to it, and
+/// possibly from inside IPC delivery, where a teardown's bound-thread stop and
+/// cross-CPU waits must not run.
 ///
 /// # Safety
 /// `ptr` is an exclusively-owned `Thread`, `CSpaceObj`, or `AddressSpace`
 /// object (refcount 0). A `Thread` pushed by a self-teardown is already
 /// `Exited` and unlinked from every run queue; one pushed by
-/// `release_moved_object` may be in any state, and the drain's Thread arm
+/// `release_ref` may be in any state, and the drain's Thread arm
 /// then runs `dealloc_object`'s ordinary stop-and-drain — or its self net
 /// when the draining thread is that thread. `cpu` is the local CPU index
 /// (`< MAX_CPUS`) and its scheduler is initialised.
@@ -1465,7 +1523,7 @@ pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObject
 /// whose own `Thread` object was queued by a self-teardown is `Exited`,
 /// reaches the Exited arm of the syscall epilogue, and `schedule()`s away,
 /// never the drain arm; one whose own object reached the stack through
-/// `release_moved_object` is caught by the Thread arm's self net, which
+/// `release_ref` is caught by the Thread arm's self net, which
 /// marks it `Exited`, re-queues the object, and returns, so the epilogue's
 /// post-drain `Exited` check schedules it away.
 // cast_ptr_alignment: the `*mut u8` head only ever holds an object pointer
@@ -1544,6 +1602,79 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
     // SAFETY: object exclusively owned (refcount 0) and of a linkable type;
     // queued for off-CPU reclaim on this CPU.
     unsafe { push_deferred_reclaim(this_cpu, ptr) };
+}
+
+/// Unlink a dying thread from the source queue its park binding names, under
+/// the source lock `ipc::lock_bound_source` took (step 11 of
+/// core/kernel/docs/thread-lifecycle-and-sleep.md § `dealloc_object(Thread)`
+/// Drain Protocol). A thread a waker already claimed is not on the queue, and
+/// the unlink is a no-op.
+///
+/// # Safety
+/// `tcb` is the dying, valid TCB; `blocked_on` is the source state its
+/// binding names under `bound_state` (a source-blocking state), whose lock the
+/// caller holds together with `tcb`'s `sched_lock`.
+// cast_ptr_alignment: blocked_on_object stores a type-erased pointer to the
+// source state bound_state names, whose allocation guarantees its alignment.
+#[allow(clippy::cast_ptr_alignment)]
+#[cfg(not(test))]
+unsafe fn unlink_dying_waiter(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    bound_state: crate::sched::thread::IpcThreadState,
+    blocked_on: *mut u8,
+)
+{
+    use crate::sched::thread::IpcThreadState;
+
+    // SAFETY: blocked_on is the live source of the named type, and its lock
+    // is held (contract), which serialises every queue edit below.
+    unsafe {
+        match bound_state
+        {
+            IpcThreadState::BlockedOnNotification =>
+            {
+                let sig = blocked_on.cast::<crate::ipc::notification::NotificationState>();
+                if (*sig).waiters.remove(tcb)
+                {
+                    (*sig).refresh_observer();
+                }
+            }
+            IpcThreadState::BlockedOnSend =>
+            {
+                let ep = &mut *blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
+                crate::ipc::endpoint::unlink_from_wait_queue(
+                    tcb,
+                    &mut ep.send_head,
+                    &mut ep.send_tail,
+                );
+                // Republish send-queue level (#285-adjacent): this unlink can
+                // empty the queue, and the wait-set self-heal reads the shadow
+                // locklessly.
+                ep.refresh_send_ready();
+            }
+            IpcThreadState::BlockedOnRecv =>
+            {
+                let ep = &mut *blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
+                crate::ipc::endpoint::unlink_from_wait_queue(
+                    tcb,
+                    &mut ep.recv_head,
+                    &mut ep.recv_tail,
+                );
+            }
+            IpcThreadState::BlockedOnEventQueue =>
+            {
+                let eq = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
+                (*eq).waiters.remove(tcb);
+            }
+            IpcThreadState::BlockedOnWaitSet =>
+            {
+                let ws = blocked_on.cast::<crate::ipc::wait_set::WaitSetState>();
+                (*ws).waiters.remove(tcb);
+            }
+            _ =>
+            {}
+        }
+    }
 }
 
 /// Free a kernel object that no capability slot references: its reference
@@ -1976,8 +2107,8 @@ unsafe fn dealloc_object_one(
                     // sys_cap_delete refuses a self thread-cap delete before the
                     // dec-ref. It guards every OTHER dealloc of the running
                     // thread: a self-targeting cap_revoke, and the deferred
-                    // reclaim of a Thread object whose last reference a
-                    // batched move dropped (`release_moved_object`) when the
+                    // reclaim of a Thread object whose last reference a pin or
+                    // a batched move dropped (`release_ref`) when the
                     // draining thread is that thread. Mark Exited + drain run
                     // queues (no free), queue the object for off-CPU reclaim,
                     // and return. The syscall epilogue observes Exited and
@@ -2227,8 +2358,12 @@ unsafe fn dealloc_object_one(
                 // the abort arm of a wake that claimed tcb before its Exited
                 // mark writes the same pair under that lock (see
                 // core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
-                // Ownership). The source locks below are taken after it is
-                // released, never inside it.
+                // Ownership). A source is reached only through
+                // `ipc::lock_bound_source`, which re-reads the binding under
+                // tcb's sched_lock and try-locks the source under it: a
+                // binding still observed there names a source not yet freed,
+                // so a concurrent last-capability delete of the source cannot
+                // free it under this unlink.
                 // SAFETY: tcb is valid (not yet freed); blocked_on_object
                 // and ipc_state are always valid on an initialized TCB.
                 unsafe {
@@ -2241,64 +2376,28 @@ unsafe fn dealloc_object_one(
                     {
                         match bound_state
                         {
-                            IpcThreadState::BlockedOnNotification =>
+                            IpcThreadState::BlockedOnNotification
+                            | IpcThreadState::BlockedOnSend
+                            | IpcThreadState::BlockedOnRecv
+                            | IpcThreadState::BlockedOnEventQueue
+                            | IpcThreadState::BlockedOnWaitSet =>
                             {
-                                let sig = blocked_obj
-                                    .cast::<crate::ipc::notification::NotificationState>();
-                                // SAFETY: sig is valid; lock serialises with notification_send.
-                                let saved = (*sig).lock.lock_raw();
-                                if (*sig).waiters.remove(tcb)
+                                if let Some(held) = crate::ipc::lock_bound_source(
+                                    tcb,
+                                    bound_state,
+                                    blocked_obj,
+                                    None,
+                                )
                                 {
-                                    (*sig).refresh_observer();
+                                    // SAFETY: `held` holds the live source's
+                                    // lock and tcb's sched_lock.
+                                    unlink_dying_waiter(tcb, bound_state, blocked_obj);
+                                    // Retire the binding inside the hold, so
+                                    // no later reader passes its re-read once
+                                    // the source no longer queues tcb.
+                                    (*tcb).blocked_on_object = core::ptr::null_mut();
+                                    held.unlock();
                                 }
-                                (*sig).lock.unlock_raw(saved);
-                            }
-                            IpcThreadState::BlockedOnSend =>
-                            {
-                                let ep =
-                                    &mut *blocked_obj.cast::<crate::ipc::endpoint::EndpointState>();
-                                // SAFETY: ep is valid; lock serialises with endpoint ops.
-                                let saved = ep.lock.lock_raw();
-                                crate::ipc::endpoint::unlink_from_wait_queue(
-                                    tcb,
-                                    &mut ep.send_head,
-                                    &mut ep.send_tail,
-                                );
-                                // Republish send-queue level (#285-adjacent):
-                                // this unlink can empty the queue, and the
-                                // wait-set self-heal reads the shadow locklessly.
-                                ep.refresh_send_ready();
-                                ep.lock.unlock_raw(saved);
-                            }
-                            IpcThreadState::BlockedOnRecv =>
-                            {
-                                let ep =
-                                    &mut *blocked_obj.cast::<crate::ipc::endpoint::EndpointState>();
-                                // SAFETY: ep is valid; lock serialises with endpoint ops.
-                                let saved = ep.lock.lock_raw();
-                                crate::ipc::endpoint::unlink_from_wait_queue(
-                                    tcb,
-                                    &mut ep.recv_head,
-                                    &mut ep.recv_tail,
-                                );
-                                ep.lock.unlock_raw(saved);
-                            }
-                            IpcThreadState::BlockedOnEventQueue =>
-                            {
-                                let eq =
-                                    blocked_obj.cast::<crate::ipc::event_queue::EventQueueState>();
-                                // SAFETY: eq is valid; lock serialises with event_queue ops.
-                                let saved = (*eq).lock.lock_raw();
-                                (*eq).waiters.remove(tcb);
-                                (*eq).lock.unlock_raw(saved);
-                            }
-                            IpcThreadState::BlockedOnWaitSet =>
-                            {
-                                let ws = blocked_obj.cast::<crate::ipc::wait_set::WaitSetState>();
-                                // SAFETY: ws is valid; lock serialises with waitset ops.
-                                let saved = (*ws).lock.lock_raw();
-                                (*ws).waiters.remove(tcb);
-                                (*ws).lock.unlock_raw(saved);
                             }
                             IpcThreadState::BlockedOnReply =>
                             {

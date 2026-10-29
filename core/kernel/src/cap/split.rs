@@ -193,7 +193,8 @@ pub(crate) unsafe fn install_split_children(
 
     DERIVATION_LOCK.write_unlock();
 
-    // SAFETY: orig_obj_ptr from the caller's lookup; object still valid.
+    // SAFETY: orig_obj_ptr is the object the caller's lookup pins (its
+    // `PinnedCap` outlives this call), so it is live here.
     let remaining = unsafe { (*orig_obj_ptr.as_ptr()).dec_ref() };
     if remaining == 0
     {

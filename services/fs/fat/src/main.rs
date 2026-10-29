@@ -1701,29 +1701,32 @@ fn handle_remove_node_cap(
         }
     }
 
-    // A failed removal is settled by what the device holds in the 8.3 slot
+    // A failed removal is settled by where it left the 8.3 slot
     // (services/fs/docs/fs-driver-protocol.md § Label 14: `FS_REMOVE`).
     let removed = match remove_entry(state, parent_cluster, name, cache, block_dev, ipc_buf)
     {
         Ok(r) => r,
-        Err(failure) => match dir::device_slot_state(removed_loc, cache, block_dev, ipc_buf)
+        Err(failure) =>
         {
-            DeviceSlotState::Live =>
+            match failed_removal_state(&failure, removed_loc, cache, block_dev, ipc_buf)
             {
-                restore_lfn_slots(&failure, removed_loc, cache, block_dev, ipc_buf);
-                reply_err(fat_error_to_wire(failure.error), ipc_buf);
-                return;
+                DeviceSlotState::Live =>
+                {
+                    restore_lfn_slots(&failure, removed_loc, cache, block_dev, ipc_buf);
+                    reply_err(fat_error_to_wire(failure.error), ipc_buf);
+                    return;
+                }
+                DeviceSlotState::Deleted => RemovedEntry {
+                    start_cluster: entry.cluster,
+                },
+                DeviceSlotState::Unreadable =>
+                {
+                    nodes.invalidate_for_loc(removed_loc);
+                    reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+                    return;
+                }
             }
-            DeviceSlotState::Deleted => RemovedEntry {
-                start_cluster: entry.cluster,
-            },
-            DeviceSlotState::Unreadable =>
-            {
-                nodes.invalidate_for_loc(removed_loc);
-                reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
-                return;
-            }
-        },
+        }
     };
 
     if let Err(e) = free_entry_data(state, &removed, cache, block_dev, ipc_buf)
@@ -1743,6 +1746,32 @@ fn handle_remove_node_cap(
     let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Where a failed removal of the entry whose 8.3 slot is `sfn_loc` left
+/// that slot. The removal writes the 8.3 slot last and stops at its first
+/// failure, so the slot is still live unless its own write was the one that
+/// failed; only then is the device read, past the cache, to tell
+/// ([`dir::device_slot_state`]).
+fn failed_removal_state(
+    failure: &dir::RemoveFailure,
+    sfn_loc: dir::DirEntryLocation,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+) -> DeviceSlotState
+{
+    if failure
+        .touched
+        .last()
+        .is_some_and(|slot| slot.loc == sfn_loc)
+    {
+        dir::device_slot_state(sfn_loc, cache, block_dev, ipc_buf)
+    }
+    else
+    {
+        DeviceSlotState::Live
+    }
 }
 
 /// Put back the LFN slots a failed removal of the entry whose 8.3 slot is
@@ -1859,9 +1888,9 @@ fn handle_rename_node_cap(
     }
     if let Err(failure) = remove_entry(state, parent_cluster, src_name, cache, block_dev, ipc_buf)
     {
-        // Settled by what the device holds in the source's 8.3 slot
+        // Settled by where the removal left the source's 8.3 slot
         // (services/fs/docs/fs-driver-protocol.md § Label 16: `FS_RENAME`).
-        match dir::device_slot_state(src_loc, cache, block_dev, ipc_buf)
+        match failed_removal_state(&failure, src_loc, cache, block_dev, ipc_buf)
         {
             DeviceSlotState::Live =>
             {

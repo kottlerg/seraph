@@ -76,8 +76,9 @@ its block device endpoint and reply success or a typed error.
 **Reply (error)**: `label = ipc::fs_errors::*`:
 `LABEL_VERSION_MISMATCH` when `data[0]` differs from the driver's
 `FS_LABELS_VERSION` (checked before the BPB is read), else e.g.
-`IO_ERROR`, or `NOT_FOUND` for a malformed BPB or one whose sector size
-is not 512 bytes (the only size the FAT driver reads).
+`IO_ERROR`, or `NOT_FOUND` for a malformed BPB, one whose sector size
+is not 512 bytes (the only size the FAT driver reads), or one with fewer
+than 4085 clusters (FAT12, which the driver does not read).
 
 The block device endpoint arrives in the driver's bootstrap round;
 see [Bootstrap caps](#bootstrap-caps).
@@ -499,9 +500,11 @@ than `.` and `..`), `IO_ERROR`, `PERMISSION_DENIED`, `INVALID_BADGE`
 its 8.3 slot, each with its own block write (see
 [`crash-safety.md`](../fat/docs/crash-safety.md)). A sector write the block
 device fails leaves the driver's cached copy of that sector as it was
-before the write, though the device may hold either version. When one of
-those writes fails, the driver reads the 8.3 slot back from the device,
-past its cache, and settles the request by what it finds:
+before the write, though the device may hold either version. When a
+block access of the removal fails, the driver settles the request by
+where it left the 8.3 slot: a failure before the 8.3 slot's own write
+leaves the entry live, and when that write failed, the driver reads the
+slot back from the device, past its cache:
 
 - **Entry still live**: the driver writes back the first bytes of the LFN
   slots it marked and replies the error (`IO_ERROR`). The entry stays,
@@ -511,9 +514,10 @@ past its cache, and settles the request by what it finds:
 - **Entry deleted**: the removal took effect. The driver frees the entry's
   cluster chain, drops its node, and replies as for a removal whose writes
   all succeeded.
-- **Slot unreadable**: the driver replies `IO_ERROR` and drops the entry's
-  node, since it may be gone; caps held on it then reply `INVALID_BADGE`.
-  The entry may remain on the device without its LFN run.
+- **Slot unreadable** (only after the 8.3 slot's write failed): the
+  driver replies `IO_ERROR` and drops the entry's node, since it may be
+  gone; caps held on it then reply `INVALID_BADGE`. The entry may remain
+  on the device without its LFN run.
 
 A node the driver drops no longer names anything, so a later `FS_CREATE`
 that reuses the slot cannot reach a stale node through a held cap.
@@ -575,9 +579,9 @@ intent; not yet implemented). Tracked as
 for the post-crash visible states. The driver inserts the destination
 entry, then removes the source as [`FS_REMOVE`](#label-14-fs_remove) does,
 and drops the source's node once the source is gone. An error inserting
-the destination is replied as it stands. When a block write of the
-source's removal fails, the driver settles the request by the source's 8.3
-slot as the device holds it, as `FS_REMOVE` does:
+the destination is replied as it stands. When a block access of the
+source's removal fails, the driver settles the request by where it left
+the source's 8.3 slot, as `FS_REMOVE` does:
 
 - **Source still live**: the driver undoes the rename. It marks the
   destination's slots deleted first, so a failure part-way leaves at
@@ -586,8 +590,9 @@ slot as the device holds it, as `FS_REMOVE` does:
   The source keeps its node.
 - **Source deleted**: the rename took effect. The driver drops the
   source's node and replies success.
-- **Slot unreadable**: the driver replies `IO_ERROR` without undoing
-  anything and drops the source's node. Both names may remain.
+- **Slot unreadable** (only after the source's 8.3 write failed): the
+  driver replies `IO_ERROR` without undoing anything and drops the
+  source's node. Both names may remain.
 
 **Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination
 occupied), `NO_SPACE`, `IO_ERROR` (malformed name lengths, an invalid name, a
@@ -643,7 +648,7 @@ words:
 
 | Slot | Cap |
 |---|---|
-| `caps[0]` | Block device endpoint (SEND, partition-scoped badge on virtio-blk) |
+| `caps[0]` | Block device endpoint (`SEND_GRANT`, partition-scoped badge on virtio-blk; GRANT because every block request moves the Memory cap it fills or drains) |
 | `caps[1]` | Driver service endpoint (all rights: receive and badge derivation) |
 
 A round with fewer than two caps, or not marked done, is a bootstrap

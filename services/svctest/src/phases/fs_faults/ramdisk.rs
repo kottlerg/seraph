@@ -3,28 +3,36 @@
 
 // services/svctest/src/phases/fs_faults/ramdisk.rs
 
-//! RAM block device behind the `fs_faults` phase's own fatfs: a small FAT16
-//! volume formatted at run time, served over the `BLK_READ_INTO_MEMORY` /
-//! `BLK_WRITE_FROM_MEMORY` requests fatfs issues, with block faults armed by
-//! sector and attempt.
+//! RAM block device behind the `fs_faults` phase's own fatfs: a FAT16 volume
+//! just past FAT12's cluster count, formatted at run time and held sparsely,
+//! served over the `BLK_READ_INTO_MEMORY` / `BLK_WRITE_FROM_MEMORY` requests
+//! fatfs issues, with block faults armed by sector and attempt.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ipc::{IpcMessage, blk_errors, blk_labels};
 
 /// Bytes per sector, the only size fatfs reads.
 pub const SECTOR: usize = 512;
-/// Sectors on the volume: one cluster per sector, so 250 data clusters.
-const TOTAL_SECTORS: u16 = 256;
-/// One reserved sector (the boot sector), then one FAT copy of one sector,
-/// which holds the 252 FAT16 entries the clusters need.
+/// One reserved sector (the boot sector), then one FAT copy.
 const FAT_LBA: usize = 1;
+/// Sectors of the FAT copy: 17 sectors hold 4352 FAT16 entries, enough for
+/// the 4098 the clusters need.
+const FAT_SECTORS: usize = 17;
 /// The fixed root directory: 64 entries, four sectors.
 const ROOT_ENTRIES: u16 = 64;
-const ROOT_LBA: usize = 2;
+const ROOT_LBA: usize = FAT_LBA + FAT_SECTORS;
 const ROOT_SECTORS: usize = 4;
 /// First sector of the data region, cluster 2.
 const DATA_LBA: usize = ROOT_LBA + ROOT_SECTORS;
+/// Data clusters, one sector each: past the 4085 below which a volume is
+/// FAT12, which fatfs refuses.
+const CLUSTERS: usize = 4096;
+/// Sectors on the volume.
+const TOTAL_SECTORS: usize = DATA_LBA + CLUSTERS;
+/// What an unwritten sector reads as.
+const ZERO_SECTOR: [u8; SECTOR] = [0; SECTOR];
 /// Largest request fatfs issues: one cache page of sectors.
 const MAX_SECTORS_PER_REQUEST: usize = 8;
 
@@ -77,15 +85,24 @@ struct Rule
     fault: Fault,
 }
 
-/// The volume's bytes and its armed faults.
+/// The volume's written sectors (every other one reads as zeros) and its
+/// armed faults.
 pub struct RamDisk
 {
-    bytes: Vec<u8>,
+    sectors: BTreeMap<usize, Box<[u8; SECTOR]>>,
     rules: Vec<Rule>,
 }
 
 /// The disk the phase and the block server thread share.
 pub type SharedDisk = Arc<Mutex<RamDisk>>;
+
+/// A geometry count as the little-endian 16-bit BPB field that holds it.
+fn bpb_u16(count: usize) -> [u8; 2]
+{
+    u16::try_from(count)
+        .expect("fs_faults volume geometry fits a 16-bit BPB field")
+        .to_le_bytes()
+}
 
 /// Lock the shared disk, ignoring poison: a panicking holder fails the run
 /// anyway.
@@ -100,8 +117,7 @@ impl RamDisk
     /// entries: an empty root directory and every cluster free.
     pub fn formatted() -> SharedDisk
     {
-        let mut bytes = vec![0u8; usize::from(TOTAL_SECTORS) * SECTOR];
-        let boot = &mut bytes[..SECTOR];
+        let mut boot = Box::new(ZERO_SECTOR);
         boot[..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
         boot[3..11].copy_from_slice(b"SVCTEST ");
         boot[11..13].copy_from_slice(&512u16.to_le_bytes());
@@ -109,30 +125,31 @@ impl RamDisk
         boot[14..16].copy_from_slice(&1u16.to_le_bytes()); // reserved sectors
         boot[16] = 1; // FAT copies
         boot[17..19].copy_from_slice(&ROOT_ENTRIES.to_le_bytes());
-        boot[19..21].copy_from_slice(&TOTAL_SECTORS.to_le_bytes());
+        boot[19..21].copy_from_slice(&bpb_u16(TOTAL_SECTORS));
         boot[21] = 0xF8; // media descriptor
-        boot[22..24].copy_from_slice(&1u16.to_le_bytes()); // sectors per FAT
+        boot[22..24].copy_from_slice(&bpb_u16(FAT_SECTORS));
         boot[510] = 0x55;
         boot[511] = 0xAA;
-        let fat = FAT_LBA * SECTOR;
-        bytes[fat..fat + 4].copy_from_slice(&[0xF8, 0xFF, 0xFF, 0xFF]);
+        let mut fat = Box::new(ZERO_SECTOR);
+        fat[..4].copy_from_slice(&[0xF8, 0xFF, 0xFF, 0xFF]);
         Arc::new(Mutex::new(Self {
-            bytes,
+            sectors: BTreeMap::from([(0, boot), (FAT_LBA, fat)]),
             rules: Vec::new(),
         }))
     }
 
     /// The bytes of sector `lba`.
-    pub fn sector(&self, lba: usize) -> &[u8]
+    pub fn sector(&self, lba: usize) -> &[u8; SECTOR]
     {
-        &self.bytes[lba * SECTOR..(lba + 1) * SECTOR]
+        self.sectors.get(&lba).map_or(&ZERO_SECTOR, |sector| sector)
     }
 
     /// The FAT16 entry of `cluster`.
     pub fn fat_entry(&self, cluster: u16) -> u16
     {
-        let at = FAT_LBA * SECTOR + usize::from(cluster) * 2;
-        u16::from_le_bytes([self.bytes[at], self.bytes[at + 1]])
+        let at = usize::from(cluster) * 2;
+        let sector = self.sector(FAT_LBA + at / SECTOR);
+        u16::from_le_bytes([sector[at % SECTOR], sector[at % SECTOR + 1]])
     }
 
     /// The sector of `cluster` (one sector per cluster).
@@ -160,10 +177,16 @@ impl RamDisk
         self.rules.push(Rule { lba, skip, fault });
     }
 
-    /// How many armed faults have not fired.
-    pub fn unfired(&self) -> usize
+    /// The armed faults that have not fired, in arming order.
+    pub fn unfired(&self) -> Vec<Fault>
     {
-        self.rules.len()
+        self.rules.iter().map(|rule| rule.fault).collect()
+    }
+
+    /// Disarm every fault that has not fired.
+    pub fn disarm(&mut self)
+    {
+        self.rules.clear();
     }
 
     /// The fault that fires on a request starting at `lba`, counting the
@@ -268,7 +291,7 @@ fn transfer(
     {
         return blk_errors::INVALID_MEMORY_CAP;
     }
-    if lba.saturating_add(count) > usize::from(TOTAL_SECTORS)
+    if lba.saturating_add(count) > TOTAL_SECTORS
     {
         return blk_errors::OUT_OF_BOUNDS;
     }
@@ -290,18 +313,27 @@ fn transfer(
     {
         return blk_errors::INVALID_MEMORY_CAP;
     }
-    let len = count * SECTOR;
-    let sectors = &mut disk.bytes[lba * SECTOR..lba * SECTOR + len];
-    // SAFETY: `va` maps one page for this copy, and `len` is at most
-    // `MAX_SECTORS_PER_REQUEST` sectors, one page.
-    unsafe {
-        match direction
-        {
-            Direction::Write =>
+    for i in 0..count
+    {
+        let page = (va + (i * SECTOR) as u64) as *mut u8;
+        // SAFETY: `va` maps one page for this copy, and sector `i` of at
+        // most `MAX_SECTORS_PER_REQUEST`, one page's worth, lies inside it.
+        unsafe {
+            match direction
             {
-                core::ptr::copy_nonoverlapping(va as *const u8, sectors.as_mut_ptr(), len);
+                Direction::Write =>
+                {
+                    let sector = disk
+                        .sectors
+                        .entry(lba + i)
+                        .or_insert_with(|| Box::new(ZERO_SECTOR));
+                    core::ptr::copy_nonoverlapping(page, sector.as_mut_ptr(), SECTOR);
+                }
+                Direction::Read =>
+                {
+                    core::ptr::copy_nonoverlapping(disk.sector(lba + i).as_ptr(), page, SECTOR);
+                }
             }
-            Direction::Read => core::ptr::copy_nonoverlapping(sectors.as_ptr(), va as *mut u8, len),
         }
     }
     // SAFETY: the same reserved page, accessed above only through a raw

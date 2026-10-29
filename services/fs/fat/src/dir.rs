@@ -715,10 +715,12 @@ pub struct RemoveFailure
     pub error: FatError,
     /// The slots the removal wrote or tried to write, in disk order, each
     /// with its first byte before the removal: LFN slots first, then the
-    /// 8.3 slot when its write was tried. The last one's write failed, so
-    /// the device may hold either byte; the cache holds the original (see
-    /// [`PageCache::write_sector`]). Empty when the failure came before any
-    /// write.
+    /// 8.3 slot when its write was tried. Every write but possibly the last
+    /// one's succeeded. When the failure was a write, it is the last slot's:
+    /// the device may hold either byte there, and the cache holds the
+    /// original (see [`PageCache::write_sector`]). When it was the read of
+    /// the next slot's sector, every listed write succeeded. Empty when the
+    /// failure came before any write.
     pub touched: Vec<SlotFirstByte>,
 }
 
@@ -737,8 +739,9 @@ pub struct RemoveFailure
 /// cluster chain, or when the directory's first cluster or a link lies
 /// outside the data region, a link is a bad-cluster marker, or the chain
 /// has a cycle; or [`FatError::Io`] when a directory or FAT sector read or
-/// a deletion write fails. Its `touched` list names the slots already
-/// marked, with the bytes [`restore_slot_first_bytes`] puts back.
+/// a deletion write fails. Its `touched` list names the slots the
+/// removal wrote or tried to write, with the bytes
+/// [`restore_slot_first_bytes`] puts back.
 pub fn remove_entry(
     state: &mut FatState,
     parent_dir_cluster: u32,

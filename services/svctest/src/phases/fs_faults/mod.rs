@@ -57,13 +57,93 @@ pub fn fs_block_faults_phase(_: &Caps)
     rename_undone_when_lfn_write_dropped(&fs, &disk);
     rename_done_when_failed_sfn_write_landed(&fs, &disk);
     rename_unsettled_when_device_unreadable(&fs, &disk);
+    rename_undone_unread_when_lfn_write_dropped(&fs, &disk);
     remove_kept_when_sfn_write_dropped(&fs, &disk);
     remove_done_when_failed_sfn_write_landed(&fs, &disk);
     remove_unsettled_when_device_unreadable(&fs, &disk);
+    remove_kept_unread_when_lfn_write_dropped(&fs, &disk);
     write_dropped_leaves_cache_unchanged(&fs, &disk);
 
     fs.stop();
     std::os::seraph::log!("fs_block_faults phase passed");
+}
+
+/// The source's only LFN write is dropped, and the device would fail a read
+/// of the source's sector: the 8.3 slot was never written, so the rename is
+/// undone without reading the device back.
+fn rename_undone_unread_when_lfn_write_dropped(fs: &OwnFatfs, disk: &SharedDisk)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let src_name: &[u8] = b"r5_source.txt";
+    let (dir, lba) = fs.case_dir(disk, b"R5");
+    let src = create_with_content(dir, src_name);
+    fill_rest_of_sector(dir, 2 + lfn_slots(src_name) + 1);
+    let before = lock(disk).sector(lba).to_vec();
+
+    {
+        let mut disk = lock(disk);
+        disk.arm(lba, 0, Fault::DropWrite);
+        disk.arm(lba, 0, Fault::FailRead);
+    }
+    let got = fs_rename(dir, src_name, b"R5DST.TXT", ipc_buf);
+    assert_only_read_unfired(disk, "R5");
+    assert_eq!(
+        got,
+        Err(fs_errors::IO_ERROR),
+        "R5: a rename whose LFN write was dropped"
+    );
+    assert_eq!(
+        lock(disk).sector(lba),
+        &before[..],
+        "R5: the undone rename left the source's slots changed on disk"
+    );
+    expect_present(dir, src_name, "R5: source by its long name");
+    expect_missing(dir, b"R5DST.TXT", "R5: undone destination");
+    assert_eq!(
+        fs_read_bytes(src, 0, CONTENT.len() as u64, ipc_buf).as_deref(),
+        Ok(CONTENT),
+        "R5: a read through the source cap after the undone rename"
+    );
+    let _ = syscall::cap_delete(src);
+    let _ = syscall::cap_delete(dir);
+}
+
+/// A removal's only LFN write is dropped, and the device would fail a read
+/// of the entry's sector: the 8.3 slot was never written, so the entry is
+/// kept, with its node, without reading the device back.
+fn remove_kept_unread_when_lfn_write_dropped(fs: &OwnFatfs, disk: &SharedDisk)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let name: &[u8] = b"m4_source.txt";
+    let (dir, lba) = fs.case_dir(disk, b"M4");
+    let file = create_with_content(dir, name);
+    let before = lock(disk).sector(lba).to_vec();
+
+    {
+        let mut disk = lock(disk);
+        disk.arm(lba, 0, Fault::DropWrite);
+        disk.arm(lba, 0, Fault::FailRead);
+    }
+    let got = fs_remove(dir, name, ipc_buf);
+    assert_only_read_unfired(disk, "M4");
+    assert_eq!(
+        got,
+        Err(fs_errors::IO_ERROR),
+        "M4: a removal whose LFN write was dropped"
+    );
+    assert_eq!(
+        lock(disk).sector(lba),
+        &before[..],
+        "M4: the kept entry's slots changed on disk"
+    );
+    expect_present(dir, name, "M4: kept entry by its long name");
+    assert_eq!(
+        fs_read_bytes(file, 0, CONTENT.len() as u64, ipc_buf).as_deref(),
+        Ok(CONTENT),
+        "M4: a read through the kept entry's cap"
+    );
+    let _ = syscall::cap_delete(file);
+    let _ = syscall::cap_delete(dir);
 }
 
 /// The source's 8.3 write is dropped after its LFN slot was marked: the
@@ -354,9 +434,22 @@ fn assert_fired(disk: &SharedDisk, case: &str)
 {
     assert_eq!(
         lock(disk).unfired(),
-        0,
+        Vec::<Fault>::new(),
         "{case}: an armed block fault never fired"
     );
+}
+
+/// The case's write fault fired and its read fault did not: the driver
+/// settled the failure without reading the device back. Disarms the read.
+fn assert_only_read_unfired(disk: &SharedDisk, case: &str)
+{
+    let mut disk = lock(disk);
+    assert_eq!(
+        disk.unfired(),
+        vec![Fault::FailRead],
+        "{case}: the write fault must fire and the read fault must not"
+    );
+    disk.disarm();
 }
 
 fn expect_present(dir: u32, name: &[u8], what: &str)

@@ -48,8 +48,8 @@ use crate::bpb::SECTOR_SIZE;
 /// eight sectors has been dirtied (the device would over-write the
 /// other seven on the disk side using whatever happened to be in the
 /// page). The scratch memory cap holds a single 512-byte sector copy per
-/// write and is reused across calls; allocated lazily on first write
-/// and held for the process lifetime.
+/// write or device read and is reused across calls; [`PageCache::init`]
+/// allocates it, and it is held for the process lifetime.
 static SCRATCH_MEMORY: OnceLock<ScratchMemory> = OnceLock::new();
 
 struct ScratchMemory
@@ -193,9 +193,9 @@ impl PageCache
     /// copies the same sector into a process-static scratch memory cap and
     /// issues one `BLK_WRITE_FROM_MEMORY` against the block device. When the
     /// writeback fails, the cached sector is put back to its bytes before
-    /// the call, so the cache never shows a write the device refused; the
-    /// device may still have taken it, which only [`Self::reload_sector`]
-    /// can tell.
+    /// the call once the reply arrives, so a later read of the cache sees
+    /// no write the device refused; the device may still have taken it,
+    /// which only [`Self::reload_sector`] can tell.
     ///
     /// Single-sector writeback only. Multi-sector cache pages cannot be
     /// flushed as a unit because the unmodified neighbouring sectors

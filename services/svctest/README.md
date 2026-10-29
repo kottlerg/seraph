@@ -155,11 +155,10 @@ Phases spawn these programs from `/programs/`: `hello` (procmgr, pipes), `stdiot
 phase has devmgr spawn the [`test-orphan`](../drivers/test-orphan/README.md) driver. The
 `fs_block_faults` phase spawns a fatfs of its own from `/services/fs/fatfs` through procmgr,
 delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume, and tears it
-down with `DESTROY_PROCESS`. The FS,
-namespace, and procmgr phases read `/data/test.txt`; the FS phases also read the build-synthesised
-`/data/svctest/large.bin` and write their scratch files under `/data/svctest/`; and `fsbench`,
-spawned by the `fs_crossover_bench` phase, reads the build-synthesised
-`/data/svctest/bench.bin`. The sysroot placement of all of these is listed in
+down with `DESTROY_PROCESS`. The FS, namespace, and procmgr phases read `/data/test.txt`; the FS
+phases also read the build-synthesised `/data/svctest/large.bin` and write their scratch files
+under `/data/svctest/`; and `fsbench`, spawned by the `fs_crossover_bench` phase, reads the
+build-synthesised `/data/svctest/bench.bin`. The sysroot placement of all of these is listed in
 [docs/testing.md § Sysroot layout](../../docs/testing.md#sysroot-layout).
 
 ---

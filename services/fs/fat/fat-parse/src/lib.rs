@@ -53,7 +53,16 @@ pub enum BpbError
     /// no FAT entry, or one past the FAT, or a FAT32 root cluster lies
     /// outside the data region.
     BadGeometry,
+    /// The volume has fewer than [`FAT16_MIN_CLUSTERS`] clusters, which
+    /// makes it FAT12 under the Microsoft specification's type rule. Its
+    /// FAT holds 12-bit entries, and the `fatfs` FAT walker and allocator
+    /// read and write only 16- and 32-bit ones.
+    Fat12,
 }
+
+/// Fewest clusters a FAT16 volume has: the Microsoft specification types a
+/// volume with fewer as FAT12.
+pub const FAT16_MIN_CLUSTERS: u32 = 4085;
 
 /// Geometry decoded from a FAT BPB (sector 0).
 ///
@@ -83,14 +92,16 @@ pub struct BpbGeometry
 /// Validates the boot signature, the sector size, and the geometry (every
 /// check is listed under `# Errors`), computing on the way the data-region
 /// start, total cluster count, FAT variant (per the Microsoft FAT32
-/// specification's `< 65525` rule), and — for FAT32 — the `FSInfo` sector,
+/// specification's type rule: under 4085 clusters FAT12, under 65525
+/// FAT16, else FAT32), and — for FAT32 — the `FSInfo` sector,
 /// which is `None` unless it names a sector inside the reserved region.
 ///
 /// # Errors
 /// Returns [`BpbError::BadSignature`] when bytes 510/511 are not `0x55 0xAA`,
 /// [`BpbError::ZeroDivisor`] when `bytes_per_sector` or
 /// `sectors_per_cluster` is zero, [`BpbError::UnsupportedSectorSize`]
-/// when `bytes_per_sector` is non-zero but not [`SECTOR_SIZE`], or
+/// when `bytes_per_sector` is non-zero but not [`SECTOR_SIZE`],
+/// [`BpbError::Fat12`] for a FAT12 cluster count, or
 /// [`BpbError::BadGeometry`] when `num_fats` or `reserved_sectors` is zero,
 /// the data region's start overflows, the FAT cannot hold an entry for
 /// every cluster, or a FAT32 root cluster lies outside the data region.
@@ -177,7 +188,12 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
     let data_sectors = total_sectors.saturating_sub(data_start_sector);
     let total_clusters = data_sectors / u32::from(sectors_per_cluster);
 
-    // FAT type determination per Microsoft specification.
+    // FAT type determination per the Microsoft specification. FAT12 is
+    // refused: the driver reads only 16- and 32-bit FAT entries.
+    if total_clusters < FAT16_MIN_CLUSTERS
+    {
+        return Err(BpbError::Fat12);
+    }
     let (fat_type, fsinfo_sector) = if total_clusters < 65525
     {
         (FatType::Fat16, None)
@@ -1039,11 +1055,12 @@ mod tests
         s
     }
 
-    /// A FAT16 volume: small enough that total_clusters < 65525.
-    /// data_start = 1 + 2*20 + 32 = 73; clusters = (8192-73)/4 = 2029.
+    /// A FAT16 volume: 4085 <= total_clusters < 65525.
+    /// data_start = 1 + 2*32 + 32 = 97; clusters = (8192-97)/1 = 8095,
+    /// within the 32 * 256 = 8192 entries one FAT holds.
     fn fat16_sector() -> [u8; SECTOR_SIZE]
     {
-        bpb_sector(512, 4, 1, 2, 512, 8192, 20, 0, 0, 0, 0)
+        bpb_sector(512, 1, 1, 2, 512, 8192, 32, 0, 0, 0, 0)
     }
 
     /// A FAT32 volume: large enough that total_clusters >= 65525.
@@ -1087,11 +1104,23 @@ mod tests
             .ok()
             .expect("valid FAT16");
         assert!(matches!(g.fat_type, FatType::Fat16));
-        assert_eq!(g.total_clusters, 2029);
-        assert_eq!(g.data_start_sector, 73);
-        assert_eq!(g.fat_size, 20);
+        assert_eq!(g.total_clusters, 8095);
+        assert_eq!(g.data_start_sector, 97);
+        assert_eq!(g.fat_size, 32);
         // FAT16 leaves FSInfo absent regardless of the bytes at offset 48.
         assert_eq!(g.fsinfo_sector, None);
+    }
+
+    #[test]
+    fn parse_bpb_geometry_refuses_a_fat12_cluster_count()
+    {
+        // data_start = 1 + 2*20 + 32 = 73, one sector per cluster.
+        let fat12 = bpb_sector(512, 1, 1, 2, 512, 73 + 4084, 20, 0, 0, 0, 0);
+        assert!(matches!(parse_bpb_geometry(&fat12), Err(BpbError::Fat12)));
+        let g = parse_bpb_geometry(&bpb_sector(512, 1, 1, 2, 512, 73 + 4085, 20, 0, 0, 0, 0))
+            .ok()
+            .expect("the fewest clusters FAT16 has");
+        assert!(matches!(g.fat_type, FatType::Fat16));
     }
 
     #[test]

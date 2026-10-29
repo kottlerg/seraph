@@ -142,8 +142,11 @@ Three of the kernel's object types make up what userspace calls a process:
 - **Thread** — a schedulable unit of execution with a saved register state, a priority,
   and bindings to an AddressSpace, a CSpace, and an IPC buffer.
 - **AddressSpace** — a virtual address space with a page table root and a set of frame mappings.
-  When the last capability to an AddressSpace (or a CSpace) is deleted, every thread bound to it is
-  stopped (see [capability-model.md](capability-model.md#kill-process-pattern)).
+  When the last capability to an AddressSpace (or a CSpace) is deleted and the object is freed,
+  every thread bound to it is stopped (see
+  [capability-model.md](capability-model.md#kill-process-pattern)); an AddressSpace an Mmio
+  capability's object records a mapping into is freed only when that Mmio object is freed (see
+  [capability-model.md](capability-model.md#mmio)).
 - **CSpace** — a capability space: a growable array of capability slots that a thread
   uses to name kernel objects.
 
@@ -184,23 +187,24 @@ and init looks each module up by name there.
 
 Device drivers run as unprivileged userspace processes. No driver code executes in
 kernel space. Hardware access is granted explicitly via capabilities and is fully
-revocable (for MMIO and x86-64 port I/O, design intent; not yet implemented, #457).
+revocable: deleting the capability an MMIO mapping or a port binding was made through,
+consuming it with a split, or revoking an ancestor of it withdraws it.
 
 **MMIO**
 Physical MMIO regions are mapped into a driver’s address space under capability
 control. Once mapped, drivers access registers directly without kernel mediation.
-Revoking an Mmio capability blocks new `SYS_MMIO_MAP` calls through its descendants
-but does not unmap mappings already established through them (unmapping on revocation
-is design intent; not yet implemented, #457; see
-[capability-model.md](capability-model.md#mmio)).
+Revoking an Mmio capability unmaps, with TLB shootdown, every mapping made through its
+descendants before the revoke returns (a descendant a concurrent syscall still holds has its
+mappings unmapped when that syscall releases it); the revoked capability itself is preserved, so
+mappings made through it remain (see [capability-model.md](capability-model.md#mmio)).
 
 **Port I/O (x86‑64 only)**
 Drivers receive an IoPort capability for assigned port ranges. Binding an IoPort
 capability to a thread enables direct execution of port I/O instructions for those
-ranges. Revoking an IoPort capability is intended to withdraw port access from every
-thread bound through its descendants; the revoked capability itself is preserved, so
-bindings made through it remain (withdrawal on revocation is design intent; not yet
-implemented, #457; see [capability-model.md](capability-model.md#ioport-x86-64-only)).
+ranges. Revoking an IoPort capability withdraws port access from every thread bound
+through its descendants, on every CPU, with the same timing as for MMIO; the revoked capability
+itself is preserved, so bindings made through it remain (see
+[capability-model.md](capability-model.md#ioport-x86-64-only)).
 RISC‑V does not support port I/O.
 
 **DMA**

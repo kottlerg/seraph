@@ -324,13 +324,14 @@ each change; the binding statement of the resulting invariants is
     capture `current_state`/`save_flag`; release the CPU lock, release
     `current.sched_lock`.
   - **Incoming flip:** if `next != idle`, acquire `next.sched_lock`; if
-    `state == Ready` → flip Running + set `preferred_cpu`; else idle-fallback —
+    `state == Ready` → flip Running + set `preferred_cpu` + load its IOPB (its
+    own, or the all-denied one when it has none); else idle-fallback —
     `next` was `set_state`'d Stopped/Exited in the dequeue→flip window (reachable:
     `dealloc_object(Thread)` marks Exited under all-CPU locks BEFORE its
     not-current spin blocks). `next` is now off-queue and drained, so re-claim
     `idle` (`set_current(idle)` under a re-taken CPU lock) and dispatch idle this
     cycle; the next tick re-schedules. Release `next.sched_lock`.
-  - THEN trap-stack / AS-switch / IOPB / FPU for the final `next` (all CPU-local,
+  - THEN trap-stack / AS-switch / idle-IOPB / FPU for the final `next` (all CPU-local,
     safe with the CPU lock released, IRQs still off), the `next_state` pointer,
     the `context_saved` spin, `switch()`, `restore_interrupts_from`. The
     AS-switch/FPU is AFTER the flip/idle-fallback — never load a Stopped/Exited

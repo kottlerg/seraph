@@ -38,6 +38,7 @@ use alloc::boxed::Box;
 
 pub mod cspace;
 pub mod derivation;
+pub mod ioport_bindings;
 pub mod object;
 pub mod retype;
 pub mod slot;
@@ -1641,13 +1642,7 @@ fn populate_cspace(
 
     if let Some((uart_base, uart_size)) = crate::arch::current::platform::console_mmio()
     {
-        let ptr = mint_phase7_body(MmioObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::Mmio, seed_header_nn()),
-            base: uart_base,
-            size: uart_size,
-            flags: 0,
-            _pad: 0,
-        });
+        let ptr = mint_phase7_body(MmioObject::new_root(uart_base, uart_size, 0));
         let slot = insert_or_fatal(
             cspace,
             MmioRights::MAP | MmioRights::WRITE,
@@ -1673,13 +1668,7 @@ fn populate_cspace(
 
     for ap in mmio_apertures
     {
-        let ptr = mint_phase7_body(MmioObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::Mmio, seed_header_nn()),
-            base: ap.phys_base,
-            size: ap.size,
-            flags: 0,
-            _pad: 0,
-        });
+        let ptr = mint_phase7_body(MmioObject::new_root(ap.phys_base, ap.size, 0));
         let slot = insert_or_fatal(
             cspace,
             MmioRights::MAP | MmioRights::WRITE,
@@ -1918,12 +1907,8 @@ fn populate_cspace(
     // subdivides and delegates sub-ranges to services as needed.
     if crate::arch::current::HAS_IO_PORTS
     {
-        let ptr = mint_phase7_body(IoPortObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::IoPort, seed_header_nn()),
-            base: 0,
-            size: 0, // 0 means 0x10000 (full range; u16 cannot hold 65536)
-            _pad: 0,
-        });
+        // Size 0 means 0x10000 (the full range; u16 cannot hold 65536).
+        let ptr = mint_phase7_body(IoPortObject::new_root(0, 0));
         let ioport_root_slot = insert_or_fatal(
             cspace,
             IoPortRights::USE,

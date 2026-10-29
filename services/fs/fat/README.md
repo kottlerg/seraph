@@ -64,7 +64,9 @@ Cap-monotonic attenuation: `FS_CREATE` / `FS_MKDIR` mint a child cap
 with rights `caller_parent ∩ kind_max` where `kind_max` is
 `{STAT, READ, WRITE, EXEC}` for files and `NamespaceRights::ALL` for
 directories. A caller with `MUTATE_DIR`-only on a parent cannot widen
-into `READ` or `WRITE` on the created entry.
+into `READ` or `WRITE` on the created entry. A file whose cap would
+carry no rights (a parent with none of the file rights) is refused with
+`PERMISSION_DENIED` before anything is written, so no entry is created.
 
 ---
 
@@ -84,10 +86,14 @@ into `READ` or `WRITE` on the created entry.
   Microsoft FAT specification.
 * **Page cache** (`src/cache.rs`): 128 single-page slots backed by
   `BLK_READ_INTO_MEMORY` for fills and a process-static scratch memory cap
-  for single-sector `BLK_WRITE_FROM_MEMORY` writebacks. Write-through:
-  the cached page is updated in place before the on-disk write so any
-  outstanding `FS_READ_MEMORY` cap aliasing the page observes new bytes
-  immediately.
+  for single-sector `BLK_WRITE_FROM_MEMORY` writebacks and single-sector
+  device reads. Write-through: the cached page is updated in place before
+  the on-disk write so any outstanding `FS_READ_MEMORY` cap aliasing the
+  page observes new bytes immediately, and the sector is put back when the
+  write fails.
+  `reload_sector` reads one sector from the device past the cache and
+  refreshes the cached copy; a failed `FS_REMOVE` or `FS_RENAME` whose
+  8.3 slot write failed uses it to learn whether that slot was deleted.
 * **NodeTable** (`src/backend.rs`): dedupes by on-disk slot
   `(sector_lba, offset_in_sector)`; two distinct on-disk entries
   always allocate distinct `NodeId`s, even when both are empty files

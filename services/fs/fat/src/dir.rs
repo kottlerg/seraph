@@ -578,7 +578,7 @@ const MAX_NUMERIC_TAIL: u8 = 6;
 /// Returned by [`insert_entry`] so dispatch can later patch the
 /// `first_cluster` and `size` fields via [`update_entry_metadata`]
 /// after a write extends the file.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct DirEntryLocation
 {
     pub sector_lba: u32,
@@ -699,8 +699,33 @@ pub fn insert_entry(
     Ok(slots[total_slots - 1])
 }
 
+/// A directory slot and its first byte before a removal marked it.
+#[derive(Copy, Clone, Debug)]
+pub struct SlotFirstByte
+{
+    pub loc: DirEntryLocation,
+    pub first_byte: u8,
+}
+
+/// Why [`remove_entry`] failed, and which of the entry's slots it may have
+/// changed on the way.
+#[derive(Debug)]
+pub struct RemoveFailure
+{
+    pub error: FatError,
+    /// The slots the removal wrote or tried to write, in disk order, each
+    /// with its first byte before the removal: LFN slots first, then the
+    /// 8.3 slot when its write was tried. Every write but possibly the last
+    /// one's succeeded. When the failure was a write, it is the last slot's:
+    /// the device may hold either byte there, and the cache holds the
+    /// original (see [`PageCache::write_sector`]). When it was the read of
+    /// the next slot's sector, every listed write succeeded. Empty when the
+    /// failure came before any write.
+    pub touched: Vec<SlotFirstByte>,
+}
+
 /// Mark an existing directory entry (and any preceding LFN run) as
-/// deleted (`0xE5`).
+/// deleted (`0xE5`), LFN slots first and the 8.3 slot last.
 ///
 /// Returns the entry's `start_cluster` (0 for an empty file), which the
 /// caller passes to [`free_entry_data`]. Directory removal additionally
@@ -709,13 +734,14 @@ pub fn insert_entry(
 /// function.
 ///
 /// # Errors
-/// [`FatError::Corrupt`] when no entry of that name is found before the
-/// end of the directory or of its cluster chain, or when the directory's
-/// first cluster or a link lies outside the data region, a link is a
-/// bad-cluster marker, or the chain has a cycle;
-/// [`FatError::Io`] when a directory or FAT sector read or a deletion
-/// write fails, possibly after some of the entry's slots are already
-/// marked.
+/// A [`RemoveFailure`] whose `error` is [`FatError::Corrupt`] when no
+/// entry of that name is found before the end of the directory or of its
+/// cluster chain, or when the directory's first cluster or a link lies
+/// outside the data region, a link is a bad-cluster marker, or the chain
+/// has a cycle; or [`FatError::Io`] when a directory or FAT sector read or
+/// a deletion write fails. Its `touched` list names the slots the
+/// removal wrote or tried to write, with the bytes
+/// [`restore_slot_first_bytes`] puts back.
 pub fn remove_entry(
     state: &mut FatState,
     parent_dir_cluster: u32,
@@ -723,15 +749,110 @@ pub fn remove_entry(
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
-) -> Result<RemovedEntry, FatError>
+) -> Result<RemovedEntry, RemoveFailure>
 {
     let (entry, scan) =
-        locate_entry_with_lfn_run(state, parent_dir_cluster, name, cache, block_dev, ipc_buf)?;
+        locate_entry_with_lfn_run(state, parent_dir_cluster, name, cache, block_dev, ipc_buf)
+            .map_err(|error| RemoveFailure {
+                error,
+                touched: Vec::new(),
+            })?;
+    let mut touched = Vec::with_capacity(scan.run().len());
     for slot in scan.run()
     {
-        mark_slot_deleted(*slot, cache, block_dev, ipc_buf)?;
+        let mut buf = Box::new([0u8; SECTOR_SIZE]);
+        if !cache.read_sector(u64::from(slot.sector_lba), block_dev, &mut buf, ipc_buf)
+        {
+            return Err(RemoveFailure {
+                error: FatError::Io,
+                touched,
+            });
+        }
+        touched.push(SlotFirstByte {
+            loc: *slot,
+            first_byte: buf[slot.offset_in_sector],
+        });
+        buf[slot.offset_in_sector] = 0xE5;
+        if !cache.write_sector(u64::from(slot.sector_lba), block_dev, &buf, ipc_buf)
+        {
+            return Err(RemoveFailure {
+                error: FatError::Io,
+                touched,
+            });
+        }
     }
     Ok(entry)
+}
+
+/// Write each slot's recorded first byte back, undoing the marks a failed
+/// [`remove_entry`] left. Every slot is tried; a slot whose write fails
+/// stays marked.
+///
+/// # Errors
+/// [`FatError::Io`] when any slot's sector read or write failed.
+pub fn restore_slot_first_bytes(
+    slots: &[SlotFirstByte],
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+) -> Result<(), FatError>
+{
+    let mut result = Ok(());
+    for slot in slots
+    {
+        let mut buf = Box::new([0u8; SECTOR_SIZE]);
+        if !cache.read_sector(u64::from(slot.loc.sector_lba), block_dev, &mut buf, ipc_buf)
+        {
+            result = Err(FatError::Io);
+            continue;
+        }
+        buf[slot.loc.offset_in_sector] = slot.first_byte;
+        if !cache.write_sector(u64::from(slot.loc.sector_lba), block_dev, &buf, ipc_buf)
+        {
+            result = Err(FatError::Io);
+        }
+    }
+    result
+}
+
+/// What the block device holds in the 8.3 slot at `loc`, read past the
+/// cache with [`PageCache::reload_sector`], which also refreshes the
+/// cached copy. Decides the outcome of a removal whose 8.3 slot write
+/// failed: the cache cannot, since it shows the slot as it was before that
+/// write. A removal that failed before that write left the slot live and
+/// needs no read.
+pub enum DeviceSlotState
+{
+    /// The slot does not carry the `0xE5` deleted marker.
+    Live,
+    /// The slot carries the deleted marker.
+    Deleted,
+    /// The sector could not be read.
+    Unreadable,
+}
+
+/// Read the 8.3 slot at `loc` from the block device; see
+/// [`DeviceSlotState`].
+pub fn device_slot_state(
+    loc: DirEntryLocation,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+) -> DeviceSlotState
+{
+    let mut buf = Box::new([0u8; SECTOR_SIZE]);
+    if !cache.reload_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
+    {
+        return DeviceSlotState::Unreadable;
+    }
+    if buf[loc.offset_in_sector] == 0xE5
+    {
+        DeviceSlotState::Deleted
+    }
+    else
+    {
+        DeviceSlotState::Live
+    }
 }
 
 /// Patch the 8.3 entry at `loc` with new `first_cluster` and `size`
@@ -1028,26 +1149,6 @@ fn write_dir_slot(
         return Err(FatError::Io);
     }
     buf[loc.offset_in_sector..loc.offset_in_sector + 32].copy_from_slice(raw);
-    if !cache.write_sector(u64::from(loc.sector_lba), block_dev, &buf, ipc_buf)
-    {
-        return Err(FatError::Io);
-    }
-    Ok(())
-}
-
-fn mark_slot_deleted(
-    loc: DirEntryLocation,
-    cache: &PageCache,
-    block_dev: u32,
-    ipc_buf: *mut u64,
-) -> Result<(), FatError>
-{
-    let mut buf = Box::new([0u8; SECTOR_SIZE]);
-    if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
-    {
-        return Err(FatError::Io);
-    }
-    buf[loc.offset_in_sector] = 0xE5;
     if !cache.write_sector(u64::from(loc.sector_lba), block_dev, &buf, ipc_buf)
     {
         return Err(FatError::Io);

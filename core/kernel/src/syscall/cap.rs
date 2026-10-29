@@ -104,10 +104,11 @@ pub(super) unsafe fn revalidate_src_under_lock(
     Ok(())
 }
 
-/// Give up the reference a copy or derive took on its source object when the
-/// new slot did not materialise. The caller's source pin still holds the
-/// object, so this is never the last reference in practice; the release
-/// goes through `release_ref` all the same, so it frees correctly if it is.
+/// Give up the reference a copy or derive took for its new slot when the slot
+/// did not materialise. For a shared object the caller's source pin still
+/// holds it, so this is never the last reference; for the fresh object an
+/// `Mmio` or `IoPort` copy mints (`object_for_new_slot`) it is, and the
+/// release frees it through `release_ref`.
 ///
 /// # Safety
 ///
@@ -1326,7 +1327,9 @@ fn pre_grow_for_explicit_slot(
 ///
 /// Copies the source capability's kernel object into the destination `CSpace`
 /// with the requested (attenuated) rights, increments the object's reference
-/// count, propagates the source badge, and wires the new slot as a child of the
+/// count (an `Mmio` or `IoPort` copy instead references a fresh object over the
+/// same range, `QuotaExceeded` past `RANGE_COPY_LIMIT` live copies of its
+/// lineage), propagates the source badge, and wires the new slot as a child of the
 /// source in the derivation tree. When `arg2 == 0` a free slot is allocated;
 /// otherwise the cap is placed at the caller-chosen index — init populates
 /// well-known slots in child `CSpaces` this way.
@@ -1423,11 +1426,12 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
     // silently dropped — callers cannot escalate.
     let effective_rights = rights_mask & src_rights;
 
-    // Increment reference count on the shared kernel object.
-    // SAFETY: src_object is the object `src` pins, so its count is not zero.
-    unsafe {
-        (*src_object.as_ptr()).inc_ref();
-    }
+    // Take the reference the new slot holds: on the source's object, or, for
+    // an `Mmio` or `IoPort` capability, on a fresh object of its own, so the
+    // mappings and port bindings made through the new capability are withdrawn
+    // when it goes (docs/capability-model.md § Mmio, § `IoPort`).
+    // SAFETY: src_object is the object `src` pins, of tag `src_tag`.
+    let new_object = unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object) }?;
 
     // Revalidate the source, then insert and link, under one DERIVATION_LOCK
     // hold (the destination's cspace.lock nested per the documented order).
@@ -1448,7 +1452,7 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
     {
         crate::cap::DERIVATION_LOCK.write_unlock();
         // SAFETY: the reference taken above is given up; no lock held.
-        unsafe { release_src_ref(src_object) };
+        unsafe { release_src_ref(new_object) };
         return Err(e);
     }
     // SAFETY: dest_cs_ptr validated above; lock_raw/unlock_raw paired.
@@ -1457,7 +1461,7 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
         let r: Result<u32, crate::cap::cspace::CapError> = if dest_slot_idx == 0
         {
             (*dest_cs_ptr)
-                .insert_cap(src_tag, effective_rights, src_object)
+                .insert_cap(src_tag, effective_rights, new_object)
                 .map(core::num::NonZeroU32::get)
         }
         else
@@ -1465,7 +1469,7 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
             // insert_cap_at returns () on success; the destination index is the
             // caller-supplied (non-zero) dest_slot_idx.
             (*dest_cs_ptr)
-                .insert_cap_at(dest_slot_idx, src_tag, effective_rights, src_object)
+                .insert_cap_at(dest_slot_idx, src_tag, effective_rights, new_object)
                 .map(|()| dest_slot_idx)
         };
         if let Ok(idx) = r
@@ -1491,7 +1495,7 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
         {
             crate::cap::DERIVATION_LOCK.write_unlock();
             // SAFETY: the reference taken above is given up; no lock held.
-            unsafe { release_src_ref(src_object) };
+            unsafe { release_src_ref(new_object) };
             return Err(SyscallError::from(e));
         }
     };
@@ -1556,11 +1560,12 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
     // malformed request.
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
 
-    // Increment refcount, then insert into caller's CSpace.
-    // SAFETY: src_object is the object `src` pins, so its count is not zero.
-    unsafe {
-        (*src_object.as_ptr()).inc_ref();
-    }
+    // Take the reference the new slot holds: on the source's object, or, for
+    // an `Mmio` or `IoPort` capability, on a fresh object of its own, so the
+    // mappings and port bindings made through the new capability are withdrawn
+    // when it goes (docs/capability-model.md § Mmio, § `IoPort`).
+    // SAFETY: src_object is the object `src` pins, of tag `src_tag`.
+    let new_object = unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object) }?;
 
     // Revalidate the source, then insert and link, under one DERIVATION_LOCK
     // hold (cspace.lock nested per the documented order). The source was
@@ -1579,13 +1584,13 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
     {
         crate::cap::DERIVATION_LOCK.write_unlock();
         // SAFETY: the reference taken above is given up; no lock held.
-        unsafe { release_src_ref(src_object) };
+        unsafe { release_src_ref(new_object) };
         return Err(e);
     }
     // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace).insert_cap(src_tag, effective_rights, src_object);
+        let r = (*caller_cspace).insert_cap(src_tag, effective_rights, new_object);
         if let Ok(idx) = r
             && src_badge != 0
             && let Some(new_slot) = (*caller_cspace).slot_mut(idx.get())
@@ -1603,7 +1608,7 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
         {
             crate::cap::DERIVATION_LOCK.write_unlock();
             // SAFETY: the reference taken above is given up; no lock held.
-            unsafe { release_src_ref(src_object) };
+            unsafe { release_src_ref(new_object) };
             return Err(SyscallError::from(e));
         }
     };
@@ -1681,11 +1686,12 @@ pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
     // malformed request.
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
 
-    // Increment refcount, then insert into caller's CSpace.
-    // SAFETY: src_object is the object `src` pins, so its count is not zero.
-    unsafe {
-        (*src_object.as_ptr()).inc_ref();
-    }
+    // Take the reference the new slot holds: on the source's object, or, for
+    // an `Mmio` or `IoPort` capability, on a fresh object of its own, so the
+    // mappings and port bindings made through the new capability are withdrawn
+    // when it goes (docs/capability-model.md § Mmio, § `IoPort`).
+    // SAFETY: src_object is the object `src` pins, of tag `src_tag`.
+    let new_object = unsafe { crate::cap::object::object_for_new_slot(src_tag, src_object) }?;
 
     // Revalidate the source, then insert and link, under one DERIVATION_LOCK
     // hold (cspace.lock nested per the documented order). The source was
@@ -1704,13 +1710,13 @@ pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
     {
         crate::cap::DERIVATION_LOCK.write_unlock();
         // SAFETY: the reference taken above is given up; no lock held.
-        unsafe { release_src_ref(src_object) };
+        unsafe { release_src_ref(new_object) };
         return Err(e);
     }
     // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace).insert_cap(src_tag, effective_rights, src_object);
+        let r = (*caller_cspace).insert_cap(src_tag, effective_rights, new_object);
         if let Ok(idx) = r
             && let Some(new_slot) = (*caller_cspace).slot_mut(idx.get())
         {
@@ -1727,7 +1733,7 @@ pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
         {
             crate::cap::DERIVATION_LOCK.write_unlock();
             // SAFETY: the reference taken above is given up; no lock held.
-            unsafe { release_src_ref(src_object) };
+            unsafe { release_src_ref(new_object) };
             return Err(SyscallError::from(e));
         }
     };

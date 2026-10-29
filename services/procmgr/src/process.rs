@@ -1431,6 +1431,8 @@ fn create_process_from_bytes(
 {
     let machine = crate::arch::current::EXPECTED_ELF_MACHINE;
     let (ehdr, kind) = elf::validate_executable(module_bytes, machine).ok()?;
+    // `validate_executable` returns the header decoded; the parsers borrow it.
+    let ehdr = &ehdr;
     let bias = match kind
     {
         elf::ElfKind::Exec => 0,
@@ -1474,6 +1476,7 @@ fn create_process_from_bytes(
     // PT_GNU_RELRO (biased, page-rounded): fully-covered pages of writable
     // segments are mapped read-only after relocation.
     let ro_range = elf::relro_span(ehdr, module_bytes)
+        .ok()?
         .map(|(va, sz)| ((va + bias) & !0xFFF, (va + bias + sz + 0xFFF) & !0xFFF));
 
     let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
@@ -2300,6 +2303,8 @@ pub fn create_process_from_file(
     let machine = crate::arch::current::EXPECTED_ELF_MACHINE;
     let (ehdr, kind) =
         elf::validate_executable(header_data, machine).map_err(|_| procmgr_errors::INVALID_ELF)?;
+    // `validate_executable` returns the header decoded; the parsers borrow it.
+    let ehdr = &ehdr;
     let bias = match kind
     {
         elf::ElfKind::Exec => 0,
@@ -2359,6 +2364,7 @@ pub fn create_process_from_file(
     // PT_GNU_RELRO (biased, page-rounded): fully-covered pages of writable
     // segments are mapped read-only after relocation.
     let ro_range = elf::relro_span(ehdr, header_data)
+        .map_err(|_| procmgr_errors::INVALID_ELF)?
         .map(|(va, sz)| ((va + bias) & !0xFFF, (va + bias + sz + 0xFFF) & !0xFFF));
 
     // Parse the optional stack-size note. Section headers and the note

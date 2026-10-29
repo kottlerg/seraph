@@ -1879,6 +1879,10 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 ///   split, or revoking an ancestor of it unmaps the mapping
 ///   (`core/kernel/docs/syscalls.md` § `SYS_MMIO_MAP`).
 ///
+/// # Safety
+/// The contract of [`mem_map`], for the span the MMIO region covers at
+/// `virt`.
+///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned or
 /// non-canonical, or the range leaves the user half), `InvalidCapability`,
@@ -1888,10 +1892,6 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 /// pool exhausted; refill with [`cap_create_aspace`] in augment mode). An
 /// `OutOfMemory` failure keeps the mapping's record and the pages already
 /// mapped; a retry at the same `virt` reuses the record.
-///
-/// # Safety
-/// The contract of [`mem_map`], for the span the MMIO region covers at
-/// `virt`.
 #[inline]
 pub unsafe fn mmio_map(aspace_cap: u32, mmio_cap: u32, virt: u64, flags: u64) -> Result<(), i64>
 {

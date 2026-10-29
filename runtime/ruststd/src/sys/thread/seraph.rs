@@ -878,8 +878,11 @@ extern "C" fn thread_entry(arg: u64) -> ! {
     // allocated for this thread alone; no Rust object lives in it, and std
     // reaches it only through the raw `current_ipc_buf` pointer, holding no
     // reference across an IPC syscall.
-    let _ = unsafe { syscall::ipc_buffer_set(args.ipc_buffer_vaddr) };
-    crate::os::seraph::set_current_ipc_buf(args.ipc_buffer_vaddr as *mut u64);
+    if unsafe { syscall::ipc_buffer_set(args.ipc_buffer_vaddr) }.is_ok() {
+        // SAFETY: the page was registered for this thread just above; a
+        // refused registration leaves the TLS pointer null.
+        unsafe { crate::os::seraph::set_current_ipc_buf(args.ipc_buffer_vaddr as *mut u64) };
+    }
 
     // SAFETY: args.init was produced via `Box::into_raw(init)` in
     // Thread::new; consumed exactly once here.

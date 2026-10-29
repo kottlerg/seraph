@@ -321,7 +321,10 @@ impl io::Write for PanicWriter {
         if cap == 0 || ipc_ptr.is_null() {
             return Ok(buf.len());
         }
-        ::log::write_bytes(cap, ipc_ptr, buf);
+        // SAFETY: `current_ipc_buf` is non-null (checked above), so it is
+        // this thread's registered IPC buffer page (`_start` and the spawn
+        // trampoline set it after registering).
+        unsafe { ::log::write_bytes(cap, ipc_ptr, buf) };
         Ok(buf.len())
     }
 

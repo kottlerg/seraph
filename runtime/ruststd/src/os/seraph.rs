@@ -238,8 +238,14 @@ static IPC_BUF_TLS: Cell<*mut u64> = Cell::new(core::ptr::null_mut());
 
 /// Record the current thread's IPC buffer VA. Called by `_start` and by the
 /// thread trampoline immediately after `syscall::ipc_buffer_set`.
+///
+/// # Safety
+/// `buf` must be null or the calling thread's IPC buffer page as registered
+/// via `syscall::ipc_buffer_set`: std's IPC paths (`log!`, the stdio and
+/// panic writers, registry lookups) pass [`current_ipc_buf`] to
+/// `ipc::ipc_call`, whose contract requires exactly that.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn set_current_ipc_buf(buf: *mut u64) {
+pub unsafe fn set_current_ipc_buf(buf: *mut u64) {
     IPC_BUF_TLS.set(buf);
 }
 
@@ -359,8 +365,11 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
     // page, outside every image, stack, heap and TLS mapping
     // (docs/userspace-memory-model.md); std reaches it only through the raw
     // `current_ipc_buf` pointer, holding no reference across an IPC syscall.
-    let _ = unsafe { syscall::ipc_buffer_set(info.ipc_buffer_vaddr) };
-    set_current_ipc_buf(info.ipc_buffer_vaddr as *mut u64);
+    if unsafe { syscall::ipc_buffer_set(info.ipc_buffer_vaddr) }.is_ok() {
+        // SAFETY: the page was registered for this thread just above; a
+        // refused registration leaves the TLS pointer null.
+        unsafe { set_current_ipc_buf(info.ipc_buffer_vaddr as *mut u64) };
+    }
 
     // Build the argv slice from the ProcessInfo-page region procmgr wrote.
     // `args_offset` is a byte offset within the mapped ProcessInfo page;
@@ -493,14 +502,16 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
             info.self_aspace_cap,
         );
         if !ok {
-            ::log::emit(
+            // SAFETY: `_start` registered `info.ipc_buffer_vaddr` and
+            // installed it as `current_ipc_buf` above.
+            unsafe { ::log::emit(
                 current_ipc_buf(),
                 format_args!(
                     "std::os::seraph: FATAL: heap_bootstrap failed (memmgr_ep={}); \
                      likely memmgr frame-pool exhaustion — aborting",
                     info.memmgr_endpoint_cap,
                 ),
-            );
+            ) };
             syscall::process_exit(STARTUP_FAIL_HEAP);
         }
         // Wire the object-slab refill path against the same memmgr endpoint.
@@ -993,7 +1004,10 @@ pub mod log {
     pub fn register_name(name: &[u8]) {
         let buf = current_ipc_buf();
         let cap = ::log::ensure_badged_cap(buf);
-        ::log::register_name(cap, buf, name);
+        // SAFETY: `current_ipc_buf` is null or this thread's registered IPC
+        // buffer page (`_start` and the spawn trampoline set it after
+        // registering).
+        unsafe { ::log::register_name(cap, buf, name) };
     }
 
     /// Macro entry point. Resolves the calling thread's IPC buffer and
@@ -1003,7 +1017,10 @@ pub mod log {
     #[doc(hidden)]
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn __emit(args: core::fmt::Arguments<'_>) {
-        ::log::emit(current_ipc_buf(), args);
+        // SAFETY: `current_ipc_buf` is null or this thread's registered IPC
+        // buffer page (`_start` and the spawn trampoline set it after
+        // registering).
+        unsafe { ::log::emit(current_ipc_buf(), args) };
     }
 }
 

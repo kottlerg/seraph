@@ -25,8 +25,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
     RIGHTS_ALL, cap_create_notification, cap_create_thread, cap_delete, cap_derive,
-    notification_send, notification_wait, sched_split, thread_configure, thread_exit,
-    thread_set_affinity, thread_start,
+    notification_send, sched_split, thread_configure, thread_exit, thread_set_affinity,
+    thread_start,
 };
 use syscall_abi::{CAP_INFO_CSPACE_USED, SyscallError, SystemInfoType};
 
@@ -40,6 +40,10 @@ const CHILDREN: usize = 600;
 const SPLIT_AT: u8 = 21;
 const BIT_DELETED: u64 = 1 << 0;
 const BIT_DELETE_FAILED: u64 = 1 << 1;
+/// Poll bound for each sibling's exit: ~100 s at ~1 ms per poll, through
+/// [`crate::scaled_polls`], which stretches it past [`crate::UNSCALED_CPUS`]
+/// CPUs, where the sibling's CPU waits for a host core.
+const EXIT_POLLS: u32 = 100_000;
 
 static mut SIBLING_STACK: ChildStack = ChildStack::ZERO;
 
@@ -98,8 +102,13 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         GO.store(1, Ordering::Release);
         let split = sched_split(orig, SPLIT_AT);
-        let bits =
-            notification_wait(done).map_err(|_| "stress::split_delete_race: done wait failed")?;
+        let mut bits = 0u64;
+        crate::tally::await_report(
+            done,
+            &mut bits,
+            BIT_DELETED | BIT_DELETE_FAILED,
+            "stress::split_delete_race: sibling never reported its delete",
+        )?;
         let deleted = bits & BIT_DELETED != 0;
         match split
         {
@@ -120,7 +129,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         {
             cap_delete(child).map_err(|_| "stress::split_delete_race: delete child failed")?;
         }
-        spawn::wait_until_exited(th, 100_000)?;
+        spawn::wait_until_exited(th, crate::scaled_polls(EXIT_POLLS))?;
         cap_delete(th).map_err(|_| "stress::split_delete_race: reap sibling failed")?;
     }
 

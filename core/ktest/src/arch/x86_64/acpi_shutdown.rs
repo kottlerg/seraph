@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// core/ktest/src/acpi_shutdown.rs
+// core/ktest/src/arch/x86_64/acpi_shutdown.rs
 
 //! ACPI S5 (soft-off) shutdown for x86-64.
 //!
@@ -62,7 +62,7 @@ pub fn shutdown(info: &InitInfo)
         return;
     };
 
-    if !crate::ioport::bind_port_range(info.thread_cap, pm1a_cnt_blk, PM1A_CNT_PORTS)
+    if !super::ioport::bind_port_range(info.thread_cap, pm1a_cnt_blk, PM1A_CNT_PORTS)
     {
         crate::log("ktest: shutdown failed (ioport_bind)");
         return;

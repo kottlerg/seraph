@@ -574,10 +574,8 @@ pub fn run_all(ctx: &TestContext)
         "hw::irq_split_wrong_tag_err",
         hw::irq_split_wrong_tag_err(ctx)
     );
-    run_test!("hw::ioport_bind", hw::ioport_bind(ctx));
-    run_test!("hw::ioport_split", hw::ioport_split(ctx));
 
-    // ── Architecture-specific tests (thread configure, SBI call) ──────────────
+    // ── Architecture-specific tests (`crate::arch::run_unit`) ────────────────────
     crate::arch::run_unit(ctx);
 
     // ── System info syscalls ──────────────────────────────────────────────────

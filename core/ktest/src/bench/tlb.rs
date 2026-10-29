@@ -18,21 +18,26 @@
 //!
 //! ## Worker shutdown contract
 //!
-//! The workers must terminate cleanly before the bench's `cap_delete`
-//! cleanup, otherwise `cap_delete` of a still-running pinned thread
-//! on a CPU with no other ready threads races a kernel preemption
-//! point — observed to hang the harness past the CI per-run watchdog
-//! on both `x86_64` and `riscv64` in release mode.
+//! The workers are asked to leave their loop before the bench's
+//! `cap_delete` cleanup: `cap_delete` of a pinned thread still running
+//! the bench loop, on a CPU with no other ready threads, was observed to
+//! race a kernel preemption point and hang the harness past the CI
+//! per-run watchdog on both `x86_64` and `riscv64` in release mode.
 //!
-//! The fix here is cooperative: workers check `EXIT_REQUESTED` between
-//! yields and call `thread_exit` themselves. By the time the parent
-//! calls `cap_delete`, every worker is already Exited.
+//! The mitigation is cooperative, and it narrows that window rather than
+//! closing it: workers check `EXIT_REQUESTED` between yields and call
+//! `thread_exit` themselves, so a deleted worker is at most finishing its
+//! last two syscalls (the done send and the exit). By the time the parent
+//! calls `cap_delete`, every worker has sent its done bit and is about to
+//! exit (it may not yet be Exited: the bit precedes `thread_exit`), or
+//! failed to report within the parent's bounded wait (logged); either may
+//! still be running when deleted, which the kernel's Thread teardown
+//! drains.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use syscall::{
-    cap_create_notification, cap_delete, notification_send, notification_wait, system_info,
-    thread_exit, thread_yield,
+    cap_create_notification, cap_delete, notification_send, system_info, thread_exit, thread_yield,
 };
 use syscall_abi::SystemInfoType;
 
@@ -62,9 +67,9 @@ static SPINNER_ARGS: spawn::ArgBlock<SpinnerArgs, MAX_PINNED> = spawn::ArgBlock:
 });
 
 /// Set by the parent before its `cap_delete` cleanup. Workers poll this
-/// between yields and exit cleanly when set; the parent then `notification_wait`s
+/// between yields and exit cleanly when set; the parent then waits, bounded,
 /// on the per-worker exited-bits before deleting any Thread cap, so
-/// `cap_delete` never has to reap a running thread.
+/// `cap_delete` reaps a running thread only after a worker failed to report.
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Worker entry: `notification_send` this worker's unique bit on `ready`, then
@@ -74,8 +79,8 @@ static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 ///
 /// `arg`: address of this worker's [`SpinnerArgs`]. Each worker sends a unique
 /// bit: notification bits coalesce (see docs/ipc-design.md § Notifications), so
-/// identical bits from N workers would wake the parent's `notification_wait` loop
-/// once and hang it on the second iteration.
+/// identical bits from N workers would wake the parent's bounded wait once
+/// and leave it waiting out its bound for the rest.
 extern "C" fn shootdown_spinner_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the bench published for this worker.
@@ -104,8 +109,7 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     // Print the header up front so failures in the spawn / notification_wait /
     // measure loop are bisectable on the boot log instead of looking
     // like the bench never ran. Min/mean/max are logged after the measure loop
-    // runs with `iters > 0`, including after a loop that broke early (the mean
-    // divides by `iters`, not the completed count; #444).
+    // completes at least one iteration, the mean over the iterations completed.
     log_bench_header("tlb_shootdown_unmap", iters);
 
     let cpus = system_info(SystemInfoType::CpuCount as u64).unwrap_or(1);
@@ -190,15 +194,11 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     // Wait for every spawned child's unique ready-bit (saturate then drop
     // the loop). Identical bits from N workers would coalesce into one
     // wakeup (docs/ipc-design.md § Notifications), so each worker sends `1 << i`.
-    if spawned > 0
-    {
-        let all_ready = (1u64 << spawned) - 1;
-        let mut ready_bits: u64 = 0;
-        while ready_bits & all_ready != all_ready
-        {
-            ready_bits |= notification_wait(ready).unwrap_or(0);
-        }
-    }
+    await_worker_bits(
+        ready,
+        spawned,
+        "ktest: bench  tlb: a worker never reported ready",
+    );
 
     let Some(memory_cap) = crate::frame_pool::alloc()
     else
@@ -213,6 +213,9 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     let mut min = u64::MAX;
     let mut max = 0u64;
     let mut total = 0u64;
+    let mut completed: u64 = 0;
+    // Whether the frame is left mapped at BENCH_VA (an unmap failed).
+    let mut still_mapped = false;
 
     for _ in 0..n
     {
@@ -230,8 +233,13 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
         }
         // Measure the unmap — that's the path that issues the shootdown IPI.
         let t0 = cycles_now();
-        let _ = syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1);
+        let unmapped = syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1).is_ok();
         let t1 = cycles_now();
+        if !unmapped
+        {
+            still_mapped = true;
+            break;
+        }
         let delta = t1.saturating_sub(t0);
         if delta < min
         {
@@ -242,17 +250,25 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
             max = delta;
         }
         total = total.saturating_add(delta);
+        completed += 1;
     }
 
-    // SAFETY: memory_cap is from pool and now unmapped.
-    unsafe { crate::frame_pool::free(memory_cap) };
+    // A frame still mapped stays out of the pool rather than alias the next
+    // test's mapping.
+    if !still_mapped
+    {
+        // SAFETY: memory_cap is from pool and mapped nowhere: every map in the
+        // loop was undone by a successful unmap, or failed.
+        unsafe { crate::frame_pool::free(memory_cap) };
+    }
 
     // Cooperative teardown: flip the flag, wait for every worker's
-    // exit-bit on `done`, then cap_delete (each Thread is already Exited).
+    // done bit (bounded), then cap_delete (each Thread is about to exit, or
+    // missed the wait; either may still be running).
     EXIT_REQUESTED.store(true, Ordering::Release);
     teardown(&threads, &cspaces, spawned, ready, done);
 
-    if let Some(mean) = total.checked_div(n)
+    if let Some(mean) = total.checked_div(completed)
     {
         crate::log_u64("ktest: bench  cycles_min=", min);
         crate::log_u64("ktest: bench  cycles_mean=", mean);
@@ -263,8 +279,10 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 /// Wait for every spawned worker's `done` bit, then `cap_delete` all
 /// thread + cspace caps. Each worker `notification_send`s its `1 << i` bit on
 /// `done` right before `thread_exit`; the parent accumulates all bits
-/// before issuing any `cap_delete`, so every Thread cap deleted is in
-/// the Exited state.
+/// before issuing any `cap_delete`, so every Thread deleted is about to
+/// exit, though it may not yet be Exited. If a worker does not report
+/// within the bound, the timeout is logged. Either way a Thread may still
+/// be running when deleted, which the kernel's Thread teardown drains.
 fn teardown(
     threads: &[u32; MAX_PINNED],
     cspaces: &[u32; MAX_PINNED],
@@ -273,17 +291,11 @@ fn teardown(
     done: u32,
 )
 {
-    if spawned > 0
-    {
-        // Saturate the expected bitmask; `1u64 << spawned` would overflow
-        // at `spawned == 64`, but MAX_PINNED caps us well below that.
-        let all_done = (1u64 << spawned) - 1;
-        let mut done_bits: u64 = 0;
-        while done_bits & all_done != all_done
-        {
-            done_bits |= notification_wait(done).unwrap_or(0);
-        }
-    }
+    await_worker_bits(
+        done,
+        spawned,
+        "ktest: bench  tlb: a worker never reported done",
+    );
     for i in 0..spawned
     {
         cap_delete(threads[i]).ok();
@@ -291,6 +303,26 @@ fn teardown(
     }
     cap_delete(ready).ok();
     cap_delete(done).ok();
+}
+
+/// Wait, bounded (`tally::await_all`), for each of the first `spawned`
+/// workers' bit (`1 << i`) on `notif`. On a timeout or a failed wait, log
+/// `label` and return, so a worker that never reports cannot hang the bench
+/// (the benches produce no verdict; their teardown deletes the workers).
+fn await_worker_bits(notif: u32, spawned: usize, label: &'static str)
+{
+    if spawned == 0
+    {
+        return;
+    }
+    // `1u64 << spawned` would overflow at `spawned == 64`, but MAX_PINNED
+    // caps it well below that.
+    let all = (1u64 << spawned) - 1;
+    let mut acc = 0u64;
+    if crate::tally::await_all(notif, &mut acc, all, label).is_err()
+    {
+        crate::log(label);
+    }
 }
 
 // ── Concurrent-initiator variant ───────────────────────────────────────────────
@@ -575,19 +607,16 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     crate::log_u64("ktest: bench  conc_workers=", spawned as u64);
 
     // Wait for every worker's unique ready bit, then release them together.
-    if spawned > 0
-    {
-        let all_ready = (1u64 << spawned) - 1;
-        let mut ready_bits: u64 = 0;
-        while ready_bits & all_ready != all_ready
-        {
-            ready_bits |= notification_wait(ready).unwrap_or(0);
-        }
-    }
+    await_worker_bits(
+        ready,
+        spawned,
+        "ktest: bench  tlb: a worker never reported ready",
+    );
     CONC_GO.store(true, Ordering::Release);
 
     // Cooperative teardown: wait every worker's done bit (each is about to
-    // thread_exit), then delete caps — no cap_delete races a running worker.
+    // thread_exit), then delete caps; a worker may still be running when
+    // deleted (its bit precedes thread_exit, or it missed the bounded wait).
     teardown(&threads, &cspaces, spawned, ready, done);
 
     for (i, fr) in memory_caps.iter().enumerate().take(allocated)
@@ -596,11 +625,14 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         // pool: a worker that hit an (unexpected) mem_unmap error exits with its
         // VA still mapped, and frame_pool::free requires the frame unmapped.
         // mem_unmap is idempotent, so this is a no-op for the normal path and
-        // for frames whose worker never spawned.
+        // for frames whose worker never spawned. A frame whose unmap fails
+        // stays out of the pool rather than alias the next test's mapping.
         let va = CONC_VA_BASE + (i as u64) * CONC_VA_STRIDE;
-        let _ = syscall::mem_unmap(ctx.aspace_cap, va, 1);
-        // SAFETY: frame is from the pool and now unmapped (above).
-        unsafe { crate::frame_pool::free(*fr) };
+        if syscall::mem_unmap(ctx.aspace_cap, va, 1).is_ok()
+        {
+            // SAFETY: frame is from the pool and its mapping was just removed.
+            unsafe { crate::frame_pool::free(*fr) };
+        }
     }
 
     let map_cnt = CONC_MAP_CNT.load(Ordering::Acquire);

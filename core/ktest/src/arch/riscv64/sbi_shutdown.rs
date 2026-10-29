@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// core/ktest/src/sbi_shutdown.rs
+// core/ktest/src/arch/riscv64/sbi_shutdown.rs
 
 //! SBI SRST (System Reset) shutdown for RISC-V.
 //!

@@ -79,13 +79,30 @@ impl EventRing
 
     /// Pull one filled event off the used ring, re-posting its buffer. Returns
     /// `None` when the used ring is empty.
+    ///
+    /// A used element `poll_used` refuses (an id heading no outstanding
+    /// chain) is skipped: it names no buffer this ring posted, and the free
+    /// list is untouched.
     pub fn drain(&mut self, vq: &mut SplitVirtqueue) -> Option<VirtioInputEvent>
     {
-        let (head, _len) = vq.poll_used()?;
-        let slot = self.slot_for_head[head as usize];
-        let event = self.read_event(slot);
-        self.post(vq, slot);
-        Some(event)
+        loop
+        {
+            match vq.poll_used()
+            {
+                Ok(Some((head, _len))) =>
+                {
+                    // poll_used returns only outstanding heads, which add_chain
+                    // handed out below queue_size <= EVENT_QUEUE_SIZE.
+                    let slot = self.slot_for_head[usize::from(head)];
+                    let event = self.read_event(slot);
+                    self.post(vq, slot);
+                    return Some(event);
+                }
+                Ok(None) => return None,
+                Err(_) =>
+                {}
+            }
+        }
     }
 
     /// Post buffer `slot` to the eventq and record its descriptor head. A full

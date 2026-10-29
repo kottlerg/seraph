@@ -154,26 +154,13 @@ fn handle_request(msg: &IpcMessage, irq_cap: u32, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
-/// one more before the fatal exit.
-fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
-{
-    match stage
-    {
-        ipc::recv_guard::RecvFailureStage::First =>
-        {
-            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
-        }
-        ipc::recv_guard::RecvFailureStage::Fatal =>
-        {
-            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
-        }
-    }
-}
-
 fn service_loop(service_ep: u32, irq_cap: u32, ipc_buf: *mut u64) -> !
 {
-    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    // No diagnostic hook: a `log!` here is a blocking call into logd, which
+    // may itself be blocked calling this driver (see the module doc). The
+    // kernel's rate-limited recv-failure line and the guard's exit remain
+    // the signal.
+    let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.

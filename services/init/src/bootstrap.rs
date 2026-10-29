@@ -720,8 +720,9 @@ fn descriptor_for(info: &InitInfo, slot: u32) -> Option<&CapDescriptor>
 /// go in each spawned process's `ProcessInfo.memmgr_endpoint_cap`.
 // similar_names: memmgr's kernel objects are named by kind (`mm_aspace`,
 // `mm_cspace`). too_many_lines: memmgr's raw bring-up is one ordered sequence
-// (load, map, create objects, seed caps, start) whose steps share the caps it
-// creates, and every failure exit must see them all.
+// (load the image, create its objects, mint its creator cap, populate its
+// `ProcessInfo`, place its stack and IPC buffer) whose steps share the caps
+// it creates.
 #[allow(clippy::similar_names, clippy::too_many_lines)]
 pub fn bootstrap_memmgr(
     info: &InitInfo,

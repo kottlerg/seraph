@@ -583,11 +583,15 @@ pub fn create_devmgr_with_caps(
             {
                 continue;
             };
+            // A failed derive skips the module (the aperture and ACPI rounds
+            // likewise carry on past a cap they cannot derive): returning
+            // here would leave devmgr blocked in `request_round` without the
+            // terminal round.
             let Ok(module_copy) = syscall::cap_derive(module_cap, syscall::RIGHTS_ALL)
             else
             {
-                log("devmgr: driver module cap derive failed");
-                return None;
+                log("devmgr: driver module cap derive failed; module skipped");
+                continue;
             };
             module_caps[n] = module_copy;
             module_data[2 + n] = tag;
@@ -749,9 +753,6 @@ pub fn create_devmgr_with_caps(
 // ── vfsd creation ────────────────────────────────────────────────────────────
 
 /// Endpoint set passed to vfsd via its bootstrap round.
-// struct_field_names: both fields are endpoints, and the shared `_ep` suffix
-// is the codebase's name for an endpoint cap slot.
-#[allow(clippy::struct_field_names)]
 pub struct VfsdSpawnCaps
 {
     pub registry_ep: u32,
@@ -966,10 +967,6 @@ mod endow_kind
 /// derives the shapes it publishes / sends / launches with from these
 /// reserved sources; it keeps the log-sink sources for the system's life
 /// so it can (re)launch real-logd any number of times.
-// struct_field_names: every field is a cap slot named for the service it
-// addresses and the cap kind (`_ep`, `_cap`, `_source`), as everywhere else
-// in init; dropping the shared affixes would lose which slot is which.
-#[allow(clippy::struct_field_names)]
 pub struct SvcmgrEndowment
 {
     pub svcmgr_service_ep: u32,
@@ -1009,9 +1006,15 @@ pub struct SvcmgrEndowment
 /// keeps to launch + supervise + restart real-logd: the master-log endpoint
 /// source and a badge-0 procmgr `SEND|GRANT` source (see [`SvcmgrEndowment`]).
 ///
-/// Best-effort: a failed round logs and aborts the endowment; svcmgr then
-/// runs with whatever it received (the system is already non-viable if a
-/// substrate thread cap cannot be delivered).
+/// Best-effort: a failed round logs and ends the endowment early with the
+/// terminal round, so svcmgr leaves its round loop and runs with whatever it
+/// received (the system is already non-viable if a substrate thread cap
+/// cannot be delivered) instead of blocking in it.
+///
+/// Returns whether svcmgr was started and received the `CAPS` round, which
+/// carries its service endpoint: only then can it receive `HANDOVER_COMPLETE`,
+/// so phase 3 sends that only on `true`. The endpoint copies are derived
+/// before svcmgr starts, so a failed derive leaves it unstarted.
 fn endow_svcmgr(
     bootstrap_ep: u32,
     process_handle: u32,
@@ -1019,8 +1022,21 @@ fn endow_svcmgr(
     endow: &SvcmgrEndowment,
     thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
-)
+) -> bool
 {
+    let Ok(service_copy) = syscall::cap_derive(endow.svcmgr_service_ep, syscall::RIGHTS_ALL)
+    else
+    {
+        log("phase 3: svcmgr service-ep derive failed; svcmgr not started");
+        return false;
+    };
+    let Ok(boot_copy) = syscall::cap_derive(endow.svcmgr_bootstrap_ep, syscall::RIGHTS_ALL)
+    else
+    {
+        log("phase 3: svcmgr bootstrap-ep derive failed; svcmgr not started");
+        return false;
+    };
+
     if !start_process(
         process_handle,
         ipc_buf,
@@ -1028,21 +1044,8 @@ fn endow_svcmgr(
         "phase 3: svcmgr START_PROCESS failed",
     )
     {
-        return;
+        return false;
     }
-
-    let Ok(service_copy) = syscall::cap_derive(endow.svcmgr_service_ep, syscall::RIGHTS_ALL)
-    else
-    {
-        log("phase 3: svcmgr service-ep derive failed");
-        return;
-    };
-    let Ok(boot_copy) = syscall::cap_derive(endow.svcmgr_bootstrap_ep, syscall::RIGHTS_ALL)
-    else
-    {
-        log("phase 3: svcmgr bootstrap-ep derive failed");
-        return;
-    };
     // rootfs.root SEND — badge inherited from the root fs namespace cap.
     let rootfs_send = if endow.rootfs_root_cap != 0
     {
@@ -1088,7 +1091,8 @@ fn endow_svcmgr(
         "phase 3: svcmgr endowment CAPS round failed",
     )
     {
-        return;
+        end_endowment(bootstrap_ep, child_badge, ipc_buf);
+        return false;
     }
 
     // Substrate rounds: one (name, thread_cap) each.
@@ -1114,7 +1118,8 @@ fn endow_svcmgr(
             "phase 3: svcmgr endowment SUBSTRATE round failed",
         )
         {
-            return;
+            end_endowment(bootstrap_ep, child_badge, ipc_buf);
+            return true;
         }
     }
 
@@ -1134,6 +1139,24 @@ fn endow_svcmgr(
         &[endow_kind::LOGD_SOURCES],
         "phase 3: svcmgr endowment LOGD_SOURCES round failed",
     );
+    true
+}
+
+/// End a failed endowment with an empty terminal `LOGD_SOURCES` round, so
+/// svcmgr leaves its round loop (`request_round`) rather than block in it.
+/// Best-effort: the round that failed may have left the bootstrap endpoint
+/// unusable, in which case this one fails too and is only logged.
+fn end_endowment(bootstrap_ep: u32, child_badge: u64, ipc_buf: *mut u64)
+{
+    let _ = serve(
+        bootstrap_ep,
+        child_badge,
+        ipc_buf,
+        true,
+        &[],
+        &[endow_kind::LOGD_SOURCES],
+        "phase 3: svcmgr endowment terminal round after a failure failed",
+    );
 }
 
 // ── Phase 3 orchestration ───────────────────────────────────────────────────
@@ -1149,8 +1172,8 @@ fn endow_svcmgr(
 /// svcmgr-launched services (`logd`, `timed`, `pwrmgr`); svcmgr's
 /// pure-consumer launch path fires only for staged test recipes (svctest /
 /// usertest, and crasher co-staged with svctest).
-// too_many_arguments: the handover passes svcmgr every cap init holds for it,
-// and each argument is a distinct slot from a different bootstrap stage.
+// too_many_arguments: the function carries both svcmgr's endowment and
+// procmgr's reap-handoff inputs, each from a different bootstrap stage.
 // too_many_lines: the handover is one ordered protocol (spawn, endowment
 // rounds, teardown registration, completion) that must run in sequence.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -1225,7 +1248,7 @@ pub fn phase3_svcmgr_handover(
         master_log_source,
         procmgr_death_auth_source,
     };
-    endow_svcmgr(
+    let svcmgr_endowed = endow_svcmgr(
         bootstrap_ep,
         svcmgr_handle,
         svcmgr_badge,
@@ -1245,28 +1268,16 @@ pub fn phase3_svcmgr_handover(
     // while the underlying objects keep backing init's still-running threads.
     let reap_bound = register_init_reap_objects(procmgr_ep, info, init_logd_thread_cap, ipc_buf);
 
-    // svcmgr honours HANDOVER_COMPLETE only through a SEND carrying the
-    // `HANDOVER_AUTHORITY` verb-bit, so init derives one for the call and
-    // deletes it.
-    let handover_msg = IpcMessage::new(svcmgr_labels::HANDOVER_COMPLETE);
-    match syscall::cap_derive_badge(
-        svcmgr_service_ep,
-        syscall::RIGHTS_EP_SEND,
-        svcmgr_labels::HANDOVER_AUTHORITY,
-    )
+    // A svcmgr that never received its service endpoint cannot receive
+    // HANDOVER_COMPLETE; the call would block init here forever and leave the
+    // reap unarmed, so it is skipped then.
+    if svcmgr_endowed
     {
-        Ok(handover_send) =>
-        {
-            // SAFETY: ipc_buf is caller's registered IPC buffer.
-            let result = unsafe { ipc::ipc_call(handover_send, &handover_msg, ipc_buf) };
-            let _ = syscall::cap_delete(handover_send);
-            match result
-            {
-                Ok(reply) if reply.label == 0 => log("phase 3: handover complete"),
-                _ => log("phase 3: handover failed"),
-            }
-        }
-        Err(_) => log("phase 3: handover cap derive failed"),
+        send_handover_complete(svcmgr_service_ep, ipc_buf);
+    }
+    else
+    {
+        log("phase 3: svcmgr endowment failed; handover skipped");
     }
 
     // Reap-handoff (donation + arm): stream init's reclaimable Memory caps to
@@ -1288,6 +1299,33 @@ pub fn phase3_svcmgr_handover(
 
     log("main thread exiting; init handed off to procmgr for reap");
     syscall::thread_exit();
+}
+
+/// Send svcmgr `HANDOVER_COMPLETE` on its service endpoint through a SEND
+/// carrying the `HANDOVER_AUTHORITY` verb-bit, derived for the call and
+/// deleted after it. Logs the outcome; a failure is not fatal to init.
+fn send_handover_complete(svcmgr_service_ep: u32, ipc_buf: *mut u64)
+{
+    let handover_msg = IpcMessage::new(svcmgr_labels::HANDOVER_COMPLETE);
+    match syscall::cap_derive_badge(
+        svcmgr_service_ep,
+        syscall::RIGHTS_EP_SEND,
+        svcmgr_labels::HANDOVER_AUTHORITY,
+    )
+    {
+        Ok(handover_send) =>
+        {
+            // SAFETY: ipc_buf is caller's registered IPC buffer.
+            let result = unsafe { ipc::ipc_call(handover_send, &handover_msg, ipc_buf) };
+            let _ = syscall::cap_delete(handover_send);
+            match result
+            {
+                Ok(reply) if reply.label == 0 => log("phase 3: handover complete"),
+                _ => log("phase 3: handover failed"),
+            }
+        }
+        Err(_) => log("phase 3: handover cap derive failed"),
+    }
 }
 
 /// Send one `REGISTER_INIT_TEARDOWN` donate-only round (word 0 = 0)

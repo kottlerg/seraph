@@ -175,9 +175,10 @@ impl<const N: usize> SenderTable<N>
     /// Re-registering the sender's current name, or an empty name, changes
     /// nothing and returns `None`. Otherwise the sender's previous name is
     /// released first, then the name is stored bare if no other sender holds
-    /// it, else as `name.2`, `name.3`, …, the first free suffix; when every
-    /// suffix collides (a full-length name leaves no room for one), the bare
-    /// name is stored, colliding. Returns the index of the slot whose name
+    /// it, else as `name.2`, `name.3`, …, the first free suffix; a name too
+    /// long to hold its suffix within [`MAX_NAME_LEN`] gets truncated
+    /// suffixed forms, and when every one of those collides, the bare name is
+    /// stored, colliding. Returns the index of the slot whose name
     /// changed; [`SenderSlot::name`] gives the stored form.
     pub fn register_name(&mut self, badge: u64, requested: &[u8]) -> Option<usize>
     {
@@ -206,8 +207,9 @@ impl<const N: usize> SenderTable<N>
 
     /// Write into `out` the bare `requested` name if no occupied slot holds
     /// it, else the first `requested.<n>` (`n` from 2) no slot holds, else the
-    /// bare name; return its length. `N + 1` suffixes always leave one free
-    /// unless truncation makes every suffixed form equal the bare name.
+    /// bare name; return its length. The `N` suffixes `2..=N + 1` leave one
+    /// free against the at most `N - 1` other names, unless truncation
+    /// collapses them into names already held.
     fn resolve_unique_name(&self, requested: &[u8], out: &mut [u8; MAX_NAME_LEN]) -> usize
     {
         if !self.name_in_use(requested)
@@ -309,20 +311,46 @@ mod tests
     }
 
     #[test]
-    fn a_full_table_of_named_senders_evicts_round_robin_with_a_clean_slot()
+    fn a_full_table_of_named_senders_evicts_them_round_robin()
     {
-        let mut t = SenderTable::<2>::new();
-        let first = t.register_name(1, b"a").expect("name stored");
-        let second = t.register_name(2, b"b").expect("name stored");
-        t.slot_mut(first).push_byte(b'x');
+        let mut t = SenderTable::<3>::new();
+        for badge in 1..=3
+        {
+            assert!(t.register_name(badge, b"s").is_some());
+        }
+        // Each newcomer registers a name, so every slot stays named and the
+        // victim advances one slot per eviction.
+        let first = t.register_name(4, b"n").expect("name stored");
+        let second = t.register_name(5, b"n").expect("name stored");
+        let third = t.register_name(6, b"n").expect("name stored");
+        assert_eq!([first, second, third], [0, 1, 2]);
+        assert_eq!(t.register_name(7, b"n"), Some(0));
+    }
 
-        assert_eq!(t.find_or_alloc(3), first);
-        assert_eq!(t.slots()[first].badge(), 3);
-        assert!(t.slots()[first].name().is_empty());
-        assert!(t.slots()[first].line().is_empty());
-        // Badge 3 is unnamed now, so the next newcomer takes its slot again.
-        assert_eq!(t.find_or_alloc(4), first);
-        assert_eq!(t.slots()[second].name(), b"b");
+    #[test]
+    fn an_evicted_slot_starts_with_no_name_and_no_line()
+    {
+        let mut t = SenderTable::<1>::new();
+        let slot = t.register_name(1, b"a").expect("name stored");
+        t.slot_mut(slot).push_byte(b'x');
+
+        assert_eq!(t.find_or_alloc(2), slot);
+        assert_eq!(t.slots()[slot].badge(), 2);
+        assert!(t.slots()[slot].name().is_empty());
+        assert!(t.slots()[slot].line().is_empty());
+    }
+
+    #[test]
+    fn suffixes_past_nine_keep_their_digit_order()
+    {
+        let mut t = SenderTable::<12>::new();
+        let mut last = 0;
+        for badge in 1..=11
+        {
+            last = t.register_name(badge, b"w").expect("stored");
+        }
+        assert_eq!(t.slots()[last].name(), b"w.11");
+        assert!(t.slots().iter().any(|s| s.name() == b"w.10"));
     }
 
     #[test]

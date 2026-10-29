@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+# Host-testable logic (bins are test = false).
+[lib]
+name = "framebuffer"
+path = "src/lib.rs"
+
 [[bin]]
 name = "framebuffer"
 path = "src/main.rs"

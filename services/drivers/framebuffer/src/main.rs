@@ -30,19 +30,19 @@
 //! the decoder.
 //!
 //! Like the serial driver, this driver MUST NOT call
-//! `std::os::seraph::log!`: a future logd fanout that routes its own
-//! output here would deadlock (driver → log endpoint → logd → driver).
-//! Diagnostics are dropped; fatal bootstrap failures `thread_exit`
-//! silently. The kernel framebuffer renderer
+//! `std::os::seraph::log!`: logd mirrors every log line here through a
+//! blocking `FB_WRITE_BYTES` call, so a log call would deadlock
+//! (driver → log endpoint → logd → driver). Diagnostics are dropped;
+//! fatal bootstrap failures `thread_exit` silently. The kernel framebuffer renderer
 //! (`core/kernel/src/framebuffer.rs`) remains the early-boot / panic
 //! fallback (see `docs/console-model.md`).
 
 #![allow(clippy::cast_possible_truncation)]
 
 mod arch;
-mod render;
 
 use boot_protocol::FramebufferInfo;
+use framebuffer::render;
 use ipc::{IpcMessage, devmgr_labels, fb_errors, fb_labels};
 use std::os::seraph::startup_info;
 use text::{DecodeOutcome, Utf8Decoder};
@@ -231,27 +231,14 @@ unsafe fn render_at(writer: &mut render::FramebufferWriter, cp: u32)
     });
 }
 
-/// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
-/// one more before the fatal exit.
-fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
-{
-    match stage
-    {
-        ipc::recv_guard::RecvFailureStage::First =>
-        {
-            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
-        }
-        ipc::recv_guard::RecvFailureStage::Fatal =>
-        {
-            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
-        }
-    }
-}
-
 fn service_loop(service_ep: u32, mut writer: render::FramebufferWriter, ipc_buf: *mut u64) -> !
 {
     let mut decoder = Utf8Decoder::new();
-    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    // No diagnostic hook: a `log!` here is a blocking call into logd, which
+    // may itself be blocked mirroring a line to this driver (see the module
+    // doc). The kernel's rate-limited recv-failure line and the guard's exit
+    // remain the signal.
+    let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -313,9 +300,9 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    // SAFETY: arch::fb_mmio_init mapped the entire framebuffer MMIO
-    // region as writable; `fb_info.physical_base != 0` was verified
-    // upstream (devmgr skipped this driver when it was zero).
+    // SAFETY: arch::fb_mmio_init mapped total_pages pages, which cover
+    // `stride * height` bytes, writable at `base`; `new` validates the
+    // geometry itself and returns None for a framebuffer it cannot drive.
     let Some(writer) = (unsafe { render::FramebufferWriter::new(base, &fb_info) })
     else
     {

@@ -2335,11 +2335,8 @@ pub mod blk_errors
     /// Memory cap rejected: `BLK_READ_INTO_MEMORY` target missing
     /// `MAP|WRITE` rights, `BLK_WRITE_FROM_MEMORY` source missing
     /// `MAP` rights, smaller than `count * 512` bytes, or absent;
-    /// also returned when `count` is 0 or `count * 512` exceeds `u32::MAX`.
-    /// virtio-blk does not yet check the `count * 512` multiply for
-    /// overflow: a `count` of 2^55 or more panics the driver under the dev
-    /// profile (`overflow-checks = true`) and wraps in release instead of
-    /// returning this error (#454).
+    /// also returned when `count` is 0 or `count * 512` exceeds `u32::MAX`
+    /// (an overflowing multiply included).
     pub const INVALID_MEMORY_CAP: u64 = 5;
     /// Caller's compiled `BLK_LABELS_VERSION` does not match the receiver's.
     /// `REGISTER_PARTITION` is the handshake entry point and carries the
@@ -2347,6 +2344,14 @@ pub mod blk_errors
     /// and `length_lba` to `data[2]`); mismatch here means the caller was
     /// built against a different revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 6;
+    /// The request got no usable completion: the device did not complete it
+    /// within the driver's timeout, published a malformed completion, wrote a
+    /// status byte outside `VirtIO`'s set, or the chain could not be queued.
+    /// After a lost request the driver resets the device, so the reply's
+    /// Memory cap is free of device DMA, and answers every later
+    /// `BLK_READ_INTO_MEMORY` / `BLK_WRITE_FROM_MEMORY` with this code
+    /// (fail-stop).
+    pub const DEVICE_FAULT: u64 = 7;
     /// Unknown opcode on block endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }

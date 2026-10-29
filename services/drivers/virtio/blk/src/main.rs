@@ -18,6 +18,7 @@ mod io;
 use ipc::{IpcMessage, blk_labels, devmgr_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use syscall_abi::PAGE_SIZE;
+use virtio_blk::IoOutcome;
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::{self, SplitVirtqueue};
 use virtio_core::{
@@ -291,7 +292,11 @@ fn request_memory_caps(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Op
 /// section 3.1.1): reset, acknowledge, negotiate features, read capacity.
 fn init_device(transport: &PciTransport) -> u64
 {
-    transport.reset();
+    if !transport.try_reset()
+    {
+        std::os::seraph::log!("device reset unacknowledged");
+        syscall::thread_exit();
+    }
     transport.set_status(STATUS_ACKNOWLEDGE);
     transport.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
@@ -418,6 +423,12 @@ fn setup_virtqueue(
             queue_size,
         )
     };
+    let Some(vq) = vq
+    else
+    {
+        std::os::seraph::log!("device offers no usable requestq (queue size {queue_size})");
+        syscall::thread_exit();
+    };
 
     (vq, queue_notify_off)
 }
@@ -487,6 +498,9 @@ pub struct BlkRuntime<'a>
     /// `MOUNT_AUTHORITY` bit lives at `1 << 63`; this counter stays in
     /// the low bits and so is bit-disjoint by construction.
     next_partition_badge: u64,
+    /// Set once [`quiesce_device`] has reset the device after a lost
+    /// request; every later transfer is answered `DEVICE_FAULT`.
+    device_faulted: bool,
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
@@ -529,11 +543,11 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
         {
             blk_labels::BLK_READ_INTO_MEMORY =>
             {
-                handle_read_block_into_memory(&msg, ipc_buf, rt);
+                handle_transfer(&msg, ipc_buf, rt, io::IoDirection::Read);
             }
             blk_labels::BLK_WRITE_FROM_MEMORY =>
             {
-                handle_write_block_from_memory(&msg, ipc_buf, rt);
+                handle_transfer(&msg, ipc_buf, rt, io::IoDirection::Write);
             }
             blk_labels::REGISTER_PARTITION =>
             {
@@ -549,102 +563,47 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
     }
 }
 
-/// Handle a `BLK_READ_INTO_MEMORY` request.
+/// Handle a `BLK_READ_INTO_MEMORY` (`dir` = [`io::IoDirection::Read`]) or
+/// `BLK_WRITE_FROM_MEMORY` (`dir` = [`io::IoDirection::Write`]) request.
 ///
-/// Reads `caps[0]` (target Memory cap) and DMAs `data[1]` consecutive sectors
-/// (default 1) starting at LBA `data[0]` into the memory cap at offset 0,
-/// packed contiguously. The memory cap must be at least `count * 512` bytes;
-/// the driver rejects with `INVALID_MEMORY_CAP` otherwise.
+/// `caps[0]` is the data-segment Memory cap: the read target, which needs
+/// `MAP|WRITE` rights, or the write source, which needs `MAP`. The device
+/// DMAs `data[1]` consecutive sectors (default 1) starting at LBA `data[0]`
+/// into or out of the cap at offset 0, packed contiguously; the cap must be
+/// at least `count * 512` bytes or the driver rejects with
+/// `INVALID_MEMORY_CAP`.
 ///
 /// `caps[1]` and `caps[2]` are reserved IPC-shape slots and remain null
-/// pre-IOMMU; the driver does not inspect them. The target Memory cap is
-/// moved back to the caller in `caps[0]` of the reply regardless of
-/// success — leaving the cap in the driver's `CSpace` would leak it.
-// too_many_lines: handle_read_block_into_memory folds nine validation
-// gates (cap presence, sector count, descriptor-length bound, three
-// cap_info lookups, partition resolution for start and end LBA) into
-// one flat dispatch; each rejection path replies with the cap moved
-// back so it never leaks. Extracting helpers would still leave the
-// reply-with-cap pattern wired through main.
-#[allow(clippy::too_many_lines)]
-fn handle_read_block_into_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
+/// pre-IOMMU; the driver does not inspect them. Every reply moves the
+/// Memory cap back to the caller in `caps[0]`; leaving it in the driver's
+/// `CSpace` would leak it. A request the device loses (see
+/// [`io::submit_and_wait`]) is answered only after [`quiesce_device`] has
+/// stopped the device, so the returned cap is free of device DMA.
+fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir: io::IoDirection)
 {
-    const SECTOR_SIZE: u64 = 512;
-
-    let target_cap = msg.caps().first().copied().unwrap_or(0);
+    let mem_cap = msg.caps().first().copied().unwrap_or(0);
 
     let reply_with = |code: u64, ipc_buf: *mut u64| {
         let mut builder = IpcMessage::builder(code);
-        if target_cap != 0
+        if mem_cap != 0
         {
-            builder = builder.cap(target_cap);
+            builder = builder.cap(mem_cap);
         }
         let reply = builder.build();
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
     };
 
-    if target_cap == 0
+    if rt.device_faulted
+    {
+        reply_with(ipc::blk_errors::DEVICE_FAULT, ipc_buf);
+        return;
+    }
+    if mem_cap == 0
     {
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
-
-    let sector_count = if msg.word_count() >= 2
-    {
-        msg.word(1)
-    }
-    else
-    {
-        1
-    };
-    if sector_count == 0
-    {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
-    }
-    let data_len_bytes = sector_count * SECTOR_SIZE;
-    // VirtIO descriptor length is u32; this also bounds total transfer
-    // well below any plausible per-cap ask.
-    if data_len_bytes > u64::from(u32::MAX)
-    {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
-    }
-
-    // Validate the target cap: must be a Memory cap with MAP+WRITE rights and
-    // at least `data_len_bytes` of capacity.
-    let Ok(tag_rights) = syscall::cap_info(target_cap, syscall::CAP_INFO_TAG_RIGHTS)
-    else
-    {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
-    };
-    let tag = (tag_rights >> 32) as u8;
-    let rights = tag_rights & 0xFFFF_FFFF;
-    let required = syscall::RIGHTS_MEM_MAP_RW;
-    if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY) || (rights & required) != required
-    {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
-    }
-    let Ok(size) = syscall::cap_info(target_cap, syscall::CAP_INFO_MEMORY_SIZE)
-    else
-    {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
-    };
-    if size < data_len_bytes
-    {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
-    }
-    let Ok(phys_base) = syscall::cap_info(target_cap, syscall::CAP_INFO_MEMORY_PHYS_BASE)
-    else
-    {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
-    };
 
     let sector = if msg.word_count() >= 1
     {
@@ -654,7 +613,32 @@ fn handle_read_block_into_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
     {
         0
     };
-    let absolute_sector = match resolve_sector(msg.badge, sector, rt)
+    let sector_count = if msg.word_count() >= 2
+    {
+        msg.word(1)
+    }
+    else
+    {
+        1
+    };
+    // VirtIO descriptor length is u32; this also bounds total transfer well
+    // below any plausible per-cap ask.
+    let Some(data_len) = virtio_blk::transfer_len(sector_count)
+    else
+    {
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
+        return;
+    };
+    let phys_base = match validate_memory_cap(mem_cap, dir, data_len)
+    {
+        Ok(phys_base) => phys_base,
+        Err(code) =>
+        {
+            reply_with(code, ipc_buf);
+            return;
+        }
+    };
+    let absolute_sector = match resolve_run(msg.badge, sector, sector_count, rt)
     {
         Ok(s) => s,
         Err(code) =>
@@ -663,174 +647,90 @@ fn handle_read_block_into_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
             return;
         }
     };
-    // Validate the entire run lies within the partition / device bounds:
-    // resolve_sector only checks the starting LBA. Re-check the inclusive
-    // end LBA so a multi-sector ask doesn't walk past the partition.
-    let last_relative = sector.saturating_add(sector_count - 1);
-    if resolve_sector(msg.badge, last_relative, rt).is_err()
-    {
-        reply_with(ipc::blk_errors::OUT_OF_BOUNDS, ipc_buf);
-        return;
-    }
 
-    // cast_possible_truncation: data_len_bytes <= u32::MAX checked above.
-    #[allow(clippy::cast_possible_truncation)]
-    if !io::submit_and_wait(
+    let outcome = io::submit_and_wait(
         rt.layout,
-        io::IoDirection::Read,
+        dir,
         absolute_sector,
         phys_base,
-        data_len_bytes as u32,
+        data_len,
         rt.vq,
         rt.transport,
         rt.queue_notify_off,
         rt.irq_notification,
         rt.irq_cap,
-    )
+    );
+    if outcome == IoOutcome::Lost
     {
-        let status = rt.layout.read_status();
-        reply_with(u64::from(status), ipc_buf);
-        return;
+        quiesce_device(rt);
     }
-
-    reply_with(ipc::blk_errors::SUCCESS, ipc_buf);
+    reply_with(outcome.reply_label(), ipc_buf);
 }
 
-/// Handle a `BLK_WRITE_FROM_MEMORY` request.
+/// Check the data-segment Memory cap of a transfer of `data_len` bytes and
+/// return its physical base, or the `blk_errors` code to reply.
 ///
-/// Mirror of [`handle_read_block_into_memory`] with the data direction
-/// inverted. Reads `caps[0]` (source Memory cap, `MAP` rights) and DMAs
-/// `data[1]` consecutive sectors (default 1) starting at LBA `data[0]`
-/// out of the memory cap at offset 0, packed contiguously. The source Memory cap
-/// is moved back to the caller in `caps[0]` of the reply.
-// too_many_lines: matches the read sibling — the same validation gates
-// (cap presence, sector count, descriptor-length bound, three cap_info
-// lookups, two partition resolutions for start and end LBA) all apply
-// here, and the reply-with-cap pattern is unchanged.
-#[allow(clippy::too_many_lines)]
-fn handle_write_block_from_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
+/// The cap must be a Memory cap of at least `data_len` bytes carrying
+/// `MAP|WRITE` for a read (the device writes into it) or `MAP` for a write
+/// (the device only reads it).
+fn validate_memory_cap(mem_cap: u32, dir: io::IoDirection, data_len: u32) -> Result<u64, u64>
 {
-    const SECTOR_SIZE: u64 = 512;
-
-    let source_cap = msg.caps().first().copied().unwrap_or(0);
-
-    let reply_with = |code: u64, ipc_buf: *mut u64| {
-        let mut builder = IpcMessage::builder(code);
-        if source_cap != 0
-        {
-            builder = builder.cap(source_cap);
-        }
-        let reply = builder.build();
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-    };
-
-    if source_cap == 0
-    {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
-    }
-
-    let sector_count = if msg.word_count() >= 2
-    {
-        msg.word(1)
-    }
-    else
-    {
-        1
-    };
-    if sector_count == 0
-    {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
-    }
-    let data_len_bytes = sector_count * SECTOR_SIZE;
-    if data_len_bytes > u64::from(u32::MAX)
-    {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
-    }
-
-    // Source memory cap must be a Memory cap with at least MAP rights
-    // (device reads sector data out of it) and large enough to cover the
-    // requested run.
-    let Ok(tag_rights) = syscall::cap_info(source_cap, syscall::CAP_INFO_TAG_RIGHTS)
-    else
-    {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
-    };
+    let invalid = ipc::blk_errors::INVALID_MEMORY_CAP;
+    let tag_rights =
+        syscall::cap_info(mem_cap, syscall::CAP_INFO_TAG_RIGHTS).map_err(|_| invalid)?;
     let tag = (tag_rights >> 32) as u8;
     let rights = tag_rights & 0xFFFF_FFFF;
-    let required = syscall::RIGHTS_MEM_MAP;
+    let required = match dir
+    {
+        io::IoDirection::Read => syscall::RIGHTS_MEM_MAP_RW,
+        io::IoDirection::Write => syscall::RIGHTS_MEM_MAP,
+    };
     if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY) || (rights & required) != required
     {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
+        return Err(invalid);
     }
-    let Ok(size) = syscall::cap_info(source_cap, syscall::CAP_INFO_MEMORY_SIZE)
-    else
+    let size = syscall::cap_info(mem_cap, syscall::CAP_INFO_MEMORY_SIZE).map_err(|_| invalid)?;
+    if size < u64::from(data_len)
     {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
-    };
-    if size < data_len_bytes
-    {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
+        return Err(invalid);
     }
-    let Ok(phys_base) = syscall::cap_info(source_cap, syscall::CAP_INFO_MEMORY_PHYS_BASE)
-    else
-    {
-        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
-        return;
-    };
+    syscall::cap_info(mem_cap, syscall::CAP_INFO_MEMORY_PHYS_BASE).map_err(|_| invalid)
+}
 
-    let sector = if msg.word_count() >= 1
+/// Resolve the run of `sector_count` sectors starting at caller-relative
+/// `sector` to its absolute starting LBA, checking that the whole run lies
+/// within the caller badge's partition or the device: [`resolve_sector`]
+/// checks one LBA, so the run's inclusive end is checked too.
+fn resolve_run(badge: u64, sector: u64, sector_count: u64, rt: &BlkRuntime) -> Result<u64, u64>
+{
+    let absolute = resolve_sector(badge, sector, rt)?;
+    let last_relative = sector.saturating_add(sector_count.saturating_sub(1));
+    if resolve_sector(badge, last_relative, rt).is_err()
     {
-        msg.word(0)
+        return Err(ipc::blk_errors::OUT_OF_BOUNDS);
     }
-    else
-    {
-        0
-    };
-    let absolute_sector = match resolve_sector(msg.badge, sector, rt)
-    {
-        Ok(s) => s,
-        Err(code) =>
-        {
-            reply_with(code, ipc_buf);
-            return;
-        }
-    };
-    let last_relative = sector.saturating_add(sector_count - 1);
-    if resolve_sector(msg.badge, last_relative, rt).is_err()
-    {
-        reply_with(ipc::blk_errors::OUT_OF_BOUNDS, ipc_buf);
-        return;
-    }
+    Ok(absolute)
+}
 
-    // cast_possible_truncation: data_len_bytes <= u32::MAX checked above.
-    #[allow(clippy::cast_possible_truncation)]
-    if !io::submit_and_wait(
-        rt.layout,
-        io::IoDirection::Write,
-        absolute_sector,
-        phys_base,
-        data_len_bytes as u32,
-        rt.vq,
-        rt.transport,
-        rt.queue_notify_off,
-        rt.irq_notification,
-        rt.irq_cap,
-    )
+/// Stop the device after it lost a request, so the request's data buffer is
+/// free of device DMA before its Memory cap goes back to the caller.
+///
+/// A reset the device acknowledges ends its access to the virtqueue and the
+/// buffers it describes (`VirtIO` 1.2 §2.4.1). The driver then fails stop:
+/// `device_faulted` answers every later transfer with `DEVICE_FAULT`, so a
+/// client gets an error rather than a call nobody receives. A device that
+/// does not acknowledge the reset may still DMA into the buffer, so the
+/// driver exits without replying, and the cap dies with its `CSpace` instead
+/// of returning to a caller who could reuse the memory.
+fn quiesce_device(rt: &mut BlkRuntime)
+{
+    if !rt.transport.try_reset()
     {
-        let status = rt.layout.read_status();
-        reply_with(u64::from(status), ipc_buf);
-        return;
+        std::os::seraph::log!("request lost and device reset unacknowledged; exiting");
+        syscall::thread_exit();
     }
-
-    reply_with(ipc::blk_errors::SUCCESS, ipc_buf);
+    std::os::seraph::log!("request lost; device reset, failing all further I/O");
+    rt.device_faulted = true;
 }
 
 /// Translate a caller-supplied sector number into an absolute device LBA,
@@ -1004,7 +904,7 @@ fn main() -> !
     }
     if caps.memmgr_ep == 0
     {
-        std::os::seraph::log!("no procmgr endpoint");
+        std::os::seraph::log!("no memmgr endpoint");
         syscall::thread_exit();
     }
 
@@ -1102,6 +1002,7 @@ fn main() -> !
         partitions: PartitionTable::new(),
         capacity,
         next_partition_badge: 1,
+        device_faulted: false,
     };
     service_loop(caps.service_ep, ipc_buf, &mut rt);
 }

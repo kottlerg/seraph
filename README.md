@@ -29,18 +29,21 @@ see there for the authoritative statement.
 
 | Directory | Purpose |
 |---|---|
-| `.cargo/` | Cargo configuration: the `cargo xtask` alias, the custom-target search path, and the workspace rustflags |
-| `.claude/` | Assistant operating instructions, agents, and workflows (outside the documentation hierarchy) |
-| `.github/` | CI workflows, their scripts, and Issue and PR templates (outside the documentation hierarchy) |
 | [`abi/`](abi/README.md) | Stable cross-boundary contracts |
 | [`core/`](core/README.md) | Core OS: bootloader, kernel, and the kernel-validation harness (ktest) |
-| `docs/` | Architecture and design documentation |
+| [`docs/`](docs/) | Architecture and design documentation |
 | [`programs/`](programs/README.md) | General-purpose userspace applications, utilities, and the test fixtures the harnesses spawn |
 | [`rootfs/`](rootfs/README.md) | System files installed into the sysroot during builds (config files, etc) |
 | [`runtime/`](runtime/README.md) | Language runtime layers consumed by userspace (ruststd; libc is design intent, not yet implemented) |
 | [`services/`](services/README.md) | Userspace OS processes: managers, drivers, filesystems, daemons |
 | [`shared/`](shared/README.md) | Shared utility crates |
 | [`xtask/`](xtask/README.md) | Build task runner (`cargo xtask`); custom target JSON specs under `xtask/targets/` |
+
+Three hidden tooling directories sit beside these. [`.cargo/`](.cargo/) holds the Cargo
+configuration: the `cargo xtask` alias, the custom-target search path, and the workspace
+rustflags. [`.github/`](.github/) holds the CI workflows, their scripts, and the Issue and PR
+templates (outside the documentation hierarchy). [`.claude/`](.claude/) holds the assistant
+operating instructions, agents, and workflows (outside the documentation hierarchy).
 
 ## Usage
 

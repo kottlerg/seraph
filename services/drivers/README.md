@@ -14,11 +14,13 @@ services/drivers/
 │   ├── Cargo.toml
 │   ├── README.md
 │   └── src/
+│       ├── lib.rs                  # CMOS register snapshot (host-tested)
 │       └── main.rs
 ├── framebuffer/                    # Linear-framebuffer text driver (binary)
 │   ├── Cargo.toml
 │   ├── README.md                   # Framebuffer IPC interface (FB_WRITE_BYTES, FB_SET_ATTRS)
 │   └── src/
+│       ├── lib.rs                  # Library root exposing render (host-tested)
 │       ├── main.rs
 │       ├── render.rs               # 9×20 bitmap glyph blit + cursor + scroll
 │       └── arch/                   # Per-arch MMIO mapping (x86_64 / riscv64)
@@ -51,6 +53,7 @@ services/drivers/
 │   │   ├── README.md               # Block-driver IPC interface
 │   │   │                           #   (BLK_READ_INTO_MEMORY, REGISTER_PARTITION)
 │   │   └── src/
+│   │       ├── lib.rs              # Request-length and reply-label logic (host-tested)
 │   │       ├── main.rs
 │   │       └── io.rs
 │   └── input/                      # VirtIO input (keyboard) device driver (binary)

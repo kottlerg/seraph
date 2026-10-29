@@ -287,7 +287,57 @@ pub fn ns_system_root_phase(_: &Caps)
     std::os::seraph::log!("ns_system_root: absent → NOT_FOUND");
 
     let _ = syscall::cap_delete(esp_cap);
+
+    system_root_readdir_index_bound(system_root_cap, ipc_buf);
     std::os::seraph::log!("ns_system_root phase passed");
+}
+
+/// `NS_READDIR` on the synthetic root lists its local mount (`/esp`) and
+/// the root-fs entries behind its fall-through, and answers `END_OF_DIR`
+/// for every index beyond `u32`. An index of `2^32 + i` that vfsd
+/// truncated to `i` would return the `i`-th entry instead.
+fn system_root_readdir_index_bound(system_root_cap: u32, ipc_buf: *mut u64)
+{
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    for idx in 0..256u64
+    {
+        match ns_readdir(system_root_cap, idx, ipc_buf)
+        {
+            Ok(Some((_kind, name))) => names.push(name),
+            Ok(None) => break,
+            Err(code) => panic!("NS_READDIR(system_root, {idx}) failed: code={code}"),
+        }
+    }
+    for expected in [&b"esp"[..], &b"config"[..]]
+    {
+        assert!(
+            names.iter().any(|n| n.as_slice() == expected),
+            "NS_READDIR of the synthetic root did not list {:?} (merged local + \
+             fall-through enumeration regression)",
+            core::str::from_utf8(expected).unwrap_or("<non-utf8>"),
+        );
+    }
+    std::os::seraph::log!(
+        "ns_system_root: NS_READDIR root listed {} merged entries",
+        names.len()
+    );
+
+    let listed = names.len() as u64;
+    for idx in (0..=listed).map(|i| (1u64 << 32) + i).chain([u64::MAX])
+    {
+        match ns_readdir(system_root_cap, idx, ipc_buf)
+        {
+            Ok(None) =>
+            {}
+            Ok(Some((_kind, name))) => panic!(
+                "NS_READDIR(system_root, {idx:#x}) returned {:?}, expected END_OF_DIR \
+                 (readdir index truncated to u32?)",
+                core::str::from_utf8(&name).unwrap_or("<non-utf8>")
+            ),
+            Err(code) => panic!("NS_READDIR(system_root, {idx:#x}) failed: code={code}"),
+        }
+    }
+    std::os::seraph::log!("ns_system_root: NS_READDIR index beyond u32 -> END_OF_DIR");
 }
 
 pub fn ns_mount_boundary_phase(_: &Caps)

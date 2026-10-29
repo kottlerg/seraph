@@ -47,8 +47,12 @@ impl FramebufferWriter
 {
     /// Construct a `FramebufferWriter` from a `FramebufferInfo`.
     ///
-    /// Returns `None` if `fb.physical_base == 0` (no framebuffer available).
-    /// Clears the screen to black on success.
+    /// Returns `None` if `fb.physical_base == 0` (no framebuffer available), if
+    /// the framebuffer is smaller than one glyph cell in either dimension, or if
+    /// `fb.stride` is narrower than `fb.width` 4-byte pixels: such a framebuffer
+    /// is treated as absent, so the renderer can rely on at least one row and
+    /// one column (`scroll` and `draw_glyph_bitmap` do) and on every pixel it
+    /// writes lying inside its row. Clears the screen to black on success.
     ///
     /// # Safety
     /// `fb.physical_base` must be a valid, writable framebuffer region of at
@@ -62,6 +66,10 @@ impl FramebufferWriter
 
         let max_cols = fb.width / GLYPH_WIDTH;
         let max_rows = fb.height / GLYPH_HEIGHT;
+        if max_cols == 0 || max_rows == 0 || u64::from(fb.stride) < u64::from(fb.width) * 4
+        {
+            return None;
+        }
 
         let mut writer = FramebufferWriter {
             base: fb.physical_base as *mut u8,
@@ -287,5 +295,66 @@ impl FramebufferWriter
 
         // Park cursor on the last row.
         self.row = self.max_rows - 1;
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// A `FramebufferInfo` over `buf`, `width` x `height` pixels, `stride` bytes per row.
+    fn info_over(buf: &mut [u8], width: u32, height: u32, stride: u32) -> FramebufferInfo
+    {
+        FramebufferInfo {
+            physical_base: buf.as_mut_ptr() as u64,
+            width,
+            height,
+            stride,
+            pixel_format: PixelFormat::Rgbx8,
+        }
+    }
+
+    // Defect caught: a framebuffer shorter than one glyph row yields max_rows == 0,
+    // and the first newline's scroll underflows `total_rows - 1`.
+    #[test]
+    fn framebuffer_smaller_than_a_glyph_cell_is_absent()
+    {
+        let (w, h) = (GLYPH_WIDTH * 4, GLYPH_HEIGHT - 1);
+        let mut buf = vec![0u8; (w * 4 * h) as usize];
+        let info = info_over(&mut buf, w, h, w * 4);
+        // SAFETY: buf is writable for stride * height bytes.
+        assert!(unsafe { FramebufferWriter::new(&info) }.is_none());
+
+        let (w, h) = (GLYPH_WIDTH - 1, GLYPH_HEIGHT * 2);
+        let mut buf = vec![0u8; (w * 4 * h) as usize];
+        let info = info_over(&mut buf, w, h, w * 4);
+        // SAFETY: as above.
+        assert!(unsafe { FramebufferWriter::new(&info) }.is_none());
+    }
+
+    // Defect caught: a stride narrower than the row's pixels lets glyph writes
+    // spill into the next row and past the `stride * height` region.
+    #[test]
+    fn stride_narrower_than_the_row_is_absent()
+    {
+        let (w, h) = (GLYPH_WIDTH * 2, GLYPH_HEIGHT * 2);
+        let stride = w * 4 - 4;
+        let mut buf = vec![0u8; (stride * h) as usize];
+        let info = info_over(&mut buf, w, h, stride);
+        // SAFETY: buf is writable for stride * height bytes.
+        assert!(unsafe { FramebufferWriter::new(&info) }.is_none());
+    }
+
+    // Boundary: exactly one glyph cell is the smallest usable framebuffer, so an
+    // off-by-one in the size check would refuse it.
+    #[test]
+    fn framebuffer_of_exactly_one_glyph_cell_is_accepted()
+    {
+        let (w, h) = (GLYPH_WIDTH, GLYPH_HEIGHT);
+        let mut buf = vec![0u8; (w * 4 * h) as usize];
+        let info = info_over(&mut buf, w, h, w * 4);
+        // SAFETY: buf is writable for stride * height bytes.
+        assert!(unsafe { FramebufferWriter::new(&info) }.is_some());
     }
 }

@@ -18,12 +18,12 @@ vfsd/
 ├── Cargo.toml
 ├── README.md
 ├── gpt/                     # `vfsd-gpt` crate: pure host-tested GPT-format parser
+├── root-backend/            # `vfsd-root-backend` crate: VfsdRootBackend (NamespaceBackend impl)
 ├── src/
 │   ├── main.rs              # Entry, root self-mount, service + namespace loops, MOUNT handler
 │   ├── driver.rs            # Spawning fatfs driver instances
 │   ├── partition.rs         # Boot-disk partition discovery: block I/O over the gpt crate
 │   ├── role_guids.rs        # Compile-time arch-conditional root + ESP GUIDs
-│   ├── root_backend.rs      # VfsdRootBackend (NamespaceBackend impl)
 │   ├── worker.rs            # Worker thread implementation
 │   └── worker_pool.rs       # Bootstrap-endpoint pool for spawned drivers
 └── docs/

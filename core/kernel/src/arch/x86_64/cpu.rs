@@ -12,7 +12,7 @@
 //! `user_copy_fixup`, the enable routines, `verify_baseline`, `install_percpu`, and the
 //! trap-stack and interrupt save/restore primitives are built only under
 //! `#[cfg(not(test))]` (`copy_user` and `verify_baseline` have host stubs). `cpuid`,
-//! `current_id`, `current_cpu` (which returns 0 under test), `halt_until_interrupt`,
+//! `current_cpu` (which returns 0 under test), `halt_until_interrupt`,
 //! `disable_interrupts`, and `halt_loop` are also built for host tests.
 
 // ── CPUID ─────────────────────────────────────────────────────────────────────
@@ -493,19 +493,6 @@ pub fn halt_until_interrupt()
     unsafe {
         core::arch::asm!("sti; hlt", options(nostack, preserves_flags));
     }
-}
-
-/// Return the initial APIC ID of the executing CPU (`CPUID.01H:EBX[31:24]`).
-///
-/// The field is 8 bits wide: an x2APIC ID above 255 is truncated (the full ID is
-/// in CPUID leaf 0x0B).
-// dead_code: part of the arch interface (core/kernel/docs/arch-interface.md
-// § `cpu`); no arch-neutral caller exists yet.
-#[allow(dead_code)]
-pub fn current_id() -> u32
-{
-    let (_eax, ebx, _ecx, _edx) = cpuid(1);
-    ebx >> 24
 }
 
 // ── Per-CPU GS-base ───────────────────────────────────────────────────────────

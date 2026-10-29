@@ -5,8 +5,6 @@
 
 //! pwrmgr service surface: cap-deny enforcement + terminal shutdown.
 
-use std::os::seraph::startup_info;
-
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
@@ -30,9 +28,7 @@ pub fn pwrmgr_cap_deny_phase(caps: &Caps)
         return;
     }
 
-    let info = startup_info();
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     let msg = ipc::IpcMessage::new(ipc::pwrmgr_labels::SHUTDOWN);
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -61,9 +57,7 @@ pub fn pwrmgr_shutdown_phase(caps: &Caps)
         return;
     }
 
-    let info = startup_info();
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     let msg = ipc::IpcMessage::new(ipc::pwrmgr_labels::SHUTDOWN);
     // SAFETY: ipc_buf is the registered IPC buffer.

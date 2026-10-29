@@ -5,8 +5,6 @@
 
 //! Shared recv-loop failure policy (`RecvGuard`) surface.
 
-use std::os::seraph::startup_info;
-
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
@@ -55,9 +53,7 @@ fn recv_wedge_phase(_: &Caps)
     );
 
     {
-        let info = startup_info();
-        #[allow(clippy::cast_ptr_alignment)]
-        let ipc_buf = info.ipc_buffer.cast::<u64>();
+        let ipc_buf = std::os::seraph::current_ipc_buf();
         let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
         // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
         let reply = unsafe { ipc::ipc_call(id, &query, ipc_buf) }

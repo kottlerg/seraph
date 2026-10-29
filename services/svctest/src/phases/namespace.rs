@@ -9,8 +9,6 @@
 //! `programs_child_main`, spawned by `ns_sandbox_phase` and
 //! `ns_programs_subtree_phase` respectively.
 
-use std::os::seraph::startup_info;
-
 use crate::bootstrap::Caps;
 use crate::ipc_util::ns::{ns_lookup, ns_readdir, ns_stat};
 use crate::runner::Phase;
@@ -131,9 +129,7 @@ pub fn ns_phase(caps: &Caps)
         return;
     }
 
-    let info = startup_info();
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     let programs_cap = match ns_lookup(root_fs, b"programs", 0xFFFF, ipc_buf)
     {
@@ -252,9 +248,7 @@ pub fn ns_system_root_phase(_: &Caps)
     );
     std::os::seraph::log!("ns_system_root: root_dir_cap()={system_root_cap:#x}");
 
-    let info = startup_info();
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     let esp_cap = match ns_lookup(system_root_cap, b"esp", 0xFFFF, ipc_buf)
     {
@@ -301,9 +295,7 @@ pub fn ns_mount_boundary_phase(_: &Caps)
         "ns_mount_boundary: root_dir_cap() returned 0"
     );
 
-    let info = startup_info();
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     // Transparent root-fs delegation: paths that are not shadowed by a
     // mount on the synthetic root must resolve through the root fs.
@@ -356,9 +348,7 @@ pub fn ns_multi_component_phase(_: &Caps)
         "ns_multi_component: root_dir_cap() returned 0"
     );
 
-    let info = startup_info();
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     // `/esp` is a terminal mount on the EFI System Partition (vfsd
     // auto-mounts it after root). The original multi-component root-
@@ -403,9 +393,7 @@ pub fn ns_sandbox_phase(_: &Caps)
         return;
     }
 
-    let info = startup_info();
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     let stat_only = NamespaceRights::from_raw(rights::STAT).raw();
     let attenuated = match ns_lookup(root, b"data", u64::from(stat_only), ipc_buf)
@@ -487,9 +475,7 @@ pub fn ns_startup_cwd_phase(_: &Caps)
         "ns_startup_cwd: init did not install a startup cwd cap via CONFIGURE_NAMESPACE",
     );
 
-    let info = startup_info();
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     let (file_cap, kind, _size) = ns_lookup(cwd, b"test.txt", 0xFFFF, ipc_buf).expect(
         "ns_startup_cwd: NS_LOOKUP test.txt from startup cwd cap failed — cwd cap \

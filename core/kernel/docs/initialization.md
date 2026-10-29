@@ -218,6 +218,8 @@ overlap the kernel image window halts with
    GDT/TSS, IST stacks, and NMI-backtrace storage (`sched::init_storage`); then the
    entropy subsystem's per-CPU CSPRNGs, central pool, jitter accumulators, and
    self-test sample slab (`entropy::init_storage`)
+5. Copy `BootInfo.cpu_ids` into the APIC-ID slab (`percpu::init_apic_ids`), so Phase 5
+   can name the BSP by its hardware id (the riscv64 PLIC context)
 ```
 
 Retype-based kernel object memory, which replaces a kernel heap, is specified in
@@ -287,8 +289,9 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
      the V extension)
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
 4. Grant U-mode the cycle counter (scounteren.CY)
-5. Initialise the PLIC for the BSP context: priority 1 for every source, all enables
-   cleared, threshold 0
+5. Initialise the PLIC for the BSP's S-mode context, the one numbered by the BSP's hart
+   id (`BootInfo.cpu_ids[0]`, which need not be 0): priority 1 for every source, all
+   enables cleared, threshold 0; halts if that context lies outside the PLIC window
 6. Arm stimecmp (Sstc) for the initial tick, using the bootloader-discovered
    timebase; halts if Sstc or the timebase was not discovered
 7. Enable interrupts (set sstatus.SIE)
@@ -513,7 +516,9 @@ A started CPU that never announces itself leaves the BSP waiting at
 since SIPI delivery is unacknowledged and `start_ap` cannot report a delivery failure.
 An AP that provides fewer hardware TLB tags than the BSP configured halts itself with
 "AP provides fewer hardware TLB tags than the BSP configured" before announcing itself,
-which leaves the BSP waiting at `APS_READY`.
+which leaves the BSP waiting at `APS_READY`. On riscv64 an AP whose PLIC S-mode context
+registers lie outside the PLIC window (a firmware hart id too large for the window
+`plic_size` reports) halts itself the same way, before announcing itself.
 An entropy self-test FAIL (step 5) is printed and the boot continues; the
 marker is matched by the `run-parallel` fail regex, which turns a QEMU run red
 (see [entropy.md](entropy.md) § Testing).
@@ -686,7 +691,7 @@ through its drain until a teardown commits `Exited` over it (see
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; bad entries skipped, entries beyond MAX_MMIO_APERTURES dropped |
 | 7 | Capability system + root CSpace | Halt: OOM |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace). A started CPU that never announces itself leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged); an entropy self-test FAIL is printed and the boot continues |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace). A started CPU that never announces itself, or an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window), leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged); an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation + scheduler entry (user mode) | Halt: invalid InitImage or OOM |
 
 ---

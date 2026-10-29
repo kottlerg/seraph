@@ -541,7 +541,8 @@ pub struct MemmgrBootstrap
     pub bootstrap_badge: u64,
     /// Badge init used when minting the procmgr-side badged SEND on
     /// memmgr's endpoint. Memmgr stores this and uses it to gate the
-    /// procmgr-only labels (`REGISTER_PROCESS`, `PROCESS_DIED`).
+    /// procmgr-only labels (`REGISTER_PROCESS`, `PROCESS_DIED`,
+    /// `DONATE_MEMORY_CAPS`, `DELEGATE_ASPACE`).
     pub procmgr_badge: u64,
     /// Slot in init's `CSpace` of the badged SEND cap on memmgr's
     /// endpoint that init will install in procmgr's `ProcessInfo`.

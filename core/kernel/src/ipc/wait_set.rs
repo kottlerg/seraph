@@ -74,6 +74,16 @@ pub enum WaitSetSourceTag
 /// in `core/kernel/src/cap/object.rs`.
 const SOURCE_WRAPPER_BYTES: usize = 24;
 
+// `source_header` subtracts SOURCE_WRAPPER_BYTES from a state pointer and then
+// `dec_ref`s through the result, and each construction site places the state at
+// `size_of::<Wrapper>()`; a wrapper that grew without this constant would land
+// the subtraction inside the wrapper. Anchor the constant to all three wrappers.
+const _: () = {
+    assert!(SOURCE_WRAPPER_BYTES == core::mem::size_of::<crate::cap::object::EndpointObject>());
+    assert!(SOURCE_WRAPPER_BYTES == core::mem::size_of::<crate::cap::object::NotificationObject>());
+    assert!(SOURCE_WRAPPER_BYTES == core::mem::size_of::<crate::cap::object::EventQueueObject>());
+};
+
 /// Derive the `KernelObjectHeader` pointer from a registered source state
 /// pointer.
 ///

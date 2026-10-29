@@ -81,7 +81,20 @@ pub(crate) unsafe fn install_split_children(
 {
     let orig_idx = syscall::cap_handle_index(orig_handle);
     let orig_gen = syscall::cap_handle_gen(orig_handle);
-    let orig_idx_nz = NonZeroU32::new(orig_idx).ok_or(SyscallError::InvalidCapability)?;
+    let Some(orig_idx_nz) = NonZeroU32::new(orig_idx)
+    else
+    {
+        // Unreachable for the in-tree callers (each resolves orig_handle with
+        // lookup_cap, which rejects slot 0), but fail as the other arms do:
+        // return both uninserted children to SEED.
+        // SAFETY: both bodies are fresh (refcount 1) and were never inserted
+        // anywhere (caller contract).
+        unsafe {
+            dealloc_object(child1_ptr);
+            dealloc_object(child2_ptr);
+        }
+        return Err(SyscallError::InvalidCapability);
+    };
     let orig_node = SlotId::current(cspace_id, orig_idx_nz);
     let original = Original {
         idx: orig_idx,

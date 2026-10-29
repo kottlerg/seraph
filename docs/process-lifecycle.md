@@ -103,7 +103,8 @@ knows where in its own CSpace the pool lives.
 
 After this step, memmgr is ready to serve its labels, including
 `REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`, and the procmgr-only
-`REGISTER_PROCESS`, `PROCESS_DIED`, and `DELEGATE_ASPACE` (see
+`REGISTER_PROCESS`, `PROCESS_DIED`, `DONATE_MEMORY_CAPS`, and
+`DELEGATE_ASPACE` (see
 [`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)).
 
 memmgr is `no_std` and inherits the constraint that motivated the split:
@@ -249,9 +250,10 @@ loading, consumed as read-only sources) and the Memory caps init streams to
 it for the init-reap donation (forwarded to memmgr via
 `DONATE_MEMORY_CAPS`), every Memory cap procmgr holds originates in memmgr.
 
-Procmgr is the privileged caller for memmgr's three procmgr-only labels
-(`REGISTER_PROCESS`, `PROCESS_DIED`, `DELEGATE_ASPACE`). No other service
-can mint or retire process badges against memmgr. See
+Procmgr is the privileged caller for memmgr's four procmgr-only labels
+(`REGISTER_PROCESS`, `PROCESS_DIED`, `DONATE_MEMORY_CAPS`, `DELEGATE_ASPACE`).
+No other service can mint or retire process badges against memmgr, or donate
+Memory caps into its pool. See
 [`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)
 § Badge Discipline.
 

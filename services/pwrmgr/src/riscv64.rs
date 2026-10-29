@@ -47,18 +47,23 @@ pub fn resolve(devmgr_registry: u32, _self_aspace: u32, ipc_buf: *mut u64) -> Op
 /// Attempt SBI SRST shutdown. Logs and returns on failure.
 pub fn shutdown(_self_thread: u32, act: &Actuator)
 {
-    sbi_reset(act, SRST_TYPE_SHUTDOWN);
+    sbi_reset(act, SRST_TYPE_SHUTDOWN, "shutdown");
 }
 
 /// Attempt SBI SRST cold reboot. Logs and returns on failure.
 pub fn reboot(_self_thread: u32, act: &Actuator)
 {
-    sbi_reset(act, SRST_TYPE_COLD_REBOOT);
+    sbi_reset(act, SRST_TYPE_COLD_REBOOT, "reboot");
 }
 
-fn sbi_reset(act: &Actuator, reset_type: u64)
+/// Issue SBI `system_reset` of `reset_type` through the kernel. Does not
+/// return when the platform resets. Logs and returns when the kernel or
+/// firmware rejects the call, and, after [`crate::await_reset`]'s grace,
+/// when the call returned success but the platform kept running (SRST does
+/// not return on success, so that is a firmware failure too).
+fn sbi_reset(act: &Actuator, reset_type: u64, op: &str)
 {
-    let _ = syscall::sbi_call(
+    let result = syscall::sbi_call(
         act.sbi_control_cap,
         SBI_EXT_SRST,
         SBI_SRST_RESET,
@@ -66,14 +71,9 @@ fn sbi_reset(act: &Actuator, reset_type: u64)
         SRST_REASON_NONE,
         0,
     );
-    // If we reach here, SRST returned unexpectedly. Halt to prevent
-    // partial output from racing the reset.
-    loop
+    match result
     {
-        // SAFETY: `wfi` is non-privileged; it hints the hart to enter a
-        // low-power wait state.
-        unsafe {
-            core::arch::asm!("wfi", options(nomem, nostack));
-        }
+        Ok(_) => crate::await_reset(op),
+        Err(e) => std::os::seraph::log!("{op} failed (sbi_call err={e})"),
     }
 }

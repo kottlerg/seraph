@@ -24,9 +24,8 @@ Every function in the dispatch surface MUST be defined on every supported archit
 ([coding-standards.md](../../../docs/coding-standards.md) §C). The per-architecture build
 checks completeness for every surface item that architecture-neutral code calls: if one is
 missing on the target being compiled, its `arch::current::…` call fails to resolve and the
-build breaks. Items with no neutral caller are not checked this way: `MIN_IRQ_ID`,
-`MAX_IRQ_ID`, `interrupts::disable`, `timer::delay_us`, `cpu::current_id`,
-`cpu::user_copy_fixup`, `paging::user_fault_is_spurious`, and
+build breaks. Items with no neutral caller are not checked this way: `interrupts::disable`,
+`timer::delay_us`, `cpu::user_copy_fixup`, `paging::user_fault_is_spurious`, and
 `TrapFrame::set_ipc_return_with_badge`. Of these, `timer::delay_us`, `cpu::user_copy_fixup`, and
 `paging::user_fault_is_spurious` are called only by arch-internal code; the rest have no caller.
 
@@ -130,9 +129,11 @@ pub fn init_paging_mode(info: &boot_protocol::BootInfo);
 /// `mm::paging::direct_map_base()` for architecture-neutral consumers.
 pub fn direct_map_base() -> u64;
 
-/// Exclusive upper bound of user-half virtual addresses: constant `1 << 47` on
-/// x86-64; the active mode's half boundary on RISC-V. Wrapped by
-/// `mm::user_va_top()` — the single kernel-wide user-VA gate.
+/// Exclusive upper bound of user-accessible virtual addresses: constant
+/// `(1 << 47) - 4096` on x86-64 (the canonical lower half less its top page,
+/// kept unmappable so every hardware-saved ring-3 return RIP is canonical); the
+/// active mode's half boundary on RISC-V. Wrapped by `mm::user_va_top()` — the
+/// single kernel-wide user-VA gate.
 pub fn user_va_top() -> u64;
 
 /// Map `phys` at `virt` in the user region of the address space rooted at
@@ -460,8 +461,9 @@ pub fn delay_us(us: u64);
 
 Architecture-specific syscall entry/return glue. Shared code does not call into this beyond
 initialisation; the arch entry stub saves user state, calls `crate::syscall::dispatch`,
-restores state, and returns to userspace (on x86-64 a non-canonical return RIP is never passed
-to `sysretq`; the thread is terminated as for an unhandled user `#GP`, per
+restores state, and returns to userspace (on x86-64 no non-canonical return RIP can reach
+`sysretq`, since `paging::user_va_top` keeps the top user page unmappable; the exit path
+still checks and terminates the thread as for an unhandled user `#GP`, per
 [syscalls.md](syscalls.md) § Syscall Entry and Exit).
 
 ```rust
@@ -489,10 +491,6 @@ CS-keyed stubs do not depend on it. `FSGSBASE` is classified unsupported in
 [platform-requirements.md](../../../docs/platform-requirements.md) § x86-64 Classification.
 
 ```rust
-/// Hardware CPU identity: the initial (8-bit, CPUID leaf 1) APIC id on x86-64,
-/// the hart id on RISC-V. No in-tree caller; the RISC-V implementation returns 0
-/// on every hart (#443).
-pub fn current_id() -> u32;
 /// The 0-based logical CPU index used by arch-neutral code (`PerCpuData::cpu_id`).
 pub fn current_cpu() -> u32;
 
@@ -640,9 +638,9 @@ impl TrapFrame {
     /// Validate and sanitize a user-supplied register snapshot before resuming
     /// it in user mode. x86-64 rejects a non-user `rip` or `rsp`, forces ring-3
     /// selectors, and clears RFLAGS privilege bits; RISC-V rejects a non-user
-    /// `sepc`, clears `scause`/`stval`, and leaves `sp` and `sstatus` as supplied,
-    /// so a supplied SPP or SUM bit reaches hardware on resume (#443).
-    /// `Err(())` maps to `SyscallError::InvalidArgument`.
+    /// `sepc`, clears `scause`/`stval`, leaves `sp` as supplied, and replaces
+    /// `sstatus` with the first-entry value (SPIE set; SPP, SIE, SUM, MXR clear;
+    /// FS and VS Off). `Err(())` maps to `SyscallError::InvalidArgument`.
     pub fn sanitize_for_user_resume(&mut self) -> Result<(), ()>;
 
     /// Read syscall argument `n` (rdi/rsi/rdx/r10/r8/r9 or a0..a5); 0 for n >= 6.
@@ -680,16 +678,16 @@ pub const ARCH_NAME: &str;
 /// (`EM_X86_64` / `EM_RISCV`); `mm::init_reloc` checks relocations against it.
 pub const EXPECTED_ELF_MACHINE: u16;
 
-/// Valid external-interrupt id range (0..=255 GSIs on x86-64; PLIC sources
-/// 1..=127 on RISC-V). No in-tree consumer.
+/// Routable external-interrupt id range (0..=255 GSIs on x86-64; PLIC sources
+/// 1..=127 on RISC-V). `SYS_IRQ_REGISTER` refuses an id outside it with
+/// `InvalidArgument`.
 pub const MIN_IRQ_ID: u32;
 pub const MAX_IRQ_ID: u32;
 
 /// Width of the root `Interrupt` range capability minted at Phase 7 (256 on
-/// x86-64; 1024 on RISC-V, the PLIC id space). On RISC-V the cap admits ids
-/// the kernel cannot route: `plic_enable` ignores a source above
-/// `PLIC_NUM_SOURCES`, and registering an id of 256 or above panics in
-/// `irq::register` (#443).
+/// x86-64; 1024 on RISC-V, the PLIC id space). On RISC-V the cap spans ids
+/// above `MAX_IRQ_ID`; a split names them, `SYS_IRQ_REGISTER` refuses them, and
+/// the Interrupt teardown leaves their routing untouched.
 pub const ROOT_IRQ_COUNT: u32;
 
 /// Whether the architecture has an I/O port space — `IoPort` capabilities and

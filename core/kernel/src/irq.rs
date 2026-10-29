@@ -35,6 +35,10 @@ use crate::ipc::notification::NotificationState;
 /// sources (1–127).
 const MAX_IRQ: usize = 256;
 
+// `SYS_IRQ_REGISTER` admits ids up to `MAX_IRQ_ID`, and `register` indexes the
+// table by id: every admissible id must have an entry.
+const _: () = assert!((crate::arch::current::MAX_IRQ_ID as usize) < MAX_IRQ);
+
 /// Per-IRQ routing entry.
 struct IrqRoute
 {

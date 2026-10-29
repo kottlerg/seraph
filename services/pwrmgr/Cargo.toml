@@ -10,6 +10,9 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+# Pure ACPI FADT/DSDT parser the x86-64 shutdown path hands its mapped
+# tables to; the `acpi` key keeps the in-crate path short.
+acpi = { path = "acpi", package = "pwrmgr-acpi" }
 ipc = { path = "../../shared/ipc" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }

@@ -103,6 +103,8 @@ The full memmgr IPC specification is in
 - `RELEASE_MEMORY_CAPS(phys_base[..])` — return granted regions mid-life
 - `REGISTER_PROCESS(...) → badged_endpoint_cap` (procmgr-only)
 - `PROCESS_DIED(badge)` (procmgr-only)
+- `DONATE_MEMORY_CAPS(memory_caps[..])` — hand init's reaped RAM to the pool
+  (procmgr-only)
 
 ---
 

@@ -35,14 +35,15 @@ table (see [`memory-pool.md`](memory-pool.md) §"Per-Process Tracking").
 Two privilege classes:
 
 - **Procmgr-only** labels (`REGISTER_PROCESS`, `PROCESS_DIED`,
-  `DELEGATE_ASPACE`) are callable only over the cap that init transfers
-  to procmgr at procmgr's bootstrap round. memmgr identifies this cap by
-  badge and rejects procmgr-only calls received over any other badged cap.
+  `DONATE_MEMORY_CAPS`, `DELEGATE_ASPACE`) are callable only over the cap
+  that init transfers to procmgr at procmgr's bootstrap round. memmgr
+  identifies this cap by badge and rejects procmgr-only calls received over
+  any other badged cap, replying `Unauthorized`.
 - **Universal** labels (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`,
-  `DONATE_MEMORY_CAPS`, `QUERY_POOL_STATUS`, `REGISTER_REGION`,
-  `UNREGISTER_REGION`) are callable over any badged cap, including those
-  memmgr returned from `REGISTER_PROCESS`. `REGISTER_REGION` and
-  `UNREGISTER_REGION` are attributed to the caller by its own badge.
+  `QUERY_POOL_STATUS`, `REGISTER_REGION`, `UNREGISTER_REGION`) are callable
+  over any badged cap, including those memmgr returned from
+  `REGISTER_PROCESS`. `REGISTER_REGION` and `UNREGISTER_REGION` are
+  attributed to the caller by its own badge.
 
 The badge on an ordinary IPC message is the badge of the sender's cap,
 and it cannot be forged: badges are minted by `cap_derive_badge` only
@@ -107,7 +108,7 @@ pages. Privilege: universal.
 | data[0] | `returned_cap_count` (u32) |
 | data[1 + i] | `page_count_for_cap_i` (u32) for each returned cap, `i ∈ [0, count)` |
 | data[1 + count + i] | `phys_base_for_cap_i` (u64) — physical base address of the contiguous page run described by `page_count_for_cap_i`, `i ∈ [0, count)` |
-| cap[0..returned_cap_count] | Memory capabilities (MAP\|WRITE rights) |
+| cap[0..returned_cap_count] | Memory capabilities carrying every right of their pool frames (derived with `RIGHTS_ALL`; pool frames carry WRITE, EXECUTE, and RETYPE, see [`memory-pool.md`](memory-pool.md) §"Pool Ingest") |
 
 The cumulative `sum(page_count_for_cap_i) == want_pages` for both
 contiguous and best-effort replies. With `REQUIRE_CONTIGUOUS` the reply
@@ -160,7 +161,7 @@ as the per-process tracking anchor and uses `phys_base` to find it.
 | label | 2 |
 | data[0] | `count` (u32) |
 | data[1+i] | `phys_base_i` (u64) — physical base of region `i` to release |
-| cap[..] | any inner caps the caller still holds (dropped defensively) |
+| cap[..] | none; memmgr deletes any cap attached (see [Capability Transfer](#capability-transfer)) |
 
 **Reply (success):**
 
@@ -277,12 +278,11 @@ success. Reclamation is idempotent.
 
 ### Label 5: `DONATE_MEMORY_CAPS`
 
-Permanently transfer Memory caps into memmgr's pool. Privilege: universal —
-memmgr accepts the label from any badged client. A client can donate a
-derivation of a Memory cap memmgr already granted it, which aliases those
-frames into the pool while the client still holds them; this defect is
-tracked in [#459](https://github.com/kottlerg/seraph/issues/459), which
-makes the label procmgr-only. Used by procmgr's init reap to hand over
+Permanently transfer Memory caps into memmgr's pool. Privilege: procmgr-only.
+memmgr does not check a donated cap's provenance, and the RAM Memory caps a
+client holds derive from memmgr's own grants, so a client's donation would
+alias frames memmgr has already lent out back into the free pool and count
+them in `pool_total` twice. Used by procmgr's init reap to hand over
 init's reclaimed memory: the usable-RAM caps that did not fit memmgr's
 bootstrap round, the free remainders `MemoryAlloc` abandoned, ELF segments,
 `InitInfo`, stack, the bootloader/bundle reclaim ranges, the AP-trampoline
@@ -305,9 +305,21 @@ frame, and boot-module ELF sources. See
 | data[1] | `accepted_pages` — total pages across the accepted caps |
 | data[2] | `pool_total_pages` — memmgr's owned page count after the donation |
 
-The reply is always success. memmgr validates each cap with `cap_info`; a
-cap that is not a Memory cap or lacks a required right is deleted and not
-counted. Each accepted cap is owned by memmgr for the rest of its life: it
+**Reply (error):**
+
+| Field | Value |
+|---|---|
+| label | Nonzero error code |
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 5 | `Unauthorized` | Caller is not procmgr; every transferred cap is deleted and none is counted |
+
+A procmgr donation always succeeds. memmgr validates each cap with
+`cap_info`; a cap that is not a Memory cap or lacks a required right is
+deleted and not counted. Each accepted cap is owned by memmgr for the rest of its life: it
 is added to `pool_total` (see Label 6) and placed in the free pool,
 coalescing where possible. A donated cap that finds no free-pool slot stays
 owned and counted but is unreachable for allocation until a later coalesce
@@ -472,13 +484,23 @@ after the caller's CSpace is torn down. See [`memory-pool.md`](memory-pool.md)
 
 Neither `RELEASE_MEMORY_CAPS` nor `PROCESS_DIED` transfers the caps it
 reclaims. `RELEASE_MEMORY_CAPS` names each region by `phys_base`, and
-`PROCESS_DIED` names the dead process by badge; memmgr deletes any cap
-transferred with either call defensively, on `PROCESS_DIED` only when the
-caller is procmgr. An unauthorized `PROCESS_DIED` replies `Unauthorized`
-without deleting the caps attached to it; this defect is tracked in
-[#459](https://github.com/kottlerg/seraph/issues/459). Reclamation returns memmgr's
+`PROCESS_DIED` names the dead process by badge. Reclamation returns memmgr's
 retained intermediary to the free pool; memmgr does not derive from the
 caller's cap.
+
+Only two labels carry caps in their contract: `DONATE_MEMORY_CAPS` (every
+attached cap) and `DELEGATE_ASPACE` (`cap[0]`). memmgr deletes every other
+cap a message carries before it handles the message, whatever the label,
+the caller, or the reply: the caps attached to any other label (a
+`FAULT_LABEL` message and an unknown label included) and the caps after
+`cap[0]` on `DELEGATE_ASPACE`. It deletes the contract caps as well when the
+caller is not procmgr, and in the error cases the two labels' sections
+state. An attached cap therefore never outlives the call that carried it
+unless memmgr takes ownership of it, so no client can fill memmgr's `CSpace`
+by attaching caps until its receive loop fails and memmgr exits with
+`EXIT_RECV_WEDGE` (see
+[docs/ipc-design.md](../../../docs/ipc-design.md#receive-failure-policy)
+§"Receive-Failure Policy").
 
 ---
 

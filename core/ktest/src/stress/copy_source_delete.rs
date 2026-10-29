@@ -35,8 +35,10 @@
 //! phase), and opens the round. The caller loops over one group of calls
 //! through that handle until a call finds it gone: copy it into ktest's own
 //! `CSpace`, derive from it, derive a badged capability from it, deleting each
-//! new capability at once (so the controller's free is the last reference,
-//! or is followed by the caller's delete of a just-made copy, which then is).
+//! new capability at once. In the delete phase the controller's free is the
+//! source's last reference, or is followed by the caller's delete of a
+//! just-made copy, which then is; in the revoke phase the revoke clears the
+//! caller's copy and everything just made from it.
 //! The caller flags the call it is inside. The controller aims each round at
 //! one of the three calls in turn: it waits, bounded by [`ROUND_WAIT_US`],
 //! until the caller flags that call (a round whose aim never shows up
@@ -46,10 +48,10 @@
 //! controller waits for that report, bounded, before the next round.
 //!
 //! Accepted results, per call (anything else is recorded as bad): `Ok`, after
-//! which the caller deletes the new capability (a failed delete is bad);
-//! `InvalidCapability` once the handle is gone, which ends the caller's
-//! round; and `InvalidState` in the revoke phase, for a source slot a revoke
-//! batch has pinned in flight.
+//! which the caller deletes the new capability (a failed delete is bad,
+//! except `InvalidCapability` in the revoke phase, where the revoke cleared
+//! the new capability first); and `InvalidCapability` once the handle is
+//! gone, which ends the caller's round.
 //!
 //! Required, per phase: no bad result; the caller saw every round's handle
 //! go; each of the three calls returned `Ok` in some round; and some free was
@@ -148,6 +150,9 @@ static HANDLE: AtomicU32 = AtomicU32::new(0);
 static DEST_CSPACE: AtomicU32 = AtomicU32::new(0);
 /// The call the caller is inside (one of the call constants), or `NONE`.
 static IN_CALL: AtomicU32 = AtomicU32::new(NONE);
+/// 1 while the phase frees by revoking the original, whose revoke also
+/// clears every capability the caller has just made from its derived copy.
+static REVOKE_PHASE: AtomicU32 = AtomicU32::new(0);
 /// Per call, the results that returned `Ok`.
 static OKS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 /// Rounds whose handle the caller saw gone.
@@ -272,6 +277,7 @@ fn phase(ctx: &TestContext, free: Free, cycles: u32) -> Result<[u32; 4], &'stati
         counter.store(0, Ordering::Release);
     }
     BAD.reset();
+    REVOKE_PHASE.store(u32::from(free == Free::RevokeThenDelete), Ordering::Release);
     DEST_CSPACE.store(ctx.cspace_cap, Ordering::Release);
 
     let done = cap_create_notification(ctx.memory_base)
@@ -481,10 +487,11 @@ struct HandleGone;
 
 /// Issue one call of kind `kind`, flagged in [`IN_CALL`] for its span, and
 /// classify its result: `Ok` is tallied and its new capability deleted at
-/// once (a failed delete is recorded as bad); `InvalidCapability` (the handle
-/// is gone) is `Err(HandleGone)`; `InvalidState` (a revoke batch pins the
-/// source in flight) is accepted; anything else is recorded as bad. Every
-/// outcome but `Err(HandleGone)` lets the group go on.
+/// once (a failed delete is recorded as bad, except an `InvalidCapability`
+/// in the revoke phase: the new capability descends from the revoked
+/// original, and the revoke may clear it first); `InvalidCapability` (the
+/// handle is gone) is `Err(HandleGone)`; anything else is recorded as bad.
+/// Every outcome but `Err(HandleGone)` lets the group go on.
 fn call(kind: u32, issue: impl FnOnce() -> Result<u32, i64>) -> Result<(), HandleGone>
 {
     IN_CALL.store(kind, Ordering::Release);
@@ -495,14 +502,19 @@ fn call(kind: u32, issue: impl FnOnce() -> Result<u32, i64>) -> Result<(), Handl
         Ok(made) =>
         {
             OKS[kind as usize].fetch_add(1, Ordering::AcqRel);
-            if let Err(e) = cap_delete(made)
+            match cap_delete(made)
             {
-                BAD.record_error(e);
+                Ok(()) =>
+                {}
+                Err(e)
+                    if e == SyscallError::InvalidCapability as i64
+                        && REVOKE_PHASE.load(Ordering::Acquire) == 1 =>
+                {}
+                Err(e) => BAD.record_error(e),
             }
             Ok(())
         }
         Err(e) if e == SyscallError::InvalidCapability as i64 => Err(HandleGone),
-        Err(e) if e == SyscallError::InvalidState as i64 => Ok(()),
         Err(e) =>
         {
             BAD.record_error(e);

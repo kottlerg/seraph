@@ -1727,8 +1727,12 @@ unsafe fn unlink_dying_waiter(
 /// not: the `CSpaceObj` arm for the objects a dying `CSpace`'s slots
 /// reference, and the `AddressSpace` and `CSpaceObj` arms' `free_donation`
 /// (nested in `dealloc_object_one`) for a pool donation's Memory object that
-/// reaches zero. The first recurses one frame per nested `CSpace` whose last
-/// reference the dying one held; bounding that depth is #435.
+/// reaches zero. Neither re-entry can reach a `CSpace`: a nested `CSpace`
+/// whose last reference a dying one held is linked, through its
+/// `deferred_next` field, onto this call's pending list instead, and the
+/// outer loop below tears it down once the worklist is empty. The re-entry
+/// depth is therefore one frame whatever the nesting depth of `CSpace`s
+/// (core/kernel/docs/capability-internals.md § Teardown).
 #[cfg(not(test))]
 pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
 {
@@ -1748,22 +1752,41 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
         [None; MAX_CASCADE];
     worklist[0] = Some(ptr);
     let mut head: usize = 1;
+    // Nested `CSpace`s a dying `CSpace` released the last reference to,
+    // linked through `CSpaceKernelObject::deferred_next` (see `# Cascade
+    // handling`). Each is exclusively owned (refcount 0) and on no other list.
+    let mut pending: *mut KernelObjectHeader = core::ptr::null_mut();
 
-    while head > 0
+    loop
     {
-        head -= 1;
-        let Some(next) = worklist[head]
+        while head > 0
+        {
+            head -= 1;
+            let Some(next) = worklist[head]
+            else
+            {
+                continue;
+            };
+            worklist[head] = None;
+            // SAFETY: `next` is a NonNull<KernelObjectHeader> that was the
+            // original caller-supplied pointer, pushed onto the worklist by an
+            // ancestor-reclaim arm, or taken from `pending` below — every
+            // contract requires that no slot references the object (refcount
+            // 0, or a never-published body) and exclusive ownership.
+            unsafe { dealloc_object_one(next, &mut worklist, &mut head, &mut pending) };
+        }
+        let Some(nested) = NonNull::new(pending)
         else
         {
-            continue;
+            break;
         };
-        worklist[head] = None;
-        // SAFETY: `next` is a NonNull<KernelObjectHeader> that was either the
-        // original caller-supplied pointer or pushed onto the worklist by an
-        // ancestor-reclaim arm — both contracts require that no slot
-        // references the object (refcount 0, or a never-published body) and
-        // exclusive ownership at this point.
-        unsafe { dealloc_object_one(next, &mut worklist, &mut head) };
+        // SAFETY: `nested` is a refcount-0 CSpaceObj the CSpaceObj arm linked
+        // here; its link field is read before its teardown can reuse it (a
+        // self-teardown re-queues it on the per-CPU stack through the same
+        // field).
+        pending = unsafe { *deferred_link(nested) };
+        worklist[0] = Some(nested);
+        head = 1;
     }
 }
 
@@ -1793,6 +1816,7 @@ unsafe fn dealloc_object_one(
     ptr: core::ptr::NonNull<KernelObjectHeader>,
     worklist: &mut [Option<core::ptr::NonNull<KernelObjectHeader>>],
     head: &mut usize,
+    pending: &mut *mut KernelObjectHeader,
 )
 {
     /// Push `anc` onto the cascade worklist. Drops the entry on overflow —
@@ -2848,15 +2872,29 @@ unsafe fn dealloc_object_one(
                 }
 
                 // Dec-ref all objects referenced by non-null slots. Runs
-                // without DERIVATION_LOCK so nested CSpaceObj deallocs (a
-                // dying CSpace whose slots hold caps to other CSpaces) can
-                // acquire it themselves without re-entry.
+                // without DERIVATION_LOCK so the nested deallocs can take it.
+                // A nested CSpace reaching zero is not torn down here: it is
+                // linked onto the outer `dealloc_object`'s pending list, so a
+                // chain of CSpaces each holding the last reference to the
+                // next is torn down iteratively, not one recursion per level.
+                // No other type's teardown can release a CSpace, so the
+                // re-entry below is one frame deep.
                 // SAFETY: cs_ptr non-null; for_each_object handles iteration.
                 unsafe {
                     (*cs_ptr).for_each_object(|obj_ptr| {
                         let hdr = obj_ptr.as_ref();
                         let rc = hdr.dec_ref();
-                        if rc == 0
+                        if rc != 0
+                        {
+                            return;
+                        }
+                        if hdr.obj_type == ObjectType::CSpaceObj
+                        {
+                            // Refcount 0: the object is ours and on no list.
+                            *deferred_link(obj_ptr) = *pending;
+                            *pending = obj_ptr.as_ptr();
+                        }
+                        else
                         {
                             dealloc_object(obj_ptr);
                         }

@@ -193,14 +193,17 @@ page tables by a bit in the parent entry, not by the records; see
 
 ### Teardown
 
-Teardown walks the record pages newest first, returning each page's other
-records before its record 0 (whose donation holds the page), then the
-inline records, the create-time slab last. A donation's Memory object that
-reaches zero there is reclaimed through its own nested cascade, not the
-bounded worklist the dealloc cascade otherwise uses, since the number of
-donations is unbounded. The cascade's other re-entry, one frame per nested
-`CSpace` whose last reference the dying one held, is unbounded in depth;
-bounding it is [#435](https://github.com/kottlerg/seraph/issues/435).
+Teardown walks the record pages newest first, returning each page's other records before its
+record 0 (whose donation holds the page), then the inline records, the create-time slab last. A
+donation's Memory object that reaches zero there is reclaimed through its own nested cascade, not
+the bounded worklist the dealloc cascade otherwise uses, since the number of donations is
+unbounded. The cascade's other re-entry is the `CSpace` arm's release of the objects its slots
+reference. A nested `CSpace` that release drops to zero is not torn down in that frame: it is
+linked, through its deferred-reclaim link, onto a pending list the outermost `dealloc_object` call
+drains once its worklist is empty, so a chain of `CSpace`s each holding the last reference to the
+next is torn down iteratively. No other object's teardown can release a `CSpace`, so each re-entry
+is one frame deep and the teardown's stack use is bounded by a constant, whatever the nesting
+depth.
 
 The walk costs one `retype_free` per donation, holds no lock across records (each return takes only
 its ancestor's locks, the Memory object's read lock and its retype-allocator lock, so unlike a

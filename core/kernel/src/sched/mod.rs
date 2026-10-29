@@ -2008,7 +2008,7 @@ fn idle_thread_entry(_cpu_id: u64) -> !
             // last references a syscall pin or a batched capability move
             // dropped, and the `AddressSpace` an Mmio object's mapping record
             // held, released by that object's teardown
-            // (`MmioObject::withdraw_mappings`; all through
+            // (`MmioObject::withdraw_mappings`; the last three through
             // `cap::object::release_ref`), whose `CSpace` or `AddressSpace`
             // may still have live bound threads that the teardown stops here.
             // The idle thread is a safe context: never one of the queued dead

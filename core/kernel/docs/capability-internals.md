@@ -468,18 +468,17 @@ through, and withdraws it when that object is freed.
 
 ### Copies and Lineages
 
-`SYS_CAP_COPY`, `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` of an Mmio or IoPort
-capability do not share the source's object: `object_for_new_slot` retypes a fresh object
-over the same range from SEED, so every slot owns its object, and deleting or revoking the
-slot frees it (a syscall pin defers the free to the pinning syscall's end, as for any
+`SYS_CAP_COPY`, `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` of an Mmio or IoPort capability do not
+share the source's object: `object_for_new_slot` retypes a fresh object over the same range from
+SEED, so every slot owns its object, and deleting the slot, consuming it with a split, or revoking
+an ancestor of it frees it (a syscall pin defers the free to the pinning syscall's end, as for any
 object). A boot mint or a range split produces a lineage *root*; a copy records its root
-(`RangeLineage`), and the root's lineage count holds a root share while the root has
-references plus one per live copy. A copy past `RANGE_COPY_LIMIT` (64) live copies of one
-root returns `QuotaExceeded`, counting the copies alone whether or not the root is still
-referenced; that bounds the SEED copying can consume per lineage, while a split of a copy
-produces two fresh roots, each with a lineage of its own. A copy's body is freed with its
-last reference; the root's body is freed when its last share goes, so a copy's root pointer
-never dangles.
+(`RangeLineage`), and the root's lineage count holds a root share while the root has references plus
+one per live copy. A copy past `RANGE_COPY_LIMIT` (64) live copies of one root returns
+`QuotaExceeded`, counting the copies alone whether or not the root is still referenced; that bounds
+the SEED copying can consume per lineage, while a split of a copy produces two fresh roots, each
+with a lineage of its own. A copy's body is freed with its last reference; the root's body is freed
+when its last share goes, so a copy's root pointer never dangles.
 
 ### Mmio Mappings
 

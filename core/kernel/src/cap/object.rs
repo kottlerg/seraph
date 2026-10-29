@@ -2078,8 +2078,9 @@ unsafe fn release_range_object<T>(
 ///
 /// For an `Mmio` or `IoPort` capability this is a fresh SEED-backed object
 /// over the same range, in `src`'s lineage, so mappings and port bindings made
-/// through the new capability are withdrawn when it is deleted or revoked,
-/// whatever other capabilities to the range survive
+/// through the new capability are withdrawn when it is deleted, consumed by a
+/// split, or revoked through an ancestor, whatever other capabilities to the
+/// range survive
 /// (docs/capability-model.md § Mmio, § `IoPort`). Every other type shares
 /// `src`, whose reference count is incremented.
 ///

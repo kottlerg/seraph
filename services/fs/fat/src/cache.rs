@@ -52,21 +52,17 @@ use crate::bpb::SECTOR_SIZE;
 /// allocates it, and it is held for the process lifetime.
 static SCRATCH_MEMORY: OnceLock<ScratchMemory> = OnceLock::new();
 
+/// The scratch page's cap and the VA it is mapped at.
+///
+/// The page is used by one thread only: the dispatch thread calls
+/// [`PageCache::write_sector`] and [`PageCache::reload_sector`], the two
+/// users of the page and its cap, and the eviction worker touches the cache
+/// only through [`PageCache::release_slot`].
 struct ScratchMemory
 {
     cap: AtomicU32,
     va: u64,
 }
-
-// SAFETY: ScratchMemory's fields are an `AtomicU32` and a `u64`, both Send
-// and Sync, so these impls assert only what the compiler derives for the
-// struct. The scratch page the VA names is used by one thread only: the
-// dispatch thread calls `write_sector` and `reload_sector`, the two users
-// of the page and its cap, and the eviction worker touches the cache only
-// through `release_slot`.
-unsafe impl Send for ScratchMemory {}
-// SAFETY: see Send above — same justification.
-unsafe impl Sync for ScratchMemory {}
 
 /// Number of cache slots.
 pub const SLOT_COUNT: usize = 128;

@@ -1764,7 +1764,10 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
 /// capability move's freed source slot (`cap::transfer::release_moved_object`)
 /// or a syscall's pin — from a live thread: possibly one bound to it, and
 /// possibly from inside IPC delivery, where a teardown's bound-thread stop and
-/// cross-CPU waits must not run.
+/// cross-CPU waits must not run; and the `AddressSpace` an Mmio object's
+/// mapping record held, released by that object's teardown
+/// (`MmioObject::withdraw_mappings`) from a syscall or from the idle thread's
+/// own drain.
 ///
 /// # Safety
 /// `ptr` is an exclusively-owned `Thread`, `CSpaceObj`, or `AddressSpace`

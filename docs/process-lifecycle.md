@@ -405,14 +405,15 @@ A process dies when:
 - procmgr revokes and deletes its caps to the process's `Thread`, `CSpace`, and `AddressSpace` (the
   "kill process" pattern; see [`capability-model.md`](capability-model.md)
   §`"Kill process" pattern`).
-- The last capability to its `CSpace` or `AddressSpace` is deleted: the kernel stops every thread
-  bound to the object (retained exit reason `EXIT_KILLED`) before reclaiming it, so the process's
-  threads cannot outlive either. A thread deleting the last capability to its own `CSpace` or
-  `AddressSpace` is stopped by that same delete and never returns from it, unless another
-  thread's syscall still pins the object, or an Mmio capability's object records a mapping into
-  that `AddressSpace` (see [`capability-model.md`](capability-model.md#mmio) § Mmio): the delete
-  then returns, and the stop follows when that syscall releases the object or that Mmio object is
-  freed.
+- The last capability to its `CSpace` or `AddressSpace` is deleted and the object is freed: the
+  kernel stops every thread bound to the object (retained exit reason `EXIT_KILLED`) before
+  reclaiming it, so the process's threads cannot outlive either. An `AddressSpace` an Mmio
+  capability's object records a mapping into is freed, and its threads stopped, only when that
+  Mmio object is freed (see [`capability-model.md`](capability-model.md#mmio) § Mmio). A thread
+  deleting the last capability to its own `CSpace` or `AddressSpace` is stopped by that same delete
+  and never returns from it, unless another thread's syscall still pins the object, or an Mmio
+  capability's object records a mapping into that `AddressSpace`: the delete then returns, and the
+  stop follows when that syscall releases the object or that Mmio object is freed.
 - An unhandled fault terminates its threads.
 
 Under the kill-process pattern and the `CSpace`/`AddressSpace` teardown, an object a concurrent

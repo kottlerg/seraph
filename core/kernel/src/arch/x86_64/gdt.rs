@@ -680,8 +680,10 @@ pub unsafe fn load_iopb(iopb: Option<&[u8; IOPB_SIZE]>)
 /// Make every CPU reload its TSS I/O permission bitmap before its next ring-3
 /// port access.
 ///
-/// Called after a thread's bitmap lost ports (an `IoPort` binding withdrawn,
-/// `cap::ioport_bindings::withdraw_everywhere`). Sets every CPU's
+/// Called after a thread's bitmap changed while it may be running on another
+/// CPU: an `IoPort` binding withdrawn
+/// (`cap::ioport_bindings::withdraw_everywhere`), or a `SYS_IOPORT_BIND` of a
+/// thread other than the caller. Sets every CPU's
 /// `iopb_offset` to [`IOPB_OFFSET_INVALID`], so the next port access on each
 /// raises `#GP`, whose handler reloads the running thread's current bitmap
 /// ([`reload_invalidated_iopb`]) and retries the instruction. A CPU that

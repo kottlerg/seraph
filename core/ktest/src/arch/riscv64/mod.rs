@@ -36,20 +36,23 @@ use init_protocol::InitInfo;
 use crate::TestContext;
 
 /// A fresh range-capability lineage root for `integration::range_copy_lineage`:
-/// the low page split off a copy of a live `Mmio` cap of at least two pages
-/// (riscv64 has no I/O ports). Every slot is tried by index; a copy of
-/// another type, or of a one-page `Mmio`, refuses the split and is deleted.
+/// the low page split off a copy of a boot `Mmio` aperture cap of at least two
+/// pages (riscv64 has no I/O ports). The apertures are taken from `InitInfo`'s
+/// descriptors, whose slots were never recycled, so their handles carry
+/// generation 0; one an earlier test consumed refuses the derive and is
+/// skipped.
 pub fn fresh_range_root(ctx: &TestContext) -> Option<u32>
 {
-    for slot in 1..=crate::unit::hw::scan_bound(ctx)
+    // SAFETY: the kernel maps the read-only InitInfo page at init_info_va for
+    // ktest's lifetime.
+    let info = unsafe { &*(ctx.init_info_va as *const InitInfo) };
+    for d in crate::init_info::descriptors(info)
     {
-        // A copy of ktest's own Thread cap could not be deleted again (a thread
-        // cannot delete a capability to itself).
-        if slot == ctx.thread_cap
+        if d.cap_type != init_protocol::CapType::Mmio || d.aux1 < 0x2000
         {
             continue;
         }
-        let Ok(copy) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
+        let Ok(copy) = syscall::cap_derive(d.slot, syscall::RIGHTS_ALL)
         else
         {
             continue;

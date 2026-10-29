@@ -1733,9 +1733,9 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
         ObjectType::Thread | ObjectType::CSpaceObj | ObjectType::AddressSpace =>
         {
             let cpu = crate::arch::current::cpu::current_cpu() as usize;
-            // SAFETY: refcount 0, exclusively owned, a linkable type;
-            // syscall context with interrupts disabled, so the CPU index
-            // is stable.
+            // SAFETY: refcount 0, exclusively owned, a linkable type; the
+            // CPU index is stable (syscall context with interrupts disabled,
+            // or the pinned idle thread's drain, per the contract).
             unsafe { push_deferred_reclaim(cpu, obj) };
         }
         _ =>

@@ -104,6 +104,16 @@ pub fn carve_port_range(port: u16, count: u16) -> Option<u32>
         // `ioport_split` syscall.
         let _ = prefix;
         slot = rest;
+        // The split consumed the old wide cap: record `rest` now, so a failed
+        // second split below leaves a wide cap that still resolves.
+        // SAFETY: ktest is single-threaded.
+        unsafe {
+            WIDE = WideCap {
+                slot,
+                base: port_start,
+                end,
+            };
+        }
     }
 
     if port_end < end

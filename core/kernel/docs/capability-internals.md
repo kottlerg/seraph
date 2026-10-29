@@ -482,10 +482,14 @@ never dangles.
 ### Mmio Mappings
 
 An `MmioObject` holds up to `MMIO_MAX_MAPPINGS` (4) mapping records, each an `AddressSpace` (with a
-reference) and the VA of the region's first page; mapping the object again at the same place reuses
-its record, and a fifth distinct mapping returns `QuotaExceeded`. `sys_mmio_map` records the mapping
-under the object's `map_lock` before it maps a page, so the teardown finds every page a call maps, a
-partial map included. The object's dealloc arm runs `withdraw_mappings`: for each record,
+reference) and the VA of the region's first page; mapping the object again at a place already
+recorded reuses its record, and a fifth distinct mapping returns `QuotaExceeded`. The records are
+atomics: `sys_mmio_map` claims a free record by compare-exchange, fills its VA, and publishes the
+address space last with Release, so concurrent maps through one object need no lock. Two maps racing
+to record the same place may each take a record, which costs a record and is otherwise harmless.
+`sys_mmio_map` records the mapping before it maps a page, and holds its pin on the object across
+both, so the teardown finds every page a call maps, a partial map included, and never sees a claimed
+record unfilled. The object's dealloc arm runs `withdraw_mappings`: for each record,
 `AddressSpace::unmap_region_if_phys` clears, under `pt_lock`, each leaf that still maps the matching
 device page (a page the user has since remapped to other memory is left alone), then issues one TLB
 invalidation for the span on every CPU that runs the space, after the lock is released; the device

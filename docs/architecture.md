@@ -191,14 +191,15 @@ through withdraws it.
 Physical MMIO regions are mapped into a driver’s address space under capability
 control. Once mapped, drivers access registers directly without kernel mediation.
 Revoking an Mmio capability unmaps, with TLB shootdown, every mapping made through its
-descendants before the revoke returns; the revoked capability itself is preserved, so
+descendants, before the revoke returns unless a concurrent syscall still holds a descendant
+(then when that syscall releases it); the revoked capability itself is preserved, so
 mappings made through it remain (see [capability-model.md](capability-model.md#mmio)).
 
 **Port I/O (x86‑64 only)**
 Drivers receive an IoPort capability for assigned port ranges. Binding an IoPort
 capability to a thread enables direct execution of port I/O instructions for those
 ranges. Revoking an IoPort capability withdraws port access from every thread bound
-through its descendants, on every CPU, before the revoke returns; the revoked capability
+through its descendants, on every CPU, with the same timing as for MMIO; the revoked capability
 itself is preserved, so bindings made through it remain (see
 [capability-model.md](capability-model.md#ioport-x86-64-only)).
 RISC‑V does not support port I/O.

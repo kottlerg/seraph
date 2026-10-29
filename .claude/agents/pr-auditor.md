@@ -32,8 +32,10 @@ claims.
 
 5. Per-issue closure: extract every closing reference from the PR body and
    the commit messages, as `docs/conventions.md` § Commit and PR
-   cross-references defines one: `close`, `fix`, or `resolve` in any
-   inflection or letter case, directly followed by a reference to Issue N
+   cross-references defines one: `close`, `closes`, `closed`, `fix`,
+   `fixes`, `fixed`, `resolve`, `resolves`, or `resolved`, in any letter
+   case (not `closing`, `fixing`, or `resolving`), directly followed by a
+   reference to Issue N
    (`#N`, `<owner>/<repo>#N`, or the Issue's URL) with at most a colon and
    whitespace between (a subject such as `fix #N items` closes #N exactly
    as `Fixes #N` does; the `(fixed by PR #M)` marker is not a closing

@@ -169,10 +169,11 @@ impl PageCache
         }
 
         // Allocate and map the single-page scratch memory cap used for
-        // single-sector writeback in `write_sector`. Lazy fallback would
-        // need to re-do the request/reserve/map dance under an Ordering
-        // discipline; doing it once at startup keeps `write_sector`
-        // synchronous and free of init-time error paths.
+        // single-sector writeback in `write_sector` and single-sector reads
+        // in `reload_sector`. Lazy fallback would need to re-do the
+        // request/reserve/map dance under an Ordering discipline; doing it
+        // once at startup keeps both synchronous and free of init-time
+        // error paths.
         let scratch_va = reserve_pages(1).map_err(|_| InitError::Reserve)?.va_start();
         let scratch_cap = request_one_page(memmgr_ep, ipc_buf).ok_or(InitError::Memmgr)?;
         syscall::mem_map(scratch_cap, self_aspace, scratch_va, 0, 1, MAP_WRITABLE)

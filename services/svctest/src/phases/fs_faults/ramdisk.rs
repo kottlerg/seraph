@@ -316,23 +316,24 @@ fn transfer(
     for i in 0..count
     {
         let page = (va + (i * SECTOR) as u64) as *mut u8;
-        // SAFETY: `va` maps one page for this copy, and sector `i` of at
-        // most `MAX_SECTORS_PER_REQUEST`, one page's worth, lies inside it.
-        unsafe {
-            match direction
+        match direction
+        {
+            Direction::Write =>
             {
-                Direction::Write =>
-                {
-                    let sector = disk
-                        .sectors
-                        .entry(lba + i)
-                        .or_insert_with(|| Box::new(ZERO_SECTOR));
-                    core::ptr::copy_nonoverlapping(page, sector.as_mut_ptr(), SECTOR);
-                }
-                Direction::Read =>
-                {
-                    core::ptr::copy_nonoverlapping(disk.sector(lba + i).as_ptr(), page, SECTOR);
-                }
+                let sector = disk
+                    .sectors
+                    .entry(lba + i)
+                    .or_insert_with(|| Box::new(ZERO_SECTOR));
+                // SAFETY: `va` maps one page for this copy, and sector `i` of
+                // at most `MAX_SECTORS_PER_REQUEST`, one page's worth, lies
+                // inside it; `sector` is a distinct heap buffer.
+                unsafe { core::ptr::copy_nonoverlapping(page, sector.as_mut_ptr(), SECTOR) };
+            }
+            Direction::Read =>
+            {
+                let sector = disk.sector(lba + i);
+                // SAFETY: as for the write arm, the other way round.
+                unsafe { core::ptr::copy_nonoverlapping(sector.as_ptr(), page, SECTOR) };
             }
         }
     }

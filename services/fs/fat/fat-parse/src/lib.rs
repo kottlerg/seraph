@@ -200,7 +200,10 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
     }
     else
     {
-        (FatType::Fat32, fsinfo_sector(sector_data, reserved_sectors))
+        (
+            FatType::Fat32,
+            named_fsinfo_sector(sector_data, reserved_sectors),
+        )
     };
 
     check_fat_capacity(fat_type, fat_size, bytes_per_sector, total_clusters)?;
@@ -235,7 +238,7 @@ pub fn parse_bpb_geometry(sector_data: &[u8; SECTOR_SIZE]) -> Result<BpbGeometry
 /// region; one named past it lies in a FAT copy or the data region, where
 /// writing the hints back would corrupt the volume, so it is treated as
 /// absent too.
-fn fsinfo_sector(sector_data: &[u8; SECTOR_SIZE], reserved_sectors: u16) -> Option<u32>
+fn named_fsinfo_sector(sector_data: &[u8; SECTOR_SIZE], reserved_sectors: u16) -> Option<u32>
 {
     let fsinfo = u16::from_le_bytes([sector_data[48], sector_data[49]]);
     (fsinfo != 0 && fsinfo != 0xFFFF && fsinfo < reserved_sectors).then_some(u32::from(fsinfo))

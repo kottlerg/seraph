@@ -7,10 +7,11 @@
 //! volume whose device drops or fails chosen block requests.
 //!
 //! A write the device refuses leaves fatfs's cache as it was before the
-//! write (`PageCache::write_sector`), and a removal whose last write failed
-//! is settled by what the device holds in the entry's 8.3 slot
-//! (services/fs/docs/fs-driver-protocol.md § Label 14: `FS_REMOVE` and
-//! § Label 16: `FS_RENAME`). Each case lives in its own directory, whose
+//! write (`PageCache::write_sector`), and a failed removal is settled by
+//! where it left the entry's 8.3 slot: live when the failure came before
+//! that slot's write, and as the device holds the slot when that write
+//! failed (services/fs/docs/fs-driver-protocol.md § Label 14: `FS_REMOVE`
+//! and § Label 16: `FS_RENAME`). Each case lives in its own directory, whose
 //! single sector the faults are armed on.
 
 mod ramdisk;

@@ -817,8 +817,10 @@ pub fn restore_slot_first_bytes(
 
 /// What the block device holds in the 8.3 slot at `loc`, read past the
 /// cache with [`PageCache::reload_sector`], which also refreshes the
-/// cached copy. Decides the outcome of a removal whose last write failed:
-/// the cache cannot, since it shows the slot as it was before that write.
+/// cached copy. Decides the outcome of a removal whose 8.3 slot write
+/// failed: the cache cannot, since it shows the slot as it was before that
+/// write. A removal that failed before that write left the slot live and
+/// needs no read.
 pub enum DeviceSlotState
 {
     /// The slot does not carry the `0xE5` deleted marker.

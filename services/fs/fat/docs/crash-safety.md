@@ -82,12 +82,15 @@ process.
 device that drops chosen sector writes, or lands them and reports them
 failed, and fails chosen reads. It confirms that a failed `FS_WRITE`
 leaves the cached sector as it was, so a later `FS_READ` returns the old
-bytes, and that a failed `FS_REMOVE` or `FS_RENAME` is settled by the
-8.3 slot as the device holds it
+bytes, and that a failed `FS_REMOVE` or `FS_RENAME` is settled by where
+it left the 8.3 slot
 ([fs-driver-protocol.md](../../docs/fs-driver-protocol.md) § Label 14
-and § Label 16): undone, with the source's slots as they were on disk,
-while the entry is live; taken effect when the entry is deleted; and
-unsettled, with the node dropped, when the slot cannot be read.
+and § Label 16). A failure before the 8.3 slot's write (a dropped LFN
+write) leaves the entry live, without reading the device back. When the
+8.3 write itself failed, the device read decides: undone, with the
+source's slots as they were on disk, while the entry is live; taken
+effect when the entry is deleted; and unsettled, with the node dropped,
+when the slot cannot be read.
 
 The other write-side phases (`fs_write_phase`, `fs_create_remove_phase`,
 `fs_mkdir_phase`, `fs_rename_phase`, `fs_write_memory_phase`) are

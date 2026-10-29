@@ -37,7 +37,7 @@
 //!   harmless, because eviction needs the space inactive everywhere (proof:
 //!   core/kernel/docs/memory-internals.md § SMP TLB Shootdown).
 //!
-//! The AddressSpace teardown (`dealloc_object`, core/kernel/src/cap/object.rs)
+//! The `AddressSpace` teardown (`dealloc_object`, core/kernel/src/cap/object.rs)
 //! does not read `tag` itself: an eviction can move the dying space's tag to
 //! another space between such a read and the free, so [`free_tag`] re-reads the
 //! tag under the lock and frees it only while the pool still records the dying

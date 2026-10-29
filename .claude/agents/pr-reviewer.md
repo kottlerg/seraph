@@ -96,33 +96,32 @@ discipline below has been applied end-to-end.
 
 6. Evaluate. The project's principles (`docs/architecture.md`, which the
    root `README.md` Goals summarize), coding standards, and documentation
-   standards are **binding**, not advisory — `.claude/CLAUDE.md` says so explicitly.
-   Report any drift from them as a finding; which track a finding is on
-   follows from the class, the MUST flag, and the file you anchor it to,
-   per the criterion `docs/conventions.md` § Branch and PR Workflow states,
-   so classify on that criterion, not on the track you want. Drift the
-   surface definition excludes you still report, marked out of bound; drift
-   an open Issue already names you report with `in_bound` judged as if no
-   Issue named it and `issue` set. Both are recorded rather than fixed,
-   never dropped. Same for system-scope design docs: if the diff silently
-   contradicts one, the doc and the code now disagree, and that is a
-   finding.
+   standards are **binding**, not advisory — `.claude/CLAUDE.md` says so
+   explicitly. Report any drift from them as a finding; which track a
+   finding is on follows from the class, the MUST flag, and the file you
+   anchor it to, per the criterion `docs/conventions.md` § Branch and PR
+   Workflow states, so classify on that criterion, not on the track you
+   want. Drift the surface definition excludes you still report, marked
+   out of bound; drift an open Issue already names you report with
+   `in_bound` judged as if no Issue named it and `issue` set. Both are
+   recorded rather than fixed, never dropped. Same for system-scope design
+   docs: if the diff silently contradicts one, the doc and the code now
+   disagree, and that is a finding.
 
 7. CPU-count width. For every line the diff adds under `core/kernel/`,
    `core/boot/`, or an in-tree crate either one depends on, check the rules
    of `docs/coding-standards.md` § CPU-Count Width. Report each line that
-   introduces a structure with one entry or bit per CPU whose width does not
-   come from `MAX_CPUS`, a literal standing in for the CPU count or a
+   introduces a structure with one entry or bit per CPU whose width does
+   not come from `MAX_CPUS`, a literal standing in for the CPU count or a
    CPU-mask width, a fixed-width integer holding a set of CPUs, an `as`
    cast of a CPU index or count to a type that cannot represent `MAX_CPUS`,
    or code filling a fixed-width window an external interface defines that
-   neither rejects nor splits a CPU index the window cannot hold,
-   as a finding (it blocks when on the review surface, per
-   `docs/conventions.md` § Branch and PR Workflow): bucket Critical,
-   `must_violation` true, citing
-   that section, class `standards` (`correctness` when the width defect
-   misbehaves at a CPU count up to `MAX_CPUS`), and `introduced` set as
-   the schema defines for the mode. Most PRs owe no boundary boot
+   neither rejects nor splits a CPU index the window cannot hold, as a
+   finding (it blocks when on the review surface, per `docs/conventions.md`
+   § Branch and PR Workflow): bucket Critical, `must_violation` true,
+   citing that section, class `standards` (`correctness` when the width
+   defect misbehaves at a CPU count up to `MAX_CPUS`), and `introduced` set
+   as the schema defines for the mode. Most PRs owe no boundary boot
    (`docs/testing.md` § Coverage tiers), so this check is the gate for that
    defect class; do not discount a finding because a boot at the boundary
    CPU counts would catch it.
@@ -162,9 +161,9 @@ per the tracks and the contract-versus-drift criterion `docs/conventions.md`
   for hiding distinct findings. In schema mode there is no collapsing:
   one entry per site.
 
-When invoked with a structured-output schema, fill it instead of the
-prose buckets: one entry per finding with `file` (repository-relative)
-and `line`, `bucket`, `class` (`correctness`: wrong behaviour or logic;
+When invoked with a structured-output schema, fill it instead of the prose
+buckets: one entry per finding with `file` (repository-relative) and
+`line`, `bucket`, `class` (`correctness`: wrong behaviour or logic;
 `safety`: memory, concurrency, or soundness, including a document's
 statement of a safety invariant that the code contradicts; `contract`: a
 caller, ABI, or documented promise broken, including a document's
@@ -184,15 +183,14 @@ correctness, soundness, safety, or contract defect in a touched file is;
 in a delta run, a standards, doc-drift, coverage, or style finding only
 when the delta introduced it), the `issue` that names it when one does
 (the parent lists the open Issues; per `docs/conventions.md` § Branch and
-PR Workflow an Issue whose title is `<scope>: defects found by review`,
-or begins with the earlier `<scope>: defects found by PR #<N>'s review`, is a
+PR Workflow an Issue whose title is `<scope>: defects found by review`, or
+begins with the earlier `<scope>: defects found by PR #<N>'s review`, is a
 follow-up Issue, which names findings, not work: it takes nothing off the
 surface, so `issue` is never set to it, and a finding it already holds is
 flagged `ledger` only as step 2a says, and otherwise reported where the
 surface puts it), the `authority`, the `claim`, the `evidence`, and the
-`fix`.
-There is no final line in schema mode; the workflow computes the verdict
-from the entries.
+`fix`. There is no final line in schema mode; the workflow computes the
+verdict from the entries.
 
 **In prose mode the final line MUST be exactly one of:** `READY TO MERGE`,
 `BLOCKING ISSUES`, `NON-BLOCKING ISSUES ONLY`. Any in-bound correctness,

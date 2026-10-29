@@ -13,14 +13,8 @@
 //! IPC buffer page via [`ipc_buffer_set`] first.
 //!
 //! # ABI
-//! - x86-64: syscall number in `rax`; args in `rdi/rsi/rdx/r10/r8/r9`;
-//!   return in `rax` (primary), `rdx` (secondary label for `ipc_call`/`ipc_recv`).
-//!   On `SYS_IPC_CALL`, `rdx` and `r9` are aliased: each carries an argument in
-//!   and a return value out (`r9` = sixth argument / tertiary return).
-//! - RISC-V: syscall number in `a7`; args in `a0–a5`;
-//!   return in `a0` (primary), `a1` (secondary label). On `SYS_IPC_CALL`,
-//!   `a1`/`a2` are aliased the same way (`a2` = third argument / tertiary
-//!   return).
+//! Register assignment follows `core/kernel/docs/syscalls.md` § Calling
+//! Convention; `arch::current` implements it per architecture.
 
 // When pulled into std's dep graph via build-std (feature
 // `rustc-dep-of-std` on), `core` isn't yet a conventional crate — we
@@ -132,7 +126,7 @@ pub use syscall_abi::pack_cap_handles;
 /// Voluntarily yield the CPU to the next runnable thread.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the kernel rejects the call.
+/// None: the kernel never fails this call, so the result is always `Ok`.
 #[inline]
 pub fn thread_yield() -> Result<(), i64>
 {
@@ -341,7 +335,9 @@ pub fn raw_ipc_reply(
 /// Send `bits` to a notification cap. `bits` must be non-zero.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the notification cap is invalid or `bits` is zero.
+/// Returns a negative `i64` error code: `InvalidCapability` (bad cap),
+/// `InsufficientRights` (cap lacks Notify), or `InvalidArgument` (`bits` is
+/// zero).
 #[inline]
 pub fn notification_send(sig: u32, bits: u64) -> Result<(), i64>
 {
@@ -552,8 +548,9 @@ pub fn cap_create_cspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 /// rejection; other callers should use [`cap_create_cspace`], which
 /// always passes `0`.
 ///
-/// Returns the kernel's raw `i64`: the new cap slot (create-mode) or `0`
-/// (augment-mode) on success, a negative `SyscallError` code on failure.
+/// Returns the kernel's raw `i64`: the new capability handle (slot index plus
+/// generation) in create-mode, or `0` in augment-mode, on success; a negative
+/// `SyscallError` code on failure.
 #[doc(hidden)]
 #[must_use]
 #[inline]
@@ -591,11 +588,13 @@ pub fn raw_cap_create_cspace(
 /// `[min, max]` band.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if any cap is invalid, the Memory
-/// cap lacks `RETYPE` or sufficient `available_bytes`, the priority is
-/// outside the `SchedControl` band (or nonzero without one), or the
-/// caller's `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
-/// structural ceiling).
+/// Returns a negative `i64` error code: `InvalidCapability` (a cap is
+/// invalid), `InsufficientRights` (a source cap lacks Retype/Map/Insert, or
+/// `priority` is outside the `SchedControl` band), `InvalidArgument` (nonzero
+/// `priority` without a `SchedControl` cap, or `priority` above
+/// `PRIORITY_MAX`), `OutOfMemory` (the Memory cap's `available_bytes` or the
+/// caller's `CSpace` slot pool is exhausted), or `QuotaExceeded` (the `CSpace`
+/// directory is structurally full).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -626,22 +625,26 @@ pub fn cap_create_thread(
 
 /// Map `page_count` pages of a Memory cap into an address space.
 ///
-/// - `memory_cap`: cap index of the source Memory cap.
-/// - `aspace_cap`: cap index of the target `AddressSpace`.
-/// - `virt`: virtual address to map at (page-aligned, below the kernel's
-///   per-mode user VA ceiling: `2^47` on x86-64 and riscv64 Sv48, `2^38` on
-///   Sv39, `2^56` on Sv57).
+/// - `memory_cap`: capability handle (slot index plus generation) of the source Memory cap.
+/// - `aspace_cap`: capability handle (slot index plus generation) of the target `AddressSpace`.
+/// - `virt`: virtual address to map at (page-aligned and below the kernel's
+///   `user_va_top`; see `core/kernel/docs/arch-interface.md` § `paging`, `user_va_top`).
 /// - `offset_pages`: first page within the memory region to map.
 /// - `page_count`: number of pages to map.
-/// - `prot_bits`: explicit permission bits (bit 1 = WRITE, bit 2 = EXECUTE).
-///   Must be a subset of the Memory cap's rights. If zero, permissions are
-///   derived from the Memory cap's rights directly.
+/// - `prot_bits`: explicit permission bits (bit 0 = READ, bit 1 = WRITE,
+///   bit 2 = EXECUTE; bit 0 grants nothing of its own but makes a read-only
+///   request non-zero). Must be a subset of the Memory cap's rights. If zero,
+///   permissions are derived from the Memory cap's rights directly.
 ///
 /// W^X is enforced: WRITE and EXECUTE may not both be set.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if either cap is invalid, `virt` is
-/// not page-aligned or out of range, the memory region is too small, or W^X is violated.
+/// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,
+/// non-canonical, or the range leaves the user half), `InvalidArgument`
+/// (zero page count, overflow, or the range runs past the memory region),
+/// `InvalidCapability`, `InsufficientRights` (requested permissions exceed
+/// the cap's rights), `WxViolation`, or `OutOfMemory` (page-table
+/// allocation).
 #[inline]
 pub fn mem_map(
     memory_cap: u32,
@@ -679,8 +682,9 @@ pub fn mem_map(
 /// `virt` must be page-aligned and in the user address range.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the cap is invalid or `virt` is
-/// not page-aligned.
+/// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,
+/// or the range leaves the user half), `InvalidArgument` (zero page count or
+/// overflow), `InvalidCapability`, or `InsufficientRights` (cap lacks Map).
 #[inline]
 pub fn mem_unmap(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
 {
@@ -700,8 +704,7 @@ pub fn mem_unmap(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
 /// region span in one call so a wholly-covered intermediate table is reclaimed.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the cap is invalid or `virt` is
-/// not page-aligned.
+/// The same codes as [`mem_unmap`].
 #[inline]
 pub fn mem_unmap_reclaim(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
 {
@@ -726,9 +729,11 @@ pub fn mem_unmap_reclaim(aspace_cap: u32, virt: u64, page_count: u64) -> Result<
 /// W^X is enforced. Returns an error if any page is not currently mapped.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if either cap is invalid, the
-/// requested permissions exceed the cap's rights, or any target page is
-/// not currently mapped.
+/// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,
+/// the range leaves the user half, or a page in it is not mapped),
+/// `InvalidArgument` (zero page count, overflow, or no free frame during the
+/// page-table walk), `WxViolation`, `InvalidCapability`, or
+/// `InsufficientRights` (requested permissions exceed the cap's rights).
 #[inline]
 pub fn mem_protect(
     memory_cap: u32,
@@ -761,18 +766,21 @@ pub fn mem_protect(
 /// so any in-range page-aligned offset is acceptable).
 ///
 /// The parent (`memory_cap`) stays in its slot; its `size` shrinks to
-/// `split_offset` and its `available_bytes` debits accordingly. A new
+/// `split_offset` and, when it carries `RETYPE`, its `available_bytes`
+/// debits by the carved length. A new
 /// child cap covering `[base + split_offset, base + orig_size)` is
 /// inserted in the caller's `CSpace` as a derivation sibling of the
 /// parent. Returns the tail's capability handle (slot index plus generation).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the cap is invalid,
-/// `split_offset` is not page-aligned, is out of range, lands inside
-/// the cap's bump region, or the parent has derivation children.
-/// `InvalidCapability` also covers a parent a concurrent delete freed
-/// before the tail was linked; `InvalidState` means a `cap_revoke`,
-/// `cap_move`, or IPC capability transfer is in flight on the parent.
+/// Returns a negative `i64` error code: `InvalidArgument` (`split_offset`
+/// not page-aligned, out of range, inside the cap's bump region, or the
+/// parent has derivation children), `InvalidCapability` (also a parent a
+/// concurrent delete freed before the tail was linked), `InvalidState` (a
+/// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
+/// parent), `InsufficientRights` (cap lacks Map), `OutOfMemory` (tail
+/// allocation or `CSpace` slot pool exhausted), or `QuotaExceeded` (`CSpace`
+/// directory structurally full).
 // cast_sign_loss: proven non-negative in Ok branch.
 // cast_possible_truncation: returned value is a cap handle — a 24-bit slot index plus an
 // 8-bit generation — so it fits u32.
@@ -788,7 +796,7 @@ pub fn memory_split(memory_cap: u32, split_offset: u64) -> Result<u32, i64>
 
 /// Absorb a virgin tail Memory cap back into its parent.
 ///
-/// Inverse of [`memory_split`] under Option D. `parent_cap` covers the
+/// Inverse of [`memory_split`]. `parent_cap` covers the
 /// physically-lower half and `tail_cap` the upper;
 /// `parent.base + parent.size == tail.base` is required. Both caps must
 /// share the same rights, `owns_memory` state, derivation parent, and
@@ -804,10 +812,12 @@ pub fn memory_split(memory_cap: u32, split_offset: u64) -> Result<u32, i64>
 /// `PROCESS_DIED` reclamation.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the caps fail validation.
-/// `InvalidCapability` also covers a cap a concurrent delete freed before
-/// the merge took the derivation lock; `InvalidState` means a `cap_revoke`,
-/// `cap_move`, or IPC capability transfer is in flight on either cap.
+/// Returns a negative `i64` error code: `InvalidArgument` (same slot or
+/// object, rights or ownership-flag mismatch, not contiguous, tail not
+/// virgin, not siblings, or either has children), `InvalidCapability` (also a
+/// cap a concurrent delete freed before the merge took the derivation lock),
+/// `InvalidState` (a `cap_revoke`, `cap_move`, or IPC capability transfer is
+/// in flight on either cap), or `InsufficientRights` (either cap lacks Map).
 #[inline]
 pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 {
@@ -827,12 +837,15 @@ pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 /// Split `mmio_cap` into two non-overlapping child `Mmio` caps.
 ///
 /// `split_offset` is in bytes and must be page-aligned, > 0, and < the region
-/// size. The original cap is consumed. Returns `(slot1, slot2)` where slot1
-/// covers `[base, base+split_offset)` and slot2 covers `[base+split_offset, end)`.
+/// size. The original cap is consumed. Returns `(lower_handle, upper_handle)`,
+/// two capability handles: the lower covers `[base, base+split_offset)` and
+/// the upper `[base+split_offset, end)`.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the cap is invalid, `split_offset`
-/// is not page-aligned, or is out of range for the region.
+/// Returns a negative `i64` error code if the cap is invalid
+/// (`InvalidCapability`) or lacks Map (`InsufficientRights`), or
+/// `split_offset` is not page-aligned or out of range for the region
+/// (`InvalidArgument`).
 ///
 /// The split consumes the original under the derivation lock. `InvalidState`
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE`,
@@ -869,11 +882,12 @@ pub fn mmio_split(mmio_cap: u32, split_offset: u64) -> Result<(u32, u32), i64>
 /// upper bound of the lower child); it must satisfy
 /// `start < split_at < start + count` on the cap being split. The
 /// original cap is consumed on success; both children inherit the parent's
-/// rights. Returns `(lower_slot, upper_slot)`.
+/// rights. Returns `(lower_handle, upper_handle)`, two capability handles.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the cap is invalid or `split_at`
-/// falls outside the cap's range.
+/// Returns a negative `i64` error code if the cap is invalid
+/// (`InvalidCapability`) or lacks Notify (`InsufficientRights`), or
+/// `split_at` falls outside the cap's range (`InvalidArgument`).
 ///
 /// The split consumes the original under the derivation lock. `InvalidState`
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE`,
@@ -918,14 +932,16 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 /// yield an empty lower half) and lie in `1..=0xFFFF`; the kernel rejects
 /// values outside that range with `InvalidArgument` before loading the cap.
 /// The original cap is consumed on success; both children inherit the
-/// parent's rights. Returns `(lower_slot, upper_slot)`.
+/// parent's rights. Returns `(lower_handle, upper_handle)`, two capability
+/// handles.
 ///
 /// On RISC-V: always returns `NotSupported`.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the cap is invalid, `split_at`
-/// falls outside the cap's range, or the syscall is not supported on this
-/// architecture.
+/// Returns a negative `i64` error code if the cap is invalid
+/// (`InvalidCapability`) or lacks Use (`InsufficientRights`), `split_at`
+/// falls outside the cap's range (`InvalidArgument`), or the syscall is not
+/// supported on this architecture (`NotSupported`).
 ///
 /// The split consumes the original under the derivation lock. `InvalidState`
 /// if a concurrent delete removed the original or a `SYS_CAP_REVOKE`,
@@ -967,8 +983,8 @@ pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
 /// top of the lower child); it must satisfy `min < split_at <= max` on the cap
 /// being split. The lower child covers `[min, split_at - 1]`, the upper child
 /// `[split_at, max]`. The original cap is consumed on success. Returns
-/// `(lower_slot, upper_slot)`. `cap_derive` cannot narrow a band, so this is the
-/// only way to hand out a sub-band.
+/// `(lower_handle, upper_handle)`, two capability handles. `cap_derive` cannot
+/// narrow a band, so this is the only way to hand out a sub-band.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid or `split_at`
@@ -1098,8 +1114,9 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 
 /// Copy a capability slot from the calling thread's `CSpace` into another `CSpace`.
 ///
-/// - `src_slot`: slot index in the caller's `CSpace`.
-/// - `dest_cspace_cap`: cap index of the destination `CSpace`.
+/// - `src_slot`: capability handle (slot index plus generation) of the source
+///   in the caller's `CSpace`.
+/// - `dest_cspace_cap`: capability handle of the destination `CSpace`.
 /// - `rights_mask`: bitmask of rights to grant. The effective rights are the
 ///   intersection of this mask and the source cap's rights — pass `RIGHTS_ALL`
 ///   to copy with the same rights as the source.
@@ -1124,8 +1141,8 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result<u32, i64>
 {
     // SAFETY: syscall4 issues raw syscall instruction; all arguments are scalar u64 values
-    // (source slot, dest CSpace cap, dest slot, rights mask); a dest slot of 0 asks the
-    // kernel to allocate a free slot, which it returns.
+    // (source handle, dest CSpace cap, dest slot, rights mask); a dest slot of 0 asks the
+    // kernel to allocate a free slot, whose handle it returns.
     let ret = unsafe {
         syscall4(
             SYS_CAP_COPY,
@@ -1320,7 +1337,8 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 pub fn cap_move(src_cap: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u32, i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
-    // (source slot, dest CSpace cap, dest index); kernel validates and moves cap, returns slot.
+    // (source handle, dest CSpace cap, dest index); kernel validates and moves cap, returns
+    // the destination cap handle.
     let ret = unsafe {
         syscall3(
             SYS_CAP_MOVE,
@@ -1464,15 +1482,17 @@ pub fn cap_info(slot: u32, field: u64) -> Result<u64, i64>
 
 /// Translate a virtual address in an address space to its mapped physical address.
 ///
-/// `aspace_cap` — cap slot of the `AddressSpace` (must have READ right).
+/// `aspace_cap` — capability handle (slot index plus generation) of the
+/// `AddressSpace` (must have READ right).
 /// `virt` — page-aligned virtual address in the user half.
 ///
 /// Returns the physical address on success, or a negative `SyscallError`
 /// code if the address is not mapped or the cap is invalid.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the cap is invalid or the address
-/// is not currently mapped.
+/// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,
+/// outside the user half, or not currently mapped), `InvalidCapability`, or
+/// `InsufficientRights` (cap lacks READ).
 // cast_sign_loss: ret is proven non-negative in the Ok branch.
 #[allow(clippy::cast_sign_loss)]
 #[inline]
@@ -1490,7 +1510,7 @@ pub fn aspace_query(aspace_cap: u32, virt: u64) -> Result<u64, i64>
 ///
 /// `memory_cap` MUST carry `RIGHTS_MEM_RETYPE`; the wrapper, state, and ring
 /// buffer all live inline in the same retype slot. Sub-page in-place when
-/// the total fits in `BIN_512` (≈ capacity ≤ 54), page-aligned split for
+/// the total fits in `BIN_512` (capacity ≤ 53), page-aligned split for
 /// larger rings.
 ///
 /// # Errors
@@ -1522,8 +1542,8 @@ pub fn event_queue_create(memory_cap: u32, capacity: u32) -> Result<u32, i64>
 /// Returns `SyscallError::QueueFull` (-13) if the queue is at capacity.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the queue cap is invalid or the
-/// queue is full.
+/// Returns a negative `i64` error code: `InvalidCapability`,
+/// `InsufficientRights` (cap lacks Post), or `QueueFull`.
 #[inline]
 pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 {
@@ -1555,8 +1575,8 @@ pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
 /// empty; otherwise returns the payload.
 ///
 /// # Errors
-/// Returns `-6` (`WouldBlock`) if the queue is empty, or another negative
-/// `i64` error code on invalid cap.
+/// Returns `-6` (`WouldBlock`) if the queue is empty, or `InvalidCapability`
+/// or `InsufficientRights` (cap lacks Recv).
 #[inline]
 pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
 {
@@ -1620,8 +1640,10 @@ pub fn wait_set_create(memory_cap: u32) -> Result<u32, i64>
 /// or the source is already in a wait set.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if either cap is invalid, the source
-/// is already in a wait set, or the wait set is full.
+/// Returns a negative `i64` error code: `InvalidCapability`,
+/// `InsufficientRights` (wait set lacks Modify, or the source lacks its
+/// receive right), or `InvalidArgument` (the wait set is full, or the source
+/// is already in a wait set).
 #[inline]
 pub fn wait_set_add(ws_cap: u32, source_cap: u32, badge: u64) -> Result<(), i64>
 {
@@ -1711,7 +1733,9 @@ pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
 /// otherwise the interrupt will fire again immediately on unmask.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the IRQ cap is invalid.
+/// Returns a negative `i64` error code: `InvalidCapability`,
+/// `InsufficientRights` (cap lacks Notify), or `InvalidArgument` (the cap
+/// covers more than one line).
 #[inline]
 pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 {
@@ -1730,8 +1754,12 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 ///   PBMT=IO on `riscv64`).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if either cap is invalid, `virt` is
-/// not page-aligned, or the virtual address is out of range.
+/// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned or
+/// non-canonical, or the range leaves the user half), `InvalidCapability`,
+/// `InsufficientRights` (a cap lacks Map), `InvalidArgument` (MMIO region
+/// size zero, unaligned, or overflowing), or `OutOfMemory` (page-table
+/// growth pool exhausted; refill with [`cap_create_aspace`] in augment
+/// mode).
 #[inline]
 pub fn mmio_map(aspace_cap: u32, mmio_cap: u32, virt: u64, flags: u64) -> Result<(), i64>
 {
@@ -1754,8 +1782,9 @@ pub fn mmio_map(aspace_cap: u32, mmio_cap: u32, virt: u64, flags: u64) -> Result
 /// On RISC-V this always returns an error (`NotSupported`).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if either cap is invalid or the
-/// architecture does not support I/O ports.
+/// Returns a negative `i64` error code: `NotSupported` (RISC-V),
+/// `InvalidCapability`, `InsufficientRights` (a cap lacks Control/Use), or
+/// `OutOfMemory` (IOPB allocation).
 #[inline]
 pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 {
@@ -1886,9 +1915,10 @@ pub fn thread_set_affinity(thread_cap: u32, cpu_id: u32) -> Result<(), i64>
 /// Requires `CONTROL` on `thread_cap`. See `docs/fault-handling.md`.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the thread cap lacks `CONTROL`,
-/// `endpoint_cap` is non-zero but not an `Endpoint`, or `fault_class_mask`
-/// is unsupported.
+/// Returns a negative `i64` error code: `InvalidCapability` (bad thread cap,
+/// or `endpoint_cap` non-zero but not an `Endpoint`), `InsufficientRights`
+/// (the thread cap lacks `CONTROL`), or `InvalidArgument` (`fault_class_mask`
+/// other than `FAULT_CLASS_ALL`).
 #[inline]
 pub fn thread_set_fault_handler(
     thread_cap: u32,
@@ -1921,10 +1951,12 @@ pub fn thread_set_fault_handler(
 /// `buf` must be valid for `buf_size` bytes of writes.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the thread cap is invalid, the
-/// thread is neither stopped nor fault-blocked (`InvalidState`), `buf_size` is
-/// too small or `buf` is null (`InvalidArgument`), or `buf` is not wholly in
-/// the user half or not mapped writable (`InvalidAddress`).
+/// Returns a negative `i64` error code if the thread cap is invalid
+/// (`InvalidCapability`) or lacks Observe (`InsufficientRights`), the thread
+/// is neither stopped nor fault-blocked (`InvalidState`), `buf_size` is too
+/// small, `buf` is null, or the thread has no register frame
+/// (`InvalidArgument`), or `buf` is not wholly in the user half or not mapped
+/// writable (`InvalidAddress`).
 // cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
 #[allow(clippy::cast_sign_loss)]
 #[inline]
@@ -1957,11 +1989,13 @@ pub fn thread_read_regs(thread_cap: u32, buf: *mut u8, buf_size: usize) -> Resul
 /// `buf` must be valid for `buf_size` bytes of reads.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the thread cap is invalid, the
-/// thread is neither stopped nor fault-blocked (`InvalidState`), `buf_size` is
-/// too small, `buf` is null, or the instruction pointer (on x86-64, also the
-/// stack pointer) is not a user address (`InvalidArgument`), or `buf` is not
-/// wholly in the user half or not mapped readable (`InvalidAddress`).
+/// Returns a negative `i64` error code if the thread cap is invalid
+/// (`InvalidCapability`) or lacks Control (`InsufficientRights`), the thread
+/// is neither stopped nor fault-blocked (`InvalidState`), `buf_size` is too
+/// small, `buf` is null, the thread has no register frame, or the instruction
+/// pointer (on x86-64, also the stack pointer) is not a user address
+/// (`InvalidArgument`), or `buf` is not wholly in the user half or not mapped
+/// readable (`InvalidAddress`).
 #[inline]
 pub fn thread_write_regs(thread_cap: u32, buf: *const u8, buf_size: usize) -> Result<(), i64>
 {
@@ -1996,8 +2030,9 @@ pub fn thread_write_regs(thread_cap: u32, buf: *const u8, buf_size: usize) -> Re
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidArgument` if `len >
-/// MAX_GETRANDOM_LEN`, or `InvalidAddress` if `buf`/the span is not a valid
-/// user buffer.
+/// MAX_GETRANDOM_LEN`, `InvalidAddress` if `buf`/the span is not a valid
+/// user buffer, or `WouldBlock` if the pool is not yet seeded (unreachable in
+/// practice).
 // cast_sign_loss: ret is proven non-negative in the Ok branch; it is a byte count.
 #[allow(clippy::cast_sign_loss)]
 #[inline]
@@ -2045,7 +2080,7 @@ pub fn random_u64() -> Result<u64, i64>
 
 /// Forward an SBI call to M-mode firmware (RISC-V only).
 ///
-/// - `sbi_cap`: `SbiControl` capability slot index
+/// - `sbi_cap`: `SbiControl` capability handle (slot index plus generation)
 /// - `extension`: SBI extension ID
 /// - `function`: SBI function ID
 /// - `a0`–`a2`: SBI arguments
@@ -2056,8 +2091,8 @@ pub fn random_u64() -> Result<u64, i64>
 /// Returns a negative `i64` error code if the kernel rejects the call:
 /// `InvalidArgument` if `extension` is not a sanctioned extension,
 /// `InsufficientRights` if `sbi_cap` lacks that extension's right (e.g.
-/// `RIGHTS_SBI_RESET` for SRST), `InvalidCapability` for a bad slot, or
-/// `NotSupported` if SBI firmware itself returns an error.
+/// `RIGHTS_SBI_RESET` for SRST), `InvalidCapability` for a bad handle, or
+/// `NotSupported` on x86-64 or if SBI firmware itself returns an error.
 #[inline]
 pub fn sbi_call(
     sbi_cap: u32,
@@ -2131,9 +2166,12 @@ pub fn thread_sleep(ms: u64) -> Result<(), i64>
 /// (e.g. procmgr's `ProcessTable` badge) so it can dispatch the death
 /// event to the right bookkeeping without a secondary lookup.
 ///
+/// Requires `CONTROL` on `thread_cap` and `POST` on `event_queue_cap`.
+///
 /// # Errors
-/// Returns a negative `i64` error code if either cap is invalid or the
-/// target's observer array is full.
+/// Returns a negative `i64` error code: `InvalidCapability`,
+/// `InsufficientRights` (the thread lacks Control or the event queue lacks
+/// Post), or `OutOfMemory` (the target's observer array is full).
 #[inline]
 pub fn thread_bind_notification(
     thread_cap: u32,
@@ -2193,8 +2231,10 @@ pub fn thread_bind_notification(
 /// terminal-fault event routes into its teardown bookkeeping.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if either cap is invalid or the
-/// address space's observer array is full.
+/// Returns a negative `i64` error code: `InvalidCapability`,
+/// `InsufficientRights` (the address space lacks Control or the event queue
+/// lacks Post), or `OutOfMemory` (the address space's observer array is
+/// full).
 #[inline]
 pub fn aspace_bind_notification(
     aspace_cap: u32,
@@ -2215,5 +2255,6 @@ pub fn aspace_bind_notification(
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-// Silence "unused import" if user only uses some functions.
+// Names `MSG_DATA_WORDS_MAX` at module level; the IPC wrappers above use it
+// directly as well.
 const _: usize = MSG_DATA_WORDS_MAX;

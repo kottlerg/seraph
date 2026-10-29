@@ -9,7 +9,8 @@ syscall numbers, error codes, and constants come from [`abi/syscall/`](../../abi
 Beyond the inline-assembly invocation layer, a few wrappers do work in userspace. One rejects,
 without issuing the syscall, an argument the kernel would misread: `cap_insert` returns
 `InvalidArgument` for a destination index of 0, which the kernel reads as "allocate a slot".
-Others compose calls: `cap_revoke_all` retries `cap_revoke` while it reports `Interrupted`. One
+Others compose calls: `cap_revoke_all` retries `cap_revoke` while it reports `Interrupted`,
+and `random_u64` draws through `getrandom` and returns `InvalidState` on a short count. One
 untyped entry, `raw_syscall3`, passes three argument registers as given, for harness tests of
 the kernel's argument validation that need register values the typed wrappers cannot express.
 

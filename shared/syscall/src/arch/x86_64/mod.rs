@@ -200,9 +200,9 @@ pub unsafe fn syscall3_any(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 
 /// Issue a syscall with up to 5 arguments. Returns (primary, secondary).
 ///
-/// r9 is marked clobbered because `SYS_IPC_CALL`'s kernel handler writes
-/// `reply_word_count` into r9 via `set_ipc_call_return`; even though this
-/// wrapper does not read r9, LLVM must not assume r9 is preserved.
+/// r9 is marked clobbered defensively: the kernel's IPC return path writes it
+/// (`SYS_IPC_CALL` itself goes through `syscall6_ret3`), and LLVM must not
+/// assume any IPC return register preserved across this wrapper.
 ///
 /// # Safety
 ///
@@ -239,7 +239,7 @@ pub unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
 
 /// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary, quaternary).
 ///
-/// Used by `ipc_recv` to retrieve `(ret, label, badge, word_count)`.
+/// Used by `raw_ipc_recv` to retrieve `(ret, label, badge, word_count)`.
 ///
 /// # Safety
 ///

@@ -1288,8 +1288,9 @@ fn walk_root_mount_path(root_mount_cap: u32, path: &[u8], ipc_buf: *mut u64) -> 
         {
             continue;
         }
-        // Components are bounded by MAX_ENTRY_NAME (64) on the install
-        // side, so the length fits the label's name-length field.
+        // Components are bounded by `vfsd_root_backend::MAX_ENTRY_NAME`
+        // (64), which `install` enforces, so the length fits the label's
+        // name-length field.
         let name_len = component.len() as u64;
         let label = ns_labels::NS_LOOKUP | (name_len << 16);
         let msg = IpcMessage::builder(label)

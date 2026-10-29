@@ -473,8 +473,15 @@ mod tests
     }
 
     #[test]
-    fn mapping_refuses_a_region_size_that_overflows()
+    fn mapping_refuses_a_region_end_that_overflows()
     {
         assert_eq!(table_mapping(0x7001, u64::MAX, 0x7001), None);
+    }
+
+    #[test]
+    fn mapping_refuses_a_page_count_whose_byte_length_overflows()
+    {
+        // The region end fits a u64, but 2^52 pages of 4 KiB do not.
+        assert_eq!(table_mapping(0, u64::MAX, 0), None);
     }
 }

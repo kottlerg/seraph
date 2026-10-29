@@ -47,9 +47,10 @@ It exposes a small IPC surface (`shared/ipc/src/lib.rs::pwrmgr_labels`):
   type 1 on RISC-V).
 
 For both labels, on the success path the platform powers off or resets and
-no reply is delivered. A reply only arrives on rejection or hardware-failure
-paths (`pwrmgr_errors::INVALID_REQUEST`), including a request the platform
-has not acted on one second after it was issued.
+no reply is delivered. A reply only arrives when the request is rejected (see
+the authority gate below) or the platform fails to act; a failure replies
+`pwrmgr_errors::INVALID_REQUEST`, including a request the platform has not
+acted on one second after it was issued.
 
 Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
 `1<<63`). Calls without the bit reply `pwrmgr_errors::UNAUTHORIZED`.

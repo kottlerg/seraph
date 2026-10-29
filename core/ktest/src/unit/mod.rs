@@ -5,44 +5,10 @@
 
 //! Tier 1 — per-syscall isolation tests.
 //!
-//! Rule (durable):
-//!
-//! > **One module per kernel subsystem under test. New subsystem ⇒ new
-//! > module.**
-//!
-//! Adding a new syscall means adding a section in the file for its
-//! kernel subsystem — not a new file. New file only when a new kernel
-//! subsystem is added. Files stay scoped; they don't grow unboundedly
-//! because each is one surface.
-//!
-//! Per-syscall coverage requirement: see [core/ktest/README.md](../../README.md) § Tier 1 —
-//! `src/unit/`.
-//!
-//! Files:
-//! - `cap.rs`      — capability creation, copy, move, insert, derive, revoke, delete
-//! - `cap_info.rs` — read-only capability state inspection (`SYS_CAP_INFO`)
-//! - `retype.rs`   — retype primitive: aspace/cspace augment (unbounded donations), PT
-//!   budget, kernel PT pool
-//! - `mm.rs`       — memory map/unmap/protect, memory split and merge, address space query
-//! - `entropy.rs`  — userspace randomness (`SYS_GETRANDOM`), incl. the user-copy
-//!   fault-recovery regression (unmapped or read-only buffer ⇒ `InvalidAddress`,
-//!   not panic)
-//! - `notification.rs`   — notification send and wait (blocking and timeout)
-//! - `event.rs`    — event queue post and receive (blocking, try, timeout)
-//! - `wait_set.rs` — wait set add, remove, wait, and the occupied-set refusal
-//! - `ipc.rs`      — IPC call, reply, recv, buffer set
-//! - `thread.rs`   — thread lifecycle, register read/write, priority, affinity, sleep, `bind_notification`
-//! - `fpu.rs`      — FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration
-//! - `hw.rs`       — MMIO, IRQ, I/O ports (`SYS_SBI_CALL` is under `src/arch/<arch>/`)
-//! - `sysinfo.rs`  — system info queries (`SYS_SYSTEM_INFO`)
-//! - `crypto.rs`   — shared `crypto` crate KATs (SHA-512, Ed25519 verify),
-//!   run on-target so the primitives are validated on both arches (not a
-//!   kernel syscall surface, but ktest is the only both-arch on-target harness)
-//! - `init_layout.rs` — kernel Phase 9 ASLR draws (#39): `InitInfo` VA,
-//!   init stack, and PIE image-base window membership, asserted on ktest's
-//!   own layout and load base
-//! - Architecture-only tests live behind `crate::arch` (`run_unit`); per-arch
-//!   helpers and branches inside the tests above are still gated in place (#460).
+//! The module list, what each module covers, the per-syscall coverage
+//! requirement, and where a new syscall's tests go are defined in
+//! [core/ktest/README.md](../../README.md) § Tier 1 — `src/unit/`; how
+//! architecture-specific tests are dispatched is in its § Test structure.
 
 pub mod cap;
 pub mod cap_info;

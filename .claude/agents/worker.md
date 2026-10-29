@@ -38,8 +38,9 @@ the recommendation of each question you raise unless the orchestrator says other
 with no clear recommendation is raised, and before ending the turn you commit the part of the
 work that does not depend on the answer, or, when no part is independent of it, the work on its
 most likely option, marked provisional in the report. Told by the orchestrator to stand down
-(your PR or branch handed to another worker), you edit, commit and push nothing further on that
-branch, whatever your worktree's state: you reply with one line and end your turn.
+(your PR or branch handed to another worker), you edit no file, PR or Issue, and commit and push
+nothing further on that branch, whatever your worktree's state: you reply with one line and end
+your turn.
 
 1. After reading: the items you will fix, the items you will not with a one-line reason each,
    the mechanism for anything non-trivial, the tests per item, and every scope expansion.
@@ -94,8 +95,11 @@ branch, whatever your worktree's state: you reply with one line and end your tur
   it on a feature branch: another worker or the orchestrator may have built on the remote
   branch. A pushed subject or body that needs changing is left to the maintainer, who either
   accepts the departure in the PR body (for a SHOULD rule of § Commit Messages) or has the
-  history rewritten (by the orchestrator; standalone, by you, on the maintainer's own words
-  and only then); say so in your report. Before any push, run `git fetch origin` and
+  history rewritten by the orchestrator; say so in your report. The one exception: standalone,
+  the maintainer's own words may direct you to make that rewrite, and you then make it as
+  `.claude/skills/orchestrate/SKILL.md` § Rulings describes (identical trees, checked with
+  `git diff --quiet <old> <new>`, pushed with `--force-with-lease` after `git fetch origin`).
+  Before any other push, run `git fetch origin` and
   `git rev-list --left-right --count origin/<branch>...HEAD`, and push only when it prints `0`
   and a positive count, or when `origin/<branch>` does not exist yet; a diverged branch is
   reported, never pushed over.

@@ -51,7 +51,8 @@ maintainer when it comes up:
    report; if the host is idle with no active grant and a queued request exists, grant the
    next one. Call `ListAgents` and compare it against the worker ids the record lists as
    active; a worker that is not listed, whose last report was not its gate and whose worktree
-   is gone (`git worktree list`), is dead: log it and respawn it with its plan and every answer
+   is gone (`git worktree list`), is dead: log it, send it the stand-down message and end its
+   task where the harness allows (§ Spawn), and respawn it with its plan and every answer
    already given folded into the prompt. A worker that is not listed, whose last report was not
    its gate and that awaits no answer or grant, but whose worktree remains, is sent a message
    asking for a status report. Also check whether any PR at its gate (clean verdicts, CI green)

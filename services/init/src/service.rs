@@ -153,7 +153,8 @@ fn start_process(process_handle: u32, ipc_buf: *mut u64, ok_msg: &str, fail_msg:
     }
 }
 
-/// Serve one bootstrap round from init to the named child.
+/// Serve one bootstrap round from init to the named child. Logs `context`
+/// and returns `false` on failure; [`serve_checked`] keeps the error code.
 fn serve(
     bootstrap_ep: u32,
     badge: u64,
@@ -164,14 +165,27 @@ fn serve(
     context: &str,
 ) -> bool
 {
+    serve_checked(bootstrap_ep, badge, ipc_buf, done, caps, data, context).is_ok()
+}
+
+/// [`serve`], returning the `ipc::bootstrap::serve_round` error code
+/// (`bootstrap_errors::NO_CHILD` when another child's request was received
+/// and refused, so the named child's request is still pending;
+/// `bootstrap_errors::INVALID` otherwise, including a failed reply that has
+/// already woken the child with an error).
+fn serve_checked(
+    bootstrap_ep: u32,
+    badge: u64,
+    ipc_buf: *mut u64,
+    done: bool,
+    caps: &[u32],
+    data: &[u64],
+    context: &str,
+) -> Result<(), u64>
+{
     // SAFETY: ipc_buf is caller's registered IPC buffer.
-    if unsafe { ipc::bootstrap::serve_round(bootstrap_ep, badge, ipc_buf, done, caps, data) }
-        .is_err()
-    {
-        log(context);
-        return false;
-    }
-    true
+    unsafe { ipc::bootstrap::serve_round(bootstrap_ep, badge, ipc_buf, done, caps, data) }
+        .inspect_err(|_| log(context))
 }
 
 // ── Hardware cap partitioning for devmgr ────────────────────────────────────
@@ -317,6 +331,57 @@ mod present
     pub const IRQ_RANGE: u64 = 1 << 0;
     pub const RSDP: u64 = 1 << 1;
     pub const DTB: u64 = 1 << 2;
+}
+
+/// Serve devmgr the `kind` rounds (`APERTURE` or `ACPI_REGION`) for
+/// `regions`, four `(slot, base, size)` entries per round. A region whose cap
+/// derive fails is left out of its round (cap and `(base, size)` pair alike):
+/// the kernel refuses a reply carrying a Null cap slot, so a zero handle would
+/// fail the whole round. Returns `false`, after logging `context`, when a
+/// round fails.
+fn serve_region_rounds(
+    bootstrap_ep: u32,
+    child_badge: u64,
+    ipc_buf: *mut u64,
+    round_kind: u64,
+    regions: &[(u32, u64, u64)],
+    context: &str,
+) -> bool
+{
+    for batch in regions.chunks(4)
+    {
+        let mut caps = [0u32; 4];
+        let mut data = [0u64; 2 + 4 * 2];
+        let mut n = 0usize;
+        for &(slot, base, size) in batch
+        {
+            let Ok(c) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
+            else
+            {
+                log("devmgr: region cap derive failed; region skipped");
+                continue;
+            };
+            caps[n] = c;
+            data[2 + n * 2] = base;
+            data[3 + n * 2] = size;
+            n += 1;
+        }
+        data[0] = round_kind;
+        data[1] = n as u64;
+        if !serve(
+            bootstrap_ep,
+            child_badge,
+            ipc_buf,
+            false,
+            &caps[..n],
+            &data[..2 + n * 2],
+            context,
+        )
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Create devmgr via procmgr and serve its bootstrap (raw firmware caps).
@@ -485,76 +550,24 @@ pub fn create_devmgr_with_caps(
     // round therefore sets `done=false` regardless of what follows.
     let virtio_blk_module = crate::find_module_by_name(info, b"virtio-blk");
 
-    // ── Aperture rounds ─────────────────────────────────────────────────
-    let mut idx = 0;
-    while idx < hw.aperture_count
+    // ── Aperture and ACPI region rounds ─────────────────────────────────
+    if !serve_region_rounds(
+        bootstrap_ep,
+        child_badge,
+        ipc_buf,
+        kind::APERTURE,
+        &hw.apertures[..hw.aperture_count],
+        "devmgr: bootstrap aperture round failed",
+    ) || !serve_region_rounds(
+        bootstrap_ep,
+        child_badge,
+        ipc_buf,
+        kind::ACPI_REGION,
+        &hw.acpi_regions[..hw.acpi_region_count],
+        "devmgr: bootstrap ACPI region round failed",
+    )
     {
-        let batch_end = (idx + 4).min(hw.aperture_count);
-        let batch_count = batch_end - idx;
-        let mut caps = [0u32; 4];
-        let mut data = [0u64; 2 + 4 * 2];
-        data[0] = kind::APERTURE;
-        data[1] = batch_count as u64;
-        for j in 0..batch_count
-        {
-            let (slot, base, size) = hw.apertures[idx + j];
-            if let Ok(c) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
-            {
-                caps[j] = c;
-            }
-            data[2 + j * 2] = base;
-            data[3 + j * 2] = size;
-        }
-
-        if !serve(
-            bootstrap_ep,
-            child_badge,
-            ipc_buf,
-            false,
-            &caps[..batch_count],
-            &data[..2 + batch_count * 2],
-            "devmgr: bootstrap aperture round failed",
-        )
-        {
-            return None;
-        }
-        idx = batch_end;
-    }
-
-    // ── ACPI region rounds ──────────────────────────────────────────────
-    let mut idx = 0;
-    while idx < hw.acpi_region_count
-    {
-        let batch_end = (idx + 4).min(hw.acpi_region_count);
-        let batch_count = batch_end - idx;
-        let mut caps = [0u32; 4];
-        let mut data = [0u64; 2 + 4 * 2];
-        data[0] = kind::ACPI_REGION;
-        data[1] = batch_count as u64;
-        for j in 0..batch_count
-        {
-            let (slot, base, size) = hw.acpi_regions[idx + j];
-            if let Ok(c) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
-            {
-                caps[j] = c;
-            }
-            data[2 + j * 2] = base;
-            data[3 + j * 2] = size;
-        }
-
-        if !serve(
-            bootstrap_ep,
-            child_badge,
-            ipc_buf,
-            false,
-            &caps[..batch_count],
-            &data[..2 + batch_count * 2],
-            "devmgr: bootstrap ACPI region round failed",
-        )
-        {
-            return None;
-        }
-        idx = batch_end;
+        return None;
     }
 
     // ── Module round (driver binaries devmgr spawns) ────────────────────
@@ -583,10 +596,9 @@ pub fn create_devmgr_with_caps(
             {
                 continue;
             };
-            // A failed derive skips the module (the aperture and ACPI rounds
-            // likewise carry on past a cap they cannot derive): returning
-            // here would leave devmgr blocked in `request_round` without the
-            // terminal round.
+            // A failed derive skips the module, as `serve_region_rounds` skips
+            // a region: returning here would leave devmgr blocked in
+            // `request_round` without the terminal round.
             let Ok(module_copy) = syscall::cap_derive(module_cap, syscall::RIGHTS_ALL)
             else
             {
@@ -851,11 +863,23 @@ pub fn create_vfsd_with_caps(
         return None;
     }
 
-    // Round 2: fatfs module.
+    // Round 2: fatfs module. An absent or underived module rides as an empty
+    // cap list, not a zero handle, which the kernel would refuse along with
+    // the whole round; vfsd then rejects the round (it needs the module to
+    // mount root) instead of failing on a reply error.
     let fatfs_cap = match crate::find_module_by_name(info, b"fatfs")
     {
         Some(slot) => syscall::cap_derive(slot, syscall::RIGHTS_ALL).unwrap_or(0),
         None => 0,
+    };
+    let fatfs_slot = [fatfs_cap];
+    let fatfs_caps = if fatfs_cap == 0
+    {
+        &fatfs_slot[..0]
+    }
+    else
+    {
+        &fatfs_slot[..]
     };
 
     let _ = serve(
@@ -863,7 +887,7 @@ pub fn create_vfsd_with_caps(
         child_badge,
         ipc_buf,
         true,
-        &[fatfs_cap],
+        fatfs_caps,
         &[],
         "vfsd: bootstrap round 2 failed",
     );
@@ -1006,15 +1030,18 @@ pub struct SvcmgrEndowment
 /// keeps to launch + supervise + restart real-logd: the master-log endpoint
 /// source and a badge-0 procmgr `SEND|GRANT` source (see [`SvcmgrEndowment`]).
 ///
-/// Best-effort: a failed round logs and ends the endowment early with the
-/// terminal round, so svcmgr leaves its round loop and runs with whatever it
-/// received (the system is already non-viable if a substrate thread cap
-/// cannot be delivered) instead of blocking in it.
+/// Best-effort. The endpoint copies are derived before svcmgr starts; a
+/// failed derive or `START_PROCESS` destroys the unstarted svcmgr. A round
+/// that fails with svcmgr's request still pending (`NO_CHILD`: another
+/// child's request was refused) is followed by an empty terminal round
+/// ([`end_endowment`]) so svcmgr leaves its round loop: without `CAPS` it then
+/// exits, and after a failed `SUBSTRATE` round it runs without the remaining
+/// substrates. Any other failure has already woken svcmgr with an error (it
+/// exits) or left its state unknown, so init receives nothing further.
 ///
-/// Returns whether svcmgr was started and received the `CAPS` round, which
-/// carries its service endpoint: only then can it receive `HANDOVER_COMPLETE`,
-/// so phase 3 sends that only on `true`. The endpoint copies are derived
-/// before svcmgr starts, so a failed derive leaves it unstarted.
+/// Returns whether svcmgr holds its endowment through a delivered terminal
+/// round, so it is serving its service endpoint: only then can it receive
+/// `HANDOVER_COMPLETE`, and phase 3 sends that only on `true`.
 fn endow_svcmgr(
     bootstrap_ep: u32,
     process_handle: u32,
@@ -1028,12 +1055,14 @@ fn endow_svcmgr(
     else
     {
         log("phase 3: svcmgr service-ep derive failed; svcmgr not started");
+        destroy_partial_child(process_handle, ipc_buf);
         return false;
     };
     let Ok(boot_copy) = syscall::cap_derive(endow.svcmgr_bootstrap_ep, syscall::RIGHTS_ALL)
     else
     {
         log("phase 3: svcmgr bootstrap-ep derive failed; svcmgr not started");
+        destroy_partial_child(process_handle, ipc_buf);
         return false;
     };
 
@@ -1044,6 +1073,7 @@ fn endow_svcmgr(
         "phase 3: svcmgr START_PROCESS failed",
     )
     {
+        destroy_partial_child(process_handle, ipc_buf);
         return false;
     }
     // rootfs.root SEND — badge inherited from the root fs namespace cap.
@@ -1067,21 +1097,9 @@ fn endow_svcmgr(
         0
     };
 
-    // Substrate set; init skips a service whose thread cap it could not
-    // capture, so a missing recipe match is bind-only-absent rather than a
-    // `registered without definition` orphan in svcmgr. logd is absent — it
-    // is a svcmgr-launched service (LOGD_SOURCES round), not a parked
-    // substrate.
-    let registrations: &[(&[u8], u32)] = &[
-        (b"memmgr", thread_caps.memmgr),
-        (b"procmgr", thread_caps.procmgr),
-        (b"devmgr", thread_caps.devmgr),
-        (b"vfsd", thread_caps.vfsd),
-    ];
-
     // Round 1 (CAPS), positional: [service, bootstrap, rootfs, devmgr_reg].
     // The LOGD_SOURCES round is always terminal, so no earlier round is.
-    if !serve(
+    if let Err(code) = serve_checked(
         bootstrap_ep,
         child_badge,
         ipc_buf,
@@ -1091,11 +1109,58 @@ fn endow_svcmgr(
         "phase 3: svcmgr endowment CAPS round failed",
     )
     {
-        end_endowment(bootstrap_ep, child_badge, ipc_buf);
+        if code == ipc::bootstrap_errors::NO_CHILD
+        {
+            let _ = end_endowment(bootstrap_ep, child_badge, ipc_buf);
+        }
         return false;
     }
 
-    // Substrate rounds: one (name, thread_cap) each.
+    if let Err(code) = serve_substrate_rounds(bootstrap_ep, child_badge, thread_caps, ipc_buf)
+    {
+        return code == ipc::bootstrap_errors::NO_CHILD
+            && end_endowment(bootstrap_ep, child_badge, ipc_buf);
+    }
+
+    // Terminal round (LOGD_SOURCES): the reserved master-log endpoint source
+    // and the badge-0 procmgr `SEND|GRANT` source. svcmgr mints real-logd's
+    // bootstrap caps from these on every (re)launch. A zero slot rides if a
+    // source derive failed and reaches logd as a zero cap: without the death-auth
+    // source logd runs but cannot reclaim per-sender slots; without the master-log
+    // source logd exits at startup and, being `critical = yes` with no
+    // `on_failure` restart for a clean exit, svcmgr starts a graceful shutdown.
+    serve(
+        bootstrap_ep,
+        child_badge,
+        ipc_buf,
+        true,
+        &[endow.master_log_source, endow.procmgr_death_auth_source],
+        &[endow_kind::LOGD_SOURCES],
+        "phase 3: svcmgr endowment LOGD_SOURCES round failed",
+    )
+}
+
+/// Serve svcmgr one `SUBSTRATE` round per init-bootstrapped service whose
+/// thread cap init captured, stopping at the first failure with its
+/// `serve_round` error code.
+///
+/// init skips a service whose thread cap it could not capture, so a missing
+/// recipe match is bind-only-absent rather than a `registered without
+/// definition` orphan in svcmgr. logd is absent: it is a svcmgr-launched
+/// service (the `LOGD_SOURCES` round), not a parked substrate.
+fn serve_substrate_rounds(
+    bootstrap_ep: u32,
+    child_badge: u64,
+    thread_caps: ServiceThreadCaps,
+    ipc_buf: *mut u64,
+) -> Result<(), u64>
+{
+    let registrations: &[(&[u8], u32)] = &[
+        (b"memmgr", thread_caps.memmgr),
+        (b"procmgr", thread_caps.procmgr),
+        (b"devmgr", thread_caps.devmgr),
+        (b"vfsd", thread_caps.vfsd),
+    ];
     for &(name, thread_cap) in registrations
     {
         if thread_cap == 0
@@ -1108,7 +1173,7 @@ fn endow_svcmgr(
         data[0] = endow_kind::SUBSTRATE;
         data[1] = name.len() as u64;
         data[2..2 + nw].copy_from_slice(&name_words[..nw]);
-        if !serve(
+        serve_checked(
             bootstrap_ep,
             child_badge,
             ipc_buf,
@@ -1116,39 +1181,19 @@ fn endow_svcmgr(
             &[thread_cap],
             &data[..2 + nw],
             "phase 3: svcmgr endowment SUBSTRATE round failed",
-        )
-        {
-            end_endowment(bootstrap_ep, child_badge, ipc_buf);
-            return true;
-        }
+        )?;
     }
-
-    // Terminal round (LOGD_SOURCES): the reserved master-log endpoint source
-    // and the badge-0 procmgr `SEND|GRANT` source. svcmgr mints real-logd's
-    // bootstrap caps from these on every (re)launch. A zero slot rides if a
-    // source derive failed and reaches logd as a zero cap: without the death-auth
-    // source logd runs but cannot reclaim per-sender slots; without the master-log
-    // source logd exits at startup and, being `critical = yes` with no
-    // `on_failure` restart for a clean exit, svcmgr starts a graceful shutdown.
-    let _ = serve(
-        bootstrap_ep,
-        child_badge,
-        ipc_buf,
-        true,
-        &[endow.master_log_source, endow.procmgr_death_auth_source],
-        &[endow_kind::LOGD_SOURCES],
-        "phase 3: svcmgr endowment LOGD_SOURCES round failed",
-    );
-    true
+    Ok(())
 }
 
 /// End a failed endowment with an empty terminal `LOGD_SOURCES` round, so
 /// svcmgr leaves its round loop (`request_round`) rather than block in it.
-/// Best-effort: the round that failed may have left the bootstrap endpoint
-/// unusable, in which case this one fails too and is only logged.
-fn end_endowment(bootstrap_ep: u32, child_badge: u64, ipc_buf: *mut u64)
+/// Called only after a `NO_CHILD` failure, which leaves svcmgr's request
+/// pending, so the receive is answered. Returns whether the round reached
+/// svcmgr; a further failure is logged.
+fn end_endowment(bootstrap_ep: u32, child_badge: u64, ipc_buf: *mut u64) -> bool
 {
-    let _ = serve(
+    serve(
         bootstrap_ep,
         child_badge,
         ipc_buf,
@@ -1156,7 +1201,7 @@ fn end_endowment(bootstrap_ep: u32, child_badge: u64, ipc_buf: *mut u64)
         &[],
         &[endow_kind::LOGD_SOURCES],
         "phase 3: svcmgr endowment terminal round after a failure failed",
-    );
+    )
 }
 
 // ── Phase 3 orchestration ───────────────────────────────────────────────────

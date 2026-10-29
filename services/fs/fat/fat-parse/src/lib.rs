@@ -586,14 +586,9 @@ impl LfnAccum
                 {
                     return None;
                 }
-                // Casts are range-safe: ch is 16 bits and BMP-only here
-                // (surrogate range handled above).
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    out[pos] = 0xE0 | (ch >> 12) as u8;
-                    out[pos + 1] = 0x80 | ((ch >> 6) & 0x3F) as u8;
-                    out[pos + 2] = 0x80 | (ch & 0x3F) as u8;
-                }
+                out[pos] = 0xE0 | (ch >> 12) as u8;
+                out[pos + 1] = 0x80 | ((ch >> 6) & 0x3F) as u8;
+                out[pos + 2] = 0x80 | (ch & 0x3F) as u8;
                 pos += 3;
                 i += 1;
             }

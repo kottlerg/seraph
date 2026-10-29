@@ -27,7 +27,17 @@ Report in the shape below, as a message to the address the prompt names (orchest
 widening beyond the rules below, a contested review finding, a design choice an Issue leaves
 open, filing an Issue) go in the report as a question with your recommendation; then end
 your turn and wait. Never run `gh issue create`: draft the body in your scratchpad and name
-the path in the report.
+the path in the report. The scratchpad is shared by every worker of one session, so you name
+each file you put there with your PR number or branch slug (`pr581-body.md`, never a bare
+`pr-body.md`). Orchestrated, you end a turn only once your worktree differs from
+`origin/master` (a commit beyond it on your branch, or uncommitted edits to tracked files),
+since a turn that ends on an unchanged worktree loses the worktree and you with it. Before that
+point, while a question you raised is unanswered, all you do stays within the scope's files
+(apart from the forced expansions § Scope and branches allows) and provisional: you continue on
+the recommendation of each question you raise unless the orchestrator says otherwise; a question
+with no clear recommendation is raised, and before ending the turn you commit the part of the
+work that does not depend on the answer, or, when no part is independent of it, the work on its
+most likely option, marked provisional in the report.
 
 1. After reading: the items you will fix, the items you will not with a one-line reason each,
    the mechanism for anything non-trivial, the tests per item, and every scope expansion.
@@ -39,8 +49,10 @@ the path in the report.
 ## Scope and branches
 
 - One branch from current `origin/master` after `git fetch origin`, named per docs/conventions.md
-  § Branch naming; one PR per scope. Several scopes in one prompt mean several branches and PRs,
-  each cut from `master`, never stacked.
+  § Branch naming, cut as your first action after reading, before the first report; one PR per
+  scope. Several scopes in one prompt mean several branches and PRs, each cut from `master`,
+  never stacked. When the prompt names an existing branch (a respawn), check it out from
+  `origin/<branch>` instead, and continue its PR when it has one.
 - Touch only the scope's files. A change the rules force elsewhere (a caller of a changed
   signature, every copy of a changed fact per § Change propagation procedure, a harness phase the
   Issue's acceptance requires, the root `Cargo.toml` and `Cargo.lock` for a new host-tested
@@ -78,7 +90,9 @@ the path in the report.
 - Every item you fix: tick it on its Issue in the Issue's own style with `(fixed by PR #<M>)`
   (`gh issue edit`), copy the ticked items into the PR body's `## Acceptance`, and carry
   `Refs #N`. `Fixes #N` only when no item of that Issue stays open once your last run's
-  findings are recorded. An Issue the PR closes carries the current milestone.
+  findings are recorded. An Issue the PR closes carries the current milestone. A PR carries no
+  milestone (`gh pr create` and `gh pr edit` never take `--milestone`); milestones are set on
+  Issues with `gh issue edit` (docs/conventions.md § Milestones).
 - Fill `.github/pull_request_template.md` completely. The Validation section names the
   validated head, says when later commits are comment-only or Markdown-only, lists each owed
   local host run with its `--runs` count, outcome and head, or states that none is owed and why.

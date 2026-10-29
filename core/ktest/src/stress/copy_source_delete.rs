@@ -329,15 +329,13 @@ fn round(ctx: &TestContext, free: Free, cycle: u32, done: u32, landed: &mut [u32
         .map_err(|_| "stress::copy_source_delete: create source failed")?;
     let handle = if free == Free::RevokeThenDelete
     {
-        match cap_derive(original, RIGHTS_ALL)
+        let Ok(copy) = cap_derive(original, RIGHTS_ALL)
+        else
         {
-            Ok(copy) => copy,
-            Err(_) =>
-            {
-                let _ = cap_delete(original);
-                return Err("stress::copy_source_delete: derive copy failed");
-            }
-        }
+            let _ = cap_delete(original);
+            return Err("stress::copy_source_delete: derive copy failed");
+        };
+        copy
     }
     else
     {

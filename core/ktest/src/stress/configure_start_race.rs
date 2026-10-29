@@ -107,6 +107,8 @@ const STACK_BYTES: u64 = core::mem::size_of::<ChildStack>() as u64;
 const ROUND_WAIT_US: u64 = 1_000_000;
 
 /// Bound on the waits for a thread to exit, in 1 ms polls.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const EXIT_POLLS: u32 = 2000;
 
 /// Polls a bounded wait spins busily before it polls in 1 ms sleeps.
@@ -411,7 +413,7 @@ fn race(th: u32, seq: u32) -> Result<u32, &'static str>
 /// have exited voluntarily (a torn frame faults, or runs garbage).
 fn await_exit(th: u32) -> TestResult
 {
-    let reason = spawn::wait_until_exited(th, EXIT_POLLS)
+    let reason = spawn::wait_until_exited(th, crate::scaled_polls(EXIT_POLLS))
         .map_err(|_| "stress::configure_start_race: the thread did not reach Exited")?;
     if reason != EXIT_VOLUNTARY
     {
@@ -460,7 +462,7 @@ fn check_ran(seq: u32, outcome: u32) -> TestResult
 fn finish(helper: u32) -> TestResult
 {
     QUIT.store(1, Ordering::Release);
-    let reason = spawn::wait_until_exited(helper, EXIT_POLLS)
+    let reason = spawn::wait_until_exited(helper, crate::scaled_polls(EXIT_POLLS))
         .map_err(|_| "stress::configure_start_race: the helper did not reach Exited")?;
     if HELPER_EXITED.load(Ordering::Acquire) == 0 || reason != EXIT_VOLUNTARY
     {

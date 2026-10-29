@@ -71,104 +71,19 @@ static PREEMPT_OBSERVED: AtomicU32 = AtomicU32::new(0);
 static mut STACK0: ChildStack = ChildStack::ZERO;
 static mut STACK1: ChildStack = ChildStack::ZERO;
 
-#[cfg(target_arch = "x86_64")]
-fn spin_check(pat_ptr: *const u64, iters: u64) -> u64
-{
-    let mut mism: u64 = 0;
-    // SAFETY: loads the sentinel at `pat_ptr` into r12..r15, then re-checks each
-    // against the (stable, in-memory) sentinel every iteration. r12..r15 are
-    // callee-saved; a timer preemption that mishandles the entry frame would
-    // restore a wrong value, which the compare catches into `mism`. The
-    // sentinel-in-memory compare is immune to register save/restore so it
-    // detects corruption regardless of which register the operands land in.
-    unsafe {
-        core::arch::asm!(
-            "mov r12, [{pat}]",
-            "mov r13, [{pat}]",
-            "mov r14, [{pat}]",
-            "mov r15, [{pat}]",
-            "2:",
-            "cmp r12, [{pat}]",
-            "jne 3f",
-            "cmp r13, [{pat}]",
-            "jne 3f",
-            "cmp r14, [{pat}]",
-            "jne 3f",
-            "cmp r15, [{pat}]",
-            "jne 3f",
-            "dec {it}",
-            "jnz 2b",
-            "jmp 4f",
-            "3:",
-            "mov qword ptr [{mism}], 1",
-            "4:",
-            pat = in(reg) pat_ptr,
-            mism = in(reg) core::ptr::from_mut(&mut mism),
-            it = inout(reg) iters => _,
-            out("r12") _,
-            out("r13") _,
-            out("r14") _,
-            out("r15") _,
-            options(nostack),
-        );
-    }
-    mism
-}
-
-#[cfg(target_arch = "riscv64")]
-fn spin_check(pat_ptr: *const u64, iters: u64) -> u64
-{
-    let mut mism: u64 = 0;
-    // SAFETY: loads the sentinel at `pat_ptr` into s2..s5 (callee-saved), then
-    // re-checks each against the in-memory sentinel every iteration via t0; t1
-    // is the store scratch for the mismatch flag. See the x86-64 sibling.
-    unsafe {
-        core::arch::asm!(
-            "ld s2, 0({pat})",
-            "ld s3, 0({pat})",
-            "ld s4, 0({pat})",
-            "ld s5, 0({pat})",
-            "2:",
-            "ld t0, 0({pat})",
-            "bne s2, t0, 3f",
-            "bne s3, t0, 3f",
-            "bne s4, t0, 3f",
-            "bne s5, t0, 3f",
-            "addi {it}, {it}, -1",
-            "bnez {it}, 2b",
-            "j 4f",
-            "3:",
-            "li t1, 1",
-            "sd t1, 0({mism})",
-            "4:",
-            pat = in(reg) pat_ptr,
-            mism = in(reg) core::ptr::from_mut(&mut mism),
-            it = inout(reg) iters => _,
-            out("s2") _,
-            out("s3") _,
-            out("s4") _,
-            out("s5") _,
-            out("t0") _,
-            out("t1") _,
-            options(nostack),
-        );
-    }
-    mism
-}
-
 extern "C" fn spinner_entry(id: u64) -> !
 {
     let idx = usize::from(id & 1 != 0);
     let other = idx ^ 1;
     // PATTERN is a read-only static; the index is 0 or 1.
-    let pat_ptr = core::ptr::addr_of!(PATTERN[idx]);
+    let pattern = &PATTERN[idx];
     let budget_us = crate::scaled_bound(TIME_BUDGET_US);
     let start_us = system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(0);
     let mut c: u64 = 0;
     while c < MAX_CHUNKS
     {
         let sibling_before = PROGRESS[other].load(Ordering::Acquire);
-        if spin_check(pat_ptr, CHUNK_ITERS) != 0
+        if crate::arch::callee_saved::spin_check(pattern, CHUNK_ITERS) != 0
         {
             MISMATCHES.fetch_add(1, Ordering::AcqRel);
             break;

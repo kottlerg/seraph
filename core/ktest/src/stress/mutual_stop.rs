@@ -111,6 +111,8 @@ const CHILD_CPUS: [u32; CHILDREN] = [1, 2];
 const ROUND_WAIT_US: u64 = 50_000;
 
 /// Bound on the wait for both children to exit, in 1 ms polls.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const EXIT_POLLS: u32 = 2000;
 
 /// Set by the controller once both children are started: a child's first
@@ -469,10 +471,11 @@ fn elapsed_us() -> Result<u64, &'static str>
 fn finish(th: [u32; CHILDREN], tally: &mut Tally) -> TestResult
 {
     QUIT.store(1, Ordering::Release);
+    let max_polls = crate::scaled_polls(EXIT_POLLS);
     let mut polls = 0;
     while EXITED.load(Ordering::Acquire) as usize != CHILDREN
     {
-        if polls == EXIT_POLLS
+        if polls == max_polls
         {
             return Err("stress::mutual_stop: a child did not exit");
         }
@@ -488,7 +491,7 @@ fn finish(th: [u32; CHILDREN], tally: &mut Tally) -> TestResult
     }
     for &child in &th
     {
-        let reason = spawn::wait_until_exited(child, EXIT_POLLS)
+        let reason = spawn::wait_until_exited(child, crate::scaled_polls(EXIT_POLLS))
             .map_err(|_| "stress::mutual_stop: a child did not reach Exited")?;
         if reason != EXIT_VOLUNTARY
         {

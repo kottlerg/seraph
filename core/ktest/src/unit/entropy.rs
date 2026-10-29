@@ -11,8 +11,9 @@ use syscall_abi::SyscallError;
 /// A canonical user-half virtual address that ktest never maps.
 const UNMAPPED_USER_VA: u64 = 0x3E_3000_0000;
 
-/// Safe test VA (5 GiB), well above ktest's load address and stack. Mapped and
-/// unmapped within a single test, so it is free between tests.
+/// Test VA (5 GiB), below ktest's PIE image, `InitInfo`, and stack windows
+/// (`shared/process-layout`), so it overlaps no ktest image or startup mapping.
+/// Mapped and unmapped within a single test, so it is free between tests.
 const RO_TEST_VA: u64 = 0x1_4000_0000;
 
 /// `getrandom` into a valid buffer fills the whole span with non-zero entropy.

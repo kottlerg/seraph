@@ -7,12 +7,14 @@
 //!
 //! One module per architecture, selected here by `target_arch` (the arch-module
 //! declaration site, per docs/coding-standards.md § C). Each exposes the same
-//! entry points and constants; architecture-specific ktest code belongs behind
-//! them.
+//! entry points, constants, and modules; all architecture-specific ktest code
+//! lives behind them, and no `#[cfg(target_arch)]` appears elsewhere in ktest.
 //!
-//! TODO: move every `#[cfg(target_arch)]` item outside `src/arch/` behind this
-//! surface. Deferred because the move is ktest-wide restructuring, separate from
-//! the kernel fixes the code here validates; #460 tracks the move.
+//! - `fpu`, `callee_saved`, `code_stub`: the per-architecture halves of
+//!   arch-neutral tests (register-file probes, machine-code stubs).
+//! - `serial`: the UART behind `crate::serial`.
+//! - `init_io_ports`, `shutdown`, `cycles_now`: harness services.
+//! - `run_unit`, `run_integration`: architecture-only Tier 1 and Tier 2 tests.
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]
@@ -24,5 +26,6 @@ mod current;
 
 pub use current::{
     ARG1_OFFSET, ILLEGAL_INSTRUCTION_VECTOR, IP_OFFSET, PAGE_FAULT_STORE_VECTOR, SYSCALL_NR_OFFSET,
-    TRAP_FRAME_BYTES, illegal_instruction, run_integration, run_unit,
+    TRAP_FRAME_BYTES, callee_saved, code_stub, cycles_now, fpu, illegal_instruction, init_io_ports,
+    run_integration, run_unit, serial, shutdown,
 };

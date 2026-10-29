@@ -21,10 +21,10 @@ bootloader.
 
 The compile-time view of what each phase of boot establishes, and the
 sequence of steps the reference bootloader takes, is documented at the
-component level in [`boot/docs/`](../../core/boot/docs/) — particularly
-[`boot/docs/kernel-handoff.md`](../../core/boot/docs/kernel-handoff.md) for the
+component level in [`core/boot/docs/`](../../core/boot/docs/) — particularly
+[`core/boot/docs/kernel-handoff.md`](../../core/boot/docs/kernel-handoff.md) for the
 CPU-state contract at entry, and
-[`boot/docs/boot-flow.md`](../../core/boot/docs/boot-flow.md) for the ten-step
+[`core/boot/docs/boot-flow.md`](../../core/boot/docs/boot-flow.md) for the ten-step
 sequence.
 
 ---
@@ -58,7 +58,7 @@ A compliant bootloader MUST, before jumping to the kernel entry point:
 - Guarantee that the `BootInfo` structure and all referenced data
   remain mapped and readable at kernel entry.
 - Establish the CPU state documented in
-  [`boot/docs/kernel-handoff.md`](../../core/boot/docs/kernel-handoff.md)
+  [`core/boot/docs/kernel-handoff.md`](../../core/boot/docs/kernel-handoff.md)
   for the target architecture.
 
 A compliant bootloader MUST NOT:

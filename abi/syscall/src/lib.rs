@@ -587,8 +587,8 @@ const _: () = assert!(MSG_CAP_SLOTS_MAX <= 4);
 /// before delivery (caller's `CSpace` cannot accept reply caps, server
 /// cap-slot lookup failed, malformed IPC buffer), or the reply-cap transfer
 /// refused after the caller was claimed (a reply cap slot went stale, was
-/// repeated, or is pinned by an in-flight `SYS_CAP_REVOKE` or
-/// `SYS_CAP_MOVE`) — in the latter case this label replaces the
+/// repeated, or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`,
+/// or IPC capability transfer) — in the latter case this label replaces the
 /// already-staged reply. The caller un-parks with this label so it can
 /// surface a graceful failure instead of dead-locking. Reserved by the
 /// kernel; servers must not produce this label themselves.

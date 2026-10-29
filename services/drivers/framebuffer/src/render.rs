@@ -345,11 +345,12 @@ mod tests
         let fb = info(GLYPH_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH * 4);
         let mut buf = Vec::new();
         let mut w = writer(&fb, &mut buf).expect("one-cell geometry is valid");
+        // The clear in `new` covered every byte: no 0xEE fill survives.
+        assert!(buf.iter().all(|&b| b == 0));
         let lit = [0xFFFFu16; GLYPH_HEIGHT as usize];
         // SAFETY: the writer's buffer is alive and exactly stride * height.
         unsafe { w.draw_glyph_bitmap(&lit) };
-        // The scroll cleared the only row to the black background, and the
-        // clear in `new` covered every byte (no 0xEE fill survives).
+        // The scroll cleared the only row to the black background again.
         assert!(buf.iter().all(|&b| b == 0));
     }
 }

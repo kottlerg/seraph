@@ -292,7 +292,7 @@ fn request_memory_caps(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Op
 /// section 3.1.1): reset, acknowledge, negotiate features, read capacity.
 fn init_device(transport: &PciTransport) -> u64
 {
-    if !transport.try_reset(RESET_POLLS)
+    if !transport.try_reset()
     {
         std::os::seraph::log!("device reset unacknowledged");
         syscall::thread_exit();
@@ -563,12 +563,6 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
     }
 }
 
-/// Polls of the device status register [`init_device`] and
-/// [`quiesce_device`] allow for a reset to complete. QEMU completes a reset
-/// within the status write; the bound only keeps a wedged device from
-/// parking the driver in the poll.
-const RESET_POLLS: u32 = 1_000_000;
-
 /// Handle a `BLK_READ_INTO_MEMORY` (`dir` = [`io::IoDirection::Read`]) or
 /// `BLK_WRITE_FROM_MEMORY` (`dir` = [`io::IoDirection::Write`]) request.
 ///
@@ -730,7 +724,7 @@ fn resolve_run(badge: u64, sector: u64, sector_count: u64, rt: &BlkRuntime) -> R
 /// of returning to a caller who could reuse the memory.
 fn quiesce_device(rt: &mut BlkRuntime)
 {
-    if !rt.transport.try_reset(RESET_POLLS)
+    if !rt.transport.try_reset()
     {
         std::os::seraph::log!("request lost and device reset unacknowledged; exiting");
         syscall::thread_exit();

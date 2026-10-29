@@ -10,13 +10,13 @@ capabilities delegated by devmgr.
 ```
 services/drivers/
 ├── README.md
-├── cmos/                           # x86-64 CMOS / MC146818 RTC driver (binary)
+├── cmos/                           # x86-64 CMOS / MC146818 RTC driver (binary + lib)
 │   ├── Cargo.toml
 │   ├── README.md
 │   └── src/
 │       ├── lib.rs                  # CMOS register snapshot (host-tested)
 │       └── main.rs
-├── framebuffer/                    # Linear-framebuffer text driver (binary)
+├── framebuffer/                    # Linear-framebuffer text driver (binary + lib)
 │   ├── Cargo.toml
 │   ├── README.md                   # Framebuffer IPC interface (FB_WRITE_BYTES, FB_SET_ATTRS)
 │   └── src/
@@ -48,7 +48,7 @@ services/drivers/
 │   │       ├── lib.rs
 │   │       ├── pci.rs              # Modern PCI transport register access
 │   │       └── virtqueue.rs        # Split virtqueue rings and descriptors
-│   ├── blk/                        # VirtIO block device driver (binary)
+│   ├── blk/                        # VirtIO block device driver (binary + lib)
 │   │   ├── Cargo.toml
 │   │   ├── README.md               # Block-driver IPC interface
 │   │   │                           #   (BLK_READ_INTO_MEMORY, REGISTER_PARTITION)
@@ -117,11 +117,11 @@ The full driver lifecycle is specified in
 | Crate | Type | Purpose |
 |---|---|---|
 | [`virtio/core/`](virtio/core/README.md) | Library | Shared VirtIO transport primitives: device initialisation, virtqueue setup, descriptor chain management |
-| [`virtio/blk/`](virtio/blk/README.md) | Binary | VirtIO block device driver — exposes per-request DMA block-read IPC endpoint |
+| [`virtio/blk/`](virtio/blk/README.md) | Binary + library | VirtIO block device driver — exposes per-request DMA block-read IPC endpoint |
 | [`virtio/input/`](virtio/input/README.md) | Binary | VirtIO input (keyboard) device driver — decodes `EV_KEY` events into keysyms; answers `INPUT_READ_EVENTS` behind devmgr's `QUERY_INPUT_DEVICE` |
 | [`serial/`](serial/README.md) | Binary | Serial (UART) device driver — COM1 (x86-64) / NS16550 (RISC-V); sole driver-mediated serial-byte sink |
-| [`framebuffer/`](framebuffer/README.md) | Binary | Linear framebuffer text driver — owns the GOP framebuffer MMIO; sole driver-mediated framebuffer-byte sink |
-| [`cmos/`](cmos/README.md) | Binary | x86-64 CMOS / MC146818 RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_RTC_DEVICE` |
+| [`framebuffer/`](framebuffer/README.md) | Binary + library | Linear framebuffer text driver — owns the GOP framebuffer MMIO; sole driver-mediated framebuffer-byte sink |
+| [`cmos/`](cmos/README.md) | Binary + library | x86-64 CMOS / MC146818 RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_RTC_DEVICE` |
 | [`goldfish-rtc/`](goldfish-rtc/README.md) | Binary | RISC-V Goldfish RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_RTC_DEVICE` |
 | [`test-orphan/`](test-orphan/README.md) | Binary | Test-only fault-injection driver — forces a mid-bootstrap spawn failure so svctest exercises devmgr's orphan-teardown path |
 

@@ -207,7 +207,11 @@ elements:
 - **Caller-supplied Memory-cap DMA.** Each read or write transfers one
   Memory cap of at least `count * 512` bytes as the DMA target; the
   Memory cap is moved back to the caller in every reply (success or
-  error). The block driver never retains the data Memory cap.
+  error). The block driver never retains the data Memory cap. After a
+  request the device loses, the driver resets the device before it
+  replies and then fails every later read or write with `DeviceFault`;
+  if the device does not acknowledge the reset, the driver exits without
+  replying and the cap is destroyed with it.
 
 Authoritative wire shapes for `REGISTER_PARTITION`,
 `BLK_READ_INTO_MEMORY`, and `BLK_WRITE_FROM_MEMORY` live in

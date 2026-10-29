@@ -174,7 +174,7 @@ The driver keeps one request in flight and waits for the completion of
 that chain, polling and parking on the IRQ notification, for at most
 50 seconds. A request the device loses, by timing out or by publishing a
 used-ring element the virtqueue refuses (an id heading no outstanding
-chain, or a corrupted chain) or one naming another chain, may still be
+chain) or one naming another chain, may still be
 in flight, so its Memory cap cannot go back while the device can still
 DMA into or out of it. The driver resets the device first: once the
 reset is acknowledged, the device no longer accesses the virtqueue or

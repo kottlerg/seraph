@@ -91,7 +91,7 @@ pub fn init_io_ports(info: &InitInfo)
 }
 
 /// Shut the machine down through ACPI S5 ([`acpi_shutdown::shutdown`]); returns
-/// only if the shutdown failed.
+/// only if the shutdown could not be issued (a missing table, field, or port).
 pub fn shutdown(info: &InitInfo)
 {
     acpi_shutdown::shutdown(info);

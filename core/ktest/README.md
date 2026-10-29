@@ -412,8 +412,11 @@ ShutdownPolicy::Never` and rebuild and re-compose as above.
 `ShutdownPolicy::Always` shuts down regardless of test outcome.
 `ShutdownPolicy::Pass` shuts down only if all tests passed; otherwise the harness thread
 exits (`thread_exit`) and the system idles. `ShutdownPolicy::Never` exits the harness thread
-after printing results, leaving the system idle with QEMU open. A shutdown attempt that fails
-also falls through to `thread_exit`.
+after printing results, leaving the system idle with QEMU open. A shutdown attempt that cannot
+be issued falls through to `thread_exit`: on x86-64 when the FADT, `PM1a_CNT_BLK`, the DSDT's
+`\_S5_`, or the port bind is missing; on RISC-V when there is no `SbiControl` cap. One issued
+but not completed halts the harness thread in a spin instead (the `PM1a` write on x86-64, the
+SRST call on RISC-V), so no partial output follows it.
 
 On x86-64 shutdown uses ACPI S5 (parsed from FADT/DSDT in userspace).
 On RISC-V shutdown uses SBI SRST via the `SYS_SBI_CALL` syscall.

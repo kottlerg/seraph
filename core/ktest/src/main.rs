@@ -434,7 +434,7 @@ extern "C" fn run(info_ptr: u64) -> !
         wait_us(100_000);
         arch::shutdown(info);
 
-        // Shutdown failed; fall through to thread_exit.
+        // The shutdown could not be issued; fall through to thread_exit.
         log("ktest: shutdown failed, exiting harness thread");
     }
 

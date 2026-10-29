@@ -70,7 +70,9 @@ const PLIC_PRIORITY_BASE: u64 = 0x0000;
 
 /// PLIC S-mode context of the hart with hardware id `hart`.
 ///
-/// Standard PLIC context numbering: M-mode = `hart*2`, S-mode = `hart*2+1`.
+/// Assumes the context layout of the targeted platforms (QEMU `virt`,
+/// SiFive-style PLICs): M-mode = `hart*2`, S-mode = `hart*2+1`. The PLIC
+/// specification leaves the mapping to the platform (module doc).
 const fn plic_s_context(hart: u32) -> u64
 {
     hart as u64 * 2 + 1
@@ -140,6 +142,9 @@ fn current_hart() -> u32
 /// through the direct map.
 const fn plic_context_in_window(hart: u32, window: u64) -> bool
 {
+    // With the standard register map the claim register always ends past the
+    // enable words, so the enable-word test is defensive: it keeps the bound
+    // correct should the enable span ever grow past the context block.
     let enable_end = plic_enable_base_for(hart) + PLIC_NUM_SOURCES.div_ceil(32) as u64 * 4;
     let claim_end = plic_threshold_offset_for(hart) + 8;
     enable_end <= window && claim_end <= window

@@ -516,7 +516,9 @@ A started CPU that never announces itself leaves the BSP waiting at
 since SIPI delivery is unacknowledged and `start_ap` cannot report a delivery failure.
 An AP that provides fewer hardware TLB tags than the BSP configured halts itself with
 "AP provides fewer hardware TLB tags than the BSP configured" before announcing itself,
-which leaves the BSP waiting at `APS_READY`.
+which leaves the BSP waiting at `APS_READY`. On riscv64 an AP whose PLIC S-mode context
+registers lie outside the PLIC window (a firmware hart id too large for the window
+`plic_size` reports) halts itself the same way, before announcing itself.
 An entropy self-test FAIL (step 5) is printed and the boot continues; the
 marker is matched by the `run-parallel` fail regex, which turns a QEMU run red
 (see [entropy.md](entropy.md) § Testing).
@@ -689,7 +691,7 @@ through its drain until a teardown commits `Exited` over it (see
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; bad entries skipped, entries beyond MAX_MMIO_APERTURES dropped |
 | 7 | Capability system + root CSpace | Halt: OOM |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace). A started CPU that never announces itself leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged); an entropy self-test FAIL is printed and the boot continues |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace). A started CPU that never announces itself, or an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window), leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged); an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation + scheduler entry (user mode) | Halt: invalid InitImage or OOM |
 
 ---

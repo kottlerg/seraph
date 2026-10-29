@@ -79,26 +79,32 @@ pub use syscall_abi::{
 mod arch;
 
 use arch::current::{
-    syscall1_ret4, syscall2, syscall3, syscall4, syscall5, syscall5_ret2, syscall6, syscall6_ret3,
+    syscall1_ret4, syscall2, syscall3, syscall3_any, syscall4, syscall5, syscall5_ret2, syscall6,
+    syscall6_ret3,
 };
 
 /// Issue syscall `nr` with three argument registers exactly as given, bypassing
 /// the typed wrappers' argument types; returns the primary return register
-/// (negative = error code).
+/// (negative = error code). Any secondary return values are discarded.
 ///
 /// For harness tests of the kernel's own argument validation, which must hand
 /// it register values no typed wrapper can express (a priority above 255, a
-/// CPU id above `u32::MAX`). Everything else uses the typed wrappers.
+/// CPU id above `u32::MAX`). Everything else uses the typed wrappers. Every
+/// register the kernel can write on return is declared clobbered, so the call
+/// is sound for any `nr`, including those that return values in argument
+/// registers (`SYS_SCHED_SPLIT`, the IPC calls).
 ///
 /// # Safety
 /// The kernel receives the arguments unchecked by this crate: any argument the
-/// syscall treats as a user pointer must name memory valid for that use.
+/// syscall treats as a user pointer must name memory valid for the access the
+/// kernel makes through it.
 #[inline]
 #[must_use]
 pub unsafe fn raw_syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 {
-    // SAFETY: caller contract; syscall3 issues the raw syscall instruction.
-    unsafe { syscall3(nr, a0, a1, a2) }
+    // SAFETY: caller contract covers the pointer arguments; syscall3_any declares
+    // every register the kernel can write on return as clobbered.
+    unsafe { syscall3_any(nr, a0, a1, a2) }
 }
 
 // ── IPC capability handle helpers ─────────────────────────────────────────────

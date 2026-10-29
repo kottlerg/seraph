@@ -36,7 +36,8 @@ pub const MAX_IRQ_ID: u32 = 127;
 
 /// Minimum valid PLIC source number. PLIC source 0 is reserved and never
 /// wired to a real device.
-// dead_code: host test builds compile out `sys_irq_register`, the only reader.
+// dead_code: host test builds compile out its readers (`sys_irq_register`,
+// `dealloc_object_one`).
 #[cfg_attr(test, allow(dead_code))]
 pub const MIN_IRQ_ID: u32 = 1;
 

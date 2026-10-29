@@ -35,7 +35,8 @@ pub const MAX_IRQ_ID: u32 = 255;
 
 /// Minimum valid GSI number on x86-64. GSI 0 (PIT timer) is a legitimate
 /// platform resource; nothing is reserved at the low end.
-// dead_code: host test builds compile out `sys_irq_register`, the only reader.
+// dead_code: host test builds compile out its readers (`sys_irq_register`,
+// `dealloc_object_one`).
 #[cfg_attr(test, allow(dead_code))]
 pub const MIN_IRQ_ID: u32 = 0;
 

@@ -141,6 +141,48 @@ pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
     ret
 }
 
+/// Issue any syscall with 3 argument registers and every register the kernel
+/// can write on return declared clobbered. Returns the primary return value.
+///
+/// Unlike [`syscall3`], which declares `a1`/`a2` input-only and so serves only
+/// syscalls that return in `a0` alone, this declares every argument register
+/// (`a1` to `a5`) as discarded on output, so it is sound for a syscall whose
+/// return also writes them (the IPC and split calls' `set_ipc_*` returns).
+/// `a3` to `a5` carry 0.
+///
+/// # Safety
+///
+/// The raw-wrapper contract in [`crate::arch`] § Safety, except that the
+/// arguments need not match `nr`'s typed contract (pointer arguments must still
+/// be valid for the access the kernel makes through them).
+// inline_always: syscall wrapper contains inline asm; must inline to call site.
+// cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
+#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[inline(always)]
+pub unsafe fn syscall3_any(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
+{
+    let ret: i64;
+    let a0 = a0 as i64;
+    // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
+    // args in a0-a2 (a3-a5 zero); every argument register is declared inout-to-discard
+    // because the kernel may write return values into any of them. `nomem` is omitted as
+    // in `syscall3`; `nostack` holds because the asm itself does not use the Rust stack.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inout("a0") a0 => ret,
+            inout("a1") a1 => _,
+            inout("a2") a2 => _,
+            inout("a3") 0u64 => _,
+            inout("a4") 0u64 => _,
+            inout("a5") 0u64 => _,
+            in("a7") nr,
+            options(nostack),
+        );
+    }
+    ret
+}
+
 /// Issue a syscall with up to 5 arguments. Returns (primary, secondary).
 ///
 /// # Safety

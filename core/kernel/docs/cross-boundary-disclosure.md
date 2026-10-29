@@ -3,9 +3,7 @@
 Enumerates every value the kernel emits across the user/kernel boundary and
 classifies it toward the goal that no kernel virtual address or kernel pointer
 escapes to userspace — a prerequisite for kernel address-space layout
-randomization (KASLR). Known open disclosures: the unpinned
-`SYS_THREAD_READ_REGS` trap-frame copy under a concurrent last-cap delete
-([#502](https://github.com/kottlerg/seraph/issues/502)), kernel state in
+randomization (KASLR). Known open disclosures: kernel state in
 donated memory that the donor can still map
 ([#433](https://github.com/kottlerg/seraph/issues/433)), mirrored console diagnostics
 ([#440](https://github.com/kottlerg/seraph/issues/440)), and unzeroed bootloader
@@ -19,8 +17,7 @@ KASLR randomizes the kernel's virtual base. A single kernel virtual address (VA)
 kernel pointer, or value derived from one that reaches userspace defeats base
 randomization. This inventory audits the kernel's complete output surface and
 records, per surface, why it carries no kernel VA or, for each known open
-disclosure ([#502](https://github.com/kottlerg/seraph/issues/502),
-[#433](https://github.com/kottlerg/seraph/issues/433),
+disclosure ([#433](https://github.com/kottlerg/seraph/issues/433),
 [#439](https://github.com/kottlerg/seraph/issues/439),
 [#440](https://github.com/kottlerg/seraph/issues/440)), what it leaks. It is the
 standing reference the coding-standards rule "Cross-Boundary Data Hygiene"
@@ -35,11 +32,8 @@ distinct, narrower concern handled in "Physical-address surfaces" below.
 Each surface is classified as one of:
 
 - **(a) kernel VA / pointer** — a kernel virtual address, kernel pointer, or value
-  derived from one. A leak. **One found** among emitted values: the unpinned
-  `SYS_THREAD_READ_REGS` trap-frame copy, which can hand freed or reused kernel
-  memory to the caller (see the fault-message note below;
-  [#502](https://github.com/kottlerg/seraph/issues/502));
-  kernel state kept in donated memory is a separate surface, below.
+  derived from one. A leak. **None found** among emitted values; kernel state kept in
+  donated memory is a separate surface, below.
 - **(b) userspace VA** — an address in the caller's own (or a delegate's) address
   space. The caller already owns it; not a disclosure.
 - **(c) opaque / randomized** — a kernel-minted identifier that is unguessable
@@ -67,7 +61,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `CAP_INFO_MEMORY_PHYS_BASE` → `MemoryObject::base` | `cap::sys_cap_info`, `cap::object::MemoryObject` | **e** |
 | `SYS_SYSTEM_INFO` (kernel and boot-protocol versions, cpu count, page size, elapsed µs, current cpu) | `sysinfo::sys_system_info` | c/d |
 | `SYS_ASPACE_QUERY` → leaf physical address of a user page | `sysinfo::sys_aspace_query`, `AddressSpace::query_page` | **e** |
-| `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d; **a** under a concurrent last-cap delete ([#502](https://github.com/kottlerg/seraph/issues/502)) |
+| `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d |
 | `SYS_GETRANDOM` → random bytes into a user buffer + byte count | `entropy::sys_getrandom` | d |
 | `SYS_SBI_CALL` → firmware `sbiret.value` on success, `NotSupported` on any firmware error (RISC-V; args caller-supplied) | `sbi::sys_sbi_call` | d |
 | `SYS_IPC_BUFFER_SET` → status only (validates user-half, page-aligned VA) | `syscall::sys_ipc_buffer_set` | (no output) |
@@ -100,14 +94,11 @@ Notes on the non-obvious entries:
   it is reported clear there. RISC-V never sets the bit. No other word carries a kernel
   VA or a value derived from one. The forwarded/readable `TrapFrame` holds only user-mode
   register state (no kernel stack pointer, kernel return address, or `CR3`/`satp`); the
-  write path re-validates through `sanitize_for_user_resume`. `sys_thread_read_regs` does
-  not pin the TCB it resolves through `lookup_cap`, so a sibling's concurrent delete or
-  revoke of the last
-  Thread capability can free the thread slab before or while `sched::with_held_frame`
-  takes its `sched_lock`, reads its state, and snapshots its trap frame into a kernel
-  stack buffer, and freed or reused kernel memory lands in the snapshot that
-  `copy_to_user` returns to the caller; closing it is
-  [#502](https://github.com/kottlerg/seraph/issues/502).
+  write path re-validates through `sanitize_for_user_resume`. `sys_thread_read_regs`
+  pins the Thread it resolves through `lookup_cap` for the call, so a sibling's concurrent
+  delete or revoke of the last Thread capability cannot free the thread slab while
+  `sched::with_held_frame` snapshots its trap frame: the snapshot `copy_to_user` returns
+  is the target's user register state.
 - **Thread IDs** are random per `sched::alloc_thread_id`, except init's, which is the
   fixed value 1 (class **d**) (issue #248;
   [scheduling-internals.md](scheduling-internals.md) § Cross-CPU TCB Ownership) — a

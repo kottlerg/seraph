@@ -88,24 +88,27 @@ it serves the next grow. Pages are never freed while the CSpace is live
 
 **Memory ordering and lock domains:** directory and leaf pointers are write-once while the CSpace is
 live, published with Release after full initialisation, and read with Acquire by the lock-free
-lookup path (`lookup_cap`, `cap_info`). Mutation is split across two lock domains: slot occupancy,
-the free list, the directory, and the counters change only under the CSpace spinlock, while the
-derivation linkage of occupied slots changes only under the global derivation write lock (which
-reaches any registered CSpace's slots via registry lookup without taking its spinlock — see
-Derivation Tree below). Paths crossing the families hold the derivation lock outermost, then the
-spinlock. Races on slot content against the unlocked readers are narrowed — not closed — by the tag
-and per-slot generation checks at the resolution sites. `lookup_cap` takes no reference on the
-object it resolves, so the object can be freed while a handler still dereferences it. An object is
-freed when its reference count reaches zero, whatever releases the last reference: a capability or
-a kernel-internal owner (the principal ones are listed in
-[§ Kernel Object Reference Counting](#kernel-object-reference-counting)). A split child (a
-`SYS_MEMORY_SPLIT` tail, or a range-split MMIO, IoPort, IRQ, or SchedControl child) is a distinct
+readers. Mutation is split across two lock domains: slot occupancy, the free list, the directory,
+and the counters change only under the CSpace spinlock, while the derivation linkage of occupied
+slots changes only under the global derivation write lock (which reaches any registered CSpace's
+slots via registry lookup without taking its spinlock — see Derivation Tree below). Paths crossing
+the families hold the derivation lock outermost, then the spinlock.
+
+A syscall that uses the object a handle names resolves the handle through `syscall::pin_slot` (or
+`lookup_cap`, its single-type form): it reads the slot's tag, generation, rights, badge, and object
+under the CSpace spinlock and takes a reference on the object inside that hold, the syscall pin of
+[§ Kernel Object Reference Counting](#kernel-object-reference-counting). The pin keeps the object
+live for as long as the handler uses it, whatever releases the slot's own reference meanwhile: a
+sibling's delete of the last capability, or another holder's revoke of an ancestor. A split child
+(a `SYS_MEMORY_SPLIT` tail, or a range-split MMIO, IoPort, IRQ, or SchedControl child) is a distinct
 object linked under the original's derivation parent, so another holder's revoke of that ancestor
-can free it directly. For a same-object derivation, as in the kill-process pattern, it is the delete
-following the revoke that frees the object: a revoke keeps its target capability, so it never frees
-the target's own object, though it can free a descendant's. That a handler can dereference an
-object freed under it is a known kernel memory-safety defect tracked in
-[#502](https://github.com/kottlerg/seraph/issues/502).
+can release it directly; for a same-object derivation, as in the kill-process pattern, it is the
+delete following the revoke that releases it. Either way the object is freed only when its count
+reaches zero, which a held pin defers until the syscall drops it. The remaining lock-free readers —
+the capability-tree syscalls' first resolution of a source (copy, derive, derive-badge, and
+move) and the IPC transfer pre-validation — dereference no object until they revalidate the slot
+under the derivation write lock (see [§ Global Derivation Lock](#global-derivation-lock)); the tag
+and per-slot generation checks at those resolution sites only narrow the race they act on.
 
 **Slot 0** is always null. The leaf covering slot 0 exists once the CSpace
 has grown, but the slot is permanently locked to the null capability,
@@ -270,13 +273,14 @@ Each slot carries an 8-bit **generation** counter (in `pad[1]`, keeping the slot
 `CSpace::free_slot` increments it every time the slot is recycled. The generation is encoded into
 the capability handle userspace receives — `handle = (generation << CAP_INDEX_BITS) | index` (see
 [capability-model.md](../../../docs/capability-model.md) § Capability Handle Format) — and
-`lookup_cap`, together with the raw-resolution paths in `syscall/cap.rs` (whose
-`revalidate_src_under_lock` `syscall/mem.rs` reuses), `syscall/ipc.rs`, `cap/transfer.rs`, and
-`cap/split.rs`, rejects a handle whose generation no longer matches the slot's, returning
-`InvalidCapability`. This is the #349 fix: a stale handle that reaches a recycled slot — including a
-slot a cross-`CSpace` revoke freed out from under its holder — fails closed instead of aliasing the
-new occupant. A never-recycled slot has generation 0, so its handle equals the bare index — the
-backward-compatibility hinge that lets long-lived boot caps keep their historical handle values.
+`syscall::pin_slot` (and `lookup_cap` through it), together with the raw-resolution paths in
+`syscall/cap.rs` (whose `revalidate_src_under_lock` `syscall/mem.rs` reuses), `syscall/ipc.rs`,
+`cap/transfer.rs`, and `cap/split.rs`, rejects a handle whose generation no longer matches the
+slot's, returning `InvalidCapability`. This is the #349 fix: a stale handle that reaches a recycled
+slot — including a slot a cross-`CSpace` revoke freed out from under its holder — fails closed
+instead of aliasing the new occupant. A never-recycled slot has generation 0, so its handle equals
+the bare index — the backward-compatibility hinge that lets long-lived boot caps keep their
+historical handle values.
 
 The generation is distinct from `SlotId.epoch` (the `CSpace` registry epoch, a random value redrawn
 each time the id is recycled) and from the `pad[0]` free-list marker. It must survive the
@@ -402,8 +406,16 @@ The principal kernel-internal owners:
   [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
 - **Fault-handler binding.** `SYS_THREAD_SET_FAULT_HANDLER` takes a reference on the
   bound Endpoint, released on unbind, rebind, or thread destruction.
-- **Transient holds.** A syscall that must keep an object live across a lock-free step
-  takes one for that step (for example `pre_grow_holding_dest`).
+- **Syscall pins.** Every syscall that resolves a handle to use the object it names
+  holds a reference on that object for as long as it uses it: `syscall::pin_slot` (and
+  `lookup_cap` through it) takes it under the slot's CSpace lock and returns it as a
+  `syscall::PinnedCap`, whose drop releases it through `cap::object::release_ref`. A
+  release that drops the last reference queues a `Thread`, `CSpace`, or `AddressSpace` for
+  this CPU's deferred reclaim (it may be bound to the running thread) and frees any other
+  type in place. A pin is dropped before its syscall parks (the pin-before-park rule of
+  [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)): a
+  thread killed while parked never runs the destructor, and the park's binding, not the
+  pin, keeps the parked thread reachable from the object's teardown.
 - **Wait-set membership.** `sys_wait_set_add` `inc_ref`s the source's header under the
   source's lock together with the back-pointer publication; `sys_wait_set_remove` and
   `wait_set_drop` perform the matching `dec_ref`. The source's state therefore outlives
@@ -411,6 +423,18 @@ The principal kernel-internal owners:
   only `debug_assert` that `state.wait_set` is null on entry (the invariant follows from
   the refcount). The membership protocol is in [ipc-internals.md](ipc-internals.md)
   § Wait Set Add/Remove.
+
+**Pin invariant.** A syscall pin may be taken only on an object whose count is not zero, so
+`pin_slot` takes it under the CSpace lock while the slot it reads is still occupied, and every
+path that frees an occupied slot clears the slot under that CSpace's lock before it releases the
+reference the slot held: `SYS_CAP_DELETE`, the revoke batch's `unlink_free_collect`, the range
+splits' consume of the original (`install_split_children`) and their rollback of a child, the
+`SYS_MEMORY_MERGE` tail, and a move's freed source (`free_source`, released through
+`release_moved_object`). A slot observed occupied under the lock therefore still holds its
+reference, and the increment lands before any release can reach zero. The one release that
+clears no slot, the dying CSpace's `for_each_object` drop in its `dealloc_object` arm, runs only
+after every thread bound to the CSpace is stopped and off every CPU and the CSpace is unregistered,
+so no `pin_slot` can be reading it.
 
 ---
 
@@ -587,13 +611,14 @@ can touch the derivation forest during the drain below. If the thread running th
 stopped — it deleted the last capability to its own `CSpace`, or a concurrent teardown stopped it —
 nothing below runs now: the object is queued for off-CPU reclaim and the whole arm re-runs from the
 deferred drain once the thread has been scheduled away. The same discipline applies to an
-`AddressSpace` reaching refcount zero. This path has known kernel memory-safety gaps, tracked in
-[#501](https://github.com/kottlerg/seraph/issues/501) and
-[#502](https://github.com/kottlerg/seraph/issues/502) (see
-[§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix),
+`AddressSpace` reaching refcount zero. A syscall on another thread that still uses a `Thread`,
+`CSpace`, or `AddressSpace` it resolved holds a syscall pin on it, so the count cannot reach zero
+under that syscall (see [§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix)); and
+the stops' cancellations, like a dying thread's own drain, reach the IPC source a stopped thread
+was parked on only through its binding, re-read under the thread's `sched_lock`, which proves the
+source not yet freed (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
-§ `dealloc_object(Thread)` Drain Protocol, step 11, and
-[syscalls.md](syscalls.md#sys_thread_stop-20) § `SYS_THREAD_STOP`).
+§ `dealloc_object(Thread)` Drain Protocol, step 11).
 
 Every derivation link reachable from a live slot resolves: before a `CSpace`
 unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every
@@ -768,8 +793,8 @@ crosses a `CSpace` boundary, revoking a source's subtree frees a slot in a forei
 recycle slot indices, that freed index would then alias an unrelated live object.
 
 Per-slot generation handles keep a stale handle from aliasing a recycled slot after a
-cross-`CSpace` revoke. A syscall already in flight on the object is not covered
-([#502](https://github.com/kottlerg/seraph/issues/502); see
+cross-`CSpace` revoke, and a syscall already in flight on the object holds a pin that keeps
+the object live until the syscall drops it (see
 [§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix)). Both forms
 of cross-`CSpace` sharing keep a derivation edge across the boundary:
 
@@ -893,8 +918,9 @@ binding outside the process CSpace: the receiving thread's `reply_tcb` field, wh
 points at the caller when a call and a receive rendezvous — in `SYS_IPC_CALL` when the server is
 already waiting, in `SYS_IPC_RECV` when the caller is, or in kernel fault delivery
 (`core/kernel/src/ipc/fault.rs`), which takes the caller role. The kernel clears the binding when
-`SYS_IPC_REPLY` claims it before waking the caller (by compare-exchange in `endpoint_reply` on
-delivery, or by `swap(null)` in `fail_reply_and_wake_caller` on its transfer-failure path), at the
+`SYS_IPC_REPLY` claims it by compare-exchange in `endpoint_reply`, before it reads the caller,
+validates the payload, or moves a capability (a failure after the claim wakes the caller with the
+transfer-failed reply), at the
 thread's next `SYS_IPC_RECV` that passes its capability check and cap-slot pre-allocation, which
 releases the unreplied caller, when a stop (`cancel_ipc_block`) or a teardown claims the bound
 caller, or when the rendezvous is rolled back because the caller's park or rebind commit was

@@ -132,9 +132,8 @@ capability type. The binding is per-thread kernel state: the bound endpoint and 
 - `thread_cap` MUST carry `CONTROL`. It selects the thread whose handler is set.
 - `endpoint_cap` MUST refer to an `Endpoint`, or be the null index `0` to **unbind**.
   Binding takes a reference on the endpoint object for the lifetime of the binding (see
-  [Liveness](#liveness)); unbinding releases it. Neither the thread lookup nor the endpoint
-  lookup takes a reference on its object, so neither object is pinned while the binding is
-  written (a known defect tracked in [#502](https://github.com/kottlerg/seraph/issues/502); see
+  [Liveness](#liveness)); unbinding releases it. Both lookups pin their object for the call,
+  so neither the thread nor the endpoint can be freed while the binding is written (see
   [capability-internals.md § Storage: Hybrid Two-Level Radix](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)).
 - `badge` is a caller-chosen value delivered as the fault message badge. It identifies the
   faulting thread (or its process) to the handler only if no other binder can reach the
@@ -253,10 +252,8 @@ The kernel ignores reply data words. The reply **label** conveys disposition:
 1. The binding holds a reference on the handler endpoint object, so a fault-blocked thread
    — which is queued on neither the endpoint's send nor receive queue — cannot be stranded
    by the endpoint being destroyed while it is bound. The reference is released on unbind,
-   rebind, or thread destruction. This holds only once the reference is taken: neither the
-   thread nor the endpoint is pinned while the binding is written (see
-   [Fault-Handler Binding](#fault-handler-binding);
-   [#502](https://github.com/kottlerg/seraph/issues/502)).
+   rebind, or thread destruction. The binder pins both the thread and the endpoint while it
+   writes the binding (see [Fault-Handler Binding](#fault-handler-binding)).
 2. Destruction of the handler thread (deletion of the last capability to its Thread object)
    releases any fault-blocked thread awaiting that handler, killing it (the
    [Kill](#delivery-resume-and-kill) path), as does a later receive on the handler thread while

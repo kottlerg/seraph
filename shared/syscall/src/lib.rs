@@ -1777,9 +1777,9 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 /// the stop is in progress, the blocking syscall returns `Interrupted` once
 /// the thread is restarted, unless its wake was claimed first, or a timed
 /// wait or sleep that found the kernel's sleep list full withdrew itself
-/// first (it then returns its timeout or `OutOfMemory`). The kernel's
-/// known exceptions (#501) are listed in `core/kernel/docs/syscalls.md`
-/// § `SYS_THREAD_STOP`. A thread may stop itself (pass its own thread cap).
+/// first (it then returns its timeout or `OutOfMemory`); the full contract is
+/// in `core/kernel/docs/syscalls.md` § `SYS_THREAD_STOP`. A thread may stop
+/// itself (pass its own thread cap).
 ///
 /// If the thread is blocked on a fault, its fault episode is cancelled with a
 /// kill outcome, unless the handler's reply claimed it first, in which case
@@ -1850,8 +1850,8 @@ pub fn thread_set_priority(thread_cap: u32, priority: u8, sched_cap: u32) -> Res
 /// stopped, or not-yet-started thread observes the new affinity on its next
 /// enqueue (a wake, or `SYS_THREAD_START` on start or resume).
 ///
-/// See `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_AFFINITY` for the known
-/// defect (#502).
+/// See `core/kernel/docs/syscalls.md` § `SYS_THREAD_SET_AFFINITY` for the
+/// call's full contract.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` if the thread cap

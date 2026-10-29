@@ -527,11 +527,11 @@ recipient's slot in the recipient's own CSpace. Per-slot generation handles ensu
 the recipient's now-stale handle then fails with `InvalidCapability` rather than
 aliasing a recycled slot index — the cross-CSpace stale-slot alias that was the #349
 hazard. See [capability-internals.md](../core/kernel/docs/capability-internals.md)
-§ Capability Transfer in IPC. Kernel lookups take no reference on the object they resolve,
-so the object is not pinned while a holder's syscall still dereferences it — a known kernel
-memory-safety defect (see
+§ Capability Transfer in IPC. A syscall already in flight on the object holds a reference on it
+until the syscall stops using it, so the revoke frees the object only after that syscall is done
+with it (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
-§ Storage: Hybrid Two-Level Radix, [#502](https://github.com/kottlerg/seraph/issues/502)).
+§ Storage: Hybrid Two-Level Radix).
 
 
 ---
@@ -712,14 +712,12 @@ bound to: when the last capability to either object is deleted, every thread bou
 before the object's storage is reclaimed, wherever those threads' own capabilities are held —
 including the deleting thread itself, when it holds that last capability to its own `CSpace` or
 `AddressSpace` (the delete then never returns to it). The process's resources are reclaimed as their
-capability reference counts reach zero. This path has known kernel memory-safety gaps, tracked in
-[#501](https://github.com/kottlerg/seraph/issues/501) and
-[#502](https://github.com/kottlerg/seraph/issues/502) (see
+capability reference counts reach zero; an object another thread's syscall is still using is freed
+only once that syscall is done with it (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
-§ Storage: Hybrid Two-Level Radix,
+§ Storage: Hybrid Two-Level Radix and
 [thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
-§ `dealloc_object(Thread)` Drain Protocol, step 11, and
-[syscalls.md](../core/kernel/docs/syscalls.md#sys_thread_stop-20) § `SYS_THREAD_STOP`).
+§ `dealloc_object(Thread)` Drain Protocol, step 11).
 
 Beyond that stop, the kernel's role in death is *notification*. An `AddressSpace` carries a
 death-observer set (mirroring the per-thread death observers). A fault is terminal when:

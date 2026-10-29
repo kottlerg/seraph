@@ -220,7 +220,9 @@ each change; the binding statement of the resulting invariants is
   landed together with that consumer plus a host unit test, not ahead of it (an unused
   `pub fn` would have stood as a `dead_code` warning). It has since gained other
   non-blocking callers: the pull's own run-queue locks, `THREAD_REGISTRY_LOCK`, the
-  entropy `POOL_LOCK`, and the watchdog's `SLEEP_LIST_LOCK` read.
+  entropy `POOL_LOCK`, the watchdog's `SLEEP_LIST_LOCK` read, and the source lock
+  `ipc::lock_bound_source` takes under a parked thread's `sched_lock` (the second inverse-order
+  site; [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy, rule 7).
 
 - **`sched_lock: Spinlock` and `wake_pending: bool`** are TCB fields in the
   `=== Scheduling state ===` group (followed by the diagnostic `park_started_tick` and the

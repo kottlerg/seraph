@@ -12,8 +12,9 @@
 //!
 //! ktest receives a set of buddy-backed RAM Memory caps from the kernel
 //! alongside its three segment caps (TEXT, RODATA, BSS/DATA). Before any
-//! tests run, `init()` splits the first RAM cap into single-page frames
-//! (up to `POOL_SIZE`) and stores the capability slots in `POOL_SLOTS`.
+//! tests run, `init()` carves a tail of up to `POOL_SIZE` pages off the
+//! first RAM cap (leaving at least one page in its head), splits that tail
+//! into single-page frames, and stores the capability slots in `POOL_SLOTS`.
 //! Each slot is marked available in `POOL_AVAILABLE` (one bit per slot).
 //! Segment caps are intentionally left intact: the pool never draws from
 //! the binary's own image, so non-zero initialised statics in ktest cannot

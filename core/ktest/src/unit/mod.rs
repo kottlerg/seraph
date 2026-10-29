@@ -34,7 +34,7 @@
 //! - `thread.rs`   — thread lifecycle, register read/write, priority, affinity, sleep, `bind_notification`
 //! - `fpu.rs`      — FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration
 //! - `hw.rs`       — MMIO, IRQ, I/O ports (`SYS_SBI_CALL` is under `src/arch/<arch>/`)
-//! - `sysinfo.rs`  — system info queries and debug log
+//! - `sysinfo.rs`  — system info queries (`SYS_SYSTEM_INFO`)
 //! - `crypto.rs`   — shared `crypto` crate KATs (SHA-512, Ed25519 verify),
 //!   run on-target so the primitives are validated on both arches (not a
 //!   kernel syscall surface, but ktest is the only both-arch on-target harness)

@@ -846,13 +846,20 @@ pub mod svcmgr_labels
     /// bytes packed little-endian. `caps[0]` is the endpoint the name
     /// resolves to.
     pub const PUBLISH_ENDPOINT: u64 = 3;
-    /// Look up a named endpoint; reply transfers the cap if known.
+    /// Look up a named public endpoint; on success the reply carries a
+    /// freshly derived SEND cap.
     ///
-    /// Label bits 16..31 carry `name_len` (see `shared/ipc` `read_path`
-    /// pattern); data words from 0 carry the name. Reply attaches the cap on
-    /// success, or returns `svcmgr_errors::UNKNOWN_NAME` on miss and for a
-    /// seed-only name (one whose cap carries authority, which reaches only
-    /// the recipes seeding it; see [`crate::published_names`]).
+    /// Label bits 16..31 carry `name_len`; data words from 0 carry the name
+    /// bytes packed little-endian, as for [`PUBLISH_ENDPOINT`]
+    /// (`registry-client`'s `pack_name` is the reference encoder). Reply
+    /// attaches a freshly derived SEND cap on success. On failure it carries
+    /// no cap and returns `svcmgr_errors::INVALID_NAME` if `name_len` is 0
+    /// or exceeds `registry::NAME_MAX`; `svcmgr_errors::UNKNOWN_NAME` on
+    /// miss and for a seed-only name (one whose cap carries authority, which
+    /// reaches only the recipes seeding it; see [`crate::published_names`]);
+    /// or `svcmgr_errors::INSUFFICIENT_CAPS` if svcmgr cannot derive a SEND
+    /// from the published endpoint, in which case it drops the entry, so a
+    /// later query of the name gets `UNKNOWN_NAME`.
     pub const QUERY_ENDPOINT: u64 = 4;
 
     /// Verb-bit carried by the caller's badge to authorise

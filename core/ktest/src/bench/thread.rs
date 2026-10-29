@@ -54,8 +54,12 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
         {
             break;
         };
-        if spawn::configure_and_start(&child, lifecycle_entry, stack_top, u64::from(child_done))
-            .is_err()
+        // SAFETY: the stack is `BENCH_LIFECYCLE_STACK`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        if unsafe {
+            spawn::configure_and_start(&child, lifecycle_entry, stack_top, u64::from(child_done))
+        }
+        .is_err()
         {
             break;
         }
@@ -154,13 +158,17 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
         return;
     };
     let stack_top = ChildStack::top(core::ptr::addr_of!(BENCH_CTXSWITCH_STACK));
-    if spawn::configure_and_start_pinned(
-        &child,
-        ctxswitch_child_entry,
-        stack_top,
-        u64::from(child_done),
-        0,
-    )
+    // SAFETY: the stack is `BENCH_CTXSWITCH_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    if unsafe {
+        spawn::configure_and_start_pinned(
+            &child,
+            ctxswitch_child_entry,
+            stack_top,
+            u64::from(child_done),
+            0,
+        )
+    }
     .is_err()
     {
         cap_delete(child.th).ok();

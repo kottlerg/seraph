@@ -169,7 +169,11 @@ fn main() -> !
         std::os::seraph::log!("PT-budget funding failed");
         syscall::thread_exit();
     }
-    if syscall::mmio_map(info.self_aspace, caps.mmio_cap, base_va, 0).is_err()
+    // SAFETY: `range` is a fresh one-page reservation from the per-process
+    // arena, owned for the process's lifetime, and devmgr carves the RTC
+    // `Mmio` cap as one page (`carve_rtc_authority`), so the whole-region
+    // mapping stays inside it: VA no Rust object or IPC page occupies.
+    if unsafe { syscall::mmio_map(info.self_aspace, caps.mmio_cap, base_va, 0) }.is_err()
     {
         std::os::seraph::log!("mmio_map failed");
         syscall::thread_exit();

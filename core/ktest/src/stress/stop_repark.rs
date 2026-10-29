@@ -397,7 +397,10 @@ fn create_thread(
     // stress tests run sequentially, and a phase reuses them only after the
     // previous phase's children exited and were deleted.
     let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack]) });
-    thread_configure(th, entry as *const () as u64, top, arg)
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe { thread_configure(th, entry as *const () as u64, top, arg) }
         .map_err(|_| "stress::stop_repark: thread_configure failed")?;
     thread_set_affinity(th, cpu).map_err(|_| "stress::stop_repark: pin thread failed")
 }

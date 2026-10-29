@@ -202,7 +202,9 @@ fn start_pinned_child(
     // SAFETY: stack_idx is unique per child; the children live for the whole
     // cell and are reaped after both report done.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack_idx]) });
-    spawn::configure_and_start_pinned(&child, entry, stack, arg, cpu)
+    // SAFETY: the stack is `super::STRESS_STACKS[stack_idx]`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(&child, entry, stack, arg, cpu) }
         .map_err(|_| "stress::event_try_recv_post_race: start child failed")?;
     Ok(child)
 }

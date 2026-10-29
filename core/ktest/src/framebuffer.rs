@@ -121,13 +121,24 @@ pub unsafe fn init(info: &InitInfo, aspace_cap: u32)
     let span_end = (fb.physical_base + fb_bytes + 0xFFF) & !0xFFF;
     let map_bytes = span_end - base_aligned;
 
+    // The carved region is mapped from FB_VA, so it must end below the next
+    // fixed mapping above it (`arch::FB_WINDOW_END`: the riscv64 UART window,
+    // else the low scratch band, crate docs § Scratch VAs).
+    if map_bytes > crate::arch::FB_WINDOW_END - FB_VA
+    {
+        return;
+    }
     let Some(fb_cap) = carve_framebuffer_cap(info, base_aligned, map_bytes)
     else
     {
         return;
     };
 
-    if syscall::mmio_map(aspace_cap, fb_cap, FB_VA, 0).is_err()
+    // SAFETY: `aspace_cap` is ktest's own address space; the carved region
+    // spans `map_bytes` from FB_VA, ending below `arch::FB_WINDOW_END` (checked
+    // above), in a range no other ktest mapping and no Rust object uses, and
+    // this once-only call is its sole mapper.
+    if unsafe { syscall::mmio_map(aspace_cap, fb_cap, FB_VA, 0) }.is_err()
     {
         return;
     }

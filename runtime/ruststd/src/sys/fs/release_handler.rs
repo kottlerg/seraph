@@ -356,7 +356,12 @@ pub(super) fn release_one_local(entry: &FileEntry, aspace: u32, cookie: u64)
 /// land on the driver's page. Returns whether the unmap succeeded.
 pub(super) fn discard_mapping(m: OutstandingMapping, aspace: u32) -> bool
 {
-    let unmapped = syscall::mem_unmap(aspace, m.range.va_start(), m.range.page_count()).is_ok();
+    // SAFETY: `m` owns its `ReservedRange`, arena VA that holds no Rust
+    // object; the read path reads the page only through raw volatile reads,
+    // which end before the mapping enters the registry (`ReadMark::finish`),
+    // so no Rust reference into it is live.
+    let unmapped =
+        unsafe { syscall::mem_unmap(aspace, m.range.va_start(), m.range.page_count()) }.is_ok();
     let _ = syscall::cap_delete(m.memory_cap);
     if unmapped
     {

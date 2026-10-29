@@ -133,7 +133,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         )
     };
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start(&child, child_entry, stack_top, arg)
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, child_entry, stack_top, arg) }
         .map_err(|_| "cross_cspace_revoke_no_alias: configure_and_start failed")?;
 
     // Receive the child's call, derive `c1` from `target`, and hand it back in
@@ -205,6 +207,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 // ── Child thread ──────────────────────────────────────────────────────────────
 
+/// IPC page of the [`child_entry`] child.
+static mut CHILD_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
 /// `arg`: address of the child's [`ChildArgs`].
 extern "C" fn child_entry(arg: u64) -> !
 {
@@ -215,8 +220,11 @@ extern "C" fn child_entry(arg: u64) -> !
         report: report_slot,
     } = unsafe { child_args(arg) };
 
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(CHILD_IPC_PAGE));
+    // SAFETY: `CHILD_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { ipc_buffer_set(buf_addr) }.is_err()
     {
         thread_exit()
     }

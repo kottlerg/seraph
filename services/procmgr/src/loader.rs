@@ -41,7 +41,11 @@ impl ScratchMapping
     {
         let range = reserve_pages(pages).ok()?;
         let va = range.va_start();
-        if syscall::mem_map(memory_cap, self_aspace, va, 0, pages, prot).is_err()
+        // SAFETY: the span is the `pages`-page reservation just taken from the
+        // per-process arena, owned by this mapping: VA no Rust object or IPC
+        // page occupies. A cap shorter than `pages` is refused, so the map
+        // never reaches past the reservation.
+        if unsafe { syscall::mem_map(memory_cap, self_aspace, va, 0, pages, prot) }.is_err()
         {
             unreserve_pages(range);
             return None;
@@ -78,7 +82,11 @@ impl Drop for ScratchMapping
         if let Some(range) = self.range.take()
         {
             let va = range.va_start();
-            let _ = syscall::mem_unmap(self.self_aspace, va, self.pages);
+            // SAFETY: the span is this mapping's own reservation; a slice over
+            // it exists only where a `from_raw_parts` call site builds one from
+            // `va()`, and each such site's SAFETY comment bounds the slice by
+            // the mapping's lifetime, so none is live in Drop.
+            let _ = unsafe { syscall::mem_unmap(self.self_aspace, va, self.pages) };
             unreserve_pages(range);
         }
         if self.owns_cap != 0
@@ -162,11 +170,16 @@ pub fn derive_memory_for_prot(memory_cap: u32, prot: u64) -> Option<u32>
 /// inside it are mapped read-only instead of `prot`, sealing the GOT and
 /// `.data.rel.ro` after the relocation values were written via the scratch
 /// span.
+///
+/// # Safety
+/// `child_aspace` must name a child's address space, never procmgr's own:
+/// the function maps pages into it, at VAs the child's layout chooses,
+/// without checking what procmgr holds there.
 // too_many_lines: one transaction owning the scratch span, the per-page cap
 // set, and the child mappings; splitting would thread the guard state through
 // helpers that all need the same aspace + cap context.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(crate) fn load_elf_segment_into_child(
+pub(crate) unsafe fn load_elf_segment_into_child(
     first_page_vaddr: u64,
     num_pages: u64,
     prot: u64,
@@ -196,7 +209,12 @@ pub(crate) fn load_elf_segment_into_child(
             {
                 if self.mapped > 0
                 {
-                    let _ = syscall::mem_unmap(self.self_aspace, range.va_start(), self.mapped);
+                    // SAFETY: the span is this guard's own reservation; the
+                    // fill slice over it is dead on every path that drops the
+                    // guard with the range still held.
+                    let _ = unsafe {
+                        syscall::mem_unmap(self.self_aspace, range.va_start(), self.mapped)
+                    };
                 }
                 unreserve_pages(range);
             }
@@ -242,15 +260,19 @@ pub(crate) fn load_elf_segment_into_child(
             return Err(procmgr_errors::OUT_OF_MEMORY);
         };
         scratch.caps.push(memory_cap);
-        if syscall::mem_map(
-            memory_cap,
-            self_aspace,
-            scratch_base + i * PAGE_SIZE,
-            0,
-            1,
-            syscall::MAP_WRITABLE,
-        )
-        .is_err()
+        // SAFETY: page `i` of the `num_pages`-page reservation taken above,
+        // owned by `scratch`: VA no Rust object or IPC page occupies.
+        let mapped = unsafe {
+            syscall::mem_map(
+                memory_cap,
+                self_aspace,
+                scratch_base + i * PAGE_SIZE,
+                0,
+                1,
+                syscall::MAP_WRITABLE,
+            )
+        };
+        if mapped.is_err()
         {
             std::os::seraph::log!(
                 "procmgr: load_elf_segment: scratch map failed vaddr=0x{:x}",
@@ -272,7 +294,9 @@ pub(crate) fn load_elf_segment_into_child(
     // child.
     if let Some(range) = scratch.range.take()
     {
-        let _ = syscall::mem_unmap(self_aspace, range.va_start(), scratch.mapped);
+        // SAFETY: the span is `scratch`'s own reservation, and `span`, the only
+        // reference into it, is not used past `fill` above.
+        let _ = unsafe { syscall::mem_unmap(self_aspace, range.va_start(), scratch.mapped) };
         unreserve_pages(range);
         scratch.mapped = 0;
     }
@@ -299,7 +323,10 @@ pub(crate) fn load_elf_segment_into_child(
             );
             return Err(procmgr_errors::INSUFFICIENT_RIGHTS);
         };
-        let mapped = syscall::mem_map(derived, child_aspace, page_vaddr, 0, 1, 0);
+        // SAFETY: the caller's contract: `child_aspace` is a child's address
+        // space, never procmgr's own, so the map changes nothing procmgr runs
+        // on.
+        let mapped = unsafe { syscall::mem_map(derived, child_aspace, page_vaddr, 0, 1, 0) };
         let _ = syscall::cap_delete(derived);
         if let Err(e) = mapped
         {

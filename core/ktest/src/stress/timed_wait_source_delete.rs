@@ -203,13 +203,17 @@ fn race(
     // The waiter alternates between CPU 0, which runs the timer, and a CPU
     // other than the controller's 1 (CPU 0 again on a 2-CPU run).
     let waiter_cpu = if (cycle >> 1) & 1 == 0 { 0 } else { 2 % cpus };
-    spawn::configure_and_start_pinned(
-        child,
-        entry,
-        stack,
-        u64::from(c_source) | (u64::from(c_done) << 32),
-        waiter_cpu,
-    )
+    // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        spawn::configure_and_start_pinned(
+            child,
+            entry,
+            stack,
+            u64::from(c_source) | (u64::from(c_done) << 32),
+            waiter_cpu,
+        )
+    }
     .map_err(|_| "stress::timed_wait_source_delete: start waiter failed")?;
 
     let mut acc = 0u64;

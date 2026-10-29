@@ -105,7 +105,9 @@ pub fn run(ctx: &TestContext) -> TestResult
             // SAFETY: Each caller uses a distinct stack index.
             let stack_top =
                 ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-            spawn::configure_and_start(&child, caller_entry, stack_top, arg)
+            // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
+            // on which no other live thread runs (`ChildStack`'s rule).
+            unsafe { spawn::configure_and_start(&child, caller_entry, stack_top, arg) }
                 .map_err(|_| "concurrent_ipc: configure_and_start failed")?;
 
             threads[i] = child.th;
@@ -180,6 +182,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// IPC pages of the [`caller_entry`] children, one per `bit_index`.
+static mut CALLER_IPC_PAGES: [crate::IpcPage; NUM_CALLERS] = [crate::IpcPage::ZERO; NUM_CALLERS];
+
 extern "C" fn caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `run` published for this caller.
@@ -191,9 +196,16 @@ extern "C" fn caller_entry(arg: u64) -> !
     } = unsafe { spawn::child_args(arg) };
     let done_bit = 1u64 << bit_index;
 
-    // Register the shared IPC buffer for this child thread.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    // cast_possible_truncation: `bit_index` is below `NUM_CALLERS`.
+    #[allow(clippy::cast_possible_truncation)]
+    let page = bit_index as usize;
+    // SAFETY: takes the element's raw address without forming a reference to
+    // the `static mut`.
+    let buf_addr = crate::IpcPage::addr(unsafe { core::ptr::addr_of_mut!(CALLER_IPC_PAGES[page]) });
+    // SAFETY: `CALLER_IPC_PAGES[page]` is this caller's own IPC page, used by one
+    // thread at a time (`IpcPage`'s rule); no Rust object lives in it, and the
+    // child reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, done_bit).ok();
         thread_exit()

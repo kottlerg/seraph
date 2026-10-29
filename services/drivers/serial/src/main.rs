@@ -199,12 +199,17 @@ fn main() -> !
         syscall::thread_exit();
     }
 
-    if !arch::current::serial_init(
-        info.self_thread,
-        info.self_aspace,
-        caps.hw_cap,
-        caps.irq_cap != 0,
-    )
+    // SAFETY: `info.self_aspace` is this process's address space; on riscv64
+    // devmgr hands this driver the one-page UART `Mmio` cap
+    // (`carve_uart_authority`), and on x86-64 the call maps nothing.
+    if !unsafe {
+        arch::current::serial_init(
+            info.self_thread,
+            info.self_aspace,
+            caps.hw_cap,
+            caps.irq_cap != 0,
+        )
+    }
     {
         syscall::thread_exit();
     }

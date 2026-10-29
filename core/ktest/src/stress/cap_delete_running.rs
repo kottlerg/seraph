@@ -92,7 +92,9 @@ fn spawn_children(ctx: &TestContext, running: u32, children: &mut Children) -> T
         // SAFETY: stress tests run sequentially; only this test uses these
         // STRESS_STACKS slots.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        spawn::configure_and_start(&child, spinner_entry, stack_top, arg)
+        // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe { spawn::configure_and_start(&child, spinner_entry, stack_top, arg) }
             .map_err(|_| "cap_delete_running: configure_and_start failed")?;
     }
     Ok(())

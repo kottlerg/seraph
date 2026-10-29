@@ -28,7 +28,26 @@ use process_layout::{ProcessLayout, choose_process_layout};
 // procmgr.
 
 /// Per-page ELF write scratch during init's procmgr/memmgr bootstrap.
+///
+/// Only [`BootArena::place_page`] and [`BootArena::place_segment`] map this
+/// span, and each unmaps it before returning; a module's read-only mapping at
+/// `TEMP_MAP_BASE` stops below it ([`MODULE_SCRATCH_MAX_PAGES`]), and nothing
+/// else of init lies there, so no Rust object outlives a scratch mapping.
 const ELF_PAGE_TEMP_VA: u64 = TEMP_MAP_BASE + 0x1000_0000;
+
+/// Most pages a boot module's read-only mapping at `TEMP_MAP_BASE` may span:
+/// a longer one would reach [`ELF_PAGE_TEMP_VA`], where the per-page scratch
+/// maps would replace module bytes `populate` is still reading.
+const MODULE_SCRATCH_MAX_PAGES: u64 = (ELF_PAGE_TEMP_VA - TEMP_MAP_BASE) / PAGE_SIZE;
+
+/// Pages a boot module of `module_size` bytes spans at `TEMP_MAP_BASE`, or
+/// `None` when it would reach the ELF scratch span
+/// ([`MODULE_SCRATCH_MAX_PAGES`]).
+fn module_scratch_pages(module_size: u64) -> Option<u64>
+{
+    let pages = module_size.div_ceil(PAGE_SIZE);
+    (pages <= MODULE_SCRATCH_MAX_PAGES).then_some(pages)
+}
 
 /// Draw the entropy one bootstrap-layout choice consumes (ASLR, #39).
 ///
@@ -37,7 +56,7 @@ const ELF_PAGE_TEMP_VA: u64 = TEMP_MAP_BASE + 0x1000_0000;
 fn draw_layout_entropy() -> Option<[u8; process_layout::LAYOUT_ENTROPY_BYTES]>
 {
     let mut entropy = [0_u8; process_layout::LAYOUT_ENTROPY_BYTES];
-    let n = syscall::getrandom(entropy.as_mut_ptr(), entropy.len()).ok()?;
+    let n = syscall::getrandom(&mut entropy).ok()?;
     (n == entropy.len() as u64).then_some(entropy)
 }
 
@@ -191,7 +210,12 @@ impl BootArena
     /// (`MAP_READ` / `MAP_WRITABLE` / `MAP_EXECUTABLE`) applied directly to
     /// the full-rights arena cap — no per-page derived child, so no live
     /// derivation blocks a later `memory_split` of the arena.
-    pub(crate) fn place_page(
+    ///
+    /// # Safety
+    /// When `target_aspace` is init's own address space, the page at
+    /// `target_va` must hold no live Rust object or registered IPC page (the
+    /// contract of `syscall::mem_map`).
+    pub(crate) unsafe fn place_page(
         &mut self,
         target_aspace: u32,
         target_va: u64,
@@ -200,20 +224,27 @@ impl BootArena
     ) -> Option<()>
     {
         let offset = self.cursor;
-        syscall::mem_map(
-            self.cap,
-            self.init_aspace,
-            ELF_PAGE_TEMP_VA,
-            offset,
-            1,
-            syscall::MAP_WRITABLE,
-        )
+        // SAFETY: ELF_PAGE_TEMP_VA is init's private scratch span, unmapped
+        // between placements, with no Rust object in it (its rustdoc).
+        unsafe {
+            syscall::mem_map(
+                self.cap,
+                self.init_aspace,
+                ELF_PAGE_TEMP_VA,
+                offset,
+                1,
+                syscall::MAP_WRITABLE,
+            )
+        }
         .ok()?;
         // SAFETY: ELF_PAGE_TEMP_VA is mapped writable, one page.
         unsafe { core::ptr::write_bytes(ELF_PAGE_TEMP_VA as *mut u8, 0, PAGE_SIZE as usize) };
         populate(ELF_PAGE_TEMP_VA);
-        let _ = syscall::mem_unmap(self.init_aspace, ELF_PAGE_TEMP_VA, 1);
-        syscall::mem_map(self.cap, target_aspace, target_va, offset, 1, prot).ok()?;
+        // SAFETY: the scratch page, which `populate` reached only through the
+        // raw address it was handed; it has returned, so nothing uses it.
+        let _ = unsafe { syscall::mem_unmap(self.init_aspace, ELF_PAGE_TEMP_VA, 1) };
+        // SAFETY: the caller's contract covers `target_va` in `target_aspace`.
+        unsafe { syscall::mem_map(self.cap, target_aspace, target_va, offset, 1, prot) }.ok()?;
         self.cursor += 1;
         Some(())
     }
@@ -233,7 +264,12 @@ impl BootArena
     /// `ro_head_pages` maps that many leading pages read-only instead of
     /// `prot` (`PT_GNU_RELRO` enforcement: the read-only-after-relocation
     /// region is a prefix of the writable image region by link order).
-    pub(crate) fn place_segment(
+    ///
+    /// # Safety
+    /// When `target_aspace` is init's own address space, the `num_pages`
+    /// pages at `target_va` must hold no live Rust object or registered IPC
+    /// page (the contract of `syscall::mem_map`).
+    pub(crate) unsafe fn place_segment(
         &mut self,
         target_aspace: u32,
         target_va: u64,
@@ -248,14 +284,18 @@ impl BootArena
             return Some(());
         }
         let offset = self.cursor;
-        syscall::mem_map(
-            self.cap,
-            self.init_aspace,
-            ELF_PAGE_TEMP_VA,
-            offset,
-            num_pages,
-            syscall::MAP_WRITABLE,
-        )
+        // SAFETY: ELF_PAGE_TEMP_VA is init's private scratch span, unmapped
+        // between placements, with no Rust object in it (its rustdoc).
+        unsafe {
+            syscall::mem_map(
+                self.cap,
+                self.init_aspace,
+                ELF_PAGE_TEMP_VA,
+                offset,
+                num_pages,
+                syscall::MAP_WRITABLE,
+            )
+        }
         .ok()?;
         let len = (num_pages * PAGE_SIZE) as usize;
         // SAFETY: the span at ELF_PAGE_TEMP_VA was just mapped writable for
@@ -263,30 +303,38 @@ impl BootArena
         let span = unsafe { core::slice::from_raw_parts_mut(ELF_PAGE_TEMP_VA as *mut u8, len) };
         span.fill(0);
         populate(span);
-        let _ = syscall::mem_unmap(self.init_aspace, ELF_PAGE_TEMP_VA, num_pages);
+        // SAFETY: the scratch span; `span`, the only reference into it, is not
+        // used past `populate`.
+        let _ = unsafe { syscall::mem_unmap(self.init_aspace, ELF_PAGE_TEMP_VA, num_pages) };
         let ro = ro_head_pages.min(num_pages);
         if ro > 0
         {
-            syscall::mem_map(
-                self.cap,
-                target_aspace,
-                target_va,
-                offset,
-                ro,
-                syscall::MAP_READ,
-            )
+            // SAFETY: the caller's contract covers the target span.
+            unsafe {
+                syscall::mem_map(
+                    self.cap,
+                    target_aspace,
+                    target_va,
+                    offset,
+                    ro,
+                    syscall::MAP_READ,
+                )
+            }
             .ok()?;
         }
         if ro < num_pages
         {
-            syscall::mem_map(
-                self.cap,
-                target_aspace,
-                target_va + ro * PAGE_SIZE,
-                offset + ro,
-                num_pages - ro,
-                prot,
-            )
+            // SAFETY: the caller's contract covers the target span.
+            unsafe {
+                syscall::mem_map(
+                    self.cap,
+                    target_aspace,
+                    target_va + ro * PAGE_SIZE,
+                    offset + ro,
+                    num_pages - ro,
+                    prot,
+                )
+            }
             .ok()?;
         }
         self.cursor += num_pages;
@@ -349,11 +397,16 @@ pub struct ChildTlsMeta
 /// template. When the binary has no `PT_TLS` segment (or it is empty),
 /// returns `(0, ChildTlsMeta::default())` without consuming a backing
 /// page — matching [`tls_backing_pages`].
+///
+/// # Safety
+/// `target_aspace` must name a child's address space, never init's own: the
+/// function places pages into it at VAs the child's layout chooses, without
+/// checking what init holds there.
 // similar_names: the TLS template's bounds (`tdata_start` / `tdata_end`) and
 // its base in each address space (`tls_base` / `tls_base_va`) are pairs named
 // for what they share.
 #[allow(clippy::similar_names)]
-fn place_main_tls(
+unsafe fn place_main_tls(
     arena: &mut BootArena,
     ehdr: &elf::Elf64Ehdr,
     module_bytes: &[u8],
@@ -397,43 +450,40 @@ fn place_main_tls(
     }
 
     let tls_base_va = tls_base + tls_base_offset;
-    arena.place_page(
-        target_aspace,
-        tls_base,
-        syscall::MAP_WRITABLE,
-        |scratch_va| {
-            // SAFETY: scratch_va is mapped writable and zeroed; the copy
-            // length is bounded by the tls_block_layout fit check above.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    module_bytes[tdata_start..tdata_end].as_ptr(),
-                    scratch_va as *mut u8,
-                    seg.filesz as usize,
-                );
-            }
-            if let Some(t) = rela
-            {
-                let table =
-                    &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
-                // SAFETY: the template region [0, filesz) was just populated
-                // and stays mapped writable for the rest of this closure.
-                let template = unsafe {
-                    core::slice::from_raw_parts_mut(scratch_va as *mut u8, seg.filesz as usize)
-                };
-                let _ = elf::apply_relative_relocs(
-                    table,
-                    arch::current::EXPECTED_ELF_MACHINE,
-                    bias,
-                    seg.vaddr,
-                    template,
-                );
-            }
-            // SAFETY: scratch_va is mapped writable; the block fits one page.
-            unsafe {
-                process_abi::tls_install_tcb(scratch_va as *mut u8, tls_base_offset, tls_base_va);
-            }
-        },
-    )?;
+    let populate = |scratch_va: u64| {
+        // SAFETY: scratch_va is mapped writable and zeroed; the copy
+        // length is bounded by the tls_block_layout fit check above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                module_bytes[tdata_start..tdata_end].as_ptr(),
+                scratch_va as *mut u8,
+                seg.filesz as usize,
+            );
+        }
+        if let Some(t) = rela
+        {
+            let table = &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
+            // SAFETY: the template region [0, filesz) was just populated
+            // and stays mapped writable for the rest of this closure.
+            let template = unsafe {
+                core::slice::from_raw_parts_mut(scratch_va as *mut u8, seg.filesz as usize)
+            };
+            let _ = elf::apply_relative_relocs(
+                table,
+                arch::current::EXPECTED_ELF_MACHINE,
+                bias,
+                seg.vaddr,
+                template,
+            );
+        }
+        // SAFETY: scratch_va is mapped writable; the block fits one page.
+        unsafe {
+            process_abi::tls_install_tcb(scratch_va as *mut u8, tls_base_offset, tls_base_va);
+        }
+    };
+    // SAFETY: the caller's contract: `target_aspace` is a child's address space,
+    // never init's own.
+    unsafe { arena.place_page(target_aspace, tls_base, syscall::MAP_WRITABLE, populate) }?;
 
     Some((tls_base_va, meta))
 }
@@ -448,7 +498,12 @@ fn place_main_tls(
 /// page-aligned, so the page counts are bias-invariant). Returns the number
 /// of relocations applied; the caller checks it equals the validated table
 /// count.
-fn load_elf_into_arena(
+///
+/// # Safety
+/// `target_aspace` must name a child's address space, never init's own: the
+/// function places pages into it at VAs the child's layout chooses, without
+/// checking what init holds there.
+unsafe fn load_elf_into_arena(
     arena: &mut BootArena,
     ehdr: &elf::Elf64Ehdr,
     module_bytes: &[u8],
@@ -503,29 +558,34 @@ fn load_elf_into_arena(
             _ => 0,
         };
 
-        arena.place_segment(
-            target_aspace,
-            first_page,
-            num_pages,
-            prot,
-            ro_head_pages,
-            |span| {
-                let copy_len = file_data.len().min(seg.memsz as usize);
-                span[dest_offset..dest_offset + copy_len].copy_from_slice(&file_data[..copy_len]);
-                // Writable segments only, matching the kernel's init applier: a
-                // target in text/rodata goes unapplied and the caller's
-                // applied-count check rejects the image.
-                if seg.writable
-                    && let Some(t) = rela
-                {
-                    let table =
-                        &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
-                    let seg_span = &mut span[dest_offset..dest_offset + seg.memsz as usize];
-                    applied +=
-                        elf::apply_relative_relocs(table, machine, bias, seg.vaddr, seg_span);
-                }
-            },
-        )?;
+        // SAFETY: the caller's contract: `target_aspace` is a child's address space,
+        // never init's own.
+        unsafe {
+            arena.place_segment(
+                target_aspace,
+                first_page,
+                num_pages,
+                prot,
+                ro_head_pages,
+                |span| {
+                    let copy_len = file_data.len().min(seg.memsz as usize);
+                    span[dest_offset..dest_offset + copy_len]
+                        .copy_from_slice(&file_data[..copy_len]);
+                    // Writable segments only, matching the kernel's init applier: a
+                    // target in text/rodata goes unapplied and the caller's
+                    // applied-count check rejects the image.
+                    if seg.writable
+                        && let Some(t) = rela
+                    {
+                        let table = &module_bytes
+                            [t.file_offset as usize..(t.file_offset + t.size) as usize];
+                        let seg_span = &mut span[dest_offset..dest_offset + seg.memsz as usize];
+                        applied +=
+                            elf::apply_relative_relocs(table, machine, bias, seg.vaddr, seg_span);
+                    }
+                },
+            )
+        }?;
     }
 
     Some(applied)
@@ -634,11 +694,16 @@ struct MemmgrCaps
 
 /// Populate memmgr's `ProcessInfo` page from `arena` and map it read-only
 /// into `target_aspace`.
+///
+/// # Safety
+/// `target_aspace` must name a child's address space, never init's own: the
+/// function places pages into it at VAs the child's layout chooses, without
+/// checking what init holds there.
 // similar_names: memmgr's copies of its own objects are named by object and
 // holder (`mm_aspace_in_mm`, `mm_cspace_in_mm`); the names differ only in the
 // object kind, which is the distinction that matters.
 #[allow(clippy::similar_names)]
-fn populate_memmgr_info(
+unsafe fn populate_memmgr_info(
     arena: &mut BootArena,
     target_aspace: u32,
     caps: &MemmgrCaps,
@@ -655,43 +720,48 @@ fn populate_memmgr_info(
     let mm_sched_in_mm =
         syscall::cap_copy(caps.sched_baseline, caps.cspace, syscall::RIGHTS_ALL).ok()?;
 
-    arena.place_page(
-        target_aspace,
-        layout.process_info_va,
-        syscall::MAP_READ,
-        |scratch_va| {
-            // SAFETY: scratch_va is mapped writable and zeroed, one page.
-            let pi = unsafe { process_abi::process_info_mut(scratch_va) };
-            pi.version = PROCESS_ABI_VERSION;
-            pi.self_thread_cap = mm_thread_in_mm;
-            pi.self_aspace_cap = mm_aspace_in_mm;
-            pi.self_cspace_cap = mm_cspace_in_mm;
-            pi.sched_control_cap = mm_sched_in_mm;
-            pi.initial_priority = ipc::sched_policy::MEMMGR_PRIORITY;
-            pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
-            pi.creator_endpoint_cap = caps.creator_endpoint_slot;
-            pi.procmgr_endpoint_cap = 0;
-            pi.memmgr_endpoint_cap = 0;
-            pi.stdin_memory_cap = 0;
-            pi.stdout_memory_cap = 0;
-            pi.stderr_memory_cap = 0;
-            pi.log_send_cap = 0;
-            pi.stdin_data_notification_cap = 0;
-            pi.stdin_space_notification_cap = 0;
-            pi.stdout_data_notification_cap = 0;
-            pi.stdout_space_notification_cap = 0;
-            pi.stderr_data_notification_cap = 0;
-            pi.stderr_space_notification_cap = 0;
-            pi.stack_top_vaddr = layout.stack_top;
-            pi.stack_pages = stack_pages;
-            // memmgr's bespoke `_start` configures no TLS.
-            pi.main_tls_vaddr = 0;
-            // Infrastructure is never demand-paged (would recurse on its own
-            // faults); leave the pager unbound.
-            pi.pager_endpoint_cap = 0;
-            pi.pager_badge = 0;
-        },
-    )?;
+    let populate = |scratch_va: u64| {
+        // SAFETY: scratch_va is mapped writable and zeroed, one page.
+        let pi = unsafe { process_abi::process_info_mut(scratch_va) };
+        pi.version = PROCESS_ABI_VERSION;
+        pi.self_thread_cap = mm_thread_in_mm;
+        pi.self_aspace_cap = mm_aspace_in_mm;
+        pi.self_cspace_cap = mm_cspace_in_mm;
+        pi.sched_control_cap = mm_sched_in_mm;
+        pi.initial_priority = ipc::sched_policy::MEMMGR_PRIORITY;
+        pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
+        pi.creator_endpoint_cap = caps.creator_endpoint_slot;
+        pi.procmgr_endpoint_cap = 0;
+        pi.memmgr_endpoint_cap = 0;
+        pi.stdin_memory_cap = 0;
+        pi.stdout_memory_cap = 0;
+        pi.stderr_memory_cap = 0;
+        pi.log_send_cap = 0;
+        pi.stdin_data_notification_cap = 0;
+        pi.stdin_space_notification_cap = 0;
+        pi.stdout_data_notification_cap = 0;
+        pi.stdout_space_notification_cap = 0;
+        pi.stderr_data_notification_cap = 0;
+        pi.stderr_space_notification_cap = 0;
+        pi.stack_top_vaddr = layout.stack_top;
+        pi.stack_pages = stack_pages;
+        // memmgr's bespoke `_start` configures no TLS.
+        pi.main_tls_vaddr = 0;
+        // Infrastructure is never demand-paged (would recurse on its own
+        // faults); leave the pager unbound.
+        pi.pager_endpoint_cap = 0;
+        pi.pager_badge = 0;
+    };
+    // SAFETY: the caller's contract: `target_aspace` is a child's address space,
+    // never init's own.
+    unsafe {
+        arena.place_page(
+            target_aspace,
+            layout.process_info_va,
+            syscall::MAP_READ,
+            populate,
+        )
+    }?;
 
     Some(())
 }
@@ -735,7 +805,12 @@ pub fn bootstrap_memmgr(
     let init_aspace = info.aspace_cap;
     let module_memory_cap = crate::find_module_by_name(info, b"memmgr")?;
     let module_size = descriptor_for(info, module_memory_cap).map(|d| d.aux1)?;
-    let module_pages = (module_size + 0xFFF) / PAGE_SIZE;
+    let Some(module_pages) = module_scratch_pages(module_size)
+    else
+    {
+        log("init: FATAL: memmgr module too large for the scratch region");
+        return None;
+    };
 
     // The module Memory cap carries full rights (R+W+X+RETYPE): init retains
     // it as the module-source owner and donates it to memmgr's pool at reap,
@@ -743,14 +818,19 @@ pub fn bootstrap_memmgr(
     // load-time mapping so `mem_map`'s derive-from-cap path produces a strictly
     // read-only page (otherwise W+X cap rights trip W^X).
     let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP).ok()?;
-    syscall::mem_map(
-        module_ro,
-        init_aspace,
-        TEMP_MAP_BASE,
-        0,
-        module_pages,
-        syscall::MAP_READONLY,
-    )
+    // SAFETY: TEMP_MAP_BASE starts init's scratch region, unmapped between
+    // bootstrap steps; `module_scratch_pages` keeps the span below
+    // ELF_PAGE_TEMP_VA, and no Rust object of init lies in it.
+    unsafe {
+        syscall::mem_map(
+            module_ro,
+            init_aspace,
+            TEMP_MAP_BASE,
+            0,
+            module_pages,
+            syscall::MAP_READONLY,
+        )
+    }
     .ok()?;
     // SAFETY: module memory cap mapped read-only at TEMP_MAP_BASE.
     let module_bytes =
@@ -818,14 +898,18 @@ pub fn bootstrap_memmgr(
     log("created memmgr kernel objects");
     log("loading memmgr ELF segments");
 
+    // SAFETY: the target is the child address space `cap_create_aspace` retyped
+    // above for this service, never init's own.
     let applied_relocs =
-        load_elf_into_arena(&mut arena, ehdr, module_bytes, mm_aspace, bias, rela)?;
+        unsafe { load_elf_into_arena(&mut arena, ehdr, module_bytes, mm_aspace, bias, rela) }?;
     if applied_relocs != total_relocs
     {
         log("init: memmgr reloc application mismatch");
         return None;
     }
-    let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages);
+    // SAFETY: the module's scratch mapping; `module_bytes` and the header
+    // borrowed from it are not used past this point.
+    let _ = unsafe { syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages) };
     let _ = syscall::cap_delete(module_ro);
     log("loaded memmgr ELF");
 
@@ -845,14 +929,20 @@ pub fn bootstrap_memmgr(
         creator_endpoint_slot: mm_creator_slot,
         sched_baseline: baseline_sched,
     };
-    populate_memmgr_info(&mut arena, mm_aspace, &mm_caps, stack_pages, &layout)?;
-    place_stack_and_ipc(
-        &mut arena,
-        mm_aspace,
-        layout.ipc_buffer_va,
-        layout.stack_top,
-        stack_pages,
-    )?;
+    // SAFETY: the target is the child address space `cap_create_aspace` retyped
+    // above for this service, never init's own.
+    unsafe { populate_memmgr_info(&mut arena, mm_aspace, &mm_caps, stack_pages, &layout) }?;
+    // SAFETY: the target is the child address space `cap_create_aspace` retyped
+    // above for this service, never init's own.
+    unsafe {
+        place_stack_and_ipc(
+            &mut arena,
+            mm_aspace,
+            layout.ipc_buffer_va,
+            layout.stack_top,
+            stack_pages,
+        )
+    }?;
 
     // Mint procmgr's badged SEND cap on memmgr's endpoint. Memmgr will
     // recognise calls bearing this badge as authorised for the
@@ -1134,12 +1224,16 @@ pub fn finalize_memmgr(
 
     assert_init_arena_front_bounded(init_arena_cap);
 
-    syscall::thread_configure(
-        mm.mm_thread,
-        mm.entry,
-        mm.stack_top_vaddr,
-        mm.process_info_va,
-    )
+    // SAFETY: the thread is bound to the service's own address space, never
+    // init's, so its entry state touches nothing init runs on.
+    unsafe {
+        syscall::thread_configure(
+            mm.mm_thread,
+            mm.entry,
+            mm.stack_top_vaddr,
+            mm.process_info_va,
+        )
+    }
     .ok()?;
     crate::start_thread(mm.mm_thread).ok()?;
     log("memmgr started");
@@ -1243,11 +1337,16 @@ struct ProcmgrCaps
 /// SEND caps per child arrives via procmgr's bootstrap round, not via
 /// `ProcessInfo`. The pre-installed badged SEND cap procmgr uses for
 /// its OWN `seraph::log!` writes lives in `pi.log_send_cap`.
+///
+/// # Safety
+/// `target_aspace` must name a child's address space, never init's own: the
+/// function places pages into it at VAs the child's layout chooses, without
+/// checking what init holds there.
 // similar_names: procmgr's copies of its own objects are named by object and
 // holder (`pm_aspace_in_pm`, `pm_cspace_in_pm`); the names differ only in the
 // object kind, which is the distinction that matters.
 #[allow(clippy::similar_names)]
-fn populate_procmgr_info(
+unsafe fn populate_procmgr_info(
     arena: &mut BootArena,
     target_aspace: u32,
     caps: &ProcmgrCaps,
@@ -1265,61 +1364,66 @@ fn populate_procmgr_info(
     let pm_sched_in_pm =
         syscall::cap_copy(caps.sched_baseline, caps.cspace, syscall::RIGHTS_ALL).ok()?;
 
-    arena.place_page(
-        target_aspace,
-        layout.process_info_va,
-        syscall::MAP_READ,
-        |scratch_va| {
-            // SAFETY: scratch_va is mapped writable and zeroed, one page.
-            let pi = unsafe { process_abi::process_info_mut(scratch_va) };
-            pi.version = PROCESS_ABI_VERSION;
-            pi.self_thread_cap = pm_thread_in_pm;
-            pi.self_aspace_cap = pm_aspace_in_pm;
-            pi.self_cspace_cap = pm_cspace_in_pm;
-            pi.sched_control_cap = pm_sched_in_pm;
-            pi.initial_priority = ipc::sched_policy::PROCMGR_PRIORITY;
-            pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
-            pi.creator_endpoint_cap = caps.creator_endpoint_slot;
-            // procmgr has no procmgr above it; leave zero.
-            pi.procmgr_endpoint_cap = 0;
-            pi.memmgr_endpoint_cap = caps.memmgr_endpoint_slot;
-            pi.stdin_memory_cap = 0;
-            pi.stdout_memory_cap = 0;
-            pi.stderr_memory_cap = 0;
-            // Procmgr's own `seraph::log!` surface. The slot holds a badged
-            // SEND cap on the log endpoint with badge `LOG_BADGE_PROCMGR`,
-            // derived by init via `cap_derive_badge`. Procmgr's std `_start`
-            // installs it via `::log::install_badged_cap`. The un-badged
-            // SEND procmgr uses to derive per-child badged caps is separate
-            // (delivered via procmgr's bootstrap round).
-            pi.log_send_cap = caps.log_send_slot;
-            pi.stdin_data_notification_cap = 0;
-            pi.stdin_space_notification_cap = 0;
-            pi.stdout_data_notification_cap = 0;
-            pi.stdout_space_notification_cap = 0;
-            pi.stderr_data_notification_cap = 0;
-            pi.stderr_space_notification_cap = 0;
-            pi.tls_template_vaddr = caps.tls.vaddr;
-            pi.tls_template_filesz = caps.tls.filesz;
-            pi.tls_template_memsz = caps.tls.memsz;
-            pi.tls_template_align = caps.tls.align;
-            pi.stack_top_vaddr = layout.stack_top;
-            pi.stack_pages = stack_pages;
-            // TLS block base, or zero when procmgr's image carries no PT_TLS.
-            pi.main_tls_vaddr = if caps.tls.memsz != 0
-            {
-                layout.tls_base
-            }
-            else
-            {
-                0
-            };
-            // Infrastructure is never demand-paged (would recurse on its own
-            // faults); leave the pager unbound.
-            pi.pager_endpoint_cap = 0;
-            pi.pager_badge = 0;
-        },
-    )?;
+    let populate = |scratch_va: u64| {
+        // SAFETY: scratch_va is mapped writable and zeroed, one page.
+        let pi = unsafe { process_abi::process_info_mut(scratch_va) };
+        pi.version = PROCESS_ABI_VERSION;
+        pi.self_thread_cap = pm_thread_in_pm;
+        pi.self_aspace_cap = pm_aspace_in_pm;
+        pi.self_cspace_cap = pm_cspace_in_pm;
+        pi.sched_control_cap = pm_sched_in_pm;
+        pi.initial_priority = ipc::sched_policy::PROCMGR_PRIORITY;
+        pi.ipc_buffer_vaddr = layout.ipc_buffer_va;
+        pi.creator_endpoint_cap = caps.creator_endpoint_slot;
+        // procmgr has no procmgr above it; leave zero.
+        pi.procmgr_endpoint_cap = 0;
+        pi.memmgr_endpoint_cap = caps.memmgr_endpoint_slot;
+        pi.stdin_memory_cap = 0;
+        pi.stdout_memory_cap = 0;
+        pi.stderr_memory_cap = 0;
+        // Procmgr's own `seraph::log!` surface. The slot holds a badged
+        // SEND cap on the log endpoint with badge `LOG_BADGE_PROCMGR`,
+        // derived by init via `cap_derive_badge`. Procmgr's std `_start`
+        // installs it via `::log::install_badged_cap`. The un-badged
+        // SEND procmgr uses to derive per-child badged caps is separate
+        // (delivered via procmgr's bootstrap round).
+        pi.log_send_cap = caps.log_send_slot;
+        pi.stdin_data_notification_cap = 0;
+        pi.stdin_space_notification_cap = 0;
+        pi.stdout_data_notification_cap = 0;
+        pi.stdout_space_notification_cap = 0;
+        pi.stderr_data_notification_cap = 0;
+        pi.stderr_space_notification_cap = 0;
+        pi.tls_template_vaddr = caps.tls.vaddr;
+        pi.tls_template_filesz = caps.tls.filesz;
+        pi.tls_template_memsz = caps.tls.memsz;
+        pi.tls_template_align = caps.tls.align;
+        pi.stack_top_vaddr = layout.stack_top;
+        pi.stack_pages = stack_pages;
+        // TLS block base, or zero when procmgr's image carries no PT_TLS.
+        pi.main_tls_vaddr = if caps.tls.memsz != 0
+        {
+            layout.tls_base
+        }
+        else
+        {
+            0
+        };
+        // Infrastructure is never demand-paged (would recurse on its own
+        // faults); leave the pager unbound.
+        pi.pager_endpoint_cap = 0;
+        pi.pager_badge = 0;
+    };
+    // SAFETY: the caller's contract: `target_aspace` is a child's address space,
+    // never init's own.
+    unsafe {
+        arena.place_page(
+            target_aspace,
+            layout.process_info_va,
+            syscall::MAP_READ,
+            populate,
+        )
+    }?;
 
     Some(())
 }
@@ -1327,7 +1431,12 @@ fn populate_procmgr_info(
 /// Place the stack and IPC buffer pages in `arena`, zeroed and mapped
 /// read-write into `target_aspace`. Consumes `stack_pages + 1` backing
 /// pages.
-fn place_stack_and_ipc(
+///
+/// # Safety
+/// `target_aspace` must name a child's address space, never init's own: the
+/// function places pages into it at VAs the child's layout chooses, without
+/// checking what init holds there.
+unsafe fn place_stack_and_ipc(
     arena: &mut BootArena,
     target_aspace: u32,
     ipc_buf_va: u64,
@@ -1338,14 +1447,20 @@ fn place_stack_and_ipc(
     let stack_base = stack_top - u64::from(stack_pages) * PAGE_SIZE;
     for i in 0..stack_pages
     {
-        arena.place_page(
-            target_aspace,
-            stack_base + u64::from(i) * PAGE_SIZE,
-            syscall::MAP_WRITABLE,
-            |_| {},
-        )?;
+        // SAFETY: the caller's contract: `target_aspace` is a child's address space,
+        // never init's own.
+        unsafe {
+            arena.place_page(
+                target_aspace,
+                stack_base + u64::from(i) * PAGE_SIZE,
+                syscall::MAP_WRITABLE,
+                |_| {},
+            )
+        }?;
     }
-    arena.place_page(target_aspace, ipc_buf_va, syscall::MAP_WRITABLE, |_| {})?;
+    // SAFETY: the caller's contract: `target_aspace` is a child's address space,
+    // never init's own.
+    unsafe { arena.place_page(target_aspace, ipc_buf_va, syscall::MAP_WRITABLE, |_| {}) }?;
     Some(())
 }
 
@@ -1446,18 +1561,28 @@ pub fn bootstrap_procmgr(
         .find(|d| d.slot == module_memory_cap)
         .map(|d| d.aux1)?;
 
-    let module_pages = (module_size + 0xFFF) / PAGE_SIZE;
+    let Some(module_pages) = module_scratch_pages(module_size)
+    else
+    {
+        log("init: FATAL: procmgr module too large for the scratch region");
+        return None;
+    };
 
     // Derive a read-only child cap (see `bootstrap_memmgr` for rationale).
     let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP).ok()?;
-    syscall::mem_map(
-        module_ro,
-        init_aspace,
-        TEMP_MAP_BASE,
-        0,
-        module_pages,
-        syscall::MAP_READONLY,
-    )
+    // SAFETY: TEMP_MAP_BASE starts init's scratch region, unmapped between
+    // bootstrap steps; `module_scratch_pages` keeps the span below
+    // ELF_PAGE_TEMP_VA, and no Rust object of init lies in it.
+    unsafe {
+        syscall::mem_map(
+            module_ro,
+            init_aspace,
+            TEMP_MAP_BASE,
+            0,
+            module_pages,
+            syscall::MAP_READONLY,
+        )
+    }
     .ok()?;
 
     // SAFETY: module memory cap is now mapped read-only at TEMP_MAP_BASE.
@@ -1530,8 +1655,10 @@ pub fn bootstrap_procmgr(
     log("created procmgr kernel objects");
     log("loading procmgr ELF segments");
 
+    // SAFETY: the target is the child address space `cap_create_aspace` retyped
+    // above for this service, never init's own.
     let applied_relocs =
-        load_elf_into_arena(&mut arena, ehdr, module_bytes, pm_aspace, bias, rela)?;
+        unsafe { load_elf_into_arena(&mut arena, ehdr, module_bytes, pm_aspace, bias, rela) }?;
     if applied_relocs != total_relocs
     {
         log("init: procmgr reloc application mismatch");
@@ -1543,17 +1670,23 @@ pub fn bootstrap_procmgr(
     // std-using so the std runtime's `_start` accesses thread-local statics
     // (e.g. `IPC_BUF_TLS`) before user `main` runs; without a configured TLS
     // block, the first such access page-faults at NULL.
-    let (pm_tls_base_va, pm_tls_meta) = place_main_tls(
-        &mut arena,
-        ehdr,
-        module_bytes,
-        pm_aspace,
-        layout.tls_base,
-        bias,
-        rela,
-    )?;
+    // SAFETY: the target is the child address space `cap_create_aspace` retyped
+    // above for this service, never init's own.
+    let (pm_tls_base_va, pm_tls_meta) = unsafe {
+        place_main_tls(
+            &mut arena,
+            ehdr,
+            module_bytes,
+            pm_aspace,
+            layout.tls_base,
+            bias,
+            rela,
+        )
+    }?;
 
-    let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages);
+    // SAFETY: the module's scratch mapping; `module_bytes` and the header
+    // borrowed from it are not used past this point.
+    let _ = unsafe { syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages) };
     let _ = syscall::cap_delete(module_ro);
 
     log("loaded procmgr ELF");
@@ -1647,23 +1780,33 @@ pub fn bootstrap_procmgr(
         tls: pm_tls_meta,
         sched_baseline: baseline_sched,
     };
-    populate_procmgr_info(&mut arena, pm_aspace, &pm_caps, stack_pages, &layout)?;
+    // SAFETY: the target is the child address space `cap_create_aspace` retyped
+    // above for this service, never init's own.
+    unsafe { populate_procmgr_info(&mut arena, pm_aspace, &pm_caps, stack_pages, &layout) }?;
 
-    place_stack_and_ipc(
-        &mut arena,
-        pm_aspace,
-        layout.ipc_buffer_va,
-        layout.stack_top,
-        stack_pages,
-    )?;
+    // SAFETY: the target is the child address space `cap_create_aspace` retyped
+    // above for this service, never init's own.
+    unsafe {
+        place_stack_and_ipc(
+            &mut arena,
+            pm_aspace,
+            layout.ipc_buffer_va,
+            layout.stack_top,
+            stack_pages,
+        )
+    }?;
 
-    syscall::thread_configure_with_tls(
-        pm_thread,
-        entry,
-        layout.stack_top,
-        layout.process_info_va,
-        pm_tls_base_va,
-    )
+    // SAFETY: the thread is bound to the service's own address space, never
+    // init's, so its entry state touches nothing init runs on.
+    unsafe {
+        syscall::thread_configure_with_tls(
+            pm_thread,
+            entry,
+            layout.stack_top,
+            layout.process_info_va,
+            pm_tls_base_va,
+        )
+    }
     .ok()?;
     // **Don't** thread_start here — procmgr's `_start` calls
     // `heap_bootstrap` which calls memmgr's `REQUEST_MEMORY_CAPS`, so memmgr

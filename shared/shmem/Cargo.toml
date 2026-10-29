@@ -9,7 +9,6 @@ publish.workspace = true
 # single-consumer byte ring on top. Consumed by the ruststd pipe backing
 # `std::process::Child::stdin/stdout`.
 [lib]
-test = false
 doctest = false
 
 [dependencies]

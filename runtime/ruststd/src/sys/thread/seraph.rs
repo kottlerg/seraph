@@ -331,9 +331,14 @@ impl Thread {
         let sp = stack.sp();
         let entry_addr = thread_entry as extern "C" fn(u64) -> ! as usize as u64;
 
-        if let Err(_) =
+        // SAFETY: the thread is bound to this process's own address space;
+        // `thread_entry` is an `extern "C" fn(u64) -> !` taking `args`; `sp` is
+        // the top of `stack`, allocated above for this thread alone and freed
+        // only after it exits (the reaper); `tls_base` is 0 or the thread
+        // pointer of the TLS block `alloc_thread_tls` built above for it alone.
+        if let Err(_) = unsafe {
             syscall::thread_configure_with_tls(thread_cap, entry_addr, sp, args as u64, tls_base)
-        {
+        } {
             // The thread was created but never started; deleting its cap drives
             // `dealloc_object(Thread)` (drain gates pass immediately — it never
             // ran) to reclaim the retype slot + ancestor bytes.
@@ -869,7 +874,11 @@ extern "C" fn thread_entry(arg: u64) -> ! {
     // SAFETY: arg was produced via `Box::into_raw(Box::new(SpawnArgs {..}))`
     // in Thread::new; this is the sole consumer.
     let args = unsafe { Box::from_raw(arg as *mut SpawnArgs) };
-    let _ = syscall::ipc_buffer_set(args.ipc_buffer_vaddr);
+    // SAFETY: `ipc_buffer_vaddr` is the page-aligned page Thread::new heap-
+    // allocated for this thread alone; no Rust object lives in it, and std
+    // reaches it only through the raw `current_ipc_buf` pointer, holding no
+    // reference across an IPC syscall.
+    let _ = unsafe { syscall::ipc_buffer_set(args.ipc_buffer_vaddr) };
     crate::os::seraph::set_current_ipc_buf(args.ipc_buffer_vaddr as *mut u64);
 
     // SAFETY: args.init was produced via `Box::into_raw(init)` in

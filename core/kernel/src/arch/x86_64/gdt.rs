@@ -82,6 +82,15 @@ pub struct Tss
 /// Size of the I/O Permission Bitmap in bytes (65536 ports / 8 bits each).
 pub const IOPB_SIZE: usize = 8192;
 
+/// `Tss::iopb_offset` while the CPU's TSS bitmap is current: the offset of
+/// `TssWithIopb::iopb`.
+const IOPB_OFFSET_VALID: u16 = core::mem::size_of::<Tss>() as u16;
+
+/// `Tss::iopb_offset` that places the bitmap past the TSS limit, so every
+/// ring-3 port access raises `#GP` until the CPU reloads its bitmap
+/// ([`reload_invalidated_iopb`]).
+const IOPB_OFFSET_INVALID: u16 = u16::MAX;
+
 /// TSS extended with an I/O Permission Bitmap.
 ///
 /// The hardware TSS is 104 bytes; immediately following it is the 8 KiB IOPB
@@ -89,11 +98,17 @@ pub const IOPB_SIZE: usize = 8192;
 /// all-ones terminator byte (Intel SDM §8.5.3 requires the byte at IOPB limit
 /// to be 0xFF).
 ///
-/// The GDT TSS descriptor limit must cover the entire struct:
-///   limit = `size_of`::<TssWithIopb>() - 1
+/// The GDT TSS descriptor limit reaches the terminator:
+///   limit = `offset_of!(TssWithIopb, terminator)`
 ///
-/// `iopb_offset` in the `Tss` is 104 (the offset of `iopb` within this struct).
-#[repr(C, packed)]
+/// `iopb_offset` in the `Tss` is [`IOPB_OFFSET_VALID`] (104, the offset of
+/// `iopb` within this struct) while the CPU's bitmap is current, and
+/// [`IOPB_OFFSET_INVALID`] after [`invalidate_all_iopbs`] until the CPU reloads
+/// it. Every field has alignment 1 (`Tss` is packed), so `repr(C)` lays them
+/// out with no padding; `align(2)` makes every instance, the per-CPU slab's
+/// elements included, 2-byte aligned, so `iopb_offset` (at offset 102) is a
+/// naturally aligned `u16` that another CPU can store atomically.
+#[repr(C, align(2))]
 pub struct TssWithIopb
 {
     /// The base TSS (must be at offset 0).
@@ -137,7 +152,7 @@ static mut TSS: TssWithIopb = TssWithIopb {
         _ist7: 0,
         _reserved2: 0,
         _reserved3: 0,
-        iopb_offset: 104, // offset of TssWithIopb::iopb within the struct
+        iopb_offset: IOPB_OFFSET_VALID,
     },
     iopb: [0xFF; IOPB_SIZE], // all ports denied by default
     terminator: 0xFF,
@@ -161,6 +176,11 @@ static mut GDT: [u64; 7] = [0u64; 7];
 #[cfg(not(test))]
 static AP_TSS_PTR: core::sync::atomic::AtomicPtr<TssWithIopb> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Number of entries in the [`AP_TSS_PTR`] slab (the boot CPU count), set
+/// with it by [`init_ap_storage`].
+#[cfg(not(test))]
+static AP_TSS_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Base pointer for the dynamically-sized per-CPU `[[u64; 7]; cpu_count]`
 /// AP-GDT array. Slot indexing matches [`AP_TSS_PTR`].
@@ -192,9 +212,10 @@ pub fn init_ap_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocat
             let term = core::ptr::addr_of_mut!((*slot).terminator);
             core::ptr::write(term, 0xFF);
             let ofs = core::ptr::addr_of_mut!((*slot).tss.iopb_offset);
-            core::ptr::write_unaligned(ofs, core::mem::size_of::<Tss>() as u16);
+            core::ptr::write_unaligned(ofs, IOPB_OFFSET_VALID);
         }
     }
+    AP_TSS_COUNT.store(cpu_count, core::sync::atomic::Ordering::Relaxed);
     AP_TSS_PTR.store(tss_ptr, core::sync::atomic::Ordering::Release);
 
     let gdt_bytes = cpu_count * core::mem::size_of::<[u64; 7]>();
@@ -250,15 +271,14 @@ pub fn data_desc_64(dpl: u8) -> u64
 /// into GDT\[6\] (0x30).
 ///
 /// Encoding:
-/// - limit = sizeof(TssWithIopb) − 1 = 8296 (covers TSS + IOPB + terminator)
+/// - limit = offset of the terminator byte = 8296 (covers TSS + IOPB + terminator)
 /// - type = 0x89: P=1, DPL=0, 64-bit TSS available
 ///
-/// The limit must cover the full `TssWithIopb` struct so the CPU can
-/// walk the I/O permission bitmap when a user thread executes I/O instructions.
+/// The limit must reach the terminator so the CPU can walk the I/O
+/// permission bitmap when a user thread executes I/O instructions.
 pub fn tss_desc(tss_addr: u64) -> (u64, u64)
 {
-    // Use TssWithIopb size so the descriptor covers the IOPB region.
-    let limit: u64 = (core::mem::size_of::<TssWithIopb>() as u64) - 1;
+    let limit: u64 = core::mem::offset_of!(TssWithIopb, terminator) as u64;
 
     let low: u64 = (limit & 0xFFFF) // [15:0]  limit[15:0]
         | ((tss_addr & 0x00FF_FFFF) << 16) // [39:16] base[23:0]
@@ -297,10 +317,10 @@ pub unsafe fn init(kernel_stack_top: u64, ist1_top: u64, ist2_top: u64)
     tss.rsp0 = kernel_stack_top;
     tss.ist1 = ist1_top;
     tss.ist2 = ist2_top;
-    // iopb_offset = 104 = offsetof(TssWithIopb, iopb) = size_of::<Tss>().
-    // This is correct because TssWithIopb is #[repr(C, packed)] and Tss is
-    // exactly 104 bytes, so iopb follows immediately.
-    tss.iopb_offset = core::mem::size_of::<Tss>() as u16;
+    // iopb_offset = 104 = offsetof(TssWithIopb, iopb) = size_of::<Tss>():
+    // every TssWithIopb field has alignment 1 and Tss is exactly 104 bytes, so
+    // iopb follows immediately.
+    tss.iopb_offset = IOPB_OFFSET_VALID;
 
     // Fill GDT slots.
     gdt[0] = 0; // null
@@ -483,7 +503,7 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
                 _ist7: 0,
                 _reserved2: 0,
                 _reserved3: 0,
-                iopb_offset: core::mem::size_of::<Tss>() as u16,
+                iopb_offset: IOPB_OFFSET_VALID,
             },
         );
         // The IOPB and terminator are pre-filled with 0xFF by
@@ -586,23 +606,18 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
     }
 }
 
-/// Copy `iopb` into the TSS I/O Permission Bitmap for the current CPU.
-///
-/// If `iopb` is `Some`, the bitmap is copied from the thread's per-thread IOPB.
-/// If `None`, the bitmap is filled with 0xFF (all ports denied).
-///
-/// Called on every context switch (with `None` when the incoming thread has
-/// no port bindings) and by the I/O-port bind syscall when it binds the calling thread.
+/// The current CPU's `TssWithIopb`.
 ///
 /// # Safety
-/// Must be called with interrupts disabled or from a single-CPU context.
 /// GS-base must point to a valid `PerCpuData` with `tss_ptr` set.
 #[cfg(not(test))]
-pub unsafe fn load_iopb(iopb: Option<&[u8; IOPB_SIZE]>)
+unsafe fn current_tss() -> *mut TssWithIopb
 {
     let tss_ptr: u64;
     // SAFETY: gs:[32] == PerCpuData::tss_ptr (PERCPU_TSS_PTR_OFFSET=32); valid
-    // after percpu::init_bsp() / init_ap() sets GS-base and tss_ptr.
+    // after percpu::init_bsp() / init_ap() sets GS-base and tss_ptr. The load
+    // reads one GS-relative quadword, clobbers only the output register, and
+    // leaves the flags and stack untouched.
     unsafe {
         core::arch::asm!(
             "mov {}, gs:[32]",
@@ -610,13 +625,137 @@ pub unsafe fn load_iopb(iopb: Option<&[u8; IOPB_SIZE]>)
             options(nostack, readonly, preserves_flags),
         );
     }
-    // SAFETY: tss_ptr points to the current CPU's TssWithIopb; interrupts
-    // disabled by caller; no concurrent access.
-    let tss_iopb = unsafe { &mut (*(tss_ptr as *mut TssWithIopb)).iopb };
+    tss_ptr as *mut TssWithIopb
+}
+
+/// The `iopb_offset` field of `tss`, as an atomic another CPU may store to.
+///
+/// # Safety
+/// `tss` points to a live `TssWithIopb`.
+#[cfg(not(test))]
+unsafe fn iopb_offset_of<'a>(tss: *mut TssWithIopb) -> &'a core::sync::atomic::AtomicU16
+{
+    // cast_ptr_alignment: `TssWithIopb` is `align(2)` and `iopb_offset` sits
+    // at an even offset, so the field is 2-byte aligned.
+    #[allow(clippy::cast_ptr_alignment)]
+    // SAFETY: caller contract; the field is a naturally aligned u16 (above),
+    // and every access to it after boot goes through this atomic view.
+    unsafe {
+        &*core::ptr::addr_of_mut!((*tss).tss.iopb_offset).cast::<core::sync::atomic::AtomicU16>()
+    }
+}
+
+/// Copy `iopb` into the TSS I/O Permission Bitmap for the current CPU and
+/// mark the bitmap current.
+///
+/// If `iopb` is `Some`, the bitmap is copied from the thread's per-thread IOPB.
+/// If `None`, the bitmap is filled with 0xFF (all ports denied).
+///
+/// Called on every context switch: for an incoming non-idle thread under its
+/// `sched_lock`, in the hold that marks it running (with `None` when it has
+/// no port bindings), and with `None` for the idle thread, which runs no
+/// ring-3 code. Also called by the I/O-port bind syscall when it binds the
+/// calling thread, and by [`reload_invalidated_iopb`].
+///
+/// # Safety
+/// Must be called with interrupts disabled or from a single-CPU context.
+/// GS-base must point to a valid `PerCpuData` with `tss_ptr` set.
+#[cfg(not(test))]
+pub unsafe fn load_iopb(iopb: Option<&[u8; IOPB_SIZE]>)
+{
+    // SAFETY: caller contract.
+    let tss = unsafe { current_tss() };
+    // SAFETY: tss points to the current CPU's TssWithIopb; interrupts disabled
+    // by caller, so this CPU does not reload it concurrently; other CPUs only
+    // store `iopb_offset`, atomically.
+    let tss_iopb = unsafe { &mut *core::ptr::addr_of_mut!((*tss).iopb) };
     match iopb
     {
         Some(src) => tss_iopb.copy_from_slice(src),
         None => tss_iopb.fill(0xFF),
+    }
+    // Release: the bitmap bytes precede the offset that makes them live.
+    // SAFETY: tss is live.
+    unsafe { iopb_offset_of(tss) }.store(IOPB_OFFSET_VALID, core::sync::atomic::Ordering::Release);
+}
+
+/// Make every CPU reload its TSS I/O permission bitmap before its next ring-3
+/// port access.
+///
+/// Called after a thread's bitmap changed while it may be running on another
+/// CPU: an `IoPort` binding withdrawn
+/// (`cap::ioport_bindings::withdraw_everywhere`), or a `SYS_IOPORT_BIND` of a
+/// thread other than the caller. Sets every CPU's
+/// `iopb_offset` to [`IOPB_OFFSET_INVALID`], so the next port access on each
+/// raises `#GP`, whose handler reloads the running thread's current bitmap
+/// ([`reload_invalidated_iopb`]) and retries the instruction. A CPU that
+/// context-switches in the meantime loads its incoming thread's bitmap (the
+/// all-denied one for a thread with no bindings) under that thread's
+/// `sched_lock` and marks it current, which is equally fresh; only the idle
+/// thread, which runs no ring-3 code, gets its all-denied bitmap outside a
+/// thread lock.
+/// The trailing fence makes the stores visible to every CPU before this
+/// returns, so no port access after the return reads a stale bitmap.
+#[cfg(not(test))]
+pub fn invalidate_all_iopbs()
+{
+    use core::sync::atomic::Ordering;
+
+    // SAFETY: the BSP TSS static is live for the kernel's lifetime.
+    unsafe { iopb_offset_of(core::ptr::addr_of_mut!(TSS)) }
+        .store(IOPB_OFFSET_INVALID, Ordering::Relaxed);
+    let slab = AP_TSS_PTR.load(Ordering::Acquire);
+    if !slab.is_null()
+    {
+        for cpu in 1..AP_TSS_COUNT.load(Ordering::Relaxed)
+        {
+            // SAFETY: the slab holds AP_TSS_COUNT live entries for the kernel's
+            // lifetime.
+            unsafe { iopb_offset_of(slab.add(cpu)) }.store(IOPB_OFFSET_INVALID, Ordering::Relaxed);
+        }
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+}
+
+/// Reload the running thread's I/O permission bitmap into this CPU's TSS if
+/// [`invalidate_all_iopbs`] invalidated it. Called from the `#GP` handler for
+/// a fault taken in ring 3; returns `true` when it reloaded a bitmap, so the
+/// faulting instruction should be retried, and `false` when the fault is to be
+/// handled as a genuine one.
+///
+/// A retried instruction that faults again finds the offset current and is
+/// handled as genuine, so a thread denied the port takes exactly one retry.
+///
+/// # Safety
+/// `#GP` handler context for a ring-3 fault: interrupts disabled, no lock
+/// held, the running thread is a user thread.
+#[cfg(not(test))]
+pub unsafe fn reload_invalidated_iopb() -> bool
+{
+    // SAFETY: GS-base is valid in exception context.
+    let tss = unsafe { current_tss() };
+    // SAFETY: tss is live.
+    if unsafe { iopb_offset_of(tss) }.load(core::sync::atomic::Ordering::Relaxed)
+        != IOPB_OFFSET_INVALID
+    {
+        return false;
+    }
+    // SAFETY: a ring-3 fault has a running user thread (contract).
+    let tcb = unsafe { crate::syscall::current_tcb() };
+    if tcb.is_null()
+    {
+        return false;
+    }
+    // The bitmap and its pointer are owned by the thread's sched_lock, which
+    // the withdrawal walk holds while it rebuilds them.
+    // SAFETY: tcb is the running thread; lock_raw/unlock_raw paired.
+    unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        let iopb = (*tcb).iopb;
+        let reloaded = !iopb.is_null();
+        load_iopb(if reloaded { Some(&*iopb) } else { None });
+        (*tcb).sched_lock.unlock_raw(saved);
+        reloaded
     }
 }
 
@@ -656,14 +795,20 @@ mod tests
     use super::*;
 
     // Hardware contract: on a ring-3 I/O instruction the CPU reads the bitmap
-    // offset from the TSS (`iopb_offset`, written as 104 by the TSS
-    // initialisers) and walks the I/O permission bitmap up to the TSS
-    // descriptor's limit, which must reach the 0xFF terminator byte.
+    // offset from the TSS (`iopb_offset`: IOPB_OFFSET_VALID while the CPU's
+    // bitmap is current) and walks the I/O permission bitmap up to the TSS
+    // descriptor's limit, which must reach the 0xFF terminator byte; an
+    // offset past the limit (IOPB_OFFSET_INVALID) denies every port, which the
+    // lazy reload after a withdrawal relies on. Another CPU stores the offset
+    // atomically, so the field must be 2-byte aligned in every instance.
     #[test]
     fn tss_layout_and_descriptor_limit_cover_the_iopb_walk()
     {
         assert_eq!(core::mem::size_of::<Tss>(), 104);
-        assert_eq!(core::mem::offset_of!(TssWithIopb, iopb), 104);
+        assert_eq!(
+            core::mem::offset_of!(TssWithIopb, iopb),
+            usize::from(IOPB_OFFSET_VALID)
+        );
         let (lo, _hi) = tss_desc(0x1000);
         let limit = (lo & 0xFFFF) | (((lo >> 48) & 0xF) << 16);
         assert_eq!(
@@ -671,6 +816,9 @@ mod tests
             core::mem::offset_of!(TssWithIopb, terminator) as u64,
             "TSS descriptor limit must reach the IOPB terminator byte"
         );
+        assert!(u64::from(IOPB_OFFSET_INVALID) > limit);
+        assert_eq!(core::mem::align_of::<TssWithIopb>() % 2, 0);
+        assert_eq!(core::mem::offset_of!(Tss, iopb_offset) % 2, 0);
     }
 
     #[test]

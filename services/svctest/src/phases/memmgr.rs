@@ -36,6 +36,10 @@ pub fn phases() -> &'static [Phase]
             name: "memmgr_stray_cap_flood",
             run: stray_cap_flood_phase,
         },
+        Phase {
+            name: "grant_retyped_unmappable",
+            run: grant_retyped_unmappable_phase,
+        },
     ]
 }
 
@@ -248,6 +252,47 @@ pub fn donate_unauthorized_phase(_: &Caps)
 
     release_one_page(grant, phys_base);
     std::os::seraph::log!("non-procmgr donation refused with UNAUTHORIZED");
+}
+
+/// A process cannot map the slot pages it funded its own `CSpace` with. A
+/// one-page memmgr grant augments svctest's `CSpace`, and `mem_map` of that
+/// page, writable or read-only, is refused with `InvalidArgument` (the
+/// retype/map boundary of docs/capability-model.md § Typed Memory). The
+/// donated page stays in the `CSpace`'s pool until svctest exits; memmgr
+/// reclaims it then with the rest of the grant.
+pub fn grant_retyped_unmappable_phase(_: &Caps)
+{
+    use syscall::{MAP_READ, MAP_WRITABLE};
+
+    let info = startup_info();
+    let (grant, _phys_base) = request_one_page();
+    syscall::cap_create_cspace(grant, info.self_cspace, 1)
+        .expect("augment of svctest's CSpace from the grant failed");
+
+    let range = std::os::seraph::reserve_pages(1).expect("reserve_pages");
+    let va = range.va_start();
+    let refused = syscall_abi::SyscallError::InvalidArgument as i64;
+    for prot in [MAP_WRITABLE, MAP_READ]
+    {
+        // SAFETY: `range` is a fresh page reservation from the per-process
+        // arena, owned here: VA no Rust object or IPC page occupies.
+        let mapped = unsafe { syscall::mem_map(grant, info.self_aspace, va, 0, 1, prot) };
+        if mapped.is_ok()
+        {
+            // SAFETY: as for the map above.
+            let _ = unsafe { syscall::mem_unmap(info.self_aspace, va, 1) };
+        }
+        assert_eq!(
+            mapped,
+            Err(refused),
+            "mem_map of the grant page backing svctest's CSpace slots was not refused"
+        );
+    }
+
+    std::os::seraph::unreserve_pages(range);
+    // The donation holds its own reference on the grant's memory.
+    syscall::cap_delete(grant).expect("cap_delete of grant");
+    std::os::seraph::log!("retyped grant page refused by mem_map");
 }
 
 /// One stray-cap flood case: a message memmgr refuses or answers with no

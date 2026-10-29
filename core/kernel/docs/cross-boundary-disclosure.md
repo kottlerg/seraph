@@ -3,9 +3,9 @@
 Enumerates every value the kernel emits across the user/kernel boundary and
 classifies it toward the goal that no kernel virtual address or kernel pointer
 escapes to userspace — a prerequisite for kernel address-space layout
-randomization (KASLR). Known open disclosures: kernel state in
-donated memory that the donor can still map
-([#433](https://github.com/kottlerg/seraph/issues/433)), mirrored console diagnostics
+randomization (KASLR). Known open disclosures: kernel state retyped into
+donated memory the donor had already mapped
+([#577](https://github.com/kottlerg/seraph/issues/577)), mirrored console diagnostics
 ([#440](https://github.com/kottlerg/seraph/issues/440)), and unzeroed bootloader
 frames ([#439](https://github.com/kottlerg/seraph/issues/439)).
 
@@ -17,7 +17,7 @@ KASLR randomizes the kernel's virtual base. A single kernel virtual address (VA)
 kernel pointer, or value derived from one that reaches userspace defeats base
 randomization. This inventory audits the kernel's complete output surface and
 records, per surface, why it carries no kernel VA or, for each known open
-disclosure ([#433](https://github.com/kottlerg/seraph/issues/433),
+disclosure ([#577](https://github.com/kottlerg/seraph/issues/577),
 [#439](https://github.com/kottlerg/seraph/issues/439),
 [#440](https://github.com/kottlerg/seraph/issues/440)), what it leaks. It is the
 standing reference the coding-standards rule "Cross-Boundary Data Hygiene"
@@ -166,11 +166,14 @@ slabs (the kernel stack with its saved kernel pointers and return addresses,
 the TCB, and the extended-state save area), and the sub-page bodies of
 endpoints, notifications, wait sets, and event queues (which hold TCB and
 source-object pointers) — plus the retype allocator's free-list links (offsets
-into the region, not addresses). The holder of the donating capability is
-trusted not to map what it has retyped away; the kernel does not yet enforce
-that boundary ([#433](https://github.com/kottlerg/seraph/issues/433)). Until
-it does, the claim that no kernel object state in donated memory reaches
-userspace holds only under that trust.
+into the region, not addresses). The donating capability cannot map what it
+has retyped away: `SYS_MEM_MAP` refuses a range below its retype bump cursor
+([docs/capability-model.md § Typed Memory](../../../docs/capability-model.md#typed-memory)).
+The converse order is open: a retype into pages the holder already maps puts
+kernel state behind a live user mapping
+([#577](https://github.com/kottlerg/seraph/issues/577)). Until that closes,
+the claim that no kernel object state in donated memory reaches userspace
+holds only for a donor that maps none of the region it retypes from.
 
 Memory the bootloader used is a related surface, whether it is donated
 through `reclaim_ranges` or returned by the memory map as usable and drained

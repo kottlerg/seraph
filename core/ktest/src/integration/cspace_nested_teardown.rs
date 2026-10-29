@@ -40,20 +40,20 @@ pub fn run(ctx: &TestContext) -> TestResult
     let baseline = available(memory)?;
 
     let mut chain = [0u32; DEPTH];
-    for (i, entry) in chain.iter_mut().enumerate()
+    let mut built = 0;
+    while built < DEPTH
     {
-        match cap_create_cspace(memory, 0, PAGES_PER_CSPACE)
+        let Ok(cs) = cap_create_cspace(memory, 0, PAGES_PER_CSPACE)
+        else
         {
-            Ok(cs) => *entry = cs,
-            Err(_) =>
+            for &cs in &chain[..built]
             {
-                for &cs in &chain[..i]
-                {
-                    cap_delete(cs).ok();
-                }
-                return Err("integration::cspace_nested_teardown: cap_create_cspace failed");
+                cap_delete(cs).ok();
             }
-        }
+            return Err("integration::cspace_nested_teardown: cap_create_cspace failed");
+        };
+        chain[built] = cs;
+        built += 1;
     }
 
     // Move each CSpace's capability into its predecessor, deepest first, so

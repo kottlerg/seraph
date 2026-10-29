@@ -87,7 +87,7 @@ it left the 8.3 slot
 ([fs-driver-protocol.md](../../docs/fs-driver-protocol.md) § Label 14
 and § Label 16). A failure before the 8.3 slot's write (a dropped LFN
 write) leaves the entry live, so the operation is undone, with the
-source's slots as they were on disk, without reading the device back.
+entry's slots as they were on disk, without reading the device back.
 When the 8.3 write itself failed, the device read decides: undone the
 same way while the entry is live; taken effect when the entry is
 deleted; and unsettled, with the node dropped, when the slot cannot be

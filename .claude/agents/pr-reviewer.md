@@ -111,18 +111,17 @@ discipline below has been applied end-to-end.
 7. CPU-count width. For every line the diff adds under `core/kernel/`,
    `core/boot/`, or an in-tree crate either one depends on, check the rules
    of `docs/coding-standards.md` § CPU-Count Width. Report each line that
-   introduces a structure with one entry or bit per CPU whose width does not
-   come from `MAX_CPUS`, a literal standing in for the CPU count or a
+   introduces a structure with one entry or bit per CPU whose width does
+   not come from `MAX_CPUS`, a literal standing in for the CPU count or a
    CPU-mask width, a fixed-width integer holding a set of CPUs, an `as`
    cast of a CPU index or count to a type that cannot represent `MAX_CPUS`,
    or code filling a fixed-width window an external interface defines that
-   neither rejects nor splits a CPU index the window cannot hold,
-   as a finding (it blocks when on the review surface, per
-   `docs/conventions.md` § Branch and PR Workflow): bucket Critical,
-   `must_violation` true, citing
-   that section, class `standards` (`correctness` when the width defect
-   misbehaves at a CPU count up to `MAX_CPUS`), and `introduced` set as
-   the schema defines for the mode. Most PRs owe no boundary boot
+   neither rejects nor splits a CPU index the window cannot hold, as a
+   finding (it blocks when on the review surface, per `docs/conventions.md`
+   § Branch and PR Workflow): bucket Critical, `must_violation` true,
+   citing that section, class `standards` (`correctness` when the width
+   defect misbehaves at a CPU count up to `MAX_CPUS`), and `introduced` set
+   as the schema defines for the mode. Most PRs owe no boundary boot
    (`docs/testing.md` § Coverage tiers), so this check is the gate for that
    defect class; do not discount a finding because a boot at the boundary
    CPU counts would catch it.

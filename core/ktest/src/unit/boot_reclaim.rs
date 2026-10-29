@@ -15,7 +15,7 @@
 //! userspace.
 
 use init_protocol::{CapType, InitInfo};
-use syscall::{MAP_READONLY, mem_map, mem_unmap};
+use syscall::{MAP_READ, mem_map, mem_unmap};
 
 use crate::{TestContext, TestResult};
 
@@ -53,7 +53,7 @@ fn window_is_zero(
 {
     // SAFETY: `PROBE_VA` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.
-    unsafe { mem_map(cap, ctx.aspace_cap, PROBE_VA, offset, pages, MAP_READONLY) }
+    unsafe { mem_map(cap, ctx.aspace_cap, PROBE_VA, offset, pages, MAP_READ) }
         .map_err(|_| "mem_map of a reclaim cap failed")?;
     let words = usize::try_from(pages * PAGE_SIZE / 8).map_err(|_| "probe window too large")?;
     let base = PROBE_VA as *const u64;

@@ -7,33 +7,66 @@
 //!
 //! Provides `init_serial()`, `init_framebuffer()`, and `console_write_fmt()` /
 //! `console_write_str()` used by the `bprint!`/`bprintln!` macros. Output goes
-//! to both the serial port and the framebuffer (when available). All state is
-//! static and unlocked; see `core/boot/docs/console.md` § Scope.
+//! to both the serial port and the framebuffer (when available). The
+//! framebuffer state sits behind a busy-flag cell that turns away panic
+//! re-entry; see `core/boot/docs/console.md` § Scope.
 
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::current::serial::{serial_init, serial_write_byte};
 use crate::framebuffer::FramebufferWriter;
 use boot_protocol::FramebufferInfo;
 
-/// Static console state; unlocked (see `core/boot/docs/console.md` § Scope).
-/// Referenced only by [`init_framebuffer`] and, while it holds
-/// [`CONSOLE_BUSY`], by [`console_write_str`].
-static mut CONSOLE: Console = Console { fb: None };
+/// Framebuffer console state, reached only through [`ConsoleCell::try_with`].
+static CONSOLE: ConsoleCell = ConsoleCell {
+    busy: AtomicBool::new(false),
+    state: UnsafeCell::new(Console { fb: None }),
+};
 
 /// Set by [`init_serial`] once the UART is programmed. Kept outside
-/// [`CONSOLE`] so a re-entered write can reach serial without referencing it.
+/// [`CONSOLE`] so a re-entered write can reach serial without touching it.
 static SERIAL_READY: AtomicBool = AtomicBool::new(false);
-
-/// Held by [`console_write_str`] while it references [`CONSOLE`]. A write
-/// that finds it set is a re-entry (the panic handler printing a panic raised
-/// inside an outer write) and goes to serial only.
-static CONSOLE_BUSY: AtomicBool = AtomicBool::new(false);
 
 /// Internal console state.
 struct Console
 {
     fb: Option<FramebufferWriter>,
+}
+
+/// The console state together with the flag that marks it in use, so the
+/// state is reachable only while the flag is held.
+struct ConsoleCell
+{
+    busy: AtomicBool,
+    state: UnsafeCell<Console>,
+}
+
+// SAFETY: the bootloader runs on a single boot thread with no console-touching
+// interrupt handlers. The one overlapping access is the panic handler
+// re-entering a console write on that same thread, which `try_with`'s busy
+// flag turns away before it forms a reference to `state`.
+unsafe impl Sync for ConsoleCell {}
+
+impl ConsoleCell
+{
+    /// Run `f` on the console state, or return `None` without running it when
+    /// a call is already in progress (a panic raised inside `f` whose handler
+    /// writes to the console). A panic inside `f` leaves the flag held, so
+    /// later output stays serial-only; the bootloader halts on panic.
+    fn try_with<R>(&self, f: impl FnOnce(&mut Console) -> R) -> Option<R>
+    {
+        if self.busy.swap(true, Ordering::Acquire)
+        {
+            return None;
+        }
+        // SAFETY: `busy` was clear and this call set it, so no other
+        // reference into `state` is live: every access goes through
+        // `try_with`, and an overlapping call returned above.
+        let result = f(unsafe { &mut *self.state.get() });
+        self.busy.store(false, Ordering::Release);
+        Some(result)
+    }
 }
 
 /// Initialize the serial backend.
@@ -65,11 +98,8 @@ pub unsafe fn init_framebuffer(fb: &FramebufferInfo)
 {
     // SAFETY: FramebufferWriter::new requires a valid framebuffer; caller ensures this.
     let writer = unsafe { FramebufferWriter::new(fb) };
-    // SAFETY: CONSOLE is only accessed from the single boot thread, and this
-    // runs between writes, so console_write_str holds no reference to it.
-    unsafe {
-        CONSOLE.fb = writer;
-    }
+    // Called from step 1, never inside a console write, so the cell is free.
+    let _ = CONSOLE.try_with(|console| console.fb = writer);
 }
 
 /// Write a string to both serial and framebuffer backends.
@@ -84,28 +114,19 @@ pub unsafe fn init_framebuffer(fb: &FramebufferInfo)
 pub fn console_write_str(s: &str)
 {
     write_serial(s);
-    if CONSOLE_BUSY.swap(true, Ordering::Acquire)
-    {
-        return;
-    }
-    // SAFETY: the bootloader runs on a single boot thread with no
-    // console-writing interrupt handlers, and CONSOLE_BUSY was clear, so no
-    // other reference to CONSOLE is live: an outer call would have set it, and
-    // init_framebuffer runs only between writes. A re-entered call returns
-    // above without referencing CONSOLE. The raw pointer avoids the
-    // static_mut_refs lint.
-    let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
-    if let Some(fb) = console.fb.as_mut()
-    {
-        for byte in s.bytes()
+    // A re-entered call finds the cell busy and skips the framebuffer.
+    let _ = CONSOLE.try_with(|console| {
+        if let Some(fb) = console.fb.as_mut()
         {
-            // SAFETY: fb was constructed from a valid FramebufferInfo.
-            unsafe {
-                fb.write_byte(byte);
+            for byte in s.bytes()
+            {
+                // SAFETY: fb was constructed from a valid FramebufferInfo.
+                unsafe {
+                    fb.write_byte(byte);
+                }
             }
         }
-    }
-    CONSOLE_BUSY.store(false, Ordering::Release);
+    });
 }
 
 /// Write `s` to the serial backend, if initialized, inserting `\r` before

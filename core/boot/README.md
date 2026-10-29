@@ -28,7 +28,7 @@ core/boot/
     ├── main.rs                 # efi_main — boot sequence orchestrator
     ├── uefi.rs                 # UEFI protocol wrappers and memory services
     ├── elf.rs                  # UEFI-allocation layer over `shared/elf` + InitImage construction
-    ├── firmware.rs             # ACPI RSDP / DTB address discovery (UEFI config table)
+    ├── firmware.rs             # ACPI RSDP / DTB discovery; MADT/DTB shared CPU-id placement
     ├── acpi.rs                 # ACPI walker (CPUs, hart caps, apertures, VMGENID)
     ├── dtb.rs                  # DTB walker (CPUs, hart caps, mmu-type, apertures, rng-seed)
     ├── memory_map.rs           # UEFI memory map → MemoryType; mmio_apertures derivation

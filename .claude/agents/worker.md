@@ -89,7 +89,9 @@ of it, the work on its most likely option, marked provisional in the report.
 - Every item you fix: tick it on its Issue in the Issue's own style with `(fixed by PR #<M>)`
   (`gh issue edit`), copy the ticked items into the PR body's `## Acceptance`, and carry
   `Refs #N`. `Fixes #N` only when no item of that Issue stays open once your last run's
-  findings are recorded. An Issue the PR closes carries the current milestone.
+  findings are recorded. An Issue the PR closes carries the current milestone. A PR carries no
+  milestone (`gh pr create` and `gh pr edit` never take `--milestone`); milestones are set on
+  Issues with `gh issue edit` (docs/conventions.md § Milestones).
 - Fill `.github/pull_request_template.md` completely. The Validation section names the
   validated head, says when later commits are comment-only or Markdown-only, lists each owed
   local host run with its `--runs` count, outcome and head, or states that none is owed and why.

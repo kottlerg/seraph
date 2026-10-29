@@ -227,7 +227,8 @@ pub struct TestContext
 /// test reaps its children before it returns `Ok`; the rule is therefore
 /// guaranteed for the stacks of passing tests only. A test that returns `Err`
 /// early can leave a child alive, and a later reuse of its stack is outside
-/// the rule; ktest's run has then already failed.
+/// the rule; ktest's run has then already failed. Reaping children on every
+/// exit path is #580.
 // Field is CPU stack memory; only the hardware stack pointer accesses it, not Rust code.
 #[allow(dead_code)]
 #[repr(align(16))]

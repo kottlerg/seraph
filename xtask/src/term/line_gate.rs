@@ -23,6 +23,15 @@
 //! byte-line would be rare to nonexistent. Once the marker is seen,
 //! the gate becomes a transparent pass-through forever.
 //!
+//! The in-progress line is bounded (`MAX_LINE_BYTES`), as
+//! `FilterWriter`'s in-flight sequence is: a producer that emits no
+//! `\n` before the marker (firmware progress output driven by `\r` or
+//! cursor positioning, or a guest that hangs mid-line) cannot make the
+//! gate grow without limit. Once a line reaches the cap, its head is
+//! discarded and only the trailing `marker.len() - 1` bytes are kept,
+//! so a marker that straddles the cut still matches; the marker line
+//! the gate then emits starts at the kept tail.
+//!
 //! Composition with `FilterWriter`: the gate sits **after** the filter
 //! (i.e. filter wraps inner; gate wraps filter). This ordering matters
 //! because the filter never modifies a Seraph-style ASCII marker line,
@@ -33,6 +42,12 @@
 //! this invariant.
 
 use std::io::{self, Write};
+
+/// Maximum bytes the gate buffers for the in-progress line before the
+/// marker is seen. The marker line is a short ASCII log line, so 64 KiB,
+/// the figure `FilterWriter` caps its in-flight sequence at, is far
+/// beyond any line the gate must classify.
+const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// `Write` adapter that drops bytes until the first complete line
 /// containing `marker` is seen, then passes everything through.
@@ -107,6 +122,14 @@ impl<W: Write> Write for LineGate<W>
                 }
                 // No marker on this line — discard and continue.
                 self.line.clear();
+            }
+            else if self.line.len() >= MAX_LINE_BYTES
+            {
+                // Runaway line: keep only the tail a marker straddling
+                // the cut could still need.
+                let keep = self.marker.len().saturating_sub(1);
+                let cut = self.line.len().saturating_sub(keep);
+                self.line.drain(..cut);
             }
         }
         Ok(buf.len())
@@ -264,6 +287,36 @@ mod tests
         // not the full marker must not open the gate.
         let input = b"[--------] boo\n[--------] boot: real\n";
         assert_eq!(run(input), b"[--------] boot: real\n");
+    }
+
+    #[test]
+    fn pre_open_line_buffer_is_bounded_against_runaway_line()
+    {
+        // A producer that never emits `\n` before the marker must not grow
+        // the in-progress line past the cap.
+        let mut out = Vec::new();
+        let mut g = LineGate::new(&mut out, MARKER);
+        let chunk = vec![b'A'; 4096];
+        for _ in 0..(3 * MAX_LINE_BYTES / chunk.len())
+        {
+            g.write_all(&chunk).unwrap();
+            assert!(g.line.len() <= MAX_LINE_BYTES);
+        }
+    }
+
+    #[test]
+    fn marker_straddling_the_line_cap_still_opens_gate()
+    {
+        // The line reaches the cap five bytes into the marker; the trim
+        // must keep enough of the line for the marker to match once its
+        // remaining bytes arrive.
+        let mut input = vec![b'A'; MAX_LINE_BYTES - 5];
+        input.extend_from_slice(b"[--------] boot: x\n");
+
+        let out = run(&input);
+
+        assert!(out.ends_with(b"[--------] boot: x\n"));
+        assert!(out.len() < MAX_LINE_BYTES);
     }
 
     #[test]

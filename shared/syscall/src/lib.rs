@@ -91,24 +91,27 @@ use arch::current::{
 /// it register values no typed wrapper can express (a priority above 255, a
 /// CPU id above `u32::MAX`). Everything else uses the typed wrappers. No
 /// register the kernel can write on return is assumed preserved, including the
-/// argument registers that carry secondary returns (`SYS_SCHED_SPLIT`, the IPC
-/// calls).
+/// argument register that carries `SYS_SCHED_SPLIT`'s second handle.
 ///
 /// # Safety
-/// The kernel receives the arguments unchecked by this crate, and the caller
-/// answers for the call's effects on its own memory: any argument the syscall
-/// treats as a user pointer must name memory valid for the access the kernel
-/// makes through it, and the syscall's other memory effects (the registered IPC
-/// buffer the IPC calls read and write, the caller's own mappings and
-/// capabilities a memory or capability call changes) must not invalidate live
-/// Rust data. `nr` need not be a defined syscall: an undefined number returns
-/// `UnknownSyscall` in the primary return register and changes nothing else.
+/// The syscall's effects must be confined to kernel objects the capability
+/// arguments name, leaving everything the calling process runs on untouched:
+/// `nr` must take no user-pointer argument, use no IPC buffer, change none of
+/// the caller's mappings, and change no register state or execution of a
+/// thread in the caller's address space. (The scheduling and band calls the
+/// kernel's validation tests make qualify: `SYS_THREAD_SET_PRIORITY` and
+/// `SYS_THREAD_SET_AFFINITY` on another thread, `SYS_SCHED_SPLIT` on a
+/// capability copy.) Every argument is then a value the kernel validates, so
+/// any value is admissible. `nr` need not be a defined syscall: an undefined
+/// number returns `UnknownSyscall` in the primary return register and changes
+/// nothing else.
 #[inline]
 #[must_use]
 pub unsafe fn raw_syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 {
-    // SAFETY: the caller contract covers the pointer arguments and the call's
-    // other memory effects; `syscall3_any` accepts any `nr` and arguments (its
+    // SAFETY: the caller contract confines the call's effects to kernel objects
+    // its capability arguments name, so nothing this process runs on changes;
+    // `syscall3_any` accepts any `nr` and arguments under that same contract (its
     // `# Safety`) and declares every register the kernel can write on return as
     // clobbered.
     unsafe { syscall3_any(nr, a0, a1, a2) }

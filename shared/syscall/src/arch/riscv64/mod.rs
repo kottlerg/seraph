@@ -146,18 +146,19 @@ pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 ///
 /// Unlike [`syscall3`], which declares `a1`/`a2` input-only and so serves only
 /// syscalls that return in `a0` alone, this declares every argument register
-/// (`a1` to `a5`) as discarded on output, so it is sound for a syscall whose
-/// return also writes them (the IPC and split calls' `set_ipc_*` returns).
-/// `a3` to `a5` carry 0.
+/// (`a1` to `a5`) as discarded on output, so a syscall whose return also writes
+/// them (`SYS_SCHED_SPLIT`'s second handle in `a1`) leaves no register the
+/// compiler assumes preserved. `a3` to `a5` carry 0.
 ///
 /// # Safety
 ///
-/// The raw-wrapper contract in [`crate::arch`] § Safety, except that `nr`
-/// need not be a defined syscall (the kernel returns `UnknownSyscall` in the
-/// primary register and changes nothing else) and the arguments need not match
-/// `nr`'s typed contract: pointer arguments must still be valid for the access
-/// the kernel makes through them, and the call's other effects on the caller's
-/// memory (the IPC buffer, its own mappings) must not invalidate live data.
+/// The contract of `crate::raw_syscall3`, its only caller, in place of the
+/// raw-wrapper contract in [`crate::arch`] § Safety: the call's effects must be
+/// confined to kernel objects the capability arguments name (no user-pointer
+/// argument, no IPC buffer, no change to the caller's mappings or to the
+/// register state or execution of a thread in its address space). Any argument
+/// value is then admissible, and `nr` need not be a defined syscall (the kernel
+/// returns `UnknownSyscall` in the primary register and changes nothing else).
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
 #[allow(clippy::inline_always, clippy::cast_possible_wrap)]

@@ -31,7 +31,10 @@ static SHUTDOWN_CAP: AtomicU32 = AtomicU32::new(0);
 
 /// Set by the first path that claims the run's terminal marker, so a run
 /// logs exactly one (docs/testing.md § Reporting marker) even when a
-/// second thread fails, or a failure follows `ALL TESTS PASSED`.
+/// second thread fails, or a failure follows `ALL TESTS PASSED`. A failing
+/// thread that finds it already set never returns to std's abort, which
+/// would end the process before the claimant logs its marker and sends
+/// `SHUTDOWN`; see [`fail_run`].
 static MARKER_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Install the hooks that end a failed run. svctest's targets abort on
@@ -64,13 +67,23 @@ fn alloc_error_hook(layout: std::alloc::Layout)
 }
 
 /// Log `SOME TESTS FAILED` and request pwrmgr shutdown, unless another
-/// path already claimed the marker.
+/// path already claimed the marker. In that case the calling thread
+/// yields forever instead of returning: its caller aborts next, and the
+/// abort's fault would tear the process down while the claimant is still
+/// logging or sending `SHUTDOWN`. Exiting the thread is no substitute,
+/// since a main-thread exit also ends the process. The loop neither
+/// allocates nor panics, and the claimant's power-off or abort ends it.
 fn fail_run()
 {
     if !MARKER_CLAIMED.swap(true, Ordering::AcqRel)
     {
         std::os::seraph::log!("SOME TESTS FAILED");
         crate::phases::pwrmgr::request_shutdown(SHUTDOWN_CAP.load(Ordering::Acquire));
+        return;
+    }
+    loop
+    {
+        std::thread::yield_now();
     }
 }
 

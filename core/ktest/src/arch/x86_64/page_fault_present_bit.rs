@@ -72,7 +72,7 @@ const PROBES: u64 = DIRECT_MAP_GUARD / IMAGE_SLIDE_ALIGN;
 /// begin here. The direct map ends at least `DIRECT_MAP_GUARD` below the image
 /// base, and the image base lies below the window's end, so no direct-map
 /// address reaches this floor.
-const PROBE_FLOOR: u64 = KERNEL_LINK_BASE + IMAGE_WINDOW_SIZE - DIRECT_MAP_GUARD;
+const PROBE_FLOOR: u64 = KERNEL_LINK_BASE + (IMAGE_WINDOW_SIZE - DIRECT_MAP_GUARD);
 
 /// Badge bound with the handler and delivered in each fault message.
 const FAULT_BADGE: u64 = 0x9F_0001;

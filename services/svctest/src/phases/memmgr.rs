@@ -346,7 +346,7 @@ const STRAY_CAP_CASES: [StrayCapCase; 11] = [
 const STRAY_CAP_LEAK_BUDGET: usize = 9 * 1024;
 
 /// Calls a case makes so that a leak on either of its two deletion paths alone
-/// exceeds [`STRAY_CAP_LEAK_BUDGET`]: `dispatch` deletes the
+/// reaches [`STRAY_CAP_LEAK_BUDGET`]: `dispatch` deletes the
 /// `MSG_CAP_SLOTS_MAX - kept` caps past the contract, and the handler deletes
 /// the `kept` contract caps it refuses. The smaller nonzero per-call leak of
 /// the two sets the count, so a memmgr that kept either path's caps would

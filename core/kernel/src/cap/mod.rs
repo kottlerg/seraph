@@ -2466,7 +2466,7 @@ pub(crate) unsafe fn scrub_reclaim_ranges(boot_info_phys: u64)
 
     // SAFETY: every entry was read in the loop above, so nothing reads the
     // reclaim array's pages again.
-    unsafe { zero_covered_span_pages(span_lo, &span_covered) };
+    unsafe { zero_covered_span_pages(span_lo, span_covered) };
 
     crate::kprintln!("reclaim scrub: zeroed {pages} pages over {count} ranges");
 }
@@ -2515,10 +2515,10 @@ unsafe fn scrub_outside_span(
 /// # Safety
 /// No reclaim entry is read after this call.
 #[cfg(not(test))]
-unsafe fn zero_covered_span_pages(span_lo: u64, span_covered: &[bool; 2])
+unsafe fn zero_covered_span_pages(span_lo: u64, span_covered: [bool; 2])
 {
     let page = crate::mm::PAGE_SIZE as u64;
-    for (k, &covered) in span_covered.iter().enumerate()
+    for (k, covered) in span_covered.into_iter().enumerate()
     {
         if covered
         {

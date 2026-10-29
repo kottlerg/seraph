@@ -414,6 +414,7 @@ changed line that names one of these items as a whole identifier or lies within 
   `CpuRng`), and so is a change to a constant that sizes a per-CPU allocation (`KERNEL_STACK_PAGES`
   for the idle stacks);
 - CPU enumeration and bringup: in the bootloader, `parse_cpu_topology`, `parse_madt_topology`,
+  `madt_topology` and `record_cpu_id` (the MADT CPU walk behind `parse_madt_topology`),
   `parse_cpu_count`, `step5_discover_cpu_topology`, `single_cpu_topology`, `CpuTopology`,
   `discover_boot_hart_id` and `bsp_hardware_id` (the source of the BSP id that becomes
   `cpu_ids[0]`), and the handoff of the count and the CPU ids into `BootInfo` (`cpus.count` and
@@ -453,7 +454,8 @@ git diff --stat "$B" <head> -- core/kernel/src/cpu_mask.rs core/kernel/src/percp
 S='MAX_CPUS|CpuMask|CPU_MASK_WORDS|alloc_zeroed_slab|init_storage|init_per_cpu_storage'
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|TlbShootdownRequest|CpuTopology"
-S="$S|parse_cpu_topology|parse_madt_topology|parse_cpu_count|step5_discover_cpu_topology"
+S="$S|parse_cpu_topology|parse_madt_topology|madt_topology|record_cpu_id|parse_cpu_count"
+S="$S|step5_discover_cpu_topology"
 S="$S|single_cpu_topology|cpus\.count|cpus\.cpu_ids|info\.cpu_count|info\.cpu_ids|boot_cpu_ids"
 S="$S|start_ap|discover_boot_hart_id|bsp_hardware_id"
 S="$S|sbi_hart_start|kernel_entry_ap|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdown|init)_ipi"

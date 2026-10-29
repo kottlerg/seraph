@@ -65,13 +65,14 @@ A message consists of:
   The transfer is all-or-nothing at commit: either every capability's move
   begins with the message (the sender loses access as each completes), or none
   does. A refused transfer — a source slot gone stale, repeated within the
-  message, or pinned by an in-flight revocation or move, a sender's or
-  receiver's CSpace already torn down, or a receiving CSpace (the server's on a
-  call, the caller's on a reply) that cannot supply the destination slots — never
-  delivers a partial set. On the call/receive direction a refusal detectable up
-  front rejects the sender before blocking; one that arises after the sender
-  blocked does not block delivery: the message arrives with zero capabilities and
-  the sender keeps its own, without learning of the refusal. On the reply
+  message, or pinned by an in-flight revocation, move, or IPC capability
+  transfer, a sender's or receiver's CSpace already torn down, or a receiving
+  CSpace (the server's on a call, the caller's on a reply) that cannot supply the
+  destination slots — never delivers a partial set. On the call/receive
+  direction a refusal detectable up front rejects the sender before blocking; one
+  that arises after the sender blocked does not block delivery: the message
+  arrives with zero capabilities and the sender keeps its own, without learning
+  of the refusal. On the reply
   direction the replying server receives the error and the waiting caller resumes
   with the `IPC_REPLY_TRANSFER_FAILED` label, zero data words, and zero
   capabilities in place of the reply. A capability

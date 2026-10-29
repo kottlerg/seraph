@@ -72,10 +72,11 @@ procmgr/
 - **Death-notification fan-out to logd** — accept
   `REGISTER_DEATH_EQ` from real-logd (gated by the
   `DEATH_EQ_AUTHORITY` badge), store logd's `EventQueue` cap, bind
-  it retroactively on every existing thread, and bind it on every
-  new spawn alongside procmgr's own death observer (correlator =
-  process badge, equal to logd's per-sender slot key). See
-  [docs/ipc-interface.md](docs/ipc-interface.md) § `REGISTER_DEATH_EQ`.
+  it retroactively on the main thread of every existing process, and
+  bind it on the main thread of every new spawn alongside procmgr's own
+  death observer (correlator = process badge, equal to logd's
+  per-sender slot key). Threads a process creates itself carry no logd
+  binding. See [docs/ipc-interface.md](docs/ipc-interface.md) § `REGISTER_DEATH_EQ`.
 - **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff during
   init's Handover stage
   ([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover):

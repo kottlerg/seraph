@@ -352,15 +352,17 @@ Wire format:
 |---|---|
 | label | `procmgr_labels::REGISTER_DEATH_EQ` (14) |
 | caller's cap badge | MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY` (`1 << 62`); svcmgr mints this badged `SEND\|GRANT` cap for real-logd on each launch, from the badge-0 `SEND\|GRANT` procmgr source init hands it at the handover (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)) |
-| `caps[0]` | `EventQueue` cap with `POST` right; procmgr binds it as a second death observer on every supervised thread |
+| `caps[0]` | `EventQueue` cap with `POST` right; procmgr binds it as a second death observer on the main thread of every supervised process |
 
 Procmgr stores the cap in
 [`process::LOGD_DEATH_EQ`](../src/process.rs) and immediately
 walks its process table, calling
 `sys_thread_bind_notification(entry.thread_cap, logd_eq,
-entry.badge as u32)` on every live entry. From that moment onward,
+entry.badge as u32)` on every live entry, where `entry.thread_cap` is
+the process's main thread. From that moment onward,
 [`finalize_creation`](../src/process.rs) also binds the same EQ on
-every newly spawned child (correlator = process badge).
+the main thread of every newly spawned child (correlator = process
+badge). Threads a process creates itself carry no logd binding.
 
 Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
 caller lacks `DEATH_EQ_AUTHORITY` or a death EQ is already registered,

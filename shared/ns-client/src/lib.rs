@@ -46,19 +46,25 @@ pub struct WalkedFile
 /// - `path`: `/`-separated components, resolved one `NS_LOOKUP` per component.
 /// - `requested_rights`: the rights word sent on every hop (`0xFFFF` asks for
 ///   everything the server allows).
-/// - `ipc_buf`: the calling thread's registered IPC buffer; it is passed to
-///   `ipc::ipc_call` unchecked (#558).
+/// - `ipc_buf`: the calling thread's registered IPC buffer.
 ///
 /// Returns `None` on any failure. On error, any partially-derived cap
 /// the helper owns is `cap_delete`d before returning.
-pub fn walk_to_file(
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC buffer page
+/// as registered via `syscall::ipc_buffer_set` (the contract of
+/// `ipc::ipc_call`, which each hop issues through it).
+pub unsafe fn walk_to_file(
     root_cap: u32,
     path: &[u8],
     requested_rights: u64,
     ipc_buf: *mut u64,
 ) -> Option<WalkedFile>
 {
-    let WalkResult { cap, kind, size } = walk(root_cap, path, requested_rights, ipc_buf)?;
+    // SAFETY: the caller's contract makes `ipc_buf` the registered IPC page.
+    let WalkResult { cap, kind, size } =
+        unsafe { walk(root_cap, path, requested_rights, ipc_buf) }?;
     if kind != 0
     {
         let _ = syscall::cap_delete(cap);
@@ -81,19 +87,24 @@ pub fn walk_to_file(
 /// - `path`: `/`-separated components, resolved one `NS_LOOKUP` per component.
 /// - `requested_rights`: the rights word sent on every hop (`0xFFFF` asks for
 ///   everything the server allows).
-/// - `ipc_buf`: the calling thread's registered IPC buffer; it is passed to
-///   `ipc::ipc_call` unchecked (#558).
+/// - `ipc_buf`: the calling thread's registered IPC buffer.
 ///
 /// Returns `None` on any failure. On error, any partially-derived cap
 /// the helper owns is `cap_delete`d before returning.
-pub fn walk_to_dir(
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's 4 KiB-aligned IPC buffer page
+/// as registered via `syscall::ipc_buffer_set` (the contract of
+/// `ipc::ipc_call`, which each hop issues through it).
+pub unsafe fn walk_to_dir(
     root_cap: u32,
     path: &[u8],
     requested_rights: u64,
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
-    let WalkResult { cap, kind, .. } = walk(root_cap, path, requested_rights, ipc_buf)?;
+    // SAFETY: the caller's contract makes `ipc_buf` the registered IPC page.
+    let WalkResult { cap, kind, .. } = unsafe { walk(root_cap, path, requested_rights, ipc_buf) }?;
     if kind != 1
     {
         let _ = syscall::cap_delete(cap);
@@ -113,8 +124,15 @@ struct WalkResult
 /// Returns the cap, kind, and size hint reported by the final hop.
 /// Refuses empty paths (an empty walk would hand back the caller's
 /// own input cap, which the helper does not own).
-fn walk(root_cap: u32, path: &[u8], requested_rights: u64, ipc_buf: *mut u64)
--> Option<WalkResult>
+///
+/// # Safety
+/// The contract of [`walk_to_file`] for `ipc_buf`.
+unsafe fn walk(
+    root_cap: u32,
+    path: &[u8],
+    requested_rights: u64,
+    ipc_buf: *mut u64,
+) -> Option<WalkResult>
 {
     let mut current_cap = root_cap;
     let mut current_owns = false;
@@ -149,7 +167,8 @@ fn walk(root_cap: u32, path: &[u8], requested_rights: u64, ipc_buf: *mut u64)
             .bytes(1, name)
             .build();
 
-        // SAFETY: ipc_buf is the caller's registered IPC buffer page.
+        // SAFETY: the caller's contract makes ipc_buf this thread's
+        // registered IPC buffer page.
         let Ok(reply) = (unsafe { ipc::ipc_call(current_cap, &msg, ipc_buf) })
         else
         {

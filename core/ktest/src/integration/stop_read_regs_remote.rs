@@ -122,8 +122,11 @@ fn scenario(ctx: &TestContext) -> TestResult
     let child = spawn::new_child(ctx)
         .map_err(|_| "integration::stop_read_regs_remote: spawn::new_child failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    let ran = spawn::configure_and_start_pinned(&child, spin_entry, stack_top, 0, CHILD_CPU)
-        .and_then(|()| rounds(&child));
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    let ran =
+        unsafe { spawn::configure_and_start_pinned(&child, spin_entry, stack_top, 0, CHILD_CPU) }
+            .and_then(|()| rounds(&child));
     let released = release(&child);
     ran?;
     released
@@ -163,7 +166,7 @@ fn rounds(child: &SpawnedChild) -> TestResult
 fn redirect(child: &SpawnedChild, round: u32) -> TestResult
 {
     let mut regs = [0u8; BUF];
-    thread_read_regs(child.th, regs.as_mut_ptr(), BUF).map_err(|e| {
+    thread_read_regs(child.th, &mut regs[..BUF]).map_err(|e| {
         log_error(
             "ktest: integration::stop_read_regs_remote thread_read_regs error=",
             e,
@@ -183,8 +186,14 @@ fn redirect(child: &SpawnedChild, round: u32) -> TestResult
     }
     ROUND.store(round, Ordering::Release);
     let target = redirected_entry as *const () as u64;
-    regs[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&target.to_le_bytes());
-    thread_write_regs(child.th, regs.as_ptr(), BUF).map_err(|e| {
+    crate::spawn::redirect_to_entry(&mut regs[..], target);
+    // SAFETY: the frame was read from this child, so its stack pointer lies on
+    // the child's own `ChildStack`; `redirect_to_entry` pointed it at `redirected_entry`,
+    // an `extern "C"` entry that never returns and needs nothing of the
+    // abandoned frame, with the stack pointer moved down to the entry ABI's
+    // alignment on that same stack, so the child resumes on code and a stack
+    // it owns.
+    unsafe { thread_write_regs(child.th, &regs[..BUF]) }.map_err(|e| {
         log_error(
             "ktest: integration::stop_read_regs_remote thread_write_regs error=",
             e,
@@ -300,7 +309,7 @@ extern "C" fn spin_entry(_arg: u64) -> !
 /// restart, then spin on. Each redirect enters this on the stack the child
 /// was stopped on, which grows by a few frames a round, far inside a
 /// `ChildStack` across [`ROUNDS`] rounds.
-fn redirected_entry() -> !
+extern "C" fn redirected_entry(_arg: u64) -> !
 {
     REDIRECTED.store(ROUND.load(Ordering::Acquire), Ordering::Release);
     spin_entry(0)

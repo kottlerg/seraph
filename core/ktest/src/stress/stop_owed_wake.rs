@@ -377,8 +377,12 @@ fn start(
         // stress tests run sequentially and every child is deleted before
         // this test returns.
         let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[index]) });
-        spawn::configure_and_start_pinned(child, entry, stack, u64::from(arg), cpus[index])
-            .map_err(|_| "stress::stop_owed_wake: start child failed")?;
+        // SAFETY: the stack is `super::STRESS_STACKS[index]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe {
+            spawn::configure_and_start_pinned(child, entry, stack, u64::from(arg), cpus[index])
+        }
+        .map_err(|_| "stress::stop_owed_wake: start child failed")?;
     }
     Ok(())
 }

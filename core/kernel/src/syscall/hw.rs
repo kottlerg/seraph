@@ -212,6 +212,12 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// All pages are mapped with `uncacheable = true` (PCD|PWT on `x86_64`,
 /// Svpbmt PBMT=IO on RISC-V — see [`PageFlags`]).
 ///
+/// The `Mmio` object records the mapping, holding a reference on the address
+/// space, before any page is mapped; freeing the object (its capability
+/// deleted, consumed by a split, or revoked through an ancestor) unmaps it,
+/// with TLB shootdown (docs/capability-model.md § Mmio). Returns `QuotaExceeded` when the object
+/// already records `MMIO_MAX_MAPPINGS` other mappings.
+///
 /// Intermediate page-table pages come from the target AS's PT growth pool;
 /// the map fails with `OutOfMemory` when that pool is exhausted, so a caller
 /// mapping a large region augments it first via `SYS_CAP_CREATE_ASPACE`
@@ -254,14 +260,16 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
     // rejects a null cspace and checks tag and rights.
     let mmio_slot = unsafe { super::lookup_cap(cspace, mmio_idx, MmioRights::MAP) }?;
-    let (mmio_phys, mmio_size) = {
-        let obj = mmio_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Mmio; the object is a MmioObject
-        // constructed in place at a size-class-aligned retype offset.
-        #[allow(clippy::cast_ptr_alignment)]
-        let mo = unsafe { &*obj.as_ptr().cast::<MmioObject>() };
-        (mo.base, mo.size)
-    };
+    // cast_ptr_alignment: tag confirmed Mmio; the MmioObject is constructed in
+    // place at a size-class-aligned retype offset, header at offset 0.
+    #[allow(clippy::cast_ptr_alignment)]
+    let mmio_obj = mmio_slot
+        .object
+        .ok_or(SyscallError::InvalidCapability)?
+        .as_ptr()
+        .cast::<MmioObject>();
+    // SAFETY: `mmio_slot` pins the MmioObject for the whole call.
+    let (mmio_phys, mmio_size) = unsafe { ((*mmio_obj).base, (*mmio_obj).size) };
 
     // Size must be at least one page and page-aligned.
     if mmio_size == 0 || mmio_size & 0xFFF != 0
@@ -312,6 +320,12 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
     let pooled = unsafe { (*aso_raw).pt_pool.has_create_donation() };
 
+    // Record the mapping before mapping a page, so the object's teardown
+    // finds every page this call maps, including after a partial failure.
+    // SAFETY: `mmio_slot` pins the Mmio object and `as_slot` the address
+    // space for the whole call.
+    unsafe { (*mmio_obj).record_mapping(aso_raw, virt_base) }?;
+
     // Map each page.
     for i in 0..page_count
     {
@@ -352,16 +366,20 @@ pub fn sys_mmio_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg0 = Thread cap index (must have CONTROL right).
 /// arg1 = `IoPort` cap index (must have USE right).
 ///
-/// On first bind, an 8 KiB per-thread IOPB bitmap is carved from the SEED
-/// Memory cap and all ports are denied (0xFF). The requested range bits are
-/// then cleared (0 = allowed). On context switch the bitmap is copied into
-/// the TSS IOPB region. The install and the edit run under the target's
-/// `sched_lock`, which the context-switch load also holds, so concurrent binds
-/// on one thread accumulate their permits and leak no bitmap.
+/// On first bind, a per-thread port-binding table (`cap::ioport_bindings`: the
+/// 8 KiB IOPB bitmap, all ports denied, and the record of each binding) is
+/// carved from the SEED Memory cap. The bind records the `IoPort` object it is
+/// made through and clears the range's bits (0 = allowed); freeing that object
+/// withdraws the binding (docs/capability-model.md § `IoPort`). On context
+/// switch the bitmap is copied into the TSS IOPB region. The install and the
+/// edit run under the target's `sched_lock`, which the context-switch load
+/// also holds, so concurrent binds on one thread accumulate their permits and
+/// leak no table.
 ///
 /// On RISC-V: always returns `NotSupported` (no I/O port concept).
 ///
-/// Returns 0 on success.
+/// Returns 0 on success; `QuotaExceeded` when the thread already records
+/// `MAX_IOPORT_BINDINGS` bindings through other objects.
 #[cfg(not(test))]
 pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -373,6 +391,7 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
 
     {
         use crate::arch::current::gdt;
+        use crate::cap::ioport_bindings::{IoPortBindings, TABLE_BYTES};
         use crate::cap::object::{IoPortObject, ThreadObject};
         use crate::cap::slot::{IoPortRights, ThreadRights};
         use crate::syscall::current_tcb;
@@ -411,37 +430,30 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
         // Resolve IoPort cap.
         // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
         // rejects a null cspace and checks tag and rights.
+        // `port_slot` pins the IoPort object for the rest of the call, so its
+        // teardown, which withdraws the bindings recorded against it, cannot
+        // run before the record below is in place.
         let port_slot = unsafe { super::lookup_cap(cspace, ioport_idx, IoPortRights::USE) }?;
-        let (port_base, port_size) = {
+        let (port_object, port_base, port_count) = {
             let obj = port_slot.object.ok_or(SyscallError::InvalidCapability)?;
             // SAFETY: tag confirmed IoPort; the object is an IoPortObject retyped in
-            // place from the SEED reserve (at boot, or by sys_ioport_split).
+            // place from the SEED reserve (at boot, by a split, or by a copy).
             #[allow(clippy::cast_ptr_alignment)]
             let po = unsafe { &*obj.as_ptr().cast::<IoPortObject>() };
-            (po.base, po.size)
+            (obj.as_ptr() as usize, u32::from(po.base), po.port_count())
         };
 
-        // Clear the bits for the requested port range (0 = allow).
-        // size == 0 encodes the full 64K range (u16 cannot hold 65536).
-        let effective_size = if port_size == 0
-        {
-            65536u32
-        }
-        else
-        {
-            u32::from(port_size)
-        };
-
-        // The per-thread IOPB is allocated on first bind from the kernel SEED
-        // Memory cap and freed back to SEED on thread dealloc via the Thread arm
-        // of `dealloc_object`. The pointer and the bitmap's bytes are owned by
-        // the target's `sched_lock` (core/kernel/docs/scheduling-internals.md §
-        // Cross-CPU TCB Ownership, Address-space / capability row), which
-        // `schedule()` also holds when it loads the bitmap into a CPU's TSS. The
-        // SEED allocation is not made under that lock: a first bind peeks under
-        // it, allocates outside it, and installs under it only if the slot is
-        // still empty; a concurrent bind that installed first wins, and the
-        // loser's block goes back to SEED.
+        // The per-thread binding table is allocated on first bind from the
+        // kernel SEED Memory cap and freed back to SEED on thread dealloc via
+        // the Thread arm of `dealloc_object`. The pointer and the table's bytes
+        // are owned by the target's `sched_lock`
+        // (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership,
+        // Address-space / capability row), which `schedule()` also holds when
+        // it loads the bitmap into a CPU's TSS. The SEED allocation is not made
+        // under that lock: a first bind peeks under it, allocates outside it,
+        // and installs under it only if the slot is still empty; a concurrent
+        // bind that installed first wins, and the loser's block goes back to
+        // SEED.
         // SAFETY: target_tcb validated non-null; lock_raw/unlock_raw paired.
         let needs_iopb = unsafe {
             let saved = (*target_tcb).sched_lock.lock_raw();
@@ -449,51 +461,70 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
             (*target_tcb).sched_lock.unlock_raw(saved);
             empty
         };
-        let mut fresh: *mut [u8; gdt::IOPB_SIZE] = core::ptr::null_mut();
+        let mut fresh: *mut IoPortBindings = core::ptr::null_mut();
         if needs_iopb
         {
-            let raw = crate::cap::retype::alloc_seed_scratch(gdt::IOPB_SIZE as u64)?;
-            // SAFETY: raw points at a freshly-carved IOPB-sized block in
-            // SEED's region, not aliased.
-            unsafe { core::ptr::write_bytes(raw, 0xFFu8, gdt::IOPB_SIZE) };
-            // cast_ptr_alignment: `[u8; IOPB_SIZE]` has alignment 1, so any
-            // byte pointer from alloc_seed_scratch is suitably aligned.
+            let raw = crate::cap::retype::alloc_seed_scratch(TABLE_BYTES)?;
+            // cast_ptr_alignment: a page-class SEED scratch block is page-aligned,
+            // which satisfies the table's alignment.
             #[allow(clippy::cast_ptr_alignment)]
             {
-                fresh = raw.cast::<[u8; gdt::IOPB_SIZE]>();
+                fresh = raw.cast::<IoPortBindings>();
             }
+            // SAFETY: fresh points at a freshly-carved TABLE_BYTES block in
+            // SEED's region, page-aligned and not aliased.
+            unsafe { IoPortBindings::init_in_place(fresh) };
         }
 
         // SAFETY: target_tcb validated non-null; under its sched_lock, iopb is
-        // null or a live block installed by a bind, and `fresh` (when non-null)
-        // is ours alone; lock_raw/unlock_raw paired, interrupts disabled between.
-        unsafe {
+        // null or the bitmap of a live table installed by a bind, and `fresh`
+        // (when non-null) is ours alone; lock_raw/unlock_raw paired, interrupts
+        // disabled between.
+        let bound = unsafe {
             let saved = (*target_tcb).sched_lock.lock_raw();
             if (*target_tcb).iopb.is_null() && !fresh.is_null()
             {
-                (*target_tcb).iopb = fresh;
+                (*target_tcb).iopb = fresh.cast::<[u8; gdt::IOPB_SIZE]>();
                 fresh = core::ptr::null_mut();
             }
-            let iopb = (*target_tcb).iopb;
-            if !iopb.is_null()
+            // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
+            // IoPortBindings block (the allocation above or an earlier bind's).
+            #[allow(clippy::cast_ptr_alignment)]
+            let table = (*target_tcb).iopb.cast::<IoPortBindings>();
+            let bound = if table.is_null()
             {
-                gdt::permit_port_range(&mut *iopb, u32::from(port_base), effective_size);
+                Ok(())
+            }
+            else
+            {
+                let r = (*table).bind(port_object, port_base, port_count);
                 // Binding the running thread: reload this CPU's TSS IOPB so in/out
                 // instructions work without a context switch.
-                if target_tcb == caller_tcb
+                if r.is_ok() && target_tcb == caller_tcb
                 {
-                    gdt::load_iopb(Some(&*iopb));
+                    gdt::load_iopb(Some(&(*table).bitmap));
                 }
-            }
+                r
+            };
             (*target_tcb).sched_lock.unlock_raw(saved);
-        }
+            bound
+        };
 
-        // A concurrent bind installed its bitmap first: return ours to SEED.
+        // A concurrent bind installed its table first: return ours to SEED.
         if !fresh.is_null()
         {
-            crate::cap::retype::free_seed_scratch(fresh.cast::<u8>(), gdt::IOPB_SIZE as u64);
+            crate::cap::retype::free_seed_scratch(fresh.cast::<u8>(), TABLE_BYTES);
         }
 
+        bound.map_err(|_| SyscallError::QuotaExceeded)?;
+        // A target running on another CPU loaded its bitmap before this bind:
+        // invalidate every TSS so its next port access reloads the grown
+        // bitmap (the lazy reload of `gdt::reload_invalidated_iopb`) instead
+        // of faulting on the stale copy.
+        if target_tcb != caller_tcb
+        {
+            gdt::invalidate_all_iopbs();
+        }
         Ok(0)
     }
 }
@@ -527,9 +558,8 @@ pub fn sys_ioport_bind(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_mmio_split(tf: UserFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{KernelObjectHeader, MmioObject, ObjectType, dealloc_object};
+    use crate::cap::object::{MmioObject, dealloc_object};
     use crate::cap::retype::alloc_in_seed;
-    use crate::cap::seed_header_nn;
     use crate::cap::slot::{CapTag, MmioRights};
     use crate::cap::split::install_split_children;
     use crate::mm::PAGE_SIZE;
@@ -608,22 +638,14 @@ pub fn sys_mmio_split(tf: UserFrame) -> Result<u64, SyscallError>
     // `retype_free`.
 
     // child1: [base, base + split_offset).
-    let child1_ptr = alloc_in_seed(MmioObject {
-        header: KernelObjectHeader::with_ancestor(ObjectType::Mmio, seed_header_nn()),
-        base: mmio_phys,
-        size: split_offset,
-        flags: mmio_flags,
-        _pad: 0,
-    })?;
+    let child1_ptr = alloc_in_seed(MmioObject::new_root(mmio_phys, split_offset, mmio_flags))?;
 
     // child2: [base + split_offset, end).
-    let child2_ptr = match alloc_in_seed(MmioObject {
-        header: KernelObjectHeader::with_ancestor(ObjectType::Mmio, seed_header_nn()),
-        base: mmio_phys + split_offset,
-        size: mmio_size - split_offset,
-        flags: mmio_flags,
-        _pad: 0,
-    })
+    let child2_ptr = match alloc_in_seed(MmioObject::new_root(
+        mmio_phys + split_offset,
+        mmio_size - split_offset,
+        mmio_flags,
+    ))
     {
         Ok(p) => p,
         Err(e) =>
@@ -827,9 +849,8 @@ pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
     }
 
     {
-        use crate::cap::object::{IoPortObject, KernelObjectHeader, ObjectType, dealloc_object};
+        use crate::cap::object::{IoPortObject, dealloc_object};
         use crate::cap::retype::alloc_in_seed;
-        use crate::cap::seed_header_nn;
         use crate::cap::slot::{CapTag, IoPortRights};
         use crate::cap::split::install_split_children;
         use crate::syscall::current_tcb;
@@ -912,19 +933,9 @@ pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
         let upper_count: u16 = (end - split_at) as u16;
         let split_at_u16: u16 = split_at as u16;
 
-        let child1_ptr = alloc_in_seed(IoPortObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::IoPort, seed_header_nn()),
-            base,
-            size: lower_count,
-            _pad: 0,
-        })?;
+        let child1_ptr = alloc_in_seed(IoPortObject::new_root(base, lower_count))?;
 
-        let child2_ptr = match alloc_in_seed(IoPortObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::IoPort, seed_header_nn()),
-            base: split_at_u16,
-            size: upper_count,
-            _pad: 0,
-        })
+        let child2_ptr = match alloc_in_seed(IoPortObject::new_root(split_at_u16, upper_count))
         {
             Ok(p) => p,
             Err(e) =>

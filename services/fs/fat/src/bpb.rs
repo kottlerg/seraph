@@ -118,7 +118,8 @@ impl FatState
 /// `state`, and emits the detection and geometry log lines the driver has
 /// always produced. Returns `false` after logging the reason on an invalid
 /// boot signature, a zero `bytes_per_sector` / `sectors_per_cluster`, a
-/// sector size other than [`SECTOR_SIZE`], or an inconsistent geometry.
+/// sector size other than [`SECTOR_SIZE`], an inconsistent geometry, or a
+/// FAT12 cluster count.
 pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
 {
     let geom = match fat_parse::parse_bpb_geometry(sector_data)
@@ -145,6 +146,14 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
                 "invalid BPB: inconsistent geometry (no FAT copy or reserved sector, data-region \
                  start overflows, cluster count exceeds the FAT, or FAT32 root outside the data \
                  region)"
+            );
+            return false;
+        }
+        Err(fat_parse::BpbError::Fat12) =>
+        {
+            std::os::seraph::log!(
+                "unsupported BPB: fewer than {} clusters (FAT12)",
+                fat_parse::FAT16_MIN_CLUSTERS
             );
             return false;
         }

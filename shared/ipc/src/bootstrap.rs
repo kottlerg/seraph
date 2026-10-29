@@ -9,9 +9,8 @@
 //! `process_abi::ProcessInfo`, beside the other caps the handover page
 //! carries). The child calls [`request_round`] in a loop on that cap; the
 //! creator serves each request with [`reply_round`] or [`reply_error`],
-//! transferring up to
-//! `MSG_CAP_SLOTS_MAX` caps plus payload words per round. When the creator
-//! sets the `done` flag, the child stops.
+//! transferring up to `MSG_CAP_SLOTS_MAX` caps plus payload words per round.
+//! When the creator sets the `done` flag, the child stops.
 //!
 //! Per-(creator, child-type) payload formats are defined in each child's
 //! crate. This module only implements the generic protocol.
@@ -110,7 +109,10 @@ pub const fn unpack_data_words(label: u64) -> usize
 ///   [`bootstrap_errors::EXHAUSTED`], or [`bootstrap_errors::INVALID`], or
 ///   `0xFF` when the kernel's reply-cap transfer failed
 ///   (`IPC_REPLY_TRANSFER_FAILED`).
-/// * `Err(bootstrap_errors::INVALID)` if the underlying IPC fails.
+/// * `Err(bootstrap_errors::INVALID)` if the underlying IPC fails, or if
+///   the reply's label disagrees with its payload: the delivered cap count
+///   differs from the count the label declares, or the label declares more
+///   data words than a message carries.
 pub unsafe fn request_round(creator_ep: u32, ipc_buf: *mut u64) -> Result<BootstrapRound, u64>
 {
     let request = IpcMessage::new(REQUEST);
@@ -126,8 +128,12 @@ pub unsafe fn request_round(creator_ep: u32, ipc_buf: *mut u64) -> Result<Bootst
             let reply_caps = reply.caps();
             let declared_cap_count = unpack_cap_count(reply.label);
             let data_words = unpack_data_words(reply.label);
-            debug_assert_eq!(reply_caps.len(), declared_cap_count);
-            debug_assert!(data_words <= MSG_DATA_WORDS_MAX);
+            // The label is the creator's word; a mismatch with what the
+            // kernel delivered is refused in every build.
+            if reply_caps.len() != declared_cap_count || data_words > MSG_DATA_WORDS_MAX
+            {
+                return Err(bootstrap_errors::INVALID);
+            }
             let mut caps = [0u32; MSG_CAP_SLOTS_MAX];
             caps[..reply_caps.len()].copy_from_slice(reply_caps);
             let mut data = [0u64; MSG_DATA_WORDS_MAX];

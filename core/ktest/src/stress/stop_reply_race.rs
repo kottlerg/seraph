@@ -560,7 +560,9 @@ fn spawn_client(
     // SAFETY: stack index 1 is the client's; each cycle reaps its client
     // before the next starts.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
-    spawn::configure_and_start_pinned(client, client_entry, stack, arg, cpu)
+    // SAFETY: the stack is `super::STRESS_STACKS[1]`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(client, client_entry, stack, arg, cpu) }
         .map_err(|_| "stress::stop_reply_race: start client failed")?;
     Ok(client.th)
 }
@@ -590,7 +592,9 @@ fn spawn_server(
     // SAFETY: stack index 0 is the server's; each cycle reaps its server
     // before the next starts.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
-    spawn::configure_and_start_pinned(server, server_entry, stack, arg, cpu)
+    // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(server, server_entry, stack, arg, cpu) }
         .map_err(|_| "stress::stop_reply_race: start server failed")?;
     Ok(server.th)
 }
@@ -630,7 +634,9 @@ fn spawn_stopper(
     // SAFETY: stack index 2 is the stopper's; each cycle reaps its stopper
     // before the next starts.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[2]) });
-    spawn::configure_and_start_pinned(stopper, stopper_entry, stack, arg, cpu)
+    // SAFETY: the stack is `super::STRESS_STACKS[2]`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(stopper, stopper_entry, stack, arg, cpu) }
         .map_err(|_| "stress::stop_reply_race: start stopper failed")
 }
 
@@ -658,7 +664,10 @@ extern "C" fn server_entry(arg: u64) -> !
     // SERVER_IPC_BUF; sequential cycles never alias it.
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
 
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }
@@ -726,7 +735,10 @@ extern "C" fn client_entry(arg: u64) -> !
     // CLIENT_IPC_BUF; sequential cycles never alias it.
     let buf = core::ptr::addr_of_mut!(CLIENT_IPC_BUF).cast::<u64>();
 
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }

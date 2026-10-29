@@ -312,7 +312,10 @@ fn start_caller(ctx: &TestContext, done: u32, slot: &mut Option<u32>) -> TestRes
     // sequentially, and a phase's caller has exited before the next phase's
     // caller reuses the stack.
     let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[CALLER_STACK]) });
-    thread_configure(th, caller_entry as *const () as u64, top, u64::from(done))
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe { thread_configure(th, caller_entry as *const () as u64, top, u64::from(done)) }
         .map_err(|_| "stress::copy_source_delete: thread_configure failed")?;
     thread_set_affinity(th, CALLER_CPU)
         .map_err(|_| "stress::copy_source_delete: pin caller failed")?;

@@ -126,7 +126,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     let arg = publish_client_args(c_ep, c_done, BIT_P1_READY, BIT_P1_OK, BIT_P1_BAD);
     // Phase 1's client is the sole user of CLIENT_STACK until reaped.
     let stack = ChildStack::top(core::ptr::addr_of!(CLIENT_STACK));
-    spawn::configure_and_start(&client, client_entry, stack, arg)
+    // SAFETY: the stack is `CLIENT_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start(&client, client_entry, stack, arg) }
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: start p1 client failed")?;
 
     wait_for(done, &mut acc, BIT_P1_READY)?;
@@ -176,7 +178,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     };
     // Phase 2's server is the sole user of SERVER_STACK.
     let s_stack = ChildStack::top(core::ptr::addr_of!(SERVER_STACK));
-    spawn::configure_and_start(&server, server_entry, s_stack, s_arg)
+    // SAFETY: the stack is `SERVER_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start(&server, server_entry, s_stack, s_arg) }
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: start server failed")?;
 
     let client2 = spawn::new_child(ctx)
@@ -188,7 +192,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     let c2_arg = publish_client_args(p2c_ep, p2c_done, 0, BIT_P2_OK, BIT_P2_BAD);
     // Phase 1's client was reaped above; CLIENT_STACK is free again.
     let c2_stack = ChildStack::top(core::ptr::addr_of!(CLIENT_STACK));
-    spawn::configure_and_start(&client2, client_entry, c2_stack, c2_arg)
+    // SAFETY: the stack is `CLIENT_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start(&client2, client_entry, c2_stack, c2_arg) }
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: start p2 client failed")?;
 
     // The armed bit is raised only after the server's `ipc_recv` returns, so
@@ -270,7 +276,10 @@ extern "C" fn client_entry(arg: u64) -> !
 
     // SAFETY: sole live user of CLIENT_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(CLIENT_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }
@@ -297,7 +306,10 @@ extern "C" fn server_entry(arg: u64) -> !
 
     // SAFETY: sole user of SERVER_IPC_BUF.
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }

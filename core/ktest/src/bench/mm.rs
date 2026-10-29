@@ -28,19 +28,25 @@ pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, iters: u32)
     for _ in 0..n
     {
         let t0 = cycles_now();
-        if syscall::mem_map(
-            memory_cap,
-            ctx.aspace_cap,
-            BENCH_VA,
-            0,
-            1,
-            syscall::MAP_WRITABLE,
-        )
+        // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe {
+            syscall::mem_map(
+                memory_cap,
+                ctx.aspace_cap,
+                BENCH_VA,
+                0,
+                1,
+                syscall::MAP_WRITABLE,
+            )
+        }
         .is_err()
         {
             break;
         }
-        if syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1).is_err()
+        // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe { syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1) }.is_err()
         {
             still_mapped = true;
             break;
@@ -78,7 +84,7 @@ pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, iters: u32)
     }
 }
 
-/// Benchmark: alternate `mem_protect(MAP_READONLY)` and
+/// Benchmark: alternate `mem_protect(MAP_READ)` (read-only) and
 /// `mem_protect(MAP_WRITABLE)` on a pre-mapped page. Measures the cost of one round-trip permission
 /// flip — relevant for any future mmap-like userspace API.
 pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
@@ -92,14 +98,18 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
         return;
     };
 
-    if syscall::mem_map(
-        memory_cap,
-        ctx.aspace_cap,
-        BENCH_VA,
-        0,
-        1,
-        syscall::MAP_WRITABLE,
-    )
+    // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe {
+        syscall::mem_map(
+            memory_cap,
+            ctx.aspace_cap,
+            BENCH_VA,
+            0,
+            1,
+            syscall::MAP_WRITABLE,
+        )
+    }
     .is_err()
     {
         // SAFETY: memory_cap is from pool and was not mapped (mem_map failed).
@@ -115,24 +125,26 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
     for _ in 0..n
     {
         let t0 = cycles_now();
-        if syscall::mem_protect(
-            memory_cap,
-            ctx.aspace_cap,
-            BENCH_VA,
-            1,
-            syscall::MAP_READONLY,
-        )
+        // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe {
+            syscall::mem_protect(memory_cap, ctx.aspace_cap, BENCH_VA, 1, syscall::MAP_READ)
+        }
         .is_err()
         {
             break;
         }
-        if syscall::mem_protect(
-            memory_cap,
-            ctx.aspace_cap,
-            BENCH_VA,
-            1,
-            syscall::MAP_WRITABLE,
-        )
+        // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe {
+            syscall::mem_protect(
+                memory_cap,
+                ctx.aspace_cap,
+                BENCH_VA,
+                1,
+                syscall::MAP_WRITABLE,
+            )
+        }
         .is_err()
         {
             break;
@@ -153,7 +165,9 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
 
     // A frame whose unmap failed stays out of the pool rather than alias the
     // next test's mapping.
-    if syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1).is_ok()
+    // SAFETY: `BENCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe { syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1) }.is_ok()
     {
         // SAFETY: memory_cap is from pool and its only mapping was just removed.
         unsafe { crate::frame_pool::free(memory_cap) };

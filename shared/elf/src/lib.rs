@@ -159,6 +159,11 @@ pub enum ElfError
 // ── Raw ELF types ────────────────────────────────────────────────────────────
 
 /// 64-bit ELF file header (`Elf64_Ehdr`).
+///
+/// Decoded byte-wise from the image by [`validate`] and
+/// [`validate_executable`], which return it by value, so no reference into
+/// the image's bytes needs their alignment.
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 // ELF field names follow the ELF spec (e_ident, e_type, …); removing the `e_`
 // prefix would diverge from all reference material.
@@ -198,7 +203,8 @@ pub struct Elf64Ehdr
     pub e_shstrndx: u16,
 }
 
-/// 64-bit ELF program header (`Elf64_Phdr`).
+/// 64-bit ELF program header (`Elf64_Phdr`), decoded byte-wise.
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 // ELF field names follow the ELF spec (p_type, p_flags, …).
 #[allow(clippy::struct_field_names)]
@@ -294,7 +300,7 @@ pub enum ElfKind
     Dyn,
 }
 
-/// Validate an ELF64 header and return a typed reference.
+/// Validate an ELF64 header and return it, decoded.
 ///
 /// Checks: minimum size, magic, class (64-bit), data encoding (little-endian),
 /// version, type (`ET_EXEC`), machine, program header entry size, program
@@ -310,19 +316,19 @@ pub enum ElfKind
 /// [`ElfError::NotExecutable`], [`ElfError::WrongMachine`],
 /// [`ElfError::BadPhentsize`], [`ElfError::NoSegments`], or
 /// [`ElfError::PhdrTableOverflow`].
-pub fn validate(data: &[u8], expected_machine: u16) -> Result<&Elf64Ehdr, ElfError>
+pub fn validate(data: &[u8], expected_machine: u16) -> Result<Elf64Ehdr, ElfError>
 {
     let ehdr = validate_ident(data)?;
     if ehdr.e_type != ET_EXEC
     {
         return Err(ElfError::NotExecutable);
     }
-    validate_tail(ehdr, data, expected_machine)?;
+    validate_tail(&ehdr, data, expected_machine)?;
     Ok(ehdr)
 }
 
 /// Validate an ELF64 executable header, accepting both `ET_EXEC` and
-/// `ET_DYN`, and return a typed reference plus the detected [`ElfKind`].
+/// `ET_DYN`, and return it, decoded, plus the detected [`ElfKind`].
 ///
 /// Same checks as [`validate`] apart from the type check. Loader callers
 /// branch on the kind: `Exec` images load at their link VAs with bias 0;
@@ -334,7 +340,7 @@ pub fn validate(data: &[u8], expected_machine: u16) -> Result<&Elf64Ehdr, ElfErr
 pub fn validate_executable(
     data: &[u8],
     expected_machine: u16,
-) -> Result<(&Elf64Ehdr, ElfKind), ElfError>
+) -> Result<(Elf64Ehdr, ElfKind), ElfError>
 {
     let ehdr = validate_ident(data)?;
     let kind = match ehdr.e_type
@@ -343,25 +349,16 @@ pub fn validate_executable(
         ET_DYN => ElfKind::Dyn,
         _ => return Err(ElfError::NotExecutable),
     };
-    validate_tail(ehdr, data, expected_machine)?;
+    validate_tail(&ehdr, data, expected_machine)?;
     Ok((ehdr, kind))
 }
 
 /// Size, magic, class, data-encoding, and version checks shared by
 /// [`validate`] and [`validate_executable`]; the caller checks `e_type`
 /// next, then [`validate_tail`].
-fn validate_ident(data: &[u8]) -> Result<&Elf64Ehdr, ElfError>
+fn validate_ident(data: &[u8]) -> Result<Elf64Ehdr, ElfError>
 {
-    if data.len() < size_of::<Elf64Ehdr>()
-    {
-        return Err(ElfError::TooSmall);
-    }
-
-    // SAFETY: length check above guarantees data is large enough for Elf64Ehdr.
-    // cast_ptr_alignment: assumes the caller's slice is 8-byte aligned; this is
-    // not enforced (#558).
-    #[allow(clippy::cast_ptr_alignment)]
-    let ehdr = unsafe { &*data.as_ptr().cast::<Elf64Ehdr>() };
+    let ehdr = decode_ehdr(data).ok_or(ElfError::TooSmall)?;
 
     if ehdr.e_ident[0] != ELFMAG0
         || ehdr.e_ident[1] != ELFMAG1
@@ -403,8 +400,9 @@ fn validate_tail(ehdr: &Elf64Ehdr, data: &[u8], expected_machine: u16) -> Result
     }
 
     // Verify the program header table fits within the file data.
-    let phdr_end = (ehdr.e_phoff as usize)
-        .checked_add(ehdr.e_phnum as usize * size_of::<Elf64Phdr>())
+    let phdr_end = usize::try_from(ehdr.e_phoff)
+        .ok()
+        .and_then(|base| base.checked_add(ehdr.e_phnum as usize * size_of::<Elf64Phdr>()))
         .ok_or(ElfError::PhdrTableOverflow)?;
     if phdr_end > data.len()
     {
@@ -412,6 +410,32 @@ fn validate_tail(ehdr: &Elf64Ehdr, data: &[u8], expected_machine: u16) -> Result
     }
 
     Ok(())
+}
+
+/// Decode the ELF header from the first `size_of::<Elf64Ehdr>()` bytes of
+/// `data`, or `None` when `data` is shorter. Byte decoding needs no
+/// alignment of `data`.
+fn decode_ehdr(data: &[u8]) -> Option<Elf64Ehdr>
+{
+    let b = data.get(..size_of::<Elf64Ehdr>())?;
+    let mut e_ident = [0u8; 16];
+    e_ident.copy_from_slice(&b[0..16]);
+    Some(Elf64Ehdr {
+        e_ident,
+        e_type: u16_le(&b[16..18]),
+        e_machine: u16_le(&b[18..20]),
+        e_version: u32_le(&b[20..24]),
+        e_entry: u64_le(&b[24..32]),
+        e_phoff: u64_le(&b[32..40]),
+        e_shoff: u64_le(&b[40..48]),
+        e_flags: u32_le(&b[48..52]),
+        e_ehsize: u16_le(&b[52..54]),
+        e_phentsize: u16_le(&b[54..56]),
+        e_phnum: u16_le(&b[56..58]),
+        e_shentsize: u16_le(&b[58..60]),
+        e_shnum: u16_le(&b[60..62]),
+        e_shstrndx: u16_le(&b[62..64]),
+    })
 }
 
 /// Return the entry point virtual address from a validated ELF header.
@@ -443,16 +467,17 @@ impl Iterator for LoadSegmentIter<'_>
     {
         while self.index < self.phdr_count
         {
-            let offset = self.phdr_base + self.index * size_of::<Elf64Phdr>();
+            let index = self.index;
             self.index += 1;
-
-            // SAFETY: the validator (`validate_tail`) confirmed the entire
-            // program header table fits within data. Each entry is at a known
-            // offset.
-            // cast_ptr_alignment: assumes `data` and `e_phoff` are 8-byte
-            // aligned; not enforced (#558).
-            #[allow(clippy::cast_ptr_alignment)]
-            let phdr = unsafe { &*self.data.as_ptr().add(offset).cast::<Elf64Phdr>() };
+            let phdr = match read_phdr_at(self.data, self.phdr_base, index)
+            {
+                Ok(phdr) => phdr,
+                Err(e) =>
+                {
+                    self.index = self.phdr_count;
+                    return Some(Err(e));
+                }
+            };
 
             if phdr.p_type != PT_LOAD
             {
@@ -485,19 +510,22 @@ impl Iterator for LoadSegmentIter<'_>
 /// Return an iterator over `PT_LOAD` segments in a validated ELF image.
 ///
 /// `ehdr` must have been returned by a successful [`validate`] or
-/// [`validate_executable`] call on `data`. The iterator yields one [`LoadSegment`] per `PT_LOAD` program header,
-/// skipping all other segment types.
+/// [`validate_executable`] call on `data`. The iterator yields one
+/// [`LoadSegment`] per `PT_LOAD` program header, skipping all other segment
+/// types.
 ///
 /// # Errors
 ///
 /// Individual segments may yield `Err(`[`ElfError::SegmentOverflow`]`)` if
-/// their file data extends beyond the ELF image.
+/// their file data extends beyond the ELF image. The iterator yields
+/// `Err(`[`ElfError::PhdrTableOverflow`]`)` and ends if a program header lies
+/// outside `data` (`ehdr` paired with data it was not validated against).
 #[must_use]
 pub fn load_segments<'a>(ehdr: &Elf64Ehdr, data: &'a [u8]) -> LoadSegmentIter<'a>
 {
     LoadSegmentIter {
         data,
-        phdr_base: ehdr.e_phoff as usize,
+        phdr_base: usize::try_from(ehdr.e_phoff).unwrap_or(usize::MAX),
         phdr_count: ehdr.e_phnum as usize,
         index: 0,
     }
@@ -527,16 +555,17 @@ impl Iterator for LoadSegmentMetaIter<'_>
     {
         while self.index < self.phdr_count
         {
-            let offset = self.phdr_base + self.index * size_of::<Elf64Phdr>();
+            let index = self.index;
             self.index += 1;
-
-            // SAFETY: the validator (`validate_tail`) confirmed the entire
-            // program header table fits within header_data. Each entry is at a
-            // known offset.
-            // cast_ptr_alignment: assumes `header_data` and `e_phoff` are 8-byte
-            // aligned; not enforced (#558).
-            #[allow(clippy::cast_ptr_alignment)]
-            let phdr = unsafe { &*self.header_data.as_ptr().add(offset).cast::<Elf64Phdr>() };
+            let phdr = match read_phdr_at(self.header_data, self.phdr_base, index)
+            {
+                Ok(phdr) => phdr,
+                Err(e) =>
+                {
+                    self.index = self.phdr_count;
+                    return Some(Err(e));
+                }
+            };
 
             if phdr.p_type != PT_LOAD
             {
@@ -569,14 +598,16 @@ impl Iterator for LoadSegmentMetaIter<'_>
 /// Return an iterator over `PT_LOAD` segments from the ELF header page only.
 ///
 /// `ehdr` must have been returned by a successful [`validate`] or
-/// [`validate_executable`] call on `header_data`. Segment file bounds are checked against `file_size`
-/// rather than the buffer length, allowing the caller to hold only the
-/// first page of the ELF file.
+/// [`validate_executable`] call on `header_data`. Segment file bounds are
+/// checked against `file_size` rather than the buffer length, allowing the
+/// caller to hold only the first page of the ELF file.
 ///
 /// # Errors
 ///
 /// Individual segments may yield `Err(`[`ElfError::SegmentOverflow`]`)` if
-/// their file data extends beyond `file_size`.
+/// their file data extends beyond `file_size`. The iterator yields
+/// `Err(`[`ElfError::PhdrTableOverflow`]`)` and ends if a program header lies
+/// outside `header_data`.
 #[must_use]
 pub fn load_segments_metadata<'a>(
     ehdr: &Elf64Ehdr,
@@ -587,7 +618,7 @@ pub fn load_segments_metadata<'a>(
     LoadSegmentMetaIter {
         header_data,
         file_size,
-        phdr_base: ehdr.e_phoff as usize,
+        phdr_base: usize::try_from(ehdr.e_phoff).unwrap_or(usize::MAX),
         phdr_count: ehdr.e_phnum as usize,
         index: 0,
     }
@@ -608,21 +639,16 @@ pub fn load_segments_metadata<'a>(
 /// # Errors
 ///
 /// Returns [`ElfError::SegmentOverflow`] if the `PT_TLS` segment's file data
-/// extends beyond the ELF image.
+/// extends beyond the ELF image, or [`ElfError::PhdrTableOverflow`] if a
+/// program header lies outside `data`.
 pub fn tls_segment(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<TlsSegment>, ElfError>
 {
-    let phdr_base = ehdr.e_phoff as usize;
+    let phdr_base = usize::try_from(ehdr.e_phoff).unwrap_or(usize::MAX);
     let phdr_count = ehdr.e_phnum as usize;
 
     for i in 0..phdr_count
     {
-        let offset = phdr_base + i * size_of::<Elf64Phdr>();
-        // SAFETY: the validator (`validate_tail`) confirmed the phdr table
-        // fits within data.
-        // cast_ptr_alignment: assumes `data` and `e_phoff` are 8-byte aligned;
-        // not enforced (#558).
-        #[allow(clippy::cast_ptr_alignment)]
-        let phdr = unsafe { &*data.as_ptr().add(offset).cast::<Elf64Phdr>() };
+        let phdr = read_phdr_at(data, phdr_base, i)?;
 
         if phdr.p_type != PT_TLS
         {
@@ -901,6 +927,11 @@ fn decode_shdr(bytes: &[u8]) -> Elf64Shdr
     }
 }
 
+fn u16_le(b: &[u8]) -> u16
+{
+    u16::from_le_bytes([b[0], b[1]])
+}
+
 fn u32_le(b: &[u8]) -> u32
 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
@@ -963,25 +994,20 @@ fn parse_note_payload(bytes: &[u8]) -> Option<u32>
 /// # Errors
 ///
 /// Returns [`ElfError::SegmentOverflow`] if the `PT_TLS` segment's file data
-/// extends beyond `file_size`.
+/// extends beyond `file_size`, or [`ElfError::PhdrTableOverflow`] if a
+/// program header lies outside `header_data`.
 pub fn tls_segment_metadata(
     ehdr: &Elf64Ehdr,
     header_data: &[u8],
     file_size: u64,
 ) -> Result<Option<TlsSegment>, ElfError>
 {
-    let phdr_base = ehdr.e_phoff as usize;
+    let phdr_base = usize::try_from(ehdr.e_phoff).unwrap_or(usize::MAX);
     let phdr_count = ehdr.e_phnum as usize;
 
     for i in 0..phdr_count
     {
-        let offset = phdr_base + i * size_of::<Elf64Phdr>();
-        // SAFETY: the validator (`validate_tail`) confirmed the phdr table
-        // fits within header_data.
-        // cast_ptr_alignment: assumes `header_data` and `e_phoff` are 8-byte
-        // aligned; not enforced (#558).
-        #[allow(clippy::cast_ptr_alignment)]
-        let phdr = unsafe { &*header_data.as_ptr().add(offset).cast::<Elf64Phdr>() };
+        let phdr = read_phdr_at(header_data, phdr_base, i)?;
 
         if phdr.p_type != PT_TLS
         {
@@ -1024,6 +1050,7 @@ pub fn tls_segment_metadata(
 /// # Errors
 ///
 /// - [`ElfError::NoSegments`] if the image has no `PT_LOAD` segment.
+/// - [`ElfError::PhdrTableOverflow`] if a program header lies outside `data`.
 /// - [`ElfError::SegmentOverflow`] if a segment's `p_vaddr + p_memsz`
 ///   overflows.
 pub fn load_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<(u64, u64), ElfError>
@@ -1033,7 +1060,7 @@ pub fn load_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<(u64, u64), ElfError>
     let mut found = false;
     for i in 0..ehdr.e_phnum as usize
     {
-        let phdr = read_phdr(data, ehdr, i);
+        let phdr = read_phdr(data, ehdr, i)?;
         if phdr.p_type != PT_LOAD || phdr.p_memsz == 0
         {
             continue;
@@ -1053,26 +1080,30 @@ pub fn load_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<(u64, u64), ElfError>
     Ok((min_vaddr, max_end))
 }
 
-/// Return the `PT_GNU_RELRO` span `(vaddr, memsz)`, or `None` when the image
-/// has no RELRO region.
+/// Return the `PT_GNU_RELRO` span `(vaddr, memsz)`, or `Ok(None)` when the
+/// image has no RELRO region.
 ///
 /// The span marks data that must become read-only once relocations are
 /// applied (GOT, `.data.rel.ro`, the in-image TLS template). Loaders map the
 /// fully-covered pages of a writable segment read-only; link VAs — `ET_DYN`
 /// callers add the load bias. Needs only the program header table, so the
 /// ELF header page suffices (like [`load_span`]).
-#[must_use]
-pub fn relro_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Option<(u64, u64)>
+///
+/// # Errors
+///
+/// [`ElfError::PhdrTableOverflow`] if a program header lies outside `data`
+/// (`ehdr` paired with data it was not validated against).
+pub fn relro_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<(u64, u64)>, ElfError>
 {
     for i in 0..ehdr.e_phnum as usize
     {
-        let phdr = read_phdr(data, ehdr, i);
+        let phdr = read_phdr(data, ehdr, i)?;
         if phdr.p_type == PT_GNU_RELRO && phdr.p_memsz > 0
         {
-            return Some((phdr.p_vaddr, phdr.p_memsz));
+            return Ok(Some((phdr.p_vaddr, phdr.p_memsz)));
         }
     }
-    None
+    Ok(None)
 }
 
 // ── PT_DYNAMIC / RELATIVE relocations ────────────────────────────────────────
@@ -1204,7 +1235,7 @@ fn resolve_rela_table(
 
     for i in 0..ehdr.e_phnum as usize
     {
-        let phdr = read_phdr(phdr_data, ehdr, i);
+        let phdr = read_phdr(phdr_data, ehdr, i)?;
         if phdr.p_type != PT_LOAD
         {
             continue;
@@ -1233,18 +1264,24 @@ fn resolve_rela_table(
     Err(ElfError::MalformedDynamic)
 }
 
-/// Locate the `PT_DYNAMIC` program header; returns `(p_offset, p_filesz)`.
-fn find_dynamic_phdr(ehdr: &Elf64Ehdr, phdr_data: &[u8]) -> Option<(u64, u64)>
+/// Locate the `PT_DYNAMIC` program header; returns `(p_offset, p_filesz)`,
+/// or `None` when the image has none.
+///
+/// # Errors
+///
+/// [`ElfError::PhdrTableOverflow`] if a program header lies outside
+/// `phdr_data`.
+fn find_dynamic_phdr(ehdr: &Elf64Ehdr, phdr_data: &[u8]) -> Result<Option<(u64, u64)>, ElfError>
 {
     for i in 0..ehdr.e_phnum as usize
     {
-        let phdr = read_phdr(phdr_data, ehdr, i);
+        let phdr = read_phdr(phdr_data, ehdr, i)?;
         if phdr.p_type == PT_DYNAMIC
         {
-            return Some((phdr.p_offset, phdr.p_filesz));
+            return Ok(Some((phdr.p_offset, phdr.p_filesz)));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Locate the `.rela.dyn` table of a fully-mapped, validated ELF image.
@@ -1260,6 +1297,7 @@ fn find_dynamic_phdr(ehdr: &Elf64Ehdr, phdr_data: &[u8]) -> Option<(u64, u64)>
 /// - [`ElfError::UnsupportedRelocation`] if the dynamic section describes
 ///   `DT_REL`, `DT_RELR`, or active `DT_JMPREL` relocations — formats the
 ///   loaders do not apply.
+/// - [`ElfError::PhdrTableOverflow`] if a program header lies outside `data`.
 /// - [`ElfError::MalformedDynamic`] for structural failures: `PT_DYNAMIC`
 ///   out of file bounds, a missing counterpart tag, `DT_RELAENT` ≠
 ///   [`RELA_ENTRY_SIZE`], `DT_RELASZ` not a multiple of it or above
@@ -1267,7 +1305,7 @@ fn find_dynamic_phdr(ehdr: &Elf64Ehdr, phdr_data: &[u8]) -> Option<(u64, u64)>
 ///   segment's file data.
 pub fn rela_table(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<RelaTable>, ElfError>
 {
-    let Some((offset, filesz)) = find_dynamic_phdr(ehdr, data)
+    let Some((offset, filesz)) = find_dynamic_phdr(ehdr, data)?
     else
     {
         return Ok(None);
@@ -1293,7 +1331,7 @@ pub fn rela_table(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<RelaTable>, El
 ///
 /// # Errors
 ///
-/// As [`rela_table`]; a failed or short `read_at`, or an oversized
+/// As [`rela_table`] (with `header_data` for `data`); a failed or short `read_at`, or an oversized
 /// `PT_DYNAMIC` segment, is [`ElfError::MalformedDynamic`].
 pub fn rela_table_metadata<F>(
     ehdr: &Elf64Ehdr,
@@ -1304,7 +1342,7 @@ pub fn rela_table_metadata<F>(
 where
     F: FnMut(u64, &mut [u8]) -> Option<usize>,
 {
-    let Some((offset, filesz)) = find_dynamic_phdr(ehdr, header_data)
+    let Some((offset, filesz)) = find_dynamic_phdr(ehdr, header_data)?
     else
     {
         return Ok(None);
@@ -1486,14 +1524,31 @@ pub fn apply_relative_relocs(
     applied
 }
 
-/// Decode program header `idx` from a validated ELF image or header page.
-/// Byte decoding avoids any alignment requirement on `data`; bounds were
-/// established by [`validate`] / [`validate_executable`].
-fn read_phdr(data: &[u8], ehdr: &Elf64Ehdr, idx: usize) -> Elf64Phdr
+/// Decode program header `idx` of `ehdr`'s table from `data`.
+///
+/// Byte decoding avoids any alignment requirement on `data`. The bounds are
+/// checked here rather than trusted from validation, so a header paired with
+/// data it was not validated against yields
+/// [`ElfError::PhdrTableOverflow`] instead of an out-of-bounds read.
+fn read_phdr(data: &[u8], ehdr: &Elf64Ehdr, idx: usize) -> Result<Elf64Phdr, ElfError>
 {
-    let offset = ehdr.e_phoff as usize + idx * size_of::<Elf64Phdr>();
-    let b = &data[offset..offset + size_of::<Elf64Phdr>()];
-    Elf64Phdr {
+    let base = usize::try_from(ehdr.e_phoff).map_err(|_| ElfError::PhdrTableOverflow)?;
+    read_phdr_at(data, base, idx)
+}
+
+/// Decode the program header at index `idx` of a table at byte offset `base`
+/// in `data`, bounds-checked; see [`read_phdr`].
+fn read_phdr_at(data: &[u8], base: usize, idx: usize) -> Result<Elf64Phdr, ElfError>
+{
+    let offset = idx
+        .checked_mul(size_of::<Elf64Phdr>())
+        .and_then(|off| off.checked_add(base))
+        .ok_or(ElfError::PhdrTableOverflow)?;
+    let end = offset
+        .checked_add(size_of::<Elf64Phdr>())
+        .ok_or(ElfError::PhdrTableOverflow)?;
+    let b = data.get(offset..end).ok_or(ElfError::PhdrTableOverflow)?;
+    Ok(Elf64Phdr {
         p_type: u32_le(&b[0..4]),
         p_flags: u32_le(&b[4..8]),
         p_offset: u64_le(&b[8..16]),
@@ -1502,7 +1557,7 @@ fn read_phdr(data: &[u8], ehdr: &Elf64Ehdr, idx: usize) -> Elf64Phdr
         p_filesz: u64_le(&b[32..40]),
         p_memsz: u64_le(&b[40..48]),
         p_align: u64_le(&b[48..56]),
-    }
+    })
 }
 
 fn i64_le(b: &[u8]) -> i64
@@ -1651,7 +1706,7 @@ mod tests
         ]
     }
 
-    fn valid_executable(img: &[u8]) -> (&Elf64Ehdr, ElfKind)
+    fn valid_executable(img: &[u8]) -> (Elf64Ehdr, ElfKind)
     {
         match validate_executable(img, MACHINE)
         {
@@ -1663,7 +1718,7 @@ mod tests
     fn rela_of(img: &[u8]) -> Result<Option<RelaTable>, ElfError>
     {
         let (ehdr, _) = valid_executable(img);
-        rela_table(ehdr, img)
+        rela_table(&ehdr, img)
     }
 
     #[test]
@@ -1958,7 +2013,7 @@ mod tests
     {
         let img = build_image(ET_DYN, &std_dynamic());
         let (ehdr, _) = valid_executable(&img);
-        assert_eq!(load_span(ehdr, &img), Ok((0, 0x500)));
+        assert_eq!(load_span(&ehdr, &img), Ok((0, 0x500)));
     }
 
     #[test]
@@ -1966,7 +2021,7 @@ mod tests
     {
         let mut img = build_image(ET_DYN, &std_dynamic());
         let (ehdr, _) = valid_executable(&img);
-        assert_eq!(relro_span(ehdr, &img), None);
+        assert_eq!(relro_span(&ehdr, &img), Ok(None));
         // Rewrite the PT_DYNAMIC header as PT_GNU_RELRO covering [0x200, 0x300).
         put(
             &mut img,
@@ -1974,7 +2029,7 @@ mod tests
             &phdr_bytes(PT_GNU_RELRO, PF_R, 0x200, 0x200, 0x100, 0x100),
         );
         let (ehdr, _) = valid_executable(&img);
-        assert_eq!(relro_span(ehdr, &img), Some((0x200, 0x100)));
+        assert_eq!(relro_span(&ehdr, &img), Ok(Some((0x200, 0x100))));
     }
 
     #[test]
@@ -1985,7 +2040,7 @@ mod tests
         put(&mut img, 64, &phdr_bytes(0, 0, 0, 0, 0, 0));
         put(&mut img, 64 + 56, &phdr_bytes(0, 0, 0, 0, 0, 0));
         let (ehdr, _) = valid_executable(&img);
-        assert_eq!(load_span(ehdr, &img), Err(ElfError::NoSegments));
+        assert_eq!(load_span(&ehdr, &img), Err(ElfError::NoSegments));
     }
 
     #[test]
@@ -1994,14 +2049,14 @@ mod tests
         let img = build_image(ET_DYN, &std_dynamic());
         let (ehdr, _) = valid_executable(&img);
         let header_page = &img[..0x100];
-        let streamed = rela_table_metadata(ehdr, header_page, img.len() as u64, |off, dst| {
+        let streamed = rela_table_metadata(&ehdr, header_page, img.len() as u64, |off, dst| {
             let off = off as usize;
             img.get(off..off + dst.len()).map(|src| {
                 dst.copy_from_slice(src);
                 dst.len()
             })
         });
-        assert_eq!(streamed, rela_table(ehdr, &img));
+        assert_eq!(streamed, rela_table(&ehdr, &img));
     }
 
     #[test]
@@ -2009,7 +2064,7 @@ mod tests
     {
         let img = build_image(ET_DYN, &std_dynamic());
         let (ehdr, _) = valid_executable(&img);
-        let failed = rela_table_metadata(ehdr, &img[..0x100], img.len() as u64, |_, _| None);
+        let failed = rela_table_metadata(&ehdr, &img[..0x100], img.len() as u64, |_, _| None);
         assert_eq!(failed, Err(ElfError::MalformedDynamic));
     }
 
@@ -2062,7 +2117,7 @@ mod tests
             ),
         );
         let (ehdr, _) = valid_executable(&img);
-        let streamed = rela_table_metadata(ehdr, &img[..0x100], 1 << 20, |off, dst| {
+        let streamed = rela_table_metadata(&ehdr, &img[..0x100], 1 << 20, |off, dst| {
             let off = off as usize;
             img.get(off..off + dst.len()).map(|src| {
                 dst.copy_from_slice(src);
@@ -2070,5 +2125,64 @@ mod tests
             })
         });
         assert_eq!(streamed, Err(ElfError::MalformedDynamic));
+    }
+
+    #[test]
+    fn program_headers_at_an_unaligned_offset_decode()
+    {
+        // e_phoff = 65 places the table at an odd offset, where a typed
+        // reference into the image would be misaligned.
+        let mut img = vec![0u8; 0x400];
+        let mut eh = ehdr_bytes(ET_EXEC, 1);
+        put(&mut eh, 32, &65u64.to_le_bytes());
+        put(&mut img, 0, &eh);
+        put(
+            &mut img,
+            65,
+            &phdr_bytes(PT_LOAD, PF_R | PF_X, 0, 0, 0x200, 0x200),
+        );
+        let (ehdr, _) = valid_executable(&img);
+        let segs: Vec<_> = load_segments(&ehdr, &img).collect();
+        assert!(matches!(
+            segs.as_slice(),
+            [Ok(LoadSegment {
+                filesz: 0x200,
+                executable: true,
+                ..
+            })]
+        ));
+    }
+
+    #[test]
+    fn header_paired_with_shorter_data_errs_instead_of_reading_past_it()
+    {
+        // The table spans [64, 232); a header validated against the full
+        // image and handed a 100-byte prefix must not read past the prefix.
+        let img = build_image(ET_DYN, &std_dynamic());
+        let (ehdr, _) = valid_executable(&img);
+        let short = &img[..100];
+        assert!(matches!(
+            load_segments(&ehdr, short).next(),
+            Some(Err(ElfError::PhdrTableOverflow))
+        ));
+        assert!(matches!(
+            load_segments_metadata(&ehdr, short, FILE_SIZE as u64).next(),
+            Some(Err(ElfError::PhdrTableOverflow))
+        ));
+        assert!(matches!(
+            tls_segment(&ehdr, short),
+            Err(ElfError::PhdrTableOverflow)
+        ));
+        assert!(matches!(
+            tls_segment_metadata(&ehdr, short, FILE_SIZE as u64),
+            Err(ElfError::PhdrTableOverflow)
+        ));
+        assert_eq!(load_span(&ehdr, short), Err(ElfError::PhdrTableOverflow));
+        assert_eq!(relro_span(&ehdr, short), Err(ElfError::PhdrTableOverflow));
+        assert_eq!(rela_table(&ehdr, short), Err(ElfError::PhdrTableOverflow));
+        assert_eq!(
+            rela_table_metadata(&ehdr, short, FILE_SIZE as u64, |_, _| None),
+            Err(ElfError::PhdrTableOverflow)
+        );
     }
 }

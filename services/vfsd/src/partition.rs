@@ -40,7 +40,10 @@ pub fn alloc_scratch(memmgr_ep: u32, self_aspace: u32, ipc_buf: *mut u64) -> Opt
         range.va_start()
     };
     let cap = request_one_page(memmgr_ep, ipc_buf)?;
-    syscall::mem_map(cap, self_aspace, scratch_va, 0, 1, MAP_WRITABLE).ok()?;
+    // SAFETY: scratch_va is a fresh page reservation from the per-process
+    // arena, owned here for the process's lifetime: VA no Rust object or IPC
+    // page occupies.
+    unsafe { syscall::mem_map(cap, self_aspace, scratch_va, 0, 1, MAP_WRITABLE) }.ok()?;
     Some((cap, scratch_va))
 }
 

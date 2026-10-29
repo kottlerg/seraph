@@ -203,7 +203,10 @@ releasing a still-retyped region is correctness-safe (the kernel refuses to
 re-hand-out live bytes) but the run is only re-grantable whole — its retype
 bump pointer blocks `memory_split`, per
 [`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_memory_split-33)
-§"`SYS_MEMORY_SPLIT`" — until the retype is freed.
+§"`SYS_MEMORY_SPLIT`" — until the retype is freed, and its next grantee cannot `mem_map` it
+below that pointer either (`InvalidArgument`; see
+[`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_mem_map-16)
+§"`SYS_MEM_MAP`"), so a mapping grant of such a run fails until the retype is freed.
 
 `UNREGISTER_REGION` from a live process is the mid-life counterpart for a
 demand-paged region: memmgr removes the region node and **actively unmaps** the

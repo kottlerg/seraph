@@ -35,6 +35,38 @@ use init_protocol::InitInfo;
 
 use crate::TestContext;
 
+/// A fresh range-capability lineage root for `integration::range_copy_lineage`:
+/// the low page split off a copy of a boot `Mmio` aperture cap of at least two
+/// pages (riscv64 has no I/O ports). The apertures are taken from `InitInfo`'s
+/// descriptors, whose slots were never recycled, so their handles carry
+/// generation 0; one an earlier test consumed refuses the derive and is
+/// skipped.
+pub fn fresh_range_root(ctx: &TestContext) -> Option<u32>
+{
+    // SAFETY: the kernel maps the read-only InitInfo page at init_info_va for
+    // ktest's lifetime.
+    let info = unsafe { &*(ctx.init_info_va as *const InitInfo) };
+    for d in crate::init_info::descriptors(info)
+    {
+        if d.cap_type != init_protocol::CapType::Mmio || d.aux1 < 0x2000
+        {
+            continue;
+        }
+        let Ok(copy) = syscall::cap_derive(d.slot, syscall::RIGHTS_ALL)
+        else
+        {
+            continue;
+        };
+        if let Ok((low, high)) = syscall::mmio_split(copy, 0x1000)
+        {
+            syscall::cap_delete(high).ok();
+            return Some(low);
+        }
+        syscall::cap_delete(copy).ok();
+    }
+    None
+}
+
 /// Exception cause a not-present user store faults with (store/AMO page
 /// fault), as recorded in `EXIT_FAULT_BASE + <vector>` when the fault kills
 /// the thread.
@@ -44,6 +76,18 @@ pub const PAGE_FAULT_STORE_VECTOR: u64 = 15;
 /// `EXIT_FAULT_BASE + <vector>` when the fault kills the thread.
 pub const ILLEGAL_INSTRUCTION_VECTOR: u64 = 2;
 
+/// Exception cause a not-present user load faults with (load page fault), as
+/// recorded in `EXIT_FAULT_BASE + <vector>` when the fault kills the thread.
+pub const PAGE_FAULT_LOAD_VECTOR: u64 = 13;
+
+/// Physical base of an MMIO register page that a test may read without side
+/// effects: the console UART, which init receives as its own `Mmio` cap. Its
+/// line-status register, at [`MMIO_PROBE_OFFSET`], has no read side effect.
+pub const MMIO_PROBE_PHYS: u64 = serial::UART_PHYS;
+
+/// Byte offset of the side-effect-free register (LSR) in the [`MMIO_PROBE_PHYS`] page.
+pub const MMIO_PROBE_OFFSET: usize = 5;
+
 /// Size of the register file `thread_read_regs` returns (the kernel
 /// `TrapFrame`), as the ABI publishes it.
 pub const TRAP_FRAME_BYTES: u64 = syscall_abi::REGS_RISCV64_SIZE as u64;
@@ -51,6 +95,22 @@ pub const TRAP_FRAME_BYTES: u64 = syscall_abi::REGS_RISCV64_SIZE as u64;
 /// Byte offset of the instruction pointer (`sepc`) in the register file: the
 /// field a register-file edit redirects.
 pub const IP_OFFSET: usize = syscall_abi::REGS_RISCV64_IP_OFFSET;
+
+/// End of the window the framebuffer is mapped into from `FB_VA`: the UART
+/// window at `serial::SERIAL_VA`, the next fixed device mapping above it.
+pub const FB_WINDOW_END: u64 = serial::SERIAL_VA;
+
+/// Byte offset of the stack pointer (`sp`) in the register file.
+pub const SP_OFFSET: usize = syscall_abi::REGS_RISCV64_SP_OFFSET;
+
+/// The stack pointer an `extern "C"` function expects on entry, at or below
+/// `sp`: the RISC-V psABI keeps `sp` 16-byte aligned at every call, so a frame
+/// redirected into an entry gets `sp & !0xF`, at most 15 bytes below `sp`.
+#[must_use]
+pub const fn entry_stack_pointer(sp: u64) -> u64
+{
+    sp & !0xF
+}
 
 /// Byte offset of the syscall-number register (`a7`) in the kernel
 /// `TrapFrame`: it holds the number of the syscall a thread is blocked in, and

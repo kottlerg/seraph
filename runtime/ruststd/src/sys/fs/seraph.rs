@@ -922,13 +922,13 @@ fn acquire_write_frame(aspace: u32, memmgr_ep: u32) -> io::Result<WriteFrame>
     {
         Some("seraph fs: page-table funding failed for write frame")
     }
-    else if syscall::mem_map(cap, aspace, range.va_start(), 0, 1, syscall::MAP_WRITABLE).is_err()
-    {
-        Some("seraph fs: mem_map MAP_WRITABLE failed")
-    }
     else
     {
-        None
+        // SAFETY: `range` is a fresh reservation from the per-process arena,
+        // owned here: VA no Rust object or IPC page occupies.
+        let mapped =
+            unsafe { syscall::mem_map(cap, aspace, range.va_start(), 0, 1, syscall::MAP_WRITABLE) };
+        mapped.is_err().then_some("seraph fs: mem_map MAP_WRITABLE failed")
     };
     if let Some(msg) = failure
     {
@@ -995,7 +995,10 @@ impl Drop for ReadMark<'_>
 /// reserved, and accounted to this process until it exits.
 fn release_write_frame(frame: WriteFrame, aspace: u32)
 {
-    if syscall::mem_unmap(aspace, frame.va(), 1).is_err()
+    // SAFETY: the frame owns its reserved page, which holds no Rust object;
+    // the write path reaches it only through raw pointers, and consuming the
+    // frame here ends every use of it.
+    if unsafe { syscall::mem_unmap(aspace, frame.va(), 1) }.is_err()
     {
         return;
     }
@@ -1692,13 +1695,13 @@ impl File
         {
             Some("seraph fs: page-table funding failed for read frame")
         }
-        else if syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READ).is_err()
-        {
-            Some("seraph fs: mem_map failed")
-        }
         else
         {
-            None
+            // SAFETY: `range` is a fresh reservation from the per-process
+            // arena, owned here: VA no Rust object or IPC page occupies.
+            let mapped =
+                unsafe { syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READ) };
+            mapped.is_err().then_some("seraph fs: mem_map failed")
         };
         if let Some(msg) = failure
         {

@@ -97,7 +97,10 @@ fn main() -> !
         std::os::seraph::log!("failed to fund PT budget for ECAM region");
         halt_loop();
     }
-    if syscall::mmio_map(caps.self_aspace, ecam_cap, ecam_va, 0).is_err()
+    // SAFETY: ecam_va starts `ecam_range`, a fresh reservation of the ECAM
+    // region's page count from the per-process arena, owned here: VA no Rust
+    // object or IPC page occupies.
+    if unsafe { syscall::mmio_map(caps.self_aspace, ecam_cap, ecam_va, 0) }.is_err()
     {
         std::os::seraph::log!("failed to map ECAM region");
         halt_loop();
@@ -112,7 +115,9 @@ fn main() -> !
     let dev_count = unsafe { pci::pci_enumerate(ecam_va, start_bus, end_bus, &mut devices) };
     std::os::seraph::log!("PCI devices found: {:#x}", dev_count as u64);
 
-    let _ = syscall::mem_unmap(caps.self_aspace, ecam_va, ecam_pages);
+    // SAFETY: `pci_enumerate` has returned and reached ECAM only through raw
+    // pointers; the span is `ecam_range`, owned here.
+    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, ecam_va, ecam_pages) };
     unreserve_pages(ecam_range);
 
     // Create block device service endpoint for the driver to receive on.
@@ -787,15 +792,19 @@ fn read_xsdt_phys(caps: &caps::DevmgrCaps) -> Option<u64>
     }
     let range = reserve_pages(1).ok()?;
     let va = range.va_start();
-    if syscall::mem_map(
-        caps.rsdp_memory_cap,
-        caps.self_aspace,
-        va,
-        0,
-        1,
-        syscall_abi::MAP_READONLY,
-    )
-    .is_err()
+    // SAFETY: `range` is a fresh reservation from the per-process arena,
+    // owned here: VA no Rust object or IPC page occupies.
+    let mapped = unsafe {
+        syscall::mem_map(
+            caps.rsdp_memory_cap,
+            caps.self_aspace,
+            va,
+            0,
+            1,
+            syscall_abi::MAP_FROM_CAP,
+        )
+    };
+    if mapped.is_err()
     {
         unreserve_pages(range);
         return None;
@@ -809,7 +818,9 @@ fn read_xsdt_phys(caps: &caps::DevmgrCaps) -> Option<u64>
         )
     };
     let xsdt_phys = firmware::acpi::rsdp_xsdt_phys(rsdp_bytes);
-    let _ = syscall::mem_unmap(caps.self_aspace, va, 1);
+    // SAFETY: the span is this call's own reservation, and `rsdp_bytes`,
+    // the only reference into it, is not used past the line above.
+    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, 1) };
     unreserve_pages(range);
     xsdt_phys
 }
@@ -824,15 +835,19 @@ fn read_xsdt_entries(caps: &caps::DevmgrCaps, xsdt_phys: u64) -> Option<std::vec
     let span = usize::try_from(map_pages * PAGE_SIZE).ok()?;
     let range = reserve_pages(map_pages).ok()?;
     let va = range.va_start();
-    if syscall::mem_map(
-        region.slot,
-        caps.self_aspace,
-        va,
-        0,
-        map_pages,
-        syscall_abi::MAP_READONLY,
-    )
-    .is_err()
+    // SAFETY: `range` is a fresh reservation from the per-process arena,
+    // owned here: VA no Rust object or IPC page occupies.
+    let mapped = unsafe {
+        syscall::mem_map(
+            region.slot,
+            caps.self_aspace,
+            va,
+            0,
+            map_pages,
+            syscall_abi::MAP_FROM_CAP,
+        )
+    };
+    if mapped.is_err()
     {
         unreserve_pages(range);
         return None;
@@ -852,7 +867,9 @@ fn read_xsdt_entries(caps: &caps::DevmgrCaps, xsdt_phys: u64) -> Option<std::vec
             }
         }
     }
-    let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
+    // SAFETY: the span is this call's own reservation, and the slice over it
+    // is not used past this point.
+    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, map_pages) };
     unreserve_pages(range);
     Some(entries)
 }
@@ -867,15 +884,19 @@ fn read_mcfg_at(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<firmware::Ecam
     let span = usize::try_from(map_pages * PAGE_SIZE).ok()?;
     let range = reserve_pages(map_pages).ok()?;
     let va = range.va_start();
-    if syscall::mem_map(
-        region.slot,
-        caps.self_aspace,
-        va,
-        0,
-        map_pages,
-        syscall_abi::MAP_READONLY,
-    )
-    .is_err()
+    // SAFETY: `range` is a fresh reservation from the per-process arena,
+    // owned here: VA no Rust object or IPC page occupies.
+    let mapped = unsafe {
+        syscall::mem_map(
+            region.slot,
+            caps.self_aspace,
+            va,
+            0,
+            map_pages,
+            syscall_abi::MAP_FROM_CAP,
+        )
+    };
+    if mapped.is_err()
     {
         unreserve_pages(range);
         return None;
@@ -893,7 +914,9 @@ fn read_mcfg_at(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<firmware::Ecam
             ecam = firmware::acpi::parse_mcfg_ecam(&region_bytes[off..tbl_end]);
         }
     }
-    let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
+    // SAFETY: the span is this call's own reservation, and the slice over it
+    // is not used past this point.
+    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, map_pages) };
     unreserve_pages(range);
     ecam
 }
@@ -906,15 +929,19 @@ fn discover_ecam_dtb(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
     let in_page_off = usize::try_from(caps.dtb_page_base & 0xFFF).ok()?;
     let range = reserve_pages(map_pages).ok()?;
     let va = range.va_start();
-    if syscall::mem_map(
-        caps.dtb_memory_cap,
-        caps.self_aspace,
-        va,
-        0,
-        map_pages,
-        syscall_abi::MAP_READONLY,
-    )
-    .is_err()
+    // SAFETY: `range` is a fresh reservation from the per-process arena,
+    // owned here: VA no Rust object or IPC page occupies.
+    let mapped = unsafe {
+        syscall::mem_map(
+            caps.dtb_memory_cap,
+            caps.self_aspace,
+            va,
+            0,
+            map_pages,
+            syscall_abi::MAP_FROM_CAP,
+        )
+    };
+    if mapped.is_err()
     {
         unreserve_pages(range);
         return None;
@@ -924,7 +951,9 @@ fn discover_ecam_dtb(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
         core::slice::from_raw_parts((va as *const u8).add(in_page_off), span - in_page_off)
     };
     let ecam = firmware::dtb::Fdt::new(blob_bytes).and_then(|fdt| fdt.find_pci_ecam());
-    let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
+    // SAFETY: the span is this call's own reservation, and the slice over it
+    // is not used past this point.
+    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, map_pages) };
     unreserve_pages(range);
     ecam
 }
@@ -959,15 +988,19 @@ fn with_acpi_table<R>(
     let span = usize::try_from(map_pages * PAGE_SIZE).ok()?;
     let range = reserve_pages(map_pages).ok()?;
     let va = range.va_start();
-    if syscall::mem_map(
-        region.slot,
-        caps.self_aspace,
-        va,
-        0,
-        map_pages,
-        syscall_abi::MAP_READONLY,
-    )
-    .is_err()
+    // SAFETY: `range` is a fresh reservation from the per-process arena,
+    // owned here: VA no Rust object or IPC page occupies.
+    let mapped = unsafe {
+        syscall::mem_map(
+            region.slot,
+            caps.self_aspace,
+            va,
+            0,
+            map_pages,
+            syscall_abi::MAP_FROM_CAP,
+        )
+    };
+    if mapped.is_err()
     {
         unreserve_pages(range);
         return None;
@@ -982,7 +1015,9 @@ fn with_acpi_table<R>(
     {
         None
     };
-    let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
+    // SAFETY: the span is this call's own reservation, and the slice over it
+    // is not used past this point.
+    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, map_pages) };
     unreserve_pages(range);
     out
 }
@@ -1486,11 +1521,15 @@ fn find_virtio_bar_cap(
             pci_dev.bar_size[b]
         );
 
-        if let Some(cap) = carve_subrange(caps, pci_dev.bar_phys[b], pci_dev.bar_size[b])
+        // The driver reserves `bar_aperture_pages` of VA for the BAR and
+        // `mmio_map` maps the whole cap region, so the cap covers no more of
+        // the BAR than the VirtIO capability structures reach.
+        let size = pci_dev.bar_size[b].min(pci_dev.virtio_info.bar_aperture_pages() * PAGE_SIZE);
+        if let Some(cap) = carve_subrange(caps, pci_dev.bar_phys[b], size)
         {
             bar_caps[0] = cap;
             bar_bases[0] = pci_dev.bar_phys[b];
-            bar_sizes[0] = pci_dev.bar_size[b];
+            bar_sizes[0] = size;
             count = 1;
         }
         else
@@ -1607,8 +1646,12 @@ fn spawn_virtio_input_from_disk(
 ) -> Option<u32>
 {
     let requested_rights = u64::from(namespace_protocol::rights::READ);
-    let Some(walked) =
+    // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
+    // registered at startup), passed down unchanged.
+    let walked = unsafe {
         ns_client::walk_to_file(drivers_dir_cap, b"virtio-input", requested_rights, ipc_buf)
+    };
+    let Some(walked) = walked
     else
     {
         std::os::seraph::log!("virtio-input: walk_to_file failed (binary missing on rootfs)");
@@ -1891,12 +1934,16 @@ fn spawn_rtc_from_disk(
     // /services/drivers/ subtree, so the namespace server will only ever
     // mint a file cap with at most those bits set.
     let requested_rights = u64::from(namespace_protocol::rights::READ);
-    let Some(walked) = ns_client::walk_to_file(
-        drivers_dir_cap,
-        arch::current::RTC_DRIVER_NAME,
-        requested_rights,
-        ipc_buf,
-    )
+    // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
+    // registered at startup), passed down unchanged.
+    let Some(walked) = (unsafe {
+        ns_client::walk_to_file(
+            drivers_dir_cap,
+            arch::current::RTC_DRIVER_NAME,
+            requested_rights,
+            ipc_buf,
+        )
+    })
     else
     {
         std::os::seraph::log!("rtc: walk_to_file failed (binary missing on rootfs)");
@@ -1970,8 +2017,11 @@ fn test_spawn_orphan(
     const QUERY_BADGE: u64 = 0x7E57;
 
     let requested_rights = u64::from(namespace_protocol::rights::READ);
-    let walked =
-        ns_client::walk_to_file(drivers_dir_cap, b"test-orphan", requested_rights, ipc_buf)?;
+    // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
+    // registered at startup), passed down unchanged.
+    let walked = unsafe {
+        ns_client::walk_to_file(drivers_dir_cap, b"test-orphan", requested_rights, ipc_buf)
+    }?;
 
     // Throwaway service + hw endpoints handed to the child in round 1. Ownership
     // of `hw_cap` transfers to `spawn_simple_device` (moved into the child or

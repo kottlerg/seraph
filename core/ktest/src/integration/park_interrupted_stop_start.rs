@@ -260,7 +260,9 @@ fn spawn_phase(
     // Phases run sequentially and each child is reaped before the next spawn,
     // so the shared stack has exactly one live user.
     let stack = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    spawn::configure_and_start(&child, entry, stack, arg)
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start(&child, entry, stack, arg) }
         .map_err(|_| "integration::park_interrupted_stop_start: start child failed")?;
     Ok(child)
 }
@@ -402,7 +404,10 @@ extern "C" fn recv_entry(arg: u64) -> !
     let (ep, done) = unpack(arg);
     // SAFETY: sole live user of CHILD_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(CHILD_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }

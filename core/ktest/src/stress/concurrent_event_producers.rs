@@ -112,7 +112,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         // SAFETY: stress tests run sequentially; each producer gets its own stack.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        spawn::configure_and_start(&child, producer_entry, stack_top, arg)
+        // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe { spawn::configure_and_start(&child, producer_entry, stack_top, arg) }
             .map_err(|_| "concurrent_event_producers: configure_and_start failed")?;
 
         threads[i] = child.th;

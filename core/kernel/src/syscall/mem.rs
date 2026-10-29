@@ -122,6 +122,18 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidArgument);
     }
 
+    // Retype/map boundary (docs/capability-model.md § Typed Memory): every
+    // live retype lies below the bump cursor at the time of this check, so a
+    // range at or above the page-rounded cursor holds none. A retype that
+    // bumps into the range after this check is the converse order, #577.
+    let retyped_end = crate::cap::retype::current_bump(memory_ref)
+        .div_ceil(PAGE_SIZE as u64)
+        .saturating_mul(PAGE_SIZE as u64);
+    if byte_offset < retyped_end
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+
     // Determine page permissions per `core/kernel/docs/syscalls.md`
     // § `SYS_MEM_MAP` (16), prot_bits.
     let (writable, executable) = if prot_bits != 0

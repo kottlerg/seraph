@@ -26,14 +26,19 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 /// in the low 32 bits of `arg`, then `notification_send` on `done_slot` (high 32 bits) and exit.
 // cast_possible_truncation: slot indices are < 2^32.
 #[allow(clippy::cast_possible_truncation)]
+/// IPC page of the [`caller_entry`] child.
+static mut CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
 extern "C" fn caller_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 
-    // Register the shared IPC buffer for this child thread.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(CALLER_IPC_PAGE));
+    // SAFETY: `CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         syscall::notification_send(done_slot, 1).ok();
         syscall::thread_exit();
@@ -82,7 +87,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     let arg = u64::from(child_ep) | (u64::from(child_done) << 32);
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start(&child, caller_entry, stack_top, arg)
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, caller_entry, stack_top, arg) }
         .map_err(|_| "cap_move_into_fresh_cspace_then_ipc: configure_and_start failed")?;
 
     // Server side: recv the call through the parent's original cap, reply,

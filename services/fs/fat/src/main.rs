@@ -10,9 +10,9 @@
 //! `NS_READDIR`) for directory walks; per-node badged caps carry
 //! the read side (`FS_READ`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`,
 //! `FS_CLOSE`) and the write side (`FS_WRITE`, `FS_WRITE_MEMORY`,
-//! `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`). `FS_MOUNT` is
-//! the one unbadged service-level request, used by vfsd as a
-//! BPB-validation probe at mount time. All disk I/O is performed via
+//! `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`, `FS_TRUNCATE`).
+//! `FS_MOUNT` is the one unbadged service-level request, used by vfsd
+//! as a BPB-validation probe at mount time. All disk I/O is performed via
 //! the block device IPC endpoint received at creation time.
 //!
 //! Per-node badges are minted by `NS_LOOKUP` (badge = `(NodeId,
@@ -46,8 +46,8 @@ use backend::{FatfsBackend, NO_OPEN_SLOT, NodeTable};
 use bpb::{FatState, SECTOR_SIZE};
 use cache::PageCache;
 use dir::{
-    NewEntryKind, directory_is_empty, free_entry_data, insert_entry, remove_entry,
-    update_entry_metadata, write_dot_entries,
+    DeviceSlotState, NewEntryKind, RemovedEntry, directory_is_empty, free_entry_data, insert_entry,
+    remove_entry, update_entry_metadata, write_dot_entries,
 };
 use eviction::{EvictReq, EvictionState};
 use fat::{chain_next, next_cluster, read_file_data};
@@ -1305,7 +1305,7 @@ fn handle_write_memory_node_cap(
         return;
     };
     // memmgr-issued memory caps carry RIGHTS_ALL (both WRITE and EXECUTE);
-    // mem_map with MAP_READONLY (= 0) on such a cap derives both w and
+    // mem_map with MAP_FROM_CAP (= 0) on such a cap derives both w and
     // x from the cap rights and trips the kernel's W^X check. Derive a
     // sub-cap restricted to RIGHTS_MEM_MAP (no WRITE or EXECUTE) first;
     // delete it after the unmap.
@@ -1315,15 +1315,20 @@ fn handle_write_memory_node_cap(
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     };
-    if syscall::mem_map(
-        restricted_cap,
-        self_aspace,
-        va,
-        0,
-        1,
-        syscall_abi::MAP_READONLY,
-    )
-    .is_err()
+    // SAFETY: `va` is the page `write_memory_va` reserved from the
+    // per-process arena for this handler alone, which runs only on the
+    // dispatch thread; nothing else maps it and no Rust object lies in it.
+    let mapped = unsafe {
+        syscall::mem_map(
+            restricted_cap,
+            self_aspace,
+            va,
+            0,
+            1,
+            syscall_abi::MAP_FROM_CAP,
+        )
+    };
+    if mapped.is_err()
     {
         let _ = syscall::cap_delete(restricted_cap);
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
@@ -1334,8 +1339,8 @@ fn handle_write_memory_node_cap(
     // FS_WRITE_MEMORY path past the default 32 KiB stack envelope
     // once it cascades into `write_file_bytes → insert_entry → …`.
     let mut buf = Box::new([0u8; PAGE_BYTES]);
-    // SAFETY: va just mapped MAP_READONLY for one page; bounds checked
-    // above.
+    // SAFETY: va was just mapped read-only for one page (MAP_FROM_CAP on the
+    // Map-only cap); bounds checked above.
     unsafe {
         core::ptr::copy_nonoverlapping(
             (va + memory_data_offset as u64) as *const u8,
@@ -1343,7 +1348,9 @@ fn handle_write_memory_node_cap(
             byte_count,
         );
     }
-    let _ = syscall::mem_unmap(self_aspace, va, 1);
+    // SAFETY: the same reserved page, read above only through a raw copy; no
+    // Rust reference into it is live.
+    let _ = unsafe { syscall::mem_unmap(self_aspace, va, 1) };
     // Drop the rights-restricted sub-cap we derived to satisfy W^X
     // at mem_map. The original src_cap is unaffected and returns to
     // the caller in the reply.
@@ -1484,11 +1491,28 @@ fn handle_mkdir_node_cap(
     );
 }
 
+/// Rights ceiling of a new entry's cap: `STAT | READ | WRITE | EXEC` for a
+/// file, every right for a directory (intermediate-directory composition
+/// passes every bit through; per-op gating still checks the leaf).
+fn new_entry_rights_ceiling(kind: NewEntryKind) -> NamespaceRights
+{
+    match kind
+    {
+        NewEntryKind::Dir => NamespaceRights::ALL,
+        NewEntryKind::File => NamespaceRights::from_raw(
+            namespace_protocol::rights::STAT
+                | namespace_protocol::rights::READ
+                | namespace_protocol::rights::WRITE
+                | namespace_protocol::rights::EXEC,
+        ),
+    }
+}
+
 // too_many_arguments: the request, the parent node and its rights, the entry
 // kind, and the driver state creation writes through. too_many_lines: creation
-// is one sequence (validate the name, refuse a taken one, allocate, insert the
-// entry, mint the child cap, reply) whose steps share the parent cluster and the
-// new entry's state.
+// is one sequence (settle the child's rights, validate the name, refuse a taken
+// one, allocate, insert the entry, mint the child cap, reply) whose steps share
+// the parent cluster and the new entry's state.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn create_entry_common(
     node_id: NodeId,
@@ -1502,6 +1526,19 @@ fn create_entry_common(
     ipc_buf: *mut u64,
 )
 {
+    // Cap-monotonic attenuation: the child cap carries at most the
+    // intersection of the caller's parent rights and the kind ceiling that
+    // `backend::lookup` applies on a re-walk. The rights are settled before
+    // anything reaches the disk: an empty set (a file created through a
+    // parent with none of the file rights) is refused, since a cap with no
+    // rights could do nothing (services/fs/docs/fs-driver-protocol.md
+    // § Label 13: `FS_CREATE`).
+    let child_rights = parent_rights.intersect(new_entry_rights_ceiling(kind));
+    if child_rights.is_empty()
+    {
+        reply_err(ipc::fs_errors::PERMISSION_DENIED, ipc_buf);
+        return;
+    }
     let parent_cluster = match resolve_dir_cluster(node_id, state, nodes)
     {
         Ok(cluster) => cluster,
@@ -1592,23 +1629,6 @@ fn create_entry_common(
         reply_err(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
         return;
     };
-    // Cap-monotonic attenuation: the child cap can carry at most the
-    // intersection of the caller's parent rights and the kind-specific
-    // ceiling that `backend::lookup` would later apply on a re-walk.
-    // Files: STAT|READ|WRITE|EXEC. Dirs: ALL (intermediate-dir
-    // composition relies on dirs passing every bit through; per-op
-    // gating still enforces the leaf check).
-    let kind_max = match kind_for_node
-    {
-        NodeKind::Dir => NamespaceRights::ALL,
-        NodeKind::File => NamespaceRights::from_raw(
-            namespace_protocol::rights::STAT
-                | namespace_protocol::rights::READ
-                | namespace_protocol::rights::WRITE
-                | namespace_protocol::rights::EXEC,
-        ),
-    };
-    let child_rights = parent_rights.intersect(kind_max);
     let badge = pack_badge(new_node_id, child_rights);
     let Ok(new_cap) = syscall::cap_derive_badge(caps.service, syscall::RIGHTS_EP_SEND_GRANT, badge)
     else
@@ -1688,19 +1708,31 @@ fn handle_remove_node_cap(
         }
     }
 
+    // A failed removal is settled by where it left the 8.3 slot
+    // (services/fs/docs/fs-driver-protocol.md § Label 14: `FS_REMOVE`).
     let removed = match remove_entry(state, parent_cluster, name, cache, block_dev, ipc_buf)
     {
         Ok(r) => r,
-        Err(e) =>
+        Err(failure) =>
         {
-            // A failed removal may already have marked the 8.3 slot; drop
-            // its node then too, as below.
-            if slot_deleted_in_cache(removed_loc, cache, block_dev, ipc_buf)
+            match failed_removal_state(&failure, removed_loc, cache, block_dev, ipc_buf)
             {
-                nodes.invalidate_for_loc(removed_loc);
+                DeviceSlotState::Live =>
+                {
+                    restore_lfn_slots(&failure, removed_loc, cache, block_dev, ipc_buf);
+                    reply_err(fat_error_to_wire(failure.error), ipc_buf);
+                    return;
+                }
+                DeviceSlotState::Deleted => RemovedEntry {
+                    start_cluster: entry.cluster,
+                },
+                DeviceSlotState::Unreadable =>
+                {
+                    nodes.invalidate_for_loc(removed_loc);
+                    reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+                    return;
+                }
             }
-            reply_err(fat_error_to_wire(e), ipc_buf);
-            return;
         }
     };
 
@@ -1723,21 +1755,55 @@ fn handle_remove_node_cap(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// Whether the cached copy of the directory slot at `loc` carries the `0xE5`
-/// deleted marker. A cached node for a slot must be dropped once the cache
-/// shows it deleted, because a later `FS_CREATE` picks free slots from the
-/// same cached view and would otherwise dedupe to the stale `NodeId`. A
-/// sector that cannot be read counts as not deleted.
-fn slot_deleted_in_cache(
-    loc: dir::DirEntryLocation,
+/// Where a failed removal of the entry whose 8.3 slot is `sfn_loc` left
+/// that slot. The removal writes the 8.3 slot last and stops at its first
+/// failure, so the slot is still live unless its own write was the one that
+/// failed; only then is the device read, past the cache, to tell
+/// ([`dir::device_slot_state`]).
+fn failed_removal_state(
+    failure: &dir::RemoveFailure,
+    sfn_loc: dir::DirEntryLocation,
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
-) -> bool
+) -> DeviceSlotState
 {
-    let mut buf = Box::new([0u8; SECTOR_SIZE]);
-    cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
-        && buf[loc.offset_in_sector] == 0xE5
+    if failure
+        .touched
+        .last()
+        .is_some_and(|slot| slot.loc == sfn_loc)
+    {
+        dir::device_slot_state(sfn_loc, cache, block_dev, ipc_buf)
+    }
+    else
+    {
+        DeviceSlotState::Live
+    }
+}
+
+/// Put back the LFN slots a failed removal of the entry whose 8.3 slot is
+/// `sfn_loc` marked, so an entry the device still holds keeps its long
+/// name. The 8.3 slot itself is left as the device holds it. Best-effort:
+/// a slot that cannot be restored stays marked, leaving the entry visible
+/// only under its short alias (services/fs/fat/docs/crash-safety.md).
+fn restore_lfn_slots(
+    failure: &dir::RemoveFailure,
+    sfn_loc: dir::DirEntryLocation,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+)
+{
+    let lfn: Vec<dir::SlotFirstByte> = failure
+        .touched
+        .iter()
+        .copied()
+        .filter(|slot| slot.loc != sfn_loc)
+        .collect();
+    if dir::restore_slot_first_bytes(&lfn, cache, block_dev, ipc_buf).is_err()
+    {
+        std::os::seraph::log!("WARNING: could not restore an LFN slot after a failed removal");
+    }
 }
 
 /// `FS_RENAME`: rename an entry within a single directory.
@@ -1827,18 +1893,34 @@ fn handle_rename_node_cap(
         reply_err(fat_error_to_wire(e), ipc_buf);
         return;
     }
-    if let Err(e) = remove_entry(state, parent_cluster, src_name, cache, block_dev, ipc_buf)
+    if let Err(failure) = remove_entry(state, parent_cluster, src_name, cache, block_dev, ipc_buf)
     {
-        // No rollback: the destination stays inserted, so an error here can
-        // leave both names (fs-driver-protocol.md § Label 16; #447). A
-        // failed removal may already have marked the source's 8.3 slot;
-        // drop its node then, as on success.
-        if slot_deleted_in_cache(src_loc, cache, block_dev, ipc_buf)
+        // Settled by where the removal left the source's 8.3 slot
+        // (services/fs/docs/fs-driver-protocol.md § Label 16: `FS_RENAME`).
+        match failed_removal_state(&failure, src_loc, cache, block_dev, ipc_buf)
         {
-            nodes.invalidate_for_loc(src_loc);
+            DeviceSlotState::Live =>
+            {
+                // The source survives: undo the rename, the destination's
+                // run first, so a failure part-way leaves at worst both
+                // names, never neither.
+                if remove_entry(state, parent_cluster, dst_name, cache, block_dev, ipc_buf).is_err()
+                {
+                    std::os::seraph::log!("WARNING: could not undo a failed rename's destination");
+                }
+                restore_lfn_slots(&failure, src_loc, cache, block_dev, ipc_buf);
+                reply_err(fat_error_to_wire(failure.error), ipc_buf);
+                return;
+            }
+            DeviceSlotState::Deleted =>
+            {}
+            DeviceSlotState::Unreadable =>
+            {
+                nodes.invalidate_for_loc(src_loc);
+                reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+                return;
+            }
         }
-        reply_err(fat_error_to_wire(e), ipc_buf);
-        return;
     }
 
     // Drop any cached node referencing the now-deleted source slot.

@@ -573,7 +573,9 @@ pub fn fs_write_memory_phase(_: &Caps)
 
     let range = std::os::seraph::reserve_pages(1).expect("reserve_pages");
     let va = range.va_start();
-    syscall::mem_map(memory_cap, info.self_aspace, va, 0, 1, MAP_WRITABLE)
+    // SAFETY: `range` is a fresh page reservation from the per-process arena,
+    // owned here: VA no Rust object or IPC page occupies.
+    unsafe { syscall::mem_map(memory_cap, info.self_aspace, va, 0, 1, MAP_WRITABLE) }
         .expect("mem_map memory cap failed");
 
     // SAFETY: va just mapped MAP_WRITABLE for one page; WRITE_LEN ≤ PAGE_SIZE.
@@ -607,7 +609,9 @@ pub fn fs_write_memory_phase(_: &Caps)
         .expect("FS_WRITE_MEMORY returned no cap");
     let _ = syscall::cap_delete(returned);
 
-    let _ = syscall::mem_unmap(info.self_aspace, va, 1);
+    // SAFETY: `va` is this phase's reserved page, written only through raw
+    // pointers above; no Rust reference into it is live.
+    let _ = unsafe { syscall::mem_unmap(info.self_aspace, va, 1) };
     let _ = syscall::cap_delete(file_cap);
 
     let mut f = std::fs::File::open("/data/svctest/wrtf.bin").expect("open wrtf.bin");
@@ -676,13 +680,32 @@ pub fn fs_write_invariants_phase(_: &Caps)
         let _ = fs_remove(svctest_full, scratch_name, ipc_buf);
 
         let root = std::os::seraph::root_dir_cap();
-        let restricted_rights = u64::from(rights::LOOKUP | rights::MUTATE_DIR);
         let (data_cap, _, _) =
             ns_lookup(root, b"data", 0xFFFF, ipc_buf).expect("ns_lookup /data for attenuated walk");
-        let (parent_attenuated, _, _) = ns_lookup(data_cap, b"svctest", restricted_rights, ipc_buf)
-            .expect("ns_lookup /data/svctest attenuated");
-        let _ = syscall::cap_delete(data_cap);
+        let attenuated = |parent_rights: u32| {
+            ns_lookup(data_cap, b"svctest", u64::from(parent_rights), ipc_buf)
+                .expect("ns_lookup /data/svctest attenuated")
+                .0
+        };
 
+        // A parent with none of a file's rights would mint a child cap with
+        // no rights: the create is refused before anything reaches the disk
+        // (fs-driver-protocol.md § Label 13).
+        let parent_no_file_rights = attenuated(rights::LOOKUP | rights::MUTATE_DIR);
+        assert_eq!(
+            fs_create(parent_no_file_rights, scratch_name, ipc_buf).map(|(cap, _)| cap),
+            Err(ipc::fs_errors::PERMISSION_DENIED),
+            "FS_CREATE whose child cap would carry no rights"
+        );
+        assert_eq!(
+            ns_lookup(svctest_full, scratch_name, 0xFFFF, ipc_buf).map(|(cap, _, _)| cap),
+            Err(namespace_protocol::NsError::NotFound.as_label()),
+            "a refused FS_CREATE must not create the entry"
+        );
+        let _ = syscall::cap_delete(parent_no_file_rights);
+
+        let parent_attenuated = attenuated(rights::LOOKUP | rights::MUTATE_DIR | rights::STAT);
+        let _ = syscall::cap_delete(data_cap);
         let (child_cap, _) = fs_create(parent_attenuated, scratch_name, ipc_buf)
             .expect("FS_CREATE through attenuated parent should succeed");
 

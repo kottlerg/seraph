@@ -503,21 +503,24 @@ pub const MAP_WRITABLE: u64 = 0x2;
 /// (`RIGHTS_MEM_EXECUTE`).
 pub const MAP_EXECUTABLE: u64 = 0x4;
 
-/// Mapping protection value `0`.
+/// `SYS_MEM_MAP` protection value `0`: derive the mapping's permissions from
+/// the Memory cap's rights (`core/kernel/docs/syscalls.md` § `SYS_MEM_MAP` (16)).
 ///
-/// Passed as `prot_bits` to `SYS_MEM_MAP`, it does not request read-only: the
-/// kernel derives the permissions from the Memory cap's rights, so a cap with
-/// WRITE maps read-write. `SYS_MEM_PROTECT` treats `0` as read-only. Use
-/// [`MAP_READ`] to force a read-only mapping (#559).
-pub const MAP_READONLY: u64 = 0;
+/// A cap with WRITE maps read-write and one with EXECUTE maps executable, and
+/// a cap carrying both fails with `WxViolation`; a cap narrowed to Map alone
+/// maps read-only. To request read-only whatever the cap's rights, pass
+/// [`MAP_READ`].
+pub const MAP_FROM_CAP: u64 = 0;
 
 /// Mapping protection: explicit read-only. Bit 0.
 ///
-/// Unlike `MAP_READONLY` (= 0, which derives permissions from the Memory
-/// cap's rights), this nonzero value forces a read-only mapping regardless
-/// of the cap's WRITE/EXECUTE rights, so a full-rights cap can be mapped
-/// read-only without first deriving a narrowed child cap. W^X holds
-/// trivially (neither WRITE nor EXECUTE set).
+/// Unlike [`MAP_FROM_CAP`] (= 0, which derives permissions from the Memory
+/// cap's rights), this nonzero value forces a read-only `SYS_MEM_MAP`
+/// mapping regardless of the cap's WRITE/EXECUTE rights, so a full-rights cap
+/// can be mapped read-only without first deriving a narrowed child cap. W^X
+/// holds trivially (neither WRITE nor EXECUTE set). `SYS_MEM_PROTECT` reads
+/// only the WRITE and EXECUTE bits, so this value reprotects read-only there
+/// too.
 pub const MAP_READ: u64 = 0x1;
 
 // ── Unmap flags ──────────────────────────────────────────────────────────────

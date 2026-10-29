@@ -27,7 +27,20 @@ Report in the shape below, as a message to the address the prompt names (orchest
 widening beyond the rules below, a contested review finding, a design choice an Issue leaves
 open, filing an Issue) go in the report as a question with your recommendation; then end
 your turn and wait. Never run `gh issue create`: draft the body in your scratchpad and name
-the path in the report.
+the path in the report. The scratchpad is shared by every worker of one session, so you name
+each file you put there with your PR number or branch slug (`pr581-body.md`, never a bare
+`pr-body.md`). Orchestrated, you end a turn only once your worktree differs from
+`origin/master` (a commit beyond it on your branch, or uncommitted edits to tracked files),
+since a turn that ends on an unchanged worktree loses the worktree and you with it. Before that
+point, while a question you raised is unanswered, all you do stays within the scope's files
+(apart from the forced expansions § Scope and branches allows) and provisional: you continue on
+the recommendation of each question you raise unless the orchestrator says otherwise; a question
+with no clear recommendation is raised, and before ending the turn you commit the part of the
+work that does not depend on the answer, or, when no part is independent of it, the work on its
+most likely option, marked provisional in the report. Told by the orchestrator to stand down
+(your PR or branch handed to another worker), you edit no file, PR or Issue, and commit and push
+nothing further on that branch, whatever your worktree's state: you reply with one line and end
+your turn.
 
 1. After reading: the items you will fix, the items you will not with a one-line reason each,
    the mechanism for anything non-trivial, the tests per item, and every scope expansion.
@@ -39,8 +52,10 @@ the path in the report.
 ## Scope and branches
 
 - One branch from current `origin/master` after `git fetch origin`, named per docs/conventions.md
-  § Branch naming; one PR per scope. Several scopes in one prompt mean several branches and PRs,
-  each cut from `master`, never stacked.
+  § Branch naming, cut as your first action after reading, before the first report; one PR per
+  scope. Several scopes in one prompt mean several branches and PRs, each cut from `master`,
+  never stacked. When the prompt names an existing branch (a respawn), check it out from
+  `origin/<branch>` instead, and continue its PR when it has one.
 - Touch only the scope's files. A change the rules force elsewhere (a caller of a changed
   signature, every copy of a changed fact per § Change propagation procedure, a harness phase the
   Issue's acceptance requires, the root `Cargo.toml` and `Cargo.lock` for a new host-tested
@@ -75,10 +90,26 @@ the path in the report.
   their inflections) appears only in the PR body, never in a commit body, since a commit's
   keyword cannot be withdrawn without a history rewrite. No attribution trailers
   (docs/conventions.md § Commit Messages).
+- Never force-push (`git push --force`, `--force-with-lease`, `-f`), and never amend, rebase or
+  otherwise rewrite a commit you have pushed, although docs/conventions.md § Operations allows
+  it on a feature branch: another worker or the orchestrator may have built on the remote
+  branch. A pushed subject or body that needs changing is left to the maintainer, who either
+  accepts the departure in the PR body (for a SHOULD rule of § Commit Messages) or has the
+  history rewritten (orchestrated, by the orchestrator; standalone, by you under the exception
+  below); say so in your report. The one exception: standalone, the maintainer's own words may
+  direct you to make that rewrite, and you then make it as `.claude/skills/orchestrate/SKILL.md`
+  § Rulings describes (identical trees, checked with `git diff --quiet <old> <new>`, pushed
+  with the lease pinned to the old head, `--force-with-lease=<branch>:<old>`).
+  Before any other push, run `git fetch origin` and
+  `git rev-list --left-right --count origin/<branch>...HEAD`, and push only when it prints `0`
+  and a positive count, or when `origin/<branch>` does not exist yet; a diverged branch is
+  reported, never pushed over.
 - Every item you fix: tick it on its Issue in the Issue's own style with `(fixed by PR #<M>)`
   (`gh issue edit`), copy the ticked items into the PR body's `## Acceptance`, and carry
   `Refs #N`. `Fixes #N` only when no item of that Issue stays open once your last run's
-  findings are recorded. An Issue the PR closes carries the current milestone.
+  findings are recorded. An Issue the PR closes carries the current milestone. A PR carries no
+  milestone (`gh pr create` and `gh pr edit` never take `--milestone`); milestones are set on
+  Issues with `gh issue edit` (docs/conventions.md § Milestones).
 - Fill `.github/pull_request_template.md` completely. The Validation section names the
   validated head, says when later commits are comment-only or Markdown-only, lists each owed
   local host run with its `--runs` count, outcome and head, or states that none is owed and why.
@@ -142,7 +173,10 @@ the ledger). Save records under `target/xtask/review/pr<N>/`. Push and open the 
 - `NON-BLOCKING ISSUES ONLY`: record every surface finding on the follow-up Issue of its scope
   first (docs/conventions.md § Branch and PR Workflow requires it before the merge prompt),
   then report and wait; take no fix round on your own. The decision between the merge and one
-  more round is the maintainer's; a fix round that lands ticks the recorded items.
+  more round is the maintainer's; a fix round that lands ticks the recorded items. The one
+  exception is the maintainer's standing ruling in `.claude/skills/orchestrate/SKILL.md`
+  § Rulings: a PR that drains a follow-up Issue of the scope fixes a nits-only run's findings,
+  recorded there, in the same PR.
 - `AUDIT FAIL`: fix each item (`gh pr edit`, `gh issue edit`, or a commit) and re-run the audit.
 - A contested finding is put to the maintainer (through the orchestrator when orchestrated); on
   the surface it resolves in this PR as that section says. A correctness, soundness, safety or

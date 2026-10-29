@@ -159,8 +159,12 @@ fn start_waiter(child: &spawn::SpawnedChild, cycle: u32, cpus: u32, sig: u32, eq
     // The waiter alternates between CPU 0, which runs the timer, and a CPU
     // other than the controller's 1 (CPU 0 again on a 2-CPU run).
     let waiter_cpu = if (cycle / 3) & 1 == 0 { 0 } else { 2 % cpus };
-    spawn::configure_and_start_pinned(child, entry, stack, u64::from(c_source), waiter_cpu)
-        .map_err(|_| "stress::timed_waiter_thread_delete: start waiter failed")
+    // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        spawn::configure_and_start_pinned(child, entry, stack, u64::from(c_source), waiter_cpu)
+    }
+    .map_err(|_| "stress::timed_waiter_thread_delete: start waiter failed")
 }
 
 /// Count a started wait, then run it; loop until deleted.

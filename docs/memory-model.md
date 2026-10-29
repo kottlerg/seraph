@@ -56,7 +56,8 @@ Kernel space is divided into regions:
 
 The physical memory direct map gives the kernel a virtual address for every physical
 page. The RAM portion is mapped with 2 MiB large pages; a framebuffer or kernel MMIO
-region above the RAM ceiling gets 4 KiB pages.
+region above the RAM ceiling gets 4 KiB pages, and so does a 2 MiB chunk below it that holds a
+kernel MMIO page, so that page can be mapped uncacheable.
 
 Both the kernel image base and the direct-map base are randomized at boot behind
 the boot-entropy source (KASLR,

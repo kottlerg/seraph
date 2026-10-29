@@ -102,10 +102,11 @@ pub fn pack_name(name: &[u8], out: &mut [u64; NAME_WORDS]) -> Option<usize>
 pub unsafe fn lookup(name: &[u8], ipc_buf: *mut u64) -> Option<u32>
 {
     let registry = REGISTRY_CAP.load(Ordering::Acquire);
-    if registry == 0 || name.is_empty() || name.len() > NAME_MAX
+    if registry == 0 || name.is_empty()
     {
         return None;
     }
+    // `pack_name` refuses a name longer than NAME_MAX.
     let mut words = [0u64; NAME_WORDS];
     let word_count = pack_name(name, &mut words)?;
 
@@ -137,6 +138,21 @@ mod tests
         let mut out = [0u64; NAME_WORDS];
         assert_eq!(pack_name(&[b'a'; NAME_MAX + 1], &mut out), None);
         assert_eq!(out, [0; NAME_WORDS]);
+    }
+
+    #[test]
+    fn pack_name_fills_both_words_at_name_max()
+    {
+        let name = *b"0123456789abcdef";
+        let mut out = [0u64; NAME_WORDS];
+        assert_eq!(pack_name(&name, &mut out), Some(2));
+        assert_eq!(
+            out,
+            [
+                u64::from_le_bytes(*b"01234567"),
+                u64::from_le_bytes(*b"89abcdef")
+            ]
+        );
     }
 
     #[test]

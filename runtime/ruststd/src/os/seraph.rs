@@ -238,8 +238,14 @@ static IPC_BUF_TLS: Cell<*mut u64> = Cell::new(core::ptr::null_mut());
 
 /// Record the current thread's IPC buffer VA. Called by `_start` and by the
 /// thread trampoline immediately after `syscall::ipc_buffer_set`.
+///
+/// # Safety
+/// `buf` must be null or the calling thread's IPC buffer page as registered
+/// via `syscall::ipc_buffer_set`: std's IPC paths (`log!`, the stdio and
+/// panic writers, registry lookups) pass [`current_ipc_buf`] to
+/// `ipc::ipc_call`, whose contract requires exactly that.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn set_current_ipc_buf(buf: *mut u64) {
+pub unsafe fn set_current_ipc_buf(buf: *mut u64) {
     IPC_BUF_TLS.set(buf);
 }
 
@@ -359,8 +365,11 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
     // page, outside every image, stack, heap and TLS mapping
     // (docs/userspace-memory-model.md); std reaches it only through the raw
     // `current_ipc_buf` pointer, holding no reference across an IPC syscall.
-    let _ = unsafe { syscall::ipc_buffer_set(info.ipc_buffer_vaddr) };
-    set_current_ipc_buf(info.ipc_buffer_vaddr as *mut u64);
+    if unsafe { syscall::ipc_buffer_set(info.ipc_buffer_vaddr) }.is_ok() {
+        // SAFETY: the page was registered for this thread just above; a
+        // refused registration leaves the TLS pointer null.
+        unsafe { set_current_ipc_buf(info.ipc_buffer_vaddr as *mut u64) };
+    }
 
     // Build the argv slice from the ProcessInfo-page region procmgr wrote.
     // `args_offset` is a byte offset within the mapped ProcessInfo page;

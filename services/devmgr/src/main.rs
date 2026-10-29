@@ -1646,10 +1646,12 @@ fn spawn_virtio_input_from_disk(
 ) -> Option<u32>
 {
     let requested_rights = u64::from(namespace_protocol::rights::READ);
-    let Some(walked) =
-        // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
-        // registered at startup), passed down unchanged.
-        (unsafe { ns_client::walk_to_file(drivers_dir_cap, b"virtio-input", requested_rights, ipc_buf) })
+    // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
+    // registered at startup), passed down unchanged.
+    let walked = unsafe {
+        ns_client::walk_to_file(drivers_dir_cap, b"virtio-input", requested_rights, ipc_buf)
+    };
+    let Some(walked) = walked
     else
     {
         std::os::seraph::log!("virtio-input: walk_to_file failed (binary missing on rootfs)");
@@ -2015,10 +2017,11 @@ fn test_spawn_orphan(
     const QUERY_BADGE: u64 = 0x7E57;
 
     let requested_rights = u64::from(namespace_protocol::rights::READ);
-    let walked =
-        // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
-        // registered at startup), passed down unchanged.
-        unsafe { ns_client::walk_to_file(drivers_dir_cap, b"test-orphan", requested_rights, ipc_buf) }?;
+    // SAFETY: `ipc_buf` is devmgr's main-thread IPC buffer (`info.ipc_buffer`,
+    // registered at startup), passed down unchanged.
+    let walked = unsafe {
+        ns_client::walk_to_file(drivers_dir_cap, b"test-orphan", requested_rights, ipc_buf)
+    }?;
 
     // Throwaway service + hw endpoints handed to the child in round 1. Ownership
     // of `hw_cap` transfers to `spawn_simple_device` (moved into the child or

@@ -19,7 +19,7 @@ use crate::sha512::Sha512;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyError
 {
-    /// The public key did not decode to a curve point.
+    /// The public key is not the canonical encoding of a curve point.
     BadPublicKey,
     /// The signature scalar S was not in `{0, …, L-1}` (RFC 8032 §5.1.7).
     NonCanonicalS,

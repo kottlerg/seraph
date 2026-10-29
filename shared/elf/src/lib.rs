@@ -510,13 +510,16 @@ impl Iterator for LoadSegmentIter<'_>
 /// Return an iterator over `PT_LOAD` segments in a validated ELF image.
 ///
 /// `ehdr` must have been returned by a successful [`validate`] or
-/// [`validate_executable`] call on `data`. The iterator yields one [`LoadSegment`] per `PT_LOAD` program header,
-/// skipping all other segment types.
+/// [`validate_executable`] call on `data`. The iterator yields one
+/// [`LoadSegment`] per `PT_LOAD` program header, skipping all other segment
+/// types.
 ///
 /// # Errors
 ///
 /// Individual segments may yield `Err(`[`ElfError::SegmentOverflow`]`)` if
-/// their file data extends beyond the ELF image.
+/// their file data extends beyond the ELF image. The iterator yields
+/// `Err(`[`ElfError::PhdrTableOverflow`]`)` and ends if a program header lies
+/// outside `data` (`ehdr` paired with data it was not validated against).
 #[must_use]
 pub fn load_segments<'a>(ehdr: &Elf64Ehdr, data: &'a [u8]) -> LoadSegmentIter<'a>
 {
@@ -595,14 +598,16 @@ impl Iterator for LoadSegmentMetaIter<'_>
 /// Return an iterator over `PT_LOAD` segments from the ELF header page only.
 ///
 /// `ehdr` must have been returned by a successful [`validate`] or
-/// [`validate_executable`] call on `header_data`. Segment file bounds are checked against `file_size`
-/// rather than the buffer length, allowing the caller to hold only the
-/// first page of the ELF file.
+/// [`validate_executable`] call on `header_data`. Segment file bounds are
+/// checked against `file_size` rather than the buffer length, allowing the
+/// caller to hold only the first page of the ELF file.
 ///
 /// # Errors
 ///
 /// Individual segments may yield `Err(`[`ElfError::SegmentOverflow`]`)` if
-/// their file data extends beyond `file_size`.
+/// their file data extends beyond `file_size`. The iterator yields
+/// `Err(`[`ElfError::PhdrTableOverflow`]`)` and ends if a program header lies
+/// outside `header_data`.
 #[must_use]
 pub fn load_segments_metadata<'a>(
     ehdr: &Elf64Ehdr,
@@ -634,7 +639,8 @@ pub fn load_segments_metadata<'a>(
 /// # Errors
 ///
 /// Returns [`ElfError::SegmentOverflow`] if the `PT_TLS` segment's file data
-/// extends beyond the ELF image.
+/// extends beyond the ELF image, or [`ElfError::PhdrTableOverflow`] if a
+/// program header lies outside `data`.
 pub fn tls_segment(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<TlsSegment>, ElfError>
 {
     let phdr_base = usize::try_from(ehdr.e_phoff).unwrap_or(usize::MAX);
@@ -988,7 +994,8 @@ fn parse_note_payload(bytes: &[u8]) -> Option<u32>
 /// # Errors
 ///
 /// Returns [`ElfError::SegmentOverflow`] if the `PT_TLS` segment's file data
-/// extends beyond `file_size`.
+/// extends beyond `file_size`, or [`ElfError::PhdrTableOverflow`] if a
+/// program header lies outside `header_data`.
 pub fn tls_segment_metadata(
     ehdr: &Elf64Ehdr,
     header_data: &[u8],
@@ -1043,6 +1050,7 @@ pub fn tls_segment_metadata(
 /// # Errors
 ///
 /// - [`ElfError::NoSegments`] if the image has no `PT_LOAD` segment.
+/// - [`ElfError::PhdrTableOverflow`] if a program header lies outside `data`.
 /// - [`ElfError::SegmentOverflow`] if a segment's `p_vaddr + p_memsz`
 ///   overflows.
 pub fn load_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<(u64, u64), ElfError>
@@ -1072,26 +1080,30 @@ pub fn load_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<(u64, u64), ElfError>
     Ok((min_vaddr, max_end))
 }
 
-/// Return the `PT_GNU_RELRO` span `(vaddr, memsz)`, or `None` when the image
-/// has no RELRO region.
+/// Return the `PT_GNU_RELRO` span `(vaddr, memsz)`, or `Ok(None)` when the
+/// image has no RELRO region.
 ///
 /// The span marks data that must become read-only once relocations are
 /// applied (GOT, `.data.rel.ro`, the in-image TLS template). Loaders map the
 /// fully-covered pages of a writable segment read-only; link VAs — `ET_DYN`
 /// callers add the load bias. Needs only the program header table, so the
 /// ELF header page suffices (like [`load_span`]).
-#[must_use]
-pub fn relro_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Option<(u64, u64)>
+///
+/// # Errors
+///
+/// [`ElfError::PhdrTableOverflow`] if a program header lies outside `data`
+/// (`ehdr` paired with data it was not validated against).
+pub fn relro_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<(u64, u64)>, ElfError>
 {
     for i in 0..ehdr.e_phnum as usize
     {
-        let phdr = read_phdr(data, ehdr, i).ok()?;
+        let phdr = read_phdr(data, ehdr, i)?;
         if phdr.p_type == PT_GNU_RELRO && phdr.p_memsz > 0
         {
-            return Some((phdr.p_vaddr, phdr.p_memsz));
+            return Ok(Some((phdr.p_vaddr, phdr.p_memsz)));
         }
     }
-    None
+    Ok(None)
 }
 
 // ── PT_DYNAMIC / RELATIVE relocations ────────────────────────────────────────
@@ -1252,18 +1264,24 @@ fn resolve_rela_table(
     Err(ElfError::MalformedDynamic)
 }
 
-/// Locate the `PT_DYNAMIC` program header; returns `(p_offset, p_filesz)`.
-fn find_dynamic_phdr(ehdr: &Elf64Ehdr, phdr_data: &[u8]) -> Option<(u64, u64)>
+/// Locate the `PT_DYNAMIC` program header; returns `(p_offset, p_filesz)`,
+/// or `None` when the image has none.
+///
+/// # Errors
+///
+/// [`ElfError::PhdrTableOverflow`] if a program header lies outside
+/// `phdr_data`.
+fn find_dynamic_phdr(ehdr: &Elf64Ehdr, phdr_data: &[u8]) -> Result<Option<(u64, u64)>, ElfError>
 {
     for i in 0..ehdr.e_phnum as usize
     {
-        let phdr = read_phdr(phdr_data, ehdr, i).ok()?;
+        let phdr = read_phdr(phdr_data, ehdr, i)?;
         if phdr.p_type == PT_DYNAMIC
         {
-            return Some((phdr.p_offset, phdr.p_filesz));
+            return Ok(Some((phdr.p_offset, phdr.p_filesz)));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Locate the `.rela.dyn` table of a fully-mapped, validated ELF image.
@@ -1279,6 +1297,7 @@ fn find_dynamic_phdr(ehdr: &Elf64Ehdr, phdr_data: &[u8]) -> Option<(u64, u64)>
 /// - [`ElfError::UnsupportedRelocation`] if the dynamic section describes
 ///   `DT_REL`, `DT_RELR`, or active `DT_JMPREL` relocations — formats the
 ///   loaders do not apply.
+/// - [`ElfError::PhdrTableOverflow`] if a program header lies outside `data`.
 /// - [`ElfError::MalformedDynamic`] for structural failures: `PT_DYNAMIC`
 ///   out of file bounds, a missing counterpart tag, `DT_RELAENT` ≠
 ///   [`RELA_ENTRY_SIZE`], `DT_RELASZ` not a multiple of it or above
@@ -1286,7 +1305,7 @@ fn find_dynamic_phdr(ehdr: &Elf64Ehdr, phdr_data: &[u8]) -> Option<(u64, u64)>
 ///   segment's file data.
 pub fn rela_table(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<RelaTable>, ElfError>
 {
-    let Some((offset, filesz)) = find_dynamic_phdr(ehdr, data)
+    let Some((offset, filesz)) = find_dynamic_phdr(ehdr, data)?
     else
     {
         return Ok(None);
@@ -1312,7 +1331,7 @@ pub fn rela_table(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<RelaTable>, El
 ///
 /// # Errors
 ///
-/// As [`rela_table`]; a failed or short `read_at`, or an oversized
+/// As [`rela_table`] (with `header_data` for `data`); a failed or short `read_at`, or an oversized
 /// `PT_DYNAMIC` segment, is [`ElfError::MalformedDynamic`].
 pub fn rela_table_metadata<F>(
     ehdr: &Elf64Ehdr,
@@ -1323,7 +1342,7 @@ pub fn rela_table_metadata<F>(
 where
     F: FnMut(u64, &mut [u8]) -> Option<usize>,
 {
-    let Some((offset, filesz)) = find_dynamic_phdr(ehdr, header_data)
+    let Some((offset, filesz)) = find_dynamic_phdr(ehdr, header_data)?
     else
     {
         return Ok(None);
@@ -2002,7 +2021,7 @@ mod tests
     {
         let mut img = build_image(ET_DYN, &std_dynamic());
         let (ehdr, _) = valid_executable(&img);
-        assert_eq!(relro_span(&ehdr, &img), None);
+        assert_eq!(relro_span(&ehdr, &img), Ok(None));
         // Rewrite the PT_DYNAMIC header as PT_GNU_RELRO covering [0x200, 0x300).
         put(
             &mut img,
@@ -2010,7 +2029,7 @@ mod tests
             &phdr_bytes(PT_GNU_RELRO, PF_R, 0x200, 0x200, 0x100, 0x100),
         );
         let (ehdr, _) = valid_executable(&img);
-        assert_eq!(relro_span(&ehdr, &img), Some((0x200, 0x100)));
+        assert_eq!(relro_span(&ehdr, &img), Ok(Some((0x200, 0x100))));
     }
 
     #[test]
@@ -2154,6 +2173,16 @@ mod tests
             tls_segment(&ehdr, short),
             Err(ElfError::PhdrTableOverflow)
         ));
+        assert!(matches!(
+            tls_segment_metadata(&ehdr, short, FILE_SIZE as u64),
+            Err(ElfError::PhdrTableOverflow)
+        ));
         assert_eq!(load_span(&ehdr, short), Err(ElfError::PhdrTableOverflow));
+        assert_eq!(relro_span(&ehdr, short), Err(ElfError::PhdrTableOverflow));
+        assert_eq!(rela_table(&ehdr, short), Err(ElfError::PhdrTableOverflow));
+        assert_eq!(
+            rela_table_metadata(&ehdr, short, FILE_SIZE as u64, |_, _| None),
+            Err(ElfError::PhdrTableOverflow)
+        );
     }
 }

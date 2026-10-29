@@ -594,7 +594,7 @@ pub unsafe fn load_init(
                 }
                 None => (0, 0),
             };
-            let (relro_vaddr, relro_size) = elf::relro_span(&ehdr, data).unwrap_or((0, 0));
+            let (relro_vaddr, relro_size) = elf::relro_span(&ehdr, data)?.unwrap_or((0, 0));
             (
                 boot_protocol::INIT_IMAGE_FLAG_PIE,
                 rela_phys,

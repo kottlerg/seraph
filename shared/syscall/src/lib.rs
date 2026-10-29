@@ -99,8 +99,9 @@ use arch::current::{
 /// - it takes no user-pointer argument and uses no IPC buffer;
 /// - it changes none of the caller's mappings;
 /// - it changes no thread of the caller's address space that has started,
-///   other than the calling thread's return registers (which `syscall3_any`
-///   declares clobbered);
+///   other than the calling thread's registers that `syscall3_any` declares
+///   clobbered (its return registers and, on x86-64, the `rcx` / `r11` that
+///   `SYSCALL` overwrites);
 /// - it changes the caller's `CSpace` only at the slots its capability
 ///   arguments name and in fresh slots the kernel fills.
 ///

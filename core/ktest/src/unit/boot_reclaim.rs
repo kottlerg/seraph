@@ -47,27 +47,49 @@ fn is_named_memory_cap(info: &InitInfo, slot: u32) -> bool
             .any(|m| m.slot == slot)
 }
 
-/// Map `pages` pages of `cap` from `offset` at [`PROBE_VA`] read-only and
-/// report whether every byte is zero.
-fn window_is_zero(
-    ctx: &TestContext,
-    cap: u32,
-    offset: u64,
-    pages: u64,
-) -> Result<bool, &'static str>
+/// Why a probe of a Memory cap failed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeError
 {
+    /// `mem_map` refused the window; nothing is mapped.
+    Map,
+    /// `mem_unmap` failed; the window stays mapped at [`PROBE_VA`].
+    Unmap,
+}
+
+impl ProbeError
+{
+    fn message(self) -> &'static str
+    {
+        match self
+        {
+            Self::Map => "probe mem_map failed",
+            Self::Unmap => "probe mem_unmap failed",
+        }
+    }
+}
+
+/// Map `pages` pages of `cap` from `offset` at
+/// [`PROBE_VA`] read-only and report whether every byte is zero.
+fn window_is_zero(ctx: &TestContext, cap: u32, offset: u64, pages: u64)
+-> Result<bool, ProbeError>
+{
+    let Ok(words) = usize::try_from(pages * PAGE_SIZE / 8)
+    else
+    {
+        return Err(ProbeError::Map);
+    };
     // SAFETY: `PROBE_VA` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.
     unsafe { mem_map(cap, ctx.aspace_cap, PROBE_VA, offset, pages, MAP_READ) }
-        .map_err(|_| "probe mem_map failed")?;
-    let words = usize::try_from(pages * PAGE_SIZE / 8).map_err(|_| "probe window too large")?;
+        .map_err(|_| ProbeError::Map)?;
     let base = PROBE_VA as *const u64;
     // SAFETY: `[PROBE_VA, PROBE_VA + pages * PAGE_SIZE)` was mapped readable
     // above; volatile reads form no Rust reference into the page.
     let zero = (0..words).all(|i| unsafe { base.add(i).read_volatile() } == 0);
     // SAFETY: `PROBE_VA` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.
-    unsafe { mem_unmap(ctx.aspace_cap, PROBE_VA, pages) }.map_err(|_| "probe mem_unmap failed")?;
+    unsafe { mem_unmap(ctx.aspace_cap, PROBE_VA, pages) }.map_err(|_| ProbeError::Unmap)?;
     Ok(zero)
 }
 
@@ -94,7 +116,7 @@ pub fn reclaimed_bootloader_pages_are_zero(ctx: &TestContext) -> TestResult
         while offset < pages
         {
             let n = WINDOW_PAGES.min(pages - offset);
-            if !window_is_zero(ctx, d.slot, offset, n)?
+            if !window_is_zero(ctx, d.slot, offset, n).map_err(ProbeError::message)?
             {
                 return Err("a reclaimed bootloader page holds non-zero bytes");
             }
@@ -123,8 +145,7 @@ pub fn reclaimed_bootloader_pages_are_zero(ctx: &TestContext) -> TestResult
 /// reaches userspace.
 pub fn drained_ram_frames_are_zero(ctx: &TestContext) -> TestResult
 {
-    // The pool holds at most 64 frames (`frame_pool`'s `POOL_SIZE`).
-    let mut taken = [0u32; 64];
+    let mut taken = [0u32; crate::frame_pool::POOL_SIZE];
     let mut n = 0;
     while n < taken.len()
     {
@@ -145,6 +166,9 @@ pub fn drained_ram_frames_are_zero(ctx: &TestContext) -> TestResult
     {
         Ok(())
     };
+    // A frame whose probe failed to unmap stays mapped at `PROBE_VA`; it is
+    // kept out of the pool rather than aliased by the next test's mapping.
+    let mut still_mapped = None;
     for &cap in &taken[..n]
     {
         if result.is_ok()
@@ -153,14 +177,26 @@ pub fn drained_ram_frames_are_zero(ctx: &TestContext) -> TestResult
             {
                 Ok(true) => Ok(()),
                 Ok(false) => Err("a drained RAM frame holds non-zero bytes"),
-                Err(e) => Err(e),
+                Err(e) =>
+                {
+                    if e == ProbeError::Unmap
+                    {
+                        still_mapped = Some(cap);
+                    }
+                    Err(e.message())
+                }
             };
         }
     }
     for &cap in &taken[..n]
     {
-        // SAFETY: `cap` came from `frame_pool::alloc` above, and
-        // `window_is_zero` unmapped every page it mapped.
+        if Some(cap) == still_mapped
+        {
+            continue;
+        }
+        // SAFETY: `cap` came from `frame_pool::alloc` above, and every probe
+        // of it unmapped what it mapped (the one whose unmap failed is
+        // skipped above).
         unsafe { crate::frame_pool::free(cap) };
     }
     result

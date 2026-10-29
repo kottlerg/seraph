@@ -76,12 +76,14 @@ A compliant bootloader MUST NOT:
   RAM (a region the memory map classifies as `Usable`, `Loaded`,
   `AcpiReclaimable`, or `Persistent`), or reserved for firmware's exclusive
   use: UEFI runtime-services code and data, ACPI NVS, and firmware-reserved
-  memory that no firmware table, device tree, or framebuffer names as a
-  device's registers or frame buffer. A region firmware reports as reserved
-  MAY be included where such a source names it (the GOP framebuffer, an
-  interrupt controller, an ECAM window); a window placed by a layout
-  heuristic rather than named by firmware MUST exclude every range the memory
-  map describes other than MMIO. The reference bootloader's rule is
+  memory that no naming source names as a device's registers or frame buffer.
+  The naming sources are a firmware table, the device tree, the framebuffer,
+  and a register window the bootloader fixes for a platform it identifies (a
+  UART, RTC, or ECAM window at a platform-defined address). A region firmware
+  reports as reserved MAY be included where a naming source names it (the GOP
+  framebuffer, an interrupt controller, an ECAM window). A PCI window placed by
+  a layout heuristic rather than named by such a source MUST exclude every
+  range the memory map describes other than MMIO. The reference bootloader's rule is
   [core/boot/docs/firmware-parsing.md](../../core/boot/docs/firmware-parsing.md)
   § Firmware exclusion. The kernel rejects an aperture that intersects RAM at
   Phase 6

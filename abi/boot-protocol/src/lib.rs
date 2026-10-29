@@ -628,8 +628,8 @@ impl KernelMmio
 /// Each entry the kernel's Phase 6 validates is a region from which the kernel
 /// mints one `Mmio` capability (MAP | WRITE) and hands it to init; Phase 6
 /// rejects an entry that intersects RAM (`core/kernel/docs/initialization.md`
-/// § Phase 6). Userspace narrows these to per-device ranges via `SYS_MMIO_SPLIT` and distributes
-/// them to drivers. Apertures are
+/// § Phase 6). Userspace narrows these to per-device ranges via
+/// `SYS_MMIO_SPLIT` and distributes them to drivers. Apertures are
 /// intentionally coarse; device-level enumeration is `devmgr`'s job from
 /// ACPI / DTB passthrough.
 #[repr(C)]
@@ -823,8 +823,8 @@ pub struct BootInfo
     /// `Mmio` capabilities.
     ///
     /// One cap minted per entry the kernel's Phase 6 validates, handed to
-    /// init, narrowed and distributed by userspace. Replaces the per-device `PlatformResource` array from
-    /// protocol versions 4 and 5.
+    /// init, narrowed and distributed by userspace. Replaces the per-device
+    /// `PlatformResource` array from protocol versions 4 and 5.
     pub mmio_apertures: MmioApertureSlice,
 
     // ── SMP fields (added in protocol version 4) ──────────────────────────────

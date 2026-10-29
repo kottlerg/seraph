@@ -97,7 +97,8 @@ after `ExitBootServices` by
    carry past `ExitBootServices`. Seeds beyond the `MAX_APERTURE_SEEDS` (64)
    seed buffer, the framebuffer seed included, are dropped without a diagnostic.
    The ACPI seeder's heuristic PCI windows go to a separate buffer
-   (`MAX_HEURISTIC_SEEDS`, 16). Each seed is first clipped to the memory map as
+   (`MAX_HEURISTIC_SEEDS`, 16); windows beyond it are dropped without a
+   diagnostic. Each seed is first clipped to the memory map as
    [§ Firmware exclusion](#firmware-exclusion) defines, so it contributes only
    the gaps the subtracted ranges leave, and a seed wholly inside one contributes
    nothing.
@@ -120,9 +121,11 @@ Apertures are coarse but **not indiscriminate**. No aperture covers RAM or
 firmware-exclusive state. Step 1 collects only MMIO descriptors, and step 2
 clips each seed by its class:
 
-- **Named seeds** are windows a firmware table, the DTB, the arch defaults, or
-  GOP names as a device's registers or frame buffer: LAPIC, IOAPIC, PLIC, ECAM,
-  UART, RTC, `virtio,mmio` and other DTB nodes, and the framebuffer. Every range of
+- **Named seeds** are windows a firmware table, the DTB, or GOP names as a device's
+  registers or frame buffer, or that the arch defaults fix at a platform-defined
+  register address (`default_mmio_apertures`: on riscv64 the QEMU virt ECAM, UART,
+  and RTC windows): LAPIC, IOAPIC, PLIC, ECAM, UART, RTC, `virtio,mmio` and other
+  DTB nodes, and the framebuffer. Every range of
   the RAM-class types (`EfiConventionalMemory`, `EfiBootServicesCode`,
   `EfiBootServicesData`, `EfiLoaderCode`, `EfiLoaderData`, `EfiACPIReclaimMemory`,
   `EfiPersistentMemory`) and of the firmware-exclusive types

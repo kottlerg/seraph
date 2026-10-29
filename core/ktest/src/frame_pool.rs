@@ -54,7 +54,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use init_protocol::{CapType, InitInfo};
 
 /// Maximum frames in the pool.
-const POOL_SIZE: usize = 64;
+pub(crate) const POOL_SIZE: usize = 64;
 
 /// Size of one page.
 const PAGE_SIZE: u64 = 0x1000;

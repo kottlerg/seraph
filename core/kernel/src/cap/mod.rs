@@ -2403,6 +2403,12 @@ fn mint_reclaim_pass(
     let _ = (total_before, pages_total, label);
 }
 
+/// Pages the reclaim array can span: at most [`boot_protocol::MAX_RECLAIM_RANGES`]
+/// entries fill one page, and an array whose base is not page-aligned reaches
+/// into one more.
+#[cfg(not(test))]
+const RECLAIM_ARRAY_MAX_SPAN_PAGES: usize = 2;
+
 /// Zero every range `BootInfo.reclaim_ranges` records, late-flagged entries
 /// included, through the direct map, so no page the bootloader wrote (its
 /// transient page tables, which encode the slid kernel layout, the `BootInfo`
@@ -2448,9 +2454,7 @@ pub(crate) unsafe fn scrub_reclaim_ranges(boot_info_phys: u64)
     let span_lo = array_phys & !(page - 1);
     let span_hi =
         (array_phys + (count * core::mem::size_of::<ReclaimRange>()) as u64).next_multiple_of(page);
-    // At most MAX_RECLAIM_RANGES entries fill one page, so the array spans at
-    // most two pages (one more when its base is not page-aligned).
-    let mut span_covered = [false; 2];
+    let mut span_covered = [false; RECLAIM_ARRAY_MAX_SPAN_PAGES];
     let entries = phys_to_virt(array_phys) as *const ReclaimRange;
     let mut pages: u64 = 0;
 
@@ -2484,7 +2488,7 @@ unsafe fn scrub_outside_span(
     range: boot_protocol::ReclaimRange,
     span_lo: u64,
     span_hi: u64,
-    span_covered: &mut [bool; 2],
+    span_covered: &mut [bool; RECLAIM_ARRAY_MAX_SPAN_PAGES],
 ) -> u64
 {
     let page = crate::mm::PAGE_SIZE as u64;
@@ -2515,7 +2519,7 @@ unsafe fn scrub_outside_span(
 /// # Safety
 /// No reclaim entry is read after this call.
 #[cfg(not(test))]
-unsafe fn zero_covered_span_pages(span_lo: u64, span_covered: [bool; 2])
+unsafe fn zero_covered_span_pages(span_lo: u64, span_covered: [bool; RECLAIM_ARRAY_MAX_SPAN_PAGES])
 {
     let page = crate::mm::PAGE_SIZE as u64;
     for (k, covered) in span_covered.into_iter().enumerate()

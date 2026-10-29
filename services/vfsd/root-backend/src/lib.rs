@@ -799,6 +799,12 @@ mod tests
         assert_eq!(b.path_of(a, &mut [0u8; 1]), None);
         assert_eq!(b.path_of(0, &mut []), None);
         assert_eq!(b.path_of(30, &mut [0u8; 64]), None);
+    }
+
+    #[test]
+    fn path_of_the_root_is_a_single_slash()
+    {
+        let b = VfsdRootBackend::new();
         let mut buf = [0u8; 64];
         assert_eq!(b.path_of(0, &mut buf), Some(1));
         assert_eq!(buf[0], b'/');

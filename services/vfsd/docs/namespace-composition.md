@@ -156,10 +156,11 @@ derived from it — the `terminal_endpoint`, every per-lookup reply cap,
 and the `MOUNT` caller's copy. This is the `kill the server` shape
 documented in
 [`docs/namespace-model.md`](../../../docs/namespace-model.md#revocation).
-That authority is the driver's original service endpoint, which vfsd
-keeps per mount (`FatfsDriver::endpoint` in `src/driver.rs`): the
-backend's retained `terminal_endpoint`, the root mount's badged
-fall-through cap, and the driver's own receive copy all derive from it.
+That authority is the driver's original endpoint (a driver's service and
+namespace endpoint are one), which vfsd keeps per mount
+(`FatfsDriver::endpoint` in `src/driver.rs`): the backend's retained
+`terminal_endpoint`, the root mount's badged fall-through cap, and the
+driver's own receive copy all derive from it.
 Revoking a cap the backend retains reaches only that cap's descendants,
 not the driver's receive copy, so it does not stop the server.
 Per-cap revocation — invalidating one issued node cap without affecting

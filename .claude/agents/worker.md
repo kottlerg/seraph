@@ -47,10 +47,9 @@ the path in the report.
   crate) is a scope expansion: state it in one line in the report and in the PR body, and
   continue. Anything else outside the scope is a question, not an edit.
 - Do not edit `.claude/CLAUDE.md` unless the maintainer's own words allow it, in the prompt or
-  relayed verbatim by the orchestrator. If a
-  changed fact has a copy there, report it and hold the push until the maintainer has applied
-  or authorized that copy, so every copy of the fact lands in the same push (§ Change
-  propagation procedure).
+  relayed verbatim by the orchestrator. If a changed fact has a copy there, report it and hold
+  the push until the maintainer has applied or authorized that copy, so every copy of the fact
+  lands in the same push (§ Change propagation procedure).
 - Read every Issue item against the current code before fixing it; items filed against older
   heads may be partly or fully fixed. An item already fixed is ticked citing the PR that fixed
   it (`git log -S`, `git blame`). An item that is wrong on the code is dropped as
@@ -157,6 +156,6 @@ Stop when CI is green and the head includes `master` (docs/conventions.md § CI 
 the last run completed with no failed agent, its verdict is `READY TO MERGE` or
 `NON-BLOCKING ISSUES ONLY` with every surface finding recorded and no contested finding on the
 surface unresolved, and `AUDIT PASS` is on record for the head. Report the gate with the merge
-command `gh pr merge <N> --merge --delete-branch`
-and end your turn. The merge decision is the maintainer's (`.claude/CLAUDE.md` § PR workflow
-operations); a worker that merges has failed its task.
+command `gh pr merge <N> --merge --delete-branch` and end your turn. The merge decision is the
+maintainer's (`.claude/CLAUDE.md` § PR workflow operations); a worker that merges has failed
+its task.

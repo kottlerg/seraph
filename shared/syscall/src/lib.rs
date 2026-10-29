@@ -94,26 +94,29 @@ use arch::current::{
 /// argument register that carries `SYS_SCHED_SPLIT`'s second handle.
 ///
 /// # Safety
-/// The syscall's effects must be confined to kernel objects the capability
-/// arguments name, leaving everything the calling process runs on untouched:
-/// `nr` must take no user-pointer argument, use no IPC buffer, change none of
-/// the caller's mappings, and change no register state or execution of a
-/// thread in the caller's address space. (The scheduling and band calls the
-/// kernel's validation tests make qualify: `SYS_THREAD_SET_PRIORITY` and
-/// `SYS_THREAD_SET_AFFINITY` on another thread, `SYS_SCHED_SPLIT` on a
-/// capability copy.) Every argument is then a value the kernel validates, so
-/// any value is admissible. `nr` need not be a defined syscall: an undefined
-/// number returns `UnknownSyscall` in the primary return register and changes
-/// nothing else.
+/// The call must leave untouched everything the calling program runs on. Each
+/// of these must hold for `nr` and its arguments:
+/// - it takes no user-pointer argument and uses no IPC buffer;
+/// - it changes none of the caller's mappings;
+/// - it changes no thread of the caller's address space that has started;
+/// - it changes the caller's `CSpace` only at the slots its capability
+///   arguments name and in fresh slots the kernel fills.
+///
+/// The calls the kernel's validation tests make meet all four:
+/// `SYS_THREAD_SET_PRIORITY` and `SYS_THREAD_SET_AFFINITY` on a thread never
+/// started, and `SYS_SCHED_SPLIT` on a capability copy (it consumes the copy's
+/// slot and fills two fresh ones). Every argument is then a value the kernel
+/// validates, so any value is admissible. `nr` need not be a defined syscall:
+/// an undefined number returns `UnknownSyscall` in the primary return register
+/// and changes nothing else.
 #[inline]
 #[must_use]
 pub unsafe fn raw_syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 {
-    // SAFETY: the caller contract confines the call's effects to kernel objects
-    // its capability arguments name, so nothing this process runs on changes;
-    // `syscall3_any` accepts any `nr` and arguments under that same contract (its
-    // `# Safety`) and declares every register the kernel can write on return as
-    // clobbered.
+    // SAFETY: the caller contract keeps the call's effects off everything this
+    // program runs on; `syscall3_any` accepts any `nr` and arguments under this
+    // same contract (its `# Safety`) and declares every register the kernel can
+    // write on return as clobbered.
     unsafe { syscall3_any(nr, a0, a1, a2) }
 }
 

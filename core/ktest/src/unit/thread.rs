@@ -697,10 +697,10 @@ pub fn set_affinity_wide_arg_err(ctx: &TestContext) -> TestResult
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::set_affinity_wide_arg_err: spawn::new_child failed")?;
 
-    // SAFETY: SYS_THREAD_SET_AFFINITY takes no pointer and touches no memory or
-    // mapping; it changes only the affinity of the child, a thread that was never
-    // configured or started, so no thread of this address space changes state or
-    // execution (raw_syscall3's # Safety).
+    // SAFETY: raw_syscall3's four conditions hold. SYS_THREAD_SET_AFFINITY takes
+    // no pointer and uses no IPC buffer; it changes no mapping; the only thread it
+    // changes is the child, which was never started; and it changes no CSpace
+    // slot.
     let ret = unsafe {
         syscall::raw_syscall3(
             syscall_abi::SYS_THREAD_SET_AFFINITY,
@@ -727,10 +727,10 @@ pub fn set_priority_wide_arg_err(ctx: &TestContext) -> TestResult
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::set_priority_wide_arg_err: spawn::new_child failed")?;
 
-    // SAFETY: SYS_THREAD_SET_PRIORITY takes no pointer and touches no memory or
-    // mapping; it changes only the priority of the child, a thread that was never
-    // configured or started, so no thread of this address space changes state or
-    // execution (raw_syscall3's # Safety).
+    // SAFETY: raw_syscall3's four conditions hold. SYS_THREAD_SET_PRIORITY takes
+    // no pointer and uses no IPC buffer; it changes no mapping; the only thread it
+    // changes is the child, which was never started; and it changes no CSpace
+    // slot.
     let ret = unsafe {
         syscall::raw_syscall3(
             syscall_abi::SYS_THREAD_SET_PRIORITY,
@@ -758,9 +758,10 @@ pub fn sched_split_wide_arg_err(ctx: &TestContext) -> TestResult
     let root_copy = cap_derive(ctx.sched_control_cap, RIGHTS_ALL)
         .map_err(|_| "thread::sched_split_wide_arg_err: cap_derive(root) failed")?;
 
-    // SAFETY: SYS_SCHED_SPLIT takes no pointer, touches no memory, mapping, or
-    // thread; it only consumes `root_copy` and mints its two band children into
-    // fresh slots of ktest's CSpace (raw_syscall3's # Safety).
+    // SAFETY: raw_syscall3's four conditions hold. SYS_SCHED_SPLIT takes no
+    // pointer and uses no IPC buffer; it changes no mapping and no thread; and in
+    // ktest's CSpace it changes only the slot `root_copy` names and the fresh
+    // slots it fills with the two band children.
     let ret = unsafe {
         syscall::raw_syscall3(syscall_abi::SYS_SCHED_SPLIT, u64::from(root_copy), 0x115, 0)
     };

@@ -162,13 +162,11 @@ pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 ///
 /// # Safety
 ///
-/// The contract of `crate::raw_syscall3`, its only caller, in place of the
-/// raw-wrapper contract in [`crate::arch`] § Safety: the call's effects must be
-/// confined to kernel objects the capability arguments name (no user-pointer
-/// argument, no IPC buffer, no change to the caller's mappings or to the
-/// register state or execution of a thread in its address space). Any argument
-/// value is then admissible, and `nr` need not be a defined syscall (the kernel
-/// returns `UnknownSyscall` in the primary register and changes nothing else).
+/// The `# Safety` contract of `crate::raw_syscall3`, its only caller, which
+/// replaces the raw-wrapper contract in [`crate::arch`] § Safety: the call must
+/// leave untouched everything the calling program runs on (see that contract's
+/// four conditions). Under it any argument value is admissible, and `nr` need
+/// not be a defined syscall.
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
 #[allow(clippy::inline_always, clippy::cast_possible_wrap)]

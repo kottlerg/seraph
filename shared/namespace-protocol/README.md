@@ -151,10 +151,11 @@ lacks the `STAT` rights bit.
 ## NS_READDIR
 
 Enumerate one directory entry by zero-based index. Clients iterate by
-incrementing the index until the reply label is `END_OF_DIR`. Hidden
+incrementing the index until the reply label is `END_OF_DIR`. Skipping hidden
 entries (per the visibility rule above and [docs/namespace-model.md](../../docs/namespace-model.md)
-§ Per-Entry Rights and Visibility) MUST be skipped without
-contributing to the index.
+§ Per-Entry Rights and Visibility) without contributing to the index is
+design intent; not yet implemented: the dispatch checks only the `READDIR`
+right ([#558](https://github.com/kottlerg/seraph/issues/558)).
 
 **Request**
 
@@ -260,9 +261,9 @@ accidental edits.
 ## Backend trait
 
 Servers implement [`NamespaceBackend`] over their storage layer. The
-trait's methods are called by [`dispatch_request`] after the crate
-has performed name validation, rights composition, and visibility
-filtering — backends never re-implement those checks.
+trait's methods are called by `dispatch_request` after the crate
+has performed name validation, rights composition, and (for `NS_LOOKUP`)
+visibility filtering — backends never re-implement those checks.
 
 | Method | Called from |
 |---|---|

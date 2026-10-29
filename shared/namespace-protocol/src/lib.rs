@@ -7,7 +7,8 @@
 //!
 //! This crate owns the security-relevant code path that every namespace
 //! server runs: IPC dispatch, name validation, rights composition,
-//! per-entry visibility filtering, and node-cap minting via
+//! per-entry visibility filtering at `NS_LOOKUP` (at `NS_READDIR` it is
+//! design intent; not yet implemented, #558), and node-cap minting via
 //! `cap_derive_badge`. Storage backends — fatfs, future ext4, tmpfs,
 //! vfsd's synthetic root — implement [`NamespaceBackend`], own their
 //! own `ipc_recv` loop on their namespace endpoint, and route each
@@ -169,7 +170,8 @@ pub struct EntryView
     /// Independent of the parent directory's rights.
     pub max_rights: NamespaceRights,
     /// Rights the caller's directory cap MUST hold for this entry to
-    /// be visible at lookup or readdir.
+    /// be visible at lookup (enforced) or readdir (design intent; not yet
+    /// implemented, #558).
     pub visible_requires: NamespaceRights,
 }
 
@@ -197,7 +199,8 @@ pub struct MemoryReply
 /// Storage backend trait implemented by every namespace server.
 ///
 /// [`dispatch_request`] calls these methods after running the
-/// protocol's wire decode, rights / visibility / name checks, and
+/// protocol's wire decode, rights / name checks (and, for `NS_LOOKUP`,
+/// visibility), and
 /// child-cap minting; backends own only their storage layer and never
 /// the wire surface or the access-control checks.
 pub trait NamespaceBackend

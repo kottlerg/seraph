@@ -67,7 +67,8 @@
 //! - **Pending buffer is bounded** (`MAX_PENDING_BYTES`). A producer
 //!   that opens a sequence and never finishes it cannot make the
 //!   filter grow without limit; once the cap is exceeded the buffered
-//!   bytes are dropped and the parser resyncs to `Ground`.
+//!   bytes, and the byte that overflowed the cap, are dropped and the
+//!   parser resyncs to `Ground`, whatever that byte is.
 
 use std::io::{self, Write};
 
@@ -130,17 +131,26 @@ impl<W: Write> FilterWriter<W>
     }
 
     /// Append `b` to `pending`, dropping the entire in-progress
-    /// sequence and resyncing to `Ground` if the cap is exceeded.
-    /// Protects against unbounded growth on malformed input.
-    fn push_pending(&mut self, b: u8)
+    /// sequence (and `b` with it) and resyncing to `Ground` if the cap
+    /// is exceeded. Protects against unbounded growth on malformed
+    /// input.
+    ///
+    /// Returns `false` when it resynced: the caller MUST then skip the
+    /// state transition `b` would otherwise drive, or it overrides the
+    /// resync (an overflowing `ESC` in an OSC would leave the parser in
+    /// `OscEsc` with an empty `pending`, and the next byte, itself
+    /// possibly an `ESC` opening a blocklisted sequence, would be
+    /// emitted raw).
+    fn push_pending(&mut self, b: u8) -> bool
     {
         if self.pending.len() >= MAX_PENDING_BYTES
         {
             self.pending.clear();
             self.state = State::Ground;
-            return;
+            return false;
         }
         self.pending.push(b);
+        true
     }
 
     /// Resolve a completed escape sequence: emit it to `inner` if
@@ -180,7 +190,8 @@ impl<W: Write> Write for FilterWriter<W>
                             self.inner.write_all(&buf[start..i])?;
                         }
                         self.state = State::Esc;
-                        self.push_pending(b);
+                        let buffered = self.push_pending(b);
+                        debug_assert!(buffered, "pending is empty in Ground");
                     }
                     else
                     {
@@ -189,7 +200,10 @@ impl<W: Write> Write for FilterWriter<W>
                 }
                 State::Esc =>
                 {
-                    self.push_pending(b);
+                    if !self.push_pending(b)
+                    {
+                        continue;
+                    }
                     match b
                     {
                         b'[' => self.state = State::Csi,
@@ -210,7 +224,10 @@ impl<W: Write> Write for FilterWriter<W>
                 }
                 State::Csi =>
                 {
-                    self.push_pending(b);
+                    if !self.push_pending(b)
+                    {
+                        continue;
+                    }
                     // Final byte (0x40..=0x7e) ends the CSI sequence.
                     if (0x40..=0x7e).contains(&b)
                     {
@@ -220,7 +237,10 @@ impl<W: Write> Write for FilterWriter<W>
                 }
                 State::Osc =>
                 {
-                    self.push_pending(b);
+                    if !self.push_pending(b)
+                    {
+                        continue;
+                    }
                     if b == 0x07
                     {
                         self.flush_pending()?;
@@ -233,7 +253,10 @@ impl<W: Write> Write for FilterWriter<W>
                 }
                 State::OscEsc =>
                 {
-                    self.push_pending(b);
+                    if !self.push_pending(b)
+                    {
+                        continue;
+                    }
                     // Whether the next byte is `\` (proper ST) or anything
                     // else (malformed input — treat as end-of-sequence),
                     // we resolve `pending` and return to Ground.
@@ -620,6 +643,23 @@ mod tests
             !out.windows(5).any(|w| w == b"1049h"),
             "post-resync alt-screen sequence leaked",
         );
+    }
+
+    #[test]
+    fn overflow_on_esc_inside_osc_resyncs_to_ground()
+    {
+        // Fill `pending` to the cap with an unterminated OSC so that the
+        // next byte, an ESC, is the one that overflows it. The parser must
+        // resync to Ground rather than enter `OscEsc`: there, a following
+        // `ESC c` (RIS) would be emitted raw, a lone ESC as a one-byte
+        // "sequence" and the `c` as plain text, resetting the host tty.
+        let mut input = Vec::with_capacity(MAX_PENDING_BYTES + 16);
+        input.extend_from_slice(b"\x1b]0;");
+        input.resize(MAX_PENDING_BYTES, b'A');
+        input.push(0x1b);
+        input.extend_from_slice(b"\x1bcok");
+
+        assert_eq!(run(&input), b"ok");
     }
 
     #[test]

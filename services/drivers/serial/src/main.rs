@@ -7,8 +7,8 @@
 //!
 //! Spawned by devmgr with the platform UART authority cap — an
 //! `IoPort` covering COM1 on x86-64, an `Mmio` covering the
-//! ACPI-SPCR-reported NS16550 on RISC-V — a RECV cap on its service endpoint,
-//! and (optionally) the UART interrupt cap. Owns the UART end-to-end and is
+//! QEMU `virt` NS16550 at its platform-static address on RISC-V — a RECV cap
+//! on its service endpoint, and (optionally) the UART interrupt cap. Owns the UART end-to-end and is
 //! the sole driver-mediated path for userspace serial bytes in both
 //! directions: real-logd and every other writer reach it via
 //! [`serial_labels::SERIAL_WRITE_BYTES`]; the terminal reads input via

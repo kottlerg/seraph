@@ -20,8 +20,7 @@ const RO_TEST_VA: u64 = 0x1_4000_0000;
 pub fn getrandom_fills_buffer(_ctx: &TestContext) -> TestResult
 {
     let mut buf = [0u8; 32];
-    let n = syscall::getrandom(buf.as_mut_ptr(), buf.len())
-        .map_err(|_| "getrandom failed on a valid buffer")?;
+    let n = syscall::getrandom(&mut buf).map_err(|_| "getrandom failed on a valid buffer")?;
     if n != buf.len() as u64
     {
         return Err("getrandom returned a short count");
@@ -41,7 +40,9 @@ pub fn getrandom_fills_buffer(_ctx: &TestContext) -> TestResult
 /// the fatal kernel-exception handler.
 pub fn getrandom_unmapped_ptr_invalid_address(_ctx: &TestContext) -> TestResult
 {
-    let r = syscall::getrandom(UNMAPPED_USER_VA as *mut u8, 16);
+    // SAFETY: nothing is mapped at UNMAPPED_USER_VA (the test's premise), so
+    // the kernel refuses the span with nothing written.
+    let r = unsafe { syscall::getrandom_raw(UNMAPPED_USER_VA as *mut u8, 16) };
     if r == Err(SyscallError::InvalidAddress as i64)
     {
         Ok(())
@@ -61,14 +62,18 @@ pub fn getrandom_readonly_ptr_invalid_address(ctx: &TestContext) -> TestResult
 {
     let mut frame = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
         .ok_or("getrandom RO: frame pool exhausted")?;
-    frame
-        .map(RO_TEST_VA)
-        .map_err(|_| "getrandom RO: mem_map failed")?;
+    // SAFETY: `RO_TEST_VA` is a scratch VA (crate docs § Scratch VAs), off every
+    // Rust object and IPC page of ktest.
+    unsafe { frame.map(RO_TEST_VA) }.map_err(|_| "getrandom RO: mem_map failed")?;
     // prot = 0: read-only (no WRITE/EXECUTE). Drops the W bit on the live PTE.
-    syscall::mem_protect(frame.cap(), ctx.aspace_cap, RO_TEST_VA, 1, 0)
+    // SAFETY: `RO_TEST_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    unsafe { syscall::mem_protect(frame.cap(), ctx.aspace_cap, RO_TEST_VA, 1, 0) }
         .map_err(|_| "getrandom RO: mem_protect to read-only failed")?;
 
-    let r = syscall::getrandom(RO_TEST_VA as *mut u8, 16);
+    // SAFETY: RO_TEST_VA is a scratch VA mapped read-only just above, so the
+    // kernel refuses the span with nothing written.
+    let r = unsafe { syscall::getrandom_raw(RO_TEST_VA as *mut u8, 16) };
     if r != Err(SyscallError::InvalidAddress as i64)
     {
         return Err(
@@ -83,7 +88,9 @@ pub fn getrandom_readonly_ptr_invalid_address(ctx: &TestContext) -> TestResult
 pub fn getrandom_over_max_len_invalid_arg(_ctx: &TestContext) -> TestResult
 {
     let mut buf = [0u8; 8];
-    let r = syscall::getrandom(buf.as_mut_ptr(), syscall::MAX_GETRANDOM_LEN + 1);
+    // SAFETY: a length above MAX_GETRANDOM_LEN is refused before the kernel
+    // touches the buffer, so nothing past `buf`'s 8 bytes is written.
+    let r = unsafe { syscall::getrandom_raw(buf.as_mut_ptr(), syscall::MAX_GETRANDOM_LEN + 1) };
     if r == Err(SyscallError::InvalidArgument as i64)
     {
         Ok(())
@@ -106,8 +113,7 @@ pub fn getrandom_reseed_interval_stream(_ctx: &TestContext) -> TestResult
     for i in 0..300
     {
         let mut buf = [0u8; 8];
-        let n = syscall::getrandom(buf.as_mut_ptr(), buf.len())
-            .map_err(|_| "getrandom failed mid-stream")?;
+        let n = syscall::getrandom(&mut buf).map_err(|_| "getrandom failed mid-stream")?;
         if n != buf.len() as u64
         {
             return Err("getrandom returned a short count mid-stream");

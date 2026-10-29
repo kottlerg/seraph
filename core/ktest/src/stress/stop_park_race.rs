@@ -264,8 +264,12 @@ fn setup(
             .map_err(|_| "stress::stop_park_race: cap_copy server ep failed")?;
         // SAFETY: stack index 1 is the server's; phases run sequentially.
         let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
-        spawn::configure_and_start_pinned(s, server_entry, stack, u64::from(s_ep), server_cpu)
-            .map_err(|_| "stress::stop_park_race: start server failed")?;
+        // SAFETY: the stack is `super::STRESS_STACKS[1]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe {
+            spawn::configure_and_start_pinned(s, server_entry, stack, u64::from(s_ep), server_cpu)
+        }
+        .map_err(|_| "stress::stop_park_race: start server failed")?;
     }
 
     let p = spawn::new_child(ctx).map_err(|_| "stress::stop_park_race: spawn peer failed")?;
@@ -284,7 +288,9 @@ fn setup(
     };
     // SAFETY: stack index 0 is the peer's; phases run sequentially.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
-    spawn::configure_and_start_pinned(p, entry, stack, u64::from(p_source), 1)
+    // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(p, entry, stack, u64::from(p_source), 1) }
         .map_err(|_| "stress::stop_park_race: start peer failed")
 }
 
@@ -456,7 +462,10 @@ extern "C" fn call_peer(arg: u64) -> !
     let ep = arg as u32;
     // SAFETY: sole live user of PEER_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(PEER_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }
@@ -492,7 +501,10 @@ extern "C" fn server_entry(arg: u64) -> !
     let ep = arg as u32;
     // SAFETY: sole live user of SERVER_IPC_BUF (phases run sequentially).
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }

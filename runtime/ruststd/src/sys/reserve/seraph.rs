@@ -118,7 +118,7 @@ impl Arena {
         // the arena, so holding the lock across it is safe. A failed draw
         // degrades to the deterministic default base.
         let mut entropy = [0u8; 8];
-        let base = match syscall::getrandom(entropy.as_mut_ptr(), entropy.len()) {
+        let base = match syscall::getrandom(&mut entropy) {
             Ok(n) if n == entropy.len() as u64 => {
                 RESERVE_ARENA_BASE_DEFAULT
                     + ((u64::from_le_bytes(entropy) & ((1 << RESERVE_ARENA_SLOTS_LOG2) - 1)) << 12)

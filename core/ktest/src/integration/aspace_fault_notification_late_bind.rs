@@ -53,7 +53,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Entry PC is unmapped: the thread terminal-faults on its first instruction
     // fetch (no fault handler bound) with no aspace observer bound yet.
-    thread_configure(thread, UNMAPPED_ENTRY, UNMAPPED_STACK, 0)
+    // SAFETY: the thread is bound to the dedicated `aspace` created above, not
+    // ktest's own, so its entry state touches nothing ktest runs on.
+    unsafe { thread_configure(thread, UNMAPPED_ENTRY, UNMAPPED_STACK, 0) }
         .map_err(|_| "aspace_fault_notification_late_bind: thread_configure failed")?;
     thread_start(thread).map_err(|_| "aspace_fault_notification_late_bind: thread_start failed")?;
 

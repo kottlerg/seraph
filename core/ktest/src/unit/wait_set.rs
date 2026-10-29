@@ -144,8 +144,12 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
         cap_copy(sig, child.cs, RIGHTS_NOTIFY).map_err(|_| "cap_copy for blocking test failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
-        .map_err(|_| "configure_and_start for blocking test failed")?;
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
+    }
+    .map_err(|_| "configure_and_start for blocking test failed")?;
 
     // Block until the child fires the notification.
     let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait (blocking) failed")?;
@@ -280,12 +284,16 @@ fn start_occupied_child(
     // SAFETY: each occupied stack belongs to one of this test's two children,
     // which the test deletes before returning; unit tests run sequentially.
     let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(OCCUPIED_STACKS[stack]) });
-    crate::spawn::configure_and_start(
-        child,
-        entry,
-        stack_top,
-        u64::from(c_ws) | (u64::from(c_done) << 32),
-    )
+    // SAFETY: the stack is `OCCUPIED_STACKS[stack]`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(
+            child,
+            entry,
+            stack_top,
+            u64::from(c_ws) | (u64::from(c_done) << 32),
+        )
+    }
     .map_err(|_| "configure_and_start for occupied failed")
 }
 

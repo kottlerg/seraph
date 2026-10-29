@@ -160,7 +160,10 @@ impl PageCache
             // Cache init is a process-fatal precondition; on partial
             // failure here previously-acquired caps are released by
             // process exit (no caller-side cleanup needed).
-            syscall::mem_map(cap, self_aspace, slot.va, 0, 1, MAP_WRITABLE)
+            // SAFETY: slot.va is a page of the `SLOT_COUNT`-page window
+            // reserved above from the per-process arena and owned by the
+            // cache: VA no Rust object or IPC page occupies.
+            unsafe { syscall::mem_map(cap, self_aspace, slot.va, 0, 1, MAP_WRITABLE) }
                 .map_err(|_| InitError::Map)?;
             slot.memory_cap.store(cap, Ordering::Release);
         }
@@ -172,7 +175,9 @@ impl PageCache
         // synchronous and free of init-time error paths.
         let scratch_va = reserve_pages(1).map_err(|_| InitError::Reserve)?.va_start();
         let scratch_cap = request_one_page(memmgr_ep, ipc_buf).ok_or(InitError::Memmgr)?;
-        syscall::mem_map(scratch_cap, self_aspace, scratch_va, 0, 1, MAP_WRITABLE)
+        // SAFETY: scratch_va is a fresh page reservation from the per-process
+        // arena, owned by the cache: VA no Rust object or IPC page occupies.
+        unsafe { syscall::mem_map(scratch_cap, self_aspace, scratch_va, 0, 1, MAP_WRITABLE) }
             .map_err(|_| InitError::Map)?;
         SCRATCH_MEMORY
             .set(ScratchMemory {

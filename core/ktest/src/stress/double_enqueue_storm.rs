@@ -130,7 +130,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         // SAFETY: stress tests run sequentially; only this test uses these
         // STRESS_STACKS slots during its run.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        spawn::configure_and_start(&child, worker_entry, stack_top, arg)
+        // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe { spawn::configure_and_start(&child, worker_entry, stack_top, arg) }
             .map_err(|_| "stress::double_enqueue_storm: configure_and_start failed")?;
         threads[i] = child.th;
         cspaces[i] = child.cs;

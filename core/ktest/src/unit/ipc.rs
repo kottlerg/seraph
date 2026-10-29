@@ -35,6 +35,7 @@ const RIGHTS_RECV_ONLY: u64 = syscall_abi::RIGHTS_EP_RECEIVE;
 
 // Child stacks — one per test that spawns a child.
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
+static mut UNBADGED_STACK: ChildStack = ChildStack::ZERO;
 static mut RECV_BLOCKS_STACK: ChildStack = ChildStack::ZERO;
 static mut DATA_WORDS_STACK: ChildStack = ChildStack::ZERO;
 static mut CAP_XFER_STACK: ChildStack = ChildStack::ZERO;
@@ -121,7 +122,9 @@ pub fn call_reply_recv(ctx: &TestContext) -> TestResult
     let child_arg = u64::from(child_ep) | (u64::from(child_notify) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start(&child, caller_entry, stack_top, child_arg)
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, caller_entry, stack_top, child_arg) }
         .map_err(|_| "ipc::call_reply_recv: configure_and_start failed")?;
 
     // Server: wait for the child's IPC call.
@@ -177,7 +180,9 @@ pub fn recv_finds_queued_caller(ctx: &TestContext) -> TestResult
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK));
-    crate::spawn::configure_and_start(&child, queued_caller_entry, stack_top, child_arg)
+    // SAFETY: the stack is `RECV_BLOCKS_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, queued_caller_entry, stack_top, child_arg) }
         .map_err(|_| "ipc::recv_finds_queued_caller: configure_and_start failed")?;
 
     // Sleep so the child (created at the floor priority, strictly below
@@ -220,7 +225,9 @@ pub fn recv_finds_queued_caller(ctx: &TestContext) -> TestResult
 /// modifying any state, so the currently registered buffer remains valid.
 pub fn ipc_buffer_misaligned_err(_ctx: &TestContext) -> TestResult
 {
-    let err = ipc_buffer_set(1);
+    // SAFETY: address 1 is not page-aligned, so the kernel registers nothing (the
+    // test's premise) and ktest's registered buffer stays as it was.
+    let err = unsafe { ipc_buffer_set(1) };
     if err.is_ok()
     {
         return Err("ipc_buffer_set with non-page-aligned address should fail");
@@ -275,7 +282,9 @@ pub fn call_with_data_words(ctx: &TestContext) -> TestResult
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(DATA_WORDS_STACK));
-    crate::spawn::configure_and_start(&child, data_caller_entry, stack_top, child_arg)
+    // SAFETY: the stack is `DATA_WORDS_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, data_caller_entry, stack_top, child_arg) }
         .map_err(|_| "ipc::call_with_data_words: configure_and_start failed")?;
 
     // Server: receive the call.
@@ -351,8 +360,12 @@ pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
     };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CAP_XFER_STACK));
-    crate::spawn::configure_and_start(&child, cap_xfer_caller_entry, stack_top, child_arg)
-        .map_err(|_| "ipc::call_with_cap_transfer: configure_and_start failed")?;
+    // SAFETY: the stack is `CAP_XFER_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, cap_xfer_caller_entry, stack_top, child_arg)
+    }
+    .map_err(|_| "ipc::call_with_cap_transfer: configure_and_start failed")?;
 
     // Server: receive the call with cap transfer.
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
@@ -419,7 +432,9 @@ pub fn recv_delivers_badge(ctx: &TestContext) -> TestResult
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(BADGE_STACK));
-    crate::spawn::configure_and_start(&child, badge_caller_entry, stack_top, child_arg)
+    // SAFETY: the stack is `BADGE_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, badge_caller_entry, stack_top, child_arg) }
         .map_err(|_| "ipc::recv_delivers_badge: configure_and_start failed")?;
 
     // Server: receive and check badge.
@@ -469,8 +484,10 @@ pub fn recv_unbadged_returns_zero(ctx: &TestContext) -> TestResult
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
 
     // Reuse the caller_entry (sends 0xCAFE, expects reply 0xBEEF).
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start(&child, caller_entry, stack_top, child_arg)
+    let stack_top = ChildStack::top(core::ptr::addr_of!(UNBADGED_STACK));
+    // SAFETY: the stack is `UNBADGED_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, caller_entry, stack_top, child_arg) }
         .map_err(|_| "ipc::recv_unbadged_returns_zero: configure_and_start failed")?;
 
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
@@ -501,6 +518,36 @@ pub fn recv_unbadged_returns_zero(ctx: &TestContext) -> TestResult
 
 // ── Child thread entry ────────────────────────────────────────────────────────
 
+/// IPC page of the [`caller_entry`] child.
+static mut CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
+/// IPC page of the [`queued_caller_entry`] child.
+static mut QUEUED_CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
+/// IPC page of the [`data_caller_entry`] child.
+static mut DATA_CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
+/// IPC page of the [`cap_xfer_caller_entry`] child.
+static mut CAP_XFER_CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
+/// IPC page of the [`badge_caller_entry`] child.
+static mut BADGE_CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
+/// IPC page of the [`snapshot_caller_entry`] child.
+static mut SNAPSHOT_CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
+/// IPC page of the [`reply_oom_caller_entry`] child.
+static mut REPLY_OOM_CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
+/// IPC page of the [`dup_reply_caller_entry`] child.
+static mut DUP_REPLY_CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
+/// IPC page of the [`four_caps_caller_entry`] child.
+static mut FOUR_CAPS_CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
+/// IPC page of the [`recv_oom_victim_entry`] child.
+static mut RECV_OOM_VICTIM_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
 /// Child: calls the endpoint with label 0xCAFE, waits for reply, then signals.
 ///
 /// `arg`: bits[31:0] = `ep_slot`, bits[63:32] = `notify_slot` (in child's `CSpace`).
@@ -509,10 +556,11 @@ extern "C" fn caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let notify_slot = (arg >> 32) as u32;
 
-    // Register the shared IPC buffer for this child thread; registration is
-    // per-thread (core/kernel/docs/syscalls.md § `SYS_IPC_BUFFER_SET`).
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(CALLER_IPC_PAGE));
+    // SAFETY: `CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(notify_slot, 0xBAD).ok();
         thread_exit()
@@ -551,9 +599,11 @@ extern "C" fn queued_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 
-    // Register the shared IPC buffer for this child thread.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(QUEUED_CALLER_IPC_PAGE));
+    // SAFETY: `QUEUED_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
         thread_exit()
@@ -586,10 +636,11 @@ extern "C" fn data_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 
-    // Register the shared IPC buffer for this child thread; registration is
-    // per-thread (core/kernel/docs/syscalls.md § `SYS_IPC_BUFFER_SET`).
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(DATA_CALLER_IPC_PAGE));
+    // SAFETY: `DATA_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
         thread_exit()
@@ -621,9 +672,11 @@ extern "C" fn cap_xfer_caller_entry(arg: u64) -> !
         memory: memory_slot,
     } = unsafe { child_args(arg) };
 
-    // Register IPC buffer for cap transfer.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(CAP_XFER_CALLER_IPC_PAGE));
+    // SAFETY: `CAP_XFER_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
         thread_exit()
@@ -656,9 +709,11 @@ extern "C" fn badge_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 
-    // Register the shared IPC buffer for this child thread.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(BADGE_CALLER_IPC_PAGE));
+    // SAFETY: `BADGE_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
         thread_exit()
@@ -703,8 +758,12 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(SNAPSHOT_STACK));
-    crate::spawn::configure_and_start(&child, snapshot_caller_entry, stack_top, child_arg)
-        .map_err(|_| "ipc::recv_snapshot_survives_buffer_clobber: configure_and_start failed")?;
+    // SAFETY: the stack is `SNAPSHOT_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, snapshot_caller_entry, stack_top, child_arg)
+    }
+    .map_err(|_| "ipc::recv_snapshot_survives_buffer_clobber: configure_and_start failed")?;
 
     // Server: receive the call with two known data words.
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
@@ -764,8 +823,11 @@ extern "C" fn snapshot_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(SNAPSHOT_CALLER_IPC_PAGE));
+    // SAFETY: `SNAPSHOT_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
         thread_exit()
@@ -844,12 +906,17 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
     let child_th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, child_cs, 0, 0)
         .map_err(|_| "cap_create_thread for reply_oom test failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(REPLY_OOM_STACK));
-    thread_configure(
-        child_th,
-        reply_oom_caller_entry as *const () as u64,
-        stack_top,
-        child_arg,
-    )
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe {
+        thread_configure(
+            child_th,
+            reply_oom_caller_entry as *const () as u64,
+            stack_top,
+            child_arg,
+        )
+    }
     .map_err(|_| "thread_configure for reply_oom test failed")?;
     thread_start(child_th).map_err(|_| "thread_start for reply_oom test failed")?;
 
@@ -919,8 +986,11 @@ extern "C" fn reply_oom_caller_entry(arg: u64) -> !
         memory: memory_slot,
     } = unsafe { child_args(arg) };
 
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(REPLY_OOM_CALLER_IPC_PAGE));
+    // SAFETY: `REPLY_OOM_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(ready_slot, 0xBAD).ok();
         thread_exit()
@@ -1070,8 +1140,12 @@ pub fn reply_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy done for reply_dup test failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
     let stack_top = ChildStack::top(core::ptr::addr_of!(DUP_REPLY_STACK));
-    crate::spawn::configure_and_start(&child, dup_reply_caller_entry, stack_top, child_arg)
-        .map_err(|_| "reply_dup: configure_and_start failed")?;
+    // SAFETY: the stack is `DUP_REPLY_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, dup_reply_caller_entry, stack_top, child_arg)
+    }
+    .map_err(|_| "reply_dup: configure_and_start failed")?;
 
     // Receive the child's call, then reply with one slot repeated.
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
@@ -1119,8 +1193,11 @@ extern "C" fn dup_reply_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_slot = (arg >> 32) as u32;
 
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(DUP_REPLY_CALLER_IPC_PAGE));
+    // SAFETY: `DUP_REPLY_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
         thread_exit()
@@ -1176,8 +1253,12 @@ pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy done for reply_stale test failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 32);
     let stack_top = ChildStack::top(core::ptr::addr_of!(STALE_REPLY_STACK));
-    crate::spawn::configure_and_start(&child, dup_reply_caller_entry, stack_top, child_arg)
-        .map_err(|_| "reply_stale: configure_and_start failed")?;
+    // SAFETY: the stack is `STALE_REPLY_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, dup_reply_caller_entry, stack_top, child_arg)
+    }
+    .map_err(|_| "reply_stale: configure_and_start failed")?;
 
     // Receive the child's call, then reply naming the stale handle.
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
@@ -1252,8 +1333,12 @@ pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
     };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(FOUR_CAPS_STACK));
-    crate::spawn::configure_and_start(&child, four_caps_caller_entry, stack_top, child_arg)
-        .map_err(|_| "four_caps: configure_and_start failed")?;
+    // SAFETY: the stack is `FOUR_CAPS_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, four_caps_caller_entry, stack_top, child_arg)
+    }
+    .map_err(|_| "four_caps: configure_and_start failed")?;
 
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
     let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
@@ -1308,8 +1393,11 @@ extern "C" fn four_caps_caller_entry(arg: u64) -> !
         memory: memory_slot,
     } = unsafe { child_args(arg) };
 
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(FOUR_CAPS_CALLER_IPC_PAGE));
+    // SAFETY: `FOUR_CAPS_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
         thread_exit()
@@ -1386,12 +1474,17 @@ pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
     let victim_th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, victim_cs, 0, 0)
         .map_err(|_| "cap_create_thread for recv_oom test failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_OOM_STACK));
-    thread_configure(
-        victim_th,
-        recv_oom_victim_entry as *const () as u64,
-        stack_top,
-        victim_arg,
-    )
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe {
+        thread_configure(
+            victim_th,
+            recv_oom_victim_entry as *const () as u64,
+            stack_top,
+            victim_arg,
+        )
+    }
     .map_err(|_| "thread_configure for recv_oom test failed")?;
     thread_start(victim_th).map_err(|_| "thread_start for recv_oom test failed")?;
 
@@ -1421,8 +1514,11 @@ extern "C" fn recv_oom_victim_entry(arg: u64) -> !
         memory: memory_slot,
     } = unsafe { child_args(arg) };
 
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(RECV_OOM_VICTIM_IPC_PAGE));
+    // SAFETY: `RECV_OOM_VICTIM_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 0xBAD).ok();
         thread_exit()

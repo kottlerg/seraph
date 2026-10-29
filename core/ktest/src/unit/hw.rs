@@ -69,7 +69,9 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
         // stays in the CSpace as a valid `Mmio` for the split test that
         // runs next.
         let result = (|| -> TestResult {
-            syscall::mmio_map(ctx.aspace_cap, lo, MMIO_TEST_VA, 0)
+            // SAFETY: `MMIO_TEST_VA` is a scratch VA (crate docs § Scratch VAs), so the
+            // span holds no Rust object or IPC page of ktest.
+            unsafe { syscall::mmio_map(ctx.aspace_cap, lo, MMIO_TEST_VA, 0) }
                 .map_err(|_| "mmio_map of carved page failed")?;
             let phys = aspace_query(ctx.aspace_cap, MMIO_TEST_VA)
                 .map_err(|_| "aspace_query after mmio_map failed")?;
@@ -79,7 +81,9 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
             }
             Ok(())
         })();
-        let _ = mem_unmap(ctx.aspace_cap, MMIO_TEST_VA, 1);
+        // SAFETY: `MMIO_TEST_VA` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        let _ = unsafe { mem_unmap(ctx.aspace_cap, MMIO_TEST_VA, 1) };
         syscall::cap_delete(lo).ok();
         return result;
     }

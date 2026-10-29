@@ -355,7 +355,11 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
 
     // Register the IPC buffer before any IPC-using code runs. Idempotent in
     // the kernel, so services that call `ipc_buffer_set` again are fine.
-    let _ = syscall::ipc_buffer_set(info.ipc_buffer_vaddr);
+    // SAFETY: the creator maps `ipc_buffer_vaddr` as the main thread's own IPC
+    // page, outside every image, stack, heap and TLS mapping
+    // (docs/userspace-memory-model.md); std reaches it only through the raw
+    // `current_ipc_buf` pointer, holding no reference across an IPC syscall.
+    let _ = unsafe { syscall::ipc_buffer_set(info.ipc_buffer_vaddr) };
     set_current_ipc_buf(info.ipc_buffer_vaddr as *mut u64);
 
     // Build the argv slice from the ProcessInfo-page region procmgr wrote.

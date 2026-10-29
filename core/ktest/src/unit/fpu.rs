@@ -108,19 +108,29 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
     let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
     let stack_b = ChildStack::top(core::ptr::addr_of!(STACK_B));
 
-    thread_configure(
-        th_a,
-        child_a_entry as *const () as u64,
-        stack_a,
-        u64::from(child_sig_a),
-    )
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe {
+        thread_configure(
+            th_a,
+            child_a_entry as *const () as u64,
+            stack_a,
+            u64::from(child_sig_a),
+        )
+    }
     .map_err(|_| "thread_configure a for fpu::preempt_isolation failed")?;
-    thread_configure(
-        th_b,
-        child_b_entry as *const () as u64,
-        stack_b,
-        u64::from(child_sig_b),
-    )
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe {
+        thread_configure(
+            th_b,
+            child_b_entry as *const () as u64,
+            stack_b,
+            u64::from(child_sig_b),
+        )
+    }
     .map_err(|_| "thread_configure b for fpu::preempt_isolation failed")?;
 
     // Pin both children to CPU 0 to force time-sliced co-residency.
@@ -248,7 +258,10 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
         .map_err(|_| "initial thread_set_affinity(0) for preempt_isolation_cross_cpu failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CROSS));
-    thread_configure(th, child_cross_entry as *const () as u64, stack_top, 0)
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe { thread_configure(th, child_cross_entry as *const () as u64, stack_top, 0) }
         .map_err(|_| "thread_configure for preempt_isolation_cross_cpu failed")?;
     thread_start(th).map_err(|_| "thread_start for preempt_isolation_cross_cpu failed")?;
 

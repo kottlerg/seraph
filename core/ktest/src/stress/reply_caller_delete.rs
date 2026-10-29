@@ -301,13 +301,17 @@ fn race(ctx: &TestContext, round: &mut Round, kind: u32, cycle: u32) -> Result<u
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[CALLER_STACK]) });
     if let Some(caller) = round.caller.as_ref()
     {
-        spawn::configure_and_start_pinned(
-            caller,
-            entry,
-            stack,
-            u64::from(c_ep) | (u64::from(c_done) << 32),
-            CALLER_CPU,
-        )
+        // SAFETY: the stack is `super::STRESS_STACKS[CALLER_STACK]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe {
+            spawn::configure_and_start_pinned(
+                caller,
+                entry,
+                stack,
+                u64::from(c_ep) | (u64::from(c_done) << 32),
+                CALLER_CPU,
+            )
+        }
         .map_err(|_| "stress::reply_caller_delete: start caller failed")?;
     }
     let mut acc = 0u64;
@@ -384,7 +388,9 @@ fn start_server(ctx: &TestContext, round: &mut Round, kind: u32, cycle: u32) -> 
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[SERVER_STACK]) });
     if let Some(server) = round.server.as_ref()
     {
-        spawn::configure_and_start_pinned(server, server_entry, stack, arg, SERVER_CPU)
+        // SAFETY: the stack is `super::STRESS_STACKS[SERVER_STACK]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe { spawn::configure_and_start_pinned(server, server_entry, stack, arg, SERVER_CPU) }
             .map_err(|_| "stress::reply_caller_delete: start server failed")?;
     }
     Ok(())
@@ -463,7 +469,10 @@ extern "C" fn server_entry(arg: u64) -> !
     // SAFETY: arg is SERVER_ARGS entry 0's address, published before the start.
     let args: ServerArgs = unsafe { spawn::child_args(arg) };
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         BAD_SERVER.record(0);
         notification_send(args.done, BIT_SERVER_BAD).ok();
@@ -550,7 +559,10 @@ extern "C" fn caller_entry(arg: u64) -> !
 {
     let (ep, done) = unpack(arg);
     let buf = core::ptr::addr_of_mut!(CALLER_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         BAD_CALLER.record(0);
         notification_send(done, BIT_CALLER_BAD).ok();

@@ -557,9 +557,12 @@ impl NamespaceBackend for VfsdRootBackend
             {
                 if visible == idx
                 {
+                    // Matches the NONE `lookup` reports: no synthetic
+                    // node is hidden.
                     return Ok(EntryName::new(
                         &n.name[..usize::from(n.name_len)],
                         NodeKind::Dir,
+                        NamespaceRights::NONE,
                     ));
                 }
                 visible += 1;

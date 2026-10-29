@@ -32,7 +32,8 @@ use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Sub};
 /// `LOCK`, identity-related bits, MAC labels, …).
 pub const RIGHTS_BITS: u32 = 24;
 
-/// Mask of all bits valid in a [`NamespaceRights`] backing value.
+/// Mask of the whole rights field (defined and reserved bits) within a
+/// node-cap badge.
 pub const RIGHTS_MASK: u32 = (1 << RIGHTS_BITS) - 1;
 
 /// `NS_LOOKUP` into this directory is permitted.
@@ -55,10 +56,15 @@ pub const MUTATE_DIR: u32 = 1 << 6;
 /// rule in `docs/namespace-model.md`).
 pub const ADMIN: u32 = 1 << 7;
 
+/// Mask of the defined rights bits (bits 0..8). The reserved bits of the
+/// field (8..24) MUST be zero on derive and are ignored on read, so no
+/// [`NamespaceRights`] value carries a bit outside this mask.
+pub const DEFINED_MASK: u32 = LOOKUP | READDIR | STAT | READ | WRITE | EXEC | MUTATE_DIR | ADMIN;
+
 /// Set of namespace rights packed in a node-cap badge.
 ///
-/// 24-bit field; bits beyond [`RIGHTS_BITS`] MUST be zero in any
-/// constructed value. The newtype is `Copy` and supports bitwise ops
+/// 24-bit field; only the bits of [`DEFINED_MASK`] can be set in a
+/// constructed value (reserved and out-of-field bits are cleared). The newtype is `Copy` and supports bitwise ops
 /// (`&`, `|`, `-`) for composition; `const fn` equivalents
 /// ([`Self::intersect`], [`Self::union`], [`Self::difference`]) cover
 /// const contexts.
@@ -71,22 +77,23 @@ impl NamespaceRights
     /// The empty rights set. A cap with [`Self::NONE`] permits nothing
     /// but exists as a structural value (e.g. derived intermediate).
     pub const NONE: Self = Self(0);
-    /// Every defined and reserved bit set. Used by clients that ask for
-    /// "everything I am allowed" at lookup; the server intersects with
-    /// the parent's rights and the entry's `max_rights` ceiling.
-    pub const ALL: Self = Self(RIGHTS_MASK);
+    /// Every defined bit set ([`DEFINED_MASK`]); reserved bits clear.
+    /// Used by clients that ask for "everything I am allowed" at lookup;
+    /// the server intersects with the parent's rights and the entry's
+    /// `max_rights` ceiling.
+    pub const ALL: Self = Self(DEFINED_MASK);
 
-    /// Construct from a raw `u32`. Bits beyond [`RIGHTS_BITS`] are
-    /// truncated; this matches the wire convention that reserved bits
-    /// are ignored on read.
+    /// Construct from a raw `u32`. Bits outside [`DEFINED_MASK`] (the
+    /// reserved bits of the field and every bit beyond [`RIGHTS_BITS`])
+    /// are cleared: reserved bits are ignored on read and never derived.
     #[must_use]
     pub const fn from_raw(value: u32) -> Self
     {
-        Self(value & RIGHTS_MASK)
+        Self(value & DEFINED_MASK)
     }
 
-    /// Returns the raw `u32` representation. The high
-    /// `32 - RIGHTS_BITS` bits are zero.
+    /// Returns the raw `u32` representation. Only bits of
+    /// [`DEFINED_MASK`] can be set.
     #[must_use]
     pub const fn raw(self) -> u32
     {
@@ -178,10 +185,10 @@ mod tests
     use super::*;
 
     #[test]
-    fn from_raw_truncates_reserved_bits()
+    fn from_raw_clears_reserved_and_out_of_field_bits()
     {
         let r = NamespaceRights::from_raw(0xFFFF_FFFF);
-        assert_eq!(r.raw(), RIGHTS_MASK);
+        assert_eq!(r.raw(), DEFINED_MASK);
     }
 
     #[test]
@@ -192,13 +199,14 @@ mod tests
     }
 
     #[test]
-    fn all_has_every_defined_bit_set()
+    fn all_has_every_defined_bit_and_no_reserved_bit()
     {
         let all = NamespaceRights::ALL;
         for bit in [LOOKUP, READDIR, STAT, READ, WRITE, EXEC, MUTATE_DIR, ADMIN]
         {
             assert!(all.contains(bit), "ALL missing bit {bit:#x}");
         }
+        assert_eq!(all.raw() & RIGHTS_MASK & !DEFINED_MASK, 0, "ALL sets a reserved bit");
     }
 
     #[test]
@@ -248,13 +256,5 @@ mod tests
         let a = NamespaceRights::from_raw(LOOKUP | READ | STAT);
         let b = NamespaceRights::from_raw(STAT);
         assert_eq!((a - b).raw(), a.difference(b).raw());
-    }
-
-    #[test]
-    fn rights_mask_covers_exactly_the_field_width()
-    {
-        assert_eq!(RIGHTS_MASK, (1 << RIGHTS_BITS) - 1);
-        assert_eq!(RIGHTS_MASK & !RIGHTS_MASK, 0);
-        assert_eq!(RIGHTS_MASK.count_ones(), RIGHTS_BITS);
     }
 }

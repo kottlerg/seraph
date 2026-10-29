@@ -385,15 +385,16 @@ impl SenderSlot
 /// The only mutator is the log thread; no synchronisation needed.
 static mut HISTORY: [HistoryLine; HISTORY_RING_LEN] = [HistoryLine::empty(); HISTORY_RING_LEN];
 
-/// Write cursor (next slot to overwrite, monotonically increasing modulo
-/// `HISTORY_RING_LEN`). Once `HISTORY_TOTAL >= HISTORY_RING_LEN` the
-/// ring has wrapped; oldest entry = `HISTORY[(HISTORY_TOTAL %
-/// HISTORY_RING_LEN)]`.
+/// Write cursor: the push sequence number of the next line, which lands in
+/// slot `HISTORY_HEAD % HISTORY_RING_LEN`. `history_push` advances it and
+/// [`HISTORY_TOTAL`] together, so the two are always equal; the handover
+/// reads sequence `s` from `HISTORY[s % HISTORY_RING_LEN]` on that basis.
 static HISTORY_HEAD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// Total lines ever pushed (monotonic, never reset). Lets the handover
-/// know whether the ring has wrapped (and thus how many entries to
-/// dump) without scanning for sentinel values.
+/// Total lines ever pushed (monotonic, never reset): the exclusive upper
+/// bound of the push sequence numbers. The live (not yet overwritten) lines
+/// are sequences `HISTORY_TOTAL.saturating_sub(HISTORY_RING_LEN)..HISTORY_TOTAL`
+/// (`logd_codec::handover::next_history_seq`).
 static HISTORY_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Set when init-logd acknowledges real-logd's `HANDOVER_RELEASE`. The
@@ -456,7 +457,8 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
     let mut slots: [SenderSlot; MAX_SENDERS] = [SenderSlot::empty(); MAX_SENDERS];
     // Round-robin pointer used to evict when all slots are in use.
     let mut next_evict: usize = 0;
-    // Cursor into HISTORY for staged HANDOVER_PULL replies.
+    // Handover cursor: 0 until the HANDOVER_PULL header is sent, then one
+    // more than the next history push sequence to send.
     let mut handover_cursor: u64 = 0;
     // Cursor into the slot table for staged HANDOVER_PULL replies.
     let mut handover_slot_idx: usize = 0;

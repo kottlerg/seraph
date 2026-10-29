@@ -43,4 +43,4 @@ services/logd/codec/
 
 ## Summarized By
 
-[services/logd/README.md](../README.md), [services/init/README.md](../../init/README.md)
+[services/init/README.md](../../init/README.md), [services/logd/README.md](../README.md)

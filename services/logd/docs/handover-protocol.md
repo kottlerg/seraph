@@ -202,6 +202,7 @@ side) and [`services/logd/src/handover.rs`](../src/handover.rs)
 [System Bootstrap](../../../docs/bootstrap.md), [Console Model](../../../docs/console-model.md),
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md), [services/logd/README.md](../README.md),
-[logd IPC interface](ipc-interface.md), [services/procmgr/README.md](../../procmgr/README.md),
+[services/logd/codec/README.md](../codec/README.md), [logd IPC interface](ipc-interface.md),
+[services/procmgr/README.md](../../procmgr/README.md),
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
 [`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)

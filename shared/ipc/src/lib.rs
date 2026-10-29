@@ -2083,7 +2083,8 @@ pub mod log_labels
     /// Sent by real-logd on the same single-use SEND cap after its
     /// [`HANDOVER_PULL`] drain settles (whether the drain ran to `DONE`,
     /// aborted on an IPC error, or hit its iteration cap); a call that
-    /// fails is retried until one is delivered. Init-logd replies with a
+    /// fails is retried, up to `MAX_RETRIES` (64) attempts, until one is
+    /// delivered. Init-logd replies with a
     /// status in the label:
     ///
     /// * `RELEASE_ACK` (0) — it sets its handover-complete flag and

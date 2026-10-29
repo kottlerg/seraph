@@ -1259,8 +1259,8 @@ pub fn phase3_svcmgr_handover(
 
     // Reap-handoff (donation + arm): stream init's reclaimable Memory caps to
     // procmgr and notify INIT_TEARDOWN_DONE. The death observers were bound
-    // above; procmgr reaps once both init threads have exited — init-logd when
-    // real-logd pulls the handover, main on the thread_exit below. The Memory
+    // above; procmgr reaps once both init threads have exited — init-logd on
+    // real-logd's acknowledged HANDOVER_RELEASE, main on the thread_exit below. The Memory
     // caps land in memmgr's pool at reap. Skipped if the object round failed:
     // the reap cannot run without it.
     if reap_bound

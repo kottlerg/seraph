@@ -326,7 +326,16 @@ pub(crate) unsafe fn load_elf_segment_into_child(
         // SAFETY: the caller's contract: `child_aspace` is a child's address
         // space, never procmgr's own, so the map changes nothing procmgr runs
         // on.
-        let mapped = unsafe { syscall::mem_map(derived, child_aspace, page_vaddr, 0, 1, 0) };
+        let mapped = unsafe {
+            syscall::mem_map(
+                derived,
+                child_aspace,
+                page_vaddr,
+                0,
+                1,
+                syscall::MAP_FROM_CAP,
+            )
+        };
         let _ = syscall::cap_delete(derived);
         if let Err(e) = mapped
         {

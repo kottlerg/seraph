@@ -322,7 +322,7 @@ thread,event,wait_set,tlb}.rs`). Benchmarks log min/mean/max cycle counts
 | `notification_roundtrip` | Notification ping-pong between two threads, per-iteration |
 | `cap_create_delete` | `cap_create_notification` + `cap_delete` cycle |
 | `mem_map_unmap` | `mem_map` + `mem_unmap` cycle |
-| `mem_protect_pair` | `mem_protect(READONLY)` + `mem_protect(WRITABLE)` round trip |
+| `mem_protect_pair` | `mem_protect(READ)` + `mem_protect(WRITABLE)` round trip |
 | `thread_lifecycle` | Full thread create → start → exit → cleanup |
 | `context_switch` | Parent/child `thread_yield` ping-pong on one CPU; reports cycles per switch |
 | `event_post_recv` | `event_post` + `event_recv` on a pre-created queue |

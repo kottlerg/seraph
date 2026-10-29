@@ -504,7 +504,7 @@ pub const MAP_WRITABLE: u64 = 0x2;
 pub const MAP_EXECUTABLE: u64 = 0x4;
 
 /// `SYS_MEM_MAP` protection value `0`: derive the mapping's permissions from
-/// the Memory cap's rights (`core/kernel/docs/syscalls.md` § `SYS_MEM_MAP`).
+/// the Memory cap's rights (`core/kernel/docs/syscalls.md` § `SYS_MEM_MAP` (16)).
 ///
 /// A cap with WRITE maps read-write and one with EXECUTE maps executable, and
 /// a cap carrying both fails with `WxViolation`; a cap narrowed to Map alone

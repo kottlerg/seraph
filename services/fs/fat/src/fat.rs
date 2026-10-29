@@ -205,10 +205,14 @@ pub fn read_file_data(
     }
 
     let remaining = u64::from(req.file_size) - req.offset;
+    // cast_possible_truncation: `to_read` is at most SECTOR_SIZE.
+    #[allow(clippy::cast_possible_truncation)]
     let to_read = req.max_len.min(remaining).min(SECTOR_SIZE as u64) as usize;
 
     let cluster_size = state.cluster_size();
     let cluster_idx = req.offset / u64::from(cluster_size);
+    // cast_possible_truncation: the remainder is below the `u32` cluster size.
+    #[allow(clippy::cast_possible_truncation)]
     let offset_in_cluster = (req.offset % u64::from(cluster_size)) as u32;
     let sector_in_cluster = offset_in_cluster / u32::from(state.bytes_per_sector);
     let offset_in_sector = (offset_in_cluster % u32::from(state.bytes_per_sector)) as usize;

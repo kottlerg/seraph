@@ -11,15 +11,12 @@
 //! confined to the ports the consumer actually drives instead of
 //! binding the full 64K I/O port space at startup.
 //!
-//! Once `ioport_bind` succeeds for a thread, the IOPB grant for those
-//! ports lives in per-thread state
-//! (`core/kernel/src/sched/thread.rs::ThreadControlBlock::iopb`) and is not
-//! withdrawn when the cap is later consumed or revoked: revocation does not
-//! yet withdraw bound IOPB access (#457; intended semantics in
-//! [capability-model.md](../../../../../docs/capability-model.md) § `IoPort` (x86-64 only)).
-//! Narrow caps produced here are therefore consumed afterwards (e.g. by
-//! Tier-1 unit tests that exercise `ioport_split`) without losing the
-//! established permission.
+//! Once `ioport_bind` succeeds for a thread, the grant lasts as long as the
+//! carved cap it was made through: deleting that cap, consuming it with a
+//! split, or revoking an ancestor of it withdraws it
+//! ([capability-model.md](../../../../../docs/capability-model.md) § `IoPort` (x86-64 only)).
+//! The carved caps a consumer binds therefore stay in ktest's `CSpace`; the
+//! prefix caps left beside them are the ones other tests may consume.
 
 use init_protocol::{CapType, InitInfo};
 
@@ -63,15 +60,28 @@ pub fn init(info: &InitInfo)
 /// Bind `[port, port + count)` to `thread_cap`. Returns `true` on
 /// success.
 ///
-/// Splits the wide cap to carve out exactly the requested sub-range,
-/// binds the carved cap, and stores the residual (if any) as the new
-/// wide cap. A request whose range falls outside the residual wide
-/// cap fails.
+/// Carves exactly the requested sub-range ([`carve_port_range`]) and binds
+/// the carved cap, which stays in ktest's `CSpace` so the binding lasts.
 pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
+{
+    carve_port_range(port, count).is_some_and(|cap| syscall::ioport_bind(thread_cap, cap).is_ok())
+}
+
+/// Carve an `IoPort` cap covering exactly `[port, port + count)` out of the
+/// wide cap, store the residual (if any) as the new wide cap, and return the
+/// carved cap: a lineage root of its own, split from the wide cap.
+///
+/// Returns `None` when `count` is 0, when the range falls outside the residual
+/// wide cap, or when an `ioport_split` fails. When `port` is above the wide
+/// cap's base, a failure at the second split (the one at `port + count`) comes
+/// after the first has consumed the old wide cap: the prefix cap for
+/// `[base, port)` stays in the `CSpace` and the wide cap is left narrowed to
+/// `[port, end)`.
+pub fn carve_port_range(port: u16, count: u16) -> Option<u32>
 {
     if count == 0
     {
-        return false;
+        return None;
     }
     let port_start = u32::from(port);
     let port_end = port_start + u32::from(count);
@@ -83,18 +93,14 @@ pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
     } = unsafe { WIDE };
     if slot == 0 || port_start < base || port_end > end
     {
-        return false;
+        return None;
     }
 
     if port_start > base
     {
         // port_start <= 0xFFFF because the caller supplied a u16; safe cast.
         #[allow(clippy::cast_possible_truncation)]
-        let Ok((prefix, rest)) = syscall::ioport_split(slot, port_start as u16)
-        else
-        {
-            return false;
-        };
+        let (prefix, rest) = syscall::ioport_split(slot, port_start as u16).ok()?;
         // ktest itself never drives the prefix range [base, port_start),
         // but the carved-off prefix cap is left alive in the cspace so
         // that any consumer (test harness, future module, debug probe)
@@ -104,6 +110,16 @@ pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
         // `ioport_split` syscall.
         let _ = prefix;
         slot = rest;
+        // The split consumed the old wide cap: record `rest` now, so a failed
+        // second split below leaves a wide cap that still resolves.
+        // SAFETY: ktest is single-threaded.
+        unsafe {
+            WIDE = WideCap {
+                slot,
+                base: port_start,
+                end,
+            };
+        }
     }
 
     if port_end < end
@@ -111,11 +127,7 @@ pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
         // port_end < end <= 0x10000 and we took this branch because
         // port_end != end, so port_end <= 0xFFFF; safe cast.
         #[allow(clippy::cast_possible_truncation)]
-        let Ok((target, residual)) = syscall::ioport_split(slot, port_end as u16)
-        else
-        {
-            return false;
-        };
+        let (target, residual) = syscall::ioport_split(slot, port_end as u16).ok()?;
         // SAFETY: ktest is single-threaded.
         unsafe {
             WIDE = WideCap {
@@ -124,10 +136,10 @@ pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
                 end,
             };
         }
-        return syscall::ioport_bind(thread_cap, target).is_ok();
+        return Some(target);
     }
 
-    // port_end == end: bind what's left and exhaust the wide cap.
+    // port_end == end: hand out what's left and exhaust the wide cap.
     // SAFETY: ktest is single-threaded.
     unsafe {
         WIDE = WideCap {
@@ -136,7 +148,7 @@ pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
             end: 0,
         };
     }
-    syscall::ioport_bind(thread_cap, slot).is_ok()
+    Some(slot)
 }
 
 /// Locate the root `IoPort` descriptor in `InitInfo`.

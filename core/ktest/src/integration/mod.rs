@@ -30,6 +30,14 @@
 //! - `cap_delegation_chain.rs`   — multi-level rights attenuation and cascaded revocation
 //! - `tlb_coherency.rs`          — map/unmap cycles across CPUs exercising TLB shootdown
 //! - `retype_reclaim.rs`         — auto-reclaim invariant for every retypable kernel object
+//! - `mem_map_retyped_refused.rs` — `mem_map` refuses a Memory cap's retyped pages and maps
+//!   the page past its retype cursor
+//! - `mmio_revoke_unmaps.rs` — revoking an `Mmio` cap unmaps, with shootdown, a mapping made
+//!   through its descendant while a reader on another CPU uses it
+//! - `range_copy_lineage.rs` — a range lineage admits exactly 64 live copies, counted
+//!   alone after the root's delete
+//! - `cspace_nested_teardown.rs` — deleting the root of a 256-deep chain of nested `CSpace`s
+//!   reclaims every one without exhausting the kernel stack
 //! - `retype_subpage_clobber.rs` — a clobbered sub-page free-list link is rejected, not dereferenced
 //! - `priority_preemption.rs`    — higher-priority runnable thread preempts a busy lower-priority one
 //! - `shared_memory_two_aspaces.rs` — one Memory cap mapped into two `AddressSpace` caps; phys round-trip
@@ -69,6 +77,7 @@ pub mod cap_move_into_fresh_cspace_then_ipc;
 pub mod cap_transfer;
 pub mod cap_transfer_large;
 pub mod cross_cspace_revoke_no_alias;
+pub mod cspace_nested_teardown;
 pub mod death_notification_late_bind;
 pub mod destroyed_source_interrupts;
 pub mod fault_exception_no_handler_kills;
@@ -80,11 +89,14 @@ pub mod fault_resume_modifies_pc;
 pub mod fpu_survives_ipc_call;
 pub mod ipc_call_interrupted_stop_start;
 pub mod irq_preserves_user_regs;
+pub mod mem_map_retyped_refused;
 pub mod memory_lifecycle;
+pub mod mmio_revoke_unmaps;
 pub mod multi_caller_ipc_fifo;
 pub mod park_interrupted_stop_start;
 pub mod priority_preemption;
 pub mod queued_waiters_fifo;
+pub mod range_copy_lineage;
 pub mod reply_binding_displaced;
 pub mod retype_reclaim;
 pub mod retype_subpage_clobber;
@@ -158,6 +170,22 @@ pub fn run_all(ctx: &TestContext)
     crate::arch::run_integration(ctx);
     run_integration_test!("integration::tlb_coherency", tlb_coherency::run(ctx));
     run_integration_test!("integration::retype_reclaim", retype_reclaim::run(ctx));
+    run_integration_test!(
+        "integration::cspace_nested_teardown",
+        cspace_nested_teardown::run(ctx)
+    );
+    run_integration_test!(
+        "integration::mem_map_retyped_refused",
+        mem_map_retyped_refused::run(ctx)
+    );
+    run_integration_test!(
+        "integration::mmio_revoke_unmaps",
+        mmio_revoke_unmaps::run(ctx)
+    );
+    run_integration_test!(
+        "integration::range_copy_lineage",
+        range_copy_lineage::run(ctx)
+    );
     run_integration_test!(
         "integration::retype_subpage_clobber",
         retype_subpage_clobber::run(ctx)

@@ -98,23 +98,23 @@ not a concern.
 ## Kernel Object Memory (`cap/retype.rs`)
 
 The kernel runs no heap and no `GlobalAlloc`
-([docs/memory-model.md](../../../docs/memory-model.md) § Kernel Object Memory). Every kernel object
-— the slot pages of a CSpace, thread control blocks, endpoints, notifications, event
-queues, wait sets, address spaces, CSpaces, and Memory objects themselves — is
-carved out of a Memory capability by retype: the body is constructed in place
-at the offset the retype allocator returns, its header records the source, and
-the bytes go back to that source when the object's reference count reaches zero,
-whether a capability (deleted, or removed by a revoke) or a kernel-internal owner
-releases the last reference (see [capability-internals.md](capability-internals.md)
-§ Kernel Object Reference Counting). The kernel's own objects are retyped from the SEED
-reserve, pinned at the Phase 7 handoff from the front of the largest block
-drained from the buddy allocator
-([initialization.md](initialization.md) § Phase 7: Capability System); the wrapper bodies
-of split-derived caps (the `sys_memory_split` tail and the MMIO, IRQ, I/O-port and
-SchedControl split children) and per-thread IOPB leases are also carved from SEED at
-runtime; every other userspace object comes from the capability a `cap_create_*` syscall
-names. Address spaces and CSpaces
-additionally own a page pool for their page tables and slot pages
+([docs/memory-model.md](../../../docs/memory-model.md) § Kernel Object Memory). Every kernel
+object — the slot pages of a CSpace, thread control blocks, endpoints, notifications, event
+queues, wait sets, address spaces, CSpaces, and Memory objects themselves — is carved out of
+a Memory capability by retype: the body is constructed in place at the offset the retype
+allocator returns, its header records the source, and the bytes go back to that source when
+the object's reference count reaches zero, whether a capability (deleted, or removed by a
+revoke) or a kernel-internal owner releases the last reference (see
+[capability-internals.md](capability-internals.md) § Kernel Object Reference Counting). The
+kernel's own objects are retyped from the SEED reserve, pinned at the Phase 7 handoff from
+the front of the largest block drained from the buddy allocator
+([initialization.md](initialization.md) § Phase 7: Capability System); the wrapper bodies of
+split-derived caps (the `sys_memory_split` tail and the MMIO, IRQ, I/O-port and SchedControl
+split children), the bodies of Mmio and IoPort copies and derivations
+([capability-internals.md](capability-internals.md) § Copies and Lineages), and per-thread
+port-binding tables (the IOPB and its binding records) are also carved from SEED at runtime;
+every other userspace object comes from the capability a `cap_create_*` syscall names.
+Address spaces and CSpaces additionally own a page pool for their page tables and slot pages
 ([capability-internals.md](capability-internals.md) § Page Pools).
 
 Retype and pool allocation are fallible and MUST be handled as fallible at every
@@ -279,6 +279,12 @@ on the address space behind cross-CPU latency. Region teardown (`unmap_region_po
 the exception: it holds `pt_lock` across its one coarse shootdown so that no CPU can reuse
 a just-freed page-table frame before every TLB and paging-structure cache is clean; the
 contended `pt_lock` path enables interrupts, so a waiting CPU still acks the IPI.
+The withdrawal of an `SYS_MMIO_MAP` mapping when its Mmio object is freed
+(`unmap_region_if_phys`) clears the span's leaves under one `pt_lock` hold, skipping a page
+remapped to other memory, and issues one invalidation for the span after releasing it, the
+region-teardown shape with `tag == 0`; it frees no page table and the device frames are never
+reallocated, so no reuse waits on it (see
+[capability-internals.md](capability-internals.md) § Mmio Mappings).
 
 The shootdown itself is lock-free — there is no global shootdown lock and no IPI
 payload. Each CPU owns a request slot. The initiator publishes `(root, virt, pages, tag)`
@@ -293,20 +299,19 @@ into its own slot, sets the pending bit of each target CPU, then sends the IPI:
 4. Send the shootdown IPI to the targets and wait for every pending bit to clear.
 ```
 
-A target services the slot only once it observes its own pending bit set, so it never
-reads a half-published request; it invalidates the named VA — or, for a range request
-(`pages > 1`), each page of the span inside one batched-invalidation window — for `tag`
-when the request carries one (so a CPU that has since switched to another space still
-flushes the right translation; region teardown's range and full-flush requests carry
-`tag == 0` and rely on its `tlb_gen` bump for any CPU that switched away) and clears its
-bit. Range flushes from every slot matched in one service pass share a
-single window, and **every acknowledgement is deferred until the window closes**: a queued
-`sinval.vma` is architecturally complete only when the closing `sfence.inval.ir` retires,
-so acking earlier would let the initiator proceed against a translation the target can
-still use. A full-flush or single-page slot serviced after the window opens executes its
-`sfence.vma`-family instruction inside the open window — architecturally legal (the
-closing fence still completes the queued `sinval.vma`s), just not part of the batch.
-Preemption stays disabled across the whole edit-then-shootdown sequence.
+A target services the slot only once it observes its own pending bit set, so it never reads a
+half-published request; it invalidates the named VA — or, for a range request (`pages > 1`), each
+page of the span inside one batched-invalidation window — for `tag` when the request carries one (so
+a CPU that has since switched to another space still flushes the right translation; region
+teardown's and the Mmio withdrawal's range and full-flush requests carry `tag == 0` and rely on
+their `tlb_gen` bump for any CPU that switched away) and clears its bit. Range flushes from every
+slot matched in one service pass share a single window, and **every acknowledgement is deferred
+until the window closes**: a queued `sinval.vma` is architecturally complete only when the closing
+`sfence.inval.ir` retires, so acking earlier would let the initiator proceed against a translation
+the target can still use. A full-flush or single-page slot serviced after the window opens executes
+its `sfence.vma`-family instruction inside the open window — architecturally legal (the closing
+fence still completes the queued `sinval.vma`s), just not part of the batch. Preemption stays
+disabled across the whole edit-then-shootdown sequence.
 
 The shootdown is **not** issued unconditionally. Each rewrite is classified as it
 commits (`MapOutcome`):

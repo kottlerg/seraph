@@ -402,15 +402,17 @@ re-enters their arms the same way.
 
 The stack also receives `Thread`, `CSpace`, and `AddressSpace` objects whose last reference a
 syscall pin or a batched capability move dropped (`cap::object::release_ref`), pushed from a live
-thread that may itself be the queued thread or bound to the queued object. The drain runs only
-from a live thread's syscall return or the idle thread, so it is never one of the self-teardown's
-dead threads; a draining thread that is the queued `Thread` (or bound to a queued object) is
-caught by the arm's self net, which marks it `Exited`, re-queues the object, and returns, so the
-drain never re-enters the wedge it exists to avoid. A queued `Thread` left `current` on a CPU
+thread that may itself be the queued thread or bound to the queued object, and an `AddressSpace`
+whose last reference an Mmio object's mapping record held, released by that object's teardown
+(`MmioObject::withdraw_mappings`) from a syscall or from the idle thread's own drain. The drain runs
+only from a live thread's syscall return or the idle thread, so it is never one of the
+self-teardown's dead threads; a draining thread that is the queued `Thread` (or bound to a queued
+object) is caught by the arm's self net, which marks it `Exited`, re-queues the object, and returns,
+so the drain never re-enters the wedge it exists to avoid. A queued `Thread` left `current` on a CPU
 that `fatal` halted, or a queued `CSpace` or `AddressSpace` with such a thread bound, is the
 exception: its teardown never completes, so the drain spins forever on the CPU that runs it
-(invariant 3 below;
-[scheduling-internals.md](scheduling-internals.md#thread-registry) § Thread Registry).
+(invariant 3 below; [scheduling-internals.md](scheduling-internals.md#thread-registry) § Thread
+Registry).
 
 **Invariants the drain protocol MUST hold:**
 

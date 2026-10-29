@@ -148,8 +148,10 @@ has no heap (see Phase 4).
    - Map [0, max RAM address) rounded up to 2 MiB — the top of every Usable, Loaded,
      AcpiReclaimable, and Persistent entry, holes included (boot_protocol::max_ram_address)
      — at direct_map_base() + phys
-   - Use 2 MiB large pages (megapages on RISC-V); 1 GiB gigapages are not used
-   - Permissions: readable, writable, not executable
+   - Use 2 MiB large pages (megapages on RISC-V); 1 GiB gigapages are not used, except that a
+     2 MiB chunk holding an arch kernel MMIO page (xAPIC or I/O APIC on x86-64) is mapped as
+     4 KiB pages, the MMIO pages uncacheable
+   - Permissions: readable, writable, not executable; write-back except those MMIO pages
    direct_map_base() is the runtime KASLR-chosen base from BootInfo — a
    1 GiB-aligned base at or above the paging mode's kernel-half floor
    (0xFFFF800000000000 on x86-64 / Sv48), published by init_paging_mode
@@ -160,8 +162,9 @@ has no heap (see Phase 4).
 5. Map the remaining boot-time windows: a 64 KiB identity window (VA == PA) around the boot
    stack pointer, used until the stack is rebased onto the direct map right after
    activation; the framebuffer at direct_map_base() + phys when it lies above the RAM
-   ceiling; the arch kernel MMIO regions above that ceiling (xAPIC and I/O APIC on x86-64;
-   none on RISC-V); and the AP trampoline page as a 4 KiB RWX identity page, retired in
+   ceiling; the arch kernel MMIO regions above that ceiling, uncacheable (xAPIC and I/O APIC
+   on x86-64; none on RISC-V, whose PLIC and UART take their memory type from the platform
+   PMAs); and the AP trampoline page as a 4 KiB RWX identity page, retired in
    Phase 8. BootInfo and boot modules are not mapped: after activation the kernel reaches
    them through the direct map.
 6. Install the new page table:

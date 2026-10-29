@@ -142,6 +142,8 @@ fn iter_entries(
 ) -> usize
 {
     let mut sector = [0u8; SECTOR_SIZE];
+    // Cast is range-safe: SECTOR_SIZE is 512.
+    #[allow(clippy::cast_possible_truncation)]
     let entries_per_sector = SECTOR_SIZE as u32 / header.entry_size;
     let sectors_needed = header.num_parts.div_ceil(entries_per_sector);
     let mut found: usize = 0;

@@ -21,8 +21,6 @@
 //! See `services/vfsd/README.md` for the design and
 //! `services/fs/docs/fs-driver-protocol.md` for the driver-side protocol.
 
-#![allow(clippy::cast_possible_truncation)]
-
 mod driver;
 mod partition;
 mod role_guids;
@@ -356,9 +354,11 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// - `rt.boot_module_cap` — Mutex; swapped to zero on the first
 ///   successful mount.
 /// - `rt.root_backend` — Mutex; the synthetic-root tree's only
-///   mutator. `root_backend.install_mount` rejects on an already-
-///   terminal entry, so two concurrent MOUNTs targeting the same
-///   path serialise on the lock and the loser sees `install` reject.
+///   mutator. `VfsdRootBackend::can_install` and
+///   `VfsdRootBackend::install` reject an already-terminal entry, so
+///   two concurrent MOUNTs targeting the same path serialise on the
+///   lock and the loser sees `can_install` (or, if both pass that
+///   check before either installs, `install`) reject.
 ///
 /// No `do_mount`-touched state is shared without one of these locks.
 fn service_loop(rt: &'static VfsdRuntime) -> !
@@ -550,6 +550,7 @@ fn try_forward_lookup_fallthrough(
         Err(GateError::PermissionDenied | GateError::UnknownLabel) => return false,
     };
     // Cast is range-safe: name_len lives in bits 16..32 of the label.
+    #[allow(clippy::cast_possible_truncation)]
     let name_len = ((recv.label >> 16) & 0xFFFF) as usize;
     let data_bytes = recv.data_bytes();
     if name_len == 0 || data_bytes.len() < 8 + name_len

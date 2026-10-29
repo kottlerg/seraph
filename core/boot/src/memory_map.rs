@@ -10,9 +10,10 @@
 
 use crate::bprintln;
 use crate::uefi::{
-    EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA,
+    EFI_ACPI_MEMORY_NVS, EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA,
     EFI_CONVENTIONAL_MEMORY, EFI_LOADER_CODE, EFI_LOADER_DATA, EFI_MEMORY_MAPPED_IO,
-    EFI_MEMORY_MAPPED_IO_PORT_SPACE, EFI_PERSISTENT_MEMORY, EfiMemoryDescriptor,
+    EFI_MEMORY_MAPPED_IO_PORT_SPACE, EFI_PERSISTENT_MEMORY, EFI_RUNTIME_SERVICES_CODE,
+    EFI_RUNTIME_SERVICES_DATA, EfiMemoryDescriptor,
 };
 use boot_protocol::{MAX_APERTURES, MemoryMapEntry, MemoryType, MmioAperture};
 
@@ -93,11 +94,124 @@ fn translate_memory_type(uefi_type: u32) -> MemoryType
 
 // ── MMIO aperture derivation ─────────────────────────────────────────────────
 
+/// Iterator over the descriptors of a raw UEFI memory map, yielding each
+/// descriptor by value.
+///
+/// Invariant (the contract of [`RawDescriptors::new`]): the map's buffer holds
+/// valid descriptors covering `map_size` bytes at `descriptor_size` strides for
+/// the iterator's lifetime.
+#[derive(Clone)]
+struct RawDescriptors<'a>
+{
+    map: &'a crate::uefi::MemoryMapResult,
+    offset: usize,
+}
+
+impl<'a> RawDescriptors<'a>
+{
+    /// # Safety
+    /// `map.buffer_phys` must hold valid `EfiMemoryDescriptor`s covering
+    /// `map.map_size` bytes at `map.descriptor_size` strides, readable for `'a`.
+    unsafe fn new(map: &'a crate::uefi::MemoryMapResult) -> Self
+    {
+        Self { map, offset: 0 }
+    }
+}
+
+impl Iterator for RawDescriptors<'_>
+{
+    type Item = EfiMemoryDescriptor;
+
+    fn next(&mut self) -> Option<EfiMemoryDescriptor>
+    {
+        if self.map.descriptor_size == 0
+            || self.offset + self.map.descriptor_size > self.map.map_size
+        {
+            return None;
+        }
+        // cast_possible_truncation: buffer_phys is a UEFI physical address;
+        // on all supported UEFI targets (x86_64, riscv64) usize == u64.
+        #[allow(clippy::cast_possible_truncation)]
+        let ptr = (self.map.buffer_phys as usize + self.offset) as *const EfiMemoryDescriptor;
+        self.offset += self.map.descriptor_size;
+        // SAFETY: the type invariant (`new`'s contract) puts a valid descriptor
+        // at every stride below `map_size`; `read_unaligned` makes no alignment
+        // demand on a firmware-chosen stride.
+        Some(unsafe { core::ptr::read_unaligned(ptr) })
+    }
+}
+
+/// Whether a UEFI memory type is excluded from every MMIO aperture: RAM
+/// (`EfiConventionalMemory`, `EfiBootServices*`, `EfiLoader*`,
+/// `EfiACPIReclaimMemory`, `EfiPersistentMemory`) and firmware-exclusive state
+/// (`EfiRuntimeServices*`, `EfiACPIMemoryNVS`), per
+/// `core/boot/docs/firmware-parsing.md` § Firmware exclusion.
+/// `EfiReservedMemoryType` is not excluded: firmware reports the GOP
+/// framebuffer and some interrupt-controller and ECAM windows as Reserved.
+fn excluded_from_apertures(uefi_type: u32) -> bool
+{
+    matches!(
+        uefi_type,
+        EFI_CONVENTIONAL_MEMORY
+            | EFI_BOOT_SERVICES_CODE
+            | EFI_BOOT_SERVICES_DATA
+            | EFI_LOADER_CODE
+            | EFI_LOADER_DATA
+            | EFI_ACPI_RECLAIM_MEMORY
+            | EFI_PERSISTENT_MEMORY
+            | EFI_RUNTIME_SERVICES_CODE
+            | EFI_RUNTIME_SERVICES_DATA
+            | EFI_ACPI_MEMORY_NVS
+    )
+}
+
+/// Emit the parts of `seed` that no `excluded` range covers, in ascending
+/// order. `excluded` yields half-open `(start, end)` ranges in any order; they
+/// may overlap one another.
+///
+/// Sweeps a cursor up from the seed's base: the lowest-starting excluded range
+/// that overlaps the rest of the seed bounds the next gap, and the cursor moves
+/// past that range's end, so every pass either emits the final gap or advances.
+fn subtract_excluded<I>(seed: MmioAperture, excluded: I, mut emit: impl FnMut(MmioAperture))
+where
+    I: Iterator<Item = (u64, u64)> + Clone,
+{
+    let end = seed.phys_base.saturating_add(seed.size);
+    let mut cur = seed.phys_base;
+    while cur < end
+    {
+        let next = excluded
+            .clone()
+            .filter(|&(start, stop)| start < end && stop > cur)
+            .min_by_key(|&(start, _)| start);
+        let Some((start, stop)) = next
+        else
+        {
+            emit(MmioAperture {
+                phys_base: cur,
+                size: end - cur,
+            });
+            return;
+        };
+        if start > cur
+        {
+            emit(MmioAperture {
+                phys_base: cur,
+                size: start - cur,
+            });
+        }
+        cur = stop;
+    }
+}
+
 /// Derive the coarse MMIO aperture array from the raw UEFI memory map and
 /// the caller-supplied firmware and framebuffer seeds (`seed`), following
-/// `core/boot/docs/firmware-parsing.md` § `mmio_apertures` construction.
-/// Writes at most `MAX_APERTURES` entries to `out` and returns the number
-/// written; surplus is dropped with a diagnostic.
+/// `core/boot/docs/firmware-parsing.md` § `mmio_apertures` construction:
+/// every RAM-class and firmware-exclusive range of the map
+/// ([`excluded_from_apertures`]) is subtracted from each seed before the
+/// merge, so no aperture covers RAM. Writes at most `MAX_APERTURES` entries
+/// to `out` and returns the number written; surplus is dropped with a
+/// diagnostic.
 ///
 /// Apertures are coarse by design; see `docs/device-management.md`
 /// § Raw Firmware Passthrough for where device-level discovery happens.
@@ -114,7 +228,7 @@ pub unsafe fn derive_mmio_apertures(
 ) -> usize
 {
     // Scratch buffer: MAX_APERTURES * 4 gives headroom for fragmented UEFI
-    // maps plus seed entries before the merge pass. 16 apertures × 4 × 16
+    // maps plus seed pieces before the merge pass. 16 apertures × 4 × 16
     // bytes = 1 KiB, stack-safe.
     const SCRATCH: usize = MAX_APERTURES * 4;
     let mut buf: [MmioAperture; SCRATCH] = [MmioAperture {
@@ -123,55 +237,50 @@ pub unsafe fn derive_mmio_apertures(
     }; SCRATCH];
     let mut n: usize = 0;
     let mut dropped = false;
-
-    // Collect MMIO-class descriptors from the UEFI map.
-    let mut offset: usize = 0;
-    while offset + uefi_map.descriptor_size <= uefi_map.map_size
-    {
-        // SAFETY: uefi_map.buffer_phys is the UEFI raw map buffer; offset is
-        // within map_size; the descriptor at this offset is a valid
-        // EfiMemoryDescriptor produced by firmware.
-        // cast_possible_truncation: buffer_phys is a UEFI physical address;
-        // on all supported UEFI targets (x86_64, riscv64) usize == u64.
-        #[allow(clippy::cast_possible_truncation)]
-        let desc =
-            unsafe { &*((uefi_map.buffer_phys as usize + offset) as *const EfiMemoryDescriptor) };
-        offset += uefi_map.descriptor_size;
-
-        let is_mmio = desc.memory_type == EFI_MEMORY_MAPPED_IO
-            || desc.memory_type == EFI_MEMORY_MAPPED_IO_PORT_SPACE;
-        if is_mmio
-        {
-            if n < SCRATCH
-            {
-                buf[n] = MmioAperture {
-                    phys_base: desc.physical_start,
-                    size: desc.number_of_pages * 4096,
-                };
-                n += 1;
-            }
-            else
-            {
-                dropped = true;
-            }
-        }
-    }
-
-    // Fold in firmware-seeded apertures.
-    for s in seed
-    {
-        if s.size == 0
-        {
-            continue;
-        }
+    let mut push = |ap: MmioAperture| {
         if n < SCRATCH
         {
-            buf[n] = *s;
+            buf[n] = ap;
             n += 1;
         }
         else
         {
             dropped = true;
+        }
+    };
+
+    // SAFETY: the caller's contract is `RawDescriptors::new`'s.
+    let descriptors = unsafe { RawDescriptors::new(uefi_map) };
+
+    // Collect MMIO-class descriptors from the UEFI map.
+    for desc in descriptors.clone()
+    {
+        if desc.memory_type == EFI_MEMORY_MAPPED_IO
+            || desc.memory_type == EFI_MEMORY_MAPPED_IO_PORT_SPACE
+        {
+            push(MmioAperture {
+                phys_base: desc.physical_start,
+                size: desc.number_of_pages.saturating_mul(4096),
+            });
+        }
+    }
+
+    // Fold in the firmware-seeded apertures, each clipped to the gaps the
+    // map's RAM-class and firmware-exclusive ranges leave.
+    let excluded = descriptors
+        .filter(|d| excluded_from_apertures(d.memory_type))
+        .map(|d| {
+            (
+                d.physical_start,
+                d.physical_start
+                    .saturating_add(d.number_of_pages.saturating_mul(4096)),
+            )
+        });
+    for s in seed
+    {
+        if s.size != 0
+        {
+            subtract_excluded(*s, excluded.clone(), &mut push);
         }
     }
 
@@ -241,7 +350,7 @@ mod tests
     use core::mem::size_of;
 
     use super::{
-        derive_mmio_apertures, insertion_sort_memory_map, translate_memory_map,
+        derive_mmio_apertures, insertion_sort_memory_map, subtract_excluded, translate_memory_map,
         translate_memory_type,
     };
     use crate::uefi::{
@@ -648,6 +757,118 @@ mod tests
         assert_eq!(
             out[MAX_APERTURES - 1].phys_base,
             0x1000_0000 + (MAX_APERTURES as u64 - 1) * 0x10_0000
+        );
+    }
+
+    // ── RAM subtraction ───────────────────────────────────────────────────────
+
+    fn desc(memory_type: u32, physical_start: u64, number_of_pages: u64) -> EfiMemoryDescriptor
+    {
+        EfiMemoryDescriptor {
+            memory_type,
+            physical_start,
+            virtual_start: 0,
+            number_of_pages,
+            attribute: 0,
+        }
+    }
+
+    fn ap(phys_base: u64, size: u64) -> MmioAperture
+    {
+        MmioAperture { phys_base, size }
+    }
+
+    fn pairs(out: &[MmioAperture]) -> Vec<(u64, u64)>
+    {
+        out.iter().map(|a| (a.phys_base, a.size)).collect()
+    }
+
+    #[test]
+    fn seed_overlapping_ram_is_trimmed_to_its_gaps()
+    {
+        // RAM [0x1000_2000, 0x1000_4000) inside the seed [0x1000_0000, 0x1000_6000).
+        let descs = [desc(EFI_CONVENTIONAL_MEMORY, 0x1000_2000, 2)];
+        let out = run_derive(&descs, &[ap(0x1000_0000, 0x6000)]);
+        assert_eq!(
+            pairs(&out),
+            vec![(0x1000_0000, 0x2000), (0x1000_4000, 0x2000)]
+        );
+    }
+
+    #[test]
+    fn seed_wholly_inside_ram_vanishes()
+    {
+        let descs = [desc(EFI_BOOT_SERVICES_DATA, 0x4000_0000, 0x100)];
+        assert!(run_derive(&descs, &[ap(0x4001_0000, 0x1000)]).is_empty());
+    }
+
+    #[test]
+    fn reserved_and_mmio_ranges_do_not_clip_a_seed()
+    {
+        // The GOP framebuffer and interrupt-controller windows are often
+        // Reserved; an MMIO descriptor merges with the seed instead.
+        let descs = [
+            desc(0 /* EfiReservedMemoryType */, 0x8000_0000, 0x10),
+            desc(EFI_MEMORY_MAPPED_IO, 0x8001_0000, 0x10),
+        ];
+        let out = run_derive(&descs, &[ap(0x8000_0000, 0x2_0000)]);
+        assert_eq!(pairs(&out), vec![(0x8000_0000, 0x2_0000)]);
+    }
+
+    #[test]
+    fn every_ram_class_and_firmware_exclusive_type_clips_a_seed()
+    {
+        let excluded = [
+            EFI_CONVENTIONAL_MEMORY,
+            EFI_BOOT_SERVICES_CODE,
+            EFI_BOOT_SERVICES_DATA,
+            EFI_LOADER_CODE,
+            EFI_LOADER_DATA,
+            EFI_ACPI_RECLAIM_MEMORY,
+            EFI_PERSISTENT_MEMORY,
+            EFI_RUNTIME_SERVICES_CODE,
+            EFI_RUNTIME_SERVICES_DATA,
+            EFI_ACPI_MEMORY_NVS,
+        ];
+        for ty in excluded
+        {
+            let descs = [desc(ty, 0x2000_0000, 1)];
+            let out = run_derive(&descs, &[ap(0x2000_0000, 0x2000)]);
+            assert_eq!(pairs(&out), vec![(0x2000_1000, 0x1000)], "type {ty}");
+        }
+    }
+
+    #[test]
+    fn q35_lowmem_ram_clips_the_32bit_pci_window()
+    {
+        // q35 with 2.5 GiB: lowmem RAM [0, 0xA000_0000); the MCFG heuristic's
+        // 32-bit window is [0x8000_0000, 0xB000_0000).
+        let descs = [desc(EFI_CONVENTIONAL_MEMORY, 0, 0xA000_0000 / 4096)];
+        let out = run_derive(&descs, &[ap(0x8000_0000, 0x3000_0000)]);
+        assert_eq!(pairs(&out), vec![(0xA000_0000, 0x1000_0000)]);
+    }
+
+    #[test]
+    fn ram_above_4gib_clips_the_64bit_pci_window()
+    {
+        // High RAM [4 GiB, 5 GiB); the q35 64-bit window is [4 GiB, 1 << 46).
+        let descs = [desc(EFI_CONVENTIONAL_MEMORY, 1 << 32, (1 << 30) / 4096)];
+        let out = run_derive(&descs, &[ap(1 << 32, (1u64 << 46) - (1 << 32))]);
+        assert_eq!(
+            pairs(&out),
+            vec![(0x1_4000_0000, (1u64 << 46) - 0x1_4000_0000)]
+        );
+    }
+
+    #[test]
+    fn unsorted_overlapping_excluded_ranges_leave_only_the_true_gaps()
+    {
+        let excluded = [(0x5000, 0x8000), (0x1000, 0x3000), (0x2000, 0x4000)];
+        let mut got = Vec::new();
+        subtract_excluded(ap(0, 0xA000), excluded.iter().copied(), |a| got.push(a));
+        assert_eq!(
+            pairs(&got),
+            vec![(0, 0x1000), (0x4000, 0x1000), (0x8000, 0x2000)]
         );
     }
 }

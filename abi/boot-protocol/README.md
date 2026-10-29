@@ -72,8 +72,13 @@ A compliant bootloader MUST NOT:
 - Leave UEFI boot services active at kernel entry.
 - Assume anything about the kernel's internal layout beyond the ELF
   headers.
-- Include in `BootInfo.mmio_apertures` any region that is inaccessible
-  or reserved for firmware's exclusive use.
+- Include in `BootInfo.mmio_apertures` any region that is inaccessible,
+  RAM (a region the memory map classifies as `Usable`, `Loaded`,
+  `AcpiReclaimable`, or `Persistent`), or reserved for firmware's exclusive
+  use (UEFI runtime-services code and data, ACPI NVS). The kernel rejects an
+  aperture that intersects RAM at Phase 6
+  ([core/kernel/docs/initialization.md](../../core/kernel/docs/initialization.md)
+  § Phase 6).
 
 ---
 

@@ -96,6 +96,10 @@ after `ExitBootServices` by
    UEFI typically reports as `EfiReservedMemoryType` and only the bootloader can
    carry past `ExitBootServices`. Seeds beyond the `MAX_APERTURE_SEEDS` (64)
    seed buffer, the framebuffer seed included, are dropped without a diagnostic.
+   Each seed is first clipped to the memory map: every range of a type
+   [§ Firmware exclusion](#firmware-exclusion) excludes is subtracted from it, so a
+   seed contributes only the gaps those ranges leave, and a seed wholly inside one
+   contributes nothing.
 3. Sort by `phys_base`.
 4. Merge adjacent and overlapping entries into a minimal non-overlapping
    list.
@@ -111,16 +115,23 @@ PLIC / ECAM / BAR windows).
 
 ### Firmware exclusion
 
-Apertures are coarse but **not indiscriminate**: regions classified as
-`EfiRuntimeServices*`, `EfiACPIMemoryNVS`, or `EfiReservedMemoryType` are
-omitted from the aperture list unless a firmware-table or framebuffer seed names
-them explicitly. Userspace therefore never receives capabilities that
-cover firmware-exclusive state (see
-[abi/boot-protocol](../../../abi/boot-protocol/README.md#contract-for-a-compliant-bootloader)),
-except through the heuristic PCI windows: the MCFG-derived 32-bit and 64-bit windows on
-x86-64 and the MCFG and arch-default windows on riscv64 are not clipped to the memory map, so
-they can cover RAM, kernel frames included, and any firmware ranges inside them (defect,
-[#499](https://github.com/kottlerg/seraph/issues/499)).
+Apertures are coarse but **not indiscriminate**. No aperture covers RAM or
+firmware-exclusive state: step 2 subtracts from every seed each range of the
+RAM-class types (`EfiConventionalMemory`, `EfiBootServicesCode`,
+`EfiBootServicesData`, `EfiLoaderCode`, `EfiLoaderData`, `EfiACPIReclaimMemory`,
+`EfiPersistentMemory`) and of the firmware-exclusive types (`EfiRuntimeServicesCode`,
+`EfiRuntimeServicesData`, `EfiACPIMemoryNVS`), and no UEFI descriptor of those types
+is collected in step 1. This holds for the coarse heuristic windows too (the
+MCFG-derived 32-bit and 64-bit PCI windows and the riscv64 arch defaults), which
+ignore the memory map and would otherwise cover RAM. `EfiReservedMemoryType` is not
+subtracted, since firmware reports the GOP framebuffer and some interrupt-controller and
+ECAM windows as Reserved; such a range is an aperture only where a seed names it.
+Userspace therefore never receives an `Mmio` capability over RAM or firmware-exclusive
+state (see
+[abi/boot-protocol](../../../abi/boot-protocol/README.md#contract-for-a-compliant-bootloader)).
+The kernel re-checks the RAM half at Phase 6, rejecting any aperture that intersects a
+RAM-class memory-map region
+([initialization.md](../../kernel/docs/initialization.md#phase-6-platform-resource-validation)).
 
 ---
 

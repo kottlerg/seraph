@@ -368,9 +368,11 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // Scrub the bootloader's own copies of the KASLR entropy words
     // (`boot_entropy.kaslr`, and the `kaslr.dm_rand` copy step 9 consumed) and
     // of the pool seed; the BootInfo copy is the kernel's to scrub, and step 5c
-    // scrubs its own byte buffers. The rest of the UEFI stack still reaches
-    // userspace unzeroed (core/kernel/docs/cross-boundary-disclosure.md § Kernel
-    // state in donated memory, #439).
+    // scrubs its own byte buffers. The kernel zeroes the whole UEFI stack (free
+    // RAM it drains at Phase 7) and every reclaim range before init runs
+    // (core/kernel/docs/cross-boundary-disclosure.md § Kernel state in donated
+    // memory); these local scrubs keep the secrets from outliving their last
+    // bootloader consumer.
     scrub(&mut boot_entropy.seed);
     // SAFETY: all are live locals; volatile so the stores are not elided as
     // dead ahead of the values going out of scope.

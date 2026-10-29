@@ -242,7 +242,10 @@ init's CSpace by the kernel-initialisation reclaim-minting steps. See
 [`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md)
 Phase 7 (standard reclaim mint) and Phase 8 (`RECLAIM_FLAG_LATE`
 late-mint for the AP trampoline page) for the authoritative
-mechanism.
+mechanism. Neither bootloader scratch nor firmware leftovers reach userspace
+with their contents intact: Phase 9 zeroes every recorded range before init
+runs, and Phase 7 zeroes every page of free RAM it drains into Memory caps,
+the UEFI stack the bootloader ran on among them.
 
 ### Buddy Allocator
 

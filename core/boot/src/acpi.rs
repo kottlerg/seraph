@@ -647,8 +647,9 @@ pub(crate) const MADT_TYPE_LAPIC_OVERRIDE: u8 = 5;
 ///   RISC-V platforms that expose ACPI such as QEMU+EDK2 virt).
 /// - Each MCFG ECAM window, plus a 32-bit and 64-bit PCI MMIO aperture
 ///   placed by a QEMU q35 / virt layout heuristic (ECAM-base-dependent).
-///   The heuristic windows are not bounded by the memory map and can cover
-///   RAM (defect, #499).
+///   The heuristic windows ignore the memory map;
+///   [`super::memory_map::derive_mmio_apertures`] clips them, like every
+///   seed, to the gaps the map's RAM-class and firmware-exclusive ranges leave.
 /// - The arch's platform defaults from
 ///   `crate::arch::current::default_mmio_apertures` (empty on x86-64),
 ///   appended once the RSDP and XSDT validate.
@@ -807,13 +808,14 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
                     //     below ECAM; 64-bit window `[4 GiB, 1<<MAXPHYADDR)`
                     //     so it covers wherever firmware places it
                     //     without per-CPU tuning.
-                    // Neither window is bounded by the memory map, and
-                    // nothing downstream clips it: the q35 64-bit window
-                    // covers all RAM above 4 GiB, and the virt 64-bit
-                    // window covers RAM once a guest has more than about
-                    // 14 GiB. The `Mmio` cap init receives over such a
-                    // window grants MAP and WRITE on that RAM, kernel-owned
-                    // frames included (defect, #499).
+                    // Neither window is bounded by the memory map here: the
+                    // q35 32-bit window covers lowmem RAM above 2 GiB, the
+                    // q35 64-bit window all RAM above 4 GiB, and the virt
+                    // 64-bit window RAM once a guest has more than about
+                    // 14 GiB. `derive_mmio_apertures` subtracts the
+                    // map's RAM-class and firmware-exclusive ranges from
+                    // every seed, so no aperture init receives covers RAM
+                    // (core/boot/docs/firmware-parsing.md § Firmware exclusion).
                     let (lo_base, lo_size) = if base < 0x8000_0000
                     {
                         (0x4000_0000u64, 0x4000_0000u64)

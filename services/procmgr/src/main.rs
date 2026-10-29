@@ -645,7 +645,7 @@ fn dispatch_death(
             // reclaimable Memory caps to memmgr's pool. The caps init still
             // holds stay in its kernel-pinned root CSpace, alive but
             // unreachable; releasing them at the reap is design intent, not
-            // yet implemented (`docs/process-lifecycle.md` § Init reap, #443).
+            // yet implemented (`docs/process-lifecycle.md` § Init reap, #540).
             init_reap::run_reap(memmgr_ep, ipc_buf);
             continue;
         }

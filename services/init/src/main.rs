@@ -520,7 +520,7 @@ fn run(info_ptr: u64) -> !
     // spawned process can ever reach it. The kernel pins that CSpace (it is
     // the root CSpace), so the remainder stays alive but unreachable after
     // init's reap; releasing it at the reap is design intent, not yet
-    // implemented (`docs/process-lifecycle.md` § Init reap, #443). Both memmgr
+    // implemented (`docs/process-lifecycle.md` § Init reap, #540). Both memmgr
     // and procmgr get a baseline copy; procmgr also uses it as the fan-out
     // source for every process it creates. (#185) Runs after
     // `spawn_log_thread`, which places init-logd from the still-unsplit root

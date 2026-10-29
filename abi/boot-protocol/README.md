@@ -13,8 +13,8 @@ halts at entry if the bootloader's version does not match (see
 § Phase 0: Entry Validation).
 
 **Constraints:** `no_std`, `#[repr(C)]` for every struct and `#[repr(u32)]` for every
-enum, no dependencies outside `core`. Changes that alter `BootInfo` layout or the CPU
-entry contract MUST increment `BOOT_PROTOCOL_VERSION`.
+enum `BootInfo` carries, no dependencies outside `core`. Changes that alter `BootInfo`
+layout or the CPU entry contract MUST increment `BOOT_PROTOCOL_VERSION`.
 
 The crate source itself ([`src/lib.rs`](src/lib.rs)) is the authoritative
 layout specification — type fields, discriminants, doc-comment invariants,
@@ -99,7 +99,9 @@ boot-protocol/
 | [core/boot/docs/kernel-handoff.md](../../core/boot/docs/kernel-handoff.md) | CPU and memory state at kernel entry |
 | [core/boot/docs/boot-flow.md](../../core/boot/docs/boot-flow.md) | Reference bootloader's steps, including `BootInfo` population |
 | [core/kernel/docs/initialization.md](../../core/kernel/docs/initialization.md) | Phase 0 entry validation of `BootInfo` |
+| [docs/bootstrap.md](../../docs/bootstrap.md) | Boot lifecycle: the bootloader loading the bundle `bundle.rs` encodes and handing over `BootInfo` |
 | [docs/memory-model.md](../../docs/memory-model.md) | Kernel virtual layout (direct map, KASLR), W^X enforcement, boot-time memory map |
+| [docs/storage.md](../../docs/storage.md) | GPT role-GUID discovery, whose partition type GUIDs `role_guids.rs` defines |
 
 ---
 

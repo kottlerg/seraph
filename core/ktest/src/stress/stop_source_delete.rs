@@ -868,7 +868,7 @@ fn create_source(ctx: &TestContext, kind: Kind, parts: &mut RoundParts)
         Kind::Notification => cap_create_notification(ctx.memory_base),
         Kind::EventQueue => event_queue_create(ctx.memory_base, EVENT_QUEUE_CAPACITY),
         Kind::WaitSet => wait_set_create(ctx.memory_base),
-        Kind::Recv | Kind::Call => cap_create_endpoint(ctx.memory_base),
+        Kind::Recv | Kind::Call | Kind::CallServed => cap_create_endpoint(ctx.memory_base),
     };
     let source = *parts
         .source

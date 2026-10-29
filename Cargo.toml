@@ -5,6 +5,7 @@ members = [
     "core/boot",
     "core/ktest",
     "services/init",
+    "services/init/sender-table",
     "services/memmgr",
     "services/memmgr/free-pool",
     "services/procmgr",

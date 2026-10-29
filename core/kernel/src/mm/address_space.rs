@@ -340,21 +340,14 @@ impl AddressSpace
     fn shootdown_remote(&self, virt: u64)
     {
         // This is the Replace-class path (unmap / frame-replace / permission
-        // narrow). `self.tag` is read without the pool lock, before the tlb_gen
-        // bump and the active-CPU snapshot below, and the caller need not be
-        // running this space (cross-AS edits by procmgr / memmgr), so the read
-        // can race eviction. Whether a concurrent eviction and re-activation can
-        // make the request carry a revoked tag to a CPU in the snapshot is an
-        // open question recorded on #443 (core/kernel/docs/memory-internals.md
-        // § SMP TLB Shootdown).
-        let tag = self.tag.load(Ordering::Acquire);
-
+        // narrow).
         if crate::mm::tag_allocator::tagging_enabled()
         {
             // Bump the per-space TLB generation, then fence before the active-CPU
             // snapshot: the initiator side of the tlb_gen / active_cpus Dekker
             // exclusion with the fence in `activate` (see
-            // core/kernel/docs/memory-internals.md § SMP TLB Shootdown).
+            // core/kernel/docs/memory-internals.md § SMP TLB Shootdown). The
+            // fence also orders the caller's PTE store before the tag read below.
             self.tlb_gen.fetch_add(1, Ordering::Release);
             core::sync::atomic::fence(Ordering::SeqCst);
         }
@@ -364,6 +357,15 @@ impl AddressSpace
         remote_cpus.clear(current);
         if !remote_cpus.is_empty()
         {
+            // `self.tag` is read without the pool lock, after the fence, and the
+            // caller need not be running this space (cross-AS edits by procmgr /
+            // memmgr), so the read can race eviction. A revoked tag it carries is
+            // harmless: eviction needs the space inactive everywhere, so a CPU
+            // in the snapshot reactivated it under a fresh claim, which flushed
+            // that new tag and walks the PTE the fence published (proof:
+            // core/kernel/docs/memory-internals.md § SMP TLB Shootdown). With
+            // tagging disabled the tag is always 0.
+            let tag = self.tag.load(Ordering::Acquire);
             // SAFETY: root_phys is a valid page table root; remote_cpus
             // contains only online CPUs (enforced by scheduler); the caller
             // holds preempt_disable() and no longer holds pt_lock.

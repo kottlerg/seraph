@@ -97,10 +97,15 @@ On `SYSCALL`:
    restores the user's `IF`
 10. `SYSRET` restores `rip` from `rcx`, `rflags` from `r11`, transitions to CPL 3
 
-A return `rip` with any of bits 63:47 set is never passed to `SYSRET`, which would
-fault in ring 0 on the user stack: the kernel terminates the thread as for an
-unhandled user `#GP` (vector 13). The GS-base exchange on every ring-3 entry and exit
-follows [arch-interface.md](arch-interface.md) § `cpu`.
+No return `rip` with any of bits 63:47 set can reach `SYSRET`, which would fault in
+ring 0 on the user stack: the top user page is unmappable (`user_va_top`, see
+[arch-interface.md](arch-interface.md) § `paging`), so the address after a `SYSCALL`
+instruction is canonical, and `SYS_THREAD_CONFIGURE` and `SYS_THREAD_WRITE_REGS` reject
+a non-canonical `rip`. The exit path still checks: a frame failing the check would
+indicate a kernel defect, and the thread is terminated as for an unhandled user `#GP`
+(vector 13) without the fault being offered to a bound fault handler, since no handler
+action can make that frame's return valid. The GS-base exchange on every ring-3 entry
+and exit follows [arch-interface.md](arch-interface.md) § `cpu`.
 
 `SFMASK` clears `IF`, `TF`, `DF`, `AC`, `NT` and `IOPL` on `SYSCALL` entry, whatever
 the user set: interrupts stay off until the kernel enables them, `DF` clear is the
@@ -1280,6 +1285,16 @@ longer names the target with Control rights — the target may then still be exe
 its CPU with its save published (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md)
 § `sys_thread_stop` Cross-CPU Stop Protocol).
 
+**Latency contract:** a stop of a thread running on another CPU completes at the target's next
+slice-expiry `schedule()` or its own park or yield, not within the inter-processor-interrupt
+latency: no interrupt-return path deschedules a `Stopped` current thread. That is within the
+target's remaining time slice (at most `TIME_SLICE_TICKS`, 10 timer ticks), except when the
+slice expires while the target runs a preemption-disabled kernel section with interrupts
+enabled (a TLB-shootdown or drain spin): `timer_tick` then refills the slice without
+rescheduling, and `preempt_enable` does not reschedule, so the stop completes at the first slice
+expiry that finds preemption enabled, a further slice later at the least. Callers that need a
+bounded stop latency MUST budget a slice for each expiry the target can spend in such a section.
+
 **Capability requirement:** `thread_cap` must have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control),
@@ -1358,7 +1373,7 @@ Change a thread's scheduling priority after creation.
 | # | Name | Description |
 |---|---|---|
 | 0 | `thread_cap` | Thread capability (Control rights): selects *which* thread |
-| 1 | `priority` | New priority (1–`PRIORITY_MAX`); the kernel reads only the low 8 bits of the register |
+| 1 | `priority` | New priority (1–`PRIORITY_MAX`); a register value above 255 is out of range |
 | 2 | `sched_cap` | `SchedControl` capability whose `[min, max]` band covers `priority`: governs *which level*. Always required |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
@@ -1394,7 +1409,7 @@ bands. Mirrors the range-split shape of `SYS_IRQ_SPLIT` / `SYS_MMIO_SPLIT` /
 | # | Name | Description |
 |---|---|---|
 | 0 | `sched_cap` | `SchedControl` capability to split |
-| 1 | `split_at` | Lowest priority level of the upper child; must satisfy `min < split_at <= max` on the cap being split; the kernel reads only the low 8 bits of the register |
+| 1 | `split_at` | Lowest priority level of the upper child; must satisfy `min < split_at <= max` on the cap being split (a register value above 255 is outside it) |
 
 **Return:**
 
@@ -1429,7 +1444,7 @@ Set or change a thread's CPU affinity.
 | # | Name | Description |
 |---|---|---|
 | 0 | `thread_cap` | Thread capability (Control rights) |
-| 1 | `cpu_id` | Target CPU ID, or `AFFINITY_ANY` (u32::MAX) to clear affinity |
+| 1 | `cpu_id` | Target CPU ID, or `AFFINITY_ANY` (u32::MAX) to clear affinity; a register value above `u32::MAX` is rejected |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
@@ -1449,13 +1464,12 @@ takes effect immediately:
 
 If `cpu_id` names an offline CPU, the call fails with `InvalidArgument`.
 
-The call writes `cpu_affinity` and reads the target's `preferred_cpu` and `state` without the
-target's `sched_lock`, so those accesses race other CPUs' scheduler paths, and the target Thread
-is not pinned for the call
+The call writes `cpu_affinity`, reads the target's `preferred_cpu` and `state`, and performs the
+migration under the target's `sched_lock`, so the decision cannot race another CPU's scheduler
+path. The target Thread is not pinned for the call
 ([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage:
-Hybrid Two-Level Radix); the outcomes above hold only when neither race occurs (defects tracked in
-[#443](https://github.com/kottlerg/seraph/issues/443) and
-[#502](https://github.com/kottlerg/seraph/issues/502)).
+Hybrid Two-Level Radix); the outcomes above hold only absent a concurrent free of the target
+(defect tracked in [#502](https://github.com/kottlerg/seraph/issues/502)).
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
@@ -1483,9 +1497,10 @@ reply (`BlockedOnFault`) — the latter lets a bound fault handler inspect the
 faulting registers (see [`docs/fault-handling.md`](../../../docs/fault-handling.md)).
 The buffer receives the kernel's architecture-specific `TrapFrame`
 (`core/kernel/src/arch/x86_64/trap_frame.rs`, `core/kernel/src/arch/riscv64/trap_frame.rs`);
-its layout is not published in an ABI crate, so userspace consumers hard-code its size and
-field offsets ([#443](https://github.com/kottlerg/seraph/issues/443)). If `buf_size` is smaller
-than the required size, the call fails with `InvalidArgument`.
+`abi/syscall` publishes its size and its instruction- and stack-pointer offsets per
+architecture (`REGS_X86_64_*`, `REGS_RISCV64_*`), and the kernel asserts its `TrapFrame`
+against them at compile time. If `buf_size` is smaller than the required size, the call fails
+with `InvalidArgument`.
 
 A thread stopped while it runs on another CPU is `Stopped` from the stop's commit, but it executes
 until that CPU deschedules it, so the call refuses it with `InvalidState` until it is `current` on
@@ -1528,8 +1543,9 @@ or otherwise edit the faulting thread before replying (see
 the frame per architecture ([arch-interface.md](arch-interface.md) § `trap_frame` —
 `arch::current::trap_frame`): a non-user instruction pointer (on x86-64, also a non-user
 stack pointer) is rejected with `InvalidArgument`; x86-64 forces ring-3 selectors and
-clears privileged RFLAGS bits; RISC-V applies `sstatus` as supplied, so a supplied SPP or
-SUM bit reaches hardware on resume ([#443](https://github.com/kottlerg/seraph/issues/443)).
+clears privileged RFLAGS bits; RISC-V discards the supplied `sstatus` and resumes the thread
+with the value a first entry gets (SPIE set; SPP, SIE, SUM, and MXR clear; FS and VS Off, so
+the thread's saved F/V state is restored lazily on first use).
 
 A thread stopped while it runs on another CPU is `Stopped` from the stop's commit, but it executes
 until that CPU deschedules it, so the call refuses it with `InvalidState` until it is `current` on
@@ -1779,7 +1795,10 @@ delivering the notification; the driver MUST call `SYS_IRQ_ACK` to re-enable it
 (Notify rights).
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (a cap lacks Notify),
-`InvalidArgument` (IRQ cap covers more than one line).
+`InvalidArgument` (IRQ cap covers more than one line, or names an id outside the
+routable range `MIN_IRQ_ID..=MAX_IRQ_ID`: GSIs 0–255 on x86-64, PLIC sources 1–127 on
+RISC-V, where the root Interrupt cap spans the PLIC's 1024-id space; see
+[arch-interface.md](arch-interface.md) § Module-level constants and free functions).
 
 ---
 
@@ -2051,8 +2070,8 @@ Translate a user virtual address to its mapped physical address.
 
 **Errors:**
 - `InvalidAddress` — `virt` is not page-aligned, outside the user half
-  (at or above `user_va_top`: `1 << 47` on x86-64; on riscv64 the active paging mode's
-  boundary, `1 << 38` / `1 << 47` / `1 << 56`), or not currently mapped.
+  (at or above `user_va_top`: `(1 << 47) - 4096` on x86-64; on riscv64 the active paging
+  mode's boundary, `1 << 38` / `1 << 47` / `1 << 56`), or not currently mapped.
 - `InvalidCapability` — cap slot is null, wrong type, or the object is gone.
 - `InsufficientRights` — cap does not have the `READ` right.
 

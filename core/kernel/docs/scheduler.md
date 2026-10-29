@@ -69,7 +69,7 @@ space is uniform; any partition into tiers is userspace policy, expressed by how
   baseline. After init's reap the remainder stays in init's CSpace, which the
   kernel pins (it is the root CSpace), so it remains alive but unreachable;
   releasing it at the reap is design intent, not yet implemented
-  ([#443](https://github.com/kottlerg/seraph/issues/443); see
+  ([#540](https://github.com/kottlerg/seraph/issues/540); see
   [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
 - Every spawned process receives a band through
   `ProcessInfo.sched_control_cap`. Init hands memmgr and procmgr each a copy of the
@@ -406,12 +406,12 @@ The `context_saved == 1` predicate is the load-balancer liveness gate of
 relocating it would dispatch it on two CPUs at once (#314/#293). The candidate's
 `sched_lock` is try-acquired because it is taken after the run-queue locks, the reverse of
 the canonical order; a failed try defers the pull. `relocate_ready_thread` re-checks
-`Ready`, `context_saved == 1`, and affinity under that `sched_lock`. This narrows, but does
-not close, a race with `sys_thread_set_affinity` between the `find_runnable` predicate and
-the move. That syscall writes `cpu_affinity` without the target's `sched_lock`
-([#443](https://github.com/kottlerg/seraph/issues/443)), so a pin landing after the re-check
-can leave the thread linked, and dispatched, on `dst` until its next `schedule()`
-cross-affinity requeue.
+`Ready`, `context_saved == 1`, and affinity under that `sched_lock`. This closes the race
+with `sys_thread_set_affinity` between the `find_runnable` predicate and the move: that
+syscall writes `cpu_affinity` under the same `sched_lock`, so a pin committed before the
+re-check refuses the move, and one committed after it finds the thread already on `dst`
+and migrates it (or, once dispatched there, moves it at its next `schedule()`
+cross-affinity requeue).
 
 Lock order follows [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy rule 4
 (ascending CPU id), and both acquisitions are **try-locks**: the pull runs
@@ -588,13 +588,13 @@ next enqueue ([syscalls.md](syscalls.md) § `SYS_THREAD_SET_AFFINITY`). Clearing
 `AFFINITY_ANY`, or naming the CPU in the thread's `preferred_cpu`, does no migration work.
 Otherwise, by target state:
 
-- **Ready** thread queued on the old CPU: the syscall calls
-  `migrate_ready_thread`. It takes the target's `sched_lock` and then both scheduler locks
-  (lower-numbered CPU first; see [scheduling-internals.md](scheduling-internals.md) § Lock
-  Hierarchy rule 4) and revalidates `Ready`, `context_saved == 1`, and the affinity under
-  them (`relocate_ready_thread`). It then moves the TCB from the source CPU's run queue to
-  the destination's and, on a committed move, sends a wakeup IPI to the destination. A lost
-  race leaves the thread where it is.
+- **Ready** thread queued on the old CPU: the syscall, holding the target's `sched_lock`,
+  calls `migrate_ready_thread`. It takes both scheduler locks (lower-numbered CPU first; see
+  [scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy rule 4) and revalidates
+  `Ready`, `context_saved == 1`, and the affinity under them (`relocate_ready_thread`). It
+  then moves the TCB from the source CPU's run queue to the destination's; on a committed
+  move the syscall sends a wakeup IPI to the destination once it has released
+  `sched_lock`. A lost race leaves the thread where it is.
 - **Running** thread on a different CPU: the syscall sets the
   **source** CPU's reschedule-pending flag and sends a wakeup IPI to the
   **source** CPU (where the thread is currently running). The IPI itself
@@ -611,12 +611,12 @@ Otherwise, by target state:
   next enqueue (a wake, or `SYS_THREAD_START` on start or resume) via
   `select_target_cpu`; no migration work is needed.
 
-The syscall writes `cpu_affinity`, and reads `preferred_cpu` and `state`, without the target's
-`sched_lock`, so those accesses race other CPUs' scheduler paths
-([#443](https://github.com/kottlerg/seraph/issues/443)). `lookup_cap` does not pin the target
-Thread (see [capability-internals.md](capability-internals.md) § Storage: Hybrid Two-Level Radix
-and [#502](https://github.com/kottlerg/seraph/issues/502)). The outcomes above hold only absent
-those hazards.
+The syscall writes `cpu_affinity`, reads `preferred_cpu` and `state`, and performs the
+migration under the target's `sched_lock`, and prods the acting CPU after releasing it.
+`lookup_cap` does not pin the target Thread (see
+[capability-internals.md](capability-internals.md) § Storage: Hybrid Two-Level Radix and
+[#502](https://github.com/kottlerg/seraph/issues/502)), so the outcomes above hold only absent
+a concurrent free of the target.
 
 ### Soft Affinity
 

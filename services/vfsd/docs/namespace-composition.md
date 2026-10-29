@@ -41,7 +41,7 @@ The synthetic root is `NodeId::ROOT` (pool index 0) and is always
 active; its `fallthrough_cap` carries the root mount cap captured
 when `MOUNT path="/"` succeeds. `MAX_TREE_NODES` is `32` and
 `MAX_ENTRY_NAME` is `64` bytes; both are file-local constants in
-[`services/vfsd/src/root_backend.rs`](../src/root_backend.rs).
+[`services/vfsd/root-backend/src/lib.rs`](../root-backend/src/lib.rs).
 
 Multi-component mount paths install through the tree by walking
 components, creating synthetic intermediates on demand, and setting
@@ -156,10 +156,15 @@ derived from it — the `terminal_endpoint`, every per-lookup reply cap,
 and the `MOUNT` caller's copy. This is the `kill the server` shape
 documented in
 [`docs/namespace-model.md`](../../../docs/namespace-model.md#revocation).
-Retaining the unbadged endpoint in the backend (rather than leaking it,
-as the pre-attenuation design did) means vfsd now holds that revocation
-authority by name. Per-cap revocation — invalidating one issued node cap
-without affecting its siblings — is not supported by this scheme.
+That authority is the driver's original endpoint (a driver's service and
+namespace endpoint are one), which vfsd keeps per mount
+(`FatfsDriver::endpoint` in `src/driver.rs`): the backend's retained
+`terminal_endpoint`, the root mount's badged fall-through cap, and the
+driver's own receive copy all derive from it.
+Revoking a cap the backend retains reaches only that cap's descendants,
+not the driver's receive copy, so it does not stop the server.
+Per-cap revocation — invalidating one issued node cap without affecting
+its siblings — is not supported by this scheme.
 
 ---
 
@@ -211,7 +216,9 @@ Wire-label numbers for both surfaces live in [`ipc::vfsd_labels`] and
 A successful `install` retains the `terminal_endpoint` (terminal
 nodes) and any walked `fallthrough_cap`s (synthetic intermediates, plus
 the root mount's badged fall-through cap) for the lifetime of the vfsd
-process. Unmount is not implemented;
+process. vfsd also keeps each mounted driver's original service endpoint,
+from which every cap above derives, as the handle that revokes the driver;
+a mount that fails after its driver started is torn down through it. Unmount is not implemented;
 the mount-tree is permanent until vfsd exits. Deferred follow-ups:
 per-process `system_root_cap` distribution (different processes
 seeing different roots) and `cap_revoke`-driven unmount.

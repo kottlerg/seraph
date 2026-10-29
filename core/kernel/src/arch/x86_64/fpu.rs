@@ -312,7 +312,8 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
         return;
     }
     let cpu = super::cpu::current_cpu() as usize;
-    let owner_slot = crate::percpu::fpu_owner_for(cpu);
+    // SAFETY: `cpu` is the executing CPU's logical index, below CPU_COUNT.
+    let owner_slot = unsafe { crate::percpu::fpu_owner_for(cpu) };
     let owner = owner_slot.load(core::sync::atomic::Ordering::Acquire);
     if owner == tcb
     {

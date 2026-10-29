@@ -328,6 +328,50 @@ pub fn mmio_split_wrong_tag_err(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// An Interrupt cap naming an id outside the routable range
+/// (`MIN_IRQ_ID..=MAX_IRQ_ID`) is refused by `irq_register` with
+/// `InvalidArgument`, and deleting it leaves the kernel's routing table alone.
+///
+/// Only riscv64 can name such an id: its root Interrupt cap spans the PLIC's
+/// 1024-id space while the kernel routes sources 1..=127. The test splits id
+/// 1023 off the first cap whose range contains it, which leaves the low part
+/// `[start, 1023)` in place for the split tests that follow. Skipped where no
+/// cap contains id 1023 (x86-64, whose root cap is the routable range).
+pub fn irq_register_unroutable_id_err(ctx: &TestContext) -> TestResult
+{
+    const UNROUTABLE_ID: u32 = 1023;
+
+    let irq_sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "hw::irq_register_unroutable_id_err: cap_create_notification failed")?;
+
+    let bound = scan_bound(ctx);
+    for slot in 1u32..=bound
+    {
+        // Wrong-tag and out-of-range responses leave the cap intact.
+        let Ok((_lo, hi)) = irq_split(slot, UNROUTABLE_ID)
+        else
+        {
+            continue;
+        };
+        // `hi` is the single id 1023 (no cap extends past the 1024-id space).
+        let err = irq_register(hi, irq_sig);
+        // Deleting the cap must not touch the routing table for an id it cannot
+        // index (the kernel panicked here before the teardown guard).
+        let deleted = syscall::cap_delete(hi);
+        syscall::cap_delete(irq_sig).ok();
+        if err != Err(SyscallError::InvalidArgument as i64)
+        {
+            return Err("hw::irq_register_unroutable_id_err: id 1023 not refused");
+        }
+        deleted.map_err(|_| "hw::irq_register_unroutable_id_err: cap_delete of id 1023 failed")?;
+        return Ok(());
+    }
+
+    crate::log("ktest: hw::irq_register_unroutable_id_err SKIP (no cap contains id 1023)");
+    syscall::cap_delete(irq_sig).ok();
+    Ok(())
+}
+
 // ── SYS_IRQ_SPLIT ─────────────────────────────────────────────────────────────
 
 /// `irq_split` at IRQ id 1 on the first Interrupt-range cap whose range

@@ -515,6 +515,18 @@ pub fn run_all(ctx: &TestContext)
         thread::set_affinity_invalid_err(ctx)
     );
     run_test!(
+        "thread::set_affinity_wide_arg_err",
+        thread::set_affinity_wide_arg_err(ctx)
+    );
+    run_test!(
+        "thread::set_priority_wide_arg_err",
+        thread::set_priority_wide_arg_err(ctx)
+    );
+    run_test!(
+        "thread::sched_split_wide_arg_err",
+        thread::sched_split_wide_arg_err(ctx)
+    );
+    run_test!(
         "thread::configure_running_thread_err",
         thread::configure_running_thread_err(ctx)
     );
@@ -587,6 +599,10 @@ pub fn run_all(ctx: &TestContext)
         hw::mmio_split_wrong_tag_err(ctx)
     );
     run_test!("hw::irq_register_ack", hw::irq_register_ack(ctx));
+    run_test!(
+        "hw::irq_register_unroutable_id_err",
+        hw::irq_register_unroutable_id_err(ctx)
+    );
     run_test!("hw::irq_split_carves", hw::irq_split_carves(ctx));
     run_test!(
         "hw::irq_split_wrong_tag_err",

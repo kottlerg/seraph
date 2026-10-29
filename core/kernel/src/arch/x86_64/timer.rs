@@ -26,9 +26,9 @@
 //! The PIT output is readable on port 0x61 (bit 5: channel 2 output). The
 //! same window also calibrates the TSC (`TSC_PER_US`), which both
 //! `elapsed_us()` and TSC-deadline arming consume — so the PIT is used
-//! exactly once, at boot, in either mode. The windows coincide only when the
-//! channel-2 gate is clear on entry; calibration leaves a gate firmware set
-//! as found, and the PIT window then starts early (known defect, #443).
+//! exactly once, at boot, in either mode. Calibration clears the channel-2
+//! gate before programming the count (firmware may leave it set), so the PIT
+//! window starts at the gate-enable, together with the APIC and TSC windows.
 //!
 //! # Timer ISR
 //! The ISR re-arms the deadline (TSC-deadline mode only; periodic mode
@@ -220,9 +220,9 @@ unsafe fn inb(port: u16) -> u8
 /// Programs PIT channel 2 for `pit_counts` counts (`PIT_CALIBRATION_MS`,
 /// ~10 ms), starts the APIC timer at full count with divide-by-16, spins
 /// until the PIT expires, and records `TSC_PER_US` and `BOOT_TSC` from the
-/// same window. The channel-2 gate is left as found, so when firmware left it
-/// set the PIT window starts before the APIC and TSC windows and both rates
-/// read low (known defect, #443).
+/// same window. The channel-2 gate is cleared before the count is programmed,
+/// so the PIT counts only from the gate-enable that opens the APIC and TSC
+/// windows, whatever state firmware left the gate in.
 ///
 /// Returns APIC timer ticks per second at divide-by-16 (the 10 ms sample
 /// scaled by 100).
@@ -234,15 +234,16 @@ unsafe fn calibrate_apic_timer() -> u64
     // PIT counts for 10 ms.
     let pit_counts = (PIT_HZ * PIT_CALIBRATION_MS / 1000) as u16;
 
-    // Clear bit 1 of port 0x61 (speaker data enable); bit 0 (channel 2
-    // gate) is left as found. If firmware left the gate set, mode-0 counting
-    // starts when the count below is written, before the APIC timer and
-    // `tsc_start`, so both calibrated rates read low by that skew (known
-    // defect, #443).
+    // Clear bit 1 of port 0x61 (speaker data enable) and bit 0 (channel 2
+    // gate). Mode 0 counts only while the gate is high, so with the gate low
+    // the count written below waits for the gate-enable after the APIC timer
+    // start and `tsc_start`; a gate firmware left set would start the PIT
+    // window at the count write instead, and both calibrated rates would read
+    // low by that skew.
     // SAFETY: port I/O at ring 0.
     unsafe {
         let gate = inb(PIT_GATE);
-        outb(PIT_GATE, gate & 0xFD); // speaker data off; gate bit unchanged
+        outb(PIT_GATE, gate & 0xFC); // speaker data off; channel 2 gate off
     }
 
     // Program PIT channel 2: mode 0 (interrupt on terminal count), binary.
@@ -261,11 +262,9 @@ unsafe fn calibrate_apic_timer() -> u64
         apic_write(APIC_TIMER_INITIAL, 0xFFFF_FFFF);
     }
 
-    // Set PIT channel 2 gate (bit 0 of port 0x61). When the gate was clear,
-    // setting it starts the countdown, and reading the TSC immediately before
-    // starts the measurement window as close to gate-enable as possible. When
-    // the gate was already set, the write is a no-op and the PIT window began
-    // at the count load above (known defect, #443).
+    // Set PIT channel 2 gate (bit 0 of port 0x61, cleared above). Setting it
+    // starts the countdown, and reading the TSC immediately before starts the
+    // measurement window as close to gate-enable as possible.
     let tsc_start = read_tsc();
     // SAFETY: port 0x61 (PIT gate control) is standard legacy hardware; ring 0 I/O access.
     unsafe {

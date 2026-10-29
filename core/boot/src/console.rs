@@ -10,20 +10,29 @@
 //! to both the serial port and the framebuffer (when available). All state is
 //! static and unlocked; see `core/boot/docs/console.md` § Scope.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::arch::current::serial::{serial_init, serial_write_byte};
 use crate::framebuffer::FramebufferWriter;
 use boot_protocol::FramebufferInfo;
 
 /// Static console state; unlocked (see `core/boot/docs/console.md` § Scope).
-static mut CONSOLE: Console = Console {
-    serial_ready: false,
-    fb: None,
-};
+/// Referenced only by [`init_framebuffer`] and, while it holds
+/// [`CONSOLE_BUSY`], by [`console_write_str`].
+static mut CONSOLE: Console = Console { fb: None };
+
+/// Set by [`init_serial`] once the UART is programmed. Kept outside
+/// [`CONSOLE`] so a re-entered write can reach serial without referencing it.
+static SERIAL_READY: AtomicBool = AtomicBool::new(false);
+
+/// Held by [`console_write_str`] while it references [`CONSOLE`]. A write
+/// that finds it set is a re-entry (the panic handler printing a panic raised
+/// inside an outer write) and goes to serial only.
+static CONSOLE_BUSY: AtomicBool = AtomicBool::new(false);
 
 /// Internal console state.
 struct Console
 {
-    serial_ready: bool,
     fb: Option<FramebufferWriter>,
 }
 
@@ -41,10 +50,7 @@ pub unsafe fn init_serial()
     unsafe {
         serial_init();
     }
-    // SAFETY: CONSOLE is only accessed from the single boot thread.
-    unsafe {
-        CONSOLE.serial_ready = true;
-    }
+    SERIAL_READY.store(true, Ordering::Release);
 }
 
 /// Initialize the framebuffer backend.
@@ -59,7 +65,8 @@ pub unsafe fn init_framebuffer(fb: &FramebufferInfo)
 {
     // SAFETY: FramebufferWriter::new requires a valid framebuffer; caller ensures this.
     let writer = unsafe { FramebufferWriter::new(fb) };
-    // SAFETY: CONSOLE is only accessed from the single boot thread.
+    // SAFETY: CONSOLE is only accessed from the single boot thread, and this
+    // runs between writes, so console_write_str holds no reference to it.
     unsafe {
         CONSOLE.fb = writer;
     }
@@ -71,38 +78,56 @@ pub unsafe fn init_framebuffer(fb: &FramebufferInfo)
 /// before each `\n` on the serial path so terminals show correct line endings.
 ///
 /// Safe to call at any point: output to a backend that is not yet
-/// initialized is dropped.
+/// initialized is dropped. A call made while another is in progress (the
+/// panic handler reporting a panic raised inside a write) goes to serial
+/// only, since the framebuffer state is still in use by the outer call.
 pub fn console_write_str(s: &str)
 {
-    // SAFETY: the bootloader runs on a single boot thread with no
-    // console-writing interrupt handlers, and nothing below re-enters the
-    // console, so this is the only live reference to CONSOLE. The raw pointer
-    // avoids the static_mut_refs lint.
-    let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
-
-    for byte in s.bytes()
+    write_serial(s);
+    if CONSOLE_BUSY.swap(true, Ordering::Acquire)
     {
-        if console.serial_ready
-        {
-            if byte == b'\n'
-            {
-                // SAFETY: serial_init was called during init_serial.
-                unsafe {
-                    serial_write_byte(b'\r');
-                }
-            }
-            // SAFETY: serial_init was called during init_serial.
-            unsafe {
-                serial_write_byte(byte);
-            }
-        }
-
-        if let Some(ref mut fb) = console.fb
+        return;
+    }
+    // SAFETY: the bootloader runs on a single boot thread with no
+    // console-writing interrupt handlers, and CONSOLE_BUSY was clear, so no
+    // other reference to CONSOLE is live: an outer call would have set it, and
+    // init_framebuffer runs only between writes. A re-entered call returns
+    // above without referencing CONSOLE. The raw pointer avoids the
+    // static_mut_refs lint.
+    let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
+    if let Some(fb) = console.fb.as_mut()
+    {
+        for byte in s.bytes()
         {
             // SAFETY: fb was constructed from a valid FramebufferInfo.
             unsafe {
                 fb.write_byte(byte);
             }
+        }
+    }
+    CONSOLE_BUSY.store(false, Ordering::Release);
+}
+
+/// Write `s` to the serial backend, if initialized, inserting `\r` before
+/// each `\n`. Touches no shared console state but [`SERIAL_READY`].
+fn write_serial(s: &str)
+{
+    if !SERIAL_READY.load(Ordering::Acquire)
+    {
+        return;
+    }
+    for byte in s.bytes()
+    {
+        if byte == b'\n'
+        {
+            // SAFETY: SERIAL_READY is set only after init_serial ran serial_init.
+            unsafe {
+                serial_write_byte(b'\r');
+            }
+        }
+        // SAFETY: SERIAL_READY is set only after init_serial ran serial_init.
+        unsafe {
+            serial_write_byte(byte);
         }
     }
 }

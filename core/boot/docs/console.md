@@ -22,7 +22,10 @@ The kernel has its own console arrangements and takes nothing from the
 bootloader's console state.
 
 The bootloader is single-threaded and never preempts itself, so the shared
-console state needs no locking.
+console state needs no locking. The one re-entry is the panic handler printing
+a panic raised inside a console write; the writer detects it with a busy flag
+and sends the re-entered output to serial only, leaving the framebuffer state
+to the interrupted outer write.
 
 ---
 

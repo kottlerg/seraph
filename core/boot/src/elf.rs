@@ -97,9 +97,10 @@ pub struct KernelInfo
 /// Physical span and link-time bases of a kernel image, derived from its
 /// `PT_LOAD` segments by [`validate_kernel_layout`].
 ///
-/// The loader allocates one contiguous region of `span_bytes` at any free
-/// physical base and places each segment at `span_base + (p_paddr -
-/// link_phys)`, preserving the ELF's relative layout.
+/// The loader allocates one contiguous region of `span_bytes` through
+/// `arch::current::allocate_kernel_span` (any free physical base on riscv64,
+/// wholly below 4 GiB on x86-64) and places each segment at `span_base +
+/// (p_paddr - link_phys)`, preserving the ELF's relative layout.
 struct KernelSpan
 {
     /// Lowest `p_paddr` across all segments — the ELF's link-time physical origin.
@@ -443,7 +444,7 @@ pub unsafe fn relocate_kernel(
 
 /// Parse and load a userspace init ELF into physical memory.
 ///
-/// Like [`load_kernel`], the init ELF is placed via `AllocateAnyPages` (init is
+/// The init ELF is placed via `AllocateAnyPages` (init is
 /// a regular userspace executable whose `p_paddr` values are in low memory
 /// already occupied by UEFI); unlike the kernel's single contiguous span, each
 /// LOAD segment is allocated independently, then the data is copied in. The

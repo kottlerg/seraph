@@ -117,9 +117,9 @@ omitted from the aperture list unless a firmware-table or framebuffer seed names
 them explicitly. Userspace therefore never receives capabilities that
 cover firmware-exclusive state (see
 [abi/boot-protocol](../../../abi/boot-protocol/README.md#contract-for-a-compliant-bootloader)),
-except through the heuristic PCI windows: the MCFG-derived 64-bit window on x86-64 and the
-MCFG and arch-default windows on riscv64 are not clipped to the memory map, so they can cover
-RAM, kernel frames included, and any firmware ranges inside them (defect,
+except through the heuristic PCI windows: the MCFG-derived 32-bit and 64-bit windows on
+x86-64 and the MCFG and arch-default windows on riscv64 are not clipped to the memory map, so
+they can cover RAM, kernel frames included, and any firmware ranges inside them (defect,
 [#499](https://github.com/kottlerg/seraph/issues/499)).
 
 ---

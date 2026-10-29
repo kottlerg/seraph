@@ -728,8 +728,8 @@ unsafe fn step5_discover_cpu_topology(ctx: &UefiContext, firm: &FirmwareInfo) ->
         let (count, hart_ids) = unsafe { dtb::parse_cpu_count(firm.device_tree) };
         if count > 0
         {
-            let (topology, truncated) =
-                cpu_topology_from_ids(boot_hart_id, bsp_id, &hart_ids[..count as usize]);
+            let (count, cpu_ids, truncated) =
+                firmware::place_cpu_ids(bsp_id, &hart_ids[..count as usize]);
             if truncated
             {
                 bprintln!(
@@ -737,8 +737,13 @@ unsafe fn step5_discover_cpu_topology(ctx: &UefiContext, firm: &FirmwareInfo) ->
                      included); surplus dropped"
                 );
             }
-            bprintln!("[--------] boot: DTB: {} hart(s) found", topology.count);
-            topology
+            bprintln!("[--------] boot: DTB: {count} hart(s) found");
+            CpuTopology {
+                boot_hart_id,
+                bsp_id,
+                count,
+                cpu_ids,
+            }
         }
         else
         {
@@ -751,40 +756,6 @@ unsafe fn step5_discover_cpu_topology(ctx: &UefiContext, firm: &FirmwareInfo) ->
         bprintln!("[--------] boot: CPU topology: no firmware tables, defaulting to 1");
         single_cpu_topology(boot_hart_id, bsp_id)
     }
-}
-
-/// Build the topology from the enabled CPU hardware IDs a firmware table
-/// lists, in table order: the BSP at index 0, then each other distinct ID
-/// once. The count is the number of slots filled, so the BSP counts once
-/// whether or not the table lists it, and `cpu_ids[1..count]` holds exactly
-/// the APs. Returns the topology and whether a distinct ID found no slot.
-fn cpu_topology_from_ids(boot_hart_id: u64, bsp_id: u32, ids: &[u32]) -> (CpuTopology, bool)
-{
-    let mut topology = single_cpu_topology(boot_hart_id, bsp_id);
-    let mut filled: usize = 1;
-    let mut truncated = false;
-    for &id in ids
-    {
-        if topology.cpu_ids[..filled].contains(&id)
-        {
-            continue;
-        }
-        if filled < MAX_CPUS
-        {
-            topology.cpu_ids[filled] = id;
-            filled += 1;
-        }
-        else
-        {
-            truncated = true;
-        }
-    }
-    // filled is at most MAX_CPUS, which fits in u32.
-    #[allow(clippy::cast_possible_truncation)]
-    {
-        topology.count = filled as u32;
-    }
-    (topology, truncated)
 }
 
 fn single_cpu_topology(boot_hart_id: u64, bsp_id: u32) -> CpuTopology
@@ -1645,12 +1616,8 @@ unsafe fn step10_handoff(
 #[cfg(test)]
 mod tests
 {
-    use super::{
-        BootEntropy, ElfKind, KaslrOverride, choose_kaslr_layout, cpu_topology_from_ids, scrub,
-    };
-    use boot_protocol::{
-        KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED, MAX_CPUS,
-    };
+    use super::{BootEntropy, ElfKind, KaslrOverride, choose_kaslr_layout, scrub};
+    use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
 
     const IMAGE: u64 = 8 << 20;
 
@@ -1737,49 +1704,5 @@ mod tests
     {
         let mut empty: [u8; 0] = [];
         scrub(&mut empty);
-    }
-
-    #[test]
-    fn boot_hart_absent_from_the_list_still_counts_once()
-    {
-        let (t, truncated) = cpu_topology_from_ids(7, 0, &[1, 2, 3]);
-        assert_eq!(t.count, 4);
-        assert_eq!(t.cpu_ids[..4], [0, 1, 2, 3]);
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn listed_boot_hart_is_not_placed_again()
-    {
-        let (t, _) = cpu_topology_from_ids(0, 2, &[0, 1, 2, 3]);
-        assert_eq!(t.count, 4);
-        assert_eq!(t.cpu_ids[..4], [2, 0, 1, 3]);
-    }
-
-    #[test]
-    fn duplicated_hart_id_is_placed_once()
-    {
-        let (t, _) = cpu_topology_from_ids(0, 0, &[1, 2, 1]);
-        assert_eq!(t.count, 3);
-        assert_eq!(t.cpu_ids[..3], [0, 1, 2]);
-    }
-
-    #[test]
-    fn full_list_including_the_boot_hart_fits_exactly()
-    {
-        let ids: Vec<u32> = (0..MAX_CPUS as u32).collect();
-        let (t, truncated) = cpu_topology_from_ids(0, 0, &ids);
-        assert_eq!(t.count as usize, MAX_CPUS);
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn full_list_omitting_the_boot_hart_drops_the_last_ap_and_says_so()
-    {
-        let ids: Vec<u32> = (1..=MAX_CPUS as u32).collect();
-        let (t, truncated) = cpu_topology_from_ids(0, 0, &ids);
-        assert_eq!(t.count as usize, MAX_CPUS);
-        assert_eq!(t.cpu_ids[MAX_CPUS - 1], MAX_CPUS as u32 - 1);
-        assert!(truncated);
     }
 }

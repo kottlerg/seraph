@@ -73,11 +73,13 @@ pub const SP_OFFSET: usize = syscall_abi::REGS_X86_64_SP_OFFSET;
 /// The stack pointer an `extern "C"` function expects on entry, at or below
 /// `sp`: the System V ABI enters a function with `rsp + 8` 16-byte aligned (a
 /// return address just pushed), so a frame redirected into an entry gets
-/// `(sp & !0xF) - 8`, at most 24 bytes below `sp`.
+/// `(sp & !0xF) - 8`, at most 24 bytes below `sp`. A user stack pointer is
+/// never below 16; the subtraction wraps rather than panics for one that is,
+/// and the kernel refuses the resulting non-user stack pointer.
 #[must_use]
 pub const fn entry_stack_pointer(sp: u64) -> u64
 {
-    (sp & !0xF) - 8
+    (sp & !0xF).wrapping_sub(8)
 }
 
 /// Byte offset of the syscall-number register (`rax`) in the kernel

@@ -195,11 +195,9 @@ pub unsafe fn configure_and_start_pinned(
 pub fn redirect_to_entry(regs: &mut [u8], entry: u64)
 {
     use crate::arch::{IP_OFFSET, SP_OFFSET, entry_stack_pointer};
-    let sp = u64::from_le_bytes(
-        regs[SP_OFFSET..SP_OFFSET + 8]
-            .try_into()
-            .unwrap_or([0u8; 8]),
-    );
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&regs[SP_OFFSET..SP_OFFSET + 8]);
+    let sp = u64::from_le_bytes(word);
     regs[SP_OFFSET..SP_OFFSET + 8].copy_from_slice(&entry_stack_pointer(sp).to_le_bytes());
     regs[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&entry.to_le_bytes());
 }

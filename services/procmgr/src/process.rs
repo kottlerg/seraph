@@ -1696,7 +1696,9 @@ pub fn create_process(
     let module_size = module_pages * PAGE_SIZE;
     let module_va = module_scratch.va();
 
-    // SAFETY: module memory cap mapped read-only at module_va for module_size bytes.
+    // SAFETY: module memory cap mapped read-only at module_va for module_size
+    // bytes; `module_scratch` owns that mapping and is dropped below, after
+    // `create_process_from_bytes`, the last use of `module_bytes`, returns.
     let module_bytes =
         unsafe { core::slice::from_raw_parts(module_va as *const u8, module_size as usize) };
 
@@ -2179,7 +2181,8 @@ fn stream_segment_bytes(
 
         // SAFETY: `mapping.va()` covers PAGE_SIZE bytes mapped read-only;
         // `cache_page_range` checked `range.start + range.len() <= PAGE_SIZE`,
-        // and `chunk_len <= range.len()`.
+        // and `chunk_len <= range.len()`. `src` is last used in the copy below,
+        // before `mapping` is dropped.
         let src = unsafe {
             core::slice::from_raw_parts((mapping.va() as *const u8).add(range.start), chunk_len)
         };

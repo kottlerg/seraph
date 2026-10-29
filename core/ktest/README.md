@@ -366,7 +366,7 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   IPC buffer page, each declared per test and handed to one thread at a time
   (the rule in their rustdoc, which covers passing tests).
 - `spawn::redirect_to_entry(regs, entry)` — points a register file read
-  from a stopped child at an `extern "C"` entry, with the stack pointer
+  from a stopped or fault-blocked child at an `extern "C"` entry, with the stack pointer
   aligned for the entry ABI, for the `thread_write_regs` redirect tests.
 - `SCRATCH_LOW_BASE` and the crate docs' § Scratch VAs — the VA bands tests
   map, unmap, and reprotect pages of ktest's own address space in, which hold

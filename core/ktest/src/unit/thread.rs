@@ -333,7 +333,8 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
     thread_read_regs(child.th, &mut reg_buf[..BUF_SIZE])
         .map_err(|_| "thread_read_regs for write_regs_resume failed")?;
 
-    // Overwrite instruction pointer to redirect child to phase2_entry.
+    // Redirect the child to phase2_entry: its instruction pointer, and its
+    // stack pointer aligned for the entry ABI.
     let phase2_ptr = phase2_entry as *const () as u64;
     crate::spawn::redirect_to_entry(&mut reg_buf[..], phase2_ptr);
 

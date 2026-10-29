@@ -1245,7 +1245,7 @@ unsafe fn kernel_entry_post_rebase(
                 init_image.entry_point,
                 kstack_top,
                 init_layout.init_info_va, // forwarded to init's a0/rdi on first entry
-                true,
+                arch::ThreadKind::User,
             );
 
             // SAFETY: tcb_ptr lies on page 4 of the freshly-retyped slab,

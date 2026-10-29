@@ -1084,7 +1084,7 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
         crate::sched::user_thread_trampoline as *const () as u64,
         trampoline_rsp,
         0,
-        true,
+        crate::arch::ThreadKind::User,
     );
 
     let ancestor = memory_obj_nn;

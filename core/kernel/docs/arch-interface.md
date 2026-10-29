@@ -325,13 +325,18 @@ The context switch is the most performance-critical path in the kernel.
 /// `user_arg(&self) -> u64`.
 pub struct SavedState { /* arch-specific */ }
 
+/// Which privilege level a new thread runs at (`User` or `Kernel`), selecting
+/// its first-dispatch interrupt state in `new_state`. `arch::ThreadKind`, defined in
+/// `arch/mod.rs` and shared by both architectures.
+pub enum ThreadKind { User, Kernel }
+
 /// Construct a `SavedState` for a freshly created thread. `entry` is the start
 /// PC and `stack_top` the initial kernel SP. `arg` is the first argument:
 /// x86-64 stashes it in `rbx` (read back by `SavedState::user_arg`), RISC-V
-/// delivers it in `a0`. `is_user` selects the first-dispatch interrupt state on
-/// x86-64 (IF clear for a user thread's kernel trampoline, set for a kernel
-/// thread) and is unused on RISC-V.
-pub fn new_state(entry: u64, stack_top: u64, arg: u64, is_user: bool) -> SavedState;
+/// delivers it in `a0`. `kind` selects the first-dispatch interrupt state on
+/// x86-64 (IF clear for a `ThreadKind::User` thread's kernel trampoline, set
+/// for a `ThreadKind::Kernel` thread) and is unused on RISC-V.
+pub fn new_state(entry: u64, stack_top: u64, arg: u64, kind: ThreadKind) -> SavedState;
 
 /// Seed the thread-local-storage base in a `SavedState` before first run
 /// (x86-64 `fs_base`, loaded into `IA32_FS_BASE` on first switch; a no-op on

@@ -297,13 +297,13 @@ pub mod procmgr_labels
     /// every supervised thread, so the kernel posts each death to it.
     /// Real-logd uses it to evict the slot of a dead sender. Specified,
     /// with its replies, in `services/procmgr/docs/ipc-interface.md`
-    /// § REGISTER_DEATH_EQ — install logd's death observer.
+    /// § `REGISTER_DEATH_EQ` — install logd's death observer.
     pub const REGISTER_DEATH_EQ: u64 = 14;
 
     /// Badge bit on procmgr service caps that authorises
     /// `REGISTER_DEATH_EQ`; un-badged or differently-badged callers are
     /// rejected. Who holds it is in `services/procmgr/docs/ipc-interface.md`
-    /// § REGISTER_DEATH_EQ — install logd's death observer.
+    /// § `REGISTER_DEATH_EQ` — install logd's death observer.
     pub const DEATH_EQ_AUTHORITY: u64 = 1u64 << 62;
 
     /// Hand init's kernel-object caps and reclaimable Memory caps to
@@ -311,7 +311,7 @@ pub mod procmgr_labels
     /// path, then `sys_thread_exit`s. The rounds, the death-EQ binding on
     /// both init threads (correlator [`INIT_REAP_CORRELATOR`]), and the
     /// replies are specified in `services/procmgr/docs/ipc-interface.md`
-    /// § REGISTER_INIT_TEARDOWN — init reap handoff.
+    /// § `REGISTER_INIT_TEARDOWN` — init reap handoff.
     pub const REGISTER_INIT_TEARDOWN: u64 = 15;
 
     /// Notification end of init's reap-handoff cap stream. After this call
@@ -1935,7 +1935,7 @@ pub mod keysym
 {
     // Named keys (X11 function-key range). Printable keys are not enumerated;
     // their keysym equals their Unicode codepoint.
-    /// Keysym of the BackSpace key.
+    /// Keysym of the Backspace key.
     pub const BACKSPACE: u32 = 0xFF08;
     /// Keysym of the Tab key.
     pub const TAB: u32 = 0xFF09;

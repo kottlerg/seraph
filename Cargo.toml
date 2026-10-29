@@ -17,6 +17,7 @@ members = [
     "services/devmgr",
     "services/devmgr/firmware",
     "services/logd",
+    "services/logd/codec",
     "services/pwrmgr",
     "services/pwrmgr/acpi",
     "services/timed",

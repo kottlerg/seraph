@@ -88,7 +88,7 @@ pub fn bootstrap_loop(bootstrap_ep: u32, state: &Mutex<BootstrapState>) -> !
         if !ok
         {
             // A failed reply transfers no cap (the move is all-or-nothing),
-            // so both are still in vfsd's CSpace.
+            // so both are still in vfsd's `CSpace`.
             delete_bootstrap_caps(pending.blk, pending.service);
         }
         notification_channel(&pending.channel, ok);
@@ -139,7 +139,7 @@ fn take_next_active_job(active: &ActiveState) -> ActiveJob
 ///
 /// Returns `true` once the child holds its bootstrap caps. On every `false`
 /// return the bootstrap order is withdrawn ([`abandon_bootstrap`]) and the
-/// process handle released, so no cap of the order is left in vfsd's CSpace.
+/// process handle released, so no cap of the order is left in vfsd's `CSpace`.
 fn handle_create_from_file(
     order: CreateFromFileOrder,
     bootstrap_state: &Mutex<BootstrapState>,

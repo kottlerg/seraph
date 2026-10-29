@@ -96,14 +96,14 @@ pub fn spawn_fatfs_driver(
         system_root_cap,
         ipc_buf,
     );
-    match started
+    if let Some(send) = started
     {
-        Some(send) => Some(FatfsDriver { endpoint, send }),
-        None =>
-        {
-            teardown_driver(endpoint);
-            None
-        }
+        Some(FatfsDriver { endpoint, send })
+    }
+    else
+    {
+        teardown_driver(endpoint);
+        None
     }
 }
 
@@ -245,7 +245,7 @@ pub fn start_and_release(process_handle: u32, ipc_buf: *mut u64) -> bool
 /// root mount only; `/services/fs/fatfs` is not yet reachable when this runs.
 ///
 /// Returns `true` once the child holds its bootstrap caps. On `false` no cap
-/// of `bootstrap` and no `badged_creator` is left in vfsd's CSpace.
+/// of `bootstrap` and no `badged_creator` is left in vfsd's `CSpace`.
 fn spawn_via_module(
     caps: &VfsdCaps,
     pool: &WorkerPool,
@@ -336,7 +336,7 @@ fn spawn_via_module(
 /// caller's MOUNT reply path.
 ///
 /// Returns `true` once the child holds its bootstrap caps. On `false` no cap
-/// of `bootstrap` and no `badged_creator` is left in vfsd's CSpace.
+/// of `bootstrap` and no `badged_creator` is left in vfsd's `CSpace`.
 fn spawn_via_vfs(
     caps: &VfsdCaps,
     pool: &WorkerPool,

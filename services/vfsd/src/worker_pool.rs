@@ -50,7 +50,7 @@ pub enum WorkOrder
 ///
 /// Handing an order to the pool hands over its two caps: from then on the
 /// pool either delivers them to the child (the bootstrap round moves them
-/// out of vfsd's CSpace) or deletes them — [`submit_bootstrap`] when its
+/// out of vfsd's `CSpace`) or deletes them — [`submit_bootstrap`] when its
 /// table is full, the bootstrap worker when a round fails, and
 /// [`abandon_bootstrap`] when the order is withdrawn before its child asks.
 pub struct BootstrapOrder
@@ -229,7 +229,7 @@ impl WorkerPool
 
     /// Submit a work order. Returns `None` if the relevant slot table is
     /// full, after deleting every cap the order carries, so a refused order
-    /// leaves nothing of it in vfsd's CSpace.
+    /// leaves nothing of it in vfsd's `CSpace`.
     pub fn submit(&self, order: WorkOrder) -> Option<WorkHandle>
     {
         match order
@@ -313,7 +313,7 @@ pub fn submit_bootstrap(
 /// it for a child's REQUEST, and this waits on `handle` for that round's
 /// outcome: `true` if the caps reached the child, `false` if the round
 /// failed (the worker then deleted them). Either way no cap of the order
-/// remains in vfsd's CSpace once this returns.
+/// remains in vfsd's `CSpace` once this returns.
 pub fn abandon_bootstrap(state: &Mutex<BootstrapState>, badge: u64, handle: WorkHandle) -> bool
 {
     if let Some(pending) = take_pending_by_badge(state, badge)

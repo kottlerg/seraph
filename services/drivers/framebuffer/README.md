@@ -85,7 +85,7 @@ The driver feeds each byte to its `text::Utf8Decoder`:
   table).
 * Invalid UTF-8 that reaches the decoder emits one `U+FFFD` glyph per ill-formed subsequence; a
   byte that cuts a sequence short is then decoded on its own. A control byte (`\n`, `\r`,
-  `\x08`) resets the decoder before it is decoded, so a sequence it cuts short is dropped without
+  `\x08`) resets the decoder before it is handled, so a sequence it cuts short is dropped without
   a glyph.
 
 A multi-byte sequence may straddle two `FB_WRITE_BYTES` calls; partial

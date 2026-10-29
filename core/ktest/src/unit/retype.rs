@@ -40,8 +40,7 @@ use syscall::{
 use syscall_abi::{
     CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_USED,
     CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_THREAD_STATE, EXIT_KILLED, FAULT_CLASS_ALL, FAULT_LABEL,
-    MAP_EXECUTABLE, MAP_WRITABLE, RIGHTS_ALL, RIGHTS_NTF_NOTIFY, SYS_CAP_DELETE,
-    THREAD_STATE_EXITED,
+    MAP_EXECUTABLE, MAP_WRITABLE, RIGHTS_ALL, RIGHTS_NTF_NOTIFY, THREAD_STATE_EXITED,
 };
 
 use crate::{TestContext, TestResult};
@@ -62,63 +61,6 @@ const FAULT_BADGE: u64 = 0xA5_7A5E;
 /// which stretches it past [`crate::UNSCALED_CPUS`] CPUs, where the child's
 /// CPU waits for a host core.
 const MAX_POLLS: u32 = 2000;
-
-/// Encode `loop {}` into `buf`; returns the byte count.
-#[cfg(target_arch = "x86_64")]
-fn emit_spin(buf: &mut [u8]) -> usize
-{
-    // jmp rel8 -2 (to itself)
-    buf[..2].copy_from_slice(&[0xEB, 0xFE]);
-    2
-}
-
-/// Encode `loop {}` into `buf`; returns the byte count.
-#[cfg(target_arch = "riscv64")]
-fn emit_spin(buf: &mut [u8]) -> usize
-{
-    // jal x0, 0 (to itself)
-    buf[..4].copy_from_slice(&0x0000_006Fu32.to_le_bytes());
-    4
-}
-
-/// Encode `cap_delete(handle); loop {}` into `buf`; returns the byte count.
-#[cfg(target_arch = "x86_64")]
-fn emit_self_delete(buf: &mut [u8], handle: u32) -> usize
-{
-    // mov eax, SYS_CAP_DELETE ; mov edi, handle ; syscall ; jmp .
-    // cast_possible_truncation: syscall numbers fit 32 bits.
-    #[allow(clippy::cast_possible_truncation)]
-    let nr = SYS_CAP_DELETE as u32;
-    buf[0] = 0xB8;
-    buf[1..5].copy_from_slice(&nr.to_le_bytes());
-    buf[5] = 0xBF;
-    buf[6..10].copy_from_slice(&handle.to_le_bytes());
-    buf[10..12].copy_from_slice(&[0x0F, 0x05]);
-    12 + emit_spin(&mut buf[12..])
-}
-
-/// Encode `cap_delete(handle); loop {}` into `buf`; returns the byte count.
-#[cfg(target_arch = "riscv64")]
-fn emit_self_delete(buf: &mut [u8], handle: u32) -> usize
-{
-    // lui rd, hi ; addi rd, rd, lo — a full 32-bit immediate (the handle
-    // carries generation bits above the 12-bit addi range).
-    fn li32(out: &mut [u8], rd: u32, value: u32)
-    {
-        let hi = value.wrapping_add(0x800) >> 12;
-        let lo = value & 0xFFF;
-        let lui = (hi << 12) | (rd << 7) | 0x37;
-        let addi = (lo << 20) | (rd << 15) | (rd << 7) | 0x13;
-        out[..4].copy_from_slice(&lui.to_le_bytes());
-        out[4..8].copy_from_slice(&addi.to_le_bytes());
-    }
-    // cast_possible_truncation: syscall numbers fit 32 bits.
-    #[allow(clippy::cast_possible_truncation)]
-    li32(&mut buf[0..8], 17, SYS_CAP_DELETE as u32); // a7 = nr
-    li32(&mut buf[8..16], 10, handle); // a0 = handle
-    buf[16..20].copy_from_slice(&0x0000_0073u32.to_le_bytes()); // ecall
-    20 + emit_spin(&mut buf[20..])
-}
 
 /// Write a machine-code stub into a fresh frame-pool page and map it
 /// executable at [`STUB_VA`] in `aspace`. Returns the frame's Memory cap.
@@ -223,7 +165,7 @@ pub fn aspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
         .map_err(|_| "retype::aspace_stop: cap_create_aspace (spin) failed")?;
     let cspace = cap_create_cspace(memory, 0, 4)
         .map_err(|_| "retype::aspace_stop: cap_create_cspace (spin) failed")?;
-    let frame = install_stub(ctx, aspace, emit_spin)?;
+    let frame = install_stub(ctx, aspace, crate::arch::code_stub::emit_spin)?;
     let thread = cap_create_thread(memory, aspace, cspace, 0, 0)
         .map_err(|_| "retype::aspace_stop: cap_create_thread (spin) failed")?;
     // The stub never touches its stack; any VA will do.
@@ -312,7 +254,9 @@ pub fn aspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
         .map_err(|_| "retype::aspace_self_delete: cap_create_cspace failed")?;
     let child_as = cap_copy(aspace, cspace, RIGHTS_ALL)
         .map_err(|_| "retype::aspace_self_delete: cap_copy(aspace) failed")?;
-    let frame = install_stub(ctx, aspace, |buf| emit_self_delete(buf, child_as))?;
+    let frame = install_stub(ctx, aspace, |buf| {
+        crate::arch::code_stub::emit_self_delete(buf, child_as)
+    })?;
     let thread = cap_create_thread(memory, aspace, cspace, 0, 0)
         .map_err(|_| "retype::aspace_self_delete: cap_create_thread failed")?;
     thread_configure(thread, STUB_VA, STUB_VA + 0x800, 0)

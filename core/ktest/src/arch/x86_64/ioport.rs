@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// core/ktest/src/ioport.rs
+// core/ktest/src/arch/x86_64/ioport.rs
 
 //! Per-thread I/O port access for ktest (x86-64).
 //!
@@ -16,7 +16,7 @@
 //! (`core/kernel/src/sched/thread.rs::ThreadControlBlock::iopb`) and is not
 //! withdrawn when the cap is later consumed or revoked: revocation does not
 //! yet withdraw bound IOPB access (#457; intended semantics in
-//! [capability-model.md](../../../docs/capability-model.md) § `IoPort` (x86-64 only)).
+//! [capability-model.md](../../../../../docs/capability-model.md) § `IoPort` (x86-64 only)).
 //! Narrow caps produced here are therefore consumed afterwards (e.g. by
 //! Tier-1 unit tests that exercise `ioport_split`) without losing the
 //! established permission.
@@ -99,7 +99,7 @@ pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
         // but the carved-off prefix cap is left alive in the cspace so
         // that any consumer (test harness, future module, debug probe)
         // that wants to claim those ports can find an IoPort
-        // covering them. See `core/ktest/src/unit/hw.rs::ioport_split`
+        // covering them. See `ioport_syscalls::split` (this directory)
         // for the test that relies on this for coverage of the
         // `ioport_split` syscall.
         let _ = prefix;

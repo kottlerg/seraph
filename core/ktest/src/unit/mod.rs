@@ -33,7 +33,7 @@
 //! - `ipc.rs`      — IPC call, reply, recv, buffer set
 //! - `thread.rs`   — thread lifecycle, register read/write, priority, affinity, sleep, `bind_notification`
 //! - `fpu.rs`      — FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration
-//! - `hw.rs`       — MMIO, IRQ, I/O ports (`SYS_SBI_CALL` is under `src/arch/<arch>/`)
+//! - `hw.rs`       — MMIO, IRQ (`SYS_IOPORT_*` and `SYS_SBI_CALL` are under `src/arch/<arch>/`)
 //! - `sysinfo.rs`  — system info queries and debug log
 //! - `crypto.rs`   — shared `crypto` crate KATs (SHA-512, Ed25519 verify),
 //!   run on-target so the primitives are validated on both arches (not a
@@ -608,10 +608,8 @@ pub fn run_all(ctx: &TestContext)
         "hw::irq_split_wrong_tag_err",
         hw::irq_split_wrong_tag_err(ctx)
     );
-    run_test!("hw::ioport_bind", hw::ioport_bind(ctx));
-    run_test!("hw::ioport_split", hw::ioport_split(ctx));
 
-    // ── Architecture-specific tests (thread configure, SBI call) ──────────────
+    // ── Architecture-specific tests (I/O ports, SBI call, user-half bounds) ───────
     crate::arch::run_unit(ctx);
 
     // ── System info syscalls ──────────────────────────────────────────────────

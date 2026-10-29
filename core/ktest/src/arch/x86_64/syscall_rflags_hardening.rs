@@ -8,7 +8,7 @@
 //!
 //! The SYSCALL entry contract (`core/kernel/src/arch/x86_64/syscall.rs`
 //! § Entry contract) clears TF, DF and AC on entry and swaps to the kernel GS
-//! base. Three phases exercise it from ring 3:
+//! base. Four phases exercise it from ring 3:
 //!
 //!   1. **DF**: with DF set, `SYS_GETRANDOM` fills a buffer that sits between
 //!      guard bytes. The kernel's user copy must run forward, so the guard bytes
@@ -20,6 +20,14 @@
 //!   3. **GS**: a child loads the flat user data selector into GS (which reloads
 //!      the user GS base from the descriptor) and issues a syscall. The kernel
 //!      must keep using its own per-CPU base; the child then exits normally.
+//!   4. **AC**: with AC set, `SYS_GETRANDOM` fills a buffer through the kernel's
+//!      SMAP-windowed user copy, and AC is still set when the syscall returns
+//!      (`sysretq` restores the user's RFLAGS). A kernel that mishandled a
+//!      user-set AC on entry, or dropped it from the user's RFLAGS, fails here.
+//!      Whether AC is clear while the kernel runs has no ring-3-visible effect
+//!      (it only lifts SMAP for kernel accesses outside the user-copy window,
+//!      which the kernel makes none of); the kernel-side check that observes it
+//!      is recorded on #443.
 
 use syscall::cap_delete;
 use syscall_abi::{EXIT_FAULT_BASE, SYS_GETRANDOM, SYS_THREAD_YIELD};
@@ -39,6 +47,14 @@ const GUARD: usize = 64;
 /// Bytes requested from `SYS_GETRANDOM`.
 const DRAW: usize = 32;
 const GUARD_BYTE: u8 = 0xA5;
+
+/// RFLAGS.AC (bit 18), the alignment-check / SMAP-override flag.
+const RFLAGS_AC: u64 = 1 << 18;
+
+/// The low RFLAGS doubleword's AC bit, and its complement, as the 32-bit
+/// immediates that set and clear it in the stack image of RFLAGS.
+const AC_SET_IMM: i32 = 1 << 18;
+const AC_CLEAR_IMM: i32 = !AC_SET_IMM;
 
 /// Flat ring-3 data selector (`core/kernel/src/arch/x86_64/gdt.rs` `USER_DS`).
 const USER_DS: u16 = 0x1B;
@@ -61,7 +77,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         return Err("syscall_rflags_hardening: GS child faulted");
     }
-    Ok(())
+
+    ac_survives_syscall()
 }
 
 /// Phase 1: `SYS_GETRANDOM` with DF set leaves the guard bytes untouched.
@@ -105,6 +122,63 @@ fn getrandom_with_df_set(dst: &mut [u8]) -> i64
         );
     }
     ret
+}
+
+/// Phase 4: `SYS_GETRANDOM` with AC set fills its buffer and returns with AC
+/// still set.
+fn ac_survives_syscall() -> TestResult
+{
+    let mut buf = [GUARD_BYTE; DRAW];
+    let (ret, rflags) = getrandom_with_ac_set(&mut buf);
+    if ret < 0
+    {
+        return Err("syscall_rflags_hardening: SYS_GETRANDOM with AC set failed");
+    }
+    if buf.iter().all(|&b| b == GUARD_BYTE)
+    {
+        return Err("syscall_rflags_hardening: SYS_GETRANDOM with AC set wrote nothing");
+    }
+    if rflags & RFLAGS_AC == 0
+    {
+        return Err("syscall_rflags_hardening: user AC lost across the syscall");
+    }
+    Ok(())
+}
+
+/// Issue `SYS_GETRANDOM` into `dst` with RFLAGS.AC set for the syscall only;
+/// returns the syscall result and RFLAGS as read right after it returned.
+fn getrandom_with_ac_set(dst: &mut [u8]) -> (i64, u64)
+{
+    let ret: i64;
+    let rflags: u64;
+    // SAFETY: `dst` is a live, writable buffer of `dst.len()` bytes. AC is set
+    // through the stack image of RFLAGS (`stac` is ring-0 only) and cleared the
+    // same way before the block ends; between the two only the syscall and an
+    // aligned `pushfq` run, so no user access can take an alignment check.
+    // Registers: rax carries the syscall number in and the result out; rdi and
+    // rsi carry the arguments; SYSCALL clobbers rcx and r11; `flags` receives
+    // RFLAGS after the syscall. pushfq/popfq use the stack.
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "or dword ptr [rsp], {ac}",
+            "popfq",
+            "syscall",
+            "pushfq",
+            "mov {flags}, qword ptr [rsp]",
+            "and dword ptr [rsp], {not_ac}",
+            "popfq",
+            ac = const AC_SET_IMM,
+            not_ac = const AC_CLEAR_IMM,
+            flags = out(reg) rflags,
+            inlateout("rax") SYS_GETRANDOM.cast_signed() => ret,
+            in("rdi") dst.as_mut_ptr() as u64,
+            in("rsi") dst.len() as u64,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    (ret, rflags)
 }
 
 /// Start `entry` on a fresh child thread and return its exit reason once the

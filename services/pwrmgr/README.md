@@ -140,7 +140,8 @@ acceptance criteria are written.
 
 ## Relationship to ktest
 
-`core/ktest/src/acpi_shutdown.rs` and `core/ktest/src/sbi_shutdown.rs`
+`core/ktest/src/arch/x86_64/acpi_shutdown.rs` and
+`core/ktest/src/arch/riscv64/sbi_shutdown.rs`
 hold their own implementations of the same mechanisms. They are kept
 deliberately separate so the kernel-validation harness does not depend
 on any userspace-service crate. The ktest copies are a frozen,

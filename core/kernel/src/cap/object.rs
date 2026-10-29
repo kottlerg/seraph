@@ -2710,10 +2710,10 @@ unsafe fn dealloc_object_one(
                 // above), and any CPU that cached the tag while switched away is
                 // flushed lazily by the generation check the next time it loads
                 // the tag for whatever space claims it next.
-                // SAFETY: as_ptr is a valid AddressSpace being reclaimed; with
-                // active_cpus empty no concurrent activate races this read.
-                let tag = unsafe { (*as_ptr).tag.load(Ordering::Acquire) };
-                crate::mm::tag_allocator::free_tag(tag);
+                // free_tag reads the tag under the pool lock, since an eviction
+                // can reissue this inactive space's tag to another space.
+                // SAFETY: as_ptr is a valid AddressSpace being reclaimed.
+                crate::mm::tag_allocator::free_tag(unsafe { &*as_ptr });
 
                 // Drop in-place objects before reclaiming their storage.
                 // `AddressSpace` and `AddressSpaceObject` have no Drop logic

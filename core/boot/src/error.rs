@@ -70,7 +70,7 @@ impl From<elf::ElfError> for BootError
             elf::ElfError::Not64Bit => "ELF is not 64-bit (ELFCLASS64 required)",
             elf::ElfError::NotLittleEndian => "ELF is not little-endian (ELFDATA2LSB required)",
             elf::ElfError::BadVersion => "ELF ident version is not EV_CURRENT",
-            elf::ElfError::NotExecutable => "ELF type is not ET_EXEC",
+            elf::ElfError::NotExecutable => "ELF type is not ET_EXEC or ET_DYN",
             elf::ElfError::WrongMachine =>
             {
                 "ELF machine type does not match bootloader architecture"
@@ -113,7 +113,7 @@ impl BootError
             BootError::ProtocolNotFound(_) => "required UEFI protocol not found",
             BootError::UefiError(_) => "UEFI call returned an error status",
             BootError::FileNotFound(_) => "required file not found on ESP",
-            BootError::InvalidElf(_) => "kernel ELF validation failed",
+            BootError::InvalidElf(_) => "ELF validation failed",
             BootError::WxViolation => "ELF segment has writable+executable permissions (W^X)",
             BootError::OutOfMemory => "physical memory allocation failed",
             BootError::ExitBootServicesFailed => "ExitBootServices failed after retries",

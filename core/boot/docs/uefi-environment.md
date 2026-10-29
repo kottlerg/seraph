@@ -80,28 +80,35 @@ allocation modes are used:
 
 **`AllocateAnyPages`** — the firmware selects a free physical page range. Used for
 everything whose absolute address does not matter: the bundle buffer (boot modules are
-referenced in place inside it), the kernel file buffer and kernel image span, init image
-segments, page-table frames (and, on RISC-V, the paging-mode probe root and the AP trampoline
-page), the `BootInfo` page, the module descriptor array, the `MemoryMapEntry` array, the
-`MmioAperture` array, the kernel stack, the reclaim-range array, and the memory map buffer.
-The kernel image is placed as one contiguous span and its base recorded in
-`BootInfo.kernel_physical_base`, so kernel placement tolerates any firmware memory layout; see
-[elf-loading.md](elf-loading.md) for the placement sequence.
+referenced in place inside it), the kernel file buffer, the kernel image span on RISC-V,
+init image segments, page-table frames (and, on RISC-V, the paging-mode probe root and the
+AP trampoline page), the `BootInfo` page, the module descriptor array, the `MemoryMapEntry`
+array, the `MmioAperture` array, the kernel stack, the reclaim-range array, and the memory
+map buffer. The kernel image is placed as one contiguous span and its base recorded in
+`BootInfo.kernel_physical_base`, so kernel placement does not depend on a fixed firmware
+layout; see [elf-loading.md](elf-loading.md) for the placement sequence.
 
-**`AllocateMaxAddress`** — the firmware selects a free range with a physical base at or
-below a bound. Used only by the x86-64 AP-startup trampoline, whose SIPI vector must
-reside below 1 MiB; see [boot-flow.md](boot-flow.md) for the trampoline-page step.
+**`AllocateMaxAddress`** — the firmware selects a free range whose uppermost address is at
+or below a bound. Used only on x86-64: for the AP-startup trampoline, whose SIPI vector must
+reside below 1 MiB (see [boot-flow.md](boot-flow.md) for the trampoline-page step), and for
+the kernel image span, which must lie wholly below 4 GiB because the kernel's root page
+table sits in the image's BSS and the AP trampoline loads it into CR3 with a 32-bit move
+(`BootInfo.kernel_physical_base` in
+[abi/boot-protocol](../../../abi/boot-protocol/src/lib.rs)).
 
 All allocation uses memory type `EfiLoaderData`. UEFI memory map entries for
 `EfiLoaderData` regions translate to `MemoryType::Loaded` in the boot protocol,
 notifying to the kernel that these regions are in use and must not be reused until
 explicitly reclaimed; [memory-map.md](memory-map.md) owns the full translation policy.
 
-The bootloader never frees its own `AllocatePages` allocations; the only deallocation
-before `ExitBootServices` is `FreePool` on the pool buffers firmware returns from
-`LocateHandleBuffer` and GOP `QueryMode`. Memory is allocated once and used; the bootloader
-does not implement a heap. UEFI boot services terminate
-before any reclamation would be relevant.
+Two `AllocatePages` allocations are returned with `FreePages` before `ExitBootServices`,
+each zeroed first: the kernel ELF file buffer, once step 3 has copied the image out, and,
+on RISC-V, the paging-mode probe root, once the mode is negotiated
+([memory-map.md](memory-map.md) § Allocation-Class Classification). The only other
+deallocation before `ExitBootServices` is `FreePool` on the pool buffers firmware returns
+from `LocateHandleBuffer` and GOP `QueryMode`. Every other allocation is made once and
+kept; the bootloader does not implement a heap, and the scratch it keeps past
+`ExitBootServices` is recorded in `BootInfo.reclaim_ranges` for the kernel to reclaim.
 
 ---
 
@@ -185,7 +192,8 @@ After `ExitBootServices` returns:
 - `RuntimeServices` pointer remains technically valid (UEFI runtime services), but
   Seraph does not use runtime services and makes no runtime calls
 - Memory descriptors in the acquired map buffer remain valid; the buffer was allocated
-  as `EfiLoaderData` and is not reclaimed by UEFI
+  as `EfiLoaderData` and is not reclaimed by UEFI. Step 9 zeroes it after its last read
+  and records it in `BootInfo.reclaim_ranges`
 - Only pre-allocated memory (from `AllocatePages` calls made before the exit) is
   available; no further allocation is possible
 

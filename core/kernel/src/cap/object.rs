@@ -1806,8 +1806,14 @@ unsafe fn dealloc_object_one(
             // Only single-IRQ caps ever register a notification with the routing
             // table and program the controller (sys_irq_register asserts
             // `count == 1`). Range caps are delegation authorities; they
-            // have no routing-table footprint to clean up.
+            // have no routing-table footprint to clean up. Nor does a
+            // single-id cap outside the routable range: sys_irq_register
+            // refuses it, and on riscv64 a split of the 1024-id root cap can
+            // name an id past the routing table, which `irq::unregister`
+            // must not be handed.
             if count == 1
+                && (crate::arch::current::MIN_IRQ_ID..=crate::arch::current::MAX_IRQ_ID)
+                    .contains(&start)
             {
                 // SAFETY: the routing entry is an atomic pointer (irq.rs § Thread
                 //         safety); disabling interrupts orders the unregister against
@@ -1978,7 +1984,8 @@ unsafe fn dealloc_object_one(
                     // schedule()s away; drain_deferred_reclaim completes the
                     // free off-CPU, where the existing gate passes immediately.
                     // SAFETY: tcb valid; marks Exited + drains every run queue
-                    // under the all-CPU-locks discipline (mirrors sys_thread_exit).
+                    // under the all-CPU-locks discipline (mirrors `sys_exit`,
+                    // `SYS_THREAD_EXIT`).
                     unsafe {
                         // Committing Exited: a refusal means a teardown
                         // already did.

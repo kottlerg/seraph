@@ -503,7 +503,7 @@ pub unsafe fn setup_ap_params(
 /// `APS_READY` after this call. Halts the boot through `fatal`, before any
 /// SIPI, when the kernel root page table lies above 4 GiB
 /// (`kernel_root_table_pa()` does not fit the PM32 stub's 32-bit
-/// `mov cr3, eax`; #443).
+/// `mov cr3, eax`; the bootloader-side bound is #482).
 ///
 /// # Parameters
 /// - `trampoline_pa`: physical address of the trampoline page (from `BootInfo`).
@@ -543,7 +543,7 @@ pub unsafe fn start_ap(
 
     // The PM32 stub loads CR3 with a 32-bit `mov cr3, eax`, so the kernel root
     // table must lie below 4 GiB; the bootloader does not yet guarantee that
-    // (#443). Halt with a reason rather than start the AP on a truncated root.
+    // (#482). Halt with a reason rather than start the AP on a truncated root.
     let Ok(pml4_pa) = u32::try_from(crate::mm::paging::kernel_root_table_pa())
     else
     {

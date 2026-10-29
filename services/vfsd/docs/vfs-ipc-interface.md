@@ -65,11 +65,13 @@ driver, sends `FS_MOUNT` (see
 to validate the BPB, captures the driver's
 root cap into [`VfsdRootBackend`], and replies with a badged SEND on
 the new filesystem's namespace endpoint addressing its root. A mount
-on `/` once root is already mounted is rejected (`TABLE_FULL`) at the
-install step. The partition registration and fatfs spawn run before that
-step and are not undone, so the registration leaks and the spawned fatfs
-driver is left orphaned; see
-[#452](https://github.com/kottlerg/seraph/issues/452).
+on `/` once root is already mounted, or on a path that is already a mount
+point, is rejected (`TABLE_FULL`) before any partition is registered or
+driver spawned. A mount that fails after the spawn (the `FS_MOUNT` probe,
+or an install a concurrent `MOUNT` beat) revokes the new driver's service
+endpoint, which stops the driver; the partition bound virtio-blk
+registered for it stays in virtio-blk's table, which has no unregister
+request.
 
 When the requested role is the rootfs (`MountRole::Root`, byte `0`),
 vfsd additionally auto-mounts the EFI System Partition at `/esp` and

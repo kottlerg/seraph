@@ -135,9 +135,7 @@ pub fn spawn_phase(_: &Caps)
     std::os::seraph::log!("spawned /programs/hello handle={id:#x}");
 
     {
-        let info = startup_info();
-        #[allow(clippy::cast_ptr_alignment)]
-        let ipc_buf = info.ipc_buffer.cast::<u64>();
+        let ipc_buf = std::os::seraph::current_ipc_buf();
         let id = child.id();
         let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
         // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
@@ -183,9 +181,7 @@ pub fn spawn_phase(_: &Caps)
     std::os::seraph::log!("try_wait phase passed");
 
     {
-        let info = startup_info();
-        #[allow(clippy::cast_ptr_alignment)]
-        let ipc_buf = info.ipc_buffer.cast::<u64>();
+        let ipc_buf = std::os::seraph::current_ipc_buf();
         let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
         // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
         let reply =

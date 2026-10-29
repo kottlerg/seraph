@@ -7,24 +7,66 @@
 //!
 //! Provides `init_serial()`, `init_framebuffer()`, and `console_write_fmt()` /
 //! `console_write_str()` used by the `bprint!`/`bprintln!` macros. Output goes
-//! to both the serial port and the framebuffer (when available). All state is
-//! static and unlocked; see `core/boot/docs/console.md` § Scope.
+//! to both the serial port and the framebuffer (when available). The
+//! framebuffer state sits behind a busy-flag cell that turns away panic
+//! re-entry; see `core/boot/docs/console.md` § Scope.
+
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::current::serial::{serial_init, serial_write_byte};
 use crate::framebuffer::FramebufferWriter;
 use boot_protocol::FramebufferInfo;
 
-/// Static console state; unlocked (see `core/boot/docs/console.md` § Scope).
-static mut CONSOLE: Console = Console {
-    serial_ready: false,
-    fb: None,
+/// Framebuffer console state, reached only through [`ConsoleCell::try_with`].
+static CONSOLE: ConsoleCell = ConsoleCell {
+    busy: AtomicBool::new(false),
+    state: UnsafeCell::new(Console { fb: None }),
 };
+
+/// Set by [`init_serial`] once the UART is programmed. Kept outside
+/// [`CONSOLE`] so a re-entered write can reach serial without touching it.
+static SERIAL_READY: AtomicBool = AtomicBool::new(false);
 
 /// Internal console state.
 struct Console
 {
-    serial_ready: bool,
     fb: Option<FramebufferWriter>,
+}
+
+/// The console state together with the flag that marks it in use, so the
+/// state is reachable only while the flag is held.
+struct ConsoleCell
+{
+    busy: AtomicBool,
+    state: UnsafeCell<Console>,
+}
+
+// SAFETY: the bootloader runs on a single boot thread with no console-touching
+// interrupt handlers. The one overlapping access is the panic handler
+// re-entering a console write on that same thread, which `try_with`'s busy
+// flag turns away before it forms a reference to `state`.
+unsafe impl Sync for ConsoleCell {}
+
+impl ConsoleCell
+{
+    /// Run `f` on the console state, or return `None` without running it when
+    /// a call is already in progress (a panic raised inside `f` whose handler
+    /// writes to the console). A panic inside `f` leaves the flag held, so
+    /// later output stays serial-only; the bootloader halts on panic.
+    fn try_with<R>(&self, f: impl FnOnce(&mut Console) -> R) -> Option<R>
+    {
+        if self.busy.swap(true, Ordering::Acquire)
+        {
+            return None;
+        }
+        // SAFETY: `busy` was clear and this call set it, so no other
+        // reference into `state` is live: every access goes through
+        // `try_with`, and an overlapping call returned above.
+        let result = f(unsafe { &mut *self.state.get() });
+        self.busy.store(false, Ordering::Release);
+        Some(result)
+    }
 }
 
 /// Initialize the serial backend.
@@ -41,10 +83,7 @@ pub unsafe fn init_serial()
     unsafe {
         serial_init();
     }
-    // SAFETY: CONSOLE is only accessed from the single boot thread.
-    unsafe {
-        CONSOLE.serial_ready = true;
-    }
+    SERIAL_READY.store(true, Ordering::Release);
 }
 
 /// Initialize the framebuffer backend.
@@ -59,10 +98,12 @@ pub unsafe fn init_framebuffer(fb: &FramebufferInfo)
 {
     // SAFETY: FramebufferWriter::new requires a valid framebuffer; caller ensures this.
     let writer = unsafe { FramebufferWriter::new(fb) };
-    // SAFETY: CONSOLE is only accessed from the single boot thread.
-    unsafe {
-        CONSOLE.fb = writer;
-    }
+    // Called from step 1, never inside a console write, so the cell is free.
+    let installed = CONSOLE.try_with(|console| console.fb = writer);
+    debug_assert!(
+        installed.is_some(),
+        "init_framebuffer ran inside a console write"
+    );
 }
 
 /// Write a string to both serial and framebuffer backends.
@@ -70,39 +111,48 @@ pub unsafe fn init_framebuffer(fb: &FramebufferInfo)
 /// This is the low-level sink used by `bprint!`/`bprintln!`. Inserts `\r`
 /// before each `\n` on the serial path so terminals show correct line endings.
 ///
-/// # Safety
-/// Must be called only from the single boot thread (no concurrent access to
-/// `CONSOLE`). Backends need not be initialized: output to a backend that is
-/// not live is dropped (the `unsafe` qualifier is stale, #442).
-pub unsafe fn console_write_str(s: &str)
+/// Safe to call at any point: output to a backend that is not yet
+/// initialized is dropped. A call made while another is in progress (the
+/// panic handler reporting a panic raised inside a write) goes to serial
+/// only, since the framebuffer state is still in use by the outer call.
+pub fn console_write_str(s: &str)
 {
-    // SAFETY: CONSOLE is only accessed from the single boot thread.
-    // SAFETY: raw pointer avoids the static_mut_refs lint; single-threaded bootloader.
-    let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
-
-    for byte in s.bytes()
-    {
-        if console.serial_ready
+    write_serial(s);
+    // A re-entered call finds the cell busy and skips the framebuffer.
+    let _ = CONSOLE.try_with(|console| {
+        if let Some(fb) = console.fb.as_mut()
         {
-            if byte == b'\n'
+            for byte in s.bytes()
             {
-                // SAFETY: serial_init was called during init_serial.
+                // SAFETY: fb was constructed from a valid FramebufferInfo.
                 unsafe {
-                    serial_write_byte(b'\r');
+                    fb.write_byte(byte);
                 }
             }
-            // SAFETY: serial_init was called during init_serial.
+        }
+    });
+}
+
+/// Write `s` to the serial backend, if initialized, inserting `\r` before
+/// each `\n`. Touches no shared console state but [`SERIAL_READY`].
+fn write_serial(s: &str)
+{
+    if !SERIAL_READY.load(Ordering::Acquire)
+    {
+        return;
+    }
+    for byte in s.bytes()
+    {
+        if byte == b'\n'
+        {
+            // SAFETY: SERIAL_READY is set only after init_serial ran serial_init.
             unsafe {
-                serial_write_byte(byte);
+                serial_write_byte(b'\r');
             }
         }
-
-        if let Some(ref mut fb) = console.fb
-        {
-            // SAFETY: fb was constructed from a valid FramebufferInfo.
-            unsafe {
-                fb.write_byte(byte);
-            }
+        // SAFETY: SERIAL_READY is set only after init_serial ran serial_init.
+        unsafe {
+            serial_write_byte(byte);
         }
     }
 }
@@ -117,10 +167,7 @@ impl core::fmt::Write for ConsoleWriter
 {
     fn write_str(&mut self, s: &str) -> core::fmt::Result
     {
-        // SAFETY: single-threaded bootloader; output before init is dropped.
-        unsafe {
-            console_write_str(s);
-        }
+        console_write_str(s);
         Ok(())
     }
 }
@@ -159,16 +206,41 @@ macro_rules! bprint {
 #[macro_export]
 macro_rules! bprintln {
     () => {{
-        // SAFETY: single-threaded bootloader; output before init is dropped.
-        unsafe {
-            $crate::console::console_write_str("\r\n");
-        }
+        $crate::console::console_write_str("\r\n");
     }};
     ($($arg:tt)*) => {{
         $crate::console::console_write_fmt(::core::format_args!($($arg)*));
-        // SAFETY: single-threaded bootloader; output before init is dropped.
-        unsafe {
-            $crate::console::console_write_str("\r\n");
-        }
+        $crate::console::console_write_str("\r\n");
     }};
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    fn cell() -> ConsoleCell
+    {
+        ConsoleCell {
+            busy: AtomicBool::new(false),
+            state: UnsafeCell::new(Console { fb: None }),
+        }
+    }
+
+    /// A call made while another holds the cell (panic re-entry) is turned
+    /// away without running, and the cell is free again once the outer call
+    /// returns.
+    #[test]
+    fn nested_call_is_turned_away_and_the_cell_is_released_after()
+    {
+        let console = cell();
+        let mut inner_ran = false;
+        let outer = console.try_with(|_| {
+            let inner = console.try_with(|_| inner_ran = true);
+            assert!(inner.is_none());
+        });
+        assert!(outer.is_some());
+        assert!(!inner_ran);
+        assert_eq!(console.try_with(|_| 7), Some(7));
+    }
 }

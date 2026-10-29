@@ -753,6 +753,11 @@ pub struct BootInfo
     pub memory_map: MemoryMapSlice,
 
     /// Physical base address of the loaded kernel image.
+    ///
+    /// On x86-64 the whole image, `[kernel_physical_base,
+    /// kernel_physical_base + kernel_size)`, MUST lie below 4 GiB: the kernel's
+    /// root page table sits in the image, and the AP trampoline loads it into
+    /// CR3 with a 32-bit move from protected mode. RISC-V places no bound.
     pub kernel_physical_base: u64,
     /// ELF virtual base address of the kernel image: [`layout::KERNEL_LINK_BASE`]
     /// plus a slide that is a multiple of [`layout::IMAGE_SLIDE_ALIGN`].

@@ -30,40 +30,39 @@ claims.
    discipline, every `- [ ]` in the PR body MUST be `- [x]` or removed
    with a one-line rationale in the same edit. List violators.
 
-5. Per-issue closure: extract every closing reference from the PR body
-   and the commit messages, as `docs/conventions.md` § Commit and PR
+5. Per-issue closure: extract every closing reference from the PR body and
+   the commit messages, as `docs/conventions.md` § Commit and PR
    cross-references defines one: `close`, `fix`, or `resolve` in any
    inflection or letter case, directly followed by a reference to Issue N
    (`#N`, `<owner>/<repo>#N`, or the Issue's URL) with at most a colon and
    whitespace between (a subject such as `fix #N items` closes #N exactly
    as `Fixes #N` does; the `(fixed by PR #M)` marker is not a closing
-   reference). Report as FAIL a closing reference in a commit
-   message to an Issue the PR body does not close with `Fixes #N` or
-   `Closes #N`, per that section. For each closed Issue, `gh issue view
-   <N> --json body`. For every `- [ ]` under `## Acceptance` in the issue,
-   one of two outcomes MUST be reconciled per `docs/conventions.md`:
-   either the diff delivers the criterion, or the issue was edited to
-   drop the criterion with a one-line rationale. Report per-criterion as
-   one of: `delivered` (cite `path:line` evidence), `dropped` (cite the
-   rationale text), or `not delivered, no rationale` (FAIL). Report an
-   Issue the PR closes whose milestone (`gh issue view <N> --json
-   milestone`) is missing or is not the current, lowest-versioned open
-   milestone as FAIL, per `docs/conventions.md` § Milestones. A
-   `Refs #N` is not a closure. For a `Refs #N` or `Fixes #N` naming a
-   follow-up Issue (title `<scope>: defects found by review`, or one
-   beginning with the earlier `<scope>: defects found by PR #<N>'s
-   review`), audit every item the PR body's `## Acceptance` copies from
-   it for `path:line` delivery evidence as for a closure; report as FAIL
-   such an item the diff does not deliver, one not ticked on the Issue
-   with `(fixed by PR #<this PR>)`, and an item ticked on the Issue with
-   that marker that the PR body does not copy. Report as FAIL an
-   unmarked `- [x]` item on the Issue whose file the diff touches and
-   that the diff delivers (a tick this PR made without its marker); on a
-   rolling Issue, whose ticks all carry a marker, report every unmarked
-   `- [x]` item as FAIL; list, without failing, an unmarked tick on an
-   earlier-pattern Issue whose file the diff touches but does not
-   deliver, since it may predate the marker.
-   A `Fixes #N` on a follow-up Issue is valid only under the closing
+   reference). Report as FAIL a closing reference in a commit message to
+   an Issue the PR body does not close with `Fixes #N` or `Closes #N`, per
+   that section. For each closed Issue, `gh issue view <N> --json body`.
+   For every `- [ ]` under `## Acceptance` in the issue, one of two
+   outcomes MUST be reconciled per `docs/conventions.md`: either the diff
+   delivers the criterion, or the issue was edited to drop the criterion
+   with a one-line rationale. Report per-criterion as one of: `delivered`
+   (cite `path:line` evidence), `dropped` (cite the rationale text), or
+   `not delivered, no rationale` (FAIL). Report an Issue the PR closes
+   whose milestone (`gh issue view <N> --json milestone`) is missing or is
+   not the current, lowest-versioned open milestone as FAIL, per
+   `docs/conventions.md` § Milestones. A `Refs #N` is not a closure. For a
+   `Refs #N` or `Fixes #N` naming a follow-up Issue (title
+   `<scope>: defects found by review`, or one beginning with the earlier
+   `<scope>: defects found by PR #<N>'s review`), audit every item the PR
+   body's `## Acceptance` copies from it for `path:line` delivery evidence
+   as for a closure; report as FAIL such an item the diff does not
+   deliver, one not ticked on the Issue with `(fixed by PR #<this PR>)`,
+   and an item ticked on the Issue with that marker that the PR body does
+   not copy. Report as FAIL an unmarked `- [x]` item on the Issue whose
+   file the diff touches and that the diff delivers (a tick this PR made
+   without its marker); on a rolling Issue, whose ticks all carry a
+   marker, report every unmarked `- [x]` item as FAIL; list, without
+   failing, an unmarked tick on an earlier-pattern Issue whose file the
+   diff touches but does not deliver, since it may predate the marker. A
+   `Fixes #N` on a follow-up Issue is valid only under the closing
    condition of `docs/conventions.md` § Branch and PR Workflow: no item
    left open once the findings of the PR's last run are recorded; a drain
    that leaves items open MUST say `Refs #N` instead. Report a `Fixes` on
@@ -103,14 +102,15 @@ claims.
    section — a planning label ("step X", "phase Y", "tier N", "stage M",
    "round N", or any label that only a planning conversation can resolve;
    the name of a step in a sequence a document defines permanently is not
-   a label), an Issue reference (`#N`, with or without a closing keyword:
-   `fix #N items` is an Issue reference, not a task ID), a task ID, or a
-   branch name — is a FAIL, as is a closing reference step 5 fails. A
-   departure from a SHOULD rule (a subject over 72 characters, a body not
-   wrapped at ~72 columns) is a FAIL unless the PR body records the
-   maintainer's acceptance of it, quoting the maintainer's words, which
-   § Commit Messages makes an accepted departure: report such an item as
-   `accepted`, citing that quotation, and it does not fail the section.
+   a label), an Issue reference (`#N`, `<owner>/<repo>#N`, or the Issue's
+   URL, with or without a closing keyword: `fix #N items` is an Issue
+   reference, not a task ID), a task ID, or a branch name — is a FAIL, as
+   is a closing reference step 5 fails. A departure from a SHOULD rule (a
+   subject over 72 characters, a body not wrapped at ~72 columns) is a
+   FAIL unless the PR body records the maintainer's acceptance of it,
+   quoting the maintainer's words, which § Commit Messages makes an
+   accepted departure: report such an item as `accepted`, citing that
+   quotation, and it does not fail the section.
 
 9. Validation claim: the PR body's `## Validation` section states the
    validated head X. X MUST be the PR head, or else X MUST be the merge base

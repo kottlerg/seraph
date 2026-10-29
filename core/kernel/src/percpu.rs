@@ -55,7 +55,8 @@ use crate::sched::thread::ThreadControlBlock;
 
 /// Array mapping logical CPU index to hardware APIC ID (x86-64) or hart ID (RISC-V).
 ///
-/// Populated by [`init_apic_ids`] from `BootInfo::cpu_ids` during Phase 5.
+/// Populated by [`init_apic_ids`] from `BootInfo::cpu_ids` at the end of Phase 4,
+/// before Phase 5's riscv64 PLIC setup names the BSP by its hart id.
 /// Accessed by [`apic_id_for`] to retrieve the APIC ID for a given logical CPU.
 ///
 /// # Safety
@@ -95,7 +96,7 @@ pub unsafe fn init_apic_ids(cpu_ids: &[u32])
 ///
 /// # Safety
 /// `cpu` must be < `CPU_COUNT` (the slab holds `CPU_COUNT` entries and the
-/// body does not check the bound; #443), and [`init_apic_ids`] must have been called.
+/// body does not check the bound), and [`init_apic_ids`] must have been called.
 #[cfg(not(test))]
 pub unsafe fn apic_id_for(cpu: usize) -> u32
 {
@@ -317,7 +318,7 @@ pub unsafe fn init_bsp()
 /// # Safety
 /// Must execute at ring 0 / S-mode on the AP being initialised.
 /// `cpu_id` must be < `CPU_COUNT` (the slab holds `CPU_COUNT` entries and the
-/// body does not check the bound; #443), and `per_cpu_ptr(cpu_id)`'s entry
+/// body does not check the bound), and `per_cpu_ptr(cpu_id)`'s entry
 /// must not yet be in use.
 #[cfg(not(test))]
 pub unsafe fn init_ap(cpu_id: u32)
@@ -388,17 +389,18 @@ pub fn preemption_disabled() -> bool
 /// Called from the x86-64 `#NM` handler (`idt::nm_handler`) and
 /// `fpu::switch_out_save`; both pass `current_cpu()`.
 ///
-/// # Safety
-/// `cpu` must be < `CPU_COUNT`; the function is a safe `fn` and does not check
-/// the bound, so an out-of-range `cpu` is undefined behaviour (#443). The
-/// returned reference is `'static` because the per-CPU slab is never freed;
+/// The returned reference is `'static` because the per-CPU slab is never freed;
 /// concurrent access is safe via the [`AtomicPtr`] interior mutability.
+///
+/// # Safety
+/// `cpu` must be < `CPU_COUNT` (an online logical CPU index): the slab holds
+/// `CPU_COUNT` entries and the body does not check the bound.
 // dead_code: consumed only by arch/x86_64 (lazy-FPU owner cache + #NM handler);
 // present unconditionally so no architecture cfg-gate is needed here. RISC-V
 // uses eager FS/VS-dirty FPU tracking and never reads this slot.
 #[allow(dead_code)]
 #[cfg(not(test))]
-pub fn fpu_owner_for(cpu: usize) -> &'static AtomicPtr<ThreadControlBlock>
+pub unsafe fn fpu_owner_for(cpu: usize) -> &'static AtomicPtr<ThreadControlBlock>
 {
     // SAFETY: cpu < CPU_COUNT by caller contract; AtomicPtr permits concurrent
     // access through a shared reference, and the PER_CPU slab is alive for the

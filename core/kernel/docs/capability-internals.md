@@ -398,7 +398,7 @@ The principal kernel-internal owners:
   CSpace's count at 1, so neither is ever freed. The root CSpace is init's CSpace, so the
   caps init still holds at its reap stay in it, alive but unreachable; releasing them at
   the reap is design intent, not yet implemented
-  ([#443](https://github.com/kottlerg/seraph/issues/443); see
+  ([#540](https://github.com/kottlerg/seraph/issues/540); see
   [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
 - **Fault-handler binding.** `SYS_THREAD_SET_FAULT_HANDLER` takes a reference on the
   bound Endpoint, released on unbind, rebind, or thread destruction.
@@ -666,7 +666,7 @@ move(src, dst):
         insert dst; inc_ref the object; pin src and dst
         migrate up to MAX_REPARENT_EDITS children of src under dst
         all moved → finish; else link dst as src's first child
-    every later hold (derivation lock only):
+    every later hold (derivation lock; a finish also takes the source CSpace lock to free src):
         revalidate src and dst: occupied, same generation, same object
         both live     → unlink dst, migrate another batch, finish or re-link
         src gone, dst live → unpin dst; done (whoever freed src dropped its reference)

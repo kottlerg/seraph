@@ -140,8 +140,7 @@ fn demand_paging_pinned_phase(_: &Caps)
 fn assert_ram_identity()
 {
     let info = startup_info();
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(info.memmgr_endpoint, &req, ipc_buf) }

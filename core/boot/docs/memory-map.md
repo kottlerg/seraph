@@ -66,14 +66,15 @@ in-place, no-allocation, no-recursion implementation is preferred.
 
 ## Allocation-Class Classification
 
-Every bootloader allocation uses `EfiLoaderCode` or `EfiLoaderData` and
-therefore surfaces as `MemoryType::Loaded`. The kernel never hands
+Every bootloader allocation still held at `ExitBootServices` uses `EfiLoaderCode` or
+`EfiLoaderData` and therefore surfaces as `MemoryType::Loaded`. The kernel never hands
 `Loaded` regions to its buddy allocator. Three `Loaded` sets return to the
 pool, each through reclaimable Memory caps that the kernel hands to init;
 init hands those caps to procmgr, which donates them to memmgr when it reaps
 init (see [process-lifecycle.md](../../../docs/process-lifecycle.md) §"Init reap"):
 
-- The bootloader-scratch subset recorded in `BootInfo.reclaim_ranges`, minted
+- The bootloader-scratch subset recorded in `BootInfo.reclaim_ranges` (the raw UEFI
+  memory-map buffer among it, zeroed after its last read in step 9), minted
   in Phase 7 (the AP trampoline page is late-minted in Phase 8). See
   [initialization.md](../../kernel/docs/initialization.md) §"Phase 7: Capability System",
   and §"Phase 3: Kernel Page Tables" step 7 for the bootloader page-table
@@ -87,19 +88,22 @@ init (see [process-lifecycle.md](../../../docs/process-lifecycle.md) §"Init rea
 
 Every other `Loaded` page is permanent: the bootloader's own loaded image
 (firmware-allocated as `EfiLoaderCode` / `EfiLoaderData`; it contains the
-handoff trampoline), the kernel image, the kernel handoff stack (kept as the
-BSP boot stack), the kernel ELF file read buffer, the raw UEFI memory-map
-buffer, and, on riscv64, the paging-mode probe page. The read buffer and the raw map
-buffer are dead once consumed; freeing or reclaiming them is
-[#442](https://github.com/kottlerg/seraph/issues/442).
+handoff trampoline), the kernel image, and the kernel handoff stack (kept as the
+BSP boot stack).
+
+Two scratch allocations never reach the final map: the kernel ELF file read
+buffer, freed in step 3 once `load_kernel` has copied the image out, and, on
+riscv64, the paging-mode probe page, freed once the mode is negotiated. Both are
+zeroed and returned with `FreePages` before `ExitBootServices`, so their frames
+surface as `Usable` (or back a later bootloader allocation); a free the firmware
+refuses leaves the allocation `Loaded` and permanent, with a console diagnostic.
 
 The `Loaded` allocations are:
 
 - The bootloader's own loaded image (firmware-allocated as `EfiLoaderCode` /
   `EfiLoaderData`; it contains the handoff trampoline).
-- Kernel image LOAD segments, placed in one contiguous `AllocateAnyPages` span at a
-  firmware-chosen address.
-- Kernel ELF file read buffer.
+- Kernel image LOAD segments, placed in one contiguous span at a firmware-chosen
+  address (`AllocateAnyPages` on riscv64; `AllocateMaxAddress` below 4 GiB on x86-64).
 - Init image LOAD segments, placed at any free physical address.
 - Bundle blob: one allocation holding the bundle header and entry table,
   every boot-module body, and the init ELF source.
@@ -113,7 +117,6 @@ The `Loaded` allocations are:
 - Kernel handoff stack (`KERNEL_STACK_PAGES`, 64 KiB).
 - Page-table frames allocated for the initial mapping (see
   [page-tables.md](page-tables.md)).
-- riscv64 only: the paging-mode probe page.
 
 ---
 

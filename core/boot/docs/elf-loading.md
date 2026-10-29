@@ -8,8 +8,8 @@ Partition: kernel ELF, init ELF, and boot modules.
 ## Categories
 
 - **Kernel ELF** — fully validated and loaded as a single contiguous span at a
-  firmware-chosen physical base (`AllocateAnyPages`), preserving the ELF's relative segment
-  offsets.
+  firmware-chosen physical base (`AllocateAnyPages` on RISC-V; `AllocateMaxAddress` below
+  4 GiB on x86-64), preserving the ELF's relative segment offsets.
 - **Init ELF** — fully validated and ELF-parsed; segments allocated at any available
   physical address. Result is an `InitImage` passed to the kernel in `BootInfo.init_image`.
 - **Boot modules** — opaque flat binaries loaded verbatim into physical memory and
@@ -96,8 +96,11 @@ on each segment:
    and `PF_X` during `load_init`, before any frame is allocated for that segment,
    and surfaces it as [`BootError::WxViolation`](../src/error.rs).
 2. Allocate physical frames via `AllocatePages`, classified `EfiLoaderData`:
-   - **Kernel ELF** — one `AllocateAnyPages` span covering the whole image at
-     any free physical base; each segment is copied to
+   - **Kernel ELF** — one span covering the whole image at a firmware-chosen
+     physical base, allocated by `arch::current::allocate_kernel_span`: any free
+     base on RISC-V (`AllocateAnyPages`), and on x86-64 a span lying wholly below
+     4 GiB (`AllocateMaxAddress`), since the AP trampoline loads the kernel's root
+     page table, which sits in the image's BSS, with a 32-bit move; each segment is copied to
      `span_base + (p_paddr - link_phys)`, preserving the ELF's relative
      offsets. The chosen base is recorded in `BootInfo.kernel_physical_base`.
    - **Init ELF** — `AllocateAnyPages` per segment, preserving the in-page
@@ -141,8 +144,8 @@ address is computed or used. `validate_kernel_layout` confirms `e_entry` falls w
 
 ## Init ELF Loading
 
-Init is loaded and pre-parsed into an `InitImage` for the kernel. Like the kernel
-image, init segments are allocated via `AllocateAnyPages` (init is a userspace ELF
+Init is loaded and pre-parsed into an `InitImage` for the kernel. Init segments are
+allocated via `AllocateAnyPages` (init is a userspace ELF
 whose `p_paddr` values fall in low memory already occupied by UEFI firmware). Unlike
 the kernel — placed as one contiguous span — each init segment is allocated
 independently and the in-page byte offset of `p_vaddr` is preserved, so the kernel

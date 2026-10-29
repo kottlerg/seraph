@@ -64,18 +64,6 @@ pub fn current_stack_pointer() -> u64
     sp
 }
 
-/// Return the current hart ID.
-///
-/// Currently returns the constant 0 on every hart, not the hart ID that
-/// `core/kernel/docs/arch-interface.md` § cpu promises; nothing calls it (#443).
-// Part of the arch-dispatch surface in core/kernel/docs/arch-interface.md § cpu;
-// no kernel code calls it yet.
-#[allow(dead_code)]
-pub fn current_id() -> u32
-{
-    0
-}
-
 // ── Baseline feature gate ─────────────────────────────────────────────────────
 
 /// Verify the RISC-V platform baseline and refuse unsupported hardware.

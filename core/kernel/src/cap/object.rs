@@ -170,7 +170,9 @@ impl KernelObjectHeader
     /// Returns 0 when no capability slot or kernel-internal owner still holds
     /// the object (see core/kernel/docs/capability-internals.md § Kernel Object
     /// Reference Counting); the caller is responsible for freeing the object at
-    /// that point.
+    /// that point. The decrement is a Release, and the one that reaches 0 is
+    /// followed by an Acquire fence, so that freer observes every write the
+    /// other owners made before releasing theirs.
     ///
     /// Headers carrying [`HDR_FLAG_IS_ROOT`] (the boot root `CSpace`) clamp
     /// at 1 via a CAS loop: when the current count is 1 the operation is a
@@ -216,6 +218,13 @@ impl KernelObjectHeader
             self,
             self.ancestor.load(Ordering::Relaxed),
         );
+        if prev == 1
+        {
+            // The last release: pair the Release decrements of every other
+            // owner with an Acquire, so the caller that frees the object
+            // observes every write those owners made before releasing.
+            core::sync::atomic::fence(Ordering::Acquire);
+        }
         prev - 1
     }
 }
@@ -1394,10 +1403,12 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// Release one reference on `obj` that the caller owns, and free the object
 /// if it was the last.
 ///
-/// The release half of every kernel-internal owner that is not a slot freed
-/// under the derivation lock: a syscall's pin ([`crate::syscall::PinnedCap`])
-/// and the reference a moved capability's freed source slot held
-/// (`cap::transfer::release_moved_object`). Either may name an object bound to
+/// The release half of a syscall's pin ([`crate::syscall::PinnedCap`]), of
+/// the reference a moved capability's freed source slot held
+/// (`cap::transfer::release_moved_object`), of the slot references a range
+/// split's consumed original and a memory merge's consumed tail held, and of
+/// a copy's or derive's unused source reference. Pins and moves may name an
+/// object bound to
 /// the running thread, so a `Thread`, `CSpace`, or `AddressSpace` whose last
 /// reference goes here is queued for this CPU's deferred reclaim (drained at
 /// the next syscall epilogue or idle loop) rather than torn down in place.
@@ -1428,10 +1439,6 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
     {
         return;
     }
-    // `dec_ref` is a Release decrement: pair it with an Acquire here, so this
-    // freer observes every write the other owners made before they released
-    // their references.
-    core::sync::atomic::fence(Ordering::Acquire);
     // SAFETY: refcount reached 0; nothing else references the object.
     match unsafe { obj.as_ref().obj_type }
     {
@@ -2513,6 +2520,11 @@ unsafe fn dealloc_object_one(
                 // releasing the lock and clears it in `enqueue_and_wake`. The
                 // unlink above acquired the same wait-object lock after any
                 // such waker released it, so this load cannot miss the set.
+                // A server whose receive dequeued this thread and found its
+                // rebind refused set the flag under `ep.lock` and retired the
+                // binding under this thread's `sched_lock`, so the unlink found
+                // no binding and skipped `ep.lock`; the binding re-read under
+                // that `sched_lock` orders this load after the set instead.
                 // Spin until the in-flight wake commits, so `retype_free` below
                 // cannot free the TCB out from under the waker's pending
                 // `enqueue_and_wake` (the residual #117/#160 use-after-free).

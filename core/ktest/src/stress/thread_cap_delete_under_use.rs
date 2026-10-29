@@ -629,7 +629,7 @@ struct HandleGone;
 /// Issue one call of kind `kind`, flagged in [`IN_CALL`] for its span, and
 /// classify its result: `Ok` is tallied and returned as `Ok(Some(value))`;
 /// the call's own `refusal`, if any, is `Ok(None)`; `InvalidCapability`
-/// (the handle is gone) is `None`; anything else is recorded as bad and
+/// (the handle is gone) is `Err(HandleGone)`; anything else is recorded as bad and
 /// returned as `Ok(None)`, so the group goes on.
 fn call(
     kind: u32,

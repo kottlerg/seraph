@@ -105,22 +105,19 @@ pub(super) unsafe fn revalidate_src_under_lock(
 }
 
 /// Give up the reference a copy or derive took on its source object when the
-/// new slot did not materialise; frees the object if that was the last
-/// reference (a sibling may have deleted the source meanwhile).
+/// new slot did not materialise. The caller's source pin still holds the
+/// object, so this is never the last reference in practice; the release
+/// goes through `release_ref` all the same, so it frees correctly if it is.
 ///
 /// # Safety
 ///
-/// The caller must hold one reference on `object` that it is giving up; no
-/// lock may be held (`dealloc_object` takes its own).
+/// The caller must hold one reference on `object` that it is giving up, in
+/// syscall context with no lock held (`release_ref`'s preconditions).
 #[cfg(not(test))]
 unsafe fn release_src_ref(object: core::ptr::NonNull<crate::cap::object::KernelObjectHeader>)
 {
     // SAFETY: caller contract.
-    if unsafe { (*object.as_ptr()).dec_ref() } == 0
-    {
-        // SAFETY: refcount reached 0; no other references exist.
-        unsafe { crate::cap::object::dealloc_object(object) };
-    }
+    unsafe { crate::cap::object::release_ref(object) };
 }
 
 /// `SYS_CAP_CREATE_ENDPOINT` (7): retype a Memory cap into a new Endpoint.

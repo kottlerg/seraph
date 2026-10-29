@@ -1793,7 +1793,10 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
 ///
 /// If the thread is running on another CPU, the call returns once that CPU
 /// has descheduled it and published its register save, or once an object
-/// teardown has made it `Exited`. A caller that is itself stopped while it
+/// teardown, or the target's own exit, has made it `Exited` (a stop landing
+/// inside the target's exit returns `Ok`, and the exit commits `Exited` over
+/// it, so a later [`thread_start`] returns `InvalidArgument`). A caller that is
+/// itself stopped while it
 /// waits returns at once when restarted if `thread_cap` no longer names the
 /// target with Control rights, even while the target still runs, and
 /// otherwise keeps waiting as above; [`thread_read_regs`] and

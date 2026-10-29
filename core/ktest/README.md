@@ -220,28 +220,27 @@ test, apply through `scaled_bound` (`src/main.rs`), or through `scaled_polls` fo
 multiplied past it by the oversubscription factor the width implies (CPUs / 16), by which each
 cross-CPU handoff slows, so the bound still separates a slow step from a stuck or wrong one. They
 are the report bound of `tally::await_report` and `tally::await_all`; the round bounds of
-`configure_start_race`, `stop_target_vanishes` and `thread_cap_delete_under_use`, and the
-latter's exit polls; the acknowledgement, result, approach, sync and entry bounds of
-`stop_claimed_delete`, `stop_park_race`, `stop_fault_sender` and `timed_wait_reuse`; the
-acknowledgement and exit bounds of `stop_source_delete`; the preemption budget of
-`integration::priority_preemption`; the expiry and report bounds of
+`configure_start_race`, `stop_target_vanishes`, `thread_cap_delete_under_use` and
+`copy_source_delete`, and the exit polls of the last two; the acknowledgement, result, approach,
+sync and entry bounds of `stop_claimed_delete`, `stop_park_race`, `stop_fault_sender` and
+`timed_wait_reuse`; the acknowledgement and exit bounds of `stop_source_delete`; the preemption
+budget of `integration::priority_preemption`; the expiry and report bounds of
 `integration::queued_waiters_fifo`; the observation window and finish wait of
-`integration::irq_preserves_user_regs`; the child waits of `integration::stop_read_regs_remote`;
-the probe and redirect polls of `integration::write_regs_blocked_syscall`; the report bounds of
-`integration::cross_cspace_revoke_no_alias`,
-`integration::reply_binding_displaced`, `integration::destroyed_source_interrupts` and
-`wait_set::occupied_wait_refused`; the post waits of `event::recv_timeout_payload_zero_wins` and
-`event::recv_timeout_payload_nonzero_wins`; the exit, event and memory polls of
-`integration::fault_kills_thread`, `integration::fault_exception_no_handler_kills`,
-`integration::fault_handler_declines_kills`, `integration::aspace_fault_notification_late_bind`,
-`integration::death_notification_late_bind`, `integration::reply_binding_displaced`,
-`integration::syscall_rflags_hardening`, `integration::page_fault_present_bit`,
-`cap::cspace_self_delete_stops_caller` and `retype::aspace_self_delete_stops_caller`; the
-phase polls, the child's spin bound and the cleanup exit wait of `integration::tlb_widen_retry`
-(the cleanup wait only gives up, and is stretched so its `cap_delete` does not race a
-still-running pinned child); the migration polls of `thread::affinity_migrate_running`, the
-report wait of `thread::affinity_migrate_ready_queued`, the convergence polls of
-`thread::load_balancer_redistributes_skewed`; the exit and come-up polls of
+`integration::irq_preserves_user_regs`; the child waits of `integration::stop_read_regs_remote`; the
+probe and redirect polls of `integration::write_regs_blocked_syscall`; the report bounds of
+`integration::cross_cspace_revoke_no_alias`, `integration::reply_binding_displaced`,
+`integration::destroyed_source_interrupts` and `wait_set::occupied_wait_refused`; the post waits of
+`event::recv_timeout_payload_zero_wins` and `event::recv_timeout_payload_nonzero_wins`; the exit,
+event and memory polls of `integration::fault_kills_thread`,
+`integration::fault_exception_no_handler_kills`, `integration::fault_handler_declines_kills`,
+`integration::aspace_fault_notification_late_bind`, `integration::death_notification_late_bind`,
+`integration::reply_binding_displaced`, `integration::syscall_rflags_hardening`,
+`integration::page_fault_present_bit`, `cap::cspace_self_delete_stops_caller` and
+`retype::aspace_self_delete_stops_caller`; the phase polls, the child's spin bound and the cleanup
+exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and is stretched so its
+`cap_delete` does not race a still-running pinned child); the migration polls of
+`thread::affinity_migrate_running`, the report wait of `thread::affinity_migrate_ready_queued`, the
+convergence polls of `thread::load_balancer_redistributes_skewed`; the exit and come-up polls of
 `configure_start_race`, `mutual_stop`, `stop_fault_sender`, `stop_owed_wake`, `stop_repark`,
 `stop_target_vanishes` and `split_delete_race`, the final-delivery polls of `stop_repark`, and the
 controller polls of `sleep_list_full`. Every other bound applies as written.
@@ -269,6 +268,7 @@ their CPU through syscalls wedge the kernel
 | File | Scenario | Knobs |
 |---|---|---|
 | `cap_tree_deep.rs` | 8-level derivation chain with cascading revocation | `CHAIN_DEPTH=8`, `PASSES=500` |
+| `copy_source_delete.rs` | Free an endpoint through its last capability — a delete of its original cap, then a revoke of the original that removes the caller's derived copy followed by the original's delete — while a caller on another CPU loops `SYS_CAP_COPY` (into its own `CSpace`), `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` through that handle, deleting each new capability at once, each free aimed in turn at one of the three calls; every call returns `Ok` (its new capability then deletes cleanly), `InvalidState` (a revoke batch pins the source), or `InvalidCapability` once the handle is gone, the caller sees every round's handle go, each call returns `Ok` in some round, and some free is issued while the caller is inside a call (the call's source pin keeps the object live for its reference increment; the kernel's debug assertions are the tripwires for an increment landing on a freed object) (≥ 2 CPUs) | `CYCLES=300`† per phase, `ROUND_WAIT_US=200_000` |
 | `cspace_recycle.rs` | Repeated `CSpace` create+delete past the live-count bound (free-list recycling) | `ITERATIONS=10_000` |
 | `event_queue_fill_drain.rs` | Fill/drain cycles on a capacity-8 queue (ring buffer wrap-around) | `CAPACITY=8`, `CYCLES=2000` |
 | `idle_wake_race.rs` | Worker pinned to CPU 1 parks in `notification_wait`; `ITERATIONS` notification round trips from CPU 0 exercise the cross-CPU idle-wake / wake-IPI path (≥ 2 CPUs) | `ITERATIONS=50_000` |

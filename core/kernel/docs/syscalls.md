@@ -1248,7 +1248,10 @@ commit again.
 
 ### `SYS_THREAD_STOP` (20)
 
-Stop a running or runnable thread. The thread transitions to `Stopped` state.
+Stop a running or runnable thread. The thread transitions to `Stopped` state. A stop that
+lands while the target is inside its own exit (`SYS_THREAD_EXIT`, `SYS_PROCESS_EXIT`, or a
+terminal fault) still returns 0, but the exit then commits `Exited` over the `Stopped` mark, so
+the target never runs again and a later `SYS_THREAD_START` returns `InvalidArgument`.
 
 **Arguments:**
 

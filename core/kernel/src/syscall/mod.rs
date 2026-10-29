@@ -873,8 +873,9 @@ impl Drop for PinnedCap
 /// `handle` is the encoded value userspace passes: slot index in the low
 /// [`syscall::CAP_INDEX_BITS`] bits, per-slot generation in the high bits.
 /// Handlers that accept several tags (`SYS_CAP_INFO`, `SYS_WAIT_SET_ADD`'s
-/// source) check the tag and rights themselves; every other handler resolves
-/// through [`lookup_cap`].
+/// source) check the tag and rights themselves, as do copy, derive, and
+/// derive-badge for their source; every other handler resolves through
+/// [`lookup_cap`].
 ///
 /// # Errors
 /// [`SyscallError::InvalidCapability`] for a null `cspace`, a missing or

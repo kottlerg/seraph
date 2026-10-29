@@ -94,6 +94,7 @@ use arch::current::{
 /// The kernel receives the arguments unchecked by this crate: any argument the
 /// syscall treats as a user pointer must name memory valid for that use.
 #[inline]
+#[must_use]
 pub unsafe fn raw_syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 {
     // SAFETY: caller contract; syscall3 issues the raw syscall instruction.

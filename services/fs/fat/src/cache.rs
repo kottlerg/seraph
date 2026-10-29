@@ -218,6 +218,8 @@ impl PageCache
             return false;
         };
         let slot = &self.slots[idx];
+        // cast_possible_truncation: `lba - page_base < SECTORS_PER_PAGE`.
+        #[allow(clippy::cast_possible_truncation)]
         let sector_in_page = (lba - page_base) as usize;
         let offset = sector_in_page * SECTOR_SIZE;
 
@@ -257,6 +259,8 @@ impl PageCache
             return false;
         };
         let slot = &self.slots[idx];
+        // cast_possible_truncation: `lba - page_base < SECTORS_PER_PAGE`.
+        #[allow(clippy::cast_possible_truncation)]
         let sector_in_page = (lba - page_base) as usize;
         let offset = sector_in_page * SECTOR_SIZE;
         // SAFETY: refcount > 0 for the duration of this borrow; slot.va

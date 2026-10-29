@@ -46,7 +46,8 @@ the path in the report.
   Issue's acceptance requires, the root `Cargo.toml` and `Cargo.lock` for a new host-tested
   crate) is a scope expansion: state it in one line in the report and in the PR body, and
   continue. Anything else outside the scope is a question, not an edit.
-- Do not edit `.claude/CLAUDE.md` unless the maintainer's own words in the prompt allow it. If a
+- Do not edit `.claude/CLAUDE.md` unless the maintainer's own words allow it, in the prompt or
+  relayed verbatim by the orchestrator. If a
   changed fact has a copy there, report it and hold the push until the maintainer has applied
   or authorized that copy, so every copy of the fact lands in the same push (§ Change
   propagation procedure).
@@ -54,7 +55,8 @@ the path in the report.
   heads may be partly or fully fixed. An item already fixed is ticked citing the PR that fixed
   it (`git log -S`, `git blame`). An item that is wrong on the code is dropped as
   docs/conventions.md § Acceptance checklist discipline says: removed from the Issue body, or
-  rewritten to what holds, with the one-line rationale and the evidence in an Issue comment.
+  rewritten to what holds, with the one-line rationale in the closing comment and the evidence
+  in an Issue comment.
 
 ## Code and tests
 
@@ -150,10 +152,11 @@ the ledger). Save records under `target/xtask/review/pr<N>/`. Push and open the 
 
 ## Gate
 
-Stop when CI is green, the head includes `master`, the last run completed with no failed
-agent, its verdicts are `READY TO MERGE` or `NON-BLOCKING ISSUES ONLY` with every surface
-finding recorded and no contested finding on the surface unresolved, and `AUDIT PASS` is on
-record for the head (the merge-prompt condition of docs/conventions.md § Branch and PR
-Workflow). Report the gate with the merge command `gh pr merge <N> --merge --delete-branch`
+Stop when CI is green and the head includes `master` (docs/conventions.md § CI Gating and
+§ Branch protection), and the merge-prompt condition of its § Branch and PR Workflow holds:
+the last run completed with no failed agent, its verdict is `READY TO MERGE` or
+`NON-BLOCKING ISSUES ONLY` with every surface finding recorded and no contested finding on the
+surface unresolved, and `AUDIT PASS` is on record for the head. Report the gate with the merge
+command `gh pr merge <N> --merge --delete-branch`
 and end your turn. The merge decision is the maintainer's (`.claude/CLAUDE.md` § PR workflow
 operations); a worker that merges has failed its task.

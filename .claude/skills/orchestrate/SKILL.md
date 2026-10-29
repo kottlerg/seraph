@@ -88,13 +88,14 @@ produces hangs that then need classifying. One slot at a time:
 ## Merge order and the gate
 
 A PR is at its gate when: `gh pr view <N> --json mergeStateStatus,statusCheckRollup` shows
-`CLEAN` and every check green; the last run record under the worker's
-`target/xtask/review/pr<N>/` is a completed run with no failed agent whose verdict is `READY
-TO MERGE`, or `NON-BLOCKING ISSUES ONLY` with every surface finding recorded and no contested
-finding on the surface unresolved; `AUDIT PASS` is on record for the head; every Issue the
-body closes carries the current milestone; a delta since the validated head is comment-only or
-Markdown-only (`git diff <validated> <head> -- . ':!*.md'` shows only comment lines). This is
-the merge-prompt condition of docs/conventions.md § Branch and PR Workflow; verify each part
+`CLEAN` and every check green (docs/conventions.md § CI Gating, § Branch protection); the
+merge-prompt condition of its § Branch and PR Workflow holds, that is, the last run record
+under the worker's `target/xtask/review/pr<N>/` is a completed run with no failed agent whose
+verdict is `READY TO MERGE`, or `NON-BLOCKING ISSUES ONLY` with every surface finding recorded
+and no contested finding on the surface unresolved, and `AUDIT PASS` is on record for the
+head; every Issue the body closes carries the current milestone (§ Milestones); and a delta
+since the validated head is comment-only or Markdown-only (§ PR-body checklist discipline;
+`git diff <validated> <head> -- . ':!*.md'` shows only comment lines). Verify each part
 yourself, since a worker's report is a claim. Then prompt the maintainer, or merge under their
 standing instruction, with `gh pr merge <N> --merge --delete-branch`; fast-forward your own
 checkout, record it, and tell every open PR's worker what moved.

@@ -182,9 +182,11 @@ budget reported by `SYS_CAP_INFO` is authoritative.
 
 A record page is kernel state kept in donated memory, like the wrapper page,
 the slot pages, and the page tables themselves: the kernel trusts its
-contents, and the donating Memory capability's holder is trusted not to map
-what it has retyped away, which the kernel does not yet enforce
-([#433](https://github.com/kottlerg/seraph/issues/433));
+contents because the donating Memory capability cannot map what it has
+retyped away (the retype/map boundary of
+[docs/capability-model.md § Typed Memory](../../../docs/capability-model.md#typed-memory));
+a retype into pages the holder already maps is not yet refused
+([#577](https://github.com/kottlerg/seraph/issues/577)), and
 [cross-boundary-disclosure.md](cross-boundary-disclosure.md) § Kernel state
 in donated memory records that surface. The records are never scanned while
 the owner is live: an address space's reclaiming unmap recognises pool-owned

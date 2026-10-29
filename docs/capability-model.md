@@ -575,6 +575,14 @@ capability. There is no ambient kernel pool from which a process can
 draw kernel-object memory; a process can only create kernel objects
 against Memory caps it holds with `Retype` rights.
 
+A Memory capability cannot map bytes it has retyped into kernel objects. Retype carves a cap's
+region upward from its first byte, and `mem_map` refuses any range that starts below the
+highest byte retyped so far, rounded up to a page (the same bound `SYS_MEMORY_SPLIT` applies),
+so kernel state carved from donated memory (slot pages, page tables, wrapper and page-pool
+record pages) is never reachable through a mapping made afterwards. The converse order, a
+retype into pages the cap already maps, is not yet refused
+([#577](https://github.com/kottlerg/seraph/issues/577)).
+
 ### Available-bytes ledger
 
 Each retypable Memory capability carries an `available_bytes` counter.

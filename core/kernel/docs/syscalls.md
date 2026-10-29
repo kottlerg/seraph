@@ -980,11 +980,17 @@ nonzero so the explicit path is taken instead of deriving from the cap's rights.
 If `prot_bits` is zero, permissions are derived from the memory cap's rights directly.
 This fails with `WxViolation` if the memory cap has both WRITE and EXECUTE rights.
 
+The mapping may not reach bytes the memory cap has retyped into kernel objects: the range must
+start at or above the cap's retype bump cursor rounded up to a page, the bound `SYS_MEMORY_SPLIT`
+applies to its split offset (see
+[docs/capability-model.md § Typed Memory](../../../docs/capability-model.md#typed-memory)).
+
 **Capability requirements:** `memory_cap` (Map), `aspace_cap` (Map).
 
 **Errors:** `InvalidAddress` (unaligned `virt`, non-canonical address, or mapping
 range leaves the user half), `InvalidArgument` (zero page count, size/offset overflow,
-or `offset_pages` + `page_count` past the end of the memory cap's region),
+`offset_pages` + `page_count` past the end of the memory cap's region, or `offset_pages`
+below the page-rounded retype bump cursor),
 `InvalidCapability`, `InsufficientRights` (requested prot
 exceeds cap rights), `WxViolation` (both WRITE and EXECUTE requested), `OutOfMemory`
 (page table allocation failure).

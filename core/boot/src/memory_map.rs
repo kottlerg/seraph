@@ -141,12 +141,12 @@ impl Iterator for RawDescriptors<'_>
     }
 }
 
-/// Whether a UEFI memory type is excluded from every MMIO aperture: RAM
+/// Whether a UEFI memory type is subtracted from every named aperture seed: RAM
 /// (`EfiConventionalMemory`, `EfiBootServices*`, `EfiLoader*`,
 /// `EfiACPIReclaimMemory`, `EfiPersistentMemory`) and firmware-exclusive state
 /// (`EfiRuntimeServices*`, `EfiACPIMemoryNVS`), per
 /// `core/boot/docs/firmware-parsing.md` § Firmware exclusion.
-/// `EfiReservedMemoryType` is not excluded: firmware reports the GOP
+/// `EfiReservedMemoryType` is kept in a named seed: firmware reports the GOP
 /// framebuffer and some interrupt-controller and ECAM windows as Reserved.
 fn excluded_from_apertures(uefi_type: u32) -> bool
 {
@@ -204,12 +204,39 @@ where
     }
 }
 
+/// Whether a UEFI memory type marks device space: `EfiMemoryMappedIO` or
+/// `EfiMemoryMappedIOPortSpace`.
+fn is_mmio(uefi_type: u32) -> bool
+{
+    uefi_type == EFI_MEMORY_MAPPED_IO || uefi_type == EFI_MEMORY_MAPPED_IO_PORT_SPACE
+}
+
+/// The half-open physical range `[start, end)` a descriptor covers.
+fn descriptor_range(d: &EfiMemoryDescriptor) -> (u64, u64)
+{
+    (
+        d.physical_start,
+        d.physical_start
+            .saturating_add(d.number_of_pages.saturating_mul(4096)),
+    )
+}
+
 /// Derive the coarse MMIO aperture array from the raw UEFI memory map and
-/// the caller-supplied firmware and framebuffer seeds (`seed`), following
-/// `core/boot/docs/firmware-parsing.md` § `mmio_apertures` construction:
-/// every RAM-class and firmware-exclusive range of the map
-/// ([`excluded_from_apertures`]) is subtracted from each seed before the
-/// merge, so no aperture covers RAM. Writes at most `MAX_APERTURES` entries
+/// the caller-supplied seeds, following `core/boot/docs/firmware-parsing.md`
+/// § `mmio_apertures` construction. Two seed classes are clipped
+/// differently before the merge:
+///
+/// - `seed` holds windows the firmware or the framebuffer names (interrupt
+///   controllers, UARTs, ECAM, DTB nodes, the GOP framebuffer): every
+///   RAM-class and firmware-exclusive range of the map
+///   ([`excluded_from_apertures`]) is subtracted, and `EfiReservedMemoryType`
+///   is kept, since firmware reports such windows as Reserved.
+/// - `heuristic` holds layout-heuristic PCI windows no firmware table names:
+///   every range the map describes, except MMIO, is subtracted, so only the
+///   map's holes and MMIO descriptors remain and firmware-reserved DRAM
+///   inside such a window is left out.
+///
+/// No aperture therefore covers RAM. Writes at most `MAX_APERTURES` entries
 /// to `out` and returns the number written; surplus is dropped with a
 /// diagnostic.
 ///
@@ -219,11 +246,12 @@ where
 /// # Safety
 /// `uefi_map.buffer_phys` must be the UEFI raw map buffer from the most
 /// recent `GetMemoryMap` call, with valid descriptors covering
-/// `uefi_map.map_size` bytes. `seed` is a caller-owned slice of already
-/// validated apertures.
+/// `uefi_map.map_size` bytes. `seed` and `heuristic` are caller-owned slices
+/// of already validated apertures.
 pub unsafe fn derive_mmio_apertures(
     uefi_map: &crate::uefi::MemoryMapResult,
     seed: &[MmioAperture],
+    heuristic: &[MmioAperture],
     out: &mut [MmioAperture; MAX_APERTURES],
 ) -> usize
 {
@@ -255,8 +283,7 @@ pub unsafe fn derive_mmio_apertures(
     // Collect MMIO-class descriptors from the UEFI map.
     for desc in descriptors.clone()
     {
-        if desc.memory_type == EFI_MEMORY_MAPPED_IO
-            || desc.memory_type == EFI_MEMORY_MAPPED_IO_PORT_SPACE
+        if is_mmio(desc.memory_type)
         {
             push(MmioAperture {
                 phys_base: desc.physical_start,
@@ -265,22 +292,30 @@ pub unsafe fn derive_mmio_apertures(
         }
     }
 
-    // Fold in the firmware-seeded apertures, each clipped to the gaps the
-    // map's RAM-class and firmware-exclusive ranges leave.
+    // Fold in the named seeds, each clipped to the gaps the map's RAM-class
+    // and firmware-exclusive ranges leave.
     let excluded = descriptors
+        .clone()
         .filter(|d| excluded_from_apertures(d.memory_type))
-        .map(|d| {
-            (
-                d.physical_start,
-                d.physical_start
-                    .saturating_add(d.number_of_pages.saturating_mul(4096)),
-            )
-        });
+        .map(|d| descriptor_range(&d));
     for s in seed
     {
         if s.size != 0
         {
             subtract_excluded(*s, &excluded, &mut push);
+        }
+    }
+
+    // Fold in the heuristic windows, each clipped to the map's holes and
+    // MMIO descriptors.
+    let described = descriptors
+        .filter(|d| !is_mmio(d.memory_type))
+        .map(|d| descriptor_range(&d));
+    for s in heuristic
+    {
+        if s.size != 0
+        {
+            subtract_excluded(*s, &described, &mut push);
         }
     }
 
@@ -692,11 +727,22 @@ mod tests
     /// Run `derive_mmio_apertures` over `descs` and `seed`; return the output.
     fn run_derive(descs: &[EfiMemoryDescriptor], seed: &[MmioAperture]) -> Vec<MmioAperture>
     {
-        let stride = size_of::<EfiMemoryDescriptor>();
+        run_derive_with(descs, size_of::<EfiMemoryDescriptor>(), seed, &[])
+    }
+
+    /// Run `derive_mmio_apertures` over `descs` at `stride`, the named
+    /// `seed`, and the `heuristic` windows; return the output.
+    fn run_derive_with(
+        descs: &[EfiMemoryDescriptor],
+        stride: usize,
+        seed: &[MmioAperture],
+        heuristic: &[MmioAperture],
+    ) -> Vec<MmioAperture>
+    {
         let uefi_map = MemoryMapResult {
             buffer_phys: descs.as_ptr() as u64,
-            buffer_size: descs.len() * stride,
-            map_size: descs.len() * stride,
+            buffer_size: descs.len() * size_of::<EfiMemoryDescriptor>(),
+            map_size: descs.len() * size_of::<EfiMemoryDescriptor>(),
             map_key: 0,
             descriptor_size: stride,
         };
@@ -704,8 +750,9 @@ mod tests
             phys_base: 0,
             size: 0,
         }; MAX_APERTURES];
-        // SAFETY: `descs` is a live, aligned descriptor array covering `map_size`.
-        let n = unsafe { derive_mmio_apertures(&uefi_map, seed, &mut out) };
+        // SAFETY: `descs` is a live, aligned descriptor array covering
+        // `map_size`; a zero stride reads nothing.
+        let n = unsafe { derive_mmio_apertures(&uefi_map, seed, heuristic, &mut out) };
         out[..n].to_vec()
     }
 
@@ -844,7 +891,12 @@ mod tests
         // q35 with 2.5 GiB: lowmem RAM [0, 0xA000_0000); the MCFG heuristic's
         // 32-bit window is [0x8000_0000, 0xB000_0000).
         let descs = [desc(EFI_CONVENTIONAL_MEMORY, 0, 0xA000_0000 / 4096)];
-        let out = run_derive(&descs, &[ap(0x8000_0000, 0x3000_0000)]);
+        let out = run_derive_with(
+            &descs,
+            size_of::<EfiMemoryDescriptor>(),
+            &[],
+            &[ap(0x8000_0000, 0x3000_0000)],
+        );
         assert_eq!(pairs(&out), vec![(0xA000_0000, 0x1000_0000)]);
     }
 
@@ -853,7 +905,8 @@ mod tests
     {
         // High RAM [4 GiB, 5 GiB); the q35 64-bit window is [4 GiB, 1 << 46).
         let descs = [desc(EFI_CONVENTIONAL_MEMORY, 1 << 32, (1 << 30) / 4096)];
-        let out = run_derive(&descs, &[ap(1 << 32, (1u64 << 46) - (1 << 32))]);
+        let window = ap(1 << 32, (1u64 << 46) - (1 << 32));
+        let out = run_derive_with(&descs, size_of::<EfiMemoryDescriptor>(), &[], &[window]);
         assert_eq!(
             pairs(&out),
             vec![(0x1_4000_0000, (1u64 << 46) - 0x1_4000_0000)]
@@ -870,6 +923,34 @@ mod tests
             pairs(&got),
             vec![(0, 0x1000), (0x4000, 0x1000), (0x8000, 0x2000)]
         );
+    }
+
+    #[test]
+    fn reserved_memory_clips_a_heuristic_window_but_not_a_named_seed()
+    {
+        // Firmware-reserved DRAM (TSEG-like) inside the q35 32-bit window, and
+        // an MMIO descriptor beside it.
+        let descs = [
+            desc(0 /* EfiReservedMemoryType */, 0x9000_0000, 0x10),
+            desc(EFI_MEMORY_MAPPED_IO, 0x9001_0000, 0x10),
+        ];
+        let window = ap(0x9000_0000, 0x10_0000);
+        let stride = size_of::<EfiMemoryDescriptor>();
+
+        let heuristic = run_derive_with(&descs, stride, &[], &[window]);
+        assert_eq!(pairs(&heuristic), vec![(0x9001_0000, 0xF_0000)]);
+
+        let named = run_derive_with(&descs, stride, &[window], &[]);
+        assert_eq!(pairs(&named), vec![(0x9000_0000, 0x10_0000)]);
+    }
+
+    #[test]
+    fn zero_descriptor_stride_reads_no_descriptor_and_keeps_the_seeds()
+    {
+        // A RAM descriptor that would clip the seed, behind a zero stride.
+        let descs = [desc(EFI_CONVENTIONAL_MEMORY, 0x2000_0000, 1)];
+        let out = run_derive_with(&descs, 0, &[ap(0x2000_0000, 0x2000)], &[]);
+        assert_eq!(pairs(&out), vec![(0x2000_0000, 0x2000)]);
     }
 }
 

@@ -54,22 +54,24 @@ The XSDT pointer at RSDP offset 24 is the authoritative table root; the
 | Table | Signature | Extracted into |
 |---|---|---|
 | MADT | `"APIC"` | `BootInfo.cpu_count` / `cpu_ids` via LAPIC (type 0), Local x2APIC (type 9, 32-bit IDs), and RINTC (type 0x18). On x86-64: `BootInfo.kernel_mmio` LAPIC base (MADT header + type-5 override) and IOAPIC entries (type 1). On RISC-V: `BootInfo.kernel_mmio.plic_base` / `plic_size` from the first PLIC entry (type 0x1B). Aperture seeds for LAPIC, IOAPIC, and RISC-V PLIC. |
-| MCFG | `"MCFG"` | Aperture seeds for each ECAM window and the derived 32-bit / 64-bit PCI BAR windows (QEMU-layout heuristic: real hardware advertises these windows through the host bridge's `_CRS`, which the bootloader does not evaluate; see [firmware-parsing.md](firmware-parsing.md) §"Parsing Depth"). An absent MCFG contributes no seed; the arch's platform defaults below are appended either way. Like every seed, the windows reach `mmio_apertures` only where they cover no RAM-class or firmware-exclusive memory-map range (see [firmware-parsing.md](firmware-parsing.md) §"Firmware exclusion"). |
+| MCFG | `"MCFG"` | Aperture seeds for each ECAM window and the derived 32-bit / 64-bit PCI BAR windows (QEMU-layout heuristic: real hardware advertises these windows through the host bridge's `_CRS`, which the bootloader does not evaluate; see [firmware-parsing.md](firmware-parsing.md) §"Parsing Depth"). An absent MCFG contributes no seed; the arch's platform defaults below are appended either way. The ECAM windows are named seeds; the PCI BAR windows are heuristic windows, which reach `mmio_apertures` only where the memory map leaves them undescribed or reports MMIO (see [firmware-parsing.md](firmware-parsing.md) §"Firmware exclusion"). |
 | SPCR | `"SPCR"` | RISC-V only: `BootInfo.kernel_mmio.uart_base` (from the Generic Address Structure when the address-space identifier is MMIO). `uart_size` is set to the ns16550a conventional 0x100 (SPCR does not carry a region size; the later DTB pass fills `uart_base` / `uart_size` only when ACPI left `uart_base` zero). The pre-Step-1 serial-init path uses the same walk to pick up a UART base for early diagnostics (see [console.md](console.md)). |
 | RHCT | `"RHCT"` | RISC-V only, Step 9 (`populate_kernel_mmio`): `BootInfo.kernel_mmio.timebase_freq` from the time-base-frequency field, and the `HART_CAP_*` bits (Sstc, Svpbmt, Svinval, Svnapot) named by every ISA-string node (a per-bit AND; zero when no ISA-string node exists). |
 | SSDT | `"SSDT"` | Every architecture where an RSDP is present, Step 9: `BootInfo.vmgenid_paddr`, the non-zero, 4 KiB-aligned `VGIA` named-DWORD value plus the 40-byte GUID offset; an SSDT whose OEM table ID starts with `VMGENID` is preferred, otherwise the first SSDT carrying the pattern. No AML is evaluated. |
 
-After the table walk, `parse_aperture_seed` appends the arch's platform-default apertures
-(`arch::current::default_mmio_apertures`) whenever the RSDP revision and the XSDT validate, MCFG
-present or absent. The list is empty on x86-64; on riscv64 it is the QEMU virt ECAM window, the
-32-bit and 64-bit PCI windows, and the ns16550a UART and Goldfish RTC register pages
-(`parse_aperture_seed` reads only MADT and MCFG, so no table seeds those two pages; the aperture
-seeder does not read SPCR). Any overlap with the MCFG-derived seeds is collapsed by
-`derive_mmio_apertures` (see [firmware-parsing.md](firmware-parsing.md) §"`mmio_apertures`
-construction"). Like the MCFG heuristic windows, the defaults ignore the memory map (the riscv64
-64-bit window `[16 GiB, 32 GiB)` covers RAM on a virt guest with more than about 14 GiB);
-`derive_mmio_apertures` subtracts the RAM-class and firmware-exclusive ranges from every seed (see
-[firmware-parsing.md](firmware-parsing.md) §"Firmware exclusion").
+After the table walk, `parse_aperture_seed` appends the arch's platform defaults whenever the
+RSDP revision and the XSDT validate, MCFG present or absent: the register windows
+(`arch::current::default_mmio_apertures`) as named seeds and the PCI windows
+(`arch::current::default_pci_windows`) as heuristic windows. Both lists are empty on x86-64; on
+riscv64 the register windows are the QEMU virt ECAM window and the ns16550a UART and Goldfish RTC
+register pages (`parse_aperture_seed` reads only MADT and MCFG, so no table seeds those two pages;
+the aperture seeder does not read SPCR), and the PCI windows are the 32-bit and 64-bit windows. Any
+overlap with the MCFG-derived seeds is collapsed by `derive_mmio_apertures` (see
+[firmware-parsing.md](firmware-parsing.md) §"`mmio_apertures` construction"). Like the MCFG
+heuristic windows, the default PCI windows ignore the memory map (the riscv64 64-bit window
+`[16 GiB, 32 GiB)` covers RAM on a virt guest with more than about 14 GiB);
+`derive_mmio_apertures` keeps only the parts of a heuristic window the map leaves undescribed or
+reports as MMIO (see [firmware-parsing.md](firmware-parsing.md) §"Firmware exclusion").
 
 Every signature outside this table is ignored by the bootloader. Userspace consumes
 the remaining ACPI tree via `BootInfo.acpi_rsdp`; see [firmware-parsing.md](firmware-parsing.md).

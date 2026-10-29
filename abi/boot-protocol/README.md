@@ -75,8 +75,16 @@ A compliant bootloader MUST NOT:
 - Include in `BootInfo.mmio_apertures` any region that is inaccessible,
   RAM (a region the memory map classifies as `Usable`, `Loaded`,
   `AcpiReclaimable`, or `Persistent`), or reserved for firmware's exclusive
-  use (UEFI runtime-services code and data, ACPI NVS). The kernel rejects an
-  aperture that intersects RAM at Phase 6
+  use: UEFI runtime-services code and data, ACPI NVS, and firmware-reserved
+  memory that no firmware table, device tree, or framebuffer names as a
+  device's registers or frame buffer. A region firmware reports as reserved
+  MAY be included where such a source names it (the GOP framebuffer, an
+  interrupt controller, an ECAM window); a window placed by a layout
+  heuristic rather than named by firmware MUST exclude every range the memory
+  map describes other than MMIO. The reference bootloader's rule is
+  [core/boot/docs/firmware-parsing.md](../../core/boot/docs/firmware-parsing.md)
+  § Firmware exclusion. The kernel rejects an aperture that intersects RAM at
+  Phase 6
   ([core/kernel/docs/initialization.md](../../core/kernel/docs/initialization.md)
   § Phase 6).
 

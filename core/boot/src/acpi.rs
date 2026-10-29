@@ -19,8 +19,9 @@
 //! - [`parse_cpu_topology`]: MADT walk producing `BootInfo.cpu_count` and
 //!   `BootInfo.cpu_ids`.
 //! - [`parse_aperture_seed`]: MADT + MCFG walk, plus the arch's
-//!   platform-default MMIO apertures (`core/boot/docs/acpi.md` § Tables
-//!   Consumed), producing MMIO aperture seeds fed into
+//!   platform-default MMIO apertures and PCI windows
+//!   (`core/boot/docs/acpi.md` § Tables Consumed), producing the register
+//!   and heuristic-window MMIO aperture seeds fed into
 //!   [`super::memory_map::derive_mmio_apertures`].
 //! - [`parse_hart_caps`]: RHCT walk (RISC-V, ACPI 6.5+) producing the
 //!   `time` CSR frequency and the `HART_CAP_*` bits every hart advertises.
@@ -636,8 +637,9 @@ fn record_cpu_id(id: u32, ids: &mut [u32; MAX_CPUS], count: &mut usize, truncate
 /// `LocalApicAddress` in the MADT header with a 64-bit value).
 pub(crate) const MADT_TYPE_LAPIC_OVERRIDE: u8 = 5;
 
-/// Walk ACPI tables and collect MMIO extents into `out` for aperture
-/// seeding.
+/// Walk ACPI tables and collect MMIO extents for aperture seeding: the
+/// register windows tables name into `out`, and the heuristic PCI windows
+/// into `heuristic`.
 ///
 /// Writes up to `out.len()` [`MmioAperture`] entries covering:
 /// - Local APIC register window, when non-zero (x86-64 only: from the
@@ -645,32 +647,42 @@ pub(crate) const MADT_TYPE_LAPIC_OVERRIDE: u8 = 5;
 /// - Each I/O APIC register window (x86-64, MADT type 1).
 /// - Each RISC-V PLIC register window (MADT type 0x1B, present on
 ///   RISC-V platforms that expose ACPI such as QEMU+EDK2 virt).
-/// - Each MCFG ECAM window, plus a 32-bit and 64-bit PCI MMIO aperture
-///   placed by a QEMU q35 / virt layout heuristic (ECAM-base-dependent).
-///   The heuristic windows ignore the memory map;
-///   [`super::memory_map::derive_mmio_apertures`] clips them, like every
-///   seed, to the gaps the map's RAM-class and firmware-exclusive ranges leave.
-/// - The arch's platform defaults from
+/// - Each MCFG ECAM window.
+/// - The arch's platform-default register windows from
 ///   `crate::arch::current::default_mmio_apertures` (empty on x86-64),
 ///   appended once the RSDP and XSDT validate.
 ///
+/// Writes up to `heuristic.len()` entries covering the 32-bit and 64-bit PCI
+/// MMIO windows a QEMU q35 / virt layout heuristic places from each ECAM
+/// base, and the arch's default PCI windows
+/// (`crate::arch::current::default_pci_windows`, empty on x86-64). These
+/// windows ignore the memory map; [`super::memory_map::derive_mmio_apertures`]
+/// clips them to the map's holes and MMIO descriptors, where it clips the
+/// `out` seeds only to the gaps the RAM-class and firmware-exclusive ranges
+/// leave (`core/boot/docs/firmware-parsing.md` § Firmware exclusion).
+///
 /// Callable unconditionally on every supported architecture; a zero
-/// `rsdp_addr` (no ACPI) is a fast no-op that returns 0. The caller
+/// `rsdp_addr` (no ACPI) is a fast no-op that returns `(0, 0)`. The caller
 /// typically also calls [`super::dtb::parse_aperture_seed`] to cover
 /// DTB-only platforms, and merges both into
 /// [`super::memory_map::derive_mmio_apertures`].
 ///
-/// Returns the number of entries written.
+/// Returns the number of entries written to `out` and to `heuristic`.
 ///
 /// # Safety
 /// `rsdp_addr` must be the physical address of a valid, identity-mapped
-/// ACPI RSDP. A zero `rsdp_addr` returns 0 without reading.
+/// ACPI RSDP. A zero `rsdp_addr` returns `(0, 0)` without reading.
 // too_many_lines: linear walk over MADT and MCFG with per-entry push dispatch;
 // the cases are flat and inline-local, splitting them loses the walk's shape.
 #[allow(clippy::too_many_lines)]
-pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> usize
+pub unsafe fn parse_aperture_seed(
+    rsdp_addr: u64,
+    out: &mut [MmioAperture],
+    heuristic: &mut [MmioAperture],
+) -> (usize, usize)
 {
     let mut n: usize = 0;
+    let mut h: usize = 0;
 
     macro_rules! push {
         ($base:expr, $size:expr) => {
@@ -684,33 +696,45 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
             }
         };
     }
+    macro_rules! push_heuristic {
+        ($base:expr, $size:expr) => {
+            if h < heuristic.len() && $size > 0
+            {
+                heuristic[h] = MmioAperture {
+                    phys_base: $base,
+                    size: $size,
+                };
+                h += 1;
+            }
+        };
+    }
 
     if rsdp_addr == 0
     {
-        return n;
+        return (n, h);
     }
     // SAFETY: caller contract.
     let rsdp = unsafe { phys_slice(rsdp_addr, 36) };
     if &rsdp[..8] != RSDP_SIG || read_u8(rsdp, RSDP_OFF_REVISION) < 2
     {
-        return n;
+        return (n, h);
     }
     let xsdt_addr = read_u64(rsdp, RSDP_OFF_XSDT);
     if xsdt_addr == 0
     {
-        return n;
+        return (n, h);
     }
 
     // SAFETY: validated RSDP.
     let xsdt_hdr = unsafe { phys_slice(xsdt_addr, SDT_HDR_LEN) };
     if &xsdt_hdr[SDT_OFF_SIGNATURE..SDT_OFF_SIGNATURE + 4] != b"XSDT"
     {
-        return n;
+        return (n, h);
     }
     let xsdt_len = read_u32(xsdt_hdr, SDT_OFF_LENGTH) as usize;
     if xsdt_len < SDT_HDR_LEN
     {
-        return n;
+        return (n, h);
     }
     // SAFETY: length validated.
     let xsdt = unsafe { phys_slice(xsdt_addr, xsdt_len) };
@@ -812,9 +836,11 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
                     // q35 32-bit window covers lowmem RAM above 2 GiB, the
                     // q35 64-bit window all RAM above 4 GiB, and the virt
                     // 64-bit window RAM once a guest has more than about
-                    // 14 GiB. `derive_mmio_apertures` subtracts the
-                    // map's RAM-class and firmware-exclusive ranges from
-                    // every seed, so no aperture init receives covers RAM
+                    // 14 GiB, and on real hardware either can span
+                    // firmware-reserved DRAM. Both go to `heuristic`, which
+                    // `derive_mmio_apertures` clips to the memory map's
+                    // holes and MMIO descriptors, so no aperture init
+                    // receives covers RAM or firmware-reserved memory
                     // (core/boot/docs/firmware-parsing.md § Firmware exclusion).
                     let (lo_base, lo_size) = if base < 0x8000_0000
                     {
@@ -824,7 +850,7 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
                     {
                         (0x8000_0000u64, base - 0x8000_0000)
                     };
-                    push!(lo_base, lo_size);
+                    push_heuristic!(lo_base, lo_size);
                     let (hi_base, hi_size) = if base < 0x8000_0000
                     {
                         (0x4_0000_0000u64, 0x4_0000_0000u64)
@@ -843,7 +869,7 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
                         let hi_base: u64 = 1u64 << 32;
                         (hi_base, hi_top.saturating_sub(hi_base))
                     };
-                    push!(hi_base, hi_size);
+                    push_heuristic!(hi_base, hi_size);
                 }
                 off += MCFG_ENTRY_SIZE;
             }
@@ -862,8 +888,12 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
     {
         push!(base, size);
     }
+    for &(base, size) in crate::arch::current::default_pci_windows()
+    {
+        push_heuristic!(base, size);
+    }
 
-    n
+    (n, h)
 }
 
 /// ECAM window `(phys_base, size)` of one MCFG allocation entry: the MCFG

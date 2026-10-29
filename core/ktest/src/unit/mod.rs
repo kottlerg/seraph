@@ -43,6 +43,10 @@ pub fn run_all(ctx: &TestContext)
         "boot_reclaim::reclaimed_bootloader_pages_are_zero",
         boot_reclaim::reclaimed_bootloader_pages_are_zero(ctx)
     );
+    run_test!(
+        "boot_reclaim::drained_ram_frames_are_zero",
+        boot_reclaim::drained_ram_frames_are_zero(ctx)
+    );
 
     // ── Capability syscalls ───────────────────────────────────────────────────
     run_test!("cap::create_notification", cap::create_notification(ctx));

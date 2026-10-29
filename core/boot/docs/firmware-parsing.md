@@ -20,7 +20,7 @@ five parts of `BootInfo`:
    MMIO seed regions, which are merged with the UEFI memory map's MMIO
    classifications into the final aperture list this field carries (see
    [`mmio_apertures` construction](#mmio_apertures-construction)). The kernel mints
-   one `Mmio` capability per aperture entry (see
+   one `Mmio` capability per aperture entry its Phase 6 validates (see
    [initialization.md](../../kernel/docs/initialization.md#phase-7-capability-system)).
 4. `boot_entropy_seed` / `boot_entropy_len` — the DTB `/chosen/rng-seed`
    fallback, consulted only when `EFI_RNG_PROTOCOL` yields no seed
@@ -96,10 +96,11 @@ after `ExitBootServices` by
    UEFI typically reports as `EfiReservedMemoryType` and only the bootloader can
    carry past `ExitBootServices`. Seeds beyond the `MAX_APERTURE_SEEDS` (64)
    seed buffer, the framebuffer seed included, are dropped without a diagnostic.
-   Each seed is first clipped to the memory map: every range of a type
-   [§ Firmware exclusion](#firmware-exclusion) excludes is subtracted from it, so a
-   seed contributes only the gaps those ranges leave, and a seed wholly inside one
-   contributes nothing.
+   The ACPI seeder's heuristic PCI windows go to a separate buffer
+   (`MAX_HEURISTIC_SEEDS`, 16). Each seed is first clipped to the memory map as
+   [§ Firmware exclusion](#firmware-exclusion) defines, so it contributes only
+   the gaps the subtracted ranges leave, and a seed wholly inside one contributes
+   nothing.
 3. Sort by `phys_base`.
 4. Merge adjacent and overlapping entries into a minimal non-overlapping
    list.
@@ -116,18 +117,29 @@ PLIC / ECAM / BAR windows).
 ### Firmware exclusion
 
 Apertures are coarse but **not indiscriminate**. No aperture covers RAM or
-firmware-exclusive state: step 2 subtracts from every seed each range of the
-RAM-class types (`EfiConventionalMemory`, `EfiBootServicesCode`,
-`EfiBootServicesData`, `EfiLoaderCode`, `EfiLoaderData`, `EfiACPIReclaimMemory`,
-`EfiPersistentMemory`) and of the firmware-exclusive types (`EfiRuntimeServicesCode`,
-`EfiRuntimeServicesData`, `EfiACPIMemoryNVS`), and no UEFI descriptor of those types
-is collected in step 1. This holds for the coarse heuristic windows too (the
-MCFG-derived 32-bit and 64-bit PCI windows and the riscv64 arch defaults), which
-ignore the memory map and would otherwise cover RAM. `EfiReservedMemoryType` is not
-subtracted, since firmware reports the GOP framebuffer and some interrupt-controller and
-ECAM windows as Reserved; such a range is an aperture only where a seed names it.
-Userspace therefore never receives an `Mmio` capability over RAM or firmware-exclusive
-state (see
+firmware-exclusive state. Step 1 collects only MMIO descriptors, and step 2
+clips each seed by its class:
+
+- **Named seeds** are windows a firmware table, the DTB, the arch defaults, or
+  GOP names as a device's registers or frame buffer: LAPIC, IOAPIC, PLIC, ECAM,
+  UART, RTC, `virtio,mmio` and other DTB nodes, and the framebuffer. Every range of
+  the RAM-class types (`EfiConventionalMemory`, `EfiBootServicesCode`,
+  `EfiBootServicesData`, `EfiLoaderCode`, `EfiLoaderData`, `EfiACPIReclaimMemory`,
+  `EfiPersistentMemory`) and of the firmware-exclusive types
+  (`EfiRuntimeServicesCode`, `EfiRuntimeServicesData`, `EfiACPIMemoryNVS`) is
+  subtracted. `EfiReservedMemoryType` is not, because firmware reports the GOP
+  framebuffer and some interrupt-controller and ECAM windows as Reserved, and a
+  named seed covers such a range only where the device it names lives.
+- **Heuristic windows** are the MCFG-derived 32-bit and 64-bit PCI BAR windows and the
+  riscv64 default PCI windows (`default_pci_windows`), placed by a QEMU layout
+  heuristic rather than named by firmware. Every range the memory map describes,
+  except MMIO, is subtracted, `EfiReservedMemoryType` included, so only the map's
+  holes and MMIO descriptors remain. Firmware-reserved DRAM inside such a window
+  (SMM memory, graphics stolen memory) therefore never becomes an aperture.
+
+Userspace therefore never receives an `Mmio` capability over RAM, over
+runtime-services or ACPI NVS memory, or over Reserved memory that no named seed
+covers (see
 [abi/boot-protocol](../../../abi/boot-protocol/README.md#contract-for-a-compliant-bootloader)).
 The kernel re-checks the RAM half at Phase 6, rejecting any aperture that intersects a
 RAM-class memory-map region

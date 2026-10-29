@@ -110,7 +110,7 @@ mirroring the kernel's own source layout.
 | `sysinfo.rs` | `SYS_SYSTEM_INFO` |
 | `crypto.rs` | Shared `crypto` crate known-answer tests (SHA-512, Ed25519 verify) run on-target (not a syscall surface) |
 | `init_layout.rs` | Kernel init-bootstrap ASLR draws: the `InitInfo` VA, init stack, and PIE image base lie in their windows |
-| `boot_reclaim.rs` | Every reclaimable Memory cap over a bootloader reclaim range (page-table frames, `BootInfo`, descriptor arrays, bundle non-module pages, AP trampoline) reads as zero through `SYS_MEM_MAP`, a single-page cap among them (not a syscall surface; runs first) |
+| `boot_reclaim.rs` | Every reclaimable Memory cap over a bootloader reclaim range (page-table frames, `BootInfo`, descriptor arrays, bundle non-module pages, AP trampoline) reads as zero through `SYS_MEM_MAP`, a single-page cap among them, and so does every frame-pool frame of drained RAM (not a syscall surface; runs first) |
 
 Adding a new syscall means adding a section in the appropriate file here.
 

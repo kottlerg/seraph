@@ -2459,39 +2459,73 @@ pub(crate) unsafe fn scrub_reclaim_ranges(boot_info_phys: u64)
         // SAFETY: i < count, within the bootloader-recorded array, which the
         // loop never zeroes (pages of [span_lo, span_hi) are deferred below).
         let range = unsafe { entries.add(i).read_unaligned() };
-        if range.page_count == 0
-        {
-            continue;
-        }
-        let lo = range.phys_base & !(page - 1);
-        let hi = lo + u64::from(range.page_count) * page;
-        let (outside, inside) = split_around_span(lo, hi, span_lo, span_hi);
-        for (start, end) in outside
-        {
-            // SAFETY: a recorded range, which nothing reads after this call
-            // (caller contract); disjoint from the reclaim array's pages.
-            unsafe { zero_phys(start, end - start) };
-        }
-        let mut p = inside.0;
-        while p < inside.1
-        {
-            span_covered[((p - span_lo) / page) as usize] = true;
-            p += page;
-        }
-        pages += u64::from(range.page_count);
+        // SAFETY: a recorded range, which nothing reads after this call
+        // (caller contract).
+        pages += unsafe { scrub_outside_span(range, span_lo, span_hi, &mut span_covered) };
     }
 
+    // SAFETY: every entry was read in the loop above, so nothing reads the
+    // reclaim array's pages again.
+    unsafe { zero_covered_span_pages(span_lo, &span_covered) };
+
+    crate::kprintln!("reclaim scrub: zeroed {pages} pages over {count} ranges");
+}
+
+/// Zero the pages of one reclaim `range` that lie outside the reclaim-array
+/// span `[span_lo, span_hi)`, mark the span pages it covers in
+/// `span_covered` (indexed from `span_lo`) for [`zero_covered_span_pages`],
+/// and return its page count.
+///
+/// # Safety
+/// `range` is a recorded reclaim range that nothing reads afterwards, and the
+/// span is at most `span_covered.len()` pages.
+#[cfg(not(test))]
+unsafe fn scrub_outside_span(
+    range: boot_protocol::ReclaimRange,
+    span_lo: u64,
+    span_hi: u64,
+    span_covered: &mut [bool; 2],
+) -> u64
+{
+    let page = crate::mm::PAGE_SIZE as u64;
+    if range.page_count == 0
+    {
+        return 0;
+    }
+    let lo = range.phys_base & !(page - 1);
+    let hi = lo + u64::from(range.page_count) * page;
+    let (outside, inside) = split_around_span(lo, hi, span_lo, span_hi);
+    for (start, end) in outside
+    {
+        // SAFETY: part of `range` (caller contract), disjoint from the span.
+        unsafe { zero_phys(start, end - start) };
+    }
+    let mut p = inside.0;
+    while p < inside.1
+    {
+        span_covered[((p - span_lo) / page) as usize] = true;
+        p += page;
+    }
+    u64::from(range.page_count)
+}
+
+/// Zero each reclaim-array span page, from `span_lo`, that `span_covered`
+/// marks as recorded.
+///
+/// # Safety
+/// No reclaim entry is read after this call.
+#[cfg(not(test))]
+unsafe fn zero_covered_span_pages(span_lo: u64, span_covered: &[bool; 2])
+{
+    let page = crate::mm::PAGE_SIZE as u64;
     for (k, &covered) in span_covered.iter().enumerate()
     {
         if covered
         {
-            // SAFETY: a recorded page of the reclaim array; every entry was
-            // read in the loop above, so nothing reads it again.
+            // SAFETY: a recorded page of the reclaim array (caller contract).
             unsafe { zero_phys(span_lo + k as u64 * page, page) };
         }
     }
-
-    crate::kprintln!("reclaim scrub: zeroed {pages} pages over {count} ranges");
 }
 
 /// Split the page range `[lo, hi)` around the span `[span_lo, span_hi)`:

@@ -676,13 +676,32 @@ pub fn fs_write_invariants_phase(_: &Caps)
         let _ = fs_remove(svctest_full, scratch_name, ipc_buf);
 
         let root = std::os::seraph::root_dir_cap();
-        let restricted_rights = u64::from(rights::LOOKUP | rights::MUTATE_DIR);
         let (data_cap, _, _) =
             ns_lookup(root, b"data", 0xFFFF, ipc_buf).expect("ns_lookup /data for attenuated walk");
-        let (parent_attenuated, _, _) = ns_lookup(data_cap, b"svctest", restricted_rights, ipc_buf)
-            .expect("ns_lookup /data/svctest attenuated");
-        let _ = syscall::cap_delete(data_cap);
+        let attenuated = |parent_rights: u32| {
+            ns_lookup(data_cap, b"svctest", u64::from(parent_rights), ipc_buf)
+                .expect("ns_lookup /data/svctest attenuated")
+                .0
+        };
 
+        // A parent with none of a file's rights would mint a child cap with
+        // no rights: the create is refused before anything reaches the disk
+        // (fs-driver-protocol.md § Label 13).
+        let parent_no_file_rights = attenuated(rights::LOOKUP | rights::MUTATE_DIR);
+        assert_eq!(
+            fs_create(parent_no_file_rights, scratch_name, ipc_buf).map(|(cap, _)| cap),
+            Err(ipc::fs_errors::PERMISSION_DENIED),
+            "FS_CREATE whose child cap would carry no rights"
+        );
+        assert_eq!(
+            ns_lookup(svctest_full, scratch_name, 0xFFFF, ipc_buf).map(|(cap, _, _)| cap),
+            Err(namespace_protocol::NsError::NotFound.as_label()),
+            "a refused FS_CREATE must not create the entry"
+        );
+        let _ = syscall::cap_delete(parent_no_file_rights);
+
+        let parent_attenuated = attenuated(rights::LOOKUP | rights::MUTATE_DIR | rights::STAT);
+        let _ = syscall::cap_delete(data_cap);
         let (child_cap, _) = fs_create(parent_attenuated, scratch_name, ipc_buf)
             .expect("FS_CREATE through attenuated parent should succeed");
 

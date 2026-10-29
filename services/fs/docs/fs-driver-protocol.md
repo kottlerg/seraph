@@ -464,10 +464,14 @@ badge must carry the `MUTATE_DIR` namespace right.
 
 **Reply (success)**: `label = 0`, `data[0]` = `NodeKind` (= File),
 `caps[0]` = node cap for the newly-created file. The new file starts
-empty (size 0, no allocated cluster).
+empty (size 0, no allocated cluster). The cap's rights are the parent
+cap's rights intersected with `STAT | READ | WRITE | EXEC`.
 
 **Errors**: `INVALID_BADGE`, `EXISTS` (the directory already holds an
-entry of that name), `NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`,
+entry of that name), `NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED` (the
+badge lacks `MUTATE_DIR`, or it carries none of `STAT`, `READ`, `WRITE`,
+and `EXEC`, so the new file's cap would carry no rights; the driver
+refuses before writing anything, and no entry is created),
 `TOO_MANY_OPEN` (the driver's node table is full; the entry was
 created).
 
@@ -491,13 +495,28 @@ Unlink a file or empty directory. Badge = parent-directory cap with
 than `.` and `..`), `IO_ERROR`, `PERMISSION_DENIED`, `INVALID_BADGE`
 (the badge is not a directory node).
 
-`FS_REMOVE` is not atomic: an error reply can leave any of
-[`crash-safety.md`](../fat/docs/crash-safety.md)'s `FS_REMOVE` states, and
-the driver's cached copy of a sector whose write failed keeps the new bytes
-until a later write of that sector succeeds or the page is evicted. Once
-the cached view shows the entry deleted, the driver drops the entry's node,
-so caps held on it no longer name it
-([#447](https://github.com/kottlerg/seraph/issues/447)).
+`FS_REMOVE` is not atomic: the driver marks the entry's LFN slots, then
+its 8.3 slot, each with its own block write (see
+[`crash-safety.md`](../fat/docs/crash-safety.md)). A sector write the block
+device fails leaves the driver's cached copy of that sector as it was
+before the write, though the device may hold either version. When one of
+those writes fails, the driver reads the 8.3 slot back from the device,
+past its cache, and settles the request by what it finds:
+
+- **Entry still live**: the driver writes back the first bytes of the LFN
+  slots it marked and replies the error (`IO_ERROR`). The entry stays,
+  with its long name and its node, so caps held on it keep working. An
+  LFN slot whose restore also fails stays marked, leaving the entry
+  visible only under its short alias.
+- **Entry deleted**: the removal took effect. The driver frees the entry's
+  cluster chain, drops its node, and replies as for a removal whose writes
+  all succeeded.
+- **Slot unreadable**: the driver replies `IO_ERROR` and drops the entry's
+  node, since it may be gone; caps held on it then reply `INVALID_BADGE`.
+  The entry may remain on the device without its LFN run.
+
+A node the driver drops no longer names anything, so a later `FS_CREATE`
+that reuses the slot cannot reach a stale node through a held cap.
 
 ---
 
@@ -508,9 +527,12 @@ one cluster, zero-fills it, and populates `.` / `..` entries before
 the directory entry is inserted in the parent.
 
 **Reply (success)**: `label = 0`, `data[0]` = `NodeKind` (= Dir),
-`caps[0]` = node cap for the new directory.
+`caps[0]` = node cap for the new directory, carrying the parent cap's
+rights.
 
-**Errors**: as `FS_CREATE`.
+**Errors**: as `FS_CREATE`, except that `PERMISSION_DENIED` means only a
+missing `MUTATE_DIR`: a directory's cap keeps every parent right, so it
+is never empty.
 
 ---
 
@@ -550,12 +572,22 @@ intent; not yet implemented). Tracked as
 
 `FS_RENAME` is not atomic — see
 [`services/fs/fat/docs/crash-safety.md`](../fat/docs/crash-safety.md)
-for the post-crash visible states. The server does not roll a failed rename
-back, so an error reply can leave any of those states too, with the same
-cached-sector caveat as `FS_REMOVE`; once the cached view shows the source
-deleted, the driver drops the source's node, on success and on error. Rollback
-of a failed rename is tracked in
-[#447](https://github.com/kottlerg/seraph/issues/447).
+for the post-crash visible states. The driver inserts the destination
+entry, then removes the source as [`FS_REMOVE`](#label-14-fs_remove) does,
+and drops the source's node once the source is gone. An error inserting
+the destination is replied as it stands. When a block write of the
+source's removal fails, the driver settles the request by the source's 8.3
+slot as the device holds it, as `FS_REMOVE` does:
+
+- **Source still live**: the driver undoes the rename. It marks the
+  destination's slots deleted first, so a failure part-way leaves at
+  worst both names and never neither, then writes back the first bytes of
+  the source's LFN slots it marked, and replies the error (`IO_ERROR`).
+  The source keeps its node.
+- **Source deleted**: the rename took effect. The driver drops the
+  source's node and replies success.
+- **Slot unreadable**: the driver replies `IO_ERROR` without undoing
+  anything and drops the source's node. Both names may remain.
 
 **Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination
 occupied), `NO_SPACE`, `IO_ERROR` (malformed name lengths, an invalid name, a

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "logd-codec"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# `IpcMessage`: the handover chunk decoder reads the reply snapshot directly,
+# so its bounds checks are host-tested.
+ipc = { path = "../../../shared/ipc" }
+# `MSG_DATA_WORDS_MAX`: the encoders clip a payload to the message's data area.
+syscall-abi = { path = "../../../abi/syscall" }
+
+[lints]
+workspace = true

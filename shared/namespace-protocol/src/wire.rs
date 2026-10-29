@@ -50,17 +50,14 @@ pub enum NsError
     InvalidName = 5,
     /// Read offset is out of range for the addressed file.
     InvalidOffset = 6,
-    /// `NS_READ_MEMORY` reply target Memory cap is missing required
-    /// rights or has the wrong shape. Preserved from the existing
-    /// fs-frame protocol.
+    /// `FS_READ_MEMORY` reply target Memory cap is missing required
+    /// rights or has the wrong shape.
     InvalidMemoryCap = 7,
-    /// `NS_READ_MEMORY` cookie is invalid (e.g., zero, or duplicates an
-    /// outstanding cookie). Preserved from the existing fs-frame
-    /// protocol.
+    /// `FS_READ_MEMORY` cookie is invalid (e.g., zero, or duplicates an
+    /// outstanding cookie).
     InvalidCookie = 8,
     /// Page referenced by a held cookie has been evicted; the client
-    /// MUST drop the stale Memory cap and reissue. Preserved from the
-    /// existing fs-frame protocol.
+    /// MUST drop the stale Memory cap and reissue.
     Evicted = 9,
     /// Backend storage failed (disk read error, filesystem
     /// inconsistency, …).
@@ -91,8 +88,8 @@ mod tests
     #[test]
     fn error_codes_match_protocol_specification()
     {
-        // Stable wire codes per docs/namespace-model.md and the
-        // error table in shared/namespace-protocol/README.md.
+        // Stable wire codes per the error table in
+        // shared/namespace-protocol/README.md.
         // Reordering or renumbering breaks the wire contract; this
         // test is a guard against accidental edits.
         assert_eq!(NsError::NotFound.as_label(), 1);

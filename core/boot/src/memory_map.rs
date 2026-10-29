@@ -172,7 +172,7 @@ fn excluded_from_apertures(uefi_type: u32) -> bool
 /// Sweeps a cursor up from the seed's base: the lowest-starting excluded range
 /// that overlaps the rest of the seed bounds the next gap, and the cursor moves
 /// past that range's end, so every pass either emits the final gap or advances.
-fn subtract_excluded<I>(seed: MmioAperture, excluded: I, mut emit: impl FnMut(MmioAperture))
+fn subtract_excluded<I>(seed: MmioAperture, excluded: &I, mut emit: impl FnMut(MmioAperture))
 where
     I: Iterator<Item = (u64, u64)> + Clone,
 {
@@ -280,7 +280,7 @@ pub unsafe fn derive_mmio_apertures(
     {
         if s.size != 0
         {
-            subtract_excluded(*s, excluded.clone(), &mut push);
+            subtract_excluded(*s, &excluded, &mut push);
         }
     }
 
@@ -865,7 +865,7 @@ mod tests
     {
         let excluded = [(0x5000, 0x8000), (0x1000, 0x3000), (0x2000, 0x4000)];
         let mut got = Vec::new();
-        subtract_excluded(ap(0, 0xA000), excluded.iter().copied(), |a| got.push(a));
+        subtract_excluded(ap(0, 0xA000), &excluded.iter().copied(), |a| got.push(a));
         assert_eq!(
             pairs(&got),
             vec![(0, 0x1000), (0x4000, 0x1000), (0x8000, 0x2000)]

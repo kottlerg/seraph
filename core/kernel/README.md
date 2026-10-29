@@ -206,8 +206,7 @@ matches the syscall number to the subsystem handler.
 See [`docs/syscalls.md`](docs/syscalls.md). The audit classifying
 every cross-boundary output (syscall, IPC, fault, exit) for kernel-virtual-address
 disclosure is in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md);
-it records the open disclosures: the x86-64 fault-message `d2` present bit
-([#443](https://github.com/kottlerg/seraph/issues/443)) and the unpinned
+it records the open disclosures: the unpinned
 `SYS_THREAD_READ_REGS` trap-frame copy under a concurrent last-cap delete
 ([#502](https://github.com/kottlerg/seraph/issues/502)); and the exposures through
 donated memory, bootloader-reclaimed frames, and mirrored console output

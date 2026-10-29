@@ -103,6 +103,15 @@ pub struct TrapFrame
     pub fs_base: u64,
 }
 
+// ABI contract: `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` copy this struct
+// as the user register file, whose size and IP/SP offsets `abi/syscall`
+// publishes; userspace edits the frame at those offsets.
+const _: () = {
+    assert!(core::mem::size_of::<TrapFrame>() == syscall::REGS_X86_64_SIZE);
+    assert!(core::mem::offset_of!(TrapFrame, rip) == syscall::REGS_X86_64_IP_OFFSET);
+    assert!(core::mem::offset_of!(TrapFrame, rsp) == syscall::REGS_X86_64_SP_OFFSET);
+};
+
 // ── Syscall / IPC accessors ───────────────────────────────────────────────────
 
 impl TrapFrame

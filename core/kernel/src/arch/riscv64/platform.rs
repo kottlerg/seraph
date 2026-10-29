@@ -123,10 +123,11 @@ pub fn plic_base() -> u64
     v
 }
 
-/// PLIC MMIO window size, page-rounded.
-// Arch-private accessor for the bootloader-reported PLIC window size; no
-// current in-tree caller.
-#[allow(dead_code)]
+/// PLIC MMIO window size, page-rounded. Bounds the per-hart context registers
+/// `interrupts::init` and `interrupts::init_ap` program.
+// dead_code: host test builds compile out its only readers (interrupts::init
+// and init_ap).
+#[cfg_attr(test, allow(dead_code))]
 #[must_use]
 pub fn plic_size() -> u64
 {

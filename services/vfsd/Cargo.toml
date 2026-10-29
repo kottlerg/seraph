@@ -19,6 +19,9 @@ boot-protocol = { path = "../../abi/boot-protocol" }
 gpt = { path = "gpt", package = "vfsd-gpt" }
 ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
+# Pure host-tested synthetic-root tree (`VfsdRootBackend`); the `root_backend`
+# key keeps the in-crate path the module name it replaced.
+root_backend = { path = "root-backend", package = "vfsd-root-backend" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }
 

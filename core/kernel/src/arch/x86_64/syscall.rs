@@ -31,8 +31,12 @@
 //! immediately before `sysretq`.
 //!
 //! A return RIP with any of bits 63:47 set is never returned to with `sysretq`,
-//! which would fault in ring 0 after the swap; the thread is terminated as for
-//! an unhandled user #GP.
+//! which would fault in ring 0 after the swap. None can arise: the top user page
+//! is unmappable (`paging::user_va_top`), so the address after a `syscall` is
+//! canonical, and configure and `WRITE_REGS` reject a non-canonical RIP. The exit
+//! path checks anyway and terminates such a thread as for an unhandled user #GP,
+//! without delivery to a bound fault handler (core/kernel/docs/syscalls.md
+//! § Syscall Entry and Exit).
 //!
 //! We save R11 (user RFLAGS) to `PerCpuData::scratch` (`gs:[24]`) immediately,
 //! use R11 to shuttle user RSP to `PerCpuData::user_rsp` (`gs:[16]`), switch to
@@ -174,9 +178,9 @@ unsafe extern "C" fn syscall_entry()
 
         // ── Phase 4: restore registers for sysretq ────────────────────────
         // sysretq raises #GP in ring 0, on the user RSP and after the GS swap,
-        // when RCX is not canonical. A syscall from the last bytes of the user
-        // half returns to exactly such an address, so a return RIP with any of
-        // bits 63:47 set is terminated as a user #GP instead.
+        // when RCX is not canonical. With the top user page unmappable no
+        // syscall returns to such an address; a return RIP with any of bits
+        // 63:47 set (a kernel defect) is terminated as a user #GP instead.
         "mov rax, [rsp + 120]",
         "shr rax, 47",
         "jnz 3f",

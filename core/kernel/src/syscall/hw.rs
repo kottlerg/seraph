@@ -144,6 +144,13 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
         io.start
     };
+    // The root Interrupt cap spans the controller's whole id space
+    // (`ROOT_IRQ_COUNT`), which on riscv64 exceeds both the sources the kernel
+    // programs and the routing table; refuse an id the kernel cannot route.
+    if !(crate::arch::current::MIN_IRQ_ID..=crate::arch::current::MAX_IRQ_ID).contains(&irq_id)
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
 
     // Resolve Notification cap.
     // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
@@ -344,8 +351,9 @@ pub fn sys_mmio_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// On first bind, an 8 KiB per-thread IOPB bitmap is carved from the SEED
 /// Memory cap and all ports are denied (0xFF). The requested range bits are
 /// then cleared (0 = allowed). On context switch the bitmap is copied into
-/// the TSS IOPB region. The allocate-and-edit takes no lock on the target, so
-/// concurrent binds on one thread from different CPUs race (Issue #443).
+/// the TSS IOPB region. The install and the edit run under the target's
+/// `sched_lock`, which the context-switch load also holds, so concurrent binds
+/// on one thread accumulate their permits and leak no bitmap.
 ///
 /// On RISC-V: always returns `NotSupported` (no I/O port concept).
 ///
@@ -409,33 +417,6 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             (po.base, po.size)
         };
 
-        // Allocate per-thread IOPB on first bind. Sourced from the kernel
-        // SEED Memory cap; freed back to SEED on thread dealloc via the
-        // Thread arm of `dealloc_object`.
-        // The null check, the install, and the bit edits below take no lock
-        // on the target. Two binds on the same target from different CPUs can
-        // both see null and both allocate; the later store overwrites the
-        // earlier one, leaking a SEED scratch block and dropping the permits
-        // of a bind that returned Ok (defect, Issue #443).
-        // SAFETY: target_tcb validated non-null; iopb is null or a pointer
-        // installed by a prior bind. The read is unsynchronized (Issue #443).
-        if unsafe { (*target_tcb).iopb.is_null() }
-        {
-            let raw = crate::cap::retype::alloc_seed_scratch(gdt::IOPB_SIZE as u64)?;
-            // SAFETY: raw points at a freshly-carved IOPB-sized block in
-            // SEED's region, not aliased. The unlocked store can overwrite a
-            // block a concurrent bind installed (Issue #443).
-            unsafe {
-                core::ptr::write_bytes(raw, 0xFFu8, gdt::IOPB_SIZE);
-                // cast_ptr_alignment: `[u8; IOPB_SIZE]` has alignment 1, so any
-                // byte pointer from alloc_seed_scratch is suitably aligned.
-                #[allow(clippy::cast_ptr_alignment)]
-                {
-                    (*target_tcb).iopb = raw.cast::<[u8; gdt::IOPB_SIZE]>();
-                }
-            }
-        }
-
         // Clear the bits for the requested port range (0 = allow).
         // size == 0 encodes the full 64K range (u16 cannot hold 65536).
         let effective_size = if port_size == 0
@@ -446,23 +427,67 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             u32::from(port_size)
         };
-        // SAFETY: iopb is non-null after the allocation above; target_tcb validated.
-        unsafe {
-            gdt::permit_port_range(
-                &mut *(*target_tcb).iopb,
-                u32::from(port_base),
-                effective_size,
-            );
+
+        // The per-thread IOPB is allocated on first bind from the kernel SEED
+        // Memory cap and freed back to SEED on thread dealloc via the Thread arm
+        // of `dealloc_object`. The pointer and the bitmap's bytes are owned by
+        // the target's `sched_lock` (core/kernel/docs/scheduling-internals.md §
+        // Cross-CPU TCB Ownership, Address-space / capability row), which
+        // `schedule()` also holds when it loads the bitmap into a CPU's TSS. The
+        // SEED allocation is not made under that lock: a first bind peeks under
+        // it, allocates outside it, and installs under it only if the slot is
+        // still empty; a concurrent bind that installed first wins, and the
+        // loser's block goes back to SEED.
+        // SAFETY: target_tcb validated non-null; lock_raw/unlock_raw paired.
+        let needs_iopb = unsafe {
+            let saved = (*target_tcb).sched_lock.lock_raw();
+            let empty = (*target_tcb).iopb.is_null();
+            (*target_tcb).sched_lock.unlock_raw(saved);
+            empty
+        };
+        let mut fresh: *mut [u8; gdt::IOPB_SIZE] = core::ptr::null_mut();
+        if needs_iopb
+        {
+            let raw = crate::cap::retype::alloc_seed_scratch(gdt::IOPB_SIZE as u64)?;
+            // SAFETY: raw points at a freshly-carved IOPB-sized block in
+            // SEED's region, not aliased.
+            unsafe { core::ptr::write_bytes(raw, 0xFFu8, gdt::IOPB_SIZE) };
+            // cast_ptr_alignment: `[u8; IOPB_SIZE]` has alignment 1, so any
+            // byte pointer from alloc_seed_scratch is suitably aligned.
+            #[allow(clippy::cast_ptr_alignment)]
+            {
+                fresh = raw.cast::<[u8; gdt::IOPB_SIZE]>();
+            }
         }
 
-        // If binding to the currently running thread, reload the TSS IOPB
-        // immediately so in/out instructions work without a context switch.
-        if target_tcb == caller_tcb
-        {
-            // SAFETY: iopb non-null after allocation; target_tcb validated.
-            unsafe {
-                gdt::load_iopb(Some(&*(*target_tcb).iopb));
+        // SAFETY: target_tcb validated non-null; under its sched_lock, iopb is
+        // null or a live block installed by a bind, and `fresh` (when non-null)
+        // is ours alone; lock_raw/unlock_raw paired, interrupts disabled between.
+        unsafe {
+            let saved = (*target_tcb).sched_lock.lock_raw();
+            if (*target_tcb).iopb.is_null() && !fresh.is_null()
+            {
+                (*target_tcb).iopb = fresh;
+                fresh = core::ptr::null_mut();
             }
+            let iopb = (*target_tcb).iopb;
+            if !iopb.is_null()
+            {
+                gdt::permit_port_range(&mut *iopb, u32::from(port_base), effective_size);
+                // Binding the running thread: reload this CPU's TSS IOPB so in/out
+                // instructions work without a context switch.
+                if target_tcb == caller_tcb
+                {
+                    gdt::load_iopb(Some(&*iopb));
+                }
+            }
+            (*target_tcb).sched_lock.unlock_raw(saved);
+        }
+
+        // A concurrent bind installed its bitmap first: return ours to SEED.
+        if !fresh.is_null()
+        {
+            crate::cap::retype::free_seed_scratch(fresh.cast::<u8>(), gdt::IOPB_SIZE as u64);
         }
 
         Ok(0)

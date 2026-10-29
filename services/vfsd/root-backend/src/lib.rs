@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/vfsd/src/root_backend.rs
+// services/vfsd/root-backend/src/lib.rs
 
 //! Synthetic system-root [`NamespaceBackend`] composed at boot time.
 //!
@@ -34,6 +34,12 @@
 //! The synthetic root (`NodeId::ROOT`) is itself a tree node whose
 //! `fallthrough_cap` is the root mount cap captured when
 //! `MOUNT path="/"` succeeds.
+//!
+//! The tree holds cap slot numbers but makes no syscall, so the crate is
+//! pure and host-tested — see
+//! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
+
+#![cfg_attr(not(test), no_std)]
 
 use namespace_protocol::{
     EntryName, EntryTarget, EntryView, MemoryReply, NamespaceBackend, NamespaceRights, NodeId,
@@ -62,20 +68,20 @@ const NONE: u32 = u32::MAX;
 /// corresponding directory in the root filesystem; the synthetic
 /// root's `fallthrough_cap` is the root mount cap itself.
 #[derive(Copy, Clone)]
-pub struct TreeNode
+struct TreeNode
 {
-    pub name: [u8; MAX_ENTRY_NAME],
-    pub name_len: u8,
-    pub parent: u32,
-    pub first_child: u32,
-    pub next_sibling: u32,
+    name: [u8; MAX_ENTRY_NAME],
+    name_len: u8,
+    parent: u32,
+    first_child: u32,
+    next_sibling: u32,
     /// Unbadged SEND on the mounted driver's namespace endpoint,
     /// captured at MOUNT time. Non-zero on terminal (mount-point)
     /// nodes, zero on synthetic intermediates. Each `NS_LOOKUP` that
     /// crosses this mount mints a freshly-attenuated badged SEND from
     /// it (see `EntryTarget::External`); the endpoint is held here and
     /// never handed out directly.
-    pub terminal_endpoint: u32,
+    terminal_endpoint: u32,
     /// Badged SEND on the root mount's namespace endpoint addressing
     /// the directory at the path corresponding to this node, used to
     /// forward unmatched `NS_LOOKUP` requests so root-fs entries
@@ -83,13 +89,13 @@ pub struct TreeNode
     /// such fall-through is available (the path does not exist in the
     /// root filesystem, or the root mount has not been installed yet).
     /// On `NodeId::ROOT` this field carries the root mount cap.
-    pub fallthrough_cap: u32,
-    pub active: bool,
+    fallthrough_cap: u32,
+    active: bool,
 }
 
 impl TreeNode
 {
-    pub const fn empty() -> Self
+    const fn empty() -> Self
     {
         Self {
             name: [0; MAX_ENTRY_NAME],
@@ -123,8 +129,8 @@ pub struct VfsdRootBackend
 /// after walking the root mount component-by-component.
 pub struct InstallResult
 {
-    pub new_intermediates: [u32; MAX_TREE_NODES],
-    pub new_intermediates_len: usize,
+    new_intermediates: [u32; MAX_TREE_NODES],
+    new_intermediates_len: usize,
 }
 
 impl InstallResult
@@ -148,14 +154,26 @@ impl InstallResult
         true
     }
 
+    /// Pool indices of the synthetic intermediates the install created.
+    #[must_use]
     pub fn as_slice(&self) -> &[u32]
     {
         &self.new_intermediates[..self.new_intermediates_len]
     }
 }
 
+impl Default for VfsdRootBackend
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
+}
+
 impl VfsdRootBackend
 {
+    /// An empty tree: only the synthetic root, with no root mount.
+    #[must_use]
     pub const fn new() -> Self
     {
         let mut nodes = [TreeNode::empty(); MAX_TREE_NODES];
@@ -183,100 +201,115 @@ impl VfsdRootBackend
     /// compute and store each intermediate's `fallthrough_cap` via
     /// [`Self::set_fallthrough_cap`].
     ///
-    /// Returns `None` on tree exhaustion, oversize component
-    /// (`> MAX_ENTRY_NAME`), attempting to mount on top of an
-    /// already-terminal node, or re-installing the root mount.
+    /// Returns `None`, leaving the tree unchanged, on tree exhaustion,
+    /// oversize component (`> MAX_ENTRY_NAME`), attempting to mount on
+    /// top of an already-terminal node, or re-installing the root mount
+    /// (see [`Self::can_install`]).
     pub fn install(&mut self, path: &[u8], cap: u32) -> Option<InstallResult>
     {
-        let stripped = path.strip_prefix(b"/").unwrap_or(path);
-        if stripped.is_empty()
-        {
-            if self.nodes[0].fallthrough_cap != 0
-            {
-                // Root is already mounted; reject rather than overwrite
-                // the cap and leak the running root fs driver.
-                return None;
-            }
-            self.nodes[0].fallthrough_cap = cap;
-            return Some(InstallResult::empty());
-        }
+        // Validate the whole path, and that the pool has a free node for
+        // every component the walk must create, before mutating anything.
+        self.plan_install(path)?;
 
-        // Count components; rejects oversize ones up front so the tree
-        // is never partially mutated on a failure.
-        let mut total = 0usize;
-        for component in stripped.split(|&b| b == b'/')
+        let mut components = path_components(path).peekable();
+        if components.peek().is_none()
         {
-            if component.is_empty()
-            {
-                continue;
-            }
-            if component.len() > MAX_ENTRY_NAME
-            {
-                return None;
-            }
-            total += 1;
-        }
-        if total == 0
-        {
-            // Path was something like `///` — treat as root.
-            if self.nodes[0].fallthrough_cap != 0
-            {
-                return None;
-            }
             self.nodes[0].fallthrough_cap = cap;
             return Some(InstallResult::empty());
         }
 
         let mut result = InstallResult::empty();
         let mut current: u32 = 0;
-        let mut i = 0;
-        for component in stripped.split(|&b| b == b'/')
+        while let Some(component) = components.next()
         {
-            if component.is_empty()
-            {
-                continue;
-            }
-            let is_last = i == total - 1;
-            i += 1;
-
+            let is_last = components.peek().is_none();
             if let Some(child) = self.find_child(current, component)
             {
                 if is_last
                 {
-                    if self.nodes[child as usize].terminal_endpoint != 0
-                    {
-                        // Path is already a mount point.
-                        return None;
-                    }
                     self.nodes[child as usize].terminal_endpoint = cap;
                 }
                 current = child;
+                continue;
             }
-            else
+            // `plan_install` counted a free node for this component.
+            let new_idx = self.alloc_slot()?;
+            let parent_first_child = self.nodes[current as usize].first_child;
+            let n = &mut self.nodes[new_idx as usize];
+            n.active = true;
+            n.parent = current;
+            n.name[..component.len()].copy_from_slice(component);
+            // cast_possible_truncation: `plan_install` bounded the
+            // component to MAX_ENTRY_NAME (64) bytes, which fits a u8.
+            #[allow(clippy::cast_possible_truncation)]
             {
-                let new_idx = self.alloc_slot()?;
-                let parent_first_child = self.nodes[current as usize].first_child;
-                let n = &mut self.nodes[new_idx as usize];
-                n.active = true;
-                n.parent = current;
-                n.name[..component.len()].copy_from_slice(component);
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    n.name_len = component.len() as u8;
-                }
-                n.first_child = NONE;
-                n.next_sibling = parent_first_child;
-                n.terminal_endpoint = if is_last { cap } else { 0 };
-                n.fallthrough_cap = 0;
-                self.nodes[current as usize].first_child = new_idx;
-                if !is_last && !result.push(new_idx)
-                {
-                    return None;
-                }
-                current = new_idx;
+                n.name_len = component.len() as u8;
             }
+            n.first_child = NONE;
+            n.next_sibling = parent_first_child;
+            n.terminal_endpoint = if is_last { cap } else { 0 };
+            n.fallthrough_cap = 0;
+            self.nodes[current as usize].first_child = new_idx;
+            // The pool has MAX_TREE_NODES - 1 allocatable nodes, so the
+            // MAX_TREE_NODES-entry result list cannot overflow.
+            if !is_last && !result.push(new_idx)
+            {
+                return None;
+            }
+            current = new_idx;
         }
         Some(result)
+    }
+
+    /// Whether [`Self::install`] would accept `path` against the current
+    /// tree: the root is not yet mounted (for `/`), no component exceeds
+    /// `MAX_ENTRY_NAME`, the final node is not already a mount point,
+    /// and the pool has a free node for every component that must be
+    /// created. The MOUNT path checks this before it registers a
+    /// partition or spawns a driver, so a mount `install` would reject
+    /// acquires nothing.
+    #[must_use]
+    pub fn can_install(&self, path: &[u8]) -> bool
+    {
+        self.plan_install(path).is_some()
+    }
+
+    /// Read-only walk behind [`Self::install`] and [`Self::can_install`]:
+    /// the number of tree nodes installing `path` would create, or `None`
+    /// when `install` must reject it.
+    fn plan_install(&self, path: &[u8]) -> Option<usize>
+    {
+        let mut components = path_components(path).peekable();
+        if components.peek().is_none()
+        {
+            // Root mount: reject a second one rather than overwrite the
+            // cap and leak the running root fs driver.
+            return (self.nodes[0].fallthrough_cap == 0).then_some(0);
+        }
+
+        // `existing` is the node the walk is at while every component so
+        // far names an existing node; once one does not, the rest are new.
+        let mut existing = Some(0u32);
+        let mut new_nodes = 0usize;
+        for component in components
+        {
+            if component.len() > MAX_ENTRY_NAME
+            {
+                return None;
+            }
+            existing = existing.and_then(|idx| self.find_child(idx, component));
+            if existing.is_none()
+            {
+                new_nodes += 1;
+            }
+        }
+        if let Some(last) = existing
+            && self.nodes[last as usize].terminal_endpoint != 0
+        {
+            // Path is already a mount point.
+            return None;
+        }
+        (new_nodes <= self.free_node_count()).then_some(new_nodes)
     }
 
     /// Set a synthetic intermediate's `fallthrough_cap`. Called by the
@@ -419,6 +452,12 @@ impl VfsdRootBackend
         count
     }
 
+    /// Number of inactive pool nodes `alloc_slot` can still hand out.
+    fn free_node_count(&self) -> usize
+    {
+        self.nodes.iter().skip(1).filter(|n| !n.active).count()
+    }
+
     fn alloc_slot(&self) -> Option<u32>
     {
         // Skip index 0 — that's the synthetic root.
@@ -426,6 +465,8 @@ impl VfsdRootBackend
         {
             if !n.active
             {
+                // cast_possible_truncation: `i < MAX_TREE_NODES` (32), so the
+                // index fits a u32.
                 #[allow(clippy::cast_possible_truncation)]
                 return Some(i as u32);
             }
@@ -453,6 +494,13 @@ impl VfsdRootBackend
         }
         None
     }
+}
+
+/// The non-empty `/`-separated components of a mount path; `/`, the empty
+/// path, and all-separator paths such as `///` yield none (the root).
+fn path_components(path: &[u8]) -> impl Iterator<Item = &[u8]>
+{
+    path.split(|&b| b == b'/').filter(|c| !c.is_empty())
 }
 
 impl NamespaceBackend for VfsdRootBackend
@@ -558,4 +606,218 @@ impl NamespaceBackend for VfsdRootBackend
     fn release_memory(&mut self, _file: NodeId, _cookie: u64) {}
 
     fn close(&mut self, _node: NodeId) {}
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// Cap value standing in for a driver endpoint; the tree only stores it.
+    const CAP: u32 = 7;
+
+    #[test]
+    fn a_second_root_mount_is_rejected_and_keeps_the_first()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/", CAP).is_some());
+        assert!(!b.can_install(b"/"));
+        assert!(!b.can_install(b"///"));
+        assert!(b.install(b"///", CAP + 1).is_none());
+        assert_eq!(b.root_mount_cap(), CAP);
+    }
+
+    #[test]
+    fn mounting_on_an_existing_mount_point_is_rejected()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", CAP).is_some());
+        assert!(!b.can_install(b"/esp"));
+        assert!(b.install(b"/esp", CAP + 1).is_none());
+        assert_eq!(b.local_child_count(0), 1);
+    }
+
+    #[test]
+    fn a_component_longer_than_the_name_limit_is_rejected()
+    {
+        let mut b = VfsdRootBackend::new();
+        let mut path = vec![b'/'];
+        path.extend(core::iter::repeat_n(b'a', MAX_ENTRY_NAME + 1));
+        assert!(!b.can_install(&path));
+        assert!(b.install(&path, CAP).is_none());
+        path.truncate(1 + MAX_ENTRY_NAME);
+        assert!(b.can_install(&path));
+    }
+
+    #[test]
+    fn an_install_the_pool_cannot_hold_leaves_the_tree_unchanged()
+    {
+        let mut b = VfsdRootBackend::new();
+        // Fill all but one of the MAX_TREE_NODES - 1 allocatable nodes.
+        for i in 0..MAX_TREE_NODES - 2
+        {
+            assert!(b.install(format!("/m{i}").as_bytes(), CAP).is_some());
+        }
+        // `/x/y` needs two nodes; one is free.
+        assert!(!b.can_install(b"/x/y"));
+        assert!(b.install(b"/x/y", CAP).is_none());
+        assert!(!b.has_local_child(0, b"x"));
+        assert_eq!(b.local_child_count(0), (MAX_TREE_NODES - 2) as u32);
+        assert!(b.install(b"/x", CAP).is_some());
+    }
+
+    #[test]
+    fn a_multi_component_install_reports_its_new_intermediates()
+    {
+        let mut b = VfsdRootBackend::new();
+        let result = b.install(b"/a/b/c", CAP).expect("install fits");
+        let mut paths = Vec::new();
+        for &idx in result.as_slice()
+        {
+            let mut buf = [0u8; 64];
+            let len = b.path_of(idx, &mut buf).expect("intermediate has a path");
+            paths.push(buf[..len].to_vec());
+        }
+        paths.sort();
+        assert_eq!(paths, vec![b"/a".to_vec(), b"/a/b".to_vec()]);
+        // A sibling under the existing intermediate creates only its leaf.
+        assert_eq!(
+            b.install(b"/a/b/d", CAP).map(|r| r.as_slice().len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn an_existing_intermediate_can_become_a_mount_point()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/a/b", CAP).is_some());
+        assert!(b.can_install(b"/a"));
+        assert!(b.install(b"/a", CAP).is_some());
+        assert!(!b.can_install(b"/a"));
+    }
+
+    /// Pool index of the intermediate `/a` an install of `/a/b` creates.
+    fn intermediate_a(b: &mut VfsdRootBackend) -> u32
+    {
+        let result = b.install(b"/a/b", CAP).expect("install fits");
+        result.as_slice()[0]
+    }
+
+    #[test]
+    fn lookup_of_a_mount_point_crosses_to_the_peer_root()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", CAP).is_some());
+        let view = b.lookup(NodeId::ROOT, b"esp").expect("mount point found");
+        assert_eq!(
+            view.target,
+            EntryTarget::External {
+                endpoint: CAP,
+                node: NodeId::ROOT,
+            }
+        );
+    }
+
+    #[test]
+    fn lookup_of_an_intermediate_stays_on_the_synthetic_root()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        let view = b.lookup(NodeId::ROOT, b"a").expect("intermediate found");
+        assert_eq!(
+            view.target,
+            EntryTarget::Local(NodeId::from_raw_truncated(u64::from(a)))
+        );
+    }
+
+    #[test]
+    fn lookup_of_a_missing_name_is_not_found()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", CAP).is_some());
+        assert_eq!(
+            b.lookup(NodeId::ROOT, b"data").err(),
+            Some(NsError::NotFound)
+        );
+    }
+
+    #[test]
+    fn lookup_in_an_unresolvable_directory_is_not_a_directory()
+    {
+        let mut b = VfsdRootBackend::new();
+        let inactive = NodeId::from_raw_truncated(5);
+        assert_eq!(b.lookup(inactive, b"x").err(), Some(NsError::NotADirectory));
+    }
+
+    #[test]
+    fn readdir_lists_each_child_then_ends()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", CAP).is_some());
+        assert!(b.install(b"/data", CAP).is_some());
+        let mut names = Vec::new();
+        for i in 0..2
+        {
+            let entry = b.readdir_entry(NodeId::ROOT, i).expect("root resolves");
+            names.push(entry.expect("entry present").as_bytes().to_vec());
+        }
+        names.sort();
+        assert_eq!(names, vec![b"data".to_vec(), b"esp".to_vec()]);
+        assert_eq!(b.readdir_entry(NodeId::ROOT, 2), Ok(None));
+    }
+
+    #[test]
+    fn readdir_of_an_unresolvable_directory_is_not_a_directory()
+    {
+        let mut b = VfsdRootBackend::new();
+        let out_of_range = NodeId::from_raw_truncated(MAX_TREE_NODES as u64);
+        assert_eq!(
+            b.readdir_entry(out_of_range, 0),
+            Err(NsError::NotADirectory)
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_out_of_range_and_inactive_nodes()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        assert_eq!(b.resolve(NodeId::from_raw_truncated(u64::from(a))), Some(a));
+        assert_eq!(
+            b.resolve(NodeId::from_raw_truncated(MAX_TREE_NODES as u64)),
+            None
+        );
+        assert_eq!(b.resolve(NodeId::from_raw_truncated(30)), None);
+    }
+
+    #[test]
+    fn path_of_rejects_a_short_buffer_and_an_inactive_node()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        assert_eq!(b.path_of(a, &mut [0u8; 1]), None);
+        assert_eq!(b.path_of(0, &mut []), None);
+        assert_eq!(b.path_of(30, &mut [0u8; 64]), None);
+    }
+
+    #[test]
+    fn path_of_the_root_is_a_single_slash()
+    {
+        let b = VfsdRootBackend::new();
+        let mut buf = [0u8; 64];
+        assert_eq!(b.path_of(0, &mut buf), Some(1));
+        assert_eq!(buf[0], b'/');
+    }
+
+    #[test]
+    fn set_fallthrough_cap_applies_only_to_an_active_node()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        b.set_fallthrough_cap(a, CAP);
+        assert_eq!(b.fallthrough_of(a), CAP);
+        b.set_fallthrough_cap(30, CAP);
+        assert_eq!(b.fallthrough_of(30), 0);
+    }
 }

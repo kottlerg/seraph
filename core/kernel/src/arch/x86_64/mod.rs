@@ -29,17 +29,15 @@ pub const ARCH_NAME: &str = "x86_64";
 pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_X86_64;
 
 /// Maximum GSI (Global System Interrupt) number the IRQ id range admits on x86-64 (255,
-/// matching `irq::MAX_IRQ`). The IDT dispatches only GSIs 0-22 (`idt::irq_dispatch`).
-///
-/// Part of the arch-interface contract; no current in-tree consumer.
-#[allow(dead_code)]
+/// matching `irq::MAX_IRQ`); `SYS_IRQ_REGISTER` refuses an id above it. The IDT
+/// dispatches only GSIs 0-22 (`idt::irq_dispatch`).
 pub const MAX_IRQ_ID: u32 = 255;
 
 /// Minimum valid GSI number on x86-64. GSI 0 (PIT timer) is a legitimate
 /// platform resource; nothing is reserved at the low end.
-// dead_code: arch-interface constant (core/kernel/docs/arch-interface.md § Module-level
-// constants and free functions); no current in-tree consumer.
-#[allow(dead_code)]
+// dead_code: host test builds compile out its readers (`sys_irq_register`,
+// `dealloc_object_one`).
+#[cfg_attr(test, allow(dead_code))]
 pub const MIN_IRQ_ID: u32 = 0;
 
 /// x86-64 has I/O port space; `IoPort` resources are valid here.

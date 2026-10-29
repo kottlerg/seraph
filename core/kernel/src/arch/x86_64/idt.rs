@@ -23,7 +23,9 @@
 //!
 //! # Entry and exit discipline
 //! Every stub that runs kernel code clears DF and AC (`cld`, `clac`) on entry and
-//! runs that code on the kernel GS base. The normal stubs swap GS when the saved
+//! runs that code on the kernel GS base; in debug builds the exception, `#PF`,
+//! `#NM`, and IRQ handler bodies assert AC, DF and TF clear first
+//! (`cpu::debug_assert_kernel_entry_flags`). The normal stubs swap GS when the saved
 //! CS is ring 3 (`entry_swapgs_asm` / `exit_swapgs_asm`, and the ring-3 path of
 //! `common_irq_trampoline`). The paranoid stubs (NMI, `#DB`, `#DF`, `#MC`) can
 //! arrive between a ring-3 entry and its `swapgs`, so they decide the swap from
@@ -292,14 +294,17 @@ macro_rules! entry_swapgs_asm {
 /// to the user GS base when returning to ring 3 (the iret frame's CS at
 /// `[rsp + $cs]` has a non-zero RPL). Interrupts stay off from the swap to the
 /// `iretq` (which restores the interrupted context's IF), and the `iretq` itself
-/// does not fault: every ring-3 return carries a canonical user RIP and RSP
-/// (`sys_thread_configure` rejects a non-user entry or stack,
-/// `SYS_THREAD_WRITE_REGS` sanitizes the frame via
-/// `TrapFrame::sanitize_for_user_resume`, the RIP the hardware saves on a ring-3
-/// interrupt or trap is canonical because `paging::user_va_top` keeps the top
-/// user page unmappable, so no user instruction ends at the canonical boundary,
-/// and `syscall_entry` diverts a non-canonical return RIP to a user `#GP`
-/// instead of `sysretq`) and kernel-set CS and SS selectors. So no stub can
+/// does not fault. A 64-bit `iretq` raises `#GP` in ring 0 only on a
+/// non-canonical return RIP or an invalid CS or SS selector; it does not check
+/// the RSP it pops (Intel SDM Vol. 2A, IRET), so a non-canonical user RSP faults
+/// in ring 3, at the thread's first stack access. Every ring-3 return carries
+/// kernel-set CS and SS selectors and a canonical user RIP:
+/// `sys_thread_configure` rejects a non-user entry or stack, `SYS_THREAD_WRITE_REGS`
+/// sanitizes the frame via `TrapFrame::sanitize_for_user_resume`, the RIP the
+/// hardware saves on a ring-3 interrupt or trap is canonical because
+/// `paging::user_va_top` keeps the top user page unmappable, so no user
+/// instruction ends at the canonical boundary, and `syscall_entry` diverts a
+/// non-canonical return RIP to a user `#GP` instead of `sysretq`. So no stub can
 /// enter with a ring-0 frame on the user GS base.
 #[cfg(not(test))]
 macro_rules! exit_swapgs_asm {
@@ -550,6 +555,7 @@ pub(super) unsafe extern "C" fn common_exception_handler(
 #[cfg(not(test))]
 extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64)
 {
+    super::cpu::debug_assert_kernel_entry_flags();
     // SAFETY: tf is constructed by common_exception_trampoline or
     // paranoid_exception_trampoline on this stack.
     let f = unsafe { &*tf };
@@ -902,6 +908,7 @@ pub(super) unsafe fn publish_user_frame(frame: *mut TrapFrame)
 #[cfg(not(test))]
 extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
 {
+    super::cpu::debug_assert_kernel_entry_flags();
     if !user_frame.is_null()
     {
         // SAFETY: the ring-3 trampoline path passes the frame it built on the
@@ -1134,6 +1141,7 @@ unsafe extern "C" fn isr_nm()
 #[cfg(not(test))]
 extern "C" fn nm_handler()
 {
+    super::cpu::debug_assert_kernel_entry_flags();
     crate::percpu::preempt_disable();
 
     let cpu = super::cpu::current_cpu() as usize;
@@ -1257,6 +1265,8 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
     const ERR_WRITE: u64 = 1 << 1;
     const ERR_RSVD: u64 = 1 << 3;
     const ERR_INSTR: u64 = 1 << 4;
+
+    super::cpu::debug_assert_kernel_entry_flags();
 
     // SAFETY: tf is constructed by isr_page_fault on this stack.
     let f = unsafe { &*tf };

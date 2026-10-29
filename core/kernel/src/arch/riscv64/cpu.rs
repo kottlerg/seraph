@@ -402,6 +402,45 @@ pub unsafe fn restore_interrupts(saved: u64)
     }
 }
 
+// ── Kernel-entry flags check ──────────────────────────────────────────────────
+
+/// `sstatus.SUM` (bit 18): S-mode access to U-mode pages.
+const SSTATUS_SUM: u64 = 1 << 18;
+
+/// Read `sstatus`.
+///
+/// Clobbers only the output register; touches no memory. Assumes S-mode.
+#[cfg(not(test))]
+#[inline]
+fn read_sstatus() -> u64
+{
+    let sstatus: u64;
+    // SAFETY: csrr sstatus is a privileged S-mode read with no side effect.
+    unsafe {
+        core::arch::asm!("csrr {0}, sstatus", out(reg) sstatus, options(nostack, nomem));
+    }
+    sstatus
+}
+
+/// Debug-build check, at syscall dispatch, that `sstatus.SUM` is clear: the
+/// RISC-V analogue of the x86-64 RFLAGS AC/DF/TF check. An `ecall` from U-mode
+/// runs with the `sstatus` the thread resumed under, which
+/// `TrapFrame::sanitize_for_user_resume` and the first-entry value keep SUM-clear,
+/// and only the user-copy routines open a SUM window, so a set SUM here is a
+/// regression that lets kernel code touch user pages outside them. Not checked
+/// on other trap entries: a trap taken from S-mode inside a user-copy window
+/// carries SUM legitimately. A no-op in release builds (the CSR read is not
+/// performed).
+#[cfg(not(test))]
+#[inline]
+pub fn debug_assert_kernel_entry_flags()
+{
+    debug_assert!(
+        read_sstatus() & SSTATUS_SUM == 0,
+        "kernel entry: sstatus.SUM set at syscall dispatch"
+    );
+}
+
 // ── Interrupt control ─────────────────────────────────────────────────────────
 
 /// Disable supervisor-mode interrupts via sstatus.SIE.

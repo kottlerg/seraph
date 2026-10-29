@@ -541,6 +541,15 @@ pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
 /// Map a faulting PC to the `copy_user` recovery fixup, or `None`. Consulted by
 /// the page-fault handler on a kernel-mode fault to redirect into the fixup.
 pub fn user_copy_fixup(pc: u64) -> Option<u64>;
+
+/// Debug-build check that the user-controlled privileged state a kernel entry
+/// must clear is clear; a no-op in release builds. x86-64 asserts RFLAGS AC,
+/// DF and TF clear (SFMASK and the IDT stubs' `cld` / `clac` establish it) and
+/// is called first in `syscall::dispatch` and the IDT handler bodies. RISC-V
+/// asserts `sstatus.SUM` clear, the analogue (SUM, like AC, lifts the
+/// supervisor-access block on user pages), and is called at syscall dispatch
+/// only: a trap taken from S-mode inside a `copy_user` window carries SUM.
+pub fn debug_assert_kernel_entry_flags();
 ```
 
 The required/opportunistic/unsupported classification and what each arch gates are in

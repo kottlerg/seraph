@@ -21,8 +21,9 @@
 //! On SYSCALL: hardware saves RIP→RCX, RFLAGS→R11, and clears the RFLAGS bits
 //! in SFMASK, so the kernel runs with IF, TF, DF and AC clear whatever the user
 //! set (AC clear keeps SMAP enforced; DF clear is the string-instruction
-//! direction `copy_user` relies on). It loads CS and SS from STAR; RSP, DS, ES,
-//! FS and GS are NOT changed by the hardware.
+//! direction `copy_user` relies on); in debug builds `syscall::dispatch` asserts
+//! TF, DF and AC clear first (`cpu::debug_assert_kernel_entry_flags`). It loads
+//! CS and SS from STAR; RSP, DS, ES, FS and GS are NOT changed by the hardware.
 //!
 //! The stub's first instruction is `swapgs`: while user code runs, the per-CPU
 //! pointer lives in `IA32_KERNEL_GS_BASE` and the active GS base is the user's,
@@ -60,12 +61,12 @@ const IA32_SFMASK: u32 = 0xC000_0084;
 
 const EFER_SCE: u64 = 1 << 0;
 
-const RFLAGS_TF: u64 = 1 << 8;
+pub(super) const RFLAGS_TF: u64 = 1 << 8;
 const RFLAGS_IF: u64 = 1 << 9;
-const RFLAGS_DF: u64 = 1 << 10;
+pub(super) const RFLAGS_DF: u64 = 1 << 10;
 const RFLAGS_IOPL: u64 = 3 << 12;
 const RFLAGS_NT: u64 = 1 << 14;
-const RFLAGS_AC: u64 = 1 << 18;
+pub(super) const RFLAGS_AC: u64 = 1 << 18;
 
 /// RFLAGS bits SYSCALL clears on entry: interrupts stay off until the kernel
 /// enables them, and no user-set trap, direction, alignment-check (SMAP

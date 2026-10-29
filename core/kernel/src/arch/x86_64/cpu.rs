@@ -10,7 +10,8 @@
 //!
 //! `current_stack_pointer`, the CR4/MSR accessors, `x2apic_wrmsr_fence`, `copy_user`,
 //! `user_copy_fixup`, the enable routines, `verify_baseline`, `install_percpu`, and the
-//! trap-stack and interrupt save/restore primitives are built only under
+//! trap-stack and interrupt save/restore primitives, and the kernel-entry flags check
+//! are built only under
 //! `#[cfg(not(test))]` (`copy_user` and `verify_baseline` have host stubs). `cpuid`,
 //! `current_cpu` (which returns 0 under test), `halt_until_interrupt`,
 //! `disable_interrupts`, and `halt_loop` are also built for host tests.
@@ -622,6 +623,46 @@ pub unsafe fn restore_interrupts(saved: u64)
             flags = in(reg) saved,
         );
     }
+}
+
+// ── Kernel-entry flags check ──────────────────────────────────────────────────
+
+/// Read RFLAGS.
+///
+/// Clobbers only the output register; `pushfq` writes 8 bytes below RSP and the
+/// `pop` reads them back (net RSP delta zero), so `nostack` is absent for the
+/// reason [`save_and_disable_interrupts`] gives. Assumes ring 0 (any ring can
+/// read RFLAGS; the kernel calls this only from kernel entry).
+#[cfg(not(test))]
+#[inline]
+fn read_rflags() -> u64
+{
+    let flags: u64;
+    // SAFETY: pushfq/pop reads RFLAGS into a register and changes no state
+    // beyond the transient stack slot it pops back.
+    unsafe {
+        core::arch::asm!("pushfq", "pop {flags}", flags = out(reg) flags);
+    }
+    flags
+}
+
+/// Debug-build check that the user-controlled RFLAGS bits a ring-3 entry must
+/// clear are clear while the kernel runs: AC (SMAP override), DF (string
+/// direction) and TF (single-step). `IA32_SFMASK` clears them on SYSCALL, and
+/// every ring-3-reachable IDT stub runs `cld` and `clac` (TF is cleared by the
+/// interrupt or trap gate), so a set bit here is a regression in that entry
+/// discipline. Called first in `syscall::dispatch` and in the IDT handler
+/// bodies. A no-op in release builds (the RFLAGS read is not performed).
+#[cfg(not(test))]
+#[inline]
+pub fn debug_assert_kernel_entry_flags()
+{
+    const MUST_BE_CLEAR: u64 =
+        super::syscall::RFLAGS_AC | super::syscall::RFLAGS_DF | super::syscall::RFLAGS_TF;
+    debug_assert!(
+        read_rflags() & MUST_BE_CLEAR == 0,
+        "kernel entry: RFLAGS AC, DF or TF set in ring 0"
+    );
 }
 
 // ── Interrupts (hardware state) ───────────────────────────────────────────────

@@ -89,7 +89,9 @@
 //! Required, per phase: every wait returned `Interrupted` or
 //! `InvalidCapability` (nothing is ever delivered); every racer action
 //! returned an accepted result (a stop `Ok` or `InvalidState`, a Thread
-//! delete `Ok`), and every restart after an `Ok` stop returned `Ok`; in a
+//! delete `Ok`), and every restart after an `Ok` stop returned `Ok`, or `InvalidArgument`
+//! on a waiter the stop caught inside its exit syscall, whose exit then
+//! committed `Exited` over the stop; in a
 //! stop phase some stop landed on a waiter inside a wait (the waiter's counts,
 //! read once it is stopped, show the wait entered and not finished) and some
 //! wait returned `Interrupted`; in a Thread-delete phase some delete ended a
@@ -339,6 +341,10 @@ struct Seen
     /// Stop phase: rounds whose stop found the waiter already exited
     /// (`InvalidState`).
     stops_after_exit: u32,
+    /// Stop phase: rounds whose `Ok` stop landed inside the waiter's exit
+    /// syscall, which then committed `Exited` over the stop (the restart
+    /// answers `InvalidArgument` on an exited waiter).
+    stops_into_exit: u32,
     /// Thread-delete phase: rounds whose delete ended a waiter inside a
     /// wait, and between waits (or after its exit).
     died_in_wait: u32,
@@ -458,6 +464,7 @@ fn log_seen(seen: &Seen)
         (" stopped_in_wait=", seen.stopped_in_wait),
         (" stopped_between=", seen.stopped_between),
         (" stops_after_exit=", seen.stops_after_exit),
+        (" stops_into_exit=", seen.stops_into_exit),
         (" died_in_wait=", seen.died_in_wait),
         (" died_between=", seen.died_between),
         (" interrupted=", seen.interrupted),
@@ -748,6 +755,16 @@ fn settle_stopped(
         {}
         Err(e) if !stopped && e == SyscallError::InvalidArgument as i64 =>
         {}
+        // A stop that lands while the waiter is inside its exit syscall
+        // commits `Stopped`, and the exit then commits `Exited` over it, so
+        // the restart finds the waiter already exited.
+        Err(e)
+            if stopped
+                && e == SyscallError::InvalidArgument as i64
+                && matches!(spawn::is_exited(waiter), Ok(true)) =>
+        {
+            seen.stops_into_exit += 1;
+        }
         Err(e) => BAD_ACTIONS.record_error(e),
     }
     if await_within(crate::scaled_bound(EXIT_WAIT_US), || {

@@ -333,7 +333,7 @@ mod present
     pub const DTB: u64 = 1 << 2;
 }
 
-/// Serve devmgr the `kind` rounds (`APERTURE` or `ACPI_REGION`) for
+/// Serve devmgr the `round_kind` rounds (`kind::APERTURE` or `kind::ACPI_REGION`) for
 /// `regions`, four `(slot, base, size)` entries per round. A region whose cap
 /// derive fails is left out of its round (cap and `(base, size)` pair alike):
 /// the kernel refuses a reply carrying a Null cap slot, so a zero handle would
@@ -1033,11 +1033,13 @@ pub struct SvcmgrEndowment
 /// Best-effort. The endpoint copies are derived before svcmgr starts; a
 /// failed derive or `START_PROCESS` destroys the unstarted svcmgr. A round
 /// that fails with svcmgr's request still pending (`NO_CHILD`: another
-/// child's request was refused) is followed by an empty terminal round
-/// ([`end_endowment`]) so svcmgr leaves its round loop: without `CAPS` it then
-/// exits, and after a failed `SUBSTRATE` round it runs without the remaining
-/// substrates. Any other failure has already woken svcmgr with an error (it
-/// exits) or left its state unknown, so init receives nothing further.
+/// child's request was refused) ends the rounds before it: after a failed
+/// `CAPS` round an empty terminal round ([`end_endowment`]) lets svcmgr
+/// leave its round loop and exit; after a failed `SUBSTRATE` round the real
+/// terminal `LOGD_SOURCES` round follows, and svcmgr runs without the
+/// remaining substrates. Any other failure has already woken svcmgr with an
+/// error (it exits) or left its state unknown, so init receives nothing
+/// further.
 ///
 /// Returns whether svcmgr holds its endowment through a delivered terminal
 /// round, so it is serving its service endpoint: only then can it receive
@@ -1111,15 +1113,18 @@ fn endow_svcmgr(
     {
         if code == ipc::bootstrap_errors::NO_CHILD
         {
-            let _ = end_endowment(bootstrap_ep, child_badge, ipc_buf);
+            end_endowment(bootstrap_ep, child_badge, ipc_buf);
         }
         return false;
     }
 
+    // A substrate round that fails on NO_CHILD leaves svcmgr's request
+    // pending: skip the remaining substrates and serve the real terminal
+    // round below, so svcmgr keeps its log-sink sources.
     if let Err(code) = serve_substrate_rounds(bootstrap_ep, child_badge, thread_caps, ipc_buf)
+        && code != ipc::bootstrap_errors::NO_CHILD
     {
-        return code == ipc::bootstrap_errors::NO_CHILD
-            && end_endowment(bootstrap_ep, child_badge, ipc_buf);
+        return false;
     }
 
     // Terminal round (LOGD_SOURCES): the reserved master-log endpoint source
@@ -1189,11 +1194,10 @@ fn serve_substrate_rounds(
 /// End a failed endowment with an empty terminal `LOGD_SOURCES` round, so
 /// svcmgr leaves its round loop (`request_round`) rather than block in it.
 /// Called only after a `NO_CHILD` failure, which leaves svcmgr's request
-/// pending, so the receive is answered. Returns whether the round reached
-/// svcmgr; a further failure is logged.
-fn end_endowment(bootstrap_ep: u32, child_badge: u64, ipc_buf: *mut u64) -> bool
+/// pending, so the receive is answered. A further failure is logged.
+fn end_endowment(bootstrap_ep: u32, child_badge: u64, ipc_buf: *mut u64)
 {
-    serve(
+    let _ = serve(
         bootstrap_ep,
         child_badge,
         ipc_buf,
@@ -1201,7 +1205,7 @@ fn end_endowment(bootstrap_ep: u32, child_badge: u64, ipc_buf: *mut u64) -> bool
         &[],
         &[endow_kind::LOGD_SOURCES],
         "phase 3: svcmgr endowment terminal round after a failure failed",
-    )
+    );
 }
 
 // ── Phase 3 orchestration ───────────────────────────────────────────────────

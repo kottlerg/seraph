@@ -124,7 +124,7 @@ pub(crate) fn decompress_neg(pk: &[u8; 32]) -> Option<Point>
     let tmp = den;
     field::add(&mut den, &r[2], &tmp); // 1 + d*y^2
 
-    // x = (num/den) recovered as num * den^3 * (num * den^7)^((p-5)/8).
+    // x = sqrt(num/den) recovered as num * den^3 * (num * den^7)^((p-5)/8).
     let mut den2 = GF0;
     field::sqr(&mut den2, &den);
     let mut den4 = GF0;

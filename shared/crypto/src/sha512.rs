@@ -10,7 +10,7 @@
 //! incremental [`Sha512`] so large inputs hash without being buffered whole.
 //!
 //! Correctness is anchored by the known-answer tests in [`run_sha512_kats`]
-//! (FIPS 180-4 Appendix C vectors plus incremental/padding-boundary
+//! (NIST SHA-512 example vectors, FIPS 180-2 Appendix C, plus incremental/padding-boundary
 //! self-consistency checks).
 
 /// Output length in bytes.
@@ -352,7 +352,8 @@ struct Sha512Kat
     digest: [u8; DIGEST_LEN],
 }
 
-/// FIPS 180-4 Appendix C vectors plus the empty-string vector.
+/// NIST SHA-512 example vectors (FIPS 180-2 Appendix C) plus the
+/// empty-string vector.
 const SHA512_KATS: &[Sha512Kat] = &[
     // SHA-512("")
     Sha512Kat {
@@ -365,7 +366,7 @@ const SHA512_KATS: &[Sha512Kat] = &[
             0xa5, 0x38, 0x32, 0x7a, 0xf9, 0x27, 0xda, 0x3e,
         ],
     },
-    // FIPS 180-4 C.1: SHA-512("abc")
+    // FIPS 180-2 C.1: SHA-512("abc")
     Sha512Kat {
         msg: b"abc",
         digest: [
@@ -376,7 +377,7 @@ const SHA512_KATS: &[Sha512Kat] = &[
             0x2a, 0x9a, 0xc9, 0x4f, 0xa5, 0x4c, 0xa4, 0x9f,
         ],
     },
-    // FIPS 180-4 C.2: the 112-byte two-block message.
+    // FIPS 180-2 C.2: the 112-byte two-block message.
     Sha512Kat {
         msg: b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
         digest: [

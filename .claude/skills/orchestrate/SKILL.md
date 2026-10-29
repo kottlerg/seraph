@@ -49,8 +49,11 @@ maintainer when it comes up:
    `pgrep -af qemu-system`) and the holder's expected duration. If the host is idle and the
    holder has not reported for longer than its slot should take, ping the holder for a status
    report; if the host is idle with no active grant and a queued request exists, grant the
-   next one. Also check whether any PR at its gate (clean verdicts, CI green) is waiting on a
-   merge. Do nothing else." Cancel it when the batch ends.
+   next one. Call `ListAgents` and compare it against the worker ids the record lists as
+   active; a worker that is not listed, whose last report was not its gate, is dead: log it and
+   respawn it with its plan and every answer already given folded into the prompt. Also check
+   whether any PR at its gate (clean verdicts, CI green) is waiting on a merge. Do nothing
+   else." Cancel it when the batch ends.
 
 ## Spawn
 
@@ -64,6 +67,10 @@ prompt of this shape; nothing in it repeats the agent file:
 A documentation-only scope may run on `model: sonnet`; everything that compiles stays on the
 agent file's default. Record the agent id and the scope in the record file; the id is the
 address for every later message.
+
+A respawn prompt also carries the dead worker's classified item list, its mechanism choices and
+every answer already given, marked as decisions already made, so the new worker neither
+re-plans nor re-asks; the new id replaces the dead one in the record.
 
 ## Host token
 
@@ -116,6 +123,10 @@ review is still owed after the branch is gone, run it yourself (`pr-reviewer` an
 Workers bring you the decisions they may not make. Those below are the recurring ones; each
 is either settled by the documents (then you apply the document) or by the maintainer (then
 you ask, once per batch where a standing answer makes sense, and quote it in the record).
+A worker's question that no document reserves to the maintainer and whose recommendation you
+share is decided: answer it and surface the decision to the maintainer in your next message.
+Only a split recommendation, a major design decision, or a case with no clearly best option
+waits for the maintainer.
 
 - `NON-BLOCKING ISSUES ONLY`: the worker records the surface findings on the scope's
   follow-up Issue; the merge prompt then offers the merge or one more fix round. A batch
@@ -166,6 +177,10 @@ this session. Cancel the watchdog. Close the record with the open-Issue count by
 
 ## Failure modes
 
+- A worker that ends its turn on an unchanged worktree is gone: the harness removes the
+  worktree, and a later message does not resume it. The worker's turn-ending rule
+  (`.claude/agents/worker.md` § Reporting) prevents it; the watchdog's liveness check (§ Plan
+  step 4) and the respawn prompt (§ Spawn) recover from it.
 - A worker's provider limit ends its session mid-slot: complete the mechanical steps yourself
   in its worktree (the drivers are plain shell: gate, build, boot, log), then resume the worker
   with the results so it writes the body and runs the review with its own context.

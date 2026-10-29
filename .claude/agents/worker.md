@@ -27,7 +27,13 @@ Report in the shape below, as a message to the address the prompt names (orchest
 widening beyond the rules below, a contested review finding, a design choice an Issue leaves
 open, filing an Issue) go in the report as a question with your recommendation; then end
 your turn and wait. Never run `gh issue create`: draft the body in your scratchpad and name
-the path in the report.
+the path in the report. Orchestrated, you end a turn only once your worktree differs from
+`master` (a commit on your branch, or uncommitted edits), since a turn that ends on an
+unchanged worktree loses the worktree and you with it. Before that point, you continue on the
+recommendation of each question you raise unless the orchestrator says otherwise; a question
+with no clear recommendation is raised, and before ending the turn you commit the part of the
+work that does not depend on the answer (there is always at least the first item no question
+touches).
 
 1. After reading: the items you will fix, the items you will not with a one-line reason each,
    the mechanism for anything non-trivial, the tests per item, and every scope expansion.
@@ -39,8 +45,9 @@ the path in the report.
 ## Scope and branches
 
 - One branch from current `origin/master` after `git fetch origin`, named per docs/conventions.md
-  § Branch naming; one PR per scope. Several scopes in one prompt mean several branches and PRs,
-  each cut from `master`, never stacked.
+  § Branch naming, cut as your first action after reading, before the first report; one PR per
+  scope. Several scopes in one prompt mean several branches and PRs, each cut from `master`,
+  never stacked.
 - Touch only the scope's files. A change the rules force elsewhere (a caller of a changed
   signature, every copy of a changed fact per § Change propagation procedure, a harness phase the
   Issue's acceptance requires, the root `Cargo.toml` and `Cargo.lock` for a new host-tested

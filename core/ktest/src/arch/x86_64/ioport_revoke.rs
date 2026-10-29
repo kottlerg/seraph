@@ -14,7 +14,7 @@
 //! permitting bitmap. Revoking `held` frees `granted`, whose teardown
 //! withdraws the binding and invalidates every CPU's TSS bitmap before the
 //! revoke returns
-//! ([docs/capability-model.md § IoPort](../../../../../docs/capability-model.md#ioport-x86-64-only)):
+//! ([docs/capability-model.md § `IoPort`](../../../../../docs/capability-model.md#ioport-x86-64-only)):
 //! the child's next read raises `#GP` and kills it.
 
 use core::sync::atomic::{AtomicU64, Ordering};

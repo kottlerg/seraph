@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+# Host-testable gate logic (bins are test = false).
+[lib]
+name = "virtio_input"
+path = "src/lib.rs"
+
 [[bin]]
 name = "virtio-input"
 path = "src/main.rs"

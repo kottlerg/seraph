@@ -20,7 +20,8 @@ services/drivers/
 │   ├── Cargo.toml
 │   ├── README.md                   # Framebuffer IPC interface (FB_WRITE_BYTES, FB_SET_ATTRS)
 │   └── src/
-│       ├── lib.rs                  # Library root exposing render (host-tested)
+│       ├── authority.rs            # WRITE_AUTHORITY verb-bit gate (host-tested)
+│       ├── lib.rs                  # Library root exposing authority and render (host-tested)
 │       ├── main.rs
 │       ├── render.rs               # 9×20 bitmap glyph blit + cursor + scroll
 │       └── arch/                   # Per-arch MMIO mapping (x86_64 / riscv64)
@@ -56,10 +57,11 @@ services/drivers/
 │   │       ├── lib.rs              # Request-length and reply-label logic (host-tested)
 │   │       ├── main.rs
 │   │       └── io.rs
-│   └── input/                      # VirtIO input (keyboard) device driver (binary)
+│   └── input/                      # VirtIO input (keyboard) device driver (binary + lib)
 │       ├── Cargo.toml
 │       ├── README.md               # Input-driver IPC interface (INPUT_READ_EVENTS)
 │       └── src/
+│           ├── lib.rs              # READ_AUTHORITY verb-bit gate (host-tested)
 │           ├── main.rs
 │           ├── input.rs            # Event virtqueue receive-buffer ring
 │           └── decode.rs           # Keycode → keysym tables + modifier state
@@ -118,7 +120,7 @@ The full driver lifecycle is specified in
 |---|---|---|
 | [`virtio/core/`](virtio/core/README.md) | Library | Shared VirtIO transport primitives: device initialisation, virtqueue setup, descriptor chain management |
 | [`virtio/blk/`](virtio/blk/README.md) | Binary + library | VirtIO block device driver — exposes per-request DMA block-read IPC endpoint |
-| [`virtio/input/`](virtio/input/README.md) | Binary | VirtIO input (keyboard) device driver — decodes `EV_KEY` events into keysyms; answers `INPUT_READ_EVENTS` behind devmgr's `QUERY_INPUT_DEVICE` |
+| [`virtio/input/`](virtio/input/README.md) | Binary + library | VirtIO input (keyboard) device driver — decodes `EV_KEY` events into keysyms; answers `INPUT_READ_EVENTS` behind devmgr's `QUERY_INPUT_DEVICE` |
 | [`serial/`](serial/README.md) | Binary | Serial (UART) device driver — COM1 (x86-64) / NS16550 (RISC-V); sole driver-mediated serial-byte sink |
 | [`framebuffer/`](framebuffer/README.md) | Binary + library | Linear framebuffer text driver — owns the GOP framebuffer MMIO; sole driver-mediated framebuffer-byte sink |
 | [`cmos/`](cmos/README.md) | Binary + library | x86-64 CMOS / MC146818 RTC driver — devmgr-spawned; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_RTC_DEVICE` |

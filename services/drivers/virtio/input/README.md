@@ -15,6 +15,7 @@ virtio/input/
 ├── Cargo.toml
 ├── README.md
 └── src/
+    ├── lib.rs                 # READ_AUTHORITY verb-bit gate (host-tested)
     ├── main.rs                # Driver entry, PCI bring-up, IPC service loop
     ├── input.rs              # Event virtqueue receive-buffer ring + event struct
     └── decode.rs             # Keycode → keysym tables + modifier-state FSM
@@ -49,7 +50,9 @@ Synchronous call/reply (`SYS_IPC_CALL`). Labels and the keysym ABI live in
 Read a batch of pending keyboard events. **Blocking**: the driver does not
 reply until at least one event is available.
 
-**Request:** empty body (caller's badge carries `READ_AUTHORITY`).
+**Request:** empty body. Gated by `READ_AUTHORITY`: a caller whose badge
+lacks it gets an immediate `UNAUTHORIZED` (`4`) reply with no events and is
+never blocked.
 
 **Reply (`SUCCESS`):**
 

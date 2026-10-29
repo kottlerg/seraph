@@ -52,9 +52,9 @@ the path in the report.
   propagation procedure).
 - Read every Issue item against the current code before fixing it; items filed against older
   heads may be partly or fully fixed. An item already fixed is ticked citing the PR that fixed
-  it (`git log -S`, `git blame`). An item that is wrong on the code is struck through in the
-  Issue body with a one-line rationale (docs/conventions.md § Acceptance checklist discipline),
-  with the evidence in an Issue comment.
+  it (`git log -S`, `git blame`). An item that is wrong on the code is dropped as
+  docs/conventions.md § Acceptance checklist discipline says: removed from the Issue body, or
+  rewritten to what holds, with the one-line rationale and the evidence in an Issue comment.
 
 ## Code and tests
 
@@ -109,8 +109,8 @@ Orchestrated mode adds the host token:
 - Sync onto `master` only when the orchestrator says `master quiet`, right before the slot: a
   sync that brings non-comment code re-owes the validation set, a Markdown-only or comment-only
   sync owes nothing, and the gate needs the head to include `master` either way. The sync
-  commit's subject is `<scope>: merge master into the <kind> branch`, naming the branch's
-  kind (`drain`, `fix`, `feature`, `audit`).
+  commit's subject is `<scope>: merge master into the <kind> branch`, where `<kind>` is the
+  branch's prefix (`cleanup`, `fix`, `feature`, `audit`).
 - `cargo xtask test` and `cargo xtask lint-docs` need no grant.
 
 Standalone mode has no token: the load check is the whole protocol, and you sync onto `master`
@@ -150,8 +150,10 @@ the ledger). Save records under `target/xtask/review/pr<N>/`. Push and open the 
 
 ## Gate
 
-Stop when CI is green, the head includes `master`, the last run's verdicts are `READY TO MERGE`
-or `NON-BLOCKING ISSUES ONLY` with every finding recorded, and `AUDIT PASS` is on record for the
-head. Report the gate with the merge command `gh pr merge <N> --merge --delete-branch` and
-end your turn. The merge decision is the maintainer's (`.claude/CLAUDE.md` § PR workflow
+Stop when CI is green, the head includes `master`, the last run completed with no failed
+agent, its verdicts are `READY TO MERGE` or `NON-BLOCKING ISSUES ONLY` with every surface
+finding recorded and no contested finding on the surface unresolved, and `AUDIT PASS` is on
+record for the head (the merge-prompt condition of docs/conventions.md § Branch and PR
+Workflow). Report the gate with the merge command `gh pr merge <N> --merge --delete-branch`
+and end your turn. The merge decision is the maintainer's (`.claude/CLAUDE.md` § PR workflow
 operations); a worker that merges has failed its task.

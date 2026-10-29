@@ -7,8 +7,10 @@ description: Drive one Issue (or one scope) to a pull request at its merge gate 
 
 `/work <issue> [<issue> ...] [scope]` makes this session the worker for one scope: the Issue
 numbers are the worker prompt's Issues, the scope is the commit-title scope that covers them
-(derived from the Issues' files when not given), and the branch name follows
-docs/conventions.md § Branch naming from the Issue's class. Follow `.claude/agents/worker.md`
+(derived from the Issues' files when not given), and the branch name takes the
+docs/conventions.md § Branch naming prefix that matches the work's purpose (`fix/` for a bug
+or security defect, `cleanup/` for cleanup and follow-up drains, `feature/` for feature and
+perf work, `audit/` for an audit) and a slug naming the scope. Follow `.claude/agents/worker.md`
 in **standalone** mode: the same authorities, planning report, branch and PR discipline, tests,
 host runs and review, with these differences.
 

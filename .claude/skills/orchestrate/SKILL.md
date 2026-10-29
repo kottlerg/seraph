@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: Run a batch of Issues as several parallel worker agents under one orchestrator session that holds the host token, orders merges, makes rulings, and keeps the record.
+description: Run a batch of Issues as several parallel worker agents under one orchestrator session that holds the host token, orders merges, carries rulings to the maintainer, and keeps the record.
 ---
 
 # Orchestrating a batch
@@ -15,8 +15,9 @@ exception, and each is recorded.
 
 Everything in this file applies `.claude/CLAUDE.md`, docs/conventions.md and docs/testing.md;
 nothing in it grants an authority those documents reserve to the maintainer. Three decisions
-are the maintainer's by those documents, and the batch cannot run without their answer, so ask
-for all three in your first message and quote the answers in the record file:
+are the maintainer's by those documents; ask for all three in your first message and quote the
+answers in the record file. Until an answer arrives, each case below is a prompt to the
+maintainer when it comes up:
 
 1. **Merges.** Per `.claude/CLAUDE.md` § PR workflow operations the merge is the maintainer's
    call per PR. For a batch the maintainer may give a standing instruction in their own words
@@ -88,11 +89,13 @@ produces hangs that then need classifying. One slot at a time:
 
 A PR is at its gate when: `gh pr view <N> --json mergeStateStatus,statusCheckRollup` shows
 `CLEAN` and every check green; the last run record under the worker's
-`target/xtask/review/pr<N>/` shows `READY TO MERGE`, or `NON-BLOCKING ISSUES ONLY` with every
-surface finding recorded; `AUDIT PASS` is on record for the head; every Issue the body closes
-carries the current milestone; a delta since the validated head is comment-only or
-Markdown-only (`git diff <validated> <head> -- . ':!*.md'` shows only comment lines). Verify
-each yourself; a worker's report is a claim. Then prompt the maintainer, or merge under their
+`target/xtask/review/pr<N>/` is a completed run with no failed agent whose verdict is `READY
+TO MERGE`, or `NON-BLOCKING ISSUES ONLY` with every surface finding recorded and no contested
+finding on the surface unresolved; `AUDIT PASS` is on record for the head; every Issue the
+body closes carries the current milestone; a delta since the validated head is comment-only or
+Markdown-only (`git diff <validated> <head> -- . ':!*.md'` shows only comment lines). This is
+the merge-prompt condition of docs/conventions.md § Branch and PR Workflow; verify each part
+yourself, since a worker's report is a claim. Then prompt the maintainer, or merge under their
 standing instruction, with `gh pr merge <N> --merge --delete-branch`; fast-forward your own
 checkout, record it, and tell every open PR's worker what moved.
 
@@ -125,17 +128,19 @@ you ask, once per batch where a standing answer makes sense, and quote it in the
   resolves in the same PR as a fix or as a clarification of the rule or document it misread;
   off the surface it is recorded with the maintainer's answer.
 - An acceptance box no test can satisfy (a path that needs a live QEMU to fail, a cap the
-  harness cannot hold) is finished or dropped: struck through in the Issue body with a one-line
-  rationale (docs/conventions.md § Acceptance checklist discipline), never ticked. Dropping it
-  is the maintainer's decision; ask with the rationale.
+  harness cannot hold) is finished or dropped, never ticked: dropping removes the item from the
+  Issue body, with the one-line rationale in the closing comment (docs/conventions.md
+  § Acceptance checklist discipline). Dropping it is the maintainer's decision; ask with the
+  rationale.
 - A closing keyword in a commit body cannot be withdrawn without a rewrite: a worker whose PR
   nonetheless carries one and loses its `Fixes` takes the comment-only fix round instead of
   recording, or asks for the rewrite.
 - A history rewrite (a commit subject over 72 columns, a wrong keyword) is yours only on the
   maintainer's instruction: rebuild the chain with identical trees (`git commit-tree -S`),
   check `git diff --quiet <old> <new>`, push with `--force-with-lease`, and record it.
-- `.claude/CLAUDE.md` edits need the maintainer's own words; hold the item and ask. A worker
-  does not edit that file.
+- `.claude/CLAUDE.md` edits need the maintainer's own words. A worker whose change has a copy
+  there reports it and holds its push; you carry the copy to the maintainer, who applies it or
+  authorizes the worker in their own words, which you pass on verbatim.
 - A finding two independent refuters refute is dropped (that section); a finding the workers
   cannot place is put to the maintainer with your recommendation, in one line.
 

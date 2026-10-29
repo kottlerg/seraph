@@ -487,6 +487,9 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
                 (*target_tcb).iopb = fresh.cast::<[u8; gdt::IOPB_SIZE]>();
                 fresh = core::ptr::null_mut();
             }
+            // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
+            // IoPortBindings block (the allocation above or an earlier bind's).
+            #[allow(clippy::cast_ptr_alignment)]
             let table = (*target_tcb).iopb.cast::<IoPortBindings>();
             let bound = if table.is_null()
             {

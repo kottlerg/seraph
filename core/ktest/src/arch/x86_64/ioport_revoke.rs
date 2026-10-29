@@ -65,18 +65,12 @@ fn carve_port_cap(ctx: &TestContext) -> Option<u32>
         };
         // A copy of any other type, or of an IoPort range that does not cover
         // [PORT, PORT + 1] with room past it, refuses the split and is dropped.
-        match ioport_split(copy, PORT + 1)
+        if let Ok((low, high)) = ioport_split(copy, PORT + 1)
         {
-            Ok((low, high)) =>
-            {
-                cap_delete(high).ok();
-                return Some(low);
-            }
-            Err(_) =>
-            {
-                cap_delete(copy).ok();
-            }
+            cap_delete(high).ok();
+            return Some(low);
         }
+        cap_delete(copy).ok();
     }
     None
 }

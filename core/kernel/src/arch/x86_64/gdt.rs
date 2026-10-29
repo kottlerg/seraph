@@ -99,7 +99,7 @@ const IOPB_OFFSET_INVALID: u16 = u16::MAX;
 /// to be 0xFF).
 ///
 /// The GDT TSS descriptor limit reaches the terminator:
-///   limit = `offset_of`!(TssWithIopb, terminator)
+///   limit = `offset_of!(TssWithIopb, terminator)`
 ///
 /// `iopb_offset` in the `Tss` is [`IOPB_OFFSET_VALID`] (104, the offset of
 /// `iopb` within this struct) while the CPU's bitmap is current, and

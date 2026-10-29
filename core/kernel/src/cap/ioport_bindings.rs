@@ -13,7 +13,7 @@
 //! remain, so a port another live binding still grants stays permitted. The
 //! rebuilt bitmap reaches a CPU that is running the thread through the lazy
 //! IOPB reload of `arch::current::gdt` (`invalidate_all_iopbs`). See
-//! core/kernel/docs/capability-internals.md § IoPort Bindings.
+//! core/kernel/docs/capability-internals.md § `IoPort` Bindings.
 //!
 //! The table lives in one SEED scratch allocation per bound thread
 //! ([`TABLE_BYTES`]), its bitmap at offset 0 so the TCB's `iopb` pointer is
@@ -153,6 +153,9 @@ pub unsafe fn withdraw_everywhere(object: usize)
             let saved = (*tcb).sched_lock.lock_raw();
             // `iopb` and the table's bytes are owned by this lock; the Thread
             // arm of dealloc_object nulls the pointer under it before freeing.
+            // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
+            // IoPortBindings block (sys_ioport_bind).
+            #[allow(clippy::cast_ptr_alignment)]
             let table = (*tcb).iopb.cast::<IoPortBindings>();
             if !table.is_null() && (*table).withdraw(object)
             {

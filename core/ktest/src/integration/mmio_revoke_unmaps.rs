@@ -139,7 +139,7 @@ fn check(ctx: &TestContext, held: u32) -> TestResult
 /// Child entry: read the probe register until the read faults.
 extern "C" fn reader(_arg: u64) -> !
 {
-    let reg = (PROBE_VA as usize + crate::arch::MMIO_PROBE_OFFSET) as *const u8;
+    let reg = (PROBE_VA + crate::arch::MMIO_PROBE_OFFSET as u64) as *const u8;
     loop
     {
         // SAFETY: PROBE_VA maps the probe page until the parent's revoke; the

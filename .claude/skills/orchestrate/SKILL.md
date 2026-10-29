@@ -141,6 +141,9 @@ decision, or a case with no clearly best option waits for the maintainer.
   default the maintainer may set: one fix round when a finding is a comment or document that
   states a falsehood, when the fix is comment-only and a later round is owed anyway, or when
   recording would need a new Issue for a one-line change; otherwise merge with the record.
+  Standing, by the maintainer's ruling: a run whose findings are all nits takes no fix round;
+  the worker records them on the scope's rolling Issue and reports the gate, and a PR draining
+  that rolling Issue fixes its own nits-only findings in place instead.
 - A reviewer's finding that a worker contests, or that the worker cannot fix within its scope
   (a pre-existing code defect in a file a documentation-only PR touches, for instance), is put
   to the maintainer with the worker's and your recommendation. A finding is never waived or
@@ -159,7 +162,7 @@ decision, or a case with no clearly best option waits for the maintainer.
   maintainer's instruction: rebuild the chain with identical trees (`git commit-tree -S`),
   check `git diff --quiet <old> <new>`, push with the lease pinned to the old head
   (`git push --force-with-lease=<branch>:<old> origin <new>:refs/heads/<branch>`, which refuses
-  when the remote branch has moved past `<old>`), and record it.
+  whenever the remote branch is not at `<old>`), and record it.
 - `.claude/CLAUDE.md` edits need the maintainer's own words. A worker whose change has a copy
   there reports it and holds its push; you carry the copy to the maintainer, who applies it or
   authorizes the worker in their own words, which you pass on verbatim.

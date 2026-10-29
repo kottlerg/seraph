@@ -210,12 +210,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         // barrier — the armable setup. Notification sends coalesce (OR), so one
         // accumulator collects all three witnesses.
         let mut acc = 0u64;
-        while acc & ALL_READY != ALL_READY
-        {
-            let bits = notification_wait(done)
-                .map_err(|_| "stress::stop_resume_race: notification_wait(ready) failed")?;
-            acc |= bits;
-        }
+        crate::tally::await_all(
+            done,
+            &mut acc,
+            ALL_READY,
+            "stress::stop_resume_race: victim and racers never all reported ready",
+        )?;
         armed_cycles += 1;
 
         // Fire both racers at the same instant. Do NOT yield here — that would

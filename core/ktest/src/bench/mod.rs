@@ -46,48 +46,15 @@ mod wait_set;
 
 // ── Cycle counter ─────────────────────────────────────────────────────────────
 
-/// Read the hardware cycle counter.
-///
-/// On x86-64, uses `rdtsc`. On RISC-V, uses `csrr cycle`.
-/// On RISC-V, requires the kernel to have set `scounteren.CY = 1`.
+/// Read the hardware cycle counter (`crate::arch::cycles_now`).
 ///
 /// Returns raw cycle counts. Units differ by architecture; use deltas only.
-// inline_always: RDTSC must be inlined to avoid call overhead in cycle benchmarks.
+// inline_always: the counter read must be inlined to avoid call overhead in cycle benchmarks.
 #[allow(clippy::inline_always)]
 #[inline(always)]
 pub(super) fn cycles_now() -> u64
 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let lo: u32;
-        let hi: u32;
-        // SAFETY: rdtsc is a user-mode instruction when CR4.TSD = 0 (the
-        // kernel does not set TSD). preserves_flags: rdtsc does not modify
-        // RFLAGS, only EAX/EDX.
-        unsafe {
-            core::arch::asm!(
-                "rdtsc",
-                out("eax") lo,
-                out("edx") hi,
-                options(nostack, nomem, preserves_flags),
-            );
-        }
-        u64::from(hi) << 32 | u64::from(lo)
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        let c: u64;
-        // SAFETY: cycle CSR is accessible from U-mode when scounteren.CY = 1,
-        // which the kernel sets during Phase 5 init.
-        unsafe {
-            core::arch::asm!(
-                "csrr {}, cycle",
-                out(reg) c,
-                options(nostack, nomem),
-            );
-        }
-        c
-    }
+    crate::arch::cycles_now()
 }
 
 /// Log the benchmark header line `ktest: bench  <name>  N=<n>`.

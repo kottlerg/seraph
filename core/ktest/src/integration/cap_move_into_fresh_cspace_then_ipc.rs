@@ -73,10 +73,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     let child_ep = syscall::cap_move(ep_donor, child.cs, 0)
         .map_err(|_| "cap_move_into_fresh_cspace_then_ipc: cap_move failed")?;
 
-    // This probe is vacuous: `notification_send` with zero bits on an Endpoint
-    // slot fails whether or not the move nulled the slot, so it does not
-    // observe the move (#444).
-    if syscall::notification_send(ep_donor, 0).is_ok()
+    // `cap_info` succeeds on any live cap and fails with `InvalidCapability` on
+    // a null slot, so it observes whether the move nulled the source.
+    if syscall::cap_info(ep_donor, syscall_abi::CAP_INFO_TAG_RIGHTS).is_ok()
     {
         return Err("cap_move_into_fresh_cspace_then_ipc: source slot still usable after cap_move");
     }

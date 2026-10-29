@@ -87,6 +87,8 @@ const MIN_CYCLES: u32 = 64;
 
 /// Bound, in 1 ms sleeps, on the controller's polls for the starter to go
 /// idle and for every child to exit.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const EXIT_POLLS: u32 = 2000;
 
 /// The waiter, the sender, and the starter.
@@ -542,7 +544,7 @@ fn ensure_started(starter_th: u32) -> TestResult
 fn await_starter_idle() -> TestResult
 {
     RACE.store(0, Ordering::SeqCst);
-    for _ in 0..EXIT_POLLS
+    for _ in 0..crate::scaled_polls(EXIT_POLLS)
     {
         if STARTER_BUSY.load(Ordering::SeqCst) == 0
         {
@@ -556,7 +558,7 @@ fn await_starter_idle() -> TestResult
 /// Wait for every child to exit, waking the waiter until it does.
 fn await_exit(sig: u32) -> TestResult
 {
-    for _ in 0..EXIT_POLLS
+    for _ in 0..crate::scaled_polls(EXIT_POLLS)
     {
         if EXITED.load(Ordering::Acquire) as usize == CHILDREN
         {

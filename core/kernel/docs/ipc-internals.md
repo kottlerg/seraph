@@ -794,4 +794,4 @@ the "Lock primitive" and "Bare spin locks" paragraphs of
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
 [Thread Lifecycle and Sleep List Invariants](thread-lifecycle-and-sleep.md),
-[IPC Design](../../../docs/ipc-design.md)
+[Coding Standards](../../../docs/coding-standards.md), [IPC Design](../../../docs/ipc-design.md)

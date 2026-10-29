@@ -61,10 +61,9 @@ core/ktest/
 
 Tests are organised across four tiers (unit, integration, stress, and
 benchmark), all run on every boot by default. Each tier lives in its own
-source directory, whose `mod.rs` codifies at its top the tier's one-file rule
-(one file per surface, scenario, or race or resource invariant, as Source Layout
-lists per tier), except its architecture-only tests, which live under
-`src/arch/<arch>/` (see below).
+source directory and follows a one-file rule (one file per surface, scenario, or
+race or resource invariant, as Source Layout lists per tier), except its
+architecture-only tests, which live under `src/arch/<arch>/` (see below).
 
 `src/arch/` is ktest's arch-dispatch surface: one module per architecture,
 selected by `target_arch` in `src/arch/mod.rs`, each exposing the same

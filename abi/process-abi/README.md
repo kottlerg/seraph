@@ -236,6 +236,22 @@ they are always compiled together with the consuming binary.
 
 ---
 
+## Source Layout
+
+```
+process-abi/
+├── Cargo.toml
+├── README.md
+└── src/
+    └── lib.rs      # ProcessInfo, PROCESS_ABI_VERSION, process_info_ref / process_info_mut;
+                    # StartupInfo (the memmgr runtime's view); the stack-size note
+                    # (StackNote, the stack_pages! macro, stack-page bounds); the
+                    # main-thread TLS bound and TLS block helpers (tls_block_layout,
+                    # tls_install_tcb)
+```
+
+---
+
 ## Relevant Design Documents
 
 | Document | Content |
@@ -254,6 +270,7 @@ they are always compiled together with the consuming binary.
 
 [Process Lifecycle](../../docs/process-lifecycle.md),
 [Userspace Memory Model](../../docs/userspace-memory-model.md),
+[runtime/ruststd/README.md](../../runtime/ruststd/README.md),
 [Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md),
 [services/procmgr/README.md](../../services/procmgr/README.md),
 [svcmgr IPC Interface](../../services/svcmgr/docs/ipc-interface.md),

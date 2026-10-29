@@ -5,17 +5,20 @@ description: Drive one Issue (or one scope) to a pull request at its merge gate 
 
 # Working one Issue
 
-`/work <issue> [<issue> ...] [scope]` makes this session the worker for one scope. Follow
-`.claude/agents/worker.md` in **standalone** mode: the same authorities, planning report,
-branch and PR discipline, tests, host runs and review, with these differences.
+`/work <issue> [<issue> ...] [scope]` makes this session the worker for one scope: the Issue
+numbers are the worker prompt's Issues, the scope is the commit-title scope that covers them
+(derived from the Issues' files when not given), and the branch name follows
+docs/conventions.md § Branch naming from the Issue's class. Follow `.claude/agents/worker.md`
+in **standalone** mode: the same authorities, planning report, branch and PR discipline, tests,
+host runs and review, with these differences.
 
 - There is no host token. The load check before every build or boot is the whole protocol;
   `nice` is optional.
 - Reports go to the maintainer in this conversation: the plan before coding, the host-run
   results, each review's verdict lines verbatim, and the gate.
 - Decisions the worker file routes to "the orchestrator" are the maintainer's: ask them in the
-  conversation and wait. Routine rulings follow `.claude/skills/orchestrate/SKILL.md`
-  § Rulings unless the maintainer says otherwise.
+  conversation and wait. `.claude/skills/orchestrate/SKILL.md` § Rulings lists the recurring
+  ones and which document settles each.
 - Issues the worker file says to draft are filed with the maintainer's approval in the
   conversation, then with `gh issue create`.
 - Sync onto `master` yourself right before the validation run, and again (Markdown-only syncs

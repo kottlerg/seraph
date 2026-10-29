@@ -817,9 +817,14 @@ name = "pwrmgr"
 version = "0.1.1"
 dependencies = [
  "ipc",
+ "pwrmgr-acpi",
  "syscall",
  "syscall-abi",
 ]
+
+[[package]]
+name = "pwrmgr-acpi"
+version = "0.1.1"
 
 [[package]]
 name = "quote"

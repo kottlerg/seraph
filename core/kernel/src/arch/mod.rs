@@ -5,7 +5,8 @@
 
 //! Architecture dispatch module: selects the active architecture's module as
 //! `current` (see `docs/coding-standards.md` § C. Architecture Invariants and
-//! `core/kernel/docs/arch-interface.md`).
+//! `core/kernel/docs/arch-interface.md`), and defines [`ThreadKind`], the one
+//! type both architectures' `context::new_state` share.
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]

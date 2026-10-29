@@ -6,15 +6,16 @@
 //! x86-64 CPU control primitives: CPUID, CR4 and MSR access, the fault-recoverable
 //! user-copy routine, SMEP/SMAP and PCID enablement, the boot-time baseline feature
 //! gate, per-CPU GS-base install and lookup, the kernel trap stack, interrupt
-//! control and halt, and the fence ahead of an x2APIC MSR write.
+//! control and halt, the fence ahead of an x2APIC MSR write, and the debug-build
+//! kernel-entry RFLAGS check.
 //!
 //! `current_stack_pointer`, the CR4/MSR accessors, `x2apic_wrmsr_fence`, `copy_user`,
-//! `user_copy_fixup`, the enable routines, `verify_baseline`, `install_percpu`, and the
+//! `user_copy_fixup`, the enable routines, `verify_baseline`, `install_percpu`, the
 //! trap-stack and interrupt save/restore primitives, and the kernel-entry flags check
-//! are built only under
-//! `#[cfg(not(test))]` (`copy_user` and `verify_baseline` have host stubs). `cpuid`,
-//! `current_cpu` (which returns 0 under test), `halt_until_interrupt`,
-//! `disable_interrupts`, and `halt_loop` are also built for host tests.
+//! are built only under `#[cfg(not(test))]` (`copy_user` and `verify_baseline` have
+//! host stubs). `cpuid`, `current_cpu` (which returns 0 under test),
+//! `halt_until_interrupt`, `disable_interrupts`, and `halt_loop` are also built for
+//! host tests.
 
 // ── CPUID ─────────────────────────────────────────────────────────────────────
 
@@ -651,8 +652,9 @@ fn read_rflags() -> u64
 /// direction) and TF (single-step). `IA32_SFMASK` clears them on SYSCALL, and
 /// every ring-3-reachable IDT stub runs `cld` and `clac` (TF is cleared by the
 /// interrupt or trap gate), so a set bit here is a regression in that entry
-/// discipline. Called first in `syscall::dispatch` and in the IDT handler
-/// bodies. A no-op in release builds (the RFLAGS read is not performed).
+/// discipline. Called first in `syscall::dispatch` and in the exception,
+/// `#PF`, `#NM`, and IRQ handler bodies (`idt.rs`). A no-op in release builds
+/// (the RFLAGS read is not performed).
 #[cfg(not(test))]
 #[inline]
 pub fn debug_assert_kernel_entry_flags()

@@ -10,19 +10,23 @@
 //!
 //! 1. Receives via bootstrap protocol a RECV cap on the master log
 //!    endpoint, a SEND cap on the same endpoint (single-use, for the
-//!    `HANDOVER_PULL` IPC to init-logd), a `SEND|GRANT` cap on procmgr
+//!    `HANDOVER_PULL` drain and `HANDOVER_RELEASE` rounds with
+//!    init-logd), a `SEND|GRANT` cap on procmgr
 //!    carrying `DEATH_EQ_AUTHORITY` (for `REGISTER_DEATH_EQ`), and a
 //!    SEND cap on devmgr's registry endpoint carrying
 //!    `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via
-//!    `QUERY_SERIAL_DEVICE`).
-//! 2. Drains init-logd's captured state via `HANDOVER_PULL` until
-//!    `DONE`. Init-logd self-terminates immediately after replying
-//!    `DONE`.
-//! 3. Creates an `EventQueue` for procmgr-routed death notifications.
-//! 4. Registers the EQ with procmgr via `REGISTER_DEATH_EQ`. Procmgr
-//!    retroactively binds it on every existing thread and on every
-//!    future spawn (correlator = process badge, equal to the log
-//!    badge logd sees on `STREAM_BYTES`).
+//!    `QUERY_SERIAL_DEVICE` and the framebuffer driver via
+//!    `QUERY_FRAMEBUFFER_DEVICE`).
+//! 2. Creates an `EventQueue` for procmgr-routed death notifications.
+//! 3. Registers the EQ with procmgr via `REGISTER_DEATH_EQ`. Procmgr
+//!    retroactively binds it on the main thread of every existing
+//!    process and of every future spawn (correlator = process badge,
+//!    equal to the log badge logd sees on `STREAM_BYTES`).
+//! 4. Drains init-logd's captured state via `HANDOVER_PULL` until
+//!    `DONE`, then releases init-logd with `HANDOVER_RELEASE`, pulling
+//!    again while init-logd defers the release (see
+//!    `docs/handover-protocol.md`). Init-logd self-terminates on the
+//!    acknowledged release, not on `DONE`.
 //! 5. Enters the main wait loop, draining death notifications first
 //!    then servicing log endpoint messages.
 //!
@@ -77,7 +81,8 @@ struct BootCaps
     /// this cap is in use.
     log_ep_recv: u32,
     /// SEND cap on the master log endpoint, used only for the
-    /// `HANDOVER_PULL` IPC to init-logd. Deleted after handover.
+    /// `HANDOVER_PULL` drain and `HANDOVER_RELEASE` rounds with
+    /// init-logd. Deleted after handover.
     log_ep_handover_send: u32,
     /// `SEND|GRANT` cap on procmgr carrying `DEATH_EQ_AUTHORITY`, used to
     /// call `REGISTER_DEATH_EQ`. Kept across the lifetime of
@@ -170,13 +175,12 @@ fn main() -> !
         // init-logd, then drop the single-use SEND so logd carries no SEND cap
         // to its own log endpoint.
         self_log("started; pulling init-logd handover state");
+        // Drain, then the terminal release: init-logd exits on an acknowledged
+        // release, not on the drain's DONE, so a dropped data chunk cannot
+        // wedge it (and thus cannot block procmgr's reap of init's memory
+        // caps).
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        unsafe { handover::pull_all(caps.log_ep_handover_send, ipc_buf, &mut table) };
-        // Terminal release: init-logd exits on this, not on the drain's DONE,
-        // so a dropped data chunk cannot wedge it (and thus cannot block
-        // procmgr's reap of init's memory caps).
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        unsafe { handover::send_release(caps.log_ep_handover_send, ipc_buf) };
+        unsafe { handover::transfer(caps.log_ep_handover_send, ipc_buf, &mut table) };
         let _ = syscall::cap_delete(caps.log_ep_handover_send);
 
         let mut buf = SerialFmt::new();
@@ -186,7 +190,7 @@ fn main() -> !
             table.slots.len(),
             table.slots.values().map(|s| s.history.len()).sum::<usize>(),
         );
-        buf.flush_self_log();
+        self_log(buf.as_str());
     }
     else
     {
@@ -222,21 +226,21 @@ fn create_wait_set(log_ep_recv: u32, death_eq: u32) -> Option<u32>
     {
         let mut buf = SerialFmt::new();
         let _ = write!(buf, "wait_set_create failed");
-        buf.flush_self_log();
+        self_log(buf.as_str());
         return None;
     };
     if let Err(e) = syscall::wait_set_add(ws, log_ep_recv, WS_BADGE_LOG)
     {
         let mut buf = SerialFmt::new();
         let _ = write!(buf, "wait_set_add(log) err={e}");
-        buf.flush_self_log();
+        self_log(buf.as_str());
         return None;
     }
     if let Err(e) = syscall::wait_set_add(ws, death_eq, WS_BADGE_DEATH)
     {
         let mut buf = SerialFmt::new();
         let _ = write!(buf, "wait_set_add(death) err={e}");
-        buf.flush_self_log();
+        self_log(buf.as_str());
         return None;
     }
     Some(ws)
@@ -284,7 +288,7 @@ fn register_with_procmgr(procmgr_send: u32, death_eq: u32, ipc_buf: *mut u64)
     {
         let mut buf = SerialFmt::new();
         let _ = write!(buf, "REGISTER_DEATH_EQ: error code {}", reply.label);
-        buf.flush_self_log();
+        self_log(buf.as_str());
     }
 }
 
@@ -342,7 +346,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
             write!(buf, "recv loop wedged (err={err}); exiting")
         }
     };
-    buf.flush_self_log();
+    self_log(buf.as_str());
 }
 
 /// Non-blocking drain of the death event queue. Each payload encodes
@@ -374,7 +378,7 @@ fn drain_deaths(death_eq: u32, table: &mut SlotTable)
             {
                 let mut buf = SerialFmt::new();
                 let _ = write!(buf, "reclaim: badge={badge} exit_reason=0x{exit_reason:x}");
-                buf.flush_self_log();
+                self_log(buf.as_str());
             }
         }
     }
@@ -851,46 +855,11 @@ fn self_log(payload: &str)
     out.flush();
 }
 
-/// Stack-buffer `fmt::Write` adapter for one-shot formatted
-/// diagnostics. 256-byte cap matches `LINE_BUF_SIZE`; over-long
-/// formatted output truncates.
-struct SerialFmt
-{
-    buf: [u8; 256],
-    used: usize,
-}
-
-impl SerialFmt
-{
-    fn new() -> Self
-    {
-        Self {
-            buf: [0u8; 256],
-            used: 0,
-        }
-    }
-
-    fn flush_self_log(&self)
-    {
-        // SAFETY: SerialFmt only ever receives UTF-8 from
-        // `core::fmt::write`.
-        let s = unsafe { core::str::from_utf8_unchecked(&self.buf[..self.used]) };
-        self_log(s);
-    }
-}
-
-impl Write for SerialFmt
-{
-    fn write_str(&mut self, s: &str) -> core::fmt::Result
-    {
-        let bytes = s.as_bytes();
-        let cap = self.buf.len() - self.used;
-        let n = bytes.len().min(cap);
-        self.buf[self.used..self.used + n].copy_from_slice(&bytes[..n]);
-        self.used += n;
-        Ok(())
-    }
-}
+/// Stack-buffer `fmt::Write` target for one-shot formatted diagnostics,
+/// emitted with `self_log(buf.as_str())`. The 256-byte cap matches
+/// `LINE_BUF_SIZE`; over-long formatted output truncates on a character
+/// boundary, so the text stays valid UTF-8.
+type SerialFmt = logd_codec::BoundedStr<LINE_BUF_SIZE>;
 
 fn elapsed_us() -> u64
 {

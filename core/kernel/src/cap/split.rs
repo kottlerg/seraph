@@ -193,14 +193,13 @@ pub(crate) unsafe fn install_split_children(
 
     DERIVATION_LOCK.write_unlock();
 
-    // SAFETY: orig_obj_ptr is the object the caller's lookup pins (its
-    // `PinnedCap` outlives this call), so it is live here.
-    let remaining = unsafe { (*orig_obj_ptr.as_ptr()).dec_ref() };
-    if remaining == 0
-    {
-        // SAFETY: ref count reached zero; no other references exist.
-        unsafe { dealloc_object(orig_obj_ptr) };
-    }
+    // Release the reference the consumed slot held, freeing the original if
+    // it was the last (a caller's syscall pin, released after this call,
+    // usually is).
+    // SAFETY: orig_obj_ptr is the object the freed slot referenced, live
+    // until this release (contract: refcount > 0), and the slot's reference
+    // is released exactly once, here; syscall context with no lock held.
+    unsafe { crate::cap::object::release_ref(orig_obj_ptr) };
 
     // Return the handles minted under the insert's lock hold (#349), never a
     // re-read of the slot (core/kernel/docs/capability-internals.md

@@ -711,9 +711,10 @@ own; the one thing it enforces is that a thread cannot outlive the `CSpace` or `
 bound to: when the last capability to either object is deleted, every thread bound to it is stopped
 before the object's storage is reclaimed, wherever those threads' own capabilities are held —
 including the deleting thread itself, when it holds that last capability to its own `CSpace` or
-`AddressSpace` (the delete then never returns to it). The process's resources are reclaimed as their
-capability reference counts reach zero; an object another thread's syscall is still using is freed
-only once that syscall is done with it (see
+`AddressSpace` (the delete then never returns to it, unless another thread's syscall still pins the
+object, in which case the stop follows when that syscall releases it). The process's resources are
+reclaimed as their capability reference counts reach zero; an object another thread's syscall is
+still using is freed only once that syscall is done with it (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
 § Storage: Hybrid Two-Level Radix and
 [thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)

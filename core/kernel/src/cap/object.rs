@@ -1428,6 +1428,10 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
     {
         return;
     }
+    // `dec_ref` is a Release decrement: pair it with an Acquire here, so this
+    // freer observes every write the other owners made before they released
+    // their references.
+    core::sync::atomic::fence(Ordering::Acquire);
     // SAFETY: refcount reached 0; nothing else references the object.
     match unsafe { obj.as_ref().obj_type }
     {

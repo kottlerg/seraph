@@ -104,11 +104,13 @@ sibling's delete of the last capability, or another holder's revoke of an ancest
 object linked under the original's derivation parent, so another holder's revoke of that ancestor
 can release it directly; for a same-object derivation, as in the kill-process pattern, it is the
 delete following the revoke that releases it. Either way the object is freed only when its count
-reaches zero, which a held pin defers until the syscall drops it. The remaining lock-free readers —
-the capability-tree syscalls' first resolution of a source (copy, derive, derive-badge, and
-move) and the IPC transfer pre-validation — dereference no object until they revalidate the slot
-under the derivation write lock (see [§ Global Derivation Lock](#global-derivation-lock)); the tag
-and per-slot generation checks at those resolution sites only narrow the race they act on.
+reaches zero, which a held pin defers until the syscall drops it. Copy, derive, and derive-badge
+pin their source the same way, so the reference they take for the new slot never lands on a freed
+object, and still revalidate the source slot under the derivation write lock before they link the
+new one (see [§ Global Derivation Lock](#global-derivation-lock)). The remaining lock-free readers
+— the IPC transfer pre-validation and the capability-tree syscalls' unlocked pre-checks — read only
+the tag, generation, and in-flight pin of a slot and dereference no object; the tag and per-slot
+generation checks there only narrow the race they act on, and the locked path re-decides.
 
 **Slot 0** is always null. The leaf covering slot 0 exists once the CSpace
 has grown, but the slot is permanently locked to the null capability,
@@ -618,7 +620,11 @@ the stops' cancellations, like a dying thread's own drain, reach the IPC source 
 was parked on only through its binding, re-read under the thread's `sched_lock`, which proves the
 source not yet freed (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
-§ `dealloc_object(Thread)` Drain Protocol, step 11).
+§ `dealloc_object(Thread)` Drain Protocol, step 11), except where a waker that holds no
+reference on the source has claimed the thread: device IRQ delivery
+([#561](https://github.com/kottlerg/seraph/issues/561)), fault delivery
+([#538](https://github.com/kottlerg/seraph/issues/538)), and the death post
+([#539](https://github.com/kottlerg/seraph/issues/539)).
 
 Every derivation link reachable from a live slot resolves: before a `CSpace`
 unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every

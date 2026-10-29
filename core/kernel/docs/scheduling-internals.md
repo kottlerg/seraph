@@ -220,7 +220,8 @@ skipping levels, risks deadlock.
    `enqueue_and_wake` keeps the source alive until that wake nulls the binding: a syscall waker
    through its pin (rule 10), the sleep timer through `sleep_wakeups_quiesce`, `waitset_notify`
    through the notifying source's lock that the wait set's teardown must take, and a canceller or a
-   dying thread's drain through the `sched_lock` it holds across its claim and its binding clear.
+   dying thread's drain through the `sched_lock` it holds across its claim and its binding clear,
+   and `endpoint_recv`'s refused reply rebind through the same hold (rule 8).
    The wakers that hold no such guarantee are tracked as open defects: device IRQ delivery to a
    notification ([#561](https://github.com/kottlerg/seraph/issues/561)), the death post to an
    event queue ([#539](https://github.com/kottlerg/seraph/issues/539)), and fault delivery to an
@@ -282,12 +283,15 @@ skipping levels, risks deadlock.
    the sibling for `endpoint_recv`'s `BlockedOnSend → BlockedOnReply`/`BlockedOnFault` rebind of an
    already-`Blocked` send-queue-dequeued caller: it writes `ipc_state`/`blocked_on_object` under
    `(*tcb).sched_lock` (serialising the reply-binding publication with dealloc's `Exited` mark),
-   returning `false` if a stop/exit already won, in which case `endpoint_recv` tears the binding
-   down. Direct writes to `(*tcb).state = Blocked` from outside `sched_lock` are forbidden — they
-   race the all-locks `Stopped` write in `sys_thread_stop` and silently clobber it. Lock order:
-   source IPC lock (outer, held by the IPC primitive) → `(*tcb).sched_lock` (inner, acquired by the
-   commit helper). After a successful commit, a caller whose source-side registration stands MUST
-   reach `schedule()` before returning to user mode or attempting another commit: the wake deposited
+   returning `false` if a stop/exit already won, in which case it retires the sender's stale
+   `BlockedOnSend` binding inside that same `sched_lock` hold (the dequeued sender is on no queue
+   the endpoint's teardown would reach, so a binding left behind would let the sender's own drain
+   pass rule 7's re-read against a freed endpoint) and `endpoint_recv` tears the reply binding down.
+   Direct writes to `(*tcb).state = Blocked` from outside `sched_lock` are forbidden — they race the
+   all-locks `Stopped` write in `sys_thread_stop` and silently clobber it. Lock order: source IPC
+   lock (outer, held by the IPC primitive) → `(*tcb).sched_lock` (inner, acquired by the commit
+   helper). After a successful commit, a caller whose source-side registration stands MUST reach
+   `schedule()` before returning to user mode or attempting another commit: the wake deposited
    against the park is consumed only by a run-queue dequeue inside `schedule()`, and any other exit
    leaks the waker's link (`queued_on` tripwires in `commit_blocked_under_local_lock` and
    `PerCpuScheduler::enqueue` enforce this in debug builds; #352). The only sanctioned exception is
@@ -296,14 +300,14 @@ skipping levels, risks deadlock.
    only after winning the park's claim (`sleep_list_remove` under `sched_lock`, the claim a cancel
    makes; a lost withdrawal reaches `schedule()`), and a timed notification or event-queue wait that
    finds the sleep list full (`sched::withdraw_uncontested_park`), which dequeues itself under the
-   source lock it has held since its push, so no waker or cancel can have claimed it; the
-   withdrawal rules are
-   [thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants),
-   invariant 4. Non-blocking polls MUST NOT use the park path at all: `SYS_EVENT_RECV`'s `u64::MAX`
-   try-once mode is `event_queue_try_recv`, a single dequeue attempt under `eq.lock` that takes no
-   TCB and cannot register a waiter. For `sys_ipc_call`/fault park episodes, every deposit
-   additionally carries a reply-disposition stamp consumed by the resume; see
-   [ipc-internals.md](ipc-internals.md) § Park Dispositions and Episodes.
+   source lock it has held since its push, so no waker or cancel can have claimed it; the withdrawal
+   rules are [thread-lifecycle-and-sleep.md § Sleep List
+   Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants), invariant 4. Non-blocking polls
+   MUST NOT use the park path at all: `SYS_EVENT_RECV`'s `u64::MAX` try-once mode is
+   `event_queue_try_recv`, a single dequeue attempt under `eq.lock` that takes no TCB and cannot
+   register a waiter. For `sys_ipc_call`/fault park episodes, every deposit additionally carries a
+   reply-disposition stamp consumed by the resume; see [ipc-internals.md](ipc-internals.md) § Park
+   Dispositions and Episodes.
 
 9. **Wake commit MUST go through `enqueue_and_wake`.** Wake primitives MUST NOT write
    `(*tcb).state = Ready`, `ipc_state = None`, or `blocked_on_object = null` themselves under the

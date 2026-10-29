@@ -882,19 +882,25 @@ threads never outlive either object (see [scheduling-internals.md](scheduling-in
 Registry). **The stop includes the caller**: a thread deleting the last capability to its own
 `CSpace` or `AddressSpace` — directly, or because the deleted object's teardown cascades into it —
 is stopped by that delete and the call does not return; the object is reclaimed once the thread is
-off its CPU. A teardown of a Thread left `current` on a CPU that `fatal` halted never completes
-(see
-[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
-§ `dealloc_object(Thread)` Drain Protocol, invariant 3), nor does one of a `CSpace` or
-`AddressSpace` with such a thread bound (see [scheduling-internals.md](scheduling-internals.md) §
-Thread Registry): the call does not return, or, when the deleter is itself stopped and the
-teardown is deferred, the deferred drain on its CPU never completes. An object another thread's
-syscall is still using is not freed under it: the syscall holds a pin on it until it drops it (see
+off its CPU. When another thread's syscall holds a pin on the object at the delete (see below), the
+delete is not the last release: it returns 0, and the stop and the free happen when that syscall
+drops its pin, through the deferred reclaim of the dropping thread's CPU. A teardown of a Thread
+left `current` on a CPU that `fatal` halted never completes (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol) §
+`dealloc_object(Thread)` Drain Protocol, invariant 3), nor does one of a `CSpace` or `AddressSpace`
+with such a thread bound (see [scheduling-internals.md](scheduling-internals.md) § Thread Registry):
+the call does not return, or, when the deleter is itself stopped and the teardown is deferred, the
+deferred drain on its CPU never completes. An object another thread's syscall is still using is not
+freed under it: the syscall holds a pin on it until it drops it (see
 [capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage: Hybrid
 Two-Level Radix), and a stopped thread's teardown reaches the IPC source it was parked on only
 through a binding that proves the source live (see
-[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
-§ `dealloc_object(Thread)` Drain Protocol, step 11). The caller's own `Thread` object is treated
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol) §
+`dealloc_object(Thread)` Drain Protocol, step 11), except where a waker that holds no reference on
+the source has claimed the thread: device IRQ delivery
+([#561](https://github.com/kottlerg/seraph/issues/561)), fault delivery
+([#538](https://github.com/kottlerg/seraph/issues/538)), and the death post
+([#539](https://github.com/kottlerg/seraph/issues/539)). The caller's own `Thread` object is treated
 differently, as below.
 
 Refused for two cases, both returning `InvalidState` with the capability left in

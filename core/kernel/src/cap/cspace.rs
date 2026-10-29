@@ -169,10 +169,10 @@ const _: () = assert!(core::mem::size_of::<CSpaceDirPage>() == crate::mm::PAGE_S
 /// State is split between the `CSpace` spinlock and `DERIVATION_LOCK`;
 /// directory and leaf pointers are write-once and Release-published by
 /// [`grow`][Self::grow], so [`slot`][Self::slot] serves lock-free readers
-/// (the capability-tree syscalls' first resolution, which they revalidate
-/// under `DERIVATION_LOCK`, and the transfer pre-validation). A syscall that
-/// uses the object a handle names reads the slot under this `CSpace`'s lock
-/// instead, and pins the object there (`syscall::pin_slot`). The full
+/// (the transfer pre-validation and the capability-tree syscalls' unlocked
+/// pre-checks, which dereference no object). A syscall that uses the object
+/// a handle names reads the slot under this `CSpace`'s lock instead, and pins
+/// the object there (`syscall::pin_slot`). The full
 /// contract is in core/kernel/docs/capability-internals.md § Storage: Hybrid
 /// Two-Level Radix.
 pub struct CSpace

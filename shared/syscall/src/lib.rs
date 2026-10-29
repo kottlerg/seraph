@@ -1208,7 +1208,9 @@ pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u
 ///
 /// Deleting the last capability to the caller's own `CSpace` or
 /// `AddressSpace` (directly, or through the teardown cascade) stops the
-/// caller: the call never returns. Deleting the caller's own Thread
+/// caller: the call never returns (or, when another thread's syscall still
+/// pins the object, returns, and the stop follows when that syscall
+/// releases it). Deleting the caller's own Thread
 /// capability is refused instead. A teardown of a Thread left `current` on a
 /// CPU that `fatal` halted, or of a `CSpace` or `AddressSpace` with such a
 /// thread bound, never completes, so the call does not return

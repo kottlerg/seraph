@@ -705,7 +705,7 @@ pub fn sys_memory_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::derivation::{DERIVATION_LOCK, unlink_node};
-    use crate::cap::object::{MemoryObject, dealloc_object};
+    use crate::cap::object::MemoryObject;
     use crate::cap::slot::{MemRights, SlotId};
     use crate::syscall::current_tcb;
 
@@ -930,20 +930,18 @@ pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
         (*caller_cspace).lock.unlock_raw(saved);
     }
 
-    // Drop both write locks before dec_ref'ing the tail (dec_ref can take
-    // dealloc_object, which may itself acquire other locks).
+    // Drop both write locks before releasing the tail's reference (the
+    // release can free the tail, which takes other locks).
     release_locks();
 
-    // SAFETY: tail_obj_nn is the object `tail_slot` pins, so this release
-    // cannot be its last reference while the pin lives.
-    let remaining = unsafe { (*tail_obj_nn.as_ptr()).dec_ref() };
-    if remaining == 0
-    {
-        // SAFETY: refcount reached zero; owns_memory cleared above so the
-        // dealloc path will not double-free the buddy region (parent now
-        // covers it).
-        unsafe { dealloc_object(tail_obj_nn) };
-    }
+    // Release the reference the freed tail slot held. `tail_slot` still pins
+    // the tail, so the free happens when that pin drops; owns_memory was
+    // cleared above, so the free does not return the merged range to the
+    // buddy allocator (the parent now covers it).
+    // SAFETY: tail_obj_nn is the object the freed slot referenced, live
+    // until this release; that reference is released exactly once, here;
+    // syscall context with no lock held.
+    unsafe { crate::cap::object::release_ref(tail_obj_nn) };
 
     Ok(0)
 }

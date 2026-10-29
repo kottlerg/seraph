@@ -42,8 +42,8 @@ pub const IP_OFFSET: usize = 120;
 pub const SYSCALL_NR_OFFSET: usize = 0;
 
 /// Byte offset of the second argument register (`rsi`) in the kernel
-/// `TrapFrame`: restored on the syscall return and written by no syscall's
-/// return values.
+/// `TrapFrame`: restored on the syscall return and written only by a
+/// successful syscall's secondary return (`SYS_IPC_RECV`'s badge).
 pub const ARG1_OFFSET: usize = 32;
 
 /// Execute an instruction defined to be illegal (`ud2`), so the calling

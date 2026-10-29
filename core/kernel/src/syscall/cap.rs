@@ -36,46 +36,34 @@ use syscall::SyscallError;
 use super::current_tcb;
 
 /// Resolve a user-supplied source-cap handle for `cap_copy` / `cap_derive` /
-/// `cap_derive_badge` / `cap_move`: verify the slot is non-null and that the
-/// handle's generation matches the slot's, rejecting a stale handle to a
-/// recycled slot (#349). The index is decoded from the handle. Returns the
-/// `(tag, rights, object, badge)` a copy/derive/move needs.
+/// `cap_derive_badge`: verify the slot is non-null and that the handle's
+/// generation matches the slot's, rejecting a stale handle to a recycled slot
+/// (#349), and pin the object the slot names (`super::pin_slot`). The index is
+/// decoded from the handle. Returns the pin, whose fields carry the `(tag,
+/// rights, object, badge)` a copy or derive needs; the caller holds it across
+/// the reference it takes for the new slot, so that increment never lands on a
+/// freed object, and revalidates the slot under `DERIVATION_LOCK` before it
+/// links the new slot.
+///
+/// # Errors
+/// `InvalidCapability` for a null, stale, or object-less slot.
 ///
 /// # Safety
-/// `cspace` must be a valid `CSpace` pointer.
+/// As for `super::pin_slot`: `cspace` is the running thread's bound `CSpace`,
+/// and no lock is held.
 #[cfg(not(test))]
 unsafe fn resolve_src_cap(
     cspace: *mut crate::cap::cspace::CSpace,
     handle: u32,
-) -> Result<
-    (
-        crate::cap::slot::CapTag,
-        crate::cap::slot::Rights,
-        core::ptr::NonNull<crate::cap::object::KernelObjectHeader>,
-        u64,
-    ),
-    SyscallError,
->
+) -> Result<super::PinnedCap, SyscallError>
 {
-    // SAFETY: cspace is a valid CSpace pointer (caller contract).
-    let cs = unsafe { &*cspace };
-    let slot = cs
-        .slot(syscall::cap_handle_index(handle))
-        .ok_or(SyscallError::InvalidCapability)?;
-    if slot.tag == crate::cap::slot::CapTag::Null
+    // SAFETY: forwarded caller contract.
+    let pin = unsafe { super::pin_slot(cspace, handle) }?;
+    if pin.object.is_none()
     {
         return Err(SyscallError::InvalidCapability);
     }
-    if slot.generation() != syscall::cap_handle_gen(handle)
-    {
-        return Err(SyscallError::InvalidCapability);
-    }
-    Ok((
-        slot.tag,
-        slot.rights,
-        slot.object.ok_or(SyscallError::InvalidCapability)?,
-        slot.badge,
-    ))
+    Ok(pin)
 }
 
 /// Revalidate `handle`'s slot under `DERIVATION_LOCK` before its object is
@@ -979,9 +967,9 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     // Resolve AddressSpace cap.
     // SAFETY: caller_cspace validated non-null above.
     let as_slot = unsafe { super::lookup_cap(caller_cspace, as_idx, AsRights::MAP) }?;
-    // One read of the slot's object pointer: it is what the TCB binds below
-    // and what the post-registration revalidation compares against
-    // (`as_slot` is a live reference into the leaf page, not a copy).
+    // The pinned object pointer: what the TCB binds below and what the
+    // post-registration revalidation compares against (`as_slot` is a
+    // snapshot taken under the CSpace lock; the slot itself may change).
     let as_object = as_slot.object;
     let as_ptr = {
         use crate::cap::object::AddressSpaceObject;
@@ -1405,7 +1393,7 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
     // pool pages that stay spent (`core/kernel/docs/syscalls.md` § SYS_CAP_COPY); the source
     // is resolved again below, right before its reference is taken.
     // SAFETY: caller_cspace validated non-null above.
-    unsafe { resolve_src_cap(caller_cspace, src_handle)? };
+    drop(unsafe { resolve_src_cap(caller_cspace, src_handle)? });
 
     // Pre-grow for an explicit destination before the inc_ref and the
     // destination lock: bounded holds, budget fast-fail, nothing to roll
@@ -1417,15 +1405,16 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
         pre_grow_for_explicit_slot(dest_cs_ptr, dest_slot_idx)?;
     }
 
-    // Resolve the source only now, after the pre-grow's preemptible lock
-    // releases: the object reference is taken immediately below, and a
-    // sibling's delete of the source during a long pre-grow would otherwise
-    // free the body between the resolution and the inc_ref (the residual
-    // window is the lookup itself, as everywhere else).
+    // Resolve and pin the source only now, after the pre-grow: the pin spans
+    // the inc_ref and the revalidation below, and holding it across a long
+    // pre-grow would only delay a concurrent delete's free.
     // SAFETY: caller_cspace validated non-null above. Decodes + generation-
     // checks the source handle, rejecting a stale handle to a recycled slot.
-    let (src_tag, src_rights, src_object, src_badge) =
-        unsafe { resolve_src_cap(caller_cspace, src_handle)? };
+    // `src` pins the source object for the rest of the call: the reference
+    // taken below for the new slot never lands on a freed object.
+    let src = unsafe { resolve_src_cap(caller_cspace, src_handle)? };
+    let (src_tag, src_rights, src_badge) = (src.tag, src.rights, src.badge);
+    let src_object = src.object.ok_or(SyscallError::InvalidCapability)?;
 
     // Convert src_idx to NonZeroU32 before the reference is taken. The
     // non-null tag check above excludes slot 0 (which is permanently Null),
@@ -1438,7 +1427,7 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
     let effective_rights = rights_mask & src_rights;
 
     // Increment reference count on the shared kernel object.
-    // SAFETY: src_object is a valid NonNull from a live capability slot.
+    // SAFETY: src_object is the object `src` pins, so its count is not zero.
     unsafe {
         (*src_object.as_ptr()).inc_ref();
     }
@@ -1557,8 +1546,11 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
     // Resolve source slot.
     // SAFETY: caller_cspace validated non-null above. Decodes + generation-
     // checks the source handle, rejecting a stale handle to a recycled slot.
-    let (src_tag, src_rights, src_object, src_badge) =
-        unsafe { resolve_src_cap(caller_cspace, src_handle)? };
+    // `src` pins the source object for the rest of the call: the reference
+    // taken below for the new slot never lands on a freed object.
+    let src = unsafe { resolve_src_cap(caller_cspace, src_handle)? };
+    let (src_tag, src_rights, src_badge) = (src.tag, src.rights, src.badge);
+    let src_object = src.object.ok_or(SyscallError::InvalidCapability)?;
 
     let effective_rights = rights_mask & src_rights;
 
@@ -1568,7 +1560,7 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
 
     // Increment refcount, then insert into caller's CSpace.
-    // SAFETY: src_object validated above as valid NonNull from live slot.
+    // SAFETY: src_object is the object `src` pins, so its count is not zero.
     unsafe {
         (*src_object.as_ptr()).inc_ref();
     }
@@ -1673,8 +1665,11 @@ pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
     // Resolve source slot.
     // SAFETY: caller_cspace validated non-null above. Decodes + generation-
     // checks the source handle, rejecting a stale handle to a recycled slot.
-    let (src_tag, src_rights, src_object, src_badge) =
-        unsafe { resolve_src_cap(caller_cspace, src_handle)? };
+    // `src` pins the source object for the rest of the call: the reference
+    // taken below for the new slot never lands on a freed object.
+    let src = unsafe { resolve_src_cap(caller_cspace, src_handle)? };
+    let (src_tag, src_rights, src_badge) = (src.tag, src.rights, src.badge);
+    let src_object = src.object.ok_or(SyscallError::InvalidCapability)?;
 
     // Cannot re-badge a capability that already has a badge.
     if src_badge != 0
@@ -1690,7 +1685,7 @@ pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
 
     // Increment refcount, then insert into caller's CSpace.
-    // SAFETY: src_object validated above as valid NonNull from live slot.
+    // SAFETY: src_object is the object `src` pins, so its count is not zero.
     unsafe {
         (*src_object.as_ptr()).inc_ref();
     }

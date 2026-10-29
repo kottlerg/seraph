@@ -580,10 +580,10 @@ pub struct CapabilitySlot
 // are serialised by two lock domains: slot occupancy by the CSpace spinlock,
 // derivation links by DERIVATION_LOCK. A syscall that uses the object a slot
 // names reads the slot under the CSpace spinlock and pins the object there
-// (`syscall::pin_slot`); the remaining lock-free readers — the
-// capability-tree syscalls' first resolution and the transfer pre-validation
-// — dereference no object until they revalidate the slot under
-// DERIVATION_LOCK (see
+// (`syscall::pin_slot`); the remaining lock-free readers — the transfer
+// pre-validation and the capability-tree syscalls' unlocked pre-checks —
+// read only the tag, generation, and pin bits and dereference no object
+// (see
 // core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level Radix).
 unsafe impl Send for CapabilitySlot {}
 // SAFETY: see the Send impl above; shared access follows the same lock

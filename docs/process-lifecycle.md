@@ -403,7 +403,9 @@ A process dies when:
 - The last capability to its `CSpace` or `AddressSpace` is deleted: the kernel stops every thread
   bound to the object (retained exit reason `EXIT_KILLED`) before reclaiming it, so the process's
   threads cannot outlive either. A thread deleting the last capability to its own `CSpace` or
-  `AddressSpace` is stopped by that same delete and never returns from it.
+  `AddressSpace` is stopped by that same delete and never returns from it, unless another
+  thread's syscall still pins the object: the delete then returns, and the stop follows when
+  that syscall releases the object.
 - An unhandled fault terminates its threads.
 
 Under the kill-process pattern and the `CSpace`/`AddressSpace` teardown, an object a concurrent
@@ -412,7 +414,11 @@ teardown reaches the IPC source it was parked on only while that source is live 
 [Capability Internals](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
 § Storage: Hybrid Two-Level Radix and
 [thread-lifecycle-and-sleep.md](../core/kernel/docs/thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
-§ `dealloc_object(Thread)` Drain Protocol, step 11).
+§ `dealloc_object(Thread)` Drain Protocol, step 11), except where a waker that holds no
+reference on the source has claimed the thread: device IRQ delivery
+([#561](https://github.com/kottlerg/seraph/issues/561)), fault delivery
+([#538](https://github.com/kottlerg/seraph/issues/538)), and the death post
+([#539](https://github.com/kottlerg/seraph/issues/539)).
 
 ### Exit reason
 

@@ -3706,7 +3706,10 @@ pub unsafe fn withdraw_uncontested_park(tcb: *mut ThreadControlBlock)
 /// (#289 use-after-free / double-enqueue; #284 TCB-field corruption).
 ///
 /// Returns `true` if the rebind committed (caller still `Blocked`); `false` if a
-/// concurrent stop/exit already won, in which case the caller MUST tear down the
+/// concurrent stop/exit already won, in which case this function has retired
+/// the sender's stale `BlockedOnSend` binding under its `sched_lock` (no
+/// endpoint teardown reaches a dequeued sender to null it) and the caller MUST
+/// tear down the
 /// reply binding it published: CAS the server's `reply_tcb` from the caller back
 /// to null and, on a win, stamp the cancelled deposit (`stamp_cancelled_deposit`:
 /// INTERRUPTED, or KILL for a fault sender) before clearing the caller's
@@ -3742,9 +3745,24 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
             }
             true
         }
-        thread::ThreadState::Stopped
-        | thread::ThreadState::Exited
-        | thread::ThreadState::Running
+        // A stop or teardown won: the sender is dequeued, so its
+        // `BlockedOnSend` binding to the endpoint no longer names a queue that
+        // holds it, and this refusal's caller (endpoint_recv, which dequeued
+        // it under `ep.lock`) owns the episode. Retire the binding here, inside
+        // the hold that observed the refusal: once `ep.lock` drops, the
+        // endpoint's teardown no longer reaches the sender to null it, and a
+        // binding left behind would let the sender's own `dealloc_object(Thread)`
+        // drain pass `ipc::lock_bound_source`'s re-read against a freed endpoint.
+        thread::ThreadState::Stopped | thread::ThreadState::Exited =>
+        {
+            // SAFETY: under sched_lock, the pair's serializer.
+            unsafe {
+                (*tcb).ipc_state = thread::IpcThreadState::None;
+                (*tcb).blocked_on_object = core::ptr::null_mut();
+            }
+            false
+        }
+        thread::ThreadState::Running
         | thread::ThreadState::Ready
         | thread::ThreadState::Created => false,
     };

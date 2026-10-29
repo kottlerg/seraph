@@ -931,10 +931,11 @@ pub(crate) unsafe fn pin_slot(
 /// holding those rights, and pin the object it names (see [`PinnedCap`]).
 ///
 /// This is the chokepoint for resolving a user-supplied handle of one
-/// expected type; [`pin_slot`] serves the multi-tag handlers, and the
-/// capability-tree handlers in `cap.rs` and `mem.rs` that revalidate under
-/// the derivation lock decode and generation-check the handle themselves (see
-/// core/kernel/docs/capability-internals.md § Per-Slot Generation).
+/// expected type; [`pin_slot`] serves the multi-tag handlers and the
+/// copy and derive sources, and the capability-tree handlers that act on a
+/// slot under the derivation lock decode and generation-check the handle
+/// themselves (see core/kernel/docs/capability-internals.md § Per-Slot
+/// Generation).
 ///
 /// The expected slot tag is fixed by the required-rights argument's type:
 /// `required_rights: TypedRights<K>` selects `K::TAG`, so a rights constant of

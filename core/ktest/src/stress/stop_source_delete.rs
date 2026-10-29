@@ -26,13 +26,25 @@
 //! whose teardown has not yet claimed the waiter, so it is not yet freed
 //! (core/kernel/docs/scheduling-internals.md § Lock Hierarchy, rule 7).
 //!
+//! That argument needs every claimant that takes a waiter off its source to
+//! retire the binding before the source can go. One claimant once did not: a
+//! server's `ipc_recv` that dequeued a queued caller whose stop or teardown
+//! had just committed found the caller's reply rebind refused
+//! (`commit_reply_rebind_under_local_lock`), rolled the reply binding back,
+//! and skipped the caller, leaving its `BlockedOnSend` binding naming the
+//! endpoint though no queue held it. The endpoint's teardown then no longer
+//! reached the caller, and the caller's drain re-read a binding to a freed
+//! endpoint. The refused rebind now retires that binding under the caller's
+//! `sched_lock`.
+//!
 //! ## How this exercises it
 //!
-//! Ten phases: for each source kind — a notification, an event queue, a
+//! Twelve phases: for each source kind — a notification, an event queue, a
 //! wait set with a notification member, an endpoint receive (`ipc_recv`, the
-//! waiter queued as a receiver), and an endpoint call (`ipc_call` with no
-//! receiver, the waiter queued as a sender) — one phase racing a stop and one
-//! racing a Thread delete. A long-lived racer, pinned to CPU 2, takes the
+//! waiter queued as a receiver), an endpoint call (`ipc_call` with no
+//! receiver, the waiter queued as a sender), and a served endpoint call (the
+//! same, with a server receiving on the endpoint) — one phase racing a stop
+//! and one racing a Thread delete. A long-lived racer, pinned to CPU 2, takes the
 //! phase's action (stop the waiter, or delete its Thread capability) in each
 //! round it is armed for. The controller, pinned to CPU 0, runs [`CYCLES`]
 //! rounds per phase (fewer past 16 CPUs, see [`super::scaled_attempts`]).
@@ -57,6 +69,23 @@
 //! after which it exits. In a Thread-delete phase the racer's delete ends the
 //! waiter wherever it is.
 //!
+//! The served-call phases aim at the refused-rebind claimant. A long-lived
+//! server, pinned to CPU 3, is armed with each round alongside the racer:
+//! after a varying delay of its own it receives on the round's endpoint,
+//! replies at once to any caller it receives (the waiter counts a served call
+//! and calls again), and receives again, until a receive meets the deleted
+//! endpoint: `Interrupted` (the teardown drained it while it was parked) or
+//! `InvalidCapability` (the handle was gone at entry). Its receive can thus
+//! dequeue a caller whose stop, or whose Thread delete, commits between the
+//! dequeue and the reply rebind. The controller deletes the endpoint, waits
+//! for the racer and the server, and in the stop phase does not restart the
+//! stopped caller: the round's teardown deletes its last Thread capability,
+//! so its drain runs after the endpoint's free. Userspace cannot see which
+//! receive met a refused rebind; the kernel's debug assertions are the
+//! tripwire for a binding that outlives the endpoint, and the cell requires
+//! that the race armed (an action landed on a caller inside a call) and that
+//! some server receive was parked on the endpoint when it was deleted.
+//!
 //! Required, per phase: every wait returned `Interrupted` or
 //! `InvalidCapability` (nothing is ever delivered); every racer action
 //! returned an accepted result (a stop `Ok` or `InvalidState`, a Thread
@@ -69,9 +98,12 @@
 //! kernel's own tripwires (a freed object's lock or magic word, the
 //! wait-queue and spurious-resume assertions) are what catch an access to a
 //! freed source, so the cell's checks are that the kernel survives and that
-//! the race armed.
+//! the race armed. A served-call wait may also return the server's reply
+//! (tallied as served, never required), and in the served-call stop phase,
+//! with no restart, no `Interrupted` is required.
 //!
-//! Needs **≥ 3 CPUs**.
+//! Needs **≥ 3 CPUs**; the served-call phases need a fourth (for the server)
+//! and are skipped below it.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -100,14 +132,20 @@ const MIN_CYCLES: u32 = 32;
 /// CPUs needed: one each for the controller, the waiter, and the racer.
 const MIN_CPUS: u64 = 3;
 
+/// CPUs the served-call phases need: the server takes a fourth.
+const SERVED_MIN_CPUS: u64 = 4;
+
 /// The participants' CPUs.
 const CONTROLLER_CPU: u32 = 0;
 const WAITER_CPU: u32 = 1;
 const RACER_CPU: u32 = 2;
+const SERVER_CPU: u32 = 3;
 
 /// Stress stack indices of the waiter and the racer.
 const WAITER_STACK: usize = 0;
 const RACER_STACK: usize = 1;
+/// Stress stack index of the served-call phases' server.
+const SERVER_STACK: usize = 2;
 
 /// Capacity of each event queue; nothing is ever posted to it.
 const EVENT_QUEUE_CAPACITY: u32 = 4;
@@ -135,6 +173,9 @@ const EXIT_WAIT_US: u64 = 2_000_000;
 
 /// Polls a bounded wait spins busily before it polls in 1 ms sleeps.
 const BUSY_POLLS: u32 = 100_000;
+
+/// Label of the served-call server's reply.
+const SERVER_REPLY_LABEL: u64 = 0x5D;
 
 /// The racer's result word for a successful action; an error is stored as
 /// its (negative) error word.
@@ -167,6 +208,17 @@ static WAITS_DONE: AtomicU32 = AtomicU32::new(0);
 /// `InvalidCapability` (the handle met after the delete).
 static INTERRUPTED: AtomicU32 = AtomicU32::new(0);
 static GONE: AtomicU32 = AtomicU32::new(0);
+/// Served-call phases: calls the server answered (the waiter calls again).
+static SERVED: AtomicU32 = AtomicU32::new(0);
+/// Served-call phases: controller → server, the round, counted from 1, whose
+/// endpoint it is to receive on; server → controller, the round whose
+/// receives have ended; set by the server when it exits.
+static SERVER_ARMED: AtomicU32 = AtomicU32::new(0);
+static SERVER_DONE: AtomicU32 = AtomicU32::new(0);
+static SERVER_EXITED: AtomicU32 = AtomicU32::new(0);
+/// Served-call phases: receives that ended in `Interrupted` (parked on the
+/// endpoint when it was deleted).
+static SERVER_INTERRUPTED: AtomicU32 = AtomicU32::new(0);
 /// Waits that returned anything else (with the wait's value or error).
 static BAD_WAITS: BadTally = BadTally::new();
 /// Racer actions, and restarts, outside the accepted results (with the
@@ -180,6 +232,9 @@ static BAD_ACTIONS: BadTally = BadTally::new();
 struct IpcBufPage([u64; 512]);
 // SAFETY: used only by the live round's waiter (one at a time, see above).
 static mut WAITER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
+/// The served-call phases' server's IPC buffer (one server per phase).
+// SAFETY: used only by the live phase's server.
+static mut SERVER_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
 /// What a phase's waiters park on.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -190,6 +245,8 @@ enum Kind
     WaitSet,
     Recv,
     Call,
+    /// An endpoint call with a server receiving on the endpoint.
+    CallServed,
 }
 
 impl Kind
@@ -204,6 +261,7 @@ impl Kind
             Kind::WaitSet => 2,
             Kind::Recv => 3,
             Kind::Call => 4,
+            Kind::CallServed => 5,
         }
     }
 
@@ -216,7 +274,8 @@ impl Kind
             1 => Kind::EventQueue,
             2 => Kind::WaitSet,
             3 => Kind::Recv,
-            _ => Kind::Call,
+            4 => Kind::Call,
+            _ => Kind::CallServed,
         }
     }
 }
@@ -287,6 +346,10 @@ struct Seen
     /// Waits that returned `Interrupted`, and `InvalidCapability`.
     interrupted: u32,
     gone: u32,
+    /// Served-call phases: calls the server answered, and server receives
+    /// that were parked on the endpoint when it was deleted.
+    served: u32,
+    server_interrupted: u32,
 }
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -302,15 +365,16 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "stress::stop_source_delete: pin controller failed")?;
     // Each round's waiter start, cross-CPU action and teardown grow with the
     // width; the count shrinks with it.
-    let result = phases(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus));
+    let result = phases(ctx, super::scaled_attempts(CYCLES, MIN_CYCLES, cpus), cpus);
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::stop_source_delete: restore controller affinity failed");
     result?;
     restore
 }
 
-/// Run every phase of `cycles` rounds and check each.
-fn phases(ctx: &TestContext, cycles: u32) -> TestResult
+/// Run every phase of `cycles` rounds and check each; the served-call phases
+/// only with [`SERVED_MIN_CPUS`] CPUs.
+fn phases(ctx: &TestContext, cycles: u32, cpus: u64) -> TestResult
 {
     for race in [Race::Stop, Race::ThreadDelete]
     {
@@ -320,12 +384,20 @@ fn phases(ctx: &TestContext, cycles: u32) -> TestResult
             Kind::WaitSet,
             Kind::Recv,
             Kind::Call,
+            Kind::CallServed,
         ]
         {
+            if kind == Kind::CallServed && cpus < SERVED_MIN_CPUS
+            {
+                crate::log(
+                    "ktest: stress::stop_source_delete served-call phase SKIP (need 4+ CPUs)",
+                );
+                continue;
+            }
             crate::log(phase_name(kind, race));
             let seen = phase(ctx, kind, race, cycles)?;
             log_seen(&seen);
-            check(&seen, race)?;
+            check(&seen, kind, race)?;
         }
     }
     Ok(())
@@ -347,6 +419,10 @@ fn phase_name(kind: Kind, race: Race) -> &'static str
         (Race::Stop, Kind::WaitSet) => "ktest: stress::stop_source_delete phase stop wait-set",
         (Race::Stop, Kind::Recv) => "ktest: stress::stop_source_delete phase stop endpoint-recv",
         (Race::Stop, Kind::Call) => "ktest: stress::stop_source_delete phase stop endpoint-call",
+        (Race::Stop, Kind::CallServed) =>
+        {
+            "ktest: stress::stop_source_delete phase stop endpoint-call-served"
+        }
         (Race::ThreadDelete, Kind::Notification) =>
         {
             "ktest: stress::stop_source_delete phase thread-delete notification"
@@ -367,6 +443,10 @@ fn phase_name(kind: Kind, race: Race) -> &'static str
         {
             "ktest: stress::stop_source_delete phase thread-delete endpoint-call"
         }
+        (Race::ThreadDelete, Kind::CallServed) =>
+        {
+            "ktest: stress::stop_source_delete phase thread-delete endpoint-call-served"
+        }
     }
 }
 
@@ -382,6 +462,8 @@ fn log_seen(seen: &Seen)
         (" died_between=", seen.died_between),
         (" interrupted=", seen.interrupted),
         (" gone=", seen.gone),
+        (" served=", seen.served),
+        (" server_interrupted=", seen.server_interrupted),
     ]
     {
         log_cell_u64(CELL, label, u64::from(value));
@@ -390,8 +472,9 @@ fn log_seen(seen: &Seen)
 
 /// Check a phase's tallies: nothing failed, and the race armed (a stop or a
 /// Thread delete landed on a waiter inside a wait; a stop phase's restarted
-/// waiters saw `Interrupted`).
-fn check(seen: &Seen, race: Race) -> TestResult
+/// waiters saw `Interrupted`; a served-call phase's server was parked on the
+/// endpoint at some delete).
+fn check(seen: &Seen, kind: Kind, race: Race) -> TestResult
 {
     BAD_WAITS.check(
         CELL,
@@ -409,7 +492,7 @@ fn check(seen: &Seen, race: Race) -> TestResult
             {
                 return Err("stress::stop_source_delete: no stop landed on a waiter inside a wait");
             }
-            if seen.interrupted == 0
+            if kind != Kind::CallServed && seen.interrupted == 0
             {
                 return Err("stress::stop_source_delete: no restarted wait returned Interrupted");
             }
@@ -423,6 +506,12 @@ fn check(seen: &Seen, race: Race) -> TestResult
                 );
             }
         }
+    }
+    if kind == Kind::CallServed && seen.server_interrupted == 0
+    {
+        return Err(
+            "stress::stop_source_delete: no server receive was parked on a deleted endpoint",
+        );
     }
     Ok(())
 }
@@ -442,6 +531,11 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race, cycles: u32) -> Result<Seen,
         &WAITS_DONE,
         &INTERRUPTED,
         &GONE,
+        &SERVED,
+        &SERVER_ARMED,
+        &SERVER_DONE,
+        &SERVER_EXITED,
+        &SERVER_INTERRUPTED,
     ]
     {
         counter.store(0, Ordering::Release);
@@ -453,6 +547,7 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race, cycles: u32) -> Result<Seen,
     }
 
     let mut racer = None;
+    let mut server = None;
     let result = create_thread(
         ctx,
         &mut racer,
@@ -462,17 +557,61 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race, cycles: u32) -> Result<Seen,
         RACER_CPU,
     )
     .and_then(|th| thread_start(th).map_err(|_| "stress::stop_source_delete: start racer failed"))
+    .and_then(|()| start_server(ctx, kind, &mut server))
     .and_then(|()| rounds(ctx, kind, race, cycles));
+    // QUIT ends the racer and the server alike.
     let ended = finish_racer();
-    let released = racer.map_or(Ok(()), |th| {
-        cap_delete(th).map_err(|_| "stress::stop_source_delete: delete racer failed")
-    });
+    let server_ended = if server.is_some()
+    {
+        finish_server()
+    }
+    else
+    {
+        Ok(())
+    };
+    let mut released = Ok(());
+    for th in [racer, server].into_iter().flatten()
+    {
+        if cap_delete(th).is_err()
+        {
+            released = Err("stress::stop_source_delete: delete racer or server failed");
+        }
+    }
     let mut seen = result?;
     ended?;
+    server_ended?;
     released?;
     seen.interrupted = INTERRUPTED.load(Ordering::Acquire);
     seen.gone = GONE.load(Ordering::Acquire);
+    seen.served = SERVED.load(Ordering::Acquire);
+    seen.server_interrupted = SERVER_INTERRUPTED.load(Ordering::Acquire);
     Ok(seen)
+}
+
+/// Start the served-call phases' server (none for any other kind).
+fn start_server(ctx: &TestContext, kind: Kind, server: &mut Option<u32>) -> TestResult
+{
+    if kind != Kind::CallServed
+    {
+        return Ok(());
+    }
+    let th = create_thread(ctx, server, server_entry, SERVER_STACK, 0, SERVER_CPU)?;
+    thread_start(th).map_err(|_| "stress::stop_source_delete: start server failed")
+}
+
+/// Wait for the server to exit ([`QUIT`] is already set).
+fn finish_server() -> TestResult
+{
+    if await_within(crate::scaled_bound(ACK_WAIT_US), || {
+        SERVER_EXITED.load(Ordering::Acquire) != 0
+    })?
+    {
+        Ok(())
+    }
+    else
+    {
+        Err("stress::stop_source_delete: the server did not exit")
+    }
 }
 
 /// Set [`QUIT`] and wait for the racer to exit.
@@ -547,6 +686,10 @@ fn round(
     }
     WAITER.store(waiter, Ordering::Release);
     ARMED.store(cycle + 1, Ordering::Release);
+    if kind == Kind::CallServed
+    {
+        SERVER_ARMED.store(cycle + 1, Ordering::Release);
+    }
     // 0 to 1023 spins of the controller's own, against the racer's 0 to
     // 1023 (a different hash), so the delete and the action land in both
     // orders.
@@ -564,9 +707,22 @@ fn round(
     {
         return Err("stress::stop_source_delete: the racer did not finish its action");
     }
+    if kind == Kind::CallServed
+        && !await_within(crate::scaled_bound(ACK_WAIT_US), || {
+            SERVER_DONE.load(Ordering::Acquire) == cycle + 1
+        })?
+    {
+        return Err("stress::stop_source_delete: the server's receives did not end");
+    }
     let action = RACER_RESULT.load(Ordering::Acquire);
     match race
     {
+        // The stopped caller is not restarted: the round's teardown deletes
+        // its last Thread capability after the endpoint's free.
+        Race::Stop if kind == Kind::CallServed =>
+        {
+            classify_stop(action, entered_before, done_before, seen)
+        }
         Race::Stop => settle_stopped(waiter, action, entered_before, done_before, seen),
         Race::ThreadDelete => settle_deleted(parts, action, entered_before, done_before, seen),
     }
@@ -584,26 +740,8 @@ fn settle_stopped(
     seen: &mut Seen,
 ) -> TestResult
 {
+    classify_stop(action, entered_before, done_before, seen)?;
     let stopped = action == RESULT_OK;
-    if stopped
-    {
-        if waiter_in_wait(entered_before, done_before)?
-        {
-            seen.stopped_in_wait += 1;
-        }
-        else
-        {
-            seen.stopped_between += 1;
-        }
-    }
-    else if action == error_word(SyscallError::InvalidState)
-    {
-        seen.stops_after_exit += 1;
-    }
-    else
-    {
-        BAD_ACTIONS.record(action);
-    }
     match thread_start(waiter)
     {
         Ok(()) =>
@@ -622,6 +760,34 @@ fn settle_stopped(
     {
         Err("stress::stop_source_delete: the restarted waiter did not exit")
     }
+}
+
+/// Classify where a stop landed from the waiter's counts (stable: the waiter
+/// is stopped and off its CPU, or already exited), or record an unaccepted
+/// result.
+fn classify_stop(action: u64, entered_before: u32, done_before: u32, seen: &mut Seen)
+-> TestResult
+{
+    if action == RESULT_OK
+    {
+        if waiter_in_wait(entered_before, done_before)?
+        {
+            seen.stopped_in_wait += 1;
+        }
+        else
+        {
+            seen.stopped_between += 1;
+        }
+    }
+    else if action == error_word(SyscallError::InvalidState)
+    {
+        seen.stops_after_exit += 1;
+    }
+    else
+    {
+        BAD_ACTIONS.record(action);
+    }
+    Ok(())
 }
 
 /// After a Thread delete: the waiter is gone (its counts are stable: its
@@ -736,10 +902,11 @@ fn create_thread(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::stop_source_delete: create thread failed")?,
     );
-    // SAFETY: stress stacks 0 and 1 belong to this test's waiter and racer;
-    // stress tests run sequentially, each round's waiter has exited or been
-    // deleted (and so is off its CPU) before the next is created, and a
-    // phase's racer exits and is deleted before the next phase's is created.
+    // SAFETY: stress stacks 0, 1 and 2 belong to this test's waiter, racer
+    // and served-call server; stress tests run sequentially, each round's
+    // waiter has exited or been deleted (and so is off its CPU) before the
+    // next is created, and a phase's racer and server exit and are deleted
+    // before the next phase's are created.
     let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack]) });
     thread_configure(th, entry as *const () as u64, top, arg)
         .map_err(|_| "stress::stop_source_delete: thread_configure failed")?;
@@ -804,8 +971,11 @@ fn wait(kind: Kind, source: u32, buf: *mut u64) -> Result<u64, i64>
         // SAFETY: `buf` is this thread's registered IPC buffer
         // (`waiter_entry`).
         Kind::Recv => unsafe { ipc::ipc_recv(source, buf) }.map(|m| m.label),
-        // SAFETY: as for `Kind::Recv`.
-        Kind::Call => unsafe { ipc::ipc_call(source, &IpcMessage::new(1), buf) }.map(|m| m.label),
+        Kind::Call | Kind::CallServed =>
+        {
+            // SAFETY: as for `Kind::Recv`.
+            unsafe { ipc::ipc_call(source, &IpcMessage::new(1), buf) }.map(|m| m.label)
+        }
     }
 }
 
@@ -819,7 +989,8 @@ extern "C" fn waiter_entry(arg: u64) -> !
     let source = SOURCE.load(Ordering::Acquire);
     // SAFETY: sole live user of WAITER_IPC_BUF (one waiter at a time).
     let buf = core::ptr::addr_of_mut!(WAITER_IPC_BUF).cast::<u64>();
-    if matches!(kind, Kind::Recv | Kind::Call) && ipc_buffer_set(buf as u64).is_err()
+    if matches!(kind, Kind::Recv | Kind::Call | Kind::CallServed)
+        && ipc_buffer_set(buf as u64).is_err()
     {
         BAD_WAITS.record(u64::MAX);
         thread_exit()
@@ -839,6 +1010,12 @@ extern "C" fn waiter_entry(arg: u64) -> !
             {
                 GONE.fetch_add(1, Ordering::AcqRel);
                 false
+            }
+            // The served-call server's reply: call again.
+            Ok(SERVER_REPLY_LABEL) if kind == Kind::CallServed =>
+            {
+                SERVED.fetch_add(1, Ordering::AcqRel);
+                true
             }
             Ok(value) =>
             {
@@ -896,5 +1073,69 @@ extern "C" fn racer_entry(arg: u64) -> !
         RACER_DONE.store(armed, Ordering::Release);
     }
     RACER_EXITED.store(1, Ordering::Release);
+    thread_exit()
+}
+
+/// Served-call server: until told to quit, for each round it is armed for,
+/// spin a varying delay (a different hash from the racer's), then receive on
+/// the round's endpoint, replying at once to each caller it receives, until a
+/// receive meets the deleted endpoint (`Interrupted` if it was parked when the
+/// teardown drained it, `InvalidCapability` if the handle was gone at entry);
+/// then acknowledge the round. Any other result is recorded as unaccepted.
+extern "C" fn server_entry(_arg: u64) -> !
+{
+    // SAFETY: sole live user of SERVER_IPC_BUF (one server per phase).
+    let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
+    if ipc_buffer_set(buf as u64).is_err()
+    {
+        BAD_ACTIONS.record(u64::MAX);
+        SERVER_EXITED.store(1, Ordering::Release);
+        thread_exit()
+    }
+    let mut done = 0u32;
+    while QUIT.load(Ordering::Acquire) == 0
+    {
+        let armed = SERVER_ARMED.load(Ordering::Acquire);
+        if armed == done
+        {
+            core::hint::spin_loop();
+            continue;
+        }
+        let endpoint = SOURCE.load(Ordering::Acquire);
+        // 0 to 1023 spins (a hash other than the racer's and the
+        // controller's), so the receive lands around the racer's action.
+        for _ in 0..((armed ^ 0x3C3C).wrapping_mul(3_266_489_917) >> 22)
+        {
+            core::hint::spin_loop();
+        }
+        loop
+        {
+            // SAFETY: buf is this thread's registered IPC buffer.
+            match unsafe { ipc::ipc_recv(endpoint, buf) }
+            {
+                Ok(_) =>
+                {
+                    // SAFETY: as above; the reply goes to the caller just
+                    // received (a caller gone meanwhile answers an error,
+                    // which needs no handling: it is not waiting).
+                    let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(SERVER_REPLY_LABEL), buf) };
+                }
+                Err(e) if e == SyscallError::Interrupted as i64 =>
+                {
+                    SERVER_INTERRUPTED.fetch_add(1, Ordering::AcqRel);
+                    break;
+                }
+                Err(e) if e == SyscallError::InvalidCapability as i64 => break,
+                Err(e) =>
+                {
+                    BAD_ACTIONS.record_error(e);
+                    break;
+                }
+            }
+        }
+        done = armed;
+        SERVER_DONE.store(armed, Ordering::Release);
+    }
+    SERVER_EXITED.store(1, Ordering::Release);
     thread_exit()
 }

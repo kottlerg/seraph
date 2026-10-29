@@ -820,8 +820,10 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
         IpcThreadState::BlockedOnSend =>
         {
             // SAFETY: tcb is valid and no lock is held (contract).
-            if let Some(held) =
-                unsafe { crate::ipc::lock_bound_source(tcb, ipc_state, blocked_on, Some(park_seq)) }
+            let held = unsafe {
+                crate::ipc::lock_bound_source(tcb, ipc_state, blocked_on, Some(park_seq))
+            };
+            if let Some(held) = held
             {
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
@@ -877,8 +879,10 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
         IpcThreadState::BlockedOnRecv =>
         {
             // SAFETY: tcb is valid and no lock is held (contract).
-            if let Some(held) =
-                unsafe { crate::ipc::lock_bound_source(tcb, ipc_state, blocked_on, Some(park_seq)) }
+            let held = unsafe {
+                crate::ipc::lock_bound_source(tcb, ipc_state, blocked_on, Some(park_seq))
+            };
+            if let Some(held) = held
             {
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
@@ -1013,8 +1017,10 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
         IpcThreadState::BlockedOnNotification =>
         {
             // SAFETY: tcb is valid and no lock is held (contract).
-            if let Some(held) =
-                unsafe { crate::ipc::lock_bound_source(tcb, ipc_state, blocked_on, Some(park_seq)) }
+            let held = unsafe {
+                crate::ipc::lock_bound_source(tcb, ipc_state, blocked_on, Some(park_seq))
+            };
+            if let Some(held) = held
             {
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
@@ -1059,8 +1065,10 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
         IpcThreadState::BlockedOnEventQueue =>
         {
             // SAFETY: tcb is valid and no lock is held (contract).
-            if let Some(held) =
-                unsafe { crate::ipc::lock_bound_source(tcb, ipc_state, blocked_on, Some(park_seq)) }
+            let held = unsafe {
+                crate::ipc::lock_bound_source(tcb, ipc_state, blocked_on, Some(park_seq))
+            };
+            if let Some(held) = held
             {
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
@@ -1100,8 +1108,10 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
         IpcThreadState::BlockedOnWaitSet =>
         {
             // SAFETY: tcb is valid and no lock is held (contract).
-            if let Some(held) =
-                unsafe { crate::ipc::lock_bound_source(tcb, ipc_state, blocked_on, Some(park_seq)) }
+            let held = unsafe {
+                crate::ipc::lock_bound_source(tcb, ipc_state, blocked_on, Some(park_seq))
+            };
+            if let Some(held) = held
             {
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]

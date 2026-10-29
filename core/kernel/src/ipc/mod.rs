@@ -383,7 +383,11 @@ impl BoundSource
 /// sleep timer through `sched::sleep_wakeups_quiesce`, `waitset_notify` through
 /// the notifying source's lock that the wait set's teardown must take, and a
 /// canceller or a drain through the `sched_lock` it holds across its claim
-/// and its binding clear. The source lock is taken under the `sched_lock`,
+/// and its binding clear, and `endpoint_recv`'s refused reply rebind through
+/// the same hold (`sched::commit_reply_rebind_under_local_lock`). The wakers
+/// that hold no such guarantee are open defects: device IRQ delivery (#561),
+/// fault delivery (#538), and the death post (#539). The source lock is taken
+/// under the `sched_lock`,
 /// the inverse of the canonical order (core/kernel/docs/scheduling-internals.md
 /// § Lock Hierarchy), so it is only try-locked: on contention both locks are
 /// dropped and the re-read repeats, letting a holder that wants this thread's

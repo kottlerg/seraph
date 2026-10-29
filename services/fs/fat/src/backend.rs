@@ -102,7 +102,8 @@ impl NodeTable
 
     /// Look up the [`FatNode`] for a non-root [`NodeId`]. Returns `None`
     /// for the reserved root id (0), for ids past the table tail, and for
-    /// entries `invalidate_for_loc` cleared (removed or renamed). Used by the `service_loop` node-cap dispatch arms in `main.rs`.
+    /// entries `invalidate_for_loc` cleared (removed or renamed). Used by
+    /// the `service_loop` node-cap dispatch arms in `main.rs`.
     #[must_use]
     pub fn get(&self, id: NodeId) -> Option<FatNode>
     {

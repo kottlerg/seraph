@@ -480,8 +480,7 @@ pub mod memmgr_labels
     /// * `data[0]` — `count: u32`.
     /// * `data[1+i]` — `phys_base_i: u64`, the physical base of the region to
     ///   release (the grant reply reports it at `data[1 + cap_count + i]`).
-    /// * `caps[..]` — any inner caps the caller still holds; dropped
-    ///   defensively.
+    /// * no caps; memmgr deletes any cap attached to the call.
     ///
     /// memmgr matches each `phys_base` against the caller's own outstanding
     /// grants (badge-scoped), returns the backing run to the free pool, and

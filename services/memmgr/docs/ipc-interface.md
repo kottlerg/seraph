@@ -161,7 +161,7 @@ as the per-process tracking anchor and uses `phys_base` to find it.
 | label | 2 |
 | data[0] | `count` (u32) |
 | data[1+i] | `phys_base_i` (u64) — physical base of region `i` to release |
-| cap[..] | any inner caps the caller still holds (dropped defensively) |
+| cap[..] | none; memmgr deletes any cap attached (see [Capability Transfer](#capability-transfer)) |
 
 **Reply (success):**
 

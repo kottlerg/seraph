@@ -6,7 +6,7 @@
 //! Memmgr / heap allocator surface.
 
 use std::collections::BTreeMap;
-use std::os::seraph::startup_info;
+use std::os::seraph::{current_ipc_buf, startup_info};
 
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
@@ -172,31 +172,23 @@ pub fn alloc_grow_phase(_: &Caps)
     std::os::seraph::log!("alloc_grow phase passed ({BIG} bytes + 8 KiB interleaved)");
 }
 
-/// svctest's IPC buffer page as a word pointer.
-fn ipc_buffer() -> *mut u64
+/// Call memmgr over svctest's own badged endpoint, panicking with `what` if
+/// the call itself fails.
+fn memmgr_call(msg: &ipc::IpcMessage, what: &str) -> ipc::IpcMessage
 {
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    startup_info().ipc_buffer.cast::<u64>()
+    // SAFETY: `current_ipc_buf` is this thread's kernel-registered IPC buffer.
+    unsafe { ipc::ipc_call(startup_info().memmgr_endpoint, msg, current_ipc_buf()) }
+        .unwrap_or_else(|e| panic!("memmgr {what} ipc_call failed: {e:?}"))
 }
 
-/// A `DONATE_MEMORY_CAPS` from a client other than procmgr is refused with
-/// `UNAUTHORIZED`. The donated cap is a derivation of a one-page grant svctest
-/// still holds, the aliasing donation the gate exists to stop: memmgr would
-/// otherwise put a frame it lent to svctest back into its free pool.
-pub fn donate_unauthorized_phase(_: &Caps)
+/// Request a one-page grant from memmgr: `(grant cap, physical base)`.
+fn request_one_page() -> (u32, u64)
 {
-    let info = startup_info();
-    let ipc_buf = ipc_buffer();
-
     let want = 1 | (u64::from(ipc::memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, want)
         .build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(info.memmgr_endpoint, &req, ipc_buf) }
-        .expect("memmgr REQUEST_MEMORY_CAPS ipc_call failed");
+    let reply = memmgr_call(&req, "REQUEST_MEMORY_CAPS");
     assert_eq!(
         reply.label,
         ipc::memmgr_errors::SUCCESS,
@@ -207,15 +199,38 @@ pub fn donate_unauthorized_phase(_: &Caps)
         .first()
         .expect("REQUEST_MEMORY_CAPS returned no cap");
     // One cap: data[1] is its page count, data[2] its physical base.
-    let phys_base = reply.word(2);
+    (grant, reply.word(2))
+}
+
+/// Drop the grant cap and hand its region back to memmgr.
+fn release_one_page(grant: u32, phys_base: u64)
+{
+    syscall::cap_delete(grant).expect("cap_delete of grant");
+    let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
+        .word(0, 1)
+        .word(1, phys_base)
+        .build();
+    let reply = memmgr_call(&release, "RELEASE_MEMORY_CAPS");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "RELEASE_MEMORY_CAPS status"
+    );
+}
+
+/// A `DONATE_MEMORY_CAPS` from a client other than procmgr is refused with
+/// `UNAUTHORIZED`. The donated cap is a derivation of a one-page grant svctest
+/// still holds, the aliasing donation the gate exists to stop: memmgr would
+/// otherwise put a frame it lent to svctest back into its free pool.
+pub fn donate_unauthorized_phase(_: &Caps)
+{
+    let (grant, phys_base) = request_one_page();
 
     let alias = syscall::cap_derive(grant, syscall::RIGHTS_ALL).expect("cap_derive of grant");
     let donate = ipc::IpcMessage::builder(ipc::memmgr_labels::DONATE_MEMORY_CAPS)
         .cap(alias)
         .build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(info.memmgr_endpoint, &donate, ipc_buf) }
-        .expect("memmgr DONATE_MEMORY_CAPS ipc_call failed");
+    let reply = memmgr_call(&donate, "DONATE_MEMORY_CAPS");
     assert_eq!(
         reply.label,
         ipc::memmgr_errors::UNAUTHORIZED,
@@ -225,19 +240,7 @@ pub fn donate_unauthorized_phase(_: &Caps)
         reply.word(1)
     );
 
-    syscall::cap_delete(grant).expect("cap_delete of grant");
-    let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
-        .word(0, 1)
-        .word(1, phys_base)
-        .build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(info.memmgr_endpoint, &release, ipc_buf) }
-        .expect("memmgr RELEASE_MEMORY_CAPS ipc_call failed");
-    assert_eq!(
-        reply.label,
-        ipc::memmgr_errors::SUCCESS,
-        "RELEASE_MEMORY_CAPS status"
-    );
+    release_one_page(grant, phys_base);
     std::os::seraph::log!("non-procmgr donation refused with UNAUTHORIZED");
 }
 
@@ -307,56 +310,54 @@ const STRAY_CAP_CASES: [(u64, [u64; 3], u64); 11] = [
     (0x7FFF, [0, 0, 0], ipc::memmgr_errors::INVALID_ARGUMENT),
 ];
 
-/// Calls in the stray-cap flood. Each carries `MSG_CAP_SLOTS_MAX` caps, so the
-/// flood attaches 16 Ki caps, about twice the slots memmgr's `CSpace` is seeded
-/// with (init's `CSPACE_RETYPE_PAGES` slot pages): a memmgr that kept the
-/// stray caps would exhaust its `CSpace` partway through, fail its receive,
-/// and exit with `EXIT_RECV_WEDGE`.
-const STRAY_CAP_FLOOD_CALLS: usize = 4096;
+/// Calls the stray-cap flood makes per case. Each call carries
+/// `MSG_CAP_SLOTS_MAX` caps, so every case on its own attaches 9 Ki caps, more
+/// than the slots memmgr's `CSpace` is seeded with (init's
+/// `CSPACE_RETYPE_PAGES` slot pages, about 8 Ki slots): a memmgr that kept the
+/// stray caps of any one case would exhaust its `CSpace` during that case,
+/// fail its receive, and exit with `EXIT_RECV_WEDGE`.
+const STRAY_CAP_CALLS_PER_CASE: usize = 2304;
 
-/// Flood memmgr with caps attached to messages whose contract does not keep
-/// them, then check it still answers. Every call must also get its label's
-/// normal reply, so deleting the strays changes no label's behaviour.
+/// Flood memmgr, case by case, with caps attached to messages whose contract
+/// does not keep them, then check it still answers. Every call must also get
+/// its case's normal reply, so deleting the strays changes no label's
+/// behaviour.
 pub fn stray_cap_flood_phase(_: &Caps)
 {
     let info = startup_info();
-    let ipc_buf = ipc_buffer();
-
-    for call in 0..STRAY_CAP_FLOOD_CALLS
+    for (label, words, expected) in STRAY_CAP_CASES
     {
-        let (label, words, expected) = STRAY_CAP_CASES[call % STRAY_CAP_CASES.len()];
-        let mut builder = ipc::IpcMessage::builder(label)
-            .word(0, words[0])
-            .word(1, words[1])
-            .word(2, words[2]);
-        for _ in 0..syscall_abi::MSG_CAP_SLOTS_MAX
+        for call in 0..STRAY_CAP_CALLS_PER_CASE
         {
-            let stray = syscall::cap_derive(info.memmgr_endpoint, syscall::RIGHTS_EP_SEND)
-                .expect("cap_derive of a stray cap");
-            builder = builder.cap(stray);
+            let mut builder = ipc::IpcMessage::builder(label)
+                .word(0, words[0])
+                .word(1, words[1])
+                .word(2, words[2]);
+            for _ in 0..syscall_abi::MSG_CAP_SLOTS_MAX
+            {
+                let stray = syscall::cap_derive(info.memmgr_endpoint, syscall::RIGHTS_EP_SEND)
+                    .expect("cap_derive of a stray cap");
+                builder = builder.cap(stray);
+            }
+            let reply = memmgr_call(&builder.build(), "stray-cap flood");
+            assert_eq!(
+                reply.label, expected,
+                "memmgr reply to stray-cap call {call} with label {label:#x}"
+            );
         }
-        let msg = builder.build();
-        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-        let reply = unsafe { ipc::ipc_call(info.memmgr_endpoint, &msg, ipc_buf) }
-            .unwrap_or_else(|e| panic!("memmgr call {call} (label {label:#x}) failed: {e:?}"));
-        assert_eq!(
-            reply.label, expected,
-            "memmgr call {call} (label {label:#x}) reply"
-        );
     }
 
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(info.memmgr_endpoint, &req, ipc_buf) }
-        .expect("memmgr QUERY_POOL_STATUS ipc_call failed after the flood");
+    let reply = memmgr_call(&req, "QUERY_POOL_STATUS after the flood");
     assert_eq!(
         reply.label,
         ipc::memmgr_errors::SUCCESS,
         "QUERY_POOL_STATUS status after the flood"
     );
     std::os::seraph::log!(
-        "memmgr answered {STRAY_CAP_FLOOD_CALLS} calls carrying {} stray caps",
-        STRAY_CAP_FLOOD_CALLS * syscall_abi::MSG_CAP_SLOTS_MAX
+        "memmgr answered {} calls carrying {} stray caps",
+        STRAY_CAP_CASES.len() * STRAY_CAP_CALLS_PER_CASE,
+        STRAY_CAP_CASES.len() * STRAY_CAP_CALLS_PER_CASE * syscall_abi::MSG_CAP_SLOTS_MAX
     );
 }
 

@@ -19,6 +19,8 @@ syscall = { path = "../../shared/syscall" }
 # `CREATE_FROM_FILE` data area, the `fs_std` rename cell sizes its long
 # leaf names so two of them overflow the `FS_RENAME` data area, and the
 # `fs_ipc` request-bounds phase sizes the inline FS_READ reply ceiling.
+# `SyscallError`: the svcmgr published-send phase matches the code a
+# re-badge of the already-badged published cap returns.
 syscall-abi = { path = "../../abi/syscall" }
 shmem = { path = "../../shared/shmem" }
 

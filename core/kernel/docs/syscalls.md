@@ -845,22 +845,22 @@ Revoke all capabilities derived from a capability, across all processes.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-Every descendant in the derivation tree is invalidated; the target capability
-itself is preserved. Mappings established through a revoked Mmio descendant are
-unmapped, with TLB shootdown, and IoPort bindings made through a revoked IoPort
-descendant withdrawn, before the call returns, except one a concurrent syscall is
-still making through that descendant, which is withdrawn when that syscall ends;
-mappings established through a revoked Memory descendant are not withdrawn (see
+Every descendant in the derivation tree is invalidated; the target capability itself
+is preserved. Mappings established through a revoked Mmio descendant are unmapped,
+with TLB shootdown, and IoPort bindings made through a revoked IoPort descendant
+withdrawn, before the call returns; while a concurrent syscall holds the descendant's
+object (any syscall naming it, which pins it), all of that object's mappings and
+bindings are withdrawn when that syscall releases it instead; mappings established
+through a revoked Memory descendant are not withdrawn (see
 [capability-model.md](../../../docs/capability-model.md) § Revocation; #516).
-Underlying kernel objects are not freed unless a revoked
-capability was the last reference (see
-[capability-model.md](../../../docs/capability-model.md) § Revocation); such a teardown can fail
-to complete as `SYS_CAP_DELETE` describes for a thread left on a halted CPU. While the
-revoke is in flight, `SYS_CAP_DELETE`, `SYS_CAP_MOVE`, `SYS_CAP_COPY`,
-`SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`,
-and the range splits on the target slot (and IPC transfer of it) are refused with
-`InvalidState`. A `SYS_CAP_MOVE` or IPC transfer in flight pins its source and
-destination slots the same way (see
+Underlying kernel objects are not freed unless a revoked capability was the last
+reference (see [capability-model.md](../../../docs/capability-model.md) § Revocation);
+such a teardown can fail to complete as `SYS_CAP_DELETE` describes for a thread left
+on a halted CPU. While the revoke is in flight, `SYS_CAP_DELETE`, `SYS_CAP_MOVE`,
+`SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_MEMORY_SPLIT`,
+`SYS_MEMORY_MERGE`, and the range splits on the target slot (and IPC transfer of it)
+are refused with `InvalidState`. A `SYS_CAP_MOVE` or IPC transfer in flight pins its
+source and destination slots the same way (see
 [capability-internals.md](capability-internals.md) § Revocation Algorithm).
 
 **Errors:** `InvalidCapability`; `InvalidState` (another revoke, a move, or an IPC
@@ -895,7 +895,10 @@ Registry). **The stop includes the caller**: a thread deleting the last capabili
 is stopped by that delete and the call does not return; the object is reclaimed once the thread is
 off its CPU. When another thread's syscall holds a pin on the object at the delete (see below), the
 delete is not the last release: it returns 0, and the stop and the free happen when that syscall
-drops its pin, through the deferred reclaim of the dropping thread's CPU. A teardown of a Thread
+drops its pin, through the deferred reclaim of the dropping thread's CPU. An `AddressSpace` an Mmio
+capability's object has recorded a mapping into (§ `SYS_MMIO_MAP`) is likewise not released by the
+delete of its last capability: the delete returns 0, and the stop and the free happen when that Mmio
+object is freed and its record releases the space. A teardown of a Thread
 left `current` on a CPU that `fatal` halted never completes (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol) §
 `dealloc_object(Thread)` Drain Protocol, invariant 3), nor does one of a `CSpace` or `AddressSpace`
@@ -1854,13 +1857,15 @@ Permission Bitmap (IOPB).
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-Multiple bindings may be made to the same thread, each authorising a different port
-range; a thread records at most `MAX_IOPORT_BINDINGS` (16) bindings, and binding the same
-`ioport_cap` object again reuses its record. The thread records each binding against the
-`ioport_cap`'s object. When that object is freed, because `ioport_cap` (or the copy it is) was
-deleted, consumed by a split, or revoked through an ancestor, the binding is withdrawn from the
-thread, whose bitmap is rebuilt from its remaining bindings, and every CPU reloads its TSS IOPB
-before its next port access, a CPU running the thread included (see
+Multiple bindings may be made to the same thread, each authorising a different port range; a
+thread records at most `MAX_IOPORT_BINDINGS` (16) bindings, and binding the same
+`ioport_cap` object again reuses its record. A bind takes effect at the target's next port
+access even when the target is running on another CPU (every CPU's TSS IOPB is invalidated
+and reloaded lazily). The thread records each binding against the `ioport_cap`'s object.
+When that object is freed, because `ioport_cap` (or the copy it is) was deleted, consumed by
+a split, or revoked through an ancestor, the binding is withdrawn from the thread, whose
+bitmap is rebuilt from its remaining bindings, and every CPU reloads its TSS IOPB before its
+next port access, a CPU running the thread included (see
 [capability-model.md](../../../docs/capability-model.md) § IoPort (x86-64 only)).
 
 **Capability requirements:** `thread_cap` (Control rights), `ioport_cap` (Use rights).

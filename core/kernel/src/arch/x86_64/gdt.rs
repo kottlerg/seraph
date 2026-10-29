@@ -152,7 +152,7 @@ static mut TSS: TssWithIopb = TssWithIopb {
         _ist7: 0,
         _reserved2: 0,
         _reserved3: 0,
-        iopb_offset: 104, // offset of TssWithIopb::iopb within the struct
+        iopb_offset: IOPB_OFFSET_VALID,
     },
     iopb: [0xFF; IOPB_SIZE], // all ports denied by default
     terminator: 0xFF,
@@ -212,7 +212,7 @@ pub fn init_ap_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocat
             let term = core::ptr::addr_of_mut!((*slot).terminator);
             core::ptr::write(term, 0xFF);
             let ofs = core::ptr::addr_of_mut!((*slot).tss.iopb_offset);
-            core::ptr::write_unaligned(ofs, core::mem::size_of::<Tss>() as u16);
+            core::ptr::write_unaligned(ofs, IOPB_OFFSET_VALID);
         }
     }
     AP_TSS_COUNT.store(cpu_count, core::sync::atomic::Ordering::Relaxed);
@@ -503,7 +503,7 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
                 _ist7: 0,
                 _reserved2: 0,
                 _reserved3: 0,
-                iopb_offset: core::mem::size_of::<Tss>() as u16,
+                iopb_offset: IOPB_OFFSET_VALID,
             },
         );
         // The IOPB and terminator are pre-filled with 0xFF by

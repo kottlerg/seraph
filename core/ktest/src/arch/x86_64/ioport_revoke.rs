@@ -58,6 +58,12 @@ fn carve_port_cap(ctx: &TestContext) -> Option<u32>
 {
     for slot in 1..=crate::unit::hw::scan_bound(ctx)
     {
+        // A copy of ktest's own Thread cap could not be deleted again (a thread
+        // cannot delete a capability to itself); every other copy can.
+        if slot == ctx.thread_cap
+        {
+            continue;
+        }
         let Ok(copy) = cap_derive(slot, syscall::RIGHTS_ALL)
         else
         {

@@ -122,8 +122,8 @@ fn exited_reason(thread: u32, what: &'static str) -> Result<u64, &'static str>
 
 /// A frame-pool cap a test maps in place of its retyped Memory cap. The test
 /// returns it with [`ScratchFrame::release`] once the address space it mapped
-/// the frame into is destroyed; a failure path that leaves that address space
-/// alive leaks the frame with it.
+/// the frame into is destroyed; a failure path that returns before that
+/// release leaks the frame.
 struct ScratchFrame(u32);
 
 impl ScratchFrame

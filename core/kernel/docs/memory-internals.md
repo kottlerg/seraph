@@ -98,23 +98,23 @@ not a concern.
 ## Kernel Object Memory (`cap/retype.rs`)
 
 The kernel runs no heap and no `GlobalAlloc`
-([docs/memory-model.md](../../../docs/memory-model.md) § Kernel Object Memory). Every kernel object
-— the slot pages of a CSpace, thread control blocks, endpoints, notifications, event
-queues, wait sets, address spaces, CSpaces, and Memory objects themselves — is
-carved out of a Memory capability by retype: the body is constructed in place
-at the offset the retype allocator returns, its header records the source, and
-the bytes go back to that source when the object's reference count reaches zero,
-whether a capability (deleted, or removed by a revoke) or a kernel-internal owner
-releases the last reference (see [capability-internals.md](capability-internals.md)
-§ Kernel Object Reference Counting). The kernel's own objects are retyped from the SEED
-reserve, pinned at the Phase 7 handoff from the front of the largest block
-drained from the buddy allocator
-([initialization.md](initialization.md) § Phase 7: Capability System); the wrapper bodies
-of split-derived caps (the `sys_memory_split` tail and the MMIO, IRQ, I/O-port and
-SchedControl split children) and per-thread IOPB leases are also carved from SEED at
-runtime; every other userspace object comes from the capability a `cap_create_*` syscall
-names. Address spaces and CSpaces
-additionally own a page pool for their page tables and slot pages
+([docs/memory-model.md](../../../docs/memory-model.md) § Kernel Object Memory). Every kernel
+object — the slot pages of a CSpace, thread control blocks, endpoints, notifications, event
+queues, wait sets, address spaces, CSpaces, and Memory objects themselves — is carved out of
+a Memory capability by retype: the body is constructed in place at the offset the retype
+allocator returns, its header records the source, and the bytes go back to that source when
+the object's reference count reaches zero, whether a capability (deleted, or removed by a
+revoke) or a kernel-internal owner releases the last reference (see
+[capability-internals.md](capability-internals.md) § Kernel Object Reference Counting). The
+kernel's own objects are retyped from the SEED reserve, pinned at the Phase 7 handoff from
+the front of the largest block drained from the buddy allocator
+([initialization.md](initialization.md) § Phase 7: Capability System); the wrapper bodies of
+split-derived caps (the `sys_memory_split` tail and the MMIO, IRQ, I/O-port and SchedControl
+split children), the bodies of Mmio and IoPort copies and derivations
+([capability-internals.md](capability-internals.md) § Copies and Lineages), and per-thread
+port-binding tables (the IOPB and its binding records) are also carved from SEED at runtime;
+every other userspace object comes from the capability a `cap_create_*` syscall names.
+Address spaces and CSpaces additionally own a page pool for their page tables and slot pages
 ([capability-internals.md](capability-internals.md) § Page Pools).
 
 Retype and pool allocation are fallible and MUST be handled as fallible at every

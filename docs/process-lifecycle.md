@@ -208,20 +208,25 @@ both have exited — init is threadless. The main thread exits at the end of ini
 but init-logd keeps serving the master log endpoint until the svcmgr-launched real-logd pulls its
 handover, so it outlives main; reclaiming init's address space while a thread still runs in it would
 fault that thread. On the last death procmgr tears down init's kernel objects in order (Threads →
-AddressSpace → donate Memory caps to memmgr → drop its CSpace reference), leaving two init residues:
-init's CSpace with the caps init still holds, and the kernel-direct page-table nodes behind its
-bootstrap mappings. Those caps include the remaining root caps (see [Kernel → init](#kernel--init)),
-the endpoints init created, its caps on the kernel objects it created for memmgr and procmgr, the
-intermediate caps it derived, and the bootstrap-arena Memory caps it forwarded to memmgr.
-They stay in init's CSpace, which the kernel pins (it is the root CSpace; see
-[capability-internals.md § Kernel Object Reference Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)),
-so procmgr's delete drops only its own reference and they remain alive but unreachable; releasing
-them at the reap is design intent, not yet implemented
+AddressSpace → donate Memory caps to memmgr → drop its CSpace reference), leaving two init residues
+(three on riscv64): init's CSpace with the caps init still holds, and the kernel-direct page-table
+nodes behind its bootstrap mappings. Those caps include the remaining root caps (see [Kernel →
+init](#kernel--init)), the endpoints init created, its caps on the kernel objects it created for
+memmgr and procmgr, the intermediate caps it derived, and the bootstrap-arena Memory caps it
+forwarded to memmgr. They stay in init's CSpace, which the kernel pins (it is the root CSpace; see
+[capability-internals.md § Kernel Object Reference
+Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)), so
+procmgr's delete drops only its own reference and they remain alive but unreachable; releasing them
+at the reap is design intent, not yet implemented
 ([#443](https://github.com/kottlerg/seraph/issues/443)). The page-table nodes stay consumed after
-init's AddressSpace is gone, an accepted cost owned by
-[memory-internals.md § Page Table Node Ownership](../core/kernel/docs/memory-internals.md#page-table-node-ownership).
-The procmgr-side protocol is specified in
-[procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § `REGISTER_INIT_TEARDOWN` and §
+init's AddressSpace is gone, an accepted cost owned by [memory-internals.md § Page Table Node
+Ownership](../core/kernel/docs/memory-internals.md#page-table-node-ownership). On riscv64 a third
+residue follows from the first: init maps the console UART through its boot Mmio capability, whose
+object stays in init's CSpace and records that mapping, holding a reference on init's AddressSpace
+([capability-model.md § Mmio](capability-model.md#mmio)), so procmgr's delete does not free the
+AddressSpace either; it stays allocated, with no thread bound to it, until that cap is released with
+the rest of init's CSpace. The procmgr-side protocol is specified in [procmgr IPC
+Interface](../services/procmgr/docs/ipc-interface.md) § `REGISTER_INIT_TEARDOWN` and §
 `INIT_TEARDOWN_DONE`.
 
 After init's reap completes, svcmgr is the resident supervisor. See
@@ -404,8 +409,10 @@ A process dies when:
   bound to the object (retained exit reason `EXIT_KILLED`) before reclaiming it, so the process's
   threads cannot outlive either. A thread deleting the last capability to its own `CSpace` or
   `AddressSpace` is stopped by that same delete and never returns from it, unless another
-  thread's syscall still pins the object: the delete then returns, and the stop follows when
-  that syscall releases the object.
+  thread's syscall still pins the object, or an Mmio capability's object records a mapping into
+  that `AddressSpace` (see [`capability-model.md`](capability-model.md#mmio) § Mmio): the delete
+  then returns, and the stop follows when that syscall releases the object or that Mmio object is
+  freed.
 - An unhandled fault terminates its threads.
 
 Under the kill-process pattern and the `CSpace`/`AddressSpace` teardown, an object a concurrent

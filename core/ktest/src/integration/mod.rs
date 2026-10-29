@@ -34,6 +34,8 @@
 //!   the page past its retype cursor
 //! - `mmio_revoke_unmaps.rs` — revoking an `Mmio` cap unmaps, with shootdown, a mapping made
 //!   through its descendant while a reader on another CPU uses it
+//! - `range_copy_lineage.rs` — a range lineage admits exactly 64 live copies, counted
+//!   alone after the root's delete
 //! - `cspace_nested_teardown.rs` — deleting the root of a 256-deep chain of nested `CSpace`s
 //!   reclaims every one without exhausting the kernel stack
 //! - `retype_subpage_clobber.rs` — a clobbered sub-page free-list link is rejected, not dereferenced
@@ -94,6 +96,7 @@ pub mod multi_caller_ipc_fifo;
 pub mod park_interrupted_stop_start;
 pub mod priority_preemption;
 pub mod queued_waiters_fifo;
+pub mod range_copy_lineage;
 pub mod reply_binding_displaced;
 pub mod retype_reclaim;
 pub mod retype_subpage_clobber;
@@ -178,6 +181,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::mmio_revoke_unmaps",
         mmio_revoke_unmaps::run(ctx)
+    );
+    run_integration_test!(
+        "integration::range_copy_lineage",
+        range_copy_lineage::run(ctx)
     );
     run_integration_test!(
         "integration::retype_subpage_clobber",

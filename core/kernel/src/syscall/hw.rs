@@ -517,6 +517,14 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
         }
 
         bound.map_err(|_| SyscallError::QuotaExceeded)?;
+        // A target running on another CPU loaded its bitmap before this bind:
+        // invalidate every TSS so its next port access reloads the grown
+        // bitmap (the lazy reload of `gdt::reload_invalidated_iopb`) instead
+        // of faulting on the stale copy.
+        if target_tcb != caller_tcb
+        {
+            gdt::invalidate_all_iopbs();
+        }
         Ok(0)
     }
 }

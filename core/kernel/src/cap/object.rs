@@ -432,19 +432,24 @@ pub const RANGE_COPY_LIMIT: u32 = 64;
 /// capability of either type produces a fresh object whose lineage names
 /// that root, so each capability slot owns its own object and the mappings
 /// or port bindings made through it are withdrawn when that object is freed
-/// (docs/capability-model.md § Mmio, § `IoPort`). The root's `live` counts its
-/// own capability references (one, dropped when the root's reference count
-/// reaches zero) plus every live copy; the root's body is freed when `live`
-/// reaches zero, so a copy's lineage pointer never dangles.
+/// (docs/capability-model.md § Mmio, § `IoPort`). The root's `live` holds
+/// [`ROOT_SHARE`] while the root has references (dropped when its reference
+/// count reaches zero) plus one per live copy; the root's body is freed when
+/// `live` reaches zero, so a copy's lineage pointer never dangles, and the copy
+/// limit counts copies alone, whether the root is still referenced or not.
 #[repr(C)]
 pub struct RangeLineage
 {
     /// The lineage root; null when this object is the root.
     root: *mut KernelObjectHeader,
-    /// Root only: live copies, plus one while the root has references.
+    /// Root only: live copies, plus [`ROOT_SHARE`] while the root has
+    /// references.
     live: AtomicU32,
     _pad: u32,
 }
+
+/// The share of a lineage root's `live` count the root's own references hold.
+const ROOT_SHARE: u32 = 1 << 31;
 
 impl RangeLineage
 {
@@ -453,7 +458,7 @@ impl RangeLineage
     {
         Self {
             root: core::ptr::null_mut(),
-            live: AtomicU32::new(1),
+            live: AtomicU32::new(ROOT_SHARE),
             _pad: 0,
         }
     }
@@ -475,7 +480,7 @@ impl RangeLineage
         let mut cur = live.load(Ordering::Relaxed);
         loop
         {
-            if cur > RANGE_COPY_LIMIT
+            if cur & !ROOT_SHARE >= RANGE_COPY_LIMIT
             {
                 return Err(syscall::SyscallError::QuotaExceeded);
             }
@@ -525,16 +530,25 @@ unsafe fn lineage_of<'a>(hdr: NonNull<KernelObjectHeader>) -> &'a RangeLineage
 pub const MMIO_MAX_MAPPINGS: usize = 4;
 
 /// One `SYS_MMIO_MAP` mapping of an `Mmio` object's whole region.
+///
+/// Both fields are atomics: concurrent `SYS_MMIO_MAP` calls through one object
+/// each hold only a shared reference to it. A record is claimed by moving
+/// `aso` from null to [`MMIO_RECORD_CLAIMED`], then filled (`va` first, `aso`
+/// published last with Release), so a reader that sees a real `aso` with
+/// Acquire also sees its `va`.
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct MmioMapping
 {
     /// The address space mapped into, holding one reference on it; null for an
-    /// empty record.
-    aso: *mut AddressSpaceObject,
+    /// empty record, [`MMIO_RECORD_CLAIMED`] while a map is filling it.
+    aso: AtomicPtr<AddressSpaceObject>,
     /// User virtual address of the region's first page.
-    va: u64,
+    va: AtomicU64,
 }
+
+/// The `MmioMapping::aso` value of a record a map has claimed and not yet
+/// filled; never dereferenced.
+const MMIO_RECORD_CLAIMED: *mut AddressSpaceObject = core::ptr::dangling_mut();
 
 /// Kernel object for a memory-mapped I/O region (`Mmio` capability).
 ///
@@ -554,15 +568,8 @@ pub struct MmioObject
     _pad: u32,
     /// The lineage this object belongs to (see [`RangeLineage`]).
     lineage: RangeLineage,
-    /// Spin lock serialising `mappings` between concurrent `SYS_MMIO_MAP`
-    /// calls (`0` free, `1` held). Teardown, which owns the object
-    /// exclusively, reads the records without it.
-    map_lock: AtomicU32,
-    _pad2: u32,
-    /// Mappings made through this object, written only under `map_lock` (or
-    /// by the exclusive teardown); concurrent `SYS_MMIO_MAP` calls each hold
-    /// only a shared reference to the object.
-    mappings: core::cell::UnsafeCell<[MmioMapping; MMIO_MAX_MAPPINGS]>,
+    /// Mappings made through this object.
+    mappings: [MmioMapping; MMIO_MAX_MAPPINGS],
 }
 
 // MmioObject fits the 128-byte retype size class every SEED mint and copy
@@ -584,20 +591,20 @@ impl MmioObject
             flags,
             _pad: 0,
             lineage: RangeLineage::new_root(),
-            map_lock: AtomicU32::new(0),
-            _pad2: 0,
-            mappings: core::cell::UnsafeCell::new(
-                [MmioMapping {
-                    aso: core::ptr::null_mut(),
-                    va: 0,
-                }; MMIO_MAX_MAPPINGS],
-            ),
+            mappings: [const {
+                MmioMapping {
+                    aso: AtomicPtr::new(core::ptr::null_mut()),
+                    va: AtomicU64::new(0),
+                }
+            }; MMIO_MAX_MAPPINGS],
         }
     }
 
     /// Record a mapping of this object's region at `va` in `aso`, taking a
     /// reference on `aso` for the record. A mapping already recorded at the same
-    /// place is not recorded twice.
+    /// place is not recorded again; two maps racing to record the same place
+    /// may each take a record, which costs a record and is otherwise harmless
+    /// (the teardown withdraws both).
     ///
     /// # Errors
     /// `QuotaExceeded` when [`MMIO_MAX_MAPPINGS`] mappings are already recorded.
@@ -611,34 +618,31 @@ impl MmioObject
         va: u64,
     ) -> Result<(), syscall::SyscallError>
     {
-        while self
-            .map_lock
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+        if self.mappings.iter().any(|m| {
+            core::ptr::eq(m.aso.load(Ordering::Acquire), aso) && m.va.load(Ordering::Relaxed) == va
+        })
         {
-            core::hint::spin_loop();
+            return Ok(());
         }
-        // SAFETY: map_lock is held, so this is the only access to the records.
-        let mappings = unsafe { &mut *self.mappings.get() };
-        let result = if mappings
-            .iter()
-            .any(|m| core::ptr::eq(m.aso, aso) && m.va == va)
+        for m in &self.mappings
         {
-            Ok(())
+            if m.aso
+                .compare_exchange(
+                    core::ptr::null_mut(),
+                    MMIO_RECORD_CLAIMED,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                // SAFETY: aso is live and referenced by the caller (contract).
+                unsafe { (*aso).header.inc_ref() };
+                m.va.store(va, Ordering::Relaxed);
+                m.aso.store(aso, Ordering::Release);
+                return Ok(());
+            }
         }
-        else if let Some(free) = mappings.iter_mut().find(|m| m.aso.is_null())
-        {
-            // SAFETY: aso is live and referenced by the caller (contract).
-            unsafe { (*aso).header.inc_ref() };
-            *free = MmioMapping { aso, va };
-            Ok(())
-        }
-        else
-        {
-            Err(syscall::SyscallError::QuotaExceeded)
-        };
-        self.map_lock.store(0, Ordering::Release);
-        result
+        Err(syscall::SyscallError::QuotaExceeded)
     }
 
     /// Unmap every recorded mapping, with TLB shootdown, and release each
@@ -651,31 +655,36 @@ impl MmioObject
     /// (`AddressSpace::unmap_region_if_phys`).
     ///
     /// # Safety
-    /// The object is being freed (reference count zero) and is exclusively
-    /// owned; no lock is held, and the CPU is stable (`release_ref`'s
-    /// preconditions).
+    /// No capability slot or syscall pin references the object (its reference
+    /// count is zero), so no map can be recording into it; only its lineage
+    /// count may still be touched by other CPUs. No lock is held, and the CPU
+    /// is stable (`release_ref`'s preconditions).
     // cast_possible_truncation: a region's page count fits usize on the 64-bit
     // targets the kernel supports.
     #[allow(clippy::cast_possible_truncation)]
     #[cfg(not(test))]
-    unsafe fn withdraw_mappings(&mut self)
+    unsafe fn withdraw_mappings(&self)
     {
         let pages = (self.size / crate::mm::PAGE_SIZE as u64) as usize;
-        let base = self.base;
-        for m in self.mappings.get_mut()
+        for m in &self.mappings
         {
-            let Some(aso) = NonNull::new(m.aso)
+            let Some(aso) = NonNull::new(m.aso.swap(core::ptr::null_mut(), Ordering::Acquire))
             else
             {
                 continue;
             };
-            m.aso = core::ptr::null_mut();
+            debug_assert!(
+                !core::ptr::eq(aso.as_ptr(), MMIO_RECORD_CLAIMED),
+                "withdraw_mappings: a record was being filled at refcount zero"
+            );
+            let va = m.va.load(Ordering::Relaxed);
             // SAFETY: the record's reference keeps the address space live; the
             // span is the user range SYS_MMIO_MAP validated when it mapped it.
             unsafe {
-                (*(*aso.as_ptr()).address_space).unmap_region_if_phys(m.va, pages, base);
+                (*(*aso.as_ptr()).address_space).unmap_region_if_phys(va, pages, self.base);
             }
-            // SAFETY: the record held this reference; no lock is held.
+            // SAFETY: the record held this reference; no lock is held and the
+            // CPU is stable (contract).
             unsafe { release_ref(aso.cast::<KernelObjectHeader>()) };
         }
     }
@@ -1702,8 +1711,10 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 ///
 /// - `obj` must carry an outstanding reference the caller owns, which this
 ///   call consumes.
-/// - Syscall context with interrupts disabled: the deferred-reclaim push
-///   needs a stable CPU index.
+/// - A stable CPU index, which the deferred-reclaim push needs: syscall
+///   context with interrupts disabled, or the idle thread (pinned to its CPU)
+///   draining the deferred-reclaim stack, which reaches here through an Mmio
+///   object's teardown (`MmioObject::withdraw_mappings`).
 /// - Must NOT be called with `DERIVATION_LOCK` held, nor with any IPC source,
 ///   per-TCB `sched_lock`, per-CPU scheduler, or sleep-list lock held (the
 ///   preconditions `dealloc_object` states).
@@ -1966,7 +1977,9 @@ unsafe fn unlink_dying_waiter(
 }
 
 /// Push `obj`, a refcount-0 object, onto a dealloc cascade worklist. Drops the
-/// entry on overflow — see `MAX_CASCADE` in [`dealloc_object`].
+/// entry on overflow — see `MAX_CASCADE` in [`dealloc_object`]. Overflow is
+/// unreachable in practice for the derivation depths this kernel actually
+/// produces; dropping is preferable to a panic in the dealloc path.
 #[cfg(not(test))]
 fn push_cascade(
     worklist: &mut [Option<NonNull<KernelObjectHeader>>],
@@ -2044,11 +2057,12 @@ unsafe fn release_range_object<T>(
     }
     // The root's `live` share of this object: the root's own on a root, the
     // copy's on a copy. The last share frees the root.
+    let share = if root == ptr { ROOT_SHARE } else { 1 };
     // SAFETY: the root body is kept by this object's share until this decrement.
     if unsafe { lineage_of(root) }
         .live
-        .fetch_sub(1, Ordering::AcqRel)
-        == 1
+        .fetch_sub(share, Ordering::AcqRel)
+        == share
     {
         // SAFETY: no reference and no live copy names the root any more.
         unsafe { free_body::<T>(root, worklist, head) };
@@ -2148,6 +2162,9 @@ pub unsafe fn object_for_new_slot(
 /// - No capability slot may reference the object: its reference count is 0,
 ///   or it is a fresh body that was never published (a range split's
 ///   rollback frees such bodies at their initial count of 1).
+/// - The CPU index must be stable — syscall context with interrupts disabled,
+///   or the idle thread's deferred-reclaim drain — because the Mmio arm
+///   releases address-space references through [`release_ref`].
 /// - Must NOT be called with `DERIVATION_LOCK` held: the `CSpaceObj` arm
 ///   takes that (non-recursive) lock for its batched derivation drain, and
 ///   the Memory arm takes the frame-allocator lock.
@@ -2264,23 +2281,6 @@ unsafe fn dealloc_object_one(
     pending: &mut *mut KernelObjectHeader,
 )
 {
-    /// Push `anc` onto the cascade worklist. Drops the entry on overflow —
-    /// see `MAX_CASCADE` in `dealloc_object`. Overflow is unreachable in
-    /// practice for the derivation depths this kernel actually produces;
-    /// dropping is preferable to a panic in the dealloc path.
-    fn push_ancestor(
-        worklist: &mut [Option<core::ptr::NonNull<KernelObjectHeader>>],
-        head: &mut usize,
-        anc: core::ptr::NonNull<KernelObjectHeader>,
-    )
-    {
-        if *head < worklist.len()
-        {
-            worklist[*head] = Some(anc);
-            *head += 1;
-        }
-    }
-
     /// Return one donation to its ancestor Memory object and drop the
     /// reference the donation held on it. An ancestor that reaches zero is
     /// reclaimed through its own nested cascade rather than the caller's
@@ -2376,14 +2376,16 @@ unsafe fn dealloc_object_one(
             {
                 // SAFETY: ancestor_ptr non-null.
                 let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                push_ancestor(worklist, head, ancestor_nn);
+                push_cascade(worklist, head, ancestor_nn);
             }
         }
         ObjectType::Mmio =>
         {
             // Withdraw every mapping made through this capability's object
             // before its bytes go (docs/capability-model.md § Mmio).
-            // SAFETY: refcount 0, exclusively owned; no lock held.
+            // SAFETY: refcount 0, so no slot or pin names the object and no map
+            // records into it; no lock is held; the CPU is stable
+            // (dealloc_object's contract).
             unsafe { (*ptr.as_ptr().cast::<MmioObject>()).withdraw_mappings() };
             // SAFETY: a refcount-0 Mmio object; no lock held.
             unsafe { release_range_object::<MmioObject>(ptr, worklist, head) };
@@ -2441,7 +2443,7 @@ unsafe fn dealloc_object_one(
             {
                 // SAFETY: ancestor_ptr non-null.
                 let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                push_ancestor(worklist, head, ancestor_nn);
+                push_cascade(worklist, head, ancestor_nn);
             }
         }
         ObjectType::IoPort =>
@@ -2479,7 +2481,7 @@ unsafe fn dealloc_object_one(
             {
                 // SAFETY: ancestor_ptr non-null.
                 let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                push_ancestor(worklist, head, ancestor_nn);
+                push_cascade(worklist, head, ancestor_nn);
             }
         }
         ObjectType::SbiControl =>
@@ -2507,7 +2509,7 @@ unsafe fn dealloc_object_one(
             {
                 // SAFETY: ancestor_ptr non-null.
                 let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                push_ancestor(worklist, head, ancestor_nn);
+                push_cascade(worklist, head, ancestor_nn);
             }
         }
 
@@ -2938,7 +2940,7 @@ unsafe fn dealloc_object_one(
                         .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
                     if !ep.is_null() && (*ep).header.dec_ref() == 0
                     {
-                        push_ancestor(
+                        push_cascade(
                             worklist,
                             head,
                             core::ptr::NonNull::new_unchecked(ep.cast::<KernelObjectHeader>()),
@@ -3080,7 +3082,7 @@ unsafe fn dealloc_object_one(
             if new_rc == 0
             {
                 // SAFETY: refcount reached 0.
-                push_ancestor(worklist, head, ancestor_nn);
+                push_cascade(worklist, head, ancestor_nn);
             }
         }
 
@@ -3519,7 +3521,7 @@ unsafe fn dealloc_object_one(
             {
                 // SAFETY: refcount reached 0; the worklist runs the Memory
                 // arm above (which frees the buddy pages).
-                push_ancestor(worklist, head, ancestor_nn);
+                push_cascade(worklist, head, ancestor_nn);
             }
         }
 
@@ -3622,7 +3624,7 @@ unsafe fn dealloc_object_one(
             if new_rc == 0
             {
                 // SAFETY: refcount reached 0; queue the Memory cap on the cascade worklist.
-                push_ancestor(worklist, head, ancestor_nn);
+                push_cascade(worklist, head, ancestor_nn);
             }
         }
 
@@ -3703,7 +3705,7 @@ unsafe fn dealloc_object_one(
             if new_rc == 0
             {
                 // SAFETY: refcount reached 0.
-                push_ancestor(worklist, head, ancestor_nn);
+                push_cascade(worklist, head, ancestor_nn);
             }
         }
 
@@ -3729,7 +3731,7 @@ unsafe fn dealloc_object_one(
                 let zeroed = unsafe { crate::ipc::wait_set::wait_set_drop(state) };
                 for entry in zeroed.iter().copied().flatten()
                 {
-                    push_ancestor(worklist, head, entry);
+                    push_cascade(worklist, head, entry);
                 }
             }
 
@@ -3762,7 +3764,7 @@ unsafe fn dealloc_object_one(
             if new_rc == 0
             {
                 // SAFETY: refcount reached 0.
-                push_ancestor(worklist, head, ancestor_nn);
+                push_cascade(worklist, head, ancestor_nn);
             }
         }
     }
@@ -3987,7 +3989,7 @@ mod tests
         assert!(matches!(refused, Err(syscall::SyscallError::QuotaExceeded)));
         assert_eq!(
             root.lineage.live.load(Ordering::Relaxed),
-            RANGE_COPY_LIMIT + 1
+            ROOT_SHARE + RANGE_COPY_LIMIT
         );
     }
 

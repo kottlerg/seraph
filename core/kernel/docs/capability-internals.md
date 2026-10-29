@@ -471,11 +471,13 @@ capability do not share the source's object: `object_for_new_slot` retypes a fre
 over the same range from SEED, so every slot owns its object, and deleting or revoking the
 slot frees it (a syscall pin defers the free to the pinning syscall's end, as for any
 object). A boot mint or a range split produces a lineage *root*; a copy records its root
-(`RangeLineage`), and the root counts its own references (one share) plus every live copy.
-A copy past `RANGE_COPY_LIMIT` (64) live copies of one root returns `QuotaExceeded`, which
-bounds the SEED a holder can consume by copying. A copy's body is freed with its last
-reference; the root's body is freed when its last share goes, so a copy's root pointer
-never dangles. A split of a copy produces two fresh roots.
+(`RangeLineage`), and the root's lineage count holds a root share while the root has
+references plus one per live copy. A copy past `RANGE_COPY_LIMIT` (64) live copies of one
+root returns `QuotaExceeded`, counting the copies alone whether or not the root is still
+referenced; that bounds the SEED copying can consume per lineage, while a split of a copy
+produces two fresh roots, each with a lineage of its own. A copy's body is freed with its
+last reference; the root's body is freed when its last share goes, so a copy's root pointer
+never dangles.
 
 ### Mmio Mappings
 
@@ -497,9 +499,11 @@ inside IPC delivery, where an address-space teardown must not run.
 A bound thread's `iopb` pointer names the bitmap at the head of its port-binding table
 (`cap::ioport_bindings::IoPortBindings`, one SEED scratch block): the 8 KiB IOPB and up to
 `MAX_IOPORT_BINDINGS` (16) records of `(IoPort object, base, count)`. `sys_ioport_bind`
-records the binding and permits its ports under the thread's `sched_lock`; a bind through
-an object the thread already records changes nothing, and a seventeenth distinct object
-returns `QuotaExceeded`. The bitmap is always the union of the recorded bindings.
+records the binding and permits its ports under the thread's `sched_lock`; a bind through an
+object the thread already records changes nothing, and a seventeenth distinct object returns
+`QuotaExceeded`. A bind of another thread also invalidates every CPU's TSS bitmap (below),
+so a target already running elsewhere picks up the new ports at its next port access. The
+bitmap is always the union of the recorded bindings.
 
 The IoPort dealloc arm runs `withdraw_everywhere` before the object's bytes go. It walks
 the thread registry and, under each thread's `sched_lock`, drops the records naming the

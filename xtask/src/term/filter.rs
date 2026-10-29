@@ -46,6 +46,13 @@
 //! one sequence is not idiomatic and is safer to discard wholesale than
 //! to attempt to rewrite.
 //!
+//! Interrupted sequences: an `ESC` inside an escape sequence cancels it,
+//! as it does in a terminal. The buffered bytes are dropped and the
+//! `ESC` starts a fresh sequence, screened on its own, so a blocklisted
+//! sequence cannot reach the tty nested inside another (`ESC ESC c`,
+//! `ESC [ ESC c`, `ESC ] 4;x ESC c`). An OSC whose `ESC` is not followed
+//! by `\` is unterminated and is dropped the same way.
+//!
 //! The filter is a pure byte-stream parser — no I/O beyond the wrapped
 //! writer, no platform code, no allocation beyond a small reusable
 //! scratch buffer that holds at most one in-flight sequence. It is
@@ -90,16 +97,19 @@ enum State
     /// Outside any escape sequence. Bytes pass through directly.
     Ground,
     /// Saw `ESC`. The next byte selects the sequence type
-    /// (`[` = CSI, `]` = OSC, `c` = RIS, anything else = pass through).
+    /// (`[` = CSI, `]` = OSC, `c` = RIS, `ESC` = restart, anything
+    /// else = pass through).
     Esc,
     /// Saw `ESC [`, collecting params / intermediates until a final
-    /// byte in `0x40..=0x7e` ends the CSI sequence.
+    /// byte in `0x40..=0x7e` ends the CSI sequence; an `ESC` cancels it
+    /// and restarts.
     Csi,
     /// Saw `ESC ]`, collecting OSC body until BEL (`0x07`) or the
     /// start of an ST terminator (`ESC \`).
     Osc,
     /// Saw `ESC ] ... ESC`, waiting for the trailing `\` that
-    /// completes the ST terminator.
+    /// completes the ST terminator; any other byte drops the OSC and
+    /// is handled as the byte after a fresh `ESC`.
     OscEsc,
 }
 
@@ -153,6 +163,54 @@ impl<W: Write> FilterWriter<W>
         true
     }
 
+    /// Drop the in-progress sequence and start a fresh one at the `ESC`
+    /// that interrupted it. A terminal treats an `ESC` inside a sequence
+    /// the same way (it cancels the sequence and begins a new escape), so
+    /// the dropped bytes would not take effect there either; and the new
+    /// sequence is screened on its own instead of being emitted inside the
+    /// old one (`ESC [ ESC c` would otherwise reach the tty as a RIS).
+    fn restart_at_esc(&mut self)
+    {
+        self.pending.clear();
+        self.pending.push(0x1b);
+        self.state = State::Esc;
+    }
+
+    /// Handle `b`, the byte after an `ESC`; `pending` holds that `ESC`.
+    fn esc_byte(&mut self, b: u8) -> io::Result<()>
+    {
+        if b == 0x1b
+        {
+            // `ESC ESC`: the second restarts the escape, and the first,
+            // a lone `ESC`, is dropped rather than emitted where it could
+            // combine with whatever follows a later dropped sequence.
+            self.restart_at_esc();
+            return Ok(());
+        }
+        if !self.push_pending(b)
+        {
+            return Ok(());
+        }
+        match b
+        {
+            b'[' => self.state = State::Csi,
+            b']' => self.state = State::Osc,
+            b'c' =>
+            {
+                // RIS — full terminal reset. Drop.
+                self.pending.clear();
+                self.state = State::Ground;
+            }
+            _ =>
+            {
+                // Other ESC X — pass through (charset switches, etc.).
+                self.flush_pending()?;
+                self.state = State::Ground;
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve a completed escape sequence: emit it to `inner` if
     /// permitted, or drop the buffered bytes otherwise. Always clears
     /// `pending`.
@@ -198,32 +256,14 @@ impl<W: Write> Write for FilterWriter<W>
                         ground_start.get_or_insert(i);
                     }
                 }
-                State::Esc =>
-                {
-                    if !self.push_pending(b)
-                    {
-                        continue;
-                    }
-                    match b
-                    {
-                        b'[' => self.state = State::Csi,
-                        b']' => self.state = State::Osc,
-                        b'c' =>
-                        {
-                            // RIS — full terminal reset. Drop.
-                            self.pending.clear();
-                            self.state = State::Ground;
-                        }
-                        _ =>
-                        {
-                            // Other ESC X — pass through (charset switches, etc.).
-                            self.flush_pending()?;
-                            self.state = State::Ground;
-                        }
-                    }
-                }
+                State::Esc => self.esc_byte(b)?,
                 State::Csi =>
                 {
+                    if b == 0x1b
+                    {
+                        self.restart_at_esc();
+                        continue;
+                    }
                     if !self.push_pending(b)
                     {
                         continue;
@@ -253,15 +293,24 @@ impl<W: Write> Write for FilterWriter<W>
                 }
                 State::OscEsc =>
                 {
-                    if !self.push_pending(b)
+                    if b == b'\\'
                     {
-                        continue;
+                        // Proper ST: resolve the OSC as a unit.
+                        if !self.push_pending(b)
+                        {
+                            continue;
+                        }
+                        self.flush_pending()?;
+                        self.state = State::Ground;
                     }
-                    // Whether the next byte is `\` (proper ST) or anything
-                    // else (malformed input — treat as end-of-sequence),
-                    // we resolve `pending` and return to Ground.
-                    self.flush_pending()?;
-                    self.state = State::Ground;
+                    else
+                    {
+                        // The ESC did not start an ST: the OSC is
+                        // unterminated and is dropped, and the ESC opens
+                        // a fresh sequence whose next byte is `b`.
+                        self.restart_at_esc();
+                        self.esc_byte(b)?;
+                    }
                 }
             }
         }
@@ -660,6 +709,34 @@ mod tests
         input.extend_from_slice(b"\x1bcok");
 
         assert_eq!(run(&input), b"ok");
+    }
+
+    #[test]
+    fn esc_esc_restarts_the_escape_and_screens_the_second()
+    {
+        // A terminal runs `ESC ESC c` as RIS (the second ESC restarts the
+        // escape), so emitting the first pair raw would let the reset out.
+        assert_eq!(run(b"\x1b\x1bcok"), b"ok");
+    }
+
+    #[test]
+    fn esc_inside_csi_cancels_it_and_screens_the_new_sequence()
+    {
+        // Buffered as a CSI parameter, the inner ESC would make `c` (RIS)
+        // or `[` the CSI's final byte and let the inner sequence out.
+        assert_eq!(run(b"\x1b[\x1bcok"), b"ok");
+        assert_eq!(run(b"\x1b[\x1b[8;24;80tok"), b"ok");
+    }
+
+    #[test]
+    fn osc_interrupted_by_esc_is_dropped_and_the_new_sequence_screened()
+    {
+        // An ESC not followed by `\` does not end the OSC as ST; emitted
+        // with the OSC 4 it interrupted, `ESC c` or the alt-screen toggle
+        // would reach the tty. A safe sequence after it still passes.
+        assert_eq!(run(b"\x1b]4;x\x1bcok"), b"ok");
+        assert_eq!(run_one_byte_at_a_time(b"\x1b]4;x\x1b[?1049hok"), b"ok");
+        assert_eq!(run(b"\x1b]4;x\x1b[31mred"), b"\x1b[31mred");
     }
 
     #[test]

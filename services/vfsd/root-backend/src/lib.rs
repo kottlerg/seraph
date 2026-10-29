@@ -792,13 +792,43 @@ mod tests
     }
 
     #[test]
-    fn path_of_rejects_a_short_buffer_and_an_inactive_node()
+    fn path_of_rejects_a_short_buffer_an_inactive_node_and_an_index_past_the_pool()
     {
         let mut b = VfsdRootBackend::new();
         let a = intermediate_a(&mut b);
         assert_eq!(b.path_of(a, &mut [0u8; 1]), None);
         assert_eq!(b.path_of(0, &mut []), None);
         assert_eq!(b.path_of(30, &mut [0u8; 64]), None);
+        assert_eq!(b.path_of(MAX_TREE_NODES as u32, &mut [0u8; 64]), None);
+    }
+
+    #[test]
+    fn stat_of_an_active_node_is_a_directory()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        let stat = b
+            .stat(NodeId::from_raw_truncated(u64::from(a)))
+            .expect("active node resolves");
+        assert_eq!(stat.kind, NodeKind::Dir);
+    }
+
+    #[test]
+    fn stat_of_an_unresolvable_node_is_not_found()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert_eq!(
+            b.stat(NodeId::from_raw_truncated(5)).err(),
+            Some(NsError::NotFound)
+        );
+    }
+
+    #[test]
+    fn local_child_count_past_the_pool_is_zero()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", CAP).is_some());
+        assert_eq!(b.local_child_count(MAX_TREE_NODES as u32), 0);
     }
 
     #[test]
@@ -819,5 +849,8 @@ mod tests
         assert_eq!(b.fallthrough_of(a), CAP);
         b.set_fallthrough_cap(30, CAP);
         assert_eq!(b.fallthrough_of(30), 0);
+        let past_the_pool = MAX_TREE_NODES as u32;
+        b.set_fallthrough_cap(past_the_pool, CAP);
+        assert_eq!(b.fallthrough_of(past_the_pool), 0);
     }
 }

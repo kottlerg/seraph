@@ -58,10 +58,12 @@ struct ScratchMemory
     va: u64,
 }
 
-// SAFETY: ScratchMemory holds an AtomicU32 cap (Sync by construction) and
-// a raw VA value (u64) that is process-static. Concurrent callers
-// serialise their use of the memory cap via the cap_swap dance in
-// write_sector, not via Rust borrow checking.
+// SAFETY: ScratchMemory's fields are an `AtomicU32` and a `u64`, both Send
+// and Sync, so these impls assert only what the compiler derives for the
+// struct. The scratch page the VA names is used by one thread only: the
+// dispatch thread calls `write_sector` and `reload_sector`, the two users
+// of the page and its cap, and the eviction worker touches the cache only
+// through `release_slot`.
 unsafe impl Send for ScratchMemory {}
 // SAFETY: see Send above — same justification.
 unsafe impl Sync for ScratchMemory {}

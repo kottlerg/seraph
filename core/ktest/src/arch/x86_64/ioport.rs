@@ -12,8 +12,8 @@
 //! binding the full 64K I/O port space at startup.
 //!
 //! Once `ioport_bind` succeeds for a thread, the grant lasts as long as the
-//! carved cap it was made through: deleting, consuming (splitting), or
-//! revoking that cap withdraws it
+//! carved cap it was made through: deleting that cap, consuming it with a
+//! split, or revoking an ancestor of it withdraws it
 //! ([capability-model.md](../../../../../docs/capability-model.md) § `IoPort` (x86-64 only)).
 //! The carved caps a consumer binds therefore stay in ktest's `CSpace`; the
 //! prefix caps left beside them are the ones other tests may consume.

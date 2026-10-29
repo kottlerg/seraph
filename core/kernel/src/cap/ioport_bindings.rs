@@ -7,12 +7,13 @@
 //! thread runs with, and the record of every `SYS_IOPORT_BIND` behind it.
 //!
 //! `SYS_IOPORT_BIND` records each binding against the `IoPort` object it was
-//! made through. When that object is freed — its capability deleted, or
-//! revoked through an ancestor — [`withdraw_everywhere`] drops the object's
-//! records from every thread and rebuilds each bitmap from the bindings that
-//! remain, so a port another live binding still grants stays permitted. The
-//! rebuilt bitmap reaches a CPU that is running the thread through the lazy
-//! IOPB reload of `arch::current::gdt` (`invalidate_all_iopbs`). See
+//! made through. When that object is freed — its capability deleted, consumed
+//! by a split, or revoked through an ancestor — [`withdraw_everywhere`] drops
+//! the object's records from every thread and rebuilds each bitmap from the
+//! bindings that remain, so a port another live binding still grants stays
+//! permitted. The rebuilt bitmap reaches a CPU that is running the thread
+//! through the lazy IOPB reload of `arch::current::gdt`
+//! (`invalidate_all_iopbs`). See
 //! core/kernel/docs/capability-internals.md § `IoPort` Bindings.
 //!
 //! The table lives in one SEED scratch allocation per bound thread

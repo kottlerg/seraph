@@ -214,8 +214,8 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// The `Mmio` object records the mapping, holding a reference on the address
 /// space, before any page is mapped; freeing the object (its capability
-/// deleted, or revoked through an ancestor) unmaps it, with TLB shootdown
-/// (docs/capability-model.md § Mmio). Returns `QuotaExceeded` when the object
+/// deleted, consumed by a split, or revoked through an ancestor) unmaps it,
+/// with TLB shootdown (docs/capability-model.md § Mmio). Returns `QuotaExceeded` when the object
 /// already records `MMIO_MAX_MAPPINGS` other mappings.
 ///
 /// Intermediate page-table pages come from the target AS's PT growth pool;

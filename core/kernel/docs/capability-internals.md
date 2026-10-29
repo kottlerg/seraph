@@ -5,13 +5,15 @@ capability types, rights, derivation, revocation, and transfer semantics — is
 specified in [docs/capability-model.md](../../../docs/capability-model.md). This document
 covers the data structures and algorithms that realise those semantics.
 
-The capability subsystem comprises four components:
+The capability subsystem comprises five components:
 
 1. **CSpace** — per-process capability space (slot storage and lookup)
 2. **Page pools** — the donated pages behind a CSpace's slots and an address
    space's page tables, and the record of every donation
 3. **Capability slot** — in-memory representation of one capability
-4. **Derivation tree** — cross-process tree for revocation
+4. **Range capability objects** — the Mmio and IoPort objects, which record the
+   mappings and port bindings made through them so revocation can withdraw them
+5. **Derivation tree** — cross-process tree for revocation
 
 ---
 
@@ -99,18 +101,20 @@ A syscall that uses the object a handle names resolves the handle through `sysca
 under the CSpace spinlock and takes a reference on the object inside that hold, the syscall pin of
 [§ Kernel Object Reference Counting](#kernel-object-reference-counting). The pin keeps the object
 live for as long as the handler uses it, whatever releases the slot's own reference meanwhile: a
-sibling's delete of the last capability, or another holder's revoke of an ancestor. A split child
-(a `SYS_MEMORY_SPLIT` tail, or a range-split MMIO, IoPort, IRQ, or SchedControl child) is a distinct
-object linked under the original's derivation parent, so another holder's revoke of that ancestor
-can release it directly; for a same-object derivation, as in the kill-process pattern, it is the
-delete following the revoke that releases it. Either way the object is freed only when its count
-reaches zero, which a held pin defers until the syscall drops it. Copy, derive, and derive-badge
-pin their source the same way, so the reference they take for the new slot never lands on a freed
-object, and still revalidate the source slot under the derivation write lock before they link the
-new one (see [§ Global Derivation Lock](#global-derivation-lock)). The remaining lock-free readers
-— the IPC transfer pre-validation and the capability-tree syscalls' unlocked pre-checks — read only
-the tag, generation, and in-flight pin of a slot and dereference no object; the tag and per-slot
-generation checks there only narrow the race they act on, and the locked path re-decides.
+sibling's delete of the last capability, or another holder's revoke of an ancestor. A split child (a
+`SYS_MEMORY_SPLIT` tail, or a range-split MMIO, IoPort, IRQ, or SchedControl child) is a distinct
+object linked under the original's derivation parent, and so is every copy or derivation of an Mmio
+or IoPort capability ([§ Range Capability Objects](#range-capability-objects)), so another holder's
+revoke of that ancestor can release it directly; for a same-object derivation, as in the
+kill-process pattern, it is the delete following the revoke that releases it. Either way the object
+is freed only when its count reaches zero, which a held pin defers until the syscall drops it. Copy,
+derive, and derive-badge pin their source the same way, so the reference they take for the new slot
+never lands on a freed object, and still revalidate the source slot under the derivation write lock
+before they link the new one (see [§ Global Derivation Lock](#global-derivation-lock)). The
+remaining lock-free readers — the IPC transfer pre-validation and the capability-tree syscalls'
+unlocked pre-checks — read only the tag, generation, and in-flight pin of a slot and dereference no
+object; the tag and per-slot generation checks there only narrow the race they act on, and the
+locked path re-decides.
 
 **Slot 0** is always null. The leaf covering slot 0 exists once the CSpace
 has grown, but the slot is permanently locked to the null capability,
@@ -400,9 +404,16 @@ The principal kernel-internal owners:
   page pool is referenced by the donation record until that AddressSpace or CSpace is
   freed. The Memory object an AddressSpace or CSpace is created from is referenced
   once, by donation record 0, which serves as its retype ancestry too.
-- **SEED scratch leases.** A per-thread x86-64 IOPB reserved by `sys_ioport_bind`
+- **SEED scratch leases.** A per-thread x86-64 port-binding table (the IOPB and its
+  binding records, [§ IoPort Bindings](#ioport-bindings)) reserved by `sys_ioport_bind`
   holds a reference on the SEED reserve until the thread is destroyed
-  (`alloc_seed_scratch` / `free_seed_scratch`).
+  (`alloc_seed_scratch` / `free_seed_scratch`). The body of every Mmio and IoPort object
+  is retyped from SEED as well, a copy's included, so each live copy holds one more SEED
+  lease; [§ Copies and Lineages](#copies-and-lineages) bounds how many a range can have.
+- **Mmio mapping records.** Each `SYS_MMIO_MAP` mapping an Mmio object records holds a
+  reference on the target `AddressSpace`, released when the object is freed and the
+  mapping withdrawn ([§ Mmio Mappings](#mmio-mappings)), so an address space outlives
+  its last capability while an Mmio capability mapped into it lives.
 - **Kernel-lifetime pins.** The SEED reserve and the root CSpace each hold a reference
   the kernel never releases (the SEED pin from `install_seed_memory`; the root CSpace's
   base reference, attributed to init's TCB), and `HDR_FLAG_IS_ROOT` clamps the root
@@ -442,6 +453,69 @@ reference, and the increment lands before any release can reach zero. The one re
 clears no slot, the dying CSpace's `for_each_object` drop in its `dealloc_object` arm, runs only
 after every thread bound to the CSpace is stopped and off every CPU and the CSpace is unregistered,
 so no `pin_slot` can be reading it.
+
+---
+
+## Range Capability Objects
+
+Mmio and IoPort capabilities grant hardware access that outlives the syscall that
+establishes it: a page mapping, or a thread's I/O permission bitmap. Revocation must
+withdraw that access ([docs/capability-model.md](../../../docs/capability-model.md) § Mmio,
+§ IoPort), so the kernel ties each grant to the object of the capability it was made
+through, and withdraws it when that object is freed.
+
+### Copies and Lineages
+
+`SYS_CAP_COPY`, `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` of an Mmio or IoPort
+capability do not share the source's object: `object_for_new_slot` retypes a fresh object
+over the same range from SEED, so every slot owns its object, and deleting or revoking the
+slot frees it (a syscall pin defers the free to the pinning syscall's end, as for any
+object). A boot mint or a range split produces a lineage *root*; a copy records its root
+(`RangeLineage`), and the root counts its own references (one share) plus every live copy.
+A copy past `RANGE_COPY_LIMIT` (64) live copies of one root returns `QuotaExceeded`, which
+bounds the SEED a holder can consume by copying. A copy's body is freed with its last
+reference; the root's body is freed when its last share goes, so a copy's root pointer
+never dangles. A split of a copy produces two fresh roots.
+
+### Mmio Mappings
+
+An `MmioObject` holds up to `MMIO_MAX_MAPPINGS` (4) mapping records, each an `AddressSpace` (with a
+reference) and the VA of the region's first page; mapping the object again at the same place reuses
+its record, and a fifth distinct mapping returns `QuotaExceeded`. `sys_mmio_map` records the mapping
+under the object's `map_lock` before it maps a page, so the teardown finds every page a call maps, a
+partial map included. The object's dealloc arm runs `withdraw_mappings`: for each record,
+`AddressSpace::unmap_region_if_phys` clears, under `pt_lock`, each leaf that still maps the matching
+device page (a page the user has since remapped to other memory is left alone), then issues one TLB
+invalidation for the span on every CPU that runs the space, after the lock is released; the device
+frames are never reallocated, so nothing waits on the shootdown. The record's address-space
+reference is then released through `release_ref`, so an address space it was the last reference to
+goes to this CPU's deferred reclaim, as for a syscall pin: an Mmio object can be freed in place
+inside IPC delivery, where an address-space teardown must not run.
+
+### IoPort Bindings
+
+A bound thread's `iopb` pointer names the bitmap at the head of its port-binding table
+(`cap::ioport_bindings::IoPortBindings`, one SEED scratch block): the 8 KiB IOPB and up to
+`MAX_IOPORT_BINDINGS` (16) records of `(IoPort object, base, count)`. `sys_ioport_bind`
+records the binding and permits its ports under the thread's `sched_lock`; a bind through
+an object the thread already records changes nothing, and a seventeenth distinct object
+returns `QuotaExceeded`. The bitmap is always the union of the recorded bindings.
+
+The IoPort dealloc arm runs `withdraw_everywhere` before the object's bytes go. It walks
+the thread registry and, under each thread's `sched_lock`, drops the records naming the
+object (compared by address, never dereferenced) and rebuilds the bitmap from the rest; a
+bind through the object holds a pin on it, so none can record it once the teardown runs.
+`dealloc_object(Thread)` detaches a dying thread's table under the same lock before
+freeing it. If any bitmap changed, `gdt::invalidate_all_iopbs` stores an out-of-limit
+`iopb_offset` into every CPU's TSS, with a trailing fence, so every ring-3 port access after
+the revoke raises `#GP`. The `#GP` handler (`gdt::reload_invalidated_iopb`) sees the invalid
+offset, reloads the running thread's current bitmap under its `sched_lock`, restores the
+offset, and retries the instruction: a port the thread still holds succeeds, one it lost
+faults again and is handled as a genuine `#GP`. A context switch loads its incoming
+thread's bitmap and restores the offset itself. A CPU's TSS is written only by that CPU,
+except for the offset, which `TssWithIopb`'s 2-byte alignment lets another CPU store
+atomically; any interleaving of a remote invalidation with a local reload leaves the CPU
+either invalidated or running a bitmap loaded under its thread's lock after the rebuild.
 
 ---
 

@@ -50,3 +50,11 @@ pub unsafe fn load_iopb(_iopb: Option<&[u8; IOPB_SIZE]>) {}
 /// `sys_ioport_bind` compiles on both arches; the `HAS_IO_PORTS` gate makes
 /// this unreachable on RISC-V.
 pub fn permit_port_range(_iopb: &mut [u8; IOPB_SIZE], _base: u32, _count: u32) {}
+
+/// Make every CPU reload its I/O permission bitmap — no-op on RISC-V.
+///
+/// RISC-V has no I/O port space, so no thread holds a port binding to
+/// withdraw. Present so `cap::ioport_bindings::withdraw_everywhere` compiles on
+/// both arches; the `HAS_IO_PORTS` gate makes this unreachable on RISC-V.
+#[cfg(not(test))]
+pub fn invalidate_all_iopbs() {}

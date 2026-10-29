@@ -722,7 +722,7 @@ The `SYS_SBI_CALL` handler's rights check and `HAS_SBI` gate are specified in
 
 These items in otherwise arch-private submodules are also contract surface, because
 architecture-neutral code calls them:
-`gdt::{load_iopb, permit_port_range, init_ap, bsp_tss_ptr, IOPB_SIZE}`,
+`gdt::{load_iopb, permit_port_range, invalidate_all_iopbs, init_ap, bsp_tss_ptr, IOPB_SIZE}`,
 `platform::{console_mmio, uart_base_for_boot_info, collect_mmio_direct_map_regions}`,
 `fpu::{switch_out_save, switch_in_restore}`, `idt::load`, and
 `ap_trampoline::{setup_trampoline, start_ap}` (the `gdt` items are stubs on RISC-V); the rest
@@ -733,6 +733,9 @@ of those modules is arch-private:
 pub unsafe fn gdt::load_iopb(iopb: Option<&[u8; IOPB_SIZE]>);
 /// Permit an I/O port range in a thread's IOPB (x86-64); no-op on RISC-V.
 pub fn gdt::permit_port_range(iopb: &mut [u8; IOPB_SIZE], base: u32, count: u32);
+/// Make every CPU reload its TSS IOPB before its next ring-3 port access, after a
+/// thread's bitmap lost ports (x86-64); no-op on RISC-V.
+pub fn gdt::invalidate_all_iopbs();
 /// Load a per-CPU GDT and TSS on an AP (x86-64); no-op on RISC-V.
 pub unsafe fn gdt::init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64);
 /// Virtual address of the BSP's static TSS (x86-64); 0 on RISC-V.

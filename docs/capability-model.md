@@ -183,10 +183,23 @@ memory-mapped I/O. Rights:
 Without this capability a process cannot map physical addresses — it cannot
 name hardware it has not been granted access to.
 
-Revoking an Mmio capability blocks new `SYS_MMIO_MAP` calls through its descendants but
-does not unmap mappings already established through them; the kernel unmapping every
-mapping made through those descendants on revocation is design intent (not yet
-implemented — `SYS_MMIO_MAP` records no mapping, #457).
+Every Mmio capability references an object of its own: a copy or derivation of one
+(`SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`) references a fresh object over
+the same range, and the object records each `SYS_MMIO_MAP` mapping made through the
+capability. When the capability goes — deleted, consumed by a split, or revoked through an
+ancestor — its object is freed and every mapping made through it is unmapped, with TLB
+shootdown, before the deleting or revoking call returns. A mapping a concurrent syscall is
+still making through the capability is unmapped when that syscall ends, and a page the
+address space has since remapped to other memory is left alone. The revoked capability
+itself is preserved (see [Revocation](#revocation)), so mappings made through it remain.
+A range's copies are bounded: at most 64 copies of one boot-minted or split capability's
+range are live at once, and a further copy returns `QuotaExceeded`.
+
+Deleting or revoking an Mmio capability whose mapping lies in the caller's own address
+space therefore withdraws memory the caller's code may still reference, as unmapping it
+would; the userspace wrappers for those calls stay safe functions, and making them `unsafe`
+for this case is recorded on
+[#558](https://github.com/kottlerg/seraph/issues/558).
 
 ### Thread
 
@@ -228,11 +241,16 @@ port range (see
 port, only to a caller whose badge carries `SHUTDOWN_DEVICE_AUTHORITY`: the seed-only
 `devmgr.shutdown` cap, which pwrmgr alone seeds and svcmgr's `QUERY_ENDPOINT` refuses.
 
-Revoking an IoPort capability is intended to remove port access from every thread
-bound through its descendants (the revoked capability itself is preserved, per
-[Revocation](#revocation)); the kernel tracking bindings and updating each affected
-thread's IOPB in the TSS on revocation is design intent (not yet implemented — `SYS_IOPORT_BIND`
-records no binding and revocation does not withdraw bound IOPB access, #457).
+Every IoPort capability references an object of its own, as for [Mmio](#mmio): a copy or
+derivation references a fresh object over the same range, bounded the same way. Each thread
+records its bindings against the objects they were made through. When an IoPort capability
+goes — deleted, consumed by a split, or revoked through an ancestor — the kernel withdraws
+every binding made through it from every bound thread, rebuilding each thread's I/O
+permission bitmap from the bindings that remain, so a port another live binding grants stays
+permitted. Before the deleting or revoking call returns, every CPU's TSS bitmap is
+invalidated, so a bound thread running on another CPU reloads its current bitmap at its next
+port access and a withdrawn port faults. The revoked capability itself is preserved (see
+[Revocation](#revocation)), so bindings made through it remain.
 
 ### SbiControl (RISC-V only)
 
@@ -513,9 +531,10 @@ invalidates all capabilities derived from the target, in all processes. The targ
 slot itself is preserved — the revoker keeps its own capability and only withdraws
 delegated authority.
 
-After revocation, any process that held a derived capability can no longer use it
-(an established Memory mapping, MMIO mapping, or IoPort binding outlives it; see
-[Memory](#memory), [Mmio](#mmio), and [IoPort](#ioport-x86-64-only)). The target's
+After revocation, any process that held a derived capability can no longer use it.
+MMIO mappings and IoPort bindings made through a revoked descendant are withdrawn (see
+[Mmio](#mmio) and [IoPort](#ioport-x86-64-only)); an established Memory mapping outlives
+it (see [Memory](#memory)). The target's
 kernel object is not destroyed, because the preserved target slot still references it.
 A descendant that references a distinct object, such as a range-split child, frees that
 object when its last reference goes.

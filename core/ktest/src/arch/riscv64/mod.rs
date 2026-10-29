@@ -44,6 +44,18 @@ pub const PAGE_FAULT_STORE_VECTOR: u64 = 15;
 /// `EXIT_FAULT_BASE + <vector>` when the fault kills the thread.
 pub const ILLEGAL_INSTRUCTION_VECTOR: u64 = 2;
 
+/// Exception cause a not-present user load faults with (load page fault), as
+/// recorded in `EXIT_FAULT_BASE + <vector>` when the fault kills the thread.
+pub const PAGE_FAULT_LOAD_VECTOR: u64 = 13;
+
+/// Physical base of an MMIO register page that a test may read without side
+/// effects: the console UART, which init receives as its own `Mmio` cap. Its
+/// line-status register, at [`MMIO_PROBE_OFFSET`], has no read side effect.
+pub const MMIO_PROBE_PHYS: u64 = serial::UART_PHYS;
+
+/// Byte offset of the side-effect-free register (LSR) in the [`MMIO_PROBE_PHYS`] page.
+pub const MMIO_PROBE_OFFSET: usize = 5;
+
 /// Size of the register file `thread_read_regs` returns (the kernel
 /// `TrapFrame`), as the ABI publishes it.
 pub const TRAP_FRAME_BYTES: u64 = syscall_abi::REGS_RISCV64_SIZE as u64;

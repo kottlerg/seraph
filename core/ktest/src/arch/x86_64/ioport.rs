@@ -11,15 +11,12 @@
 //! confined to the ports the consumer actually drives instead of
 //! binding the full 64K I/O port space at startup.
 //!
-//! Once `ioport_bind` succeeds for a thread, the IOPB grant for those
-//! ports lives in per-thread state
-//! (`core/kernel/src/sched/thread.rs::ThreadControlBlock::iopb`) and is not
-//! withdrawn when the cap is later consumed or revoked: revocation does not
-//! yet withdraw bound IOPB access (#457; intended semantics in
-//! [capability-model.md](../../../../../docs/capability-model.md) § `IoPort` (x86-64 only)).
-//! Narrow caps produced here are therefore consumed afterwards (e.g. by
-//! Tier-1 unit tests that exercise `ioport_split`) without losing the
-//! established permission.
+//! Once `ioport_bind` succeeds for a thread, the grant lasts as long as the
+//! carved cap it was made through: deleting, consuming (splitting), or
+//! revoking that cap withdraws it
+//! ([capability-model.md](../../../../../docs/capability-model.md) § `IoPort` (x86-64 only)).
+//! The carved caps a consumer binds therefore stay in ktest's `CSpace`; the
+//! prefix caps left beside them are the ones other tests may consume.
 
 use init_protocol::{CapType, InitInfo};
 

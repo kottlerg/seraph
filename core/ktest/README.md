@@ -150,6 +150,7 @@ concurrent notification and queue events.
 | `cap_delegation_chain.rs` | Multi-level rights attenuation and cascaded revocation |
 | `tlb_coherency.rs` | Map/unmap cycles across CPUs to exercise TLB shootdown, then the same with `mem_unmap_reclaim` |
 | `retype_reclaim.rs` | Auto-reclaim invariant for every retypable kernel object |
+| `mmio_revoke_unmaps.rs` | Revoking an `Mmio` cap unmaps, with TLB shootdown, the mapping made through its descendant while a reader on another CPU uses it; the reader's next load faults ([docs/capability-model.md § Mmio](../../docs/capability-model.md#mmio)) |
 | `mem_map_retyped_refused.rs` | `mem_map` refuses, with `InvalidArgument`, the pages a Memory cap has retyped into a `CSpace`, and maps the page past its retype cursor ([docs/capability-model.md § Typed Memory](../../docs/capability-model.md#typed-memory)) |
 | `cspace_nested_teardown.rs` | Deleting the root of a 256-deep chain of nested `CSpace`s, each held only by its predecessor's slot, reclaims every one in bounded kernel stack ([core/kernel/docs/capability-internals.md § Teardown](../kernel/docs/capability-internals.md#teardown)) |
 | `retype_subpage_clobber.rs` | The retype sub-page allocator never dereferences a free-list link clobbered through a userspace mapping of the cap region |
@@ -176,7 +177,9 @@ the kernel across a SYSCALL, and that a syscall made with AC set completes its u
 returns with AC still set; `src/arch/x86_64/page_fault_present_bit.rs` checks that a fault
 handler's `#PF` message carries `FAULT_ACCESS_PRESENT` for a store to a read-only user page and
 never for a load from the top GiB of the kernel image window (the lower GiB can hold direct-map
-leaves the kernel's spurious-fault walk misreads, #563). On RISC-V,
+leaves the kernel's spurious-fault walk misreads, #563); `src/arch/x86_64/ioport_revoke.rs` checks
+that revoking an `IoPort` cap withdraws the port access bound through its descendant from a reader
+on another CPU, whose next port read raises `#GP`. On RISC-V,
 `src/arch/riscv64/sbi_gating.rs` checks that `SYS_SBI_CALL` refuses kernel-reserved SBI
 extensions and sanctioned ones the cap lacks the right for.
 
@@ -237,7 +240,8 @@ event and memory polls of `integration::fault_kills_thread`,
 `integration::fault_exception_no_handler_kills`, `integration::fault_handler_declines_kills`,
 `integration::aspace_fault_notification_late_bind`, `integration::death_notification_late_bind`,
 `integration::reply_binding_displaced`, `integration::syscall_rflags_hardening`,
-`integration::page_fault_present_bit`, `cap::cspace_self_delete_stops_caller` and
+`integration::page_fault_present_bit`, `integration::mmio_revoke_unmaps`,
+`integration::ioport_revoke`, `cap::cspace_self_delete_stops_caller` and
 `retype::aspace_self_delete_stops_caller`; the phase polls, the child's spin bound and the cleanup
 exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and is stretched so its
 `cap_delete` does not race a still-running pinned child); the migration polls of

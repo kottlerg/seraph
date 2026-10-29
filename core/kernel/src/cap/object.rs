@@ -420,7 +420,126 @@ impl Drop for MemoryReadGuard<'_>
     }
 }
 
+/// Most copies of one range-capability lineage that may be live at once: the
+/// `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` copies of an
+/// `Mmio` or `IoPort` capability, each a fresh SEED-backed object
+/// ([`object_for_new_slot`]). A copy past it returns `QuotaExceeded`.
+pub const RANGE_COPY_LIMIT: u32 = 64;
+
+/// The lineage an `Mmio` or `IoPort` object belongs to.
+///
+/// A boot mint or a range split produces a lineage *root*; copying a
+/// capability of either type produces a fresh object whose lineage names
+/// that root, so each capability slot owns its own object and the mappings
+/// or port bindings made through it are withdrawn when that object is freed
+/// (docs/capability-model.md § Mmio, § `IoPort`). The root's `live` counts its
+/// own capability references (one, dropped when the root's reference count
+/// reaches zero) plus every live copy; the root's body is freed when `live`
+/// reaches zero, so a copy's lineage pointer never dangles.
+#[repr(C)]
+pub struct RangeLineage
+{
+    /// The lineage root; null when this object is the root.
+    root: *mut KernelObjectHeader,
+    /// Root only: live copies, plus one while the root has references.
+    live: AtomicU32,
+    _pad: u32,
+}
+
+impl RangeLineage
+{
+    /// The lineage of a fresh root.
+    pub const fn new_root() -> Self
+    {
+        Self {
+            root: core::ptr::null_mut(),
+            live: AtomicU32::new(1),
+            _pad: 0,
+        }
+    }
+
+    /// Reserve a copy against `root`'s limit and return the lineage of the
+    /// copy.
+    ///
+    /// # Errors
+    /// `QuotaExceeded` when `root` already has [`RANGE_COPY_LIMIT`] live copies.
+    ///
+    /// # Safety
+    /// `root` is a live `Mmio` or `IoPort` lineage root whose `live` count is
+    /// held above zero by a pinned member of the lineage.
+    unsafe fn reserve_copy(root: NonNull<KernelObjectHeader>)
+    -> Result<Self, syscall::SyscallError>
+    {
+        // SAFETY: caller contract.
+        let live = unsafe { &lineage_of(root).live };
+        let mut cur = live.load(Ordering::Relaxed);
+        loop
+        {
+            if cur > RANGE_COPY_LIMIT
+            {
+                return Err(syscall::SyscallError::QuotaExceeded);
+            }
+            match live.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+        Ok(Self {
+            root: root.as_ptr(),
+            live: AtomicU32::new(0),
+            _pad: 0,
+        })
+    }
+
+    /// The lineage root of the object this lineage belongs to.
+    fn root_of(&self, own: NonNull<KernelObjectHeader>) -> NonNull<KernelObjectHeader>
+    {
+        NonNull::new(self.root).unwrap_or(own)
+    }
+}
+
+/// The lineage of an `Mmio` or `IoPort` object.
+///
+/// # Safety
+/// `hdr` is a live `Mmio` or `IoPort` object.
+// cast_ptr_alignment: each object is constructed in place at a
+// size-class-aligned retype offset; the header sits at offset 0.
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn lineage_of<'a>(hdr: NonNull<KernelObjectHeader>) -> &'a RangeLineage
+{
+    // SAFETY: caller contract; header at offset 0 of each concrete type.
+    unsafe {
+        match hdr.as_ref().obj_type
+        {
+            ObjectType::Mmio => &(*hdr.as_ptr().cast::<MmioObject>()).lineage,
+            ObjectType::IoPort => &(*hdr.as_ptr().cast::<IoPortObject>()).lineage,
+            _ => crate::fatal("lineage_of: not a range-capability object"),
+        }
+    }
+}
+
+/// Most `SYS_MMIO_MAP` mappings one `Mmio` object records. A map past it
+/// returns `QuotaExceeded`; mapping the same region again at the same VA of
+/// the same address space reuses its record.
+pub const MMIO_MAX_MAPPINGS: usize = 4;
+
+/// One `SYS_MMIO_MAP` mapping of an `Mmio` object's whole region.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MmioMapping
+{
+    /// The address space mapped into, holding one reference on it; null for an
+    /// empty record.
+    aso: *mut AddressSpaceObject,
+    /// User virtual address of the region's first page.
+    va: u64,
+}
+
 /// Kernel object for a memory-mapped I/O region (`Mmio` capability).
+///
+/// Records every `SYS_MMIO_MAP` mapping made through it; freeing the object
+/// unmaps each one ([`MmioObject::withdraw_mappings`]).
 #[repr(C)]
 pub struct MmioObject
 {
@@ -429,14 +548,137 @@ pub struct MmioObject
     pub base: u64,
     /// Size of the MMIO region in bytes.
     pub size: u64,
-    /// Flags word; always `0` today (boot mints set `0`, `sys_mmio_split` copies
-    /// the parent's value, and no mapping path reads it).
+    /// Flags word; always `0` today (boot mints set `0`, `sys_mmio_split` and
+    /// copies take the source's value, and no mapping path reads it).
     pub flags: u32,
-    // Explicit padding to preserve repr(C) layout. Public because the boot mint
-    // and split sites build this object by struct literal; the underscore marks
-    // it as carrying no value.
-    #[allow(clippy::pub_underscore_fields)]
-    pub _pad: u32,
+    _pad: u32,
+    /// The lineage this object belongs to (see [`RangeLineage`]).
+    lineage: RangeLineage,
+    /// Spin lock serialising `mappings` between concurrent `SYS_MMIO_MAP`
+    /// calls (`0` free, `1` held). Teardown, which owns the object
+    /// exclusively, reads the records without it.
+    map_lock: AtomicU32,
+    _pad2: u32,
+    /// Mappings made through this object, written only under `map_lock` (or
+    /// by the exclusive teardown); concurrent `SYS_MMIO_MAP` calls each hold
+    /// only a shared reference to the object.
+    mappings: core::cell::UnsafeCell<[MmioMapping; MMIO_MAX_MAPPINGS]>,
+}
+
+// MmioObject fits the 128-byte retype size class every SEED mint and copy
+// carves it from (`retype::round_to_class`).
+const _: () = assert!(core::mem::size_of::<MmioObject>() <= 128);
+
+impl MmioObject
+{
+    /// A lineage-root `Mmio` object over `[base, base + size)`, retyped from SEED.
+    pub fn new_root(base: u64, size: u64, flags: u32) -> Self
+    {
+        Self {
+            header: KernelObjectHeader::with_ancestor(
+                ObjectType::Mmio,
+                crate::cap::seed_header_nn(),
+            ),
+            base,
+            size,
+            flags,
+            _pad: 0,
+            lineage: RangeLineage::new_root(),
+            map_lock: AtomicU32::new(0),
+            _pad2: 0,
+            mappings: core::cell::UnsafeCell::new(
+                [MmioMapping {
+                    aso: core::ptr::null_mut(),
+                    va: 0,
+                }; MMIO_MAX_MAPPINGS],
+            ),
+        }
+    }
+
+    /// Record a mapping of this object's region at `va` in `aso`, taking a
+    /// reference on `aso` for the record. A mapping already recorded at the same
+    /// place is not recorded twice.
+    ///
+    /// # Errors
+    /// `QuotaExceeded` when [`MMIO_MAX_MAPPINGS`] mappings are already recorded.
+    ///
+    /// # Safety
+    /// `aso` is a live `AddressSpaceObject` the caller holds a reference on, and
+    /// the caller pins this object.
+    pub unsafe fn record_mapping(
+        &self,
+        aso: *mut AddressSpaceObject,
+        va: u64,
+    ) -> Result<(), syscall::SyscallError>
+    {
+        while self
+            .map_lock
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        // SAFETY: map_lock is held, so this is the only access to the records.
+        let mappings = unsafe { &mut *self.mappings.get() };
+        let result = if mappings
+            .iter()
+            .any(|m| core::ptr::eq(m.aso, aso) && m.va == va)
+        {
+            Ok(())
+        }
+        else if let Some(free) = mappings.iter_mut().find(|m| m.aso.is_null())
+        {
+            // SAFETY: aso is live and referenced by the caller (contract).
+            unsafe { (*aso).header.inc_ref() };
+            *free = MmioMapping { aso, va };
+            Ok(())
+        }
+        else
+        {
+            Err(syscall::SyscallError::QuotaExceeded)
+        };
+        self.map_lock.store(0, Ordering::Release);
+        result
+    }
+
+    /// Unmap every recorded mapping, with TLB shootdown, and release each
+    /// record's address-space reference through [`release_ref`], which hands
+    /// an address space whose last reference that was to this CPU's deferred
+    /// reclaim rather than tearing it down here: an `Mmio` object can be freed
+    /// in place inside IPC delivery (a moved capability's release), where an
+    /// address-space teardown's bound-thread stop must not run. A page the user
+    /// has since remapped to other memory is left in place
+    /// (`AddressSpace::unmap_region_if_phys`).
+    ///
+    /// # Safety
+    /// The object is being freed (reference count zero) and is exclusively
+    /// owned; no lock is held, and the CPU is stable (`release_ref`'s
+    /// preconditions).
+    // cast_possible_truncation: a region's page count fits usize on the 64-bit
+    // targets the kernel supports.
+    #[allow(clippy::cast_possible_truncation)]
+    #[cfg(not(test))]
+    unsafe fn withdraw_mappings(&mut self)
+    {
+        let pages = (self.size / crate::mm::PAGE_SIZE as u64) as usize;
+        let base = self.base;
+        for m in self.mappings.get_mut()
+        {
+            let Some(aso) = NonNull::new(m.aso)
+            else
+            {
+                continue;
+            };
+            m.aso = core::ptr::null_mut();
+            // SAFETY: the record's reference keeps the address space live; the
+            // span is the user range SYS_MMIO_MAP validated when it mapped it.
+            unsafe {
+                (*(*aso.as_ptr()).address_space).unmap_region_if_phys(m.va, pages, base);
+            }
+            // SAFETY: the record held this reference; no lock is held.
+            unsafe { release_ref(aso.cast::<KernelObjectHeader>()) };
+        }
+    }
 }
 
 /// Kernel object for a hardware interrupt range (Interrupt capability).
@@ -455,6 +697,9 @@ pub struct InterruptObject
 }
 
 /// Kernel object for an x86-64 I/O port range (`IoPort` capability).
+///
+/// The threads bound through it record it in their port-binding tables
+/// (`cap::ioport_bindings`); freeing the object withdraws those bindings.
 #[repr(C)]
 pub struct IoPortObject
 {
@@ -464,11 +709,41 @@ pub struct IoPortObject
     /// Number of consecutive ports; `0` encodes the full 65536-port space
     /// (the root cap), which a `u16` cannot hold.
     pub size: u16,
-    // Explicit padding to preserve repr(C) layout. Public because the boot mint
-    // and split sites build this object by struct literal; the underscore marks
-    // it as carrying no value.
-    #[allow(clippy::pub_underscore_fields)]
-    pub _pad: u32,
+    _pad: u32,
+    /// The lineage this object belongs to (see [`RangeLineage`]).
+    lineage: RangeLineage,
+}
+
+impl IoPortObject
+{
+    /// A lineage-root `IoPort` object over `size` ports from `base` (`size == 0`
+    /// for all 65536), retyped from SEED.
+    pub fn new_root(base: u16, size: u16) -> Self
+    {
+        Self {
+            header: KernelObjectHeader::with_ancestor(
+                ObjectType::IoPort,
+                crate::cap::seed_header_nn(),
+            ),
+            base,
+            size,
+            _pad: 0,
+            lineage: RangeLineage::new_root(),
+        }
+    }
+
+    /// The number of ports the object covers (65536 for the root encoding).
+    pub fn port_count(&self) -> u32
+    {
+        if self.size == 0
+        {
+            65536
+        }
+        else
+        {
+            u32::from(self.size)
+        }
+    }
 }
 
 /// Kernel object for scheduling control authority (`SchedControl` capability).
@@ -1406,20 +1681,22 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// The release half of a syscall's pin ([`crate::syscall::PinnedCap`]), of
 /// the reference a moved capability's freed source slot held
 /// (`cap::transfer::release_moved_object`), of the slot references a range
-/// split's consumed original and a memory merge's consumed tail held, and of
-/// a copy's or derive's unused source reference. Pins and moves may name an
-/// object bound to
-/// the running thread, so a `Thread`, `CSpace`, or `AddressSpace` whose last
-/// reference goes here is queued for this CPU's deferred reclaim (drained at
-/// the next syscall epilogue or idle loop) rather than torn down in place.
-/// Every other type frees in place through [`dealloc_object`], which may take
+/// split's consumed original and a memory merge's consumed tail held, of a
+/// copy's or derive's unpublished new-slot reference, and of the address-space
+/// reference an Mmio mapping record held (`MmioObject::withdraw_mappings`).
+/// Pins, moves, and mapping records may name an object bound to the running
+/// thread, so a `Thread`, `CSpace`, or `AddressSpace` whose last reference
+/// goes here is queued for this CPU's deferred reclaim (drained at the next
+/// syscall epilogue or idle loop) rather than torn down in place. Every other
+/// type frees in place through [`dealloc_object`], which may take
 /// `DERIVATION_LOCK` and the frame allocator and, for a Notification, an
 /// `EventQueue`, or an Endpoint, wakes the waiters it drains (the running
-/// thread among them, when it is parked on the object it released), and for a
+/// thread among them, when it is parked on the object it released), for a
 /// Notification or `EventQueue` first waits for the timer's in-flight wakeup
-/// batch (`sched::sleep_wakeups_quiesce`), a bounded wait that completes only
-/// when no IPC, scheduler, or sleep-list lock is held; hence the lock
-/// preconditions below.
+/// batch (`sched::sleep_wakeups_quiesce`), and for an Mmio or `IoPort` object
+/// waits for the TLB shootdown or takes the thread registry lock its
+/// withdrawal needs — bounded waits that complete only when no IPC,
+/// scheduler, or sleep-list lock is held; hence the lock preconditions below.
 ///
 /// # Safety
 ///
@@ -1688,6 +1965,174 @@ unsafe fn unlink_dying_waiter(
     }
 }
 
+/// Push `obj`, a refcount-0 object, onto a dealloc cascade worklist. Drops the
+/// entry on overflow — see `MAX_CASCADE` in [`dealloc_object`].
+#[cfg(not(test))]
+fn push_cascade(
+    worklist: &mut [Option<NonNull<KernelObjectHeader>>],
+    head: &mut usize,
+    obj: NonNull<KernelObjectHeader>,
+)
+{
+    if *head < worklist.len()
+    {
+        worklist[*head] = Some(obj);
+        *head += 1;
+    }
+}
+
+/// Free the SEED-backed body of an object of concrete type `T`: drop it in
+/// place, return its bytes to its ancestor Memory object, and release the
+/// ancestor reference, pushing the ancestor onto `worklist` if that was the
+/// last.
+///
+/// # Safety
+/// `ptr` is an exclusively owned, retype-backed `T` (header at offset 0) that
+/// nothing references; no lock is held.
+#[cfg(not(test))]
+unsafe fn free_body<T>(
+    ptr: NonNull<KernelObjectHeader>,
+    worklist: &mut [Option<NonNull<KernelObjectHeader>>],
+    head: &mut usize,
+)
+{
+    // SAFETY: caller contract.
+    let ancestor_ptr = unsafe { ptr.as_ref().ancestor.load(Ordering::Acquire) };
+    let Some(ancestor) = NonNull::new(ancestor_ptr)
+    else
+    {
+        crate::fatal("free_body: object carries no ancestor");
+    };
+    // cast_ptr_alignment: the ancestor is a MemoryObject (header at offset 0).
+    #[allow(clippy::cast_ptr_alignment)]
+    // SAFETY: the object's reference keeps its ancestor live until the dec_ref.
+    let ancestor_memory = unsafe { &*ancestor.as_ptr().cast::<MemoryObject>() };
+    let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+    let offset = body_phys - ancestor_memory.base;
+    // SAFETY: exclusively owned body of type T (caller contract).
+    unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<T>()) };
+    crate::cap::retype::retype_free(ancestor_memory, offset, core::mem::size_of::<T>() as u64);
+    if ancestor_memory.header.dec_ref() == 0
+    {
+        push_cascade(worklist, head, ancestor);
+    }
+}
+
+/// Release the lineage share of a refcount-0 `Mmio` or `IoPort` object of
+/// concrete type `T`, freeing whatever bodies that leaves unreferenced: a
+/// copy's own body at once, and its root's when the copy was the root's last
+/// live member; a root's body only once it has no live copy
+/// ([`RangeLineage`]).
+///
+/// # Safety
+/// `ptr` is a refcount-0 `T`, exclusively owned, whose mappings or bindings
+/// have been withdrawn; no lock is held.
+#[cfg(not(test))]
+unsafe fn release_range_object<T>(
+    ptr: NonNull<KernelObjectHeader>,
+    worklist: &mut [Option<NonNull<KernelObjectHeader>>],
+    head: &mut usize,
+)
+{
+    // SAFETY: a live Mmio or IoPort object (caller contract).
+    let root = unsafe { lineage_of(ptr) }.root_of(ptr);
+    if root != ptr
+    {
+        // A copy: nothing names its body once its references are gone.
+        // SAFETY: caller contract.
+        unsafe { free_body::<T>(ptr, worklist, head) };
+    }
+    // The root's `live` share of this object: the root's own on a root, the
+    // copy's on a copy. The last share frees the root.
+    // SAFETY: the root body is kept by this object's share until this decrement.
+    if unsafe { lineage_of(root) }
+        .live
+        .fetch_sub(1, Ordering::AcqRel)
+        == 1
+    {
+        // SAFETY: no reference and no live copy names the root any more.
+        unsafe { free_body::<T>(root, worklist, head) };
+    }
+}
+
+/// The object a new capability slot made by `SYS_CAP_COPY`, `SYS_CAP_DERIVE`,
+/// or `SYS_CAP_DERIVE_BADGE` from a slot naming `src` references, with the
+/// reference the new slot holds already taken.
+///
+/// For an `Mmio` or `IoPort` capability this is a fresh SEED-backed object
+/// over the same range, in `src`'s lineage, so mappings and port bindings made
+/// through the new capability are withdrawn when it is deleted or revoked,
+/// whatever other capabilities to the range survive
+/// (docs/capability-model.md § Mmio, § `IoPort`). Every other type shares
+/// `src`, whose reference count is incremented.
+///
+/// The caller releases the returned reference with [`release_ref`] if the
+/// slot is never published.
+///
+/// # Errors
+/// For `Mmio` and `IoPort`: `QuotaExceeded` when the lineage already has
+/// [`RANGE_COPY_LIMIT`] live copies, and `OutOfMemory` when SEED cannot back
+/// the copy.
+///
+/// # Safety
+/// `src` is the live object of a slot tagged `tag`, pinned by the caller.
+// cast_ptr_alignment: each object is constructed in place at a
+// size-class-aligned retype offset; the header sits at offset 0.
+#[allow(clippy::cast_ptr_alignment)]
+#[cfg(not(test))]
+pub unsafe fn object_for_new_slot(
+    tag: crate::cap::slot::CapTag,
+    src: NonNull<KernelObjectHeader>,
+) -> Result<NonNull<KernelObjectHeader>, syscall::SyscallError>
+{
+    use crate::cap::retype::alloc_in_seed;
+    use crate::cap::slot::CapTag;
+
+    match tag
+    {
+        CapTag::Mmio =>
+        {
+            // SAFETY: tag Mmio; src pinned (contract).
+            let mo = unsafe { &*src.as_ptr().cast::<MmioObject>() };
+            let root = mo.lineage.root_of(src);
+            // SAFETY: src is a pinned member of root's lineage, so root's live
+            // count is above zero.
+            let lineage = unsafe { RangeLineage::reserve_copy(root) }?;
+            let mut body = MmioObject::new_root(mo.base, mo.size, mo.flags);
+            body.lineage = lineage;
+            alloc_in_seed(body).inspect_err(|_| {
+                // SAFETY: undoes the reservation above; src's own share keeps
+                // root's count above zero.
+                unsafe { lineage_of(root) }
+                    .live
+                    .fetch_sub(1, Ordering::AcqRel);
+            })
+        }
+        CapTag::IoPort =>
+        {
+            // SAFETY: tag IoPort; src pinned (contract).
+            let po = unsafe { &*src.as_ptr().cast::<IoPortObject>() };
+            let root = po.lineage.root_of(src);
+            // SAFETY: as the Mmio arm.
+            let lineage = unsafe { RangeLineage::reserve_copy(root) }?;
+            let mut body = IoPortObject::new_root(po.base, po.size);
+            body.lineage = lineage;
+            alloc_in_seed(body).inspect_err(|_| {
+                // SAFETY: as the Mmio arm.
+                unsafe { lineage_of(root) }
+                    .live
+                    .fetch_sub(1, Ordering::AcqRel);
+            })
+        }
+        _ =>
+        {
+            // SAFETY: src is pinned, so its count is above zero.
+            unsafe { src.as_ref().inc_ref() };
+            Ok(src)
+        }
+    }
+}
+
 /// Free a kernel object that no capability slot references: its reference
 /// count has reached zero, or it is a fresh body that was never published
 /// (see Safety).
@@ -1936,31 +2381,12 @@ unsafe fn dealloc_object_one(
         }
         ObjectType::Mmio =>
         {
-            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-            debug_assert!(
-                !ancestor_ptr.is_null(),
-                "Mmio: every production cap is retype-backed (Phase-7 SEED, sys_mmio_split SEED)"
-            );
-            use crate::cap::retype::retype_free;
-            // SAFETY: ancestor_ptr is non-null: every production object is
-            // retype-backed (`KernelObjectHeader::ancestor`).
-            let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
-            let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-            let offset = body_phys - ancestor_memory.base;
-            // SAFETY: in-place body; refcount 0 — unique access.
-            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<MmioObject>()) };
-            retype_free(
-                ancestor_memory,
-                offset,
-                core::mem::size_of::<MmioObject>() as u64,
-            );
-            let new_rc = ancestor_memory.header.dec_ref();
-            if new_rc == 0
-            {
-                // SAFETY: ancestor_ptr non-null.
-                let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                push_ancestor(worklist, head, ancestor_nn);
-            }
+            // Withdraw every mapping made through this capability's object
+            // before its bytes go (docs/capability-model.md § Mmio).
+            // SAFETY: refcount 0, exclusively owned; no lock held.
+            unsafe { (*ptr.as_ptr().cast::<MmioObject>()).withdraw_mappings() };
+            // SAFETY: a refcount-0 Mmio object; no lock held.
+            unsafe { release_range_object::<MmioObject>(ptr, worklist, head) };
         }
         ObjectType::Interrupt =>
         {
@@ -2020,31 +2446,13 @@ unsafe fn dealloc_object_one(
         }
         ObjectType::IoPort =>
         {
-            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-            debug_assert!(
-                !ancestor_ptr.is_null(),
-                "IoPort: every production cap is retype-backed (Phase-7 SEED)"
-            );
-            use crate::cap::retype::retype_free;
-            // SAFETY: ancestor_ptr is non-null: every production object is
-            // retype-backed (`KernelObjectHeader::ancestor`).
-            let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
-            let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-            let offset = body_phys - ancestor_memory.base;
-            // SAFETY: in-place body; refcount 0 — unique access.
-            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<IoPortObject>()) };
-            retype_free(
-                ancestor_memory,
-                offset,
-                core::mem::size_of::<IoPortObject>() as u64,
-            );
-            let new_rc = ancestor_memory.header.dec_ref();
-            if new_rc == 0
-            {
-                // SAFETY: ancestor_ptr non-null.
-                let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                push_ancestor(worklist, head, ancestor_nn);
-            }
+            // Withdraw every port binding made through this capability's
+            // object before its bytes go (docs/capability-model.md § IoPort).
+            // SAFETY: no lock held; the pointer is only compared, never
+            // dereferenced, by the withdrawal walk.
+            unsafe { crate::cap::ioport_bindings::withdraw_everywhere(ptr.as_ptr() as usize) };
+            // SAFETY: a refcount-0 IoPort object; no lock held.
+            unsafe { release_range_object::<IoPortObject>(ptr, worklist, head) };
         }
         ObjectType::SchedControl =>
         {
@@ -2584,22 +2992,27 @@ unsafe fn dealloc_object_one(
                 // Invariants, invariant 9.
                 crate::sched::sleep_wakeups_quiesce();
 
-                // Release the per-thread IOPB to SEED if one was bound via
-                // `sys_ioport_bind` (x86-64 only). RISC-V threads never set this
-                // field — there is no I/O port space — so `iopb` is always null
-                // and this is a no-op there.
-                // SAFETY: tcb validated non-null; iopb field always valid.
-                let iopb_ptr = unsafe { (*tcb).iopb };
+                // Release the per-thread port-binding table to SEED if one was
+                // bound via `sys_ioport_bind` (x86-64 only). RISC-V threads never
+                // set this field — there is no I/O port space — so `iopb` is
+                // always null and this is a no-op there. The pointer is taken
+                // under the thread's `sched_lock`: an `IoPort` teardown's
+                // withdrawal walk (`ioport_bindings::withdraw_everywhere`) reads
+                // the table under that lock while this TCB is still registered.
+                // SAFETY: tcb validated non-null; lock_raw/unlock_raw paired.
+                let iopb_ptr = unsafe {
+                    let saved = (*tcb).sched_lock.lock_raw();
+                    let p = (*tcb).iopb;
+                    (*tcb).iopb = core::ptr::null_mut();
+                    (*tcb).sched_lock.unlock_raw(saved);
+                    p
+                };
                 if !iopb_ptr.is_null()
                 {
                     crate::cap::retype::free_seed_scratch(
                         iopb_ptr.cast::<u8>(),
-                        crate::arch::current::IOPB_SIZE as u64,
+                        crate::cap::ioport_bindings::TABLE_BYTES,
                     );
-                    // SAFETY: tcb validated non-null.
-                    unsafe {
-                        (*tcb).iopb = core::ptr::null_mut();
-                    }
                 }
 
                 // The per-thread XSAVE / FP-save area is page N+1 of the
@@ -3556,6 +3969,58 @@ mod tests
         assert_eq!(offset_of!(InterruptObject, header), 0);
         assert_eq!(offset_of!(IoPortObject, header), 0);
         assert_eq!(offset_of!(SchedControlObject, header), 0);
+    }
+
+    #[test]
+    fn a_range_lineage_admits_exactly_the_copy_limit()
+    {
+        let mut root = MmioObject::new_root(0x1000_0000, 0x1000, 0);
+        let root_hdr = NonNull::from(&mut root).cast::<KernelObjectHeader>();
+        for _ in 0..RANGE_COPY_LIMIT
+        {
+            // SAFETY: root is a live lineage root with its own share held.
+            let copy = unsafe { RangeLineage::reserve_copy(root_hdr) }.unwrap();
+            assert_eq!(copy.root_of(NonNull::dangling()), root_hdr);
+        }
+        // SAFETY: as above.
+        let refused = unsafe { RangeLineage::reserve_copy(root_hdr) };
+        assert!(matches!(refused, Err(syscall::SyscallError::QuotaExceeded)));
+        assert_eq!(
+            root.lineage.live.load(Ordering::Relaxed),
+            RANGE_COPY_LIMIT + 1
+        );
+    }
+
+    #[test]
+    fn a_full_mapping_table_refuses_a_new_mapping_but_not_a_repeat()
+    {
+        let mmio = MmioObject::new_root(0x1000_0000, 0x1000, 0);
+        let mut spaces: [core::mem::MaybeUninit<AddressSpaceObject>; MMIO_MAX_MAPPINGS + 1] =
+            [const { core::mem::MaybeUninit::uninit() }; MMIO_MAX_MAPPINGS + 1];
+        let mut asos = [core::ptr::null_mut::<AddressSpaceObject>(); MMIO_MAX_MAPPINGS + 1];
+        for (slot, aso) in spaces.iter_mut().zip(asos.iter_mut())
+        {
+            let p = slot.as_mut_ptr();
+            // SAFETY: only the header is ever touched (record_mapping's inc_ref).
+            unsafe {
+                core::ptr::addr_of_mut!((*p).header)
+                    .write(KernelObjectHeader::new(ObjectType::AddressSpace));
+            }
+            *aso = p;
+        }
+        for &aso in &asos[..MMIO_MAX_MAPPINGS]
+        {
+            // SAFETY: each aso has a live header; mmio is exclusively ours.
+            unsafe { mmio.record_mapping(aso, 0x4000_0000) }.unwrap();
+        }
+        // SAFETY: as above.
+        let full = unsafe { mmio.record_mapping(asos[MMIO_MAX_MAPPINGS], 0x4000_0000) };
+        assert!(matches!(full, Err(syscall::SyscallError::QuotaExceeded)));
+        // SAFETY: as above.
+        unsafe { mmio.record_mapping(asos[0], 0x4000_0000) }.unwrap();
+        // SAFETY: the header was initialised above.
+        let refs = unsafe { (*asos[0]).header.ref_count.load(Ordering::Relaxed) };
+        assert_eq!(refs, 2, "a repeat mapping takes no second reference");
     }
 
     #[test]

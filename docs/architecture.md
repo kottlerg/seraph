@@ -184,23 +184,23 @@ and init looks each module up by name there.
 
 Device drivers run as unprivileged userspace processes. No driver code executes in
 kernel space. Hardware access is granted explicitly via capabilities and is fully
-revocable (for MMIO and x86-64 port I/O, design intent; not yet implemented, #457).
+revocable: deleting or revoking the capability an MMIO mapping or a port binding was made
+through withdraws it.
 
 **MMIO**
 Physical MMIO regions are mapped into a driver’s address space under capability
 control. Once mapped, drivers access registers directly without kernel mediation.
-Revoking an Mmio capability blocks new `SYS_MMIO_MAP` calls through its descendants
-but does not unmap mappings already established through them (unmapping on revocation
-is design intent; not yet implemented, #457; see
-[capability-model.md](capability-model.md#mmio)).
+Revoking an Mmio capability unmaps, with TLB shootdown, every mapping made through its
+descendants before the revoke returns; the revoked capability itself is preserved, so
+mappings made through it remain (see [capability-model.md](capability-model.md#mmio)).
 
 **Port I/O (x86‑64 only)**
 Drivers receive an IoPort capability for assigned port ranges. Binding an IoPort
 capability to a thread enables direct execution of port I/O instructions for those
-ranges. Revoking an IoPort capability is intended to withdraw port access from every
-thread bound through its descendants; the revoked capability itself is preserved, so
-bindings made through it remain (withdrawal on revocation is design intent; not yet
-implemented, #457; see [capability-model.md](capability-model.md#ioport-x86-64-only)).
+ranges. Revoking an IoPort capability withdraws port access from every thread bound
+through its descendants, on every CPU, before the revoke returns; the revoked capability
+itself is preserved, so bindings made through it remain (see
+[capability-model.md](capability-model.md#ioport-x86-64-only)).
 RISC‑V does not support port I/O.
 
 **DMA**

@@ -770,10 +770,13 @@ Derive a new capability from an existing one, with equal or fewer rights.
 
 **Return:** `rax`/`a0`: new capability descriptor on success; `SyscallError` on failure.
 
-The derived capability references the same kernel object. The effective rights are
-`rights_mask & source_rights` — bits requested beyond what the source holds are
-silently masked off rather than rejected, so derivation can only attenuate. The
-derivation is recorded in the global derivation tree for revocation tracking.
+The derived capability references the same kernel object, except that a derived `Mmio` or
+`IoPort` capability references a fresh object over the same range, so the mappings and port
+bindings made through it are withdrawn when it goes (see
+[capability-model.md](../../../docs/capability-model.md) § Mmio and § IoPort (x86-64 only)). The
+effective rights are `rights_mask & source_rights` — bits requested beyond what the source holds
+are silently masked off rather than rejected, so derivation can only attenuate. The derivation is
+recorded in the global derivation tree for revocation tracking.
 
 The source is revalidated under the derivation lock before the new slot is
 linked beneath it (see [capability-internals.md](capability-internals.md)
@@ -784,8 +787,10 @@ leaving the new capability an unlinked derivation root.
 
 **Errors:** `InvalidCapability` (source invalid, null, or freed meanwhile),
 `InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC capability transfer is in flight
-on the source), `OutOfMemory` (slot-page pool exhausted), `QuotaExceeded` (caller's CSpace
-directory structurally full).
+on the source), `OutOfMemory` (slot-page pool exhausted, or, for an `Mmio` or `IoPort` source,
+the kernel's SEED reserve cannot back the fresh object), `QuotaExceeded` (caller's CSpace
+directory structurally full, or, for an `Mmio` or `IoPort` source, its range already has
+`RANGE_COPY_LIMIT` (64) live copies).
 
 If the source capability has a non-zero badge, the derived capability inherits it.
 
@@ -818,13 +823,13 @@ The source capability must have `badge == 0`. Re-badging (setting a new badge
 on an already-badged cap) returns `InvalidArgument`. Derivation via
 `SYS_CAP_DERIVE` inherits the source's badge (see
 [capability-model.md](../../../docs/capability-model.md) § Badges). Source revalidation
-under the derivation lock: as for `SYS_CAP_DERIVE`.
+under the derivation lock, and the fresh object of an `Mmio` or `IoPort` derivation: as for
+`SYS_CAP_DERIVE`.
 
 **Errors:** `InvalidArgument` (badge is zero or source already badged),
 `InvalidCapability` (source invalid, null, or freed meanwhile), `InvalidState` (a
 `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC capability transfer is in flight on the source),
-`OutOfMemory` (slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally
-full).
+`OutOfMemory` and `QuotaExceeded` (as for `SYS_CAP_DERIVE`).
 
 ---
 
@@ -841,11 +846,13 @@ Revoke all capabilities derived from a capability, across all processes.
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 Every descendant in the derivation tree is invalidated; the target capability
-itself is preserved. Mappings established through a revoked Memory or Mmio
-descendant, and IoPort bindings made through a revoked IoPort descendant, are not
-withdrawn (see
-[capability-model.md](../../../docs/capability-model.md) § Revocation; #516,
-#457). Underlying kernel objects are not freed unless a revoked
+itself is preserved. Mappings established through a revoked Mmio descendant are
+unmapped, with TLB shootdown, and IoPort bindings made through a revoked IoPort
+descendant withdrawn, before the call returns, except one a concurrent syscall is
+still making through that descendant, which is withdrawn when that syscall ends;
+mappings established through a revoked Memory descendant are not withdrawn (see
+[capability-model.md](../../../docs/capability-model.md) § Revocation; #516).
+Underlying kernel objects are not freed unless a revoked
 capability was the last reference (see
 [capability-model.md](../../../docs/capability-model.md) § Revocation); such a teardown can fail
 to complete as `SYS_CAP_DELETE` describes for a thread left on a halted CPU. While the
@@ -876,7 +883,10 @@ Delete a single capability from the caller's CSpace. Does not affect derived cap
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-If this is the last reference to the underlying object, the object is freed. Freeing a `CSpace` or
+If this is the last reference to the underlying object, the object is freed. Every `Mmio` and
+`IoPort` capability references an object of its own, so deleting one frees it, which unmaps the
+mappings and withdraws the port bindings made through it (see § `SYS_MMIO_MAP` and
+§ `SYS_IOPORT_BIND`). Freeing a `CSpace` or
 an `AddressSpace` first stops every thread bound to it (each becomes `Exited` with retained exit
 reason `EXIT_KILLED`; its Thread object is freed when its own last capability goes), so a process's
 threads never outlive either object (see [scheduling-internals.md](scheduling-internals.md) § Thread
@@ -1118,12 +1128,21 @@ MMIO mappings are never executable, and mapping writability is derived from the
 `mmio_cap`'s Write right, not from `flags`. The kernel forces the uncacheable
 attribute unconditionally.
 
+The `mmio_cap`'s object records the mapping, holding a reference on the address space, before
+any page is mapped. When the object is freed, because `mmio_cap` (or the copy it is) was deleted
+or revoked through an ancestor, every recorded mapping is unmapped with TLB shootdown, except a
+page the address space has since remapped to other memory (see
+[capability-model.md](../../../docs/capability-model.md) § Mmio). One object records at most
+`MMIO_MAX_MAPPINGS` (4) mappings; mapping it again at the same `virt` of the same address space
+reuses its record.
+
 **Capability requirements:** `aspace_cap` (Map), `mmio_cap` (Map).
 
 **Errors:** `InvalidAddress` (unaligned or non-canonical `virt`, or range leaves the
 user half), `InvalidCapability`, `InsufficientRights` (a cap lacks Map), `InvalidArgument`
-(MMIO region size zero or not page-aligned, or size overflow), `OutOfMemory` (page table
-allocation failure).
+(MMIO region size zero or not page-aligned, or size overflow), `QuotaExceeded` (the object
+already records `MMIO_MAX_MAPPINGS` other mappings), `OutOfMemory` (page table allocation
+failure).
 
 ---
 
@@ -1836,16 +1855,20 @@ Permission Bitmap (IOPB).
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 Multiple bindings may be made to the same thread, each authorising a different port
-range. Revoking `ioport_cap` is intended to remove port access from every thread bound
-through its descendants; the revoked capability itself is preserved, so bindings made
-through it remain (design intent; not yet implemented — `SYS_IOPORT_BIND` records no
-binding and revocation does not withdraw bound IOPB access, #457; see
+range; a thread records at most `MAX_IOPORT_BINDINGS` (16) bindings, and binding the same
+`ioport_cap` object again reuses its record. The thread records each binding against the
+`ioport_cap`'s object. When that object is freed, because `ioport_cap` (or the copy it is) was
+deleted, consumed by a split, or revoked through an ancestor, the binding is withdrawn from the
+thread, whose bitmap is rebuilt from its remaining bindings, and every CPU reloads its TSS IOPB
+before its next port access, a CPU running the thread included (see
 [capability-model.md](../../../docs/capability-model.md) § IoPort (x86-64 only)).
 
 **Capability requirements:** `thread_cap` (Control rights), `ioport_cap` (Use rights).
 
 **Errors:** `NotSupported` (RISC-V — no I/O ports), `InvalidCapability`,
-`InsufficientRights` (a cap lacks Control/Use), `OutOfMemory` (IOPB allocation from SEED).
+`InsufficientRights` (a cap lacks Control/Use), `QuotaExceeded` (the thread already records
+`MAX_IOPORT_BINDINGS` bindings through other objects), `OutOfMemory` (binding-table allocation
+from SEED).
 
 ---
 
@@ -1975,7 +1998,8 @@ derivation tree node (child of the source slot).
 success; `SyscallError` on failure.
 
 The copy is a derivation (child of `src_cap` in the tree). Both the original and
-the copy remain valid. With `dst_slot == 0` the kernel auto-allocates a free
+the copy remain valid. The copy of an `Mmio` or `IoPort` capability references a fresh object, as
+for `SYS_CAP_DERIVE`. With `dst_slot == 0` the kernel auto-allocates a free
 slot (and returns it); with a non-zero `dst_slot` the cap is placed at that
 caller-chosen index — the path init uses to populate well-known slots in new
 service CSpaces before starting their threads. This caller-chosen-slot mode
@@ -2008,8 +2032,10 @@ to it is stopped and the call never returns (see
 
 **Errors:** `InvalidCapability`, `InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC
 capability transfer is in flight on the source), `InsufficientRights` (dst CSpace lacks Insert),
-`InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool exhausted),
-`QuotaExceeded` (dst CSpace directory structurally full).
+`InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool exhausted,
+or SEED cannot back an `Mmio` or `IoPort` copy's object), `QuotaExceeded` (dst CSpace directory
+structurally full, or an `Mmio` or `IoPort` source's range already has `RANGE_COPY_LIMIT` (64) live
+copies).
 
 ---
 

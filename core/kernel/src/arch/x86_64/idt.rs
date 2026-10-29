@@ -554,6 +554,16 @@ extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64
     // paranoid_exception_trampoline on this stack.
     let f = unsafe { &*tf };
     let from_user = (f.cs & 3) != 0;
+    // A ring-3 #GP after an IoPort withdrawal invalidated this CPU's I/O
+    // permission bitmap: reload the running thread's current bitmap and retry
+    // the instruction (`gdt::invalidate_all_iopbs`). A port the thread is still
+    // granted then succeeds; one it lost faults again and is handled below.
+    // SAFETY: #GP from ring 3, on the thread's kernel stack with interrupts
+    // disabled and no lock held.
+    if from_user && vector == 13 && unsafe { super::gdt::reload_invalidated_iopb() }
+    {
+        return;
+    }
     // #DF and #MC run on the IST1 stack and are terminal; every other vector's
     // frame from user mode is on the thread's kernel stack.
     if from_user && vector != 8 && vector != 18

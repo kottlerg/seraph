@@ -32,6 +32,8 @@
 //! - `retype_reclaim.rs`         — auto-reclaim invariant for every retypable kernel object
 //! - `mem_map_retyped_refused.rs` — `mem_map` refuses a Memory cap's retyped pages and maps
 //!   the page past its retype cursor
+//! - `mmio_revoke_unmaps.rs` — revoking an `Mmio` cap unmaps, with shootdown, a mapping made
+//!   through its descendant while a reader on another CPU uses it
 //! - `cspace_nested_teardown.rs` — deleting the root of a 256-deep chain of nested `CSpace`s
 //!   reclaims every one without exhausting the kernel stack
 //! - `retype_subpage_clobber.rs` — a clobbered sub-page free-list link is rejected, not dereferenced
@@ -87,6 +89,7 @@ pub mod ipc_call_interrupted_stop_start;
 pub mod irq_preserves_user_regs;
 pub mod mem_map_retyped_refused;
 pub mod memory_lifecycle;
+pub mod mmio_revoke_unmaps;
 pub mod multi_caller_ipc_fifo;
 pub mod park_interrupted_stop_start;
 pub mod priority_preemption;
@@ -171,6 +174,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::mem_map_retyped_refused",
         mem_map_retyped_refused::run(ctx)
+    );
+    run_integration_test!(
+        "integration::mmio_revoke_unmaps",
+        mmio_revoke_unmaps::run(ctx)
     );
     run_integration_test!(
         "integration::retype_subpage_clobber",

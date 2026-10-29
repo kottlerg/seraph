@@ -37,7 +37,9 @@ point, while a question you raised is unanswered, all you do stays within the sc
 the recommendation of each question you raise unless the orchestrator says otherwise; a question
 with no clear recommendation is raised, and before ending the turn you commit the part of the
 work that does not depend on the answer, or, when no part is independent of it, the work on its
-most likely option, marked provisional in the report.
+most likely option, marked provisional in the report. Told by the orchestrator to stand down
+(your PR or branch handed to another worker), you edit, commit and push nothing further on that
+branch, whatever your worktree's state: you reply with one line and end your turn.
 
 1. After reading: the items you will fix, the items you will not with a one-line reason each,
    the mechanism for anything non-trivial, the tests per item, and every scope expansion.
@@ -87,6 +89,16 @@ most likely option, marked provisional in the report.
   their inflections) appears only in the PR body, never in a commit body, since a commit's
   keyword cannot be withdrawn without a history rewrite. No attribution trailers
   (docs/conventions.md § Commit Messages).
+- Never force-push (`git push --force`, `--force-with-lease`, `-f`), and never amend, rebase or
+  otherwise rewrite a commit you have pushed, although docs/conventions.md § Operations allows
+  it on a feature branch: another worker or the orchestrator may have built on the remote
+  branch. A pushed subject or body that needs changing is left to the maintainer, who either
+  accepts the departure in the PR body (for a SHOULD rule of § Commit Messages) or has the
+  history rewritten (by the orchestrator; standalone, by you, on the maintainer's own words
+  and only then); say so in your report. Before any push, run `git fetch origin` and
+  `git rev-list --left-right --count origin/<branch>...HEAD`, and push only when it prints `0`
+  and a positive count, or when `origin/<branch>` does not exist yet; a diverged branch is
+  reported, never pushed over.
 - Every item you fix: tick it on its Issue in the Issue's own style with `(fixed by PR #<M>)`
   (`gh issue edit`), copy the ticked items into the PR body's `## Acceptance`, and carry
   `Refs #N`. `Fixes #N` only when no item of that Issue stays open once your last run's

@@ -462,10 +462,11 @@ pub mod memmgr_labels
     /// Reply (success): `data[0]` = `returned_cap_count: u32`;
     /// `data[1+i]` = `page_count_for_cap_i: u32`; `data[1+count+i]` =
     /// `phys_base_for_cap_i: u64`; `caps[0..count]` = Memory capabilities
-    /// (MAP|WRITE rights); [`super::memmgr_grant_layout`] checks the shape.
+    /// carrying every right of their pool frames;
+    /// [`super::memmgr_grant_layout`] checks the shape.
     /// `sum(page_count_for_cap_i) == want_pages` for both contiguous and
-    /// best-effort replies. Each reply cap MUST additionally carry
-    /// `MemRights::RETYPE` so the caller can retype the memory into kernel
+    /// best-effort replies. Each reply cap MUST carry `MemRights::RETYPE`
+    /// among those rights so the caller can retype the memory into kernel
     /// objects via the `SYS_CAP_CREATE_*` syscalls; memmgr derives reply caps
     /// with `RIGHTS_ALL`, which preserves the RETYPE bit stamped at boot by
     /// the kernel.
@@ -480,8 +481,7 @@ pub mod memmgr_labels
     /// * `data[0]` — `count: u32`.
     /// * `data[1+i]` — `phys_base_i: u64`, the physical base of the region to
     ///   release (the grant reply reports it at `data[1 + cap_count + i]`).
-    /// * `caps[..]` — any inner caps the caller still holds; dropped
-    ///   defensively.
+    /// * no caps; memmgr deletes any cap attached to the call.
     ///
     /// memmgr matches each `phys_base` against the caller's own outstanding
     /// grants (badge-scoped), returns the backing run to the free pool, and
@@ -509,9 +509,9 @@ pub mod memmgr_labels
     /// The caller is procmgr's init reap (donated set:
     /// `docs/process-lifecycle.md` "Init reap"; contract:
     /// `services/memmgr/docs/ipc-interface.md` "Label 5:
-    /// `DONATE_MEMORY_CAPS`"). memmgr accepts the label from any badged
-    /// client today and does not check a donated cap's provenance; gating it
-    /// to procmgr is tracked in #459.
+    /// `DONATE_MEMORY_CAPS`"). Procmgr-only: memmgr does not check a donated
+    /// cap's provenance, so it answers a donation over any other badge with
+    /// `memmgr_errors::UNAUTHORIZED` and deletes every transferred cap.
     ///
     /// Wire format:
     /// * `caps[..]` — up to `MSG_CAP_SLOTS_MAX` Memory caps to donate; each
@@ -525,7 +525,7 @@ pub mod memmgr_labels
     /// free-pool slot stays owned and counted but is unreachable for
     /// allocation until a later coalesce frees a slot.
     ///
-    /// Reply: always `memmgr_errors::SUCCESS`, with `data[0]` =
+    /// Reply to procmgr: always `memmgr_errors::SUCCESS`, with `data[0]` =
     /// `accepted_caps`, `data[1]` = `accepted_pages` (total pages across the
     /// accepted caps), and `data[2]` = `pool_total_pages` (memmgr's owned page
     /// count after the donation).

@@ -127,6 +127,8 @@ const CONTROLLER_CPU: u32 = 0;
 const VICTIM_CPU: u32 = 1;
 
 /// Bound, in 1 ms polls, on each of the controller's waits.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const WAIT_POLLS: u32 = 5000;
 
 /// A filler's stack: fillers only loop on one syscall.
@@ -290,7 +292,7 @@ fn spawn_fillers(
 /// of the controller's own meets the full list.
 fn await_full() -> TestResult
 {
-    for _ in 0..WAIT_POLLS
+    for _ in 0..crate::scaled_polls(WAIT_POLLS)
     {
         if FILLED.load(Ordering::Acquire) as usize == FILLERS
         {
@@ -298,7 +300,7 @@ fn await_full() -> TestResult
         }
         let _ = thread_sleep(1);
     }
-    for _ in 0..WAIT_POLLS
+    for _ in 0..crate::scaled_polls(WAIT_POLLS)
     {
         match thread_sleep(1)
         {
@@ -516,7 +518,7 @@ fn storm(child: &spawn::SpawnedChild, fillers: &[u32], cycles: u32) -> TestResul
 /// than sleeps: while the list is full a sleep returns `OutOfMemory` at once.
 fn await_flag(flag: &AtomicU32, err: &'static str) -> TestResult
 {
-    for _ in 0..WAIT_POLLS
+    for _ in 0..crate::scaled_polls(WAIT_POLLS)
     {
         if flag.load(Ordering::Acquire) != 0
         {

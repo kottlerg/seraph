@@ -44,13 +44,12 @@ core/ktest/
     ├── init_info.rs        # The InitInfo capability-descriptor array, for initial-cap lookups
     ├── spawn.rs            # Child-thread spawn helpers, argument blocks, exit probes
     ├── tally.rs            # Failure tallies and receive-guard diagnostics for stress cells
-    ├── ioport.rs           # Per-thread I/O port access (x86-64)
-    ├── acpi_shutdown.rs    # ACPI S5 shutdown (x86-64)
-    ├── sbi_shutdown.rs     # SBI SRST shutdown (RISC-V)
     ├── arch/               # Arch-dispatch surface (see Test structure)
     │   ├── mod.rs          # Selects the active arch module by target_arch
-    │   ├── x86_64/         # x86-64 entry points, constants, and arch-only tests
-    │   └── riscv64/        # RISC-V entry points, constants, and arch-only tests
+    │   ├── x86_64/         # x86-64 entry points, constants, I/O ports, COM1 serial,
+    │   │                   # ACPI S5 shutdown, register probes, and arch-only tests
+    │   └── riscv64/        # RISC-V entry points, constants, MMIO serial, SBI SRST
+    │                       # shutdown, register probes, and arch-only tests
     ├── unit/               # Tier 1: per-syscall isolation tests, one file per surface
     ├── integration/        # Tier 2: cross-subsystem scenarios, one file per scenario
     ├── stress/             # Tier S: stress tests, one file per race or resource invariant
@@ -67,17 +66,21 @@ architecture-only tests, which live under `src/arch/<arch>/` (see below).
 
 `src/arch/` is ktest's arch-dispatch surface: one module per architecture,
 selected by `target_arch` in `src/arch/mod.rs`, each exposing the same
-entry points and constants. Tier 1 reaches the tests behind it through
+entry points, constants, and modules, and no `#[cfg(target_arch)]` appears
+elsewhere in ktest. Tier 1 reaches the tests behind it through
 `crate::arch::run_unit` and Tier 2 through `crate::arch::run_integration`;
 arch-neutral tests take the vector of a not-present user store from
 `crate::arch::PAGE_FAULT_STORE_VECTOR` and that of an illegal-instruction
 fault from `crate::arch::ILLEGAL_INSTRUCTION_VECTOR`, raise the latter through
-`crate::arch::illegal_instruction`, and take the kernel `TrapFrame`'s size and
+`crate::arch::illegal_instruction`, and take the register file's size and
 instruction-pointer offset from `crate::arch::TRAP_FRAME_BYTES` and
-`crate::arch::IP_OFFSET`.
-Per-arch helpers and branches inside arch-neutral tests, and other arch-specific
-items elsewhere in ktest, are still gated in place with `#[cfg(target_arch)]`;
-#460 tracks the move.
+`crate::arch::IP_OFFSET` (the `abi/syscall` `REGS_<ARCH>_SIZE` and
+`REGS_<ARCH>_IP_OFFSET` constants). The register-file probes of the FPU and
+callee-saved-register tests are `crate::arch::fpu` and
+`crate::arch::callee_saved`, the machine-code stubs of `unit::retype`
+`crate::arch::code_stub`, and the harness's UART, I/O port seed, shutdown, and
+cycle counter `crate::arch::serial`, `init_io_ports`, `shutdown`, and
+`cycles_now`.
 
 ### Tier 1 — `src/unit/`
 
@@ -103,7 +106,7 @@ mirroring the kernel's own source layout.
 | `ipc.rs` | `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_BUFFER_SET` |
 | `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION`; `SYS_SCHED_SPLIT`; the `SYS_CAP_CREATE_THREAD` priority arguments |
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
-| `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT` (`SYS_SBI_CALL` is under `src/arch/<arch>/`) |
+| `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT` (`SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT` and `SYS_SBI_CALL` are under `src/arch/<arch>/`) |
 | `sysinfo.rs` | `SYS_SYSTEM_INFO` |
 | `crypto.rs` | Shared `crypto` crate known-answer tests (SHA-512, Ed25519 verify) run on-target (not a syscall surface) |
 | `init_layout.rs` | Kernel init-bootstrap ASLR draws: the `InitInfo` VA, init stack, and PIE image base lie in their windows |
@@ -112,9 +115,13 @@ Adding a new syscall means adding a section in the appropriate file here.
 
 Architecture-only Tier 1 tests live under `src/arch/<arch>/` and run through
 `crate::arch::run_unit`. On x86-64, `src/arch/x86_64/configure_wrapped_stack.rs` checks that
-`thread_configure` refuses a stack top the entry alignment wraps below zero. Each
-architecture's `sbi_call.rs` holds its `SYS_SBI_CALL` test: the call reaches the SBI firmware
-on RISC-V and returns `NotSupported` on x86-64.
+`thread_configure` refuses a stack top the entry alignment wraps below zero, and
+`src/arch/x86_64/user_half_top.rs` that `mem_map` refuses the top user page
+(`0x7FFF_FFFF_F000`) with `InvalidAddress` and maps the page below it. Each architecture's
+`ioport_syscalls.rs` holds its `SYS_IOPORT_BIND` and `SYS_IOPORT_SPLIT` tests (a bind and a split
+of the initial `IoPort` caps on x86-64, `NotSupported` on RISC-V), and its `sbi_call.rs` its
+`SYS_SBI_CALL` test: the call reaches the SBI firmware on RISC-V and returns `NotSupported` on
+x86-64.
 
 ### Tier 2 — `src/integration/`
 
@@ -162,9 +169,13 @@ concurrent notification and queue events.
 Architecture-only Tier 2 scenarios live under `src/arch/<arch>/` and run through
 `crate::arch::run_integration`. On x86-64, `src/arch/x86_64/syscall_rflags_hardening.rs`
 checks that a user-set DF and TF, and a GS base reloaded from the user selector, do not reach
-the kernel across a SYSCALL. On RISC-V, `src/arch/riscv64/sbi_gating.rs` checks that
-`SYS_SBI_CALL` refuses kernel-reserved SBI extensions and sanctioned ones the cap lacks the
-right for.
+the kernel across a SYSCALL, and that a syscall made with AC set completes its user copy and
+returns with AC still set; `src/arch/x86_64/page_fault_present_bit.rs` checks that a fault
+handler's `#PF` message carries `FAULT_ACCESS_PRESENT` for a store to a read-only user page and
+never for a load from the top GiB of the kernel image window (the lower GiB can hold direct-map
+leaves the kernel's spurious-fault walk misreads, #563). On RISC-V,
+`src/arch/riscv64/sbi_gating.rs` checks that `SYS_SBI_CALL` refuses kernel-reserved SBI
+extensions and sanctioned ones the cap lacks the right for.
 
 ### Tier S — `src/stress/`
 
@@ -220,13 +231,16 @@ the report bounds of `integration::cross_cspace_revoke_no_alias`,
 `integration::fault_kills_thread`, `integration::fault_exception_no_handler_kills`,
 `integration::fault_handler_declines_kills`, `integration::aspace_fault_notification_late_bind`,
 `integration::death_notification_late_bind`, `integration::reply_binding_displaced`,
-`integration::syscall_rflags_hardening`, `cap::cspace_self_delete_stops_caller` and
-`retype::aspace_self_delete_stops_caller`; the phase polls, the child's spin bound and the
-cleanup exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and is
-stretched so its `cap_delete` does not race a still-running pinned child); the migration polls
-of `thread::affinity_migrate_running`, the report wait of `thread::affinity_migrate_ready_queued`,
-and the convergence polls of `thread::load_balancer_redistributes_skewed`. Every other bound
-applies as written.
+`integration::syscall_rflags_hardening`, `integration::page_fault_present_bit`,
+`cap::cspace_self_delete_stops_caller` and `retype::aspace_self_delete_stops_caller`; the
+phase polls, the child's spin bound and the cleanup exit wait of `integration::tlb_widen_retry`
+(the cleanup wait only gives up, and is stretched so its `cap_delete` does not race a
+still-running pinned child); the migration polls of `thread::affinity_migrate_running`, the
+report wait of `thread::affinity_migrate_ready_queued`, the convergence polls of
+`thread::load_balancer_redistributes_skewed`; the exit and come-up polls of
+`configure_start_race`, `mutual_stop`, `stop_fault_sender`, `stop_owed_wake`, `stop_repark`,
+`stop_target_vanishes` and `split_delete_race`, the final-delivery polls of `stop_repark`, and the
+controller polls of `sleep_list_full`. Every other bound applies as written.
 
 A controller waits for a child to reach a state by a notification bit the child sends on reaching
 it. For a state inside a blocking call (`ipc_call`, `ipc_recv`, a notification wait) or at an exit,
@@ -234,7 +248,15 @@ the child sends just before the call or the exit, and a cell that needs the call
 rest of that window by an observable effect (the server's receive of the call) or a bounded probe
 (`spawn::is_exited`); elsewhere a wake or call that beats the park is consumed by it. Children run
 below the harness's priority and so run on the harness's CPU only while the harness blocks: these
-waits block, bounded, rather than spin or sleep a fixed time. One state barrier stays a fixed
+waits block, bounded (through `tally::await_report` or `tally::await_all`), rather than spin or
+sleep a fixed time. Three kinds of controller wait block unbounded instead, so a child that never
+reports surfaces as the run's timeout or a kernel watchdog dump: the completion waits of worker
+pools and racing pairs, whose workload may run long (`concurrent_map_unmap`, `concurrent_ipc`,
+`concurrent_notification`, `concurrent_event_producers`, `cap_revoke_under_use`,
+`retype_concurrent`, `load_balance_handoff_steal`, `event_try_recv_post_race`); the per-round
+acknowledgements of `idle_wake_race`, whose untimed `notification_wait` is the path under test;
+and the liveness gates `cap_delete_reply_wake` (its woke wait) and `stop_resume_race` (its done
+wait), where a lost wake is the defect the watchdog reports. One state barrier stays a fixed
 sleep: `priority_dealloc_race` waits 1 ms for each worker it pins in Phase 2 to run on its new
 CPU, because its workers stay pure userspace spinners with no way to report it; workers that report
 their CPU through syscalls wedge the kernel
@@ -390,8 +412,11 @@ ShutdownPolicy::Never` and rebuild and re-compose as above.
 `ShutdownPolicy::Always` shuts down regardless of test outcome.
 `ShutdownPolicy::Pass` shuts down only if all tests passed; otherwise the harness thread
 exits (`thread_exit`) and the system idles. `ShutdownPolicy::Never` exits the harness thread
-after printing results, leaving the system idle with QEMU open. A shutdown attempt that fails
-also falls through to `thread_exit`.
+after printing results, leaving the system idle with QEMU open. A shutdown attempt that cannot
+be issued falls through to `thread_exit`: on x86-64 when the FADT, `PM1a_CNT_BLK`, the DSDT's
+`\_S5_`, or the port bind is missing; on RISC-V when there is no `SbiControl` cap. One issued
+but not completed halts the harness thread in a spin instead (the `PM1a` write on x86-64, the
+SRST call on RISC-V), so no partial output follows it.
 
 On x86-64 shutdown uses ACPI S5 (parsed from FADT/DSDT in userspace).
 On RISC-V shutdown uses SBI SRST via the `SYS_SBI_CALL` syscall.

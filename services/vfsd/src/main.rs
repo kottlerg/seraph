@@ -21,8 +21,6 @@
 //! See `services/vfsd/README.md` for the design and
 //! `services/fs/docs/fs-driver-protocol.md` for the driver-side protocol.
 
-#![allow(clippy::cast_possible_truncation)]
-
 mod driver;
 mod partition;
 mod role_guids;
@@ -350,15 +348,18 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// re-entry via `FS_READ` while loading a driver from the now-mounted
 /// root) does not deadlock.
 ///
-/// Concurrency invariants. `MOUNT` routes into `do_mount` (and
-/// `do_mount` calls itself recursively for the ESP auto-mount), which
+/// Concurrency invariants. `MOUNT` routes into `do_mount`, and a
+/// successful root `MOUNT` then auto-mounts `/esp` and `/data` through
+/// `auto_mount_role`; all of them reach `do_mount_internal`, which
 /// mutates shared runtime state under the `VfsdRuntime` mutexes:
-/// - `rt.boot_module_cap` — Mutex; swapped to zero on the first
-///   successful mount.
+/// - `rt.boot_module_cap` — Mutex; swapped to zero by the first mount
+///   that reaches the driver spawn, whether or not it succeeds.
 /// - `rt.root_backend` — Mutex; the synthetic-root tree's only
-///   mutator. `root_backend.install_mount` rejects on an already-
-///   terminal entry, so two concurrent MOUNTs targeting the same
-///   path serialise on the lock and the loser sees `install` reject.
+///   mutator. `VfsdRootBackend::can_install` and
+///   `VfsdRootBackend::install` reject an already-terminal entry, so
+///   two concurrent MOUNTs targeting the same path serialise on the
+///   lock and the loser sees `can_install` (or, if both pass that
+///   check before either installs, `install`) reject.
 ///
 /// No `do_mount`-touched state is shared without one of these locks.
 fn service_loop(rt: &'static VfsdRuntime) -> !

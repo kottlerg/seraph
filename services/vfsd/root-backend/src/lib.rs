@@ -805,6 +805,42 @@ mod tests
     }
 
     #[test]
+    fn path_of_an_index_past_the_pool_is_none()
+    {
+        let b = VfsdRootBackend::new();
+        assert_eq!(b.path_of(MAX_TREE_NODES as u32, &mut [0u8; 64]), None);
+    }
+
+    #[test]
+    fn stat_of_an_active_node_is_a_directory()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        let stat = b
+            .stat(NodeId::from_raw_truncated(u64::from(a)))
+            .expect("active node resolves");
+        assert_eq!(stat.kind, NodeKind::Dir);
+    }
+
+    #[test]
+    fn stat_of_an_unresolvable_node_is_not_found()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert_eq!(
+            b.stat(NodeId::from_raw_truncated(5)).err(),
+            Some(NsError::NotFound)
+        );
+    }
+
+    #[test]
+    fn local_child_count_past_the_pool_is_zero()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", CAP).is_some());
+        assert_eq!(b.local_child_count(MAX_TREE_NODES as u32), 0);
+    }
+
+    #[test]
     fn path_of_the_root_is_a_single_slash()
     {
         let b = VfsdRootBackend::new();
@@ -822,5 +858,8 @@ mod tests
         assert_eq!(b.fallthrough_of(a), CAP);
         b.set_fallthrough_cap(30, CAP);
         assert_eq!(b.fallthrough_of(30), 0);
+        let past_the_pool = MAX_TREE_NODES as u32;
+        b.set_fallthrough_cap(past_the_pool, CAP);
+        assert_eq!(b.fallthrough_of(past_the_pool), 0);
     }
 }

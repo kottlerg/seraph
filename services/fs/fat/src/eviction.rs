@@ -122,24 +122,22 @@ impl EvictionState
 
 /// Eviction worker entry point. Runs forever.
 ///
-/// Takes ownership of its `Arc` clones so the worker keeps the
-/// `EvictionState` and open-file table alive for as long as it
-/// runs (i.e. for the lifetime of the fs process); main hands
-/// over its clones at spawn.
-#[allow(clippy::needless_pass_by_value)]
+/// The spawning closure owns `Arc` clones of the `EvictionState` and the
+/// open-file table and lends them here; since this never returns, they
+/// stay alive for the lifetime of the fs process.
 pub fn worker_loop(
-    state: Arc<EvictionState>,
-    files: Arc<Mutex<[OpenFile; MAX_OPEN_FILES]>>,
+    state: &EvictionState,
+    files: &Mutex<[OpenFile; MAX_OPEN_FILES]>,
     cache: &'static PageCache,
 ) -> !
 {
     loop
     {
-        let req = pop_blocking(&state);
+        let req = pop_blocking(state);
         // The client's synchronous FS_RELEASE_MEMORY and FS_CLOSE clean an
         // outstanding page up on the main thread, before or during the
         // cooperative round-trip. A page already gone is skipped.
-        let Some(endpoint) = live_release_endpoint(&files, &req)
+        let Some(endpoint) = live_release_endpoint(files, &req)
         else
         {
             continue;
@@ -154,7 +152,7 @@ pub fn worker_loop(
         // the cleanup: revoke the ancestor (invalidates the client's derived
         // child cap), delete it from fs's CSpace, and drop the cache-slot
         // refcount, once.
-        let owned = take_outstanding(&files, &req);
+        let owned = take_outstanding(files, &req);
         if owned
         {
             let _ = syscall::cap_revoke_all(req.ancestor_cap);

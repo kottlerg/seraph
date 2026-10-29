@@ -40,8 +40,9 @@ The cap-as-namespace model is defined by
 The synthetic root is `NodeId::ROOT` (pool index 0) and is always
 active; its `fallthrough_cap` carries the root mount cap captured
 when `MOUNT path="/"` succeeds. `MAX_TREE_NODES` is `32` and
-`MAX_ENTRY_NAME` is `64` bytes; both are file-local constants in
-[`services/vfsd/root-backend/src/lib.rs`](../root-backend/src/lib.rs).
+`MAX_ENTRY_NAME` is `64` bytes; both are public constants of the
+`vfsd-root-backend` crate
+([`services/vfsd/root-backend/src/lib.rs`](../root-backend/src/lib.rs)).
 
 Multi-component mount paths install through the tree by walking
 components, creating synthetic intermediates on demand, and setting

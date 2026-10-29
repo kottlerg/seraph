@@ -69,6 +69,17 @@ pub struct FatNode
 /// `FS_READ_MEMORY` against the node cap.
 pub const NO_OPEN_SLOT: u32 = u32::MAX;
 
+/// Index into [`NodeTable`]'s entries of the non-root `id` (`raw - 1`), or
+/// `None` for the reserved root id 0. An index past the table is left to the
+/// caller's bounds-checked access.
+// cast_possible_truncation: fatfs builds only for 64-bit targets (x86_64,
+// riscv64), where `usize` holds every `u64`.
+#[allow(clippy::cast_possible_truncation)]
+fn entry_index(id: NodeId) -> Option<usize>
+{
+    id.raw().checked_sub(1).map(|i| i as usize)
+}
+
 /// Append-only table of non-root nodes minted by [`FatfsBackend::lookup`].
 ///
 /// `NodeId(0)` is reserved as the fatfs root and never appears here.
@@ -90,17 +101,13 @@ impl NodeTable
     }
 
     /// Look up the [`FatNode`] for a non-root [`NodeId`]. Returns `None`
-    /// for the reserved root id (0) and for ids past the table tail.
-    /// Used by the `service_loop` node-cap dispatch arms in `main.rs`.
+    /// for the reserved root id (0), for ids past the table tail, and for
+    /// entries `invalidate_for_loc` cleared (removed or renamed). Used by
+    /// the `service_loop` node-cap dispatch arms in `main.rs`.
     #[must_use]
     pub fn get(&self, id: NodeId) -> Option<FatNode>
     {
-        let raw = id.raw();
-        if raw == 0
-        {
-            return None;
-        }
-        let idx = (raw - 1) as usize;
+        let idx = entry_index(id)?;
         self.entries.get(idx).copied().flatten()
     }
 
@@ -146,16 +153,15 @@ impl NodeTable
     /// against a node cap allocates an `OpenFile` slot, and on
     /// `FS_CLOSE` to clear it back to [`NO_OPEN_SLOT`].
     ///
-    /// No-op for the reserved root id (0) and for ids past the table
-    /// tail.
+    /// No-op for the reserved root id (0), for ids past the table tail,
+    /// and for entries `invalidate_for_loc` cleared.
     pub fn set_open_slot(&mut self, id: NodeId, slot: u32)
     {
-        let raw = id.raw();
-        if raw == 0
+        let Some(idx) = entry_index(id)
+        else
         {
             return;
-        }
-        let idx = (raw - 1) as usize;
+        };
         if let Some(Some(node)) = self.entries.get_mut(idx)
         {
             node.open_slot = slot;
@@ -187,12 +193,11 @@ impl NodeTable
     /// Used by `FS_WRITE` after extending the file's cluster chain.
     pub fn update_size_and_cluster(&mut self, id: NodeId, new_cluster: u32, new_size: u32)
     {
-        let raw = id.raw();
-        if raw == 0
+        let Some(idx) = entry_index(id)
+        else
         {
             return;
-        }
-        let idx = (raw - 1) as usize;
+        };
         if let Some(Some(node)) = self.entries.get_mut(idx)
         {
             node.cluster = new_cluster;

@@ -172,29 +172,31 @@ syscall on either side. Nothing is allocated on the path.
 `SYS_IPC_REPLY` execution on the server's thread:
 
 ```
-1. Peek caller_tcb = current_tcb.reply_tcb (Acquire load)
-   (the reply capability is this caller binding, a per-thread field outside
-   the CSpace; the peeked caller is read before the step-3 claim and is not
-   pinned, so a concurrent dealloc can free it first, #513)
-2. Unless caller_tcb is BlockedOnFault (a fault reply, whose data words and
-   caps the kernel ignores): read the data words and pre-validate the reply
-   cap slots; when caps are attached, return InvalidCapability if no caller
-   is bound (no swap), then pre-allocate the slots in the caller's CSpace
-   (resolved through the registry); on any of these failures, swap
-   current_tcb.reply_tcb to null and, if it held a caller, wake that caller
-   with the IPC_REPLY_TRANSFER_FAILED label
-3. Claim and clear the binding: CAS current_tcb.reply_tcb from caller_tcb
-   to null; a lost CAS means a concurrent canceller owns the caller's wake;
-   a null binding or a lost CAS → InvalidCapability
-4. Stage the reply in caller_tcb.ipc_msg: label/count for the caller's
+1. Claim the binding before anything reads the caller (endpoint_reply):
+   load current_tcb.reply_tcb (Acquire) and CAS it from the loaded caller
+   to null (the reply capability is this caller binding, a per-thread field
+   outside the CSpace). The won claim keeps caller_tcb live: its
+   wake_in_flight pin, set when its park published the binding, waits for
+   this reply's wake, and the caller's dealloc_object(Thread) waits for
+   that pin. A null binding or a lost CAS (a concurrent canceller owns the
+   caller's wake) means no caller: still read the data words and
+   pre-validate the reply cap slots, return the first error they raise,
+   else InvalidCapability
+2. If caller_tcb is BlockedOnFault (a fault reply, whose data words and
+   caps the kernel ignores): record RESUME/KILL from the label in
+   caller_tcb.fault_outcome, stamp the episode, and go to step 6
+3. Read the data words and pre-validate the reply cap slots; when caps are
+   attached, pre-allocate the slots in the caller's CSpace (resolved
+   through the registry from caller_tcb's cspace_id/epoch); on any of these
+   failures, deposit the IPC_REPLY_TRANSFER_FAILED reply instead, wake the
+   caller (step 6), and return the error to the server
+4. Transfer reply capability slots; if the transfer fails, deposit the
+   IPC_REPLY_TRANSFER_FAILED reply instead, wake the caller (step 6), and
+   return the error to the server
+5. Stage the reply in caller_tcb.ipc_msg (label/count for the caller's
    return registers, data words for the caller to write to its own IPC
-   buffer page when it resumes
-5. If caller_tcb is BlockedOnFault: skip step 6, record RESUME/KILL from
-   the label in caller_tcb.fault_outcome, stamp the episode, and go to step 7
-6. Transfer reply capability slots; stamp REPLY. If the transfer fails after
-   the claim, deposit the IPC_REPLY_TRANSFER_FAILED reply instead, wake the
-   caller (step 7), and return the error to the server
-7. enqueue_and_wake(caller_tcb) on its selected CPU; return to the server
+   buffer page when it resumes, cap results) and stamp REPLY
+6. enqueue_and_wake(caller_tcb) on its selected CPU; return to the server
 ```
 
 ### Park Dispositions and Episodes
@@ -232,9 +234,8 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 | Deposit site | Exclusive claim | Stamp |
 |---|---|---|
 | `sys_ipc_reply` normal arm | `reply_tcb` CAS won in `endpoint_reply` | episode + REPLY (after cap-result writes) |
-| `sys_ipc_reply` cap-transfer refusal arm (`deposit_transfer_failed_reply`) | same CAS | episode + REPLY (the synthetic `IPC_REPLY_TRANSFER_FAILED` message replaces the staged reply wholesale; the server receives the transfer error) |
+| `sys_ipc_reply` payload, cap-validation, pre-allocation, or cap-transfer refusal arm (`deposit_transfer_failed_reply`) | same CAS | episode + REPLY (the synthetic `IPC_REPLY_TRANSFER_FAILED` message, with no reply staged; the server receives the error) |
 | `sys_ipc_reply` fault-RESUME arm | same CAS | episode only (`fault_outcome` carries RESUME/KILL) |
-| `fail_reply_and_wake_caller` (via `deposit_transfer_failed_reply`) | `reply_tcb.swap(null)` non-null | episode + REPLY (synthetic failure reply) |
 | `release_unreplied_caller` (`SYS_IPC_RECV` entry, a caller bound by an earlier unreplied receive) | `reply_tcb.swap(null)` non-null | episode + INTERRUPTED (faulter: episode + KILL) |
 | `cancel_ipc_block` BlockedOnReply / BlockedOnFault arms | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
 | `cancel_ipc_block` BlockedOnSend arm | send-queue unlink of the snapshotted park (`park_seq` equal to the cancel's snapshot) under `ep.lock` (a lost unlink hands the episode to the racing rebind chain, to the endpoint's dealloc drain, or to a concurrent cancel that already claimed it; or the thread's own `dealloc_object(Thread)` unlinked it, unstamped, as it dies) | episode + INTERRUPTED (faulter: episode + KILL) |
@@ -687,13 +688,13 @@ wakes any waiter immediately.
 `SYS_WAIT_SET_REMOVE` acquires both the wait set lock and the source object lock,
 removes the member, clears the back-pointer, and `dec_ref`s the source's
 `KernelObjectHeader` to release the +1 held by membership. The lock pairing
-prevents a concurrent notification from referencing a removed member. The
-handler resolves the caller's source capability without pinning it (see
+prevents a concurrent notification from referencing a removed member. Both handlers
+resolve the source capability through `syscall::pin_slot`, which pins the source for
+the call (see
 [capability-internals.md § Storage: Hybrid Two-Level Radix](capability-internals.md#storage-hybrid-two-level-radix)),
-so a concurrent delete or ancestor revoke can release that capability mid-call.
-This `dec_ref` can then drain the refcount to zero: a debug build asserts, and the
-source is not reclaimed. This is a known defect tracked in
-[#502](https://github.com/kottlerg/seraph/issues/502).
+so a concurrent delete or ancestor revoke of that capability mid-call never makes the
+membership's `dec_ref` the last: the source is freed, if at all, when the handler drops
+its pin after releasing the locks.
 
 When the wait set itself is dropped (last cap released), `wait_set_drop`
 clears every member's back-pointer and `dec_ref`s each source's header; any

@@ -10,7 +10,8 @@
 //! § `SYS_GETRANDOM` (55); why an ambient draw from the shared per-CPU
 //! generators is safe is in `core/kernel/docs/entropy.md` § Scope and threat model.
 
-use crate::arch::current::trap_frame::TrapFrame;
+#[cfg(not(test))]
+use super::UserFrame;
 use syscall::{MAX_GETRANDOM_LEN, SyscallError};
 
 /// `SYS_GETRANDOM` (55): fill `[buf, buf+len)` with CSPRNG bytes.
@@ -30,7 +31,7 @@ use syscall::{MAX_GETRANDOM_LEN, SyscallError};
 // and `tf.arg(1) as usize` is lossless; the length is range-checked against
 // MAX_GETRANDOM_LEN immediately below.
 #[allow(clippy::cast_possible_truncation)]
-pub fn sys_getrandom(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_getrandom(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let buf_ptr = tf.arg(0);
     let len = tf.arg(1) as usize;

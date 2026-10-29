@@ -28,6 +28,10 @@
 // IoPort u32->u16 halves) are lossless or range-checked beside the cast.
 #![allow(clippy::cast_possible_truncation)]
 
+#[cfg(not(test))]
+use super::UserFrame;
+// The host-test stubs keep the arch frame type in their signatures.
+#[cfg(test)]
 use crate::arch::current::trap_frame::TrapFrame;
 use syscall::SyscallError;
 
@@ -44,7 +48,7 @@ use syscall::SyscallError;
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
-pub fn sys_irq_ack(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_irq_ack(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::InterruptObject;
     use crate::cap::slot::IrqRights;
@@ -108,7 +112,7 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
-pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{InterruptObject, NotificationObject};
     use crate::cap::slot::{IrqRights, NtfRights};
@@ -216,7 +220,7 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
-pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{AddressSpaceObject, MmioObject};
     use crate::cap::slot::{AsRights, MmioRights};
@@ -359,7 +363,7 @@ pub fn sys_mmio_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
-pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
 {
     // RISC-V has no I/O port space; the IOPB machinery below is x86-64-only.
     if !crate::arch::current::HAS_IO_PORTS
@@ -521,7 +525,7 @@ pub fn sys_ioport_bind(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // split-point between them.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
-pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_mmio_split(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{KernelObjectHeader, MmioObject, ObjectType, dealloc_object};
     use crate::cap::retype::alloc_in_seed;
@@ -562,7 +566,9 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    let (mmio_phys, mmio_size, mmio_flags, mmio_rights, cspace_id, orig_obj_ptr) = {
+    // `_orig_pin` keeps the original pinned until the split has consumed it,
+    // so the object the split revalidates under the derivation lock is live.
+    let (mmio_phys, mmio_size, mmio_flags, mmio_rights, cspace_id, orig_obj_ptr, _orig_pin) = {
         // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
         let slot = unsafe { super::lookup_cap(caller_cspace, mmio_handle, MmioRights::MAP) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -573,7 +579,15 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let mo = unsafe { &*(obj_ptr.as_ptr().cast::<MmioObject>()) };
         // SAFETY: caller_cspace validated non-null; id() reads discriminator.
         let cspace_id = unsafe { (*caller_cspace).id() };
-        (mo.base, mo.size, mo.flags, slot.rights, cspace_id, obj_ptr)
+        (
+            mo.base,
+            mo.size,
+            mo.flags,
+            slot.rights,
+            cspace_id,
+            obj_ptr,
+            slot,
+        )
     };
 
     // split_offset must be strictly within [1, mmio_size).
@@ -669,7 +683,7 @@ pub fn sys_mmio_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // too_many_lines: mirrors sys_mmio_split exactly; the shape is unavoidable.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
-pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{InterruptObject, KernelObjectHeader, ObjectType, dealloc_object};
     use crate::cap::retype::alloc_in_seed;
@@ -698,7 +712,9 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    let (start, count, rights, cspace_id, orig_obj_ptr) = {
+    // `_orig_pin` keeps the original pinned until the split has consumed it,
+    // so the object the split revalidates under the derivation lock is live.
+    let (start, count, rights, cspace_id, orig_obj_ptr, _orig_pin) = {
         // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
         let slot = unsafe { super::lookup_cap(caller_cspace, irq_handle, IrqRights::NOTIFY) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -709,7 +725,7 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let io = unsafe { &*(obj_ptr.as_ptr().cast::<InterruptObject>()) };
         // SAFETY: caller_cspace validated non-null; id() reads discriminator.
         let cspace_id = unsafe { (*caller_cspace).id() };
-        (io.start, io.count, slot.rights, cspace_id, obj_ptr)
+        (io.start, io.count, slot.rights, cspace_id, obj_ptr, slot)
     };
 
     // ── Validation ────────────────────────────────────────────────────────────
@@ -801,7 +817,7 @@ pub fn sys_irq_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // too_many_lines: mirrors sys_irq_split exactly; the shape is unavoidable.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
-pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
 {
     // RISC-V has no I/O port space; the IoPort cap-split logic below is
     // x86-64-only (no IoPort capability is ever minted on RISC-V).
@@ -847,7 +863,10 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             return Err(SyscallError::InvalidCapability);
         }
 
-        let (base, size_u16, rights, cspace_id, orig_obj_ptr) = {
+        // `_orig_pin` keeps the original pinned until the split has consumed
+        // it, so the object the split revalidates under the derivation lock is
+        // live.
+        let (base, size_u16, rights, cspace_id, orig_obj_ptr, _orig_pin) = {
             // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
             let slot = unsafe { super::lookup_cap(caller_cspace, port_handle, IoPortRights::USE) }?;
             let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
@@ -858,7 +877,7 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             let po = unsafe { &*(obj_ptr.as_ptr().cast::<IoPortObject>()) };
             // SAFETY: caller_cspace validated non-null; id() reads discriminator.
             let cspace_id = unsafe { (*caller_cspace).id() };
-            (po.base, po.size, slot.rights, cspace_id, obj_ptr)
+            (po.base, po.size, slot.rights, cspace_id, obj_ptr, slot)
         };
 
         // ── Validation ───────────────────────────────────────────────────────

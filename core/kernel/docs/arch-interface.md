@@ -615,14 +615,17 @@ faulting CPU from either ring, never a thread kill; see
 [scheduling-internals.md](scheduling-internals.md#ipi_nmi_backtrace_stub--ipi_nmi_backtrace_handler)),
 `#NM` (builds no frame), and the spurious vector 255 (`iretq` only).
 
-Several paths hold the published frame as a `&mut TrapFrame` across a point where the thread is
-descheduled: the syscall dispatcher hands one to each handler for the whole syscall, including while
-the thread is blocked in it, and on riscv64 `trap_dispatch` takes the frame as `&mut` for the whole
-trap (across preemption) and `redirect_user_fault` holds it across the fault block. Meanwhile
-another thread's `SYS_THREAD_READ_REGS` or `SYS_THREAD_WRITE_REGS` on a `Stopped` or fault-blocked
-thread reads or writes that frame, and riscv64's switch-out clears its FS/VS bits. That violates the
-`&mut`'s uniqueness; passing these paths a non-unique frame handle (as x86-64's trap entries already
-take `*mut TrapFrame`) is tracked by [#514](https://github.com/kottlerg/seraph/issues/514).
+**Aliasing model.** While the thread is descheduled inside an entry (blocked in a syscall,
+fault-blocked, or preempted), other paths access its published frame: another thread's
+`SYS_THREAD_READ_REGS` or `SYS_THREAD_WRITE_REGS` on a `Stopped` or fault-blocked thread reads or
+writes it (`sched::with_held_frame`), and riscv64's switch-out clears its FS/VS bits. No path of the
+thread itself therefore holds a reference to the frame across a point where it can be
+descheduled: every trap entry takes the frame as `*mut TrapFrame` (x86-64's trap entries; riscv64's
+`trap_dispatch` and `redirect_user_fault`), and the syscall dispatcher hands each handler a
+`syscall::UserFrame`, a copyable raw-pointer wrapper whose accessors (`arg`, the `set_*_return`
+writers) each derive a reference for that one access. A reference to the frame is formed only for
+an access or a call that cannot block, and the foreign accesses happen only while the thread is
+off-CPU, so no two accesses overlap.
 
 ```rust
 pub struct TrapFrame { /* arch-specific layout */ }

@@ -10,7 +10,8 @@
 //! 2. Add a match arm in `sys_system_info` below.
 //! 3. Add a userspace wrapper in `shared/syscall/src/lib.rs` if needed.
 
-use crate::arch::current::trap_frame::TrapFrame;
+#[cfg(not(test))]
+use super::UserFrame;
 use syscall::SyscallError;
 
 /// `SYS_SYSTEM_INFO` (43): query kernel/system information.
@@ -20,7 +21,7 @@ use syscall::SyscallError;
 /// Returns the queried value as a scalar `u64`. No buffer is required.
 /// Returns `InvalidArgument` for unknown discriminants.
 #[cfg(not(test))]
-pub fn sys_system_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
 {
     // Match on the raw discriminant rather than converting to the enum —
     // keeps the handler independent of any TryFrom impl.
@@ -81,7 +82,7 @@ pub fn sys_system_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // cast_possible_truncation: capability handles are u32 by ABI contract; the
 // truncation discards any upper 32 bits a caller sets.
 #[allow(clippy::cast_possible_truncation)]
-pub fn sys_aspace_query(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_aspace_query(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::AddressSpaceObject;
     use crate::cap::slot::AsRights;

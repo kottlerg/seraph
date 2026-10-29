@@ -883,19 +883,25 @@ threads never outlive either object (see [scheduling-internals.md](scheduling-in
 Registry). **The stop includes the caller**: a thread deleting the last capability to its own
 `CSpace` or `AddressSpace` — directly, or because the deleted object's teardown cascades into it —
 is stopped by that delete and the call does not return; the object is reclaimed once the thread is
-off its CPU. A teardown of a Thread left `current` on a CPU that `fatal` halted never completes
-(see
-[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
-§ `dealloc_object(Thread)` Drain Protocol, invariant 3), nor does one of a `CSpace` or
-`AddressSpace` with such a thread bound (see [scheduling-internals.md](scheduling-internals.md) §
-Thread Registry): the call does not return, or, when the deleter is itself stopped and the
-teardown is deferred, the deferred drain on its CPU never completes. This path has known kernel
-memory-safety gaps, tracked in [#501](https://github.com/kottlerg/seraph/issues/501) and
-[#502](https://github.com/kottlerg/seraph/issues/502) (see
+off its CPU. When another thread's syscall holds a pin on the object at the delete (see below), the
+delete is not the last release: it returns 0, and the stop and the free happen when that syscall
+drops its pin, through the deferred reclaim of the dropping thread's CPU. A teardown of a Thread
+left `current` on a CPU that `fatal` halted never completes (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol) §
+`dealloc_object(Thread)` Drain Protocol, invariant 3), nor does one of a `CSpace` or `AddressSpace`
+with such a thread bound (see [scheduling-internals.md](scheduling-internals.md) § Thread Registry):
+the call does not return, or, when the deleter is itself stopped and the teardown is deferred, the
+deferred drain on its CPU never completes. An object another thread's syscall is still using is not
+freed under it: the syscall holds a pin on it until it drops it (see
 [capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage: Hybrid
-Two-Level Radix and
-[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
-§ `dealloc_object(Thread)` Drain Protocol, step 11). The caller's own `Thread` object is treated
+Two-Level Radix), and a stopped thread's teardown reaches the IPC source it was parked on only
+through a binding that proves the source live (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol) §
+`dealloc_object(Thread)` Drain Protocol, step 11), except where a waker that holds no reference on
+the source has claimed the thread: device IRQ delivery
+([#561](https://github.com/kottlerg/seraph/issues/561)), fault delivery
+([#538](https://github.com/kottlerg/seraph/issues/538)), and the death post
+([#539](https://github.com/kottlerg/seraph/issues/539)). The caller's own `Thread` object is treated
 differently, as below.
 
 Refused for two cases, both returning `InvalidState` with the capability left in
@@ -1243,7 +1249,10 @@ commit again.
 
 ### `SYS_THREAD_STOP` (20)
 
-Stop a running or runnable thread. The thread transitions to `Stopped` state.
+Stop a running or runnable thread. The thread transitions to `Stopped` state. A stop that
+lands while the target is inside its own exit (`SYS_THREAD_EXIT`, `SYS_PROCESS_EXIT`, or a
+terminal fault) still returns 0, but the exit then commits `Exited` over the `Stopped` mark, so
+the target never runs again and a later `SYS_THREAD_START` returns `InvalidArgument`.
 
 **Arguments:**
 
@@ -1267,12 +1276,12 @@ or `OutOfMemory` (invariant 4 of
 [thread-lifecycle-and-sleep.md § Sleep List Invariants](thread-lifecycle-and-sleep.md#sleep-list-invariants)).
 A target that blocks while the stop is in progress is cancelled the same way, never left registered
 as a waiter (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § `sys_thread_stop`
-Cross-CPU Stop Protocol). This does not hold for a stop of a thread waiting on an endpoint (queued
-to send or receive), a notification, an event queue, or a wait set whose last capability is deleted
-concurrently: the cancel can lock the object after it is freed
-([#501](https://github.com/kottlerg/seraph/issues/501)). A
-thread running on another CPU is marked `Stopped` under every CPU's scheduler lock, and the call
-returns once that CPU has descheduled it and published its register save, at its next slice expiry
+Cross-CPU Stop Protocol). A target waiting on an endpoint (queued to send or receive), a
+notification, an event queue, or a wait set whose last capability is deleted concurrently is
+claimed either by the stop or by the object's teardown, and both stamp the same cancellation: on
+restart its syscall returns `Interrupted`, or a queued fault sender is killed. A thread running on
+another CPU is marked `Stopped` under every CPU's scheduler lock, and the call returns once that
+CPU has descheduled it and published its register save, at its next slice expiry
 or the thread's own park or yield, or once an object teardown has committed `Exited` over it; the
 inter-processor interrupt sent to that CPU only forces a trap. A thread left `current` on a CPU that
 `fatal` halted is never descheduled: a stop of it does not return through the drain until a
@@ -1467,10 +1476,10 @@ If `cpu_id` names an offline CPU, the call fails with `InvalidArgument`.
 
 The call writes `cpu_affinity`, reads the target's `preferred_cpu` and `state`, and performs the
 migration under the target's `sched_lock`, so the decision cannot race another CPU's scheduler
-path. The target Thread is not pinned for the call
+path. The target Thread is pinned for the call
 ([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage:
-Hybrid Two-Level Radix); the outcomes above hold only absent a concurrent free of the target
-(defect tracked in [#502](https://github.com/kottlerg/seraph/issues/502)).
+Hybrid Two-Level Radix), so a concurrent delete of its last capability frees it only after the call
+returns.
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
@@ -1589,10 +1598,10 @@ handler bound the fault is terminal. See
 
 Binding takes a reference on the endpoint object for the binding's lifetime; rebinding, unbinding,
 or thread destruction releases it (see [fault-handling.md](../../../docs/fault-handling.md) §
-Liveness). These reference and release statements hold only absent a race: the target Thread and
-the endpoint are not pinned for the call
+Liveness). The target Thread and the endpoint are pinned for the call
 ([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage:
-Hybrid Two-Level Radix, [#502](https://github.com/kottlerg/seraph/issues/502)). Binding requires
+Hybrid Two-Level Radix), so a concurrent delete of either one's last capability frees it only
+after the binding is published. Binding requires
 only a valid `Endpoint` cap — `Control` on the thread is the authority; the endpoint cap merely
 names where the thread's faults are delivered. The kernel synthesizes fault delivery via the
 binding and distributes no send capability to the endpoint, so a handler that hands out no `SEND`

@@ -18,7 +18,7 @@
 //! `transfer_caps` for the protocol and the degradation semantics).
 
 #[cfg(not(test))]
-use crate::arch::current::trap_frame::TrapFrame;
+use super::UserFrame;
 #[cfg(not(test))]
 use syscall::SyscallError;
 
@@ -504,7 +504,7 @@ unsafe fn consume_call_disposition(
 /// in the return registers and IPC buffer. Reply-direction cap handles are
 /// written to the IPC buffer at word `MSG_DATA_WORDS_MAX` by the replier.
 #[cfg(not(test))]
-pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
 {
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
@@ -584,11 +584,9 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller.
     unsafe { open_call_episode(tcb) };
 
-    // SAFETY: ep_state was a live Endpoint at lookup, but `lookup_cap` takes
-    // no reference, so the endpoint is not pinned across endpoint_call
-    // (core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
-    // Radix, #502); tcb is the running thread (current_tcb above); no
-    // scheduler lock and no ep.lock held.
+    // SAFETY: ep_state is the state of the Endpoint `slot` pins until the
+    // drop below; tcb is the running thread (current_tcb above); no scheduler
+    // lock and no ep.lock held.
     let result = unsafe {
         crate::ipc::endpoint::endpoint_call(
             ep_state,
@@ -622,6 +620,11 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     }
     // else: No server; caller is blocked on send queue. Yield to another thread.
+
+    // Release the endpoint pin before parking (the pin-before-park rule of
+    // `PinnedCap`): the park's binding now keeps this thread reachable, and
+    // the endpoint's dealloc drain claims it if this was the last reference.
+    drop(slot);
 
     // Yield CPU — the current thread is now Blocked.
     // SAFETY: scheduler initialized; called from syscall context.
@@ -722,7 +725,7 @@ fn log_recv_preallocate_failure(
 /// If the message carried capabilities, their delivered handles in the server's
 /// `CSpace` are written to the IPC buffer at word `MSG_DATA_WORDS_MAX`.
 #[cfg(not(test))]
-pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
 {
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
@@ -774,11 +777,10 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 
-    // SAFETY: ep_state was a live Endpoint at lookup, but `lookup_cap` takes
-    // no reference, so the endpoint is not pinned across endpoint_recv
-    // (core/kernel/docs/capability-internals.md § Storage: Hybrid Two-Level
-    // Radix, #502); tcb is the running thread (current_tcb above); no
-    // scheduler lock and no ep.lock held.
+    // SAFETY: ep_state is the state of the Endpoint `slot` pins until the
+    // drop before the park below (or the return of the immediate delivery);
+    // tcb is the running thread (current_tcb above); no scheduler lock and no
+    // ep.lock held.
     let result = unsafe { crate::ipc::endpoint::endpoint_recv(ep_state, tcb) };
 
     if let Ok((caller, msg)) = result
@@ -836,6 +838,11 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
     // else: No caller; server is now Blocked on recv queue. Yield.
 
+    // Release the endpoint pin before parking (the pin-before-park rule of
+    // `PinnedCap`); the endpoint's dealloc drain claims this receiver from its
+    // recv queue if this was the last reference.
+    drop(slot);
+
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
         crate::sched::schedule(crate::sched::Requeue::IfRunnable);
@@ -887,38 +894,6 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
-/// On any pre-`endpoint_reply` error in `sys_ipc_reply`, deliver a synthetic
-/// failure reply to the parked caller so it un-parks rather than waiting for
-/// a reply that will never come. Returns the error to bubble back to the
-/// server.
-///
-/// # Safety
-/// `server_tcb` must be a valid TCB pointer; its `reply_tcb` is read and
-/// cleared atomically. If `reply_tcb` is null (caller already cancelled), no
-/// caller-wake is performed.
-#[cfg(not(test))]
-unsafe fn fail_reply_and_wake_caller(
-    server_tcb: *mut crate::sched::thread::ThreadControlBlock,
-    err: SyscallError,
-) -> SyscallError
-{
-    // SAFETY: server_tcb validated by caller; reply_tcb is AtomicPtr.
-    let caller = unsafe {
-        (*server_tcb)
-            .reply_tcb
-            .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel)
-    };
-    if caller.is_null()
-    {
-        return err;
-    }
-    // The reply_tcb swap above (non-null observed) is the episode claim: the
-    // synthetic failure reply is a real REPLY deposit the resume must consume.
-    // SAFETY: caller is a valid parked TCB (episode claimed by the swap).
-    unsafe { deposit_transfer_failed_reply(caller) };
-    err
-}
-
 /// Deposit a synthetic `IPC_REPLY_TRANSFER_FAILED` reply into a parked
 /// caller and wake it. The caller resumes from its `ipc_call` with the
 /// sentinel label, zero data, and zero caps.
@@ -964,12 +939,20 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
 /// `IPC_REPLY_TRANSFER_FAILED` label and returns the error to the server. No
 /// GRANT right check: the server is trusted by virtue of holding RECEIVE on the
 /// endpoint.
-// too_many_lines: a single logical operation (validate + cap pre-alloc + reply
-// dispatch, with a fault-reply fast path); splitting would obscure the
-// all-or-nothing reply atomicity.
+///
+/// The reply binding is claimed before anything reads the caller: the won
+/// claim is what keeps the caller's TCB live (its `wake_in_flight` pin waits
+/// for this reply's wake), so every payload, capability, or destination
+/// failure after it consumes the binding and wakes the caller with the
+/// failure sentinel. With no caller bound, the payload and capability checks
+/// still run, so their errors keep precedence over `InvalidCapability`
+/// (core/kernel/docs/syscalls.md § `SYS_IPC_REPLY`).
+// too_many_lines: a single logical operation (claim + payload + cap pre-alloc
+// + reply dispatch, with a fault-reply fast path); splitting would obscure
+// the all-or-nothing reply atomicity.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
-pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let label = tf.arg(0);
     // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
@@ -987,232 +970,221 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidCapability);
     }
-
-    // Peek whether the pending caller is fault-blocked. A fault reply's data
-    // words and caps are ignored by the kernel — the reply label alone carries
-    // the disposition (RESUME/KILL) — so they MUST NOT be validated here. The
-    // normal path below diverts a payload/cap error to a synthetic
-    // `IPC_REPLY_TRANSFER_FAILED` wake via `fail_reply_and_wake_caller`, which
-    // records no `fault_outcome`; for a faulter that wake would be read as
-    // `Pending` and silently kill it. Skipping payload/cap processing for a
-    // fault reply also avoids needlessly growing the faulter's CSpace. The
-    // BlockedOnFault re-check in the `Some(caller)` arm below is the
-    // authoritative dispatch; this peek only gates the skip.
-    // SAFETY: tcb validated above; reply_tcb field always valid in TCB. The
-    // `(*c).ipc_state` read precedes any reply_tcb claim, so nothing pins the
-    // caller: a concurrent dealloc of it can win the reply_tcb CAS, clear
-    // `wake_in_flight`, and free the TCB between the load and this read — a
-    // known use-after-free window (#513).
-    let fault_reply = unsafe {
-        let c = (*tcb).reply_tcb.load(core::sync::atomic::Ordering::Acquire);
-        !c.is_null() && (*c).ipc_state == crate::sched::thread::IpcThreadState::BlockedOnFault
+    let caps = ReplyCaps {
+        count: cap_count,
+        packed_lo: cap_packed_lo,
+        packed_hi: cap_packed_hi,
     };
 
+    // Claim the binding first. `endpoint_reply` CASes `reply_tcb` from the
+    // bound caller to null; a canceller or a dealloc of either thread that
+    // loses to it leaves the caller to this reply, and the caller's
+    // `dealloc_object(Thread)` waits on its `wake_in_flight` pin, which only
+    // this reply's wake (or failure deposit) clears. Every read of the caller
+    // below therefore follows the claim.
+    // SAFETY: tcb is the calling thread's valid TCB; no scheduler or endpoint
+    // lock is held.
+    let Some(caller) = (unsafe { crate::ipc::endpoint::endpoint_reply(tcb) })
+    else
+    {
+        // No caller is bound (none pending, or a canceller already claimed
+        // it). A payload or cap check that fails still reports its own error
+        // (the documented precedence); otherwise the missing reply capability.
+        let mut scratch = Message::new(label);
+        // SAFETY: tcb is the calling thread's valid TCB.
+        unsafe { stage_reply_payload(tcb, data_count, &caps, &mut scratch) }?;
+        return Err(SyscallError::InvalidCapability);
+    };
+
+    // Fault reply: the caller is a thread the kernel parked BlockedOnFault by
+    // fault redirection, not a SYS_IPC_CALL caller. Its data words and caps
+    // are ignored — the reply label alone carries the disposition (RESUME
+    // default, KILL declines) — so they are neither validated nor moved, and
+    // the faulter's CSpace is not grown. Record the outcome for the fault
+    // helper and wake the faulter, which resumes by re-executing its faulting
+    // instruction (or continuing from a handler-modified PC) rather than
+    // returning a syscall value. We won the reply_tcb CAS, so no canceller
+    // will also wake this faulter — recording the outcome here is race-free.
+    // SAFETY: caller is pinned by the won claim (see above); its ipc_state is
+    // stable until enqueue_and_wake clears it.
+    if unsafe { (*caller).ipc_state } == crate::sched::thread::IpcThreadState::BlockedOnFault
+    {
+        let outcome = if label == syscall::FAULT_REPLY_KILL
+        {
+            crate::ipc::fault::FAULT_OUTCOME_KILL
+        }
+        else
+        {
+            crate::ipc::fault::FAULT_OUTCOME_RESUME
+        };
+        // SAFETY: caller pinned by the claim; transitions to Ready under
+        // sched.lock in enqueue_and_wake. Episode stamp: claim = the
+        // reply_tcb CAS won inside endpoint_reply.
+        unsafe {
+            (*caller)
+                .fault_outcome
+                .store(outcome, core::sync::atomic::Ordering::Release);
+            crate::sched::thread::stamp_deposit_episode(caller);
+            debug_assert!((*caller).magic == crate::sched::thread::TCB_MAGIC);
+            let target_cpu = crate::sched::select_target_cpu(caller);
+            debug_assert!(target_cpu < crate::sched::MAX_CPUS);
+            crate::sched::enqueue_and_wake(caller, target_cpu);
+        }
+        return Ok(0);
+    }
+
+    // A SYS_IPC_CALL caller: read the data words and pre-validate the reply
+    // cap slots, then pre-allocate the caller's destination slots. Every
+    // failure here is post-claim, so the caller MUST be woken: a bare error
+    // return would strand it BlockedOnReply with an unclosed park episode.
+    // The synthetic transfer-failed reply goes to the caller and the error to
+    // the server.
     let mut msg = Message::new(label);
-    if !fault_reply
-    {
-        msg.data_count = data_count;
-        if data_count > 0
+    // SAFETY: tcb is the calling thread's valid TCB.
+    let staged = unsafe { stage_reply_payload(tcb, data_count, &caps, &mut msg) }.and_then(|()| {
+        if cap_count == 0
         {
-            // SAFETY: tcb validated above; ipc_buffer is user-mapped or 0.
-            let buf = unsafe { (*tcb).ipc_buffer };
-            // SAFETY: buf validated by read_ipc_buf.
-            if let Err(e) = unsafe { read_ipc_buf(buf, data_count, &mut msg.data) }
-            {
-                // SAFETY: tcb validated above.
-                return Err(unsafe { fail_reply_and_wake_caller(tcb, e) });
-            }
+            return Ok(());
         }
-
-        // Populate cap_slots (the server's full cap handles). Pre-validate before reply.
-        if cap_count > 0
-        {
-            // SAFETY: tcb validated above.
-            let server_cspace = unsafe { (*tcb).cspace };
-            let handles = syscall::unpack_cap_handles(cap_packed_lo, cap_packed_hi, cap_count);
-            // SAFETY: server_cspace extracted from validated TCB.
-            let server_cs = unsafe { &*server_cspace };
-            if let Err(e) = prevalidate_transfer_slots(server_cs, &handles[..cap_count])
+        // Pre-allocating here keeps OOM out of the transfer below;
+        // `transfer_caps` pre-allocates again under the locks it moves
+        // under, so a slot consumed meanwhile is still caught. The caller's
+        // CSpace is resolved through the registry
+        // (core/kernel/docs/capability-internals.md § Move).
+        // SAFETY: caller is pinned by the won claim, so its `cspace_id` and
+        // `cspace_epoch` are read from a live TCB; the CSpace pointer is
+        // registry-resolved under the derivation lock; lock_raw/unlock_raw
+        // paired.
+        unsafe {
+            crate::cap::DERIVATION_LOCK.write_lock();
+            let r = match crate::cap::lookup_cspace((*caller).cspace_id, (*caller).cspace_epoch)
             {
-                // SAFETY: tcb validated above.
-                return Err(unsafe { fail_reply_and_wake_caller(tcb, e) });
-            }
-            msg.cap_slots = handles;
-            msg.cap_count = cap_count;
-
-            // Pre-allocate the caller's CSpace destination slots before claiming it.
-            // `endpoint_reply` claims and clears `(*server).reply_tcb` by CAS; after
-            // that claim no canceller can reach the caller, so a cap-transfer failure
-            // after it must wake the caller with the synthetic transfer-failed reply
-            // (below). Pre-allocating here keeps OOM out of that post-claim transfer;
-            // `transfer_caps` pre-allocates again under the locks it moves under, so a
-            // slot consumed meanwhile is still caught. The caller's CSpace is resolved
-            // through the registry (core/kernel/docs/capability-internals.md § Move).
-            // SAFETY: tcb validated above; reply_tcb field always valid in TCB.
-            let caller_peek =
-                unsafe { (*tcb).reply_tcb.load(core::sync::atomic::Ordering::Acquire) };
-            if caller_peek.is_null()
-            {
-                // No caller is bound (none pending, or a canceller already claimed it);
-                // nothing to wake.
-                return Err(SyscallError::InvalidCapability);
-            }
-            // SAFETY: caller_peek non-null; magic check flags UAF in debug builds.
-            // caller_peek is read before the reply_tcb claim and is not pinned:
-            // a concurrent dealloc of the caller can win the reply_tcb CAS and
-            // free the TCB between the load and this read (#513).
-            debug_assert!(unsafe { (*caller_peek).magic } == crate::sched::thread::TCB_MAGIC);
-            // SAFETY: caller_peek is not pinned — it is read before the
-            // reply_tcb claim, so a concurrent dealloc can free it before the
-            // `cspace_id`/`cspace_epoch` reads below, a known defect (#513);
-            // the CSpace pointer is registry-resolved under the lock;
-            // lock_raw/unlock_raw paired.
-            let pre_res = unsafe {
-                crate::cap::DERIVATION_LOCK.write_lock();
-                let r = match crate::cap::lookup_cspace(
-                    (*caller_peek).cspace_id,
-                    (*caller_peek).cspace_epoch,
-                )
+                Some(cs) =>
                 {
-                    Some(cs) =>
-                    {
-                        let saved = (*cs).lock.lock_raw();
-                        let r = (*cs).pre_allocate(cap_count);
-                        (*cs).lock.unlock_raw(saved);
-                        r.map_err(SyscallError::from)
-                    }
-                    None => Err(SyscallError::InvalidCapability),
-                };
-                crate::cap::DERIVATION_LOCK.write_unlock();
-                r
+                    let saved = (*cs).lock.lock_raw();
+                    let r = (*cs).pre_allocate(cap_count);
+                    (*cs).lock.unlock_raw(saved);
+                    r.map_err(SyscallError::from)
+                }
+                None => Err(SyscallError::InvalidCapability),
             };
-            if let Err(e) = pre_res
-            {
-                // Caller's CSpace cannot accept reply caps, or is gone. Wake the
-                // caller with a synthetic failure reply so it un-parks and
-                // surfaces the error rather than dead-locking; bubble the
-                // pool/structural-ceiling distinction to the server.
-                // SAFETY: tcb validated above.
-                return Err(unsafe { fail_reply_and_wake_caller(tcb, e) });
-            }
+            crate::cap::DERIVATION_LOCK.write_unlock();
+            r
         }
-    }
-
-    // SAFETY: tcb is the calling thread's valid TCB (current_tcb above); no
-    // scheduler or endpoint lock is held here.
-    let result = unsafe { crate::ipc::endpoint::endpoint_reply(tcb, &msg) };
-
-    match result
+    });
+    if let Err(e) = staged
     {
-        Some(caller) =>
-        {
-            // Fault reply: the caller is a thread the kernel parked
-            // BlockedOnFault by fault redirection, not a SYS_IPC_CALL caller.
-            // The kernel ignores the reply payload and caps; the reply label
-            // conveys the disposition (RESUME default, KILL declines). Record it
-            // for the fault helper and wake the faulter, which resumes by
-            // re-executing its faulting instruction (or continuing from a
-            // handler-modified PC) rather than returning a syscall value. We won
-            // the reply_tcb CAS inside endpoint_reply, so no canceller will also
-            // wake this faulter — recording the outcome here is race-free.
-            // SAFETY: caller returned by endpoint_reply; valid TCB. ipc_state is
-            // still BlockedOnFault until enqueue_and_wake clears it.
-            if unsafe { (*caller).ipc_state }
-                == crate::sched::thread::IpcThreadState::BlockedOnFault
-            {
-                let outcome = if label == syscall::FAULT_REPLY_KILL
-                {
-                    crate::ipc::fault::FAULT_OUTCOME_KILL
-                }
-                else
-                {
-                    crate::ipc::fault::FAULT_OUTCOME_RESUME
-                };
-                // SAFETY: caller valid; transitions to Ready under sched.lock in
-                // enqueue_and_wake. Episode stamp: claim = the reply_tcb CAS
-                // won inside endpoint_reply (race-free per the comment above).
-                unsafe {
-                    (*caller)
-                        .fault_outcome
-                        .store(outcome, core::sync::atomic::Ordering::Release);
-                    crate::sched::thread::stamp_deposit_episode(caller);
-                    debug_assert!((*caller).magic == crate::sched::thread::TCB_MAGIC);
-                    let target_cpu = crate::sched::select_target_cpu(caller);
-                    debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-                    crate::sched::enqueue_and_wake(caller, target_cpu);
-                }
-                return Ok(0);
-            }
-
-            // Transfer caps from server to caller (if any).
-            // Cap result handles are stored in the caller's ipc_msg so that
-            // sys_ipc_call can write them to the caller's IPC buffer when the
-            // caller resumes in its own address space.
-            if cap_count > 0
-            {
-                let mut dst_handles = [0u32; MSG_CAP_SLOTS_MAX];
-                // SAFETY: tcb is the running server; caller returned by
-                // endpoint_reply is a valid TCB parked BlockedOnReply;
-                // endpoint_reply takes no lock, so none is held.
-                let transfer = unsafe {
-                    transfer_caps(tcb, &msg.cap_slots[..cap_count], caller, &mut dst_handles)
-                };
-                let transferred = match transfer
-                {
-                    Ok(n) => n,
-                    Err(e) =>
-                    {
-                        // Post-commit failure: the reply_tcb CAS is already
-                        // won, so the caller MUST be woken — a bare error
-                        // return here would strand it BlockedOnReply with an
-                        // unclosed park episode. Reachable when a source cap
-                        // goes stale or gains an in-flight pin between the
-                        // server's send and this transfer.
-                        // Deposit the synthetic transfer-failed reply for
-                        // the caller and surface the error to the server.
-                        // SAFETY: caller is the parked TCB whose episode the
-                        // endpoint_reply CAS claimed.
-                        unsafe { deposit_transfer_failed_reply(caller) };
-                        return Err(e);
-                    }
-                };
-                // Store cap results in caller's TCB for deferred IPC buffer write.
-                // SAFETY: caller is valid TCB returned by endpoint_reply.
-                unsafe {
-                    (*caller).ipc_msg.cap_slots = dst_handles;
-                    (*caller).ipc_msg.cap_count = transferred;
-                }
-            }
-
-            // Data words are already in caller's ipc_msg (set by endpoint_reply).
-            // sys_ipc_call will write them to the caller's IPC buffer on resume.
-
-            // Deposit complete (data + cap results in ipc_msg): stamp REPLY
-            // and wake. Claim = the reply_tcb CAS won inside endpoint_reply,
-            // so this is the episode's only depositor; the stamp's Release
-            // orders the ipc_msg writes before the resume's reads.
-            // SAFETY: caller returned by endpoint_reply; is valid TCB.
-            unsafe {
-                crate::sched::thread::stamp_park_deposit(
-                    caller,
-                    crate::sched::thread::PARK_DISPOSITION_REPLY,
-                );
-                debug_assert!((*caller).magic == crate::sched::thread::TCB_MAGIC);
-                let target_cpu = crate::sched::select_target_cpu(caller);
-                debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-                crate::sched::enqueue_and_wake(caller, target_cpu);
-            }
-            Ok(0)
-        }
-        None => Err(SyscallError::InvalidCapability),
+        // SAFETY: caller is the parked TCB whose episode the claim won.
+        unsafe { deposit_transfer_failed_reply(caller) };
+        return Err(e);
     }
+
+    // Transfer caps from server to caller (if any). Cap result handles are
+    // stored in the caller's ipc_msg so that sys_ipc_call can write them to
+    // the caller's IPC buffer when the caller resumes in its own address
+    // space.
+    let mut dst_handles = [0u32; MSG_CAP_SLOTS_MAX];
+    let mut transferred = 0;
+    if cap_count > 0
+    {
+        // SAFETY: tcb is the running server; caller is pinned by the claim
+        // and parked BlockedOnReply; no lock is held.
+        let transfer =
+            unsafe { transfer_caps(tcb, &msg.cap_slots[..cap_count], caller, &mut dst_handles) };
+        transferred = match transfer
+        {
+            Ok(n) => n,
+            Err(e) =>
+            {
+                // Post-claim failure: the caller MUST be woken (see above).
+                // Reachable when a source cap goes stale or gains an
+                // in-flight pin between the pre-validation and this transfer.
+                // SAFETY: caller is the parked TCB whose episode the claim
+                // won.
+                unsafe { deposit_transfer_failed_reply(caller) };
+                return Err(e);
+            }
+        };
+    }
+
+    // Stage the reply: label and data words for the caller's return
+    // registers and its own IPC buffer write on resume (sys_ipc_call), cap
+    // results for its cap-handle write.
+    msg.cap_slots = dst_handles;
+    msg.cap_count = transferred;
+    // Deposit complete: stamp REPLY and wake. Claim = the reply_tcb CAS won
+    // inside endpoint_reply, so this is the episode's only depositor; the
+    // stamp's Release orders the ipc_msg write before the resume's reads.
+    // SAFETY: caller is pinned by the claim; ipc_msg is owned by the claim's
+    // winner while the caller is parked.
+    unsafe {
+        (*caller).ipc_msg = msg;
+        crate::sched::thread::stamp_park_deposit(
+            caller,
+            crate::sched::thread::PARK_DISPOSITION_REPLY,
+        );
+        debug_assert!((*caller).magic == crate::sched::thread::TCB_MAGIC);
+        let target_cpu = crate::sched::select_target_cpu(caller);
+        debug_assert!(target_cpu < crate::sched::MAX_CPUS);
+        crate::sched::enqueue_and_wake(caller, target_cpu);
+    }
+    Ok(0)
+}
+
+/// The reply capability arguments of `SYS_IPC_REPLY`: how many caps, and the
+/// two packed handle words.
+#[cfg(not(test))]
+struct ReplyCaps
+{
+    count: usize,
+    packed_lo: u64,
+    packed_hi: u64,
+}
+
+/// Read a reply's data words into `msg` and pre-validate its capability
+/// slots in the server's own `CSpace`, staging the handles in `msg`.
+///
+/// # Errors
+/// `read_ipc_buf`'s errors for the data words, `prevalidate_transfer_slots`'
+/// for the capability slots.
+///
+/// # Safety
+/// `server` must be the calling thread's valid TCB.
+#[cfg(not(test))]
+unsafe fn stage_reply_payload(
+    server: *mut crate::sched::thread::ThreadControlBlock,
+    data_count: usize,
+    caps: &ReplyCaps,
+    msg: &mut Message,
+) -> Result<(), SyscallError>
+{
+    msg.data_count = data_count;
+    if data_count > 0
+    {
+        // SAFETY: server is the running thread; ipc_buffer is written only
+        // by its own SYS_IPC_BUFFER_SET.
+        let buf = unsafe { (*server).ipc_buffer };
+        // SAFETY: buf validated by read_ipc_buf.
+        unsafe { read_ipc_buf(buf, data_count, &mut msg.data) }?;
+    }
+    if caps.count > 0
+    {
+        let handles = syscall::unpack_cap_handles(caps.packed_lo, caps.packed_hi, caps.count);
+        // SAFETY: server is the running thread; its bound CSpace outlives the
+        // syscall.
+        let server_cs = unsafe { &*(*server).cspace };
+        prevalidate_transfer_slots(server_cs, &handles[..caps.count])?;
+        msg.cap_slots = handles;
+        msg.cap_count = caps.count;
+    }
+    Ok(())
 }
 
 /// `SYS_NOTIFICATION_SEND` (3): OR bits into a notification object.
 ///
 /// arg0 = notification cap index, arg1 = bits to send (must be non-zero).
 #[cfg(not(test))]
-pub fn sys_notification_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_notification_send(tf: UserFrame) -> Result<u64, SyscallError>
 {
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
@@ -1291,7 +1263,7 @@ pub fn sys_notification_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// wakes the longest-waiting one (a wait that enters while bits are pending
 /// takes them at once).
 #[cfg(not(test))]
-pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_notification_wait(tf: UserFrame) -> Result<u64, SyscallError>
 {
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
@@ -1345,6 +1317,11 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Ok(0);
     }
 
+    // Release the notification pin before parking (the pin-before-park rule
+    // of `PinnedCap`); the notification's dealloc drain claims this waiter if
+    // this was the last reference.
+    drop(slot);
+
     // Yield CPU.
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
@@ -1388,7 +1365,7 @@ pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Returns `SyscallError::QueueFull` if the queue is at capacity.
 /// Any `u64` payload, 0 included, is valid; there is no zero-payload check.
 #[cfg(not(test))]
-pub fn sys_event_post(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_event_post(tf: UserFrame) -> Result<u64, SyscallError>
 {
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
@@ -1464,7 +1441,7 @@ pub fn sys_event_post(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `Interrupted`. Blocked receivers queue in arrival order and each post wakes
 /// the longest-waiting one (the try-once form never waits).
 #[cfg(not(test))]
-pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_event_recv(tf: UserFrame) -> Result<u64, SyscallError>
 {
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
@@ -1544,6 +1521,11 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // stop/wake_pending refusal rolled the park back — both outcomes resolve
     // through `schedule()` below).
 
+    // Release the event-queue pin before parking (the pin-before-park rule
+    // of `PinnedCap`); the queue's dealloc drain claims this waiter if this
+    // was the last reference.
+    drop(slot);
+
     // Yield CPU.
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
@@ -1602,7 +1584,7 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // registration) that requires dispatching over three source types; splitting it would
 // obscure the all-or-nothing atomicity contract.
 #[allow(clippy::too_many_lines)]
-pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::ipc::wait_set::WaitSetSourceTag;
 
@@ -1612,7 +1594,6 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
     let src_handle = tf.arg(1) as u32;
-    let src_idx = syscall::cap_handle_index(src_handle);
     let badge = tf.arg(2);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
@@ -1639,81 +1620,19 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*ws_obj).state
     };
 
-    // Look up source cap — accept Endpoint, Notification, or EventQueue.
-    // We must accept any of the three tags, so we read the slot directly
-    // instead of calling lookup_cap (which checks a single expected tag).
-    //
-    // The third tuple element is the wrapper's `KernelObjectHeader` pointer
-    // (header sits at offset 0 of each `#[repr(C)]` source wrapper). Wait-set
-    // membership owns a +1 cap-level reference on this header; the inc_ref
-    // call below — and the matching dec_ref in `sys_wait_set_remove`,
-    // `wait_set_drop`, and the source-side dealloc invariant — keep the
+    // Look up source cap — accept Endpoint, Notification, or EventQueue — and
+    // pin it for the registration. Wait-set membership then owns its own +1
+    // reference on the source's header (the inc_ref below, matched by the
+    // dec_ref in `sys_wait_set_remove` and `wait_set_drop`), which keeps the
     // source alive while any member references it.
-    // SAFETY: cspace_ptr validated above.
-    let (source_ptr, source_tag, source_header) = unsafe {
-        let cs = &*cspace_ptr;
-        let src_slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
-        // Reject a stale handle to a recycled slot (#349).
-        if src_slot.generation() != syscall::cap_handle_gen(src_handle)
-        {
-            return Err(SyscallError::InvalidCapability);
-        }
-        match src_slot.tag
-        {
-            CapTag::Endpoint =>
-            {
-                if !src_slot.rights.contains(EpRights::RECEIVE.erase())
-                {
-                    return Err(SyscallError::InsufficientRights);
-                }
-                let obj_ptr = src_slot
-                    .object
-                    .ok_or(SyscallError::InvalidCapability)?
-                    .as_ptr();
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-                #[allow(clippy::cast_ptr_alignment)]
-                let ep_obj = obj_ptr.cast::<crate::cap::object::EndpointObject>();
-                let ep_state = (*ep_obj).state.cast::<u8>();
-                let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
-                (ep_state, WaitSetSourceTag::Endpoint, header)
-            }
-            CapTag::Notification =>
-            {
-                if !src_slot.rights.contains(NtfRights::WAIT.erase())
-                {
-                    return Err(SyscallError::InsufficientRights);
-                }
-                let obj_ptr = src_slot
-                    .object
-                    .ok_or(SyscallError::InvalidCapability)?
-                    .as_ptr();
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-                #[allow(clippy::cast_ptr_alignment)]
-                let sig_obj = obj_ptr.cast::<crate::cap::object::NotificationObject>();
-                let sig_state = (*sig_obj).state.cast::<u8>();
-                let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
-                (sig_state, WaitSetSourceTag::Notification, header)
-            }
-            CapTag::EventQueue =>
-            {
-                if !src_slot.rights.contains(EqRights::RECV.erase())
-                {
-                    return Err(SyscallError::InsufficientRights);
-                }
-                let obj_ptr = src_slot
-                    .object
-                    .ok_or(SyscallError::InvalidCapability)?
-                    .as_ptr();
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-                #[allow(clippy::cast_ptr_alignment)]
-                let eq_obj = obj_ptr.cast::<crate::cap::object::EventQueueObject>();
-                let eq_state = (*eq_obj).state.cast::<u8>();
-                let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
-                (eq_state, WaitSetSourceTag::EventQueue, header)
-            }
-            _ => return Err(SyscallError::InvalidCapability),
-        }
-    };
+    // SAFETY: cspace_ptr is the running thread's bound CSpace; no lock held.
+    let src = unsafe { super::pin_slot(cspace_ptr, src_handle) }?;
+    // SAFETY: src pins the object it names.
+    let (source_ptr, source_tag, source_header, member_right) = unsafe { wait_set_source(&src) }?;
+    if !src.rights.contains(member_right)
+    {
+        return Err(SyscallError::InsufficientRights);
+    }
 
     // Hold source.lock outer for the entire registration sequence:
     // duplicate-registration check, waitset_add (which takes ws.lock
@@ -1824,6 +1743,66 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
+/// Resolve a pinned wait-set source capability (Endpoint, Notification, or
+/// `EventQueue`) to its state pointer, its source tag, its wrapper header
+/// (the header sits at offset 0 of each `#[repr(C)]` source wrapper), and the
+/// right a member registration requires on it (`RECEIVE`, `WAIT`, or `RECV`).
+///
+/// # Errors
+/// `InvalidCapability` for any other capability type.
+///
+/// # Safety
+/// `src` pins the object it names, which is live for the call.
+#[cfg(not(test))]
+unsafe fn wait_set_source(
+    src: &super::PinnedCap,
+) -> Result<
+    (
+        *mut u8,
+        crate::ipc::wait_set::WaitSetSourceTag,
+        *mut crate::cap::object::KernelObjectHeader,
+        crate::cap::slot::Rights,
+    ),
+    SyscallError,
+>
+{
+    use crate::ipc::wait_set::WaitSetSourceTag;
+
+    let obj_ptr = src.object.ok_or(SyscallError::InvalidCapability)?.as_ptr();
+    // SAFETY: src pins the object (contract) and its tag names the wrapper
+    // type, whose `state` field is read.
+    // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
+    #[allow(clippy::cast_ptr_alignment)]
+    let (state, tag, right) = unsafe {
+        match src.tag
+        {
+            CapTag::Endpoint => (
+                (*obj_ptr.cast::<crate::cap::object::EndpointObject>())
+                    .state
+                    .cast::<u8>(),
+                WaitSetSourceTag::Endpoint,
+                EpRights::RECEIVE.erase(),
+            ),
+            CapTag::Notification => (
+                (*obj_ptr.cast::<crate::cap::object::NotificationObject>())
+                    .state
+                    .cast::<u8>(),
+                WaitSetSourceTag::Notification,
+                NtfRights::WAIT.erase(),
+            ),
+            CapTag::EventQueue => (
+                (*obj_ptr.cast::<crate::cap::object::EventQueueObject>())
+                    .state
+                    .cast::<u8>(),
+                WaitSetSourceTag::EventQueue,
+                EqRights::RECV.erase(),
+            ),
+            _ => return Err(SyscallError::InvalidCapability),
+        }
+    };
+    Ok((state, tag, obj_ptr, right))
+}
+
 /// `SYS_WAIT_SET_REMOVE` (27): unregister a source from a wait set.
 ///
 /// arg0 = wait set cap index (must have MODIFY right).
@@ -1836,7 +1815,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // back-pointer clear under the documented lock order) whose source arms share
 // the lock bookkeeping.
 #[allow(clippy::too_many_lines)]
-pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::ipc::wait_set::WaitSetSourceTag;
 
@@ -1846,7 +1825,6 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
     let src_handle = tf.arg(1) as u32;
-    let src_idx = syscall::cap_handle_index(src_handle);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -1872,82 +1850,21 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*ws_obj).state
     };
 
-    // Look up source to get its raw state pointer and wrapper header.
-    // The header is needed for the `-1 dec_ref` that pairs with `sys_wait_set_add`'s
-    // `inc_ref`; it is performed under source.lock together with the back-pointer
-    // clear so a single critical section detaches the member from every wait-set
-    // observation path.
-    // SAFETY: cspace_ptr validated above.
-    let (source_ptr, source_tag, source_header) = unsafe {
-        let cs = &*cspace_ptr;
-        let src_slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
-        // Reject a stale handle to a recycled slot (#349).
-        if src_slot.generation() != syscall::cap_handle_gen(src_handle)
-        {
-            return Err(SyscallError::InvalidCapability);
-        }
-        match src_slot.tag
-        {
-            CapTag::Endpoint =>
-            {
-                let obj_ptr = src_slot
-                    .object
-                    .ok_or(SyscallError::InvalidCapability)?
-                    .as_ptr();
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-                #[allow(clippy::cast_ptr_alignment)]
-                let ep_obj = obj_ptr.cast::<crate::cap::object::EndpointObject>();
-                let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
-                (
-                    (*ep_obj).state.cast::<u8>(),
-                    WaitSetSourceTag::Endpoint,
-                    header,
-                )
-            }
-            CapTag::Notification =>
-            {
-                let obj_ptr = src_slot
-                    .object
-                    .ok_or(SyscallError::InvalidCapability)?
-                    .as_ptr();
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-                #[allow(clippy::cast_ptr_alignment)]
-                let sig_obj = obj_ptr.cast::<crate::cap::object::NotificationObject>();
-                let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
-                (
-                    (*sig_obj).state.cast::<u8>(),
-                    WaitSetSourceTag::Notification,
-                    header,
-                )
-            }
-            CapTag::EventQueue =>
-            {
-                let obj_ptr = src_slot
-                    .object
-                    .ok_or(SyscallError::InvalidCapability)?
-                    .as_ptr();
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-                #[allow(clippy::cast_ptr_alignment)]
-                let eq_obj = obj_ptr.cast::<crate::cap::object::EventQueueObject>();
-                let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
-                (
-                    (*eq_obj).state.cast::<u8>(),
-                    WaitSetSourceTag::EventQueue,
-                    header,
-                )
-            }
-            _ => return Err(SyscallError::InvalidCapability),
-        }
-    };
+    // Look up source to get its raw state pointer and wrapper header, pinned
+    // for the call. The header is needed for the `-1 dec_ref` that pairs with
+    // `sys_wait_set_add`'s `inc_ref`; it is performed under source.lock
+    // together with the back-pointer clear so a single critical section
+    // detaches the member from every wait-set observation path.
+    // SAFETY: cspace_ptr is the running thread's bound CSpace; no lock held.
+    let src = unsafe { super::pin_slot(cspace_ptr, src_handle) }?;
+    // SAFETY: src pins the object it names.
+    let (source_ptr, source_tag, source_header, _) = unsafe { wait_set_source(&src) }?;
 
     // Hold source.lock outer for waitset_remove (ws.lock INNER), the
     // back-pointer clear, and the dec_ref of the wait-set's +1 reference,
-    // mirroring the lock order in sys_wait_set_add. The source cap is
-    // resolved without pinning it, so a concurrent delete or ancestor revoke
-    // can release it mid-call and this dec_ref can then drain the refcount
-    // to zero; the debug_assert catches that, and the source is not
-    // reclaimed (known defect, #502; core/kernel/docs/ipc-internals.md
-    // § Wait Set Add/Remove).
+    // mirroring the lock order in sys_wait_set_add. `src` pins the source
+    // for the call, so the membership's reference is never the last one here:
+    // the source is freed, if at all, when the pin drops after the unlock.
     //
     // SAFETY: source_ptr extracted from validated cap.
     let remove_result = unsafe {
@@ -2035,7 +1952,7 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// waiter: a wait while another thread waits on the set returns `InvalidState`
 /// at once.
 #[cfg(not(test))]
-pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_wait_set_wait(tf: UserFrame) -> Result<u64, SyscallError>
 {
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
@@ -2087,6 +2004,11 @@ pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         Err(crate::ipc::wait_set::WaitSetPending::Parked) =>
         {}
     }
+
+    // Release the wait-set pin before parking (the pin-before-park rule of
+    // `PinnedCap`); the wait set's dealloc drain claims this waiter if this
+    // was the last reference.
+    drop(ws_slot);
 
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {

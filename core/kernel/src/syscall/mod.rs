@@ -88,6 +88,86 @@ unsafe fn stamp_syscall_entry(nr: u64, frame: *mut TrapFrame)
     }
 }
 
+/// The calling thread's user register frame, as a syscall handler reaches it.
+///
+/// The frame lives on the thread's kernel stack and is published as its
+/// `trap_frame`, through which other CPUs read and write it while the thread
+/// is held off-CPU (`SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` on a
+/// `Stopped` or fault-blocked thread, `sched::with_held_frame`) — including
+/// while the thread is blocked inside a syscall. A `&mut TrapFrame` held by
+/// the handler across such a block would be live during those foreign
+/// accesses. A `UserFrame` instead carries the raw frame pointer, and each
+/// accessor derives a reference for that one access, which ends before the
+/// accessor returns; no access spans a block, so the thread's own accesses
+/// and the foreign ones never overlap (core/kernel/docs/arch-interface.md
+/// § `trap_frame`).
+#[derive(Clone, Copy)]
+#[cfg(not(test))]
+pub struct UserFrame(core::ptr::NonNull<TrapFrame>);
+
+#[cfg(not(test))]
+impl UserFrame
+{
+    /// Wrap the frame `dispatch` received.
+    ///
+    /// # Safety
+    /// `frame` must be the running thread's valid frame on its kernel stack,
+    /// valid for the whole syscall, and every access to it from this thread
+    /// must go through the returned value.
+    unsafe fn new(frame: *mut TrapFrame) -> Self
+    {
+        // SAFETY: frame is non-null and valid (contract).
+        Self(unsafe { core::ptr::NonNull::new_unchecked(frame) })
+    }
+
+    /// The syscall number.
+    fn syscall_nr(self) -> u64
+    {
+        // SAFETY: the frame is valid for the syscall (`new`'s contract), and
+        // the shared reference lives only for this read, which no foreign
+        // write overlaps: the thread is running, so no other CPU holds it.
+        unsafe { (*self.0.as_ptr()).syscall_nr() }
+    }
+
+    /// Syscall argument `n`.
+    pub fn arg(self, n: usize) -> u64
+    {
+        // SAFETY: as for `syscall_nr`.
+        unsafe { (*self.0.as_ptr()).arg(n) }
+    }
+
+    /// Write the primary return value.
+    fn set_return(self, val: i64)
+    {
+        // SAFETY: as for `syscall_nr`; the exclusive reference lives only for
+        // this write.
+        unsafe { (*self.0.as_ptr()).set_return(val) };
+    }
+
+    /// Write the two-register IPC return (primary, secondary).
+    pub fn set_ipc_return(self, primary: u64, label: u64)
+    {
+        // SAFETY: as for `set_return`.
+        unsafe { (*self.0.as_ptr()).set_ipc_return(primary, label) };
+    }
+
+    /// Write the `SYS_IPC_CALL` return registers.
+    pub fn set_ipc_call_return(self, primary: u64, reply_label: u64, reply_word_count: u64)
+    {
+        // SAFETY: as for `set_return`.
+        unsafe { (*self.0.as_ptr()).set_ipc_call_return(primary, reply_label, reply_word_count) };
+    }
+
+    /// Write the `SYS_IPC_RECV` return registers.
+    pub fn set_ipc_recv_return(self, primary: u64, label: u64, badge: u64, word_count: u64)
+    {
+        // SAFETY: as for `set_return`.
+        unsafe {
+            (*self.0.as_ptr()).set_ipc_recv_return(primary, label, badge, word_count);
+        };
+    }
+}
+
 /// Syscall dispatcher: called from the arch-specific trap/syscall entry stub.
 ///
 /// Reads the syscall number from `tf`, invokes the handler, and writes the
@@ -101,12 +181,13 @@ unsafe fn stamp_syscall_entry(nr: u64, frame: *mut TrapFrame)
 pub unsafe fn dispatch(tf: *mut TrapFrame)
 {
     let frame = tf;
-    // SAFETY: caller guarantees tf is valid. The `&mut` is not exclusive for
-    // the whole call: while the thread blocks in a handler, other paths access
-    // the frame through the published `trap_frame`, a gap
-    // core/kernel/docs/arch-interface.md § `trap_frame` states and #514
-    // tracks.
-    let tf = unsafe { &mut *tf };
+    // SAFETY: caller guarantees tf is the running thread's valid frame for
+    // the whole syscall. The handlers reach it only through `UserFrame`,
+    // whose accesses each end before the next statement, so no reference to
+    // the frame lives across a block, while other paths access the frame
+    // through the published `trap_frame` (core/kernel/docs/arch-interface.md
+    // § `trap_frame`).
+    let tf = unsafe { UserFrame::new(tf) };
 
     let nr = tf.syscall_nr();
     // SAFETY: syscall entry with interrupts masked, on the caller's kernel
@@ -217,7 +298,7 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
 #[cfg(not(test))]
 // unnecessary_wraps: all dispatch arms must return Result<u64, SyscallError>; signature is fixed.
 #[allow(clippy::unnecessary_wraps)]
-fn sys_yield(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+fn sys_yield(_tf: UserFrame) -> Result<u64, SyscallError>
 {
     // SAFETY: called from syscall handler on a valid kernel stack.
     // Requeue::Always: thread is voluntarily yielding but should remain runnable.
@@ -236,7 +317,7 @@ fn sys_yield(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// last capability is deleted (procmgr's cap-revoke teardown, for process
 /// threads).
 #[cfg(not(test))]
-fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+fn sys_exit(_tf: UserFrame) -> Result<u64, SyscallError>
 {
     // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
     let tcb = unsafe { current_tcb() };
@@ -289,13 +370,12 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Like [`sys_exit`], this stops only the calling thread; sibling threads and
 /// the process's resources are torn down by procmgr (see
-/// docs/process-lifecycle.md § Process Death, including the #501 and
-/// #502 gaps).
+/// docs/process-lifecycle.md § Process Death).
 #[cfg(not(test))]
 // cast_possible_truncation: arg0 carries a u32 exit code zero-extended to u64
 // by the `process_exit` wrapper; truncating back to u32 is the intended decode.
 #[allow(clippy::cast_possible_truncation)]
-fn sys_process_exit(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+fn sys_process_exit(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let reason = syscall::encode_exit_code(tf.arg(0) as u32);
     // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
@@ -337,7 +417,7 @@ fn sys_process_exit(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// The thread is added to a global sleep list and removed from the run queue.
 /// The timer tick handler wakes it when `current_tick() >= deadline`.
 #[cfg(not(test))]
-fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let ms = tf.arg(0);
     if ms == 0
@@ -507,7 +587,7 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // cast_possible_truncation: cap handles and the correlator are u32 by ABI
 // contract; the truncation discards any upper bits a caller sets.
 #[allow(clippy::cast_possible_truncation)]
-fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::{EqRights, ThreadRights};
     use crate::sched::thread::{DeathObserver, MAX_DEATH_OBSERVERS, ThreadState};
@@ -638,7 +718,7 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 // cast_possible_truncation: cap handles and the correlator are u32 by ABI
 // contract; the truncation discards any upper bits a caller sets.
 #[allow(clippy::cast_possible_truncation)]
-fn sys_aspace_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::{AsRights, EqRights};
 
@@ -731,85 +811,169 @@ pub(crate) unsafe fn current_tcb() -> *mut crate::sched::thread::ThreadControlBl
     unsafe { crate::sched::scheduler_for(cpu).current() }
 }
 
-/// Look up a capability slot in a `CSpace` by user handle.
+/// A capability resolved from a user handle, with the object it names pinned
+/// for as long as the value lives.
+///
+/// [`pin_slot`] reads the slot's tag, generation, rights, badge, and object
+/// under the slot's `CSpace` lock and takes a reference on the object inside
+/// that hold. Every path that frees an occupied slot clears it under the same
+/// lock before it releases the reference the slot held (the pin invariant of
+/// core/kernel/docs/capability-internals.md § Kernel Object Reference
+/// Counting), so a slot still occupied under the lock names an object whose
+/// count is not zero, and the increment cannot revive a freed object. The
+/// reference is a kernel-internal owner: neither a concurrent delete of the
+/// last capability nor a revoke of an ancestor by another holder can free the
+/// object while the handler uses it.
+///
+/// Dropping the value releases the reference
+/// ([`release_ref`](crate::cap::object::release_ref)); when it was the last,
+/// the object is freed from the dropping context. A `PinnedCap` MUST
+/// therefore be dropped with no lock held, and before the thread parks: a
+/// thread killed while parked never runs its destructor, so a pin held across
+/// a park would keep the object alive for good. Blocking handlers drop it
+/// after their park commit and source unlock, before `schedule()`, and a loop
+/// that parks re-resolves its handle afterwards (the pin-before-park rule of
+/// core/kernel/docs/scheduling-internals.md § Lock Hierarchy).
+///
+/// The fields are a snapshot: the slot itself may be freed or recycled while
+/// the value lives; only the object is pinned.
+#[cfg(not(test))]
+#[must_use]
+pub(crate) struct PinnedCap
+{
+    /// The slot's tag at resolution (never `Null`).
+    pub tag: crate::cap::slot::CapTag,
+    /// The slot's rights at resolution.
+    pub rights: crate::cap::slot::Rights,
+    /// The slot's badge at resolution.
+    pub badge: u64,
+    /// The object the slot named at resolution, pinned while `self` lives.
+    pub object: Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>,
+}
+
+#[cfg(not(test))]
+impl Drop for PinnedCap
+{
+    fn drop(&mut self)
+    {
+        if let Some(obj) = self.object
+        {
+            // SAFETY: `pin_slot` took this reference and nothing else
+            // releases it; the type's contract has its holder drop it in
+            // syscall context with interrupts disabled and no lock held, the
+            // preconditions `release_ref` states.
+            unsafe { crate::cap::object::release_ref(obj) };
+        }
+    }
+}
+
+/// Resolve `handle` in `cspace` to an occupied slot of any tag and pin the
+/// object it names (see [`PinnedCap`]).
 ///
 /// `handle` is the encoded value userspace passes: slot index in the low
-/// [`syscall::CAP_INDEX_BITS`] bits, per-slot generation in the high bits. This
-/// is the single chokepoint for resolving a user-supplied handle; the
-/// raw-resolution handlers in `cap.rs`, `mem.rs`, and `ipc.rs` must decode and
-/// generation-check themselves (see core/kernel/docs/capability-internals.md
-/// § Per-Slot Generation).
+/// [`syscall::CAP_INDEX_BITS`] bits, per-slot generation in the high bits.
+/// Handlers that accept several tags (`SYS_CAP_INFO`, `SYS_WAIT_SET_ADD`'s
+/// source) check the tag and rights themselves, as do copy, derive, and
+/// derive-badge for their source; every other handler resolves through
+/// [`lookup_cap`].
+///
+/// # Errors
+/// [`SyscallError::InvalidCapability`] for a null `cspace`, a missing or
+/// `Null` slot, or a generation mismatch (a stale handle to a recycled
+/// slot, #349).
+///
+/// # Safety
+/// `cspace` must be null or the `CSpace` bound to the calling (running)
+/// thread, and the caller must be in syscall context with interrupts disabled
+/// and hold no lock: the `CSpace` lock is taken here. A bound `CSpace`
+/// outlives the call, because its refcount-0 teardown first stops every bound
+/// thread and waits until it is off every CPU (`sched::stop_threads_bound_to`).
+#[cfg(not(test))]
+pub(crate) unsafe fn pin_slot(
+    cspace: *mut crate::cap::cspace::CSpace,
+    handle: u32,
+) -> Result<PinnedCap, SyscallError>
+{
+    if cspace.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    let index = syscall::cap_handle_index(handle);
+    // SAFETY: cspace is the running thread's bound CSpace (contract), live for
+    // the call. Its lock serialises slot occupancy, and every slot free clears
+    // the slot under it before releasing the slot's reference, so an occupied
+    // slot read here names an object whose count is at least one, and the
+    // inc_ref below lands before any release can reach zero. lock_raw and
+    // unlock_raw are paired.
+    let snapshot = unsafe {
+        let saved = (*cspace).lock.lock_raw();
+        let snapshot = (*cspace).slot(index).and_then(|slot| {
+            (slot.tag != crate::cap::slot::CapTag::Null
+                && slot.generation() == syscall::cap_handle_gen(handle))
+            .then_some((slot.tag, slot.rights, slot.badge, slot.object))
+        });
+        if let Some((_, _, _, Some(obj))) = snapshot
+        {
+            obj.as_ref().inc_ref();
+        }
+        (*cspace).lock.unlock_raw(saved);
+        snapshot
+    };
+    let (tag, rights, badge, object) = snapshot.ok_or(SyscallError::InvalidCapability)?;
+    Ok(PinnedCap {
+        tag,
+        rights,
+        badge,
+        object,
+    })
+}
+
+/// Resolve `handle` to a capability of the type `required_rights` names,
+/// holding those rights, and pin the object it names (see [`PinnedCap`]).
+///
+/// This is the chokepoint for resolving a user-supplied handle of one
+/// expected type; [`pin_slot`] serves the multi-tag handlers and the
+/// copy and derive sources, and the capability-tree handlers that act on a
+/// slot under the derivation lock decode and generation-check the handle
+/// themselves (see core/kernel/docs/capability-internals.md § Per-Slot
+/// Generation).
 ///
 /// The expected slot tag is fixed by the required-rights argument's type:
 /// `required_rights: TypedRights<K>` selects `K::TAG`, so a rights constant of
 /// the wrong capability type cannot compile. Presence-only lookups pass the
 /// type's `NONE` (e.g. `SchedRights::NONE`).
 ///
-/// Returns a reference to the slot, or an appropriate [`SyscallError`]:
-/// - Null cspace pointer or missing slot → [`SyscallError::InvalidCapability`].
+/// # Errors
+/// - Null cspace pointer, missing or `Null` slot, or a generation mismatch
+///   (a stale handle to a recycled slot, #349) →
+///   [`SyscallError::InvalidCapability`].
 /// - Tag mismatch → [`SyscallError::InvalidCapability`].
-/// - Generation mismatch (stale handle to a recycled slot) →
-///   [`SyscallError::InvalidCapability`] (#349).
 /// - Insufficient rights → [`SyscallError::InsufficientRights`].
 ///
+/// Both checks read the snapshot taken under the `CSpace` lock, so a slot
+/// being cleared concurrently answers `InvalidCapability`, never a rights
+/// refusal read from a half-cleared slot.
+///
 /// # Safety
-/// `cspace` must be null or the `CSpace` bound to the calling (running)
-/// thread, and the caller must not park while it uses the returned slot:
-/// only for that `CSpace` does its refcount-0 teardown stop the caller and
-/// wait for it to leave every CPU before the slot pages are freed, which is
-/// what makes the `'static` borrow sound. The slot's contents may be
-/// recycled concurrently (the unlocked tag and generation checks narrow that
-/// race, they do not close it), and nothing pins the object the slot names
-/// past the lookup, so a caller that dereferences the object across a point
-/// where another thread may delete its last capability reads freed memory
-/// (#502).
+/// As for [`pin_slot`]; the returned [`PinnedCap`] carries the drop rules.
 #[cfg(not(test))]
 pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
     cspace: *mut crate::cap::cspace::CSpace,
     handle: u32,
     required_rights: crate::cap::slot::TypedRights<K>,
-) -> Result<&'static crate::cap::slot::CapabilitySlot, SyscallError>
+) -> Result<PinnedCap, SyscallError>
 {
-    if cspace.is_null()
+    // SAFETY: forwarded caller contract.
+    let pinned = unsafe { pin_slot(cspace, handle) }?;
+    if pinned.tag != K::TAG
     {
         return Err(SyscallError::InvalidCapability);
     }
-    // SAFETY: cspace is a valid CSpace pointer from the current thread's TCB.
-    let cs = unsafe { &*cspace };
-    let index = syscall::cap_handle_index(handle);
-    let slot = cs.slot(index).ok_or(SyscallError::InvalidCapability)?;
-    if slot.tag != K::TAG
-    {
-        return Err(SyscallError::InvalidCapability);
-    }
-    // Reject a stale handle whose generation no longer matches the slot — the
-    // slot was freed and recycled since the handle was minted (#349). Checked
-    // after the tag so a handle to a now-null slot reports InvalidCapability.
-    if slot.generation() != syscall::cap_handle_gen(handle)
-    {
-        return Err(SyscallError::InvalidCapability);
-    }
-    if !slot.rights.contains(required_rights.erase())
+    if !pinned.rights.contains(required_rights.erase())
     {
         return Err(SyscallError::InsufficientRights);
     }
-    // ref_as_ptr: intentional — raw pointer cast to extend lifetime to 'static.
-    #[allow(clippy::ref_as_ptr)]
-    // SAFETY: the slot lives in a leaf page of the CSpace's directory. Leaf
-    // pages are write-once, Release-published, and never freed or moved
-    // before refcount-0 teardown (see CSpace's memory-ordering contract),
-    // and that teardown first stops every thread bound to the CSpace and
-    // waits until it is off every CPU (`sched::stop_threads_bound_to`), so
-    // no thread can be executing this function — or holding the returned
-    // reference across a syscall — when the pages go. A caller destroying
-    // its own CSpace is stopped the same way, and the free is deferred until
-    // the syscall epilogue has scheduled it away (`drain_deferred_reclaim`).
-    // The unlocked tag/generation checks above narrow, but cannot close, the
-    // race against this slot being freed or recycled concurrently.
-    // `lookup_cap` takes no reference on the object, so it is not pinned while
-    // the caller uses it (#502; see core/kernel/docs/capability-internals.md
-    // § Storage: Hybrid Two-Level Radix).
-    Ok(unsafe { &*(slot as *const _) })
+    Ok(pinned)
 }
 
 // ── IPC buffer ────────────────────────────────────────────────────────────────
@@ -819,7 +983,7 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
 /// arg0 = virtual address of the IPC buffer page (0 = deregister; otherwise
 /// must be 4 KiB-aligned).
 #[cfg(not(test))]
-fn sys_ipc_buffer_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+fn sys_ipc_buffer_set(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let virt = tf.arg(0);
     // A non-zero buffer must be page-aligned AND in the user half. Without the

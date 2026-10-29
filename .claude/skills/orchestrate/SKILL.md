@@ -157,7 +157,9 @@ decision, or a case with no clearly best option waits for the maintainer.
   recording, or asks for the rewrite.
 - A history rewrite (a commit subject over 72 columns, a wrong keyword) is yours only on the
   maintainer's instruction: rebuild the chain with identical trees (`git commit-tree -S`),
-  check `git diff --quiet <old> <new>`, push with `--force-with-lease`, and record it.
+  check `git diff --quiet <old> <new>`, push with the lease pinned to the old head
+  (`git push --force-with-lease=<branch>:<old> origin <new>:refs/heads/<branch>`, which refuses
+  when the remote branch has moved past `<old>`), and record it.
 - `.claude/CLAUDE.md` edits need the maintainer's own words. A worker whose change has a copy
   there reports it and holds its push; you carry the copy to the maintainer, who applies it or
   authorizes the worker in their own words, which you pass on verbatim.

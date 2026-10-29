@@ -95,10 +95,11 @@ your turn.
   it on a feature branch: another worker or the orchestrator may have built on the remote
   branch. A pushed subject or body that needs changing is left to the maintainer, who either
   accepts the departure in the PR body (for a SHOULD rule of § Commit Messages) or has the
-  history rewritten by the orchestrator; say so in your report. The one exception: standalone,
-  the maintainer's own words may direct you to make that rewrite, and you then make it as
-  `.claude/skills/orchestrate/SKILL.md` § Rulings describes (identical trees, checked with
-  `git diff --quiet <old> <new>`, pushed with `--force-with-lease` after `git fetch origin`).
+  history rewritten (orchestrated, by the orchestrator; standalone, by you under the exception
+  below); say so in your report. The one exception: standalone, the maintainer's own words may
+  direct you to make that rewrite, and you then make it as `.claude/skills/orchestrate/SKILL.md`
+  § Rulings describes (identical trees, checked with `git diff --quiet <old> <new>`, pushed
+  with the lease pinned to the old head, `--force-with-lease=<branch>:<old>`).
   Before any other push, run `git fetch origin` and
   `git rev-list --left-right --count origin/<branch>...HEAD`, and push only when it prints `0`
   and a positive count, or when `origin/<branch>` does not exist yet; a diverged branch is

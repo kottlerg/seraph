@@ -1431,6 +1431,8 @@ fn create_process_from_bytes(
 {
     let machine = crate::arch::current::EXPECTED_ELF_MACHINE;
     let (ehdr, kind) = elf::validate_executable(module_bytes, machine).ok()?;
+    // `validate_executable` returns the header decoded; the parsers borrow it.
+    let ehdr = &ehdr;
     let bias = match kind
     {
         elf::ElfKind::Exec => 0,
@@ -2300,6 +2302,8 @@ pub fn create_process_from_file(
     let machine = crate::arch::current::EXPECTED_ELF_MACHINE;
     let (ehdr, kind) =
         elf::validate_executable(header_data, machine).map_err(|_| procmgr_errors::INVALID_ELF)?;
+    // `validate_executable` returns the header decoded; the parsers borrow it.
+    let ehdr = &ehdr;
     let bias = match kind
     {
         elf::ElfKind::Exec => 0,

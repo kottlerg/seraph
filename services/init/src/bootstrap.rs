@@ -838,6 +838,8 @@ pub fn bootstrap_memmgr(
 
     let machine = arch::current::EXPECTED_ELF_MACHINE;
     let (ehdr, kind) = elf::validate_executable(module_bytes, machine).ok()?;
+    // `validate_executable` returns the header decoded; the parsers borrow it.
+    let ehdr = &ehdr;
     let bias = match kind
     {
         elf::ElfKind::Exec => 0,
@@ -1591,6 +1593,8 @@ pub fn bootstrap_procmgr(
 
     let machine = arch::current::EXPECTED_ELF_MACHINE;
     let (ehdr, kind) = elf::validate_executable(module_bytes, machine).ok()?;
+    // `validate_executable` returns the header decoded; the parsers borrow it.
+    let ehdr = &ehdr;
     let bias = match kind
     {
         elf::ElfKind::Exec => 0,

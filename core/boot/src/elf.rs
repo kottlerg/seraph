@@ -246,7 +246,7 @@ pub unsafe fn load_kernel(
     }; MAX_LOAD_SEGMENTS];
     let mut segment_count: usize = 0;
 
-    for seg in elf::load_segments(ehdr, data)
+    for seg in elf::load_segments(&ehdr, data)
     {
         let seg = seg?;
         if seg.memsz == 0
@@ -261,7 +261,7 @@ pub unsafe fn load_kernel(
         segment_count += 1;
     }
 
-    let span = validate_kernel_layout(&raw[..segment_count], elf::entry_point(ehdr))?;
+    let span = validate_kernel_layout(&raw[..segment_count], elf::entry_point(&ehdr))?;
 
     // One contiguous allocation for the whole image, placed wherever the
     // firmware has free RAM within the arch's bound.
@@ -334,7 +334,7 @@ pub unsafe fn load_kernel(
     let (rela_phys, rela_size) = match kind
     {
         elf::ElfKind::Exec => (0, 0),
-        elf::ElfKind::Dyn => match elf::rela_table(ehdr, data)?
+        elf::ElfKind::Dyn => match elf::rela_table(&ehdr, data)?
         {
             Some(table) =>
             {
@@ -358,7 +358,7 @@ pub unsafe fn load_kernel(
         physical_base: span_base,
         virtual_base: span.link_virt,
         size: span.span_bytes,
-        entry_virtual: elf::entry_point(ehdr),
+        entry_virtual: elf::entry_point(&ehdr),
         segments,
         segment_count,
         kind,
@@ -496,7 +496,7 @@ pub unsafe fn load_init(
     }; INIT_MAX_SEGMENTS];
     let mut count: usize = 0;
 
-    for seg in elf::load_segments(ehdr, data)
+    for seg in elf::load_segments(&ehdr, data)
     {
         let seg = seg?;
         if seg.memsz == 0
@@ -583,7 +583,7 @@ pub unsafe fn load_init(
         elf::ElfKind::Exec => (0, 0, 0, 0, 0),
         elf::ElfKind::Dyn =>
         {
-            let (rela_phys, rela_size) = match elf::rela_table(ehdr, data)?
+            let (rela_phys, rela_size) = match elf::rela_table(&ehdr, data)?
             {
                 Some(table) =>
                 {
@@ -594,7 +594,7 @@ pub unsafe fn load_init(
                 }
                 None => (0, 0),
             };
-            let (relro_vaddr, relro_size) = elf::relro_span(ehdr, data).unwrap_or((0, 0));
+            let (relro_vaddr, relro_size) = elf::relro_span(&ehdr, data).unwrap_or((0, 0));
             (
                 boot_protocol::INIT_IMAGE_FLAG_PIE,
                 rela_phys,
@@ -608,7 +608,7 @@ pub unsafe fn load_init(
     // count ≤ INIT_MAX_SEGMENTS (≤ 8), well within u32 range.
     #[allow(clippy::cast_possible_truncation)]
     Ok(InitImage {
-        entry_point: elf::entry_point(ehdr),
+        entry_point: elf::entry_point(&ehdr),
         segments,
         segment_count: count as u32,
         flags,

@@ -10,7 +10,7 @@ publish.workspace = true
 [dependencies]
 # `ipc::SVCMGR_LABELS_VERSION` is the handshake word of the `CAPS` round.
 ipc = { path = "../../../shared/ipc" }
-# `MSG_CAP_SLOTS_MAX` / `MSG_DATA_WORDS_MAX` bound an encoded round.
+# `MSG_CAP_SLOTS_MAX` bounds an encoded round's cap list.
 syscall-abi = { path = "../../../abi/syscall" }
 
 [lints]

@@ -1133,10 +1133,9 @@ fn endow_svcmgr(
     // and the badge-0 procmgr `SEND|GRANT` source. svcmgr mints real-logd's
     // bootstrap caps from these on every (re)launch. A source whose derive
     // failed is left off the round and its presence bit clear, and svcmgr
-    // holds it as absent: without the death-auth source logd runs but cannot
-    // reclaim per-sender slots; without the master-log source logd exits at
-    // startup and, being `critical = yes` with no `on_failure` restart for a
-    // clean exit, svcmgr starts a graceful shutdown.
+    // holds it as absent; an absent source then leaves `0` in logd's own
+    // bootstrap round, which the kernel refuses, so that launch of logd
+    // fails at the bootstrap serve (#592).
     let logd_round = svcmgr_endowment::encode_logd_sources(&svcmgr_endowment::LogdSources {
         master_log_source: endow.master_log_source,
         procmgr_death_auth_source: endow.procmgr_death_auth_source,

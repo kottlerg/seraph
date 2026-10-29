@@ -12,7 +12,8 @@
 //! cannot ride as a zero slot: each of these rounds lists only the caps
 //! present, and a presence bitmap in a data word names which optional slot
 //! each listed cap fills. The encoding is specified in
-//! [services/svcmgr/docs/ipc-interface.md](../../docs/ipc-interface.md#handover-endowment-bootstrap-rounds).
+//! [services/svcmgr/docs/ipc-interface.md](../../docs/ipc-interface.md#handover-endowment-bootstrap-rounds)
+//! (see also the crate [README](../README.md)).
 //! The crate performs no IPC and issues no syscalls, so both sides of the
 //! codec are host-tested (see
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants)).
@@ -55,8 +56,9 @@ pub mod logd_present
 /// presence).
 const ROUND_DATA_WORDS: usize = 3;
 
-/// The caps of the `CAPS` round, by role. `0` marks an absent source cap;
-/// the two endpoints are required and never `0` in a decoded round.
+/// The caps of the `CAPS` round, by role. `0` marks an absent source cap.
+/// The two endpoints are required; in a decoded round they are never `0`
+/// because they are delivered caps, and the kernel refuses a null slot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CapsRound
 {

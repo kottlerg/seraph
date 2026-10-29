@@ -36,7 +36,7 @@ so a source cap init could not provide is not sent as `0`: the `CAPS` and
 presence word sets bit `i` when optional slot `i` is present. A round whose
 presence word names a bit with no slot, or a different number of caps than
 the round delivered, is malformed. The round kinds and this encoding are
-the [`svcmgr-endowment`](../endowment/src/lib.rs) crate, which init encodes
+the [`svcmgr-endowment`](../endowment/README.md) crate, which init encodes
 and svcmgr decodes with.
 
 **Round 1 — `CAPS` (`data[0] = 1`, not terminal):**
@@ -57,8 +57,8 @@ svcmgr mints the `devmgr.registry` publish cap
 publish caps (`REGISTRY_QUERY_AUTHORITY` plus `SHUTDOWN_DEVICE_AUTHORITY`
 or `ORPHAN_TEST_AUTHORITY`), and the `SET_DRIVERS_DIR` cap
 (`DRIVERS_DIR_AUTHORITY`) from the devmgr-registry source. A version
-mismatch in `data[1]`, or a malformed round, aborts bootstrap (svcmgr
-exits).
+mismatch in `data[1]`, or a malformed `CAPS` round, aborts bootstrap
+(svcmgr exits).
 
 **Rounds 2..N — `SUBSTRATE` (`data[0] = 2`, not terminal):**
 one per init-bootstrapped substrate service (memmgr, procmgr, devmgr,
@@ -84,7 +84,8 @@ vfsd) whose thread cap init captured; logd is not a substrate. See init's
 
 After a failed `CAPS` round init ends the endowment with an empty
 `LOGD_SOURCES` round (no caps, presence `0`), so svcmgr leaves its round
-loop and exits.
+loop and exits. svcmgr logs a malformed `LOGD_SOURCES` round, deletes the
+caps it delivered, and continues with both sources absent.
 
 svcmgr holds both sources for the system's life and mints real-logd's
 [`log_sink`](service-definitions.md#log_sink) bootstrap round from them on

@@ -431,7 +431,7 @@ pub fn ram_accounted_identity_phase(_: &Caps)
     const MAX_POLL: u32 = 4096;
 
     let info = startup_info();
-    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let ipc_buf = current_ipc_buf();
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
 
     let mut terms = (0u64, 0u64, 0u64);

@@ -880,7 +880,17 @@ unsafe fn populate_child_info(
     let pi_ro = CapGuard::new(syscall::cap_derive(pi_memory.cap(), syscall::RIGHTS_MEM_MAP).ok()?);
     // SAFETY: the caller's contract: `child_aspace` is a child's address
     // space, never procmgr's own, so the map changes nothing procmgr runs on.
-    unsafe { syscall::mem_map(pi_ro.cap(), child_aspace, layout.process_info_va, 0, 1, 0) }.ok()?;
+    unsafe {
+        syscall::mem_map(
+            pi_ro.cap(),
+            child_aspace,
+            layout.process_info_va,
+            0,
+            1,
+            syscall::MAP_FROM_CAP,
+        )
+    }
+    .ok()?;
     // pi_memory stays in procmgr's CSpace as the teardown handle (revoke
     // cascades to any descendants); the mapping doesn't need pi_ro to
     // outlive this call, so its guard deletes it on return.
@@ -986,7 +996,17 @@ unsafe fn finalize_main_tls(
         CapGuard::new(syscall::cap_derive(alloc.memory.cap(), syscall::RIGHTS_MEM_MAP_RW).ok()?);
     // SAFETY: the caller's contract: `child_aspace` is a child's address
     // space, never procmgr's own, so the map changes nothing procmgr runs on.
-    unsafe { syscall::mem_map(tls_rw.cap(), child_aspace, alloc.tls_block_base, 0, 1, 0) }.ok()?;
+    unsafe {
+        syscall::mem_map(
+            tls_rw.cap(),
+            child_aspace,
+            alloc.tls_block_base,
+            0,
+            1,
+            syscall::MAP_FROM_CAP,
+        )
+    }
+    .ok()?;
     // The memory cap stays as the teardown handle; tls_rw is transient and
     // its guard deletes it on return.
     Some(MainTls {
@@ -1166,7 +1186,7 @@ unsafe fn map_fresh_child_page(
     let rw = CapGuard::new(syscall::cap_derive(memory.cap(), syscall::RIGHTS_MEM_MAP_RW).ok()?);
     // SAFETY: the caller's contract: `child_aspace` is a child's address
     // space, never procmgr's own, so the map changes nothing procmgr runs on.
-    unsafe { syscall::mem_map(rw.cap(), child_aspace, va, 0, 1, 0) }.ok()
+    unsafe { syscall::mem_map(rw.cap(), child_aspace, va, 0, 1, syscall::MAP_FROM_CAP) }.ok()
 }
 
 /// Determine protection flags for an ELF segment.

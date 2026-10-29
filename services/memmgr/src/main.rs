@@ -896,7 +896,17 @@ fn bootstrap_from_init(
     // SAFETY: `phys_table_va` lies in memmgr's private phys-table scratch
     // window, which nothing else maps and where no image, stack, or IPC page
     // lies (the zone map above `META_ARENA_BASE_DEFAULT`).
-    if unsafe { syscall::mem_map(phys_table_cap, self_aspace, phys_table_va, 0, 1, 0) }.is_err()
+    if unsafe {
+        syscall::mem_map(
+            phys_table_cap,
+            self_aspace,
+            phys_table_va,
+            0,
+            1,
+            syscall::MAP_FROM_CAP,
+        )
+    }
+    .is_err()
     {
         return None;
     }

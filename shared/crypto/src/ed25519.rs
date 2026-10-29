@@ -39,10 +39,9 @@ pub enum VerifyError
 ///
 /// Returns the first failing check, in this order:
 /// - [`VerifyError::NonCanonicalS`]: S is not below the group order L.
-/// - [`VerifyError::BadPublicKey`]: `public_key` does not decode to a curve
-///   point. Non-canonical encodings RFC 8032 § 5.1.3 rejects (y ≥ p, or
-///   x = 0 with the sign bit set) are accepted rather than reported here
-///   (#558).
+/// - [`VerifyError::BadPublicKey`]: `public_key` is not the canonical
+///   encoding of a curve point (RFC 8032 § 5.1.3: a y coordinate at or above
+///   p, a y with no matching x, or x = 0 with the sign bit set).
 /// - [`VerifyError::Mismatch`]: the verification equation does not hold.
 ///
 /// A returned `Ok(())` means the signature is valid for `public_key` and
@@ -253,6 +252,26 @@ pub fn run_ed25519_kats() -> Result<(), &'static str>
     if ed25519_verify(&not_a_point, &bmsg[..bmsg_len], &sig) != Err(VerifyError::BadPublicKey)
     {
         return Err("ed25519: invalid public key accepted");
+    }
+
+    // y = p, a non-canonical encoding of the point with y = 0 (whose x is
+    // sqrt(-1)) → BadPublicKey (RFC 8032 §5.1.3 step 1).
+    let mut y_is_p = [0xFFu8; 32];
+    y_is_p[0] = 0xED;
+    y_is_p[31] = 0x7F;
+    if ed25519_verify(&y_is_p, &bmsg[..bmsg_len], &sig) != Err(VerifyError::BadPublicKey)
+    {
+        return Err("ed25519: public key with y >= p accepted");
+    }
+
+    // y = 1 (x = 0) with the sign bit set, the identity's non-canonical
+    // encoding → BadPublicKey (RFC 8032 §5.1.3 step 4).
+    let mut x0_sign = [0u8; 32];
+    x0_sign[0] = 1;
+    x0_sign[31] = 0x80;
+    if ed25519_verify(&x0_sign, &bmsg[..bmsg_len], &sig) != Err(VerifyError::BadPublicKey)
+    {
+        return Err("ed25519: public key with x = 0 and sign bit set accepted");
     }
 
     Ok(())

@@ -11,7 +11,7 @@
 //! Passing that bit through would let a process bound as its own fault handler
 //! tell mapped kernel VAs from unmapped ones, defeating KASLR
 //! (core/kernel/docs/cross-boundary-disclosure.md § Surface inventory, fault
-//! messages); `page_fault_handler` (core/kernel/src/arch/x86_64/idt.rs) reports
+//! messages); `page_fault_handler` (`core/kernel/src/arch/x86_64/idt.rs`) reports
 //! it only for a CR2 below `user_va_top`. A child whose faults this thread
 //! handles makes two kinds of access:
 //!
@@ -111,14 +111,11 @@ fn handle_child(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "page_fault_present_bit: cap_create_endpoint failed")?;
-    let child = match crate::spawn::new_child(ctx)
+    let Ok(child) = crate::spawn::new_child(ctx)
+    else
     {
-        Ok(child) => child,
-        Err(_) =>
-        {
-            cap_delete(ep).ok();
-            return Err("page_fault_present_bit: spawn::new_child failed");
-        }
+        cap_delete(ep).ok();
+        return Err("page_fault_present_bit: spawn::new_child failed");
     };
 
     let result = thread_set_fault_handler(child.th, ep, FAULT_BADGE, FAULT_CLASS_ALL)

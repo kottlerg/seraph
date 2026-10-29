@@ -54,7 +54,7 @@ pub fn permit_port_range(_iopb: &mut [u8; IOPB_SIZE], _base: u32, _count: u32) {
 /// Make every CPU reload its I/O permission bitmap — no-op on RISC-V.
 ///
 /// RISC-V has no I/O port space, so no thread holds a port binding to
-/// withdraw. Present so the architecture-neutral IoPort code
+/// withdraw. Present so the architecture-neutral `IoPort` code
 /// (`cap::ioport_bindings::withdraw_everywhere` and `sys_ioport_bind`)
 /// compiles on both arches; the `HAS_IO_PORTS` gate makes this unreachable on
 /// RISC-V.

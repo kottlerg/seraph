@@ -132,6 +132,8 @@ const TARGET_STACK: usize = 1;
 const ROUND_WAIT_US: u64 = 1_000_000;
 
 /// Bound on the wait for both children to exit, in 1 ms polls.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const EXIT_POLLS: u32 = 2000;
 
 /// Polls a bounded wait spins busily before it polls in 1 ms sleeps.
@@ -649,10 +651,11 @@ fn finish(children: &Children) -> TestResult
 {
     QUIT.store(1, Ordering::Release);
     let (stopper, target) = handles(children)?;
+    let max_polls = crate::scaled_polls(EXIT_POLLS);
     let mut polls = 0;
     while STOPPER_EXITED.load(Ordering::Acquire) == 0 || TARGET_EXITED.load(Ordering::Acquire) == 0
     {
-        if polls == EXIT_POLLS
+        if polls == max_polls
         {
             return Err("stress::stop_target_vanishes: a child did not exit");
         }
@@ -663,7 +666,7 @@ fn finish(children: &Children) -> TestResult
     }
     for child in [stopper, target]
     {
-        let reason = spawn::wait_until_exited(child, EXIT_POLLS)
+        let reason = spawn::wait_until_exited(child, crate::scaled_polls(EXIT_POLLS))
             .map_err(|_| "stress::stop_target_vanishes: a child did not reach Exited")?;
         if reason != EXIT_VOLUNTARY
         {

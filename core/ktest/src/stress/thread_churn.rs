@@ -10,8 +10,7 @@
 //! cleanup (TCBs, `CSpace` refcounts) works correctly under churn.
 
 use syscall::{
-    cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait,
-    system_info, thread_exit,
+    cap_copy, cap_create_notification, cap_delete, notification_send, system_info, thread_exit,
 };
 use syscall_abi::SystemInfoType;
 
@@ -44,8 +43,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         spawn::configure_and_start(&child, churn_entry, stack_top, u64::from(child_done))
             .map_err(|_| "thread_churn: configure_and_start failed")?;
 
-        // Wait for child to complete.
-        let bits = notification_wait(done).map_err(|_| "thread_churn: notification_wait failed")?;
+        // Wait, bounded, for the child to complete.
+        let mut bits = 0u64;
+        crate::tally::await_report(done, &mut bits, 0x1, "thread_churn: child never reported")?;
         if bits != 0x1
         {
             return Err("thread_churn: child sent unexpected bits");

@@ -6,8 +6,8 @@
 //! Tier 1 tests for hardware access syscalls.
 //!
 //! Covers: `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER`,
-//! `SYS_IRQ_ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT`.
-//! The per-architecture `SYS_SBI_CALL` tests live behind `crate::arch`.
+//! `SYS_IRQ_ACK`, `SYS_IRQ_SPLIT`. The per-architecture `SYS_IOPORT_BIND`,
+//! `SYS_IOPORT_SPLIT`, and `SYS_SBI_CALL` tests live behind `crate::arch`.
 //!
 //! Tests that require specific hardware capability types (`Mmio`, Interrupt,
 //! `IoPort`) scan the initial capability set for a matching cap. If none is
@@ -17,8 +17,6 @@
 use syscall::{
     aspace_query, cap_create_notification, irq_ack, irq_register, irq_split, mem_unmap, mmio_split,
 };
-#[cfg(target_arch = "x86_64")]
-use syscall::{cap_create_cspace, cap_create_thread};
 use syscall_abi::SyscallError;
 
 use crate::{TestContext, TestResult};
@@ -32,7 +30,7 @@ const MMIO_TEST_VA: u64 = 0x1_5000_0000;
 /// capacity, which the kernel clamps below 2^24 so the narrowing cannot fail;
 /// the address-space cap's index if the query fails, which still covers every
 /// boot-minted cap.
-fn scan_bound(ctx: &TestContext) -> u32
+pub fn scan_bound(ctx: &TestContext) -> u32
 {
     syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
         .ok()
@@ -120,165 +118,6 @@ pub fn irq_register_ack(ctx: &TestContext) -> TestResult
     crate::log("ktest: hw::irq_register_ack SKIP (no Interrupt caps in initial cap set)");
     syscall::cap_delete(irq_sig).ok();
     Ok(())
-}
-
-// ── SYS_IOPORT_BIND ───────────────────────────────────────────────────────────
-
-/// `ioport_bind` binds an I/O port range to a thread.
-///
-/// On RISC-V this syscall is not supported and must return `NotSupported`.
-/// On `x86_64`, scans for the first `IoPort` cap and binds it to a test
-/// thread. If no `IoPort` cap is found, the test is skipped.
-///
-/// The scan bound is the cspace's backed capacity (queried at runtime via
-/// `cap_info`) so the test stays robust against changes to cap mint
-/// order or post-init carve products landing at slot indices above
-/// `aspace_cap`.
-// needless_return: cfg-gated early return is required to terminate the riscv64
-// path; the x86_64 path follows in the same function body.
-#[allow(clippy::needless_return)]
-pub fn ioport_bind(ctx: &TestContext) -> TestResult
-{
-    // RISC-V: verify NotSupported is returned regardless of arguments.
-    #[cfg(target_arch = "riscv64")]
-    {
-        let _ = ctx;
-        let err = syscall::ioport_bind(0, 0);
-        if err != Err(SyscallError::NotSupported as i64)
-        {
-            return Err("ioport_bind on RISC-V did not return NotSupported");
-        }
-        return Ok(());
-    }
-
-    // x86_64: create a thread to receive the port range and scan for a cap.
-    #[cfg(target_arch = "x86_64")]
-    {
-        let cs = cap_create_cspace(ctx.memory_base, 0, 4)
-            .map_err(|_| "create_cspace for ioport_bind test failed")?;
-        let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
-            .map_err(|_| "cap_create_thread for ioport_bind test failed")?;
-
-        let bound = scan_bound(ctx);
-        for slot in 1u32..=bound
-        {
-            // Any error (a slot of another type, most often) leaves the cap
-            // intact; keep scanning.
-            if syscall::ioport_bind(th, slot).is_ok()
-            {
-                syscall::cap_delete(th).ok();
-                syscall::cap_delete(cs).ok();
-                return Ok(());
-            }
-        }
-
-        crate::log("ktest: hw::ioport_bind SKIP (no IoPort caps in initial cap set)");
-        syscall::cap_delete(th).ok();
-        syscall::cap_delete(cs).ok();
-        Ok(())
-    }
-}
-
-// ── SYS_IOPORT_SPLIT ──────────────────────────────────────────────────────────
-
-/// `ioport_split` divides an `IoPort` cap into two non-overlapping children.
-///
-/// On RISC-V this syscall is not supported and must return `NotSupported`.
-/// On `x86_64`, scans the cspace for the first `IoPort` cap whose
-/// range covers port 0x80 and splits it there. Slots whose cap is the
-/// wrong type or an `IoPort` not covering 0x80 are skipped
-/// non-destructively. Validates: both child slots are non-zero and
-/// distinct; re-splitting the now-consumed parent slot fails;
-/// out-of-range splits fail with `InvalidArgument`. If no such
-/// `IoPort` is found, the test is skipped.
-///
-/// The original cap is consumed by the split; this is the documented
-/// semantics. No later test depends on the same slot.
-// needless_return: cfg-gated early return is required to terminate the riscv64
-// path; the x86_64 path follows in the same function body.
-#[allow(clippy::needless_return)]
-pub fn ioport_split(ctx: &TestContext) -> TestResult
-{
-    // RISC-V: verify NotSupported is returned regardless of arguments.
-    #[cfg(target_arch = "riscv64")]
-    {
-        let _ = ctx;
-        let err = syscall::ioport_split(0, 1);
-        if err != Err(SyscallError::NotSupported as i64)
-        {
-            return Err("ioport_split on RISC-V did not return NotSupported");
-        }
-        return Ok(());
-    }
-
-    // x86_64: find an IoPort cap covering 0x80 by probing with
-    // `ioport_split`. `ioport_split` returns `InvalidCapability` for
-    // wrong cap types and `InvalidArgument` for an `IoPort` whose
-    // range doesn't cover the split point. Either result lets us
-    // identify the slot's type non-destructively, since neither
-    // consumes the cap.
-    //
-    // The scan bound is the cspace's backed capacity (queried at runtime
-    // via `cap_info`) so carve products from `ioport::bind_port_range`
-    // (which splits the wide cap `ioport::init` records) — which land at
-    // slot indices above `aspace_cap` — are always reachable, regardless of
-    // how the cspace has grown.
-    #[cfg(target_arch = "x86_64")]
-    {
-        let bound = scan_bound(ctx);
-        for slot in 1u32..=bound
-        {
-            // Try splitting at 0x80. If the slot is not an IoPort we
-            // get InvalidCapability and keep scanning. If it is an
-            // IoPort that doesn't cover 0x80 (e.g. a narrow
-            // sub-range carved by `ioport::bind_port_range`) we also keep
-            // scanning — another slot may hold a wider IoPort that
-            // does cover the probe point.
-            match syscall::ioport_split(slot, 0x80)
-            {
-                Err(e) if e == SyscallError::InvalidCapability as i64 =>
-                {
-                    // Wrong cap type — keep scanning.
-                }
-                Err(e) if e == SyscallError::InvalidArgument as i64 =>
-                {
-                    // IoPort whose range doesn't cover 0x80; cap is
-                    // intact. Keep scanning for another candidate.
-                }
-                Err(_) =>
-                {
-                    return Err("ioport_split returned unexpected error");
-                }
-                Ok((slot1, slot2)) =>
-                {
-                    if slot1 == 0 || slot2 == 0 || slot1 == slot2
-                    {
-                        return Err("ioport_split returned bad slot ids");
-                    }
-                    // Parent slot is consumed; re-split must fail.
-                    if syscall::ioport_split(slot, 0x80).is_ok()
-                    {
-                        return Err("re-split of consumed parent succeeded");
-                    }
-                    // Out-of-range split on a child must fail with
-                    // InvalidArgument. 0 is always invalid (would yield
-                    // an empty lower half).
-                    let oob = syscall::ioport_split(slot1, 0);
-                    if !matches!(oob, Err(e) if e == SyscallError::InvalidArgument as i64)
-                    {
-                        return Err("split with split_at=0 should fail with InvalidArgument");
-                    }
-                    // Clean up children.
-                    syscall::cap_delete(slot1).ok();
-                    syscall::cap_delete(slot2).ok();
-                    return Ok(());
-                }
-            }
-        }
-
-        crate::log("ktest: hw::ioport_split SKIP (no IoPort covering 0x80 in initial cap set)");
-        Ok(())
-    }
 }
 
 // ── SYS_MMIO_SPLIT ────────────────────────────────────────────────────────────

@@ -68,9 +68,6 @@ extern "C" fn ipc_caller_entry(arg: u64) -> !
 
 pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
 {
-    use syscall_abi::RIGHTS_EP_SEND_GRANT;
-    let n = u64::from(iters);
-
     let Ok(ep) = cap_create_endpoint(ctx.memory_base)
     else
     {
@@ -79,14 +76,41 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
     let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
+        cap_delete(ep).ok();
         return;
     };
-
     let Ok(child) = spawn::new_child(ctx)
     else
     {
+        cap_delete(done).ok();
+        cap_delete(ep).ok();
         return;
     };
+
+    run_round_trips(ctx, ep, done, &child, iters);
+
+    // One cleanup path for every exit: deleting the child's Thread cap also
+    // ends a child still parked in `ipc_call` after an early break.
+    cap_delete(child.th).ok();
+    cap_delete(child.cs).ok();
+    cap_delete(done).ok();
+    cap_delete(ep).ok();
+}
+
+/// Start the caller child on `ep`, serve `iters` round trips, and log the
+/// statistics. Returns early, leaving cleanup to the caller, when the child
+/// cannot be set up.
+fn run_round_trips(
+    ctx: &crate::TestContext,
+    ep: u32,
+    done: u32,
+    child: &spawn::SpawnedChild,
+    iters: u32,
+)
+{
+    use syscall_abi::RIGHTS_EP_SEND_GRANT;
+    let n = u64::from(iters);
+
     let Ok(child_ep) = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
     else
     {
@@ -111,7 +135,7 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
     };
     let stack_top = ChildStack::top(core::ptr::addr_of!(BENCH_IPC_STACK));
 
-    if spawn::configure_and_start(&child, ipc_caller_entry, stack_top, arg).is_err()
+    if spawn::configure_and_start(child, ipc_caller_entry, stack_top, arg).is_err()
     {
         return;
     }
@@ -148,7 +172,13 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
         completed += 1;
     }
 
-    notification_wait(done).ok();
+    // After every round trip the child's last call has returned and it is on
+    // its way to `done`; after an early break it may be parked in `ipc_call`
+    // for good, so the caller's Thread-cap delete ends it instead of a wait.
+    if completed == n
+    {
+        notification_wait(done).ok();
+    }
 
     log_bench_header("ipc_round_trip", iters);
     if let Some(mean) = total.checked_div(completed)
@@ -157,9 +187,4 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
         crate::log_u64("ktest: bench  cycles_mean=", mean);
         crate::log_u64("ktest: bench  cycles_max=", max);
     }
-
-    cap_delete(child.th).ok();
-    cap_delete(ep).ok();
-    cap_delete(done).ok();
-    cap_delete(child.cs).ok();
 }

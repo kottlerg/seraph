@@ -102,9 +102,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     )
     .map_err(|_| "stress::idle_wake_race: configure_and_start_pinned failed")?;
 
-    // Wait for worker to reach its notification_wait loop.
-    let ready = notification_wait(c2p)
-        .map_err(|_| "stress::idle_wake_race: notification_wait (readiness) failed")?;
+    // Wait, bounded, for the worker to reach its notification_wait loop.
+    let mut ready = 0u64;
+    crate::tally::await_report(
+        c2p,
+        &mut ready,
+        BIT_ACK,
+        "stress::idle_wake_race: worker never reported ready",
+    )?;
     if ready != BIT_ACK
     {
         return Err("stress::idle_wake_race: child sent wrong readiness bits");
@@ -157,8 +162,13 @@ pub fn run(ctx: &TestContext) -> TestResult
     // thread cap.
     notification_send(p2c, BIT_GO | 0x2)
         .map_err(|_| "stress::idle_wake_race: notification_send (quit) failed")?;
-    let _ = notification_wait(c2p)
-        .map_err(|_| "stress::idle_wake_race: notification_wait (final ack) failed")?;
+    let mut final_ack = 0u64;
+    crate::tally::await_report(
+        c2p,
+        &mut final_ack,
+        BIT_ACK,
+        "stress::idle_wake_race: worker never acknowledged the quit",
+    )?;
 
     // Cleanup.
     cap_delete(child.th).map_err(|_| "stress::idle_wake_race: cap_delete (thread) failed")?;

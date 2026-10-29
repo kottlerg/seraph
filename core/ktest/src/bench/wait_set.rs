@@ -33,6 +33,7 @@ pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
     let mut min = u64::MAX;
     let mut max = 0u64;
     let mut total = 0u64;
+    let mut completed: u64 = 0;
 
     for _ in 0..n
     {
@@ -68,6 +69,7 @@ pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
             max = delta;
         }
         total = total.saturating_add(delta);
+        completed += 1;
     }
 
     cap_delete(sig).ok();
@@ -76,7 +78,9 @@ pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
     #[allow(clippy::cast_possible_truncation)]
     let actual_n = n as u32;
     log_bench_header("wait_set_cycle", actual_n);
-    if let Some(mean) = total.checked_div(n)
+    // A loop that broke early is averaged over the iterations it completed,
+    // and one that completed none logs no statistics.
+    if let Some(mean) = total.checked_div(completed)
     {
         crate::log_u64("ktest: bench  cycles_min=", min);
         crate::log_u64("ktest: bench  cycles_mean=", mean);

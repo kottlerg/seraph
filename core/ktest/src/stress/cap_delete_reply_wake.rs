@@ -206,12 +206,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         // only after `ipc_recv` returns, so its arrival proves the client is
         // `BlockedOnReply` on this server — the live window in which
         // `reply_tcb = client` and the reply-wake is owed.
-        while acc & BIT_SERVER_ARMED == 0
-        {
-            let bits = notification_wait(done)
-                .map_err(|_| "stress::cap_delete_reply_wake: notification_wait(armed) failed")?;
-            acc |= bits;
-        }
+        crate::tally::await_report(
+            done,
+            &mut acc,
+            BIT_SERVER_ARMED,
+            "stress::cap_delete_reply_wake: server never reported armed",
+        )?;
         armed_cycles += 1;
 
         // Delete the server Thread cap. This drives `dealloc_object(Thread)`,

@@ -336,21 +336,19 @@ pub fn mem_map_multi_page(ctx: &TestContext) -> TestResult
 {
     const MULTI_VA: u64 = 0x1_4200_0000;
 
-    let memory_a = crate::frame_pool::alloc().ok_or("mem_map_multi_page: memory_a exhausted")?;
-    let memory_b = crate::frame_pool::alloc().ok_or("mem_map_multi_page: memory_b exhausted")?;
+    // The guards unmap and return both frames on every exit path.
+    let mut frame_a = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
+        .ok_or("mem_map_multi_page: memory_a exhausted")?;
+    let mut frame_b = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
+        .ok_or("mem_map_multi_page: memory_b exhausted")?;
 
     // Map each cap at consecutive pages.
-    mem_map(memory_a, ctx.aspace_cap, MULTI_VA, 0, 1, MAP_WRITABLE)
+    frame_a
+        .map(MULTI_VA)
         .map_err(|_| "mem_map memory_a failed")?;
-    mem_map(
-        memory_b,
-        ctx.aspace_cap,
-        MULTI_VA + 0x1000,
-        0,
-        1,
-        MAP_WRITABLE,
-    )
-    .map_err(|_| "mem_map memory_b failed")?;
+    frame_b
+        .map(MULTI_VA + 0x1000)
+        .map_err(|_| "mem_map memory_b failed")?;
 
     // Both pages must be queryable.
     let phys_a =
@@ -365,14 +363,6 @@ pub fn mem_map_multi_page(ctx: &TestContext) -> TestResult
     if phys_a == phys_b
     {
         return Err("both pages mapped to same physical address");
-    }
-
-    mem_unmap(ctx.aspace_cap, MULTI_VA, 1).ok();
-    mem_unmap(ctx.aspace_cap, MULTI_VA + 0x1000, 1).ok();
-    // SAFETY: caps allocated from pool and now unmapped.
-    unsafe {
-        crate::frame_pool::free(memory_a);
-        crate::frame_pool::free(memory_b);
     }
     Ok(())
 }
@@ -523,7 +513,9 @@ pub fn memory_split_at_end_err(_ctx: &TestContext) -> TestResult
 /// `page PA not 4 KiB-aligned` panic during the first mapping below.
 pub fn init_segment_caps_aligned(ctx: &TestContext) -> TestResult
 {
-    const SEG_PROBE_VA: u64 = 0x1_4300_0000;
+    // Its own VA, distinct from `mem_protect_wx_err`'s `WX_TEST_VA`, so a
+    // probe page this test leaves mapped cannot collide with that test's map.
+    const SEG_PROBE_VA: u64 = 0x1_4400_0000;
     // Phase 9 mints one Memory cap per init LOAD segment, in contiguous slots
     // from `aspace_cap + 1`. ktest's image has four (RODATA, TEXT, RELRO,
     // DATA/BSS); this loop probes only the first three, so the DATA/BSS cap
@@ -540,16 +532,16 @@ pub fn init_segment_caps_aligned(ctx: &TestContext) -> TestResult
         mem_map(seg_cap, ctx.aspace_cap, SEG_PROBE_VA, 0, 1, MAP_READ)
             .map_err(|_| "init_segment_caps_aligned: mem_map failed")?;
 
-        let phys = aspace_query(ctx.aspace_cap, SEG_PROBE_VA)
-            .map_err(|_| "init_segment_caps_aligned: aspace_query failed")?;
+        // Unmap before judging the query, so no exit path leaves ktest's own
+        // segment page mapped at the probe VA.
+        let phys = aspace_query(ctx.aspace_cap, SEG_PROBE_VA);
+        let unmapped = mem_unmap(ctx.aspace_cap, SEG_PROBE_VA, 1);
+        let phys = phys.map_err(|_| "init_segment_caps_aligned: aspace_query failed")?;
         if phys == 0 || phys & 0xFFF != 0
         {
-            mem_unmap(ctx.aspace_cap, SEG_PROBE_VA, 1).ok();
             return Err("init_segment_caps_aligned: segment cap mapped to non-page-aligned PA");
         }
-
-        mem_unmap(ctx.aspace_cap, SEG_PROBE_VA, 1)
-            .map_err(|_| "init_segment_caps_aligned: mem_unmap failed")?;
+        unmapped.map_err(|_| "init_segment_caps_aligned: mem_unmap failed")?;
     }
 
     // Touch the sentinel static so the optimiser keeps `.data` populated.

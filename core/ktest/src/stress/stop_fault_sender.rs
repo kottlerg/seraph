@@ -133,6 +133,8 @@ const SYNC_WAIT_US: u64 = 1_000_000;
 const POLL_SPINS: u32 = 1024;
 
 /// Bound on the waits for a child to exit or come up, in 1 ms polls.
+/// Applied through [`crate::scaled_polls`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
 const EXIT_POLLS: u32 = 2000;
 
 /// Stress stack indices of the faulter, the handler, and the syncer.
@@ -478,7 +480,7 @@ fn spawn_faulter(ctx: &TestContext, parts: &mut Parts) -> TestResult
 /// sync call queues on an endpoint nothing receives on.
 fn await_handler_ready(handler: u32) -> TestResult
 {
-    for _ in 0..EXIT_POLLS
+    for _ in 0..crate::scaled_polls(EXIT_POLLS)
     {
         if HANDLER_READY.load(Ordering::Acquire) != 0
         {
@@ -685,7 +687,7 @@ fn elapsed_us() -> Result<u64, &'static str>
 /// The exit reason of the exited faulter `th`.
 fn exit_reason(th: u32) -> Result<u64, &'static str>
 {
-    spawn::wait_until_exited(th, EXIT_POLLS)
+    spawn::wait_until_exited(th, crate::scaled_polls(EXIT_POLLS))
         .map_err(|_| "stress::stop_fault_sender: the faulter's exit reason could not be read")
 }
 
@@ -792,7 +794,7 @@ fn finish(parts: &mut Parts, tally: &mut Tally) -> TestResult
             log_error("ktest: stress::stop_fault_sender final restart error=", e);
             return Err("stress::stop_fault_sender: final restart of the faulter failed");
         }
-        let reason = spawn::wait_until_exited(th, EXIT_POLLS)
+        let reason = spawn::wait_until_exited(th, crate::scaled_polls(EXIT_POLLS))
             .map_err(|_| "stress::stop_fault_sender: the faulter did not exit")?;
         if reason == EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR
         {
@@ -812,10 +814,10 @@ fn finish(parts: &mut Parts, tally: &mut Tally) -> TestResult
     let handler = parts
         .handler
         .ok_or("stress::stop_fault_sender: no handler")?;
-    spawn::wait_until_exited(handler, EXIT_POLLS)
+    spawn::wait_until_exited(handler, crate::scaled_polls(EXIT_POLLS))
         .map_err(|_| "stress::stop_fault_sender: the handler did not exit")?;
     let syncer = parts.syncer.ok_or("stress::stop_fault_sender: no syncer")?;
-    spawn::wait_until_exited(syncer, EXIT_POLLS)
+    spawn::wait_until_exited(syncer, crate::scaled_polls(EXIT_POLLS))
         .map_err(|_| "stress::stop_fault_sender: the syncer did not exit")
         .map(|_| ())
 }

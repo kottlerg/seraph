@@ -349,6 +349,9 @@ pub struct ChildTlsMeta
 /// template. When the binary has no `PT_TLS` segment (or it is empty),
 /// returns `(0, ChildTlsMeta::default())` without consuming a backing
 /// page — matching [`tls_backing_pages`].
+// similar_names: the TLS template's bounds (`tdata_start` / `tdata_end`) and
+// its base in each address space (`tls_base` / `tls_base_va`) are pairs named
+// for what they share.
 #[allow(clippy::similar_names)]
 fn place_main_tls(
     arena: &mut BootArena,
@@ -631,6 +634,9 @@ struct MemmgrCaps
 
 /// Populate memmgr's `ProcessInfo` page from `arena` and map it read-only
 /// into `target_aspace`.
+// similar_names: memmgr's copies of its own objects are named by object and
+// holder (`mm_aspace_in_mm`, `mm_cspace_in_mm`); the names differ only in the
+// object kind, which is the distinction that matters.
 #[allow(clippy::similar_names)]
 fn populate_memmgr_info(
     arena: &mut BootArena,
@@ -712,6 +718,10 @@ fn descriptor_for(info: &InitInfo, slot: u32) -> Option<&CapDescriptor>
 /// `mm_service_ep` is the full-rights cap on memmgr's service endpoint
 /// (created in init's `CSpace`); init keeps a copy and minted SENDs from it
 /// go in each spawned process's `ProcessInfo.memmgr_endpoint_cap`.
+// similar_names: memmgr's kernel objects are named by kind (`mm_aspace`,
+// `mm_cspace`). too_many_lines: memmgr's raw bring-up is one ordered sequence
+// (load, map, create objects, seed caps, start) whose steps share the caps it
+// creates, and every failure exit must see them all.
 #[allow(clippy::similar_names, clippy::too_many_lines)]
 pub fn bootstrap_memmgr(
     info: &InitInfo,
@@ -895,7 +905,6 @@ fn forward_arena(arena_cap: u32, mm_cspace: u32, kind: u64) -> Option<InUseArena
 /// `MemoryAlloc` tail and the transient phys-table page — both `memory_split`
 /// products with no `InitInfo` descriptor that would otherwise free into the
 /// sealed post-handoff buddy.
-#[allow(clippy::too_many_arguments)]
 fn push_free_run(
     src_cap: u32,
     pages: u32,
@@ -966,6 +975,10 @@ fn assert_init_arena_front_bounded(init_arena_cap: u32)
 /// run — its keep-alive moves to memmgr's pool copy, and after memmgr reads it
 /// through the read-only `caps[1]` derivation the page becomes allocatable like
 /// any other.
+// similar_names: the parallel payload arrays and their cursors are named for
+// what they index (`mm_memory_base` / `mm_memory_count`, `in_use` /
+// `in_use_count`). too_many_lines: the payload is built in one pass over
+// those arrays, whose cursors every step advances.
 #[allow(clippy::similar_names, clippy::too_many_lines)]
 pub fn finalize_memmgr(
     info: &InitInfo,
@@ -1229,6 +1242,9 @@ struct ProcmgrCaps
 /// SEND caps per child arrives via procmgr's bootstrap round, not via
 /// `ProcessInfo`. The pre-installed badged SEND cap procmgr uses for
 /// its OWN `seraph::log!` writes lives in `pi.log_send_cap`.
+// similar_names: procmgr's copies of its own objects are named by object and
+// holder (`pm_aspace_in_pm`, `pm_cspace_in_pm`); the names differ only in the
+// object kind, which is the distinction that matters.
 #[allow(clippy::similar_names)]
 fn populate_procmgr_info(
     arena: &mut BootArena,

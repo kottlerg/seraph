@@ -336,7 +336,10 @@ mod present
 ///   - terminal round has `done = true`.
 ///
 /// The bootstrap layout mirrors `devmgr/src/caps.rs::bootstrap_caps`.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+// too_many_lines: devmgr's spawn and bootstrap round are one ordered sequence
+// whose cap derivations each later step consumes; splitting it would only
+// thread those slots through helpers.
+#[allow(clippy::too_many_lines)]
 pub fn create_devmgr_with_caps(
     info: &InitInfo,
     procmgr_ep: u32,
@@ -746,6 +749,8 @@ pub fn create_devmgr_with_caps(
 // ── vfsd creation ────────────────────────────────────────────────────────────
 
 /// Endpoint set passed to vfsd via its bootstrap round.
+// struct_field_names: both fields are endpoints, and the shared `_ep` suffix
+// is the codebase's name for an endpoint cap slot.
 #[allow(clippy::struct_field_names)]
 pub struct VfsdSpawnCaps
 {
@@ -961,6 +966,9 @@ mod endow_kind
 /// derives the shapes it publishes / sends / launches with from these
 /// reserved sources; it keeps the log-sink sources for the system's life
 /// so it can (re)launch real-logd any number of times.
+// struct_field_names: every field is a cap slot named for the service it
+// addresses and the cap kind (`_ep`, `_cap`, `_source`), as everywhere else
+// in init; dropping the shared affixes would lose which slot is which.
 #[allow(clippy::struct_field_names)]
 pub struct SvcmgrEndowment
 {
@@ -1141,6 +1149,10 @@ fn endow_svcmgr(
 /// svcmgr-launched services (`logd`, `timed`, `pwrmgr`); svcmgr's
 /// pure-consumer launch path fires only for staged test recipes (svctest /
 /// usertest, and crasher co-staged with svctest).
+// too_many_arguments: the handover passes svcmgr every cap init holds for it,
+// and each argument is a distinct slot from a different bootstrap stage.
+// too_many_lines: the handover is one ordered protocol (spawn, endowment
+// rounds, teardown registration, completion) that must run in sequence.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn phase3_svcmgr_handover(
     info: &InitInfo,

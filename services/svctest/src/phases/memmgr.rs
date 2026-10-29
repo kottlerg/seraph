@@ -6,7 +6,9 @@
 //! Memmgr / heap allocator surface.
 
 use std::collections::BTreeMap;
-use std::os::seraph::startup_info;
+use std::os::seraph::{current_ipc_buf, startup_info};
+
+use syscall_abi::MSG_CAP_SLOTS_MAX;
 
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
@@ -25,6 +27,14 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "alloc_grow",
             run: alloc_grow_phase,
+        },
+        Phase {
+            name: "memmgr_donate_unauthorized",
+            run: donate_unauthorized_phase,
+        },
+        Phase {
+            name: "memmgr_stray_cap_flood",
+            run: stray_cap_flood_phase,
         },
     ]
 }
@@ -162,6 +172,241 @@ pub fn alloc_grow_phase(_: &Caps)
     assert_eq!(post.last().copied(), Some(4095));
 
     std::os::seraph::log!("alloc_grow phase passed ({BIG} bytes + 8 KiB interleaved)");
+}
+
+/// Call memmgr over svctest's own badged endpoint, panicking with `what` if
+/// the call itself fails.
+fn memmgr_call(msg: &ipc::IpcMessage, what: &str) -> ipc::IpcMessage
+{
+    // SAFETY: `current_ipc_buf` is this thread's kernel-registered IPC buffer.
+    unsafe { ipc::ipc_call(startup_info().memmgr_endpoint, msg, current_ipc_buf()) }
+        .unwrap_or_else(|e| panic!("memmgr {what} ipc_call failed: {e:?}"))
+}
+
+/// Request a one-page grant from memmgr: `(grant cap, physical base)`.
+fn request_one_page() -> (u32, u64)
+{
+    let want = 1 | (u64::from(ipc::memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
+        .word(0, want)
+        .build();
+    let reply = memmgr_call(&req, "REQUEST_MEMORY_CAPS");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "REQUEST_MEMORY_CAPS status"
+    );
+    let grant = *reply
+        .caps()
+        .first()
+        .expect("REQUEST_MEMORY_CAPS returned no cap");
+    // One cap: data[1] is its page count, data[2] its physical base.
+    (grant, reply.word(2))
+}
+
+/// Drop the grant cap and hand its region back to memmgr.
+fn release_one_page(grant: u32, phys_base: u64)
+{
+    syscall::cap_delete(grant).expect("cap_delete of grant");
+    let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
+        .word(0, 1)
+        .word(1, phys_base)
+        .build();
+    let reply = memmgr_call(&release, "RELEASE_MEMORY_CAPS");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "RELEASE_MEMORY_CAPS status"
+    );
+}
+
+/// A `DONATE_MEMORY_CAPS` from a client other than procmgr is refused with
+/// `UNAUTHORIZED`. The donated cap is a derivation of a one-page grant svctest
+/// still holds, the aliasing donation the gate exists to stop: memmgr would
+/// otherwise put a frame it lent to svctest back into its free pool.
+pub fn donate_unauthorized_phase(_: &Caps)
+{
+    let (grant, phys_base) = request_one_page();
+
+    let alias = syscall::cap_derive(grant, syscall::RIGHTS_ALL).expect("cap_derive of grant");
+    let donate = ipc::IpcMessage::builder(ipc::memmgr_labels::DONATE_MEMORY_CAPS)
+        .cap(alias)
+        .build();
+    let reply = memmgr_call(&donate, "DONATE_MEMORY_CAPS");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::UNAUTHORIZED,
+        "DONATE_MEMORY_CAPS from a non-procmgr client was not refused \
+         (accepted_caps={}, accepted_pages={})",
+        reply.word(0),
+        reply.word(1)
+    );
+
+    release_one_page(grant, phys_base);
+    std::os::seraph::log!("non-procmgr donation refused with UNAUTHORIZED");
+}
+
+/// One stray-cap flood case: a message memmgr refuses or answers with no
+/// lasting effect, sent with `MSG_CAP_SLOTS_MAX` caps attached.
+struct StrayCapCase
+{
+    label: u64,
+    words: [u64; 3],
+    /// Attached caps memmgr's `dispatch` hands to the handler (the label's
+    /// contract caps); `dispatch` deletes the others itself.
+    kept: usize,
+    expected: u64,
+}
+
+/// Every label whose contract carries no caps, the two cap-carrying labels
+/// from a caller that is not procmgr, a forged `FAULT_LABEL`, and an unknown
+/// label. Each request is refused or has no lasting effect, so the flood
+/// changes no memmgr state but its `CSpace`.
+const STRAY_CAP_CASES: [StrayCapCase; 11] = [
+    // want_pages == 0.
+    StrayCapCase {
+        label: ipc::memmgr_labels::REQUEST_MEMORY_CAPS,
+        words: [0, 0, 0],
+        kept: 0,
+        expected: ipc::memmgr_errors::INVALID_ARGUMENT,
+    },
+    // count == 0: nothing to release.
+    StrayCapCase {
+        label: ipc::memmgr_labels::RELEASE_MEMORY_CAPS,
+        words: [0, 0, 0],
+        kept: 0,
+        expected: ipc::memmgr_errors::SUCCESS,
+    },
+    StrayCapCase {
+        label: ipc::memmgr_labels::REGISTER_PROCESS,
+        words: [0, 0, 0],
+        kept: 0,
+        expected: ipc::memmgr_errors::UNAUTHORIZED,
+    },
+    StrayCapCase {
+        label: ipc::memmgr_labels::PROCESS_DIED,
+        words: [0, 0, 0],
+        kept: 0,
+        expected: ipc::memmgr_errors::UNAUTHORIZED,
+    },
+    // Every attached cap reaches the handler, which refuses and deletes them.
+    StrayCapCase {
+        label: ipc::memmgr_labels::DONATE_MEMORY_CAPS,
+        words: [0, 0, 0],
+        kept: MSG_CAP_SLOTS_MAX,
+        expected: ipc::memmgr_errors::UNAUTHORIZED,
+    },
+    StrayCapCase {
+        label: ipc::memmgr_labels::QUERY_POOL_STATUS,
+        words: [0, 0, 0],
+        kept: 0,
+        expected: ipc::memmgr_errors::SUCCESS,
+    },
+    // len == 0.
+    StrayCapCase {
+        label: ipc::memmgr_labels::REGISTER_REGION,
+        words: [0, 0, 0],
+        kept: 0,
+        expected: ipc::memmgr_errors::INVALID_ARGUMENT,
+    },
+    // `cap[0]` reaches the handler, which refuses and deletes it.
+    StrayCapCase {
+        label: ipc::memmgr_labels::DELEGATE_ASPACE,
+        words: [0, 0, 0],
+        kept: 1,
+        expected: ipc::memmgr_errors::UNAUTHORIZED,
+    },
+    // No region is registered at [0, 0).
+    StrayCapCase {
+        label: ipc::memmgr_labels::UNREGISTER_REGION,
+        words: [0, 0, 0],
+        kept: 0,
+        expected: ipc::memmgr_errors::INVALID_ARGUMENT,
+    },
+    // A non-VM kind: memmgr answers KILL, which an ordinary caller receives
+    // as a plain reply label.
+    StrayCapCase {
+        label: syscall_abi::FAULT_LABEL,
+        words: [syscall_abi::FAULT_KIND_EXCEPTION, 0, 0],
+        kept: 0,
+        expected: syscall_abi::FAULT_REPLY_KILL,
+    },
+    // No memmgr label: the default arm.
+    StrayCapCase {
+        label: 0x7FFF,
+        words: [0, 0, 0],
+        kept: 0,
+        expected: ipc::memmgr_errors::INVALID_ARGUMENT,
+    },
+];
+
+/// Stray caps one case must leave behind to overflow memmgr's `CSpace`: more
+/// than the slots it is seeded with (init's `CSPACE_RETYPE_PAGES` slot pages,
+/// about 8 Ki slots), with margin.
+const STRAY_CAP_LEAK_BUDGET: usize = 9 * 1024;
+
+/// Calls a case makes so that a leak on either of its two deletion paths alone
+/// reaches [`STRAY_CAP_LEAK_BUDGET`]: `dispatch` deletes the
+/// `MSG_CAP_SLOTS_MAX - kept` caps past the contract, and the handler deletes
+/// the `kept` contract caps it refuses. The smaller nonzero per-call leak of
+/// the two sets the count, so a memmgr that kept either path's caps would
+/// exhaust its `CSpace` during that case, fail its receive, and exit with
+/// `EXIT_RECV_WEDGE`.
+const fn stray_cap_calls(kept: usize) -> usize
+{
+    let dispatch_leak = MSG_CAP_SLOTS_MAX - kept;
+    let smallest_leak = if kept == 0 || (dispatch_leak != 0 && dispatch_leak < kept)
+    {
+        dispatch_leak
+    }
+    else
+    {
+        kept
+    };
+    STRAY_CAP_LEAK_BUDGET.div_ceil(smallest_leak)
+}
+
+/// Flood memmgr, case by case, with caps attached to messages whose contract
+/// does not keep them, then check it still answers. Every call must also get
+/// its case's normal reply, so deleting the strays changes no label's
+/// behaviour.
+pub fn stray_cap_flood_phase(_: &Caps)
+{
+    let info = startup_info();
+    let mut total_calls = 0;
+    for case in &STRAY_CAP_CASES
+    {
+        let label = case.label;
+        for call in 0..stray_cap_calls(case.kept)
+        {
+            let mut builder = ipc::IpcMessage::builder(label)
+                .word(0, case.words[0])
+                .word(1, case.words[1])
+                .word(2, case.words[2]);
+            for _ in 0..MSG_CAP_SLOTS_MAX
+            {
+                let stray = syscall::cap_derive(info.memmgr_endpoint, syscall::RIGHTS_EP_SEND)
+                    .expect("cap_derive of a stray cap");
+                builder = builder.cap(stray);
+            }
+            let what = format!("stray-cap call {call} with label {label:#x}");
+            let reply = memmgr_call(&builder.build(), &what);
+            assert_eq!(reply.label, case.expected, "memmgr reply to {what}");
+            total_calls += 1;
+        }
+    }
+
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
+    let reply = memmgr_call(&req, "QUERY_POOL_STATUS after the flood");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "QUERY_POOL_STATUS status after the flood"
+    );
+    std::os::seraph::log!(
+        "memmgr answered {total_calls} calls carrying {} stray caps",
+        total_calls * MSG_CAP_SLOTS_MAX
+    );
 }
 
 /// Assert the all-RAM-accounted identity `system_ram == kernel_reserved +

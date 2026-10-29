@@ -310,7 +310,7 @@ handler's badges are secret. memmgr's attribution of a fault to a process rests 
 process badges being unguessable (random 64-bit values minted by `mint_process_badge`): a
 client that learns another process's badge can direct memmgr to back a fault in that
 process's address space. This defect is tracked in
-[#459](https://github.com/kottlerg/seraph/issues/459).
+[#550](https://github.com/kottlerg/seraph/issues/550).
 
 ---
 

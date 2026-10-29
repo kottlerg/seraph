@@ -65,8 +65,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "fault_pager_roundtrip: thread_set_fault_handler failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start(&child, fault_child, stack_top, u64::from(child_sig))
-        .map_err(|_| "fault_pager_roundtrip: configure_and_start failed")?;
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, fault_child, stack_top, u64::from(child_sig))
+    }
+    .map_err(|_| "fault_pager_roundtrip: configure_and_start failed")?;
 
     // Act as the pager: receive the fault, verify its shape, back the page.
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
@@ -97,7 +101,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Back the faulting page from the frame pool, then resume the child.
     let mem = crate::frame_pool::alloc()
         .ok_or("fault_pager_roundtrip: frame_pool::alloc returned None")?;
-    mem_map(mem, ctx.aspace_cap, RESERVED_VA, 0, 1, MAP_WRITABLE)
+    // SAFETY: `RESERVED_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    unsafe { mem_map(mem, ctx.aspace_cap, RESERVED_VA, 0, 1, MAP_WRITABLE) }
         .map_err(|_| "fault_pager_roundtrip: mem_map failed")?;
 
     // Reply RESUME, deliberately attaching a (null) cap slot. The kernel must
@@ -120,7 +126,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     // binding's reference on the endpoint), then the rest.
     cap_delete(child.th).ok();
     cap_delete(child.cs).ok();
-    mem_unmap(ctx.aspace_cap, RESERVED_VA, 1).ok();
+    // SAFETY: `RESERVED_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    unsafe { mem_unmap(ctx.aspace_cap, RESERVED_VA, 1) }.ok();
     // SAFETY: mem is from the pool and now unmapped.
     unsafe { crate::frame_pool::free(mem) };
     cap_delete(ep).ok();

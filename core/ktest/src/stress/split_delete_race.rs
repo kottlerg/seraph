@@ -91,7 +91,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         // SAFETY: one sibling per cycle, reaped below before the next publish.
         let arg = unsafe { SIBLING_ARGS.publish(0, SiblingArgs { orig, done }) };
         let stack_top = ChildStack::top(core::ptr::addr_of!(SIBLING_STACK));
-        thread_configure(th, sibling_entry as *const () as u64, stack_top, arg)
+        // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+        // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+        // rule, as noted where the stack is chosen).
+        unsafe { thread_configure(th, sibling_entry as *const () as u64, stack_top, arg) }
             .map_err(|_| "stress::split_delete_race: thread_configure failed")?;
         if cpus > 1
         {

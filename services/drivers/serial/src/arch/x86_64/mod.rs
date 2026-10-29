@@ -22,7 +22,12 @@ const UART_LSR: u16 = 5;
 /// Bind the COM1 `IoPort` cap to `self_thread` so `out`/`in` against the UART
 /// do not fault, then enable the receive-data interrupt when `enable_rx_irq` is
 /// set. `self_aspace` is unused on x86-64. Returns `false` if the bind fails.
-pub fn serial_init(
+///
+/// # Safety
+/// None on x86-64: the UART is reached through I/O ports and nothing is
+/// mapped. The function is `unsafe` for the arch-dispatch surface, whose
+/// riscv64 implementation maps the cap it is handed.
+pub unsafe fn serial_init(
     self_thread: u32,
     _self_aspace: u32,
     ioport_cap: u32,

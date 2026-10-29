@@ -91,7 +91,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Map the page read-only. MAP_READ forces R-- regardless of the Memory cap's
     // rights, so the child caches a narrow entry the widen can later broaden.
-    if mem_map(memory_cap, ctx.aspace_cap, WIDEN_VA, 0, 1, MAP_READ).is_err()
+    // SAFETY: `WIDEN_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe { mem_map(memory_cap, ctx.aspace_cap, WIDEN_VA, 0, 1, MAP_READ) }.is_err()
     {
         // SAFETY: memory_cap is from the pool and was never mapped.
         unsafe { crate::frame_pool::free(memory_cap) };
@@ -106,13 +108,17 @@ pub fn run(ctx: &TestContext) -> TestResult
     };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    if crate::spawn::configure_and_start_pinned(
-        &child,
-        widen_child,
-        stack_top,
-        crate::scaled_bound(SPIN_BOUND),
-        1,
-    )
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    if unsafe {
+        crate::spawn::configure_and_start_pinned(
+            &child,
+            widen_child,
+            stack_top,
+            crate::scaled_bound(SPIN_BOUND),
+            1,
+        )
+    }
     .is_err()
     {
         cleanup(ctx, Some(&child), memory_cap);
@@ -130,13 +136,17 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Widen R-- → RW-. Same Memory cap, strictly broader rights ⇒ MapOutcome::Widen ⇒
     // the kernel elides the remote shootdown, leaving CPU 1's stale entry live.
-    if mem_protect(
-        memory_cap,
-        ctx.aspace_cap,
-        WIDEN_VA,
-        1,
-        MAP_READ | MAP_WRITABLE,
-    )
+    // SAFETY: `WIDEN_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe {
+        mem_protect(
+            memory_cap,
+            ctx.aspace_cap,
+            WIDEN_VA,
+            1,
+            MAP_READ | MAP_WRITABLE,
+        )
+    }
     .is_err()
     {
         cleanup(ctx, Some(&child), memory_cap);
@@ -236,7 +246,9 @@ fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, memory
         cap_delete(child.th).ok();
         cap_delete(child.cs).ok();
     }
-    if mem_unmap(ctx.aspace_cap, WIDEN_VA, 1).is_ok()
+    // SAFETY: `WIDEN_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe { mem_unmap(ctx.aspace_cap, WIDEN_VA, 1) }.is_ok()
     {
         // SAFETY: the page is now unmapped, so the cap is free to return.
         unsafe { crate::frame_pool::free(memory_cap) };

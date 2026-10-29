@@ -69,7 +69,9 @@ fn check(ctx: &TestContext, held: u32) -> TestResult
     // CSpace.
     let granted = cap_derive(held, syscall::RIGHTS_ALL)
         .map_err(|_| "integration::mmio_revoke_unmaps: cap_derive(granted) failed")?;
-    if mmio_map(ctx.aspace_cap, granted, PROBE_VA, 0).is_err()
+    // SAFETY: `PROBE_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe { mmio_map(ctx.aspace_cap, granted, PROBE_VA, 0) }.is_err()
     {
         cap_delete(granted).ok();
         return Err("integration::mmio_revoke_unmaps: mmio_map failed");

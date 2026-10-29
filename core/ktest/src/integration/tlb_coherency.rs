@@ -93,13 +93,17 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── 3. Configure + pin child to CPU 1, then start. ──────────────────────
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start_pinned(
-        &child,
-        tlb_worker_thread,
-        stack_top,
-        u64::from(child_p2c), // arg = p2c slot; c2p slot read from static
-        1,
-    )
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start_pinned(
+            &child,
+            tlb_worker_thread,
+            stack_top,
+            u64::from(child_p2c), // arg = p2c slot; c2p slot read from static
+            1,
+        )
+    }
     .map_err(|_| "integration::tlb_coherency: configure_and_start_pinned failed")?;
 
     // Wait for child to signal readiness on c2p.
@@ -132,14 +136,18 @@ pub fn run(ctx: &TestContext) -> TestResult
         let reclaim = phase == 1;
         for cycle in 0..CYCLES
         {
-            mem_map(
-                memory_cap,
-                ctx.aspace_cap,
-                TEST_VA,
-                0,
-                1,
-                syscall::MAP_WRITABLE,
-            )
+            // SAFETY: `TEST_VA` is a scratch VA (crate docs § Scratch VAs), so the
+            // span holds no Rust object or IPC page of ktest.
+            unsafe {
+                mem_map(
+                    memory_cap,
+                    ctx.aspace_cap,
+                    TEST_VA,
+                    0,
+                    1,
+                    syscall::MAP_WRITABLE,
+                )
+            }
             .map_err(|_| "integration::tlb_coherency: mem_map failed")?;
 
             // Stamp the freshly mapped frame so the child can validate the
@@ -166,12 +174,16 @@ pub fn run(ctx: &TestContext) -> TestResult
             // Unmap. Phase 1 also reclaims the now-empty intermediate PT.
             if reclaim
             {
-                mem_unmap_reclaim(ctx.aspace_cap, TEST_VA, 1)
+                // SAFETY: `TEST_VA` is a scratch VA (crate docs § Scratch VAs), so the
+                // span holds no Rust object or IPC page of ktest.
+                unsafe { mem_unmap_reclaim(ctx.aspace_cap, TEST_VA, 1) }
                     .map_err(|_| "integration::tlb_coherency: mem_unmap_reclaim failed")?;
             }
             else
             {
-                mem_unmap(ctx.aspace_cap, TEST_VA, 1)
+                // SAFETY: `TEST_VA` is a scratch VA (crate docs § Scratch VAs), so the
+                // span holds no Rust object or IPC page of ktest.
+                unsafe { mem_unmap(ctx.aspace_cap, TEST_VA, 1) }
                     .map_err(|_| "integration::tlb_coherency: mem_unmap failed")?;
             }
 

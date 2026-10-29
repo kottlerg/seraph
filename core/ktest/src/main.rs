@@ -24,6 +24,23 @@
 //! `KtestConfig::DEFAULT.shutdown_policy`, or exits its thread.
 //!
 //! See `core/ktest/README.md` for the full test structure and output format.
+//!
+//! # Scratch VAs
+//!
+//! Tests map, unmap, and reprotect pages of ktest's own address space only at
+//! scratch VAs: the low band `[0x1_4000_0000, 0x2_0000_0000)`, the high band
+//! `[0x3E_0000_0000, 0x3F_0000_0000)`, and, on x86-64, the top two pages of
+//! the user half. ktest's own memory lies in none of them: the kernel places its
+//! image (every static: child stacks, IPC pages, argument blocks), its boot
+//! stack, and its `InitInfo` page in the `shared/process-layout` windows
+//! (`0x21_0000_0000` up to the image window's end below `0x38_4000_0000`) or
+//! at the kernel's fallback addresses above `0x3F_FFFF_0000`; the framebuffer
+//! and serial MMIO mappings end below the low band ([`SCRATCH_LOW_BASE`],
+//! checked where they are mapped); ktest has no heap. A test
+//! that forms a Rust reference into a scratch page ends it before the page is
+//! unmapped or remapped, so a mapping change at a scratch VA meets the
+//! `# Safety` contracts of `syscall::mem_map` and its siblings. Tests run one
+//! at a time; children reach a scratch page only as their test directs.
 
 #![no_std]
 #![no_main]
@@ -43,6 +60,10 @@ mod spawn;
 mod stress;
 mod tally;
 mod unit;
+
+/// Base of the low scratch band (crate docs § Scratch VAs); ktest's fixed
+/// device mappings end below it.
+pub(crate) const SCRATCH_LOW_BASE: u64 = 0x1_4000_0000;
 
 // ── Test infrastructure ───────────────────────────────────────────────────────
 
@@ -199,7 +220,15 @@ pub struct TestContext
 /// `thread_configure` as the initial stack pointer.
 ///
 /// Each test file that needs a child thread declares its own static stack so
-/// stacks never alias across concurrent (or sequential) test boundaries.
+/// stacks never alias across concurrent (or sequential) test boundaries. A
+/// stack is handed to one thread at a time: a test starts a child on it only
+/// once the stack's previous child has exited or never started, which is
+/// what `spawn::configure_and_start`'s contract asks of the caller. Every
+/// test reaps its children before it returns `Ok`; the rule is therefore
+/// guaranteed for the stacks of passing tests only. A test that returns `Err`
+/// early can leave a child alive, and a later reuse of its stack is outside
+/// the rule; ktest's run has then already failed. Reaping children on every
+/// exit path is #580.
 // Field is CPU stack memory; only the hardware stack pointer accesses it, not Rust code.
 #[allow(dead_code)]
 #[repr(align(16))]
@@ -225,17 +254,41 @@ impl ChildStack
 
 /// Static IPC buffer — 4 KiB, page-aligned.
 ///
-/// Registered once in `run()` via `ipc_buffer_set`. The kernel writes received
-/// message data and capability slot indices here; the `ipc::IpcMessage`
-/// wrappers snapshot those values into a stack-owned message before returning,
-/// so tests read from the returned `IpcMessage` rather than from the buffer
-/// directly.
+/// Registered once in `run()` via `ipc_buffer_set`, for ktest's main thread
+/// alone. The kernel writes received message data and capability slot indices
+/// here; the `ipc::IpcMessage` wrappers snapshot those values into a
+/// stack-owned message before returning, so tests read from the returned
+/// `IpcMessage` rather than from the buffer directly. A child thread that
+/// runs IPC registers an [`IpcPage`] of its own.
 #[repr(C, align(4096))]
 struct IpcBuf([u64; 512]);
 
-// SAFETY: ktest is single-threaded on the main test path. Child threads that
-// need IPC data transfer must register this buffer via ipc_buffer_set.
 pub(crate) static mut IPC_BUF: IpcBuf = IpcBuf([0u64; 512]);
+
+/// A page-aligned IPC buffer page for one child thread.
+///
+/// Declare one per concurrently running child as a `static mut` (or an array
+/// of them), as for [`ChildStack`], and have the child register it with
+/// `ipc_buffer_set` before its first IPC. A page serves one thread at a time:
+/// a child registers it only once the page's previous user has exited, with
+/// the same passing-tests scope as the [`ChildStack`] rule.
+#[repr(C, align(4096))]
+pub struct IpcPage([u64; 512]);
+
+impl IpcPage
+{
+    pub const ZERO: IpcPage = IpcPage([0u64; 512]);
+
+    /// Address of the page at `ptr`, the value to pass to `ipc_buffer_set`.
+    ///
+    /// Takes a raw pointer to avoid creating a reference to a `static mut` —
+    /// pass `core::ptr::addr_of_mut!(PAGE)`.
+    #[must_use]
+    pub fn addr(ptr: *mut Self) -> u64
+    {
+        ptr as u64
+    }
+}
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -333,9 +386,12 @@ extern "C" fn run(info_ptr: u64) -> !
 
     // Register the IPC buffer before any IPC syscall. All Tier 1 IPC tests
     // and integration tests depend on this.
-    // SAFETY: IPC_BUF is a page-aligned static in ktest's BSS; single-threaded here.
     let ipc_buf_ptr = core::ptr::addr_of_mut!(IPC_BUF).cast::<u64>();
-    syscall::ipc_buffer_set(ipc_buf_ptr as u64).unwrap_or_else(|_| {
+    // SAFETY: IPC_BUF is a page-aligned static in ktest's BSS, registered by
+    // the main thread alone (children register their own `IpcPage`); no Rust
+    // object lives in it besides the buffer, which ktest reaches only through
+    // the raw `ipc_buf` pointer, holding no reference across an IPC syscall.
+    unsafe { syscall::ipc_buffer_set(ipc_buf_ptr as u64) }.unwrap_or_else(|_| {
         log("ktest: FATAL: ipc_buffer_set failed");
         halt()
     });

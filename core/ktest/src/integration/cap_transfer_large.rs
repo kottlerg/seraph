@@ -124,7 +124,10 @@ fn run_round(ctx: &TestContext, round: usize, order: Order) -> TestResult
         .map_err(|_| "integration::cap_transfer_large: cap_create_thread failed")?;
     // SAFETY: one stack per round; the round's child is the only user.
     let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(CHILD_STACKS[round]) });
-    thread_configure(th, child_entry as *const () as u64, stack_top, child_arg)
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe { thread_configure(th, child_entry as *const () as u64, stack_top, child_arg) }
         .map_err(|_| "integration::cap_transfer_large: thread_configure failed")?;
     thread_start(th).map_err(|_| "integration::cap_transfer_large: thread_start failed")?;
 
@@ -180,6 +183,9 @@ fn run_round(ctx: &TestContext, round: usize, order: Order) -> TestResult
     Ok(())
 }
 
+/// IPC page of the [`child_entry`] child.
+static mut CHILD_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
 /// `arg`: address of the child's [`ChildArgs`].
 extern "C" fn child_entry(arg: u64) -> !
 {
@@ -196,8 +202,11 @@ extern "C" fn child_entry(arg: u64) -> !
         thread_exit()
     };
 
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(CHILD_IPC_PAGE));
+    // SAFETY: `CHILD_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         fail();
     }

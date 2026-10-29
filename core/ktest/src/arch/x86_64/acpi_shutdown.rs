@@ -102,7 +102,9 @@ fn locate_fadt_fields(info: &InitInfo) -> Option<(u16, u64)>
     // whose X_DSDT would cross the region's end is refused unread.
     if table_off as u64 + FADT_END as u64 > region_size
     {
-        let _ = syscall::mem_unmap(info.aspace_cap, ACPI_MAP_BASE, pages);
+        // SAFETY: `ACPI_MAP_BASE` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        let _ = unsafe { syscall::mem_unmap(info.aspace_cap, ACPI_MAP_BASE, pages) };
         return None;
     }
     let table_vaddr = ACPI_MAP_BASE + (region_phys & 0xFFF) + table_off as u64;
@@ -126,7 +128,9 @@ fn locate_fadt_fields(info: &InitInfo) -> Option<(u16, u64)>
         u64::from(dsdt32)
     };
 
-    let _ = syscall::mem_unmap(info.aspace_cap, ACPI_MAP_BASE, pages);
+    // SAFETY: `ACPI_MAP_BASE` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    let _ = unsafe { syscall::mem_unmap(info.aspace_cap, ACPI_MAP_BASE, pages) };
     Some((pm1a, dsdt_phys))
 }
 
@@ -154,14 +158,18 @@ fn locate_and_parse_dsdt(info: &InitInfo, dsdt_phys: u64) -> Option<u16>
         let region_size = d.aux1;
         let pages = pages_for(region_phys, region_size);
         let vaddr = ACPI_MAP_BASE + 0x10_0000;
-        if syscall::mem_map(
-            d.slot,
-            info.aspace_cap,
-            vaddr,
-            0,
-            pages,
-            syscall::MAP_READONLY,
-        )
+        // SAFETY: `vaddr` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe {
+            syscall::mem_map(
+                d.slot,
+                info.aspace_cap,
+                vaddr,
+                0,
+                pages,
+                syscall::MAP_READONLY,
+            )
+        }
         .is_err()
         {
             continue;
@@ -170,7 +178,9 @@ fn locate_and_parse_dsdt(info: &InitInfo, dsdt_phys: u64) -> Option<u16>
         let table_off = dsdt_phys - region_phys;
         let dsdt_vaddr = vaddr + (region_phys & 0xFFF) + table_off;
         let result = parse_mapped_dsdt(dsdt_vaddr, region_size - table_off);
-        let _ = syscall::mem_unmap(info.aspace_cap, vaddr, pages);
+        // SAFETY: `vaddr` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        let _ = unsafe { syscall::mem_unmap(info.aspace_cap, vaddr, pages) };
         return result;
     }
     None
@@ -223,14 +233,18 @@ fn find_table_in_acpi_regions(
         let region_phys = d.aux0;
         let region_size = d.aux1;
         let pages = pages_for(region_phys, region_size);
-        if syscall::mem_map(
-            d.slot,
-            info.aspace_cap,
-            map_vaddr,
-            0,
-            pages,
-            syscall::MAP_READONLY,
-        )
+        // SAFETY: `map_vaddr` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if unsafe {
+            syscall::mem_map(
+                d.slot,
+                info.aspace_cap,
+                map_vaddr,
+                0,
+                pages,
+                syscall::MAP_READONLY,
+            )
+        }
         .is_err()
         {
             continue;
@@ -242,7 +256,9 @@ fn find_table_in_acpi_regions(
             return Some((d.slot, region_phys, region_size, off));
         }
 
-        let _ = syscall::mem_unmap(info.aspace_cap, map_vaddr, pages);
+        // SAFETY: `map_vaddr` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        let _ = unsafe { syscall::mem_unmap(info.aspace_cap, map_vaddr, pages) };
     }
     None
 }

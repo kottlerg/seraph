@@ -451,7 +451,10 @@ fn create_thread(
     // handler, and syncer; stress tests run sequentially, and the faulter's
     // stack is reused only after the thread on it exited and was deleted.
     let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack]) });
-    thread_configure(th, entry as *const () as u64, top, arg)
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe { thread_configure(th, entry as *const () as u64, top, arg) }
         .map_err(|_| "stress::stop_fault_sender: thread_configure failed")?;
     thread_set_affinity(th, cpu).map_err(|_| "stress::stop_fault_sender: pin thread failed")
 }
@@ -708,7 +711,9 @@ fn faulter_died(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally, reason:
     }
     tally.killed += 1;
     call_handler(parts, SYNC_LABEL)?;
-    mem_unmap(ctx.aspace_cap, RESERVED_VA, 1)
+    // SAFETY: `RESERVED_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    unsafe { mem_unmap(ctx.aspace_cap, RESERVED_VA, 1) }
         .map_err(|_| "stress::stop_fault_sender: unmap after a death failed")?;
     if let Some(th) = parts.faulter.take()
     {
@@ -836,7 +841,9 @@ fn release(ctx: &TestContext, parts: &Parts) -> TestResult
     {
         ok &= cap_delete(th).is_ok();
     }
-    let unmapped = mem_unmap(ctx.aspace_cap, RESERVED_VA, 1).is_ok();
+    // SAFETY: `RESERVED_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    let unmapped = unsafe { mem_unmap(ctx.aspace_cap, RESERVED_VA, 1) }.is_ok();
     ok &= unmapped;
     if let Some(frame) = parts.frame.filter(|_| unmapped)
     {
@@ -875,7 +882,9 @@ extern "C" fn faulter_entry(arg: u64) -> !
         unsafe {
             page.write_volatile(u64::from(attempt));
         }
-        if let Err(e) = mem_unmap(aspace, RESERVED_VA, 1)
+        // SAFETY: `RESERVED_VA` is a scratch VA (crate docs § Scratch VAs), so the
+        // span holds no Rust object or IPC page of ktest.
+        if let Err(e) = unsafe { mem_unmap(aspace, RESERVED_VA, 1) }
         {
             UNMAP_FAILED.record_error(e);
         }
@@ -896,7 +905,10 @@ extern "C" fn handler_entry(arg: u64) -> !
     // SAFETY: sole user of HANDLER_IPC_BUF (one handler per test; stress
     // tests run sequentially).
     let buf = core::ptr::addr_of_mut!(HANDLER_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }
@@ -974,7 +986,9 @@ extern "C" fn handler_entry(arg: u64) -> !
 /// and the fault declined, so the faulter does not re-fault for good.
 fn service_fault(args: &HandlerArgs, buf: *mut u64)
 {
-    let mapped = mem_map(args.frame, args.aspace, RESERVED_VA, 0, 1, MAP_WRITABLE);
+    // SAFETY: `args.aspace` is an address space this test created, not ktest's
+    // own, so the call changes nothing ktest runs on.
+    let mapped = unsafe { mem_map(args.frame, args.aspace, RESERVED_VA, 0, 1, MAP_WRITABLE) };
     let disposition = match mapped
     {
         Ok(()) => FAULT_REPLY_RESUME,
@@ -1015,7 +1029,10 @@ extern "C" fn syncer_entry(arg: u64) -> !
     // SAFETY: sole user of SYNCER_IPC_BUF (one syncer per test; stress tests
     // run sequentially).
     let buf = core::ptr::addr_of_mut!(SYNCER_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }

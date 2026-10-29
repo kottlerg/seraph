@@ -108,7 +108,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "priority_preemption: cap_copy hog_done failed")?;
     let hog_arg = u64::from(hog_done) | (0x1u64 << 32);
     let hog_stack = ChildStack::top(core::ptr::addr_of!(HOG_STACK));
-    crate::spawn::configure_and_start_pinned(&hog, hog_entry, hog_stack, hog_arg, 0)
+    // SAFETY: the stack is `HOG_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start_pinned(&hog, hog_entry, hog_stack, hog_arg, 0) }
         .map_err(|_| "priority_preemption: hog configure_and_start_pinned failed")?;
 
     // Sleep so the hog (strictly below this thread's INIT_PRIORITY) gets
@@ -126,13 +128,17 @@ pub fn run(ctx: &TestContext) -> TestResult
     let budget_us = crate::scaled_bound(PREEMPT_BUDGET_US);
     let t_made_runnable = system_info(SystemInfoType::ElapsedUs as u64)
         .map_err(|_| "priority_preemption: system_info before configure failed")?;
-    crate::spawn::configure_and_start_pinned(
-        &elevated,
-        elevated_entry,
-        elevated_stack,
-        elevated_arg,
-        0,
-    )
+    // SAFETY: the stack is `ELEVATED_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start_pinned(
+            &elevated,
+            elevated_entry,
+            elevated_stack,
+            elevated_arg,
+            0,
+        )
+    }
     .map_err(|_| "priority_preemption: elevated configure_and_start_pinned failed")?;
 
     // Wait for either notification: elevated bit 0x2 means preemption succeeded,

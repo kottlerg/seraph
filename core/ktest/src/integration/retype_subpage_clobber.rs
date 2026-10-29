@@ -48,7 +48,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Map the cap region's first page writable before any retype: a mapping
     // made after them is refused.
-    mem_map(memory_cap, ctx.aspace_cap, CLOBBER_VA, 0, 1, MAP_WRITABLE)
+    // SAFETY: `CLOBBER_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    unsafe { mem_map(memory_cap, ctx.aspace_cap, CLOBBER_VA, 0, 1, MAP_WRITABLE) }
         .map_err(|_| "integration::retype_subpage_clobber: mem_map failed")?;
 
     // Two sub-page (BIN_128) retypes: `a` lands at offset 0 of the virgin
@@ -66,7 +68,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     // SAFETY: CLOBBER_VA..+8 is mapped writable above and exclusively
     // owned by this thread for the duration of the write.
     unsafe { core::ptr::write_volatile(CLOBBER_VA as *mut u64, POISON) };
-    mem_unmap(ctx.aspace_cap, CLOBBER_VA, 1)
+    // SAFETY: `CLOBBER_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    unsafe { mem_unmap(ctx.aspace_cap, CLOBBER_VA, 1) }
         .map_err(|_| "integration::retype_subpage_clobber: mem_unmap failed")?;
 
     // Drive another sub-page retype. The allocator pops the valid head

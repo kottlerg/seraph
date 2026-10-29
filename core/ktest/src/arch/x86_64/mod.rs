@@ -78,6 +78,26 @@ pub const TRAP_FRAME_BYTES: u64 = syscall_abi::REGS_X86_64_SIZE as u64;
 /// field a register-file edit redirects.
 pub const IP_OFFSET: usize = syscall_abi::REGS_X86_64_IP_OFFSET;
 
+/// End of the window the framebuffer is mapped into from `FB_VA`: the low
+/// scratch band, as x86-64 maps no other fixed device window (its serial
+/// port is I/O-port based).
+pub const FB_WINDOW_END: u64 = crate::SCRATCH_LOW_BASE;
+
+/// Byte offset of the stack pointer (`rsp`) in the register file.
+pub const SP_OFFSET: usize = syscall_abi::REGS_X86_64_SP_OFFSET;
+
+/// The stack pointer an `extern "C"` function expects on entry, at or below
+/// `sp`: the System V ABI enters a function with `rsp + 8` 16-byte aligned (a
+/// return address just pushed), so a frame redirected into an entry gets
+/// `(sp & !0xF) - 8`, at most 24 bytes below `sp`. A user stack pointer is
+/// never below 16; the subtraction wraps rather than panics for one that is,
+/// and the kernel refuses the resulting non-user stack pointer.
+#[must_use]
+pub const fn entry_stack_pointer(sp: u64) -> u64
+{
+    (sp & !0xF).wrapping_sub(8)
+}
+
 /// Byte offset of the syscall-number register (`rax`) in the kernel
 /// `TrapFrame`: it holds the number of the syscall a thread is blocked in
 /// until the dispatcher writes the return value on the way out.

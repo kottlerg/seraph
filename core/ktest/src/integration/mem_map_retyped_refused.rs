@@ -72,13 +72,16 @@ fn probe(ctx: &TestContext, grant: u32, cs: u32) -> TestResult
     {
         for prot in [MAP_WRITABLE, MAP_READ]
         {
-            match mem_map(grant, ctx.aspace_cap, PROBE_VA, page, 1, prot)
+            // SAFETY: `PROBE_VA` is a scratch VA (crate docs § Scratch VAs), so
+            // the span holds no Rust object or IPC page of ktest.
+            match unsafe { mem_map(grant, ctx.aspace_cap, PROBE_VA, page, 1, prot) }
             {
                 Err(e) if e == refused =>
                 {}
                 Ok(()) =>
                 {
-                    mem_unmap(ctx.aspace_cap, PROBE_VA, 1).ok();
+                    // SAFETY: as for the map above.
+                    unsafe { mem_unmap(ctx.aspace_cap, PROBE_VA, 1) }.ok();
                     return Err("integration::mem_map_retyped_refused: a retyped page was mapped");
                 }
                 Err(_) =>
@@ -91,10 +94,13 @@ fn probe(ctx: &TestContext, grant: u32, cs: u32) -> TestResult
         }
     }
 
-    mem_map(grant, ctx.aspace_cap, PROBE_VA, 2, 1, MAP_WRITABLE).map_err(
+    // SAFETY: `PROBE_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    unsafe { mem_map(grant, ctx.aspace_cap, PROBE_VA, 2, 1, MAP_WRITABLE) }.map_err(
         |_| "integration::mem_map_retyped_refused: the page past the retype cursor was refused",
     )?;
-    mem_unmap(ctx.aspace_cap, PROBE_VA, 1)
+    // SAFETY: as for the map above.
+    unsafe { mem_unmap(ctx.aspace_cap, PROBE_VA, 1) }
         .map_err(|_| "integration::mem_map_retyped_refused: mem_unmap failed")?;
     Ok(())
 }

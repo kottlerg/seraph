@@ -64,6 +64,22 @@ pub const TRAP_FRAME_BYTES: u64 = syscall_abi::REGS_RISCV64_SIZE as u64;
 /// field a register-file edit redirects.
 pub const IP_OFFSET: usize = syscall_abi::REGS_RISCV64_IP_OFFSET;
 
+/// End of the window the framebuffer is mapped into from `FB_VA`: the UART
+/// window at `serial::SERIAL_VA`, the next fixed device mapping above it.
+pub const FB_WINDOW_END: u64 = serial::SERIAL_VA;
+
+/// Byte offset of the stack pointer (`sp`) in the register file.
+pub const SP_OFFSET: usize = syscall_abi::REGS_RISCV64_SP_OFFSET;
+
+/// The stack pointer an `extern "C"` function expects on entry, at or below
+/// `sp`: the RISC-V psABI keeps `sp` 16-byte aligned at every call, so a frame
+/// redirected into an entry gets `sp & !0xF`, at most 15 bytes below `sp`.
+#[must_use]
+pub const fn entry_stack_pointer(sp: u64) -> u64
+{
+    sp & !0xF
+}
+
 /// Byte offset of the syscall-number register (`a7`) in the kernel
 /// `TrapFrame`: it holds the number of the syscall a thread is blocked in, and
 /// no syscall return writes it.

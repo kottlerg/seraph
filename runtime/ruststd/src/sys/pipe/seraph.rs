@@ -47,6 +47,11 @@ use syscall_abi::SyscallError;
 /// data area; largest power of two ≤ 4080 is 2048.
 pub const RING_CAPACITY: u32 = 2048;
 
+/// The error a ring half reports when the shared header's capacity is not
+/// [`RING_CAPACITY`].
+const BAD_RING: io::Error =
+    io::const_error!(io::ErrorKind::InvalidData, "seraph pipe: ring header capacity mismatch");
+
 // Ring VAs come from the process's page-reservation arena
 // (`sys::reserve::seraph`), so they inherit the arena's per-process
 // randomised base (ASLR, #39). The count of outstanding pipe rings is
@@ -232,16 +237,22 @@ impl Pipe {
         unsafe { &*(self.ring_vaddr as *const SpscHeader) }
     }
 
-    fn writer(&self) -> SpscWriter<'_> {
-        // SAFETY: header at ring_vaddr is initialised; this Pipe holds
-        // exclusive access to the writer half (callers honour the SPSC
-        // single-writer invariant via &mut on Stdio wrappers).
-        unsafe { SpscWriter::from_raw(self.ring_vaddr) }
+    /// The writer half over this pipe's ring, or `InvalidData` when the
+    /// ring header's capacity is not the [`RING_CAPACITY`] this end mapped
+    /// (a peer rewrote it).
+    fn writer(&self) -> io::Result<SpscWriter<'_>> {
+        // SAFETY: ring_vaddr names the one page this Pipe maps read-write
+        // for its lifetime (the borrow of `self` bounds the half's), holding
+        // an initialised header plus RING_CAPACITY body bytes; this Pipe
+        // holds exclusive access to the writer half (callers honour the
+        // SPSC single-writer invariant via &mut on Stdio wrappers).
+        unsafe { SpscWriter::from_raw(self.ring_vaddr, RING_CAPACITY) }.ok_or(BAD_RING)
     }
 
-    fn reader(&self) -> SpscReader<'_> {
+    /// The reader half over this pipe's ring; refused as for [`Self::writer`].
+    fn reader(&self) -> io::Result<SpscReader<'_>> {
         // SAFETY: as above, single-reader half.
-        unsafe { SpscReader::from_raw(self.ring_vaddr) }
+        unsafe { SpscReader::from_raw(self.ring_vaddr, RING_CAPACITY) }.ok_or(BAD_RING)
     }
 
     /// Allocate a fresh shmem page + two notifications, map the page at a
@@ -290,7 +301,13 @@ impl Pipe {
         // the original stays clean for the child handoff derivations.
         let map_result = syscall::cap_derive(memory_cap, syscall::RIGHTS_MEM_MAP_RW)
             .and_then(|rw| {
-                let r = syscall::mem_map(rw, aspace, parent_va, 0, 1, syscall::MAP_WRITABLE);
+                // SAFETY: parent_va is a page reserved above from the
+                // per-process reservation arena (`sys::reserve`), which hands
+                // out VA no Rust object or IPC page occupies, and this call
+                // owns it exclusively.
+                let r = unsafe {
+                    syscall::mem_map(rw, aspace, parent_va, 0, 1, syscall::MAP_WRITABLE)
+                };
                 let _ = syscall::cap_delete(rw);
                 r
             });
@@ -317,7 +334,9 @@ impl Pipe {
         {
             Ok(s) => s,
             Err(e) => {
-                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
+                // SAFETY: `reserved` holds the ring page mapped above, and
+                // no Pipe has been built over it yet.
+                unsafe { discard_mapped_ring(aspace, memory_cap, ring_phys, reserved) };
                 return Err(e);
             }
         };
@@ -329,7 +348,9 @@ impl Pipe {
             Ok(s) => s,
             Err(e) => {
                 let _ = syscall::cap_delete(data_notification);
-                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
+                // SAFETY: `reserved` holds the ring page mapped above, and
+                // no Pipe has been built over it yet.
+                unsafe { discard_mapped_ring(aspace, memory_cap, ring_phys, reserved) };
                 return Err(e);
             }
         };
@@ -344,7 +365,9 @@ impl Pipe {
             Err(_) => {
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
-                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
+                // SAFETY: `reserved` holds the ring page mapped above, and
+                // no Pipe has been built over it yet.
+                unsafe { discard_mapped_ring(aspace, memory_cap, ring_phys, reserved) };
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (memory handoff) failed",
                 ));
@@ -356,7 +379,9 @@ impl Pipe {
                 let _ = syscall::cap_delete(memory_handoff);
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
-                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
+                // SAFETY: `reserved` holds the ring page mapped above, and
+                // no Pipe has been built over it yet.
+                unsafe { discard_mapped_ring(aspace, memory_cap, ring_phys, reserved) };
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (data handoff) failed",
                 ));
@@ -369,7 +394,9 @@ impl Pipe {
                 let _ = syscall::cap_delete(memory_handoff);
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
-                discard_mapped_ring(aspace, memory_cap, ring_phys, reserved);
+                // SAFETY: `reserved` holds the ring page mapped above, and
+                // no Pipe has been built over it yet.
+                unsafe { discard_mapped_ring(aspace, memory_cap, ring_phys, reserved) };
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (space handoff) failed",
                 ));
@@ -411,7 +438,10 @@ impl Pipe {
     ) -> io::Result<Pipe> {
         let child_va = reserved.va_start();
         let memory_caps = [memory_cap, 0, 0, 0];
-        match SharedBuffer::attach(&memory_caps, 1, aspace, child_va) {
+        // SAFETY: child_va is the caller's reservation from the per-process
+        // arena (`sys::reserve`): VA no Rust object or IPC page occupies, owned
+        // exclusively by this pipe until its Drop unmaps it and returns it.
+        match unsafe { SharedBuffer::attach(&memory_caps, 1, aspace, child_va) } {
             // Same forget-the-SharedBuffer trick: Pipe's Drop unmaps.
             Ok(sb) => core::mem::forget(sb),
             Err(_) => {
@@ -513,7 +543,7 @@ impl Pipe {
             // flag load. Bytes another thread writes after a concurrent
             // close may go unseen (module doc).
             let eof = self.header().is_closed() || self.peer_dead();
-            let mut reader = self.reader();
+            let mut reader = self.reader()?;
             let n = reader.read(buf);
             if n > 0 {
                 // Wake any blocked writer that's waiting for space.
@@ -602,7 +632,7 @@ impl Pipe {
                     "seraph pipe: peer died abnormally",
                 ));
             }
-            let mut writer = self.writer();
+            let mut writer = self.writer()?;
             let n = writer.write(buf);
             if n > 0 {
                 // Wake any blocked reader.
@@ -682,7 +712,10 @@ impl Drop for Pipe {
     fn drop(&mut self) {
         self.close();
         // Unmap the ring page from this process's aspace.
-        let unmapped = syscall::mem_unmap(self.aspace, self.ring_vaddr, 1).is_ok();
+        // SAFETY: ring_vaddr is this pipe's reserved ring page; the ring
+        // halves borrow `self`, so none is live in Drop, and no other Rust
+        // object lies in the page.
+        let unmapped = unsafe { syscall::mem_unmap(self.aspace, self.ring_vaddr, 1) }.is_ok();
         // Release this side's cap slots. The peer's Drop releases its
         // own copies; the underlying kernel objects free when refcount
         // hits zero.
@@ -719,8 +752,19 @@ impl Drop for Pipe {
 /// `aspace`. The page returns to memmgr and its VA to the arena only once
 /// the unmap succeeds; a page still mapped stays held, with its VA, until
 /// this process exits, as in `Pipe::drop`.
-fn discard_mapped_ring(aspace: u32, memory_cap: u32, ring_phys: u64, reserved: ReservedRange) {
-    let unmapped = syscall::mem_unmap(aspace, reserved.va_start(), 1).is_ok();
+///
+/// # Safety
+/// `reserved` must be the arena reservation the ring page is mapped at, and
+/// no Rust reference into the page may be live (no `Pipe` was built over it).
+unsafe fn discard_mapped_ring(
+    aspace: u32,
+    memory_cap: u32,
+    ring_phys: u64,
+    reserved: ReservedRange,
+) {
+    // SAFETY: the caller's contract: `reserved` is the ring page's own arena
+    // reservation and nothing references the page.
+    let unmapped = unsafe { syscall::mem_unmap(aspace, reserved.va_start(), 1) }.is_ok();
     let _ = syscall::cap_delete(memory_cap);
     if unmapped {
         crate::sys::alloc::seraph::slab_release_fresh(ring_phys);

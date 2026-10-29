@@ -285,24 +285,36 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    // Compute the VA reservation: `stride * height` rounded up to
-    // 4 KiB pages, matching the bootloader's aperture seed.
+    // Compute the VA reservation: the page-aligned aperture covering
+    // `[physical_base, physical_base + stride * height)`, the same span
+    // devmgr carves the `Mmio` cap over (`spawn_framebuffer`), so the
+    // whole-region mapping fits the reservation.
     let span = u64::from(fb_info.stride) * u64::from(fb_info.height);
-    let total_pages = span.div_ceil(0x1000);
-    if total_pages == 0
+    let in_page = fb_info.physical_base & 0xFFF;
+    let total_pages = (in_page + span).div_ceil(0x1000);
+    if span == 0
     {
         syscall::thread_exit();
     }
 
-    let Some(base) = arch::current::fb_mmio_init(info.self_aspace, caps.mmio_cap, total_pages)
+    // SAFETY: `info.self_aspace` is this process's address space, and devmgr
+    // carves the framebuffer `Mmio` cap over exactly the page-aligned
+    // aperture of the geometry it reports here (`spawn_framebuffer`), so the
+    // region spans `total_pages` pages.
+    let Some(aperture) =
+        (unsafe { arch::current::fb_mmio_init(info.self_aspace, caps.mmio_cap, total_pages) })
     else
     {
         syscall::thread_exit();
     };
+    let in_page_bytes = usize::try_from(in_page).unwrap_or(0);
+    // SAFETY: `in_page_bytes` is below one page, inside the mapping.
+    let base = unsafe { aperture.add(in_page_bytes) };
 
-    // SAFETY: arch::fb_mmio_init mapped total_pages pages, which cover
-    // `stride * height` bytes, writable at `base`; `new` validates the
-    // geometry itself and returns None for a framebuffer it cannot drive.
+    // SAFETY: arch::fb_mmio_init mapped total_pages pages from `aperture`,
+    // which cover the `stride * height` bytes from `base`, writable; `new`
+    // validates the geometry itself and returns None for a framebuffer it
+    // cannot drive.
     let Some(writer) = (unsafe { render::FramebufferWriter::new(base, &fb_info) })
     else
     {

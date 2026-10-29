@@ -119,7 +119,10 @@ pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
     };
     let stack_top = ChildStack::top(core::ptr::addr_of!(BENCH_SIGNAL_STACK));
 
-    if spawn::configure_and_start(&child, notification_pong_entry, stack_top, arg).is_err()
+    // SAFETY: the stack is `BENCH_SIGNAL_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    if unsafe { spawn::configure_and_start(&child, notification_pong_entry, stack_top, arg) }
+        .is_err()
     {
         return;
     }

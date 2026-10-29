@@ -40,8 +40,12 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         // SAFETY: Sequential execution; only one child uses STRESS_STACKS[0] at a time.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
-        spawn::configure_and_start(&child, churn_entry, stack_top, u64::from(child_done))
-            .map_err(|_| "thread_churn: configure_and_start failed")?;
+        // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe {
+            spawn::configure_and_start(&child, churn_entry, stack_top, u64::from(child_done))
+        }
+        .map_err(|_| "thread_churn: configure_and_start failed")?;
 
         // Wait, bounded, for the child to complete.
         let mut bits = 0u64;

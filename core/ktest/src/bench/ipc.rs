@@ -35,6 +35,9 @@ static CALLER_ARGS: spawn::ArgBlock<CallerArgs, 1> = spawn::ArgBlock::new(Caller
     n: 0,
 });
 
+/// IPC page of the [`ipc_caller_entry`] child.
+static mut IPC_CALLER_IPC_PAGE: crate::IpcPage = crate::IpcPage::ZERO;
+
 extern "C" fn ipc_caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the bench published for this child.
@@ -44,9 +47,11 @@ extern "C" fn ipc_caller_entry(arg: u64) -> !
         n,
     } = unsafe { spawn::child_args(arg) };
 
-    // Register the shared IPC buffer for this child thread.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    let buf_addr = crate::IpcPage::addr(core::ptr::addr_of_mut!(IPC_CALLER_IPC_PAGE));
+    // SAFETY: `IPC_CALLER_IPC_PAGE` is this child's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         notification_send(done_slot, 1).ok();
         thread_exit()
@@ -135,7 +140,9 @@ fn run_round_trips(
     };
     let stack_top = ChildStack::top(core::ptr::addr_of!(BENCH_IPC_STACK));
 
-    if spawn::configure_and_start(child, ipc_caller_entry, stack_top, arg).is_err()
+    // SAFETY: the stack is `BENCH_IPC_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    if unsafe { spawn::configure_and_start(child, ipc_caller_entry, stack_top, arg) }.is_err()
     {
         return;
     }

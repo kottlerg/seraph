@@ -36,12 +36,22 @@ pub fn serial_init(info: &InitInfo, _thread_cap: u32)
             break;
         }
     }
-    let Some((slot, base, _size)) = aperture
+    let Some((slot, base, size)) = aperture
     else
     {
         return;
     };
-    if syscall::mmio_map(info.aspace_cap, slot, SERIAL_VA, 0).is_err()
+    // The whole aperture is mapped from SERIAL_VA, so it must end below the
+    // next page of init's VA plan, the main thread's IPC buffer.
+    if size > crate::INIT_IPC_BUF_VA - SERIAL_VA
+    {
+        return;
+    }
+    // SAFETY: `info.aspace_cap` is init's own address space; the span
+    // `[SERIAL_VA, SERIAL_VA + size)` lies in init's private VA plan below
+    // INIT_IPC_BUF_VA (checked above), where nothing else is mapped and no
+    // Rust object lies.
+    if unsafe { syscall::mmio_map(info.aspace_cap, slot, SERIAL_VA, 0) }.is_err()
     {
         return;
     }

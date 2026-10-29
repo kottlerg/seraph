@@ -265,11 +265,10 @@ impl Heap {
     /// then a later batch fails) still adds the mapped pages to the free
     /// list and advances `mapped_end` past them (see [`Self::grow_exact`]).
     ///
-    /// # Safety
-    /// Caller must hold the heap lock. IPC wrappers and `mem_map` are
+    /// Called with the heap lock held. IPC wrappers and `mem_map` are
     /// themselves non-allocating — the bootstrap IPC buffer is the
-    /// pre-registered page, not heap-backed — so `grow` is safe to call
-    /// under the allocator lock without re-entrant allocation.
+    /// pre-registered page, not heap-backed — so `grow` runs under the
+    /// allocator lock without re-entrant allocation.
     fn grow(&mut self, want_bytes: usize) -> bool {
         if self.memmgr_ep == 0 || self.self_aspace == 0 {
             return false;
@@ -291,7 +290,10 @@ impl Heap {
             return false;
         }
 
-        self.grow_exact(pages, start_va)
+        // SAFETY: `[start_va, start_va + pages * PAGE_SIZE)` lies in the
+        // heap's zone at or above `mapped_end` and below `max`, which only
+        // this heap maps and where nothing is mapped yet.
+        unsafe { self.grow_exact(pages, start_va) }
     }
 
     /// Request and map exactly `pages` pages starting at `start_va`,
@@ -313,7 +315,13 @@ impl Heap {
     /// earlier round, are still added to the free list with `mapped_end`
     /// advanced past them, so a later grow maps above them rather than over
     /// them.
-    fn grow_exact(&mut self, pages: u64, start_va: u64) -> bool {
+    ///
+    /// # Safety
+    /// `[start_va, start_va + pages * PAGE_SIZE)` must lie in this heap's
+    /// zone (`HEAP_SPAN` from the drawn base, which nothing else in the
+    /// process maps) at or above `mapped_end`, so no live Rust object or IPC
+    /// page lies in it.
+    unsafe fn grow_exact(&mut self, pages: u64, start_va: u64) -> bool {
         // Read the calling thread's registered IPC buffer from TLS. The
         // kernel services `ipc_call` by reading the payload from that
         // thread's `tcb.ipc_buffer`; targeting any other VA silently
@@ -360,8 +368,14 @@ impl Heap {
                     break;
                 }
                 let va = start_va + mapped * PAGE_SIZE;
-                if !self.mem_map_with_augment_retry(cap_slot, va, pages_in_cap) {
-                    keep_failed = syscall::mem_unmap(self.self_aspace, va, pages_in_cap).is_err();
+                // SAFETY: `va` and the cap's pages lie in the unmapped part of
+                // the heap zone the caller's contract names (`mapped` never
+                // exceeds `pages`).
+                if !unsafe { self.mem_map_with_augment_retry(cap_slot, va, pages_in_cap) } {
+                    // SAFETY: the same span, which nothing but this failed map
+                    // touched.
+                    keep_failed =
+                        unsafe { syscall::mem_unmap(self.self_aspace, va, pages_in_cap) }.is_err();
                     break;
                 }
                 mapped += pages_in_cap;
@@ -397,10 +411,15 @@ impl Heap {
     /// memmgr, augment the AS via `cap_create_aspace(memory_cap, self_aspace,
     /// init_pages=1)`, and retry the map — augmenting up to `PT_FUND_ROUNDS`
     /// times. If the map still fails the caller treats the grow as failed.
-    fn mem_map_with_augment_retry(&self, memory_cap: u32, va: u64, pages: u64) -> bool {
+    ///
+    /// # Safety
+    /// The contract of `syscall::mem_map` for `pages` pages at `va` in this
+    /// process's own address space.
+    unsafe fn mem_map_with_augment_retry(&self, memory_cap: u32, va: u64, pages: u64) -> bool {
         const SYSCALL_OUT_OF_MEMORY: i64 = -8;
         for _ in 0..PT_FUND_ROUNDS {
-            match syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) {
+            // SAFETY: the caller's contract covers the span.
+            match unsafe { syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) } {
                 Ok(()) => return true,
                 Err(SYSCALL_OUT_OF_MEMORY) => { /* fall through to augment + retry */ }
                 Err(_) => return false,
@@ -419,7 +438,8 @@ impl Heap {
                 return false;
             }
         }
-        syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE).is_ok()
+        // SAFETY: the caller's contract covers the span.
+        unsafe { syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) }.is_ok()
     }
 }
 
@@ -484,7 +504,7 @@ fn heap_install(memmgr_ep: u32, self_aspace: u32) -> bool {
     // the IPC wrappers `grow_exact` uses. A failed draw degrades to the
     // deterministic default base (no log surface exists this early).
     let mut entropy = [0u8; 8];
-    let heap_base = match syscall::getrandom(entropy.as_mut_ptr(), entropy.len()) {
+    let heap_base = match syscall::getrandom(&mut entropy) {
         Ok(n) if n == entropy.len() as u64 => {
             HEAP_BASE_DEFAULT
                 + ((u64::from_le_bytes(entropy) & ((1 << HEAP_BASE_SLOTS_LOG2) - 1)) << 12)
@@ -500,7 +520,10 @@ fn heap_install(memmgr_ep: u32, self_aspace: u32) -> bool {
     heap.max = (heap_base + HEAP_SPAN) as usize;
     heap.memmgr_ep = memmgr_ep;
     heap.self_aspace = self_aspace;
-    let ok = heap.grow_exact(HEAP_INITIAL_PAGES, heap_base);
+    // SAFETY: the heap zone starts at `heap_base`, which nothing in the
+    // process has mapped yet (the heap is unbootstrapped), and
+    // `HEAP_INITIAL_PAGES` pages fit `HEAP_SPAN`.
+    let ok = unsafe { heap.grow_exact(HEAP_INITIAL_PAGES, heap_base) };
     if !ok {
         *heap = Heap::new();
     }

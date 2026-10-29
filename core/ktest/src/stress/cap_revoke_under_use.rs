@@ -194,7 +194,9 @@ fn start_senders(
         };
         // SAFETY: Each child uses a distinct stack index.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        spawn::configure_and_start(&child, sender_loop_entry, stack_top, arg)
+        // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe { spawn::configure_and_start(&child, sender_loop_entry, stack_top, arg) }
             .map_err(|_| "cap_revoke_under_use: configure_and_start failed")?;
     }
     Ok(())

@@ -68,7 +68,7 @@ fn next_process_badge() -> Option<u64>
 fn draw_layout_entropy() -> Option<[u8; process_layout::LAYOUT_ENTROPY_BYTES]>
 {
     let mut entropy = [0_u8; process_layout::LAYOUT_ENTROPY_BYTES];
-    let n = syscall::getrandom(entropy.as_mut_ptr(), entropy.len()).ok()?;
+    let n = syscall::getrandom(&mut entropy).ok()?;
     (n == entropy.len() as u64).then_some(entropy)
 }
 
@@ -553,6 +553,11 @@ pub struct MainTls
 /// child's `CSpace`, and writes the slot indices into the PI page. This
 /// split keeps the core `CREATE_PROCESS` path stdio-agnostic and lets
 /// spawners pipe each direction independently.
+///
+/// # Safety
+/// `child_aspace` must name a child's address space, never procmgr's own:
+/// the function maps pages into it, at VAs the child's layout chooses,
+/// without checking what procmgr holds there.
 // similar_names: child_aspace/child_cspace are intentionally parallel.
 // too_many_arguments: each cluster is a small fixed-size bundle; collapsing
 // them into one struct shifts the verbosity to the call sites without
@@ -565,7 +570,7 @@ pub struct MainTls
     clippy::too_many_arguments,
     clippy::too_many_lines
 )]
-fn populate_child_info(
+unsafe fn populate_child_info(
     self_aspace: u32,
     child_aspace: u32,
     child_cspace: u32,
@@ -873,7 +878,9 @@ fn populate_child_info(
     drop(scratch);
 
     let pi_ro = CapGuard::new(syscall::cap_derive(pi_memory.cap(), syscall::RIGHTS_MEM_MAP).ok()?);
-    syscall::mem_map(pi_ro.cap(), child_aspace, layout.process_info_va, 0, 1, 0).ok()?;
+    // SAFETY: the caller's contract: `child_aspace` is a child's address
+    // space, never procmgr's own, so the map changes nothing procmgr runs on.
+    unsafe { syscall::mem_map(pi_ro.cap(), child_aspace, layout.process_info_va, 0, 1, 0) }.ok()?;
     // pi_memory stays in procmgr's CSpace as the teardown handle (revoke
     // cascades to any descendants); the mapping doesn't need pi_ro to
     // outlive this call, so its guard deletes it on return.
@@ -953,7 +960,16 @@ fn alloc_main_tls_memory(
 /// Install the TCB self-pointer at `scratch_va + tls_base_offset`, drop
 /// the scratch mapping from procmgr's aspace, derive an RW cap, and map
 /// the block into the child at the chosen TLS block base.
-fn finalize_main_tls(alloc: MainTlsAlloc, _self_aspace: u32, child_aspace: u32) -> Option<MainTls>
+///
+/// # Safety
+/// `child_aspace` must name a child's address space, never procmgr's own:
+/// the function maps pages into it, at VAs the child's layout chooses,
+/// without checking what procmgr holds there.
+unsafe fn finalize_main_tls(
+    alloc: MainTlsAlloc,
+    _self_aspace: u32,
+    child_aspace: u32,
+) -> Option<MainTls>
 {
     // SAFETY: scratch_va is mapped writable for one page; the block fits.
     unsafe {
@@ -968,7 +984,9 @@ fn finalize_main_tls(alloc: MainTlsAlloc, _self_aspace: u32, child_aspace: u32) 
 
     let tls_rw =
         CapGuard::new(syscall::cap_derive(alloc.memory.cap(), syscall::RIGHTS_MEM_MAP_RW).ok()?);
-    syscall::mem_map(tls_rw.cap(), child_aspace, alloc.tls_block_base, 0, 1, 0).ok()?;
+    // SAFETY: the caller's contract: `child_aspace` is a child's address
+    // space, never procmgr's own, so the map changes nothing procmgr runs on.
+    unsafe { syscall::mem_map(tls_rw.cap(), child_aspace, alloc.tls_block_base, 0, 1, 0) }.ok()?;
     // The memory cap stays as the teardown handle; tls_rw is transient and
     // its guard deletes it on return.
     Some(MainTls {
@@ -985,10 +1003,15 @@ fn finalize_main_tls(alloc: MainTlsAlloc, _self_aspace: u32, child_aspace: u32) 
 /// finalized; PIE spawns re-apply the `.tdata`-targeting `RELATIVE`
 /// relocations there (the in-image template copy is relocated separately
 /// during segment loading).
+///
+/// # Safety
+/// `child_aspace` must name a child's address space, never procmgr's own:
+/// the function maps pages into it, at VAs the child's layout chooses,
+/// without checking what procmgr holds there.
 // too_many_arguments: each is a distinct creation input; see
 // prepare_main_tls_from_vfs.
 #[allow(clippy::too_many_arguments)]
-fn prepare_main_tls_from_bytes(
+unsafe fn prepare_main_tls_from_bytes(
     self_aspace: u32,
     child_aspace: u32,
     tls: &ChildTlsTemplate,
@@ -1022,7 +1045,8 @@ fn prepare_main_tls_from_bytes(
     let template =
         unsafe { core::slice::from_raw_parts_mut(scratch_va as *mut u8, template_bytes.len()) };
     relocate(template);
-    finalize_main_tls(alloc, self_aspace, child_aspace)
+    // SAFETY: the caller's contract covers `child_aspace`.
+    unsafe { finalize_main_tls(alloc, self_aspace, child_aspace) }
 }
 
 /// Allocate, populate by streaming `.tdata` from an open VFS file handle,
@@ -1030,10 +1054,15 @@ fn prepare_main_tls_from_bytes(
 ///
 /// `relocate` runs over the streamed template copy before the block is
 /// finalized; see [`prepare_main_tls_from_bytes`].
+///
+/// # Safety
+/// `child_aspace` must name a child's address space, never procmgr's own:
+/// the function maps pages into it, at VAs the child's layout chooses,
+/// without checking what procmgr holds there.
 // too_many_arguments: each is a distinct creation input (caps, file handle,
 // IPC scratch, chosen layout); grouping them would not reduce coupling.
 #[allow(clippy::too_many_arguments)]
-fn prepare_main_tls_from_vfs(
+unsafe fn prepare_main_tls_from_vfs(
     self_aspace: u32,
     child_aspace: u32,
     tls: &ChildTlsTemplate,
@@ -1069,7 +1098,8 @@ fn prepare_main_tls_from_vfs(
         return None;
     }
     relocate(template);
-    finalize_main_tls(alloc, self_aspace, child_aspace)
+    // SAFETY: the caller's contract covers `child_aspace`.
+    unsafe { finalize_main_tls(alloc, self_aspace, child_aspace) }
 }
 
 /// Map stack and IPC buffer pages into a child address space.
@@ -1079,7 +1109,12 @@ fn prepare_main_tls_from_vfs(
 /// construction — `process-layout` chooses disjoint VAs for the stack and the
 /// other bootstrap surfaces so the gap is always present. Stack overflow faults
 /// on the guard VA instead of silently writing into adjacent mappings.
-fn map_child_stack_and_ipc(
+///
+/// # Safety
+/// `child_aspace` must name a child's address space, never procmgr's own:
+/// the function maps pages into it, at VAs the child's layout chooses,
+/// without checking what procmgr holds there.
+unsafe fn map_child_stack_and_ipc(
     child_aspace: u32,
     child_memmgr_send: u32,
     ipc_buf: *mut u64,
@@ -1090,26 +1125,37 @@ fn map_child_stack_and_ipc(
     let stack_base = layout.stack_top - u64::from(stack_pages) * PAGE_SIZE;
     for i in 0..stack_pages
     {
+        // SAFETY: the caller's contract covers `child_aspace`.
+        unsafe {
+            map_fresh_child_page(
+                child_aspace,
+                child_memmgr_send,
+                ipc_buf,
+                stack_base + u64::from(i) * PAGE_SIZE,
+            )
+        }?;
+    }
+    // SAFETY: the caller's contract covers `child_aspace`.
+    unsafe {
         map_fresh_child_page(
             child_aspace,
             child_memmgr_send,
             ipc_buf,
-            stack_base + u64::from(i) * PAGE_SIZE,
-        )?;
+            layout.ipc_buffer_va,
+        )
     }
-    map_fresh_child_page(
-        child_aspace,
-        child_memmgr_send,
-        ipc_buf,
-        layout.ipc_buffer_va,
-    )
 }
 
 /// Allocate one child-billed page and map it read-write into the child at
 /// `va`. procmgr's transient slots are dropped on every path: the mapping
 /// owns no cap reference, and memmgr's record pins the page until
 /// `PROCESS_DIED`.
-fn map_fresh_child_page(
+///
+/// # Safety
+/// `child_aspace` must name a child's address space, never procmgr's own:
+/// the function maps pages into it, at VAs the child's layout chooses,
+/// without checking what procmgr holds there.
+unsafe fn map_fresh_child_page(
     child_aspace: u32,
     child_memmgr_send: u32,
     ipc_buf: *mut u64,
@@ -1118,7 +1164,9 @@ fn map_fresh_child_page(
 {
     let memory = CapGuard::new(crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?);
     let rw = CapGuard::new(syscall::cap_derive(memory.cap(), syscall::RIGHTS_MEM_MAP_RW).ok()?);
-    syscall::mem_map(rw.cap(), child_aspace, va, 0, 1, 0).ok()
+    // SAFETY: the caller's contract: `child_aspace` is a child's address
+    // space, never procmgr's own, so the map changes nothing procmgr runs on.
+    unsafe { syscall::mem_map(rw.cap(), child_aspace, va, 0, 1, 0) }.ok()
 }
 
 /// Determine protection flags for an ELF segment.
@@ -1467,32 +1515,37 @@ fn create_process_from_bytes(
         let file_data = &module_bytes[seg.offset as usize..(seg.offset + seg.filesz) as usize];
         let dest_offset = (seg_vaddr - first_page) as usize;
 
-        loader::load_elf_segment_into_child(
-            first_page,
-            num_pages,
-            prot,
-            if seg.writable { ro_range } else { None },
-            self_aspace,
-            child_aspace,
-            child_memmgr_send,
-            ipc_buf,
-            |buf| {
-                let copy_len = file_data.len().min(seg.memsz as usize);
-                buf[dest_offset..dest_offset + copy_len].copy_from_slice(&file_data[..copy_len]);
-                // Writable segments only, matching the kernel's init
-                // applier: a target in text/rodata goes unapplied and the
-                // applied-count check below rejects the image.
-                if seg.writable
-                    && let Some(t) = rela
-                {
-                    let table =
-                        &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
-                    let span = &mut buf[dest_offset..dest_offset + seg.memsz as usize];
-                    applied_relocs +=
-                        elf::apply_relative_relocs(table, machine, bias, seg.vaddr, span);
-                }
-            },
-        )
+        // SAFETY: `child_aspace` is the fresh address space
+        // `create_child_kernel_objects` retyped for this child above.
+        unsafe {
+            loader::load_elf_segment_into_child(
+                first_page,
+                num_pages,
+                prot,
+                if seg.writable { ro_range } else { None },
+                self_aspace,
+                child_aspace,
+                child_memmgr_send,
+                ipc_buf,
+                |buf| {
+                    let copy_len = file_data.len().min(seg.memsz as usize);
+                    buf[dest_offset..dest_offset + copy_len]
+                        .copy_from_slice(&file_data[..copy_len]);
+                    // Writable segments only, matching the kernel's init
+                    // applier: a target in text/rodata goes unapplied and the
+                    // applied-count check below rejects the image.
+                    if seg.writable
+                        && let Some(t) = rela
+                    {
+                        let table = &module_bytes
+                            [t.file_offset as usize..(t.file_offset + t.size) as usize];
+                        let span = &mut buf[dest_offset..dest_offset + seg.memsz as usize];
+                        applied_relocs +=
+                            elf::apply_relative_relocs(table, machine, bias, seg.vaddr, span);
+                    }
+                },
+            )
+        }
         .ok()?;
     }
     // Every pre-validated record must have landed in exactly one segment;
@@ -1524,26 +1577,31 @@ fn create_process_from_bytes(
         {
             return None;
         }
-        prepare_main_tls_from_bytes(
-            self_aspace,
-            child_aspace,
-            &tls_template,
-            &module_bytes[start..end],
-            child_memmgr_send,
-            ipc_buf,
-            &layout,
-            |template| {
-                // Re-apply the .tdata-targeting relocations to this
-                // independent copy; the image copy was relocated (and
-                // counted) during segment loading.
-                if let Some(t) = rela
-                {
-                    let table =
-                        &module_bytes[t.file_offset as usize..(t.file_offset + t.size) as usize];
-                    let _ = elf::apply_relative_relocs(table, machine, bias, seg.vaddr, template);
-                }
-            },
-        )?
+        // SAFETY: `child_aspace` is the fresh address space
+        // `create_child_kernel_objects` retyped for this child above.
+        unsafe {
+            prepare_main_tls_from_bytes(
+                self_aspace,
+                child_aspace,
+                &tls_template,
+                &module_bytes[start..end],
+                child_memmgr_send,
+                ipc_buf,
+                &layout,
+                |template| {
+                    // Re-apply the .tdata-targeting relocations to this
+                    // independent copy; the image copy was relocated (and
+                    // counted) during segment loading.
+                    if let Some(t) = rela
+                    {
+                        let table = &module_bytes
+                            [t.file_offset as usize..(t.file_offset + t.size) as usize];
+                        let _ =
+                            elf::apply_relative_relocs(table, machine, bias, seg.vaddr, template);
+                    }
+                },
+            )
+        }?
     }
     else
     {
@@ -1553,29 +1611,37 @@ fn create_process_from_bytes(
     let main_tls_memory = CapGuard::new(main_tls.memory_cap);
 
     let process_badge = next_process_badge()?;
-    let pi_memory = CapGuard::new(populate_child_info(
-        self_aspace,
-        child_aspace,
-        child_cspace,
-        child_thread,
-        creator_endpoint,
-        universals,
-        &tls_template,
-        args,
-        env,
-        ipc_buf,
-        stack_pages,
-        process_badge,
-        sched,
-        &layout,
-    )?);
-    map_child_stack_and_ipc(
-        child_aspace,
-        child_memmgr_send,
-        ipc_buf,
-        stack_pages,
-        &layout,
-    )?;
+    // SAFETY: `child_aspace` is the fresh address space
+    // `create_child_kernel_objects` retyped for this child above.
+    let pi_memory = CapGuard::new(unsafe {
+        populate_child_info(
+            self_aspace,
+            child_aspace,
+            child_cspace,
+            child_thread,
+            creator_endpoint,
+            universals,
+            &tls_template,
+            args,
+            env,
+            ipc_buf,
+            stack_pages,
+            process_badge,
+            sched,
+            &layout,
+        )
+    }?);
+    // SAFETY: `child_aspace` is the fresh address space
+    // `create_child_kernel_objects` retyped for this child above.
+    unsafe {
+        map_child_stack_and_ipc(
+            child_aspace,
+            child_memmgr_send,
+            ipc_buf,
+            stack_pages,
+            &layout,
+        )
+    }?;
 
     // The guards stay armed across `finalize_creation`, so its failure
     // releases every resource; on success the table entry owns them.
@@ -1630,7 +1696,9 @@ pub fn create_process(
     let module_size = module_pages * PAGE_SIZE;
     let module_va = module_scratch.va();
 
-    // SAFETY: module memory cap mapped read-only at module_va for module_size bytes.
+    // SAFETY: module memory cap mapped read-only at module_va for module_size
+    // bytes; `module_scratch` owns that mapping and is dropped below, after
+    // `create_process_from_bytes`, the last use of `module_bytes`, returns.
     let module_bytes =
         unsafe { core::slice::from_raw_parts(module_va as *const u8, module_size as usize) };
 
@@ -2113,7 +2181,8 @@ fn stream_segment_bytes(
 
         // SAFETY: `mapping.va()` covers PAGE_SIZE bytes mapped read-only;
         // `cache_page_range` checked `range.start + range.len() <= PAGE_SIZE`,
-        // and `chunk_len <= range.len()`.
+        // and `chunk_len <= range.len()`. `src` is last used in the copy below,
+        // before `mapping` is dropped.
         let src = unsafe {
             core::slice::from_raw_parts((mapping.va() as *const u8).add(range.start), chunk_len)
         };
@@ -2332,35 +2401,44 @@ pub fn create_process_from_file(
         };
         let mut streamed = true;
 
-        loader::load_elf_segment_into_child(
-            first_page,
-            num_pages,
-            prot,
-            if seg.writable { ro_range } else { None },
-            self_aspace,
-            child_objs.aspace(),
-            mms.cap(),
-            ipc_buf,
-            |buf| {
-                streamed = stream_segment_bytes(buf, dest_offset, &seg, &load_ctx);
-                // Writable segments only, matching the kernel's init
-                // applier: a target in text/rodata goes unapplied and the
-                // applied-count check below rejects the image.
-                if seg.writable
-                    && let Some(t) = &rela
-                {
-                    let span = &mut buf[dest_offset..dest_offset + seg.memsz as usize];
-                    // A read failure mid-walk leaves records unapplied; the
-                    // applied-count check below then rejects the spawn.
-                    let _ = walk_relocs_streaming(
-                        t,
-                        machine,
-                        |off, dst| vfs_read_exact(load_ctx.file_cap, load_ctx.ipc_buf, off, dst),
-                        |r| applied_relocs += elf::apply_reloc_in_span(r, bias, seg.vaddr, span),
-                    );
-                }
-            },
-        )?;
+        // SAFETY: `child_objs.aspace()` is the fresh address space
+        // `create_child_kernel_objects` retyped for this child above.
+        unsafe {
+            loader::load_elf_segment_into_child(
+                first_page,
+                num_pages,
+                prot,
+                if seg.writable { ro_range } else { None },
+                self_aspace,
+                child_objs.aspace(),
+                mms.cap(),
+                ipc_buf,
+                |buf| {
+                    streamed = stream_segment_bytes(buf, dest_offset, &seg, &load_ctx);
+                    // Writable segments only, matching the kernel's init
+                    // applier: a target in text/rodata goes unapplied and the
+                    // applied-count check below rejects the image.
+                    if seg.writable
+                        && let Some(t) = &rela
+                    {
+                        let span = &mut buf[dest_offset..dest_offset + seg.memsz as usize];
+                        // A read failure mid-walk leaves records unapplied; the
+                        // applied-count check below then rejects the spawn.
+                        let _ = walk_relocs_streaming(
+                            t,
+                            machine,
+                            |off, dst| {
+                                vfs_read_exact(load_ctx.file_cap, load_ctx.ipc_buf, off, dst)
+                            },
+                            |r| {
+                                applied_relocs +=
+                                    elf::apply_reloc_in_span(r, bias, seg.vaddr, span);
+                            },
+                        );
+                    }
+                },
+            )
+        }?;
         // A segment whose file bytes did not all arrive would run with a
         // zeroed tail; the spawn fails instead.
         if !streamed
@@ -2398,32 +2476,36 @@ pub fn create_process_from_file(
     let main_tls = if let Some(seg) = tls_seg
         && tls_template.memsz != 0
     {
-        prepare_main_tls_from_vfs(
-            self_aspace,
-            child_objs.aspace(),
-            &tls_template,
-            seg.offset,
-            file_cap.cap(),
-            mms.cap(),
-            ipc_buf,
-            &layout,
-            |template| {
-                // Re-apply the .tdata-targeting relocations to this
-                // independent copy; the image copy was relocated (and
-                // counted) during segment loading.
-                if let Some(t) = &rela
-                {
-                    let _ = walk_relocs_streaming(
-                        t,
-                        machine,
-                        |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
-                        |r| {
-                            let _ = elf::apply_reloc_in_span(r, bias, seg.vaddr, template);
-                        },
-                    );
-                }
-            },
-        )
+        // SAFETY: `child_objs.aspace()` is the fresh address space
+        // `create_child_kernel_objects` retyped for this child above.
+        unsafe {
+            prepare_main_tls_from_vfs(
+                self_aspace,
+                child_objs.aspace(),
+                &tls_template,
+                seg.offset,
+                file_cap.cap(),
+                mms.cap(),
+                ipc_buf,
+                &layout,
+                |template| {
+                    // Re-apply the .tdata-targeting relocations to this
+                    // independent copy; the image copy was relocated (and
+                    // counted) during segment loading.
+                    if let Some(t) = &rela
+                    {
+                        let _ = walk_relocs_streaming(
+                            t,
+                            machine,
+                            |off, dst| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst),
+                            |r| {
+                                let _ = elf::apply_reloc_in_span(r, bias, seg.vaddr, template);
+                            },
+                        );
+                    }
+                },
+            )
+        }
         .ok_or(procmgr_errors::OUT_OF_MEMORY)?
     }
     else
@@ -2449,32 +2531,40 @@ pub fn create_process_from_file(
         self_memmgr_ep: ctx.memmgr_ep,
     };
     let process_badge = next_process_badge().ok_or(procmgr_errors::OUT_OF_MEMORY)?;
-    let pi_memory_cap = populate_child_info(
-        self_aspace,
-        child_objs.aspace(),
-        child_objs.cspace(),
-        child_objs.thread(),
-        creator_endpoint,
-        &universals,
-        &tls_template,
-        args,
-        env,
-        ipc_buf,
-        stack_pages,
-        process_badge,
-        sched,
-        &layout,
-    )
+    // SAFETY: `child_objs.aspace()` is the fresh address space
+    // `create_child_kernel_objects` retyped for this child above.
+    let pi_memory_cap = unsafe {
+        populate_child_info(
+            self_aspace,
+            child_objs.aspace(),
+            child_objs.cspace(),
+            child_objs.thread(),
+            creator_endpoint,
+            &universals,
+            &tls_template,
+            args,
+            env,
+            ipc_buf,
+            stack_pages,
+            process_badge,
+            sched,
+            &layout,
+        )
+    }
     .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let pi_memory_guard = CapGuard::new(pi_memory_cap);
 
-    map_child_stack_and_ipc(
-        child_objs.aspace(),
-        mms.cap(),
-        ipc_buf,
-        stack_pages,
-        &layout,
-    )
+    // SAFETY: `child_objs.aspace()` is the fresh address space
+    // `create_child_kernel_objects` retyped for this child above.
+    unsafe {
+        map_child_stack_and_ipc(
+            child_objs.aspace(),
+            mms.cap(),
+            ipc_buf,
+            stack_pages,
+            &layout,
+        )
+    }
     .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
 
     // Commit point: hand the accumulated cap values to `finalize_creation`,
@@ -2711,13 +2801,17 @@ pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u32) -> 
         }
     }
 
-    syscall::thread_configure_with_tls(
-        entry.thread_cap,
-        entry.entry_point,
-        entry.stack_top_vaddr,
-        entry.process_info_va,
-        entry.tls_base_va,
-    )
+    // SAFETY: the thread is bound to the child's address space, never
+    // procmgr's own, so its entry state touches nothing procmgr runs on.
+    unsafe {
+        syscall::thread_configure_with_tls(
+            entry.thread_cap,
+            entry.entry_point,
+            entry.stack_top_vaddr,
+            entry.process_info_va,
+            entry.tls_base_va,
+        )
+    }
     .map_err(|_| procmgr_errors::THREAD_CONFIGURE_FAILED)?;
 
     // `Interrupted` means procmgr's thread was stopped while the start waited

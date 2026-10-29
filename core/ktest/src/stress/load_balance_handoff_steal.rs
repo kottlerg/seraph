@@ -242,8 +242,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         // SAFETY: server stacks occupy [NUM_PAIRS, 2*NUM_PAIRS); distinct per j.
         let stack =
             ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[NUM_PAIRS + j]) });
-        spawn::configure_and_start_pinned(&server, server_entry, stack, server_arg, server_cpu)
-            .map_err(|_| "stress::load_balance_handoff_steal: start server failed")?;
+        // SAFETY: the stack is `super::STRESS_STACKS[NUM_PAIRS + j]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe {
+            spawn::configure_and_start_pinned(&server, server_entry, stack, server_arg, server_cpu)
+        }
+        .map_err(|_| "stress::load_balance_handoff_steal: start server failed")?;
         server_th[j] = server.th;
         server_cs[j] = server.cs;
     }
@@ -302,7 +306,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         };
         // SAFETY: client stacks occupy [0, NUM_PAIRS); distinct per i.
         let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        spawn::configure_and_start(&client, client_entry, stack, client_arg)
+        // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe { spawn::configure_and_start(&client, client_entry, stack, client_arg) }
             .map_err(|_| "stress::load_balance_handoff_steal: start client failed")?;
         client_th[i] = client.th;
         client_cs[i] = client.cs;
@@ -398,7 +404,10 @@ extern "C" fn client_entry(arg: u64) -> !
 
     // SAFETY: client `idx` is the sole user of IPC_BUFS[idx] this run.
     let buf = unsafe { core::ptr::addr_of_mut!(IPC_BUFS[idx]) }.cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         notification_send(done, done_bit).ok();
         thread_exit()
@@ -441,7 +450,10 @@ extern "C" fn server_entry(arg: u64) -> !
 
     // SAFETY: server `buf_index` is the sole user of IPC_BUFS[buf_index] this run.
     let buf = unsafe { core::ptr::addr_of_mut!(IPC_BUFS[buf_index]) }.cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }

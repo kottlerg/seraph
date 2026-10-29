@@ -925,7 +925,10 @@ fn create_thread(
     // next is created, and a phase's racer and server exit and are deleted
     // before the next phase's are created.
     let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack]) });
-    thread_configure(th, entry as *const () as u64, top, arg)
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe { thread_configure(th, entry as *const () as u64, top, arg) }
         .map_err(|_| "stress::stop_source_delete: thread_configure failed")?;
     thread_set_affinity(th, cpu).map_err(|_| "stress::stop_source_delete: pin thread failed")?;
     Ok(th)
@@ -1007,7 +1010,10 @@ extern "C" fn waiter_entry(arg: u64) -> !
     // SAFETY: sole live user of WAITER_IPC_BUF (one waiter at a time).
     let buf = core::ptr::addr_of_mut!(WAITER_IPC_BUF).cast::<u64>();
     if matches!(kind, Kind::Recv | Kind::Call | Kind::CallServed)
-        && ipc_buffer_set(buf as u64).is_err()
+        // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+        // registered by one thread at a time; no Rust object lives in it, and the
+        // thread reaches it only through the raw `buf` pointer.
+        && unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         BAD_WAITS.record(u64::MAX);
         thread_exit()
@@ -1103,7 +1109,10 @@ extern "C" fn server_entry(_arg: u64) -> !
 {
     // SAFETY: sole live user of SERVER_IPC_BUF (one server per phase).
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         BAD_ACTIONS.record(u64::MAX);
         SERVER_EXITED.store(1, Ordering::Release);

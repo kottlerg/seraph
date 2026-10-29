@@ -274,10 +274,13 @@ pub fn grant_retyped_unmappable_phase(_: &Caps)
     let refused = syscall_abi::SyscallError::InvalidArgument as i64;
     for prot in [MAP_WRITABLE, MAP_READ]
     {
-        let mapped = syscall::mem_map(grant, info.self_aspace, va, 0, 1, prot);
+        // SAFETY: `range` is a fresh page reservation from the per-process
+        // arena, owned here: VA no Rust object or IPC page occupies.
+        let mapped = unsafe { syscall::mem_map(grant, info.self_aspace, va, 0, 1, prot) };
         if mapped.is_ok()
         {
-            let _ = syscall::mem_unmap(info.self_aspace, va, 1);
+            // SAFETY: as for the map above.
+            let _ = unsafe { syscall::mem_unmap(info.self_aspace, va, 1) };
         }
         assert_eq!(
             mapped,

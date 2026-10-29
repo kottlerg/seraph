@@ -630,8 +630,8 @@ impl KernelMmio
 /// rejects an entry that intersects RAM (`core/kernel/docs/initialization.md`
 /// § Phase 6). Userspace narrows these to per-device ranges via
 /// `SYS_MMIO_SPLIT` and distributes them to drivers. Apertures are
-/// intentionally coarse; device-level enumeration is `devmgr`'s job from ACPI
-/// / DTB passthrough.
+/// intentionally coarse; device-level enumeration is `devmgr`'s job from
+/// ACPI/DTB passthrough.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MmioAperture

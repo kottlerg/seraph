@@ -51,8 +51,8 @@ core/kernel/src/arch/
     ├── platform.rs ├── ap_trampoline.rs └── entropy.rs
 ```
 
-`arch/mod.rs` performs the conditional compilation, and also defines the one
-architecture-shared type, `ThreadKind` (see § `context`):
+`arch/mod.rs` performs the conditional compilation, and also defines the one type it holds
+itself, `ThreadKind`, which both architectures' `context::new_state` take (see § `context`):
 
 ```rust
 #[cfg(target_arch = "x86_64")]
@@ -553,10 +553,10 @@ pub fn user_copy_fixup(pc: u64) -> Option<u64>;
 /// must clear is clear; a no-op in release builds. x86-64 asserts RFLAGS AC,
 /// DF and TF clear (SFMASK and the IDT stubs' `cld` / `clac` establish it) and
 /// is called first in `syscall::dispatch` and the exception, `#PF`, `#NM`, and
-/// IRQ handler bodies. RISC-V
-/// asserts `sstatus.SUM` clear, the analogue (SUM, like AC, lifts the
-/// supervisor-access block on user pages), and is called at syscall dispatch
-/// only: a trap taken from S-mode inside a `copy_user` window carries SUM.
+/// IRQ handler bodies. RISC-V asserts `sstatus.SUM` clear, the analogue (SUM,
+/// like AC, lifts the supervisor-access block on user pages), and is called at
+/// syscall dispatch only: a trap taken from S-mode inside a `copy_user` window
+/// carries SUM.
 pub fn debug_assert_kernel_entry_flags();
 ```
 

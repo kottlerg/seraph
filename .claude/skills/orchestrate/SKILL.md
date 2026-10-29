@@ -74,7 +74,10 @@ the record lists it as active until the worker's last PR merges or a respawn rep
 A respawn prompt also carries the dead worker's classified item list, its mechanism choices and
 every answer already given, marked as decisions already made, so the new worker neither
 re-plans nor re-asks, and names the dead worker's branch and PR when either exists, for the new
-worker to continue on.
+worker to continue on. Before or with the respawn, send the replaced worker a stand-down
+message (its PR and branch now belong to the new worker; it edits, commits and pushes nothing
+further, per `.claude/agents/worker.md` § Reporting), and end that worker's task where the
+harness allows, so a worker presumed dead that resumes does not push over its replacement.
 
 ## Host token
 

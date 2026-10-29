@@ -290,7 +290,7 @@ fn publish_devmgr_registry_send(
 
 /// Hand devmgr a `LOOKUP | READ`-attenuated `/services/drivers/` subtree
 /// cap via `SET_DRIVERS_DIR`, so devmgr can lazily walk + spawn its on-disk
-/// driver binaries (today: the per-arch RTC). svcmgr walks its universal
+/// driver binaries (the per-arch RTC and virtio-input). svcmgr walks its universal
 /// root for the dir and mints a `DRIVERS_DIR_AUTHORITY` `SEND|GRANT` from
 /// the endowed devmgr-registry source.
 ///

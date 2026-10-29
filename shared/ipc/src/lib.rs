@@ -10,7 +10,8 @@
 //! per-thread IPC buffer as scratch at the syscall boundary (nested IPC
 //! cannot clobber a received/reply message). Also hosts the bootstrap
 //! protocol (children receive their initial cap set via IPC from their
-//! creator), typed error-code constants, and label modules.
+//! creator), typed error-code constants, label modules, and the shared
+//! policy and code tables listed in `shared/ipc/README.md`.
 
 // When built as a std dep via `rustc-dep-of-std`, we switch to `no_core`
 // and rebind `core` to the `rustc_std_workspace_core` facade — same dance
@@ -39,18 +40,22 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //
 // Each `*_LABELS_VERSION` constant declares the wire-protocol version of
 // its namespace. Bumped on any breaking change (label added, removed, or
-// repurposed; payload shape change). Three consumer-wiring categories:
+// repurposed; payload shape change). Four consumer-wiring categories:
 //
-//   Handshake-checked at first contact — producer prepends its compiled
-//   `*_LABELS_VERSION` as the first u32 of the handshake payload; receiver
-//   compares to its own and rejects on mismatch. Mismatched binaries are
-//   stopped before any per-IO traffic.
+//   Handshake-checked at first contact — producer carries its compiled
+//   `*_LABELS_VERSION` in the handshake payload (`data[0]` unless noted);
+//   receiver compares to its own and rejects on mismatch. Mismatched
+//   binaries are stopped before any per-IO traffic.
 //     FS_LABELS_VERSION     — fs_labels::FS_MOUNT             (vfsd ↔ fatfs)
 //     VFSD_LABELS_VERSION   — vfsd_labels::GET_SYSTEM_ROOT_CAP (init ↔ vfsd)
 //     BLK_LABELS_VERSION    — blk_labels::REGISTER_PARTITION   (vfsd ↔ virtio-blk)
-//     DEVMGR_LABELS_VERSION — devmgr_labels::QUERY_BLOCK_DEVICE (vfsd ↔ devmgr)
 //     MEMMGR_LABELS_VERSION — memmgr_labels::REGISTER_PROCESS   (procmgr ↔ memmgr)
-//     SVCMGR_LABELS_VERSION — svcmgr handover endowment round 1   (init ↔ svcmgr)
+//     SVCMGR_LABELS_VERSION — svcmgr handover endowment `CAPS` round, in
+//                             `data[1]` after the round kind (init ↔ svcmgr)
+//
+//   Checked on every request — the caller carries its compiled version in
+//   `data[0]` of each request and the receiver rejects a mismatch per call.
+//     DEVMGR_LABELS_VERSION — every devmgr_labels request
 //
 //   Implicitly covered by parent-channel handshake — the channel was opened
 //   against a cap-badge first minted by a handshake-checked namespace; the
@@ -77,6 +82,8 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //                             ProcessInfo.log_send_cap (init derives its
 //                             own), not via a handshake
 
+/// Wire-protocol version of [`procmgr_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const PROCMGR_LABELS_VERSION: u32 = 3;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
@@ -188,13 +195,10 @@ pub mod procmgr_labels
             | ((band_max as u64) & CREATE_SCHED_FIELD_MASK) << CREATE_BAND_MAX_SHIFT
     }
 
-    /// Destroy a process: `cap_delete` its kernel objects (thread, aspace,
-    /// cspace, `ProcessInfo` Memory cap), dec-refing any pages the child
-    /// still holds so they recycle back into the kernel buddy allocator. The
-    /// caller identifies the process via the badged `process_handle`
-    /// received from `CREATE_PROCESS` / `CREATE_FROM_FILE`; the badge is
-    /// delivered by `ipc_recv` and looked up in procmgr's table. Idempotent
-    /// on already-destroyed badges.
+    /// Destroy a process, sent on its badged `process_handle`; procmgr
+    /// deletes its kernel objects and sends memmgr `PROCESS_DIED` for it.
+    /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 8:
+    /// `DESTROY_PROCESS`.
     pub const DESTROY_PROCESS: u64 = 8;
     /// Query a process's state. Caller identifies the target via the badged
     /// `process_handle` (delivered by `ipc_recv` on procmgr's side). Reply
@@ -214,9 +218,9 @@ pub mod procmgr_labels
     /// * `data[0]` — direction selector ([`PIPE_DIR_STDIN`] /
     ///   [`PIPE_DIR_STDOUT`] / [`PIPE_DIR_STDERR`]).
     /// * `data[1]` — ring byte capacity (power of two, ≤ ring page bytes
-    ///   minus header). v1 uses 2048.
+    ///   minus header); std's pipe uses 2048.
     /// * `caps[0]` — memory cap (one shmem page; spawner has already
-    ///   initialised the [`SpscHeader`] via `init`).
+    ///   initialised the `shmem::SpscHeader` via `init`).
     /// * `caps[1]` — data-available notification cap.
     /// * `caps[2]` — space-available notification cap.
     ///
@@ -288,60 +292,26 @@ pub mod procmgr_labels
     /// caps (the prior caps are `cap_delete`'d procmgr-side).
     pub const CONFIGURE_NAMESPACE: u64 = 12;
 
-    /// Register a death-notification `EventQueue` cap with procmgr.
-    ///
-    /// Wire format:
-    /// * `caps[0]` = `EventQueue` cap (POST right) on which procmgr
-    ///   posts `(process_badge as u32) << 32 | exit_reason` for every
-    ///   tracked process when it exits or faults.
-    ///
-    /// Procmgr stores the cap and, for every process already in its
-    /// table, calls `sys_thread_bind_notification` on the child's
-    /// main thread with this EQ as a second observer. From the
-    /// registration moment onward, every newly spawned child also
-    /// receives the binding inside `finalize_creation`. Registration is
-    /// first-wins: a second registration has its cap deleted.
-    ///
-    /// Real-logd uses this to learn about sender deaths so it can
-    /// evict the corresponding slot in its hash-keyed badge table.
-    /// Reply is `procmgr_errors::SUCCESS` on bind, `INVALID_ARGUMENT`
-    /// if no cap (or a zero cap) is transferred, `UNAUTHORIZED` without
-    /// the `DEATH_EQ_AUTHORITY` badge or when an EQ is already
-    /// registered (`services/procmgr/docs/ipc-interface.md`
-    /// § `REGISTER_DEATH_EQ`).
+    /// Register a death-notification `EventQueue` cap (`caps[0]`, POST
+    /// right) with procmgr, which binds it as a second death observer on
+    /// every supervised thread, so the kernel posts each death to it.
+    /// Real-logd uses it to evict the slot of a dead sender. Specified,
+    /// with its replies, in `services/procmgr/docs/ipc-interface.md`
+    /// § REGISTER_DEATH_EQ — install logd's death observer.
     pub const REGISTER_DEATH_EQ: u64 = 14;
 
     /// Badge bit on procmgr service caps that authorises
     /// `REGISTER_DEATH_EQ`; un-badged or differently-badged callers are
     /// rejected. Who holds it is in `services/procmgr/docs/ipc-interface.md`
-    /// § `REGISTER_DEATH_EQ`.
+    /// § REGISTER_DEATH_EQ — install logd's death observer.
     pub const DEATH_EQ_AUTHORITY: u64 = 1u64 << 62;
 
-    /// Hand init's kernel-object caps + reclaimable Memory caps to procmgr
-    /// for post-death reap. Init calls this in the post-Phase-3 exit
-    /// path, then `sys_thread_exit`s.
-    ///
-    /// First round (`is_first = data[0] != 0`):
-    ///   `caps[0]` = init's `AddressSpace` cap (MOVED out of init's `CSpace`).
-    ///   `caps[1]` = init's `CSpace` cap (MOVED).
-    ///   `caps[2]` = init's main `Thread` cap (MOVED).
-    ///   `caps[3]` = init-logd `Thread` cap (MOVED; may be the same slot
-    ///               as a previously-exited thread — its TCB is reclaimed
-    ///               on `cap_delete` regardless of state).
-    /// Subsequent rounds (`data[0] == 0`):
-    ///   `caps[0..N]` = reclaimable Memory caps (segments + stack +
-    ///                  `InitInfo` + any other init-owned donatable
-    ///                  Memory cap). MOVED out of init's `CSpace`
-    ///                  via IPC cap-transfer; procmgr accumulates them
-    ///                  for the eventual `memmgr.DONATE_MEMORY_CAPS` chunk.
-    ///
-    /// Procmgr binds the death-EQ on both init threads (main and
-    /// init-logd) with correlator `INIT_REAP_CORRELATOR` as part of the
-    /// first round, and reaps once both have exited. Only an un-badged
-    /// cap is accepted, and the handoff is one-shot. Each round replies
-    /// `procmgr_errors::SUCCESS`, `UNAUTHORIZED` from a badged sender, or
-    /// `INVALID_ARGUMENT` on the reject arms in
-    /// `services/procmgr/docs/ipc-interface.md` § `REGISTER_INIT_TEARDOWN`.
+    /// Hand init's kernel-object caps and reclaimable Memory caps to
+    /// procmgr for the reap after init exits; init calls it on its exit
+    /// path, then `sys_thread_exit`s. The rounds, the death-EQ binding on
+    /// both init threads (correlator [`INIT_REAP_CORRELATOR`]), and the
+    /// replies are specified in `services/procmgr/docs/ipc-interface.md`
+    /// § REGISTER_INIT_TEARDOWN — init reap handoff.
     pub const REGISTER_INIT_TEARDOWN: u64 = 15;
 
     /// Notification end of init's reap-handoff cap stream. After this call
@@ -353,9 +323,10 @@ pub mod procmgr_labels
     pub const INIT_TEARDOWN_DONE: u64 = 16;
 
     /// Reserved death-notification correlator used by `REGISTER_INIT_TEARDOWN`.
-    /// Per-child correlators are `process_badge as u32` starting at
-    /// `log_badges::LOG_BADGE_FIRST_CHILD = 16`; reserving the top of
-    /// the u32 range avoids collision.
+    /// Per-child correlators are `process_badge as u32`; procmgr redraws a
+    /// random badge whose low 32 bits are below
+    /// `log_badges::LOG_BADGE_FIRST_CHILD` or equal this value, so the two
+    /// never collide.
     pub const INIT_REAP_CORRELATOR: u32 = u32::MAX;
 }
 
@@ -377,7 +348,7 @@ pub mod procmgr_labels
 /// | 24 | devmgr |
 /// | 23 | vfsd, fs drivers (fatfs) |
 /// | 21 | svcmgr |
-/// | ≤21 | svcmgr-launched services, per `.svc` recipe (logd 18, timed/pwrmgr 16, terminal 10, shell/crasher 5) |
+/// | ≤21 | svcmgr-launched services, per `.svc` recipe (logd 18, timed/pwrmgr 16, terminal/svctest/usertest 10, crasher 5), and what they spawn (the shell, at 5 from terminal) |
 ///
 /// Levels for svcmgr-launched services live in their `.svc` recipes
 /// (`priority = ...` / `sched_max = ...`), not here — this module carries
@@ -439,6 +410,8 @@ pub mod sched_policy
     pub const SVCMGR_PRIORITY: u8 = 21;
 }
 
+/// Wire-protocol version of [`memmgr_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const MEMMGR_LABELS_VERSION: u32 = 5;
 /// IPC labels for the memory manager (`memmgr`).
 ///
@@ -494,10 +467,13 @@ pub mod memmgr_labels
     /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` if the caller's
     /// badge is unknown.
     pub const RELEASE_MEMORY_CAPS: u64 = 2;
-    /// Procmgr-only: register a new process. memmgr allocates a per-process
-    /// tracking entry and replies with a badged SEND cap on its endpoint
-    /// identifying the new process. Procmgr installs the returned cap in
-    /// the new process's `ProcessInfo.memmgr_endpoint_cap`.
+    /// Procmgr-only: register a new process. Request `data[0]` = caller's
+    /// compiled [`super::MEMMGR_LABELS_VERSION`]. memmgr allocates a
+    /// per-process tracking entry and replies with the new badge in
+    /// `data[0]` and a badged SEND cap on its endpoint in `caps[0]`, which
+    /// procmgr installs in the new process's `ProcessInfo.memmgr_endpoint_cap`.
+    /// Specified in `services/memmgr/docs/ipc-interface.md` § Label 3:
+    /// `REGISTER_PROCESS`.
     pub const REGISTER_PROCESS: u64 = 3;
     /// Procmgr-only: notify process death. `data[0]` carries the dead process's
     /// memmgr badge (no cap is required); memmgr reclaims every Memory cap
@@ -570,7 +546,8 @@ pub mod memmgr_labels
     /// * `data[2]` — `prot` (MAP_* protection bits; W^X enforced).
     ///
     /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` (bad alignment,
-    /// zero length, W^X violation, unknown badge, or overlap); or `QUOTA`
+    /// zero length, W^X violation, unknown prot bit, unknown badge, or
+    /// overlap); or `QUOTA`
     /// (metadata arena could not grow — system RAM exhausted). No mapping is
     /// installed here — backing happens lazily on fault, and only once procmgr
     /// has delegated the process `AddressSpace` cap via [`DELEGATE_ASPACE`].
@@ -580,7 +557,8 @@ pub mod memmgr_labels
     /// memmgr so the pager can map frames into it on fault.
     ///
     /// Sent at process finalize for demand-paged processes — the default;
-    /// not those created with the [`CREATE_PINNED`] flag — after the child
+    /// not those created with the
+    /// [`CREATE_PINNED`](super::procmgr_labels::CREATE_PINNED) flag — after the child
     /// address space exists (so it cannot ride on the earlier
     /// [`REGISTER_PROCESS`] handshake).
     /// memmgr stores the transferred cap against the child's tracking
@@ -656,6 +634,7 @@ pub fn memmgr_grant_layout(reply: &IpcMessage) -> Option<(&[u64], &[u64])>
 /// to retry, fall back, or propagate the OOM upstream.
 pub mod memmgr_errors
 {
+    /// Request handled.
     pub const SUCCESS: u64 = 0;
     /// `REQUIRE_CONTIGUOUS` was set and no free run satisfies `want_pages`.
     /// Caller may retry without the flag, or fail.
@@ -668,15 +647,16 @@ pub mod memmgr_errors
     /// exhausted. Per-process region and frame counts are otherwise RAM-bound,
     /// not capped by a constant.
     pub const QUOTA: u64 = 3;
-    /// `want_pages == 0`, reserved flag bits set, or badge unknown
-    /// (`REQUEST_MEMORY_CAPS` / `RELEASE_MEMORY_CAPS` from an unregistered
-    /// badge).
+    /// A malformed request: the per-label cases are listed in
+    /// `services/memmgr/docs/ipc-interface.md` (for example `want_pages == 0`
+    /// or reserved flag bits on `REQUEST_MEMORY_CAPS`, an unregistered badge,
+    /// or a bad region on `REGISTER_REGION`).
     pub const INVALID_ARGUMENT: u64 = 4;
     /// Procmgr-only label called over a non-procmgr badge.
     pub const UNAUTHORIZED: u64 = 5;
-    /// `REGISTER_PROCESS` failed because the per-process tracking table
-    /// is at static cap. Procmgr handles this as a process-creation
-    /// failure.
+    /// `REGISTER_PROCESS` could not complete: the tracking table could not
+    /// take a new entry, the badge draw failed, or the reply cap could not
+    /// be derived. Procmgr handles this as a process-creation failure.
     pub const TOO_MANY_PROCESSES: u64 = 6;
     /// Caller's compiled `MEMMGR_LABELS_VERSION` does not match the receiver's.
     /// `REGISTER_PROCESS` is the handshake entry point and carries the
@@ -755,9 +735,9 @@ pub mod memmgr_bootstrap
 /// Process-state codes returned by `procmgr_labels::QUERY_PROCESS`.
 ///
 /// Populated in data word 0 of the reply. Word 1 carries an accompanying
-/// exit reason (kernel death-notification encoding: 0 = clean, `0x1000+vec`
-/// = fault, `0x2000` = killed); it is zero for states in which the exit
-/// reason is not meaningful (ALIVE, CREATED, UNKNOWN).
+/// exit reason (encoded as `docs/process-lifecycle.md` § Exit reason
+/// defines); it is zero for states in which the exit reason is not
+/// meaningful (ALIVE, CREATED, UNKNOWN).
 pub mod procmgr_process_state
 {
     /// Entry exists and the process has been started. Running or blocked.
@@ -768,20 +748,24 @@ pub mod procmgr_process_state
     /// No entry for this badge — already reaped, or the badge was never
     /// valid. Equivalent to `ESRCH`.
     pub const UNKNOWN: u64 = 2;
-    /// Entry has been auto-reaped by procmgr but the badge is still in the
-    /// recent-exits ring. Reply word 1 carries the kernel-encoded
-    /// `exit_reason`. Recent-exit retention is best-effort; once the ring
-    /// rotates, queries on the same badge return `UNKNOWN`.
+    /// The process has exited: its main thread is already `Exited` (before
+    /// procmgr's death-event drain reaps it), or procmgr reaped it and the
+    /// badge is still in the recent-exits ring. Reply word 1 carries the
+    /// kernel-encoded `exit_reason`. Recent-exit retention is best-effort;
+    /// once the ring rotates, queries on the same badge return `UNKNOWN`.
     pub const EXITED: u64 = 3;
 }
 
+/// Wire-protocol version of [`svcmgr_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const SVCMGR_LABELS_VERSION: u32 = 5;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
-    // The substrate services init bootstrapped before svcmgr existed
-    // (memmgr, procmgr, devmgr, vfsd, logd) are handed to svcmgr over
-    // init's bootstrap-round endowment, not a dedicated label: round 1
+    // The services init started before svcmgr existed (memmgr, procmgr,
+    // devmgr, vfsd) are handed to svcmgr over init's bootstrap-round
+    // endowment, not a dedicated label (svcmgr launches logd itself, from
+    // its recipe): round 1
     // carries svcmgr's own endpoints plus the source caps it needs for
     // its publish role (`rootfs.root` SEND, devmgr-registry `SEND|GRANT`
     // source) and `SVCMGR_LABELS_VERSION` in `data[1]`; each subsequent
@@ -801,10 +785,9 @@ pub mod svcmgr_labels
     /// service's `namespace = ...` line in `/config/svcmgr/services/<name>.svc`.
     ///
     /// Namespace-policy descriptor: hand the child a `cap_copy` of
-    /// svcmgr's own root cap at full rights. Reserved for the small
-    /// allow-list of services that need genuine root authority (vfsd
-    /// as the namespace authority, devmgr for `/dev`, procmgr for
-    /// walking `/bin`, svctest as the namespace tester).
+    /// svcmgr's own root cap at full rights. Reserved for the services
+    /// that need genuine root authority; today the `terminal`, `svctest`,
+    /// and `usertest` recipes select it.
     pub const NS_POLICY_UNIVERSAL: u8 = 0;
     /// Namespace-policy descriptor: do not deliver any namespace
     /// cap. The child's `ProcessInfo.system_root_cap` stays zero
@@ -938,9 +921,10 @@ pub mod published_names
 
     /// `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry
     /// endpoint. Consumers needing to resolve a device driver
-    /// themselves (today: `programs/terminal` → `QUERY_FRAMEBUFFER_DEVICE` /
-    /// `QUERY_INPUT_DEVICE` / `QUERY_SERIAL_DEVICE`; future: any non-init
-    /// caller of devmgr's discovery surface) seed this name. svcmgr publishes it
+    /// themselves seed this name: today `programs/terminal` (frame buffer,
+    /// input, and serial queries), `timed` (`QUERY_RTC_DEVICE`), and
+    /// `svctest`; logd instead receives a SEND svcmgr mints for it at
+    /// launch. svcmgr publishes it
     /// post-handover from the devmgr-registry source cap init endows it
     /// with; the `REGISTRY_QUERY_AUTHORITY` badge bit is preserved
     /// through svcmgr's plain `cap_derive` in `registry_lookup_derived`.
@@ -962,6 +946,8 @@ pub mod published_names
     pub const DEVMGR_TEST: &[u8] = b"devmgr.test";
 }
 
+/// Wire-protocol version of [`rtc_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const RTC_LABELS_VERSION: u32 = 1;
 /// IPC labels for RTC chip drivers (`services/drivers/cmos`,
 /// `services/drivers/goldfish-rtc`, and future per-board chip drivers).
@@ -977,10 +963,10 @@ pub const RTC_LABELS_VERSION: u32 = 1;
 ///
 /// **Acquisition path**: the RTC driver binary lives on the rootfs disk
 /// at `/services/drivers/<chip>` and is loaded by devmgr from there.
-/// Init walks vfsd to `/services/drivers/` and hands devmgr a
+/// svcmgr walks its system root to `/services/drivers/` and hands devmgr a
 /// `LOOKUP | READ`-attenuated subtree cap via
 /// [`devmgr_labels::SET_DRIVERS_DIR`]. Devmgr replies SUCCESS to that
-/// handshake *before* doing any spawn work (so init never blocks on
+/// handshake *before* doing any spawn work (so svcmgr never blocks on
 /// driver bring-up); it then walks the per-arch driver name
 /// (`cmos-rtc` on x86-64, `goldfish-rtc` on RISC-V) from the subtree
 /// cap, calls [`procmgr_labels::CREATE_FROM_FILE`], and delivers the
@@ -1014,9 +1000,9 @@ pub mod rtc_labels
     /// [`devmgr_labels::QUERY_RTC_DEVICE`]; gates [`RTC_GET_EPOCH_TIME`].
     /// A verb ("may read"), not an identity. Shares the same `1 << 63`
     /// bit position as [`serial_labels::WRITE_AUTHORITY`] and
-    /// [`fb_labels::WRITE_AUTHORITY`]; unlike those two, the cmos /
-    /// goldfish-rtc drivers do enforce the bit at the service loop
-    /// (defence-in-depth alongside the upstream
+    /// [`fb_labels::WRITE_AUTHORITY`]. The cmos / goldfish-rtc drivers
+    /// enforce the bit at the service loop, as the serial driver enforces
+    /// its bits (defence-in-depth alongside the upstream
     /// [`REGISTRY_QUERY_AUTHORITY`](devmgr_labels::REGISTRY_QUERY_AUTHORITY)
     /// gate at devmgr's `QUERY_RTC_DEVICE` handler).
     pub const READ_AUTHORITY: u64 = 1u64 << 63;
@@ -1025,6 +1011,7 @@ pub mod rtc_labels
 /// Error replies from RTC chip drivers.
 pub mod rtc_errors
 {
+    /// Request handled.
     pub const SUCCESS: u64 = 0;
     /// Driver could not read the underlying hardware (transient or
     /// permanent device failure). Caller may retry; `timed` treats this
@@ -1044,6 +1031,8 @@ pub mod rtc_errors
     pub const UNAUTHORIZED: u64 = 4;
 }
 
+/// Wire-protocol version of [`timed_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const TIMED_LABELS_VERSION: u32 = 1;
 /// IPC labels for the wall-clock service (`services/timed`).
 ///
@@ -1067,14 +1056,15 @@ pub mod timed_labels
 /// Error replies from the wall-clock service.
 pub mod timed_errors
 {
+    /// Request handled.
     pub const SUCCESS: u64 = 0;
     /// No RTC was reachable through devmgr's [`devmgr_labels::QUERY_RTC_DEVICE`]
     /// at timed's startup; the offset was never computed. Boards without
-    /// an RTC (some real RISC-V hardware) reach this state until an
-    /// operator or NTP path seeds the offset out-of-band. Out of scope
-    /// for this PR; documented to make the no-RTC path explicit at the
-    /// wire level rather than panicking.
+    /// an RTC (some real RISC-V hardware) stay in this state: seeding the
+    /// offset out of band (an operator or NTP path) is design intent; not
+    /// yet implemented.
     pub const WALL_CLOCK_UNAVAILABLE: u64 = 1;
+    /// Unknown opcode on timed's endpoint.
     pub const UNKNOWN_OPCODE: u64 = 2;
     /// Reserved for a future per-message version handshake. Unused
     /// today — `TIMED_LABELS_VERSION` is marker-only and covered by
@@ -1082,6 +1072,8 @@ pub mod timed_errors
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
 }
 
+/// Wire-protocol version of [`pwrmgr_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const PWRMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the power manager (`pwrmgr`).
 ///
@@ -1103,8 +1095,9 @@ pub mod pwrmgr_labels
     /// carries [`SHUTDOWN_AUTHORITY`] and replies
     /// [`pwrmgr_errors::UNAUTHORIZED`] otherwise. On the success path the
     /// platform powers off and no reply is delivered (QEMU exits the
-    /// process). A reply only ever arrives on a rejection or hardware
-    /// failure path.
+    /// process). A reply arrives only on a rejection, when pwrmgr has no
+    /// actuator, or when the platform call fails (see
+    /// [`pwrmgr_errors::INVALID_REQUEST`]).
     pub const SHUTDOWN: u64 = 1;
     /// Cold reboot the platform.
     ///
@@ -1122,21 +1115,26 @@ pub mod pwrmgr_labels
 /// Error replies from pwrmgr.
 pub mod pwrmgr_errors
 {
+    /// Request handled (never observed for SHUTDOWN / REBOOT, whose
+    /// success path does not return).
     pub const SUCCESS: u64 = 0;
     /// Caller's badge lacks the verb bit required by the handler
     /// ([`pwrmgr_labels::SHUTDOWN_AUTHORITY`] for SHUTDOWN / REBOOT).
     pub const UNAUTHORIZED: u64 = 1;
-    /// Malformed request (unknown opcode, label-version mismatch on a
-    /// future handshake, or platform handler failed in a way that
-    /// returned to userspace rather than powering off).
+    /// An authorised SHUTDOWN / REBOOT could not be carried out: pwrmgr has
+    /// no platform actuator (its startup acquisition from devmgr failed), or
+    /// the platform call returned without powering off or resetting
+    /// (`services/pwrmgr/README.md`).
     pub const INVALID_REQUEST: u64 = 2;
-    /// Reserved for a future per-message version handshake. Unused in
-    /// v0.1.0 — the bootstrap-round handshake gates the cap itself.
+    /// Reserved for a future per-message version handshake; not emitted.
+    /// `PWRMGR_LABELS_VERSION` is marker-only.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
     /// Unknown opcode on pwrmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
 
+/// Wire-protocol version of [`vfsd_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const VFSD_LABELS_VERSION: u32 = 1;
 /// IPC labels for the VFS daemon (`vfsd`).
 pub mod vfsd_labels
@@ -1150,11 +1148,13 @@ pub mod vfsd_labels
     /// the synthetic system root at full namespace rights and return it
     /// to the caller.
     ///
-    /// Empty request body. Reply: `SUCCESS` with `caps[0]` = the
-    /// system-root cap; `UNAUTHORIZED` when the caller's badge lacks
-    /// [`SEED_AUTHORITY`]. Init calls this once during bootstrap (after
-    /// the role-byte root mount completes) to obtain the seed cap from
-    /// which all later namespace-cap distribution flows.
+    /// Request: `data[0]` = caller's compiled [`super::VFSD_LABELS_VERSION`].
+    /// Reply: `SUCCESS` with `caps[0]` = the system-root cap;
+    /// `UNAUTHORIZED` when the caller's badge lacks [`SEED_AUTHORITY`];
+    /// `LABEL_VERSION_MISMATCH` when `data[0]` differs; `NO_MOUNT` before
+    /// vfsd's own root mount completes; `IO_ERROR` when the derivation
+    /// fails. Init calls this once during bootstrap to obtain the seed cap
+    /// from which all later namespace-cap distribution flows.
     pub const GET_SYSTEM_ROOT_CAP: u64 = 13;
 
     /// Authority bit in the vfsd-service-endpoint badge. Set on caps
@@ -1162,23 +1162,25 @@ pub mod vfsd_labels
     /// [`GET_SYSTEM_ROOT_CAP`]. Without it the handler replies
     /// `UNAUTHORIZED`. Holding this cap is equivalent to holding the
     /// system-root cap (the handler is a seed source), so it is only
-    /// distributed to init (and svcmgr's restart path, via init's
-    /// future per-service policy).
+    /// distributed to init. Distributing it to svcmgr's restart path is
+    /// design intent; not yet implemented.
     pub const SEED_AUTHORITY: u64 = 1u64 << 62;
 }
 
+/// Wire-protocol version of [`ns_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const NS_LABELS_VERSION: u32 = 1;
 /// IPC labels for the namespace protocol (cap-as-namespace surface).
 ///
-/// Numbered in a reserved range above the surviving [`fs_labels`] codes
-/// (`FS_READ`, `FS_CLOSE`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`,
-/// `FS_RELEASE_ACK`, `FS_MOUNT`, `END_OF_DIR`) so node-cap and per-file
-/// requests share one fs-driver endpoint with no opcode collisions.
+/// Numbered in a reserved range above the [`fs_labels`] codes (2 through
+/// 17) so node-cap and per-file requests share one fs-driver endpoint with
+/// no opcode collisions.
 /// [`fs_labels::END_OF_DIR`] is reused unchanged as the readdir
 /// terminator.
 ///
 /// Protocol semantics, including caller-rights checks, name validation,
-/// per-entry visibility, and child-cap minting, are owned by the
+/// per-entry visibility (enforced at `NS_LOOKUP`; at `NS_READDIR` design
+/// intent, not yet implemented), and child-cap minting, are owned by the
 /// `namespace-protocol` crate's `dispatch_request` function; backends
 /// implement the `NamespaceBackend` trait, run their own receive loop,
 /// and route each `NS_*` message through `dispatch_request` for reply.
@@ -1216,6 +1218,8 @@ pub mod ns_labels
     pub const NS_READDIR: u64 = 22;
 }
 
+/// Wire-protocol version of [`fs_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const FS_LABELS_VERSION: u32 = 3;
 /// IPC labels for filesystem drivers (FAT, ext4, etc.).
 pub mod fs_labels
@@ -1291,7 +1295,9 @@ pub mod fs_labels
     /// Client acknowledgement of [`FS_RELEASE_MEMORY`]: synchronous reply,
     /// empty body.
     pub const FS_RELEASE_ACK: u64 = 9;
-    /// Mount notification from vfsd.
+    /// Mount-time probe from vfsd. Request `data[0]` = caller's compiled
+    /// [`super::FS_LABELS_VERSION`]. Specified in
+    /// `services/fs/docs/fs-driver-protocol.md` § Label 10: `FS_MOUNT`.
     pub const FS_MOUNT: u64 = 10;
     /// Write file content from a caller-supplied source Memory cap.
     ///
@@ -1365,23 +1371,20 @@ pub mod fs_labels
     /// Truncate a file to a new length.
     ///
     /// Request: badge = file-node cap (must carry `WRITE`),
-    /// `label = FS_TRUNCATE`, `data[0]` = new length in bytes.
-    ///
-    /// v1 supports only `new_len == 0` (sufficient for
-    /// `OpenOptions::truncate(true)` and `File::set_len(0)`); non-zero
-    /// lengths reply `IO_ERROR`. The wire shape is forward-compatible
-    /// with later extend-with-zero-fill semantics. The corresponding
-    /// follow-up is tracked in the `ruststd::fs` completeness-gaps Issue.
-    ///
-    /// Reply (label `fs_errors::SUCCESS`): empty body. Errors:
-    /// `INVALID_BADGE`, `IS_A_DIRECTORY`, `PERMISSION_DENIED`,
-    /// `IO_ERROR` (chain walk / `FSInfo` flush failure, or non-zero
-    /// `new_len` until the v2 extend path lands).
+    /// `label = FS_TRUNCATE`, `data[0]` = new length in bytes; only zero
+    /// is supported. Specified, with its errors, in
+    /// `services/fs/docs/fs-driver-protocol.md` § Label 17: `FS_TRUNCATE`.
     pub const FS_TRUNCATE: u64 = 17;
 }
 
+/// Wire-protocol version of [`devmgr_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const DEVMGR_LABELS_VERSION: u32 = 9;
 /// IPC labels for the device manager (`devmgr`).
+///
+/// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
+/// `data[0]`; after any badge check the label makes, devmgr replies
+/// [`devmgr_errors::LABEL_VERSION_MISMATCH`] when it differs.
 pub mod devmgr_labels
 {
     /// Query for a block device endpoint.
@@ -1389,12 +1392,15 @@ pub mod devmgr_labels
     /// Mints a `MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` cap on
     /// `blk_ep` to the caller. Caller's badge must have
     /// [`BLOCK_DEVICE_AUTHORITY`] set; the handler replies
-    /// `UNAUTHORIZED` otherwise.
+    /// `UNAUTHORIZED` otherwise, and `INVALID_REQUEST` when no block driver
+    /// is running or the derivation fails.
     pub const QUERY_BLOCK_DEVICE: u64 = 1;
     /// Query a device's startup-info payload from devmgr's catalog.
     ///
     /// The caller's badge identifies the device by indexing devmgr's
-    /// [`DeviceCatalog`] (badge == entry index + 1). Devmgr stores the
+    /// `DeviceCatalog` (badge == entry index + 1); a badge that indexes no
+    /// entry gets `INVALID_REQUEST`. No authority bit is checked. Devmgr
+    /// stores the
     /// payload bytes opaquely; the per-class shape lives in the driver
     /// crate. Reply schema (generic for every kind):
     /// - `word[0]` = `kind` discriminant ([`super::device_info_kind`])
@@ -1412,7 +1418,8 @@ pub mod devmgr_labels
     /// serial_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap on the
     /// serial driver's service endpoint to the caller.
     /// Caller's badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the
-    /// handler replies `UNAUTHORIZED` otherwise. Mirrors
+    /// handler replies `UNAUTHORIZED` otherwise, and `INVALID_REQUEST`
+    /// when the driver is not running or the derivation fails. Mirrors
     /// [`QUERY_BLOCK_DEVICE`]'s reply shape.
     pub const QUERY_SERIAL_DEVICE: u64 = 3;
     /// Query for the framebuffer device endpoint.
@@ -1421,37 +1428,41 @@ pub mod devmgr_labels
     /// on the framebuffer driver's service endpoint to the caller.
     /// Caller's badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the
     /// handler replies `UNAUTHORIZED` otherwise. Mirrors
-    /// [`QUERY_SERIAL_DEVICE`].
+    /// [`QUERY_SERIAL_DEVICE`], including its `INVALID_REQUEST` cases.
     pub const QUERY_FRAMEBUFFER_DEVICE: u64 = 4;
     /// Query for the platform real-time-clock device endpoint.
     ///
     /// Mints a `rtc_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap
     /// on the RTC driver's service endpoint to the caller. Caller's
     /// badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler
-    /// replies `UNAUTHORIZED` otherwise. Mirrors
-    /// [`QUERY_SERIAL_DEVICE`]. Today's sole consumer is `timed`,
-    /// which seeds its wall-clock offset from one
-    /// `RTC_GET_EPOCH_TIME` round-trip and serves `GET_WALL_TIME`
-    /// thereafter.
+    /// replies `UNAUTHORIZED` otherwise. Replies `NO_DEVICE` until the
+    /// driver is spawned (see [`SET_DRIVERS_DIR`]), and for the rest of the
+    /// boot if that spawn failed; `INVALID_REQUEST` when the derivation
+    /// fails. Today's sole consumer is `timed`, which seeds its wall-clock
+    /// offset from one `RTC_GET_EPOCH_TIME` round-trip and serves
+    /// `GET_WALL_TIME` thereafter.
     pub const QUERY_RTC_DEVICE: u64 = 5;
     /// svcmgr-only handshake: install the
     /// `LOOKUP | READ`-attenuated `/services/drivers/` namespace cap from
     /// which devmgr walks its on-disk driver binaries.
     ///
     /// Request: `data[0]` = caller's compiled
-    /// [`super::DEVMGR_LABELS_VERSION`]; `caps[0]` = badged SEND on a
-    /// vfsd directory node rooted at the system's `/services/drivers/`
-    /// path, derived by svcmgr via
-    /// `namespace_lookup_dir(root_dir_cap, …, LOOKUP | READ)`.
+    /// [`super::DEVMGR_LABELS_VERSION`]; `caps[0]` = badged SEND on the
+    /// `/services/drivers/` directory node, which svcmgr walks from its
+    /// system root via `namespace_lookup_dir(root_dir_cap, …, LOOKUP |
+    /// READ)` (so the node is served by the root filesystem).
     /// Caller's badge MUST carry [`DRIVERS_DIR_AUTHORITY`]; the handler
-    /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise and
+    /// [`super::devmgr_errors::INVALID_REQUEST`] when `caps[0]` is
+    /// absent. A repeated request keeps the first cap and replies
+    /// `SUCCESS`.
     ///
     /// Devmgr stashes the cap and replies
     /// [`super::devmgr_errors::SUCCESS`] **before** doing any spawn
     /// work, so svcmgr never blocks on driver bring-up. The actual walk,
     /// the [`super::procmgr_labels::CREATE_FROM_FILE`] call, and the
-    /// bootstrap-round delivery for any on-disk driver (today: the
-    /// per-arch RTC; #165 will generalize) runs after the reply but
+    /// bootstrap-round delivery for the on-disk drivers (the per-arch RTC
+    /// and virtio-input; #165 will generalize) run after the reply but
     /// before devmgr returns to its next `ipc_recv`. The nested IPC
     /// chain the spawn requires (procmgr → vfsd → block driver) cannot
     /// run inside a request-handler frame without clobbering the
@@ -1462,11 +1473,12 @@ pub mod devmgr_labels
     /// queries see `rtc_ep != 0` (or the sticky-failure state) and
     /// reply normally.
     ///
-    /// The spawn is attempted at most once per boot. On failure
+    /// Each spawn is attempted at most once per boot. On failure
     /// (missing binary, ELF corrupt, carve failure, OOM, etc.),
     /// devmgr marks the driver permanently unavailable for this boot
-    /// and replies [`super::devmgr_errors::NO_DEVICE`] on subsequent
-    /// queries; clients MUST NOT retry-loop.
+    /// and replies [`super::devmgr_errors::NO_DEVICE`] to subsequent
+    /// [`QUERY_RTC_DEVICE`] / [`QUERY_INPUT_DEVICE`] queries; clients MUST
+    /// NOT retry-loop.
     pub const SET_DRIVERS_DIR: u64 = 6;
 
     /// Locate an ACPI table and serve a read-only view of it.
@@ -1537,7 +1549,9 @@ pub mod devmgr_labels
     /// Mints an `input_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap on
     /// the input driver's service endpoint to the caller. Caller's badge
     /// must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies
-    /// `UNAUTHORIZED` otherwise. Mirrors [`QUERY_SERIAL_DEVICE`]. The verb
+    /// `UNAUTHORIZED` otherwise. Like [`QUERY_RTC_DEVICE`], it replies
+    /// `NO_DEVICE` until the on-disk driver is spawned and for the rest of
+    /// the boot if that spawn failed. The verb
     /// is transport-agnostic: any keyboard backend (virtio-input today,
     /// USB HID / PS-2 later) registers this one slot, so consumers never
     /// learn the transport. Value 11 — 9 and 10 are the TODO(#165) test
@@ -1605,7 +1619,7 @@ pub mod devmgr_labels
 
 /// Device-info kind discriminants for [`devmgr_labels::QUERY_DEVICE_INFO`]
 /// replies. Each driver class owns a fixed value; devmgr stores payload
-/// bytes against this discriminant in its [`DeviceCatalog`] and replies
+/// bytes against this discriminant in its `DeviceCatalog` and replies
 /// with the discriminant as `word[0]` so callers can verify the type
 /// before deserialising.
 pub mod device_info_kind
@@ -1617,6 +1631,8 @@ pub mod device_info_kind
     pub const FRAMEBUFFER: u32 = 2;
 }
 
+/// Wire-protocol version of [`blk_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const BLK_LABELS_VERSION: u32 = 2;
 /// IPC labels for block device drivers.
 pub mod blk_labels
@@ -1637,13 +1653,13 @@ pub mod blk_labels
     /// Register a partition range, receiving back a badged SEND cap
     /// scoped to that partition.
     ///
-    /// Caller's badge must have [`MOUNT_AUTHORITY`] set; un-badged
-    /// or partition-badged callers are rejected. Data words:
-    /// `[base_lba, length_lba]`. The driver allocates a fresh
-    /// partition-identity badge, inserts the bound, and replies with
-    /// the partition cap in `caps[0]` — server-side derivation is
-    /// required because [`MOUNT_AUTHORITY`] caps are badged and the
-    /// kernel rejects re-badging of a badged source.
+    /// Caller's badge must have [`MOUNT_AUTHORITY`] set. Data words:
+    /// `[BLK_LABELS_VERSION, base_lba, length_lba]`. The driver derives
+    /// the partition cap itself because [`MOUNT_AUTHORITY`] caps are
+    /// badged and the kernel rejects re-badging of a badged source.
+    /// Specified, with its replies, in
+    /// `services/drivers/virtio/blk/README.md` § Label 2:
+    /// `REGISTER_PARTITION`.
     pub const REGISTER_PARTITION: u64 = 2;
     /// Read one or more contiguous sectors into a caller-supplied Memory cap.
     ///
@@ -1682,12 +1698,15 @@ pub mod blk_labels
     pub const BLK_WRITE_FROM_MEMORY: u64 = 4;
 }
 
+/// Wire-protocol version of [`serial_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const SERIAL_LABELS_VERSION: u32 = 2;
 /// IPC labels for the serial (UART) device driver (`services/drivers/serial`).
 ///
 /// The driver answers byte write, byte read, and RX-notify registration. It
 /// owns the platform UART hardware authority (an `IoPort` for COM1 on x86-64,
-/// an `Mmio` for the ACPI-SPCR-reported NS16550 on RISC-V) and is the sole
+/// an `Mmio` for the QEMU `virt` NS16550 at its platform-static address on
+/// RISC-V) and is the sole
 /// driver-mediated path for userspace serial bytes in both directions. devmgr
 /// spawns it and hands clients a cap badged with
 /// [`serial_labels::WRITE_AUTHORITY`] | [`serial_labels::READ_AUTHORITY`] via
@@ -1752,6 +1771,7 @@ pub mod serial_labels
 /// Error replies from the serial device driver.
 pub mod serial_errors
 {
+    /// Request handled.
     pub const SUCCESS: u64 = 0;
     /// Driver received a label it does not implement.
     pub const UNKNOWN_OPCODE: u64 = 2;
@@ -1768,6 +1788,8 @@ pub mod serial_errors
     pub const UNAUTHORIZED: u64 = 5;
 }
 
+/// Wire-protocol version of [`fb_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const FB_LABELS_VERSION: u32 = 2;
 /// IPC labels for the framebuffer device driver
 /// (`services/drivers/framebuffer`).
@@ -1823,14 +1845,17 @@ pub mod fb_labels
 
     /// Authority bit in the framebuffer-service-endpoint badge's high
     /// u64 bit. Set on caps devmgr mints in response to
-    /// [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]; gates
-    /// [`FB_WRITE_BYTES`]. A verb ("may write"), not an identity.
+    /// [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]. Gating
+    /// [`FB_WRITE_BYTES`] and [`FB_SET_ATTRS`] on it is design intent; not
+    /// yet implemented: the framebuffer driver does not check the bit
+    /// (#454). A verb ("may write"), not an identity.
     pub const WRITE_AUTHORITY: u64 = 1u64 << 63;
 }
 
 /// Error replies from the framebuffer device driver.
 pub mod fb_errors
 {
+    /// Request handled.
     pub const SUCCESS: u64 = 0;
     /// Driver received a label it does not implement.
     pub const UNKNOWN_OPCODE: u64 = 2;
@@ -1840,6 +1865,8 @@ pub mod fb_errors
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
 }
 
+/// Wire-protocol version of [`input_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const INPUT_LABELS_VERSION: u32 = 1;
 /// IPC labels for the keyboard/input device driver
 /// (`services/drivers/virtio/input` today; future USB / PS-2 backends reuse
@@ -1857,7 +1884,9 @@ pub mod input_labels
 {
     /// Read a batch of pending keyboard events (blocking).
     ///
-    /// Request: empty body; the caller's badge must carry [`READ_AUTHORITY`].
+    /// Request: empty body; the caller's badge is meant to carry
+    /// [`READ_AUTHORITY`] (the driver does not yet check it; see that
+    /// constant).
     /// The driver blocks until at least one event is available, then replies
     /// with up to [`super::keysym::INPUT_MAX_EVENTS_PER_READ`] events.
     ///
@@ -1870,14 +1899,16 @@ pub mod input_labels
 
     /// Authority bit in the input-service-endpoint badge's high u64 bit. Set
     /// on caps devmgr mints in response to
-    /// [`devmgr_labels::QUERY_INPUT_DEVICE`]; gates [`INPUT_READ_EVENTS`]. A
-    /// verb ("may read"), not an identity.
+    /// [`devmgr_labels::QUERY_INPUT_DEVICE`]. Gating [`INPUT_READ_EVENTS`] on
+    /// it is design intent; not yet implemented: the virtio-input driver does
+    /// not check the bit (#454). A verb ("may read"), not an identity.
     pub const READ_AUTHORITY: u64 = 1u64 << 63;
 }
 
 /// Error replies from the input device driver.
 pub mod input_errors
 {
+    /// Request handled.
     pub const SUCCESS: u64 = 0;
     /// Driver received a label it does not implement.
     pub const UNKNOWN_OPCODE: u64 = 2;
@@ -1904,33 +1935,55 @@ pub mod keysym
 {
     // Named keys (X11 function-key range). Printable keys are not enumerated;
     // their keysym equals their Unicode codepoint.
+    /// Keysym of the BackSpace key.
     pub const BACKSPACE: u32 = 0xFF08;
+    /// Keysym of the Tab key.
     pub const TAB: u32 = 0xFF09;
+    /// Keysym of the Return key.
     pub const RETURN: u32 = 0xFF0D;
+    /// Keysym of the Escape key.
     pub const ESCAPE: u32 = 0xFF1B;
+    /// Keysym of the Home key.
     pub const HOME: u32 = 0xFF50;
+    /// Keysym of the Left arrow key.
     pub const LEFT: u32 = 0xFF51;
+    /// Keysym of the Up arrow key.
     pub const UP: u32 = 0xFF52;
+    /// Keysym of the Right arrow key.
     pub const RIGHT: u32 = 0xFF53;
+    /// Keysym of the Down arrow key.
     pub const DOWN: u32 = 0xFF54;
+    /// Keysym of the End key.
     pub const END: u32 = 0xFF57;
+    /// Keysym of the Delete key.
     pub const DELETE: u32 = 0xFFFF;
 
     // Modifier keys are delivered as their own press/release events too, so
     // consumers can observe modifier state changes directly.
+    /// Keysym of the Left Shift key.
     pub const SHIFT_L: u32 = 0xFFE1;
+    /// Keysym of the Right Shift key.
     pub const SHIFT_R: u32 = 0xFFE2;
+    /// Keysym of the Left Control key.
     pub const CONTROL_L: u32 = 0xFFE3;
+    /// Keysym of the Right Control key.
     pub const CONTROL_R: u32 = 0xFFE4;
+    /// Keysym of the Caps Lock key.
     pub const CAPS_LOCK: u32 = 0xFFE5;
+    /// Keysym of the Left Alt key.
     pub const ALT_L: u32 = 0xFFE9;
+    /// Keysym of the Right Alt key.
     pub const ALT_R: u32 = 0xFFEA;
 
     // Modifier mask bits (X11 state-mask values: Shift=1, Lock=2, Control=4,
     // Mod1=8). Reported in bits 32-62 of a packed event.
+    /// Modifier-mask bit: Shift held.
     pub const MOD_SHIFT: u32 = 1 << 0;
+    /// Modifier-mask bit: Caps Lock active.
     pub const MOD_CAPS: u32 = 1 << 1;
+    /// Modifier-mask bit: Control held.
     pub const MOD_CTRL: u32 = 1 << 2;
+    /// Modifier-mask bit: Alt held.
     pub const MOD_ALT: u32 = 1 << 3;
 
     /// Maximum events returned by one
@@ -1960,6 +2013,8 @@ pub mod keysym
     }
 }
 
+/// Wire-protocol version of [`stream_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const STREAM_LABELS_VERSION: u32 = 1;
 /// IPC labels for byte-stream endpoints (stdin/stdout/stderr backing).
 ///
@@ -1985,10 +2040,11 @@ pub mod stream_labels
     /// 16-31 of the label, same encoding as `STREAM_BYTES`. The mediator
     /// looks up the slot for the sender's badge (delivered by the kernel
     /// from the badged SEND cap) and stores the bytes as that slot's
-    /// display name. Names that would collide with another badge's name
-    /// are stored with a `.2` / `.3` / … suffix; re-registration by the
-    /// same badge with its own current name is a silent no-op. Names
-    /// longer than the mediator's per-slot buffer are truncated.
+    /// display name, truncated to the mediator's per-slot buffer.
+    /// Collision handling is the mediator's: init's bootstrap log thread
+    /// stores a colliding name with a `.2` / `.3` / … suffix, while logd
+    /// stores names as given (`services/logd/docs/ipc-interface.md`
+    /// § `stream_labels::STREAM_REGISTER_NAME`).
     pub const STREAM_REGISTER_NAME: u64 = 11;
 }
 
@@ -2023,20 +2079,22 @@ pub mod log_badges
 {
     /// init's self-identity. Init derives `cap_derive_badge(log_ep,
     /// SEND, LOG_BADGE_INIT)` at boot and uses the cap for its own
-    /// `seraph::log!` writes.
+    /// log writes (`services/init/src/logging.rs`).
     pub const LOG_BADGE_INIT: u64 = 1;
     /// procmgr's self-identity. Init derives a badged SEND cap with
     /// this badge at procmgr-bootstrap time and seeds it into
     /// `ProcessInfo.log_send_cap` so procmgr's std `_start` can
     /// install it. Procmgr's `seraph::log!` writes ride this cap.
     pub const LOG_BADGE_PROCMGR: u64 = 2;
-    /// First badge value procmgr's per-child counter
-    /// (`NEXT_PROCESS_BADGE`) hands out. Lower values are reserved
-    /// for the system specials above; raising this leaves room to
-    /// reserve more.
+    /// Floor of the low 32 bits of every per-child badge: procmgr draws
+    /// child badges at random and redraws any whose low 32 bits fall below
+    /// it. Lower values are reserved for the system specials above;
+    /// raising this leaves room to reserve more.
     pub const LOG_BADGE_FIRST_CHILD: u64 = 16;
 }
 
+/// Wire-protocol version of [`log_labels`]; bumped and checked as the
+/// block comment above the label modules describes.
 pub const LOG_LABELS_VERSION: u32 = 2;
 /// IPC labels for the system log endpoint's legacy discovery interface
 /// and the one-shot init-logd → real-logd handover.
@@ -2114,9 +2172,9 @@ pub mod log_labels
 
 // ── Bootstrap protocol ──────────────────────────────────────────────────────
 //
-// Children receive their initial cap set via IPC on their `creator_endpoint`
-// cap (the only cap installed at process creation beyond the self-caps). The
-// child issues `BOOTSTRAP_REQUEST` in a loop; the creator replies with up to
+// Children receive the startup caps their `ProcessInfo` does not carry via IPC
+// on their `creator_endpoint` cap. The child issues `bootstrap::REQUEST` in a
+// loop; the creator replies with up to
 // `MSG_CAP_SLOTS_MAX = 4` caps plus arbitrary payload words per round. The
 // reply label's low byte indicates whether more rounds are expected (`MORE`)
 // or the bootstrap is complete (`DONE`).
@@ -2149,6 +2207,7 @@ pub mod bootstrap_errors
 /// Error replies from procmgr.
 pub mod procmgr_errors
 {
+    /// Request handled.
     pub const SUCCESS: u64 = 0;
     /// ELF image validation failed.
     pub const INVALID_ELF: u64 = 1;
@@ -2188,12 +2247,13 @@ pub mod procmgr_errors
 /// Error replies from vfsd.
 pub mod vfsd_errors
 {
+    /// Request handled.
     pub const SUCCESS: u64 = 0;
     /// File / path not found, or mount-path invalid.
     pub const NOT_FOUND: u64 = 1;
     /// No mount covers the requested path / partition not found.
     pub const NO_MOUNT: u64 = 2;
-    /// Filesystem driver module capability unavailable.
+    /// Reserved; not emitted by the current vfsd.
     pub const NO_FS_MODULE: u64 = 3;
     /// Failed to spawn filesystem driver.
     pub const SPAWN_FAILED: u64 = 4;
@@ -2216,6 +2276,7 @@ pub mod vfsd_errors
 /// Error replies from filesystem drivers (FAT, …).
 pub mod fs_errors
 {
+    /// Request handled.
     pub const SUCCESS: u64 = 0;
     /// File not found, or filesystem failed to validate on mount.
     pub const NOT_FOUND: u64 = 1;
@@ -2225,11 +2286,13 @@ pub mod fs_errors
     pub const TOO_MANY_OPEN: u64 = 3;
     /// File badge is invalid or expired.
     pub const INVALID_BADGE: u64 = 4;
-    /// Cooperative-release watchdog fired; the driver revoked the parent
-    /// Memory cap and any derived caps the client still held are now dead.
+    /// Reserved; not emitted by the current fs driver (the fat driver's
+    /// cooperative-release watchdog revokes without replying this code).
     pub const RELEASE_TIMEOUT: u64 = 5;
     /// `FS_READ_MEMORY` cookie is invalid (zero — collides with the
-    /// `OutstandingPage::None` sentinel in fs driver tracking).
+    /// `OutstandingPage::None` sentinel in fs driver tracking), or an
+    /// `FS_WRITE_MEMORY` byte range does not fit its source page (zero
+    /// count, or offset plus count past the page).
     pub const BAD_MEMORY_OFFSET: u64 = 6;
     /// Caller's node-cap badge lacks a rights bit required by the
     /// requested operation (see `namespace-protocol::rights`).
@@ -2260,26 +2323,32 @@ pub mod fs_errors
 /// Error replies from devmgr.
 pub mod devmgr_errors
 {
+    /// Request handled.
     pub const SUCCESS: u64 = 0;
-    /// Cap derivation failed, or invalid device index.
+    /// The request cannot be served: a reply-cap derivation failed, the
+    /// requested driver is not running (`QUERY_BLOCK_DEVICE`,
+    /// `QUERY_SERIAL_DEVICE`, `QUERY_FRAMEBUFFER_DEVICE`), the badge indexes
+    /// no catalog entry (`QUERY_DEVICE_INFO`), `SET_DRIVERS_DIR` carried no
+    /// cap, or a label-specific argument was rejected (see
+    /// `QUERY_ACPI_TABLE` and `QUERY_SHUTDOWN_DEVICE`).
     pub const INVALID_REQUEST: u64 = 1;
     /// Caller's badge lacks the verb bit required by the handler
     /// (e.g. `BLOCK_DEVICE_AUTHORITY` for `QUERY_BLOCK_DEVICE`).
     pub const UNAUTHORIZED: u64 = 2;
-    /// Caller's compiled `DEVMGR_LABELS_VERSION` does not match the receiver's.
-    /// `QUERY_BLOCK_DEVICE` is the handshake entry point and carries the
-    /// caller's version as `data[0]`; mismatch here means the caller was
+    /// Caller's compiled `DEVMGR_LABELS_VERSION`, carried in `data[0]` of
+    /// every devmgr request, does not match the receiver's: the caller was
     /// built against a different revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
-    /// Requested device class is permanently unavailable on this boot.
-    /// Returned by `QUERY_RTC_DEVICE` when devmgr either (a) has not
-    /// received [`super::devmgr_labels::SET_DRIVERS_DIR`] yet, or
-    /// (b) attempted the lazy disk-walked spawn and failed (missing
-    /// binary, ELF corrupt, hardware carve failed, OOM, etc.). The
-    /// answer is sticky for the boot: a single attempt is made and
-    /// further queries get the same `NO_DEVICE` reply. Clients (timed)
-    /// MUST treat this as terminal and fall through to their no-device
-    /// path; they MUST NOT retry-loop.
+    /// Requested device or table is unavailable. Returned by
+    /// `QUERY_RTC_DEVICE` and `QUERY_INPUT_DEVICE` when devmgr either (a)
+    /// has not yet spawned the on-disk driver (no
+    /// [`super::devmgr_labels::SET_DRIVERS_DIR`] yet), or (b) attempted the
+    /// lazy disk-walked spawn and failed (missing binary, ELF corrupt,
+    /// hardware carve failed, OOM, etc.); case (b) is sticky for the boot,
+    /// since a single attempt is made. Clients (timed) MUST treat it as
+    /// terminal and fall through to their no-device path; they MUST NOT
+    /// retry-loop. Also returned by `QUERY_ACPI_TABLE` (table not found)
+    /// and `QUERY_SHUTDOWN_DEVICE` (actuator caps unavailable).
     pub const NO_DEVICE: u64 = 4;
     /// Unknown opcode on devmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
@@ -2288,24 +2357,26 @@ pub mod devmgr_errors
 /// Error replies from svcmgr.
 pub mod svcmgr_errors
 {
+    /// Request handled.
     pub const SUCCESS: u64 = 0;
-    /// Service table is full.
+    /// Reserved; not emitted by the current svcmgr.
     pub const TABLE_FULL: u64 = 1;
     /// Invalid service name (too long / malformed).
     pub const INVALID_NAME: u64 = 2;
-    /// Registration reply missing required caps.
+    /// A required cap is missing: `PUBLISH_ENDPOINT` carried no `caps[0]`,
+    /// or `QUERY_ENDPOINT` could not derive from the stored cap (its
+    /// publisher is gone; the entry is evicted).
     pub const INSUFFICIENT_CAPS: u64 = 3;
-    /// `EventQueue` binding failed for death notification.
+    /// Reserved; not emitted by the current svcmgr.
     pub const EVENT_QUEUE_FAILED: u64 = 4;
     /// Discovery registry lookup: name is not published.
     pub const UNKNOWN_NAME: u64 = 5;
     /// Discovery registry publish: table full or duplicate name.
     pub const REGISTER_REJECTED: u64 = 6;
-    /// Caller's compiled `SVCMGR_LABELS_VERSION` does not match the receiver's.
-    /// The handover-endowment `CAPS` round carries the caller's version
-    /// in `data[1]` (after the `endow_kind` discriminant in `data[0]`);
-    /// mismatch here means the caller was built against a different
-    /// revision of `shared/ipc`.
+    /// Reserved; not emitted by the current svcmgr. The handover-endowment
+    /// `CAPS` round carries the caller's `SVCMGR_LABELS_VERSION` in `data[1]`
+    /// (after the `endow_kind` discriminant in `data[0]`); on a mismatch
+    /// svcmgr's bootstrap fails without replying this code.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
     /// Caller's badge lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
     /// `PUBLISH_ENDPOINT` request or [`svcmgr_labels::HANDOVER_AUTHORITY`] on
@@ -2323,10 +2394,13 @@ pub mod svcmgr_errors
 /// Error replies from block device drivers.
 pub mod blk_errors
 {
+    /// Request handled.
     pub const SUCCESS: u64 = 0;
     /// Device returned an error status byte (value is the `VirtIO` status byte).
     /// Values 1 (IOERR), 2 (UNSUPP) per `VirtIO` 1.2 §5.2.6.
     pub const DEVICE_STATUS_IOERR: u64 = 1;
+    /// Device returned the `VirtIO` UNSUPP status byte (2): it does not
+    /// support the request type.
     pub const DEVICE_STATUS_UNSUPP: u64 = 2;
     /// Read LBA is outside the bounds registered for the caller's badge.
     pub const OUT_OF_BOUNDS: u64 = 3;
@@ -2372,7 +2446,7 @@ pub const ARGS_BLOB_MAX: usize = 256;
 // ── IpcMessage ──────────────────────────────────────────────────────────────
 
 /// Stack-owned snapshot of an IPC message — label, badge, data words, and
-/// received cap-slot indices, carried by value across the IPC wrapper
+/// received capability handles, carried by value across the IPC wrapper
 /// boundary.
 ///
 /// `ipc_recv` and the reply path of `ipc_call` return an `IpcMessage`;

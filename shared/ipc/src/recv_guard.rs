@@ -5,25 +5,12 @@
 
 //! Receive-failure policy for blocking service receive loops.
 //!
-//! A service main loop is `loop { ipc_recv(...) }`. The kernel pre-allocates
-//! worst-case cap-slot headroom in the receiver's `CSpace` before parking, so
-//! a `CSpace`-exhausted receiver fails the recv *before* blocking — an unguarded
-//! loop then retries instantly, forever: 100% CPU, no log line, every client
-//! blocked. [`RecvGuard`] converts that silent wedge into a diagnosable
-//! signal: bounded exponential backoff between retries, a diagnostic hook on
-//! the first failure of a streak, and a loud voluntary death
-//! ([`EXIT_RECV_WEDGE`]) once a streak of identical failures proves the
-//! condition persistent. Supervised services are restarted by svcmgr with a
-//! fresh `CSpace`; unsupervised ones die visibly instead of spinning.
-//!
-//! The guard is for *blocking* receive loops only. Non-blocking drain loops
-//! (`event_try_recv` and friends) treat `WouldBlock` as normal flow and MUST
-//! NOT route their errors through a guard — here `WouldBlock` from a blocking
-//! recv is a defect like any other and counts toward the fatal streak.
-//!
-//! `Interrupted` is exempt: park-interrupted episodes are expected during
-//! thread stop/start and carry no information about the receive path's
-//! health. They neither extend nor reset the streak.
+//! The policy — why an unguarded `loop { ipc_recv }` wedges, the backoff,
+//! the diagnostic hook, the fatal streak and [`EXIT_RECV_WEDGE`], the
+//! `Interrupted` exemption, and which loops use the guard — is specified in
+//! `docs/ipc-design.md` § Receive-Failure Policy. [`RecvGuard`] implements
+//! it. Within a guarded (blocking) loop, `WouldBlock` is a defect like any
+//! other failure and counts toward the fatal streak.
 
 // When this crate is compiled as a std dep via rustc-dep-of-std, the
 // crate root is `no_core` and the usual prelude is not auto-imported.
@@ -37,11 +24,9 @@ use core::prelude::rust_2024::*;
 use syscall_abi::SyscallError;
 
 /// Voluntary exit code for a service whose blocking receive loop wedged
-/// (a fatal streak of identical receive failures). In the voluntary range
-/// `[1, EXIT_FAULT_BASE)`; ruststd privately reserves `0x0F01..=0x0F02` for
-/// startup-infrastructure failures — this code starts the shared/ipc policy
-/// block at `0x0F10`. The exit-code space is flat and has no central
-/// registry; new policy codes should extend this block.
+/// (a fatal streak of identical receive failures). Its place in the flat
+/// voluntary exit-code space is in `docs/ipc-design.md` § Receive-Failure
+/// Policy; new policy codes extend the block it starts.
 pub const EXIT_RECV_WEDGE: u32 = 0x0F10;
 
 /// Consecutive identical receive failures before the guard escalates to
@@ -87,7 +72,9 @@ pub struct RecvGuard
 
 impl RecvGuard
 {
-    /// New guard with a zero streak.
+    /// New guard with a zero streak. `diag` is called with the stage and the
+    /// error code at the first failure of a streak and before the fatal exit;
+    /// pass a function that does nothing when the service has no log access.
     #[must_use]
     pub const fn new(diag: fn(RecvFailureStage, i64)) -> Self
     {

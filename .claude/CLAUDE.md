@@ -50,6 +50,10 @@ truth for "how work is tracked and shipped" on this project.
   (per [docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot).
 
 ## PR workflow operations
+- A batch of Issues is driven as `.claude/skills/orchestrate/SKILL.md` describes (one
+  orchestrator session, one `worker` agent per scope, a host token for the shared host's
+  builds and boots); a single Issue in one session follows `.claude/skills/work/SKILL.md`.
+  Both apply the rules below; neither changes them.
 - All non-tag-driven work lands via a feature-branch PR per
   [docs/conventions.md](../docs/conventions.md); the assistant MUST NOT push directly
   to `master`.

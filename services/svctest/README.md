@@ -71,15 +71,15 @@ aborts without a panic; it logs the failed size. Each then logs `SOME TESTS FAIL
 failure marker of [docs/testing.md § Reporting marker](../../docs/testing.md#reporting-marker),
 and sends the same `SHUTDOWN`, so a failed run also ends in a power-off. The hooks cover any
 thread of the parent run; child modes keep std's default hooks. Whichever path claims the
-marker first logs it, so a run logs exactly one.
+marker first logs it, so a run logs exactly one. A failing thread that finds the marker already
+claimed yields until the run ends instead of aborting, so its abort cannot cut off the
+claimant's marker or `SHUTDOWN`.
 
 Some failures still end the run idle. A panic or allocation failure during the bootstrap round
 logs `SOME TESTS FAILED` but sends no `SHUTDOWN`, because the hooks get the pwrmgr cap only
 after the round returns. A `SHUTDOWN` that pwrmgr answers, or whose call fails, is logged and
 leaves the system idle, as on the pass path. A fault in svctest's own process (a stray access,
-a stack overflow) kills it without running either hook, so it logs neither marker. A failing
-thread that finds the marker already claimed yields until the run ends instead of aborting, so
-its abort cannot cut off the claimant's marker or `SHUTDOWN`.
+a stack overflow) kills it without running either hook, so it logs neither marker.
 
 The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.deny` cap) log the
 skip and return when their cap is zero; the devmgr deny phases (`caps[2]`), the orphan-teardown

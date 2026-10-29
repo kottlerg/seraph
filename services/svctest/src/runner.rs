@@ -72,7 +72,9 @@ fn alloc_error_hook(layout: std::alloc::Layout)
 /// abort's fault would tear the process down while the claimant is still
 /// logging or sending `SHUTDOWN`. Exiting the thread is no substitute,
 /// since a main-thread exit also ends the process. The loop neither
-/// allocates nor panics, and the claimant's power-off or abort ends it.
+/// allocates nor panics, and the end of the process ends it: the
+/// claimant's power-off, its abort, or, when `report_pass` claimed and
+/// pwrmgr answers or fails the `SHUTDOWN`, the main thread's exit.
 fn fail_run()
 {
     if !MARKER_CLAIMED.swap(true, Ordering::AcqRel)

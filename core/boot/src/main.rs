@@ -33,7 +33,8 @@ use crate::paging::{PageTableBuilder, build_initial_tables};
 use crate::uefi::{
     EFI_RNG_PROTOCOL_GUID, EFI_SUCCESS, EfiBootServices, EfiFileProtocol, EfiGuid, EfiHandle,
     EfiRngProtocol, EfiSystemTable, allocate_pages, connect_all_controllers, exit_boot_services,
-    file_read, file_size, get_loaded_image, get_memory_map, open_esp_volume, open_file, query_gop,
+    file_read, file_size, free_pages, get_loaded_image, get_memory_map, open_esp_volume, open_file,
+    query_gop,
 };
 use boot_protocol::{
     BOOT_MODULE_NAME_LEN, BOOT_PROTOCOL_VERSION, BootInfo, BootModule, FramebufferInfo, InitImage,
@@ -113,18 +114,12 @@ struct UefiContext
     framebuffer: FramebufferInfo,
 }
 
-/// Kernel ELF load result: the parsed info and the read-buffer allocation.
-///
-/// The read buffer is unused once `load_kernel` has copied the segments
-/// out, but it is never freed or recorded in `BootInfo.reclaim_ranges`, so it
-/// stays a permanent `Loaded` page (`core/boot/docs/memory-map.md`; #442). It
-/// is identity-mapped in the handoff tables per
-/// `core/boot/docs/page-tables.md` § Contract at Kernel Entry.
+/// Kernel ELF load result. The file read buffer is released inside
+/// [`step3_load_kernel`] once `load_kernel` has copied the segments out, so
+/// only the parsed info outlives step 3.
 struct KernelLoad
 {
     info: KernelInfo,
-    buf_phys: u64,
-    buf_pages: usize,
 }
 
 /// Init ELF load result. Pre-parsed via [`load_init`]; segment bodies live
@@ -532,6 +527,17 @@ unsafe fn step3_load_kernel(ctx: &UefiContext) -> Result<KernelLoad, BootError>
     unsafe { file_read(kernel_file, kernel_buf)? };
     // SAFETY: bs is valid; kernel_buf is the complete ELF file.
     let info = unsafe { load_kernel(ctx.bs, kernel_buf, arch::current::EXPECTED_ELF_MACHINE)? };
+    // The read buffer is dead: load_kernel copied every segment and the
+    // relocation table into the image span. Zero it, so the kernel file
+    // bytes do not reach the memory the kernel hands out, then return it to
+    // the firmware; a refused free only leaves it allocated.
+    kernel_buf.fill(0);
+    // SAFETY: bs is valid pre-exit; buf_phys/buf_pages is the allocation made
+    // above, and kernel_buf, its only view, is not used again.
+    if unsafe { free_pages(ctx.bs, buf_phys, buf_pages) }.is_err()
+    {
+        bprintln!("[--------] boot: kernel ELF read buffer not freed; it stays allocated");
+    }
 
     bprintln!(
         "[--------] boot: kernel base={:#018x}  entry={:#018x}  size={:#018x} bytes",
@@ -540,11 +546,7 @@ unsafe fn step3_load_kernel(ctx: &UefiContext) -> Result<KernelLoad, BootError>
         info.size
     );
 
-    Ok(KernelLoad {
-        info,
-        buf_phys,
-        buf_pages,
-    })
+    Ok(KernelLoad { info })
 }
 
 // ── Step 4: Parse bundle, pre-parse init ELF, collect modules ────────────────
@@ -726,24 +728,17 @@ unsafe fn step5_discover_cpu_topology(ctx: &UefiContext, firm: &FirmwareInfo) ->
         let (count, hart_ids) = unsafe { dtb::parse_cpu_count(firm.device_tree) };
         if count > 0
         {
-            bprintln!("[--------] boot: DTB: {count} hart(s) found");
-            let mut cpu_ids = [0u32; MAX_CPUS];
-            cpu_ids[0] = bsp_id;
-            let mut ap_idx = 1usize;
-            for &hart_id in hart_ids.iter().take(count as usize)
+            let (topology, truncated) =
+                cpu_topology_from_ids(boot_hart_id, bsp_id, &hart_ids[..count as usize]);
+            if truncated
             {
-                if hart_id != bsp_id && ap_idx < MAX_CPUS
-                {
-                    cpu_ids[ap_idx] = hart_id;
-                    ap_idx += 1;
-                }
+                bprintln!(
+                    "[--------] boot: DTB: more than MAX_CPUS distinct harts (boot hart \
+                     included); surplus dropped"
+                );
             }
-            CpuTopology {
-                boot_hart_id,
-                bsp_id,
-                count,
-                cpu_ids,
-            }
+            bprintln!("[--------] boot: DTB: {} hart(s) found", topology.count);
+            topology
         }
         else
         {
@@ -756,6 +751,40 @@ unsafe fn step5_discover_cpu_topology(ctx: &UefiContext, firm: &FirmwareInfo) ->
         bprintln!("[--------] boot: CPU topology: no firmware tables, defaulting to 1");
         single_cpu_topology(boot_hart_id, bsp_id)
     }
+}
+
+/// Build the topology from the enabled CPU hardware IDs a firmware table
+/// lists, in table order: the BSP at index 0, then each other distinct ID
+/// once. The count is the number of slots filled, so the BSP counts once
+/// whether or not the table lists it, and `cpu_ids[1..count]` holds exactly
+/// the APs. Returns the topology and whether a distinct ID found no slot.
+fn cpu_topology_from_ids(boot_hart_id: u64, bsp_id: u32, ids: &[u32]) -> (CpuTopology, bool)
+{
+    let mut topology = single_cpu_topology(boot_hart_id, bsp_id);
+    let mut filled: usize = 1;
+    let mut truncated = false;
+    for &id in ids
+    {
+        if topology.cpu_ids[..filled].contains(&id)
+        {
+            continue;
+        }
+        if filled < MAX_CPUS
+        {
+            topology.cpu_ids[filled] = id;
+            filled += 1;
+        }
+        else
+        {
+            truncated = true;
+        }
+    }
+    // filled is at most MAX_CPUS, which fits in u32.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        topology.count = filled as u32;
+    }
+    (topology, truncated)
 }
 
 fn single_cpu_topology(boot_hart_id: u64, bsp_id: u32) -> CpuTopology
@@ -1138,19 +1167,13 @@ fn collect_identity_regions(
     push(allocs.stack_phys, (KERNEL_STACK_PAGES as u64) * 4096);
     // Init segments — segment bodies live in their own UEFI allocations,
     // produced by `load_init` against the bundle slice for the `init` entry.
-    // Each region spans `size` rounded up to whole pages from the page holding
-    // `phys_addr`, which carries the `p_vaddr` in-page offset; when that offset
-    // plus `size` crosses one more page boundary than `size` alone, the
-    // segment's last page is left unmapped (defect, #442).
+    // `phys_addr` carries the `p_vaddr` in-page offset; `build_initial_tables`
+    // maps every page the byte range touches.
     for i in 0..(init.image.segment_count as usize)
     {
         let seg = &init.image.segments[i];
-        push(seg.phys_addr, (seg.size + 4095) & !4095);
+        push(seg.phys_addr, seg.size);
     }
-    // Kernel ELF file read buffer: a permanent `Loaded` page, never freed or
-    // reclaimed (core/boot/docs/memory-map.md; #442), identity-mapped per
-    // core/boot/docs/page-tables.md § Contract at Kernel Entry.
-    push(kernel.buf_phys, (kernel.buf_pages as u64) * 4096);
     // Bundle blob: one allocation covers every module body and the init
     // ELF source bytes. Map once.
     push(bundle.phys, (bundle.pages as u64) * 4096);
@@ -1353,12 +1376,18 @@ unsafe fn step9_populate_boot_info(
     };
     bprintln!("[--------] boot: MMIO apertures: {aperture_count} derived");
 
+    // The raw UEFI memory-map buffer is dead: the translation and the
+    // aperture derivation above were its last readers. Zero it before it is
+    // recorded below, so the firmware's map does not reach the memory the
+    // kernel hands out.
+    // SAFETY: buffer_phys is the step 7 allocation of buffer_size bytes, still
+    // identity-mapped under the firmware's tables; nothing reads it again.
+    unsafe { core::ptr::write_bytes(uefi_map.buffer_phys as *mut u8, 0, uefi_map.buffer_size) };
+
     // Build `BootInfo.reclaim_ranges` in the dedicated 4 KiB page at
     // `allocs.reclaim_array_phys`: the scratch pages core/boot/docs/boot-flow.md
     // § Step 9 lists for `reclaim_ranges` (the AP trampoline entry flagged
     // `RECLAIM_FLAG_LATE`), with the reclaim-array page itself recorded last.
-    // The kernel ELF read buffer and the raw UEFI memory-map buffer are not
-    // recorded and stay permanent (core/boot/docs/memory-map.md; #442).
     // SAFETY: reclaim_array_phys is a valid 4 KiB allocation; we treat it as
     // a fixed-size array of MAX_RECLAIM_RANGES entries (256 × 16 B = 4 KiB).
     let reclaim_ranges: &mut [ReclaimRange; MAX_RECLAIM_RANGES] =
@@ -1399,6 +1428,15 @@ unsafe fn step9_populate_boot_info(
         push_reclaim(allocs.mem_entries_phys, MEM_MAP_ENTRY_PAGES as u32, 0);
     }
     push_reclaim(allocs.apertures_phys, 1, 0);
+    // The map buffer is a whole-page allocation far below u32::MAX pages.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        push_reclaim(
+            uefi_map.buffer_phys,
+            (uefi_map.buffer_size / 4096) as u32,
+            0,
+        );
+    }
     for &frame in page_table.allocated_frames()
     {
         push_reclaim(frame, 1, 0);
@@ -1607,8 +1645,12 @@ unsafe fn step10_handoff(
 #[cfg(test)]
 mod tests
 {
-    use super::{BootEntropy, ElfKind, KaslrOverride, choose_kaslr_layout, scrub};
-    use boot_protocol::{KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED};
+    use super::{
+        BootEntropy, ElfKind, KaslrOverride, choose_kaslr_layout, cpu_topology_from_ids, scrub,
+    };
+    use boot_protocol::{
+        KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED, MAX_CPUS,
+    };
 
     const IMAGE: u64 = 8 << 20;
 
@@ -1695,5 +1737,49 @@ mod tests
     {
         let mut empty: [u8; 0] = [];
         scrub(&mut empty);
+    }
+
+    #[test]
+    fn boot_hart_absent_from_the_list_still_counts_once()
+    {
+        let (t, truncated) = cpu_topology_from_ids(7, 0, &[1, 2, 3]);
+        assert_eq!(t.count, 4);
+        assert_eq!(t.cpu_ids[..4], [0, 1, 2, 3]);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn listed_boot_hart_is_not_placed_again()
+    {
+        let (t, _) = cpu_topology_from_ids(0, 2, &[0, 1, 2, 3]);
+        assert_eq!(t.count, 4);
+        assert_eq!(t.cpu_ids[..4], [2, 0, 1, 3]);
+    }
+
+    #[test]
+    fn duplicated_hart_id_is_placed_once()
+    {
+        let (t, _) = cpu_topology_from_ids(0, 0, &[1, 2, 1]);
+        assert_eq!(t.count, 3);
+        assert_eq!(t.cpu_ids[..3], [0, 1, 2]);
+    }
+
+    #[test]
+    fn full_list_including_the_boot_hart_fits_exactly()
+    {
+        let ids: Vec<u32> = (0..MAX_CPUS as u32).collect();
+        let (t, truncated) = cpu_topology_from_ids(0, 0, &ids);
+        assert_eq!(t.count as usize, MAX_CPUS);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn full_list_omitting_the_boot_hart_drops_the_last_ap_and_says_so()
+    {
+        let ids: Vec<u32> = (1..=MAX_CPUS as u32).collect();
+        let (t, truncated) = cpu_topology_from_ids(0, 0, &ids);
+        assert_eq!(t.count as usize, MAX_CPUS);
+        assert_eq!(t.cpu_ids[MAX_CPUS - 1], MAX_CPUS as u32 - 1);
+        assert!(truncated);
     }
 }

@@ -66,7 +66,8 @@ fn mode_name(mode: PagingMode) -> &'static str
 ///
 /// # Safety
 /// Must run in S-mode before `ExitBootServices` (`bs` valid for the probe-root
-/// frame allocation) and before step 6 builds the boot page tables.
+/// frame allocation and its release) and before step 6 builds the boot page
+/// tables.
 /// `dtb_addr` must be zero or the physical address of an identity-mapped FDT.
 pub unsafe fn negotiate_paging(
     bs: *mut uefi::EfiBootServices,
@@ -98,6 +99,19 @@ pub unsafe fn negotiate_paging(
         candidate = candidate
             .next_lower()
             .ok_or(BootError::PagingModeUnsupported)?;
+    }
+
+    // The probe table is dead once a mode is chosen. Zero it, so no stale
+    // table reaches the memory the kernel later hands out, then return it
+    // to the firmware; a refused free only leaves the page `Loaded`.
+    // SAFETY: probe_root is the exclusively-owned 4 KiB frame allocated
+    // above; satp no longer names it (probe_satp_mode restored the live value).
+    unsafe { core::ptr::write_bytes(probe_root as *mut u8, 0, PAGE_SIZE_USIZE) };
+    // SAFETY: bs is valid pre-ExitBootServices; probe_root is our allocation
+    // and is not touched again.
+    if unsafe { uefi::free_pages(bs, probe_root, 1) }.is_err()
+    {
+        bprintln!("[--------] boot: paging-mode probe page not freed; it stays allocated");
     }
 
     NEGOTIATED_MODE.store(candidate as u8, Ordering::Relaxed);

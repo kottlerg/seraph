@@ -78,10 +78,10 @@ the re-exports in `core/boot/src/arch/mod.rs`.
 (header validation, `PT_LOAD` segment enumeration, entry point, `PT_TLS` and stack-note
 extraction, load-span computation, and `RELATIVE` relocation support).
 `core/boot/src/elf.rs` is a thin UEFI-allocation layer over it: for the kernel
-image it allocates one contiguous span at any available physical base via
-`AllocatePages(AllocateAnyPages, …)` and places each `PT_LOAD` segment at
-its ELF-relative offset within the span, so kernel placement tolerates any
-firmware memory layout; for the init image it allocates at any available
+image it allocates one contiguous span (at any available physical base on RISC-V,
+wholly below 4 GiB on x86-64) and places each `PT_LOAD` segment at its
+ELF-relative offset within the span, so kernel placement does not depend on a
+fixed firmware layout; for the init image it allocates at any available
 address while preserving the in-page byte offset of `p_vaddr`, then
 constructs the `BootInfo.init_image` ABI surface so the kernel never needs
 an ELF parser. Boot modules are loaded as opaque flat binaries with no

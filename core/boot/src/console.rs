@@ -70,14 +70,14 @@ pub unsafe fn init_framebuffer(fb: &FramebufferInfo)
 /// This is the low-level sink used by `bprint!`/`bprintln!`. Inserts `\r`
 /// before each `\n` on the serial path so terminals show correct line endings.
 ///
-/// # Safety
-/// Must be called only from the single boot thread (no concurrent access to
-/// `CONSOLE`). Backends need not be initialized: output to a backend that is
-/// not live is dropped (the `unsafe` qualifier is stale, #442).
-pub unsafe fn console_write_str(s: &str)
+/// Safe to call at any point: output to a backend that is not yet
+/// initialized is dropped.
+pub fn console_write_str(s: &str)
 {
-    // SAFETY: CONSOLE is only accessed from the single boot thread.
-    // SAFETY: raw pointer avoids the static_mut_refs lint; single-threaded bootloader.
+    // SAFETY: the bootloader runs on a single boot thread with no
+    // console-writing interrupt handlers, and nothing below re-enters the
+    // console, so this is the only live reference to CONSOLE. The raw pointer
+    // avoids the static_mut_refs lint.
     let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
 
     for byte in s.bytes()
@@ -117,10 +117,7 @@ impl core::fmt::Write for ConsoleWriter
 {
     fn write_str(&mut self, s: &str) -> core::fmt::Result
     {
-        // SAFETY: single-threaded bootloader; output before init is dropped.
-        unsafe {
-            console_write_str(s);
-        }
+        console_write_str(s);
         Ok(())
     }
 }
@@ -159,16 +156,10 @@ macro_rules! bprint {
 #[macro_export]
 macro_rules! bprintln {
     () => {{
-        // SAFETY: single-threaded bootloader; output before init is dropped.
-        unsafe {
-            $crate::console::console_write_str("\r\n");
-        }
+        $crate::console::console_write_str("\r\n");
     }};
     ($($arg:tt)*) => {{
         $crate::console::console_write_fmt(::core::format_args!($($arg)*));
-        // SAFETY: single-threaded bootloader; output before init is dropped.
-        unsafe {
-            $crate::console::console_write_str("\r\n");
-        }
+        $crate::console::console_write_str("\r\n");
     }};
 }

@@ -18,8 +18,10 @@
 //! # Surface
 //! - [`parse_cpu_topology`]: MADT walk producing `BootInfo.cpu_count` and
 //!   `BootInfo.cpu_ids`.
-//! - [`parse_aperture_seed`]: MADT + MCFG walk producing MMIO aperture
-//!   seeds fed into [`super::memory_map::derive_mmio_apertures`].
+//! - [`parse_aperture_seed`]: MADT + MCFG walk, plus the arch's
+//!   platform-default MMIO apertures (`core/boot/docs/acpi.md` § Tables
+//!   Consumed), producing MMIO aperture seeds fed into
+//!   [`super::memory_map::derive_mmio_apertures`].
 //! - [`parse_hart_caps`]: RHCT walk (RISC-V, ACPI 6.5+) producing the
 //!   `time` CSR frequency and the `HART_CAP_*` bits every hart advertises.
 //! - [`parse_vmgenid_paddr`]: SSDT walk (QEMU VMGENID) producing the
@@ -513,7 +515,8 @@ fn parse_madt_topology(table: &[u8], bsp_id: u32) -> (u32, u32, [u32; MAX_CPUS])
     if truncated
     {
         bprintln!(
-            "[--------] boot: ACPI: MADT reported more than MAX_CPUS enabled CPUs; surplus dropped"
+            "[--------] boot: ACPI: MADT reported more than MAX_CPUS enabled CPUs (BSP \
+             included); surplus dropped"
         );
     }
     (cpu_count, bsp_id, cpu_ids)

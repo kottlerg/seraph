@@ -27,7 +27,11 @@ The implementation lives in [`core/boot/src/memory_map.rs`](../src/memory_map.rs
 
 `EfiBootServices*` → `Usable` is deliberate: those regions are dead
 after `ExitBootServices` and represent the largest usable reclaim on a
-typical system. `EfiRuntimeServices*` → `Reserved` keeps firmware runtime
+typical system. They still hold what firmware and the bootloader left there
+(the UEFI stack the bootloader runs on is `EfiBootServicesData`), so the kernel
+zeroes every page it drains from them before minting it to userspace
+([initialization.md § Phase 7](../../kernel/docs/initialization.md#phase-7-capability-system)).
+`EfiRuntimeServices*` → `Reserved` keeps firmware runtime
 code and data out of every allocator and reclaim path even though Seraph never
 calls into it.
 
@@ -75,7 +79,8 @@ init (see [process-lifecycle.md](../../../docs/process-lifecycle.md) §"Init rea
 
 - The bootloader-scratch subset recorded in `BootInfo.reclaim_ranges` (the raw UEFI
   memory-map buffer among it, zeroed after its last read in step 9), minted
-  in Phase 7 (the AP trampoline page is late-minted in Phase 8). See
+  in Phase 7 (the AP trampoline page is late-minted in Phase 8) and zeroed
+  whole by the kernel in Phase 9, before init runs. See
   [initialization.md](../../kernel/docs/initialization.md) §"Phase 7: Capability System",
   and §"Phase 3: Kernel Page Tables" step 7 for the bootloader page-table
   frames.

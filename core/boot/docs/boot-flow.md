@@ -87,8 +87,9 @@ The bootloader walks the bundle header from step 2 and produces both
 `bundle::INIT_ENTRY_NAME` (`"init"`). Its body bytes — a slice of the
 bundle allocation — receive full ELF treatment: header validation, W^X
 check, and per-segment loading. Each `PT_LOAD` segment is allocated at
-any available physical address via `AllocateAnyPages`, file data copied
-in, BSS tail zeroed. The resulting `InitImage` is stored in
+any available physical address via `AllocateAnyPages`, zeroed whole (the
+segment's Memory cap reaches userspace at init's reap, slack pages included),
+and file data copied in. The resulting `InitImage` is stored in
 `BootInfo.init_image`. Exactly one bundle entry MUST carry this name;
 zero or two is `BootError::InvalidBundle`.
 
@@ -134,9 +135,10 @@ A third extraction, run in step 9, produces **seed entries** for `mmio_apertures
 `{phys_base, size}` regions the kernel mints as `Mmio` capabilities. The seed covers LAPIC / IOAPIC
 / PLIC / CLINT / UART / ECAM / BAR windows / `virtio,mmio` transports from the firmware tables, the
 arch's platform-default MMIO apertures the ACPI seeder appends ([acpi.md](acpi.md) § Tables
-Consumed), and the GOP framebuffer, and is merged there with the UEFI memory map's `MemoryMappedIO`
-regions (firmware-parsing.md § [`mmio_apertures`
-construction](firmware-parsing.md#mmio_apertures-construction)).
+Consumed), and the GOP framebuffer. Each seed is clipped to the memory map (named seeds lose the
+RAM-class and firmware-exclusive ranges, heuristic PCI windows every non-MMIO range) and merged
+there with the UEFI memory map's `MemoryMappedIO` regions (firmware-parsing.md
+§ [`mmio_apertures` construction](firmware-parsing.md#mmio_apertures-construction)).
 
 On RISC-V the paging mode is negotiated here, from the DTB `mmu-type` claim and
 a `satp` probe, before step 6 fixes the table hierarchy depth (see
@@ -249,7 +251,7 @@ this donated page after consuming them. The `version` field is set to
 | `acpi_rsdp` | Physical address of ACPI RSDP from step 5; zero if GUID absent |
 | `device_tree` | Physical address of DTB from step 5; zero if GUID absent |
 | `kernel_mmio` | Arch-specific MMIO bases and riscv64 hart facts, extracted from the firmware tables discovered in step 5 and written here in step 9 (see [firmware-parsing.md](firmware-parsing.md)). MMIO bases the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults; a zero riscv64 `timebase_freq` or missing `hart_caps` bit is fatal at kernel [Phase 5](../../kernel/docs/initialization.md#phase-5-architecture-hardware-initialisation). |
-| `mmio_apertures` | Coarse `{phys_base, size}` array assembled in step 9 (UEFI MMIO regions merged with the firmware-table and framebuffer seeds). Empty if no MMIO regions were reported. |
+| `mmio_apertures` | Coarse `{phys_base, size}` array assembled in step 9 (UEFI MMIO regions merged with the firmware-table and framebuffer seeds, each seed clipped to the memory map as firmware-parsing.md § Firmware exclusion defines). Empty if no MMIO regions were reported. |
 | `cpu_count` | Count of distinct hardware IDs among the enabled or online-capable Local APIC / Local x2APIC entries from MADT (x86-64) or the enabled RINTC entries (RISC-V), the BSP counted once whether or not the MADT lists it, capped at `MAX_CPUS`; or the DTB hart count (RISC-V); always ≥ 1 |
 | `bsp_id` | APIC ID of the BSP (x86-64) or boot hart ID from `EFI_RISCV_BOOT_PROTOCOL` (RISC-V) |
 | `cpu_ids` | Per-CPU hardware identifiers; `cpu_ids[0] == bsp_id`; entries beyond `cpu_count` are zero |

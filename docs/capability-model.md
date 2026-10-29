@@ -714,8 +714,8 @@ The kernel mints these during Phases 7–9 of
 (Phase 8 mints the late-reclaim cap over the AP trampoline page).
 
 - Memory capabilities for all usable physical memory
-- Mmio capabilities (Map | Write), one per `BootInfo.mmio_apertures` entry, plus one
-  over the kernel console UART on RISC-V
+- Mmio capabilities (Map | Write), one per `BootInfo.mmio_apertures` entry Phase 6 validates,
+  plus one over the kernel console UART on RISC-V
 - One root Interrupt range capability covering every valid IRQ id on the architecture
 - Map-only Memory capabilities over each `AcpiReclaimable` memory-map region, the page
   holding `BootInfo.acpi_rsdp`, and the `BootInfo.device_tree` blob, allowing userspace

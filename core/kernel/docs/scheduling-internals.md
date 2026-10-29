@@ -1579,4 +1579,5 @@ adds one lock acquire at thread create/destroy and a walk per `CSpace` or
 [Scheduler Internals](scheduler.md), [Syscall Interface Specification](syscalls.md),
 [Thread Lifecycle and Sleep List Invariants](thread-lifecycle-and-sleep.md),
 [Build System](../../../docs/build-system.md),
+[Coding Standards](../../../docs/coding-standards.md),
 [Fault Handling](../../../docs/fault-handling.md)

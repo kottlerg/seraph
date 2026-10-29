@@ -915,6 +915,7 @@ Path, and
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
 [Capability Model](../../../docs/capability-model.md),
+[Coding Standards](../../../docs/coding-standards.md),
 [Fault Handling](../../../docs/fault-handling.md), [IPC Design](../../../docs/ipc-design.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [init Bootstrap Stages](../../../services/init/docs/bootstrap.md)

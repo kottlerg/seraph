@@ -424,7 +424,9 @@ donation-record mechanism.
 [Capability Subsystem Internals](capability-internals.md),
 [Kernel Initialization Sequence](initialization.md), [IPC Subsystem Internals](ipc-internals.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
-[Syscall Interface Specification](syscalls.md), [Memory Model](../../../docs/memory-model.md),
+[Syscall Interface Specification](syscalls.md),
+[Coding Standards](../../../docs/coding-standards.md),
+[Memory Model](../../../docs/memory-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [init Bootstrap Stages](../../../services/init/docs/bootstrap.md),
 [services/procmgr/README.md](../../../services/procmgr/README.md)

@@ -100,7 +100,8 @@ feature) MAY stay unassigned; it is assigned when it is scheduled. The rule appl
 filed before it: the maintainer assigns each a milestone or confirms it as unscheduled work. An
 Issue that closes without a milestone, or under one other than the current milestone, MUST be
 assigned the current milestone when it closes; step 7 of § Release Production decides the release
-a closed Issue settles on.
+a closed Issue settles on. A pull request MUST NOT carry a milestone; milestones are assigned to
+Issues only.
 
 ### Commit and PR cross-references
 

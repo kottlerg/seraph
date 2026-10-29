@@ -465,8 +465,8 @@ pub mod memmgr_labels
     /// carrying every right of their pool frames;
     /// [`super::memmgr_grant_layout`] checks the shape.
     /// `sum(page_count_for_cap_i) == want_pages` for both contiguous and
-    /// best-effort replies. Each reply cap MUST additionally carry
-    /// `MemRights::RETYPE` so the caller can retype the memory into kernel
+    /// best-effort replies. Each reply cap MUST carry `MemRights::RETYPE`
+    /// among those rights so the caller can retype the memory into kernel
     /// objects via the `SYS_CAP_CREATE_*` syscalls; memmgr derives reply caps
     /// with `RIGHTS_ALL`, which preserves the RETYPE bit stamped at boot by
     /// the kernel.

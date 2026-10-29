@@ -48,9 +48,11 @@ It exposes a small IPC surface (`shared/ipc/src/lib.rs::pwrmgr_labels`):
 
 For both labels, on the success path the platform powers off or resets and
 no reply is delivered. A reply only arrives when the request is rejected (see
-the authority gate below) or the platform fails to act; a failure replies
-`pwrmgr_errors::INVALID_REQUEST`, including a request the platform has not
-acted on one second after it was issued.
+the authority gate below), when pwrmgr cannot act on it (no actuator was
+resolved from devmgr at startup, so it serves degraded), or when the platform
+fails to act. Both failures reply `pwrmgr_errors::INVALID_REQUEST`, the latter
+including a request the platform has not acted on one second after it was
+issued.
 
 Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
 `1<<63`). Calls without the bit reply `pwrmgr_errors::UNAUTHORIZED`.

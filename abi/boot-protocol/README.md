@@ -31,7 +31,7 @@ sequence.
 
 ## Compliant Bootloader
 
-The Seraph bootloader in [`boot/`](../../core/boot/) is the **reference
+The Seraph bootloader in [`core/boot/`](../../core/boot/README.md) is the **reference
 implementation**. Any compliant bootloader that satisfies the contract
 defined by this crate — the `BootInfo` layout, the
 `BOOT_PROTOCOL_VERSION` check, and the CPU/memory state at kernel entry

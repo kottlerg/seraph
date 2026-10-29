@@ -68,7 +68,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
 
     // ── Step 3: Start — child signals readiness. ──────────────────────────────
-    crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg) }
         .map_err(|_| "integration::thread_lifecycle: configure_and_start failed")?;
     let ready_bits = notification_wait(ready)
         .map_err(|_| "integration::thread_lifecycle: notification_wait (readiness) failed")?;
@@ -82,7 +84,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── Step 5: Read registers — verify IP is non-zero. ───────────────────────
     let mut reg_buf = [0u8; BUF];
-    thread_read_regs(child.th, reg_buf.as_mut_ptr(), BUF)
+    thread_read_regs(child.th, &mut reg_buf[..BUF])
         .map_err(|_| "integration::thread_lifecycle: thread_read_regs failed")?;
 
     let ip = u64::from_le_bytes(
@@ -101,7 +103,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     PHASE2_SIG.store(child_ready, Ordering::Release);
     let phase2_ptr = phase2_entry as *const () as u64;
     reg_buf[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&phase2_ptr.to_le_bytes());
-    thread_write_regs(child.th, reg_buf.as_ptr(), BUF)
+    // SAFETY: the frame was read from this stopped child, so its stack pointer
+    // stays on the child's own `ChildStack`; its IP is set to `phase2_entry`,
+    // an `extern "C"` entry that never returns and needs nothing of the
+    // abandoned frame, so the child resumes on code and a stack it owns.
+    unsafe { thread_write_regs(child.th, &reg_buf[..BUF]) }
         .map_err(|_| "integration::thread_lifecycle: thread_write_regs failed")?;
 
     // ── Step 7: Resume — child lands in phase2_entry and sends 0x2. ──────────

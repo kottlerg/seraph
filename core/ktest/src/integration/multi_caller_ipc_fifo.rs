@@ -79,7 +79,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     let arg_a = unsafe { caller_arg(0, ep_a, done_a, 1) };
     let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
     // Pin to CPU 0 so sleep-based FIFO ordering is reliable under SMP.
-    spawn::configure_and_start_pinned(&child_a, caller_entry, stack_a, arg_a, 0)
+    // SAFETY: the stack is `STACK_A`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(&child_a, caller_entry, stack_a, arg_a, 0) }
         .map_err(|_| "multi_caller_ipc_fifo: start A failed")?;
     // Sleep so A (floor priority, strictly below this thread) runs and
     // blocks on ipc_call before B is started.
@@ -94,7 +96,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     // SAFETY: entry 1 is caller B's, not yet started.
     let arg_b = unsafe { caller_arg(1, ep_b, done_b, 2) };
     let stack_b = ChildStack::top(core::ptr::addr_of!(STACK_B));
-    spawn::configure_and_start_pinned(&child_b, caller_entry, stack_b, arg_b, 0)
+    // SAFETY: the stack is `STACK_B`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(&child_b, caller_entry, stack_b, arg_b, 0) }
         .map_err(|_| "multi_caller_ipc_fifo: start B failed")?;
     thread_sleep(1).map_err(|_| "multi_caller_ipc_fifo: sleep after B failed")?;
 
@@ -107,7 +111,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     // SAFETY: entry 2 is caller C's, not yet started.
     let arg_c = unsafe { caller_arg(2, ep_c, done_c, 3) };
     let stack_c = ChildStack::top(core::ptr::addr_of!(STACK_C));
-    spawn::configure_and_start_pinned(&child_c, caller_entry, stack_c, arg_c, 0)
+    // SAFETY: the stack is `STACK_C`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(&child_c, caller_entry, stack_c, arg_c, 0) }
         .map_err(|_| "multi_caller_ipc_fifo: start C failed")?;
     thread_sleep(1).map_err(|_| "multi_caller_ipc_fifo: sleep after C failed")?;
 
@@ -176,6 +182,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 // ── Child thread entry ────────────────────────────────────────────────────────
 
+/// IPC pages of the three [`caller_entry`] children, one per caller label.
+static mut CALLER_IPC_PAGES: [crate::IpcPage; 3] = [crate::IpcPage::ZERO; 3];
+
 /// Caller entry: calls the endpoint immediately with its label, then ORs its
 /// bit into the `done` notification when the reply arrives.
 ///
@@ -189,9 +198,15 @@ extern "C" fn caller_entry(arg: u64) -> !
         label,
     } = unsafe { spawn::child_args(arg) };
 
-    // Register the shared IPC buffer for this child thread.
-    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
-    if syscall::ipc_buffer_set(buf_addr).is_err()
+    // SAFETY: takes the element's raw address without forming a reference to
+    // the `static mut`.
+    let buf_addr = crate::IpcPage::addr(unsafe {
+        core::ptr::addr_of_mut!(CALLER_IPC_PAGES[(label - 1) as usize])
+    });
+    // SAFETY: `CALLER_IPC_PAGES[(label - 1) as usize]` is this caller's own IPC page, used by one thread at a time
+    // (`IpcPage`'s rule); no Rust object lives in it, and the child
+    // reaches it only through the raw `buf_addr` pointer.
+    if unsafe { syscall::ipc_buffer_set(buf_addr) }.is_err()
     {
         thread_exit()
     }

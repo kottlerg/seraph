@@ -398,7 +398,10 @@ fn create_thread(
     // a stack is never reused while its previous target runs; the caller's is
     // reused only by the next phase's caller, after this one has exited.
     let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack]) });
-    thread_configure(th, entry as *const () as u64, top, arg)
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+    // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+    // rule, as noted where the stack is chosen).
+    unsafe { thread_configure(th, entry as *const () as u64, top, arg) }
         .map_err(|_| "stress::thread_cap_delete_under_use: thread_configure failed")?;
     thread_set_affinity(th, cpu)
         .map_err(|_| "stress::thread_cap_delete_under_use: pin thread failed")?;
@@ -597,7 +600,7 @@ fn group(handle: u32, regs: &mut [u8; REGS_BUF]) -> bool
     if stopped.is_some()
     {
         let Ok(read) = call(READ_REGS, Some(refused), || {
-            thread_read_regs(handle, regs.as_mut_ptr(), REGS_BUF)
+            thread_read_regs(handle, &mut regs[..REGS_BUF])
         })
         else
         {
@@ -609,7 +612,10 @@ fn group(handle: u32, regs: &mut [u8; REGS_BUF]) -> bool
             #[allow(clippy::cast_possible_truncation)]
             let len = len as usize;
             if call(WRITE_REGS, Some(refused), || {
-                thread_write_regs(handle, regs.as_ptr(), len).map(|()| 0)
+                // SAFETY: `regs` holds the frame just read from this stopped thread,
+                // written back unchanged, so it resumes where it stopped, on its own
+                // stack; a handle the delete already invalidated is refused.
+                unsafe { thread_write_regs(handle, &regs[..len]) }.map(|()| 0)
             })
             .is_err()
             {

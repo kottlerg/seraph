@@ -100,11 +100,18 @@ procmgr), `std::sys::seraph` exposes a page-granular reservation allocator:
 ```rust
 let range = std::os::seraph::reserve_pages(n)?;     // unmapped VA range
 std::os::seraph::fund_aspace_pt_budget(self_aspace, n); // fund PT growth
-syscall::mem_map(memory_cap, self_aspace, range.va, 0, n, prot)?;
+// SAFETY: `range` is an owned reservation; no Rust object or IPC page lies in it.
+unsafe { syscall::mem_map(memory_cap, self_aspace, range.va, 0, n, prot)? };
 // ... use the mapping ...
-syscall::mem_unmap(self_aspace, range.va, n)?;
+// SAFETY: no Rust reference into the range is live any more.
+unsafe { syscall::mem_unmap(self_aspace, range.va, n)? };
 std::os::seraph::unreserve_pages(range);
 ```
+
+`mem_map`, `mem_unmap`, and `mmio_map` are `unsafe fn`: on the caller's own address space they
+change the memory behind a span, so the caller states why no live Rust object or registered IPC
+page lies in it (the `# Safety` sections in `shared/syscall`). A fresh reservation discharges that
+by construction.
 
 Mapping a foreign Memory cap into a retype-backed `AddressSpace` first funds
 that AS's page-table growth budget: `fund_aspace_pt_budget(self_aspace, n)`

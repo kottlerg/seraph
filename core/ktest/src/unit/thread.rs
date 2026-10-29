@@ -147,8 +147,12 @@ pub fn configure_start(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy for configure_start failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE));
-    crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
-        .map_err(|_| "thread::configure_start: configure_and_start failed")?;
+    // SAFETY: the stack is `STACK_CONFIGURE`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
+    }
+    .map_err(|_| "thread::configure_start: configure_and_start failed")?;
 
     let bits = notification_wait(sig).map_err(|_| "notification_wait after thread_start failed")?;
     if bits != 0xBEEF
@@ -193,7 +197,9 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_STOP_REGS));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
-    crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
+    // SAFETY: the stack is `STACK_STOP_REGS`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg) }
         .map_err(|_| "thread::stop_read_regs: configure_and_start failed")?;
 
     // Wait for the child to signal readiness then enter its blocking notification_wait.
@@ -209,7 +215,7 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 
     // Read the register file.
     let mut reg_buf = [0u8; BUF_SIZE];
-    let bytes = thread_read_regs(child.th, reg_buf.as_mut_ptr(), BUF_SIZE)
+    let bytes = thread_read_regs(child.th, &mut reg_buf[..BUF_SIZE])
         .map_err(|_| "thread_read_regs failed")?;
 
     if bytes != TRAP_FRAME_BYTES
@@ -253,7 +259,9 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_DOUBLE_STOP));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
-    crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
+    // SAFETY: the stack is `STACK_DOUBLE_STOP`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg) }
         .map_err(|_| "thread::stop_again_invalid_state: configure_and_start failed")?;
 
     let _ = notification_wait(ready); // Wait for readiness notification.
@@ -309,7 +317,9 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_WRITE_REGS));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
-    crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
+    // SAFETY: the stack is `STACK_WRITE_REGS`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg) }
         .map_err(|_| "thread::write_regs_resume: configure_and_start failed")?;
 
     // Wait for readiness then stop while the child is blocked.
@@ -320,14 +330,18 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
     PHASE2_SIG.store(child_ready, Ordering::Release);
 
     let mut reg_buf = [0u8; BUF_SIZE];
-    thread_read_regs(child.th, reg_buf.as_mut_ptr(), BUF_SIZE)
+    thread_read_regs(child.th, &mut reg_buf[..BUF_SIZE])
         .map_err(|_| "thread_read_regs for write_regs_resume failed")?;
 
     // Overwrite instruction pointer to redirect child to phase2_entry.
     let phase2_ptr = phase2_entry as *const () as u64;
     reg_buf[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&phase2_ptr.to_le_bytes());
 
-    thread_write_regs(child.th, reg_buf.as_ptr(), BUF_SIZE)
+    // SAFETY: the frame was read from this stopped child, so its stack pointer
+    // stays on the child's own `ChildStack`; its IP is set to `phase2_entry`,
+    // an `extern "C"` entry that never returns and needs nothing of the
+    // abandoned frame, so the child resumes on code and a stack it owns.
+    unsafe { thread_write_regs(child.th, &reg_buf[..BUF_SIZE]) }
         .map_err(|_| "thread_write_regs failed")?;
 
     // Resume — child runs phase2_entry and sends 0x2. The helper is single-shot,
@@ -511,8 +525,12 @@ pub fn sched_split_rollback_on_full_cspace(ctx: &TestContext) -> TestResult
         .map_err(|_| "thread::split_rollback: cap_copy done failed")?;
     let arg = u64::from(child_sched) | (u64::from(child_done) << 32);
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_SPLIT_ROLLBACK));
-    crate::spawn::configure_and_start(&child, split_rollback_child_entry, stack_top, arg)
-        .map_err(|_| "thread::split_rollback: configure_and_start failed")?;
+    // SAFETY: the stack is `STACK_SPLIT_ROLLBACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, split_rollback_child_entry, stack_top, arg)
+    }
+    .map_err(|_| "thread::split_rollback: configure_and_start failed")?;
 
     let bits = notification_wait(done).map_err(|_| "thread::split_rollback: wait done failed")?;
     cap_delete(child.th).map_err(|_| "thread::split_rollback: cap_delete(thread) failed")?;
@@ -798,7 +816,9 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE_ERR));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
-    crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
+    // SAFETY: the stack is `STACK_CONFIGURE_ERR`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg) }
         .map_err(|_| "thread::configure_running_thread_err: configure_and_start failed")?;
 
     // Wait for the child to signal readiness (it is now Running or Blocked).
@@ -807,7 +827,10 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
     // Attempting to configure a non-Created thread must fail. The helper is
     // single-shot for the started-from-Created path; re-configuring uses the
     // raw syscall on purpose to exercise the error case.
-    let err = thread_configure(child.th, blocker_entry as *const () as u64, stack_top, 0);
+    // SAFETY: the thread has started, so the kernel refuses the configure (the
+    // test's premise) and its running state is untouched.
+    let err =
+        unsafe { thread_configure(child.th, blocker_entry as *const () as u64, stack_top, 0) };
 
     // Stop the blocked child before cleanup.
     thread_stop(child.th).ok();
@@ -890,13 +913,17 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
 
     // Bind to CPU 1 before starting.
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_CPU1));
-    crate::spawn::configure_and_start_pinned(
-        &child,
-        affinity_sender_entry,
-        stack_top,
-        u64::from(child_sig),
-        1,
-    )
+    // SAFETY: the stack is `STACK_AFFINITY_CPU1`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start_pinned(
+            &child,
+            affinity_sender_entry,
+            stack_top,
+            u64::from(child_sig),
+            1,
+        )
+    }
     .map_err(|_| "thread::affinity_bind_cpu1: configure_and_start_pinned failed")?;
 
     let bits =
@@ -991,13 +1018,17 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
 
     // Pin to CPU 0 initially so T's first enqueue lands on CPU 0's run queue.
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_MIGRATE_READY));
-    crate::spawn::configure_and_start_pinned(
-        &child,
-        report_cpu_entry,
-        stack_top,
-        u64::from(child_sig),
-        0,
-    )
+    // SAFETY: the stack is `STACK_AFFINITY_MIGRATE_READY`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start_pinned(
+            &child,
+            report_cpu_entry,
+            stack_top,
+            u64::from(child_sig),
+            0,
+        )
+    }
     .map_err(|_| "thread::affinity_migrate_ready_queued: configure_and_start_pinned failed")?;
 
     // T is Ready, queued on CPU 0 at priority 1; the parent is Running on
@@ -1063,13 +1094,17 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy for affinity_migrate_running failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_MIGRATE_RUNNING));
-    crate::spawn::configure_and_start_pinned(
-        &child,
-        migrate_spinner_entry,
-        stack_top,
-        u64::from(child_sig),
-        1,
-    )
+    // SAFETY: the stack is `STACK_AFFINITY_MIGRATE_RUNNING`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start_pinned(
+            &child,
+            migrate_spinner_entry,
+            stack_top,
+            u64::from(child_sig),
+            1,
+        )
+    }
     .map_err(|_| "thread::affinity_migrate_running: configure_and_start_pinned failed")?;
 
     // Wait until T has been scheduled on CPU 1 and reported its CPU. Sleep
@@ -1146,13 +1181,17 @@ fn balance_spawn_spinners(
         // SAFETY: per-spinner stack slot, no aliasing.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(STACK_BALANCE_SPINNERS[i]) });
         let arg = (i as u64) << 32 | u64::from(child_sig);
-        crate::spawn::configure_and_start_pinned(
-            &child,
-            balance_spinner_entry,
-            stack_top,
-            arg,
-            initial_cpu,
-        )
+        // SAFETY: the stack is `STACK_BALANCE_SPINNERS[i]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe {
+            crate::spawn::configure_and_start_pinned(
+                &child,
+                balance_spinner_entry,
+                stack_top,
+                arg,
+                initial_cpu,
+            )
+        }
         .map_err(|_| "balance: configure_and_start_pinned failed")?;
 
         triples[i] = (child.th, child.cs, sig);
@@ -1322,13 +1361,17 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
 
     // Bind to CPU 1 before starting.
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_RESPECTED));
-    crate::spawn::configure_and_start_pinned(
-        &child,
-        affinity_sender_entry,
-        stack_top,
-        u64::from(child_sig),
-        1,
-    )
+    // SAFETY: the stack is `STACK_AFFINITY_RESPECTED`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start_pinned(
+            &child,
+            affinity_sender_entry,
+            stack_top,
+            u64::from(child_sig),
+            1,
+        )
+    }
     .map_err(|_| "thread::affinity_respected: configure_and_start_pinned failed")?;
 
     // If the thread successfully signals back, affinity routing worked.
@@ -1375,8 +1418,12 @@ pub fn default_affinity_runs(ctx: &TestContext) -> TestResult
     // Placement follows core/kernel/docs/scheduler.md § Thread Assignment.
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_DEFAULT_AFFINITY));
-    crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
-        .map_err(|_| "thread::default_affinity_runs: configure_and_start failed")?;
+    // SAFETY: the stack is `STACK_DEFAULT_AFFINITY`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
+    }
+    .map_err(|_| "thread::default_affinity_runs: configure_and_start failed")?;
 
     // If the thread successfully signals back, default affinity routing worked.
     let bits =
@@ -1593,7 +1640,9 @@ pub fn bind_notification_fires_on_exit(ctx: &TestContext) -> TestResult
         .map_err(|_| "thread::bind_notification_fires_on_exit: thread_bind_notification failed")?;
 
     let stack_top = crate::ChildStack::top(core::ptr::addr_of!(BIND_NOTIF_STACK));
-    crate::spawn::configure_and_start(&child, bind_notif_exit_entry, stack_top, 0)
+    // SAFETY: the stack is `BIND_NOTIF_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, bind_notif_exit_entry, stack_top, 0) }
         .map_err(|_| "thread::bind_notification_fires_on_exit: configure_and_start failed")?;
 
     // Block until the death notification arrives.
@@ -1644,19 +1693,29 @@ pub fn configure_non_user_address_err(ctx: &TestContext) -> TestResult
 
     let cases = [
         (
-            thread_configure(child.th, UPPER_HALF, stack_top, 0),
+            // SAFETY: the kernel refuses a non-user entry, stack, or TLS address (the
+            // test's premise), so the thread is never configured.
+            unsafe { thread_configure(child.th, UPPER_HALF, stack_top, 0) },
             "upper-half entry",
         ),
         (
-            thread_configure(child.th, NON_CANONICAL, stack_top, 0),
+            // SAFETY: the kernel refuses a non-user entry, stack, or TLS address (the
+            // test's premise), so the thread is never configured.
+            unsafe { thread_configure(child.th, NON_CANONICAL, stack_top, 0) },
             "non-canonical entry",
         ),
         (
-            thread_configure(child.th, entry, UPPER_HALF, 0),
+            // SAFETY: the kernel refuses a non-user entry, stack, or TLS address (the
+            // test's premise), so the thread is never configured.
+            unsafe { thread_configure(child.th, entry, UPPER_HALF, 0) },
             "upper-half stack",
         ),
         (
-            syscall::thread_configure_with_tls(child.th, entry, stack_top, 0, NON_CANONICAL),
+            // SAFETY: the kernel refuses a non-user entry, stack, or TLS address (the
+            // test's premise), so the thread is never configured.
+            unsafe {
+                syscall::thread_configure_with_tls(child.th, entry, stack_top, 0, NON_CANONICAL)
+            },
             "non-canonical TLS base",
         ),
     ];

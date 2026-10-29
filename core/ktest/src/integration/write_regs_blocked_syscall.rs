@@ -243,7 +243,11 @@ fn with_child(ctx: &TestContext, parts: &Parts) -> TestResult
     let ran = publish_handles(&child, parts)
         .and_then(|()| {
             let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-            spawn::configure_and_start_pinned(&child, child_entry, stack_top, 0, CHILD_CPU)
+            // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+            // on which no other live thread runs (`ChildStack`'s rule).
+            unsafe {
+                spawn::configure_and_start_pinned(&child, child_entry, stack_top, 0, CHILD_CPU)
+            }
         })
         .and_then(|()| rounds(&child, parts.done));
     let released = release(&child);
@@ -302,7 +306,7 @@ fn stop_in_syscall(child: &SpawnedChild, kind: u32) -> Result<[u8; BUF], &'stati
             "integration::write_regs_blocked_syscall: thread_stop of the child failed"
         })?;
         let mut regs = [0u8; BUF];
-        thread_read_regs(child.th, regs.as_mut_ptr(), BUF).map_err(|e| {
+        thread_read_regs(child.th, &mut regs[..BUF]).map_err(|e| {
             log_error(
                 "ktest: integration::write_regs_blocked_syscall thread_read_regs error=",
                 e,
@@ -331,7 +335,11 @@ fn edit_and_restart(child: &SpawnedChild, round: u32, regs: &mut [u8; BUF]) -> T
     regs[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&target.to_le_bytes());
     let token = TOKEN_TAG | u64::from(round);
     regs[ARG1_OFFSET..ARG1_OFFSET + 8].copy_from_slice(&token.to_le_bytes());
-    thread_write_regs(child.th, regs.as_ptr(), BUF).map_err(|e| {
+    // SAFETY: the frame was read from this stopped child, so its stack pointer
+    // stays on the child's own `ChildStack`; its IP is set to `redirected_entry`,
+    // an `extern "C"` entry that never returns and needs nothing of the
+    // abandoned frame, so the child resumes on code and a stack it owns.
+    unsafe { thread_write_regs(child.th, &regs[..BUF]) }.map_err(|e| {
         log_error(
             "ktest: integration::write_regs_blocked_syscall thread_write_regs error=",
             e,
@@ -404,7 +412,10 @@ fn release(child: &SpawnedChild) -> TestResult
 extern "C" fn child_entry(_arg: u64) -> !
 {
     let buf = core::ptr::addr_of_mut!(CHILD_IPC_BUF).cast::<u64>();
-    if let Err(e) = ipc_buffer_set(buf as u64)
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if let Err(e) = unsafe { ipc_buffer_set(buf as u64) }
     {
         RETURNED.record_error(e);
     }

@@ -282,7 +282,9 @@ fn spawn_fillers(
         // SAFETY: element i is this filler's alone (see FILL_STACKS).
         let base = unsafe { core::ptr::addr_of!(FILL_STACKS[i]) } as u64;
         let child = spawn::SpawnedChild { th, cs };
-        spawn::configure_and_start(&child, filler_entry, base + 8192, 0)
+        // SAFETY: `base + 8192` tops `FILL_STACKS[i]`, this filler's own
+        // 8 KiB stack, on which no other live thread runs.
+        unsafe { spawn::configure_and_start(&child, filler_entry, base + 8192, 0) }
             .map_err(|_| "stress::sleep_list_full: start filler failed")?;
     }
     Ok(())
@@ -409,7 +411,9 @@ fn storm_waits(child: &spawn::SpawnedChild, sig: u32, eq: u32, cycles: u32) -> T
     // victim is deleted before the sleep victim reuses the stack.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
     let arg = u64::from(c_sig) | (u64::from(c_eq) << 32);
-    spawn::configure_and_start_pinned(child, wait_victim_entry, stack, arg, VICTIM_CPU)
+    // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(child, wait_victim_entry, stack, arg, VICTIM_CPU) }
         .map_err(|_| "stress::sleep_list_full: start wait victim failed")?;
     await_flag(
         &WAIT_RUNNING,
@@ -482,7 +486,9 @@ fn storm(child: &spawn::SpawnedChild, fillers: &[u32], cycles: u32) -> TestResul
     // SAFETY: stack index 0 is this cell's only STRESS_STACKS user; the
     // victim is deleted before this cell returns.
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
-    spawn::configure_and_start_pinned(child, victim_entry, stack, 0, VICTIM_CPU)
+    // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { spawn::configure_and_start_pinned(child, victim_entry, stack, 0, VICTIM_CPU) }
         .map_err(|_| "stress::sleep_list_full: start victim failed")?;
     await_flag(&RUNNING, "stress::sleep_list_full: the victim never ran")?;
 

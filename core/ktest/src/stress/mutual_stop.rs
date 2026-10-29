@@ -370,7 +370,10 @@ fn start(
         // stress tests run sequentially and both are deleted before this
         // test returns.
         let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[index]) });
-        thread_configure(own, child_entry as *const () as u64, top, arg)
+        // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+        // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+        // rule, as noted where the stack is chosen).
+        unsafe { thread_configure(own, child_entry as *const () as u64, top, arg) }
             .map_err(|_| "stress::mutual_stop: thread_configure failed")?;
         thread_set_affinity(own, CHILD_CPUS[index])
             .map_err(|_| "stress::mutual_stop: pin child failed")?;

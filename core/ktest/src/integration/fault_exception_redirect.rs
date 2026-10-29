@@ -72,7 +72,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "fault_exception_redirect: thread_set_fault_handler failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start(&child, fault_child, stack_top, 0)
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe { crate::spawn::configure_and_start(&child, fault_child, stack_top, 0) }
         .map_err(|_| "fault_exception_redirect: configure_and_start failed")?;
 
     // Receive the fault and verify it is the expected illegal-instruction
@@ -97,7 +99,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Read the fault-blocked thread's registers and confirm the captured IP in
     // the message matches the register frame.
     let mut reg_buf = [0u8; BUF];
-    thread_read_regs(child.th, reg_buf.as_mut_ptr(), BUF)
+    thread_read_regs(child.th, &mut reg_buf[..BUF])
         .map_err(|_| "fault_exception_redirect: thread_read_regs failed")?;
     let ip = u64::from_le_bytes(
         reg_buf[IP_OFFSET..IP_OFFSET + 8]
@@ -113,7 +115,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     // child never re-executes the illegal instruction.
     let recovery_ptr = recovery_child as *const () as u64;
     reg_buf[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&recovery_ptr.to_le_bytes());
-    thread_write_regs(child.th, reg_buf.as_ptr(), BUF)
+    // SAFETY: the frame was read from this stopped child, so its stack pointer
+    // stays on the child's own `ChildStack`; its IP is set to `recovery_child`,
+    // an `extern "C"` entry that never returns and needs nothing of the
+    // abandoned frame, so the child resumes on code and a stack it owns.
+    unsafe { thread_write_regs(child.th, &reg_buf[..BUF]) }
         .map_err(|_| "fault_exception_redirect: thread_write_regs failed")?;
 
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.

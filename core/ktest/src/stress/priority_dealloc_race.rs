@@ -96,7 +96,9 @@ fn spawn_workers(ctx: &TestContext, running: u32, workers: &mut Workers) -> Test
         // SAFETY: stress tests run sequentially; only this test uses these
         // STRESS_STACKS slots during its run.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        spawn::configure_and_start(&child, spinner_entry, stack_top, arg)
+        // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe { spawn::configure_and_start(&child, spinner_entry, stack_top, arg) }
             .map_err(|_| "stress::priority_dealloc_race: configure_and_start failed")?;
     }
     let mut running_bits = 0u64;

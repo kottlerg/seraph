@@ -162,13 +162,17 @@ pub fn run(ctx: &TestContext) -> TestResult
         let client_arg = u64::from(client_ep) | (u64::from(client_done) << 32);
         // SAFETY: stack index 1 is the client's; sequential cycles never alias.
         let client_stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
-        spawn::configure_and_start_pinned(
-            &client,
-            client_entry,
-            client_stack,
-            client_arg,
-            client_cpu,
-        )
+        // SAFETY: the stack is `super::STRESS_STACKS[1]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe {
+            spawn::configure_and_start_pinned(
+                &client,
+                client_entry,
+                client_stack,
+                client_arg,
+                client_cpu,
+            )
+        }
         .map_err(|_| "stress::cap_delete_reply_wake: start client failed")?;
 
         // Start the server once the client is entering `ipc_call`, so the
@@ -193,13 +197,17 @@ pub fn run(ctx: &TestContext) -> TestResult
         let server_arg = u64::from(server_ep) | (u64::from(server_done) << 32);
         // SAFETY: stack index 0 is the server's; sequential cycles never alias.
         let server_stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
-        spawn::configure_and_start_pinned(
-            &server,
-            server_entry,
-            server_stack,
-            server_arg,
-            server_cpu,
-        )
+        // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe {
+            spawn::configure_and_start_pinned(
+                &server,
+                server_entry,
+                server_stack,
+                server_arg,
+                server_cpu,
+            )
+        }
         .map_err(|_| "stress::cap_delete_reply_wake: start server failed")?;
 
         // Wait until the server has dequeued the client. The armed bit is raised
@@ -293,7 +301,10 @@ extern "C" fn server_entry(arg: u64) -> !
     // SERVER_IPC_BUF; sequential cycles never alias it.
     let buf = core::ptr::addr_of_mut!(SERVER_IPC_BUF).cast::<u64>();
 
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }
@@ -326,7 +337,10 @@ extern "C" fn client_entry(arg: u64) -> !
     // CLIENT_IPC_BUF; sequential cycles never alias it.
     let buf = core::ptr::addr_of_mut!(CLIENT_IPC_BUF).cast::<u64>();
 
-    if ipc_buffer_set(buf as u64).is_err()
+    // SAFETY: `buf` is this thread's own page-aligned IPC page (the static above),
+    // registered by one thread at a time; no Rust object lives in it, and the
+    // thread reaches it only through the raw `buf` pointer.
+    if unsafe { ipc_buffer_set(buf as u64) }.is_err()
     {
         thread_exit()
     }

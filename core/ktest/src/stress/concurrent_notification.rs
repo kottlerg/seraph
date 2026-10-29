@@ -86,7 +86,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         // SAFETY: Sequential setup; each child gets a unique stack index.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        spawn::configure_and_start(&child, sender_entry, stack_top, arg)
+        // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe { spawn::configure_and_start(&child, sender_entry, stack_top, arg) }
             .map_err(|_| "concurrent_notification: configure_and_start failed")?;
 
         threads[i] = child.th;

@@ -67,8 +67,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::wait_concurrency: cap_copy sig failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
-        .map_err(|_| "integration::wait_concurrency: configure_and_start failed")?;
+    // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    unsafe {
+        crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
+    }
+    .map_err(|_| "integration::wait_concurrency: configure_and_start failed")?;
 
     // Block until the child fires the notification.
     let tok_b = wait_set_wait(ws)

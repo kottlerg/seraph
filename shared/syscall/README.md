@@ -12,7 +12,17 @@ without issuing the syscall, an argument the kernel would misread: `cap_insert` 
 Others compose calls: `cap_revoke_all` retries `cap_revoke` while it reports `Interrupted`,
 and `random_u64` draws through `getrandom` and returns `InvalidState` on a short count. One
 untyped entry, `raw_syscall3`, passes three argument registers as given, for harness tests of
-the kernel's argument validation that need register values the typed wrappers cannot express.
+the kernel's argument validation that need register values the typed wrappers cannot express;
+`getrandom_raw` likewise takes a raw buffer pointer for the kernel's buffer-validation tests.
+
+A wrapper is safe when nothing it can make the kernel do reaches memory a live Rust object
+occupies: buffers the kernel writes or reads are slices (`getrandom`, `thread_read_regs`). The
+wrappers whose effect the types cannot bound are `unsafe fn`, each with a `# Safety` contract:
+`ipc_buffer_set` (the registered page is dedicated to the kernel's IPC access), `mem_map`,
+`mem_unmap`, `mem_unmap_reclaim`, `mem_protect` and `mmio_map` (on the caller's own address
+space, no live object or registered IPC page in the span), and `thread_configure`,
+`thread_configure_with_tls` and `thread_write_regs` (a thread of the caller's address space
+starts or resumes only on code, a stack, and a TLS block dedicated to it).
 
 No stability obligation. Not used by the kernel.
 

@@ -98,7 +98,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         // SAFETY: stress tests run sequentially; each worker uses a distinct stack.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        thread_configure(th, worker_entry as *const () as u64, stack_top, arg)
+        // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
+        // stack is this child's own, on which no other live thread runs (`ChildStack`'s
+        // rule, as noted where the stack is chosen).
+        unsafe { thread_configure(th, worker_entry as *const () as u64, stack_top, arg) }
             .map_err(|_| "stress::retype_concurrent: thread_configure failed")?;
         thread_start(th).map_err(|_| "stress::retype_concurrent: thread_start failed")?;
 

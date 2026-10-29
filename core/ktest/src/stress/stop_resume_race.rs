@@ -155,13 +155,17 @@ pub fn run(ctx: &TestContext) -> TestResult
         // SAFETY: stack index 0 is the victim's; sequential cycles never alias
         // (cap_delete(victim.th) drains the spinner before the next cycle).
         let victim_stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
-        spawn::configure_and_start_pinned(
-            &victim,
-            victim_entry,
-            victim_stack,
-            u64::from(victim_done),
-            victim_cpu,
-        )
+        // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe {
+            spawn::configure_and_start_pinned(
+                &victim,
+                victim_entry,
+                victim_stack,
+                u64::from(victim_done),
+                victim_cpu,
+            )
+        }
         .map_err(|_| "stress::stop_resume_race: start victim failed")?;
 
         // ── STOPPER: CONTROL on victim + signal on done; pinned stop_cpu. ────
@@ -176,13 +180,17 @@ pub fn run(ctx: &TestContext) -> TestResult
         // SAFETY: stack index 1 is the stopper's; sequential cycles never alias.
         let stopper_stack =
             ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
-        spawn::configure_and_start_pinned(
-            &stopper,
-            stopper_entry,
-            stopper_stack,
-            stopper_arg,
-            stop_cpu,
-        )
+        // SAFETY: the stack is `super::STRESS_STACKS[1]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe {
+            spawn::configure_and_start_pinned(
+                &stopper,
+                stopper_entry,
+                stopper_stack,
+                stopper_arg,
+                stop_cpu,
+            )
+        }
         .map_err(|_| "stress::stop_resume_race: start stopper failed")?;
 
         // ── STARTER: CONTROL on victim + signal on done; pinned start_cpu. ───
@@ -197,13 +205,17 @@ pub fn run(ctx: &TestContext) -> TestResult
         // SAFETY: stack index 2 is the starter's; sequential cycles never alias.
         let starter_stack =
             ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[2]) });
-        spawn::configure_and_start_pinned(
-            &starter,
-            starter_entry,
-            starter_stack,
-            starter_arg,
-            start_cpu,
-        )
+        // SAFETY: the stack is `super::STRESS_STACKS[2]`, this test's own `ChildStack`,
+        // on which no other live thread runs (`ChildStack`'s rule).
+        unsafe {
+            spawn::configure_and_start_pinned(
+                &starter,
+                starter_entry,
+                starter_stack,
+                starter_arg,
+                start_cpu,
+            )
+        }
         .map_err(|_| "stress::stop_resume_race: start starter failed")?;
 
         // Wait until the victim is Running and both racers are parked on the

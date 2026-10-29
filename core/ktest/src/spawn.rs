@@ -139,14 +139,23 @@ pub fn new_child_at(
 /// passed to `thread_configure`: the kernel enters a thread with its argument
 /// in the platform C convention's first argument register, so the entry must
 /// use that convention, not the unspecified Rust ABI.
-pub fn configure_and_start(
+///
+/// # Safety
+/// `stack_top` must top a stack (a `ChildStack`, as `ChildStack::top` gives
+/// it) that no other live thread uses and none will until this child exits:
+/// every ktest child runs in ktest's own address space, so this is the
+/// contract of `syscall::thread_configure` (the entry ABI holds by `entry`'s
+/// type).
+pub unsafe fn configure_and_start(
     child: &SpawnedChild,
     entry: extern "C" fn(u64) -> !,
     stack_top: u64,
     arg: u64,
 ) -> Result<(), &'static str>
 {
-    thread_configure(child.th, entry as *const () as u64, stack_top, arg)
+    // SAFETY: `entry` is an `extern "C" fn(u64) -> !` and the caller's
+    // contract dedicates `stack_top`'s stack to this child.
+    unsafe { thread_configure(child.th, entry as *const () as u64, stack_top, arg) }
         .map_err(|_| "spawn::configure_and_start: thread_configure failed")?;
     thread_start(child.th).map_err(|_| "spawn::configure_and_start: thread_start failed")?;
     Ok(())
@@ -154,7 +163,10 @@ pub fn configure_and_start(
 
 /// Like [`configure_and_start`] but pins the child to `cpu` via
 /// `thread_set_affinity` before starting it.
-pub fn configure_and_start_pinned(
+///
+/// # Safety
+/// The contract of [`configure_and_start`].
+pub unsafe fn configure_and_start_pinned(
     child: &SpawnedChild,
     entry: extern "C" fn(u64) -> !,
     stack_top: u64,
@@ -162,7 +174,9 @@ pub fn configure_and_start_pinned(
     cpu: u32,
 ) -> Result<(), &'static str>
 {
-    thread_configure(child.th, entry as *const () as u64, stack_top, arg)
+    // SAFETY: `entry` is an `extern "C" fn(u64) -> !` and the caller's
+    // contract dedicates `stack_top`'s stack to this child.
+    unsafe { thread_configure(child.th, entry as *const () as u64, stack_top, arg) }
         .map_err(|_| "spawn::configure_and_start_pinned: thread_configure failed")?;
     thread_set_affinity(child.th, cpu)
         .map_err(|_| "spawn::configure_and_start_pinned: thread_set_affinity failed")?;

@@ -41,10 +41,14 @@ pub fn shmem_phase(_: &Caps)
     };
 
     let region_vaddr = &raw mut buf as u64;
-    // SAFETY: `buf` lives for the whole phase; header is pre-initialised by
-    // the `Buf` literal above, so Init's job is already done.
+    // SAFETY: `buf` is an aligned header plus `CAP` body bytes and lives for
+    // the whole phase; the header is pre-initialised by the `Buf` literal
+    // above, so Init's job is already done.
+    // cast_possible_truncation: `CAP` is 64, which fits u32.
+    #[allow(clippy::cast_possible_truncation)]
     let (mut writer, mut reader): (SpscWriter<'_>, SpscReader<'_>) =
-        unsafe { shmem::spsc_pair(region_vaddr) };
+        unsafe { shmem::spsc_pair(region_vaddr, CAP as u32) }
+            .expect("spsc_pair refused the ring's own capacity");
 
     let payload: [u8; 10] = [0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4, 5, 6];
     let n = writer.write(&payload);

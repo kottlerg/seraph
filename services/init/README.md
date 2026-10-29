@@ -31,7 +31,10 @@ init/
 
 Init depends on `shared/elf` for ELF parsing (used to load memmgr and procmgr
 from their bundle entries) and `shared/syscall` for raw syscall wrappers (used
-to create memmgr and procmgr without IPC).
+to create memmgr and procmgr without IPC). init-logd packs its handover replies
+with the wire contract in [`logd-codec`](../logd/codec/README.md), the crate
+real-logd decodes them with (see the
+[logd handover protocol](../logd/docs/handover-protocol.md)).
 
 ---
 

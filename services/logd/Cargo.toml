@@ -11,6 +11,9 @@ test = false
 
 [dependencies]
 ipc = { path = "../../shared/ipc" }
+# Pure handover decoding and diagnostic formatting, extracted so it is
+# host-testable.
+logd-codec = { path = "codec" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }
 

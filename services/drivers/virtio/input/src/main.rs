@@ -202,7 +202,11 @@ fn request_memory_caps(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Op
 /// bits the driver needs beyond `VIRTIO_F_VERSION_1`.
 fn init_device(transport: &PciTransport)
 {
-    transport.reset();
+    if !transport.try_reset()
+    {
+        std::os::seraph::log!("device reset unacknowledged");
+        syscall::thread_exit();
+    }
     transport.set_status(STATUS_ACKNOWLEDGE);
     transport.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
@@ -315,6 +319,12 @@ fn setup_virtqueue(
             used_va as *mut virtqueue::VirtqUsed,
             queue_size,
         )
+    };
+    let Some(vq) = vq
+    else
+    {
+        std::os::seraph::log!("device offers no usable eventq (queue size {queue_size})");
+        syscall::thread_exit();
     };
 
     (vq, queue_notify_off)

@@ -69,8 +69,9 @@ targets; only the one-time init-logd history pull
   registers it with procmgr via `procmgr_labels::REGISTER_DEATH_EQ`
   (authorised by the `DEATH_EQ_AUTHORITY` badged `SEND|GRANT` cap svcmgr mints
   into logd's bootstrap round). Procmgr binds that EQ as an
-  additional death observer on every existing thread and on every
-  future spawn (see
+  additional death observer on the main thread of every existing
+  process and of every future spawn, so only a process's own exit
+  posts to it; a worker thread's exit does not (see
   [`services/procmgr/docs/ipc-interface.md`](../procmgr/docs/ipc-interface.md)).
   When a process exits, logd's EQ receives
   `(process_badge << 32) | exit_reason`; logd evicts the matching
@@ -88,6 +89,9 @@ targets; only the one-time init-logd history pull
 logd/
 ├── Cargo.toml                  # std-built workspace member
 ├── README.md
+├── codec/                      # logd-codec, its own component shared
+│                               # with init-logd: handover wire contract
+│                               # and BoundedStr (see codec/README.md)
 ├── docs/
 │   ├── handover-protocol.md    # init-logd → logd wire format
 │   └── ipc-interface.md        # IPC labels logd handles
@@ -95,7 +99,7 @@ logd/
     ├── main.rs                 # entry, bootstrap, event loop,
     │                           # driver-mediated serial + framebuffer
     │                           # emit, self_log
-    ├── handover.rs             # HANDOVER_PULL caller
+    ├── handover.rs             # HANDOVER_PULL / HANDOVER_RELEASE caller
     └── slot.rs                 # SlotTable: HashMap<badge, Slot>
                                 # with per-sender history ring
 ```
@@ -111,7 +115,7 @@ and [`docs/ipc-interface.md`](docs/ipc-interface.md)):
 | Index | Cap |
 |---|---|
 | 0 | RECV on the master log endpoint |
-| 1 | SEND on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE`, then deleted; see [`docs/handover-protocol.md`](docs/handover-protocol.md)). `0` on a restart — there is no init-logd left to pull from, so logd skips the handover (restart: design intent; not yet implemented (#262)) |
+| 1 | SEND on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE`, repeated after a further drain while init-logd defers it, then deleted; see [`docs/handover-protocol.md`](docs/handover-protocol.md)). `0` on a restart — there is no init-logd left to pull from, so logd skips the handover (restart: design intent; not yet implemented (#262)) |
 | 2 | Badged `SEND\|GRANT` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | Badged SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE` and the framebuffer driver via `QUERY_FRAMEBUFFER_DEVICE`) |
 
@@ -134,6 +138,7 @@ the devmgr-registry cap for its lifetime (see
 | [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler + retroactive bind |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
 | [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts |
+| [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with and the `BoundedStr` diagnostic formatter |
 
 ---
 

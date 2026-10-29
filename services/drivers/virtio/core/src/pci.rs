@@ -10,6 +10,13 @@
 
 use crate::{STATUS_FEATURES_OK, VirtioPciStartupInfo};
 
+/// Status-register polls [`PciTransport::try_reset`] allows for a reset to
+/// complete. QEMU completes a reset within the status write; the bound only
+/// keeps a wedged device from parking the driver in the poll. Each poll is
+/// one MMIO read, so the time the bound spans depends on the platform's
+/// MMIO-read cost.
+pub const RESET_POLL_LIMIT: u32 = 1_000_000;
+
 /// Modern PCI transport backed by MMIO-mapped BAR regions.
 ///
 /// The four register regions are located within BAR MMIO mappings at offsets
@@ -232,15 +239,30 @@ impl PciTransport
 
     // ── Device negotiation (`VirtIO` 1.2 §3.1.1) ───────────────────────
 
-    /// Reset the device (write 0 to status).
-    pub fn reset(&self)
+    /// Reset the device (write 0 to status), polling the status register at
+    /// most [`RESET_POLL_LIMIT`] times for the reset to complete.
+    ///
+    /// Returns `true` once the status reads 0. From then on the device sends
+    /// no notifications and does not interact with the queues until the
+    /// driver re-initialises it (`VirtIO` 1.2 §2.4.1), so a driver can use a
+    /// `true` return to quiesce DMA it can no longer track. Returns `false`
+    /// when the status never reads 0 within the bound: the device has not
+    /// confirmed the reset and may still be accessing driver memory. The
+    /// status is device-written, so the wait is bounded rather than trusted
+    /// to end.
+    #[must_use]
+    pub fn try_reset(&self) -> bool
     {
         self.set_status(0);
-        // Wait for reset to complete: status must read 0.
-        while self.get_status() != 0
+        for _ in 0..RESET_POLL_LIMIT
         {
+            if self.get_status() == 0
+            {
+                return true;
+            }
             core::hint::spin_loop();
         }
+        false
     }
 
     /// Run the standard feature negotiation sequence.

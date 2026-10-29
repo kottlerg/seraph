@@ -1218,7 +1218,7 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     //   data[0]                  = cap_count
     //   data[1..1+count]         = page_count_for_cap_i (u32 in low half)
     //   data[1+count..1+2*count] = phys_base_for_cap_i (u64)
-    //   caps[0..count]           = Memory caps (MAP|WRITE)
+    //   caps[0..count]           = Memory caps (RIGHTS_ALL derivations)
     let mut builder = IpcMessage::builder(memmgr_errors::SUCCESS).word(0, granted_count as u64);
     for (i, &(_, pages, phys)) in granted.iter().take(granted_count).enumerate()
     {
@@ -1249,15 +1249,8 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 
 fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
-    // Drop any inner caps the caller still holds. The common caller (ruststd
-    // releasing a reclaimed Thread-retype slab) already deleted its inner cap
-    // after retype, so this is usually empty; it is defensive for callers that
-    // hand the cap back too.
-    for &slot in req.caps()
-    {
-        let _ = syscall::cap_delete(slot);
-    }
-
+    // Any inner caps the caller handed back were deleted by `dispatch`: a
+    // release names regions by `phys_base`, never by cap.
     let pool = pool_mut();
     let Some(record) = table_mut().find_mut(req.badge)
     else
@@ -1330,7 +1323,15 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32,
         .cap(send_cap)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    {
+        // The reply did not reach procmgr (it is gone, or its CSpace could not
+        // take the cap), so the cap was not moved and no process will ever
+        // carry this badge: drop both, or the cap stays in memmgr's CSpace and
+        // the record holds a table slot no `PROCESS_DIED` will free.
+        let _ = syscall::cap_delete(send_cap);
+        table.free(new_badge);
+    }
 }
 
 fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
@@ -1340,11 +1341,10 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
         reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
         return;
     }
-    // The dead process's badged SEND cap arrives in `caps[0]` (when the
-    // caller transfers it). The kernel does not surface the badge of a
-    // transferred cap to the receiver — only the badge of the
-    // receive-side cap — so procmgr also encodes the dead process's
-    // badge in `data[0]` for memmgr's table lookup.
+    // The dead process is named by its memmgr badge in `data[0]`, not by a
+    // transferred cap: the kernel does not surface the badge of a transferred
+    // cap to the receiver. Any cap the caller attached was deleted by
+    // `dispatch`.
     let dead_badge = req.word(0);
 
     // Auto-reclaim invariant (documented, not asserted in-line):
@@ -1396,18 +1396,12 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
         record.badge = 0;
     }
     // Idempotent: missing badge is not an error.
-
-    // Drop any caps the caller transferred (typically the dead process's
-    // badged SEND cap, no longer useful).
-    for &slot in req.caps()
-    {
-        let _ = syscall::cap_delete(slot);
-    }
-
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
-fn handle_donate_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
+/// Procmgr-only: take permanent ownership of the Memory caps in `caps` (every
+/// cap the message carried) and add them to the free pool.
+fn handle_donate_memory_caps(badge: u64, caps: &[u32], ipc_buf: *mut u64, procmgr_badge: u64)
 {
     // Caller (procmgr's init reap) is permanently transferring init's
     // reclaimed Memory caps into memmgr's pool (the donated set is specified
@@ -1418,17 +1412,22 @@ fn handle_donate_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     // inner a demand fault or REQUEST_MEMORY_CAPS consumer needs and retype
     // on their behalf.
     //
-    // Donation is ungated: memmgr accepts it from any badged client and does
-    // not check the cap's provenance, so a client that donates a cap derived
-    // from its own memmgr grant puts frames memmgr has already lent out into
-    // the free pool a second time. Only procmgr's init reap should donate;
-    // gating donation is tracked in #459. memmgr validates only the cap shape
+    // memmgr does not check a donated cap's provenance, so donation is
+    // procmgr-only: any other client holds caps derived from memmgr's own
+    // grants, and accepting one would put frames memmgr has already lent out
+    // into the free pool a second time. memmgr validates only the cap shape
     // via `cap_info` — a malformed or under-rights cap from a buggy loader
     // rejects rather than poisoning the pool.
+    if badge != procmgr_badge
+    {
+        delete_caps(caps);
+        reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
+        return;
+    }
     let pool = pool_mut();
     let mut accepted_caps: u32 = 0;
     let mut accepted_pages: u64 = 0;
-    for &slot in req.caps()
+    for &slot in caps
     {
         // Required: Memory tag implied by MEMORY_SIZE selector returning Ok.
         // Required: full pool-frame rights (WRITE|EXECUTE|RETYPE).
@@ -1605,20 +1604,18 @@ fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
 
 /// Procmgr-only: store a demand-paged child's delegated `AddressSpace` cap so
 /// [`handle_fault`] can map backing frames into it. Keyed by the child's
-/// memmgr badge in `data[0]`; the cap arrives in `caps[0]`.
-fn handle_delegate_aspace(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
+/// memmgr badge in `data[0]`; the cap arrives in `caps[0]`, which [`dispatch`]
+/// passes as `caps` (it has already deleted any cap after it).
+fn handle_delegate_aspace(req: &IpcMessage, caps: &[u32], ipc_buf: *mut u64, procmgr_badge: u64)
 {
     if req.badge != procmgr_badge
     {
-        for &slot in req.caps()
-        {
-            let _ = syscall::cap_delete(slot);
-        }
+        delete_caps(caps);
         reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
         return;
     }
     let child_badge = req.word(0);
-    let Some(&as_cap) = req.caps().first()
+    let Some(&as_cap) = caps.first()
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -1645,7 +1642,7 @@ fn handle_delegate_aspace(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u6
 /// `req.badge` is the value bound by `SYS_THREAD_SET_FAULT_HANDLER` (procmgr
 /// and the runtime bind the process's memmgr badge); attribution rests on
 /// badge unguessability (`services/memmgr/docs/ipc-interface.md`
-/// § Badge Discipline; #459). Words are `[kind, faulting_va, access, ip]`
+/// § Badge Discipline; #550). Words are `[kind, faulting_va, access, ip]`
 /// (same document, § Kernel-origin fault message (`FAULT_LABEL`)). On a VM
 /// fault whose address lies in a registered region of a process with a
 /// delegated address space, memmgr backs the [`chunk_for`] chunk containing
@@ -1876,17 +1873,53 @@ fn ingest_in_use(boot: &InitBootstrap)
     }
 }
 
+/// Delete every cap in `caps` from memmgr's `CSpace`.
+fn delete_caps(caps: &[u32])
+{
+    for &slot in caps
+    {
+        let _ = syscall::cap_delete(slot);
+    }
+}
+
+/// Number of attached caps, counted from `caps[0]`, that the contract of the
+/// label `opcode` hands to its handler (`services/memmgr/docs/ipc-interface.md`
+/// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS`, the first for
+/// `DELEGATE_ASPACE`, none for any other label. [`dispatch`] deletes the rest.
+fn contract_cap_count(opcode: u64, attached: usize) -> usize
+{
+    match opcode
+    {
+        memmgr_labels::DONATE_MEMORY_CAPS => attached,
+        memmgr_labels::DELEGATE_ASPACE => attached.min(1),
+        _ => 0,
+    }
+}
+
 fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
 {
+    // Every cap a message carries has landed in memmgr's CSpace. Delete each
+    // one the label's contract does not hand to its handler before the
+    // handler runs, so no client can grow memmgr's CSpace by attaching caps
+    // until its receive loop wedges, and so no handler can delete a slot that
+    // was freed here and reused since. Handlers see only the caps their
+    // contract keeps.
+    let attached = req.caps();
+
     // The kernel-synthesized fault IPC carries the full `FAULT_LABEL` sentinel
     // (`u64::MAX - 1`), which would alias other opcodes under the `& 0xFFFF`
-    // mask below; match it on the full label first.
+    // mask below; match it on the full label first. A kernel delivery carries
+    // no caps; a client's forged one may.
     if req.label == syscall_abi::FAULT_LABEL
     {
+        delete_caps(attached);
         handle_fault(req, ipc_buf);
         return;
     }
-    match req.label & 0xFFFF
+    let opcode = req.label & 0xFFFF;
+    let (kept, stray) = attached.split_at(contract_cap_count(opcode, attached.len()));
+    delete_caps(stray);
+    match opcode
     {
         memmgr_labels::REQUEST_MEMORY_CAPS =>
         {
@@ -1906,7 +1939,7 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         }
         memmgr_labels::DONATE_MEMORY_CAPS =>
         {
-            handle_donate_memory_caps(req, ipc_buf);
+            handle_donate_memory_caps(req.badge, kept, ipc_buf, boot.procmgr_badge);
         }
         memmgr_labels::QUERY_POOL_STATUS =>
         {
@@ -1922,7 +1955,7 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         }
         memmgr_labels::DELEGATE_ASPACE =>
         {
-            handle_delegate_aspace(req, ipc_buf, boot.procmgr_badge);
+            handle_delegate_aspace(req, kept, ipc_buf, boot.procmgr_badge);
         }
         _ =>
         {
@@ -1957,9 +1990,10 @@ fn main(startup: &StartupInfo) -> !
     // Auto-register procmgr's record so `REQUEST_MEMORY_CAPS` against
     // procmgr's badged SEND succeeds — procmgr's own std heap-bootstrap
     // is the first IPC memmgr serves after entering the loop. The
-    // procmgr_badge cap doubles as the auth gate for `REGISTER_PROCESS`
-    // and `PROCESS_DIED`; both code paths still check `req.badge` against
-    // `boot.procmgr_badge` independently of the table entry.
+    // procmgr_badge cap doubles as the auth gate for the procmgr-only labels
+    // (`REGISTER_PROCESS`, `PROCESS_DIED`, `DONATE_MEMORY_CAPS`,
+    // `DELEGATE_ASPACE`); each code path still checks the message badge
+    // against `boot.procmgr_badge` independently of the table entry.
     //
     // Register memmgr-self and init-self records too: `ingest_in_use` files
     // memmgr's, procmgr's, and init's bootstrap arenas against them so every

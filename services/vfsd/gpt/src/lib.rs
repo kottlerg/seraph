@@ -84,20 +84,24 @@ pub enum GptError
     IoError,
     /// GPT header signature is not "EFI PART".
     InvalidSignature,
-    /// Partition entry size is outside the GPT-spec range `128..=512`.
+    /// Partition entry size is not one the GPT spec permits within one
+    /// sector: `128 * 2^n` bytes, so `128`, `256`, or `512`.
     InvalidEntrySize,
 }
 
 /// Parse and validate the GPT header from sector 1.
 ///
-/// Checks the `EFI PART` signature and that `entry_size` is within the GPT-spec
-/// range. The entry-size bound matters: `parse_entry` reads 56 bytes per entry,
-/// and a malformed `entry_size` would otherwise misalign the per-entry windows.
+/// Checks the `EFI PART` signature and that `entry_size` is one the GPT spec
+/// permits (`128 * 2^n`) and fits one sector. The entry-size check matters: the
+/// partition-array walk tiles each sector from offset 0 with
+/// `SECTOR_SIZE / entry_size` entries, which reads every entry at its true
+/// offset only when `entry_size` divides the sector, and `parse_entry` reads 56
+/// bytes per entry.
 ///
 /// # Errors
 /// Returns [`GptError::InvalidSignature`] when the `EFI PART` signature is
-/// absent, or [`GptError::InvalidEntrySize`] when `entry_size` falls outside
-/// `128..=512`.
+/// absent, or [`GptError::InvalidEntrySize`] when `entry_size` is not `128`,
+/// `256`, or `512`.
 pub fn parse_header(sector: &[u8; SECTOR_SIZE]) -> Result<GptHeader, GptError>
 {
     if &sector[0..8] != b"EFI PART"
@@ -107,7 +111,7 @@ pub fn parse_header(sector: &[u8; SECTOR_SIZE]) -> Result<GptHeader, GptError>
     let part_entry_lba = u64::from_le_bytes(sector[72..80].try_into().unwrap_or([0; 8]));
     let num_parts = u32::from_le_bytes(sector[80..84].try_into().unwrap_or([0; 4]));
     let entry_size = u32::from_le_bytes(sector[84..88].try_into().unwrap_or([0; 4]));
-    if !(128..=512).contains(&entry_size)
+    if !(128..=512).contains(&entry_size) || !entry_size.is_power_of_two()
     {
         return Err(GptError::InvalidEntrySize);
     }
@@ -274,10 +278,20 @@ mod tests
     }
 
     #[test]
-    fn parse_header_accepts_entry_size_range_boundaries()
+    fn parse_header_accepts_every_spec_entry_size()
     {
         assert!(parse_header(&header_sector(b"EFI PART", 2, 1, 128)).is_ok());
+        assert!(parse_header(&header_sector(b"EFI PART", 2, 1, 256)).is_ok());
         assert!(parse_header(&header_sector(b"EFI PART", 2, 1, 512)).is_ok());
+    }
+
+    #[test]
+    fn parse_header_rejects_non_power_of_two_entry_size()
+    {
+        // 200 lies inside 128..=512 but does not divide the sector, so the
+        // per-sector entry walk would read entries at the wrong offsets.
+        let s = header_sector(b"EFI PART", 2, 128, 200);
+        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntrySize)));
     }
 
     #[test]

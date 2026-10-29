@@ -37,6 +37,12 @@ non-canonical address, providing a natural guard between userspace and kernel sp
   0x0000000000000000 ┘
 ```
 
+The top 4 KiB page of the userspace half (from `0x00007FFFFFFFF000`) is never mapped:
+with it unmappable no user instruction ends at the canonical boundary, so every return RIP
+the hardware saves on a ring-3 interrupt, trap, or `syscall` is canonical, and the
+kernel's ring-3 `iretq` / `sysretq` never faults in ring 0 (`user_va_top`,
+[arch-interface.md](../core/kernel/docs/arch-interface.md) § `paging`).
+
 Kernel space is divided into regions:
 
 ```

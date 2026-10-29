@@ -109,7 +109,8 @@ pub(crate) fn scalar_mul_base(s: &[u8; 32]) -> Point
 /// Returns `None` if the bytes do not decode to a curve point. Returning the
 /// negation directly lets the verifier compute `[S]B + [k](-A)` in one
 /// addition. Follows RFC 8032 §5.1.3 for the square-root recovery, with the
-/// sign condition inverted to select `-A`.
+/// sign condition inverted to select `-A`, but omits its canonical-encoding
+/// checks (y < p; x = 0 with the sign bit set), as `TweetNaCl` does (#558).
 pub(crate) fn decompress_neg(pk: &[u8; 32]) -> Option<Point>
 {
     let mut r: Point = [GF0, GF0, GF1, GF0];

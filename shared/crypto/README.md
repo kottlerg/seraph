@@ -20,7 +20,7 @@ design intent; not yet implemented.
 |---|---|
 | `sha512(&[u8]) -> [u8; 64]` | One-shot SHA-512 (FIPS 180-4). |
 | `Sha512` (`new`/`update`/`finalize`) | Incremental SHA-512, so large inputs (e.g. module bodies) hash without being buffered whole. |
-| `ed25519_verify(&[u8;32], &[u8], &[u8;64]) -> Result<(), VerifyError>` | RFC 8032 Ed25519 verification. Verify-only; no signing or key generation. |
+| `ed25519_verify(&[u8;32], &[u8], &[u8;64]) -> Result<(), VerifyError>` | Ed25519 verification per RFC 8032, except that public-key decoding accepts the non-canonical encodings `TweetNaCl` accepts (a y coordinate ≥ p, or x = 0 with the sign bit set); the RFC's canonical checks are recorded on #558. Verify-only; no signing or key generation. |
 | `VerifyError` | `BadPublicKey`, `NonCanonicalS`, `Mismatch`. |
 | `sha512::DIGEST_LEN` | SHA-512 digest length in bytes (64). |
 | `run_sha512_kats()` / `run_ed25519_kats()` `-> Result<(), &'static str>` | Known-answer-test drivers shared by the host tests and ktest. |

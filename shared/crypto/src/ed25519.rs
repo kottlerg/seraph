@@ -40,7 +40,9 @@ pub enum VerifyError
 /// Returns the first failing check, in this order:
 /// - [`VerifyError::NonCanonicalS`]: S is not below the group order L.
 /// - [`VerifyError::BadPublicKey`]: `public_key` does not decode to a curve
-///   point.
+///   point. Non-canonical encodings RFC 8032 § 5.1.3 rejects (y ≥ p, or
+///   x = 0 with the sign bit set) are accepted rather than reported here
+///   (#558).
 /// - [`VerifyError::Mismatch`]: the verification equation does not hold.
 ///
 /// A returned `Ok(())` means the signature is valid for `public_key` and

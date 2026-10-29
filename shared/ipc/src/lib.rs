@@ -462,7 +462,8 @@ pub mod memmgr_labels
     /// Reply (success): `data[0]` = `returned_cap_count: u32`;
     /// `data[1+i]` = `page_count_for_cap_i: u32`; `data[1+count+i]` =
     /// `phys_base_for_cap_i: u64`; `caps[0..count]` = Memory capabilities
-    /// (MAP|WRITE rights); [`super::memmgr_grant_layout`] checks the shape.
+    /// carrying every right of their pool frames;
+    /// [`super::memmgr_grant_layout`] checks the shape.
     /// `sum(page_count_for_cap_i) == want_pages` for both contiguous and
     /// best-effort replies. Each reply cap MUST additionally carry
     /// `MemRights::RETYPE` so the caller can retype the memory into kernel

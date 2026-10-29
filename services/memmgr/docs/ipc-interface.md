@@ -108,7 +108,7 @@ pages. Privilege: universal.
 | data[0] | `returned_cap_count` (u32) |
 | data[1 + i] | `page_count_for_cap_i` (u32) for each returned cap, `i ∈ [0, count)` |
 | data[1 + count + i] | `phys_base_for_cap_i` (u64) — physical base address of the contiguous page run described by `page_count_for_cap_i`, `i ∈ [0, count)` |
-| cap[0..returned_cap_count] | Memory capabilities (MAP\|WRITE rights) |
+| cap[0..returned_cap_count] | Memory capabilities carrying every right of their pool frames (derived with `RIGHTS_ALL`; pool frames carry WRITE, EXECUTE, and RETYPE, see [`memory-pool.md`](memory-pool.md) §"Pool Ingest") |
 
 The cumulative `sum(page_count_for_cap_i) == want_pages` for both
 contiguous and best-effort replies. With `REQUIRE_CONTIGUOUS` the reply

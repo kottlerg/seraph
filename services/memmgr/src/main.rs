@@ -1218,7 +1218,7 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     //   data[0]                  = cap_count
     //   data[1..1+count]         = page_count_for_cap_i (u32 in low half)
     //   data[1+count..1+2*count] = phys_base_for_cap_i (u64)
-    //   caps[0..count]           = Memory caps (MAP|WRITE)
+    //   caps[0..count]           = Memory caps (RIGHTS_ALL derivations)
     let mut builder = IpcMessage::builder(memmgr_errors::SUCCESS).word(0, granted_count as u64);
     for (i, &(_, pages, phys)) in granted.iter().take(granted_count).enumerate()
     {

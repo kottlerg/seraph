@@ -172,9 +172,10 @@ checks that a user-set DF and TF, and a GS base reloaded from the user selector,
 the kernel across a SYSCALL, and that a syscall made with AC set completes its user copy and
 returns with AC still set; `src/arch/x86_64/page_fault_present_bit.rs` checks that a fault
 handler's `#PF` message carries `FAULT_ACCESS_PRESENT` for a store to a read-only user page and
-never for a load from the kernel image window. On RISC-V, `src/arch/riscv64/sbi_gating.rs`
-checks that `SYS_SBI_CALL` refuses kernel-reserved SBI extensions and sanctioned ones the cap
-lacks the right for.
+never for a load from the top GiB of the kernel image window (the lower GiB can hold direct-map
+leaves the kernel's spurious-fault walk misreads, #563). On RISC-V,
+`src/arch/riscv64/sbi_gating.rs` checks that `SYS_SBI_CALL` refuses kernel-reserved SBI
+extensions and sanctioned ones the cap lacks the right for.
 
 ### Tier S — `src/stress/`
 

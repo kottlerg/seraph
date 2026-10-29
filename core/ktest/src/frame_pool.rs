@@ -332,7 +332,8 @@ pub unsafe fn free(memory_cap: u32)
 
 /// RAII wrapper for allocated frames.
 ///
-/// Automatically unmaps and frees the frame when dropped.
+/// Automatically unmaps and frees the frame when dropped; a frame whose unmap
+/// fails is logged and not returned to the pool.
 pub struct FrameGuard
 {
     memory_cap: u32,

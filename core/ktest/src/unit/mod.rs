@@ -575,7 +575,7 @@ pub fn run_all(ctx: &TestContext)
         hw::irq_split_wrong_tag_err(ctx)
     );
 
-    // ── Architecture-specific tests (I/O ports, SBI call, user-half bounds) ───────
+    // ── Architecture-specific tests (`crate::arch::run_unit`) ────────────────────
     crate::arch::run_unit(ctx);
 
     // ── System info syscalls ──────────────────────────────────────────────────

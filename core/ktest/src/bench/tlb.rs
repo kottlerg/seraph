@@ -26,7 +26,9 @@
 //!
 //! The fix here is cooperative: workers check `EXIT_REQUESTED` between
 //! yields and call `thread_exit` themselves. By the time the parent
-//! calls `cap_delete`, every worker is already Exited.
+//! calls `cap_delete`, every worker is already Exited, unless one failed to
+//! report within the parent's bounded wait (logged), which is then deleted
+//! while it may still run.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -257,7 +259,8 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     }
 
     // Cooperative teardown: flip the flag, wait for every worker's
-    // exit-bit on `done`, then cap_delete (each Thread is already Exited).
+    // exit-bit on `done` (bounded), then cap_delete (each Thread is already
+    // Exited unless the wait timed out).
     EXIT_REQUESTED.store(true, Ordering::Release);
     teardown(&threads, &cspaces, spawned, ready, done);
 
@@ -273,7 +276,8 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 /// thread + cspace caps. Each worker `notification_send`s its `1 << i` bit on
 /// `done` right before `thread_exit`; the parent accumulates all bits
 /// before issuing any `cap_delete`, so every Thread cap deleted is in
-/// the Exited state.
+/// the Exited state. If a worker does not report within the bound, the
+/// timeout is logged and its Thread is deleted while it may still run.
 fn teardown(
     threads: &[u32; MAX_PINNED],
     cspaces: &[u32; MAX_PINNED],
@@ -606,7 +610,8 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     CONC_GO.store(true, Ordering::Release);
 
     // Cooperative teardown: wait every worker's done bit (each is about to
-    // thread_exit), then delete caps — no cap_delete races a running worker.
+    // thread_exit), then delete caps; only a worker that misses the bounded
+    // wait (logged) is deleted while it may still run.
     teardown(&threads, &cspaces, spawned, ready, done);
 
     for (i, fr) in memory_caps.iter().enumerate().take(allocated)

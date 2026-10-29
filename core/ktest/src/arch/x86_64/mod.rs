@@ -23,8 +23,9 @@
 //! - `user_half_top.rs` — the top page of the user half is unmappable
 //!
 //! Tier 2 scenarios:
-//! - `syscall_rflags_hardening.rs` — user-set DF, TF and AC and a reloaded user
-//!   GS base do not reach the kernel across a SYSCALL
+//! - `syscall_rflags_hardening.rs` — user-set DF and TF and a reloaded user GS
+//!   base do not reach the kernel across a SYSCALL, and a user-set AC survives
+//!   one
 //! - `page_fault_present_bit.rs` — a `#PF` fault message reports the present
 //!   bit only for a user-half address
 

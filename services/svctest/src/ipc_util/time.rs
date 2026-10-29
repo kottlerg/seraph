@@ -8,6 +8,9 @@
 /// Convert seconds since the Unix epoch to `(year, month, day, hh, mm, ss)`.
 /// Civil-from-days algorithm (Howard Hinnant, public domain); branch-free
 /// for years ≥ 0.
+// cast_possible_truncation: the second of the day (< 86 400) and the day of
+// the era (< 146 097) fit u32, and `era` overflows u32 only for a year past
+// 1.7e12, which no wall clock reports.
 #[allow(clippy::cast_possible_truncation)]
 pub fn epoch_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32)
 {

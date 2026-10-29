@@ -67,10 +67,7 @@ fn assert_registry_denies(caps: &Caps, label: u64, label_name: &str, bit_name: &
         "{label_name} deny: no devmgr.registry cap seeded"
     );
 
-    let info = startup_info();
-    // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB).
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(devmgr, &versioned(label), ipc_buf) }
@@ -143,9 +140,7 @@ fn orphan_teardown_phase(caps: &Caps)
     assert!(devmgr != 0, "devmgr_orphan: no devmgr.test cap seeded");
 
     let info = startup_info();
-    // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB).
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let memmgr = info.memmgr_endpoint;
 
     let mut last_before = 0u64;
@@ -232,29 +227,16 @@ fn orphan_teardown_phase(caps: &Caps)
 /// `UNAUTHORIZED`.
 fn test_label_deny_phase(caps: &Caps)
 {
-    let registry = caps.devmgr_registry;
-    assert!(
-        registry != 0,
-        "devmgr_test_label_deny: no devmgr.registry cap seeded"
+    assert_registry_denies(
+        caps,
+        ipc::devmgr_labels::TEST_SPAWN_ORPHAN,
+        "TEST_SPAWN_ORPHAN",
+        "ORPHAN_TEST_AUTHORITY",
     );
-
-    let info = startup_info();
-    // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB).
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
-
-    for (label, shown) in [
-        (ipc::devmgr_labels::TEST_SPAWN_ORPHAN, "TEST_SPAWN_ORPHAN"),
-        (ipc::devmgr_labels::TEST_ORPHAN_RESULT, "TEST_ORPHAN_RESULT"),
-    ]
-    {
-        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-        let reply = unsafe { ipc::ipc_call(registry, &versioned(label), ipc_buf) }
-            .unwrap_or_else(|_| panic!("{shown} on devmgr.registry: ipc_call failed"));
-        assert_eq!(
-            reply.label,
-            ipc::devmgr_errors::UNAUTHORIZED,
-            "{shown} without ORPHAN_TEST_AUTHORITY must reply UNAUTHORIZED"
-        );
-    }
+    assert_registry_denies(
+        caps,
+        ipc::devmgr_labels::TEST_ORPHAN_RESULT,
+        "TEST_ORPHAN_RESULT",
+        "ORPHAN_TEST_AUTHORITY",
+    );
 }

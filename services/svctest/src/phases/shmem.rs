@@ -27,6 +27,8 @@ pub fn shmem_phase(_: &Caps)
         header: SpscHeader,
         body: [u8; CAP],
     }
+    // cast_possible_truncation: `CAP` is 64, which fits the u32 capacity
+    // field.
     #[allow(clippy::cast_possible_truncation)]
     let mut buf = Buf {
         header: SpscHeader {

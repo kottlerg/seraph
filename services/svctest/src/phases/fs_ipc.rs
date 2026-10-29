@@ -208,11 +208,7 @@ pub fn fs_rights_attenuation_phase(_: &Caps)
         "fs_rights_attenuation: root_dir_cap() returned 0"
     );
 
-    let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     let (data_cap, _kind, _) = ns_lookup(system_root_cap, b"data", 0xFFFF, ipc_buf)
         .expect("fs_rights_attenuation: NS_LOOKUP /data failed");
@@ -316,11 +312,7 @@ pub fn fs_rights_attenuation_phase(_: &Caps)
 
 pub fn fs_write_phase(_: &Caps)
 {
-    let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
 
     let name: &[u8] = b"wrt.bin";
@@ -350,11 +342,7 @@ pub fn fs_write_phase(_: &Caps)
 
 pub fn fs_create_remove_phase(_: &Caps)
 {
-    let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
 
     let name: &[u8] = b"crt.bin";
@@ -390,11 +378,7 @@ pub fn fs_create_remove_phase(_: &Caps)
 
 pub fn fs_mkdir_phase(_: &Caps)
 {
-    let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
 
     let dname: &[u8] = b"mkd";
@@ -427,11 +411,7 @@ pub fn fs_mkdir_phase(_: &Caps)
 
 pub fn fs_rename_phase(_: &Caps)
 {
-    let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
 
     let src: &[u8] = b"ren_a.bin";
@@ -488,11 +468,7 @@ pub fn fs_request_bounds_phase(_: &Caps)
     // word 0's byte count.
     const INLINE_MAX: usize = (syscall_abi::MSG_DATA_WORDS_MAX - 1) * 8;
 
-    let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
 
     let name: &[u8] = b"bounds.bin";
@@ -564,10 +540,7 @@ pub fn fs_write_memory_phase(_: &Caps)
     const WRITE_LEN: usize = 2048;
 
     let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
 
     let name: &[u8] = b"wrtf.bin";
@@ -653,11 +626,7 @@ pub fn fs_write_memory_phase(_: &Caps)
 
 pub fn fs_write_cache_coherence_phase(_: &Caps)
 {
-    let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
 
     let name: &[u8] = b"coh.bin";
@@ -692,10 +661,7 @@ pub fn fs_write_invariants_phase(_: &Caps)
     const INLINE_CHUNK: usize = 504;
 
     let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     // ── (1) rights attenuation on FS_CREATE child cap ──────────────
     {
@@ -924,11 +890,7 @@ pub fn fs_open_relative_phase(_: &Caps)
 /// allocated cluster, past every reader's end of scan.
 pub fn fs_long_name_insert_phase(_: &Caps)
 {
-    let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
 
     let dname: &[u8] = b"lfnd";
@@ -995,11 +957,7 @@ fn read_memory_bytes_valid(cap: u32, offset: u64, cookie: u64, ipc_buf: *mut u64
 /// slot, missing appends and reading the freed chain after a truncate.
 pub fn fs_memory_read_tracks_size_phase(_: &Caps)
 {
-    let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
 
     let name: &[u8] = b"mrsize.bin";
@@ -1044,11 +1002,7 @@ pub fn fs_memory_read_tracks_size_phase(_: &Caps)
 /// index up to the offset, filling the volume.
 pub fn fs_write_size_bound_phase(_: &Caps)
 {
-    let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
 
     let name: &[u8] = b"bigoff.bin";
@@ -1089,11 +1043,7 @@ pub fn fs_carried_caps_dropped_phase(_: &Caps)
     // six slot pages of 56 slots (335 usable), and fatfs never augments it.
     const REQUESTS: usize = 1024;
 
-    let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer is a kernel-registered, page-aligned
-    // page, so the u64 cast is aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
 
     let name: &[u8] = b"capdrop.bin";

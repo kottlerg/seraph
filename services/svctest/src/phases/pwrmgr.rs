@@ -5,8 +5,6 @@
 
 //! pwrmgr service surface: cap-deny enforcement + terminal shutdown.
 
-use std::os::seraph::startup_info;
-
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
@@ -30,9 +28,7 @@ pub fn pwrmgr_cap_deny_phase(caps: &Caps)
         return;
     }
 
-    let info = startup_info();
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     let msg = ipc::IpcMessage::new(ipc::pwrmgr_labels::SHUTDOWN);
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -54,16 +50,22 @@ pub fn pwrmgr_cap_deny_phase(caps: &Caps)
 /// its normal `thread_exit`, leaving the system idle.
 pub fn pwrmgr_shutdown_phase(caps: &Caps)
 {
-    let pwrmgr_auth_cap = caps.pwrmgr_auth;
+    request_shutdown(caps.pwrmgr_auth);
+}
+
+/// Send `SHUTDOWN` on `pwrmgr_auth_cap`, the authority-badged pwrmgr cap.
+/// When the cap is zero, pwrmgr replies, or the call fails, it logs the
+/// outcome and returns. It never panics or allocates, because the failure
+/// hooks call it too.
+pub fn request_shutdown(pwrmgr_auth_cap: u32)
+{
     if pwrmgr_auth_cap == 0
     {
-        std::os::seraph::log!("pwrmgr shutdown phase skipped: no authority cap");
+        std::os::seraph::log!("pwrmgr SHUTDOWN skipped: no authority cap");
         return;
     }
 
-    let info = startup_info();
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
 
     let msg = ipc::IpcMessage::new(ipc::pwrmgr_labels::SHUTDOWN);
     // SAFETY: ipc_buf is the registered IPC buffer.

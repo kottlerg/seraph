@@ -14,13 +14,12 @@
 //! * **Process-global cap cache ([`install_badged_cap`],
 //!   [`ensure_badged_cap`]):** holds the pre-installed badged SEND
 //!   cap. Std's `_start` installs the cap procmgr seeded in
-//!   `ProcessInfo.log_send_cap`; init installs its own badge-1 cap
-//!   derived directly from the log endpoint it owns. No discovery
-//!   roundtrip — the cap is live from the first user instruction.
+//!   `ProcessInfo.log_send_cap`. No discovery roundtrip — the cap is
+//!   live from the first user instruction.
 //!
 //! The user-facing macro lives in the std overlay (it needs thread-
-//! local IPC-buffer access). Inside no_std code (init), call [`emit`]
-//! directly.
+//! local IPC-buffer access) and reaches [`emit`]; std is the crate's only
+//! consumer (`shared/log/README.md`).
 
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
@@ -45,30 +44,27 @@ use ipc::{
 };
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
-/// Maximum bytes per `STREAM_BYTES` chunk. Same value as the existing
-/// `ruststd::sys::stdio::seraph::CHUNK_SIZE`. Lines longer than this are
+/// Maximum bytes per `STREAM_BYTES` chunk. Lines longer than this are
 /// chunked across multiple `ipc_call`s; the receiver concatenates per-call
 /// bytes in order.
 pub const CHUNK_SIZE: usize = MSG_DATA_WORDS_MAX * 8;
 
-/// Stack-buffer size used by [`write_args`]. Sized to hold one full
-/// `STREAM_BYTES` payload plus a trailing newline.
+/// Stack-buffer size used by [`write_args`]. Sized to one `STREAM_BYTES`
+/// payload; the trailing newline is dropped when the formatted text fills
+/// it.
 const STACK_BUF_LEN: usize = CHUNK_SIZE;
 
 // ── Process-global cap cache ────────────────────────────────────────────────
 
 /// Badged SEND cap on the log endpoint, pre-installed at process
 /// startup via [`install_badged_cap`]. Zero when no logger is
-/// reachable (init/memmgr/procmgr-self before its bootstrap completes,
-/// or any tier of the boot chain that runs before the log endpoint
-/// exists); [`emit`] silently drops in that case.
+/// reachable (a process spawned before the log endpoint exists);
+/// [`emit`] drops in that case (asserting in debug builds).
 static BADGEED_CAP: AtomicU32 = AtomicU32::new(0);
 
 /// Pre-install a badged SEND cap on the log endpoint. Called by
 /// std's `_start` with the cap procmgr seeded in
-/// `ProcessInfo.log_send_cap`, and by init with its self-badge-1 cap
-/// derived directly from the log endpoint it owns. Idempotent — last
-/// writer wins.
+/// `ProcessInfo.log_send_cap`. Idempotent — last writer wins.
 pub fn install_badged_cap(cap: u32)
 {
     BADGEED_CAP.store(cap, Ordering::Release);
@@ -76,7 +72,7 @@ pub fn install_badged_cap(cap: u32)
 
 /// Return the pre-installed badged SEND cap, or zero. Caller is
 /// expected to have set it via [`install_badged_cap`] before the
-/// first log call.
+/// first log call. `_ipc_buf` is unused.
 pub fn ensure_badged_cap(_ipc_buf: *mut u64) -> u32
 {
     BADGEED_CAP.load(Ordering::Acquire)
@@ -113,10 +109,9 @@ pub fn write_bytes(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
 }
 
 /// Send a `STREAM_REGISTER_NAME` message on `cap`. Names longer than
-/// [`CHUNK_SIZE`] are truncated. The receiver applies collision-suffix
-/// policy (`name.2`, `name.3`, …) and emits a synthetic registration
-/// log line; see `ipc::stream_labels::STREAM_REGISTER_NAME` for the
-/// receiver-side contract.
+/// [`CHUNK_SIZE`] are truncated. The receiver stores the name for the
+/// sender's badge, truncating it at its per-slot limit
+/// (`services/logd/docs/ipc-interface.md` § `stream_labels::STREAM_REGISTER_NAME`).
 pub fn register_name(cap: u32, ipc_buf: *mut u64, name: &[u8])
 {
     if cap == 0 || ipc_buf.is_null() || name.is_empty()
@@ -179,19 +174,17 @@ pub fn write_args(cap: u32, ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
 }
 
 /// One-shot emit: format `args` and send on the pre-installed badged
-/// SEND cap. Silently drops when no cap is installed (the process has
-/// no log access — init/memmgr/procmgr-self before bootstrap, or any
-/// process spawned before the log endpoint existed).
+/// SEND cap. Drops when no cap is installed (a process spawned before the
+/// log endpoint existed); debug builds assert instead (#558).
 pub fn emit(ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
 {
     let cap = ensure_badged_cap(ipc_buf);
     if cap == 0
     {
         // Reaching here means the binary linked `seraph::log!` but
-        // received no pre-installed badged cap. Tier-2 binaries that
-        // never call `log!` never reach this function (dead-code-
-        // eliminated). Loud in debug; silent drop in release for
-        // cap-oblivious tier-2 use.
+        // received no pre-installed badged cap. Binaries that never call
+        // `log!` never reach this function (dead-code-eliminated). Loud
+        // in debug; silent drop in release.
         debug_assert!(
             false,
             "seraph::log! invoked but no log cap was installed at startup",

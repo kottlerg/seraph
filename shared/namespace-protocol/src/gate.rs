@@ -89,7 +89,7 @@ pub fn gate(label: u64, badge: u64) -> Result<(NodeId, NamespaceRights), GateErr
 /// caller holding an attenuated cap on the intermediary can obtain a
 /// child cap whose rights exceed its parent's, violating the
 /// monotonic-attenuation invariant in `docs/namespace-model.md`
-/// § "Walking". Pre-intersecting the request body restores the
+/// § Principles. Pre-intersecting the request body restores the
 /// invariant; the receiver still applies its own
 /// `entry.max_rights` ceiling on top.
 ///

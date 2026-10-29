@@ -6,22 +6,13 @@
 // (terminus-font.sourceforge.net). The rightmost pixel column of each
 // 10×20 source glyph is dropped to produce the 9×20 cells used here;
 // that column is structurally blank for ASCII/Latin-1 (and verified
-// blank for each codepoint in `FONT_9X20_EXT`).
+// blank for each Terminus-derived glyph in `FONT_9X20_EXT`; its slot 0, the
+// U+FFFD checkerboard, is original).
 
 // shared/font/src/lib.rs
 
-//! Embedded 9×20 bitmap font.
-//!
-//! 256 glyphs × 20 rows each, stored as a flat `[u16; 5120]` array.
-//! Each `u16` encodes one scanline: bits 15–7 are the 9 pixels (MSB = leftmost).
-//! To look up glyph N, row R: `FONT_9X20[N * 20 + R]`.
-//!
-//! `FONT_9X20` is byte-indexed by CP437. Codepoints used by the codebase
-//! but absent from CP437 (em-dash, en-dash, ×, …, ⇒, ≠, ✓, etc.) live in
-//! `FONT_9X20_EXT` and are looked up via `FONT_9X20_EXT_MAP`. The mapping
-//! from a UTF-8 byte stream to a glyph (CP437 reverse → ext → ASCII
-//! fallback → U+FFFD) is handled by the `shared/text` crate; this crate
-//! holds only the bitmap data.
+//! Embedded 9×20 bitmap font. The layout, indexing, and extension table are
+//! described in `shared/font/README.md` and on each item below.
 
 #![no_std]
 
@@ -31,7 +22,8 @@ pub const GLYPH_WIDTH: u32 = 9;
 /// Glyph height in pixels.
 pub const GLYPH_HEIGHT: u32 = 20;
 
-/// Flat 9×20 bitmap font: 256 glyphs × 20 rows per glyph.
+/// Flat 9×20 bitmap font, CP437-indexed: glyph N row R is at `[N * 20 + R]`;
+/// bits 15–7 of each `u16` are the 9 pixels, MSB leftmost.
 pub static FONT_9X20: [u16; 5120] = [
     // glyph 0
     0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,

@@ -7,7 +7,8 @@
 //!
 //! This crate owns the security-relevant code path that every namespace
 //! server runs: IPC dispatch, name validation, rights composition,
-//! per-entry visibility filtering, and node-cap minting via
+//! per-entry visibility filtering at `NS_LOOKUP` (at `NS_READDIR` it is
+//! design intent; not yet implemented, #558), and node-cap minting via
 //! `cap_derive_badge`. Storage backends — fatfs, future ext4, tmpfs,
 //! vfsd's synthetic root — implement [`NamespaceBackend`], own their
 //! own `ipc_recv` loop on their namespace endpoint, and route each
@@ -48,9 +49,11 @@ pub use wire::NsError;
 #[repr(u64)]
 pub enum NodeKind
 {
-    /// A regular file. Permits `NS_READ`, `NS_READ_MEMORY`, `NS_STAT`.
+    /// A regular file: `NS_STAT` and the `FS_*` file labels (see
+    /// `shared/namespace-protocol/README.md` § Rights).
     File = 0,
-    /// A directory. Permits `NS_LOOKUP`, `NS_READDIR`, `NS_STAT`.
+    /// A directory: `NS_LOOKUP`, `NS_READDIR`, `NS_STAT`, and the
+    /// `MUTATE_DIR` labels.
     Dir = 1,
 }
 
@@ -74,8 +77,8 @@ pub struct NodeStat
 /// One entry in a directory, as surfaced by `NS_READDIR`.
 ///
 /// The name is carried inline as a fixed-capacity byte buffer so that
-/// the iteration can be no-alloc on the backend side. Names are
-/// validated by [`validate_name`] before serving.
+/// the iteration can be no-alloc on the backend side. Names are not
+/// validated server-side; clients validate the names they receive.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct EntryName
 {
@@ -116,11 +119,9 @@ impl EntryName
 ///
 /// `Local` entries are minted on this server's namespace endpoint via
 /// `cap_derive_badge` against the entry's stored [`NodeId`] (the common
-/// case). `External` entries return a pre-installed cap on a different
-/// server's namespace endpoint via `cap_copy` (the mount-point case).
-/// The composing backend stores `External` entries when boot-time
-/// mount composition installs a child filesystem's root cap into a
-/// parent directory.
+/// case). `External` entries mint a fresh badged SEND via
+/// `cap_derive_badge` on the peer's stored unbadged namespace endpoint
+/// (the mount-point case).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum EntryTarget
 {
@@ -169,7 +170,8 @@ pub struct EntryView
     /// Independent of the parent directory's rights.
     pub max_rights: NamespaceRights,
     /// Rights the caller's directory cap MUST hold for this entry to
-    /// be visible at lookup or readdir.
+    /// be visible at lookup (enforced) or readdir (design intent; not yet
+    /// implemented, #558).
     pub visible_requires: NamespaceRights,
 }
 
@@ -197,7 +199,8 @@ pub struct MemoryReply
 /// Storage backend trait implemented by every namespace server.
 ///
 /// [`dispatch_request`] calls these methods after running the
-/// protocol's wire decode, rights / visibility / name checks, and
+/// protocol's wire decode, rights / name checks (and, for `NS_LOOKUP`,
+/// visibility), and
 /// child-cap minting; backends own only their storage layer and never
 /// the wire surface or the access-control checks.
 pub trait NamespaceBackend
@@ -211,9 +214,9 @@ pub trait NamespaceBackend
     /// (storage I/O, malformed on-disk metadata, …).
     fn lookup(&mut self, dir: NodeId, name: &[u8]) -> Result<EntryView, NsError>;
 
-    /// Return the entry at zero-based index `idx` within `dir`. The
-    /// crate iterates by incrementing `idx` until the backend returns
-    /// `Ok(None)`, notifying end-of-directory.
+    /// Return the entry at zero-based index `idx` within `dir`. Called
+    /// once per `NS_READDIR` with the client-supplied index; `Ok(None)`
+    /// produces `END_OF_DIR`.
     ///
     /// # Errors
     ///
@@ -414,9 +417,9 @@ fn handle_lookup<B: NamespaceBackend>(
         EntryTarget::External { endpoint, node } =>
         {
             // Mount-boundary crossing: mint a fresh badged SEND on the
-            // peer server's endpoint carrying the composed rights —
-            // exactly as the `Local` arm does on this server's own
-            // endpoint. Deriving the badge from the (unbadged) peer
+            // peer server's endpoint carrying the composed rights, as the
+            // `Local` arm does on this server's own endpoint but without
+            // GRANT. Deriving the badge from the (unbadged) peer
             // endpoint, rather than copying a pre-badged mount cap, is
             // what lets attenuation cross the mount: the kernel forbids
             // re-badging an already-badged cap (`SYS_CAP_DERIVE_BADGE`
@@ -425,8 +428,8 @@ fn handle_lookup<B: NamespaceBackend>(
             let badge = pack(node, returned_rights);
             if badge == 0
             {
-                // cap_derive_badge requires a non-zero badge; empty
-                // composed rights means no access.
+                // cap_derive_badge requires a non-zero badge (zero only
+                // for node 0 with empty composed rights).
                 return ipc::IpcMessage::new(NsError::PermissionDenied.as_label());
             }
             match syscall::cap_derive_badge(endpoint, syscall_abi::RIGHTS_EP_SEND, badge)

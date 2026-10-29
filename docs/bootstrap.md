@@ -45,7 +45,7 @@ with `BootInfo` supplied by register. The CPU state and register contents
 at this gate are specified in
 [`core/boot/docs/kernel-handoff.md`](../core/boot/docs/kernel-handoff.md); the
 `BootInfo` layout and `BOOT_PROTOCOL_VERSION` contract are owned by the
-[`abi/boot-protocol/`](../abi/boot-protocol/) crate.
+[`abi/boot-protocol/`](../abi/boot-protocol/README.md) crate.
 
 ---
 
@@ -78,7 +78,7 @@ In kernel phase 9, the kernel maps the init image — pre-parsed
 by the bootloader and delivered via `BootInfo.init_image` — into a new
 address space, creates init's initial thread, and enters userspace. The
 init-image contract is specified by the `InitImage` type in the
-[`abi/boot-protocol/`](../abi/boot-protocol/) crate; the kernel side of
+[`abi/boot-protocol/`](../abi/boot-protocol/README.md) crate; the kernel side of
 the handoff is the last phase in
 [`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md). The
 kernel's only baked-in knowledge of userspace is this handoff — it has no

@@ -29,10 +29,24 @@ pub enum VerifyError
 
 /// Verify an Ed25519 signature over `message`.
 ///
+/// # Arguments
+///
+/// - `public_key`: the 32-byte compressed public key A.
+/// - `message`: the signed message, any length.
+/// - `signature`: the 64-byte signature R ‖ S.
+///
 /// # Errors
 ///
-/// Returns [`VerifyError`] identifying the first failing check. A returned
-/// `Ok(())` means the signature is valid for `public_key` and `message`.
+/// Returns the first failing check, in this order:
+/// - [`VerifyError::NonCanonicalS`]: S is not below the group order L.
+/// - [`VerifyError::BadPublicKey`]: `public_key` does not decode to a curve
+///   point. Non-canonical encodings RFC 8032 § 5.1.3 rejects (y ≥ p, or
+///   x = 0 with the sign bit set) are accepted rather than reported here
+///   (#558).
+/// - [`VerifyError::Mismatch`]: the verification equation does not hold.
+///
+/// A returned `Ok(())` means the signature is valid for `public_key` and
+/// `message`.
 pub fn ed25519_verify(
     public_key: &[u8; 32],
     message: &[u8],

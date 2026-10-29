@@ -111,13 +111,10 @@ pub enum BundleError
 
 /// Parse the header and entry-header array from a bundle byte slice.
 ///
-/// Returns the parsed `BundleHeader` and a slice view of the entry-header
-/// array. Bodies are not validated beyond bounds and alignment; the caller
-/// inspects each entry's `(offset, size)` against the slice as needed.
-///
-/// The function performs unaligned reads via [`core::ptr::read_unaligned`]
-/// so the slice need not be 8-byte aligned. The returned entry-header
-/// slice references the input bytes (read-only).
+/// Validates the header and every entry header and returns the parsed
+/// `BundleHeader`; read entries with [`entry_at`]. Bodies are not validated
+/// beyond bounds and alignment. Fields are decoded byte-wise little-endian,
+/// so the slice need not be aligned.
 ///
 /// # Errors
 ///

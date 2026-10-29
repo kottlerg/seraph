@@ -5,23 +5,16 @@
 
 //! Shared-memory byte transport for Seraph userspace.
 //!
-//! Two-layer helper:
+//! [`SharedBuffer`] maps Memory caps received from a peer; [`SpscHeader`],
+//! [`SpscWriter`], and [`SpscReader`] form a single-producer,
+//! single-consumer byte ring over any mapped shared region. The two layers,
+//! the ring's header layout, and its ordering are described in
+//! `shared/shmem/README.md`.
 //!
-//! 1. [`SharedBuffer`] — map Memory caps received from a peer contiguous
-//!    at a chosen VA ([`SharedBuffer::attach`]). The granting side owns
-//!    allocation and release of the backing pages (e.g. the ruststd pipe
-//!    requests its ring page from memmgr directly).
-//! 2. [`SpscRing`] — single-producer / single-consumer byte ring over a
-//!    [`SharedBuffer`]. Classic Lamport layout: two `AtomicU32` indices at
-//!    the head of the region, followed by a power-of-two-sized byte buffer.
-//!    Writer and reader may run on different CPUs; ordering is Acquire/
-//!    Release on the indices, which is sufficient on both x86-64 (TSO) and
-//!    RISC-V (RVWMO) for data published before the index store to be
-//!    observed after the index load.
-//!
-//! This crate holds only the userspace mechanism. Blocking/notification —
-//! "reader waits until writer has pushed N bytes" — is out of scope; use a
-//! notification cap out-of-band when that is wanted (pipes).
+//! Index ordering is Acquire/Release, which suffices on both x86-64 (TSO)
+//! and RISC-V (RVWMO) for data published before the index store to be
+//! observed after the index load. Blocking and wake-up use a notification
+//! cap out of band (pipes); this crate holds only the mechanism.
 
 // Under `rustc-dep-of-std` (build-std), use the core facade and no_core
 // so this crate can sit inside std's dep graph. Mirrors abi/syscall,
@@ -78,10 +71,11 @@ pub const MAX_PAGES: u32 = 4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShmemError
 {
-    /// `pages` is zero or exceeds [`MAX_PAGES`].
+    /// `pages` is zero, exceeds [`MAX_PAGES`], or exceeds the number of
+    /// Memory caps supplied.
     InvalidPageCount,
-    /// `sys_mem_map` failed partway through — pages already mapped are
-    /// unmapped before the error surfaces.
+    /// Deriving a mapping cap or `sys_mem_map` failed partway through —
+    /// pages already mapped are unmapped before the error surfaces.
     MapFailed,
 }
 
@@ -101,7 +95,10 @@ impl SharedBuffer
     /// Maps `memory_caps[..pages]` sequentially read-write at `vaddr`.
     ///
     /// # Errors
-    /// [`ShmemError::MapFailed`] if any map call rejects.
+    /// [`ShmemError::InvalidPageCount`] if `pages` is zero, exceeds
+    /// [`MAX_PAGES`], or exceeds `memory_caps.len()`;
+    /// [`ShmemError::MapFailed`] if deriving a mapping cap or any map call
+    /// fails.
     pub fn attach(
         memory_caps: &[u32],
         pages: u32,
@@ -207,8 +204,8 @@ fn unmap_range(aspace: u32, vaddr: u64, count: u32)
 ///
 /// Two atomic indices plus a u32 `capacity` (byte buffer length, must be a
 /// power of two) and a `closed` flag used by pipe peers to signal EOF.
-/// The byte buffer follows immediately after this struct, aligned to the
-/// ring's alignment (u64 is enough for our use case).
+/// The byte buffer follows immediately after this struct, at offset
+/// [`SpscHeader::SIZE`].
 #[repr(C)]
 pub struct SpscHeader
 {
@@ -231,14 +228,14 @@ pub struct SpscHeader
 impl SpscHeader
 {
     /// Size of the header in bytes. Usable bytes for the ring start at
-    /// `vaddr + HEADER_SIZE` and run for `capacity` bytes.
+    /// `vaddr + SpscHeader::SIZE` and run for `capacity` bytes.
     pub const SIZE: usize = core::mem::size_of::<Self>();
 
     /// Initialise a fresh header at `ptr` with `capacity` bytes of ring
     /// storage. `capacity` must be a non-zero power of two.
     ///
     /// # Safety
-    /// `ptr` must be valid, writable, and aligned for `SpscHeader` (u64).
+    /// `ptr` must be valid, writable, and aligned for `SpscHeader` (4 bytes).
     /// The caller is the unique initialiser of the header; no other thread
     /// on either side of the shared region may be reading the header yet.
     pub unsafe fn init(ptr: *mut Self, capacity: u32)

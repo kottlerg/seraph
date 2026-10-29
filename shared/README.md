@@ -8,7 +8,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`ansi/`](ansi/README.md) | Incremental ANSI SGR colour parser for the terminal output path |
 | [`crypto/`](crypto/README.md) | In-OS crypto primitives — SHA-512 hashing and Ed25519 signature verification, `no_std`, zero-dependency |
 | [`elf/`](elf/README.md) | ELF64 parser — header validation, segment enumeration |
-| [`font/`](font/README.md) | Embedded 9×20 bitmap font for early console output |
+| [`font/`](font/README.md) | Embedded 9×20 bitmap font shared by every framebuffer console |
 | [`ipc/`](ipc/README.md) | IPC helpers — `IpcMessage` snapshot type, `ipc_call`/`recv`/`reply` wrappers, bootstrap protocol, and the `RecvGuard` receive-failure policy for blocking recv loops |
 | [`log/`](log/README.md) | System log primitives — wire-format helpers and process-global cache for the badged log cap |
 | [`mmio/`](mmio/README.md) | Architecture-specific MMIO ordering barriers for device drivers |

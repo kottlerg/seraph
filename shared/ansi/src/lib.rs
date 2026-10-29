@@ -13,20 +13,9 @@
 //! into the driver's `FB_SET_ATTRS` attribute before the text that uses
 //! it (see `docs/console-model.md`).
 //!
-//! Scope (issue #175): the 16 named SGR colours — foreground `30..=37` /
-//! `90..=97`, background `40..=47` / `100..=107`, `0` reset, `1` bold
-//! (promotes a base colour to its bright variant), `22` normal intensity,
-//! `39` / `49` default fg / bg. Every other SGR code (italic, underline,
-//! blink, reverse) is silently ignored. The `38` / `48` 256-colour /
-//! truecolour introducers are also ignored, along with their operands
-//! (`5;<n>` or `2;<r>;<g>;<b>`), so the operands are not misread as further
-//! SGR codes. Non-`m` CSI sequences (cursor movement, erase) and non-CSI
-//! escapes are swallowed rather than rendered as literal glyphs.
-//!
-//! The 16 → RGB mapping lives here, not in the driver: the driver renders
-//! whatever 24-bit colour it is handed and holds no palette, so a future
-//! direct-RGB client (a compositor) reuses the same wire without inheriting
-//! ANSI's colour vocabulary.
+//! The recognised SGR codes, the handling of every other escape, and why the
+//! 16 → RGB palette lives here rather than in the driver are specified in
+//! `shared/ansi/README.md` § Scope.
 
 #![no_std]
 
@@ -67,7 +56,7 @@ pub enum Event<'a>
 {
     /// Set the rendering colours to `(fg, bg)` 24-bit RGB before the
     /// following text. Emitted at an `ESC[…m` boundary, and only when the
-    /// resolved pair differs from the last one emitted.
+    /// resolved pair differs from the last pair the sink accepted.
     Attrs([u8; 3], [u8; 3]),
     /// A run of literal output bytes containing no escape sequences,
     /// borrowing the slice passed to [`AnsiParser::feed`].
@@ -107,7 +96,8 @@ pub struct AnsiParser
     /// Bold/bright: promotes a base foreground in `0..=7` to `+8`.
     bold: bool,
     /// Operands still to swallow for a `38`/`48` extended-colour introducer
-    /// (`ESC[38;2;r;g;bm` / `ESC[38;5;nm`); the v1 palette does not use them.
+    /// (`ESC[38;2;r;g;bm` / `ESC[38;5;nm`); the 16-colour palette does not use
+    /// them.
     sgr_skip: u8,
     /// Saw a `38`/`48`; the next parameter is its `2`/`5` selector.
     sgr_await_sel: bool,
@@ -169,7 +159,7 @@ impl AnsiParser
     fn apply_param(&mut self, value: u16, seen: bool)
     {
         let code = if seen { value } else { 0 };
-        // `38`/`48` (256-colour / truecolour) introduce operands the v1
+        // `38`/`48` (256-colour / truecolour) introduce operands the 16-colour
         // palette cannot represent; swallow the introducer and its operands so
         // they are not misread as independent SGR codes — a colour component of
         // `0`, `1`, `30..=47`, … would otherwise change or reset the attrs.

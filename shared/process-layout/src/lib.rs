@@ -22,33 +22,11 @@
 //!
 //! # Randomisation model (ASLR, #39)
 //!
-//! Every surface is drawn independently inside a fixed, per-region
-//! [`VaWindow`]: a power-of-two count of page-aligned slots starting at a
-//! constant base. A draw is `base + ((r & (2^slots_log2 - 1)) << 12)` —
-//! page-aligned and free of modulo bias by construction. The windows sit on
-//! 9 GiB strides between the reservation-arena zone and the image window,
-//! so pairwise disjointness, the `tls < ipc < info < stack_top` ordering,
-//! and the unmapped guard page below every stack hold for **all** possible
-//! draws; no rejection or collision checking is needed (const-asserted
-//! below). Every zone ends below [`LAYOUT_VA_CEILING`] = 2^38, the smallest
-//! user half among the supported paging modes (riscv64 Sv39), so one static
-//! map is canonical under Sv39/Sv48/Sv57 and x86-64 alike — at the cost of
-//! 21 rather than 23 entropy bits per bootstrap surface.
-//!
-//! The per-process VA zone map (creator-chosen and process-private zones):
-//!
-//! | Zone | Base | Entropy bits | Chooser |
-//! |---|---|---|---|
-//! | `ET_EXEC` image (bias 0) | ~`0x20_0000` | — | linker |
-//! | Byte heap | `0x4000_0000` | 19 | `std::sys` (`alloc/seraph.rs`) |
-//! | Reservation arena | `0x10_0000_0000` | 24 | `std::sys` (`reserve/seraph.rs`) |
-//! | Main TLS | `0x21_0000_0000` | 21 | creator ([`MAIN_TLS_WINDOW`]) |
-//! | IPC buffer | `0x23_4000_0000` | 21 | creator ([`IPC_BUFFER_WINDOW`]) |
-//! | `ProcessInfo` | `0x25_8000_0000` | 21 | creator ([`PROCESS_INFO_WINDOW`]) |
-//! | Stack guard | `0x27_C000_0000` | 21 | creator ([`STACK_GUARD_WINDOW`]) |
-//! | `InitInfo` | `0x2A_0000_0000` | 21 | kernel ([`INIT_INFO_WINDOW`]) |
-//! | Init stack guard | `0x2C_4000_0000` | 21 | kernel ([`INIT_STACK_GUARD_WINDOW`]) |
-//! | PIE image bias | `0x30_0000_0000` | 23 | creator ([`IMAGE_WINDOW`]) |
+//! The draw windows and the per-process zone map are specified in
+//! `docs/userspace-memory-model.md` § Bootstrap Cross-Boundary VAs and
+//! § Image Placement. Each window's base, slot count, and the
+//! disjointness and ordering of every possible draw are const-asserted
+//! below.
 //!
 //! The heap and reservation-arena bases are drawn by the process itself in
 //! `runtime/ruststd/src/sys/{alloc,reserve}/seraph.rs`; their zone bounds are
@@ -185,13 +163,15 @@ pub const IMAGE_WINDOW: VaWindow = VaWindow {
 /// [`validate_image_placement`].
 pub const IMAGE_MAX_SPAN: u64 = 0x4000_0000;
 
-/// Upper bound of the byte-heap zone; mirrors `HEAP` in
+/// Upper bound of the byte-heap zone; mirrors `HEAP_BASE_DEFAULT`,
+/// `HEAP_BASE_SLOTS_LOG2`, and `HEAP_SPAN` in
 /// `runtime/ruststd/src/sys/alloc/seraph.rs` (base window `[1 GiB, 3 GiB)` +
 /// 1 GiB span).
 const HEAP_ZONE_END: u64 = 0x0000_0001_0000_0000;
 
-/// Upper bound of the reservation-arena zone; mirrors `RESERVE_ARENA` in
-/// `runtime/ruststd/src/sys/reserve/seraph.rs` (base window
+/// Upper bound of the reservation-arena zone; mirrors
+/// `RESERVE_ARENA_BASE_DEFAULT`, `RESERVE_ARENA_SLOTS_LOG2`, and
+/// `RESERVE_ARENA_PAGES` in `runtime/ruststd/src/sys/reserve/seraph.rs` (base window
 /// `[64 GiB, 128 GiB)` + 256 MiB arena).
 const RESERVE_ARENA_ZONE_END: u64 = 0x0000_0020_1000_0000;
 

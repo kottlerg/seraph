@@ -107,4 +107,4 @@ stream. It runs as a boot in the `usertest` cell. See
 [programs/fb-charset/README.md](../fb-charset/README.md),
 [programs/shell/README.md](../shell/README.md),
 [services/drivers/framebuffer/README.md](../../services/drivers/framebuffer/README.md),
-[xtask/README.md](../../xtask/README.md)
+[shared/ansi/README.md](../../shared/ansi/README.md), [xtask/README.md](../../xtask/README.md)

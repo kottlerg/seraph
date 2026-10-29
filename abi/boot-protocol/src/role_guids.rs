@@ -7,15 +7,15 @@
 //!
 //! Each constant is a 16-byte array in the on-disk GPT layout (little-endian
 //! for the first three fields, big-endian for the last two — the same byte
-//! ordering [`uuid::Uuid::to_bytes_le`] produces). Direct byte comparison
+//! ordering `uuid::Uuid::to_bytes_le` produces). Direct byte comparison
 //! against a GPT entry's type-GUID field is therefore correct without
 //! conversion; producers (xtask) reconstruct a `uuid::Uuid` via
-//! [`uuid::Uuid::from_bytes_le`].
+//! `uuid::Uuid::from_bytes_le`.
 //!
 //! Root partitions are arch-distinguished following the Discoverable
 //! Partitions Specification convention: a single disk image may carry both
-//! an `x86_64` and a `riscv64` root; the bootloader and vfsd select by
-//! their own compile-time `target_arch`. The data partition GUID is
+//! an `x86_64` and a `riscv64` root; xtask writes the root GUID for the
+//! target arch and vfsd selects by its own compile-time `target_arch`. The data partition GUID is
 //! arch-neutral.
 //!
 //! Each value is a freshly minted v4 UUID with no extra structure encoded.

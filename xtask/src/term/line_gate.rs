@@ -27,10 +27,11 @@
 //! `FilterWriter`'s in-flight sequence is: a producer that emits no
 //! `\n` before the marker (firmware progress output driven by `\r` or
 //! cursor positioning, or a guest that hangs mid-line) cannot make the
-//! gate grow without limit. Once a line reaches the cap, its head is
-//! discarded and only the trailing `marker.len() - 1` bytes are kept,
-//! so a marker that straddles the cut still matches; the marker line
-//! the gate then emits starts at the kept tail.
+//! gate grow without limit. A line that reaches the cap and already
+//! holds the marker opens the gate there, without waiting for its `\n`.
+//! One that does not has its head discarded, keeping only the trailing
+//! `marker.len() - 1` bytes, so a marker that straddles the cut still
+//! matches; the marker line the gate then emits starts at the kept tail.
 //!
 //! Composition with `FilterWriter`: the gate sits **after** the filter
 //! (i.e. filter wraps inner; gate wraps filter). This ordering matters
@@ -50,7 +51,8 @@ use std::io::{self, Write};
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// `Write` adapter that drops bytes until the first complete line
-/// containing `marker` is seen, then passes everything through.
+/// containing `marker` is seen (or a line holding it reaches
+/// `MAX_LINE_BYTES`), then passes everything through.
 ///
 /// See the module docs for the line-vs-byte rationale and ordering
 /// rule relative to `FilterWriter`.
@@ -68,7 +70,8 @@ impl<W: Write> LineGate<W>
 {
     /// Wrap `inner` in a gate keyed on `marker`. Bytes are dropped
     /// until the first complete line whose content (terminated by `\n`)
-    /// contains `marker`.
+    /// contains `marker`, or until a line containing it reaches
+    /// `MAX_LINE_BYTES` unterminated.
     ///
     /// `marker` must be plain ASCII with no `ESC` byte; combining the
     /// gate with a CSI/OSC-bearing marker would interact badly with
@@ -103,30 +106,36 @@ impl<W: Write> Write for LineGate<W>
         for (i, &b) in buf.iter().enumerate()
         {
             self.line.push(b);
+            let at_cap = self.line.len() >= MAX_LINE_BYTES;
+            if b != b'\n' && !at_cap
+            {
+                continue;
+            }
+            if contains_subsequence(&self.line, &self.marker)
+            {
+                // Emit the marker line (in full, or as far as it has
+                // come when the cap is reached first), then drain any
+                // remaining bytes from this write batch directly into
+                // the inner writer.
+                self.inner.write_all(&self.line)?;
+                self.line.clear();
+                self.opened = true;
+                let rest = &buf[i + 1..];
+                if !rest.is_empty()
+                {
+                    self.inner.write_all(rest)?;
+                }
+                return Ok(buf.len());
+            }
             if b == b'\n'
             {
-                if contains_subsequence(&self.line, &self.marker)
-                {
-                    // Emit the marker line in full, then drain any
-                    // remaining bytes from this write batch directly
-                    // into the inner writer.
-                    self.inner.write_all(&self.line)?;
-                    self.line.clear();
-                    self.opened = true;
-                    let rest = &buf[i + 1..];
-                    if !rest.is_empty()
-                    {
-                        self.inner.write_all(rest)?;
-                    }
-                    return Ok(buf.len());
-                }
                 // No marker on this line — discard and continue.
                 self.line.clear();
             }
-            else if self.line.len() >= MAX_LINE_BYTES
+            else
             {
-                // Runaway line: keep only the tail a marker straddling
-                // the cut could still need.
+                // Runaway line without the marker: keep only the tail a
+                // marker straddling the cut could still need.
                 let keep = self.marker.len().saturating_sub(1);
                 let cut = self.line.len().saturating_sub(keep);
                 self.line.drain(..cut);
@@ -317,6 +326,22 @@ mod tests
 
         assert!(out.ends_with(b"[--------] boot: x\n"));
         assert!(out.len() < MAX_LINE_BYTES);
+    }
+
+    #[test]
+    fn marker_complete_when_the_line_reaches_the_cap_opens_gate()
+    {
+        // A marker already whole when the line hits the cap, whether it
+        // ends exactly at the cap or earlier, must open the gate rather
+        // than be cut by the runaway-line trim; every byte then passes.
+        let mut ends_at_cap = vec![b'A'; MAX_LINE_BYTES - MARKER.len()];
+        ends_at_cap.extend_from_slice(b"[--------] boot: x\nafter\n");
+        assert_eq!(run(&ends_at_cap), ends_at_cap);
+
+        let mut runs_past_cap = b"[--------] boot: x".to_vec();
+        runs_past_cap.resize(2 * MAX_LINE_BYTES, b'A');
+        runs_past_cap.extend_from_slice(b"\nafter\n");
+        assert_eq!(run(&runs_past_cap), runs_past_cap);
     }
 
     #[test]

@@ -691,7 +691,7 @@ pub fn set_affinity_invalid_err(ctx: &TestContext) -> TestResult
 
 /// A raw `SYS_THREAD_SET_AFFINITY` whose CPU-id register exceeds `u32::MAX`
 /// returns `InvalidArgument`: the kernel validates the whole register rather
-/// than its low word (0x1_0000_0000 would otherwise pin to CPU 0).
+/// than its low word (`0x1_0000_0000` would otherwise pin to CPU 0).
 pub fn set_affinity_wide_arg_err(ctx: &TestContext) -> TestResult
 {
     let child = crate::spawn::new_child(ctx)

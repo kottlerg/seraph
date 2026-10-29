@@ -18,7 +18,7 @@
 //! in `runtime/ruststd/src/sys/fs/seraph.rs`, reduced to `no_std`
 //! primitives. `requested_rights` is the rights word sent on every hop;
 //! the server composes each hop's rights from the parent cap, the entry, and
-//! the request (`shared/namespace-protocol/README.md` § NS_LOOKUP), so the
+//! the request (`shared/namespace-protocol/README.md` § `NS_LOOKUP`), so the
 //! returned cap carries at most `requested_rights` on every bit. `0xFFFF`
 //! requests everything the caller is allowed.
 

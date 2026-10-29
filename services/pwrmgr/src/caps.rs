@@ -19,9 +19,9 @@
 //! actuator caps from devmgr "as if it were a device driver": the ACPI
 //! tables it interprets come from [`devmgr_labels::QUERY_ACPI_TABLE`]
 //! (devmgr is the sole ACPI owner) and the carved I/O-port / `SbiControl`
-//! caps from [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`]. The arch module
-//! ([`crate::arch`]) drives those queries and parses what it needs; devmgr
-//! runs no shutdown logic.
+//! caps from [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`]. The target's arch
+//! module ([`crate::arch::current`]) drives those queries and parses what it
+//! needs; devmgr runs no shutdown logic.
 
 use ipc::{IpcMessage, devmgr_errors};
 use std::os::seraph::StartupInfo;

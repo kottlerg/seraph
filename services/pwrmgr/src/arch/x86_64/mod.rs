@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/pwrmgr/src/x86_64.rs
+// services/pwrmgr/src/arch/x86_64/mod.rs
 
 //! x86-64 platform shutdown and reboot.
 //!

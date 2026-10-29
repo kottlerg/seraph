@@ -59,6 +59,20 @@ enum Status
 
 impl Status
 {
+    /// One value of every variant (the payloads are placeholders).
+    /// `is_run_log` derives the preserved-log prefixes from this list
+    /// through `log_prefix`, so the purge of earlier runs' logs cannot
+    /// drift from the names `finalize_log` writes. A new variant MUST be
+    /// added here.
+    const ALL: [Status; 6] = [
+        Status::Pass,
+        Status::Ok,
+        Status::Fail,
+        Status::Hang,
+        Status::Err(0),
+        Status::QemuCrash(0),
+    ];
+
     fn label(&self) -> String
     {
         match self
@@ -161,7 +175,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
         {
             let run_id = next_run.fetch_add(1, Ordering::AcqRel);
             let slot_dir = workdir.join(slot.to_string());
-            let log_path = workdir.join(format!("log-{run_id}.log"));
+            let log_path = workdir.join(run_log_name(IN_FLIGHT_LOG_PREFIX, run_id));
             let disk_dst = slot_dir.join("disk.img");
             let vars_dst = slot_dir.join("VARS.fd");
 
@@ -379,6 +393,36 @@ fn resolve_firmware(ctx: &BuildContext, arch: Arch) -> Result<FirmwareSet>
     }
 }
 
+/// Prefix of a run's in-flight log, which `finalize_log` renames to the
+/// status prefix or removes once the run is classified.
+const IN_FLIGHT_LOG_PREFIX: &str = "log";
+
+/// File name of run `run_id`'s log under `prefix`: the in-flight prefix or
+/// one `Status::log_prefix` returns.
+fn run_log_name(prefix: &str, run_id: u32) -> String
+{
+    format!("{prefix}-{run_id}.log")
+}
+
+/// Whether `name` is a log an earlier invocation left: `<prefix>-<run>.log`
+/// (the shape `run_log_name` writes), with `<prefix>` the in-flight prefix
+/// or one `Status::log_prefix` returns for some variant.
+fn is_run_log(name: &str) -> bool
+{
+    let Some((prefix, run)) = name.strip_suffix(".log").and_then(|s| s.rsplit_once('-'))
+    else
+    {
+        return false;
+    };
+    !run.is_empty()
+        && run.bytes().all(|b| b.is_ascii_digit())
+        && (prefix == IN_FLIGHT_LOG_PREFIX
+            || Status::ALL.iter().any(|s| s.log_prefix() == Some(prefix)))
+}
+
+/// Remove every run log an earlier invocation left in `workdir`, so the
+/// preserved logs there (and the CI artifact upload that globs them)
+/// belong to this invocation alone.
 fn purge_prior_logs(workdir: &Path)
 {
     let Ok(entries) = std::fs::read_dir(workdir)
@@ -394,15 +438,7 @@ fn purge_prior_logs(workdir: &Path)
         {
             continue;
         };
-        let is_log = Path::new(name)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
-            && (name.starts_with("log-")
-                || name.starts_with("FAIL-")
-                || name.starts_with("HANG-")
-                || name.starts_with("ERR-")
-                || name.starts_with("QEMU-CRASH-"));
-        if is_log
+        if is_run_log(name)
         {
             let _ = std::fs::remove_file(&path);
         }
@@ -660,7 +696,7 @@ fn finalize_log(workdir: &Path, log_path: &Path, run_id: u32, status: &Status) -
         }
         Some(prefix) =>
         {
-            let dest = workdir.join(format!("{prefix}-{run_id}.log"));
+            let dest = workdir.join(run_log_name(prefix, run_id));
             std::fs::rename(log_path, &dest).with_context(|| {
                 format!("renaming {} -> {}", log_path.display(), dest.display())
             })?;
@@ -786,7 +822,7 @@ fn print_failing_tails(workdir: &Path, outcomes: &[RunOutcome])
         {
             continue;
         };
-        let log_path = workdir.join(format!("{}-{}.log", prefix, o.run));
+        let log_path = workdir.join(run_log_name(prefix, o.run));
         println!(
             "--- run={} status={} log={}",
             o.run,
@@ -971,6 +1007,42 @@ mod tests
             classify(RC_SIGSEGV, false, log, &pass, &fail).0,
             Status::Fail
         ));
+    }
+
+    // Every log a run can leave (in flight, or renamed to any status's
+    // prefix) is purged by the next invocation; a prefix the purge misses
+    // survives and is re-uploaded as if the next invocation had written it.
+    #[test]
+    fn every_log_a_run_leaves_is_purged()
+    {
+        let prefixes = Status::ALL
+            .iter()
+            .filter_map(Status::log_prefix)
+            .chain([IN_FLIGHT_LOG_PREFIX]);
+        for prefix in prefixes
+        {
+            let name = run_log_name(prefix, 17);
+            assert!(is_run_log(&name), "{name} is not purged");
+        }
+    }
+
+    // Files that are not a run's log, including near-misses on the
+    // `<prefix>-<run>.log` shape, survive the purge.
+    #[test]
+    fn files_other_than_run_logs_are_not_purged()
+    {
+        for name in [
+            "notes.log",
+            "FAIL-.log",
+            "FAIL-x.log",
+            "PASS-3.log",
+            "OK-3.txt",
+            "OK-3.log.bak",
+            "vars-0.fd",
+        ]
+        {
+            assert!(!is_run_log(name), "{name} would be purged");
+        }
     }
 
     // SIGKILL (our own timeout kill, or OOM) is NOT a tolerated QEMU crash.

@@ -12,8 +12,9 @@
 //!
 //! ktest receives a set of buddy-backed RAM Memory caps from the kernel
 //! alongside its three segment caps (TEXT, RODATA, BSS/DATA). Before any
-//! tests run, `init()` splits the first RAM cap into single-page frames
-//! (up to `POOL_SIZE`) and stores the capability slots in `POOL_SLOTS`.
+//! tests run, `init()` carves a tail of up to `POOL_SIZE` pages off the
+//! first RAM cap (leaving at least one page in its head), splits that tail
+//! into single-page frames, and stores the capability slots in `POOL_SLOTS`.
 //! Each slot is marked available in `POOL_AVAILABLE` (one bit per slot).
 //! Segment caps are intentionally left intact: the pool never draws from
 //! the binary's own image, so non-zero initialised statics in ktest cannot
@@ -21,7 +22,8 @@
 //!
 //! Tests call `alloc()` to reserve a memory cap from the pool. When done, they
 //! call `free()` to return it. The cap is never deleted, only marked available
-//! for reuse. With proper cleanup, 64 memory caps can service unlimited tests.
+//! for reuse. With proper cleanup, the pool's caps (at most `POOL_SIZE`) can
+//! service any number of tests.
 //!
 //! ## Usage
 //!
@@ -137,9 +139,10 @@ unsafe fn split_frame_recursive(memory_cap: u32, count: &mut usize)
 /// Initialize the frame pool by carving a tail off the first RAM cap.
 ///
 /// Called once from `main()` before any tests run. Reads the size of the
-/// first RAM Memory cap from the `CapDescriptor` array, splits a
-/// `POOL_SIZE * PAGE_SIZE` tail off the end, then recursively splits that
-/// tail into single-page frames. The head of the RAM cap stays in
+/// first RAM Memory cap from the `CapDescriptor` array, splits a tail of up
+/// to `POOL_SIZE * PAGE_SIZE` off the end, leaving at least one page in the
+/// head (no pool when the cap is two pages or smaller), then recursively
+/// splits that tail into single-page frames. The head of the RAM cap stays in
 /// `info.memory_base` with full retype rights so tests can continue
 /// to create kernel objects from it.
 ///

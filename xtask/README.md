@@ -339,8 +339,9 @@ cargo xtask run-parallel --arch x86_64 --parallel 4 --runs 100 \
 
 **Output**: one line per completed run, plus a summary block. Logs for
 non-passing runs are preserved under `target/xtask/run-parallel/` as
-`FAIL-<run>.log`, `HANG-<run>.log`, `ERR-<run>.log`, or `QEMU-CRASH-<run>.log`.
-PASS logs are discarded.
+`OK-<run>.log`, `FAIL-<run>.log`, `HANG-<run>.log`, `ERR-<run>.log`, or
+`QEMU-CRASH-<run>.log`. PASS logs are discarded. Each invocation first removes
+the run logs an earlier one left there, so the preserved logs are its own.
 
 **Outcome precedence**:
 1. `--fail` regex matches → `FAIL` (a live match also triggers early abort

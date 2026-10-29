@@ -60,10 +60,9 @@ core/ktest/
 
 Tests are organised across four tiers (unit, integration, stress, and
 benchmark), all run on every boot by default. Each tier lives in its own
-source directory, whose `mod.rs` codifies at its top the tier's one-file rule
-(one file per surface, scenario, or race or resource invariant, as Source Layout
-lists per tier), except its architecture-only tests, which live under
-`src/arch/<arch>/` (see below).
+source directory and follows a one-file rule (one file per surface, scenario, or
+race or resource invariant, as Source Layout lists per tier), except its
+architecture-only tests, which live under `src/arch/<arch>/` (see below).
 
 `src/arch/` is ktest's arch-dispatch surface: one module per architecture,
 selected by `target_arch` in `src/arch/mod.rs`, each exposing the same
@@ -173,9 +172,9 @@ checks that a user-set DF and TF, and a GS base reloaded from the user selector,
 the kernel across a SYSCALL, and that a syscall made with AC set completes its user copy and
 returns with AC still set; `src/arch/x86_64/page_fault_present_bit.rs` checks that a fault
 handler's `#PF` message carries `FAULT_ACCESS_PRESENT` for a store to a read-only user page and
-never for a load from the kernel image window. On RISC-V, `src/arch/riscv64/sbi_gating.rs` checks that
-`SYS_SBI_CALL` refuses kernel-reserved SBI extensions and sanctioned ones the cap lacks the
-right for.
+never for a load from the kernel image window. On RISC-V, `src/arch/riscv64/sbi_gating.rs`
+checks that `SYS_SBI_CALL` refuses kernel-reserved SBI extensions and sanctioned ones the cap
+lacks the right for.
 
 ### Tier S — `src/stress/`
 
@@ -232,12 +231,13 @@ the report bounds of `integration::cross_cspace_revoke_no_alias`,
 `integration::fault_handler_declines_kills`, `integration::aspace_fault_notification_late_bind`,
 `integration::death_notification_late_bind`, `integration::reply_binding_displaced`,
 `integration::syscall_rflags_hardening`, `integration::page_fault_present_bit`,
-`cap::cspace_self_delete_stops_caller` and `retype::aspace_self_delete_stops_caller`; the phase polls, the child's spin bound and the
-cleanup exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and is
-stretched so its `cap_delete` does not race a still-running pinned child); the migration polls
-of `thread::affinity_migrate_running`, the report wait of `thread::affinity_migrate_ready_queued`,
-the convergence polls of `thread::load_balancer_redistributes_skewed`; the exit and come-up polls
-of `configure_start_race`, `mutual_stop`, `stop_fault_sender`, `stop_owed_wake`, `stop_repark`,
+`cap::cspace_self_delete_stops_caller` and `retype::aspace_self_delete_stops_caller`; the
+phase polls, the child's spin bound and the cleanup exit wait of `integration::tlb_widen_retry`
+(the cleanup wait only gives up, and is stretched so its `cap_delete` does not race a
+still-running pinned child); the migration polls of `thread::affinity_migrate_running`, the
+report wait of `thread::affinity_migrate_ready_queued`, the convergence polls of
+`thread::load_balancer_redistributes_skewed`; the exit and come-up polls of
+`configure_start_race`, `mutual_stop`, `stop_fault_sender`, `stop_owed_wake`, `stop_repark`,
 `stop_target_vanishes` and `split_delete_race`, the final-delivery polls of `stop_repark`, and the
 controller polls of `sleep_list_full`. Every other bound applies as written.
 

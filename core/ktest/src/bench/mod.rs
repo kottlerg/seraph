@@ -5,8 +5,7 @@
 
 //! Tier 3 — Benchmarks / profiling.
 //!
-//! Rule (mirrors `core/ktest/src/unit/mod.rs`; see `core/ktest/README.md`
-//! § Tier 3):
+//! Rule (see `core/ktest/README.md` § Source Layout and § Tier 3):
 //!
 //! > **One file per kernel surface measured. New surface ⇒ new file.**
 //!

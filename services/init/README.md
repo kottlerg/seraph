@@ -17,6 +17,8 @@ init/
 ├── docs/
 │   └── bootstrap.md            # Authoritative stage enumeration;
 │                               # init's side of the capability flow
+├── sender-table/               # `init-sender-table` crate: init-logd's per-sender
+│                               # slot table (host-tested)
 └── src/
     ├── main.rs                 # _start, run() orchestration across the three stages
     ├── bootstrap.rs            # Raw memmgr / procmgr ELF-load + kernel-object setup

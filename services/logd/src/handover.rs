@@ -72,8 +72,8 @@ pub unsafe fn transfer(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut Sl
 unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut SlotTable)
 {
     // Bound on chunks per drain. A first drain sends 1 header + up to
-    // MAX_SENDERS (16) slots + up to HISTORY_RING_LEN (512) lines + 1
-    // DONE, about 530 chunks; slots resent after a rename and lines pushed
+    // MAX_SENDERS (32) slots + up to HISTORY_RING_LEN (512) lines + 1
+    // DONE, about 550 chunks; slots resent after a rename and lines pushed
     // during the drain add to that only while senders keep renaming or
     // logging. 2048 leaves ample headroom for both, and also ends a
     // malformed reply stream that never sends DONE.

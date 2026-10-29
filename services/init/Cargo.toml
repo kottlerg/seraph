@@ -11,6 +11,8 @@ test = false
 
 [dependencies]
 init-protocol = { path = "../../abi/init-protocol" }
+# init-logd's per-sender slot table, kept host-testable outside this no_std bin.
+init-sender-table = { path = "sender-table" }
 process-abi = { path = "../../abi/process-abi" }
 process-layout = { path = "../../shared/process-layout" }
 elf = { path = "../../shared/elf" }

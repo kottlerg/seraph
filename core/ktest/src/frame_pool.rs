@@ -332,7 +332,8 @@ pub unsafe fn free(memory_cap: u32)
 
 /// RAII wrapper for allocated frames.
 ///
-/// Automatically unmaps and frees the frame when dropped.
+/// Automatically unmaps and frees the frame when dropped; a frame whose unmap
+/// fails is logged and not returned to the pool.
 pub struct FrameGuard
 {
     memory_cap: u32,
@@ -384,14 +385,20 @@ impl Drop for FrameGuard
 {
     fn drop(&mut self)
     {
-        // Unmap if mapped
-        if let Some(va) = self.mapped_va
+        // Unmap if mapped. A frame whose unmap fails stays out of the pool
+        // rather than alias the next test's mapping.
+        let unmap_failed = self
+            .mapped_va
+            .is_some_and(|va| syscall::mem_unmap(self.aspace_cap, va, 1).is_err());
+        if unmap_failed
         {
-            let _ = syscall::mem_unmap(self.aspace_cap, va, 1);
+            crate::log("ktest: frame_pool: FrameGuard unmap failed; frame not returned");
+            return;
         }
 
         // Return to pool
-        // SAFETY: memory_cap was allocated from the pool by new().
+        // SAFETY: memory_cap was allocated from the pool by new(), and it is
+        // mapped nowhere: never mapped, or its mapping was just removed.
         unsafe { free(self.memory_cap) };
     }
 }

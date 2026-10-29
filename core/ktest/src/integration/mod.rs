@@ -58,9 +58,9 @@
 //! - `queued_waiters_fifo.rs` — threads waiting on one notification or event queue are woken in
 //!   arrival order, one per delivery, including after a timed waiter expires at the head or the
 //!   tail
-//! - Architecture-only scenarios live behind `crate::arch` (`run_integration`);
-//!   per-arch helpers and branches inside the scenarios above are still gated in
-//!   place (#460).
+//! - Architecture-only scenarios live behind `crate::arch` (`run_integration`),
+//!   and the scenarios above reach their per-arch helpers and constants (for
+//!   example `crate::arch::fpu`, `crate::arch::IP_OFFSET`) through it.
 
 pub mod aspace_fault_notification_late_bind;
 pub mod cap_delegation_chain;

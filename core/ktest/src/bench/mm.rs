@@ -21,6 +21,9 @@ pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, iters: u32)
     let mut min = u64::MAX;
     let mut max = 0u64;
     let mut total = 0u64;
+    let mut completed: u64 = 0;
+    // Whether the frame is left mapped at BENCH_VA (an unmap failed).
+    let mut still_mapped = false;
 
     for _ in 0..n
     {
@@ -37,7 +40,11 @@ pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, iters: u32)
         {
             break;
         }
-        let _ = syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1);
+        if syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1).is_err()
+        {
+            still_mapped = true;
+            break;
+        }
         let t1 = cycles_now();
         let delta = t1.saturating_sub(t0);
         if delta < min
@@ -49,13 +56,21 @@ pub(super) fn bench_mem_map_unmap(ctx: &crate::TestContext, iters: u32)
             max = delta;
         }
         total = total.saturating_add(delta);
+        completed += 1;
     }
 
-    // SAFETY: memory_cap is from pool and now unmapped.
-    unsafe { crate::frame_pool::free(memory_cap) };
+    // A frame still mapped stays out of the pool rather than alias the next
+    // test's mapping.
+    if !still_mapped
+    {
+        // SAFETY: memory_cap is from pool and mapped nowhere: every map in the
+        // loop was undone by a successful unmap, or failed.
+        unsafe { crate::frame_pool::free(memory_cap) };
+    }
 
     log_bench_header("mem_map_unmap", iters);
-    if let Some(mean) = total.checked_div(n)
+    // Averaged over the completed iterations; none completed logs no statistics.
+    if let Some(mean) = total.checked_div(completed)
     {
         crate::log_u64("ktest: bench  cycles_min=", min);
         crate::log_u64("ktest: bench  cycles_mean=", mean);
@@ -95,6 +110,7 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
     let mut min = u64::MAX;
     let mut max = 0u64;
     let mut total = 0u64;
+    let mut completed: u64 = 0;
 
     for _ in 0..n
     {
@@ -132,14 +148,20 @@ pub(super) fn bench_mem_protect(ctx: &crate::TestContext, iters: u32)
             max = delta;
         }
         total = total.saturating_add(delta);
+        completed += 1;
     }
 
-    let _ = syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1);
-    // SAFETY: memory_cap is from pool and now unmapped.
-    unsafe { crate::frame_pool::free(memory_cap) };
+    // A frame whose unmap failed stays out of the pool rather than alias the
+    // next test's mapping.
+    if syscall::mem_unmap(ctx.aspace_cap, BENCH_VA, 1).is_ok()
+    {
+        // SAFETY: memory_cap is from pool and its only mapping was just removed.
+        unsafe { crate::frame_pool::free(memory_cap) };
+    }
 
     log_bench_header("mem_protect_pair", iters);
-    if let Some(mean) = total.checked_div(n)
+    // Averaged over the completed iterations; none completed logs no statistics.
+    if let Some(mean) = total.checked_div(completed)
     {
         crate::log_u64("ktest: bench  cycles_min=", min);
         crate::log_u64("ktest: bench  cycles_mean=", mean);

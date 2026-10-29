@@ -15,9 +15,9 @@ pwrmgr/
     ├── main.rs       # Entry, bootstrap, IPC dispatch loop, cap-gating
     ├── caps.rs       # svcmgr bootstrap + devmgr-query acquisition
     └── arch/
-        ├── mod.rs        # Arch dispatch: `arch::current` (Actuator, resolve,
-        │                 # shutdown, reboot)
-        ├── x86_64/mod.rs # ACPI table mapping, PM1a S5 write; 8042 KBC reboot
+        ├── mod.rs         # Arch dispatch: `arch::current` (Actuator, resolve,
+        │                  # shutdown, reboot)
+        ├── x86_64/mod.rs  # ACPI table mapping, PM1a S5 write; 8042 KBC reboot
         └── riscv64/mod.rs # SBI SRST shutdown + cold reboot
 ```
 

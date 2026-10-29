@@ -291,7 +291,7 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
 4. Grant U-mode the cycle counter (scounteren.CY)
 5. Initialise the PLIC for the BSP's S-mode context, the one numbered by the BSP's hart
    id (`BootInfo.cpu_ids[0]`, which need not be 0): priority 1 for every source, all
-   enables cleared, threshold 0
+   enables cleared, threshold 0; halts if that context lies outside the PLIC window
 6. Arm stimecmp (Sstc) for the initial tick, using the bootloader-discovered
    timebase; halts if Sstc or the timebase was not discovered
 7. Enable interrupts (set sstatus.SIE)

@@ -686,7 +686,8 @@ pub const MAX_IRQ_ID: u32;
 
 /// Width of the root `Interrupt` range capability minted at Phase 7 (256 on
 /// x86-64; 1024 on RISC-V, the PLIC id space). On RISC-V the cap spans ids
-/// above `MAX_IRQ_ID`; a split names them, and `SYS_IRQ_REGISTER` refuses them.
+/// above `MAX_IRQ_ID`; a split names them, `SYS_IRQ_REGISTER` refuses them, and
+/// the Interrupt teardown leaves their routing untouched.
 pub const ROOT_IRQ_COUNT: u32;
 
 /// Whether the architecture has an I/O port space — `IoPort` capabilities and

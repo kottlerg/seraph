@@ -1491,7 +1491,8 @@ fn populate_cspace(
     /// Width of the root `Interrupt` range cap minted at Phase 7 — the per-arch
     /// interrupt-controller spec maximum (`arch::current::ROOT_IRQ_COUNT`: 256
     /// GSIs on x86-64, 1024 PLIC sources on RISC-V). `SYS_IRQ_REGISTER` refuses
-    /// an id outside `MIN_IRQ_ID..=MAX_IRQ_ID`, so oversizing is safe.
+    /// an id outside `MIN_IRQ_ID..=MAX_IRQ_ID` and the Interrupt teardown
+    /// touches the routing table only for ids inside it, so oversizing is safe.
     const ROOT_IRQ_COUNT: u32 = crate::arch::current::ROOT_IRQ_COUNT;
 
     /// Maximum number of `AcpiReclaimable` regions to mint caps for.

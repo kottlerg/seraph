@@ -1285,11 +1285,15 @@ longer names the target with Control rights — the target may then still be exe
 its CPU with its save published (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md)
 § `sys_thread_stop` Cross-CPU Stop Protocol).
 
-**Latency contract:** a stop of a thread running user code on another CPU completes within the
-target's remaining time slice (at most `TIME_SLICE_TICKS`, 10 timer ticks), not within the
-inter-processor-interrupt latency: no interrupt-return path deschedules a `Stopped` current thread,
-so the target runs until its next slice-expiry `schedule()` or its own park or yield. Callers that
-need a bounded stop latency MUST budget a full slice per stop.
+**Latency contract:** a stop of a thread running on another CPU completes at the target's next
+slice-expiry `schedule()` or its own park or yield, not within the inter-processor-interrupt
+latency: no interrupt-return path deschedules a `Stopped` current thread. That is within the
+target's remaining time slice (at most `TIME_SLICE_TICKS`, 10 timer ticks), except when the
+slice expires while the target runs a preemption-disabled kernel section with interrupts
+enabled (a TLB-shootdown or drain spin): `timer_tick` then refills the slice without
+rescheduling, and `preempt_enable` does not reschedule, so the stop completes at the first slice
+expiry that finds preemption enabled, a further slice later at the least. Callers that need a
+bounded stop latency MUST budget a slice for each expiry the target can spend in such a section.
 
 **Capability requirement:** `thread_cap` must have Control rights.
 

@@ -50,8 +50,9 @@ pub const HAS_SBI: bool = true;
 /// Width of the root `Interrupt` range capability minted at Phase 7: the
 /// PLIC's 1024-entry id space (id 0 reserved, sources 1–1023); most platforms
 /// expose far fewer. The cap spans ids the kernel does not program; a split can
-/// name them, and `SYS_IRQ_REGISTER` refuses any outside
-/// `MIN_IRQ_ID..=MAX_IRQ_ID` with `InvalidArgument`.
+/// name them, `SYS_IRQ_REGISTER` refuses any outside `MIN_IRQ_ID..=MAX_IRQ_ID`
+/// with `InvalidArgument`, and the teardown of a cap naming one leaves the
+/// routing table and the PLIC untouched.
 pub const ROOT_IRQ_COUNT: u32 = 1024;
 
 /// Size of the I/O Permission Bitmap (re-exported from gdt for use in

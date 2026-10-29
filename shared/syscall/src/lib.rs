@@ -82,6 +82,24 @@ use arch::current::{
     syscall1_ret4, syscall2, syscall3, syscall4, syscall5, syscall5_ret2, syscall6, syscall6_ret3,
 };
 
+/// Issue syscall `nr` with three argument registers exactly as given, bypassing
+/// the typed wrappers' argument types; returns the primary return register
+/// (negative = error code).
+///
+/// For harness tests of the kernel's own argument validation, which must hand
+/// it register values no typed wrapper can express (a priority above 255, a
+/// CPU id above `u32::MAX`). Everything else uses the typed wrappers.
+///
+/// # Safety
+/// The kernel receives the arguments unchecked by this crate: any argument the
+/// syscall treats as a user pointer must name memory valid for that use.
+#[inline]
+pub unsafe fn raw_syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
+{
+    // SAFETY: caller contract; syscall3 issues the raw syscall instruction.
+    unsafe { syscall3(nr, a0, a1, a2) }
+}
+
 // ── IPC capability handle helpers ─────────────────────────────────────────────
 
 pub use syscall_abi::pack_cap_handles;

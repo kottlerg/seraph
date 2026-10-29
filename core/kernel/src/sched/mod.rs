@@ -3777,7 +3777,10 @@ pub unsafe fn commit_reply_rebind_under_local_lock(
 /// the target's own park or yield), where the requeue denylist drops a
 /// `Stopped` or `Exited` target and the affinity check relocates a moved one.
 /// The callers' drains wait for that; the prod itself only exits a `hlt` on an
-/// idle CPU.
+/// idle CPU. `sys_thread_set_affinity` also uses it as the wake-protocol prod
+/// of the destination CPU after `migrate_ready_thread` moved a `Ready` thread
+/// there (the move set that CPU's reschedule-pending flag; the prod wakes it
+/// from idle to dispatch the thread).
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`). Self-IPI
@@ -3928,8 +3931,10 @@ pub unsafe fn migrate_ready_thread(
 /// is linked at on `src_cpu` — the value the caller located it by — NOT a
 /// re-read of `(*tcb).priority` inside a context where a concurrent
 /// `sys_thread_set_priority` could have desynced them. Takes/releases NO lock and
-/// sends NO IPI: the caller owns the lock lifecycle and the `wake_idle_cpu(dst)`
-/// that follows a `true` return.
+/// sends NO IPI: the caller owns the lock lifecycle and the wake of `dst` that
+/// follows a `true` return (`pull_unpinned_ready`'s `wake_idle_cpu(dst)`;
+/// `sys_thread_set_affinity`'s `prod_remote_cpu(dst)` once it has released
+/// `sched_lock`).
 #[cfg(not(test))]
 unsafe fn relocate_ready_thread(
     tcb: *mut thread::ThreadControlBlock,

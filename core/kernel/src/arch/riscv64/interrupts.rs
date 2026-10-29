@@ -33,10 +33,16 @@
 //! - Threshold:         base + `0x20_0000` + 0x1000*context.
 //! - Claim/Complete:    the threshold register + 4.
 //!
-//! A hart's S-mode context is `hart*2 + 1`, numbered by the hardware hart id
-//! (`percpu::apic_id_for`), never by the kernel's logical CPU index: the boot hart
-//! need not be hart 0, and the two numberings differ wherever firmware enumerates
-//! harts sparsely.
+//! A hart's S-mode context is taken to be `hart*2 + 1`, numbered by the hardware
+//! hart id (`percpu::apic_id_for`), never by the kernel's logical CPU index: the
+//! boot hart need not be hart 0, and the two numberings differ wherever firmware
+//! enumerates harts sparsely. The PLIC specification leaves the context-to-hart
+//! mapping to the platform (a device tree states it in the PLIC's
+//! `interrupts-extended`); `hart*2 + 1` is the layout of the platforms the kernel
+//! targets (QEMU `virt` and SiFive-style PLICs), an assumption the kernel does
+//! not read from firmware. `init` and `init_ap` halt the boot when a hart's
+//! context registers would fall outside the PLIC window
+//! (`super::platform::plic_size`).
 //!
 //! # Locking
 //! [`plic_enable`] and [`plic_disable`] read-modify-write a 32-source enable word of
@@ -123,6 +129,30 @@ fn current_hart() -> u32
 fn current_hart() -> u32
 {
     0
+}
+
+/// Whether the S-mode context registers of the hart with hardware id `hart`
+/// (its enable words and its threshold and claim/complete pair) lie inside the
+/// PLIC window of `window` bytes.
+///
+/// Hart ids come from firmware and can be sparse or large; a context past the
+/// window would turn a `plic_write` into a store to arbitrary physical memory
+/// through the direct map.
+const fn plic_context_in_window(hart: u32, window: u64) -> bool
+{
+    let enable_end = plic_enable_base_for(hart) + PLIC_NUM_SOURCES.div_ceil(32) as u64 * 4;
+    let claim_end = plic_threshold_offset_for(hart) + 8;
+    enable_end <= window && claim_end <= window
+}
+
+/// Halt the boot unless hart `hart`'s PLIC context lies inside the PLIC window.
+#[cfg(not(test))]
+fn require_plic_context(hart: u32)
+{
+    if !plic_context_in_window(hart, super::platform::plic_size())
+    {
+        crate::fatal("riscv64: a hart's PLIC S-mode context lies outside the PLIC window");
+    }
 }
 
 /// PLIC claim/complete register offset for the executing hart's S-mode context.
@@ -1074,9 +1104,11 @@ pub unsafe fn init()
     // SAFETY: logical CPU 0 (the BSP) is below CPU_COUNT, and the caller ran
     // percpu::init_apic_ids first.
     let bsp_hart = unsafe { crate::percpu::apic_id_for(0) };
+    require_plic_context(bsp_hart);
     BSP_HART.store(bsp_hart, core::sync::atomic::Ordering::Relaxed);
     // SAFETY: direct map active; PLIC MMIO region accessible; plic_write performs
-    // volatile stores to valid PLIC register offsets.
+    // volatile stores to valid PLIC register offsets (the BSP's context was
+    // checked above to lie inside the PLIC window).
     unsafe {
         for src in 1..=PLIC_NUM_SOURCES
         {
@@ -1148,7 +1180,9 @@ pub unsafe fn init_ap()
     // context is this hart's (by hart id); percpu::init_ap installed `tp`
     // before this call, so current_cpu() is valid.
     let hart = current_hart();
-    // SAFETY: direct map active; PLIC MMIO accessible; per-hart context.
+    require_plic_context(hart);
+    // SAFETY: direct map active; PLIC MMIO accessible; this hart's context,
+    // checked above to lie inside the PLIC window.
     unsafe {
         plic_write(plic_threshold_offset_for(hart), 0);
         // Disable all source enable words for this hart's context.
@@ -1532,6 +1566,20 @@ mod tests
         // registers rather than hart 0's.
         assert_eq!(plic_enable_base_for(3), 0x2000 + 7 * 0x80);
         assert_eq!(plic_threshold_offset_for(3), 0x0020_0000 + 7 * 0x1000);
+    }
+
+    // Defect caught: a firmware hart id whose context lies past the PLIC window
+    // being accepted, which would turn the context writes into stores outside it.
+    #[test]
+    fn plic_context_outside_the_window_is_refused()
+    {
+        // A 4 MiB window holds 512 contexts after the 2 MiB of priority, pending
+        // and enable registers: the S-mode contexts of harts 0..=255 (context
+        // 511's claim register ends at 0x3F_F008); hart 256's is context 513.
+        assert!(plic_context_in_window(0, 0x40_0000));
+        assert!(plic_context_in_window(255, 0x40_0000));
+        assert!(!plic_context_in_window(256, 0x40_0000));
+        assert!(!plic_context_in_window(u32::MAX, 0x40_0000));
     }
 
     #[test]

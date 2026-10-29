@@ -689,6 +689,84 @@ pub fn set_affinity_invalid_err(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// A raw `SYS_THREAD_SET_AFFINITY` whose CPU-id register exceeds `u32::MAX`
+/// returns `InvalidArgument`: the kernel validates the whole register rather
+/// than its low word (0x1_0000_0000 would otherwise pin to CPU 0).
+pub fn set_affinity_wide_arg_err(ctx: &TestContext) -> TestResult
+{
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::set_affinity_wide_arg_err: spawn::new_child failed")?;
+
+    // SAFETY: no argument of SYS_THREAD_SET_AFFINITY is a pointer.
+    let ret = unsafe {
+        syscall::raw_syscall3(
+            syscall_abi::SYS_THREAD_SET_AFFINITY,
+            u64::from(child.th),
+            0x1_0000_0000,
+            0,
+        )
+    };
+    if ret != SyscallError::InvalidArgument as i64
+    {
+        return Err("thread_set_affinity(0x1_0000_0000) did not return InvalidArgument");
+    }
+
+    cap_delete(child.th).map_err(|_| "cap_delete th after set_affinity_wide_arg_err failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_affinity_wide_arg_err failed")?;
+    Ok(())
+}
+
+/// A raw `SYS_THREAD_SET_PRIORITY` whose priority register exceeds 255 returns
+/// `InvalidArgument` even when its low byte is a level the `SchedControl` band
+/// covers (0x105 would otherwise set priority 5).
+pub fn set_priority_wide_arg_err(ctx: &TestContext) -> TestResult
+{
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::set_priority_wide_arg_err: spawn::new_child failed")?;
+
+    // SAFETY: no argument of SYS_THREAD_SET_PRIORITY is a pointer.
+    let ret = unsafe {
+        syscall::raw_syscall3(
+            syscall_abi::SYS_THREAD_SET_PRIORITY,
+            u64::from(child.th),
+            0x105,
+            u64::from(ctx.sched_control_cap),
+        )
+    };
+    if ret != SyscallError::InvalidArgument as i64
+    {
+        return Err("thread_set_priority(0x105) did not return InvalidArgument");
+    }
+
+    cap_delete(child.th).map_err(|_| "cap_delete th after set_priority_wide_arg_err failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_priority_wide_arg_err failed")?;
+    Ok(())
+}
+
+/// A raw `SYS_SCHED_SPLIT` whose split-point register exceeds 255 returns
+/// `InvalidArgument` and leaves the cap unsplit, even when its low byte lies
+/// inside the band (0x115 would otherwise split at 21).
+pub fn sched_split_wide_arg_err(ctx: &TestContext) -> TestResult
+{
+    // Split a full-range copy, so a failure consumes the copy, not ktest's root.
+    let root_copy = cap_derive(ctx.sched_control_cap, RIGHTS_ALL)
+        .map_err(|_| "thread::sched_split_wide_arg_err: cap_derive(root) failed")?;
+
+    // SAFETY: no argument of SYS_SCHED_SPLIT is a pointer.
+    let ret = unsafe {
+        syscall::raw_syscall3(syscall_abi::SYS_SCHED_SPLIT, u64::from(root_copy), 0x115, 0)
+    };
+    if ret != SyscallError::InvalidArgument as i64
+    {
+        return Err("sched_split(0x115) did not return InvalidArgument");
+    }
+
+    // The refused split left the copy in place.
+    cap_delete(root_copy)
+        .map_err(|_| "cap_delete root copy after sched_split_wide_arg_err failed")?;
+    Ok(())
+}
+
 // ── SYS_THREAD_CONFIGURE negative ────────────────────────────────────────────
 
 /// `thread_configure` on a thread that is already Running or Blocked must fail.

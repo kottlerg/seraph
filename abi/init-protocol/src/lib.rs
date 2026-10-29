@@ -20,7 +20,8 @@
 //! # Rules
 //! - `no_std`; builds in `no_std`.
 //! - No inline assembly.
-//! - All cross-boundary types are `#[repr(C)]` with stable layout.
+//! - Cross-boundary structs are `#[repr(C)]` and enums carry a fixed-width
+//!   integer repr, all with stable layout.
 //! - No dependencies outside `core`.
 
 #![no_std]
@@ -85,7 +86,7 @@
 pub const INIT_PROTOCOL_VERSION: u32 = 13;
 
 /// Length of [`InitModuleName::name`], matching
-/// [`boot_protocol::BOOT_MODULE_NAME_LEN`] so the kernel copies the bundle
+/// `boot_protocol::BOOT_MODULE_NAME_LEN` so the kernel copies the bundle
 /// entry name straight through.
 pub const INIT_MODULE_NAME_LEN: usize = 32;
 
@@ -163,8 +164,9 @@ pub struct InitInfo
     /// Byte offset from the start of this struct to the first [`CapDescriptor`].
     ///
     /// The descriptor array contains `cap_descriptor_count` entries, one per
-    /// capability in the hardware resource and memory cap ranges. Init uses
-    /// these to identify what each capability slot represents without probing.
+    /// Phase 7 and Phase 8 capability in init's `CSpace` (see
+    /// `core/kernel/docs/capability-internals.md`). Init uses these to
+    /// identify what each capability slot represents without probing.
     pub cap_descriptors_offset: u32,
 
     /// Slot index of init's own `Thread` capability (CONTROL right).
@@ -192,7 +194,7 @@ pub struct InitInfo
     /// Covers the full valid IRQ range for the target arch (x86-64: GSI
     /// 0..256; RISC-V: PLIC sources 0..N). Userspace splits this cap
     /// with `SYS_IRQ_SPLIT` to produce single-IRQ sub-caps for device
-    /// drivers. Zero if no valid range could be determined at boot.
+    /// drivers.
     pub irq_range_cap: u32,
 
     /// Slot index of the read-only `Memory` cap covering the 4 KiB page
@@ -221,8 +223,7 @@ pub struct InitInfo
     /// `init_stack_memory_count` consecutive caps starting at this slot.
     /// Used by init's reap-handoff (`procmgr.REGISTER_INIT_TEARDOWN`) to
     /// donate the stack pages back to memmgr's pool after init's
-    /// `AddressSpace` is torn down. Zero if the kernel did not mint stack
-    /// caps (legacy boot path).
+    /// `AddressSpace` is torn down.
     pub init_stack_memory_base: u32,
     /// Number of stack `Memory` caps (typically `INIT_STACK_PAGES = 4`).
     pub init_stack_memory_count: u32,
@@ -235,14 +236,13 @@ pub struct InitInfo
     /// alongside the stack caps in init's reap-handoff.
     /// The cap range includes the page that contains this `InitInfo`
     /// struct itself — once init has read `InitInfo` at `_start`, the
-    /// pages can be reclaimed safely. Zero if the kernel did not mint
-    /// `InitInfo` caps (legacy boot path).
+    /// pages can be reclaimed safely.
     pub init_info_memory_base: u32,
     /// Number of `InitInfo` `Memory` caps (1..=[`INIT_INFO_MAX_PAGES`]).
     pub init_info_memory_count: u32,
 
     // ── Boot-module name table (added in protocol version 7) ────────────
-    /// Number of valid [`InitModuleName`] entries in [`module_names`].
+    /// Number of valid [`InitModuleName`] entries in [`Self::module_names`].
     /// Indices `0..module_name_count` are populated; the rest are
     /// [`INIT_MODULE_NAME_EMPTY`].
     pub module_name_count: u32,
@@ -339,7 +339,7 @@ pub struct CapDescriptor
 /// Named boot-module entry published in [`InitInfo::module_names`].
 ///
 /// Maps a bundle-entry name (carried through
-/// [`boot_protocol::BootModule::name`]) to the `CSpace` slot index of
+/// `boot_protocol::BootModule::name`) to the `CSpace` slot index of
 /// the module's `Memory` capability. The table sits in the `InitInfo`
 /// header so it always lives on the first `InitInfo` page and does not
 /// interact with the variable-length [`CapDescriptor`] array, which

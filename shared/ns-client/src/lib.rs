@@ -16,12 +16,11 @@
 //!
 //! Both helpers mirror the per-component `NS_LOOKUP` walk std performs
 //! in `runtime/ruststd/src/sys/fs/seraph.rs`, reduced to `no_std`
-//! primitives. `requested_rights` is the rights mask sent on every
-//! intermediate hop; namespace-protocol intersects it against each
-//! entry's `max_rights`, so the returned cap carries at most
-//! `requested_rights` on every bit. Callers wanting "everything
-//! permitted" pass `0xFFFF` (the sentinel that selects each entry's
-//! full `max_rights`).
+//! primitives. `requested_rights` is the rights word sent on every hop;
+//! the server composes each hop's rights from the parent cap, the entry, and
+//! the request (`shared/namespace-protocol/README.md` § `NS_LOOKUP`), so the
+//! returned cap carries at most `requested_rights` on every bit. `0xFFFF`
+//! requests everything the caller is allowed.
 
 #![no_std]
 
@@ -42,6 +41,13 @@ pub struct WalkedFile
 ///
 /// Each non-final hop must resolve to a directory; the final hop must
 /// resolve to a file (kind 0).
+///
+/// - `root_cap`: badged SEND addressing the directory the walk starts from.
+/// - `path`: `/`-separated components, resolved one `NS_LOOKUP` per component.
+/// - `requested_rights`: the rights word sent on every hop (`0xFFFF` asks for
+///   everything the server allows).
+/// - `ipc_buf`: the calling thread's registered IPC buffer; it is passed to
+///   `ipc::ipc_call` unchecked (#558).
 ///
 /// Returns `None` on any failure. On error, any partially-derived cap
 /// the helper owns is `cap_delete`d before returning.
@@ -70,6 +76,13 @@ pub fn walk_to_file(
 /// Every hop (including the final) must resolve to a directory
 /// (kind 1). Used to derive attenuated subtree / cwd caps for
 /// `CONFIGURE_NAMESPACE`.
+///
+/// - `root_cap`: badged SEND addressing the directory the walk starts from.
+/// - `path`: `/`-separated components, resolved one `NS_LOOKUP` per component.
+/// - `requested_rights`: the rights word sent on every hop (`0xFFFF` asks for
+///   everything the server allows).
+/// - `ipc_buf`: the calling thread's registered IPC buffer; it is passed to
+///   `ipc::ipc_call` unchecked (#558).
 ///
 /// Returns `None` on any failure. On error, any partially-derived cap
 /// the helper owns is `cap_delete`d before returning.

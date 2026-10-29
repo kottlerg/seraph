@@ -88,13 +88,16 @@ pub const PROCESS_ABI_VERSION: u32 = 22;
 /// Loaders use this when the binary does not declare a custom size via
 /// the `.note.seraph.stack` ELF note. Binaries with deeper stack
 /// pressure (memmgr's bootstrap parser, future fs-cache workers)
-/// declare a larger value through the `elf::stack_pages!` macro.
+/// declare a larger value through the `process_abi::stack_pages!` macro
+/// (`seraph::stack_pages!` in std-built binaries).
 pub const DEFAULT_PROCESS_STACK_PAGES: u32 = 8;
 
 /// Hard cap on the declared main-thread stack size, in 4 KiB pages.
 ///
 /// Loaders clamp the note value to this bound before allocation;
-/// memmgr's existing per-process quota remains the actual policy gate.
+/// the pool's available RAM is the remaining gate on the resulting
+/// `REQUEST_MEMORY_CAPS` calls; memmgr enforces no per-process quota (see
+/// `services/memmgr/docs/memory-pool.md` § Non-Goals).
 /// 256 pages = 1 MiB — far above any realistic in-tree need, sized to
 /// catch a corrupt or hostile note rather than to ration memory.
 pub const MAX_PROCESS_STACK_PAGES: u32 = 256;
@@ -116,12 +119,12 @@ pub const MAX_PROCESS_STACK_PAGES: u32 = 256;
 // Standard ELF note layout: a header (`namesz`, `descsz`, `ntype`)
 // followed by `name` (padded to 4-byte alignment) and `desc` (likewise).
 // For this note: `namesz = 7`, `descsz = 8`, `ntype = NT_SERAPH_STACK`,
-// `name = b"seraph\0\0"` (7 bytes + 1 align padding), `desc =
+// `name = b"seraph\0\0"` (6 bytes + NUL + 1 align padding), `desc =
 // StackNoteDesc { pages, reserved: 0 }`.
 
-/// Vendor name for Seraph-specific ELF notes. Seven bytes plus the
-/// terminating NUL, then one padding byte to 8-byte alignment for the
-/// descriptor that follows.
+/// Vendor name for Seraph-specific ELF notes. Six bytes plus the
+/// terminating NUL (`namesz` = 7), then one padding byte to the 4-byte note
+/// alignment.
 pub const SERAPH_NOTE_NAME: [u8; 8] = *b"seraph\0\0";
 
 /// Note type for the main-thread stack-size declaration.
@@ -197,7 +200,7 @@ macro_rules! stack_pages {
 
 /// Maximum number of 4 KiB pages reserved for the main thread's TLS block.
 ///
-/// Procmgr rejects binaries whose TLS block exceeds this size. Spawned
+/// Loaders (init, procmgr) reject binaries whose TLS block exceeds this size. Spawned
 /// threads allocate their own blocks from the heap and are unconstrained by
 /// this limit.
 pub const PROCESS_MAIN_TLS_MAX_PAGES: u64 = 4;
@@ -241,7 +244,7 @@ pub struct ProcessInfo
     /// creator's own band). Pass this slot as the `SchedControl` argument
     /// when setting a thread's priority. Zero when no scheduling authority
     /// is delegated (the process then cannot set any priority). See
-    /// [capability-model.md](../../docs/capability-model.md).
+    /// [capability-model.md](../../../docs/capability-model.md).
     pub sched_control_cap: u32,
 
     /// Priority level the creator placed this process's initial thread at.
@@ -441,7 +444,7 @@ pub struct ProcessInfo
     /// use.
     ///
     /// **Deprecated**: this slot predates the service registry and is
-    /// on a migration path to lookup via [`service_registry_cap`]. New
+    /// on a migration path to lookup via [`Self::service_registry_cap`]. New
     /// services MUST NOT add per-service fixed slots like this one;
     /// the registry is the system-wide service-discovery channel from
     /// this point forward. The migration is tracked by #74.
@@ -474,10 +477,9 @@ pub struct ProcessInfo
     // rights. At most one side blocks on each notification at any given
     // moment.
     //
-    // Zero in any slot means the corresponding notification is not attached;
-    // the AnonPipe peer treats `notification_wait` as a no-op and falls back
-    // to spinning on the ring header (used during silent-drop init when
-    // a memory cap is also zero).
+    // Zero in any slot means that notification is not attached: a reader
+    // with no data notification reports EOF instead of blocking, and a writer
+    // with no space notification drops bytes, so neither side spins.
     /// Data-available notification for the stdin pipe. Writer-kicked.
     pub stdin_data_notification_cap: u32,
     /// Space-available notification for the stdin pipe. Reader-kicked.
@@ -605,10 +607,15 @@ pub struct StartupInfo
     /// corresponding direction is not piped. See `ProcessInfo` for the
     /// full data-vs-space and writer-vs-reader semantics.
     pub stdin_data_notification_cap: u32,
+    /// Space-available notification for the stdin pipe.
     pub stdin_space_notification_cap: u32,
+    /// Data-available notification for the stdout pipe.
     pub stdout_data_notification_cap: u32,
+    /// Space-available notification for the stdout pipe.
     pub stdout_space_notification_cap: u32,
+    /// Data-available notification for the stderr pipe.
     pub stderr_data_notification_cap: u32,
+    /// Space-available notification for the stderr pipe.
     pub stderr_space_notification_cap: u32,
 
     /// Virtual address of the `PT_TLS` template in the loaded image.
@@ -707,8 +714,8 @@ pub unsafe fn process_info_mut(va: u64) -> &'static mut ProcessInfo
 
 // ── TLS block layout ────────────────────────────────────────────────────────
 //
-// Shared by procmgr (main thread) and the std thread-spawn path (children of
-// the main thread). Encapsulates the two TLS-layout variants Seraph supports:
+// Shared by the loaders (init, procmgr; main thread) and the std thread-spawn
+// path (children of the main thread). Encapsulates the two TLS-layout variants Seraph supports:
 //
 //   * x86-64 Variant II — [tdata|tbss|TCB]; thread pointer points at TCB;
 //     a self-pointer lives at `*tp`; variables live at negative offsets

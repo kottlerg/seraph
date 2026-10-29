@@ -5,8 +5,8 @@ edition.workspace = true
 publish.workspace = true
 
 # no_std: helper for looking up service caps by name in the per-process
-# svcmgr registry. Used by std-built services (timed, ruststd) and
-# directly by no_std consumers via the same API. Mirrors the
+# svcmgr registry. Consumed by ruststd; std-built services reach it
+# through `std::os::seraph`. Mirrors the
 # `shared/log` cap-install pattern: cache the per-process registry cap
 # once, then expose `lookup(name, ipc_buf)`.
 [lib]

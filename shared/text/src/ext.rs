@@ -7,7 +7,7 @@
 //!
 //! Resolves codepoints that are not in CP437 but for which the codebase
 //! ships a glyph in `font::FONT_9X20_EXT`. The map is sorted; the lookup
-//! is `O(log N)` over the ~15-entry table.
+//! is `O(log N)` over the `FONT_9X20_EXT_COUNT`-entry table.
 
 /// Returns the slot index into `font::FONT_9X20_EXT` for `cp`, or `None`
 /// if no extension glyph exists for that codepoint.

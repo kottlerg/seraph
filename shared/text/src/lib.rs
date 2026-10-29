@@ -20,8 +20,9 @@
 //!   into the four sources above and emits 9×20 glyph bitmaps via a
 //!   caller-supplied sink closure.
 //!
-//! Consumed by the userspace framebuffer driver and the early-boot
-//! framebuffer consoles (kernel, bootloader, ktest); each holds its own
+//! Consumed by the userspace framebuffer driver, the bootloader and ktest
+//! framebuffer consoles, and the kernel's retained framebuffer renderer;
+//! each holds its own
 //! [`Utf8Decoder`] and resolves the same glyph set through
 //! [`render_codepoint`].
 

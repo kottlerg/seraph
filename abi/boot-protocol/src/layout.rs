@@ -6,7 +6,7 @@
 //! Shared kernel-half layout arithmetic.
 //!
 //! The bootloader selects the direct-map virtual base (KASLR, #252) and the
-//! kernel validates and guards the same window at Phase 3. Both sides MUST
+//! kernel validates the window at Phase 0 and re-checks it at Phase 3. Both sides MUST
 //! agree bitwise on two derived quantities — the highest RAM address the
 //! direct map covers and the full ceiling of everything Phase 3 maps at
 //! `direct_map_base + phys` — so the arithmetic lives here, in the one

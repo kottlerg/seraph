@@ -105,7 +105,8 @@ pub(crate) fn sub(o: &mut Fe, a: &Fe, b: &Fe)
     }
 }
 
-/// Field multiplication, fully reduced.
+/// Field multiplication; limbs carried back to radix 2^16 (not canonical; `pack`
+/// canonicalises).
 pub(crate) fn mul(o: &mut Fe, a: &Fe, b: &Fe)
 {
     let mut t = [0i64; 31];

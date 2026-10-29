@@ -304,5 +304,6 @@ terminal fault tears down the whole process (see
 
 ## Summarized By
 
+[abi/process-abi/README.md](../../../abi/process-abi/README.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md), [services/memmgr/README.md](../README.md),
 [memmgr IPC Interface](ipc-interface.md)

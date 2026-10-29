@@ -30,7 +30,7 @@ text/
 | `utf8` | Incremental UTF-8 decoder (`Utf8Decoder`, `DecodeOutcome`). Holds partial state across the byte stream so a multi-byte sequence may straddle two IPC payloads. |
 | `cp437` | `unicode_to_cp437(cp) -> Option<u8>`. ASCII fast path plus binary search over the standard CP437 high-half. |
 | `ext` | `ext_glyph_index(cp) -> Option<usize>`. Lookup into `font::FONT_9X20_EXT_MAP` for codepoints the codebase uses but CP437 lacks. |
-| `fallback` | `ascii_fallback(cp) -> Option<&'static [u8]>`. Best-fit ASCII substitutes (`(C)`, `<->`, `(TM)`, …) for the long tail. |
+| `fallback` | `ascii_fallback(cp) -> Option<&'static [u8]>`. Best-fit ASCII substitutes (`(C)`, `(TM)`, `*`, …) for the long tail. |
 | `glyphs` | `render_codepoint(cp, sink)`. Dispatcher; resolves a codepoint to one or more 9×20 bitmaps. |
 
 ## Dispatch order
@@ -44,7 +44,7 @@ nothing matches, slot 0 of `FONT_9X20_EXT` (`U+FFFD`) is emitted.
 | Consumer | Use |
 |---|---|
 | [`services/drivers/framebuffer`](../../services/drivers/framebuffer/README.md) | Owns one `Utf8Decoder` in its service loop; dispatches every assembled codepoint via `render_codepoint`. |
-| `core/kernel` | Early-boot / panic framebuffer console (`core/kernel/src/framebuffer.rs`). |
+| `core/kernel` | Kernel framebuffer renderer (`core/kernel/src/framebuffer.rs`); its role across boot is in [docs/console-model.md](../../docs/console-model.md). |
 | `core/boot` | UEFI bootloader framebuffer console, rendering diagnostics up to kernel handoff (`core/boot/src/framebuffer.rs`). |
 | `core/ktest` | ktest harness direct framebuffer output (`core/ktest/src/framebuffer.rs`). |
 
@@ -55,7 +55,8 @@ identical glyph set.
 ## Licensing
 
 GPL-2.0-only for code. The bitmap data the crate resolves into lives in
-`shared/font` and is OFL-1.1 (Terminus 10×20 trimmed to 9×20).
+`shared/font` and carries its own licence
+([shared/font/README.md](../font/README.md) § Licensing).
 
 ---
 
@@ -64,7 +65,7 @@ GPL-2.0-only for code. The bitmap data the crate resolves into lives in
 | Document | Content |
 |---|---|
 | [docs/console-model.md](../../docs/console-model.md) | Console output phase ownership; where the framebuffer-driver path that consumes this crate sits |
-| [services/drivers/framebuffer/README.md](../../services/drivers/framebuffer/README.md) | Sole runtime consumer; FB_WRITE_BYTES contract and the resolver chain |
+| [services/drivers/framebuffer/README.md](../../services/drivers/framebuffer/README.md) | Sole userspace consumer; FB_WRITE_BYTES contract and the resolver chain |
 
 ---
 

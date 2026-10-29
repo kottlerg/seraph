@@ -10,10 +10,11 @@
 //!
 //! - Allocate physical pages via UEFI for each `PT_LOAD` segment, copy
 //!   file data in, and zero the BSS tail.
-//! - For the kernel: allocate one contiguous span at any available physical
-//!   base via `AllocatePages(AllocateAnyPages, …)` and place each segment at
-//!   its ELF-relative offset within the span, so kernel placement tolerates
-//!   any firmware memory layout.
+//! - For the kernel: allocate one contiguous span through the arch hook
+//!   `arch::current::allocate_kernel_span` (any free physical base on
+//!   riscv64, wholly below 4 GiB on x86-64) and place each segment at its
+//!   ELF-relative offset within the span, so kernel placement does not
+//!   depend on a fixed firmware layout.
 //! - For init: place segments at any available physical address while
 //!   preserving the in-page byte offset of `p_vaddr`, so the kernel can map
 //!   each page at its virtual address onto the allocated frame without a
@@ -96,9 +97,10 @@ pub struct KernelInfo
 /// Physical span and link-time bases of a kernel image, derived from its
 /// `PT_LOAD` segments by [`validate_kernel_layout`].
 ///
-/// The loader allocates one contiguous region of `span_bytes` at any free
-/// physical base and places each segment at `span_base + (p_paddr -
-/// link_phys)`, preserving the ELF's relative layout.
+/// The loader allocates one contiguous region of `span_bytes` through
+/// `arch::current::allocate_kernel_span` (any free physical base on riscv64,
+/// wholly below 4 GiB on x86-64) and places each segment at `span_base +
+/// (p_paddr - link_phys)`, preserving the ELF's relative layout.
 struct KernelSpan
 {
     /// Lowest `p_paddr` across all segments — the ELF's link-time physical origin.
@@ -191,12 +193,13 @@ fn validate_kernel_layout(segs: &[elf::LoadSegment], entry: u64) -> Result<Kerne
 
 /// Load the kernel ELF from `data` into physical memory allocated via UEFI.
 ///
-/// The image is placed as a single contiguous span allocated at any free
-/// physical base via `AllocateAnyPages`; each `PT_LOAD` segment is copied to
+/// The image is placed as a single contiguous span allocated by
+/// `arch::current::allocate_kernel_span` (any free physical base on riscv64,
+/// wholly below 4 GiB on x86-64); each `PT_LOAD` segment is copied to
 /// `span_base + (p_paddr - link_phys)`, preserving the ELF's relative offsets,
 /// and its BSS tail (`p_memsz - p_filesz` bytes) is zeroed. Dynamic placement
-/// tolerates any firmware memory layout (issue #377); the kernel learns the
-/// chosen base through `BootInfo.kernel_physical_base`.
+/// does not depend on a fixed firmware layout (issue #377); the kernel learns
+/// the chosen base through `BootInfo.kernel_physical_base`.
 ///
 /// Both `ET_EXEC` and `ET_DYN` (static-PIE) kernels are accepted. For
 /// `ET_DYN` the `.rela.dyn` table is pre-located and fully validated here
@@ -214,7 +217,8 @@ fn validate_kernel_layout(segs: &[elf::LoadSegment], entry: u64) -> Result<Kerne
 ///   `elf::ElfError`), the segment layout failed [`validate_kernel_layout`],
 ///   or the relocation table is malformed, non-`RELATIVE`, or targets bytes
 ///   outside the load span.
-/// - `BootError::OutOfMemory` — no free contiguous span of the required size.
+/// - `BootError::OutOfMemory` — no free contiguous span of the required size
+///   (below 4 GiB on x86-64).
 ///
 /// # Safety
 ///
@@ -260,12 +264,12 @@ pub unsafe fn load_kernel(
     let span = validate_kernel_layout(&raw[..segment_count], elf::entry_point(ehdr))?;
 
     // One contiguous allocation for the whole image, placed wherever the
-    // firmware has free RAM.
+    // firmware has free RAM within the arch's bound.
     // span_bytes → usize: 64-bit on all supported UEFI targets; cast is exact.
     #[allow(clippy::cast_possible_truncation)]
     let page_count = (span.span_bytes as usize).div_ceil(4096);
     // SAFETY: `bs` is valid boot services per the function's safety contract.
-    let span_base = unsafe { crate::uefi::allocate_pages(bs, page_count)? };
+    let span_base = unsafe { crate::arch::current::allocate_kernel_span(bs, page_count)? };
 
     let mut segments: [LoadedSegment; MAX_LOAD_SEGMENTS] =
         core::array::from_fn(|_| LoadedSegment {
@@ -440,7 +444,7 @@ pub unsafe fn relocate_kernel(
 
 /// Parse and load a userspace init ELF into physical memory.
 ///
-/// Like [`load_kernel`], the init ELF is placed via `AllocateAnyPages` (init is
+/// The init ELF is placed via `AllocateAnyPages` (init is
 /// a regular userspace executable whose `p_paddr` values are in low memory
 /// already occupied by UEFI); unlike the kernel's single contiguous span, each
 /// LOAD segment is allocated independently, then the data is copied in. The

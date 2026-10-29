@@ -90,8 +90,8 @@ fn map_err(e: MapError) -> BootError
 /// Build the initial page tables for kernel handoff.
 ///
 /// Maps all kernel ELF segments at their virtual addresses with per-segment
-/// permissions, then identity-maps all provided boot regions (`BootInfo`, modules,
-/// stack, memory map buffer, etc.) as readable+writable.
+/// permissions, then identity-maps every page a provided boot region (`BootInfo`,
+/// modules, stack, memory map buffer, etc.) touches as readable+writable.
 ///
 /// # Errors
 /// Returns [`BootError::OutOfMemory`] if page table frame allocation fails,
@@ -128,20 +128,57 @@ pub fn build_initial_tables(
             continue;
         }
 
-        // Round size up to the next page boundary so no partial page is unmapped.
-        let aligned_size = (size + PAGE_ALIGN_MASK) & !PAGE_ALIGN_MASK;
-
+        let (base, span) = page_span(phys, size);
         let flags = PageFlags {
             writable: true,
             executable: false,
         };
-        table
-            .map(phys, phys, aligned_size, flags)
-            .map_err(map_err)?;
+        table.map(base, base, span, flags).map_err(map_err)?;
     }
 
     Ok(table)
 }
 
-/// Mask used for page-aligning sizes upward (4 KiB pages).
+/// Mask used for page-aligning addresses (4 KiB pages).
 const PAGE_ALIGN_MASK: u64 = 4095;
+
+/// Return `(base, size)` of the whole pages covering the byte range
+/// `[phys, phys + size)`: the base rounded down and the end rounded up to
+/// page boundaries, so a region that does not start on a page boundary
+/// keeps its last page (an init segment's `phys_addr` carries its
+/// `p_vaddr` in-page offset).
+fn page_span(phys: u64, size: u64) -> (u64, u64)
+{
+    let base = phys & !PAGE_ALIGN_MASK;
+    let end = (phys + size + PAGE_ALIGN_MASK) & !PAGE_ALIGN_MASK;
+    (base, end - base)
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// A region whose in-page offset pushes its end across one more page
+    /// boundary than its size alone keeps that last page.
+    #[test]
+    fn offset_region_spans_the_page_its_tail_reaches()
+    {
+        // 0x1F00 + 0x200 ends at 0x2100: pages 0x1000 and 0x2000.
+        assert_eq!(page_span(0x1F00, 0x200), (0x1000, 0x2000));
+    }
+
+    /// A page-aligned region of whole pages maps exactly those pages.
+    #[test]
+    fn aligned_region_spans_exactly_its_pages()
+    {
+        assert_eq!(page_span(0x4000, 0x2000), (0x4000, 0x2000));
+    }
+
+    /// A page-aligned region with a partial last page rounds up to it.
+    #[test]
+    fn partial_last_page_rounds_up()
+    {
+        assert_eq!(page_span(0x4000, 0x1001), (0x4000, 0x2000));
+    }
+}

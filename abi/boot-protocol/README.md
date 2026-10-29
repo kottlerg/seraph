@@ -43,7 +43,8 @@ bootloader that produced a `BootInfo`; only the contract matters.
 A compliant bootloader MUST, before jumping to the kernel entry point:
 
 - Verify the kernel ELF is valid and has a recognisable entry point.
-- Load all ELF LOAD segments into allocated physical memory.
+- Load all ELF LOAD segments into allocated physical memory; on x86-64, wholly
+  below 4 GiB (`BootInfo.kernel_physical_base` in [`src/lib.rs`](src/lib.rs)).
 - Zero BSS segments.
 - Respect ELF segment permissions (readable, writable, executable) when
   establishing initial page table entries; never map any region as both

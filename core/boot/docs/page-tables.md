@@ -21,15 +21,13 @@ bootloader *builds*, described in later sections — is:
   bootloader has already applied the image's `RELATIVE` relocations for
   the chosen slide ([boot-flow.md](boot-flow.md#step-5d-apply-the-kaslr-slide)),
   so the mapped image is internally consistent.
-- An identity map, read-write and non-executable, covers the `BootInfo` page, the
-  boot-module array page, the translated `MemoryMapEntry` array (`BootInfo.memory_map`),
-  the `MmioAperture` array page, the reclaim-range array page, the handoff stack, the
-  `InitImage` segments, the kernel segments' physical frames, the kernel ELF file buffer,
-  the bundle blob (every boot module body), the framebuffer when present, and the UART
-  MMIO page on RISC-V, so the kernel can read them using physical addresses before its
-  own direct-physical map is established. An `InitImage` segment whose `p_vaddr` in-page offset
-  plus its size crosses one more page boundary than its size alone has its last page left unmapped
-  (defect, [#442](https://github.com/kottlerg/seraph/issues/442)).
+- An identity map, read-write and non-executable, covers every page touched by the
+  `BootInfo` page, the boot-module array page, the translated `MemoryMapEntry` array
+  (`BootInfo.memory_map`), the `MmioAperture` array page, the reclaim-range array page, the
+  handoff stack, the `InitImage` segments (whose `phys_addr` carries the `p_vaddr` in-page
+  offset), the kernel segments' physical frames, the bundle blob (every boot module body),
+  the framebuffer when present, and the UART MMIO page on RISC-V, so the kernel can read
+  them using physical addresses before its own direct-physical map is established.
 - The handoff trampoline's page or pages are identity-mapped read-execute, so execution
   continues across the root-table switch.
 - Nothing else is mapped; an access outside these ranges faults. The ACPI RSDP and the
@@ -196,7 +194,8 @@ value falls the candidate back to the next-narrower mode. Probe failure
 below Sv39 is fatal — Sv39 is the platform minimum
 ([platform-requirements.md](../../../docs/platform-requirements.md)). The
 probe runs under a one-frame identity table with S-mode interrupts masked
-and restores the live `satp` (UEFI may run with its own translation active).
+and restores the live `satp` (UEFI may run with its own translation active);
+the frame is zeroed and freed once the mode is chosen.
 
 ### Hierarchy
 

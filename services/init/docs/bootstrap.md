@@ -135,7 +135,10 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     `devmgr.shutdown`, and `devmgr.test` publish caps and the
     `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from it; see
     [Publish authority](../../svcmgr/docs/ipc-interface.md#publish-authority)). `data[1]` carries
-    `SVCMGR_LABELS_VERSION`. An absent source rides as a zero slot.
+    `SVCMGR_LABELS_VERSION`. An absent source is left off the round and
+    its bit in the `data[2]` presence word clear, since the kernel refuses
+    a null cap slot (the encoding is in the
+    [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md#handover-endowment-bootstrap-rounds)).
   - **Rounds 2..N (`SUBSTRATE`)** — one `(name, thread_cap)` per
     init-bootstrapped substrate service: `memmgr`, `procmgr`, `devmgr`,
     `vfsd`. svcmgr parks them and binds death-notification on
@@ -158,8 +161,8 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     death-EQ registration). Holding `master_log_source` keeps the log
     endpoint object alive across a logd crash, so log senders are
     agnostic to which process holds the RECV (per
-    [`log_sink`](../../svcmgr/docs/service-definitions.md#log_sink)). An absent source rides as
-    a zero slot.
+    [`log_sink`](../../svcmgr/docs/service-definitions.md#log_sink)). An absent source is
+    left off the round and its bit in the `data[1]` presence word clear.
 - After draining the endowment, **svcmgr** (not init) publishes the
   well-known names it owns into its own registry and installs devmgr's
   drivers dir (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)):

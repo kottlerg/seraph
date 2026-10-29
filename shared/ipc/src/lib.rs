@@ -755,7 +755,7 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 5;
+pub const SVCMGR_LABELS_VERSION: u32 = 6;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {

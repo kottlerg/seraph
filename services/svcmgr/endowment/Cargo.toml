@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "svcmgr-endowment"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# `ipc::SVCMGR_LABELS_VERSION` is the handshake word of the `CAPS` round.
+ipc = { path = "../../../shared/ipc" }
+# `MSG_CAP_SLOTS_MAX` / `MSG_DATA_WORDS_MAX` bound an encoded round.
+syscall-abi = { path = "../../../abi/syscall" }
+
+[lints]
+workspace = true

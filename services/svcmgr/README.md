@@ -54,6 +54,9 @@ svcmgr/
 │                                  # wire-blob encoder (`build_blob`), and
 │                                  # the `cwd_rights` / `handover_permitted`
 │                                  # decisions
+├── endowment/                     # `svcmgr-endowment` crate: host-tested
+│                                  # codec of init's handover endowment
+│                                  # (round kinds, presence-word encoding)
 └── docs/
     ├── ipc-interface.md           # handover endowment, HANDOVER_COMPLETE,
     │                              # PUBLISH_ENDPOINT / QUERY_ENDPOINT

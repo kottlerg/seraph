@@ -36,7 +36,11 @@ from their bundle entries) and `shared/syscall` for raw syscall wrappers (used
 to create memmgr and procmgr without IPC). init-logd packs its handover replies
 with the wire contract in [`logd-codec`](../logd/codec/README.md), the crate
 real-logd decodes them with (see the
-[logd handover protocol](../logd/docs/handover-protocol.md)).
+[logd handover protocol](../logd/docs/handover-protocol.md)). init encodes
+svcmgr's handover endowment with the
+[`svcmgr-endowment`](../svcmgr/endowment/src/lib.rs) codec, the crate svcmgr
+decodes it with (see the
+[svcmgr IPC interface](../svcmgr/docs/ipc-interface.md#handover-endowment-bootstrap-rounds)).
 
 ---
 

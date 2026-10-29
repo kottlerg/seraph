@@ -979,19 +979,6 @@ pub fn create_svcmgr_from_file(
     Some((process_handle, child_badge))
 }
 
-/// Round kinds for the svcmgr handover endowment, tagged in `data[0]`.
-/// Mirrors the receive side in `services/svcmgr/src/service.rs::endow_kind`.
-mod endow_kind
-{
-    /// Round 1: svcmgr's own endpoints + publish-role source caps.
-    pub const CAPS: u64 = 1;
-    /// One substrate `(name, thread_cap)` registration.
-    pub const SUBSTRATE: u64 = 2;
-    /// Terminal round: the reserved source caps svcmgr keeps to launch +
-    /// supervise + restart real-logd (master-log endpoint, procmgr death-auth).
-    pub const LOGD_SOURCES: u64 = 3;
-}
-
 /// Source + endpoint caps init endows svcmgr with at handover. svcmgr
 /// derives the shapes it publishes / sends / launches with from these
 /// reserved sources; it keeps the log-sink sources for the system's life
@@ -1025,7 +1012,8 @@ pub struct SvcmgrEndowment
 /// a badge-0 `SEND|GRANT` source on devmgr's registry endpoint (svcmgr mints
 /// the `devmgr.registry` / `devmgr.shutdown` / `devmgr.test` publish caps and
 /// the `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from it). An absent source
-/// cap rides as a zero slot, which svcmgr tolerates.
+/// cap is left off the round and its presence bit clear (the
+/// `svcmgr_endowment` encoding), since the kernel refuses a null cap slot.
 ///
 /// Each `SUBSTRATE` round then delivers one init-bootstrapped service's
 /// thread cap plus its name (memmgr/procmgr/devmgr/vfsd); svcmgr parks the
@@ -1106,15 +1094,22 @@ fn endow_svcmgr(
         0
     };
 
-    // Round 1 (CAPS), positional: [service, bootstrap, rootfs, devmgr_reg].
+    // Round 1 (CAPS): [service, bootstrap] then whichever of rootfs and
+    // devmgr_reg are present, named by the presence word.
     // The LOGD_SOURCES round is always terminal, so no earlier round is.
+    let caps_round = svcmgr_endowment::encode_caps(&svcmgr_endowment::CapsRound {
+        service_ep: service_copy,
+        bootstrap_ep: boot_copy,
+        rootfs_root: rootfs_send,
+        devmgr_registry: devmgr_registry_src,
+    });
     if let Err(code) = serve_checked(
         bootstrap_ep,
         child_badge,
         ipc_buf,
         false,
-        &[service_copy, boot_copy, rootfs_send, devmgr_registry_src],
-        &[endow_kind::CAPS, u64::from(ipc::SVCMGR_LABELS_VERSION)],
+        caps_round.caps(),
+        caps_round.data(),
         "phase 3: svcmgr endowment CAPS round failed",
     )
     {
@@ -1136,18 +1131,23 @@ fn endow_svcmgr(
 
     // Terminal round (LOGD_SOURCES): the reserved master-log endpoint source
     // and the badge-0 procmgr `SEND|GRANT` source. svcmgr mints real-logd's
-    // bootstrap caps from these on every (re)launch. A zero slot rides if a
-    // source derive failed and reaches logd as a zero cap: without the death-auth
-    // source logd runs but cannot reclaim per-sender slots; without the master-log
-    // source logd exits at startup and, being `critical = yes` with no
-    // `on_failure` restart for a clean exit, svcmgr starts a graceful shutdown.
+    // bootstrap caps from these on every (re)launch. A source whose derive
+    // failed is left off the round and its presence bit clear, and svcmgr
+    // holds it as absent: without the death-auth source logd runs but cannot
+    // reclaim per-sender slots; without the master-log source logd exits at
+    // startup and, being `critical = yes` with no `on_failure` restart for a
+    // clean exit, svcmgr starts a graceful shutdown.
+    let logd_round = svcmgr_endowment::encode_logd_sources(&svcmgr_endowment::LogdSources {
+        master_log_source: endow.master_log_source,
+        procmgr_death_auth_source: endow.procmgr_death_auth_source,
+    });
     serve(
         bootstrap_ep,
         child_badge,
         ipc_buf,
         true,
-        &[endow.master_log_source, endow.procmgr_death_auth_source],
-        &[endow_kind::LOGD_SOURCES],
+        logd_round.caps(),
+        logd_round.data(),
         "phase 3: svcmgr endowment LOGD_SOURCES round failed",
     )
 }
@@ -1182,7 +1182,7 @@ fn serve_substrate_rounds(
         let mut name_words = [0u64; 2];
         let nw = pack_svc_name(name, &mut name_words);
         let mut data = [0u64; 2 + 2];
-        data[0] = endow_kind::SUBSTRATE;
+        data[0] = svcmgr_endowment::kind::SUBSTRATE;
         data[1] = name.len() as u64;
         data[2..2 + nw].copy_from_slice(&name_words[..nw]);
         serve_checked(
@@ -1204,13 +1204,17 @@ fn serve_substrate_rounds(
 /// pending, so the receive is answered. A further failure is logged.
 fn end_endowment(bootstrap_ep: u32, child_badge: u64, ipc_buf: *mut u64)
 {
+    let empty = svcmgr_endowment::encode_logd_sources(&svcmgr_endowment::LogdSources {
+        master_log_source: 0,
+        procmgr_death_auth_source: 0,
+    });
     let _ = serve(
         bootstrap_ep,
         child_badge,
         ipc_buf,
         true,
-        &[],
-        &[endow_kind::LOGD_SOURCES],
+        empty.caps(),
+        empty.data(),
         "phase 3: svcmgr endowment terminal round after a failure failed",
     );
 }

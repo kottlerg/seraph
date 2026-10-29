@@ -1173,11 +1173,19 @@ dependencies = [
  "syscall",
  "syscall-abi",
  "vfsd-gpt",
+ "vfsd-root-backend",
 ]
 
 [[package]]
 name = "vfsd-gpt"
 version = "0.1.1"
+
+[[package]]
+name = "vfsd-root-backend"
+version = "0.1.1"
+dependencies = [
+ "namespace-protocol",
+]
 
 [[package]]
 name = "virtio-blk"

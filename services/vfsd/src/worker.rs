@@ -139,7 +139,8 @@ fn take_next_active_job(active: &ActiveState) -> ActiveJob
 ///
 /// Returns `true` once the child holds its bootstrap caps. On every `false`
 /// return the bootstrap order is withdrawn ([`abandon_bootstrap`]) and the
-/// process handle released, so no cap of the order is left in vfsd's `CSpace`.
+/// process handle and child Thread cap released, so no cap of the order is
+/// left in vfsd's `CSpace`.
 fn handle_create_from_file(
     order: CreateFromFileOrder,
     bootstrap_state: &Mutex<BootstrapState>,
@@ -184,7 +185,9 @@ fn handle_create_from_file(
     let Ok(create_reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
     {
-        // A failed call transfers no cap, so both are still ours.
+        // A call refused before delivery transfers no cap, so both are still
+        // ours; after delivery the handles are stale and each delete fails
+        // closed.
         std::os::seraph::log!("active worker: CREATE_FROM_FILE ipc_call failed");
         let _ = syscall::cap_delete(file_cap);
         let _ = syscall::cap_delete(badged_creator);
@@ -201,15 +204,14 @@ fn handle_create_from_file(
         return false;
     }
 
-    let Some(&process_handle) = create_reply.caps().first()
-    else
+    if create_reply.caps().is_empty()
     {
         std::os::seraph::log!("active worker: CREATE_FROM_FILE reply missing process handle");
         abandon_bootstrap(bootstrap_state, badge, bootstrap_handle);
         return false;
-    };
+    }
 
-    if !crate::driver::start_and_release(process_handle, ipc_buf)
+    if !crate::driver::start_and_release(create_reply.caps(), ipc_buf)
     {
         std::os::seraph::log!("active worker: START_PROCESS failed");
         abandon_bootstrap(bootstrap_state, badge, bootstrap_handle);

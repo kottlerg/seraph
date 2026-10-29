@@ -41,7 +41,7 @@ The synthetic root is `NodeId::ROOT` (pool index 0) and is always
 active; its `fallthrough_cap` carries the root mount cap captured
 when `MOUNT path="/"` succeeds. `MAX_TREE_NODES` is `32` and
 `MAX_ENTRY_NAME` is `64` bytes; both are file-local constants in
-[`services/vfsd/src/root_backend.rs`](../src/root_backend.rs).
+[`services/vfsd/root-backend/src/lib.rs`](../root-backend/src/lib.rs).
 
 Multi-component mount paths install through the tree by walking
 components, creating synthetic intermediates on demand, and setting
@@ -211,7 +211,9 @@ Wire-label numbers for both surfaces live in [`ipc::vfsd_labels`] and
 A successful `install` retains the `terminal_endpoint` (terminal
 nodes) and any walked `fallthrough_cap`s (synthetic intermediates, plus
 the root mount's badged fall-through cap) for the lifetime of the vfsd
-process. Unmount is not implemented;
+process. vfsd also keeps each mounted driver's original service endpoint,
+from which every cap above derives, as the handle that revokes the driver;
+a mount that fails after its driver started is torn down through it. Unmount is not implemented;
 the mount-tree is permanent until vfsd exits. Deferred follow-ups:
 per-process `system_root_cap` distribution (different processes
 seeing different roots) and `cap_revoke`-driven unmount.

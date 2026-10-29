@@ -26,7 +26,6 @@
 mod driver;
 mod partition;
 mod role_guids;
-mod root_backend;
 mod worker;
 mod worker_pool;
 
@@ -868,6 +867,9 @@ fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
 /// real work. When the requested role is [`MountRole::Root`], vfsd
 /// additionally auto-mounts the EFI System Partition at `/esp` and the
 /// data partition at `/data`.
+// cast_possible_truncation: the role byte is the low byte of data[0] by wire
+// contract, and the path length is checked against 1..=64 right after its
+// cast, so neither `as` loses a value the handler accepts.
 #[allow(clippy::cast_possible_truncation)]
 fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 {
@@ -1006,13 +1008,6 @@ fn mount_path_is_root(path: &[u8]) -> bool
 /// On success returns a fresh badged SEND for the caller (zero if
 /// minting failed; the mount itself still landed). On failure
 /// returns the matching `vfsd_errors::*` label.
-// do_mount runs the full mount-and-publish transaction inline:
-// GPT lookup, partition cap registration with virtio-blk, fatfs
-// driver spawn, mount-table registration, and namespace-root cap
-// minting all share the partition_lba / partition_len / driver_ep
-// locals; folding any subset into helpers requires threading those
-// locals through and obscures the failure-paths' resource releases.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn do_mount(
     rt: &VfsdRuntime,
     ipc_buf: *mut u64,
@@ -1027,6 +1022,13 @@ pub(crate) fn do_mount(
 /// internally-triggered (`auto_mount_role`) mounts. Takes a type-GUID
 /// directly so callers without a [`MountRole`] (the `/esp` and `/data`
 /// auto-mounts) can reuse the transaction body.
+// too_many_lines: the mount-and-publish transaction runs inline. The
+// install pre-check, partition registration with virtio-blk, fatfs spawn,
+// synthetic-root install, and namespace-root cap minting share the
+// `partition_ep` / `fatfs` / `driver_ep` locals, and every failure arm after
+// the spawn tears the driver down through `fatfs.endpoint`; folding a subset
+// into helpers would thread those locals through and hide which arm releases
+// what.
 #[allow(clippy::too_many_lines)]
 fn do_mount_internal(
     rt: &VfsdRuntime,
@@ -1139,7 +1141,8 @@ fn do_mount_internal(
     //     fall-through forwarder pre-composes each forwarded request
     //     with the caller's own rights (`compose_forward_lookup_rights`),
     //     so a full-rights badge here cannot over-grant; `driver_ep` is
-    //     not retained (the root fs is never unmounted).
+    //     not retained, and is deleted once the badged caps exist (they
+    //     stay derived from `fatfs.endpoint`).
     //   - Terminal mount (`/esp`, `/data`, …): the *unbadged* driver
     //     endpoint itself. Every `NS_LOOKUP` crossing the mount mints a
     //     freshly-attenuated badged SEND from it (the
@@ -1188,6 +1191,16 @@ fn do_mount_internal(
         driver::teardown_driver(fatfs.endpoint);
         return Err(ipc::vfsd_errors::TABLE_FULL);
     };
+
+    if install_cap != driver_ep
+    {
+        // Root mount: the badged fall-through and caller caps are derived,
+        // so the unbadged SEND_GRANT has no further use.
+        log_cap_delete("root mount driver_ep", driver_ep);
+    }
+    // `fatfs.endpoint` stays in vfsd's CSpace for the life of the mount
+    // (every mount is permanent): it is the one handle that can revoke
+    // the driver, per `driver::FatfsDriver`.
 
     populate_fallthrough_caps(rt, ipc_buf, install_result.as_slice());
 

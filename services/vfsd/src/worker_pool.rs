@@ -265,9 +265,9 @@ impl WorkerPool
 
     /// Withdraw a bootstrap order registered by [`Self::submit`]; see
     /// [`abandon_bootstrap`].
-    pub fn abandon_bootstrap(&self, badge: u64, handle: WorkHandle) -> bool
+    pub fn abandon_bootstrap(&self, badge: u64, handle: WorkHandle)
     {
-        abandon_bootstrap(&self.bootstrap_state, badge, handle)
+        abandon_bootstrap(&self.bootstrap_state, badge, handle);
     }
 }
 
@@ -305,23 +305,21 @@ pub fn submit_bootstrap(
 }
 
 /// Withdraw the bootstrap order registered under `badge`, whose child will
-/// not be served (its creation or start failed, or its caller gave up), and
-/// report whether the child received the order's caps.
+/// not be served (its creation or start failed, or its caller gave up).
 ///
 /// If the order is still pending, its slot is freed and its undelivered
-/// caps are deleted: `false`. Otherwise the bootstrap worker already took
-/// it for a child's REQUEST, and this waits on `handle` for that round's
-/// outcome: `true` if the caps reached the child, `false` if the round
-/// failed (the worker then deleted them). Either way no cap of the order
-/// remains in vfsd's `CSpace` once this returns.
-pub fn abandon_bootstrap(state: &Mutex<BootstrapState>, badge: u64, handle: WorkHandle) -> bool
+/// caps are deleted. Otherwise the bootstrap worker already took it for a
+/// child's REQUEST, and this waits on `handle` until that round ends (the
+/// caps then reached the child, or the worker deleted them). Either way no
+/// cap of the order remains in vfsd's `CSpace` once this returns.
+pub fn abandon_bootstrap(state: &Mutex<BootstrapState>, badge: u64, handle: WorkHandle)
 {
     if let Some(pending) = take_pending_by_badge(state, badge)
     {
         delete_bootstrap_caps(pending.blk, pending.service);
-        return false;
+        return;
     }
-    handle.wait()
+    let _ = handle.wait();
 }
 
 /// Find and remove a pending-bootstrap slot whose badge matches.

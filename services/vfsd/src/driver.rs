@@ -44,7 +44,10 @@ pub struct FatfsDriver
     /// endpoint derives from this slot (the child's receive copy, [`Self::send`],
     /// and the badged caps a mount mints from `send`), so [`teardown_driver`]
     /// on it is the kill-the-server shape of `docs/namespace-model.md`
-    /// § Revocation.
+    /// § Revocation. A failed mount tears the driver down through it; a
+    /// mount that lands keeps it, unused, for the life of vfsd, since mounts
+    /// are permanent (no unmount exists), as the revocation handle an unmount
+    /// would use.
     pub endpoint: u32,
     /// `SEND_GRANT` derivation of `endpoint`; the mount transaction probes
     /// the driver and mints its badged caps through it.
@@ -215,15 +218,28 @@ fn new_bootstrap_order(
     Some((bootstrap, badged_creator))
 }
 
-/// Start a process procmgr created, then release vfsd's handle on it.
+/// Start a process procmgr created, then release vfsd's caps on it.
 ///
-/// vfsd never addresses a fatfs process after starting it (the driver is
-/// reached through its service endpoint and torn down by revoking it), so
-/// the handle is deleted on both outcomes. A process that fails to start is
-/// first destroyed (`DESTROY_PROCESS`) so procmgr does not keep it. Returns
-/// whether `START_PROCESS` succeeded.
-pub fn start_and_release(process_handle: u32, ipc_buf: *mut u64) -> bool
+/// `reply_caps` are the caps of the `CREATE_PROCESS` / `CREATE_FROM_FILE`
+/// success reply: `[process_handle, child Thread cap]`. vfsd never addresses
+/// a fatfs process or its thread after starting it (the driver is reached
+/// through its service endpoint and torn down by revoking it), so both are
+/// deleted on either outcome. A process that fails to start is first
+/// destroyed (`DESTROY_PROCESS`) so procmgr does not keep it. Returns
+/// whether `START_PROCESS` succeeded; `false` without any call when the
+/// reply carried no process handle.
+pub fn start_and_release(reply_caps: &[u32], ipc_buf: *mut u64) -> bool
 {
+    for &cap in reply_caps.iter().skip(1)
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    let Some(&process_handle) = reply_caps.first()
+    else
+    {
+        return false;
+    };
+
     let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
     let started = matches!(
@@ -289,7 +305,9 @@ fn spawn_via_module(
     let Ok(create_reply) = (unsafe { ipc::ipc_call(caps.procmgr_ep, &create_msg, ipc_buf) })
     else
     {
-        // A failed call transfers no cap, so both are still vfsd's.
+        // A call refused before delivery transfers no cap, so both are still
+        // vfsd's; after delivery the handles are stale and each delete fails
+        // closed.
         std::os::seraph::log!("fatfs CREATE_PROCESS ipc_call failed");
         let _ = syscall::cap_delete(module_copy);
         let _ = syscall::cap_delete(badged_creator);
@@ -303,15 +321,14 @@ fn spawn_via_module(
         return false;
     }
 
-    let Some(&process_handle) = create_reply.caps().first()
-    else
+    if create_reply.caps().is_empty()
     {
         std::os::seraph::log!("fatfs CREATE_PROCESS reply missing caps");
         pool.abandon_bootstrap(badge, handle);
         return false;
-    };
+    }
 
-    if !start_and_release(process_handle, ipc_buf)
+    if !start_and_release(create_reply.caps(), ipc_buf)
     {
         std::os::seraph::log!("fatfs START_PROCESS failed");
         pool.abandon_bootstrap(badge, handle);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/vfsd/src/root_backend.rs
+// services/vfsd/root-backend/src/lib.rs
 
 //! Synthetic system-root [`NamespaceBackend`] composed at boot time.
 //!
@@ -34,6 +34,12 @@
 //! The synthetic root (`NodeId::ROOT`) is itself a tree node whose
 //! `fallthrough_cap` is the root mount cap captured when
 //! `MOUNT path="/"` succeeds.
+//!
+//! The tree holds cap slot numbers but makes no syscall, so the crate is
+//! pure and host-tested — see
+//! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
+
+#![cfg_attr(not(test), no_std)]
 
 use namespace_protocol::{
     EntryName, EntryTarget, EntryView, MemoryReply, NamespaceBackend, NamespaceRights, NodeId,
@@ -62,7 +68,7 @@ const NONE: u32 = u32::MAX;
 /// corresponding directory in the root filesystem; the synthetic
 /// root's `fallthrough_cap` is the root mount cap itself.
 #[derive(Copy, Clone)]
-pub struct TreeNode
+struct TreeNode
 {
     pub name: [u8; MAX_ENTRY_NAME],
     pub name_len: u8,
@@ -89,7 +95,7 @@ pub struct TreeNode
 
 impl TreeNode
 {
-    pub const fn empty() -> Self
+    const fn empty() -> Self
     {
         Self {
             name: [0; MAX_ENTRY_NAME],
@@ -148,14 +154,26 @@ impl InstallResult
         true
     }
 
+    /// Pool indices of the synthetic intermediates the install created.
+    #[must_use]
     pub fn as_slice(&self) -> &[u32]
     {
         &self.new_intermediates[..self.new_intermediates_len]
     }
 }
 
+impl Default for VfsdRootBackend
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
+}
+
 impl VfsdRootBackend
 {
+    /// An empty tree: only the synthetic root, with no root mount.
+    #[must_use]
     pub const fn new() -> Self
     {
         let mut nodes = [TreeNode::empty(); MAX_TREE_NODES];
@@ -447,6 +465,8 @@ impl VfsdRootBackend
         {
             if !n.active
             {
+                // cast_possible_truncation: `i < MAX_TREE_NODES` (32), so the
+                // index fits a u32.
                 #[allow(clippy::cast_possible_truncation)]
                 return Some(i as u32);
             }
@@ -586,4 +606,94 @@ impl NamespaceBackend for VfsdRootBackend
     fn release_memory(&mut self, _file: NodeId, _cookie: u64) {}
 
     fn close(&mut self, _node: NodeId) {}
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// Cap value standing in for a driver endpoint; the tree only stores it.
+    const CAP: u32 = 7;
+
+    #[test]
+    fn a_second_root_mount_is_rejected_and_keeps_the_first()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/", CAP).is_some());
+        assert!(!b.can_install(b"/"));
+        assert!(!b.can_install(b"///"));
+        assert!(b.install(b"///", CAP + 1).is_none());
+        assert_eq!(b.root_mount_cap(), CAP);
+    }
+
+    #[test]
+    fn mounting_on_an_existing_mount_point_is_rejected()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", CAP).is_some());
+        assert!(!b.can_install(b"/esp"));
+        assert!(b.install(b"/esp", CAP + 1).is_none());
+        assert_eq!(b.local_child_count(0), 1);
+    }
+
+    #[test]
+    fn a_component_longer_than_the_name_limit_is_rejected()
+    {
+        let mut b = VfsdRootBackend::new();
+        let mut path = vec![b'/'];
+        path.extend(core::iter::repeat_n(b'a', MAX_ENTRY_NAME + 1));
+        assert!(!b.can_install(&path));
+        assert!(b.install(&path, CAP).is_none());
+        path.truncate(1 + MAX_ENTRY_NAME);
+        assert!(b.can_install(&path));
+    }
+
+    #[test]
+    fn an_install_the_pool_cannot_hold_leaves_the_tree_unchanged()
+    {
+        let mut b = VfsdRootBackend::new();
+        // Fill all but one of the MAX_TREE_NODES - 1 allocatable nodes.
+        for i in 0..MAX_TREE_NODES - 2
+        {
+            assert!(b.install(format!("/m{i}").as_bytes(), CAP).is_some());
+        }
+        // `/x/y` needs two nodes; one is free.
+        assert!(!b.can_install(b"/x/y"));
+        assert!(b.install(b"/x/y", CAP).is_none());
+        assert!(!b.has_local_child(0, b"x"));
+        assert_eq!(b.local_child_count(0), (MAX_TREE_NODES - 2) as u32);
+        assert!(b.install(b"/x", CAP).is_some());
+    }
+
+    #[test]
+    fn a_multi_component_install_reports_its_new_intermediates()
+    {
+        let mut b = VfsdRootBackend::new();
+        let result = b.install(b"/a/b/c", CAP).expect("install fits");
+        let mut paths = Vec::new();
+        for &idx in result.as_slice()
+        {
+            let mut buf = [0u8; 64];
+            let len = b.path_of(idx, &mut buf).expect("intermediate has a path");
+            paths.push(buf[..len].to_vec());
+        }
+        paths.sort();
+        assert_eq!(paths, vec![b"/a".to_vec(), b"/a/b".to_vec()]);
+        // A sibling under the existing intermediate creates only its leaf.
+        assert_eq!(
+            b.install(b"/a/b/d", CAP).map(|r| r.as_slice().len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn an_existing_intermediate_can_become_a_mount_point()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/a/b", CAP).is_some());
+        assert!(b.can_install(b"/a"));
+        assert!(b.install(b"/a", CAP).is_some());
+        assert!(!b.can_install(b"/a"));
+    }
 }

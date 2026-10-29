@@ -75,9 +75,7 @@ fn request_round() -> Caps
         return caps;
     }
 
-    // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB), satisfying u64 alignment.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by
     // the boot protocol.
     let Ok(round) = (unsafe { ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf) })

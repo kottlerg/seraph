@@ -84,7 +84,8 @@ Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
    assert the gate rejects an unauthorised cap
    ([`provides`](../svcmgr/docs/service-definitions.md#provides);
    [svctest Capabilities](../svctest/README.md#capabilities)).
-4. svctest, at the end of `main()` after `ALL TESTS PASSED`, sends
+4. svctest, at the end of `main()` after `ALL TESTS PASSED`, or from its
+   failure hooks after `SOME TESTS FAILED`, sends
    `pwrmgr_labels::SHUTDOWN` through the authorised cap, per
    [Cross-harness conventions](../../docs/testing.md#cross-harness-conventions)
    and [svctest Run Sequence](../svctest/README.md#run-sequence).

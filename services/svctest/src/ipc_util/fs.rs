@@ -91,7 +91,6 @@ pub fn fs_rename(dir_cap: u32, src: &[u8], dst: &[u8], ipc_buf: *mut u64) -> Res
 }
 
 /// `FS_WRITE` inline: returns `bytes_written`.
-#[allow(clippy::doc_markdown)]
 pub fn fs_write_inline(
     file_cap: u32,
     offset: u64,
@@ -131,6 +130,8 @@ pub fn fs_read_bytes(
     {
         return Err(reply.label);
     }
+    // cast_possible_truncation: both Seraph targets are 64-bit, so usize
+    // holds every u64 byte count.
     #[allow(clippy::cast_possible_truncation)]
     let n = reply.word(0) as usize;
     Ok(reply.data_bytes()[8..8 + n].to_vec())

@@ -45,9 +45,7 @@ fn registry_cap_and_buf(phase: &str) -> (u32, *mut u64)
         registry_cap, 0,
         "{phase}: no service_registry_cap in ProcessInfo"
     );
-    // cast_ptr_alignment: the IPC buffer is page-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
     (registry_cap, ipc_buf)
 }
 

@@ -261,7 +261,7 @@ fn phases(ctx: &TestContext, cycles: u32) -> TestResult
 /// and some free landed inside a call.
 fn report(landed: &[u32; 8], cycles: u32) -> TestResult
 {
-    for call in FIRST..FIRST + CALLS
+    for call in (0..CALLS).map(|offset| FIRST + offset)
     {
         let i = call as usize;
         log_cell_u64(
@@ -343,10 +343,13 @@ fn phase(ctx: &TestContext, free: Free, cycles: u32) -> Result<[u32; 8], &'stati
         (0..cycles).try_for_each(|cycle| round(ctx, free, cycle, done, &mut landed))
     });
     let ended = caller.map_or(Ok(()), finish);
-    let released = [caller, Some(done), Some(ep)]
+    // Every delete runs, whatever an earlier one returned.
+    let failed_deletes = [caller, Some(done), Some(ep)]
         .into_iter()
         .flatten()
-        .fold(true, |ok, cap| cap_delete(cap).is_ok() && ok);
+        .filter(|&cap| cap_delete(cap).is_err())
+        .count();
+    let released = failed_deletes == 0;
     ran?;
     ended?;
     if !released
@@ -574,26 +577,26 @@ fn group(handle: u32, regs: &mut [u8; REGS_BUF]) -> bool
     if call(AFFINITY, None, || {
         thread_set_affinity(handle, TARGET_CPU).map(|()| 0)
     })
-    .is_none()
+    .is_err()
         || call(BIND, None, || {
             thread_set_fault_handler(handle, ep, BADGE, FAULT_CLASS_ALL).map(|()| 0)
         })
-        .is_none()
+        .is_err()
         || call(UNBIND, None, || {
             thread_set_fault_handler(handle, 0, 0, FAULT_CLASS_ALL).map(|()| 0)
         })
-        .is_none()
+        .is_err()
     {
         return false;
     }
-    let Some(stopped) = call(STOP, Some(refused), || thread_stop(handle).map(|()| 0))
+    let Ok(stopped) = call(STOP, Some(refused), || thread_stop(handle).map(|()| 0))
     else
     {
         return false;
     };
     if stopped.is_some()
     {
-        let Some(read) = call(READ_REGS, Some(refused), || {
+        let Ok(read) = call(READ_REGS, Some(refused), || {
             thread_read_regs(handle, regs.as_mut_ptr(), REGS_BUF)
         })
         else
@@ -608,7 +611,7 @@ fn group(handle: u32, regs: &mut [u8; REGS_BUF]) -> bool
             if call(WRITE_REGS, Some(refused), || {
                 thread_write_regs(handle, regs.as_ptr(), len).map(|()| 0)
             })
-            .is_none()
+            .is_err()
             {
                 return false;
             }
@@ -617,19 +620,22 @@ fn group(handle: u32, regs: &mut [u8; REGS_BUF]) -> bool
     call(START, Some(start_refused), || {
         thread_start(handle).map(|()| 0)
     })
-    .is_some()
+    .is_ok()
 }
 
+/// A call found the handle gone (`InvalidCapability`).
+struct HandleGone;
+
 /// Issue one call of kind `kind`, flagged in [`IN_CALL`] for its span, and
-/// classify its result: `Ok` is tallied and returned as `Some(Some(value))`;
-/// the call's own `refusal`, if any, is `Some(None)`; `InvalidCapability`
+/// classify its result: `Ok` is tallied and returned as `Ok(Some(value))`;
+/// the call's own `refusal`, if any, is `Ok(None)`; `InvalidCapability`
 /// (the handle is gone) is `None`; anything else is recorded as bad and
-/// returned as `Some(None)`, so the group goes on.
+/// returned as `Ok(None)`, so the group goes on.
 fn call(
     kind: u32,
     refusal: Option<i64>,
     issue: impl FnOnce() -> Result<u64, i64>,
-) -> Option<Option<u64>>
+) -> Result<Option<u64>, HandleGone>
 {
     IN_CALL.store(kind, Ordering::Release);
     let result = issue();
@@ -639,14 +645,14 @@ fn call(
         Ok(value) =>
         {
             OKS[kind as usize].fetch_add(1, Ordering::AcqRel);
-            Some(Some(value))
+            Ok(Some(value))
         }
-        Err(e) if e == SyscallError::InvalidCapability as i64 => None,
-        Err(e) if Some(e) == refusal => Some(None),
+        Err(e) if e == SyscallError::InvalidCapability as i64 => Err(HandleGone),
+        Err(e) if Some(e) == refusal => Ok(None),
         Err(e) =>
         {
             BAD.record_error(e);
-            Some(None)
+            Ok(None)
         }
     }
 }

@@ -53,14 +53,15 @@ pub fn pwrmgr_shutdown_phase(caps: &Caps)
     request_shutdown(caps.pwrmgr_auth);
 }
 
-/// Send `SHUTDOWN` on `pwrmgr_auth_cap`, the authority-badged pwrmgr cap,
-/// logging instead of returning when the cap is zero, pwrmgr replies, or the
-/// call fails. Never panics: the failure panic hook calls it too.
+/// Send `SHUTDOWN` on `pwrmgr_auth_cap`, the authority-badged pwrmgr cap.
+/// When the cap is zero, pwrmgr replies, or the call fails, it logs the
+/// outcome and returns. It never panics or allocates, because the failure
+/// hooks call it too.
 pub fn request_shutdown(pwrmgr_auth_cap: u32)
 {
     if pwrmgr_auth_cap == 0
     {
-        std::os::seraph::log!("pwrmgr shutdown phase skipped: no authority cap");
+        std::os::seraph::log!("pwrmgr SHUTDOWN skipped: no authority cap");
         return;
     }
 

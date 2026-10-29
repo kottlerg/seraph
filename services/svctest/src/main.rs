@@ -15,12 +15,13 @@
 //!
 //! * [`bootstrap`] — typed `Caps` from the creator-endpoint round.
 //! * [`runner`] — `Phase` struct + uniform log envelope; the failure
-//!   panic hook and the run's terminal marker.
+//!   hooks and the run's terminal marker.
 //! * [`reentry`] — argv-driven child-mode dispatch into the phase
 //!   modules that own each role.
 //! * [`ipc_util`] — raw-IPC helpers shared across phases.
 //! * [`phases`] — one module per services-tier surface under test.
 
+#![feature(alloc_error_hook)]
 #![feature(thread_local)]
 // svctest is an integration test harness: a standalone binary that
 // panics on failure so faults surface in the log. `expect`/`unwrap` are
@@ -53,7 +54,7 @@ fn main()
 
     // Parent run only (a matching role above never returns), and before the
     // bootstrap round, so a failure there also logs the fail marker.
-    runner::install_failure_hook();
+    runner::install_failure_hooks();
 
     let caps = bootstrap::request();
     runner::arm_failure_shutdown(&caps);

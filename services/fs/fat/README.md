@@ -87,10 +87,10 @@ carry no rights (a parent with none of the file rights) is refused with
 * **Page cache** (`src/cache.rs`): 128 single-page slots backed by
   `BLK_READ_INTO_MEMORY` for fills and a process-static scratch memory cap
   for single-sector `BLK_WRITE_FROM_MEMORY` writebacks and single-sector
-  device reads. Write-through:
-  the cached page is updated in place before the on-disk write so any
-  outstanding `FS_READ_MEMORY` cap aliasing the page observes new bytes
-  immediately, and the sector is put back when the write fails.
+  device reads. Write-through: the cached page is updated in place before
+  the on-disk write so any outstanding `FS_READ_MEMORY` cap aliasing the
+  page observes new bytes immediately, and the sector is put back when the
+  write fails.
   `reload_sector` reads one sector from the device past the cache and
   refreshes the cached copy; a failed `FS_REMOVE` or `FS_RENAME` whose
   8.3 slot write failed uses it to learn whether that slot was deleted.

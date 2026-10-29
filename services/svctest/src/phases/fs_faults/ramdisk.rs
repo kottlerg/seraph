@@ -332,7 +332,10 @@ fn transfer(
             Direction::Read =>
             {
                 let sector = disk.sector(lba + i);
-                // SAFETY: as for the write arm, the other way round.
+                // SAFETY: `va` maps one page for this copy, and sector `i`
+                // lies inside it, as for the write arm; `sector` is the
+                // disk's own buffer or the static `ZERO_SECTOR`, either way
+                // distinct from the mapped page.
                 unsafe { core::ptr::copy_nonoverlapping(sector.as_ptr(), page, SECTOR) };
             }
         }

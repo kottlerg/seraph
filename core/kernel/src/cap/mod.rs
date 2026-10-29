@@ -2092,7 +2092,7 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         // Full rights so the cap can flow through the donation chain into
         // memmgr's pool (memmgr-issued reply caps must carry RETYPE for
         // userspace to retype into kernel objects). Loaders (init,
-        // procmgr) map with `MAP_READONLY` for defence-in-depth on the
+        // procmgr) map with `MAP_FROM_CAP` for defence-in-depth on the
         // ELF source — read-only at the page-table level despite the
         // cap allowing WRITE.
         let slot = insert_or_fatal(

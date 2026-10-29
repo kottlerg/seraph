@@ -801,7 +801,7 @@ fn read_xsdt_phys(caps: &caps::DevmgrCaps) -> Option<u64>
             va,
             0,
             1,
-            syscall_abi::MAP_READONLY,
+            syscall_abi::MAP_FROM_CAP,
         )
     };
     if mapped.is_err()
@@ -844,7 +844,7 @@ fn read_xsdt_entries(caps: &caps::DevmgrCaps, xsdt_phys: u64) -> Option<std::vec
             va,
             0,
             map_pages,
-            syscall_abi::MAP_READONLY,
+            syscall_abi::MAP_FROM_CAP,
         )
     };
     if mapped.is_err()
@@ -893,7 +893,7 @@ fn read_mcfg_at(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<firmware::Ecam
             va,
             0,
             map_pages,
-            syscall_abi::MAP_READONLY,
+            syscall_abi::MAP_FROM_CAP,
         )
     };
     if mapped.is_err()
@@ -938,7 +938,7 @@ fn discover_ecam_dtb(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
             va,
             0,
             map_pages,
-            syscall_abi::MAP_READONLY,
+            syscall_abi::MAP_FROM_CAP,
         )
     };
     if mapped.is_err()
@@ -997,7 +997,7 @@ fn with_acpi_table<R>(
             va,
             0,
             map_pages,
-            syscall_abi::MAP_READONLY,
+            syscall_abi::MAP_FROM_CAP,
         )
     };
     if mapped.is_err()

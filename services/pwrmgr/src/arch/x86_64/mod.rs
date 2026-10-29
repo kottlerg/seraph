@@ -31,7 +31,7 @@
 use crate::caps::devmgr_call;
 use ipc::devmgr_labels;
 use std::os::seraph::{reserve_pages, unreserve_pages};
-use syscall_abi::MAP_READONLY;
+use syscall_abi::MAP_FROM_CAP;
 
 /// ACPI PM1 control register: `SLP_EN` bit (bit 13).
 const SLP_EN: u16 = 1 << 13;
@@ -268,7 +268,7 @@ where
             map_vaddr,
             0,
             geometry.pages,
-            MAP_READONLY,
+            MAP_FROM_CAP,
         )
     };
     let out = if mapped.is_ok()

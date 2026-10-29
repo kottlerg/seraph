@@ -355,7 +355,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
             ring_va,
             0,
             ring_pages,
-            syscall::MAP_READONLY | syscall::MAP_WRITABLE,
+            syscall::MAP_WRITABLE,
         )
     };
     if mapped.is_err()
@@ -467,7 +467,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
             data_va,
             0,
             1,
-            syscall::MAP_READONLY | syscall::MAP_WRITABLE,
+            syscall::MAP_WRITABLE,
         )
     };
     if mapped.is_err()

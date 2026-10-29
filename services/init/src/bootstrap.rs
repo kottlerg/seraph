@@ -829,7 +829,7 @@ pub fn bootstrap_memmgr(
             TEMP_MAP_BASE,
             0,
             module_pages,
-            syscall::MAP_READONLY,
+            syscall::MAP_FROM_CAP,
         )
     }
     .ok()?;
@@ -1583,7 +1583,7 @@ pub fn bootstrap_procmgr(
             TEMP_MAP_BASE,
             0,
             module_pages,
-            syscall::MAP_READONLY,
+            syscall::MAP_FROM_CAP,
         )
     }
     .ok()?;

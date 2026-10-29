@@ -258,7 +258,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
             ring_va,
             0,
             ring_pages,
-            syscall::MAP_READONLY | syscall::MAP_WRITABLE,
+            syscall::MAP_WRITABLE,
         )
     };
     if mapped.is_err()
@@ -354,16 +354,8 @@ fn setup_event_buffers(caps: &DriverCaps, buf_count: u16, ipc_buf: *mut u64) -> 
     // SAFETY: `range` is a fresh reservation from the per-process arena,
     // owned here for the mapping's life: VA no Rust object or IPC page
     // occupies.
-    let mapped = unsafe {
-        syscall::mem_map(
-            mem,
-            caps.self_aspace,
-            va,
-            0,
-            1,
-            syscall::MAP_READONLY | syscall::MAP_WRITABLE,
-        )
-    };
+    let mapped =
+        unsafe { syscall::mem_map(mem, caps.self_aspace, va, 0, 1, syscall::MAP_WRITABLE) };
     if mapped.is_err()
     {
         std::os::seraph::log!("event buffer mem_map failed");

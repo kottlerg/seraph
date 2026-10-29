@@ -1305,7 +1305,7 @@ fn handle_write_memory_node_cap(
         return;
     };
     // memmgr-issued memory caps carry RIGHTS_ALL (both WRITE and EXECUTE);
-    // mem_map with MAP_READONLY (= 0) on such a cap derives both w and
+    // mem_map with MAP_FROM_CAP (= 0) on such a cap derives both w and
     // x from the cap rights and trips the kernel's W^X check. Derive a
     // sub-cap restricted to RIGHTS_MEM_MAP (no WRITE or EXECUTE) first;
     // delete it after the unmap.
@@ -1325,7 +1325,7 @@ fn handle_write_memory_node_cap(
             va,
             0,
             1,
-            syscall_abi::MAP_READONLY,
+            syscall_abi::MAP_FROM_CAP,
         )
     };
     if mapped.is_err()
@@ -1339,8 +1339,8 @@ fn handle_write_memory_node_cap(
     // FS_WRITE_MEMORY path past the default 32 KiB stack envelope
     // once it cascades into `write_file_bytes → insert_entry → …`.
     let mut buf = Box::new([0u8; PAGE_BYTES]);
-    // SAFETY: va just mapped MAP_READONLY for one page; bounds checked
-    // above.
+    // SAFETY: va was just mapped read-only for one page (MAP_FROM_CAP on the
+    // Map-only cap); bounds checked above.
     unsafe {
         core::ptr::copy_nonoverlapping(
             (va + memory_data_offset as u64) as *const u8,

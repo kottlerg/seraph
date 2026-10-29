@@ -27,7 +27,9 @@ Report in the shape below, as a message to the address the prompt names (orchest
 widening beyond the rules below, a contested review finding, a design choice an Issue leaves
 open, filing an Issue) go in the report as a question with your recommendation; then end
 your turn and wait. Never run `gh issue create`: draft the body in your scratchpad and name
-the path in the report. Orchestrated, you end a turn only once your worktree differs from
+the path in the report. The scratchpad is shared by every worker of one session, so you name
+each file you put there with your PR number or scope (`pr581-body.md`, never a bare
+`pr-body.md`). Orchestrated, you end a turn only once your worktree differs from
 `origin/master` (a commit beyond it on your branch, or uncommitted edits to tracked files),
 since a turn that ends on an unchanged worktree loses the worktree and you with it. Before that
 point, all you do stays within the scope's files and provisional until the answer arrives: you

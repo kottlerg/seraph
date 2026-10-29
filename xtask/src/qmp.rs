@@ -9,10 +9,12 @@
 //! `input-send-event` (interactive-input test), `migrate` + `query-migrate`
 //! and `quit` (snapshot-resume test).
 //!
-//! Hand-rolled (no JSON dependency): the messages are fixed strings and
-//! responses are matched by substring. QMP messages are newline-delimited
-//! JSON.
+//! Hand-rolled (no JSON dependency): the messages are built by `format!`
+//! from fixed templates, the one caller-supplied free-form string (the
+//! migrate URI) JSON-escaped by `json_string`, and responses are matched
+//! by substring. QMP messages are newline-delimited JSON.
 
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -251,7 +253,11 @@ fn json_string(s: &str) -> String
         {
             '"' => out.push_str(r#"\""#),
             '\\' => out.push_str(r"\\"),
-            c if c < ' ' => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c if c < ' ' =>
+            {
+                // Writing to a `String` cannot fail.
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
             c => out.push(c),
         }
     }

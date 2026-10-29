@@ -1490,9 +1490,10 @@ fn populate_cspace(
 
     /// Width of the root `Interrupt` range cap minted at Phase 7 — the per-arch
     /// interrupt-controller spec maximum (`arch::current::ROOT_IRQ_COUNT`: 256
-    /// GSIs on x86-64, 1024 PLIC sources on RISC-V). `SYS_IRQ_REGISTER` refuses
-    /// an id outside `MIN_IRQ_ID..=MAX_IRQ_ID` and the Interrupt teardown
-    /// touches the routing table only for ids inside it, so oversizing is safe.
+    /// GSIs on x86-64; on RISC-V the PLIC's 1024-entry id space, sources
+    /// 1-1023). `SYS_IRQ_REGISTER` refuses an id outside
+    /// `MIN_IRQ_ID..=MAX_IRQ_ID` and the Interrupt teardown touches the routing
+    /// table only for ids inside it, so oversizing is safe.
     const ROOT_IRQ_COUNT: u32 = crate::arch::current::ROOT_IRQ_COUNT;
 
     /// Maximum number of `AcpiReclaimable` regions to mint caps for.
@@ -1734,9 +1735,9 @@ fn populate_cspace(
     // `SYS_IRQ_SPLIT` and delegates one per device.
     //
     // x86-64: 256 GSI lines covers every IOAPIC pin in the currently
-    // targeted systems. RISC-V: 1024 PLIC sources is the spec maximum;
-    // most platforms expose far fewer (e.g. 128). Sizing the root at the
-    // spec max is safe because `SYS_IRQ_REGISTER` refuses an id outside
+    // targeted systems. RISC-V: the PLIC's 1024-entry id space (sources
+    // 1-1023) is the spec maximum; most platforms expose far fewer (e.g.
+    // 128). Sizing the root at the spec max is safe because `SYS_IRQ_REGISTER` refuses an id outside
     // `MIN_IRQ_ID..=MAX_IRQ_ID` and the Interrupt teardown touches the routing
     // table only for ids inside it (see `ROOT_IRQ_COUNT` above).
     let irq_ptr = mint_phase7_body(InterruptObject {
@@ -2147,7 +2148,8 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 /// Mint reclaimable `Memory` capabilities over bootloader scratch ranges.
 ///
 /// Walks `boot_info.reclaim_ranges` — the `BootInfo` page, module
-/// descriptor array, memory-map entry array, MMIO aperture array, the
+/// descriptor array, memory-map entry array, the raw UEFI memory-map buffer
+/// (zeroed by the bootloader after its last read), MMIO aperture array, the
 /// reclaim-array page itself, the bootloader's transient page-table
 /// frames, and the bundle's non-module pages (header + entry table +
 /// pad, init ELF source body, inter-module and trailing slack —

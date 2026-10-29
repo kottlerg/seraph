@@ -769,7 +769,7 @@ pub fn revoke_null_slot_err(ctx: &TestContext) -> TestResult
 // ── SYS_CAP_CREATE_EVENT_Q negative ──────────────────────────────────────────
 
 /// `event_queue_create(0)` must return `InvalidArgument` (capacity bounds per
-/// core/kernel/docs/syscalls.md § `SYS_CAP_CREATE_EVENT_QUEUE`).
+/// core/kernel/docs/syscalls.md § `SYS_CAP_CREATE_EVENT_Q`).
 pub fn create_event_q_zero_capacity_err(ctx: &TestContext) -> TestResult
 {
     let err = event_queue_create(ctx.memory_base, 0);
@@ -781,7 +781,7 @@ pub fn create_event_q_zero_capacity_err(ctx: &TestContext) -> TestResult
 }
 
 /// `event_queue_create(EVENT_QUEUE_MAX_CAPACITY + 1)` must return
-/// `InvalidArgument` (see core/kernel/docs/syscalls.md § `SYS_CAP_CREATE_EVENT_QUEUE`).
+/// `InvalidArgument` (see core/kernel/docs/syscalls.md § `SYS_CAP_CREATE_EVENT_Q`).
 pub fn create_event_q_over_max_err(ctx: &TestContext) -> TestResult
 {
     let err = event_queue_create(ctx.memory_base, 4097);

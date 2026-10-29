@@ -105,20 +105,43 @@ pub fn inject_events(socket: &Path, events: &[(&str, bool)]) -> Result<()>
     Ok(())
 }
 
+/// `exec:` migration URI that saves the outgoing state to `state_path`
+/// (`exec:cat > <path>`). QEMU runs an `exec:` command through `/bin/sh -c`,
+/// so the path is shell-quoted: whitespace and shell metacharacters in it
+/// reach `cat` as one literal argument.
+///
+/// # Errors
+///
+/// Fails when `state_path` is not UTF-8, since the URI is a string.
+pub fn exec_save_uri(state_path: &Path) -> Result<String>
+{
+    Ok(format!("exec:cat > {}", shell_quote(path_str(state_path)?)))
+}
+
+/// `exec:` migration URI that restores incoming state from `state_path`
+/// (`exec:cat <path>`, for `-incoming`), shell-quoted as [`exec_save_uri`]
+/// quotes it.
+///
+/// # Errors
+///
+/// Fails when `state_path` is not UTF-8, since the URI is a string.
+pub fn exec_restore_uri(state_path: &Path) -> Result<String>
+{
+    Ok(format!("exec:cat {}", shell_quote(path_str(state_path)?)))
+}
+
 /// Migrate the guest's state to `state_path` (QEMU's save-to-file recipe:
-/// `migrate` with an `exec:cat > file` URI) and block until the migration
-/// reports `completed`, or fail after `timeout`.
+/// `migrate` with the [`exec_save_uri`] URI) and block until the migration
+/// reports `completed`, or fail after `timeout`. Any path is accepted: the
+/// URI is shell-quoted and then JSON-escaped into the command.
 ///
 /// The source VM is left in QEMU's `postmigrate` runstate; the caller
 /// [`quit`]s it before restoring the file elsewhere (the raw disk image
 /// stays write-locked until the process exits).
 pub fn migrate_to_file(socket: &Path, state_path: &Path, timeout: Duration) -> Result<()>
 {
+    let msg = migrate_command(state_path)?;
     let mut client = Client::connect(socket)?;
-    let msg = format!(
-        r#"{{"execute":"migrate","arguments":{{"uri":"exec:cat > {}"}}}}"#,
-        state_path.display()
-    );
     client.send(&msg)?;
     client.read_result().context("migrate command")?;
 
@@ -189,4 +212,95 @@ fn read_line(reader: &mut BufReader<UnixStream>) -> Result<String>
         bail!("QMP connection closed");
     }
     Ok(line)
+}
+
+/// The QMP `migrate` command saving the state to `state_path`: the
+/// [`exec_save_uri`] URI, JSON-escaped into the command's string argument.
+fn migrate_command(state_path: &Path) -> Result<String>
+{
+    let uri = exec_save_uri(state_path)?;
+    Ok(format!(
+        r#"{{"execute":"migrate","arguments":{{"uri":{}}}}}"#,
+        json_string(&uri)
+    ))
+}
+
+fn path_str(path: &Path) -> Result<&str>
+{
+    path.to_str()
+        .with_context(|| format!("state path {} is not UTF-8", path.display()))
+}
+
+/// Quote `s` as one POSIX shell word: wrapped in single quotes, inside
+/// which nothing is special but the single quote itself, written `'\''`
+/// (close, escaped quote, reopen).
+fn shell_quote(s: &str) -> String
+{
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// `s` as a JSON string literal, quotes included: `"` and `\` are
+/// backslash-escaped and control characters written as `\u00XX`.
+fn json_string(s: &str) -> String
+{
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars()
+    {
+        match c
+        {
+            '"' => out.push_str(r#"\""#),
+            '\\' => out.push_str(r"\\"),
+            c if c < ' ' => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn exec_uris_pass_a_path_with_shell_metacharacters_as_one_word()
+    {
+        // Unquoted, the space splits the path, `;` ends the command, and
+        // `$x` expands; the single quote must close, escape, and reopen.
+        let path = Path::new("/w s/it's;$x");
+        assert_eq!(
+            exec_save_uri(path).unwrap(),
+            r"exec:cat > '/w s/it'\''s;$x'"
+        );
+        assert_eq!(
+            exec_restore_uri(path).unwrap(),
+            r"exec:cat '/w s/it'\''s;$x'"
+        );
+    }
+
+    #[test]
+    fn migrate_command_json_escapes_the_uri()
+    {
+        // An unescaped `"` would end the JSON string early and an unescaped
+        // `\` would start an escape sequence, so QEMU would reject or
+        // misread the command.
+        let cmd = migrate_command(Path::new("/w/\"q\"\\b\n")).unwrap();
+        assert_eq!(
+            cmd,
+            r#"{"execute":"migrate","arguments":{"uri":"exec:cat > '/w/\"q\"\\b\u000a'"}}"#
+        );
+    }
+
+    #[test]
+    fn non_utf8_state_path_is_rejected()
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(OsStr::from_bytes(b"/w/\xff.bin"));
+        assert!(exec_save_uri(path).is_err());
+        assert!(exec_restore_uri(path).is_err());
+    }
 }

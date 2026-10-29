@@ -81,11 +81,35 @@ const TIMEOUT: Duration = Duration::from_mins(3);
 /// Budget for the migrate-to-file completion poll.
 const MIGRATE_TIMEOUT: Duration = Duration::from_mins(2);
 
+/// One QEMU instance and the thread reading its serial output.
+///
+/// Dropping a `Guest` kills QEMU, reaps it, and joins the reader, so every
+/// exit path of [`run`], an early `?` return included, releases the
+/// process and the raw disk image's write lock it holds; `std::process::Child`
+/// does not kill on drop, and an orphaned source QEMU would block boot B's
+/// open of the image. The error paths therefore return without an explicit
+/// shutdown.
 struct Guest
 {
     child: Child,
     lines: mpsc::Receiver<String>,
     reader: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for Guest
+{
+    fn drop(&mut self)
+    {
+        // Best-effort teardown: both calls fail harmlessly when QEMU has
+        // already exited and been reaped (after `wait_exit`), and a drop
+        // has no caller to report to.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(r) = self.reader.take()
+        {
+            let _ = r.join();
+        }
+    }
 }
 
 impl Guest
@@ -178,17 +202,16 @@ impl Guest
         }
     }
 
-    fn shutdown(mut self)
+    /// Kill QEMU and reap it now rather than at the end of scope (the
+    /// teardown is `Drop`'s).
+    fn shutdown(self)
     {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(r) = self.reader.take()
-        {
-            let _ = r.join();
-        }
+        drop(self);
     }
 
-    /// Wait for the process to exit on its own (post-`quit`).
+    /// Wait for the process to exit on its own (post-`quit`). On a timeout
+    /// or a `try_wait` error the process is killed and reaped as `self`
+    /// drops.
     fn wait_exit(mut self, timeout: Duration) -> Result<()>
     {
         let deadline = Instant::now() + timeout;
@@ -208,8 +231,6 @@ impl Guest
             }
             if Instant::now() >= deadline
             {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
                 bail!("QEMU did not exit within {}s after quit", timeout.as_secs());
             }
             thread::sleep(Duration::from_millis(100));
@@ -233,44 +254,34 @@ pub fn run(ctx: &Context, args: &TestVmgenidArgs) -> Result<()>
         let _ = std::fs::remove_file(p);
     }
 
+    // Built before boot A so a path the URI cannot carry fails up front.
+    let incoming = qmp::exec_restore_uri(&state_path)?;
+
     // ── Boot A: fixed GUID, wait until fully up ─────────────────────────────
     step("vmgenid test: boot A (source) — waiting for armed + READY markers");
+    // Every `?` below drops the live `Guest`, which kills and reaps its QEMU
+    // (see `Guest`).
     let mut guest_a = Guest::launch(&qemu_binary, ctx, args, &sock_a, GUID_A, None)?;
-    let res_a = guest_a.wait_for_markers(&[ARMED_MARKER, READY_MARKER], Instant::now() + TIMEOUT);
-    if let Err(e) = res_a
-    {
-        guest_a.shutdown();
-        return Err(e.context("boot A"));
-    }
+    guest_a
+        .wait_for_markers(&[ARMED_MARKER, READY_MARKER], Instant::now() + TIMEOUT)
+        .context("boot A")?;
 
     // ── Save: migrate to file, then quit to release the disk lock ──────────
     step("vmgenid test: migrating state to file");
-    if let Err(e) = qmp::migrate_to_file(&sock_a, &state_path, MIGRATE_TIMEOUT)
-    {
-        guest_a.shutdown();
-        return Err(e.context("migrate to file"));
-    }
+    qmp::migrate_to_file(&sock_a, &state_path, MIGRATE_TIMEOUT).context("migrate to file")?;
     qmp::quit(&sock_a).context("quitting source QEMU")?;
     guest_a.wait_exit(Duration::from_secs(30))?;
 
     // ── Boot B: new GUID, restore the state, assert detection ──────────────
     step("vmgenid test: boot B (restore with new GUID) — waiting for detection");
-    let incoming = format!("exec:cat {}", state_path.display());
     let mut guest_b = Guest::launch(&qemu_binary, ctx, args, &sock_b, GUID_B, Some(&incoming))?;
-    let detect = guest_b.wait_for_markers(&[CHANGE_MARKER], Instant::now() + TIMEOUT);
-    if let Err(e) = detect
-    {
-        guest_b.shutdown();
-        return Err(e.context("generation-change detection after restore"));
-    }
+    guest_b
+        .wait_for_markers(&[CHANGE_MARKER], Instant::now() + TIMEOUT)
+        .context("generation-change detection after restore")?;
 
     // ── Liveness: the resumed guest still draws and schedules ───────────────
     step("vmgenid test: post-resume liveness round (help via QMP)");
-    if let Err(e) = qmp::inject_events(&sock_b, EVENTS)
-    {
-        guest_b.shutdown();
-        return Err(e.context("QMP key injection after resume"));
-    }
+    qmp::inject_events(&sock_b, EVENTS).context("QMP key injection after resume")?;
     let live = guest_b.wait_for_markers(&[CHILD_LINE], Instant::now() + TIMEOUT);
     guest_b.shutdown();
     let _ = std::fs::remove_file(&state_path);

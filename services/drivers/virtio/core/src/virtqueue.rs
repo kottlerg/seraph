@@ -117,8 +117,10 @@ pub struct SplitVirtqueue
     /// Driver-private link of each descriptor, indexed by descriptor: the
     /// next free descriptor while it is free, the next descriptor of its
     /// chain while it is outstanding. Every value stored is below
-    /// `queue_size` except the free list's terminator, which `num_free`
-    /// keeps from being followed.
+    /// `queue_size` except the free list's terminator (`queue_size`), which
+    /// is never followed: `num_free` stops `alloc_desc` at the free list's
+    /// end, and `chain_len` stops `free_chain` at a chain's tail, whose link
+    /// may still hold the terminator or a stale free-list link.
     links: [u16; MAX_QUEUE_SIZE as usize],
 }
 
@@ -217,6 +219,9 @@ impl SplitVirtqueue
 
         let head = self.alloc_desc()?;
         let mut prev = head;
+        // The flags the previous iteration wrote to `prev`, kept here so
+        // setting its NEXT bit does not read the device-visible table back.
+        let mut prev_flags = 0u16;
 
         for (i, &(addr, len, writable)) in bufs.iter().enumerate()
         {
@@ -227,6 +232,7 @@ impl SplitVirtqueue
             {
                 self.links[usize::from(prev)] = idx;
             }
+            let flags = if writable { VRING_DESC_F_WRITE } else { 0 };
             // SAFETY: idx and prev come from alloc_desc, so both are below
             // queue_size and inside the DMA descriptor table. Volatile: prevents
             // dead-store elimination and ensures the device sees writes in order.
@@ -234,24 +240,20 @@ impl SplitVirtqueue
                 let desc = self.desc_va.add(idx as usize);
                 core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc).addr), addr);
                 core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc).len), len);
-                core::ptr::write_volatile(
-                    core::ptr::addr_of_mut!((*desc).flags),
-                    if writable { VRING_DESC_F_WRITE } else { 0 },
-                );
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc).flags), flags);
 
                 if i > 0
                 {
                     let prev_desc = self.desc_va.add(prev as usize);
-                    let old_flags =
-                        core::ptr::read_volatile(core::ptr::addr_of!((*prev_desc).flags));
                     core::ptr::write_volatile(
                         core::ptr::addr_of_mut!((*prev_desc).flags),
-                        old_flags | VRING_DESC_F_NEXT,
+                        prev_flags | VRING_DESC_F_NEXT,
                     );
                     core::ptr::write_volatile(core::ptr::addr_of_mut!((*prev_desc).next), idx);
                 }
             }
             prev = idx;
+            prev_flags = flags;
         }
 
         // Add head to available ring.
@@ -658,9 +660,11 @@ mod tests
             .add_chain(&[(0xA000, 1, false), (0xB000, 1, false), (0xC000, 1, false)])
             .expect("three free descriptors available");
         assert_eq!((head, rings.desc(1).next), (0, 2));
-        // The device rewrites the table: the middle descriptor links to free
-        // descriptor 5 marked as the tail, the head links out of the table.
-        // A walk of the DMA links would free 5 twice and leak 2.
+        // The device rewrites the table. The middle descriptor now links to
+        // free descriptor 5 marked as the tail: a walk of the DMA links that
+        // reached it would free 5 a second time and leak 2. The head now
+        // links out of the table: such a walk would leave the table at its
+        // first step.
         rings.set_next(1, 5, 0);
         rings.set_next(0, 200, VRING_DESC_F_NEXT);
         rings.publish_used(0, u32::from(head), 1, 1);

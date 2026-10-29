@@ -12,8 +12,9 @@ use crate::{STATUS_FEATURES_OK, VirtioPciStartupInfo};
 
 /// Status-register polls [`PciTransport::try_reset`] allows for a reset to
 /// complete. QEMU completes a reset within the status write; the bound only
-/// keeps a wedged device from parking the driver in the poll (each poll is
-/// an MMIO read, so the bound spans well over a second).
+/// keeps a wedged device from parking the driver in the poll. Each poll is
+/// one MMIO read, so the time the bound spans depends on the platform's
+/// MMIO-read cost.
 pub const RESET_POLL_LIMIT: u32 = 1_000_000;
 
 /// Modern PCI transport backed by MMIO-mapped BAR regions.

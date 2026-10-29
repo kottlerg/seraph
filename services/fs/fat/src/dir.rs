@@ -619,8 +619,8 @@ pub struct RemovedEntry
 /// slots were written.
 // too_many_arguments: the parent directory, the new entry's name, kind, first
 // cluster, and size, and the driver state the insert writes through (FAT
-// state, cache, block device, IPC buffer); each caller supplies a different
-// mix, so no shared struct would fit them.
+// state, cache, block device, IPC buffer); fatfs passes its driver state
+// unbundled throughout, and bundling it is a crate-wide refactor.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_entry(
     state: &mut FatState,

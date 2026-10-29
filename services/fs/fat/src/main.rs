@@ -141,7 +141,7 @@ fn main() -> !
         let f = files.clone();
         if std::thread::Builder::new()
             .name("fatfs-eviction-worker".into())
-            .spawn(move || eviction::worker_loop(ev, f, cache))
+            .spawn(move || eviction::worker_loop(&ev, &f, cache))
             .is_err()
         {
             std::os::seraph::log!("eviction worker spawn failed");
@@ -1019,9 +1019,7 @@ fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> 
 // too_many_arguments: the engine takes the file's extent, the write, and the
 // driver state it writes through (FAT state, cache, block device, IPC
 // buffer), shared by two callers with different request shapes.
-// single_match_else: each chain step names both outcomes of `chain_next`
-// (the next cluster, or end of chain to extend), which `if let` would hide.
-#[allow(clippy::too_many_arguments, clippy::single_match_else)]
+#[allow(clippy::too_many_arguments)]
 fn write_file_bytes(
     start_cluster: u32,
     file_size: u32,
@@ -1266,10 +1264,9 @@ fn handle_write_memory_node_cap(
     // `usize` holds every `u64`; both values are range-checked below.
     #[allow(clippy::cast_possible_truncation)]
     let (byte_count, memory_data_offset) = (msg.word(1) as usize, msg.word(2) as usize);
-    let page_size = PAGE_BYTES;
     if byte_count == 0
-        || memory_data_offset >= page_size
-        || byte_count > page_size - memory_data_offset
+        || memory_data_offset >= PAGE_BYTES
+        || byte_count > PAGE_BYTES - memory_data_offset
     {
         reply_with(ipc::fs_errors::BAD_MEMORY_OFFSET, ipc_buf);
         return;
@@ -1490,7 +1487,8 @@ fn handle_mkdir_node_cap(
 // too_many_arguments: the request, the parent node and its rights, the entry
 // kind, and the driver state creation writes through. too_many_lines: creation
 // is one sequence (validate the name, refuse a taken one, allocate, insert the
-// entry, mint the child cap, reply) whose failure exits undo what came before.
+// entry, mint the child cap, reply) whose steps share the parent cluster and the
+// new entry's state.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn create_entry_common(
     node_id: NodeId,
@@ -1743,9 +1741,6 @@ fn slot_deleted_in_cache(
 }
 
 /// `FS_RENAME`: rename an entry within a single directory.
-// too_many_lines: one request's sequential validation, lookup, and the
-// non-atomic insert-then-remove, whose order crash-safety.md documents.
-#[allow(clippy::too_many_lines)]
 fn handle_rename_node_cap(
     node_id: NodeId,
     msg: &IpcMessage,

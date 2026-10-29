@@ -101,8 +101,8 @@ impl NodeTable
     }
 
     /// Look up the [`FatNode`] for a non-root [`NodeId`]. Returns `None`
-    /// for the reserved root id (0) and for ids past the table tail.
-    /// Used by the `service_loop` node-cap dispatch arms in `main.rs`.
+    /// for the reserved root id (0), for ids past the table tail, and for
+    /// entries `invalidate_for_loc` cleared (removed or renamed). Used by the `service_loop` node-cap dispatch arms in `main.rs`.
     #[must_use]
     pub fn get(&self, id: NodeId) -> Option<FatNode>
     {
@@ -152,8 +152,8 @@ impl NodeTable
     /// against a node cap allocates an `OpenFile` slot, and on
     /// `FS_CLOSE` to clear it back to [`NO_OPEN_SLOT`].
     ///
-    /// No-op for the reserved root id (0) and for ids past the table
-    /// tail.
+    /// No-op for the reserved root id (0), for ids past the table tail,
+    /// and for entries `invalidate_for_loc` cleared.
     pub fn set_open_slot(&mut self, id: NodeId, slot: u32)
     {
         let Some(idx) = entry_index(id)

@@ -788,7 +788,7 @@ fn resolve_sector(badge: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
 /// latter is already partition-scoped and has no authority to create
 /// additional scopes.
 ///
-/// Data words: `[base_lba, length_lba]`. The driver allocates a fresh
+/// Data words: `[BLK_LABELS_VERSION, base_lba, length_lba]`. The driver allocates a fresh
 /// partition-identity badge from its monotonic counter, inserts the
 /// bound, derives a badged `SEND_GRANT` cap on its own service endpoint
 /// scoped to that badge, and returns the cap in `caps[0]` of the reply.

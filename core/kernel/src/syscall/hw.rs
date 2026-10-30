@@ -149,8 +149,8 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
         io.start
     };
     // The root Interrupt cap spans the controller's whole id space
-    // (`ROOT_IRQ_COUNT`), which on riscv64 exceeds both the sources the kernel
-    // programs and the routing table; refuse an id the kernel cannot route.
+    // (`ROOT_IRQ_COUNT`), which on both architectures exceeds the ids the kernel
+    // routes (on riscv64 also the routing table); refuse an id it cannot route.
     if !(crate::arch::current::MIN_IRQ_ID..=crate::arch::current::MAX_IRQ_ID).contains(&irq_id)
     {
         return Err(SyscallError::InvalidArgument);

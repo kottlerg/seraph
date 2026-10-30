@@ -132,7 +132,8 @@ Each feature is classified per architecture as one of:
 - **UMIP** (`CR4.UMIP`) — set on every CPU when present, so ring-3 `SGDT`, `SIDT`, `SLDT`, `SMSW`,
   and `STR` raise `#GP`. It is not uniform at the platform floor (Intel's Skylake-derived 10th
   generation lacks it), so it is not required. Without it ring 3 can read the IDT and GDT bases,
-  kernel image addresses that disclose the KASLR slide; see
+  which disclose the KASLR image slide (the IDT and the BSP's GDT lie in the kernel image) or
+  the direct-map base (an AP's GDT lies in the direct map); see
   [core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
   § Surface inventory.
 - **EFI_RNG_PROTOCOL** — an additional boot entropy seed.

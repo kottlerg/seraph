@@ -69,7 +69,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | Thread ID (random CSPRNG correlator for every thread but init, whose ID is the fixed value 1; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c/d |
 | `CSpaceId` (registry index, never returned to userspace); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |
 | Boot-time `InitInfo` handover — kernel writes a read-only struct into init's mapped region | `init_protocol::InitInfo`, `init_protocol::CapDescriptor` | b/c/d/e |
-| x86-64 descriptor-table registers read at CPL 3 (`SGDT`, `SIDT`, `SLDT`, `SMSW`, `STR`): `#GP` where `CR4.UMIP` is set; the IDTR and GDTR bases on a CPU without UMIP | `cpu::enable_smep_smap`, `idt::IDT`, `gdt::GDT` | d / **a** without UMIP |
+| x86-64 descriptor-table registers read at CPL 3 (`SGDT`, `SIDT`, `SLDT`, `SMSW`, `STR`): `#GP` where `CR4.UMIP` is set; the IDTR and GDTR bases on a CPU without UMIP | `cpu::enable_smep_smap`, `idt::IDT`, `gdt::GDT`, `gdt::AP_GDT_PTR` | d / **a** without UMIP |
 
 Notes on the non-obvious entries:
 
@@ -98,9 +98,11 @@ Notes on the non-obvious entries:
   `sched::with_held_frame` snapshots its trap frame: the snapshot `copy_to_user` returns
   is the target's user register state.
 - **Descriptor-table registers** are a hardware output, not a value the kernel emits:
-  with `CR4.UMIP` clear, `SIDT` and `SGDT` execute at CPL 3 and return the IDTR and GDTR,
-  whose bases are kernel image addresses (the static IDT, and the BSP's static GDT or an
-  AP's), so one unprivileged instruction recovers the KASLR image slide. The kernel sets
+  with `CR4.UMIP` clear, `SIDT` and `SGDT` execute at CPL 3 and return the IDTR and GDTR.
+  The IDT and the BSP's GDT are statics in the kernel image, so on any CPU `SIDT`, and
+  `SGDT` on the BSP, recover the KASLR image slide; an AP's GDT is a slot of the per-AP slab
+  `gdt::init_ap_storage` allocates, a direct-map address, so `SGDT` on an AP recovers the
+  randomized direct-map base. One unprivileged instruction reveals either. The kernel sets
   `CR4.UMIP` on every CPU whose CPUID reports it (`cpu::enable_smep_smap`, BSP and APs,
   before the first ring-3 entry), and the five reads then raise `#GP`, delivered or killed
   on as any user exception. UMIP is opportunistic

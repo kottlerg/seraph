@@ -6,13 +6,15 @@
 //! Integration (x86-64): on a CPU that reports UMIP, a ring-3 `SIDT` or `SGDT`
 //! raises `#GP` instead of returning a kernel address.
 //!
-//! The IDTR and GDTR bases are kernel image addresses (the static IDT, the
-//! static or per-AP GDT), so a ring-3 read of either recovers the KASLR image
-//! slide. The kernel sets `CR4.UMIP` on every CPU whose CPUID reports it
+//! The IDTR and GDTR bases are kernel addresses: the IDT and the BSP's GDT are
+//! statics in the kernel image, which disclose the KASLR image slide, and an
+//! AP's GDT lies in the direct map, which discloses the direct-map base. The
+//! kernel sets `CR4.UMIP` on every CPU whose CPUID reports it
 //! (`cpu::enable_smep_smap`; core/kernel/docs/cross-boundary-disclosure.md
-//! § Surface inventory, descriptor-table registers). Two children, one at a
-//! time on the same stack, each execute one of the reads with no fault handler
-//! bound; each must die with `EXIT_FAULT_BASE + 13` (`#GP`).
+//! § Surface inventory, descriptor-table registers). On every CPU in turn, two
+//! children pinned there, one at a time on the same stack, each execute one of
+//! the reads with no fault handler bound; each must die with
+//! `EXIT_FAULT_BASE + 13` (`#GP`), so a CPU that missed the CR4 bit fails it.
 //!
 //! The children are killed rather than resumed by a bound handler: a CPU that
 //! executes the read writes the register to the child's buffer and the child
@@ -24,7 +26,7 @@
 //! `CPUID.(EAX=07H,ECX=0):ECX[2]` is clear. CPUID executes at CPL 3, so the
 //! check reads the same bit the kernel gates on.
 
-use syscall_abi::EXIT_FAULT_BASE;
+use syscall_abi::{EXIT_FAULT_BASE, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -50,22 +52,30 @@ pub fn run(ctx: &TestContext) -> TestResult
         crate::log("ktest: integration::umip_descriptor_reads_fault SKIP (CPUID reports no UMIP)");
         return Ok(());
     }
-    expect_gp(
-        ctx,
-        READ_IDTR,
-        "integration::umip_descriptor_reads_fault: SIDT did not #GP",
-    )?;
-    expect_gp(
-        ctx,
-        READ_GDTR,
-        "integration::umip_descriptor_reads_fault: SGDT did not #GP",
-    )
+    let cpus = syscall::system_info(SystemInfoType::CpuCount as u64)
+        .ok()
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or("integration::umip_descriptor_reads_fault: system_info(CpuCount) failed")?;
+    (0..cpus).try_for_each(|cpu| {
+        expect_gp(
+            ctx,
+            READ_IDTR,
+            cpu,
+            "integration::umip_descriptor_reads_fault: SIDT did not #GP",
+        )?;
+        expect_gp(
+            ctx,
+            READ_GDTR,
+            cpu,
+            "integration::umip_descriptor_reads_fault: SGDT did not #GP",
+        )
+    })
 }
 
-/// Run one child that executes the read `which` selects and check it died of
-/// `#GP`; `failure` names the read. The child's caps are deleted on every path
-/// (the `SpawnedChild` guard).
-fn expect_gp(ctx: &TestContext, which: u64, failure: &'static str) -> TestResult
+/// Run one child, pinned to `cpu`, that executes the read `which` selects and
+/// check it died of `#GP`; `failure` names the read. The child's caps are
+/// deleted on every path (the `SpawnedChild` guard).
+fn expect_gp(ctx: &TestContext, which: u64, cpu: u32, failure: &'static str) -> TestResult
 {
     let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "integration::umip_descriptor_reads_fault: spawn::new_child failed")?;
@@ -73,8 +83,10 @@ fn expect_gp(ctx: &TestContext, which: u64, failure: &'static str) -> TestResult
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`, on which
     // no other live thread runs (`ChildStack`'s rule): the previous child has
     // exited and its Thread cap has been deleted before the next starts.
-    unsafe { crate::spawn::configure_and_start(&child, reader, stack_top, which) }
-        .map_err(|_| "integration::umip_descriptor_reads_fault: configure_and_start failed")?;
+    unsafe { crate::spawn::configure_and_start_pinned(&child, reader, stack_top, which, cpu) }
+        .map_err(
+            |_| "integration::umip_descriptor_reads_fault: configure_and_start_pinned failed",
+        )?;
     let reason = crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS))?;
     child.delete_thread().ok();
     child.delete_cspace().ok();

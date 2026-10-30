@@ -1410,8 +1410,9 @@ fn pte_permits_user_access(pte: u64, write: bool, instr: bool) -> bool
 /// updates A/D in hardware), the retried instruction is guaranteed to make
 /// progress — no retry counter is needed.
 ///
-/// A kernel-half `va` (at or above [`user_va_top`]) is never a user mapping, so
-/// it is never a stale-TLB fault: it returns `false` without walking the tables
+/// A `va` at or above [`user_va_top`] (the unmappable top user page and the
+/// kernel half) is never a user mapping, so it is never a stale-TLB fault: it
+/// returns `false` without walking the tables
 /// ([`fault_is_spurious_given`]).
 ///
 /// # Safety
@@ -1429,9 +1430,9 @@ pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool
     })
 }
 
-/// The decision of [`user_fault_is_spurious`], with the live leaf PTE of a
-/// user-half `va` supplied by `live_leaf` (`None` when `va` is unmapped).
-/// `live_leaf` is not called for a kernel-half `va`.
+/// The decision of [`user_fault_is_spurious`], with the live leaf PTE of a `va`
+/// below [`user_va_top`] supplied by `live_leaf` (`None` when `va` is
+/// unmapped). `live_leaf` is not called for a `va` at or above it.
 fn fault_is_spurious_given(
     va: u64,
     write: bool,

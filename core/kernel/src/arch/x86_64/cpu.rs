@@ -252,8 +252,8 @@ const CR4_UMIP: u64 = 1 << 11;
 /// relies on that to tell the user GS base from the kernel's.
 ///
 /// With UMIP on, ring 3 cannot read the IDTR or GDTR, whose bases are kernel
-/// image addresses (the static IDT, the BSP's static GDT) that would disclose
-/// the KASLR slide. UMIP is opportunistic
+/// addresses: the static IDT and the BSP's static GDT disclose the KASLR image
+/// slide, and an AP's GDT, in the direct map, the direct-map base. UMIP is opportunistic
 /// ([platform-requirements.md](../../../../../docs/platform-requirements.md) § x86-64
 /// Classification); without it that read remains, as
 /// [cross-boundary-disclosure.md](../../../docs/cross-boundary-disclosure.md) § Surface

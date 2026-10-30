@@ -198,7 +198,7 @@ pub fn irq_register_unroutable_id_err(ctx: &TestContext) -> TestResult
 fn refuse_unroutable_id(ctx: &TestContext, id: u32, irq_sig: u32) -> TestResult
 {
     let single = isolate_irq_id(ctx, id)
-        .ok_or("hw::irq_register_unroutable_id_err: no cap contains the id")?;
+        .ok_or("hw::irq_register_unroutable_id_err: cannot isolate the id")?;
     let err = irq_register(single, irq_sig);
     // Deleting the cap must not touch the routing table for an id it cannot
     // index (the kernel panicked here before the teardown guard).
@@ -211,7 +211,8 @@ fn refuse_unroutable_id(ctx: &TestContext, id: u32, irq_sig: u32) -> TestResult
 }
 
 /// A single-id Interrupt cap for `id`, split off a derived copy of the first
-/// cap in the test's `CSpace` whose range contains it; `None` when no cap does.
+/// cap in the test's `CSpace` whose range contains it; `None` when no cap does
+/// or the split that cuts the id off from the ids above it is refused.
 fn isolate_irq_id(ctx: &TestContext, id: u32) -> Option<u32>
 {
     let bound = scan_bound(ctx);
@@ -238,8 +239,16 @@ fn isolate_irq_id(ctx: &TestContext, id: u32) -> Option<u32>
                 syscall::cap_delete(above).ok();
                 Some(single)
             }
-            // The range ends at `id`: `from_id` is the id alone.
-            Err(_) => Some(from_id),
+            // `id + 1` is not strictly inside `from_id`, whose range starts at
+            // `id`: the range ends at `id`, and `from_id` is the id alone.
+            Err(e) if e == SyscallError::InvalidArgument as i64 => Some(from_id),
+            // Any other refusal leaves a multi-id cap, which `irq_register`
+            // would refuse for its width, not its id; fail instead.
+            Err(_) =>
+            {
+                syscall::cap_delete(from_id).ok();
+                None
+            }
         };
     }
     None

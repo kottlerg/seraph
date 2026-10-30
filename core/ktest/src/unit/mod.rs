@@ -447,8 +447,8 @@ pub fn run_all(ctx: &TestContext)
         ipc::call_four_caps_transfer(ctx)
     );
     run_test!(
-        "ipc::recv_oom_returns_cleanly",
-        ipc::recv_oom_returns_cleanly(ctx)
+        "ipc::recv_succeeds_on_exhausted_general_slots",
+        ipc::recv_succeeds_on_exhausted_general_slots(ctx)
     );
 
     // ── Thread syscalls ───────────────────────────────────────────────────────

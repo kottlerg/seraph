@@ -18,6 +18,13 @@
 //! slots themselves (core/kernel/src/cap/slot.rs, `CapabilitySlot::set_next_free`);
 //! see core/kernel/docs/capability-internals.md § Free Slot Tracking.
 //!
+//! ## IPC receive reserve
+//!
+//! General allocations ([`CSpace::allocate_slot`] and the inserts built on
+//! it) leave the last [`IPC_RECV_RESERVE`] free slots untouched; only IPC
+//! capability transfer ([`CSpace::allocate_transfer_slot`]) takes them. See
+//! core/kernel/docs/capability-internals.md § IPC Receive Reserve.
+//!
 //! ## Growth
 //!
 //! Leaves are allocated on demand by [`CSpace::grow`] behind the `next_leaf`
@@ -49,6 +56,16 @@ use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
 /// page); see core/kernel/docs/capability-internals.md § Storage: Hybrid
 /// Two-Level Radix for the sizing constraints.
 pub const L2_SIZE: usize = 56;
+
+/// Free slots kept back from general allocations for IPC capability
+/// transfer: one message's worth, so a `CSpace` whose general slots are
+/// exhausted still receives a cap-bearing message (core/kernel/docs/capability-internals.md
+/// § IPC Receive Reserve).
+pub const IPC_RECV_RESERVE: usize = syscall::CSPACE_IPC_RECV_RESERVE as usize;
+
+// The ABI publishes the slots a slot-page backs for userspace funding
+// arithmetic (`CSPACE_SLOTS_PER_PAGE`); the leaf layout must match it.
+const _: () = assert!(L2_SIZE as u64 == syscall::CSPACE_SLOTS_PER_PAGE);
 
 /// Inline root pointers to leaf pages (the direct region).
 const L1_DIRECT: usize = 128;
@@ -214,6 +231,10 @@ pub struct CSpace
     /// stub, which boxes pages instead. Set once via [`Self::set_kobj`]
     /// right after construction.
     kobj: AtomicPtr<CSpaceKernelObject>,
+    /// Host-test stand-in for a finite slot-page pool: the heap pages the
+    /// test stub may still allocate, or `None` for unbounded.
+    #[cfg(test)]
+    test_page_budget: Option<usize>,
 }
 
 // SAFETY: page pointers are write-once, Release-published after full
@@ -242,6 +263,8 @@ impl CSpace
             free_count: 0,
             lock: crate::sync::Spinlock::new(),
             kobj: AtomicPtr::new(core::ptr::null_mut()),
+            #[cfg(test)]
+            test_page_budget: None,
         }
     }
 
@@ -265,14 +288,26 @@ impl CSpace
         if p.is_null() { None } else { Some(p) }
     }
 
+    /// Bound the host-test stub's heap pages to `pages`, standing in for a
+    /// finite slot-page pool.
+    #[cfg(test)]
+    pub(crate) fn set_test_page_budget(&mut self, pages: usize)
+    {
+        self.test_page_budget = Some(pages);
+    }
+
     /// Return this `CSpace`'s unique identifier.
     pub fn id(&self) -> CSpaceId
     {
         self.id
     }
 
-    /// Allocate a free slot index, growing the `CSpace` if needed.
+    /// Allocate a free slot index for a general insert, growing the `CSpace`
+    /// if needed.
     ///
+    /// Leaves [`IPC_RECV_RESERVE`] free slots behind: when fewer than
+    /// `IPC_RECV_RESERVE + 1` slots are free and the `CSpace` cannot grow,
+    /// it fails with the grow's error even though reserved slots remain.
     /// Returns [`CapError::OutOfSlots`] if the directory is structurally
     /// full, or [`CapError::PoolExhausted`] if the slot-page pool has no
     /// page left. The returned slot is cleared to null; callers must
@@ -281,11 +316,24 @@ impl CSpace
     /// The returned index is always non-zero (slot 0 is reserved).
     pub fn allocate_slot(&mut self) -> Result<NonZeroU32, CapError>
     {
-        if self.free_head.is_none()
-        {
-            self.grow()?;
-        }
+        self.pre_allocate(IPC_RECV_RESERVE + 1)?;
+        self.pop_free_slot()
+    }
 
+    /// Allocate a free slot index for an IPC capability transfer, taking
+    /// a reserved slot when no other is free.
+    ///
+    /// Errors as [`Self::allocate_slot`], reached only once every free slot,
+    /// the reserve included, is taken and the `CSpace` cannot grow.
+    pub fn allocate_transfer_slot(&mut self) -> Result<NonZeroU32, CapError>
+    {
+        self.pre_allocate(1)?;
+        self.pop_free_slot()
+    }
+
+    /// Pop the free list's head. The caller has made the list non-empty.
+    fn pop_free_slot(&mut self) -> Result<NonZeroU32, CapError>
+    {
         let idx = self.free_head.ok_or(CapError::OutOfSlots)?;
 
         // Read next_free through a shared borrow, then drop it before the
@@ -371,6 +419,14 @@ impl CSpace
         {
             if kobj_ptr.is_null()
             {
+                if let Some(left) = self.test_page_budget.as_mut()
+                {
+                    if *left == 0
+                    {
+                        return Err(CapError::PoolExhausted);
+                    }
+                    *left -= 1;
+                }
                 // Test stub: no retype machinery, allocate via the host
                 // heap.
                 // SAFETY: the caller's T is zero-valid per the contract.
@@ -667,8 +723,34 @@ impl CSpace
     ) -> Result<NonZeroU32, CapError>
     {
         let index = self.allocate_slot()?;
+        self.fill_slot(index, tag, rights, object)?;
+        Ok(index)
+    }
 
-        // SAFETY: allocate_slot returned a valid index into an allocated page.
+    /// [`insert_cap`](Self::insert_cap) for an IPC capability transfer: the
+    /// slot comes from [`allocate_transfer_slot`](Self::allocate_transfer_slot),
+    /// so the IPC receive reserve is available to it.
+    pub fn insert_cap_transfer(
+        &mut self,
+        tag: CapTag,
+        rights: Rights,
+        object: NonNull<KernelObjectHeader>,
+    ) -> Result<NonZeroU32, CapError>
+    {
+        let index = self.allocate_transfer_slot()?;
+        self.fill_slot(index, tag, rights, object)?;
+        Ok(index)
+    }
+
+    /// Populate the just-allocated slot `index` with a fresh, unlinked cap.
+    fn fill_slot(
+        &mut self,
+        index: NonZeroU32,
+        tag: CapTag,
+        rights: Rights,
+        object: NonNull<KernelObjectHeader>,
+    ) -> Result<(), CapError>
+    {
         let slot = self.slot_mut(index.get()).ok_or(CapError::InvalidIndex)?;
         slot.tag = tag;
         slot.rights = rights;
@@ -678,8 +760,7 @@ impl CSpace
         slot.deriv_first_child = None;
         slot.deriv_next_sibling = None;
         slot.deriv_prev_sibling = None;
-
-        Ok(index)
+        Ok(())
     }
 
     /// Encode the cap handle (per-slot generation + slot index) for `index`.
@@ -755,8 +836,10 @@ impl CSpace
         self.insert_cap_handle(K::TAG, rights.erase(), object)
     }
 
-    /// Grow the `CSpace` until at least `min_free` slots are available without
-    /// a further grow. Used to pre-warm the free list before bulk insertions.
+    /// Grow the `CSpace` until at least `min_free` slots are free without a
+    /// further grow. The IPC paths call it before a transfer, whose inserts
+    /// may take the [`IPC_RECV_RESERVE`]; the general allocation path calls
+    /// it with the reserve added.
     pub fn pre_allocate(&mut self, min_free: usize) -> Result<(), CapError>
     {
         while self.free_count < min_free
@@ -827,7 +910,11 @@ impl CSpace
     /// # Errors
     ///
     /// - [`CapError::InvalidIndex`] — index is 0, out of range, or occupied.
-    /// - [`CapError::PoolExhausted`] — slot-page pool empty during grow.
+    /// - [`CapError::PoolExhausted`] — slot-page pool empty during grow,
+    ///   including the grow that keeps [`IPC_RECV_RESERVE`] free slots
+    ///   behind the placement.
+    /// - [`CapError::OutOfSlots`] — the directory is structurally full with
+    ///   no more than the reserve free.
     pub fn insert_cap_at(
         &mut self,
         index: u32,
@@ -873,6 +960,10 @@ impl CSpace
                 return Err(CapError::InvalidIndex);
             }
         }
+
+        // An explicit placement is a general allocation: it takes a free slot
+        // only while the IPC receive reserve stays free behind it.
+        self.pre_allocate(IPC_RECV_RESERVE + 1)?;
 
         // Remove from free list (may or may not be on it if page was just grown).
         self.remove_from_free_list(index);
@@ -1253,8 +1344,10 @@ mod tests
         let mut last_direct = 0u32;
         for i in 0..direct_slots
         {
+            // Transfer allocations take every free slot, the reserve
+            // included, so the direct region fills exactly.
             let idx = cs
-                .allocate_slot()
+                .allocate_transfer_slot()
                 .unwrap_or_else(|e| panic!("direct-region allocation {i} failed: {e:?}"));
             last_direct = idx.get();
         }
@@ -1373,7 +1466,9 @@ mod tests
         let mut seen = Vec::new();
         for _ in 0..cs.free_count
         {
-            let idx = cs.allocate_slot().expect("free list drained early");
+            let idx = cs
+                .allocate_transfer_slot()
+                .expect("free list drained early");
             assert!(!seen.contains(&idx), "duplicate index from free list");
             assert!(
                 ![1u32, 30, 55].contains(&idx.get()),
@@ -1413,7 +1508,9 @@ mod tests
         let mut seen = Vec::new();
         for _ in 0..free_before
         {
-            let idx = cs.allocate_slot().expect("free list drained early");
+            let idx = cs
+                .allocate_transfer_slot()
+                .expect("free list drained early");
             assert!(
                 !seen.contains(&idx),
                 "allocate_slot returned duplicate index {} — free list corrupted",
@@ -1425,5 +1522,93 @@ mod tests
             cs.free_head.is_none(),
             "free list must be empty after draining free_count entries"
         );
+    }
+
+    /// A one-leaf `CSpace` whose pool is spent: `L2_SIZE - 1` usable slots.
+    fn one_leaf_cspace() -> CSpace
+    {
+        let mut cs = CSpace::new(0);
+        cs.test_page_budget = Some(1);
+        cs
+    }
+
+    #[test]
+    fn general_allocations_stop_at_the_ipc_reserve()
+    {
+        let mut cs = one_leaf_cspace();
+        let general = L2_SIZE - 1 - IPC_RECV_RESERVE;
+        for i in 0..general
+        {
+            cs.allocate_slot()
+                .unwrap_or_else(|e| panic!("general allocation {i} failed: {e:?}"));
+        }
+        assert_eq!(cs.allocate_slot(), Err(CapError::PoolExhausted));
+        assert_eq!(cs.free_count, IPC_RECV_RESERVE);
+    }
+
+    #[test]
+    fn transfer_allocations_take_the_reserve_then_fail()
+    {
+        let mut cs = one_leaf_cspace();
+        while cs.allocate_slot().is_ok()
+        {}
+        // A receive's pre-allocation is met without growth.
+        assert_eq!(cs.pre_allocate(IPC_RECV_RESERVE), Ok(()));
+        for i in 0..IPC_RECV_RESERVE
+        {
+            cs.allocate_transfer_slot()
+                .unwrap_or_else(|e| panic!("reserved allocation {i} failed: {e:?}"));
+        }
+        assert_eq!(cs.allocate_transfer_slot(), Err(CapError::PoolExhausted));
+        assert_eq!(cs.pre_allocate(1), Err(CapError::PoolExhausted));
+    }
+
+    #[test]
+    fn freeing_a_slot_reopens_general_allocation()
+    {
+        let mut cs = one_leaf_cspace();
+        let mut last = None;
+        while let Ok(idx) = cs.allocate_slot()
+        {
+            last = Some(idx);
+        }
+        let freed = last.expect("at least one general allocation");
+        cs.free_slot(freed.get());
+        assert_eq!(cs.allocate_slot(), Ok(freed));
+    }
+
+    #[test]
+    fn explicit_placement_respects_the_ipc_reserve()
+    {
+        let mut cs = one_leaf_cspace();
+        let obj = dummy_object();
+        while cs.allocate_slot().is_ok()
+        {}
+        // Some slot of leaf 0 is still free (a reserved one); placing a cap
+        // there is a general allocation and is refused.
+        let target = (1..L2_SIZE as u32)
+            .find(|&i| cs.slot(i).is_some_and(CapabilitySlot::is_on_free_list))
+            .expect("a reserved slot is free");
+        assert_eq!(
+            cs.insert_cap_at(target, CapTag::Memory, MemRights::MAP.erase(), obj),
+            Err(CapError::PoolExhausted)
+        );
+        assert_eq!(cs.free_count, IPC_RECV_RESERVE);
+    }
+
+    #[test]
+    fn transfer_insert_fills_a_reserved_slot()
+    {
+        let mut cs = one_leaf_cspace();
+        let obj = dummy_object();
+        while cs.allocate_slot().is_ok()
+        {}
+        let idx = cs
+            .insert_cap_transfer(CapTag::Memory, MemRights::MAP.erase(), obj)
+            .expect("transfer insert into the reserve");
+        let slot = cs.slot(idx.get()).unwrap();
+        assert_eq!(slot.tag, CapTag::Memory);
+        assert_eq!(slot.object, Some(obj));
+        assert_eq!(cs.free_count, IPC_RECV_RESERVE - 1);
     }
 }

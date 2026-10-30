@@ -16,10 +16,13 @@ pub fn phases() -> &'static [Phase]
     }]
 }
 
-/// Spawn the capexhaust fixture, which exhausts its own `CSpace` and enters a
-/// guarded blocking receive loop. The kernel fails every `ipc_recv` at the
-/// `MSG_CAP_SLOTS_MAX` pre-allocate; the fixture's `RecvGuard` must escalate
-/// to a loud `EXIT_RECV_WEDGE` death instead of spinning silently.
+/// Spawn the capexhaust fixture, which exhausts its own `CSpace`'s general
+/// slots, spends the IPC receive reserve on memmgr grants (which must land),
+/// and enters a guarded blocking receive loop. With the reserve spent, the
+/// kernel fails every `ipc_recv` at the `MSG_CAP_SLOTS_MAX` pre-allocate; the
+/// fixture's `RecvGuard` must escalate to a loud `EXIT_RECV_WEDGE` death
+/// instead of spinning silently. A failed reserve check panics the fixture,
+/// whose fault exit code fails the assertion below.
 // cast_sign_loss: ExitStatus::code() returns i32; exit_reason is always
 // non-negative (voluntary codes < 0x1000). Casting to u64 is safe.
 #[allow(clippy::cast_sign_loss)]

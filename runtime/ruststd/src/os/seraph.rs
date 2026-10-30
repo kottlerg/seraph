@@ -843,6 +843,37 @@ pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
     pal_alloc::fund_aspace_pt_budget(self_aspace, region_pages)
 }
 
+/// Free slots of `self_cspace` a general capability allocation may still
+/// take without growing it: `CAP_INFO_CSPACE_CAPACITY` less
+/// `CAP_INFO_CSPACE_USED` and the IPC receive reserve
+/// (`CSPACE_IPC_RECV_RESERVE`). Zero when the queries fail. A service that
+/// holds headroom above a low-water mark compares this against the mark and
+/// calls [`fund_cspace_slot_budget`] when it falls below.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn cspace_slot_headroom(self_cspace: u32) -> u64 {
+    pal_alloc::cspace_general_headroom(self_cspace)
+}
+
+/// Fund `self_cspace`'s slot-page pool so at least `slots` general
+/// capability allocations succeed without further growth.
+///
+/// A `CSpace` keeps its last `CSPACE_IPC_RECV_RESERVE` free slots for IPC
+/// capability transfer, so general allocations (`cap_create_*`, `cap_copy`,
+/// `cap_derive`, splits, received grants that a handler then derives from)
+/// fail with `OutOfMemory` first. This helper measures the headroom above
+/// that reserve and, when it is short, requests Memory from memmgr and
+/// donates it to the pool via augment-mode `cap_create_cspace`. Call it
+/// before a known burst of cap acquisitions (a cache filling its slots) or
+/// periodically to hold headroom above a low-water mark.
+///
+/// `slots == 0` is a no-op success. Returns `false` if memmgr is
+/// unreachable, the request/augment fails, or the headroom still falls
+/// short after the funding rounds.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn fund_cspace_slot_budget(self_cspace: u32, slots: u64) -> bool {
+    pal_alloc::fund_cspace_slot_budget(self_cspace, slots)
+}
+
 // ── Page-reservation allocator ──────────────────────────────────────────────
 //
 // Re-exports from `crate::sys::reserve`. See that module for the per-process

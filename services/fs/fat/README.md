@@ -76,7 +76,7 @@ carry no rights (a parent with none of the file rights) is refused with
 ## Storage layout
 
 The driver's storage engine is a cluster allocator (`src/alloc.rs`), directory mutation
-(`src/dir.rs`), a 128-slot write-through page cache (`src/cache.rs`), a node table that dedupes by
+(`src/dir.rs`), a 256-slot write-through page cache (`src/cache.rs`), a node table that dedupes by
 on-disk slot (`src/backend.rs`), and a cooperative-release eviction worker (`src/eviction.rs`). Each
 component's behavior is specified in [docs/storage-layout.md](docs/storage-layout.md).
 

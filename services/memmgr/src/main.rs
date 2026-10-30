@@ -1820,6 +1820,69 @@ fn reply_label(ipc_buf: *mut u64, label: u64)
 
 // ── Main loop ────────────────────────────────────────────────────────────────
 
+/// General-allocation headroom of memmgr's own `CSpace` below which it tops
+/// the slot-page pool up from its own pool. Every grant splits a frame and
+/// derives an inner, each a slot, so a burst of requests draws slots fast;
+/// the mark covers a full reply's worth of grants many times over.
+const CSPACE_LOW_WATER: u64 = 256;
+
+/// Pool pages one top-up donates (`CSPACE_SLOTS_PER_PAGE` slots each).
+const CSPACE_TOPUP_PAGES: u32 = 16;
+
+/// Free slots of memmgr's `CSpace` a general allocation may take: capacity
+/// less populated slots less the IPC receive reserve.
+fn cspace_headroom(self_cspace: u32) -> u64
+{
+    let capacity =
+        syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_CAPACITY).unwrap_or(0);
+    let used =
+        syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_USED).unwrap_or(capacity);
+    capacity
+        .saturating_sub(used)
+        .saturating_sub(syscall_abi::CSPACE_IPC_RECV_RESERVE)
+}
+
+/// Keep memmgr's `CSpace` above [`CSPACE_LOW_WATER`] general slots by
+/// donating pool frames to its slot-page pool (augment-mode
+/// `cap_create_cspace`), so its own splits and derivations never meet an
+/// exhausted `CSpace` and its receives keep the IPC receive reserve
+/// (services/memmgr/docs/memory-pool.md § CSpace headroom). The donated
+/// pages leave the free pool for good, like the metadata arena's: they stay
+/// in `pool_total` as memmgr-owned metadata. memmgr cannot ask anyone else
+/// for this memory, which is why it funds itself from its own pool. A
+/// failed top-up (no contiguous run, or the augment refused) leaves the
+/// frame in the pool and is retried before the next receive.
+fn hold_cspace_headroom(self_cspace: u32)
+{
+    if cspace_headroom(self_cspace) >= CSPACE_LOW_WATER
+    {
+        return;
+    }
+    let pool = pool_mut();
+    let selected = select_memory_caps(pool, CSPACE_TOPUP_PAGES, true)
+        .or_else(|_| select_memory_caps(pool, 1, true));
+    let Ok((granted, _)) = selected
+    else
+    {
+        return;
+    };
+    let (outer, pages, phys) = granted[0];
+    if syscall::cap_create_cspace(outer, self_cspace, u64::from(pages)).is_ok()
+    {
+        // The donation holds its own reference on the frame's Memory object;
+        // the outer cap's slot is returned.
+        let _ = syscall::cap_delete(outer);
+    }
+    else
+    {
+        let _ = pool.push(FreeRun {
+            cap_slot: outer,
+            page_count: pages,
+            phys_base: phys,
+        });
+    }
+}
+
 fn ingest_pool(boot: &InitBootstrap)
 {
     let pool = pool_mut();
@@ -2050,6 +2113,7 @@ fn main(startup: &StartupInfo) -> !
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
     loop
     {
+        hold_cspace_headroom(startup.self_cspace);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let req = match unsafe { ipc::ipc_recv(boot.service_ep, ipc_buf) }
         {

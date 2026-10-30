@@ -2252,7 +2252,9 @@ fn dealloc_revoked(snapshot: &[Option<core::ptr::NonNull<crate::cap::object::Ker
 pub fn sys_cap_move(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::CSpaceKernelObject;
-    use crate::cap::transfer::{MoveStep, move_cap_begin, move_cap_drive, release_moved_object};
+    use crate::cap::transfer::{
+        MoveStep, Placement, move_cap_begin, move_cap_drive, release_moved_object,
+    };
 
     let src_handle = tf.arg(0) as u32;
     let src_idx = syscall::cap_handle_index(src_handle);
@@ -2314,7 +2316,7 @@ pub fn sys_cap_move(tf: UserFrame) -> Result<u64, SyscallError>
 
     let placement = match core::num::NonZeroU32::new(dest_idx)
     {
-        None => None,
+        None => Placement::Any,
         Some(idx) =>
         {
             // Pre-grow for the explicit destination before the heavyweight
@@ -2322,7 +2324,7 @@ pub fn sys_cap_move(tf: UserFrame) -> Result<u64, SyscallError>
             // pre_grow_for_explicit_slot), the destination wrapper pinned
             // across it by `dest_cs_slot`.
             pre_grow_for_explicit_slot(dest_cs_ptr, dest_idx)?;
-            Some(idx)
+            Placement::At(idx)
         }
     };
 

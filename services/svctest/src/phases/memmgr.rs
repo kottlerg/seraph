@@ -40,6 +40,10 @@ pub fn phases() -> &'static [Phase]
             name: "grant_retyped_unmappable",
             run: grant_retyped_unmappable_phase,
         },
+        Phase {
+            name: "cspace_slot_budget",
+            run: cspace_slot_budget_phase,
+        },
     ]
 }
 
@@ -293,6 +297,27 @@ pub fn grant_retyped_unmappable_phase(_: &Caps)
     // The donation holds its own reference on the grant's memory.
     syscall::cap_delete(grant).expect("cap_delete of grant");
     std::os::seraph::log!("retyped grant page refused by mem_map");
+}
+
+/// `std::os::seraph::fund_cspace_slot_budget` raises svctest's own `CSpace`
+/// headroom (free slots above the IPC receive reserve) to at least the asked
+/// count, funding the slot-page pool from memmgr: asking for two slot pages
+/// past the current headroom must succeed and leave at least that much.
+pub fn cspace_slot_budget_phase(_: &Caps)
+{
+    let info = startup_info();
+    let before = std::os::seraph::cspace_slot_headroom(info.self_cspace);
+    let want = before + 2 * syscall_abi::CSPACE_SLOTS_PER_PAGE;
+    assert!(
+        std::os::seraph::fund_cspace_slot_budget(info.self_cspace, want),
+        "fund_cspace_slot_budget({want}) failed from headroom {before}"
+    );
+    let after = std::os::seraph::cspace_slot_headroom(info.self_cspace);
+    assert!(
+        after >= want,
+        "CSpace headroom {after} after funding falls short of {want}"
+    );
+    std::os::seraph::log!("CSpace headroom funded {before} -> {after} (asked {want})");
 }
 
 /// One stray-cap flood case: a message memmgr refuses or answers with no

@@ -237,7 +237,7 @@ unsafe fn transfer_caps(
 ) -> Result<usize, SyscallError>
 {
     use crate::cap::transfer::{
-        CapMove, MoveStep, move_cap_begin, move_cap_drive, release_moved_object,
+        CapMove, MoveStep, Placement, move_cap_begin, move_cap_drive, release_moved_object,
     };
 
     let cap_count = src_handles.len().min(MSG_CAP_SLOTS_MAX);
@@ -296,7 +296,7 @@ unsafe fn transfer_caps(
     for (i, &src_handle) in src_handles[..cap_count].iter().enumerate()
     {
         // SAFETY: DERIVATION_LOCK and both CSpace locks held; pointers valid.
-        match unsafe { move_cap_begin(src_cspace, src_handle, dst_cspace, None) }
+        match unsafe { move_cap_begin(src_cspace, src_handle, dst_cspace, Placement::IpcTransfer) }
         {
             Ok(MoveStep::Done { handle, release }) =>
             {
@@ -756,11 +756,16 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // IPC state. A cap-transfer failure on either path degrades to zero-cap
     // delivery (the sender keeps its caps), so pre-growing the destination
     // here makes OOM unlikely on both the immediate-delivery path and the
-    // resumed-recv path (`deliver_call_caps`). `pre_allocate` reserves
-    // nothing and the CSpace lock is dropped before `endpoint_recv`, so
-    // slots consumed by a sibling thread sharing this CSpace force
-    // `transfer_caps`'s locked `pre_allocate` to grow again, and a failure
-    // of that grow fails the transfer, which degrades to zero-cap delivery.
+    // resumed-recv path (`deliver_call_caps`). General allocations never
+    // take the last `IPC_RECV_RESERVE` (= `MSG_CAP_SLOTS_MAX`) free slots
+    // (core/kernel/docs/capability-internals.md § IPC Receive Reserve), so
+    // this succeeds without growth on a CSpace whose general slots are
+    // exhausted; it fails only once received caps have taken the reserve
+    // and the pool cannot grow. The CSpace lock is dropped before
+    // `endpoint_recv`, so a sibling thread's transfer into this CSpace can
+    // take reserved slots meanwhile; `transfer_caps`'s locked
+    // `pre_allocate` then grows again, and a failure of that grow fails the
+    // transfer, which degrades to zero-cap delivery.
     // SAFETY: cspace_ptr validated above; lock_raw/unlock_raw paired.
     unsafe {
         let saved = (*cspace_ptr).lock.lock_raw();

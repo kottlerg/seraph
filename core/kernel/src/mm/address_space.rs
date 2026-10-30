@@ -1038,10 +1038,10 @@ impl AddressSpace
     ///
     /// Drives `SYS_MEM_UNMAP` with `MEM_UNMAP_RECLAIM_PTS` (memmgr region
     /// teardown). Unlike the per-page [`unmap_page`](Self::unmap_page), it tears
-    /// the whole span down under a single `pt_lock` hold and a single coarse TLB
-    /// + paging-structure-cache shootdown, plus one span invalidation under
-    /// `pt_lock` each time the cleared frames overflow the frame-map release
-    /// batch (core/kernel/docs/memory-internals.md § Frame Map Table).
+    /// the whole span down under a single `pt_lock` hold and a single coarse
+    /// TLB and paging-structure-cache shootdown, plus one span invalidation
+    /// under `pt_lock` each time the cleared frames overflow the frame-map
+    /// release batch (core/kernel/docs/memory-internals.md § Frame Map Table).
     ///
     /// `aso` MUST wrap *this* `AddressSpace`; `sys_mem_unmap` enforces this by
     /// resolving both from the same capability.

@@ -306,7 +306,16 @@ pub fn bootstrap_caps(
                     }
                 }
             }
-            other => std::os::seraph::log!("bootstrap: unknown endowment kind {other}"),
+            other =>
+            {
+                // A round of a kind svcmgr does not know: its caps have no
+                // role here, so release them rather than hold them.
+                std::os::seraph::log!("bootstrap: unknown endowment kind {other}");
+                for &cap in &round.caps[..round.cap_count]
+                {
+                    let _ = syscall::cap_delete(cap);
+                }
+            }
         }
         if round.done
         {

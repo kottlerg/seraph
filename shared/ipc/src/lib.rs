@@ -857,8 +857,9 @@ pub mod svcmgr_labels
     /// [`PUBLISH_ENDPOINT`] by an *external* publisher (no per-publisher
     /// identity in the low bits today — server-side auth is binary: have
     /// the bit, or don't). svcmgr publishes the well-known names it owns
-    /// (`rootfs.root`, `svcmgr`, the three `devmgr.*` names, and each
-    /// provider's `provides` names) directly into its own registry, so those
+    /// (`rootfs.root`, `svcmgr`, the three `devmgr.*` names, the two
+    /// `vfsd.*` names, and each provider's `provides` names) directly into
+    /// its own registry, so those
     /// need no badge. The gate exists for a future external publisher — devmgr
     /// holds a `PUBLISH_AUTHORITY`-badged SEND from its bootstrap bundle,
     /// reserved for driver registrations.
@@ -896,10 +897,11 @@ pub mod svcmgr_labels
 /// derivation, not the published name nor any consumer.
 ///
 /// A name whose cap carries authority is seed-only: `rootfs.root`, the
-/// three `devmgr.*` names, and each provider name whose badge carries a
-/// verb bit ([`crate::VERB_BIT_MASK`]; today `pwrmgr.shutdown`) resolve
-/// only through a recipe's `seed = ...` line, and `QUERY_ENDPOINT` answers
-/// them `UNKNOWN_NAME`. `svcmgr`, `pwrmgr.deny`, `timed`, and any name
+/// three `devmgr.*` names, [`published_names::VFSD_MOUNT`], and each provider
+/// name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
+/// `pwrmgr.shutdown`) resolve only through a recipe's `seed = ...` line, and
+/// `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`. [`published_names::VFSD_DENY`]
+/// carries no authority but is seed-only too, as svctest's test twin. `svcmgr`, `pwrmgr.deny`, `timed`, and any name
 /// published through [`svcmgr_labels::PUBLISH_ENDPOINT`] are public
 /// (services/svcmgr/docs/ipc-interface.md § Label 4).
 pub mod published_names

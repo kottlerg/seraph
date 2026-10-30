@@ -32,7 +32,7 @@ Four system-scope invariants govern the stack:
   corrupt another. `vfsd` spawns every fs driver.
 - **Block access is partition-scoped at the capability layer.** The
   block driver serves only badged callers: vfsd holds a
-  `MOUNT_AUTHORITY`-badged whole-disk cap minted by devmgr, and fs
+  `blk_labels::MOUNT_AUTHORITY`-badged whole-disk cap minted by devmgr, and fs
   drivers hold partition-identity-badged caps the block driver mints
   on `REGISTER_PARTITION`; unbadged callers are rejected. vfsd is the
   sole holder of the whole-disk cap: devmgr mints it on
@@ -65,7 +65,7 @@ kernel (phase 7) mints Mmio caps from BootInfo.mmio_apertures and the root IRQ r
   → init delegates Mmio + IRQ caps to devmgr
     → devmgr binds virtio-blk; delegates per-device MMIO + IRQ
       → devmgr creates the block service endpoint and hands it to virtio-blk at spawn
-        → vfsd queries devmgr's device registry → MOUNT_AUTHORITY-badged whole-disk SEND_GRANT
+        → vfsd queries devmgr's registry → blk_labels::MOUNT_AUTHORITY-badged whole-disk SEND_GRANT
           → vfsd issues REGISTER_PARTITION (whole-disk endpoint only)
             → virtio-blk mints a partition-badged SEND_GRANT and returns it in the reply
               → vfsd spawns fs driver; injects partition-scoped block cap
@@ -83,7 +83,7 @@ Distribution". Badge semantics, derivation, and revocation are owned by
 [`capability-model.md`](capability-model.md) §"Badges".
 
 `REGISTER_PARTITION` is rejected unless the caller's badge carries
-`MOUNT_AUTHORITY`: only the holder of the devmgr-minted whole-disk cap
+`blk_labels::MOUNT_AUTHORITY`: only the holder of the devmgr-minted whole-disk cap
 can mint a partition binding. vfsd is the only such holder: devmgr
 mints the whole-disk cap on `QUERY_BLOCK_DEVICE` only for a caller
 whose registry cap carries `BLOCK_DEVICE_AUTHORITY`, which init sets on
@@ -148,7 +148,7 @@ Three actors cooperate to bring a filesystem online:
 **init** holds the un-badged vfsd service endpoint it created plus a
 `SEED_AUTHORITY`-badged SEND derived from it (required by the
 `GET_SYSTEM_ROOT_CAP` gate). Init issues no `MOUNT` — vfsd
-self-mounts root; the `MOUNT_AUTHORITY`-badged SEND it endows svcmgr
+self-mounts root; the `vfsd_labels::MOUNT_AUTHORITY`-badged SEND it endows svcmgr
 with (published as `vfsd.mount`) reaches only svctest. Init pulls the system root via
 `GET_SYSTEM_ROOT_CAP` (which vfsd serves only once root is mounted, so
 the call blocks until the root filesystem is up), then distributes
@@ -197,7 +197,7 @@ by structure. See
 The contract between fs drivers and the block driver has three
 elements:
 
-- **Two-tier endpoint.** Whole-disk `MOUNT_AUTHORITY`-badged (vfsd
+- **Two-tier endpoint.** Whole-disk `blk_labels::MOUNT_AUTHORITY`-badged (vfsd
   only) versus
   per-partition badged (fs drivers); unbadged callers
   are rejected. The block driver distinguishes by the

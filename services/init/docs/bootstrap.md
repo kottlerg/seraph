@@ -188,6 +188,9 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     gating devmgr's test labels, the `TEST_SPAWN_ORPHAN` /
     `TEST_ORPHAN_RESULT` shim and `TEST_QUERY_DENY_DEVICE` (TODO(#165));
     svctest is the only recipe seeding it.
+  - `vfsd.mount` / `vfsd.deny` — the endowed `MOUNT_AUTHORITY`-badged and
+    `DENY_BADGE`-badged SENDs on vfsd's service endpoint, published as
+    they arrive; svctest is the only recipe seeding them.
   - `SET_DRIVERS_DIR` — svcmgr walks its universal root to
     `/services/drivers/` at `LOOKUP | READ` and hands devmgr the subtree
     cap on a `DRIVERS_DIR_AUTHORITY`-badged copy of the

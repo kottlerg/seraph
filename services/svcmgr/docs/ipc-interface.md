@@ -110,8 +110,8 @@ bind death-notification at endowment time — the matching `.svc`
 definition is paired at reconciliation, on
 [`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
 endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
-`svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`) into its own
-registry and installs devmgr's
+`svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`, `vfsd.mount`,
+`vfsd.deny`) into its own registry and installs devmgr's
 `/services/drivers/` cap via `SET_DRIVERS_DIR`, before entering the event
 loop.
 
@@ -203,8 +203,10 @@ freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint.
 
 Only public names resolve. A name whose cap carries authority is published
 seed-only and answers `UNKNOWN_NAME`, as an unknown name does: `rootfs.root`,
-the three `devmgr.*` names, and each provider name whose badge carries a verb
-bit (`ipc::VERB_BIT_MASK`; the `:auth` entries, today `pwrmgr.shutdown`). A
+the three `devmgr.*` names, `vfsd.mount`, and each provider name whose badge
+carries a verb bit (`ipc::VERB_BIT_MASK`; the `:auth` entries, today
+`pwrmgr.shutdown`). `vfsd.deny` carries no authority but is seed-only too: it
+is svctest's test twin, reached only through svctest's recipe. A
 seed-only name reaches a process only through a recipe's `seed = ...` line,
 which svcmgr resolves itself, so its authority stays with the recipes that
 seed it ([service-definitions.md § `seed`](service-definitions.md#seed)). The
@@ -234,7 +236,8 @@ through [`PUBLISH_ENDPOINT`](#label-3-publish_endpoint).
 `svcmgr_labels::PUBLISH_AUTHORITY` is a verb-bit (the top bit of the
 caller's cap badge) gating `PUBLISH_ENDPOINT` for *external* publishers.
 svcmgr publishes the well-known names it owns (`rootfs.root`, `svcmgr`,
-the three `devmgr.*` names, and each provider's `provides` names) directly into
+the three `devmgr.*` names, the two `vfsd.*` names, and each provider's
+`provides` names) directly into
 its own registry, so those need no badge. The gate exists for a future
 external publisher — devmgr holds a `PUBLISH_AUTHORITY`-badged SEND from
 its bootstrap bundle, reserved for driver registrations. The SEND

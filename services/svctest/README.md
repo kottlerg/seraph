@@ -106,7 +106,7 @@ the front, from the back, and from both ends at once, and env carries `SERAPH_TE
 ## Capabilities
 
 The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, the
-fifth in a second round;
+fifth and sixth in a second round;
 [service-definitions.md § `seed`](../svcmgr/docs/service-definitions.md#seed) defines each
 name's cap shape and the zero slot an unresolved name leaves. With no creator endpoint, every
 slot stays zero.

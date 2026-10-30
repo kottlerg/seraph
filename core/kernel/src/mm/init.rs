@@ -100,8 +100,10 @@ pub fn system_ram_bytes() -> u64
 
 /// Lowest and highest DRAM addresses (`compute_dram_bounds`), captured by
 /// [`print_memory_map`]. Read once at Phase 4 to size the frame map table.
-static DRAM_BOUNDS: [core::sync::atomic::AtomicU64; 2] =
-    [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)];
+static DRAM_BOUNDS: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
 
 /// The `[bottom, top)` span of DRAM-typed memory-map entries, `(0, 0)` until
 /// [`print_memory_map`] runs at early boot or when the map holds no DRAM.

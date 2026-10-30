@@ -1078,11 +1078,15 @@ pub unsafe fn for_each_user_leaf(root_virt: u64, on_leaf: &mut dyn FnMut(u64))
         }
         // SAFETY: a present PML4E points at a live PDPT frame.
         let pdpt = unsafe { table_at(phys_to_virt(e4.phys_addr())) };
-        for e3 in pdpt.iter().filter(|e| e.is_present() && e.0 & LARGE_PAGE == 0)
+        for e3 in pdpt
+            .iter()
+            .filter(|e| e.is_present() && e.0 & LARGE_PAGE == 0)
         {
             // SAFETY: a present non-large PDPTE points at a live PD frame.
             let pd = unsafe { table_at(phys_to_virt(e3.phys_addr())) };
-            for e2 in pd.iter().filter(|e| e.is_present() && e.0 & LARGE_PAGE == 0)
+            for e2 in pd
+                .iter()
+                .filter(|e| e.is_present() && e.0 & LARGE_PAGE == 0)
             {
                 // SAFETY: a present non-large PDE points at a live PT frame.
                 let pt = unsafe { table_at(phys_to_virt(e2.phys_addr())) };

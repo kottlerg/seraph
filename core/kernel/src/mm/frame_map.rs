@@ -336,7 +336,10 @@ mod tests
         map.raise(frame).unwrap();
         map.lower(frame);
         assert!(map.any_mapped(frame, P));
-        assert!(map.any_mapped(frame - 3 * P, 4 * P), "a range reaching the frame");
+        assert!(
+            map.any_mapped(frame - 3 * P, 4 * P),
+            "a range reaching the frame"
+        );
         assert!(!map.any_mapped(frame + P, 8 * P), "a range past the frame");
         map.lower(frame);
         assert!(!map.any_mapped(frame, P));
@@ -358,7 +361,9 @@ mod tests
     {
         let map = table_with_gib_one();
         let frame = 1 << 30;
-        map.counter(frame).unwrap().store(u32::MAX, Ordering::SeqCst);
+        map.counter(frame)
+            .unwrap()
+            .store(u32::MAX, Ordering::SeqCst);
         assert_eq!(map.raise(frame), Err(()));
         assert_eq!(map.counter(frame).unwrap().load(Ordering::SeqCst), u32::MAX);
     }
@@ -397,7 +402,10 @@ mod tests
             assert!(batch.push((1 << 30) + 2 * i * P));
         }
         let last = (1 << 30) + 2 * (RELEASE_RUNS as u64 - 1) * P;
-        assert!(batch.push(last + P), "extending the last run needs no new run");
+        assert!(
+            batch.push(last + P),
+            "extending the last run needs no new run"
+        );
         assert!(!batch.push(last + 3 * P));
     }
 }

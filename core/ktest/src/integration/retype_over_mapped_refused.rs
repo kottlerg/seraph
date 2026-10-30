@@ -193,9 +193,8 @@ fn teardown_releases_frames(ctx: &TestContext, grant: u32) -> TestResult
         .map_err(|_| "integration::retype_over_mapped_refused: cap_create_aspace failed")?;
     // SAFETY: `aspace` is an address space this test created, which runs
     // nothing of ktest's.
-    let refused = unsafe { map_one(grant, aspace, OTHER_AS_VA, 0) }.and_then(|()| {
-        expect_refused(grant)
-    });
+    let refused =
+        unsafe { map_one(grant, aspace, OTHER_AS_VA, 0) }.and_then(|()| expect_refused(grant));
     // Destroying the address space drops its leaves without an unmap.
     cap_delete(aspace)
         .map_err(|_| "integration::retype_over_mapped_refused: cap_delete(aspace) failed")?;

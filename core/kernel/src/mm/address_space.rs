@@ -685,9 +685,7 @@ impl AddressSpace
         aso: &crate::cap::object::AddressSpaceObject,
     ) -> Result<(), ()>
     {
-        use crate::arch::current::paging::{
-            flush_page, map_user_page_pooled, translate_user_page,
-        };
+        use crate::arch::current::paging::{flush_page, map_user_page_pooled, translate_user_page};
 
         // Count the new leaf before it is installed, as `map_page` does.
         crate::mm::frame_map::raise(phys)?;

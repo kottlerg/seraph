@@ -20,10 +20,15 @@
 //! **Checked CPUs.** Every CPU up to [`EVERY_CPU_MAX`]; past it, the first
 //! [`LOW_CPUS`] (the BSP and the first APs) and [`SAMPLED_CPUS`] spread evenly
 //! over the rest, the last CPU among them. Every AP sets the bit through the
-//! same `init_ap` call, so a per-CPU miss is a bring-up-path defect the BSP/AP
-//! split and the two ends of the index range expose; checking all 512 CPUs
-//! at the `MAX_CPUS` boundary costs minutes of oversubscribed scheduling for
-//! no path the sample misses.
+//! same call in `arch::x86_64::interrupts::init_ap`, so a per-CPU miss is a
+//! bring-up-path defect the BSP/AP split and the two ends of the index range
+//! expose; checking every CPU at the `MAX_CPUS` boundary costs minutes of
+//! oversubscribed scheduling for no path the sample misses.
+//!
+//! **What counts as the fault.** A `FAULT_EXC_PROTECTION` message whose error
+//! code is 0 and whose faulting IP is the read itself: the child records the
+//! read's address in [`READ_IP`] before executing it, as the UMIP `#GP` is the
+//! only protection fault that reports that IP with a zero error code there.
 //!
 //! **No fault dump.** A fault the kernel kills a thread for prints a register
 //! dump to the serial console, which at boundary widths costs over a second
@@ -38,6 +43,8 @@
 //! Classification): the case SKIPs, naming the reason, where
 //! `CPUID.(EAX=07H,ECX=0):ECX[2]` is clear. CPUID executes at CPL 3, so the
 //! check reads the same bit the kernel gates on.
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use ipc::IpcMessage;
 use syscall::{cap_create_endpoint, cap_delete, thread_read_regs, thread_write_regs};
@@ -75,6 +82,10 @@ const READ_IDTR: u64 = 0;
 
 /// Child argument selecting `SGDT`.
 const READ_GDTR: u64 = 1;
+
+/// Address of the read the child is about to execute, written by the child
+/// before the read and compared with the fault message's IP by the handler.
+static READ_IP: AtomicU64 = AtomicU64::new(0);
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
@@ -119,7 +130,8 @@ fn checked_cpu(k: u32, cpus: u32) -> u32
 
 /// Run one child, pinned to `cpu` with this thread as its fault handler on
 /// `ep`, that executes the read `which` selects; check the read is delivered
-/// as a `#GP`, then resume the child at [`exit_entry`] and check it exits
+/// as a `#GP` at the read with error code 0, then resume the child at
+/// [`exit_entry`] and check it exits
 /// voluntarily. The child's caps are deleted on every path (the `SpawnedChild`
 /// guard).
 fn expect_gp(ctx: &TestContext, ep: u32, which: u64, cpu: u32) -> TestResult
@@ -129,6 +141,8 @@ fn expect_gp(ctx: &TestContext, ep: u32, which: u64, cpu: u32) -> TestResult
     crate::bind_fault_handler(child.th, ep, FAULT_BADGE)
         .map_err(|_| "integration::umip_descriptor_reads_fault: thread_set_fault_handler failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // The previous child's read address must not stand in for this one's.
+    READ_IP.store(0, Ordering::Release);
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`, on which
     // no other live thread runs (`ChildStack`'s rule): the previous child has
     // exited and its Thread cap has been deleted before the next starts.
@@ -158,6 +172,11 @@ fn expect_gp(ctx: &TestContext, ep: u32, which: u64, cpu: u32) -> TestResult
         }
         _ => return Err("integration::umip_descriptor_reads_fault: unexpected exception class"),
     }
+    let read_ip = READ_IP.load(Ordering::Acquire);
+    if msg.word(2) != 0 || read_ip == 0 || msg.word(3) != read_ip
+    {
+        return Err("integration::umip_descriptor_reads_fault: #GP is not the read's (IP or code)");
+    }
 
     let mut regs = [0u8; BUF];
     thread_read_regs(child.th, &mut regs[..BUF])
@@ -179,7 +198,9 @@ fn expect_gp(ctx: &TestContext, ep: u32, which: u64, cpu: u32) -> TestResult
     child.delete_cspace().ok();
     if reason != EXIT_VOLUNTARY
     {
-        return Err("integration::umip_descriptor_reads_fault: resumed child did not exit");
+        return Err(
+            "integration::umip_descriptor_reads_fault: resumed child did not exit voluntarily",
+        );
     }
     Ok(())
 }
@@ -192,22 +213,40 @@ extern "C" fn reader(which: u64) -> !
 {
     let mut descriptor = [0u8; 10];
     let dst = descriptor.as_mut_ptr();
+    let slot = READ_IP.as_ptr();
     if which == READ_IDTR
     {
-        // SAFETY: `sidt` stores the 10-byte IDTR to `[dst]`, the stack buffer
-        // above, and touches no register or flag; under UMIP it raises #GP and
-        // stores nothing.
+        // SAFETY: `lea` and the `READ_IP` store use the scratch register `t`
+        // and write only the `READ_IP` atomic; `sidt` then stores the 10-byte
+        // IDTR to `[dst]`, the stack buffer above. No other register or flag
+        // is touched; under UMIP the `sidt` raises #GP and stores nothing.
         unsafe {
-            core::arch::asm!("sidt [{dst}]", dst = in(reg) dst, options(nostack, preserves_flags));
+            core::arch::asm!(
+                "lea {t}, [rip + 2f]",
+                "mov qword ptr [{slot}], {t}",
+                "2:",
+                "sidt [{dst}]",
+                t = out(reg) _,
+                slot = in(reg) slot,
+                dst = in(reg) dst,
+                options(nostack, preserves_flags),
+            );
         }
     }
     else
     {
-        // SAFETY: `sgdt` stores the 10-byte GDTR to `[dst]`, the stack buffer
-        // above, and touches no register or flag; under UMIP it raises #GP and
-        // stores nothing.
+        // SAFETY: as for the `sidt` arm, with `sgdt` storing the 10-byte GDTR.
         unsafe {
-            core::arch::asm!("sgdt [{dst}]", dst = in(reg) dst, options(nostack, preserves_flags));
+            core::arch::asm!(
+                "lea {t}, [rip + 2f]",
+                "mov qword ptr [{slot}], {t}",
+                "2:",
+                "sgdt [{dst}]",
+                t = out(reg) _,
+                slot = in(reg) slot,
+                dst = in(reg) dst,
+                options(nostack, preserves_flags),
+            );
         }
     }
     crate::arch::illegal_instruction()

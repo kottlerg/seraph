@@ -767,8 +767,10 @@ pub mod svcmgr_labels
     /// attaches a freshly derived SEND cap on success. On failure it carries
     /// no cap and returns `svcmgr_errors::INVALID_NAME` if `name_len` is 0
     /// or exceeds `registry::NAME_MAX`; `svcmgr_errors::UNKNOWN_NAME` on
-    /// miss and for a seed-only name (one whose cap carries authority, which
-    /// reaches only the recipes seeding it; see [`crate::published_names`]);
+    /// miss and for a seed-only name (one whose cap carries authority, or
+    /// [`crate::published_names::VFSD_DENY`], svctest's test twin, which
+    /// carries none; a seed-only name reaches only the recipes seeding it;
+    /// see [`crate::published_names`]);
     /// or `svcmgr_errors::INSUFFICIENT_CAPS` if svcmgr cannot derive a SEND
     /// from the published endpoint, in which case it drops the entry, so a
     /// later query of the name gets `UNKNOWN_NAME`.

@@ -54,7 +54,7 @@ fn main()
     }
 
     // Parent run only (a matching role above never returns), and before the
-    // bootstrap round, so a failure there also logs the fail marker.
+    // bootstrap rounds, so a failure there also logs the fail marker.
     runner::install_failure_hooks();
 
     let caps = bootstrap::request();

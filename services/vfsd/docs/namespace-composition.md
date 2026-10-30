@@ -27,8 +27,8 @@ The cap-as-namespace model is defined by
 
 ## Synthetic root state
 
-`VfsdRootBackend` owns a single fixed-capacity tree of
-`TreeNode`s. Each node carries:
+`VfsdRootBackend` owns a single tree of `TreeNode`s that grows on
+vfsd's heap. Each node carries:
 
 | Field | Purpose |
 |---|---|
@@ -37,11 +37,18 @@ The cap-as-namespace model is defined by
 | `terminal_endpoint` | *Unbadged* SEND on the underlying driver's namespace endpoint, set on a node that is itself a mount point; zero on a synthetic intermediate. Each crossing `NS_LOOKUP` mints a fresh attenuated badged SEND from it |
 | `fallthrough_cap` | Badged SEND on the root mount's namespace endpoint addressing the directory at this node's path in the root filesystem; zero if no such fall-through is available |
 
-The synthetic root is `NodeId::ROOT` (pool index 0) and is always
-active; its `fallthrough_cap` carries the root mount cap captured
-when `MOUNT path="/"` succeeds. `MAX_TREE_NODES` is `32` and
-`MAX_ENTRY_NAME` is `64` bytes; both are public constants of the
-`vfsd-root-backend` crate
+The synthetic root is `NodeId::ROOT` (pool index 0) and always
+exists; its `fallthrough_cap` carries the root mount cap captured
+when `MOUNT path="/"` succeeds. An install adds one node per path
+component not yet in the tree, and nodes are never freed (there is no
+unmount), so a node's pool index is its `NodeId` for the life of vfsd.
+No fixed count bounds the tree; an install that cannot allocate its
+nodes is refused and leaves the tree unchanged. A component follows the
+namespace protocol's name rule (`namespace_protocol::validate_name`, at
+most `MAX_NAME_LEN`, 255 bytes), and a `MOUNT` path is bounded only by
+the bytes the request carries (`MAX_MOUNT_PATH_LEN`; see
+[`vfs-ipc-interface.md`](vfs-ipc-interface.md#label-10-mount)). The tree
+is the `vfsd-root-backend` crate
 ([`services/vfsd/root-backend/src/lib.rs`](../root-backend/src/lib.rs)).
 
 Multi-component mount paths install through the tree by walking
@@ -174,17 +181,19 @@ its siblings — is not supported by this scheme.
 vfsd holds two un-badged endpoints:
 
 - **Service endpoint** — `MOUNT` and `GET_SYSTEM_ROOT_CAP`.
-  Multi-threaded recv (4 handlers today) so
-  that a handler blocked on a worker pool order does not deadlock
-  the system: `CREATE_FROM_FILE` for a fatfs respawn re-enters
-  vfsd's namespace dispatcher (procmgr issues `FS_READ` against the
-  caller-supplied file cap, which lands on a vfs node), which must
-  remain serviceable while a service-thread is awaiting the mount
-  transaction.
+  Multi-threaded recv (`SERVICE_THREAD_COUNT` handlers) so that
+  independent requests proceed while one handler waits on a fatfs
+  spawn. The count is a concurrency knob, not a correctness bound: no
+  service-endpoint request waits on another, since what a `MOUNT`
+  handler blocks on (the worker pool, procmgr's `CREATE_FROM_FILE`,
+  whose `FS_READ`s go to the fs driver that minted the file cap, the
+  `/services/fs/fatfs` walk the namespace dispatcher serves, and the
+  `FS_MOUNT` probe) never calls the service endpoint. A request past
+  the last free handler waits in the endpoint queue.
 - **Namespace endpoint** — `NS_LOOKUP`, `NS_STAT`, `NS_READDIR`.
   Single dispatcher thread; the `NamespaceBackend` methods are
-  bounded by `MAX_TREE_NODES` and the only blocking call is the
-  optional fall-through `ipc_call`. The same endpoint is the
+  in-memory walks of one node's children or ancestors, and the only
+  blocking call is the optional fall-through `ipc_call`. The same endpoint is the
   kernel-derivation parent for every system-root cap vfsd ever
   issues via `cap_derive_badge` (the synthetic root cap, plus a
   fresh cap per synthetic intermediate descent).

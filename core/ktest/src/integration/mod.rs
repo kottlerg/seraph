@@ -40,8 +40,8 @@ pub mod priority_preemption;
 pub mod queued_waiters_fifo;
 pub mod range_copy_lineage;
 pub mod reply_binding_displaced;
+pub mod retype_over_mapped_refused;
 pub mod retype_reclaim;
-pub mod retype_subpage_clobber;
 pub mod shared_memory_two_aspaces;
 pub mod stop_read_regs_remote;
 pub mod thread_lifecycle;
@@ -125,16 +125,16 @@ pub fn run_all(ctx: &TestContext)
         mem_map_retyped_refused::run(ctx)
     );
     run_integration_test!(
+        "integration::retype_over_mapped_refused",
+        retype_over_mapped_refused::run(ctx)
+    );
+    run_integration_test!(
         "integration::mmio_revoke_unmaps",
         mmio_revoke_unmaps::run(ctx)
     );
     run_integration_test!(
         "integration::range_copy_lineage",
         range_copy_lineage::run(ctx)
-    );
-    run_integration_test!(
-        "integration::retype_subpage_clobber",
-        retype_subpage_clobber::run(ctx)
     );
     run_integration_test!(
         "integration::priority_preemption",

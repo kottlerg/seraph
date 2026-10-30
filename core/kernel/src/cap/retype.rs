@@ -557,7 +557,9 @@ unsafe fn carve_page_into_bin(
 /// Returns `Err(SyscallError::OutOfMemory)` if the cap doesn't have enough
 /// room: `available_bytes` is below the rounded size, or no path above can
 /// place it (free bytes held only in the other sub-page bin, or only in
-/// sub-page slots for a page-aligned request, stay unusable). A carve is
+/// sub-page slots for a page-aligned request, stay unusable), or when the
+/// bump frontier would advance over a page some address space maps
+/// (`crate::mm::frame_map`), in which case nothing changes. A carve is
 /// permanent while the cap holds a live object (the drain reset alone undoes
 /// it, and SEED never drains), so carving trades page blocks for sub-page
 /// capacity: on SEED, sustained sub-page demand can leave too few contiguous
@@ -653,6 +655,25 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
         return carved.ok_or(SyscallError::OutOfMemory);
     }
 
+    // Retype/map boundary (docs/capability-model.md § Typed Memory): publish
+    // the new cursor, then refuse if any frame the advance covers is mapped.
+    // A concurrent `sys_mem_map` pins its frames before it reads the cursor,
+    // so with the fences on both sides one of the two sees the other
+    // (core/kernel/docs/memory-internals.md § Frame Map Table). The free-list
+    // paths above need no check: their bytes lie below the cursor, which no
+    // mapping can reach once the cursor has passed them. A refusal restores
+    // the cursor before anything else changes, leaving the ledger, the free
+    // lists, and the cap's bytes as they were.
+    alloc.bump_offset.store(new_bump, Ordering::SeqCst);
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let advance_start = bump & !(PAGE_SIZE as u64 - 1);
+    if crate::mm::frame_map::any_mapped(memory.base + advance_start, new_bump - advance_start)
+    {
+        alloc.bump_offset.store(bump, Ordering::Release);
+        alloc.unlock();
+        return Err(SyscallError::OutOfMemory);
+    }
+
     // Debit only the bytes the caller is consuming. The alignment pad is
     // retained as future-reusable sub-page slots, NOT charged to the cap
     // ledger. This matters when a sub-page bump is followed by a page-aligned
@@ -662,6 +683,7 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
     if prev_avail < need
     {
         memory.available_bytes.fetch_add(need, Ordering::Release);
+        alloc.bump_offset.store(bump, Ordering::Release);
         alloc.unlock();
         return Err(SyscallError::OutOfMemory);
     }
@@ -690,7 +712,6 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
         // every rollback target is), so the pad divides exactly into bins.
     }
 
-    alloc.bump_offset.store(new_bump, Ordering::Release);
     alloc.unlock();
 
     Ok(aligned_bump)
@@ -1324,6 +1345,28 @@ mod tests
             lock: core::sync::atomic::AtomicU32::new(0),
         };
         (buf, memory)
+    }
+
+    #[test]
+    fn a_clobbered_sub_page_successor_link_is_dropped_not_followed()
+    {
+        // A freed slot's link cell lives in the cap's bytes. No mapping can
+        // reach them (the retype/map boundary), so the guard is defence in
+        // depth: a corrupt successor truncates the list, and the valid head is
+        // still served, without the poison ever being dereferenced.
+        let (_buf, memory) = host_region(1);
+        let a = retype_allocate(&memory, 96).unwrap();
+        let b = retype_allocate(&memory, 96).unwrap();
+        assert_eq!((a, b), (0, BIN_128));
+        retype_free(&memory, a, 96);
+        // SAFETY: offset 0 is the freed slot's link cell in the live buffer.
+        unsafe { write_u64_at(memory.base, 0, 0x3F_FFFF_D048) };
+        assert_eq!(retype_allocate(&memory, 96), Ok(0));
+        assert_eq!(
+            retype_allocate(&memory, 96),
+            Ok(2 * BIN_128),
+            "the truncated list falls through to the bump frontier"
+        );
     }
 
     #[test]

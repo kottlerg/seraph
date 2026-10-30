@@ -110,8 +110,8 @@ yet implemented ([#540](https://github.com/kottlerg/seraph/issues/540); see [pro
 Init reap](../../docs/process-lifecycle.md#init-reap)); and, as an accepted cost, the kernel-direct
 page-table nodes behind init's bootstrap mappings stay consumed (see [memory-internals.md § Page
 Table Node Ownership](../../core/kernel/docs/memory-internals.md#page-table-node-ownership)). On
-riscv64 init's AddressSpace is a third residue: init's boot UART Mmio capability, held in that
-pinned CSpace, records a mapping into it and keeps it allocated (see process-lifecycle.md § Init
+riscv64 init-logd deletes init's boot UART Mmio capability as it exits, so that capability's mapping
+record no longer holds init's AddressSpace and the reap frees it (see process-lifecycle.md § Init
 reap). Implementation in [`src/init_reap.rs`](src/init_reap.rs). The two-thread, death-driven reap
 model is in [docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Init reap; the hold when
 a handover never completes is in

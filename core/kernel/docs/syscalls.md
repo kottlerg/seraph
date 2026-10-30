@@ -559,6 +559,15 @@ Format.
 
 ## Capability Syscalls
 
+Every `SYS_CAP_CREATE_*` call below, in create-mode and in augment-mode, carves the new object's
+bytes from `memory_cap`'s region, and never from a page that some address space maps: a carve
+whose bytes would advance the region's retype bump cursor over a page any user mapping still
+names fails with `OutOfMemory` and changes nothing (the region's available bytes, retype cursor,
+and free lists are as before the call). The page becomes retypable once every mapping of it is
+gone, by `SYS_MEM_UNMAP` or by the destruction of the address space that maps it (see
+[docs/capability-model.md § Typed Memory](../../../docs/capability-model.md#typed-memory)). Each
+call's `OutOfMemory` for its Memory cap region covers this refusal.
+
 ### `SYS_CAP_CREATE_ENDPOINT` (7)
 
 Retype a Memory capability into a new IPC endpoint. Returns a capability with
@@ -995,7 +1004,10 @@ This fails with `WxViolation` if the memory cap has both WRITE and EXECUTE right
 The mapping may not reach bytes the memory cap has retyped into kernel objects: the range must
 start at or above the cap's retype bump cursor rounded up to a page, the bound `SYS_MEMORY_SPLIT`
 applies to its split offset (see
-[docs/capability-model.md § Typed Memory](../../../docs/capability-model.md#typed-memory)).
+[docs/capability-model.md § Typed Memory](../../../docs/capability-model.md#typed-memory)). While
+the mapping lives, no retype carves its pages (see [Capability Syscalls](#capability-syscalls)).
+A call that races a retype advancing the cursor over the requested range may fail with
+`InvalidArgument` even when that retype is itself refused.
 
 **Capability requirements:** `memory_cap` (Map), `aspace_cap` (Map).
 
@@ -1005,7 +1017,7 @@ range leaves the user half), `InvalidArgument` (zero page count, size/offset ove
 below the page-rounded retype bump cursor),
 `InvalidCapability`, `InsufficientRights` (requested prot
 exceeds cap rights), `WxViolation` (both WRITE and EXECUTE requested), `OutOfMemory`
-(page table allocation failure).
+(page table allocation failure, or a frame already named by `u32::MAX` user mappings).
 
 ---
 

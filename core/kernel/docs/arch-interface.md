@@ -174,14 +174,22 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64);
 /// free each intermediate table the span leaves empty back to `aso`'s pool —
 /// only a table whose parent entry carries the pooled-table bit the pooled map
 /// path set when it installed the table (core/kernel/docs/memory-internals.md
-/// § Page Table Node Ownership). Returns the number of tables freed.
+/// § Page Table Node Ownership). Returns the number of tables freed, and passes
+/// the frame of each present leaf it clears to `on_leaf`, in VA order.
 /// The caller holds the address space's `pt_lock` and performs the shootdown.
 pub unsafe fn unmap_user_region_pooled(
     root_virt: u64,
     virt_base: u64,
     page_count: usize,
     aso: &AddressSpaceObject,
+    on_leaf: &mut dyn FnMut(u64),
 ) -> usize;
+
+/// Pass the frame of every present 4 KiB leaf in the user half of the page
+/// table rooted at `root_virt` to `on_leaf`, changing nothing; drives the
+/// frame-map release of an address space's teardown
+/// (core/kernel/docs/memory-internals.md § Frame Map Table).
+pub unsafe fn for_each_user_leaf(root_virt: u64, on_leaf: &mut dyn FnMut(u64));
 
 /// Walk the user tables and return `(phys, flags_word)` mapped at `virt`, or
 /// None if unmapped. RISC-V decodes Svnapot 64 KiB group members internally,

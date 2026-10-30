@@ -37,6 +37,11 @@ pub fn serial_init(info: &InitInfo, thread_cap: u32)
     }
 }
 
+/// Release init's serial mapping: a no-op on x86-64, where COM1 is reached
+/// through I/O ports bound to the writing thread, not a mapping that would
+/// hold init's address space live past its reap.
+pub fn serial_release() {}
+
 /// Write one byte to COM1, spinning until the transmit register is ready.
 pub fn serial_write_byte(byte: u8)
 {

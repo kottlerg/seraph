@@ -5,6 +5,8 @@
 
 //! RISC-V serial output via 16550 UART MMIO and architecture constants.
 
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 use init_protocol::{CapType, InitInfo};
 
 /// ELF machine type for RISC-V.
@@ -12,7 +14,14 @@ pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_RISCV;
 
 const UART_PHYS: u64 = 0x1000_0000;
 const SERIAL_VA: u64 = 0x0000_0000_3000_0000;
-static mut UART_BASE: u64 = 0;
+/// The UART's virtual address once `serial_init` has mapped and programmed
+/// it; 0 before that and after `serial_release`. Published with Release after
+/// the programming, so a thread that loads it with Acquire sees the device
+/// set up.
+static UART_BASE: AtomicU64 = AtomicU64::new(0);
+/// The Mmio cap slot `serial_init` mapped the UART aperture through; 0 until
+/// it maps one and after `serial_release` takes it.
+static UART_MMIO_CAP: AtomicU32 = AtomicU32::new(0);
 
 /// Initialise UART serial output via MMIO.
 ///
@@ -57,10 +66,11 @@ pub fn serial_init(info: &InitInfo, _thread_cap: u32)
     }
     let uart_offset = UART_PHYS - base;
     let uart_va = SERIAL_VA + uart_offset;
-    // SAFETY: single-threaded init; UART MMIO programming. The full
-    // aperture is mapped at SERIAL_VA; UART sits at uart_offset inside it.
+    UART_MMIO_CAP.store(slot, Ordering::Release);
+    // SAFETY: UART MMIO programming before any other thread exists (init-logd
+    // starts later). The full aperture is mapped at SERIAL_VA; UART sits at
+    // uart_offset inside it.
     unsafe {
-        UART_BASE = uart_va;
         let ptr = uart_va as *mut u8;
         core::ptr::write_volatile(ptr.add(1), 0x00);
         core::ptr::write_volatile(ptr.add(3), 0x80);
@@ -68,21 +78,41 @@ pub fn serial_init(info: &InitInfo, _thread_cap: u32)
         core::ptr::write_volatile(ptr.add(1), 0x00);
         core::ptr::write_volatile(ptr.add(3), 0x03);
     }
+    UART_BASE.store(uart_va, Ordering::Release);
+}
+
+/// Release init's serial mapping: delete the Mmio cap `serial_init` mapped the
+/// UART aperture through, which unmaps it and drops the reference its mapping
+/// record holds on init's address space, so the reap's delete of that address
+/// space frees it and its mappings of the frames init donates
+/// (`docs/process-lifecycle.md` § Init reap). Later serial writes are dropped.
+///
+/// Called by init-logd as it exits after the handover, when no thread of init
+/// writes the UART again: the main thread logs through init-logd once it runs.
+pub fn serial_release()
+{
+    UART_BASE.store(0, Ordering::Release);
+    let slot = UART_MMIO_CAP.swap(0, Ordering::AcqRel);
+    if slot != 0
+    {
+        let _ = syscall::cap_delete(slot);
+    }
 }
 
 /// Write one byte to the UART, spinning until the transmit register is ready.
 pub fn serial_write_byte(byte: u8)
 {
-    // SAFETY: single-threaded init; reading the static set during serial_init().
-    let base = unsafe { UART_BASE };
+    let base = UART_BASE.load(Ordering::Acquire);
     if base == 0
     {
         return;
     }
     let p = base as *mut u8;
-    // SAFETY: UART MMIO region is mapped at UART_BASE; reading LSR is safe.
+    // SAFETY: a nonzero UART_BASE names the UART inside the aperture
+    // serial_init mapped, which stays mapped until serial_release, run by the
+    // last writer as it exits; reading LSR is side-effect free.
     while unsafe { core::ptr::read_volatile(p.add(5)) } & 0x20 == 0
     {}
-    // SAFETY: UART MMIO region is mapped at UART_BASE; writing data register.
+    // SAFETY: as above; writing the data register.
     unsafe { core::ptr::write_volatile(p, byte) };
 }

@@ -9,7 +9,8 @@
 //! with the bootloader-specific responsibilities:
 //!
 //! - Allocate physical pages via UEFI for each `PT_LOAD` segment, copy
-//!   file data in, and zero the BSS tail.
+//!   file data in, and zero the BSS tail (for init, the whole allocation,
+//!   zeroed before the copy).
 //! - For the kernel: allocate one contiguous span through the arch hook
 //!   `arch::current::allocate_kernel_span` (any free physical base on
 //!   riscv64, wholly below 4 GiB on x86-64) and place each segment at its
@@ -524,6 +525,15 @@ pub unsafe fn load_init(
         // SAFETY: `bs` is valid per the caller's contract.
         let phys_base = unsafe { crate::uefi::allocate_pages(bs, page_count)? };
 
+        // Zero the whole allocation before the copy: `AllocatePages` returns
+        // frames with prior contents, and the segment's Memory cap, donated to
+        // userspace at init's reap, covers every page, including the slack
+        // before the in-page offset and past `p_memsz`. This also zeroes the
+        // BSS tail `[p_filesz, p_memsz)`.
+        // SAFETY: `phys_base` is a fresh, identity-mapped allocation of
+        // `page_count` pages.
+        unsafe { core::ptr::write_bytes(phys_base as *mut u8, 0, page_count * 4096) };
+
         // Copy file data at the correct in-page offset.
         // p_offset and p_filesz → usize: 64-bit targets only; cast is exact.
         #[allow(clippy::cast_possible_truncation)]
@@ -541,17 +551,6 @@ pub unsafe fn load_init(
             // page_count * 4096 ≥ in_page_off + file_sz). `src` is within
             // `data`, validated by `elf::load_segments`. Regions are disjoint.
             unsafe { core::ptr::copy_nonoverlapping(src, dst, file_sz) };
-        }
-
-        // Zero BSS tail (bytes [file_sz, memsz) relative to virt_addr).
-        // Difference fits in usize: memsz ≤ allocated region; 64-bit only.
-        #[allow(clippy::cast_possible_truncation)]
-        let bss_sz = (seg.memsz - seg.filesz) as usize;
-        if bss_sz > 0
-        {
-            let bss_ptr = (phys_base + in_page_off as u64 + seg.filesz) as *mut u8;
-            // SAFETY: `bss_ptr` is within the allocated region.
-            unsafe { core::ptr::write_bytes(bss_ptr, 0, bss_sz) };
         }
 
         segments[count] = InitSegment {

@@ -9,8 +9,9 @@ enumeration, binding, and policy live in `devmgr`.
 ## Boot-Provided Resource Descriptors
 
 The kernel consumes `BootInfo.mmio_apertures` during Phase 7 of
-initialization and mints one `Mmio` capability per entry; on RISC-V it mints one more for
-the console UART range `BootInfo.kernel_mmio` names, which may also lie inside an aperture.
+initialization and mints one `Mmio` capability per entry its Phase 6 validates; on RISC-V it
+mints one more for the console UART range `BootInfo.kernel_mmio` names, which may also lie
+inside an aperture.
 These apertures, the arch-specific `BootInfo.kernel_mmio`, and the framebuffer description
 are the only device descriptors the bootloader produces. Device-level firmware parsing
 (enumerating devices from ACPI / DTB) is a userspace concern, and the kernel contains no

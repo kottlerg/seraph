@@ -419,7 +419,8 @@ fn dispatch_ipc(
     // Every cap a request transfers has already moved into procmgr's
     // CSpace. Each arm releases the caps its wire layout does not name, and
     // every cap on a reject arm, so a padded or refused request cannot grow
-    // procmgr's CSpace (`docs/ipc-interface.md` § Capability Transfer).
+    // procmgr's CSpace (`services/procmgr/docs/ipc-interface.md`
+    // § Capability Transfer).
     match label & 0xFFFF
     {
         procmgr_labels::CREATE_PROCESS =>
@@ -516,7 +517,7 @@ pub(crate) fn release_caps(caps: &[u32])
 
 /// Handle `REGISTER_DEATH_EQ` — store the caller's `EventQueue` cap
 /// as procmgr's logd-death observer, then retroactively bind it to
-/// every thread currently in the process table.
+/// the main thread of every process currently in the process table.
 ///
 /// Wire format:
 /// * `caller badge` MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY`
@@ -551,10 +552,10 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64, table: &mut pro
         return;
     }
     // install_logd_death_eq is first-wins: it stores the cap and
-    // binds it as a second observer on every existing thread, or
-    // returns false if a previous registration already filled the
-    // slot. Future spawns pick it up inside finalize_creation by
-    // reading the same atomic.
+    // binds it as a second observer on the main thread of every
+    // process in the table, or returns false if a previous
+    // registration already filled the slot. Future spawns pick it up
+    // inside finalize_creation by reading the same atomic.
     if process::install_logd_death_eq(table, logd_eq)
     {
         reply_empty(ipc_buf, procmgr_errors::SUCCESS);
@@ -645,7 +646,7 @@ fn dispatch_death(
             // reclaimable Memory caps to memmgr's pool. The caps init still
             // holds stay in its kernel-pinned root CSpace, alive but
             // unreachable; releasing them at the reap is design intent, not
-            // yet implemented (`docs/process-lifecycle.md` § Init reap, #443).
+            // yet implemented (`docs/process-lifecycle.md` § Init reap, #540).
             init_reap::run_reap(memmgr_ep, ipc_buf);
             continue;
         }

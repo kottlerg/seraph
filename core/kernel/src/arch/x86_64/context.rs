@@ -14,6 +14,8 @@
 //! `return_to_user` builds an `iretq` frame from a [`TrapFrame`] on the
 //! current kernel stack and transitions to ring-3 user mode.
 
+use crate::arch::ThreadKind;
+
 // ── SavedState ────────────────────────────────────────────────────────────────
 
 /// Kernel-mode callee-saved register state for one thread.
@@ -111,15 +113,19 @@ pub fn align_initial_stack(sp: u64) -> u64
 /// `arg`       — first argument; stashed in `rbx`. `switch` only restores `rbx`;
 ///               `sched::enter` reads it back via [`SavedState::user_arg`] for
 ///               init, and the idle entry ignores it.
-/// `is_user`   — selects the initial RFLAGS (interrupt-enable) for the first
+/// `kind`      — selects the initial RFLAGS (interrupt-enable) for the first
 ///               dispatch; see below.
-pub fn new_state(entry: u64, stack_top: u64, arg: u64, is_user: bool) -> SavedState
+pub fn new_state(entry: u64, stack_top: u64, arg: u64, kind: ThreadKind) -> SavedState
 {
     // User threads start with IF=0 (0x002) so the first-dispatch trampoline runs
     // interrupts-masked; kernel threads (idle) start with IF=1 (0x200) to wake from
     // `hlt`. See core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership
     // (first-dispatch trampoline, #160).
-    let rflags = if is_user { 0x002 } else { 0x200 };
+    let rflags = match kind
+    {
+        ThreadKind::User => 0x002,
+        ThreadKind::Kernel => 0x200,
+    };
     SavedState {
         rip: entry,
         rsp: stack_top,
@@ -433,4 +439,28 @@ pub unsafe extern "C" fn switch_and_enter_user(
         "swapgs",
         "iretq",
     );
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// RFLAGS.IF, the interrupt-enable bit `switch`'s `popfq` restores.
+    const RFLAGS_IF: u64 = 1 << 9;
+
+    // Defect caught: a user thread whose first dispatch runs the kernel-side
+    // trampoline with IF set (a timer preempting it mid-trampoline corrupts the
+    // resume, #160), or an idle thread that starts with IF clear and never wakes
+    // from `hlt`.
+    #[test]
+    fn new_state_masks_interrupts_only_for_user_threads()
+    {
+        let user = new_state(0x1000, 0x2000, 0, ThreadKind::User);
+        let kernel = new_state(0x1000, 0x2000, 0, ThreadKind::Kernel);
+        assert_eq!(user.rflags & RFLAGS_IF, 0);
+        assert_ne!(kernel.rflags & RFLAGS_IF, 0);
+    }
 }

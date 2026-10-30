@@ -293,7 +293,7 @@ The kernel mints the root cap once at boot, carrying every sanctioned right, int
 **init is reaped after bootstrap, so any right not transferred to a surviving service before the
 reap is unforwardable until the next boot: the cap stays in init's CSpace, which the kernel pins (it
 is the root CSpace), so it remains alive but unreachable; releasing it at the reap is design intent,
-not yet implemented ([#443](https://github.com/kottlerg/seraph/issues/443); see
+not yet implemented ([#540](https://github.com/kottlerg/seraph/issues/540); see
 [process-lifecycle.md § Init reap](process-lifecycle.md#init-reap)). This, not a kernel wall, is
 what bounds the live extension set.** init transfers a cap narrowed to **Reset** + **Suspend** to
 devmgr, the steady-state holder of platform firmware authority (it sits alongside the ACPI / MMIO /
@@ -714,8 +714,8 @@ The kernel mints these during Phases 7–9 of
 (Phase 8 mints the late-reclaim cap over the AP trampoline page).
 
 - Memory capabilities for all usable physical memory
-- Mmio capabilities (Map | Write), one per `BootInfo.mmio_apertures` entry, plus one
-  over the kernel console UART on RISC-V
+- Mmio capabilities (Map | Write), one per `BootInfo.mmio_apertures` entry Phase 6 validates,
+  plus one over the kernel console UART on RISC-V
 - One root Interrupt range capability covering every valid IRQ id on the architecture
 - Map-only Memory capabilities over each `AcpiReclaimable` memory-map region, the page
   holding `BootInfo.acpi_rsdp`, and the `BootInfo.device_tree` blob, allowing userspace

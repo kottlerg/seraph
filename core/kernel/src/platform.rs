@@ -188,25 +188,11 @@ fn validate_apertures_inner(info: &BootInfo, out: &mut [MmioAperture]) -> usize
         )
     };
 
-    let mut accepted: usize = 0;
-    let mut skip_count: usize = 0;
-    let mut overflow_count: usize = 0;
-
-    for (i, entry) in raw.iter().enumerate()
-    {
-        if !aperture_valid(entry, i)
-        {
-            skip_count += 1;
-            continue;
-        }
-        if accepted >= out.len()
-        {
-            overflow_count += 1;
-            continue;
-        }
-        out[accepted] = *entry;
-        accepted += 1;
-    }
+    let ApertureCounts {
+        accepted,
+        skipped: skip_count,
+        dropped: overflow_count,
+    } = filter_apertures(raw, mmap, out);
 
     if overflow_count > 0
     {
@@ -227,6 +213,85 @@ fn validate_apertures_inner(info: &BootInfo, out: &mut [MmioAperture]) -> usize
     }
 
     accepted
+}
+
+/// Outcome of [`filter_apertures`]: entries accepted into `out`, entries
+/// skipped as invalid or RAM-overlapping, and valid entries dropped past the
+/// capacity of `out`.
+struct ApertureCounts
+{
+    accepted: usize,
+    skipped: usize,
+    dropped: usize,
+}
+
+/// Copy every aperture of `raw` that [`aperture_valid`] accepts and that
+/// intersects no RAM-class region of `mmap` ([`ram_overlap`]) into the head
+/// of `out`, in order, until `out` is full.
+fn filter_apertures(
+    raw: &[MmioAperture],
+    mmap: &[MemoryMapEntry],
+    out: &mut [MmioAperture],
+) -> ApertureCounts
+{
+    let mut counts = ApertureCounts {
+        accepted: 0,
+        skipped: 0,
+        dropped: 0,
+    };
+
+    for (i, entry) in raw.iter().enumerate()
+    {
+        if !aperture_valid(entry, i)
+        {
+            counts.skipped += 1;
+            continue;
+        }
+        if let Some(ram) = ram_overlap(entry, mmap)
+        {
+            kprintln!(
+                "  aperture[{}]: range {:#x}+{:#x} intersects {:?} memory {:#x}+{:#x}, skipping",
+                i,
+                entry.phys_base,
+                entry.size,
+                ram.memory_type,
+                ram.physical_base,
+                ram.size
+            );
+            counts.skipped += 1;
+            continue;
+        }
+        if counts.accepted >= out.len()
+        {
+            counts.dropped += 1;
+            continue;
+        }
+        out[counts.accepted] = *entry;
+        counts.accepted += 1;
+    }
+
+    counts
+}
+
+/// The first RAM-class (`Usable`, `Loaded`, `AcpiReclaimable`, `Persistent`)
+/// entry of `map` that `ap` intersects, or `None`. An `Mmio` capability over
+/// RAM would let its holder map and write frames outside Memory-capability
+/// accounting, so Phase 6 rejects such an aperture
+/// (`core/kernel/docs/initialization.md` § Phase 6). `ap` has passed
+/// [`aperture_valid`], so its end does not wrap.
+fn ram_overlap<'a>(ap: &MmioAperture, map: &'a [MemoryMapEntry]) -> Option<&'a MemoryMapEntry>
+{
+    let ap_end = ap.phys_base + ap.size;
+    map.iter().find(|e| {
+        matches!(
+            e.memory_type,
+            MemoryType::Usable
+                | MemoryType::Loaded
+                | MemoryType::AcpiReclaimable
+                | MemoryType::Persistent
+        ) && e.physical_base < ap_end
+            && ap.phys_base < e.physical_base.saturating_add(e.size)
+    })
 }
 
 /// Accept an aperture iff its base is page-aligned, its size is non-zero
@@ -409,6 +474,64 @@ mod tests
     {
         let ap = aperture(u64::MAX - 0x0FFF, 0x1000);
         assert!(!aperture_valid(&ap, 0));
+    }
+
+    fn entry(base: u64, size: u64, memory_type: MemoryType) -> MemoryMapEntry
+    {
+        MemoryMapEntry {
+            physical_base: base,
+            size,
+            memory_type,
+        }
+    }
+
+    /// Run `filter_apertures`; return the accepted apertures and the skip count.
+    fn run_filter(raw: &[MmioAperture], map: &[MemoryMapEntry]) -> (Vec<MmioAperture>, usize)
+    {
+        let mut out = [aperture(0, 0); MAX_MMIO_APERTURES];
+        let counts = filter_apertures(raw, map, &mut out);
+        (out[..counts.accepted].to_vec(), counts.skipped)
+    }
+
+    #[test]
+    fn aperture_intersecting_any_ram_type_is_rejected_as_skipped()
+    {
+        for ty in [
+            MemoryType::Usable,
+            MemoryType::Loaded,
+            MemoryType::AcpiReclaimable,
+            MemoryType::Persistent,
+        ]
+        {
+            // RAM [0x10_0000, 0x20_0000); the aperture overlaps its last page.
+            let map = [entry(0x10_0000, 0x10_0000, ty)];
+            let (accepted, skipped) = run_filter(&[aperture(0x1F_F000, 0x2000)], &map);
+            assert!(accepted.is_empty(), "{ty:?} overlap accepted");
+            assert_eq!(skipped, 1, "{ty:?} overlap not counted as skipped");
+        }
+    }
+
+    #[test]
+    fn aperture_adjacent_to_ram_is_accepted()
+    {
+        let map = [
+            entry(0x10_0000, 0x10_0000, MemoryType::Usable),
+            entry(0x30_0000, 0x10_0000, MemoryType::Loaded),
+        ];
+        let ap = aperture(0x20_0000, 0x10_0000);
+        let (accepted, skipped) = run_filter(&[ap], &map);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].phys_base, ap.phys_base);
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn aperture_over_reserved_memory_is_accepted()
+    {
+        let map = [entry(0xFEC0_0000, 0x10_0000, MemoryType::Reserved)];
+        let (accepted, skipped) = run_filter(&[aperture(0xFEC0_0000, 0x1000)], &map);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(skipped, 0);
     }
 
     #[test]

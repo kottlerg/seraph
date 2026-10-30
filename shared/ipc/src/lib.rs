@@ -294,7 +294,9 @@ pub mod procmgr_labels
 
     /// Register a death-notification `EventQueue` cap (`caps[0]`, POST
     /// right) with procmgr, which binds it as a second death observer on
-    /// every supervised thread, so the kernel posts each death to it.
+    /// the main thread of every supervised process (threads a process
+    /// creates itself carry no binding), so the kernel posts each
+    /// process's main-thread death to it.
     /// Real-logd uses it to evict the slot of a dead sender. Specified,
     /// with its replies, in `services/procmgr/docs/ipc-interface.md`
     /// § `REGISTER_DEATH_EQ` — install logd's death observer.
@@ -361,7 +363,7 @@ pub mod sched_policy
     /// (`[29, 30]`, which stays alive but unreachable in init's pinned
     /// `CSpace` after its reap; releasing it there is design intent, not
     /// yet implemented, per `docs/process-lifecycle.md` § Init reap and
-    /// #443), and hands the baseline `[1, 28]` to memmgr and procmgr.
+    /// #540), and hands the baseline `[1, 28]` to memmgr and procmgr.
     /// Every band procmgr mints for a child is a (possibly narrowed)
     /// descendant of this baseline, so no spawned process can ever reach
     /// `[29, 30]`.

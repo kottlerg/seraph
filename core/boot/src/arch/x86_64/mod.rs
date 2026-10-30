@@ -14,8 +14,8 @@
 //! [`BootPageTable`], [`perform_handoff`], [`trampoline_page_range`]);
 //! firmware MMIO population ([`populate_kernel_mmio`]); and stubs, each
 //! stating why the concept does not apply on x86-64, for hooks such as
-//! [`pre_serial_init`], [`uart_mmio_region`], [`discover_boot_hart_id`], and
-//! [`default_mmio_apertures`].
+//! [`pre_serial_init`], [`uart_mmio_region`], [`discover_boot_hart_id`],
+//! [`default_mmio_apertures`], and [`default_pci_windows`].
 //!
 //! Submodules: [`paging`] (4-level page tables), [`handoff`] (kernel entry
 //! transfer), [`serial`] (COM1 UART), [`acpi_kernel_mmio`] (LAPIC/IOAPIC
@@ -211,6 +211,15 @@ pub fn bsp_hardware_id(_boot_hart_id: u64) -> u32
 /// q35 firmware always publishes MCFG, and BAR placement varies by
 /// machine and CPU MAXPHYADDR, so no single fixed seed makes sense.
 pub fn default_mmio_apertures() -> &'static [(u64, u64)]
+{
+    &[]
+}
+
+/// No platform-default PCI windows on x86-64; a no-op stub.
+///
+/// q35 firmware always publishes MCFG, from which the ACPI seeder derives the
+/// PCI windows, so no fixed fallback window is needed.
+pub fn default_pci_windows() -> &'static [(u64, u64)]
 {
     &[]
 }

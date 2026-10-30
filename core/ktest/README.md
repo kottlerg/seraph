@@ -110,6 +110,7 @@ mirroring the kernel's own source layout.
 | `sysinfo.rs` | `SYS_SYSTEM_INFO` |
 | `crypto.rs` | Shared `crypto` crate known-answer tests (SHA-512, Ed25519 verify) run on-target (not a syscall surface) |
 | `init_layout.rs` | Kernel init-bootstrap ASLR draws: the `InitInfo` VA, init stack, and PIE image base lie in their windows |
+| `boot_reclaim.rs` | Every reclaimable Memory cap over a bootloader reclaim range (page-table frames, `BootInfo`, descriptor arrays, bundle non-module pages, AP trampoline) reads as zero through `SYS_MEM_MAP`, a single-page cap among them, and so does every frame-pool frame of drained RAM (not a syscall surface; runs first) |
 
 Adding a new syscall means adding a section in the appropriate file here.
 
@@ -172,17 +173,18 @@ concurrent notification and queue events.
 | `write_regs_blocked_syscall.rs` | A thread stopped while blocked in `notification_wait`, `ipc_recv`, or `thread_sleep` (the frame's syscall-number register names that syscall) has its instruction pointer and second-argument register rewritten from another CPU; on restart the blocked syscall's `Interrupted` return resumes at the new instruction pointer with the edited argument intact, every round, as the raw-pointer frame model of [core/kernel/docs/arch-interface.md § `trap_frame`](../kernel/docs/arch-interface.md#trap_frame--archcurrenttrap_frame) preserves (≥ 2 CPUs) |
 
 Architecture-only Tier 2 scenarios live under `src/arch/<arch>/` and run through
-`crate::arch::run_integration`. On x86-64, `src/arch/x86_64/syscall_rflags_hardening.rs`
-checks that a user-set DF and TF, and a GS base reloaded from the user selector, do not reach
-the kernel across a SYSCALL, and that a syscall made with AC set completes its user copy and
-returns with AC still set; `src/arch/x86_64/page_fault_present_bit.rs` checks that a fault
-handler's `#PF` message carries `FAULT_ACCESS_PRESENT` for a store to a read-only user page and
-never for a load from the top GiB of the kernel image window (the lower GiB can hold direct-map
-leaves the kernel's spurious-fault walk misreads, #563); `src/arch/x86_64/ioport_revoke.rs` checks
-that revoking an `IoPort` cap withdraws the port access bound through its descendant from a reader
-on another CPU, whose next port read raises `#GP`. On RISC-V,
-`src/arch/riscv64/sbi_gating.rs` checks that `SYS_SBI_CALL` refuses kernel-reserved SBI
-extensions and sanctioned ones the cap lacks the right for.
+`crate::arch::run_integration`. On x86-64, `src/arch/x86_64/syscall_rflags_hardening.rs` checks that
+a user-set DF and TF, and a GS base reloaded from the user selector, do not reach the kernel across
+a SYSCALL, and that a syscall made with AC set completes its user copy and returns with AC still set
+(in debug builds that syscall also trips the kernel's `debug_assert_kernel_entry_flags` if entry
+left AC set in ring 0); `src/arch/x86_64/page_fault_present_bit.rs` checks that a fault handler's
+`#PF` message carries `FAULT_ACCESS_PRESENT` for a store to a read-only user page and never for a
+load from the top GiB of the kernel image window (the lower GiB can hold direct-map leaves the
+kernel's spurious-fault walk misreads, #563); `src/arch/x86_64/ioport_revoke.rs` checks that
+revoking an `IoPort` cap withdraws the port access bound through its descendant from a reader on
+another CPU, whose next port read raises `#GP`. On RISC-V, `src/arch/riscv64/sbi_gating.rs` checks
+that `SYS_SBI_CALL` refuses kernel-reserved SBI extensions and sanctioned ones the cap lacks the
+right for.
 
 ### Tier S — `src/stress/`
 

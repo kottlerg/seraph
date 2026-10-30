@@ -1615,9 +1615,16 @@ mod tests
     {
         let sources = coverage_sources();
         let sources: Vec<&SourceFile> = sources.iter().collect();
-        let tracked: Vec<String> = ["core/a/mm.rs", "core/a/x86/tramp.rs", "xtask/src/x.rs"]
-            .map(str::to_owned)
-            .to_vec();
+        let tracked: Vec<String> = [
+            "core/a/mm.rs",
+            "core/a/x86/tramp.rs",
+            "core/b/ap_.rs",
+            "core/b/x86_tramp_entry.rs",
+            "core/b/x86_trampoline.S",
+            "xtask/src/x.rs",
+        ]
+        .map(str::to_owned)
+        .to_vec();
         check_coverage_symbols(&[doc], &sources, &tracked)
             .into_iter()
             .map(|d| (d.line, d.message))
@@ -1677,28 +1684,35 @@ mod tests
     }
 
     #[test]
-    fn coverage_glob_path_stays_within_one_component_and_one_naming_nothing_is_reported()
+    fn coverage_glob_path_matching_only_across_a_slash_or_naming_nothing_is_reported()
     {
         // `core/*/tramp.rs` matches `core/a/x86/tramp.rs` only if `*` crosses a `/`.
         let diags = coverage_check(&coverage_doc(" `core/*/tramp.rs`, `core/a/*/gone.rs`,", ""));
         let shown: Vec<&str> = diags.iter().map(|d| d.1.as_str()).collect();
         assert_eq!(shown.len(), 2, "{shown:?}");
         assert!(
-            shown[0].contains("`core/*/tramp.rs`") && shown[0].contains("names no tracked file")
+            shown[0].contains("`core/*/tramp.rs`") && shown[0].contains("names no tracked file"),
+            "{}",
+            shown[0]
         );
         assert!(
-            shown[1].contains("`core/a/*/gone.rs`") && shown[1].contains("names no tracked file")
+            shown[1].contains("`core/a/*/gone.rs`") && shown[1].contains("names no tracked file"),
+            "{}",
+            shown[1]
         );
     }
 
     #[test]
-    fn glob_star_matches_any_run_including_an_empty_one()
+    fn coverage_glob_path_star_matches_any_run_of_its_component_but_not_a_wrong_suffix()
     {
-        assert!(glob_matches("ap_*", "ap_trampoline.rs"));
-        assert!(glob_matches("ap_*.rs", "ap_.rs"));
-        assert!(glob_matches("*_tramp*.rs", "x86_trampoline.rs"));
-        assert!(!glob_matches("*_tramp*.rs", "x86_trampoline.S"));
-        assert!(!glob_matches("ap_*", "bp_trampoline.rs"));
+        // `ap_*.rs` resolves through an empty run (`ap_.rs`), `*_tramp*.rs` through two
+        // runs; `*.S.rs` names nothing, since `x86_trampoline.S` lacks the `.rs` suffix.
+        let diags = coverage_check(&coverage_doc(
+            " `core/b/ap_*.rs`, `core/b/*_tramp*.rs`, `core/b/*.S.rs`,",
+            "",
+        ));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].1.contains("`core/b/*.S.rs`"), "{}", diags[0].1);
     }
 
     #[test]

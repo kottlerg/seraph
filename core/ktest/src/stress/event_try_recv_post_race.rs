@@ -238,7 +238,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // POLLER (CPU 0): try_recv polls + gate park. POSTER (CPU 1): ticket +
     // post + gate signal. Caps published in (eq, gate, ack, done) order.
-    let poller = start_pinned_child(
+    let mut poller = start_pinned_child(
         ctx,
         [eq, gate, ack, done],
         [RIGHTS_EQ_RECV, RIGHTS_WAIT, RIGHTS_SIGNAL, RIGHTS_SIGNAL],
@@ -246,7 +246,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         0,
         0,
     )?;
-    let poster = start_pinned_child(
+    let mut poster = start_pinned_child(
         ctx,
         [eq, gate, ack, done],
         [RIGHTS_EQ_POST, RIGHTS_SIGNAL, RIGHTS_WAIT, RIGHTS_SIGNAL],
@@ -267,13 +267,17 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // ── Cleanup. ─────────────────────────────────────────────────────────────
-    cap_delete(poller.th)
+    poller
+        .delete_thread()
         .map_err(|_| "stress::event_try_recv_post_race: cap_delete poller th failed")?;
-    cap_delete(poller.cs)
+    poller
+        .delete_cspace()
         .map_err(|_| "stress::event_try_recv_post_race: cap_delete poller cs failed")?;
-    cap_delete(poster.th)
+    poster
+        .delete_thread()
         .map_err(|_| "stress::event_try_recv_post_race: cap_delete poster th failed")?;
-    cap_delete(poster.cs)
+    poster
+        .delete_cspace()
         .map_err(|_| "stress::event_try_recv_post_race: cap_delete poster cs failed")?;
     cap_delete(eq).map_err(|_| "stress::event_try_recv_post_race: cap_delete eq failed")?;
     cap_delete(gate).map_err(|_| "stress::event_try_recv_post_race: cap_delete gate failed")?;

@@ -53,7 +53,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "fault_pager_roundtrip: cap_create_notification failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "fault_pager_roundtrip: spawn::new_child failed")?;
 
     // Give the child a notification cap so it can signal success after resume.
@@ -124,8 +124,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Cleanup: delete the child first (its Thread dealloc releases the fault
     // binding's reference on the endpoint), then the rest.
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     // SAFETY: `RESERVED_VA` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.
     unsafe { mem_unmap(ctx.aspace_cap, RESERVED_VA, 1) }.ok();

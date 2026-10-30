@@ -65,8 +65,8 @@ fn check(ctx: &TestContext, held: u32) -> TestResult
 {
     // Every early return below leaves `granted` derived from `held`, so the
     // caller's delete of `held` hands it to the boot capability, and its own
-    // delete here unmaps the page; a started child is stopped by deleting its
-    // CSpace.
+    // delete here unmaps the page; a started child is reaped by its guard
+    // on return.
     let granted = cap_derive(held, syscall::RIGHTS_ALL)
         .map_err(|_| "integration::mmio_revoke_unmaps: cap_derive(granted) failed")?;
     // SAFETY: `PROBE_VA` is a scratch VA (crate docs § Scratch VAs), so the
@@ -77,15 +77,13 @@ fn check(ctx: &TestContext, held: u32) -> TestResult
         return Err("integration::mmio_revoke_unmaps: mmio_map failed");
     }
 
-    let Ok(child) = crate::spawn::new_child(ctx)
+    let Ok(mut child) = crate::spawn::new_child(ctx)
     else
     {
         cap_delete(granted).ok();
         return Err("integration::mmio_revoke_unmaps: spawn::new_child failed");
     };
     let abandon = |why: &'static str| -> TestResult {
-        cap_delete(child.cs).ok();
-        cap_delete(child.th).ok();
         cap_delete(granted).ok();
         Err(why)
     };
@@ -127,14 +125,14 @@ fn check(ctx: &TestContext, held: u32) -> TestResult
     }
     if aspace_query(ctx.aspace_cap, PROBE_VA).is_ok()
     {
-        cap_delete(child.cs).ok();
-        cap_delete(child.th).ok();
+        child.delete_cspace().ok();
+        child.delete_thread().ok();
         return Err("integration::mmio_revoke_unmaps: the mapping survived the revoke");
     }
 
     let reason = crate::spawn::wait_until_exited(child.th, polls)?;
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     if reason != EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_LOAD_VECTOR
     {
         return Err("integration::mmio_revoke_unmaps: the reader did not die of a load fault");

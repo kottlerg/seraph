@@ -86,8 +86,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "concurrent_event_producers: cap_create_notification failed")?;
 
-    let mut threads = [0u32; NUM_PRODUCERS];
-    let mut cspaces = [0u32; NUM_PRODUCERS];
+    let mut children = [const { spawn::SpawnedChild::EMPTY }; NUM_PRODUCERS];
 
     for i in 0..NUM_PRODUCERS
     {
@@ -117,8 +116,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         unsafe { spawn::configure_and_start(&child, producer_entry, stack_top, arg) }
             .map_err(|_| "concurrent_event_producers: configure_and_start failed")?;
 
-        threads[i] = child.th;
-        cspaces[i] = child.cs;
+        children[i] = child;
     }
 
     // Consumer: drain TOTAL_MESSAGES messages and bucket by producer id.
@@ -170,10 +168,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         }
     }
 
-    for i in 0..NUM_PRODUCERS
+    for child in &mut children
     {
-        cap_delete(threads[i]).ok();
-        cap_delete(cspaces[i]).ok();
+        child.delete_thread().ok();
+        child.delete_cspace().ok();
     }
     cap_delete(eq).ok();
     cap_delete(done).ok();

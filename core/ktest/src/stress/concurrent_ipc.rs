@@ -75,8 +75,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         let done = cap_create_notification(ctx.memory_base)
             .map_err(|_| "concurrent_ipc: create_notification failed")?;
 
-        let mut threads = [0u32; NUM_CALLERS];
-        let mut cspaces = [0u32; NUM_CALLERS];
+        let mut children = [const { spawn::SpawnedChild::EMPTY }; NUM_CALLERS];
 
         // Start all callers simultaneously (no yields between starts).
         for i in 0..NUM_CALLERS
@@ -110,8 +109,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             unsafe { spawn::configure_and_start(&child, caller_entry, stack_top, arg) }
                 .map_err(|_| "concurrent_ipc: configure_and_start failed")?;
 
-            threads[i] = child.th;
-            cspaces[i] = child.cs;
+            children[i] = child;
         }
 
         // Server: receive and reply to all callers.
@@ -170,10 +168,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         }
 
         // Clean up.
-        for i in 0..NUM_CALLERS
+        for child in &mut children
         {
-            cap_delete(threads[i]).ok();
-            cap_delete(cspaces[i]).ok();
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
         }
         cap_delete(ep).ok();
         cap_delete(done).ok();

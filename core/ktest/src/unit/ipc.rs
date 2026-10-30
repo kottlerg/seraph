@@ -111,7 +111,7 @@ pub fn call_reply_recv(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_create_notification for IPC notify failed")?;
 
     // Build child CSpace: endpoint (SEND | GRANT) + notify notification (NOTIFY only).
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::call_reply_recv: spawn::new_child failed")?;
     let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep into child CSpace failed")?;
@@ -148,10 +148,14 @@ pub fn call_reply_recv(ctx: &TestContext) -> TestResult
         return Err("child IPC post-reply verification failed (expected 0xDEAD)");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete child_th after IPC test failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete child_th after IPC test failed")?;
     cap_delete(ep).map_err(|_| "cap_delete ep after IPC test failed")?;
     cap_delete(notify).map_err(|_| "cap_delete notify after IPC test failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete child_cs after IPC test failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete child_cs after IPC test failed")?;
     Ok(())
 }
 
@@ -171,7 +175,7 @@ pub fn recv_finds_queued_caller(ctx: &TestContext) -> TestResult
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for recv_finds_queued_caller failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::recv_finds_queued_caller: spawn::new_child failed")?;
     let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for recv_finds_queued_caller failed")?;
@@ -210,10 +214,10 @@ pub fn recv_finds_queued_caller(ctx: &TestContext) -> TestResult
         return Err("child post-reply check failed (expected 0xDEAD)");
     }
 
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -273,7 +277,7 @@ pub fn call_with_data_words(ctx: &TestContext) -> TestResult
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for data_words test failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::call_with_data_words: spawn::new_child failed")?;
     let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for data_words test failed")?;
@@ -319,10 +323,10 @@ pub fn call_with_data_words(ctx: &TestContext) -> TestResult
         return Err("data word[1] mismatch (expected 0xCCCCDDDD)");
     }
 
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -339,7 +343,7 @@ pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for cap_xfer test failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::call_with_cap_transfer: spawn::new_child failed")?;
     let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for cap_xfer test failed")?;
@@ -399,10 +403,10 @@ pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
 
     // Clean up the transferred cap.
     cap_delete(transferred_sig).ok();
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -423,7 +427,7 @@ pub fn recv_delivers_badge(ctx: &TestContext) -> TestResult
     let badged_ep = syscall::cap_derive_badge(ep, RIGHTS_EP_SEND_GRANT, 0x1234)
         .map_err(|_| "cap_derive_badge for recv_delivers_badge failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::recv_delivers_badge: spawn::new_child failed")?;
     let child_ep = cap_copy(badged_ep, child.cs, syscall::RIGHTS_ALL)
         .map_err(|_| "cap_copy badged ep for recv_delivers_badge failed")?;
@@ -458,11 +462,11 @@ pub fn recv_delivers_badge(ctx: &TestContext) -> TestResult
 
     notification_wait(done).map_err(|_| "notification_wait for recv_delivers_badge failed")?;
 
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(badged_ep).ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -475,7 +479,7 @@ pub fn recv_unbadged_returns_zero(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_create_notification for recv_unbadged failed")?;
 
     // Give child an unbadged send+grant cap (regular derive, no badge).
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::recv_unbadged_returns_zero: spawn::new_child failed")?;
     let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for recv_unbadged failed")?;
@@ -509,10 +513,10 @@ pub fn recv_unbadged_returns_zero(ctx: &TestContext) -> TestResult
 
     notification_wait(done).map_err(|_| "notification_wait for recv_unbadged failed")?;
 
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -749,7 +753,7 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for snapshot test failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "ipc::recv_snapshot_survives_buffer_clobber: spawn::new_child failed")?;
     let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for snapshot test failed")?;
@@ -809,10 +813,10 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
         return Err("snapshot test: word[1] clobbered by buffer write");
     }
 
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -905,6 +909,10 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
 
     let child_th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, child_cs, 0, 0)
         .map_err(|_| "cap_create_thread for reply_oom test failed")?;
+    let mut child = crate::spawn::SpawnedChild {
+        th: child_th,
+        cs: child_cs,
+    };
     let stack_top = ChildStack::top(core::ptr::addr_of!(REPLY_OOM_STACK));
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
@@ -963,12 +971,12 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
         return Err("reply_oom: child did not observe IPC_REPLY_TRANSFER_FAILED");
     }
 
-    cap_delete(child_th).ok();
+    child.delete_thread().ok();
     cap_delete(ep).ok();
     cap_delete(ready).ok();
     cap_delete(done).ok();
     cap_delete(xfer).ok();
-    cap_delete(child_cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -1133,7 +1141,8 @@ pub fn reply_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
     let xfer = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification(xfer) for reply_dup test failed")?;
 
-    let child = crate::spawn::new_child(ctx).map_err(|_| "reply_dup: spawn::new_child failed")?;
+    let mut child =
+        crate::spawn::new_child(ctx).map_err(|_| "reply_dup: spawn::new_child failed")?;
     let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for reply_dup test failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
@@ -1176,11 +1185,11 @@ pub fn reply_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
     // The refused transfer left the server's cap untouched.
     notification_send(xfer, 0x1).map_err(|_| "reply_dup: cap lost after refused reply")?;
 
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
     cap_delete(xfer).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -1246,7 +1255,8 @@ pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
         return Err("reply_stale: freed slot was not recycled by the next create");
     }
 
-    let child = crate::spawn::new_child(ctx).map_err(|_| "reply_stale: spawn::new_child failed")?;
+    let mut child =
+        crate::spawn::new_child(ctx).map_err(|_| "reply_stale: spawn::new_child failed")?;
     let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for reply_stale test failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
@@ -1290,11 +1300,11 @@ pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
     notification_send(occupant, 0x1)
         .map_err(|_| "reply_stale: occupant cap disturbed by refused reply")?;
 
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
     cap_delete(occupant).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -1313,7 +1323,8 @@ pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for four_caps test failed")?;
 
-    let child = crate::spawn::new_child(ctx).map_err(|_| "four_caps: spawn::new_child failed")?;
+    let mut child =
+        crate::spawn::new_child(ctx).map_err(|_| "four_caps: spawn::new_child failed")?;
     let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cap_copy ep for four_caps test failed")?;
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
@@ -1375,10 +1386,10 @@ pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
     {
         cap_delete(h).ok();
     }
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -1473,6 +1484,10 @@ pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
 
     let victim_th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, victim_cs, 0, 0)
         .map_err(|_| "cap_create_thread for recv_oom test failed")?;
+    let mut victim_guard = crate::spawn::SpawnedChild {
+        th: victim_th,
+        cs: victim_cs,
+    };
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_OOM_STACK));
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
@@ -1495,10 +1510,10 @@ pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
         return Err("recv_oom: victim did not see OutOfMemory from ipc_recv");
     }
 
-    cap_delete(victim_th).ok();
+    victim_guard.delete_thread().ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
-    cap_delete(victim_cs).ok();
+    victim_guard.delete_cspace().ok();
     Ok(())
 }
 

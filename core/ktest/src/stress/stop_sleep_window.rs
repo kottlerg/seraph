@@ -122,7 +122,7 @@ fn with_sleeper(ctx: &TestContext, cycles: u32) -> TestResult
 {
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::stop_sleep_window: create done failed")?;
-    let Ok(child) = spawn::new_child(ctx)
+    let Ok(mut child) = spawn::new_child(ctx)
     else
     {
         let _ = cap_delete(done);
@@ -131,9 +131,13 @@ fn with_sleeper(ctx: &TestContext, cycles: u32) -> TestResult
     let result = start_and_storm(&child, done, cycles);
     // Deleting the thread stops it wherever it is, so the shared stack is
     // free for the next test even when the storm failed.
-    let reaped = [cap_delete(child.th), cap_delete(child.cs), cap_delete(done)]
-        .into_iter()
-        .collect::<Result<(), i64>>();
+    let reaped = [
+        child.delete_thread(),
+        child.delete_cspace(),
+        cap_delete(done),
+    ]
+    .into_iter()
+    .collect::<Result<(), i64>>();
     result?;
     reaped.map_err(|_| "stress::stop_sleep_window: reap failed")
 }

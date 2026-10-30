@@ -431,9 +431,11 @@ impl Phase
             .map_err(|_| "integration::queued_waiters_fifo: del object failed")?;
         for child in self.children.iter().flatten()
         {
-            cap_delete(child.th)
+            child
+                .delete_thread()
                 .map_err(|_| "integration::queued_waiters_fifo: reap child thread failed")?;
-            cap_delete(child.cs)
+            child
+                .delete_cspace()
                 .map_err(|_| "integration::queued_waiters_fifo: reap child cspace failed")?;
         }
         cap_delete(self.done).map_err(|_| "integration::queued_waiters_fifo: del done failed")

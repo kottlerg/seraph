@@ -89,17 +89,79 @@ pub unsafe fn child_args<T: Copy>(arg: u64) -> T
     unsafe { *(arg as *const T) }
 }
 
-/// Child-thread handle returned by [`new_child`].
+/// Child-thread handle returned by [`new_child`]; owns the child's Thread
+/// and `CSpace` caps and reaps the child when dropped.
 ///
-/// Caller is responsible for deleting both caps when the child has exited
-/// (typically via `notification_wait`-based handshake). Either order is
-/// safe: deleting `cs` first stops a still-live child
-/// (`core/kernel/docs/scheduling-internals.md` § Thread Registry); deleting `th`
-/// first is the tidy order, since the exited thread's object goes at once.
+/// Dropping the guard deletes whichever of `th` and `cs` it still holds,
+/// `th` first. Either delete stops a still-live child: the last Thread cap's
+/// delete tears the thread down, and the `CSpace`'s teardown stops every
+/// thread bound to it (`core/kernel/docs/scheduling-internals.md` § Thread
+/// Registry). So a test that returns early, on any path, leaves no child of
+/// its own running on the `ChildStack` or `IpcPage` a later test reuses. A
+/// copy of either cap the test made elsewhere keeps its object alive, and the
+/// test deletes that copy itself.
+///
+/// A test that deletes a cap before the guard goes calls
+/// [`delete_thread`](Self::delete_thread) or
+/// [`delete_cspace`](Self::delete_cspace), or drops the guard, rather than
+/// `cap_delete` on the field: each clears its field first, so a handle is
+/// deleted once, and the drop never deletes a stale handle a recycled slot's
+/// wrapped generation would alias to another cap. A zero field holds nothing:
+/// [`EMPTY`](Self::EMPTY) fills a guard array before its children exist, and
+/// a thread bound to ktest's own `CSpace` is guarded with `cs: 0`.
 pub struct SpawnedChild
 {
     pub th: u32,
     pub cs: u32,
+}
+
+impl SpawnedChild
+{
+    /// A guard holding no cap.
+    pub const EMPTY: SpawnedChild = SpawnedChild { th: 0, cs: 0 };
+
+    /// Delete the Thread cap now, clearing the field so the drop skips it;
+    /// `Ok` at once when the guard holds none.
+    ///
+    /// # Errors
+    ///
+    /// The `cap_delete` error code.
+    pub fn delete_thread(&mut self) -> Result<(), i64>
+    {
+        delete_held(&mut self.th)
+    }
+
+    /// Delete the `CSpace` cap now, clearing the field so the drop skips it;
+    /// `Ok` at once when the guard holds none.
+    ///
+    /// # Errors
+    ///
+    /// The `cap_delete` error code.
+    pub fn delete_cspace(&mut self) -> Result<(), i64>
+    {
+        delete_held(&mut self.cs)
+    }
+}
+
+/// Delete the cap `handle` holds and clear it; a zero handle holds none.
+fn delete_held(handle: &mut u32) -> Result<(), i64>
+{
+    match core::mem::take(handle)
+    {
+        0 => Ok(()),
+        held => syscall::cap_delete(held),
+    }
+}
+
+impl Drop for SpawnedChild
+{
+    fn drop(&mut self)
+    {
+        // Best-effort: a guard has no caller to report to, and a refused
+        // delete leaves nothing more it could do.
+        let _ = self.delete_thread();
+        let _ = self.delete_cspace();
+    }
 }
 
 /// Mint a new (`CSpace`, Thread) pair both bound to the test's address
@@ -153,11 +215,28 @@ pub unsafe fn configure_and_start(
     arg: u64,
 ) -> Result<(), &'static str>
 {
+    // SAFETY: the caller's contract is this function's.
+    unsafe { configure_and_start_thread(child.th, entry, stack_top, arg) }
+}
+
+/// [`configure_and_start`] for a thread that is not held by a [`SpawnedChild`]:
+/// one of a set the caller creates in a shared `CSpace` and reaps itself on
+/// every path.
+///
+/// # Safety
+/// The contract of [`configure_and_start`].
+pub unsafe fn configure_and_start_thread(
+    th: u32,
+    entry: extern "C" fn(u64) -> !,
+    stack_top: u64,
+    arg: u64,
+) -> Result<(), &'static str>
+{
     // SAFETY: `entry` is an `extern "C" fn(u64) -> !` and the caller's
-    // contract dedicates `stack_top`'s stack to this child.
-    unsafe { thread_configure(child.th, entry as *const () as u64, stack_top, arg) }
+    // contract dedicates `stack_top`'s stack to this thread.
+    unsafe { thread_configure(th, entry as *const () as u64, stack_top, arg) }
         .map_err(|_| "spawn::configure_and_start: thread_configure failed")?;
-    thread_start(child.th).map_err(|_| "spawn::configure_and_start: thread_start failed")?;
+    thread_start(th).map_err(|_| "spawn::configure_and_start: thread_start failed")?;
     Ok(())
 }
 
@@ -191,7 +270,10 @@ pub unsafe fn configure_and_start_pinned(
 /// child resumed with the frame then runs `entry` as if called, with the
 /// frame's other registers as its arguments.
 ///
-/// Panics if `regs` is shorter than the register file.
+/// Panics if `regs` is shorter than `max(SP_OFFSET, IP_OFFSET) + 8` bytes,
+/// the end of the last register it touches; a shorter buffer than the full
+/// register file (`arch::TRAP_FRAME_BYTES`) that still reaches past both is
+/// accepted.
 pub fn redirect_to_entry(regs: &mut [u8], entry: u64)
 {
     use crate::arch::{IP_OFFSET, SP_OFFSET, entry_stack_pointer};

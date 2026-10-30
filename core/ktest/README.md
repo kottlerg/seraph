@@ -369,11 +369,18 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   child-thread spawn helper wrapping the cspace + thread + configure + start
   sequence each spawning test would otherwise repeat; `new_child` creates the
   thread at the floor priority, `new_child_at` at `priority` under
-  `sched_cap`'s band. The two `configure_and_start` helpers are `unsafe fn`:
-  the caller states that the stack it passes runs no other live thread.
+  `sched_cap`'s band. The `configure_and_start` helpers (and
+  `configure_and_start_thread`, for a thread in a `CSpace` several threads
+  share) are `unsafe fn`: the caller states that the stack it passes runs no
+  other live thread.
+- `spawn::SpawnedChild` — the guard `new_child` returns: it owns the child's
+  Thread and `CSpace` caps, and its drop deletes whichever the test has not
+  (through `delete_thread` / `delete_cspace`), so a test that fails early
+  leaves no child running.
 - `ChildStack` / `IpcPage` — a child's static 16 KiB stack and page-aligned
-  IPC buffer page, each declared per test and handed to one thread at a time
-  (the rule in their rustdoc, which covers passing tests).
+  IPC buffer page, declared per test (the stress cells share
+  `stress::STRESS_STACKS`) and handed to one thread at a time (the rule in
+  their rustdoc).
 - `spawn::redirect_to_entry(regs, entry)` — points a register file read
   from a stopped or fault-blocked child at an `extern "C"` entry, with the stack pointer
   aligned for the entry ABI, for the `thread_write_regs` redirect tests.

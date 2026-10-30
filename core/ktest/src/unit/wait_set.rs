@@ -138,7 +138,7 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
     wait_set_add(ws, sig, 7).map_err(|_| "wait_set_add for blocking test failed")?;
 
     // Set up a child thread that sends on the notification.
-    let child =
+    let mut child =
         crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child for blocking test failed")?;
     let child_sig =
         cap_copy(sig, child.cs, RIGHTS_NOTIFY).map_err(|_| "cap_copy for blocking test failed")?;
@@ -166,9 +166,13 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
         return Err("notification bits after blocking wait_set_wait are wrong (expected 0xBEEF)");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after blocking test failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after blocking test failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after blocking test failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after blocking test failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after blocking test failed")?;
     cap_delete(ws).map_err(|_| "cap_delete ws after blocking test failed")?;
     Ok(())
 }
@@ -197,10 +201,10 @@ pub fn occupied_wait_refused(ctx: &TestContext) -> TestResult
     // Deleting a thread tears the child down wherever it is, so the stacks
     // are free even when the test failed with a child still parked.
     let mut ok = true;
-    for child in o.waiters.iter().flatten()
+    for child in o.waiters.iter_mut().flatten()
     {
-        ok &= cap_delete(child.th).is_ok();
-        ok &= cap_delete(child.cs).is_ok();
+        ok &= child.delete_thread().is_ok();
+        ok &= child.delete_cspace().is_ok();
     }
     for cap in [o.ws, o.sig, o.done].into_iter().flatten()
     {

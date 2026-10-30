@@ -103,6 +103,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
         .map_err(|_| "integration::cap_transfer: cap_create_thread failed")?;
+    let mut child = crate::spawn::SpawnedChild { th, cs };
     crate::log("cap_transfer: child thread created");
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
@@ -156,11 +157,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     cap_delete(recv_sig).ok();
-    cap_delete(th).ok();
+    child.delete_thread().ok();
     cap_delete(ep).ok();
     cap_delete(test_sig).ok();
     cap_delete(sync_sig).ok();
-    cap_delete(cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 

@@ -219,16 +219,17 @@ pub struct TestContext
 /// any test module that spawns a child thread. Pass `ChildStack::top(ptr)` to
 /// `thread_configure` as the initial stack pointer.
 ///
-/// Each test file that needs a child thread declares its own static stack so
-/// stacks never alias across concurrent (or sequential) test boundaries. A
-/// stack is handed to one thread at a time: a test starts a child on it only
-/// once the stack's previous child has exited or never started, which is
-/// what `spawn::configure_and_start`'s contract asks of the caller. Every
-/// test reaps its children before it returns `Ok`; the rule is therefore
-/// guaranteed for the stacks of passing tests only. A test that returns `Err`
-/// early can leave a child alive, and a later reuse of its stack is outside
-/// the rule; ktest's run has then already failed. Reaping children on every
-/// exit path is #580.
+/// A test that needs a child thread declares its own static stacks, except
+/// the stress cells, which take theirs from the shared `stress::STRESS_STACKS`
+/// array one cell after another. A stack is handed to one thread at a time: a
+/// test starts a child on it only once the stack's previous child has exited
+/// or never started, which is what `spawn::configure_and_start`'s contract
+/// asks of the caller. Every test reaps each child it starts on one of these
+/// stacks before it returns, on every path: through the child's
+/// `spawn::SpawnedChild` guard,
+/// whose drop deletes the caps the test has not, or, for a set of threads
+/// sharing one `CSpace`, by its own cleanup on every path. So the rule holds
+/// across test boundaries whether the earlier test passed or failed.
 // Field is CPU stack memory; only the hardware stack pointer accesses it, not Rust code.
 #[allow(dead_code)]
 #[repr(align(16))]
@@ -270,8 +271,8 @@ pub(crate) static mut IPC_BUF: IpcBuf = IpcBuf([0u64; 512]);
 /// Declare one per concurrently running child as a `static mut` (or an array
 /// of them), as for [`ChildStack`], and have the child register it with
 /// `ipc_buffer_set` before its first IPC. A page serves one thread at a time:
-/// a child registers it only once the page's previous user has exited, with
-/// the same passing-tests scope as the [`ChildStack`] rule.
+/// a child registers it only once the page's previous user has exited, which
+/// holds across test boundaries for the reason the [`ChildStack`] rule does.
 #[repr(C, align(4096))]
 pub struct IpcPage([u64; 512]);
 

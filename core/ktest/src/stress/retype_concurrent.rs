@@ -65,8 +65,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let done = syscall::cap_create_notification(memory)
         .map_err(|_| "stress::retype_concurrent: create done failed")?;
 
-    let mut threads = [0u32; NUM_WORKERS];
-    let mut cspaces = [0u32; NUM_WORKERS];
+    let mut workers = [const { crate::spawn::SpawnedChild::EMPTY }; NUM_WORKERS];
 
     for i in 0..NUM_WORKERS
     {
@@ -82,6 +81,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::retype_concurrent: cap_copy done failed")?;
         let th = cap_create_thread(memory, ctx.aspace_cap, cs, 0, 0)
             .map_err(|_| "stress::retype_concurrent: create_thread failed")?;
+        workers[i] = crate::spawn::SpawnedChild { th, cs };
 
         // SAFETY: worker `i` has not been started yet; the block is reused
         // only after every worker has been reaped.
@@ -104,9 +104,6 @@ pub fn run(ctx: &TestContext) -> TestResult
         unsafe { thread_configure(th, worker_entry as *const () as u64, stack_top, arg) }
             .map_err(|_| "stress::retype_concurrent: thread_configure failed")?;
         thread_start(th).map_err(|_| "stress::retype_concurrent: thread_start failed")?;
-
-        threads[i] = th;
-        cspaces[i] = cs;
     }
 
     // Collect done bits. The loop exits only once every worker has reported:
@@ -121,10 +118,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // Cleanup workers.
-    for i in 0..NUM_WORKERS
+    for worker in &mut workers
     {
-        cap_delete(threads[i]).ok();
-        cap_delete(cspaces[i]).ok();
+        worker.delete_thread().ok();
+        worker.delete_cspace().ok();
     }
     cap_delete(done).ok();
 

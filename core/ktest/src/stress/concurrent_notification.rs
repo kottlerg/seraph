@@ -58,8 +58,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "concurrent_notification: create done failed")?;
 
     // Spawn `NUM_SENDERS` sender threads.
-    let mut threads = [0u32; NUM_SENDERS];
-    let mut cspaces = [0u32; NUM_SENDERS];
+    let mut children = [const { spawn::SpawnedChild::EMPTY }; NUM_SENDERS];
 
     for i in 0..NUM_SENDERS
     {
@@ -91,8 +90,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         unsafe { spawn::configure_and_start(&child, sender_entry, stack_top, arg) }
             .map_err(|_| "concurrent_notification: configure_and_start failed")?;
 
-        threads[i] = child.th;
-        cspaces[i] = child.cs;
+        children[i] = child;
     }
 
     // Wait for all senders to report done. Each child ORs a unique bit into
@@ -113,10 +111,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "concurrent_notification: notification_wait target failed")?;
 
     // Clean up.
-    for i in 0..NUM_SENDERS
+    for child in &mut children
     {
-        cap_delete(threads[i]).ok();
-        cap_delete(cspaces[i]).ok();
+        child.delete_thread().ok();
+        child.delete_cspace().ok();
     }
     cap_delete(target).ok();
     cap_delete(done).ok();

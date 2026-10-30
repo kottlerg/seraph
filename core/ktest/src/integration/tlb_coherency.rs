@@ -78,7 +78,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let c2p = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::tlb_coherency: cap_create_notification (c2p) failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "integration::tlb_coherency: spawn::new_child failed")?;
 
     // Copy both notifications into child's cspace.
@@ -199,8 +199,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::tlb_coherency: notification_send (exit) failed")?;
 
     // ── 6. Clean up. ─────────────────────────────────────────────────────────
-    cap_delete(child.th).map_err(|_| "integration::tlb_coherency: cap_delete (th) failed")?;
-    cap_delete(child.cs).map_err(|_| "integration::tlb_coherency: cap_delete (cs) failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "integration::tlb_coherency: cap_delete (th) failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "integration::tlb_coherency: cap_delete (cs) failed")?;
     cap_delete(p2c).map_err(|_| "integration::tlb_coherency: cap_delete (p2c) failed")?;
     cap_delete(c2p).map_err(|_| "integration::tlb_coherency: cap_delete (c2p) failed")?;
 

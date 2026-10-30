@@ -155,7 +155,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::cap_delete_reply_wake: cap_create_notification failed")?;
 
         // ── Client child: SEND|GRANT on ep, signal on done. ─────────────────
-        let client = spawn::new_child(ctx)
+        let mut client = spawn::new_child(ctx)
             .map_err(|_| "stress::cap_delete_reply_wake: spawn::new_child client failed")?;
         let client_ep = cap_copy(ep, client.cs, RIGHTS_EP_SEND_GRANT)
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy client ep failed")?;
@@ -192,7 +192,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         )?;
 
         // ── Server child: RECEIVE on ep, signal on done. ────────────────────
-        let server = spawn::new_child(ctx)
+        let mut server = spawn::new_child(ctx)
             .map_err(|_| "stress::cap_delete_reply_wake: spawn::new_child server failed")?;
         let server_ep = cap_copy(ep, server.cs, RIGHTS_EP_RECEIVE)
             .map_err(|_| "stress::cap_delete_reply_wake: cap_copy server ep failed")?;
@@ -228,7 +228,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         // Delete the server Thread cap. This drives `dealloc_object(Thread)`,
         // which owes the orphaned client its deferred `Interrupted` wake.
-        cap_delete(server.th)
+        server
+            .delete_thread()
             .map_err(|_| "stress::cap_delete_reply_wake: cap_delete server th failed")?;
 
         // LIVENESS GATE: the client MUST wake. A lost reply-wake never sends
@@ -255,12 +256,15 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         // ── Per-cycle cleanup. ──────────────────────────────────────────────
         // The server Thread cap is already deleted; reap the rest. The client
-        // has woken and is exiting; `cap_delete(client.th)` reaps its TCB.
-        cap_delete(server.cs)
+        // has woken and is exiting; `client.delete_thread()` reaps its TCB.
+        server
+            .delete_cspace()
             .map_err(|_| "stress::cap_delete_reply_wake: cap_delete server cs failed")?;
-        cap_delete(client.th)
+        client
+            .delete_thread()
             .map_err(|_| "stress::cap_delete_reply_wake: cap_delete client th failed")?;
-        cap_delete(client.cs)
+        client
+            .delete_cspace()
             .map_err(|_| "stress::cap_delete_reply_wake: cap_delete client cs failed")?;
         cap_delete(ep).map_err(|_| "stress::cap_delete_reply_wake: cap_delete ep failed")?;
         cap_delete(done).map_err(|_| "stress::cap_delete_reply_wake: cap_delete done failed")?;

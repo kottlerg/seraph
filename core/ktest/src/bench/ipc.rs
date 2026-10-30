@@ -84,7 +84,7 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
         cap_delete(ep).ok();
         return;
     };
-    let Ok(child) = spawn::new_child(ctx)
+    let Ok(mut child) = spawn::new_child(ctx)
     else
     {
         cap_delete(done).ok();
@@ -96,8 +96,8 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
 
     // One cleanup path for every exit: deleting the child's Thread cap also
     // ends a child still parked in `ipc_call` after an early break.
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     cap_delete(done).ok();
     cap_delete(ep).ok();
 }

@@ -227,7 +227,7 @@ fn phase(ctx: &TestContext, kind: Kind, server_cpu: u32) -> Result<u64, &'static
         }
         Ok(interrupted)
     });
-    let torn_down = teardown(peer.as_ref(), &objects);
+    let torn_down = teardown(peer.as_mut(), &mut objects);
     let interrupted = result?;
     torn_down.map(|()| interrupted)
 }
@@ -296,13 +296,13 @@ fn setup(
 
 /// Delete the peer, the server, and the source. Deleting a thread stops it
 /// wherever it is, so the stacks are free for the next phase.
-fn teardown(peer: Option<&spawn::SpawnedChild>, objects: &PhaseObjects) -> TestResult
+fn teardown(peer: Option<&mut spawn::SpawnedChild>, objects: &mut PhaseObjects) -> TestResult
 {
     let mut ok = true;
-    for child in peer.into_iter().chain(objects.server.as_ref())
+    for child in peer.into_iter().chain(objects.server.as_mut())
     {
-        ok &= cap_delete(child.th).is_ok();
-        ok &= cap_delete(child.cs).is_ok();
+        ok &= child.delete_thread().is_ok();
+        ok &= child.delete_cspace().is_ok();
     }
     if let Some(src) = objects.source
     {

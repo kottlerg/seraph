@@ -117,7 +117,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // ── Phase 1: stop while BlockedOnSend (no receiver on the endpoint). ────
     let ep1 = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: create ep1 failed")?;
-    let client = spawn::new_child(ctx)
+    let mut client = spawn::new_child(ctx)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: spawn p1 client failed")?;
     let c_ep = cap_copy(ep1, client.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p1 ep failed")?;
@@ -145,9 +145,11 @@ pub fn run(ctx: &TestContext) -> TestResult
              non-Interrupted result (stale reply surfaced — #361)",
         );
     }
-    cap_delete(client.th)
+    client
+        .delete_thread()
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: reap p1 client failed")?;
-    cap_delete(client.cs)
+    client
+        .delete_cspace()
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: reap p1 cs failed")?;
     cap_delete(ep1).map_err(|_| "integration::ipc_call_interrupted_stop_start: del ep1 failed")?;
 
@@ -157,7 +159,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let block = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: create block failed")?;
 
-    let server = spawn::new_child(ctx)
+    let mut server = spawn::new_child(ctx)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: spawn server failed")?;
     let s_ep = cap_copy(ep2, server.cs, RIGHTS_EP_RECEIVE)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy s ep failed")?;
@@ -183,7 +185,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     unsafe { spawn::configure_and_start(&server, server_entry, s_stack, s_arg) }
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: start server failed")?;
 
-    let client2 = spawn::new_child(ctx)
+    let mut client2 = spawn::new_child(ctx)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: spawn p2 client failed")?;
     let p2c_ep = cap_copy(ep2, client2.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p2 ep failed")?;
@@ -214,13 +216,17 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // ── Cleanup. The server is parked on `block`; deleting its TCB reaps it. ─
-    cap_delete(client2.th)
+    client2
+        .delete_thread()
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: reap p2 client failed")?;
-    cap_delete(client2.cs)
+    client2
+        .delete_cspace()
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: reap p2 cs failed")?;
-    cap_delete(server.th)
+    server
+        .delete_thread()
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: reap server failed")?;
-    cap_delete(server.cs)
+    server
+        .delete_cspace()
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: reap server cs failed")?;
     cap_delete(ep2).map_err(|_| "integration::ipc_call_interrupted_stop_start: del ep2 failed")?;
     cap_delete(block)

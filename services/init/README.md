@@ -36,7 +36,11 @@ from their bundle entries) and `shared/syscall` for raw syscall wrappers (used
 to create memmgr and procmgr without IPC). init-logd packs its handover replies
 with the wire contract in [`logd-codec`](../logd/codec/README.md), the crate
 real-logd decodes them with (see the
-[logd handover protocol](../logd/docs/handover-protocol.md)).
+[logd handover protocol](../logd/docs/handover-protocol.md)). init encodes
+svcmgr's handover endowment with the
+[`svcmgr-endowment`](../svcmgr/endowment/README.md) codec, the crate svcmgr
+decodes it with (see the
+[svcmgr IPC interface](../svcmgr/docs/ipc-interface.md#handover-endowment-bootstrap-rounds)).
 
 ---
 
@@ -127,6 +131,7 @@ transfer table.
 | [services/svcmgr/README.md](../svcmgr/README.md) | Takes over as resident supervisor after `HANDOVER_COMPLETE` |
 | [services/logd/README.md](../logd/README.md) | Master log endpoint owner; svcmgr-launched, pulls init-logd's history at handover |
 | [services/pwrmgr/README.md](../pwrmgr/README.md) | svcmgr-launched post-handover; acquires its shutdown caps from devmgr, not from init |
+| [services/svcmgr/endowment/README.md](../svcmgr/endowment/README.md) | `svcmgr-endowment`: the handover-endowment wire codec init encodes with |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 | [docs/documentation-standards.md](../../docs/documentation-standards.md) | Document hierarchy, authority, backlinks |
 

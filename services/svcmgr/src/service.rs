@@ -11,6 +11,8 @@
 
 use std::os::seraph::StartupInfo;
 
+use svcmgr_endowment::{DecodeError, kind as endow_kind};
+
 use crate::definitions::reconcile::PendingRegistration;
 
 /// Maximum number of monitored services.
@@ -164,52 +166,15 @@ pub struct RestartRecipe
 // ── Bootstrap (init → svcmgr handover endowment) ────────────────────────────
 //
 // init hands svcmgr its entire startup state over the bootstrap-round
-// protocol — there is no separate post-bootstrap registration label.
-// Round kinds are tagged in `data[0]`:
-//
-//   CAPS (round 1, not done):
-//     caps[0]: svcmgr's service endpoint (RECV — the discovery-registry
-//              + handover endpoint)
-//     caps[1]: svcmgr's own bootstrap endpoint (RECV — serves bootstrap
-//              requests from launched / restarted children)
-//     caps[2]: SEND on the root filesystem's namespace endpoint, which
-//              svcmgr publishes as `rootfs.root` (0 if init could not
-//              derive it)
-//     caps[3]: SEND|GRANT (badge 0) source on devmgr's registry endpoint,
-//              from which svcmgr mints the `devmgr.registry`
-//              (`REGISTRY_QUERY_AUTHORITY`), `devmgr.shutdown` (adds
-//              `SHUTDOWN_DEVICE_AUTHORITY`), and `devmgr.test` (adds
-//              `ORPHAN_TEST_AUTHORITY`) publish caps and the
-//              `DRIVERS_DIR_AUTHORITY` SET_DRIVERS_DIR cap (0 if absent)
-//     data[1]: `SVCMGR_LABELS_VERSION` handshake
-//
-//   SUBSTRATE (one per init-bootstrapped service):
-//     caps[0]: the service's main thread cap (svcmgr binds death-
-//              notification on it at reconciliation)
-//     data[1]: name_len; data[2..]: name bytes (LE-packed)
-//
-//   LOGD_SOURCES (terminal round, done):
-//     caps[0]: reserved master-log endpoint source (svcmgr mints real-logd's
-//              RECV from it per launch, and the first-launch HANDOVER_PULL
-//              SEND); held for the system's life so it can relaunch logd
-//     caps[1]: badge-0 `SEND|GRANT` source on procmgr's service endpoint
-//              (svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it)
-//
-// The substrate pairs land in `pending`; `HANDOVER_COMPLETE` later
-// reconciles them against `/config/svcmgr/services/`. log and procmgr
-// endpoints arrive via `ProcessInfo` / `StartupInfo`, not these rounds.
-//
-// Mirrors the serve side in `services/init/src/service.rs::endow_kind`.
-mod endow_kind
-{
-    /// Round 1: svcmgr's own endpoints + publish-role source caps.
-    pub const CAPS: u64 = 1;
-    /// One substrate `(name, thread_cap)` registration.
-    pub const SUBSTRATE: u64 = 2;
-    /// Terminal round: the reserved log-sink sources svcmgr mints real-logd's
-    /// bootstrap caps from on every (re)launch.
-    pub const LOGD_SOURCES: u64 = 3;
-}
+// protocol — there is no separate post-bootstrap registration label. The
+// round kinds and the encoding of the `CAPS` and `LOGD_SOURCES` rounds
+// (only present caps ride, a presence bitmap names the slot each fills) are
+// the `svcmgr_endowment` crate, which init encodes with; the wire layout is
+// specified in services/svcmgr/docs/ipc-interface.md § Handover endowment.
+// Each `SUBSTRATE` round parks one `(name, thread_cap)` pair in `pending`;
+// `HANDOVER_COMPLETE` later reconciles them against
+// `/config/svcmgr/services/`. log and procmgr endpoints arrive via
+// `ProcessInfo` / `StartupInfo`, not these rounds.
 
 /// Well-known capability slots acquired from the handover endowment.
 #[allow(clippy::struct_field_names)]
@@ -242,8 +207,8 @@ pub struct SvcmgrCaps
 /// creator (init) by draining the handover endowment rounds. Substrate
 /// `(name, thread_cap)` pairs are parked in `pending`; the returned
 /// `SvcmgrCaps` carries the endpoint + publish-source caps. Returns `None`
-/// on a missing creator endpoint, a version mismatch, or a malformed CAPS
-/// round.
+/// on a missing creator endpoint, a failed round, a version mismatch, or a
+/// malformed CAPS round.
 pub fn bootstrap_caps(
     info: &StartupInfo,
     ipc_buf: *mut u64,
@@ -265,54 +230,68 @@ pub fn bootstrap_caps(
         {
             endow_kind::CAPS =>
             {
-                if round.cap_count < 2
+                match svcmgr_endowment::decode_caps(
+                    &round.caps[..round.cap_count],
+                    &round.data[..round.data_words],
+                )
                 {
-                    return None;
-                }
-                if round.data_words < 2 || round.data[1] != u64::from(ipc::SVCMGR_LABELS_VERSION)
-                {
-                    std::os::seraph::log!("bootstrap: endowment version mismatch");
-                    return None;
-                }
-                caps = Some(SvcmgrCaps {
-                    service_ep: round.caps[0],
-                    bootstrap_ep: round.caps[1],
-                    rootfs_root: if round.cap_count > 2
+                    Ok(c) =>
                     {
-                        round.caps[2]
+                        caps = Some(SvcmgrCaps {
+                            service_ep: c.service_ep,
+                            bootstrap_ep: c.bootstrap_ep,
+                            rootfs_root: c.rootfs_root,
+                            devmgr_registry: c.devmgr_registry,
+                            master_log_source: 0,
+                            procmgr_death_auth_source: 0,
+                        });
                     }
-                    else
+                    Err(DecodeError::VersionMismatch) =>
                     {
-                        0
-                    },
-                    devmgr_registry: if round.cap_count > 3
-                    {
-                        round.caps[3]
+                        std::os::seraph::log!("bootstrap: endowment version mismatch");
+                        return None;
                     }
-                    else
+                    Err(DecodeError::Malformed) =>
                     {
-                        0
-                    },
-                    master_log_source: 0,
-                    procmgr_death_auth_source: 0,
-                });
+                        std::os::seraph::log!("bootstrap: malformed endowment CAPS round");
+                        return None;
+                    }
+                }
             }
             endow_kind::SUBSTRATE => ingest_substrate(&round, pending, pending_count),
             endow_kind::LOGD_SOURCES =>
             {
                 // Terminal round (arrives after CAPS). Record the reserved
-                // log-sink sources on the already-built cap set.
-                if let Some(c) = caps.as_mut()
+                // log-sink sources on the already-built cap set; a round
+                // with no cap set to land on, or one that does not decode,
+                // is released rather than leaked.
+                let delivered = &round.caps[..round.cap_count];
+                match (
+                    caps.as_mut(),
+                    svcmgr_endowment::decode_logd_sources(
+                        delivered,
+                        &round.data[..round.data_words],
+                    ),
+                )
                 {
-                    c.master_log_source = round.caps[0];
-                    c.procmgr_death_auth_source = if round.cap_count > 1
+                    (Some(c), Ok(sources)) =>
                     {
-                        round.caps[1]
+                        c.master_log_source = sources.master_log_source;
+                        c.procmgr_death_auth_source = sources.procmgr_death_auth_source;
                     }
-                    else
+                    (_, decoded) =>
                     {
-                        0
-                    };
+                        if decoded.is_err()
+                        {
+                            std::os::seraph::log!(
+                                "bootstrap: malformed endowment LOGD_SOURCES round"
+                            );
+                        }
+                        for &cap in delivered
+                        {
+                            let _ = syscall::cap_delete(cap);
+                        }
+                    }
                 }
             }
             other => std::os::seraph::log!("bootstrap: unknown endowment kind {other}"),

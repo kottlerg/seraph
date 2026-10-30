@@ -527,6 +527,7 @@ dependencies = [
  "ns-client",
  "process-abi",
  "process-layout",
+ "svcmgr-endowment",
  "syscall",
  "syscall-abi",
 ]
@@ -1041,6 +1042,7 @@ dependencies = [
  "namespace-protocol",
  "registry",
  "svcmgr-defs",
+ "svcmgr-endowment",
  "syscall",
  "syscall-abi",
 ]
@@ -1052,6 +1054,14 @@ dependencies = [
  "ipc",
  "namespace-protocol",
  "registry",
+ "syscall-abi",
+]
+
+[[package]]
+name = "svcmgr-endowment"
+version = "0.1.1"
+dependencies = [
+ "ipc",
  "syscall-abi",
 ]
 

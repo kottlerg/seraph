@@ -12,6 +12,7 @@ members = [
     "services/procmgr/process-table",
     "services/svcmgr",
     "services/svcmgr/svc-defs",
+    "services/svcmgr/endowment",
     "services/svctest",
     "services/usertest",
     "services/crasher",

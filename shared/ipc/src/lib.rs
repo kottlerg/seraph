@@ -757,7 +757,7 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 5;
+pub const SVCMGR_LABELS_VERSION: u32 = 6;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -775,9 +775,10 @@ pub mod svcmgr_labels
     // a parked name with a definition is bound and supervised using the
     // on-disk recipe; a defined name not parked is launched by svcmgr
     // itself; a parked name with no definition is a hard error (svcmgr
-    // has no recipe to restart it). The endowment layout lives in
-    // `services/init/src/service.rs` and `services/svcmgr/src/service.rs`;
-    // see `services/svcmgr/docs/ipc-interface.md` and
+    // has no recipe to restart it). The round kinds and the encoding of
+    // the endowment are the `svcmgr-endowment` crate
+    // (`services/svcmgr/endowment`); see
+    // `services/svcmgr/docs/ipc-interface.md` and
     // `services/svcmgr/docs/service-definitions.md` for the spec.
 
     /// Internal namespace-policy descriptor stored on `ServiceEntry`
@@ -2381,8 +2382,8 @@ pub mod svcmgr_errors
     pub const REGISTER_REJECTED: u64 = 6;
     /// Reserved; not emitted by the current svcmgr. The handover-endowment
     /// `CAPS` round carries the caller's `SVCMGR_LABELS_VERSION` in `data[1]`
-    /// (after the `endow_kind` discriminant in `data[0]`); on a mismatch
-    /// svcmgr's bootstrap fails without replying this code.
+    /// (after the `svcmgr_endowment::kind::CAPS` round kind in `data[0]`); on
+    /// a mismatch svcmgr's bootstrap fails without replying this code.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
     /// Caller's badge lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
     /// `PUBLISH_ENDPOINT` request or [`svcmgr_labels::HANDOVER_AUTHORITY`] on

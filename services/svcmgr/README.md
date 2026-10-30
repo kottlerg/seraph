@@ -54,6 +54,10 @@ svcmgr/
 │                                  # wire-blob encoder (`build_blob`), and
 │                                  # the `cwd_rights` / `handover_permitted`
 │                                  # decisions
+├── endowment/                     # `svcmgr-endowment`, its own component
+│                                  # shared with init: host-tested codec of
+│                                  # init's handover endowment (see
+│                                  # endowment/README.md)
 └── docs/
     ├── ipc-interface.md           # handover endowment, HANDOVER_COMPLETE,
     │                              # PUBLISH_ENDPOINT / QUERY_ENDPOINT
@@ -236,6 +240,7 @@ death leaves it permanently down — degraded, or a graceful shutdown for
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Userspace boot order, init's Handover stage, process-death flow |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 | [docs/documentation-standards.md](../../docs/documentation-standards.md) | Document hierarchy, authority, backlinks |
+| [services/svcmgr/endowment/README.md](endowment/README.md) | `svcmgr-endowment`: the handover-endowment wire codec svcmgr decodes with |
 
 ---
 

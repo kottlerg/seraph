@@ -2020,9 +2020,10 @@ pub fn sys_cap_delete(tf: UserFrame) -> Result<u64, SyscallError>
 /// - `InvalidState` — another revoke, a move, or an IPC capability transfer is
 ///   already in flight on this slot; or a corrupted derivation link was found
 ///   (the dangling chain was truncated and the revoke is incomplete).
-/// - `Interrupted` — the liveness backstop tripped: sustained concurrent
-///   derivation kept extending the subtree past `MAX_REVOKE_BATCHES`
-///   batches. Everything revoked so far stays revoked; retry to continue.
+/// - `Interrupted` — the liveness backstop tripped after `MAX_REVOKE_BATCHES`
+///   batches: the subtree was larger than they cover, or concurrent
+///   derivation kept extending it. Everything revoked so far stays revoked;
+///   retry to continue.
 #[cfg(not(test))]
 pub fn sys_cap_revoke(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -2169,7 +2170,7 @@ pub fn sys_cap_revoke(tf: UserFrame) -> Result<u64, SyscallError>
 /// Liveness backstop for `sys_cap_revoke`: the maximum number of batches one
 /// syscall runs before returning `Interrupted`. At `MAX_REVOKE_EDITS` edits
 /// per batch this covers ~2.7 × 10^8 edits (~1.3 × 10^8 revoked nodes), which
-/// a subtree can exceed: at a 72-byte slot per node, some 9 to 19 GiB of slots
+/// a subtree can exceed: at a 72-byte slot per node, some 9 to 18 GiB of slots
 /// hold one that large. The bound is still correct, because the backstop loses
 /// no work: every node a batch revokes stays revoked, so a caller that retries
 /// after `Interrupted` resumes on the remaining subtree, and a fixed subtree of

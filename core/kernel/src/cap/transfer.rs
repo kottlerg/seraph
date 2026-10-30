@@ -172,25 +172,35 @@ unsafe fn stage_move(
         )
     };
 
-    let dst_idx_nz =
-        match dst_idx
+    // The destination takes its own object reference while both slots name
+    // the object (capability-internals.md § Move). It is checked like any new
+    // slot's (`REF_COUNT_LIMIT`): a move the liveness backstop abandons leaves
+    // the destination a live second slot.
+    // SAFETY: object is the live header the source slot holds.
+    unsafe { object.as_ref().try_inc_ref() }?;
+
+    let inserted = match dst_idx
+    {
+        // SAFETY: caller contract; the destination lock is held.
+        None =>
+        unsafe { (*dst_cspace).insert_cap(tag, rights, object) },
+        Some(idx) =>
         {
             // SAFETY: caller contract; the destination lock is held.
-            None => unsafe { (*dst_cspace).insert_cap(tag, rights, object) }
-                .map_err(SyscallError::from)?,
-            Some(idx) =>
-            {
-                // SAFETY: caller contract; the destination lock is held.
-                unsafe { (*dst_cspace).insert_cap_at(idx.get(), tag, rights, object) }
-                    .map_err(SyscallError::from)?;
-                idx
-            }
-        };
-
-    // The destination takes its own object reference while both slots name
-    // the object (capability-internals.md § Move).
-    // SAFETY: object is the live header the source slot holds.
-    unsafe { object.as_ref().inc_ref() };
+            unsafe { (*dst_cspace).insert_cap_at(idx.get(), tag, rights, object) }.map(|()| idx)
+        }
+    };
+    let dst_idx_nz = match inserted
+    {
+        Ok(idx) => idx,
+        Err(e) =>
+        {
+            // SAFETY: undoes the increment above; the source slot's own
+            // reference keeps the count above zero.
+            unsafe { object.as_ref().dec_ref() };
+            return Err(SyscallError::from(e));
+        }
+    };
 
     // SAFETY: caller contract; the destination lock is held.
     let (dst_gen, handle) = unsafe {

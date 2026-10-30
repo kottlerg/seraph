@@ -106,8 +106,8 @@ pub struct KernelObjectHeader
 
 /// Ceiling on [`KernelObjectHeader::ref_count`] for the references userspace
 /// can multiply without a bound of its own: a new capability slot (copy,
-/// derive, badged derive) refuses at it, and so does a retype from a Memory
-/// object whose count is at it.
+/// derive, badged derive, a move's destination) refuses at it, and so does a
+/// retype from a Memory object whose count is at it.
 ///
 /// The value is correct as is, not a limit a workload meets: every
 /// userspace-amplifiable reference costs a 72-byte capability slot or a retype
@@ -116,18 +116,24 @@ pub struct KernelObjectHeader
 /// ceiling refuses the request with `QuotaExceeded` instead of wrapping the
 /// count and freeing a live object.
 ///
+/// A move's destination slot takes its reference through the same check: a
+/// move its liveness backstop abandons leaves that slot live beside the
+/// source.
+///
 /// The ceiling leaves 2^31 of headroom below `u32::MAX` for every other
 /// reference, which the kernel takes unchecked. Each of those is bounded by an
-/// object count, not by a caller's request: syscall pins and the transient
-/// reference of a move (a few per thread), fault-handler and death-observer
-/// bindings (one per thread binding), wait-set membership (one per source),
-/// Mmio mapping records (four per Mmio object, whose bodies are SEED-backed),
-/// SEED leases (bounded by the SEED reserve), and the leases of retypes that
-/// passed `retype_allocate`'s check before another took the count to the
-/// ceiling (one per thread mid-retype). Exhausting the headroom would take
-/// 2^31 threads, and a thread costs a kernel stack and a TCB, so the count
-/// cannot wrap (core/kernel/docs/capability-internals.md § Kernel Object
-/// Reference Counting).
+/// object count, not by a caller's request. Per thread: its syscall pins (a
+/// few), its fault-handler binding (one), the death observers bound on it (at
+/// most `MAX_DEATH_OBSERVERS`, four), and the lease of a retype it has in
+/// flight that passed `retype_allocate`'s check before another took the count
+/// to the ceiling (one); fewer than 16 in all. Per other object: wait-set
+/// membership (one per source), Mmio mapping records (four per Mmio object,
+/// whose bodies are SEED-backed), address-space death observers (a fixed
+/// number per address space), and SEED leases (bounded by the SEED reserve).
+/// Exhausting the headroom would take some 2^27 threads, each with its own
+/// kernel stack and TCB (at least 2 TiB of kernel stacks), so the count cannot
+/// wrap (core/kernel/docs/capability-internals.md § Kernel Object Reference
+/// Counting).
 pub const REF_COUNT_LIMIT: u32 = 1 << 31;
 
 // SAFETY: ancestor is a back-pointer to a kernel object whose lifetime is
@@ -171,11 +177,11 @@ impl KernelObjectHeader
 
     /// Increment the reference count for an owner whose number is bounded
     /// below the headroom above [`REF_COUNT_LIMIT`]: a syscall pin, a binding,
-    /// a mapping record, a SEED lease, the transient second reference of a
-    /// move, or the lease of a retype that [`crate::cap::retype::retype_allocate`]
-    /// admitted (see core/kernel/docs/capability-internals.md § Kernel Object
-    /// Reference Counting). A new capability slot takes its reference through
-    /// [`Self::try_inc_ref`] instead.
+    /// a mapping record, a SEED lease, or the lease of a retype that
+    /// [`crate::cap::retype::retype_allocate`] admitted (see
+    /// core/kernel/docs/capability-internals.md § Kernel Object Reference
+    /// Counting). A new capability slot, a move's destination included, takes
+    /// its reference through [`Self::try_inc_ref`] instead.
     pub fn inc_ref(&self)
     {
         let prev = self.ref_count.fetch_add(1, Ordering::Relaxed);

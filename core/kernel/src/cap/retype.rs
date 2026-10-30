@@ -28,22 +28,27 @@
 //!   linked list. New allocations pop from the list, or bump-allocate; once
 //!   the bump frontier is spent, one free page block is carved into the
 //!   bin's slots.
-//! - **Page-aligned blocks** — first-fit free list with split-on-allocate.
-//!   Each freed block's first 16 bytes hold `(size_pages: u64,
-//!   next_offset: u64)`. Allocations walk the list looking for a block
-//!   `>= requested pages`; on a larger fit, the block is split and the
-//!   remainder kept on the list. No coalesce on free.
+//! - **Page-aligned blocks** — an address-ordered first-fit free list with
+//!   split-on-allocate and coalesce-on-free. Each freed block's first 16
+//!   bytes hold `(size_pages: u64, next_offset: u64)`. A free merges the
+//!   block with the free blocks on either side; an allocation walks the list
+//!   for a block `>= requested pages` and, on a larger fit, leaves the
+//!   remainder in the block's place.
 //!
 //! Free-list nodes are still stored inline in the cap's region (the freed
 //! offsets that the lists thread together), but the *head pointers and
 //! bump cursor* live in kernel memory. Userspace `sys_mem_map` writes
 //! against the cap's region therefore cannot corrupt allocator metadata;
-//! they can at worst overwrite a freed offset's link cell. Both allocation
-//! paths validate every inline link before dereferencing it: the page path
-//! via the bounds/iteration-cap walk in `try_alloc_page_block`, the sub-page
-//! path via `subpage_link_ok` in `try_pop_subpage`. A corrupt link is
-//! rejected (the affected list is truncated to `FREE_LIST_END` and the
-//! request falls through to bump allocation), never dereferenced.
+//! they can at worst overwrite a freed offset's link cell. Every walk
+//! validates each inline link before dereferencing it. The page walks use
+//! `page_node_ok`: a node must lie in the region, be page-aligned and
+//! non-empty, and start at or above its predecessor's end, so a walk is
+//! bounded by `size / PAGE_SIZE` nodes and a cycle cannot be followed; a
+//! malformed node stops the allocation walk (the request falls through to
+//! bump allocation), sends a free to the list head, and is reported once per
+//! boot. The sub-page path uses `subpage_link_ok` in `try_pop_subpage`, which
+//! truncates the bin's list to `FREE_LIST_END` at a corrupt link. No corrupt
+//! link is dereferenced.
 //!
 //! ## Concurrency
 //!
@@ -1682,6 +1687,34 @@ mod tests
         retype_free(&memory, c, p);
         retype_free(&memory, b, p);
         assert_eq!(retype_allocate(&memory, 3 * p), Ok(a));
+    }
+
+    // Defect guarded: a free that meets a malformed node follows it, or drops
+    // the freed block, instead of keeping the block allocatable.
+    #[test]
+    fn a_free_past_a_malformed_page_node_keeps_the_freed_block_allocatable()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(4);
+        let a = retype_allocate(&memory, p).unwrap();
+        let _b = retype_allocate(&memory, p).unwrap();
+        let c = retype_allocate(&memory, p).unwrap();
+        let _d = retype_allocate(&memory, p).unwrap();
+        retype_free(&memory, a, p);
+        // Zero a's size word: a node no well-formed list holds.
+        // SAFETY: a's size cell lies in the live buffer.
+        unsafe { write_u64_at(memory.base, a, 0) };
+        retype_free(&memory, c, p);
+        assert_eq!(
+            retype_allocate(&memory, p),
+            Ok(c),
+            "the freed block went to the head"
+        );
+        assert_eq!(
+            retype_allocate(&memory, p),
+            Err(SyscallError::OutOfMemory),
+            "the walk stops at the malformed node"
+        );
     }
 
     // Defect guarded: a list that loops back (a corrupt link) is walked

@@ -396,19 +396,22 @@ kernel objects are freed — there is no explicit "destroy" syscall (see
 
 The count is 32 bits wide and cannot wrap. The references userspace can multiply without a bound
 of their own, new capability slots and retype leases, are refused at `REF_COUNT_LIMIT` (2^31) with
-`QuotaExceeded`: a copy, derivation, or badged derivation takes its slot's reference through
-`KernelObjectHeader::try_inc_ref`, the one checked increment, and `retype_allocate` refuses a
-retype from a Memory object whose count is at the limit, before the new object takes its lease.
-The limit is correct as is, not one a workload meets: each such reference costs a 72-byte slot or a
-retype child of at least 128 bytes, so 2^31 of them hold at least 144 GiB against one object, and
-reaching it refuses instead of corrupting. Every other reference is taken unchecked, in the 2^31 of
-headroom between the limit and `u32::MAX`, because each kind is bounded by an object count rather
-than by a request: syscall pins and the transient second reference of a move (a few per thread),
-fault-handler and death-observer bindings (one per binding thread), wait-set membership (one per
-source), Mmio mapping records (four per Mmio object, whose bodies are SEED-backed), SEED leases
-(bounded by the SEED reserve), and the leases of retypes admitted just before the count reached
-the limit (one per thread mid-retype). Exhausting the headroom would take 2^31 threads, each with
-its own kernel stack and TCB.
+`QuotaExceeded`: a copy, derivation, badged derivation, or move takes its new slot's reference
+through `KernelObjectHeader::try_inc_ref`, the one checked increment (a move's destination counts
+because a move its liveness backstop abandons leaves both slots live), and `retype_allocate`
+refuses a retype from a Memory object whose count is at the limit, before the new object takes its
+lease. The limit is correct as is, not one a workload meets: each such reference costs a 72-byte
+slot or a retype child of at least 128 bytes, so 2^31 of them hold at least 144 GiB against one
+object, and reaching it refuses instead of corrupting. Every other reference is taken unchecked, in
+the 2^31 of headroom between the limit and `u32::MAX`, because each kind is bounded by an object
+count rather than by a request. Per thread: its syscall pins (a few), its fault-handler binding
+(one), the death observers bound on it (at most `MAX_DEATH_OBSERVERS`, four), and the lease of a
+retype it has in flight that passed `retype_allocate`'s check just before the count reached the
+limit (one); fewer than 16 in all. Per other object: wait-set membership (one per source), Mmio
+mapping records (four per Mmio object, whose bodies are SEED-backed), address-space death
+observers (a fixed number per address space), and SEED leases (bounded by the SEED reserve).
+Exhausting the headroom would take some 2^27 threads, each with its own kernel stack and TCB (at
+least 2 TiB of kernel stacks).
 
 The principal kernel-internal owners:
 
@@ -671,11 +674,12 @@ cleared, and the root is revalidated per batch so a root recycled mid-revoke
 stops the loop. Every batch that reports more work performed a full budget of
 edits, so the loop terminates against any fixed subtree; a concurrent deriver
 can extend the work only by spending its own slots and syscalls. A liveness
-backstop (`MAX_REVOKE_BATCHES`) bounds the loop unconditionally: it covers more
-edits than any subtree plausibly-sized hardware can hold (every node costs its
-creator a slot plus a kernel object), so tripping it indicates sustained
-concurrent re-derivation and returns `Interrupted` — revoked nodes stay
-revoked, and a retry continues from the surviving subtree.
+backstop (`MAX_REVOKE_BATCHES`) bounds the loop unconditionally and returns
+`Interrupted` once that many batches have run: about 2.7 × 10^8 edits, which a
+fixed subtree of some 1.3 × 10^8 nodes (9 to 18 GiB of slots) also exceeds, as
+does sustained concurrent re-derivation. Revoked nodes stay revoked, so a retry
+continues from the surviving subtree, and a fixed subtree of any size is cleared
+by finitely many retries.
 
 Deletion and the range splits (`SYS_MMIO_SPLIT`, `SYS_IRQ_SPLIT`,
 `SYS_IOPORT_SPLIT`, `SYS_SCHED_SPLIT`) consume a slot without revoking
@@ -973,7 +977,7 @@ specific slot numbers.
 | Order | Phase | Capability |
 |---|---|---|
 | 0 | — | Null (permanent; always slot 0) |
-| 1 | 7 | Memory capabilities (one per RAM block drained from the buddy allocator; the seed block contributes only its post-reserve tail) |
+| 1 | 7 | Memory capabilities (one per contiguous RAM extent drained from the buddy allocator; the seed extent contributes only its post-reserve tail) |
 | 2 | 7 | Mmio capabilities, Map and Write rights (one over the kernel console UART on RISC-V, then one per validated `BootInfo.mmio_apertures` entry) |
 | 3 | 7 | SchedControl capability (band `[1, PRIORITY_MAX]`) |
 | 4 | 7 | One root Interrupt range capability (every valid IRQ id on the architecture) |

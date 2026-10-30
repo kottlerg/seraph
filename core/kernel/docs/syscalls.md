@@ -356,7 +356,8 @@ stale), `InvalidArgument` (a cap slot repeated in one reply, or
 (registered IPC buffer page unmapped), `InvalidState` (a reply cap slot is
 pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer),
 `QuotaExceeded` (caller's CSpace
-directory structurally full for reply cap transfer), `OutOfMemory`
+directory structurally full for reply cap transfer, or a transferred cap's object has its
+reference count at its 2^31 ceiling), `OutOfMemory`
 (slot-page pool exhausted); a `data_count` or `cap_count` above its maximum is clamped, not
 refused, and the call never blocks, so it never returns `Interrupted`. Every payload or cap
 failure while
@@ -884,8 +885,9 @@ source and destination slots the same way (see
 **Errors:** `InvalidCapability`; `InvalidState` (another revoke, a move, or an IPC
 capability transfer is already in flight on this slot, or a corrupted derivation link
 was found — the revoke is incomplete and the dangling chain was cut); `Interrupted`
-(liveness backstop: sustained concurrent derivation kept extending the subtree — everything revoked
-so far stays revoked; retry to continue).
+(liveness backstop, after `MAX_REVOKE_BATCHES` batches: the subtree was larger than they cover, or
+concurrent derivation kept extending it — everything revoked so far stays revoked; retry to
+continue).
 
 ---
 
@@ -2150,7 +2152,9 @@ and the call never returns (see
 capability while the move was in flight), `InsufficientRights` (dst CSpace
 lacks Insert), `InvalidArgument` (dst_slot occupied or out of range),
 `OutOfMemory` (slot-page pool exhausted), `QuotaExceeded` (dst CSpace directory
-structurally full), `InvalidState` (a `SYS_CAP_REVOKE`, another `SYS_CAP_MOVE`, or an IPC
+structurally full, or the object's reference count is at its 2^31 ceiling: the destination takes
+its reference before the source releases its own), `InvalidState` (a `SYS_CAP_REVOKE`, another
+`SYS_CAP_MOVE`, or an IPC
 capability transfer is in flight on the source slot; or the destination slot was
 freed while the move was in flight — the source keeps the capability),
 `Interrupted` (liveness backstop, per above).

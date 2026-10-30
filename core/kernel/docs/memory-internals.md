@@ -124,7 +124,7 @@ one page taken from the page free list and cut into that class's slots. A page-m
 is placed from the page free list, else at the bump cursor. The page free list is kept in
 ascending address order, a freed block merging with the free blocks on either side, so it holds
 one node per run of free pages and a first-fit walk visits at most `size / PAGE_SIZE` nodes; a
-node that is not above its predecessor's end, or lies outside the object, is corruption, which the
+node that starts below its predecessor's end, or lies outside the object, is corruption, which the
 walk reports once per boot and stops at. The carve keeps freed page blocks
 usable by sub-page requests, which SEED depends on: init's bootstrap objects return to it as page
 blocks at init's reap, and its runtime bodies are sub-page apart from x86_64's per-thread

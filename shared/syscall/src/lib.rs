@@ -451,7 +451,8 @@ pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, or the caller's
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
-/// structural ceiling).
+/// structural ceiling). `QuotaExceeded` also means the Memory object's reference
+/// count is at its 2^31 ceiling.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -477,7 +478,8 @@ pub fn cap_create_endpoint(memory_cap: u32) -> Result<u32, i64>
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, or the caller's
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
-/// structural ceiling).
+/// structural ceiling). `QuotaExceeded` also means the Memory object's reference
+/// count is at its 2^31 ceiling.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -520,7 +522,8 @@ pub fn cap_create_notification(memory_cap: u32) -> Result<u32, i64>
 /// object type; `InsufficientRights` if `memory_cap` lacks Retype or the
 /// augment target lacks Map; `OutOfMemory` if `memory_cap`'s region or the
 /// caller's `CSpace` slot-page pool is exhausted; `QuotaExceeded` if the
-/// caller's `CSpace` directory is structurally full.
+/// caller's `CSpace` directory is structurally full or `memory_cap`'s object has
+/// its reference count at its 2^31 ceiling.
 // cast_possible_truncation, cast_sign_loss: ret is 0 (augment mode) or a
 // non-negative cap handle — a 24-bit slot index plus an 8-bit generation
 // (`CAP_INDEX_BITS + 8 <= 32`) — so it fits u32.
@@ -572,7 +575,8 @@ pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 /// `OutOfMemory` if `memory_cap`'s region or the caller's `CSpace` slot-page
 /// pool is exhausted, or, in create mode, the kernel's 4096-entry `CSpace` id
 /// namespace is; `QuotaExceeded` if the caller's `CSpace` directory is
-/// structurally full. A later cap insert into the new `CSpace` fails with
+/// structurally full or `memory_cap`'s object has its reference count at its
+/// 2^31 ceiling. A later cap insert into the new `CSpace` fails with
 /// `OutOfMemory` (-8) when the seeded pool is exhausted (refill via augment
 /// mode) and `QuotaExceeded` (-17) at the structural ceiling.
 // cast_possible_truncation, cast_sign_loss: ret is 0 (augment mode) or a
@@ -639,7 +643,8 @@ pub fn raw_cap_create_cspace(
 /// `priority` without a `SchedControl` cap, or `priority` above
 /// `PRIORITY_MAX`), `OutOfMemory` (the Memory cap's `available_bytes` or the
 /// caller's `CSpace` slot pool is exhausted), or `QuotaExceeded` (the `CSpace`
-/// directory is structurally full).
+/// directory is structurally full, or the Memory object's reference count is at
+/// its 2^31 ceiling).
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1260,7 +1265,8 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 /// augment mode; `QuotaExceeded` at the structural ceiling). For an `Mmio` or
 /// `IoPort` source, `QuotaExceeded` also means its range already has 64 live
 /// copies, and `OutOfMemory` that the kernel's SEED reserve cannot back the
-/// fresh object. `InvalidCapability`
+/// fresh object; for any other source, `QuotaExceeded` also means the object's
+/// reference count is at its 2^31 ceiling. `InvalidCapability`
 /// also covers a source a concurrent delete, move, or revoke freed before the
 /// copy was linked; `InvalidState` means a `cap_revoke`, `cap_move`, or IPC
 /// capability transfer is in flight on the source.
@@ -1298,9 +1304,10 @@ pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result
 /// # Errors
 /// Returns a negative `i64` error code if the source cap is invalid or the
 /// `CSpace`'s slot pool cannot back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the
-/// structural ceiling), or, for an `Mmio` or `IoPort` source, as for
-/// [`cap_copy`] (`QuotaExceeded` past 64 live copies of the range,
-/// `OutOfMemory` when SEED cannot back the object). `InvalidCapability` also covers a source a concurrent
+/// structural ceiling), or, as for [`cap_copy`], `QuotaExceeded` past 64 live
+/// copies of an `Mmio` or `IoPort` source's range or at any other source
+/// object's 2^31 reference-count ceiling, and `OutOfMemory` when SEED cannot
+/// back an `Mmio` or `IoPort` object. `InvalidCapability` also covers a source a concurrent
 /// delete, move, or revoke freed before the new slot was linked;
 /// `InvalidState` means a `cap_revoke`, `cap_move`, or IPC capability
 /// transfer is in flight on the source.
@@ -1329,7 +1336,8 @@ pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 /// Returns a negative `i64` error code if the source cap is invalid, the badge
 /// is zero, the source already has a badge, or the `CSpace`'s slot pool cannot
 /// back a fresh slot (`OutOfMemory`; `QuotaExceeded` at the structural ceiling),
-/// or, for an `Mmio` or `IoPort` source, as for [`cap_copy`].
+/// or as for [`cap_copy`] (the `Mmio` and `IoPort` copy limits, and any other
+/// source object's 2^31 reference-count ceiling).
 /// `InvalidCapability` also covers a source a concurrent delete, move, or
 /// revoke freed before the new slot was linked; `InvalidState` means a
 /// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
@@ -1400,8 +1408,9 @@ pub fn cap_delete(slot: u32) -> Result<(), i64>
 /// - `InvalidState` (-15) — another revoke, a move, or an IPC capability
 ///   transfer is already in flight on this slot, or the kernel found a
 ///   corrupted derivation link (the revoke is incomplete).
-/// - `Interrupted` (-16) — the kernel's liveness backstop tripped under
-///   sustained concurrent derivation; everything revoked so far stays
+/// - `Interrupted` (-16) — the kernel's liveness backstop tripped: the
+///   subtree was larger than one call covers (about 1.3 × 10^8 nodes), or
+///   concurrent derivation kept extending it; everything revoked so far stays
 ///   revoked, and a retry continues (see [`cap_revoke_all`]).
 pub fn cap_revoke(slot: u32) -> Result<(), i64>
 {
@@ -1413,14 +1422,16 @@ pub fn cap_revoke(slot: u32) -> Result<(), i64>
 
 /// [`cap_revoke`], retried while the kernel reports `Interrupted` (the
 /// multi-batch liveness backstop) — each retry continues clearing the
-/// surviving subtree, so the loop finishes once concurrent derivation
-/// stops. The call sites that must fully clear a subtree before releasing
-/// its root (teardown/reclaim paths) use this form.
+/// surviving subtree, so the loop finishes on a fixed subtree, however large,
+/// and once concurrent derivation stops. The call sites that must fully clear
+/// a subtree before releasing its root (teardown/reclaim paths) use this form.
 ///
 /// Retries are bounded: each `Interrupted` round already represents ~10^8
-/// kernel-side edits, so exhausting the bound means an adversarial deriver
-/// is outpacing revocation indefinitely — the caller gets the final
-/// `Interrupted` back rather than this wrapper spinning forever.
+/// kernel-side edits, so 4096 rounds cover a fixed subtree of about 5 × 10^11
+/// nodes, more than every `CSpace` the kernel can hold at once has slots
+/// (about 1.5 × 10^10), and exhausting the bound
+/// means an adversarial deriver is outpacing revocation — the caller gets the
+/// final `Interrupted` back rather than this wrapper spinning forever.
 ///
 /// # Errors
 /// As for [`cap_revoke`]; `Interrupted` only after the retry bound.
@@ -1463,7 +1474,9 @@ pub fn cap_revoke_all(slot: u32) -> Result<(), i64>
 /// range (including above `CAP_INDEX_MASK`); `OutOfMemory` if the
 /// destination's slot pool cannot back the slot (for a non-zero
 /// `dest_index`, every leaf up to that index must be backed;
-/// `QuotaExceeded` at the structural ceiling);
+/// `QuotaExceeded` at the structural ceiling, or when the object's reference
+/// count is at its 2^31 ceiling, since the destination takes its reference
+/// before the source releases its own);
 /// `InvalidState` if a revoke, another move, or an IPC capability transfer
 /// is in flight on the source, or the destination slot was freed mid-move
 /// (the source keeps the capability);
@@ -1513,9 +1526,10 @@ pub fn cap_move(src_cap: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u
 /// range, including above `CAP_INDEX_MASK` (`InvalidArgument`; the wrapper
 /// returns it for 0 without a syscall), or the destination
 /// `CSpace`'s slot pool cannot back every leaf up to `dest_index`
-/// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
-/// `InvalidCapability` also covers a source a concurrent delete, move, or
-/// revoke freed before the copy was linked; `InvalidState` means a
+/// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling), or as for
+/// [`cap_copy`] (`QuotaExceeded` at the copy limits and the 2^31
+/// reference-count ceiling). `InvalidCapability` also covers a source a
+/// concurrent delete, move, or revoke freed before the copy was linked; `InvalidState` means a
 /// `cap_revoke`, `cap_move`, or IPC capability transfer is in flight on the
 /// source.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
@@ -1658,7 +1672,8 @@ pub fn aspace_query(aspace_cap: u32, virt: u64) -> Result<u64, i64>
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, has insufficient `available_bytes`, `capacity` is out
 /// of range, or the `CSpace`'s slot pool cannot back a fresh slot
-/// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
+/// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling). `QuotaExceeded`
+/// also means the Memory object's reference count is at its 2^31 ceiling.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.
@@ -1759,7 +1774,8 @@ pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 /// # Errors
 /// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_MEM_RETYPE`, or the `CSpace`'s slot pool cannot back a fresh slot
-/// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling).
+/// (`OutOfMemory`; `QuotaExceeded` at the structural ceiling). `QuotaExceeded`
+/// also means the Memory object's reference count is at its 2^31 ceiling.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative cap handle —
 // a 24-bit slot index plus an 8-bit generation (`CAP_INDEX_BITS + 8 <= 32`),
 // so it fits u32.

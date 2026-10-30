@@ -279,7 +279,8 @@ To prevent inference of behavior that does not exist:
 
 ## Summarized By
 
-[System Bootstrap](bootstrap.md), [Build System](build-system.md),
+[Architecture Overview](architecture.md), [System Bootstrap](bootstrap.md),
+[Build System](build-system.md),
 [rootfs/README.md](../rootfs/README.md),
 [services/drivers/README.md](../services/drivers/README.md),
 [services/drivers/virtio/blk/README.md](../services/drivers/virtio/blk/README.md),

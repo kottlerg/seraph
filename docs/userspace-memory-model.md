@@ -284,14 +284,14 @@ memmgr serves frame requests over IPC. The contract:
 - **Request shape.** `REQUEST_MEMORY_CAPS(want_pages, flags)`. `flags`
   carries `REQUIRE_CONTIGUOUS`; unset means best-effort.
 - **`REQUIRE_CONTIGUOUS` reply.** A single Memory cap covering exactly
-  `want_pages`, or an `OutOfMemoryContiguous` error.
+  `want_pages`, or a `memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS` error.
 - **Best-effort reply.** One or more Memory caps whose page counts sum
   to `want_pages`. The reply carries each returned cap's page count
   alongside it. memmgr prefers fewer caps over many.
 - **Reply cap-count bound.** A reply carries at most `MSG_CAP_SLOTS_MAX`
   (4) Memory caps, the IPC reply-side cap-slot capacity; a best-effort
   request no single free run covers is served largest-first across at
-  most that many runs, else fails with `OutOfMemoryBestEffort`.
+  most that many runs, else fails with `memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT`.
 - **Caller maps.** Every returned Memory cap is mapped at a caller-
   chosen VA via `mem_map` (which already accepts a multi-page
   `page_count` argument).
@@ -354,7 +354,8 @@ contains the faulting page (up to `DEMAND_CHUNK_PAGES` pages; see
 [Kernel Entropy Subsystem](../core/kernel/docs/entropy.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Architecture Overview](architecture.md), [Capability Model](capability-model.md),
-[Memory Model](memory-model.md), [Process Lifecycle](process-lifecycle.md),
+[Fault Handling](fault-handling.md), [Memory Model](memory-model.md),
+[Process Lifecycle](process-lifecycle.md),
 [programs/demandpaged/README.md](../programs/demandpaged/README.md),
 [programs/pipestress/README.md](../programs/pipestress/README.md),
 [programs/relrofault/README.md](../programs/relrofault/README.md),

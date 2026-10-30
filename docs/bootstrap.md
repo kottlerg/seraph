@@ -138,4 +138,4 @@ Once init exits, svcmgr is the resident supervisor. See
 
 ## Summarized By
 
-None
+[Architecture Overview](architecture.md)

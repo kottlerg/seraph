@@ -120,12 +120,9 @@ fn take_next_active_job(active: &ActiveState) -> ActiveJob
     let mut q = active.queue.lock().unwrap_or_else(PoisonError::into_inner);
     loop
     {
-        for slot in q.iter_mut()
+        if let Some(job) = q.pop_front()
         {
-            if let Some(job) = slot.take()
-            {
-                return job;
-            }
+            return job;
         }
         q = active
             .condvar
@@ -159,7 +156,7 @@ fn handle_create_from_file(
     let Some(bootstrap_handle) = submit_bootstrap(bootstrap_state, bootstrap)
     else
     {
-        // No room in the bootstrap registry (`submit_bootstrap` released
+        // The bootstrap registry could not grow (`submit_bootstrap` released
         // the order's caps) — drop the caps we still own.
         let _ = syscall::cap_delete(file_cap);
         let _ = syscall::cap_delete(badged_creator);

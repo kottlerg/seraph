@@ -550,21 +550,21 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643).
 
 ### vfsd and namespace
 
-Tracked by [#644](https://github.com/kottlerg/seraph/issues/644).
+Tracked by [#647](https://github.com/kottlerg/seraph/issues/647) (gpt `SECTOR_SIZE`, with the
+device block-size query and fs-fat's sector size).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `MAX_TREE_NODES` | `services/vfsd/root-backend/src/lib.rs` | 32, never freed | current peak plus headroom | about 2.9 KiB | make pay-as-you-go | Growable mount tree |
-| tree node index (`NONE`) | `services/vfsd/root-backend/src/lib.rs` | `u32` | provably unreachable (below `MAX_TREE_NODES`) | 4 B per link | correct as is | None |
-| `MAX_ENTRY_NAME` | `services/vfsd/root-backend/src/lib.rs` | 64 | unknown | 64 B per node | raise | `MAX_NAME_LEN` is 255 |
-| MOUNT path limit | `services/vfsd/src/main.rs` | literal 64 | unknown | 64 B stack | raise | One path limit |
-| `populate_fallthrough_caps` `path_buf` | `services/vfsd/src/main.rs` | 256 B | unknown | 256 B stack | raise | Shorter than `path_of` can produce; the fall-through is skipped silently |
-| `MAX_GPT_PARTS` | `services/vfsd/gpt/src/lib.rs` | 8 | unknown | about 450 B | raise | GPT defaults to 128 entries; size from `num_parts` |
-| gpt `SECTOR_SIZE` | `services/vfsd/gpt/src/lib.rs` | 512 | hardware spec (512-byte logical sector only) | 512 B stack | needs a design | 4Kn disks |
+| `VfsdRootBackend.nodes` | `services/vfsd/root-backend/src/lib.rs` | heap `Vec`, one node per installed path component, never freed (no unmount) | per-instance (grows with the mount tree; an allocation failure refuses the install) | none | correct as is | None |
+| tree node index (`NONE`) | `services/vfsd/root-backend/src/lib.rs` | `u32` | provably unreachable (`install` refuses a pool of `u32::MAX` nodes, each a heap allocation) | 4 B per link | correct as is | None |
+| tree component limit (`validate_name`) | `services/vfsd/root-backend/src/lib.rs` | `MAX_NAME_LEN` (255) | ABI width (the namespace protocol's name rule) | none (names are heap-allocated to their length) | correct as is | None |
+| `MAX_MOUNT_PATH_LEN` | `services/vfsd/src/main.rs` | `(MSG_DATA_WORDS_MAX - 2) * 8` = 496 | ABI width (the path bytes one MOUNT message carries) | none | correct as is | None |
+| `collect_partitions` entry list | `services/vfsd/gpt/src/lib.rs` | heap `Vec`, every used entry of the header's `num_parts` array | hardware spec (UEFI GPT: `parse_header` requires the array to lie between LBA 2 and the header's own `first_usable_lba`); a header that also inflates `first_usable_lba` is bounded by the device capacity, and a read or allocation failure stops the walk with a log | none | correct as is | None |
+| gpt `SECTOR_SIZE` | `services/vfsd/gpt/src/lib.rs` | 512 | hardware spec (512-byte logical sector only) | 512 B stack | needs a design | 4Kn disks; query the device block size (#647) |
 | `GptHeader.num_parts`, `entry_size` | `services/vfsd/gpt/src/lib.rs` | `u32` | hardware spec (UEFI GPT) | none | correct as is | None |
-| `MAX_PENDING_BOOTSTRAPS`, `MAX_PENDING_ACTIVE_JOBS` | `services/vfsd/src/worker_pool.rs` | 4 / 4 | current peak plus headroom | small | make pay-as-you-go | A fifth request is refused (#254) |
+| `BootstrapState.pending`, `ActiveState.queue` | `services/vfsd/src/worker_pool.rs` | heap `Vec` and `VecDeque`, one entry per in-flight fatfs spawn | per-instance (an allocation failure refuses the order and releases its caps) | none | correct as is | None |
 | `ACTIVE_WORKER_COUNT` | `services/vfsd/src/worker_pool.rs` | 2 | tuning (concurrency knob) | 2 thread stacks | correct as is | None (#254) |
-| `SERVICE_THREAD_COUNT` | `services/vfsd/src/main.rs` | 4 | unknown (re-entrancy depth) | 4 thread stacks | needs a design | Re-entry deeper than 3 can deadlock (#464) |
+| `SERVICE_THREAD_COUNT` | `services/vfsd/src/main.rs` | 4 | tuning (concurrency knob; no service-endpoint request waits on another) | 4 thread stacks | correct as is | None (#254) |
 
 ### init and logd
 

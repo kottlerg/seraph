@@ -35,28 +35,32 @@
 //! `fallthrough_cap` is the root mount cap captured when
 //! `MOUNT path="/"` succeeds.
 //!
+//! The tree grows on the heap, one node per installed path component
+//! that does not yet exist, and nodes are never freed (vfsd has no
+//! unmount), so a node's pool index, which is its `NodeId`, is stable
+//! for the life of the process. A component follows the namespace
+//! protocol's name rule ([`validate_name`], at most
+//! [`MAX_NAME_LEN`](namespace_protocol::MAX_NAME_LEN) bytes).
+//!
 //! The tree holds cap slot numbers but makes no syscall, so the crate is
 //! pure and host-tested — see
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
 use namespace_protocol::{
     EntryName, EntryTarget, EntryView, MemoryReply, NamespaceBackend, NamespaceRights, NodeId,
-    NodeKind, NodeStat, NsError,
+    NodeKind, NodeStat, NsError, validate_name,
 };
 
-/// Maximum tree-pool size — enough for every mount path's components
-/// plus their synthetic intermediates. The synthetic root occupies
-/// index 0; install allocates the rest linearly.
-pub const MAX_TREE_NODES: usize = 32;
-
-/// Maximum length of a single path component captured in the tree.
-pub const MAX_ENTRY_NAME: usize = 64;
-
 /// Sentinel marking "no node" in `parent` / `first_child` /
-/// `next_sibling` links. `u32::MAX` is unambiguous because tree-pool
-/// indices are bounded by `MAX_TREE_NODES`.
+/// `next_sibling` links. `u32::MAX` is unambiguous because
+/// [`VfsdRootBackend::install`] refuses to grow the pool to that many
+/// nodes.
 const NONE: u32 = u32::MAX;
 
 /// One node in the synthetic-root tree.
@@ -67,11 +71,10 @@ const NONE: u32 = u32::MAX;
 /// Both forms may carry a `fallthrough_cap` addressing the
 /// corresponding directory in the root filesystem; the synthetic
 /// root's `fallthrough_cap` is the root mount cap itself.
-#[derive(Copy, Clone)]
 struct TreeNode
 {
-    name: [u8; MAX_ENTRY_NAME],
-    name_len: u8,
+    /// Path component captured at install time; empty on the root.
+    name: Vec<u8>,
     parent: u32,
     first_child: u32,
     next_sibling: u32,
@@ -90,24 +93,6 @@ struct TreeNode
     /// root filesystem, or the root mount has not been installed yet).
     /// On `NodeId::ROOT` this field carries the root mount cap.
     fallthrough_cap: u32,
-    active: bool,
-}
-
-impl TreeNode
-{
-    const fn empty() -> Self
-    {
-        Self {
-            name: [0; MAX_ENTRY_NAME],
-            name_len: 0,
-            parent: NONE,
-            first_child: NONE,
-            next_sibling: NONE,
-            terminal_endpoint: 0,
-            fallthrough_cap: 0,
-            active: false,
-        }
-    }
 }
 
 /// In-process synthetic root for vfsd.
@@ -118,7 +103,11 @@ impl TreeNode
 /// `Mutex`).
 pub struct VfsdRootBackend
 {
-    nodes: [TreeNode; MAX_TREE_NODES],
+    /// The synthetic root, pool index 0. Held apart from `nodes` so an
+    /// empty tree needs no allocation.
+    root: TreeNode,
+    /// Every other node; pool index `i` (from 1) is `nodes[i - 1]`.
+    nodes: Vec<TreeNode>,
 }
 
 /// Outcome of a successful [`VfsdRootBackend::install`] call.
@@ -129,36 +118,16 @@ pub struct VfsdRootBackend
 /// after walking the root mount component-by-component.
 pub struct InstallResult
 {
-    new_intermediates: [u32; MAX_TREE_NODES],
-    new_intermediates_len: usize,
+    new_intermediates: Vec<u32>,
 }
 
 impl InstallResult
 {
-    fn empty() -> Self
-    {
-        Self {
-            new_intermediates: [0; MAX_TREE_NODES],
-            new_intermediates_len: 0,
-        }
-    }
-
-    fn push(&mut self, idx: u32) -> bool
-    {
-        if self.new_intermediates_len >= MAX_TREE_NODES
-        {
-            return false;
-        }
-        self.new_intermediates[self.new_intermediates_len] = idx;
-        self.new_intermediates_len += 1;
-        true
-    }
-
     /// Pool indices of the synthetic intermediates the install created.
     #[must_use]
     pub fn as_slice(&self) -> &[u32]
     {
-        &self.new_intermediates[..self.new_intermediates_len]
+        &self.new_intermediates
     }
 }
 
@@ -176,11 +145,19 @@ impl VfsdRootBackend
     #[must_use]
     pub const fn new() -> Self
     {
-        let mut nodes = [TreeNode::empty(); MAX_TREE_NODES];
-        // The synthetic root always exists and has no name. `parent`
-        // remains NONE so a stray walk never escapes upward.
-        nodes[0].active = true;
-        Self { nodes }
+        Self {
+            // The synthetic root has no name. `parent` remains NONE so a
+            // stray walk never escapes upward.
+            root: TreeNode {
+                name: Vec::new(),
+                parent: NONE,
+                first_child: NONE,
+                next_sibling: NONE,
+                terminal_endpoint: 0,
+                fallthrough_cap: 0,
+            },
+            nodes: Vec::new(),
+        }
     }
 
     /// Install one mount-point entry.
@@ -201,73 +178,87 @@ impl VfsdRootBackend
     /// compute and store each intermediate's `fallthrough_cap` via
     /// [`Self::set_fallthrough_cap`].
     ///
-    /// Returns `None`, leaving the tree unchanged, on tree exhaustion,
-    /// oversize component (`> MAX_ENTRY_NAME`), attempting to mount on
-    /// top of an already-terminal node, or re-installing the root mount
-    /// (see [`Self::can_install`]).
+    /// Returns `None`, leaving the tree unchanged, on a component that
+    /// fails [`validate_name`], an attempt to mount on top of an
+    /// already-terminal node, a re-install of the root mount (see
+    /// [`Self::can_install`]), or a failure to allocate the new nodes.
     pub fn install(&mut self, path: &[u8], cap: u32) -> Option<InstallResult>
     {
-        // Validate the whole path, and that the pool has a free node for
-        // every component the walk must create, before mutating anything.
-        self.plan_install(path)?;
-
-        let mut components = path_components(path).peekable();
-        if components.peek().is_none()
+        // Validate the whole path, and allocate every node and name the
+        // walk creates, before mutating anything.
+        let new_nodes = self.plan_install(path)?;
+        let component_count = path_components(path).count();
+        if component_count == 0
         {
-            self.nodes[0].fallthrough_cap = cap;
-            return Some(InstallResult::empty());
+            self.root.fallthrough_cap = cap;
+            return Some(InstallResult {
+                new_intermediates: Vec::new(),
+            });
         }
 
-        let mut result = InstallResult::empty();
+        // The components past the last existing node are the new ones.
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        names.try_reserve_exact(new_nodes).ok()?;
+        for component in path_components(path).skip(component_count - new_nodes)
+        {
+            let mut name = Vec::new();
+            name.try_reserve_exact(component.len()).ok()?;
+            name.extend_from_slice(component);
+            names.push(name);
+        }
+        let mut new_intermediates = Vec::new();
+        new_intermediates
+            .try_reserve_exact(new_nodes.saturating_sub(1))
+            .ok()?;
+        self.nodes.try_reserve(new_nodes).ok()?;
+
+        // Nothing below allocates: every push lands in reserved capacity.
+        let mut names = names.into_iter();
+        let mut components = path_components(path).peekable();
         let mut current: u32 = 0;
         while let Some(component) = components.next()
         {
             let is_last = components.peek().is_none();
             if let Some(child) = self.find_child(current, component)
             {
-                if is_last
+                if is_last && let Some(node) = self.node_mut(child)
                 {
-                    self.nodes[child as usize].terminal_endpoint = cap;
+                    node.terminal_endpoint = cap;
                 }
                 current = child;
                 continue;
             }
-            // `plan_install` counted a free node for this component.
-            let new_idx = self.alloc_slot()?;
-            let parent_first_child = self.nodes[current as usize].first_child;
-            let n = &mut self.nodes[new_idx as usize];
-            n.active = true;
-            n.parent = current;
-            n.name[..component.len()].copy_from_slice(component);
-            // cast_possible_truncation: `plan_install` bounded the
-            // component to MAX_ENTRY_NAME (64) bytes, which fits a u8.
-            #[allow(clippy::cast_possible_truncation)]
+            // `plan_install` counted this component among the new ones,
+            // and the loop above prepared its name.
+            let name = names.next()?;
+            let new_idx = self.next_index()?;
+            let parent_first_child = self.node(current)?.first_child;
+            self.nodes.push(TreeNode {
+                name,
+                parent: current,
+                first_child: NONE,
+                next_sibling: parent_first_child,
+                terminal_endpoint: if is_last { cap } else { 0 },
+                fallthrough_cap: 0,
+            });
+            self.node_mut(current)?.first_child = new_idx;
+            if !is_last
             {
-                n.name_len = component.len() as u8;
-            }
-            n.first_child = NONE;
-            n.next_sibling = parent_first_child;
-            n.terminal_endpoint = if is_last { cap } else { 0 };
-            n.fallthrough_cap = 0;
-            self.nodes[current as usize].first_child = new_idx;
-            // The pool has MAX_TREE_NODES - 1 allocatable nodes, so the
-            // MAX_TREE_NODES-entry result list cannot overflow.
-            if !is_last && !result.push(new_idx)
-            {
-                return None;
+                new_intermediates.push(new_idx);
             }
             current = new_idx;
         }
-        Some(result)
+        Some(InstallResult { new_intermediates })
     }
 
     /// Whether [`Self::install`] would accept `path` against the current
-    /// tree: the root is not yet mounted (for `/`), no component exceeds
-    /// `MAX_ENTRY_NAME`, the final node is not already a mount point,
-    /// and the pool has a free node for every component that must be
-    /// created. The MOUNT path checks this before it registers a
+    /// tree: the root is not yet mounted (for `/`), every component
+    /// passes [`validate_name`], the final node is not already a mount
+    /// point, and the pool can index every node the install would
+    /// create. The MOUNT path checks this before it registers a
     /// partition or spawns a driver, so a mount `install` would reject
-    /// acquires nothing.
+    /// acquires nothing; only an allocation failure in `install` itself
+    /// remains to be handled after the spawn.
     #[must_use]
     pub fn can_install(&self, path: &[u8]) -> bool
     {
@@ -284,7 +275,7 @@ impl VfsdRootBackend
         {
             // Root mount: reject a second one rather than overwrite the
             // cap and leak the running root fs driver.
-            return (self.nodes[0].fallthrough_cap == 0).then_some(0);
+            return (self.root.fallthrough_cap == 0).then_some(0);
         }
 
         // `existing` is the node the walk is at while every component so
@@ -293,10 +284,7 @@ impl VfsdRootBackend
         let mut new_nodes = 0usize;
         for component in components
         {
-            if component.len() > MAX_ENTRY_NAME
-            {
-                return None;
-            }
+            validate_name(component).ok()?;
             existing = existing.and_then(|idx| self.find_child(idx, component));
             if existing.is_none()
             {
@@ -304,78 +292,63 @@ impl VfsdRootBackend
             }
         }
         if let Some(last) = existing
-            && self.nodes[last as usize].terminal_endpoint != 0
+            && self.node(last)?.terminal_endpoint != 0
         {
             // Path is already a mount point.
             return None;
         }
-        (new_nodes <= self.free_node_count()).then_some(new_nodes)
+        // Every index, the root's included, stays below `NONE`.
+        let total = self.nodes.len().checked_add(1 + new_nodes)?;
+        (total <= NONE as usize).then_some(new_nodes)
     }
 
     /// Set a synthetic intermediate's `fallthrough_cap`. Called by the
     /// MOUNT path after walking the root mount to the corresponding
-    /// directory.
+    /// directory. An index outside the pool is ignored.
     pub fn set_fallthrough_cap(&mut self, node_idx: u32, cap: u32)
     {
-        if (node_idx as usize) < MAX_TREE_NODES && self.nodes[node_idx as usize].active
+        if let Some(node) = self.node_mut(node_idx)
         {
-            self.nodes[node_idx as usize].fallthrough_cap = cap;
+            node.fallthrough_cap = cap;
         }
     }
 
-    /// Reconstruct the absolute path of the node at `idx` into `out`,
-    /// returning the number of bytes written. The path begins with
-    /// `/` and uses `/` separators. Returns `None` if `out` is too
-    /// small or the node is inactive.
-    pub fn path_of(&self, idx: u32, out: &mut [u8]) -> Option<usize>
+    /// The absolute path of the node at `idx`: it begins with `/` and
+    /// uses `/` separators. Returns `None` if `idx` is outside the pool
+    /// or the path cannot be allocated.
+    #[must_use]
+    pub fn path_of(&self, idx: u32) -> Option<Vec<u8>>
     {
-        if (idx as usize) >= MAX_TREE_NODES || !self.nodes[idx as usize].active
-        {
-            return None;
-        }
-        if idx == 0
-        {
-            if out.is_empty()
-            {
-                return None;
-            }
-            out[0] = b'/';
-            return Some(1);
-        }
-        // Walk to root collecting indices along the way.
-        let mut chain = [0u32; MAX_TREE_NODES];
-        let mut depth = 0usize;
+        // Walk to the root collecting indices; each step moves to a
+        // lower index, so the walk ends.
+        let mut chain = Vec::new();
+        let mut len = 0usize;
         let mut cur = idx;
         while cur != 0
         {
-            if depth >= MAX_TREE_NODES
-            {
-                return None;
-            }
-            chain[depth] = cur;
-            depth += 1;
-            cur = self.nodes[cur as usize].parent;
-            if cur == NONE
-            {
-                return None;
-            }
+            let node = self.node(cur)?;
+            chain.try_reserve(1).ok()?;
+            chain.push(cur);
+            len += 1 + node.name.len();
+            cur = node.parent;
+        }
+        if idx == 0
+        {
+            len = 1;
+        }
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).ok()?;
+        if idx == 0
+        {
+            out.push(b'/');
         }
         // Emit components in root-first order separated by `/`.
-        let mut written = 0usize;
-        for i in (0..depth).rev()
+        for &i in chain.iter().rev()
         {
-            let node = &self.nodes[chain[i] as usize];
-            let nlen = node.name_len as usize;
-            if written + 1 + nlen > out.len()
-            {
-                return None;
-            }
-            out[written] = b'/';
-            written += 1;
-            out[written..written + nlen].copy_from_slice(&node.name[..nlen]);
-            written += nlen;
+            out.push(b'/');
+            out.extend_from_slice(&self.node(i)?.name);
         }
-        Some(written)
+        Some(out)
     }
 
     /// Badged SEND on the root mount's namespace endpoint, or `0` if
@@ -384,32 +357,21 @@ impl VfsdRootBackend
     #[must_use]
     pub fn root_mount_cap(&self) -> u32
     {
-        self.nodes[0].fallthrough_cap
+        self.root.fallthrough_cap
     }
 
     /// Resolve `node` to its tree-pool index, returning `None` if
-    /// the `NodeId` is out of range or inactive.
+    /// the `NodeId` is outside the pool.
     #[must_use]
     pub fn resolve(&self, node: NodeId) -> Option<u32>
     {
-        let raw = node.raw();
-        if raw >= MAX_TREE_NODES as u64
-        {
-            return None;
-        }
-        // Cast is range-safe: raw < MAX_TREE_NODES (≤ u32::MAX).
-        #[allow(clippy::cast_possible_truncation)]
-        let idx = raw as u32;
-        if !self.nodes[idx as usize].active
-        {
-            return None;
-        }
-        Some(idx)
+        let idx = u32::try_from(node.raw()).ok()?;
+        self.node(idx).map(|_| idx)
     }
 
-    /// Whether the directory at pool index `idx` has an active child
-    /// matching `name`. Used by the namespace dispatcher to decide
-    /// whether to fall through to `fallthrough_cap`.
+    /// Whether the directory at pool index `idx` has a child matching
+    /// `name`. Used by the namespace dispatcher to decide whether to
+    /// fall through to `fallthrough_cap`.
     #[must_use]
     pub fn has_local_child(&self, idx: u32, name: &[u8]) -> bool
     {
@@ -420,73 +382,59 @@ impl VfsdRootBackend
     #[must_use]
     pub fn fallthrough_of(&self, idx: u32) -> u32
     {
-        if (idx as usize) >= MAX_TREE_NODES
-        {
-            return 0;
-        }
-        self.nodes[idx as usize].fallthrough_cap
+        self.node(idx).map_or(0, |n| n.fallthrough_cap)
     }
 
-    /// Number of active children of the directory at pool index `idx`.
+    /// Number of children of the directory at pool index `idx`.
     /// `NS_READDIR` enumerates these synthetic children first; the
     /// dispatcher's fall-through readdir serves higher indices from the
     /// node's `fallthrough_cap`.
     #[must_use]
     pub fn local_child_count(&self, idx: u32) -> u32
     {
-        if (idx as usize) >= MAX_TREE_NODES
-        {
-            return 0;
-        }
         let mut count = 0u32;
-        let mut cur = self.nodes[idx as usize].first_child;
-        while cur != NONE
+        let mut cur = self.node(idx).map_or(NONE, |n| n.first_child);
+        while let Some(n) = self.node(cur)
         {
-            let n = &self.nodes[cur as usize];
-            if n.active
-            {
-                count += 1;
-            }
+            count += 1;
             cur = n.next_sibling;
         }
         count
     }
 
-    /// Number of inactive pool nodes `alloc_slot` can still hand out.
-    fn free_node_count(&self) -> usize
+    /// The node at pool index `idx`, or `None` outside the pool (`NONE`
+    /// included).
+    fn node(&self, idx: u32) -> Option<&TreeNode>
     {
-        self.nodes.iter().skip(1).filter(|n| !n.active).count()
+        match idx
+        {
+            0 => Some(&self.root),
+            i => self.nodes.get(i as usize - 1),
+        }
     }
 
-    fn alloc_slot(&self) -> Option<u32>
+    fn node_mut(&mut self, idx: u32) -> Option<&mut TreeNode>
     {
-        // Skip index 0 — that's the synthetic root.
-        for (i, n) in self.nodes.iter().enumerate().skip(1)
+        match idx
         {
-            if !n.active
-            {
-                // cast_possible_truncation: `i < MAX_TREE_NODES` (32), so the
-                // index fits a u32.
-                #[allow(clippy::cast_possible_truncation)]
-                return Some(i as u32);
-            }
+            0 => Some(&mut self.root),
+            i => self.nodes.get_mut(i as usize - 1),
         }
-        None
+    }
+
+    /// Pool index the next pushed node takes; `plan_install` bounded the
+    /// pool below `NONE`.
+    fn next_index(&self) -> Option<u32>
+    {
+        u32::try_from(self.nodes.len() + 1).ok()
     }
 
     fn find_child(&self, parent: u32, name: &[u8]) -> Option<u32>
     {
-        if (parent as usize) >= MAX_TREE_NODES
+        let mut cur = self.node(parent)?.first_child;
+        while let Some(n) = self.node(cur)
         {
-            return None;
-        }
-        let mut cur = self.nodes[parent as usize].first_child;
-        while cur != NONE
-        {
-            let n = &self.nodes[cur as usize];
-            if n.active
-                && usize::from(n.name_len) == name.len()
-                && n.name[..usize::from(n.name_len)] == *name
+            if n.name == name
             {
                 return Some(cur);
             }
@@ -517,7 +465,11 @@ impl NamespaceBackend for VfsdRootBackend
         {
             return Err(NsError::NotFound);
         };
-        let child = &self.nodes[child_idx as usize];
+        let Some(child) = self.node(child_idx)
+        else
+        {
+            return Err(NsError::NotFound);
+        };
         let target = if child.terminal_endpoint != 0
         {
             // Terminal mount: cross into the peer fs by minting a fresh
@@ -548,25 +500,21 @@ impl NamespaceBackend for VfsdRootBackend
         {
             return Err(NsError::NotADirectory);
         };
-        let mut cur = self.nodes[parent_idx as usize].first_child;
+        let mut cur = self.node(parent_idx).map_or(NONE, |n| n.first_child);
         let mut visible = 0u32;
-        while cur != NONE
+        while let Some(n) = self.node(cur)
         {
-            let n = &self.nodes[cur as usize];
-            if n.active
+            if visible == idx
             {
-                if visible == idx
-                {
-                    // Matches the NONE `lookup` reports: no synthetic
-                    // node is hidden.
-                    return Ok(EntryName::new(
-                        &n.name[..usize::from(n.name_len)],
-                        NodeKind::Dir,
-                        NamespaceRights::NONE,
-                    ));
-                }
-                visible += 1;
+                // Matches the NONE `lookup` reports: no synthetic node is
+                // hidden. `install` held the name to `MAX_NAME_LEN`.
+                return Ok(EntryName::new(
+                    &n.name,
+                    NodeKind::Dir,
+                    NamespaceRights::NONE,
+                ));
             }
+            visible += 1;
             cur = n.next_sibling;
         }
         Ok(None)
@@ -622,10 +570,15 @@ impl NamespaceBackend for VfsdRootBackend
 #[cfg(test)]
 mod tests
 {
+    use namespace_protocol::MAX_NAME_LEN;
+
     use super::*;
 
     /// Cap value standing in for a driver endpoint; the tree only stores it.
     const CAP: u32 = 7;
+
+    /// A pool index no install below creates.
+    const UNUSED_IDX: u32 = 30;
 
     #[test]
     fn a_second_root_mount_is_rejected_and_keeps_the_first()
@@ -649,32 +602,49 @@ mod tests
     }
 
     #[test]
-    fn a_component_longer_than_the_name_limit_is_rejected()
+    fn a_component_is_bounded_by_the_protocol_name_limit()
     {
         let mut b = VfsdRootBackend::new();
         let mut path = vec![b'/'];
-        path.extend(core::iter::repeat_n(b'a', MAX_ENTRY_NAME + 1));
+        path.extend(core::iter::repeat_n(b'a', MAX_NAME_LEN + 1));
         assert!(!b.can_install(&path));
         assert!(b.install(&path, CAP).is_none());
-        path.truncate(1 + MAX_ENTRY_NAME);
-        assert!(b.can_install(&path));
+        assert_eq!(b.local_child_count(0), 0);
+        path.truncate(1 + MAX_NAME_LEN);
+        assert!(b.install(&path, CAP).is_some());
+        let entry = b
+            .readdir_entry(NodeId::ROOT, 0)
+            .expect("root resolves")
+            .expect("entry present");
+        assert_eq!(entry.as_bytes(), &path[1..]);
     }
 
     #[test]
-    fn an_install_the_pool_cannot_hold_leaves_the_tree_unchanged()
+    fn a_component_the_protocol_cannot_name_is_rejected()
     {
         let mut b = VfsdRootBackend::new();
-        // Fill all but one of the MAX_TREE_NODES - 1 allocatable nodes.
-        for i in 0..MAX_TREE_NODES - 2
+        assert!(!b.can_install(b"/a/../b"));
+        assert!(b.install(b"/a/./b", CAP).is_none());
+        assert!(b.install(b"/a\0", CAP).is_none());
+        assert_eq!(b.local_child_count(0), 0);
+    }
+
+    #[test]
+    fn the_tree_grows_past_the_former_fixed_pool()
+    {
+        let mut b = VfsdRootBackend::new();
+        for i in 0..200
         {
-            assert!(b.install(format!("/m{i}").as_bytes(), CAP).is_some());
+            assert!(b.install(format!("/m{i}/leaf").as_bytes(), CAP).is_some());
         }
-        // `/x/y` needs two nodes; one is free.
-        assert!(!b.can_install(b"/x/y"));
-        assert!(b.install(b"/x/y", CAP).is_none());
-        assert!(!b.has_local_child(0, b"x"));
-        assert_eq!(b.local_child_count(0), (MAX_TREE_NODES - 2) as u32);
-        assert!(b.install(b"/x", CAP).is_some());
+        assert_eq!(b.local_child_count(0), 200);
+        let view = b.lookup(NodeId::ROOT, b"m199").expect("last mount found");
+        let EntryTarget::Local(m199) = view.target
+        else
+        {
+            panic!("an intermediate is local");
+        };
+        assert!(b.lookup(m199, b"leaf").is_ok());
     }
 
     #[test]
@@ -682,13 +652,11 @@ mod tests
     {
         let mut b = VfsdRootBackend::new();
         let result = b.install(b"/a/b/c", CAP).expect("install fits");
-        let mut paths = Vec::new();
-        for &idx in result.as_slice()
-        {
-            let mut buf = [0u8; 64];
-            let len = b.path_of(idx, &mut buf).expect("intermediate has a path");
-            paths.push(buf[..len].to_vec());
-        }
+        let mut paths: Vec<Vec<u8>> = result
+            .as_slice()
+            .iter()
+            .map(|&idx| b.path_of(idx).expect("intermediate has a path"))
+            .collect();
         paths.sort();
         assert_eq!(paths, vec![b"/a".to_vec(), b"/a/b".to_vec()]);
         // A sibling under the existing intermediate creates only its leaf.
@@ -696,6 +664,25 @@ mod tests
             b.install(b"/a/b/d", CAP).map(|r| r.as_slice().len()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn path_of_a_deep_intermediate_is_not_cut_short()
+    {
+        // Eight 255-byte components: a path well past the 256-byte buffer
+        // the fall-through walk once used.
+        let component = "c".repeat(MAX_NAME_LEN);
+        let mut path = String::new();
+        for _ in 0..8
+        {
+            path.push('/');
+            path.push_str(&component);
+        }
+        let mut b = VfsdRootBackend::new();
+        let result = b.install(path.as_bytes(), CAP).expect("install fits");
+        let deepest = *result.as_slice().last().expect("seven intermediates");
+        let expected = &path.as_bytes()[..7 * (1 + MAX_NAME_LEN)];
+        assert_eq!(b.path_of(deepest).as_deref(), Some(expected));
     }
 
     #[test]
@@ -757,8 +744,8 @@ mod tests
     fn lookup_in_an_unresolvable_directory_is_not_a_directory()
     {
         let mut b = VfsdRootBackend::new();
-        let inactive = NodeId::from_raw_truncated(5);
-        assert_eq!(b.lookup(inactive, b"x").err(), Some(NsError::NotADirectory));
+        let unused = NodeId::from_raw_truncated(u64::from(UNUSED_IDX));
+        assert_eq!(b.lookup(unused, b"x").err(), Some(NsError::NotADirectory));
     }
 
     #[test]
@@ -782,51 +769,42 @@ mod tests
     fn readdir_of_an_unresolvable_directory_is_not_a_directory()
     {
         let mut b = VfsdRootBackend::new();
-        let out_of_range = NodeId::from_raw_truncated(MAX_TREE_NODES as u64);
-        assert_eq!(
-            b.readdir_entry(out_of_range, 0),
-            Err(NsError::NotADirectory)
-        );
+        let unused = NodeId::from_raw_truncated(u64::from(UNUSED_IDX));
+        assert_eq!(b.readdir_entry(unused, 0), Err(NsError::NotADirectory));
     }
 
     #[test]
-    fn resolve_rejects_out_of_range_and_inactive_nodes()
+    fn resolve_accepts_only_indices_inside_the_pool()
     {
         let mut b = VfsdRootBackend::new();
         let a = intermediate_a(&mut b);
         assert_eq!(b.resolve(NodeId::from_raw_truncated(u64::from(a))), Some(a));
+        // `/a/b` created two nodes, indices 1 and 2.
+        assert_eq!(b.resolve(NodeId::from_raw_truncated(3)), None);
+        assert_eq!(b.resolve(NodeId::from_raw_truncated(u64::from(NONE))), None);
         assert_eq!(
-            b.resolve(NodeId::from_raw_truncated(MAX_TREE_NODES as u64)),
+            b.resolve(NodeId::from_raw_truncated(u64::from(NONE) + 1)),
             None
         );
-        assert_eq!(b.resolve(NodeId::from_raw_truncated(30)), None);
     }
 
     #[test]
-    fn path_of_rejects_a_short_buffer_and_an_inactive_node()
+    fn path_of_an_index_outside_the_pool_is_none()
     {
         let mut b = VfsdRootBackend::new();
-        let a = intermediate_a(&mut b);
-        assert_eq!(b.path_of(a, &mut [0u8; 1]), None);
-        assert_eq!(b.path_of(0, &mut []), None);
-        assert_eq!(b.path_of(30, &mut [0u8; 64]), None);
+        let _ = intermediate_a(&mut b);
+        assert_eq!(b.path_of(UNUSED_IDX), None);
+        assert_eq!(b.path_of(NONE), None);
     }
 
     #[test]
-    fn path_of_an_index_past_the_pool_is_none()
-    {
-        let b = VfsdRootBackend::new();
-        assert_eq!(b.path_of(MAX_TREE_NODES as u32, &mut [0u8; 64]), None);
-    }
-
-    #[test]
-    fn stat_of_an_active_node_is_a_directory()
+    fn stat_of_an_installed_node_is_a_directory()
     {
         let mut b = VfsdRootBackend::new();
         let a = intermediate_a(&mut b);
         let stat = b
             .stat(NodeId::from_raw_truncated(u64::from(a)))
-            .expect("active node resolves");
+            .expect("installed node resolves");
         assert_eq!(stat.kind, NodeKind::Dir);
     }
 
@@ -835,39 +813,35 @@ mod tests
     {
         let mut b = VfsdRootBackend::new();
         assert_eq!(
-            b.stat(NodeId::from_raw_truncated(5)).err(),
+            b.stat(NodeId::from_raw_truncated(u64::from(UNUSED_IDX)))
+                .err(),
             Some(NsError::NotFound)
         );
     }
 
     #[test]
-    fn local_child_count_past_the_pool_is_zero()
+    fn local_child_count_outside_the_pool_is_zero()
     {
         let mut b = VfsdRootBackend::new();
         assert!(b.install(b"/esp", CAP).is_some());
-        assert_eq!(b.local_child_count(MAX_TREE_NODES as u32), 0);
+        assert_eq!(b.local_child_count(UNUSED_IDX), 0);
     }
 
     #[test]
     fn path_of_the_root_is_a_single_slash()
     {
         let b = VfsdRootBackend::new();
-        let mut buf = [0u8; 64];
-        assert_eq!(b.path_of(0, &mut buf), Some(1));
-        assert_eq!(buf[0], b'/');
+        assert_eq!(b.path_of(0).as_deref(), Some(&b"/"[..]));
     }
 
     #[test]
-    fn set_fallthrough_cap_applies_only_to_an_active_node()
+    fn set_fallthrough_cap_applies_only_inside_the_pool()
     {
         let mut b = VfsdRootBackend::new();
         let a = intermediate_a(&mut b);
         b.set_fallthrough_cap(a, CAP);
         assert_eq!(b.fallthrough_of(a), CAP);
-        b.set_fallthrough_cap(30, CAP);
-        assert_eq!(b.fallthrough_of(30), 0);
-        let past_the_pool = MAX_TREE_NODES as u32;
-        b.set_fallthrough_cap(past_the_pool, CAP);
-        assert_eq!(b.fallthrough_of(past_the_pool), 0);
+        b.set_fallthrough_cap(UNUSED_IDX, CAP);
+        assert_eq!(b.fallthrough_of(UNUSED_IDX), 0);
     }
 }

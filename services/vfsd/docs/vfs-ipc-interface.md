@@ -78,10 +78,12 @@ driver, sends `FS_MOUNT` (see
 to validate the BPB, captures the driver's
 root cap into `VfsdRootBackend`, and replies with a badged SEND on
 the new filesystem's namespace endpoint addressing its root. A mount
-on `/` once root is already mounted, or on a path that is already a mount
-point, is rejected (`TABLE_FULL`) before any partition is registered or
-driver spawned. A mount that fails after the spawn (the `FS_MOUNT` probe,
-or an install a concurrent `MOUNT` beat) revokes the new driver's service
+on `/` once root is already mounted, on a path that is already a mount
+point, or on a path with a component the namespace protocol cannot name, is
+rejected (`TABLE_FULL`) before any partition is registered or driver
+spawned. A mount that fails after the spawn (the `FS_MOUNT` probe, an
+install a concurrent `MOUNT` beat, or an install that cannot allocate its
+tree nodes) revokes the new driver's service
 endpoint, which stops the driver; the partition bound virtio-blk
 registered for it stays in virtio-blk's table, which has no unregister
 request.
@@ -104,7 +106,7 @@ the arch-neutral `SERAPH_DATA` GUID.
 |---|---|
 | `label` | `10` |
 | `data[0]` low byte | `MountRole` discriminant (`0` = `Root`; `1` = `Data`; other roles reserved) |
-| `data[1]` | Mount path length (1..=64) |
+| `data[1]` | Mount path length (1..=`MAX_MOUNT_PATH_LEN`, the 496 bytes the 62 data words after `data[1]` carry) |
 | `data[2..]` | Mount path bytes packed little-endian |
 
 **Reply (success)**
@@ -119,7 +121,9 @@ badge without `MOUNT_AUTHORITY`, `NOT_FOUND` for an
 unknown role byte or invalid path length, `NO_MOUNT` if no partition
 matches the role GUID or if duplicate-priority partitions are detected,
 `SPAWN_FAILED`, `IO_ERROR`, `TABLE_FULL` if the synthetic-root install
-fails, including when root is already mounted).
+fails: root already mounted, the path already a mount point, a path
+component the namespace protocol's name rule rejects, or no memory to
+grow the tree).
 
 Single-component mount paths only (`/`, `/<name>`). Multi-component
 paths are not surfaced through `NS_LOOKUP` and remain reachable only

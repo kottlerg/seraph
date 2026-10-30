@@ -19,7 +19,7 @@
 
 use std::os::seraph::reserve_pages;
 
-use gpt::{GptEntry, GptError, GptHeader, MAX_GPT_PARTS, SECTOR_SIZE, parse_entry, parse_header};
+use gpt::{GptEntry, GptError, GptHeader, SECTOR_SIZE, ScanStop, collect_partitions, parse_header};
 use ipc::{IpcMessage, blk_errors, blk_labels, memmgr_errors, memmgr_labels};
 use syscall_abi::MAP_WRITABLE;
 
@@ -132,70 +132,11 @@ fn read_and_validate_header(
     parse_header(&sector)
 }
 
-/// Walk the partition entries starting at `header.part_entry_lba`, decoding
-/// each via the pure parser and pushing active partitions into `parts`. Stops
-/// when `MAX_GPT_PARTS` are collected or all `num_parts` entries are checked.
-fn iter_entries(
-    blk_ep: u32,
-    ipc_buf: *mut u64,
-    scratch_cap: &mut u32,
-    scratch_va: u64,
-    header: &GptHeader,
-    parts: &mut [GptEntry; MAX_GPT_PARTS],
-) -> usize
-{
-    let mut sector = [0u8; SECTOR_SIZE];
-    // Cast is range-safe: SECTOR_SIZE is 512.
-    #[allow(clippy::cast_possible_truncation)]
-    let entries_per_sector = SECTOR_SIZE as u32 / header.entry_size;
-    let sectors_needed = header.num_parts.div_ceil(entries_per_sector);
-    let mut found: usize = 0;
-    let mut entries_checked: u32 = 0;
-
-    for s in 0..sectors_needed
-    {
-        if found >= MAX_GPT_PARTS
-        {
-            break;
-        }
-        if !read_block_sector(
-            blk_ep,
-            header.part_entry_lba + u64::from(s),
-            &mut sector,
-            scratch_cap,
-            scratch_va,
-            ipc_buf,
-        )
-        {
-            break;
-        }
-
-        for e in 0..entries_per_sector
-        {
-            if entries_checked >= header.num_parts || found >= MAX_GPT_PARTS
-            {
-                break;
-            }
-            entries_checked += 1;
-            let off = (e * header.entry_size) as usize;
-            if let Some(entry) = parse_entry(&sector[off..])
-            {
-                std::os::seraph::log!(
-                    "GPT: partition at LBA {:#018x} length {:#018x}",
-                    entry.first_lba,
-                    entry.length_lba
-                );
-                parts[found] = entry;
-                found += 1;
-            }
-        }
-    }
-    found
-}
-
-/// Parse the GPT and populate a partition table with UUID and LBA for each
-/// non-empty partition. Returns the number of entries found, or an error if
-/// the header cannot be read or validated.
+/// Parse the GPT and return every used partition entry, in on-disk order.
+/// The list holds as many entries as the header's `num_parts` array has
+/// used ones; a walk that stops early (a failed sector read, or no memory
+/// for the list) is logged and returns the partitions found before it.
+/// Returns an error if the header cannot be read or validated.
 ///
 /// `scratch_cap` and `scratch_va` describe a single-page Memory cap allocated
 /// via [`alloc_scratch`]. The cap is moved through IPC on every block read;
@@ -204,13 +145,37 @@ fn iter_entries(
 pub fn parse_gpt(
     blk_ep: u32,
     ipc_buf: *mut u64,
-    parts: &mut [GptEntry; MAX_GPT_PARTS],
     scratch_cap: &mut u32,
     scratch_va: u64,
-) -> Result<usize, GptError>
+) -> Result<Vec<GptEntry>, GptError>
 {
     let header = read_and_validate_header(blk_ep, scratch_cap, scratch_va, ipc_buf)?;
-    let found = iter_entries(blk_ep, ipc_buf, scratch_cap, scratch_va, &header, parts);
-    std::os::seraph::log!("GPT: partitions found: {found}");
-    Ok(found)
+    let scan = collect_partitions(&header, |lba, sector| {
+        read_block_sector(blk_ep, lba, sector, scratch_cap, scratch_va, ipc_buf)
+    });
+    for entry in &scan.entries
+    {
+        std::os::seraph::log!(
+            "GPT: partition at LBA {:#018x} length {:#018x}",
+            entry.first_lba,
+            entry.length_lba
+        );
+    }
+    match scan.stop
+    {
+        None =>
+        {}
+        Some(ScanStop::ReadFailed { lba }) => std::os::seraph::log!(
+            "GPT: entry-array read at LBA {lba:#018x} failed; later partitions are not visible"
+        ),
+        Some(ScanStop::OutOfMemory) => std::os::seraph::log!(
+            "GPT: no memory for the partition list; later partitions are not visible"
+        ),
+    }
+    std::os::seraph::log!(
+        "GPT: partitions found: {} of {} entries",
+        scan.entries.len(),
+        header.num_parts
+    );
+    Ok(scan.entries)
 }

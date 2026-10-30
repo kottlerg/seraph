@@ -53,9 +53,10 @@ vfsd/
   [`docs/namespace-composition.md`](docs/namespace-composition.md#two-endpoints-one-process)
   and [`docs/storage.md`](../../docs/storage.md).
 - **Service endpoint** — handles `MOUNT` and `GET_SYSTEM_ROOT_CAP` on
-  its un-badged service endpoint, with multi-threaded recv so a
-  worker-driven `CREATE_FROM_FILE` re-entry cannot deadlock an in-
-  flight reply. `MOUNT` is the runtime explicit-mount surface
+  its un-badged service endpoint, with multi-threaded recv so
+  independent requests proceed while one waits on a driver spawn; no
+  service-endpoint request waits on another, so the thread count is a
+  concurrency knob, not a correctness bound. `MOUNT` is the runtime explicit-mount surface
   (foreign-GUID disks, user-invoked mounts), gated on the
   `MOUNT_AUTHORITY` badge bit; root, `/esp`, and `/data` are
   self-mounted, and svctest is its only in-tree caller. See
@@ -86,7 +87,8 @@ vfsd/
   See [`docs/namespace-composition.md`](docs/namespace-composition.md)
   and [`docs/storage.md`](../../docs/storage.md).
 - **GPT enumeration + mount discovery** — parses the GPT partition
-  table from a single scratch memory cap at startup, then resolves the
+  table from a single scratch memory cap at startup, keeping every used
+  entry of the header's `num_parts`-entry array, then resolves the
   arch-conditional root GUID in `src/role_guids.rs` via
   `gpt::lookup_partition_by_type_guid` for the self-mount. The EFI
   System Partition (standard type GUID) and the Seraph data partition

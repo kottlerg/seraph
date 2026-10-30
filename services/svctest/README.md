@@ -139,15 +139,15 @@ vfsd's service endpoint, badged `MOUNT_AUTHORITY` and the no-authority `DENY_BAD
 (services/vfsd/docs/vfs-ipc-interface.md § Endpoint). The vfsd phases require an `UNAUTHORIZED`
 reply to `MOUNT` on `caps[5]` with nothing mounted; a `TABLE_FULL` reply on `caps[4]` to `MOUNT` of
 the root role at `/` and of the data role at `/esp`, both already mounted, in each of six rounds
-(more than vfsd's four per-mount bootstrap slots, so a rejection that spawned a driver or held a
-slot would change a later reply); a `NOT_FOUND` reply to a `MOUNT` whose path length exceeds the
-path bytes it carries; and that the mounted filesystems still answer afterwards. The two vfsd
-seeds ride in a second bootstrap round, so every svctest boot receives a seed list longer than one
-round, and the svcmgr second-seed-round phase fails the run when either arrives empty. Every seed
-is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is public, so svctest
-resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap` and spends no seed
-slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED` reply to
-`SHUTDOWN`.
+(vfsd checks the mount point before it registers a partition or spawns a driver, so a rejection
+that started a spawn first would change a later reply); a `NOT_FOUND` reply to a `MOUNT` whose
+path length exceeds the path bytes it carries; and that the mounted filesystems still answer
+afterwards. The two vfsd seeds ride in a second bootstrap round, so every svctest boot receives a
+seed list longer than one round, and the svcmgr second-seed-round phase fails the run when either
+arrives empty. Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
+public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`
+and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`
+reply to `SHUTDOWN`.
 
 ---
 

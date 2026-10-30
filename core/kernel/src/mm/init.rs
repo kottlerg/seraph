@@ -88,7 +88,9 @@ fn print_memory_line(idx: usize, start: u64, end: u64, ty: MemoryType)
 }
 
 /// Total installed DRAM in bytes, captured by [`print_memory_map`].
-/// Read once at Phase 9 to populate `InitInfo::system_ram_bytes`.
+/// Read at Phase 4 to size the `CSpace` registry arena
+/// (`cap::init_cspace_registry`) and at Phase 9 to populate
+/// `InitInfo::system_ram_bytes`.
 static SYSTEM_RAM_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Total installed DRAM in bytes (the sum of every DRAM-typed memory-map

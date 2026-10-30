@@ -301,8 +301,8 @@ reaches zero (its capabilities and every kernel-internal reference released); se
 kernel's own objects come from the SEED reserve pinned at the Phase 7
 handoff, after which the buddy is sealed and every page of RAM is either a
 bounded fixed kernel reserve or a userspace Memory capability. The reserves
-are the Phase 4 per-CPU storage and frame map table, the Phase 5 per-CPU tag-state slab, and
-the Phase 7 contributors, in the order
+are the Phase 4 per-CPU storage, frame map table, and `CSpace` registry, the
+Phase 5 per-CPU tag-state slab, and the Phase 7 contributors, in the order
 [initialization.md](../core/kernel/docs/initialization.md) § Phase 4,
 § Phase 5, and § Phase 7 give.
 

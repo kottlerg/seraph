@@ -83,6 +83,7 @@ core/kernel/
 │   │   ├── derivation.rs       # Derivation tree, revocation algorithm
 │   │   ├── ioport_bindings.rs  # Per-thread I/O-port binding table and its withdrawal
 │   │   ├── object.rs           # Kernel object headers and wrappers, page pools, teardown
+│   │   ├── registry.rs         # RAM-sized CSpaceId registry arena (id → CSpace, epoch, free list)
 │   │   ├── retype.rs           # Memory-cap retype allocator (object carving)
 │   │   ├── split.rs            # Shared tail of the range-cap split syscalls
 │   │   └── transfer.rs         # Batched capability move (SYS_CAP_MOVE, IPC transfer)
@@ -166,6 +167,7 @@ bitmask. `derivation.rs` maintains the global derivation tree used for revocatio
 address-space page tables and CSpace slot pages, and their allocation and teardown, including
 the withdrawal of the MMIO mappings an Mmio object records; `ioport_bindings.rs` records each
 thread's I/O-port bindings and withdraws those made through a freed IoPort object;
+`registry.rs` is the RAM-sized arena that maps each `CSpaceId` to its live CSpace and epoch;
 `retype.rs` is the allocator that carves kernel objects out of Memory-cap
 backing; `split.rs` is the tail shared by the range-capability split syscalls;
 `transfer.rs` moves a capability, with its derived children, to another slot in

@@ -161,7 +161,7 @@ This gives amortised O(1) allocation and O(1) deallocation.
 
 ---
 
-### CSpace Registry (`cap/registry.rs`)
+## CSpace Registry (`cap/registry.rs`)
 
 The registry maps a `CSpaceId` to its live `CSpace` and current epoch. It is an arena of 16-byte
 entries (pointer, epoch, free-list link), one per 4 KiB page of DRAM
@@ -183,6 +183,8 @@ epoch, its pointer, and its epoch again, each with Acquire, and resolves only wh
 reads equal the stamped epoch and the pointer is non-null. The second epoch read rejects a
 concurrent unregister, retire, reuse, and register that would otherwise pair the new tenant's
 pointer with the old epoch. An id no installed chunk backs resolves nothing.
+
+---
 
 ## Page Pools (`cap/object.rs`)
 
@@ -302,7 +304,7 @@ because the capability, not the `SlotId`, is the authority. See #137 for the
 recycling allocator design.
 
 The registry that maps a `CSpaceId` to its live `CSpace` and epoch is described in
-§ CSpace Registry below.
+§ CSpace Registry above.
 
 ### Per-Slot Generation
 

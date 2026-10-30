@@ -221,6 +221,7 @@ pub fn bootstrap_caps(
         return None;
     }
     let mut caps: Option<SvcmgrCaps> = None;
+    let mut caps_decoder = svcmgr_endowment::CapsDecoder::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -230,12 +231,15 @@ pub fn bootstrap_caps(
         {
             endow_kind::CAPS =>
             {
-                match svcmgr_endowment::decode_caps(
+                match caps_decoder.push(
                     &round.caps[..round.cap_count],
                     &round.data[..round.data_words],
                 )
                 {
-                    Ok(c) =>
+                    // More CAPS rounds are owed; their caps are recorded.
+                    Ok(None) =>
+                    {}
+                    Ok(Some(c)) =>
                     {
                         caps = Some(SvcmgrCaps {
                             service_ep: c.service_ep,

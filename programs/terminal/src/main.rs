@@ -246,7 +246,7 @@ fn relay_stderr<R: std::io::Read>(reader: R, tx: &Sender<Msg>)
     pump_stream(reader, tx);
 }
 
-/// Pull the single bootstrap round; expect `caps[0]` from the recipe's
+/// Pull the bootstrap rounds; expect slot 0 from the recipe's
 /// `seed = devmgr.registry`.
 fn bootstrap_devmgr_registry(creator_ep: u32, ipc_buf: *mut u64) -> Option<u32>
 {
@@ -255,10 +255,9 @@ fn bootstrap_devmgr_registry(creator_ep: u32, ipc_buf: *mut u64) -> Option<u32>
         return None;
     }
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let round = unsafe { ipc::bootstrap::request_round(creator_ep, ipc_buf) }.ok()?;
-    // Only the present caps ride, named by the round's presence word; an
+    // Only the present caps ride, named by each round's presence word; an
     // absent slot decodes as `0`.
-    let cap = ipc::bootstrap::unpack_slots(&round).ok()?[0];
+    let [cap] = unsafe { ipc::bootstrap::request_slots::<1>(creator_ep, ipc_buf) }.ok()?;
     (cap != 0).then_some(cap)
 }
 

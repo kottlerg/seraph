@@ -14,7 +14,7 @@
 //! spec.
 
 use namespace_protocol::rights as ns_rights;
-use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
+use syscall_abi::MSG_DATA_WORDS_MAX;
 
 use super::{Definition, NamespaceShape, ProvidedName, RestartPolicy, build_blob};
 
@@ -146,8 +146,7 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// inconsistent combination (`cwd` with `namespace = none`, a `cwd` of the
 /// root under `namespace = universal`, a `cwd` outside a
 /// `namespace = subtree:` path or under one whose rights lack `LOOKUP`,
-/// `log_sink` with `seed`/`provides`, more
-/// `seed` names than the bootstrap caps left after a provider's RECV,
+/// `log_sink` with `seed`/`provides`,
 /// `sched_max` below `priority`), a `binary` or
 /// subtree path over `ipc::MAX_PATH_LEN` or with no path components
 /// ([`ParseError::InvalidValue`]), or
@@ -456,16 +455,6 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         }
         _ =>
         {}
-    }
-
-    // One bootstrap round carries at most MSG_CAP_SLOTS_MAX caps, and a
-    // provider's own service-endpoint RECV takes cap[0] ahead of the seeds.
-    if seed.len() + usize::from(!provides.is_empty()) > MSG_CAP_SLOTS_MAX
-    {
-        return Err(ParseError::InvalidValue(
-            0,
-            "seed names (plus the provider RECV) exceed MSG_CAP_SLOTS_MAX bootstrap caps",
-        ));
     }
 
     let log_sink = log_sink.unwrap_or(false);
@@ -959,20 +948,14 @@ sched_max = 12\n";
         }
     }
 
+    // svcmgr serves seeds over as many bootstrap rounds as they need, so a
+    // seed list longer than one round's cap slots is a valid recipe.
     #[test]
-    fn seeds_are_bounded_by_the_bootstrap_cap_slots_left_after_the_provider_recv()
+    fn seeds_past_one_bootstrap_round_parse_in_order()
     {
-        let consumer = parse_with("seed = a b c d\n").expect("4 seeds fill a consumer round");
-        assert_eq!(consumer.seed.len(), MSG_CAP_SLOTS_MAX);
-        let provider = parse_with("provides = p\nseed = a b c\n").expect("RECV + 3 seeds");
-        assert_eq!(provider.seed.len(), MSG_CAP_SLOTS_MAX - 1);
-        for extra in ["seed = a b c d e\n", "provides = p\nseed = a b c d\n"]
-        {
-            assert!(matches!(
-                parse_with(extra),
-                Err(ParseError::InvalidValue(0, why)) if why.starts_with("seed names")
-            ));
-        }
+        let provider = parse_with("provides = p\nseed = a b c d e f\n")
+            .expect("RECV + 6 seeds span two rounds");
+        assert_eq!(provider.seed, ["a", "b", "c", "d", "e", "f"]);
     }
 
     #[test]

@@ -17,7 +17,7 @@ once during its own startup; see that document for the wire format.
 ## Bootstrap caps
 
 svcmgr launches and supervises real-logd, minting its bootstrap round —
-one round, `done = true`, four positional slots, of which only the present
+one round for its four positional slots, `done = true`, of which only the present
 caps ride, named by a presence word (an absent slot reads as `0`) — from the reserved
 log-sink sources init endows it (see
 [`services/svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md)).

@@ -44,7 +44,7 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test pwrmgr.deny
 ```
 
 ## Keys
@@ -58,7 +58,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test
 | `critical` | yes | `yes` or `no`. Whether the system is viable without this service once it is permanently down. Orthogonal to `restart`. |
 | `namespace` | yes | One of `none`, `universal`, `subtree:<path>:<rights>`. |
 | `cwd` | no | Path interpreted relative to svcmgr's universal root; must lie inside the namespace (see [`cwd`](#cwd)). Forbidden when `namespace = none`. |
-| `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name; cap[i+1] for a `provides` service). At most `MSG_CAP_SLOTS_MAX` (4) names, or 3 for a `provides` service; see [`seed`](#seed). |
+| `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name; cap[i+1] for a `provides` service). Any number of names; slots past one bootstrap round's `MSG_CAP_SLOTS_MAX` (4) caps ride in further rounds; see [`seed`](#seed). |
 | `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one badged SEND per entry into the discovery registry. See [`provides`](#provides). |
 | `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
 | `priority` | no | Priority level (`1..=30`) the service's initial thread is created at. Unset: procmgr's default (`sched_policy::DEFAULT_SPAWN_PRIORITY`, clamped to the band). See [`priority` / `sched_max`](#priority--sched_max). |
@@ -204,23 +204,25 @@ injects them positionally into the child's bootstrap round:
 seed = rootfs.root pwrmgr.shutdown pwrmgr.deny
 ```
 
-becomes `caps = [rootfs_root_send, pwrmgr_shutdown_send,
-pwrmgr_deny_send]` on the child's `bootstrap::request_round`. A
-bootstrap round carries at most `MSG_CAP_SLOTS_MAX` (currently 4) caps, and
-a `provides` service's provider RECV takes cap[0], so a recipe with more
-than 4 seeds, or more than 3 for a `provides` service, is a parser error.
+becomes slots `[rootfs_root_send, pwrmgr_shutdown_send,
+pwrmgr_deny_send]` of the child's bootstrap rounds. A `provides`
+service's provider RECV takes slot 0, ahead of the seeds. A recipe may
+name any number of seeds.
 
-An unresolved name leaves slot `i` absent. The kernel refuses a message carrying a null cap slot,
-so the round transfers only the present caps, in slot order, and carries a presence word in
-`data[0]`: bit `i` is set when slot `i` holds a cap (`ipc::bootstrap::pack_slots`). The child
-spreads the caps back over their slots with `ipc::bootstrap::unpack_slots`, which yields `0` for
-an absent slot and refuses a round whose word is missing, sets a bit at or above
-`MSG_CAP_SLOTS_MAX`, or names a different number of caps than the round delivered. The
+A bootstrap round carries at most `MSG_CAP_SLOTS_MAX` (currently 4) caps, so svcmgr splits the slot
+list into windows of that many slots and serves one round per window, the last marked done
+(`ipc::bootstrap::slot_rounds`); a list of four slots or fewer is one round. An unresolved name
+leaves its slot absent. The kernel refuses a message carrying a null cap slot, so each round
+transfers only its window's present caps, in slot order, and carries a presence word in `data[0]`:
+bit `i` is set when slot `i` of the window holds a cap (`ipc::bootstrap::pack_slots`). The child
+concatenates the rounds with `ipc::bootstrap::request_slots`, which yields `0` for an absent slot,
+releases a cap past the slots the child reads, and refuses a round whose word is missing, sets a bit
+at or above `MSG_CAP_SLOTS_MAX`, or names a different number of caps than the round delivered. The
 [`log_sink`](#log_sink) round uses the same encoding. Consumers that tolerate `cap == 0 → skip`
 continue to work; consumers that don't fail on first use, which is the right surface for a real
 misconfiguration. svctest does both: its `ns` phase skips on a zero cap, and its svcmgr seed-only
-phase fails the run on any unresolved seed (per
-[services/svctest/README.md § Run Sequence](../../svctest/README.md#run-sequence)).
+and second-seed-round phases fail the run on any unresolved seed (per [services/svctest/README.md §
+Run Sequence](../../svctest/README.md#run-sequence)).
 
 Well-known names are centralised in
 [`ipc::published_names`](../../../shared/ipc/src/lib.rs). Every name
@@ -320,7 +322,7 @@ At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 | Definition | Pending registration | Outcome |
 |---|---|---|
 | present | present | **bind only** — bind death-notification on the endowed thread cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink flag, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
-| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, `CONFIGURE_NAMESPACE` with the namespace+cwd, bind death-notification (when `restart != never`, so the observer is in place before the thread runs), `START_PROCESS`, serve the seed bootstrap round, and (when `restart != never`) record a `ServiceEntry`. |
+| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, `CONFIGURE_NAMESPACE` with the namespace+cwd, bind death-notification (when `restart != never`, so the observer is in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 
 ## Relevant Design Documents

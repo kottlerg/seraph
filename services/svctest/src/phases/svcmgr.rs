@@ -32,7 +32,25 @@ pub fn phases() -> &'static [Phase]
             name: "svcmgr_seed_only_names_refused",
             run: svcmgr_seed_only_names_refused_phase,
         },
+        Phase {
+            name: "svcmgr_second_seed_round",
+            run: svcmgr_second_seed_round_phase,
+        },
     ]
+}
+
+/// The recipe's fifth seed (`pwrmgr.deny`) fills slot 4, which svcmgr serves
+/// in a second bootstrap round, since one round carries at most
+/// `MSG_CAP_SLOTS_MAX` caps. An empty slot 4 means the seed list lost its
+/// second round (or the public name did not resolve).
+fn svcmgr_second_seed_round_phase(caps: &Caps)
+{
+    assert_ne!(
+        caps.pwrmgr_deny_seed, 0,
+        "svcmgr_second_seed_round: slot 4 (pwrmgr.deny) empty: second seed round lost or name \
+         unresolved"
+    );
+    std::os::seraph::log!("svcmgr second-seed-round phase passed (slot 4 present)");
 }
 
 /// The registry SEND procmgr installed in svctest's `ProcessInfo`, and the

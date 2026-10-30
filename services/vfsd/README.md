@@ -110,7 +110,7 @@ virtio-blk's whole-disk endpoint. See
 
 Once a client holds a node cap returned by `NS_LOOKUP` through the
 synthetic root or via transparent root delegation, every subsequent
-operation (`NS_LOOKUP` on subdirectories, `NS_READ` / `NS_READ_MEMORY`,
+operation (`NS_LOOKUP` on subdirectories, `FS_READ` / `FS_READ_MEMORY`,
 `FS_CLOSE`) goes directly to the owning filesystem driver. vfsd is
 not on the request path. See
 [`docs/storage.md`](../../docs/storage.md).

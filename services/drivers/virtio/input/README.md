@@ -26,10 +26,11 @@ virtio/input/
 ## Endpoint
 
 Devmgr enumerates the virtio-input PCI device, carves its per-device
-capabilities (BAR MMIO, IRQ), and spawns this driver from the rootfs
-(`/services/drivers/virtio-input`) — it is not bootstrap-essential, so it loads
-lazily through devmgr's `SET_DRIVERS_DIR` subtree cap, like the RTC drivers
-(see [docs/device-management.md](../../../../docs/device-management.md)).
+capabilities (BAR MMIO, and an IRQ unless the device shares an `INTx` line), and
+spawns this driver from the rootfs (`/services/drivers/virtio-input`) — it is not
+bootstrap-essential, so it loads lazily through devmgr's `SET_DRIVERS_DIR` subtree cap,
+like the RTC drivers (see
+[docs/device-management.md](../../../../docs/device-management.md)).
 Devmgr owns the service endpoint and mints clients an
 `input_labels::READ_AUTHORITY`-badged SEND cap via
 `devmgr_labels::QUERY_INPUT_DEVICE` (see
@@ -82,8 +83,8 @@ The driver owns one DMA page of 8-byte event buffers posted to the eventq
 buffer as keys arrive and raises an interrupt; the driver drains the used ring,
 decodes, and re-posts each buffer. A descriptor-head → buffer-slot map locates
 the filled buffer on completion. The IRQ wait carries a bounded timeout and
-re-drains each tick, tolerating the occasional lost PLIC interrupt on QEMU virt
-RISC-V (the same mitigation virtio-blk uses).
+re-drains each tick, so the read still completes with no IRQ cap and tolerates
+the occasional lost PLIC interrupt on QEMU virt RISC-V.
 
 ---
 

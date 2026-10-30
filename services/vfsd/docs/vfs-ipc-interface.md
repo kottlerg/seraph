@@ -127,6 +127,33 @@ via the root mount's transparent delegation.
 
 ---
 
+## Label 13: `GET_SYSTEM_ROOT_CAP`
+
+Seed pull of the system-root cap by init; the delivery chain is in the introduction. The
+caller's badge MUST carry `SEED_AUTHORITY`: vfsd replies `UNAUTHORIZED` otherwise, before it
+checks the version word.
+
+**Request**
+
+| Field | Value |
+|---|---|
+| `label` | `13` |
+| `data[0]` | Caller's `ipc::VFSD_LABELS_VERSION` |
+
+**Reply (success)**
+
+| Field | Value |
+|---|---|
+| `label` | `vfsd_errors::SUCCESS` (0) |
+| `caps[0]` | Fresh badged SEND on vfsd's namespace endpoint addressing `NodeId::ROOT` at full namespace rights |
+
+**Reply (error)**: `label = vfsd_errors::*` (`UNAUTHORIZED` for a badge without
+`SEED_AUTHORITY`, `LABEL_VERSION_MISMATCH` when `data[0]` differs from vfsd's
+`VFSD_LABELS_VERSION`, `NO_MOUNT` when the root self-mount failed, and `IO_ERROR` if the
+cap derivation fails).
+
+---
+
 ## Relevant Design Documents
 
 | Document | Content |

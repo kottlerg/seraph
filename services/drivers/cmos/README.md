@@ -86,6 +86,16 @@ the year 2099).
 
 ---
 
+## Relevant Design Documents
+
+| Document | Content |
+|---|---|
+| [docs/device-management.md](../../../docs/device-management.md) | Driver binary sources; devmgr spawn and RTC query flow |
+| [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md) | Per-driver capability carve and `QUERY_RTC_DEVICE` |
+| [services/timed/README.md](../../timed/README.md) | The sole client of this driver |
+
+---
+
 ## Summarized By
 
 None

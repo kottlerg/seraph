@@ -25,11 +25,14 @@ process creation to procmgr IPC.
   (`arch::current::serial_init`, `../src/main.rs`).
 - Build the `MemoryAlloc` bump allocator over the kernel-provided
   memory pool (`MemoryAlloc::new`, `../src/main.rs`).
-- Reserve a Memory cap to back kernel-object retypes (the endpoint slab;
-  one page suffices for the eight endpoints init creates)
-  (`../src/main.rs`).
-- Map a fresh IPC buffer page at `INIT_IPC_BUF_VA` and register it
-  with the kernel (`syscall::ipc_buffer_set`, `../src/main.rs`).
+- Carve init's bootstrap arena (`bootstrap::BootArena::carve_reserve`,
+  `../src/main.rs`): one contiguous Memory cap whose front reserve
+  absorbs init's endpoint and init-logd thread retypes and whose backing
+  is offset-mapped as init's IPC buffer, the init-logd stack, and the
+  init-logd IPC buffer. `finalize_memmgr` forwards it to memmgr as an
+  in-use run.
+- Register the arena-backed IPC buffer page at `INIT_IPC_BUF_VA` with
+  the kernel (`syscall::ipc_buffer_set`, `../src/main.rs`).
 - Mint endpoint objects: init's bootstrap endpoint, procmgr's
   service endpoint, memmgr's service endpoint, svcmgr's service
   endpoint (`syscall::cap_create_endpoint`, `../src/main.rs`; minted here so procmgr can receive

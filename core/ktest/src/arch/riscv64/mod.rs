@@ -80,6 +80,12 @@ pub const ILLEGAL_INSTRUCTION_VECTOR: u64 = 2;
 /// recorded in `EXIT_FAULT_BASE + <vector>` when the fault kills the thread.
 pub const PAGE_FAULT_LOAD_VECTOR: u64 = 13;
 
+/// Interrupt ids the root Interrupt cap names but the kernel does not route,
+/// which `unit::hw::irq_register_unroutable_id_err` expects `irq_register` to
+/// refuse: the top of the PLIC's 1024-id space, far above the 127 sources the
+/// kernel programs.
+pub const UNROUTABLE_IRQ_IDS: &[u32] = &[1023];
+
 /// Physical base of an MMIO register page that a test may read without side
 /// effects: the console UART, which init receives as its own `Mmio` cap. Its
 /// line-status register, at [`MMIO_PROBE_OFFSET`], has no read side effect.

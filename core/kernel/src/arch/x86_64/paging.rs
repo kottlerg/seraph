@@ -1254,11 +1254,12 @@ pub unsafe fn protect_user_page(
 /// TLB. Returns `Some((phys_addr, raw_pte_bits))` if the page is present at
 /// every level, or `None` if any level is not present.
 ///
-/// Assumes 4 KiB user leaves: it descends to the PT level and does not test
-/// the PS (large-page) bit at PDPT/PD. The user mapping path never installs a
-/// large leaf, so this holds for every user VA — the spurious-fault classifier
-/// relies on it. A caller that introduces user large pages must add a
-/// large-leaf branch here.
+/// Accepts 4 KiB user leaves only: a present PDPT or PD entry with the PS
+/// (large-page) bit set yields `None` rather than a translation, since its
+/// frame is a 1 GiB or 2 MiB page, not a page table. The user mapping path
+/// never installs a large leaf, so every user VA resolves; a large leaf is
+/// reached only through a kernel-half VA (the direct map's 2 MiB leaves). A
+/// caller that introduces user large pages must add a large-leaf branch here.
 ///
 /// # Safety
 /// `root_virt` must be the direct-map virtual address of a valid 4 KiB PML4
@@ -1266,41 +1267,62 @@ pub unsafe fn protect_user_page(
 #[cfg(not(test))]
 pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64)>
 {
-    use crate::mm::paging::phys_to_virt;
-
-    // SAFETY: root_virt is direct-map VA of valid user PML4; table entries validated before dereference.
-    let pml4 = unsafe { table_at(root_virt) };
-    let e = pml4[pml4_index(virt)];
-    if !e.is_present()
-    {
-        return None;
-    }
-
-    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
-    let pdpt = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    let e = pdpt[pdpt_index(virt)];
-    if !e.is_present()
-    {
-        return None;
-    }
-
-    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
-    let pd = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    let e = pd[pd_index(virt)];
-    if !e.is_present()
-    {
-        return None;
-    }
-
-    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
-    let pt = unsafe { table_at(phys_to_virt(e.phys_addr())) };
-    let leaf = pt[pt_index(virt)];
-    if !leaf.is_present()
-    {
-        return None;
-    }
-
+    // SAFETY: root_virt is the direct-map VA of a valid PML4 (caller contract), and
+    // every table frame a present non-leaf entry names is reachable through the
+    // direct map at `phys_to_virt` of its physical address.
+    let leaf = unsafe { walk_to_4k_leaf(root_virt, virt, crate::mm::paging::phys_to_virt) }?;
     Some((leaf.phys_addr(), leaf.0))
+}
+
+/// Walk PML4 → PDPT → PD → PT for `virt` from the table at `root_virt`, reading
+/// each entry in place and reaching each next table at `to_virt(phys)`.
+///
+/// Returns the present 4 KiB leaf, or `None` when an entry on the path is not
+/// present or a PDPT or PD entry is a large leaf (PS set): its frame holds data,
+/// not entries, so the walk never reads it as a table.
+///
+/// # Safety
+/// `root_virt` must address a readable 512-entry table, and `to_virt` must map
+/// the physical address of every table a present non-leaf entry on the path
+/// names to a readable address of that table.
+unsafe fn walk_to_4k_leaf(
+    root_virt: u64,
+    virt: u64,
+    to_virt: impl Fn(u64) -> u64,
+) -> Option<PageTableEntry>
+{
+    let indices = [pml4_index(virt), pdpt_index(virt), pd_index(virt)];
+    let mut table = root_virt;
+    for (level, index) in indices.into_iter().enumerate()
+    {
+        // SAFETY: `table` is the root (caller contract) or `to_virt` of the table
+        // a present non-leaf entry named (the checks below), readable per the
+        // caller contract; `index` < 512.
+        let e = unsafe { read_entry(table, index) };
+        // Level 0 is the PML4, whose entries have no PS bit.
+        if !e.is_present() || (level > 0 && e.0 & LARGE_PAGE != 0)
+        {
+            return None;
+        }
+        table = to_virt(e.phys_addr());
+    }
+    // SAFETY: as above; `table` is the PT the PD entry named.
+    let leaf = unsafe { read_entry(table, pt_index(virt)) };
+    leaf.is_present().then_some(leaf)
+}
+
+/// Read entry `index` of the 512-entry table at `table_va` without forming a
+/// reference to the table.
+///
+/// # Safety
+/// `table_va` must address a readable, 8-byte-aligned 512-entry table and
+/// `index` must be below 512.
+unsafe fn read_entry(table_va: u64, index: usize) -> PageTableEntry
+{
+    debug_assert!(index < 512);
+    // SAFETY: per the caller contract the entry lies inside a readable,
+    // aligned table.
+    unsafe { (table_va as *const PageTableEntry).add(index).read() }
 }
 
 // ── Shootdown-elision classification ──────────────────────────────────────────
@@ -1388,21 +1410,41 @@ fn pte_permits_user_access(pte: u64, write: bool, instr: bool) -> bool
 /// updates A/D in hardware), the retried instruction is guaranteed to make
 /// progress — no retry counter is needed.
 ///
+/// A `va` at or above [`user_va_top`] (the unmappable top user page and the
+/// kernel half) is never a user mapping, so it is never a stale-TLB fault: it
+/// returns `false` without walking the tables
+/// ([`fault_is_spurious_given`]).
+///
 /// # Safety
 /// Must run at ring 0 in the faulting thread's context, i.e. before CR3 has
 /// been changed by a context switch.
 #[cfg(not(test))]
 pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool
 {
-    // SAFETY: ring 0; reads CR3 to recover the active page-table root.
-    let root_phys = unsafe { read_root_phys() };
-    let root_virt = crate::mm::paging::phys_to_virt(root_phys);
-    // SAFETY: root_virt is the direct-map VA of the active PML4.
-    match unsafe { translate_user_page(root_virt, va) }
+    fault_is_spurious_given(va, write, instr, |va| {
+        // SAFETY: ring 0; reads CR3 to recover the active page-table root.
+        let root_phys = unsafe { read_root_phys() };
+        let root_virt = crate::mm::paging::phys_to_virt(root_phys);
+        // SAFETY: root_virt is the direct-map VA of the active PML4.
+        unsafe { translate_user_page(root_virt, va) }.map(|(_pa, pte)| pte)
+    })
+}
+
+/// The decision of [`user_fault_is_spurious`], with the live leaf PTE of a `va`
+/// below [`user_va_top`] supplied by `live_leaf` (`None` when `va` is
+/// unmapped). `live_leaf` is not called for a `va` at or above it.
+fn fault_is_spurious_given(
+    va: u64,
+    write: bool,
+    instr: bool,
+    live_leaf: impl FnOnce(u64) -> Option<u64>,
+) -> bool
+{
+    if va >= user_va_top()
     {
-        Some((_pa, pte)) => pte_permits_user_access(pte, write, instr),
-        None => false,
+        return false;
     }
+    live_leaf(va).is_some_and(|pte| pte_permits_user_access(pte, write, instr))
 }
 
 // ── TLB flush operations ──────────────────────────────────────────────────────
@@ -1610,6 +1652,129 @@ mod tests
         // Not present: genuine fault regardless of other bits.
         let absent = USER_BIT | WRITABLE;
         assert!(!pte_permits_user_access(absent, false, false));
+    }
+
+    #[test]
+    fn kernel_half_fault_is_never_spurious_even_when_the_lookup_permits()
+    {
+        let permitting = |_| Some(PRESENT | USER_BIT | WRITABLE);
+        let kernel_half = [
+            user_va_top(),
+            KERNEL_HALF_BASE,
+            KERNEL_HALF_BASE + (1 << 30),
+            u64::MAX,
+        ];
+        for va in kernel_half
+        {
+            assert!(!fault_is_spurious_given(va, true, false, permitting));
+        }
+    }
+
+    #[test]
+    fn user_half_fault_is_spurious_only_when_the_live_leaf_permits()
+    {
+        let read_only = |_| Some(PRESENT | USER_BIT | NO_EXECUTE);
+        let unmapped = |_| None;
+        let va = 0x40_0000;
+        assert!(fault_is_spurious_given(va, false, false, read_only));
+        assert!(!fault_is_spurious_given(va, true, false, read_only));
+        assert!(!fault_is_spurious_given(va, false, false, unmapped));
+    }
+
+    // ── User-page walk ────────────────────────────────────────────────────────
+
+    /// A page-table frame on the host heap; its host address stands for its
+    /// physical address (host addresses lie below bit 52, so `PHYS_MASK` keeps
+    /// them), and the walk reaches it through an identity `to_virt`.
+    #[repr(C, align(4096))]
+    struct Table([PageTableEntry; 512]);
+
+    impl Table
+    {
+        fn new() -> Box<Table>
+        {
+            Box::new(Table([PageTableEntry(0); 512]))
+        }
+
+        fn addr(&self) -> u64
+        {
+            core::ptr::from_ref(self) as u64
+        }
+    }
+
+    /// A user VA and the PML4 → PDPT → PD path to it; the PD entry is left for
+    /// the test to fill. Every entry of `bait` is a present, user, writable
+    /// "leaf", so a walk that read a large leaf's frame (`bait`) as a page
+    /// table would return a permitting entry.
+    struct Path
+    {
+        va: u64,
+        pml4: Box<Table>,
+        pdpt: Box<Table>,
+        pd: Box<Table>,
+        bait: Box<Table>,
+    }
+
+    fn path() -> Path
+    {
+        let va = 0x7F_4060_3000_u64;
+        let mut bait = Table::new();
+        let lure = PageTableEntry(PRESENT | USER_BIT | WRITABLE | (bait.addr() & PHYS_MASK));
+        bait.0 = [lure; 512];
+        let mut pml4 = Table::new();
+        let mut pdpt = Table::new();
+        let pd = Table::new();
+        pml4.0[pml4_index(va)] =
+            PageTableEntry(PageTableEntry::new_table(pdpt.addr()).0 | USER_BIT);
+        pdpt.0[pdpt_index(va)] = PageTableEntry(PageTableEntry::new_table(pd.addr()).0 | USER_BIT);
+        Path {
+            va,
+            pml4,
+            pdpt,
+            pd,
+            bait,
+        }
+    }
+
+    fn walk(p: &Path) -> Option<PageTableEntry>
+    {
+        // SAFETY: every table on the path is a live host `Table`, and the
+        // identity `to_virt` maps each entry's address back to it.
+        unsafe { walk_to_4k_leaf(p.pml4.addr(), p.va, |pa| pa) }
+    }
+
+    #[test]
+    fn walk_reaches_a_present_4k_leaf()
+    {
+        let mut p = path();
+        let mut pt = Table::new();
+        let leaf = PageTableEntry(PRESENT | USER_BIT | 0x1234_5000);
+        pt.0[pt_index(p.va)] = leaf;
+        p.pd.0[pd_index(p.va)] = PageTableEntry(PageTableEntry::new_table(pt.addr()).0 | USER_BIT);
+        assert_eq!(walk(&p).map(|e| e.0), Some(leaf.0));
+        pt.0[pt_index(p.va)] = PageTableEntry(0);
+        assert!(walk(&p).is_none());
+    }
+
+    #[test]
+    fn walk_stops_at_a_large_pd_leaf()
+    {
+        // The leaf names the bait frame itself (not 2 MiB-aligned, which only
+        // the hardware would care about), so a walk that read it as a PT would
+        // return the bait's permitting entry.
+        let mut p = path();
+        p.pd.0[pd_index(p.va)] =
+            PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (p.bait.addr() & PHYS_MASK));
+        assert!(walk(&p).is_none());
+    }
+
+    #[test]
+    fn walk_stops_at_a_large_pdpt_leaf()
+    {
+        let mut p = path();
+        p.pdpt.0[pdpt_index(p.va)] =
+            PageTableEntry(PRESENT | USER_BIT | LARGE_PAGE | (p.bait.addr() & PHYS_MASK));
+        assert!(walk(&p).is_none());
     }
 
     // ── Shootdown-elision classification ───────────────────────────────────────

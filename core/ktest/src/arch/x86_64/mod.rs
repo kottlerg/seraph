@@ -30,6 +30,7 @@
 //!   bit only for a user-half address
 //! - `ioport_revoke.rs` — revoking an `IoPort` cap withdraws the port access
 //!   bound through its descendant from a reader on another CPU
+//! - `umip.rs` — on a CPU reporting UMIP, ring-3 `SIDT` and `SGDT` raise `#GP`
 
 mod acpi_shutdown;
 pub mod callee_saved;
@@ -43,6 +44,7 @@ mod page_fault_present_bit;
 mod sbi_call;
 pub mod serial;
 mod syscall_rflags_hardening;
+mod umip;
 mod user_half_top;
 
 use init_protocol::InitInfo;
@@ -60,6 +62,12 @@ pub const ILLEGAL_INSTRUCTION_VECTOR: u64 = 6;
 /// Exception vector a not-present user load faults with (`#PF`), as recorded
 /// in `EXIT_FAULT_BASE + <vector>` when the fault kills the thread.
 pub const PAGE_FAULT_LOAD_VECTOR: u64 = 14;
+
+/// Interrupt ids the root Interrupt cap names but the kernel does not route,
+/// which `unit::hw::irq_register_unroutable_id_err` expects `irq_register` to
+/// refuse: GSI 23, the first above the 23 GSIs with an IDT gate (vectors
+/// 33-55), and GSI 255, whose vector `33 + 255` overflows a `u8`.
+pub const UNROUTABLE_IRQ_IDS: &[u32] = &[23, 255];
 
 /// Physical base of an MMIO register page that a test may read without side
 /// effects: the I/O APIC at QEMU's default base, a page of its own among the
@@ -210,4 +218,5 @@ pub fn run_integration(ctx: &TestContext)
         page_fault_present_bit::run(ctx)
     );
     crate::run_integration_test!("integration::ioport_revoke", ioport_revoke::run(ctx));
+    crate::run_integration_test!("integration::umip_descriptor_reads_fault", umip::run(ctx));
 }

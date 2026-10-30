@@ -17,9 +17,9 @@
 //! ## Read path
 //! - Inline reads carry the payload in the IPC buffer.
 //! - Memory-cap reads: the driver returns a Memory cap covering one cached
-//!   page; we reserve VA, `mem_map` it read-only, copy out, then
-//!   proactively release the cache slot via `FS_RELEASE_MEMORY` and tear
-//!   the mapping down locally.
+//!   page; we reserve VA, `mem_map` it read-only, copy out, tear the
+//!   mapping down locally, then proactively release the cache slot via
+//!   `FS_RELEASE_MEMORY`.
 //!
 //! ## Write path
 //! - Inline writes carry the payload in the IPC buffer.
@@ -949,8 +949,8 @@ fn acquire_write_frame(aspace: u32, memmgr_ep: u32) -> io::Result<WriteFrame>
 /// A driver release of the cookie waits on the mark, up to the driver's
 /// release window, so the page is not unmapped, or acked back to the
 /// driver, mid-copy; a copy outlasting the window gets no ack, and the
-/// driver may recycle the page (#516). Dropping the mark ends the read on
-/// every early return.
+/// driver quarantines the page rather than refill it while it stays mapped
+/// here. Dropping the mark ends the read on every early return.
 struct ReadMark<'a>
 {
     entry: &'a FileEntry,
@@ -1622,14 +1622,16 @@ impl File
             // `checked_frame_reply` holds `memory_data_offset + bytes_valid
             // <= PAGE_SIZE`, so `src + i` lies in the mapped page for every
             // `i < copy_len <= bytes_valid`. The page is the driver's and
-            // another process may write it: the `ReadMark` holds a driver
-            // release off only within the driver's cooperative-release
-            // window, and the driver's revoke unmaps nothing, so a copy that
-            // outlasts the window can read the page after the driver
-            // recycles it. Volatile reads make that a defined read of
-            // possibly foreign bytes rather than a data race; the copy is
-            // discarded below when it is known to have outlasted the window,
-            // and otherwise cannot be told apart (#516).
+            // another process may write it. The driver writes it in place only
+            // by write-through of the sectors it caches, which may include
+            // other files' or the FAT's sectors; it refills a released page
+            // only once no mapping but its own remains, so a copy that
+            // outlasts the release window never reads a refilled page, and
+            // this read's own bytes [memory_data_offset, + bytes_valid) are
+            // this file's. Volatile reads keep a concurrent
+            // driver write a defined read rather than a data race; a copy
+            // known to have outlasted the window is still discarded below,
+            // as defence in depth.
             *byte = unsafe { core::ptr::read_volatile(src.add(i)) };
         }
         // The copy is done: hand the mapping to the registry, where a driver
@@ -1640,18 +1642,20 @@ impl File
             memory_cap,
         });
 
-        // Proactive release: synchronous FS_RELEASE_MEMORY on the file
-        // cap clears the fs-side outstanding entry and decrements the
-        // cache slot's refcount. After ack we own the local cleanup
-        // (take_mapping is no-op if the handler thread already grabbed
-        // it via a forced-release race).
-        self.release_frame(cookie);
+        // Unmap first (take_mapping is a no-op if the handler thread already
+        // took the mapping on a forced release), then the proactive
+        // FS_RELEASE_MEMORY on the file cap, which clears the fs-side
+        // outstanding entry and drops the cache slot's refcount. In this
+        // order the driver finds the page mapped by itself alone when it next
+        // reuses the slot, and need not quarantine it.
         release_handler::release_one_local(self.entry.as_ref(), self.aspace, cookie);
+        self.release_frame(cookie);
 
         // A driver release whose wait ran out during the copy means the
-        // driver's window had passed, so the page may have been recycled:
-        // the bytes are not used, the position stays, and `Interrupted` asks
-        // the caller to read again.
+        // driver's window had passed. The driver does not refill a page this
+        // process still maps, so the bytes are its file's; they are dropped
+        // anyway as defence in depth: the position stays, and `Interrupted`
+        // asks the caller to read again.
         if stalled
         {
             return Err(io::const_error!(
@@ -1912,9 +1916,9 @@ impl Drop for File
         // FS_CLOSE: fs walks its outstanding-page table and revokes
         // every per-cookie ancestor cap, decrementing each cache-slot
         // refcount. The revoke invalidates our derived caps but leaves
-        // their mappings in place, and fs may recycle the pages (#516),
-        // so each VA must still be unmapped, its reservation freed, and
-        // its cap deleted.
+        // their mappings in place; fs refills none of those pages while we
+        // map it, but each held page shrinks its cache, so each VA must
+        // still be unmapped, its reservation freed, and its cap deleted.
         if !ipc_buf.is_null()
         {
             let close = IpcMessage::new(fs_labels::FS_CLOSE);

@@ -55,17 +55,17 @@ use syscall_abi::{
 pub use syscall_abi::{
     CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY,
     CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
-    CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, CAP_TAG_MEMORY,
-    EXIT_FAULT_BASE, EXIT_KILLED, EXIT_VOLUNTARY, IPC_REPLY_TRANSFER_FAILED, MAP_EXECUTABLE,
-    MAP_FROM_CAP, MAP_READ, MAP_WRITABLE, MAX_GETRANDOM_LEN, RIGHTS_ALL, RIGHTS_AS_CONTROL,
-    RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_CS_ALL, RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE,
-    RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE, RIGHTS_EP_GRANT, RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND,
-    RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST, RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE, RIGHTS_IRQ_NOTIFY,
-    RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP, RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_RETYPE,
-    RIGHTS_MEM_WRITE, RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT,
-    RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET,
-    RIGHTS_SBI_SUSPEND, RIGHTS_THREAD, RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE,
-    RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT,
+    CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES, CAP_INFO_MEMORY_PHYS_BASE,
+    CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, CAP_TAG_MEMORY, EXIT_FAULT_BASE, EXIT_KILLED,
+    EXIT_VOLUNTARY, IPC_REPLY_TRANSFER_FAILED, MAP_EXECUTABLE, MAP_FROM_CAP, MAP_READ,
+    MAP_WRITABLE, MAX_GETRANDOM_LEN, RIGHTS_ALL, RIGHTS_AS_CONTROL, RIGHTS_AS_MAP, RIGHTS_AS_READ,
+    RIGHTS_CS_ALL, RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE, RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE,
+    RIGHTS_EP_GRANT, RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST,
+    RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE, RIGHTS_IRQ_NOTIFY, RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP,
+    RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE, RIGHTS_MMIO_MAP,
+    RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC,
+    RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND, RIGHTS_THREAD,
+    RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT,
 };
 
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
@@ -703,9 +703,10 @@ pub fn cap_create_thread(
 /// non-canonical, or the range leaves the user half), `InvalidArgument`
 /// (zero page count, overflow, the range runs past the memory region, or
 /// `offset_pages` lies below the retype cursor),
-/// `InvalidCapability`, `InsufficientRights` (requested permissions exceed
-/// the cap's rights), `WxViolation`, or `OutOfMemory` (page-table
-/// allocation).
+/// `InvalidCapability` (also when `memory_cap` is revoked or deleted while
+/// the call runs), `InsufficientRights` (requested permissions exceed the
+/// cap's rights), `WxViolation`, or `OutOfMemory` (page-table
+/// allocation, or a frame already named by `u32::MAX` user mappings).
 #[inline]
 pub unsafe fn mem_map(
     memory_cap: u32,
@@ -1849,7 +1850,7 @@ pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid or lacks
 /// Notify rights, or (`InvalidArgument`) if `irq_cap` covers more than one line
-/// or names an id the kernel cannot route (outside GSIs 0–255 on x86-64, PLIC
+/// or names an id the kernel cannot route (outside GSIs 0–22 on x86-64, PLIC
 /// sources 1–127 on RISC-V). A second registration of a line replaces the first.
 #[inline]
 pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>

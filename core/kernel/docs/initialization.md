@@ -248,7 +248,7 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 
 ```
 1. Enable SMEP and SMAP in CR4 (fatal if CPUID lacks either; both are required and
-   already gated in Phase 1) and clear CR4.FSGSBASE
+   already gated in Phase 1), set CR4.UMIP where CPUID reports it, and clear CR4.FSGSBASE
 2. Enable XSAVE (x87 | SSE | AVX in XCR0) and set CR0.TS for lazy FPU/SIMD save-restore
 3. Construct and install the permanent GDT and the BSP's TSS:
    - Null descriptor (index 0)

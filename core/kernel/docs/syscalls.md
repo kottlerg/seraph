@@ -860,8 +860,9 @@ with TLB shootdown, and IoPort bindings made through a revoked IoPort descendant
 withdrawn, before the call returns; while a concurrent syscall holds the descendant's
 object (any syscall naming it, which pins it), all of that object's mappings and
 bindings are withdrawn when that syscall releases it instead; mappings established
-through a revoked Memory descendant are not withdrawn (see
-[capability-model.md](../../../docs/capability-model.md) § Revocation; #516).
+through a revoked Memory descendant are not withdrawn; a server verifies their withdrawal
+with `SYS_CAP_INFO`'s `CAP_INFO_MEMORY_MAPPINGS` (see
+[capability-model.md](../../../docs/capability-model.md) § Memory).
 Underlying kernel objects are not freed unless a revoked capability was the last
 reference (see [capability-model.md](../../../docs/capability-model.md) § Revocation);
 such a teardown can fail to complete as `SYS_CAP_DELETE` describes for a thread left
@@ -966,11 +967,22 @@ selected by a field code. Read-only inquiry.
 Some fields pack two values into the word — e.g. `TAG_RIGHTS` returns `(tag << 32) |
 rights`, and `THREAD_STATE` returns `(state << 32) | (exit_reason & 0xFFFFFFFF)`.
 
+`CAP_INFO_MEMORY_MAPPINGS` (12) returns, for a Memory cap, the number of user page-table
+leaves in every address space that name a frame of its region, summed over the region's
+frames (the frame map table's counts; see
+[memory-internals.md § Frame Map Table](memory-internals.md#frame-map-table)). A frame's
+count falls only once every CPU has dropped the leaf, so a value equal to the mappings the
+caller itself holds means no other address space can reach the region; the value is a
+snapshot, which stays current only while no one else holds a capability that can map the
+region. The kernel answers only through a Memory cap the caller holds, and only for a region
+of at most `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` (512) pages, so the walk stays bounded.
+
 **Capability requirement:** None — `cap_info` reads the slot without a rights check.
 
 **Errors:** `InvalidCapability` (null/stale handle, empty slot, or a referenced target
-object is gone), `InvalidArgument` (field requires a different capability type, or the
-selector is unknown).
+object is gone), `InvalidArgument` (field requires a different capability type, the
+selector is unknown, or a `CAP_INFO_MEMORY_MAPPINGS` region is larger than
+`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages).
 
 ---
 
@@ -1007,7 +1019,11 @@ applies to its split offset (see
 [docs/capability-model.md § Typed Memory](../../../docs/capability-model.md#typed-memory)). While
 the mapping lives, no retype carves its pages (see [Capability Syscalls](#capability-syscalls)).
 A call that races a retype advancing the cursor over the requested range may fail with
-`InvalidArgument` even when that retype is itself refused.
+`InvalidArgument` even when that retype is itself refused. Once the range's frames are counted,
+the call resolves `memory_cap` a second time, and it fails with `InvalidCapability` if the
+capability was revoked or deleted in between. A revoke therefore either stops the map or is
+followed by a mappings count that includes it (see
+[memory-internals.md § Frame Map Table](memory-internals.md#frame-map-table)).
 
 **Capability requirements:** `memory_cap` (Map), `aspace_cap` (Map).
 
@@ -1015,8 +1031,9 @@ A call that races a retype advancing the cursor over the requested range may fai
 range leaves the user half), `InvalidArgument` (zero page count, size/offset overflow,
 `offset_pages` + `page_count` past the end of the memory cap's region, or `offset_pages`
 below the page-rounded retype bump cursor),
-`InvalidCapability`, `InsufficientRights` (requested prot
-exceeds cap rights), `WxViolation` (both WRITE and EXECUTE requested), `OutOfMemory`
+`InvalidCapability` (also: `memory_cap` revoked or deleted while the call runs),
+`InsufficientRights` (requested prot exceeds cap rights), `WxViolation` (both WRITE and
+EXECUTE requested), `OutOfMemory`
 (page table allocation failure, or a frame already named by `u32::MAX` user mappings).
 
 ---
@@ -1864,8 +1881,9 @@ delivering the notification; the driver MUST call `SYS_IRQ_ACK` to re-enable it
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (a cap lacks Notify),
 `InvalidArgument` (IRQ cap covers more than one line, or names an id outside the
-routable range `MIN_IRQ_ID..=MAX_IRQ_ID`: GSIs 0–255 on x86-64, PLIC sources 1–127 on
-RISC-V, where the root Interrupt cap spans the PLIC's 1024-id space; see
+routable range `MIN_IRQ_ID..=MAX_IRQ_ID`: GSIs 0–22 on x86-64, the GSIs with an IDT gate,
+where the root Interrupt cap spans 256 GSIs; PLIC sources 1–127 on RISC-V, where the root
+Interrupt cap spans the PLIC's 1024-id space; see
 [arch-interface.md](arch-interface.md) § Module-level constants and free functions).
 
 ---

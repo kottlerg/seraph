@@ -4,7 +4,8 @@ Enumerates every value the kernel emits across the user/kernel boundary and
 classifies it toward the goal that no kernel virtual address or kernel pointer
 escapes to userspace — a prerequisite for kernel address-space layout
 randomization (KASLR). Known open disclosure: mirrored console diagnostics
-([#440](https://github.com/kottlerg/seraph/issues/440)).
+([#440](https://github.com/kottlerg/seraph/issues/440)). Accepted residual: the x86-64
+descriptor-table registers on a CPU without UMIP (§ Surface inventory).
 
 ---
 
@@ -27,8 +28,9 @@ distinct, narrower concern handled in "Physical-address surfaces" below.
 Each surface is classified as one of:
 
 - **(a) kernel VA / pointer** — a kernel virtual address, kernel pointer, or value
-  derived from one. A leak. **None found** among emitted values; kernel state kept in
-  donated memory is a separate surface, below.
+  derived from one. A leak. **None found** among emitted values; the one hardware surface
+  of this class, the descriptor-table registers on an x86-64 CPU without UMIP, is listed
+  below, and kernel state kept in donated memory is a separate surface, below.
 - **(b) userspace VA** — an address in the caller's own (or a delegate's) address
   space. The caller already owns it; not a disclosure.
 - **(c) opaque / randomized** — a kernel-minted identifier that is unguessable
@@ -54,6 +56,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | Syscall return convention; no raw-pointer return path | `syscall::dispatch`, `TrapFrame::set_return` | b/c/d |
 | `SYS_CAP_INFO` tag/rights (rights half is type-scoped, interpreted via the tag in the high half), thread-state, TLB / cspace / memory / address-space page-table budget counts, memory has-retype flag | `cap::sys_cap_info` | c/d |
 | `CAP_INFO_MEMORY_PHYS_BASE` → `MemoryObject::base` | `cap::sys_cap_info`, `cap::object::MemoryObject` | **e** |
+| `CAP_INFO_MEMORY_MAPPINGS` → summed user-mapping counts of a Memory region's frames | `cap::sys_cap_info`, `mm::frame_map::mappings_in` | d |
 | `SYS_SYSTEM_INFO` (kernel and boot-protocol versions, cpu count, page size, elapsed µs, current cpu) | `sysinfo::sys_system_info` | c/d |
 | `SYS_ASPACE_QUERY` → leaf physical address of a user page | `sysinfo::sys_aspace_query`, `AddressSpace::query_page` | **e** |
 | `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d |
@@ -67,6 +70,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | Thread ID (random CSPRNG correlator for every thread but init, whose ID is the fixed value 1; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c/d |
 | `CSpaceId` (registry index, never returned to userspace); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |
 | Boot-time `InitInfo` handover — kernel writes a read-only struct into init's mapped region | `init_protocol::InitInfo`, `init_protocol::CapDescriptor` | b/c/d/e |
+| x86-64 descriptor-table registers read at CPL 3 (`SGDT`, `SIDT`, `SLDT`, `SMSW`, `STR`): `#GP` where `CR4.UMIP` is set; the IDTR and GDTR bases on a CPU without UMIP | `cpu::enable_smep_smap`, `idt::IDT`, `gdt::GDT`, `gdt::AP_GDT_PTR` | d / **a** without UMIP |
 
 Notes on the non-obvious entries:
 
@@ -94,6 +98,20 @@ Notes on the non-obvious entries:
   delete or revoke of the last Thread capability cannot free the thread slab while
   `sched::with_held_frame` snapshots its trap frame: the snapshot `copy_to_user` returns
   is the target's user register state.
+- **Descriptor-table registers** are a hardware output, not a value the kernel emits:
+  with `CR4.UMIP` clear, `SIDT` and `SGDT` execute at CPL 3 and return the IDTR and GDTR.
+  The IDT and the BSP's GDT are statics in the kernel image, so on any CPU `SIDT`, and
+  `SGDT` on the BSP, recover the KASLR image slide; an AP's GDT is a slot of the per-AP slab
+  `gdt::init_ap_storage` allocates, a direct-map address, so `SGDT` on an AP recovers the
+  randomized direct-map base. One unprivileged instruction reveals either. The kernel sets
+  `CR4.UMIP` on every CPU whose CPUID reports it (`cpu::enable_smep_smap`, BSP and APs,
+  before the first ring-3 entry), and the five reads then raise `#GP`, delivered or killed
+  on as any user exception. UMIP is opportunistic
+  ([docs/platform-requirements.md](../../../docs/platform-requirements.md) § x86-64
+  Classification), so on a CPU without it the disclosure remains (class **a**): an accepted
+  residual of the platform floor, not a defect of the kernel's outputs. `SLDT` and `STR`
+  return selectors and `SMSW` the low CR0 bits, none of them an address. RISC-V has no
+  user-readable descriptor-table register.
 - **Thread IDs** are random per `sched::alloc_thread_id`, except init's, which is the
   fixed value 1 (class **d**) (issue #248;
   [scheduling-internals.md](scheduling-internals.md) § Cross-CPU TCB Ownership) — a
@@ -114,6 +132,13 @@ Notes on the non-obvious entries:
   addresses (**d**); the only addresses it carries are physical — each
   `CapDescriptor::aux0` for a Memory/Mmio cap and `InitFramebufferInfo::physical_base`
   (**e**, see "Physical-address surfaces"). No field is a kernel VA.
+- **`CAP_INFO_MEMORY_MAPPINGS`** returns a count (**d**). It is the number of user
+  page-table leaves, in any address space, that name a frame of the queried Memory region.
+  It carries no address, and the kernel answers only through a Memory capability the caller
+  holds, for a region of at most 512 pages. What it discloses beyond the caller's own
+  mappings is how many leaves other holders of the same frames map, a coarse activity signal
+  about those holders. A server that hands pages out needs exactly that signal: it reuses a
+  page only once a client's mapping of it is gone.
 
 ## Physical-address surfaces
 

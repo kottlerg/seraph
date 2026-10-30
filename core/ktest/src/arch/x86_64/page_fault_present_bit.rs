@@ -18,28 +18,19 @@
 //!   1. **User half**: a store to a page mapped read-only. The message must
 //!      carry `FAULT_ACCESS_PRESENT` (and `FAULT_ACCESS_WRITE`), so the test
 //!      fails if the bit is dropped for user faults too.
-//!   2. **Kernel half**: a load from the start of every 2 MiB slot of the top
-//!      GiB of the kernel image window. Every message must carry the bit clear.
-//!      The image slides within the 2 GiB window at 2 MiB granularity
-//!      (docs/memory-model.md § x86-64), so on a boot whose slide puts the image
-//!      in the top GiB (about half of KASLR boots) some probe lands on a mapped
-//!      supervisor page whose fault has P = 1, and a kernel that passed the bit
-//!      through fails the test; on the other boots every probe finds an unmapped
-//!      page and this half cannot fail. CI boots x86-64 ktest twice per change
-//!      (debug and release), so it exercises this half in about three runs of
-//!      four until #563's fix lets the probes cover the whole window.
+//!   2. **Kernel half**: a load from the start of every 2 MiB slot of the
+//!      kernel image window. Every message must carry the bit clear. The image
+//!      slides within the 2 GiB window at 2 MiB granularity (docs/memory-model.md
+//!      § x86-64) and is mapped with 4 KiB pages, so on every boot some probe
+//!      lands on a mapped supervisor page whose fault has P = 1, and a kernel
+//!      that passed the bit through fails the test.
 //!
-//! The probes do not locate a mapped kernel VA with `SIDT`/`SGDT`, which ring 3
-//! can still execute while `CR4.UMIP` is clear (#560): that disclosure is a
-//! defect to be closed, and a test built on it would break when it is. Nor do
-//! they cover the window's lower GiB: the direct map is bounded only below the
-//! slid image (`DIRECT_MAP_GUARD` under its base, abi/boot-protocol
-//! `layout::direct_map_slots`), so its top can reach into the lower GiB, and
-//! the kernel's spurious-fault check walks a kernel-half CR2 through the direct
-//! map's 2 MiB leaves as if they were page tables and can loop on the fault
-//! instead of delivering it (#563). The top GiB lies above every direct-map
-//! address, and the image is mapped with 4 KiB pages, so every probe here is
-//! delivered.
+//! The direct map's top can reach into the window's lower GiB (it is bounded
+//! only below the slid image, `DIRECT_MAP_GUARD` under its base,
+//! abi/boot-protocol `layout::direct_map_slots`), so a probe can also land on a
+//! direct-map 2 MiB leaf. The kernel's spurious-fault check refuses every
+//! kernel-half address before walking the tables
+//! (`paging::user_fault_is_spurious`), so that fault is delivered too.
 //!
 //! Each fault is resumed past its faulting instruction: the child records the
 //! instruction's address before the access, and the handler checks the fault IP
@@ -47,9 +38,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use boot_protocol::layout::{
-    DIRECT_MAP_GUARD, IMAGE_SLIDE_ALIGN, IMAGE_WINDOW_SIZE, KERNEL_LINK_BASE,
-};
+use boot_protocol::layout::{IMAGE_SLIDE_ALIGN, IMAGE_WINDOW_SIZE, KERNEL_LINK_BASE};
 use ipc::IpcMessage;
 use syscall::{
     cap_create_endpoint, cap_delete, mem_map, mem_unmap, thread_read_regs, thread_write_regs,
@@ -66,14 +55,11 @@ use crate::{ChildStack, TestContext, TestResult};
 /// ktest fixed VA.
 const RO_VA: u64 = 0x3E_9000_0000;
 
-/// Kernel-image-window slots probed: one per 2 MiB slide slot of the top GiB.
-const PROBES: u64 = DIRECT_MAP_GUARD / IMAGE_SLIDE_ALIGN;
+/// Kernel-image-window slots probed: one per 2 MiB slide slot of the window.
+const PROBES: u64 = IMAGE_WINDOW_SIZE / IMAGE_SLIDE_ALIGN;
 
-/// The lowest probe address: the image window's top `DIRECT_MAP_GUARD` bytes
-/// begin here. The direct map ends at least `DIRECT_MAP_GUARD` below the image
-/// base, and the image base lies below the window's end, so no direct-map
-/// address reaches this floor.
-const PROBE_FLOOR: u64 = KERNEL_LINK_BASE + (IMAGE_WINDOW_SIZE - DIRECT_MAP_GUARD);
+/// The lowest probe address: the image window's floor.
+const PROBE_FLOOR: u64 = KERNEL_LINK_BASE;
 
 /// Badge bound with the handler and delivered in each fault message.
 const FAULT_BADGE: u64 = 0x9F_0001;
@@ -254,14 +240,14 @@ fn expect_fault(ctx: &TestContext, ep: u32, child_th: u32, va: u64, access: Acce
 }
 
 /// The `k`th kernel-half probe address: the start of the `k`th 2 MiB slot of
-/// the image window's top GiB.
+/// the image window.
 fn probe_va(k: u64) -> u64
 {
     PROBE_FLOOR + k * IMAGE_SLIDE_ALIGN
 }
 
 /// Child entry: store to the read-only user page, then load from every probe
-/// address in the image window's top GiB, then exit. Each access faults and is
+/// address in the image window, then exit. Each access faults and is
 /// resumed past by the handler.
 extern "C" fn probe_child(_arg: u64) -> !
 {

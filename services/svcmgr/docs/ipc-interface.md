@@ -62,8 +62,9 @@ svcmgr mints the `devmgr.registry` publish cap
 publish caps (`REGISTRY_QUERY_AUTHORITY` plus `SHUTDOWN_DEVICE_AUTHORITY`
 or `TEST_LABEL_AUTHORITY`), and the `SET_DRIVERS_DIR` cap
 (`DRIVERS_DIR_AUTHORITY`) from the devmgr-registry source. A version
-mismatch in `data[1]`, or a malformed `CAPS` round (including one that
-carries a slot past the list, or a last round that leaves a required
+mismatch in `data[1]`, or a malformed `CAPS` round (including one past the
+rounds the list takes, one whose rounds-left word disagrees with them, one
+that carries a slot past the list, or a last round that leaves a required
 endpoint absent), aborts bootstrap (svcmgr exits).
 
 **After the `CAPS` rounds — `SUBSTRATE` (`data[0] = 2`, not terminal):**

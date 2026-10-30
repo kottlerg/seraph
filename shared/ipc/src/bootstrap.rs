@@ -318,7 +318,8 @@ impl<const N: usize> SlotAccumulator<N>
 ///   [`MORE`] / [`DONE`]: the creator's [`bootstrap_errors::NO_CHILD`],
 ///   [`bootstrap_errors::EXHAUSTED`], or [`bootstrap_errors::INVALID`], or
 ///   `0xFF` when the kernel's reply-cap transfer failed
-///   (`IPC_REPLY_TRANSFER_FAILED`).
+///   (`IPC_REPLY_TRANSFER_FAILED`). Any caps such a reply delivered are
+///   deleted.
 /// * `Err(bootstrap_errors::INVALID)` if the underlying IPC fails, or if
 ///   the reply's label disagrees with its payload: the delivered cap count
 ///   differs from the count the label declares, or the label declares more
@@ -360,7 +361,12 @@ pub unsafe fn request_round(creator_ep: u32, ipc_buf: *mut u64) -> Result<Bootst
                 done: base == DONE,
             })
         }
-        err => Err(err),
+        err =>
+        {
+            // A refused reply's caps reach no caller; release them.
+            delete_slots(reply.caps());
+            Err(err)
+        }
     }
 }
 

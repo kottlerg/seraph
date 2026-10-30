@@ -133,9 +133,8 @@ pending, so the deny would wait behind it for a keypress. The first four seeds a
 svcmgr's registry. The no-authority `pwrmgr.deny` cap is public: the pwrmgr cap-deny phase, which
 requires an `UNAUTHORIZED` reply to `SHUTDOWN`, uses the copy svctest resolves through
 `QUERY_ENDPOINT` on its per-process `service_registry_cap`. `caps[4]` seeds the same name only so
-that every svctest boot receives a seed list longer than one bootstrap round; svctest logs a
-`FATAL:` line, which fails the harness run through the svcmgr second-seed-round phase when slot 4
-arrives empty.
+that every svctest boot receives a seed list longer than one bootstrap round; the svcmgr
+second-seed-round phase fails the run when slot 4 arrives empty.
 
 ---
 

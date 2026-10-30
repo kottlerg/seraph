@@ -46,8 +46,9 @@ space, would this bound still stop the system first?**
   overflow only splits work into more rounds (a batch size, a streaming chunk, a per-message
   count that every protocol iterates over, a refillable seed) or that bounds no capacity at all (a
   tuning threshold, a diagnostic output cap) cannot stop the system first and is
-  `correct as is` under the provable-unreachability arm. The constant's doc comment states which
-  arm applies.
+  `correct as is` under the provable-unreachability arm. The reason is meant to be stated at the
+  constant, in its doc comment or in the comment at its definition; an entry whose constant does
+  not state it is a documentation gap to be recorded.
 
 ### Columns
 
@@ -140,7 +141,7 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636); the buddy pool
 | `PerCpuData.cpu_id`, `preempt_count` | `core/kernel/src/percpu.rs` | `u32` | provably unreachable (CPUs and nesting are far below 2^32) | embedded | correct as is | None |
 | `Spinlock.next_ticket`, `now_serving` | `core/kernel/src/sync.rs` | `AtomicU32`, wrapping | provably unreachable (equality compare; waiters at most CPUs) | 8 B per lock | correct as is | None |
 | `boot_cpu_ids` (by value) | `core/kernel/src/main.rs` | `[u32; MAX_CPUS]` | ABI width (`MAX_CPUS`) | 2 KiB boot stack | make pay-as-you-go | Pass a slice into `BootInfo` |
-| `INIT_ASPACE_PAGES` | `core/kernel/src/main.rs` | 18 | refillable seed (augment donation) | 72 KiB from SEED | correct as is | None |
+| `INIT_ASPACE_PAGES` | `core/kernel/src/main.rs` | 18 | provably unreachable (init's fixed footprint: temp-map scratch and one UART page; augment can refill it, as ktest does) | 72 KiB from SEED | correct as is | None |
 | `INIT_THREAD_PAGES` | `core/kernel/src/main.rs` | `KERNEL_STACK_PAGES + 2` = 6 | encoding artefact (stack, TCB, FPU page) | 24 KiB from SEED | correct as is | None |
 | `page_ptrs`, `page_phys` | `core/kernel/src/main.rs` | `[_; INIT_INFO_MAX_PAGES]` | ABI width (init protocol) | 64 B stack | correct as is | Overflow is fatal above it |
 | `backtrace_scan` `MAX_BYTES` | `core/kernel/src/main.rs` | 8 KiB | unknown | none | raise | Half the 16 KiB kernel stack; bound by `stack_top` |
@@ -368,8 +369,8 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 | `IMAGE_MAX_SPAN` | `shared/process-layout/src/lib.rs` | 1 GiB | unknown | none | raise | Derive from the per-architecture ceiling |
 | Window `slots_log2` values | `shared/process-layout/src/lib.rs` | 21, 23 | encoding artefact (ASLR budget under the ceiling) | none | correct as is | None |
 | `MAX_WINDOW_REGION_PAGES` | `shared/process-layout/src/lib.rs` | 512 | current peak plus headroom (stack 1 + 256) | none | needs a design | Pin against `MAX_PROCESS_STACK_PAGES` with a const assert |
-| `HEAP_ZONE_END`, ruststd `HEAP_SPAN` | `shared/process-layout/src/lib.rs`, `runtime/ruststd/src/sys/alloc/seraph.rs` | 1 GiB | encoding artefact (zone map under 2^38) | none (VA only) | needs a design | No process can hold more than 1 GiB of heap |
-| `RESERVE_ARENA_ZONE_END`, `RESERVE_ARENA_PAGES` | `shared/process-layout/src/lib.rs`, `runtime/ruststd/src/sys/reserve/seraph.rs` | 256 MiB | current peak plus headroom | none (VA only) | raise | About 120 demand stacks exhaust it, then stacks fall back unguarded |
+| `HEAP_ZONE_END`, ruststd `HEAP_SPAN` | `shared/process-layout/src/lib.rs`, `runtime/ruststd/src/sys/alloc/seraph.rs` | zone end 4 GiB (`0x1_0000_0000`); span 1 GiB | encoding artefact (zone map under 2^38) | none (VA only) | needs a design | No process can hold more than 1 GiB of heap |
+| `RESERVE_ARENA_ZONE_END`, `RESERVE_ARENA_PAGES` | `shared/process-layout/src/lib.rs`, `runtime/ruststd/src/sys/reserve/seraph.rs` | zone end `0x20_1000_0000`; arena 256 MiB | current peak plus headroom | none (VA only) | raise | About 120 demand stacks exhaust it, then stacks fall back unguarded |
 | Zone-map asserts | `shared/process-layout/src/lib.rs` | 10 asserts | encoding artefact | none | correct as is | Keep |
 | `LAYOUT_ENTROPY_BYTES` | `shared/process-layout/src/lib.rs` | 32 | provably unreachable (exactly four surfaces) | none | correct as is | None |
 | `DEFAULT_PROCESS_STACK_PAGES` | `abi/process-abi/src/lib.rs` | 8 | default (per-binary override exists) | 32 KiB per process | correct as is | None |
@@ -394,7 +395,7 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 | `DEFAULT_DEMAND_STACK_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 512 (2 MiB) | default (VA only, lazy) | none | correct as is | Multiplies against the reserve arena (#46) |
 | `GUARD_PAGES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 1 | unknown | VA only | raise | A frame over 4 KiB can step over it |
 | `DEFAULT_MIN_STACK_SIZE` | `runtime/ruststd/src/sys/thread/seraph.rs` | 64 KiB | default (matches the upstream platform layer) | eager on the fallback path | correct as is | None |
-| `THREAD_RETYPE_BYTES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 5 pages | encoding artefact (mirrors the kernel) | 20 KiB per thread | needs a design | Export from abi/syscall so it cannot drift |
+| `THREAD_RETYPE_BYTES` | `runtime/ruststd/src/sys/thread/seraph.rs` | 5 pages | encoding artefact, short of the kernel's 6-page `dispatch_for(Thread)`; it works only because `ALLOCATOR_METADATA_RESERVE` rounds the request up to 6 pages | 24 KiB per thread | needs a design | Export the size from abi/syscall so it cannot drift |
 | `DEATH_EQ_CAPACITY` (process) | `runtime/ruststd/src/sys/process/seraph.rs` | 4 | provably unreachable (four post sources, each posting at most once per child) | about 112 B per child | correct as is | None |
 | `Process::id` | `runtime/ruststd/src/sys/process/seraph.rs` | `u32` | ABI width (upstream `Child::id` is `u32`) | none | correct as is | None |
 | pipe `RING_CAPACITY` | `runtime/ruststd/src/sys/pipe/seraph.rs` | 2048 | encoding artefact (largest power of two in one page after the header) | 4 KiB per direction | correct as is | None |

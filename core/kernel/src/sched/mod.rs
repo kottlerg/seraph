@@ -308,7 +308,8 @@ const OWED_RULE_WAKE_PENDING: u8 = 3;
 #[cfg(not(test))]
 const OWED_WAKE_MAX: usize = 8;
 
-/// `schedule()` context-saved spin: single-shot warning threshold (µs).
+/// `schedule()` context-saved spin: single-shot warning threshold (µs). A
+/// diagnostic threshold; it bounds no capacity.
 #[cfg(not(test))]
 const CS_SPIN_WARN_US: u64 = 100_000;
 

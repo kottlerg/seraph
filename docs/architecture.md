@@ -293,7 +293,8 @@ mode.
 What the system can hold is meant to be limited only by the hardware: a bound that would still
 stop the system first on a machine with more RAM, CPUs, devices, or address space is a defect,
 unless a hardware or format specification, a committed ABI width, or provable unreachability
-sets it. The cost of a ceiling is paid in proportion to use, not up front. The catalogue
+sets it. The cost of a ceiling is meant to be paid in proportion to use, not up front; the
+catalogue lists the bounds that do not yet meet either aim. The catalogue
 classifies every in-tree bound against this test.
 
 ---

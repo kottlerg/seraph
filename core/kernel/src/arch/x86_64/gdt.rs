@@ -159,7 +159,8 @@ static mut TSS: TssWithIopb = TssWithIopb {
 };
 
 /// GDT: 7 × 64-bit descriptors, in BSS. Seven is the fixed layout the module
-/// documentation lists (five segments plus the two-slot TSS); it bounds no count.
+/// documentation lists (the null descriptor, four segments, and the two-slot TSS);
+/// it bounds no count.
 #[cfg(not(test))]
 static mut GDT: [u64; 7] = [0u64; 7];
 

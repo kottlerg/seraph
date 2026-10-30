@@ -333,11 +333,11 @@ impl Heap {
             return false;
         }
         let mut mapped: u64 = 0;
-        // memmgr's reply slot count is bounded; if a single best-effort
-        // call satisfies fewer pages than requested, loop. Bound the
-        // retry count so a misbehaving memmgr cannot wedge the caller. A
-        // correct memmgr never reaches it: `REQUEST_MEMORY_CAPS` grants the
-        // whole request or fails, so one round suffices.
+        // Loop until the request is mapped, in case a reply covers fewer
+        // pages than asked. Bound the retry count so a misbehaving memmgr
+        // cannot wedge the caller. A correct memmgr never reaches it:
+        // `REQUEST_MEMORY_CAPS` grants the whole request or fails, so one
+        // round suffices.
         const MAX_ROUNDS: u32 = 16;
         let mut rounds: u32 = 0;
         let complete = loop {

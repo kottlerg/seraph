@@ -304,8 +304,8 @@ pub struct InitSegment
 ///
 /// Must match the bootloader's segment array capacity.
 ///
-/// Eight is provably sufficient: the in-tree init links to four or five LOAD
-/// segments, and the bootloader fails the load with an error on a ninth
+/// Eight is provably sufficient: the in-tree init links to four LOAD segments
+/// on x86_64, and the bootloader fails the load with an error on a ninth
 /// rather than truncating.
 pub const INIT_MAX_SEGMENTS: usize = 8;
 

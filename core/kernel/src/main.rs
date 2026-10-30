@@ -704,8 +704,9 @@ unsafe fn kernel_entry_post_rebase(
         // serves init's userspace pooled paths: `sys_mem_map`
         // (TEMP_MAP_BASE + ELF_PAGE_TEMP_VA scratch) and `sys_mmio_map` for
         // init's own MMIO (the riscv64 serial UART, one page). 16 pool
-        // pages cover that footprint with margin. The pool is a refillable
-        // seed: init grows it by augment-mode `SYS_CAP_CREATE_ASPACE` donations.
+        // pages cover that footprint with margin. The footprint is fixed by
+        // init's own code, so no hardware count grows it; the pool also takes
+        // augment-mode `SYS_CAP_CREATE_ASPACE` donations, which ktest uses.
         // items_after_statements: the constant is documented by the comment
         // above, next to its only use.
         #[allow(clippy::items_after_statements)]

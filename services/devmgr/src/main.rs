@@ -9,7 +9,7 @@
 //! devmgr receives raw firmware access (ACPI RSDP / reclaimable regions,
 //! DTB blob), a full-rights derivation of the root Interrupt range cap,
 //! and the MMIO aperture list from init. It parses MCFG / DTB to locate
-//! the PCI ECAM, narrows MMIO apertures via `mmio_split`, and splits
+//! every PCI ECAM window, narrows MMIO apertures via `mmio_split`, and splits
 //! single-IRQ caps off that range via `irq_split` before delegating to driver processes.
 //!
 //! See `services/devmgr/docs/responsibilities.md` for devmgr's responsibilities
@@ -828,8 +828,8 @@ fn handle_query_shutdown_device(
 /// Carve, map, and scan one ECAM window, appending its functions to
 /// `devices`. Returns `false`, logging why, when no aperture covers the
 /// window, the VA reservation, page-table funding, or mapping fails, or the
-/// scan stops for lack of memory (the functions found before that point are
-/// kept).
+/// scan stops for lack of memory before recording any function; a scan that
+/// stops after recording some keeps them and counts as scanned.
 fn enumerate_ecam(
     caps: &mut caps::DevmgrCaps,
     loc: &firmware::EcamLocation,
@@ -883,6 +883,7 @@ fn enumerate_ecam(
     // `loc.phys_base`, the configuration space of `start_bus`, and stays
     // mapped until after the scan below.
     let ecam = unsafe { pci::Ecam::new(ecam_va, loc.start_bus, loc.end_bus) };
+    let found_before = devices.len();
     let scanned = firmware::scan::scan(&ecam, loc.segment, loc.start_bus, loc.end_bus, devices);
     // SAFETY: the scan has returned and reached ECAM only through raw
     // pointers; the span is `ecam_range`, owned here.
@@ -898,7 +899,7 @@ fn enumerate_ecam(
             dev,
             func
         );
-        return false;
+        return devices.len() > found_before;
     }
     true
 }
@@ -977,8 +978,10 @@ impl IrqRangeAllocator
         Self { ranges }
     }
 
-    /// Isolate a single-IRQ cap for line `id`.
-    fn isolate_one(&mut self, id: u32) -> Option<u32>
+    /// Isolate a single-IRQ cap for line `id`; [`CarveError::NotCovered`]
+    /// when no held range contains it (another device already holds the
+    /// line, or it lies outside the range cap).
+    fn isolate_one(&mut self, id: u32) -> Result<u32, CarveError>
     {
         self.ranges
             .carve(u64::from(id), 1, 1, |span: &Span<u32>, at| {
@@ -994,7 +997,6 @@ impl IrqRangeAllocator
                     }
                 })
             })
-            .ok()
     }
 }
 
@@ -1178,12 +1180,14 @@ fn carve_virtio_device(
     })
 }
 
-/// Spawn a `VirtIO` block driver for every virtio-blk device, in BDF order,
+/// Spawn a `VirtIO` block driver for every virtio-blk device that gets a
+/// private IRQ line, in BDF order,
 /// each from a copy of the boot module and with its own service endpoint.
 /// Returns the endpoints of the drivers that completed their bootstrap, in
 /// that order: `QUERY_BLOCK_DEVICE`'s instance ordinal indexes it. A device
 /// is skipped, logged, when no module was delivered, its caps cannot be
-/// carved, it gets no IRQ cap (virtio-blk requires one), or its spawn fails.
+/// carved, it gets no IRQ cap (virtio-blk requires one; a line another device
+/// already holds gives none, #664), or its spawn fails.
 fn spawn_virtio_blk_all(
     devices: &[pci::PciDevice],
     caps: &mut caps::DevmgrCaps,
@@ -1243,7 +1247,8 @@ fn spawn_one_virtio_blk(
 {
     // virtio-blk requires an IRQ: it rejects the 2-cap no-IRQ round 1 and
     // exits, which would leave `spawn_driver` blocked serving round 2.
-    // Refuse the spawn instead.
+    // Refuse the spawn instead; a disk on a line another device holds is
+    // not served until shared lines are (#664).
     let Some(irq_cap) = dev_caps.irq_cap
     else
     {
@@ -1312,16 +1317,28 @@ fn acquire_single_irq_cap(
 ) -> Option<u32>
 {
     let gsi = device_gsi(pci_dev)?;
-    let cap = irq_range.isolate_one(gsi);
-    if cap.is_some()
+    match irq_range.isolate_one(gsi)
     {
-        std::os::seraph::log!("split single-IRQ cap for GSI {:#x}", u64::from(gsi));
+        Ok(cap) =>
+        {
+            std::os::seraph::log!("split single-IRQ cap for GSI {:#x}", u64::from(gsi));
+            Some(cap)
+        }
+        Err(CarveError::NotCovered) =>
+        {
+            // Shared INTx lines are not served yet (#664).
+            std::os::seraph::log!(
+                "GSI {:#x} already held by another device (or outside the IRQ range); no IRQ cap",
+                u64::from(gsi)
+            );
+            None
+        }
+        Err(_) =>
+        {
+            std::os::seraph::log!("irq_split failed for GSI {:#x}", u64::from(gsi));
+            None
+        }
     }
-    else
-    {
-        std::os::seraph::log!("irq_split failed for GSI {:#x}", u64::from(gsi));
-    }
-    cap
 }
 
 /// Compute the GSI for a PCI device: the firmware-programmed config-space

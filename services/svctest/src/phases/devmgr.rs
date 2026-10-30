@@ -32,6 +32,7 @@ use std::os::seraph::startup_info;
 use std::time::Duration;
 
 use crate::bootstrap::Caps;
+use crate::phases::drivers::INPUT_ATTEMPTS;
 use crate::runner::Phase;
 
 pub fn phases() -> &'static [Phase]
@@ -113,12 +114,6 @@ fn shutdown_device_deny_phase(caps: &Caps)
         "SHUTDOWN_DEVICE_AUTHORITY",
     );
 }
-
-/// Attempts at the ordinal-0 input query while devmgr reports `NO_DEVICE`:
-/// the input driver is spawned from disk after devmgr's `SET_DRIVERS_DIR`,
-/// so its endpoint can lag svctest's start. 500 attempts 10 ms apart bound
-/// the wait at about 5 s.
-const INPUT_ATTEMPTS: u32 = 500;
 
 /// `QUERY_INPUT_DEVICE` on `devmgr.registry` selecting `ordinal` in
 /// `data[1]`, or sending no `data[1]` for `None`.

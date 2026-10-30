@@ -22,7 +22,7 @@ no window is skipped and the walk continues. For each window devmgr then
 carves the ECAM `Mmio` sub-cap from the boot-provided MMIO aperture cap that
 covers it, maps it, and scans it. A window no aperture covers, or that
 cannot be mapped, is logged and not scanned; the boot halts only when no
-window is scanned.
+window yields a scan.
 
 ### Address Calculation
 
@@ -40,8 +40,10 @@ covers and to 255 (the `reg` is decoded in the parent's `#address-cells` /
 `#size-cells`, and its address is the configuration space of the first bus);
 for the platform default, 0..=255. The window's `size` is 1 MiB per bus of
 that range on every path. Its `segment` is the MCFG entry's PCI segment
-group; for a DTB node, its `linux,pci-domain` property, else its ordinal
-among the ECAM nodes; for the platform default, 0. A table whose window is empty, inverted, or
+group; for a DTB node, its `linux,pci-domain` property, else the lowest
+segment no other ECAM node's property or earlier fallback takes; for the
+platform default, 0. A DTB node whose `linux,pci-domain` is short or above
+65535 yields no window. A table whose window is empty, inverted, or
 overflows a 64-bit physical address yields no ECAM. The offset arithmetic is
 `firmware::pci::config_offset`; devmgr reads a bus outside
 `start_bus..=end_bus` as all-ones.
@@ -52,7 +54,8 @@ The walk is `firmware::scan::scan`, which reaches configuration space through
 the `ConfigSpace` accessor devmgr implements over the mapped window. It
 collects every present function into a growable list; when the list cannot
 grow, the scan stops, logged with the first function it could not record,
-and keeps the functions found before it. The functions of every window are
+and keeps the functions found before it (a window that recorded any counts
+as scanned). The functions of every window are
 then ordered by segment, bus, device, and function.
 
 1. Map the ECAM `Mmio` cap into devmgr's address space.
@@ -100,7 +103,9 @@ VirtIO PCI devices use vendor ID `0x1AF4`. Device IDs:
 devmgr matches discovered devices against its driver binaries by vendor and
 device ID: a boot module for virtio-blk, an on-disk driver for virtio-input.
 Every matching device gets its own driver process, in segment, bus, device,
-function order. Class-based matching is design intent (#165).
+function order, except a virtio-blk device that cannot get a private IRQ
+line: virtio-blk requires one, and a line another device already holds is
+not served until shared lines are (#664). Class-based matching is design intent (#165).
 
 ---
 

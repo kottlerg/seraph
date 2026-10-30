@@ -388,6 +388,8 @@ mod tests
     struct FakeSpace
     {
         funcs: RefCell<BTreeMap<(u8, u8, u8), Function>>,
+        /// Writes to any function's Command register.
+        command_writes: std::cell::Cell<u32>,
     }
 
     impl FakeSpace
@@ -460,6 +462,10 @@ mod tests
         }
         fn write16(&self, bus: u8, dev: u8, func: u8, reg: u16, val: u16)
         {
+            if reg == PCI_COMMAND
+            {
+                self.command_writes.set(self.command_writes.get() + 1);
+            }
             if let Some(f) = self.funcs.borrow_mut().get_mut(&(bus, dev, func))
             {
                 let r = usize::from(reg);
@@ -621,5 +627,70 @@ mod tests
         );
         assert_eq!(virtio_second_bar(&one), None);
         assert_eq!(virtio_second_bar(&found[1].virtio_info), Some(2));
+    }
+
+    #[test]
+    fn host_bridge_keeps_decode_on_while_other_functions_toggle_it()
+    {
+        let space = FakeSpace::default();
+        let bridge = (0, 0, 0);
+        space.add(bridge, 0x8086, 1, 0x00);
+        // Base class 0x06, subclass 0x00 (host bridge), decode on.
+        space.set32(bridge, 0x08, 0x0600_0000);
+        space.set32(bridge, 0x04, 0x0007);
+        space.set_bar(bridge, 0, 0xFEB0_0000, !0xFFF & !0xF);
+        scan_all(&space, 0, 0);
+        assert_eq!(space.command_writes.get(), 0);
+        let other = (0, 1, 0);
+        space.add(other, 0x8086, 2, 0x00);
+        space.set32(other, 0x04, 0x0007);
+        scan_all(&space, 0, 0);
+        // The non-bridge function is turned off for the probe and restored.
+        assert_eq!(space.command_writes.get(), 2);
+        assert_eq!(space.get32(other, 0x04) & 0xFFFF, 0x0007);
+    }
+
+    #[test]
+    fn cyclic_capability_list_ends_at_the_capability_bound()
+    {
+        let space = FakeSpace::default();
+        let bdf = (0, 3, 0);
+        virtio_with_caps(&space, bdf, &[(1, 4, 0, 0x38)]);
+        // The capability's next pointer names itself.
+        space.funcs.borrow_mut().get_mut(&bdf).unwrap().cfg[0x41] = 0x40;
+        let found = scan_all(&space, 0, 0);
+        assert_eq!(found[0].virtio_info.common_cfg.length, 0x38);
+    }
+
+    #[test]
+    fn capability_list_is_not_walked_when_the_status_bit_is_clear()
+    {
+        let space = FakeSpace::default();
+        let bdf = (0, 3, 0);
+        virtio_with_caps(&space, bdf, &[(1, 4, 0, 0x38)]);
+        space.set32(bdf, 0x04, 0);
+        let found = scan_all(&space, 0, 0);
+        assert_eq!(found[0].virtio_info.common_cfg.length, 0);
+    }
+
+    #[test]
+    fn a_64_bit_type_in_the_last_bar_register_is_sized_as_32_bit()
+    {
+        let space = FakeSpace::default();
+        let bdf = (0, 1, 0);
+        space.add(bdf, 0x8086, 1, 0x00);
+        // BAR5 claims a 64-bit type but has no upper register after it.
+        space.set_bar(bdf, 5, 0xFE00_0004, !0xFFF & !0xF);
+        let d = scan_all(&space, 0, 0)[0];
+        assert_eq!(d.bar_count, 1);
+        assert_eq!(
+            (
+                d.bar_phys[0],
+                d.bar_size[0],
+                d.bar_pci_idx[0],
+                d.bar_is_mmio[0]
+            ),
+            (0xFE00_0000, 0x1000, 5, true)
+        );
     }
 }

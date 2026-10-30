@@ -14,7 +14,7 @@ exclusively by capability delegation:
 
 | Layer | Process | Owns |
 |---|---|---|
-| Block | `virtio-blk` (single instance, first virtio-blk device) | Hardware MMIO, IRQ, descriptor rings |
+| Block | `virtio-blk` (one per virtio-blk device; vfsd binds instance ordinal 0) | Hardware MMIO, IRQ, descriptor rings |
 | Filesystem | one fs driver per mount (e.g. `fatfs`) | On-disk format, BPB, FAT chains |
 | Namespace | `vfsd` (single instance) | Synthetic root, GPT discovery, mount tree |
 

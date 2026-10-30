@@ -135,21 +135,24 @@ impl<'a> Fdt<'a>
     /// address is the configuration space of the first bus. The bus range
     /// is the node's `bus-range` property, else bus 0 onward, clamped to the
     /// buses `reg` covers and to 255; the window's size is 1 MiB per bus of
-    /// that range. Its segment is the node's `linux,pci-domain` property,
-    /// else the node's ordinal among the ECAM nodes. A node more than 16
-    /// levels deep (the root node is level 1) is skipped, and so is a node
-    /// whose parent's cell sizes are unsupported, whose `reg` is missing,
-    /// short, or zero, that covers less than one bus, or whose `bus-range` is
-    /// short, inverted, or starts above bus 255. The walk stops, keeping the
-    /// windows found so far, where the structure block closes more nodes
-    /// than it has opened.
+    /// that range. Its segment is the node's `linux,pci-domain` property;
+    /// a node without one takes, in structure-block order, the lowest
+    /// segment that no node's `linux,pci-domain` and no earlier node without
+    /// one takes, so two windows share a segment only when their properties
+    /// name the same one. A node more than 16 levels deep (the root node is
+    /// level 1) is skipped, and so is a node whose parent's cell sizes are
+    /// unsupported, whose `reg` is missing, short, or zero, that covers less
+    /// than one bus, whose `bus-range` is short, inverted, or starts above
+    /// bus 255, or whose `linux,pci-domain` is short or above 65535. The walk
+    /// stops, keeping the windows found so far, where the structure block
+    /// closes more nodes than it has opened.
     ///
     /// # Errors
     /// Returns the allocation error when the window list cannot grow.
     pub fn find_pci_ecams(&self) -> Result<Vec<EcamLocation>, TryReserveError>
     {
-        let mut found = Vec::new();
-        let mut ordinal: u16 = 0;
+        // Each window with whether its segment came from `linux,pci-domain`.
+        let mut found: Vec<(EcamLocation, bool)> = Vec::new();
         let mut walker = FdtWalker::new(self);
         // `cells[d]`: the cell sizes the children of the node at depth `d`
         // decode their `reg` in (the root node is depth 1). Tracked only for
@@ -202,20 +205,44 @@ impl<'a> Fdt<'a>
                             continue;
                         };
                         let (addr_cells, size_cells) = cells[depth - 1];
-                        if let Some(loc) =
-                            extract_ecam(self, node_start, addr_cells, size_cells, ordinal)
+                        if let Some((loc, domain)) =
+                            extract_ecam(self, node_start, addr_cells, size_cells)
                         {
                             found.try_reserve(1)?;
-                            found.push(loc);
+                            found.push((loc, domain.is_some()));
                         }
-                        ordinal = ordinal.wrapping_add(1);
                     }
                 }
                 FdtEvent::Prop { .. } =>
                 {}
             }
         }
-        Ok(found)
+        assign_fallback_segments(&mut found);
+        let mut windows = Vec::new();
+        windows.try_reserve(found.len())?;
+        windows.extend(found.iter().map(|&(loc, _)| loc));
+        Ok(windows)
+    }
+}
+
+/// Give each window whose node has no `linux,pci-domain` (flag `false`), in
+/// order, the lowest segment no other window holds: not an explicit domain,
+/// and not one an earlier fallback took. A segment space with no free value
+/// leaves the window at 0.
+fn assign_fallback_segments(found: &mut [(EcamLocation, bool)])
+{
+    for i in 0..found.len()
+    {
+        if found[i].1
+        {
+            continue;
+        }
+        let taken = |seg: u16, f: &[(EcamLocation, bool)]| {
+            f.iter()
+                .enumerate()
+                .any(|(j, &(l, explicit))| (explicit || j < i) && l.segment == seg)
+        };
+        found[i].0.segment = (0..=u16::MAX).find(|&seg| !taken(seg, found)).unwrap_or(0);
     }
 }
 
@@ -254,15 +281,14 @@ fn read_cells(data: &[u8], off: usize, cells: usize) -> Option<u64>
 /// Decode the ECAM window of the node starting at `dt_struct` offset
 /// `node_start` from its `reg` (first pair, in the parent's
 /// `addr_cells` / `size_cells`), optional `bus-range`, and optional
-/// `linux,pci-domain` (else `ordinal` is the segment), per
-/// [`Fdt::find_pci_ecams`].
+/// `linux,pci-domain`, per [`Fdt::find_pci_ecams`]. Returns the window, its
+/// segment the domain or 0, with the domain the node names, if any.
 fn extract_ecam(
     fdt: &Fdt<'_>,
     node_start: usize,
     addr_cells: usize,
     size_cells: usize,
-    ordinal: u16,
-) -> Option<EcamLocation>
+) -> Option<(EcamLocation, Option<u16>)>
 {
     let mut walker = FdtWalker::at(fdt, node_start);
     // Consume the BEGIN_NODE for `node_start` itself.
@@ -336,13 +362,14 @@ fn extract_ecam(
     let end_bus = u8::try_from(u64::from(last).min(covered_last).min(255)).ok()?;
     let bus_count = u64::from(end_bus) - u64::from(start_bus) + 1;
     base.checked_add(bus_count << 20)?;
-    Some(EcamLocation {
+    let loc = EcamLocation {
         phys_base: base,
         size: bus_count << 20,
-        segment: domain.unwrap_or(ordinal),
+        segment: domain.unwrap_or(0),
         start_bus,
         end_bus,
-    })
+    };
+    Some((loc, domain))
 }
 
 /// Events yielded by `FdtWalker::next_event`. Node names are not consumed
@@ -635,10 +662,98 @@ mod tests
             got,
             [
                 (0x3000_0000, 15, 0),
-                (0x5000_0000, 1, 2),
+                (0x5000_0000, 1, 1),
                 (0x6000_0000, 0, 7)
             ]
         );
+    }
+
+    /// `/soc` holding one ECAM node per `extra` property list, in order.
+    fn ecam_nodes(nodes: &[(u64, &[(&str, &[u8])])]) -> Vec<u8>
+    {
+        let mut b = Builder::new()
+            .begin("")
+            .begin("soc")
+            .prop("#address-cells", &2u32.to_be_bytes())
+            .prop("#size-cells", &2u32.to_be_bytes());
+        for &(base, extra) in nodes
+        {
+            b = b
+                .begin("pcie")
+                .prop("compatible", ECAM)
+                .prop("reg", &reg(base, 1 << 20));
+            for &(name, data) in extra
+            {
+                b = b.prop(name, data);
+            }
+            b = b.end();
+        }
+        b.end().end().finish()
+    }
+
+    fn segments(blob: &[u8]) -> Vec<(u64, u16)>
+    {
+        let found = Fdt::new(blob).unwrap().find_pci_ecams().unwrap();
+        found.iter().map(|l| (l.phys_base, l.segment)).collect()
+    }
+
+    #[test]
+    fn fallback_segments_avoid_every_explicit_domain()
+    {
+        let zero = 0u32.to_be_bytes();
+        let one = 1u32.to_be_bytes();
+        // Nodes without a domain sit before and after nodes naming 0 and 1.
+        let blob = ecam_nodes(&[
+            (0x1000_0000, &[]),
+            (0x2000_0000, &[("linux,pci-domain", &zero)]),
+            (0x3000_0000, &[]),
+            (0x4000_0000, &[("linux,pci-domain", &one)]),
+        ]);
+        assert_eq!(
+            segments(&blob),
+            [
+                (0x1000_0000, 2),
+                (0x2000_0000, 0),
+                (0x3000_0000, 3),
+                (0x4000_0000, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn short_or_oversized_pci_domain_skips_only_its_node()
+    {
+        let short = [0u8; 2];
+        let wide = 0x1_0000u32.to_be_bytes();
+        let blob = ecam_nodes(&[
+            (0x1000_0000, &[("linux,pci-domain", &short)]),
+            (0x2000_0000, &[("linux,pci-domain", &wide)]),
+            (0x3000_0000, &[]),
+        ]);
+        assert_eq!(segments(&blob), [(0x3000_0000, 0)]);
+    }
+
+    #[test]
+    fn stray_end_node_keeps_the_windows_found_before_it()
+    {
+        let blob = Builder::new()
+            .begin("")
+            .prop("#size-cells", &2u32.to_be_bytes())
+            .begin("pcie@10000000")
+            .prop("compatible", ECAM)
+            .prop("reg", &reg(0x1000_0000, 1 << 20))
+            .end()
+            .end()
+            .end()
+            .begin("")
+            .prop("#size-cells", &2u32.to_be_bytes())
+            .begin("pcie@20000000")
+            .prop("compatible", ECAM)
+            .prop("reg", &reg(0x2000_0000, 1 << 20))
+            .end()
+            .end()
+            .finish();
+        assert_eq!(segments(&blob), [(0x1000_0000, 0)]);
     }
 
     #[test]

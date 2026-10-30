@@ -49,9 +49,11 @@ devmgr's responsibilities are:
   (see
   [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming)).
 
-  devmgr spawns one driver for every virtio-blk and every virtio-input
-  device, each with its own service endpoint, and refuses, logged, a VirtIO
-  device whose register regions span more than one BAR.
+  devmgr spawns one driver for every virtio-input device and for every
+  virtio-blk device it can give a private IRQ line (a disk whose line another
+  device already holds is not served, #664), each with its own service
+  endpoint, and refuses, logged, a VirtIO device whose register regions span
+  more than one BAR.
 
   Driver binaries are sourced from one of two places:
 
@@ -70,7 +72,8 @@ devmgr's responsibilities are:
     to each driver's binary and spawns it between `ipc_reply` and the next
     `ipc_recv`. Each spawn is at-most-once per boot; failure is sticky and
     surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_RTC_DEVICE`
-    and `QUERY_INPUT_DEVICE` queries. See
+    and `QUERY_INPUT_DEVICE` queries, the same reply as before the spawn has
+    run, so a client retries it only a bounded number of times. See
     [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves

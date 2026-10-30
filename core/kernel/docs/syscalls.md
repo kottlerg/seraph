@@ -1031,8 +1031,9 @@ followed by a mappings count that includes it (see
 range leaves the user half), `InvalidArgument` (zero page count, size/offset overflow,
 `offset_pages` + `page_count` past the end of the memory cap's region, or `offset_pages`
 below the page-rounded retype bump cursor),
-`InvalidCapability`, `InsufficientRights` (requested prot
-exceeds cap rights), `WxViolation` (both WRITE and EXECUTE requested), `OutOfMemory`
+`InvalidCapability` (also: `memory_cap` revoked or deleted while the call runs),
+`InsufficientRights` (requested prot exceeds cap rights), `WxViolation` (both WRITE and
+EXECUTE requested), `OutOfMemory`
 (page table allocation failure, or a frame already named by `u32::MAX` user mappings).
 
 ---

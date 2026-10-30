@@ -703,9 +703,10 @@ pub fn cap_create_thread(
 /// non-canonical, or the range leaves the user half), `InvalidArgument`
 /// (zero page count, overflow, the range runs past the memory region, or
 /// `offset_pages` lies below the retype cursor),
-/// `InvalidCapability`, `InsufficientRights` (requested permissions exceed
-/// the cap's rights), `WxViolation`, or `OutOfMemory` (page-table
-/// allocation).
+/// `InvalidCapability` (also when `memory_cap` is revoked or deleted while
+/// the call runs), `InsufficientRights` (requested permissions exceed the
+/// cap's rights), `WxViolation`, or `OutOfMemory` (page-table
+/// allocation, or a frame already named by `u32::MAX` user mappings).
 #[inline]
 pub unsafe fn mem_map(
     memory_cap: u32,

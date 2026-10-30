@@ -294,3 +294,118 @@ pub fn run(ctx: &Context, args: &TestVmgenidArgs) -> Result<()>
     step("vmgenid snapshot-resume test: PASS (detection + post-resume liveness)");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// A `Guest` around a stand-in child running `program` with its stdout
+    /// piped to a reader thread, wired as [`Guest::launch`] wires QEMU. The
+    /// teardown under test is generic over the child, so a long `sleep`
+    /// stands for a QEMU that is still running.
+    fn stand_in(program: &str, args: &[&str]) -> Guest
+    {
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        let reader = thread::spawn(move || {
+            for line in std::io::BufRead::lines(BufReader::new(stdout)).map_while(Result::ok)
+            {
+                if tx.send(line).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Guest {
+            child,
+            lines: rx,
+            reader: Some(reader),
+        }
+    }
+
+    /// Whether a process with this pid exists, an unreaped zombie included
+    /// (`kill -0` succeeds on one).
+    fn process_exists(pid: u32) -> bool
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// Kills the stand-in by pid on drop unless disarmed, so a failed
+    /// assertion cannot leave it running on the host even when the
+    /// teardown under test is the part that is broken. It is armed only
+    /// while the pid is known to be the test's own unreaped child, so the
+    /// kill cannot reach a reused pid.
+    struct KillGuard(Option<u32>);
+
+    impl KillGuard
+    {
+        fn disarm(&mut self)
+        {
+            self.0 = None;
+        }
+    }
+
+    impl Drop for KillGuard
+    {
+        fn drop(&mut self)
+        {
+            if let Some(pid) = self.0
+            {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+
+    // In each test below, the teardown under test (`Drop` or `wait_exit`)
+    // collects the exit status through the `Child` handle (`wait` or a
+    // `try_wait` that returned `Some`) before it returns, so the `kill -0`
+    // check after it runs strictly after the reap and cannot race it: an
+    // unkilled process or an unreaped zombie fails the check.
+
+    #[test]
+    fn dropping_a_live_guest_kills_and_reaps_its_process()
+    {
+        let guest = stand_in("sleep", &["3600"]);
+        let pid = guest.child.id();
+        assert!(process_exists(pid));
+        let mut guard = KillGuard(Some(pid));
+        drop(guest);
+        assert!(!process_exists(pid));
+        guard.disarm();
+    }
+
+    #[test]
+    fn wait_exit_timeout_kills_and_reaps_the_process()
+    {
+        let guest = stand_in("sleep", &["3600"]);
+        let pid = guest.child.id();
+        assert!(process_exists(pid));
+        let mut guard = KillGuard(Some(pid));
+        assert!(guest.wait_exit(Duration::ZERO).is_err());
+        assert!(!process_exists(pid));
+        guard.disarm();
+    }
+
+    #[test]
+    fn wait_exit_returns_once_the_process_exits_on_its_own()
+    {
+        let guest = stand_in("true", &[]);
+        let pid = guest.child.id();
+        assert!(guest.wait_exit(TIMEOUT).is_ok());
+        assert!(!process_exists(pid));
+    }
+}

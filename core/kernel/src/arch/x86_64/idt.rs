@@ -111,7 +111,7 @@ impl IdtEntry
 
 // ── IDT storage ───────────────────────────────────────────────────────────────
 
-/// 256-entry IDT in BSS.
+/// 256-entry IDT in BSS. 256 is the whole x86 vector space (vectors are 8-bit).
 ///
 /// Written only during single-threaded boot init.
 #[cfg(not(test))]

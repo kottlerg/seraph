@@ -89,6 +89,7 @@ pub enum ObjectType
 pub struct KernelObjectHeader
 {
     /// Reference count; starts at 1 when created.
+    /// Tracked by #633: the unchecked `u32` increment in `inc_ref` can wrap.
     pub ref_count: AtomicU32,
     /// Concrete type, for use during deallocation.
     pub obj_type: ObjectType,
@@ -249,7 +250,9 @@ pub struct MemoryObject
 }
 
 /// Sentinel encoding a held write lock in [`MemoryObject::lock`]. Matches
-/// `DerivationLock`'s convention.
+/// `DerivationLock`'s convention. A reader count cannot reach it: a holder is
+/// never descheduled (core/kernel/docs/scheduling-internals.md § Lock
+/// Hierarchy), so readers are at most one per CPU.
 const FRAME_WRITE_LOCKED: u32 = u32::MAX;
 
 impl MemoryObject
@@ -401,6 +404,7 @@ pub struct RangeLineage
 }
 
 /// The share of a lineage root's `live` count the root's own references hold.
+/// The copy count below it is capped at `RANGE_COPY_LIMIT`, so the two never collide.
 const ROOT_SHARE: u32 = 1 << 31;
 
 impl RangeLineage
@@ -849,7 +853,8 @@ const SEED_BATCH_PAGES: u64 = 64;
 #[cfg(not(test))]
 const RECORD_PAGE_HEADER: usize = core::mem::size_of::<u64>() + core::mem::size_of::<usize>();
 
-/// Donation records per `RecordPage`.
+/// Donation records per `RecordPage`. Fixed by the page and record layout;
+/// record pages chain through `next_phys`, so it bounds no record count.
 #[cfg(not(test))]
 const RECORDS_PER_PAGE: usize =
     (crate::mm::PAGE_SIZE - RECORD_PAGE_HEADER) / core::mem::size_of::<DonationRecord>();

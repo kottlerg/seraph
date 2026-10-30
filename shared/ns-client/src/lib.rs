@@ -138,11 +138,15 @@ unsafe fn walk(
     let mut current_owns = false;
     let mut last_kind: u64 = 0;
     let mut size_hint: u64 = 0;
+    // Counts hops only to detect an empty path; it cannot exceed the number
+    // of components in `path`.
     let mut hop_count: usize = 0;
 
     let mut iter = PathComponents::new(path);
     while let Some(name) = iter.next_component()
     {
+        // 255 is `namespace_protocol::MAX_NAME_LEN`, the per-component limit
+        // the server enforces; a longer name cannot resolve.
         if name.is_empty() || name.len() > 255
         {
             if current_owns

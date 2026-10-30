@@ -68,7 +68,9 @@ pub fn new_gpt_table() -> [GptEntry; MAX_GPT_PARTS]
     ]
 }
 
-/// Validated GPT header fields needed to walk the partition array.
+/// Validated GPT header fields needed to walk the partition array. The
+/// `u32` widths of `num_parts` and `entry_size` are the UEFI GPT header's
+/// own field widths.
 pub struct GptHeader
 {
     pub part_entry_lba: u64,

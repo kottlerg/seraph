@@ -36,6 +36,8 @@ const FRAMES_PER_CHUNK: usize = 1 << (CHUNK_SHIFT - 12);
 #[cfg(not(test))]
 const CHUNK_ORDER: usize = 8;
 
+// Chunk geometry is an encoding artefact, not a capacity: one GiB of frames is
+// exactly one order-`CHUNK_ORDER` buddy block of counters; `MAX_CHUNKS` bounds the span.
 #[cfg(not(test))]
 const _: () = assert!(FRAMES_PER_CHUNK * 4 == PAGE_SIZE << CHUNK_ORDER);
 
@@ -93,6 +95,9 @@ impl FrameMap
     }
 
     /// Count one more user leaf mapping of the frame holding `phys`.
+    ///
+    /// The `u32` ceiling is unreachable: 2^32 leaf PTEs naming one frame need
+    /// 32 GiB of page tables, and a saturated count refuses the map, never wraps.
     ///
     /// # Errors
     /// `Err(())` when the count is already `u32::MAX`; nothing changes.
@@ -284,6 +289,8 @@ impl Default for ReleaseBatch
 }
 
 /// Runs one [`ReleaseBatch`] holds before its owner must invalidate and drain.
+/// A full batch never fails a walk: `AddressSpace::batch_cleared_frame`
+/// invalidates, drains and pushes again, so the size only sets the round count.
 const RELEASE_RUNS: usize = 16;
 
 impl ReleaseBatch

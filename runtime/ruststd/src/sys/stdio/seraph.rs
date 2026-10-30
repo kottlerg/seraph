@@ -247,6 +247,8 @@ impl io::Write for Stderr {
 
 // ── Module API expected by std::io::stdio ──────────────────────────────────
 
+/// Buffer size for upstream std's `Stdin`. A streaming chunk that bounds no
+/// input: a longer read refills the buffer from the stdin pipe.
 pub const STDIN_BUF_SIZE: usize = 512;
 
 pub fn is_ebadf(_err: &io::Error) -> bool {

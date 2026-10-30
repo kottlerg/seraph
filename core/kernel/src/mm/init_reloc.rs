@@ -70,6 +70,8 @@ pub fn apply_relro(
         }
         else
         {
+            // The segment table is the boot protocol's fixed
+            // `[InitSegment; INIT_MAX_SEGMENTS]`, so a split past it is a clean error.
             if *count as usize >= INIT_MAX_SEGMENTS
             {
                 return Err("Phase 9: RELRO split exceeds INIT_MAX_SEGMENTS");

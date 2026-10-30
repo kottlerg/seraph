@@ -143,6 +143,8 @@ fn run_one(path: &Path) -> Result<(), String>
 /// output is silently dropped past the first NUL.
 fn forward_lines<R: std::io::Read>(tester: &str, stream: &str, mut r: R)
 {
+    // A read chunk, not a line limit: the loop reads until EOF and `line`
+    // grows to hold a line of any length.
     let mut buf = [0u8; 512];
     let mut line: Vec<u8> = Vec::with_capacity(512);
     loop

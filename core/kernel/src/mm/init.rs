@@ -491,8 +491,9 @@ fn read_dtb_totalsize(phys: u64) -> Option<u64>
 {
     /// FDT magic in big-endian: bytes `d0 0d fe ed`.
     const FDT_MAGIC: u32 = 0xd00d_feed;
-    /// Largest accepted DTB `totalsize` (64 KiB, far above any realistic DTB);
-    /// a larger value is rejected and no exclusion is added, not clamped.
+    /// Largest accepted DTB `totalsize` (64 KiB); a larger value is rejected and no
+    /// exclusion is added, not clamped.
+    /// Tracked by #635: a larger DTB gets no exclusion and no cap.
     const DTB_MAX_SIZE: u64 = 64 * 1024;
 
     // `phys` is the firmware's DTB physical address. The bootloader's initial

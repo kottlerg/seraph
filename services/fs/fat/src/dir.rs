@@ -577,7 +577,8 @@ const MAX_NUMERIC_TAIL: u8 = 6;
 ///
 /// Returned by [`insert_entry`] so dispatch can later patch the
 /// `first_cluster` and `size` fields via [`update_entry_metadata`]
-/// after a write extends the file.
+/// after a write extends the file. `sector_lba` is a `u32` because FAT32
+/// counts sectors in 32 bits (`BPB_TotSec32`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct DirEntryLocation
 {
@@ -589,6 +590,7 @@ pub struct DirEntryLocation
 ///
 /// `start_cluster` is `0` for empty files (cluster chain was never
 /// allocated) — the caller must skip `free_cluster_chain` in that case.
+/// Its `u32` is the FAT32 directory entry's 32-bit first-cluster field.
 #[derive(Copy, Clone, Debug)]
 pub struct RemovedEntry
 {

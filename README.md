@@ -96,6 +96,8 @@ Overall project design documents live in [`docs/`](docs/):
   driver binding, DMA safety
 - [Platform Requirements](docs/platform-requirements.md) — per-arch
   required/opportunistic/unsupported CPU and platform feature baseline; boot-time feature-gate
+- [Limits](docs/limits.md) — catalogue of every in-tree bound, classified against
+  hardware-realistic ceilings and pay-as-you-go cost
 - [Console Model](docs/console-model.md) — serial/console output ownership across boot;
   serial-driver-mediated userspace output
 - [Build System](docs/build-system.md) — toolchain, workspace layout, sysroot, xtask commands

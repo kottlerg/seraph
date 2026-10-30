@@ -35,7 +35,9 @@ pub const STATUS_A_UIP: u8 = 0x80;
 
 /// Snapshot attempts before [`snapshot`] gives up. An attempt fails when
 /// the update-in-progress bit does not clear within [`UIP_POLL_LIMIT`]
-/// polls, rises during the first read, or the two reads disagree.
+/// polls, rises during the first read, or the two reads disagree. The
+/// MC146818 updates once a second and an attempt lasts a few milliseconds, so a
+/// working clock fails at most one or two attempts in a row.
 pub const MAX_ATTEMPTS: u32 = 16;
 
 /// Status A polls one attempt allows for update-in-progress to clear. The

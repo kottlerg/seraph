@@ -1826,6 +1826,7 @@ fn populate_cspace(
 fn read_dtb_totalsize(phys: u64) -> Option<u64>
 {
     const FDT_MAGIC: u32 = 0xd00d_feed;
+    // Tracked by #635: a larger DTB is not minted.
     const DTB_MAX_SIZE: u64 = 64 * 1024;
 
     // `phys` is in the direct physical map (active since Phase 3). The

@@ -56,6 +56,9 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use init_protocol::{CapType, InitInfo};
 
 /// Maximum frames in the pool.
+///
+/// Sixty-four is the width of the `u64` availability bitmap
+/// (`POOL_AVAILABLE`), one bit per frame.
 pub(crate) const POOL_SIZE: usize = 64;
 
 /// Size of one page.

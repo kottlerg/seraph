@@ -435,7 +435,10 @@ impl Command {
         // death-relay cap. procmgr binds that copy as an address-space death
         // observer on the child, so a terminal fault in *any* of the child's
         // threads (not just the main thread) posts the fault class to this
-        // queue and `wait()` returns.
+        // queue and `wait()` returns. Four covers one post from each source
+        // that targets the queue: the main thread's death, the address-space
+        // death observer, `kill`'s `EXIT_KILLED`, and the bridge's drop
+        // sentinel.
         const DEATH_EQ_CAPACITY: u32 = 4;
         let bytes = syscall_abi::event_queue_retype_bytes(u64::from(DEATH_EQ_CAPACITY));
         let death_eq = crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
@@ -1029,7 +1032,8 @@ pub struct Process {
 impl Process {
     pub fn id(&self) -> u32 {
         // No POSIX pid on Seraph; the process-handle cap's handle uniquely
-        // identifies the process within this caller's CSpace.
+        // identifies the process within this caller's CSpace. The `u32` is
+        // upstream's `Child::id` width and matches the cap-handle width.
         self.process_handle
     }
 

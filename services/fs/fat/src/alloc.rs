@@ -227,7 +227,8 @@ pub fn update_fat_entry(
 /// finding a free entry or completing the wrap. Bad clusters are
 /// skipped. On success, the returned cluster's FAT entry is written
 /// `eoc_value(fat_type)` and `next_free_hint` is bumped to the slot
-/// after the allocation.
+/// after the allocation. The single wrap visits each of the volume's
+/// `total_clusters` at most once, so the volume, not a constant, bounds it.
 pub fn allocate_cluster(
     state: &mut FatState,
     prev: Option<u32>,

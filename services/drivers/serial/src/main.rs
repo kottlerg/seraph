@@ -69,7 +69,8 @@ fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
 // ── Service loop ───────────────────────────────────────────────────────────
 
 /// Maximum bytes drained per `SERIAL_READ_BYTES`, matching the write path's
-/// `0..=512` payload bound.
+/// `0..=512` payload bound: `MSG_DATA_WORDS_MAX` words of 8 bytes, the most
+/// one reply carries. A caller drains more input with further reads.
 const MAX_READ_BYTES: usize = 512;
 
 fn handle_request(msg: &IpcMessage, irq_cap: u32, ipc_buf: *mut u64)
@@ -96,6 +97,8 @@ fn handle_request(msg: &IpcMessage, irq_cap: u32, ipc_buf: *mut u64)
     else if op == serial_labels::SERIAL_WRITE_BYTES
     {
         // The mask bounds the length to 16 bits, so the conversion cannot fail.
+        // 16 label bits exceed the 512 bytes one message's data words carry,
+        // and `n` clamps to those bytes.
         let byte_len = usize::try_from((msg.label >> 16) & 0xFFFF).unwrap_or(0);
         let bytes = msg.data_bytes();
         let n = byte_len.min(bytes.len());

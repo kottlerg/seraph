@@ -31,7 +31,8 @@ pub const MAX_PENDING_BOOTSTRAPS: usize = 4;
 /// Maximum number of active jobs that may be queued at once.
 pub const MAX_PENDING_ACTIVE_JOBS: usize = 4;
 
-/// Number of active worker threads.
+/// Number of active worker threads. A concurrency knob that bounds no
+/// capacity: a queued job waits for the next free worker.
 pub const ACTIVE_WORKER_COUNT: usize = 2;
 
 /// A unit of work submitted to the pool.

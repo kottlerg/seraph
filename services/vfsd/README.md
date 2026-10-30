@@ -36,7 +36,7 @@ vfsd/
 ## Responsibilities
 
 - **Namespace composition** — owns `VfsdRootBackend`, the in-process
-  [`NamespaceBackend`] that surfaces installed mounts as cross-server
+  `NamespaceBackend` that surfaces installed mounts as cross-server
   entries on the synthetic system root, and forwards unmatched
   lookups to the root mount via transparent delegation. See
   [`docs/namespace-composition.md`](docs/namespace-composition.md).

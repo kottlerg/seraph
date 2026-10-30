@@ -151,7 +151,8 @@ Three actors cooperate to bring a filesystem online:
 self-mounts root; the `vfsd_labels::MOUNT_AUTHORITY`-badged SEND it endows svcmgr
 with (published as `vfsd.mount`) reaches only svctest. Init pulls the system root via
 `GET_SYSTEM_ROOT_CAP` (which vfsd serves only once root is mounted, so
-the call blocks until the root filesystem is up), then distributes
+the call blocks until the root filesystem is up, and replies `NO_MOUNT`
+if the root self-mount failed), then distributes
 per-child copies on every spawn via
 `procmgr_labels::CONFIGURE_NAMESPACE`. Init retains no further
 filesystem access of its own. The `GET_SYSTEM_ROOT_CAP` contract is

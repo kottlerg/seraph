@@ -9,7 +9,7 @@ the synthetic-root composition that backs it is described in
 [`namespace-composition.md`](namespace-composition.md).
 
 The system-root cap is requested by init via
-[`vfsd_labels::GET_SYSTEM_ROOT_CAP`]. vfsd self-mounts root before any
+`vfsd_labels::GET_SYSTEM_ROOT_CAP`. vfsd self-mounts root before any
 service thread starts receiving, so the pull blocks until the root
 filesystem is up; if the self-mount failed, vfsd replies `NO_MOUNT`
 and init FATALs. Vfsd derives a fresh badged SEND on its own namespace
@@ -50,7 +50,7 @@ paths.
 | 62 | `vfsd_labels::SEED_AUTHORITY` | `GET_SYSTEM_ROOT_CAP` | init only |
 
 All requests use `SYS_IPC_CALL` (synchronous call/reply). Numeric
-labels live in [`ipc::vfsd_labels`] in `shared/ipc`.
+labels live in `ipc::vfsd_labels` in `shared/ipc`.
 
 ---
 
@@ -76,7 +76,7 @@ registers the partition bound with virtio-blk, spawns a fatfs
 driver, sends `FS_MOUNT` (see
 [services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md))
 to validate the BPB, captures the driver's
-root cap into [`VfsdRootBackend`], and replies with a badged SEND on
+root cap into `VfsdRootBackend`, and replies with a badged SEND on
 the new filesystem's namespace endpoint addressing its root. A mount
 on `/` once root is already mounted, or on a path that is already a mount
 point, is rejected (`TABLE_FULL`) before any partition is registered or

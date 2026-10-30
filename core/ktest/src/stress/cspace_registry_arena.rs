@@ -65,23 +65,18 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut outcome = Ok(());
     for slot in handles.iter_mut()
     {
-        match cap_create_cspace(ctx.memory_base, 0, 1)
+        let Ok(cs) = cap_create_cspace(ctx.memory_base, 0, 1)
+        else
         {
-            Ok(cs) =>
-            {
-                *slot = cs;
-                created += 1;
-            }
-            Err(_) =>
-            {
-                crate::log_u64(
-                    "ktest: stress::cspace_registry_arena refused at live ",
-                    created as u64,
-                );
-                outcome = Err("cspace_registry_arena: cap_create_cspace refused below LIVE");
-                break;
-            }
-        }
+            crate::log_u64(
+                "ktest: stress::cspace_registry_arena refused at live ",
+                created as u64,
+            );
+            outcome = Err("cspace_registry_arena: cap_create_cspace refused below LIVE");
+            break;
+        };
+        *slot = cs;
+        created += 1;
     }
 
     for &cs in &handles[..created]

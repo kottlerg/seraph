@@ -1213,7 +1213,15 @@ impl HeldPage
             .word(0, cookie)
             .build();
         // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_call(node, &release, ipc_buf) };
+        let released = unsafe { ipc::ipc_call(node, &release, ipc_buf) }
+            .expect("slot reuse: FS_RELEASE_MEMORY ipc_call");
+        // A failed release would leave the slot in use, so the reuse the
+        // cases check would never happen.
+        assert_eq!(
+            released.label,
+            ipc::fs_errors::SUCCESS,
+            "slot reuse: FS_RELEASE_MEMORY {index}"
+        );
         let held = Self {
             index,
             cap,

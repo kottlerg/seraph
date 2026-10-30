@@ -1089,6 +1089,8 @@ pub mod vfsd_labels
     /// [`MOUNT_AUTHORITY`]; vfsd replies `UNAUTHORIZED` otherwise, before it
     /// reads the request.
     pub const MOUNT: u64 = 10;
+    // Label 12 is reserved and MUST NOT be reused for an unrelated request
+    // (services/vfsd/docs/vfs-ipc-interface.md).
     /// Mint a fresh badged SEND on vfsd's namespace endpoint addressing
     /// the synthetic system root at full namespace rights and return it
     /// to the caller.

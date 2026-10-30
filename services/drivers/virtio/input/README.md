@@ -52,8 +52,10 @@ Read a batch of pending keyboard events. **Blocking**: the driver does not
 reply until at least one event is available.
 
 **Request:** empty body. Gated by `READ_AUTHORITY`: a caller whose badge
-lacks it gets an immediate `UNAUTHORIZED` (`4`) reply with no events and is
-never blocked.
+lacks it gets an `UNAUTHORIZED` (`4`) reply with no events as soon as the
+driver reaches the request, without waiting for input. The driver serves one
+request at a time, so that request still waits behind any authorized read
+already blocked for a key (the terminal's keyboard loop keeps one pending).
 
 **Reply (`SUCCESS`):**
 

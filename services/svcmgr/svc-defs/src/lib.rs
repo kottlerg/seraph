@@ -145,7 +145,7 @@ pub struct Definition
     /// `services/svcmgr/docs/service-definitions.md` § cwd.
     pub cwd: Option<String>,
     /// Published-registry names svcmgr resolves at launch time and
-    /// injects positionally into the child's bootstrap round.
+    /// injects positionally into the child's bootstrap rounds.
     pub seed: Vec<String>,
     /// Registry names this service's own service endpoint is published
     /// under. When non-empty, svcmgr's launch path creates a service

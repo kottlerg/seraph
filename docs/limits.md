@@ -76,9 +76,9 @@ An entry an existing open Issue already names cites it in the recommendation.
   block, and `AP_IST_STACKS` is exactly 8 MiB at `MAX_CPUS = 512`. `MAX_CPUS` itself is inline
   in the one-page `BootInfo`, and shipping two-socket servers already exceed 512 logical CPUs.
 - **Process ceiling.** Live processes stop at 32 (procmgr `MAX_PROCESSES`), then 64 (memmgr);
-  the kernel's `CSpace` registry is sized from RAM and does not bind first. Behind those sit the per-process `u32` death correlator,
-  `badge as u32` in procmgr, logd and svcmgr, which collides once tables grow, and the cap
-  handle's 8-bit wrapping generation.
+  the kernel's `CSpace` registry is sized from RAM and does not bind first. Behind those sit
+  the per-process `u32` death correlator, `badge as u32` in procmgr, logd and svcmgr, which
+  collides once tables grow, and the cap handle's 8-bit wrapping generation.
 - **Per-process address space.** One static VA map sized to Sv39's 2^38 is used on every
   architecture. It caps each process's heap at 1 GiB, its reservation arena at 256 MiB, and its
   main stack at 1 MiB.

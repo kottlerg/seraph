@@ -117,6 +117,16 @@ every other userspace object comes from the capability a `cap_create_*` syscall 
 Address spaces and CSpaces additionally own a page pool for their page tables and slot pages
 ([capability-internals.md](capability-internals.md) § Page Pools).
 
+The retype allocator (`core/kernel/src/cap/retype.rs`) rounds each request to a size class: two
+sub-page classes of 128 and 512 bytes, or a page multiple. A sub-page request is placed from its
+class's free list, else at the bump cursor, else, once the cursor has reached the end of the
+Memory object, in one page taken from the page free list and cut into that class's slots. A
+page-multiple request is placed from the page free list, else at the bump cursor. The carve keeps
+freed page blocks usable by sub-page requests, which SEED depends on: init's bootstrap objects
+return to it as page blocks at init's reap, and every runtime SEED body is sub-page. Free bytes
+held in the other sub-page class, or in sub-page slots for a page-multiple request, are not
+placeable, so a request can still fail while the object's `available_bytes` counts enough bytes.
+
 Retype and pool allocation are fallible and MUST be handled as fallible at every
 call site; there is no allocation that cannot fail
 ([docs/memory-model.md](../../../docs/memory-model.md) § Kernel Allocation is Fallible).

@@ -43,8 +43,9 @@ use syscall::SyscallError;
 /// arg0 = Interrupt cap index (must have NOTIFY right).
 ///
 /// Unmasks the IRQ line at the interrupt controller, allowing the next
-/// interrupt delivery. The driver must call this after clearing the interrupt
-/// source in the device to avoid an interrupt storm.
+/// interrupt delivery, when a notification is registered on it; a line with
+/// no registration stays masked. The driver must call this after clearing the
+/// interrupt source in the device to avoid an interrupt storm.
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -82,8 +83,11 @@ pub fn sys_irq_ack(tf: UserFrame) -> Result<u64, SyscallError>
         io.start
     };
 
-    // Unmask at the interrupt controller to re-enable delivery.
-    crate::arch::current::interrupts::unmask(irq_id);
+    // Unmask at the interrupt controller to re-enable delivery, if the line is
+    // routed (`irq::ack` checks and unmasks under the routing lock).
+    // SAFETY: syscall context, not interrupt context, with no IPC source,
+    // scheduler, or sleep-list lock held.
+    unsafe { crate::irq::ack(irq_id) };
 
     Ok(0)
 }
@@ -107,10 +111,13 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// 3. Any thread blocked on `SYS_NOTIFICATION_WAIT` for this notification is woken.
 /// 4. The driver must call `SYS_IRQ_ACK` to re-enable delivery.
 ///
-/// On `x86_64`: programs the IOAPIC redirection entry (masked until first ACK).
-/// On RISC-V: enables the PLIC source (masked at controller until first ACK).
+/// On `x86_64`: assigns the GSI a device IDT vector and programs its IOAPIC
+/// redirection entry (masked until first ACK). On RISC-V: assigns the PLIC
+/// source a target hart (masked at the controller until first ACK).
 ///
-/// Returns 0 on success.
+/// Returns 0 on success; `InvalidArgument` for an id no discovered controller
+/// implements, `QuotaExceeded` when the controller has no delivery resource left
+/// (x86-64: every device vector assigned).
 #[cfg(not(test))]
 pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -149,8 +156,8 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
         io.start
     };
     // The root Interrupt cap spans the controller's whole id space
-    // (`ROOT_IRQ_COUNT`), which on both architectures exceeds the ids the kernel
-    // routes (on riscv64 also the routing table); refuse an id it cannot route.
+    // (`ROOT_IRQ_COUNT`); refuse an id outside the routable range here, and
+    // `irq::register` refuses a line no discovered controller implements.
     if !(crate::arch::current::MIN_IRQ_ID..=crate::arch::current::MAX_IRQ_ID).contains(&irq_id)
     {
         return Err(SyscallError::InvalidArgument);
@@ -170,25 +177,17 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
         }
     };
 
-    // Register the notification in the IRQ routing table.
-    // Disable interrupts to serialise with dispatch_device_irq, which reads
-    // the table from interrupt context.
-    // SAFETY: save_and_disable_interrupts/restore_interrupts are paired;
-    //         irq::register requires interrupts disabled.
-    unsafe {
-        let saved = crate::arch::current::cpu::save_and_disable_interrupts();
-        crate::irq::register(irq_id, sig_state);
-        crate::arch::current::cpu::restore_interrupts(saved);
-    }
-
-    // Route the device IRQ at the interrupt controller. The line is left
-    // masked (x86_64 IOAPIC redirection entry / RISC-V PLIC source); the driver
-    // unmasks via SYS_IRQ_ACK after registering.
-    // SAFETY: irq_id validated from capability; route_device_irq requires a
-    // valid IRQ number.
-    unsafe {
-        crate::arch::current::interrupts::route_device_irq(irq_id);
-    }
+    // Route the line at its controller (left masked: the x86_64 IOAPIC
+    // redirection entry, the RISC-V PLIC source; the driver unmasks via
+    // SYS_IRQ_ACK after registering) and record the notification in the IRQ
+    // routing table, both under the table's routing lock.
+    // SAFETY: syscall context, no IPC source, scheduler, or sleep-list lock held;
+    // sig_state is the live state of the Notification cap resolved above.
+    unsafe { crate::irq::register(irq_id, sig_state) }.map_err(|e| match e
+    {
+        crate::irq::RouteError::NoSuchLine => SyscallError::InvalidArgument,
+        crate::irq::RouteError::Exhausted => SyscallError::QuotaExceeded,
+    })?;
 
     Ok(0)
 }

@@ -20,10 +20,11 @@ core/kernel/
 │   └── riscv64.ld              # Linker script for RISC-V
 ├── src/
 │   ├── main.rs                 # kernel_entry() — arch-neutral init sequence
+│   ├── bounded_wait.rs         # Clock-bounded busy waits with a spin-count fallback
 │   ├── console.rs              # Early console: serial and framebuffer output
 │   ├── cpu_mask.rs             # Fixed-capacity sets of logical CPU indices
 │   ├── framebuffer.rs          # Framebuffer text renderer
-│   ├── irq.rs                  # IRQ routing table: lines to notification objects
+│   ├── irq.rs                  # IRQ routing table (sized at boot): lines to notifications
 │   ├── percpu.rs               # Per-CPU private state
 │   ├── platform.rs             # kernel_mmio cache (Phase 4), Phase 6 MMIO-aperture validation
 │   ├── sync.rs                 # Kernel synchronisation primitives

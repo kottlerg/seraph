@@ -35,6 +35,7 @@ static APS_READY: AtomicU32 = AtomicU32::new(0);
 use boot_protocol::BootInfo;
 
 mod arch;
+mod bounded_wait;
 mod cap;
 mod console;
 mod cpu_mask;
@@ -451,6 +452,11 @@ unsafe fn kernel_entry_post_rebase(
         arch::current::interrupts::init();
     }
     kprintln!("interrupts ok");
+    // Size the IRQ routing table from the interrupt controllers the init above
+    // discovered (x86-64: the I/O APICs' GSIs; riscv64: the PLIC's sources),
+    // before any line is routed (Phase 9 on).
+    #[cfg(not(test))]
+    irq::init_table(arch::current::interrupts::irq_line_count(), allocator);
     // Install per-CPU GS-base (x86-64) / tp (RISC-V) for the BSP.
     // Must be before timer::init() — the timer ISR calls current_cpu() which
     // reads GS-base. Without this, a timer interrupt before init_bsp reads

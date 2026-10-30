@@ -82,9 +82,14 @@ pub const PAGE_FAULT_LOAD_VECTOR: u64 = 13;
 
 /// Interrupt ids the root Interrupt cap names but the kernel does not route,
 /// which `unit::hw::irq_register_unroutable_id_err` expects `irq_register` to
-/// refuse: the top of the PLIC's 1024-id space, far above the 127 sources the
-/// kernel programs.
-pub const UNROUTABLE_IRQ_IDS: &[u32] = &[1023];
+/// refuse: source 127, past the QEMU `virt` PLIC's reported sources (95 by
+/// `riscv,ndev`) though inside the fixed 127 the kernel once programmed, and
+/// the top of the PLIC's 1024-id space.
+pub const UNROUTABLE_IRQ_IDS: &[u32] = &[127, 1023];
+
+/// Interrupt ids the kernel routes, which `unit::hw::irq_register_high_id`
+/// expects `irq_register` to accept: source 95, the QEMU `virt` PLIC's last.
+pub const ROUTABLE_HIGH_IRQ_IDS: &[u32] = &[95];
 
 /// Physical base of an MMIO register page that a test may read without side
 /// effects: the console UART, which init receives as its own `Mmio` cap. Its

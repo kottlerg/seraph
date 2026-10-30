@@ -286,7 +286,8 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
      IST2)
    - APIC timer vector (32) and spurious vector (255)
    - TLB-shootdown (250) and wakeup (251) IPI vectors
-   - Device IRQ vectors 33–55 (I/O APIC GSIs 0–22)
+   - Device IRQ vectors 33–249, one generated stub each; a vector is assigned to a GSI when
+     the GSI is routed (`SYS_IRQ_REGISTER`)
 5. Switch to x2APIC mode where CPUID advertises it, software-enable the BSP local APIC
    with every LVT masked, and mask every I/O APIC entry
 6. Configure SYSCALL/SYSRET: set EFER.SCE; write LSTAR, STAR, SFMASK (clears IF, TF, DF, AC,
@@ -317,12 +318,19 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
 4. Grant U-mode the cycle counter (scounteren.CY)
 5. Initialise the PLIC for the BSP's S-mode context, the one numbered by the BSP's hart
-   id (`BootInfo.cpu_ids[0]`, which need not be 0): priority 1 for every source, all
-   enables cleared, threshold 0; halts if that context lies outside the PLIC window
+   id (`BootInfo.cpu_ids[0]`, which need not be 0): priority 1 for every source the PLIC
+   reports (`BootInfo.kernel_mmio.plic_ndev`, the specification's 1023 when unreported), all
+   enables cleared, threshold 0; halts if that context lies outside the PLIC window (the
+   reported size, or the specification's 64 MiB register map when unreported)
 6. Arm stimecmp (Sstc) for the initial tick, using the bootloader-discovered
    timebase; halts if Sstc or the timebase was not discovered
 7. Enable interrupts (set sstatus.SIE)
 ```
+
+On both architectures, right after the interrupt-controller step, the BSP allocates the IRQ
+routing table from the buddy allocator, one entry per line the discovered controllers
+implement (`irq::init_table` with `interrupts::irq_line_count`: the I/O APICs' GSIs on x86-64,
+the PLIC's sources on RISC-V), before any line is routed; its failure is fatal.
 
 Within the architecture hardware path, after interrupt and per-CPU setup and before the
 syscall entry and preemption timer are configured, the BSP checks the boot-gated paging
@@ -426,7 +434,7 @@ Phase 7.
       elevated remainder and delegates copies per policy (see
       [capability-model.md § SchedControl](../../../docs/capability-model.md))
    d. One root Interrupt range capability (Notify rights) covering every valid
-      IRQ id on the architecture (ROOT_IRQ_COUNT: 256 on x86-64, 1024 on RISC-V);
+      IRQ id on the architecture (ROOT_IRQ_COUNT: 2048 on x86-64, 1024 on RISC-V);
       userspace narrows it to single-IRQ children via SYS_IRQ_SPLIT.
    e. Map-only Memory capabilities over firmware tables (not retypable, not
       buddy-backed): one per `AcpiReclaimable` memory-map region (up to

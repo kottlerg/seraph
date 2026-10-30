@@ -173,13 +173,14 @@ pub fn mmio_split_wrong_tag_err(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// An Interrupt cap naming an id outside the routable range
-/// (`MIN_IRQ_ID..=MAX_IRQ_ID`) is refused by `irq_register` with
-/// `InvalidArgument`, and deleting it leaves the kernel's routing table alone.
+/// An Interrupt cap naming an id no discovered interrupt controller
+/// implements is refused by `irq_register` with `InvalidArgument`, and
+/// deleting it leaves the kernel's routing table alone.
 ///
-/// The root Interrupt cap spans more ids than the kernel routes on both
-/// architectures: on riscv64 the PLIC's 1024-id space against sources 1..=127,
-/// on x86-64 256 GSIs against the 23 with an IDT gate (0..=22). Each id of
+/// The root Interrupt cap spans more ids than the controllers implement on
+/// both architectures: on riscv64 the PLIC's 1024-id space against the sources
+/// its `riscv,ndev` reports, on x86-64 2048 GSIs against the pins the I/O APICs
+/// report, which size the kernel's routing table. Each id of
 /// `crate::arch::UNROUTABLE_IRQ_IDS` is isolated as a single-id cap split off a
 /// derived copy of the first cap whose range contains it, so the original range
 /// stays whole for later tests (the IRQ stress cell carves a device line from
@@ -193,6 +194,36 @@ pub fn irq_register_unroutable_id_err(ctx: &TestContext) -> TestResult
         .try_for_each(|&id| refuse_unroutable_id(ctx, id, irq_sig));
     syscall::cap_delete(irq_sig).ok();
     result
+}
+
+/// An Interrupt cap naming a line a fixed-size routing table once refused, but
+/// that the discovered controller implements, is accepted by `irq_register`,
+/// acknowledged, and deleted. Each id of `crate::arch::ROUTABLE_HIGH_IRQ_IDS`
+/// (x86-64: a GSI above the old 23-vector gate range; riscv64: the PLIC's
+/// last reported source) is isolated as for `irq_register_unroutable_id_err`.
+pub fn irq_register_high_id(ctx: &TestContext) -> TestResult
+{
+    let irq_sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "hw::irq_register_high_id: cap_create_notification failed")?;
+    let result = crate::arch::ROUTABLE_HIGH_IRQ_IDS
+        .iter()
+        .try_for_each(|&id| route_high_id(ctx, id, irq_sig));
+    syscall::cap_delete(irq_sig).ok();
+    result
+}
+
+/// Isolate `id`, register `irq_sig` on it, acknowledge it, and delete the cap,
+/// which clears the route.
+fn route_high_id(ctx: &TestContext, id: u32, irq_sig: u32) -> TestResult
+{
+    let single =
+        isolate_irq_id(ctx, id).ok_or("hw::irq_register_high_id: cannot isolate the id")?;
+    let registered = irq_register(single, irq_sig);
+    let acked = registered.and_then(|()| irq_ack(single));
+    let deleted = syscall::cap_delete(single);
+    registered.map_err(|_| "hw::irq_register_high_id: routable id refused")?;
+    acked.map_err(|_| "hw::irq_register_high_id: irq_ack failed")?;
+    deleted.map_err(|_| "hw::irq_register_high_id: cap_delete of the id failed")
 }
 
 /// Isolate `id` and check `irq_register` refuses it with `InvalidArgument`

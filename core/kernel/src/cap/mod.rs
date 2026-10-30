@@ -1276,11 +1276,11 @@ fn populate_cspace(
     use init_protocol::CapType;
 
     /// Width of the root `Interrupt` range cap minted at Phase 7 — the per-arch
-    /// interrupt-controller spec maximum (`arch::current::ROOT_IRQ_COUNT`: 256
-    /// GSIs on x86-64; on RISC-V the PLIC's 1024-entry id space, sources
-    /// 1-1023). `SYS_IRQ_REGISTER` refuses an id outside
-    /// `MIN_IRQ_ID..=MAX_IRQ_ID` and the Interrupt teardown touches the routing
-    /// table only for ids inside it, so oversizing is safe.
+    /// interrupt id space (`arch::current::ROOT_IRQ_COUNT`: 2048 GSIs on x86-64,
+    /// eight I/O APICs of 256 pins; on RISC-V the PLIC's 1024-entry id space,
+    /// sources 1-1023). `SYS_IRQ_REGISTER` refuses an id no discovered controller
+    /// implements, and the routing table ignores one past its discovered size,
+    /// so oversizing is safe.
     const ROOT_IRQ_COUNT: u32 = crate::arch::current::ROOT_IRQ_COUNT;
 
     /// Maximum number of `AcpiReclaimable` regions to mint caps for.
@@ -1509,13 +1509,13 @@ fn populate_cspace(
     // this arch. Userspace narrows it to single-IRQ children via
     // `SYS_IRQ_SPLIT` and delegates one per device.
     //
-    // x86-64: 256 GSI lines covers every IOAPIC pin in the currently
-    // targeted systems. RISC-V: the PLIC's 1024-entry id space (sources
+    // x86-64: 2048 GSI lines, every pin of the eight I/O APICs the boot
+    // protocol carries. RISC-V: the PLIC's 1024-entry id space (sources
     // 1-1023) is the spec maximum; most platforms expose far fewer (e.g.
-    // 128). Sizing the root at the spec max is safe because
-    // `SYS_IRQ_REGISTER` refuses an id outside `MIN_IRQ_ID..=MAX_IRQ_ID` and
-    // the Interrupt teardown touches the routing table only for ids inside it
-    // (see `ROOT_IRQ_COUNT` above).
+    // 95). Sizing the root at the id space is safe because
+    // `SYS_IRQ_REGISTER` refuses an id no discovered controller implements and
+    // the routing table ignores one past its discovered size (see
+    // `ROOT_IRQ_COUNT` above).
     let irq_ptr = mint_phase7_body(InterruptObject {
         header: KernelObjectHeader::with_ancestor(ObjectType::Interrupt, seed_header_nn()),
         start: 0,

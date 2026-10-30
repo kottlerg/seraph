@@ -944,13 +944,16 @@ pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
     let Some(phys) = virt.checked_sub(crate::mm::paging::direct_map_base())
     else
     {
+        // The pointer is a kernel VA: serial only
+        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+        // diagnostics).
         crate::kprintln!(
-            "SEED SCRATCH FREE CORRUPT: ptr=0x{:x} bytes=0x{:x} base=0x{:x} size=0x{:x} (out of range)",
-            virt,
+            "SEED SCRATCH FREE CORRUPT: bytes=0x{:x} base=0x{:x} size=0x{:x} (out of range)",
             bytes,
             seed.base,
             seed.size
         );
+        crate::kprintln_serial!("  ptr=0x{:x}", virt);
         return;
     };
 
@@ -959,24 +962,24 @@ pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
     // unbalance the lease refcount. The lease is leaked and the anomaly logged;
     // SEED is statically pinned (initial refcount 1 + Phase-7 pin), so the
     // imbalance is inert.
-    match seed_scratch_offset(phys, seed.base, seed.size, bytes)
+    if let Some(offset) = seed_scratch_offset(phys, seed.base, seed.size, bytes)
     {
-        Some(offset) =>
-        {
-            retype_free(seed, offset, bytes);
-            seed.header.dec_ref();
-        }
-        None =>
-        {
-            crate::kprintln!(
-                "SEED SCRATCH FREE CORRUPT: ptr=0x{:x} phys=0x{:x} bytes=0x{:x} base=0x{:x} size=0x{:x} (out of range)",
-                virt,
-                phys,
-                bytes,
-                seed.base,
-                seed.size
-            );
-        }
+        retype_free(seed, offset, bytes);
+        seed.header.dec_ref();
+    }
+    else
+    {
+        // The pointer is a kernel VA and, with `phys`, gives the direct-map
+        // base: both serial only
+        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+        // diagnostics).
+        crate::kprintln!(
+            "SEED SCRATCH FREE CORRUPT: bytes=0x{:x} base=0x{:x} size=0x{:x} (out of range)",
+            bytes,
+            seed.base,
+            seed.size
+        );
+        crate::kprintln_serial!("  ptr=0x{:x} phys=0x{:x}", virt, phys);
     }
 }
 

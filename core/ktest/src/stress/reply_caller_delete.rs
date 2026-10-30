@@ -97,8 +97,9 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 const CELL: &str = "stress::reply_caller_delete";
 
 /// Rounds to run, rotating over the three kinds and the four order slots
-/// ([`ORDERS`]); half are race rounds, so a full-width run races the reply
-/// against the delete 600 times.
+/// ([`ORDERS`]); half are race rounds, so an unscaled run (up to
+/// [`crate::UNSCALED_CPUS`] CPUs) races the reply against the delete 600
+/// times.
 const CYCLES: u32 = 1200;
 
 /// Fewest rounds at any width ([`super::scaled_attempts`]): 96 rounds give

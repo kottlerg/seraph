@@ -377,6 +377,10 @@ pub const SPIN_SITE_REGS_SETTLE: u32 = 8;
 /// `sys_thread_stop` save wait (`await_stopped_save`): spinning until a
 /// target that left its CPU before the commit publishes its save.
 pub const SPIN_SITE_STOP_SAVE: u32 = 9;
+/// Notification dealloc gate: spinning until every device-IRQ delivery in
+/// flight through a route the dying notification held has finished
+/// (`irq::unregister_notification`).
+pub const SPIN_SITE_DEALLOC_IRQ_DELIVERY: u32 = 10;
 
 /// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
 /// executing, for the softlockup watchdog. A wedged CPU (no non-idle dispatch
@@ -386,7 +390,8 @@ pub const SPIN_SITE_STOP_SAVE: u32 = 9;
 /// The reporting sites are the three `dealloc_object(Thread)` gates (the
 /// first of which `stop_threads_bound_to`'s phase-2 spin shares), the
 /// `dealloc_object(AddressSpace)` root-free gate, the timer-dispatch gate the
-/// Notification, `EventQueue`, and Thread dealloc arms share, the
+/// Notification, `EventQueue`, and Thread dealloc arms share, the Notification
+/// arm's IRQ-delivery gate (`irq::unregister_notification`), the
 /// `sys_thread_start` settle loop (`start_under_all_locks`), the register-access
 /// wait (`with_held_frame`), the `sys_thread_stop` save wait
 /// (`await_stopped_save`), and the
@@ -436,6 +441,7 @@ fn spin_site_name(site: u32) -> &'static str
         SPIN_SITE_START_SETTLE => "start:settle",
         SPIN_SITE_REGS_SETTLE => "regs:settle",
         SPIN_SITE_STOP_SAVE => "stop:save",
+        SPIN_SITE_DEALLOC_IRQ_DELIVERY => "dealloc:irq-delivery",
         _ => "none",
     }
 }
@@ -5611,12 +5617,15 @@ pub unsafe fn schedule(requeue: Requeue)
 /// newly-bound observer.
 ///
 /// # Safety
-/// `eq` must be null or a valid `EventQueueState` pointer. The caller must
-/// NOT hold the dying thread's `sched_lock` — this posts to the event queue
-/// and may wake and enqueue a receiver.
+/// `eq` must be null or a live `EventQueueObject`, held live for the call by a
+/// reference the caller relies on: the observer binding's own (the death
+/// walks, whose owner outlives the walk) or the binder's capability pin (the
+/// bind-after-death path). The caller must NOT hold the dying thread's
+/// `sched_lock` — this posts to the event queue and may wake and enqueue a
+/// receiver.
 #[cfg(not(test))]
 pub(crate) unsafe fn post_one_death_event(
-    eq: *mut crate::ipc::event_queue::EventQueueState,
+    eq: *mut crate::cap::object::EventQueueObject,
     correlator: u32,
     exit_reason: u64,
 )
@@ -5627,8 +5636,9 @@ pub(crate) unsafe fn post_one_death_event(
     }
     let payload = (u64::from(correlator) << 32) | (exit_reason & 0xFFFF_FFFF);
 
-    // SAFETY: eq validated non-null; event_queue_post acquires its own lock.
-    let result = unsafe { crate::ipc::event_queue::event_queue_post(eq, payload) };
+    // SAFETY: eq is a live EventQueueObject (contract); its state is inline in
+    // the same retype slot; event_queue_post acquires its own lock.
+    let result = unsafe { crate::ipc::event_queue::event_queue_post((*eq).state, payload) };
     if let Ok(Some(woken_tcb)) = result
     {
         // Route through `select_target_cpu` like every other waker so the
@@ -5679,8 +5689,10 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
 
     for observer in &observers[..count]
     {
-        // SAFETY: observer.eq is null (unused slot) or a valid EventQueueState
-        // stored by SYS_THREAD_BIND_NOTIFICATION; sched_lock is released.
+        // SAFETY: observer.eq is null (unused slot) or an EventQueueObject the
+        // observer's own reference keeps live: only this thread's teardown
+        // releases it, and that waits until the thread runs on no CPU.
+        // sched_lock is released.
         unsafe { post_one_death_event(observer.eq, observer.correlator, exit_reason) };
     }
 }
@@ -5728,9 +5740,11 @@ pub unsafe fn post_aspace_death_notification(
 
     for observer in &observers[..count]
     {
-        // SAFETY: observer.eq is null (unused slot) or a valid EventQueueState
-        // stored by SYS_ASPACE_BIND_NOTIFICATION; not called holding a thread's
-        // sched_lock.
+        // SAFETY: observer.eq is null (unused slot) or an EventQueueObject the
+        // observer's own reference keeps live: only the address space's
+        // teardown releases it, and that first stops every bound thread,
+        // this faulting one included, and waits until it runs on no CPU. Not
+        // called holding a thread's sched_lock.
         unsafe { post_one_death_event(observer.eq, observer.correlator, exit_reason) };
     }
 }

@@ -496,6 +496,10 @@ pub fn run_all(ctx: &TestContext)
         thread::set_affinity_wide_arg_err(ctx)
     );
     run_test!(
+        "thread::set_fault_handler_badge_arg_err",
+        thread::set_fault_handler_badge_arg_err(ctx)
+    );
+    run_test!(
         "thread::set_priority_wide_arg_err",
         thread::set_priority_wide_arg_err(ctx)
     );

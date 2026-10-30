@@ -73,7 +73,7 @@ pub use syscall_abi::{
 mod arch;
 
 use arch::current::{
-    syscall1_ret4, syscall2, syscall3, syscall3_any, syscall4, syscall5, syscall5_ret2, syscall6,
+    syscall1_ret4, syscall2, syscall3, syscall4, syscall4_any, syscall5, syscall5_ret2, syscall6,
     syscall6_ret3,
 };
 
@@ -93,7 +93,7 @@ use arch::current::{
 /// - it takes no user-pointer argument and uses no IPC buffer;
 /// - it changes none of the caller's mappings;
 /// - it changes no thread of the caller's address space that has started,
-///   other than the calling thread's registers that `syscall3_any` declares
+///   other than the calling thread's registers that `syscall4_any` declares
 ///   clobbered (its return registers and, on x86-64, the `rcx` / `r11` that
 ///   `SYSCALL` overwrites);
 /// - it changes the caller's `CSpace` only at the slots its capability
@@ -110,11 +110,27 @@ use arch::current::{
 #[must_use]
 pub unsafe fn raw_syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 {
+    // SAFETY: the caller contract is raw_syscall4's, with a fourth argument of 0.
+    unsafe { raw_syscall4(nr, a0, a1, a2, 0) }
+}
+
+/// [`raw_syscall3`] with a fourth argument register, for validation tests of
+/// a syscall whose fourth argument the typed wrapper fixes (the reserved
+/// `badge` word of `SYS_THREAD_SET_FAULT_HANDLER`, which the wrapper passes as
+/// 0, beside its class mask). The fourth argument travels in the register
+/// `core/kernel/docs/syscalls.md` § Syscall Entry and Exit assigns it.
+///
+/// # Safety
+/// The `# Safety` contract of [`raw_syscall3`].
+#[inline]
+#[must_use]
+pub unsafe fn raw_syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
+{
     // SAFETY: the caller contract keeps the call's effects off everything this
-    // program runs on; `syscall3_any` accepts any `nr` and arguments under this
+    // program runs on; `syscall4_any` accepts any `nr` and arguments under this
     // same contract (its `# Safety`) and declares every register the kernel can
     // write on return as clobbered.
-    unsafe { syscall3_any(nr, a0, a1, a2) }
+    unsafe { syscall4_any(nr, a0, a1, a2, a3) }
 }
 
 // ── IPC capability handle helpers ─────────────────────────────────────────────
@@ -2046,13 +2062,11 @@ pub fn thread_set_affinity(thread_cap: u32, cpu_id: u32) -> Result<(), i64>
 /// Bind (or clear) a thread's per-thread fault-handler endpoint.
 ///
 /// `endpoint_cap` is the `Endpoint` whose receiver services this thread's
-/// kernel-unresolvable faults, or `0` to unbind. `badge` is a caller-chosen
-/// value delivered as the fault message badge; it identifies the faulting
-/// thread/process to the handler only if no other binder can reach the
-/// endpoint, or if the handler's badges are secret (see
-/// [`syscall_abi::FAULT_LABEL`] and `docs/fault-handling.md` § Security).
-/// `fault_class_mask` selects the covered fault classes; pass
-/// [`syscall_abi::FAULT_CLASS_ALL`].
+/// kernel-unresolvable faults, or `0` to unbind. The fault message badge is
+/// the derivation badge of `endpoint_cap`, so a handler attributes a fault by
+/// which of its badged caps the binder bound (see [`syscall_abi::FAULT_LABEL`]
+/// and `docs/fault-handling.md` § Security). `fault_class_mask` selects the
+/// covered fault classes; pass [`syscall_abi::FAULT_CLASS_ALL`].
 ///
 /// Requires `CONTROL` on `thread_cap`. See `docs/fault-handling.md`.
 ///
@@ -2065,18 +2079,18 @@ pub fn thread_set_affinity(thread_cap: u32, cpu_id: u32) -> Result<(), i64>
 pub fn thread_set_fault_handler(
     thread_cap: u32,
     endpoint_cap: u32,
-    badge: u64,
     fault_class_mask: u64,
 ) -> Result<(), i64>
 {
     // SAFETY: syscall4 issues a raw syscall; all arguments are scalar values.
-    // The kernel validates the caps and rebinds (or clears) the handler.
+    // The kernel validates the caps and rebinds (or clears) the handler. arg2
+    // is reserved and must be 0.
     let ret = unsafe {
         syscall4(
             SYS_THREAD_SET_FAULT_HANDLER,
             u64::from(thread_cap),
             u64::from(endpoint_cap),
-            badge,
+            0,
             fault_class_mask,
         )
     };

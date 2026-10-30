@@ -345,7 +345,12 @@ stated explicitly.
     refcount reaches 0, enqueue the orphaned endpoint header on the cascade
     worklist (step 19's mechanism) rather than recursing into dealloc_object.
     Done after the step-11 unlink so the endpoint dealloc cannot observe this
-    thread still on its send queue.
+    thread still on its send queue. Then release the EventQueue reference
+    each populated death observer holds (`release_death_observers`), queueing
+    a queue whose count reaches 0 on the same worklist, and zero
+    death_observer_count. No lock is taken: tcb is off every CPU (steps 8-9),
+    so its death walk is over or never runs, and its refcount is 0, so no
+    binder can pin it to append.
 14. Wake-in-flight gate (#160): spin, preempt-disabled with interrupts
     enabled, until tcb.wake_in_flight == 0 — a waker that claimed tcb (under a
     source lock, or the timer at its pop) set it before its enqueue_and_wake,
@@ -357,7 +362,8 @@ stated explicitly.
 17. Poison: tcb.magic = 0; tcb.priority = 0xFF.
 18. drop_in_place(tcb).
 19. retype_free + ancestor dec_ref + cascade (the worklist driven by
-    dealloc_object; step 13's orphaned endpoint, if any, is processed here).
+    dealloc_object; step 13's orphaned endpoint and event queues, if any, are
+    processed here).
 ```
 
 ### Self-teardown (the caller is the freed thread)

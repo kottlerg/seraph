@@ -33,8 +33,10 @@ mod cspace_recycle;
 mod double_enqueue_storm;
 mod event_queue_fill_drain;
 mod event_try_recv_post_race;
+mod fault_bind_race;
 mod fpu_migration_churn;
 mod idle_wake_race;
+mod irq_route_delete_race;
 mod load_balance_handoff_steal;
 mod mutual_stop;
 mod priority_dealloc_race;
@@ -148,6 +150,11 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!("stress::stop_park_race", stop_park_race::run(ctx));
     run_integration_test!("stress::stop_owed_wake", stop_owed_wake::run(ctx));
     run_integration_test!("stress::stop_fault_sender", stop_fault_sender::run(ctx));
+    run_integration_test!("stress::fault_bind_race", fault_bind_race::run(ctx));
+    run_integration_test!(
+        "stress::irq_route_delete_race",
+        irq_route_delete_race::run(ctx)
+    );
     run_integration_test!("stress::mutual_stop", mutual_stop::run(ctx));
     run_integration_test!("stress::stop_repark", stop_repark::run(ctx));
     run_integration_test!("stress::stop_claimed_delete", stop_claimed_delete::run(ctx));

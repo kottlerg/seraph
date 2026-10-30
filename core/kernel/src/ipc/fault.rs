@@ -25,6 +25,7 @@
 
 use core::sync::atomic::Ordering;
 
+use crate::cap::object::{EndpointObject, KernelObjectHeader};
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 
 /// [`ThreadControlBlock::fault_outcome`] value: no disposition committed yet.
@@ -61,7 +62,12 @@ pub enum FaultOutcome
     Kill,
 }
 
-/// True iff `tcb` has a fault handler bound.
+/// True iff `tcb` has a fault handler bound at the moment of the load.
+///
+/// A lock-free pre-check for the architecture handlers only: a concurrent
+/// unbind may clear the binding before [`fault_dispatch`] runs, so the
+/// dispatcher's own load under `sched_lock` decides, and a binding found
+/// cleared there takes the unhandled-fault kill.
 ///
 /// # Safety
 /// `tcb` must be a valid TCB pointer.
@@ -72,6 +78,39 @@ pub unsafe fn has_handler(tcb: *mut ThreadControlBlock) -> bool
     !unsafe { (*tcb).fault_handler.load(Ordering::Acquire) }.is_null()
 }
 
+/// Read `tcb`'s fault-handler binding once and pin its endpoint for a delivery.
+///
+/// Returns the bound `EndpointObject`, with a reference the caller owns and
+/// MUST release, and the badge bound with it; `None` when no handler is bound.
+/// The pair is read under `tcb`'s `sched_lock`, the lock
+/// `sys_thread_set_fault_handler` publishes it under, so the badge is the one
+/// bound with this endpoint, and the reference is taken while the binding's
+/// own reference still holds the object: the binder releases the old binding's
+/// reference only after it unlocks.
+///
+/// # Safety
+/// `tcb` must be the current CPU's running thread, with no lock held.
+#[cfg(not(test))]
+unsafe fn pin_binding(
+    tcb: *mut ThreadControlBlock,
+) -> Option<(core::ptr::NonNull<EndpointObject>, u64)>
+{
+    // SAFETY: tcb is the running thread (contract); lock_raw is paired with
+    // the unlock_raw below. A non-null fault_handler read under sched_lock
+    // names an endpoint the binding references, so it is live for inc_ref.
+    unsafe {
+        let saved = (*tcb).sched_lock.lock_raw();
+        let ep = core::ptr::NonNull::new((*tcb).fault_handler.load(Ordering::Acquire));
+        let badge = (*tcb).fault_badge.load(Ordering::Relaxed);
+        if let Some(ep) = ep
+        {
+            ep.as_ref().header.inc_ref();
+        }
+        (*tcb).sched_lock.unlock_raw(saved);
+        ep.map(|ep| (ep, badge))
+    }
+}
+
 /// Deliver `info` to `tcb`'s bound fault-handler endpoint and block until the
 /// handler replies or the binding is severed. Returns the disposition.
 ///
@@ -79,8 +118,16 @@ pub unsafe fn has_handler(tcb: *mut ThreadControlBlock) -> bool
 /// [`IpcThreadState::BlockedOnFault`] state and reads the disposition from
 /// `tcb.fault_outcome` on resume rather than writing a syscall return value.
 ///
+/// The binding is read once, under `tcb`'s `sched_lock`, and its endpoint is
+/// pinned for the delivery ([`pin_binding`]); a binding a concurrent unbind
+/// cleared returns [`FaultOutcome::Kill`], the unhandled-fault path. The pin
+/// is released after the delivery and before the park's `schedule()` (the
+/// pin-before-park rule, core/kernel/docs/scheduling-internals.md § Lock
+/// Hierarchy rule 10): a release that drops the endpoint's last reference
+/// runs its teardown, whose send-queue drain claims this thread with a kill
+/// outcome when it is still queued there.
+///
 /// # Preconditions
-/// - The caller verified [`has_handler`] (i.e. `tcb.fault_handler` is non-null).
 /// - `tcb.trap_frame` already points at the canonical register frame the handler
 ///   reads/edits via `SYS_THREAD_READ_REGS`/`SYS_THREAD_WRITE_REGS` while the
 ///   thread is `BlockedOnFault`.
@@ -91,14 +138,14 @@ pub unsafe fn has_handler(tcb: *mut ThreadControlBlock) -> bool
 #[cfg(not(test))]
 pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> FaultOutcome
 {
-    // SAFETY: fault_handler is non-null per precondition; the binding holds an
-    // inc_ref on the EndpointObject, so it (and its inline state) is live.
-    let ep_state = unsafe {
-        let ep_obj = (*tcb).fault_handler.load(Ordering::Acquire);
-        (*ep_obj).state
+    // SAFETY: tcb is the current CPU's running thread; no lock is held.
+    let Some((ep_obj, badge)) = (unsafe { pin_binding(tcb) })
+    else
+    {
+        return FaultOutcome::Kill;
     };
-    // SAFETY: tcb validated; fault_badge always valid.
-    let badge = unsafe { (*tcb).fault_badge.load(Ordering::Acquire) };
+    // SAFETY: ep_obj is pinned by the reference pin_binding took.
+    let ep_state = unsafe { ep_obj.as_ref().state };
 
     // Arm the in-flight markers BEFORE delivery: `in_fault_delivery` so a
     // dequeuing `endpoint_recv` parks us `BlockedOnFault` (not `BlockedOnReply`),
@@ -128,7 +175,7 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
     msg.data[3] = info.ip;
     msg.data_count = 4;
 
-    // SAFETY: ep_state is a valid EndpointState (the binding's inc_ref keeps it
+    // SAFETY: ep_state is a valid EndpointState (this delivery's pin keeps it
     // live); tcb is the current CPU's running thread (this fn's contract); no
     // scheduler or IPC lock is held (# Preconditions). The BlockedOnFault
     // parked-state diverges from a normal call only in the committed
@@ -149,6 +196,14 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
     }
     // else: no handler waiting; we are queued on the endpoint's send queue as
     // BlockedOnSend + in_fault_delivery, to be picked up by a later recv.
+
+    // Drop the delivery's pin before parking (rule 10): the park's binding now
+    // keeps this thread reachable, and a release that frees the endpoint runs
+    // its teardown here, which claims this thread if it is still queued.
+    // SAFETY: the reference pin_binding took is owned here; fault delivery on
+    // the faulting thread with interrupts disabled, before its park, is the
+    // stable-CPU context release_ref's # Safety lists; no lock is held.
+    unsafe { crate::cap::object::release_ref(ep_obj.cast::<KernelObjectHeader>()) };
 
     // Yield the CPU — the current thread is now blocked (or, on the rare
     // concurrent-stop rollback, already Stopped/Exited and not re-enqueued).

@@ -425,7 +425,23 @@ The principal kernel-internal owners:
   ([#540](https://github.com/kottlerg/seraph/issues/540); see
   [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
 - **Fault-handler binding.** `SYS_THREAD_SET_FAULT_HANDLER` takes a reference on the
-  bound Endpoint, released on unbind, rebind, or thread destruction.
+  bound Endpoint, released on unbind, rebind, or thread destruction. The binder publishes the
+  endpoint and its badge as one unit under the target thread's `sched_lock` and releases the
+  previous binding's reference only after it unlocks (`release_ref`).
+- **Fault delivery.** `ipc::fault::fault_dispatch` reads the faulting thread's binding once,
+  under that thread's own `sched_lock`, and takes its own reference on the endpoint in the same
+  hold, while the binding's reference still holds it. It releases that reference after the
+  delivery and before its park (the pin-before-park rule), so a concurrent rebind or unbind
+  cannot free the endpoint mid-delivery; a release that drops the last reference runs the
+  endpoint's teardown, whose send-queue drain kills the faulter if it is still queued there.
+- **Death-observer bindings.** `SYS_THREAD_BIND_NOTIFICATION` and
+  `SYS_ASPACE_BIND_NOTIFICATION` take a reference on the bound EventQueue, under the owner's
+  lock (the thread's `sched_lock`, the address space's `death_lock`), held for the binding's
+  lifetime. The owner's teardown (the `dealloc_object` Thread and `AddressSpace` arms)
+  releases each through the cascade worklist; a death walk runs on the dying thread or on a
+  faulting thread of the live address space, so the owner, and with it every observer
+  reference, outlives every post. A bind after the death posts at once under the binder's
+  syscall pin and takes no reference.
 - **Syscall pins.** Every syscall that resolves a handle to use the object it names
   holds a reference on that object for as long as it uses it: `syscall::pin_slot` (and
   `lookup_cap` through it) takes it under the slot's CSpace lock and returns it as a
@@ -712,11 +728,11 @@ the stops' cancellations, like a dying thread's own drain, reach the IPC source 
 was parked on only through its binding, re-read under the thread's `sched_lock`, which proves the
 source not yet freed (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol)
-§ `dealloc_object(Thread)` Drain Protocol, step 11), except where a waker that holds no
-reference on the source has claimed the thread: device IRQ delivery
-([#561](https://github.com/kottlerg/seraph/issues/561)), fault delivery
-([#538](https://github.com/kottlerg/seraph/issues/538)), and the death post
-([#539](https://github.com/kottlerg/seraph/issues/539)).
+§ `dealloc_object(Thread)` Drain Protocol, step 11). A waker that claimed the thread holds the
+source live until its wake nulls the binding: device IRQ delivery through its line's in-flight
+count, which the Notification teardown waits out (`irq::unregister_notification`), fault delivery
+through the reference it pins on the handler endpoint, and the death post through the observer
+binding's reference on its `EventQueue` (§ Kernel Object Reference Counting).
 
 Every derivation link reachable from a live slot resolves: before a `CSpace`
 unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every

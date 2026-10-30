@@ -127,7 +127,7 @@ The fault handler is bound **per thread**. The handler is an ordinary
 [`Endpoint`](capability-model.md#ipc-endpoint); there is no distinct fault-endpoint
 capability type. The binding is per-thread kernel state: the bound endpoint and its badge.
 
-`SYS_THREAD_SET_FAULT_HANDLER(thread_cap, endpoint_cap, badge, fault_class_mask)`:
+`SYS_THREAD_SET_FAULT_HANDLER(thread_cap, endpoint_cap, reserved, fault_class_mask)`:
 
 - `thread_cap` MUST carry `CONTROL`. It selects the thread whose handler is set.
 - `endpoint_cap` MUST refer to an `Endpoint`, or be the null index `0` to **unbind**.
@@ -135,14 +135,22 @@ capability type. The binding is per-thread kernel state: the bound endpoint and 
   [Liveness](#liveness)); unbinding releases it. Both lookups pin their object for the call,
   so neither the thread nor the endpoint can be freed while the binding is written (see
   [capability-internals.md § Storage: Hybrid Two-Level Radix](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)).
-- `badge` is a caller-chosen value delivered as the fault message badge. It identifies the
-  faulting thread (or its process) to the handler only if no other binder can reach the
-  endpoint, or if the handler's badges are secret; see [Security](#security). It is opaque
-  to the kernel, mirroring the death-observer correlator of
-  [Process Lifecycle](process-lifecycle.md#process-death).
+  The binding's badge is the derivation badge of `endpoint_cap`
+  ([Capability Model § Badges](capability-model.md#badges)), `0` for an unbadged cap: the
+  binder chooses which of its caps to bind, never the badge value; see [Security](#security).
+- `reserved` MUST be `0`; any other value fails with `InvalidArgument`.
 - `fault_class_mask` selects which fault classes this handler covers. The defined value
   is the all-classes mask; it reserves the encoding for future per-class handlers without
   a new syscall.
+
+The endpoint and its badge are published as one unit: the binder writes both under the target
+thread's scheduler lock, and fault delivery reads both once under the same lock and pins the
+endpoint for the delivery (it takes its own reference there, while the binding's reference still
+holds the endpoint, and releases it before the faulting thread parks; see
+[capability-internals.md § Kernel Object Reference Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)).
+A delivery therefore carries the badge bound with the endpoint it reaches, and a rebind or
+unbind concurrent with a fault never frees the endpoint mid-delivery. A fault whose delivery
+finds the binding already cleared is unhandled: the thread is killed.
 
 A thread has a single fault handler covering all fault classes it is bound for. The
 handler dispatches on the fault kind (see [Fault Message](#fault-message)) and replies
@@ -173,9 +181,8 @@ thread's behalf. Its format is a stable cross-boundary contract.
 
 - **Label** — the reserved `FAULT_LABEL`. It proves kernel origin only on an endpoint whose
   handler hands out no `SEND`. A handler that multiplexes client traffic on the same endpoint
-  (memmgr) attributes the message by its badge, not by the label, and that attribution relies
-  on its badges being unguessable; see [Security](#security).
-- **Badge** — the bound `badge`.
+  (memmgr) attributes the message by its badge, not by the label; see [Security](#security).
+- **Badge** — the derivation badge of the bound Endpoint cap.
 - **Data word 0** — the fault **kind**:
   - `FAULT_KIND_VM` — a virtual-memory (page) fault.
   - `FAULT_KIND_EXCEPTION` — a CPU exception with no kernel resolution (illegal
@@ -253,7 +260,9 @@ The kernel ignores reply data words. The reply **label** conveys disposition:
    — which is queued on neither the endpoint's send nor receive queue — cannot be stranded
    by the endpoint being destroyed while it is bound. The reference is released on unbind,
    rebind, or thread destruction. The binder pins both the thread and the endpoint while it
-   writes the binding (see [Fault-Handler Binding](#fault-handler-binding)).
+   writes the binding, and a delivery pins the endpoint it read until it parks (see
+   [Fault-Handler Binding](#fault-handler-binding)), so a release that drops the endpoint's
+   last reference while a fault is queued on it destroys the endpoint under rule 3.
 2. Destruction of the handler thread (deletion of the last capability to its Thread object)
    releases any fault-blocked thread awaiting that handler, killing it (the
    [Kill](#delivery-resume-and-kill) path), as does a later receive on the handler thread while
@@ -295,19 +304,18 @@ also serves ordinary clients on the same endpoint therefore cannot rely on the l
 client holding `SEND` can send a message bearing `FAULT_LABEL`, carrying the badge of that
 client's cap.
 
-The fault message badge is no stronger. It is binder-chosen: the value the binder passes to
-`SYS_THREAD_SET_FAULT_HANDLER`, not the badge of a cap the handler minted. Binding requires
-only `CONTROL` on the target thread and any `Endpoint` cap, a `SEND`-only one included; the
-kernel looks `endpoint_cap` up with `EpRights::NONE` (`core/kernel/src/syscall/thread.rs`).
-Any client holding a cap to a shared endpoint (such as memmgr's `pager_endpoint_cap`) can
-therefore bind its own thread with an arbitrary badge and have the kernel deliver a genuine
-`FAULT_LABEL` message carrying that badge. A handler that shares its endpoint with clients
-cannot attribute a fault message by badge alone; badge attribution there holds only if the
-handler's badges are secret. memmgr's attribution of a fault to a process rests on its
-process badges being unguessable (random 64-bit values minted by `mint_process_badge`): a
-client that learns another process's badge can direct memmgr to back a fault in that
-process's address space. This defect is tracked in
-[#550](https://github.com/kottlerg/seraph/issues/550).
+The badge is what attributes a fault there. The fault message badge is the derivation badge
+of the Endpoint cap the binder bound, exactly the badge an ordinary send through that cap
+carries, so it has the guarantees of [Capability Model § Badges](capability-model.md#badges):
+set once by `SYS_CAP_DERIVE_BADGE`, inherited unchanged by every derived cap, and never chosen
+by a binder (`SYS_THREAD_SET_FAULT_HANDLER`'s third argument is reserved). Binding requires
+only `CONTROL` on the target thread and any `Endpoint` cap, a `SEND`-only one included, so a
+client can bind its own threads to a shared endpoint, but its faults carry the badge of a cap
+it holds, the same badge its own sends carry. memmgr mints one badged cap per process and
+hands each process only its own, so a process that faults through `pager_endpoint_cap`
+identifies itself, and its faults can back only its own registered regions; attributing a
+fault to another process would need a cap bearing that process's badge, which memmgr never
+gives it. Whether a badge value is guessable plays no part.
 
 ---
 

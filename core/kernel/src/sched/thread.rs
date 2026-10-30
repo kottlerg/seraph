@@ -41,11 +41,18 @@ pub const MAX_DEATH_OBSERVERS: usize = 4;
 
 /// A single registered death observer: an event queue plus a caller-chosen
 /// correlator. See `ThreadControlBlock::death_observers`.
+///
+/// A populated observer owns one reference on its `EventQueueObject`, taken at
+/// bind under the owner's lock and released by the owner's teardown (the
+/// `dealloc_object` Thread and `AddressSpace` arms), so the queue outlives
+/// every post through the binding however its capabilities are deleted
+/// (core/kernel/docs/capability-internals.md § Kernel Object Reference
+/// Counting).
 #[derive(Clone, Copy)]
 pub struct DeathObserver
 {
-    /// Target event queue. `null` means this slot is unused.
-    pub eq: *mut crate::ipc::event_queue::EventQueueState,
+    /// Target event queue object. `null` means this slot is unused.
+    pub eq: *mut crate::cap::object::EventQueueObject,
     /// Caller-chosen routing tag. Delivered as the upper 32 bits of the
     /// posted payload. Opaque to the kernel.
     pub correlator: u32,
@@ -66,8 +73,10 @@ impl DeathObserver
 // SAFETY: `DeathObserver` is a plain (pointer, correlator) pair. The arrays
 // holding it are read and written only under their owner's lock (the thread's
 // `sched_lock` for `ThreadControlBlock::death_observers`, the address space's
-// `death_lock` for `AddressSpace::death_observers`); `eq` is dereferenced only
-// by `post_one_death_event`, on a snapshot taken under that lock.
+// `death_lock` for `AddressSpace::death_observers`), or by the owner's
+// teardown once nothing else reaches the owner; `eq` is dereferenced only by
+// `post_one_death_event`, on a snapshot taken under that lock, while the
+// observer's own reference keeps the queue live.
 unsafe impl Send for DeathObserver {}
 // SAFETY: same rationale as `Send`.
 unsafe impl Sync for DeathObserver {}
@@ -627,18 +636,24 @@ pub struct ThreadControlBlock
     /// queue) could be stranded by the endpoint being freed. See
     /// `docs/fault-handling.md` § Liveness.
     ///
-    /// `AtomicPtr` because the binder (`SYS_THREAD_SET_FAULT_HANDLER`, holding
-    /// the thread's `CONTROL` cap) runs on a different thread than the target,
-    /// which loads this field lock-free when it faults. The binder swaps the
-    /// pointer (releasing the previous object's ref); the faulter loads it.
+    /// The binding is the pair (`fault_handler`, [`Self::fault_badge`]),
+    /// published as one unit: the binder (`SYS_THREAD_SET_FAULT_HANDLER`,
+    /// holding the thread's `CONTROL` cap) writes both under this thread's
+    /// [`sched_lock`](Self::sched_lock), and the faulter (`fault_dispatch`)
+    /// reads both once under the same lock and takes its own reference on the
+    /// endpoint there, so a concurrent rebind's release cannot free it during
+    /// the delivery. The fields stay atomics for the lock-free
+    /// [`has_handler`](crate::ipc::fault::has_handler) pre-check, which decides
+    /// nothing, and for the `dealloc_object(Thread)` release, which runs once
+    /// no binder can pin the thread and the thread runs on no CPU.
     pub fault_handler: core::sync::atomic::AtomicPtr<crate::cap::object::EndpointObject>,
 
-    /// Binder-chosen value (`SYS_THREAD_SET_FAULT_HANDLER` arg2) delivered as
-    /// the fault message badge; it is not the badge of a cap the handler
-    /// minted, so it does not by itself identify the faulter (see
-    /// `docs/fault-handling.md` § Security). Opaque to the kernel;
-    /// mirrors the death-observer correlator. `AtomicU64` for the same
-    /// cross-thread binder/faulter access as [`Self::fault_handler`].
+    /// Derivation badge of the Endpoint cap the binder passed to
+    /// `SYS_THREAD_SET_FAULT_HANDLER`, delivered as the fault message badge.
+    /// The binder cannot choose it: a badge is attached only by
+    /// `SYS_CAP_DERIVE_BADGE` and inherited unchanged by every cap derived
+    /// from the badged one (`docs/fault-handling.md` § Security). Published
+    /// with [`Self::fault_handler`] as one unit, under the same lock.
     pub fault_badge: core::sync::atomic::AtomicU64,
 
     /// Disposition of an in-flight fault delivery, read by the fault helper

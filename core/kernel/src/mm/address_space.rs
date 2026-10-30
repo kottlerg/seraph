@@ -466,20 +466,23 @@ impl AddressSpace
     /// dropped — closing the bind-after-fault window for an observer bound after
     /// the space was already running.
     ///
-    /// Returns `Ok(None)` if the observer was appended, `Ok(Some(reason))` if
-    /// the space already faulted (caller posts `reason` to `eq`), or `Err(())`
-    /// if the observer array is full.
+    /// Returns `Ok(None)` if the observer was appended, holding a reference on
+    /// `eq` that the address space's teardown releases
+    /// ([`Self::take_death_observers`]); `Ok(Some(reason))` if the space
+    /// already faulted (the caller posts `reason` to `eq`; no reference is
+    /// taken); or `Err(())` if the observer array is full.
     ///
     /// # Safety
-    /// `this` must be a valid `AddressSpace` pointer. The caller must NOT hold
-    /// `death_lock`.
+    /// `this` must be a valid `AddressSpace` pointer and `eq` a live
+    /// `EventQueueObject` the caller pins for the call. The caller must NOT
+    /// hold `death_lock`.
     #[cfg(not(test))]
     // cast_possible_truncation: the usize→u8 `death_observer_count` store is
     // bounded by `MAX_DEATH_OBSERVERS`, checked immediately before it.
     #[allow(clippy::cast_possible_truncation)]
     pub unsafe fn bind_or_retained(
         this: *mut Self,
-        eq: *mut crate::ipc::event_queue::EventQueueState,
+        eq: *mut crate::cap::object::EventQueueObject,
         correlator: u32,
     ) -> Result<Option<u64>, ()>
     {
@@ -495,7 +498,8 @@ impl AddressSpace
             unsafe { (*this).death_lock.unlock_raw(saved) };
             return Ok(Some(reason));
         }
-        // SAFETY: lock held; the append stays within MAX_DEATH_OBSERVERS.
+        // SAFETY: lock held; the append stays within MAX_DEATH_OBSERVERS. The
+        // binding's reference is taken while the caller's pin holds `eq`.
         let result = unsafe {
             let count = (*this).death_observer_count as usize;
             if count >= crate::sched::thread::MAX_DEATH_OBSERVERS
@@ -504,6 +508,7 @@ impl AddressSpace
             }
             else
             {
+                (*eq).header.inc_ref();
                 (*this).death_observers[count] =
                     crate::sched::thread::DeathObserver { eq, correlator };
                 (*this).death_observer_count = (count + 1) as u8;
@@ -545,6 +550,37 @@ impl AddressSpace
             let count = (*this).death_observer_count as usize;
             (*this).death_lock.unlock_raw(saved);
             (snapshot, count)
+        }
+    }
+
+    /// Empty the observer set for the address space's teardown, returning the
+    /// observers whose `EventQueueObject` references the caller now owns and
+    /// MUST release.
+    ///
+    /// # Safety
+    /// `this` must be a valid `AddressSpace` whose teardown is running: no
+    /// capability, binding, or bound thread reaches it any more, so no bind
+    /// or terminal-fault post can race the call. The caller must NOT hold
+    /// `death_lock`.
+    #[cfg(not(test))]
+    pub unsafe fn take_death_observers(
+        this: *mut Self,
+    ) -> (
+        [crate::sched::thread::DeathObserver; crate::sched::thread::MAX_DEATH_OBSERVERS],
+        usize,
+    )
+    {
+        // SAFETY: this is valid (contract); death_lock is taken for the
+        // field-ownership rule though nothing can contend it here.
+        unsafe {
+            let saved = (*this).death_lock.lock_raw();
+            let taken = (*this).death_observers;
+            let count = (*this).death_observer_count as usize;
+            (*this).death_observers = [crate::sched::thread::DeathObserver::empty();
+                crate::sched::thread::MAX_DEATH_OBSERVERS];
+            (*this).death_observer_count = 0;
+            (*this).death_lock.unlock_raw(saved);
+            (taken, count)
         }
     }
 

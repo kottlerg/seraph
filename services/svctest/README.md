@@ -37,7 +37,7 @@ services/svctest/
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
         ├── devmgr.rs          # Block, shutdown, test-label deny; `TEST_SPAWN_ORPHAN` teardown
         ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny
-        ├── pager.rs           # Demand paging: backed, declined, and pinned faults
+        ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd

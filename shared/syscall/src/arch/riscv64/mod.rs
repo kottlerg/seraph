@@ -141,18 +141,18 @@ pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
     ret
 }
 
-/// Issue any syscall with 3 argument registers and every register the kernel
+/// Issue any syscall with 4 argument registers and every register the kernel
 /// can write on return declared clobbered. Returns the primary return value.
 ///
 /// Unlike [`syscall3`], which declares `a1`/`a2` input-only and so serves only
 /// syscalls that return in `a0` alone, this declares every argument register
 /// (`a1` to `a5`) as discarded on output, so a syscall whose return also writes
 /// them (`SYS_SCHED_SPLIT`'s second handle in `a1`) leaves no register the
-/// compiler assumes preserved. `a3` to `a5` carry 0.
+/// compiler assumes preserved. `a4` and `a5` carry 0.
 ///
 /// # Safety
 ///
-/// The `# Safety` contract of `crate::raw_syscall3`, its only caller, which
+/// The `# Safety` contract of `crate::raw_syscall4`, its only caller, which
 /// replaces the raw-wrapper contract in [`crate::arch`] § Safety: the call must
 /// leave untouched everything the calling program runs on (see that contract's
 /// four conditions). Under it any argument value is admissible, and `nr` need
@@ -161,12 +161,12 @@ pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
 #[allow(clippy::inline_always, clippy::cast_possible_wrap)]
 #[inline(always)]
-pub unsafe fn syscall3_any(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
+pub unsafe fn syscall4_any(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
 {
     let ret: i64;
     let a0 = a0 as i64;
     // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
-    // args in a0-a2 (a3-a5 zero); every argument register is declared inout-to-discard
+    // args in a0-a3 (a4-a5 zero); every argument register is declared inout-to-discard
     // because the kernel may write return values into any of them. `nomem` is omitted as
     // in `syscall3`; `nostack` holds because the asm itself does not use the Rust stack.
     unsafe {
@@ -175,7 +175,7 @@ pub unsafe fn syscall3_any(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
             inout("a0") a0 => ret,
             inout("a1") a1 => _,
             inout("a2") a2 => _,
-            inout("a3") 0u64 => _,
+            inout("a3") a3 => _,
             inout("a4") 0u64 => _,
             inout("a5") 0u64 => _,
             in("a7") nr,

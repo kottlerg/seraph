@@ -23,11 +23,10 @@
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, mem_map, mem_unmap,
-    notification_wait, thread_set_fault_handler,
+    notification_wait,
 };
 use syscall_abi::{
-    FAULT_ACCESS_WRITE, FAULT_CLASS_ALL, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_RESUME,
-    MAP_WRITABLE, RIGHTS_ALL,
+    FAULT_ACCESS_WRITE, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_RESUME, MAP_WRITABLE, RIGHTS_ALL,
 };
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -37,8 +36,8 @@ use crate::{ChildStack, TestContext, TestResult};
 /// user half) and distinct from other tests' VAs.
 const RESERVED_VA: u64 = 0x3E_4000_0000;
 
-/// Caller-chosen badge bound with the handler; the kernel delivers it in the
-/// fault message so the pager can correlate the faulting thread.
+/// Badge of the Endpoint cap bound as the handler; the kernel delivers it in
+/// the fault message so the pager can correlate the faulting thread.
 const FAULT_BADGE: u64 = 0xC0FF_EE01;
 
 /// Sentinel the child stores and reads back to prove the resumed store landed.
@@ -61,7 +60,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "fault_pager_roundtrip: cap_copy(sig) failed")?;
 
     // Bind the child's fault handler to our endpoint before it runs.
-    thread_set_fault_handler(child.th, ep, FAULT_BADGE, FAULT_CLASS_ALL)
+    crate::bind_fault_handler(child.th, ep, FAULT_BADGE)
         .map_err(|_| "fault_pager_roundtrip: thread_set_fault_handler failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));

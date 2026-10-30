@@ -110,8 +110,10 @@ holds a handle to it.
 **Pinned flag.** Demand paging is the default: at finalize procmgr binds every
 child's main thread fault handler to memmgr (the system pager) via
 `SYS_THREAD_SET_FAULT_HANDLER`, delegates the child `AddressSpace` to memmgr via
-`memmgr_labels::DELEGATE_ASPACE`, and sets `ProcessInfo.pager_endpoint_cap` /
-`pager_badge` so the runtime inherits the handler onto spawned threads. The
+`memmgr_labels::DELEGATE_ASPACE`, and sets `ProcessInfo.pager_endpoint_cap` (the
+child's badged memmgr cap, whose derivation badge the kernel stamps on each fault)
+and `pager_badge` (that badge) so the runtime inherits the handler onto spawned
+threads. The
 child then backs reserved regions lazily via
 `std::os::seraph::register_demand_paged`. The label's bit 16 (`CREATE_PINNED`,
 in the `[16..32]` window shared with `CREATE_FROM_FILE`) opts out: the

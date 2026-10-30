@@ -27,6 +27,62 @@ pub fn spawn_only() -> &'static [Phase]
     }]
 }
 
+/// The init-reap release check. Registered late (see [`super::all`]) so
+/// init's reap has almost always run; the phase polls for it in any case.
+pub fn init_reap() -> &'static [Phase]
+{
+    &[Phase {
+        name: "init_cspace_released",
+        run: init_cspace_released_phase,
+    }]
+}
+
+/// Wait for init's reap, then assert that it released init's `CSpace`:
+/// procmgr's release probe, an endpoint it moved into init's `CSpace` just
+/// before deleting its last cap on that `CSpace`, must have been freed with
+/// it (`QUERY_INIT_REAP` reports `INIT_REAP_PROBE_RELEASED`; see
+/// `services/procmgr/docs/ipc-interface.md` § `QUERY_INIT_REAP`). A kernel
+/// that kept init's `CSpace` alive past its last capability reports
+/// `INIT_REAP_PROBE_HELD`. The reap waits for init-logd's exit after
+/// real-logd's handover, which races svctest's startup, so the phase polls.
+pub fn init_cspace_released_phase(_: &Caps)
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+
+    const POLL_INTERVAL_MS: u64 = 10;
+    // 30 s: far past the handover on every CI cell, short enough to fail
+    // rather than hang when the reap never runs.
+    const MAX_POLLS: u32 = 3000;
+
+    let procmgr = startup_info().procmgr_endpoint;
+    let query = IpcMessage::builder(procmgr_labels::QUERY_INIT_REAP).build();
+    for _ in 0..MAX_POLLS
+    {
+        // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(procmgr, &query, std::os::seraph::current_ipc_buf()) }
+            .unwrap_or_else(|e| panic!("QUERY_INIT_REAP: ipc_call failed ({e})"));
+        assert_eq!(
+            reply.label,
+            procmgr_errors::SUCCESS,
+            "QUERY_INIT_REAP: procmgr replied {}",
+            reply.label
+        );
+        if reply.word(0) != 0
+        {
+            assert_eq!(
+                reply.word(1),
+                procmgr_labels::INIT_REAP_PROBE_RELEASED,
+                "init's CSpace was not released at its reap (probe outcome {})",
+                reply.word(1)
+            );
+            std::os::seraph::log!("init_cspace_released passed");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+    }
+    panic!("init_cspace_released: init's reap did not run within the poll budget");
+}
+
 /// `command_*`, `stdio_file_unsupported`, and `procmgr_refusals` run after
 /// the namespace cluster has established attenuation invariants.
 pub fn command_phases() -> &'static [Phase]

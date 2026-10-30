@@ -495,6 +495,11 @@ fn dispatch_ipc(
             init_reap::handle_done(&req, ipc_buf);
         }
 
+        procmgr_labels::QUERY_INIT_REAP =>
+        {
+            init_reap::handle_query(&req, ipc_buf);
+        }
+
         _ =>
         {
             release_caps(req.caps());
@@ -646,11 +651,10 @@ fn dispatch_death(
         {
             // An init thread exited. `run_reap` counts down the two init
             // threads and, on the last exit, tears down init's Thread and
-            // AddressSpace objects, deletes its CSpace cap, and donates its
-            // reclaimable Memory caps to memmgr's pool. The caps init still
-            // holds stay in its kernel-pinned root CSpace, alive but
-            // unreachable; releasing them at the reap is design intent, not
-            // yet implemented (`docs/process-lifecycle.md` § Init reap, #540).
+            // AddressSpace objects, donates its reclaimable Memory caps to
+            // memmgr's pool, and deletes its CSpace cap, which frees the CSpace
+            // and releases the caps init still holds
+            // (`docs/process-lifecycle.md` § Init reap).
             init_reap::run_reap(memmgr_ep, ipc_buf);
             continue;
         }

@@ -5,15 +5,16 @@ capability types, rights, derivation, revocation, and transfer semantics — is
 specified in [docs/capability-model.md](../../../docs/capability-model.md). This document
 covers the data structures and algorithms that realise those semantics.
 
-The capability subsystem comprises five components:
+The capability subsystem comprises six components:
 
 1. **CSpace** — per-process capability space (slot storage and lookup)
-2. **Page pools** — the donated pages behind a CSpace's slots and an address
+2. **CSpace registry** — the RAM-sized arena mapping a `CSpaceId` to its live CSpace and epoch
+3. **Page pools** — the donated pages behind a CSpace's slots and an address
    space's page tables, and the record of every donation
-3. **Capability slot** — in-memory representation of one capability
-4. **Range capability objects** — the Mmio and IoPort objects, which record the
+4. **Capability slot** — in-memory representation of one capability
+5. **Range capability objects** — the Mmio and IoPort objects, which record the
    mappings and port bindings made through them so revocation can withdraw them
-5. **Derivation tree** — cross-process tree for revocation
+6. **Derivation tree** — cross-process tree for revocation
 
 ---
 
@@ -161,6 +162,31 @@ This gives amortised O(1) allocation and O(1) deallocation.
 
 ---
 
+## CSpace Registry (`cap/registry.rs`)
+
+The registry maps a `CSpaceId` to its live `CSpace` and current epoch. It is an arena of 16-byte
+entries (pointer, epoch, free-list link), one per 4 KiB page of DRAM
+(`mm::init::system_ram_bytes`), so the id space never runs out before the memory that pays for
+the `CSpace`s does: every `CSpace` costs its creator at least one wrapper page. Storage is
+two-level: `MAX_REGISTRY_CHUNKS` (1024) chunk pointers in BSS, each naming one 1 MiB buddy block
+of 65,536 entries (`REGISTRY_CHUNK_ORDER`), which covers the 256 GiB of DRAM the frame map table
+admits. `cap::init_cspace_registry` carves the chunks in Phase 4
+([initialization.md](initialization.md) § Phase 4), after the Phase-2 exclusions and before the
+Phase-7 drain; a short buddy is fatal.
+
+`alloc_cspace_id` hands out the most recently retired id, else the next fresh one, under one
+spinlock with O(1) holds. A vacant entry keeps its epoch and threads the free list through its
+link word, so the epoch `free_cspace_id` redraws at retirement (§ Representation) persists across
+the vacancy and is the one the next tenant's `register_cspace` returns.
+
+`lookup_cspace` takes no lock. It loads the chunk pointer (Acquire), then reads the entry's
+epoch, its pointer, and its epoch again, each with Acquire, and resolves only when both epoch
+reads equal the stamped epoch and the pointer is non-null. The second epoch read rejects a
+concurrent unregister, retire, reuse, and register that would otherwise pair the new tenant's
+pointer with the old epoch. An id no installed chunk backs resolves nothing.
+
+---
+
 ## Page Pools (`cap/object.rs`)
 
 The wrapper object that owns a `CSpace` (`CSpaceKernelObject`) keeps the
@@ -278,6 +304,9 @@ random epoch with probability ~2⁻³² per recycle; this residual is accepted
 because the capability, not the `SlotId`, is the authority. See #137 for the
 recycling allocator design.
 
+The registry that maps a `CSpaceId` to its live `CSpace` and epoch is described in
+§ CSpace Registry above.
+
 ### Per-Slot Generation
 
 Each slot carries an 8-bit **generation** counter (in `pad[1]`, keeping the slot at 72 bytes).
@@ -380,8 +409,7 @@ pub struct KernelObjectHeader
 {
     ref_count: AtomicU32,
     obj_type: ObjectType,
-    flags: u8,
-    _pad: [u8; 2],
+    _pad: [u8; 3],
     /// The Memory object this object's bytes were retyped from.
     ancestor: AtomicPtr<KernelObjectHeader>,
 }
@@ -414,14 +442,11 @@ The principal kernel-internal owners:
   reference on the target `AddressSpace`, released when the object is freed and the
   mapping withdrawn ([§ Mmio Mappings](#mmio-mappings)), so an address space outlives
   its last capability while an Mmio capability mapped into it lives.
-- **Kernel-lifetime pins.** The SEED reserve and the root CSpace each hold a reference
-  the kernel never releases (the SEED pin from `install_seed_memory`; the root CSpace's
-  base reference, attributed to init's TCB), and `HDR_FLAG_IS_ROOT` clamps the root
-  CSpace's count at 1, so neither is ever freed. The root CSpace is init's CSpace, so the
-  caps init still holds at its reap stay in it, alive but unreachable; releasing them at
-  the reap is design intent, not yet implemented
-  ([#540](https://github.com/kottlerg/seraph/issues/540); see
-  [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
+- **Kernel-lifetime pins.** The SEED reserve holds a reference the kernel never releases
+  (the SEED pin from `install_seed_memory`), so it is never freed. No other object is
+  pinned: the root CSpace's creation reference, the kernel's hold on it through boot,
+  passes to init's own CSpace capability in Phase 9
+  ([§ Initial CSpace Population](#initial-cspace-population)).
 - **Fault-handler binding.** `SYS_THREAD_SET_FAULT_HANDLER` takes a reference on the
   bound Endpoint, released on unbind, rebind, or thread destruction. The binder publishes the
   endpoint and its badge as one unit under the target thread's `sched_lock` and releases the
@@ -982,6 +1007,15 @@ init's address space (its VA is init's first argument; see
 [abi/init-protocol/README.md](../../../abi/init-protocol/README.md)). The `CapDescriptor` array
 lists each Phase 7 and Phase 8 slot with its type; header fields name the single
 caps and the base and count of several groups, including every Phase 9 group.
+
+The root CSpace is created with one reference, the kernel's hold on it while Phases 7 to 9
+populate it. Init's own CSpace capability (order 15) takes over that reference rather than
+adding one, and init's thread, like every thread, holds none on the CSpace it is bound to,
+so from Phase 9 on the root CSpace is an ordinary CSpace whose count is its capabilities and
+syscall pins: the deletion of its last capability, procmgr's at init's reap, frees it
+through the CSpace teardown ([§ Teardown](#teardown)) and releases every capability it
+still holds ([process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
+Its id, 0, is recycled then like any other.
 
 ---
 

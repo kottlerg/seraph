@@ -75,8 +75,8 @@ An entry an existing open Issue already names cites it in the recommendation.
 - **CPU ceiling.** The binding CPU ceiling is `MAX_ORDER`: every per-CPU slab must fit one buddy
   block, and `AP_IST_STACKS` is exactly 8 MiB at `MAX_CPUS = 512`. `MAX_CPUS` itself is inline
   in the one-page `BootInfo`, and shipping two-socket servers already exceed 512 logical CPUs.
-- **Process ceiling.** Live processes stop at 32 (procmgr `MAX_PROCESSES`), then 64 (memmgr),
-  then 4096 (kernel `MAX_CSPACES`). Behind those sit the per-process `u32` death correlator,
+- **Process ceiling.** Live processes stop at 32 (procmgr `MAX_PROCESSES`), then 64 (memmgr);
+  the kernel's `CSpace` registry is sized from RAM and does not bind first. Behind those sit the per-process `u32` death correlator,
   `badge as u32` in procmgr, logd and svcmgr, which collides once tables grow, and the cap
   handle's 8-bit wrapping generation.
 - **Per-process address space.** One static VA map sized to Sv39's 2^38 is used on every
@@ -161,8 +161,10 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637); the Phase 7 bo
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `MAX_CSPACES` (`CSPACE_REGISTRY`, `CSPACE_FREE_LIST`) | `core/kernel/src/cap/mod.rs` | 4096 live | current peak plus headroom | 80 KiB BSS | needs a design | Caps live processes at 4096; growable registry from typed memory |
-| `CSpaceRegistryEntry.epoch`, `SlotId.epoch` | `core/kernel/src/cap/mod.rs`, `slot.rs` | `u32`, redrawn on recycle | encoding artefact (12 B `SlotId`, 72 B slot) | 4 B per `SlotId` | correct as is | Freshness-only; the residual per recycle is documented |
+| `CSPACE_REGISTRY` arena (`chunks_for_ram`, `init_cspace_registry`) | `core/kernel/src/cap/registry.rs` | one 16 B entry per page of DRAM | provably unreachable (every `CSpace` costs its creator at least one page, so the id space never binds before RAM does) | about 0.4 % of DRAM, carved at boot | correct as is | None |
+| `REGISTRY_CHUNK_ORDER` | `core/kernel/src/cap/registry.rs` | 8 (1 MiB chunks) | encoding artefact (chunk granularity of the two-level arena) | none | correct as is | None |
+| `MAX_REGISTRY_CHUNKS` | `core/kernel/src/cap/registry.rs` | 1024 (one entry per page of 256 GiB) | encoding artefact (matched to `frame_map::MAX_CHUNKS`, asserted) | 8 KiB BSS | needs a design | Fatal past 256 GiB of DRAM; follows `MAX_CHUNKS` (#636) |
+| `RegistryEntry.epoch`, `SlotId.epoch` | `core/kernel/src/cap/registry.rs`, `slot.rs` | `u32`, redrawn on recycle | encoding artefact (12 B `SlotId`, 72 B slot) | 4 B per `SlotId` | correct as is | Freshness-only; the residual per recycle is documented |
 | `CapabilitySlot.pad[1]` (handle generation) | `core/kernel/src/cap/slot.rs` | `u8`, wrapping | ABI width (`u32` handle: 8 generation + 24 index bits) | 1 B per slot | raise | Wraps after 256 recycles of one index; retire at wrap or widen handles |
 | `CAP_INDEX_BITS` | `abi/syscall/src/lib.rs` | 24 | ABI width (`u32` handle) | none | needs a design | About 16.7 M slots per CSpace; decide with the generation (#41) |
 | `L2_SIZE` | `core/kernel/src/cap/cspace.rs` | 56 | encoding artefact (56 x 72 B in one page, asserted) | none | correct as is | None |

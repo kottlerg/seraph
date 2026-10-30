@@ -41,7 +41,9 @@ pub struct GptEntry
 /// `u32` widths of `num_parts` and `entry_size` are the UEFI GPT header's
 /// own field widths; [`parse_header`] has checked that the
 /// `num_parts * entry_size`-byte array lies between LBA 2 and the header's
-/// first usable LBA, so the walk reads no partition data as entries.
+/// own first usable LBA. That holds the array to the layout the header
+/// declares; it is only as trustworthy as `first_usable_lba`, which comes
+/// from the same sector.
 pub struct GptHeader
 {
     pub part_entry_lba: u64,
@@ -77,9 +79,13 @@ pub enum GptError
 /// bytes per entry.
 ///
 /// Also checks that the entry array lies between LBA 2 and the header's
-/// `first_usable_lba`, as the GPT spec places it. That is the bound on
-/// `num_parts`: without it a corrupt or hostile header could declare up to
-/// `u32::MAX` entries and have the walk decode partition data as entries.
+/// `first_usable_lba`, as the GPT spec places it, so a `num_parts` that
+/// disagrees with the header's own layout is refused rather than walked.
+/// The check trusts `first_usable_lba`, which the same sector supplies: a
+/// header that also inflates it still passes, and its walk is then bounded
+/// only by the device (a read past its capacity fails) and by memory
+/// ([`collect_partitions`] stops with [`ScanStop`] either way). The header
+/// and entry-array CRC32s are not checked.
 ///
 /// # Errors
 /// Returns [`GptError::InvalidSignature`] when the `EFI PART` signature is

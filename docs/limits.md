@@ -96,8 +96,7 @@ An entry an existing open Issue already names cites it in the recommendation.
   iterations, whose wall time depends on CPU and MMIO speed. `wait_for_ack` is the time-based
   model.
 - **Hidden global pools.** The kernel's 512 KiB SEED also funds split bodies, Mmio and IoPort
-  copies, and IOPB tables at runtime; the memmgr and procmgr CSpaces are seeded once with
-  8231 slots and have no augment path.
+  copies, and IOPB tables at runtime.
 
 ## Catalogue
 
@@ -586,7 +585,7 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645).
 | `LOG_THREAD_STACK_PAGES` | `services/init/src/logging.rs` | 4 | BSS budget (the tables live in BSS, not on this stack) | 16 KiB | correct as is | None |
 | `STREAM_CHUNK_SIZE` | `services/init/src/logging.rs`, `services/logd/src/main.rs` | 512 | ABI width | 512 B stack | correct as is | None |
 | `MAX_ORPHAN_MEMORY_CAPS` | `services/init/src/main.rs` | 64 | current peak plus headroom | 256 B | raise | Halts on overflow; size from `memory_count` |
-| `CSPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 149 pages (8231 slots) | current peak plus headroom | 149 pages each for memmgr and procmgr | needs a design | Lifetime cap on tier-1 caps; self-augment path |
+| `CSPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 149 pages (8231 slots) | refillable seed (augment) | 149 pages each for memmgr and procmgr | correct as is | None: both self-augment (#642, #643, #41) |
 | `THREAD_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 6 | encoding artefact (kernel stack, TCB and FPU pages) | per tier-1 service | correct as is | Share with procmgr |
 | `ASPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 48 | refillable seed for procmgr; a static seed for memmgr, which has no augment path | 48 pages per tier-1 service | make pay-as-you-go | memmgr's page-table pool caps its metadata-arena growth; fund it from its pool (#642) |
 | `INIT_RETYPE_RESERVE_PAGES` | `services/init/src/bootstrap.rs` | 8 | provably unreachable (asserted against the fixed endpoint count) | 8 pages | correct as is | None |
@@ -719,7 +718,6 @@ production value is raised.
 | `REPORT_SLICES`, `REPORT_SLICE_MS` | `core/ktest/src/tally.rs` | 1000 x 5 ms | test fixture | none | correct as is | None |
 | `await_all` mask | `core/ktest/src/tally.rs` | 64 children | ABI width (notification word) | none | correct as is | None |
 | `MAX_POLLS` (14 copies) | `core/ktest/src/` | 2000 x 1 ms, scaled | test fixture | none | correct as is | Hoist to one constant |
-| `RESERVE_GRANTS_MAX` | `programs/capexhaust/src/main.rs` | `CSPACE_IPC_RECV_RESERVE` | ABI width | none | correct as is | None |
 | `SLOTS_PER_PAGE`, `LIVE` (`HANDLES`) | `core/ktest/src/stress/cspace_registry_arena.rs` | 56 / 4097 | mirror of kernel `L2_SIZE`; one past the former 4096-entry registry | about 16 KiB BSS | correct as is | Reference or assert against `L2_SIZE` |
 | `FILLERS` | `core/ktest/src/stress/sleep_list_full.rs` | 128 | mirror of kernel `MAX_SLEEPING` | 1 MiB BSS | correct as is | Reference or assert against `MAX_SLEEPING` (#638) |
 | `MAX_PINNED` | `core/ktest/src/bench/tlb.rs` | 7 | test fixture | 224 KiB BSS | correct as is | None |

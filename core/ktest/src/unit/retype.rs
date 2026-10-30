@@ -702,9 +702,13 @@ pub fn cspace_grow_consumes_pool(ctx: &TestContext) -> TestResult
 /// the directory's structural ceiling.
 pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
 {
+    // Slots one pool page backs (the kernel's `L2_SIZE`).
+    const PAGE_SLOTS: u64 = syscall_abi::CSPACE_SLOTS_PER_PAGE;
+
     let memory = ctx.memory_base;
 
-    // init_pages = 2 → 1 pool page → 55 usable slots.
+    // init_pages = 2 → 1 pool page → PAGE_SLOTS - 1 usable slots (slot 0 is
+    // the null slot).
     let cspace = cap_create_cspace(memory, 0, 2)
         .map_err(|_| "retype::pool_exhaust: cap_create_cspace failed")?;
     let Ok(probe) = cap_create_endpoint(memory)
@@ -714,12 +718,12 @@ pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
         return Err("retype::pool_exhaust: cap_create_endpoint failed");
     };
 
-    // Copy until the first failure: the seeded pool backs 55 slots, of which
-    // the IPC receive reserve keeps 4 free, so 51 copies succeed and the
-    // 52nd hits pool exhaustion.
-    let mut ok_before = 0u32;
+    // Copy until the first failure: the seeded pool backs PAGE_SLOTS - 1
+    // slots, of which the IPC receive reserve keeps CSPACE_IPC_RECV_RESERVE
+    // free, so that many fewer copies succeed before pool exhaustion.
+    let mut ok_before = 0u64;
     let mut err_at_pool = 0i64;
-    for _ in 0..=55
+    for _ in 0..PAGE_SLOTS
     {
         match cap_copy(probe, cspace, 1)
         {
@@ -732,12 +736,12 @@ pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
         }
     }
 
-    // Refill the pool (2 more slot pages = 112 slots); every backed slot
-    // must then accept an insert with no error in between.
+    // Refill the pool (2 more slot pages); every backed slot must then accept
+    // an insert with no error in between.
     let augment_ok = cap_create_cspace(memory, cspace, 2).is_ok();
-    let mut ok_after = 0u32;
+    let mut ok_after = 0u64;
     let mut err_after = 0i64;
-    for _ in 0..=112
+    for _ in 0..=2 * PAGE_SLOTS
     {
         match cap_copy(probe, cspace, 1)
         {
@@ -754,8 +758,7 @@ pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
     cap_delete(probe).ok();
     cap_delete(cspace).ok();
 
-    if u64::from(ok_before)
-        != syscall_abi::CSPACE_SLOTS_PER_PAGE - 1 - syscall_abi::CSPACE_IPC_RECV_RESERVE
+    if ok_before != PAGE_SLOTS - 1 - syscall_abi::CSPACE_IPC_RECV_RESERVE
         || err_at_pool != SYS_OUT_OF_MEMORY
     {
         return Err(
@@ -766,10 +769,10 @@ pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
     {
         return Err("retype::pool_exhaust: augment-mode refill failed");
     }
-    if ok_after != 112 || err_after != SYS_OUT_OF_MEMORY
+    if ok_after != 2 * PAGE_SLOTS || err_after != SYS_OUT_OF_MEMORY
     {
         return Err(
-            "retype::pool_exhaust: augmented pool did not back exactly 112 further inserts",
+            "retype::pool_exhaust: augmented pool did not back exactly two pages of inserts",
         );
     }
     Ok(())

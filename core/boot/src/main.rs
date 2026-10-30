@@ -98,6 +98,10 @@ const MAX_IDENTITY_REGIONS: usize = 64;
 /// before merging with the UEFI memory map).
 const MAX_APERTURE_SEEDS: usize = 64;
 
+/// Size of the heuristic-window seed buffer: two layout-heuristic PCI windows
+/// per MCFG allocation entry plus the arch's default PCI windows.
+const MAX_HEURISTIC_SEEDS: usize = 16;
+
 // ── Forward-state groupings ───────────────────────────────────────────────────
 
 /// UEFI handles and early-discovery results held across the boot sequence.
@@ -368,9 +372,11 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // Scrub the bootloader's own copies of the KASLR entropy words
     // (`boot_entropy.kaslr`, and the `kaslr.dm_rand` copy step 9 consumed) and
     // of the pool seed; the BootInfo copy is the kernel's to scrub, and step 5c
-    // scrubs its own byte buffers. The rest of the UEFI stack still reaches
-    // userspace unzeroed (core/kernel/docs/cross-boundary-disclosure.md § Kernel
-    // state in donated memory, #439).
+    // scrubs its own byte buffers. The kernel zeroes the whole UEFI stack (free
+    // RAM it drains at Phase 7) and every reclaim range before init runs
+    // (core/kernel/docs/cross-boundary-disclosure.md § Kernel state in donated
+    // memory); these local scrubs keep the secrets from outliving their last
+    // bootloader consumer.
     scrub(&mut boot_entropy.seed);
     // SAFETY: all are live locals; volatile so the stores are not elided as
     // dead ahead of the values going out of scope.
@@ -1305,10 +1311,17 @@ unsafe fn step9_populate_boot_info(
         phys_base: 0,
         size: 0,
     }; MAX_APERTURE_SEEDS];
-    let mut seed_count: usize = 0;
+    // The ACPI seeder's layout-heuristic PCI windows go to their own buffer:
+    // derive_mmio_apertures clips them harder than the named seeds
+    // (core/boot/docs/firmware-parsing.md § Firmware exclusion).
+    let mut heuristic_seed = [MmioAperture {
+        phys_base: 0,
+        size: 0,
+    }; MAX_HEURISTIC_SEEDS];
     // SAFETY: acpi_rsdp is zero or identity-mapped; parse_aperture_seed validates.
-    seed_count +=
-        unsafe { acpi::parse_aperture_seed(firm.acpi_rsdp, &mut aperture_seed[seed_count..]) };
+    let (mut seed_count, heuristic_count) = unsafe {
+        acpi::parse_aperture_seed(firm.acpi_rsdp, &mut aperture_seed, &mut heuristic_seed)
+    };
     // SAFETY: device_tree is zero or identity-mapped; parse_aperture_seed validates.
     seed_count +=
         unsafe { dtb::parse_aperture_seed(firm.device_tree, &mut aperture_seed[seed_count..]) };
@@ -1343,7 +1356,12 @@ unsafe fn step9_populate_boot_info(
     }; MAX_APERTURES];
     // SAFETY: uefi_map.buffer_phys is the raw UEFI map from step 7, still mapped.
     let aperture_count = unsafe {
-        memory_map::derive_mmio_apertures(uefi_map, &aperture_seed[..seed_count], apertures_buf)
+        memory_map::derive_mmio_apertures(
+            uefi_map,
+            &aperture_seed[..seed_count],
+            &heuristic_seed[..heuristic_count],
+            apertures_buf,
+        )
     };
     bprintln!("[--------] boot: MMIO apertures: {aperture_count} derived");
 

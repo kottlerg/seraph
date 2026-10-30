@@ -5,17 +5,17 @@
 
 //! Seraph userspace serial (UART) device driver.
 //!
-//! Spawned by devmgr with the platform UART authority cap — an
-//! `IoPort` covering COM1 on x86-64, an `Mmio` covering the
-//! QEMU `virt` NS16550 at its platform-static address on RISC-V — a RECV cap
-//! on its service endpoint, and (optionally) the UART interrupt cap. Owns the UART end-to-end and is
-//! the sole driver-mediated path for userspace serial bytes in both
-//! directions: real-logd and every other writer reach it via
+//! Spawned by devmgr with the platform UART authority cap — an `IoPort`
+//! covering COM1 on x86-64, an `Mmio` covering the QEMU `virt` NS16550 at
+//! its platform-static address on RISC-V — a RECV cap on its service
+//! endpoint, and (optionally) the UART interrupt cap. Owns the UART
+//! end-to-end and is the sole driver-mediated path for userspace serial
+//! bytes in both directions: real-logd and every other writer reach it via
 //! [`serial_labels::SERIAL_WRITE_BYTES`]; the terminal reads input via
 //! [`serial_labels::SERIAL_READ_BYTES`], waking on an interrupt registered
-//! through [`serial_labels::SERIAL_REGISTER_RX_NOTIFY`]. The service loop never
-//! blocks (reads drain and return at once), so a pending read never starves
-//! writers.
+//! through [`serial_labels::SERIAL_REGISTER_RX_NOTIFY`]. The service loop
+//! never blocks (reads drain and return at once), so a pending read never
+//! starves writers.
 //!
 //! Unlike the sibling RTC drivers, this driver MUST NOT call
 //! `std::os::seraph::log!`. logd routes its own output here, so a log call
@@ -23,8 +23,6 @@
 //! therefore dropped; fatal bootstrap failures `thread_exit` silently. The
 //! pre-driver boot window is covered by init-logd's direct-UART path (see
 //! `docs/console-model.md`).
-
-#![allow(clippy::cast_possible_truncation)]
 
 mod arch;
 
@@ -98,7 +96,8 @@ fn handle_request(msg: &IpcMessage, irq_cap: u32, ipc_buf: *mut u64)
     }
     else if op == serial_labels::SERIAL_WRITE_BYTES
     {
-        let byte_len = ((msg.label >> 16) & 0xFFFF) as usize;
+        // The mask bounds the length to 16 bits, so the conversion cannot fail.
+        let byte_len = usize::try_from((msg.label >> 16) & 0xFFFF).unwrap_or(0);
         let bytes = msg.data_bytes();
         let n = byte_len.min(bytes.len());
         for &b in &bytes[..n]

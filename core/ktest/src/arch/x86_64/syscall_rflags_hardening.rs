@@ -26,8 +26,10 @@
 //!      user-set AC on entry, or dropped it from the user's RFLAGS, fails here.
 //!      Whether AC is clear while the kernel runs has no ring-3-visible effect
 //!      (it only lifts SMAP for kernel accesses outside the user-copy window,
-//!      which the kernel makes none of); the kernel-side check that observes it
-//!      is recorded on #443.
+//!      which the kernel makes none of), so the kernel observes it itself: in
+//!      debug builds `syscall::dispatch` asserts AC, DF and TF clear
+//!      (`arch::current::cpu::debug_assert_kernel_entry_flags`), and this
+//!      phase's syscall trips that assertion if SYSCALL entry left AC set.
 
 use syscall::cap_delete;
 use syscall_abi::{EXIT_FAULT_BASE, SYS_GETRANDOM, SYS_THREAD_YIELD};

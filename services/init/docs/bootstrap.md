@@ -253,7 +253,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   deleted. The caps init still holds stay in init's `CSpace`, which
   the kernel pins (it is the root CSpace), so they remain alive but
   unreachable; releasing them at the reap is design intent; not yet
-  implemented ([#443](https://github.com/kottlerg/seraph/issues/443);
+  implemented ([#540](https://github.com/kottlerg/seraph/issues/540);
   [Process Lifecycle](../../../docs/process-lifecycle.md#init-reap)
   § Init reap describes those caps). Every reclaimable Memory cap was donated, so no
   `owns_memory` cap reaches its last reference and nothing frees to

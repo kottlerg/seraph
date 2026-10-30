@@ -1884,7 +1884,7 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
                     let remaining = (*source_header).dec_ref();
                     debug_assert!(
                         remaining > 0,
-                        "wait-set dec_ref drained source while caller still holds cap"
+                        "wait-set dec_ref drained source under the call's `src` pin"
                     );
                 }
                 (*ep).lock.unlock_raw(saved);
@@ -1906,7 +1906,7 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
                     let remaining = (*source_header).dec_ref();
                     debug_assert!(
                         remaining > 0,
-                        "wait-set dec_ref drained source while caller still holds cap"
+                        "wait-set dec_ref drained source under the call's `src` pin"
                     );
                 }
                 (*sig).lock.unlock_raw(saved);
@@ -1926,7 +1926,7 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
                     let remaining = (*source_header).dec_ref();
                     debug_assert!(
                         remaining > 0,
-                        "wait-set dec_ref drained source while caller still holds cap"
+                        "wait-set dec_ref drained source under the call's `src` pin"
                     );
                 }
                 (*eq).lock.unlock_raw(saved);

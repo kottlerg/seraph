@@ -294,7 +294,9 @@ pub mod procmgr_labels
 
     /// Register a death-notification `EventQueue` cap (`caps[0]`, POST
     /// right) with procmgr, which binds it as a second death observer on
-    /// every supervised thread, so the kernel posts each death to it.
+    /// the main thread of every supervised process (threads a process
+    /// creates itself carry no binding), so the kernel posts each
+    /// process's main-thread death to it.
     /// Real-logd uses it to evict the slot of a dead sender. Specified,
     /// with its replies, in `services/procmgr/docs/ipc-interface.md`
     /// § `REGISTER_DEATH_EQ` — install logd's death observer.
@@ -361,7 +363,7 @@ pub mod sched_policy
     /// (`[29, 30]`, which stays alive but unreachable in init's pinned
     /// `CSpace` after its reap; releasing it there is design intent, not
     /// yet implemented, per `docs/process-lifecycle.md` § Init reap and
-    /// #443), and hands the baseline `[1, 28]` to memmgr and procmgr.
+    /// #540), and hands the baseline `[1, 28]` to memmgr and procmgr.
     /// Every band procmgr mints for a child is a (possibly narrowed)
     /// descendant of this baseline, so no spawned process can ever reach
     /// `[29, 30]`.
@@ -1843,10 +1845,10 @@ pub mod fb_labels
 
     /// Authority bit in the framebuffer-service-endpoint badge's high
     /// u64 bit. Set on caps devmgr mints in response to
-    /// [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]. Gating
-    /// [`FB_WRITE_BYTES`] and [`FB_SET_ATTRS`] on it is design intent; not
-    /// yet implemented: the framebuffer driver does not check the bit
-    /// (#454). A verb ("may write"), not an identity.
+    /// [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]. It gates
+    /// [`FB_WRITE_BYTES`] and [`FB_SET_ATTRS`]: the driver answers either
+    /// label with [`super::fb_errors::UNAUTHORIZED`] when the caller's
+    /// badge lacks it. A verb ("may write"), not an identity.
     pub const WRITE_AUTHORITY: u64 = 1u64 << 63;
 }
 
@@ -1861,6 +1863,10 @@ pub mod fb_errors
     /// today — `FB_LABELS_VERSION` is marker-only and covered by
     /// `PROCESS_ABI_VERSION` at process startup.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
+    /// Caller's badge lacks [`super::fb_labels::WRITE_AUTHORITY`], which
+    /// gates [`super::fb_labels::FB_WRITE_BYTES`] and
+    /// [`super::fb_labels::FB_SET_ATTRS`].
+    pub const UNAUTHORIZED: u64 = 4;
 }
 
 /// Wire-protocol version of [`input_labels`]; bumped as the block comment above
@@ -1882,9 +1888,9 @@ pub mod input_labels
 {
     /// Read a batch of pending keyboard events (blocking).
     ///
-    /// Request: empty body; the caller's badge is meant to carry
-    /// [`READ_AUTHORITY`] (the driver does not yet check it; see that
-    /// constant).
+    /// Request: empty body; the caller's badge must carry
+    /// [`READ_AUTHORITY`], else the driver replies
+    /// [`super::input_errors::UNAUTHORIZED`] at once.
     /// The driver blocks until at least one event is available, then replies
     /// with up to [`super::keysym::INPUT_MAX_EVENTS_PER_READ`] events.
     ///
@@ -1897,9 +1903,9 @@ pub mod input_labels
 
     /// Authority bit in the input-service-endpoint badge's high u64 bit. Set
     /// on caps devmgr mints in response to
-    /// [`devmgr_labels::QUERY_INPUT_DEVICE`]. Gating [`INPUT_READ_EVENTS`] on
-    /// it is design intent; not yet implemented: the virtio-input driver does
-    /// not check the bit (#454). A verb ("may read"), not an identity.
+    /// [`devmgr_labels::QUERY_INPUT_DEVICE`]. It gates [`INPUT_READ_EVENTS`]:
+    /// the driver answers the label with [`super::input_errors::UNAUTHORIZED`]
+    /// when the caller's badge lacks it. A verb ("may read"), not an identity.
     pub const READ_AUTHORITY: u64 = 1u64 << 63;
 }
 
@@ -1914,6 +1920,9 @@ pub mod input_errors
     /// `INPUT_LABELS_VERSION` is marker-only and covered by
     /// `PROCESS_ABI_VERSION` at process startup.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
+    /// Caller's badge lacks [`super::input_labels::READ_AUTHORITY`], which
+    /// gates [`super::input_labels::INPUT_READ_EVENTS`].
+    pub const UNAUTHORIZED: u64 = 4;
 }
 
 /// Keysym numbering, modifier mask bits, and the

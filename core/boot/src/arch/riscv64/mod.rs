@@ -203,9 +203,11 @@ pub unsafe fn allocate_kernel_span(bs: *mut EfiBootServices, pages: usize)
     unsafe { allocate_pages(bs, pages) }
 }
 
-/// QEMU virt RISC-V default MMIO apertures: PCI ECAM + 32-bit + 64-bit
-/// PCI windows, plus the ns16550a UART register page at `0x1000_0000` and
-/// the Goldfish RTC register page at `0x101000`.
+/// QEMU virt RISC-V default MMIO register apertures: the PCI ECAM window,
+/// the ns16550a UART register page at `0x1000_0000`, and the Goldfish RTC
+/// register page at `0x101000`. The PCI windows are separate
+/// ([`default_pci_windows`]) because they are a layout heuristic, clipped
+/// harder against the memory map.
 ///
 /// Fixed rather than discovered: EDK2 on the seraph boot path does not
 /// re-publish the DTB via a UEFI configuration table, so
@@ -226,9 +228,22 @@ pub fn default_mmio_apertures() -> &'static [(u64, u64)]
         (0x1000_0000, 0x1000),
         (0x10_1000, 0x1000),
         (0x3000_0000, 0x1000_0000),
-        (0x4000_0000, 0x4000_0000),
-        (0x4_0000_0000, 0x4_0000_0000),
     ];
+    ENTRIES
+}
+
+/// QEMU virt RISC-V default PCI MMIO windows: the 32-bit window
+/// `[1 GiB, 2 GiB)` and the 64-bit window `[16 GiB, 32 GiB)`, the latter
+/// QEMU's own only for guests with at most about 14 GiB of RAM.
+///
+/// Like the MCFG-derived windows, these name no device the firmware
+/// reported, so [`crate::memory_map::derive_mmio_apertures`] keeps only the
+/// parts the memory map leaves undescribed or reports as MMIO
+/// (`core/boot/docs/firmware-parsing.md` § Firmware exclusion). Appended by
+/// [`crate::acpi::parse_aperture_seed`] with [`default_mmio_apertures`].
+pub fn default_pci_windows() -> &'static [(u64, u64)]
+{
+    const ENTRIES: &[(u64, u64)] = &[(0x4000_0000, 0x4000_0000), (0x4_0000_0000, 0x4_0000_0000)];
     ENTRIES
 }
 

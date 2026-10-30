@@ -2105,7 +2105,7 @@ pub unsafe fn init(cpu_count: u32) -> u32
             idle_thread_entry as *const () as u64,
             stack_top,
             cpu as u64,
-            false,
+            crate::arch::ThreadKind::Kernel,
         );
 
         // Initialise this CPU's idle TCB in place inside the dynamic slab.

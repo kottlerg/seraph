@@ -610,7 +610,9 @@ fn try_forward_lookup_fallthrough(
 /// skipping any name shadowed by a local child. Without it, listing a
 /// synthetic node would show only its in-tree mounts and hide root-fs
 /// entries reachable by name (e.g. `/programs`, `/data` under the
-/// synthetic root), making enumeration inconsistent with lookup.
+/// synthetic root), making enumeration inconsistent with lookup. An
+/// index beyond `u32` is answered `END_OF_DIR` here, on any node the
+/// caller may read, as the protocol crate answers it.
 ///
 /// `NS_READDIR` surfaces names only — no caps — so, unlike lookup
 /// fall-through, there is no authority to launder: the caller's
@@ -643,9 +645,17 @@ fn try_forward_readdir_fallthrough(
         Ok((node, _)) => node,
         Err(GateError::PermissionDenied | GateError::UnknownLabel) => return false,
     };
-    // Cast is range-safe: the readdir cursor is bounded by directory size.
-    #[allow(clippy::cast_possible_truncation)]
-    let idx = recv.word(0) as u32;
+    // An index beyond u32 cannot name an entry; answer `END_OF_DIR` as
+    // namespace-protocol's `handle_readdir` does for the local children,
+    // so both readdir paths agree.
+    let Ok(idx) = u32::try_from(recv.word(0))
+    else
+    {
+        let end = IpcMessage::new(ipc::fs_labels::END_OF_DIR);
+        // SAFETY: ipc_buf is the thread-registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&end, ipc_buf) };
+        return true;
+    };
 
     let backend = rt
         .root_backend
@@ -1278,9 +1288,9 @@ fn walk_root_mount_path(root_mount_cap: u32, path: &[u8], ipc_buf: *mut u64) -> 
         {
             continue;
         }
-        // Cast is range-safe: components are bounded by MAX_ENTRY_NAME
-        // (64) on the install side.
-        #[allow(clippy::cast_possible_truncation)]
+        // Components are bounded by `root_backend::MAX_ENTRY_NAME`
+        // (64), which `install` enforces, so the length fits the label's
+        // name-length field.
         let name_len = component.len() as u64;
         let label = ns_labels::NS_LOOKUP | (name_len << 16);
         let msg = IpcMessage::builder(label)

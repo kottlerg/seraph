@@ -5,7 +5,8 @@
 
 //! Architecture dispatch module: selects the active architecture's module as
 //! `current` (see `docs/coding-standards.md` § C. Architecture Invariants and
-//! `core/kernel/docs/arch-interface.md`).
+//! `core/kernel/docs/arch-interface.md`), and defines [`ThreadKind`], the one
+//! type both architectures' `context::new_state` share.
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]
@@ -14,3 +15,17 @@ pub mod current;
 #[cfg(target_arch = "riscv64")]
 #[path = "riscv64/mod.rs"]
 pub mod current;
+
+/// Which privilege level a new thread runs at, selecting its first-dispatch
+/// interrupt state in `context::new_state` (the first-dispatch trampoline rule of
+/// core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadKind
+{
+    /// A user thread: its first dispatch runs the kernel-side trampoline to
+    /// `return_to_user` with interrupts masked.
+    User,
+    /// A kernel thread (idle): its first dispatch runs kernel code that may
+    /// wait for interrupts.
+    Kernel,
+}

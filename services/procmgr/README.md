@@ -72,9 +72,11 @@ procmgr/
 - **Death-notification fan-out to logd** — accept
   `REGISTER_DEATH_EQ` from real-logd (gated by the
   `DEATH_EQ_AUTHORITY` badge), store logd's `EventQueue` cap, bind
-  it retroactively on every existing thread, and bind it on every
-  new spawn alongside procmgr's own death observer (correlator =
-  process badge, equal to logd's per-sender slot key). See
+  it retroactively on the main thread of every existing process, and
+  bind it on the main thread of every new spawn alongside procmgr's own
+  death observer (correlator = process badge, equal to logd's
+  per-sender slot key). Threads a process creates itself carry no logd
+  binding. See
   [docs/ipc-interface.md](docs/ipc-interface.md) § `REGISTER_DEATH_EQ`.
 - **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff during
   init's Handover stage
@@ -104,7 +106,7 @@ handover completes. The reap path tears down init's kernel objects in order — 
 → donate Memory caps to memmgr via `DONATE_MEMORY_CAPS` → drop procmgr's CSpace reference — leaving
 two init residues: init's CSpace with the caps init still holds, which the kernel pins (it is the
 root CSpace), so they remain alive but unreachable; releasing them at the reap is design intent, not
-yet implemented ([#443](https://github.com/kottlerg/seraph/issues/443); see [process-lifecycle.md §
+yet implemented ([#540](https://github.com/kottlerg/seraph/issues/540); see [process-lifecycle.md §
 Init reap](../../docs/process-lifecycle.md#init-reap)); and, as an accepted cost, the kernel-direct
 page-table nodes behind init's bootstrap mappings stay consumed (see [memory-internals.md § Page
 Table Node Ownership](../../core/kernel/docs/memory-internals.md#page-table-node-ownership)). On

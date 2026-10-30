@@ -737,7 +737,7 @@ pub fn create_devmgr_with_caps(
         // carried into no surviving cap and become unreachable at init's reap:
         // the root cap stays alive in init's kernel-pinned root CSpace;
         // releasing it at the reap is design intent, not yet implemented
-        // (`docs/process-lifecycle.md` § Init reap, #443).
+        // (`docs/process-lifecycle.md` § Init reap, #540).
         syscall::cap_derive(
             info.sbi_control_cap,
             syscall::RIGHTS_SBI_RESET | syscall::RIGHTS_SBI_SUSPEND,
@@ -1392,7 +1392,7 @@ fn send_handover_complete(svcmgr_service_ep: u32, ipc_buf: *mut u64)
 /// and any un-sent cap stays in init's `CSpace`, which the kernel pins (it is
 /// the root `CSpace`), so it remains alive but unreachable; releasing it at the
 /// reap is design intent, not yet implemented (`docs/process-lifecycle.md`
-/// § Init reap, #443).
+/// § Init reap, #540).
 ///
 /// # Safety
 /// `ipc_buf` must be init's registered IPC buffer; `procmgr_ep` must carry
@@ -1484,7 +1484,7 @@ fn register_init_reap_objects(
 /// `sys_thread_exit` afterward, leaving the un-transferred caps in init's
 /// `CSpace`, which the kernel pins (it is the root `CSpace`), so they remain
 /// alive but unreachable; releasing them at the reap is design intent, not yet
-/// implemented (`docs/process-lifecycle.md` § Init reap, #443).
+/// implemented (`docs/process-lifecycle.md` § Init reap, #540).
 fn finish_init_reap_handoff(
     info: &InitInfo,
     procmgr_ep: u32,
@@ -1565,7 +1565,7 @@ fn finish_init_reap_handoff(
         // arenas: memory_split remainders below the floor with no descriptor.
         // Without this they would stay stranded in init's kernel-pinned root
         // CSpace after the reap and leak (`docs/process-lifecycle.md` § Init
-        // reap, #443). They carry RETYPE + owns_memory like any RAM memory
+        // reap, #540). They carry RETYPE + owns_memory like any RAM memory
         // cap, so memmgr ingests them into its pool.
         for &slot in orphan_memory_caps
         {

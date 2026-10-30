@@ -7,7 +7,9 @@
 //!
 //! Receives BAR MMIO cap, IRQ cap, and `VirtioPciStartupInfo` startup message
 //! from devmgr. Initialises the `VirtIO` device via the modern PCI transport,
-//! sets up a split virtqueue, and serves block read requests over IPC.
+//! sets up a split virtqueue, and serves block reads
+//! (`BLK_READ_INTO_MEMORY`), block writes (`BLK_WRITE_FROM_MEMORY`), and
+//! partition registration (`REGISTER_PARTITION`) over IPC.
 
 // cast_possible_truncation: userspace targets 64-bit only; u64/usize conversions
 // are lossless. u32 casts on capability slot indices are bounded by CSpace capacity.
@@ -798,13 +800,14 @@ fn resolve_sector(badge: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
 /// latter is already partition-scoped and has no authority to create
 /// additional scopes.
 ///
-/// Data words: `[BLK_LABELS_VERSION, base_lba, length_lba]`. The driver allocates a fresh
-/// partition-identity badge from its monotonic counter, inserts the
-/// bound, derives a badged `SEND_GRANT` cap on its own service endpoint
-/// scoped to that badge, and returns the cap in `caps[0]` of the reply.
-/// Server-side derivation is required because [`MOUNT_AUTHORITY`] caps
-/// are badged and the kernel rejects re-badging of a badged source —
-/// the caller cannot mint partition caps itself.
+/// Data words: `[BLK_LABELS_VERSION, base_lba, length_lba]`. The
+/// driver allocates a fresh partition-identity badge from its monotonic
+/// counter, inserts the bound, derives a badged `SEND_GRANT` cap on its
+/// own service endpoint scoped to that badge, and returns the cap in
+/// `caps[0]` of the reply. Server-side derivation is required because
+/// [`MOUNT_AUTHORITY`] caps are badged and the kernel rejects
+/// re-badging of a badged source — the caller cannot mint partition
+/// caps itself.
 fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
 {
     let reject = |ipc_buf: *mut u64| {

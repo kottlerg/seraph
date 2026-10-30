@@ -11,8 +11,6 @@
 //! ([`rtc_labels::RTC_GET_EPOCH_TIME`]) by re-reading hardware on
 //! every request.
 
-#![allow(clippy::cast_possible_truncation)]
-
 use cmos_rtc::{CmosFields, CmosRegs};
 use ipc::{IpcMessage, rtc_errors, rtc_labels};
 use std::os::seraph::startup_info;

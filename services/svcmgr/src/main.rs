@@ -192,27 +192,18 @@ fn publish_well_known(
 )
 {
     // rootfs.root — SEND on the root filesystem's namespace endpoint,
-    // endowed pre-derived by init. Published as-is; `registry_lookup_derived`
-    // re-derives a SEND per consumer and the badge survives. Seed-only: the
-    // whole-filesystem namespace reaches only the recipes that seed it.
-    if caps.rootfs_root != 0
-    {
-        if registry
-            .publish(
-                ipc::published_names::ROOTFS_ROOT,
-                caps.rootfs_root,
-                Visibility::SeedOnly,
-            )
-            .is_err()
-        {
-            std::os::seraph::log!("publish rootfs.root failed");
-            let _ = syscall::cap_delete(caps.rootfs_root);
-        }
-    }
-    else
-    {
-        std::os::seraph::log!("no rootfs.root source cap; not published");
-    }
+    // endowed pre-derived by init. Seed-only: the whole-filesystem namespace
+    // reaches only the recipes that seed it.
+    publish_endowed_send(
+        registry,
+        caps.rootfs_root,
+        ipc::published_names::ROOTFS_ROOT,
+    );
+    // vfsd.mount / vfsd.deny — SENDs on vfsd's service endpoint, endowed
+    // pre-badged by init (`MOUNT_AUTHORITY`, and the no-authority
+    // `DENY_BADGE`). Seed-only: svctest alone seeds them.
+    publish_endowed_send(registry, caps.vfsd_mount, ipc::published_names::VFSD_MOUNT);
+    publish_endowed_send(registry, caps.vfsd_deny, ipc::published_names::VFSD_DENY);
 
     // svcmgr — SEND on svcmgr's own service endpoint (crasher seeds it),
     // badged so no consumer holds an unbadged source it could re-badge with
@@ -255,6 +246,25 @@ fn publish_well_known(
     ]
     {
         publish_devmgr_registry_send(registry, caps.devmgr_registry, name, badge);
+    }
+}
+
+/// Publish the endowed, pre-derived SEND `cap` seed-only as `name`, as-is:
+/// `registry_lookup_derived` re-derives a SEND per consumer and the badge
+/// survives. Logs and skips when the cap is absent; deletes it when the
+/// publish fails.
+fn publish_endowed_send(registry: &mut registry::Registry<REGISTRY_CAPACITY>, cap: u32, name: &[u8])
+{
+    let shown = core::str::from_utf8(name).unwrap_or("?");
+    if cap == 0
+    {
+        std::os::seraph::log!("no {shown} source cap; not published");
+        return;
+    }
+    if registry.publish(name, cap, Visibility::SeedOnly).is_err()
+    {
+        std::os::seraph::log!("publish {shown} failed");
+        let _ = syscall::cap_delete(cap);
     }
 }
 

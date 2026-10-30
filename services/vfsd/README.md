@@ -56,8 +56,9 @@ vfsd/
   its un-badged service endpoint, with multi-threaded recv so a
   worker-driven `CREATE_FROM_FILE` re-entry cannot deadlock an in-
   flight reply. `MOUNT` is the runtime explicit-mount surface
-  (foreign-GUID disks, user-invoked mounts); no in-tree caller issues
-  it, since root, `/esp`, and `/data` are self-mounted. See
+  (foreign-GUID disks, user-invoked mounts), gated on the
+  `MOUNT_AUTHORITY` badge bit; root, `/esp`, and `/data` are
+  self-mounted, and svctest is its only in-tree caller. See
   [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md) and
   [`docs/namespace-composition.md`](docs/namespace-composition.md).
 - **System-root cap delivery** — vfsd does not push a system-root

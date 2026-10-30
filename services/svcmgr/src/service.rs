@@ -193,6 +193,12 @@ pub struct SvcmgrCaps
     /// `devmgr.test` publish caps and the `SET_DRIVERS_DIR` cap
     /// (`DRIVERS_DIR_AUTHORITY`) from it. Zero if absent.
     pub devmgr_registry: u32,
+    /// `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint, published
+    /// seed-only as `vfsd.mount`. Zero if absent.
+    pub vfsd_mount: u32,
+    /// `DENY_BADGE`-badged SEND on vfsd's service endpoint, published
+    /// seed-only as `vfsd.deny`. Zero if absent.
+    pub vfsd_deny: u32,
     /// Reserved master-log endpoint source (`RIGHTS_ALL`). svcmgr mints
     /// real-logd's master-log RECV from it on every (re)launch, and the
     /// one-shot `HANDOVER_PULL` SEND on the first launch. Holding it keeps the
@@ -246,6 +252,8 @@ pub fn bootstrap_caps(
                             bootstrap_ep: c.bootstrap_ep,
                             rootfs_root: c.rootfs_root,
                             devmgr_registry: c.devmgr_registry,
+                            vfsd_mount: c.vfsd_mount,
+                            vfsd_deny: c.vfsd_deny,
                             master_log_source: 0,
                             procmgr_death_auth_source: 0,
                         });
@@ -298,7 +306,16 @@ pub fn bootstrap_caps(
                     }
                 }
             }
-            other => std::os::seraph::log!("bootstrap: unknown endowment kind {other}"),
+            other =>
+            {
+                // A round of a kind svcmgr does not know: its caps have no
+                // role here, so release them rather than hold them.
+                std::os::seraph::log!("bootstrap: unknown endowment kind {other}");
+                for &cap in &round.caps[..round.cap_count]
+                {
+                    let _ = syscall::cap_delete(cap);
+                }
+            }
         }
         if round.done
         {

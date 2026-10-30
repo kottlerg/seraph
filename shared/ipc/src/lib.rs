@@ -757,7 +757,7 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 8;
+pub const SVCMGR_LABELS_VERSION: u32 = 9;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -766,7 +766,8 @@ pub mod svcmgr_labels
     // endowment, not a dedicated label (svcmgr launches logd itself, from
     // its recipe). The `CAPS` rounds carry svcmgr's own endpoints plus the source
     // caps it needs for its publish role (`rootfs.root` SEND,
-    // devmgr-registry `SEND|GRANT` source) and `SVCMGR_LABELS_VERSION` in
+    // devmgr-registry `SEND|GRANT` source, `vfsd.mount` and `vfsd.deny`
+    // SENDs) and `SVCMGR_LABELS_VERSION` in
     // `data[1]`; each `SUBSTRATE` round carries one `(name, thread_cap)`
     // pair svcmgr parks in its pending-registration table; a final
     // `LOGD_SOURCES` round carries the master-log and procmgr death-auth
@@ -856,8 +857,9 @@ pub mod svcmgr_labels
     /// [`PUBLISH_ENDPOINT`] by an *external* publisher (no per-publisher
     /// identity in the low bits today — server-side auth is binary: have
     /// the bit, or don't). svcmgr publishes the well-known names it owns
-    /// (`rootfs.root`, `svcmgr`, the three `devmgr.*` names, and each
-    /// provider's `provides` names) directly into its own registry, so those
+    /// (`rootfs.root`, `svcmgr`, the three `devmgr.*` names, the two
+    /// `vfsd.*` names, and each provider's `provides` names) directly into
+    /// its own registry, so those
     /// need no badge. The gate exists for a future external publisher — devmgr
     /// holds a `PUBLISH_AUTHORITY`-badged SEND from its bootstrap bundle,
     /// reserved for driver registrations.
@@ -895,11 +897,13 @@ pub mod svcmgr_labels
 /// derivation, not the published name nor any consumer.
 ///
 /// A name whose cap carries authority is seed-only: `rootfs.root`, the
-/// three `devmgr.*` names, and each provider name whose badge carries a
-/// verb bit ([`crate::VERB_BIT_MASK`]; today `pwrmgr.shutdown`) resolve
-/// only through a recipe's `seed = ...` line, and `QUERY_ENDPOINT` answers
-/// them `UNKNOWN_NAME`. `svcmgr`, `pwrmgr.deny`, `timed`, and any name
-/// published through [`svcmgr_labels::PUBLISH_ENDPOINT`] are public
+/// three `devmgr.*` names, [`published_names::VFSD_MOUNT`], and each provider
+/// name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
+/// `pwrmgr.shutdown`) resolve only through a recipe's `seed = ...` line, and
+/// `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`.
+/// [`published_names::VFSD_DENY`] carries no authority but is seed-only
+/// too, as svctest's test twin. `svcmgr`, `pwrmgr.deny`, `timed`, and any
+/// name published through [`svcmgr_labels::PUBLISH_ENDPOINT`] are public
 /// (services/svcmgr/docs/ipc-interface.md § Label 4).
 pub mod published_names
 {
@@ -951,6 +955,17 @@ pub mod published_names
     /// `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` fault-injection shim and
     /// `TEST_QUERY_DENY_DEVICE`. Seed-only and seeded only by svctest.
     pub const DEVMGR_TEST: &[u8] = b"devmgr.test";
+
+    /// SEND on vfsd's service endpoint badged
+    /// `vfsd_labels::MOUNT_AUTHORITY` alone: the `MOUNT` surface, without
+    /// `GET_SYSTEM_ROOT_CAP`. Seed-only and seeded only by svctest, whose
+    /// vfsd phases drive `MOUNT`'s rejection paths.
+    pub const VFSD_MOUNT: &[u8] = b"vfsd.mount";
+
+    /// SEND on vfsd's service endpoint badged `vfsd_labels::DENY_BADGE`,
+    /// which carries no verb bit: the negative-test twin of [`VFSD_MOUNT`].
+    /// Seed-only and seeded only by svctest.
+    pub const VFSD_DENY: &[u8] = b"vfsd.deny";
 }
 
 /// Wire-protocol version of [`rtc_labels`]; bumped as the block comment above
@@ -1142,14 +1157,16 @@ pub mod pwrmgr_errors
 
 /// Wire-protocol version of [`vfsd_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const VFSD_LABELS_VERSION: u32 = 1;
+pub const VFSD_LABELS_VERSION: u32 = 2;
 /// IPC labels for the VFS daemon (`vfsd`).
 pub mod vfsd_labels
 {
     /// Mount a filesystem at a path. The request body carries a
     /// `MountRole` byte (see `services/vfsd/docs/vfs-ipc-interface.md`)
     /// selecting which GPT type-GUID role to mount; vfsd looks the
-    /// partition up itself.
+    /// partition up itself. The caller's badge MUST carry
+    /// [`MOUNT_AUTHORITY`]; vfsd replies `UNAUTHORIZED` otherwise, before it
+    /// reads the request.
     pub const MOUNT: u64 = 10;
     /// Mint a fresh badged SEND on vfsd's namespace endpoint addressing
     /// the synthetic system root at full namespace rights and return it
@@ -1172,6 +1189,23 @@ pub mod vfsd_labels
     /// distributed to init. Distributing it to svcmgr's restart path is
     /// design intent; not yet implemented.
     pub const SEED_AUTHORITY: u64 = 1u64 << 62;
+
+    /// Authority bit in the vfsd-service-endpoint badge gating [`MOUNT`].
+    /// init mints it, alone, onto the SEND it endows svcmgr with; svcmgr
+    /// publishes that SEND seed-only as
+    /// [`crate::published_names::VFSD_MOUNT`], which svctest alone seeds.
+    /// The cap is badged, so its holder cannot add [`SEED_AUTHORITY`].
+    /// Disjoint position from [`SEED_AUTHORITY`].
+    pub const MOUNT_AUTHORITY: u64 = 1u64 << 63;
+
+    /// The badge init stamps on the no-authority SEND on vfsd's service
+    /// endpoint that svcmgr publishes seed-only as
+    /// [`crate::published_names::VFSD_DENY`]: no verb bit, so [`MOUNT`]
+    /// and [`GET_SYSTEM_ROOT_CAP`] refuse it, and non-zero, since a holder
+    /// may badge an un-badged SEND itself
+    /// (docs/capability-model.md § Verb-bit authority pattern). svctest
+    /// asserts the `MOUNT` refusal through it.
+    pub const DENY_BADGE: u64 = 1;
 }
 
 /// Wire-protocol version of [`ns_labels`]; bumped as the block comment above
@@ -2095,6 +2129,9 @@ const _: () = core::assert!(
     devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::TEST_LABEL_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::BLOCK_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
+        && vfsd_labels::MOUNT_AUTHORITY & VERB_BIT_MASK != 0
+        && vfsd_labels::SEED_AUTHORITY & VERB_BIT_MASK != 0
+        && vfsd_labels::DENY_BADGE & VERB_BIT_MASK == 0
 );
 
 /// Reserved log-endpoint badges.

@@ -757,7 +757,7 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 6;
+pub const SVCMGR_LABELS_VERSION: u32 = 7;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -779,7 +779,11 @@ pub mod svcmgr_labels
     // the endowment are the `svcmgr-endowment` crate
     // (`services/svcmgr/endowment`); see
     // `services/svcmgr/docs/ipc-interface.md` and
-    // `services/svcmgr/docs/service-definitions.md` for the spec.
+    // `services/svcmgr/docs/service-definitions.md` for the spec. The
+    // bootstrap round svcmgr serves each child it launches (the `seed` and
+    // `log_sink` rounds) carries only the present caps and a presence word
+    // in `data[0]` (`bootstrap::pack_slots` / `bootstrap::unpack_slots`);
+    // that layout is part of this version.
 
     /// Internal namespace-policy descriptor stored on `ServiceEntry`
     /// (one of the values below). Parsed by svcmgr from each

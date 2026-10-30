@@ -139,7 +139,7 @@ The launch path is documented in
 fields are recorded on `ServiceEntry` and the argv / env / cwd / seed,
 log-sink flag, and scheduling fields on the parallel `RestartRecipe`, so
 a restart reproduces the first-launch spawn shape byte-for-byte, except the
-log-sink round, whose history-pull SEND is `0` on a restart (per
+log-sink round, whose history-pull SEND is absent on a restart (per
 [service-definitions.md](service-definitions.md#log_sink)). The binary path
 is re-walked on every spawn, so a binary update on disk is picked up by
 the next restart without code changes.

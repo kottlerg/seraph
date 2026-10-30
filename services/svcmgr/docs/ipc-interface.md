@@ -49,7 +49,7 @@ and svcmgr decodes with.
 | optional slot 0 | SEND on the root filesystem's namespace endpoint (published as `rootfs.root`; absent if init could not derive it) |
 | optional slot 1 | `SEND\|GRANT`, badge-0 source on devmgr's registry endpoint (absent if init holds none or its derive fails) |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `6`) handshake |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `7`) handshake |
 | data[2] | presence word: bit 0 `ROOTFS_ROOT`, bit 1 `DEVMGR_REGISTRY` |
 
 svcmgr mints the `devmgr.registry` publish cap
@@ -89,9 +89,10 @@ caps it delivered, and continues with both sources absent.
 
 svcmgr holds both sources for the system's life and mints real-logd's
 [`log_sink`](service-definitions.md#log_sink) bootstrap round from them on
-every (re)launch. An absent source leaves a `0` in the matching slot of
-logd's round, and the kernel refuses a round carrying a null slot, so that
-launch of logd fails at the bootstrap serve (#592).
+every (re)launch. An absent source leaves the matching slot of logd's round
+absent, which the round's presence word records (see
+[`seed`](service-definitions.md#seed)); logd runs without that slot's cap, or,
+for the master-log source, exits at startup.
 
 svcmgr parks each substrate pair in its pending-registration table. It does **not**
 bind death-notification at endowment time — the matching `.svc`

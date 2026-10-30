@@ -91,6 +91,95 @@ pub const fn unpack_data_words(label: u64) -> usize
     ((label >> 16) & 0xFF) as usize
 }
 
+// ── Positional slots ────────────────────────────────────────────────────────
+
+/// A round's positional cap slots packed for the wire: the present caps in
+/// slot order and the presence word naming the slot each fills.
+///
+/// The kernel refuses a message carrying a null cap slot, so a round whose
+/// consumer reads its caps by position cannot carry an absent cap as `0`.
+/// Such a round transfers [`PackedSlots::caps`] and carries
+/// [`PackedSlots::presence`] in `data[0]`: bit `i` is set when slot `i`
+/// holds a cap. The child spreads the caps back over their slots with
+/// [`unpack_slots`].
+pub struct PackedSlots
+{
+    caps: [u32; MSG_CAP_SLOTS_MAX],
+    cap_count: usize,
+    presence: u64,
+}
+
+impl PackedSlots
+{
+    /// The caps the round transfers, in slot order, none of them `0`.
+    #[must_use]
+    pub fn caps(&self) -> &[u32]
+    {
+        &self.caps[..self.cap_count]
+    }
+
+    /// The presence word, carried in the round's `data[0]`.
+    #[must_use]
+    pub fn presence(&self) -> u64
+    {
+        self.presence
+    }
+}
+
+/// Pack positional `slots`, where `0` marks an absent cap, into the caps a
+/// round transfers and its presence word. Slots past `MSG_CAP_SLOTS_MAX`
+/// are not packed; the caller bounds its slot list to the round.
+#[must_use]
+pub fn pack_slots(slots: &[u32]) -> PackedSlots
+{
+    let mut packed = PackedSlots {
+        caps: [0; MSG_CAP_SLOTS_MAX],
+        cap_count: 0,
+        presence: 0,
+    };
+    for (i, &cap) in slots.iter().take(MSG_CAP_SLOTS_MAX).enumerate()
+    {
+        if cap != 0
+        {
+            packed.caps[packed.cap_count] = cap;
+            packed.cap_count += 1;
+            packed.presence |= 1 << i;
+        }
+    }
+    packed
+}
+
+/// Spread a received round's caps over its positional slots by the presence
+/// word in `data[0]`: slot `i` takes the next delivered cap when bit `i` is
+/// set and is `0` otherwise.
+///
+/// # Errors
+/// [`bootstrap_errors::INVALID`] when the round carries no presence word,
+/// the word sets a bit at or above `MSG_CAP_SLOTS_MAX`, or it names a
+/// different number of caps than the round delivered.
+pub fn unpack_slots(round: &BootstrapRound) -> Result<[u32; MSG_CAP_SLOTS_MAX], u64>
+{
+    if round.data_words == 0
+    {
+        return Err(bootstrap_errors::INVALID);
+    }
+    let presence = round.data[0];
+    if presence >> MSG_CAP_SLOTS_MAX != 0 || presence.count_ones() as usize != round.cap_count
+    {
+        return Err(bootstrap_errors::INVALID);
+    }
+    let mut slots = [0u32; MSG_CAP_SLOTS_MAX];
+    let mut next = round.caps[..round.cap_count].iter();
+    for (i, slot) in slots.iter_mut().enumerate()
+    {
+        if presence & (1 << i) != 0
+        {
+            *slot = next.next().copied().ok_or(bootstrap_errors::INVALID)?;
+        }
+    }
+    Ok(slots)
+}
+
 // ── Child side ──────────────────────────────────────────────────────────────
 
 /// Request the next bootstrap round from the creator.
@@ -245,4 +334,83 @@ pub unsafe fn serve_round(
 
     // SAFETY: same invariant.
     unsafe { reply_round(done, caps, data, ipc_buf) }.map_err(|_| bootstrap_errors::INVALID)
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// The round a child receives for `packed`, as `request_round` builds it.
+    fn received(packed: &PackedSlots) -> BootstrapRound
+    {
+        let mut round = BootstrapRound {
+            caps: [0; MSG_CAP_SLOTS_MAX],
+            cap_count: packed.caps().len(),
+            data: [0; MSG_DATA_WORDS_MAX],
+            data_words: 1,
+            done: true,
+        };
+        round.caps[..packed.caps().len()].copy_from_slice(packed.caps());
+        round.data[0] = packed.presence();
+        round
+    }
+
+    #[test]
+    fn slots_round_trip_with_every_slot_present_or_absent()
+    {
+        for mask in 0u32..(1 << MSG_CAP_SLOTS_MAX)
+        {
+            let mut slots = [0u32; MSG_CAP_SLOTS_MAX];
+            for (i, slot) in slots.iter_mut().enumerate()
+            {
+                if mask & (1 << i) != 0
+                {
+                    *slot = 0x40 + i as u32;
+                }
+            }
+            let packed = pack_slots(&slots);
+            assert_eq!(unpack_slots(&received(&packed)), Ok(slots));
+        }
+    }
+
+    // The kernel refuses a message carrying a null cap slot, so an absent
+    // slot must leave the cap list rather than ride in it as `0`.
+    #[test]
+    fn an_absent_slot_is_left_off_the_cap_list()
+    {
+        let packed = pack_slots(&[0x41, 0, 0x43]);
+        assert_eq!(packed.caps(), &[0x41, 0x43]);
+        assert_eq!(packed.presence(), 0b101);
+    }
+
+    #[test]
+    fn a_round_without_its_presence_word_is_invalid()
+    {
+        let mut round = received(&pack_slots(&[0x41]));
+        round.data_words = 0;
+        assert_eq!(unpack_slots(&round), Err(bootstrap_errors::INVALID));
+    }
+
+    #[test]
+    fn a_presence_word_disagreeing_with_the_delivered_caps_is_invalid()
+    {
+        let mut more_bits = received(&pack_slots(&[0x41]));
+        more_bits.data[0] = 0b11;
+        assert_eq!(unpack_slots(&more_bits), Err(bootstrap_errors::INVALID));
+
+        let mut fewer_bits = received(&pack_slots(&[0x41, 0x42]));
+        fewer_bits.data[0] = 0b01;
+        assert_eq!(unpack_slots(&fewer_bits), Err(bootstrap_errors::INVALID));
+    }
+
+    #[test]
+    fn a_presence_bit_with_no_slot_is_invalid()
+    {
+        let mut round = received(&pack_slots(&[0x41]));
+        round.cap_count = 2;
+        round.caps[1] = 0x42;
+        round.data[0] = 0b1 | (1 << MSG_CAP_SLOTS_MAX);
+        assert_eq!(unpack_slots(&round), Err(bootstrap_errors::INVALID));
+    }
 }

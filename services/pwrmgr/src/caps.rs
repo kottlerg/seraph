@@ -47,22 +47,9 @@ pub fn request_bootstrap(info: &StartupInfo, ipc_buf: *mut u64) -> Option<Bootst
     }
     // SAFETY: `ipc_buf` is the kernel-registered per-thread IPC buffer.
     let round = unsafe { ipc::bootstrap::request_round(creator, ipc_buf) }.ok()?;
-    let service_ep = if round.cap_count >= 1
-    {
-        round.caps[0]
-    }
-    else
-    {
-        0
-    };
-    let devmgr_registry = if round.cap_count >= 2
-    {
-        round.caps[1]
-    }
-    else
-    {
-        0
-    };
+    // Only the present caps ride, named by the round's presence word; an
+    // absent slot decodes as `0`.
+    let [service_ep, devmgr_registry, ..] = ipc::bootstrap::unpack_slots(&round).ok()?;
     Some(Bootstrap {
         service_ep,
         devmgr_registry,

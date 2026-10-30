@@ -195,7 +195,7 @@ column). The handover endowment and
 | `svcmgr` | svcmgr (its own service ep) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) | yes |
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
 | `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
-| `devmgr.test` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| ORPHAN_TEST_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by svctest only; TODO(#165)) | no |
+| `devmgr.test` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| TEST_LABEL_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by svctest only; TODO(#165)) | no |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint | no |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) | yes |
 | `timed` | svcmgr (`timed.svc` [provider](docs/service-definitions.md)) | SEND on timed's service endpoint | yes |

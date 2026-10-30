@@ -14,7 +14,11 @@
 //! driver's `UNAUTHORIZED` at once, without blocking for input or consuming
 //! a byte. The serial and input drivers are part of every boot's device set;
 //! the framebuffer case skips on a headless boot (CI's), where devmgr runs no
-//! framebuffer driver. TODO(#165): retire with the devmgr test labels.
+//! framebuffer driver. The input case also skips when the `terminal` recipe
+//! is staged: the input driver serves one request at a time, and the
+//! terminal keeps a blocking `INPUT_READ_EVENTS` pending, so svctest's call
+//! would wait behind it for a keypress. TODO(#165): retire with the devmgr
+//! test labels.
 
 use std::time::Duration;
 
@@ -35,6 +39,10 @@ pub fn phases() -> &'static [Phase]
 /// wait at about 5 s. devmgr spawns the serial and framebuffer drivers
 /// before it serves any query, so one attempt settles those.
 const INPUT_ATTEMPTS: u32 = 500;
+
+/// The recipe that starts the terminal, the system's other input reader
+/// (programs/terminal/README.md), when it is staged for this boot.
+const TERMINAL_RECIPE: &str = "/config/svcmgr/services/terminal.svc";
 
 /// A no-authority SEND on the driver `query_label` names, from devmgr's
 /// `TEST_QUERY_DENY_DEVICE`, or `None` when devmgr still reports
@@ -103,22 +111,29 @@ fn verb_bit_deny_phase(caps: &Caps)
     assert_denied(serial, &notify, unauth, "SERIAL_REGISTER_RX_NOTIFY");
     let _ = syscall::cap_delete(serial);
 
-    let input = deny_send(
-        devmgr,
-        ipc::devmgr_labels::QUERY_INPUT_DEVICE,
-        "input",
-        INPUT_ATTEMPTS,
-    )
-    .expect("drivers deny: no input driver");
-    // A granted read blocks until a key arrives; the deny must not.
-    let read = ipc::IpcMessage::new(ipc::input_labels::INPUT_READ_EVENTS);
-    assert_denied(
-        input,
-        &read,
-        ipc::input_errors::UNAUTHORIZED,
-        "INPUT_READ_EVENTS",
-    );
-    let _ = syscall::cap_delete(input);
+    if std::fs::metadata(TERMINAL_RECIPE).is_ok()
+    {
+        std::os::seraph::log!("drivers deny: input case skipped: terminal staged as a reader");
+    }
+    else
+    {
+        let input = deny_send(
+            devmgr,
+            ipc::devmgr_labels::QUERY_INPUT_DEVICE,
+            "input",
+            INPUT_ATTEMPTS,
+        )
+        .expect("drivers deny: no input driver");
+        // A granted read blocks until a key arrives; the deny must not.
+        let read = ipc::IpcMessage::new(ipc::input_labels::INPUT_READ_EVENTS);
+        assert_denied(
+            input,
+            &read,
+            ipc::input_errors::UNAUTHORIZED,
+            "INPUT_READ_EVENTS",
+        );
+        let _ = syscall::cap_delete(input);
+    }
 
     let Some(fb) = deny_send(
         devmgr,

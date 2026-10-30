@@ -55,7 +55,7 @@ and svcmgr decodes with.
 svcmgr mints the `devmgr.registry` publish cap
 (`REGISTRY_QUERY_AUTHORITY`), the `devmgr.shutdown` and `devmgr.test`
 publish caps (`REGISTRY_QUERY_AUTHORITY` plus `SHUTDOWN_DEVICE_AUTHORITY`
-or `ORPHAN_TEST_AUTHORITY`), and the `SET_DRIVERS_DIR` cap
+or `TEST_LABEL_AUTHORITY`), and the `SET_DRIVERS_DIR` cap
 (`DRIVERS_DIR_AUTHORITY`) from the devmgr-registry source. A version
 mismatch in `data[1]`, or a malformed `CAPS` round, aborts bootstrap
 (svcmgr exits).

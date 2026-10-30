@@ -8,7 +8,7 @@
 //!
 //! The deny phases send the gated labels on `devmgr.registry`, a cap
 //! carrying `REGISTRY_QUERY_AUTHORITY` but none of `BLOCK_DEVICE_AUTHORITY`,
-//! `SHUTDOWN_DEVICE_AUTHORITY`, and `ORPHAN_TEST_AUTHORITY`, and assert
+//! `SHUTDOWN_DEVICE_AUTHORITY`, and `TEST_LABEL_AUTHORITY`, and assert
 //! `UNAUTHORIZED`: such a holder cannot acquire the whole-disk block cap or
 //! the platform shutdown actuators, or drive the test shim.
 //!
@@ -223,7 +223,7 @@ fn orphan_teardown_phase(caps: &Caps)
     );
 }
 
-/// The test labels on `devmgr.registry` (no `ORPHAN_TEST_AUTHORITY`) reply
+/// The test labels on `devmgr.registry` (no `TEST_LABEL_AUTHORITY`) reply
 /// `UNAUTHORIZED`.
 fn test_label_deny_phase(caps: &Caps)
 {
@@ -231,12 +231,18 @@ fn test_label_deny_phase(caps: &Caps)
         caps,
         ipc::devmgr_labels::TEST_SPAWN_ORPHAN,
         "TEST_SPAWN_ORPHAN",
-        "ORPHAN_TEST_AUTHORITY",
+        "TEST_LABEL_AUTHORITY",
     );
     assert_registry_denies(
         caps,
         ipc::devmgr_labels::TEST_ORPHAN_RESULT,
         "TEST_ORPHAN_RESULT",
-        "ORPHAN_TEST_AUTHORITY",
+        "TEST_LABEL_AUTHORITY",
+    );
+    assert_registry_denies(
+        caps,
+        ipc::devmgr_labels::TEST_QUERY_DENY_DEVICE,
+        "TEST_QUERY_DENY_DEVICE",
+        "TEST_LABEL_AUTHORITY",
     );
 }

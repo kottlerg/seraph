@@ -654,7 +654,7 @@ fn main() -> !
             }
             // TODO(#165): remove with the devmgr enumeration redesign.
             // Test-only fault injection for #176, gated on
-            // ORPHAN_TEST_AUTHORITY. The forced-failure spawn does nested
+            // TEST_LABEL_AUTHORITY. The forced-failure spawn does nested
             // `ipc_call`s that would clobber the implicit reply context, so
             // ack first (mirroring SET_DRIVERS_DIR), then run the spawn and
             // stash the outcome for TEST_ORPHAN_RESULT.
@@ -722,11 +722,11 @@ fn main() -> !
 
 /// TODO(#165): remove with the test labels. Admit a `TEST_SPAWN_ORPHAN`,
 /// `TEST_ORPHAN_RESULT`, or `TEST_QUERY_DENY_DEVICE` request: the badge
-/// carries `ORPHAN_TEST_AUTHORITY` and `data[0]` is `DEVMGR_LABELS_VERSION`.
+/// carries `TEST_LABEL_AUTHORITY` and `data[0]` is `DEVMGR_LABELS_VERSION`.
 /// Otherwise reply the rejection and return `false`.
 fn test_label_admitted(msg: &IpcMessage, badge: u64, ipc_buf: *mut u64) -> bool
 {
-    if badge & ipc::devmgr_labels::ORPHAN_TEST_AUTHORITY == 0
+    if badge & ipc::devmgr_labels::TEST_LABEL_AUTHORITY == 0
     {
         reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
         return false;
@@ -1097,7 +1097,6 @@ fn locate_acpi_table(
     Some((region, table_phys))
 }
 
-/// Send a bodyless status reply (no caps) on the current request.
 /// TODO(#165): remove with `TEST_QUERY_DENY_DEVICE`. Reply with a SEND on
 /// `driver_ep` badged `TEST_DENY_BADGE`, which carries none of the driver's
 /// verb bits; `NO_DEVICE` when the driver is not running (`driver_ep == 0`)
@@ -1126,6 +1125,7 @@ fn reply_deny_send(driver_ep: u32, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+/// Send a bodyless status reply (no caps) on the current request.
 fn reply_status(code: u64, ipc_buf: *mut u64)
 {
     let reply = IpcMessage::new(code);

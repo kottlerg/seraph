@@ -13,7 +13,10 @@
 //! When the creator sets the `done` flag, the child stops.
 //!
 //! Per-(creator, child-type) payload formats are defined in each child's
-//! crate. This module only implements the generic protocol.
+//! crate. Beside the generic protocol, this module owns one shared payload
+//! codec: [`pack_slots`] / [`unpack_slots`], for a round whose caps fill
+//! positional slots that may be absent (the rounds svcmgr serves the
+//! children it launches).
 
 // When this crate is compiled as a std dep via rustc-dep-of-std, the
 // crate root is `no_core` and the usual prelude is not auto-imported.

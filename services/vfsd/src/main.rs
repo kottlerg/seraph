@@ -392,7 +392,23 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
 
         match opcode
         {
-            ipc::vfsd_labels::MOUNT => handle_mount_request(&recv, ipc_buf, rt),
+            ipc::vfsd_labels::MOUNT =>
+            {
+                // Verb-bit gate (docs/capability-model.md): MOUNT spawns a
+                // driver and installs a mount, so only a MOUNT_AUTHORITY
+                // badge reaches the handler.
+                if badge & ipc::vfsd_labels::MOUNT_AUTHORITY == 0
+                {
+                    std::os::seraph::log!("MOUNT rejected: badge lacks MOUNT_AUTHORITY");
+                    let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
+                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+                }
+                else
+                {
+                    handle_mount_request(&recv, ipc_buf, rt);
+                }
+            }
             ipc::vfsd_labels::GET_SYSTEM_ROOT_CAP =>
             {
                 if badge & ipc::vfsd_labels::SEED_AUTHORITY == 0

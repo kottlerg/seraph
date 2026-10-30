@@ -3,7 +3,7 @@
 
 // services/svctest/src/bootstrap.rs
 
-//! Decode the creator-endpoint bootstrap round into a typed [`Caps`].
+//! Decode the creator-endpoint bootstrap rounds into a typed [`Caps`].
 //!
 //! Slot layout (set by whichever launcher minted the rounds, each of which
 //! carries only its window's present caps and names the slot each fills in
@@ -26,21 +26,25 @@
 //!     fault-injection shim in the devmgr orphan-teardown phase, and
 //!     `TEST_QUERY_DENY_DEVICE` in the drivers deny phase. TODO(#165):
 //!     retire with those labels.
+//!   * `caps[4]`: `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint
+//!     (`vfsd.mount`). Drives the vfsd `MOUNT` rejection phases.
+//!   * `caps[5]`: `DENY_BADGE`-badged SEND on vfsd's service endpoint
+//!     (`vfsd.deny`), carrying no verb bit. Drives the vfsd `MOUNT` deny
+//!     phase.
 //!
-//!   * `caps[4]`: the no-authority pwrmgr SEND (`pwrmgr.deny`). It is the
-//!     fifth seed, so svcmgr delivers it in a second round: every svctest
-//!     boot exercises a seed list longer than one round, and the
-//!     `svcmgr_second_seed_round` phase fails the run when slot 4 is empty.
+//! Slots 4 and 5 ride in a second round, so every svctest boot exercises a
+//! seed list longer than one round, and the `svcmgr_second_seed_round`
+//! phase fails the run when either is empty.
 //!
-//! `pwrmgr.deny` is also public, and the pwrmgr cap-deny phase uses the
-//! copy svctest resolves through `QUERY_ENDPOINT` (zero when pwrmgr is
-//! absent).
+//! The no-authority pwrmgr SEND (`pwrmgr.deny`) is public, so svctest
+//! resolves it through `QUERY_ENDPOINT` rather than spending a seed slot
+//! on it (zero when pwrmgr is absent).
 //!
 //! svctest requests the rounds from `info.creator_endpoint`; if no
 //! creator endpoint is present (`== 0`), every slot stays zero. The `ns`
 //! phase then skips; the phases that assert on a slot (the devmgr deny,
-//! orphan-teardown, drivers deny, svcmgr seed-only and second-seed-round
-//! phases) fail, per README § Run Sequence. The pwrmgr cap-deny phase reads
+//! orphan-teardown, drivers deny, svcmgr seed-only, second-seed-round and
+//! vfsd phases) fail, per README § Run Sequence. The pwrmgr cap-deny phase reads
 //! no slot: it skips only when its queried `pwrmgr.deny` cap is zero.
 
 use std::os::seraph::startup_info;
@@ -64,9 +68,12 @@ pub struct Caps
     /// `TEST_SPAWN_ORPHAN` shim and `TEST_QUERY_DENY_DEVICE`. TODO(#165):
     /// retire with those labels.
     pub devmgr_test: u32,
-    /// `pwrmgr.deny`, seeded in slot 4: the second-round seed whose
-    /// arrival the `svcmgr_second_seed_round` phase checks.
-    pub pwrmgr_deny_seed: u32,
+    /// `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint
+    /// (`vfsd.mount`), in slot 4.
+    pub vfsd_mount: u32,
+    /// `DENY_BADGE`-badged SEND on vfsd's service endpoint (`vfsd.deny`),
+    /// in slot 5.
+    pub vfsd_deny: u32,
 }
 
 /// Drain the bootstrap rounds from `creator_endpoint` and pull caps out,
@@ -94,7 +101,7 @@ fn request_round() -> Caps
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by
     // the boot protocol.
-    // Five seeds take two rounds; an absent slot decodes as `0`, and a
+    // Six seeds take two rounds; an absent slot decodes as `0`, and a
     // round that does not decode leaves every slot `0`.
     let Ok(
         [
@@ -102,9 +109,10 @@ fn request_round() -> Caps
             pwrmgr_auth,
             devmgr_registry,
             devmgr_test,
-            pwrmgr_deny_seed,
+            vfsd_mount,
+            vfsd_deny,
         ],
-    ) = (unsafe { ipc::bootstrap::request_slots::<5>(info.creator_endpoint, ipc_buf) })
+    ) = (unsafe { ipc::bootstrap::request_slots::<6>(info.creator_endpoint, ipc_buf) })
     else
     {
         return caps;
@@ -113,7 +121,8 @@ fn request_round() -> Caps
     caps.pwrmgr_auth = pwrmgr_auth;
     caps.devmgr_registry = devmgr_registry;
     caps.devmgr_test = devmgr_test;
-    caps.pwrmgr_deny_seed = pwrmgr_deny_seed;
+    caps.vfsd_mount = vfsd_mount;
+    caps.vfsd_deny = vfsd_deny;
 
     caps
 }

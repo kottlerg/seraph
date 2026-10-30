@@ -41,9 +41,9 @@ and svcmgr decodes with.
 
 **First rounds — `CAPS` (`data[0] = 1`, not terminal):** a positional
 slot list, split into windows of `MSG_CAP_SLOTS_MAX` slots, one `CAPS`
-round per window (`ipc::bootstrap::slot_rounds`); the four slots below
-take one round, and a longer list takes more with no change to the
-encoding.
+round per window (`ipc::bootstrap::slot_rounds`); the six slots below
+take two rounds (slots 0-3, then 4-5), and a longer list takes more with
+no change to the encoding.
 
 | Field | Value |
 |---|---|
@@ -51,9 +51,11 @@ encoding.
 | slot 1 | svcmgr's own bootstrap endpoint (RECV — serves launched/restarted children; required) |
 | slot 2 | SEND on the root filesystem's namespace endpoint (published as `rootfs.root`; absent if init could not derive it) |
 | slot 3 | `SEND\|GRANT`, badge-0 source on devmgr's registry endpoint (absent if init holds none or its derive fails) |
+| slot 4 | `vfsd_labels::MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.mount`; absent if its derive fails) |
+| slot 5 | `vfsd_labels::DENY_BADGE`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.deny`; absent if its derive fails) |
 | caps[..] | the present slots of the round's window, in slot order |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `8`) handshake, in every `CAPS` round |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `9`) handshake, in every `CAPS` round |
 | data[2] | presence word, relative to the round's window: bit `i` is set when window slot `i` is present |
 | data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 
@@ -61,7 +63,9 @@ svcmgr mints the `devmgr.registry` publish cap
 (`REGISTRY_QUERY_AUTHORITY`), the `devmgr.shutdown` and `devmgr.test`
 publish caps (`REGISTRY_QUERY_AUTHORITY` plus `SHUTDOWN_DEVICE_AUTHORITY`
 or `TEST_LABEL_AUTHORITY`), and the `SET_DRIVERS_DIR` cap
-(`DRIVERS_DIR_AUTHORITY`) from the devmgr-registry source. A version
+(`DRIVERS_DIR_AUTHORITY`) from the devmgr-registry source, and publishes
+the two vfsd SENDs as they arrive (their badges ride through to the
+seeding recipe unchanged). A version
 mismatch in `data[1]`, or a malformed `CAPS` round (including one past the
 rounds the list takes, one whose rounds-left word disagrees with them, one
 that carries a slot past the list, or a last round that leaves a required

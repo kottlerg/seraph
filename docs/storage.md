@@ -148,7 +148,8 @@ Three actors cooperate to bring a filesystem online:
 **init** holds the un-badged vfsd service endpoint it created plus a
 `SEED_AUTHORITY`-badged SEND derived from it (required by the
 `GET_SYSTEM_ROOT_CAP` gate). Init issues no `MOUNT` — vfsd
-self-mounts root. Init pulls the system root via
+self-mounts root; the `MOUNT_AUTHORITY`-badged SEND it endows svcmgr
+with (published as `vfsd.mount`) reaches only svctest. Init pulls the system root via
 `GET_SYSTEM_ROOT_CAP` (which vfsd serves only once root is mounted, so
 the call blocks until the root filesystem is up), then distributes
 per-child copies on every spawn via

@@ -10,16 +10,14 @@ against the substrate registrations init delivers in the handover
 endowment to either supervise the running instance or launch a fresh
 one ([docs/service-definitions.md](docs/service-definitions.md) § Reconciliation).
 
-svcmgr also owns the system-wide discovery registry: it publishes the
-well-known names it owns (`rootfs.root`, `svcmgr`, `devmgr.registry`,
-`devmgr.shutdown`, `devmgr.test`, and each provider's `provides` names like
-`pwrmgr.shutdown` / `timed`) into the registry itself — from the source caps init endows it with at
-handover, and from each provider's launch. Consumers resolve any name
-through their `.svc` `seed = ...` line at launch time, and the public
-names (`svcmgr`, `pwrmgr.deny`, `timed`) also via `QUERY_ENDPOINT`; a
-name whose cap carries authority is seed-only, so `QUERY_ENDPOINT`
-answers it `UNKNOWN_NAME`. The endowment and registry wire format are in
-[docs/ipc-interface.md](docs/ipc-interface.md).
+svcmgr also owns the system-wide discovery registry: it publishes the well-known names it owns
+(`rootfs.root`, `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`, `vfsd.mount`,
+`vfsd.deny`, and each provider's `provides` names like `pwrmgr.shutdown` / `timed`) into the
+registry itself — from the source caps init endows it with at handover, and from each provider's
+launch. Consumers resolve any name through their `.svc` `seed = ...` line at launch time, and the
+public names (`svcmgr`, `pwrmgr.deny`, `timed`) also via `QUERY_ENDPOINT`; a name whose cap carries
+authority is seed-only, so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. The endowment and registry
+wire format are in [docs/ipc-interface.md](docs/ipc-interface.md).
 
 A raw-syscall fallback that lets svcmgr recreate procmgr if procmgr
 itself crashes is design intent; not yet implemented (#26); svcmgr holds no
@@ -159,7 +157,7 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test pwrmgr.deny
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test vfsd.mount vfsd.deny
 ```
 
 Recognised keys: `binary` (required), `argv`, `env`, `restart`
@@ -177,7 +175,7 @@ in the host-tested `svc-defs` crate.
 ## Cap publication
 
 svcmgr publishes every well-known name into its own registry — there is
-no init-side `PUBLISH_ENDPOINT` traffic. The first five are published in
+no init-side `PUBLISH_ENDPOINT` traffic. The first seven are published in
 `main()` right after the endowment is drained, from the source caps init
 endows svcmgr with at handover; the provider names are published on each
 provider's launch path from its `provides` line
@@ -196,6 +194,8 @@ column). The handover endowment and
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
 | `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
 | `devmgr.test` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| TEST_LABEL_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by svctest only; TODO(#165)) | no |
+| `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest only) | no |
+| `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint | no |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) | yes |
 | `timed` | svcmgr (`timed.svc` [provider](docs/service-definitions.md)) | SEND on timed's service endpoint | yes |

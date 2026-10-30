@@ -39,18 +39,24 @@ pub fn phases() -> &'static [Phase]
     ]
 }
 
-/// The recipe's fifth seed (`pwrmgr.deny`) fills slot 4, which svcmgr serves
-/// in a second bootstrap round, since one round carries at most
-/// `MSG_CAP_SLOTS_MAX` caps. An empty slot 4 means the seed list lost its
-/// second round (or the public name did not resolve).
+/// The recipe's fifth and sixth seeds (`vfsd.mount`, `vfsd.deny`) fill
+/// slots 4 and 5, which svcmgr serves in a second bootstrap round, since one
+/// round carries at most `MSG_CAP_SLOTS_MAX` caps. An empty slot there means
+/// the seed list lost its second round (or the name did not resolve).
 fn svcmgr_second_seed_round_phase(caps: &Caps)
 {
-    assert_ne!(
-        caps.pwrmgr_deny_seed, 0,
-        "svcmgr_second_seed_round: slot 4 (pwrmgr.deny) empty: second seed round lost or name \
-         unresolved"
-    );
-    std::os::seraph::log!("svcmgr second-seed-round phase passed (slot 4 present)");
+    for (slot, cap, shown) in [
+        (4, caps.vfsd_mount, "vfsd.mount"),
+        (5, caps.vfsd_deny, "vfsd.deny"),
+    ]
+    {
+        assert_ne!(
+            cap, 0,
+            "svcmgr_second_seed_round: slot {slot} ({shown}) empty: second seed round lost or \
+             name unresolved"
+        );
+    }
+    std::os::seraph::log!("svcmgr second-seed-round phase passed (slots 4 and 5 present)");
 }
 
 /// The registry SEND procmgr installed in svctest's `ProcessInfo`, and the
@@ -180,7 +186,7 @@ fn svcmgr_published_send_badged_phase(_caps: &Caps)
 
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
-/// cap. svctest's own non-zero seeds show four of the refused names are
+/// cap. svctest's own non-zero seeds show six of the refused names are
 /// published; `devmgr.shutdown`, which only pwrmgr seeds, is published by
 /// the same loop as `devmgr.registry` and `devmgr.test`. A queryable
 /// seed-only name would hand its authority to every process.
@@ -191,6 +197,8 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         (caps.pwrmgr_auth, "pwrmgr.shutdown"),
         (caps.devmgr_registry, "devmgr.registry"),
         (caps.devmgr_test, "devmgr.test"),
+        (caps.vfsd_mount, "vfsd.mount"),
+        (caps.vfsd_deny, "vfsd.deny"),
     ]
     {
         assert_ne!(cap, 0, "svcmgr_seed_only_names_refused: no {shown} seed");
@@ -209,6 +217,8 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         ipc::published_names::DEVMGR_REGISTRY,
         ipc::published_names::DEVMGR_SHUTDOWN,
         ipc::published_names::DEVMGR_TEST,
+        ipc::published_names::VFSD_MOUNT,
+        ipc::published_names::VFSD_DENY,
     ]
     {
         let reply = query(name);
@@ -247,5 +257,5 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
             let _ = syscall::cap_delete(cap);
         }
     }
-    std::os::seraph::log!("svcmgr seed-only phase passed (5 refused, 2 public resolved)");
+    std::os::seraph::log!("svcmgr seed-only phase passed (7 refused, 2 public resolved)");
 }

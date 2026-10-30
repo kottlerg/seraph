@@ -96,14 +96,22 @@ carry no rights (a parent with none of the file rights) is refused with
   `reload_sector` reads one sector from the device past the cache and
   refreshes the cached copy; a failed `FS_REMOVE` or `FS_RENAME` whose
   8.3 slot write failed uses it to learn whether that slot was deleted.
+  A slot whose page went to a client through `FS_READ_MEMORY` is reused
+  only once `SYS_CAP_INFO`'s mappings count shows the cache's own mapping
+  alone. A page a client still maps is quarantined, and the slot gets a
+  replacement page. The cache takes at most 32 pages beyond its slots for
+  replacements, past which a still-mapped slot stays out of service (`src/cache.rs` module
+  docs; [fs-driver-protocol.md § Label 8](../docs/fs-driver-protocol.md#label-8-fs_release_memory)).
 * **NodeTable** (`src/backend.rs`): dedupes by on-disk slot
   `(sector_lba, offset_in_sector)`; two distinct on-disk entries
   always allocate distinct `NodeId`s, even when both are empty files
   at cluster 0. `FS_REMOVE` and `FS_RENAME` invalidate the entry for
   the unlinked slot.
-* **Eviction worker** (`src/eviction.rs`): unchanged from the read-side
-  cooperative-release design; outstanding write paths return their
-  caps before reply so they do not create new eviction pressure.
+* **Eviction worker** (`src/eviction.rs`): the read-side cooperative release.
+  It sends `FS_RELEASE_MEMORY`, waits up to 100 ms for the ack, then revokes the
+  page's caps and drops the slot. Reuse of the slot is then subject to the page
+  cache's mapping check above. Outstanding write paths return their caps before
+  reply, so they create no eviction pressure.
 
 ---
 

@@ -11,7 +11,8 @@
 //! `core/kernel/docs/memory-internals.md` § Frame Map Table. The table is the
 //! kernel's answer to "is this frame mapped into any address space now", which
 //! `cap::retype::retype_allocate` asks before it carves a page into kernel
-//! objects (docs/capability-model.md § Typed Memory).
+//! objects (docs/capability-model.md § Typed Memory), and whose per-region sum
+//! `SYS_CAP_INFO`'s `CAP_INFO_MEMORY_MAPPINGS` reports to a Memory cap's holder.
 //!
 //! Storage is two-level: [`MAX_CHUNKS`] chunk pointers in BSS, each naming a
 //! 1 MiB buddy block of [`FRAMES_PER_CHUNK`] `AtomicU32` counters that covers
@@ -146,6 +147,26 @@ impl FrameMap
         }
         false
     }
+
+    /// The sum of the counts of every frame of `[phys, phys + len)`,
+    /// saturating at `u64::MAX`; an untracked frame counts zero.
+    #[must_use]
+    pub fn mappings_in(&self, phys: u64, len: u64) -> u64
+    {
+        let p = PAGE_SIZE as u64;
+        let mut frame = phys & !(p - 1);
+        let end = phys.saturating_add(len);
+        let mut total: u64 = 0;
+        while frame < end
+        {
+            if let Some(c) = self.counter(frame)
+            {
+                total = total.saturating_add(u64::from(c.load(Ordering::SeqCst)));
+            }
+            frame += p;
+        }
+        total
+    }
 }
 
 #[cfg(not(test))]
@@ -234,6 +255,14 @@ pub fn lower(phys: u64)
 pub fn any_mapped(phys: u64, len: u64) -> bool
 {
     FRAME_MAP.any_mapped(phys, len)
+}
+
+/// The sum of [`FRAME_MAP`]'s counts over the frames of `[phys, phys + len)`
+/// (`SYS_CAP_INFO` with `CAP_INFO_MEMORY_MAPPINGS`).
+#[must_use]
+pub fn mappings_in(phys: u64, len: u64) -> u64
+{
+    FRAME_MAP.mappings_in(phys, len)
 }
 
 /// Runs of frames whose leaf mappings a walk has cleared and whose counts are
@@ -343,6 +372,23 @@ mod tests
         assert!(!map.any_mapped(frame + P, 8 * P), "a range past the frame");
         map.lower(frame);
         assert!(!map.any_mapped(frame, P));
+    }
+
+    #[test]
+    fn mappings_in_sums_every_frame_of_the_range()
+    {
+        let map = table_with_gib_one();
+        let base = 1 << 30;
+        map.raise(base).unwrap();
+        map.raise(base + 2 * P).unwrap();
+        map.raise(base + 2 * P).unwrap();
+        assert_eq!(map.mappings_in(base, 3 * P), 3);
+        assert_eq!(map.mappings_in(base + P, P), 0, "a frame with no mapping");
+        assert_eq!(
+            map.mappings_in(base - P, 2 * P),
+            1,
+            "an untracked frame below the chunk counts zero"
+        );
     }
 
     #[test]

@@ -180,6 +180,16 @@ at least one observes the other, so a page is never both carved and mapped. Rety
 free list need no check: their bytes lie below the cursor, which no mapping can reach once the
 cursor has passed them, and the cursor passed them only after the check.
 
+**Revoke check.** `SYS_CAP_INFO` with `CAP_INFO_MEMORY_MAPPINGS` sums a Memory region's counts,
+so a server that hands a page out can tell when the client's mappings are gone. For that, a
+revoke of the client's capability must stop new mappings, including a `SYS_MEM_MAP` already
+past its first handle lookup. After pinning its frames and fencing, `SYS_MEM_MAP` resolves the
+Memory handle a second time, and it refuses the map with `InvalidCapability` if the slot no
+longer names the same object. A revoke clears the slot under its CSpace's lock before the
+issuer's later `CAP_INFO_MEMORY_MAPPINGS`, which fences before it reads the counts. Either the
+second lookup sees the cleared slot, or the issuer's count sees the pins and then every leaf
+the map installs. The query reads one count per page of the region, at most 512 pages.
+
 **Storage.** The table is two-level: 256 chunk pointers in BSS, one per GiB of physical address
 space (covering the ~248 GiB the boot table pool can direct-map), each naming a 1 MiB buddy block
 of 262144 counters. Phase 4 allocates a chunk for every GiB the DRAM span touches, before the

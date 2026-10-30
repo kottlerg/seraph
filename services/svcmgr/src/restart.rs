@@ -21,6 +21,7 @@
 use crate::REGISTRY_CAPACITY;
 use crate::definitions::launch::{
     LaunchKind, assemble_boot_caps, delete_caps, mint_logd_boot_caps, resolve_seeds,
+    serve_boot_slots,
 };
 use crate::definitions::{build_blob, cwd_rights};
 use crate::service::{MAX_RESTARTS, POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
@@ -442,18 +443,7 @@ fn restart_process(
         return false;
     };
 
-    // SAFETY: ctx.ipc_buf is the registered IPC buffer.
-    if unsafe {
-        ipc::bootstrap::serve_round(
-            ctx.bootstrap_ep,
-            child_badge,
-            ctx.ipc_buf,
-            true,
-            &boot_caps,
-            &[],
-        )
-    }
-    .is_err()
+    if serve_boot_slots(ctx, child_badge, &boot_caps).is_err()
     {
         std::os::seraph::log!("bootstrap serve failed");
         // serve_round MOVES caps on success; on failure they may or

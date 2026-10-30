@@ -6,8 +6,9 @@
 # root-mount cap; pwrmgr.shutdown is the SHUTDOWN_AUTHORITY-tokened SEND;
 # devmgr.registry is the REGISTRY_QUERY_AUTHORITY SEND the devmgr deny
 # phases send the gated labels on; devmgr.test is the
-# REGISTRY_QUERY_AUTHORITY | ORPHAN_TEST_AUTHORITY SEND that drives the
-# orphan-teardown phase's TEST_SPAWN_ORPHAN shim (TODO(#165)). svctest
+# REGISTRY_QUERY_AUTHORITY | TEST_LABEL_AUTHORITY SEND that drives
+# devmgr's test labels: the orphan-teardown phase's TEST_SPAWN_ORPHAN shim
+# and the drivers deny phase's TEST_QUERY_DENY_DEVICE (TODO(#165)). svctest
 # resolves the public pwrmgr.deny no-auth twin itself via QUERY_ENDPOINT.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT

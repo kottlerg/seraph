@@ -36,6 +36,7 @@
 use crate::runner::Phase;
 
 pub mod devmgr;
+pub mod drivers;
 pub mod exit_code;
 pub mod fs_faults;
 pub mod fs_ipc;
@@ -83,6 +84,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(pwrmgr::deny_only());
     out.extend_from_slice(svcmgr::phases());
     out.extend_from_slice(timed::phases());
+    out.extend_from_slice(drivers::phases());
     out.extend_from_slice(memmgr::identity());
     out
 }

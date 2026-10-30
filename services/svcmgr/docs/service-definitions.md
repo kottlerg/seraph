@@ -210,8 +210,14 @@ bootstrap round carries at most `MSG_CAP_SLOTS_MAX` (currently 4) caps, and
 a `provides` service's provider RECV takes cap[0], so a recipe with more
 than 4 seeds, or more than 3 for a `provides` service, is a parser error.
 
-An unresolved name leaves slot `i` as `0`. Consumers that tolerate `cap == 0 → skip` continue to
-work; consumers that don't fail on first use, which is the right surface for a real
+An unresolved name leaves slot `i` absent. The kernel refuses a message carrying a null cap slot,
+so the round transfers only the present caps, in slot order, and carries a presence word in
+`data[0]`: bit `i` is set when slot `i` holds a cap (`ipc::bootstrap::pack_slots`). The child
+spreads the caps back over their slots with `ipc::bootstrap::unpack_slots`, which yields `0` for
+an absent slot and refuses a round whose word is missing, sets a bit at or above
+`MSG_CAP_SLOTS_MAX`, or names a different number of caps than the round delivered. The
+[`log_sink`](#log_sink) round uses the same encoding. Consumers that tolerate `cap == 0 → skip`
+continue to work; consumers that don't fail on first use, which is the right surface for a real
 misconfiguration. svctest does both: its `ns` phase skips on a zero cap, and its svcmgr seed-only
 phase fails the run on any unresolved seed (per
 [services/svctest/README.md § Run Sequence](../../svctest/README.md#run-sequence)).
@@ -231,7 +237,7 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name
 | `svcmgr` | svcmgr (its own service endpoint) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) | yes |
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
 | `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
-| `devmgr.test` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| ORPHAN_TEST_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by svctest only; TODO(#165)) | no |
+| `devmgr.test` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| TEST_LABEL_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by svctest only; TODO(#165)) | no |
 
 ## `provides`
 
@@ -271,12 +277,13 @@ A log-sink service's bootstrap round is **not** assembled from `seed` or
 at handover (the master-log endpoint source and the procmgr `SEND|GRANT`
 death-auth source — see
 [`process-lifecycle.md`](../../../docs/process-lifecycle.md)) plus the
-`devmgr.registry` source. The round is four positional caps:
+`devmgr.registry` source. The round has four positional slots, carried with a presence word as
+[`seed`](#seed) describes, so an absent slot rides as no cap:
 
 | Index | Cap |
 |---|---|
 | 0 | `RECV` on the master log endpoint |
-| 1 | `SEND` on the master log endpoint (single-use; the `HANDOVER_PULL` drain then the terminal `HANDOVER_RELEASE`, then deleted; see the [logd handover protocol](../../logd/docs/handover-protocol.md#call-shape)). `0` on a restart — no init-logd remains to pull from |
+| 1 | `SEND` on the master log endpoint (single-use; the `HANDOVER_PULL` drain then the terminal `HANDOVER_RELEASE`, then deleted; see the [logd handover protocol](../../logd/docs/handover-protocol.md#call-shape)). Absent on a restart — no init-logd remains to pull from |
 | 2 | badged `SEND\|GRANT` on procmgr carrying `DEATH_EQ_AUTHORITY` (logd registers per-sender death-notifications for slot reclaim; see [logd README](../../logd/README.md#bootstrap-caps)) |
 | 3 | badged `SEND` on devmgr's registry carrying `REGISTRY_QUERY_AUTHORITY` (logd resolves the serial driver via `QUERY_SERIAL_DEVICE`; see [logd README](../../logd/README.md#bootstrap-caps)) |
 
@@ -284,9 +291,10 @@ Because these slots are svcmgr-minted, `seed` and `provides` have no
 position in the round; declaring either alongside `log_sink = yes` is a
 parser error. The same svcmgr-minted round drives the first launch (`cap[1]`
 present, history pulled from init-logd per the
-[logd handover protocol](../../logd/docs/handover-protocol.md)). svcmgr holds
-the master-log source for the system's life, so the round is designed to also
-drive every restart (`cap[1] = 0`, history pull skipped), each relaunched logd
+[logd handover protocol](../../logd/docs/handover-protocol.md)). A slot whose source is absent
+from the endowment, or whose derive fails, is absent from the round; logd requires only `cap[0]`.
+svcmgr holds the master-log source for the system's life, so the round is designed to also
+drive every restart (`cap[1]` absent, history pull skipped), each relaunched logd
 re-attaching a fresh RECV to the same endpoint object every sender already
 targets, with `restart` and `critical` behaving as for any other service;
 design intent; not yet implemented (#262). Today, on a logd death svcmgr's

@@ -218,6 +218,11 @@ pub struct CSpace
     /// Slot 0 is permanently null and never placed on the free list, so the
     /// head index is always non-zero when present — encoded in the type.
     free_head: Option<NonZeroU32>,
+    /// Tail of the intrusive free list; None if no free slots. `grow`
+    /// appends a new leaf's slots here, so the slots a general allocation
+    /// leaves free for the IPC receive reserve are handed out before the new
+    /// leaf's and allocation order stays ascending across a grow.
+    free_tail: Option<NonZeroU32>,
     /// Number of slots currently on the free list (for O(1) `pre_allocate`).
     free_count: usize,
     /// Protects concurrent access to all `CSpace` state: the grow cursor, the
@@ -260,6 +265,7 @@ impl CSpace
             allocated_slots: 0,
             pool_exhaustions: 0,
             free_head: None,
+            free_tail: None,
             free_count: 0,
             lock: crate::sync::Spinlock::new(),
             kobj: AtomicPtr::new(core::ptr::null_mut()),
@@ -351,6 +357,10 @@ impl CSpace
         };
 
         self.free_head = next;
+        if next.is_none()
+        {
+            self.free_tail = None;
+        }
         if let Some(new_head) = next
             && let Some(head_slot) = self.slot_mut(new_head.get())
         {
@@ -480,10 +490,18 @@ impl CSpace
         // of pointer visibility.
         let base = leaf_idx * L2_SIZE;
         let start_slot = usize::from(leaf_idx == 0);
+        // Append the leaf's slots, ascending, after the current tail. The
+        // free slots a general allocation leaves for the IPC receive reserve
+        // are therefore handed out before the new leaf's, so allocation stays
+        // in ascending index order across a grow (a run of consecutive
+        // inserts gets consecutive indices, as `InitInfo`'s contiguous
+        // Memory-cap ranges require). The predecessor links make
+        // `remove_from_free_list` O(1).
+        let old_tail = self.free_tail;
+        let mut prev = old_tail;
+        let mut first: Option<NonZeroU32> = None;
         let mut new_free = 0usize;
-        let old_head = self.free_head;
-        let mut next = old_head;
-        for i in (start_slot..L2_SIZE).rev()
+        for i in start_slot..L2_SIZE
         {
             // `base + i >= 1`: `start_slot` skips slot 0 of the first leaf. A
             // zero index (unreachable) is left off the list — fail closed —
@@ -494,31 +512,34 @@ impl CSpace
             {
                 continue;
             };
+            let next = if i + 1 < L2_SIZE
+            {
+                NonZeroU32::new((base + i + 1) as u32)
+            }
+            else
+            {
+                None
+            };
             page.slots[i].set_next_free(next);
-            next = Some(idx);
+            page.slots[i].set_prev_free_link(prev);
+            prev = Some(idx);
+            first.get_or_insert(idx);
             new_free += 1;
         }
-        // Back-fill the predecessor links (the doubly-linked list makes
-        // `remove_from_free_list` O(1)): each new slot's successor is the
-        // next slot in this page, except the last, whose successor is the
-        // old head in a possibly different page — patched below.
-        let mut prev: Option<NonZeroU32> = None;
-        for i in start_slot..L2_SIZE
+        match old_tail
         {
-            page.slots[i].set_prev_free_link(prev);
-            prev = NonZeroU32::new((base + i) as u32);
-        }
-        self.free_head = next;
-        if let Some(old_head_idx) = old_head
-        {
-            // The old head's predecessor is this page's last slot; it lives
-            // in an already-published page, reached via slot_mut.
-            let last = prev;
-            if let Some(old_head_slot) = self.slot_mut(old_head_idx.get())
+            // The old tail lives in an already-published page, reached via
+            // slot_mut.
+            Some(tail) =>
             {
-                old_head_slot.set_prev_free_link(last);
+                if let Some(tail_slot) = self.slot_mut(tail.get())
+                {
+                    tail_slot.set_next_free_link(first);
+                }
             }
+            None => self.free_head = first,
         }
+        self.free_tail = prev;
 
         // Publish.
         if leaf_idx < L1_DIRECT
@@ -703,6 +724,10 @@ impl CSpace
         slot.bump_generation();
         slot.set_next_free(old_head);
         self.free_head = Some(nz_index);
+        if old_head.is_none()
+        {
+            self.free_tail = Some(nz_index);
+        }
         if let Some(old_head_idx) = old_head
             && let Some(old_head_slot) = self.slot_mut(old_head_idx.get())
         {
@@ -888,6 +913,10 @@ impl CSpace
             && let Some(next_slot) = self.slot_mut(n.get())
         {
             next_slot.set_prev_free_link(prev);
+        }
+        if next.is_none()
+        {
+            self.free_tail = prev;
         }
         self.free_count -= 1;
         // Drop the free-list marker so the unlinked slot is canonical
@@ -1610,5 +1639,44 @@ mod tests
         assert_eq!(slot.tag, CapTag::Memory);
         assert_eq!(slot.object, Some(obj));
         assert_eq!(cs.free_count, IPC_RECV_RESERVE - 1);
+    }
+
+    #[test]
+    fn general_allocations_stay_ascending_across_a_grow()
+    {
+        // The reserve makes `allocate_slot` grow while slots are still free;
+        // those slots must still be handed out before the new leaf's, so a
+        // run of inserts gets consecutive indices across the leaf boundary.
+        let mut cs = CSpace::new(0);
+        let mut last = cs.allocate_slot().unwrap().get();
+        for _ in 0..3 * L2_SIZE
+        {
+            let idx = cs.allocate_slot().unwrap().get();
+            assert_eq!(idx, last + 1, "allocation skipped or reordered an index");
+            last = idx;
+        }
+    }
+
+    #[test]
+    fn removing_the_tail_keeps_appends_linked()
+    {
+        // After the free list's tail is unlinked by an explicit placement, the
+        // next grow must append behind the new tail, or the leaf's slots are
+        // lost to the list.
+        let mut cs = CSpace::new(0);
+        cs.allocate_slot().unwrap();
+        let tail = cs.free_tail.expect("a non-empty list has a tail");
+        assert!(cs.remove_from_free_list(tail.get()));
+        let free_before = cs.free_count;
+        cs.grow().unwrap();
+        assert_eq!(cs.free_count, free_before + L2_SIZE);
+        let mut drained = 0;
+        while cs.free_count > 0
+        {
+            cs.allocate_transfer_slot().unwrap();
+            drained += 1;
+        }
+        assert_eq!(drained, free_before + L2_SIZE);
+        assert!(cs.free_head.is_none() && cs.free_tail.is_none());
     }
 }

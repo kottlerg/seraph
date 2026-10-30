@@ -970,21 +970,31 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
     }
 
     // One more page: the surviving directory page is not re-charged, so a
-    // single page now buys the leaf and the insert lands in leaf 128.
+    // single page now buys leaf 128. Its 56 slots join the 4 the IPC receive
+    // reserve kept free, so exactly 56 more general inserts succeed before
+    // the reserve is reached again.
     if cap_create_cspace(memory, cspace, 1).is_err()
     {
         cap_delete(probe).ok();
         cap_delete(cspace).ok();
         return Err("retype::dir_survives: second refill failed");
     }
-    let landed = cap_copy(probe, cspace, 1);
+    let mut landed = 0u32;
+    for _ in 0..=56
+    {
+        if cap_copy(probe, cspace, 1).is_err()
+        {
+            break;
+        }
+        landed += 1;
+    }
     cap_delete(probe).ok();
     cap_delete(cspace).ok();
     match landed
     {
-        Ok(handle) if syscall_abi::cap_handle_index(handle) > DIRECT_SLOTS => Ok(()),
-        Ok(_) => Err("retype::dir_survives: post-refill insert landed below the boundary"),
-        Err(_) => Err("retype::dir_survives: insert after refill failed — dir page re-charged?"),
+        56 => Ok(()),
+        0 => Err("retype::dir_survives: insert after refill failed — dir page re-charged?"),
+        _ => Err("retype::dir_survives: the refill page did not back exactly one leaf"),
     }
 }
 

@@ -132,6 +132,7 @@ pub struct CSpace
 {
     // ... (above fields)
     free_head: Option<NonZeroU32>, // head of the intrusive free list (None = empty)
+    free_tail: Option<NonZeroU32>, // tail of the intrusive free list (None = empty)
     free_count: usize,             // slots currently on the free list (O(1) queries)
 }
 ```
@@ -144,8 +145,12 @@ link never does, so the two uses stay distinguishable. The predecessor link make
 `remove_from_free_list` — the explicit-placement path that unlinks an arbitrary
 index — O(1); a list walk would run under the CSpace spinlock with interrupts
 disabled. Allocation pops `free_head` and clears the slot; deallocation pushes onto
-the head. When the list is empty and more slots are needed, the next leaf page is
-allocated and all its usable slots are threaded onto the list.
+the head. When more free slots are needed, the next leaf page is allocated and all its
+usable slots are appended, in ascending order, at `free_tail`. Because a general
+allocation grows while the slots of the IPC receive reserve (below) are still free,
+appending hands those out before the new leaf's, so a run of consecutive inserts gets
+consecutive indices across a leaf boundary: `InitInfo`'s contiguous Memory-cap ranges
+depend on it.
 
 A `Null` tag alone cannot tell a slot that is *linked on the free list* from one that
 was just allocated and not yet populated, and the list tail is byte-identical to a

@@ -1368,7 +1368,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 10;
+pub const DEVMGR_LABELS_VERSION: u32 = 11;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -1378,11 +1378,16 @@ pub mod devmgr_labels
 {
     /// Query for a block device endpoint.
     ///
-    /// Mints a `MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` cap on
-    /// `blk_ep` to the caller. Caller's badge must have
-    /// [`BLOCK_DEVICE_AUTHORITY`] set; the handler replies
-    /// `UNAUTHORIZED` otherwise, and `INVALID_REQUEST` when no block driver
-    /// is running or the derivation fails.
+    /// Mints a `MOUNT_AUTHORITY`-badged whole-disk `SEND_GRANT` cap on the
+    /// service endpoint of one block driver to the caller. devmgr spawns a
+    /// driver for every block device it enumerates; `data[1]`, when sent,
+    /// selects which: an ordinal over the running block drivers in PCI
+    /// segment, bus, device, function order, not stable across boots (a
+    /// device added, removed, or failing its spawn shifts the ones after it).
+    /// An absent `data[1]` is 0, the first. Caller's badge must have
+    /// [`BLOCK_DEVICE_AUTHORITY`] set; the handler replies `UNAUTHORIZED`
+    /// otherwise, and `INVALID_REQUEST` when no block driver runs at that
+    /// ordinal or the derivation fails.
     pub const QUERY_BLOCK_DEVICE: u64 = 1;
     /// Query a device's startup-info payload from devmgr's catalog.
     ///
@@ -1539,12 +1544,16 @@ pub mod devmgr_labels
     /// Query for the keyboard/input device endpoint.
     ///
     /// Mints an `input_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap on
-    /// the input driver's service endpoint to the caller. Caller's badge
-    /// must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies
-    /// `UNAUTHORIZED` otherwise. Like [`QUERY_RTC_DEVICE`], it replies
-    /// `NO_DEVICE` until the on-disk driver is spawned, and for the rest of
-    /// the boot if no input device was enumerated or the spawn failed;
-    /// `INVALID_REQUEST` when the derivation fails. The verb
+    /// the service endpoint of one input driver to the caller. devmgr spawns
+    /// a driver for every input device it enumerates; `data[1]`, when sent,
+    /// selects which: an ordinal over the running input drivers in PCI
+    /// segment, bus, device, function order, not stable across boots. An
+    /// absent `data[1]` is 0, the first. Caller's badge must have
+    /// [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies `UNAUTHORIZED`
+    /// otherwise. Like [`QUERY_RTC_DEVICE`], it replies `NO_DEVICE` until
+    /// the on-disk drivers are spawned, and for the rest of the boot when
+    /// no input driver runs at that ordinal (none enumerated there, or its
+    /// spawn failed); `INVALID_REQUEST` when the derivation fails. The verb
     /// is transport-agnostic: any keyboard backend (virtio-input today,
     /// USB HID / PS-2 later) registers this one slot, so consumers never
     /// learn the transport. Value 11 — 9 and 10 are the TODO(#165) test

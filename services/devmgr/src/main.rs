@@ -20,16 +20,12 @@ mod arch;
 mod caps;
 mod pci;
 mod spawn;
+mod tables;
 
+use firmware::resource::{CarveError, Span, SpanTable, SplitError};
 use ipc::IpcMessage;
 use std::os::seraph::{reserve_pages, startup_info, unreserve_pages};
 use syscall_abi::PAGE_SIZE;
-
-/// Cap on the number of pages devmgr will reserve for a single firmware
-/// table mapping. QEMU typically reports ~72 KiB `AcpiReclaimable`
-/// regions; 256 pages = 1 MiB leaves comfortable headroom for real
-/// hardware.
-const FIRMWARE_MAP_MAX_PAGES: u64 = 256;
 
 // The registry loop is one match over every label, each arm carrying its
 // own reply handling; splitting it would scatter the dispatch table.
@@ -52,118 +48,56 @@ fn main() -> !
 
     std::os::seraph::log!(
         "got {} apertures, {} ACPI regions, irq_range={:#x}, rsdp={:#x}, dtb={:#x}",
-        caps.aperture_count as u64,
-        caps.acpi_region_count as u64,
+        caps.apertures.spans().len() as u64,
+        caps.acpi_regions.len() as u64,
         u64::from(caps.irq_range_cap),
         u64::from(caps.rsdp_memory_cap),
         u64::from(caps.dtb_memory_cap)
     );
 
-    // Parse firmware to locate the PCI ECAM. ACPI wins when RSDP is
+    // Parse firmware to locate every PCI ECAM window. ACPI wins when RSDP is
     // present; DTB is the fallback; the arch platform default (QEMU virt
     // on riscv64, none on x86-64) is the last resort.
-    let Some(ecam_loc) = discover_ecam(&caps)
-    else
+    let ecams = tables::discover_ecams(&caps);
+    let mut devices: Vec<pci::PciDevice> = Vec::new();
+    let mut windows_scanned = 0usize;
+    for loc in &ecams
     {
-        std::os::seraph::log!("failed to locate PCI ECAM via ACPI or DTB, halting");
+        if enumerate_ecam(&mut caps, loc, &mut devices)
+        {
+            windows_scanned += 1;
+        }
+    }
+    if windows_scanned == 0
+    {
+        std::os::seraph::log!("no PCI ECAM window located or enumerated via ACPI or DTB, halting");
         halt_loop();
-    };
+    }
+    // Firmware lists windows in any segment order; the instance ordinals the
+    // registry serves are in segment, bus, device, function order.
+    devices.sort_unstable_by_key(|d| (d.segment, d.bus, d.dev, d.func));
     std::os::seraph::log!(
-        "devmgr: ECAM phys={:#x} size={:#x} buses {}..={}",
-        ecam_loc.phys_base,
-        ecam_loc.size,
-        ecam_loc.start_bus,
-        ecam_loc.end_bus
+        "PCI functions found: {} in {} ECAM windows",
+        devices.len() as u64,
+        windows_scanned as u64
     );
 
-    // Find the aperture covering ECAM and carve a narrow ECAM Mmio cap.
-    let Some(ecam_cap) = carve_subrange(&mut caps, ecam_loc.phys_base, ecam_loc.size)
-    else
-    {
-        std::os::seraph::log!("no aperture covers the ECAM range, halting");
-        halt_loop();
-    };
-
-    let ecam_pages = ecam_loc.size.div_ceil(PAGE_SIZE);
-    let Ok(ecam_range) = reserve_pages(ecam_pages)
-    else
-    {
-        std::os::seraph::log!("failed to reserve VA for ECAM region");
-        halt_loop();
-    };
-    let ecam_va = ecam_range.va_start();
-    if !std::os::seraph::fund_aspace_pt_budget(caps.self_aspace, ecam_pages)
-    {
-        std::os::seraph::log!("failed to fund PT budget for ECAM region");
-        halt_loop();
-    }
-    // SAFETY: ecam_va starts `ecam_range`, a fresh reservation of the ECAM
-    // region's page count from the per-process arena, owned here: VA no Rust
-    // object or IPC page occupies.
-    // `pci_enumerate` reaches the mapping only through the raw volatile
-    // `pci` config accessors, never a reference, and `ecam_range` is
-    // unreserved only after it returns (`mmio_map` § Safety).
-    if unsafe { syscall::mmio_map(caps.self_aspace, ecam_cap, ecam_va, 0) }.is_err()
-    {
-        std::os::seraph::log!("failed to map ECAM region");
-        halt_loop();
-    }
-
-    let start_bus = ecam_loc.start_bus;
-    let end_bus = ecam_loc.end_bus;
-
-    let mut devices = [pci::PciDevice::empty(); pci::MAX_DEVICES];
-    // SAFETY: ecam_va maps `ecam_loc.size` = (end_bus - start_bus + 1) MiB
-    // from `ecam_loc.phys_base`, the configuration space of `start_bus`.
-    let dev_count = unsafe { pci::pci_enumerate(ecam_va, start_bus, end_bus, &mut devices) };
-    std::os::seraph::log!("PCI devices found: {:#x}", dev_count as u64);
-
-    // SAFETY: `pci_enumerate` has returned and reached ECAM only through raw
-    // pointers; the span is `ecam_range`, owned here.
-    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, ecam_va, ecam_pages) };
-    unreserve_pages(ecam_range);
-
-    // Create block device service endpoint for the driver to receive on.
-    let blk_ep =
-        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
-            syscall::cap_create_endpoint(slab).ok()
-        })
-        .unwrap_or(0);
-    if blk_ep == 0
-    {
-        std::os::seraph::log!("failed to create block device endpoint");
-    }
-
-    // IRQ allocator state: consume devmgr's Interrupt range cap ascending.
+    // IRQ allocator state: single-line caps carved out of devmgr's
+    // Interrupt range cap, every remainder kept.
     let mut irq_range = IrqRangeAllocator::new(caps.irq_range_cap);
 
-    // Carve the UART interrupt before any PCI device IRQ. The allocator is
-    // monotonic (it discards lines below each isolate point), and the UART line
-    // (`arch::current::UART_IRQ`) sits below the PCI GSI/PLIC range, so it must
-    // be isolated first. Zero on failure: the serial driver then
-    // degrades to client-side timeout polling for RX.
+    // The UART line (`arch::current::UART_IRQ`); zero on failure, and the
+    // serial driver then degrades to client-side timeout polling for RX.
     let uart_irq = irq_range.isolate_one(arch::current::UART_IRQ).unwrap_or(0);
 
     // Generic device-info catalog: each entry carries a kind discriminant +
     // version + opaque payload bytes. virtio populates entries with kind
     // VIRTIO_PCI; framebuffer (spawned later) uses kind FRAMEBUFFER.
-    // PCI bus devices share the catalog with non-PCI devices like the
-    // framebuffer, so size for both.
-    let mut device_info = [DeviceInfoEntry::empty(); pci::MAX_DEVICES + 4];
-    let mut device_info_count: usize = 0;
+    let mut catalog = DeviceCatalog::default();
 
-    let mut catalog = DeviceCatalog {
-        entries: &mut device_info,
-        count: &mut device_info_count,
-    };
-    let blk_driver_spawned = spawn_virtio_blk(
-        &devices[..dev_count],
-        &mut caps,
-        &mut irq_range,
-        blk_ep,
-        ipc_buf,
-        &mut catalog,
-    );
+    // One service endpoint per running virtio-blk driver, in BDF order:
+    // `QUERY_BLOCK_DEVICE`'s instance ordinal indexes it.
+    let blk_eps = spawn_virtio_blk_all(&devices, &mut caps, &mut irq_range, ipc_buf, &mut catalog);
 
     // Spawn the serial (UART) driver via the non-PCI simple-device path.
     // devmgr owns `serial_ep` and mints client SEND caps on
@@ -184,22 +118,21 @@ fn main() -> !
         std::os::seraph::log!("devmgr: framebuffer driver spawned");
     }
 
-    // Enumerate the virtio-input (keyboard) device now — PCI scan, catalog
-    // entry, and carve of its BAR/IRQ caps — but defer the spawn. The driver
-    // binary lives on the rootfs, not the boot bundle (it is not
+    // Enumerate every virtio-input (keyboard) device now — catalog entry and
+    // carve of its BAR/IRQ caps — but defer the spawns. The driver binary
+    // lives on the rootfs, not the boot bundle (it is not
     // bootstrap-essential), so it loads inside the SET_DRIVERS_DIR handler like
-    // the RTC. `pending_input` stashes the carved caps across the boot →
-    // registry-loop transition; `take()` in that handler makes the spawn
+    // the RTC. `pending_inputs` stashes the carved caps across the boot →
+    // registry-loop transition; `take()` in that handler makes the spawns
     // at-most-once.
-    let mut pending_input = enumerate_virtio_input(
-        &devices[..dev_count],
-        &mut caps,
-        &mut irq_range,
-        &mut catalog,
-    );
-    if pending_input.is_some()
+    let mut pending_inputs =
+        enumerate_virtio_input(&devices, &mut caps, &mut irq_range, &mut catalog);
+    if !pending_inputs.is_empty()
     {
-        std::os::seraph::log!("devmgr: virtio-input device enumerated (deferred spawn)");
+        std::os::seraph::log!(
+            "devmgr: {} virtio-input devices enumerated (deferred spawn)",
+            pending_inputs.len() as u64
+        );
     }
 
     // On-disk driver state. The RTC binary lives on the rootfs at
@@ -217,10 +150,11 @@ fn main() -> !
     let mut drivers_dir_cap: u32 = 0;
     let mut rtc_ep: u32 = 0;
     let mut rtc_spawn_attempted: bool = false;
-    // Service endpoint for the on-disk virtio-input driver. devmgr owns it and
-    // mints client SEND caps on `QUERY_INPUT_DEVICE`. Zero until the
-    // `SET_DRIVERS_DIR` handler spawns the driver (or permanently, on failure).
-    let mut input_ep: u32 = 0;
+    // Service endpoints of the on-disk virtio-input drivers, in BDF order.
+    // devmgr owns them and mints client SEND caps on `QUERY_INPUT_DEVICE`,
+    // whose instance ordinal indexes this list. Empty until the
+    // `SET_DRIVERS_DIR` handler spawns the drivers; a failed spawn adds none.
+    let mut input_eps: Vec<u32> = Vec::new();
 
     // TODO(#165): remove with the devmgr enumeration redesign. Outcome of the
     // last TEST_SPAWN_ORPHAN trigger, reported by TEST_ORPHAN_RESULT. 0=not
@@ -280,7 +214,7 @@ fn main() -> !
                     // SAFETY: ipc_buf is the registered IPC buffer.
                     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
                 }
-                else if blk_driver_spawned && blk_ep != 0
+                else if let Some(&blk_ep) = instance_ordinal(&msg).and_then(|i| blk_eps.get(i))
                 {
                     // Mint a badged SEND_GRANT cap with the
                     // MOUNT_AUTHORITY verb bit. The bit gates
@@ -489,19 +423,30 @@ fn main() -> !
                         rtc_ep = new_ep;
                     }
                     // virtio-input is on-disk too (not bootstrap-essential).
-                    // Spawn it here, after the reply, like the RTC. `take()`
-                    // makes the attempt at-most-once and sticky on failure:
-                    // a failed spawn leaves `input_ep == 0`, so
-                    // `QUERY_INPUT_DEVICE` replies `NO_DEVICE` thereafter.
-                    if let Some(pending) = pending_input.take()
-                        && let Some(new_ep) = spawn_virtio_input_from_disk(
+                    // Spawn every enumerated device's driver here, after the
+                    // reply, like the RTC. `take()` makes the attempts
+                    // at-most-once and sticky on failure: a failed spawn adds
+                    // no endpoint, so `QUERY_INPUT_DEVICE` replies `NO_DEVICE`
+                    // past the running drivers thereafter.
+                    for pending in core::mem::take(&mut pending_inputs)
+                    {
+                        if input_eps.try_reserve(1).is_err()
+                        {
+                            std::os::seraph::log!(
+                                "virtio-input: no memory to record a driver; not spawned"
+                            );
+                            pending.release();
+                            continue;
+                        }
+                        if let Some(new_ep) = spawn_virtio_input_from_disk(
                             &mut caps,
                             &pending,
                             drivers_dir_cap,
                             ipc_buf,
                         )
-                    {
-                        input_ep = new_ep;
+                        {
+                            input_eps.push(new_ep);
+                        }
                     }
                 }
             }
@@ -561,9 +506,10 @@ fn main() -> !
             }
             ipc::devmgr_labels::QUERY_INPUT_DEVICE =>
             {
-                // Like QUERY_RTC_DEVICE: the driver is spawned on-disk by the
-                // SET_DRIVERS_DIR handler, so `input_ep` is zero until then (or
-                // permanently on spawn failure) — reply NO_DEVICE in that case.
+                // Like QUERY_RTC_DEVICE: the drivers are spawned on-disk by the
+                // SET_DRIVERS_DIR handler, so `input_eps` is empty until then
+                // and holds no entry for a failed spawn — reply NO_DEVICE for an
+                // ordinal no running driver has.
                 // Do not `seraph::log!` here (deadlock risk if logd ever fans
                 // input queries through devmgr).
                 if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
@@ -578,7 +524,8 @@ fn main() -> !
                     // SAFETY: ipc_buf is the registered IPC buffer.
                     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
                 }
-                else if input_ep != 0
+                else if let Some(&input_ep) =
+                    instance_ordinal(&msg).and_then(|i| input_eps.get(i))
                 {
                     // Mint a badged SEND_GRANT cap carrying the READ_AUTHORITY
                     // verb bit on the input driver's service endpoint.
@@ -625,9 +572,8 @@ fn main() -> !
                     // SAFETY: ipc_buf is the registered IPC buffer.
                     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
                 }
-                else if dev_idx < device_info_count
+                else if let Some(entry) = catalog.entries.get(dev_idx)
                 {
-                    let entry = &device_info[dev_idx];
                     // Reply schema: word[0] = kind, word[1] = version,
                     // word[2] = byte_len, word[3..] = payload bytes
                     // packed contiguously as u64. Devmgr does not
@@ -704,7 +650,10 @@ fn main() -> !
                 {
                     ipc::devmgr_labels::QUERY_SERIAL_DEVICE if serial_spawned => serial_ep,
                     ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE if fb_spawned => fb_ep,
-                    ipc::devmgr_labels::QUERY_INPUT_DEVICE => input_ep,
+                    ipc::devmgr_labels::QUERY_INPUT_DEVICE =>
+                    {
+                        input_eps.first().copied().unwrap_or(0)
+                    }
                     ipc::devmgr_labels::QUERY_SERIAL_DEVICE
                     | ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE => 0,
                     _ =>
@@ -744,7 +693,13 @@ fn test_label_admitted(msg: &IpcMessage, badge: u64, ipc_buf: *mut u64) -> bool
     true
 }
 
-// ── ECAM discovery ──────────────────────────────────────────────────────────
+/// The instance ordinal a `QUERY_BLOCK_DEVICE` or `QUERY_INPUT_DEVICE`
+/// request selects: `data[1]` when sent, else 0, the first instance.
+/// `None` for an ordinal no `usize` holds, which no instance has.
+fn instance_ordinal(msg: &IpcMessage) -> Option<usize>
+{
+    usize::try_from(msg.words().get(1).copied().unwrap_or(0)).ok()
+}
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
 /// one more before the fatal exit.
@@ -761,345 +716,6 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
             std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
         }
     }
-}
-
-fn discover_ecam(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
-{
-    if caps.rsdp_memory_cap != 0
-        && let Some(loc) = discover_ecam_acpi(caps)
-    {
-        return Some(loc);
-    }
-    if caps.dtb_memory_cap != 0
-        && let Some(loc) = discover_ecam_dtb(caps)
-    {
-        return Some(loc);
-    }
-    arch::current::platform_default_ecam()
-}
-
-fn discover_ecam_acpi(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
-{
-    let xsdt_phys = read_xsdt_phys(caps)?;
-
-    // Copy XSDT entry pointers into a heap vec so we can release the XSDT
-    // mapping and remap per-table — MCFG may live in a different ACPI
-    // region than the XSDT (e.g. EDK2 on RISC-V virt: many tiny regions).
-    let entries = read_xsdt_entries(caps, xsdt_phys)?;
-
-    for tbl_phys in entries
-    {
-        if let Some(loc) = read_mcfg_at(caps, tbl_phys)
-        {
-            return Some(loc);
-        }
-    }
-    None
-}
-
-/// Map the RSDP page and read the XSDT physical address out of it.
-///
-/// Shared by ECAM discovery and the [`devmgr_labels::QUERY_ACPI_TABLE`]
-/// broker so the RSDP → XSDT step exists exactly once. Returns `None` when
-/// no RSDP was delivered, it straddles the end of its page, or the table is
-/// pre-ACPI-2.0.
-fn read_xsdt_phys(caps: &caps::DevmgrCaps) -> Option<u64>
-{
-    if caps.rsdp_memory_cap == 0
-    {
-        return None;
-    }
-    // `rsdp_page_base` carries the exact RSDP physical address (see
-    // init-protocol v5 docs); the backing Memory cap covers that one page,
-    // so an RSDP straddling the page end is unreadable.
-    let rsdp_page_offset = usize::try_from(caps.rsdp_page_base & 0xFFF).ok()?;
-    if rsdp_page_offset + firmware::acpi::RSDP_LEN > usize::try_from(PAGE_SIZE).ok()?
-    {
-        std::os::seraph::log!("RSDP straddles its page; ACPI unavailable");
-        return None;
-    }
-    let range = reserve_pages(1).ok()?;
-    let va = range.va_start();
-    // SAFETY: `range` is a fresh reservation from the per-process arena,
-    // owned here: VA no Rust object or IPC page occupies.
-    let mapped = unsafe {
-        syscall::mem_map(
-            caps.rsdp_memory_cap,
-            caps.self_aspace,
-            va,
-            0,
-            1,
-            syscall_abi::MAP_FROM_CAP,
-        )
-    };
-    if mapped.is_err()
-    {
-        unreserve_pages(range);
-        return None;
-    }
-    // SAFETY: one page mapped read-only above; `rsdp_page_offset +
-    // RSDP_LEN` lies within it (checked before mapping).
-    let rsdp_bytes = unsafe {
-        core::slice::from_raw_parts(
-            (va as *const u8).add(rsdp_page_offset),
-            firmware::acpi::RSDP_LEN,
-        )
-    };
-    let xsdt_phys = firmware::acpi::rsdp_xsdt_phys(rsdp_bytes);
-    // SAFETY: the span is this call's own reservation, and `rsdp_bytes`,
-    // the only reference into it, is not used past the line above.
-    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, 1) };
-    unreserve_pages(range);
-    xsdt_phys
-}
-
-/// Map the ACPI region containing `xsdt_phys`, copy the entry pointer
-/// list into a heap vec, then unmap and return them.
-fn read_xsdt_entries(caps: &caps::DevmgrCaps, xsdt_phys: u64) -> Option<std::vec::Vec<u64>>
-{
-    let (region, off) = find_region_for(caps, xsdt_phys)?;
-    let region_pages = region.size.div_ceil(PAGE_SIZE);
-    let map_pages = region_pages.min(FIRMWARE_MAP_MAX_PAGES);
-    let span = usize::try_from(map_pages * PAGE_SIZE).ok()?;
-    let range = reserve_pages(map_pages).ok()?;
-    let va = range.va_start();
-    // SAFETY: `range` is a fresh reservation from the per-process arena,
-    // owned here: VA no Rust object or IPC page occupies.
-    let mapped = unsafe {
-        syscall::mem_map(
-            region.slot,
-            caps.self_aspace,
-            va,
-            0,
-            map_pages,
-            syscall_abi::MAP_FROM_CAP,
-        )
-    };
-    if mapped.is_err()
-    {
-        unreserve_pages(range);
-        return None;
-    }
-    // SAFETY: map_pages × PAGE_SIZE bytes mapped RO from `va`.
-    let region_bytes = unsafe { core::slice::from_raw_parts(va as *const u8, span) };
-    let mut entries = std::vec::Vec::new();
-    if off + 36 <= region_bytes.len()
-    {
-        let xsdt_len = firmware::acpi::sdt_length(&region_bytes[off..]).unwrap_or(0) as usize;
-        let xsdt_end = (off + xsdt_len).min(region_bytes.len());
-        if xsdt_len >= 36
-        {
-            for e in firmware::acpi::iter_xsdt_entries(&region_bytes[off..xsdt_end])
-            {
-                entries.push(e);
-            }
-        }
-    }
-    // SAFETY: the span is this call's own reservation, and the slice over it
-    // is not used past this point.
-    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, map_pages) };
-    unreserve_pages(range);
-    Some(entries)
-}
-
-/// Map the ACPI region containing `tbl_phys`; if the table is MCFG,
-/// parse and return its first entry.
-fn read_mcfg_at(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<firmware::EcamLocation>
-{
-    let (region, off) = find_region_for(caps, tbl_phys)?;
-    let region_pages = region.size.div_ceil(PAGE_SIZE);
-    let map_pages = region_pages.min(FIRMWARE_MAP_MAX_PAGES);
-    let span = usize::try_from(map_pages * PAGE_SIZE).ok()?;
-    let range = reserve_pages(map_pages).ok()?;
-    let va = range.va_start();
-    // SAFETY: `range` is a fresh reservation from the per-process arena,
-    // owned here: VA no Rust object or IPC page occupies.
-    let mapped = unsafe {
-        syscall::mem_map(
-            region.slot,
-            caps.self_aspace,
-            va,
-            0,
-            map_pages,
-            syscall_abi::MAP_FROM_CAP,
-        )
-    };
-    if mapped.is_err()
-    {
-        unreserve_pages(range);
-        return None;
-    }
-    // SAFETY: map_pages × PAGE_SIZE bytes mapped RO from `va`.
-    let region_bytes = unsafe { core::slice::from_raw_parts(va as *const u8, span) };
-    let mut ecam = None;
-    if off + 36 <= region_bytes.len()
-    {
-        let sig = firmware::acpi::sdt_signature(&region_bytes[off..]);
-        if &sig == b"MCFG"
-        {
-            let tbl_len = firmware::acpi::sdt_length(&region_bytes[off..]).unwrap_or(0) as usize;
-            let tbl_end = (off + tbl_len).min(region_bytes.len());
-            ecam = firmware::acpi::parse_mcfg_ecam(&region_bytes[off..tbl_end]);
-        }
-    }
-    // SAFETY: the span is this call's own reservation, and the slice over it
-    // is not used past this point.
-    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, map_pages) };
-    unreserve_pages(range);
-    ecam
-}
-
-fn discover_ecam_dtb(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
-{
-    let dtb_pages = caps.dtb_size.div_ceil(PAGE_SIZE).max(1);
-    let map_pages = dtb_pages.min(FIRMWARE_MAP_MAX_PAGES);
-    let span = usize::try_from(map_pages * PAGE_SIZE).ok()?;
-    let in_page_off = usize::try_from(caps.dtb_page_base & 0xFFF).ok()?;
-    let range = reserve_pages(map_pages).ok()?;
-    let va = range.va_start();
-    // SAFETY: `range` is a fresh reservation from the per-process arena,
-    // owned here: VA no Rust object or IPC page occupies.
-    let mapped = unsafe {
-        syscall::mem_map(
-            caps.dtb_memory_cap,
-            caps.self_aspace,
-            va,
-            0,
-            map_pages,
-            syscall_abi::MAP_FROM_CAP,
-        )
-    };
-    if mapped.is_err()
-    {
-        unreserve_pages(range);
-        return None;
-    }
-    // SAFETY: map_pages × PAGE_SIZE mapped RO from `va`.
-    let blob_bytes = unsafe {
-        core::slice::from_raw_parts((va as *const u8).add(in_page_off), span - in_page_off)
-    };
-    let ecam = firmware::dtb::Fdt::new(blob_bytes).and_then(|fdt| fdt.find_pci_ecam());
-    // SAFETY: the span is this call's own reservation, and the slice over it
-    // is not used past this point.
-    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, map_pages) };
-    unreserve_pages(range);
-    ecam
-}
-
-/// Find which ACPI region's Memory cap covers `phys` and return `(region,
-/// in-region byte offset)`.
-fn find_region_for(caps: &caps::DevmgrCaps, phys: u64) -> Option<(caps::AcpiRegion, usize)>
-{
-    for r in &caps.acpi_regions[..caps.acpi_region_count]
-    {
-        if phys >= r.base && phys < r.base + r.size
-        {
-            return usize::try_from(phys - r.base).ok().map(|off| (*r, off));
-        }
-    }
-    None
-}
-
-/// Map the ACPI region containing the table at physical address `tbl_phys`
-/// read-only and run `read` on the bytes from the table's start to the end
-/// of the mapping (at most [`FIRMWARE_MAP_MAX_PAGES`]). Returns `None` if
-/// no region covers the address, the mapping fails, or `read` does.
-fn with_acpi_table<R>(
-    caps: &caps::DevmgrCaps,
-    tbl_phys: u64,
-    read: impl FnOnce(&[u8]) -> Option<R>,
-) -> Option<R>
-{
-    let (region, off) = find_region_for(caps, tbl_phys)?;
-    let region_pages = region.size.div_ceil(PAGE_SIZE);
-    let map_pages = region_pages.min(FIRMWARE_MAP_MAX_PAGES);
-    let span = usize::try_from(map_pages * PAGE_SIZE).ok()?;
-    let range = reserve_pages(map_pages).ok()?;
-    let va = range.va_start();
-    // SAFETY: `range` is a fresh reservation from the per-process arena,
-    // owned here: VA no Rust object or IPC page occupies.
-    let mapped = unsafe {
-        syscall::mem_map(
-            region.slot,
-            caps.self_aspace,
-            va,
-            0,
-            map_pages,
-            syscall_abi::MAP_FROM_CAP,
-        )
-    };
-    if mapped.is_err()
-    {
-        unreserve_pages(range);
-        return None;
-    }
-    let out = if off < span
-    {
-        // SAFETY: `span` bytes mapped read-only from `va`.
-        let bytes = unsafe { core::slice::from_raw_parts(va as *const u8, span) };
-        read(&bytes[off..])
-    }
-    else
-    {
-        None
-    };
-    // SAFETY: the span is this call's own reservation, and the slice over it
-    // is not used past this point.
-    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, map_pages) };
-    unreserve_pages(range);
-    out
-}
-
-/// Read the 4-byte signature of the ACPI table at physical address
-/// `tbl_phys`. Returns `None` if no region covers the address or the
-/// header is unreadable. devmgr reads only the header signature here —
-/// never a table body.
-fn read_table_sig(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<[u8; 4]>
-{
-    with_acpi_table(caps, tbl_phys, |table| {
-        (table.len() >= 4).then(|| firmware::acpi::sdt_signature(table))
-    })
-}
-
-/// Locate an ACPI table by 4-byte `sig` via an XSDT walk. Returns the
-/// table's physical address. Reuses the same RSDP/XSDT directory read as
-/// ECAM discovery, so there is one XSDT walk in the whole system.
-fn locate_table_by_sig(caps: &caps::DevmgrCaps, sig: [u8; 4]) -> Option<u64>
-{
-    let xsdt_phys = read_xsdt_phys(caps)?;
-    let entries = read_xsdt_entries(caps, xsdt_phys)?;
-    entries
-        .into_iter()
-        .find(|&tbl_phys| read_table_sig(caps, tbl_phys) == Some(sig))
-}
-
-/// Resolve an ACPI-table request to `(region, table_phys)`, per the
-/// `QUERY_ACPI_TABLE` contract: a zero `sig_word` looks `phys` up directly
-/// (e.g. the DSDT, whose address the caller read from the FADT); otherwise
-/// `sig_word` is a 4-byte signature found via the XSDT. Returns `None` when
-/// both are zero, `sig_word` has bits above its low 32, or the table is not
-/// found.
-fn locate_acpi_table(
-    caps: &caps::DevmgrCaps,
-    sig_word: u64,
-    phys: u64,
-) -> Option<(caps::AcpiRegion, u64)>
-{
-    let table_phys = if sig_word == 0
-    {
-        if phys == 0
-        {
-            return None;
-        }
-        phys
-    }
-    else
-    {
-        let sig = u32::try_from(sig_word).ok()?.to_le_bytes();
-        locate_table_by_sig(caps, sig)?
-    };
-    let (region, _off) = find_region_for(caps, table_phys)?;
-    Some((region, table_phys))
 }
 
 /// TODO(#165): remove with `TEST_QUERY_DENY_DEVICE`. Reply with a SEND on
@@ -1154,7 +770,7 @@ fn handle_query_acpi_table(caps: &caps::DevmgrCaps, msg: &IpcMessage, badge: u64
         reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
         return;
     }
-    let Some((region, table_phys)) = locate_acpi_table(caps, msg.word(1), msg.word(2))
+    let Some((region, table_phys)) = tables::locate_acpi_table(caps, msg.word(1), msg.word(2))
     else
     {
         reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
@@ -1207,122 +823,178 @@ fn handle_query_shutdown_device(
     arch::current::reply_shutdown_device(caps, msg, ipc_buf);
 }
 
+// ── ECAM enumeration ────────────────────────────────────────────────────────
+
+/// Carve, map, and scan one ECAM window, appending its functions to
+/// `devices`. Returns `false`, logging why, when no aperture covers the
+/// window, the VA reservation, page-table funding, or mapping fails, or the
+/// scan stops for lack of memory (the functions found before that point are
+/// kept).
+fn enumerate_ecam(
+    caps: &mut caps::DevmgrCaps,
+    loc: &firmware::EcamLocation,
+    devices: &mut Vec<pci::PciDevice>,
+) -> bool
+{
+    std::os::seraph::log!(
+        "devmgr: ECAM segment {} phys={:#x} size={:#x} buses {}..={}",
+        loc.segment,
+        loc.phys_base,
+        loc.size,
+        loc.start_bus,
+        loc.end_bus
+    );
+    // The ECAM cap stays held: no driver is delegated configuration space.
+    let Some(ecam_cap) = carve_subrange(caps, loc.phys_base, loc.size)
+    else
+    {
+        std::os::seraph::log!(
+            "no aperture covers ECAM segment {}; not scanned",
+            loc.segment
+        );
+        return false;
+    };
+    let ecam_pages = loc.size.div_ceil(PAGE_SIZE);
+    let Ok(ecam_range) = reserve_pages(ecam_pages)
+    else
+    {
+        std::os::seraph::log!("no VA for ECAM segment {}; not scanned", loc.segment);
+        return false;
+    };
+    let ecam_va = ecam_range.va_start();
+    if !std::os::seraph::fund_aspace_pt_budget(caps.self_aspace, ecam_pages)
+    {
+        std::os::seraph::log!("failed to fund PT budget for ECAM segment {}", loc.segment);
+        unreserve_pages(ecam_range);
+        return false;
+    }
+    // SAFETY: ecam_va starts `ecam_range`, a fresh reservation of the ECAM
+    // window's page count from the per-process arena, owned here: VA no Rust
+    // object or IPC page occupies. The scan reaches the mapping only through
+    // `pci::Ecam`'s raw volatile accessors, never a reference, and
+    // `ecam_range` is unreserved only after it returns (`mmio_map` § Safety).
+    if unsafe { syscall::mmio_map(caps.self_aspace, ecam_cap, ecam_va, 0) }.is_err()
+    {
+        std::os::seraph::log!("failed to map ECAM segment {}", loc.segment);
+        unreserve_pages(ecam_range);
+        return false;
+    }
+    // SAFETY: ecam_va maps `loc.size` = (end_bus - start_bus + 1) MiB from
+    // `loc.phys_base`, the configuration space of `start_bus`, and stays
+    // mapped until after the scan below.
+    let ecam = unsafe { pci::Ecam::new(ecam_va, loc.start_bus, loc.end_bus) };
+    let scanned = firmware::scan::scan(&ecam, loc.segment, loc.start_bus, loc.end_bus, devices);
+    // SAFETY: the scan has returned and reached ECAM only through raw
+    // pointers; the span is `ecam_range`, owned here.
+    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, ecam_va, ecam_pages) };
+    unreserve_pages(ecam_range);
+    if let Err(stop) = scanned
+    {
+        let (seg, bus, dev, func) = stop.bdf;
+        std::os::seraph::log!(
+            "PCI scan stopped at {}:{}:{}.{}: no memory for the device list",
+            seg,
+            bus,
+            dev,
+            func
+        );
+        return false;
+    }
+    true
+}
+
 // ── Aperture splitting helper ───────────────────────────────────────────────
 
-/// Carve a narrow `Mmio` cap of `(phys, size)` out of whichever
-/// aperture covers it. Consumes the entry and replaces it with up to
-/// two remainders: the **lower** portion `[ap_base, phys)` becomes a
-/// new aperture slot (if non-empty and a free slot exists), and the
-/// **upper** portion `[phys + size, ap_end)` updates the carved
-/// aperture in place via [`pci::split_bar_cap`].
-///
-/// The lower portion is split off here, before [`pci::split_bar_cap`]
-/// runs on a window already starting at `phys`, so it is preserved rather
-/// than released: the surrounding range may host other useful MMIO (e.g.
-/// the framebuffer lives below the ECAM in the same parent aperture on
-/// x86-64 QEMU+OVMF).
-fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Option<u32>
+/// Carve a narrow `Mmio` cap of `(phys, size)`, its end rounded up to a
+/// page, out of whichever aperture covers it. The lower remainder
+/// `[ap_base, phys)` and the upper remainder stay in the aperture table as
+/// caps of their own: the surrounding range may host other useful MMIO
+/// (e.g. the framebuffer lives below the ECAM in the same parent aperture on
+/// x86-64 QEMU+OVMF). Returns `None` when no aperture covers the range, the
+/// table cannot grow, or a split fails.
+pub fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Option<u32>
 {
-    let mut found: Option<usize> = None;
-    for (i, ap) in caps.apertures[..caps.aperture_count].iter().enumerate()
+    let carved = caps
+        .apertures
+        .carve(phys, size, PAGE_SIZE, |span: &Span<u32>, at| {
+            // `mmio_split` takes the split point as an offset into the cap; the
+            // table records each aperture's exact range, so no split it asks for
+            // falls outside its cap.
+            syscall::mmio_split(span.slot, at - span.base).map_err(|_| SplitError::Failed)
+        });
+    match carved
     {
-        if ap.size == 0
+        Ok(cap) => Some(cap),
+        Err(CarveError::NotCovered) => None,
+        Err(e) =>
         {
-            continue;
-        }
-        if phys >= ap.base && phys + size <= ap.base + ap.size
-        {
-            found = Some(i);
-            break;
+            std::os::seraph::log!(
+                "MMIO carve of {:#x}+{:#x} failed ({}); remainders kept",
+                phys,
+                size,
+                if e == CarveError::NoMemory
+                {
+                    "no memory"
+                }
+                else
+                {
+                    "split"
+                }
+            );
+            None
         }
     }
-    let i = found?;
-
-    let ap_base = caps.apertures[i].base;
-    let ap_size = caps.apertures[i].size;
-    let offset = phys - ap_base;
-
-    // Preserve the lower portion [ap_base, phys) as a new aperture slot
-    // when non-empty.
-    if offset > 0
-    {
-        let Ok((lower_cap, upper_cap)) = syscall::mmio_split(caps.apertures[i].slot, offset)
-        else
-        {
-            return None;
-        };
-        // This entry switches to the upper portion.
-        caps.apertures[i].slot = upper_cap;
-        caps.apertures[i].base = phys;
-        caps.apertures[i].size = ap_size - offset;
-        // Park the lower portion in a free aperture slot if one exists.
-        if caps.aperture_count < caps.apertures.len()
-        {
-            caps.apertures[caps.aperture_count] = caps::Aperture {
-                slot: lower_cap,
-                base: ap_base,
-                size: offset,
-            };
-            caps.aperture_count += 1;
-        }
-        else
-        {
-            let _ = syscall::cap_delete(lower_cap);
-        }
-    }
-
-    // The (possibly post-trim) entry now starts at `phys`. Carve the
-    // requested sub-range with `split_bar_cap`'s in-place upper-remainder
-    // path; with `offset_in_window == 0` it preserves any upper remainder
-    // back into the same slot.
-    pci::split_bar_cap(
-        &mut caps.apertures[i].slot,
-        &mut caps.apertures[i].base,
-        &mut caps.apertures[i].size,
-        phys,
-        size,
-    )
 }
 
 // ── Interrupt range allocator ───────────────────────────────────────────────
 
+/// `SYS_IRQ_SPLIT`'s error for a split point outside the cap's range.
+const IRQ_SPLIT_OUT_OF_RANGE: i64 = syscall_abi::SyscallError::InvalidArgument as i64;
+
+/// Single-line `Interrupt` caps carved out of devmgr's Interrupt range cap,
+/// in any order: every line not yet carved stays in the table, so a device
+/// whose GSI lies below one already carved still gets its line.
 struct IrqRangeAllocator
 {
-    range_slot: u32,
-    next_start: u32,
-    valid: bool,
+    ranges: SpanTable<u32>,
 }
 
 impl IrqRangeAllocator
 {
+    /// Exclusive upper bound recorded for the range cap: its true end is not
+    /// queryable, and `SYS_IRQ_SPLIT` reports a split past it as out of
+    /// range, which [`SpanTable::carve`] reads as the cap ending there.
+    const RANGE_END_BOUND: u64 = 1 << 32;
+
     fn new(range_slot: u32) -> Self
     {
-        Self {
-            range_slot,
-            next_start: 0,
-            valid: range_slot != 0,
+        let mut ranges = SpanTable::new();
+        // A range cap starts at line 0 (init derives it from the root range).
+        if range_slot != 0 && ranges.insert(range_slot, 0, Self::RANGE_END_BOUND) != Ok(true)
+        {
+            std::os::seraph::log!("IRQ range not recorded (no memory); no device IRQs");
         }
+        Self { ranges }
     }
 
-    /// Isolate a single-IRQ cap at `id`. `id` must be `>= next_start`.
-    /// The lower prefix `[next_start, id)` is discarded on success.
+    /// Isolate a single-IRQ cap for line `id`.
     fn isolate_one(&mut self, id: u32) -> Option<u32>
     {
-        if !self.valid || id < self.next_start
-        {
-            return None;
-        }
-        if id > self.next_start
-        {
-            let (prefix, after) = syscall::irq_split(self.range_slot, id).ok()?;
-            let _ = syscall::cap_delete(prefix);
-            self.range_slot = after;
-            self.next_start = id;
-        }
-        let (one, remainder) = syscall::irq_split(self.range_slot, id + 1).ok()?;
-        self.range_slot = remainder;
-        self.next_start = id + 1;
-        Some(one)
+        self.ranges
+            .carve(u64::from(id), 1, 1, |span: &Span<u32>, at| {
+                let at = u32::try_from(at).map_err(|_| SplitError::OutOfRange)?;
+                syscall::irq_split(span.slot, at).map_err(|e| {
+                    if e == IRQ_SPLIT_OUT_OF_RANGE
+                    {
+                        SplitError::OutOfRange
+                    }
+                    else
+                    {
+                        SplitError::Failed
+                    }
+                })
+            })
+            .ok()
     }
 }
 
@@ -1382,144 +1054,255 @@ impl DeviceInfoEntry
     }
 }
 
-/// Growing registry of spawned-device startup-info entries, populated as
+/// Growable registry of spawned-device startup-info entries, populated as
 /// drivers are spawned. Devmgr does not interpret payload bytes; the
 /// per-class shape lives in the driver crate (e.g.
-/// `virtio_core::VirtioPciStartupInfo::from_bytes`).
-pub struct DeviceCatalog<'a>
+/// `virtio_core::VirtioPciStartupInfo::from_bytes`). An entry's badge is
+/// its index + 1.
+#[derive(Default)]
+pub struct DeviceCatalog
 {
-    pub entries: &'a mut [DeviceInfoEntry],
-    pub count: &'a mut usize,
+    pub entries: Vec<DeviceInfoEntry>,
 }
 
-/// Find and spawn a `VirtIO` block device driver from the discovered devices.
-/// Returns `true` only when the driver completed its bootstrap; `false`
-/// when no virtio-blk device or virtio-blk driver module is present, the
-/// catalog entry cannot be filled, no single-IRQ cap can be split for the
-/// device (virtio-blk requires an IRQ), or the spawn fails.
-fn spawn_virtio_blk(
+impl DeviceCatalog
+{
+    /// Append an entry of `kind`/`version` holding `bytes` and return its
+    /// badge, or `None` when the payload exceeds [`MAX_DEVICE_INFO_PAYLOAD`]
+    /// or the catalog cannot grow.
+    pub fn add(&mut self, kind: u32, version: u32, bytes: &[u8]) -> Option<u64>
+    {
+        let mut entry = DeviceInfoEntry::empty();
+        if !entry.fill(kind, version, bytes)
+        {
+            return None;
+        }
+        self.entries.try_reserve(1).ok()?;
+        self.entries.push(entry);
+        u64::try_from(self.entries.len()).ok()
+    }
+
+    /// Drop the newest entry, whose driver failed to spawn before its badge
+    /// was delivered, so no live badge ever names a recycled slot.
+    pub fn drop_newest(&mut self)
+    {
+        self.entries.pop();
+    }
+}
+
+/// Per-device caps carved for a `VirtIO` PCI driver: its BAR `Mmio`, its
+/// optional single-IRQ cap, and the badge of its catalog entry.
+struct VirtioDeviceCaps
+{
+    bar_cap: u32,
+    bar_base: u64,
+    bar_size: u64,
+    irq_cap: Option<u32>,
+    device_badge: u64,
+}
+
+impl VirtioDeviceCaps
+{
+    /// Release the BAR and IRQ caps of a device whose driver is not spawned.
+    fn release(&self)
+    {
+        let _ = syscall::cap_delete(self.bar_cap);
+        if let Some(irq) = self.irq_cap
+        {
+            let _ = syscall::cap_delete(irq);
+        }
+    }
+}
+
+/// Carve a `VirtIO` device's BAR and IRQ caps and add its catalog entry.
+/// Returns `None`, logging why and releasing what it carved, when the
+/// device's register regions span more than one BAR (a `VirtIO` driver is
+/// delivered one), no aperture covers the BAR, or the catalog entry cannot
+/// be added. The IRQ is optional here; a driver that requires one checks.
+fn carve_virtio_device(
+    name: &str,
+    pci_dev: &pci::PciDevice,
+    caps: &mut caps::DevmgrCaps,
+    irq_range: &mut IrqRangeAllocator,
+    catalog: &mut DeviceCatalog,
+) -> Option<VirtioDeviceCaps>
+{
+    std::os::seraph::log!(
+        "devmgr: found {} PCI device {}:{}:{}.{} IRQ line={:#x} pin={:#x}",
+        name,
+        pci_dev.segment,
+        pci_dev.bus,
+        pci_dev.dev,
+        pci_dev.func,
+        pci_dev.irq_line,
+        pci_dev.irq_pin
+    );
+    if let Some(second) = firmware::scan::virtio_second_bar(&pci_dev.virtio_info)
+    {
+        std::os::seraph::log!(
+            "{}: registers span BAR {} and BAR {}; a VirtIO driver is delivered one BAR, not spawned",
+            name,
+            pci_dev.virtio_info.common_cfg.bar,
+            second
+        );
+        return None;
+    }
+    let (bar_cap, bar_base, bar_size) = find_virtio_bar_cap(pci_dev, caps)?;
+    // Serialise the virtio startup info into the generic catalog entry.
+    // Devmgr stores the bytes opaquely; the driver's `from_bytes` (verified
+    // via kind/version) deserialises on the QUERY_DEVICE_INFO reply.
+    let mut buf = [0u8; virtio_core::VirtioPciStartupInfo::SIZE];
+    let device_badge = pci_dev.virtio_info.to_bytes(&mut buf).and_then(|()| {
+        catalog.add(
+            ipc::device_info_kind::VIRTIO_PCI,
+            virtio_core::VIRTIO_PCI_INFO_VERSION,
+            &buf,
+        )
+    });
+    let Some(device_badge) = device_badge
+    else
+    {
+        std::os::seraph::log!(
+            "{}: catalog entry not added (payload or memory); not spawned",
+            name
+        );
+        let _ = syscall::cap_delete(bar_cap);
+        return None;
+    };
+    Some(VirtioDeviceCaps {
+        bar_cap,
+        bar_base,
+        bar_size,
+        irq_cap: acquire_single_irq_cap(pci_dev, irq_range),
+        device_badge,
+    })
+}
+
+/// Spawn a `VirtIO` block driver for every virtio-blk device, in BDF order,
+/// each from a copy of the boot module and with its own service endpoint.
+/// Returns the endpoints of the drivers that completed their bootstrap, in
+/// that order: `QUERY_BLOCK_DEVICE`'s instance ordinal indexes it. A device
+/// is skipped, logged, when no module was delivered, its caps cannot be
+/// carved, it gets no IRQ cap (virtio-blk requires one), or its spawn fails.
+fn spawn_virtio_blk_all(
     devices: &[pci::PciDevice],
     caps: &mut caps::DevmgrCaps,
     irq_range: &mut IrqRangeAllocator,
-    blk_ep: u32,
     ipc_buf: *mut u64,
     catalog: &mut DeviceCatalog,
-) -> bool
+) -> Vec<u32>
 {
-    // Guard the boot module across every retained exit — no virtio device, no
-    // module delivered, a catalog-serialisation failure, or no IRQ cap for the
-    // device — until it is handed to `spawn_driver`. A retained module cap is
-    // a live derivation child of init's donated pool-run source and pins that
-    // run unsplittable. Disarmed immediately before the spawn, which then owns
-    // the cap's lifecycle.
+    // Guard the boot module across every exit. A retained module cap is a
+    // live derivation child of init's donated pool-run source and pins that
+    // run unsplittable; each spawn takes a derived copy, and the guard
+    // releases the original once every device is served.
     let module_cap = caps.module_cap_for_kind(caps::module_kind::VIRTIO_BLK);
-    let mut module_guard = spawn::ModuleCapGuard::new(module_cap);
+    let _module_guard = spawn::ModuleCapGuard::new(module_cap);
+    let mut endpoints = Vec::new();
 
-    for pci_dev in devices
+    for pci_dev in devices.iter().filter(|d| pci::is_virtio_blk(d))
     {
-        if !pci::is_virtio_blk(pci_dev)
-        {
-            continue;
-        }
-
-        std::os::seraph::log!(
-            "devmgr: found virtio-blk PCI device IRQ line={:#x} pin={:#x}",
-            u64::from(pci_dev.irq_line),
-            u64::from(pci_dev.irq_pin)
-        );
-
         if module_cap == 0
         {
             std::os::seraph::log!("no virtio-blk driver module available");
-            return false;
+            break;
         }
-
-        // virtio-blk requires an IRQ: it rejects the 2-cap no-IRQ round 1
-        // and exits, which would leave `spawn_driver` blocked serving round
-        // 2. Refuse the spawn instead.
-        let Some(irq_cap) = acquire_single_irq_cap(pci_dev, irq_range)
+        if endpoints.try_reserve(1).is_err()
+        {
+            std::os::seraph::log!("virtio-blk: no memory to record a driver; not spawned");
+            break;
+        }
+        let Some(dev_caps) = carve_virtio_device("virtio-blk", pci_dev, caps, irq_range, catalog)
         else
         {
-            std::os::seraph::log!("virtio-blk: no IRQ cap for the device; not spawned");
-            return false;
+            continue;
         };
-
-        let dev_idx = *catalog.count;
-        let catalogued = dev_idx < catalog.entries.len();
-        if catalogued
+        if let Some(ep) = spawn_one_virtio_blk(caps, module_cap, &dev_caps, ipc_buf)
         {
-            // Serialise the virtio startup info into the generic
-            // catalog entry. Devmgr stores the bytes opaquely; the
-            // driver's `from_bytes` (verified via kind/version)
-            // deserialises on the QUERY_DEVICE_INFO reply.
-            let mut buf = [0u8; virtio_core::VirtioPciStartupInfo::SIZE];
-            if pci_dev.virtio_info.to_bytes(&mut buf).is_none()
-            {
-                std::os::seraph::log!("virtio: to_bytes overflowed (catalog entry skipped)");
-                let _ = syscall::cap_delete(irq_cap);
-                return false;
-            }
-            if !catalog.entries[dev_idx].fill(
-                ipc::device_info_kind::VIRTIO_PCI,
-                virtio_core::VIRTIO_PCI_INFO_VERSION,
-                &buf,
-            )
-            {
-                std::os::seraph::log!("virtio: catalog entry payload too large");
-                let _ = syscall::cap_delete(irq_cap);
-                return false;
-            }
-            *catalog.count += 1;
+            endpoints.push(ep);
         }
-        // Deliberately index-derived (not randomized like the cross-boundary
-        // service badges, #249): this badge names a specific device-catalog
-        // slot — the driver enforces its own badge per registered device — so
-        // it is a semantically-meaningful identity, not an enumerable
-        // correlator. `dev_idx` is at most `catalog.entries.len()`, so the
-        // `u64` cannot overflow.
-        let device_badge = (dev_idx as u64) + 1;
-
-        let bar_info = find_virtio_bar_cap(pci_dev, caps);
-
-        let config = spawn::DriverSpawnConfig {
-            procmgr_ep: caps.procmgr_ep,
-            bootstrap_ep: caps.self_bootstrap_ep,
-            source: spawn::CreateSource::Module(module_cap),
-            bars: spawn::BarSpec {
-                caps: &bar_info.0[..bar_info.2],
-                bases: &bar_info.1[..bar_info.2],
-                sizes: &bar_info.3[..bar_info.2],
-            },
-            irq_cap: Some(irq_cap),
-            service_ep: blk_ep,
-            registry_ep: caps.registry_ep,
-            device_badge,
-            // Boot-critical: the root-disk path.
-            priority: ipc::sched_policy::BOOT_DRIVER_PRIORITY,
-        };
-        // `spawn_driver` owns the module cap's lifecycle from here (guarded
-        // internally: consumed by CREATE_PROCESS, or released on failure).
-        module_guard.disarm();
-        let spawned = spawn::spawn_driver(&config, ipc_buf);
-        if !spawned
+        else
         {
-            // No driver exists for the device: release its per-device caps
-            // and drop its catalog entry.
-            let _ = syscall::cap_delete(irq_cap);
-            for &bar_cap in &bar_info.0[..bar_info.2]
-            {
-                let _ = syscall::cap_delete(bar_cap);
-            }
-            if catalogued
-            {
-                *catalog.count -= 1;
-            }
+            dev_caps.release();
+            catalog.drop_newest();
         }
-        return spawned;
     }
+    endpoints
+}
 
-    // No virtio block device present: `module_guard` releases the module here.
-    false
+/// Spawn one virtio-blk driver for the carved `dev_caps` from a copy of
+/// `module_cap`, with a fresh service endpoint. Returns that endpoint when
+/// the driver completed its bootstrap; on `None` the caller releases
+/// `dev_caps`.
+fn spawn_one_virtio_blk(
+    caps: &caps::DevmgrCaps,
+    module_cap: u32,
+    dev_caps: &VirtioDeviceCaps,
+    ipc_buf: *mut u64,
+) -> Option<u32>
+{
+    // virtio-blk requires an IRQ: it rejects the 2-cap no-IRQ round 1 and
+    // exits, which would leave `spawn_driver` blocked serving round 2.
+    // Refuse the spawn instead.
+    let Some(irq_cap) = dev_caps.irq_cap
+    else
+    {
+        std::os::seraph::log!("virtio-blk: no IRQ cap for the device; not spawned");
+        return None;
+    };
+    let Ok(module_copy) = syscall::cap_derive(module_cap, syscall::RIGHTS_ALL)
+    else
+    {
+        std::os::seraph::log!("virtio-blk: module cap derivation failed; not spawned");
+        return None;
+    };
+    let blk_ep =
+        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+            syscall::cap_create_endpoint(slab).ok()
+        })
+        .unwrap_or(0);
+    if blk_ep == 0
+    {
+        std::os::seraph::log!("virtio-blk: failed to create service endpoint; not spawned");
+        let _ = syscall::cap_delete(module_copy);
+        return None;
+    }
+    let bar_caps = [dev_caps.bar_cap];
+    let bar_bases = [dev_caps.bar_base];
+    let bar_sizes = [dev_caps.bar_size];
+    let config = spawn::DriverSpawnConfig {
+        procmgr_ep: caps.procmgr_ep,
+        bootstrap_ep: caps.self_bootstrap_ep,
+        source: spawn::CreateSource::Module(module_copy),
+        bars: spawn::BarSpec {
+            caps: &bar_caps,
+            bases: &bar_bases,
+            sizes: &bar_sizes,
+        },
+        irq_cap: Some(irq_cap),
+        service_ep: blk_ep,
+        registry_ep: caps.registry_ep,
+        // Deliberately index-derived (not randomized like the
+        // cross-boundary service badges, #249): this badge names a specific
+        // device-catalog slot — the driver enforces its own badge per
+        // registered device — so it is a semantically-meaningful identity,
+        // not an enumerable correlator.
+        device_badge: dev_caps.device_badge,
+        // Boot-critical: the root-disk path.
+        priority: ipc::sched_policy::BOOT_DRIVER_PRIORITY,
+    };
+    // `spawn_driver` owns the module copy's lifecycle from here (consumed by
+    // CREATE_PROCESS, or released on failure).
+    if spawn::spawn_driver(&config, ipc_buf)
+    {
+        std::os::seraph::log!("devmgr: virtio-blk driver spawned");
+        Some(blk_ep)
+    }
+    else
+    {
+        let _ = syscall::cap_delete(blk_ep);
+        None
+    }
 }
 
 /// Split a single-IRQ `Interrupt` cap for a PCI device off devmgr's Interrupt range cap.
@@ -1553,141 +1336,77 @@ fn device_gsi(pci_dev: &pci::PciDevice) -> Option<u32>
     arch::current::intx_fallback_gsi(pci_dev.irq_pin, pci_dev.dev)
 }
 
-/// Find the BAR cap for the `VirtIO` device's primary register region.
-/// Returns `(bar_caps, bar_bases, count, bar_sizes)`.
+/// Carve the cap for the `VirtIO` device's register BAR, the one its
+/// common-configuration region names. Returns `(cap, base, size)`, or
+/// `None`, logged, when the device has no such MMIO BAR or no aperture
+/// covers it.
 fn find_virtio_bar_cap(
     pci_dev: &pci::PciDevice,
     caps: &mut caps::DevmgrCaps,
-) -> ([u32; 1], [u64; 1], usize, [u64; 1])
+) -> Option<(u32, u64, u64)>
 {
     let virtio_bar_idx = pci_dev.virtio_info.common_cfg.bar;
-    let mut bar_caps = [0u32; 1];
-    let mut bar_bases = [0u64; 1];
-    let mut bar_sizes = [0u64; 1];
-    let mut count = 0;
-
-    for b in 0..pci_dev.bar_count
+    let Some(b) = (0..pci_dev.bar_count)
+        .find(|&b| pci_dev.bar_pci_idx[b] == virtio_bar_idx && pci_dev.bar_is_mmio[b])
+    else
     {
-        if pci_dev.bar_pci_idx[b] != virtio_bar_idx || !pci_dev.bar_is_mmio[b]
-        {
-            continue;
-        }
+        std::os::seraph::log!("devmgr: VirtIO BAR {} is not an MMIO BAR", virtio_bar_idx);
+        return None;
+    };
+    std::os::seraph::log!(
+        "devmgr: VirtIO BAR phys={:#018x} size={:#018x}",
+        pci_dev.bar_phys[b],
+        pci_dev.bar_size[b]
+    );
+    // The driver reserves `bar_aperture_pages` of VA for the BAR and
+    // `mmio_map` maps the whole cap region, so the cap covers no more of the
+    // BAR than the VirtIO capability structures reach.
+    let size = pci_dev.bar_size[b].min(pci_dev.virtio_info.bar_aperture_pages() * PAGE_SIZE);
+    let Some(cap) = carve_subrange(caps, pci_dev.bar_phys[b], size)
+    else
+    {
         std::os::seraph::log!(
-            "devmgr: VirtIO BAR phys={:#018x} size={:#018x}",
-            pci_dev.bar_phys[b],
-            pci_dev.bar_size[b]
+            "devmgr: VirtIO BAR not covered by any aperture virtio_bar_idx={:#x}",
+            u64::from(virtio_bar_idx)
         );
-
-        // The driver reserves `bar_aperture_pages` of VA for the BAR and
-        // `mmio_map` maps the whole cap region, so the cap covers no more of
-        // the BAR than the VirtIO capability structures reach.
-        let size = pci_dev.bar_size[b].min(pci_dev.virtio_info.bar_aperture_pages() * PAGE_SIZE);
-        if let Some(cap) = carve_subrange(caps, pci_dev.bar_phys[b], size)
-        {
-            bar_caps[0] = cap;
-            bar_bases[0] = pci_dev.bar_phys[b];
-            bar_sizes[0] = size;
-            count = 1;
-        }
-        else
-        {
-            std::os::seraph::log!(
-                "devmgr: VirtIO BAR not covered by any aperture virtio_bar_idx={:#x}",
-                u64::from(virtio_bar_idx)
-            );
-        }
-        break;
-    }
-
-    (bar_caps, bar_bases, count, bar_sizes)
+        return None;
+    };
+    Some((cap, pci_dev.bar_phys[b], size))
 }
 
 // ── VirtIO input (keyboard) driver: deferred on-disk spawn ──────────────────
 
-/// A virtio-input PCI device discovered during enumeration, with its BAR/IRQ
-/// caps carved and its catalog entry filled, awaiting an on-disk spawn in the
-/// `SET_DRIVERS_DIR` handler.
-struct PendingInputDevice
-{
-    bar_cap: u32,
-    bar_base: u64,
-    bar_size: u64,
-    irq_cap: Option<u32>,
-    device_badge: u64,
-}
-
-/// Discover the virtio-input device: fill its `DeviceCatalog` entry and carve
-/// its BAR + IRQ caps, returning the stash for a deferred on-disk spawn.
-/// Mirrors the discovery half of [`spawn_virtio_blk`] but does not spawn — the
-/// binary lives on the rootfs and is loaded later by the `SET_DRIVERS_DIR`
-/// handler (it is not bootstrap-essential).
+/// Discover every virtio-input device, in BDF order: fill its
+/// `DeviceCatalog` entry and carve its BAR + IRQ caps, returning the stash
+/// for a deferred on-disk spawn. Mirrors the discovery half of
+/// [`spawn_virtio_blk_all`] but does not spawn — the binary lives on the
+/// rootfs and is loaded later by the `SET_DRIVERS_DIR` handler (it is not
+/// bootstrap-essential).
 fn enumerate_virtio_input(
     devices: &[pci::PciDevice],
     caps: &mut caps::DevmgrCaps,
     irq_range: &mut IrqRangeAllocator,
     catalog: &mut DeviceCatalog,
-) -> Option<PendingInputDevice>
+) -> Vec<VirtioDeviceCaps>
 {
-    for pci_dev in devices
+    let mut pending = Vec::new();
+    for pci_dev in devices.iter().filter(|d| pci::is_virtio_input(d))
     {
-        if !pci::is_virtio_input(pci_dev)
+        if pending.try_reserve(1).is_err()
         {
-            continue;
+            std::os::seraph::log!("virtio-input: no memory to record a device; not spawned");
+            break;
         }
-
-        std::os::seraph::log!(
-            "devmgr: found virtio-input PCI device IRQ line={:#x} pin={:#x}",
-            u64::from(pci_dev.irq_line),
-            u64::from(pci_dev.irq_pin)
-        );
-
-        let dev_idx = *catalog.count;
-        if dev_idx >= catalog.entries.len()
+        if let Some(dev_caps) =
+            carve_virtio_device("virtio-input", pci_dev, caps, irq_range, catalog)
         {
-            std::os::seraph::log!("virtio-input: device catalog full");
-            return None;
+            pending.push(dev_caps);
         }
-        // Serialise the virtio startup info into the generic catalog entry, as
-        // virtio-blk does; the driver deserialises it on QUERY_DEVICE_INFO.
-        let mut buf = [0u8; virtio_core::VirtioPciStartupInfo::SIZE];
-        if pci_dev.virtio_info.to_bytes(&mut buf).is_none()
-        {
-            std::os::seraph::log!("virtio-input: to_bytes overflowed (skipped)");
-            return None;
-        }
-        if !catalog.entries[dev_idx].fill(
-            ipc::device_info_kind::VIRTIO_PCI,
-            virtio_core::VIRTIO_PCI_INFO_VERSION,
-            &buf,
-        )
-        {
-            std::os::seraph::log!("virtio-input: catalog entry payload too large");
-            return None;
-        }
-        *catalog.count += 1;
-        let device_badge = (dev_idx as u64) + 1;
-
-        let bar_info = find_virtio_bar_cap(pci_dev, caps);
-        if bar_info.2 == 0
-        {
-            std::os::seraph::log!("virtio-input: BAR not covered by any aperture");
-            return None;
-        }
-        let irq_cap = acquire_single_irq_cap(pci_dev, irq_range);
-
-        return Some(PendingInputDevice {
-            bar_cap: bar_info.0[0],
-            bar_base: bar_info.1[0],
-            bar_size: bar_info.3[0],
-            irq_cap,
-            device_badge,
-        });
     }
-
-    None
+    pending
 }
 
-/// Spawn the on-disk virtio-input driver. Walks
+/// Spawn the on-disk virtio-input driver for one stashed device. Walks
 /// `/services/drivers/virtio-input` through the `SET_DRIVERS_DIR` subtree cap,
 /// then hands the carved BAR/IRQ caps (stashed at enumeration) to the
 /// file-source PCI spawn path. Returns the freshly created service endpoint on
@@ -1697,7 +1416,7 @@ fn enumerate_virtio_input(
 /// `None` and releases the stashed BAR and IRQ caps.
 fn spawn_virtio_input_from_disk(
     caps: &mut caps::DevmgrCaps,
-    pending: &PendingInputDevice,
+    pending: &VirtioDeviceCaps,
     drivers_dir_cap: u32,
     ipc_buf: *mut u64,
 ) -> Option<u32>
@@ -1712,7 +1431,7 @@ fn spawn_virtio_input_from_disk(
     else
     {
         std::os::seraph::log!("virtio-input: walk_to_file failed (binary missing on rootfs)");
-        release_pending_input(pending);
+        pending.release();
         return None;
     };
 
@@ -1725,7 +1444,7 @@ fn spawn_virtio_input_from_disk(
     {
         std::os::seraph::log!("virtio-input: failed to create service endpoint");
         let _ = syscall::cap_delete(walked.file_cap);
-        release_pending_input(pending);
+        pending.release();
         return None;
     }
 
@@ -1761,19 +1480,8 @@ fn spawn_virtio_input_from_disk(
     else
     {
         let _ = syscall::cap_delete(input_ep);
-        release_pending_input(pending);
+        pending.release();
         None
-    }
-}
-
-/// Release the BAR and IRQ caps stashed for a virtio-input device whose
-/// driver could not be spawned; the caller drops the stash.
-fn release_pending_input(pending: &PendingInputDevice)
-{
-    let _ = syscall::cap_delete(pending.bar_cap);
-    if let Some(irq) = pending.irq_cap
-    {
-        let _ = syscall::cap_delete(irq);
     }
 }
 
@@ -1904,13 +1612,6 @@ fn spawn_framebuffer(
 
     // Register a catalog entry so the driver can fetch its geometry via
     // QUERY_DEVICE_INFO. Badge == catalog-index + 1, mirroring virtio.
-    let dev_idx = *catalog.count;
-    if dev_idx >= catalog.entries.len()
-    {
-        std::os::seraph::log!("framebuffer: catalog full");
-        let _ = syscall::cap_delete(hw_cap);
-        return (false, fb_ep);
-    }
     let fb_info_serial = boot_protocol::FramebufferInfo {
         physical_base: fb.physical_base,
         width: fb.width,
@@ -1929,18 +1630,17 @@ fn spawn_framebuffer(
         let _ = syscall::cap_delete(hw_cap);
         return (false, fb_ep);
     }
-    if !catalog.entries[dev_idx].fill(
+    let Some(device_badge) = catalog.add(
         ipc::device_info_kind::FRAMEBUFFER,
         boot_protocol::FRAMEBUFFER_INFO_VERSION,
         &buf,
     )
+    else
     {
-        std::os::seraph::log!("framebuffer: catalog entry too large");
+        std::os::seraph::log!("framebuffer: catalog entry not added (payload or memory)");
         let _ = syscall::cap_delete(hw_cap);
         return (false, fb_ep);
-    }
-    *catalog.count += 1;
-    let device_badge = (dev_idx as u64) + 1;
+    };
 
     // Badged devmgr-query endpoint so the driver can call
     // QUERY_DEVICE_INFO and retrieve its FramebufferInfo.

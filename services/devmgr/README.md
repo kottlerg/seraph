@@ -11,7 +11,8 @@ discovery, and driver binding.
 devmgr/
 ├── Cargo.toml
 ├── README.md
-├── firmware/                       # `devmgr-firmware`: host-tested ACPI / DTB parsers, PCI math
+├── firmware/                       # `devmgr-firmware`: host-tested ACPI / DTB parsers, PCI scan,
+│                                   #   aperture / IRQ range-cap table
 ├── src/
 │   ├── main.rs                     # Bootstrap, registry loop, QUERY_* handlers, device catalog
 │   ├── arch/                       # Arch dispatch: ECAM/INTx defaults, UART/RTC carves, shutdown
@@ -19,8 +20,9 @@ devmgr/
 │   │   ├── x86_64/mod.rs           # IoPort carves (COM1, CMOS, PM1a + 8042); no ECAM default
 │   │   └── riscv64/mod.rs          # QEMU virt windows (ECAM, NS16550, goldfish-RTC); SbiControl
 │   ├── caps.rs                     # Bootstrap-round capability absorbers and DevmgrCaps
-│   ├── pci.rs                      # PCI ECAM enumeration + BAR splitting
-│   └── spawn.rs                    # Driver-process spawn helpers (simple-device, virtio-blk, ...)
+│   ├── pci.rs                      # ECAM configuration-space accessor for the PCI scan
+│   ├── spawn.rs                    # Driver-process spawn helpers (simple-device, virtio-blk, ...)
+│   └── tables.rs                   # Firmware-table mapping: ECAM discovery, ACPI table lookup
 └── docs/
     ├── responsibilities.md         # Responsibilities, bootstrap capabilities, driver authority
     ├── pci-enumeration.md          # PCI enumeration via ECAM MMIO

@@ -175,6 +175,13 @@ only after initial enumeration and binding complete. The dependency ordering is 
 init's bootstrap sequence (devmgr before vfsd) and by svcmgr launching those consumers only
 after handover; devmgr and vfsd are `restart = never`, so no restart ordering exists.
 
+devmgr spawns one driver for every virtio-blk and every virtio-input device it enumerates,
+each with its own service endpoint. `QUERY_BLOCK_DEVICE` and `QUERY_INPUT_DEVICE` select one
+of those drivers by an optional instance ordinal in `data[1]` (absent means the first): the
+ordinal counts the running drivers of that class in PCI segment, bus, device, function order,
+and is not stable across boots. vfsd and the terminal send none, so they bind the first
+instance.
+
 ### Driver binary sources
 
 devmgr loads driver binaries from one of two places:

@@ -8,7 +8,8 @@
 use ipc::IpcMessage;
 
 use crate::caps::DevmgrCaps;
-use crate::{locate_table_by_sig, reply_status, with_acpi_table};
+use crate::reply_status;
+use crate::tables::{locate_table_by_sig, with_acpi_table};
 use firmware::EcamLocation;
 
 /// Arch-specific authority caps devmgr holds after bootstrap.
@@ -42,7 +43,7 @@ impl ArchCaps
 ///
 /// Returns `None`: no x86-64 machine model fixes an ECAM base the way QEMU
 /// `virt` does on RISC-V, so there is no default to fall back to;
-/// `discover_ecam` yields `None` and `main` halts the boot, surfacing the
+/// `discover_ecams` yields no window and `main` halts the boot, surfacing the
 /// missing firmware table explicitly.
 pub fn platform_default_ecam() -> Option<EcamLocation>
 {

@@ -16,20 +16,21 @@ death triggers a graceful shutdown rather than re-delegation (see
 The full design is specified in [docs/device-management.md](../../../docs/device-management.md);
 devmgr's responsibilities are:
 
-- **Parse firmware tables** — locate the PCI ECAM, from read-only memory
-  capabilities, through the ACPI MCFG table (RSDP → XSDT → MCFG; preferred on
-  either architecture whenever an RSDP is present) or, failing that, the
-  Device Tree blob's `pci-host-ecam-generic` node; and serve ACPI tables to
-  pwrmgr (below). When neither yields an ECAM, devmgr on RISC-V falls back to
+- **Parse firmware tables** — locate every PCI ECAM window, from read-only
+  memory capabilities, through every allocation entry of the ACPI MCFG table
+  (RSDP → XSDT → MCFG; preferred on either architecture whenever an RSDP is
+  present and it yields a window) or, failing that, every
+  `pci-host-ecam-generic` node of the Device Tree blob; and serve ACPI tables
+  to pwrmgr (below). When neither yields an ECAM, devmgr on RISC-V falls back to
   the QEMU `virt` platform-default ECAM window (`platform_default_ecam`:
   `0x3000_0000`, 256 MiB, buses 0..=255); on x86-64 the boot halts. devmgr
   derives per-device interrupt lines from PCI configuration space; resolving
   interrupt routing and power domains from firmware tables is design intent;
   not yet implemented.
-- **Enumerate PCI devices** — reserve VA, fund the AS's page-table growth
-  budget via `fund_aspace_pt_budget`, then map the ECAM MMIO region via
-  `mmio_map`, read configuration space, discover devices and BARs, resolve
-  interrupt assignments. See
+- **Enumerate PCI devices** — for each ECAM window, reserve VA, fund the AS's
+  page-table growth budget via `fund_aspace_pt_budget`, then map the window
+  via `mmio_map`, read configuration space, discover every function and its
+  BARs, resolve interrupt assignments. See
   [`docs/pci-enumeration.md`](pci-enumeration.md).
 - **Bind drivers** — match discovered devices to driver binaries in
   [`drivers/`](../../drivers/README.md), request procmgr to create driver
@@ -47,6 +48,10 @@ devmgr's responsibilities are:
   it acquires via the `Mmio` cap flow is design intent; not yet implemented
   (see
   [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming)).
+
+  devmgr spawns one driver for every virtio-blk and every virtio-input
+  device, each with its own service endpoint, and refuses, logged, a VirtIO
+  device whose register regions span more than one BAR.
 
   Driver binaries are sourced from one of two places:
 
@@ -74,9 +79,13 @@ devmgr's responsibilities are:
   input drivers (`QUERY_FRAMEBUFFER_DEVICE` / `QUERY_INPUT_DEVICE`), timed
   resolves the platform RTC (`QUERY_RTC_DEVICE`), and netd (design intent; not
   yet implemented, #30). devmgr owns each driver's service endpoint and mints a
-  badged SEND on query. `QUERY_BLOCK_DEVICE`, whose reply is the
-  `MOUNT_AUTHORITY`-badged whole-disk cap, is gated on `BLOCK_DEVICE_AUTHORITY`,
-  which only the registry cap init mints for vfsd carries. The serial,
+  badged SEND on query. `QUERY_BLOCK_DEVICE` and `QUERY_INPUT_DEVICE` select
+  one driver of their class by an optional instance ordinal in `data[1]`
+  (absent means the first), counted over the running drivers in PCI
+  segment, bus, device, function order and not stable across boots.
+  `QUERY_BLOCK_DEVICE`, whose reply is the `MOUNT_AUTHORITY`-badged whole-disk
+  cap, is gated on `BLOCK_DEVICE_AUTHORITY`, which only the registry cap init
+  mints for vfsd carries. The serial,
   framebuffer, RTC, and input queries are gated on `REGISTRY_QUERY_AUTHORITY`,
   which every consumer query cap carries: svcmgr's `devmgr.*` publications,
   the cap svcmgr mints for logd at launch, and vfsd's.
@@ -90,8 +99,8 @@ devmgr's responsibilities are:
   and one over the 8042 reset port, or a Reset-only `SbiControl` derivation
   on RISC-V. pwrmgr names the PM1a port it computed from the FADT, and devmgr
   serves it only when it equals the FADT's `PM1a_CNT_BLK`, which devmgr reads
-  itself (the only table-body field it reads beside the MCFG allocation entry
-  it locates the ECAM from). On every call the caps are re-derived from the
+  itself (the only table-body field it reads beside the MCFG allocation
+  entries it locates the ECAM windows from). On every call the caps are re-derived from the
   `IoPort` / `SbiControl` caps devmgr holds, so nothing is consumed and a
   restarted pwrmgr re-acquires them cleanly. devmgr runs no shutdown logic;
   it brokers the hardware, pwrmgr interprets and actuates. `QUERY_ACPI_TABLE`
@@ -134,7 +143,7 @@ how devmgr uses them.
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (CMOS, COM1) and pwrmgr's PM1a + 8042 reset ports |
 | SbiControl (RISC-V, Reset + Suspend) | Reset / Suspend | Steady-state holder of the platform power-state SBI authority (init is reaped); broker a Reset-only derivation to pwrmgr for SBI SRST shutdown / reboot. Suspend held for a future power path |
 | Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob; broker read-only ACPI tables to pwrmgr via `QUERY_ACPI_TABLE`. Parsing IOMMU topology (DMAR on x86-64, `iommu` / `iommu-map` on RISC-V) is design intent; not yet implemented |
-| Memory (driver modules, MODULE round) | As held by init | Boot-bundle driver images (virtio-blk, serial, framebuffer) spawned via `procmgr_labels::CREATE_PROCESS` |
+| Memory (driver modules, MODULE round) | As held by init | Boot-bundle driver images (virtio-blk, serial, framebuffer), one per `module_kind`, spawned via `procmgr_labels::CREATE_PROCESS`; a module of an unknown kind or a second of one kind is logged and released |
 | svcmgr publish authority (Endpoint, SVCMGR_BUNDLE round) | Send, Grant (`PUBLISH_AUTHORITY` badge) | Register service caps in svcmgr's registry; held but unused today, reserved for future devmgr publications |
 | SchedControl (baseline, via `ProcessInfo`) | band `[1, 26]` (`sched_policy::DEVMGR_BAND_MAX`) | Place spawned drivers at their assigned levels (serial/virtio-blk at 26, framebuffer/RTC/virtio-input at 25 — the `CREATE_PRIORITY` field of each driver spawn) and set devmgr's own threads' priorities. Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`); init requests the deliberately-elevated ceiling (above devmgr's own level 24) via the create label's `CREATE_BAND_MAX` field |
 

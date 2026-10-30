@@ -104,7 +104,8 @@ static IRQ_TABLE: [IrqRoute; MAX_IRQ] = {
 pub unsafe fn register(irq: u32, notification: *mut NotificationState)
 {
     debug_assert!((irq as usize) < MAX_IRQ, "irq out of range");
-    // SeqCst, for the replaced pointer's teardown (rustdoc above). An
+    // SeqCst, so every route write is in the teardown's total order
+    // (rustdoc above). An
     // out-of-range `irq` panics at the index (the debug_assert reports it
     // first in debug builds).
     IRQ_TABLE[irq as usize]
@@ -124,7 +125,8 @@ pub unsafe fn register(irq: u32, notification: *mut NotificationState)
 pub unsafe fn unregister(irq: u32)
 {
     debug_assert!((irq as usize) < MAX_IRQ, "irq out of range");
-    // SeqCst, for the cleared pointer's teardown (rustdoc above). An
+    // SeqCst, so every route write is in the teardown's total order
+    // (rustdoc above). An
     // out-of-range `irq` panics at the index (the debug_assert reports it
     // first in debug builds).
     IRQ_TABLE[irq as usize]
@@ -249,8 +251,8 @@ pub unsafe fn dispatch_device_irq(irq: u32)
     let route = &IRQ_TABLE[irq as usize];
     // Count this delivery before reading the route, so a Notification teardown
     // that clears the route waits for it (`unregister_notification`). SeqCst
-    // on the raise and the read pairs with the clearer's SeqCst clear and
-    // count read.
+    // on the raise and the read pairs with the teardown's every-line SeqCst
+    // compare-exchange and count reads (`unregister_notification`).
     route.in_flight.fetch_add(1, Ordering::SeqCst);
     let sig_ptr = route.notification.load(Ordering::SeqCst);
     // SAFETY: interrupt context with interrupts disabled (contract); sig_ptr

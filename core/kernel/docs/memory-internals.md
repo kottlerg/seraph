@@ -131,8 +131,8 @@ retype (only the drain reset, when every retyped byte is freed, undoes it, and S
 as it is pinned), so on SEED the carve trades page blocks for sub-page capacity: sustained
 sub-page demand can leave too few contiguous pages for a port-binding table, and
 `sys_ioport_bind` then returns `OutOfMemory`. A carve happens only once the bump cursor cannot
-serve the class, so SEED is by then already at its shared budget: without the carve, the sub-page
-request fails instead.
+serve the class, so the bump frontier is by then spent and the class's free list empty: without
+the carve, the sub-page request fails instead.
 
 Retype and pool allocation are fallible and MUST be handled as fallible at every
 call site; there is no allocation that cannot fail
@@ -358,12 +358,15 @@ stale TLB entries on those CPUs may need invalidation. The leaf PTE is edited un
 the per-address-space `pt_lock`, which is then **released before** any cross-CPU
 work: holding it across the IPI ack-wait would serialize every concurrent map/unmap
 on the address space behind cross-CPU latency. Region teardown (`unmap_region_pooled`) is
-the exception: it holds `pt_lock` across its one coarse shootdown so that no CPU can reuse
-a just-freed page-table frame before every TLB and paging-structure cache is clean; the
+the exception: it holds `pt_lock` across its one coarse shootdown, plus one span invalidation
+under `pt_lock` each time the cleared frames overflow the frame-map release batch (§ Frame Map
+Table), so that no CPU can reuse a just-freed page-table frame before every TLB and
+paging-structure cache is clean; the
 contended `pt_lock` path enables interrupts, so a waiting CPU still acks the IPI.
 The withdrawal of an `SYS_MMIO_MAP` mapping when its Mmio object is freed
 (`unmap_region_if_phys`) clears the span's leaves under one `pt_lock` hold, skipping a page
-remapped to other memory, and issues one invalidation for the span after releasing it, the
+remapped to other memory, and issues one invalidation for the span after releasing it (plus
+one under `pt_lock` each time the cleared frames overflow the frame-map release batch), the
 region-teardown shape with `tag == 0`; it frees no page table and the device frames are never
 reallocated, so no reuse waits on it (see
 [capability-internals.md](capability-internals.md) § Mmio Mappings).

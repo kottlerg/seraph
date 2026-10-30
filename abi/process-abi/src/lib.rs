@@ -514,15 +514,17 @@ pub struct ProcessInfo
     /// pre-pager bootstrap (memmgr/procmgr).
     ///
     /// procmgr binds the main thread's fault handler to this endpoint at
-    /// creation; the runtime reads this slot and `pager_badge` to bind the
-    /// same handler onto every thread it spawns, so demand paging covers the
-    /// whole process and not just the main thread. Consumers must tolerate
-    /// zero.
+    /// creation; the runtime reads this slot to bind the same handler onto
+    /// every thread it spawns, so demand paging covers the whole process and
+    /// not just the main thread. The kernel stamps each fault with this cap's
+    /// derivation badge. Consumers must tolerate zero.
     pub pager_endpoint_cap: u32,
 
-    /// Fault-message badge bound with [`Self::pager_endpoint_cap`],
-    /// identifying this process to the pager. Zero when the process is pinned
-    /// (no pager).
+    /// The derivation badge of [`Self::pager_endpoint_cap`], identifying this
+    /// process to the pager: the badge the kernel stamps on this process's
+    /// fault messages. Informational: `SYS_THREAD_SET_FAULT_HANDLER` takes no
+    /// badge, so no binder passes it to the kernel. Zero when the process is
+    /// pinned (no pager).
     pub pager_badge: u64,
 
     /// Mapped base virtual address of the main thread's TLS block — the value
@@ -660,8 +662,9 @@ pub struct StartupInfo
     /// thread it spawns. See `ProcessInfo::pager_endpoint_cap`.
     pub pager_endpoint_cap: u32,
 
-    /// Fault-message badge bound with [`Self::pager_endpoint_cap`]. Zero
-    /// when not demand-paged.
+    /// The derivation badge of [`Self::pager_endpoint_cap`], which the kernel
+    /// stamps on this process's fault messages. Zero when not demand-paged.
+    /// See `ProcessInfo::pager_badge`.
     pub pager_badge: u64,
 
     /// Mapped base virtual address of the main thread's TLS block, or zero when

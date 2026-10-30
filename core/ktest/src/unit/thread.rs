@@ -784,6 +784,55 @@ pub fn set_affinity_wide_arg_err(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// A raw `SYS_THREAD_SET_FAULT_HANDLER` whose reserved badge word is nonzero
+/// returns `InvalidArgument`, and the same call with the word 0 binds: a binder
+/// cannot supply the fault badge, which is the bound Endpoint cap's own
+/// derivation badge (docs/fault-handling.md § Security).
+pub fn set_fault_handler_badge_arg_err(ctx: &TestContext) -> TestResult
+{
+    let ep = syscall::cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "thread::set_fault_handler_badge_arg_err: cap_create_endpoint failed")?;
+    let Ok(child) = crate::spawn::new_child(ctx)
+    else
+    {
+        cap_delete(ep).ok();
+        return Err("thread::set_fault_handler_badge_arg_err: spawn::new_child failed");
+    };
+
+    let bind = |badge: u64| {
+        // SAFETY: raw_syscall4's four conditions hold. SYS_THREAD_SET_FAULT_HANDLER
+        // takes no pointer and uses no IPC buffer; it changes no mapping; besides
+        // the registers the call clobbers in this thread, the only thread it
+        // changes is the child, which is never started; and it changes no
+        // CSpace slot.
+        unsafe {
+            syscall::raw_syscall4(
+                syscall_abi::SYS_THREAD_SET_FAULT_HANDLER,
+                u64::from(child.th),
+                u64::from(ep),
+                badge,
+                syscall_abi::FAULT_CLASS_ALL,
+            )
+        }
+    };
+    let forged = bind(0xF0_96ED);
+    let plain = bind(0);
+    let unbound = syscall::thread_set_fault_handler(child.th, 0, syscall_abi::FAULT_CLASS_ALL);
+
+    cap_delete(child.th).ok();
+    cap_delete(child.cs).ok();
+    cap_delete(ep).ok();
+    if forged != SyscallError::InvalidArgument as i64
+    {
+        return Err("thread::set_fault_handler_badge_arg_err: nonzero badge word not refused");
+    }
+    if plain != 0
+    {
+        return Err("thread::set_fault_handler_badge_arg_err: zero badge word refused");
+    }
+    unbound.map_err(|_| "thread::set_fault_handler_badge_arg_err: unbind failed")
+}
+
 /// A raw `SYS_THREAD_SET_PRIORITY` whose priority register exceeds 255 returns
 /// `InvalidArgument` even when its low byte is a level the `SchedControl` band
 /// covers (0x105 would otherwise set priority 5).

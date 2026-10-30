@@ -198,8 +198,8 @@ pub struct StartupInfo {
     /// procmgr at creation. See `process_abi::ProcessInfo::pager_endpoint_cap`.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub pager_endpoint_cap: u32,
-    /// Fault-message badge bound with [`Self::pager_endpoint_cap`]. Zero
-    /// when not demand-paged.
+    /// The derivation badge of [`Self::pager_endpoint_cap`], which the kernel
+    /// stamps on this process's fault messages. Zero when not demand-paged.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub pager_badge: u64,
     /// Mapped base virtual address of the main thread's TLS block, or zero when

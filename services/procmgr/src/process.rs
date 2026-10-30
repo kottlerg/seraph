@@ -808,8 +808,10 @@ unsafe fn populate_child_info(
     pi.main_tls_vaddr = if tls.memsz != 0 { layout.tls_base } else { 0 };
     // Advertise the demand-paging pager so the runtime can inherit it onto
     // spawned threads. The child's badged memmgr endpoint is the pager
-    // endpoint; the fault badge equals the child's memmgr badge so the
-    // kernel-synthesized fault is attributed to the right memmgr record.
+    // endpoint; the kernel stamps each fault with that cap's derivation
+    // badge, the child's memmgr badge, so the fault is attributed to the
+    // right memmgr record. `pager_badge` records the same value for the
+    // runtime's information; no binder passes it to the kernel.
     // procmgr binds the main thread separately in `finalize_creation`.
     if universals.demand_paged
     {
@@ -1405,11 +1407,12 @@ fn finalize_creation(
             if delegated
             {
                 // Bind only after the AS is delegated, so memmgr can service
-                // the first fault. fault_badge = the child's memmgr badge.
+                // the first fault. The kernel stamps each fault with the
+                // derivation badge of memmgr_send_cap, which memmgr minted as
+                // the child's memmgr badge.
                 let _ = syscall::thread_set_fault_handler(
                     child_thread,
                     memmgr_send_cap,
-                    memmgr_badge,
                     FAULT_CLASS_ALL,
                 );
             }

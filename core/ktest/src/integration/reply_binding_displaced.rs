@@ -30,12 +30,10 @@
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
-    notification_send, notification_wait, notification_wait_timeout, thread_exit,
-    thread_set_fault_handler, thread_sleep, thread_start, thread_stop,
+    notification_send, notification_wait, notification_wait_timeout, thread_exit, thread_sleep,
+    thread_start, thread_stop,
 };
-use syscall_abi::{
-    EXIT_FAULT_BASE, FAULT_CLASS_ALL, FAULT_LABEL, RIGHTS_EP_SEND_GRANT, SyscallError,
-};
+use syscall_abi::{EXIT_FAULT_BASE, FAULT_LABEL, RIGHTS_EP_SEND_GRANT, SyscallError};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -276,7 +274,7 @@ fn displace_fault(ctx: &TestContext, parts: &mut Parts, objects: &Objects, acc: 
         spawn::new_child(ctx)
             .map_err(|_| "integration::reply_binding_displaced: spawn faulter failed")?,
     );
-    thread_set_fault_handler(faulter.th, objects.ep, FAULT_BADGE, FAULT_CLASS_ALL)
+    crate::bind_fault_handler(faulter.th, objects.ep, FAULT_BADGE)
         .map_err(|_| "integration::reply_binding_displaced: thread_set_fault_handler failed")?;
     // The faulter stack belongs to this test's faulter, deleted before this
     // test returns.

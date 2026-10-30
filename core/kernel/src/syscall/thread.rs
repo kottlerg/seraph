@@ -1148,20 +1148,25 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 ///
 /// arg0 = Thread cap index (must have CONTROL) — the thread whose handler is set.
 /// arg1 = Endpoint cap index, or `0` to **unbind**.
-/// arg2 = binder-chosen `badge` delivered as the fault message badge (its
-///        attribution strength is in `docs/fault-handling.md` § Security).
+/// arg2 = reserved; MUST be `0`. The fault message badge is the derivation
+///        badge of the arg1 cap, never a binder-supplied value
+///        (`docs/fault-handling.md` § Security).
 /// arg3 = `fault_class_mask`; v1 accepts only [`syscall::FAULT_CLASS_ALL`].
 ///
 /// Binding takes a reference on the endpoint object for the binding's lifetime
 /// (see `docs/fault-handling.md` § Liveness); rebinding / unbinding / thread
 /// destruction releases it. The target Thread and the endpoint are pinned for
 /// the call (`lookup_cap`), so a concurrent delete of either one's last
-/// capability frees it only after the binding is published.
+/// capability frees it only after the binding is published. The endpoint and
+/// its badge are published as one unit under the target's `sched_lock`, the
+/// lock `ipc::fault::fault_dispatch` reads them under.
 /// Binding requires only a valid `Endpoint` cap — `CONTROL` on the thread is
-/// the authority; the endpoint cap merely names where this thread's
-/// kernel-unresolvable faults are delivered.
+/// the authority; the endpoint cap names where this thread's
+/// kernel-unresolvable faults are delivered and, by its badge, how they are
+/// attributed.
 ///
-/// Returns 0 on success.
+/// Returns 0 on success; `InvalidArgument` for a nonzero arg2 or an
+/// unsupported arg3.
 #[cfg(not(test))]
 pub fn sys_thread_set_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -1172,12 +1177,14 @@ pub fn sys_thread_set_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
 
     let thread_idx = tf.arg(0) as u32;
     let endpoint_idx = tf.arg(1) as u32;
-    let badge = tf.arg(2);
+    let reserved = tf.arg(2);
     let fault_class_mask = tf.arg(3);
 
     // v1 supports only the all-classes mask; the argument reserves the encoding
-    // for future per-class handlers without a new syscall.
-    if fault_class_mask != syscall::FAULT_CLASS_ALL
+    // for future per-class handlers without a new syscall. arg2 once carried a
+    // binder-chosen badge; it is reserved so a caller still passing one fails
+    // loudly instead of having its value ignored.
+    if reserved != 0 || fault_class_mask != syscall::FAULT_CLASS_ALL
     {
         return Err(SyscallError::InvalidArgument);
     }
@@ -1218,16 +1225,16 @@ pub fn sys_thread_set_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
         // SAFETY: caller_cspace validated; no specific endpoint right required.
         Some(unsafe { super::lookup_cap(caller_cspace, endpoint_idx, EpRights::NONE) }?)
     };
-    let new_ep: *mut EndpointObject = match &ep_slot
+    let (new_ep, new_badge): (*mut EndpointObject, u64) = match &ep_slot
     {
-        None => core::ptr::null_mut(),
+        None => (core::ptr::null_mut(), 0),
         Some(slot) =>
         {
             let obj = slot.object.ok_or(SyscallError::InvalidCapability)?;
             // cast_ptr_alignment: header at offset 0 of EndpointObject; allocator guarantees alignment.
             #[allow(clippy::cast_ptr_alignment)]
             let p = obj.as_ptr().cast::<EndpointObject>();
-            p
+            (p, slot.badge)
         }
     };
 
@@ -1239,32 +1246,33 @@ pub fn sys_thread_set_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
         unsafe { (*new_ep).header.inc_ref() };
     }
 
-    // Publish the badge first, then atomically swap the handler pointer, so a
-    // faulter that observes the new handler also observes the matching badge.
+    // Publish (endpoint, badge) as one unit under the target's sched_lock.
+    // `fault_dispatch` reads the pair under the same lock and takes its own
+    // reference on the endpoint before unlocking, so the release of the old
+    // binding below cannot free an endpoint a delivery still uses, and no
+    // faulter pairs one binding's endpoint with another's badge.
     // SAFETY: target_tcb is the TCB of the Thread object `thread_slot` pins;
-    // both fields are atomics safe to write cross-thread.
+    // lock_raw is paired with the unlock_raw below.
     let old_ep = unsafe {
-        (*target_tcb).fault_badge.store(badge, Ordering::Release);
-        (*target_tcb).fault_handler.swap(new_ep, Ordering::AcqRel)
+        let saved = (*target_tcb).sched_lock.lock_raw();
+        (*target_tcb)
+            .fault_badge
+            .store(new_badge, Ordering::Relaxed);
+        let old = (*target_tcb).fault_handler.swap(new_ep, Ordering::AcqRel);
+        (*target_tcb).sched_lock.unlock_raw(saved);
+        old
     };
 
     // Release the previous binding's reference, freeing the object if this was
-    // its last reference (mirrors cap_delete's dec-ref-then-dealloc, outside any
-    // lock since dealloc_object may take inner locks). Rebinding to the same
-    // endpoint nets to a no-op (the inc above balances this dec).
-    if !old_ep.is_null()
+    // its last reference, outside every lock (release_ref's precondition).
+    // Rebinding to the same endpoint nets to a no-op (the inc above balances
+    // this release).
+    if let Some(old) = core::ptr::NonNull::new(old_ep)
     {
-        // SAFETY: old_ep was a live EndpointObject referenced by this binding.
-        let remaining = unsafe { (*old_ep).header.dec_ref() };
-        if remaining == 0
-        {
-            // SAFETY: refcount reached 0; old_ep header is at offset 0.
-            unsafe {
-                crate::cap::object::dealloc_object(core::ptr::NonNull::new_unchecked(
-                    old_ep.cast::<KernelObjectHeader>(),
-                ));
-            }
-        }
+        // SAFETY: old was a live EndpointObject referenced by this binding,
+        // whose reference this call now owns; the header is at offset 0;
+        // syscall context with interrupts disabled and no lock held.
+        unsafe { crate::cap::object::release_ref(old.cast::<KernelObjectHeader>()) };
     }
 
     Ok(0)

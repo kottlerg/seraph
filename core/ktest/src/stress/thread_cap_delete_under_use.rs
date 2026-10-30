@@ -132,10 +132,6 @@ const BUSY_POLLS: u32 = 100_000;
 /// Bound on the wait for the caller to exit, in 1 ms polls.
 const EXIT_POLLS: u32 = 2000;
 
-/// Badge the caller binds the target's fault handler with; the target never
-/// faults, so it is never delivered.
-const BADGE: u64 = 0x5EED_0502;
-
 /// Register buffer size; holds the arch `TrapFrame`
 /// (`crate::arch::TRAP_FRAME_BYTES`) on every architecture, as the guard
 /// below checks.
@@ -582,11 +578,11 @@ fn group(handle: u32, regs: &mut [u8; REGS_BUF]) -> bool
     })
     .is_err()
         || call(BIND, None, || {
-            thread_set_fault_handler(handle, ep, BADGE, FAULT_CLASS_ALL).map(|()| 0)
+            thread_set_fault_handler(handle, ep, FAULT_CLASS_ALL).map(|()| 0)
         })
         .is_err()
         || call(UNBIND, None, || {
-            thread_set_fault_handler(handle, 0, 0, FAULT_CLASS_ALL).map(|()| 0)
+            thread_set_fault_handler(handle, 0, FAULT_CLASS_ALL).map(|()| 0)
         })
         .is_err()
     {

@@ -50,27 +50,26 @@ and it cannot be forged: badges are minted by `cap_derive_badge` only
 under the kernel's derivation rules, and procmgr is the only process
 that holds memmgr's procmgr-only cap. See
 [docs/capability-model.md](../../../docs/capability-model.md) §"Badges".
-The fault-message badge is the exception, covered below.
+The fault-message badge carries the same guarantee, as below.
 
 A third, kernel-origin class is the **fault message**: when a demand-paged
 process's thread takes a page fault, the kernel synthesises an IPC to
 memmgr's endpoint with label `FAULT_LABEL` (`u64::MAX - 1`) and `badge`
-set to the value bound by `SYS_THREAD_SET_FAULT_HANDLER`. The binding is
-installed by procmgr for a process's main thread and by the runtime for
-each thread it spawns, and both set the badge to the process's memmgr
+set to the derivation badge of the Endpoint cap bound by
+`SYS_THREAD_SET_FAULT_HANDLER`. The binding is installed by procmgr for a
+process's main thread and by the runtime for each thread it spawns, and
+both bind the process's own badged memmgr cap
+(`ProcessInfo.pager_endpoint_cap`), so the badge is the process's memmgr
 badge. The fault endpoint is memmgr's client endpoint, so any holder of a
 badged SEND cap can also send a message labelled `FAULT_LABEL`; memmgr
-does not distinguish it from a kernel delivery, but such a message
-carries the badge of the sender's own cap, so it is attributed to the
-sender. The fault badge is whatever value the binder passes, and any
-client holding a cap to this endpoint can also bind its own thread's
-fault handler to it with an arbitrary badge (see
-[docs/fault-handling.md](../../../docs/fault-handling.md) §"Security").
-memmgr's attribution of a fault to a process therefore rests on its
-process badges being unguessable, not unforgeable: a client that learns
-another process's badge can bind its own thread with that badge and, by
-faulting, direct memmgr to back any chunk of the regions that process
-registered (one chunk per forged fault).
+does not distinguish it from a kernel delivery, and either way the message
+carries the badge of a cap the sender holds, so it is attributed to the
+sender. A client may bind its own threads to this endpoint, but the binder
+cannot choose the badge (see
+[docs/fault-handling.md](../../../docs/fault-handling.md) §"Security"), so
+a client holding only its own memmgr cap cannot make memmgr back a fault
+in another process's regions: memmgr's attribution of a fault rests on the
+derivation-locked badge, not on badge secrecy.
 
 ---
 
@@ -456,9 +455,10 @@ pool as on `PROCESS_DIED`, so the all-RAM-accounted identity is unaffected.
 
 Not a callable label. When a demand-paged process's thread takes a page
 fault the kernel cannot resolve, it synthesises an IPC to memmgr's
-endpoint with label `FAULT_LABEL` (`u64::MAX - 1`), `badge` = the value
-bound by `SYS_THREAD_SET_FAULT_HANDLER` (which procmgr and the runtime set
-to the process's memmgr badge), and data words `[kind, faulting_va, access, ip]`
+endpoint with label `FAULT_LABEL` (`u64::MAX - 1`), `badge` = the derivation
+badge of the Endpoint cap bound by `SYS_THREAD_SET_FAULT_HANDLER` (procmgr and
+the runtime bind the process's own badged memmgr cap, so this is the process's
+memmgr badge), and data words `[kind, faulting_va, access, ip]`
 (see [docs/fault-handling.md](../../../docs/fault-handling.md)). For a
 `FAULT_KIND_VM` fault whose `faulting_va` lies in a registered region of a
 process with a delegated address space, memmgr backs the contiguous chunk of

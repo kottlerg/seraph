@@ -52,12 +52,11 @@ use boot_protocol::layout::{
 };
 use ipc::IpcMessage;
 use syscall::{
-    cap_create_endpoint, cap_delete, mem_map, mem_unmap, thread_read_regs,
-    thread_set_fault_handler, thread_write_regs,
+    cap_create_endpoint, cap_delete, mem_map, mem_unmap, thread_read_regs, thread_write_regs,
 };
 use syscall_abi::{
-    FAULT_ACCESS_PRESENT, FAULT_ACCESS_READ, FAULT_ACCESS_WRITE, FAULT_CLASS_ALL, FAULT_KIND_VM,
-    FAULT_LABEL, FAULT_REPLY_RESUME, MAP_READ,
+    FAULT_ACCESS_PRESENT, FAULT_ACCESS_READ, FAULT_ACCESS_WRITE, FAULT_KIND_VM, FAULT_LABEL,
+    FAULT_REPLY_RESUME, MAP_READ,
 };
 
 use super::IP_OFFSET;
@@ -139,7 +138,7 @@ fn handle_child(ctx: &TestContext) -> TestResult
         return Err("page_fault_present_bit: spawn::new_child failed");
     };
 
-    let result = thread_set_fault_handler(child.th, ep, FAULT_BADGE, FAULT_CLASS_ALL)
+    let result = crate::bind_fault_handler(child.th, ep, FAULT_BADGE)
         .map_err(|_| "page_fault_present_bit: thread_set_fault_handler failed")
         .and_then(|()| {
             let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));

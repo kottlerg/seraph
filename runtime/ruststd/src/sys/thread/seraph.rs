@@ -368,7 +368,6 @@ impl Thread {
             let _ = syscall::thread_set_fault_handler(
                 thread_cap,
                 info.pager_endpoint_cap,
-                info.pager_badge,
                 FAULT_CLASS_ALL,
             );
         }

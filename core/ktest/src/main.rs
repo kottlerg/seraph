@@ -718,6 +718,24 @@ fn wait_us(target_us: u64)
     }
 }
 
+/// Bind `thread`'s fault handler to `endpoint` so its fault messages carry
+/// `badge`.
+///
+/// The kernel stamps a fault with the derivation badge of the bound Endpoint
+/// cap (docs/fault-handling.md § Security), so this binds a cap derived from
+/// `endpoint` with `badge` attached, then deletes that cap: the binding holds
+/// its own reference on the endpoint object and the badge it was bound with.
+///
+/// # Errors
+/// The failing syscall's error code.
+pub fn bind_fault_handler(thread: u32, endpoint: u32, badge: u64) -> Result<(), i64>
+{
+    let badged = syscall::cap_derive_badge(endpoint, syscall::RIGHTS_ALL, badge)?;
+    let bound = syscall::thread_set_fault_handler(thread, badged, syscall_abi::FAULT_CLASS_ALL);
+    let deleted = syscall::cap_delete(badged);
+    bound.and(deleted)
+}
+
 /// The widest CPU count at which ktest's attempt counts and wall-clock
 /// budgets apply as written. Past it a boot is an oversubscribed boundary
 /// run, where every cross-CPU handoff waits for a host core, so an

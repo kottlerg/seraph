@@ -30,11 +30,11 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_wait,
-    thread_read_regs, thread_set_fault_handler, thread_write_regs,
+    thread_read_regs, thread_write_regs,
 };
 use syscall_abi::{
-    FAULT_CLASS_ALL, FAULT_EXC_ILLEGAL_INSTRUCTION, FAULT_KIND_EXCEPTION, FAULT_LABEL,
-    FAULT_REPLY_RESUME, RIGHTS_ALL,
+    FAULT_EXC_ILLEGAL_INSTRUCTION, FAULT_KIND_EXCEPTION, FAULT_LABEL, FAULT_REPLY_RESUME,
+    RIGHTS_ALL,
 };
 
 use crate::arch::IP_OFFSET;
@@ -68,7 +68,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "fault_exception_redirect: cap_copy(sig) failed")?;
     RECOVERY_SIG.store(child_sig, Ordering::Release);
 
-    thread_set_fault_handler(child.th, ep, FAULT_BADGE, FAULT_CLASS_ALL)
+    crate::bind_fault_handler(child.th, ep, FAULT_BADGE)
         .map_err(|_| "fault_exception_redirect: thread_set_fault_handler failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));

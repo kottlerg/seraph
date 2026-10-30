@@ -106,7 +106,8 @@ logd/
 
 ## Bootstrap caps
 
-svcmgr's bootstrap round (one round, `done = true`) delivers four caps,
+svcmgr's bootstrap round (one round, `done = true`) fills four positional slots, carrying only
+the present caps and a presence word naming the slot each fills (an absent slot reads as `0`),
 minted from the reserved log-sink sources svcmgr holds (master-log
 endpoint, procmgr `SEND|GRANT`, devmgr registry; see
 [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md)
@@ -115,7 +116,7 @@ and [`docs/ipc-interface.md`](docs/ipc-interface.md)):
 | Index | Cap |
 |---|---|
 | 0 | RECV on the master log endpoint |
-| 1 | SEND on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE`, repeated after a further drain while init-logd defers it, then deleted; see [`docs/handover-protocol.md`](docs/handover-protocol.md)). `0` on a restart — there is no init-logd left to pull from, so logd skips the handover (restart: design intent; not yet implemented (#262)) |
+| 1 | SEND on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE`, repeated after a further drain while init-logd defers it, then deleted; see [`docs/handover-protocol.md`](docs/handover-protocol.md)). Absent on a restart — there is no init-logd left to pull from, so logd skips the handover (restart: design intent; not yet implemented (#262)) |
 | 2 | Badged `SEND\|GRANT` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | Badged SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE` and the framebuffer driver via `QUERY_FRAMEBUFFER_DEVICE`) |
 

@@ -42,6 +42,14 @@ pub unsafe fn init(info: &InitInfo, aspace_cap: u32, thread_cap: u32)
     unsafe { SERIAL_READY = ready };
 }
 
+/// Whether the UART is initialised, so its registers may be programmed
+/// (`crate::arch::serial::raise_tx_interrupt` and its sibling).
+pub fn is_ready() -> bool
+{
+    // SAFETY: single-threaded read of flag set during init.
+    unsafe { SERIAL_READY }
+}
+
 /// Write a single byte to the serial port.
 ///
 /// No-op if serial has not been initialised.

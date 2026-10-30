@@ -45,6 +45,12 @@
 //                or rebased branch still works. Only files the PR diff also
 //                touches are reviewed, so files a merge or rebase of the base
 //                brought in are not.
+//   Every stage takes the PR diff from the local tree (`git diff <base> <head>`,
+//   the merge base resolved against `origin/<baseRefName>`), never from
+//   `gh pr diff` or the `files` field of `gh pr view`, which GitHub caps (300
+//   files or 20000 lines for the diff, 100 files for the field). The script
+//   checks the returned file lists against the count the scope agent reads from
+//   the same local diff, and aborts rather than review a partial list.
 //   ledger       path of the ledger file `.claude/CLAUDE.md` § PR workflow
 //                operations builds; required in 'delta' mode and taken in
 //                every mode once one exists, so a full run after an earlier
@@ -133,8 +139,8 @@ const SCOPE_SCHEMA = {
     type: 'object',
     required: [
         'head', 'base', 'since_base', 'repo_root', 'tree_at_head', 'since_reachable',
-        'pr_has_code', 'files', 'pr_files', 'open_issues', 'changed_items', 'design_docs',
-        'claimed_fixes',
+        'pr_has_code', 'files', 'pr_files', 'pr_file_count', 'open_issues', 'changed_items',
+        'design_docs', 'claimed_fixes',
     ],
     properties: {
         head: { type: 'string', description: 'Full SHA of the PR head commit.' },
@@ -183,8 +189,15 @@ const SCOPE_SCHEMA = {
             items: { type: 'string', description: PATH_DESCRIPTION },
             description:
                 'Every file the whole PR diff touches, whatever the mode (the delta is limited ' +
-                'to these files, and the script filters on them as a backstop and for the ' +
-                'in-bound gate).',
+                'to these files, and the script checks the delta against them and keys the ' +
+                'in-bound gate on them).',
+        },
+        pr_file_count: {
+            type: 'integer',
+            description:
+                'The number `git diff --name-only --no-renames <base> <head> | wc -l` prints; ' +
+                'the script aborts when `pr_files` (or, in full mode, `files`) holds a ' +
+                'different number of paths.',
         },
         open_issues: {
             type: 'array',
@@ -420,10 +433,15 @@ const SCOPE_PROMPT = [
     'Scope pull request #' + PR + ' for a sharded review.' +
         (DELTA ? ' Re-review: the previous run reviewed head ' + SINCE + '.' : ''),
     '',
-    'Run `gh pr view ' + PR + ' --json headRefOid,baseRefName,body,files,commits`, ' +
-        '`git merge-base <head> origin/<baseRefName>`, `git rev-parse --show-toplevel`, ' +
-        '`git rev-parse HEAD`, `git status --porcelain`, `gh pr diff ' + PR + '`, and ' +
-        '`gh issue list --state open --limit 500 --json number,title`.' +
+    'Run `gh pr view ' + PR + ' --json headRefOid,baseRefName,body,commits`, ' +
+        '`git merge-base <head> origin/<baseRefName>` (the base), `git rev-parse ' +
+        '--show-toplevel`, `git rev-parse HEAD`, `git status --porcelain`, `git diff ' +
+        '--name-only --no-renames <base> <head>` (the PR diff\'s file list; count its lines ' +
+        'with `wc -l`), `git diff --numstat --no-renames <base> <head>` (its line counts), ' +
+        '`git diff <base> <head>` (the PR diff), and `gh issue list --state open --limit 500 ' +
+        '--json number,title`. Take the PR diff and its file list only from the local tree: ' +
+        '`gh pr diff` and the `files` field of `gh pr view` are capped by GitHub (300 files ' +
+        'or 20000 lines; 100 files) and must not be used.' +
         (DELTA
             ? ' Then run `git cat-file -e ' + SINCE + '^{commit}` (reachability), ' +
                 '`git merge-base ' + SINCE + ' origin/<baseRefName>` (since_base), ' +
@@ -448,13 +466,17 @@ const SCOPE_PROMPT = [
     '- pr_has_code: whether the whole PR diff changes a file of kind code.',
     '- files: one entry per file in ' +
         (DELTA
-            ? 'the delta (every file it lists; the script drops, and logs, a file the ' +
-                'whole PR diff does not touch)'
-            : 'the PR diff') +
-        ', with path; changed = added plus deleted lines; kind = code (Rust, assembly, ' +
+            ? 'the delta (every file it lists; the script aborts on a file the whole PR ' +
+                'diff does not touch, since it cannot confirm that file\'s membership)'
+            : 'the PR diff, one per path the name-only list prints, a symlink or submodule ' +
+                'entry included') +
+        ', with path; changed = added plus deleted lines (0 where numstat prints `-`); kind = ' +
+        'code (Rust, assembly, ' +
         'linker scripts, build inputs, anything a build embeds), markdown, comment-only (only ' +
         'comment lines changed), rules (`.claude/` and `.github/`), or other.',
-    '- pr_files: every file the whole PR diff touches, whatever the mode.',
+    '- pr_files: every path `git diff --name-only --no-renames <base> <head>` prints, ' +
+        'whatever the mode, none omitted however long the list; pr_file_count: the number of ' +
+        'those paths, as `wc -l` counts them. The script aborts when the two disagree.',
     '- open_issues: every open Issue, by number and title.',
     '- changed_items: every public or crate-visible function, type, trait, constant, syscall, ' +
         'or wire-protocol element whose signature, contract, semantics, or documentation the ' +
@@ -519,17 +541,39 @@ const normalize = (p) => {
     return s
 }
 for (const f of scope.files) f.path = normalize(f.path)
-// The in-bound gate keys on the PR's own file list; in full mode that is the
-// files list itself, and in delta mode an empty list would silently leave
-// every correctness, safety, or contract finding the reviewer marked out of
-// bound recorded. Scope mode returns the plan before the gate applies.
-const pr_files = new Set(
-    DELTA ? scope.pr_files.map(normalize) : scope.files.map((f) => f.path),
-)
+// The in-bound gate and the delta check key on the PR's own file list. A list
+// shorter than the local name-only diff would silently leave correctness,
+// safety, or contract findings the reviewer marked out of bound recorded, and
+// in full mode leave files unreviewed, so every mode, scope mode included,
+// aborts unless the list has exactly the count the scope agent read.
+const pr_files = new Set(scope.pr_files.map(normalize))
 const open_issue_numbers = new Set(scope.open_issues.map((i) => i.number))
 const issue_title = (n) => (scope.open_issues.find((i) => i.number === n) || {}).title || ''
-if (DELTA && MODE !== 'scope' && pr_files.size === 0) {
-    return { error: 'scope returned no pr_files; the in-bound gate cannot be applied' }
+if (!Number.isInteger(scope.pr_file_count) || scope.pr_file_count < 0) {
+    return { error: 'scope returned no pr_file_count; the PR file list cannot be confirmed' }
+}
+if (scope.pr_file_count === 0) {
+    return {
+        error: 'the PR diff against merge base ' + scope.base + ' is empty; nothing to review',
+    }
+}
+if (pr_files.size !== scope.pr_file_count) {
+    return {
+        error: 'scope returned ' + pr_files.size + ' pr_files for a PR diff of ' +
+            scope.pr_file_count + ' files; the in-bound gate cannot be applied',
+    }
+}
+if (!DELTA) {
+    const listed = new Set(scope.files.map((f) => f.path))
+    const missing = [...pr_files].filter((p) => !listed.has(p))
+    if (missing.length || listed.size !== pr_files.size) {
+        return {
+            error: 'scope returned ' + listed.size + ' files for a PR diff of ' +
+                pr_files.size + ' files' +
+                (missing.length ? ', missing ' + missing.slice(0, 10).join(', ') : '') +
+                '; a full review cannot leave PR files out',
+        }
+    }
 }
 for (const i of scope.changed_items) i.file = normalize(i.file)
 for (const c of scope.claimed_fixes) c.file = normalize(c.file)
@@ -537,13 +581,19 @@ scope.design_docs = scope.design_docs.map(normalize)
 // A delta reviews only the PR's own files: one a merge or rebase of the base
 // branch changed between `since` and the head is master's, not this PR's. The
 // numstat runs without rename detection, so a renamed file keeps its new path.
-// The scope agent lists only the PR's files, so this filter is a backstop that
-// logs what it drops; base hunks inside a PR file are told apart by provenance.
-if (DELTA && pr_files.size > 0) {
-    for (const f of scope.files) {
-        if (!pr_files.has(f.path)) log('delta: ' + f.path + ' is not in the PR diff; not reviewed')
+// The scope agent limits the delta to the PR's files, so a delta file outside
+// `pr_files` means one of the two lists is wrong; the run aborts rather than
+// drop a file whose PR-diff membership it cannot confirm. Base hunks inside a
+// PR file are told apart by provenance.
+if (DELTA) {
+    const outside = scope.files.filter((f) => !pr_files.has(f.path)).map((f) => f.path)
+    if (outside.length) {
+        return {
+            error: 'delta files not in pr_files (' + outside.slice(0, 10).join(', ') +
+                (outside.length > 10 ? ', ...' : '') + '); their PR-diff membership cannot ' +
+                'be confirmed, so nothing was reviewed',
+        }
     }
-    scope.files = scope.files.filter((f) => pr_files.has(f.path))
 }
 
 const shards = shards_of(scope.files)
@@ -564,8 +614,9 @@ log(
 
 const HEAD_LINE =
     'Scope: pull request #' + PR + ', mode ' + MODE + '. Merge base ' + scope.base + ', head ' +
-    scope.head + '. The working tree is checked out at the head; `gh pr diff ' + PR +
-    '` is the PR diff' +
+    scope.head + '. The working tree is checked out at the head; `git diff ' + scope.base + ' ' +
+    scope.head + '` is the PR diff (not `gh pr diff`, which GitHub caps at 300 files or 20000 ' +
+    'lines)' +
     (DELTA
         ? ' and `git diff ' + SINCE + ' ' + scope.head + ' -- <the PR diff\'s files>` is the ' +
             'delta (a file only a merge or rebase of the base changed is not in it). A delta ' +
@@ -822,7 +873,8 @@ function verify_prompt(f, lens) {
         f.issue ? '- named open Issue: #' + f.issue + ' ' + issue_title(f.issue) : null,
     ].filter((line) => line !== null).join('\n')
     const tree =
-        'The working tree is checked out at the head; `gh pr diff ' + PR + '` is the diff. ' +
+        'The working tree is checked out at the head; `git diff ' + scope.base + ' ' +
+            scope.head + '` is the diff (not `gh pr diff`, which GitHub caps). ' +
         'A defect may be in code or in a document; an absence (a missing check, test, or ' +
         'statement) is exhibited by the place where it should be.' +
         (LEDGER === null

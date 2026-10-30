@@ -66,11 +66,10 @@ use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, cap_info, ipc_buffer_set,
     notification_send, notification_wait_timeout, system_info, thread_exit, thread_set_affinity,
-    thread_set_fault_handler,
 };
 use syscall_abi::{
-    CAP_INFO_TAG_RIGHTS, FAULT_CLASS_ALL, FAULT_LABEL, FAULT_REPLY_RESUME, RIGHTS_ALL,
-    RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, SyscallError, SystemInfoType,
+    CAP_INFO_TAG_RIGHTS, FAULT_LABEL, FAULT_REPLY_RESUME, RIGHTS_ALL, RIGHTS_EP_RECEIVE,
+    RIGHTS_EP_SEND_GRANT, SyscallError, SystemInfoType,
 };
 
 use crate::tally::{BadTally, await_report};
@@ -285,7 +284,7 @@ fn race(ctx: &TestContext, round: &mut Round, kind: u32, cycle: u32) -> Result<u
     let (c_ep, c_done) = (c_ep?, c_done?);
     let entry: extern "C" fn(u64) -> ! = if kind == KIND_FAULT
     {
-        thread_set_fault_handler(th, round.ep, FAULT_BADGE, FAULT_CLASS_ALL)
+        crate::bind_fault_handler(th, round.ep, FAULT_BADGE)
             .map_err(|_| "stress::reply_caller_delete: thread_set_fault_handler failed")?;
         faulter_entry
     }

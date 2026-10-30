@@ -100,9 +100,20 @@ impl Drop for Guest
 {
     fn drop(&mut self)
     {
-        // Best-effort teardown: both calls fail harmlessly when QEMU has
-        // already exited and been reaped (after `wait_exit`), and a drop
-        // has no caller to report to.
+        self.teardown();
+    }
+}
+
+impl Guest
+{
+    /// Kill QEMU, reap it, and join the reader thread. Idempotent: a
+    /// second call (the drop after an explicit one) finds the child
+    /// reaped and the reader joined.
+    fn teardown(&mut self)
+    {
+        // Best-effort: both calls fail harmlessly when QEMU has already
+        // exited and been reaped (after `wait_exit`), and a drop has no
+        // caller to report to.
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(r) = self.reader.take()
@@ -110,10 +121,50 @@ impl Drop for Guest
             let _ = r.join();
         }
     }
-}
 
-impl Guest
-{
+    /// Wrap a spawned child whose stdout is piped, starting the thread that
+    /// reads its serial lines.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the child's stdout was not piped; the child is then
+    /// killed and reaped before returning, so it is not orphaned.
+    fn from_child(mut child: Child) -> Result<Self>
+    {
+        let Some(stdout) = child.stdout.take()
+        else
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("QEMU stdout unavailable");
+        };
+
+        // Read serial on a worker thread so the caller can enforce timeouts
+        // via recv_timeout (std pipes have no read deadline).
+        let (tx, rx) = mpsc::channel::<String>();
+        let reader = thread::spawn(move || {
+            let buf = BufReader::new(stdout);
+            for line in std::io::BufRead::lines(buf)
+            {
+                let Ok(l) = line
+                else
+                {
+                    break;
+                };
+                if tx.send(l).is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        Ok(Self {
+            child,
+            lines: rx,
+            reader: Some(reader),
+        })
+    }
+
     fn launch(
         qemu_binary: &Path,
         ctx: &Context,
@@ -141,39 +192,14 @@ impl Guest
         };
         let qemu_args = build_qemu_argv(&spec)?;
 
-        let mut child = Command::new(qemu_binary)
+        let child = Command::new(qemu_binary)
             .args(&qemu_args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
             .context("spawning qemu-system-x86_64")?;
-        let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
-
-        // Read serial on a worker thread so the caller can enforce timeouts
-        // via recv_timeout (std pipes have no read deadline).
-        let (tx, rx) = mpsc::channel::<String>();
-        let reader = thread::spawn(move || {
-            let buf = BufReader::new(stdout);
-            for line in std::io::BufRead::lines(buf)
-            {
-                let Ok(l) = line
-                else
-                {
-                    break;
-                };
-                if tx.send(l).is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        Ok(Self {
-            child,
-            lines: rx,
-            reader: Some(reader),
-        })
+        Self::from_child(child)
     }
 
     /// Echo serial lines until every marker has appeared (in any order) or
@@ -203,7 +229,7 @@ impl Guest
     }
 
     /// Kill QEMU and reap it now rather than at the end of scope (the
-    /// teardown is `Drop`'s).
+    /// teardown is [`Guest::teardown`], which `Drop` runs).
     fn shutdown(self)
     {
         drop(self);
@@ -293,4 +319,67 @@ pub fn run(ctx: &Context, args: &TestVmgenidArgs) -> Result<()>
 
     step("vmgenid snapshot-resume test: PASS (detection + post-resume liveness)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// A `cat` stand-in for QEMU: it runs until its stdin reaches EOF, and
+    /// the test holds the write end in `child.stdin`. A broken teardown
+    /// therefore cannot leave it on the host: dropping the `Child` closes
+    /// that pipe and `cat` exits. It exits successfully only on that EOF.
+    fn stand_in(stdout: Stdio) -> Child
+    {
+        Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(stdout)
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn teardown_kills_reaps_and_joins_a_live_guest()
+    {
+        let mut guest = Guest::from_child(stand_in(Stdio::piped())).unwrap();
+        guest.teardown();
+        // The status comes from the `Child` handle, cached by the reap: no
+        // pid lookup. `None` means the child was not reaped. A success
+        // status means it was never killed and only left on the stdin EOF
+        // that `Child::wait` causes.
+        let status = guest.child.try_wait().unwrap();
+        assert!(status.is_some_and(|s| !s.success()));
+        // A joined reader has returned and dropped its sender.
+        assert!(matches!(
+            guest.lines.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn wait_exit_fails_on_a_live_guest_past_its_deadline()
+    {
+        // The stand-in cannot exit while the test holds its stdin, so the
+        // first poll finds it running and the zero deadline has passed.
+        let guest = Guest::from_child(stand_in(Stdio::piped())).unwrap();
+        assert!(guest.wait_exit(Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn wait_exit_succeeds_once_the_guest_has_exited()
+    {
+        // Reaped through the handle first, so the first poll sees the exit
+        // and no deadline is involved.
+        let mut guest = Guest::from_child(stand_in(Stdio::piped())).unwrap();
+        guest.child.kill().unwrap();
+        guest.child.wait().unwrap();
+        assert!(guest.wait_exit(Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn from_child_rejects_a_child_without_piped_stdout()
+    {
+        assert!(Guest::from_child(stand_in(Stdio::null())).is_err());
+    }
 }

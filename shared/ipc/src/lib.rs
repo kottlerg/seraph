@@ -757,7 +757,7 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 6;
+pub const SVCMGR_LABELS_VERSION: u32 = 7;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -779,7 +779,11 @@ pub mod svcmgr_labels
     // the endowment are the `svcmgr-endowment` crate
     // (`services/svcmgr/endowment`); see
     // `services/svcmgr/docs/ipc-interface.md` and
-    // `services/svcmgr/docs/service-definitions.md` for the spec.
+    // `services/svcmgr/docs/service-definitions.md` for the spec. The
+    // bootstrap round svcmgr serves each child it launches (the `seed` and
+    // `log_sink` rounds) carries only the present caps and a presence word
+    // in `data[0]` (`bootstrap::pack_slots` / `bootstrap::unpack_slots`);
+    // that layout is part of this version.
 
     /// Internal namespace-policy descriptor stored on `ServiceEntry`
     /// (one of the values below). Parsed by svcmgr from each
@@ -940,10 +944,10 @@ pub mod published_names
 
     /// TODO(#165): remove with devmgr's test labels. SEND on devmgr's
     /// registry endpoint badged
-    /// `REGISTRY_QUERY_AUTHORITY | ORPHAN_TEST_AUTHORITY`: the
-    /// `devmgr.registry` surface plus the `TEST_SPAWN_ORPHAN` /
-    /// `TEST_ORPHAN_RESULT` fault-injection shim. Seed-only and seeded only
-    /// by svctest.
+    /// `REGISTRY_QUERY_AUTHORITY | TEST_LABEL_AUTHORITY`: the
+    /// `devmgr.registry` surface plus devmgr's test labels: the
+    /// `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` fault-injection shim and
+    /// `TEST_QUERY_DENY_DEVICE`. Seed-only and seeded only by svctest.
     pub const DEVMGR_TEST: &[u8] = b"devmgr.test";
 }
 
@@ -1379,7 +1383,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 9;
+pub const DEVMGR_LABELS_VERSION: u32 = 10;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -1566,7 +1570,7 @@ pub mod devmgr_labels
     /// round-2 bootstrap failure and stashes the outcome for
     /// [`TEST_ORPHAN_RESULT`]. Request: `data[0]` = caller's compiled
     /// [`super::DEVMGR_LABELS_VERSION`]. Caller's badge MUST carry
-    /// [`ORPHAN_TEST_AUTHORITY`]; the handler replies
+    /// [`TEST_LABEL_AUTHORITY`]; the handler replies
     /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise and
     /// [`super::devmgr_errors::LABEL_VERSION_MISMATCH`] on a version
     /// mismatch, without spawning.
@@ -1577,6 +1581,25 @@ pub mod devmgr_labels
     /// unexpected success, `3` shim setup error. Request and gate as
     /// [`TEST_SPAWN_ORPHAN`].
     pub const TEST_ORPHAN_RESULT: u64 = 10;
+    /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
+    /// label: mint a SEND on one driver's service endpoint badged
+    /// [`TEST_DENY_BADGE`], which carries none of the driver's verb bits, so
+    /// a harness can assert the driver's `UNAUTHORIZED` reply. No other
+    /// path mints a SEND on these endpoints without the bit, and a holder
+    /// cannot strip a bit from a badged cap. Request: `data[0]` = caller's
+    /// compiled [`super::DEVMGR_LABELS_VERSION`]; `data[1]` = the query label
+    /// naming the driver ([`QUERY_SERIAL_DEVICE`], [`QUERY_INPUT_DEVICE`], or
+    /// [`QUERY_FRAMEBUFFER_DEVICE`]). Gate as [`TEST_SPAWN_ORPHAN`]. Reply:
+    /// `SUCCESS` with the SEND in `caps[0]`; `NO_DEVICE` when that driver is
+    /// not running; `INVALID_REQUEST` for any other `data[1]` or a failed
+    /// derive.
+    pub const TEST_QUERY_DENY_DEVICE: u64 = 12;
+    /// TODO(#165): remove with [`TEST_QUERY_DENY_DEVICE`]. The badge devmgr
+    /// stamps on a [`TEST_QUERY_DENY_DEVICE`] SEND: no verb bit of the
+    /// serial, input, or framebuffer driver, and non-zero, since a holder
+    /// may badge an un-badged SEND itself
+    /// (docs/capability-model.md § Verb-bit authority pattern).
+    pub const TEST_DENY_BADGE: u64 = 1;
 
     /// Authority bit in the devmgr-registry-endpoint badge's high
     /// u64 bit, gating the device-endpoint queries ([`QUERY_SERIAL_DEVICE`],
@@ -1603,11 +1626,12 @@ pub mod devmgr_labels
     /// holds the bit. Disjoint position from the other authority bits.
     pub const SHUTDOWN_DEVICE_AUTHORITY: u64 = 1u64 << 61;
     /// TODO(#165): remove with the test labels. Authority bit gating
-    /// [`TEST_SPAWN_ORPHAN`] and [`TEST_ORPHAN_RESULT`]. svcmgr mints it,
+    /// [`TEST_SPAWN_ORPHAN`], [`TEST_ORPHAN_RESULT`], and
+    /// [`TEST_QUERY_DENY_DEVICE`]. svcmgr mints it,
     /// beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
     /// seed-only as [`crate::published_names::DEVMGR_TEST`], which svctest
     /// alone seeds. Disjoint position from the other authority bits.
-    pub const ORPHAN_TEST_AUTHORITY: u64 = 1u64 << 60;
+    pub const TEST_LABEL_AUTHORITY: u64 = 1u64 << 60;
     /// Authority bit gating [`QUERY_BLOCK_DEVICE`], whose reply is a
     /// `MOUNT_AUTHORITY`-badged whole-disk cap. init mints it, beside
     /// [`REGISTRY_QUERY_AUTHORITY`], only onto the registry SEND it hands
@@ -2067,7 +2091,7 @@ pub const VERB_BIT_MASK: u64 =
     (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60) | (1u64 << 59);
 const _: () = core::assert!(
     devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
-        && devmgr_labels::ORPHAN_TEST_AUTHORITY & VERB_BIT_MASK != 0
+        && devmgr_labels::TEST_LABEL_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::BLOCK_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
 );
 

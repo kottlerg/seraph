@@ -180,9 +180,10 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   - `devmgr.shutdown` — the same SEND with `SHUTDOWN_DEVICE_AUTHORITY`
     added, gating `QUERY_SHUTDOWN_DEVICE`; pwrmgr is the only recipe
     seeding it.
-  - `devmgr.test` — the same SEND with `ORPHAN_TEST_AUTHORITY` added,
-    gating devmgr's `TEST_SPAWN_ORPHAN` / `TEST_ORPHAN_RESULT` shim
-    (TODO(#165)); svctest is the only recipe seeding it.
+  - `devmgr.test` — the same SEND with `TEST_LABEL_AUTHORITY` added,
+    gating devmgr's test labels, the `TEST_SPAWN_ORPHAN` /
+    `TEST_ORPHAN_RESULT` shim and `TEST_QUERY_DENY_DEVICE` (TODO(#165));
+    svctest is the only recipe seeding it.
   - `SET_DRIVERS_DIR` — svcmgr walks its universal root to
     `/services/drivers/` at `LOOKUP | READ` and hands devmgr the subtree
     cap on a `DRIVERS_DIR_AUTHORITY`-badged copy of the

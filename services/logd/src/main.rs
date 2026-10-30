@@ -73,7 +73,7 @@ const WS_BADGE_LOG: u64 = 0;
 /// `WaitSet` badge for the death-notification event queue.
 const WS_BADGE_DEATH: u64 = 1;
 
-/// Caps real-logd receives from init's bootstrap round.
+/// Caps real-logd receives from svcmgr's bootstrap round; an absent slot is `0`.
 struct BootCaps
 {
     /// RECV cap on the master log endpoint. Real-logd is now the
@@ -104,15 +104,28 @@ fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let round = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
-    if round.cap_count < 4 || !round.done
+    if !round.done
+    {
+        return None;
+    }
+    // The round carries only the present caps and a presence word naming
+    // the slot each fills; an absent slot decodes as `0`. Only the RECV is
+    // required.
+    let [
+        log_ep_recv,
+        log_ep_handover_send,
+        procmgr_death_auth_send,
+        devmgr_registry_ep,
+    ] = ipc::bootstrap::unpack_slots(&round).ok()?;
+    if log_ep_recv == 0
     {
         return None;
     }
     Some(BootCaps {
-        log_ep_recv: round.caps[0],
-        log_ep_handover_send: round.caps[1],
-        procmgr_death_auth_send: round.caps[2],
-        devmgr_registry_ep: round.caps[3],
+        log_ep_recv,
+        log_ep_handover_send,
+        procmgr_death_auth_send,
+        devmgr_registry_ep,
     })
 }
 

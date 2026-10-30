@@ -250,7 +250,7 @@ fn publish_well_known(
         ),
         (
             ipc::published_names::DEVMGR_TEST,
-            query | ipc::devmgr_labels::ORPHAN_TEST_AUTHORITY,
+            query | ipc::devmgr_labels::TEST_LABEL_AUTHORITY,
         ),
     ]
     {

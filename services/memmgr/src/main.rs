@@ -1663,10 +1663,11 @@ fn handle_delegate_aspace(req: &IpcMessage, caps: &[u32], ipc_buf: *mut u64, pro
 
 /// Service a kernel-synthesized page fault for a demand-paged process.
 ///
-/// `req.badge` is the value bound by `SYS_THREAD_SET_FAULT_HANDLER` (procmgr
-/// and the runtime bind the process's memmgr badge); attribution rests on
-/// badge unguessability (`services/memmgr/docs/ipc-interface.md`
-/// § Badge Discipline; #550). Words are `[kind, faulting_va, access, ip]`
+/// `req.badge` is the derivation badge of the Endpoint cap bound by
+/// `SYS_THREAD_SET_FAULT_HANDLER` (procmgr and the runtime bind the process's
+/// own badged memmgr cap), so attribution rests on the derivation-locked badge
+/// (`services/memmgr/docs/ipc-interface.md` § Badge Discipline). Words are
+/// `[kind, faulting_va, access, ip]`
 /// (same document, § Kernel-origin fault message (`FAULT_LABEL`)). On a VM
 /// fault whose address lies in a registered region of a process with a
 /// delegated address space, memmgr backs the [`chunk_for`] chunk containing

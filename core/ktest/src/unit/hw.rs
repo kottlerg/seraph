@@ -177,9 +177,10 @@ pub fn mmio_split_wrong_tag_err(ctx: &TestContext) -> TestResult
 ///
 /// Only riscv64 can name such an id: its root Interrupt cap spans the PLIC's
 /// 1024-id space while the kernel routes sources 1..=127. The test splits id
-/// 1023 off the first cap whose range contains it, which leaves the low part
-/// `[start, 1023)` in place for the split tests that follow. Skipped where no
-/// cap contains id 1023 (x86-64, whose root cap is the routable range).
+/// 1023 off a derived copy of the first cap whose range contains it, so the
+/// original range stays whole for later tests (the IRQ stress cell carves a
+/// device line from the root). Skipped where no cap contains id 1023
+/// (x86-64, whose root cap is the routable range).
 pub fn irq_register_unroutable_id_err(ctx: &TestContext) -> TestResult
 {
     const UNROUTABLE_ID: u32 = 1023;
@@ -190,12 +191,20 @@ pub fn irq_register_unroutable_id_err(ctx: &TestContext) -> TestResult
     let bound = scan_bound(ctx);
     for slot in 1u32..=bound
     {
-        // Wrong-tag and out-of-range responses leave the cap intact.
-        let Ok((_lo, hi)) = irq_split(slot, UNROUTABLE_ID)
+        // A slot that cannot be derived is empty; keep scanning.
+        let Ok(copy) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
         else
         {
             continue;
         };
+        // Wrong-tag and out-of-range responses leave the copy intact.
+        let Ok((lo, hi)) = irq_split(copy, UNROUTABLE_ID)
+        else
+        {
+            syscall::cap_delete(copy).ok();
+            continue;
+        };
+        syscall::cap_delete(lo).ok();
         // `hi` is the single id 1023 (no cap extends past the 1024-id space).
         let err = irq_register(hi, irq_sig);
         // Deleting the cap must not touch the routing table for an id it cannot
@@ -217,22 +226,32 @@ pub fn irq_register_unroutable_id_err(ctx: &TestContext) -> TestResult
 
 // ── SYS_IRQ_SPLIT ─────────────────────────────────────────────────────────────
 
-/// `irq_split` at IRQ id 1 on the first Interrupt-range cap whose range
-/// strictly contains it (start 0, `count > 1`) returns two disjoint
-/// children. Skipped if no such cap exists.
+/// `irq_split` at IRQ id 1 on a derived copy of the first Interrupt-range cap
+/// whose range strictly contains it (start 0, `count > 1`) returns two
+/// disjoint children. The copy, not the original, is consumed, so the
+/// original range stays whole for later tests. Skipped if no such cap exists.
 pub fn irq_split_carves(ctx: &TestContext) -> TestResult
 {
     let bound = scan_bound(ctx);
 
     for slot in 1u32..=bound
     {
+        // A slot that cannot be derived is empty; keep scanning.
+        let Ok(copy) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
+        else
+        {
+            continue;
+        };
         // Probe: split at IRQ id 1 (`split_at` is absolute), which only a cap
         // starting at IRQ 0 with count > 1 accepts. Wrong-tag and out-of-range
-        // responses both leave the cap intact.
-        match irq_split(slot, 1)
+        // responses both leave the copy intact.
+        match irq_split(copy, 1)
         {
             Err(_) =>
-            {} // Wrong tag or non-splittable; keep scanning.
+            {
+                // Wrong tag or non-splittable; keep scanning.
+                syscall::cap_delete(copy).ok();
+            }
             Ok((slot1, slot2)) =>
             {
                 if slot1 == 0 || slot2 == 0 || slot1 == slot2

@@ -116,7 +116,8 @@ fn check_seeds(svcmgr_cap: u32, second_cap: u32, cap_count: usize)
 }
 
 /// Request the generic bootstrap round, returning `(svcmgr_cap, second_cap,
-/// cap_count)`. Missing caps are zero.
+/// cap_count)`, `cap_count` being the caps the round delivered. Missing caps
+/// are zero.
 fn bootstrap_caps(creator_ep: u32, ipc_buffer: *mut u8) -> (u32, u32, usize)
 {
     if creator_ep == 0
@@ -133,22 +134,9 @@ fn bootstrap_caps(creator_ep: u32, ipc_buffer: *mut u8) -> (u32, u32, usize)
     {
         return (0, 0, 0);
     };
-    let cap0 = if round.cap_count >= 1
-    {
-        round.caps[0]
-    }
-    else
-    {
-        0
-    };
-    let cap1 = if round.cap_count >= 2
-    {
-        round.caps[1]
-    }
-    else
-    {
-        0
-    };
+    // Only the present caps ride, named by the round's presence word; an
+    // absent slot decodes as `0`, and a malformed word leaves both `0`.
+    let [cap0, cap1, ..] = ipc::bootstrap::unpack_slots(&round).unwrap_or_default();
     (cap0, cap1, round.cap_count)
 }
 

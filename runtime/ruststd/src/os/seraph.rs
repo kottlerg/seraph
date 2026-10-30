@@ -783,6 +783,15 @@ pub fn event_queue_retype_bytes(capacity: u64) -> u64 {
     syscall_abi::event_queue_retype_bytes(capacity)
 }
 
+// The copies above must equal the ABI crate's items; a mismatch fails the
+// std build. The function forwards to the ABI crate's, so it equals it by
+// construction.
+const _: () = {
+    assert!(ENDPOINT_RETYPE_BYTES == syscall_abi::ENDPOINT_RETYPE_BYTES);
+    assert!(NOTIFICATION_RETYPE_BYTES == syscall_abi::NOTIFICATION_RETYPE_BYTES);
+    assert!(WAIT_SET_RETYPE_BYTES == syscall_abi::WAIT_SET_RETYPE_BYTES);
+};
+
 /// Retype one kernel object out of the runtime's object-slab machinery.
 ///
 /// `min_bytes` is the full raw debit the kernel charges for the object the

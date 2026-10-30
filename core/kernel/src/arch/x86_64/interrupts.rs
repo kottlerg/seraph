@@ -39,8 +39,9 @@
 //! - Device IRQs are routed generically: `SYS_IRQ_REGISTER` (`syscall::hw::sys_irq_register`)
 //!   records the Notification via `irq::register` and calls [`route_device_irq`], which installs
 //!   the I/O APIC entry masked; `SYS_IRQ_ACK` (`syscall::hw::sys_irq_ack`) calls [`unmask`].
-//!   Only GSIs 0-22 (vectors 33-55) have IDT stubs; serving a higher GSI needs a
-//!   `device_irq_stub!` entry and a wider device arm in `idt::irq_dispatch`.
+//!   Only GSIs 0-22 (vectors 33-55) have IDT stubs, and `MAX_IRQ_ID` admits no other; serving
+//!   a higher GSI needs a `device_irq_stub!` entry, a wider device arm in
+//!   `idt::irq_dispatch`, and a larger `ioapic::DEVICE_GSI_COUNT`.
 
 // cast_possible_truncation: u64→usize/u8 APIC address arithmetic; bounded by APIC layout.
 // cast_lossless: u8→u32 vector casts are always widening.
@@ -754,25 +755,25 @@ pub fn unmask(_irq: u32) {}
 /// masked at the I/O APIC. The driver unmasks via `SYS_IRQ_ACK` once it has
 /// registered a handler.
 ///
-/// Known defect (#500): neither this function nor `sys_irq_register` checks
-/// `irq` against the stubbed range. Only GSIs 0-22 (vectors 33-55) have IDT
-/// gates; GSIs 23-216 and 219-221 route to vectors with no gate, GSIs 217, 218
-/// and 222 land on the TLB-shootdown, wakeup and spurious vectors, and from GSI
-/// 223 the `u8` add overflows (a panic in debug builds; in release builds GSIs
-/// 223-254 wrap to exception vectors 0-31 and GSI 255 to the timer vector 32).
+/// The vector is [`super::ioapic::device_vector`]'s: only GSIs 0-22 (vectors 33-55) have IDT
+/// gates. `sys_irq_register` admits only `MIN_IRQ_ID..=MAX_IRQ_ID`, every one of which has a
+/// gate; a GSI without one is left unrouted rather than programmed with an ungated, reserved,
+/// or wrapped vector.
 ///
 /// # Safety
 /// Must be called after Phase 5 init (IOAPIC initialised) with a valid GSI.
-// cast_possible_truncation: a GSI is < 256 (`ROOT_IRQ_COUNT`), so `irq as u8` is exact; the
-// vector add that follows is unchecked (#500, see above).
-#[allow(clippy::cast_possible_truncation)]
 #[cfg(not(test))]
 pub unsafe fn route_device_irq(irq: u32)
 {
+    let Some(vector) = super::ioapic::device_vector(irq)
+    else
+    {
+        return;
+    };
     // SAFETY: caller guarantees a valid GSI and post-Phase-5 IOAPIC. route()
     // installs the redirection entry masked; the driver unmasks via SYS_IRQ_ACK.
     unsafe {
-        super::ioapic::route(irq, super::ioapic::DEVICE_VECTOR_BASE + irq as u8);
+        super::ioapic::route(irq, vector);
     }
 }
 

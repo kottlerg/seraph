@@ -40,8 +40,8 @@ use crate::ipc::notification::NotificationState;
 
 // ── Routing table ─────────────────────────────────────────────────────────────
 
-/// Maximum IRQ lines tracked. Covers x86-64 GSIs (0–255) and RISC-V PLIC
-/// sources (1–127).
+/// Maximum IRQ lines tracked. Covers the routable x86-64 GSIs (0–22) and RISC-V
+/// PLIC sources (1–127).
 const MAX_IRQ: usize = 256;
 
 // `SYS_IRQ_REGISTER` admits ids up to `MAX_IRQ_ID`, and `register` indexes the

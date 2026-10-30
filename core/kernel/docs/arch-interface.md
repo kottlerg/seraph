@@ -192,9 +192,10 @@ pub unsafe fn unmap_user_region_pooled(
 pub unsafe fn for_each_user_leaf(root_virt: u64, on_leaf: &mut dyn FnMut(u64));
 
 /// Walk the user tables and return `(phys, flags_word)` mapped at `virt`, or
-/// None if unmapped. RISC-V decodes Svnapot 64 KiB group members internally,
-/// so `phys` is always the exact per-page frame; the raw flags word may carry
-/// the N bit.
+/// None if unmapped. Only 4 KiB leaves translate: both architectures return
+/// None at a large leaf above the last level rather than read its frame as a
+/// table. RISC-V decodes Svnapot 64 KiB group members internally, so `phys` is
+/// always the exact per-page frame; the raw flags word may carry the N bit.
 pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64)>;
 
 /// Invalidate the local-CPU TLB entry for a single virtual address
@@ -268,7 +269,9 @@ pub unsafe fn verify_paging_extensions();
 
 /// Classify a user page fault as spurious (the live PTE already permits the
 /// access — a stale entry the handler resolves by retrying) versus a real fault.
-/// Called only by each architecture's own page-fault handler, not by neutral code.
+/// Only a user-accessible leaf can make a fault spurious, so a kernel-half `va`
+/// never is (x86-64 refuses one before walking). Called only by each
+/// architecture's own page-fault handler, not by neutral code.
 pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool;
 
 /// Rebase the boot stack from its identity mapping into the direct map during
@@ -707,14 +710,14 @@ pub const ARCH_NAME: &str;
 /// (`EM_X86_64` / `EM_RISCV`); `mm::init_reloc` checks relocations against it.
 pub const EXPECTED_ELF_MACHINE: u16;
 
-/// Routable external-interrupt id range (0..=255 GSIs on x86-64; PLIC sources
-/// 1..=127 on RISC-V). `SYS_IRQ_REGISTER` refuses an id outside it with
-/// `InvalidArgument`.
+/// Routable external-interrupt id range (0..=22 GSIs on x86-64, the GSIs with an
+/// IDT gate; PLIC sources 1..=127 on RISC-V). `SYS_IRQ_REGISTER` refuses an id
+/// outside it with `InvalidArgument`.
 pub const MIN_IRQ_ID: u32;
 pub const MAX_IRQ_ID: u32;
 
 /// Width of the root `Interrupt` range capability minted at Phase 7 (256 on
-/// x86-64; 1024 on RISC-V, the PLIC id space). On RISC-V the cap spans ids
+/// x86-64; 1024 on RISC-V, the PLIC id space). On both the cap spans ids
 /// above `MAX_IRQ_ID`; a split names them, `SYS_IRQ_REGISTER` refuses them, and
 /// the Interrupt teardown leaves their routing untouched.
 pub const ROOT_IRQ_COUNT: u32;

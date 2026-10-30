@@ -129,6 +129,12 @@ Each feature is classified per architecture as one of:
 - **CET (shadow stack / IBT)** — control-flow integrity (design intent; not yet enabled).
 - **TSC-deadline timer mode** — drives the preemption tick when present; the periodic APIC
   timer is the fallback.
+- **UMIP** (`CR4.UMIP`) — set on every CPU when present, so ring-3 `SGDT`, `SIDT`, `SLDT`, `SMSW`,
+  and `STR` raise `#GP`. It is not uniform at the platform floor (Intel's Skylake-derived 10th
+  generation lacks it), so it is not required. Without it ring 3 can read the IDT and GDT bases,
+  kernel image addresses that disclose the KASLR slide; see
+  [core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
+  § Surface inventory.
 - **EFI_RNG_PROTOCOL** — an additional boot entropy seed.
 - **GOP framebuffer** — graphical console; a headless serial-only boot is valid.
 - **PCIe ECAM (MCFG)** — discovered when firmware publishes it; not required by the kernel.

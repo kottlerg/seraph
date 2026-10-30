@@ -215,7 +215,9 @@ prevents the kernel from executing userspace pages; SMAP prevents the kernel fro
 writing userspace memory except through designated safe copy routines. Every kernel entry
 that runs kernel code clears RFLAGS.AC (SYSCALL's flag mask; `clac` in the interrupt and
 exception stubs; the spurious-interrupt stub runs only `iretq`), so a user-set AC cannot
-lift SMAP in ring 0. Together these mitigate a class of privilege escalation exploits.
+lift SMAP in ring 0. Together these mitigate a class of privilege escalation exploits. Where
+the CPU has UMIP, which is opportunistic, the kernel also sets `CR4.UMIP`, so ring 3 cannot read
+the descriptor-table registers, whose bases are kernel image addresses.
 
 On RISC-V, S-mode can never execute from user (U=1) pages, and the kernel keeps
 `sstatus.SUM` clear except inside its user-copy routines, so supervisor loads and stores

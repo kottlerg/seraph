@@ -1849,7 +1849,7 @@ pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid or lacks
 /// Notify rights, or (`InvalidArgument`) if `irq_cap` covers more than one line
-/// or names an id the kernel cannot route (outside GSIs 0–255 on x86-64, PLIC
+/// or names an id the kernel cannot route (outside GSIs 0–22 on x86-64, PLIC
 /// sources 1–127 on RISC-V). A second registration of a line replaces the first.
 #[inline]
 pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>

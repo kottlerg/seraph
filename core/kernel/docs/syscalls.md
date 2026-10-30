@@ -1864,8 +1864,9 @@ delivering the notification; the driver MUST call `SYS_IRQ_ACK` to re-enable it
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (a cap lacks Notify),
 `InvalidArgument` (IRQ cap covers more than one line, or names an id outside the
-routable range `MIN_IRQ_ID..=MAX_IRQ_ID`: GSIs 0–255 on x86-64, PLIC sources 1–127 on
-RISC-V, where the root Interrupt cap spans the PLIC's 1024-id space; see
+routable range `MIN_IRQ_ID..=MAX_IRQ_ID`: GSIs 0–22 on x86-64, the GSIs with an IDT gate,
+where the root Interrupt cap spans 256 GSIs; PLIC sources 1–127 on RISC-V, where the root
+Interrupt cap spans the PLIC's 1024-id space; see
 [arch-interface.md](arch-interface.md) § Module-level constants and free functions).
 
 ---

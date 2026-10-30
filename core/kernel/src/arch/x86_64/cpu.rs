@@ -237,21 +237,34 @@ pub fn user_copy_fixup(pc: u64) -> Option<u64>
 /// instructions.
 const CR4_FSGSBASE: u64 = 1 << 16;
 
+/// `CR4.UMIP` (bit 11): faults the descriptor-table reads `SGDT`, `SIDT`,
+/// `SLDT`, `SMSW`, and `STR` at CPL > 0 with `#GP`.
+const CR4_UMIP: u64 = 1 << 11;
+
 /// Enable Supervisor Mode Execution Prevention (SMEP) and Supervisor Mode
-/// Access Prevention (SMAP) by setting CR4 bits 20 and 21, and clear
-/// `CR4.FSGSBASE`, which firmware may have left set.
+/// Access Prevention (SMAP) by setting CR4 bits 20 and 21, set `CR4.UMIP`
+/// where the CPU has it, and clear `CR4.FSGSBASE`, which firmware may have left
+/// set.
 ///
 /// With FSGSBASE off, ring 3 can change its GS base only by loading a GDT
 /// selector, whose base is 0, so a user GS base is never a kernel-half address;
 /// the paranoid NMI/`#MC`/`#DF`/`#DB` entry (`idt.rs` `paranoid_entry_asm`)
 /// relies on that to tell the user GS base from the kernel's.
 ///
-/// Checks CPUID.07H:EBX bit 7 (SMEP) and bit 20 (SMAP). Halts with a fatal
-/// message if either feature is absent, because the security model requires
-/// both.
+/// With UMIP on, ring 3 cannot read the IDTR or GDTR, whose bases are kernel
+/// image addresses (the static IDT, the BSP's static GDT) that would disclose
+/// the KASLR slide. UMIP is opportunistic
+/// ([platform-requirements.md](../../../../../docs/platform-requirements.md) § x86-64
+/// Classification); without it that read remains, as
+/// [cross-boundary-disclosure.md](../../../docs/cross-boundary-disclosure.md) § Surface
+/// inventory records.
+///
+/// Checks CPUID.07H:EBX bit 7 (SMEP) and bit 20 (SMAP), and CPUID.07H:ECX bit 2
+/// (UMIP). Halts with a fatal message if SMEP or SMAP is absent, because the
+/// security model requires both.
 ///
 /// # Safety
-/// Must execute at ring 0. The IDT need not be loaded: CPUID gates both bits
+/// Must execute at ring 0. The IDT need not be loaded: CPUID gates every bit
 /// this sets and `CR4.FSGSBASE` is only cleared, so the CR4 write cannot fault,
 /// and the BSP calls this before `idt::init`.
 // similar_names: smep_present and smap_present are distinct CPU security features.
@@ -260,9 +273,10 @@ const CR4_FSGSBASE: u64 = 1 << 16;
 pub unsafe fn enable_smep_smap()
 {
     // CPUID leaf 7, sub-leaf 0.
-    let (_eax, ebx, _ecx, _edx) = cpuid(7);
+    let (_eax, ebx, ecx, _edx) = cpuid(7);
     let smep_present = (ebx >> 7) & 1 != 0;
     let smap_present = (ebx >> 20) & 1 != 0;
+    let umip_present = (ecx >> 2) & 1 != 0;
     if !smep_present
     {
         crate::fatal("SMEP not supported by CPU — required");
@@ -272,10 +286,15 @@ pub unsafe fn enable_smep_smap()
         crate::fatal("SMAP not supported by CPU — required");
     }
     // Bit 20 = SMEP, bit 21 = SMAP.
-    let cr4 = read_cr4();
-    // SAFETY: CPUID confirmed both features are present; new CR4 value is valid.
+    let mut cr4 = (read_cr4() & !CR4_FSGSBASE) | (1 << 20) | (1 << 21);
+    if umip_present
+    {
+        cr4 |= CR4_UMIP;
+    }
+    // SAFETY: CPUID confirmed SMEP and SMAP, and UMIP whenever its bit is set;
+    // the new CR4 value is valid.
     unsafe {
-        write_cr4((cr4 & !CR4_FSGSBASE) | (1 << 20) | (1 << 21));
+        write_cr4(cr4);
     }
 }
 

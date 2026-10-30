@@ -4,7 +4,8 @@ Enumerates every value the kernel emits across the user/kernel boundary and
 classifies it toward the goal that no kernel virtual address or kernel pointer
 escapes to userspace — a prerequisite for kernel address-space layout
 randomization (KASLR). Known open disclosure: mirrored console diagnostics
-([#440](https://github.com/kottlerg/seraph/issues/440)).
+([#440](https://github.com/kottlerg/seraph/issues/440)). Accepted residual: the x86-64
+descriptor-table registers on a CPU without UMIP (§ Surface inventory).
 
 ---
 
@@ -27,8 +28,9 @@ distinct, narrower concern handled in "Physical-address surfaces" below.
 Each surface is classified as one of:
 
 - **(a) kernel VA / pointer** — a kernel virtual address, kernel pointer, or value
-  derived from one. A leak. **None found** among emitted values; kernel state kept in
-  donated memory is a separate surface, below.
+  derived from one. A leak. **None found** among emitted values; the one hardware surface
+  of this class, the descriptor-table registers on an x86-64 CPU without UMIP, is listed
+  below, and kernel state kept in donated memory is a separate surface, below.
 - **(b) userspace VA** — an address in the caller's own (or a delegate's) address
   space. The caller already owns it; not a disclosure.
 - **(c) opaque / randomized** — a kernel-minted identifier that is unguessable
@@ -67,6 +69,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | Thread ID (random CSPRNG correlator for every thread but init, whose ID is the fixed value 1; no `tid → TCB` table; never returned as data) | `sched::alloc_thread_id` | c/d |
 | `CSpaceId` (registry index, never returned to userspace); capability badges (caller-chosen) | `cap::alloc_cspace_id`, `cap::slot::CapabilitySlot::badge` | c |
 | Boot-time `InitInfo` handover — kernel writes a read-only struct into init's mapped region | `init_protocol::InitInfo`, `init_protocol::CapDescriptor` | b/c/d/e |
+| x86-64 descriptor-table registers read at CPL 3 (`SGDT`, `SIDT`, `SLDT`, `SMSW`, `STR`): `#GP` where `CR4.UMIP` is set; the IDTR and GDTR bases on a CPU without UMIP | `cpu::enable_smep_smap`, `idt::IDT`, `gdt::GDT` | d / **a** without UMIP |
 
 Notes on the non-obvious entries:
 
@@ -94,6 +97,18 @@ Notes on the non-obvious entries:
   delete or revoke of the last Thread capability cannot free the thread slab while
   `sched::with_held_frame` snapshots its trap frame: the snapshot `copy_to_user` returns
   is the target's user register state.
+- **Descriptor-table registers** are a hardware output, not a value the kernel emits:
+  with `CR4.UMIP` clear, `SIDT` and `SGDT` execute at CPL 3 and return the IDTR and GDTR,
+  whose bases are kernel image addresses (the static IDT, and the BSP's static GDT or an
+  AP's), so one unprivileged instruction recovers the KASLR image slide. The kernel sets
+  `CR4.UMIP` on every CPU whose CPUID reports it (`cpu::enable_smep_smap`, BSP and APs,
+  before the first ring-3 entry), and the five reads then raise `#GP`, delivered or killed
+  on as any user exception. UMIP is opportunistic
+  ([docs/platform-requirements.md](../../../docs/platform-requirements.md) § x86-64
+  Classification), so on a CPU without it the disclosure remains (class **a**): an accepted
+  residual of the platform floor, not a defect of the kernel's outputs. `SLDT` and `STR`
+  return selectors and `SMSW` the low CR0 bits, none of them an address. RISC-V has no
+  user-readable descriptor-table register.
 - **Thread IDs** are random per `sched::alloc_thread_id`, except init's, which is the
   fixed value 1 (class **d**) (issue #248;
   [scheduling-internals.md](scheduling-internals.md) § Cross-CPU TCB Ownership) — a

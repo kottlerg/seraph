@@ -71,6 +71,7 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
         let result = (|| -> TestResult {
             // SAFETY: `MMIO_TEST_VA` is a scratch VA (crate docs § Scratch VAs), so the
             // span holds no Rust object or IPC page of ktest.
+            // Only raw pointers reach the mapping, never a reference (`mmio_map` § Safety).
             unsafe { syscall::mmio_map(ctx.aspace_cap, lo, MMIO_TEST_VA, 0) }
                 .map_err(|_| "mmio_map of carved page failed")?;
             let phys = aspace_query(ctx.aspace_cap, MMIO_TEST_VA)

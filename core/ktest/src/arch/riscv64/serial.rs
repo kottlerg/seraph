@@ -52,6 +52,7 @@ pub unsafe fn init(info: &InitInfo, aspace_cap: u32, _thread_cap: u32) -> bool
     // SERIAL_VA ends below the low scratch band (checked above), in a range
     // no other ktest mapping and no Rust object uses, and this once-only call
     // is its sole mapper.
+    // Only raw pointers reach the mapping, never a reference (`mmio_map` § Safety).
     if unsafe { syscall::mmio_map(aspace_cap, slot, SERIAL_VA, 0) }.is_err()
     {
         return false;

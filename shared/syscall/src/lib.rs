@@ -930,11 +930,10 @@ pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 /// mapping made through it, with TLB shootdown, before the call returns
 /// (or, when a concurrent syscall still pins the object, when that syscall
 /// releases it); a caller that needs the region mapped maps it again through
-/// a child (`core/kernel/docs/syscalls.md` § `SYS_MMIO_SPLIT`). A mapping in
-/// the caller's own address space is withdrawn although its Rust code may
-/// still reference it; this wrapper stays a safe function, and making it
-/// `unsafe` for that case is recorded on
-/// [#558](https://github.com/kottlerg/seraph/issues/558).
+/// a child (`core/kernel/docs/syscalls.md` § `SYS_MMIO_SPLIT`). The
+/// withdrawal reaches no Rust object, because [`mmio_map`]'s `# Safety`
+/// contract keeps Rust references out of every MMIO mapping, so this wrapper
+/// is safe.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the cap is invalid
@@ -1898,7 +1897,15 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 ///
 /// # Safety
 /// The contract of [`mem_map`], for the span the MMIO region covers at
-/// `virt`.
+/// `virt`. Besides, the mapping can be withdrawn at any time: by this
+/// program deleting, splitting, or revoking the capability, or by any holder
+/// of an ancestor capability, in any process, revoking it. When `aspace_cap`
+/// names the calling program's own address space, the program therefore
+/// reaches the span only through raw-pointer accesses, never
+/// through a Rust reference, and puts the span's virtual addresses to no
+/// other use while such an access can still run. A withdrawn mapping then
+/// reaches no Rust object, which is why [`cap_delete`], [`cap_revoke`], and
+/// [`mmio_split`] stay safe functions.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned or

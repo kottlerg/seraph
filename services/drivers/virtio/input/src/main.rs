@@ -547,6 +547,7 @@ fn main() -> !
     // carves the BAR cap to at most the same `bar_aperture_pages`
     // (`find_virtio_bar_cap`), so the whole-region mapping stays inside it:
     // VA no Rust object or IPC page occupies.
+    // Only raw pointers reach the mapping, never a reference (`mmio_map` § Safety).
     if unsafe { syscall::mmio_map(caps.self_aspace, caps.bar_mmio_slot, bar_va, 0) }.is_err()
     {
         std::os::seraph::log!("BAR mmio_map failed");

@@ -56,6 +56,7 @@ pub unsafe fn serial_init(
     // arena, owned for the process's lifetime, and the caller's contract
     // bounds the region to one page, so the whole-region mapping stays
     // inside it: VA no Rust object or IPC page occupies.
+    // Only raw pointers reach the mapping, never a reference (`mmio_map` § Safety).
     if unsafe { syscall::mmio_map(self_aspace, mmio_cap, base_va, 0) }.is_err()
     {
         return false;

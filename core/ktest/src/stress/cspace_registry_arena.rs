@@ -15,16 +15,17 @@
 //!
 //! Each `CSpace` costs one page of `memory_base` and one slot in ktest's own
 //! `CSpace`, which the test funds first through augment-mode
-//! `cap_create_cspace`. When `memory_base` cannot cover both, the test
-//! skip-passes, logging the bytes it needed and the bytes available.
+//! `cap_create_cspace`. The test logs the bytes it needs and the bytes
+//! `memory_base` has before it starts, and skip-passes when they fall short.
 
 use syscall::{cap_create_cspace, cap_delete, cap_info};
 use syscall_abi::CAP_INFO_MEMORY_AVAILABLE;
 
 use crate::{TestContext, TestResult};
 
-/// `CSpace`s held live at once: past the former fixed registry's 4096.
-const LIVE: usize = 4200;
+/// `CSpace`s held live at once: one past the former fixed registry's 4096
+/// entries, the least count that registry could not hold.
+const LIVE: usize = 4097;
 
 /// Slots per kernel `CSpace` leaf page (`cap::cspace::L2_SIZE`). An
 /// underestimate here shows as a slot-pool failure of a creation, which the
@@ -38,7 +39,7 @@ const FUND_PAGES: u64 = LIVE.div_ceil(SLOTS_PER_PAGE) as u64 + 4;
 
 const PAGE: u64 = 4096;
 
-/// Handles of the live `CSpace`s. Static because the array (16.8 KB) is too
+/// Handles of the live `CSpace`s. Static because the array (16.4 KB) is too
 /// large for the harness stack; only this single-threaded test touches it.
 static mut HANDLES: [u32; LIVE] = [0; LIVE];
 
@@ -47,11 +48,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     let needed = (LIVE as u64 + FUND_PAGES) * PAGE;
     let had = cap_info(ctx.memory_base, CAP_INFO_MEMORY_AVAILABLE)
         .map_err(|_| "cspace_registry_arena: cap_info(memory_base) failed")?;
+    log_budget(needed, had);
     if had < needed
     {
         crate::log("ktest: stress::cspace_registry_arena SKIP (memory-limited)");
-        crate::log_u64("ktest: stress::cspace_registry_arena needed bytes ", needed);
-        crate::log_u64("ktest: stress::cspace_registry_arena available bytes ", had);
         return Ok(());
     }
 
@@ -93,4 +93,48 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "cspace_registry_arena: create after the mass delete failed")?;
     cap_delete(again).map_err(|_| "cspace_registry_arena: final cap_delete failed")?;
     Ok(())
+}
+
+/// Log `needed bytes <needed> available bytes <had>` on one line.
+fn log_budget(needed: u64, had: u64)
+{
+    const PREFIX: &[u8] = b"ktest: stress::cspace_registry_arena needed bytes ";
+    const MIDDLE: &[u8] = b" available bytes ";
+    let (needed_digits, needed_len) = decimal(needed);
+    let (had_digits, had_len) = decimal(had);
+    let mut line = [0u8; 128];
+    let mut len = 0;
+    for part in [
+        PREFIX,
+        &needed_digits[..needed_len],
+        MIDDLE,
+        &had_digits[..had_len],
+    ]
+    {
+        line[len..len + part.len()].copy_from_slice(part);
+        len += part.len();
+    }
+    crate::log(core::str::from_utf8(&line[..len]).unwrap_or("?"));
+}
+
+/// The decimal digits of `value` and their count.
+fn decimal(mut value: u64) -> ([u8; 20], usize)
+{
+    let mut digits = [0u8; 20];
+    let mut n = 0;
+    loop
+    {
+        // Lossless: a decimal digit.
+        #[allow(clippy::cast_possible_truncation)]
+        let digit = (value % 10) as u8;
+        digits[n] = b'0' + digit;
+        n += 1;
+        value /= 10;
+        if value == 0
+        {
+            break;
+        }
+    }
+    digits[..n].reverse();
+    (digits, n)
 }

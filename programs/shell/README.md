@@ -4,7 +4,7 @@ Minimal interactive shell: the child of [`programs/terminal`](../terminal/README
 It reads `\n`-terminated lines from stdin, runs a small set of built-ins, and
 otherwise spawns `/programs/<name>` as an external command. Pure `std` — no
 Seraph cap awareness; stdin/stdout/stderr are the terminal's stdio pipes and
-children are spawned via `std::process::Command`. This is v0.0.1 (#112),
+children are spawned via `std::process::Command`. This is v0.0.1 ([#112]),
 replacing the `echosh` placeholder; the feature surface grows in later releases.
 
 The terminal renders no prompt, so the shell owns the `$ ` prompt.
@@ -100,12 +100,14 @@ stdin forwarding — and exits non-zero on any mismatch. The terminal interactiv
 path (the `$ ` prompt rendered via the terminal) is covered by
 `cargo xtask test-terminal`. See [docs/testing.md](../../docs/testing.md).
 
-## References
+## Relevant Design Documents
 
-- System: [docs/console-model.md](../../docs/console-model.md),
-  [docs/process-lifecycle.md](../../docs/process-lifecycle.md),
-  [docs/testing.md](../../docs/testing.md).
-- Parent: [`programs/terminal`](../terminal/README.md) ([#111]).
+| Document | Content |
+|---|---|
+| [docs/console-model.md](../../docs/console-model.md) | Console output ownership; the terminal relays the shell's stdout |
+| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Process spawn and stdio handover |
+| [docs/testing.md](../../docs/testing.md) | Per-program tester protocol and the `usertest` orchestrator |
+| [programs/terminal/README.md](../terminal/README.md) | Parent process ([#111]) |
 
 [#29]: https://github.com/kottlerg/seraph/issues/29
 [#111]: https://github.com/kottlerg/seraph/issues/111

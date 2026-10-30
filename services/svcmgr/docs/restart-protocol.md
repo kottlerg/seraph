@@ -149,7 +149,9 @@ the next restart without code changes.
 ## Recipe storage
 
 svcmgr records the parsed `.svc` recipe across two index-aligned tables
-at reconciliation time. The fixed-size fields live on `ServiceEntry`:
+at reconciliation time. The recipe-derived fixed-size fields live on
+`ServiceEntry` (which also carries the runtime state `restart_count`, `active`,
+`bootstrap_badge`, and `provided_endpoint`):
 
 | Field | Source |
 |---|---|

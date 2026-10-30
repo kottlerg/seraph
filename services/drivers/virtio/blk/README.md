@@ -52,7 +52,7 @@ defined in `shared/ipc::blk_labels`; error codes in `shared/ipc::blk_errors`.
 
 Register a partition LBA range and receive a partition-badged `SEND_GRANT`
 cap scoped to it. Callable only with a `MOUNT_AUTHORITY`-badged cap (the
-whole-disk cap); callers whose badge lacks it receive `RegisterRejected`.
+whole-disk cap); callers whose badge lacks it receive `REGISTER_REJECTED`.
 
 **Request:**
 
@@ -67,7 +67,7 @@ whole-disk cap); callers whose badge lacks it receive `RegisterRejected`.
 
 | Field | Value |
 |---|---|
-| label | 0 (success), `RegisterRejected` (4), or `LabelVersionMismatch` (6) |
+| label | 0 (success), `REGISTER_REJECTED` (4), or `LABEL_VERSION_MISMATCH` (6) |
 | caps[0] | On success, the partition-badged `SEND_GRANT` cap on this endpoint |
 
 ### Label 3: `BLK_READ_INTO_MEMORY`
@@ -98,11 +98,11 @@ page, packed contiguously; the rest of the page is unspecified.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 1 | `DeviceStatusIoerr` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
-| 2 | `DeviceStatusUnsupp` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
-| 3 | `OutOfBounds` | LBA outside the caller badge's partition range |
-| 5 | `InvalidMemoryCap` | Target Memory cap missing `MAP|WRITE`, smaller than `count * 512`, or absent; or `count` is 0 or `count * 512` exceeds the u32 descriptor length |
-| 7 | `DeviceFault` | No usable completion: the request could not be queued, the device wrote a status outside `VirtIO`'s set, or the device lost the request (timeout or malformed completion); after a lost request, every later request (see DMA Discipline) |
+| 1 | `DEVICE_STATUS_IOERR` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
+| 2 | `DEVICE_STATUS_UNSUPP` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
+| 3 | `OUT_OF_BOUNDS` | LBA outside the caller badge's partition range |
+| 5 | `INVALID_MEMORY_CAP` | Target Memory cap missing `MAP|WRITE`, smaller than `count * 512`, or absent; or `count` is 0 or `count * 512` exceeds the u32 descriptor length |
+| 7 | `DEVICE_FAULT` | No usable completion: the request could not be queued, the device wrote a status outside `VirtIO`'s set, or the device lost the request (timeout or malformed completion); after a lost request, every later request (see DMA Discipline) |
 
 #### Reserved cap slots and the IOMMU forward-compat shape
 
@@ -151,11 +151,11 @@ read.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 1 | `DeviceStatusIoerr` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
-| 2 | `DeviceStatusUnsupp` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
-| 3 | `OutOfBounds` | LBA outside the caller badge's partition range |
-| 5 | `InvalidMemoryCap` | Source Memory cap missing `MAP`, smaller than `count * 512`, or absent; or `count` is 0 or `count * 512` exceeds the u32 descriptor length |
-| 7 | `DeviceFault` | No usable completion: the request could not be queued, the device wrote a status outside `VirtIO`'s set, or the device lost the request (timeout or malformed completion); after a lost request, every later request (see DMA Discipline) |
+| 1 | `DEVICE_STATUS_IOERR` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
+| 2 | `DEVICE_STATUS_UNSUPP` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
+| 3 | `OUT_OF_BOUNDS` | LBA outside the caller badge's partition range |
+| 5 | `INVALID_MEMORY_CAP` | Source Memory cap missing `MAP`, smaller than `count * 512`, or absent; or `count` is 0 or `count * 512` exceeds the u32 descriptor length |
+| 7 | `DEVICE_FAULT` | No usable completion: the request could not be queued, the device wrote a status outside `VirtIO`'s set, or the device lost the request (timeout or malformed completion); after a lost request, every later request (see DMA Discipline) |
 
 ---
 
@@ -179,8 +179,8 @@ in flight, so its Memory cap cannot go back while the device can still
 DMA into or out of it. The driver resets the device first: once the
 reset is acknowledged, the device no longer accesses the virtqueue or
 the buffers it describes (`VirtIO` 1.2 §2.4.1). It then replies
-`DeviceFault` with the cap moved back, and fails stop: every later read
-or write is answered `DeviceFault` with its cap moved back, so clients
+`DEVICE_FAULT` with the cap moved back, and fails stop: every later read
+or write is answered `DEVICE_FAULT` with its cap moved back, so clients
 see an error rather than block on an endpoint nobody serves. A device
 that does not acknowledge the reset within a bounded poll may still be
 transferring, so the driver logs and exits without replying; the cap is

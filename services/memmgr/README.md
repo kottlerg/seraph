@@ -105,6 +105,10 @@ The full memmgr IPC specification is in
 - `PROCESS_DIED(badge)` (procmgr-only)
 - `DONATE_MEMORY_CAPS(memory_caps[..])` — hand init's reaped RAM to the pool
   (procmgr-only)
+- `QUERY_POOL_STATUS` — read the all-RAM-accounted identity terms and the free total
+- `REGISTER_REGION` / `UNREGISTER_REGION` — register and tear down a demand-paged region
+- `DELEGATE_ASPACE(child_badge, aspace_cap)` — delegate a demand-paged child's
+  address space (procmgr-only)
 
 ---
 
@@ -119,7 +123,7 @@ when those workloads grow.
 
 | Constant | Value | Surface effect on overflow | Revisit when |
 |---|---|---|---|
-| `MAX_PROCESSES` | 64 | `REGISTER_PROCESS` returns `TooManyProcesses` (see [`docs/ipc-interface.md`](docs/ipc-interface.md) §"Label 3: `REGISTER_PROCESS`") | a workload approaches ~50 concurrent processes |
+| `MAX_PROCESSES` | 64 | `REGISTER_PROCESS` returns `TOO_MANY_PROCESSES` (see [`docs/ipc-interface.md`](docs/ipc-interface.md) §"Label 3: `REGISTER_PROCESS`") | a workload approaches ~50 concurrent processes |
 | `MAX_FREE_RUNS` | 512 | `push_or_coalesce` parks the run after a coalesce retry: still owned and counted in `pool_total`, but with no free-pool slot (unreachable for allocation until a later coalesce frees one) | post-coalesce free-run count regularly approaches 512 |
 
 Donation and reclamation push through `push_or_coalesce`, which coalesces

@@ -160,6 +160,17 @@ driver, not a console daemon: no name registry, no log routing, no graphical
 primitives, no input. The driver's IPC contract is specified in
 [services/drivers/framebuffer/README.md](../services/drivers/framebuffer/README.md).
 
+## Logging constraint on the serial and framebuffer drivers
+
+The serial driver and the framebuffer driver MUST NOT emit `std::os::seraph::log!`. logd routes
+its own output to these drivers (its UART mirror and its framebuffer mirror are blocking
+`SERIAL_WRITE_BYTES` and `FB_WRITE_BYTES` calls), so a log call from either driver would
+deadlock: driver → log endpoint → logd → driver. Both drivers therefore drop diagnostics, and
+fatal bootstrap failures end the driver's thread without output. The pre-driver boot window is
+covered by init-logd's direct-UART path (see § Why the direct paths remain), and the kernel
+renderer is the early-boot and panic fallback for the framebuffer. The other userspace drivers
+are not under this constraint.
+
 ## Why the direct paths remain
 
 The kernel panic console (UART) and the kernel framebuffer renderer bypass the serial and

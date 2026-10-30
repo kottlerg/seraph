@@ -5,47 +5,13 @@
 
 //! Decode the creator-endpoint bootstrap rounds into a typed [`Caps`].
 //!
-//! Slot layout (set by whichever launcher minted the rounds, each of which
-//! carries only its window's present caps and names the slot each fills in
-//! its presence word; see `ipc::bootstrap::request_slots`):
-//!   * `caps[0]`: badged SEND on the unified **root-filesystem**
-//!     namespace at its root directory (`rootfs.root`; zero when the
-//!     launcher could not mint one). This is vfsd's synthetic system
-//!     root — `NS_LOOKUP` walks it, and vfsd transparently delegates
-//!     to the underlying fs driver (fatfs today), which stays opaque
-//!     to svctest.
-//!   * `caps[1]`: `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's
-//!     service endpoint (zero when pwrmgr is absent)
-//!   * `caps[2]`: `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's
-//!     registry endpoint (`devmgr.registry`; zero when devmgr is absent).
-//!     Lacking `SHUTDOWN_DEVICE_AUTHORITY` and `TEST_LABEL_AUTHORITY`, it
-//!     drives the devmgr deny phases.
-//!   * `caps[3]`: `REGISTRY_QUERY_AUTHORITY | TEST_LABEL_AUTHORITY`-badged
-//!     SEND on devmgr's registry endpoint (`devmgr.test`; zero when devmgr
-//!     is absent). Drives devmgr's test labels: the `TEST_SPAWN_ORPHAN`
-//!     fault-injection shim in the devmgr orphan-teardown phase, and
-//!     `TEST_QUERY_DENY_DEVICE` in the drivers deny phase. TODO(#165):
-//!     retire with those labels.
-//!   * `caps[4]`: `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint
-//!     (`vfsd.mount`). Drives the vfsd `MOUNT` rejection phases.
-//!   * `caps[5]`: `DENY_BADGE`-badged SEND on vfsd's service endpoint
-//!     (`vfsd.deny`), carrying no verb bit. Drives the vfsd `MOUNT` deny
-//!     phase.
-//!
-//! Slots 4 and 5 ride in a second round, so every svctest boot exercises a
-//! seed list longer than one round, and the `svcmgr_second_seed_round`
-//! phase fails the run when either is empty.
-//!
-//! The no-authority pwrmgr SEND (`pwrmgr.deny`) is public, so svctest
-//! resolves it through `QUERY_ENDPOINT` rather than spending a seed slot
-//! on it (zero when pwrmgr is absent).
-//!
-//! svctest requests the rounds from `info.creator_endpoint`; if no
-//! creator endpoint is present (`== 0`), every slot stays zero. The `ns`
-//! phase then skips; the phases that assert on a slot (the devmgr deny,
-//! orphan-teardown, drivers deny, svcmgr seed-only, second-seed-round and
-//! vfsd phases) fail, per README § Run Sequence. The pwrmgr cap-deny phase reads
-//! no slot: it skips only when its queried `pwrmgr.deny` cap is zero.
+//! The seed each slot carries, and what svctest uses it for, are specified in
+//! `services/svctest/README.md` § Capabilities; each seed's cap shape in
+//! `services/svcmgr/docs/service-definitions.md` § `seed`; and which phases
+//! skip or fail on a zero slot in the README's § Run Sequence. The rounds are
+//! drained with `ipc::bootstrap::request_slots`, which leaves an absent slot
+//! `0`. The public `pwrmgr.deny` is resolved here too, through
+//! `QUERY_ENDPOINT`, after the rounds.
 
 use std::os::seraph::startup_info;
 

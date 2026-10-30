@@ -5,20 +5,13 @@
 
 //! Filesystem driver process spawning.
 //!
-//! Creates fatfs driver processes via procmgr. Two spawn paths exist:
-//!
-//! * **Boot-module path** (root mount only): the very first MOUNT consumes
-//!   the boot-module fatfs memory cap delivered to vfsd at bootstrap. This is
-//!   the only way to get fatfs running before any filesystem is mounted, so
-//!   the cap chain `init → vfsd → procmgr` is unavoidable for the root
-//!   mount. After the root MOUNT succeeds, `/services/fs/fatfs` is reachable through
-//!   the just-mounted root filesystem and the boot module is dropped.
-//! * **VFS path** (every subsequent mount): vfsd walks its own held
-//!   system-root cap to `/services/fs/fatfs` and asks procmgr to load that
-//!   resolved file cap via `procmgr_labels::CREATE_FROM_FILE`.
-//!   Procmgr issues `FS_READ` against the file cap, which lands on a
-//!   vfs node; the active worker pool absorbs this round so vfsd's
-//!   main reply path is not blocked while procmgr re-enters.
+//! Creates fatfs driver processes via procmgr, over the two spawn paths
+//! `services/vfsd/README.md` § Responsibilities (Filesystem driver
+//! lifecycle) specifies: the root self-mount spawns from the boot-module
+//! fatfs cap (`spawn_via_module`), and every later mount (`spawn_via_vfs`)
+//! from the file cap vfsd walks to `/services/fs/fatfs` through
+//! `CREATE_FROM_FILE`, whose `FS_READ` re-entry the worker pool absorbs so
+//! vfsd's main reply path is not blocked.
 //!
 //! Both paths route the per-child cap delivery through the bootstrap worker
 //! so the main thread's `reply_tcb` is never clobbered while servicing the

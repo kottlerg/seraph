@@ -3,18 +3,9 @@
 
 // core/ktest/src/stress/mod.rs
 
-//! Tier S — Stress and torture tests.
-//!
-//! Rule (durable):
-//!
-//! > **One file per race / resource invariant under stress. New race
-//! > class ⇒ new file.**
-//!
-//! These tests exercise race conditions, resource exhaustion, deep capability
-//! trees, and concurrent operations. They run on every ktest boot — the
-//! compile-time `KtestConfig::DEFAULT` sets `run_stress = true` and the boot
-//! protocol carries no command line, so the tier set is fixed at build time.
-//! SMP-dependent cells self-skip below their required CPU count.
+//! Tier S — Stress and torture tests. The file layout (one file per race or
+//! resource invariant), when the tier runs, and the CPU minimums cells skip
+//! below are specified in `core/ktest/README.md` § Source Layout and § Tier S.
 //!
 //! Each stress test uses [`run_integration_test!`](crate::run_integration_test)
 //! for logging and PASS/FAIL counting.

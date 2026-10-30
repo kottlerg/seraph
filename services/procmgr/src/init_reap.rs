@@ -25,28 +25,11 @@
 //! This module performs the syscalls and IPC around it, serialised under
 //! procmgr's single-threaded `service_ep` recv loop.
 //!
-//! init-logd outlives init's main thread until svcmgr-launched real-logd pulls
-//! its handover and releases it (`HANDOVER_RELEASE` → init-logd `thread_exit`).
-//! The reap is purely death-driven: procmgr waits for init-logd's natural exit
-//! and never force-stops it. If a handover genuinely never completes (real-logd
-//! crashes mid-pull or never launches), init-logd serves on and init's memory
-//! caps stay held — a benign hold, not a wedge — until shutdown.
-//!
-//! ```text
-//! do_reap:
-//!   1. cap_delete(logd_thread)                — Exited
-//!   2. cap_delete(main_thread)
-//!   3. cap_revoke + cap_delete(aspace)        — mappings gone
-//!   4. DONATE_MEMORY_CAPS(caps[..]) → memmgr       — safe; no aliasing
-//!   5. cap_revoke + cap_delete(cspace)        — drops procmgr's
-//!                                                reference only;
-//!                                                init's caps stay in
-//!                                                the kernel-pinned
-//!                                                root CSpace (release
-//!                                                is design intent;
-//!                                                #540)
-//!   6. log summary
-//! ```
+//! The reap is purely death-driven, and a handover that never completes
+//! leaves init's caps held, a benign hold
+//! (`services/procmgr/docs/ipc-interface.md` § `INIT_TEARDOWN_DONE`);
+//! `do_reap` tears init's objects down in the order
+//! `docs/process-lifecycle.md` § Init reap specifies.
 
 // Procmgr runs single-threaded under its lone `service_ep` recv loop;
 // the `Mutex` here is only the `Sync` shell required for a `static`.

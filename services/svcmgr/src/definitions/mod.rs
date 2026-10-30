@@ -23,22 +23,12 @@
 //! impure halves:
 //!
 //! At [`crate::svcmgr_labels::HANDOVER_COMPLETE`] svcmgr calls
-//! [`reconcile::reconcile_and_launch`]:
-//!
-//! 1. Scan [`SERVICES_DIR`] and parse every `.svc` into a [`Definition`].
-//! 2. Reconcile against the pending-registration table
-//!    [`crate::service::bootstrap_caps`] populated from init's handover
-//!    endowment (one substrate `(name, thread_cap)` round each):
-//!    - **Defined AND parked**: bind death-notification on the endowed
-//!      thread cap, record the recipe's fixed fields on the
-//!      `ServiceEntry` and its argv/env/cwd/seed, log-sink flag, and
-//!      scheduling fields in the parallel `RestartRecipe` table for
-//!      restart use.
-//!    - **Defined only**: launch the service via [`launch::launch`].
-//!    - **Parked without definition**: log a hard error and refuse to
-//!      bind — svcmgr has no recipe to restart it.
-//!
-//! After reconciliation the supervision loop proceeds as today.
+//! [`reconcile::reconcile_and_launch`], which scans [`SERVICES_DIR`], parses
+//! every `.svc` into a [`Definition`], and pairs each with the
+//! pending-registration table [`crate::service::bootstrap_caps`] populated
+//! from init's endowment; a defined-only service is launched through
+//! [`launch::launch`]. The three reconcile outcomes are specified in
+//! `services/svcmgr/docs/service-definitions.md` § Reconciliation.
 
 pub mod launch;
 pub mod reconcile;

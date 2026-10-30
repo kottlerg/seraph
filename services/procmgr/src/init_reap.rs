@@ -7,10 +7,11 @@
 //! reclaimable Memory caps in the post-Phase-3 exit IPCs, binds death-EQ
 //! observers on both init threads (main + init-logd), and once both have
 //! exited — init threadless — tears down init's `AddressSpace`/`Thread`
-//! objects and donates the Memory caps to memmgr. Tearing down init's
-//! `CSpace` is design intent, not yet implemented: it is the kernel-pinned
-//! root `CSpace`, so the caps init still holds stay in it, alive but
-//! unreachable (`docs/process-lifecycle.md` § Init reap, #540). init-logd
+//! objects, donates the Memory caps to memmgr, and deletes its cap on init's
+//! `CSpace`, the last reference to it, so the kernel frees that `CSpace` and
+//! releases the caps init still holds (`docs/process-lifecycle.md` § Init
+//! reap). A probe endpoint moved into init's `CSpace` just before that
+//! deletion confirms the release, and `QUERY_INIT_REAP` reports it. init-logd
 //! outlives the main thread until the svcmgr-launched real-logd pulls its
 //! handover, so the reap waits for the later of the two deaths; reclaiming
 //! init's aspace/cspace while a thread still runs in them would fault it.
@@ -38,10 +39,130 @@
 #![allow(clippy::expect_used)]
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 use process_table::{CapDisposition, DeathOutcome, InitReap, Refusal};
-use syscall_abi::MSG_CAP_SLOTS_MAX;
+use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_PHYS_BASE, MSG_CAP_SLOTS_MAX};
+
+/// Whether the reap has run, for `QUERY_INIT_REAP`.
+static REAPED: AtomicBool = AtomicBool::new(false);
+
+/// The release probe's outcome (a `procmgr_labels::INIT_REAP_PROBE_*`
+/// value), for `QUERY_INIT_REAP`.
+static PROBE_OUTCOME: AtomicU64 = AtomicU64::new(procmgr_labels::INIT_REAP_PROBE_UNCHECKED);
+
+/// Reads of the probe page after the deletion before the probe is judged
+/// held. The kernel normally frees init's `CSpace` inside procmgr's
+/// `cap_delete`; a concurrent syscall pin on it defers the free to that
+/// pin's release, which the yields wait out.
+const PROBE_SETTLE_READS: u32 = 64;
+
+/// An Endpoint procmgr retypes from a fresh one-page grant and moves into
+/// init's `CSpace` just before deleting its cap on that `CSpace`. Freeing the
+/// `CSpace` releases the endpoint, whose bytes return to the page, so the
+/// page's `available_bytes` rising across the deletion shows init's caps
+/// were released.
+struct ReleaseProbe
+{
+    /// procmgr's slot for the one-page grant the endpoint is retyped from.
+    page: u32,
+    /// The grant's physical base, naming it to `RELEASE_MEMORY_CAPS`.
+    phys_base: u64,
+    /// The page's `available_bytes` with the endpoint alive in init's
+    /// `CSpace`.
+    available_before: u64,
+}
+
+impl ReleaseProbe
+{
+    /// Retype the probe endpoint and move it into init's `CSpace` through
+    /// procmgr's `cspace` cap. `None` when any step fails, after undoing the
+    /// steps that succeeded; the reap then reports no probe result.
+    fn place(memmgr_ep: u32, cspace: u32, ipc_buf: *mut u64) -> Option<Self>
+    {
+        let page = crate::memmgr_alloc_pages_contig(memmgr_ep, 1, ipc_buf)?;
+        let Ok(phys_base) = syscall::cap_info(page, CAP_INFO_MEMORY_PHYS_BASE)
+        else
+        {
+            let _ = syscall::cap_delete(page);
+            return None;
+        };
+        let Ok(endpoint) = syscall::cap_create_endpoint(page)
+        else
+        {
+            release_page(memmgr_ep, page, phys_base, ipc_buf);
+            return None;
+        };
+        if syscall::cap_move(endpoint, cspace, 0).is_err()
+        {
+            let _ = syscall::cap_delete(endpoint);
+            release_page(memmgr_ep, page, phys_base, ipc_buf);
+            return None;
+        }
+        let Ok(available_before) = syscall::cap_info(page, CAP_INFO_MEMORY_AVAILABLE)
+        else
+        {
+            // The endpoint now sits in init's CSpace; the page cannot be
+            // returned while it may still back it.
+            let _ = syscall::cap_delete(page);
+            return None;
+        };
+        Some(Self {
+            page,
+            phys_base,
+            available_before,
+        })
+    }
+
+    /// Judge the probe after procmgr's cap on init's `CSpace` is deleted, and
+    /// return the page to memmgr once the endpoint is gone. A held endpoint
+    /// still backs the page, so the page is then kept (its cap dropped, its
+    /// pages still billed to procmgr) rather than reissued under a live
+    /// object.
+    fn settle(self, memmgr_ep: u32, ipc_buf: *mut u64) -> u64
+    {
+        for _ in 0..PROBE_SETTLE_READS
+        {
+            if syscall::cap_info(self.page, CAP_INFO_MEMORY_AVAILABLE)
+                .is_ok_and(|after| after > self.available_before)
+            {
+                release_page(memmgr_ep, self.page, self.phys_base, ipc_buf);
+                return procmgr_labels::INIT_REAP_PROBE_RELEASED;
+            }
+            let _ = syscall::thread_yield();
+        }
+        let _ = syscall::cap_delete(self.page);
+        procmgr_labels::INIT_REAP_PROBE_HELD
+    }
+}
+
+/// Drop procmgr's cap on a one-page grant and return the page to memmgr's
+/// pool by its physical base (`RELEASE_MEMORY_CAPS`).
+fn release_page(memmgr_ep: u32, page: u32, phys_base: u64, ipc_buf: *mut u64)
+{
+    let _ = syscall::cap_delete(page);
+    let msg = IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS)
+        .word(0, 1)
+        .word(1, phys_base)
+        .build();
+    // SAFETY: ipc_buf is procmgr's registered IPC buffer.
+    let _ = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) };
+}
+
+/// Handle `QUERY_INIT_REAP`: reply with whether the reap has run and the
+/// release probe's outcome. The message names no caps, so procmgr deletes
+/// any it moved.
+pub fn handle_query(req: &IpcMessage, ipc_buf: *mut u64)
+{
+    crate::release_caps(req.caps());
+    let msg = IpcMessage::builder(procmgr_errors::SUCCESS)
+        .word(0, u64::from(REAPED.load(Ordering::Relaxed)))
+        .word(1, PROBE_OUTCOME.load(Ordering::Relaxed))
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&msg, ipc_buf) };
+}
 
 /// Init's kernel-object and reclaim-Memory caps, accumulated across
 /// `REGISTER_INIT_TEARDOWN` rounds and consumed by `run_reap`.
@@ -253,15 +374,25 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
     let (donated_caps, donated_pages, pool_total) =
         donate_to_memmgr(memmgr_ep, &donate_caps, ipc_buf);
 
-    // 5. Revoke and delete procmgr's cap on init's CSpace last. init's
-    //    CSpace is the kernel-pinned root CSpace, so this drops only
-    //    procmgr's reference: the caps init still holds (described in
-    //    `docs/process-lifecycle.md` § Init reap) stay in it, alive but
-    //    unreachable. Releasing them at the reap is design intent,
-    //    not yet implemented (`docs/process-lifecycle.md` § Init reap,
-    //    #540).
+    // 5. Revoke and delete procmgr's cap on init's CSpace last. It is the
+    //    last reference to that CSpace (the kernel keeps none once init
+    //    runs), so the deletion frees it and the kernel's CSpace teardown
+    //    releases the caps init still holds (described in
+    //    `docs/process-lifecycle.md` § Init reap). The probe is placed
+    //    first and read on either side of this step only, so it observes
+    //    exactly this release and changes the order of nothing else.
+    let probe = ReleaseProbe::place(memmgr_ep, cspace, ipc_buf);
     let _ = syscall::cap_revoke_all(cspace);
     let _ = syscall::cap_delete(cspace);
+    let outcome = probe.map_or(procmgr_labels::INIT_REAP_PROBE_UNCHECKED, |p| {
+        p.settle(memmgr_ep, ipc_buf)
+    });
+    PROBE_OUTCOME.store(outcome, Ordering::Relaxed);
+    REAPED.store(true, Ordering::Relaxed);
+    if outcome == procmgr_labels::INIT_REAP_PROBE_HELD
+    {
+        std::os::seraph::log!("init-reap: init's CSpace survived the deletion of its last cap");
+    }
 
     // 6. Summary line so the operator can confirm the reap actually ran.
     std::os::seraph::log!(

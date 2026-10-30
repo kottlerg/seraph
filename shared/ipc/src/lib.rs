@@ -298,6 +298,24 @@ pub mod procmgr_labels
     /// is already armed.
     pub const INIT_TEARDOWN_DONE: u64 = 16;
 
+    /// Report the outcome of init's reap. Any caller; no caps, no state
+    /// change. Reply `SUCCESS` with `data[0]` = 1 once the reap has run (0
+    /// before) and `data[1]` = the release probe's outcome, one of
+    /// [`INIT_REAP_PROBE_UNCHECKED`], [`INIT_REAP_PROBE_RELEASED`], or
+    /// [`INIT_REAP_PROBE_HELD`]. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § `QUERY_INIT_REAP`.
+    pub const QUERY_INIT_REAP: u64 = 17;
+
+    /// [`QUERY_INIT_REAP`] probe outcome: no probe result (the reap has not
+    /// run, or procmgr could not place the probe).
+    pub const INIT_REAP_PROBE_UNCHECKED: u64 = 0;
+    /// [`QUERY_INIT_REAP`] probe outcome: deleting procmgr's cap on init's
+    /// `CSpace` freed it, releasing the probe endpoint init's `CSpace` held.
+    pub const INIT_REAP_PROBE_RELEASED: u64 = 1;
+    /// [`QUERY_INIT_REAP`] probe outcome: the probe endpoint survived the
+    /// deletion, so init's `CSpace` was not freed.
+    pub const INIT_REAP_PROBE_HELD: u64 = 2;
+
     /// Reserved death-notification correlator used by `REGISTER_INIT_TEARDOWN`.
     /// Per-child correlators are `process_badge as u32`; procmgr redraws a
     /// random badge whose low 32 bits are below
@@ -334,10 +352,9 @@ pub mod sched_policy
     /// Upper bound of the baseline `SchedControl` band init delegates to
     /// the spawn chain: init splits its root `[1, 30]` cap at
     /// `BASELINE_PRIORITY_MAX + 1`, keeps the elevated remainder
-    /// (`[29, 30]`, which stays alive but unreachable in init's pinned
-    /// `CSpace` after its reap; releasing it there is design intent, not
-    /// yet implemented, per `docs/process-lifecycle.md` § Init reap and
-    /// #540), and hands the baseline `[1, 28]` to memmgr and procmgr.
+    /// (`[29, 30]`, released when init's reap frees its `CSpace`, per
+    /// `docs/process-lifecycle.md` § Init reap), and hands the baseline
+    /// `[1, 28]` to memmgr and procmgr.
     /// Every band procmgr mints for a child is a (possibly narrowed)
     /// descendant of this baseline, so no spawned process can ever reach
     /// `[29, 30]`.

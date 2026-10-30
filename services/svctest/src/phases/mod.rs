@@ -24,6 +24,8 @@
 //!    closes once init's reap donations reach memmgr, which races
 //!    svctest startup. Running it last maximises the chance the
 //!    donations have landed; the phase polls to close the residual race.
+//! 6. [`procmgr::init_reap`] just before it, for the same reason: it waits
+//!    for init's reap, and polls for it.
 
 use crate::runner::Phase;
 
@@ -79,6 +81,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(timed::phases());
     out.extend_from_slice(drivers::phases());
     out.extend_from_slice(vfsd::phases());
+    out.extend_from_slice(procmgr::init_reap());
     out.extend_from_slice(memmgr::identity());
     out
 }

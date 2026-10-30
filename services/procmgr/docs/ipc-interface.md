@@ -26,8 +26,9 @@ Label numbers, error codes, and query states are defined in
 `START_PROCESS`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`, and
 `CONFIGURE_NAMESPACE` are sent on a **process handle** (the badged endpoint a
 create call returns); procmgr identifies the target process by the badge
-`ipc_recv` delivers. Labels 14–16 are specified in § `REGISTER_DEATH_EQ`,
-§ `REGISTER_INIT_TEARDOWN`, and § `INIT_TEARDOWN_DONE` below. Labels 3–7 and 10
+`ipc_recv` delivers. Labels 14–17 are specified in § `REGISTER_DEATH_EQ`,
+§ `REGISTER_INIT_TEARDOWN`, § `INIT_TEARDOWN_DONE`, and § `QUERY_INIT_REAP`
+below. Labels 3–7 and 10
 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
 other unknown opcode, and deletes the caps such a request carried (see
 § Capability Transfer).
@@ -444,15 +445,42 @@ Each death-EQ event with
 `INIT_REAP_CORRELATOR` (reserved `u32::MAX`) calls
 [`init_reap::run_reap`](../src/init_reap.rs), which counts the death and, on the
 second, executes the six-step teardown (Threads → AddressSpace →
-DONATE_MEMORY_CAPS → drop procmgr's CSpace reference → log), whether or not
-`INIT_TEARDOWN_DONE` has armed the reap: a threadless init can send no further
-round.
+DONATE_MEMORY_CAPS → revoke and delete procmgr's CSpace capability, the last
+reference to init's CSpace, which frees it and releases the caps init still holds →
+log), whether or not `INIT_TEARDOWN_DONE` has armed the reap: a threadless init can
+send no further round.
 init-logd normally exits last, once real-logd's `HANDOVER_RELEASE` releases it;
 procmgr never force-stops it. If the handover never completes, init-logd serves on
 and init's caps stay held until shutdown — a benign hold, not a wedge (see the
 [logd handover protocol](../../logd/docs/handover-protocol.md) § Failure modes).
 The system-scope reap model is in
 [docs/process-lifecycle.md](../../../docs/process-lifecycle.md) § Init reap.
+
+## QUERY_INIT_REAP — init reap outcome
+
+Wire format:
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::QUERY_INIT_REAP` (17) |
+| caps | none |
+
+Accepted on any procmgr cap, badged or not: it returns two words and changes no
+state. Procmgr deletes any cap the message carried. Reply `SUCCESS` with:
+
+| Field | Meaning |
+|---|---|
+| `data[0]` | `1` once the reap has run, `0` before |
+| `data[1]` | The release probe's outcome: `INIT_REAP_PROBE_UNCHECKED` (0) before the reap, or when procmgr could not place the probe; `INIT_REAP_PROBE_RELEASED` (1) when deleting procmgr's CSpace capability freed init's CSpace; `INIT_REAP_PROBE_HELD` (2) when it did not |
+
+The probe is an Endpoint procmgr retypes from a one-page memmgr grant and moves
+into init's CSpace through its CSpace capability after the donation step and
+before the revoke and delete. Freeing init's CSpace releases the endpoint, whose
+bytes return to the grant; procmgr reads the grant's `available_bytes` on each side
+of the deletion, with nothing else released between the two reads, reports
+`RELEASED` when it rose, and returns the page to memmgr (`RELEASE_MEMORY_CAPS`).
+A held endpoint still backs the page, so procmgr then keeps the page. svctest's
+`init_cspace_released` phase asserts `RELEASED`.
 
 ---
 

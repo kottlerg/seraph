@@ -71,6 +71,9 @@ fn check(ctx: &TestContext, held: u32) -> TestResult
         .map_err(|_| "integration::mmio_revoke_unmaps: cap_derive(granted) failed")?;
     // SAFETY: `PROBE_VA` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.
+    // Only `reader`'s raw `read_volatile` reaches the mapping, never a
+    // reference, and the test maps nothing else at PROBE_VA while the reader
+    // runs (`mmio_map` § Safety).
     if unsafe { mmio_map(ctx.aspace_cap, granted, PROBE_VA, 0) }.is_err()
     {
         cap_delete(granted).ok();

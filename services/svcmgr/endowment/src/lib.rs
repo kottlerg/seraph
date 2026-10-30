@@ -331,16 +331,28 @@ mod tests
         let mut data = [0u64; ROUND_DATA_WORDS];
         data.copy_from_slice(round.data());
         data[1] = u64::from(ipc::SVCMGR_LABELS_VERSION) + 1;
-        assert_eq!(decode_caps(round.caps(), &data), Err(DecodeError::VersionMismatch));
-        assert_eq!(decode_caps(round.caps(), &data[..1]), Err(DecodeError::VersionMismatch));
+        assert_eq!(
+            decode_caps(round.caps(), &data),
+            Err(DecodeError::VersionMismatch)
+        );
+        assert_eq!(
+            decode_caps(round.caps(), &data[..1]),
+            Err(DecodeError::VersionMismatch)
+        );
     }
 
     #[test]
     fn caps_round_missing_its_presence_word_or_an_endpoint_is_malformed()
     {
         let round = encode_caps(&caps_round(0, 0));
-        assert_eq!(decode_caps(round.caps(), &round.data()[..2]), Err(DecodeError::Malformed));
-        assert_eq!(decode_caps(&round.caps()[..1], round.data()), Err(DecodeError::Malformed));
+        assert_eq!(
+            decode_caps(round.caps(), &round.data()[..2]),
+            Err(DecodeError::Malformed)
+        );
+        assert_eq!(
+            decode_caps(&round.caps()[..1], round.data()),
+            Err(DecodeError::Malformed)
+        );
     }
 
     #[test]
@@ -349,33 +361,54 @@ mod tests
         let both = encode_caps(&caps_round(0x21, 0x22));
         let one = encode_caps(&caps_round(0x21, 0));
         // Bitmap names two optional caps, one delivered; and the reverse.
-        assert_eq!(decode_caps(one.caps(), both.data()), Err(DecodeError::Malformed));
-        assert_eq!(decode_caps(both.caps(), one.data()), Err(DecodeError::Malformed));
+        assert_eq!(
+            decode_caps(one.caps(), both.data()),
+            Err(DecodeError::Malformed)
+        );
+        assert_eq!(
+            decode_caps(both.caps(), one.data()),
+            Err(DecodeError::Malformed)
+        );
 
         let none = encode_logd_sources(&LogdSources {
             master_log_source: 0,
             procmgr_death_auth_source: 0,
         });
-        assert_eq!(decode_logd_sources(&[0x31], none.data()), Err(DecodeError::Malformed));
+        assert_eq!(
+            decode_logd_sources(&[0x31], none.data()),
+            Err(DecodeError::Malformed)
+        );
     }
 
     #[test]
     fn a_presence_bit_with_no_slot_is_malformed()
     {
         let data = [kind::LOGD_SOURCES, logd_present::MASTER_LOG | (1 << 2)];
-        assert_eq!(decode_logd_sources(&[0x31, 0x32], &data), Err(DecodeError::Malformed));
+        assert_eq!(
+            decode_logd_sources(&[0x31, 0x32], &data),
+            Err(DecodeError::Malformed)
+        );
     }
 
     #[test]
     fn a_round_of_another_kind_or_without_presence_word_is_malformed()
     {
         let caps = encode_caps(&caps_round(0, 0));
-        assert_eq!(decode_logd_sources(caps.caps(), caps.data()), Err(DecodeError::Malformed));
-        assert_eq!(decode_logd_sources(&[], &[kind::LOGD_SOURCES]), Err(DecodeError::Malformed));
+        assert_eq!(
+            decode_logd_sources(caps.caps(), caps.data()),
+            Err(DecodeError::Malformed)
+        );
+        assert_eq!(
+            decode_logd_sources(&[], &[kind::LOGD_SOURCES]),
+            Err(DecodeError::Malformed)
+        );
         let logd = encode_logd_sources(&LogdSources {
             master_log_source: 0,
             procmgr_death_auth_source: 0,
         });
-        assert_eq!(decode_caps(logd.caps(), logd.data()), Err(DecodeError::Malformed));
+        assert_eq!(
+            decode_caps(logd.caps(), logd.data()),
+            Err(DecodeError::Malformed)
+        );
     }
 }

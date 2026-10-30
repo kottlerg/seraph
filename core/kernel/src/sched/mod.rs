@@ -1613,7 +1613,7 @@ fn watchdog_print_blocked_on(decoded: &BlockedOnSnapshot)
         {}
         BlockedOnSnapshot::Server { tid, reply_is_self } =>
         {
-            crate::kprintln!("      server tid{} reply_is_self={}", tid, reply_is_self)
+            crate::kprintln!("      server tid{} reply_is_self={}", tid, reply_is_self);
         }
         BlockedOnSnapshot::SourceLocked => crate::kprintln!("      source lock held"),
         BlockedOnSnapshot::Source(SourceSnapshot::EventQueue {

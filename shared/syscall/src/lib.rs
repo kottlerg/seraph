@@ -1898,11 +1898,11 @@ pub fn irq_ack(irq_cap: u32) -> Result<(), i64>
 /// # Safety
 /// The contract of [`mem_map`], for the span the MMIO region covers at
 /// `virt`. Besides, the mapping can be withdrawn at any time: by this
-/// program deleting, splitting, or revoking the capability, or by any holder
-/// of an ancestor capability, in any process, revoking it. When `aspace_cap`
-/// names the calling program's own address space, the program therefore
-/// reaches the span only through raw-pointer accesses, never
-/// through a Rust reference, and puts the span's virtual addresses to no
+/// program deleting or splitting the capability or revoking an ancestor of
+/// it, or by any holder of an ancestor capability, in any process, revoking
+/// it. When `aspace_cap` names the calling program's own address space, the
+/// program therefore reaches the span only through raw-pointer accesses,
+/// never through a Rust reference, and puts the span's virtual addresses to no
 /// other use while such an access can still run. A withdrawn mapping then
 /// reaches no Rust object, which is why [`cap_delete`], [`cap_revoke`], and
 /// [`mmio_split`] stay safe functions.

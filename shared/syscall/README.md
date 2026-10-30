@@ -65,4 +65,5 @@ shared/syscall/
 
 [Syscall Interface Specification](../../core/kernel/docs/syscalls.md),
 [Build System](../../docs/build-system.md),
+[Capability Model](../../docs/capability-model.md),
 [runtime/ruststd/README.md](../../runtime/ruststd/README.md)

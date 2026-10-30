@@ -37,7 +37,9 @@ pub unsafe fn fb_mmio_init(self_aspace: u32, mmio_cap: u32, total_pages: u64) ->
     // per-process arena, owned for the process's lifetime, and the caller's
     // contract bounds the region to it: VA no Rust object or IPC page
     // occupies.
-    // Only raw pointers reach the mapping, never a reference (`mmio_map` § Safety).
+    // The renderer (`render.rs`) reaches the mapping only through raw
+    // `write_volatile` and `ptr::copy` accesses, never a reference, and the
+    // reservation stays held for the process's lifetime (`mmio_map` § Safety).
     unsafe { syscall::mmio_map(self_aspace, mmio_cap, base_va, 0) }.ok()?;
     Some(base_va as *mut u8)
 }

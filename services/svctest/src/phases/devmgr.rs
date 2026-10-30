@@ -4,7 +4,8 @@
 // services/svctest/src/phases/devmgr.rs
 
 //! devmgr surface — the `QUERY_BLOCK_DEVICE`, `QUERY_SHUTDOWN_DEVICE`, and
-//! test-label authority gates, and driver-spawn orphan teardown (#176).
+//! test-label authority gates, the instance ordinal of `QUERY_INPUT_DEVICE`,
+//! and driver-spawn orphan teardown (#176).
 //!
 //! The deny phases send the gated labels on `devmgr.registry`, a cap
 //! carrying `REGISTRY_QUERY_AUTHORITY` but none of `BLOCK_DEVICE_AUTHORITY`,
@@ -12,6 +13,10 @@
 //! `UNAUTHORIZED`: such a holder cannot acquire the whole-disk block cap or
 //! the platform shutdown actuators, or drive devmgr's test labels (the
 //! `TEST_SPAWN_ORPHAN` shim and `TEST_QUERY_DENY_DEVICE`).
+//!
+//! The ordinal phase asks `devmgr.registry` for the input driver at ordinal 0,
+//! absent and explicit, and past the one keyboard every boot's device set
+//! carries, and asserts a cap for the first and `NO_DEVICE` for the second.
 //!
 //! The teardown phase drives devmgr's temporary `TEST_SPAWN_ORPHAN` shim to
 //! force a round-2 bootstrap failure in a fault-injection driver that hangs
@@ -24,6 +29,7 @@
 //! phase with the devmgr enumeration redesign and its shim.
 
 use std::os::seraph::startup_info;
+use std::time::Duration;
 
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
@@ -38,6 +44,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "devmgr_shutdown_device_deny",
             run: shutdown_device_deny_phase,
+        },
+        Phase {
+            name: "devmgr_input_instance_ordinal",
+            run: input_instance_ordinal_phase,
         },
         Phase {
             name: "devmgr_orphan_teardown",
@@ -102,6 +112,72 @@ fn shutdown_device_deny_phase(caps: &Caps)
         "QUERY_SHUTDOWN_DEVICE",
         "SHUTDOWN_DEVICE_AUTHORITY",
     );
+}
+
+/// Attempts at the ordinal-0 input query while devmgr reports `NO_DEVICE`:
+/// the input driver is spawned from disk after devmgr's `SET_DRIVERS_DIR`,
+/// so its endpoint can lag svctest's start. 500 attempts 10 ms apart bound
+/// the wait at about 5 s.
+const INPUT_ATTEMPTS: u32 = 500;
+
+/// `QUERY_INPUT_DEVICE` on `devmgr.registry` selecting `ordinal` in
+/// `data[1]`, or sending no `data[1]` for `None`.
+fn query_input(devmgr: u32, ordinal: Option<u64>) -> ipc::IpcMessage
+{
+    let mut req = ipc::IpcMessage::builder(ipc::devmgr_labels::QUERY_INPUT_DEVICE)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION));
+    if let Some(o) = ordinal
+    {
+        req = req.word(1, o);
+    }
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    unsafe { ipc::ipc_call(devmgr, &req.build(), ipc_buf) }
+        .unwrap_or_else(|_| panic!("QUERY_INPUT_DEVICE ordinal {ordinal:?} ipc_call failed"))
+}
+
+/// `reply` is a `SUCCESS` carrying one cap, which is released.
+fn assert_granted(reply: &ipc::IpcMessage, what: &str)
+{
+    assert_eq!(reply.label, ipc::devmgr_errors::SUCCESS, "{what} status");
+    let cap = reply.caps().first().copied().unwrap_or(0);
+    assert!(cap != 0, "{what} carried no cap");
+    let _ = syscall::cap_delete(cap);
+}
+
+fn input_instance_ordinal_phase(caps: &Caps)
+{
+    let devmgr = caps.devmgr_registry;
+    assert!(devmgr != 0, "input ordinal: no devmgr.registry cap seeded");
+
+    let mut first = query_input(devmgr, None);
+    for _ in 1..INPUT_ATTEMPTS
+    {
+        if first.label != ipc::devmgr_errors::NO_DEVICE
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        first = query_input(devmgr, None);
+    }
+    assert_granted(&first, "QUERY_INPUT_DEVICE without an ordinal");
+    assert_granted(
+        &query_input(devmgr, Some(0)),
+        "QUERY_INPUT_DEVICE ordinal 0",
+    );
+    for ordinal in [1, u64::MAX]
+    {
+        let reply = query_input(devmgr, Some(ordinal));
+        assert_eq!(
+            reply.label,
+            ipc::devmgr_errors::NO_DEVICE,
+            "QUERY_INPUT_DEVICE ordinal {ordinal} past the one keyboard must reply NO_DEVICE"
+        );
+        assert!(
+            reply.caps().is_empty(),
+            "ordinal {ordinal} reply must carry no cap"
+        );
+    }
 }
 
 /// Read memmgr's current free-pool total (`QUERY_POOL_STATUS` `data[3]`).

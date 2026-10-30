@@ -21,7 +21,8 @@ framebuffer/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    ├── lib.rs                   # Library root exposing render (host-tested)
+    ├── authority.rs             # WRITE_AUTHORITY verb-bit gate (host-tested)
+    ├── lib.rs                   # Library root exposing authority and render (host-tested)
     ├── main.rs                  # Driver entry, bootstrap, write service loop
     ├── render.rs                # FramebufferWriter (geometry checks, cursor, glyph blit, scroll)
     └── arch/
@@ -53,7 +54,9 @@ is a device, not a service. Devmgr answers
 [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`] by minting a
 [`fb_labels::WRITE_AUTHORITY`]-badged `SEND_GRANT` cap on the driver's
 service endpoint, mirroring the `QUERY_SERIAL_DEVICE` flow. The caller's
-devmgr-registry badge must carry `REGISTRY_QUERY_AUTHORITY`.
+devmgr-registry badge must carry `REGISTRY_QUERY_AUTHORITY`. Both labels below
+are gated by `WRITE_AUTHORITY`: a request whose badge lacks it is answered
+`UNAUTHORIZED` and has no effect.
 
 ---
 
@@ -103,7 +106,7 @@ There is one decoder per driver process, alongside the single cursor.
 
 | Field | Value |
 |---|---|
-| label | `0` (`SUCCESS`) or `2` (`UNKNOWN_OPCODE`) |
+| label | `0` (`SUCCESS`), `4` (`UNAUTHORIZED` — badge lacks `WRITE_AUTHORITY`), or `2` (`UNKNOWN_OPCODE`) |
 
 The driver's UTF-8 / font output is exercised by
 [`programs/fb-charset`](../../../programs/fb-charset/README.md), a
@@ -135,7 +138,7 @@ framebuffer log mirror, any pre-terminal caller — render unchanged.
 
 | Field | Value |
 |---|---|
-| label | `0` (`SUCCESS`) or `2` (`UNKNOWN_OPCODE`) |
+| label | `0` (`SUCCESS`), `4` (`UNAUTHORIZED` — badge lacks `WRITE_AUTHORITY`), or `2` (`UNKNOWN_OPCODE`) |
 
 The terminal owns ANSI SGR parsing (`ESC[…m` → `FB_SET_ATTRS`); the driver
 never sees `ESC`. See [docs/console-model.md](../../../docs/console-model.md).

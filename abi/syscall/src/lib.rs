@@ -492,8 +492,9 @@ pub enum SyscallError
     /// backstop leaves.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
-    /// directory is full). Unlike `OutOfMemory`, donating memory (augment
-    /// mode) cannot satisfy the request.
+    /// directory is full, or the object a new capability or a retype would
+    /// reference already holds 2^31 references). Unlike `OutOfMemory`,
+    /// donating memory (augment mode) cannot satisfy the request.
     QuotaExceeded = -17,
 }
 

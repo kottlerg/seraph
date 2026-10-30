@@ -2866,7 +2866,8 @@ impl IpcMessageBuilder
 /// a cap slot is stale or Null (`InvalidCapability`), a cap slot is
 /// repeated in the message (`InvalidArgument`), a cap slot is pinned by an
 /// in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer
-/// (`InvalidState`), or the call is interrupted. Cap-slot problems are
+/// (`InvalidState`), a cap's object has its reference count at its 2^31
+/// ceiling (`QuotaExceeded`), or the call is interrupted. Cap-slot problems are
 /// rejected before blocking; a refusal arising only afterwards delivers the
 /// message with zero caps (the caller keeps its capabilities).
 #[inline]
@@ -2935,7 +2936,8 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// reply either way: when a caller was claimed it has already been woken
 /// with the synthetic `IPC_REPLY_TRANSFER_FAILED` label (a reply cap slot
 /// stale, repeated, pinned by an in-flight revoke, move, or IPC capability
-/// transfer, or unacceptable to its `CSpace`), and when none was pending
+/// transfer, naming an object at its reference ceiling, or unacceptable to
+/// its `CSpace`), and when none was pending
 /// there is nothing to wake — in both cases the reply must not be retried.
 ///
 /// # Safety
@@ -2947,8 +2949,10 @@ pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 /// reply target, or a reply cap slot is stale or Null), `InvalidArgument`
 /// (a cap slot repeated in the reply), `InvalidState` (a reply cap slot is
 /// pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
-/// transfer), or `QuotaExceeded` / `OutOfMemory` (the caller's `CSpace`
-/// cannot accept the reply caps). The reply never blocks, so it never returns
+/// transfer), `QuotaExceeded` (the caller's `CSpace` directory cannot accept
+/// the reply caps, or a reply cap's object has its reference count at its
+/// 2^31 ceiling), or `OutOfMemory` (the caller's `CSpace` slot pool cannot
+/// back them). The reply never blocks, so it never returns
 /// `Interrupted`; the message's counts are within the kernel's maxima by
 /// construction (the kernel clamps larger ones rather than rejecting them).
 #[inline]

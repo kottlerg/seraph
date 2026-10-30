@@ -88,8 +88,8 @@ pub enum ObjectType
 #[repr(C)]
 pub struct KernelObjectHeader
 {
-    /// Reference count; starts at 1 when created.
-    /// Tracked by #633: the unchecked `u32` increment in `inc_ref` can wrap.
+    /// Reference count; starts at 1 when created. Bounded by
+    /// [`REF_COUNT_LIMIT`] for the references userspace can multiply.
     pub ref_count: AtomicU32,
     /// Concrete type, for use during deallocation.
     pub obj_type: ObjectType,
@@ -104,6 +104,44 @@ pub struct KernelObjectHeader
     /// sentinel without imposing const-init constraints on construction.
     pub ancestor: AtomicPtr<KernelObjectHeader>,
 }
+
+/// Ceiling on [`KernelObjectHeader::ref_count`] for the references userspace
+/// can multiply without a bound of its own: a new capability slot (copy,
+/// derive, badged derive, a move's destination) refuses at it, and so does a
+/// retype from a Memory object whose count is at it.
+///
+/// The value is correct as is, not a limit a workload meets: every
+/// userspace-amplifiable reference costs a 72-byte capability slot or a retype
+/// child of at least 128 bytes, so 2^31 references to one object hold at least
+/// 144 GiB against that single object, which no workload does, and reaching the
+/// ceiling refuses the request with `QuotaExceeded` instead of wrapping the
+/// count and freeing a live object.
+///
+/// A move's destination slot takes its reference through the same check (a
+/// move its liveness backstop abandons leaves that slot live beside the
+/// source); an IPC transfer checks every cap of its message before its first
+/// move and then takes the destinations' references unchecked.
+///
+/// The ceiling leaves 2^31 of headroom below `u32::MAX` for every other
+/// reference, which the kernel takes unchecked. Each of those is bounded by an
+/// object count, not by a caller's request. Per thread: its syscall pins (a
+/// few), its fault-handler binding (one), the death observers bound on it (at
+/// most `MAX_DEATH_OBSERVERS`, four), the lease of a retype it has in flight
+/// that passed `retype_allocate`'s check before another took the count to the
+/// ceiling (one), and the destinations of an IPC transfer it has in flight that
+/// passed the message check (at most `MSG_CAP_SLOTS_MAX`, four); fewer than 16
+/// in all. Per other object: wait-set membership (one per source), Mmio mapping
+/// records (four per Mmio object, whose bodies are SEED-backed), address-space
+/// death observers (a fixed number per address space), SEED leases (bounded by
+/// the SEED reserve), and the destinations IPC transfers' abandoned moves leave
+/// live: a message check refuses once the count is at the ceiling, and
+/// transfers run one at a time under `DERIVATION_LOCK`, so these keep an
+/// object's slot references within `MSG_CAP_SLOTS_MAX - 1` of the ceiling.
+/// Exhausting the headroom would take some 2^27 threads, each with its own
+/// kernel stack and TCB (at least 2 TiB of kernel stacks), so the count cannot
+/// wrap (core/kernel/docs/capability-internals.md § Kernel Object Reference
+/// Counting).
+pub const REF_COUNT_LIMIT: u32 = 1 << 31;
 
 // SAFETY: ancestor is a back-pointer to a kernel object whose lifetime is
 // guaranteed by retype's refcount semantics. Send+Sync via the surrounding
@@ -144,13 +182,61 @@ impl KernelObjectHeader
         }
     }
 
-    /// Increment the reference count. Call when a capability slot or a
-    /// kernel-internal owner takes a reference to this object (see
+    /// Increment the reference count for an owner whose number is bounded
+    /// below the headroom above [`REF_COUNT_LIMIT`]: a syscall pin, a binding,
+    /// a mapping record, a SEED lease, or the lease of a retype that
+    /// [`crate::cap::retype::retype_allocate`] admitted (see
     /// core/kernel/docs/capability-internals.md § Kernel Object Reference
-    /// Counting).
+    /// Counting), or an IPC transfer's move destination, whose message
+    /// [`crate::cap::transfer::check_transfer_ref_limits`] checked first. Every
+    /// other new capability slot, a `SYS_CAP_MOVE` destination included, takes
+    /// its reference through [`Self::try_inc_ref`] instead.
     pub fn inc_ref(&self)
     {
-        self.ref_count.fetch_add(1, Ordering::Relaxed);
+        let prev = self.ref_count.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(
+            prev < u32::MAX,
+            "inc_ref overflow: obj_type={:?} self={:p}",
+            self.obj_type,
+            self,
+        );
+    }
+
+    /// Increment the reference count unless it has reached
+    /// [`REF_COUNT_LIMIT`]. The path for references whose number userspace
+    /// can grow without a bound of its own: new capability slots.
+    ///
+    /// # Errors
+    ///
+    /// `QuotaExceeded` when the count is at the limit; the count is left
+    /// unchanged.
+    pub fn try_inc_ref(&self) -> Result<(), syscall::SyscallError>
+    {
+        let mut cur = self.ref_count.load(Ordering::Relaxed);
+        loop
+        {
+            if cur >= REF_COUNT_LIMIT
+            {
+                return Err(syscall::SyscallError::QuotaExceeded);
+            }
+            match self.ref_count.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            {
+                Ok(_) => return Ok(()),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Whether the count has reached [`REF_COUNT_LIMIT`], so a new
+    /// userspace-amplifiable reference must be refused.
+    pub fn at_ref_limit(&self) -> bool
+    {
+        self.ref_count.load(Ordering::Relaxed) >= REF_COUNT_LIMIT
     }
 
     /// Decrement the reference count and return the new value.
@@ -2085,7 +2171,8 @@ unsafe fn release_range_object<T>(
 /// # Errors
 /// For `Mmio` and `IoPort`: `QuotaExceeded` when the lineage already has
 /// [`RANGE_COPY_LIMIT`] live copies, and `OutOfMemory` when SEED cannot back
-/// the copy.
+/// the copy. For every other type: `QuotaExceeded` when `src`'s reference
+/// count is at [`REF_COUNT_LIMIT`].
 ///
 /// # Safety
 /// `src` is the live object of a slot tagged `tag`, pinned by the caller.
@@ -2139,8 +2226,10 @@ pub unsafe fn object_for_new_slot(
         }
         _ =>
         {
+            // A new slot is the reference userspace can multiply, so it is
+            // refused at the ceiling (`REF_COUNT_LIMIT`).
             // SAFETY: src is pinned, so its count is above zero.
-            unsafe { src.as_ref().inc_ref() };
+            unsafe { src.as_ref().try_inc_ref() }?;
             Ok(src)
         }
     }
@@ -4058,5 +4147,27 @@ mod tests
         assert_eq!(after_dec, 1);
         let after_dec2 = h.dec_ref();
         assert_eq!(after_dec2, 0);
+    }
+
+    // Defect guarded: a checked increment that admits the reference at the
+    // ceiling, or one that moves the count when it refuses, lets userspace
+    // walk the count toward the wrap that frees a live object.
+    #[test]
+    fn checked_increment_refuses_at_the_ceiling_and_leaves_the_count()
+    {
+        let h = KernelObjectHeader::new(ObjectType::Endpoint);
+        h.ref_count.store(REF_COUNT_LIMIT - 1, Ordering::Relaxed);
+        assert!(!h.at_ref_limit());
+        assert!(h.try_inc_ref().is_ok());
+        assert_eq!(h.ref_count.load(Ordering::Relaxed), REF_COUNT_LIMIT);
+        assert!(h.at_ref_limit());
+        assert!(matches!(
+            h.try_inc_ref(),
+            Err(syscall::SyscallError::QuotaExceeded)
+        ));
+        assert_eq!(h.ref_count.load(Ordering::Relaxed), REF_COUNT_LIMIT);
+        // A release below the ceiling admits a new reference again.
+        assert_eq!(h.dec_ref(), REF_COUNT_LIMIT - 1);
+        assert!(h.try_inc_ref().is_ok());
     }
 }

@@ -107,10 +107,11 @@ pub unsafe fn child_args<T: Copy>(arg: u64) -> T
 /// `cap_delete` on the field: each clears its field once the delete has
 /// taken the cap, so a handle is deleted once, and the drop never deletes a
 /// stale handle a recycled slot's wrapped generation would alias to another
-/// cap. A delete refused with `InvalidState` leaves the cap in place (a
-/// revoke, move, or IPC transfer in flight on the slot,
-/// `core/kernel/docs/syscalls.md` § `SYS_CAP_REVOKE`), so the field keeps it
-/// and the drop deletes it again. A zero field holds nothing:
+/// cap. Any other refusal leaves the cap in place (`InvalidState` for a
+/// revoke, move, or IPC transfer in flight on the slot, `Interrupted` for a
+/// delete a concurrent derive cut short; `core/kernel/docs/syscalls.md`
+/// § `SYS_CAP_REVOKE` and § `SYS_CAP_DELETE`), so the field keeps it and the
+/// drop tries the delete again. A zero field holds nothing:
 /// [`EMPTY`](Self::EMPTY) fills a guard array before its children exist, and
 /// a thread bound to ktest's own `CSpace` is guarded with `cs: 0`.
 pub struct SpawnedChild
@@ -124,9 +125,10 @@ impl SpawnedChild
     /// A guard holding no cap.
     pub const EMPTY: SpawnedChild = SpawnedChild { th: 0, cs: 0 };
 
-    /// Delete the Thread cap now, clearing the field so the drop skips it
-    /// (unless the delete is refused with `InvalidState`, which leaves the cap
-    /// for the drop); `Ok` at once when the guard holds none.
+    /// Delete the Thread cap now, clearing the field once the cap is gone
+    /// (the delete succeeded, or the handle names no cap); a refusal that
+    /// leaves the cap keeps it for the drop. `Ok` at once when the guard holds
+    /// none.
     ///
     /// # Errors
     ///
@@ -136,9 +138,10 @@ impl SpawnedChild
         delete_held(&mut self.th)
     }
 
-    /// Delete the `CSpace` cap now, clearing the field so the drop skips it
-    /// (unless the delete is refused with `InvalidState`, which leaves the cap
-    /// for the drop); `Ok` at once when the guard holds none.
+    /// Delete the `CSpace` cap now, clearing the field once the cap is gone
+    /// (the delete succeeded, or the handle names no cap); a refusal that
+    /// leaves the cap keeps it for the drop. `Ok` at once when the guard holds
+    /// none.
     ///
     /// # Errors
     ///
@@ -149,9 +152,10 @@ impl SpawnedChild
     }
 }
 
-/// Delete the cap `handle` holds and clear it, unless the delete is refused
-/// with `InvalidState`, which leaves the cap in place; a zero handle holds
-/// none.
+/// Delete the cap `handle` holds, clearing it once the cap is gone: the delete
+/// succeeded, or was refused with `InvalidCapability` because the handle names
+/// no cap. Every other refusal leaves the cap in place, so the handle is kept.
+/// A zero handle holds none.
 fn delete_held(handle: &mut u32) -> Result<(), i64>
 {
     if *handle == 0
@@ -159,7 +163,7 @@ fn delete_held(handle: &mut u32) -> Result<(), i64>
         return Ok(());
     }
     let deleted = syscall::cap_delete(*handle);
-    if deleted != Err(syscall_abi::SyscallError::InvalidState as i64)
+    if deleted.is_ok() || deleted == Err(syscall_abi::SyscallError::InvalidCapability as i64)
     {
         *handle = 0;
     }

@@ -256,11 +256,9 @@ fn bootstrap_devmgr_registry(creator_ep: u32, ipc_buf: *mut u64) -> Option<u32>
     }
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
     let round = unsafe { ipc::bootstrap::request_round(creator_ep, ipc_buf) }.ok()?;
-    if round.cap_count < 1
-    {
-        return None;
-    }
-    let cap = round.caps[0];
+    // Only the present caps ride, named by the round's presence word; an
+    // absent slot decodes as `0`.
+    let cap = ipc::bootstrap::unpack_slots(&round).ok()?[0];
     (cap != 0).then_some(cap)
 }
 

@@ -81,6 +81,33 @@ pub(crate) fn assemble_boot_caps(provided_recv: u32, seeds: Vec<u32>) -> Vec<u32
     caps
 }
 
+/// Serve a child's single bootstrap round from its positional `slots`
+/// (`0` marks an absent cap). The kernel refuses a message carrying a null
+/// cap slot, so the round transfers only the present caps, in slot order,
+/// with the presence word [`ipc::bootstrap::pack_slots`] builds in `data[0]`;
+/// the child spreads them back with [`ipc::bootstrap::unpack_slots`]
+/// (encoding in [service-definitions.md § `seed`](../../docs/service-definitions.md#seed)).
+/// Shared by the launch and restart paths.
+///
+/// # Errors
+/// The [`ipc::bootstrap::serve_round`] error code.
+pub(crate) fn serve_boot_slots(ctx: &RestartCtx, child_badge: u64, slots: &[u32])
+-> Result<(), u64>
+{
+    let packed = ipc::bootstrap::pack_slots(slots);
+    // SAFETY: `ctx.ipc_buf` is the registered IPC buffer.
+    unsafe {
+        ipc::bootstrap::serve_round(
+            ctx.bootstrap_ep,
+            child_badge,
+            ctx.ipc_buf,
+            true,
+            packed.caps(),
+            &[packed.presence()],
+        )
+    }
+}
+
 /// Which launch of the log-sink service [`mint_logd_boot_caps`] mints for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum LaunchKind
@@ -107,11 +134,11 @@ pub(crate) enum LaunchKind
 ///   * `[3]` a `REGISTRY_QUERY_AUTHORITY` SEND on devmgr's registry (logd
 ///     resolves the serial driver via `QUERY_SERIAL_DEVICE`).
 ///
-/// A source absent from the endowment yields `0` in its slot. The four
-/// slots are positional, so zeros are preserved (the round still carries
-/// `MSG_CAP_SLOTS_MAX` caps). The kernel refuses a round carrying a null
-/// slot, so such a round, and every [`LaunchKind::Restart`] round, fails at
-/// the bootstrap serve (#592).
+/// A source absent from the endowment, or a derive that fails, yields `0`
+/// in its slot. The slots are positional; [`serve_boot_slots`] transfers
+/// only the present caps and names the slot each fills in the round's
+/// presence word, so a round with an absent slot, such as every
+/// [`LaunchKind::Restart`] round, still reaches logd.
 pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, kind: LaunchKind) -> Vec<u32>
 {
     let recv = if ctx.master_log_source != 0
@@ -288,12 +315,11 @@ fn assemble_provided_boot_caps(
 /// [`walk_and_create_from_file`]) leaves no child, since procmgr destroys
 /// a child whose create reply it cannot deliver.
 ///
-/// Seed caps that fail to resolve are passed through as slot `0`, so
-/// the child's bootstrap decoder sees a zero in that position. This
-/// matches the existing "absent dep ⇒ skip" pattern already used by
-/// svctest's pwrmgr phases; consumers that don't tolerate a missing
-/// cap fail on first use, which is the right surface for a real
-/// misconfiguration.
+/// A seed that fails to resolve leaves its slot absent: the round omits it
+/// and clears its presence bit, so the child's decoder sees `0` in that
+/// position. This matches the "absent dep ⇒ skip" pattern svctest's
+/// pwrmgr phases use; consumers that don't tolerate a missing cap fail on
+/// first use, which is the right surface for a real misconfiguration.
 ///
 /// `bind_target` carries the `(deaths_eq, correlator)` for supervised
 /// launches: when present, death-notification is bound BEFORE
@@ -369,18 +395,7 @@ pub fn launch(
         return None;
     }
 
-    // SAFETY: `ctx.ipc_buf` is the registered IPC buffer.
-    let bootstrap_result = unsafe {
-        ipc::bootstrap::serve_round(
-            ctx.bootstrap_ep,
-            created.child_badge,
-            ctx.ipc_buf,
-            true,
-            &boot_caps,
-            &[],
-        )
-    };
-    if bootstrap_result.is_err()
+    if serve_boot_slots(ctx, created.child_badge, &boot_caps).is_err()
     {
         std::os::seraph::log!("launch {}: bootstrap serve failed", def.name);
         // The started child is blocked in its bootstrap request; destroy it
@@ -407,9 +422,8 @@ pub fn launch(
 
 /// Resolve each `seed = ...` name to a derived `RIGHTS_EP_SEND` cap on
 /// the published endpoint. Unresolved names become `0` in their slot
-/// so positional ordering is preserved; the kernel refuses a round carrying
-/// a null slot, so a launch with an unresolved seed fails at the bootstrap
-/// serve (#592). Truncated to
+/// so positional ordering is preserved; [`serve_boot_slots`] leaves an
+/// absent slot off the round and clears its presence bit. Truncated to
 /// `MSG_CAP_SLOTS_MAX` (the bootstrap round's cap limit), a backstop
 /// behind the `.svc` parser's seed bound.
 ///

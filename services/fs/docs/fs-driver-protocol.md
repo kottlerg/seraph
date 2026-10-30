@@ -408,8 +408,9 @@ Inline write to a file. Badge = file cap; the badge must carry the
 | `data[0]` | File byte offset |
 | `bytes(1, &payload)` | Payload bytes (`byte_len` of them) starting at byte 8 |
 
-**Reply (success)**: `label = 0`, `data[0]` = bytes_written. May be
-short on `NO_SPACE`; callers iterate.
+**Reply (success)**: `label = 0`, `data[0]` = bytes_written. A caller iterates on a short
+count; the FAT driver always reports the whole payload and replies an error (`NO_SPACE`)
+instead of a short count.
 
 **Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `IO_ERROR`,
 `PERMISSION_DENIED`, `NO_SPACE` (no free cluster, or the write would end

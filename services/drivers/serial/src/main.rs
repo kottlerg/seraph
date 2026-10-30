@@ -18,11 +18,10 @@
 //! starves writers.
 //!
 //! Unlike the sibling RTC drivers, this driver MUST NOT call
-//! `std::os::seraph::log!`. logd routes its own output here, so a log call
-//! would deadlock (driver → log endpoint → logd → driver). Diagnostics are
-//! therefore dropped; fatal bootstrap failures `thread_exit` silently. The
-//! pre-driver boot window is covered by init-logd's direct-UART path (see
-//! `docs/console-model.md`).
+//! `std::os::seraph::log!`; the rule and its deadlock chain are in
+//! `docs/console-model.md` § Logging constraint on the serial and framebuffer
+//! drivers. Diagnostics are dropped; fatal bootstrap failures `thread_exit`
+//! silently.
 
 mod arch;
 

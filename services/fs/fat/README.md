@@ -55,8 +55,9 @@ resolve to a `NodeId`. Cross-directory rename is deferred; see
 
 Per-label rights gating (`WRITE` for the write / truncate labels,
 `MUTATE_DIR` for the directory-mutation labels) goes through
-[`namespace-protocol::gate`](../../../shared/namespace-protocol/src/gate.rs).
-The exact wire shapes are defined in
+[`namespace-protocol::gate`](../../../shared/namespace-protocol/src/gate.rs), as
+[`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
+§ Rights gate specifies. The exact wire shapes are defined in
 [`shared/ipc/src/lib.rs`](../../../shared/ipc/src/lib.rs) and documented
 in [`../docs/fs-driver-protocol.md`](../docs/fs-driver-protocol.md).
 
@@ -66,7 +67,8 @@ with rights `caller_parent ∩ kind_max` where `kind_max` is
 directories. A caller with `MUTATE_DIR`-only on a parent cannot widen
 into `READ` or `WRITE` on the created entry. A file whose cap would
 carry no rights (a parent with none of the file rights) is refused with
-`PERMISSION_DENIED` before anything is written, so no entry is created.
+`PERMISSION_DENIED` before anything is written, so no entry is created
+(see [`../docs/fs-driver-protocol.md`](../docs/fs-driver-protocol.md) § Label 13: `FS_CREATE`).
 
 ---
 

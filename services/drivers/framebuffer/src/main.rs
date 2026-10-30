@@ -29,13 +29,10 @@
 //! the `FramebufferWriter`. `\n`, `\r`, and `\x08` (backspace) short-circuit
 //! the decoder.
 //!
-//! Like the serial driver, this driver MUST NOT call
-//! `std::os::seraph::log!`: logd mirrors every log line here through a
-//! blocking `FB_WRITE_BYTES` call, so a log call would deadlock
-//! (driver → log endpoint → logd → driver). Diagnostics are dropped;
-//! fatal bootstrap failures `thread_exit` silently. The kernel framebuffer renderer
-//! (`core/kernel/src/framebuffer.rs`) remains the early-boot / panic
-//! fallback (see `docs/console-model.md`).
+//! Like the serial driver, this driver MUST NOT call `std::os::seraph::log!`;
+//! the rule and its deadlock chain are in `docs/console-model.md` § Logging
+//! constraint on the serial and framebuffer drivers. Diagnostics are dropped;
+//! fatal bootstrap failures `thread_exit` silently.
 
 mod arch;
 

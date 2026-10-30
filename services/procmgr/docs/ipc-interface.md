@@ -127,7 +127,7 @@ creation.
 **Scheduling fields.** Bits `[18..23]` (`CREATE_PRIORITY`) and `[23..28]`
 (`CREATE_BAND_MAX`) of the label window — shared by `CREATE_PROCESS` and
 `CREATE_FROM_FILE` — carry the child's scheduling placement; bits `[28..32]`
-remain reserved and MUST be zero (`InvalidArgument` otherwise, which keeps a
+remain reserved and MUST be zero (`INVALID_ARGUMENT` otherwise, which keeps a
 future field addition provably additive). Resolution, against the **creator's
 band ceiling** (badge 0 = init, ceiling `sched_policy::BASELINE_PRIORITY_MAX`;
 a badged caller's ceiling is its own minted `band_max`; an unknown badge falls
@@ -138,7 +138,7 @@ back to `sched_policy::DEFAULT_SPAWN_PRIORITY`):
 | `CREATE_BAND_MAX` | copy of the creator's band | `[1, band_max]`; must be ≤ the creator's ceiling |
 | `CREATE_PRIORITY` | `DEFAULT_SPAWN_PRIORITY` clamped to the band | must be ≤ the resolved `band_max` (so the child's own band always covers its starting level) |
 
-Violations reply `InvalidArgument` before any resource is acquired. On
+Violations reply `INVALID_ARGUMENT` before any resource is acquired. On
 success procmgr creates the child's initial thread at the resolved priority
 (via its own baseline `SchedControl`), mints the child's band — a plain
 `cap_copy` of the baseline for a full-width band, copy-then-`SYS_SCHED_SPLIT`
@@ -478,4 +478,5 @@ The system-scope reap model is in
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [services/logd/README.md](../../logd/README.md),
 [logd IPC interface](../../logd/docs/ipc-interface.md), [services/procmgr/README.md](../README.md),
+[Restart Protocol](../../svcmgr/docs/restart-protocol.md),
 [`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)

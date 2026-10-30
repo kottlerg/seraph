@@ -26,7 +26,7 @@ process-creation capabilities today
 
 ---
 
-## Source layout
+## Source Layout
 
 ```
 svcmgr/
@@ -72,7 +72,8 @@ svcmgr/
 - **Handover endowment** — drain init's bootstrap-round endowment in
   [`service::bootstrap_caps`](src/service.rs): svcmgr's own endpoints,
   the publish-role source caps (`rootfs.root` SEND, devmgr-registry
-  `SEND|GRANT` source), one `(name, thread_cap)` round per substrate
+  `SEND|GRANT` source, the `vfsd.mount` and `vfsd.deny` SENDs on vfsd's
+  service endpoint), one `(name, thread_cap)` round per substrate
   service init bootstrapped before svcmgr existed, and a terminal
   `LOGD_SOURCES` round carrying the two log-sink source caps svcmgr holds
   for the system's lifetime (the master-log source and a badge-0

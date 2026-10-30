@@ -93,11 +93,10 @@ Reply: `label = 0`. Sender unblocks.
 ### `log_labels::HANDOVER_PULL` (13)
 
 One-shot init-logd → real-logd state transfer. Documented in
-[`handover-protocol.md`](handover-protocol.md). logd's own receive
-loop accepts the label too, but real-logd never receives it post-
-handover (no caller in the system holds a SEND cap suitable for
-the handover after init-logd exits). The handler in real-logd is
-unreachable; init-logd is the only intended target.
+[`handover-protocol.md`](handover-protocol.md). real-logd is the caller,
+not a handler: its receive loop dispatches only `STREAM_BYTES` and
+`STREAM_REGISTER_NAME`, and any other label, this one included, gets an
+empty reply. init-logd is the only receiver of the label.
 
 ### `log_labels::GET_LOG_CAP` (12) — legacy
 

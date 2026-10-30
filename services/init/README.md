@@ -27,13 +27,14 @@ init/
     ├── mount.rs                # GET_SYSTEM_ROOT_CAP pull (vfsd self-mounts root)
     ├── logging.rs              # init-logd thread
     │                           # (serves the log endpoint until real-logd takes over)
-    ├── walk.rs                 # /services/<name> path walker over the seed system-root cap
+    ├── walk.rs                 # Re-exports `ns_client`'s `walk_to_dir` / `walk_to_file`
     └── arch/                   # Per-arch serial init (x86-64, riscv64)
 ```
 
-Init depends on `shared/elf` for ELF parsing (used to load memmgr and procmgr
-from their bundle entries) and `shared/syscall` for raw syscall wrappers (used
-to create memmgr and procmgr without IPC). init-logd packs its handover replies
+Init depends on [`shared/elf`](../../shared/elf/README.md) for ELF parsing (used to load
+memmgr and procmgr from their bundle entries) and
+[`shared/syscall`](../../shared/syscall/README.md) for raw syscall wrappers (used to create
+memmgr and procmgr without IPC). init-logd packs its handover replies
 with the wire contract in [`logd-codec`](../logd/codec/README.md), the crate
 real-logd decodes them with (see the
 [logd handover protocol](../logd/docs/handover-protocol.md)). init encodes
@@ -83,8 +84,8 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    `vfsd.deny`) and installs
    devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR` from the endowment (see
    [svcmgr IPC interface](../svcmgr/docs/ipc-interface.md)); it then
-   launches the non-bootstrap services itself — `timed` and `pwrmgr`
-   (providers), `terminal`, the staged test harnesses — and publishes their
+   launches the non-bootstrap services itself — real-logd (the log sink), `timed` and
+   `pwrmgr` (providers), `terminal`, the staged test harnesses — and publishes their
    names (see [svcmgr](../svcmgr/README.md)). The per-arch RTC chip driver is
    spawned lazily by devmgr after `SET_DRIVERS_DIR` (see
    [devmgr responsibilities](../devmgr/docs/responsibilities.md#responsibilities)) and

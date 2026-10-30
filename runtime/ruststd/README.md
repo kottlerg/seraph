@@ -8,7 +8,7 @@ filesystem, process management, time — using Seraph's native IPC and
 syscall interfaces.
 
 ruststd is shipped as an overlay over the upstream Rust source tree;
-Seraph-specific files live under `src/sys/seraph` and `src/os/seraph` in the
+Seraph-specific files live under `src/sys/<area>/seraph.rs` and `src/os/seraph.rs` in the
 overlay. The build pipeline applies the overlay onto a vendored
 `library/std` checkout per
 [`docs/build-system.md`](../../docs/build-system.md).
@@ -40,6 +40,7 @@ ruststd/
         ├── fs/                 # filesystem over the namespace protocol
         ├── pipe/               # stdio pipe backing
         ├── process/            # process spawn
+        ├── random/             # std::random and HashMap seeds over SYS_GETRANDOM
         ├── reserve/            # page-reservation surface
         ├── stdio/              # stdout/stderr
         ├── sync/               # mutex / rwlock / once / condvar / thread parking

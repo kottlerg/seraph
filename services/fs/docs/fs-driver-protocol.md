@@ -313,13 +313,20 @@ client's [client-to-driver release](#client-to-driver-release) or
 cleaned up once, by whichever path removes it from the open-file
 table first. The ack tells the driver the client unmapped in time.
 The revoke invalidates the client's derived cap but removes no mapping
-([Capability Model § Revocation](../../../docs/capability-model.md#revocation)),
-and the released slot may be refilled with other data, so a client
-that has not unmapped the page by then can read what the cache loads
-there next; a client MUST unmap before it acks. A copy that outlasts
-the window can read the recycled page, and a client that starts its
-own wait only when the release arrives cannot detect every such copy
-([#516](https://github.com/kottlerg/seraph/issues/516)).
+([Capability Model § Revocation](../../../docs/capability-model.md#revocation)).
+The driver still never refills the page under a live client mapping. Before it
+reuses a released slot whose page it handed out, on any of the three release
+paths, it revokes every derivation of the slot's cap and reads the page's
+mapping count (`SYS_CAP_INFO` `CAP_INFO_MEMORY_MAPPINGS`). It refills the page only
+when the count shows its own mapping alone. Otherwise it moves the slot onto a
+replacement page and quarantines the still-mapped one, which is never refilled
+and never returned to memmgr until no address space maps it. A client that keeps
+a page mapped after the release, or whose copy outlasts the window, therefore
+keeps reading the bytes the page held when it was read, never other data. A
+client SHOULD still unmap before it acks: the driver holds at most 32
+quarantined and spare pages, and past that a still-mapped slot stays out of
+service, so a client that never unmaps shrinks the cache, and a read that finds
+no reusable slot is answered `IO_ERROR` (2).
 A reply with any other label is not an
 acknowledgement; a client that cannot unmap the page, or whose copy
 outlasts the window, replies `IO_ERROR` (2).

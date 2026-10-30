@@ -23,14 +23,15 @@
 //! The VA returns to the reservation arena only once the unmap succeeds
 //! (see [`discard_mapping`]). A failed unmap or a copy still running at the
 //! end of the wait is answered with [`fs_errors::IO_ERROR`], no ack. After
-//! any reply, or the window with none, the driver revokes the page's caps
-//! and may recycle the page; the revoke unmaps nothing. Holding the reply
-//! keeps that recycling from racing a copy that ends within the window. A
-//! copy still running when the handler's own wait runs out is marked
-//! stalled, and `File::read_frame` discards it. The handler's wait starts
-//! only when the release arrives, after the driver's window has begun, so a
-//! copy that ends between the two deadlines can read the recycled page
-//! undetected (#516).
+//! any reply, or the window with none, the driver revokes the page's caps;
+//! the revoke unmaps nothing. The driver never refills a page this client
+//! still maps: before reuse it checks that no mapping but its own remains,
+//! and quarantines a page that is still mapped (services/fs/docs/
+//! fs-driver-protocol.md § Label 8). A copy that outlasts the window
+//! therefore reads the page's original bytes. A copy still running when the
+//! handler's own wait runs out is marked stalled, and `File::read_frame`
+//! discards it as defence in depth. Holding the reply keeps the client's own
+//! unmap from racing a copy that ends within the window.
 //!
 //! The endpoint and the handler thread are created lazily on the first
 //! [`super::File::open`] call; until then the cost is one
@@ -433,8 +434,8 @@ fn handler_main(state: &ReleaseState)
             .map_or(Taken::Absent, |e| take_mapping_after_read(e.as_ref(), cookie));
 
         // A page this process cannot unmap, or one a copy is still reading,
-        // is not acknowledged: the driver may recycle the page after any
-        // reply, and its revoke unmaps nothing.
+        // is not acknowledged: the ack tells the driver this process unmapped
+        // the page, and a page still mapped here costs it a quarantined page.
         let released = match taken
         {
             Taken::Absent => true,

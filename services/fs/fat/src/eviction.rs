@@ -20,9 +20,18 @@
 //! cleaned it up meanwhile, `cap_revoke`s the per-cookie ancestor cap,
 //! drops it, and decrements the cache slot's refcount. An ack means
 //! the client has already unmapped the page. The revoke invalidates
-//! the client's derived cap but unmaps nothing, and the released slot
-//! may be refilled with other data, so a client that never unmapped
-//! keeps reading whatever the cache loads there next (#516).
+//! the client's derived cap but unmaps nothing.
+//!
+//! Releasing the slot does not make it refillable. All three paths that
+//! drop a handed-out page's slot reference revoke the per-cookie ancestor
+//! first: this worker, the client's synchronous `FS_RELEASE_MEMORY`, and
+//! `FS_CLOSE`. The order before reuse is revoke, then count, then reuse.
+//! The cache's victim pick revokes every derivation of the slot's cap
+//! again, so no holder can map the page anew, and only then reads the
+//! page's mapping count. It refills the page only when the cache's own
+//! mapping is the only one left. A page a client still maps is quarantined
+//! instead, never refilled (`cache` module docs § Reuse of a page a client
+//! mapped).
 //!
 //! The watchdog is fully userspace. `ipc_call` has no kernel-side
 //! timeout, so the worker spawns a child thread to issue the call

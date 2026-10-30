@@ -679,6 +679,10 @@ fn read_memory_at_slot(
         return;
     };
 
+    // From here the client may map the page; the slot is reused only once
+    // that mapping is gone (cache module docs § Reuse of a page a client
+    // mapped).
+    cache.mark_exposed(slot_idx);
     let entry = OutstandingPage {
         cookie,
         slot_idx,

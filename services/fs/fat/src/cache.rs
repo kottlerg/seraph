@@ -26,16 +26,36 @@
 //!
 //! Slot caps are minted once at startup via memmgr `REQUEST_MEMORY_CAPS` with
 //! the `REQUIRE_CONTIGUOUS` flag (one IPC per slot — slot count is bounded
-//! and the round-trip cost is paid once). Each slot's mapping is held for
+//! and the round-trip cost is paid once). Each slot's VA window is held for
 //! the fs process's lifetime; the reservation is intentionally leaked
 //! (`ReservedRange` has no `Drop`).
+//!
+//! ## Reuse of a page a client mapped
+//!
+//! `FS_READ_MEMORY` hands a client a cap derived from a slot's page and marks
+//! the slot exposed. Nothing a client sends proves it unmapped the page, and
+//! revoking its cap unmaps nothing, so an exposed slot is reused only once the
+//! kernel reports the page mapped by the cache alone. In [`PageCache::pick_victim`]
+//! an exposed candidate first has every derivation of its cap revoked, so no
+//! holder can map the page again, and then its `CAP_INFO_MEMORY_MAPPINGS`
+//! count is read: 1, the cache's own mapping, makes the slot reusable. A
+//! higher count means a client still maps the page. The slot then takes a
+//! replacement page (a clean spare, else a fresh page from memmgr), and the
+//! still-mapped page is quarantined: kept, never returned to memmgr, and
+//! re-checked on every later pick. A quarantined page whose count falls to
+//! 0 becomes a spare. Spares and quarantined pages together never exceed
+//! [`QUARANTINE_MAX`]. Past that bound, a still-mapped slot stays out of
+//! service until its client unmaps, and a read that finds no reusable slot is
+//! answered `IO_ERROR`, as under ordinary cache pressure. One client can
+//! therefore cost the fs at most `QUARANTINE_MAX` extra pages before the
+//! cache starts to shrink.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use ipc::{IpcMessage, blk_errors, blk_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::reserve_pages;
-use std::sync::OnceLock;
-use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
+use std::sync::{Mutex, OnceLock, PoisonError};
+use syscall_abi::{CAP_INFO_MEMORY_MAPPINGS, MAP_WRITABLE, PAGE_SIZE};
 
 use crate::bpb::SECTOR_SIZE;
 
@@ -67,6 +87,10 @@ struct ScratchMemory
 /// Number of cache slots.
 pub const SLOT_COUNT: usize = 128;
 
+/// Most pages the cache holds beyond its [`SLOT_COUNT`] slot pages: the
+/// quarantined pages a client still maps plus the clean spares they become.
+pub const QUARANTINE_MAX: usize = 32;
+
 /// Number of consecutive sectors held in one cache slot. Fixed by the
 /// page size and the FAT sector size: `PAGE_SIZE / SECTOR_SIZE` = 8.
 pub const SECTORS_PER_PAGE: u64 = PAGE_SIZE / SECTOR_SIZE as u64;
@@ -95,6 +119,20 @@ struct CacheSlot
     va: u64,
     refcount: AtomicU32,
     lru_seq: AtomicU64,
+    /// Set when `FS_READ_MEMORY` hands a client a cap to this slot's page;
+    /// cleared once the page is known to be mapped by the cache alone
+    /// (module docs § Reuse of a page a client mapped).
+    exposed: AtomicBool,
+}
+
+/// Pages the cache holds beyond its slots (module docs § Reuse of a page a
+/// client mapped). Only the dispatch thread, which picks victims, touches it.
+struct Quarantine
+{
+    /// Caps of pages taken out of a slot while a client still mapped them.
+    held: Vec<u32>,
+    /// Caps of pages no address space maps, ready to replace a slot's page.
+    spare: Vec<u32>,
 }
 
 /// Process-wide page cache.
@@ -102,6 +140,11 @@ pub struct PageCache
 {
     slots: [CacheSlot; SLOT_COUNT],
     next_seq: AtomicU64,
+    /// memmgr endpoint replacement pages are requested from.
+    memmgr_ep: u32,
+    /// The fs process's own address space, which maps every slot.
+    self_aspace: u32,
+    quarantine: Mutex<Quarantine>,
 }
 
 /// Cache-init failure cause.
@@ -149,8 +192,15 @@ impl PageCache
                 va: base_va + (i as u64) * PAGE_SIZE,
                 refcount: AtomicU32::new(0),
                 lru_seq: AtomicU64::new(0),
+                exposed: AtomicBool::new(false),
             }),
             next_seq: AtomicU64::new(1),
+            memmgr_ep,
+            self_aspace,
+            quarantine: Mutex::new(Quarantine {
+                held: Vec::with_capacity(QUARANTINE_MAX),
+                spare: Vec::with_capacity(QUARANTINE_MAX),
+            }),
         }));
 
         for slot in &mut cache.slots
@@ -372,13 +422,21 @@ impl PageCache
         self.release(idx);
     }
 
+    /// Record that a cap to slot `idx`'s page is being handed to a client, so
+    /// the slot is reused only once the client's mapping is gone (module docs
+    /// § Reuse of a page a client mapped). The caller holds a refcount.
+    pub fn mark_exposed(&self, idx: usize)
+    {
+        self.slots[idx].exposed.store(true, Ordering::Release);
+    }
+
     fn get_or_fill(&self, page_lba_base: u64, block_dev: u32, ipc_buf: *mut u64) -> Option<usize>
     {
         if let Some(i) = self.lookup_cached(page_lba_base)
         {
             return Some(i);
         }
-        let victim = self.pick_victim()?;
+        let victim = self.pick_victim(ipc_buf)?;
         let slot = &self.slots[victim];
         // Refcount the victim before the fill so a racing `pick_victim`
         // will skip it.
@@ -422,12 +480,110 @@ impl PageCache
         None
     }
 
-    fn pick_victim(&self) -> Option<usize>
+    /// The least recently used unreferenced slot that is safe to refill:
+    /// either never exposed to a client, or exposed and now mapped by the cache
+    /// alone or given a replacement page ([`Self::make_reusable`]). An exposed
+    /// slot that is neither is skipped for this pick and checked again on the
+    /// next one. `None` when no slot qualifies.
+    fn pick_victim(&self, ipc_buf: *mut u64) -> Option<usize>
+    {
+        let mut skipped = [false; SLOT_COUNT];
+        loop
+        {
+            let candidate = self.lru_unreferenced(&skipped)?;
+            if !self.slots[candidate].exposed.load(Ordering::Acquire)
+                || self.make_reusable(candidate, ipc_buf)
+            {
+                return Some(candidate);
+            }
+            skipped[candidate] = true;
+        }
+    }
+
+    /// Make exposed, unreferenced slot `idx` safe to refill. Revoke every
+    /// derivation of its cap, so no holder can map the page again, then read
+    /// the page's mapping count. If only the cache maps it, clear `exposed`.
+    /// Otherwise swap in a replacement page and quarantine the old one. Returns
+    /// whether the slot is now safe to refill: `false` when the page is still
+    /// mapped and no replacement is available within [`QUARANTINE_MAX`].
+    fn make_reusable(&self, idx: usize, ipc_buf: *mut u64) -> bool
+    {
+        let slot = &self.slots[idx];
+        let cap = slot.memory_cap.load(Ordering::Acquire);
+        if cap == 0
+        {
+            return false;
+        }
+        let _ = syscall::cap_revoke_all(cap);
+        // An unreadable count is treated as still mapped.
+        if syscall::cap_info(cap, CAP_INFO_MEMORY_MAPPINGS) == Ok(1)
+        {
+            slot.exposed.store(false, Ordering::Release);
+            return true;
+        }
+        let mut quarantine = self
+            .quarantine
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        quarantine.recheck();
+        let fresh = if let Some(spare) = quarantine.spare.pop()
+        {
+            spare
+        }
+        else if quarantine.held.len() + quarantine.spare.len() < QUARANTINE_MAX
+        {
+            let Some(page) = request_one_page(self.memmgr_ep, ipc_buf)
+            else
+            {
+                return false;
+            };
+            page
+        }
+        else
+        {
+            return false;
+        };
+        if !self.swap_page(slot, cap, fresh)
+        {
+            quarantine.spare.push(fresh);
+            return false;
+        }
+        quarantine.held.push(cap);
+        slot.exposed.store(false, Ordering::Release);
+        true
+    }
+
+    /// Replace `slot`'s page `old` with page `fresh` at the slot's VA. On a
+    /// failure `old` is mapped back and `false` returned. The slot is
+    /// unreferenced, so no reader is inside its page.
+    fn swap_page(&self, slot: &CacheSlot, old: u32, fresh: u32) -> bool
+    {
+        // SAFETY: slot.va is this slot's page of the cache's reserved window,
+        // which only the cache maps; the slot is unreferenced, so no read or
+        // write of the page is in progress and no Rust reference into it lives.
+        if unsafe { syscall::mem_unmap(self.self_aspace, slot.va, 1) }.is_err()
+        {
+            return false;
+        }
+        // SAFETY: as above; the VA was just unmapped.
+        if unsafe { syscall::mem_map(fresh, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_ok()
+        {
+            slot.memory_cap.store(fresh, Ordering::Release);
+            return true;
+        }
+        // SAFETY: as above; restores the page the slot had.
+        let _ = unsafe { syscall::mem_map(old, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) };
+        false
+    }
+
+    /// The least recently used slot with no reference that `skipped` does not
+    /// exclude.
+    fn lru_unreferenced(&self, skipped: &[bool; SLOT_COUNT]) -> Option<usize>
     {
         let mut best: Option<(usize, u64)> = None;
         for (i, slot) in self.slots.iter().enumerate()
         {
-            if slot.refcount.load(Ordering::Acquire) != 0
+            if skipped[i] || slot.refcount.load(Ordering::Acquire) != 0
             {
                 continue;
             }
@@ -462,6 +618,28 @@ impl PageCache
         if dropped.is_err()
         {
             std::os::seraph::log!("WARNING: cache slot {idx} released with refcount 0");
+        }
+    }
+}
+
+impl Quarantine
+{
+    /// Move every held page that no address space maps any more to the spare
+    /// list.
+    fn recheck(&mut self)
+    {
+        let mut i = 0;
+        while i < self.held.len()
+        {
+            if syscall::cap_info(self.held[i], CAP_INFO_MEMORY_MAPPINGS) == Ok(0)
+            {
+                let cap = self.held.swap_remove(i);
+                self.spare.push(cap);
+            }
+            else
+            {
+                i += 1;
+            }
         }
     }
 }

@@ -15,7 +15,9 @@ use crate::runner::Phase;
 
 // 2024-01-01 00:00:00 UTC = 1 704 067 200 s.
 const SYSTEM_TIME_AFTER_2024_SECS: u64 = 1_704_067_200;
-// 2100-01-01 00:00:00 UTC = 4 102 444 800 s. Sanity ceiling.
+// 2100-01-01 00:00:00 UTC = 4 102 444 800 s. Sanity ceiling: QEMU's century
+// register reads zero, and the cmos driver's fallback century of 20 keeps the
+// year below 2100.
 const SYSTEM_TIME_BEFORE_2100_SECS: u64 = 4_102_444_800;
 
 pub fn phases() -> &'static [Phase]

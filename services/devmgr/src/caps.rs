@@ -276,7 +276,9 @@ fn bootstrap_round1(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
     Some(())
 }
 
-/// Unpack one aperture-batch round into the aperture array.
+/// Unpack one aperture-batch round into the aperture array. The `.min(4)` is
+/// `MSG_CAP_SLOTS_MAX`, the caps one round carries; init sends more rounds
+/// for more apertures.
 fn absorb_aperture_round(
     round_caps: &[u32],
     round_cap_count: usize,
@@ -305,7 +307,8 @@ fn absorb_aperture_round(
     }
 }
 
-/// Unpack one ACPI-region-batch round.
+/// Unpack one ACPI-region-batch round. The `.min(4)` is `MSG_CAP_SLOTS_MAX`,
+/// the caps one round carries.
 fn absorb_acpi_region_round(
     round_caps: &[u32],
     round_cap_count: usize,
@@ -335,7 +338,8 @@ fn absorb_acpi_region_round(
 }
 
 /// Unpack one module-cap round. `data[2 + i]` carries the `module_kind`
-/// tag for `caps[i]`.
+/// tag for `caps[i]`. The `.min(4)` is `MSG_CAP_SLOTS_MAX`, the caps one
+/// round carries.
 fn absorb_module_round(
     round_caps: &[u32],
     round_cap_count: usize,

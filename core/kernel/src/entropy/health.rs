@@ -15,7 +15,7 @@ const ASSESSED_H: u32 = 1;
 /// RCT cutoff: `1 + ceil(30 / H)` (α = 2⁻³⁰).
 const RCT_CUTOFF: u32 = 1 + 30_u32.div_ceil(ASSESSED_H);
 
-/// APT window length (samples).
+/// APT window length (samples): the §4.4.2 window for non-binary samples.
 const APT_WINDOW: u32 = 512;
 
 /// APT cutoff: reject when the window's first value recurs past ¾ of the window.

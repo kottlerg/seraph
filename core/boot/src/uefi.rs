@@ -580,7 +580,9 @@ pub unsafe fn open_file(
 }
 
 /// Byte length of [`FileInfoBuf`]: an `EfiFileInfo` plus room for a short
-/// UTF-16 file name.
+/// UTF-16 file name. Provably sufficient: [`file_size`] queries only the
+/// bootloader's own fixed ESP files (`kernel`, `bootstrap.bundle`), far below
+/// 128 UTF-16 units, and a longer name fails the call rather than truncating.
 const FILE_INFO_BUF_LEN: usize = core::mem::size_of::<EfiFileInfo>() + 256;
 
 /// Receive buffer for `GetInfo(EFI_FILE_INFO_ID)`, aligned so its filled
@@ -907,7 +909,8 @@ pub unsafe fn exit_boot_services(
 /// fixed-mode policy is specified in
 /// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md) § UEFI Protocol Usage.
 /// 1280x720 (720p) is present in both arches' std VGA GOP mode table
-/// (`QemuVideoDxe`).
+/// (`QemuVideoDxe`). The request is best-effort policy and bounds no
+/// capacity: without a matching mode the firmware's current mode is kept.
 const TARGET_FB_WIDTH: u32 = 1280;
 const TARGET_FB_HEIGHT: u32 = 720;
 

@@ -40,7 +40,7 @@ pub const IDLE_PRIORITY: u8 = 0;
 
 /// Default time-slice length in preemption-timer ticks. Decremented by
 /// `timer_tick` on every tick; a thread is preempted when its counter
-/// reaches zero.
+/// reaches zero. A tuning value; it bounds no capacity.
 pub const TIME_SLICE_TICKS: u32 = 10;
 
 /// Number of 4 KiB pages in each idle thread's kernel stack (16 KiB total).
@@ -308,7 +308,8 @@ const OWED_RULE_WAKE_PENDING: u8 = 3;
 #[cfg(not(test))]
 const OWED_WAKE_MAX: usize = 8;
 
-/// `schedule()` context-saved spin: single-shot warning threshold (µs).
+/// `schedule()` context-saved spin: single-shot warning threshold (µs). A
+/// diagnostic threshold; it bounds no capacity.
 #[cfg(not(test))]
 const CS_SPIN_WARN_US: u64 = 100_000;
 
@@ -1306,7 +1307,8 @@ fn watchdog_dump_cpu(cpu: usize, now: u64)
     }
 }
 
-/// Most sleep-list entries the watchdog dump prints.
+/// Most sleep-list entries the watchdog dump prints. A diagnostic output cap;
+/// it bounds no capacity.
 #[cfg(not(test))]
 const WATCHDOG_SLEEP_ENTRIES: usize = 8;
 

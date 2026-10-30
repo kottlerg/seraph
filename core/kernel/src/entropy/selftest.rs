@@ -16,7 +16,8 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::mm::BuddyAllocator;
 
-/// Bytes captured per CPU.
+/// Bytes captured per CPU: one 256-bit sample for the distinctness and balance
+/// checks; it bounds no capacity.
 const SAMPLE: usize = 32;
 
 /// One CPU's self-test row. `captured` marks a row whose CPU drew its sample.

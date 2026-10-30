@@ -251,8 +251,8 @@ high-level dependency order:
 ```
 boot info validation
     └─► early console (arch)
-        └─► buddy allocator (mm)
-            └─► kernel page tables (arch + mm)
+        └─► kernel page tables (arch + mm)
+            └─► buddy allocator (mm)
                 └─► typed-memory cap surface (cap)
                     └─► arch hardware init (arch)
                         └─► platform resource validation

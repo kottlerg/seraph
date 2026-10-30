@@ -23,6 +23,8 @@
 //! # One wait set per source
 //! A source can be in at most one wait set at a time. `sys_wait_set_add`
 //! returns `InvalidArgument` if the source's `wait_set` pointer is non-null.
+//! This is a design choice, not a capacity bound: each source carries one
+//! `wait_set` pointer and member index, a fixed cost per source.
 //!
 //! # Lifetime — wait-set membership refcount
 //! Each member holds a +1 reference on its source's `KernelObjectHeader`, per

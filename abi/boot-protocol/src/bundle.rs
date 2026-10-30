@@ -35,6 +35,9 @@ pub const VERSION: u32 = 1;
 /// Length of [`BundleEntryHeader::name`] — also the size of
 /// [`crate::BootModule::name`], by convention, so producers copy the name
 /// straight through.
+///
+/// The value is an ABI width of the bundle wire format (it fixes
+/// [`ENTRY_HEADER_SIZE`]) and bounds only the length of a module identifier.
 pub const ENTRY_NAME_LEN: usize = 32;
 
 /// Bundle body alignment in bytes. The bootloader allocates the whole
@@ -71,6 +74,9 @@ pub struct BundleHeader
     /// Must equal [`VERSION`].
     pub version: u32,
     /// Number of [`BundleEntryHeader`] records that follow.
+    ///
+    /// The `u32` is an ABI width of the wire format; the binding bound on the
+    /// module count is the bootloader's `MAX_MODULES`.
     pub entry_count: u32,
 }
 

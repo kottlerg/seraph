@@ -67,7 +67,9 @@ pub const IPC_RECV_RESERVE: usize = syscall::CSPACE_IPC_RECV_RESERVE as usize;
 // arithmetic (`CSPACE_SLOTS_PER_PAGE`); the leaf layout must match it.
 const _: () = assert!(L2_SIZE as u64 == syscall::CSPACE_SLOTS_PER_PAGE);
 
-/// Inline root pointers to leaf pages (the direct region).
+/// Inline root pointers to leaf pages (the direct region). Both inline regions
+/// are fixed by the two-level directory embedded in `CSpace`; `MAX_SLOTS_STRUCTURAL`
+/// derives from them and is the only capacity they set.
 const L1_DIRECT: usize = 128;
 
 /// Inline root pointers to directory pages (the indirect region).
@@ -206,12 +208,14 @@ pub struct CSpace
     /// unallocated.
     indirect: [AtomicPtr<CSpaceDirPage>; L1_INDIRECT],
     /// Grow cursor: leaves `0..next_leaf` are allocated (contiguously);
-    /// `next_leaf` is the next leaf `grow` will materialise.
+    /// `next_leaf` is the next leaf `grow` will materialise. A `u32` holds it:
+    /// a compile-time assert bounds `MAX_LEAVES` by `u32::MAX`.
     next_leaf: u32,
     /// Total usable slots allocated across all pages (excludes slot 0).
     allocated_slots: usize,
     /// Slot-page pool exhaustions seen by `grow`, for the throttled
-    /// diagnostic (logged at powers of two).
+    /// diagnostic (logged at powers of two). A wrapping diagnostic counter;
+    /// it bounds no capacity.
     pool_exhaustions: u32,
     /// Head of the intrusive free list; None if no free slots.
     ///

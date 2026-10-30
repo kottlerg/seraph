@@ -18,7 +18,8 @@ use core::prelude::rust_2024::*;
 /// Minimum permitted name length, in bytes. Empty names are rejected.
 pub const MIN_NAME_LEN: usize = 1;
 
-/// Maximum permitted name length, in bytes.
+/// Maximum permitted name length, in bytes. 255 is the POSIX `NAME_MAX`
+/// convention and the largest length `EntryName` holds in its `u8` length.
 pub const MAX_NAME_LEN: usize = 255;
 
 /// Reasons a candidate name fails [`validate_name`].

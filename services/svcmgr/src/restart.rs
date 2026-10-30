@@ -60,7 +60,8 @@ pub struct CreatedProcess
 /// distinct badge so svcmgr can correlate each round to the right service entry.
 /// Random rather than monotonic so the service-spawn count it would otherwise
 /// leak stays unguessable; svcmgr matches each round by exact badge value, never
-/// by index. Returns `None` if the entropy draw or cap derivation fails.
+/// by index. The `u64` width is the kernel badge word, so the space never runs
+/// out. Returns `None` if the entropy draw or cap derivation fails.
 pub fn mint_child_creator(bootstrap_ep: u32) -> Option<(u64, u32)>
 {
     let mut badge = syscall::random_u64().ok()?;

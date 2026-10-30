@@ -441,6 +441,7 @@ pub(crate) unsafe fn lock_bound_source(
         // source lock that needs this thread's sched_lock can finish.
         // SAFETY: paired with the lock_raw above.
         unsafe { (*tcb).sched_lock.unlock_raw(sched_saved) };
+        // A backoff, not a bound: the enclosing loop retries until it locks.
         for _ in 0..64
         {
             core::hint::spin_loop();

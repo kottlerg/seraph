@@ -253,7 +253,8 @@ pub struct PerCpuScheduler
     queues: UnsafeCell<[RunQueue; NUM_PRIORITY_LEVELS]>,
 
     /// Bitmask: bit N is set iff `queues[N]` is non-empty.
-    /// Enables O(1) selection of the highest non-empty priority queue.
+    /// Enables O(1) selection of the highest non-empty priority queue. A `u32`
+    /// holds one bit per level: `NUM_PRIORITY_LEVELS` is 32.
     ///
     /// Atomic so the idle loop can read it without acquiring the lock; the
     /// Release/Acquire pairing is specified in
@@ -282,7 +283,8 @@ pub struct PerCpuScheduler
     /// queues; the running thread is not counted). Relaxed-updated; advisory
     /// for load balancing. Lives in the
     /// scheduler rather than a `MAX_CPUS`-wide global so it scales with the
-    /// CPU count.
+    /// CPU count. A `u32` cannot overflow: each thread costs at least
+    /// `KERNEL_STACK_PAGES + 2` pages, so 2^32 threads would need 96 TiB.
     load: AtomicU32,
 
     /// Interrupt-flag word saved by [`lock_saving_flags`](Self::lock_saving_flags)

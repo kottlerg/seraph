@@ -432,6 +432,10 @@ changed line that names one of these items as a whole identifier or lies within 
 
 A change anywhere else, however close to the scheduler or the SMP paths, is off the surface. A PR
 that adds an item of the kinds above that names none of the listed items MUST add it to this list.
+`cargo xtask lint-docs` fails when a name this list, the memory surface's list, or their screens
+state no longer names code or a tracked file (its `md-coverage-symbols` rule,
+[xtask/README.md](../xtask/README.md#cargo-xtask-lint-docs)), so a PR that renames or deletes a
+listed item updates the list in the same change.
 The commands below screen a diff for the surface. The first lists the whole-surface files the diff
 changes. The second prints every file header of the diff and every line, changed or context, that
 names a listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed
@@ -507,7 +511,7 @@ guest's RAM, exactly as listed here. It is `core/kernel/src/mm/buddy.rs` and
 within the definition of, one of these items: the boot memory map and the direct map
 (`translate_memory_map`, `max_ram_address`, `direct_map_ceiling`, `compute_max_physical_address`,
 `init_kernel_page_tables`, and `BOOT_TABLE_POOL_SIZE`), and the drain of RAM into Memory caps
-(`drain_and_install_seed`, `coalesce_ram_blocks`, `MAX_DRAIN_BLOCKS`, `populate_cspace`, and
+(`drain_and_install_seed`, `MAX_DRAIN_BLOCKS`, `populate_cspace`, and
 `INIT_INFO_MAX_PAGES`), the frame map table's DRAM-span sizing (`dram_bounds`, `DRAM_BOUNDS`,
 `frame_map::init`, and `CHUNK_ORDER`), and the `CSpace` registry arena's RAM sizing
 (`init_cspace_registry`, `chunks_for_ram`, and `REGISTRY_CHUNK_ORDER`). The screen works as the
@@ -516,7 +520,7 @@ boundary one does:
 ```sh
 git diff --stat "$B" <head> -- core/kernel/src/mm/buddy.rs core/kernel/src/mm/init.rs
 M='translate_memory_map|max_ram_address|direct_map_ceiling|compute_max_physical_address'
-M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|drain_and_install_seed|coalesce_ram_blocks"
+M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|drain_and_install_seed"
 M="$M|MAX_DRAIN_BLOCKS|populate_cspace|INIT_INFO_MAX_PAGES"
 M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|CHUNK_ORDER"
 M="$M|init_cspace_registry|chunks_for_ram|REGISTRY_CHUNK_ORDER"

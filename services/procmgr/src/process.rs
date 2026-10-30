@@ -19,6 +19,8 @@ use process_layout::{ProcessLayout, choose_process_layout};
 use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE, SyscallError};
 
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
+/// The reply's `MSG_DATA_WORDS_MAX` words less the count word fix it, and
+/// `fill_exact` issues as many reads as a file needs.
 const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 
 /// Mint a fresh process badge: a random `u64` drawn from the kernel entropy
@@ -28,6 +30,7 @@ const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 /// random — rather than the former monotonic counter — keeps the per-process
 /// identifier and the spawn rate it would otherwise leak unguessable; the
 /// capability is still the sole authority, so this is defense-in-depth.
+/// The `u64` width is the kernel badge word, so the space never runs out.
 ///
 /// Single allocation point so the value threads to `populate_child_info`
 /// (writes the badged SEND derivation into `pi.log_send_cap`) AND
@@ -1218,7 +1221,9 @@ fn segment_prot(seg: &elf::LoadSegment) -> u64
 // `apply_reloc_in_span`); this section adds only the VFS-streaming walk the
 // create-from-file path needs.
 
-/// Number of `Elf64_Rela` records fetched per streaming chunk.
+/// Number of `Elf64_Rela` records fetched per streaming chunk. A batch size
+/// that bounds no table: `walk_relocs_streaming` loops until `DT_RELASZ` is
+/// consumed.
 const RELA_CHUNK_RECORDS: usize = 128;
 
 /// Stream a rela table in bounded chunks, invoking `f` on every decoded
@@ -1755,7 +1760,8 @@ pub fn create_process(
 /// cookie 0 as the `OutstandingPage::None` sentinel). Random rather than
 /// monotonic so the read-memory request count/rate it would otherwise leak to
 /// the fs stays unguessable; the cookie is opaque and never indexes a table.
-/// Returns `None` if the entropy draw fails (a kernel-contract violation).
+/// Its `u64` is the one request word that carries it, so the space never
+/// runs out. Returns `None` if the entropy draw fails (a kernel-contract violation).
 fn next_memory_cookie() -> Option<u64>
 {
     loop

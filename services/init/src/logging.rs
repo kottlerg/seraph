@@ -55,7 +55,8 @@ const LOG_THREAD_IPC_BUF_VA: u64 = crate::INIT_IPC_BUF_VA + crate::PAGE_SIZE;
 /// init log-thread stack base.
 const LOG_THREAD_STACK_VA: u64 = 0x0000_0000_D000_0000;
 
-/// Number of stack pages for the log thread (16 KiB).
+/// Number of stack pages for the log thread (16 KiB). It bounds no log
+/// capacity: [`SENDERS`] and [`HISTORY`] live in BSS, not on this stack.
 pub(crate) const LOG_THREAD_STACK_PAGES: u64 = 4;
 
 /// Max bytes per IPC chunk. Must match `MSG_DATA_WORDS_MAX * 8` from `syscall_abi`.
@@ -88,6 +89,7 @@ struct HistoryLine
     badge: u64,
     us: u64,
     bytes: [u8; LINE_BUF_SIZE],
+    // At most `LINE_BUF_SIZE` (256), which a `u16` always holds.
     used: u16,
 }
 
@@ -386,13 +388,15 @@ static mut HISTORY: [HistoryLine; HISTORY_RING_LEN] = [HistoryLine::empty(); HIS
 /// writing the slot and [`HISTORY_TOTAL`] after, both on the log thread, which
 /// also runs the handover; so the two are equal whenever the handover reads
 /// them, and it reads sequence `s` from `HISTORY[s % HISTORY_RING_LEN]` for
-/// every `s < HISTORY_TOTAL` still live.
+/// every `s < HISTORY_TOTAL` still live. `usize` is 64 bits on both targets,
+/// so the cursor is as wide as [`HISTORY_TOTAL`] and cannot wrap first.
 static HISTORY_HEAD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Total lines ever pushed (monotonic, never reset): the exclusive upper
 /// bound of the push sequence numbers. The live (not yet overwritten) lines
 /// are sequences `HISTORY_TOTAL.saturating_sub(HISTORY_RING_LEN)..HISTORY_TOTAL`
-/// (`logd_codec::handover::next_history_seq`).
+/// (`logd_codec::handover::next_history_seq`). The `u64` is that handover
+/// sequence width, and a line count cannot wrap it within any boot.
 static HISTORY_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Set when init-logd acknowledges real-logd's `HANDOVER_RELEASE`. The

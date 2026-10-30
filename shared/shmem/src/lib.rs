@@ -62,6 +62,8 @@ pub enum ShmemError
 pub struct SharedBuffer
 {
     vaddr: u64,
+    /// At most [`MAX_PAGES`], which [`SharedBuffer::attach`] enforces, so the
+    /// `u32` never truncates.
     page_count: u32,
     aspace: u32,
 }
@@ -216,8 +218,14 @@ pub struct SpscHeader
     pub head: AtomicU32,
     /// Writer's index into the buffer (bytes produced, mod capacity).
     /// Written by the writer, read by the reader.
+    ///
+    /// Both indices run free and wrap at `u32`: the ends mask them to a slot
+    /// and take the fill level as `tail.wrapping_sub(head)`, which stays
+    /// correct across the wrap for any capacity up to 2^31, so the width
+    /// bounds no transfer volume.
     pub tail: AtomicU32,
-    /// Capacity of the byte buffer. Power of two.
+    /// Capacity of the byte buffer. Power of two. `u32` is the width the
+    /// `repr(C)` header both peers map fixes.
     ///
     /// Atomic because it lies in memory the peer can write: each end reads it
     /// only to compare against the capacity it mapped (see

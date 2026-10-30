@@ -594,8 +594,8 @@ unsafe fn drain_remote_stopped(
 /// 100 ms; returns whether it printed.
 ///
 /// # Safety
-/// `target_tcb` must be a valid TCB and `run_cpu < CPU_COUNT`; the reads are
-/// racy and diagnostic only.
+/// `target_tcb` must be a valid TCB, `run_cpu < CPU_COUNT`, and the caller
+/// must hold no `sched_lock` and no scheduler lock.
 #[cfg(not(test))]
 unsafe fn warn_slow_drain(
     target_tcb: *mut crate::sched::thread::ThreadControlBlock,
@@ -609,25 +609,46 @@ unsafe fn warn_slow_drain(
     {
         return false;
     }
-    // SAFETY: target_tcb is valid per contract and the remote CPU's current
-    // TCB stays mapped, so these reads cannot fault. They are not race-free:
-    // `current` and both TCBs' fields are read without their locks, a
-    // diagnostic-only residual #440 records.
+    // SAFETY: target_tcb is valid per contract; `thread_id` is immutable. The
+    // target's state is read under its `sched_lock`, and the remote CPU's
+    // `current` under that CPU's scheduler lock, which keeps that thread from
+    // being freed while it is `current` (dealloc's not-current scan reads
+    // under the same lock); both are try-locked, so the diagnostic never waits.
     let (tid, st, cur_tid) = unsafe {
-        let cur = crate::sched::scheduler_for(run_cpu).current();
+        let sched = crate::sched::scheduler_for(run_cpu);
         (
             (*target_tcb).thread_id,
-            (*target_tcb).state,
-            if cur.is_null() { 0 } else { (*cur).thread_id },
+            (*target_tcb).sched_lock.try_lock_raw().map(|saved| {
+                let st = (*target_tcb).state;
+                (*target_tcb).sched_lock.unlock_raw(saved);
+                st
+            }),
+            sched.lock.try_lock_raw().map(|saved| {
+                let cur = sched.current();
+                let cur_tid = if cur.is_null() { 0 } else { (*cur).thread_id };
+                sched.lock.unlock_raw(saved);
+                cur_tid
+            }),
         )
     };
-    crate::kprintln!(
-        "kernel: sys_thread_stop spin >100ms target_tid={} state={:?} run_cpu={} cur_tid={}",
-        tid,
-        st,
-        run_cpu,
-        cur_tid
-    );
+    if let (Some(st), Some(cur_tid)) = (st, cur_tid)
+    {
+        crate::kprintln!(
+            "kernel: sys_thread_stop spin >100ms target_tid={} state={:?} run_cpu={} cur_tid={}",
+            tid,
+            st,
+            run_cpu,
+            cur_tid
+        );
+    }
+    else
+    {
+        crate::kprintln!(
+            "kernel: sys_thread_stop spin >100ms target_tid={} run_cpu={} (locks held)",
+            tid,
+            run_cpu
+        );
+    }
     true
 }
 

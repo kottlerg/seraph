@@ -33,9 +33,7 @@ use crate::sched::thread::ThreadControlBlock;
 /// holder of any source lock may read a TCB's tag to test membership in that
 /// lock's own queue, even while the TCB is linked on another queue: only that
 /// lock's holders store that queue's address in a tag, so a store made under
-/// another source's lock never makes the test pass or fail wrongly. The
-/// watchdog's [`tags_racy`](Self::tags_racy) read is the only read without a
-/// lock. A delivery wakes the head; destroying the source wakes every waiter.
+/// another source's lock never makes the test pass or fail wrongly. A delivery wakes the head; destroying the source wakes every waiter.
 ///
 /// A queue must not move while a thread is on it: the tags hold its address.
 pub struct WaitQueue
@@ -160,24 +158,6 @@ impl WaitQueue
     {
         // SAFETY: caller contract.
         unsafe { self.remove_if(tcb, |_| true) }
-    }
-
-    /// Whether `tcb`'s tag names `queue`, read without `queue`'s source lock
-    /// and without dereferencing `queue`: for the softlockup watchdog, whose
-    /// source may already be freed. A racy snapshot.
-    ///
-    /// # Safety
-    /// `tcb` is a valid, mapped TCB.
-    pub unsafe fn tags_racy(queue: *const WaitQueue, tcb: *const ThreadControlBlock) -> bool
-    {
-        // SAFETY: caller contract; the tag is atomic, so the racy read is
-        // defined.
-        let tag = unsafe {
-            (*tcb)
-                .ipc_wait_queue
-                .load(core::sync::atomic::Ordering::Relaxed)
-        };
-        core::ptr::eq(tag, queue)
     }
 
     /// Unlink `tcb` and clear its links and tag.
@@ -477,7 +457,7 @@ pub(crate) unsafe fn lock_bound_source(
 // source state ipc_state names, whose allocation guarantees its alignment.
 #[allow(clippy::cast_ptr_alignment)]
 #[cfg(not(test))]
-unsafe fn source_lock_of(
+pub(crate) unsafe fn source_lock_of(
     ipc_state: crate::sched::thread::IpcThreadState,
     blocked_on: *mut u8,
 ) -> Option<*const crate::sync::Spinlock>
@@ -638,9 +618,8 @@ mod tests
             assert!(!q1.contains(pb) && !q2.contains(pa));
             assert!(!q1.remove(pb));
             assert!(q2.contains(pb));
-            assert!(WaitQueue::tags_racy(&q2, pb) && !WaitQueue::tags_racy(&q1, pb));
             assert_eq!(q2.pop(), pb);
-            assert!(!WaitQueue::tags_racy(&q2, pb));
+            assert!(!q2.contains(pb));
             assert_eq!(q1.pop(), pa);
         }
     }

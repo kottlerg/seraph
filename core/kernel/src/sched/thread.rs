@@ -447,9 +447,8 @@ pub unsafe fn consume_park_interrupted(tcb: *mut ThreadControlBlock) -> bool
 /// `ipc_wait_prev` and the `ipc_wait_queue` tag are written under the lock of
 /// the IPC source whose queue links the TCB. Any source-lock holder may read
 /// the tag to test membership in its own queue (see
-/// [`crate::ipc::WaitQueue`]); the softlockup watchdog also reads it without a
-/// lock. See core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
-/// Ownership.
+/// [`crate::ipc::WaitQueue`]). See core/kernel/docs/scheduling-internals.md
+/// § Cross-CPU TCB Ownership.
 #[repr(C)]
 pub struct ThreadControlBlock
 {
@@ -534,8 +533,7 @@ pub struct ThreadControlBlock
     /// `commit_blocked_under_local_lock`. Diagnostic-only: the owed-wake
     /// detector ages `Blocked` threads against it (see
     /// core/kernel/docs/scheduling-internals.md § Softlockup Watchdog); never gates
-    /// control flow. Owned by `sched_lock`; the watchdog's lock-free diagnostic
-    /// read is the residual #440 records.
+    /// control flow. Owned by `sched_lock`, under which the watchdog reads it.
     pub park_started_tick: u64,
 
     /// Park-binding generation: advanced under [`sched_lock`](Self::sched_lock)

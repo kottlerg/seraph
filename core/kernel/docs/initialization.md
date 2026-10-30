@@ -224,7 +224,10 @@ overlap the kernel image window halts with
 5. Allocate the frame map table, one 1 MiB chunk of per-frame user-mapping counts for each GiB
    the DRAM span touches (`mm::frame_map::init`; see
    [memory-internals.md](memory-internals.md) § Frame Map Table)
-6. Copy `BootInfo.cpu_ids` into the APIC-ID slab (`percpu::init_apic_ids`), so Phase 5
+6. Allocate the `CSpace` registry arena, one 1 MiB chunk of 65,536 registry entries per
+   65,536 pages of DRAM (`cap::init_cspace_registry`; see
+   [capability-internals.md](capability-internals.md) § Representation)
+7. Copy `BootInfo.cpu_ids` into the APIC-ID slab (`percpu::init_apic_ids`), so Phase 5
    can name the BSP by its hardware id (the riscv64 PLIC context)
 ```
 
@@ -232,11 +235,11 @@ Retype-based kernel object memory, which replaces a kernel heap, is specified in
 [memory-internals.md](memory-internals.md) § Kernel Object Memory; the entropy
 subsystem's per-CPU state is described in [entropy.md](entropy.md).
 
-**Failure mode:** a failed per-CPU storage or frame map table allocation halts the kernel,
-as does DRAM reaching past the table's 256 GiB.
+**Failure mode:** a failed per-CPU storage, frame map table, or `CSpace` registry allocation
+halts the kernel, as does DRAM reaching past the frame map table's 256 GiB.
 
-**Completion criterion:** per-CPU storage and the frame map table are allocated; there is no
-kernel allocator to activate.
+**Completion criterion:** per-CPU storage, the frame map table, and the `CSpace` registry are
+allocated; there is no kernel allocator to activate.
 
 ---
 
@@ -716,7 +719,7 @@ through its drain until a teardown commits `Exited` over it (see
 | 1 | Early console; platform feature gate | Halt: missing required baseline feature (no console is non-fatal) |
 | 2 | Buddy allocator from memory map | Halt: no usable RAM |
 | 3 | Kernel page tables + direct map | Halt: BOOT_TABLE_POOL exhausted; direct map would overlap the kernel image window |
-| 4 | Typed-memory cap surface; per-CPU storage; frame map table | Halt: per-CPU storage or frame map table allocation failed, or DRAM past 256 GiB |
+| 4 | Typed-memory cap surface; per-CPU storage; frame map table; `CSpace` registry | Halt: per-CPU storage, frame map table, or `CSpace` registry allocation failed, or DRAM past 256 GiB |
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped, entries beyond MAX_MMIO_APERTURES dropped |
 | 7 | Capability system + root CSpace | Halt: OOM |

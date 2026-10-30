@@ -107,7 +107,7 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `BuddyAllocator.free_lists` (`FreeHeader` in each free block) | `core/kernel/src/mm/buddy.rs` | none: one 16 B header inside each free block, linked by physical address | provable unreachability (no metadata outside the free pages) | none | correct as is | None |
+| `BuddyAllocator.free_lists` (`FreeHeader` in each free block) | `core/kernel/src/mm/buddy.rs` | none: one 16 B header inside each free block, linked by physical address | provable unreachability (no metadata outside the free pages) | 96 B BSS (the 12 list heads) | correct as is | None |
 | `MAX_ORDER` | `core/kernel/src/mm/buddy.rs` | 11 (8 MiB largest block) | BSS budget (the 512-CPU `AP_IST_STACKS` slab fits one block) | none | needs a design | With the one-block rule of `alloc_zeroed_slab` it is the effective `MAX_CPUS` ceiling; allocate per-CPU slabs in several blocks |
 | `BOOT_TABLE_POOL_SIZE` (`BootTablePool.frames`) | `core/kernel/src/mm/paging.rs` | 256 frames | BSS budget | 1 MiB BSS | make pay-as-you-go | Halts above about 248 GiB of top RAM address; 1 GiB leaves or tables carved from usable RAM |
 | `LARGE_PAGE_SIZE` | `core/kernel/src/mm/paging.rs` | 2 MiB | hardware spec (x86-64 and Sv39 large leaf) | none | correct as is | None |
@@ -118,8 +118,9 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 | `RELEASE_RUNS` (`ReleaseBatch.runs`) | `core/kernel/src/mm/frame_map.rs` | 16 | batch size (a full batch flushes, never fails) | 256 B stack | correct as is | None |
 | `FRAMES_PER_CHUNK` geometry assert | `core/kernel/src/mm/frame_map.rs` | 1 GiB per chunk, 1 MiB counter block | encoding artefact | none | correct as is | Keep |
 | `MAX_RANGES` (`RangeList` usable and work lists) | `core/kernel/src/mm/init.rs` | 64 | current peak plus headroom | about 1 KiB stack per list | raise | `push` drops RAM ranges past 64 silently; size from `memory_map.count` or fail loudly |
-| `MAX_EXCL` | `core/kernel/src/mm/init.rs` | 32 | provably unreachable today (28 at most) only through core/boot's private `MAX_MODULES` | 512 B stack | needs a design | Derive from an ABI constant with a const assert; make overflow fatal |
-| `fdt_extent` DTB size check | `core/kernel/src/mm/init.rs` | FDT `u32` `totalsize`, at least the 40-byte header, inside the direct-mapped span | hardware or format spec (FDT header) and RAM (the direct map) | none | correct as is | None; a blob outside the bounds halts the boot at Phase 3 |
+| `MAX_EXCL` | `core/kernel/src/mm/init.rs` | 32 | provably unreachable today (27 at most) only through core/boot's private `MAX_MODULES` | 512 B stack | needs a design | Derive from an ABI constant with a const assert; make overflow fatal |
+| `FREE_RANGE_CAP` (`FREE_RANGES`) | `core/kernel/src/mm/init.rs` | `MAX_RANGES + MAX_EXCL + 1` = 97 | provable unreachability (the usable ranges are disjoint, so each subtracted extent adds at most one piece; `push_counted` asserts it) | about 1.5 KiB BSS | correct as is | None |
+| `fdt_extent` DTB size check | `core/kernel/src/mm/init.rs` | FDT `u32` `totalsize`, at least the 40-byte header, inside the direct-mapped span | hardware or format spec (FDT header) | none | correct as is | None; a blob outside the bounds halts the boot at Phase 3 |
 | `TAG_CAP` (`TagPool`) | `core/kernel/src/mm/tag_allocator.rs` | 4096 | hardware spec (x86 12-bit PCID); clips riscv64's 16-bit ASID | about 64.5 KiB BSS | make pay-as-you-go | Allocate from the buddy, sized to the probed tag count |
 | `enable` `max_fit` tag trim | `core/kernel/src/mm/tag_allocator.rs` | `2^MAX_ORDER` pages / (`cpu_count` x 16) | BSS budget (one-block slab) | `cpu_count` x tags x 16 B | needs a design | Follows the per-CPU slab design |
 | `AddressSpace.tag`, `TlbShootdownRequest.tag` | `core/kernel/src/mm/address_space.rs`, `tlb_shootdown.rs` | `AtomicU16` | hardware spec (PCID and ASID widths) | 2 B each | correct as is | None |

@@ -57,9 +57,9 @@ pub struct CreatedProcess
 /// pool, redrawn off the reserved `0` value (an unbadged SEND carries badge 0)
 /// — and mint a badged SEND on `bootstrap_ep` for a soon-to-spawn child. Every
 /// child that receives its bootstrap rounds on svcmgr's `bootstrap_ep` gets a
-/// distinct badge so svcmgr can correlate the round to the right service entry.
+/// distinct badge so svcmgr can correlate each round to the right service entry.
 /// Random rather than monotonic so the service-spawn count it would otherwise
-/// leak stays unguessable; svcmgr matches the round by exact badge value, never
+/// leak stays unguessable; svcmgr matches each round by exact badge value, never
 /// by index. Returns `None` if the entropy draw or cap derivation fails.
 pub fn mint_child_creator(bootstrap_ep: u32) -> Option<(u64, u32)>
 {

@@ -19,7 +19,9 @@ use ipc::input_labels;
 ///
 /// Returns `false` when `label` is [`input_labels::INPUT_READ_EVENTS`] and
 /// `badge` lacks [`input_labels::READ_AUTHORITY`]; the driver then replies
-/// `input_errors::UNAUTHORIZED` without blocking. Returns `true` for every
+/// `input_errors::UNAUTHORIZED` as soon as it reaches the request, without
+/// waiting for input, though the request still waits behind any authorized
+/// read already blocked. Returns `true` for every
 /// other request: unknown labels carry no gate and are answered
 /// `UNKNOWN_OPCODE`.
 #[must_use]

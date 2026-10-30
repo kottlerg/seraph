@@ -1863,7 +1863,9 @@ pub mod input_labels
     ///
     /// Request: empty body; the caller's badge must carry
     /// [`READ_AUTHORITY`], else the driver replies
-    /// [`super::input_errors::UNAUTHORIZED`] at once.
+    /// [`super::input_errors::UNAUTHORIZED`] as soon as it reaches the request,
+    /// without waiting for input; the request still waits behind any authorized
+    /// read already blocked.
     /// The driver blocks until at least one event is available, then replies
     /// with up to [`super::keysym::INPUT_MAX_EVENTS_PER_READ`] events.
     ///

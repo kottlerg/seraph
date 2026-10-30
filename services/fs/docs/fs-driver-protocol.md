@@ -330,8 +330,8 @@ beyond its cache slots to replace still-mapped ones, and past that a still-mappe
 slot stays out of service, so a client that never unmaps shrinks the cache, and a
 read that finds no reusable slot is answered `IO_ERROR` (2). A slot whose revoke
 does not complete keeps its page and still serves cache hits, but the page is not
-refilled with other data, and a quarantined page is not made a spare, until a
-later revoke completes.
+refilled with other data until a later revoke completes. A quarantined page
+likewise becomes a spare only after a revoke of it completes.
 A reply with any other label is not an
 acknowledgement; a client that cannot unmap the page, or whose copy
 outlasts the window, replies `IO_ERROR` (2).

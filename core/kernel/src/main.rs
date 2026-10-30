@@ -237,8 +237,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     //
     // Save the framebuffer physical base before the switch; `info` is a
     // physical-address reference that is no longer identity-mapped in the
-    // new tables (it is accessible via the direct map as a future Phase 4
-    // concern). All further uses of `info` must be resolved before activate.
+    // new tables (later phases reach it through the direct map). All
+    // further uses of `info` must be resolved before activate.
     let fb_phys = info.framebuffer.physical_base;
     if let Err(_e) = mm::paging::init_kernel_page_tables(info)
     {

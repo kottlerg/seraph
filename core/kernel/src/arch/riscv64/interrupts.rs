@@ -28,7 +28,7 @@
 //! Base physical address is supplied by the bootloader through
 //! `BootInfo.kernel_mmio.plic_base` (see [`super::platform::plic_base`]) and
 //! accessed via the direct map. Register offsets follow the RISC-V PLIC spec:
-//! - Priority registers: base + 4*source (sources `1..=PLIC_NUM_SOURCES`).
+//! - Priority registers: base + 4*source (sources `1..=platform::plic_ndev()`).
 //! - Enable registers:  base + 0x2000 + 0x80*context + 4*word.
 //! - Threshold:         base + `0x20_0000` + 0x1000*context.
 //! - Claim/Complete:    the threshold register + 4.
@@ -44,28 +44,36 @@
 //! context registers would fall outside the PLIC window
 //! (`super::platform::plic_size`).
 //!
+//! # Routing
+//! Each routed source is enabled on one hart's S-mode context, its target, chosen at
+//! route time ([`route_device_irq`], through `irq::next_target_cpu`): the harts in turn,
+//! so device interrupts spread over the harts. One context per source avoids the PLIC
+//! thundering herd, in which every enabled hart traps and all but one lose the claim.
+//! The target is recorded per source (`SOURCE_TARGET`), so mask and unmask act on that
+//! context, and the claim and complete run on the hart that took the trap.
+//!
 //! # Locking
 //! [`plic_enable`] and [`plic_disable`] read-modify-write a 32-source enable word of
-//! the BSP's context, and run on any hart (`SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`, the
-//! device-IRQ dispatch in interrupt context, and the Interrupt and Notification dealloc
-//! paths), so each holds `PLIC_LOCK`, a leaf lock taken with interrupts disabled,
-//! across its read and write; otherwise two updates to sources sharing a word could
-//! lose one. [`init`] and [`init_ap`] write only the boot hart's or their own hart's
-//! context before any IRQ is routed and take no lock; the claim and complete
-//! registers are per-context and need none.
+//! the source's target context, and run on any hart (`SYS_IRQ_ACK`, the device-IRQ
+//! dispatch in interrupt context, and the route changes `irq` makes), so each holds
+//! `PLIC_LOCK`, a leaf lock taken with interrupts disabled, across its read and write;
+//! otherwise two updates to sources sharing a word could lose one. `SOURCE_TARGET` is
+//! written only by the route changes, which `irq` serialises under its routing lock.
+//! [`init`] and [`init_ap`] write only the boot hart's or their own hart's context
+//! before any IRQ is routed and take no lock; the claim and complete registers are
+//! per-context and need none.
 //!
 //! # Modification notes
-//! - Device IRQs need no per-device code here: `route_device_irq` enables (and masks) the
-//!   source on the BSP context, and `dispatch_external` forwards every claimed source to
-//!   `crate::irq::dispatch_device_irq`.
-//! - Device IRQs are enabled on the BSP context only (`bsp_enable_base`).
+//! - Device IRQs need no per-device code here: `route_device_irq` picks the source's
+//!   target and leaves it masked, and `dispatch_external` forwards every claimed source
+//!   to `crate::irq::dispatch_device_irq`.
 
 use super::trap_frame::TrapFrame;
 use crate::mm::paging::phys_to_virt;
 
 // ── PLIC constants ────────────────────────────────────────────────────────────
 
-/// PLIC priority register base: base + 4 * `source_id` (source 1..=127).
+/// PLIC priority register base: base + 4 * `source_id` (source 1..=`plic_ndev`).
 const PLIC_PRIORITY_BASE: u64 = 0x0000;
 
 /// PLIC S-mode context of the hart with hardware id `hart`.
@@ -92,27 +100,27 @@ const fn plic_threshold_offset_for(hart: u32) -> u64
     0x0020_0000 + plic_s_context(hart) * 0x1000
 }
 
-/// Hardware hart id of the BSP, whose S-mode context every device IRQ is routed to.
-///
-/// Written once by [`init`] (Phase 5, single-threaded, before any AP starts or any IRQ
-/// is routed) from `percpu::apic_id_for(0)`, and read-only afterwards.
+/// Target hart of each PLIC source, plus one; 0 for an unrouted source, so the zeroed
+/// table routes none. Indexed by source id over the specification's id space. Written
+/// only by [`route_device_irq`] and [`unroute_device_irq`], which `irq` serialises under
+/// its routing lock; read by [`plic_enable`] and [`plic_disable`].
 #[cfg(not(test))]
-static BSP_HART: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SOURCE_TARGET: [core::sync::atomic::AtomicU32; PLIC_MAX_SOURCES as usize + 1] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; PLIC_MAX_SOURCES as usize + 1];
 
 /// Serialises the enable-word read-modify-write of [`plic_enable`] and [`plic_disable`]
 /// (see the module doc's § Locking). A leaf lock: nothing is acquired while it is held.
 #[cfg(not(test))]
 static PLIC_LOCK: crate::sync::Spinlock = crate::sync::Spinlock::new();
 
-/// PLIC S-mode enable-bits base of the BSP's context.
-///
-/// All device IRQs are routed to the BSP's S-mode context — a single known
-/// hart — so that only one hart takes the trap and there is no thundering-
-/// herd claim race between multiple harts for the same source.
+/// The hart id `source` is routed to, or `None` when it is unrouted (or out of range).
 #[cfg(not(test))]
-fn bsp_enable_base() -> u64
+fn source_target(source: u32) -> Option<u32>
 {
-    plic_enable_base_for(BSP_HART.load(core::sync::atomic::Ordering::Relaxed))
+    SOURCE_TARGET
+        .get(source as usize)?
+        .load(core::sync::atomic::Ordering::Relaxed)
+        .checked_sub(1)
 }
 
 /// Hardware hart id of the executing hart.
@@ -145,7 +153,7 @@ const fn plic_context_in_window(hart: u32, window: u64) -> bool
     // With the standard register map the claim register always ends past the
     // enable words, so the enable-word test is defensive: it keeps the bound
     // correct should the enable span ever grow past the context block.
-    let enable_end = plic_enable_base_for(hart) + PLIC_NUM_SOURCES.div_ceil(32) as u64 * 4;
+    let enable_end = plic_enable_base_for(hart) + enable_words(PLIC_MAX_SOURCES) as u64 * 4;
     let claim_end = plic_threshold_offset_for(hart) + 8;
     enable_end <= window && claim_end <= window
 }
@@ -166,16 +174,15 @@ fn plic_claim_complete_offset() -> u64
     plic_threshold_offset_for(current_hart()) + 4
 }
 
-/// Conservative cap on the PLIC source number the kernel programs. The
-/// RISC-V PLIC spec admits up to 1023 sources; every targeted platform
-/// exposes far fewer, and the boot-time priority and enable-word loops stay cheap at
-/// this bound.
-const PLIC_NUM_SOURCES: u32 = 127;
+/// Largest PLIC source id the RISC-V PLIC specification allows (sources 1..=1023;
+/// source 0 is reserved).
+pub const PLIC_MAX_SOURCES: u32 = 1023;
 
-// `SYS_IRQ_REGISTER` admits sources up to the arch-interface `MAX_IRQ_ID`; a
-// source above PLIC_NUM_SOURCES would be accepted and then silently left
-// unprogrammed by `plic_enable`.
-const _: () = assert!(super::MAX_IRQ_ID == PLIC_NUM_SOURCES);
+/// Number of 32-bit enable words a context needs for sources `0..=ndev`.
+const fn enable_words(ndev: u32) -> u32
+{
+    (ndev + 1).div_ceil(32)
+}
 
 // ── PLIC access helpers ───────────────────────────────────────────────────────
 
@@ -918,64 +925,49 @@ unsafe fn redirect_user_fault(
     matches!(outcome, crate::ipc::fault::FaultOutcome::Resume)
 }
 
-/// Enable PLIC `source` on the BSP's S-mode context.
-///
-/// Device IRQs are routed to a single hart (the BSP). Routing to one hart
-/// avoids the PLIC thundering-herd: with N harts all enabled for the same
-/// source, each trap fires on all N, N-1 of them lose the claim race
-/// (the claim read of `plic_claim_complete_offset` returns 0), and the redundant traps
-/// waste cycles on every hart. Pinning to a single context
-/// makes IRQ delivery deterministic. This matches the `x86_64` side, which
-/// programs every IOAPIC redirection entry for destination LAPIC ID 0 (see
-/// `core/kernel/src/arch/x86_64/ioapic.rs` (`ioapic::route`)).
-///
-/// TODO: per-IRQ affinity. When the system grows multiple high-rate IRQ
-/// sources (additional block devices, a NIC, more than one virtio queue
-/// with per-queue MSI), concentrating all trap dispatch on the BSP becomes
-/// a bottleneck. Replace this with a per-source hart selector — either
-/// round-robin at registration, user-supplied affinity, or a dynamic
-/// rebalancer. The downstream `dispatch_device_irq` path is already
-/// hart-agnostic (`acknowledge` completes on the executing hart's context), so
-/// only the enable-bit placement here needs to change. Same TODO applies to
-/// `core/kernel/src/arch/x86_64/ioapic.rs` (`ioapic::route`).
+/// Enable PLIC `source` on its target hart's S-mode context; an unrouted source is left
+/// disabled.
 #[cfg(not(test))]
 pub fn plic_enable(source: u32)
 {
-    plic_update_enable_word(source, |word, bit| word | bit);
+    if let Some(hart) = source_target(source)
+    {
+        plic_update_enable_word(source, hart, |word, bit| word | bit);
+    }
 }
 
-/// Disable PLIC `source` on the BSP's S-mode context.
-///
-/// Paired with [`plic_enable`]; both operate on the BSP only so that
-/// mask/unmask is always symmetric against the one hart that actually
-/// takes the trap.
+/// Disable PLIC `source` on its target hart's S-mode context (a no-op for an unrouted
+/// source, which is enabled on no context).
 #[cfg(not(test))]
 pub fn plic_disable(source: u32)
 {
-    plic_update_enable_word(source, |word, bit| word & !bit);
+    if let Some(hart) = source_target(source)
+    {
+        plic_update_enable_word(source, hart, |word, bit| word & !bit);
+    }
 }
 
-/// Rewrite the BSP-context enable word holding PLIC `source` to
+/// Rewrite the enable word holding PLIC `source` in hart `hart`'s S-mode context to
 /// `update(word, bit)`, where `bit` is the source's mask in that word, under
-/// `PLIC_LOCK` (module doc § Locking). A source outside `1..=PLIC_NUM_SOURCES`
-/// is ignored; `SYS_IRQ_REGISTER` refuses such an id.
+/// `PLIC_LOCK` (module doc § Locking). A source outside `1..=plic_ndev()` is ignored;
+/// `irq::register` refuses such an id.
 #[cfg(not(test))]
-fn plic_update_enable_word(source: u32, update: impl FnOnce(u32, u32) -> u32)
+fn plic_update_enable_word(source: u32, hart: u32, update: impl FnOnce(u32, u32) -> u32)
 {
-    if source == 0 || source > PLIC_NUM_SOURCES
+    if source == 0 || source > super::platform::plic_ndev()
     {
         return;
     }
     let word_idx = source / 32;
     let bit = 1u32 << (source % 32);
-    let offset = bsp_enable_base() + (u64::from(word_idx) * 4);
+    let offset = plic_enable_base_for(hart) + (u64::from(word_idx) * 4);
     // SAFETY: PLIC_LOCK is a leaf lock; lock_raw disables interrupts and is
     // paired with unlock_raw below on the only path out.
     let saved = unsafe { PLIC_LOCK.lock_raw() };
     let current = plic_read(offset);
     let updated = update(current, bit);
     // SAFETY: direct map active; PLIC MMIO is accessible; `offset` is an enable
-    // word of the BSP's S-mode context.
+    // word of a context `init` or `init_ap` checked to lie inside the window.
     unsafe { plic_write(offset, updated) };
     // SAFETY: paired with lock_raw above.
     unsafe { PLIC_LOCK.unlock_raw(saved) };
@@ -999,19 +991,33 @@ pub fn unmask(irq: u32)
     let _ = irq;
 }
 
-/// Route device IRQ (PLIC source) `irq` to the BSP, leaving it masked at the
-/// controller. The driver unmasks via `SYS_IRQ_ACK` once it has registered a
-/// handler.
+/// Route device IRQ (PLIC source) `irq`, leaving it masked at the controller: pick
+/// its target hart (the next in turn, `irq::next_target_cpu`) and record it. The
+/// driver unmasks via `SYS_IRQ_ACK` once it has registered a handler. A source routed
+/// again is disabled on its old target first.
+///
+/// # Errors
+/// `NoSuchLine` for a source outside `1..=plic_ndev()`.
 ///
 /// # Safety
-/// Must be called after PLIC init with a valid source id.
+/// Must be called after PLIC init, under `irq`'s routing lock.
 #[cfg(not(test))]
-pub unsafe fn route_device_irq(irq: u32)
+pub unsafe fn route_device_irq(irq: u32) -> Result<(), crate::irq::RouteError>
 {
-    // Enable at the PLIC, then immediately mask until the driver ACKs — the
-    // x86-64 IOAPIC path leaves the line masked the same way.
-    plic_enable(irq);
-    mask(irq);
+    if irq == 0 || irq > super::platform::plic_ndev()
+    {
+        return Err(crate::irq::RouteError::NoSuchLine);
+    }
+    let cpu = crate::irq::next_target_cpu(|_| true).ok_or(crate::irq::RouteError::Exhausted)?;
+    // SAFETY: `next_target_cpu` returns an index below CPU_COUNT; the hart id slab
+    // is read-only after boot.
+    let hart = unsafe { crate::percpu::apic_id_for(cpu) };
+    plic_disable(irq);
+    SOURCE_TARGET[irq as usize].store(hart + 1, core::sync::atomic::Ordering::Relaxed);
+    // Left disabled on the new target: unmask (SYS_IRQ_ACK) enables it, as the
+    // x86-64 I/O APIC path leaves its entry masked.
+    plic_disable(irq);
+    Ok(())
 }
 
 /// No-op test stub.
@@ -1019,7 +1025,40 @@ pub unsafe fn route_device_irq(irq: u32)
 /// # Safety
 /// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
-pub unsafe fn route_device_irq(_irq: u32) {}
+pub unsafe fn route_device_irq(_irq: u32) -> Result<(), crate::irq::RouteError>
+{
+    Ok(())
+}
+
+/// Release PLIC source `irq`'s route: disable it on its target and forget the target.
+///
+/// # Safety
+/// Must be called after PLIC init, under `irq`'s routing lock.
+#[cfg(not(test))]
+pub unsafe fn unroute_device_irq(irq: u32)
+{
+    plic_disable(irq);
+    if let Some(entry) = SOURCE_TARGET.get(irq as usize)
+    {
+        entry.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// No-op test stub.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the non-test item.
+#[cfg(test)]
+pub unsafe fn unroute_device_irq(_irq: u32) {}
+
+/// Number of interrupt lines the routing table covers: PLIC ids `0..=plic_ndev()` (id 0
+/// reserved).
+#[cfg(not(test))]
+#[must_use]
+pub fn irq_line_count() -> u32
+{
+    super::platform::plic_ndev() + 1
+}
 
 /// Dispatch an external interrupt from the PLIC to its registered notification.
 ///
@@ -1163,18 +1202,22 @@ pub unsafe fn init()
     // percpu::init_apic_ids first.
     let bsp_hart = unsafe { crate::percpu::apic_id_for(0) };
     require_plic_context(bsp_hart);
-    BSP_HART.store(bsp_hart, core::sync::atomic::Ordering::Relaxed);
+    let ndev = super::platform::plic_ndev();
+    crate::kprintln!(
+        "plic: {} sources (firmware reported {})",
+        ndev,
+        crate::platform::kernel_mmio().plic_ndev
+    );
     // SAFETY: direct map active; PLIC MMIO region accessible; plic_write performs
     // volatile stores to valid PLIC register offsets (the BSP's context was
     // checked above to lie inside the PLIC window).
     unsafe {
-        for src in 1..=PLIC_NUM_SOURCES
+        for src in 1..=ndev
         {
             plic_write(PLIC_PRIORITY_BASE + (u64::from(src) * 4), 1);
         }
-        let enable_words = PLIC_NUM_SOURCES.div_ceil(32);
         let bsp_enable_base = plic_enable_base_for(bsp_hart);
-        for w in 0..enable_words
+        for w in 0..enable_words(ndev)
         {
             plic_write(bsp_enable_base + u64::from(w) * 4, 0);
         }
@@ -1245,8 +1288,7 @@ pub unsafe fn init_ap()
         plic_write(plic_threshold_offset_for(hart), 0);
         // Disable all source enable words for this hart's context.
         let enable_base = plic_enable_base_for(hart);
-        let enable_words = PLIC_NUM_SOURCES.div_ceil(32);
-        for w in 0..enable_words
+        for w in 0..enable_words(super::platform::plic_ndev())
         {
             plic_write(enable_base + u64::from(w) * 4, 0);
         }
@@ -1439,7 +1481,9 @@ pub struct IpiWaitCtx<'a>
 #[cfg(not(test))]
 pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
 {
-    let start = super::timer::elapsed_us().unwrap_or(0);
+    // A clock-less wait (`elapsed_us` not yet calibrated) falls back to the spin-count
+    // estimate (`bounded_wait::WaitTimer`), so it is bounded too.
+    let mut timer = crate::bounded_wait::WaitTimer::start(super::timer::elapsed_us());
     let mut resent = false;
     let mut warned = false;
     loop
@@ -1449,12 +1493,7 @@ pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
             return;
         }
         core::hint::spin_loop();
-        let Some(now) = super::timer::elapsed_us()
-        else
-        {
-            continue;
-        };
-        let elapsed_ms = now.saturating_sub(start) / 1_000;
+        let elapsed_ms = timer.elapsed(super::timer::elapsed_us()) / 1_000;
         if elapsed_ms >= 5_000
         {
             crate::kprintln!(
@@ -1626,6 +1665,19 @@ mod tests
         assert!(plic_context_in_window(255, 0x40_0000));
         assert!(!plic_context_in_window(256, 0x40_0000));
         assert!(!plic_context_in_window(u32::MAX, 0x40_0000));
+    }
+
+    // Defect caught: a default window too small for the hart ids the PLIC
+    // specification admits, so a platform reporting no PLIC size halts the boot
+    // on a hart id at or above 256.
+    #[test]
+    fn default_plic_window_holds_every_context_the_specification_admits()
+    {
+        // Context 15871, the specification's last, is hart 7935's S-mode context.
+        let window = super::super::platform::DEFAULT_PLIC_SIZE;
+        assert!(plic_context_in_window(256, window));
+        assert!(plic_context_in_window(7935, window));
+        assert!(!plic_context_in_window(7936, window));
     }
 
     #[test]

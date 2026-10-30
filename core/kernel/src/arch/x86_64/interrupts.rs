@@ -37,11 +37,10 @@
 //!
 //! # Modification notes
 //! - Device IRQs are routed generically: `SYS_IRQ_REGISTER` (`syscall::hw::sys_irq_register`)
-//!   records the Notification via `irq::register` and calls [`route_device_irq`], which installs
-//!   the I/O APIC entry masked; `SYS_IRQ_ACK` (`syscall::hw::sys_irq_ack`) calls [`unmask`].
-//!   Only GSIs 0-22 (vectors 33-55) have IDT stubs, and `MAX_IRQ_ID` admits no other; serving
-//!   a higher GSI needs a `device_irq_stub!` entry, a wider device arm in
-//!   `idt::irq_dispatch`, and a larger `ioapic::DEVICE_GSI_COUNT`.
+//!   calls `irq::register`, which calls [`route_device_irq`] (assign a device vector and a
+//!   destination CPU, install the I/O APIC entry masked) and records the Notification;
+//!   clearing the route calls [`unroute_device_irq`]. `SYS_IRQ_ACK`
+//!   (`syscall::hw::sys_irq_ack`) calls [`unmask`].
 
 // cast_possible_truncation: u64→usize/u8 APIC address arithmetic; bounded by APIC layout.
 // cast_lossless: u8→u32 vector casts are always widening.
@@ -72,7 +71,12 @@ const APIC_LVT_PERF: usize = 0x340;
 /// Bit to mask an LVT entry (prevent delivery).
 const LVT_MASK: u32 = 1 << 16;
 
-/// IST stack size: 8 KiB.
+/// IST stack size: 8 KiB. The stacks carry the NMI path (the watchdog backtrace in
+/// `idt::ipi_nmi_backtrace_handler`, or a hardware NMI's fatal diagnostics) on IST2 and the
+/// `#DF` / `#MC` fatal path on IST1. A static call-graph bound of those paths (frame sizes
+/// from the disassembly, every indirect formatting call taken as its deepest candidate)
+/// stays under 3.7 KiB in both the debug and the release build, so 8 KiB holds them with
+/// more than twice that depth to spare.
 const IST_STACK_SIZE: usize = 8192;
 
 /// BSP IST stacks, in BSS. The BSP installs these at Phase-5 init.
@@ -396,8 +400,13 @@ unsafe fn apic_send_icr(dest: u32, cmd: u32)
     }
 }
 
+/// Wall-clock budget for the ICR delivery-status bit to clear, in microseconds. A healthy
+/// local APIC clears it within microseconds, so the budget only separates a stuck APIC from
+/// a slow one: a tuning value that bounds no capacity.
+const ICR_IDLE_BUDGET_US: u64 = 1_000_000;
+
 /// Spin until the ICR delivery status bit clears (IPI accepted by hardware); a no-op in x2APIC
-/// mode, which has no delivery-status bit. Iteration bound and fatal policy:
+/// mode, which has no delivery-status bit. Time bound and fatal policy:
 /// core/kernel/docs/scheduling-internals.md § `wait_icr_idle` discipline.
 #[cfg(not(test))]
 unsafe fn wait_icr_idle()
@@ -406,15 +415,14 @@ unsafe fn wait_icr_idle()
     {
         return;
     }
-    let mut n = 0u64;
-    while apic_read(APIC_ICR_LOW) & ICR_PENDING != 0
+    let idle = crate::bounded_wait::spin_until(
+        || apic_read(APIC_ICR_LOW) & ICR_PENDING == 0,
+        super::timer::elapsed_us,
+        ICR_IDLE_BUDGET_US,
+    );
+    if !idle
     {
-        core::hint::spin_loop();
-        n += 1;
-        if n >= 1_000_000
-        {
-            crate::fatal("wait_icr_idle: APIC ICR delivery-status stuck after 1M iters");
-        }
+        crate::fatal("wait_icr_idle: APIC ICR delivery-status stuck for 1 s");
     }
 }
 
@@ -525,7 +533,9 @@ pub struct IpiWaitCtx<'a>
 #[cfg(not(test))]
 pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
 {
-    let start = super::timer::elapsed_us().unwrap_or(0);
+    // A clock-less wait (`elapsed_us` not yet calibrated) falls back to the spin-count
+    // estimate (`bounded_wait::WaitTimer`), so it is bounded too.
+    let mut timer = crate::bounded_wait::WaitTimer::start(super::timer::elapsed_us());
     let mut resent = false;
     let mut nmi_sent = false;
     loop
@@ -535,12 +545,7 @@ pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
             return;
         }
         core::hint::spin_loop();
-        let Some(now) = super::timer::elapsed_us()
-        else
-        {
-            continue;
-        };
-        let elapsed_ms = now.saturating_sub(start) / 1_000;
+        let elapsed_ms = timer.elapsed(super::timer::elapsed_us()) / 1_000;
         if elapsed_ms >= 5_000
         {
             crate::kprintln!(
@@ -737,12 +742,15 @@ pub fn mask(_irq: u32) {}
 
 /// Unmask (enable delivery of) GSI `irq` at the I/O APIC. Called by `SYS_IRQ_ACK`
 /// (`syscall::hw::sys_irq_ack`) to re-enable delivery after the driver has serviced the
-/// interrupt. The GSI is expected to have been routed by [`route_device_irq`]
-/// (`SYS_IRQ_REGISTER`); `sys_irq_ack` does not check this, and an unrouted entry still holds
-/// the vector-0 value [`super::ioapic::init`] programmed.
+/// interrupt. A GSI with no device vector (never routed, or its route cleared) is left
+/// masked: its redirection entry names no vector this kernel dispatches.
 #[cfg(not(test))]
 pub fn unmask(irq: u32)
 {
+    if super::ioapic::vector_of(irq).is_none()
+    {
+        return;
+    }
     // SAFETY: IOAPIC is initialised in Phase 5.
     unsafe { super::ioapic::unmask(irq) }
 }
@@ -751,32 +759,82 @@ pub fn unmask(irq: u32)
 #[cfg(test)]
 pub fn unmask(_irq: u32) {}
 
-/// Route device IRQ (GSI) `irq` to the BSP's local APIC, leaving the line
-/// masked at the I/O APIC. The driver unmasks via `SYS_IRQ_ACK` once it has
-/// registered a handler.
+/// Route device IRQ (GSI) `irq`, leaving the line masked at the I/O APIC: assign it a
+/// device vector ([`super::ioapic::assign_vector`]) and a destination CPU, and program its
+/// redirection entry. The driver unmasks via `SYS_IRQ_ACK` once it has registered a
+/// handler. A GSI routed again keeps its vector and is given the next destination.
 ///
-/// The vector is [`super::ioapic::device_vector`]'s: only GSIs 0-22 (vectors 33-55) have IDT
-/// gates. `sys_irq_register` admits only `MIN_IRQ_ID..=MAX_IRQ_ID`, every one of which has a
-/// gate; a GSI without one is left unrouted rather than programmed with an ungated, reserved,
-/// or wrapped vector.
+/// The destination is the next CPU in turn (`irq::next_target_cpu`) whose APIC id fits the
+/// redirection entry's 8-bit physical destination field (module doc of
+/// [`super::ioapic`] § Destination).
+///
+/// # Errors
+/// `NoSuchLine` when no discovered I/O APIC implements the GSI; `Exhausted` when every
+/// device vector is assigned, or no CPU has an APIC id an I/O APIC can name.
 ///
 /// # Safety
-/// Must be called after Phase 5 init (IOAPIC initialised) with a valid GSI.
+/// Must be called after Phase 5 init (IOAPIC initialised), under `irq`'s routing lock.
 #[cfg(not(test))]
-pub unsafe fn route_device_irq(irq: u32)
+pub unsafe fn route_device_irq(irq: u32) -> Result<(), crate::irq::RouteError>
 {
-    let Some(vector) = super::ioapic::device_vector(irq)
-    else
+    if !super::ioapic::owns(irq)
     {
-        return;
-    };
-    // SAFETY: caller guarantees a valid GSI and post-Phase-5 IOAPIC. route()
-    // installs the redirection entry masked; the driver unmasks via SYS_IRQ_ACK.
-    unsafe {
-        super::ioapic::route(irq, vector);
+        return Err(crate::irq::RouteError::NoSuchLine);
     }
+    let destination = crate::irq::next_target_cpu(|cpu| {
+        // SAFETY: `next_target_cpu` passes only indices below CPU_COUNT; the APIC id
+        // slab is read-only after boot.
+        unsafe { crate::percpu::apic_id_for(cpu) <= 0xFF }
+    })
+    .ok_or(crate::irq::RouteError::Exhausted)?;
+    // SAFETY: as above; the id was checked to fit eight bits.
+    let apic_id = unsafe { crate::percpu::apic_id_for(destination) };
+    let apic_id = u8::try_from(apic_id).map_err(|_| crate::irq::RouteError::Exhausted)?;
+    let vector = super::ioapic::assign_vector(irq).ok_or(crate::irq::RouteError::Exhausted)?;
+    // SAFETY: post-Phase-5 IOAPIC; route() installs the redirection entry masked, after
+    // the vector assignment is published, and the driver unmasks via SYS_IRQ_ACK.
+    unsafe {
+        super::ioapic::route(irq, vector, apic_id);
+    }
+    Ok(())
 }
 
 /// No-op test stub.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the non-test item.
 #[cfg(test)]
-pub unsafe fn route_device_irq(_irq: u32) {}
+pub unsafe fn route_device_irq(_irq: u32) -> Result<(), crate::irq::RouteError>
+{
+    Ok(())
+}
+
+/// Release GSI `irq`'s route: mask its redirection entry, then free its device vector. An
+/// interrupt already latched on the vector reaches `idt::irq_dispatch`, finds no GSI, and is
+/// dropped.
+///
+/// # Safety
+/// Must be called after Phase 5 init, under `irq`'s routing lock.
+#[cfg(not(test))]
+pub unsafe fn unroute_device_irq(irq: u32)
+{
+    // SAFETY: post-Phase-5 IOAPIC.
+    unsafe { super::ioapic::mask(irq) };
+    super::ioapic::release_vector(irq);
+}
+
+/// No-op test stub.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the non-test item.
+#[cfg(test)]
+pub unsafe fn unroute_device_irq(_irq: u32) {}
+
+/// Number of interrupt lines the routing table covers: one past the highest GSI the
+/// discovered I/O APICs implement (`ioapic::gsi_limit`). Valid after [`init`].
+#[cfg(not(test))]
+#[must_use]
+pub fn irq_line_count() -> u32
+{
+    super::ioapic::gsi_limit()
+}

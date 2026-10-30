@@ -180,7 +180,7 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637); the Phase 7 bo
 | `INIT_STACK_PHYS`, `INIT_INFO_RESERVE_ORDER` | `core/kernel/src/cap/mod.rs` | `INIT_STACK_PAGES`, `INIT_INFO_MAX_PAGES` | ABI width (init protocol) | 32 B | correct as is | None |
 | `POOL_SEED_PAGES` | `core/kernel/src/cap/mod.rs` | 64 | current peak plus headroom (measured 6 to 7) | 256 KiB | needs a design | See `kernel_pt_pool` in the memory-management section |
 | Phase 7 `MAX_ACPI_REGIONS` | `core/kernel/src/cap/mod.rs` | 8 | current peak plus headroom | none | raise | Truncates with a log; raise to the boot-protocol bound |
-| `ROOT_IRQ_COUNT` | `core/kernel/src/cap/mod.rs` | arch `ROOT_IRQ_COUNT` | hardware spec (IOAPIC GSI and PLIC id spaces) | none | correct as is | None |
+| `ROOT_IRQ_COUNT` | `core/kernel/src/cap/mod.rs` | arch `ROOT_IRQ_COUNT` | hardware spec (the GSIs of `MAX_IOAPICS` I/O APICs; the PLIC id space) | none | correct as is | None |
 | `RECLAIM_ARRAY_MAX_SPAN_PAGES` | `core/kernel/src/cap/mod.rs` | from `MAX_RECLAIM_RANGES` | ABI width (boot protocol) | none | correct as is | None |
 | `MAX_IOPORT_BINDINGS` (`IoPortBindings.records`) | `core/kernel/src/cap/ioport_bindings.rs` | 16 per thread | unknown | 256 B per bound thread | raise | Spill to a caller-funded page |
 | `TABLE_BYTES` (`IoPortBindings` with `bitmap[IOPB_SIZE]`) | `core/kernel/src/cap/ioport_bindings.rs` | about 8.4 KiB | hardware spec (x86 IOPB) | one SEED allocation per bound thread | needs a design | About 40 bound threads exhaust SEED; fund from the caller |
@@ -247,39 +247,46 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 
 ### Kernel: interrupts and architecture
 
-Tracked by [#639](https://github.com/kottlerg/seraph/issues/639).
+The entries left open are tracked by the Issue each recommendation names: the vector space by
+[#325](https://github.com/kottlerg/seraph/issues/325), the per-CPU slabs by
+[#636](https://github.com/kottlerg/seraph/issues/636), the vector-register save area by
+[#658](https://github.com/kottlerg/seraph/issues/658), and `IOAPICS` by the boot section's Issue.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `MAX_IRQ` (`IRQ_TABLE`) | `core/kernel/src/irq.rs` | 256 | hardware spec of the targeted controllers | 4 KiB BSS | raise | Real PLICs have 1023 sources; size from the discovered maximum (#325) |
-| `MAX_IRQ_ID < MAX_IRQ` assert | `core/kernel/src/irq.rs` | compile time | hardware spec | none | correct as is | Keep |
-| `IrqRoute.notification` | `core/kernel/src/irq.rs` | one per line | unknown | none | needs a design | Shared lines are unsupported (#325) |
-| x86_64 `DEVICE_GSI_COUNT`, `MAX_IRQ_ID` | `core/kernel/src/arch/x86_64/ioapic.rs`, `mod.rs` | 23 GSIs / 22 | encoding artefact (vector = 33 + GSI, one stub each) | 23 IDT stubs | needs a design | Only the first IOAPIC is usable; vector allocator (#325) |
-| x86_64 `ROOT_IRQ_COUNT` | `core/kernel/src/arch/x86_64/mod.rs` | 256 | encoding artefact (root cap width, matches `MAX_IRQ`) | none | correct as is | None |
-| `DEVICE_VECTOR_BASE` and GSI-count assert | `core/kernel/src/arch/x86_64/idt.rs` | 33, 23 | encoding artefact | none | correct as is | Changes with the vector allocator |
+| IRQ routing table (`irq::init_table`) | `core/kernel/src/irq.rs` | one entry per line the discovered controllers implement (`interrupts::irq_line_count`) | hardware (the discovered I/O APICs' GSIs; the PLIC's `riscv,ndev`) | 24 B per line from the buddy at Phase 5 | correct as is | None |
+| `unregister_notification` walk | `core/kernel/src/irq.rs` | the routed lines (`LineSet`) | provable unreachability (scales with the registrations) | none | correct as is | None |
+| `IrqRoute.notification` | `core/kernel/src/irq.rs` | one per line | single owner per wired line: devmgr delegates no shared `INTx` line, and shared sources get message-signaled interrupts (#325) | none | correct as is | None |
+| x86_64 `DEVICE_VECTOR_COUNT` (`VECTOR_GSI`) | `core/kernel/src/arch/x86_64/ioapic.rs` | 217 device vectors (33-249), one generated stub each | hardware spec (x86 vector space less the exception, timer, IPI and spurious vectors), on one destination's vector space | 868 B BSS, 217 stubs of 16 B | needs a design | GSIs routed at once stop at 217; per-CPU vector spaces belong with the MSI work (#325) |
+| x86_64 `ROOT_IRQ_COUNT`, `MAX_IRQ_ID` | `core/kernel/src/arch/x86_64/mod.rs` | `MAX_IOAPICS` x `IOAPIC_MAX_PINS` = 2048 / 2047 | ABI width (boot protocol) times hardware spec (8-bit redirection-entry count) | none | correct as is | Follows `MAX_IOAPICS`; a GSI above it is logged at boot |
+| `IOAPIC_MAX_PINS` | `core/kernel/src/arch/x86_64/ioapic.rs` | 256 | hardware spec (I/O APIC version register) | none | correct as is | None |
+| `DEVICE_VECTOR_BASE`, `DEVICE_VECTOR_LAST` and vector-range assert | `core/kernel/src/arch/x86_64/ioapic.rs`, `idt.rs` | 33, 249 | hardware spec (between the timer and IPI vectors) | none | correct as is | None |
 | `IOAPICS` | `core/kernel/src/arch/x86_64/ioapic.rs` | `MAX_IOAPICS` = 8 | ABI width (boot protocol) | 128 B BSS | raise | See the boot section |
 | `IDT` | `core/kernel/src/arch/x86_64/idt.rs` | 256 entries | hardware spec (x86 vector space) | 4 KiB BSS | correct as is | None |
 | `GDT`, AP GDTs | `core/kernel/src/arch/x86_64/gdt.rs` | 7 descriptors | hardware spec (fixed descriptor layout) | 56 B per CPU | correct as is | None |
 | `IOPB_SIZE` (`TssWithIopb.iopb`) | `core/kernel/src/arch/x86_64/gdt.rs` | 8192 B | hardware spec (65536 ports / 8) | about 8.3 KiB per CPU | correct as is | None |
 | TSS slab assert | `core/kernel/src/arch/x86_64/gdt.rs` | `MAX_CPUS` x TSS within `2^MAX_ORDER` pages | BSS budget (one-block slab) | none | needs a design | Follows the per-CPU slab design (#636) |
-| `IST_STACK_SIZE` (`BSP_IST_STACKS`) | `core/kernel/src/arch/x86_64/interrupts.rs` | 8 KiB x 2 | stack budget for the fixed NMI, #DF and #MC paths (depth unaudited) | 16 KiB BSS | needs a design | Audit the NMI backtrace path's depth (#639) |
+| `IST_STACK_SIZE` (`BSP_IST_STACKS`) | `core/kernel/src/arch/x86_64/interrupts.rs` | 8 KiB x 2 | stack budget for the fixed NMI, #DF and #MC paths, audited: worst case under 3.7 KiB, debug and release builds | 16 KiB BSS | correct as is | None |
 | `AP_IST_PAIR_SIZE` | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | 16384 | encoding artefact (two IST stacks) | `cpu_count` x 16 KiB | correct as is | Derive as `2 * IST_STACK_SIZE` |
 | AP IST slab assert | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | 512 x 16 KiB = 8 MiB, at the limit | BSS budget (one-block slab) | none | needs a design | The binding `MAX_CPUS` constraint (#636) |
 | Trampoline template and SIPI widths | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | page-sized; PML4 below 4 GiB | hardware spec (real-mode SIPI, 32-bit CR3 load) | one page | correct as is | None |
-| `wait_icr_idle` | `core/kernel/src/arch/x86_64/interrupts.rs` | 1 000 000 iterations | unknown (spin count) | none | needs a design | Time-based bound |
-| `wait_for_ack` ladder | `core/kernel/src/arch/*/interrupts.rs` | 250 / 750 / 5000 ms | tuning (time-based) | none | needs a design | Spins forever if `elapsed_us()` is `None`; add a fallback bound |
+| `wait_icr_idle` (`ICR_IDLE_BUDGET_US`) | `core/kernel/src/arch/x86_64/interrupts.rs` | 1 s | tuning (time-based) | none | correct as is | None |
+| `wait_for_ack` ladder | `core/kernel/src/arch/*/interrupts.rs` | 250 / 750 / 5000 ms, on the spin-count estimate before the timer is calibrated | tuning (time-based) | none | correct as is | None |
+| `MAX_SPINS_PER_UNIT` | `core/kernel/src/bounded_wait.rs` | 10 000 spins per us | provable unreachability (a 10 GHz clock), so the fallback never times out early | none | correct as is | None |
 | `start_ap` delays | `core/kernel/src/arch/x86_64/interrupts.rs` | 10 ms, 200 us | hardware spec (Intel SDM INIT-SIPI-SIPI) | none | correct as is | None |
 | `delay_us` pre-calibration spin | `core/kernel/src/arch/x86_64/timer.rs` | `us * 200` iterations | tuning (early boot only) | none | correct as is | None |
 | `PIT_CALIBRATION_MS` | `core/kernel/src/arch/x86_64/timer.rs` | 10 ms | hardware spec (PIT) | none | correct as is | None |
-| PIT output poll in `calibrate_apic_timer` | `core/kernel/src/arch/x86_64/timer.rs` | unbounded | unknown | none | needs a design | Bound it and fatal on PIT-less platforms |
+| `PIT_POLL_BUDGET_TSC_TICKS` | `core/kernel/src/arch/x86_64/timer.rs` | 2^32 TSC ticks (0.43 s at 10 GHz), then fatal | tuning (bounds no capacity) | none | correct as is | None |
 | `rdseed_u64`, `rdrand_u64` retry | `core/kernel/src/arch/x86_64/entropy.rs` | 32 | tolerance (above the Intel DRNG RDRAND guidance of 10; RDSEED has no fixed count) | none | correct as is | None |
 | `enable_tagged_tlb` | `core/kernel/src/arch/x86_64/paging.rs` | 4096 | hardware spec (12-bit PCID) | none | correct as is | None |
 | `TrapFrame::arg` | `core/kernel/src/arch/*/trap_frame.rs` | 6 arguments | ABI width (syscall register convention) | none | correct as is | None |
-| riscv64 `MAX_IRQ_ID`, `PLIC_NUM_SOURCES` | `core/kernel/src/arch/riscv64/mod.rs`, `interrupts.rs` | 127 | unknown (QEMU `virt`) | none | raise | The PLIC allows 1023; use the discovered `riscv,ndev` |
+| riscv64 `MAX_IRQ_ID`, `PLIC_MAX_SOURCES` | `core/kernel/src/arch/riscv64/mod.rs`, `interrupts.rs` | 1023 | hardware spec (PLIC) | none | correct as is | None |
+| riscv64 `plic_ndev` | `core/kernel/src/arch/riscv64/platform.rs` | the firmware's `riscv,ndev`, clamped to 1023; 1023 when unreported | hardware (discovered) | none | correct as is | None |
+| riscv64 `SOURCE_TARGET` | `core/kernel/src/arch/riscv64/interrupts.rs` | 1024 entries | hardware spec (PLIC id space) | 4 KiB BSS | correct as is | None |
 | riscv64 `ROOT_IRQ_COUNT` | `core/kernel/src/arch/riscv64/mod.rs` | 1024 | hardware spec (PLIC id space) | none | correct as is | None |
-| riscv64 `DEFAULT_PLIC_SIZE` | `core/kernel/src/arch/riscv64/platform.rs` | 4 MiB | unknown | none | raise | Hart ids at or above 256 fatal; default to the 64 MiB spec window |
-| riscv64 BSP-only device IRQ routing | `core/kernel/src/arch/riscv64/interrupts.rs` | 1 hart | unknown | none | needs a design | One hart takes every device IRQ (#325) |
-| riscv64 `MAX_VLENB` | `core/kernel/src/arch/riscv64/fpu.rs` | 64 (VLEN 512) | BSS budget (one 4 KiB save page per thread) | one page per thread | make pay-as-you-go | Boot halts at VLEN above 512; size the save area from `vlenb` |
+| riscv64 `DEFAULT_PLIC_SIZE` | `core/kernel/src/arch/riscv64/platform.rs` | 64 MiB | hardware spec (PLIC register map, 15 872 contexts) | none | correct as is | None |
+| device IRQ destination (`irq::next_target_cpu`) | `core/kernel/src/irq.rs` | one CPU per line, the CPUs in turn at route time; x86_64 only APIC ids up to 255 | hardware spec (one PLIC context per source; the 8-bit physical destination of an I/O APIC entry without interrupt remapping) | none | correct as is | None |
+| riscv64 `MAX_VLENB` | `core/kernel/src/arch/riscv64/fpu.rs` | 64 (VLEN 512) | BSS budget (one 4 KiB save page per thread) | one page per thread | make pay-as-you-go | Boot halts at VLEN above 512; size the save area from `vlenb` (#658) |
 | riscv64 ASID mask | `core/kernel/src/arch/riscv64/cpu.rs` | 16 bits | hardware spec (`satp`) | none | correct as is | Clipped by `TAG_CAP` |
 | riscv64 `sbi_hart_mask` window | `core/kernel/src/arch/riscv64/interrupts.rs` | 64 harts per call | hardware spec (SBI `hart_mask`) | none | correct as is | None |
 | riscv64 `NAPOT_64K_PAGES` | `core/kernel/src/arch/riscv64/paging.rs` | 16 | hardware spec (Svnapot) | none | correct as is | None |

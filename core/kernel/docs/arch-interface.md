@@ -419,10 +419,22 @@ pub fn acknowledge(irq: u32);
 pub fn mask(irq: u32);
 pub fn unmask(irq: u32);
 
-/// Route a device IRQ to the BSP and leave it masked at the controller; the
-/// driver unmasks via `SYS_IRQ_ACK`. x86-64 installs an IOAPIC redirection
-/// entry; RISC-V enables then masks the PLIC source.
-pub unsafe fn route_device_irq(irq: u32);
+/// Route a device IRQ to a destination CPU and leave it masked at the
+/// controller; the driver unmasks via `SYS_IRQ_ACK`. x86-64 assigns the GSI a
+/// device IDT vector and installs its IOAPIC redirection entry; RISC-V records
+/// the source's target hart. Fails with `irq::RouteError::NoSuchLine` for a line
+/// no discovered controller implements, `Exhausted` when the controller has no
+/// delivery resource left (x86-64: every device vector assigned). Called by
+/// `irq::register`, under its routing lock.
+pub unsafe fn route_device_irq(irq: u32) -> Result<(), irq::RouteError>;
+/// Release a routed line: mask it and free what `route_device_irq` assigned (the
+/// x86-64 device vector; the RISC-V target hart). Called by `irq` when a route is
+/// cleared, under its routing lock.
+pub unsafe fn unroute_device_irq(irq: u32);
+/// Number of interrupt lines the discovered controllers implement, which sizes
+/// the `irq` routing table at Phase 5: one past the highest I/O APIC GSI on
+/// x86-64 (capped at `ROOT_IRQ_COUNT`), the PLIC's `riscv,ndev` plus one on RISC-V.
+pub fn irq_line_count() -> u32;
 
 /// Send a TLB-shootdown or wakeup IPI to the CPU with the given hardware id
 /// (APIC id on x86-64; hart id on RISC-V).
@@ -439,10 +451,20 @@ The `wait_for_ack` phases and their windows are specified in
 [scheduling-internals.md](scheduling-internals.md) § IPI Watchdog Ladder.
 
 External-IRQ routing is reached through the `route_device_irq` surface function above; the
-underlying controller programming (`ioapic::route` on x86-64; the PLIC enable path on
-RISC-V) remains arch-private. Per-CPU table allocation that exists only on x86-64 (GDT/TSS,
-AP IST stacks, NMI-backtrace storage) is reached through the `init_ap_percpu_storage`
-module-level surface function (a no-op on RISC-V), not a `cfg(target_arch)`-gated call.
+underlying controller programming (`ioapic::route` and the device-vector table on x86-64; the
+PLIC enable path on RISC-V) remains arch-private.
+
+**Delivery destination.** Each routed line is delivered to one CPU, chosen when the line is
+routed: the boot CPUs in turn, by logical index (`irq::next_target_cpu`), so device
+interrupts spread over the CPUs rather than all landing on the boot CPU. On x86-64 the turn
+skips CPUs whose APIC id exceeds `0xFF`, which an I/O APIC redirection entry cannot name in
+physical destination mode (the kernel programs no interrupt remapping). On RISC-V the line's
+PLIC source is enabled on the chosen hart's S-mode context only, so exactly one hart takes
+and claims it. A line routed again (a `SYS_IRQ_REGISTER` replace) takes the next CPU in turn.
+
+Per-CPU table allocation that exists only on x86-64 (GDT/TSS, AP IST stacks, NMI-backtrace
+storage) is reached through the `init_ap_percpu_storage` module-level surface function (a
+no-op on RISC-V), not a `cfg(target_arch)`-gated call.
 
 ---
 
@@ -710,16 +732,18 @@ pub const ARCH_NAME: &str;
 /// (`EM_X86_64` / `EM_RISCV`); `mm::init_reloc` checks relocations against it.
 pub const EXPECTED_ELF_MACHINE: u16;
 
-/// Routable external-interrupt id range (0..=22 GSIs on x86-64, the GSIs with an
-/// IDT gate; PLIC sources 1..=127 on RISC-V). `SYS_IRQ_REGISTER` refuses an id
-/// outside it with `InvalidArgument`.
+/// External-interrupt id range (GSIs 0..=2047 on x86-64; PLIC sources 1..=1023
+/// on RISC-V, the specification's). `SYS_IRQ_REGISTER` refuses an id outside it
+/// with `InvalidArgument`, and within it an id no discovered controller
+/// implements (`irq_line_count`).
 pub const MIN_IRQ_ID: u32;
 pub const MAX_IRQ_ID: u32;
 
-/// Width of the root `Interrupt` range capability minted at Phase 7 (256 on
-/// x86-64; 1024 on RISC-V, the PLIC id space). On both the cap spans ids
-/// above `MAX_IRQ_ID`; a split names them, `SYS_IRQ_REGISTER` refuses them, and
-/// the Interrupt teardown leaves their routing untouched.
+/// Width of the root `Interrupt` range capability minted at Phase 7, the
+/// interrupt id space (2048 on x86-64: `MAX_IOAPICS` I/O APICs of 256 pins;
+/// 1024 on RISC-V, the PLIC id space). The discovered controllers implement
+/// fewer; a split names the other ids, `SYS_IRQ_REGISTER` refuses them, and the
+/// Interrupt teardown leaves their routing untouched.
 pub const ROOT_IRQ_COUNT: u32;
 
 /// Whether the architecture has an I/O port space — `IoPort` capabilities and
@@ -879,4 +903,5 @@ equally clearly.
 [Kernel Initialization Sequence](initialization.md), [Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
+[Device Management](../../../docs/device-management.md),
 [Platform Requirements](../../../docs/platform-requirements.md)

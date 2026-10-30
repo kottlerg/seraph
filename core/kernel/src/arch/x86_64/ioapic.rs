@@ -36,29 +36,42 @@
 //! before any IRQ is routed and takes no lock.
 //!
 //! # Vector assignment
-//! GSI `n` is assigned to IDT vector `DEVICE_VECTOR_BASE + n` (33 + n), which keeps the mapping
-//! trivial and avoids a vector allocator. Only GSIs 0-22 (vectors 33-55, `DEVICE_GSI_COUNT`)
-//! have IDT stubs and are dispatched (`idt::irq_dispatch`); [`device_vector`] refuses every
-//! other GSI, and `SYS_IRQ_REGISTER` refuses an id above the arch `MAX_IRQ_ID` before routing.
+//! A GSI is assigned an IDT vector when it is routed ([`assign_vector`], from
+//! `interrupts::route_device_irq`) and releases it when its route is cleared
+//! ([`release_vector`]). The device vectors are `DEVICE_VECTOR_BASE..=DEVICE_VECTOR_LAST`
+//! (33-249), between the timer vector and the IPI vectors; `idt::init` installs a generated
+//! stub on every one, and `idt::irq_dispatch` maps the vector back to its GSI through
+//! [`gsi_for_vector`]. Any GSI the discovered I/O APICs cover can be routed, up to
+//! [`DEVICE_VECTOR_COUNT`] of them at once; a route past that is refused
+//! (`irq::RouteError::Exhausted`). The vector table is written only by the route changes,
+//! which `irq` serialises under its routing lock, and read lock-free by the dispatch.
+//!
+//! # Destination
+//! Each route names one destination CPU, chosen at route time by `irq::next_target_cpu`
+//! among the CPUs whose APIC id fits the 8-bit physical destination field of a redirection
+//! entry (`interrupts::route_device_irq`). An I/O APIC cannot name a CPU with a wider
+//! x2APIC id without interrupt remapping, which the kernel does not program.
 //!
 //! # Limitations / deferred work
 //!
-//! - **No MSI/MSI-X support.** Required for modern `PCIe` devices.
+//! - **No MSI/MSI-X support.** Required for modern `PCIe` devices (#325).
 //!
 //! - **Edge-triggered, active-high only.** Level-triggered and active-low sources (PCI `INTx`
 //!   lines, MADT interrupt-source overrides) are not handled; no trigger/polarity information
 //!   reaches the kernel (`InterruptObject` carries only `start` and `count`).
 //!
 //! # Modification notes
-//! - Every GSI is routed by `interrupts::route_device_irq` (from `SYS_IRQ_REGISTER`) and
-//!   unmasked by `interrupts::unmask` (from `SYS_IRQ_ACK`); serving a GSI above 22 needs an
-//!   IDT stub, a wider device arm in `idt::irq_dispatch`, and a larger `DEVICE_GSI_COUNT`.
+//! - Every GSI is routed by `interrupts::route_device_irq` (from `SYS_IRQ_REGISTER`, through
+//!   `irq::register`), released by `interrupts::unroute_device_irq`, and unmasked by
+//!   `interrupts::unmask` (from `SYS_IRQ_ACK`).
 //! - To support level-triggered IRQs: set bit 15 (level-sensitive) and
 //!   bit 13 (active-low polarity) in the redirection entry low dword.
 
 // cast_possible_truncation: u64→usize APIC MMIO address arithmetic; bounded by APIC layout.
 // cast_lossless: u8→u32 vector widening casts.
 #![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
+
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use boot_protocol::{IoApicEntry, MAX_IOAPICS};
 
@@ -74,28 +87,117 @@ const IOAPICID: u32 = 0x00;
 /// I/O APIC version register (bits [23:16] = max redirection entry index).
 const IOAPICVER: u32 = 0x01;
 
-/// Base IDT vector for device IRQs.
-/// GSI `n` maps to vector `DEVICE_VECTOR_BASE + n`.
+/// First IDT vector assigned to device IRQs, the one after the timer vector.
 pub const DEVICE_VECTOR_BASE: u8 = 33;
 
-/// Number of GSIs with an IDT gate: GSIs `0..DEVICE_GSI_COUNT` map to vectors
-/// `DEVICE_VECTOR_BASE..DEVICE_VECTOR_BASE + DEVICE_GSI_COUNT` (33-55), the
-/// `device_irq_stub!` gates `idt::init` installs. The arch `MAX_IRQ_ID` is the last of them.
-pub const DEVICE_GSI_COUNT: u32 = 23;
+/// Last IDT vector assigned to device IRQs, the one below the IPI vectors (250 and 251;
+/// the spurious vector is 255).
+pub const DEVICE_VECTOR_LAST: u8 = 249;
 
-/// IDT vector GSI `gsi` is routed to, or `None` for a GSI with no gate
-/// (`gsi >= DEVICE_GSI_COUNT`), which no vector may be programmed for: the vectors
-/// above the device range are ungated or belong to the IPIs and the spurious vector.
-#[must_use]
-pub fn device_vector(gsi: u32) -> Option<u8>
+/// Number of device vectors, and so the number of GSIs routed at once: 217.
+pub const DEVICE_VECTOR_COUNT: usize = (DEVICE_VECTOR_LAST - DEVICE_VECTOR_BASE) as usize + 1;
+
+/// Pins an I/O APIC can have: its version register reports the last redirection entry in
+/// an 8-bit field.
+pub const IOAPIC_MAX_PINS: u32 = 256;
+
+/// GSI each device vector is assigned to, plus one; 0 for a free vector, so the zeroed
+/// table is all free. Index `v - DEVICE_VECTOR_BASE` for vector `v`. Written only by
+/// [`assign_vector`] and [`release_vector`], which `irq` serialises under its routing lock;
+/// read lock-free by [`gsi_for_vector`] in interrupt context.
+#[cfg(not(test))]
+static VECTOR_GSI: [AtomicU32; DEVICE_VECTOR_COUNT] =
+    [const { AtomicU32::new(0) }; DEVICE_VECTOR_COUNT];
+
+/// The device vector at `index` of a vector table.
+fn vector_at(index: usize) -> Option<u8>
 {
-    if gsi >= DEVICE_GSI_COUNT
-    {
-        return None;
-    }
-    u8::try_from(gsi)
+    u8::try_from(index)
         .ok()
         .and_then(|offset| DEVICE_VECTOR_BASE.checked_add(offset))
+}
+
+/// The vector `table` assigns to `gsi`, if any.
+fn find_vector(table: &[AtomicU32], gsi: u32) -> Option<u8>
+{
+    let tag = gsi.checked_add(1)?;
+    let index = table
+        .iter()
+        .position(|entry| entry.load(Ordering::Relaxed) == tag)?;
+    vector_at(index)
+}
+
+/// The vector `table` assigns to `gsi`: its existing one, else the lowest free vector,
+/// now assigned to it. `None` when every vector is assigned (or `gsi` is `u32::MAX`, which
+/// no I/O APIC covers).
+fn assign_vector_in(table: &[AtomicU32], gsi: u32) -> Option<u8>
+{
+    if let Some(vector) = find_vector(table, gsi)
+    {
+        return Some(vector);
+    }
+    let tag = gsi.checked_add(1)?;
+    let index = table
+        .iter()
+        .position(|entry| entry.load(Ordering::Relaxed) == 0)?;
+    // Release: a dispatch that reads the tag (Acquire) once the redirection entry that
+    // names this vector fires sees a complete assignment.
+    table[index].store(tag, Ordering::Release);
+    vector_at(index)
+}
+
+/// Free every vector `table` assigns to `gsi`.
+fn release_vector_in(table: &[AtomicU32], gsi: u32)
+{
+    let Some(tag) = gsi.checked_add(1)
+    else
+    {
+        return;
+    };
+    for entry in table
+    {
+        if entry.load(Ordering::Relaxed) == tag
+        {
+            entry.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Assign `gsi` a device vector (its existing one if it has one). `None` when every device
+/// vector is assigned. Called under `irq`'s routing lock.
+#[cfg(not(test))]
+#[must_use]
+pub fn assign_vector(gsi: u32) -> Option<u8>
+{
+    assign_vector_in(&VECTOR_GSI, gsi)
+}
+
+/// The device vector assigned to `gsi`, if it is routed.
+#[cfg(not(test))]
+#[must_use]
+pub fn vector_of(gsi: u32) -> Option<u8>
+{
+    find_vector(&VECTOR_GSI, gsi)
+}
+
+/// Free `gsi`'s device vector. Called under `irq`'s routing lock, after the redirection
+/// entry is masked.
+#[cfg(not(test))]
+pub fn release_vector(gsi: u32)
+{
+    release_vector_in(&VECTOR_GSI, gsi);
+}
+
+/// The GSI device vector `vector` is assigned to, or `None` for a free vector or one
+/// outside the device range. Read in interrupt context (`idt::irq_dispatch`): an interrupt
+/// latched before its vector was released finds `None` and is dropped.
+#[cfg(not(test))]
+#[must_use]
+pub fn gsi_for_vector(vector: u8) -> Option<u32>
+{
+    let index = vector.checked_sub(DEVICE_VECTOR_BASE)? as usize;
+    let tag = VECTOR_GSI.get(index)?.load(Ordering::Acquire);
+    tag.checked_sub(1)
 }
 
 /// Mask bit in the low dword of a redirection entry (bit 16).
@@ -136,6 +238,44 @@ static mut IOAPIC_COUNT: usize = 0;
 /// acquired while it is held.
 static IOAPIC_LOCK: crate::sync::Spinlock = crate::sync::Spinlock::new();
 
+/// One past the highest GSI the I/O APICs in `states` cover, capped at `ceiling`: the
+/// routing table's line count.
+fn gsi_limit_of(states: &[IoApicState], ceiling: u32) -> u32
+{
+    states
+        .iter()
+        .map(|s| s.gsi_base.saturating_add(s.pin_count))
+        .max()
+        .unwrap_or(0)
+        .min(ceiling)
+}
+
+/// One past the highest GSI the discovered I/O APICs cover, capped at the Interrupt id
+/// space (`super::ROOT_IRQ_COUNT`): the number of lines the routing table needs. Zero
+/// before [`init`].
+#[cfg(not(test))]
+#[must_use]
+pub fn gsi_limit() -> u32
+{
+    // SAFETY: IOAPIC_COUNT and IOAPICS are written exactly once during init,
+    // before any reader; entries [0..count) are initialized.
+    let states = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(IOAPICS).cast::<IoApicState>(),
+            IOAPIC_COUNT,
+        )
+    };
+    gsi_limit_of(states, super::ROOT_IRQ_COUNT)
+}
+
+/// Whether a discovered I/O APIC implements `gsi`.
+#[cfg(not(test))]
+#[must_use]
+pub fn owns(gsi: u32) -> bool
+{
+    lookup_ioapic_for_gsi(gsi).is_some()
+}
+
 /// Locate the IOAPIC owning `gsi`. Returns `(phys_base, intra_ioapic_pin)`.
 fn lookup_ioapic_for_gsi(gsi: u32) -> Option<(u64, u32)>
 {
@@ -147,7 +287,7 @@ fn lookup_ioapic_for_gsi(gsi: u32) -> Option<(u64, u32)>
     {
         // SAFETY: i < count ≤ MAX_IOAPICS; entries [0..count) are initialized.
         let s = unsafe { *base.add(i) };
-        if gsi >= s.gsi_base && gsi < s.gsi_base + s.pin_count
+        if gsi >= s.gsi_base && gsi - s.gsi_base < s.pin_count
         {
             return Some((s.phys_base, gsi - s.gsi_base));
         }
@@ -231,6 +371,15 @@ pub unsafe fn init()
             entry.gsi_base,
             pin_count
         );
+        if entry.gsi_base.saturating_add(pin_count) > super::ROOT_IRQ_COUNT
+        {
+            crate::kprintln!(
+                "ioapic[{}]: GSIs from {} lie past the Interrupt id space ({}); not routable",
+                i,
+                super::ROOT_IRQ_COUNT.max(entry.gsi_base),
+                super::ROOT_IRQ_COUNT
+            );
+        }
 
         // Mask all entries on this IOAPIC (bit 16 = interrupt mask = 1).
         for pin in 0..pin_count
@@ -250,34 +399,27 @@ pub unsafe fn init()
     }
 }
 
-/// Program a redirection entry for `gsi` to deliver `vector`.
+/// Program a redirection entry for `gsi` to deliver `vector` to the local APIC
+/// with id `destination` (physical destination mode, so at most `0xFF`).
 ///
 /// The entry is programmed masked; call [`unmask`] when ready to receive.
-/// Uses edge-triggered, active-high, fixed delivery to LAPIC 0.
-///
-/// TODO: per-IRQ affinity. Every GSI is delivered to local APIC ID 0 (destination field = 0),
-/// the BSP only when the BSP's APIC ID is 0. With several IRQ sources (virtio-blk, virtio-input,
-/// serial) one CPU takes every device trap. Deferred because only one of those sources
-/// (virtio-blk) is high-rate; the concentration becomes a trap bottleneck once several
-/// high-rate sources exist (more block devices, a NIC). Replace the hard-coded destination with
-/// a per-GSI selector (round-robin, user-supplied affinity, or a rebalancer). Mirror the
-/// matching change on RISC-V (`plic_enable` in `core/kernel/src/arch/riscv64/interrupts.rs`).
+/// Uses edge-triggered, active-high, fixed delivery. A GSI no discovered I/O
+/// APIC owns is left alone (`interrupts::route_device_irq` checks [`owns`] first).
 ///
 /// # Safety
 /// Must only be called after [`init`].
 #[cfg(not(test))]
-pub unsafe fn route(gsi: u32, vector: u8)
+pub unsafe fn route(gsi: u32, vector: u8, destination: u8)
 {
     let Some((base, pin)) = lookup_ioapic_for_gsi(gsi)
     else
     {
-        crate::kprintln!("ioapic: no IOAPIC owns GSI {} — route ignored", gsi);
         return;
     };
     // Low dword: vector | fixed delivery | masked.
-    // High dword: destination LAPIC ID 0 in bits [27:24].
+    // High dword: destination APIC id in bits [31:24] (entry bits [63:56]).
     let low = REDIR_MASK | REDIR_FIXED | (vector as u32);
-    let high: u32 = 0; // dest LAPIC ID 0
+    let high = u32::from(destination) << 24;
 
     // SAFETY: caller ensures init() has completed; entry remains masked
     // until unmask(). IOAPIC_LOCK covers both select/window pairs.
@@ -343,24 +485,56 @@ mod tests
 {
     use super::*;
 
-    #[test]
-    fn last_routable_gsi_has_a_gate_and_the_next_does_not()
+    fn table() -> [AtomicU32; DEVICE_VECTOR_COUNT]
     {
-        assert!(device_vector(crate::arch::current::MAX_IRQ_ID).is_some());
-        assert_eq!(device_vector(crate::arch::current::MAX_IRQ_ID + 1), None);
+        [const { AtomicU32::new(0) }; DEVICE_VECTOR_COUNT]
     }
 
     #[test]
-    fn gsi_whose_vector_overflows_u8_has_no_gate()
+    fn routed_gsis_get_distinct_device_vectors()
     {
-        // 33 + 223 > 255: an unchecked add wraps these into the exception vectors.
-        assert_eq!(device_vector(223), None);
-        assert_eq!(device_vector(255), None);
-        assert_eq!(device_vector(u32::MAX), None);
+        // GSIs past the old 23-gate range (a second I/O APIC's) are assigned too.
+        let t = table();
+        let a = assign_vector_in(&t, 2).expect("vector");
+        let b = assign_vector_in(&t, 40).expect("vector");
+        assert_ne!(a, b);
+        assert_eq!(find_vector(&t, 40), Some(b));
     }
 
     #[test]
-    fn routable_gsis_avoid_the_exception_timer_ipi_and_spurious_vectors()
+    fn a_gsi_routed_again_keeps_its_vector()
+    {
+        let t = table();
+        let first = assign_vector_in(&t, 7).expect("vector");
+        assert_eq!(assign_vector_in(&t, 7), Some(first));
+    }
+
+    #[test]
+    fn exhausted_vectors_refuse_a_new_gsi_until_one_is_released()
+    {
+        let t = table();
+        for gsi in 0..DEVICE_VECTOR_COUNT as u32
+        {
+            assert!(assign_vector_in(&t, gsi).is_some());
+        }
+        assert_eq!(assign_vector_in(&t, 1000), None);
+        release_vector_in(&t, 5);
+        assert_eq!(find_vector(&t, 5), None);
+        assert!(assign_vector_in(&t, 1000).is_some());
+    }
+
+    #[test]
+    fn gsi_zero_is_assignable()
+    {
+        // The table marks a free vector with 0, so GSI 0 must not read as free.
+        let t = table();
+        let v = assign_vector_in(&t, 0).expect("vector");
+        assert_eq!(find_vector(&t, 0), Some(v));
+        assert_ne!(assign_vector_in(&t, 1), Some(v));
+    }
+
+    #[test]
+    fn device_vectors_avoid_the_exception_timer_ipi_and_spurious_vectors()
     {
         use crate::arch::current::interrupts::{IPI_VECTOR_TLB_SHOOTDOWN, IPI_VECTOR_WAKEUP};
         use crate::arch::current::timer::TIMER_VECTOR;
@@ -368,10 +542,11 @@ mod tests
         /// The spurious-interrupt vector `idt::init` installs.
         const SPURIOUS_VECTOR: u8 = 255;
 
-        for gsi in crate::arch::current::MIN_IRQ_ID..=crate::arch::current::MAX_IRQ_ID
+        let t = table();
+        for gsi in 0..DEVICE_VECTOR_COUNT as u32
         {
-            let vector = device_vector(gsi).expect("routable GSI has a vector");
-            assert!(vector > 31, "GSI {gsi} routed to exception vector {vector}");
+            let vector = assign_vector_in(&t, gsi).expect("vector");
+            assert!(vector > 31, "GSI {gsi} assigned exception vector {vector}");
             for reserved in [
                 TIMER_VECTOR,
                 IPI_VECTOR_TLB_SHOOTDOWN,
@@ -379,8 +554,28 @@ mod tests
                 SPURIOUS_VECTOR,
             ]
             {
-                assert_ne!(vector, reserved, "GSI {gsi} routed to reserved vector");
+                assert_ne!(vector, reserved, "GSI {gsi} assigned a reserved vector");
             }
         }
+    }
+
+    #[test]
+    fn gsi_limit_covers_every_ioapic_and_stops_at_the_id_space()
+    {
+        let states = [
+            IoApicState {
+                phys_base: 0xFEC0_0000,
+                gsi_base: 0,
+                pin_count: 24,
+            },
+            IoApicState {
+                phys_base: 0xFEC0_1000,
+                gsi_base: 24,
+                pin_count: 32,
+            },
+        ];
+        assert_eq!(gsi_limit_of(&states, 2048), 56);
+        assert_eq!(gsi_limit_of(&states, 40), 40);
+        assert_eq!(gsi_limit_of(&[], 2048), 0);
     }
 }

@@ -1874,19 +1874,24 @@ the registered notification.
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 Only one notification may be registered per interrupt line at a time. A second call
-replaces the previous registration. The kernel masks the interrupt line before
-delivering the notification; the driver MUST call `SYS_IRQ_ACK` to re-enable it
-(see [architecture.md](../../../docs/architecture.md) § Driver Model).
+replaces the previous registration, and returns once no delivery to the replaced
+notification is still in flight. The kernel routes the line to one CPU, the next in turn
+([arch-interface.md](arch-interface.md) § `interrupts`), and leaves it masked, and it masks
+the line again before each delivery of the notification; the driver MUST call
+`SYS_IRQ_ACK` to re-enable it (see [architecture.md](../../../docs/architecture.md)
+§ Driver Model).
 
 **Capability requirements:** `irq_cap` (Notify rights; single-line), `notification_cap`
 (Notify rights).
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (a cap lacks Notify),
-`InvalidArgument` (IRQ cap covers more than one line, or names an id outside the
-routable range `MIN_IRQ_ID..=MAX_IRQ_ID`: GSIs 0–22 on x86-64, the GSIs with an IDT gate,
-where the root Interrupt cap spans 256 GSIs; PLIC sources 1–127 on RISC-V, where the root
-Interrupt cap spans the PLIC's 1024-id space; see
-[arch-interface.md](arch-interface.md) § Module-level constants and free functions).
+`InvalidArgument` (IRQ cap covers more than one line, or names an id no discovered
+interrupt controller implements: on x86-64 a GSI no I/O APIC reports, where the root
+Interrupt cap spans 2048 GSIs; on RISC-V a source outside the PLIC's reported
+`1..=riscv,ndev`, where the root Interrupt cap spans the PLIC's 1024-id space; see
+[arch-interface.md](arch-interface.md) § Module-level constants and free functions),
+`QuotaExceeded` (x86-64: every device IDT vector, 217 of them, is assigned to another
+routed GSI; a vector is freed when its line's route is cleared).
 
 ---
 

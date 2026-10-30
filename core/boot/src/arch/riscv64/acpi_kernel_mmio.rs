@@ -6,7 +6,7 @@
 //! RISC-V `kernel_mmio` extraction from ACPI.
 //!
 //! Walks RSDP → XSDT → MADT for the PLIC entry (type 0x1B) to populate
-//! [`KernelMmio::plic_base`] and `plic_size`, uses the shared SPCR
+//! [`KernelMmio::plic_base`], `plic_size` and `plic_ndev`, uses the shared SPCR
 //! walker to populate [`KernelMmio::uart_base`] and `uart_size`, and
 //! uses the shared RHCT walker to populate the non-MMIO hart facts
 //! [`KernelMmio::timebase_freq`] and [`KernelMmio::hart_caps`]. Fields
@@ -20,7 +20,9 @@
 //! entries and the UART size convention live here.
 
 use super::acpi_spcr::find_spcr_base;
-use crate::acpi::{MADT_ENTRIES_OFF, MADT_TYPE_PLIC, find_acpi_table, read_u8, read_u32, read_u64};
+use crate::acpi::{
+    MADT_ENTRIES_OFF, MADT_TYPE_PLIC, find_acpi_table, read_u8, read_u16, read_u32, read_u64,
+};
 use boot_protocol::KernelMmio;
 
 /// Conventional ns16550a register-file size. SPCR carries no region size; a
@@ -34,7 +36,8 @@ const NS16550A_MMIO_SIZE: u64 = 0x100;
 /// Walks:
 /// - RSDP → XSDT → MADT for type-0x1B `PlicStructure` entries → first
 ///   match writes `km.plic_base` / `km.plic_size` (MADT-supplied size
-///   used verbatim).
+///   used verbatim) and `km.plic_ndev` (the total external interrupt
+///   sources).
 /// - SPCR (via the shared walker) → `km.uart_base` is taken from the
 ///   Generic Address Structure's `address` field; `km.uart_size` is set
 ///   to the ns16550a conventional [`NS16550A_MMIO_SIZE`] (0x100) since
@@ -114,6 +117,7 @@ fn scan_madt_for_plic(table: &[u8], km: &mut KernelMmio)
             {
                 km.plic_base = base;
                 km.plic_size = size;
+                km.plic_ndev = u64::from(read_u16(table, off + 12));
                 return;
             }
         }

@@ -65,9 +65,15 @@ pub const PAGE_FAULT_LOAD_VECTOR: u64 = 14;
 
 /// Interrupt ids the root Interrupt cap names but the kernel does not route,
 /// which `unit::hw::irq_register_unroutable_id_err` expects `irq_register` to
-/// refuse: GSI 23, the first above the 23 GSIs with an IDT gate (vectors
-/// 33-55), and GSI 255, whose vector `33 + 255` overflows a `u8`.
-pub const UNROUTABLE_IRQ_IDS: &[u32] = &[23, 255];
+/// refuse: GSI 24, the first past the 24 pins of the q35 I/O APIC, and GSI
+/// 2047, the top of the 2048-GSI id space, which no I/O APIC there covers.
+pub const UNROUTABLE_IRQ_IDS: &[u32] = &[24, 2047];
+
+/// Interrupt ids the kernel routes that a fixed-size table once refused,
+/// which `unit::hw::irq_register_high_id` expects `irq_register` to accept:
+/// GSI 23, the q35 I/O APIC's last pin, above the 23 GSIs (0-22) that had an
+/// IDT gate before device vectors were assigned at route time.
+pub const ROUTABLE_HIGH_IRQ_IDS: &[u32] = &[23];
 
 /// Physical base of an MMIO register page that a test may read without side
 /// effects: the I/O APIC at QEMU's default base, a page of its own among the

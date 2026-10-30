@@ -2401,10 +2401,9 @@ unsafe fn dealloc_object_one(
             // table and program the controller (sys_irq_register asserts
             // `count == 1`). Range caps are delegation authorities; they
             // have no routing-table footprint to clean up. Nor does a
-            // single-id cap outside the routable range: sys_irq_register
-            // refuses it, and on riscv64 a split of the 1024-id root cap can
-            // name an id past the routing table, which `irq::unregister`
-            // must not be handed.
+            // single-id cap outside the routable range, which
+            // sys_irq_register refuses; `irq::unregister` ignores an id
+            // inside it that lies past the discovered routing table.
             if count == 1
                 && (crate::arch::current::MIN_IRQ_ID..=crate::arch::current::MAX_IRQ_ID)
                     .contains(&start)

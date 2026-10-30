@@ -254,7 +254,9 @@ feature it halts with a message naming the specific feature, rather than failing
   frequency) for every hart from the firmware tables (ACPI RHCT, or the DTB `/cpus` nodes).
 
 Platform features that are not CPU-detectable (the PIT, UEFI, ACPI/DTB, the UART) are not probed by
-the gate; their absence manifests as a boot failure on the discovery path they feed.
+the gate; their absence manifests as a boot failure on the discovery path they feed. A missing or
+dead 8254 PIT halts the boot at timer calibration with a message naming the PIT, once a poll
+budget in TSC ticks expires.
 
 ---
 

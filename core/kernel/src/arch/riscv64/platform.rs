@@ -25,15 +25,32 @@ const DEFAULT_UART_SIZE: u64 = 0x1000;
 /// here; most UEFI-on-RISC-V firmwares match.
 const DEFAULT_PLIC_BASE: u64 = 0x0C00_0000;
 
-/// Default PLIC MMIO window size when the bootloader did not report one.
-/// 4 MiB covers the priority + per-context enable + threshold + claim/complete
-/// ranges defined by the RISC-V PLIC spec.
-const DEFAULT_PLIC_SIZE: u64 = 0x0040_0000;
+/// Default PLIC MMIO window size when the bootloader did not report one: the
+/// 64 MiB register map of the RISC-V PLIC specification, whose threshold and
+/// claim/complete blocks hold all 15 872 contexts. A hardware spec value, so a
+/// firmware hart id whose S-mode context the specification admits is never
+/// refused for want of a reported size.
+pub(super) const DEFAULT_PLIC_SIZE: u64 = 0x0400_0000;
 
 static CACHED_UART_BASE: AtomicU64 = AtomicU64::new(0);
 static CACHED_UART_SIZE: AtomicU64 = AtomicU64::new(0);
 static CACHED_PLIC_BASE: AtomicU64 = AtomicU64::new(0);
 static CACHED_PLIC_SIZE: AtomicU64 = AtomicU64::new(0);
+static CACHED_PLIC_NDEV: AtomicU64 = AtomicU64::new(0);
+
+/// The PLIC source count to program for a reported `riscv,ndev` of `reported`: the report
+/// when it lies in `1..=PLIC_MAX_SOURCES`, else the specification's
+/// [`super::interrupts::PLIC_MAX_SOURCES`]. An unreported count (0) programs every source
+/// the specification allows, which is harmless for the ones the PLIC lacks (their
+/// priority and enable bits read as zero); a report past the specification is clamped.
+fn ndev_for(reported: u64) -> u32
+{
+    match u32::try_from(reported)
+    {
+        Ok(n) if (1..=super::interrupts::PLIC_MAX_SOURCES).contains(&n) => n,
+        _ => super::interrupts::PLIC_MAX_SOURCES,
+    }
+}
 
 fn page_round_up(n: u64) -> u64
 {
@@ -150,6 +167,23 @@ pub fn plic_size() -> u64
     v
 }
 
+/// Number of PLIC interrupt sources the kernel programs (sources `1..=plic_ndev()`), from
+/// `BootInfo.kernel_mmio.plic_ndev` (the firmware's `riscv,ndev`; see [`ndev_for`]).
+#[must_use]
+pub fn plic_ndev() -> u32
+{
+    let cached = CACHED_PLIC_NDEV.load(Ordering::Relaxed);
+    if cached != 0
+    {
+        // The cache holds a value `ndev_for` returned, at most 1023.
+        #[allow(clippy::cast_possible_truncation)]
+        return cached as u32;
+    }
+    let v = ndev_for(crate::platform::kernel_mmio().plic_ndev);
+    CACHED_PLIC_NDEV.store(u64::from(v), Ordering::Relaxed);
+    v
+}
+
 /// UART physical base for Phase 1 console init.
 ///
 /// Reads `km` directly because Phase 1 runs before the `kernel_mmio` cache
@@ -184,6 +218,19 @@ mod tests
         assert_eq!(page_round_up(1), 0x1000);
         assert_eq!(page_round_up(0x1000), 0x1000);
         assert_eq!(page_round_up(0x1001), 0x2000);
+    }
+
+    // Defect caught: a reported source count trusted past the PLIC specification (the
+    // enable and priority loops would write past the source registers), or an unreported
+    // count leaving every source unprogrammed.
+    #[test]
+    fn plic_ndev_takes_the_report_within_the_specification()
+    {
+        assert_eq!(ndev_for(95), 95);
+        assert_eq!(ndev_for(1023), 1023);
+        assert_eq!(ndev_for(1024), 1023);
+        assert_eq!(ndev_for(u64::MAX), 1023);
+        assert_eq!(ndev_for(0), 1023);
     }
 
     #[test]

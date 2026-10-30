@@ -109,6 +109,9 @@ pub struct FdtNode
     pub ranges_entries: [(u32, u64, u64); MAX_RANGES_ENTRIES],
     /// Number of valid entries in [`ranges_entries`].
     pub ranges_count: usize,
+    /// The `riscv,ndev` property (a PLIC's interrupt-source count), or 0
+    /// when the node has none.
+    pub riscv_ndev: u32,
 }
 
 // ── Per-depth traversal state (private) ───────────────────────────────────────
@@ -124,6 +127,7 @@ struct NodeState
     irq_count: usize,
     ranges_entries: [(u32, u64, u64); MAX_RANGES_ENTRIES],
     ranges_count: usize,
+    riscv_ndev: u32,
 }
 
 impl NodeState
@@ -138,6 +142,7 @@ impl NodeState
             irq_count: 0,
             ranges_entries: [(0, 0, 0); MAX_RANGES_ENTRIES],
             ranges_count: 0,
+            riscv_ndev: 0,
         }
     }
 }
@@ -307,6 +312,7 @@ impl Fdt
                             irq_count: s.irq_count,
                             ranges_entries: s.ranges_entries,
                             ranges_count: s.ranges_count,
+                            riscv_ndev: s.riscv_ndev,
                         };
                         if !callback(node)
                         {
@@ -378,6 +384,14 @@ impl Fdt
                             state.irq_entries[state.irq_count] = read_be32(&data[i..]);
                             state.irq_count += 1;
                             i += 4;
+                        }
+                    }
+                    else if name == b"riscv,ndev"
+                    {
+                        let data = self.struct_slice(data_off, prop_len);
+                        if data.len() >= 4
+                        {
+                            state.riscv_ndev = read_be32(data);
                         }
                     }
                     else if name == b"ranges"
@@ -1251,6 +1265,38 @@ mod tests
     {
         // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
         unsafe { parse_hart_caps(blob.as_ptr() as u64) }
+    }
+
+    // Defect caught: a PLIC's `riscv,ndev` not reaching the walker's node, so the
+    // kernel would fall back to the specification maximum on every platform.
+    #[test]
+    fn plic_node_reports_its_riscv_ndev()
+    {
+        let mut b = FdtBuilder::new();
+        b.begin_node(b"");
+        b.begin_node(b"plic@c000000");
+        b.prop(b"compatible", b"sifive,plic-1.0.0\0riscv,plic0\0");
+        b.prop(b"riscv,ndev", &95u32.to_be_bytes());
+        b.end_node();
+        b.begin_node(b"uart@10000000");
+        b.prop(b"compatible", b"ns16550a\0");
+        b.end_node();
+        b.end_node();
+        let blob = b.finish();
+        // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
+        let fdt = unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.expect("valid FDT");
+        let mut plic = None;
+        fdt.walk_compatible(b"riscv,plic0", |node| {
+            plic = Some(node.riscv_ndev);
+            false
+        });
+        assert_eq!(plic, Some(95));
+        let mut uart = None;
+        fdt.walk_compatible(b"ns16550a", |node| {
+            uart = Some(node.riscv_ndev);
+            false
+        });
+        assert_eq!(uart, Some(0));
     }
 
     #[test]

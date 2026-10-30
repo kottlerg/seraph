@@ -6,7 +6,7 @@
 //! RISC-V `kernel_mmio` extraction from the Flattened Device Tree.
 //!
 //! Walks an FDT blob for compatible matches and writes first-match
-//! values into [`KernelMmio::plic_base`] / `plic_size` and
+//! values into [`KernelMmio::plic_base`] / `plic_size` / `plic_ndev` and
 //! [`KernelMmio::uart_base`] / `uart_size`, and fills the non-MMIO hart
 //! facts [`KernelMmio::timebase_freq`] and [`KernelMmio::hart_caps`]
 //! from the `/cpus` nodes. Runs only for fields the caller left zero
@@ -23,7 +23,8 @@ use boot_protocol::KernelMmio;
 /// Populate the arch-specific `kernel_mmio` fields for RISC-V from the DTB.
 ///
 /// Walks the device tree for compatible matches:
-/// - `sifive,plic-1.0.0` / `riscv,plic0` → `plic_base`, `plic_size`.
+/// - `sifive,plic-1.0.0` / `riscv,plic0` → `plic_base`, `plic_size`, and
+///   `plic_ndev` from the node's `riscv,ndev`.
 /// - `ns16550a` → `uart_base`, `uart_size`.
 /// - `/cpus` nodes → `timebase_freq` and the `HART_CAP_*` bits every
 ///   enabled hart advertises (Sstc, Svpbmt, Svinval, Svnapot).
@@ -56,6 +57,7 @@ pub unsafe fn parse_kernel_mmio(dtb_addr: u64, km: &mut KernelMmio)
             {
                 km.plic_base = node.reg_entries[0].0;
                 km.plic_size = node.reg_entries[0].1;
+                km.plic_ndev = u64::from(node.riscv_ndev);
             }
             km.plic_base == 0
         });
@@ -67,6 +69,7 @@ pub unsafe fn parse_kernel_mmio(dtb_addr: u64, km: &mut KernelMmio)
             {
                 km.plic_base = node.reg_entries[0].0;
                 km.plic_size = node.reg_entries[0].1;
+                km.plic_ndev = u64::from(node.riscv_ndev);
             }
             km.plic_base == 0
         });

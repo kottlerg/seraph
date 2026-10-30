@@ -96,6 +96,13 @@ const PIT_GATE: u16 = 0x61;
 // PIT oscillator frequency (Hz).
 const PIT_HZ: u64 = 1_193_182;
 
+/// Budget, in TSC ticks, for the calibration poll to see PIT channel 2 expire. 2^32 ticks is
+/// 0.43 s at a 10 GHz TSC, over 40 times the 10 ms window, and longer at any slower rate; the
+/// TSC is not calibrated yet, so the budget is set against the fastest plausible rate. A
+/// tuning value that bounds no capacity: it only separates a missing PIT from a slow one.
+#[cfg(not(test))]
+const PIT_POLL_BUDGET_TSC_TICKS: u64 = 1 << 32;
+
 // ── Tick state ────────────────────────────────────────────────────────────────
 
 /// APIC timer count rate in ticks per second at the divide-by-16 setting
@@ -273,13 +280,22 @@ unsafe fn calibrate_apic_timer() -> u64
         outb(PIT_GATE, gate | 0x01);
     }
 
-    // Spin until PIT output (bit 5 of port 0x61) goes high.
-    // SAFETY: port 0x61 read is safe at ring 0; polling PIT status.
-    unsafe {
-        while inb(PIT_GATE) & 0x20 == 0
-        {
-            core::hint::spin_loop();
-        }
+    // Spin until PIT output (bit 5 of port 0x61) goes high, bounded in TSC ticks: the TSC is
+    // not yet calibrated, but it always reads, and `PIT_POLL_BUDGET_TSC_TICKS` covers the
+    // window at any plausible TSC rate. A platform without a working 8254 never raises the
+    // output, so the boot halts naming the PIT rather than hanging silently.
+    let expired = crate::bounded_wait::spin_until(
+        || {
+            // SAFETY: port 0x61 read is safe at ring 0; polling PIT status.
+            let status = unsafe { inb(PIT_GATE) };
+            status & 0x20 != 0
+        },
+        || Some(read_tsc()),
+        PIT_POLL_BUDGET_TSC_TICKS,
+    );
+    if !expired
+    {
+        crate::fatal("timer: PIT channel 2 never expired (no working 8254 PIT; required)");
     }
     let tsc_end = read_tsc();
 

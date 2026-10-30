@@ -150,6 +150,21 @@ that cap's address.
 
 ---
 
+## Interrupt Delivery
+
+A driver receives a wired interrupt line as a single-line `Interrupt` cap that devmgr splits
+from the root range, and binds it to a Notification with `SYS_IRQ_REGISTER`. A line routes to one
+notification at a time: devmgr delegates no private cap for a shared `INTx` line (that driver
+polls, § Driver binary sources), and devices that need several interrupts get message-signaled
+ones, not a shared wired line (design intent, not yet implemented;
+[#325](https://github.com/kottlerg/seraph/issues/325)). The kernel delivers each registered line
+to one CPU, chosen when the line is registered by taking the CPUs in turn, so the interrupts of
+several devices spread over the CPUs. On x86-64 only CPUs whose APIC id an I/O APIC can name
+(`0xFF` or below) take part. The mechanism is specified in
+[core/kernel/docs/arch-interface.md](../core/kernel/docs/arch-interface.md) § `interrupts`.
+
+---
+
 ## Relationship to Other Services
 
 ```

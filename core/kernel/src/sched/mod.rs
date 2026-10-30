@@ -846,9 +846,8 @@ fn watchdog_tick_and_check()
 
 /// Owed-wake detector: walk the thread registry for `Blocked` threads whose
 /// wake is provably owed but never arrived — the lost-wakeup wedge signature
-/// (#375). Three rules, each on plain TCB scalar reads only (no IPC-object
-/// dereference: unlike the dump's `blocked_on` decode, this runs on a LIVE
-/// system where a blocking object can be freed concurrently).
+/// (#375). Three rules, each on TCB fields read under the thread's
+/// `sched_lock`, try-locked (no IPC-object dereference).
 ///
 /// The rules, their exemptions, and their debouncing are specified in
 /// core/kernel/docs/scheduling-internals.md § Softlockup Watchdog (owed-wake
@@ -871,23 +870,33 @@ fn owed_wake_scan()
         {
             return;
         }
-        // SAFETY: t is a registry-walked TCB kept mapped by the registry lock,
-        // so these reads cannot fault. They are not race-free: the fields
-        // are `sched_lock`-owned and read without it, a diagnostic-only
-        // residual #440 records; a torn observation is absorbed by the grace
-        // window (rule 1) and the two-scan persistence (rules 2, 3).
-        let (state, ipc, tid, dl, wif, wp, started) = unsafe {
-            (
-                (*t).state,
-                (*t).ipc_state,
-                (*t).thread_id,
-                (*t).sleep_deadline
-                    .load(core::sync::atomic::Ordering::Relaxed),
-                (*t).wake_in_flight
-                    .load(core::sync::atomic::Ordering::Relaxed),
-                (*t).wake_pending,
-                (*t).park_started_tick,
-            )
+        // SAFETY: t is a registry-walked TCB kept allocated by the registry
+        // lock, which orders before every `sched_lock`. The `sched_lock`-owned
+        // fields are read under that lock, try-locked so a wedged holder cannot
+        // stall the scan: a thread whose lock is held is not a suspect this
+        // scan (the two-scan persistence of rules 2 and 3 tolerates the
+        // skip). `thread_id` is immutable; the deadline and the wake flag are
+        // atomic.
+        let Some((state, ipc, tid, dl, wif, wp, started)) = (unsafe {
+            (*t).sched_lock.try_lock_raw().map(|saved| {
+                let fields = (
+                    (*t).state,
+                    (*t).ipc_state,
+                    (*t).thread_id,
+                    (*t).sleep_deadline
+                        .load(core::sync::atomic::Ordering::Relaxed),
+                    (*t).wake_in_flight
+                        .load(core::sync::atomic::Ordering::Relaxed),
+                    (*t).wake_pending,
+                    (*t).park_started_tick,
+                );
+                (*t).sched_lock.unlock_raw(saved);
+                fields
+            })
+        })
+        else
+        {
+            return;
         };
         if state != thread::ThreadState::Blocked
         {
@@ -920,7 +929,9 @@ fn owed_wake_scan()
         suspects[count] = (tid, rule);
         count += 1;
     };
-    // SAFETY: read-only walk; the closure only reads TCB scalars.
+    // SAFETY: the closure registers and unregisters no thread, and the only
+    // lock it takes, each walked TCB's `sched_lock`, it only try-locks, as
+    // `try_for_each`'s contract allows.
     if !unsafe { thread_registry::try_for_each(collect) }
     {
         // Registry contended; keep the previous scan's suspects and retry on
@@ -1045,16 +1056,19 @@ fn bsp_stall_check(own_heartbeat: u64)
 
 /// Dump scheduler state for a detected wedge: per-CPU current threads, the
 /// sleep list, and all non-running registered threads. Callable from any CPU
-/// in interrupt context. The sleep list and the registry are taken only by
-/// try-lock, so a wedged holder of either cannot deadlock the dump (its output
-/// still takes the console lock); the per-CPU snapshot, the sleep-list
-/// entries, the walked TCB fields and the blocking objects are read without
-/// their locks, a diagnostic-only residual #440 records.
+/// in interrupt context.
+///
+/// Every lock the dump reads under is only try-locked, so a wedged holder
+/// cannot deadlock it (its output still takes the console lock): a CPU's
+/// scheduler lock and its `current`'s `sched_lock` for the per-CPU snapshot,
+/// `SLEEP_LIST_LOCK` (a leaf; nothing is taken under it) for the sleep
+/// list, and the registry lock, each walked thread's `sched_lock` and its
+/// blocking source's lock for the registry walk. A contended lock prints as
+/// held and its fields are skipped. Kernel addresses go through
+/// `kprintln_serial!` only; the mirrored lines name threads by id
+/// (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+/// diagnostics).
 #[cfg(not(test))]
-// too_many_lines: one flat, sequential diagnostic dump (per-CPU snapshot,
-// sleep list, registry walk); splitting it would scatter the try-lock and
-// unlocked-read discipline the rustdoc states.
-#[allow(clippy::too_many_lines)]
 fn watchdog_dump(reason: &str)
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
@@ -1065,119 +1079,9 @@ fn watchdog_dump(reason: &str)
         now,
         crate::arch::current::timer::current_tick()
     );
-    // needless_range_loop: parallel scheduler_for(cpu) accesses below.
-    #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpu_count
     {
-        // SAFETY: scheduler slabs initialised and the TCB slab stays mapped,
-        // so these reads cannot fault. They are not race-free: another CPU's
-        // `current` snapshot and that TCB's fields are read without their locks,
-        // a diagnostic-only residual #440 records (nothing here decides
-        // anything, but a stalled CPU's thread may still be changing them).
-        let (cur_is_null, tid, state, ipc, blocked_on, prio, pref, last_tick, mask) = unsafe {
-            let s = scheduler_for(cpu);
-            let cur = s.current();
-            let lt = last_non_idle_tick(cpu)
-                .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed));
-            if cur.is_null()
-            {
-                (
-                    true,
-                    0u32,
-                    thread::ThreadState::Created,
-                    thread::IpcThreadState::None,
-                    core::ptr::null::<u8>(),
-                    0u8,
-                    0u32,
-                    lt,
-                    0u32,
-                )
-            }
-            else
-            {
-                (
-                    false,
-                    (*cur).thread_id,
-                    (*cur).state,
-                    (*cur).ipc_state,
-                    (*cur).blocked_on_object.cast_const(),
-                    (*cur).priority,
-                    (*cur).preferred_cpu,
-                    lt,
-                    (*scheduler_ptr(cpu)).non_empty_mask(),
-                )
-            }
-        };
-        if cur_is_null
-        {
-            crate::kprintln!(
-                "  cpu{} current=NULL last_tick={} now={}",
-                cpu,
-                last_tick,
-                now
-            );
-            continue;
-        }
-        let heartbeat = if cpu < MAX_CPUS
-        {
-            TICK_HEARTBEAT[cpu].load(core::sync::atomic::Ordering::Relaxed)
-        }
-        else
-        {
-            0
-        };
-        crate::kprintln!(
-            "  cpu{} tid{} state={:?} ipc={:?} blocked_on={:p} prio={} pref={} \
-             idle_age={} heartbeat={} mask=0x{:x}",
-            cpu,
-            tid,
-            state,
-            ipc,
-            blocked_on,
-            prio,
-            pref,
-            now.saturating_sub(last_tick),
-            heartbeat,
-            mask
-        );
-        // Name the bounded protocol-spin this CPU is wedged in, if any. A CPU
-        // whose `current` is `Exited` but which never returned to the scheduler
-        // is stuck in one of these gates (#351) — the breadcrumb says which.
-        let spin = SPIN_SITE[cpu].load(core::sync::atomic::Ordering::Relaxed);
-        if spin != SPIN_SITE_NONE
-        {
-            crate::kprintln!("    spinning in {}", spin_site_name(spin));
-        }
-        // Name the bare spin lock this CPU is waiting for, if any: these waits
-        // spin with interrupts masked, inside a preempt-disabled window, or on
-        // the idle thread, so a wedged CPU is otherwise indistinguishable from
-        // a silent or idle one.
-        // The breadcrumb belongs to another CPU, which may leave and
-        // re-enter a wait meanwhile: the kind is read before and after the
-        // word (Acquire, paired with the writer's Release), and the pair is
-        // reported only if both reads agree. The lock word itself is not
-        // read: a breadcrumb gone stale meanwhile can name storage since
-        // recycled to another object.
-        let kind_before = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
-        let word = LOCK_WAIT_WORD[cpu].load(core::sync::atomic::Ordering::Relaxed) as usize;
-        let kind_after = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
-        if let Some(lock_kind) = LockKind::from_code(kind_before)
-            && kind_after == kind_before
-            && word != 0
-        {
-            // The lock word's address is a kernel VA: serial only
-            // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
-            // diagnostics).
-            crate::kprintln!("    waiting on {} lock", lock_kind.name());
-            crate::kprintln_serial!("    lock word @0x{:x}", word);
-        }
-        // The last syscall entered on this CPU, from the dispatcher's per-CPU
-        // stamp; the stalled thread's frame and TCB are not read.
-        let syscall_nr = CPU_SYSCALL_NR[cpu].load(core::sync::atomic::Ordering::Relaxed);
-        if syscall_nr != u64::MAX
-        {
-            crate::kprintln!("    last syscall on this cpu: nr={}", syscall_nr);
-        }
+        watchdog_dump_cpu(cpu, now);
     }
     // Derivation-lock state, holder CPU, and the most recent acquisition's
     // thread, syscall, and call site: a wedged holder or a leaked hold shows
@@ -1197,264 +1101,654 @@ fn watchdog_dump(reason: &str)
         site_file,
         site_line
     );
-    // Dump sleep list. Try-lock: a wedged CPU may hold SLEEP_LIST_LOCK, and
-    // the dump must not deadlock on it.
-    // SAFETY: read-only; paired unlock inside the map closure.
-    let locked_count = unsafe {
+    watchdog_dump_sleep_list();
+    watchdog_dump_registry();
+    crate::kprintln!("=== END WATCHDOG ===");
+}
+
+/// One CPU's `current`, as the watchdog reads it under the locks that own it.
+#[cfg(not(test))]
+enum CpuSnapshot
+{
+    /// The CPU's scheduler lock was held.
+    SchedulerLocked,
+    /// No `current` (before the CPU's first dispatch).
+    NoCurrent,
+    /// `current`'s `sched_lock` was held; only its immutable id is read.
+    ThreadLocked
+    {
+        tid: u32
+    },
+    /// `current`'s scheduling fields, read under both locks.
+    Thread
+    {
+        tid: u32,
+        state: thread::ThreadState,
+        ipc: IpcThreadState,
+        bound: bool,
+        prio: u8,
+        pref: u32,
+    },
+}
+
+/// Read CPU `cpu`'s `current` under that CPU's scheduler lock and the
+/// thread's `sched_lock`, both try-locked.
+///
+/// # Safety
+/// `cpu < CPU_COUNT`, with its scheduler initialised.
+#[cfg(not(test))]
+unsafe fn watchdog_snapshot_cpu(cpu: usize) -> CpuSnapshot
+{
+    // SAFETY: caller contract.
+    let sched = unsafe { scheduler_for(cpu) };
+    // SAFETY: try_lock_raw pairs with the unlock_raw below.
+    let Some(cpu_saved) = (unsafe { sched.lock.try_lock_raw() })
+    else
+    {
+        return CpuSnapshot::SchedulerLocked;
+    };
+    let cur = sched.current();
+    let snapshot = if cur.is_null()
+    {
+        CpuSnapshot::NoCurrent
+    }
+    else
+    {
+        // SAFETY: `cur` cannot be freed while it is `current` under the held
+        // scheduler lock: `dealloc_object(Thread)` frees only after it has seen
+        // the thread `current` on no CPU, reading each CPU's `current` under
+        // that CPU's lock (core/kernel/docs/scheduling-internals.md § Cross-CPU
+        // TCB Ownership, step 8). `thread_id` is immutable; the scheduling
+        // fields are read under the thread's own `sched_lock`, try-locked (the
+        // inverse of the canonical order, so never waited on), which serialises
+        // their writers.
+        unsafe {
+            let tid = (*cur).thread_id;
+            match (*cur).sched_lock.try_lock_raw()
+            {
+                None => CpuSnapshot::ThreadLocked { tid },
+                Some(thread_saved) =>
+                {
+                    let snapshot = CpuSnapshot::Thread {
+                        tid,
+                        state: (*cur).state,
+                        ipc: (*cur).ipc_state,
+                        bound: !(*cur).blocked_on_object.is_null(),
+                        prio: (*cur).priority,
+                        pref: (*cur).preferred_cpu,
+                    };
+                    (*cur).sched_lock.unlock_raw(thread_saved);
+                    snapshot
+                }
+            }
+        }
+    };
+    // SAFETY: paired with the try_lock_raw above.
+    unsafe { sched.lock.unlock_raw(cpu_saved) };
+    snapshot
+}
+
+/// Print one CPU's line of the watchdog dump: its `current` (see
+/// [`watchdog_snapshot_cpu`]) and its lock-free breadcrumbs (dispatch age,
+/// heartbeat, run-queue mask, protocol spin, lock wait, last syscall).
+#[cfg(not(test))]
+fn watchdog_dump_cpu(cpu: usize, now: u64)
+{
+    let last_tick =
+        last_non_idle_tick(cpu).map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed));
+    let heartbeat = if cpu < MAX_CPUS
+    {
+        TICK_HEARTBEAT[cpu].load(core::sync::atomic::Ordering::Relaxed)
+    }
+    else
+    {
+        0
+    };
+    // SAFETY: cpu < CPU_COUNT (the caller's loop); slab initialised.
+    let mask = unsafe { scheduler_for(cpu) }.non_empty_mask();
+    let idle_age = now.saturating_sub(last_tick);
+    // SAFETY: as above.
+    match unsafe { watchdog_snapshot_cpu(cpu) }
+    {
+        CpuSnapshot::SchedulerLocked =>
+        {
+            crate::kprintln!(
+                "  cpu{} (scheduler lock held) idle_age={} heartbeat={} mask=0x{:x}",
+                cpu,
+                idle_age,
+                heartbeat,
+                mask
+            );
+        }
+        CpuSnapshot::NoCurrent =>
+        {
+            crate::kprintln!(
+                "  cpu{} current=NULL last_tick={} now={}",
+                cpu,
+                last_tick,
+                now
+            );
+            return;
+        }
+        CpuSnapshot::ThreadLocked { tid } =>
+        {
+            crate::kprintln!(
+                "  cpu{} tid{} (sched_lock held) idle_age={} heartbeat={} mask=0x{:x}",
+                cpu,
+                tid,
+                idle_age,
+                heartbeat,
+                mask
+            );
+        }
+        CpuSnapshot::Thread {
+            tid,
+            state,
+            ipc,
+            bound,
+            prio,
+            pref,
+        } =>
+        {
+            crate::kprintln!(
+                "  cpu{} tid{} state={:?} ipc={:?} bound={} prio={} pref={} \
+                 idle_age={} heartbeat={} mask=0x{:x}",
+                cpu,
+                tid,
+                state,
+                ipc,
+                bound,
+                prio,
+                pref,
+                idle_age,
+                heartbeat,
+                mask
+            );
+        }
+    }
+    // Name the bounded protocol-spin this CPU is wedged in, if any. A CPU
+    // whose `current` is `Exited` but which never returned to the scheduler
+    // is stuck in one of these gates (#351) — the breadcrumb says which.
+    let spin = SPIN_SITE[cpu].load(core::sync::atomic::Ordering::Relaxed);
+    if spin != SPIN_SITE_NONE
+    {
+        crate::kprintln!("    spinning in {}", spin_site_name(spin));
+    }
+    // Name the bare spin lock this CPU is waiting for, if any: these waits
+    // spin with interrupts masked, inside a preempt-disabled window, or on
+    // the idle thread, so a wedged CPU is otherwise indistinguishable from
+    // a silent or idle one.
+    // The breadcrumb belongs to another CPU, which may leave and
+    // re-enter a wait meanwhile: the kind is read before and after the
+    // word (Acquire, paired with the writer's Release), and the pair is
+    // reported only if both reads agree. The lock word itself is not
+    // read: a breadcrumb gone stale meanwhile can name storage since
+    // recycled to another object.
+    let kind_before = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
+    let word = LOCK_WAIT_WORD[cpu].load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let kind_after = LOCK_WAIT_KIND[cpu].load(core::sync::atomic::Ordering::Acquire);
+    if let Some(lock_kind) = LockKind::from_code(kind_before)
+        && kind_after == kind_before
+        && word != 0
+    {
+        // The lock word's address is a kernel VA: serial only
+        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+        // diagnostics).
+        crate::kprintln!("    waiting on {} lock", lock_kind.name());
+        crate::kprintln_serial!("    lock word @0x{:x}", word);
+    }
+    // The last syscall entered on this CPU, from the dispatcher's per-CPU
+    // stamp; the stalled thread's frame and TCB are not read.
+    let syscall_nr = CPU_SYSCALL_NR[cpu].load(core::sync::atomic::Ordering::Relaxed);
+    if syscall_nr != u64::MAX
+    {
+        crate::kprintln!("    last syscall on this cpu: nr={}", syscall_nr);
+    }
+}
+
+/// Most sleep-list entries the watchdog dump prints.
+#[cfg(not(test))]
+const WATCHDOG_SLEEP_ENTRIES: usize = 8;
+
+/// One sleep-list entry, copied under `SLEEP_LIST_LOCK`: the thread's id and
+/// deadline. Its state is printed by the registry walk, which reads it under
+/// the thread's `sched_lock`; `SLEEP_LIST_LOCK` is a leaf, so no `sched_lock`
+/// is taken under it.
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+struct SleepEntrySnapshot
+{
+    tid: u32,
+    deadline: u64,
+}
+
+/// Print the sleep list's count and first [`WATCHDOG_SLEEP_ENTRIES`] entries,
+/// copied while `SLEEP_LIST_LOCK` is held (try-locked) and printed after it is
+/// released.
+#[cfg(not(test))]
+fn watchdog_dump_sleep_list()
+{
+    let mut entries = [SleepEntrySnapshot {
+        tid: 0,
+        deadline: 0,
+    }; WATCHDOG_SLEEP_ENTRIES];
+    // SAFETY: try_lock_raw pairs with the unlock_raw inside the closure. The
+    // list is compacted under this lock, so its first SLEEP_COUNT entries are
+    // listed TCBs, and a listed TCB stays allocated while the lock is held: its
+    // teardown removes it from the list under this lock before the free
+    // (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
+    // Invariants). Only `thread_id` (immutable) and `sleep_deadline` (atomic)
+    // are read, so no other lock is taken under this leaf lock.
+    let count = unsafe {
         SLEEP_LIST_LOCK.try_lock_raw().map(|saved| {
             let count = SLEEP_COUNT;
+            for (slot, entry) in entries.iter_mut().enumerate().take(count)
+            {
+                let t = SLEEP_LIST[slot];
+                entry.tid = (*t).thread_id;
+                entry.deadline = (*t)
+                    .sleep_deadline
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            }
             SLEEP_LIST_LOCK.unlock_raw(saved);
             count
         })
     };
-    let n = if let Some(count) = locked_count
-    {
-        count
-    }
+    let Some(count) = count
     else
     {
         crate::kprintln!("  SLEEP_LIST (lock contended; skipped)");
-        0
+        return;
     };
-    crate::kprintln!("  SLEEP_LIST count={}", n);
-    // needless_range_loop: SLEEP_LIST is a static; iter().enumerate() obscures.
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..n.min(8)
+    crate::kprintln!("  SLEEP_LIST count={}", count);
+    for (i, entry) in entries.iter().enumerate().take(count)
     {
-        // SAFETY: the entries and the TCBs they name stay mapped, so these
-        // reads cannot fault. They are not race-free: the list is read after
-        // SLEEP_LIST_LOCK is released and each TCB's fields without its lock,
-        // a diagnostic-only residual #440 records.
-        let (tid, state, ipc, dl) = unsafe {
-            let t = SLEEP_LIST[i];
-            if t.is_null()
-            {
-                continue;
-            }
-            (
-                (*t).thread_id,
-                (*t).state,
-                (*t).ipc_state,
-                (*t).sleep_deadline
-                    .load(core::sync::atomic::Ordering::Relaxed),
-            )
-        };
-        crate::kprintln!(
-            "    sleep[{}] tid={} state={:?} ipc={:?} dl={}",
-            i,
-            tid,
-            state,
-            ipc,
-            dl
-        );
+        crate::kprintln!("    sleep[{}] tid={} dl={}", i, entry.tid, entry.deadline);
     }
-    // Enumerate non-running registered threads via the live-thread registry.
-    // The per-CPU `current` dump above shows only each CPU's running/idle
-    // thread. The #351 victim is invisible there: it is either a `Blocked`
-    // waiter parked on an IPC object, or a `Ready` thread stranded in a run
-    // queue that a wedged CPU never dispatched (the `mask` bit is set but no
-    // dispatch happens). For `Blocked` threads the `blocked_on` decode says
-    // whether the blocking object still queues the thread (no wake issued) or
-    // holds data while it is no longer queued (a wake deposited but never
-    // linked); for `Ready`/`Stopped` threads the scheduling fields say why a
-    // runnable thread is neither dispatched locally nor stolen
-    // (`context_saved`/`queued_on`/affinity / save-window pin).
+}
+
+/// Enumerate the non-running registered threads through the live-thread
+/// registry (try-locked), each read under its own `sched_lock` (try-locked).
+///
+/// The per-CPU `current` dump shows only each CPU's running/idle thread. The
+/// #351 victim is invisible there: it is either a `Blocked` waiter parked on
+/// an IPC object, or a `Ready` thread stranded in a run queue that a wedged
+/// CPU never dispatched (the `mask` bit is set but no dispatch happens). For
+/// `Blocked` threads the blocking-object decode says whether the object
+/// still queues the thread (no wake issued) or holds data while it is no
+/// longer queued (a wake deposited but never linked); for `Ready`/`Stopped`
+/// threads the scheduling fields say why a runnable thread is neither
+/// dispatched locally nor stolen (`context_saved`/`queued_on`/affinity /
+/// save-window pin).
+#[cfg(not(test))]
+fn watchdog_dump_registry()
+{
     crate::kprintln!("  NON-RUNNING REGISTERED THREADS:");
-    // Defined outside the `try_for_each` call so the `kprintln!` expansions are
-    // not lexically inside the `unsafe` wrapping that call (which would flag
-    // their macro-internal `unsafe` as redundant). Each raw deref is its own
-    // tight `unsafe`. The `sched_lock`-owned fields below are read without
-    // that lock: a diagnostic-only residual #440 records.
-    let dump_thread = |t: *mut ThreadControlBlock| {
-        // SAFETY: t is a registry-walked TCB kept mapped by the registry lock,
-        // so the read cannot fault; it races `sched_lock` writers (#440).
-        let state = unsafe { (*t).state };
-        match state
-        {
-            thread::ThreadState::Blocked =>
-            {
-                // SAFETY: as above: mapped, not race-free (#440).
-                let (tid, ipc, blocked_on, prio, pref, wake_pending, wake_in_flight, dl, started) = unsafe {
-                    (
-                        (*t).thread_id,
-                        (*t).ipc_state,
-                        (*t).blocked_on_object,
-                        (*t).priority,
-                        (*t).preferred_cpu,
-                        (*t).wake_pending,
-                        (*t).wake_in_flight
-                            .load(core::sync::atomic::Ordering::Relaxed),
-                        (*t).sleep_deadline
-                            .load(core::sync::atomic::Ordering::Relaxed),
-                        (*t).park_started_tick,
-                    )
-                };
-                crate::kprintln!(
-                    "    tid{} Blocked ipc={:?} blocked_on={:p} prio={} pref={} \
-                     wake_pending={} wake_in_flight={} dl={} parked_at={}",
-                    tid,
-                    ipc,
-                    blocked_on,
-                    prio,
-                    pref,
-                    wake_pending,
-                    wake_in_flight,
-                    dl,
-                    started
-                );
-                // SAFETY: as above; watchdog_decode_blocked_on reads the object
-                // without its lock (#440).
-                unsafe { watchdog_decode_blocked_on(t) };
-            }
-            thread::ThreadState::Ready
-            | thread::ThreadState::Stopped
-            | thread::ThreadState::Created =>
-            {
-                // SAFETY: as above: mapped, not race-free (#440).
-                let (tid, prio, pref, aff, queued_on, cs, wif, wp) = unsafe {
-                    (
-                        (*t).thread_id,
-                        (*t).priority,
-                        (*t).preferred_cpu,
-                        (*t).cpu_affinity,
-                        (*t).queued_on.load(core::sync::atomic::Ordering::Relaxed),
-                        (*t).context_saved
-                            .load(core::sync::atomic::Ordering::Relaxed),
-                        (*t).wake_in_flight
-                            .load(core::sync::atomic::Ordering::Relaxed),
-                        (*t).wake_pending,
-                    )
-                };
-                crate::kprintln!(
-                    "    tid{} {:?} prio={} pref={} affinity=0x{:x} queued_on={} \
-                     context_saved={} wake_in_flight={} wake_pending={}",
-                    tid,
-                    state,
-                    prio,
-                    pref,
-                    aff,
-                    queued_on,
-                    cs,
-                    wif,
-                    wp
-                );
-            }
-            // Running threads are each a CPU's `current`, already dumped above.
-            thread::ThreadState::Running | thread::ThreadState::Exited =>
-            {}
-        }
-    };
-    // SAFETY: best-effort read-only walk under the registry lock; the closure
-    // only reads through each TCB pointer (no register/unregister).
-    let walked = unsafe { thread_registry::try_for_each(dump_thread) };
+    // SAFETY: the walk holds the registry lock, which keeps each walked TCB
+    // allocated; the closure registers and unregisters no thread, the locks
+    // it takes (each TCB's `sched_lock` and its bound source's lock) are only
+    // try-locked and released before it prints, and the one lock it waits for
+    // is the console's leaf `CONSOLE_LOCK` in `kprintln!`, as `try_for_each`'s
+    // contract allows.
+    let walked = unsafe { thread_registry::try_for_each(|t| watchdog_dump_thread(t)) };
     if !walked
     {
         crate::kprintln!("    (registry lock contended; skipped)");
     }
-    crate::kprintln!("=== END WATCHDOG ===");
 }
 
-/// Decode and print the IPC object a `Blocked` thread is parked on, for the
-/// softlockup watchdog dump. The telling field is whether the object still
-/// queues `t` as a waiter (the wake was never issued) or has dequeued it /
-/// carries data while `t` is still `Blocked` (the wake was lost between the
-/// waker's deposit and the run-queue link) — the #351 lost-wakeup signature.
+/// A registry-walked thread's fields for the dump, read under its
+/// `sched_lock`, with the atomics read alongside.
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+struct ThreadSnapshot
+{
+    state: thread::ThreadState,
+    ipc: IpcThreadState,
+    bound: bool,
+    prio: u8,
+    pref: u32,
+    aff: u32,
+    wake_pending: bool,
+    started: u64,
+    wake_in_flight: u32,
+    deadline: u64,
+    queued_on: i16,
+    context_saved: u32,
+}
+
+/// Print one registry-walked thread, unless it is `Running` (a CPU's
+/// `current`, dumped above) or `Exited`. Everything printed is copied under
+/// the thread's `sched_lock`, which is released before the first line.
 ///
 /// # Safety
-/// `t` is a registry-walked TCB pointer kept mapped by the registry lock. Its
-/// `sched_lock`-owned fields and the blocking object's fields are read without
-/// their locks, so the reads are not race-free: a diagnostic-only residual
-/// #440 records. Nothing pins the object, so its scalar fields may be stale; no
-/// pointer read from it is followed. The waiter-queue probe reads only `t`'s queue tag
-/// (`WaitQueue::tags_racy`).
+/// `t` is a TCB the caller keeps allocated (the registry lock).
+#[cfg(not(test))]
+unsafe fn watchdog_dump_thread(t: *mut ThreadControlBlock)
+{
+    use core::sync::atomic::Ordering;
+    // SAFETY: caller contract; `thread_id` is immutable.
+    let tid = unsafe { (*t).thread_id };
+    // SAFETY: caller contract; try_lock_raw pairs with the unlock_raw below.
+    // The registry lock orders before every `sched_lock`, so holding it here
+    // is canonical; the try-lock only keeps a wedged holder from blocking the
+    // dump.
+    let Some(saved) = (unsafe { (*t).sched_lock.try_lock_raw() })
+    else
+    {
+        crate::kprintln!("    tid{} (sched_lock held)", tid);
+        return;
+    };
+    // SAFETY: under t's sched_lock, which serialises the plain fields'
+    // writers; the rest are atomics.
+    let (snap, blocked_on) = unsafe {
+        (
+            ThreadSnapshot {
+                state: (*t).state,
+                ipc: (*t).ipc_state,
+                bound: !(*t).blocked_on_object.is_null(),
+                prio: (*t).priority,
+                pref: (*t).preferred_cpu,
+                aff: (*t).cpu_affinity,
+                wake_pending: (*t).wake_pending,
+                started: (*t).park_started_tick,
+                wake_in_flight: (*t).wake_in_flight.load(Ordering::Relaxed),
+                deadline: (*t).sleep_deadline.load(Ordering::Relaxed),
+                queued_on: (*t).queued_on.load(Ordering::Relaxed),
+                context_saved: (*t).context_saved.load(Ordering::Relaxed),
+            },
+            (*t).blocked_on_object,
+        )
+    };
+    let decoded = if snap.state == thread::ThreadState::Blocked
+    {
+        // SAFETY: t's sched_lock is held and the binding was read under it.
+        unsafe { watchdog_read_blocked_on(t, snap.ipc, blocked_on) }
+    }
+    else
+    {
+        BlockedOnSnapshot::Unbound
+    };
+    // SAFETY: paired with the try_lock_raw above.
+    unsafe { (*t).sched_lock.unlock_raw(saved) };
+    watchdog_print_thread(tid, &snap, &decoded);
+}
+
+/// Print a walked thread's dump lines from its snapshot.
+#[cfg(not(test))]
+fn watchdog_print_thread(tid: u32, snap: &ThreadSnapshot, decoded: &BlockedOnSnapshot)
+{
+    match snap.state
+    {
+        thread::ThreadState::Blocked =>
+        {
+            crate::kprintln!(
+                "    tid{} Blocked ipc={:?} bound={} prio={} pref={} wake_pending={} \
+                 wake_in_flight={} dl={} parked_at={}",
+                tid,
+                snap.ipc,
+                snap.bound,
+                snap.prio,
+                snap.pref,
+                snap.wake_pending,
+                snap.wake_in_flight,
+                snap.deadline,
+                snap.started
+            );
+            watchdog_print_blocked_on(decoded);
+        }
+        thread::ThreadState::Ready
+        | thread::ThreadState::Stopped
+        | thread::ThreadState::Created =>
+        {
+            crate::kprintln!(
+                "    tid{} {:?} prio={} pref={} affinity=0x{:x} queued_on={} \
+                 context_saved={} wake_in_flight={} wake_pending={}",
+                tid,
+                snap.state,
+                snap.prio,
+                snap.pref,
+                snap.aff,
+                snap.queued_on,
+                snap.context_saved,
+                snap.wake_in_flight,
+                snap.wake_pending
+            );
+        }
+        // Running threads are each a CPU's `current`, already dumped above.
+        thread::ThreadState::Running | thread::ThreadState::Exited =>
+        {}
+    }
+}
+
+/// What the dump reads of the object a `Blocked` thread is parked on.
+#[cfg(not(test))]
+enum BlockedOnSnapshot
+{
+    /// No binding, or one the dump does not decode.
+    Unbound,
+    /// A reply or fault wait: the server's id, and whether its reply slot
+    /// still names the waiter.
+    Server
+    {
+        tid: u32, reply_is_self: bool
+    },
+    /// A source wait whose source lock was held.
+    SourceLocked,
+    /// A source wait's fields, read under the source lock.
+    Source(SourceSnapshot),
+}
+
+/// Read the IPC object a `Blocked` thread is parked on, for the softlockup
+/// watchdog dump. The telling field is whether the object still queues `t`
+/// as a waiter (the wake was never issued) or has dequeued it / carries data
+/// while `t` is still `Blocked` (the wake was lost between the waker's deposit
+/// and the run-queue link) — the #351 lost-wakeup signature.
+///
+/// # Safety
+/// The caller holds `t`'s `sched_lock` and read `(ipc, blocked_on)` under it.
+/// A binding observed under the bound thread's `sched_lock` names an object
+/// that is not freed while that lock is held (the argument of
+/// `ipc::lock_bound_source`; for a reply or fault wait, the server's teardown
+/// nulls the binding under this lock before the free). A source's fields are
+/// read under its own lock, try-locked (the inverse of the canonical order,
+/// so never waited on) and released before the return.
 #[cfg(not(test))]
 // cast_ptr_alignment: blocked_on_object is stored as *mut u8 but always points
 // at a properly-aligned IPC object whose concrete type is named by ipc_state.
 #[allow(clippy::cast_ptr_alignment)]
-unsafe fn watchdog_decode_blocked_on(t: *mut ThreadControlBlock)
+unsafe fn watchdog_read_blocked_on(
+    t: *mut ThreadControlBlock,
+    ipc: IpcThreadState,
+    blocked_on: *mut u8,
+) -> BlockedOnSnapshot
 {
     use core::sync::atomic::Ordering;
-    // SAFETY: caller contract: t is mapped; the binding is read without
-    // sched_lock (#440).
-    let (ipc, blocked_on) = unsafe { ((*t).ipc_state, (*t).blocked_on_object) };
     if blocked_on.is_null()
     {
-        return;
+        return BlockedOnSnapshot::Unbound;
     }
-    // Each arm reads object fields into locals under a tight `unsafe`, then
-    // prints outside it so the `kprintln!` macro's own `unsafe` is not redundant.
-    match ipc
+    if matches!(
+        ipc,
+        IpcThreadState::BlockedOnReply | IpcThreadState::BlockedOnFault
+    )
     {
-        IpcThreadState::BlockedOnEventQueue =>
+        let server = blocked_on.cast::<ThreadControlBlock>();
+        // SAFETY: for a reply/fault block, blocked_on is the live server TCB
+        // (contract); `thread_id` is immutable and `reply_tcb` atomic.
+        return unsafe {
+            BlockedOnSnapshot::Server {
+                tid: (*server).thread_id,
+                reply_is_self: core::ptr::eq((*server).reply_tcb.load(Ordering::Relaxed), t),
+            }
+        };
+    }
+    // SAFETY: the source is live (contract) and of the type ipc names.
+    let Some(source_lock) = (unsafe { crate::ipc::source_lock_of(ipc, blocked_on) })
+    else
+    {
+        return BlockedOnSnapshot::Unbound;
+    };
+    // SAFETY: source_lock is the live source's lock; try_lock_raw pairs with
+    // the unlock_raw below.
+    let Some(saved) = (unsafe { (*source_lock).try_lock_raw() })
+    else
+    {
+        return BlockedOnSnapshot::SourceLocked;
+    };
+    // SAFETY: ipc_state classifies blocked_on; its fields are read under its
+    // lock, and a queued TCB stays allocated while it is queued under it.
+    let source = unsafe { watchdog_read_source(t, ipc, blocked_on) };
+    // SAFETY: paired with the try_lock_raw above.
+    unsafe { (*source_lock).unlock_raw(saved) };
+    BlockedOnSnapshot::Source(source)
+}
+
+/// Print the blocking-object line of a `Blocked` thread. Threads are named
+/// by id; no pointer is printed.
+#[cfg(not(test))]
+fn watchdog_print_blocked_on(decoded: &BlockedOnSnapshot)
+{
+    match decoded
+    {
+        BlockedOnSnapshot::Unbound | BlockedOnSnapshot::Source(SourceSnapshot::None) =>
+        {}
+        BlockedOnSnapshot::Server { tid, reply_is_self } =>
         {
-            let eq = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
-            // SAFETY: ipc_state classifies blocked_on as an EventQueueState;
-            // the queue probe takes the queue's address without reading it and
-            // reads t's tag, t being kept mapped by the held registry lock; the
-            // object's fields are read without its lock (#440).
-            let (queued, count, capacity) = unsafe {
-                (
-                    crate::ipc::WaitQueue::tags_racy(core::ptr::addr_of!((*eq).waiters), t),
-                    (*eq).count.load(Ordering::Relaxed),
-                    (*eq).capacity,
-                )
-            };
-            crate::kprintln!(
-                "      eq: queued={} count={} capacity={}",
-                queued,
-                count,
-                capacity
-            );
+            crate::kprintln!("      server tid{} reply_is_self={}", tid, reply_is_self);
         }
-        IpcThreadState::BlockedOnNotification =>
+        BlockedOnSnapshot::SourceLocked => crate::kprintln!("      source lock held"),
+        BlockedOnSnapshot::Source(SourceSnapshot::EventQueue {
+            queued,
+            count,
+            capacity,
+        }) => crate::kprintln!(
+            "      eq: queued={} count={} capacity={}",
+            queued,
+            count,
+            capacity
+        ),
+        BlockedOnSnapshot::Source(SourceSnapshot::Notification { queued, bits }) =>
         {
-            let sig = blocked_on.cast::<crate::ipc::notification::NotificationState>();
-            // SAFETY: as for the event-queue arm, for a NotificationState.
-            let (queued, bits) = unsafe {
-                (
-                    crate::ipc::WaitQueue::tags_racy(core::ptr::addr_of!((*sig).waiters), t),
-                    (*sig).bits.load(Ordering::Relaxed),
-                )
-            };
             crate::kprintln!("      notif: queued={} bits=0x{:x}", queued, bits);
         }
-        IpcThreadState::BlockedOnReply | IpcThreadState::BlockedOnFault =>
+        BlockedOnSnapshot::Source(SourceSnapshot::Endpoint {
+            send_head,
+            recv_head,
+        }) => crate::kprintln!(
+            "      ep: send_head={} recv_head={}",
+            TidOrNone(*send_head),
+            TidOrNone(*recv_head)
+        ),
+        BlockedOnSnapshot::Source(SourceSnapshot::WaitSet { queued }) =>
         {
-            let server = blocked_on.cast::<ThreadControlBlock>();
-            // SAFETY: for a reply/fault block, blocked_on is the server TCB.
-            let (server_tid, reply_is_self, rt) = unsafe {
-                let rt = (*server).reply_tcb.load(Ordering::Relaxed);
-                ((*server).thread_id, core::ptr::eq(rt, t), rt)
-            };
-            crate::kprintln!(
-                "      server tid{} reply_is_self={} reply_tcb={:p}",
-                server_tid,
-                reply_is_self,
-                rt
-            );
-        }
-        IpcThreadState::BlockedOnSend | IpcThreadState::BlockedOnRecv =>
-        {
-            let ep = blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
-            // SAFETY: ipc_state classifies blocked_on as an EndpointState; its
-            // queue heads are read without ep.lock (#440).
-            let (send_head, recv_head) = unsafe { ((*ep).send_head, (*ep).recv_head) };
-            crate::kprintln!(
-                "      ep: send_head={:p} recv_head={:p}",
-                send_head,
-                recv_head
-            );
-        }
-        IpcThreadState::BlockedOnWaitSet =>
-        {
-            let ws = blocked_on.cast::<crate::ipc::wait_set::WaitSetState>();
-            // SAFETY: as for the event-queue arm, for a WaitSetState.
-            let queued =
-                unsafe { crate::ipc::WaitQueue::tags_racy(core::ptr::addr_of!((*ws).waiters), t) };
             crate::kprintln!("      waitset: queued={}", queued);
         }
-        IpcThreadState::None =>
-        {}
+    }
+}
+
+/// A thread id, or `none`, for the dump's queue heads.
+#[cfg(not(test))]
+struct TidOrNone(Option<u32>);
+
+#[cfg(not(test))]
+impl core::fmt::Display for TidOrNone
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        match self.0
+        {
+            Some(tid) => write!(f, "tid{tid}"),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// The fields of a blocking source the dump prints.
+#[cfg(not(test))]
+enum SourceSnapshot
+{
+    EventQueue
+    {
+        queued: bool,
+        count: u32,
+        capacity: u32,
+    },
+    Notification
+    {
+        queued: bool,
+        bits: u64,
+    },
+    Endpoint
+    {
+        send_head: Option<u32>,
+        recv_head: Option<u32>,
+    },
+    WaitSet
+    {
+        queued: bool,
+    },
+    None,
+}
+
+/// Read the dump's fields of the source `blocked_on`, of the type `ipc`
+/// names.
+///
+/// # Safety
+/// The source is live, its lock is held, and `t` is a valid TCB.
+#[cfg(not(test))]
+// cast_ptr_alignment: as for watchdog_read_blocked_on.
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn watchdog_read_source(
+    t: *mut ThreadControlBlock,
+    ipc: IpcThreadState,
+    blocked_on: *mut u8,
+) -> SourceSnapshot
+{
+    use core::sync::atomic::Ordering;
+    // SAFETY: caller contract: the typed source is live and locked, so its
+    // queues and fields are stable, and each queued TCB (a queue head) stays
+    // allocated while queued; `thread_id` is immutable.
+    unsafe {
+        match ipc
+        {
+            IpcThreadState::BlockedOnEventQueue =>
+            {
+                let eq = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
+                SourceSnapshot::EventQueue {
+                    queued: (*eq).waiters.contains(t),
+                    count: (*eq).count.load(Ordering::Relaxed),
+                    capacity: (*eq).capacity,
+                }
+            }
+            IpcThreadState::BlockedOnNotification =>
+            {
+                let sig = blocked_on.cast::<crate::ipc::notification::NotificationState>();
+                SourceSnapshot::Notification {
+                    queued: (*sig).waiters.contains(t),
+                    bits: (*sig).bits.load(Ordering::Relaxed),
+                }
+            }
+            IpcThreadState::BlockedOnSend | IpcThreadState::BlockedOnRecv =>
+            {
+                let ep = blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
+                // A non-null queue head is a queued, allocated TCB.
+                let head_tid =
+                    |head: *mut ThreadControlBlock| (!head.is_null()).then(|| (*head).thread_id);
+                SourceSnapshot::Endpoint {
+                    send_head: head_tid((*ep).send_head),
+                    recv_head: head_tid((*ep).recv_head),
+                }
+            }
+            IpcThreadState::BlockedOnWaitSet =>
+            {
+                let ws = blocked_on.cast::<crate::ipc::wait_set::WaitSetState>();
+                SourceSnapshot::WaitSet {
+                    queued: (*ws).waiters.contains(t),
+                }
+            }
+            _ => SourceSnapshot::None,
+        }
     }
 }
 

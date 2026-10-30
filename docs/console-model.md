@@ -31,8 +31,7 @@ direct console paths remain as fallbacks for the life of the system.
    userspace IPC. The kernel framebuffer renderer is similarly **retained**: it carries the
    mirrored `kprintln!` console, including the address-free header line of a fatal
    `KERNEL EXCEPTION` dump, while the panic path itself is serial-only
-   (`console::panic_write_fmt`). The dump's kernel-address lines also reaching the screen is
-   an open defect ([#440](https://github.com/kottlerg/seraph/issues/440)), not a design goal.
+   (`console::panic_write_fmt`). The dump's kernel-address lines are serial-only.
    The kernel never becomes a client of the userspace serial or framebuffer driver.
 
    A **serial-only class** of kernel output writes the UART but skips the
@@ -43,8 +42,7 @@ direct console paths remain as fallbacks for the life of the system.
    kernel writes that framebuffer directly rather than as a driver client, the
    framebuffer memory is later handed to the userspace framebuffer driver — so
    anything `kprintln!` draws can be read back by userspace. Which kernel output must use the
-   serial-only class, and the paths that still print kernel addresses through `kprintln!`
-   ([#440](https://github.com/kottlerg/seraph/issues/440)), are specified in
+   serial-only class is specified in
    [core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
    § Kernel console diagnostics.
 
@@ -178,8 +176,7 @@ framebuffer drivers for the life of the system, and neither can depend on the IP
 that the drivers require. The UART path is kept so a panic can still produce output; the
 framebuffer renderer is kept so the mirrored `kprintln!` console, including the address-free
 header line of a fatal `KERNEL EXCEPTION` dump, reaches the screen (the dump's kernel-address
-lines reaching it are the open [#440](https://github.com/kottlerg/seraph/issues/440) defect,
-not a design goal). The bootloader console (UART and
+lines are serial-only). The bootloader console (UART and
 framebuffer) and init-logd's direct-UART path are fixed parts of the boot design that bypass the
 drivers only within their windows, which end at the kernel handoff and the real-logd handover
 respectively; they carry output before the drivers are reachable. All of these paths share the

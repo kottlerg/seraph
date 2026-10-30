@@ -157,7 +157,10 @@ unsafe fn walk_locked(mut f: impl FnMut(*mut ThreadControlBlock)) -> bool
 /// [`THREAD_REGISTRY_LOCK`]). It may read through the TCB pointer, and it may
 /// take locks that order after `THREAD_REGISTRY_LOCK` (the TCB's
 /// `sched_lock`, and under it the lock of the source the TCB is bound to)
-/// only by try-lock, releasing each before it returns.
+/// only by try-lock, releasing each before it returns. The one lock it may
+/// wait for is the kernel console's `CONSOLE_LOCK` (`kprintln!`), a leaf
+/// spin lock no holder keeps across an acquisition of any other lock, so its
+/// holder never waits on this walk.
 pub unsafe fn try_for_each(f: impl FnMut(*mut ThreadControlBlock)) -> bool
 {
     // SAFETY: try_lock_raw never blocks; None means contended, so we back off.

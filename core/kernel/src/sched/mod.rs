@@ -1061,7 +1061,7 @@ fn bsp_stall_check(own_heartbeat: u64)
 /// Every lock the dump reads under is only try-locked, so a wedged holder
 /// cannot deadlock it (its output still takes the console lock): a CPU's
 /// scheduler lock and its `current`'s `sched_lock` for the per-CPU snapshot,
-/// `SLEEP_LIST_LOCK` and each listed thread's `sched_lock` for the sleep
+/// `SLEEP_LIST_LOCK` (a leaf; nothing is taken under it) for the sleep
 /// list, and the registry lock, each walked thread's `sched_lock` and its
 /// blocking source's lock for the registry walk. A contended lock prints as
 /// held and its fields are skipped. Kernel addresses go through
@@ -1385,9 +1385,11 @@ fn watchdog_dump_registry()
 {
     crate::kprintln!("  NON-RUNNING REGISTERED THREADS:");
     // SAFETY: the walk holds the registry lock, which keeps each walked TCB
-    // allocated; the closure registers and unregisters no thread, and the
-    // locks it takes (each TCB's `sched_lock` and its bound source's lock) are
-    // only try-locked, as `try_for_each`'s contract allows.
+    // allocated; the closure registers and unregisters no thread, the locks
+    // it takes (each TCB's `sched_lock` and its bound source's lock) are only
+    // try-locked and released before it prints, and the one lock it waits for
+    // is the console's leaf `CONSOLE_LOCK` in `kprintln!`, as `try_for_each`'s
+    // contract allows.
     let walked = unsafe { thread_registry::try_for_each(|t| watchdog_dump_thread(t)) };
     if !walked
     {
@@ -1695,7 +1697,7 @@ enum SourceSnapshot
 /// # Safety
 /// The source is live, its lock is held, and `t` is a valid TCB.
 #[cfg(not(test))]
-// cast_ptr_alignment: as for watchdog_decode_blocked_on.
+// cast_ptr_alignment: as for watchdog_read_blocked_on.
 #[allow(clippy::cast_ptr_alignment)]
 unsafe fn watchdog_read_source(
     t: *mut ThreadControlBlock,

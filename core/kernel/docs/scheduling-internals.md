@@ -123,8 +123,11 @@ skipping levels, risks deadlock.
    walks the registry via `try_for_each` (a non-blocking `try_lock`, so a
    contended or CPU-died lock degrades to a skipped section rather than a
    hang), and under it only try-locks each walked thread's `sched_lock` and,
-   under that, the lock of the source the thread is bound to (§ Softlockup
-   Watchdog). See § Thread Registry.
+   under that, the lock of the source the thread is bound to; the one lock it
+   waits for under the registry lock is the console's `CONSOLE_LOCK`
+   (`kprintln!`), a leaf no holder keeps across another acquisition, so that
+   wait is on no CPU that needs the registry (§ Softlockup Watchdog). See
+   § Thread Registry.
 
 4. **Per-TCB-then-cross-CPU acquisition rule.** A path mutating a TCB's Scheduling field group MUST
    acquire `(*tcb).sched_lock` FIRST (outermost among the scheduler locks), THEN any per-CPU
@@ -192,7 +195,7 @@ skipping levels, risks deadlock.
    while already holding a run-queue lock — the inverse of the canonical order; the `try` backs off
    on contention (a canonical holder makes it fail), so both are deadlock-free. For the pull, the
    source CPU's run-queue lock pins the candidate so the pointer cannot be freed under it; for the
-   snapshot, the CPU's lock pins its `current` (§ Cross-CPU TCB Ownership, step 8). Its two
+   snapshot, the CPU's lock pins its `current` (§ Cross-CPU TCB Ownership, step 8). The pull's two
    run-queue locks are themselves `try_lock_raw` (ascending order retained): the pull runs from
    every CPU's tick with interrupts disabled, and blocking there lets every idle CPU queue on one
    victim's lock — the FIFO ticket convoy that livelocked the guest system-wide under vCPU
@@ -1343,12 +1346,13 @@ prints still takes the console lock (`kprintln!`): each CPU's `current` under th
 thread's own `sched_lock`; the sleep-list entries' ids and deadlines under `SLEEP_LIST_LOCK` (a
 leaf, so nothing is taken under it; the threads' states are printed by the registry walk), copied
 there and printed after the unlock; the walked threads under the registry walk's `try_for_each` and
-each thread's `sched_lock`, copied there and printed after the unlock; and a `Blocked` thread's
-blocking source under that `sched_lock` (whose observed binding keeps the source allocated, the
-argument of `ipc::lock_bound_source`) and the source's own lock. The owed-wake detector (2 below)
-reads the walked threads' `sched_lock`-owned fields under each thread's try-locked `sched_lock`,
-skipping a thread whose lock is held for that scan. The dump names threads by id and prints no
-kernel pointer through `kprintln!`, as [cross-boundary-disclosure.md § Kernel console
+each thread's `sched_lock`, copied there and printed after that `sched_lock` is released (still
+under the registry lock); and a `Blocked` thread's blocking source under that `sched_lock` (whose
+observed binding keeps the source allocated, the argument of `ipc::lock_bound_source`) and the
+source's own lock. The owed-wake detector (2 below) reads the walked threads' `sched_lock`-owned
+fields under each thread's try-locked `sched_lock`, skipping a thread whose lock is held for that
+scan. The dump names threads by id and prints no kernel pointer through `kprintln!`, as
+[cross-boundary-disclosure.md § Kernel console
 diagnostics](cross-boundary-disclosure.md#kernel-console-diagnostics) requires.
 
 Three detectors feed the latch:

@@ -105,9 +105,43 @@ pub enum DestRef
     /// `QuotaExceeded` at the ceiling (`SYS_CAP_MOVE`).
     Checked,
     /// Taken unchecked: the caller checked the ceiling for every cap of the
-    /// operation under the same lock hold, before its first move (an IPC
-    /// transfer, which must not refuse one cap after another has moved).
+    /// operation under the same lock hold, before its first move
+    /// ([`check_transfer_ref_limits`]; an IPC transfer, which must not refuse
+    /// one cap after another has moved).
     Prechecked,
+}
+
+/// Refuse a set of transfer handles one of which names an object at
+/// [`REF_COUNT_LIMIT`](super::object::REF_COUNT_LIMIT), so a message's moves
+/// can take their destinations' references unchecked
+/// ([`DestRef::Prechecked`]) and none refuses one cap after earlier ones
+/// moved. A handle whose slot is empty or out of range passes: the slot
+/// validation that accompanies this check refuses it.
+///
+/// # Errors
+///
+/// `QuotaExceeded` when any handle's object is at the ceiling.
+///
+/// # Safety
+///
+/// The caller holds `cs`'s lock, so every occupied slot's object is live for
+/// the call.
+pub unsafe fn check_transfer_ref_limits(cs: &CSpace, handles: &[u32]) -> Result<(), SyscallError>
+{
+    for &handle in handles
+    {
+        let at_limit = cs
+            .slot(syscall::cap_handle_index(handle))
+            .and_then(|slot| slot.object)
+            // SAFETY: caller contract: an occupied slot's object is live
+            // while the CSpace lock is held.
+            .is_some_and(|o| unsafe { o.as_ref() }.at_ref_limit());
+        if at_limit
+        {
+            return Err(SyscallError::QuotaExceeded);
+        }
+    }
+    Ok(())
 }
 
 /// Begin a move: take the destination's object reference (as `dst_ref`
@@ -1073,6 +1107,57 @@ mod tests
         assert_eq!(refcount(obj), REF_COUNT_LIMIT);
         assert_eq!(snap(src), before, "the source is untouched");
         assert_eq!(count_populated(b), 0, "no destination was inserted");
+        crate::cap::unregister_cspace(ID_A);
+        crate::cap::unregister_cspace(ID_B);
+    }
+
+    // Defect guarded: an IPC transfer's move refusing a cap the message check
+    // admitted, the partial delivery the check exists to prevent; and a
+    // message check that misses one cap at the ceiling among several.
+    #[test]
+    fn a_message_check_refuses_at_the_ceiling_and_a_prechecked_move_then_succeeds()
+    {
+        use crate::cap::object::REF_COUNT_LIMIT;
+        const ID_A: CSpaceId = 3221;
+        const ID_B: CSpaceId = 3222;
+        let a = mk_registered_cspace(ID_A);
+        let b = mk_registered_cspace(ID_B);
+        let free_obj = mk_object();
+        let full_obj = mk_object();
+        let (_r1, _s1, _b1, _k1, free_handle) = mk_tree(a, ID_A, 0, free_obj);
+        let (_r2, _s2, _b2, _k2, full_handle) = mk_tree(a, ID_A, 0, full_obj);
+        // SAFETY: leaked header, valid for the process lifetime.
+        unsafe { full_obj.as_ref() }
+            .ref_count
+            .store(REF_COUNT_LIMIT, Ordering::Relaxed);
+
+        // SAFETY: single-threaded test CSpace; every slot's object is leaked.
+        let cs = unsafe { &*a };
+        // SAFETY: as above.
+        assert!(unsafe { check_transfer_ref_limits(cs, &[free_handle]) }.is_ok());
+        assert!(matches!(
+            // SAFETY: as above.
+            unsafe { check_transfer_ref_limits(cs, &[free_handle, full_handle]) },
+            Err(SyscallError::QuotaExceeded)
+        ));
+
+        // A move the caller prechecked takes its reference unchecked, even
+        // when the count reached the ceiling after the check.
+        DERIVATION_LOCK.write_lock();
+        // SAFETY: DERIVATION_LOCK held; test CSpaces are live and unshared.
+        let step =
+            unsafe { move_cap_begin(a, full_handle, b, None, DestRef::Prechecked) }.expect("begin");
+        DERIVATION_LOCK.write_unlock();
+        let MoveStep::Done { release, .. } = step
+        else
+        {
+            panic!("a childless source completes in one batch: {step:?}");
+        };
+        assert_eq!(release, Some(full_obj));
+        assert_eq!(refcount(full_obj), REF_COUNT_LIMIT + 1);
+        // SAFETY: the reference handed back above.
+        unsafe { release_moved_object(full_obj) };
+        assert_eq!(refcount(full_obj), REF_COUNT_LIMIT);
         crate::cap::unregister_cspace(ID_A);
         crate::cap::unregister_cspace(ID_B);
     }

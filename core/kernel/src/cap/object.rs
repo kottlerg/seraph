@@ -129,10 +129,13 @@ pub struct KernelObjectHeader
 /// that passed `retype_allocate`'s check before another took the count to the
 /// ceiling (one), and the destinations of an IPC transfer it has in flight that
 /// passed the message check (at most `MSG_CAP_SLOTS_MAX`, four); fewer than 16
-/// in all. Per other object: wait-set
-/// membership (one per source), Mmio mapping records (four per Mmio object,
-/// whose bodies are SEED-backed), address-space death observers (a fixed
-/// number per address space), and SEED leases (bounded by the SEED reserve).
+/// in all. Per other object: wait-set membership (one per source), Mmio mapping
+/// records (four per Mmio object, whose bodies are SEED-backed), address-space
+/// death observers (a fixed number per address space), SEED leases (bounded by
+/// the SEED reserve), and the destinations IPC transfers' abandoned moves leave
+/// live: a message check refuses once the count is at the ceiling, and
+/// transfers run one at a time under `DERIVATION_LOCK`, so these keep an
+/// object's slot references within `MSG_CAP_SLOTS_MAX - 1` of the ceiling.
 /// Exhausting the headroom would take some 2^27 threads, each with its own
 /// kernel stack and TCB (at least 2 TiB of kernel stacks), so the count cannot
 /// wrap (core/kernel/docs/capability-internals.md § Kernel Object Reference
@@ -183,7 +186,9 @@ impl KernelObjectHeader
     /// a mapping record, a SEED lease, or the lease of a retype that
     /// [`crate::cap::retype::retype_allocate`] admitted (see
     /// core/kernel/docs/capability-internals.md § Kernel Object Reference
-    /// Counting). A new capability slot, a move's destination included, takes
+    /// Counting), or an IPC transfer's move destination, whose message
+    /// [`crate::cap::transfer::check_transfer_ref_limits`] checked first. Every
+    /// other new capability slot, a `SYS_CAP_MOVE` destination included, takes
     /// its reference through [`Self::try_inc_ref`] instead.
     pub fn inc_ref(&self)
     {

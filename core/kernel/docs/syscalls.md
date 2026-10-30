@@ -297,7 +297,8 @@ when the message carries capabilities.
 its maximum is clamped, not refused),
 `InvalidAddress` (registered IPC buffer page unmapped), `InvalidState` (a cap
 slot is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
-transfer), `Interrupted` (the call was cancelled while blocked, including by the receiving thread
+transfer), `QuotaExceeded` (a cap's object has its reference count at its 2^31 ceiling),
+`Interrupted` (the call was cancelled while blocked, including by the receiving thread
 receiving again before it replied; see `SYS_IPC_RECV`). Cap-slot
 problems are rejected before the caller blocks; a refusal that arises only
 afterwards degrades to delivery with zero caps (the caller keeps its

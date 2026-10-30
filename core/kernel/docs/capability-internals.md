@@ -441,8 +441,10 @@ retype it has in flight that passed `retype_allocate`'s check just before the co
 limit (one), and the destinations of an IPC transfer it has in flight that passed the message check
 (at most `MSG_CAP_SLOTS_MAX`, four); fewer than 16 in all. Per other object: wait-set membership
 (one per source), Mmio mapping records (four per Mmio object, whose bodies are SEED-backed),
-address-space death observers (a fixed number per address space), and SEED leases (bounded by the
-SEED reserve).
+address-space death observers (a fixed number per address space), SEED leases (bounded by the
+SEED reserve), and the destinations IPC transfers' abandoned moves leave live (a message check
+refuses once the count is at the limit and transfers run one at a time under the derivation lock,
+so these keep an object's slot references within `MSG_CAP_SLOTS_MAX - 1` of the limit).
 Exhausting the headroom would take some 2^27 threads, each with its own kernel stack and TCB (at
 least 2 TiB of kernel stacks).
 

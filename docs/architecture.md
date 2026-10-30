@@ -45,8 +45,8 @@ kernel boundary — see [capability-model.md](capability-model.md#schedcontrol).
 Physical frame allocation, virtual address space management, and page table
 maintenance. The kernel enforces isolation between address spaces and explicit,
 capability‑controlled sharing (revoking a Memory capability does not unmap pages
-already mapped through its descendants; see
-[capability-model.md](capability-model.md#memory), #516).
+already mapped through its descendants, and a server verifies their withdrawal through
+the capability's mappings count; see [capability-model.md](capability-model.md#memory)).
 
 **Capabilities**
 The sole access control mechanism. All resources—memory regions, IPC endpoints,

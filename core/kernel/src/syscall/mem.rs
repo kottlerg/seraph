@@ -141,6 +141,18 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidArgument);
     }
 
+    // Revocation/map boundary (core/kernel/docs/memory-internals.md § Frame
+    // Map Table). Resolve the handle again now that the frames are pinned: a
+    // revoke clears the slot before its issuer reads the mapping count, so
+    // either this lookup sees the cleared slot and the map is refused, or the
+    // issuer's count sees the pins and every leaf this call installs.
+    // SAFETY: caller_cspace validated above; lookup_cap checks tag and rights.
+    let still_held = unsafe { super::lookup_cap(caller_cspace, memory_idx, MemRights::MAP) }?;
+    if still_held.object != memory_slot.object
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+
     // Determine page permissions per `core/kernel/docs/syscalls.md`
     // § `SYS_MEM_MAP` (16), prot_bits.
     let (writable, executable) = if prot_bits != 0

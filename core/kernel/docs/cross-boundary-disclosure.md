@@ -56,6 +56,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | Syscall return convention; no raw-pointer return path | `syscall::dispatch`, `TrapFrame::set_return` | b/c/d |
 | `SYS_CAP_INFO` tag/rights (rights half is type-scoped, interpreted via the tag in the high half), thread-state, TLB / cspace / memory / address-space page-table budget counts, memory has-retype flag | `cap::sys_cap_info` | c/d |
 | `CAP_INFO_MEMORY_PHYS_BASE` → `MemoryObject::base` | `cap::sys_cap_info`, `cap::object::MemoryObject` | **e** |
+| `CAP_INFO_MEMORY_MAPPINGS` → summed user-mapping counts of a Memory region's frames | `cap::sys_cap_info`, `mm::frame_map::mappings_in` | d |
 | `SYS_SYSTEM_INFO` (kernel and boot-protocol versions, cpu count, page size, elapsed µs, current cpu) | `sysinfo::sys_system_info` | c/d |
 | `SYS_ASPACE_QUERY` → leaf physical address of a user page | `sysinfo::sys_aspace_query`, `AddressSpace::query_page` | **e** |
 | `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d |
@@ -131,6 +132,13 @@ Notes on the non-obvious entries:
   addresses (**d**); the only addresses it carries are physical — each
   `CapDescriptor::aux0` for a Memory/Mmio cap and `InitFramebufferInfo::physical_base`
   (**e**, see "Physical-address surfaces"). No field is a kernel VA.
+- **`CAP_INFO_MEMORY_MAPPINGS`** returns a count (**d**). It is the number of user
+  page-table leaves, in any address space, that name a frame of the queried Memory region.
+  It carries no address, and the kernel answers only through a Memory capability the caller
+  holds, for a region of at most 512 pages. What it discloses beyond the caller's own
+  mappings is how many leaves other holders of the same frames map, a coarse activity signal
+  about those holders. A server that hands pages out needs exactly that signal: it reuses a
+  page only once a client's mapping of it is gone.
 
 ## Physical-address surfaces
 

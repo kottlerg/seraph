@@ -2616,9 +2616,9 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
     use syscall::{
         CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY,
         CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
-        CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS,
-        CAP_INFO_THREAD_STATE, CAP_INFO_TLB_ELIDED, CAP_INFO_TLB_PERFORMED, THREAD_STATE_ALIVE,
-        THREAD_STATE_CREATED, THREAD_STATE_EXITED,
+        CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES, CAP_INFO_MEMORY_PHYS_BASE,
+        CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, CAP_INFO_THREAD_STATE, CAP_INFO_TLB_ELIDED,
+        CAP_INFO_TLB_PERFORMED, THREAD_STATE_ALIVE, THREAD_STATE_CREATED, THREAD_STATE_EXITED,
     };
 
     use crate::cap::object::{AddressSpaceObject, CSpaceKernelObject, MemoryObject, ThreadObject};
@@ -2714,6 +2714,31 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             #[allow(clippy::cast_ptr_alignment)]
             let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
             Ok(memory.base)
+        }
+        CAP_INFO_MEMORY_MAPPINGS =>
+        {
+            if tag != CapTag::Memory
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            // SAFETY: tag confirmed Memory.
+            // cast_ptr_alignment: the wrapper (constructed in place at a size-class-aligned
+            // retype offset, so 8-byte aligned) holds the header at offset 0.
+            #[allow(clippy::cast_ptr_alignment)]
+            let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
+            // Read-lock the region so a concurrent split cannot shrink it
+            // between the bound check and the walk.
+            let _guard = crate::cap::object::MemoryReadGuard::acquire(memory);
+            if memory.size > CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES * crate::mm::PAGE_SIZE as u64
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            // Order the caller's earlier revokes before the count reads, the
+            // issuer's side of the revocation/map boundary that
+            // `sys_mem_map`'s second handle lookup closes
+            // (core/kernel/docs/memory-internals.md § Frame Map Table).
+            core::sync::atomic::fence(Ordering::SeqCst);
+            Ok(crate::mm::frame_map::mappings_in(memory.base, memory.size))
         }
         CAP_INFO_THREAD_STATE =>
         {

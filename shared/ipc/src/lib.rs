@@ -1382,10 +1382,10 @@ pub mod devmgr_labels
     /// service endpoint of one block driver to the caller. devmgr spawns a
     /// driver for every block device it enumerates and can give a private
     /// IRQ line (one whose line another device already holds is not served,
-    /// #664); `data[1]`, when sent, selects which: an ordinal over the running block drivers in PCI
-    /// segment, bus, device, function order, not stable across boots (a
-    /// device added, removed, or failing its spawn shifts the ones after it).
-    /// An absent `data[1]` is 0, the first. Caller's badge must have
+    /// #664); `data[1]`, when sent, selects which: an ordinal over the
+    /// running block drivers in PCI segment, bus, device, function order,
+    /// not stable across boots (a device added, removed, or failing its
+    /// spawn shifts the ones after it). An absent `data[1]` is 0, the first. Caller's badge must have
     /// [`BLOCK_DEVICE_AUTHORITY`] set; the handler replies `UNAUTHORIZED`
     /// otherwise, and `INVALID_REQUEST` when no block driver runs at that
     /// ordinal or the derivation fails.

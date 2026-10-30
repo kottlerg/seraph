@@ -980,7 +980,7 @@ impl IrqRangeAllocator
 
     /// Isolate a single-IRQ cap for line `id`; [`CarveError::NotCovered`]
     /// when no held range contains it (another device already holds the
-    /// line, or it lies outside the range cap).
+    /// line, it lies outside the range cap, or devmgr holds no range).
     fn isolate_one(&mut self, id: u32) -> Result<u32, CarveError>
     {
         self.ranges
@@ -1328,7 +1328,7 @@ fn acquire_single_irq_cap(
         {
             // Shared INTx lines are not served yet (#664).
             std::os::seraph::log!(
-                "GSI {:#x} already held by another device (or outside the IRQ range); no IRQ cap",
+                "GSI {:#x} not in a held IRQ range (another device holds it, or no range); no IRQ cap",
                 u64::from(gsi)
             );
             None

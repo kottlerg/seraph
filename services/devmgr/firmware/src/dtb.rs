@@ -653,7 +653,8 @@ mod tests
             .end()
             .finish();
         let found = Fdt::new(&blob).unwrap().find_pci_ecams().unwrap();
-        // The malformed second node is skipped; the nodes after it still count.
+        // The malformed second node is skipped and takes no segment; the nodes
+        // after it still yield windows.
         let got: Vec<_> = found
             .iter()
             .map(|l| (l.phys_base, l.end_bus, l.segment))

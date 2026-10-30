@@ -17,9 +17,9 @@
 //! ## Read path
 //! - Inline reads carry the payload in the IPC buffer.
 //! - Memory-cap reads: the driver returns a Memory cap covering one cached
-//!   page; we reserve VA, `mem_map` it read-only, copy out, then
-//!   proactively release the cache slot via `FS_RELEASE_MEMORY` and tear
-//!   the mapping down locally.
+//!   page; we reserve VA, `mem_map` it read-only, copy out, tear the
+//!   mapping down locally, then proactively release the cache slot via
+//!   `FS_RELEASE_MEMORY`.
 //!
 //! ## Write path
 //! - Inline writes carry the payload in the IPC buffer.

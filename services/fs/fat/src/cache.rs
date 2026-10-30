@@ -43,12 +43,16 @@
 //! replacement page (a clean spare, else a fresh page from memmgr), and the
 //! still-mapped page is quarantined: kept, never returned to memmgr, and
 //! re-checked on every later pick. A quarantined page whose count falls to
-//! 0 becomes a spare. Spares and quarantined pages together never exceed
-//! [`QUARANTINE_MAX`]. Past that bound, a still-mapped slot stays out of
-//! service until its client unmaps, and a read that finds no reusable slot is
-//! answered `IO_ERROR`, as under ordinary cache pressure. One client can
-//! therefore cost the fs at most `QUARANTINE_MAX` extra pages before the
-//! cache starts to shrink.
+//! 0, after a revoke that completed, becomes a spare. A revoke that does not
+//! complete (a holder deriving faster than revocation reaches) skips the slot
+//! or the page for that pick, so a surviving derivation can never map a page
+//! the cache reuses. The cache holds at most [`SLOT_COUNT`] + [`QUARANTINE_MAX`]
+//! pages in all: it requests a replacement page from memmgr only while its
+//! spares and quarantined pages number fewer than `QUARANTINE_MAX`. Past that
+//! bound, a still-mapped slot stays out of service until its client unmaps,
+//! and a read that finds no reusable slot is answered `IO_ERROR`, as under
+//! ordinary cache pressure. Clients that never unmap can therefore cost the
+//! fs at most `QUARANTINE_MAX` extra pages before the cache starts to shrink.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -87,8 +91,9 @@ struct ScratchMemory
 /// Number of cache slots.
 pub const SLOT_COUNT: usize = 128;
 
-/// Most pages the cache holds beyond its [`SLOT_COUNT`] slot pages: the
-/// quarantined pages a client still maps plus the clean spares they become.
+/// Most pages the cache holds beyond [`SLOT_COUNT`]: it requests a replacement
+/// page from memmgr only while its quarantined pages (still mapped by a
+/// client) and clean spares number fewer than this.
 pub const QUARANTINE_MAX: usize = 32;
 
 /// Number of consecutive sectors held in one cache slot. Fixed by the
@@ -514,7 +519,12 @@ impl PageCache
         {
             return false;
         }
-        let _ = syscall::cap_revoke_all(cap);
+        // A revoke that does not complete can leave a client a derivation that
+        // maps the page later; skip the slot for this pick instead.
+        if syscall::cap_revoke_all(cap).is_err()
+        {
+            return false;
+        }
         // An unreadable count is treated as still mapped.
         if syscall::cap_info(cap, CAP_INFO_MEMORY_MAPPINGS) == Ok(1)
         {
@@ -655,14 +665,15 @@ enum Swap
 
 impl Quarantine
 {
-    /// Move every held page that no address space maps any more to the spare
-    /// list.
+    /// Move every held page that no address space maps any more, and that no
+    /// derivation survives to map again, to the spare list.
     fn recheck(&mut self)
     {
         let mut i = 0;
         while i < self.held.len()
         {
-            if syscall::cap_info(self.held[i], CAP_INFO_MEMORY_MAPPINGS) == Ok(0)
+            if syscall::cap_revoke_all(self.held[i]).is_ok()
+                && syscall::cap_info(self.held[i], CAP_INFO_MEMORY_MAPPINGS) == Ok(0)
             {
                 let cap = self.held.swap_remove(i);
                 self.spare.push(cap);

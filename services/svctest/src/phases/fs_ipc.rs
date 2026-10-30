@@ -1126,14 +1126,17 @@ pub fn fs_carried_caps_dropped_phase(_: &Caps)
     std::os::seraph::log!("fs_carried_caps_dropped phase passed");
 }
 
-/// Pages of the slot-reuse file: more than fatfs's cache slots
-/// (`services/fs/fat/src/cache.rs` `SLOT_COUNT`, 128), so a read of the
-/// whole file reuses every unreferenced slot. Raise it with `SLOT_COUNT`, or
-/// the phase stops testing reuse.
-const SLOT_REUSE_PAGES: usize = 136;
+/// fatfs's cache slots (`services/fs/fat/src/cache.rs` `SLOT_COUNT`).
+const FATFS_SLOT_COUNT: usize = 128;
 
-/// Pages the slot-reuse phase holds mapped at once: more than fatfs's
-/// quarantine bound (`services/fs/fat/src/cache.rs` `QUARANTINE_MAX`, 32), so
+/// fatfs's quarantine bound (`services/fs/fat/src/cache.rs` `QUARANTINE_MAX`).
+const FATFS_QUARANTINE_MAX: usize = 32;
+
+/// Pages of the slot-reuse file: more than fatfs's slots plus its quarantine
+/// bound, so holding pages until fatfs refuses one ends before the file does.
+const SLOT_REUSE_PAGES: usize = 200;
+
+/// Pages the first case holds mapped: more than the quarantine bound, so
 /// some still-mapped slots must stay out of service instead of being given a
 /// replacement page.
 const SLOT_REUSE_HELD: usize = 40;
@@ -1150,8 +1153,8 @@ fn page_tag(index: usize) -> [u8; 8]
     tag
 }
 
-/// One page of the slot-reuse file that svctest keeps mapped after closing
-/// the file it read it through.
+/// One page of the slot-reuse file that svctest keeps mapped after handing
+/// it back to fatfs.
 struct HeldPage
 {
     index: usize,
@@ -1162,20 +1165,25 @@ struct HeldPage
 
 impl HeldPage
 {
-    /// Look the file up, `FS_READ_MEMORY` page `index` without a release
-    /// endpoint, map the returned cap read-only, and close the node, which
-    /// revokes the cap and drops fatfs's slot while the mapping stays.
-    fn take(svctest: u32, name: &[u8], index: usize, ipc_buf: *mut u64) -> Self
+    /// `FS_READ_MEMORY` page `index` of the open `node` without a release
+    /// endpoint, map the returned cap read-only, then send `FS_RELEASE_MEMORY`
+    /// without unmapping. fatfs revokes the cap and drops its slot while the
+    /// mapping stays. `None` when fatfs answers `IO_ERROR`, finding no slot it
+    /// may reuse.
+    fn take(node: u32, index: usize, ipc_buf: *mut u64) -> Option<Self>
     {
-        let (node, _kind, _size) =
-            ns_lookup(svctest, name, 0xFFFF, ipc_buf).expect("slot reuse: lookup");
+        let cookie = 0x5107_0000 + index as u64;
         let read = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
             .word(0, (index * SLOT_REUSE_PAGE) as u64)
-            .word(1, 0x5107_0000 + index as u64)
+            .word(1, cookie)
             .build();
         // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
         let reply = unsafe { ipc::ipc_call(node, &read, ipc_buf) }
             .expect("slot reuse: FS_READ_MEMORY ipc_call");
+        if reply.label == ipc::fs_errors::IO_ERROR
+        {
+            return None;
+        }
         assert_eq!(
             reply.label,
             ipc::fs_errors::SUCCESS,
@@ -1201,10 +1209,11 @@ impl HeldPage
             )
         }
         .expect("slot reuse: mem_map of the page");
-        let close = ipc::IpcMessage::new(ipc::fs_labels::FS_CLOSE);
+        let release = ipc::IpcMessage::builder(ipc::fs_labels::FS_RELEASE_MEMORY)
+            .word(0, cookie)
+            .build();
         // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_call(node, &close, ipc_buf) };
-        let _ = syscall::cap_delete(node);
+        let _ = unsafe { ipc::ipc_call(node, &release, ipc_buf) };
         let held = Self {
             index,
             cap,
@@ -1212,7 +1221,7 @@ impl HeldPage
             data_offset,
         };
         held.check("when mapped");
-        held
+        Some(held)
     }
 
     /// Assert the mapped page still shows its own page's tag.
@@ -1248,7 +1257,7 @@ impl HeldPage
     }
 }
 
-/// Read every page of the slot-reuse file but the first `skip`, checking
+/// Read every page of the slot-reuse file from page `skip` on, checking
 /// each page's tag, so the LRU reuses every unreferenced slot.
 fn read_slot_reuse_file(path: &str, skip: usize)
 {
@@ -1272,19 +1281,20 @@ fn read_slot_reuse_file(path: &str, skip: usize)
 }
 
 /// A page a client keeps mapped after fatfs released its cache slot is never
-/// refilled with other data. Three cases, each checked by reading the whole
-/// file, which reuses every unreferenced slot:
+/// refilled with other data, and fatfs bounds what such pages cost it. Each
+/// held page is read through `FS_READ_MEMORY` without a release endpoint,
+/// mapped, and handed back with `FS_RELEASE_MEMORY` while still mapped, so
+/// fatfs revokes the cap and drops the slot while the mapping stays.
 ///
-/// - Hold more pages than fatfs's quarantine bound. Each page is mapped
-///   through `FS_READ_MEMORY` without a release endpoint, and its file is
-///   closed without unmapping, so fatfs revokes the cap and drops the slot
-///   while the mapping stays. Some slots then get a replacement page; past
-///   the bound, the rest stay out of service. Every held page keeps its own
-///   bytes.
-/// - Unmap them all, then hold one more page. Its reuse finds every
-///   quarantined page now unmapped, makes them spares, and takes a spare as
-///   the replacement. The new held page keeps its bytes.
-/// - Throughout, the file reads back correctly.
+/// - Hold more pages than the quarantine bound, then read the whole file
+///   twice so every unreferenced slot is reused. Every held page keeps its
+///   own bytes. Then unmap them all.
+/// - Hold pages until fatfs refuses one with `IO_ERROR`. The pages quarantined
+///   in the first case are now unmapped, so fatfs can make them spares and
+///   give still-mapped slots a spare page. Without that recheck it could hold
+///   no more pages than it has slots. With the bound, the refusal comes before
+///   the file runs out. Every held page keeps its bytes; once they are
+///   unmapped, the whole file reads back.
 ///
 /// fatfs once refilled such a slot, and the mapping then showed another
 /// page of the file.
@@ -1309,9 +1319,11 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
 
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let svctest = svctest_dir_cap(ipc_buf);
+    let (node, _kind, _size) =
+        ns_lookup(svctest, name, 0xFFFF, ipc_buf).expect("slot reuse: lookup");
 
     let held: Vec<HeldPage> = (0..SLOT_REUSE_HELD)
-        .map(|i| HeldPage::take(svctest, name, i, ipc_buf))
+        .map(|i| HeldPage::take(node, i, ipc_buf).expect("slot reuse: a read past the bound"))
         .collect();
     read_slot_reuse_file(path, SLOT_REUSE_HELD);
     read_slot_reuse_file(path, 0);
@@ -1324,13 +1336,39 @@ pub fn fs_mapping_survives_slot_reuse_phase(_: &Caps)
         page.release();
     }
 
-    let last = HeldPage::take(svctest, name, 0, ipc_buf);
-    read_slot_reuse_file(path, 1);
-    last.check("after its slot took a spare page");
-    last.release();
+    let mut held = Vec::new();
+    while held.len() < SLOT_REUSE_PAGES
+    {
+        match HeldPage::take(node, held.len(), ipc_buf)
+        {
+            Some(page) => held.push(page),
+            None => break,
+        }
+    }
+    let count = held.len();
+    assert!(
+        count > FATFS_SLOT_COUNT,
+        "slot reuse: fatfs refused after {count} held pages; spares never replaced a slot"
+    );
+    assert!(
+        count <= FATFS_SLOT_COUNT + FATFS_QUARANTINE_MAX,
+        "slot reuse: fatfs held {count} pages without refusing; the quarantine is unbounded"
+    );
+    for page in &held
+    {
+        page.check("at the quarantine bound");
+    }
+    for page in held
+    {
+        page.release();
+    }
     read_slot_reuse_file(path, 0);
 
+    let close = ipc::IpcMessage::new(ipc::fs_labels::FS_CLOSE);
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_call(node, &close, ipc_buf) };
+    let _ = syscall::cap_delete(node);
     fs_remove(svctest, name, ipc_buf).expect("cleanup slotreuse");
     let _ = syscall::cap_delete(svctest);
-    std::os::seraph::log!("fs_mapping_survives_slot_reuse phase passed");
+    std::os::seraph::log!("fs_mapping_survives_slot_reuse phase passed (held {count})");
 }

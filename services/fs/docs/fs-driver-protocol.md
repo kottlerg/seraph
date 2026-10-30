@@ -325,10 +325,11 @@ a page mapped after the release, or whose copy outlasts the window, therefore
 never sees the page refilled with other data. Until the page is quarantined, its bytes
 change only by write-through of the sectors it caches; those may belong to other files
 or to the FAT. A
-client SHOULD still unmap before it acks: the driver holds at most 32
-quarantined and spare pages, and past that a still-mapped slot stays out of
-service, so a client that never unmaps shrinks the cache, and a read that finds
-no reusable slot is answered `IO_ERROR` (2).
+client SHOULD still unmap before it acks: the driver takes at most 32 pages
+beyond its cache slots to replace still-mapped ones, and past that a still-mapped
+slot stays out of service, so a client that never unmaps shrinks the cache, and a
+read that finds no reusable slot is answered `IO_ERROR` (2). A revoke that does
+not complete leaves the page unused until a later one does.
 A reply with any other label is not an
 acknowledgement; a client that cannot unmap the page, or whose copy
 outlasts the window, replies `IO_ERROR` (2).

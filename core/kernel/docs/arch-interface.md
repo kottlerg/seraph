@@ -414,7 +414,11 @@ pub unsafe fn init_ap();
 
 /// Acknowledge / mask / unmask an external interrupt line. On x86-64, `mask` and
 /// `unmask` take a GSI at the I/O APIC, and `acknowledge` writes the local-APIC
-/// EOI and ignores `irq`. On RISC-V, `irq` is a PLIC source.
+/// EOI and ignores `irq`. On RISC-V, `irq` is a PLIC source, and `acknowledge`
+/// completes it on the executing hart's context, enabling it there for the
+/// completion when the dispatch's `mask` disabled it (the PLIC ignores a
+/// completion of a disabled source). `unmask` is reached from `SYS_IRQ_ACK`
+/// through `irq::ack`, under the routing lock, only for a routed line.
 pub fn acknowledge(irq: u32);
 pub fn mask(irq: u32);
 pub fn unmask(irq: u32);
@@ -457,8 +461,9 @@ PLIC enable path on RISC-V) remains arch-private.
 **Delivery destination.** Each routed line is delivered to one CPU, chosen when the line is
 routed: the boot CPUs in turn, by logical index (`irq::next_target_cpu`), so device
 interrupts spread over the CPUs rather than all landing on the boot CPU. On x86-64 the turn
-skips CPUs whose APIC id exceeds `0xFF`, which an I/O APIC redirection entry cannot name in
-physical destination mode (the kernel programs no interrupt remapping). On RISC-V the line's
+skips CPUs whose APIC id is `0xFF` or above: an I/O APIC redirection entry cannot name a wider
+id in physical destination mode (the kernel programs no interrupt remapping), and `0xFF` is the
+broadcast id, which delivers to every CPU. On RISC-V the line's
 PLIC source is enabled on the chosen hart's S-mode context only, so exactly one hart takes
 and claims it. A line routed again (a `SYS_IRQ_REGISTER` replace) takes the next CPU in turn.
 

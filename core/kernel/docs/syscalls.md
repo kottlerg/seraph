@@ -1833,7 +1833,7 @@ caller waited).
 ### `SYS_IRQ_ACK` (29)
 
 Acknowledge a hardware interrupt line after handling. Re-enables the line at the
-interrupt controller.
+interrupt controller when a notification is registered on it.
 
 **Arguments:**
 
@@ -1847,8 +1847,9 @@ The kernel masks the interrupt line before delivering the notification to the dr
 (see [docs/architecture.md](../../../docs/architecture.md) — Driver Model). The driver
 must call `SYS_IRQ_ACK` to re-enable the line. `SYS_IRQ_REGISTER` leaves the line
 masked, so the driver's first `SYS_IRQ_ACK` after registering is what enables delivery;
-`SYS_IRQ_ACK` unmasks the line unconditionally, whether or not an interrupt has been
-delivered since the last acknowledgement.
+`SYS_IRQ_ACK` unmasks a registered line whether or not an interrupt has been delivered
+since the last acknowledgement; a line with no registered notification (never registered,
+or its registration cleared) stays masked, and the call still returns 0.
 
 **Capability requirement:** `irq_cap` MUST be a valid interrupt capability for the
 specific line.

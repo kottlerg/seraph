@@ -48,9 +48,10 @@
 //!
 //! # Destination
 //! Each route names one destination CPU, chosen at route time by `irq::next_target_cpu`
-//! among the CPUs whose APIC id fits the 8-bit physical destination field of a redirection
-//! entry (`interrupts::route_device_irq`). An I/O APIC cannot name a CPU with a wider
-//! x2APIC id without interrupt remapping, which the kernel does not program.
+//! among the CPUs whose APIC id the 8-bit physical destination field of a redirection
+//! entry can name: below [`BROADCAST_APIC_ID`] (`0xFF`, which delivers to every CPU;
+//! `interrupts::route_device_irq`). An I/O APIC cannot name a CPU with a wider x2APIC id
+//! without interrupt remapping, which the kernel does not program.
 //!
 //! # Limitations / deferred work
 //!
@@ -101,6 +102,18 @@ pub const DEVICE_VECTOR_COUNT: usize = (DEVICE_VECTOR_LAST - DEVICE_VECTOR_BASE)
 /// an 8-bit field.
 pub const IOAPIC_MAX_PINS: u32 = 256;
 
+/// The physical-mode destination id that delivers to every local APIC (all ones in the
+/// 8-bit field); no single CPU can be named by it.
+// dead_code: host test builds compile out its reader (`interrupts::route_device_irq`).
+#[cfg_attr(test, allow(dead_code))]
+pub const BROADCAST_APIC_ID: u32 = 0xFF;
+
+/// Where [`assign_vector`]'s search for a free vector starts: one past the vector it last
+/// assigned, so a released vector is reassigned only after the search has passed every
+/// other one (`interrupts::unroute_device_irq`). Written only under `irq`'s routing lock.
+#[cfg(not(test))]
+static NEXT_VECTOR_INDEX: AtomicU32 = AtomicU32::new(0);
+
 /// GSI each device vector is assigned to, plus one; 0 for a free vector, so the zeroed
 /// table is all free. Index `v - DEVICE_VECTOR_BASE` for vector `v`. Written only by
 /// [`assign_vector`] and [`release_vector`], which `irq` serialises under its routing lock;
@@ -127,23 +140,24 @@ fn find_vector(table: &[AtomicU32], gsi: u32) -> Option<u8>
     vector_at(index)
 }
 
-/// The vector `table` assigns to `gsi`: its existing one, else the lowest free vector,
-/// now assigned to it. `None` when every vector is assigned (or `gsi` is `u32::MAX`, which
-/// no I/O APIC covers).
-fn assign_vector_in(table: &[AtomicU32], gsi: u32) -> Option<u8>
+/// The vector `table` assigns to `gsi` and the index the next search starts at: its
+/// existing vector, else the first free vector at or after index `start` (wrapping), now
+/// assigned to it. `None` when every vector is assigned (or `gsi` is `u32::MAX`, which no
+/// I/O APIC covers).
+fn assign_vector_in(table: &[AtomicU32], gsi: u32, start: usize) -> Option<(u8, usize)>
 {
     if let Some(vector) = find_vector(table, gsi)
     {
-        return Some(vector);
+        return Some((vector, start));
     }
     let tag = gsi.checked_add(1)?;
-    let index = table
-        .iter()
-        .position(|entry| entry.load(Ordering::Relaxed) == 0)?;
+    let index = (0..table.len())
+        .map(|offset| (start + offset) % table.len())
+        .find(|&index| table[index].load(Ordering::Relaxed) == 0)?;
     // Release: a dispatch that reads the tag (Acquire) once the redirection entry that
     // names this vector fires sees a complete assignment.
     table[index].store(tag, Ordering::Release);
-    vector_at(index)
+    Some((vector_at(index)?, (index + 1) % table.len()))
 }
 
 /// Free every vector `table` assigns to `gsi`.
@@ -163,21 +177,19 @@ fn release_vector_in(table: &[AtomicU32], gsi: u32)
     }
 }
 
-/// Assign `gsi` a device vector (its existing one if it has one). `None` when every device
-/// vector is assigned. Called under `irq`'s routing lock.
+/// Assign `gsi` a device vector: its existing one if it has one, else the next free one in
+/// turn ([`NEXT_VECTOR_INDEX`]). `None` when every device vector is assigned. Called under
+/// `irq`'s routing lock.
 #[cfg(not(test))]
 #[must_use]
 pub fn assign_vector(gsi: u32) -> Option<u8>
 {
-    assign_vector_in(&VECTOR_GSI, gsi)
-}
-
-/// The device vector assigned to `gsi`, if it is routed.
-#[cfg(not(test))]
-#[must_use]
-pub fn vector_of(gsi: u32) -> Option<u8>
-{
-    find_vector(&VECTOR_GSI, gsi)
+    let start = NEXT_VECTOR_INDEX.load(Ordering::Relaxed) as usize;
+    let (vector, next) = assign_vector_in(&VECTOR_GSI, gsi, start)?;
+    // `next` is below DEVICE_VECTOR_COUNT (217), which fits u32.
+    #[allow(clippy::cast_possible_truncation)]
+    NEXT_VECTOR_INDEX.store(next as u32, Ordering::Relaxed);
+    Some(vector)
 }
 
 /// Free `gsi`'s device vector. Called under `irq`'s routing lock, after the redirection
@@ -490,13 +502,45 @@ mod tests
         [const { AtomicU32::new(0) }; DEVICE_VECTOR_COUNT]
     }
 
+    /// Assign from the start of the table, as a fresh boot's first route does.
+    fn assign(t: &[AtomicU32], gsi: u32) -> Option<u8>
+    {
+        assign_vector_in(t, gsi, 0).map(|(vector, _)| vector)
+    }
+
+    #[test]
+    fn a_released_vector_is_reassigned_only_after_the_others()
+    {
+        // Defect caught: a vector freed while an interrupt is latched on it being
+        // handed straight to the next GSI, which would take that interrupt.
+        let t = table();
+        let (first, next) = assign_vector_in(&t, 3, 0).expect("vector");
+        release_vector_in(&t, 3);
+        let (second, _) = assign_vector_in(&t, 4, next).expect("vector");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn the_search_wraps_to_a_vector_freed_below_the_cursor()
+    {
+        let t = table();
+        let mut start = 0;
+        for gsi in 0..DEVICE_VECTOR_COUNT as u32
+        {
+            start = assign_vector_in(&t, gsi, start).expect("vector").1;
+        }
+        release_vector_in(&t, 0);
+        let (vector, _) = assign_vector_in(&t, 5000, start).expect("vector");
+        assert_eq!(vector, DEVICE_VECTOR_BASE);
+    }
+
     #[test]
     fn routed_gsis_get_distinct_device_vectors()
     {
         // GSIs past the old 23-gate range (a second I/O APIC's) are assigned too.
         let t = table();
-        let a = assign_vector_in(&t, 2).expect("vector");
-        let b = assign_vector_in(&t, 40).expect("vector");
+        let a = assign(&t, 2).expect("vector");
+        let b = assign(&t, 40).expect("vector");
         assert_ne!(a, b);
         assert_eq!(find_vector(&t, 40), Some(b));
     }
@@ -505,8 +549,8 @@ mod tests
     fn a_gsi_routed_again_keeps_its_vector()
     {
         let t = table();
-        let first = assign_vector_in(&t, 7).expect("vector");
-        assert_eq!(assign_vector_in(&t, 7), Some(first));
+        let first = assign(&t, 7).expect("vector");
+        assert_eq!(assign(&t, 7), Some(first));
     }
 
     #[test]
@@ -515,12 +559,12 @@ mod tests
         let t = table();
         for gsi in 0..DEVICE_VECTOR_COUNT as u32
         {
-            assert!(assign_vector_in(&t, gsi).is_some());
+            assert!(assign(&t, gsi).is_some());
         }
-        assert_eq!(assign_vector_in(&t, 1000), None);
+        assert_eq!(assign(&t, 1000), None);
         release_vector_in(&t, 5);
         assert_eq!(find_vector(&t, 5), None);
-        assert!(assign_vector_in(&t, 1000).is_some());
+        assert!(assign(&t, 1000).is_some());
     }
 
     #[test]
@@ -528,9 +572,9 @@ mod tests
     {
         // The table marks a free vector with 0, so GSI 0 must not read as free.
         let t = table();
-        let v = assign_vector_in(&t, 0).expect("vector");
+        let v = assign(&t, 0).expect("vector");
         assert_eq!(find_vector(&t, 0), Some(v));
-        assert_ne!(assign_vector_in(&t, 1), Some(v));
+        assert_ne!(assign(&t, 1), Some(v));
     }
 
     #[test]
@@ -545,7 +589,7 @@ mod tests
         let t = table();
         for gsi in 0..DEVICE_VECTOR_COUNT as u32
         {
-            let vector = assign_vector_in(&t, gsi).expect("vector");
+            let vector = assign(&t, gsi).expect("vector");
             assert!(vector > 31, "GSI {gsi} assigned exception vector {vector}");
             for reserved in [
                 TIMER_VECTOR,

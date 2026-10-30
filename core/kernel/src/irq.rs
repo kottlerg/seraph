@@ -23,8 +23,8 @@
 //!
 //! # Sharing
 //! A line routes to at most one notification. Every wired line the kernel serves
-//! is edge-triggered and has a single owner: devmgr delegates no private
-//! Interrupt cap for a shared `INTx` line, whose driver polls instead
+//! has a single owner: devmgr delegates no private Interrupt cap for a shared
+//! `INTx` line, whose driver polls instead
 //! (docs/device-management.md), and devices that share an interrupt source get
 //! per-vector message-signaled interrupts, not a shared wired line (#325). A
 //! second registration on a line replaces the first (`SYS_IRQ_REGISTER`,
@@ -33,9 +33,11 @@
 //! # Thread safety
 //! The interrupt-context lookup in `dispatch_device_irq` is lock-free: it reads
 //! the line's route through an atomic pointer. Every route change ([`register`],
-//! [`unregister`], [`unregister_notification`]) runs under `ROUTING`'s lock,
-//! which also covers the controller routing the change makes
-//! (`route_device_irq`, `unroute_device_irq`, `mask`) and the set of routed lines.
+//! [`unregister`], [`unregister_notification`]) and every unmask ([`ack`],
+//! `SYS_IRQ_ACK`) runs under `ROUTING`'s lock, which also covers the controller
+//! routing the change makes (`route_device_irq`, `unroute_device_irq`, `mask`,
+//! `unmask`) and the set of routed lines, so an unmask never meets a line whose
+//! route is being cleared.
 //! Delivery itself (`notification_send`, `sched::enqueue_and_wake`) takes the
 //! notification's and the scheduler's spinlocks with interrupts disabled.
 //!
@@ -336,6 +338,29 @@ pub unsafe fn register(irq: u32, notification: *mut NotificationState) -> Result
         }
         Ok(())
     })
+}
+
+/// Re-enable delivery on line `irq` after its driver handled an interrupt
+/// (`SYS_IRQ_ACK`): unmask it at its controller, if a notification is routed to
+/// it. A line with no route (never registered, or its route cleared) stays
+/// masked; the check and the unmask run under the routing lock, so a concurrent
+/// route clear cannot leave the line unmasked behind it.
+///
+/// # Safety
+/// Must be called outside interrupt context.
+#[cfg(not(test))]
+pub unsafe fn ack(irq: u32)
+{
+    ROUTING.with(|routing| {
+        let routed = routing
+            .routes
+            .get(irq as usize)
+            .is_some_and(|route| !route.notification.load(Ordering::SeqCst).is_null());
+        if routed
+        {
+            crate::arch::current::interrupts::unmask(irq);
+        }
+    });
 }
 
 /// Clear the routing entry for `irq` (called when the Interrupt cap is freed)

@@ -740,17 +740,13 @@ pub fn mask(irq: u32)
 #[cfg(test)]
 pub fn mask(_irq: u32) {}
 
-/// Unmask (enable delivery of) GSI `irq` at the I/O APIC. Called by `SYS_IRQ_ACK`
-/// (`syscall::hw::sys_irq_ack`) to re-enable delivery after the driver has serviced the
-/// interrupt. A GSI with no device vector (never routed, or its route cleared) is left
-/// masked: its redirection entry names no vector this kernel dispatches.
+/// Unmask (enable delivery of) GSI `irq` at the I/O APIC. Called by `irq::ack`
+/// (`SYS_IRQ_ACK`) to re-enable delivery after the driver has serviced the interrupt,
+/// only for a routed GSI (one with a device vector) and under `irq`'s routing lock, so
+/// no route clear runs between its check and this unmask.
 #[cfg(not(test))]
 pub fn unmask(irq: u32)
 {
-    if super::ioapic::vector_of(irq).is_none()
-    {
-        return;
-    }
     // SAFETY: IOAPIC is initialised in Phase 5.
     unsafe { super::ioapic::unmask(irq) }
 }
@@ -764,9 +760,9 @@ pub fn unmask(_irq: u32) {}
 /// redirection entry. The driver unmasks via `SYS_IRQ_ACK` once it has registered a
 /// handler. A GSI routed again keeps its vector and is given the next destination.
 ///
-/// The destination is the next CPU in turn (`irq::next_target_cpu`) whose APIC id fits the
-/// redirection entry's 8-bit physical destination field (module doc of
-/// [`super::ioapic`] § Destination).
+/// The destination is the next CPU in turn (`irq::next_target_cpu`) whose APIC id the
+/// redirection entry's 8-bit physical destination field can name: below `0xFF`, which is
+/// the broadcast id (module doc of [`super::ioapic`] § Destination).
 ///
 /// # Errors
 /// `NoSuchLine` when no discovered I/O APIC implements the GSI; `Exhausted` when every
@@ -784,7 +780,7 @@ pub unsafe fn route_device_irq(irq: u32) -> Result<(), crate::irq::RouteError>
     let destination = crate::irq::next_target_cpu(|cpu| {
         // SAFETY: `next_target_cpu` passes only indices below CPU_COUNT; the APIC id
         // slab is read-only after boot.
-        unsafe { crate::percpu::apic_id_for(cpu) <= 0xFF }
+        unsafe { crate::percpu::apic_id_for(cpu) < super::ioapic::BROADCAST_APIC_ID }
     })
     .ok_or(crate::irq::RouteError::Exhausted)?;
     // SAFETY: as above; the id was checked to fit eight bits.
@@ -810,8 +806,10 @@ pub unsafe fn route_device_irq(_irq: u32) -> Result<(), crate::irq::RouteError>
 }
 
 /// Release GSI `irq`'s route: mask its redirection entry, then free its device vector. An
-/// interrupt already latched on the vector reaches `idt::irq_dispatch`, finds no GSI, and is
-/// dropped.
+/// interrupt already latched on the vector reaches `idt::irq_dispatch` and finds no GSI and
+/// is dropped, unless the vector was reassigned first; vectors are reassigned in turn
+/// (`ioapic::assign_vector`), so that needs every other device vector to be assigned in
+/// between, and it then reaches the new owner as one spurious delivery.
 ///
 /// # Safety
 /// Must be called after Phase 5 init, under `irq`'s routing lock.

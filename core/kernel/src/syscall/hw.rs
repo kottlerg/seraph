@@ -43,8 +43,9 @@ use syscall::SyscallError;
 /// arg0 = Interrupt cap index (must have NOTIFY right).
 ///
 /// Unmasks the IRQ line at the interrupt controller, allowing the next
-/// interrupt delivery. The driver must call this after clearing the interrupt
-/// source in the device to avoid an interrupt storm.
+/// interrupt delivery, when a notification is registered on it; a line with
+/// no registration stays masked. The driver must call this after clearing the
+/// interrupt source in the device to avoid an interrupt storm.
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -82,8 +83,10 @@ pub fn sys_irq_ack(tf: UserFrame) -> Result<u64, SyscallError>
         io.start
     };
 
-    // Unmask at the interrupt controller to re-enable delivery.
-    crate::arch::current::interrupts::unmask(irq_id);
+    // Unmask at the interrupt controller to re-enable delivery, if the line is
+    // routed (`irq::ack` checks and unmasks under the routing lock).
+    // SAFETY: syscall context, not interrupt context.
+    unsafe { crate::irq::ack(irq_id) };
 
     Ok(0)
 }

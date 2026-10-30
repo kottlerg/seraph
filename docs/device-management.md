@@ -160,7 +160,7 @@ ones, not a shared wired line (design intent, not yet implemented;
 [#325](https://github.com/kottlerg/seraph/issues/325)). The kernel delivers each registered line
 to one CPU, chosen when the line is registered by taking the CPUs in turn, so the interrupts of
 several devices spread over the CPUs. On x86-64 only CPUs whose APIC id an I/O APIC can name
-(`0xFF` or below) take part. The mechanism is specified in
+(below `0xFF`, the broadcast id) take part. The mechanism is specified in
 [core/kernel/docs/arch-interface.md](../core/kernel/docs/arch-interface.md) § `interrupts`.
 
 ---

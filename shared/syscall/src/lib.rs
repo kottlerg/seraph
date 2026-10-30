@@ -1852,9 +1852,12 @@ pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid or lacks
-/// Notify rights, or (`InvalidArgument`) if `irq_cap` covers more than one line
-/// or names an id the kernel cannot route (outside GSIs 0–22 on x86-64, PLIC
-/// sources 1–127 on RISC-V). A second registration of a line replaces the first.
+/// Notify rights, `InvalidArgument` if `irq_cap` covers more than one line or
+/// names an id no discovered interrupt controller implements (a GSI no I/O APIC
+/// reports on x86-64, a source past the PLIC's `riscv,ndev` on RISC-V), or
+/// `QuotaExceeded` when the controller has no delivery resource left (x86-64:
+/// every device vector is assigned). A second registration of a line replaces
+/// the first.
 #[inline]
 pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
 {
@@ -1873,7 +1876,8 @@ pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
 /// Re-enable interrupt delivery for `irq_cap` after handling the interrupt.
 ///
 /// Must be called once the interrupt source in the device has been cleared,
-/// otherwise the interrupt will fire again immediately on unmask.
+/// otherwise the interrupt will fire again immediately on unmask. A line with no
+/// registered notification stays masked.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability`,

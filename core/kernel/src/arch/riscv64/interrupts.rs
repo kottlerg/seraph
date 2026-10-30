@@ -926,7 +926,8 @@ unsafe fn redirect_user_fault(
 }
 
 /// Enable PLIC `source` on its target hart's S-mode context; an unrouted source is left
-/// disabled.
+/// disabled. Reached from `SYS_IRQ_ACK` through `irq::ack`, under `irq`'s routing lock,
+/// so the target cannot be cleared between its read here and the enable.
 #[cfg(not(test))]
 pub fn plic_enable(source: u32)
 {
@@ -1355,18 +1356,54 @@ pub fn are_enabled() -> bool
     sstatus & (1 << 1) != 0
 }
 
-/// Complete a PLIC external interrupt for `irq`.
+/// Complete a PLIC external interrupt for `irq` on the executing hart's context,
+/// the one that claimed it.
 ///
-/// Must be called after servicing the interrupt; called internally by the
-/// trap dispatcher after `dispatch_external`.
+/// The PLIC ignores a completion for a source not enabled on the completing
+/// context, and the dispatch masks (disables) the source before it completes
+/// (`irq::deliver`), as a route change may also have done. So a disabled source
+/// is enabled on this context for the completion and disabled again after it,
+/// under `PLIC_LOCK`; without that the gateway never sees the completion and the
+/// source never interrupts again.
+#[cfg(not(test))]
 pub fn acknowledge(irq: u32)
 {
-    // SAFETY: plic_write performs volatile store to PLIC claim/complete register;
-    // irq value claimed from PLIC; EOI protocol requires writing back the IRQ number.
-    unsafe {
-        plic_write(plic_claim_complete_offset(), irq);
+    let complete = plic_claim_complete_offset();
+    if irq == 0 || irq > super::platform::plic_ndev()
+    {
+        // SAFETY: plic_write performs a volatile store to this context's
+        // claim/complete register, inside the window init_ap checked.
+        unsafe { plic_write(complete, irq) };
+        return;
     }
+    let word = plic_enable_base_for(current_hart()) + u64::from(irq / 32) * 4;
+    let bit = 1u32 << (irq % 32);
+    // SAFETY: PLIC_LOCK is a leaf lock; lock_raw disables interrupts and is
+    // paired with unlock_raw below on the only path out.
+    let saved = unsafe { PLIC_LOCK.lock_raw() };
+    let enables = plic_read(word);
+    // SAFETY: `word` is an enable word and `complete` the claim/complete register
+    // of this hart's context, both inside the window init_ap checked; the
+    // completion writes back the claimed id, as the PLIC protocol requires.
+    unsafe {
+        if enables & bit == 0
+        {
+            plic_write(word, enables | bit);
+            plic_write(complete, irq);
+            plic_write(word, enables);
+        }
+        else
+        {
+            plic_write(complete, irq);
+        }
+    }
+    // SAFETY: paired with lock_raw above.
+    unsafe { PLIC_LOCK.unlock_raw(saved) };
 }
+
+/// No-op test stub.
+#[cfg(test)]
+pub fn acknowledge(_irq: u32) {}
 
 // ── IPI infrastructure ────────────────────────────────────────────────────────
 

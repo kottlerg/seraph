@@ -89,8 +89,8 @@ An entry an existing open Issue already names cites it in the recommendation.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
   copies: `MAX_EXCL` and core/boot `MAX_MODULES`, `MAX_MODULES` and `INIT_MAX_NAMED_MODULES`
   (16 against 12), `MAX_MMIO_DIRECT_MAP_REGIONS` and `MAX_IOAPICS`, `REAPER_SLOTS` and
-  `GEN_BITS`, the `registry` and `registry-client` copies of `NAME_MAX`, the ktest mirror of
-  `MAX_SLEEPING`, and the svctest mirrors of the fs-fat cache constants.
+  `GEN_BITS`, the `registry` and `registry-client` copies of `NAME_MAX`, the ktest mirrors of
+  `MAX_SLEEPING` and `L2_SIZE`, and the svctest mirrors of the fs-fat cache constants.
 - **Spin-count timeouts.** Several deadlock detectors and device polls are counted in loop
   iterations, whose wall time depends on CPU and MMIO speed. `wait_for_ack` is the time-based
   model.
@@ -528,6 +528,7 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643).
 | `ASPACE_RETYPE_PAGES`, `CSPACE_RETYPE_PAGES` (per child) | `services/procmgr/src/main.rs` | 48 / 7 | refillable seed (augment) | per child | correct as is | None |
 | `INIT_THREADS`, `FIRST_ROUND_CAPS` | `services/procmgr/process-table/src/init_reap.rs` | 2 / 4 | provably unreachable (fixed init protocol) | none | correct as is | None |
 | DONATE round size | `services/procmgr/src/init_reap.rs` | `MSG_CAP_SLOTS_MAX` | ABI width | none | correct as is | Loops over every cap |
+| `PROBE_SETTLE_READS` | `services/procmgr/src/init_reap.rs` | 64 reads with a yield between | unknown (yield count) | none | needs a design | When it runs out, the probe page stays out of memmgr's pool; its wall time depends on scheduling. Use a time-based bound |
 | memory cookie, process badge | `services/procmgr/src/process.rs` | random `u64` | ABI width | none | correct as is | None |
 
 ### svcmgr and registry
@@ -713,6 +714,7 @@ production value is raised.
 | `REPORT_SLICES`, `REPORT_SLICE_MS` | `core/ktest/src/tally.rs` | 1000 x 5 ms | test fixture | none | correct as is | None |
 | `await_all` mask | `core/ktest/src/tally.rs` | 64 children | ABI width (notification word) | none | correct as is | None |
 | `MAX_POLLS` (14 copies) | `core/ktest/src/` | 2000 x 1 ms, scaled | test fixture | none | correct as is | Hoist to one constant |
+| `SLOTS_PER_PAGE`, `LIVE` (`HANDLES`) | `core/ktest/src/stress/cspace_registry_arena.rs` | 56 / 4097 | mirror of kernel `L2_SIZE`; one past the former 4096-entry registry | about 16 KiB BSS | correct as is | Reference or assert against `L2_SIZE` |
 | `FILLERS` | `core/ktest/src/stress/sleep_list_full.rs` | 128 | mirror of kernel `MAX_SLEEPING` | 1 MiB BSS | correct as is | Reference or assert against `MAX_SLEEPING` (#638) |
 | `MAX_PINNED` | `core/ktest/src/bench/tlb.rs` | 7 | test fixture | 224 KiB BSS | correct as is | None |
 | `EVERY_CPU_MAX`, `LOW_CPUS` | `core/ktest/src/arch/x86_64/umip.rs` | 16 / 8 | test fixture | none | correct as is | None |

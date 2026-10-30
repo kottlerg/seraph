@@ -100,6 +100,9 @@ fn main() -> !
     // SAFETY: ecam_va starts `ecam_range`, a fresh reservation of the ECAM
     // region's page count from the per-process arena, owned here: VA no Rust
     // object or IPC page occupies.
+    // `pci_enumerate` reaches the mapping only through the raw volatile
+    // `pci` config accessors, never a reference, and `ecam_range` is
+    // unreserved only after it returns (`mmio_map` § Safety).
     if unsafe { syscall::mmio_map(caps.self_aspace, ecam_cap, ecam_va, 0) }.is_err()
     {
         std::os::seraph::log!("failed to map ECAM region");

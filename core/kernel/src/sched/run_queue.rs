@@ -11,8 +11,9 @@
 //!
 //! Locking. The `lock` field is a `crate::sync::Spinlock` that disables
 //! interrupts while held, preventing timer-driven deadlock. Acquire before
-//! any `enqueue`, `dequeue_highest`, `remove_from_queue`, `find_runnable`,
-//! or `set_current` call; the first four are `unsafe` with that contract,
+//! any `enqueue`, `enqueue_at_head`, `dequeue_highest`, `remove_from_queue`,
+//! `find_runnable`, or `set_current` call; all but `set_current` are `unsafe`
+//! with that contract,
 //! since every CPU reaches every scheduler through a shared reference. The
 //! boot exception: `sched::init` and `sched::enter` call `set_current` without
 //! the lock, before the CPU concerned first schedules (see `set_current`).
@@ -31,7 +32,19 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 // ── RunQueue ──────────────────────────────────────────────────────────────────
 
-/// Intrusive FIFO queue of ready TCBs at a single priority level.
+/// Which end of a priority level's queue a link goes to.
+#[derive(Clone, Copy)]
+enum QueueEnd
+{
+    /// Behind every queued TCB: the FIFO order of the level.
+    Tail,
+    /// Ahead of every queued TCB.
+    Head,
+}
+
+/// Intrusive FIFO queue of ready TCBs at a single priority level, except that
+/// a TCB just dequeued and handed back undispatched returns to the head
+/// ([`enqueue_head`](Self::enqueue_head)), keeping its turn.
 struct RunQueue
 {
     head: Option<*mut ThreadControlBlock>,
@@ -107,6 +120,33 @@ impl RunQueue
                 self.tail = Some(tcb);
             }
         }
+    }
+
+    /// Insert `tcb` at the head of the queue, ahead of every queued TCB: the
+    /// place a TCB just dequeued from it held. The double-enqueue tripwires
+    /// are [`enqueue`](Self::enqueue)'s.
+    #[track_caller]
+    fn enqueue_head(&mut self, tcb: *mut ThreadControlBlock)
+    {
+        #[cfg(debug_assertions)]
+        // SAFETY: tcb is a valid live TCB pointer; the caller holds the owning
+        // scheduler.lock so these fields are stable.
+        unsafe {
+            let tid = (*tcb).thread_id;
+            assert!(
+                (*tcb).run_queue_next.is_none() && self.tail != Some(tcb),
+                "run_queue::enqueue_head: tcb {tcb:p} tid={tid} already linked \
+                 — double-enqueue; prior={:?}",
+                (*tcb).last_enqueue,
+            );
+        }
+        // SAFETY: tcb is a valid live TCB pointer.
+        unsafe { (*tcb).run_queue_next = self.head };
+        if self.head.is_none()
+        {
+            self.tail = Some(tcb);
+        }
+        self.head = Some(tcb);
     }
 
     /// Remove and return the head TCB, or `None` if empty.
@@ -207,7 +247,8 @@ impl RunQueue
 /// owner of each field). Every other field is atomic or the lock itself.
 pub struct PerCpuScheduler
 {
-    /// One FIFO run queue per priority level (0 = lowest/idle, 31 = highest).
+    /// One FIFO run queue per priority level (0 = lowest/idle, 31 = highest);
+    /// see [`RunQueue`] for the head re-link that keeps a deferred TCB's turn.
     /// Owned by `lock`.
     queues: UnsafeCell<[RunQueue; NUM_PRIORITY_LEVELS]>,
 
@@ -232,8 +273,8 @@ pub struct PerCpuScheduler
 
     /// Lock protecting the run queues.
     ///
-    /// Acquire before any `enqueue`/`dequeue_highest`/`remove_from_queue`/
-    /// `find_runnable` call. The lock disables interrupts while held,
+    /// Acquire before any `enqueue`/`enqueue_at_head`/`dequeue_highest`/
+    /// `remove_from_queue`/`find_runnable` call. The lock disables interrupts while held,
     /// preventing timer-driven deadlock.
     pub lock: crate::sync::Spinlock,
 
@@ -320,6 +361,32 @@ impl PerCpuScheduler
     #[track_caller]
     pub unsafe fn enqueue(&self, tcb: *mut ThreadControlBlock, priority: u8) -> bool
     {
+        // SAFETY: the caller's contract is this function's.
+        unsafe { self.link(tcb, priority, QueueEnd::Tail) }
+    }
+
+    /// [`enqueue`](Self::enqueue) at the head of the level instead of its
+    /// tail: for a TCB [`dequeue_highest`](Self::dequeue_highest) just returned
+    /// that the caller hands back undispatched, so it keeps its turn.
+    ///
+    /// # Safety
+    /// As for [`enqueue`](Self::enqueue).
+    #[must_use]
+    #[track_caller]
+    pub unsafe fn enqueue_at_head(&self, tcb: *mut ThreadControlBlock, priority: u8) -> bool
+    {
+        // SAFETY: the caller's contract is this function's.
+        unsafe { self.link(tcb, priority, QueueEnd::Head) }
+    }
+
+    /// The shared body of [`enqueue`](Self::enqueue) and
+    /// [`enqueue_at_head`](Self::enqueue_at_head), linking at `end`.
+    ///
+    /// # Safety
+    /// As for [`enqueue`](Self::enqueue).
+    #[track_caller]
+    unsafe fn link(&self, tcb: *mut ThreadControlBlock, priority: u8, end: QueueEnd) -> bool
+    {
         let p = priority as usize;
         // Debug: detect use-after-free via magic cookie.
         // SAFETY: tcb is guaranteed valid by the caller; magic and thread_id are always readable.
@@ -381,7 +448,11 @@ impl PerCpuScheduler
         // SAFETY: the caller holds `self.lock` (contract), so no other
         // reference to the queues is live.
         let queues = unsafe { &mut *self.queues.get() };
-        queues[p].enqueue(tcb);
+        match end
+        {
+            QueueEnd::Tail => queues[p].enqueue(tcb),
+            QueueEnd::Head => queues[p].enqueue_head(tcb),
+        }
         // Tag the link under the owning scheduler.lock so any subsequent enqueue
         // (this or another CPU) observes it via the guard above. `priority` is a
         // u8 in [0, NUM_PRIORITY_LEVELS), so the widening to i16 is lossless.
@@ -735,6 +806,36 @@ mod tests
         assert_eq!(deq(&sched), pc);
         // After emptying, next dequeue should return idle.
         assert_eq!(deq(&sched), pa);
+    }
+
+    #[test]
+    fn head_link_returns_a_dequeued_thread_to_its_turn()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut a = make_tcb();
+        let mut b = make_tcb();
+        let mut c = make_tcb();
+        let mut idle_tcb = make_tcb();
+        let pa = &mut *a as *mut _;
+        let pb = &mut *b as *mut _;
+        let pc = &mut *c as *mut _;
+        sched.set_idle(&mut *idle_tcb);
+
+        assert!(enq(&sched, pa, 4));
+        assert!(enq(&sched, pb, 4));
+        assert_eq!(deq(&sched), pa);
+        // SAFETY: single-threaded test; pa is a live, unlinked boxed TCB.
+        assert!(unsafe { sched.enqueue_at_head(pa, 4) });
+        // A tail link after the head link still queues behind both.
+        assert!(enq(&sched, pc, 4));
+        assert_eq!(deq(&sched), pa);
+        assert_eq!(deq(&sched), pb);
+        assert_eq!(deq(&sched), pc);
+        // SAFETY: as above, on the now-empty level.
+        assert!(unsafe { sched.enqueue_at_head(pa, 4) });
+        assert!(enq(&sched, pb, 4));
+        assert_eq!(deq(&sched), pa);
+        assert_eq!(deq(&sched), pb);
     }
 
     #[test]

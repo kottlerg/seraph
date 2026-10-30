@@ -60,6 +60,9 @@ pub fn serial_init(info: &InitInfo, _thread_cap: u32)
     // `[SERIAL_VA, SERIAL_VA + size)` lies in init's private VA plan below
     // INIT_IPC_BUF_VA (checked above), where nothing else is mapped and no
     // Rust object lies.
+    // This module's UART accessors reach the mapping only through raw
+    // volatile loads and stores, never a reference, and SERIAL_VA serves
+    // nothing else in init's VA plan (`mmio_map` § Safety).
     if unsafe { syscall::mmio_map(info.aspace_cap, slot, SERIAL_VA, 0) }.is_err()
     {
         return;

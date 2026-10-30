@@ -818,7 +818,6 @@ The kernel does not provide:
 [programs/capexhaust/README.md](../programs/capexhaust/README.md),
 [programs/threadstack/README.md](../programs/threadstack/README.md),
 [runtime/ruststd/README.md](../runtime/ruststd/README.md),
-[services/devmgr/README.md](../services/devmgr/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),
 [services/memmgr/README.md](../services/memmgr/README.md),
 [memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),

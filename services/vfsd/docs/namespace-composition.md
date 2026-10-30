@@ -1,7 +1,7 @@
 # Synthetic Root and Namespace Composition
 
 vfsd is a namespace server that owns no on-disk storage. Its
-[`NamespaceBackend`] implementation, [`VfsdRootBackend`], composes a
+`NamespaceBackend` implementation, `VfsdRootBackend`, composes a
 synthetic system root from per-mount driver namespace endpoints
 captured at boot time and on each successful `MOUNT`. Clients holding
 the system-root cap walk into mounted filesystems through this
@@ -27,8 +27,8 @@ The cap-as-namespace model is defined by
 
 ## Synthetic root state
 
-[`VfsdRootBackend`] owns a single fixed-capacity tree of
-[`TreeNode`]s. Each node carries:
+`VfsdRootBackend` owns a single fixed-capacity tree of
+`TreeNode`s. Each node carries:
 
 | Field | Purpose |
 |---|---|
@@ -60,16 +60,16 @@ remains supported but is currently unexercised in production.
 `NS_LOOKUP(parent, name)` against any cap on vfsd's namespace
 endpoint dispatches in two stages, from `vfsd::namespace_loop`:
 
-1. **Local-child match.** [`VfsdRootBackend::lookup`] walks the
+1. **Local-child match.** `VfsdRootBackend::lookup` walks the
    parent node's child list. A match on a *terminal* child returns
-   an [`EntryTarget::External`] view carrying the driver's unbadged
+   an `EntryTarget::External` view carrying the driver's unbadged
    endpoint and the peer root node; the namespace-protocol crate
    ([`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
    § NS_LOOKUP) mints a fresh `cap_derive_badge` on that endpoint carrying the
    composed `parent_rights ∩ entry.max_rights ∩ caller_requested` rights. The
    reply cap belongs to the underlying filesystem driver's namespace
    endpoint; subsequent walks bypass vfsd entirely. A match on a
-   *synthetic intermediate* child returns an [`EntryTarget::Local`]
+   *synthetic intermediate* child returns an `EntryTarget::Local`
    view; the protocol crate mints a `cap_derive_badge` on
    `namespace_ep` addressing the intermediate's `NodeId`, so the next
    `NS_LOOKUP` lands back on vfsd.
@@ -131,7 +131,7 @@ backend then retains the driver's **unbadged** namespace endpoint
 Every `NS_LOOKUP` that crosses the mount mints a *fresh* badged SEND on
 that endpoint carrying the composed
 `parent_rights ∩ entry.max_rights ∩ caller_requested` rights (the
-[`EntryTarget::External`] arm of `handle_lookup`; see
+`EntryTarget::External` arm of `handle_lookup`; see
 [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
 § NS_LOOKUP). Storing the unbadged
 endpoint — rather than a pre-badged root cap — is what carries
@@ -207,8 +207,8 @@ structural — `/services/fs/fatfs` is unreachable until root mounts, so
 moving spawn responsibility elsewhere is a chicken-and-egg
 inversion.
 
-Wire-label numbers for both surfaces live in [`ipc::vfsd_labels`] and
-[`ipc::ns_labels`].
+Wire-label numbers for both surfaces live in `ipc::vfsd_labels` and
+`ipc::ns_labels`.
 
 ---
 

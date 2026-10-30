@@ -6,7 +6,7 @@
 //! Stress test: more than 4096 `CSpace`s live at once.
 //!
 //! The kernel's `CSpace` registry is a RAM-sized arena with one id per page
-//! of DRAM (core/kernel/docs/capability-internals.md § CSpace Registry), so
+//! of DRAM (core/kernel/docs/capability-internals.md § `CSpace` Registry), so
 //! the live-`CSpace` count is bounded by the memory that pays for the
 //! `CSpace`s, not by a fixed table. This test holds [`LIVE`] one-page
 //! `CSpace`s at once, past the 4096 entries the former fixed registry held,

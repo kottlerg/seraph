@@ -11,7 +11,7 @@
 //! pages (core/kernel/docs/capability-internals.md § Teardown). Under the
 //! former fixed 4096-entry registry the same loop also exhausted the ids had
 //! a destruction failed to return one; the RAM-sized arena
-//! (§ CSpace Registry) holds far more ids than this loop takes, and cycling
+//! (§ `CSpace` Registry) holds far more ids than this loop takes, and cycling
 //! past its capacity would overrun CI's ktest budget under TCG, so id return
 //! through the kernel's teardown is not checked here. The registry's
 //! retire-then-reuse logic is covered by the kernel's `cap::registry` host

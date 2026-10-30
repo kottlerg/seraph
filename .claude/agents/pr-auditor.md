@@ -21,10 +21,14 @@ claims.
    Acceptance-checklist closure, § Milestones).
 
 2. Resolve scope from the parent's invocation: PR number, or current-branch
-   PR via `gh pr view --json number,body,title,files`, or local feature
+   PR via `gh pr view --json number,body,title,headRefOid,baseRefName`, or local feature
    branch if no PR exists yet.
 
-3. Materialize the diff: `gh pr diff <N>` (or `git diff master...HEAD`).
+3. Materialize the diff from the local tree: `git diff <base> <head>`, the
+   base being `git merge-base <head> origin/<baseRefName>` (or
+   `git diff master...HEAD` when no PR exists). Never `gh pr diff` or the
+   `files` field of `gh pr view`: GitHub caps them (300 files or 20000
+   lines for the diff, 100 files for the field).
 
 4. PR-body checklist: per `docs/conventions.md` § PR-body checklist
    discipline, every `- [ ]` in the PR body MUST be `- [x]` or removed

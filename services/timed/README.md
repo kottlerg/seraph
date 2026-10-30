@@ -81,6 +81,7 @@ monotonic time since.
 
 ## Summarized By
 
+[Architecture Overview](../../docs/architecture.md),
 [Device Management](../../docs/device-management.md),
 [Process Lifecycle](../../docs/process-lifecycle.md),
 [services/drivers/cmos/README.md](../drivers/cmos/README.md),

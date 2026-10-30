@@ -557,8 +557,15 @@ unsafe fn carve_page_into_bin(
 /// Returns `Err(SyscallError::OutOfMemory)` if the cap doesn't have enough
 /// room: `available_bytes` is below the rounded size, or no path above can
 /// place it (free bytes held only in the other sub-page bin, or only in
-/// sub-page slots for a page-aligned request, stay unusable). Caller must
-/// validate `tag == Memory && rights.contains(RETYPE)` before invoking.
+/// sub-page slots for a page-aligned request, stay unusable). A carve is
+/// permanent while the cap holds a live object (the drain reset alone undoes
+/// it, and SEED never drains), so carving trades page blocks for sub-page
+/// capacity: on SEED, sustained sub-page demand can leave too few contiguous
+/// pages for an x86_64 port-binding table, whose `sys_ioport_bind` then
+/// returns `OutOfMemory`. A carve happens only once the bump frontier cannot
+/// serve the class, so the cap is by then already at its shared budget:
+/// without the carve, the sub-page request fails instead. Caller must validate
+/// `tag == Memory && rights.contains(RETYPE)` before invoking.
 ///
 /// # Safety
 ///
@@ -628,12 +635,13 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
 
     if new_bump > memory.size
     {
-        // The bump frontier is spent. A sub-page request can still be served
-        // from a freed page block, whose bytes `available_bytes` counts: carve
-        // one page into the request's bin rather than fail while those bytes
-        // are free. SEED reaches this state at runtime: init's bootstrap slabs
-        // return to it as page blocks at init's reap, and every later runtime
-        // mint there is sub-page.
+        // The bump frontier cannot fit the request. A sub-page request can
+        // still be served from a freed page block, whose bytes
+        // `available_bytes` counts: carve one page into the request's bin
+        // rather than fail while those bytes are free. SEED reaches this state
+        // at runtime: init's bootstrap slabs return to it as page blocks at
+        // init's reap, and its runtime bodies are sub-page apart from x86_64's
+        // per-thread port-binding tables.
         // SAFETY: alloc lock held.
         let carved = subpage_bin_for(need)
             .and_then(|bin| unsafe { carve_page_into_bin(alloc, memory, bin, need) });
@@ -1305,10 +1313,10 @@ mod tests
     fn host_region(pages: usize) -> (Vec<u64>, MemoryObject)
     {
         let bytes = pages * PAGE_SIZE;
-        let buf = vec![0u64; bytes / 8];
+        let mut buf = vec![0u64; bytes / 8];
         let memory = MemoryObject {
             header: KernelObjectHeader::new(ObjectType::Memory),
-            base: buf.as_ptr() as u64,
+            base: buf.as_mut_ptr() as u64,
             size: bytes as u64,
             available_bytes: AtomicU64::new(bytes as u64),
             owns_memory: core::sync::atomic::AtomicBool::new(false),
@@ -1345,5 +1353,57 @@ mod tests
         assert_eq!(memory.available_bytes.load(Ordering::Acquire), 0);
         // With no page block left either, the next request fails.
         assert_eq!(retype_allocate(&memory, 96), Err(SyscallError::OutOfMemory));
+    }
+
+    #[test]
+    fn a_512_byte_request_carves_once_the_bump_cannot_fit_it()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(2);
+        // Leave 384 bytes of bump room: enough for no 512-byte slot. The page
+        // freed below is then the only place a 512-byte request fits.
+        let low = retype_allocate(&memory, p).unwrap();
+        for _ in 0..29
+        {
+            retype_allocate(&memory, 96).unwrap();
+        }
+        retype_free(&memory, low, p);
+
+        let slots = p / BIN_512;
+        for _ in 0..slots
+        {
+            let off = retype_allocate(&memory, BIN_512).unwrap();
+            assert!(off < p && off.is_multiple_of(BIN_512));
+        }
+        // The 384 bytes left above the bump cursor are counted but cannot
+        // hold a 512-byte slot.
+        assert_eq!(memory.available_bytes.load(Ordering::Acquire), 384);
+        assert_eq!(
+            retype_allocate(&memory, BIN_512),
+            Err(SyscallError::OutOfMemory)
+        );
+    }
+
+    #[test]
+    fn a_page_request_is_not_served_from_carved_sub_page_slots()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(3);
+        let a = retype_allocate(&memory, p).unwrap();
+        let b = retype_allocate(&memory, p).unwrap();
+        let _c = retype_allocate(&memory, p).unwrap();
+        retype_free(&memory, a, p);
+        retype_free(&memory, b, p);
+        // Carve both freed pages into 128-byte slots, then free every slot:
+        // two pages of bytes are available again, but only as sub-page slots.
+        let carved: Vec<u64> = (0..=p / BIN_128)
+            .map(|_| retype_allocate(&memory, 96).unwrap())
+            .collect();
+        for off in carved
+        {
+            retype_free(&memory, off, 96);
+        }
+        assert_eq!(memory.available_bytes.load(Ordering::Acquire), 2 * p);
+        assert_eq!(retype_allocate(&memory, p), Err(SyscallError::OutOfMemory));
     }
 }

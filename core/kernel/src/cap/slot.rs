@@ -679,7 +679,9 @@ impl CapabilitySlot
     ///
     /// The operations that refuse a pinned slot, and why, are defined in
     /// core/kernel/docs/capability-internals.md § Revocation Algorithm and
-    /// § Move. Read and written only under `DERIVATION_LOCK`.
+    /// § Move. Written only under `DERIVATION_LOCK` and read under it by every
+    /// path that acts on it; the advisory IPC and capability-tree pre-checks
+    /// read it without that lock, and their locked path re-decides.
     /// [`set_next_free`](Self::set_next_free) zeroes `pad[2]`, so a slot freed
     /// while pinned does not carry the pin to its next occupant.
     pub fn pinned(&self) -> bool

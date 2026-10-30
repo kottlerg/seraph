@@ -750,9 +750,8 @@ proceeds, the root is pinned for the whole multi-batch operation with the
 **in-flight pin** (`CapabilitySlot::pinned`, stored in `pad[2]`, written only under
 the derivation write lock and read under it by every path that acts on it; the advisory
 pre-checks of [§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix) read it
-without that lock, and their locked
-path re-decides; a move pins its
-source and destination the same way — see [Move](#move)). `SYS_CAP_DELETE`,
+without that lock, and their locked path re-decides; a move pins its source and destination
+the same way — see [Move](#move)). `SYS_CAP_DELETE`,
 `SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
 `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, the range splits, and a further
 `SYS_CAP_REVOKE` refuse a pinned slot with `InvalidState`; IPC capability

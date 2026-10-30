@@ -834,10 +834,14 @@ unsafe fn kernel_entry_post_rebase(
                     .insert_cap_typed(rights, fo_nn)
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init segment Memory cap"));
                 cap::note_owns_memory_minted(size_aligned);
-                if i == 0
-                {
-                    seg_base = slot.get();
-                }
+                // seg_count is segment_count (a u32) widened, so i fits.
+                #[allow(clippy::cast_possible_truncation)]
+                cap::extend_slot_run_or_fatal(
+                    &mut seg_base,
+                    i as u32,
+                    slot.get(),
+                    "Phase 9: init segment Memory caps are not in consecutive slots",
+                );
             }
             kprintln!(
                 "init: aspace cap={} + {} memory caps",

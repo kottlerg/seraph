@@ -150,7 +150,9 @@ usable slots are appended, in ascending order, at `free_tail`. Because a general
 allocation grows while the slots of the IPC receive reserve (below) are still free,
 appending hands those out before the new leaf's, so a run of consecutive inserts gets
 consecutive indices across a leaf boundary: `InitInfo`'s contiguous Memory-cap ranges
-depend on it.
+depend on it, and the boot population checks every run it publishes, halting on the first
+slot out of place (`cap::extend_slot_run_or_fatal`;
+[initialization.md](initialization.md) § Phase 7 and § Phase 9).
 
 A `Null` tag alone cannot tell a slot that is *linked on the free list* from one that
 was just allocated and not yet populated, and the list tail is byte-identical to a

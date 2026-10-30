@@ -226,7 +226,7 @@ overlap the kernel image window halts with
    [memory-internals.md](memory-internals.md) § Frame Map Table)
 6. Allocate the `CSpace` registry arena, one 1 MiB chunk of 65,536 registry entries per
    65,536 pages of DRAM (`cap::init_cspace_registry`; see
-   [capability-internals.md](capability-internals.md) § Representation)
+   [capability-internals.md](capability-internals.md) § CSpace Registry)
 7. Copy `BootInfo.cpu_ids` into the APIC-ID slab (`percpu::init_apic_ids`), so Phase 5
    can name the BSP by its hardware id (the riscv64 PLIC context)
 ```

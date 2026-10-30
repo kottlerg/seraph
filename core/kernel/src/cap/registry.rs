@@ -14,7 +14,7 @@
 //! epoch and thread the id free list through their `next_free` word, so an
 //! epoch persists across vacancy into the next tenant's registration. The
 //! design is specified in core/kernel/docs/capability-internals.md
-//! § Representation.
+//! § CSpace Registry.
 
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 

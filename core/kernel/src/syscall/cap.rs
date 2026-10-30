@@ -768,8 +768,9 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
     else
     {
         // Every id the registry arena backs is live (one per DRAM page,
-        // so unreachable while the caller's pages still pay for this one). Surface to userspace; the retype carve is undone below
-        // by `retype_free` after the error return.
+        // so unreachable while the caller's pages still pay for this one).
+        // Surface to userspace; the retype carve is undone below by
+        // `retype_free` after the error return.
         retype_free(memory, offset, entry.raw_bytes);
         return Err(SyscallError::OutOfMemory);
     };

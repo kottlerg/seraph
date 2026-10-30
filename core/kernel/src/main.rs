@@ -410,7 +410,7 @@ unsafe fn kernel_entry_post_rebase(
     unsafe { mm::frame_map::init(allocator, dram_bottom, dram_top) };
 
     // Carve the CSpace registry arena (one id per DRAM page,
-    // core/kernel/docs/capability-internals.md § Representation) for the same
+    // core/kernel/docs/capability-internals.md § CSpace Registry) for the same
     // reason: before the Phase-7 drain, while the buddy still holds 1 MiB
     // blocks, and before Phase 7 registers the root CSpace.
     // SAFETY: the single boot thread, once, after Phase 3 and before the

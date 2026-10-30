@@ -161,6 +161,29 @@ This gives amortised O(1) allocation and O(1) deallocation.
 
 ---
 
+### CSpace Registry (`cap/registry.rs`)
+
+The registry maps a `CSpaceId` to its live `CSpace` and current epoch. It is an arena of 16-byte
+entries (pointer, epoch, free-list link), one per 4 KiB page of DRAM
+(`mm::init::system_ram_bytes`), so the id space never runs out before the memory that pays for
+the `CSpace`s does: every `CSpace` costs its creator at least one wrapper page. Storage is
+two-level: `MAX_REGISTRY_CHUNKS` (1024) chunk pointers in BSS, each naming one 1 MiB buddy block
+of 65,536 entries (`REGISTRY_CHUNK_ORDER`), which covers the 256 GiB of DRAM the frame map table
+admits. `cap::init_cspace_registry` carves the chunks in Phase 4
+([initialization.md](initialization.md) § Phase 4), after the Phase-2 exclusions and before the
+Phase-7 drain; a short buddy is fatal.
+
+`alloc_cspace_id` hands out the most recently retired id, else the next fresh one, under one
+spinlock with O(1) holds. A vacant entry keeps its epoch and threads the free list through its
+link word, so the epoch `free_cspace_id` redraws at retirement (§ Representation) persists across
+the vacancy and is the one the next tenant's `register_cspace` returns.
+
+`lookup_cspace` takes no lock. It loads the chunk pointer (Acquire), then reads the entry's
+epoch, its pointer, and its epoch again, each with Acquire, and resolves only when both epoch
+reads equal the stamped epoch and the pointer is non-null. The second epoch read rejects a
+concurrent unregister, retire, reuse, and register that would otherwise pair the new tenant's
+pointer with the old epoch. An id no installed chunk backs resolves nothing.
+
 ## Page Pools (`cap/object.rs`)
 
 The wrapper object that owns a `CSpace` (`CSpaceKernelObject`) keeps the
@@ -278,20 +301,8 @@ random epoch with probability ~2⁻³² per recycle; this residual is accepted
 because the capability, not the `SlotId`, is the authority. See #137 for the
 recycling allocator design.
 
-The registry (`cap/registry.rs`) maps a `CSpaceId` to its live `CSpace` and current epoch. It is
-an arena of 16-byte entries (pointer, epoch, free-list link), one per 4 KiB page of DRAM
-(`mm::init::system_ram_bytes`), so the id space never runs out before the memory that pays for
-the `CSpace`s does: every `CSpace` costs its creator at least one wrapper page. Storage is
-two-level: `MAX_REGISTRY_CHUNKS` (1024) chunk pointers in BSS, each naming one 1 MiB buddy block
-of 65,536 entries (`REGISTRY_CHUNK_ORDER`), which covers the 256 GiB of DRAM the frame map table
-admits. `cap::init_cspace_registry` carves the chunks in Phase 4
-([initialization.md](initialization.md) § Phase 4), after the Phase-2 exclusions and before the
-Phase-7 drain; a short buddy is fatal. `alloc_cspace_id` hands out the most recently retired id,
-else the next fresh one, under one spinlock with O(1) holds; a vacant entry keeps its epoch and
-threads the free list through its link word, so the epoch `free_cspace_id` redraws at retirement
-persists across the vacancy and is the one the next tenant's `register_cspace` returns. Lookup
-(`lookup_cspace`) takes no lock: one Acquire load of the chunk pointer, then the epoch, pointer,
-epoch sequence above. An id no installed chunk backs resolves nothing.
+The registry that maps a `CSpaceId` to its live `CSpace` and epoch is described in
+§ CSpace Registry below.
 
 ### Per-Slot Generation
 

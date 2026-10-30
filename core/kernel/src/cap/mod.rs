@@ -2607,19 +2607,21 @@ mod tests
     }
 
     /// `CSpaceId` reserved for the recycle test below. The host-test
-    /// `CSPACE_REGISTRY` is a process-wide static and `cargo test` runs tests concurrently, so every
-    /// host `#[test]` that registers a `CSpace` directly — this one and the
-    /// derivation-tree tests in `core/kernel/src/cap/derivation.rs`, which use
-    /// the `31xx` block — picks an id unique to that test; nothing enforces it. A high
-    /// id keeps this one clear of that block.
+    /// `CSPACE_REGISTRY` is a process-wide static and `cargo test` runs tests
+    /// concurrently, so every host `#[test]` that registers a `CSpace`
+    /// directly — this one and the derivation-tree tests in
+    /// `core/kernel/src/cap/derivation.rs`, which use the `31xx` block — picks
+    /// an id unique to that test; nothing enforces it. A high id keeps this
+    /// one clear of that block.
     const RECYCLE_TEST_ID: CSpaceId = (registry::ENTRIES_PER_CHUNK as u32) - 1;
 
     /// A `SlotId` stamped before a `CSpace` id is recycled must fail
     /// `lookup_cspace` (epoch mismatch) even after the id is reused by a new
     /// tenant, while a freshly stamped `SlotId` resolves. Couples the real
     /// stamp (`SlotId::current` → `registry_epoch`) and validation
-    /// (`lookup_cspace`) paths; only the epoch bump is simulated, because
-    /// `free_cspace_id` and the free list are `#[cfg(not(test))]`.
+    /// (`lookup_cspace`) paths; only the epoch redraw is simulated, because
+    /// `free_cspace_id` is `#[cfg(not(test))]` (it draws from the kernel
+    /// CSPRNG).
     #[test]
     fn cspace_recycle_invalidates_stale_slotid()
     {

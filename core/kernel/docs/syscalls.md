@@ -742,7 +742,7 @@ the kernel and only `init_pages − 1` pages reach the pool (see
 target lacks Insert), `OutOfMemory` (Memory cap region or slot-page pool exhausted, or,
 in create-mode, every id of the kernel's `CSpace` registry live, which the registry's
 one id per DRAM page puts past the memory that pays for the `CSpace`s; see
-[capability-internals.md](capability-internals.md) § Representation),
+[capability-internals.md](capability-internals.md) § CSpace Registry),
 `QuotaExceeded` (caller's CSpace directory structurally full).
 
 ---

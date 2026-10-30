@@ -5343,15 +5343,16 @@ pub unsafe fn schedule(requeue: Requeue)
         let dispatchable = ready && !deferred;
         if deferred
         {
-            // Re-link `next` here, still `Ready`, and claim idle. Lock order:
-            // `next.sched_lock` (held) → this CPU's run-queue lock. IRQs stay
-            // disabled across the relock/release.
+            // Re-link `next` here, still `Ready`, at the head of its level so
+            // it keeps its turn, and claim idle. Lock order: `next.sched_lock`
+            // (held) → this CPU's run-queue lock. IRQs stay disabled across the
+            // relock/release.
             // SAFETY: next valid; its sched_lock is held, so its priority is
             // stable and no other path links it; lock_raw/release_lock_only
             // paired.
             unsafe {
                 let relock = sched.lock.lock_raw();
-                let linked = sched.enqueue(next, (*next).priority);
+                let linked = sched.enqueue_at_head(next, (*next).priority);
                 debug_assert!(
                     linked,
                     "schedule deferred dispatch: enqueue skipped for a dequeued \

@@ -753,12 +753,21 @@ pub fn namespace_lookup_dir(
     Ok(walked.dir_cap)
 }
 
+/// Raw retype debits the kernel charges for one object of each kind, the
+/// `min_bytes` to pass to [`object_slab_retype`]. Re-exported from the ABI
+/// crate, where the kernel pins them to its real object sizes; a size change
+/// is an ABI-visible change by design.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub use syscall_abi::{ENDPOINT_RETYPE_BYTES, NOTIFICATION_RETYPE_BYTES, event_queue_retype_bytes};
+
 /// Retype one kernel object out of the runtime's object-slab machinery.
 ///
-/// `min_bytes` is the raw byte cost of the kernel object the caller is
-/// about to create (e.g. 80 for `Endpoint`, 64 for `Notification`); the
-/// runtime rounds up to the kernel's size-class granularity, so any value in
-/// the same class retypes alike. `retype` is called at most once with a
+/// `min_bytes` is the full raw debit the kernel charges for the object the
+/// caller is about to create, the object wrapper plus its state:
+/// [`ENDPOINT_RETYPE_BYTES`], [`NOTIFICATION_RETYPE_BYTES`], or
+/// [`event_queue_retype_bytes`]`(capacity)`, or the byte size of a
+/// page-granular object. The runtime rounds it up to the kernel's size class,
+/// so the request covers the kernel's debit. `retype` is called at most once with a
 /// Memory-cap slot whose `available_bytes` covers that class and must perform
 /// exactly one `cap_create_*` syscall against the slot, returning `Some` on
 /// success.

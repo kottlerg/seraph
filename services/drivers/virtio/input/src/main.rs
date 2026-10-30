@@ -572,7 +572,9 @@ fn main() -> !
     // the notification to it for low-latency wakeups; otherwise the bounded wait
     // degrades to timed polling.
     let Some(irq_notification) =
-        std::os::seraph::object_slab_retype(64, |slab| syscall::cap_create_notification(slab).ok())
+        std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        })
     else
     {
         std::os::seraph::log!("failed to create notification");

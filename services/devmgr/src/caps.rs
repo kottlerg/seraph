@@ -457,7 +457,9 @@ pub fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DevmgrCap
     bootstrap_rounds(creator, ipc_buf, &mut caps)?;
 
     caps.self_bootstrap_ep =
-        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())?;
+        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+            syscall::cap_create_endpoint(slab).ok()
+        })?;
 
     Some(caps)
 }

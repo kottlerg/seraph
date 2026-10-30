@@ -1047,17 +1047,20 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
 {
     match object_type
     {
-        // Sub-page wrappers + state. Header (16) + state (variable).
-        // Endpoint: 24 wrapper + EndpointState → BIN_128. Computed from
-        // size_of so a field addition cannot silently drift the budget (a
-        // bin-overflow is caught by the const-assert in endpoint.rs).
+        // Sub-page wrappers + state. The Endpoint and Notification debits are
+        // the ABI's retype-cost constants, which userspace sizes its slab
+        // requests from; the const assertions after this function pin them to
+        // the real `24 + size_of::<State>()`, so a field change breaks the
+        // build instead of drifting (a bin overflow is caught by the
+        // const-asserts in endpoint.rs and notification.rs).
+        // Endpoint: 24 wrapper + EndpointState → BIN_128.
         ObjectType::Endpoint => Some(DispatchEntry {
-            raw_bytes: 24 + core::mem::size_of::<crate::ipc::endpoint::EndpointState>() as u64,
+            raw_bytes: syscall::ENDPOINT_RETYPE_BYTES,
             split: false,
         }),
         // Notification: 24 wrapper + NotificationState → BIN_128.
         ObjectType::Notification => Some(DispatchEntry {
-            raw_bytes: NOTIFICATION_RAW_BYTES,
+            raw_bytes: syscall::NOTIFICATION_RETYPE_BYTES,
             split: false,
         }),
         // WaitSet: 24 wrapper + 440 (the asserted upper bound on WaitSetState)
@@ -1068,14 +1071,15 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             split: false,
         }),
         // EventQueue: 24 wrapper + EventQueueState (56 B, EVENT_QUEUE_STATE_BYTES)
-        // + (size_arg + 1) u64 ring slots, all inline in the retype slot. Sub-page
+        // + (size_arg + 1) u64 ring slots, all inline in the retype slot, the
+        // ABI's `event_queue_retype_bytes` (pinned below). Sub-page
         // in-place for small rings; page-aligned split when the total exceeds the
         // 512 B sub-page bin. The exact byte count here must match the
         // construction layout in `sys_cap_create_event_queue` and the reclaim
         // arithmetic in `dealloc_object_one`'s EventQueue arm.
         ObjectType::EventQueue =>
         {
-            let raw_bytes = event_queue_raw_bytes(size_arg);
+            let raw_bytes = syscall::event_queue_retype_bytes(size_arg);
             Some(DispatchEntry {
                 raw_bytes,
                 split: raw_bytes > BIN_512,
@@ -1118,6 +1122,19 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
         | ObjectType::SbiControl => None,
     }
 }
+
+// Pins the ABI retype-cost constants `dispatch_for` debits to the kernel's
+// real object sizes. The EventQueue formula is linear in the capacity, so
+// agreement at two capacities is agreement at every capacity.
+const _: () = {
+    assert!(
+        24 + core::mem::size_of::<crate::ipc::endpoint::EndpointState>() as u64
+            == syscall::ENDPOINT_RETYPE_BYTES
+    );
+    assert!(NOTIFICATION_RAW_BYTES == syscall::NOTIFICATION_RETYPE_BYTES);
+    assert!(event_queue_raw_bytes(0) == syscall::event_queue_retype_bytes(0));
+    assert!(event_queue_raw_bytes(1) == syscall::event_queue_retype_bytes(1));
+};
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

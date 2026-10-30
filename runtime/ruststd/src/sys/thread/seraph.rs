@@ -236,7 +236,8 @@ impl Thread {
             }
         };
 
-        let done_notification = match crate::sys::alloc::seraph::object_slab_retype(120, |slab| {
+        let bytes = syscall_abi::NOTIFICATION_RETYPE_BYTES;
+        let done_notification = match crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
             syscall::cap_create_notification(slab).ok()
         }) {
             Some(cap) => cap,

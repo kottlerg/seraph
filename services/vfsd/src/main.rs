@@ -215,7 +215,9 @@ fn main() -> !
     // a single dispatcher thread can serve every walk without
     // contending with mount-table mutations.
     let Some(namespace_ep) =
-        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
+        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+            syscall::cap_create_endpoint(slab).ok()
+        })
     else
     {
         std::os::seraph::log!("FATAL: cannot create namespace endpoint");

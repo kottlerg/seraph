@@ -627,8 +627,10 @@ impl OwnFatfs
 
 fn new_endpoint() -> u32
 {
-    std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
-        .expect("fs_block_faults: endpoint creation failed")
+    std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+        syscall::cap_create_endpoint(slab).ok()
+    })
+    .expect("fs_block_faults: endpoint creation failed")
 }
 
 /// Create and start a fatfs process with `creator` as its creator endpoint

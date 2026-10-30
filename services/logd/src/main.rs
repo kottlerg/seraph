@@ -182,8 +182,8 @@ fn main() -> !
 fn create_death_eq() -> Option<u32>
 {
     const MAX_DEATHS_PER_BURST: u32 = 64;
-    // Bytes: 24 wrapper + 56 state + (capacity + 1) * 8 ring.
-    let slab_bytes: u64 = 24 + 56 + (u64::from(MAX_DEATHS_PER_BURST) + 1) * 8;
+    // The kernel's raw EventQueue debit for that capacity.
+    let slab_bytes = std::os::seraph::event_queue_retype_bytes(u64::from(MAX_DEATHS_PER_BURST));
     std::os::seraph::object_slab_retype(slab_bytes, |slab| {
         syscall::event_queue_create(slab, MAX_DEATHS_PER_BURST).ok()
     })

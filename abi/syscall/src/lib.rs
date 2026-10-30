@@ -137,6 +137,32 @@ pub fn unpack_cap_handles(lo: u64, hi: u64, count: usize) -> [u32; MSG_CAP_SLOTS
     out
 }
 
+// ── Retype costs ──────────────────────────────────────────────────────────────
+
+// The raw bytes the kernel debits from a Memory cap's retype budget for one
+// sub-page kernel object: the 24-byte object wrapper plus the object's state
+// (`cap::retype::dispatch_for` in core/kernel/src/cap/retype.rs, which uses
+// these constants and pins them to the real sizes with const assertions). A
+// userspace slab allocator sizes its request from them; the kernel rounds the
+// debit up to its size class. They are the kernel's current retype cost for
+// each object kind, so a change to an object's size changes them, and that is
+// an ABI-visible change by design.
+
+/// Raw retype debit of one `Endpoint`, in bytes.
+pub const ENDPOINT_RETYPE_BYTES: u64 = 80;
+
+/// Raw retype debit of one `Notification`, in bytes.
+pub const NOTIFICATION_RETYPE_BYTES: u64 = 64;
+
+/// Raw retype debit of one `EventQueue` of user-visible `capacity` entries, in
+/// bytes: the 24-byte wrapper, the 56-byte queue state, and `capacity + 1`
+/// eight-byte ring slots, all inline in the retype slot.
+#[must_use]
+pub const fn event_queue_retype_bytes(capacity: u64) -> u64
+{
+    24 + 56 + (capacity + 1) * 8
+}
+
 // ── Syscall numbers ───────────────────────────────────────────────────────────
 
 /// IPC: synchronous call (send + block waiting for reply).

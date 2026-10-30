@@ -69,8 +69,7 @@ struct ReleaseProbe
     page: u32,
     /// The grant's physical base, naming it to `RELEASE_MEMORY_CAPS`.
     phys_base: u64,
-    /// The page's `available_bytes` with the endpoint alive in init's
-    /// `CSpace`.
+    /// The page's `available_bytes` with the endpoint alive.
     available_before: u64,
 }
 
@@ -94,20 +93,21 @@ impl ReleaseProbe
             release_page(memmgr_ep, page, phys_base, ipc_buf);
             return None;
         };
+        // Read before the move, while a failure can still be undone; the
+        // move changes no byte of the page.
+        let Ok(available_before) = syscall::cap_info(page, CAP_INFO_MEMORY_AVAILABLE)
+        else
+        {
+            let _ = syscall::cap_delete(endpoint);
+            release_page(memmgr_ep, page, phys_base, ipc_buf);
+            return None;
+        };
         if syscall::cap_move(endpoint, cspace, 0).is_err()
         {
             let _ = syscall::cap_delete(endpoint);
             release_page(memmgr_ep, page, phys_base, ipc_buf);
             return None;
         }
-        let Ok(available_before) = syscall::cap_info(page, CAP_INFO_MEMORY_AVAILABLE)
-        else
-        {
-            // The endpoint now sits in init's CSpace; the page cannot be
-            // returned while it may still back it.
-            let _ = syscall::cap_delete(page);
-            return None;
-        };
         Some(Self {
             page,
             phys_base,

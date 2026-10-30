@@ -1421,7 +1421,8 @@ fn send_handover_complete(svcmgr_service_ep: u32, ipc_buf: *mut u64)
 /// carrying `slots` as caps. Non-fatal on failure: init exits regardless,
 /// and any un-sent cap stays in init's `CSpace` until the reap frees it, when
 /// its pages free into the sealed post-handoff buddy instead of reaching
-/// memmgr's pool (`docs/process-lifecycle.md` § Init reap;
+/// memmgr's pool: an accounting violation, which trips the kernel's post-seal
+/// `debug_assert` in a debug build (`docs/process-lifecycle.md` § Init reap;
 /// `docs/userspace-memory-model.md` § Ownership Boundaries).
 ///
 /// # Safety
@@ -1513,8 +1514,9 @@ fn register_init_reap_objects(
 /// Failures here are logged but otherwise non-fatal — init still calls
 /// `sys_thread_exit` afterward, leaving the un-transferred caps in init's
 /// `CSpace` until the reap frees it, when their pages free into the sealed
-/// post-handoff buddy instead of reaching memmgr's pool
-/// (`docs/process-lifecycle.md` § Init reap).
+/// post-handoff buddy instead of reaching memmgr's pool: an accounting
+/// violation, which trips the kernel's post-seal `debug_assert` in a debug
+/// build (`docs/process-lifecycle.md` § Init reap).
 fn finish_init_reap_handoff(
     info: &InitInfo,
     procmgr_ep: u32,
@@ -1594,8 +1596,9 @@ fn finish_init_reap_handoff(
         // The free Memory caps MemoryAlloc abandoned while carving bootstrap
         // arenas: memory_split remainders below the floor with no descriptor.
         // Without this the reap's teardown of init's CSpace would free them
-        // into the sealed post-handoff buddy and their pages would never
-        // reach memmgr (`docs/process-lifecycle.md` § Init reap). They carry
+        // into the sealed post-handoff buddy, tripping the kernel's post-seal
+        // `debug_assert` in a debug build, and their pages would never reach
+        // memmgr (`docs/process-lifecycle.md` § Init reap). They carry
         // RETYPE + owns_memory like any RAM memory
         // cap, so memmgr ingests them into its pool.
         for &slot in orphan_memory_caps

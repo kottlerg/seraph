@@ -999,7 +999,8 @@ fn forward_arena(arena_cap: u32, mm_cspace: u32, kind: u64) -> Option<InUseArena
 /// `MemoryAlloc` tail and the transient phys-table page — both `memory_split`
 /// products with no `InitInfo` descriptor, which the reap donation walk does
 /// not reach, so unforwarded they would stay in init's `CSpace` until the reap
-/// frees it and then free into the sealed post-handoff buddy.
+/// frees it and then free into the sealed post-handoff buddy, tripping the
+/// kernel's post-seal `debug_assert` in a debug build.
 fn push_free_run(
     src_cap: u32,
     pages: u32,
@@ -1172,7 +1173,8 @@ pub fn finalize_memmgr(
     // `memory_split` product, so it carries no named `InitInfo` descriptor and
     // is excluded from the reap donation walk; without this the reap's teardown
     // of init's CSpace would free it into the sealed post-handoff buddy (which
-    // nothing allocates from) and its pages would be lost. It is
+    // nothing allocates from), tripping the kernel's post-seal `debug_assert`
+    // in a debug build, and its pages would be lost. It is
     // free RAM, so it joins memmgr's pool as a run like any forwarded memory cap.
     if alloc.remaining >= PAGE_SIZE
     {

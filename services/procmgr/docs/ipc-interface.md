@@ -476,11 +476,13 @@ state. Procmgr deletes any cap the message carried. Reply `SUCCESS` with:
 The probe is an Endpoint procmgr retypes from a one-page memmgr grant and moves
 into init's CSpace through its CSpace capability after the donation step and
 before the revoke and delete. Freeing init's CSpace releases the endpoint, whose
-bytes return to the grant; procmgr reads the grant's `available_bytes` on each side
-of the deletion, with nothing else released between the two reads, reports
-`RELEASED` when it rose, and returns the page to memmgr (`RELEASE_MEMORY_CAPS`).
-A held endpoint still backs the page, so procmgr then keeps the page. svctest's
-`init_cspace_released` phase asserts `RELEASED`.
+bytes return to the grant, and nothing else retypes from or returns bytes to the
+grant. procmgr reads the grant's `available_bytes` before the move and again after
+the revoke and delete, re-reading up to 64 times with a yield between reads (a
+concurrent syscall pin on init's CSpace defers its free to the pin's release). It
+reports `RELEASED` once the value rose, and returns the page to memmgr
+(`RELEASE_MEMORY_CAPS`); otherwise it reports `HELD` and keeps the page, which the
+endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
 
 ---
 

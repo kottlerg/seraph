@@ -1378,12 +1378,14 @@ unsafe fn kernel_entry_post_rebase(
             // SAFETY: cs_kobj_ptr is in-place inside the SEED slab; header at offset 0.
             let cs_nn = unsafe { NonNull::new_unchecked(cs_kobj_ptr.cast::<KernelObjectHeader>()) };
             // The self-cap takes over the CSpace's creation reference, the
-            // kernel's hold on it through boot: nothing after this handoff
-            // reads the CSpace except through init's TCB, which, like every
-            // thread's, holds no reference on it. From here the CSpace is an
-            // ordinary one whose count is its capabilities (and syscall
-            // pins), so deleting the last of them frees it and releases the
-            // caps it holds (docs/process-lifecycle.md § Init reap).
+            // kernel's hold on it through boot. Once init runs, the kernel
+            // reaches the CSpace only through init's TCB, which, like every
+            // thread's, holds no reference on it; the rest of Phase 9 reads it
+            // before init can run, while this cap, inside it, still holds it.
+            // From here the CSpace is an ordinary one whose count is its
+            // capabilities (and syscall pins), so deleting the last of them
+            // frees it and releases the caps it holds
+            // (docs/process-lifecycle.md § Init reap).
             // `insert_cap` does not bump the refcount of the inserted object,
             // so no reference is taken here.
             cs.insert_cap_typed(
@@ -1455,7 +1457,11 @@ unsafe fn kernel_entry_post_rebase(
         // for split-derived wrappers and per-thread IOPB pages), and the per-CPU
         // kernel stacks. The RAM accounting identity is defined in
         // docs/userspace-memory-model.md § Ownership Boundaries.
-        // SAFETY: init_cspace_ptr is the root CSpace, single-threaded boot.
+        // SAFETY: init_cspace_ptr is init's CSpace, held by init's self-cap
+        // inside it. Init, though enqueued, cannot run before `sched::enter`
+        // below (the idle APs' load balancer skips a queue holding only init),
+        // so nothing can delete that cap or change the slots while this reads
+        // them.
         let cap_available_bytes = unsafe { cap::sum_memory_available_bytes(&*init_cspace_ptr) };
         let seed_available_bytes = cap::seed_memory_ref()
             .available_bytes

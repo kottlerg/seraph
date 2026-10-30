@@ -229,7 +229,8 @@ impl MemoryAlloc
     /// least one free page. Halts if the fixed orphan table overflows: a cap
     /// silently dropped from it would stay in init's `CSpace` until the reap
     /// frees that `CSpace`, then free into the sealed post-handoff buddy
-    /// instead of reaching memmgr's pool.
+    /// instead of reaching memmgr's pool, tripping the kernel's post-seal
+    /// `debug_assert` in a debug build.
     fn record_orphan(&mut self, slot: u32)
     {
         assert!(

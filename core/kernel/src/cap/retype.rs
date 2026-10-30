@@ -566,8 +566,9 @@ unsafe fn carve_page_into_bin(
 /// pages for an x86-64 port-binding table, whose `sys_ioport_bind` then
 /// returns `OutOfMemory`. A carve happens only once the bump frontier cannot
 /// serve the class, so the bump frontier is by then spent and the class's
-/// free list empty: without the carve, the sub-page request fails instead. Caller must validate
-/// `tag == Memory && rights.contains(RETYPE)` before invoking.
+/// free list empty: without the carve, the sub-page request fails instead.
+/// Caller must validate `tag == Memory && rights.contains(RETYPE)` before
+/// invoking.
 ///
 /// # Safety
 ///

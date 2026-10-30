@@ -2309,11 +2309,10 @@ fn idle_thread_entry(_cpu_id: u64) -> !
             // `cap::object::push_deferred_reclaim`), the last references a
             // syscall pin or a batched capability move dropped, and the
             // `AddressSpace` an Mmio object's mapping record held, released
-            // by that object's teardown (`MmioObject::withdraw_mappings`;
-            // all but the self-teardown through
-            // `cap::object::release_ref`), whose `CSpace` or
-            // `AddressSpace` may still have live bound threads that the
-            // teardown stops here.
+            // by that object's teardown (`MmioObject::withdraw_mappings`; all
+            // but the self-teardown through `cap::object::release_ref`),
+            // whose `CSpace` or `AddressSpace` may still have live bound
+            // threads that the teardown stops here.
             // The idle thread is a safe context: never one of the queued dead
             // threads, bound to nothing, and — its time slice permanently
             // zero — never descheduled inside the teardown's cross-CPU waits.

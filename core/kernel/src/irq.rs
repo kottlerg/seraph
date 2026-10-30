@@ -105,9 +105,8 @@ pub unsafe fn register(irq: u32, notification: *mut NotificationState)
 {
     debug_assert!((irq as usize) < MAX_IRQ, "irq out of range");
     // SeqCst, so every route write is in the teardown's total order
-    // (rustdoc above). An
-    // out-of-range `irq` panics at the index (the debug_assert reports it
-    // first in debug builds).
+    // (rustdoc above). An out-of-range `irq` panics at the index (the
+    // debug_assert reports it first in debug builds).
     IRQ_TABLE[irq as usize]
         .notification
         .store(notification, Ordering::SeqCst);
@@ -126,9 +125,8 @@ pub unsafe fn unregister(irq: u32)
 {
     debug_assert!((irq as usize) < MAX_IRQ, "irq out of range");
     // SeqCst, so every route write is in the teardown's total order
-    // (rustdoc above). An
-    // out-of-range `irq` panics at the index (the debug_assert reports it
-    // first in debug builds).
+    // (rustdoc above). An out-of-range `irq` panics at the index (the
+    // debug_assert reports it first in debug builds).
     IRQ_TABLE[irq as usize]
         .notification
         .store(null_mut(), Ordering::SeqCst);

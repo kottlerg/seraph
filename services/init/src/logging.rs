@@ -6,11 +6,9 @@
 //! Logging subsystem for init — the system's *interim* log mediator.
 //!
 //! Init owns the master log endpoint at boot and runs a dedicated thread
-//! ("init-logd") that drains it until real-logd is launched at the end
-//! of Phase 2. The init-logd thread terminates immediately after the
-//! handover, leaving the same kernel endpoint object live (existing
-//! badged SEND caps held by every early writer remain valid; only the
-//! RECV-holder changes).
+//! ("init-logd") that drains it until the svcmgr-launched real-logd takes it
+//! over; init-logd's console role is specified in `docs/console-model.md`
+//! (item 3) and the takeover in `services/logd/docs/handover-protocol.md`.
 //!
 //! Three halves:
 //!
@@ -28,14 +26,10 @@
 //!   `[name] <line>\r\n` to the serial port AND records the line in a
 //!   bounded history ring for handover to real-logd.
 //!
-//! * **Handover (`HANDOVER_PULL` + `HANDOVER_RELEASE`):** real-logd,
-//!   once up, drains (badge table + history ring) via repeated
-//!   `log_labels::HANDOVER_PULL` calls on the same endpoint, then issues
-//!   `HANDOVER_RELEASE`. Init-logd breaks its loop and `sys_thread_exit`s
-//!   on an acknowledged RELEASE — not on the drain's `DONE` — so a dropped
-//!   data chunk cannot leave it running and block procmgr's reap. A name
-//!   registered after its slot was sent defers the release (bounded) until
-//!   a further pull has carried it. The wire contract lives in
+//! * **Handover (`HANDOVER_PULL` + `HANDOVER_RELEASE`):** the receiver
+//!   serves real-logd's drain of the badge table and history ring, and
+//!   exits on the release, as `services/logd/docs/handover-protocol.md`
+//!   § Call shape and § Termination specify; the wire contract is
 //!   `logd_codec::handover` (`services/logd/codec`).
 
 use crate::PAGE_SIZE;

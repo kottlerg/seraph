@@ -3,75 +3,14 @@
 
 // core/ktest/src/integration/mod.rs
 
-//! Tier 2 — cross-subsystem integration tests.
+//! Tier 2 — cross-subsystem integration tests. The file layout (one file per
+//! scenario) and each file's scenario are specified in `core/ktest/README.md`
+//! § Source Layout and § Tier 2, whose table lists the files in the dispatch
+//! order of [`run_all`].
 //!
-//! Rule (durable):
-//!
-//! > **One file per cross-subsystem scenario. New scenario ⇒ new file.**
-//!
-//! Each file exercises a realistic multi-syscall scenario that spans more than
-//! one kernel subsystem. These tests catch emergent bugs that isolated syscall
-//! tests miss — for example, capability rights surviving an IPC transfer, thread
-//! register state being correct after stop+write+resume, or wait set ordering
-//! when multiple sources fire concurrently. Don't extend an existing
-//! scenario file to bolt on a tangential second scenario; add a sibling
-//! file.
-//!
-//! Files:
-//! - `thread_lifecycle.rs`       — full thread lifecycle end-to-end
-//! - `stop_read_regs_remote.rs` — a thread stopped while running on another CPU has its registers
-//!   read and rewritten as soon as the stop returns
-//! - `cap_transfer.rs`           — capability rights through an IPC endpoint round-trip
-//! - `cap_transfer_large.rs`     — IPC transfer of a cap with a multi-batch child list
-//! - `wait_concurrency.rs`       — wait set with simultaneous notification and queue sources
-//! - `memory_lifecycle.rs`       — pool-frame map → protect → unmap with `aspace_query`
-//!   state checks
-//! - `multi_caller_ipc_fifo.rs`  — endpoint send-queue FIFO ordering with three concurrent callers
-//! - `cap_delegation_chain.rs`   — multi-level rights attenuation and cascaded revocation
-//! - `tlb_coherency.rs`          — map/unmap cycles across CPUs exercising TLB shootdown
-//! - `retype_reclaim.rs`         — auto-reclaim invariant for every retypable kernel object
-//! - `mem_map_retyped_refused.rs` — `mem_map` refuses a Memory cap's retyped pages and maps
-//!   the page past its retype cursor
-//! - `mmio_revoke_unmaps.rs` — revoking an `Mmio` cap unmaps, with shootdown, a mapping made
-//!   through its descendant while a reader on another CPU uses it
-//! - `range_copy_lineage.rs` — a range lineage admits exactly 64 live copies, counted
-//!   alone after the root's delete
-//! - `cspace_nested_teardown.rs` — deleting the root of a 256-deep chain of nested `CSpace`s
-//!   reclaims every one without exhausting the kernel stack
-//! - `retype_subpage_clobber.rs` — a clobbered sub-page free-list link is rejected, not dereferenced
-//! - `priority_preemption.rs`    — higher-priority runnable thread preempts a busy lower-priority one
-//! - `shared_memory_two_aspaces.rs` — one Memory cap mapped into two `AddressSpace` caps; phys round-trip
-//! - `cap_move_into_fresh_cspace_then_ipc.rs` — `cap_move` an endpoint into a child cspace; child IPC-calls through it
-//! - `cross_cspace_revoke_no_alias.rs` — after a cross-CSpace `cap_revoke` frees a recipient's reply-delivered cap, the recipient's stale handle fails closed, not aliases the recycled slot (#349)
-//! - `cap_generation_stale_handle.rs` — a same-CSpace stale cap handle fails closed after the slot is recycled (#349)
-//! - `fpu_survives_ipc_call.rs` — FP register file survives a raw `SYS_IPC_CALL` round-trip across CPU migration
-//! - `fault_kills_thread.rs`     — a genuine userspace page fault terminates the thread with the right exit reason
-//! - `fault_pager_roundtrip.rs`  — a bound userspace pager maps a frame on fault and resumes the thread
-//! - `fault_resume_modifies_pc.rs` — a handler reads/edits the fault-blocked thread's registers and resumes it at a new PC
-//! - `fault_handler_declines_kills.rs` — a handler that replies KILL terminates the faulting thread
-//! - `fault_exception_redirect.rs` — a non-page-fault CPU exception is redirected to a handler that resumes the thread at a new PC
-//! - `fault_exception_no_handler_kills.rs` — a non-page-fault CPU exception with no handler bound terminates the thread
-//! - `irq_preserves_user_regs.rs` — a ring-3 thread's callee-saved registers survive a timer preemption (frame-authoritative IRQ path)
-//! - `tlb_widen_retry.rs`        — a permission-widen elides its shootdown; a remote stale-TLB write still completes via spurious-fault retry
-//! - `death_notification_late_bind.rs` — a death observer bound after the thread already died still receives the retained exit reason
-//! - `aspace_fault_notification_late_bind.rs` — an aspace terminal-fault observer bound after the space already faulted still receives the retained reason
-//! - `death_observer_outlives_queue_caps.rs` — a thread's and an address space's death-observer
-//!   bindings keep their event queues live after the queues' last caps are deleted, through the
-//!   death posts, until the owners' teardowns release them
-//! - `ipc_call_interrupted_stop_start.rs` — a client stopped while parked in `ipc_call` (send-queued and awaiting-reply) restarts to `Interrupted`, never a stale reply (#361)
-//! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
-//! - `destroyed_source_interrupts.rs` — every waiter on a notification, event queue, or wait set
-//!   destroyed under it returns `Interrupted`, never a fabricated success
-//! - `reply_binding_displaced.rs` — a server that receives again without replying releases the
-//!   caller its earlier receive bound: a released `ipc_call` returns `Interrupted` and the
-//!   released caller stops and restarts; a released fault-blocked thread is killed with the
-//!   fault exit reason; the later receive's caller gets its reply
-//! - `queued_waiters_fifo.rs` — threads waiting on one notification or event queue are woken in
-//!   arrival order, one per delivery, including after a timed waiter expires at the head or the
-//!   tail
-//! - Architecture-only scenarios live behind `crate::arch` (`run_integration`),
-//!   and the scenarios above reach their per-arch helpers and constants (for
-//!   example `crate::arch::fpu`, `crate::arch::IP_OFFSET`) through it.
+//! Architecture-only scenarios live behind `crate::arch` (`run_integration`),
+//! and the scenarios here reach their per-arch helpers and constants (for
+//! example `crate::arch::fpu`, `crate::arch::IP_OFFSET`) through it.
 
 pub mod aspace_fault_notification_late_bind;
 pub mod cap_delegation_chain;

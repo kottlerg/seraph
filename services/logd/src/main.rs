@@ -4,53 +4,17 @@
 // services/logd/src/main.rs
 
 //! Seraph system log daemon — post-mount owner of the master log
-//! endpoint.
+//! endpoint, launched and supervised by svcmgr.
 //!
-//! Launched and supervised by svcmgr, real-logd:
-//!
-//! 1. Receives via bootstrap protocol a RECV cap on the master log
-//!    endpoint, a SEND cap on the same endpoint (single-use, for the
-//!    `HANDOVER_PULL` drain and `HANDOVER_RELEASE` rounds with
-//!    init-logd), a `SEND|GRANT` cap on procmgr
-//!    carrying `DEATH_EQ_AUTHORITY` (for `REGISTER_DEATH_EQ`), and a
-//!    SEND cap on devmgr's registry endpoint carrying
-//!    `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via
-//!    `QUERY_SERIAL_DEVICE` and the framebuffer driver via
-//!    `QUERY_FRAMEBUFFER_DEVICE`).
-//! 2. Creates an `EventQueue` for procmgr-routed death notifications.
-//! 3. Registers the EQ with procmgr via `REGISTER_DEATH_EQ`. Procmgr
-//!    retroactively binds it on the main thread of every existing
-//!    process and of every future spawn (correlator = process badge,
-//!    equal to the log badge logd sees on `STREAM_BYTES`).
-//! 4. Drains init-logd's captured state via `HANDOVER_PULL` until
-//!    `DONE`, then releases init-logd with `HANDOVER_RELEASE`, pulling
-//!    again while init-logd defers the release (see
-//!    `docs/handover-protocol.md`). Init-logd self-terminates on the
-//!    acknowledged release, not on `DONE`.
-//! 5. Enters the main wait loop, draining death notifications first
-//!    then servicing log endpoint messages.
-//!
-//! Logd does NOT use `seraph::log!` for its own diagnostics — it IS
-//! the log receiver, so a `log!` call would self-IPC into the
-//! endpoint it serves and deadlock once init-logd has terminated.
-//! Diagnostics + received log lines are emitted through the userspace
-//! serial driver (resolved once via devmgr's `QUERY_SERIAL_DEVICE`)
-//! using `serial_labels::SERIAL_WRITE_BYTES`. Until the driver is
-//! resolvable, serial output is dropped but received lines stay in the
-//! per-slot history ring; the pre-driver boot window is covered by
-//! init-logd's direct-UART fallback (see `docs/console-model.md`).
-//!
-//! Logd's *panic / alloc-error / precondition* output must not ride the
-//! log endpoint either. `main` registers a `std::os::seraph::set_panic_sink`
-//! sink (`panic_to_serial`) that routes that output to the serial driver,
-//! and drops the procmgr-seeded badged SEND on the log endpoint
-//! (`ProcessInfo.log_send_cap`) so no path can self-IPC into the endpoint
-//! logd receives on.
-//!
-//! The pre-existing badged SEND caps held by memmgr, procmgr,
-//! tier-1 services, and every Phase-3 child remain valid across the
-//! handover — same kernel endpoint object, only the RECV-holder
-//! changes.
+//! The bootstrap caps are specified in `services/logd/README.md`
+//! § Bootstrap caps; the startup order (death-EQ registration before the
+//! first `HANDOVER_PULL`) and the handover itself in
+//! `docs/handover-protocol.md` § Startup ordering and § Call shape; and why
+//! logd cannot use `seraph::log!`, and so routes its own diagnostics and
+//! panic output to the serial driver, in the README's § Role and
+//! `docs/console-model.md`. `main` follows that order: bootstrap caps, the
+//! serial sink and panic sink, the dropped `log_send_cap`, the death EQ and
+//! its registration, the wait set, the handover pull, then the event loop.
 
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]

@@ -5,15 +5,16 @@ capability types, rights, derivation, revocation, and transfer semantics — is
 specified in [docs/capability-model.md](../../../docs/capability-model.md). This document
 covers the data structures and algorithms that realise those semantics.
 
-The capability subsystem comprises five components:
+The capability subsystem comprises six components:
 
 1. **CSpace** — per-process capability space (slot storage and lookup)
-2. **Page pools** — the donated pages behind a CSpace's slots and an address
+2. **CSpace registry** — the RAM-sized arena mapping a `CSpaceId` to its live CSpace and epoch
+3. **Page pools** — the donated pages behind a CSpace's slots and an address
    space's page tables, and the record of every donation
-3. **Capability slot** — in-memory representation of one capability
-4. **Range capability objects** — the Mmio and IoPort objects, which record the
+4. **Capability slot** — in-memory representation of one capability
+5. **Range capability objects** — the Mmio and IoPort objects, which record the
    mappings and port bindings made through them so revocation can withdraw them
-5. **Derivation tree** — cross-process tree for revocation
+6. **Derivation tree** — cross-process tree for revocation
 
 ---
 

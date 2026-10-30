@@ -5,8 +5,13 @@
 
 //! Narrow DTB (flattened device tree) walker for devmgr.
 //!
-//! Finds the PCI host-ECAM node and returns its physical range. Follows the
+//! Finds every PCI host-ECAM node and returns its physical range. Follows the
 //! FDT v17 layout per the Device Tree Specification.
+
+extern crate alloc;
+
+use alloc::collections::TryReserveError;
+use alloc::vec::Vec;
 
 use super::EcamLocation;
 
@@ -121,25 +126,30 @@ impl<'a> Fdt<'a>
         &remain[..end]
     }
 
-    /// Search for the first PCI ECAM aperture defined by a
-    /// `pci-host-ecam-generic` node (QEMU virt's PCI host).
+    /// Collect the PCI ECAM window of every `pci-host-ecam-generic` node
+    /// (QEMU virt's PCI host), in structure-block order.
     ///
-    /// The node's `reg` is one `(address, size)` pair in its parent's
+    /// A node's `reg` is one `(address, size)` pair in its parent's
     /// `#address-cells` / `#size-cells` units (1 or 2 cells each; the
     /// specification defaults of 2 and 1 when the parent sets none). Its
     /// address is the configuration space of the first bus. The bus range
     /// is the node's `bus-range` property, else bus 0 onward, clamped to the
-    /// buses `reg` covers and to 255; the returned size is 1 MiB per bus of
-    /// that range. An ECAM node more than 16 levels deep (the root node is
-    /// level 1) is skipped. Returns `None` when no such node exists within
-    /// that depth, the structure block closes more nodes than it has opened
-    /// before the ECAM node is reached, the node's parent's cell sizes are
-    /// unsupported, its `reg` is missing, short, or zero, it covers less
-    /// than one bus, or its `bus-range` is short, inverted, or starts above
-    /// bus 255.
-    #[must_use]
-    pub fn find_pci_ecam(&self) -> Option<EcamLocation>
+    /// buses `reg` covers and to 255; the window's size is 1 MiB per bus of
+    /// that range. Its segment is the node's `linux,pci-domain` property,
+    /// else the node's ordinal among the ECAM nodes. A node more than 16
+    /// levels deep (the root node is level 1) is skipped, and so is a node
+    /// whose parent's cell sizes are unsupported, whose `reg` is missing,
+    /// short, or zero, that covers less than one bus, or whose `bus-range` is
+    /// short, inverted, or starts above bus 255. The walk stops, keeping the
+    /// windows found so far, where the structure block closes more nodes
+    /// than it has opened.
+    ///
+    /// # Errors
+    /// Returns the allocation error when the window list cannot grow.
+    pub fn find_pci_ecams(&self) -> Result<Vec<EcamLocation>, TryReserveError>
     {
+        let mut found = Vec::new();
+        let mut ordinal: u16 = 0;
         let mut walker = FdtWalker::new(self);
         // `cells[d]`: the cell sizes the children of the node at depth `d`
         // decode their `reg` in (the root node is depth 1). Tracked only for
@@ -159,7 +169,15 @@ impl<'a> Fdt<'a>
                         *c = DEFAULT_CELLS;
                     }
                 }
-                FdtEvent::EndNode => depth = depth.checked_sub(1)?,
+                FdtEvent::EndNode =>
+                {
+                    let Some(d) = depth.checked_sub(1)
+                    else
+                    {
+                        break;
+                    };
+                    depth = d;
+                }
                 FdtEvent::Prop { name, data } if depth > 0 =>
                 {
                     if name == b"#address-cells"
@@ -178,16 +196,26 @@ impl<'a> Fdt<'a>
                     {
                         // Restart at this node and read its `reg` and
                         // `bus-range` in the parent's cell sizes.
-                        let node_start = walker.current_node_start?;
+                        let Some(node_start) = walker.current_node_start
+                        else
+                        {
+                            continue;
+                        };
                         let (addr_cells, size_cells) = cells[depth - 1];
-                        return extract_ecam(self, node_start, addr_cells, size_cells);
+                        if let Some(loc) =
+                            extract_ecam(self, node_start, addr_cells, size_cells, ordinal)
+                        {
+                            found.try_reserve(1)?;
+                            found.push(loc);
+                        }
+                        ordinal = ordinal.wrapping_add(1);
                     }
                 }
                 FdtEvent::Prop { .. } =>
                 {}
             }
         }
-        None
+        Ok(found)
     }
 }
 
@@ -225,13 +253,15 @@ fn read_cells(data: &[u8], off: usize, cells: usize) -> Option<u64>
 
 /// Decode the ECAM window of the node starting at `dt_struct` offset
 /// `node_start` from its `reg` (first pair, in the parent's
-/// `addr_cells` / `size_cells`) and optional `bus-range`, per
-/// [`Fdt::find_pci_ecam`].
+/// `addr_cells` / `size_cells`), optional `bus-range`, and optional
+/// `linux,pci-domain` (else `ordinal` is the segment), per
+/// [`Fdt::find_pci_ecams`].
 fn extract_ecam(
     fdt: &Fdt<'_>,
     node_start: usize,
     addr_cells: usize,
     size_cells: usize,
+    ordinal: u16,
 ) -> Option<EcamLocation>
 {
     let mut walker = FdtWalker::at(fdt, node_start);
@@ -240,6 +270,7 @@ fn extract_ecam(
     let mut depth = 1i32;
     let mut reg: Option<(u64, u64)> = None;
     let mut bus_range: Option<(u32, u32)> = None;
+    let mut domain: Option<u16> = None;
     while let Some(event) = walker.next_event()
     {
         match event
@@ -271,6 +302,14 @@ fn extract_ecam(
                 }
                 bus_range = Some((be_u32(data, 0), be_u32(data, 4)));
             }
+            FdtEvent::Prop { name, data } if depth == 1 && name == b"linux,pci-domain" =>
+            {
+                if data.len() < 4
+                {
+                    return None;
+                }
+                domain = Some(u16::try_from(be_u32(data, 0)).ok()?);
+            }
             FdtEvent::Prop { .. } =>
             {}
         }
@@ -300,6 +339,7 @@ fn extract_ecam(
     Some(EcamLocation {
         phys_base: base,
         size: bus_count << 20,
+        segment: domain.unwrap_or(ordinal),
         start_bus,
         end_bus,
     })
@@ -543,7 +583,7 @@ mod tests
 
     fn ecam(blob: &[u8]) -> Option<EcamLocation>
     {
-        Fdt::new(blob)?.find_pci_ecam()
+        Fdt::new(blob)?.find_pci_ecams().unwrap().first().copied()
     }
 
     #[test]
@@ -554,6 +594,50 @@ mod tests
         assert_eq!(
             (loc.phys_base, loc.size, loc.start_bus, loc.end_bus),
             (0x3000_0000, 16 << 20, 0, 15)
+        );
+    }
+
+    #[test]
+    fn every_ecam_node_yields_a_window_with_its_own_segment()
+    {
+        let blob = Builder::new()
+            .begin("")
+            .begin("soc")
+            .prop("#address-cells", &2u32.to_be_bytes())
+            .prop("#size-cells", &2u32.to_be_bytes())
+            .begin("pcie@30000000")
+            .prop("compatible", ECAM)
+            .prop("reg", &reg(0x3000_0000, 16 << 20))
+            .end()
+            .begin("pcie@40000000")
+            .prop("compatible", ECAM)
+            .prop("reg", &[0u8; 4])
+            .end()
+            .begin("pcie@50000000")
+            .prop("compatible", ECAM)
+            .prop("reg", &reg(0x5000_0000, 2 << 20))
+            .end()
+            .begin("pcie@60000000")
+            .prop("compatible", ECAM)
+            .prop("reg", &reg(0x6000_0000, 1 << 20))
+            .prop("linux,pci-domain", &7u32.to_be_bytes())
+            .end()
+            .end()
+            .end()
+            .finish();
+        let found = Fdt::new(&blob).unwrap().find_pci_ecams().unwrap();
+        // The malformed second node is skipped; the nodes after it still count.
+        let got: Vec<_> = found
+            .iter()
+            .map(|l| (l.phys_base, l.end_bus, l.segment))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0x3000_0000, 15, 0),
+                (0x5000_0000, 1, 2),
+                (0x6000_0000, 0, 7)
+            ]
         );
     }
 

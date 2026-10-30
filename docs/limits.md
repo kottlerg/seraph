@@ -69,9 +69,10 @@ An entry an existing open Issue already names cites it in the recommendation.
 
 ## Cross-Cutting Findings
 
-- **RAM ceiling.** The binding RAM ceiling today is about 32 GiB, set by the buddy free-block
-  pool (`POOL_SIZE`), well before the boot direct map's about 248 GiB (`BOOT_TABLE_POOL_SIZE`)
-  and the frame map's 256 GiB (`MAX_CHUNKS`).
+- **RAM ceiling.** The binding RAM ceiling today is about 248 GiB of top RAM address, set by the
+  boot direct map's table pool (`BOOT_TABLE_POOL_SIZE`), just before the frame map's 256 GiB
+  (`MAX_CHUNKS`). The buddy allocator keeps its free-list links in the free blocks and has no
+  RAM ceiling of its own.
 - **CPU ceiling.** The binding CPU ceiling is `MAX_ORDER`: every per-CPU slab must fit one buddy
   block, and `AP_IST_STACKS` is exactly 8 MiB at `MAX_CPUS = 512`. `MAX_CPUS` itself is inline
   in the one-page `BootInfo`, and shipping two-socket servers already exceed 512 logical CPUs.
@@ -102,13 +103,11 @@ An entry an existing open Issue already names cites it in the recommendation.
 
 ### Kernel: memory management
 
-Tracked by [#636](https://github.com/kottlerg/seraph/issues/636); the buddy pool by
-[#632](https://github.com/kottlerg/seraph/issues/632).
+Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `POOL_SIZE` (`BuddyAllocator.addrs`, `.nexts`) | `core/kernel/src/mm/buddy.rs` | 4096 blocks (about 32 GiB at order 11) | current peak plus headroom | about 41 KiB BSS | needs a design | Boot halts in `push_block` above about 32 GiB of RAM; intrusive free-list links or a pool sized from the memory map (#632) |
-| `BuddyAllocator.nexts`, `free_lists`, `pool_head` | `core/kernel/src/mm/buddy.rs` | `u16` slot indices | encoding artefact (2 B per slot) | 2 B per slot | raise | Caps `POOL_SIZE` at 65535 with no assert; widen or pin with a const assert (#632) |
+| `BuddyAllocator.free_lists` (`FreeHeader` in each free block) | `core/kernel/src/mm/buddy.rs` | none: one 16 B header inside each free block, linked by physical address | provable unreachability (no metadata outside the free pages) | none | correct as is | None |
 | `MAX_ORDER` | `core/kernel/src/mm/buddy.rs` | 11 (8 MiB largest block) | BSS budget (the 512-CPU `AP_IST_STACKS` slab fits one block) | none | needs a design | With the one-block rule of `alloc_zeroed_slab` it is the effective `MAX_CPUS` ceiling; allocate per-CPU slabs in several blocks |
 | `BOOT_TABLE_POOL_SIZE` (`BootTablePool.frames`) | `core/kernel/src/mm/paging.rs` | 256 frames | BSS budget | 1 MiB BSS | make pay-as-you-go | Halts above about 248 GiB of top RAM address; 1 GiB leaves or tables carved from usable RAM |
 | `LARGE_PAGE_SIZE` | `core/kernel/src/mm/paging.rs` | 2 MiB | hardware spec (x86-64 and Sv39 large leaf) | none | correct as is | None |
@@ -120,7 +119,7 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636); the buddy pool
 | `FRAMES_PER_CHUNK` geometry assert | `core/kernel/src/mm/frame_map.rs` | 1 GiB per chunk, 1 MiB counter block | encoding artefact | none | correct as is | Keep |
 | `MAX_RANGES` (`RangeList` usable and work lists) | `core/kernel/src/mm/init.rs` | 64 | current peak plus headroom | about 1 KiB stack per list | raise | `push` drops RAM ranges past 64 silently; size from `memory_map.count` or fail loudly |
 | `MAX_EXCL` | `core/kernel/src/mm/init.rs` | 32 | provably unreachable today (28 at most) only through core/boot's private `MAX_MODULES` | 512 B stack | needs a design | Derive from an ABI constant with a const assert; make overflow fatal |
-| `DTB_MAX_SIZE` (`read_dtb_totalsize`) | `core/kernel/src/mm/init.rs` | 64 KiB | unknown | none | raise | A larger DTB gets no exclusion and no cap (#635) |
+| `fdt_extent` DTB size check | `core/kernel/src/mm/init.rs` | FDT `u32` `totalsize`, at least the 40-byte header, inside the direct-mapped span | hardware or format spec (FDT header) and RAM (the direct map) | none | correct as is | None; a blob outside the bounds halts the boot at Phase 3 |
 | `TAG_CAP` (`TagPool`) | `core/kernel/src/mm/tag_allocator.rs` | 4096 | hardware spec (x86 12-bit PCID); clips riscv64's 16-bit ASID | about 64.5 KiB BSS | make pay-as-you-go | Allocate from the buddy, sized to the probed tag count |
 | `enable` `max_fit` tag trim | `core/kernel/src/mm/tag_allocator.rs` | `2^MAX_ORDER` pages / (`cpu_count` x 16) | BSS budget (one-block slab) | `cpu_count` x tags x 16 B | needs a design | Follows the per-CPU slab design |
 | `AddressSpace.tag`, `TlbShootdownRequest.tag` | `core/kernel/src/mm/address_space.rs`, `tlb_shootdown.rs` | `AtomicU16` | hardware spec (PCID and ASID widths) | 2 B each | correct as is | None |
@@ -174,13 +173,12 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637); the Phase 7 bo
 | `CSpace.next_leaf`, `pool_exhaustions` | `core/kernel/src/cap/cspace.rs` | `u32` | encoding artefact (`next_leaf` asserted against `MAX_LEAVES`); `pool_exhaustions` is a wrapping diagnostic counter | embedded | correct as is | None |
 | `ROOT_CSPACE_INIT_SLOT_CAPACITY` | `core/kernel/src/cap/mod.rs` | 1536 slots | refillable seed (init augments) | about 29 pages | correct as is | None |
 | `SEED_RESERVE_BYTES` (`SEED_MEMORY`) | `core/kernel/src/cap/mod.rs` | 512 KiB | current peak plus headroom (boot footprint) | 512 KiB pinned | needs a design | Also funds split bodies, Mmio and IoPort copies and IOPB tables at runtime; fund them from the caller (#260) |
-| `MAX_DRAIN_BLOCKS` | `core/kernel/src/cap/mod.rs` | 4096 | encoding artefact (mirrors the buddy pool) | about 128 KiB BSS, used once | needs a design | Inherits the 32 GiB ceiling; drain from coalesced memory-map extents |
+| `MAX_DRAIN_BLOCKS` | `core/kernel/src/cap/mod.rs` | 4096 coalesced extents | current peak plus headroom (the fragmentation of free RAM, not its size) | 64 KiB BSS, used once | needs a design | Overflow is fatal with the count; size the buffer from the drained extent count, or write straight into the InitInfo block (#636) |
 | `CSPACE_LAYOUT_MAX_DESCRIPTORS` | `core/kernel/src/cap/mod.rs` | 4480 | encoding artefact (sum of other ceilings) | about 105 KiB BSS | needs a design | About 6x what InitInfo holds; write straight into the InitInfo block |
 | `CSpaceLayout.module_names` | `core/kernel/src/cap/mod.rs` | 12 (`INIT_MAX_NAMED_MODULES`) | ABI width (init protocol) | embedded | needs a design | Names past 12 are dropped without a message; see the boot section |
 | `INIT_STACK_PHYS`, `INIT_INFO_RESERVE_ORDER` | `core/kernel/src/cap/mod.rs` | `INIT_STACK_PAGES`, `INIT_INFO_MAX_PAGES` | ABI width (init protocol) | 32 B | correct as is | None |
 | `POOL_SEED_PAGES` | `core/kernel/src/cap/mod.rs` | 64 | current peak plus headroom (measured 6 to 7) | 256 KiB | needs a design | See `kernel_pt_pool` in the memory-management section |
 | Phase 7 `MAX_ACPI_REGIONS` | `core/kernel/src/cap/mod.rs` | 8 | current peak plus headroom | none | raise | Truncates with a log; raise to the boot-protocol bound |
-| `DTB_MAX_SIZE` (`read_dtb_totalsize` copy) | `core/kernel/src/cap/mod.rs` | 64 KiB | unknown | none | raise | A larger DTB is not minted (#635) |
 | `ROOT_IRQ_COUNT` | `core/kernel/src/cap/mod.rs` | arch `ROOT_IRQ_COUNT` | hardware spec (IOAPIC GSI and PLIC id spaces) | none | correct as is | None |
 | `RECLAIM_ARRAY_MAX_SPAN_PAGES` | `core/kernel/src/cap/mod.rs` | from `MAX_RECLAIM_RANGES` | ABI width (boot protocol) | none | correct as is | None |
 | `MAX_IOPORT_BINDINGS` (`IoPortBindings.records`) | `core/kernel/src/cap/ioport_bindings.rs` | 16 per thread | unknown | 256 B per bound thread | raise | Spill to a caller-funded page |

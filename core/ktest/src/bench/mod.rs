@@ -3,16 +3,9 @@
 
 // core/ktest/src/bench/mod.rs
 
-//! Tier 3 — Benchmarks / profiling.
-//!
-//! Rule (see `core/ktest/README.md` § Source Layout and § Tier 3):
-//!
-//! > **One file per kernel surface measured. New surface ⇒ new file.**
-//!
-//! Each benchmark runs an operation up to N times and logs its cycle counts
-//! (min/mean/max per iteration for most; `context_switch` logs cycles per
-//! switch) through `crate::log`/`crate::log_u64`. No PASS/FAIL verdict is
-//! produced; the numbers are for human inspection and regression tracking.
+//! Tier 3 — Benchmarks / profiling. The file layout and what each benchmark
+//! reports are specified in `core/ktest/README.md` § Source Layout and
+//! § Tier 3; benchmarks log through `crate::log` / `crate::log_u64`.
 //!
 //! # Cycle counter access
 //!
@@ -26,8 +19,8 @@
 //!
 //! # Adding a new benchmark
 //!
-//! 1. If the surface already has a file (e.g. `mm.rs`), add a `fn bench_<name>`
-//!    to that file. Otherwise create a sibling file under `bench/`.
+//! 1. Add a `fn bench_<name>` to the surface's file under `bench/`, placed as
+//!    the README's § Tier 3 layout rule says.
 //! 2. Use `super::cycles_now()` to bracket the measured operation
 //!    per-iteration and accumulate min/mean/max locally, then print the
 //!    header with `super::log_bench_header()` and the three values with

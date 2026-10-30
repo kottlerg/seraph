@@ -432,6 +432,10 @@ changed line that names one of these items as a whole identifier or lies within 
 
 A change anywhere else, however close to the scheduler or the SMP paths, is off the surface. A PR
 that adds an item of the kinds above that names none of the listed items MUST add it to this list.
+`cargo xtask lint-docs` fails when a name this list, the memory surface's list, or their screens
+state no longer names code or a tracked file (its `md-coverage-symbols` rule,
+[xtask/README.md](../xtask/README.md#cargo-xtask-lint-docs)), so a PR that renames or deletes a
+listed item updates the list in the same change.
 The commands below screen a diff for the surface. The first lists the whole-surface files the diff
 changes. The second prints every file header of the diff and every line, changed or context, that
 names a listed item; `-W` widens each hunk to its whole enclosing item, so a change inside a listed

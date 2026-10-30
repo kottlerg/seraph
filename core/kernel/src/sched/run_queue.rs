@@ -11,8 +11,9 @@
 //!
 //! Locking. The `lock` field is a `crate::sync::Spinlock` that disables
 //! interrupts while held, preventing timer-driven deadlock. Acquire before
-//! any `enqueue`, `dequeue_highest`, `remove_from_queue`, `find_runnable`,
-//! or `set_current` call; the first four are `unsafe` with that contract,
+//! any `enqueue`, `enqueue_at_head`, `dequeue_highest`, `remove_from_queue`,
+//! `find_runnable`, or `set_current` call; all but `set_current` are `unsafe`
+//! with that contract,
 //! since every CPU reaches every scheduler through a shared reference. The
 //! boot exception: `sched::init` and `sched::enter` call `set_current` without
 //! the lock, before the CPU concerned first schedules (see `set_current`).
@@ -41,7 +42,9 @@ enum QueueEnd
     Head,
 }
 
-/// Intrusive FIFO queue of ready TCBs at a single priority level.
+/// Intrusive FIFO queue of ready TCBs at a single priority level, except that
+/// a TCB just dequeued and handed back undispatched returns to the head
+/// ([`enqueue_head`](Self::enqueue_head)), keeping its turn.
 struct RunQueue
 {
     head: Option<*mut ThreadControlBlock>,
@@ -244,7 +247,8 @@ impl RunQueue
 /// owner of each field). Every other field is atomic or the lock itself.
 pub struct PerCpuScheduler
 {
-    /// One FIFO run queue per priority level (0 = lowest/idle, 31 = highest).
+    /// One FIFO run queue per priority level (0 = lowest/idle, 31 = highest);
+    /// see [`RunQueue`] for the head re-link that keeps a deferred TCB's turn.
     /// Owned by `lock`.
     queues: UnsafeCell<[RunQueue; NUM_PRIORITY_LEVELS]>,
 
@@ -269,8 +273,8 @@ pub struct PerCpuScheduler
 
     /// Lock protecting the run queues.
     ///
-    /// Acquire before any `enqueue`/`dequeue_highest`/`remove_from_queue`/
-    /// `find_runnable` call. The lock disables interrupts while held,
+    /// Acquire before any `enqueue`/`enqueue_at_head`/`dequeue_highest`/
+    /// `remove_from_queue`/`find_runnable` call. The lock disables interrupts while held,
     /// preventing timer-driven deadlock.
     pub lock: crate::sync::Spinlock,
 

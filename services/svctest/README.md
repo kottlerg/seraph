@@ -47,7 +47,7 @@ services/svctest/
         │   ├── mod.rs         # Own fatfs under block faults: failed writes, removes, renames
         │   └── ramdisk.rs     # RAM FAT16 volume and block server with armed faults
         ├── pwrmgr.rs          # Shutdown cap-deny check and terminal shutdown
-        ├── svcmgr.rs          # Late handover refused; publish gate; badged SEND; seed-only names
+        ├── svcmgr.rs          # Handover refused; publish gate; badged SEND; seed-only; round 2
         └── timed.rs           # `SystemTime::now()` through svcmgr and timed
 ```
 
@@ -61,7 +61,7 @@ identity last).
 ## Run Sequence
 
 `main` registers the log name `svctest`, so every line carries the `[svctest]` prefix. It then
-installs the failure hooks, requests the bootstrap round, hands the hooks the
+installs the failure hooks, requests the bootstrap rounds, hands the hooks the
 authority-badged pwrmgr cap, logs `starting`, and runs each registered phase in order inside
 the envelope `phase=<name> starting` / `phase=<name> passed`. After the last phase it logs
 `ALL TESTS PASSED`, the marker defined in
@@ -80,16 +80,17 @@ marker first logs it, so a run logs exactly one. A failing thread that finds the
 claimed yields until the run ends instead of aborting, so its abort cannot cut off the
 claimant's marker or `SHUTDOWN`.
 
-Some failures still end the run idle. A panic or allocation failure during the bootstrap round
+Some failures still end the run idle. A panic or allocation failure during the bootstrap rounds
 logs `SOME TESTS FAILED` but sends no `SHUTDOWN`, because the hooks get the pwrmgr cap only
-after the round returns. A `SHUTDOWN` that pwrmgr answers, or whose call fails, is logged and
+after the rounds return. A `SHUTDOWN` that pwrmgr answers, or whose call fails, is logged and
 leaves the system idle, as on the pass path. A fault in svctest's own process (a stray access,
 a stack overflow) kills it without running either hook, so it logs neither marker.
 
 The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.deny` cap) log the
 skip and return when their cap is zero; the devmgr deny phases (`caps[2]`), the orphan-teardown and
-drivers deny phases (`caps[3]`), and the svcmgr seed-only phase (every seed, plus the public
-`svcmgr` and `pwrmgr.deny` names it resolves) instead fail their assertions. The seed-only phase
+drivers deny phases (`caps[3]`), the svcmgr seed-only phase (every seed-only seed, plus the
+public `svcmgr` and `pwrmgr.deny` names it resolves), and the svcmgr second-seed-round phase
+(`caps[4]`) instead fail their assertions. The seed-only phase
 thus fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's
 own zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap,
 and the run ends idle.
@@ -102,7 +103,8 @@ the front, from the back, and from both ends at once, and env carries `SERAPH_TE
 
 ## Capabilities
 
-The bootstrap round from the creator endpoint delivers the recipe's seeds in this order;
+The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, the
+fifth in a second round;
 [service-definitions.md § `seed`](../svcmgr/docs/service-definitions.md#seed) defines each
 name's cap shape and the zero slot an unresolved name leaves. With no creator endpoint, every
 slot stays zero.
@@ -113,23 +115,26 @@ slot stays zero.
 | `caps[1]` | `pwrmgr.shutdown` | Authority cap for the final `SHUTDOWN` |
 | `caps[2]` | `devmgr.registry` | devmgr deny phases                     |
 | `caps[3]` | `devmgr.test`     | devmgr orphan-teardown, drivers deny   |
+| `caps[4]` | `pwrmgr.deny`     | Second-round delivery check            |
 
-The svcmgr seed-only phase also reads every slot and fails when any is zero, as evidence that its
-name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the devmgr deny
-phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE`, `QUERY_SHUTDOWN_DEVICE`,
-`TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, and `TEST_QUERY_DENY_DEVICE`. `caps[3]` exists for
-devmgr's test labels (TODO(#165): retire with them): the orphan-teardown phase's `TEST_SPAWN_ORPHAN`
-shim, and `TEST_QUERY_DENY_DEVICE`, which hands the drivers deny phase a SEND on the serial, input,
-or framebuffer driver's endpoint badged with none of the driver's verb bits. That phase requires an
-`UNAUTHORIZED` reply to `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, `SERIAL_REGISTER_RX_NOTIFY`, and
-`INPUT_READ_EVENTS` (at once, without blocking for a key), and to `FB_WRITE_BYTES` and
-`FB_SET_ATTRS` when a framebuffer driver runs; on a headless boot, CI's, devmgr runs none and the
-framebuffer case logs a skip. The input case also logs a skip when `terminal.svc` is staged: the
-input driver serves one request at a time and the terminal keeps a blocking read pending, so the
-deny would wait behind it for a keypress. Every seed is seed-only in svcmgr's registry. The
-no-authority `pwrmgr.deny` cap is public, so svctest resolves it through `QUERY_ENDPOINT` on its
-per-process `service_registry_cap` and spends no seed slot on it; it drives the pwrmgr cap-deny
-phase, which requires an `UNAUTHORIZED` reply to `SHUTDOWN`.
+The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
+that its name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the
+devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE`,
+`QUERY_SHUTDOWN_DEVICE`, `TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, and `TEST_QUERY_DENY_DEVICE`.
+`caps[3]` exists for devmgr's test labels (TODO(#165): retire with them): the orphan-teardown
+phase's `TEST_SPAWN_ORPHAN` shim, and `TEST_QUERY_DENY_DEVICE`, which hands the drivers deny phase a
+SEND on the serial, input, or framebuffer driver's endpoint badged with none of the driver's verb
+bits. That phase requires an `UNAUTHORIZED` reply to `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`,
+`SERIAL_REGISTER_RX_NOTIFY`, and `INPUT_READ_EVENTS` (at once, without blocking for a key), and to
+`FB_WRITE_BYTES` and `FB_SET_ATTRS` when a framebuffer driver runs; on a headless boot, CI's, devmgr
+runs none and the framebuffer case logs a skip. The input case also logs a skip when `terminal.svc`
+is staged: the input driver serves one request at a time and the terminal keeps a blocking read
+pending, so the deny would wait behind it for a keypress. The first four seeds are seed-only in
+svcmgr's registry. The no-authority `pwrmgr.deny` cap is public: the pwrmgr cap-deny phase, which
+requires an `UNAUTHORIZED` reply to `SHUTDOWN`, uses the copy svctest resolves through
+`QUERY_ENDPOINT` on its per-process `service_registry_cap`. `caps[4]` seeds the same name only so
+that every svctest boot receives a seed list longer than one bootstrap round; the svcmgr
+second-seed-round phase fails the run when slot 4 arrives empty.
 
 ---
 

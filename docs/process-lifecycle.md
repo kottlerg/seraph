@@ -154,8 +154,9 @@ post-handover.
 Init then serves svcmgr the **handover endowment** (see
 [`services/svcmgr/docs/ipc-interface.md`](../services/svcmgr/docs/ipc-interface.md)
 § Handover endowment) over the
-bootstrap-round protocol: round 1 carries svcmgr's own endpoints plus the
-publish-role source caps (a `SEND` on the root filesystem namespace
+bootstrap-round protocol: the `CAPS` rounds (one round for its four
+slots) carry svcmgr's own endpoints plus the publish-role source caps
+(a `SEND` on the root filesystem namespace
 endpoint and a badge-0 `SEND|GRANT` source on devmgr's registry
 endpoint); each subsequent `SUBSTRATE` round carries one `(name, thread_cap)`
 pair for a substrate service init bootstrapped (`memmgr`, `procmgr`,

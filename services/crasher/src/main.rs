@@ -115,9 +115,9 @@ fn check_seeds(svcmgr_cap: u32, second_cap: u32, cap_count: usize)
     }
 }
 
-/// Request the generic bootstrap round, returning `(svcmgr_cap, second_cap,
-/// cap_count)`, `cap_count` being the caps the round delivered. Missing caps
-/// are zero.
+/// Request the generic bootstrap rounds, returning `(svcmgr_cap, second_cap,
+/// cap_count)`, `cap_count` being the caps delivered in the first four
+/// slots. Missing caps are zero.
 fn bootstrap_caps(creator_ep: u32, ipc_buffer: *mut u8) -> (u32, u32, usize)
 {
     if creator_ep == 0
@@ -129,15 +129,16 @@ fn bootstrap_caps(creator_ep: u32, ipc_buffer: *mut u8) -> (u32, u32, usize)
     let ipc_buf = ipc_buffer.cast::<u64>();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by the
     // boot protocol.
-    let Ok(round) = (unsafe { ipc::bootstrap::request_round(creator_ep, ipc_buf) })
+    // Only the present caps ride, named by each round's presence word; an
+    // absent slot decodes as `0`. Two spare slots catch caps past the
+    // recipe's two seeds, which the count then shows.
+    let Ok(slots) = (unsafe { ipc::bootstrap::request_slots::<4>(creator_ep, ipc_buf) })
     else
     {
         return (0, 0, 0);
     };
-    // Only the present caps ride, named by the round's presence word; an
-    // absent slot decodes as `0`, and a malformed word leaves both `0`.
-    let [cap0, cap1, ..] = ipc::bootstrap::unpack_slots(&round).unwrap_or_default();
-    (cap0, cap1, round.cap_count)
+    let present = slots.iter().filter(|&&cap| cap != 0).count();
+    (slots[0], slots[1], present)
 }
 
 /// Liveness probe: call `QUERY_ENDPOINT` on the svcmgr cap for a name that

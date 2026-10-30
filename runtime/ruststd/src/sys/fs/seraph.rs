@@ -8,18 +8,22 @@
 //! `remove_dir`, `remove_dir_all`, `rename`) backed by vfsd /
 //! fs-driver IPC.
 //!
+//! The choice between the inline `FS_READ` / `FS_WRITE` labels and the
+//! memory-cap `FS_READ_MEMORY` / `FS_WRITE_MEMORY` labels is the client
+//! policy `services/fs/docs/fs-driver-protocol.md` § Inline-vs-memory-cap
+//! crossover specifies, with § Label 12: `FS_WRITE_MEMORY` for the write
+//! threshold; this file implements it.
+//!
 //! ## Read path
-//! - Reads ≤ 504 bytes that fit within the current page use the
-//!   inline `FS_READ` path; payload bytes ride in the IPC buffer.
-//! - Larger reads use `FS_READ_MEMORY`: the driver returns a Memory cap
-//!   covering one cached page; we reserve VA, `mem_map` it
-//!   read-only, copy out, then proactively release the cache slot
-//!   via `FS_RELEASE_MEMORY` and tear the mapping down locally.
+//! - Inline reads carry the payload in the IPC buffer.
+//! - Memory-cap reads: the driver returns a Memory cap covering one cached
+//!   page; we reserve VA, `mem_map` it read-only, copy out, then
+//!   proactively release the cache slot via `FS_RELEASE_MEMORY` and tear
+//!   the mapping down locally.
 //!
 //! ## Write path
-//! - Writes ≤ 504 bytes use the inline `FS_WRITE` path with the
-//!   payload riding in the IPC buffer.
-//! - Larger writes use `FS_WRITE_MEMORY`: one memmgr-allocated page per
+//! - Inline writes carry the payload in the IPC buffer.
+//! - Memory-cap writes: one memmgr-allocated page per
 //!   write is mapped MAP_WRITABLE in the caller's address space, filled
 //!   chunk-by-chunk, and lent to the driver as a DMA source through a
 //!   `MAP`-only derivation per chunk; the page's run goes back to memmgr

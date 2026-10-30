@@ -39,13 +39,12 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 // numbers are only meaningful relative to a specific endpoint.
 //
 // Each `*_LABELS_VERSION` constant declares the wire-protocol version of
-// its namespace. Bumped on any breaking change (label added, removed, or
-// repurposed; payload shape change). Four consumer-wiring categories:
+// its namespace. When it is bumped, and what each of the four categories
+// below means, is specified in shared/ipc/README.md § Wire Stability; this
+// block keeps the per-namespace assignment, with the handshake each check
+// rides on.
 //
-//   Handshake-checked at first contact — producer carries its compiled
-//   `*_LABELS_VERSION` in the handshake payload (`data[0]` unless noted);
-//   receiver compares to its own and rejects on mismatch. Mismatched
-//   binaries are stopped before any per-IO traffic.
+//   Handshake-checked at first contact (`data[0]` unless noted):
 //     FS_LABELS_VERSION     — fs_labels::FS_MOUNT             (vfsd ↔ fatfs)
 //     VFSD_LABELS_VERSION   — vfsd_labels::GET_SYSTEM_ROOT_CAP (init ↔ vfsd)
 //     BLK_LABELS_VERSION    — blk_labels::REGISTER_PARTITION   (vfsd ↔ virtio-blk)
@@ -53,22 +52,16 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     SVCMGR_LABELS_VERSION — every svcmgr handover endowment `CAPS` round,
 //                             in `data[1]` after the round kind (init ↔ svcmgr)
 //
-//   Checked on every request — the caller carries its compiled version in
-//   `data[0]` of each request and the receiver rejects a mismatch per call.
+//   Checked on every request (`data[0]`):
 //     DEVMGR_LABELS_VERSION — every devmgr_labels request
 //
-//   Implicitly covered by parent-channel handshake — the channel was opened
-//   against a cap-badge first minted by a handshake-checked namespace; the
-//   badge's presence is the version stamp, zero per-message cost.
+//   Implicitly covered by a parent-channel handshake:
 //     NS_LABELS_VERSION     — caps from vfsd_labels / fs_labels handshakes
 //
-//   Marker-only — no clean parent-channel handshake exists; per-message
+//   Marker-only (no clean parent-channel handshake exists, and per-message
 //   inlining would conflict with existing label-bit usage or cost wire bytes
-//   on every call. The constant exists for the bump discipline and for
-//   future tooling (CI label-stability scans, distributed-binary
-//   compatibility queries). PROCESS_ABI_VERSION at process startup
-//   provides coarse-grained coverage in lockstep with workspace-inherited
-//   versioning.
+//   on every call; PROCESS_ABI_VERSION at process startup gives
+//   coarse-grained coverage in lockstep with workspace-inherited versioning):
 //     PROCMGR_LABELS_VERSION
 //     PWRMGR_LABELS_VERSION
 //     RTC_LABELS_VERSION
@@ -212,30 +205,11 @@ pub mod procmgr_labels
     /// created via [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`] but not yet
     /// started.
     ///
-    /// Request: caller invokes on the badged `process_handle` returned
-    /// by the creation call; procmgr uses `recv.badge` to find the entry.
-    /// Wire format:
-    /// * `data[0]` — direction selector ([`PIPE_DIR_STDIN`] /
-    ///   [`PIPE_DIR_STDOUT`] / [`PIPE_DIR_STDERR`]).
-    /// * `data[1]` — ring byte capacity (power of two, ≤ ring page bytes
-    ///   minus header); std's pipe uses 2048.
-    /// * `caps[0]` — memory cap (one shmem page; spawner has already
-    ///   initialised the `shmem::SpscHeader` via `init`).
-    /// * `caps[1]` — data-available notification cap.
-    /// * `caps[2]` — space-available notification cap.
-    ///
-    /// procmgr `cap_copy`s each cap into the child's `CSpace` and writes
-    /// the resulting slot indices into the matching `<dir>_memory_cap`,
-    /// `<dir>_data_notification_cap`, and `<dir>_space_notification_cap` slots of
-    /// the child's `ProcessInfo`. All three caps are required; missing
-    /// cap slots reply `INVALID_ARGUMENT`.
-    ///
-    /// Ordering: valid only between `CREATE_PROCESS` and `START_PROCESS`.
-    /// Replies `ALREADY_STARTED` if the target is running.
-    /// `INVALID_BADGE` if the `process_handle` is unknown. Each direction
-    /// is configured at most once: a second call for a configured
-    /// direction replies `INVALID_ARGUMENT`, and a refused call installs
-    /// nothing in the child.
+    /// Called on the badged `process_handle`, with the direction in
+    /// `data[0]` ([`PIPE_DIR_STDIN`] / [`PIPE_DIR_STDOUT`] /
+    /// [`PIPE_DIR_STDERR`]). Specified, with its caps, ordering, and replies,
+    /// in `services/procmgr/docs/ipc-interface.md` § Label 11:
+    /// `CONFIGURE_PIPE`.
     ///
     /// Spawners call this 0–3 times depending on which directions are
     /// piped. The 3 caps × 3 directions = 9 caps total exceeds
@@ -426,48 +400,15 @@ pub const MEMMGR_LABELS_VERSION: u32 = 5;
 /// shape.
 pub mod memmgr_labels
 {
-    /// Allocate one or more Memory caps covering at least `want_pages` pages.
-    ///
-    /// Universal label — callable from any badged cap on memmgr's
-    /// endpoint. Wire format:
-    ///
-    /// * `data[0]` low 32 bits — `want_pages: u32`.
-    /// * `data[0]` high 32 bits — `flags: u32` (see flag constants below).
-    ///
-    /// Reply (success): `data[0]` = `returned_cap_count: u32`;
-    /// `data[1+i]` = `page_count_for_cap_i: u32`; `data[1+count+i]` =
-    /// `phys_base_for_cap_i: u64`; `caps[0..count]` = Memory capabilities
-    /// carrying every right of their pool frames;
-    /// [`super::memmgr_grant_layout`] checks the shape.
-    /// `sum(page_count_for_cap_i) == want_pages` for both contiguous and
-    /// best-effort replies. Each reply cap MUST carry `MemRights::RETYPE`
-    /// among those rights so the caller can retype the memory into kernel
-    /// objects via the `SYS_CAP_CREATE_*` syscalls; memmgr derives reply caps
-    /// with `RIGHTS_ALL`, which preserves the RETYPE bit stamped at boot by
-    /// the kernel.
+    /// Allocate one or more Memory caps covering at least `want_pages` pages,
+    /// from any badged cap; [`super::memmgr_grant_layout`] checks the reply
+    /// shape. Specified in `services/memmgr/docs/ipc-interface.md` § Label 1:
+    /// `REQUEST_MEMORY_CAPS`.
     pub const REQUEST_MEMORY_CAPS: u64 = 1;
-    /// Voluntarily return previously-granted Memory caps to the pool
-    /// mid-life. Callable from any badged cap. The caller names each region
-    /// by the `phys_base` memmgr reported in the granting
-    /// `REQUEST_MEMORY_CAPS` reply, not by transferring the cap: a caller
-    /// that retyped the region (e.g. into a Thread) and dropped the inner cap
-    /// no longer holds a cap to send back. Wire format:
-    ///
-    /// * `data[0]` — `count: u32`.
-    /// * `data[1+i]` — `phys_base_i: u64`, the physical base of the region to
-    ///   release (the grant reply reports it at `data[1 + cap_count + i]`).
-    /// * no caps; memmgr deletes any cap attached to the call.
-    ///
-    /// memmgr matches each `phys_base` against the caller's own outstanding
-    /// grants (badge-scoped), returns the backing run to the free pool, and
-    /// credits `free_bytes`. Unmatched bases are ignored (idempotent, like
-    /// `PROCESS_DIED`). The caller MUST have already deleted every kernel
-    /// object retyped from the region; releasing a region with a live retype
-    /// is correctness-safe (the kernel refuses to re-hand-out live bytes) but
-    /// strands the run until that retype is freed.
-    ///
-    /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` if the caller's
-    /// badge is unknown.
+    /// Return previously granted regions to the pool mid-life, named by the
+    /// `phys_base` the grant reply reported, from any badged cap. Specified in
+    /// `services/memmgr/docs/ipc-interface.md` § Label 2:
+    /// `RELEASE_MEMORY_CAPS`.
     pub const RELEASE_MEMORY_CAPS: u64 = 2;
     /// Procmgr-only: register a new process and receive the badged SEND cap
     /// procmgr installs in the new process's `ProcessInfo.memmgr_endpoint_cap`.
@@ -479,31 +420,11 @@ pub mod memmgr_labels
     /// it had issued to that badge, runs coalescing, and clears the
     /// per-process record. Idempotent on unknown badges.
     pub const PROCESS_DIED: u64 = 4;
-    /// Permanently transfer a batch of Memory caps into memmgr's pool.
-    ///
-    /// The caller is procmgr's init reap (donated set:
-    /// `docs/process-lifecycle.md` "Init reap"; contract:
-    /// `services/memmgr/docs/ipc-interface.md` "Label 5:
-    /// `DONATE_MEMORY_CAPS`"). Procmgr-only: memmgr does not check a donated
-    /// cap's provenance, so it answers a donation over any other badge with
-    /// `memmgr_errors::UNAUTHORIZED` and deletes every transferred cap.
-    ///
-    /// Wire format:
-    /// * `caps[..]` — up to `MSG_CAP_SLOTS_MAX` Memory caps to donate; each
-    ///   MUST carry `WRITE`, `EXECUTE`, and `RETYPE` rights.
-    ///
-    /// memmgr derives `phys_base` and `size` from each cap via `cap_info`, so
-    /// no caller-side bookkeeping is required. A cap that is not a Memory cap
-    /// or lacks a required right is deleted and not counted. Each accepted cap
-    /// is owned by memmgr for the rest of its life, added to `pool_total`, and
-    /// placed in the free pool, coalescing where possible; a cap that finds no
-    /// free-pool slot stays owned and counted but is unreachable for
-    /// allocation until a later coalesce frees a slot.
-    ///
-    /// Reply to procmgr: always `memmgr_errors::SUCCESS`, with `data[0]` =
-    /// `accepted_caps`, `data[1]` = `accepted_pages` (total pages across the
-    /// accepted caps), and `data[2]` = `pool_total_pages` (memmgr's owned page
-    /// count after the donation).
+    /// Procmgr-only: permanently transfer a batch of Memory caps into
+    /// memmgr's pool; the caller is procmgr's init reap (donated set:
+    /// `docs/process-lifecycle.md` § Init reap). Specified in
+    /// `services/memmgr/docs/ipc-interface.md` § Label 5:
+    /// `DONATE_MEMORY_CAPS`.
     pub const DONATE_MEMORY_CAPS: u64 = 5;
     /// Read-only query of the all-RAM-accounted identity. Callable from any
     /// badged cap; returns aggregate counts only — no caps, no state change.
@@ -1721,20 +1642,10 @@ pub mod blk_labels
     /// `services/drivers/virtio/blk/README.md` § Label 2:
     /// `REGISTER_PARTITION`.
     pub const REGISTER_PARTITION: u64 = 2;
-    /// Read one or more contiguous sectors into a caller-supplied Memory cap.
-    ///
-    /// Request: `data[0]` = starting LBA, `data[1]` = sector count
-    /// (`>= 1`; defaults to `1` if `data[1]` is absent). Caps: `caps[0]` =
-    /// target Memory cap (`MAP|WRITE`; the driver writes `count * 512` bytes
-    /// starting at offset 0 of the page, packed contiguously). The page
-    /// must be at least `count * 512` bytes; the driver rejects with
-    /// `INVALID_MEMORY_CAP` otherwise. `caps[1]` is reserved for a future
-    /// per-request release handle and is null today. `caps[2]` is a
-    /// reserved IPC-shape slot for a future userspace IOMMU-grant cap;
-    /// the kernel transports nothing for this slot and has no awareness
-    /// of IOMMU semantics — IOMMU enforcement is permanently userspace.
-    /// Reply: empty body, label is the success or error code; the target
-    /// Memory cap is moved back to the caller in `caps[0]` of the reply.
+    /// Read one or more contiguous sectors into a caller-supplied Memory cap,
+    /// which the reply moves back. Specified, with its caps and replies, in
+    /// `services/drivers/virtio/blk/README.md` § Label 3:
+    /// `BLK_READ_INTO_MEMORY`.
     pub const BLK_READ_INTO_MEMORY: u64 = 3;
     /// Write one or more contiguous sectors from a caller-supplied Memory cap.
     ///

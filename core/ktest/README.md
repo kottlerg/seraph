@@ -180,8 +180,9 @@ a SYSCALL, and that a syscall made with AC set completes its user copy and retur
 (in debug builds that syscall also trips the kernel's `debug_assert_kernel_entry_flags` if entry
 left AC set in ring 0); `src/arch/x86_64/page_fault_present_bit.rs` checks that a fault handler's
 `#PF` message carries `FAULT_ACCESS_PRESENT` for a store to a read-only user page and never for a
-load from the top GiB of the kernel image window (the lower GiB can hold direct-map leaves the
-kernel's spurious-fault walk misreads, #563); `src/arch/x86_64/ioport_revoke.rs` checks that
+load from any 2 MiB slot of the kernel image window, every one of which is delivered;
+`src/arch/x86_64/umip.rs` checks that, on a CPU reporting UMIP, a ring-3 `SIDT` or `SGDT` raises
+`#GP` instead of returning a kernel address; `src/arch/x86_64/ioport_revoke.rs` checks that
 revoking an `IoPort` cap withdraws the port access bound through its descendant from a reader on
 another CPU, whose next port read raises `#GP`. On RISC-V, `src/arch/riscv64/sbi_gating.rs` checks
 that `SYS_SBI_CALL` refuses kernel-reserved SBI extensions and sanctioned ones the cap lacks the
@@ -246,7 +247,8 @@ event and memory polls of `integration::fault_kills_thread`,
 `integration::death_observer_outlives_queue_caps`,
 `integration::reply_binding_displaced`, `integration::syscall_rflags_hardening`,
 `integration::page_fault_present_bit`, `integration::mmio_revoke_unmaps`,
-`integration::ioport_revoke`, `cap::cspace_self_delete_stops_caller` and
+`integration::ioport_revoke`, `integration::umip_descriptor_reads_fault`,
+`cap::cspace_self_delete_stops_caller` and
 `retype::aspace_self_delete_stops_caller`; the phase polls, the child's spin bound and the cleanup
 exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and is stretched so its
 `cap_delete` does not race a still-running pinned child); the migration polls of

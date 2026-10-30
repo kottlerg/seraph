@@ -175,19 +175,46 @@ pub fn mmio_split_wrong_tag_err(ctx: &TestContext) -> TestResult
 /// (`MIN_IRQ_ID..=MAX_IRQ_ID`) is refused by `irq_register` with
 /// `InvalidArgument`, and deleting it leaves the kernel's routing table alone.
 ///
-/// Only riscv64 can name such an id: its root Interrupt cap spans the PLIC's
-/// 1024-id space while the kernel routes sources 1..=127. The test splits id
-/// 1023 off a derived copy of the first cap whose range contains it, so the
-/// original range stays whole for later tests (the IRQ stress cell carves a
-/// device line from the root). Skipped where no cap contains id 1023
-/// (x86-64, whose root cap is the routable range).
+/// The root Interrupt cap spans more ids than the kernel routes on both
+/// architectures: on riscv64 the PLIC's 1024-id space against sources 1..=127,
+/// on x86-64 256 GSIs against the 23 with an IDT gate (0..=22). Each id of
+/// `crate::arch::UNROUTABLE_IRQ_IDS` is isolated as a single-id cap split off a
+/// derived copy of the first cap whose range contains it, so the original range
+/// stays whole for later tests (the IRQ stress cell carves a device line from
+/// the root).
 pub fn irq_register_unroutable_id_err(ctx: &TestContext) -> TestResult
 {
-    const UNROUTABLE_ID: u32 = 1023;
-
     let irq_sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "hw::irq_register_unroutable_id_err: cap_create_notification failed")?;
+    let result = crate::arch::UNROUTABLE_IRQ_IDS
+        .iter()
+        .try_for_each(|&id| refuse_unroutable_id(ctx, id, irq_sig));
+    syscall::cap_delete(irq_sig).ok();
+    result
+}
 
+/// Isolate `id` and check `irq_register` refuses it with `InvalidArgument`
+/// and that deleting its cap succeeds.
+fn refuse_unroutable_id(ctx: &TestContext, id: u32, irq_sig: u32) -> TestResult
+{
+    let single = isolate_irq_id(ctx, id)
+        .ok_or("hw::irq_register_unroutable_id_err: cannot isolate the id")?;
+    let err = irq_register(single, irq_sig);
+    // Deleting the cap must not touch the routing table for an id it cannot
+    // index (the kernel panicked here before the teardown guard).
+    let deleted = syscall::cap_delete(single);
+    if err != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("hw::irq_register_unroutable_id_err: unroutable id not refused");
+    }
+    deleted.map_err(|_| "hw::irq_register_unroutable_id_err: cap_delete of the id failed")
+}
+
+/// A single-id Interrupt cap for `id`, split off a derived copy of the first
+/// cap in the test's `CSpace` whose range contains it; `None` when no cap does
+/// or the split that cuts the id off from the ids above it is refused.
+fn isolate_irq_id(ctx: &TestContext, id: u32) -> Option<u32>
+{
     let bound = scan_bound(ctx);
     for slot in 1u32..=bound
     {
@@ -198,30 +225,33 @@ pub fn irq_register_unroutable_id_err(ctx: &TestContext) -> TestResult
             continue;
         };
         // Wrong-tag and out-of-range responses leave the copy intact.
-        let Ok((lo, hi)) = irq_split(copy, UNROUTABLE_ID)
+        let Ok((below, from_id)) = irq_split(copy, id)
         else
         {
             syscall::cap_delete(copy).ok();
             continue;
         };
-        syscall::cap_delete(lo).ok();
-        // `hi` is the single id 1023 (no cap extends past the 1024-id space).
-        let err = irq_register(hi, irq_sig);
-        // Deleting the cap must not touch the routing table for an id it cannot
-        // index (the kernel panicked here before the teardown guard).
-        let deleted = syscall::cap_delete(hi);
-        syscall::cap_delete(irq_sig).ok();
-        if err != Err(SyscallError::InvalidArgument as i64)
+        syscall::cap_delete(below).ok();
+        return match irq_split(from_id, id + 1)
         {
-            return Err("hw::irq_register_unroutable_id_err: id 1023 not refused");
-        }
-        deleted.map_err(|_| "hw::irq_register_unroutable_id_err: cap_delete of id 1023 failed")?;
-        return Ok(());
+            Ok((single, above)) =>
+            {
+                syscall::cap_delete(above).ok();
+                Some(single)
+            }
+            // `id + 1` is not strictly inside `from_id`, whose range starts at
+            // `id`: the range ends at `id`, and `from_id` is the id alone.
+            Err(e) if e == SyscallError::InvalidArgument as i64 => Some(from_id),
+            // Any other refusal leaves a multi-id cap, which `irq_register`
+            // would refuse for its width, not its id; fail instead.
+            Err(_) =>
+            {
+                syscall::cap_delete(from_id).ok();
+                None
+            }
+        };
     }
-
-    crate::log("ktest: hw::irq_register_unroutable_id_err SKIP (no cap contains id 1023)");
-    syscall::cap_delete(irq_sig).ok();
-    Ok(())
+    None
 }
 
 // ── SYS_IRQ_SPLIT ─────────────────────────────────────────────────────────────

@@ -37,8 +37,9 @@
 //!
 //! # Vector assignment
 //! GSI `n` is assigned to IDT vector `DEVICE_VECTOR_BASE + n` (33 + n), which keeps the mapping
-//! trivial and avoids a vector allocator. Only GSIs 0-22 (vectors 33-55) have IDT stubs and
-//! are dispatched (`idt::irq_dispatch`); the sum overflows `u8` for GSI >= 223.
+//! trivial and avoids a vector allocator. Only GSIs 0-22 (vectors 33-55, `DEVICE_GSI_COUNT`)
+//! have IDT stubs and are dispatched (`idt::irq_dispatch`); [`device_vector`] refuses every
+//! other GSI, and `SYS_IRQ_REGISTER` refuses an id above the arch `MAX_IRQ_ID` before routing.
 //!
 //! # Limitations / deferred work
 //!
@@ -50,8 +51,8 @@
 //!
 //! # Modification notes
 //! - Every GSI is routed by `interrupts::route_device_irq` (from `SYS_IRQ_REGISTER`) and
-//!   unmasked by `interrupts::unmask` (from `SYS_IRQ_ACK`); a GSI above 22 additionally needs
-//!   an IDT stub and a wider device arm in `idt::irq_dispatch`.
+//!   unmasked by `interrupts::unmask` (from `SYS_IRQ_ACK`); serving a GSI above 22 needs an
+//!   IDT stub, a wider device arm in `idt::irq_dispatch`, and a larger `DEVICE_GSI_COUNT`.
 //! - To support level-triggered IRQs: set bit 15 (level-sensitive) and
 //!   bit 13 (active-low polarity) in the redirection entry low dword.
 
@@ -76,6 +77,26 @@ const IOAPICVER: u32 = 0x01;
 /// Base IDT vector for device IRQs.
 /// GSI `n` maps to vector `DEVICE_VECTOR_BASE + n`.
 pub const DEVICE_VECTOR_BASE: u8 = 33;
+
+/// Number of GSIs with an IDT gate: GSIs `0..DEVICE_GSI_COUNT` map to vectors
+/// `DEVICE_VECTOR_BASE..DEVICE_VECTOR_BASE + DEVICE_GSI_COUNT` (33-55), the
+/// `device_irq_stub!` gates `idt::init` installs. The arch `MAX_IRQ_ID` is the last of them.
+pub const DEVICE_GSI_COUNT: u32 = 23;
+
+/// IDT vector GSI `gsi` is routed to, or `None` for a GSI with no gate
+/// (`gsi >= DEVICE_GSI_COUNT`), which no vector may be programmed for: the vectors
+/// above the device range are ungated or belong to the IPIs and the spurious vector.
+#[must_use]
+pub fn device_vector(gsi: u32) -> Option<u8>
+{
+    if gsi >= DEVICE_GSI_COUNT
+    {
+        return None;
+    }
+    u8::try_from(gsi)
+        .ok()
+        .and_then(|offset| DEVICE_VECTOR_BASE.checked_add(offset))
+}
 
 /// Mask bit in the low dword of a redirection entry (bit 16).
 const REDIR_MASK: u32 = 1 << 16;
@@ -312,5 +333,54 @@ pub unsafe fn unmask(gsi: u32)
         let current = ioapic_read(base, reg);
         ioapic_write(base, reg, current & !REDIR_MASK);
         IOAPIC_LOCK.unlock_raw(saved);
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn last_routable_gsi_has_a_gate_and_the_next_does_not()
+    {
+        assert!(device_vector(crate::arch::current::MAX_IRQ_ID).is_some());
+        assert_eq!(device_vector(crate::arch::current::MAX_IRQ_ID + 1), None);
+    }
+
+    #[test]
+    fn gsi_whose_vector_overflows_u8_has_no_gate()
+    {
+        // 33 + 223 > 255: an unchecked add wraps these into the exception vectors.
+        assert_eq!(device_vector(223), None);
+        assert_eq!(device_vector(255), None);
+        assert_eq!(device_vector(u32::MAX), None);
+    }
+
+    #[test]
+    fn routable_gsis_avoid_the_exception_timer_ipi_and_spurious_vectors()
+    {
+        use crate::arch::current::interrupts::{IPI_VECTOR_TLB_SHOOTDOWN, IPI_VECTOR_WAKEUP};
+        use crate::arch::current::timer::TIMER_VECTOR;
+
+        /// The spurious-interrupt vector `idt::init` installs.
+        const SPURIOUS_VECTOR: u8 = 255;
+
+        for gsi in crate::arch::current::MIN_IRQ_ID..=crate::arch::current::MAX_IRQ_ID
+        {
+            let vector = device_vector(gsi).expect("routable GSI has a vector");
+            assert!(vector > 31, "GSI {gsi} routed to exception vector {vector}");
+            for reserved in [
+                TIMER_VECTOR,
+                IPI_VECTOR_TLB_SHOOTDOWN,
+                IPI_VECTOR_WAKEUP,
+                SPURIOUS_VECTOR,
+            ]
+            {
+                assert_ne!(vector, reserved, "GSI {gsi} routed to reserved vector");
+            }
+        }
     }
 }

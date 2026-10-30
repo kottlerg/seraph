@@ -241,8 +241,9 @@ pub enum SyscallError
     /// backstop leaves.
     Interrupted = -16,
     /// A structural per-object ceiling was reached (e.g. a `CSpace`'s
-    /// directory is full). Unlike `OutOfMemory`, donating memory (augment
-    /// mode) cannot satisfy the request.
+    /// directory is full, or the object a new capability or a retype would
+    /// reference already holds 2^31 references). Unlike `OutOfMemory`,
+    /// donating memory (augment mode) cannot satisfy the request.
     QuotaExceeded = -17,
 }
 ```
@@ -587,7 +588,8 @@ Send + Receive + Grant rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
 `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace directory structurally full).
+(caller's CSpace directory structurally full, or the Memory object's reference count is at
+its 2^31 ceiling).
 
 ---
 
@@ -608,7 +610,8 @@ Notify + Wait rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
 `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace directory structurally full).
+(caller's CSpace directory structurally full, or the Memory object's reference count is at
+its 2^31 ceiling).
 
 ---
 
@@ -628,10 +631,11 @@ Retype a Memory capability into a new event queue with a fixed capacity.
 
 **Capability requirement:** `memory_cap` must have Retype rights.
 
-**Errors:** `InvalidArgument` (the low 32 bits of `capacity`, the only bits the kernel
-reads, are 0 or exceed `EVENT_QUEUE_MAX_CAPACITY`), `InvalidCapability`,
+**Errors:** `InvalidArgument` (`capacity`, the full register, is 0 or exceeds
+`EVENT_QUEUE_MAX_CAPACITY`), `InvalidCapability`,
 `InsufficientRights` (source Memory cap lacks Retype), `OutOfMemory` (Memory cap region
-or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally full).
+or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace directory structurally full,
+or the Memory object's reference count is at its 2^31 ceiling).
 
 ---
 
@@ -671,7 +675,7 @@ address space's mappings is inherently trusted to create threads that execute wi
 respectively, or `priority` is outside `sched_cap`'s band), `InvalidArgument` (nonzero
 `priority` without a `SchedControl` cap, or `priority` > `PRIORITY_MAX`), `OutOfMemory`
 (Memory cap region or slot-page pool exhausted), `QuotaExceeded` (caller's CSpace
-directory structurally full).
+directory structurally full, or the Memory object's reference count is at its 2^31 ceiling).
 
 ---
 
@@ -709,7 +713,8 @@ the pool, so a one-page donation can leave the budget unchanged. Read the budget
 **Errors:** `InvalidArgument` (`init_pages` 0, overflow, or create-mode `init_pages < 2`),
 `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype, or augment
 target lacks Map), `OutOfMemory` (Memory cap region or slot-page pool exhausted),
-`QuotaExceeded` (caller's CSpace directory structurally full).
+`QuotaExceeded` (caller's CSpace directory structurally full, or the Memory object's reference
+count is at its 2^31 ceiling).
 
 ---
 
@@ -741,7 +746,8 @@ the kernel and only `init_pages − 1` pages reach the pool (see
 `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype, or augment
 target lacks Insert), `OutOfMemory` (Memory cap region or slot-page pool exhausted, or,
 in create-mode, the kernel's 4096-entry CSpace id namespace exhausted),
-`QuotaExceeded` (caller's CSpace directory structurally full).
+`QuotaExceeded` (caller's CSpace directory structurally full, or the Memory object's reference
+count is at its 2^31 ceiling).
 
 ---
 
@@ -762,7 +768,8 @@ Retype a Memory capability into a new wait set.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype),
 `OutOfMemory` (Memory cap region or slot-page pool exhausted), `QuotaExceeded`
-(caller's CSpace directory structurally full).
+(caller's CSpace directory structurally full, or the Memory object's reference count is at
+its 2^31 ceiling).
 
 ---
 
@@ -798,8 +805,9 @@ leaving the new capability an unlinked derivation root.
 `InvalidState` (a `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC capability transfer is in flight
 on the source), `OutOfMemory` (slot-page pool exhausted, or, for an `Mmio` or `IoPort` source,
 the kernel's SEED reserve cannot back the fresh object), `QuotaExceeded` (caller's CSpace
-directory structurally full, or, for an `Mmio` or `IoPort` source, its range already has
-`RANGE_COPY_LIMIT` (64) live copies).
+directory structurally full; for an `Mmio` or `IoPort` source, its range already has
+`RANGE_COPY_LIMIT` (64) live copies; for any other source, the object's reference count is at its
+2^31 ceiling).
 
 If the source capability has a non-zero badge, the derived capability inherits it.
 
@@ -2091,8 +2099,8 @@ to it is stopped and the call never returns (see
 capability transfer is in flight on the source), `InsufficientRights` (dst CSpace lacks Insert),
 `InvalidArgument` (dst_slot occupied or out of range), `OutOfMemory` (slot-page pool exhausted,
 or SEED cannot back an `Mmio` or `IoPort` copy's object), `QuotaExceeded` (dst CSpace directory
-structurally full, or an `Mmio` or `IoPort` source's range already has `RANGE_COPY_LIMIT` (64) live
-copies).
+structurally full, an `Mmio` or `IoPort` source's range already has `RANGE_COPY_LIMIT` (64) live
+copies, or any other source's object has its reference count at its 2^31 ceiling).
 
 ---
 

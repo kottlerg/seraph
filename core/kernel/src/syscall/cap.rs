@@ -2168,11 +2168,13 @@ pub fn sys_cap_revoke(tf: UserFrame) -> Result<u64, SyscallError>
 
 /// Liveness backstop for `sys_cap_revoke`: the maximum number of batches one
 /// syscall runs before returning `Interrupted`. At `MAX_REVOKE_EDITS` edits
-/// per batch this covers ~2.7 × 10^8 edits (~1.3 × 10^8 revoked nodes) —
-/// beyond any derivation subtree plausibly-sized hardware can hold, since
-/// every node costs its creator a 72-byte slot plus a kernel object.
-/// Reaching it therefore indicates sustained concurrent re-derivation, not a
-/// large fixed subtree.
+/// per batch this covers ~2.7 × 10^8 edits (~1.3 × 10^8 revoked nodes), which
+/// a subtree can exceed: at a 72-byte slot per node, some 9 to 19 GiB of slots
+/// hold one that large. The bound is still correct, because the backstop loses
+/// no work: every node a batch revokes stays revoked, so a caller that retries
+/// after `Interrupted` resumes on the remaining subtree, and a fixed subtree of
+/// any size is revoked by finitely many retries. Only sustained concurrent
+/// re-derivation can keep a retry from finishing.
 #[cfg(not(test))]
 const MAX_REVOKE_BATCHES: u32 = 1 << 20;
 
@@ -2389,14 +2391,15 @@ pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::cap::slot::{EqRights, MemRights};
     use crate::ipc::event_queue::EventQueueState;
     use core::ptr::NonNull;
-    use syscall::EVENT_QUEUE_MAX_CAPACITY;
 
     let memory_slot = tf.arg(0) as u32;
-    let capacity = tf.arg(1) as u32;
-    if capacity == 0 || capacity > EVENT_QUEUE_MAX_CAPACITY
+    // Range-check the full register before narrowing: a 64-bit capacity whose
+    // low 32 bits are in range (0x1_0000_0001) must be refused, not truncated.
+    let Some(capacity) = event_queue_capacity(tf.arg(1))
+    else
     {
         return Err(SyscallError::InvalidArgument);
-    }
+    };
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -2958,4 +2961,42 @@ pub fn sys_cap_create_event_queue(_tf: &mut TrapFrame) -> Result<u64, SyscallErr
 pub fn sys_cap_create_wait_set(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
+}
+
+/// The `SYS_CAP_CREATE_EVENT_QUEUE` capacity argument as a `u32`, or `None`
+/// when the full 64-bit register lies outside `1..=EVENT_QUEUE_MAX_CAPACITY`.
+/// The range check runs on the register before narrowing, so high bits cannot
+/// truncate an out-of-range value into range.
+fn event_queue_capacity(raw: u64) -> Option<u32>
+{
+    if raw == 0 || raw > u64::from(syscall::EVENT_QUEUE_MAX_CAPACITY)
+    {
+        return None;
+    }
+    u32::try_from(raw).ok()
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::event_queue_capacity;
+
+    // Defect guarded: narrowing the register before the range check lets a
+    // 64-bit capacity whose low 32 bits are in range pass as that value.
+    #[test]
+    fn event_queue_capacity_refuses_out_of_range_registers_before_narrowing()
+    {
+        assert_eq!(event_queue_capacity(1), Some(1));
+        assert_eq!(
+            event_queue_capacity(u64::from(syscall::EVENT_QUEUE_MAX_CAPACITY)),
+            Some(syscall::EVENT_QUEUE_MAX_CAPACITY)
+        );
+        assert_eq!(event_queue_capacity(0), None);
+        assert_eq!(
+            event_queue_capacity(u64::from(syscall::EVENT_QUEUE_MAX_CAPACITY) + 1),
+            None
+        );
+        assert_eq!(event_queue_capacity(0x1_0000_0001), None);
+        assert_eq!(event_queue_capacity(0x1_0000_0000), None);
+    }
 }

@@ -61,7 +61,7 @@
 //! write lock. Lock order: cap-rwlock outer, allocator spinlock inner.
 
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
 use crate::mm::PAGE_SIZE;
@@ -96,7 +96,9 @@ pub struct RetypeAllocator
     subpage_free_lists: [AtomicU64; NUM_SUBPAGE_BINS],
     /// Page-aligned free-list head. `FREE_LIST_END` = empty. Each freed block
     /// stores `(size_pages: u64, next_offset: u64)` at offset 0..16 within
-    /// the freed region.
+    /// the freed region. The list is kept in ascending address order with
+    /// adjacent blocks merged ([`push_page_block`]), so it holds at most one
+    /// node per free run and a walk visits at most `size / PAGE_SIZE` nodes.
     page_free_head: AtomicU64,
 }
 
@@ -386,11 +388,70 @@ enum PagePrev
     InCap(u64),
 }
 
+/// Set by the first malformed page free-list node a walk meets, so a corrupt
+/// list costs one console line per boot rather than one per retype.
+static PAGE_LIST_CORRUPT_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Report a malformed page free-list node, once per boot. A well-formed list
+/// never reaches this, however long it is: an ordinary miss prints nothing.
+fn report_page_list_corrupt(memory: &MemoryObject, cur: u64, prev_end: u64)
+{
+    if !PAGE_LIST_CORRUPT_REPORTED.swap(true, Ordering::Relaxed)
+    {
+        crate::kprintln!(
+            "RETYPE PAGE FREE-LIST CORRUPT: memory.base=0x{:x} size=0x{:x} cur=0x{:x} prev_end=0x{:x}",
+            memory.base,
+            memory.size,
+            cur,
+            prev_end
+        );
+    }
+}
+
+/// True if a page free-list node at `cur` holding `block_pages` pages is
+/// well formed for a region of `memory_size` bytes, reached from a predecessor
+/// that ends at `prev_end` (0 for the list head): page-aligned, non-empty,
+/// inside the region, and at or above the predecessor's end. The list is kept
+/// address-ordered and coalesced, so every node starts strictly above the
+/// previous one; a walk that follows only well-formed nodes therefore visits at
+/// most `memory_size / PAGE_SIZE` of them, and a cycle shows up as a node that
+/// is not above its predecessor.
+fn page_node_ok(cur: u64, block_pages: u64, prev_end: u64, memory_size: u64) -> bool
+{
+    let p = PAGE_SIZE as u64;
+    cur.is_multiple_of(p)
+        && cur >= prev_end
+        && cur < memory_size
+        && block_pages != 0
+        && block_pages <= (memory_size - cur) / p
+}
+
+/// Point `prev` (the list head, or a node's next-pointer) at `value`.
+///
+/// Caller holds the allocator lock.
+///
+/// # Safety
+///
+/// `memory.base` must be a valid kernel direct-map address and an
+/// [`PagePrev::InCap`] offset a node the caller's walk validated.
+unsafe fn set_page_link(alloc: &RetypeAllocator, memory: &MemoryObject, prev: &PagePrev, value: u64)
+{
+    match *prev
+    {
+        PagePrev::Head => alloc.page_free_head.store(value, Ordering::Release),
+        // SAFETY: caller contract; the next-pointer is at offset + 8.
+        PagePrev::InCap(prev_off) =>
+        unsafe { write_u64_at(memory.base, prev_off + 8, value) },
+    }
+}
+
 /// Try to satisfy a page-aligned allocation from the page free list.
 ///
-/// First-fit search; on a larger-than-needed block, splits and keeps the
-/// remainder on the list. Returns the offset of the allocated block, or
-/// `None` if no fit.
+/// First-fit search over the address-ordered list; on a larger-than-needed
+/// block, the front `pages` go to the caller and the remainder takes the
+/// block's place in the list, which keeps the order. Returns the offset of the
+/// allocated block, or `None` if no block fits or the walk meets a malformed
+/// node ([`page_node_ok`], reported once per boot).
 ///
 /// Caller holds the allocator lock.
 ///
@@ -405,87 +466,65 @@ unsafe fn try_alloc_page_block(
 {
     let p = PAGE_SIZE as u64;
     let mut prev = PagePrev::Head;
+    let mut prev_end = 0;
     let mut cur = alloc.page_free_head.load(Ordering::Acquire);
-    let mut iter: u64 = 0;
 
     while cur != FREE_LIST_END
     {
-        iter += 1;
-        if iter > 1024
-        {
-            crate::kprintln!(
-                "RETYPE PAGE FREE-LIST CYCLE: memory.base=0x{:x} size=0x{:x} head=0x{:x} cur=0x{:x} iter={}",
-                memory.base,
-                memory.size,
-                alloc.page_free_head.load(Ordering::Acquire),
-                cur,
-                iter
-            );
-            return None;
-        }
         if cur >= memory.size
         {
-            crate::kprintln!(
-                "RETYPE PAGE FREE-LIST CORRUPT: memory.base=0x{:x} size=0x{:x} cur=0x{:x} (out of range)",
-                memory.base,
-                memory.size,
-                cur
-            );
+            report_page_list_corrupt(memory, cur, prev_end);
             return None;
         }
-        // SAFETY: cur is a valid offset placed by a previous push.
+        // SAFETY: cur lies inside the cap (checked above) and was placed by a
+        // push; the size word is at offset 0.
         let block_pages = unsafe { read_u64_at(memory.base, cur) };
-        // SAFETY: same as above; next is at offset cur+8.
+        if !page_node_ok(cur, block_pages, prev_end, memory.size)
+        {
+            report_page_list_corrupt(memory, cur, prev_end);
+            return None;
+        }
+        // SAFETY: same node; next is at offset cur+8.
         let block_next = unsafe { read_u64_at(memory.base, cur + 8) };
 
         if block_pages >= pages
         {
-            // Unlink the current node from the list. Where the predecessor
-            // lives determines which write path we use.
-            match prev
+            let replacement = if block_pages == pages
             {
-                PagePrev::Head =>
-                {
-                    alloc.page_free_head.store(block_next, Ordering::Release);
-                }
-                PagePrev::InCap(prev_off) =>
-                {
-                    // SAFETY: prev_off was produced by a prior iteration's
-                    // observation of a valid free-list node.
-                    unsafe { write_u64_at(memory.base, prev_off + 8, block_next) };
-                }
+                block_next
             }
-
-            if block_pages == pages
+            else
             {
-                return Some(cur);
-            }
-
-            // Split: front `pages` go to the caller; remainder forms a new
-            // free block at offset `cur + pages * p` with size
-            // `(block_pages - pages)` pushed onto the list head.
-            let remainder_offset = cur + pages * p;
-            let remainder_pages = block_pages - pages;
-            let cur_head = alloc.page_free_head.load(Ordering::Acquire);
-            // SAFETY: remainder_offset is page-aligned and within the cap.
-            unsafe { write_u64_at(memory.base, remainder_offset, remainder_pages) };
-            // SAFETY: same.
-            unsafe { write_u64_at(memory.base, remainder_offset + 8, cur_head) };
-            alloc
-                .page_free_head
-                .store(remainder_offset, Ordering::Release);
+                let remainder = cur + pages * p;
+                // SAFETY: remainder is page-aligned and inside the block being
+                // unlinked, which no object occupies.
+                unsafe {
+                    write_u64_at(memory.base, remainder, block_pages - pages);
+                    write_u64_at(memory.base, remainder + 8, block_next);
+                }
+                remainder
+            };
+            // SAFETY: lock held; prev is the head or a node validated by this
+            // walk.
+            unsafe { set_page_link(alloc, memory, &prev, replacement) };
             return Some(cur);
         }
 
-        // Advance: this node's next-pointer becomes the new predecessor.
         prev = PagePrev::InCap(cur);
+        prev_end = cur + block_pages * p;
         cur = block_next;
     }
 
     None
 }
 
-/// Push a page-aligned freed block onto the page free list.
+/// Insert a page-aligned freed block into the address-ordered page free list,
+/// merging it with the free block that ends where it starts and with the one
+/// that starts where it ends, so adjacent free pages are always one node.
+///
+/// If the walk meets a malformed node ([`page_node_ok`], reported once per
+/// boot), the block is pushed at the head instead: the list is no longer
+/// trustworthy, and the next walk stops at that node.
 ///
 /// Caller holds the allocator lock.
 ///
@@ -495,13 +534,82 @@ unsafe fn try_alloc_page_block(
 /// `memory.base + offset` must not be concurrently aliased.
 unsafe fn push_page_block(alloc: &RetypeAllocator, memory: &MemoryObject, offset: u64, pages: u64)
 {
-    let prev_head = alloc.page_free_head.load(Ordering::Acquire);
-    // SAFETY: caller guarantees offset is page-aligned within the cap and
-    // no longer aliased.
-    unsafe { write_u64_at(memory.base, offset, pages) };
-    // SAFETY: same.
-    unsafe { write_u64_at(memory.base, offset + 8, prev_head) };
-    alloc.page_free_head.store(offset, Ordering::Release);
+    let p = PAGE_SIZE as u64;
+    let end = offset + pages * p;
+    let mut prev = PagePrev::Head;
+    let mut prev_pages = 0;
+    let mut prev_end = 0;
+    let mut cur = alloc.page_free_head.load(Ordering::Acquire);
+    let mut cur_pages = 0;
+    let mut cur_next = FREE_LIST_END;
+
+    // Find the first node above `offset`; `prev` is the node below it.
+    while cur != FREE_LIST_END
+    {
+        if cur < memory.size
+        {
+            // SAFETY: cur lies inside the cap; the size word is at offset 0.
+            cur_pages = unsafe { read_u64_at(memory.base, cur) };
+        }
+        if cur >= memory.size || !page_node_ok(cur, cur_pages, prev_end, memory.size)
+        {
+            report_page_list_corrupt(memory, cur, prev_end);
+            let head = alloc.page_free_head.load(Ordering::Acquire);
+            // SAFETY: caller contract: offset is ours and page-aligned.
+            unsafe {
+                write_u64_at(memory.base, offset, pages);
+                write_u64_at(memory.base, offset + 8, head);
+            }
+            alloc.page_free_head.store(offset, Ordering::Release);
+            return;
+        }
+        // SAFETY: the node was validated above; next is at offset cur+8.
+        cur_next = unsafe { read_u64_at(memory.base, cur + 8) };
+        if cur > offset
+        {
+            break;
+        }
+        prev = PagePrev::InCap(cur);
+        prev_pages = cur_pages;
+        prev_end = cur + cur_pages * p;
+        cur = cur_next;
+    }
+    debug_assert!(
+        prev_end <= offset && (cur == FREE_LIST_END || end <= cur),
+        "push_page_block: freed block 0x{offset:x}+{pages} overlaps a free block"
+    );
+
+    let merge_next = cur != FREE_LIST_END && cur == end;
+    let (after_pages, after_next) = if merge_next
+    {
+        (cur_pages, cur_next)
+    }
+    else
+    {
+        (0, cur)
+    };
+    match prev
+    {
+        PagePrev::InCap(prev_off) if prev_end == offset =>
+        {
+            // Grow the block below over the freed pages (and the block above).
+            // SAFETY: prev_off is a node this walk validated; lock held.
+            unsafe {
+                write_u64_at(memory.base, prev_off, prev_pages + pages + after_pages);
+                write_u64_at(memory.base, prev_off + 8, after_next);
+            }
+        }
+        _ =>
+        {
+            // SAFETY: caller contract: offset is ours and page-aligned.
+            unsafe {
+                write_u64_at(memory.base, offset, pages + after_pages);
+                write_u64_at(memory.base, offset + 8, after_next);
+            }
+            // SAFETY: lock held; prev is the head or a validated node.
+            unsafe { set_page_link(alloc, memory, &prev, offset) };
+        }
+    }
 }
 
 /// Take one page from the page free list and cut it into `class`-byte slots
@@ -511,8 +619,9 @@ unsafe fn push_page_block(alloc: &RetypeAllocator, memory: &MemoryObject, offset
 /// one free list to another, and the caller debits the slot it takes.
 ///
 /// A carved page stays sub-page slots until the cap drains (the drain reset
-/// in [`retype_free`] returns the allocator to virgin); the page free list
-/// does not coalesce, so no later free reassembles it.
+/// in [`retype_free`] returns the allocator to virgin): its slots return to
+/// the sub-page bin, never to the page free list, so the page free list's
+/// coalescing never reassembles it.
 ///
 /// Caller holds the allocator lock.
 ///
@@ -567,6 +676,10 @@ unsafe fn carve_page_into_bin(
 /// returns `OutOfMemory`. A carve happens only once the bump frontier cannot
 /// serve the class, so the bump frontier is by then spent and the class's
 /// free list empty: without the carve, the sub-page request fails instead.
+/// Returns `Err(SyscallError::QuotaExceeded)`, changing nothing, when
+/// `memory`'s reference count is at
+/// [`REF_COUNT_LIMIT`](crate::cap::object::REF_COUNT_LIMIT): the object placed
+/// would take one more lease on `memory`.
 /// Caller must validate `tag == Memory && rights.contains(RETYPE)` before
 /// invoking.
 ///
@@ -593,6 +706,15 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
     if memory.available_bytes.load(Ordering::Acquire) < need
     {
         return Err(SyscallError::OutOfMemory);
+    }
+    // Every object placed here takes a lease on `memory`, a reference whose
+    // number userspace can grow, so the retype is refused once the count is
+    // at the ceiling (`REF_COUNT_LIMIT`). The lease itself is taken unchecked
+    // after this call; at most one per thread mid-retype can pass this check
+    // before another reaches the ceiling, which the ceiling's headroom covers.
+    if memory.header.at_ref_limit()
+    {
+        return Err(SyscallError::QuotaExceeded);
     }
 
     let alloc = &memory.allocator;
@@ -1481,5 +1603,105 @@ mod tests
         }
         assert_eq!(memory.available_bytes.load(Ordering::Acquire), 2 * p);
         assert_eq!(retype_allocate(&memory, p), Err(SyscallError::OutOfMemory));
+    }
+
+    // Defect guarded: a retype admitted from a Memory object whose reference
+    // count is at the ceiling takes a lease past it, the step toward a wrap
+    // that frees the Memory object while its children live.
+    #[test]
+    fn a_retype_is_refused_once_the_memory_reference_count_is_at_the_ceiling()
+    {
+        use crate::cap::object::REF_COUNT_LIMIT;
+        let (_buf, memory) = host_region(1);
+        memory
+            .header
+            .ref_count
+            .store(REF_COUNT_LIMIT, Ordering::Relaxed);
+        assert_eq!(
+            retype_allocate(&memory, 96),
+            Err(SyscallError::QuotaExceeded)
+        );
+        assert_eq!(
+            memory.available_bytes.load(Ordering::Acquire),
+            PAGE_SIZE as u64,
+            "a refused retype debits nothing"
+        );
+        memory
+            .header
+            .ref_count
+            .store(REF_COUNT_LIMIT - 1, Ordering::Relaxed);
+        assert_eq!(retype_allocate(&memory, 96), Ok(0));
+    }
+
+    // Defect guarded: a walk bound below the list's real length (the former
+    // 1024-node cap) fails a page retype that a free block past the bound
+    // could serve.
+    #[test]
+    fn a_page_request_finds_a_fitting_block_past_a_thousand_free_holes()
+    {
+        const HOLES: u64 = 1030;
+        let p = PAGE_SIZE as u64;
+        // HOLES pairs of single pages, a 4-page block, and a 1-page guard that
+        // keeps the block off the bump frontier; nothing is left for the bump.
+        let (_buf, memory) = host_region((2 * HOLES + 5) as usize);
+        let singles: Vec<u64> = (0..2 * HOLES)
+            .map(|_| retype_allocate(&memory, p).unwrap())
+            .collect();
+        let block = retype_allocate(&memory, 4 * p).unwrap();
+        let _guard = retype_allocate(&memory, p).unwrap();
+        // The block is freed first, the holes after it (the order that buried
+        // the block 1030 nodes deep under the former head-pushed list).
+        retype_free(&memory, block, 4 * p);
+        for &off in singles.iter().step_by(2)
+        {
+            retype_free(&memory, off, p);
+        }
+        assert_eq!(
+            retype_allocate(&memory, 4 * p),
+            Ok(block),
+            "the block after {HOLES} non-adjacent one-page holes is found"
+        );
+    }
+
+    // Defect guarded: freed neighbours kept as separate nodes leave a run of
+    // free pages unable to serve a request for the whole run.
+    #[test]
+    fn adjacent_freed_page_blocks_coalesce_into_one()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(4);
+        let a = retype_allocate(&memory, p).unwrap();
+        let b = retype_allocate(&memory, p).unwrap();
+        let c = retype_allocate(&memory, p).unwrap();
+        let _d = retype_allocate(&memory, p).unwrap();
+        // Free the outer two first, then the middle one: the middle free joins
+        // both neighbours.
+        retype_free(&memory, a, p);
+        retype_free(&memory, c, p);
+        retype_free(&memory, b, p);
+        assert_eq!(retype_allocate(&memory, 3 * p), Ok(a));
+    }
+
+    // Defect guarded: a list that loops back (a corrupt link) is walked
+    // forever, or its cycle is reported on every retype.
+    #[test]
+    fn a_page_list_that_loops_back_is_not_followed()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(4);
+        let a = retype_allocate(&memory, p).unwrap();
+        let _b = retype_allocate(&memory, p).unwrap();
+        let c = retype_allocate(&memory, p).unwrap();
+        let _d = retype_allocate(&memory, p).unwrap();
+        retype_free(&memory, a, p);
+        retype_free(&memory, c, p);
+        // Point c's next link back at a: a cycle the order check rejects.
+        // SAFETY: c's next cell lies in the live buffer.
+        unsafe { write_u64_at(memory.base, c + 8, a) };
+        assert_eq!(
+            retype_allocate(&memory, 2 * p),
+            Err(SyscallError::OutOfMemory)
+        );
+        assert_eq!(retype_allocate(&memory, p), Ok(a));
     }
 }

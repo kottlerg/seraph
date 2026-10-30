@@ -394,6 +394,22 @@ reaches zero, the object's bytes are returned to the Memory object it was retype
 kernel objects are freed — there is no explicit "destroy" syscall (see
 [docs/capability-model.md](../../../docs/capability-model.md) § Auto-reclaim).
 
+The count is 32 bits wide and cannot wrap. The references userspace can multiply without a bound
+of their own, new capability slots and retype leases, are refused at `REF_COUNT_LIMIT` (2^31) with
+`QuotaExceeded`: a copy, derivation, or badged derivation takes its slot's reference through
+`KernelObjectHeader::try_inc_ref`, the one checked increment, and `retype_allocate` refuses a
+retype from a Memory object whose count is at the limit, before the new object takes its lease.
+The limit is correct as is, not one a workload meets: each such reference costs a 72-byte slot or a
+retype child of at least 128 bytes, so 2^31 of them hold at least 144 GiB against one object, and
+reaching it refuses instead of corrupting. Every other reference is taken unchecked, in the 2^31 of
+headroom between the limit and `u32::MAX`, because each kind is bounded by an object count rather
+than by a request: syscall pins and the transient second reference of a move (a few per thread),
+fault-handler and death-observer bindings (one per binding thread), wait-set membership (one per
+source), Mmio mapping records (four per Mmio object, whose bodies are SEED-backed), SEED leases
+(bounded by the SEED reserve), and the leases of retypes admitted just before the count reached
+the limit (one per thread mid-retype). Exhausting the headroom would take 2^31 threads, each with
+its own kernel stack and TCB.
+
 The principal kernel-internal owners:
 
 - **Retype ancestry.** Each object retyped from a Memory object holds a reference on

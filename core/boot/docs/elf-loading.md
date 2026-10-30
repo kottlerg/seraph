@@ -238,6 +238,7 @@ ordinal ([init bootstrap.md](../../../services/init/docs/bootstrap.md#initial-cs
 
 [core/boot/README.md](../README.md), [Boot Flow](boot-flow.md), [Page Tables](page-tables.md),
 [UEFI Environment](uefi-environment.md), [core/kernel/README.md](../../kernel/README.md),
+[Kernel Cross-Boundary Disclosure Inventory](../../kernel/docs/cross-boundary-disclosure.md),
 [System Bootstrap](../../../docs/bootstrap.md),
 [Testing](../../../docs/testing.md),
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),

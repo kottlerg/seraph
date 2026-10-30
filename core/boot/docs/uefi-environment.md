@@ -119,7 +119,6 @@ here; the translation policy from UEFI memory types into
 `BootInfo.memory_map` entries and the per-entry invariants the kernel
 can assume at handoff are owned by [memory-map.md](memory-map.md).
 
-
 The UEFI memory map must be queried as the last action before `ExitBootServices`.
 Every call to `AllocatePages` (or any other `BootServices` function that allocates
 memory) invalidates the previous map key. Querying the map early and then allocating

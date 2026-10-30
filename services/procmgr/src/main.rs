@@ -119,7 +119,9 @@ fn main() -> !
         syscall::thread_exit();
     };
     let Some(ws_cap) =
-        std::os::seraph::object_slab_retype(4096, |slab| syscall::wait_set_create(slab).ok())
+        std::os::seraph::object_slab_retype(std::os::seraph::WAIT_SET_RETYPE_BYTES, |slab| {
+            syscall::wait_set_create(slab).ok()
+        })
     else
     {
         syscall::thread_exit();

@@ -758,14 +758,16 @@ pub fn namespace_lookup_dir(
 /// crate, where the kernel pins them to its real object sizes; a size change
 /// is an ABI-visible change by design.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub use syscall_abi::{ENDPOINT_RETYPE_BYTES, NOTIFICATION_RETYPE_BYTES, event_queue_retype_bytes};
+pub use syscall_abi::{
+    ENDPOINT_RETYPE_BYTES, NOTIFICATION_RETYPE_BYTES, WAIT_SET_RETYPE_BYTES, event_queue_retype_bytes,
+};
 
 /// Retype one kernel object out of the runtime's object-slab machinery.
 ///
 /// `min_bytes` is the full raw debit the kernel charges for the object the
 /// caller is about to create, the object wrapper plus its state:
-/// [`ENDPOINT_RETYPE_BYTES`], [`NOTIFICATION_RETYPE_BYTES`], or
-/// [`event_queue_retype_bytes`]`(capacity)`, or the byte size of a
+/// [`ENDPOINT_RETYPE_BYTES`], [`NOTIFICATION_RETYPE_BYTES`],
+/// [`WAIT_SET_RETYPE_BYTES`], or [`event_queue_retype_bytes`]`(capacity)`, or the byte size of a
 /// page-granular object. The runtime rounds it up to the kernel's size class,
 /// so the request covers the kernel's debit. `retype` is called at most once with a
 /// Memory-cap slot whose `available_bytes` covers that class and must perform

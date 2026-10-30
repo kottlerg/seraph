@@ -194,7 +194,9 @@ fn create_death_eq() -> Option<u32>
 fn create_wait_set(log_ep_recv: u32, death_eq: u32) -> Option<u32>
 {
     let Some(ws) =
-        std::os::seraph::object_slab_retype(4096, |slab| syscall::wait_set_create(slab).ok())
+        std::os::seraph::object_slab_retype(std::os::seraph::WAIT_SET_RETYPE_BYTES, |slab| {
+            syscall::wait_set_create(slab).ok()
+        })
     else
     {
         let mut buf = SerialFmt::new();

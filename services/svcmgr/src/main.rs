@@ -136,7 +136,9 @@ fn main() -> !
     }
 
     let Some(ws_cap) =
-        std::os::seraph::object_slab_retype(512, |slab| syscall::wait_set_create(slab).ok())
+        std::os::seraph::object_slab_retype(std::os::seraph::WAIT_SET_RETYPE_BYTES, |slab| {
+            syscall::wait_set_create(slab).ok()
+        })
     else
     {
         std::os::seraph::log!("failed to create wait set");

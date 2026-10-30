@@ -1067,7 +1067,7 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
         // → BIN_512; sizing per core/kernel/docs/ipc-internals.md § Wait Set,
         // pinned by the const assertion in core/kernel/src/ipc/wait_set.rs.
         ObjectType::WaitSet => Some(DispatchEntry {
-            raw_bytes: 24 + 440,
+            raw_bytes: syscall::WAIT_SET_RETYPE_BYTES,
             split: false,
         }),
         // EventQueue: 24 wrapper + EventQueueState (56 B, EVENT_QUEUE_STATE_BYTES)
@@ -1132,6 +1132,13 @@ const _: () = {
             == syscall::ENDPOINT_RETYPE_BYTES
     );
     assert!(NOTIFICATION_RAW_BYTES == syscall::NOTIFICATION_RETYPE_BYTES);
+    // The WaitSet debit is a declared budget, the wrapper plus 440: pin that
+    // it is that budget and that the real state fits it.
+    assert!(syscall::WAIT_SET_RETYPE_BYTES == 24 + 440);
+    assert!(
+        24 + core::mem::size_of::<crate::ipc::wait_set::WaitSetState>() as u64
+            <= syscall::WAIT_SET_RETYPE_BYTES
+    );
     assert!(event_queue_raw_bytes(0) == syscall::event_queue_retype_bytes(0));
     assert!(event_queue_raw_bytes(1) == syscall::event_queue_retype_bytes(1));
 };

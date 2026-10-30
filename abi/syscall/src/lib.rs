@@ -154,6 +154,11 @@ pub const ENDPOINT_RETYPE_BYTES: u64 = 80;
 /// Raw retype debit of one `Notification`, in bytes.
 pub const NOTIFICATION_RETYPE_BYTES: u64 = 64;
 
+/// Raw retype debit of one `WaitSet`, in bytes: the 24-byte wrapper plus the
+/// kernel's declared 440-byte budget for the wait-set state, which the
+/// state's real size never exceeds.
+pub const WAIT_SET_RETYPE_BYTES: u64 = 464;
+
 /// Raw retype debit of one `EventQueue` of user-visible `capacity` entries, in
 /// bytes: the 24-byte wrapper, the 56-byte queue state, and `capacity + 1`
 /// eight-byte ring slots, all inline in the retype slot.

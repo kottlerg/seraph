@@ -105,7 +105,7 @@ transfer table.
   after `sys_thread_exit`. The caps left in init's CSpace stay there; the
   kernel pins that CSpace (it is the root CSpace), so they remain alive but
   unreachable. Releasing them at the reap is design intent; not yet
-  implemented ([#443](https://github.com/kottlerg/seraph/issues/443); see
+  implemented ([#540](https://github.com/kottlerg/seraph/issues/540); see
   [docs/process-lifecycle.md](../../docs/process-lifecycle.md#init-reap)
   § Init reap).
 

@@ -128,7 +128,7 @@ have exited, procmgr tears down init's threads and AddressSpace, donates
 the Memory caps to memmgr's pool, and drops its reference to init's
 CSpace. The caps left in that kernel-pinned root CSpace stay alive but
 unreachable; releasing them is design intent, not yet implemented
-([#443](https://github.com/kottlerg/seraph/issues/443)). See
+([#540](https://github.com/kottlerg/seraph/issues/540)). See
 [`process-lifecycle.md`](process-lifecycle.md) §"Init reap".
 
 Once init exits, svcmgr is the resident supervisor. See

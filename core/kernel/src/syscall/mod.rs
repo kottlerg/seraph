@@ -180,6 +180,7 @@ impl UserFrame
 #[cfg(not(test))]
 pub unsafe fn dispatch(tf: *mut TrapFrame)
 {
+    crate::arch::current::cpu::debug_assert_kernel_entry_flags();
     let frame = tf;
     // SAFETY: caller guarantees tf is the running thread's valid frame for
     // the whole syscall. The handlers reach it only through `UserFrame`,

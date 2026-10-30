@@ -10,7 +10,7 @@
 //! objects and donates the Memory caps to memmgr. Tearing down init's
 //! `CSpace` is design intent, not yet implemented: it is the kernel-pinned
 //! root `CSpace`, so the caps init still holds stay in it, alive but
-//! unreachable (`docs/process-lifecycle.md` § Init reap, #443). init-logd
+//! unreachable (`docs/process-lifecycle.md` § Init reap, #540). init-logd
 //! outlives the main thread until the svcmgr-launched real-logd pulls its
 //! handover, so the reap waits for the later of the two deaths; reclaiming
 //! init's aspace/cspace while a thread still runs in them would fault it.
@@ -44,7 +44,7 @@
 //!                                                the kernel-pinned
 //!                                                root CSpace (release
 //!                                                is design intent;
-//!                                                #443)
+//!                                                #540)
 //!   6. log summary
 //! ```
 
@@ -272,7 +272,7 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
     //    `docs/process-lifecycle.md` § Init reap) stay in it, alive but
     //    unreachable. Releasing them at the reap is design intent,
     //    not yet implemented (`docs/process-lifecycle.md` § Init reap,
-    //    #443).
+    //    #540).
     let _ = syscall::cap_revoke_all(cspace);
     let _ = syscall::cap_delete(cspace);
 

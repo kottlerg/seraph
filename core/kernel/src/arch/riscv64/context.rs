@@ -15,6 +15,8 @@
 //! `return_to_user` sets `sepc` to the user entry point, configures `sstatus`
 //! for U-mode return, restores all GPRs from a [`TrapFrame`], and executes `sret`.
 
+use crate::arch::ThreadKind;
+
 // ── SavedState ────────────────────────────────────────────────────────────────
 
 /// Kernel-mode callee-saved register state for one thread.
@@ -116,8 +118,9 @@ pub fn align_initial_stack(sp: u64) -> u64
 /// `entry`     — virtual address of the thread's entry function.
 /// `stack_top` — top of the thread's kernel stack (sp starts here).
 /// `arg`       — first argument delivered in `a0` on first entry.
-/// `_is_user`  — unused; user-mode entry uses `return_to_user`.
-pub fn new_state(entry: u64, stack_top: u64, arg: u64, _is_user: bool) -> SavedState
+/// `_kind`     — unused; user-mode entry uses `return_to_user`, and the first
+///               switch leaves `sstatus.SIE` masked for either kind (below).
+pub fn new_state(entry: u64, stack_top: u64, arg: u64, _kind: ThreadKind) -> SavedState
 {
     // switch() does not save or restore sstatus, so SIE stays masked across the
     // first switch into a new thread; where each kind of thread re-enables

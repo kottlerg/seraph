@@ -411,9 +411,10 @@ directory cannot supply `MSG_CAP_SLOTS_MAX` free slots), `OutOfMemory` (slot-pag
 exhausted) — both checked before the receive parks, whether or not a message carries caps
 (see [ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure Policy),
 `Interrupted`. If an already-queued sender's cap transfer is refused (a source slot went stale
-or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer, or
-the server's CSpace cannot supply the destination slots, which the pre-park grow makes unlikely
-but does not reserve), the message is still delivered — with zero caps; the sender keeps its
+or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer, a
+cap's object has its reference count at its 2^31 ceiling, or the server's CSpace cannot supply the
+destination slots, which the pre-park grow makes unlikely but does not reserve), the message is
+still delivered — with zero caps; the sender keeps its
 capabilities (see [ipc-design.md](../../../docs/ipc-design.md) § Message Format and
 § Receive-Failure Policy).
 

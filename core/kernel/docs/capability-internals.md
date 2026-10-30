@@ -398,18 +398,22 @@ The count is 32 bits wide and cannot wrap. The references userspace can multiply
 of their own, new capability slots and retype leases, are refused at `REF_COUNT_LIMIT` (2^31) with
 `QuotaExceeded`: a copy, derivation, badged derivation, or move takes its new slot's reference
 through `KernelObjectHeader::try_inc_ref`, the one checked increment (a move's destination counts
-because a move its liveness backstop abandons leaves both slots live), and `retype_allocate`
+because a move its liveness backstop abandons leaves both slots live; an IPC transfer instead
+checks every cap of its message before its first move, so it refuses all or none, and its moves
+take their references unchecked), and `retype_allocate`
 refuses a retype from a Memory object whose count is at the limit, before the new object takes its
 lease. The limit is correct as is, not one a workload meets: each such reference costs a 72-byte
 slot or a retype child of at least 128 bytes, so 2^31 of them hold at least 144 GiB against one
 object, and reaching it refuses instead of corrupting. Every other reference is taken unchecked, in
 the 2^31 of headroom between the limit and `u32::MAX`, because each kind is bounded by an object
 count rather than by a request. Per thread: its syscall pins (a few), its fault-handler binding
-(one), the death observers bound on it (at most `MAX_DEATH_OBSERVERS`, four), and the lease of a
+(one), the death observers bound on it (at most `MAX_DEATH_OBSERVERS`, four), the lease of a
 retype it has in flight that passed `retype_allocate`'s check just before the count reached the
-limit (one); fewer than 16 in all. Per other object: wait-set membership (one per source), Mmio
-mapping records (four per Mmio object, whose bodies are SEED-backed), address-space death
-observers (a fixed number per address space), and SEED leases (bounded by the SEED reserve).
+limit (one), and the destinations of an IPC transfer it has in flight that passed the message check
+(at most `MSG_CAP_SLOTS_MAX`, four); fewer than 16 in all. Per other object: wait-set membership
+(one per source), Mmio mapping records (four per Mmio object, whose bodies are SEED-backed),
+address-space death observers (a fixed number per address space), and SEED leases (bounded by the
+SEED reserve).
 Exhausting the headroom would take some 2^27 threads, each with its own kernel stack and TCB (at
 least 2 TiB of kernel stacks).
 
@@ -818,7 +822,9 @@ in O(1)), the derivation lock released between batches, and a
 move(src, dst):
     first hold (derivation lock + both CSpace locks, pointer order):
         validate src: occupied, handle generation current, not pinned
-        insert dst; inc_ref the object; pin src and dst
+        take dst's reference on the object (QuotaExceeded at REF_COUNT_LIMIT,
+            unless an IPC transfer checked the whole message first)
+        insert dst (releasing that reference if the insert fails); pin src and dst
         migrate up to MAX_REPARENT_EDITS children of src under dst
         all moved → finish; else link dst as src's first child
     every later hold (derivation lock; a finish also takes the source CSpace lock to free src):
@@ -1027,8 +1033,10 @@ transfer_caps(sender_tcb, handles, receiver_tcb):
             TCB carries (cspace_id, cspace_epoch); either gone → refuse
         validate every handle: distinct, occupied, generation current,
             not pinned
+        refuse (QuotaExceeded) if any handle's object is at REF_COUNT_LIMIT
         pre-allocate len(handles) slots in the receiver's CSpace
-        begin every move (insert dst, pin both, first batch)
+        begin every move (insert dst, its reference unchecked, pin both,
+            first batch)
     drive each move that did not finish, one batch per hold
     deliver the destination handles
     // The moved cap takes the source's position in the derivation tree: its

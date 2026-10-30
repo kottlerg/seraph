@@ -2254,7 +2254,9 @@ fn dealloc_revoked(snapshot: &[Option<core::ptr::NonNull<crate::cap::object::Ker
 pub fn sys_cap_move(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::CSpaceKernelObject;
-    use crate::cap::transfer::{MoveStep, move_cap_begin, move_cap_drive, release_moved_object};
+    use crate::cap::transfer::{
+        DestRef, MoveStep, move_cap_begin, move_cap_drive, release_moved_object,
+    };
 
     let src_handle = tf.arg(0) as u32;
     let src_idx = syscall::cap_handle_index(src_handle);
@@ -2337,7 +2339,15 @@ pub fn sys_cap_move(tf: UserFrame) -> Result<u64, SyscallError>
     // unlock_cspace_pair with the same argument order.
     let (saved1, saved2) = unsafe { crate::cap::lock_cspace_pair(caller_cspace, dest_cs_ptr) };
     // SAFETY: both CSpace pointers valid; DERIVATION_LOCK and both cspace locks held.
-    let begun = unsafe { move_cap_begin(caller_cspace, src_handle, dest_cs_ptr, placement) };
+    let begun = unsafe {
+        move_cap_begin(
+            caller_cspace,
+            src_handle,
+            dest_cs_ptr,
+            placement,
+            DestRef::Checked,
+        )
+    };
     // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
     unsafe {
         crate::cap::unlock_cspace_pair(caller_cspace, dest_cs_ptr, saved1, saved2);

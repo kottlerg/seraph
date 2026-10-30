@@ -200,14 +200,45 @@ fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u32]) -> Result<(), Syscal
     Ok(())
 }
 
+/// Refuse a message one of whose caps names an object at
+/// [`REF_COUNT_LIMIT`](crate::cap::object::REF_COUNT_LIMIT): each move's
+/// destination takes a reference on its object, so the ceiling is checked for
+/// the whole message before the first move, and no move refuses one cap after
+/// earlier ones moved.
+///
+/// # Safety
+///
+/// The caller holds `cs`'s lock and has validated every handle
+/// (`prevalidate_transfer_slots`), so each slot is non-null and its object
+/// live for the hold.
+#[cfg(not(test))]
+unsafe fn check_transfer_ref_limits(cs: &CSpace, handles: &[u32]) -> Result<(), SyscallError>
+{
+    for &handle in handles
+    {
+        let at_limit = cs
+            .slot(syscall::cap_handle_index(handle))
+            .and_then(|slot| slot.object)
+            // SAFETY: caller contract: a validated slot's object is live
+            // while the CSpace lock is held.
+            .is_some_and(|o| unsafe { o.as_ref() }.at_ref_limit());
+        if at_limit
+        {
+            return Err(SyscallError::QuotaExceeded);
+        }
+    }
+    Ok(())
+}
+
 /// Move the caps named by `src_handles[..cap_count]` from `src_tcb`'s
 /// `CSpace` to `dst_tcb`'s.
 ///
 /// All-or-nothing at the start: if either `CSpace` is gone, any slot is
 /// null/invalid, repeated within the same message, pinned by an in-flight
-/// revoke, move, or IPC capability transfer (`CapabilitySlot::pinned`), or the
-/// destination is full (`pre_allocate` fails), returns an error and no caps are
-/// transferred.
+/// revoke, move, or IPC capability transfer (`CapabilitySlot::pinned`), names
+/// an object whose reference count is at `REF_COUNT_LIMIT` (`QuotaExceeded`),
+/// or the destination is full (`pre_allocate` fails), returns an error and no
+/// caps are transferred.
 /// Validation, destination pre-allocation, and the first batch of every
 /// move run under one `DERIVATION_LOCK` hold with both `CSpace`s resolved
 /// through the registry from each TCB's `cspace_id`/`cspace_epoch`; moves
@@ -237,7 +268,7 @@ unsafe fn transfer_caps(
 ) -> Result<usize, SyscallError>
 {
     use crate::cap::transfer::{
-        CapMove, MoveStep, move_cap_begin, move_cap_drive, release_moved_object,
+        CapMove, DestRef, MoveStep, move_cap_begin, move_cap_drive, release_moved_object,
     };
 
     let cap_count = src_handles.len().min(MSG_CAP_SLOTS_MAX);
@@ -271,16 +302,19 @@ unsafe fn transfer_caps(
     // Validate under the locks — the handles carry the sender's generation,
     // so a stale, recycled handle is rejected rather than transmitting the
     // slot's current occupant (#349) — then pre-allocate the destination
-    // slots so no move can run out of slots mid-message. Failing here keeps
-    // the all-or-nothing contract (nothing has moved yet) and the per-move
-    // failure branch below genuinely unreachable.
-    // SAFETY: both pointers registry-resolved under the lock; dst lock held.
+    // slots so no move can run out of slots mid-message, and check every
+    // object's reference ceiling so no move refuses its destination's
+    // reference. Failing here keeps the all-or-nothing contract (nothing has
+    // moved yet) and the per-move failure branch below genuinely unreachable.
+    // SAFETY: both pointers registry-resolved under the lock; both locks held.
     let prepared = unsafe {
-        prevalidate_transfer_slots(&*src_cspace, &src_handles[..cap_count]).and_then(|()| {
-            (*dst_cspace)
-                .pre_allocate(cap_count)
-                .map_err(SyscallError::from)
-        })
+        prevalidate_transfer_slots(&*src_cspace, &src_handles[..cap_count])
+            .and_then(|()| check_transfer_ref_limits(&*src_cspace, &src_handles[..cap_count]))
+            .and_then(|()| {
+                (*dst_cspace)
+                    .pre_allocate(cap_count)
+                    .map_err(SyscallError::from)
+            })
     };
     if let Err(e) = prepared
     {
@@ -296,7 +330,15 @@ unsafe fn transfer_caps(
     for (i, &src_handle) in src_handles[..cap_count].iter().enumerate()
     {
         // SAFETY: DERIVATION_LOCK and both CSpace locks held; pointers valid.
-        match unsafe { move_cap_begin(src_cspace, src_handle, dst_cspace, None) }
+        match unsafe {
+            move_cap_begin(
+                src_cspace,
+                src_handle,
+                dst_cspace,
+                None,
+                DestRef::Prechecked,
+            )
+        }
         {
             Ok(MoveStep::Done { handle, release }) =>
             {

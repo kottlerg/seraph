@@ -116,17 +116,20 @@ pub struct KernelObjectHeader
 /// ceiling refuses the request with `QuotaExceeded` instead of wrapping the
 /// count and freeing a live object.
 ///
-/// A move's destination slot takes its reference through the same check: a
+/// A move's destination slot takes its reference through the same check (a
 /// move its liveness backstop abandons leaves that slot live beside the
-/// source.
+/// source); an IPC transfer checks every cap of its message before its first
+/// move and then takes the destinations' references unchecked.
 ///
 /// The ceiling leaves 2^31 of headroom below `u32::MAX` for every other
 /// reference, which the kernel takes unchecked. Each of those is bounded by an
 /// object count, not by a caller's request. Per thread: its syscall pins (a
 /// few), its fault-handler binding (one), the death observers bound on it (at
-/// most `MAX_DEATH_OBSERVERS`, four), and the lease of a retype it has in
-/// flight that passed `retype_allocate`'s check before another took the count
-/// to the ceiling (one); fewer than 16 in all. Per other object: wait-set
+/// most `MAX_DEATH_OBSERVERS`, four), the lease of a retype it has in flight
+/// that passed `retype_allocate`'s check before another took the count to the
+/// ceiling (one), and the destinations of an IPC transfer it has in flight that
+/// passed the message check (at most `MSG_CAP_SLOTS_MAX`, four); fewer than 16
+/// in all. Per other object: wait-set
 /// membership (one per source), Mmio mapping records (four per Mmio object,
 /// whose bodies are SEED-backed), address-space death observers (a fixed
 /// number per address space), and SEED leases (bounded by the SEED reserve).

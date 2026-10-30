@@ -28,9 +28,10 @@
 //! still maps: before reuse it checks that no mapping but its own remains,
 //! and quarantines a page that is still mapped (services/fs/docs/
 //! fs-driver-protocol.md § Label 8). A copy that outlasts the window
-//! therefore reads the page's original bytes. A copy still running when the
-//! handler's own wait runs out is marked stalled, and `File::read_frame`
-//! discards it as defence in depth. Holding the reply keeps the client's own
+//! therefore never reads a refilled page; until quarantine the page changes
+//! only by the driver's write-through of the sectors it caches. A copy still
+//! running when the handler's own wait runs out is marked stalled, and
+//! `File::read_frame` discards it as defence in depth. Holding the reply keeps the client's own
 //! unmap from racing a copy that ends within the window.
 //!
 //! The endpoint and the handler thread are created lazily on the first

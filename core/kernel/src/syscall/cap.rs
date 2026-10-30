@@ -2733,6 +2733,11 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             {
                 return Err(SyscallError::InvalidArgument);
             }
+            // Order the caller's earlier revokes before the count reads, the
+            // issuer's side of the revocation/map boundary that
+            // `sys_mem_map`'s second handle lookup closes
+            // (core/kernel/docs/memory-internals.md § Frame Map Table).
+            core::sync::atomic::fence(Ordering::SeqCst);
             Ok(crate::mm::frame_map::mappings_in(memory.base, memory.size))
         }
         CAP_INFO_THREAD_STATE =>

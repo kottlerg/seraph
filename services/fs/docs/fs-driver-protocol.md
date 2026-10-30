@@ -322,7 +322,9 @@ when the count shows its own mapping alone. Otherwise it moves the slot onto a
 replacement page and quarantines the still-mapped one, which is never refilled
 and never returned to memmgr until no address space maps it. A client that keeps
 a page mapped after the release, or whose copy outlasts the window, therefore
-keeps reading the bytes the page held when it was read, never other data. A
+never sees the page refilled with other data. Until the page is quarantined, its bytes
+change only by write-through of the sectors it caches; those may belong to other files
+or to the FAT. A
 client SHOULD still unmap before it acks: the driver holds at most 32
 quarantined and spare pages, and past that a still-mapped slot stays out of
 service, so a client that never unmaps shrinks the cache, and a read that finds
@@ -334,8 +336,10 @@ outlasts the window, replies `IO_ERROR` (2).
 ### Client-to-driver release
 
 Sent by the client on the per-node badged cap the page was read
-through, once it has finished reading the page; the client then tears
-down its local mapping. No release endpoint and no
+through, once it has finished reading the page and torn down its local
+mapping: a page still mapped when the driver next reuses its slot costs
+the driver a quarantined page (see [Label 8](#label-8-fs_release_memory)).
+No release endpoint and no
 [`FS_RELEASE_ACK`](#label-9-fs_release_ack) are involved.
 
 **Request**

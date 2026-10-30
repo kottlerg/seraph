@@ -543,37 +543,57 @@ impl PageCache
         {
             return false;
         };
-        if !self.swap_page(slot, cap, fresh)
+        match self.swap_page(slot, cap, fresh)
         {
-            quarantine.spare.push(fresh);
-            return false;
+            Swap::Done =>
+            {
+                quarantine.held.push(cap);
+                slot.exposed.store(false, Ordering::Release);
+                true
+            }
+            Swap::Restored =>
+            {
+                quarantine.spare.push(fresh);
+                false
+            }
+            Swap::Lost =>
+            {
+                // The slot keeps no page: `exposed` stays set and its cap is
+                // 0, so no pick reuses it and no lookup hits it.
+                quarantine.held.push(cap);
+                quarantine.spare.push(fresh);
+                false
+            }
         }
-        quarantine.held.push(cap);
-        slot.exposed.store(false, Ordering::Release);
-        true
     }
 
     /// Replace `slot`'s page `old` with page `fresh` at the slot's VA. On a
-    /// failure `old` is mapped back and `false` returned. The slot is
-    /// unreferenced, so no reader is inside its page.
-    fn swap_page(&self, slot: &CacheSlot, old: u32, fresh: u32) -> bool
+    /// failure `old` is mapped back; when that fails too, the slot is left
+    /// with no page ([`Swap::Lost`]). The slot is unreferenced, so no reader is
+    /// inside its page.
+    fn swap_page(&self, slot: &CacheSlot, old: u32, fresh: u32) -> Swap
     {
         // SAFETY: slot.va is this slot's page of the cache's reserved window,
         // which only the cache maps; the slot is unreferenced, so no read or
         // write of the page is in progress and no Rust reference into it lives.
         if unsafe { syscall::mem_unmap(self.self_aspace, slot.va, 1) }.is_err()
         {
-            return false;
+            return Swap::Restored;
         }
         // SAFETY: as above; the VA was just unmapped.
         if unsafe { syscall::mem_map(fresh, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_ok()
         {
             slot.memory_cap.store(fresh, Ordering::Release);
-            return true;
+            return Swap::Done;
         }
         // SAFETY: as above; restores the page the slot had.
-        let _ = unsafe { syscall::mem_map(old, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) };
-        false
+        if unsafe { syscall::mem_map(old, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_ok()
+        {
+            return Swap::Restored;
+        }
+        slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
+        slot.memory_cap.store(0, Ordering::Release);
+        Swap::Lost
     }
 
     /// The least recently used slot with no reference that `skipped` does not
@@ -620,6 +640,17 @@ impl PageCache
             std::os::seraph::log!("WARNING: cache slot {idx} released with refcount 0");
         }
     }
+}
+
+/// How [`PageCache::swap_page`] left a slot.
+enum Swap
+{
+    /// The slot maps the fresh page.
+    Done,
+    /// The slot still maps its old page; the fresh page is unused.
+    Restored,
+    /// The slot's VA maps neither page; the slot is out of service.
+    Lost,
 }
 
 impl Quarantine

@@ -104,10 +104,13 @@ Revoking a Memory capability invalidates its descendants but does not unmap the
 pages they mapped: a mapping established through a revoked descendant stays in
 place until its address space unmaps it or is torn down, so a server that hands
 out a page and later revokes it cannot rely on the revoke to withdraw the
-client's access. It can instead verify the withdrawal: after the revoke, no other
-holder can map the page again, and `SYS_CAP_INFO`'s mappings count (see
-[Cap introspection](#cap-introspection)) falls to the server's own mappings once the
-client's are gone, so the server reuses the page only then.
+client's access. It can instead verify the withdrawal. After the revoke, no other
+holder can map the page again: a `mem_map` already in flight through a revoked
+capability either fails or is counted (see
+[memory-internals.md § Frame Map Table](../core/kernel/docs/memory-internals.md#frame-map-table)).
+`SYS_CAP_INFO`'s mappings count (see [Cap introspection](#cap-introspection)) falls
+to the server's own mappings once the client's are gone, so the server reuses the
+page only then.
 
 Init transfers RAM Memory caps (via the
 [derive-twice pattern](../core/kernel/docs/capability-internals.md#safe-delegation-the-derive-twice-pattern))

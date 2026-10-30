@@ -1622,11 +1622,13 @@ impl File
             // `checked_frame_reply` holds `memory_data_offset + bytes_valid
             // <= PAGE_SIZE`, so `src + i` lies in the mapped page for every
             // `i < copy_len <= bytes_valid`. The page is the driver's and
-            // another process may write it. The driver writes it only while
-            // the page caches this read's data (write-through of the same
-            // file): it refills a released page only once no mapping but its
-            // own remains, so a copy that outlasts the release window still
-            // reads this file's bytes. Volatile reads keep a concurrent
+            // another process may write it. The driver writes it in place only
+            // by write-through of the sectors it caches, which may include
+            // other files' or the FAT's sectors; it refills a released page
+            // only once no mapping but its own remains, so a copy that
+            // outlasts the release window never reads a refilled page, and
+            // this read's own bytes [memory_data_offset, + bytes_valid) are
+            // this file's. Volatile reads keep a concurrent
             // driver write a defined read rather than a data race; a copy
             // known to have outlasted the window is still discarded below,
             // as defence in depth.
@@ -1640,13 +1642,14 @@ impl File
             memory_cap,
         });
 
-        // Proactive release: synchronous FS_RELEASE_MEMORY on the file
-        // cap clears the fs-side outstanding entry and decrements the
-        // cache slot's refcount. After ack we own the local cleanup
-        // (take_mapping is no-op if the handler thread already grabbed
-        // it via a forced-release race).
-        self.release_frame(cookie);
+        // Unmap first (take_mapping is a no-op if the handler thread already
+        // took the mapping on a forced release), then the proactive
+        // FS_RELEASE_MEMORY on the file cap, which clears the fs-side
+        // outstanding entry and drops the cache slot's refcount. In this
+        // order the driver finds the page mapped by itself alone when it next
+        // reuses the slot, and need not quarantine it.
         release_handler::release_one_local(self.entry.as_ref(), self.aspace, cookie);
+        self.release_frame(cookie);
 
         // A driver release whose wait ran out during the copy means the
         // driver's window had passed. The driver does not refill a page this

@@ -140,14 +140,19 @@ pub fn memory_mappings(ctx: &TestContext) -> TestResult
     let memory_cap =
         crate::frame_pool::alloc().ok_or("cap_info::memory_mappings: frame pool exhausted")?;
     let result = mappings_probe(ctx, memory_cap);
-    // SAFETY: the probe unmapped the cap from ktest's address space and
-    // destroyed the other one before returning, success or not.
-    unsafe { crate::frame_pool::free(memory_cap) };
+    // A failed cleanup can leave the frame mapped; it then stays out of the
+    // pool rather than break `free`'s precondition.
+    if cap_info(memory_cap, CAP_INFO_MEMORY_MAPPINGS) == Ok(0)
+    {
+        // SAFETY: the kernel reports no address space maps the frame, so every
+        // mapping the probe made of it is gone.
+        unsafe { crate::frame_pool::free(memory_cap) };
+    }
     result?;
 
     let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
         .map_err(|_| "cap_info::memory_mappings: cap_info(memory_base, SIZE) failed")?;
-    if size <= CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES * 0x1000
+    if size <= CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES * syscall_abi::PAGE_SIZE
     {
         return Err("cap_info::memory_mappings: memory_base is too small to test the bound");
     }
@@ -159,7 +164,7 @@ pub fn memory_mappings(ctx: &TestContext) -> TestResult
 }
 
 /// Map `memory_cap` into ktest's address space and a fresh one, checking the
-/// count after each step. Leaves the cap unmapped everywhere.
+/// count after each step. Unmaps it from both on every path that can.
 fn mappings_probe(ctx: &TestContext, memory_cap: u32) -> TestResult
 {
     let count = || {

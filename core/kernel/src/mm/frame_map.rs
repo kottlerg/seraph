@@ -11,7 +11,8 @@
 //! `core/kernel/docs/memory-internals.md` § Frame Map Table. The table is the
 //! kernel's answer to "is this frame mapped into any address space now", which
 //! `cap::retype::retype_allocate` asks before it carves a page into kernel
-//! objects (docs/capability-model.md § Typed Memory).
+//! objects (docs/capability-model.md § Typed Memory), and whose per-region sum
+//! `SYS_CAP_INFO`'s `CAP_INFO_MEMORY_MAPPINGS` reports to a Memory cap's holder.
 //!
 //! Storage is two-level: [`MAX_CHUNKS`] chunk pointers in BSS, each naming a
 //! 1 MiB buddy block of [`FRAMES_PER_CHUNK`] `AtomicU32` counters that covers

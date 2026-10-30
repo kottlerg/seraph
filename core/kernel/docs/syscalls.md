@@ -1019,7 +1019,11 @@ applies to its split offset (see
 [docs/capability-model.md § Typed Memory](../../../docs/capability-model.md#typed-memory)). While
 the mapping lives, no retype carves its pages (see [Capability Syscalls](#capability-syscalls)).
 A call that races a retype advancing the cursor over the requested range may fail with
-`InvalidArgument` even when that retype is itself refused.
+`InvalidArgument` even when that retype is itself refused. Once the range's frames are counted,
+the call resolves `memory_cap` a second time, and it fails with `InvalidCapability` if the
+capability was revoked or deleted in between. A revoke therefore either stops the map or is
+followed by a mappings count that includes it (see
+[memory-internals.md § Frame Map Table](memory-internals.md#frame-map-table)).
 
 **Capability requirements:** `memory_cap` (Map), `aspace_cap` (Map).
 

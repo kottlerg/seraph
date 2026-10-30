@@ -1063,6 +1063,8 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 /// Unmap every 4 KiB leaf in `[virt_base, virt_base + page_count*4 KiB)` and
 /// reclaim each intermediate table the cleared span leaves empty back to
 /// `aso`'s page-table growth pool. Returns the number of non-root table frames freed.
+/// Passes the frame of each present leaf it clears to `on_leaf`, in VA order,
+/// after the clear.
 ///
 /// Walks from the root to the leaf level over the span, clearing in-range
 /// leaf PTEs. A table is freed only when it is fully empty afterwards **and**
@@ -1097,6 +1099,7 @@ pub unsafe fn unmap_user_region_pooled(
     virt_base: u64,
     page_count: usize,
     aso: &crate::cap::object::AddressSpaceObject,
+    on_leaf: &mut dyn FnMut(u64),
 ) -> usize
 {
     use crate::mm::PAGE_SIZE;
@@ -1110,7 +1113,7 @@ pub unsafe fn unmap_user_region_pooled(
     let root = unsafe { table_at(root_virt) };
     // SAFETY: root is a live table at the root level; aso wraps this page
     // table and the caller holds its pt_lock (caller's contract).
-    unsafe { unmap_span(root, top, virt_base, virt_end, aso, &mut freed) };
+    unsafe { unmap_span(root, top, virt_base, virt_end, aso, &mut freed, on_leaf) };
     freed
 }
 
@@ -1133,6 +1136,7 @@ unsafe fn unmap_span(
     hi: u64,
     aso: &crate::cap::object::AddressSpaceObject,
     freed: &mut usize,
+    on_leaf: &mut dyn FnMut(u64),
 )
 {
     use crate::mm::PAGE_SIZE;
@@ -1145,11 +1149,16 @@ unsafe fn unmap_span(
         {
             // Demote-first: a span edge can cut through a NAPOT group
             // (core/kernel/docs/memory-internals.md § NAPOT Contiguity (RISC-V)).
-            if table[vpn_index(0, va)].0 & NAPOT != 0
+            let leaf = table[vpn_index(0, va)];
+            if leaf.0 & NAPOT != 0
             {
                 demote_napot_64k(table, va);
             }
             table[vpn_index(0, va)] = PageTableEntry(0);
+            if leaf.is_present()
+            {
+                on_leaf(leaf_phys(leaf, va));
+            }
             va += PAGE_SIZE as u64;
         }
         return;
@@ -1169,7 +1178,7 @@ unsafe fn unmap_span(
             let child = unsafe { table_at(phys_to_virt(child_pa)) };
             // SAFETY: child is a live table at level - 1; same aso/pt_lock
             // guarantees as this call.
-            unsafe { unmap_span(child, level - 1, va, entry_end, aso, freed) };
+            unsafe { unmap_span(child, level - 1, va, entry_end, aso, freed, on_leaf) };
             if table_is_empty(child) && e.0 & POOLED_TABLE != 0
             {
                 table[idx] = PageTableEntry(0);
@@ -1178,6 +1187,71 @@ unsafe fn unmap_span(
                 unsafe { aso.free_pt_page(child_pa) };
                 *freed += 1;
             }
+        }
+        va = entry_end;
+    }
+}
+
+/// Pass the frame of every present 4 KiB leaf below `user_va_top()` in the
+/// page table rooted at `root_virt` to `on_leaf`, changing nothing. Leaf
+/// entries at a non-leaf level are skipped, as in [`unmap_user_region_pooled`]:
+/// the user mapping path never installs one. A NAPOT member reports its own
+/// page's frame.
+///
+/// Drives the frame-map release of an address space's teardown
+/// (`AddressSpace::release_mapped_frames`).
+///
+/// # Safety
+/// `root_virt` must be the direct-map VA of a valid 4 KiB root frame whose
+/// tables no other hart modifies during the walk.
+#[cfg(not(test))]
+pub unsafe fn for_each_user_leaf(root_virt: u64, on_leaf: &mut dyn FnMut(u64))
+{
+    let top = paging_mode().levels() - 1;
+    // SAFETY: root_virt is the direct-map VA of a valid root (caller's contract).
+    let root = unsafe { table_at(root_virt) };
+    // SAFETY: root is a live table at the root level, unmodified meanwhile.
+    unsafe { walk_leaves(root, top, 0, crate::mm::user_va_top(), on_leaf) };
+}
+
+/// Pass the frame of every present leaf of `[lo, hi)` under `table` (a table
+/// at `level`) to `on_leaf`. Bounded recursion: `level <= 4`.
+///
+/// # Safety
+/// `table` must be a live table at `level` whose reachable child frames are
+/// live and unmodified during the walk.
+#[cfg(not(test))]
+unsafe fn walk_leaves(
+    table: &[PageTableEntry; 512],
+    level: usize,
+    lo: u64,
+    hi: u64,
+    on_leaf: &mut dyn FnMut(u64),
+)
+{
+    use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::phys_to_virt;
+
+    let mut va = lo;
+    while va < hi
+    {
+        let e = table[vpn_index(level, va)];
+        if level == 0
+        {
+            if e.is_present()
+            {
+                on_leaf(leaf_phys(e, va));
+            }
+            va += PAGE_SIZE as u64;
+            continue;
+        }
+        let entry_end = hi.min(next_level_boundary(level, va));
+        if e.is_present() && e.0 & LEAF_BITS == 0
+        {
+            // SAFETY: a present non-leaf entry points at a live child table.
+            let child = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+            // SAFETY: child is a live table at level - 1 (this call's contract).
+            unsafe { walk_leaves(child, level - 1, va, entry_end, on_leaf) };
         }
         va = entry_end;
     }

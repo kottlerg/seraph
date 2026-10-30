@@ -3210,6 +3210,15 @@ unsafe fn dealloc_object_one(
                 // SAFETY: as_ptr is a valid AddressSpace being reclaimed.
                 crate::mm::tag_allocator::free_tag(unsafe { &*as_ptr });
 
+                // Lower the frame-map count of every frame the space still
+                // maps (core/kernel/docs/memory-internals.md § Frame Map
+                // Table): no CPU has it loaded and no bound thread can run
+                // (both established above), so none of its leaves is used
+                // again.
+                // SAFETY: as_ptr is valid and being reclaimed; nothing maps
+                // into it any more (refcount 0, no slot references it).
+                unsafe { (*as_ptr).release_mapped_frames() };
+
                 // Release the terminal-fault observers' EventQueue references.
                 // Every bound thread is stopped and off-CPU (above), so no
                 // terminal-fault post can still read them.

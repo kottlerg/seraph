@@ -140,6 +140,60 @@ call site; there is no allocation that cannot fail
 
 ---
 
+## Frame Map Table (`mm/frame_map.rs`)
+
+The frame map table holds one 32-bit count per 4 KiB frame of RAM. Its invariant is:
+
+> **A frame's count is at least the number of user leaf PTEs, in every address space, that name
+> it or that some CPU may still use from its TLB; a count of zero means no CPU can reach the frame
+> through a user mapping.**
+
+Every path that installs or removes a user leaf keeps it, on both architectures, and the paging
+code's comments refer here rather than restate it:
+
+- **Install.** `AddressSpace::map_page` and `map_page_pooled` raise the new frame's count before
+  the leaf is written, so the count covers the leaf from the moment any CPU can walk it. These
+  two functions back every user mapping: `SYS_MEM_MAP`, `SYS_MMIO_MAP`, and the Phase-9
+  bootstrap maps of init's address space.
+- **Replace.** A map over a present leaf lowers the replaced frame's count after the rewrite's
+  TLB invalidation (the remote shootdown when the rewrite needs one) has completed.
+- **Remove.** `unmap_page` lowers the count after its remote shootdown. The span paths
+  (`unmap_region_pooled`, and `unmap_region_if_phys` for a freed Mmio object's mappings) collect
+  the cleared frames in a bounded batch and lower them after the span's invalidation; a full
+  batch is drained first behind an invalidation of the span on every CPU running the space.
+- **Teardown.** An address space's teardown lowers the count of every frame its user half still
+  maps (`AddressSpace::release_mapped_frames`, a read-only walk of its page tables). It runs only
+  after every bound thread is stopped and `wait_until_aspace_inactive` confirms no CPU has the
+  space loaded; the space's stale TLB entries are then unusable, since a reissued PCID/ASID is
+  flushed before the space that claims it runs.
+
+The count belongs to the frame, not to a Memory object, so it follows the frame through
+derivation, split, merge, and the free of the object that mapped it.
+
+**Retype check.** `retype_allocate` publishes its advanced bump cursor, issues a `SeqCst` fence,
+and reads the counts of every page the advance covers; any nonzero count restores the cursor and
+fails the retype with `OutOfMemory` before the ledger, free lists, or region bytes change.
+`SYS_MEM_MAP` pins its range first (raises each frame's count), issues a `SeqCst` fence, then
+reads the cursor and refuses a range below it; the pins drop when the call returns, after each
+installed leaf has raised its own count. With the fences on both sides, of a racing retype and map
+at least one observes the other, so a page is never both carved and mapped. Retypes served from a
+free list need no check: their bytes lie below the cursor, which no mapping can reach once the
+cursor has passed them, and the cursor passed them only after the check.
+
+**Storage.** The table is two-level: 256 chunk pointers in BSS, one per GiB of physical address
+space (covering the ~248 GiB the boot table pool can direct-map), each naming a 1 MiB buddy block
+of 262144 counters. Phase 4 allocates a chunk for every GiB the DRAM span touches, before the
+Phase-7 drain, so the table costs 1 MiB per GiB of DRAM span (0.1%; 1 MiB on a 512 MiB guest). A
+frame in a GiB with no chunk, device memory outside DRAM, is untracked: its count never moves and
+reads as zero. A count saturated at `u32::MAX` refuses a further map with `OutOfMemory`.
+
+**Cost.** Each user leaf install and each removal performs one `SeqCst` read-modify-write on its
+frame's count; `SYS_MEM_MAP` adds a pin and an unpin per page (two more), and a map or unmap of a
+single page adds one page-table translation under `pt_lock` to learn the replaced or removed frame.
+A retype that advances the bump cursor reads one count per page it covers.
+
+---
+
 ## Address Space Objects (`mm/address_space.rs`)
 
 ### Structure

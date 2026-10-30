@@ -613,11 +613,17 @@ impl AddressSpace
         flags: crate::mm::paging::PageFlags,
     ) -> Result<(), ()>
     {
-        use crate::arch::current::paging::{flush_page, map_user_page};
+        use crate::arch::current::paging::{flush_page, map_user_page, translate_user_page};
 
+        // Count the new leaf before it is installed
+        // (core/kernel/docs/memory-internals.md § Frame Map Table).
+        crate::mm::frame_map::raise(phys)?;
         crate::percpu::preempt_disable();
         self.pt_lock();
 
+        // SAFETY: root_virt is valid; virt is in user range; pt_lock is held,
+        // so the translation sees the leaf the map below replaces.
+        let prior = unsafe { translate_user_page(self.root_virt, virt) }.map(|(p, _)| p);
         // Intermediate page table frames are drawn from
         // `mm::kernel_pt_pool` (seeded once at Phase 7 with `POOL_SEED_PAGES`
         // from the pristine buddy). No buddy lock is taken on this path; the
@@ -629,6 +635,7 @@ impl AddressSpace
         {
             self.pt_unlock();
             crate::percpu::preempt_enable();
+            crate::mm::frame_map::lower(phys);
             return Err(());
         };
 
@@ -652,6 +659,10 @@ impl AddressSpace
             self.shootdown_remote(virt);
         }
         crate::percpu::preempt_enable();
+        if let Some(prior) = prior
+        {
+            crate::mm::frame_map::lower(prior);
+        }
 
         Ok(())
     }
@@ -674,17 +685,24 @@ impl AddressSpace
         aso: &crate::cap::object::AddressSpaceObject,
     ) -> Result<(), ()>
     {
-        use crate::arch::current::paging::{flush_page, map_user_page_pooled};
+        use crate::arch::current::paging::{
+            flush_page, map_user_page_pooled, translate_user_page,
+        };
 
+        // Count the new leaf before it is installed, as `map_page` does.
+        crate::mm::frame_map::raise(phys)?;
         crate::percpu::preempt_disable();
         self.pt_lock();
 
+        // SAFETY: as in `map_page`.
+        let prior = unsafe { translate_user_page(self.root_virt, virt) }.map(|(p, _)| p);
         // SAFETY: caller's contract; aso pairs with this AS.
         let Ok(outcome) = (unsafe { map_user_page_pooled(self.root_virt, virt, phys, flags, aso) })
         else
         {
             self.pt_unlock();
             crate::percpu::preempt_enable();
+            crate::mm::frame_map::lower(phys);
             return Err(());
         };
 
@@ -701,6 +719,10 @@ impl AddressSpace
             self.shootdown_remote(virt);
         }
         crate::percpu::preempt_enable();
+        if let Some(prior) = prior
+        {
+            crate::mm::frame_map::lower(prior);
+        }
 
         Ok(())
     }
@@ -787,11 +809,14 @@ impl AddressSpace
     #[cfg(not(test))]
     pub unsafe fn unmap_page(&self, virt: u64)
     {
-        use crate::arch::current::paging::{flush_page, unmap_user_page};
+        use crate::arch::current::paging::{flush_page, translate_user_page, unmap_user_page};
 
         crate::percpu::preempt_disable();
         self.pt_lock();
 
+        // SAFETY: root_virt is valid; virt is in user range (caller's
+        // contract); pt_lock is held, so this is the leaf the unmap clears.
+        let prior = unsafe { translate_user_page(self.root_virt, virt) }.map(|(p, _)| p);
         // Remove the mapping via arch-specific page table walk.
         // SAFETY: root_virt is valid; virt is in user range (caller's contract).
         unsafe { unmap_user_page(self.root_virt, virt) };
@@ -812,6 +837,12 @@ impl AddressSpace
         self.pt_unlock();
         self.shootdown_remote(virt);
         crate::percpu::preempt_enable();
+        // Every CPU has dropped the leaf, so the frame's count may fall
+        // (core/kernel/docs/memory-internals.md § Frame Map Table).
+        if let Some(prior) = prior
+        {
+            crate::mm::frame_map::lower(prior);
+        }
     }
 
     /// Unmap each of the `page_count` pages from `virt_base` that still maps
@@ -849,6 +880,7 @@ impl AddressSpace
         crate::percpu::preempt_disable();
         self.pt_lock();
         let mut unmapped = 0;
+        let mut batch = crate::mm::frame_map::ReleaseBatch::new();
         for i in 0..page_count
         {
             let virt = virt_base + (i * PAGE_SIZE) as u64;
@@ -861,6 +893,7 @@ impl AddressSpace
                 {
                     unmap_user_page(self.root_virt, virt);
                     unmapped += 1;
+                    self.batch_cleared_frame(&mut batch, phys, virt_base, page_count);
                 }
             }
         }
@@ -870,7 +903,56 @@ impl AddressSpace
             self.invalidate_unmapped_span(virt_base, page_count);
         }
         crate::percpu::preempt_enable();
+        batch.release_into(&crate::mm::frame_map::FRAME_MAP);
         unmapped
+    }
+
+    /// Add the frame of a leaf just cleared from the span `[virt_base, +
+    /// page_count pages)` to `batch`, whose counts are lowered once the
+    /// clearing walk's TLB invalidation completes
+    /// (core/kernel/docs/memory-internals.md § Frame Map Table). A full batch is
+    /// first drained behind an invalidation of the whole span on every CPU that
+    /// runs this address space, which covers every leaf cleared so far.
+    ///
+    /// Must run with preemption disabled.
+    #[cfg(not(test))]
+    fn batch_cleared_frame(
+        &self,
+        batch: &mut crate::mm::frame_map::ReleaseBatch,
+        phys: u64,
+        virt_base: u64,
+        page_count: usize,
+    )
+    {
+        if !batch.push(phys)
+        {
+            self.invalidate_unmapped_span(virt_base, page_count);
+            batch.release_into(&crate::mm::frame_map::FRAME_MAP);
+            let _ = batch.push(phys);
+        }
+    }
+
+    /// Lower the frame-map count of every frame this address space's user half
+    /// still maps (core/kernel/docs/memory-internals.md § Frame Map Table).
+    /// Leaves the page tables as they are.
+    ///
+    /// Run by the `AddressSpace` teardown once no CPU has the space loaded and
+    /// every bound thread is stopped, so no leaf can be used again: the tag is
+    /// flushed before any later space runs under it.
+    ///
+    /// # Safety
+    /// The address space is being reclaimed: no CPU has it active, no thread
+    /// can run in it, and nothing maps or unmaps in it any more.
+    #[cfg(not(test))]
+    pub unsafe fn release_mapped_frames(&self)
+    {
+        // SAFETY: root_virt is this space's valid root; nothing modifies its
+        // tables during the walk (contract).
+        unsafe {
+            crate::arch::current::paging::for_each_user_leaf(self.root_virt, &mut |phys| {
+                crate::mm::frame_map::lower(phys);
+            });
+        }
     }
 
     /// Invalidate the TLB entries of `[virt_base, + page_count pages)` on this
@@ -984,7 +1066,12 @@ impl AddressSpace
         // pool.
         // SAFETY: root_virt is valid; aso wraps this AS; the span is user-range
         // (caller's contract); pt_lock is held.
-        let freed = unsafe { unmap_user_region_pooled(self.root_virt, virt_base, page_count, aso) };
+        let mut batch = crate::mm::frame_map::ReleaseBatch::new();
+        let freed = unsafe {
+            unmap_user_region_pooled(self.root_virt, virt_base, page_count, aso, &mut |phys| {
+                self.batch_cleared_frame(&mut batch, phys, virt_base, page_count);
+            })
+        };
 
         // ONE coarse shootdown for the whole teardown, performed UNDER pt_lock
         // (the per-VA `unmap_page` drops the lock first for throughput; here it
@@ -1083,6 +1170,8 @@ impl AddressSpace
 
         self.pt_unlock();
         crate::percpu::preempt_enable();
+        // The shootdown above covers every leaf the walk cleared.
+        batch.release_into(&crate::mm::frame_map::FRAME_MAP);
         freed
     }
 

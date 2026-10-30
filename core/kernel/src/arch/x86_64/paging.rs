@@ -928,7 +928,8 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 /// Unmap every 4 KiB leaf in `[virt_base, virt_base + page_count*4 KiB)` and
 /// reclaim each intermediate table the cleared span leaves empty back to
 /// `aso`'s page-table growth pool. Returns the number of PT/PD/PDPT frames
-/// freed.
+/// freed. Passes the frame of each present leaf it clears to `on_leaf`, in VA
+/// order, after the clear.
 ///
 /// Walks PML4 → PDPT → PD → PT over the span, clearing in-range leaf PTEs. A
 /// table is freed only when it is fully empty afterwards **and** its parent
@@ -957,6 +958,7 @@ pub unsafe fn unmap_user_region_pooled(
     virt_base: u64,
     page_count: usize,
     aso: &crate::cap::object::AddressSpaceObject,
+    on_leaf: &mut dyn FnMut(u64),
 ) -> usize
 {
     use crate::mm::PAGE_SIZE;
@@ -1007,7 +1009,12 @@ pub unsafe fn unmap_user_region_pooled(
                             let mut va1 = va2;
                             while va1 < l2_end
                             {
+                                let leaf = pt[pt_index(va1)];
                                 pt[pt_index(va1)] = PageTableEntry(0);
+                                if leaf.is_present()
+                                {
+                                    on_leaf(leaf.phys_addr());
+                                }
                                 va1 += p;
                             }
                             if table_is_empty(pt) && e2.0 & POOLED_TABLE != 0
@@ -1043,6 +1050,49 @@ pub unsafe fn unmap_user_region_pooled(
     }
 
     freed
+}
+
+/// Pass the frame of every present 4 KiB leaf in the user half (PML4 slots
+/// 0..256) of the page table rooted at `root_virt` to `on_leaf`, changing
+/// nothing. Large-page leaves are skipped, as in [`unmap_user_region_pooled`]:
+/// the user mapping path never installs one.
+///
+/// Drives the frame-map release of an address space's teardown
+/// (`AddressSpace::release_mapped_frames`).
+///
+/// # Safety
+/// `root_virt` must be the direct-map VA of a valid 4 KiB PML4 frame whose
+/// tables no other CPU modifies during the walk.
+#[cfg(not(test))]
+pub unsafe fn for_each_user_leaf(root_virt: u64, on_leaf: &mut dyn FnMut(u64))
+{
+    use crate::mm::paging::phys_to_virt;
+
+    // SAFETY: root_virt is the direct-map VA of a valid PML4 (caller's contract).
+    let pml4 = unsafe { table_at(root_virt) };
+    for e4 in &pml4[..256]
+    {
+        if !e4.is_present()
+        {
+            continue;
+        }
+        // SAFETY: a present PML4E points at a live PDPT frame.
+        let pdpt = unsafe { table_at(phys_to_virt(e4.phys_addr())) };
+        for e3 in pdpt.iter().filter(|e| e.is_present() && e.0 & LARGE_PAGE == 0)
+        {
+            // SAFETY: a present non-large PDPTE points at a live PD frame.
+            let pd = unsafe { table_at(phys_to_virt(e3.phys_addr())) };
+            for e2 in pd.iter().filter(|e| e.is_present() && e.0 & LARGE_PAGE == 0)
+            {
+                // SAFETY: a present non-large PDE points at a live PT frame.
+                let pt = unsafe { table_at(phys_to_virt(e2.phys_addr())) };
+                for leaf in pt.iter().filter(|e| e.is_present())
+                {
+                    on_leaf(leaf.phys_addr());
+                }
+            }
+        }
+    }
 }
 
 /// x86-64 implementation of [`crate::mm::paging::unmap_identity_page`].

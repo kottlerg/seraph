@@ -400,6 +400,15 @@ unsafe fn kernel_entry_post_rebase(
     #[cfg(not(test))]
     entropy::init_storage(boot_cpu_count, allocator);
 
+    // Allocate the frame map table (per-frame user-mapping counts,
+    // core/kernel/docs/memory-internals.md § Frame Map Table) before the
+    // Phase-7 drain, while the buddy still holds 1 MiB blocks, and before
+    // Phase 9 installs the first user mapping.
+    let (dram_bottom, dram_top) = mm::init::dram_bounds();
+    // SAFETY: the single boot thread, once, after Phase 3 and before any user
+    // mapping or the Phase-7 drain.
+    unsafe { mm::frame_map::init(allocator, dram_bottom, dram_top) };
+
     // Initialize the CPU-to-hardware-id mapping (wakeup and shootdown IPI
     // targets, and the riscv64 PLIC context of each hart). Before Phase 5:
     // riscv64 `interrupts::init` routes the PLIC to the BSP's hart id.

@@ -98,12 +98,29 @@ pub fn system_ram_bytes() -> u64
     SYSTEM_RAM_BYTES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Lowest and highest DRAM addresses (`compute_dram_bounds`), captured by
+/// [`print_memory_map`]. Read once at Phase 4 to size the frame map table.
+static DRAM_BOUNDS: [core::sync::atomic::AtomicU64; 2] =
+    [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)];
+
+/// The `[bottom, top)` span of DRAM-typed memory-map entries, `(0, 0)` until
+/// [`print_memory_map`] runs at early boot or when the map holds no DRAM.
+#[must_use]
+pub fn dram_bounds() -> (u64, u64)
+{
+    (
+        DRAM_BOUNDS[0].load(core::sync::atomic::Ordering::Relaxed),
+        DRAM_BOUNDS[1].load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Print the physical memory map from the bootloader to the serial console.
 ///
 /// Prints one line per run of contiguous same-type entries (address range,
 /// size in KiB, type), then a DRAM summary broken down by type in scaled
 /// units (KiB/MiB/GiB), plus persistent and MMIO lines when non-zero.
-/// Records the DRAM total for [`system_ram_bytes`].
+/// Records the DRAM total for [`system_ram_bytes`] and the DRAM span for
+/// [`dram_bounds`].
 ///
 /// Must be called before Phase 3 activates the kernel page tables; the
 /// `memory_map.entries` pointer is a physical address covered by the
@@ -129,6 +146,8 @@ pub fn print_memory_map(info: &BootInfo)
     let mut persistent_bytes: u64 = 0;
 
     let (dram_bottom, dram_top) = compute_dram_bounds(entries);
+    DRAM_BOUNDS[0].store(dram_bottom, core::sync::atomic::Ordering::Relaxed);
+    DRAM_BOUNDS[1].store(dram_top, core::sync::atomic::Ordering::Relaxed);
     let mut mmio_bytes: u64 = 0;
 
     // Merge contiguous entries of the same type to reduce output volume.

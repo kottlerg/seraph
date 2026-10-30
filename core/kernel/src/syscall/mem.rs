@@ -122,10 +122,17 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidArgument);
     }
 
-    // Retype/map boundary (docs/capability-model.md § Typed Memory): every
-    // live retype lies below the bump cursor at the time of this check, so a
-    // range at or above the page-rounded cursor holds none. A retype that
-    // bumps into the range after this check is the converse order, #577.
+    // Retype/map boundary (docs/capability-model.md § Typed Memory). Pin the
+    // range's frames in the frame map first, then read the bump cursor: a
+    // retype publishes its cursor before it reads the frame map, so with the
+    // fences on both sides either this map sees the retype's cursor or the
+    // retype sees the pin (core/kernel/docs/memory-internals.md § Frame Map
+    // Table). Every live retype lies below the cursor, so a range at or above
+    // the page-rounded cursor holds none, and none can be carved under the
+    // pinned frames while this call maps them. The pins drop when the call
+    // returns; each installed leaf holds its own count.
+    let pins = FramePins::pin(memory_phys + byte_offset, page_count)?;
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     let retyped_end = crate::cap::retype::current_bump(memory_ref)
         .div_ceil(PAGE_SIZE as u64)
         .saturating_mul(PAGE_SIZE as u64);
@@ -212,7 +219,52 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
         result.map_err(|()| SyscallError::OutOfMemory)?;
     }
 
+    drop(pins);
     Ok(0)
+}
+
+/// Frame-map pins over a span of frames, held by `sys_mem_map` from before its
+/// retype-cursor check until it returns, and dropped (each count lowered) when
+/// the guard drops.
+#[cfg(not(test))]
+struct FramePins
+{
+    phys: u64,
+    pages: usize,
+}
+
+#[cfg(not(test))]
+impl FramePins
+{
+    /// Raise the count of each of the `pages` frames from `phys`.
+    ///
+    /// # Errors
+    /// `OutOfMemory` when a frame's count is saturated; nothing stays pinned.
+    fn pin(phys: u64, pages: usize) -> Result<Self, SyscallError>
+    {
+        let page = crate::mm::PAGE_SIZE as u64;
+        let mut pins = Self { phys, pages: 0 };
+        while pins.pages < pages
+        {
+            crate::mm::frame_map::raise(phys + pins.pages as u64 * page)
+                .map_err(|()| SyscallError::OutOfMemory)?;
+            pins.pages += 1;
+        }
+        Ok(pins)
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for FramePins
+{
+    fn drop(&mut self)
+    {
+        let page = crate::mm::PAGE_SIZE as u64;
+        for i in 0..self.pages
+        {
+            crate::mm::frame_map::lower(self.phys + i as u64 * page);
+        }
+    }
 }
 
 // Test stub.

@@ -12,6 +12,7 @@
 
 pub mod address_space;
 pub mod buddy;
+pub mod frame_map;
 pub mod init;
 pub mod init_reloc;
 pub mod kernel_pt_pool;

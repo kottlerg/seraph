@@ -600,13 +600,19 @@ the objects the kernel carves from its own SEED reserve on a process's
 behalf: range-split children, Mmio and IoPort copies (bounded per range
 lineage, see [Mmio](#mmio)), and per-thread port-binding tables.
 
-A Memory capability cannot map bytes it has retyped into kernel objects. Retype carves a cap's
-region upward from its first byte, so every live kernel object retyped from it lies below its
-retype bump cursor, and `mem_map` refuses any range that starts below that cursor, rounded up to
-a page (the same bound `SYS_MEMORY_SPLIT` applies), so kernel state carved from donated memory
-(slot pages, page tables, wrapper and page-pool record pages) is never reachable through a
-mapping made afterwards. The converse order, a retype into pages the cap already maps, is not
-yet refused ([#577](https://github.com/kottlerg/seraph/issues/577)).
+Kernel objects and user mappings never share a page, in either order. A Memory capability
+cannot map bytes it has retyped into kernel objects: retype carves a cap's region upward from its
+first byte, so every live kernel object retyped from it lies below its retype bump cursor, and
+`mem_map` refuses any range that starts below that cursor, rounded up to a page (the same bound
+`SYS_MEMORY_SPLIT` applies). Nor can a retype carve a page that is already mapped: the kernel
+counts the user mappings of every frame of RAM, and a retype whose cursor would advance over a
+page any address space maps, through any capability to it, fails with `OutOfMemory` and changes
+nothing; the page is retypable again once its last mapping is unmapped or its address space is
+destroyed. So kernel state carved from donated memory (slot pages, page tables, wrapper and
+page-pool record pages) is never reachable through a user mapping, whichever came first, and
+whatever splits and merges the region went through between them (see
+[core/kernel/docs/memory-internals.md](../core/kernel/docs/memory-internals.md#frame-map-table)
+§ Frame Map Table).
 
 ### Available-bytes ledger
 

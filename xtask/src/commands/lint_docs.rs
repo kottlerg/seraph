@@ -12,8 +12,8 @@
 //! `## Summarized By` section's shape and forward links, document
 //! reachability, and that every name docs/testing.md § Coverage tiers lists
 //! for its surface screens still names code or a file in the tree. Whether a
-//! passage is a summary, or a statement matches the code, stays with the
-//! pre-merge review.
+//! passage is a summary, or any other statement matches the code, stays with
+//! the pre-merge review.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -989,60 +989,90 @@ fn listed_names(text: &str) -> std::result::Result<Vec<ListedName>, String>
     let (start, end) = surface_range(text)?;
     let mut names = Vec::new();
     let mut in_fence = false;
-    // A code span may wrap across lines: (start line, text so far).
-    let mut span: Option<(usize, String)> = None;
+    let mut spans = CodeSpans::default();
     for (idx, line) in text.lines().enumerate().take(end).skip(start)
     {
         if line.trim_start().starts_with("```")
         {
             in_fence = !in_fence;
-            continue;
         }
-        if in_fence
+        else if in_fence
         {
-            if let Some(found) = screen_names(line)
-            {
-                names.extend(found.into_iter().map(|p| ListedName {
-                    line: idx + 1,
-                    shown: p.clone(),
-                    pattern: p,
-                    kind: NameKind::Symbol,
-                }));
-                continue;
-            }
-            for token in line.split_whitespace()
-            {
-                let token = token.trim_matches(|c| c == '\'' || c == '"');
-                if is_path_span(token)
-                {
-                    names.push(ListedName {
-                        line: idx + 1,
-                        shown: token.to_owned(),
-                        pattern: token.to_owned(),
-                        kind: NameKind::Path,
-                    });
-                }
-            }
-            continue;
+            names.extend(fenced_names(idx + 1, line));
         }
+        else
+        {
+            names.extend(
+                spans
+                    .read(idx + 1, line)
+                    .into_iter()
+                    .filter_map(|(at, content)| prose_name(at, &content)),
+            );
+        }
+    }
+    Ok(names)
+}
+
+/// The names one line inside a screen fence states: a screen variable's
+/// alternatives, or the `.rs` paths among its words.
+fn fenced_names(line_no: usize, line: &str) -> Vec<ListedName>
+{
+    if let Some(found) = screen_names(line)
+    {
+        return found
+            .into_iter()
+            .map(|p| ListedName {
+                line: line_no,
+                shown: p.clone(),
+                pattern: p,
+                kind: NameKind::Symbol,
+            })
+            .collect();
+    }
+    line.split_whitespace()
+        .map(|token| token.trim_matches(|c| c == '\'' || c == '"'))
+        .filter(|token| is_path_span(token))
+        .map(|token| ListedName {
+            line: line_no,
+            shown: token.to_owned(),
+            pattern: token.to_owned(),
+            kind: NameKind::Path,
+        })
+        .collect()
+}
+
+/// Inline code spans of prose read line by line; a span may wrap across lines
+/// but not across a paragraph break.
+#[derive(Default)]
+struct CodeSpans
+{
+    /// The open span: its 1-based start line and its text so far.
+    open: Option<(usize, String)>,
+}
+
+impl CodeSpans
+{
+    /// Feed one prose line; returns the spans it closes, each with its start line.
+    fn read(&mut self, line_no: usize, line: &str) -> Vec<(usize, String)>
+    {
+        let mut closed = Vec::new();
         if line.trim().is_empty()
         {
-            // A code span does not cross a paragraph break.
-            span = None;
-            continue;
+            self.open = None;
+            return closed;
         }
         for (i, piece) in line.split('`').enumerate()
         {
             if i > 0
             {
                 // A backtick: close the open span, or open one.
-                match span.take()
+                match self.open.take()
                 {
-                    Some((at, content)) => names.extend(prose_name(at, &content)),
-                    None => span = Some((idx + 1, String::new())),
+                    Some(span) => closed.push(span),
+                    None => self.open = Some((line_no, String::new())),
                 }
             }
-            if let Some((_, content)) = span.as_mut()
+            if let Some((_, content)) = self.open.as_mut()
             {
                 if i == 0 && !content.is_empty()
                 {
@@ -1051,30 +1081,25 @@ fn listed_names(text: &str) -> std::result::Result<Vec<ListedName>, String>
                 content.push_str(piece);
             }
         }
+        closed
     }
-    Ok(names)
 }
 
 /// The listed name a prose code span states, if it is one.
 fn prose_name(line: usize, content: &str) -> Option<ListedName>
 {
     let content = content.trim();
-    let kind = if is_path_span(content)
+    let (kind, pattern) = if is_path_span(content)
     {
-        NameKind::Path
+        (NameKind::Path, content.to_owned())
     }
     else if is_symbol_span(content)
     {
-        NameKind::Symbol
+        (NameKind::Symbol, prose_symbol_pattern(content))
     }
     else
     {
         return None;
-    };
-    let pattern = match kind
-    {
-        NameKind::Symbol => prose_symbol_pattern(content),
-        NameKind::Path => content.to_owned(),
     };
     Some(ListedName {
         line,
@@ -1085,6 +1110,8 @@ fn prose_name(line: usize, content: &str) -> Option<ListedName>
 }
 
 /// `text` with every `//` comment removed, from the `//` to the end of its line.
+/// A `//` inside a string literal (a URL) also cuts the line; that can only hide
+/// a name and fail the check, never pass a name that is gone.
 fn strip_line_comments(text: &str) -> String
 {
     let mut out = String::with_capacity(text.len());
@@ -1098,7 +1125,7 @@ fn strip_line_comments(text: &str) -> String
 
 /// Whether the path pattern `pattern` (`*` within one component) names a
 /// tracked file; a pattern without `/` is a file name in any directory.
-fn path_resolves(pattern: &str, tracked: &[String]) -> bool
+fn path_resolves(pattern: &str, tracked: &[String]) -> std::result::Result<bool, regex::Error>
 {
     let anchor = if pattern.contains('/')
     {
@@ -1108,18 +1135,41 @@ fn path_resolves(pattern: &str, tracked: &[String]) -> bool
     {
         "(?:^|/)"
     };
-    let re = format!(
+    let re = Regex::new(&format!(
         "{anchor}{}$",
         regex::escape(pattern).replace(r"\*", "[^/]*")
-    );
-    Regex::new(&re).is_ok_and(|re| tracked.iter().any(|p| re.is_match(p)))
+    ))?;
+    Ok(tracked.iter().any(|p| re.is_match(p)))
+}
+
+/// Whether the symbol pattern `pattern` matches, as a whole word, in `code`.
+fn symbol_resolves(pattern: &str, code: &str) -> std::result::Result<bool, regex::Error>
+{
+    Ok(Regex::new(&format!(r"(?-u:\b)(?:{pattern})(?-u:\b)"))?.is_match(code))
+}
+
+/// Why `name` fails to resolve, or `None` when it resolves.
+fn unresolved(name: &ListedName, code: &str, tracked: &[String]) -> Option<&'static str>
+{
+    let resolved = match name.kind
+    {
+        NameKind::Symbol => symbol_resolves(&name.pattern, code),
+        NameKind::Path => path_resolves(&name.pattern, tracked),
+    };
+    match (resolved, &name.kind)
+    {
+        (Ok(true), _) => None,
+        (Ok(false), NameKind::Symbol) => Some("names nothing in the code of a tracked Rust source"),
+        (Ok(false), NameKind::Path) => Some("names no tracked file"),
+        (Err(_), _) => Some("is not a valid regular expression"),
+    }
 }
 
 /// The listed names of docs/testing.md § Coverage tiers resolve: every symbol
 /// the surface list names matches, as a whole word, the code of a tracked Rust
-/// source outside `xtask/` (comments stripped), and every listed path names a
-/// tracked file. A name left only in a comment, or in a file that is gone, is
-/// one the screen can no longer find.
+/// source outside `xtask/` with `//` comments stripped, and every listed path
+/// names a tracked file. A name left only in a `//` comment, or in a file that
+/// is gone, is one the screen can no longer find.
 fn check_coverage_symbols(
     markdown: &[&SourceFile],
     sources: &[&SourceFile],
@@ -1147,31 +1197,19 @@ fn check_coverage_symbols(
         .filter(|f| has_ext(&f.path, "rs") && !f.path.starts_with("xtask/"))
         .map(|f| strip_line_comments(&f.text))
         .collect();
-    let mut diags = Vec::new();
-    for name in &names
-    {
-        let resolves = match name.kind
-        {
-            NameKind::Symbol => Regex::new(&format!(r"(?-u:\b)(?:{})(?-u:\b)", name.pattern))
-                .is_ok_and(|re| re.is_match(&code)),
-            NameKind::Path => path_resolves(&name.pattern, tracked),
-        };
-        if !resolves
-        {
-            let what = match name.kind
-            {
-                NameKind::Symbol => "names nothing in the code of a tracked Rust source",
-                NameKind::Path => "names no tracked file",
-            };
-            diags.push(Diagnostic::new(
-                rule,
-                &doc.path,
-                name.line,
-                format!("`{}`, listed in § Coverage tiers, {what}", name.shown),
-            ));
-        }
-    }
-    diags
+    names
+        .iter()
+        .filter_map(|name| {
+            unresolved(name, &code, tracked).map(|why| {
+                Diagnostic::new(
+                    rule,
+                    &doc.path,
+                    name.line,
+                    format!("`{}`, listed in § Coverage tiers, {why}", name.shown),
+                )
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1525,7 +1563,7 @@ mod tests
             COVERAGE_DOC,
             &format!(
                 "# Testing\n\n## Coverage tiers\n\n`gone_before_the_list` is outside it.\n\n\
-                 **Boundary surface.** The surface is `core/a/*/tramp.rs` as a whole and\n\
+                 **Boundary surface.** The surface is `core/a/*/tramp.rs` (`tramp.rs`) as a whole and\n\
                  `info.cpu_count`, `per_cpu_init_*`, the `git grep -n -E\n'x|y' <head>` \
                  command, `--runs 1`,{extra} and `frame::init`.\n\n\
                  ```sh\n\
@@ -1610,7 +1648,72 @@ mod tests
     }
 
     #[test]
-    fn coverage_list_without_its_bounding_paragraphs_is_reported()
+    fn coverage_bare_file_name_resolves_in_any_directory_but_an_unknown_one_is_reported()
+    {
+        let diags = coverage_check(&coverage_doc(" `tramp.rs`, `gone.rs`,", ""));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].1.contains("`gone.rs`"), "{}", diags[0].1);
+    }
+
+    #[test]
+    fn coverage_malformed_screen_alternative_is_reported_as_an_invalid_pattern()
+    {
+        let diags = coverage_check(&coverage_doc("", "|send_(wake"));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0].1.contains("not a valid regular expression"),
+            "{}",
+            diags[0].1
+        );
+    }
+
+    #[test]
+    fn coverage_list_without_its_section_heading_is_reported()
+    {
+        let doc = coverage_doc("", "");
+        let doc = md(
+            COVERAGE_DOC,
+            &doc.text.replace("## Coverage tiers", "## Coverage"),
+        );
+        let diags = coverage_check(&doc);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].1.contains("## Coverage tiers"), "{}", diags[0].1);
+    }
+
+    #[test]
+    fn coverage_list_without_its_boundary_surface_paragraph_is_reported()
+    {
+        let doc = coverage_doc("", "");
+        let doc = md(
+            COVERAGE_DOC,
+            &doc.text
+                .replace("**Boundary surface.**", "Boundary surface."),
+        );
+        let diags = coverage_check(&doc);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0].1.contains("**Boundary surface.**"),
+            "{}",
+            diags[0].1
+        );
+    }
+
+    #[test]
+    fn coverage_check_without_the_testing_document_is_reported()
+    {
+        let other = md("docs/other.md", "# Other\n");
+        let diags = check_coverage_symbols(&[&other], &[], &[]);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].path, COVERAGE_DOC);
+        assert!(
+            diags[0].message.contains("not a tracked document"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn coverage_list_without_its_repeat_count_paragraph_is_reported()
     {
         let doc = coverage_doc("", "");
         let doc = md(

@@ -114,24 +114,22 @@ slot stays zero.
 | `caps[2]` | `devmgr.registry` | devmgr deny phases                     |
 | `caps[3]` | `devmgr.test`     | devmgr orphan-teardown, drivers deny   |
 
-The svcmgr seed-only phase also reads every slot and fails when any is zero, as evidence that
-its name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the
-devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE`,
-`QUERY_SHUTDOWN_DEVICE`, `TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, and `TEST_QUERY_DENY_DEVICE`.
-`caps[3]` exists for
-devmgr's test labels (TODO(#165): retire with them): the orphan-teardown phase's
-`TEST_SPAWN_ORPHAN` shim, and `TEST_QUERY_DENY_DEVICE`, which hands the drivers deny phase a SEND
-on the serial, input, or framebuffer driver's endpoint badged with none of the driver's verb bits.
-That phase requires an `UNAUTHORIZED` reply to `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`,
-`SERIAL_REGISTER_RX_NOTIFY`, and `INPUT_READ_EVENTS` (at once, without blocking for a key), and to
-`FB_WRITE_BYTES` and `FB_SET_ATTRS` when a framebuffer driver runs; on a headless boot, CI's,
-devmgr runs none and the framebuffer case logs a skip. The input case also logs a skip when
-`terminal.svc` is staged: the input driver serves one request at a time and the terminal keeps a
-blocking read pending, so the deny would wait behind it for a keypress.
-Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is public, so
-svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap` and spends
-no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED` reply
-to `SHUTDOWN`.
+The svcmgr seed-only phase also reads every slot and fails when any is zero, as evidence that its
+name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the devmgr deny
+phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE`, `QUERY_SHUTDOWN_DEVICE`,
+`TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, and `TEST_QUERY_DENY_DEVICE`. `caps[3]` exists for
+devmgr's test labels (TODO(#165): retire with them): the orphan-teardown phase's `TEST_SPAWN_ORPHAN`
+shim, and `TEST_QUERY_DENY_DEVICE`, which hands the drivers deny phase a SEND on the serial, input,
+or framebuffer driver's endpoint badged with none of the driver's verb bits. That phase requires an
+`UNAUTHORIZED` reply to `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, `SERIAL_REGISTER_RX_NOTIFY`, and
+`INPUT_READ_EVENTS` (at once, without blocking for a key), and to `FB_WRITE_BYTES` and
+`FB_SET_ATTRS` when a framebuffer driver runs; on a headless boot, CI's, devmgr runs none and the
+framebuffer case logs a skip. The input case also logs a skip when `terminal.svc` is staged: the
+input driver serves one request at a time and the terminal keeps a blocking read pending, so the
+deny would wait behind it for a keypress. Every seed is seed-only in svcmgr's registry. The
+no-authority `pwrmgr.deny` cap is public, so svctest resolves it through `QUERY_ENDPOINT` on its
+per-process `service_registry_cap` and spends no seed slot on it; it drives the pwrmgr cap-deny
+phase, which requires an `UNAUTHORIZED` reply to `SHUTDOWN`.
 
 ---
 

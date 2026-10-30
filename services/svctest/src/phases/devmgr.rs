@@ -10,7 +10,8 @@
 //! carrying `REGISTRY_QUERY_AUTHORITY` but none of `BLOCK_DEVICE_AUTHORITY`,
 //! `SHUTDOWN_DEVICE_AUTHORITY`, and `TEST_LABEL_AUTHORITY`, and assert
 //! `UNAUTHORIZED`: such a holder cannot acquire the whole-disk block cap or
-//! the platform shutdown actuators, or drive the test shim.
+//! the platform shutdown actuators, or drive devmgr's test labels (the
+//! `TEST_SPAWN_ORPHAN` shim and `TEST_QUERY_DENY_DEVICE`).
 //!
 //! The teardown phase drives devmgr's temporary `TEST_SPAWN_ORPHAN` shim to
 //! force a round-2 bootstrap failure in a fault-injection driver that hangs

@@ -44,7 +44,7 @@ A filesystem driver exposes one IPC endpoint, used as both:
 - the un-badged **service endpoint** (vfsd holds a SEND, derives
   per-node badged SENDs); and
 - the un-badged **namespace endpoint** routed through
-  [`namespace_protocol::dispatch_request`] for `NS_*` dispatch.
+  `namespace_protocol::dispatch_request` for `NS_*` dispatch.
 
 vfsd delivers the endpoint cap (all rights: receive and badge
 derivation) in the driver's bootstrap round; see
@@ -52,8 +52,8 @@ derivation) in the driver's bootstrap round; see
 kernel-derivation parent for every node cap the driver ever issues
 via `cap_derive_badge`.
 
-Numeric label values live in [`ipc::fs_labels`] (this document) and
-[`ipc::ns_labels`] (namespace-protocol document).
+Numeric label values live in `ipc::fs_labels` (this document) and
+`ipc::ns_labels` (namespace-protocol document).
 
 ---
 

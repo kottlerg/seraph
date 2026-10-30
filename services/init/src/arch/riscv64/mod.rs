@@ -13,6 +13,9 @@ pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_RISCV;
 const UART_PHYS: u64 = 0x1000_0000;
 const SERIAL_VA: u64 = 0x0000_0000_3000_0000;
 static mut UART_BASE: u64 = 0;
+/// The Mmio cap slot `serial_init` mapped the UART aperture through; 0 until
+/// it maps one.
+static mut UART_MMIO_CAP: u32 = 0;
 
 /// Initialise UART serial output via MMIO.
 ///
@@ -60,6 +63,7 @@ pub fn serial_init(info: &InitInfo, _thread_cap: u32)
     // SAFETY: single-threaded init; UART MMIO programming. The full
     // aperture is mapped at SERIAL_VA; UART sits at uart_offset inside it.
     unsafe {
+        UART_MMIO_CAP = slot;
         UART_BASE = uart_va;
         let ptr = uart_va as *mut u8;
         core::ptr::write_volatile(ptr.add(1), 0x00);
@@ -67,6 +71,28 @@ pub fn serial_init(info: &InitInfo, _thread_cap: u32)
         core::ptr::write_volatile(ptr, 0x01);
         core::ptr::write_volatile(ptr.add(1), 0x00);
         core::ptr::write_volatile(ptr.add(3), 0x03);
+    }
+}
+
+/// Release init's serial mapping: delete the Mmio cap `serial_init` mapped the
+/// UART aperture through, which unmaps it and drops the reference its mapping
+/// record holds on init's address space, so the reap's delete of that address
+/// space frees it and its mappings of the frames init donates
+/// (`docs/process-lifecycle.md` § Init reap). Later serial writes are dropped.
+///
+/// Called by init-logd as it exits after the handover, when no thread of init
+/// writes the UART again: the main thread logs through init-logd once it runs.
+pub fn serial_release()
+{
+    // SAFETY: init-logd's exit is the last serial use; no other thread reads
+    // or writes these statics afterwards.
+    let slot = unsafe {
+        UART_BASE = 0;
+        UART_MMIO_CAP
+    };
+    if slot != 0
+    {
+        let _ = syscall::cap_delete(slot);
     }
 }
 

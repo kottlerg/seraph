@@ -76,8 +76,9 @@ direct console paths remain as fallbacks for the life of the system.
    output, routed here via a `std::os::seraph::set_panic_sink` sink rather than
    the log endpoint logd serves (logd deletes its seeded `log_send_cap` at
    startup so a fault cannot self-IPC into it). Outside the serial driver,
-   UART hardware authority is held only by init, whose init-logd thread uses it, and by
-   devmgr, whose I/O-port and MMIO caps it carves the driver's cap from.
+   UART hardware authority is held only by init, whose init-logd thread uses it (on riscv64 until
+   init-logd exits after the handover and deletes init's UART Mmio capability), and by devmgr,
+   whose I/O-port and MMIO caps it carves the driver's cap from.
 
    real-logd is declared restartable (`restart = on_failure`; see
    [services/logd/README.md](../services/logd/README.md)); a working logd restart is design

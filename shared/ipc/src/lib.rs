@@ -294,7 +294,9 @@ pub mod procmgr_labels
 
     /// Register a death-notification `EventQueue` cap (`caps[0]`, POST
     /// right) with procmgr, which binds it as a second death observer on
-    /// every supervised thread, so the kernel posts each death to it.
+    /// the main thread of every supervised process (threads a process
+    /// creates itself carry no binding), so the kernel posts each
+    /// process's main-thread death to it.
     /// Real-logd uses it to evict the slot of a dead sender. Specified,
     /// with its replies, in `services/procmgr/docs/ipc-interface.md`
     /// § `REGISTER_DEATH_EQ` — install logd's death observer.

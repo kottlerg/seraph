@@ -100,9 +100,11 @@ fn choose_image_bias_or_default() -> u64
 /// Logd's death-notification `EventQueue` cap, registered via
 /// `procmgr_labels::REGISTER_DEATH_EQ` once real-logd is up. Zero
 /// until then. Read in `finalize_creation` to bind logd as a second
-/// death observer on every newly spawned child; on registration,
-/// retroactively bound to every existing process table entry by
-/// `bind_logd_eq_to_existing` so logd does not miss prior children.
+/// death observer on the main thread of every newly spawned child; on
+/// registration, retroactively bound to the main thread of every
+/// existing process table entry by `install_logd_death_eq` so logd does
+/// not miss prior children. Threads a process creates itself carry no
+/// logd binding.
 ///
 /// Single-writer (the `REGISTER_DEATH_EQ` handler runs under
 /// procmgr's single-threaded dispatch); readers race only with the
@@ -111,8 +113,9 @@ fn choose_image_bias_or_default() -> u64
 pub static LOGD_DEATH_EQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Install logd's death-notification EQ cap and retroactively bind it
-/// as a second observer on every thread currently in the process
-/// table. Called by `REGISTER_DEATH_EQ`'s handler.
+/// as a second observer on the main thread (`entry.thread_cap`) of
+/// every process currently in the process table. Called by
+/// `REGISTER_DEATH_EQ`'s handler.
 ///
 /// First-wins semantics: returns `false` (and changes nothing) if a
 /// previous registration already filled the slot. This mitigates the

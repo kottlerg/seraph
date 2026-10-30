@@ -77,7 +77,7 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
      [`apply_namespace_policy`](#shared-spawn-primitives).
    * Start the child via [`start_process`](#shared-spawn-primitives)
      (`START_PROCESS`).
-   * Serve the restart bootstrap round, re-resolving the recipe's
+   * Serve the restart bootstrap rounds, re-resolving the recipe's
      `seed` names from the discovery registry in declaration order.
    * Rebind death-notification on the new thread cap using the same
      correlator so subsequent crashes route back to the same entry.

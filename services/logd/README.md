@@ -106,12 +106,12 @@ logd/
 
 ## Bootstrap caps
 
-svcmgr's bootstrap round (one round, `done = true`) fills four positional slots, carrying only
-the present caps and a presence word naming the slot each fills (an absent slot reads as `0`),
-minted from the reserved log-sink sources svcmgr holds (master-log
-endpoint, procmgr `SEND|GRANT`, devmgr registry; see
-[`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md)
-and [`docs/ipc-interface.md`](docs/ipc-interface.md)):
+svcmgr's bootstrap rounds (four slots fit one round, marked `done`) fill four positional slots,
+carrying only the present caps and a presence word naming the slot each fills (an absent slot reads
+as `0`), minted from the reserved log-sink sources svcmgr holds (master-log endpoint, procmgr
+`SEND|GRANT`, devmgr registry; see
+[`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md) and
+[`docs/ipc-interface.md`](docs/ipc-interface.md)):
 
 | Index | Cap |
 |---|---|

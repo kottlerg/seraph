@@ -177,11 +177,13 @@ fn main() -> !
 }
 
 /// Capacity of logd's death-notification `EventQueue`: procmgr's own death
-/// queue's (`MAX_PROCESSES * 2`, `services/procmgr/src/main.rs`). A full
-/// queue drops the kernel's post (the death and its slot are lost to logd),
-/// and both queues observe the same main-thread deaths, so at this capacity
-/// logd drops a death only when procmgr's reap queue would drop it too, and
-/// the capacity follows procmgr's process table as it grows.
+/// queue's (`MAX_PROCESSES * 2`, `services/procmgr/src/main.rs`), so a burst
+/// of deaths procmgr's queue absorbs fits here too, provided logd drains
+/// before more deaths arrive, and the capacity follows procmgr's process
+/// table as it grows. The two queues drain independently, so a slow logd
+/// drain can still fill this one: the kernel then drops the post, the
+/// sender's slot is never evicted, and [`drain_deaths`] reports the full
+/// drain after the fact.
 const DEATH_EQ_CAPACITY: u32 = (procmgr_process_table::MAX_PROCESSES * 2) as u32;
 
 /// Allocate the slab and create the death-notification `EventQueue` of

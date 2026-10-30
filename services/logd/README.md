@@ -76,7 +76,13 @@ targets; only the one-time init-logd history pull
   When a process exits, logd's EQ receives
   `(process_badge << 32) | exit_reason`; logd evicts the matching
   slot from its hash-keyed badge table (see
-  [`docs/ipc-interface.md`](docs/ipc-interface.md)).
+  [`docs/ipc-interface.md`](docs/ipc-interface.md)). The EQ's capacity is
+  procmgr's own death queue's, `MAX_PROCESSES * 2`, read from procmgr's
+  `procmgr-process-table` crate: a build-time coupling to procmgr's
+  internals, not an IPC contract. A death posted to a full EQ is dropped and
+  its slot is never evicted; logd reports a drain that took a full queue's
+  worth. Once procmgr's table is growable the coupling gives way to a
+  liveness or resync path ([#643](https://github.com/kottlerg/seraph/issues/643)).
 
 ## Out of scope (follow-up issues)
 

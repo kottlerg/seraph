@@ -1093,8 +1093,8 @@ pub mod registry {
 /// call. The receiver tags each line with the registered display name
 /// (default `[?]`); see [`log::register_name`].
 ///
-/// Non-allocating — uses a 512-byte stack buffer; messages exceeding
-/// that are silently truncated.
+/// Non-allocating — stages the text in a 512-byte stack buffer that is
+/// sent in chunks as it fills, so a message of any length arrives whole.
 #[macro_export]
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 macro_rules! __seraph_log {

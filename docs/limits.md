@@ -594,7 +594,7 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645).
 | `log_hex` buffer | `services/init/src/bootstrap.rs` | 96 B | diagnostic output cap | 96 B stack | correct as is | None |
 | `SlotTable.slots` | `services/logd/src/slot.rs` | unbounded map | none | none | correct as is | Already pay-as-you-go |
 | `PER_SLOT_HISTORY` | `services/logd/src/slot.rs` | 16 lines | tuning (per-sender retention) | none up front | correct as is | None |
-| `DEATH_EQ_CAPACITY` | `services/logd/src/main.rs` | procmgr `MAX_PROCESSES * 2` = 64 | follows procmgr's own death queue (a full queue drops a death only when procmgr's would) | about 0.6 KiB | needs a design | A full queue still drops silently; a resync path replaces the coupling once procmgr's table grows (#643) |
+| `DEATH_EQ_CAPACITY` | `services/logd/src/main.rs` | procmgr `MAX_PROCESSES * 2` = 64 | follows procmgr's own death queue (a burst procmgr's queue absorbs fits, if logd drains before more deaths arrive) | about 0.6 KiB | needs a design | A full queue still drops, with a post-hoc diagnostic, and the slot leaks; a resync path replaces the coupling once procmgr's table grows (#643) |
 | eviction by `t as u32` | `services/logd/src/main.rs` | low 32 bits | ABI width (kernel correlator) | none | needs a design | Evicts every slot sharing the low bits (#638) |
 | death exit reason | `services/logd/src/main.rs` | `u32` | encoding artefact | none | correct as is | None |
 | handover `MAX_ITERS` | `services/logd/src/handover.rs` | 2048 | provably unreachable (init's 32 senders plus at most about 860 lines in its 16 KiB ring) | none | correct as is | Derive from those constants |

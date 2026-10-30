@@ -89,7 +89,7 @@ state up front.
 | Word | Meaning |
 |---|---|
 | 0 | `HEADER` |
-| 1 | total history-line count ever pushed (monotonic; may exceed ring size if wrapped) |
+| 1 | total history-line count ever pushed (monotonic; exceeds the lines the ring still holds once it has dropped its oldest) |
 | 2 | active sender-slot count (non-zero badges in init-logd's slot table) |
 
 No inline bytes. No transferred caps.

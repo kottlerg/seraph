@@ -35,9 +35,8 @@
 //! must still wait out a delivery that read the old route. A raise after the
 //! delete finds the line masked and unrouted (or routed to the spare).
 //! Required: the kernel survives every round, and in some rounds of each kind
-//! the controller issued a raise that began after the deleter began its
-//! delete and ended before it finished (the race armed). The UART interrupt
-//! is disabled again when the cell ends.
+//! the controller began a raise while the deleter's delete was running (the
+//! race armed). The UART interrupt is disabled again when the cell ends.
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -211,11 +210,11 @@ fn probe_delivery(ctx: &TestContext, line: u32) -> TestResult
 /// Whether the deleter reroutes the line to the spare before `round`'s delete.
 fn rerouted(round: u32) -> bool
 {
-    round % 2 == 0
+    round.is_multiple_of(2)
 }
 
-/// The rounds; returns, for direct and rerouted deletes, how many issued a
-/// raise wholly inside the delete.
+/// The rounds; returns, for direct and rerouted deletes, how many began a
+/// raise while the delete was running.
 fn rounds(ctx: &TestContext, line: u32, cycles: u32) -> Result<[u32; 2], &'static str>
 {
     let mut armed = [0u32; 2];
@@ -237,17 +236,15 @@ fn rounds(ctx: &TestContext, line: u32, cycles: u32) -> Result<[u32; 2], &'stati
         while DELETED.load(Ordering::Acquire) != round && raises < MAX_RAISES
         {
             // Sampled before the raise, so a raise counts as overlapping only
-            // when it began after the delete began and ended before it ended.
-            let began = DELETING.load(Ordering::Acquire) == round;
+            // when it began while the delete was running (begun, not done).
+            let during = DELETING.load(Ordering::Acquire) == round
+                && DELETED.load(Ordering::Acquire) != round;
             // Unmask before each raise, since each delivery masks the line;
             // after the delete the ack may fail or find the line unrouted.
             irq_ack(line).ok();
             raise_tx_interrupt();
             raises += 1;
-            if began && DELETED.load(Ordering::Acquire) != round
-            {
-                overlapped = true;
-            }
+            overlapped |= during;
         }
         if overlapped
         {

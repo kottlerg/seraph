@@ -205,10 +205,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::load_balance_handoff_steal: cap_create_notification failed")?;
 
-    let mut server_th = [0u32; NUM_PAIRS];
-    let mut server_cs = [0u32; NUM_PAIRS];
-    let mut client_th = [0u32; NUM_PAIRS];
-    let mut client_cs = [0u32; NUM_PAIRS];
+    let mut servers = [const { spawn::SpawnedChild::EMPTY }; NUM_PAIRS];
+    let mut clients = [const { spawn::SpawnedChild::EMPTY }; NUM_PAIRS];
     let mut eps = [0u32; NUM_PAIRS];
 
     // ── Servers first: pinned round-robin, RECEIVE on a private endpoint. ────
@@ -248,8 +246,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             spawn::configure_and_start_pinned(&server, server_entry, stack, server_arg, server_cpu)
         }
         .map_err(|_| "stress::load_balance_handoff_steal: start server failed")?;
-        server_th[j] = server.th;
-        server_cs[j] = server.cs;
+        servers[j] = server;
     }
 
     // Start the clients once every server is entering its first `ipc_recv`.
@@ -274,8 +271,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         // cells reuse.
         for j in 0..NUM_PAIRS
         {
-            cap_delete(server_th[j]).ok();
-            cap_delete(server_cs[j]).ok();
+            servers[j].delete_thread().ok();
+            servers[j].delete_cspace().ok();
             cap_delete(eps[j]).ok();
         }
         cap_delete(ready).ok();
@@ -310,8 +307,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start(&client, client_entry, stack, client_arg) }
             .map_err(|_| "stress::load_balance_handoff_steal: start client failed")?;
-        client_th[i] = client.th;
-        client_cs[i] = client.cs;
+        clients[i] = client;
     }
 
     // Wait until every client has completed its round-trips and signaled.
@@ -334,18 +330,22 @@ pub fn run(ctx: &TestContext) -> TestResult
     // ── Teardown. Servers are blocked in `ipc_recv`; delete-while-blocked. ───
     // Reap server threads (and so the live receivers) before deleting the
     // endpoints they wait on. Clients have already exited.
-    for j in 0..NUM_PAIRS
+    for server in &mut servers
     {
-        cap_delete(server_th[j])
+        server
+            .delete_thread()
             .map_err(|_| "stress::load_balance_handoff_steal: cap_delete server th failed")?;
-        cap_delete(server_cs[j])
+        server
+            .delete_cspace()
             .map_err(|_| "stress::load_balance_handoff_steal: cap_delete server cs failed")?;
     }
-    for i in 0..NUM_PAIRS
+    for client in &mut clients
     {
-        cap_delete(client_th[i])
+        client
+            .delete_thread()
             .map_err(|_| "stress::load_balance_handoff_steal: cap_delete client th failed")?;
-        cap_delete(client_cs[i])
+        client
+            .delete_cspace()
             .map_err(|_| "stress::load_balance_handoff_steal: cap_delete client cs failed")?;
     }
     for &ep in &eps

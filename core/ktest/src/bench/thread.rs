@@ -44,7 +44,7 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
     {
         let t0 = cycles_now();
 
-        let Ok(child) = spawn::new_child(ctx)
+        let Ok(mut child) = spawn::new_child(ctx)
         else
         {
             break;
@@ -64,8 +64,8 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
             break;
         }
         notification_wait(done).ok();
-        cap_delete(child.th).ok();
-        cap_delete(child.cs).ok();
+        child.delete_thread().ok();
+        child.delete_cspace().ok();
 
         let t1 = cycles_now();
         let delta = t1.saturating_sub(t0);
@@ -147,7 +147,7 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
         return;
     };
     // PRIORITY_MAX == INIT_PRIORITY: the level this (init-loaded) thread runs at.
-    let Ok(child) = spawn::new_child_at(ctx, ctx.sched_control_cap, syscall_abi::PRIORITY_MAX)
+    let Ok(mut child) = spawn::new_child_at(ctx, ctx.sched_control_cap, syscall_abi::PRIORITY_MAX)
     else
     {
         return;
@@ -171,8 +171,8 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
     }
     .is_err()
     {
-        cap_delete(child.th).ok();
-        cap_delete(child.cs).ok();
+        child.delete_thread().ok();
+        child.delete_cspace().ok();
         cap_delete(done).ok();
         return;
     }
@@ -185,8 +185,8 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
     let t1 = cycles_now();
 
     notification_wait(done).ok();
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     cap_delete(done).ok();
 
     let total = t1.saturating_sub(t0);

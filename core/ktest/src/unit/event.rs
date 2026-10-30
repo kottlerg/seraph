@@ -112,7 +112,7 @@ pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
     let sync = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for sync failed")?;
 
-    let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
+    let mut child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
     // Pass all rights for the queue; NOTIFY right for the sync notification.
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     let child_sync = cap_copy(sync, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
@@ -142,10 +142,10 @@ pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
         return Err("child received wrong event payload (expected 0x42)");
     }
 
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(eq).ok();
     cap_delete(sync).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -267,7 +267,7 @@ pub fn recv_timeout_payload_zero_wins(ctx: &TestContext) -> TestResult
 {
     let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "event_queue_create for zero-payload test failed")?;
-    let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
+    let mut child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     // The child's entry sleeps ~10 ms, then posts payload 0; arg carries only
     // its queue slot.
@@ -289,9 +289,9 @@ pub fn recv_timeout_payload_zero_wins(ctx: &TestContext) -> TestResult
         return Err("event_recv_timeout returned wrong payload (expected legitimate 0)");
     }
 
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(eq).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -301,7 +301,7 @@ pub fn recv_timeout_payload_nonzero_wins(ctx: &TestContext) -> TestResult
 {
     let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "event_queue_create for nonzero-payload test failed")?;
-    let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
+    let mut child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     let child_arg = u64::from(child_eq);
 
@@ -320,9 +320,9 @@ pub fn recv_timeout_payload_nonzero_wins(ctx: &TestContext) -> TestResult
         return Err("event_recv_timeout returned wrong payload (expected 0xCAFE)");
     }
 
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(eq).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -332,7 +332,7 @@ pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
 {
     let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "event_queue_create for forever-block test failed")?;
-    let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
+    let mut child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     let child_arg = u64::from(child_eq);
 
@@ -351,9 +351,9 @@ pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
         return Err("event_recv_timeout(eq, 0) returned wrong payload (expected 0xBEEF)");
     }
 
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(eq).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 

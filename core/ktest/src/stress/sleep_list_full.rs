@@ -281,10 +281,9 @@ fn spawn_fillers(
         *created = i + 1;
         // SAFETY: element i is this filler's alone (see FILL_STACKS).
         let base = unsafe { core::ptr::addr_of!(FILL_STACKS[i]) } as u64;
-        let child = spawn::SpawnedChild { th, cs };
         // SAFETY: `base + 8192` tops `FILL_STACKS[i]`, this filler's own
         // 8 KiB stack, on which no other live thread runs.
-        unsafe { spawn::configure_and_start(&child, filler_entry, base + 8192, 0) }
+        unsafe { spawn::configure_and_start_thread(th, filler_entry, base + 8192, 0) }
             .map_err(|_| "stress::sleep_list_full: start filler failed")?;
     }
     Ok(())
@@ -362,9 +361,9 @@ fn timed_wait_storm(ctx: &TestContext, cycles: u32) -> TestResult
     };
     let result = spawn::new_child(ctx)
         .map_err(|_| "stress::sleep_list_full: spawn wait victim failed")
-        .and_then(|child| {
+        .and_then(|mut child| {
             let stormed = storm_waits(&child, sig, eq, cycles);
-            let reaped = [cap_delete(child.th), cap_delete(child.cs)]
+            let reaped = [child.delete_thread(), child.delete_cspace()]
                 .into_iter()
                 .collect::<Result<(), i64>>()
                 .map_err(|_| "stress::sleep_list_full: reap wait victim failed");
@@ -471,10 +470,10 @@ extern "C" fn wait_victim_entry(arg: u64) -> !
 /// fillers, then let the victim sleep once more; always reap the victim.
 fn with_victim(ctx: &TestContext, fillers: &[u32], cycles: u32) -> TestResult
 {
-    let child =
+    let mut child =
         spawn::new_child(ctx).map_err(|_| "stress::sleep_list_full: spawn victim failed")?;
     let result = storm(&child, fillers, cycles);
-    let reaped = [cap_delete(child.th), cap_delete(child.cs)]
+    let reaped = [child.delete_thread(), child.delete_cspace()]
         .into_iter()
         .collect::<Result<(), i64>>();
     result?;

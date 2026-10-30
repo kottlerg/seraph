@@ -101,8 +101,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::double_enqueue_storm: cap_create_notification failed")?;
 
-    let mut threads = [0u32; NUM_WORKERS];
-    let mut cspaces = [0u32; NUM_WORKERS];
+    let mut children = [const { spawn::SpawnedChild::EMPTY }; NUM_WORKERS];
     // Parent-side notification caps used to wake each worker.
     let mut p2c = [0u32; NUM_WORKERS];
 
@@ -134,8 +133,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start(&child, worker_entry, stack_top, arg) }
             .map_err(|_| "stress::double_enqueue_storm: configure_and_start failed")?;
-        threads[i] = child.th;
-        cspaces[i] = child.cs;
+        children[i] = child;
         p2c[i] = notif;
     }
 
@@ -163,8 +161,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         // cells reuse.
         for i in 0..NUM_WORKERS
         {
-            cap_delete(threads[i]).ok();
-            cap_delete(cspaces[i]).ok();
+            children[i].delete_thread().ok();
+            children[i].delete_cspace().ok();
             cap_delete(p2c[i]).ok();
         }
         cap_delete(ready).ok();
@@ -188,11 +186,11 @@ pub fn run(ctx: &TestContext) -> TestResult
             let i_u32 = u32::try_from(i).unwrap_or(0);
             let _ = notification_send(p2c[i], BIT_GO);
             let prio: u8 = if (cycle + i_u32) & 1 == 0 { 3 } else { 9 };
-            let _ = thread_set_priority(threads[i], prio, ctx.sched_control_cap);
+            let _ = thread_set_priority(children[i].th, prio, ctx.sched_control_cap);
             if cycle % 4 == 0
             {
                 let target_cpu = (i_u32 + cycle) % cpu_mod;
-                let _ = thread_set_affinity(threads[i], target_cpu);
+                let _ = thread_set_affinity(children[i].th, target_cpu);
             }
         }
         // Periodically sleep so workers actually run and re-park (on the
@@ -214,12 +212,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     for i in 0..NUM_WORKERS
     {
         let i_u32 = u32::try_from(i).unwrap_or(0);
-        let _ = thread_set_affinity(threads[i], (i_u32 + 1) % cpu_mod);
+        let _ = thread_set_affinity(children[i].th, (i_u32 + 1) % cpu_mod);
         let _ = notification_send(p2c[i], BIT_GO);
-        let _ = thread_set_priority(threads[i], 5, ctx.sched_control_cap);
-        cap_delete(threads[i])
+        let _ = thread_set_priority(children[i].th, 5, ctx.sched_control_cap);
+        children[i]
+            .delete_thread()
             .map_err(|_| "stress::double_enqueue_storm: cap_delete thread failed")?;
-        cap_delete(cspaces[i])
+        children[i]
+            .delete_cspace()
             .map_err(|_| "stress::double_enqueue_storm: cap_delete cspace failed")?;
         cap_delete(p2c[i])
             .map_err(|_| "stress::double_enqueue_storm: cap_delete notification failed")?;

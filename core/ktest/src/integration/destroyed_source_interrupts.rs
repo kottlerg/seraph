@@ -138,10 +138,10 @@ fn run_phase(ctx: &TestContext, source: Source) -> TestResult
         reaped &= cap_revoke(obj).is_ok();
         reaped &= cap_delete(obj).is_ok();
     }
-    for child in children.iter().flatten()
+    for child in children.iter_mut().flatten()
     {
-        reaped &= cap_delete(child.th).is_ok();
-        reaped &= cap_delete(child.cs).is_ok();
+        reaped &= child.delete_thread().is_ok();
+        reaped &= child.delete_cspace().is_ok();
     }
     if let Some(m) = member
     {

@@ -137,7 +137,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         "integration::park_interrupted_stop_start: post-cancel notification delivery broken \
          (cancel corrupted the waiter slot / observer flag)",
     )?;
-    reap(&child)?;
+    reap(child)?;
     cap_delete(sig).map_err(|_| "integration::park_interrupted_stop_start: del sig failed")?;
 
     // ── Phase 2: notification_wait_timeout (sleep-list claim gating). ───────
@@ -154,7 +154,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         "integration::park_interrupted_stop_start: cancelled timed notification_wait returned \
          a non-Interrupted result (stale success or fabricated timeout — #363)",
     )?;
-    reap(&child)?;
+    reap(child)?;
     cap_delete(sigt).map_err(|_| "integration::park_interrupted_stop_start: del sigt failed")?;
 
     // ── Phase 3: event_recv (indefinite block). ─────────────────────────────
@@ -171,7 +171,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         "integration::park_interrupted_stop_start: cancelled event_recv returned a \
          non-Interrupted result (stale payload surfaced — #363)",
     )?;
-    reap(&child)?;
+    reap(child)?;
     cap_delete(eq).map_err(|_| "integration::park_interrupted_stop_start: del eq failed")?;
 
     // ── Phase 4: ipc_recv (empty endpoint, no caller ever arrives). ─────────
@@ -188,7 +188,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         "integration::park_interrupted_stop_start: cancelled ipc_recv returned a \
          non-Interrupted result (stale ipc_msg published to userspace — #363)",
     )?;
-    reap(&child)?;
+    reap(child)?;
     cap_delete(ep).map_err(|_| "integration::park_interrupted_stop_start: del ep failed")?;
 
     // ── Phase 5: wait_set_wait (member registered, never ready). ────────────
@@ -209,7 +209,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         "integration::park_interrupted_stop_start: cancelled wait_set_wait returned a \
          non-Interrupted result (stale badge surfaced — #363)",
     )?;
-    reap(&child)?;
+    reap(child)?;
     cap_delete(ws).map_err(|_| "integration::park_interrupted_stop_start: del ws failed")?;
     cap_delete(member)
         .map_err(|_| "integration::park_interrupted_stop_start: del member failed")?;
@@ -226,7 +226,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         "integration::park_interrupted_stop_start: cancelled thread_sleep returned a \
          non-Interrupted result (truncated sleep reported as success — #363)",
     )?;
-    reap(&child)?;
+    reap(child)?;
 
     cap_delete(done).map_err(|_| "integration::park_interrupted_stop_start: del done failed")?;
     Ok(())
@@ -309,11 +309,13 @@ fn verdict(
 }
 
 /// Reap a phase's child (thread + `CSpace`).
-fn reap(child: &spawn::SpawnedChild) -> Result<(), &'static str>
+fn reap(mut child: spawn::SpawnedChild) -> Result<(), &'static str>
 {
-    cap_delete(child.th)
+    child
+        .delete_thread()
         .map_err(|_| "integration::park_interrupted_stop_start: reap child thread failed")?;
-    cap_delete(child.cs)
+    child
+        .delete_cspace()
         .map_err(|_| "integration::park_interrupted_stop_start: reap child cspace failed")?;
     Ok(())
 }

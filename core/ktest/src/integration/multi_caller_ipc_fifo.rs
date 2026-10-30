@@ -70,7 +70,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "multi_caller_ipc_fifo: cap_create_notification failed")?;
 
     // ── Build and start caller A ──────────────────────────────────────────────
-    let child_a = spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child A failed")?;
+    let mut child_a =
+        spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child A failed")?;
     let ep_a = cap_copy(ep, child_a.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "multi_caller_ipc_fifo: ep_a failed")?;
     let done_a = cap_copy(done, child_a.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
@@ -88,7 +89,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     thread_sleep(1).map_err(|_| "multi_caller_ipc_fifo: sleep after A failed")?;
 
     // ── Build and start caller B ──────────────────────────────────────────────
-    let child_b = spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child B failed")?;
+    let mut child_b =
+        spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child B failed")?;
     let ep_b = cap_copy(ep, child_b.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "multi_caller_ipc_fifo: ep_b failed")?;
     let done_b = cap_copy(done, child_b.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
@@ -103,7 +105,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     thread_sleep(1).map_err(|_| "multi_caller_ipc_fifo: sleep after B failed")?;
 
     // ── Build and start caller C ──────────────────────────────────────────────
-    let child_c = spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child C failed")?;
+    let mut child_c =
+        spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child C failed")?;
     let ep_c = cap_copy(ep, child_c.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "multi_caller_ipc_fifo: ep_c failed")?;
     let done_c = cap_copy(done, child_c.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
@@ -167,12 +170,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         all_done |= bits;
     }
 
-    cap_delete(child_a.th).ok();
-    cap_delete(child_a.cs).ok();
-    cap_delete(child_b.th).ok();
-    cap_delete(child_b.cs).ok();
-    cap_delete(child_c.th).ok();
-    cap_delete(child_c.cs).ok();
+    child_a.delete_thread().ok();
+    child_a.delete_cspace().ok();
+    child_b.delete_thread().ok();
+    child_b.delete_cspace().ok();
+    child_c.delete_thread().ok();
+    child_c.delete_cspace().ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
 

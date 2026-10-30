@@ -135,7 +135,7 @@ const EXIT_PROBES: u32 = 4096;
 /// Bound on the server's post-recv busy-spin before it exits without replying.
 /// The spin does not keep the TCB alive: `thread_exit` only commits `Exited`
 /// and leaves `reply_tcb` bound, so the server TCB's storage persists until the
-/// controller's `cap_delete(server.th)` and the race always lands on an
+/// controller's `server.delete_thread()` and the race always lands on an
 /// allocated TCB.
 const SERVER_SPIN: u32 = 200;
 
@@ -296,9 +296,6 @@ struct CycleParts
     client: Option<spawn::SpawnedChild>,
     stopper: Option<spawn::SpawnedChild>,
     server: Option<spawn::SpawnedChild>,
-    /// Whether [`race`] has deleted the server's Thread cap, as the race's
-    /// free.
-    server_th_deleted: bool,
 }
 
 /// One cycle: create the endpoint and `done`, start the client, the second
@@ -310,7 +307,7 @@ fn one_cycle(ctx: &TestContext, place: Placement, stops: Stops, cycle: u32, slot
 {
     let mut parts = CycleParts::default();
     let result = arm_and_race(ctx, place, stops, (cycle, slot), &mut parts);
-    let reaped = reap_cycle(&parts);
+    let reaped = reap_cycle(&mut parts);
     result?;
     reaped
 }
@@ -394,7 +391,11 @@ fn arm_and_race(
     )?;
     probe_exited(server_th)?;
 
-    race(cycle, client_th, server_th, &mut parts.server_th_deleted)?;
+    let server = parts
+        .server
+        .as_mut()
+        .ok_or("stress::stop_reply_race: the cycle holds no server")?;
+    race(cycle, client_th, server)?;
     if parts.stopper.is_some()
     {
         await_report(
@@ -427,58 +428,63 @@ fn probe_exited(server: u32) -> TestResult
 /// the same teardown. Deleting a child's Thread cap stops it wherever it is,
 /// so on a failing path no child outlives the cycle. Returns the first
 /// delete that failed.
-fn reap_cycle(parts: &CycleParts) -> TestResult
+fn reap_cycle(parts: &mut CycleParts) -> TestResult
 {
-    let mut deletes: [Option<(u32, &'static str)>; 8] = [None; 8];
-    if let Some(server) = &parts.server
-    {
-        if !parts.server_th_deleted
-        {
-            deletes[0] = Some((
-                server.th,
-                "stress::stop_reply_race: cap_delete server th failed",
-            ));
-        }
-        deletes[1] = Some((
-            server.cs,
-            "stress::stop_reply_race: cap_delete server cs failed",
-        ));
-    }
-    if let Some(stopper) = &parts.stopper
-    {
-        deletes[2] = Some((
-            stopper.th,
-            "stress::stop_reply_race: cap_delete stopper th failed",
-        ));
-        deletes[3] = Some((
-            stopper.cs,
-            "stress::stop_reply_race: cap_delete stopper cs failed",
-        ));
-    }
-    if let Some(client) = &parts.client
-    {
-        deletes[4] = Some((
-            client.th,
-            "stress::stop_reply_race: cap_delete client th failed",
-        ));
-        deletes[5] = Some((
-            client.cs,
-            "stress::stop_reply_race: cap_delete client cs failed",
-        ));
-    }
-    deletes[6] = parts
-        .ep
-        .map(|ep| (ep, "stress::stop_reply_race: cap_delete ep failed"));
-    deletes[7] = parts
-        .done
-        .map(|done| (done, "stress::stop_reply_race: cap_delete done failed"));
     let mut result = Ok(());
-    for (cap, err) in deletes.into_iter().flatten()
-    {
-        if cap_delete(cap).is_err() && result.is_ok()
+    let mut note = |deleted: Result<(), i64>, err: &'static str| {
+        if deleted.is_err() && result.is_ok()
         {
             result = Err(err);
         }
+    };
+    // A guard whose Thread cap `race` already deleted holds none, and its
+    // `delete_thread` returns `Ok` at once.
+    if let Some(server) = parts.server.as_mut()
+    {
+        note(
+            server.delete_thread(),
+            "stress::stop_reply_race: cap_delete server th failed",
+        );
+        note(
+            server.delete_cspace(),
+            "stress::stop_reply_race: cap_delete server cs failed",
+        );
+    }
+    if let Some(stopper) = parts.stopper.as_mut()
+    {
+        note(
+            stopper.delete_thread(),
+            "stress::stop_reply_race: cap_delete stopper th failed",
+        );
+        note(
+            stopper.delete_cspace(),
+            "stress::stop_reply_race: cap_delete stopper cs failed",
+        );
+    }
+    if let Some(client) = parts.client.as_mut()
+    {
+        note(
+            client.delete_thread(),
+            "stress::stop_reply_race: cap_delete client th failed",
+        );
+        note(
+            client.delete_cspace(),
+            "stress::stop_reply_race: cap_delete client cs failed",
+        );
+    }
+    if let Some(ep) = parts.ep
+    {
+        note(
+            cap_delete(ep),
+            "stress::stop_reply_race: cap_delete ep failed",
+        );
+    }
+    if let Some(done) = parts.done
+    {
+        note(
+            cap_delete(done),
+            "stress::stop_reply_race: cap_delete done failed",
+        );
     }
     result
 }
@@ -509,9 +515,9 @@ fn check_second_stops() -> TestResult
 /// TCB. Client and server are pinned to different CPUs, so A's CAS and B's
 /// free execute on different cores; the issue order alternates by cycle
 /// parity to cover both interleavings. A second stopper, if any, is released
-/// first and races A with a second cancel. Sets `server_th_deleted` once the
-/// server's Thread cap is deleted.
-fn race(cycle: u32, client_th: u32, server_th: u32, server_th_deleted: &mut bool) -> TestResult
+/// first and races A with a second cancel. B deletes the Thread cap through
+/// `server`, its guard.
+fn race(cycle: u32, client_th: u32, server: &mut spawn::SpawnedChild) -> TestResult
 {
     STOPPER_GO.store(cycle + 1, Ordering::Release);
     // The stop's outcome depends on which teardown reached the client first
@@ -520,15 +526,15 @@ fn race(cycle: u32, client_th: u32, server_th: u32, server_th_deleted: &mut bool
     if cycle.is_multiple_of(2)
     {
         let _ = thread_stop(client_th);
-        cap_delete(server_th)
+        server
+            .delete_thread()
             .map_err(|_| "stress::stop_reply_race: cap_delete server th (A-first) failed")?;
-        *server_th_deleted = true;
     }
     else
     {
-        cap_delete(server_th)
+        server
+            .delete_thread()
             .map_err(|_| "stress::stop_reply_race: cap_delete server th (B-first) failed")?;
-        *server_th_deleted = true;
         // As above: any outcome of this stop is accepted.
         let _ = thread_stop(client_th);
     }
@@ -682,7 +688,7 @@ extern "C" fn server_entry(arg: u64) -> !
 
     // Spin a short, bounded window, then die without replying. The TCB stays
     // allocated (Exited, `reply_tcb` bound) until the controller's
-    // `cap_delete(server.th)`, which is the free the stop path races.
+    // `server.delete_thread()`, which is the free the stop path races.
     for _ in 0..SERVER_SPIN
     {
         core::hint::spin_loop();

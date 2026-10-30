@@ -13,7 +13,7 @@
 //! checks the aligned value too (`core/kernel/docs/syscalls.md`
 //! § `SYS_THREAD_CONFIGURE`).
 
-use syscall::{cap_delete, thread_configure};
+use syscall::thread_configure;
 use syscall_abi::SyscallError;
 
 use crate::{TestContext, TestResult};
@@ -23,14 +23,14 @@ const WRAPPING_STACK_TOP: u64 = 8;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "configure_wrapped_stack: spawn::new_child failed")?;
     let entry = run as *const () as u64;
     // SAFETY: the kernel refuses a stack that wraps on alignment (the test's
     // premise), so the thread is never configured.
     let result = unsafe { thread_configure(child.th, entry, WRAPPING_STACK_TOP, 0) };
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     if result != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("configure_wrapped_stack: a stack that wraps on alignment was accepted");

@@ -57,7 +57,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::thread_lifecycle: cap_create_notification (ready) failed")?;
     let block = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::thread_lifecycle: cap_create_notification (block) failed")?;
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "integration::thread_lifecycle: spawn::new_child failed")?;
     let child_ready = cap_copy(ready, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "integration::thread_lifecycle: cap_copy (ready→child) failed")?;
@@ -138,10 +138,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     cap_delete(th2).ok();
     cap_delete(cs2).ok();
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(ready).ok();
     cap_delete(block).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 

@@ -58,7 +58,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "fault_resume_modifies_pc: cap_create_notification failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "fault_resume_modifies_pc: spawn::new_child failed")?;
     let child_sig = cap_copy(sig, child.cs, RIGHTS_ALL)
         .map_err(|_| "fault_resume_modifies_pc: cap_copy(sig) failed")?;
@@ -115,8 +115,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     notification_wait(sig).map_err(|_| "fault_resume_modifies_pc: notification_wait failed")?;
 
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     cap_delete(ep).ok();
     cap_delete(sig).ok();
     Ok(())

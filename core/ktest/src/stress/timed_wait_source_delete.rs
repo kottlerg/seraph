@@ -147,7 +147,7 @@ fn one_cycle(ctx: &TestContext, done: u32, cycle: u32, cpus: u32) -> Result<bool
         (cap_create_notification(ctx.memory_base), notif_waiter)
     };
     let source = source.map_err(|_| "stress::timed_wait_source_delete: create source failed")?;
-    let Ok(child) = spawn::new_child(ctx)
+    let Ok(mut child) = spawn::new_child(ctx)
     else
     {
         let _ = cap_delete(source);
@@ -156,7 +156,7 @@ fn one_cycle(ctx: &TestContext, done: u32, cycle: u32, cpus: u32) -> Result<bool
     let verdict = race(&child, entry, source, done, cycle, cpus);
     // Deleting the thread stops it wherever it is, so the next cycle's
     // waiter can reuse the stack even when this one failed.
-    let reaped = [cap_delete(child.th), cap_delete(child.cs)]
+    let reaped = [child.delete_thread(), child.delete_cspace()]
         .into_iter()
         .collect::<Result<(), i64>>();
     let acc = match verdict

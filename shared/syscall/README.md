@@ -10,9 +10,10 @@ Beyond the inline-assembly invocation layer, a few wrappers do work in userspace
 without issuing the syscall, an argument the kernel would misread: `cap_insert` returns
 `InvalidArgument` for a destination index of 0, which the kernel reads as "allocate a slot".
 Others compose calls: `cap_revoke_all` retries `cap_revoke` while it reports `Interrupted`,
-and `random_u64` draws through `getrandom` and returns `InvalidState` on a short count. One
-untyped entry, `raw_syscall3`, passes three argument registers as given, for harness tests of
-the kernel's argument validation that need register values the typed wrappers cannot express;
+and `random_u64` draws through `getrandom` and returns `InvalidState` on a short count. Two
+untyped entries, `raw_syscall3` and `raw_syscall4`, pass three or four argument registers as
+given, for harness tests of the kernel's argument validation that need register values the
+typed wrappers cannot express;
 `getrandom_raw` likewise takes a raw buffer pointer for the kernel's buffer-validation tests.
 
 A wrapper is safe when nothing it can make the kernel do reaches memory a live Rust object

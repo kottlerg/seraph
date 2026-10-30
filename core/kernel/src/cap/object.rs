@@ -1997,6 +1997,35 @@ fn push_cascade(
     }
 }
 
+/// Release the `EventQueueObject` reference each populated death observer in
+/// `observers` holds, queueing a queue whose last reference this was on the
+/// cascade worklist (its dealloc then runs from the caller's loop, not by
+/// recursion). Called by an owner's teardown (the Thread and `AddressSpace`
+/// arms) once no death walk can read the observers.
+#[cfg(not(test))]
+fn release_death_observers(
+    observers: &[crate::sched::thread::DeathObserver],
+    worklist: &mut [Option<NonNull<KernelObjectHeader>>],
+    head: &mut usize,
+)
+{
+    for observer in observers
+    {
+        let Some(eq) = NonNull::new(observer.eq)
+        else
+        {
+            continue;
+        };
+        // SAFETY: a populated observer owns one reference on its live
+        // EventQueueObject (DeathObserver), consumed here; the header is at
+        // offset 0.
+        if unsafe { eq.as_ref().header.dec_ref() } == 0
+        {
+            push_cascade(worklist, head, eq.cast::<KernelObjectHeader>());
+        }
+    }
+}
+
 /// Free the SEED-backed body of an object of concrete type `T`: drop it in
 /// place, return its bytes to its ancestor Memory object, and release the
 /// ancestor reference, pushing the ancestor onto `worklist` if that was the
@@ -2952,6 +2981,19 @@ unsafe fn dealloc_object_one(
                     }
                 }
 
+                // Release the death observers' EventQueue references. The
+                // thread runs on no CPU (the gate above), so its death walk is
+                // over or never runs, and no binder can pin it (refcount 0).
+                // SAFETY: tcb valid (not yet freed) and unreachable by any
+                // other path; the array is Copy and read by value.
+                let (observers, count) = unsafe {
+                    let observers = (*tcb).death_observers;
+                    let count = (*tcb).death_observer_count as usize;
+                    (*tcb).death_observer_count = 0;
+                    (observers, count)
+                };
+                release_death_observers(&observers[..count], worklist, head);
+
                 // Wake-in-flight gate (#160): a waker that popped this thread
                 // from a wait object (notification/endpoint/event_queue/wait_set)
                 // under that object's lock sets `wake_in_flight = 1` before
@@ -3157,6 +3199,14 @@ unsafe fn dealloc_object_one(
                 // can reissue this inactive space's tag to another space.
                 // SAFETY: as_ptr is a valid AddressSpace being reclaimed.
                 crate::mm::tag_allocator::free_tag(unsafe { &*as_ptr });
+
+                // Release the terminal-fault observers' EventQueue references.
+                // Every bound thread is stopped and off-CPU (above), so no
+                // terminal-fault post can still read them.
+                // SAFETY: as_ptr valid and uniquely owned; death_lock not held.
+                let (observers, count) =
+                    unsafe { crate::mm::address_space::AddressSpace::take_death_observers(as_ptr) };
+                release_death_observers(&observers[..count], worklist, head);
 
                 // Drop in-place objects before reclaiming their storage.
                 // `AddressSpace` and `AddressSpaceObject` have no Drop logic
@@ -3542,14 +3592,12 @@ unsafe fn dealloc_object_one(
             if !state.is_null()
             {
                 // Clear any IRQ routing table entries that point to this
-                // NotificationState. A hardware interrupt firing after the notification
-                // is freed would otherwise call notification_send on a dead slot.
-                // SAFETY: interrupts disabled to serialize with IRQ delivery.
-                unsafe {
-                    let saved = crate::arch::current::cpu::save_and_disable_interrupts();
-                    crate::irq::unregister_notification(state);
-                    crate::arch::current::cpu::restore_interrupts(saved);
-                }
+                // NotificationState and wait out every device-IRQ delivery
+                // already in flight through them on any CPU, so none reaches
+                // the state after the free below (irq::unregister_notification).
+                // SAFETY: state is live; no IPC source, scheduler, or
+                // sleep-list lock is held, and this is not interrupt context.
+                unsafe { crate::irq::unregister_notification(state) };
 
                 // Wait-set membership holds a +1 cap-level ref on the source
                 // (see `sys_wait_set_add` / `wait_set_drop`); reaching dealloc

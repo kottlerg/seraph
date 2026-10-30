@@ -364,6 +364,20 @@ operations on the hot path when no waiter or wait set is registered.
 Setting an already-set bit is idempotent — this is the defined coalescing
 behaviour (per [docs/ipc-design.md § Notifications](../../../docs/ipc-design.md#notifications)).
 
+**Device IRQ delivery.** A line `SYS_IRQ_REGISTER` routed to a notification reaches the send
+path from interrupt context (`irq::dispatch_device_irq`), with no capability and no reference
+on the notification. Each route instead counts the deliveries in flight through it: a delivery
+raises the line's count before it reads the route and drops it after its last access to the
+state and to the waiter it woke (step f above). The Notification teardown
+(`dealloc_object`, Notification arm) first clears every route naming the state and masks its
+line, then waits, interrupts enabled and preemption disabled, until each cleared line's count
+is zero (`irq::unregister_notification`, spin site `dealloc:irq-delivery`), and only then drains
+the waiters and frees the state. The raise and route read, and the clear and count read, are
+`SeqCst`, so a delivery either reads the cleared route and touches nothing, or is counted and
+waited for: no delivery on any CPU reaches the state after its free. The wait is bounded by one
+in-flight delivery per cleared line, since each runs interrupts-off without waiting on the
+teardown, and a masked line raises no new one.
+
 ### Wait Path
 
 `SYS_NOTIFICATION_WAIT`:

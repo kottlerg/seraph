@@ -55,6 +55,9 @@
 //! - `tlb_widen_retry.rs`        — a permission-widen elides its shootdown; a remote stale-TLB write still completes via spurious-fault retry
 //! - `death_notification_late_bind.rs` — a death observer bound after the thread already died still receives the retained exit reason
 //! - `aspace_fault_notification_late_bind.rs` — an aspace terminal-fault observer bound after the space already faulted still receives the retained reason
+//! - `death_observer_outlives_queue_caps.rs` — a thread's and an address space's death-observer
+//!   bindings keep their event queues live after the queues' last caps are deleted, through the
+//!   death posts, until the owners' teardowns release them
 //! - `ipc_call_interrupted_stop_start.rs` — a client stopped while parked in `ipc_call` (send-queued and awaiting-reply) restarts to `Interrupted`, never a stale reply (#361)
 //! - `park_interrupted_stop_start.rs` — a thread stopped while parked in any non-call blocking syscall (notification/event/recv/wait-set/sleep) restarts to `Interrupted`, never a stale deposit (#363)
 //! - `destroyed_source_interrupts.rs` — every waiter on a notification, event queue, or wait set
@@ -79,6 +82,7 @@ pub mod cap_transfer_large;
 pub mod cross_cspace_revoke_no_alias;
 pub mod cspace_nested_teardown;
 pub mod death_notification_late_bind;
+pub mod death_observer_outlives_queue_caps;
 pub mod destroyed_source_interrupts;
 pub mod fault_exception_no_handler_kills;
 pub mod fault_exception_redirect;
@@ -131,6 +135,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::aspace_fault_notification_late_bind",
         aspace_fault_notification_late_bind::run(ctx)
+    );
+    run_integration_test!(
+        "integration::death_observer_outlives_queue_caps",
+        death_observer_outlives_queue_caps::run(ctx)
     );
     run_integration_test!("integration::cap_transfer", cap_transfer::run(ctx));
     run_integration_test!(

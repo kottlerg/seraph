@@ -580,6 +580,11 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
 /// once and never dropped — letting a supervisor that binds after the thread
 /// was started still observe a death in the bind-after-start window.
 ///
+/// A binding holds a reference on the `EventQueue` object until the thread's
+/// teardown releases it, so deleting the queue's last capability leaves the
+/// queue live for the death post (core/kernel/docs/syscalls.md
+/// § `SYS_THREAD_BIND_NOTIFICATION`). A bind onto an exited thread takes none.
+///
 /// Multiple independent observers may be registered (up to
 /// `MAX_DEATH_OBSERVERS`); all fire on death. Returns `OutOfMemory` if the
 /// per-thread observer array is full (only reachable while the thread is
@@ -624,14 +629,10 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 
     let eq_obj = eq_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // cast_ptr_alignment: header at offset 0 of EventQueueObject; allocator guarantees alignment.
-    // SAFETY: tag confirmed EventQueue; pointer is valid EventQueueObject.
     #[allow(clippy::cast_ptr_alignment)]
-    let eq_state = unsafe {
-        (*eq_obj
-            .as_ptr()
-            .cast::<crate::cap::object::EventQueueObject>())
-        .state
-    };
+    let eq = eq_obj
+        .as_ptr()
+        .cast::<crate::cap::object::EventQueueObject>();
 
     // Serialise on the target thread's `sched_lock` against the death
     // transition (`set_state_under_all_locks`) and the post-death observer
@@ -662,12 +663,14 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     {
         // SAFETY: paired with the lock_raw above.
         unsafe { (*target_tcb).sched_lock.unlock_raw(saved) };
-        // SAFETY: eq_state is a valid EventQueueState from a validated cap;
-        // sched_lock is released.
-        unsafe { crate::sched::post_one_death_event(eq_state, correlator, retained_reason) };
+        // SAFETY: eq is the EventQueueObject `eq_slot` pins for the call, so
+        // it is live for the post; sched_lock is released.
+        unsafe { crate::sched::post_one_death_event(eq, correlator, retained_reason) };
         return Ok(0);
     }
-    // SAFETY: lock held; the append stays within MAX_DEATH_OBSERVERS.
+    // SAFETY: lock held; the append stays within MAX_DEATH_OBSERVERS. The
+    // binding's reference is taken while `eq_slot` pins the queue; the
+    // thread's teardown releases it (dealloc_object, Thread arm).
     let result = unsafe {
         let count = (*target_tcb).death_observer_count as usize;
         if count >= MAX_DEATH_OBSERVERS
@@ -676,10 +679,8 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
         }
         else
         {
-            (*target_tcb).death_observers[count] = DeathObserver {
-                eq: eq_state,
-                correlator,
-            };
+            (*eq).header.inc_ref();
+            (*target_tcb).death_observers[count] = DeathObserver { eq, correlator };
             (*target_tcb).death_observer_count = (count + 1) as u8;
             Ok(0)
         }
@@ -709,6 +710,10 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// in the high 32 bits) to each bound observer. The kernel only notifies; it
 /// never enumerates or terminates threads, and normal `thread_exit` does NOT
 /// fire these observers.
+///
+/// A binding holds a reference on the `EventQueue` object until the address
+/// space's teardown releases it (core/kernel/docs/syscalls.md
+/// § `SYS_ASPACE_BIND_NOTIFICATION`); a bind after the fault takes none.
 ///
 /// Binding onto an address space that has *already* terminal-faulted posts the
 /// retained fault reason to the `EventQueue` immediately (serialised on the
@@ -765,14 +770,10 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 
     let eq_obj = eq_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // cast_ptr_alignment: header at offset 0 of EventQueueObject; allocator guarantees alignment.
-    // SAFETY: tag confirmed EventQueue; pointer is valid EventQueueObject.
     #[allow(clippy::cast_ptr_alignment)]
-    let eq_state = unsafe {
-        (*eq_obj
-            .as_ptr()
-            .cast::<crate::cap::object::EventQueueObject>())
-        .state
-    };
+    let eq = eq_obj
+        .as_ptr()
+        .cast::<crate::cap::object::EventQueueObject>();
 
     // Bind the observer, or — if the address space already terminal-faulted —
     // deliver the retained reason to the new queue immediately.
@@ -780,17 +781,18 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     // terminal-fault post, so a fault before this bind is not lost (the
     // address-space analogue of the thread bind-after-death path above).
     //
-    // SAFETY: as_ptr is a valid AddressSpace from a validated AddressSpace cap.
+    // SAFETY: as_ptr is a valid AddressSpace from a validated AddressSpace cap;
+    // eq is the EventQueueObject `eq_slot` pins for the call.
     match unsafe {
-        crate::mm::address_space::AddressSpace::bind_or_retained(as_ptr, eq_state, correlator)
+        crate::mm::address_space::AddressSpace::bind_or_retained(as_ptr, eq, correlator)
     }
     {
         Ok(None) => Ok(0),
         Ok(Some(reason)) =>
         {
-            // SAFETY: eq_state is a valid EventQueueState from a validated cap;
+            // SAFETY: eq is the EventQueueObject `eq_slot` pins for the call;
             // death_lock is released.
-            unsafe { crate::sched::post_one_death_event(eq_state, correlator, reason) };
+            unsafe { crate::sched::post_one_death_event(eq, correlator, reason) };
             Ok(0)
         }
         Err(()) => Err(SyscallError::OutOfMemory),

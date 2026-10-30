@@ -35,12 +35,12 @@ use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,
     cap_create_thread, cap_delete, cap_info, cap_insert, mem_map, mem_unmap, mem_unmap_reclaim,
-    thread_configure, thread_set_fault_handler, thread_sleep, thread_start,
+    thread_configure, thread_sleep, thread_start,
 };
 use syscall_abi::{
     CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_USED,
-    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_THREAD_STATE, EXIT_KILLED, FAULT_CLASS_ALL, FAULT_LABEL,
-    MAP_EXECUTABLE, MAP_WRITABLE, RIGHTS_ALL, RIGHTS_NTF_NOTIFY, THREAD_STATE_EXITED,
+    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_THREAD_STATE, EXIT_KILLED, FAULT_LABEL, MAP_EXECUTABLE,
+    MAP_WRITABLE, RIGHTS_ALL, RIGHTS_NTF_NOTIFY, THREAD_STATE_EXITED,
 };
 
 use crate::{TestContext, TestResult};
@@ -233,7 +233,7 @@ pub fn aspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
         .map_err(|_| "retype::aspace_stop: cap_create_cspace (fault) failed")?;
     let thread = cap_create_thread(memory, aspace, cspace, 0, 0)
         .map_err(|_| "retype::aspace_stop: cap_create_thread (fault) failed")?;
-    thread_set_fault_handler(thread, ep, FAULT_BADGE, FAULT_CLASS_ALL)
+    crate::bind_fault_handler(thread, ep, FAULT_BADGE)
         .map_err(|_| "retype::aspace_stop: thread_set_fault_handler failed")?;
     // SAFETY: the thread is bound to the `aspace` this test created, not
     // ktest's own, so its entry state touches nothing ktest runs on.

@@ -797,15 +797,16 @@ pub const fn encode_exit_code(code: u32) -> u64
 // delivered to a thread's bound fault-handler endpoint (see
 // `SYS_THREAD_SET_FAULT_HANDLER` and `docs/fault-handling.md`). The message the
 // kernel synthesizes on the faulting thread's behalf carries `FAULT_LABEL`, the
-// bound badge, and four data words: `[kind, d1, d2, ip]`.
+// badge of the bound endpoint cap, and four data words: `[kind, d1, d2, ip]`.
 
 /// Reserved IPC label marking a kernel-originated fault message. Distinct so a
 /// handler can recognise a fault message. The label proves kernel origin only
 /// on an endpoint whose handler hands out no SEND. The badge of a fault message
-/// is the value its binder chose in `SYS_THREAD_SET_FAULT_HANDLER`, not the
-/// badge of a cap the handler minted (see `docs/fault-handling.md`
-/// § Security). Reserved by the kernel; servers must not produce this label
-/// themselves. Chosen adjacent to [`IPC_REPLY_TRANSFER_FAILED`] (`u64::MAX`)
+/// is the derivation badge of the Endpoint cap bound by
+/// `SYS_THREAD_SET_FAULT_HANDLER`, so it is as derivation-locked as the badge
+/// of an ordinary send through that cap; a binder cannot choose it (see
+/// `docs/fault-handling.md` § Security). Reserved by the kernel; servers must
+/// not produce this label themselves. Chosen adjacent to [`IPC_REPLY_TRANSFER_FAILED`] (`u64::MAX`)
 /// in the reserved high range.
 pub const FAULT_LABEL: u64 = u64::MAX - 1;
 

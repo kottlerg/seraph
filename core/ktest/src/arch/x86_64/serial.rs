@@ -69,6 +69,36 @@ pub fn write_byte(byte: u8)
     unsafe { outb(COM1, byte) };
 }
 
+/// COM1's interrupt line: ISA IRQ 4, which QEMU's q35 MADT routes to GSI 4
+/// with no interrupt-source override.
+pub const UART_IRQ: u32 = 4;
+
+/// IER bit 1: transmit-holding-register-empty interrupt enable.
+const IER_THRI: u8 = 0x02;
+
+/// Raise one COM1 transmit-empty interrupt: clear IER, then set its THRI bit.
+/// The holding register is empty whenever ktest is not writing, so setting
+/// THRI asserts the line again (a rising edge, which the edge-triggered
+/// I/O APIC entry delivers once unmasked).
+///
+/// Called only on the main thread (the only one bound to COM1's ports) once
+/// [`init`] has returned `true`.
+pub fn raise_tx_interrupt()
+{
+    // SAFETY: serial_hw_init completed; I/O port access permitted.
+    unsafe {
+        outb(COM1 + 1, 0x00);
+        outb(COM1 + 1, IER_THRI);
+    }
+}
+
+/// Disable every COM1 interrupt source (IER = 0), the state [`init`] leaves.
+pub fn quiet_tx_interrupt()
+{
+    // SAFETY: serial_hw_init completed; I/O port access permitted.
+    unsafe { outb(COM1 + 1, 0x00) };
+}
+
 /// Write `val` to I/O port `port` (`out dx, al`; reads dx and al, clobbers
 /// nothing, touches no memory or flag).
 ///

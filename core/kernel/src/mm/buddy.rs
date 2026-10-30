@@ -212,7 +212,9 @@ impl<W: PhysWindow> BuddyAllocator<W>
     /// Allocate a block of `2^order` pages.
     ///
     /// Returns the physical base address, or `None` if no block is available.
-    /// The block's header bytes (its first 16) are zeroed, so no free-list
+    /// Only blocks on a free list carry a header (a merge clears the header of
+    /// every buddy it absorbs), and the returned block's own header bytes (its
+    /// first 16) are zeroed, so no free-list
     /// link survives into an allocated block; the rest of the block keeps
     /// whatever it held.
     ///
@@ -492,9 +494,10 @@ impl<W: PhysWindow> BuddyAllocator<W>
 
     /// Remove a specific block address from the free list for `order`.
     ///
-    /// Returns `true` if found and removed. O(n) in list length; acceptable
-    /// at boot time. Reads only the headers of blocks on the list, never the
-    /// target, which may be allocated.
+    /// Returns `true` if found and removed, with its header cleared. O(n) in
+    /// list length; acceptable at boot time. Reads only the headers of blocks
+    /// on the list, never the target unless it is on the list, since it may be
+    /// allocated.
     fn remove_block(&mut self, order: usize, target: u64) -> bool
     {
         // `prev` is the block whose header links to `cur`
@@ -517,6 +520,12 @@ impl<W: PhysWindow> BuddyAllocator<W>
                     // SAFETY: `prev` is on the same free list.
                     unsafe { (*W::header(prev)).next = next };
                 }
+                // The block is absorbed into a merged block whose header sits
+                // at the merged base; clearing this one keeps the rule that
+                // only blocks on a free list carry a header.
+                // SAFETY: `cur` was free until the unlink above; the caller
+                // owns it as part of the block being merged.
+                unsafe { W::header(cur).write(FreeHeader { next: 0, order: 0 }) };
                 self.free_pages -= 1 << order;
                 return true;
             }
@@ -730,6 +739,25 @@ mod tests
             // SAFETY: the slot is backed by SparseWindow and no longer free.
             let header = unsafe { SparseWindow::header(block).read() };
             assert_eq!((header.next, header.order), (0, 0));
+        }
+    }
+
+    #[test]
+    fn merged_block_handed_out_carries_no_interior_header()
+    {
+        // Splitting the 4-page block leaves headers at pages 1 (order 0) and
+        // 2 (order 1); freeing page 0 merges both back. The order-2 block then
+        // handed out must hold no header at any sub-block base.
+        let mut alloc = with_region(4);
+        let a = alloc.alloc(0).expect("split alloc");
+        // SAFETY: `a` came from this allocator and is unused.
+        unsafe { alloc.free(a, 0) };
+        let block = alloc.alloc(2).expect("merged block");
+        for offset in 0..4
+        {
+            // SAFETY: the slot is backed by SparseWindow and no longer free.
+            let header = unsafe { SparseWindow::header(block + pages(offset)).read() };
+            assert_eq!((header.next, header.order), (0, 0), "page {offset}");
         }
     }
 

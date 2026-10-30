@@ -50,7 +50,7 @@ pub fn user_va_top() -> u64
 /// Physical frame allocator, populated as the first act of Phase 3
 /// (`init::populate_buddy`).
 ///
-/// A crate-level static so every phase reaches the one allocator. Phases 2-5
+/// A crate-level static so every phase reaches the one allocator. Phases 3-5
 /// reach it through a direct `&mut` on the single boot thread, before SMP
 /// bringup; every later access goes through `with_frame_allocator`.
 ///

@@ -737,12 +737,12 @@ through its drain until a teardown commits `Exited` over it (see
 |---|---|---|
 | 0 | Validate BootInfo version | Silent halt |
 | 1 | Early console; platform feature gate | Halt: missing required baseline feature (no console is non-fatal) |
-| 2 | Buddy allocator from memory map | Halt: no usable RAM |
-| 3 | Kernel page tables + direct map | Halt: BOOT_TABLE_POOL exhausted; direct map would overlap the kernel image window |
+| 2 | Free physical ranges from memory map | Halt: no usable RAM |
+| 3 | Kernel page tables + direct map; buddy allocator populated | Halt: BOOT_TABLE_POOL exhausted; direct map would overlap the kernel image window; BootInfo.device_tree names no valid FDT blob |
 | 4 | Typed-memory cap surface; per-CPU storage; frame map table | Halt: per-CPU storage or frame map table allocation failed, or DRAM past 256 GiB |
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped, entries beyond MAX_MMIO_APERTURES dropped |
-| 7 | Capability system + root CSpace | Halt: OOM |
+| 7 | Capability system + root CSpace | Halt: OOM; drained RAM extents exceed MAX_DRAIN_BLOCKS |
 | 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace). A started CPU that never announces itself, or an AP that halts itself (too few TLB tags; a riscv64 PLIC context outside the PLIC window), leaves the BSP waiting (x86-64 cannot detect this earlier: SIPI is unacknowledged); an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 

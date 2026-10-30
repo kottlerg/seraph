@@ -51,7 +51,8 @@ pub struct BuddyAllocator<W: PhysWindow = DirectMap>
 Physical frame 0 never enters the allocator, so address 0 ends a list. No metadata lives
 outside the free pages: the number of free blocks, and so the RAM the allocator can manage, has
 no bound of its own, and the allocator costs no memory per GiB. The struct is
-all-zero-constructible and lives in BSS. `alloc` zeroes the header bytes of the block it
+all-zero-constructible and lives in BSS. Only blocks on a free list carry a header: a merge
+clears the header of every buddy it absorbs, and `alloc` zeroes the header bytes of the block it
 returns, so no free-list link survives into an allocated block; the Phase 7 drain hands blocks
 out with their headers in place, and its caller zeroes every drained extent before minting it
 ([cross-boundary-disclosure.md](cross-boundary-disclosure.md) § Kernel state in donated

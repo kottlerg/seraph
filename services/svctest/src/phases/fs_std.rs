@@ -473,9 +473,10 @@ pub fn std_release_matched_by_cookie_phase(_: &Caps)
 {
     use std::os::seraph::process::CommandExt;
 
-    let ep =
-        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
-            .expect("std_release_matched_by_cookie: endpoint creation failed");
+    let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+        syscall::cap_create_endpoint(slab).ok()
+    })
+    .expect("std_release_matched_by_cookie: endpoint creation failed");
     let root = syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND)
         .expect("std_release_matched_by_cookie: root SEND derive failed");
     let stop = syscall::cap_derive_badge(ep, syscall::RIGHTS_EP_SEND, FAKE_FS_STOP_BADGE)

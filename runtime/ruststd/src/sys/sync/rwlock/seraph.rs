@@ -233,7 +233,8 @@ fn ensure_notification(slot: &AtomicU32) -> u32 {
     if existing != 0 {
         return existing;
     }
-    let Some(fresh) = crate::sys::alloc::seraph::object_slab_retype(120, |slab| {
+    let bytes = syscall_abi::NOTIFICATION_RETYPE_BYTES;
+    let Some(fresh) = crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
         syscall::cap_create_notification(slab).ok()
     }) else {
         return 0;

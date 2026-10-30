@@ -54,9 +54,12 @@ fn main()
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    // Endpoint kernel object costs 88 B of retype slab.
+    // An Endpoint costs the kernel's raw retype debit, `ENDPOINT_RETYPE_BYTES`
+    // (wrapper plus state), served from the 128 B `BIN_128` size class.
     let Some(ep) =
-        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
+        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+            syscall::cap_create_endpoint(slab).ok()
+        })
     else
     {
         std::os::seraph::log!("cap_create_endpoint failed");

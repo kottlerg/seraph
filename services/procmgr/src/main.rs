@@ -106,11 +106,11 @@ fn main() -> !
     let mut table = process::ProcessTable::new();
     let mut recent = process::RecentExits::new();
 
-    // Death-EQ inline slot (matches `cap::retype::event_queue_raw_bytes`):
-    // 24 wrapper + 56 state + (capacity + 1) * 8 ring bytes. Capacity is
-    // `MAX_PROCESSES * 2` to absorb a simultaneous-crash burst without
-    // dropping notifications between drain calls.
-    let death_eq_slab_bytes: u64 = 24 + 56 + ((process::MAX_PROCESSES as u64 * 2) + 1) * 8;
+    // Death-EQ slab request: the kernel's raw EventQueue debit for the
+    // capacity. Capacity is `MAX_PROCESSES * 2` to absorb a simultaneous-crash
+    // burst without dropping notifications between drain calls.
+    let death_eq_slab_bytes =
+        std::os::seraph::event_queue_retype_bytes(process::MAX_PROCESSES as u64 * 2);
     let Some(death_eq) = std::os::seraph::object_slab_retype(death_eq_slab_bytes, |slab| {
         syscall::event_queue_create(slab, (process::MAX_PROCESSES as u32) * 2).ok()
     })
@@ -119,7 +119,9 @@ fn main() -> !
         syscall::thread_exit();
     };
     let Some(ws_cap) =
-        std::os::seraph::object_slab_retype(4096, |slab| syscall::wait_set_create(slab).ok())
+        std::os::seraph::object_slab_retype(std::os::seraph::WAIT_SET_RETYPE_BYTES, |slab| {
+            syscall::wait_set_create(slab).ok()
+        })
     else
     {
         syscall::thread_exit();

@@ -73,7 +73,8 @@ unsafe impl Sync for NotificationState {}
 
 // Pins the retype-slot budget assumed by `cap::retype::dispatch_for(Notification)`:
 // `NOTIFICATION_RAW_BYTES` (the 24 B `NotificationObject` wrapper plus this state,
-// the one value `dispatch_for` and `dealloc_object_one` share) must fit BIN_128
+// asserted equal in `cap::retype` to the ABI `NOTIFICATION_RETYPE_BYTES` that
+// `dispatch_for` and `dealloc_object_one` charge) must fit BIN_128
 // (128 B). Catches a future field addition that would overflow the bin.
 const _: () = {
     assert!(crate::cap::retype::NOTIFICATION_RAW_BYTES <= 128);

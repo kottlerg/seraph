@@ -210,8 +210,8 @@ both have exited — init is threadless. The main thread exits at the end of ini
 but init-logd keeps serving the master log endpoint until the svcmgr-launched real-logd pulls its
 handover, so it outlives main; reclaiming init's address space while a thread still runs in it would
 fault that thread. On the last death procmgr tears down init's kernel objects in order (Threads →
-AddressSpace → donate Memory caps to memmgr → drop its CSpace reference), leaving two init residues
-(three on riscv64): init's CSpace with the caps init still holds, and the kernel-direct page-table
+AddressSpace → donate Memory caps to memmgr → drop its CSpace reference), leaving two init residues:
+init's CSpace with the caps init still holds, and the kernel-direct page-table
 nodes behind its bootstrap mappings. Those caps include the remaining root caps (see [Kernel →
 init](#kernel--init)), the endpoints init created, its caps on the kernel objects it created for
 memmgr and procmgr, the intermediate caps it derived, and the bootstrap-arena Memory caps it
@@ -222,12 +222,14 @@ procmgr's delete drops only its own reference and they remain alive but unreacha
 at the reap is design intent, not yet implemented
 ([#540](https://github.com/kottlerg/seraph/issues/540)). The page-table nodes stay consumed after
 init's AddressSpace is gone, an accepted cost owned by [memory-internals.md § Page Table Node
-Ownership](../core/kernel/docs/memory-internals.md#page-table-node-ownership). On riscv64 a third
-residue follows from the first: init maps the console UART through its boot Mmio capability, whose
-object stays in init's CSpace and records that mapping, holding a reference on init's AddressSpace
-([capability-model.md § Mmio](capability-model.md#mmio)), so procmgr's delete does not free the
-AddressSpace either; it stays allocated, with no thread bound to it, until that cap is released with
-the rest of init's CSpace. The procmgr-side protocol is specified in [procmgr IPC
+Ownership](../core/kernel/docs/memory-internals.md#page-table-node-ownership). On riscv64 init maps
+the console UART through its boot Mmio capability, whose object records that mapping and holds a
+reference on init's AddressSpace ([capability-model.md § Mmio](capability-model.md#mmio)); init-logd
+deletes that cap as it exits after the handover, so procmgr's delete frees the AddressSpace and its
+mappings on both architectures. The donated Memory caps must be unmapped by then: the kernel refuses
+to retype a page any address space maps (see
+[capability-model.md § Typed Memory](capability-model.md#typed-memory)).
+The procmgr-side protocol is specified in [procmgr IPC
 Interface](../services/procmgr/docs/ipc-interface.md) § `REGISTER_INIT_TEARDOWN` and §
 `INIT_TEARDOWN_DONE`.
 

@@ -3,9 +3,7 @@
 Enumerates every value the kernel emits across the user/kernel boundary and
 classifies it toward the goal that no kernel virtual address or kernel pointer
 escapes to userspace — a prerequisite for kernel address-space layout
-randomization (KASLR). Known open disclosures: kernel state retyped into
-donated memory the donor had already mapped
-([#577](https://github.com/kottlerg/seraph/issues/577)) and mirrored console diagnostics
+randomization (KASLR). Known open disclosure: mirrored console diagnostics
 ([#440](https://github.com/kottlerg/seraph/issues/440)).
 
 ---
@@ -16,8 +14,7 @@ KASLR randomizes the kernel's virtual base. A single kernel virtual address (VA)
 kernel pointer, or value derived from one that reaches userspace defeats base
 randomization. This inventory audits the kernel's complete output surface and
 records, per surface, why it carries no kernel VA or, for each known open
-disclosure ([#577](https://github.com/kottlerg/seraph/issues/577),
-[#440](https://github.com/kottlerg/seraph/issues/440)), what it leaks. It is the
+disclosure ([#440](https://github.com/kottlerg/seraph/issues/440)), what it leaks. It is the
 standing reference the coding-standards rule "Cross-Boundary Data Hygiene"
 ([docs/coding-standards.md](../../../docs/coding-standards.md)) requires every new
 cross-boundary output to be added to.
@@ -167,11 +164,11 @@ source-object pointers) — plus the retype allocator's free-list links (offsets
 into the region, not addresses). The donating capability cannot map what it
 has retyped away: `SYS_MEM_MAP` refuses a range below its retype bump cursor
 ([docs/capability-model.md § Typed Memory](../../../docs/capability-model.md#typed-memory)).
-The converse order is open: a retype into pages the holder already maps puts
-kernel state behind a live user mapping
-([#577](https://github.com/kottlerg/seraph/issues/577)). Until that closes,
-the claim that no kernel object state in donated memory reaches userspace
-holds only for a donor that maps none of the region it retypes from.
+Nor can a retype carve a page any address space maps: the kernel counts the
+user mappings of every frame of RAM and refuses a retype over a mapped page
+([memory-internals.md](memory-internals.md) § Frame Map Table), so no kernel
+object state in donated memory sits behind a live user mapping, whichever order
+the map and the retype came in.
 
 Memory the bootloader used is a related surface, whether it is donated
 through `reclaim_ranges` or returned by the memory map as usable and drained

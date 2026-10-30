@@ -477,6 +477,7 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
         if HANDOVER_COMPLETE.load(core::sync::atomic::Ordering::Acquire)
         {
             flush_synthetic_logd_line(b"handover complete; init-logd thread exiting");
+            arch::current::serial_release();
             syscall::thread_exit();
         }
 

@@ -468,8 +468,10 @@ const SCOPE_PROMPT = [
         (DELTA
             ? 'the delta (every file it lists; the script aborts on a file the whole PR ' +
                 'diff does not touch, since it cannot confirm that file\'s membership)'
-            : 'the PR diff') +
-        ', with path; changed = added plus deleted lines; kind = code (Rust, assembly, ' +
+            : 'the PR diff, one per path the name-only list prints, a symlink or submodule ' +
+                'entry included') +
+        ', with path; changed = added plus deleted lines (0 where numstat prints `-`); kind = ' +
+        'code (Rust, assembly, ' +
         'linker scripts, build inputs, anything a build embeds), markdown, comment-only (only ' +
         'comment lines changed), rules (`.claude/` and `.github/`), or other.',
     '- pr_files: every path `git diff --name-only --no-renames <base> <head>` prints, ' +
@@ -547,8 +549,13 @@ for (const f of scope.files) f.path = normalize(f.path)
 const pr_files = new Set(scope.pr_files.map(normalize))
 const open_issue_numbers = new Set(scope.open_issues.map((i) => i.number))
 const issue_title = (n) => (scope.open_issues.find((i) => i.number === n) || {}).title || ''
-if (!Number.isInteger(scope.pr_file_count) || scope.pr_file_count <= 0) {
+if (!Number.isInteger(scope.pr_file_count) || scope.pr_file_count < 0) {
     return { error: 'scope returned no pr_file_count; the PR file list cannot be confirmed' }
+}
+if (scope.pr_file_count === 0) {
+    return {
+        error: 'the PR diff against merge base ' + scope.base + ' is empty; nothing to review',
+    }
 }
 if (pr_files.size !== scope.pr_file_count) {
     return {

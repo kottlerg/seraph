@@ -32,13 +32,15 @@
 //! shootdown ([`shootdown_remote`]); the shootdown is skipped for Fresh and Widen
 //! rewrites ([`MapOutcome`](crate::mm::paging::MapOutcome)). Region teardown
 //! ([`unmap_region_pooled`](AddressSpace::unmap_region_pooled)) is the exception:
-//! it holds `pt_lock` across its one coarse shootdown, so that no CPU can reuse a
-//! just-freed page-table frame before every TLB and paging-structure cache is
-//! clean. The protocol and the classification are defined in
-//! `core/kernel/docs/memory-internals.md` § SMP TLB Shootdown. The only lock that
-//! nests under `pt_lock` is the PT-frame source: the wrapper's pool lock on the
-//! pooled path, the kernel page-table pool lock on the kernel-direct path. The
-//! local flush runs unconditionally regardless of class.
+//! it holds `pt_lock` across its one coarse shootdown, plus one span
+//! invalidation under `pt_lock` each time the cleared frames overflow the
+//! frame-map release batch, so that no CPU can reuse a just-freed page-table
+//! frame before every TLB and paging-structure cache is clean. The protocol and
+//! the classification are defined in `core/kernel/docs/memory-internals.md`
+//! § SMP TLB Shootdown. The only lock that nests under `pt_lock` is the
+//! PT-frame source: the wrapper's pool lock on the pooled path, the kernel
+//! page-table pool lock on the kernel-direct path. The local flush runs
+//! unconditionally regardless of class.
 //!
 //! Fresh/Widen safety rests on the spurious-fault retry (Widen) and on x86-64 not
 //! caching not-present entries (Fresh) — not on the context-switch TLB flush — so
@@ -958,8 +960,11 @@ impl AddressSpace
 
     /// Invalidate the TLB entries of `[virt_base, + page_count pages)` on this
     /// CPU, if it runs this address space, and on every other CPU that does,
-    /// after leaf entries in the span were cleared without freeing a page
-    /// table. Per page up to `RANGE_FLUSH_CEILING_PAGES`, a full flush above.
+    /// after leaf entries in the span were cleared. It covers the cleared
+    /// leaves' translations only: a caller that freed page tables owns the
+    /// paging-structure-cache flush (`unmap_region_pooled`'s closing coarse
+    /// shootdown). Per page up to `RANGE_FLUSH_CEILING_PAGES`, a full flush
+    /// above.
     ///
     /// Must run with preemption disabled.
     #[cfg(not(test))]
@@ -982,8 +987,9 @@ impl AddressSpace
         if self.active_cpus.test_cpu(current, Ordering::Acquire)
         {
             // SAFETY: ring 0 / S-mode; the per-VA invalidations are bracketed
-            // by the batch window; no page table was freed, so leaf
-            // invalidation suffices.
+            // by the batch window; they clear the cleared leaves'
+            // translations, and a caller that freed page tables flushes the
+            // paging-structure caches itself (rustdoc above).
             unsafe {
                 if ranged
                 {
@@ -1035,8 +1041,10 @@ impl AddressSpace
     ///
     /// Drives `SYS_MEM_UNMAP` with `MEM_UNMAP_RECLAIM_PTS` (memmgr region
     /// teardown). Unlike the per-page [`unmap_page`](Self::unmap_page), it tears
-    /// the whole span down under a single `pt_lock` hold and a single coarse TLB
-    /// + paging-structure-cache shootdown.
+    /// the whole span down under a single `pt_lock` hold and a single coarse
+    /// TLB and paging-structure-cache shootdown, plus one span invalidation
+    /// under `pt_lock` each time the cleared frames overflow the frame-map
+    /// release batch (core/kernel/docs/memory-internals.md § Frame Map Table).
     ///
     /// `aso` MUST wrap *this* `AddressSpace`; `sys_mem_unmap` enforces this by
     /// resolving both from the same capability.
@@ -1074,7 +1082,8 @@ impl AddressSpace
             })
         };
 
-        // ONE coarse shootdown for the whole teardown, performed UNDER pt_lock
+        // ONE coarse shootdown closes the teardown (the batch drains add span
+        // invalidations, also under pt_lock), performed UNDER pt_lock
         // (the per-VA `unmap_page` drops the lock first for throughput; here it
         // must stay held). A freed PT frame is poppable only via `alloc_pt_page`,
         // which runs under THIS `pt_lock`, so no other CPU reuses a just-freed

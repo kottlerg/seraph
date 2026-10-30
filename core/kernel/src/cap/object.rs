@@ -3761,7 +3761,7 @@ unsafe fn dealloc_object_one(
             );
             use crate::cap::retype::{dispatch_for, retype_free};
             let raw_bytes = dispatch_for(ObjectType::WaitSet, 0)
-                .map_or(crate::mm::PAGE_SIZE as u64, |e| e.raw_bytes);
+                .map_or(syscall::WAIT_SET_RETYPE_BYTES, |e| e.raw_bytes);
             // SAFETY: ancestor_ptr non-null.
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             let header_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);

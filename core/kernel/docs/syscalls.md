@@ -1049,7 +1049,7 @@ Remove a mapping from an address space.
 | 0 | `aspace_cap` | Address space capability (Map rights) |
 | 1 | `virt` | Virtual address to unmap (page-aligned, user range) |
 | 2 | `page_count` | Number of pages to unmap (nonzero) |
-| 3 | `flags` | Bit `MEM_UNMAP_RECLAIM_PTS`: tear down the whole span and reclaim now-empty intermediate page tables with a single coarse shootdown |
+| 3 | `flags` | Bit `MEM_UNMAP_RECLAIM_PTS`: tear down the whole span and reclaim now-empty intermediate page tables with a single coarse shootdown, plus one span invalidation each time the cleared frames overflow the frame-map release batch |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 

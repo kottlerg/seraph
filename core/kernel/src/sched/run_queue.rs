@@ -603,8 +603,9 @@ impl PerCpuScheduler
 
     /// Return `true` if any thread is ready to run (non-empty run queues).
     ///
-    /// Lockless. Acquire pairs with the Release `fetch_or` in `enqueue`
-    /// (and the Release `fetch_and` in `remove_from_queue`/dequeue paths):
+    /// Lockless. Acquire pairs with the Release `fetch_or` in `link`
+    /// (`enqueue` / `enqueue_at_head`), and the Release `fetch_and` in
+    /// `remove_from_queue`/dequeue paths:
     /// observing a set bit means the queue-entry stores from the enqueueing
     /// CPU are visible; observing a clear bit means the dequeue that cleared
     /// it is visible. Used by the idle loop without holding `self.lock`.

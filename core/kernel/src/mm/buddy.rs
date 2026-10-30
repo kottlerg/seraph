@@ -9,38 +9,34 @@
 //!
 //! # Design
 //!
-//! Free block metadata is stored in a fixed-size internal pool of index-linked
-//! list nodes rather than in the free pages; see
-//! core/kernel/docs/memory-internals.md § Data Structures.
-//!
-//! Each order maintains a singly-linked list of free block addresses. Links are
-//! pool slot indices (u16, 1-indexed). Slot 0 is the list/pool sentinel (NONE).
-//! Nodes are recycled via a free-node pool (also index-linked).
+//! Free-block links are intrusive: each free block's first bytes hold a
+//! [`FreeHeader`] naming the next free block of the same order, reached
+//! through a [`PhysWindow`] (the direct physical map in the kernel). No
+//! metadata lives outside the free pages, so no RAM size exhausts the
+//! allocator; see core/kernel/docs/memory-internals.md § Data Structures.
 //!
 //! # Initial state
 //!
 //! `BuddyAllocator::new()` returns an all-zero struct, so a
-//! `static mut BuddyAllocator = BuddyAllocator::new()` is placed in `.bss`
-//! and does not inflate the kernel binary.
-//!
-//! # Capacity
-//!
-//! `POOL_SIZE` bounds the simultaneously tracked free blocks across all
-//! orders; its capacity is specified in core/kernel/docs/memory-internals.md
-//! § Data Structures. Exhausting it halts the boot (see `push_block`).
+//! `static mut BuddyAllocator = BuddyAllocator::new()` is placed in `.bss`.
+//! The allocator is populated by [`add_region`][BuddyAllocator::add_region]
+//! once the direct map is live (core/kernel/docs/initialization.md § Phase 3);
+//! an [`alloc`][BuddyAllocator::alloc] before the first `add_region` is a
+//! boot-order defect and halts the kernel.
 //!
 //! # Post-handoff sealing
 //!
 //! Phase 7 drains every page into userspace Memory caps
-//! (`drain_for_usercaps(0, …)`) and then [`seal`][BuddyAllocator::seal]s the
-//! allocator; a post-seal [`free_range`][BuddyAllocator::free_range] trips a
-//! `debug_assert`. The ownership rule is specified in
-//! docs/userspace-memory-model.md § Ownership Boundaries.
+//! ([`drain_coalesced`][BuddyAllocator::drain_coalesced]) and then
+//! [`seal`][BuddyAllocator::seal]s the allocator; a post-seal
+//! [`free_range`][BuddyAllocator::free_range] trips a `debug_assert`. The
+//! ownership rule is specified in docs/userspace-memory-model.md § Ownership
+//! Boundaries.
 
-// cast_possible_truncation: u64→usize and usize→u16 casts bounded by physical address ranges.
-// large_stack_arrays: BuddyAllocator is placed in .bss as a static; the large arrays are
-// legitimate kernel data structures, not accidental stack allocations.
-#![allow(clippy::cast_possible_truncation, clippy::large_stack_arrays)]
+// cast_possible_truncation: u64→usize page-count casts bounded by physical address ranges.
+#![allow(clippy::cast_possible_truncation)]
+
+use core::marker::PhantomData;
 
 /// Size of a single physical page in bytes.
 pub const PAGE_SIZE: usize = 4096;
@@ -53,37 +49,80 @@ pub const MAX_ORDER: usize = 11;
 /// Number of order levels (0 through `MAX_ORDER` inclusive).
 const ORDER_COUNT: usize = MAX_ORDER + 1;
 
-/// Maximum simultaneously tracked free blocks across all orders.
-/// 4096 entries ≈ 32 GiB at order 11 (8 MiB per block).
-const POOL_SIZE: usize = 4096;
+/// End-of-list marker. Physical frame 0 is never a buddy block (see
+/// [`BuddyAllocator::add_region`]), so address 0 cannot name a free block.
+const NONE: u64 = 0;
 
-/// Sentinel slot index meaning "end of list" or "empty".
-/// Slot 0 is reserved; valid slots are `1..=POOL_SIZE`.
-const NONE: u16 = 0;
+/// Bins of the drain's bottom-up list merge sort: bin `i` holds a sorted run
+/// of `2^i` blocks, so 64 bins sort any count of blocks a `u64` can number.
+const SORT_BINS: usize = 64;
+
+/// Link record written into the first bytes of every free block.
+#[repr(C)]
+pub struct FreeHeader
+{
+    /// Physical address of the next free block on the same list, or 0.
+    next: u64,
+    /// Order of the block this header heads.
+    order: u64,
+}
+
+/// Access to the memory of free blocks.
+///
+/// # Safety
+///
+/// For every physical address `phys` of a block the allocator holds as free,
+/// [`header`][Self::header] MUST return a pointer, aligned for
+/// [`FreeHeader`], through which the block's first `size_of::<FreeHeader>()`
+/// bytes are readable and writable and which no other code accesses while the
+/// block is free.
+pub unsafe trait PhysWindow
+{
+    /// Pointer to the header slot of the free block at `phys`.
+    fn header(phys: u64) -> *mut FreeHeader;
+}
+
+/// The kernel's window: the direct physical map, live from Phase 3.
+pub struct DirectMap;
+
+// SAFETY: the direct map covers all RAM from Phase 3 on
+// (core/kernel/docs/initialization.md § Phase 3), the allocator is populated
+// only after it is live, and a free block is page-aligned RAM that only the
+// allocator accesses (the `add_region` and `free` contracts).
+unsafe impl PhysWindow for DirectMap
+{
+    fn header(phys: u64) -> *mut FreeHeader
+    {
+        crate::mm::paging::phys_to_virt(phys) as *mut FreeHeader
+    }
+}
+
+/// The drain's output did not fit the caller's buffer.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DrainOverflow
+{
+    /// Coalesced extents the free blocks formed.
+    pub extents: usize,
+}
 
 /// Physical buddy allocator.
 ///
-/// Tracks free frames with per-order singly-linked lists whose node metadata
-/// lives in internal static arrays rather than inside the free pages. The
-/// struct is all-zero-constructible (`BuddyAllocator::new()`) and safe to
-/// store as a `static mut` in the kernel BSS.
-pub struct BuddyAllocator
+/// Tracks free frames with per-order singly-linked lists threaded through the
+/// free blocks themselves. The struct is all-zero-constructible
+/// (`BuddyAllocator::new()`) and safe to store as a `static mut` in the kernel
+/// BSS.
+pub struct BuddyAllocator<W: PhysWindow = DirectMap>
 {
-    /// Physical block address stored at each pool slot (slot 0 unused).
-    addrs: [u64; POOL_SIZE + 1],
-    /// Next slot index in the same list for each pool slot (0 = NONE).
-    nexts: [u16; POOL_SIZE + 1],
-    /// Head slot index for each order's free list (0 = empty list).
-    free_lists: [u16; ORDER_COUNT],
-    /// Head of the unused-slot pool chain. 0 = not yet initialised.
-    pool_head: u16,
-    /// Whether the unused-slot chain in `nexts` has been set up.
-    pool_init: bool,
+    /// Head block address for each order's free list (0 = empty list).
+    free_lists: [u64; ORDER_COUNT],
     /// Total number of free 4 KiB pages across all orders.
     free_pages: usize,
     /// Total number of 4 KiB pages added via `add_region` or
     /// `register_owned_range`. Fixed at boot.
     total_pages: usize,
+    /// Set by the first [`add_region`][Self::add_region]; an
+    /// [`alloc`][Self::alloc] before it halts the boot.
+    populated: bool,
     /// Set by [`seal`][Self::seal] after the Phase-7 drain
     /// (docs/userspace-memory-model.md § Ownership Boundaries).
     /// [`free_range`][Self::free_range] trips on a post-seal free.
@@ -93,9 +132,11 @@ pub struct BuddyAllocator
     /// page must not brick a release boot; CI's debug matrix enforces it).
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     sealed: bool,
+    /// The window through which free-block headers are reached.
+    window: PhantomData<W>,
 }
 
-impl BuddyAllocator
+impl<W: PhysWindow> BuddyAllocator<W>
 {
     /// Create an empty allocator with no usable memory.
     ///
@@ -104,26 +145,26 @@ impl BuddyAllocator
     pub const fn new() -> Self
     {
         Self {
-            addrs: [0u64; POOL_SIZE + 1],
-            nexts: [0u16; POOL_SIZE + 1],
-            free_lists: [0u16; ORDER_COUNT],
-            pool_head: 0,
-            pool_init: false,
+            free_lists: [NONE; ORDER_COUNT],
             free_pages: 0,
             total_pages: 0,
+            populated: false,
             sealed: false,
+            window: PhantomData,
         }
     }
 
     /// Add a contiguous physical region `[start, end)` to the allocator.
     ///
     /// `start` and `end` must be [`PAGE_SIZE`]-aligned. The region is split
-    /// into maximally-sized aligned buddy blocks and inserted into free lists.
+    /// into maximally-sized aligned buddy blocks and inserted into free lists;
+    /// each block's header is written into its first bytes.
     ///
     /// # Safety
     ///
     /// The caller must guarantee that:
-    /// - The region is valid, usable physical RAM not occupied by any live data.
+    /// - The region is valid, usable physical RAM not occupied by any live data,
+    ///   reachable through `W` (in the kernel, the direct map is live).
     /// - No other code will access the region until frames are allocated from it.
     pub unsafe fn add_region(&mut self, start: u64, end: u64)
     {
@@ -133,8 +174,11 @@ impl BuddyAllocator
         );
         debug_assert!(end.is_multiple_of(PAGE_SIZE as u64), "end not page-aligned");
 
+        self.populated = true;
+
         // Reserve physical frame 0, the page-table and CSpace pool empty-list
-        // sentinel; see docs/memory-model.md § Buddy Allocator.
+        // sentinel and this allocator's own end-of-list marker; see
+        // docs/memory-model.md § Buddy Allocator.
         let start = start.max(PAGE_SIZE as u64);
 
         if start >= end
@@ -158,7 +202,9 @@ impl BuddyAllocator
                 })
                 .unwrap_or(0);
 
-            self.push_block(order, cursor);
+            // SAFETY: the block lies in the caller's region, which is free RAM
+            // reachable through W and accessed by nothing else.
+            unsafe { self.push_block(order, cursor) };
             cursor += (PAGE_SIZE << order) as u64;
         }
     }
@@ -166,8 +212,24 @@ impl BuddyAllocator
     /// Allocate a block of `2^order` pages.
     ///
     /// Returns the physical base address, or `None` if no block is available.
+    /// Only blocks on a free list carry a header (a merge clears the header of
+    /// every buddy it absorbs), and the returned block's own header bytes (its
+    /// first 16) are zeroed, so no free-list
+    /// link survives into an allocated block; the rest of the block keeps
+    /// whatever it held.
+    ///
+    /// An allocation before the first [`add_region`][Self::add_region] halts
+    /// the kernel (host test builds return `None`): it is a boot-order defect,
+    /// not an out-of-memory condition.
     pub fn alloc(&mut self, order: usize) -> Option<u64>
     {
+        if !self.populated
+        {
+            #[cfg(not(test))]
+            crate::fatal("buddy: allocation before the allocator is populated (Phase 3)");
+            #[cfg(test)]
+            return None;
+        }
         if order > MAX_ORDER
         {
             return None;
@@ -185,9 +247,14 @@ impl BuddyAllocator
         {
             current_order -= 1;
             let buddy_addr = block + (PAGE_SIZE << current_order) as u64;
-            self.push_block(current_order, buddy_addr);
+            // SAFETY: the upper half of a block popped from a free list is
+            // free RAM the allocator owns.
+            unsafe { self.push_block(current_order, buddy_addr) };
         }
 
+        // SAFETY: `block` was free until the pop above, so W reaches its
+        // header slot and nothing else accesses it yet.
+        unsafe { W::header(block).write(FreeHeader { next: 0, order: 0 }) };
         Some(block)
     }
 
@@ -200,9 +267,8 @@ impl BuddyAllocator
     ///
     /// The caller must guarantee that:
     /// - Every page of the `2^order` block at `addr` was allocated from this
-    ///   buddy (by [`alloc`][Self::alloc] or
-    ///   [`drain_for_usercaps`][Self::drain_for_usercaps], alone or as part of a
-    ///   larger such block) and none of it is on a free list.
+    ///   buddy (by [`alloc`][Self::alloc], alone or as part of a larger such
+    ///   block) and none of it is on a free list.
     /// - The block is no longer accessed by any code.
     /// - `addr` is [`PAGE_SIZE`]-aligned.
     pub unsafe fn free(&mut self, addr: u64, order: usize)
@@ -229,7 +295,9 @@ impl BuddyAllocator
             }
         }
 
-        self.push_block(current_order, current_addr);
+        // SAFETY: the merged block is the caller's freed block plus buddies
+        // just unlinked from free lists, all free RAM the allocator owns.
+        unsafe { self.push_block(current_order, current_addr) };
     }
 
     /// Total number of free 4 KiB pages in the allocator.
@@ -324,170 +392,213 @@ impl BuddyAllocator
         self.total_pages
     }
 
-    // ── Pool management ───────────────────────────────────────────────────────
-
-    /// Build the unused-slot chain on first use.
+    /// Drain every free block, writing the free memory into `out` as
+    /// address-sorted, maximally coalesced `(base, size_bytes)` extents.
     ///
-    /// Chains slots 1 → 2 → … → `POOL_SIZE` → 0 (NONE) through `nexts`.
-    /// Must be called before any `pool_alloc`.
-    fn init_pool(&mut self)
+    /// Returns the number of extents written. Every free page leaves the
+    /// allocator whatever the outcome. When the extents outnumber `out`, the
+    /// first `out.len()` are written and `Err` carries the full extent count,
+    /// so the caller can report both.
+    ///
+    /// The extents still hold the drained blocks' headers in their first
+    /// bytes; the caller zeroes each extent before exposing it
+    /// (core/kernel/docs/cross-boundary-disclosure.md § Kernel state in
+    /// donated memory). Called once during Phase 7, emptying the buddy
+    /// (core/kernel/docs/initialization.md § Phase 7: Capability System).
+    ///
+    /// # Errors
+    ///
+    /// [`DrainOverflow`] when the coalesced extents do not fit `out`.
+    pub fn drain_coalesced(&mut self, out: &mut [(u64, u64)]) -> Result<usize, DrainOverflow>
     {
-        if self.pool_init
-        {
-            return;
-        }
-        for i in 1..POOL_SIZE
-        {
-            self.nexts[i] = (i + 1) as u16;
-        }
-        self.nexts[POOL_SIZE] = NONE;
-        self.pool_head = 1;
-        self.pool_init = true;
-    }
+        let sorted = self.drain_sorted();
 
-    /// Take one slot from the unused-slot pool. Returns `None` if exhausted.
-    fn pool_alloc(&mut self) -> Option<u16>
-    {
-        if self.pool_head == NONE
+        let mut extents = 0usize;
+        let mut current: Option<(u64, u64)> = None;
+        let mut cursor = sorted;
+        while cursor != NONE
         {
-            return None;
+            // SAFETY: `cursor` heads a drained block on the sorted chain; its
+            // memory has not been released to anyone yet.
+            let header = unsafe { W::header(cursor).read() };
+            let size = (PAGE_SIZE as u64) << header.order;
+            current = match current
+            {
+                Some((base, len)) if base + len == cursor => Some((base, len + size)),
+                Some(done) =>
+                {
+                    if let Some(slot) = out.get_mut(extents)
+                    {
+                        *slot = done;
+                    }
+                    extents += 1;
+                    Some((cursor, size))
+                }
+                None => Some((cursor, size)),
+            };
+            cursor = header.next;
         }
-        let slot = self.pool_head;
-        self.pool_head = self.nexts[slot as usize];
-        Some(slot)
-    }
+        if let Some(done) = current
+        {
+            if let Some(slot) = out.get_mut(extents)
+            {
+                *slot = done;
+            }
+            extents += 1;
+        }
 
-    /// Return a slot to the unused-slot pool.
-    fn pool_free(&mut self, slot: u16)
-    {
-        debug_assert!(slot != NONE);
-        self.nexts[slot as usize] = self.pool_head;
-        self.pool_head = slot;
+        if extents > out.len()
+        {
+            return Err(DrainOverflow { extents });
+        }
+        Ok(extents)
     }
 
     // ── Free list operations ─────────────────────────────────────────────────
 
-    /// Push a free block address onto the head of the free list for `order`.
+    /// Push a free block address onto the head of the free list for `order`,
+    /// writing its header.
     ///
-    /// Halts the boot if the pool is exhausted (see `POOL_SIZE`): the kernel
-    /// prints `[buddy] POOL EXHAUSTED` and spins; host test builds drop the block.
-    fn push_block(&mut self, order: usize, addr: u64)
+    /// # Safety
+    ///
+    /// `addr` is a free block of `2^order` pages that the allocator owns and
+    /// `W` reaches.
+    unsafe fn push_block(&mut self, order: usize, addr: u64)
     {
-        self.init_pool();
-        let Some(slot) = self.pool_alloc()
-        else
-        {
-            // Pool exhausted: halt the boot (host tests drop the block instead).
-            // Increase POOL_SIZE if this occurs.
-            #[cfg(not(test))]
-            crate::kprintln!(
-                "[buddy] POOL EXHAUSTED: free_pages={} order={}",
-                self.free_pages,
-                order
-            );
-            #[cfg(not(test))]
-            loop
-            {
-                core::hint::spin_loop();
-            }
-            #[cfg(test)]
-            return;
-        };
-        self.addrs[slot as usize] = addr;
-        self.nexts[slot as usize] = self.free_lists[order];
-        self.free_lists[order] = slot;
+        // SAFETY: caller's contract.
+        unsafe {
+            W::header(addr).write(FreeHeader {
+                next: self.free_lists[order],
+                order: order as u64,
+            });
+        }
+        self.free_lists[order] = addr;
         self.free_pages += 1 << order;
     }
 
     /// Pop the head block from the free list for `order`. Returns `None` if empty.
     fn pop_block(&mut self, order: usize) -> Option<u64>
     {
-        let slot = self.free_lists[order];
-        if slot == NONE
+        let addr = self.free_lists[order];
+        if addr == NONE
         {
             return None;
         }
-        let addr = self.addrs[slot as usize];
-        self.free_lists[order] = self.nexts[slot as usize];
-        self.pool_free(slot);
+        // SAFETY: `addr` heads a free list, so it is a free block whose header
+        // `push_block` wrote and W reaches.
+        let next = unsafe { (*W::header(addr)).next };
+        self.free_lists[order] = next;
         self.free_pages -= 1 << order;
         Some(addr)
     }
 
-    /// Drain free blocks for userspace Memory caps, leaving at least
-    /// `reserve_pages` pages in the buddy.
-    ///
-    /// Pops blocks from highest order downward, writing `(physical_address, order)`
-    /// pairs into `out`. Returns the number of entries written.
-    ///
-    /// Called once during Phase 7 with `reserve_pages == 0`, emptying the buddy;
-    /// the kernel reserves are taken before the drain
-    /// (core/kernel/docs/initialization.md § Phase 7: Capability System).
-    pub fn drain_for_usercaps(&mut self, reserve_pages: usize, out: &mut [(u64, usize)]) -> usize
-    {
-        let mut count = 0;
-
-        // Drain from highest order first to produce fewer, larger Memory caps.
-        for order in (0..=MAX_ORDER).rev()
-        {
-            while self.free_pages > reserve_pages && count < out.len()
-            {
-                let pages_in_block = 1usize << order;
-
-                // Don't drain if it would drop below the reserve.
-                if self.free_pages.saturating_sub(pages_in_block) < reserve_pages
-                {
-                    break;
-                }
-
-                if let Some(addr) = self.pop_block(order)
-                {
-                    out[count] = (addr, order);
-                    count += 1;
-                }
-                else
-                {
-                    break;
-                }
-            }
-        }
-
-        count
-    }
-
     /// Remove a specific block address from the free list for `order`.
     ///
-    /// Returns `true` if found and removed. O(n) in list length; acceptable
-    /// at boot time.
+    /// Returns `true` if found and removed, with its header cleared. O(n) in
+    /// list length; acceptable at boot time. Reads only the headers of blocks
+    /// on the list, never the target unless it is on the list, since it may be
+    /// allocated.
     fn remove_block(&mut self, order: usize, target: u64) -> bool
     {
-        // `prev` tracks the slot whose `nexts` points to `cur`
+        // `prev` is the block whose header links to `cur`
         // (NONE means `free_lists[order]` itself points to `cur`).
         let mut prev = NONE;
         let mut cur = self.free_lists[order];
 
         while cur != NONE
         {
-            if self.addrs[cur as usize] == target
+            // SAFETY: `cur` is on a free list, so its header is live.
+            let next = unsafe { (*W::header(cur)).next };
+            if cur == target
             {
-                let next = self.nexts[cur as usize];
                 if prev == NONE
                 {
                     self.free_lists[order] = next;
                 }
                 else
                 {
-                    self.nexts[prev as usize] = next;
+                    // SAFETY: `prev` is on the same free list.
+                    unsafe { (*W::header(prev)).next = next };
                 }
-                self.pool_free(cur);
+                // The block is absorbed into a merged block whose header sits
+                // at the merged base; clearing this one keeps the rule that
+                // only blocks on a free list carry a header.
+                // SAFETY: `cur` was free until the unlink above; the caller
+                // owns it as part of the block being merged.
+                unsafe { W::header(cur).write(FreeHeader { next: 0, order: 0 }) };
                 self.free_pages -= 1 << order;
                 return true;
             }
             prev = cur;
-            cur = self.nexts[cur as usize];
+            cur = next;
         }
 
         false
+    }
+
+    /// Empty every free list into one chain sorted by address and return its
+    /// head. Each block's header keeps its order; `free_pages` drops to 0.
+    ///
+    /// A bottom-up merge sort over the intrusive links: no buffer, and a
+    /// stack of [`SORT_BINS`] list heads.
+    fn drain_sorted(&mut self) -> u64
+    {
+        let mut bins = [NONE; SORT_BINS];
+        for order in 0..=MAX_ORDER
+        {
+            while let Some(block) = self.pop_block(order)
+            {
+                // SAFETY: `block` was just popped; the drain owns its header.
+                unsafe { (*W::header(block)).next = NONE };
+                let mut carry = block;
+                for bin in &mut bins
+                {
+                    if *bin == NONE
+                    {
+                        *bin = carry;
+                        carry = NONE;
+                        break;
+                    }
+                    carry = Self::merge(*bin, carry);
+                    *bin = NONE;
+                }
+                debug_assert!(carry == NONE, "drain sort bins exhausted");
+            }
+        }
+        bins.iter().fold(NONE, |acc, &bin| Self::merge(bin, acc))
+    }
+
+    /// Merge two address-sorted chains of drained blocks into one.
+    fn merge(mut a: u64, mut b: u64) -> u64
+    {
+        let mut head = NONE;
+        let mut tail = NONE;
+        while a != NONE && b != NONE
+        {
+            let take = if a < b { &mut a } else { &mut b };
+            let block = *take;
+            // SAFETY: `block` is a drained block on one of the two chains.
+            *take = unsafe { (*W::header(block)).next };
+            Self::link(&mut head, tail, block);
+            tail = block;
+        }
+        Self::link(&mut head, tail, if a == NONE { b } else { a });
+        head
+    }
+
+    /// Append `block` (possibly a chain, possibly empty) after `tail`, or make
+    /// it the chain's `head` when the chain is empty.
+    fn link(head: &mut u64, tail: u64, block: u64)
+    {
+        if tail == NONE
+        {
+            *head = block;
+        }
+        else
+        {
+            // SAFETY: `tail` is a drained block on the chain being built.
+            unsafe { (*W::header(tail)).next = block };
+        }
     }
 }
 
@@ -497,250 +608,256 @@ impl BuddyAllocator
 mod tests
 {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
 
-    /// Allocate a Vec with enough room to carve out `pages` naturally-aligned pages.
-    ///
-    /// Aligns to `pages * PAGE_SIZE` so that the returned region forms a valid
-    /// buddy block at the appropriate order (required for coalescing tests).
-    /// Returns the Vec (must stay alive for the duration of the test) plus
-    /// the aligned `[start, end)` range within it.
-    fn aligned_buf(pages: usize) -> (Vec<u8>, u64, u64)
+    std::thread_local! {
+        /// Backing for the header slots of synthetic physical addresses.
+        static HEADERS: RefCell<HashMap<u64, Box<FreeHeader>>> = RefCell::new(HashMap::new());
+    }
+
+    /// A window that backs only the header slot of each address it is asked
+    /// for, so tests can manage terabytes of synthetic physical memory.
+    struct SparseWindow;
+
+    // SAFETY: each address maps to its own boxed header that lives in the
+    // thread-local map for the rest of the test thread; nothing else uses it.
+    unsafe impl PhysWindow for SparseWindow
     {
-        // Over-allocate by one full aligned chunk so the start can always be
-        // placed at a naturally aligned address.
-        let align = PAGE_SIZE * pages;
-        let buf = vec![0u8; align * 2];
-        let ptr = buf.as_ptr() as u64;
-        let start = (ptr + align as u64 - 1) & !(align as u64 - 1);
-        let end = start + align as u64;
-        (buf, start, end)
+        fn header(phys: u64) -> *mut FreeHeader
+        {
+            HEADERS.with(|map| {
+                let mut map = map.borrow_mut();
+                let slot = map
+                    .entry(phys)
+                    .or_insert_with(|| Box::new(FreeHeader { next: 0, order: 0 }));
+                core::ptr::from_mut::<FreeHeader>(slot.as_mut())
+            })
+        }
+    }
+
+    type Alloc = BuddyAllocator<SparseWindow>;
+
+    /// Base of the synthetic test regions: 1 GiB, aligned to every order.
+    const BASE: u64 = 1 << 30;
+
+    fn pages(n: u64) -> u64
+    {
+        n * PAGE_SIZE as u64
+    }
+
+    /// An allocator holding the single region `[BASE, BASE + pages(n))`.
+    fn with_region(n: u64) -> Alloc
+    {
+        let mut alloc = Alloc::new();
+        // SAFETY: SparseWindow backs every header slot; nothing else uses them.
+        unsafe { alloc.add_region(BASE, BASE + pages(n)) };
+        alloc
     }
 
     #[test]
-    fn new_has_zero_free_pages()
+    fn alloc_before_population_is_refused()
     {
-        let alloc = BuddyAllocator::new();
+        let mut alloc = Alloc::new();
+        assert_eq!(alloc.alloc(0), None);
         assert_eq!(alloc.free_page_count(), 0);
     }
 
     #[test]
-    fn add_single_page_region_free_count_is_one()
+    fn add_region_counts_every_page()
     {
-        let (_buf, start, end) = aligned_buf(1);
-        let mut alloc = BuddyAllocator::new();
-        // SAFETY: _buf is alive and [start, end) is valid, page-aligned, writable
-        // memory not aliased by anything else.
-        unsafe { alloc.add_region(start, end) };
-        assert_eq!(alloc.free_page_count(), 1);
-    }
-
-    #[test]
-    fn add_single_page_region_alloc_succeeds()
-    {
-        let (_buf, start, end) = aligned_buf(1);
-        let mut alloc = BuddyAllocator::new();
-        unsafe { alloc.add_region(start, end) };
-        assert!(alloc.alloc(0).is_some());
-    }
-
-    #[test]
-    fn add_single_page_region_free_count_after_alloc_is_zero()
-    {
-        let (_buf, start, end) = aligned_buf(1);
-        let mut alloc = BuddyAllocator::new();
-        unsafe { alloc.add_region(start, end) };
-        alloc.alloc(0);
-        assert_eq!(alloc.free_page_count(), 0);
-    }
-
-    #[test]
-    fn add_16_page_region_free_count_is_16()
-    {
-        let (_buf, start, end) = aligned_buf(16);
-        let mut alloc = BuddyAllocator::new();
-        unsafe { alloc.add_region(start, end) };
-        assert_eq!(alloc.free_page_count(), 16);
+        // 3 pages pack as an order-1 and an order-0 block.
+        let alloc = with_region(3);
+        assert_eq!(alloc.free_page_count(), 3);
+        assert_eq!(alloc.total_page_count(), 3);
     }
 
     #[test]
     fn add_region_based_at_zero_excludes_frame_zero()
     {
-        // A region starting below PAGE_SIZE loses its zero page: the buddy
-        // reserves frame 0 so phys 0 (the PT/CSpace pool empty-sentinel) is
-        // never a real pool frame. add_region records block addresses in its
-        // own free lists and never dereferences [start, end), so a synthetic
-        // base of 0 is sound here.
-        let mut alloc = BuddyAllocator::new();
-        // SAFETY: add_region only records addresses; it never reads or writes
-        // the [start, end) range, so a non-backed synthetic base is valid.
-        unsafe { alloc.add_region(0, (PAGE_SIZE * 8) as u64) };
-        // 8 pages offered, frame 0 excluded → 7 manageable pages.
+        // Frame 0 is the PT/CSpace pool empty sentinel and the free lists'
+        // end marker, so the buddy never manages it.
+        let mut alloc = Alloc::new();
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe { alloc.add_region(0, pages(8)) };
         assert_eq!(alloc.free_page_count(), 7);
         assert_eq!(alloc.total_page_count(), 7);
+        for _ in 0..7
+        {
+            assert_ne!(alloc.alloc(0), Some(0));
+        }
+        assert_eq!(alloc.alloc(0), None);
     }
 
     #[test]
     fn add_region_single_zero_page_adds_nothing()
     {
-        // The only page is frame 0; after the clamp start == end, so the
-        // region collapses to empty rather than admitting phys 0.
-        let mut alloc = BuddyAllocator::new();
-        // SAFETY: as above — add_region never accesses [start, end).
-        unsafe { alloc.add_region(0, PAGE_SIZE as u64) };
+        let mut alloc = Alloc::new();
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe { alloc.add_region(0, pages(1)) };
         assert_eq!(alloc.free_page_count(), 0);
         assert_eq!(alloc.total_page_count(), 0);
     }
 
     #[test]
-    fn alloc_returns_none_when_empty()
+    fn alloc_returns_none_when_exhausted()
     {
-        let mut alloc = BuddyAllocator::new();
+        let mut alloc = with_region(1);
+        assert_eq!(alloc.alloc(0), Some(BASE));
         assert_eq!(alloc.alloc(0), None);
-    }
-
-    #[test]
-    fn alloc_splits_larger_block_returns_address()
-    {
-        let (_buf, start, end) = aligned_buf(4);
-        let mut alloc = BuddyAllocator::new();
-        unsafe { alloc.add_region(start, end) };
-        assert!(alloc.alloc(0).is_some());
-    }
-
-    #[test]
-    fn alloc_splits_larger_block_remaining_free_count()
-    {
-        let (_buf, start, end) = aligned_buf(4);
-        let mut alloc = BuddyAllocator::new();
-        unsafe { alloc.add_region(start, end) };
-        alloc.alloc(0);
-        // 4 pages added, 1 allocated → 3 remain.
-        assert_eq!(alloc.free_page_count(), 3);
-    }
-
-    #[test]
-    fn free_coalesces_buddies_back_to_order_1()
-    {
-        let (_buf, start, end) = aligned_buf(2);
-        let mut alloc = BuddyAllocator::new();
-        unsafe { alloc.add_region(start, end) };
-
-        // Drain both pages via two order-0 allocations.
-        let a = alloc.alloc(0).expect("first alloc");
-        let b = alloc.alloc(0).expect("second alloc");
-        assert_eq!(alloc.free_page_count(), 0);
-
-        // Return both; they must coalesce back into one order-1 block.
-        unsafe { alloc.free(a, 0) };
-        unsafe { alloc.free(b, 0) };
-        assert_eq!(alloc.free_page_count(), 2);
-
-        // Confirm allocatable as a single order-1 block.
-        assert!(alloc.alloc(1).is_some());
     }
 
     #[test]
     fn alloc_order_too_large_returns_none()
     {
-        let mut alloc = BuddyAllocator::new();
+        let mut alloc = with_region(1 << MAX_ORDER);
         assert_eq!(alloc.alloc(MAX_ORDER + 1), None);
+    }
+
+    #[test]
+    fn alloc_splits_a_larger_block_into_aligned_halves()
+    {
+        // 8 pages pack as one order-3 block; an order-1 request splits it.
+        let mut alloc = with_region(8);
+        let block = alloc.alloc(1).expect("order-1 alloc");
+        assert_eq!(block % pages(2), 0);
+        assert_eq!(alloc.free_page_count(), 6);
+    }
+
+    #[test]
+    fn alloc_clears_the_handed_out_blocks_header()
+    {
+        // The returned block headed a free list (it carried a link); the alloc
+        // path must leave no link in the header bytes.
+        let mut alloc = with_region(4);
+        let a = alloc.alloc(0).expect("first alloc");
+        let b = alloc
+            .alloc(0)
+            .expect("second alloc, popped from a list head");
+        for block in [a, b]
+        {
+            // SAFETY: the slot is backed by SparseWindow and no longer free.
+            let header = unsafe { SparseWindow::header(block).read() };
+            assert_eq!((header.next, header.order), (0, 0));
+        }
+    }
+
+    #[test]
+    fn merged_block_handed_out_carries_no_interior_header()
+    {
+        // Splitting the 4-page block leaves headers at pages 1 (order 0) and
+        // 2 (order 1); freeing page 0 merges both back. The order-2 block then
+        // handed out must hold no header at any sub-block base.
+        let mut alloc = with_region(4);
+        let a = alloc.alloc(0).expect("split alloc");
+        // SAFETY: `a` came from this allocator and is unused.
+        unsafe { alloc.free(a, 0) };
+        let block = alloc.alloc(2).expect("merged block");
+        for offset in 0..4
+        {
+            // SAFETY: the slot is backed by SparseWindow and no longer free.
+            let header = unsafe { SparseWindow::header(block + pages(offset)).read() };
+            assert_eq!((header.next, header.order), (0, 0), "page {offset}");
+        }
+    }
+
+    #[test]
+    fn free_coalesces_buddies_across_levels()
+    {
+        let mut alloc = with_region(4);
+        let blocks: Vec<u64> = (0..4).map(|_| alloc.alloc(0).expect("alloc")).collect();
+        assert_eq!(alloc.free_page_count(), 0);
+        for &b in &blocks
+        {
+            // SAFETY: each block came from this allocator and is unused.
+            unsafe { alloc.free(b, 0) };
+        }
+        assert_eq!(alloc.free_page_count(), 4);
+        assert_eq!(alloc.alloc(2), Some(BASE));
+    }
+
+    #[test]
+    fn free_range_returns_every_page()
+    {
+        let mut alloc = with_region(8);
+        let block = alloc.alloc(3).expect("order-3 alloc");
+        // SAFETY: the block came from this allocator and is unused.
+        unsafe { alloc.free_range(block, pages(8)) };
+        assert_eq!(alloc.free_page_count(), 8);
+        assert_eq!(alloc.alloc(3), Some(BASE));
     }
 
     #[test]
     fn add_region_packs_single_max_order_block()
     {
-        // A naturally-aligned MAX_ORDER-sized region must insert as one block,
-        // allocatable in a single MAX_ORDER request (the per-CPU boot slabs
-        // depend on this at MAX_CPUS; see #376).
-        let (_buf, start, end) = aligned_buf(1 << MAX_ORDER);
-        let mut alloc = BuddyAllocator::new();
-        // SAFETY: _buf is alive and [start, end) is valid, page-aligned,
-        // writable memory not aliased by anything else.
-        unsafe { alloc.add_region(start, end) };
-        assert_eq!(alloc.free_page_count(), 1 << MAX_ORDER);
-
-        let block = alloc.alloc(MAX_ORDER).expect("MAX_ORDER alloc");
-        assert_eq!(block, start);
+        // The per-CPU boot slabs depend on one MAX_ORDER block per aligned
+        // 8 MiB (see #376).
+        let mut alloc = with_region(1 << MAX_ORDER);
+        assert_eq!(alloc.alloc(MAX_ORDER), Some(BASE));
         assert_eq!(alloc.free_page_count(), 0);
     }
 
     #[test]
-    fn free_coalesces_three_levels()
+    fn more_max_order_blocks_than_the_old_pool_are_all_accounted()
     {
-        // 4-page region packs as one order-2 block.  Drain as four order-0
-        // allocations then free all four and verify multi-level coalescing.
-        let (_buf, start, end) = aligned_buf(4);
-        let mut alloc = BuddyAllocator::new();
-        unsafe { alloc.add_region(start, end) };
-        assert_eq!(alloc.free_page_count(), 4);
-
-        let a = alloc.alloc(0).expect("alloc a");
-        let b = alloc.alloc(0).expect("alloc b");
-        let c = alloc.alloc(0).expect("alloc c");
-        let d = alloc.alloc(0).expect("alloc d");
+        // 5000 order-11 blocks (about 39 GiB) exceed the 4096-node pool the
+        // allocator once had; every page must stay allocatable.
+        const BLOCKS: u64 = 5000;
+        let mut alloc = with_region(BLOCKS << MAX_ORDER);
+        assert_eq!(alloc.free_page_count(), (BLOCKS as usize) << MAX_ORDER);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(block) = alloc.alloc(MAX_ORDER)
+        {
+            assert!(seen.insert(block));
+        }
+        assert_eq!(seen.len() as u64, BLOCKS);
         assert_eq!(alloc.free_page_count(), 0);
-
-        // Free all four; expect: 0→1 for a+b, 0→1 for c+d, 1→2 for the pair.
-        unsafe { alloc.free(a, 0) };
-        unsafe { alloc.free(b, 0) };
-        unsafe { alloc.free(c, 0) };
-        unsafe { alloc.free(d, 0) };
-        assert_eq!(alloc.free_page_count(), 4);
-
-        // Fully coalesced block must be allocatable as a single order-2 request.
-        assert!(
-            alloc.alloc(2).is_some(),
-            "coalesced order-2 block should be allocatable"
-        );
     }
 
     #[test]
-    fn alloc_order_1_from_large_region()
+    fn drain_coalesces_blocks_of_all_orders_in_address_order()
     {
-        // 8-page region: add_region packs it as one order-3 block.
-        // Allocating order-1 (2 pages) must split the order-3 block downward.
-        let (_buf, start, end) = aligned_buf(8);
-        let mut alloc = BuddyAllocator::new();
-        unsafe { alloc.add_region(start, end) };
+        // Two regions added high first, the upper one fragmented by an alloc
+        // and a hole; the drain must report sorted, merged extents.
+        let mut alloc = Alloc::new();
+        let high = BASE + pages(1 << 12);
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe {
+            alloc.add_region(high, high + pages(5000));
+            alloc.add_region(BASE + pages(3), BASE + pages(100));
+        }
+        let taken = alloc.alloc(0).expect("alloc");
+        let free_before = alloc.free_page_count() as u64;
 
-        let ptr = alloc.alloc(1).expect("order-1 alloc from 8-page region");
+        let mut out = [(0u64, 0u64); 8];
+        let n = alloc.drain_coalesced(&mut out).expect("fits");
+        let extents = &out[..n];
+        assert!(extents.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0));
+        assert_eq!(extents.iter().map(|e| e.1).sum::<u64>(), pages(free_before));
+        assert!(extents.iter().all(|&(b, s)| taken < b || taken >= b + s));
+        // The order-0 request took page 3, the lower region's only order-0
+        // block; the 5000-page upper region stays one extent.
+        assert_eq!(taken, BASE + pages(3));
+        assert_eq!(extents, [(BASE + pages(4), pages(96)), (high, pages(5000))]);
+        assert_eq!(alloc.free_page_count(), 0);
+    }
+
+    #[test]
+    fn drain_reports_extents_that_do_not_fit()
+    {
+        let mut alloc = Alloc::new();
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe {
+            alloc.add_region(BASE, BASE + pages(1));
+            alloc.add_region(BASE + pages(2), BASE + pages(3));
+            alloc.add_region(BASE + pages(4), BASE + pages(5));
+        }
+        let mut out = [(0u64, 0u64); 2];
         assert_eq!(
-            ptr % (2 * PAGE_SIZE as u64),
-            0,
-            "order-1 alloc must be 2-page aligned"
+            alloc.drain_coalesced(&mut out),
+            Err(DrainOverflow { extents: 3 })
         );
-        // 8 pages minus 2 allocated = 6 remaining.
-        assert_eq!(alloc.free_page_count(), 6);
-    }
-
-    #[test]
-    fn interleaved_alloc_free_preserves_count()
-    {
-        // Allocate 4, free 2, re-allocate 2.  free_page_count must be consistent
-        // at each checkpoint, catching any double-count bugs in the coalescing path.
-        let (_buf, start, end) = aligned_buf(8);
-        let mut alloc = BuddyAllocator::new();
-        unsafe { alloc.add_region(start, end) };
-
-        let a = alloc.alloc(0).unwrap();
-        let b = alloc.alloc(0).unwrap();
-        let c = alloc.alloc(0).unwrap();
-        let d = alloc.alloc(0).unwrap();
-        assert_eq!(alloc.free_page_count(), 4);
-
-        unsafe { alloc.free(b, 0) };
-        unsafe { alloc.free(d, 0) };
-        assert_eq!(alloc.free_page_count(), 6);
-
-        let e = alloc.alloc(0).unwrap();
-        let f = alloc.alloc(0).unwrap();
-        assert_eq!(alloc.free_page_count(), 4);
-
-        // Clean up remaining allocations.
-        unsafe { alloc.free(a, 0) };
-        unsafe { alloc.free(c, 0) };
-        unsafe { alloc.free(e, 0) };
-        unsafe { alloc.free(f, 0) };
-        assert_eq!(alloc.free_page_count(), 8);
+        assert_eq!(out, [(BASE, pages(1)), (BASE + pages(2), pages(1))]);
+        assert_eq!(alloc.free_page_count(), 0);
     }
 }

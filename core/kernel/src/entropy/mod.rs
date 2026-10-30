@@ -215,7 +215,8 @@ mod imp
     /// microarchitectural timing of each absorb perturbs successive reads — a
     /// weak source, but distinct from the firmware seed and the hardware RNG.
     /// Where it is the only source, the result is the boot-entropy hole
-    /// `core/kernel/docs/entropy.md` § Boot-time entropy describes.
+    /// `core/kernel/docs/entropy.md` § Boot-time entropy describes. The 64-sample
+    /// count is a tuning value for a supplementary source; it bounds no capacity.
     fn boot_jitter_scrape()
     {
         for _ in 0..64

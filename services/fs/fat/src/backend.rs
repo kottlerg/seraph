@@ -66,7 +66,8 @@ pub struct FatNode
 
 /// Sentinel for [`FatNode::open_slot`] meaning "no `OpenFile` slot
 /// associated yet". The slot is allocated lazily on first
-/// `FS_READ_MEMORY` against the node cap.
+/// `FS_READ_MEMORY` against the node cap. Slot indices stay below
+/// `MAX_OPEN_FILES`, so `u32::MAX` never names a real slot.
 pub const NO_OPEN_SLOT: u32 = u32::MAX;
 
 /// Index into [`NodeTable`]'s entries of the non-root `id` (`raw - 1`), or

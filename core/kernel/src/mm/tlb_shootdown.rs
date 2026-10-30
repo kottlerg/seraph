@@ -85,7 +85,8 @@ struct TlbShootdownRequest
     /// for the untagged path. When non-zero the target CPU invalidates the
     /// `(tag, va)` entry regardless of the tag it currently has loaded, so a CPU
     /// that has switched to a different space since the snapshot still flushes
-    /// the right translation.
+    /// the right translation. `u16` holds every hardware tag: x86-64 PCIDs are
+    /// 12 bits and RISC-V ASIDs at most 16 (`satp.ASID`).
     tag: AtomicU16,
 
     /// CPUs that must still acknowledge this request. A set bit is both the

@@ -28,6 +28,8 @@ pub fn hw_rng_available() -> bool
 ///
 /// Prefers RDSEED (the seed-grade source); falls back to RDRAND. Both set CF=1
 /// on success; a bounded retry tolerates the transient CF=0 the ISA permits.
+/// The 32-attempt retry is a tolerance, not a capacity: it exceeds the 10 RDRAND
+/// retries Intel's DRNG guidance gives, and a source still unready reports `None`.
 pub fn hw_rng_u64() -> Option<u64>
 {
     if cpuid(7).1 & RDSEED_BIT != 0

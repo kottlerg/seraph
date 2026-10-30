@@ -107,6 +107,9 @@ pub const INIT_MAX_NAMED_MODULES: usize = 12;
 // both the kernel and init must agree on — remain part of the protocol.
 
 /// Number of 4 KiB pages in init's user stack (16 KiB total).
+///
+/// The stack bounds only init's own call depth, which init's fixed code sets
+/// and no hardware count grows.
 pub const INIT_STACK_PAGES: usize = 4;
 
 /// Maximum number of 4 KiB pages the kernel may allocate for the
@@ -127,7 +130,9 @@ pub const INIT_INFO_MAX_PAGES: usize = 4;
 /// a variable-length [`CapDescriptor`] array; the array starts at byte offset
 /// [`InitInfo::cap_descriptors_offset`] from the start of this struct.
 ///
-/// All slot indices refer to init's root `CSpace` (`CSpace` ID 0).
+/// All slot indices refer to init's root `CSpace` (`CSpace` ID 0). The slot
+/// and count fields are `u32`, the width of a capability handle, so each
+/// holds any slot index or slot count the `CSpace` can produce.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct InitInfo

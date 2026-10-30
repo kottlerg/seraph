@@ -42,6 +42,7 @@ pub enum DecodeOutcome
 #[derive(Clone, Copy, Debug)]
 pub struct Utf8Decoder
 {
+    /// Bytes of the sequence in progress; 4 is the longest UTF-8 sequence.
     buf: [u8; 4],
     len: u8,
 }

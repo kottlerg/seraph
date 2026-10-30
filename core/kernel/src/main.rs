@@ -221,14 +221,16 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     kprintln!("baseline ok");
 
     // ── Phase 2: physical memory ────────────────────────────────────────────
-    // Parse the memory map, subtract reserved regions, populate the buddy
-    // allocator. Halts with a FATAL message if no usable memory is found.
+    // Parse the memory map and subtract reserved regions, keeping the free
+    // ranges; the buddy is populated from them as the first act of Phase 3,
+    // once the direct map can reach the free pages its links live in. Halts
+    // with a FATAL message if no usable memory is found.
     //
     // SAFETY: single-threaded boot phase; FRAME_ALLOCATOR static mut not
     // accessed elsewhere; mutable borrow is exclusive.
     let allocator = unsafe { &mut *core::ptr::addr_of_mut!(mm::FRAME_ALLOCATOR) };
-    kprintln!("Phase 2: Memory Map Parsing and Buddy Allocator");
-    mm::init::init_physical_memory(info, allocator);
+    kprintln!("Phase 2: Memory Map Parsing");
+    mm::init::init_physical_memory(info);
     mm::init::print_memory_map(info);
 
     // ── Phase 3: kernel page tables ─────────────────────────────────────────
@@ -300,7 +302,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 /// the kernel page tables and the direct physical map are active, and the
 /// boot stack has been rebased onto them. The `BootInfo`-derived arguments
 /// were copied or validated from that `BootInfo` before Phase 3; `allocator`
-/// is the live frame allocator initialised in Phase 2. Called exactly once,
+/// is the frame allocator, still empty, whose Phase-2 free ranges this
+/// function adds before anything allocates. Called exactly once,
 /// from the boot thread, and never returns.
 // too_many_arguments: the boot state read out of BootInfo before Phase 3 must
 // cross the `#[inline(never)]` boundary as explicit arguments.
@@ -361,6 +364,17 @@ unsafe fn kernel_entry_post_rebase(
     // userspace-visible framebuffer; report_kaslr already logged it on the
     // serial-only path at Phase 1.
     kprintln!("page tables active");
+
+    // Populate the buddy allocator from the Phase-2 free ranges, less the
+    // device tree blob; nothing allocates before this
+    // (core/kernel/docs/initialization.md § Phase 3).
+    // SAFETY: the single boot thread, once, after Phase 2 and with the direct
+    // map over all RAM active; `allocator` is empty.
+    unsafe { mm::init::populate_buddy(allocator) };
+    kprintln!(
+        "buddy allocator: {} free pages",
+        allocator.free_page_count()
+    );
 
     // ── Phase 4: typed-memory cap surface ────────────────────────────────────
     // The kernel does not run a `GlobalAlloc`; every kernel-object body is
@@ -480,6 +494,7 @@ unsafe fn kernel_entry_post_rebase(
     kprintln!("syscall ok");
     // Enable preemption timer at 1 ms period (both architectures).
     // With TIME_SLICE_TICKS=10, this gives a 10 ms scheduling quantum.
+    // The period is a tuning value; it bounds no capacity.
     // timer::init() enables interrupts as its final step.
     // SAFETY: IDT/GDT/interrupts initialized above; percpu initialized;
     // called once during boot with all prerequisites met.
@@ -711,7 +726,9 @@ unsafe fn kernel_entry_post_rebase(
         // serves init's userspace pooled paths: `sys_mem_map`
         // (TEMP_MAP_BASE + ELF_PAGE_TEMP_VA scratch) and `sys_mmio_map` for
         // init's own MMIO (the riscv64 serial UART, one page). 16 pool
-        // pages cover that footprint with margin.
+        // pages cover that footprint with margin. The footprint is fixed by
+        // init's own code, so no hardware count grows it; the pool also takes
+        // augment-mode `SYS_CAP_CREATE_ASPACE` donations, which ktest uses.
         // items_after_statements: the constant is documented by the comment
         // above, next to its only use.
         #[allow(clippy::items_after_statements)]
@@ -937,6 +954,8 @@ unsafe fn kernel_entry_post_rebase(
                 core::ptr::write_bytes(block_virt, 0, block_pages * mm::PAGE_SIZE);
             }
 
+            // Sized by the init protocol's `INIT_INFO_MAX_PAGES`; an
+            // `info_pages` above it is fatal before these arrays fill.
             let mut page_ptrs: [*mut u8; init_protocol::INIT_INFO_MAX_PAGES] =
                 [core::ptr::null_mut(); init_protocol::INIT_INFO_MAX_PAGES];
             let mut page_phys: [u64; init_protocol::INIT_INFO_MAX_PAGES] =
@@ -1807,6 +1826,7 @@ unsafe fn panic_context_dump()
 unsafe fn backtrace_scan(stack_top: u64)
 {
     const MAX_BYTES: usize = 8 * 1024;
+    // A diagnostic output cap; it bounds no capacity.
     const MAX_HITS: usize = 24;
 
     // cast_possible_truncation: usize is 64-bit on every Seraph target, so the

@@ -92,6 +92,9 @@ const MEM_MAP_ENTRY_PAGES: usize = 4;
 
 /// Maximum number of physical regions tracked for identity mapping.
 /// Covers kernel segments, all fixed allocations, and the framebuffer.
+///
+/// Provably sufficient: `collect_identity_regions` pushes a fixed set of at
+/// most `MAX_LOAD_SEGMENTS + INIT_MAX_SEGMENTS + 9` = 25 regions.
 const MAX_IDENTITY_REGIONS: usize = 64;
 
 /// Size of the aperture-seed scratch buffer (firmware-advertised MMIO extents

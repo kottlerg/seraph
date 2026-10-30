@@ -54,6 +54,10 @@ const NO_NEXT: u32 = u32::MAX;
 /// It starts at 1, never 0, so the `SlotId` sentinel epoch `0` resolves
 /// nothing. `next_free` links a vacant id into the free list; it is read and
 /// written only under the registry's free-list lock.
+///
+/// The epoch width is `u32` because `SlotId.epoch` fixes it: widening would
+/// grow the 12-byte `SlotId` and the 72-byte `CapabilitySlot` that embeds
+/// four of them.
 #[repr(C, align(16))]
 pub struct RegistryEntry
 {

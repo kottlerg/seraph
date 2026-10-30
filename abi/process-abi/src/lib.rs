@@ -215,10 +215,11 @@ pub const PROCESS_MAIN_TLS_MAX_PAGES: u64 = 4;
 /// process receives it as the argument to `_start` rather than reading a fixed
 /// address.
 ///
-/// All slot indices refer to the process's own `CSpace`. Only the cap slots
-/// named by this struct's fields are delivered through this page;
-/// service-specific capabilities come from the creator over IPC at startup
-/// (see `ipc::bootstrap`).
+/// All slot indices refer to the process's own `CSpace`, and each cap field is
+/// a `u32`, the width of a capability handle. Only the cap slots named by
+/// this struct's fields are delivered through this page; service-specific
+/// capabilities come from the creator over IPC at startup (see
+/// `ipc::bootstrap`).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ProcessInfo
@@ -254,7 +255,8 @@ pub struct ProcessInfo
     /// initial_priority)` to `SYS_CAP_CREATE_THREAD` so spawned threads
     /// land at the same level as the main thread. Zero only for pre-policy
     /// bootstrap processes; consumers must then fall back to floor
-    /// creation (`(0, 0)` when no `SchedControl` is delegated).
+    /// creation (`(0, 0)` when no `SchedControl` is delegated). A `u8`
+    /// holds every level up to the syscall ABI's `PRIORITY_MAX` (30).
     pub initial_priority: u8,
 
     /// Virtual address of the pre-mapped IPC buffer page.

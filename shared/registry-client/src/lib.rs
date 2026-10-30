@@ -54,7 +54,8 @@ pub const NAME_WORDS: usize = NAME_MAX.div_ceil(8);
 
 /// Per-process cached SEND cap on svcmgr's service endpoint. Zero means
 /// "no registry available" — `_start` did not install one, or the
-/// process was spawned before svcmgr existed.
+/// process was spawned before svcmgr existed. `AtomicU32` because a cap
+/// handle is `u32` in the syscall ABI.
 static REGISTRY_CAP: AtomicU32 = AtomicU32::new(0);
 
 /// Install the per-process registry cap. Called once by `_start` from

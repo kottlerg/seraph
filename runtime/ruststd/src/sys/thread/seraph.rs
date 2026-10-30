@@ -35,6 +35,7 @@ use crate::time::Duration;
 use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE, SyscallError};
 
 /// Default minimum stack size. Matches the upstream unsupported-PAL value.
+/// A default only: `Builder::stack_size` sets a thread's size past it.
 pub const DEFAULT_MIN_STACK_SIZE: usize = 64 * 1024;
 
 const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
@@ -567,7 +568,9 @@ mod reaper {
     /// drops a post to a full queue).
     const EQ_CAPACITY: u32 = 128;
     /// Correlator bit split: low `GEN_BITS` are the generation, the rest the
-    /// slot index (6 bits → 64 slots).
+    /// slot index (6 bits → 64 slots). The split is an encoding artefact of
+    /// the `u32` correlator `thread_bind_notification` carries; the
+    /// generation is freshness-only, so its wrap needs no wider field.
     const GEN_BITS: u32 = 26;
     const GEN_MASK: u32 = (1 << GEN_BITS) - 1;
 

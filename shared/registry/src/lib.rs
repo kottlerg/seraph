@@ -51,9 +51,11 @@ pub struct Entry
 {
     /// Name bytes, zero-padded to `NAME_MAX`.
     pub name: [u8; NAME_MAX],
-    /// Active length of `name` (the entry is in use iff `cap != 0`).
+    /// Active length of `name` (the entry is in use iff `cap != 0`). At most
+    /// `NAME_MAX`, so the `u8` never truncates.
     pub name_len: u8,
-    /// Capability slot index in the supervisor's `CSpace`.
+    /// Capability slot index in the supervisor's `CSpace`; `u32` is the cap
+    /// handle width of the syscall ABI.
     pub cap: u32,
     /// Which resolvers see this entry.
     pub visibility: Visibility,

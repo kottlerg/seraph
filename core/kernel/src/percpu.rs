@@ -58,6 +58,8 @@ use crate::sched::thread::ThreadControlBlock;
 /// Populated by [`init_apic_ids`] from `BootInfo::cpu_ids` at the end of Phase 4,
 /// before Phase 5's riscv64 PLIC setup names the BSP by its hart id.
 /// Accessed by [`apic_id_for`] to retrieve the APIC ID for a given logical CPU.
+/// Elements are `u32` because `BootInfo::cpu_ids` is `[u32; MAX_CPUS]`, which
+/// holds every x2APIC ID.
 ///
 /// # Safety
 /// Written once during single-threaded boot, then read-only during SMP.
@@ -154,7 +156,8 @@ pub const PERCPU_FPU_OWNER_OFFSET: usize = 48;
 #[repr(C)]
 pub struct PerCpuData
 {
-    /// Logical CPU index (0-based). x86-64: readable as `gs:[0]`.
+    /// Logical CPU index (0-based). x86-64: readable as `gs:[0]`. A `u32`
+    /// cannot overflow: the index is below `MAX_CPUS`.
     pub cpu_id: u32,
     _pad0: u32,
     /// x86-64: kernel RSP loaded at SYSCALL entry. Written by
@@ -173,7 +176,8 @@ pub struct PerCpuData
     pub tss_ptr: u64,
     /// Preemption-disable depth counter. When > 0, `timer_tick()` skips
     /// calling `schedule()`, preventing context switches during critical
-    /// sections such as TLB shootdown spin-waits.
+    /// sections such as TLB shootdown spin-waits. A `u32` cannot overflow:
+    /// nesting depth is bounded by the kernel's call depth, far below 2^32.
     pub preempt_count: u32,
     _pad1: u32,
     /// x86-64 per-CPU owner cache: the TCB whose extended-state register
@@ -238,6 +242,9 @@ static PER_CPU_PTR: AtomicPtr<PerCpuData> = AtomicPtr::new(core::ptr::null_mut()
 /// `sched::init_per_cpu_storage` (Phase 4), before [`init_bsp`] /
 /// [`init_apic_ids`] and before any SMP startup. The `PerCpuData` slab is
 /// zero-filled, which equals [`PerCpuData::new`] for every field.
+///
+/// Sized to the booted `cpu_count`, so the slabs cost only what is used;
+/// `MAX_CPUS`, the length of `BootInfo::cpu_ids`, is only the upper bound.
 ///
 /// # Panics
 /// Halts via `crate::fatal` on buddy exhaustion.

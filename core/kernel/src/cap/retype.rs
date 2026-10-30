@@ -73,7 +73,8 @@ use crate::mm::PAGE_SIZE;
 use syscall::SyscallError;
 
 /// Sub-page size classes. Each retype request is rounded up to one of these
-/// or to a page multiple. Tunable as the object catalogue evolves.
+/// or to a page multiple. Tunable as the object catalogue evolves. They set
+/// rounding, not capacity: a request above `BIN_512` takes whole pages.
 const BIN_128: u64 = 128;
 const BIN_512: u64 = 512;
 

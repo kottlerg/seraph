@@ -33,7 +33,8 @@ const HDR_LEN: usize = 40;
 
 /// Deepest level (the root node is level 1) at which an ECAM node is found;
 /// the cell-size tracking follows nodes only to here, so a deeper ECAM node
-/// is skipped.
+/// is skipped. A PCI host-bridge node sits directly under the root or under
+/// `/soc` (level 2 or 3, as on QEMU `virt`), so no real tree reaches this.
 const MAX_DEPTH: usize = 16;
 /// `#address-cells` / `#size-cells` a node's children inherit when the node
 /// does not set them (Device Tree Specification § 2.3.5).

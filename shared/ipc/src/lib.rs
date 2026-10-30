@@ -169,7 +169,9 @@ pub mod procmgr_labels
     /// exceed the creator's band ceiling. Occupies bits 23–27 of the
     /// reserved `[16..32]` label window.
     pub const CREATE_BAND_MAX_SHIFT: u32 = 23;
-    /// Width mask of each 5-bit scheduling field in the create label.
+    /// Width mask of each 5-bit scheduling field in the create label. Five
+    /// bits hold every level of the kernel's 32-level priority space
+    /// (`syscall_abi::PRIORITY_MAX` is 30), so the width bounds nothing.
     pub const CREATE_SCHED_FIELD_MASK: u64 = 0x1F;
     /// Still-reserved bits `[28..32]` of the create-label window. Procmgr
     /// rejects labels with any of these set (`INVALID_ARGUMENT`), so a
@@ -773,7 +775,8 @@ pub mod svcmgr_labels
     ///
     /// Label bits 16..31 carry `name_len`; data words from 0 carry the name
     /// bytes packed little-endian. `caps[0]` is the endpoint the name
-    /// resolves to.
+    /// resolves to. The 16-bit field exceeds `registry::NAME_MAX`, so that
+    /// constant, not the field width, bounds a name.
     pub const PUBLISH_ENDPOINT: u64 = 3;
     /// Look up a named public endpoint; on success the reply carries a
     /// freshly derived SEND cap.
@@ -1171,7 +1174,8 @@ pub mod ns_labels
 {
     /// Walk one path component within a directory cap.
     ///
-    /// Request label encodes name length in bits 16..32. Request data:
+    /// Request label encodes name length in bits 16..32; the field exceeds
+    /// `namespace_protocol::MAX_NAME_LEN`, which bounds a name. Request data:
     /// `data[0]` = caller-requested namespace rights (low 24 bits;
     /// `0xFFFF` is interpreted as "everything I'm allowed"); subsequent
     /// data words carry the name bytes packed little-endian, length
@@ -1222,7 +1226,9 @@ pub mod fs_labels
     /// ID, bits 16-31 = payload byte length, ≤ 504), `data[0]` = file
     /// byte offset, payload bytes packed from word 1 onward via
     /// `IpcMessageBuilder::bytes(1, &payload)`. Badge must carry the
-    /// `WRITE` namespace right (see `namespace-protocol::rights`).
+    /// `WRITE` namespace right (see `namespace-protocol::rights`). The 504
+    /// bytes are the `MSG_DATA_WORDS_MAX` data words less the offset word;
+    /// a larger write is split over more calls.
     ///
     /// Reply (success label `fs_errors::SUCCESS`): `data[0]` =
     /// `bytes_written` (may be short on `NO_SPACE` or on
@@ -1235,8 +1241,9 @@ pub mod fs_labels
     ///
     /// Request: badge identifies the file (per-file cap), `data[0]` =
     /// byte offset (no alignment requirement), `data[1]` = client-chosen
-    /// release cookie (must be non-zero). `caps[0]` = optional per-process
-    /// release-endpoint SEND for cooperative `FS_RELEASE_MEMORY`; which
+    /// release cookie (must be non-zero; one full data word the client
+    /// picks per page, so its width bounds no count). `caps[0]` = optional
+    /// per-process release-endpoint SEND for cooperative `FS_RELEASE_MEMORY`; which
     /// request carries it, and which carried SEND the driver records, are
     /// specified in services/fs/docs/fs-driver-protocol.md § Label 7
     /// (the record is per node, not per client).
@@ -1381,7 +1388,10 @@ pub mod devmgr_labels
     ///
     /// The caller's badge identifies the device by indexing devmgr's
     /// `DeviceCatalog` (badge == entry index + 1); a badge that indexes no
-    /// entry gets `INVALID_REQUEST`. No authority bit is checked. Devmgr
+    /// entry gets `INVALID_REQUEST`. The catalog only grows (a failed spawn
+    /// drops its own entry before the badge is delivered), so a live badge
+    /// is never recycled and its `u64` width bounds no catalog size. No
+    /// authority bit is checked. Devmgr
     /// stores the
     /// payload bytes opaquely; the per-class shape lives in the driver
     /// crate. Reply schema (generic for every kind):
@@ -1718,6 +1728,9 @@ pub mod serial_labels
     /// # Label encoding
     /// - Bits 0-15: label ID (`SERIAL_WRITE_BYTES`)
     /// - Bits 16-31: byte length of the payload in this call (0..=512).
+    ///
+    /// 512 is the whole data area (`MSG_DATA_WORDS_MAX * 8`); callers split a
+    /// longer write over more calls.
     pub const SERIAL_WRITE_BYTES: u64 = 1;
 
     /// Read the bytes currently available in the UART receive FIFO.
@@ -1810,6 +1823,9 @@ pub mod fb_labels
     /// # Label encoding
     /// - Bits 0-15: label ID (`FB_WRITE_BYTES`)
     /// - Bits 16-31: byte length of the payload in this call (0..=512).
+    ///
+    /// 512 is the whole data area (`MSG_DATA_WORDS_MAX * 8`); callers split a
+    /// longer write over more calls.
     pub const FB_WRITE_BYTES: u64 = 1;
 
     /// Set the foreground/background colour for subsequent
@@ -1990,7 +2006,8 @@ pub mod keysym
     /// Maximum events returned by one
     /// [`super::input_labels::INPUT_READ_EVENTS`] reply. Bounded so `word[0]`
     /// (count) plus `n` event words fit the 64-word IPC data area with
-    /// headroom.
+    /// headroom. Events past it stay in the device ring for the next read,
+    /// so the bound only adds reads.
     pub const INPUT_MAX_EVENTS_PER_READ: usize = 32;
 
     /// Pack a key event into one IPC data word: keysym in bits 0-31, the
@@ -2414,7 +2431,8 @@ pub mod blk_errors
     /// `MAP|WRITE` rights, `BLK_WRITE_FROM_MEMORY` source missing
     /// `MAP` rights, smaller than `count * 512` bytes, or absent;
     /// also returned when `count` is 0 or `count * 512` exceeds `u32::MAX`
-    /// (an overflowing multiply included).
+    /// (an overflowing multiply included). The `u32` limit is the length
+    /// field of a `VirtIO` descriptor; a larger transfer takes more requests.
     pub const INVALID_MEMORY_CAP: u64 = 5;
     /// Caller's compiled `BLK_LABELS_VERSION` does not match the receiver's.
     /// `REGISTER_PARTITION` is the handshake entry point and carries the
@@ -2475,9 +2493,11 @@ pub struct IpcMessage
     /// Number of valid `u64` words in `data`. `<= MSG_DATA_WORDS_MAX`: every
     /// [`IpcMessageBuilder`] setter panics past the bound in every build (an
     /// empty source at an out-of-range start included), and
-    /// [`IpcMessage::from_ipc_buf`] requires it of its caller.
+    /// [`IpcMessage::from_ipc_buf`] requires it of its caller. That bound
+    /// (64) is far below `u8::MAX`, so the width never truncates.
     data_len: u8,
-    /// Number of valid slots in `cap_slots`. `<= MSG_CAP_SLOTS_MAX`.
+    /// Number of valid slots in `cap_slots`. `<= MSG_CAP_SLOTS_MAX` (4), far
+    /// below `u8::MAX`.
     cap_count: u8,
     cap_slots: [u32; MSG_CAP_SLOTS_MAX],
 }

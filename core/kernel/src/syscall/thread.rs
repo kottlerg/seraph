@@ -631,25 +631,32 @@ unsafe fn warn_slow_drain(
             }),
         )
     };
-    if let (Some(st), Some(cur_tid)) = (st, cur_tid)
-    {
-        crate::kprintln!(
-            "kernel: sys_thread_stop spin >100ms target_tid={} state={:?} run_cpu={} cur_tid={}",
-            tid,
-            st,
-            run_cpu,
-            cur_tid
-        );
-    }
-    else
-    {
-        crate::kprintln!(
-            "kernel: sys_thread_stop spin >100ms target_tid={} run_cpu={} (locks held)",
-            tid,
-            run_cpu
-        );
-    }
+    crate::kprintln!(
+        "kernel: sys_thread_stop spin >100ms target_tid={} state={} run_cpu={} cur_tid={}",
+        tid,
+        OrHeld(st),
+        run_cpu,
+        OrHeld(cur_tid)
+    );
     true
+}
+
+/// A field the slow-drain warning read under a try-lock: its value, or
+/// `held` when the lock was contended.
+#[cfg(not(test))]
+struct OrHeld<T>(Option<T>);
+
+#[cfg(not(test))]
+impl<T: core::fmt::Debug> core::fmt::Display for OrHeld<T>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        match &self.0
+        {
+            Some(value) => write!(f, "{value:?}"),
+            None => f.write_str("held"),
+        }
+    }
 }
 
 /// Whether the calling thread has itself been stopped or exited while it

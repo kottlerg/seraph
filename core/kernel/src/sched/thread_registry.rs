@@ -153,8 +153,11 @@ unsafe fn walk_locked(mut f: impl FnMut(*mut ThreadControlBlock)) -> bool
 /// dump's own diagnostic path).
 ///
 /// # Safety
-/// `f` must only read through the TCB pointer and must not register or
-/// unregister any thread (it runs under [`THREAD_REGISTRY_LOCK`]).
+/// `f` must not register, unregister or free any thread (it runs under
+/// [`THREAD_REGISTRY_LOCK`]). It may read through the TCB pointer, and it may
+/// take locks that order after `THREAD_REGISTRY_LOCK` (the TCB's
+/// `sched_lock`, and under it the lock of the source the TCB is bound to)
+/// only by try-lock, releasing each before it returns.
 pub unsafe fn try_for_each(f: impl FnMut(*mut ThreadControlBlock)) -> bool
 {
     // SAFETY: try_lock_raw never blocks; None means contended, so we back off.

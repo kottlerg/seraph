@@ -33,7 +33,8 @@ use crate::sched::thread::ThreadControlBlock;
 /// holder of any source lock may read a TCB's tag to test membership in that
 /// lock's own queue, even while the TCB is linked on another queue: only that
 /// lock's holders store that queue's address in a tag, so a store made under
-/// another source's lock never makes the test pass or fail wrongly. A delivery wakes the head; destroying the source wakes every waiter.
+/// another source's lock never makes the test pass or fail wrongly. A
+/// delivery wakes the head; destroying the source wakes every waiter.
 ///
 /// A queue must not move while a thread is on it: the tags hold its address.
 pub struct WaitQueue

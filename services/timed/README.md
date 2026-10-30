@@ -30,8 +30,9 @@ runs on every supported arch.
 
 ## Endpoint
 
-Bootstrap caps from svcmgr (one round, two caps, `done=true`; recipe `provides = timed`,
-`seed = devmgr.registry`):
+Bootstrap caps from svcmgr (one round, `done=true`, carrying the two slots below with the
+presence word of [service-definitions.md § `seed`](../svcmgr/docs/service-definitions.md#seed);
+recipe `provides = timed`, `seed = devmgr.registry`):
 
 | Slot      | Cap                                                          |
 |-----------|--------------------------------------------------------------|

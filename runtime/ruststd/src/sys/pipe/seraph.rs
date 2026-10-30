@@ -327,7 +327,8 @@ impl Pipe {
 
         // Allocator failure here is rare (memmgr unreachable / OOM); tear
         // down what we have so far before reporting.
-        let data_notification = match crate::sys::alloc::seraph::object_slab_retype(120, |slab| {
+        let bytes = syscall_abi::NOTIFICATION_RETYPE_BYTES;
+        let data_notification = match crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
             syscall::cap_create_notification(slab).ok()
         })
         .ok_or_else(|| io::Error::other("seraph pipe: cap_create_notification (data) failed"))
@@ -340,7 +341,8 @@ impl Pipe {
                 return Err(e);
             }
         };
-        let space_notification = match crate::sys::alloc::seraph::object_slab_retype(120, |slab| {
+        let bytes = syscall_abi::NOTIFICATION_RETYPE_BYTES;
+        let space_notification = match crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
             syscall::cap_create_notification(slab).ok()
         })
         .ok_or_else(|| io::Error::other("seraph pipe: cap_create_notification (space) failed"))

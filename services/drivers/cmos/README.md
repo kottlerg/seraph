@@ -1,4 +1,4 @@
-# drivers/cmos
+# cmos
 
 x86-64 CMOS / MC146818-compatible RTC driver. Serves
 [`rtc_labels::RTC_GET_EPOCH_TIME`](../../../shared/ipc/src/lib.rs).

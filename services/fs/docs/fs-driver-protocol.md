@@ -44,7 +44,7 @@ A filesystem driver exposes one IPC endpoint, used as both:
 - the un-badged **service endpoint** (vfsd holds a SEND, derives
   per-node badged SENDs); and
 - the un-badged **namespace endpoint** routed through
-  [`namespace_protocol::dispatch_request`] for `NS_*` dispatch.
+  `namespace_protocol::dispatch_request` for `NS_*` dispatch.
 
 vfsd delivers the endpoint cap (all rights: receive and badge
 derivation) in the driver's bootstrap round; see
@@ -52,8 +52,8 @@ derivation) in the driver's bootstrap round; see
 kernel-derivation parent for every node cap the driver ever issues
 via `cap_derive_badge`.
 
-Numeric label values live in [`ipc::fs_labels`] (this document) and
-[`ipc::ns_labels`] (namespace-protocol document).
+Numeric label values live in `ipc::fs_labels` (this document) and
+`ipc::ns_labels` (namespace-protocol document).
 
 ---
 
@@ -328,8 +328,10 @@ or to the FAT. A
 client SHOULD still unmap before it acks: the driver takes at most 32 pages
 beyond its cache slots to replace still-mapped ones, and past that a still-mapped
 slot stays out of service, so a client that never unmaps shrinks the cache, and a
-read that finds no reusable slot is answered `IO_ERROR` (2). A revoke that does
-not complete leaves the page unused until a later one does.
+read that finds no reusable slot is answered `IO_ERROR` (2). A slot whose revoke
+does not complete keeps its page and still serves cache hits, but the page is not
+refilled with other data until a later revoke completes. A quarantined page
+likewise becomes a spare only after a revoke of it completes.
 A reply with any other label is not an
 acknowledgement; a client that cannot unmap the page, or whose copy
 outlasts the window, replies `IO_ERROR` (2).

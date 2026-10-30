@@ -77,7 +77,9 @@ pub fn spawn_fatfs_driver(
     // Create fatfs's service endpoint. fatfs receives service calls on a
     // RIGHTS_ALL derivation of it; vfsd keeps the original for teardown.
     let Some(endpoint) =
-        std::os::seraph::object_slab_retype(88, |slab| syscall::cap_create_endpoint(slab).ok())
+        std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+            syscall::cap_create_endpoint(slab).ok()
+        })
     else
     {
         let _ = syscall::cap_delete(partition_ep);

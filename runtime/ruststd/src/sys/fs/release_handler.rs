@@ -141,7 +141,8 @@ pub(super) fn ensure_started() -> io::Result<&'static ReleaseState>
     })?;
     let aspace = info.self_aspace;
 
-    let release_ep = crate::sys::alloc::seraph::object_slab_retype(88, |slab| {
+    let bytes = syscall_abi::ENDPOINT_RETYPE_BYTES;
+    let release_ep = crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
         syscall::cap_create_endpoint(slab).ok()
     })
     .ok_or_else(|| io::Error::other("seraph fs: cap_create_endpoint (release) failed"))?;

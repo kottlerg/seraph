@@ -9,8 +9,9 @@ Binary syscall ABI contract for Seraph.
 Defines the `SYS_*` syscall numbers, the `SyscallError` enum, and the constants that cross the
 kernel/userspace boundary: the capability-handle encoding, the `CAP_INFO_*` selectors and
 `CAP_TAG_*` discriminants, the `MAP_*` protection and unmap flags, the per-type `RIGHTS_*`
-masks, the scheduling and message limits, the exit-reason and fault-protocol constants, the
-register-file layout, `KERNEL_VERSION`, and `SystemInfoType`.
+masks, the per-object retype costs (`*_RETYPE_BYTES`, `event_queue_retype_bytes`), the
+scheduling and message limits, the exit-reason and fault-protocol constants, the register-file
+layout, `KERNEL_VERSION`, and `SystemInfoType`.
 
 **Constraints:** `no_std`; each cross-boundary type carries an explicit stable repr
 (`#[repr(C)]` structs, fixed-width integer-repr enums); no dependencies outside `core` (the

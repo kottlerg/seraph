@@ -302,8 +302,9 @@ each change; the binding statement of the resulting invariants is
 
   Lock order across the function: `current.sched_lock` (outer) → CPU lock (inner)
   for the outgoing half; release the CPU lock then `current.sched_lock`; then
-  `next.sched_lock` alone for the incoming flip. It NEVER holds two TCB
-  `sched_lock`s at once.
+  `next.sched_lock` for the incoming flip, with the CPU lock nested inside it
+  only for the deferred-dispatch re-link. It NEVER holds two TCB `sched_lock`s
+  at once.
   - Top: read `current` (CPU-local). Acquire `current.sched_lock` (if `current`
     non-null), then the CPU lock.
   - **Outgoing requeue** under both: flip `current` Running→Ready + enqueue. The
@@ -330,7 +331,13 @@ each change; the binding statement of the resulting invariants is
     `dealloc_object(Thread)` marks Exited under all-CPU locks BEFORE its
     not-current spin blocks). `next` is now off-queue and drained, so re-claim
     `idle` (`set_current(idle)` under a re-taken CPU lock) and dispatch idle this
-    cycle; the next tick re-schedules. Release `next.sched_lock`.
+    cycle; the next tick re-schedules. A `Ready` `next` whose `context_saved` is
+    still `0` while `current` is not idle is deferred instead: re-linked `Ready`
+    at the head of its level under a re-taken CPU lock (nested in
+    `next.sched_lock`), `idle` claimed, and this CPU's reschedule flag set, so
+    idle dispatches it and only an idle outgoing thread waits in the
+    `context_saved` spin (scheduling-internals.md § Cross-CPU TCB Ownership,
+    step 3.5). Release `next.sched_lock`.
   - THEN trap-stack / AS-switch / idle-IOPB / FPU for the final `next` (all CPU-local,
     safe with the CPU lock released, IRQs still off), the `next_state` pointer,
     the `context_saved` spin, `switch()`, `restore_interrupts_from`. The

@@ -26,7 +26,7 @@ pub struct Phase
 }
 
 /// The authority-badged pwrmgr cap the failure hooks send `SHUTDOWN` on;
-/// zero until the bootstrap round delivers it.
+/// zero until the bootstrap rounds deliver it.
 static SHUTDOWN_CAP: AtomicU32 = AtomicU32::new(0);
 
 /// Set by the first path that claims the run's terminal marker, so a run

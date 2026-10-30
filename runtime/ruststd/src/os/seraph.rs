@@ -753,15 +753,49 @@ pub fn namespace_lookup_dir(
     Ok(walked.dir_cap)
 }
 
+// Raw retype debits the kernel charges for one object of each kind, the
+// `min_bytes` to pass to `object_slab_retype`. Each constant is defined as the
+// ABI crate's item and the function forwards to the ABI crate's, so each
+// equals the ABI value by construction; the kernel pins those values to its
+// real object sizes, and a size change is an ABI-visible change by design.
+// They are defined here rather than re-exported because an item reached
+// through the sysroot-private ABI crate is unstable (`rustc_private`) to
+// std's users.
+
+/// Raw retype debit of one `Endpoint`, in bytes (`syscall_abi`'s
+/// `ENDPOINT_RETYPE_BYTES`).
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub const ENDPOINT_RETYPE_BYTES: u64 = syscall_abi::ENDPOINT_RETYPE_BYTES;
+
+/// Raw retype debit of one `Notification`, in bytes (`syscall_abi`'s
+/// `NOTIFICATION_RETYPE_BYTES`).
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub const NOTIFICATION_RETYPE_BYTES: u64 = syscall_abi::NOTIFICATION_RETYPE_BYTES;
+
+/// Raw retype debit of one `WaitSet`, in bytes (`syscall_abi`'s
+/// `WAIT_SET_RETYPE_BYTES`).
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub const WAIT_SET_RETYPE_BYTES: u64 = syscall_abi::WAIT_SET_RETYPE_BYTES;
+
+/// Raw retype debit of one `EventQueue` of `capacity` entries, in bytes
+/// (`syscall_abi`'s `event_queue_retype_bytes`).
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+#[must_use]
+pub fn event_queue_retype_bytes(capacity: u64) -> u64 {
+    syscall_abi::event_queue_retype_bytes(capacity)
+}
+
 /// Retype one kernel object out of the runtime's object-slab machinery.
 ///
-/// `min_bytes` is the raw byte cost of the kernel object the caller is
-/// about to create (e.g. 80 for `Endpoint`, 64 for `Notification`); the
-/// runtime rounds up to the kernel's size-class granularity, so any value in
-/// the same class retypes alike. `retype` is called at most once with a
-/// Memory-cap slot whose `available_bytes` covers that class and must perform
-/// exactly one `cap_create_*` syscall against the slot, returning `Some` on
-/// success.
+/// `min_bytes` is the full raw debit the kernel charges for the object the
+/// caller is about to create, the object wrapper plus its state:
+/// [`ENDPOINT_RETYPE_BYTES`], [`NOTIFICATION_RETYPE_BYTES`],
+/// [`WAIT_SET_RETYPE_BYTES`], or [`event_queue_retype_bytes`]`(capacity)`, or
+/// the byte size of a page-granular object. The runtime rounds it up to the
+/// kernel's size class, so the request covers the kernel's debit. `retype` is
+/// called at most once with a Memory-cap slot whose `available_bytes` covers
+/// that class and must perform exactly one `cap_create_*` syscall against the
+/// slot, returning `Some` on success.
 ///
 /// # Closure contract
 ///

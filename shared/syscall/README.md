@@ -18,7 +18,12 @@ typed wrappers cannot express;
 
 A wrapper is safe when nothing it can make the kernel do reaches memory a live Rust object
 occupies: buffers the kernel writes or reads are slices (`getrandom`, `thread_read_regs`). The
-wrappers whose effect the types cannot bound are `unsafe fn`, each with a `# Safety` contract:
+`cap_create_*` retype wrappers are safe on that rule because the kernel never carves a page some
+address space maps, so a retype cannot overwrite bytes the caller reaches through a mapping; one
+that would fails with `OutOfMemory`, as § Capability Syscalls of
+[core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md#capability-syscalls)
+states. The wrappers whose effect the types cannot bound are `unsafe fn`, each with a
+`# Safety` contract:
 `ipc_buffer_set` (the registered page is dedicated to the kernel's IPC access), `mem_map`,
 `mem_unmap`, `mem_unmap_reclaim`, `mem_protect` and `mmio_map` (on the caller's own address
 space, no live object or registered IPC page in the span), and `thread_configure`,

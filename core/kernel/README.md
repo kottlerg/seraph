@@ -68,6 +68,7 @@ core/kernel/
 │   ├── mm/                     # Memory management subsystem
 │   │   ├── mod.rs
 │   │   ├── buddy.rs            # Physical frame allocator (buddy algorithm)
+│   │   ├── frame_map.rs        # Per-frame user-mapping counts (the retype/map boundary)
 │   │   ├── paging.rs           # Phase 3 kernel page tables and the direct physical map
 │   │   ├── address_space.rs    # Virtual address space objects and lifecycle
 │   │   ├── init.rs             # Boot memory-map parsing; seeds the buddy allocator
@@ -153,7 +154,8 @@ management. The buddy allocator (`buddy.rs`) is the boot-time foundation: it see
 kernel's fixed reserves and is drained into userspace Memory capabilities at the Phase 7
 handoff, after which kernel objects are carved from those capabilities by retype
 (`cap/retype.rs`). The `address_space` module manages per-process virtual address space
-objects. See [`docs/memory-internals.md`](docs/memory-internals.md).
+objects. The frame map table (`frame_map.rs`) counts the user mappings of every frame of RAM so
+a retype never carves a mapped page. See [`docs/memory-internals.md`](docs/memory-internals.md).
 
 ### `cap/`
 
@@ -209,10 +211,8 @@ matches the syscall number to the subsystem handler.
 See [`docs/syscalls.md`](docs/syscalls.md). The audit classifying
 every cross-boundary output (syscall, IPC, fault, exit) for kernel-virtual-address
 disclosure is in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md);
-it records the open disclosures: the exposures through
-donated memory and mirrored console output
-([#577](https://github.com/kottlerg/seraph/issues/577),
-[#440](https://github.com/kottlerg/seraph/issues/440)).
+it records the open disclosure: mirrored console output
+([#440](https://github.com/kottlerg/seraph/issues/440)).
 
 ---
 

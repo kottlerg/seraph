@@ -32,13 +32,14 @@
 //! - `retype_reclaim.rs`         — auto-reclaim invariant for every retypable kernel object
 //! - `mem_map_retyped_refused.rs` — `mem_map` refuses a Memory cap's retyped pages and maps
 //!   the page past its retype cursor
+//! - `retype_over_mapped_refused.rs` — a retype refuses a page any address space maps, through
+//!   splits, merges, and until the mapping's address space is destroyed
 //! - `mmio_revoke_unmaps.rs` — revoking an `Mmio` cap unmaps, with shootdown, a mapping made
 //!   through its descendant while a reader on another CPU uses it
 //! - `range_copy_lineage.rs` — a range lineage admits exactly 64 live copies, counted
 //!   alone after the root's delete
 //! - `cspace_nested_teardown.rs` — deleting the root of a 256-deep chain of nested `CSpace`s
 //!   reclaims every one without exhausting the kernel stack
-//! - `retype_subpage_clobber.rs` — a clobbered sub-page free-list link is rejected, not dereferenced
 //! - `priority_preemption.rs`    — higher-priority runnable thread preempts a busy lower-priority one
 //! - `shared_memory_two_aspaces.rs` — one Memory cap mapped into two `AddressSpace` caps; phys round-trip
 //! - `cap_move_into_fresh_cspace_then_ipc.rs` — `cap_move` an endpoint into a child cspace; child IPC-calls through it
@@ -102,8 +103,8 @@ pub mod priority_preemption;
 pub mod queued_waiters_fifo;
 pub mod range_copy_lineage;
 pub mod reply_binding_displaced;
+pub mod retype_over_mapped_refused;
 pub mod retype_reclaim;
-pub mod retype_subpage_clobber;
 pub mod shared_memory_two_aspaces;
 pub mod stop_read_regs_remote;
 pub mod thread_lifecycle;
@@ -187,16 +188,16 @@ pub fn run_all(ctx: &TestContext)
         mem_map_retyped_refused::run(ctx)
     );
     run_integration_test!(
+        "integration::retype_over_mapped_refused",
+        retype_over_mapped_refused::run(ctx)
+    );
+    run_integration_test!(
         "integration::mmio_revoke_unmaps",
         mmio_revoke_unmaps::run(ctx)
     );
     run_integration_test!(
         "integration::range_copy_lineage",
         range_copy_lineage::run(ctx)
-    );
-    run_integration_test!(
-        "integration::retype_subpage_clobber",
-        retype_subpage_clobber::run(ctx)
     );
     run_integration_test!(
         "integration::priority_preemption",

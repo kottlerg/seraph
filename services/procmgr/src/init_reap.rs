@@ -253,16 +253,20 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
 
     // 3. Destroy init's AddressSpace. Revoke first to clear any
     //    derived child caps, then delete to drop procmgr's reference
-    //    (which is the last one, since init's CSpace moved its copy
-    //    over via IPC). `dealloc_object` for AddressSpace returns its
-    //    pool donations via `retype_free`; user-page mappings disappear
-    //    at the same moment.
+    //    (the last one: init's CSpace moved its copy over via IPC, and
+    //    on riscv64 init-logd deleted the UART Mmio cap whose mapping
+    //    record also referenced the space as it exited).
+    //    `dealloc_object` for AddressSpace returns its pool donations
+    //    via `retype_free`; user-page mappings disappear at the same
+    //    moment.
     let _ = syscall::cap_revoke_all(aspace);
     let _ = syscall::cap_delete(aspace);
 
     // 4. Donate every reclaim Memory cap to memmgr. Safe now that
     //    init's AS is dead: no live mapping references the phys
-    //    ranges, so memmgr can reissue them without aliasing.
+    //    ranges, so memmgr can reissue them without aliasing, and the
+    //    kernel, which refuses to retype a mapped page, lets their
+    //    holders retype them.
     let (donated_caps, donated_pages, pool_total) =
         donate_to_memmgr(memmgr_ep, &donate_caps, ipc_buf);
 

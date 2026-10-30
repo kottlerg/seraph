@@ -561,7 +561,7 @@ unsafe fn carve_page_into_bin(
 /// permanent while the cap holds a live object (the drain reset alone undoes
 /// it, and SEED never drains), so carving trades page blocks for sub-page
 /// capacity: on SEED, sustained sub-page demand can leave too few contiguous
-/// pages for an x86_64 port-binding table, whose `sys_ioport_bind` then
+/// pages for an x86-64 port-binding table, whose `sys_ioport_bind` then
 /// returns `OutOfMemory`. A carve happens only once the bump frontier cannot
 /// serve the class, so the cap is by then already at its shared budget:
 /// without the carve, the sub-page request fails instead. Caller must validate

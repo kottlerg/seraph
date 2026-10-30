@@ -5,8 +5,7 @@
 
 //! Tier 2 — cross-subsystem integration tests. The file layout (one file per
 //! scenario) and each file's scenario are specified in `core/ktest/README.md`
-//! § Source Layout and § Tier 2, whose table lists the files in the dispatch
-//! order of [`run_all`].
+//! § Source Layout and § Tier 2; [`run_all`] dispatches them.
 //!
 //! Architecture-only scenarios live behind `crate::arch` (`run_integration`),
 //! and the scenarios here reach their per-arch helpers and constants (for

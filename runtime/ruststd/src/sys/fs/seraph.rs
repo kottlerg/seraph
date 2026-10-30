@@ -11,8 +11,8 @@
 //! The choice between the inline `FS_READ` / `FS_WRITE` labels and the
 //! memory-cap `FS_READ_MEMORY` / `FS_WRITE_MEMORY` labels is the client
 //! policy `services/fs/docs/fs-driver-protocol.md` § Inline-vs-memory-cap
-//! crossover specifies (with `FS_WRITE_MEMORY` for the write threshold);
-//! this file implements it.
+//! crossover specifies, with § Label 12: `FS_WRITE_MEMORY` for the write
+//! threshold; this file implements it.
 //!
 //! ## Read path
 //! - Inline reads carry the payload in the IPC buffer.

@@ -9,12 +9,13 @@
 //! The bootstrap caps are specified in `services/logd/README.md`
 //! § Bootstrap caps; the startup order (death-EQ registration before the
 //! first `HANDOVER_PULL`) and the handover itself in
-//! `docs/handover-protocol.md` § Startup ordering and § Call shape; and why
-//! logd cannot use `seraph::log!`, and so routes its own diagnostics and
-//! panic output to the serial driver, in the README's § Role and
-//! `docs/console-model.md`. `main` follows that order: bootstrap caps, the
-//! serial sink and panic sink, the dropped `log_send_cap`, the death EQ and
-//! its registration, the wait set, the handover pull, then the event loop.
+//! `services/logd/docs/handover-protocol.md` § Startup ordering and § Call
+//! shape; and why logd cannot use `seraph::log!`, and so routes its own
+//! diagnostics and panic output to the serial driver, in the README's
+//! § Role and `docs/console-model.md`. `main` follows that order: bootstrap
+//! caps, the serial sink and panic sink, the dropped `log_send_cap`, the
+//! death EQ and its registration, the wait set, the handover pull, then the
+//! event loop.
 
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]

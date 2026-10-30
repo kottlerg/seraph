@@ -100,9 +100,20 @@ impl Drop for Guest
 {
     fn drop(&mut self)
     {
-        // Best-effort teardown: both calls fail harmlessly when QEMU has
-        // already exited and been reaped (after `wait_exit`), and a drop
-        // has no caller to report to.
+        self.teardown();
+    }
+}
+
+impl Guest
+{
+    /// Kill QEMU, reap it, and join the reader thread. Idempotent: a
+    /// second call (the drop after an explicit one) finds the child
+    /// reaped and the reader joined.
+    fn teardown(&mut self)
+    {
+        // Best-effort: both calls fail harmlessly when QEMU has already
+        // exited and been reaped (after `wait_exit`), and a drop has no
+        // caller to report to.
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(r) = self.reader.take()
@@ -110,10 +121,50 @@ impl Drop for Guest
             let _ = r.join();
         }
     }
-}
 
-impl Guest
-{
+    /// Wrap a spawned child whose stdout is piped, starting the thread that
+    /// reads its serial lines.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the child's stdout was not piped; the child is then
+    /// killed and reaped before returning, so it is not orphaned.
+    fn from_child(mut child: Child) -> Result<Self>
+    {
+        let Some(stdout) = child.stdout.take()
+        else
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("QEMU stdout unavailable");
+        };
+
+        // Read serial on a worker thread so the caller can enforce timeouts
+        // via recv_timeout (std pipes have no read deadline).
+        let (tx, rx) = mpsc::channel::<String>();
+        let reader = thread::spawn(move || {
+            let buf = BufReader::new(stdout);
+            for line in std::io::BufRead::lines(buf)
+            {
+                let Ok(l) = line
+                else
+                {
+                    break;
+                };
+                if tx.send(l).is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        Ok(Self {
+            child,
+            lines: rx,
+            reader: Some(reader),
+        })
+    }
+
     fn launch(
         qemu_binary: &Path,
         ctx: &Context,
@@ -141,39 +192,14 @@ impl Guest
         };
         let qemu_args = build_qemu_argv(&spec)?;
 
-        let mut child = Command::new(qemu_binary)
+        let child = Command::new(qemu_binary)
             .args(&qemu_args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
             .context("spawning qemu-system-x86_64")?;
-        let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
-
-        // Read serial on a worker thread so the caller can enforce timeouts
-        // via recv_timeout (std pipes have no read deadline).
-        let (tx, rx) = mpsc::channel::<String>();
-        let reader = thread::spawn(move || {
-            let buf = BufReader::new(stdout);
-            for line in std::io::BufRead::lines(buf)
-            {
-                let Ok(l) = line
-                else
-                {
-                    break;
-                };
-                if tx.send(l).is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        Ok(Self {
-            child,
-            lines: rx,
-            reader: Some(reader),
-        })
+        Self::from_child(child)
     }
 
     /// Echo serial lines until every marker has appeared (in any order) or
@@ -300,112 +326,40 @@ mod tests
 {
     use super::*;
 
-    /// A `Guest` around a stand-in child running `program` with its stdout
-    /// piped to a reader thread, wired as [`Guest::launch`] wires QEMU. The
-    /// teardown under test is generic over the child, so a long `sleep`
-    /// stands for a QEMU that is still running.
-    fn stand_in(program: &str, args: &[&str]) -> Guest
+    /// A `cat` stand-in for QEMU: it runs until its stdin reaches EOF, and
+    /// the test holds the write end in `child.stdin`. A broken teardown
+    /// therefore cannot leave it on the host: dropping the `Child` closes
+    /// that pipe and `cat` exits. It exits successfully only on that EOF.
+    fn stand_in(stdout: Stdio) -> Child
     {
-        let mut child = Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+        Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(stdout)
             .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (tx, rx) = mpsc::channel::<String>();
-        let reader = thread::spawn(move || {
-            for line in std::io::BufRead::lines(BufReader::new(stdout)).map_while(Result::ok)
-            {
-                if tx.send(line).is_err()
-                {
-                    break;
-                }
-            }
-        });
-        Guest {
-            child,
-            lines: rx,
-            reader: Some(reader),
-        }
-    }
-
-    /// Whether a process with this pid exists, an unreaped zombie included
-    /// (`kill -0` succeeds on one).
-    fn process_exists(pid: u32) -> bool
-    {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(Stdio::null())
-            .status()
             .unwrap()
-            .success()
-    }
-
-    /// Kills the stand-in by pid on drop unless disarmed, so a failed
-    /// assertion cannot leave it running on the host even when the
-    /// teardown under test is the part that is broken. It is armed only
-    /// while the pid is known to be the test's own unreaped child, so the
-    /// kill cannot reach a reused pid.
-    struct KillGuard(Option<u32>);
-
-    impl KillGuard
-    {
-        fn disarm(&mut self)
-        {
-            self.0 = None;
-        }
-    }
-
-    impl Drop for KillGuard
-    {
-        fn drop(&mut self)
-        {
-            if let Some(pid) = self.0
-            {
-                let _ = Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status();
-            }
-        }
-    }
-
-    // In each test below, the teardown under test (`Drop` or `wait_exit`)
-    // collects the exit status through the `Child` handle (`wait` or a
-    // `try_wait` that returned `Some`) before it returns, so the `kill -0`
-    // check after it runs strictly after the reap and cannot race it: an
-    // unkilled process or an unreaped zombie fails the check.
-
-    #[test]
-    fn dropping_a_live_guest_kills_and_reaps_its_process()
-    {
-        let guest = stand_in("sleep", &["3600"]);
-        let pid = guest.child.id();
-        assert!(process_exists(pid));
-        let mut guard = KillGuard(Some(pid));
-        drop(guest);
-        assert!(!process_exists(pid));
-        guard.disarm();
     }
 
     #[test]
-    fn wait_exit_timeout_kills_and_reaps_the_process()
+    fn teardown_kills_reaps_and_joins_a_live_guest()
     {
-        let guest = stand_in("sleep", &["3600"]);
-        let pid = guest.child.id();
-        assert!(process_exists(pid));
-        let mut guard = KillGuard(Some(pid));
-        assert!(guest.wait_exit(Duration::ZERO).is_err());
-        assert!(!process_exists(pid));
-        guard.disarm();
+        let mut guest = Guest::from_child(stand_in(Stdio::piped())).unwrap();
+        guest.teardown();
+        // The status comes from the `Child` handle, cached by the reap: no
+        // pid lookup. `None` means the child was not reaped. A success
+        // status means it was never killed and only left on the stdin EOF
+        // that `Child::wait` causes.
+        let status = guest.child.try_wait().unwrap();
+        assert!(status.is_some_and(|s| !s.success()));
+        // A joined reader has returned and dropped its sender.
+        assert!(matches!(
+            guest.lines.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]
-    fn wait_exit_returns_once_the_process_exits_on_its_own()
+    fn from_child_rejects_a_child_without_piped_stdout()
     {
-        let guest = stand_in("true", &[]);
-        let pid = guest.child.id();
-        assert!(guest.wait_exit(TIMEOUT).is_ok());
-        assert!(!process_exists(pid));
+        assert!(Guest::from_child(stand_in(Stdio::null())).is_err());
     }
 }

@@ -792,7 +792,7 @@ pub fn set_fault_handler_badge_arg_err(ctx: &TestContext) -> TestResult
 {
     let ep = syscall::cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "thread::set_fault_handler_badge_arg_err: cap_create_endpoint failed")?;
-    let Ok(child) = crate::spawn::new_child(ctx)
+    let Ok(mut child) = crate::spawn::new_child(ctx)
     else
     {
         cap_delete(ep).ok();
@@ -819,8 +819,8 @@ pub fn set_fault_handler_badge_arg_err(ctx: &TestContext) -> TestResult
     let plain = bind(0);
     let unbound = syscall::thread_set_fault_handler(child.th, 0, syscall_abi::FAULT_CLASS_ALL);
 
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     cap_delete(ep).ok();
     if forged != SyscallError::InvalidArgument as i64
     {

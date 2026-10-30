@@ -384,9 +384,9 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   (through `delete_thread` / `delete_cspace`), so a test that fails early
   leaves no child running.
 - `ChildStack` / `IpcPage` — a child's static 16 KiB stack and page-aligned
-  IPC buffer page, declared per test (the stress cells share
-  `stress::STRESS_STACKS`) and handed to one thread at a time (the rule in
-  their rustdoc).
+  IPC buffer page, declared per test (or, for most stress cells, taken from
+  the shared `stress::STRESS_STACKS`) and handed to one thread at a time (the
+  rule in their rustdoc).
 - `spawn::redirect_to_entry(regs, entry)` — points a register file read
   from a stopped or fault-blocked child at an `extern "C"` entry, with the stack pointer
   aligned for the entry ABI, for the `thread_write_regs` redirect tests.

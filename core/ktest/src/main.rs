@@ -219,17 +219,17 @@ pub struct TestContext
 /// any test module that spawns a child thread. Pass `ChildStack::top(ptr)` to
 /// `thread_configure` as the initial stack pointer.
 ///
-/// A test that needs a child thread declares its own static stacks, except
-/// the stress cells, which take theirs from the shared `stress::STRESS_STACKS`
-/// array one cell after another. A stack is handed to one thread at a time: a
-/// test starts a child on it only once the stack's previous child has exited
-/// or never started, which is what `spawn::configure_and_start`'s contract
-/// asks of the caller. Every test reaps each child it starts on one of these
-/// stacks before it returns, on every path: through the child's
+/// A test that needs a child thread declares its own static stacks, or, as most
+/// stress cells do, takes them from the shared `stress::STRESS_STACKS` array,
+/// which the cells use one after another. A stack is handed to one thread at
+/// a time: a test starts a child on it only once the stack's previous child
+/// has exited or never started, which is what `spawn::configure_and_start`'s
+/// contract asks of the caller. Every test reaps each child it starts on one
+/// of these stacks before it returns, on every path: through the child's
 /// `spawn::SpawnedChild` guard, whose drop deletes the caps the test has not,
-/// or, for a set of threads sharing one `CSpace`, by its own cleanup on every
-/// path. So the rule holds across test boundaries whether the earlier test
-/// passed or failed.
+/// or, for a thread it creates directly, by its own cleanup on every path. So
+/// the rule holds across test boundaries whether the earlier test passed or
+/// failed.
 // Field is CPU stack memory; only the hardware stack pointer accesses it, not Rust code.
 #[allow(dead_code)]
 #[repr(align(16))]

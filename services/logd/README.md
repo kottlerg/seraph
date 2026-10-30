@@ -90,8 +90,10 @@ logd/
 ├── Cargo.toml                  # std-built workspace member
 ├── README.md
 ├── codec/                      # logd-codec, its own component shared
-│                               # with init-logd: handover wire contract
-│                               # and BoundedStr (see codec/README.md)
+│                               # with init-logd: handover wire contract,
+│                               # init-logd's history ring, the shared
+│                               # line and name widths, and BoundedStr
+│                               # (see codec/README.md)
 ├── docs/
 │   ├── handover-protocol.md    # init-logd → logd wire format
 │   └── ipc-interface.md        # IPC labels logd handles

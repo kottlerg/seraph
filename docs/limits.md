@@ -456,7 +456,7 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643) (argv, names, r
 | `registry-client` `NAME_MAX`, `NAME_WORDS` | `shared/registry-client/src/lib.rs` | 16 / 2 | copy of `registry::NAME_MAX` | 16 B stack | raise | Share one constant or pin with a test |
 | `REGISTRY_CAP`, `BADGEED_CAP` | `shared/registry-client`, `shared/log` | `AtomicU32` | ABI width (cap handle) | 4 B | correct as is | None (#74) |
 | log `CHUNK_SIZE` | `shared/log/src/lib.rs` | 512 | ABI width (`MSG_DATA_WORDS_MAX * 8`) | none | correct as is | None |
-| log `STACK_BUF_LEN` | `shared/log/src/lib.rs` | 512 | ABI width | 512 B stack per call | raise | Messages over 512 B are truncated; flush in chunks |
+| log `STACK_BUF_LEN` | `shared/log/src/lib.rs` | 512 | ABI width (one `STREAM_BYTES` payload; a longer message is sent in chunks as the buffer fills) | 512 B stack per call | correct as is | None |
 | shmem `MAX_PAGES` | `shared/shmem/src/lib.rs` | 4 (16 KiB) | ABI width (one single-page cap per slot) | none | needs a design | Multi-page caps or several rounds |
 | `SharedBuffer.page_count` | `shared/shmem/src/lib.rs` | `u32` | provably unreachable (at most `MAX_PAGES`) | 4 B | correct as is | None |
 | `SpscHeader.head`, `tail` | `shared/shmem/src/lib.rs` | `u32`, free-running | provably unreachable (modular index, correct across wrap for capacity up to 2^31) | 16 B per ring | correct as is | None |
@@ -573,14 +573,14 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `HISTORY_RING_LEN` (`HISTORY`) | `services/init/src/logging.rs` | 512 lines | current peak plus headroom (about 50) | about 140 KiB BSS | make pay-as-you-go | Variable-length byte ring |
+| `HISTORY_RING_BYTES` (`HISTORY`) | `services/init/src/logging.rs` | 16 KiB, lines packed by length (about 160 boot lines; peak about 50) | tuning (boot-history retention: a full ring drops its oldest lines, never a sender) | 16 KiB BSS | correct as is | None |
 | `MAX_SENDERS` (`SENDERS`) | `services/init/src/logging.rs` | 32 | provably unreachable as a ceiling (boot window; slots are evicted, not refused) | about 10.5 KiB BSS | correct as is | None |
-| sender-table `MAX_NAME_LEN`, `LINE_BUF_SIZE` | `services/init/sender-table/src/lib.rs` | 48 / 256 | unknown (duplicated in logd) | per slot | needs a design | Share one constant with logd |
-| `HistoryLine.used` | `services/init/src/logging.rs` | `u16` | provably unreachable (at most `LINE_BUF_SIZE`) | 2 B per line | correct as is | None |
-| `HISTORY_TOTAL`, `HISTORY_HEAD` | `services/init/src/logging.rs` | `u64` sequence | ABI width | 16 B | correct as is | None |
+| `LINE_BUF_SIZE`, `MAX_NAME_LEN` | `services/logd/codec/src/lib.rs` | 256 / 48 | line and label length, one definition for init-logd and logd (an over-long line is split, a long name truncated) | per sender slot | correct as is | None |
+| `HistoryRing` record length | `services/logd/codec/src/history.rs` | `u16` | provably unreachable (at most `LINE_BUF_SIZE`, const-asserted) | 2 B per line | correct as is | None |
+| `HistoryRing.total`, `first_seq` | `services/logd/codec/src/history.rs` | `u64` sequence | ABI width | 16 B | correct as is | None |
 | `LOG_THREAD_STACK_PAGES` | `services/init/src/logging.rs` | 4 | BSS budget (the tables live in BSS, not on this stack) | 16 KiB | correct as is | None |
 | `STREAM_CHUNK_SIZE` | `services/init/src/logging.rs`, `services/logd/src/main.rs` | 512 | ABI width | 512 B stack | correct as is | None |
-| `MAX_ORPHAN_MEMORY_CAPS` | `services/init/src/main.rs` | 64 | current peak plus headroom | 256 B | raise | Halts on overflow; size from `memory_count` |
+| `MAX_ORPHAN_MEMORY_CAPS` | `services/init/src/main.rs` | `INIT_INFO_MAX_PAGES * PAGE_SIZE / size_of::<CapDescriptor>()` = 682 | provably unreachable (at most one orphan per usable-RAM cap, each of which has an `InitInfo` descriptor; `memory_count` is clamped to it) | about 2.7 KiB BSS, reclaimed at init's reap | correct as is | None |
 | `CSPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 149 pages (8231 slots) | current peak plus headroom | 149 pages each for memmgr and procmgr | needs a design | Lifetime cap on tier-1 caps; self-augment path |
 | `THREAD_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 6 | encoding artefact (kernel stack, TCB and FPU pages) | per tier-1 service | correct as is | Share with procmgr |
 | `ASPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 48 | refillable seed for procmgr; a static seed for memmgr, which has no augment path | 48 pages per tier-1 service | make pay-as-you-go | memmgr's page-table pool caps its metadata-arena growth; fund it from its pool (#642) |
@@ -594,12 +594,11 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645).
 | `log_hex` buffer | `services/init/src/bootstrap.rs` | 96 B | diagnostic output cap | 96 B stack | correct as is | None |
 | `SlotTable.slots` | `services/logd/src/slot.rs` | unbounded map | none | none | correct as is | Already pay-as-you-go |
 | `PER_SLOT_HISTORY` | `services/logd/src/slot.rs` | 16 lines | tuning (per-sender retention) | none up front | correct as is | None |
-| logd `LINE_BUF_SIZE`, `MAX_NAME_LEN` | `services/logd/src/slot.rs` | 256 / 48 | duplicated with init | none | needs a design | Share one constant |
-| `MAX_DEATHS_PER_BURST` | `services/logd/src/main.rs` | 64 | current peak plus headroom | about 0.6 KiB | needs a design | Overflow drops deaths and leaks slots |
+| `DEATH_EQ_CAPACITY` | `services/logd/src/main.rs` | procmgr `MAX_PROCESSES * 2` = 64 | follows procmgr's own death queue (a full queue drops a death only when procmgr's would) | about 0.6 KiB | needs a design | A full queue still drops silently; a resync path replaces the coupling once procmgr's table grows (#643) |
 | eviction by `t as u32` | `services/logd/src/main.rs` | low 32 bits | ABI width (kernel correlator) | none | needs a design | Evicts every slot sharing the low bits (#638) |
 | death exit reason | `services/logd/src/main.rs` | `u32` | encoding artefact | none | correct as is | None |
-| handover `MAX_ITERS` | `services/logd/src/handover.rs` | 2048 | provably unreachable (init's 32 senders plus 512 lines) | none | correct as is | Derive from those constants |
-| `send_release` `MAX_RETRIES` | `services/logd/src/handover.rs` | 64 yields | unknown (yield count) | none | needs a design | Time-based bound |
+| handover `MAX_ITERS` | `services/logd/src/handover.rs` | 2048 | provably unreachable (init's 32 senders plus at most about 860 lines in its 16 KiB ring) | none | correct as is | Derive from those constants |
+| `RELEASE_RETRY_BUDGET_US` (`send_release`) | `services/logd/codec/src/handover.rs` | 1 s of wall-clock time | tuning (bounds no capacity; time-based, so load does not shorten it) | none | correct as is | None |
 | `MAX_RELEASE_DEFERRALS` | `services/logd/codec/src/handover.rs` | 8 | tuning (liveness bound against name churn) | none | correct as is | None |
 | `NameResend.pending` | `services/logd/codec/src/handover.rs` | init `MAX_SENDERS` | encoding artefact (mirror) | 32 B | correct as is | None |
 | `LineBuf.buf`, `SerialFmt` | `services/logd/src/main.rs` | 512 / 256 | ABI width; line length | stack | correct as is | Use `SERIAL_CHUNK` |

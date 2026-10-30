@@ -539,6 +539,9 @@ version = "0.1.1"
 [[package]]
 name = "init-sender-table"
 version = "0.1.1"
+dependencies = [
+ "logd-codec",
+]
 
 [[package]]
 name = "ipc"
@@ -636,6 +639,7 @@ version = "0.1.1"
 dependencies = [
  "ipc",
  "logd-codec",
+ "procmgr-process-table",
  "syscall",
  "syscall-abi",
 ]

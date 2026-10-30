@@ -2169,7 +2169,7 @@ pub mod log_labels
     /// Sent by real-logd on the same single-use SEND cap after its
     /// [`HANDOVER_PULL`] drain settles (whether the drain ran to `DONE`,
     /// aborted on an IPC error, or hit its iteration cap); a call that
-    /// fails is retried a bounded number of times until one is delivered
+    /// fails is retried, within a wall-clock budget, until one is delivered
     /// (see `services/logd/docs/handover-protocol.md` § Termination).
     /// Init-logd replies with a status in the label:
     ///

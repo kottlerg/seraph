@@ -283,7 +283,9 @@ pub fn bootstrap_caps(
                     {
                         if decoded.is_err()
                         {
-                            std::os::seraph::log!("bootstrap: malformed endowment LOGD_SOURCES round");
+                            std::os::seraph::log!(
+                                "bootstrap: malformed endowment LOGD_SOURCES round"
+                            );
                         }
                         for &cap in delivered
                         {

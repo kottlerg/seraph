@@ -36,7 +36,8 @@ in [crash-safety.md](crash-safety.md).
   alone. A page a client still maps is quarantined, and the slot gets a
   replacement page. The cache takes at most 32 pages beyond its slots for
   replacements, past which a still-mapped slot stays out of service (`src/cache.rs` module
-  docs; [fs-driver-protocol.md § Label 8](../../docs/fs-driver-protocol.md#label-8-fs_release_memory)).
+  docs;
+  [fs-driver-protocol.md § Label 8](../../docs/fs-driver-protocol.md#label-8-fs_release_memory)).
 * **NodeTable** (`src/backend.rs`): dedupes by on-disk slot
   `(sector_lba, offset_in_sector)`; two distinct on-disk entries
   always allocate distinct `NodeId`s, even when both are empty files

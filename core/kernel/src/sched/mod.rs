@@ -5311,6 +5311,16 @@ pub unsafe fn schedule(requeue: Requeue)
     // `invalidate_all_iopbs` that a remote bind or withdrawal issues after
     // this load is never overwritten by it. x86-64 only; `load_iopb` is a
     // no-op on RISC-V, where `iopb` is always null.
+    //
+    // Only an idle (or absent) outgoing thread may wait for `next`'s register
+    // save to publish (step 3.5 of the `context_saved` protocol in
+    // core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership): a
+    // non-idle outgoing thread is itself unpublished until this CPU's
+    // `switch()`, so two CPUs that each dispatch the other's outgoing thread
+    // would wait on each other forever. Such a CPU hands an unpublished `next`
+    // back to its own run queue and switches to idle, whose `schedule()`
+    // dispatches it once published.
+    let outgoing_may_wait = current.is_null() || core::ptr::eq(current, sched.idle());
     #[cfg(not(test))]
     let mut iopb_loaded = false;
     if !core::ptr::eq(next, sched.idle())
@@ -5318,7 +5328,45 @@ pub unsafe fn schedule(requeue: Requeue)
         // SAFETY: next is a valid TCB; sched_lock paired with unlock below.
         let ns = unsafe { (*next).sched_lock.lock_raw() };
         // SAFETY: next valid; state read/written under its sched_lock.
-        let dispatchable = unsafe { (*next).state == ThreadState::Ready };
+        let ready = unsafe { (*next).state == ThreadState::Ready };
+        // `context_saved` cannot return to 0 once read as 1 here: `next` is
+        // dequeued and current nowhere, and only the CPU it is current on
+        // clears it.
+        let deferred = ready
+            && !outgoing_may_wait
+            // SAFETY: next valid; context_saved is atomic.
+            && unsafe {
+                (*next)
+                    .context_saved
+                    .load(core::sync::atomic::Ordering::Acquire)
+            } == 0;
+        let dispatchable = ready && !deferred;
+        if deferred
+        {
+            // Re-link `next` here, still `Ready`, and claim idle. Lock order:
+            // `next.sched_lock` (held) → this CPU's run-queue lock. IRQs stay
+            // disabled across the relock/release.
+            // SAFETY: next valid; its sched_lock is held, so its priority is
+            // stable and no other path links it; lock_raw/release_lock_only
+            // paired.
+            unsafe {
+                let relock = sched.lock.lock_raw();
+                let linked = sched.enqueue(next, (*next).priority);
+                debug_assert!(
+                    linked,
+                    "schedule deferred dispatch: enqueue skipped for a dequeued \
+                     thread under its held sched_lock"
+                );
+                if linked
+                {
+                    (*next).preferred_cpu = cpu as u32;
+                }
+                sched.set_current(sched.idle());
+                sched.lock.release_lock_only();
+                let _ = relock;
+            }
+            set_reschedule_pending_for(cpu);
+        }
         if dispatchable
         {
             // SAFETY: under next.sched_lock.
@@ -5357,7 +5405,11 @@ pub unsafe fn schedule(requeue: Requeue)
         }
         // SAFETY: paired with lock_raw above.
         unsafe { (*next).sched_lock.unlock_raw(ns) };
-        if !dispatchable
+        if deferred
+        {
+            next = sched.idle();
+        }
+        else if !dispatchable
         {
             // Re-claim idle (set_current needs the CPU lock briefly); IRQs stay
             // disabled across the relock/release.
@@ -5531,7 +5583,8 @@ pub unsafe fn schedule(requeue: Requeue)
     // Wait for the next thread's SavedState to be fully committed by its
     // previous CPU's switch(). On RISC-V RVWMO, without this Acquire the
     // loads in the restore phase could see stale register values. The spin
-    // runs lockless (see #144).
+    // runs lockless (see #144), and only with an idle or absent outgoing
+    // thread: the dispatch flip above deferred an unpublished `next` otherwise.
     let cs_unpublished = !core::ptr::eq(next, sched.idle())
         && !next.is_null()
         // SAFETY: next is a valid TCB; context_saved field always valid.

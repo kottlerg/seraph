@@ -672,6 +672,8 @@ pub fn fs_write_invariants_phase(_: &Caps)
     use namespace_protocol::rights;
 
     const CLUSTER: usize = 4096;
+    // The most bytes one inline `FS_WRITE` carries: `MSG_DATA_WORDS_MAX`
+    // words less the offset word.
     const INLINE_CHUNK: usize = 504;
 
     let info = startup_info();

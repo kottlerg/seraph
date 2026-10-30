@@ -229,7 +229,8 @@ unsafe fn inb(port: u16) -> u8
 #[cfg(not(test))]
 unsafe fn calibrate_apic_timer() -> u64
 {
-    // PIT calibration interval: ~10 ms.
+    // PIT calibration interval: ~10 ms. A sampling window, not a capacity; it
+    // keeps `pit_counts` inside the PIT's 16-bit counter (about 54.9 ms at `PIT_HZ`).
     const PIT_CALIBRATION_MS: u64 = 10;
     // PIT counts for 10 ms.
     let pit_counts = (PIT_HZ * PIT_CALIBRATION_MS / 1000) as u16;
@@ -442,6 +443,7 @@ pub fn delay_us(us: u64)
     if per_us == 0
     {
         // Fallback before calibration: spin ~200 iterations per µs (very rough).
+        // A tuning value for early boot only; it bounds no capacity.
         for _ in 0..us * 200
         {
             core::hint::spin_loop();

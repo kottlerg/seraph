@@ -83,6 +83,8 @@ impl Mutex {
     }
 
     fn spin(&self) -> u32 {
+        // A tuning value that bounds no capacity: past it the waiter parks on
+        // the lock's notification instead of spinning.
         let mut spin = 100;
         loop {
             let s = self.state.load(Relaxed);

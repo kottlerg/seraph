@@ -69,7 +69,8 @@ const PAGE_BYTES: usize = PAGE_SIZE as usize;
 /// path via `FatNode.open_slot`, so the badge never crosses an IPC boundary
 /// (see `file::OpenFile::badge`). With no external observer there is nothing to
 /// enumerate, so randomization would add an entropy syscall per open for no
-/// anti-enumeration benefit.
+/// anti-enumeration benefit. One increment per open cannot wrap the `u64`
+/// within any uptime.
 static NEXT_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
@@ -609,6 +610,8 @@ fn read_memory_at_slot(
         return;
     }
     let mut cluster = node.cluster;
+    // `offset` is below the `u32` file size, so the walk ends within
+    // `u32::MAX / cluster_size` steps even on a cyclic chain.
     for _ in 0..cluster_idx
     {
         if let Some(c) = next_cluster(state, cluster, cache, block_dev, ipc_buf)
@@ -707,6 +710,7 @@ fn read_memory_at_slot(
     //   - memory-cap tail:  PAGE_SIZE - memory_data_offset
     //                  (bytes before memory_data_offset belong to other files
     //                   or the previous cluster's leftover sectors)
+    // None bounds a file: the client reads on with further calls.
     let cluster_remaining = cluster_size - offset_in_cluster;
     let bytes_valid = (file_size - offset)
         .min(cluster_remaining)
@@ -1072,7 +1076,8 @@ fn write_file_bytes(
     // separate `prev` that was updated after `cluster`, so on
     // append-past-EOC it linked the new cluster behind the prior
     // terminal, overwriting that terminal's existing forward link and
-    // orphaning the original tail.)
+    // orphaning the original tail.) `end` fits a `u32`, so the walk ends
+    // within `u32::MAX / cluster_size` steps even on a cyclic chain.
     for _ in 0..target_cluster_idx
     {
         cluster = match chain_next(state, cluster, cache, block_dev, ipc_buf)?

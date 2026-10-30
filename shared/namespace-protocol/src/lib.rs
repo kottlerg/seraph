@@ -190,7 +190,8 @@ pub struct EntryView
 /// (read-only mapping authority) covering the cached file page. The cookie value echoes the
 /// caller-supplied request cookie unchanged. `bytes_valid` is bounded
 /// by file end, the current backend cluster boundary, and the page
-/// tail.
+/// tail. Both it and `memory_data_offset` are at most a page, so their
+/// `u32` width never truncates.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct MemoryReply
 {

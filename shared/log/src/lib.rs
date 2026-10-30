@@ -56,7 +56,8 @@ const STACK_BUF_LEN: usize = CHUNK_SIZE;
 /// Badged SEND cap on the log endpoint, pre-installed at process
 /// startup via [`install_badged_cap`]. Zero when no logger is
 /// reachable (a process spawned before the log endpoint exists);
-/// [`emit`] drops in that case.
+/// [`emit`] drops in that case. `AtomicU32` because a cap handle is `u32` in
+/// the syscall ABI.
 static BADGEED_CAP: AtomicU32 = AtomicU32::new(0);
 
 /// Pre-install a badged SEND cap on the log endpoint. Called by

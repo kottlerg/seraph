@@ -267,6 +267,8 @@ fn handle_definition(
     // EQ (never in an IPC body, cap, or logged value), and consumed directly as
     // `services[idx]` on death dispatch. With no untrusted observer there is
     // nothing to enumerate, and a (random-epoch, index) split would buy nothing.
+    // `idx` is below `MAX_SERVICES`, so the cast to the kernel's 32-bit
+    // correlator is lossless.
     let correlator = idx as u32;
 
     let Some(launched) = launch::launch(def, ctx, registry, Some((deaths_eq, correlator)))

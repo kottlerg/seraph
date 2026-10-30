@@ -508,7 +508,8 @@ pub struct BlkRuntime<'a>
     capacity: u64,
     /// Monotonic counter for partition-identity badges. The
     /// `MOUNT_AUTHORITY` bit lives at `1 << 63`; this counter stays in
-    /// the low bits and so is bit-disjoint by construction.
+    /// the low bits and so is bit-disjoint by construction. Reaching that bit
+    /// takes 2^63 registrations, which no device lifetime issues.
     next_partition_badge: u64,
     /// Set once [`quiesce_device`] has reset the device after a lost
     /// request; every later transfer is answered `DEVICE_FAULT`.

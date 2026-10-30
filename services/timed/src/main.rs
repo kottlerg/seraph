@@ -77,6 +77,8 @@ fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64, offset: Option<u64>)
     {
         (timed_labels::GET_WALL_TIME, Some(off)) =>
         {
+            // `GET_WALL_TIME` replies one `u64` of microseconds since the
+            // Unix epoch, which spans about 584 000 years.
             let now = off.wrapping_add(kernel_elapsed_us());
             IpcMessage::builder(timed_errors::SUCCESS)
                 .word(0, now)

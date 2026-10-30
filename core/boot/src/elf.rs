@@ -46,6 +46,9 @@ pub use elf::ElfKind;
 // ── Output types ──────────────────────────────────────────────────────────────
 
 /// Maximum number of `PT_LOAD` segments supported in a kernel ELF.
+///
+/// Eight is provably sufficient: the in-tree kernel links to five LOAD segments
+/// on `x86_64`, and a ninth fails the load with an error rather than truncating.
 const MAX_LOAD_SEGMENTS: usize = 8;
 
 /// A single loaded ELF `PT_LOAD` segment with physical placement and permissions.

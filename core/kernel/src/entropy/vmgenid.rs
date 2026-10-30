@@ -34,7 +34,7 @@ static GUID_VA: AtomicU64 = AtomicU64::new(0);
 
 /// BSP poll cache for [`poll_log`], as two little-endian words. BSP-private
 /// (written at Phase 5 single-threaded boot and from the BSP tick only), so
-/// `Relaxed` suffices.
+/// `Relaxed` suffices. Two words because the VMGENID GUID is 128 bits.
 static LAST_SEEN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Arm snapshot detection. Phase 5, BSP, after paging (direct map live) and

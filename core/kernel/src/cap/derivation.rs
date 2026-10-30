@@ -70,6 +70,9 @@ pub static DERIVATION_LOCK: DerivationLock = DerivationLock::new();
 /// its origin).
 pub struct DerivationLock
 {
+    /// `0`, a reader count, or `WRITE_LOCKED`. A holder is never descheduled
+    /// (core/kernel/docs/scheduling-internals.md § Lock Hierarchy), so readers
+    /// are at most one per CPU and the count never reaches `WRITE_LOCKED`.
     state: AtomicU32,
     /// Holder CPU plus one while the write lock is held; 0 otherwise.
     holder: AtomicU32,
@@ -391,7 +394,8 @@ pub unsafe fn unlink_node(node: SlotId)
 /// (the source's children move under the destination). The bound and its
 /// rationale are defined in core/kernel/docs/capability-internals.md
 /// § Revocation Algorithm and § Move. The one walk that holds the lock end
-/// to end is `split::rollback_child`, whose rustdoc gives the reason.
+/// to end is `split::rollback_child`, whose rustdoc gives the reason. A longer
+/// child list only takes more batches; `reparent_children` reports the rest.
 pub const MAX_REPARENT_EDITS: usize = MAX_REVOKE_EDITS;
 
 /// Liveness backstop for the callers' [`reparent_children`] loops: more

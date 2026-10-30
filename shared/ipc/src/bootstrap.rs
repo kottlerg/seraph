@@ -68,6 +68,8 @@ pub struct BootstrapRound
 // ── Label packing ───────────────────────────────────────────────────────────
 
 /// Pack a successful reply label: base (`MORE`/`DONE`) + cap count + data count.
+/// Each field is 8 bits, which holds the base labels, `MSG_CAP_SLOTS_MAX`
+/// and `MSG_DATA_WORDS_MAX`, so the widths bound no round.
 #[must_use]
 pub const fn pack_reply_label(done: bool, cap_count: usize, data_words: usize) -> u64
 {
@@ -111,6 +113,8 @@ pub struct PackedSlots
 {
     caps: [u32; MSG_CAP_SLOTS_MAX],
     cap_count: usize,
+    /// A `u64` mask covers every slot of a round, which carries at most
+    /// `MSG_CAP_SLOTS_MAX` caps.
     presence: u64,
 }
 
@@ -374,6 +378,10 @@ pub unsafe fn request_round(creator_ep: u32, ipc_buf: *mut u64) -> Result<Bootst
 /// slots: request rounds until one is marked [`DONE`], spreading each over
 /// the next `MSG_CAP_SLOTS_MAX` slots by the presence word in its `data[0]`.
 /// A slot no round filled is `0`; a delivered cap past slot `N` is deleted.
+///
+/// The round loop has no count bound: the creator serving it created this
+/// process and already holds full authority over it, so an endless stream of
+/// rounds grants it nothing it lacks.
 ///
 /// # Safety
 /// `ipc_buf` must point to the caller thread's registered IPC buffer page.

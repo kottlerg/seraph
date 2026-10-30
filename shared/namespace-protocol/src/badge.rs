@@ -22,7 +22,8 @@ use core::prelude::rust_2024::*;
 
 use crate::rights::{NamespaceRights, RIGHTS_MASK};
 
-/// Width of the `node_id` field within a node-cap badge, in bits.
+/// Width of the `node_id` field within a node-cap badge, in bits. With the
+/// 24 rights bits ([`crate::rights::RIGHTS_BITS`]) it fills the `u64` badge.
 pub const NODE_ID_BITS: u32 = 40;
 
 /// Mask of all bits valid in a [`NodeId`] backing value.

@@ -30,6 +30,9 @@ const REPLACEMENT_CODEPOINT: u32 = 0xFFFD;
 /// Constructed from a `FramebufferInfo` supplied by the bootloader. Clears the
 /// screen to black on construction. Tracks a character-cell cursor and renders
 /// glyphs from the embedded bitmap font.
+///
+/// Geometry fields are `u32` because `FramebufferInfo`'s `width`, `height` and
+/// `stride` are; the cell counts derive from them and cannot exceed them.
 pub struct FramebufferWriter
 {
     base: *mut u8,

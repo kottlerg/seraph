@@ -23,7 +23,8 @@ pub fn phases() -> &'static [Phase]
 }
 
 /// Bound on the 1 ms polls of a piped `try_wait` after the child's stdout
-/// reached EOF.
+/// reached EOF. A test wait bound: it limits only how long the phase waits
+/// before it fails.
 const TRY_WAIT_POLLS: u32 = 5000;
 
 // too_many_lines: the phase is a sequence of independent numbered scenarios

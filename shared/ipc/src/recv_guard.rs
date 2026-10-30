@@ -36,7 +36,8 @@ pub const EXIT_RECV_WEDGE: u32 = 0x0F10;
 /// one dies before its clients' timeouts cascade.
 pub const RECV_FAILURE_FATAL_STREAK: u32 = 32;
 
-/// Ceiling of the exponential backoff applied between failed receives.
+/// Ceiling of the exponential backoff applied between failed receives. A
+/// tuning value: it only spaces retries and bounds no capacity.
 pub const RECV_FAILURE_BACKOFF_CAP_MS: u64 = 128;
 
 /// Which diagnostic event a [`RecvGuard`] hook invocation reports.
@@ -65,6 +66,8 @@ pub enum RecvFailureStage
 /// recv-failure line plus the loud death itself.
 pub struct RecvGuard
 {
+    /// Never passes [`RECV_FAILURE_FATAL_STREAK`], where the guard exits the
+    /// process, so the `u32` cannot overflow.
     streak: u32,
     last_err: i64,
     diag: fn(RecvFailureStage, i64),

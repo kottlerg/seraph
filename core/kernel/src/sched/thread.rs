@@ -475,7 +475,8 @@ pub struct ThreadControlBlock
     /// requeue site for an already-Running thread, and by
     /// `sys_thread_set_affinity` which actively migrates a Ready thread.
     /// Owned by [`sched_lock`](Self::sched_lock), under which
-    /// `sys_thread_set_affinity` writes it.
+    /// `sys_thread_set_affinity` writes it. A single CPU index is a design
+    /// choice; it bounds no capacity.
     pub cpu_affinity: u32,
 
     /// Soft affinity: the CPU this thread was last linked or dispatched on (hint
@@ -547,7 +548,8 @@ pub struct ThreadControlBlock
     /// sleep-list pop and claims only the park it popped (§ Sleep List
     /// Invariants). Atomic (Relaxed) because the timer reads it under
     /// `SLEEP_LIST_LOCK` or the source lock rather than `sched_lock`; every
-    /// write holds `sched_lock`.
+    /// write holds `sched_lock`. A wrapping `u32` suffices: a snapshot is compared
+    /// within one lock-bracketed window, far shorter than 2^32 parks.
     pub park_seq: core::sync::atomic::AtomicU32,
 
     /// Start generation: advanced under [`sched_lock`](Self::sched_lock) by
@@ -557,7 +559,9 @@ pub struct ThreadControlBlock
     /// commit and its link supersedes it instead of being overwritten by a
     /// second link (`enqueue_ready_thread`). A plain `u32` owned by
     /// `sched_lock`: every read and write holds it (the bare-field exception
-    /// of docs/coding-standards.md § Concurrency).
+    /// of docs/coding-standards.md § Concurrency). A wrapping `u32` suffices: a
+    /// snapshot is compared within one commit-to-link window, far shorter than
+    /// 2^32 starts.
     pub start_seq: u32,
 
     // === IPC state ===
@@ -596,7 +600,8 @@ pub struct ThreadControlBlock
     pub park_disposition: core::sync::atomic::AtomicU8,
 
     /// Park-episode counter for the reply protocol's spurious-resume tripwire:
-    /// incremented by `sys_ipc_call` / `fault_dispatch` at episode start.
+    /// incremented by `sys_ipc_call` / `fault_dispatch` at episode start. A
+    /// debug-only `u32`: it and `deposit_episode` are compared within one park.
     #[cfg(debug_assertions)]
     pub park_episode: core::sync::atomic::AtomicU32,
 
@@ -737,7 +742,8 @@ pub struct ThreadControlBlock
     /// unregister and free under it. `(0, 0)` for a null `cspace`; epoch 0
     /// is never registered, so it resolves to nothing.
     pub cspace_id: crate::cap::slot::CSpaceId,
-    /// See [`cspace_id`](Self::cspace_id).
+    /// See [`cspace_id`](Self::cspace_id). A `u32` because it mirrors the
+    /// registry epoch, whose width `SlotId.epoch` fixes.
     pub cspace_epoch: u32,
 
     // === IPC buffer ===
@@ -875,7 +881,7 @@ pub struct ThreadControlBlock
     pub death_observers: [DeathObserver; MAX_DEATH_OBSERVERS],
     /// Number of populated entries in `death_observers`
     /// (`0..=MAX_DEATH_OBSERVERS`). Owned by [`sched_lock`](Self::sched_lock),
-    /// as `death_observers` is.
+    /// as `death_observers` is. A `u8` holds it: `MAX_DEATH_OBSERVERS` is 4.
     pub death_observer_count: u8,
 
     /// Exit reason recorded by the kernel at the moment this thread became

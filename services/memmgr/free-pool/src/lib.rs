@@ -24,6 +24,8 @@ pub const MAX_FREE_RUNS: usize = 512;
 
 /// Pages backed per demand fault: memmgr maps a contiguous chunk of up to this
 /// many pages (clamped to the region) on each fault rather than a single page.
+/// A fault-around tuning value that bounds no capacity: a page outside the
+/// chunk faults again and is backed by the next chunk.
 pub const DEMAND_CHUNK_PAGES: u32 = 16;
 
 /// One free run: a Memory cap memmgr owns, covering `page_count` pages

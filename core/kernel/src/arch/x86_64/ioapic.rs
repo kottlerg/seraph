@@ -109,11 +109,11 @@ pub const IOAPIC_MAX_PINS: u32 = 256;
 pub const BROADCAST_APIC_ID: u32 = 0xFF;
 
 /// Where [`assign_vector`]'s search for a free vector starts: one past the vector it last
-/// assigned, and never the index of a vector just released ([`release_vector`] moves it
-/// past one). The search moves through the vectors in turn, so a released vector is taken
-/// again only once the search comes round to it, not by the next route while other
-/// vectors are free (`interrupts::unroute_device_irq`). Written only under `irq`'s routing
-/// lock.
+/// assigned, moved past a released vector the search would otherwise reach before any
+/// other free one ([`release_vector`]). The search moves through the vectors in turn, so a
+/// released vector is taken again only once the search comes round to it, not by the next
+/// route while other vectors are free (`interrupts::unroute_device_irq`). Written only
+/// under `irq`'s routing lock.
 #[cfg(not(test))]
 static NEXT_VECTOR_INDEX: AtomicU32 = AtomicU32::new(0);
 
@@ -164,8 +164,8 @@ fn assign_vector_in(table: &[AtomicU32], gsi: u32, start: usize) -> Option<(u8, 
 }
 
 /// Free every vector `table` assigns to `gsi`, and return the search cursor `cursor` moved
-/// past each freed index it names, so the next search does not start on a vector just
-/// released.
+/// past each freed index a search from it would reach before any other free vector, so
+/// the next search does not take a vector just released while another is free.
 fn release_vector_in(table: &[AtomicU32], gsi: u32, cursor: usize) -> usize
 {
     let Some(tag) = gsi.checked_add(1)
@@ -179,7 +179,10 @@ fn release_vector_in(table: &[AtomicU32], gsi: u32, cursor: usize) -> usize
         if entry.load(Ordering::Relaxed) == tag
         {
             entry.store(0, Ordering::Release);
-            if index == cursor
+            let first_free = (0..table.len())
+                .map(|offset| (cursor + offset) % table.len())
+                .find(|&i| table[i].load(Ordering::Relaxed) == 0);
+            if first_free == Some(index)
             {
                 cursor = (index + 1) % table.len();
             }
@@ -548,6 +551,22 @@ mod tests
         assert_eq!(cursor, 6);
         let (vector, _) = assign_vector_in(&t, 4, cursor).expect("vector");
         assert_ne!(vector, DEVICE_VECTOR_BASE + 5);
+    }
+
+    #[test]
+    fn a_release_behind_occupied_vectors_moves_the_cursor_past_it()
+    {
+        // Indices 0-10 held, the cursor back at 0 after a wrap, and the rest free:
+        // releasing index 10 must not leave it the first free vector a search
+        // from the cursor reaches.
+        let t = table();
+        for gsi in 0..=10
+        {
+            assign_vector_in(&t, gsi, gsi as usize).expect("vector");
+        }
+        let cursor = release_vector_in(&t, 10, 0);
+        let (vector, _) = assign_vector_in(&t, 4000, cursor).expect("vector");
+        assert_ne!(vector, DEVICE_VECTOR_BASE + 10);
     }
 
     #[test]

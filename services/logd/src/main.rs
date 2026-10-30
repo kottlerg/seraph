@@ -111,8 +111,12 @@ fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
     // The round carries only the present caps and a presence word naming
     // the slot each fills; an absent slot decodes as `0`. Only the RECV is
     // required.
-    let [log_ep_recv, log_ep_handover_send, procmgr_death_auth_send, devmgr_registry_ep] =
-        ipc::bootstrap::unpack_slots(&round).ok()?;
+    let [
+        log_ep_recv,
+        log_ep_handover_send,
+        procmgr_death_auth_send,
+        devmgr_registry_ep,
+    ] = ipc::bootstrap::unpack_slots(&round).ok()?;
     if log_ep_recv == 0
     {
         return None;

@@ -716,7 +716,8 @@ pub fn procmgr_refusals_phase(_: &Caps)
          {UNDELIVERABLE_REPLY_DELIVERED}=create reply delivered or not refused, \
          {UNDELIVERABLE_POOL_QUERY_FAILED}=pool query failed, \
          {UNDELIVERABLE_NEVER_RECLAIMED}=the child's pages were never reclaimed, \
-         {UNDELIVERABLE_CALL_FAILED}=the create call failed"
+         {UNDELIVERABLE_CALL_FAILED}=the create call failed, \
+         {UNDELIVERABLE_GRANT_FAILED}=a reserve-spending grant failed"
     );
     std::os::seraph::log!("procmgr_refusals phase passed");
 }
@@ -806,6 +807,9 @@ const UNDELIVERABLE_POOL_QUERY_FAILED: i32 = 4;
 const UNDELIVERABLE_NEVER_RECLAIMED: i32 = 5;
 /// Exit code: the `CREATE_FROM_FILE` call itself failed.
 const UNDELIVERABLE_CALL_FAILED: i32 = 6;
+/// Exit code: a memmgr grant spending the IPC receive reserve neither landed
+/// nor failed its transfer.
+const UNDELIVERABLE_GRANT_FAILED: i32 = 7;
 /// Sample windows the child retries: memmgr's free-pool size is system-wide,
 /// and other processes (crasher shares the boot) can move it inside one.
 const UNDELIVERABLE_WINDOWS: u32 = 8;
@@ -851,7 +855,7 @@ fn undeliverable_reply_child_main() -> !
             Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS && !reply.caps().is_empty() =>
             {
             }
-            _ => std::process::exit(UNDELIVERABLE_CALL_FAILED),
+            _ => std::process::exit(UNDELIVERABLE_GRANT_FAILED),
         }
     }
 

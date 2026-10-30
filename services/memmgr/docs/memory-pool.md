@@ -181,8 +181,9 @@ budgets). memmgr cannot request memory from anyone else, so it funds its own slo
   frames from the pool, or a single frame when no such run is free, and donates it with
   augment-mode `cap_create_cspace` against its own `CSpace` cap. It then deletes the frame's cap:
   the donation holds its own reference on the frame.
-- A refused donation pushes the frame back to the pool, and the check runs again before the next
-  receive.
+- A refused donation returns the frame to the pool (coalescing to make room; with no run slot even
+  then, the frame stays owned and counted but out of circulation), and the check runs again before
+  the next receive.
 
 Like arena pages, donated frames leave the free pool for good and stay in `pool_total` as
 memmgr-owned metadata, so the all-RAM-accounted identity is unaffected.

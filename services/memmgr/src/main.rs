@@ -1863,8 +1863,10 @@ fn cspace_headroom(self_cspace: u32) -> u64
 /// pages leave the free pool for good, like the metadata arena's: they stay
 /// in `pool_total` as memmgr-owned metadata. memmgr cannot ask anyone else
 /// for this memory, which is why it funds itself from its own pool. A
-/// failed top-up (no contiguous run, or the augment refused) leaves the
-/// frame in the pool and is retried before the next receive.
+/// failed top-up (no contiguous run, or the augment refused) is retried
+/// before the next receive; a refused augment returns the frame to the pool,
+/// or, when the pool has no run slot even after coalescing, leaves it owned
+/// but out of circulation.
 fn hold_cspace_headroom(self_cspace: u32)
 {
     if cspace_headroom(self_cspace) >= CSPACE_LOW_WATER

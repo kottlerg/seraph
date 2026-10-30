@@ -754,7 +754,8 @@ pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
     cap_delete(probe).ok();
     cap_delete(cspace).ok();
 
-    if u64::from(ok_before) != 55 - syscall_abi::CSPACE_IPC_RECV_RESERVE
+    if u64::from(ok_before)
+        != syscall_abi::CSPACE_SLOTS_PER_PAGE - 1 - syscall_abi::CSPACE_IPC_RECV_RESERVE
         || err_at_pool != SYS_OUT_OF_MEMORY
     {
         return Err(
@@ -979,8 +980,8 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
         cap_delete(cspace).ok();
         return Err("retype::dir_survives: second refill failed");
     }
-    let mut landed = 0u32;
-    for _ in 0..=56
+    let mut landed = 0u64;
+    for _ in 0..=syscall_abi::CSPACE_SLOTS_PER_PAGE
     {
         if cap_copy(probe, cspace, 1).is_err()
         {
@@ -992,7 +993,7 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
     cap_delete(cspace).ok();
     match landed
     {
-        56 => Ok(()),
+        syscall_abi::CSPACE_SLOTS_PER_PAGE => Ok(()),
         0 => Err("retype::dir_survives: insert after refill failed — dir page re-charged?"),
         _ => Err("retype::dir_survives: the refill page did not back exactly one leaf"),
     }

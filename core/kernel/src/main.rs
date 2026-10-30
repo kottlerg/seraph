@@ -1377,14 +1377,15 @@ unsafe fn kernel_entry_post_rebase(
                 .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE wrapper not wired"));
             // SAFETY: cs_kobj_ptr is in-place inside the SEED slab; header at offset 0.
             let cs_nn = unsafe { NonNull::new_unchecked(cs_kobj_ptr.cast::<KernelObjectHeader>()) };
-            // The root CSpace wrapper now has two logical holders: init's TCB
-            // (`init_tcb.cspace`, set below) and the self-cap slot inserted
-            // here. `insert_cap` does not bump the refcount of the inserted
-            // object — it's the caller's responsibility — so we inc here.
-            // `HDR_FLAG_IS_ROOT` (stamped in `boot_retype_cspace`) is the
-            // belt-and-suspenders defense if this accounting ever drifts.
-            // SAFETY: header at offset 0 of cs_kobj_ptr; single-threaded boot.
-            unsafe { cs_nn.as_ref().inc_ref() };
+            // The self-cap takes over the CSpace's creation reference, the
+            // kernel's hold on it through boot: nothing after this handoff
+            // reads the CSpace except through init's TCB, which, like every
+            // thread's, holds no reference on it. From here the CSpace is an
+            // ordinary one whose count is its capabilities (and syscall
+            // pins), so deleting the last of them frees it and releases the
+            // caps it holds (docs/process-lifecycle.md § Init reap).
+            // `insert_cap` does not bump the refcount of the inserted object,
+            // so no reference is taken here.
             cs.insert_cap_typed(
                 CsRights::INSERT | CsRights::DELETE | CsRights::DERIVE,
                 cs_nn,
@@ -1405,10 +1406,10 @@ unsafe fn kernel_entry_post_rebase(
             (*info_ptr).cspace_cap = init_cspace_cap_slot;
         }
 
-        // Transfer the root CSpace pointer into init's TCB. The CSpace lives
-        // inside a SEED-pinned slab; ownership is conveyed by-pointer (no
-        // Box involved). `take_root_cspace` clears `ROOT_CSPACE` so no
-        // other code observes a live root pointer afterwards.
+        // Bind init's TCB to the root CSpace. The CSpace lives inside a SEED
+        // slab and is held by init's self-cap minted above; the TCB's
+        // pointer holds no reference. `take_root_cspace` clears
+        // `ROOT_CSPACE` so no other code observes the pointer afterwards.
         // SAFETY: ROOT_CSPACE wired in Phase 7; single-threaded boot.
         let init_cspace_ptr = unsafe { cap::take_root_cspace() };
         if init_cspace_ptr.is_null()

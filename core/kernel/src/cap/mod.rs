@@ -82,20 +82,21 @@ use crate::mm::paging::phys_to_virt;
 
 /// Root capability space, populated during Phase 7.
 ///
-/// The pointer indexes into a SEED-derived retype slab whose storage is
-/// pinned for the lifetime of the kernel (the seed's pin keeps the slab
-/// alive — see [`install_seed_memory`]). Set in [`init_capability_system`]
-/// via [`boot_retype_cspace`]; consumed (read out into init's TCB) during
-/// Phase 9. Access is single-threaded during boot; `static mut` is safe
-/// here under that invariant.
+/// The pointer indexes into a SEED-derived retype slab. Set in
+/// [`init_capability_system`] via [`boot_retype_cspace`], whose creation
+/// reference is the kernel's hold on the `CSpace` through boot; consumed
+/// (read out into init's TCB) during Phase 9, where that reference passes
+/// to init's self-cap, so from then on the `CSpace` is an ordinary one that
+/// its last capability's deletion frees. Access is single-threaded during
+/// boot; `static mut` is safe here under that invariant.
 #[cfg(not(test))]
 pub static mut ROOT_CSPACE: *mut CSpace = core::ptr::null_mut();
 
 /// Take the root `CSpace` pointer, clearing the slot to null.
 ///
-/// Returns the raw pointer (storage lives inside a SEED slab; ownership is
-/// "use by-pointer until init dies"). The slot is cleared so no other code
-/// can observe a live root cspace pointer afterwards.
+/// Returns the raw pointer (storage lives inside a SEED slab). The slot is
+/// cleared so no other code can observe the pointer afterwards: once init
+/// runs, the `CSpace`'s lifetime is that of its capabilities.
 ///
 /// Uses raw pointer operations to avoid creating a mutable reference to a
 /// mutable static. Safe because access is single-threaded during boot.
@@ -134,7 +135,8 @@ pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
     else
     {
         // SAFETY: raw was set by `boot_retype_cspace` and points at a live
-        // `CSpace` inside a SEED-pinned slab; single-threaded boot.
+        // `CSpace` inside a SEED slab, held by its creation reference;
+        // single-threaded boot.
         unsafe { Some(&mut *raw) }
     }
 }
@@ -283,8 +285,9 @@ fn pop_free() -> Option<CSpaceId>
 ///
 /// The root `CSpace` receives id `0` at init time via the high-water path
 /// — Phase 7 runs before any `free_cspace_id` could populate the free list,
-/// so the root deterministically gets id 0 (and is hard-rejected from
-/// returning to the free list by [`free_cspace_id`]).
+/// so the root deterministically gets id 0. The id carries no special
+/// meaning after boot: freeing init's `CSpace` at its reap recycles it like
+/// any other.
 #[cfg(not(test))]
 pub fn alloc_cspace_id() -> Option<CSpaceId>
 {
@@ -366,14 +369,9 @@ pub fn unregister_cspace(id: CSpaceId)
 /// The epoch-recycle design (random non-zero redraw excluding the prior
 /// value) is specified in `core/kernel/docs/capability-internals.md`
 /// § Representation.
-///
-/// Asserts `id != 0`: the root `CSpace`'s id is reserved for kernel
-/// lifetime; the `HDR_FLAG_IS_ROOT` clamp in `dec_ref` should already make
-/// it unreachable, but defense-in-depth catches misroutes here.
 #[cfg(not(test))]
 pub fn free_cspace_id(id: CSpaceId)
 {
-    assert!(id != 0, "free_cspace_id: root CSpace cannot be recycled");
     debug_assert!((id as usize) < MAX_CSPACES);
     let entry = &CSPACE_REGISTRY[id as usize];
     debug_assert!(
@@ -563,8 +561,7 @@ static mut SEED_MEMORY: object::MemoryObject = object::MemoryObject {
     header: object::KernelObjectHeader {
         ref_count: AtomicU32::new(1),
         obj_type: object::ObjectType::Memory,
-        flags: 0,
-        _pad: [0; 2],
+        _pad: [0; 3],
         ancestor: AtomicPtr::new(core::ptr::null_mut()),
     },
     base: 0,
@@ -1174,12 +1171,6 @@ pub(crate) unsafe fn boot_retype_cspace(
             },
         );
     }
-    // The root CSpace is pinned for kernel lifetime: marking it here makes
-    // `dec_ref` clamp at 1, so any upstream refcount mismanagement of the
-    // wrapper / self-cap pair cannot route it through `dealloc_object`.
-    // SAFETY: header just written, exclusively owned, single-threaded boot.
-    unsafe { (*cs_kobj_ptr).header.flags |= crate::cap::object::HDR_FLAG_IS_ROOT };
-
     // SAFETY: cs_ptr just constructed.
     unsafe { (*cs_ptr).set_kobj(cs_kobj_ptr) };
     seed.header.inc_ref();
@@ -1446,9 +1437,9 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
         // SAFETY: SEED installed above.
         let (_cs_kobj_nn, cs_ptr) =
             unsafe { boot_retype_cspace(seed_memory_ref(), ROOT_CSPACE_INIT_PAGES, id) };
-        // The root CSpace's epoch is fixed at 1 (initial registry value) and
-        // never bumps — it's never recycled (asserted in `free_cspace_id`),
-        // so we discard the returned value.
+        // Nothing mints a `SlotId` from the epoch here: Phase 9 reads it
+        // back with `registry_epoch` for init's TCB, so the returned value
+        // is discarded.
         let _root_epoch = register_cspace(id, cs_ptr)
             .unwrap_or_else(|()| crate::fatal("root CSpace register: id exceeds MAX_CSPACES"));
 

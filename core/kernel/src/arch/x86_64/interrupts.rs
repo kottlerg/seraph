@@ -553,6 +553,12 @@ pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
         }
         if !nmi_sent && elapsed_ms >= 750
         {
+            crate::kprintln_serial!(
+                "IPI WATCHDOG: target_cpu={} op={} elapsed_ms={} — still unacked",
+                ctx.target_cpu,
+                ctx.op_name,
+                elapsed_ms
+            );
             crate::sched::ipi_watchdog_report_target(ctx.target_cpu);
             if let Some(pending) = nmi_backtrace_request(ctx.target_cpu)
             {

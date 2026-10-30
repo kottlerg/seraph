@@ -244,16 +244,15 @@ paths the lock-bypassing `console::panic_write_fmt` and `kprintln_nmi!` / `conso
 never `kprintln!`, and never through any IPC or log channel. The panic handler's backtrace and the
 x86-64 NMI backtrace print their kernel addresses through those two sinks, and the IPI watchdog's
 report of what an unacknowledging CPU waits in prints lock addresses only via `kprintln_serial!`.
-The Phase-1 KASLR report
-prints address-free status lines (one for the image, one for the direct map) via `kprintln!` and the
-slide/bases only via `kprintln_serial!`; the Phase-9 init-thread report prints the thread id and
-priority on one `kprintln!` line and init's kernel stack top (a direct-map VA) on a separate
-`kprintln_serial!` line; the watchdog dump's lock-wait line prints the lock kind via `kprintln!` and
-the lock word's address only via `kprintln_serial!`; the bootloader's console (which also mirrors to
-the framebuffer) prints only the opaque `kaslr_flags`. The `KERNEL EXCEPTION` dumps and the riscv64
-`BUG: ecall return sepc` path print `rip`/`sepc` and register values via `kprintln!` and `fatal`
-halts only the faulting CPU, so on SMP they are userspace-recoverable, as is the non-fatal watchdog
-dump's direct-map TCB and endpoint pointers; closing them is
+The Phase-1 KASLR report prints address-free status lines (one for the image, one for the direct
+map) via `kprintln!` and the slide/bases only via `kprintln_serial!`; the Phase-9 init-thread report
+prints the thread id and priority on one `kprintln!` line and init's kernel stack top (a direct-map
+VA) on a separate `kprintln_serial!` line; the watchdog dump's lock-wait line prints the lock kind
+via `kprintln!` and the lock word's address only via `kprintln_serial!`; the bootloader's console
+(which also mirrors to the framebuffer) prints only the opaque `kaslr_flags`. The `KERNEL EXCEPTION`
+dumps and the riscv64 `BUG: ecall return sepc` path print `rip`/`sepc` and register values via
+`kprintln!` and `fatal` halts only the faulting CPU, so on SMP they are userspace-recoverable, as is
+the non-fatal watchdog dump's direct-map TCB and endpoint pointers; closing them is
 [#440](https://github.com/kottlerg/seraph/issues/440), which also records the other mirrored
 kernel-VA sites the review found.
 

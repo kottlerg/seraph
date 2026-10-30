@@ -1138,7 +1138,7 @@ phases keyed off the elapsed-microseconds delta from the start of the wait:
 |---|---|---|
 | A | 0 – 250 ms | Spin with `core::hint::spin_loop()` while `cond()` reports unacked. |
 | B | 250 – 750 ms | Call `ctx.resend()` once at the boundary, then continue spinning. Recovers from a dropped IPI under emulators with non-deterministic LAPIC delivery. |
-| C | 750 ms – 5 s | Both arches: print, serial-only, what the target CPU is waiting in, from its per-CPU breadcrumbs (`sched::ipi_watchdog_report_target`): its protocol spin site, its bare-lock wait, its ticket-`Spinlock` wait (the lock, the tickets ahead when it joined the queue, and how long it has waited; `Spinlock::lock_raw` records it once its first check fails), and the last syscall entered there. x86-64 also: increment the per-CPU request count returned by `nmi_backtrace_request(target_cpu)` and send a vector-2 NMI to that CPU; the target's dedicated NMI handler dumps its `TrapFrame` to serial so the eventual Phase-D panic is diagnosable. RISC-V: emit a single logged warning (no S-mode NMI surface; Phase C degrades to a warn). |
+| C | 750 ms – 5 s | Both arches: print, serial-only, what the target CPU is waiting in, from its per-CPU breadcrumbs (`sched::ipi_watchdog_report_target`): its protocol spin site, its bare-lock wait, its ticket-`Spinlock` wait (the lock, the tickets ahead when it joined the queue, and how long it has waited; `Spinlock::lock_raw` records it once its first check fails), and the last syscall entered there. x86-64 also: increment the per-CPU request count returned by `nmi_backtrace_request(target_cpu)` and send a vector-2 NMI to that CPU; the target's dedicated NMI handler dumps its `TrapFrame` to serial so the eventual Phase-D panic is diagnosable. RISC-V has no NMI step (no S-mode NMI surface): it emits a single logged warning before the report. |
 | D | > 5 s | Print `target_cpu`, `op_name`, `elapsed_ms` to serial, then `crate::fatal`. |
 
 `wait_for_ack` MUST be called with preemption disabled and `IF=1` / `sstatus.SIE=1` — the same
@@ -1510,17 +1510,15 @@ genuinely never claimed it (no deadline, no `wake_in_flight`, no
 `wake_pending`) is indistinguishable from a legitimate indefinite wait by
 TCB scalars alone and is also not flagged.
 
-**Defers to an in-flight TLB shootdown:** a synchronous shootdown holds every
-participating CPU (initiator preempt-disabled in `wait_for_ack`; peers spinning
-in `pt_lock` or their own shootdown) until all remote CPUs ack. Under heavy
-oversubscription that round-trip can exceed the threshold while still making
-progress, so the all-idle detector and both heartbeat cross-checks skip firing
-while `tlb_shootdown::any_pending()` reports any per-CPU request slot with
-CPUs still to ack. The shootdown's own escalation ladder (§ IPI Watchdog
-Ladder: at 0.75 s an NMI backtrace on x86-64 or a single logged warning on
-RISC-V, `crate::fatal` at 5 s in arch `wait_for_ack`) is the authoritative detector
-for a genuinely stuck IPI; a non-shootdown stall re-checks on the next tick
-once the pending slots drain.
+**Defers to an in-flight TLB shootdown:** a synchronous shootdown holds every participating CPU
+(initiator preempt-disabled in `wait_for_ack`; peers spinning in `pt_lock` or their own shootdown)
+until all remote CPUs ack. Under heavy oversubscription that round-trip can exceed the threshold
+while still making progress, so the all-idle detector and both heartbeat cross-checks skip firing
+while `tlb_shootdown::any_pending()` reports any per-CPU request slot with CPUs still to ack. The
+shootdown's own escalation ladder (§ IPI Watchdog Ladder: at 0.75 s a serial report of what the
+target CPU is waiting in on both arches, then an NMI backtrace on x86-64 or a single logged warning
+on RISC-V, `crate::fatal` at 5 s in arch `wait_for_ack`) is the authoritative detector for a
+genuinely stuck IPI; a non-shootdown stall re-checks on the next tick once the pending slots drain.
 
 **Why kernel-side:** when every CPU is in kernel mode, no userspace monitor
 gets dispatched. The dump, like the stop drain's slow-drain warning below,

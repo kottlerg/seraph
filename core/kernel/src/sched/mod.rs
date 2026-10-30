@@ -603,6 +603,8 @@ pub fn lock_wait_exit()
 /// spins with interrupts masked, so a CPU queued behind a long convoy cannot
 /// acknowledge an IPI; this names the lock and the convoy. Recorded only once
 /// the first acquisition check fails, so the uncontended path stores nothing.
+/// The three fields are published under [`TICKET_WAIT_SEQ`], a per-CPU
+/// sequence count, so a reader on another CPU sees them as one record.
 /// Diagnostic-only — never gates control flow.
 #[cfg(not(test))]
 static TICKET_WAIT_WORD: [core::sync::atomic::AtomicU64; MAX_CPUS] =
@@ -615,13 +617,59 @@ static TICKET_WAIT_AHEAD: [core::sync::atomic::AtomicU32; MAX_CPUS] =
 #[cfg(not(test))]
 static TICKET_WAIT_SINCE_US: [core::sync::atomic::AtomicU64; MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+/// Sequence count of the ticket-wait record (a seqlock): odd while its CPU
+/// rewrites the record, advanced to the next even value once the record is
+/// whole. Only the owning CPU writes it; see [`ticket_wait_publish`].
+#[cfg(not(test))]
+static TICKET_WAIT_SEQ: [core::sync::atomic::AtomicU32; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_CPUS];
+
+/// Rewrite CPU `cpu`'s ticket-wait record as one seqlock write section: the
+/// count goes odd, a Release fence orders that store before the fields, the
+/// fields are stored, and the even count is published with Release, which
+/// orders the fields before it. Only `cpu` itself calls this, with
+/// interrupts masked, so writes to one record never overlap.
+#[cfg(not(test))]
+fn ticket_wait_publish(cpu: usize, word: u64, ahead: u32, since: u64)
+{
+    use core::sync::atomic::{Ordering, fence};
+    let seq = TICKET_WAIT_SEQ[cpu].load(Ordering::Relaxed);
+    TICKET_WAIT_SEQ[cpu].store(seq.wrapping_add(1), Ordering::Relaxed);
+    fence(Ordering::Release);
+    TICKET_WAIT_WORD[cpu].store(word, Ordering::Relaxed);
+    TICKET_WAIT_AHEAD[cpu].store(ahead, Ordering::Relaxed);
+    TICKET_WAIT_SINCE_US[cpu].store(since, Ordering::Relaxed);
+    TICKET_WAIT_SEQ[cpu].store(seq.wrapping_add(2), Ordering::Release);
+}
+
+/// Read CPU `cpu`'s ticket-wait record as `(word, ahead, since)`, or `None`
+/// when its CPU was rewriting it during the read: the seqlock read section,
+/// an Acquire load of an even count, the fields, an Acquire fence, and a
+/// reload of the count that must match. A record read this way is one the
+/// writer published whole.
+#[cfg(not(test))]
+fn ticket_wait_read(cpu: usize) -> Option<(u64, u32, u64)>
+{
+    use core::sync::atomic::{Ordering, fence};
+    let before = TICKET_WAIT_SEQ[cpu].load(Ordering::Acquire);
+    if before & 1 != 0
+    {
+        return None;
+    }
+    let record = (
+        TICKET_WAIT_WORD[cpu].load(Ordering::Relaxed),
+        TICKET_WAIT_AHEAD[cpu].load(Ordering::Relaxed),
+        TICKET_WAIT_SINCE_US[cpu].load(Ordering::Relaxed),
+    );
+    fence(Ordering::Acquire);
+    (TICKET_WAIT_SEQ[cpu].load(Ordering::Relaxed) == before).then_some(record)
+}
 
 /// Record that the current CPU is queued, `ahead` tickets back, on the ticket
 /// lock at address `word`. Called by `Spinlock::lock_raw` with interrupts
 /// masked, so the CPU index is stable; a lock is contended only once a second
 /// CPU runs, after every running CPU has installed its per-CPU base, which
-/// `current_cpu` reads. The word is published last (Release), so a reader
-/// that sees it sees the other two fields it was recorded with.
+/// `current_cpu` reads.
 #[cfg(not(test))]
 pub fn ticket_wait_enter(word: usize, ahead: u32)
 {
@@ -629,31 +677,30 @@ pub fn ticket_wait_enter(word: usize, ahead: u32)
     if cpu < MAX_CPUS
     {
         let now = crate::arch::current::timer::elapsed_us().unwrap_or(0);
-        TICKET_WAIT_AHEAD[cpu].store(ahead, core::sync::atomic::Ordering::Relaxed);
-        TICKET_WAIT_SINCE_US[cpu].store(now, core::sync::atomic::Ordering::Relaxed);
-        TICKET_WAIT_WORD[cpu].store(word as u64, core::sync::atomic::Ordering::Release);
+        ticket_wait_publish(cpu, word as u64, ahead, now);
     }
 }
 
-/// Clear the current CPU's ticket-wait breadcrumb once it holds the lock.
+/// Clear the current CPU's ticket-wait record once it holds the lock.
 #[cfg(not(test))]
 pub fn ticket_wait_exit()
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
     if cpu < MAX_CPUS
     {
-        TICKET_WAIT_WORD[cpu].store(0, core::sync::atomic::Ordering::Release);
+        ticket_wait_publish(cpu, 0, 0, 0);
     }
 }
 
 /// Report what CPU `cpu` is waiting in, from its breadcrumbs, for the IPI
-/// watchdog's escalation phase: the protocol spin site, the bare-lock wait,
+/// watchdog's escalation phase: the protocol spin site, the bare-lock kind,
 /// the ticket-lock wait (with the tickets ahead at its join and how long ago
-/// it joined) and the last syscall entered there. Every field is a per-CPU
-/// atomic; another CPU may change them meanwhile, so each pair is reported
-/// only if it reads the same before and after. Serial only: the lock
-/// addresses are kernel VAs (core/kernel/docs/cross-boundary-disclosure.md
-/// § Kernel console diagnostics).
+/// it joined) and the last syscall entered there. The spin site, bare-lock
+/// kind and syscall are single atomics, each a current-or-recent snapshot;
+/// the ticket-lock record is read whole through its seqlock, or reported as
+/// changing. Serial only: the lock address is a kernel VA
+/// (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+/// diagnostics).
 #[cfg(not(test))]
 pub fn ipi_watchdog_report_target(cpu: usize)
 {
@@ -663,14 +710,7 @@ pub fn ipi_watchdog_report_target(cpu: usize)
         return;
     }
     let spin = SPIN_SITE[cpu].load(Ordering::Relaxed);
-    let kind_before = LOCK_WAIT_KIND[cpu].load(Ordering::Acquire);
-    let lock_kind = LockKind::from_code(kind_before)
-        .filter(|_| LOCK_WAIT_KIND[cpu].load(Ordering::Acquire) == kind_before);
-    let word = TICKET_WAIT_WORD[cpu].load(Ordering::Acquire);
-    let ahead = TICKET_WAIT_AHEAD[cpu].load(Ordering::Relaxed);
-    let since = TICKET_WAIT_SINCE_US[cpu].load(Ordering::Relaxed);
-    let word_stable = TICKET_WAIT_WORD[cpu].load(Ordering::Acquire) == word;
-    let now = crate::arch::current::timer::elapsed_us().unwrap_or(since);
+    let lock_kind = LockKind::from_code(LOCK_WAIT_KIND[cpu].load(Ordering::Acquire));
     crate::kprintln_serial!(
         "  target cpu{}: spin={} bare_lock={} last_syscall={}",
         cpu,
@@ -678,15 +718,22 @@ pub fn ipi_watchdog_report_target(cpu: usize)
         lock_kind.map_or("none", LockKind::name),
         CPU_SYSCALL_NR[cpu].load(Ordering::Relaxed)
     );
-    if word != 0 && word_stable
+    match ticket_wait_read(cpu)
     {
-        crate::kprintln_serial!(
-            "  target cpu{}: ticket lock @0x{:x} ahead_at_join={} waited_ms={}",
-            cpu,
-            word,
-            ahead,
-            now.saturating_sub(since) / 1_000
-        );
+        Some((0, _, _)) =>
+        {}
+        Some((word, ahead, since)) =>
+        {
+            let now = crate::arch::current::timer::elapsed_us().unwrap_or(since);
+            crate::kprintln_serial!(
+                "  target cpu{}: ticket lock @0x{:x} ahead_at_join={} waited_ms={}",
+                cpu,
+                word,
+                ahead,
+                now.saturating_sub(since) / 1_000
+            );
+        }
+        None => crate::kprintln_serial!("  target cpu{}: ticket-lock record changing", cpu),
     }
 }
 

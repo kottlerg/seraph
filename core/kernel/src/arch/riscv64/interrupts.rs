@@ -539,7 +539,12 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
             {
                 // SAFETY: a single read of the live frame (see the top).
                 let sepc = unsafe { (*frame).sepc };
-                crate::kprintln!("unknown interrupt: scause={:#x} sepc={:#x}", scause, sepc);
+                // `sepc` is a kernel VA when the interrupt lands in S-mode, and
+                // `fatal` halts only this hart: serial only
+                // (core/kernel/docs/cross-boundary-disclosure.md § Kernel
+                // console diagnostics).
+                crate::kprintln!("unknown interrupt: scause={:#x}", scause);
+                crate::kprintln_serial!("  sepc={:#x}", sepc);
                 crate::fatal("unhandled interrupt");
             }
         }
@@ -763,9 +768,14 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 riscv_exception_name(cause_code),
                 scause
             );
-            crate::kprintln!("  sepc={:#x}  stval={:#x}", live.sepc, live.stval);
-            crate::kprintln!("  sstatus={:#x}  satp={:#x}", sstatus_val, satp_val);
-            dump_riscv_regs_console(live);
+            // `sepc`, `stval`, `satp` and the register file can hold kernel VAs
+            // or the kernel root's address, and `fatal` halts only this hart:
+            // serial only (core/kernel/docs/cross-boundary-disclosure.md
+            // § Kernel console diagnostics).
+            crate::kprintln_serial!("  sepc={:#x}  stval={:#x}", live.sepc, live.stval);
+            crate::kprintln!("  sstatus={:#x}", sstatus_val);
+            crate::kprintln_serial!("  satp={:#x}", satp_val);
+            dump_riscv_regs(live);
             crate::fatal("unhandled kernel exception");
         }
     }
@@ -782,12 +792,21 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
     let live = unsafe { &*frame };
     if live.scause == 8 && live.sepc >> 63 != 0
     {
+        // The kernel-range `sepc` and the frame's `ra`/`sp` are kernel VAs, and
+        // `fatal` halts only this hart: serial only
+        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+        // diagnostics).
         crate::kprintln!(
-            "BUG: ecall return sepc={:#x} in kernel range on cpu {}",
-            live.sepc,
+            "BUG: ecall return sepc in kernel range on cpu {}",
             super::cpu::current_cpu()
         );
-        crate::kprintln!("  ra={:#x} sp={:#x} a7={:#x}", live.ra, live.sp, live.a7);
+        crate::kprintln_serial!(
+            "  sepc={:#x} ra={:#x} sp={:#x} a7={:#x}",
+            live.sepc,
+            live.ra,
+            live.sp,
+            live.a7
+        );
         crate::fatal("TrapFrame sepc corruption");
     }
 }
@@ -1510,25 +1529,13 @@ fn riscv_exception_name(cause: u64) -> &'static str
     }
 }
 
-/// Dump all general-purpose registers from a RISC-V trap frame (serial only).
+/// Dump all general-purpose registers from a RISC-V trap frame (serial only:
+/// the registers of a kernel trap can hold kernel VAs).
 fn dump_riscv_regs(f: &super::trap_frame::TrapFrame)
-{
-    dump_riscv_regs_to(f, false);
-}
-
-/// Dump all general-purpose registers to both serial and framebuffer (kernel faults).
-fn dump_riscv_regs_console(f: &super::trap_frame::TrapFrame)
-{
-    dump_riscv_regs_to(f, true);
-}
-
-/// Inner register dump; `console` selects serial-only vs serial+framebuffer.
-fn dump_riscv_regs_to(f: &super::trap_frame::TrapFrame, console: bool)
 {
     macro_rules! out {
         ($($arg:tt)*) => {
-            if console { crate::kprintln!($($arg)*); }
-            else { crate::kprintln_serial!($($arg)*); }
+            crate::kprintln_serial!($($arg)*)
         };
     }
     out!(

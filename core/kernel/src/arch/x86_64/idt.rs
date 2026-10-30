@@ -519,9 +519,13 @@ pub(super) unsafe extern "C" fn common_exception_handler(
             vector,
             error_code,
         );
-        crate::kprintln!("  rip={:#018x}  cr2={:#018x}", f.rip, cr2);
+        // `rip`, `cr2` and the register file can hold kernel VAs, and `fatal`
+        // halts only this CPU: serial only
+        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+        // diagnostics).
+        crate::kprintln_serial!("  rip={:#018x}  cr2={:#018x}", f.rip, cr2);
         crate::kprintln!("  cs={:#x}  rflags={:#018x}", f.cs, f.rflags,);
-        dump_x86_regs_console(f);
+        dump_x86_regs(f);
         fatal(
             if (f.cs & 3) != 0
             {
@@ -667,39 +671,6 @@ fn dump_x86_regs(f: &TrapFrame)
         f.r11
     );
     crate::kprintln_serial!(
-        "  r12={:#018x}  r13={:#018x}  r14={:#018x}  r15={:#018x}",
-        f.r12,
-        f.r13,
-        f.r14,
-        f.r15
-    );
-}
-
-/// Dump all general-purpose registers to both serial and framebuffer (for kernel faults).
-fn dump_x86_regs_console(f: &TrapFrame)
-{
-    crate::kprintln!(
-        "  rax={:#018x}  rbx={:#018x}  rcx={:#018x}  rdx={:#018x}",
-        f.rax,
-        f.rbx,
-        f.rcx,
-        f.rdx
-    );
-    crate::kprintln!(
-        "  rsi={:#018x}  rdi={:#018x}  rbp={:#018x}  rsp={:#018x}",
-        f.rsi,
-        f.rdi,
-        f.rbp,
-        f.rsp
-    );
-    crate::kprintln!(
-        "   r8={:#018x}   r9={:#018x}  r10={:#018x}  r11={:#018x}",
-        f.r8,
-        f.r9,
-        f.r10,
-        f.r11
-    );
-    crate::kprintln!(
         "  r12={:#018x}  r13={:#018x}  r14={:#018x}  r15={:#018x}",
         f.r12,
         f.r13,

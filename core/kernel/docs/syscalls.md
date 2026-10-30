@@ -747,7 +747,9 @@ the kernel and only `init_pages − 1` pages reach the pool (see
 **Errors:** `InvalidArgument` (`init_pages` 0 or overflow, or arg 3 non-zero),
 `InvalidCapability`, `InsufficientRights` (source Memory cap lacks Retype, or augment
 target lacks Insert), `OutOfMemory` (Memory cap region or slot-page pool exhausted, or,
-in create-mode, the kernel's 4096-entry CSpace id namespace exhausted),
+in create-mode, every id of the kernel's `CSpace` registry live, which the registry's
+one id per DRAM page puts past the memory that pays for the `CSpace`s; see
+[capability-internals.md](capability-internals.md) § CSpace Registry),
 `QuotaExceeded` (caller's CSpace directory structurally full, or the Memory object's reference
 count is at its 2^31 ceiling).
 

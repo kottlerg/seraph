@@ -22,6 +22,7 @@ mod concurrent_notification;
 mod configure_start_race;
 mod copy_source_delete;
 mod cspace_recycle;
+mod cspace_registry_arena;
 mod double_enqueue_storm;
 mod event_queue_fill_drain;
 mod event_try_recv_post_race;
@@ -115,6 +116,10 @@ pub fn run_all(ctx: &TestContext)
 {
     run_integration_test!("stress::cap_tree_deep", cap_tree_deep::run(ctx));
     run_integration_test!("stress::cspace_recycle", cspace_recycle::run(ctx));
+    run_integration_test!(
+        "stress::cspace_registry_arena",
+        cspace_registry_arena::run(ctx)
+    );
     run_integration_test!("stress::copy_source_delete", copy_source_delete::run(ctx));
     run_integration_test!(
         "stress::event_queue_fill_drain",

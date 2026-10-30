@@ -573,8 +573,9 @@ pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
 /// is invalid, stale, or names the wrong object type; `InsufficientRights` if
 /// `memory_cap` lacks Retype or the augment target lacks Insert;
 /// `OutOfMemory` if `memory_cap`'s region or the caller's `CSpace` slot-page
-/// pool is exhausted, or, in create mode, the kernel's 4096-entry `CSpace` id
-/// namespace is; `QuotaExceeded` if the caller's `CSpace` directory is
+/// pool is exhausted, or, in create mode, every id of the kernel's `CSpace`
+/// registry is live (the registry holds one id per DRAM page);
+/// `QuotaExceeded` if the caller's `CSpace` directory is
 /// structurally full or `memory_cap`'s object has its reference count at its
 /// 2^31 ceiling. A later cap insert into the new `CSpace` fails with
 /// `OutOfMemory` (-8) when the seeded pool is exhausted (refill via augment
@@ -1428,9 +1429,8 @@ pub fn cap_revoke(slot: u32) -> Result<(), i64>
 ///
 /// Retries are bounded: each `Interrupted` round already represents ~10^8
 /// kernel-side edits, so 4096 rounds cover a fixed subtree of about 5 × 10^11
-/// nodes, more than every `CSpace` the kernel can hold at once has slots
-/// (about 1.5 × 10^10), and exhausting the bound
-/// means an adversarial deriver is outpacing revocation — the caller gets the
+/// nodes (some 36 TB of 72-byte slots), and exhausting the bound means an
+/// adversarial deriver is outpacing revocation — the caller gets the
 /// final `Interrupted` back rather than this wrapper spinning forever.
 ///
 /// # Errors

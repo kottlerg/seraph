@@ -40,6 +40,7 @@ pub mod cspace;
 pub mod derivation;
 pub mod ioport_bindings;
 pub mod object;
+pub mod registry;
 pub mod retype;
 pub mod slot;
 // Split-helper body uses production-only object/derivation internals
@@ -82,20 +83,21 @@ use crate::mm::paging::phys_to_virt;
 
 /// Root capability space, populated during Phase 7.
 ///
-/// The pointer indexes into a SEED-derived retype slab whose storage is
-/// pinned for the lifetime of the kernel (the seed's pin keeps the slab
-/// alive — see [`install_seed_memory`]). Set in [`init_capability_system`]
-/// via [`boot_retype_cspace`]; consumed (read out into init's TCB) during
-/// Phase 9. Access is single-threaded during boot; `static mut` is safe
-/// here under that invariant.
+/// The pointer indexes into a SEED-derived retype slab. Set in
+/// [`init_capability_system`] via [`boot_retype_cspace`], whose creation
+/// reference is the kernel's hold on the `CSpace` through boot; consumed
+/// (read out into init's TCB) during Phase 9, where that reference passes
+/// to init's self-cap, so from then on the `CSpace` is an ordinary one that
+/// its last capability's deletion frees. Access is single-threaded during
+/// boot; `static mut` is safe here under that invariant.
 #[cfg(not(test))]
 pub static mut ROOT_CSPACE: *mut CSpace = core::ptr::null_mut();
 
 /// Take the root `CSpace` pointer, clearing the slot to null.
 ///
-/// Returns the raw pointer (storage lives inside a SEED slab; ownership is
-/// "use by-pointer until init dies"). The slot is cleared so no other code
-/// can observe a live root cspace pointer afterwards.
+/// Returns the raw pointer (storage lives inside a SEED slab). The slot is
+/// cleared so no other code can observe the pointer afterwards: once init
+/// runs, the `CSpace`'s lifetime is that of its capabilities.
 ///
 /// Uses raw pointer operations to avoid creating a mutable reference to a
 /// mutable static. Safe because access is single-threaded during boot.
@@ -134,314 +136,134 @@ pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
     else
     {
         // SAFETY: raw was set by `boot_retype_cspace` and points at a live
-        // `CSpace` inside a SEED-pinned slab; single-threaded boot.
+        // `CSpace` inside a SEED slab, held by its creation reference;
+        // single-threaded boot.
         unsafe { Some(&mut *raw) }
     }
 }
 
-/// Maximum number of `CSpace`s that can be live in the registry at one time.
-///
-/// IDs are recycled via the [`CSPACE_FREE_LIST`] free list once
-/// [`free_cspace_id`] runs at the end of a `CSpace`'s `dealloc_object` pass,
-/// so this is a live-count bound, not a cumulative-ever bound. Per-id epochs
-/// in [`CSPACE_REGISTRY`], randomized on recycle, make a stale `SlotId`
-/// resolution fail fast on epoch mismatch, except with probability ~2⁻³² per
-/// intervening recycle; that residual is accepted (see
-/// `core/kernel/docs/capability-internals.md` § Representation). The
-/// pre-unregister derivation drain (`dealloc_object` for `CSpaceObj`)
-/// additionally scrubs the back-links in steady state.
-///
-/// Live-count peaks in ktest stress sit in the low hundreds; 4096 gives
-/// 10–40× headroom. The registry (4096 × 16 B = 64 KiB) plus the free list
-/// (4096 × 4 B = 16 KiB) cost 80 KiB of BSS. A future workload that needs
-/// more live `CSpace`s only has to bump this constant — no layout, ABI, or
-/// algorithmic change is required.
-const MAX_CSPACES: usize = 4096;
+use registry::CSPACE_REGISTRY;
 
-/// High-water mark for the bump-allocator side of `alloc_cspace_id` — only
-/// consulted when the free list is empty. Once `HIGH_WATER_CSPACE_ID` reaches
-/// `MAX_CSPACES`, no new id can be minted until a prior id is recycled.
-static HIGH_WATER_CSPACE_ID: AtomicU32 = AtomicU32::new(0);
-
-/// One slot of the global `CSpace` registry.
+/// Carve the `CSpace` registry arena from the buddy: one entry per page of
+/// DRAM ([`crate::mm::init::system_ram_bytes`]), in
+/// [`registry::REGISTRY_CHUNK_ORDER`] blocks. Fatal when the buddy cannot
+/// supply a chunk.
 ///
-/// `ptr` is the live `CSpace` pointer or null when the slot is vacant.
-/// `epoch` is a generation tag randomized each time an id is freed
-/// (see [`free_cspace_id`]); a `SlotId` stamped with a stale epoch fails
-/// resolution at [`lookup_cspace`], except with probability ~2⁻³² per
-/// intervening recycle, so a recycled id does not alias a foreign derivation
-/// link into the new tenant beyond that accepted residual (see
-/// `core/kernel/docs/capability-internals.md` § Representation).
-///
-/// `align(16)` colocates `ptr` and `epoch` on the same cache line and leaves
-/// room for a future 16-byte CAS if contention warrants it.
-#[repr(C, align(16))]
-struct CSpaceRegistryEntry
+/// # Safety
+/// The single boot thread, once, after Phase 3 (the chunks are written
+/// through the direct map) and before the Phase-7 drain and any
+/// `alloc_cspace_id`.
+#[cfg(not(test))]
+pub unsafe fn init_cspace_registry(alloc: &mut crate::mm::BuddyAllocator)
 {
-    ptr: AtomicPtr<CSpace>,
-    epoch: AtomicU32,
-    _pad: [u8; 4],
-}
-
-impl CSpaceRegistryEntry
-{
-    const fn empty() -> Self
+    let chunks = registry::chunks_for_ram(crate::mm::init::system_ram_bytes());
+    if chunks > registry::MAX_REGISTRY_CHUNKS
     {
-        Self {
-            ptr: AtomicPtr::new(core::ptr::null_mut()),
-            // Epoch starts at 1 so the sentinel value `0` (used by the
-            // free-list intrusive encoding in `CapabilitySlot::set_next_free`)
-            // never matches any live entry — a stale lookup of a free-listed
-            // slot resolves to `None` rather than the root `CSpace`.
-            epoch: AtomicU32::new(1),
-            _pad: [0; 4],
-        }
+        crate::fatal("Phase 4: DRAM exceeds the CSpace registry's chunk table");
     }
-}
-
-/// Global registry mapping `CSpaceId` → (`*mut CSpace`, epoch).
-///
-/// Populated by [`register_cspace`] when a `CSpace` is created. Cleared by
-/// [`unregister_cspace`] when the backing object is freed. The epoch is
-/// randomized by [`free_cspace_id`] at the end of `dealloc_object` so any
-/// stale `SlotId` carrying the old epoch fails fast on subsequent
-/// resolution.
-///
-/// # Safety invariant
-/// A non-null `ptr` is valid as long as the corresponding `CSpaceKernelObject`
-/// refcount is > 0. After `dec_ref` reaches 0 and `dealloc_object` runs,
-/// `unregister_cspace` clears `ptr` before the memory is freed, and
-/// `free_cspace_id` randomizes `epoch` before the id returns to the free list.
-static CSPACE_REGISTRY: [CSpaceRegistryEntry; MAX_CSPACES] =
-    [const { CSpaceRegistryEntry::empty() }; MAX_CSPACES];
-
-/// Free list of returned `CSpaceId`s, popped LIFO before
-/// [`HIGH_WATER_CSPACE_ID`] is bumped.
-///
-/// Protected by [`CSPACE_FREE_LIST_LOCK`]. The stack stores released ids;
-/// `len` is the number of valid entries. Single global spinlock is fine —
-/// cap-create/destroy is rare relative to IPC/map fast paths, and the
-/// critical sections are O(1) push/pop.
-#[cfg(not(test))]
-static CSPACE_FREE_LIST_LOCK: crate::sync::Spinlock = crate::sync::Spinlock::new();
-#[cfg(not(test))]
-static mut CSPACE_FREE_LIST: [CSpaceId; MAX_CSPACES] = [0; MAX_CSPACES];
-#[cfg(not(test))]
-static mut CSPACE_FREE_LIST_LEN: usize = 0;
-
-/// Push a recycled id onto the free list.
-///
-/// Called from [`free_cspace_id`] after the epoch bump. Saturating: if the
-/// free list is already at capacity (impossible by construction since we
-/// only push ids in `[0, MAX_CSPACES)` and `MAX_CSPACES` slots fit), the
-/// id leaks rather than panicking.
-#[cfg(not(test))]
-fn push_free(id: CSpaceId)
-{
-    // SAFETY: lock serialises all free-list mutations.
-    let saved = unsafe { CSPACE_FREE_LIST_LOCK.lock_raw() };
-    // SAFETY: single-writer access under lock.
-    unsafe {
-        if CSPACE_FREE_LIST_LEN < MAX_CSPACES
-        {
-            CSPACE_FREE_LIST[CSPACE_FREE_LIST_LEN] = id;
-            CSPACE_FREE_LIST_LEN += 1;
-        }
-    }
-    // SAFETY: paired with lock_raw above.
-    unsafe { CSPACE_FREE_LIST_LOCK.unlock_raw(saved) };
-}
-
-/// Pop a recycled id from the free list, or `None` if empty.
-#[cfg(not(test))]
-fn pop_free() -> Option<CSpaceId>
-{
-    // SAFETY: lock serialises all free-list mutations.
-    let saved = unsafe { CSPACE_FREE_LIST_LOCK.lock_raw() };
-    // SAFETY: single-writer access under lock.
-    let id = unsafe {
-        if CSPACE_FREE_LIST_LEN > 0
-        {
-            CSPACE_FREE_LIST_LEN -= 1;
-            Some(CSPACE_FREE_LIST[CSPACE_FREE_LIST_LEN])
-        }
+    for _ in 0..chunks
+    {
+        let Some(phys) = alloc.alloc(registry::REGISTRY_CHUNK_ORDER)
         else
         {
-            None
+            crate::fatal("Phase 4: buddy exhausted allocating the CSpace registry");
+        };
+        let entries = phys_to_virt(phys) as *mut registry::RegistryEntry;
+        // SAFETY: the block is freshly allocated, owned by the registry for
+        // the kernel's life, reached through the direct map active since
+        // Phase 3, page-aligned, and exactly ENTRIES_PER_CHUNK entries long;
+        // the boot thread is alone.
+        if unsafe { CSPACE_REGISTRY.install_chunk(entries) }.is_err()
+        {
+            crate::fatal("Phase 4: CSpace registry chunk table full");
         }
-    };
-    // SAFETY: paired with lock_raw above.
-    unsafe { CSPACE_FREE_LIST_LOCK.unlock_raw(saved) };
-    id
+    }
 }
 
 /// Allocate a unique `CSpace` ID.
 ///
-/// Pops a recycled id off the free list first; otherwise bumps the
-/// high-water counter. Returns `None` once `MAX_CSPACES` are simultaneously
-/// live (callers must surface `SyscallError::OutOfMemory`).
+/// Pops the most recently retired id first; otherwise hands out the next
+/// fresh one. Returns `None` once every id the registry arena backs is live
+/// (callers surface `SyscallError::OutOfMemory`); the arena holds one id per
+/// page of DRAM and every `CSpace` costs at least one page, so that point
+/// lies past the memory that pays for the `CSpace`s.
 ///
-/// The root `CSpace` receives id `0` at init time via the high-water path
-/// — Phase 7 runs before any `free_cspace_id` could populate the free list,
-/// so the root deterministically gets id 0 (and is hard-rejected from
-/// returning to the free list by [`free_cspace_id`]).
-#[cfg(not(test))]
+/// The root `CSpace` receives id `0` at init time as the first fresh id —
+/// Phase 7 runs before any `free_cspace_id` could list an id, so the root
+/// deterministically gets id 0. The id carries no special meaning after
+/// boot: freeing init's `CSpace` at its reap recycles it like any other.
 pub fn alloc_cspace_id() -> Option<CSpaceId>
 {
-    if let Some(id) = pop_free()
-    {
-        return Some(id);
-    }
-    let next = HIGH_WATER_CSPACE_ID.fetch_add(1, Ordering::Relaxed);
-    if (next as usize) >= MAX_CSPACES
-    {
-        // Clamp so the counter doesn't wrap u32 under sustained pressure.
-        HIGH_WATER_CSPACE_ID.store(MAX_CSPACES as u32, Ordering::Relaxed);
-        return None;
-    }
-    Some(next)
-}
-
-/// Test-only stub: monotonic allocation, no recycling.
-///
-/// The host-side test path doesn't exercise the lock primitive or the BSS
-/// free list (no SMP, no interrupts), and tests only ever create the single
-/// root CSpace before tearing down. A simple monotonic allocator suffices.
-#[cfg(test)]
-pub fn alloc_cspace_id() -> Option<CSpaceId>
-{
-    let next = HIGH_WATER_CSPACE_ID.fetch_add(1, Ordering::Relaxed);
-    if (next as usize) >= MAX_CSPACES
-    {
-        return None;
-    }
-    Some(next)
+    CSPACE_REGISTRY.alloc()
 }
 
 /// Register a `CSpace` pointer under its ID.
 ///
 /// Called immediately after a [`CSpace`] is allocated. Returns the registry
 /// entry's current epoch so the caller can stamp `SlotId`s minted in this
-/// `CSpace`'s lifetime. Returns `Err(())` if `id >= MAX_CSPACES`.
+/// `CSpace`'s lifetime. Returns `Err(())` if no registry chunk backs `id`.
 pub fn register_cspace(id: CSpaceId, ptr: *mut CSpace) -> Result<u32, ()>
 {
-    if (id as usize) >= MAX_CSPACES
-    {
-        return Err(());
-    }
-    let entry = &CSPACE_REGISTRY[id as usize];
-    debug_assert!(
-        entry.ptr.load(Ordering::Acquire).is_null(),
-        "register_cspace: id {id} already registered"
-    );
-    entry.ptr.store(ptr, Ordering::Release);
-    Ok(entry.epoch.load(Ordering::Acquire))
+    CSPACE_REGISTRY.register(id, ptr)
 }
 
 /// Clear a `CSpace` registration.
 ///
 /// Called from `dealloc_object` for `ObjectType::CSpaceObj` *before* freeing
 /// the backing allocation, so no dangling pointer is observable. The
-/// epoch randomization that retires this id is deferred to [`free_cspace_id`]
+/// epoch redraw that retires this id is deferred to [`free_cspace_id`]
 /// so the pre-unregister derivation drain can still resolve foreign
 /// back-links into this `CSpace`'s live (now-quiescent) registry entry.
 pub fn unregister_cspace(id: CSpaceId)
 {
-    if (id as usize) < MAX_CSPACES
-    {
-        CSPACE_REGISTRY[id as usize]
-            .ptr
-            .store(core::ptr::null_mut(), Ordering::Release);
-    }
+    CSPACE_REGISTRY.unregister(id);
 }
 
-/// Randomize the registry epoch for `id` and return it to the free list.
+/// Redraw the registry epoch for `id` and return it to the free list.
 ///
 /// Pre-condition: `unregister_cspace(id)` has run (registry `ptr` is null).
 /// The new epoch is drawn from the kernel CSPRNG, excluding the sentinel `0`
 /// and the current value, so any surviving `SlotId` stamped with the old
 /// value fails resolution at [`lookup_cspace`], and the epoch carries no
-/// monotonic information that would leak recycle counts or rates.
+/// monotonic information that would leak recycle counts or rates. The
+/// vacant entry keeps the new epoch until the id's next registration.
 ///
 /// The epoch-recycle design (random non-zero redraw excluding the prior
 /// value) is specified in `core/kernel/docs/capability-internals.md`
 /// § Representation.
-///
-/// Asserts `id != 0`: the root `CSpace`'s id is reserved for kernel
-/// lifetime; the `HDR_FLAG_IS_ROOT` clamp in `dec_ref` should already make
-/// it unreachable, but defense-in-depth catches misroutes here.
 #[cfg(not(test))]
 pub fn free_cspace_id(id: CSpaceId)
 {
-    assert!(id != 0, "free_cspace_id: root CSpace cannot be recycled");
-    debug_assert!((id as usize) < MAX_CSPACES);
-    let entry = &CSPACE_REGISTRY[id as usize];
-    debug_assert!(
-        entry.ptr.load(Ordering::Acquire).is_null(),
-        "free_cspace_id called before unregister_cspace for id {id}"
-    );
-    // Single logical writer to this entry's epoch in the free window: the
-    // caller (`dealloc_object` for `CSpaceObj`) has already run
-    // `unregister_cspace` and not yet returned the id to the free list, so the
-    // id is neither live nor recyclable elsewhere. A load-then-store therefore
-    // needs no RMW. `lookup_cspace`'s Acquire double-load still rejects a
-    // concurrent reader because the stored value differs from the old one.
-    let cur = entry.epoch.load(Ordering::Acquire);
+    debug_assert!(id < CSPACE_REGISTRY.capacity());
+    let cur = CSPACE_REGISTRY.epoch(id);
     let mut next = crate::entropy::next_u32();
     while next == 0 || next == cur
     {
         next = crate::entropy::next_u32();
     }
-    entry.epoch.store(next, Ordering::Release);
-    push_free(id);
+    CSPACE_REGISTRY.retire(id, next);
 }
 
-/// Read the current epoch for a registry entry. Returns 0 if `id` is out
-/// of range (a stale `SlotId` carrying an out-of-range `cspace_id` is
+/// Read the current epoch for a registry entry. Returns 0 if no registry
+/// chunk backs `id` (a stale `SlotId` carrying such a `cspace_id` is
 /// always rejected by `lookup_cspace` regardless).
 pub fn registry_epoch(id: CSpaceId) -> u32
 {
-    if (id as usize) >= MAX_CSPACES
-    {
-        return 0;
-    }
-    CSPACE_REGISTRY[id as usize].epoch.load(Ordering::Acquire)
+    CSPACE_REGISTRY.epoch(id)
 }
 
 /// Resolve a `CSpaceId` and expected epoch to a raw pointer.
 ///
-/// Returns `None` if `id` is out of range, the slot is vacant, or the
-/// stamped epoch doesn't match the registry's current value. The double
-/// epoch load brackets the ptr load so a concurrent `unregister →
-/// free_cspace_id → reuse → register` sequence cannot present a
-/// newly-registered ptr alongside an old expected epoch.
+/// Returns `None` if no registry chunk backs `id`, the entry is vacant, or
+/// the stamped epoch doesn't match the registry's current value (see
+/// [`registry::CSpaceRegistry::lookup`]).
 ///
 /// The returned pointer is valid only while the corresponding
 /// `CSpaceKernelObject` has a positive refcount and (for derivation-tree
 /// reads) `DERIVATION_LOCK` is held.
 pub fn lookup_cspace(id: CSpaceId, expected_epoch: u32) -> Option<*mut CSpace>
 {
-    if (id as usize) >= MAX_CSPACES
-    {
-        return None;
-    }
-    let entry = &CSPACE_REGISTRY[id as usize];
-    let e1 = entry.epoch.load(Ordering::Acquire);
-    if e1 != expected_epoch
-    {
-        return None;
-    }
-    let ptr = entry.ptr.load(Ordering::Acquire);
-    if ptr.is_null()
-    {
-        return None;
-    }
-    let e2 = entry.epoch.load(Ordering::Acquire);
-    if e2 != expected_epoch
-    {
-        return None;
-    }
-    Some(ptr)
+    CSPACE_REGISTRY.lookup(id, expected_epoch)
 }
 
 /// Sum [`MemoryObject::available_bytes`] across every [`CapTag::Memory`] cap
@@ -563,8 +385,7 @@ static mut SEED_MEMORY: object::MemoryObject = object::MemoryObject {
     header: object::KernelObjectHeader {
         ref_count: AtomicU32::new(1),
         obj_type: object::ObjectType::Memory,
-        flags: 0,
-        _pad: [0; 2],
+        _pad: [0; 3],
         ancestor: AtomicPtr::new(core::ptr::null_mut()),
     },
     base: 0,
@@ -1174,12 +995,6 @@ pub(crate) unsafe fn boot_retype_cspace(
             },
         );
     }
-    // The root CSpace is pinned for kernel lifetime: marking it here makes
-    // `dec_ref` clamp at 1, so any upstream refcount mismanagement of the
-    // wrapper / self-cap pair cannot route it through `dealloc_object`.
-    // SAFETY: header just written, exclusively owned, single-threaded boot.
-    unsafe { (*cs_kobj_ptr).header.flags |= crate::cap::object::HDR_FLAG_IS_ROOT };
-
     // SAFETY: cs_ptr just constructed.
     unsafe { (*cs_ptr).set_kobj(cs_kobj_ptr) };
     seed.header.inc_ref();
@@ -1446,11 +1261,12 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
         // SAFETY: SEED installed above.
         let (_cs_kobj_nn, cs_ptr) =
             unsafe { boot_retype_cspace(seed_memory_ref(), ROOT_CSPACE_INIT_PAGES, id) };
-        // The root CSpace's epoch is fixed at 1 (initial registry value) and
-        // never bumps — it's never recycled (asserted in `free_cspace_id`),
-        // so we discard the returned value.
-        let _root_epoch = register_cspace(id, cs_ptr)
-            .unwrap_or_else(|()| crate::fatal("root CSpace register: id exceeds MAX_CSPACES"));
+        // Nothing mints a `SlotId` from the epoch here: Phase 9 reads it
+        // back with `registry_epoch` for init's TCB, so the returned value
+        // is discarded.
+        let _root_epoch = register_cspace(id, cs_ptr).unwrap_or_else(|()| {
+            crate::fatal("root CSpace register: no registry chunk backs id 0")
+        });
 
         // SAFETY: cs_ptr is freshly constructed and exclusively owned
         // (single-threaded Phase 7).
@@ -2790,20 +2606,22 @@ mod tests
         );
     }
 
-    /// `CSpaceId` reserved for the recycle test below. `CSPACE_REGISTRY` is a
-    /// process-wide static and `cargo test` runs tests concurrently, so every
-    /// host `#[test]` that registers a `CSpace` directly — this one and the
-    /// derivation-tree tests in `core/kernel/src/cap/derivation.rs`, which use
-    /// the `31xx` block — picks an id unique to that test; nothing enforces it. A high
-    /// id keeps this one clear of that block.
-    const RECYCLE_TEST_ID: CSpaceId = (MAX_CSPACES as u32) - 1;
+    /// `CSpaceId` reserved for the recycle test below. The host-test
+    /// `CSPACE_REGISTRY` is a process-wide static and `cargo test` runs tests
+    /// concurrently, so every host `#[test]` that registers a `CSpace`
+    /// directly — this one and the derivation-tree tests in
+    /// `core/kernel/src/cap/derivation.rs`, which use the `31xx` block — picks
+    /// an id unique to that test; nothing enforces it. A high id keeps this
+    /// one clear of that block.
+    const RECYCLE_TEST_ID: CSpaceId = (registry::ENTRIES_PER_CHUNK as u32) - 1;
 
     /// A `SlotId` stamped before a `CSpace` id is recycled must fail
     /// `lookup_cspace` (epoch mismatch) even after the id is reused by a new
     /// tenant, while a freshly stamped `SlotId` resolves. Couples the real
     /// stamp (`SlotId::current` → `registry_epoch`) and validation
-    /// (`lookup_cspace`) paths; only the epoch bump is simulated, because
-    /// `free_cspace_id` and the free list are `#[cfg(not(test))]`.
+    /// (`lookup_cspace`) paths; only the epoch redraw is simulated, because
+    /// `free_cspace_id` is `#[cfg(not(test))]` (it draws from the kernel
+    /// CSPRNG).
     #[test]
     fn cspace_recycle_invalidates_stale_slotid()
     {
@@ -2829,17 +2647,15 @@ mod tests
         );
 
         // Destroy A and recycle the id. `free_cspace_id` is
-        // `#[cfg(not(test))]` (touches the host-absent free list and the
-        // kernel CSPRNG); replicate its one registry mutation — the epoch
-        // change — directly. `unregister_cspace` clears the ptr. #248
+        // `#[cfg(not(test))]` (draws from the kernel CSPRNG); replicate its
+        // epoch change directly, without listing the id, so no concurrent
+        // test's `alloc_cspace_id` can take it. `unregister_cspace` clears the ptr. #248
         // randomized this in production; the test stores a fixed distinct
         // non-zero epoch to stay deterministic (coding-standards: no
         // randomness in tests). The assertions check the property (epoch
         // changed ⇒ stale fails), not the arithmetic.
         unregister_cspace(id);
-        CSPACE_REGISTRY[id as usize]
-            .epoch
-            .store(epoch_a ^ 0x5EED_0001, Ordering::Release);
+        CSPACE_REGISTRY.force_epoch(id, epoch_a ^ 0x5EED_0001);
 
         // Tenant B reuses the id at the new epoch.
         let epoch_b = register_cspace(id, tenant_b).expect("register tenant B");

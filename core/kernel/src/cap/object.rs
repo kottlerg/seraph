@@ -92,28 +92,17 @@ pub struct KernelObjectHeader
     pub ref_count: AtomicU32,
     /// Concrete type, for use during deallocation.
     pub obj_type: ObjectType,
-    /// Lifecycle flags. See `HDR_FLAG_*` constants. Currently only used to
-    /// mark the boot root `CSpace` as undestroyable.
-    pub flags: u8,
     // Padding to reach 8-byte alignment for the ancestor pointer below. Public
     // because mint sites outside this module build the header by struct literal;
     // the underscore marks it as carrying no value.
     #[allow(clippy::pub_underscore_fields)]
-    pub _pad: [u8; 2],
+    pub _pad: [u8; 3],
     /// Pointer to the `MemoryObject`'s header this object was retyped from;
     /// every production object has one (null only in host tests). Set once at
     /// creation, read at deallocation. `AtomicPtr` for the unforgeable null
     /// sentinel without imposing const-init constraints on construction.
     pub ancestor: AtomicPtr<KernelObjectHeader>,
 }
-
-/// `flags` bit: this header belongs to the boot root `CSpace` and MUST NOT
-/// be deallocated. `dec_ref` intercepts the `→ 0` transition for these
-/// headers and returns 1, keeping the object alive regardless of upstream
-/// refcount mismanagement. Stamped in
-/// [`crate::cap::boot_retype_cspace`] for the root `CSpace`; never set
-/// elsewhere.
-pub const HDR_FLAG_IS_ROOT: u8 = 0x01;
 
 // SAFETY: ancestor is a back-pointer to a kernel object whose lifetime is
 // guaranteed by retype's refcount semantics. Send+Sync via the surrounding
@@ -134,8 +123,7 @@ impl KernelObjectHeader
         Self {
             ref_count: AtomicU32::new(1),
             obj_type,
-            flags: 0,
-            _pad: [0; 2],
+            _pad: [0; 3],
             ancestor: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -150,8 +138,7 @@ impl KernelObjectHeader
         Self {
             ref_count: AtomicU32::new(1),
             obj_type,
-            flags: 0,
-            _pad: [0; 2],
+            _pad: [0; 3],
             ancestor: AtomicPtr::new(ancestor.as_ptr()),
         }
     }
@@ -173,43 +160,8 @@ impl KernelObjectHeader
     /// that point. The decrement is a Release, and the one that reaches 0 is
     /// followed by an Acquire fence, so that freer observes every write the
     /// other owners made before releasing theirs.
-    ///
-    /// Headers carrying [`HDR_FLAG_IS_ROOT`] (the boot root `CSpace`) clamp
-    /// at 1 via a CAS loop: when the current count is 1 the operation is a
-    /// no-op (returns 1); otherwise it decrements by one. The CAS form
-    /// avoids the fetch_sub-then-restore window in which a concurrent dec
-    /// would see 0 and underflow. The root `CSpace` lives for kernel
-    /// lifetime and never reaches `dealloc_object`, even if upstream
-    /// refcount accounting mismanages the ancillary slot/wrapper pair.
     pub fn dec_ref(&self) -> u32
     {
-        if (self.flags & HDR_FLAG_IS_ROOT) != 0
-        {
-            // Root path: CAS the floor in atomically so concurrent decs
-            // cannot observe a transient 0.
-            let mut cur = self.ref_count.load(Ordering::Relaxed);
-            loop
-            {
-                debug_assert!(
-                    cur != 0,
-                    "dec_ref underflow on IS_ROOT header: obj_type={:?} self={:p}",
-                    self.obj_type,
-                    self,
-                );
-                let new = if cur == 1 { 1 } else { cur - 1 };
-                match self.ref_count.compare_exchange_weak(
-                    cur,
-                    new,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                )
-                {
-                    Ok(_) => return new,
-                    Err(actual) => cur = actual,
-                }
-            }
-        }
-
         let prev = self.ref_count.fetch_sub(1, Ordering::Release);
         debug_assert!(
             prev != 0,
@@ -3284,8 +3236,8 @@ unsafe fn dealloc_object_one(
             );
 
             // Captured for the final `free_cspace_id` after the lock release;
-            // 0 means "no dying id" (cs_ptr was null), which short-circuits
-            // the free-list push below.
+            // `needs_free_id` stays false when cs_ptr is null (no id to
+            // recycle), which short-circuits the free-list push below.
             let mut dying_id: crate::cap::slot::CSpaceId = 0;
             let mut needs_free_id = false;
 
@@ -3398,10 +3350,7 @@ unsafe fn dealloc_object_one(
                     core::ptr::drop_in_place(cs_ptr);
                 }
 
-                // Don't recycle id 0 (root CSpace's id). The root is also
-                // pinned by HDR_FLAG_IS_ROOT so this branch is unreachable
-                // for the root in practice; the guard is defense-in-depth.
-                needs_free_id = id != 0;
+                needs_free_id = true;
             }
 
             // Return every donation, the create-time slab (holding the

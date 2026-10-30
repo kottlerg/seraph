@@ -297,10 +297,9 @@ only narrows rights, never widens; there is no dedicated SBI split operation).
 
 The kernel mints the root cap once at boot, carrying every sanctioned right, into init's cspace.
 **init is reaped after bootstrap, so any right not transferred to a surviving service before the
-reap is unforwardable until the next boot: the cap stays in init's CSpace, which the kernel pins (it
-is the root CSpace), so it remains alive but unreachable; releasing it at the reap is design intent,
-not yet implemented ([#540](https://github.com/kottlerg/seraph/issues/540); see
-[process-lifecycle.md § Init reap](process-lifecycle.md#init-reap)). This, not a kernel wall, is
+reap is unforwardable until the next boot: the cap stays in init's CSpace and is released when the
+reap frees that CSpace (see [process-lifecycle.md § Init reap](process-lifecycle.md#init-reap)).
+This, not a kernel wall, is
 what bounds the live extension set.** init transfers a cap narrowed to **Reset** + **Suspend** to
 devmgr, the steady-state holder of platform firmware authority (it sits alongside the ACPI / MMIO /
 IRQ resources devmgr already brokers). The remaining sanctioned rights are carried into no surviving

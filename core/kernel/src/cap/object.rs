@@ -1691,8 +1691,11 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// the reference a moved capability's freed source slot held
 /// (`cap::transfer::release_moved_object`), of the slot references a range
 /// split's consumed original and a memory merge's consumed tail held, of a
-/// copy's or derive's unpublished new-slot reference, and of the address-space
-/// reference an Mmio mapping record held (`MmioObject::withdraw_mappings`).
+/// copy's or derive's unpublished new-slot reference, of the address-space
+/// reference an Mmio mapping record held (`MmioObject::withdraw_mappings`),
+/// of the fault-handler binding a rebind or unbind replaces
+/// (`sys_thread_set_fault_handler`), and of the endpoint pin a fault delivery
+/// holds until before its park (`ipc::fault::fault_dispatch`).
 /// Pins, moves, and mapping records may name an object bound to the running
 /// thread, so a `Thread`, `CSpace`, or `AddressSpace` whose last reference
 /// goes here is queued for this CPU's deferred reclaim (drained at the next
@@ -1701,8 +1704,10 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// `DERIVATION_LOCK` and the frame allocator and, for a Notification, an
 /// `EventQueue`, or an Endpoint, wakes the waiters it drains (the running
 /// thread among them, when it is parked on the object it released), for a
-/// Notification or `EventQueue` first waits for the timer's in-flight wakeup
-/// batch (`sched::sleep_wakeups_quiesce`), and for an Mmio or `IoPort` object
+/// Notification first waits for the device-IRQ deliveries in flight through
+/// its routes (`irq::unregister_notification`), for a Notification or
+/// `EventQueue` waits for the timer's in-flight wakeup batch
+/// (`sched::sleep_wakeups_quiesce`), and for an Mmio or `IoPort` object
 /// waits for the TLB shootdown or takes the thread registry lock its
 /// withdrawal needs — bounded waits that complete only when no IPC,
 /// scheduler, or sleep-list lock is held; hence the lock preconditions below.
@@ -1712,9 +1717,12 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// - `obj` must carry an outstanding reference the caller owns, which this
 ///   call consumes.
 /// - A stable CPU index, which the deferred-reclaim push needs: syscall
-///   context with interrupts disabled, or the idle thread (pinned to its CPU)
-///   draining the deferred-reclaim stack, which reaches here through an Mmio
-///   object's teardown (`MmioObject::withdraw_mappings`).
+///   context with interrupts disabled; fault delivery on the faulting thread
+///   with interrupts disabled, before its park (`ipc::fault::fault_dispatch`,
+///   releasing an Endpoint, which frees in place and never reaches the push);
+///   or the idle thread (pinned to its CPU) draining the deferred-reclaim
+///   stack, which reaches here through an Mmio object's teardown
+///   (`MmioObject::withdraw_mappings`).
 /// - Must NOT be called with `DERIVATION_LOCK` held, nor with any IPC source,
 ///   per-TCB `sched_lock`, per-CPU scheduler, or sleep-list lock held (the
 ///   preconditions `dealloc_object` states).
@@ -2196,16 +2204,18 @@ pub unsafe fn object_for_new_slot(
 ///   or it is a fresh body that was never published (a range split's
 ///   rollback frees such bodies at their initial count of 1).
 /// - The CPU index must be stable — syscall context with interrupts disabled,
-///   or the idle thread's deferred-reclaim drain — because the Mmio arm
-///   releases address-space references through [`release_ref`].
+///   fault delivery with interrupts disabled before its park, or the idle
+///   thread's deferred-reclaim drain — because the Mmio arm releases
+///   address-space references through [`release_ref`].
 /// - Must NOT be called with `DERIVATION_LOCK` held: the `CSpaceObj` arm
 ///   takes that (non-recursive) lock for its batched derivation drain, and
 ///   the Memory arm takes the frame-allocator lock.
 /// - Must NOT be called with any IPC source, per-TCB `sched_lock`, per-CPU
 ///   scheduler, or sleep-list lock held: the Thread, Notification, and
 ///   `EventQueue` arms spin, with interrupts enabled, until work on other
-///   CPUs that takes those locks finishes (the Thread drain gates, and
-///   `sched::sleep_wakeups_quiesce`).
+///   CPUs that takes those locks finishes (the Thread drain gates, the
+///   Notification arm's wait for in-flight device-IRQ deliveries,
+///   `irq::unregister_notification`, and `sched::sleep_wakeups_quiesce`).
 ///
 /// # Cascade handling
 ///

@@ -200,8 +200,9 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
     // Drop the delivery's pin before parking (rule 10): the park's binding now
     // keeps this thread reachable, and a release that frees the endpoint runs
     // its teardown here, which claims this thread if it is still queued.
-    // SAFETY: the reference pin_binding took is owned here; fault context with
-    // interrupts disabled (a stable CPU index) and no lock held.
+    // SAFETY: the reference pin_binding took is owned here; fault delivery on
+    // the faulting thread with interrupts disabled, before its park, is the
+    // stable-CPU context release_ref's # Safety lists; no lock is held.
     unsafe { crate::cap::object::release_ref(ep_obj.cast::<KernelObjectHeader>()) };
 
     // Yield the CPU — the current thread is now blocked (or, on the rare

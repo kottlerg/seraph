@@ -25,13 +25,15 @@
 //! carves that one line from a derived copy of the root Interrupt cap and
 //! first proves delivery: a raise must signal a routed notification. Then,
 //! each round, the controller, pinned to CPU 0 (the CPU the x86-64 I/O APIC
-//! entry targets), creates a notification, routes the line to it, unmasks
-//! it, and raises the interrupt repeatedly, while a deleter pinned to CPU 1
-//! waits a varying delay and deletes the notification's only capability. A
-//! raise after the delete finds the line masked and unrouted. Required: the
-//! kernel survives every round, and the deleter's delete lands during the
-//! raises in some rounds (the race armed). The UART interrupt is disabled
-//! again when the cell ends.
+//! entry targets), creates a notification and routes the line to it, then
+//! repeatedly unmasks the line (`SYS_IRQ_ACK`; each delivery masks it again)
+//! and raises the interrupt, so deliveries follow one another, while a
+//! deleter pinned to CPU 1 waits a varying delay and deletes the
+//! notification's only capability. A raise after the delete finds the line
+//! masked and unrouted. Required: the kernel survives every round, and in
+//! some rounds the controller raised the line after the deleter began its
+//! delete and before it finished (the race armed). The UART interrupt is
+//! disabled again when the cell ends.
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -68,6 +70,8 @@ const EXIT_POLLS: u32 = 10_000;
 static ROUND: AtomicU32 = AtomicU32::new(0);
 /// Notification handle the deleter deletes this round.
 static SIG: AtomicU32 = AtomicU32::new(0);
+/// Round whose delete the deleter has begun.
+static DELETING: AtomicU32 = AtomicU32::new(0);
 /// Last round whose delete the deleter finished.
 static DELETED: AtomicU32 = AtomicU32::new(0);
 /// Set by the controller to end the deleter.
@@ -140,6 +144,7 @@ fn race(ctx: &TestContext, line: u32, cycles: u32) -> TestResult
 
     ROUND.store(0, Ordering::Release);
     DELETED.store(0, Ordering::Release);
+    DELETING.store(0, Ordering::Release);
     QUIT.store(0, Ordering::Release);
     let deleter = cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
         .map_err(|_| "stress::irq_route_delete_race: create deleter failed")?;
@@ -162,7 +167,7 @@ fn race(ctx: &TestContext, line: u32, cycles: u32) -> TestResult
     );
     if armed == 0
     {
-        return Err("stress::irq_route_delete_race: no delete landed during the raises");
+        return Err("stress::irq_route_delete_race: no raise overlapped a delete");
     }
     Ok(())
 }
@@ -187,7 +192,7 @@ fn probe_delivery(ctx: &TestContext, line: u32) -> TestResult
     }
 }
 
-/// The rounds; returns how many saw the delete land while raising.
+/// The rounds; returns how many raised the line while the delete ran.
 fn rounds(ctx: &TestContext, line: u32, cycles: u32) -> Result<u32, &'static str>
 {
     let mut armed = 0u32;
@@ -205,16 +210,28 @@ fn rounds(ctx: &TestContext, line: u32, cycles: u32) -> Result<u32, &'static str
         SIG.store(sig, Ordering::Release);
         ROUND.store(round, Ordering::Release);
         let mut raises = 0u32;
+        let mut overlapped = false;
         while DELETED.load(Ordering::Acquire) != round && raises < MAX_RAISES
         {
+            // Unmask before each raise, since each delivery masks the line;
+            // after the delete the ack may fail or find the line unrouted.
+            irq_ack(line).ok();
             raise_tx_interrupt();
             raises += 1;
+            if DELETING.load(Ordering::Acquire) == round && DELETED.load(Ordering::Acquire) != round
+            {
+                overlapped = true;
+            }
+        }
+        if overlapped
+        {
+            armed += 1;
         }
         if DELETED.load(Ordering::Acquire) == round
         {
-            armed += 1;
             for _ in 0..TRAILING_RAISES
             {
+                irq_ack(line).ok();
                 raise_tx_interrupt();
             }
         }
@@ -261,6 +278,7 @@ extern "C" fn deleter_entry(_arg: u64) -> !
         }
         // A failed delete would leave the notification routed, which the next
         // round's register replaces; the controller's wait still completes.
+        DELETING.store(round, Ordering::Release);
         cap_delete(SIG.load(Ordering::Acquire)).ok();
         DELETED.store(round, Ordering::Release);
     }

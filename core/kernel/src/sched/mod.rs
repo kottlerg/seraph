@@ -1307,7 +1307,8 @@ fn watchdog_dump_cpu(cpu: usize, now: u64)
     }
 }
 
-/// Most sleep-list entries the watchdog dump prints.
+/// Most sleep-list entries the watchdog dump prints. A diagnostic output cap;
+/// it bounds no capacity.
 #[cfg(not(test))]
 const WATCHDOG_SLEEP_ENTRIES: usize = 8;
 

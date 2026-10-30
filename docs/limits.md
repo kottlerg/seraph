@@ -228,6 +228,7 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `WATCHDOG_THRESHOLD_TICKS`, `DETECTOR_SCAN_INTERVAL_TICKS` | `core/kernel/src/sched/mod.rs` | 3000 / 512 ticks | unknown (assumes a 1 ms tick) | none | needs a design | Express in seconds times `ticks_per_second()` |
 | `WEDGE_GRACE_SECONDS` | `core/kernel/src/sched/mod.rs` | 8, scaled per 128 CPUs | tuning (scales with CPU count) | none | correct as is | None |
 | `OWED_WAKE_MAX` (`OWED_WAKE_LAST`) | `core/kernel/src/sched/mod.rs` | 8 | diagnostic output cap | 64 B BSS | needs a design | Keyed by a random `u32` thread id; key by TCB pointer |
+| `WATCHDOG_SLEEP_ENTRIES` | `core/kernel/src/sched/mod.rs` | 8 | diagnostic output cap | about 128 B stack | correct as is | None |
 | `CS_SPIN_WARN_US` | `core/kernel/src/sched/mod.rs` | 100 000 us | diagnostic threshold | none | correct as is | None |
 | `LOAD_BALANCE_IMBALANCE_THRESHOLD` | `core/kernel/src/sched/mod.rs` | 2 | tuning | none | correct as is | None |
 | `PerCpuScheduler.load`, `non_empty` | `core/kernel/src/sched/run_queue.rs` | `AtomicU32` | provably unreachable (load at most threads, mask 32 bits) | per CPU | correct as is | None |
@@ -406,7 +407,7 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 | `READ_WAIT` | `runtime/ruststd/src/sys/fs/release_handler.rs` | 100 ms | ABI width (the driver's cooperative-release window) | none | correct as is | None |
 | `SPIN_BUDGET` | `runtime/ruststd/src/sys/time/seraph.rs` | `1 << 20` | unknown (spin count) | none | needs a design | Time-based bound |
 | `Mutex::spin` count | `runtime/ruststd/src/sys/sync/mutex/seraph.rs` | 100 | tuning (a backoff before parking) | none | correct as is | None |
-| `MAX_READERS` | `runtime/ruststd/src/sys/sync/rwlock/seraph.rs` | `2^30 - 2` | provably unreachable (more than any thread count) | 4 B per lock | correct as is | None |
+| `MAX_READERS` | `runtime/ruststd/src/sys/sync/rwlock/seraph.rs` | `2^30 - 2` | provably unreachable short of leaked guards (more than any thread count; past it readers wait) | 4 B per lock | correct as is | None |
 
 ### Shared IPC and protocol crates
 

@@ -30,7 +30,8 @@ runs on every supported arch.
 
 ## Endpoint
 
-Bootstrap caps from init (one round, two caps, `done=true`):
+Bootstrap caps from svcmgr (one round, two caps, `done=true`; recipe `provides = timed`,
+`seed = devmgr.registry`):
 
 | Slot      | Cap                                                          |
 |-----------|--------------------------------------------------------------|
@@ -38,7 +39,7 @@ Bootstrap caps from init (one round, two caps, `done=true`):
 | `caps[1]` | SEND on devmgr's registry endpoint, badged with `REGISTRY_QUERY_AUTHORITY` |
 
 No other caps are needed; the registry SEND is used once for the
-`QUERY_RTC_DEVICE` resolve and then discarded.
+`QUERY_RTC_DEVICE` resolve.
 
 ---
 
@@ -66,7 +67,8 @@ through devmgr), timed enters a degraded state and replies
 2. `devmgr.QUERY_RTC_DEVICE` → `READ_AUTHORITY`-badged SEND on the
    per-board RTC driver bound by devmgr.
 3. `rtc_driver.RTC_GET_EPOCH_TIME` → `rtc_us` (Unix-epoch us).
-4. Snapshot `kernel_us = system_info(ElapsedUs)`.
+4. Bracket the RTC read with two `system_info(ElapsedUs)` samples; `kernel_us` is their
+   midpoint.
 5. `offset = rtc_us.wrapping_sub(kernel_us)`.
 6. Enter the service loop.
 
@@ -74,8 +76,18 @@ The offset uses wrapping arithmetic so the same `offset + elapsed`
 formula serves every request without branching on whether `rtc_us`
 exceeds `kernel_us`. `wrapping_add(wrapping_sub(x, y), y) == x`
 holds for unsigned, so the reply value equals `rtc_us` at the
-instant of the original RTC read, plus exactly the elapsed
+midpoint of the RTC read, plus exactly the elapsed
 monotonic time since.
+
+---
+
+## Relevant Design Documents
+
+| Document | Content |
+|---|---|
+| [docs/architecture.md](../../docs/architecture.md) | System-wide service inventory; timed's role |
+| [docs/device-management.md](../../docs/device-management.md) | devmgr's `QUERY_RTC_DEVICE` broker and RTC driver binding |
+| [Restart Protocol](../svcmgr/docs/restart-protocol.md) | timed's `restart = on_failure`, `critical = no` supervision |
 
 ---
 

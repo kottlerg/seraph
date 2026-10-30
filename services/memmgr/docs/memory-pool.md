@@ -48,8 +48,9 @@ consumer's fault. The kernel mints every donatable RAM cap with these rights
 (rights gate derivation, not the live mapping; see
 [`docs/capability-model.md`](../../../docs/capability-model.md#memory) §"Memory");
 memmgr enforces the invariant at
-both ingest and donation, rejecting (or, for the bootstrap pool, panicking on) a
-frame that lacks them so a mint-rights regression fails loudly rather than
+both ingest and donation, rejecting a donated frame that lacks them and panicking if the first
+bootstrap cap lacks them (the kernel mints the bootstrap batch uniformly, so
+one cap is sufficient), so a mint-rights regression fails loudly rather than
 surfacing as an intermittent consumer fault.
 
 ---
@@ -58,23 +59,20 @@ surfacing as an intermittent consumer fault.
 
 memmgr is `no_std` and has no general allocator; the free pool itself is
 sized at compile time (per-process descriptors instead live in the
-RAM-backed metadata arena above). The free pool is organised for two access
-patterns:
+RAM-backed metadata arena below). It is a fixed array of at most
+`MAX_FREE_RUNS` slots (512), each holding one run: a Memory cap, its page
+count, and its physical base. Slot order is irrelevant and every selection
+scans the array linearly:
 
-- **Contiguous allocation fast path.** A `REQUIRE_CONTIGUOUS` request
-  for `N` pages must locate a free run of at least `N` pages in O(1) or
-  O(log N). Buckets indexed by run length (in pages, by power-of-two
-  size class) hold pointers to the head of each free run in that class.
-- **Best-effort allocation.** Without `REQUIRE_CONTIGUOUS`, memmgr may
-  satisfy a request from multiple runs; the smaller-end of the bucket
-  array suffices.
+- **Smallest fit.** The smallest run covering at least `N` pages serves a
+  `REQUIRE_CONTIGUOUS` request and the single-run case of best-effort
+  allocation.
+- **Largest run.** Best-effort allocation falls back to repeatedly taking the
+  largest run when no single run is large enough.
 
-Per-bucket entries are statically sized. If a bucket fills, that size
-class is at capacity for the moment and memmgr falls back to the next
-larger or smaller class. The implementation MAY choose any concrete
-representation (intrusive linked list embedded in metadata pages,
-fixed-size arrays per class, etc.) consistent with the `no_std`
-constraint.
+A run that finds no empty slot after a coalesce retry stays owned and counted
+in `pool_total` but is unreachable for allocation until a later coalesce
+frees a slot (see [Coalescing](#coalescing)).
 
 ---
 
@@ -82,13 +80,12 @@ constraint.
 
 `REQUEST_MEMORY_CAPS(want_pages, flags)`:
 
-1. **`REQUIRE_CONTIGUOUS` set.** Walk buckets from the smallest class
-   that can hold `want_pages` upward. On hit: detach the run, split off
-   exactly `want_pages` via `memory_split` if the run is larger than
-   requested, return one Memory cap. On miss: return
-   `OutOfMemory{contiguous}`. memmgr does not migrate live pages to
-   produce a contiguous run; coalescing is the only mechanism that
-   restores contiguity.
+1. **`REQUIRE_CONTIGUOUS` set.** Select the smallest run that covers
+   `want_pages`. On hit: detach the run, split off exactly `want_pages` via
+   `memory_split` if the run is larger than requested, return one Memory
+   cap. On miss, or if the split fails: return `OUT_OF_MEMORY_CONTIGUOUS`.
+   memmgr does not migrate live pages to produce a contiguous run;
+   coalescing is the only mechanism that restores contiguity.
 2. **Best-effort.** First try a single best-fit run — the smallest run
    that covers `want_pages` whole. One run is the fewest possible caps,
    and best-fit reuses a freed run of the requested size instead of
@@ -99,7 +96,10 @@ constraint.
    fall back to satisfying the request greedily from multiple runs, largest
    first. Bound the returned-cap count by the IPC reply-side cap-slot limit;
    if the pool cannot satisfy `want_pages` within that bound, return
-   `OutOfMemory{best_effort}`.
+   `OUT_OF_MEMORY_BEST_EFFORT`. The same code is returned if deriving the
+   caller's copy of a selected cap fails. A failure of pool selection carries
+   three diagnostic data words (total free pages, free-run count, and the
+   largest run in pages); a failure to derive the caller's copy carries none.
 
 Each Memory cap returned to the caller is a derive-twice copy: memmgr
 retains an intermediary in its own CSpace and hands the second derivation
@@ -130,11 +130,12 @@ not by a fixed constant. The arena is what makes the demand-paged thread-stack
 consumer (one region plus many lazily-grown frames per thread) viable: a fixed
 per-process array would cap thread count at a small constant. Allocation fails
 only when the arena cannot grow because system RAM is exhausted, surfaced as
-`OutOfMemory{quota}`.
+`QUOTA`.
 
 The table itself is statically bounded by the maximum number of
 concurrently-tracked processes (`MAX_PROCESSES`). `REGISTER_PROCESS` returns
-`OutOfMemory{too_many_processes}` if the table is full. Lifting that bound to a
+`TOO_MANY_PROCESSES` if the table is full (three of its slots hold the
+reserved procmgr, memmgr-self, and init-self records). Lifting that bound to a
 hardware-bound process count, reusing this arena, is tracked separately.
 
 ---
@@ -265,10 +266,10 @@ discrete runs.
 
 | Failure | Cause | Caller observation |
 |---|---|---|
-| `OutOfMemory{contiguous}` | No free run satisfies `REQUIRE_CONTIGUOUS` | Reply with error label; caller may retry without the flag, or fail |
-| `OutOfMemory{best_effort}` | Pool cannot cover `want_pages` even fragmented | Reply with error label; caller treats as system-wide RAM exhaustion |
-| `OutOfMemory{quota}` | Tracking-metadata arena could not grow (system RAM exhausted) | Reply with error label; caller treats as system-wide RAM exhaustion |
-| `OutOfMemory{too_many_processes}` | Per-process table at static cap | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
+| `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS` | Reply with error label; caller may retry without the flag, or fail |
+| `OUT_OF_MEMORY_BEST_EFFORT` | Pool cannot cover `want_pages` even fragmented | Reply with error label; caller treats as system-wide RAM exhaustion |
+| `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted) | Reply with error label; caller treats as system-wide RAM exhaustion |
+| `TOO_MANY_PROCESSES` | Per-process table at static cap | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
 
 memmgr never panics on allocation failure. The caller's response policy
 (panic, retry, fail the operation) is its own concern; for std-built
@@ -282,7 +283,7 @@ terminal fault tears down the whole process (see
 ## Non-Goals
 
 - **Swap.** memmgr never moves pages to backing store. RAM exhaustion
-  surfaces as `OutOfMemory` to the caller.
+  surfaces as an out-of-memory error reply to the caller.
 - **Live migration.** memmgr does not relocate pages held by a live
   process to defragment the pool. Defragmentation depends on processes
   exiting (or calling `RELEASE_MEMORY_CAPS`) and the resulting coalesce.

@@ -12,6 +12,20 @@ does not change.
 
 ---
 
+## Source Layout
+
+```
+terminal/
+├── Cargo.toml
+├── README.md
+└── src/
+    ├── main.rs            # Device resolution, child spawn/respawn, line discipline
+    ├── input.rs           # Keyboard and serial RX producer threads
+    └── output.rs          # Output sink: framebuffer (SGR-parsed) and serial mirror
+```
+
+---
+
 ## Scope
 
 - **Input**: two sources feeding one channel — the virtio-input keyboard
@@ -92,11 +106,23 @@ stream. It runs as a boot in the `usertest` cell. See
 [xtask/README.md](../../xtask/README.md#cargo-xtask-test-terminal) for the command and
 [docs/testing.md](../../docs/testing.md#interactive-input-test-terminal) for the test.
 
+---
+
+## Relevant Design Documents
+
+| Document | Content |
+|---|---|
+| [docs/console-model.md](../../docs/console-model.md) | Console output ownership; the terminal as the production console path |
+| [docs/testing.md](../../docs/testing.md) | The `test-terminal` interactive input test |
+| [xtask/README.md](../../xtask/README.md) | `cargo xtask test-terminal` and the devices `run` attaches |
+| [serial driver](../../services/drivers/serial/README.md) | `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, `SERIAL_REGISTER_RX_NOTIFY` |
+| [framebuffer driver](../../services/drivers/framebuffer/README.md) | `FB_WRITE_BYTES` and `FB_SET_ATTRS` |
+| [shared/ansi/README.md](../../shared/ansi/README.md) | SGR parser for the framebuffer path |
+
 [#29]: https://github.com/kottlerg/seraph/issues/29
 [#66]: https://github.com/kottlerg/seraph/issues/66
 [#67]: https://github.com/kottlerg/seraph/issues/67
 [#110]: https://github.com/kottlerg/seraph/issues/110
-[#112]: https://github.com/kottlerg/seraph/issues/112
 [#291]: https://github.com/kottlerg/seraph/issues/291
 
 ---

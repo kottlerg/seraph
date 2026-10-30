@@ -175,6 +175,15 @@ only after initial enumeration and binding complete. The dependency ordering is 
 init's bootstrap sequence (devmgr before vfsd) and by svcmgr launching those consumers only
 after handover; devmgr and vfsd are `restart = never`, so no restart ordering exists.
 
+devmgr spawns one driver for every virtio-input device it enumerates and for every virtio-blk
+device it can give a private IRQ line (virtio-blk requires one; a disk whose line another device
+already holds is not served until shared lines are,
+[#664](https://github.com/kottlerg/seraph/issues/664)), each with its own service endpoint.
+`QUERY_BLOCK_DEVICE` and `QUERY_INPUT_DEVICE` select one of those drivers by an optional instance
+ordinal in `data[1]` (absent means the first): the ordinal counts the running drivers of that class
+in PCI segment, bus, device, function order, and is not stable across boots. vfsd and the terminal
+send none, so they bind the first instance.
+
 ### Driver binary sources
 
 devmgr loads driver binaries from one of two places:
@@ -203,9 +212,13 @@ devmgr loads driver binaries from one of two places:
   hardware-carve failure, OOM, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on subsequent
   `QUERY_RTC_DEVICE` / `QUERY_INPUT_DEVICE` calls and clients ([timed](../services/timed/README.md)
   degrades to its no-RTC path; the terminal, today's only `QUERY_INPUT_DEVICE` consumer, logs and
-  exits). Keeping non-essentials out of the boot bundle keeps the ESP-loaded image to what the
-  system needs before the rootfs is mounted, so on-disk loading is preferred for anything not on the
-  read-the-disk-in-the-first-place critical path.
+  exits). Before the spawn has run the reply is the same `NO_DEVICE`, so a client that cannot
+  proceed without the device MAY retry a bounded number of times (the terminal does), while a
+  client with a no-device path treats the first `NO_DEVICE` as terminal; no client retries without
+  a bound (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns the rule). Keeping non-essentials out
+  of the boot bundle keeps the ESP-loaded image to what the system needs before the rootfs is
+  mounted, so on-disk loading is preferred for anything not on the read-the-disk-in-the-first-place
+  critical path.
 
 Storage-side cap delegation downstream of devmgr (whole-disk
 endpoint → vfsd → partition-scoped endpoint → fs driver) is

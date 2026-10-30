@@ -111,11 +111,13 @@ kill-process pattern, it is the delete following the revoke that releases it. Ei
 is freed only when its count reaches zero, which a held pin defers until the syscall drops it. Copy,
 derive, and derive-badge pin their source the same way, so the reference they take for the new slot
 never lands on a freed object, and still revalidate the source slot under the derivation write lock
-before they link the new one (see [§ Global Derivation Lock](#global-derivation-lock)). The
-remaining lock-free readers — the IPC transfer pre-validation and the capability-tree syscalls'
-unlocked pre-checks — read only the tag, generation, and in-flight pin of a slot and dereference no
-object; the tag and per-slot generation checks there only narrow the race they act on, and the
-locked path re-decides.
+before they link the new one (see [§ Global Derivation Lock](#global-derivation-lock)). The IPC
+transfer pre-validation (`prevalidate_sender_caps`) holds the sender's CSpace lock, under which a
+slot stays occupied and its object live, so it also reads each object's reference count against
+the ceiling. The remaining lock-free readers, the capability-tree syscalls' unlocked pre-checks,
+read only the tag, generation, and in-flight pin of a slot and dereference no object. Neither holds
+the derivation lock: their tag, generation, and pin checks only narrow the race they act on, and
+the locked path re-decides.
 
 **Slot 0** is always null. The leaf covering slot 0 exists once the CSpace
 has grown, but the slot is permanently locked to the null capability,
@@ -745,8 +747,11 @@ is released would instead return a live handle to the refill.
 
 Because hoisting destroys intermediate parent→child edges as the flattening
 proceeds, the root is pinned for the whole multi-batch operation with the
-**in-flight pin** (`CapabilitySlot::pinned`, stored in `pad[2]`, read and written
-only under the derivation write lock; a move pins its
+**in-flight pin** (`CapabilitySlot::pinned`, stored in `pad[2]`, written only under
+the derivation write lock and read under it by every path that acts on it; the advisory
+pre-checks of [§ Storage: Hybrid Two-Level Radix](#storage-hybrid-two-level-radix) read it
+without that lock, and their locked
+path re-decides; a move pins its
 source and destination the same way — see [Move](#move)). `SYS_CAP_DELETE`,
 `SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
 `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, the range splits, and a further

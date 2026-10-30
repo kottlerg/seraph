@@ -86,7 +86,7 @@ has accepted the platform.
 
 ---
 
-## Phase 2: Memory Map Parsing and Buddy Allocator
+## Phase 2: Memory Map Parsing
 
 ```
 1. Iterate boot_info.memory_map.entries
@@ -104,31 +104,26 @@ has accepted the platform.
       (boot_info.modules.entries[i].physical_base + size for each i)
    d. Frames containing the BootInfo structure itself
    e. The AP trampoline page (boot_info.ap_trampoline_page, when non-zero)
-   f. The DTB blob pages (boot_info.device_tree, sized by the FDT totalsize, when valid)
    Exclusions are rounded outward to page boundaries.
-4. The buddy allocator is the static mm::FRAME_ALLOCATOR, built at compile time by the
-   const BuddyAllocator::new(); orders run from 0 (one 4 KiB page) to the compile-time
-   constant `MAX_ORDER` = 11 (2048 pages = 8 MiB), sized so the largest per-CPU boot slab
-   at `MAX_CPUS` fits one block
-5. For each candidate range, call BuddyAllocator::add_region(phys_start, phys_end)
-6. Emit the merged memory map and a DRAM summary (usable, loaded, firmware-reserved,
+4. Keep the surviving ranges, boot_info.device_tree, and the direct-mapped span
+   (compute_max_physical_address) for the buddy population in Phase 3
+   (mm::init::init_physical_memory). Nothing is written to free RAM: the bootloader's
+   tables do not map it.
+5. Emit the merged memory map and a DRAM summary (usable, loaded, firmware-reserved,
    ACPI-reclaimable, plus persistent and MMIO-window totals when present) in scaled
    KiB/MiB/GiB units (mm::init::print_memory_map)
 ```
 
-`MAX_ORDER` and the per-CPU boot slab sizing it accommodates are specified in
-[memory-internals.md](memory-internals.md) § Buddy Allocator.
+The buddy allocator's free-list links live in the free pages
+([memory-internals.md](memory-internals.md) § Buddy Allocator), so it is populated only
+once the direct map is live, in Phase 3.
 
-The buddy allocator MUST be initialized from a static buffer or boot stack, not
-from itself.
-
-**Memory at this point:** Only the buddy allocator metadata is allocated. The kernel
-has no heap (see Phase 4).
+**Memory at this point:** Nothing is allocated. The kernel has no heap (see Phase 4).
 
 **Failure mode:** If total usable RAM is zero after exclusions, halt with message
 "FATAL: no usable physical memory after exclusions". This indicates a corrupt memory map.
 
-**Completion criterion:** `BuddyAllocator` is initialised and reports usable frames.
+**Completion criterion:** The surviving free ranges are recorded and hold usable frames.
 
 ---
 
@@ -181,7 +176,25 @@ has no heap (see Phase 4).
 8. Emit: "page tables active" (the direct-map base is a KASLR secret and is
    reported only on the serial-only path at Phase 1, never via the
    framebuffer-mirrored console)
+9. Populate the buddy allocator (mm::init::populate_buddy), the first act of Phase 3 once
+   the new tables are active; nothing allocates from Phase 2 until it, and an allocation
+   before it halts the kernel:
+   a. If boot_info.device_tree is non-zero, read the FDT header through the direct map
+      and size the blob from its totalsize. The only bounds are the FDT format's (a u32
+      totalsize no smaller than the 40-byte header) and the direct-mapped span; a blob
+      outside them halts the boot. Subtract the blob's pages, rounded outward, from the
+      Phase 2 ranges and record the extent for the Phase 7 DTB Memory cap.
+   b. The buddy allocator is the static mm::FRAME_ALLOCATOR, built at compile time by the
+      const BuddyAllocator::new(); orders run from 0 (one 4 KiB page) to the compile-time
+      constant `MAX_ORDER` = 11 (2048 pages = 8 MiB), sized so the largest per-CPU boot
+      slab at `MAX_CPUS` fits one block. For each range, call
+      BuddyAllocator::add_region(phys_start, phys_end), which writes each block's
+      free-list header through the direct map.
+   c. Emit: "buddy allocator: N free pages"
 ```
+
+`MAX_ORDER` and the per-CPU boot slab sizing it accommodates are specified in
+[memory-internals.md](memory-internals.md) § Buddy Allocator.
 
 The direct-map page sizes, the kernel-half floor, and the KASLR placement of the direct map
 are defined in [memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout
@@ -196,9 +209,13 @@ All kernel pointers derived from physical addresses use this translation.
 **Failure mode:** Exhausting `BOOT_TABLE_POOL` during page table construction is fatal:
 "FATAL: Phase 3: boot page table pool exhausted (RAM > 248 GiB?)". A direct map that would
 overlap the kernel image window halts with
-"FATAL: Phase 3: direct map would overlap the kernel image window".
+"FATAL: Phase 3: direct map would overlap the kernel image window". A
+`boot_info.device_tree` naming no valid FDT blob inside the direct-mapped span halts with
+"FATAL: Phase 3: BootInfo.device_tree names no valid FDT blob", after a line giving its
+address, the reason, and the span's end.
 
-**Completion criterion:** The kernel is executing with its own page tables active.
+**Completion criterion:** The kernel is executing with its own page tables active, and
+`BuddyAllocator` is populated and reports usable frames.
 
 ---
 
@@ -377,20 +394,23 @@ Phase 7.
 ```
 1. Reserve init's Phase 9 backing (the InitInfo block and INIT_STACK_PAGES stack frames)
    and seed the kernel page-table pool from the pristine buddy, then drain the remaining
-   buddy RAM, seal the buddy, and install SEED_MEMORY over the front SEED_RESERVE_BYTES of
-   the largest drained block (`cap::drain_and_install_seed`). Every drained extent exposed
-   to userspace (each drained block, and the seed block's tail past the reserve) is zeroed
-   through the direct map before step 3 mints it: free RAM still holds what firmware and
-   the bootloader left there, the UEFI stack among it. The "Phase 7: drained" line reports
-   the time the zeroing took
+   buddy RAM as address-sorted, maximal contiguous extents (`BuddyAllocator::drain_coalesced`;
+   more extents than MAX_DRAIN_BLOCKS halt the boot with
+   "FATAL: Phase 7: drained RAM extents exceed MAX_DRAIN_BLOCKS"), seal the buddy, and
+   install SEED_MEMORY over the front SEED_RESERVE_BYTES of the largest drained extent
+   (`cap::drain_and_install_seed`). Every drained extent exposed to userspace (each drained
+   extent, and the seed extent's tail past the reserve) is zeroed through the direct map
+   before step 3 mints it: free RAM still holds what firmware and the bootloader left there,
+   the UEFI stack among it, and the buddy's free-list headers. The "Phase 7: drained" line
+   reports the time the zeroing took
 2. Boot-retype the root CSpace from SEED_MEMORY (`boot_retype_cspace`, ROOT_CSPACE_INIT_PAGES
    pages: one wrapper page plus a slot-page pool holding at least
    ROOT_CSPACE_INIT_SLOT_CAPACITY = 1536 slots) and register it as CSpace id 0:
    - Slot 0 is permanently null
 3. Populate the root CSpace with initial capabilities:
    a. Memory capabilities for the RAM drained from the buddy allocator in step 1: one per
-      contiguous extent after physically adjacent drained blocks are coalesced, the seed
-      block contributing only its tail past SEED_RESERVE_BYTES
+      drained contiguous extent, the seed extent contributing only its tail past
+      SEED_RESERVE_BYTES
    b. Mmio capabilities (Map | Write rights): on RISC-V, first one over the
       kernel console UART (`BootInfo.kernel_mmio.uart_base`, or the platform
       default when that is zero; the range can also lie inside an aperture), then one per

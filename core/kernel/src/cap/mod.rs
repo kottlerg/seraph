@@ -478,7 +478,7 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 /// 1536 slots per the seeding policy in docs/capability-model.md
 /// (growth budgets): roughly 1.8× the observed ~850-cap
 /// pre-memmgr-handover peak. The headroom absorbs realistic
-/// per-RAM-block-count growth (more drained blocks ⇒ more init-time
+/// per-RAM-extent-count growth (more drained extents ⇒ more init-time
 /// Memory-cap derivations) and per-service growth (more boot modules ⇒
 /// more module-memory caps) without revisiting this knob.
 ///
@@ -509,13 +509,13 @@ const ROOT_CSPACE_INIT_PAGES: u64 =
 
 // ── Phase-7 seed Memory cap ───────────────────────────────────────────────────
 
-/// Bytes carved off the front of the largest drained RAM block to host
+/// Bytes carved off the front of the largest drained RAM extent to host
 /// every initial cap-identity body.
 ///
 /// Today's footprint on `x86_64` is ~150 KB:
 /// ~15 KB for sub-page cap-identity bodies (bin-128 slots: one RAM
 /// `MemoryObject` per coalesced drained extent, the seed tail included (see
-/// [`coalesce_ram_blocks`]) + 10 `Mmio` wrappers + 1 `Interrupt` + 1 `IoPort` +
+/// [`drain_and_install_seed`]) + 10 `Mmio` wrappers + 1 `Interrupt` + 1 `IoPort` +
 /// 1 `SchedControl` + 2 ACPI Memory caps + 6 module Memory caps + 3
 /// init-segment Memory caps, plus the seed's own `RetypeAllocator` metadata),
 /// plus ~130 KB for init's bootstrap state (one [`AddressSpaceObject`] slab —
@@ -525,7 +525,7 @@ const ROOT_CSPACE_INIT_PAGES: u64 =
 /// `SEED_RESERVE_BYTES` is sized at 512 KB — generous headroom so future
 /// cap types and longer module lists land without revisiting the constant.
 ///
-/// The remainder of the largest block is exposed to userspace as a
+/// The remainder of the largest extent is exposed to userspace as a
 /// regular retype-backed RAM Memory cap (the "seed-tail"), so init and
 /// memmgr operate on virgin caps with zero behavioural change in their
 /// front-split allocators.
@@ -535,16 +535,16 @@ const SEED_RESERVE_BYTES: u64 = 512 * 1024;
 /// BSS-static `MemoryObject` covering the seed RAM region.
 ///
 /// Phase 7 mints every initial cap identity (`MemoryObject` for every
-/// drained RAM block, `Mmio` / `Interrupt` / `IoPort` /
+/// drained RAM extent, `Mmio` / `Interrupt` / `IoPort` /
 /// `SchedControl` / `SbiControl` wrappers, plus firmware-table and
 /// boot-module `MemoryObject`s, plus init's ELF-segment `MemoryObject`s,
 /// plus the seed-tail `MemoryObject` exposing the rest of the largest
-/// drained block) from this seed via [`crate::cap::retype::boot_retype_body`].
+/// drained extent) from this seed via [`crate::cap::retype::boot_retype_body`].
 /// The bodies land inside the seed's `SEED_RESERVE_BYTES` reservation,
 /// debited from `available_bytes` like every other byte.
 ///
 /// The seed itself is **not** inserted into init's `CSpace`: it is pure
-/// kernel-internal storage. Userspace sees the largest drained block's
+/// kernel-internal storage. Userspace sees the largest drained extent's
 /// RAM via the seed-tail cap, which is virgin (`bump_offset = 0`) and
 /// behaves like every other RAM Memory cap.
 ///
@@ -612,7 +612,7 @@ pub(crate) fn seed_header_nn() -> NonNull<object::KernelObjectHeader>
 
 /// One-shot Phase-7 seed initializer. Sets the seed `MemoryObject`'s runtime
 /// fields (covering the front [`SEED_RESERVE_BYTES`] of the largest
-/// drained block) and bumps the refcount once for the kernel pin. Caller
+/// drained extent) and bumps the refcount once for the kernel pin. Caller
 /// must invoke before any [`crate::cap::retype::boot_retype_body`] against
 /// the seed.
 ///
@@ -634,8 +634,8 @@ unsafe fn install_seed_memory(base: u64)
     }
 }
 
-/// Drain results: per-RAM-block (physical base, size in bytes). The seed
-/// block contributes only its post-reserve tail; every other block its
+/// Drain results: per-RAM-extent (physical base, size in bytes). The seed
+/// extent contributes only its post-reserve tail; every other extent its
 /// full size. `populate_cspace` mints one Memory cap per entry.
 ///
 /// Production path populates this from the buddy drain via
@@ -643,18 +643,17 @@ unsafe fn install_seed_memory(base: u64)
 /// `populate_cspace`'s test-only branch mints from `mmap` directly.
 pub(crate) type RamBlock = (u64, u64);
 
-/// Maximum number of buddy blocks `drain_and_install_seed` collects. Each
-/// order can have at most `POOL_SIZE` entries; in practice far fewer.
+/// Maximum number of coalesced RAM extents `drain_and_install_seed` collects.
+/// The buddy drains into maximal contiguous extents, so the count follows the
+/// fragmentation of free RAM at Phase 7 (usable memory-map ranges, the holes
+/// the boot payload and the kernel's pre-drain allocations leave), not the
+/// amount of RAM. A drain that yields more is fatal and names the count.
 #[cfg(not(test))]
 pub(crate) const MAX_DRAIN_BLOCKS: usize = 4096;
 
-/// Backing storage for the buddy drain in [`drain_and_install_seed`] and
-/// the per-block (base, size) results consumed by [`populate_cspace`].
-/// Lives in BSS so Phase 7 allocates nothing for it. Cost:
-/// 4096 × 16 B (`RamBlock`) + 4096 × 16 B (`(u64, usize)` order tuple) ≈ 128 KiB.
-#[cfg(not(test))]
-static mut DRAIN_ORDER_BUF: [(u64, usize); MAX_DRAIN_BLOCKS] = [(0u64, 0usize); MAX_DRAIN_BLOCKS];
-
+/// Backing storage for the coalesced (base, size) extents the buddy drain in
+/// [`drain_and_install_seed`] writes and [`populate_cspace`] consumes. Lives
+/// in BSS so Phase 7 allocates nothing for it: 4096 × 16 B = 64 KiB.
 #[cfg(not(test))]
 static mut DRAIN_RAM_BLOCKS: [RamBlock; MAX_DRAIN_BLOCKS] = [(0u64, 0u64); MAX_DRAIN_BLOCKS];
 
@@ -774,11 +773,12 @@ pub(crate) fn init_stack_phys(i: usize) -> u64
     phys
 }
 
-/// Drain user-cap RAM from the buddy and install [`SEED_MEMORY`] over the
-/// largest drained block, reserving its first [`SEED_RESERVE_BYTES`] for
-/// kernel-internal cap-identity storage. Zeroes every user-exposed extent
-/// (each drained block, and the seed block's tail past the reserve) through the
-/// direct map, and returns the per-block (base, size) records ready for
+/// Drain user-cap RAM from the buddy as coalesced extents and install
+/// [`SEED_MEMORY`] at the base of the largest, reserving its first
+/// [`SEED_RESERVE_BYTES`] for kernel-internal cap-identity storage. Zeroes
+/// every user-exposed extent (each drained extent, and the seed extent's tail
+/// past the reserve) through the direct map, which also clears the buddy's
+/// free-block links, and returns the (base, size) records ready for
 /// `populate_cspace` to mint Memory caps.
 ///
 /// Before draining, reserves init's Phase-9 backing (the `InitInfo` block and
@@ -802,10 +802,6 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
 
     debug_assert!(out.len() >= MAX_DRAIN_BLOCKS);
 
-    // SAFETY: single-threaded Phase 7; DRAIN_ORDER_BUF is exclusively
-    // used by this call.
-    let order_buf: &mut [(u64, usize); MAX_DRAIN_BLOCKS] =
-        unsafe { &mut *core::ptr::addr_of_mut!(DRAIN_ORDER_BUF) };
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     let reserve_pages = kernel_reserve_pages();
 
@@ -832,85 +828,88 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
         INIT_STACK_PAGES,
         SEED_RESERVE_BYTES / 1024,
     );
-    let block_count = crate::mm::with_frame_allocator(|alloc| {
-        let count = alloc.drain_for_usercaps(0, order_buf);
+    let drained = crate::mm::with_frame_allocator(|alloc| {
+        let drained = alloc.drain_coalesced(out);
         // The drain emptied the buddy; seal it. memmgr owns all dynamic RAM
         // from here. A later free into the buddy (a destroyed `owns_memory`
         // cap) is an accounting violation that the seal trips.
         alloc.seal();
-        count
+        drained
+    });
+    let extent_count = drained.unwrap_or_else(|overflow| {
+        crate::kprintln!(
+            "Phase 7: drain yielded {} RAM extents, MAX_DRAIN_BLOCKS is {}",
+            overflow.extents,
+            MAX_DRAIN_BLOCKS
+        );
+        crate::fatal("Phase 7: drained RAM extents exceed MAX_DRAIN_BLOCKS")
     });
 
-    if block_count == 0
+    if extent_count == 0
     {
-        crate::fatal("Phase 7: no drained RAM blocks to seed Memory caps");
+        crate::fatal("Phase 7: no drained RAM extents to seed Memory caps");
     }
 
-    // Largest block hosts the seed; anything else is exposed verbatim.
-    let (seed_idx, _) = order_buf[..block_count]
+    // The largest extent hosts the seed; every other extent is exposed
+    // verbatim.
+    let (seed_idx, &(seed_base, seed_extent_size)) = out[..extent_count]
         .iter()
         .enumerate()
-        .max_by_key(|&(_, &(_, order))| order)
-        .unwrap_or_else(|| crate::fatal("Phase 7: drain returned only zero-order blocks"));
-    let (seed_block_base, seed_block_order) = order_buf[seed_idx];
-    let seed_block_size = (BUDDY_PAGE_SIZE << seed_block_order) as u64;
-    if seed_block_size <= SEED_RESERVE_BYTES
+        .max_by_key(|&(_, &(_, size))| size)
+        .unwrap_or_else(|| crate::fatal("Phase 7: no drained RAM extents to seed Memory caps"));
+    if seed_extent_size <= SEED_RESERVE_BYTES
     {
-        crate::fatal("Phase 7: largest drained RAM block too small to host SEED_RESERVE_BYTES");
+        crate::fatal("Phase 7: largest drained RAM extent too small to host SEED_RESERVE_BYTES");
     }
 
     // SAFETY: first and only call; single-threaded Phase 7.
-    unsafe { install_seed_memory(seed_block_base) };
+    unsafe { install_seed_memory(seed_base) };
+    // Seed-tail: the front SEED_RESERVE_BYTES go to the SEED's pool
+    // (kernel-internal); the remainder is exposed as a virgin RAM Memory cap.
+    out[seed_idx] = (
+        seed_base + SEED_RESERVE_BYTES,
+        seed_extent_size - SEED_RESERVE_BYTES,
+    );
 
-    let mut drained_pages: usize = 0;
+    let mut drained_pages: u64 = SEED_RESERVE_BYTES / BUDDY_PAGE_SIZE as u64;
     let zero_start_us = crate::arch::current::timer::elapsed_us().unwrap_or(0);
-    for (i, &(addr, order)) in order_buf[..block_count].iter().enumerate()
+    // The seed reserve is zeroed too, so no free-block link or firmware
+    // leftover survives anywhere in the drained RAM.
+    // SAFETY: the reserve is the front of an extent just drained from the
+    // buddy, and nothing has been retyped from the seed yet; the direct map
+    // covers all RAM since Phase 3; single-threaded Phase 7.
+    unsafe {
+        core::ptr::write_bytes(
+            phys_to_virt(seed_base) as *mut u8,
+            0,
+            SEED_RESERVE_BYTES as usize,
+        );
+    }
+    for &(base, size) in &out[..extent_count]
     {
-        let block_size = (BUDDY_PAGE_SIZE << order) as u64;
-        drained_pages += 1usize << order;
-        let (base, size) = if i == seed_idx
-        {
-            // Seed-tail: front SEED_RESERVE_BYTES go to the SEED's pool
-            // (kernel-internal); the remainder is exposed as a virgin RAM
-            // Memory cap.
-            (
-                seed_block_base + SEED_RESERVE_BYTES,
-                seed_block_size - SEED_RESERVE_BYTES,
-            )
-        }
-        else
-        {
-            (addr, block_size)
-        };
+        drained_pages += size / BUDDY_PAGE_SIZE as u64;
         // Zero the user-exposed extent before it is minted: free RAM still
         // holds whatever firmware and the bootloader left in it, the UEFI
-        // stack with the slid kernel layout among it
-        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel state in
-        // donated memory).
-        // SAFETY: the extent is a free buddy block (or the seed block's tail)
-        // just drained, so nothing references it; the direct map covers all
-        // RAM since Phase 3; single-threaded Phase 7.
+        // stack with the slid kernel layout among it, and the buddy's
+        // free-block links (core/kernel/docs/cross-boundary-disclosure.md
+        // § Kernel state in donated memory).
+        // SAFETY: the extent is free RAM just drained from the buddy (or the
+        // seed extent's tail), so nothing references it; the direct map
+        // covers all RAM since Phase 3; single-threaded Phase 7.
         unsafe { core::ptr::write_bytes(phys_to_virt(base) as *mut u8, 0, size as usize) };
-        out[i] = (base, size);
     }
     let zero_us = crate::arch::current::timer::elapsed_us()
         .unwrap_or(0)
         .saturating_sub(zero_start_us);
 
-    // Coalesce physically-adjacent drained blocks into the fewest contiguous
-    // extents so the per-block Memory-cap / CapDescriptor fan-out tracks
-    // memory-map fragmentation, not total RAM. Without this the Phase-9
-    // InitInfo descriptor array overflows INIT_INFO_MAX_PAGES at large guest
-    // RAM — one descriptor per order-11 buddy block.
-    let coalesced = coalesce_ram_blocks(&mut out[..block_count]);
+    let coalesced = promote_largest_extent(&mut out[..extent_count]);
 
     crate::kprintln!(
-        "Phase 7: drained {} pages across {} blocks (zeroed in {} us), coalesced to {} \
-         contiguous regions; seed reserve {} KiB",
+        "Phase 7: drained {} pages as {} contiguous regions (zeroed in {} us); \
+         seed reserve {} KiB",
         drained_pages,
-        block_count,
-        zero_us,
         coalesced,
+        zero_us,
         SEED_RESERVE_BYTES / 1024,
     );
 
@@ -920,78 +919,32 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
     coalesced
 }
 
-/// Merge physically-adjacent drained RAM blocks into the fewest contiguous
-/// extents and promote the largest extent to index 0; returns the reduced
-/// count.
+/// Move the largest drained RAM extent to index 0 so `populate_cspace`
+/// assigns it to `memory_base`; returns `extents.len()`.
 ///
-/// Drained blocks are pairwise disjoint (each is a distinct popped buddy block;
-/// the seed tail is a sub-range of one block with its front pinned out), so
-/// after sorting by base, block `i` is contiguous with `i + 1` iff
-/// `base[i] + size[i] == base[i + 1]`. All bases and sizes are `PAGE_SIZE`
-/// multiples (buddy blocks are page-aligned; `SEED_RESERVE_BYTES` is a whole
-/// page count), so merged extents stay page-aligned and a [`MemoryObject`]
-/// tolerates the larger size (the seed-tail cap is already non-power-of-two).
-///
-/// The seed-tail entry's base sits above its pinned `SEED_RESERVE_BYTES`
-/// reserve, leaving a hole below it, so nothing merges *into* it from below —
-/// only upward.
-///
-/// The largest extent is then moved to index 0 so `populate_cspace` assigns it
-/// to `memory_base`. Sorting by base would otherwise make `memory_base` the
-/// lowest-address (possibly small) fragment; the pre-coalesce drain emitted the
-/// highest-order block first, and ktest (`frame_pool`, `fund_boot_aspace_pt`,
-/// and the retype-heavy stress tests) bump-allocates every kernel object it
-/// creates from `memory_base`, so it must stay the large cap. Consumers that
-/// take the whole range (init, memmgr) read each cap's size/base individually
-/// and do not depend on the order.
-fn coalesce_ram_blocks(blocks: &mut [RamBlock]) -> usize
+/// The buddy drain (`BuddyAllocator::drain_coalesced`) returns maximal
+/// contiguous extents in address order, so the lowest-address (possibly
+/// small) fragment would otherwise become `memory_base`. ktest (`frame_pool`,
+/// `fund_boot_aspace_pt`, and the retype-heavy stress tests) bump-allocates
+/// every kernel object it creates from `memory_base`, so it must be the large
+/// cap. Strict `>` keeps the earliest extent on ties. Consumers that take the
+/// whole range (init, memmgr) read each cap's size/base individually and do
+/// not depend on the order.
+fn promote_largest_extent(extents: &mut [RamBlock]) -> usize
 {
-    if blocks.len() <= 1
-    {
-        return blocks.len();
-    }
-
-    // The drain pops order-by-order (high→low), so `blocks` is not
-    // address-sorted; sort before the single linear merge pass.
-    blocks.sort_unstable_by_key(|&(base, _)| base);
-
-    // `w` is the write cursor (last kept run); `r` scans the remainder.
-    let mut w = 0usize;
-    for r in 1..blocks.len()
-    {
-        let (cur_base, cur_size) = blocks[w];
-        let (next_base, next_size) = blocks[r];
-        debug_assert!(
-            cur_base + cur_size <= next_base,
-            "drained blocks must be disjoint and sorted"
-        );
-        if cur_base + cur_size == next_base
-        {
-            blocks[w].1 = cur_size + next_size;
-        }
-        else
-        {
-            w += 1;
-            blocks[w] = (next_base, next_size);
-        }
-    }
-
-    let count = w + 1;
-
-    // Promote the largest contiguous extent to index 0 → `memory_base`. Strict
-    // `>` keeps the earliest extent on ties, so the address-sorted order is
-    // preserved unless a strictly larger extent exists.
     let mut largest = 0usize;
-    for i in 1..count
+    for i in 1..extents.len()
     {
-        if blocks[i].1 > blocks[largest].1
+        if extents[i].1 > extents[largest].1
         {
             largest = i;
         }
     }
-    blocks.swap(0, largest);
-
-    count
+    if !extents.is_empty()
+    {
+        extents.swap(0, largest);
+    }
+    extents.len()
 }
 
 /// Boot-time helper: retype an `init_pages`-page slab from `seed` and
@@ -1409,7 +1362,7 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
     };
 
     // ── Production path ───────────────────────────────────────────────────
-    // 1. Drain the buddy + install SEED_MEMORY (largest block hosts the seed
+    // 1. Drain the buddy + install SEED_MEMORY (largest extent hosts the seed
     //    reserve; remainder exposed as the seed-tail cap).
     // 2. Boot-retype the root CSpace from SEED into a typed-memory slab.
     // 3. populate_cspace fills the root with Memory caps (from the drained
@@ -1530,10 +1483,10 @@ fn populate_cspace(
     {
         let seed_anc = seed_header_nn();
 
-        // Mint one Memory cap per drained RAM block. `ram_blocks` is the
+        // Mint one Memory cap per drained RAM extent. `ram_blocks` is the
         // already-resolved (base, size) list from `drain_and_install_seed`:
-        // the seed block contributes only its post-reserve tail; every
-        // other block contributes its full size. SEED itself is never
+        // the seed extent contributes only its post-reserve tail; every
+        // other extent contributes its full size. SEED itself is never
         // inserted into the CSpace — it's pure kernel-internal storage.
         for &(cap_base, cap_size) in ram_blocks
         {
@@ -1865,47 +1818,38 @@ fn populate_cspace(
         0
     };
 
-    // RO Memory cap covering the DTB blob. The kernel read the totalsize
-    // header in `mm::init::collect_exclusions` to keep these pages out of
-    // the buddy pool; repeat the read here to size the cap.
-    let dtb_memory_slot: u32 = if info.device_tree != 0
+    // RO Memory cap covering the DTB blob, over the page-aligned extent that
+    // `mm::init::populate_buddy` sized from the FDT header and kept out of
+    // the buddy.
+    let dtb_memory_slot: u32 = if let Some((dtb_base, dtb_size)) = crate::mm::init::dtb_extent()
     {
-        let dtb_size = read_dtb_totalsize(info.device_tree).unwrap_or(0);
-        if dtb_size != 0
-        {
-            let rounded = (dtb_size + 0xFFF) & !0xFFF;
-            let ptr = mint_phase7_body(MemoryObject {
-                header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
-                base: info.device_tree & !0xFFF,
-                size: rounded,
-                // Firmware table: not retypable; cap minted without RETYPE.
-                available_bytes: core::sync::atomic::AtomicU64::new(0),
-                owns_memory: core::sync::atomic::AtomicBool::new(false),
-                allocator: crate::cap::retype::RetypeAllocator::new_inline(),
-                lock: core::sync::atomic::AtomicU32::new(0),
-            });
-            let slot = insert_or_fatal(
-                cspace,
-                MemRights::MAP,
-                ptr,
-                "Phase 7: cannot allocate Memory capability for DTB blob",
-            );
-            push_descriptor(
-                &mut desc_count,
-                CapDescriptor {
-                    slot,
-                    cap_type: CapType::Memory,
-                    pad: [0; 3],
-                    aux0: info.device_tree & !0xFFF,
-                    aux1: rounded,
-                },
-            );
-            slot
-        }
-        else
-        {
-            0
-        }
+        let ptr = mint_phase7_body(MemoryObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
+            base: dtb_base,
+            size: dtb_size,
+            // Firmware table: not retypable; cap minted without RETYPE.
+            available_bytes: core::sync::atomic::AtomicU64::new(0),
+            owns_memory: core::sync::atomic::AtomicBool::new(false),
+            allocator: crate::cap::retype::RetypeAllocator::new_inline(),
+            lock: core::sync::atomic::AtomicU32::new(0),
+        });
+        let slot = insert_or_fatal(
+            cspace,
+            MemRights::MAP,
+            ptr,
+            "Phase 7: cannot allocate Memory capability for DTB blob",
+        );
+        push_descriptor(
+            &mut desc_count,
+            CapDescriptor {
+                slot,
+                cap_type: CapType::Memory,
+                pad: [0; 3],
+                aux0: dtb_base,
+                aux1: dtb_size,
+            },
+        );
+        slot
     }
     else
     {
@@ -1991,36 +1935,6 @@ fn populate_cspace(
         module_names: [init_protocol::INIT_MODULE_NAME_EMPTY;
             init_protocol::INIT_MAX_NAMED_MODULES],
     }
-}
-
-/// Read the `totalsize` field of a flattened device tree blob.
-///
-/// Mirror of `crate::mm::init::read_dtb_totalsize`, duplicated here because
-/// the buddy-init and cap-mint phases both need to bound DTB page accesses
-/// without creating a public dep between the two modules.
-fn read_dtb_totalsize(phys: u64) -> Option<u64>
-{
-    const FDT_MAGIC: u32 = 0xd00d_feed;
-    const DTB_MAX_SIZE: u64 = 64 * 1024;
-
-    // `phys` is in the direct physical map (active since Phase 3). The
-    // FDT spec places magic + totalsize in the first 8 bytes of the blob.
-    let base = phys_to_virt(phys) as *const u8;
-    // SAFETY: direct physical map; first 4 bytes are the FDT magic field.
-    let magic_bytes = unsafe { core::ptr::read_volatile(base.cast::<[u8; 4]>()) };
-    let magic = u32::from_be_bytes(magic_bytes);
-    if magic != FDT_MAGIC
-    {
-        return None;
-    }
-    // SAFETY: direct physical map; bytes 4..8 are the totalsize field.
-    let size_bytes = unsafe { core::ptr::read_volatile(base.add(4).cast::<[u8; 4]>()) };
-    let size = u64::from(u32::from_be_bytes(size_bytes));
-    if size == 0 || size > DTB_MAX_SIZE
-    {
-        return None;
-    }
-    Some(size)
 }
 
 /// Mint `Memory` capabilities for boot modules into the root `CSpace`.
@@ -2664,14 +2578,6 @@ mod tests
 {
     use super::*;
 
-    /// Coalesce a fixed array and return `(count, kept_runs)`.
-    fn coalesce(mut blocks: Vec<RamBlock>) -> (usize, Vec<RamBlock>)
-    {
-        let count = coalesce_ram_blocks(&mut blocks);
-        blocks.truncate(count);
-        (count, blocks)
-    }
-
     // ── split_around_span (reclaim scrub) ─────────────────────────────────────
 
     #[test]
@@ -2702,83 +2608,18 @@ mod tests
     }
 
     #[test]
-    fn empty_yields_zero()
-    {
-        assert_eq!(coalesce(vec![]), (0, vec![]));
-    }
-
-    #[test]
-    fn single_block_unchanged()
-    {
-        assert_eq!(
-            coalesce(vec![(0x1000, 0x1000)]),
-            (1, vec![(0x1000, 0x1000)])
-        );
-    }
-
-    #[test]
-    fn adjacent_blocks_merge()
-    {
-        assert_eq!(
-            coalesce(vec![(0x1000, 0x1000), (0x2000, 0x1000)]),
-            (1, vec![(0x1000, 0x2000)])
-        );
-    }
-
-    #[test]
-    fn gap_keeps_blocks_separate()
-    {
-        // 0x1000..0x2000 then a hole, 0x3000..0x4000.
-        assert_eq!(
-            coalesce(vec![(0x1000, 0x1000), (0x3000, 0x1000)]),
-            (2, vec![(0x1000, 0x1000), (0x3000, 0x1000)])
-        );
-    }
-
-    #[test]
-    fn unsorted_input_is_sorted_then_merged()
-    {
-        // Three adjacent extents supplied out of address order, as the
-        // order-by-order drain emits them.
-        assert_eq!(
-            coalesce(vec![(0x3000, 0x1000), (0x1000, 0x1000), (0x2000, 0x1000)]),
-            (1, vec![(0x1000, 0x3000)])
-        );
-    }
-
-    #[test]
-    fn seed_tail_hole_blocks_downward_merge_allows_upward()
-    {
-        // Models the seed block: its front SEED_RESERVE_BYTES is pinned out,
-        // so the seed-tail base sits a reserve above a block that ends at the
-        // seed block's true base — that hole must prevent a downward merge,
-        // while a block starting at the seed-tail's end merges upward.
-        let reserve = 0x1000u64;
-        let seed_block_base = 0x2000u64;
-        let block_below = (0x0u64, 0x2000u64); // ends exactly at seed_block_base
-        let seed_tail = (seed_block_base + reserve, 0x1000u64); // 0x3000..0x4000
-        let block_above = (0x4000u64, 0x1000u64); // starts at seed-tail end
-        assert_eq!(
-            coalesce(vec![block_above, block_below, seed_tail]),
-            (2, vec![(0x0, 0x2000), (0x3000, 0x2000)])
-        );
-    }
-
-    #[test]
     fn largest_extent_promoted_to_front()
     {
-        // A strictly larger extent (formed by merging 0x8000..0xb000) must land
-        // at index 0 so it becomes `memory_base`, even though a smaller
-        // lower-address fragment sorts ahead of it.
+        // A strictly larger extent must land at index 0 so it becomes
+        // `memory_base`, even though a smaller lower-address extent sorts
+        // ahead of it; the earliest of equal extents stays put.
+        let mut extents = [(0x1000, 0x1000), (0x8000, 0x3000), (0x20000, 0x3000)];
+        assert_eq!(promote_largest_extent(&mut extents), 3);
         assert_eq!(
-            coalesce(vec![
-                (0x1000, 0x1000),
-                (0x8000, 0x1000),
-                (0x9000, 0x1000),
-                (0xa000, 0x1000),
-            ]),
-            (2, vec![(0x8000, 0x3000), (0x1000, 0x1000)])
+            extents,
+            [(0x8000, 0x3000), (0x1000, 0x1000), (0x20000, 0x3000)]
         );
+        assert_eq!(promote_largest_extent(&mut []), 0);
     }
 
     /// `CSpaceId` reserved for the recycle test below. `CSPACE_REGISTRY` is a

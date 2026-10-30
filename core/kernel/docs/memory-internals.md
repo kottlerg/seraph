@@ -29,32 +29,33 @@ The buddy allocator manages physical memory as a set of power-of-two-sized block
 The implementation supports orders 0 through `MAX_ORDER` (inclusive), where an
 order-`n` block contains 2^n contiguous 4 KiB pages.
 
-Free-block metadata lives in fixed-size static arrays inside the allocator
-struct, not in the free pages themselves: the bootloader identity-maps only
-specific regions (`BootInfo`, modules, stack, memory map buffer; see
-[core/boot/docs/page-tables.md](../../boot/docs/page-tables.md) § What Gets Mapped), so
-free RAM is not generally writable when the allocator initialises in Phase 2.
+Free-block links are intrusive: the first 16 bytes of every free block hold a
+`FreeHeader` naming the next free block of the same order and the block's own order. The
+allocator reaches a header through its `PhysWindow`, the direct physical map in the kernel, so
+it is populated only once that map is live: Phase 2 records the surviving free ranges, and
+`mm::init::populate_buddy` adds them as the first act of Phase 3
+([initialization.md](initialization.md) § Phase 3: Kernel Page Tables). The bootloader's
+tables do not map free RAM ([core/boot/docs/page-tables.md](../../boot/docs/page-tables.md)
+§ What Gets Mapped), so no earlier population is possible; an allocation before population is
+a boot-order defect and halts the kernel.
 
 ```rust
-pub struct BuddyAllocator
+pub struct BuddyAllocator<W: PhysWindow = DirectMap>
 {
-    /// Physical block address stored at each pool slot (slot 0 unused).
-    addrs: [u64; POOL_SIZE + 1],
-    /// Next slot index in the same list for each pool slot (0 = NONE).
-    nexts: [u16; POOL_SIZE + 1],
-    /// Head slot index for each order's free list (0 = empty list).
-    free_lists: [u16; MAX_ORDER + 1],
-    /// Head of the unused-slot pool chain.
-    pool_head: u16,
-    // ... the pool-init flag, page counters, and the Phase-7 seal flag
+    /// Head block address for each order's free list (0 = empty list).
+    free_lists: [u64; MAX_ORDER + 1],
+    // ... the page counters, the populated and Phase-7 seal flags, and the window
 }
 ```
 
-Each order's free list is a singly-linked list of pool slot indices; nodes are
-recycled through a free-node chain. `POOL_SIZE` (4096) bounds the number of
-simultaneously tracked free blocks across all orders — ~32 GiB of RAM when
-blocks sit at `MAX_ORDER`. The struct is all-zero-constructible and lives in
-BSS.
+Physical frame 0 never enters the allocator, so address 0 ends a list. No metadata lives
+outside the free pages: the number of free blocks, and so the RAM the allocator can manage, has
+no bound of its own, and the allocator costs no memory per GiB. The struct is
+all-zero-constructible and lives in BSS. `alloc` zeroes the header bytes of the block it
+returns, so no free-list link survives into an allocated block; the Phase 7 drain hands blocks
+out with their headers in place, and its caller zeroes every drained extent before minting it
+([cross-boundary-disclosure.md](cross-boundary-disclosure.md) § Kernel state in donated
+memory).
 
 `MAX_ORDER` is 11 (largest single allocation: 2048 pages = 8 MiB). It is sized
 so the largest per-CPU boot slab at `boot_protocol::MAX_CPUS` — `AP_IST_STACKS`,
@@ -86,6 +87,12 @@ MAX_ORDER times. Each merge removes the buddy from its order's free list by a li
 of that list (`remove_block`), so a free costs up to MAX_ORDER levels, each linear in that
 order's free-list length. Coalescing eliminates long-term fragmentation.
 
+**Drain:** `drain_coalesced` empties every free list into one chain, sorts it by address with
+a bottom-up merge sort over the intrusive links (no buffer), and writes the free memory as
+maximal contiguous `(base, size)` extents. The extent count therefore follows the
+fragmentation of free RAM, not its amount; an output buffer too small for it is reported with
+the full count.
+
 ### Thread Safety
 
 The allocator is protected by a single spinlock (`FRAME_ALLOC_LOCK`, taken by
@@ -107,7 +114,7 @@ the object's reference count reaches zero, whether a capability (deleted, or rem
 revoke) or a kernel-internal owner releases the last reference (see
 [capability-internals.md](capability-internals.md) § Kernel Object Reference Counting). The
 kernel's own objects are retyped from the SEED reserve, pinned at the Phase 7 handoff from
-the front of the largest block drained from the buddy allocator
+the front of the largest extent drained from the buddy allocator
 ([initialization.md](initialization.md) § Phase 7: Capability System); the wrapper bodies of
 split-derived caps (the `sys_memory_split` tail and the MMIO, IRQ, I/O-port and SchedControl
 split children), the bodies of Mmio and IoPort copies and derivations

@@ -221,14 +221,16 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     kprintln!("baseline ok");
 
     // ── Phase 2: physical memory ────────────────────────────────────────────
-    // Parse the memory map, subtract reserved regions, populate the buddy
-    // allocator. Halts with a FATAL message if no usable memory is found.
+    // Parse the memory map and subtract reserved regions, keeping the free
+    // ranges; the buddy is populated from them as the first act of Phase 3,
+    // once the direct map can reach the free pages its links live in. Halts
+    // with a FATAL message if no usable memory is found.
     //
     // SAFETY: single-threaded boot phase; FRAME_ALLOCATOR static mut not
     // accessed elsewhere; mutable borrow is exclusive.
     let allocator = unsafe { &mut *core::ptr::addr_of_mut!(mm::FRAME_ALLOCATOR) };
-    kprintln!("Phase 2: Memory Map Parsing and Buddy Allocator");
-    mm::init::init_physical_memory(info, allocator);
+    kprintln!("Phase 2: Memory Map Parsing");
+    mm::init::init_physical_memory(info);
     mm::init::print_memory_map(info);
 
     // ── Phase 3: kernel page tables ─────────────────────────────────────────
@@ -300,7 +302,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 /// the kernel page tables and the direct physical map are active, and the
 /// boot stack has been rebased onto them. The `BootInfo`-derived arguments
 /// were copied or validated from that `BootInfo` before Phase 3; `allocator`
-/// is the live frame allocator initialised in Phase 2. Called exactly once,
+/// is the frame allocator, still empty, whose Phase-2 free ranges this
+/// function adds before anything allocates. Called exactly once,
 /// from the boot thread, and never returns.
 // too_many_arguments: the boot state read out of BootInfo before Phase 3 must
 // cross the `#[inline(never)]` boundary as explicit arguments.
@@ -361,6 +364,17 @@ unsafe fn kernel_entry_post_rebase(
     // userspace-visible framebuffer; report_kaslr already logged it on the
     // serial-only path at Phase 1.
     kprintln!("page tables active");
+
+    // Populate the buddy allocator from the Phase-2 free ranges, less the
+    // device tree blob; nothing allocates before this
+    // (core/kernel/docs/initialization.md § Phase 3).
+    // SAFETY: the single boot thread, once, after Phase 2 and with the direct
+    // map over all RAM active; `allocator` is empty.
+    unsafe { mm::init::populate_buddy(allocator) };
+    kprintln!(
+        "buddy allocator: {} free pages",
+        allocator.free_page_count()
+    );
 
     // ── Phase 4: typed-memory cap surface ────────────────────────────────────
     // The kernel does not run a `GlobalAlloc`; every kernel-object body is

@@ -768,8 +768,10 @@ pub unsafe fn mem_unmap(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(
 
 /// Like [`mem_unmap`], but additionally reclaims every intermediate page table
 /// the cleared span leaves empty back to `aspace_cap`'s page-table growth pool
-/// (crediting `pt_growth_budget_bytes`), with a single coarse TLB +
-/// paging-structure-cache shootdown for the whole teardown.
+/// (crediting `pt_growth_budget_bytes`), with a single coarse TLB and
+/// paging-structure-cache shootdown closing the teardown, plus one span
+/// invalidation each time the cleared frames overflow the kernel's frame-map
+/// release batch.
 ///
 /// Intended for region teardown (memmgr `UNREGISTER_REGION`): pass the whole
 /// region span in one call so a wholly-covered intermediate table is reclaimed.

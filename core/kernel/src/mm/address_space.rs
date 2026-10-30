@@ -33,13 +33,14 @@
 //! rewrites ([`MapOutcome`](crate::mm::paging::MapOutcome)). Region teardown
 //! ([`unmap_region_pooled`](AddressSpace::unmap_region_pooled)) is the exception:
 //! it holds `pt_lock` across its one coarse shootdown, plus one span
-//! invalidation under `pt_lock` each time the cleared frames overflow the frame-map release batch,
-//! so that no CPU can reuse a just-freed page-table frame before every TLB and
-//! paging-structure cache is clean. The protocol and the classification are defined in
-//! `core/kernel/docs/memory-internals.md` § SMP TLB Shootdown. The only lock that
-//! nests under `pt_lock` is the PT-frame source: the wrapper's pool lock on the
-//! pooled path, the kernel page-table pool lock on the kernel-direct path. The
-//! local flush runs unconditionally regardless of class.
+//! invalidation under `pt_lock` each time the cleared frames overflow the
+//! frame-map release batch, so that no CPU can reuse a just-freed page-table
+//! frame before every TLB and paging-structure cache is clean. The protocol and
+//! the classification are defined in `core/kernel/docs/memory-internals.md`
+//! § SMP TLB Shootdown. The only lock that nests under `pt_lock` is the
+//! PT-frame source: the wrapper's pool lock on the pooled path, the kernel
+//! page-table pool lock on the kernel-direct path. The local flush runs
+//! unconditionally regardless of class.
 //!
 //! Fresh/Widen safety rests on the spurious-fault retry (Widen) and on x86-64 not
 //! caching not-present entries (Fresh) — not on the context-switch TLB flush — so

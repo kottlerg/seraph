@@ -10,6 +10,7 @@
 //! Each stress test uses [`run_integration_test!`](crate::run_integration_test)
 //! for logging and PASS/FAIL counting.
 
+mod affinity_swap_handoff;
 mod cap_delete_reply_wake;
 mod cap_delete_running;
 mod cap_revoke_under_use;
@@ -171,6 +172,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "stress::double_enqueue_storm",
         double_enqueue_storm::run(ctx)
+    );
+    run_integration_test!(
+        "stress::affinity_swap_handoff",
+        affinity_swap_handoff::run(ctx)
     );
     run_integration_test!(
         "stress::event_try_recv_post_race",

@@ -11,10 +11,11 @@
 //!
 //! `IoLayout` owns the driver's permanent 1-page DMA buffer. The request
 //! header (offset 0, 16 bytes) and status byte (offset 1024, 1 byte) live
-//! there permanently. The 512-byte data segment is supplied per-request by
-//! the caller as a Memory cap; [`IoLayout::read_chain`] /
-//! [`IoLayout::write_chain`] parameterise the data-segment physical
-//! address. The driver's own page never holds bulk data.
+//! there permanently. The data segment, `count * 512` bytes for a request
+//! of `count` sectors, is supplied per-request by the caller as a Memory
+//! cap; [`IoLayout::read_chain`] / [`IoLayout::write_chain`] parameterise
+//! the data segment's physical address and length. The driver's own page
+//! never holds bulk data.
 
 use std::time::{Duration, Instant};
 
@@ -49,8 +50,10 @@ pub struct VirtioBlkReqHeader
 /// Physical/virtual layout for the driver's permanent DMA page.
 ///
 /// Hosts the request header (offset 0, 16 bytes) and status byte (offset
-/// 1024, 1 byte). The 512-byte data segment is supplied per-request via
-/// [`read_chain`](IoLayout::read_chain).
+/// 1024, 1 byte). The data segment, `count * 512` bytes for a request of
+/// `count` sectors, is supplied per-request (address and length) via
+/// [`read_chain`](IoLayout::read_chain) and
+/// [`write_chain`](IoLayout::write_chain).
 pub struct IoLayout
 {
     /// Virtual address of the mapped page.

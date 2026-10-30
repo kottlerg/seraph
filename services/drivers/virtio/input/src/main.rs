@@ -473,7 +473,13 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut InputRuntime) -> !
         };
         guard.on_success();
 
-        if msg.label == input_labels::INPUT_READ_EVENTS
+        if !virtio_input::authorized(msg.label, msg.badge)
+        {
+            let reply = IpcMessage::new(input_errors::UNAUTHORIZED);
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        }
+        else if msg.label == input_labels::INPUT_READ_EVENTS
         {
             handle_read_events(ipc_buf, rt);
         }

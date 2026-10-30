@@ -619,7 +619,7 @@ Every entry here is `correct as is`; none is tracked. services/netd has no code.
 
 ### devmgr
 
-Tracked by [#646](https://github.com/kottlerg/seraph/issues/646).
+Tracked by [#661](https://github.com/kottlerg/seraph/issues/661).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -637,7 +637,7 @@ Tracked by [#646](https://github.com/kottlerg/seraph/issues/646).
 | `device_badge` | `services/devmgr/src/main.rs` | `u64` | provably unreachable | none | correct as is | None |
 | `IrqRangeAllocator.ranges` (`RANGE_END_BOUND`) | `services/devmgr/src/main.rs` | growable, 2^32 lines | ABI width (`SYS_IRQ_SPLIT`'s `u32` line) | 24 B per span | correct as is | None; lines below and above each carve stay held |
 | virtio-blk and virtio-input instances | `services/devmgr/src/main.rs` | every device; registry ordinal in `data[1]` | provably unreachable (`u64` ordinal) | one driver per device | correct as is | None |
-| One BAR per `VirtIO` driver (`virtio_second_bar`) | `services/devmgr/firmware/src/scan.rs` | 1 | encoding artefact (the driver bootstrap round carries one BAR) | none | needs a design | A device whose registers span two BARs is refused with a log; multi-BAR delivery is the multi-BAR follow-up |
+| One BAR per `VirtIO` driver (`virtio_second_bar`) | `services/devmgr/firmware/src/scan.rs` | 1 | encoding artefact (the driver bootstrap round carries one BAR) | none | needs a design | A device whose registers span two BARs is refused with a log; multi-BAR delivery is #661 |
 | `mcfg_ecams` | `services/devmgr/firmware/src/acpi.rs` | every entry | firmware spec (MCFG length) | none | correct as is | None |
 | `find_pci_ecams` | `services/devmgr/firmware/src/dtb.rs` | every node | firmware spec (structure block) | 24 B per window | correct as is | None |
 | firmware dtb `MAX_DEPTH` | `services/devmgr/firmware/src/dtb.rs` | 16 | provably unreachable on real trees (under 8 deep) | 256 B stack | correct as is | None |

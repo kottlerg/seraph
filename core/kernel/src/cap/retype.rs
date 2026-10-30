@@ -439,9 +439,11 @@ unsafe fn set_page_link(alloc: &RetypeAllocator, memory: &MemoryObject, prev: &P
     match *prev
     {
         PagePrev::Head => alloc.page_free_head.store(value, Ordering::Release),
-        // SAFETY: caller contract; the next-pointer is at offset + 8.
         PagePrev::InCap(prev_off) =>
-        unsafe { write_u64_at(memory.base, prev_off + 8, value) },
+        {
+            // SAFETY: caller contract; the next-pointer is at offset + 8.
+            unsafe { write_u64_at(memory.base, prev_off + 8, value) };
+        }
     }
 }
 

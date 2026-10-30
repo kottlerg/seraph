@@ -15,16 +15,20 @@
 //!   `Notification`, `CSpace`).
 //! - Creation-mint masks of every userspace-creatable type against the ABI's
 //!   per-type rights constants (`creation_masks_match_abi`).
-//! - `CAP_INFO_MEMORY_*` against a Memory cap.
+//! - `CAP_INFO_MEMORY_*` against a Memory cap, including `CAP_INFO_MEMORY_MAPPINGS`
+//!   following a frame's mappings into two address spaces and out again.
 //! - `CAP_INFO_CSPACE_*` against a `CSpace` cap.
 //! - Negative paths: null slot index (`InvalidCapability`) and tag-mismatched
 //!   selector (`InvalidArgument`).
 
-use syscall::{cap_create_cspace, cap_create_notification, cap_delete, cap_info};
+use syscall::{
+    MAP_WRITABLE, cap_create_aspace, cap_create_cspace, cap_create_notification, cap_delete,
+    cap_info, mem_map, mem_unmap,
+};
 use syscall_abi::{
     CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED,
-    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_SIZE,
-    CAP_INFO_TAG_RIGHTS, SyscallError,
+    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_MAPPINGS,
+    CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, SyscallError,
 };
 
 use crate::{TestContext, TestResult};
@@ -122,6 +126,73 @@ pub fn tag_rights_notification(ctx: &TestContext) -> TestResult
 }
 
 // ── Memory-specific fields ───────────────────────────────────────────────────
+
+/// Scratch VA (crate docs § Scratch VAs) for the mappings-count probe, in
+/// ktest's own address space and in the second one it creates.
+const MAPPINGS_VA: u64 = 0x1_5D00_0000;
+
+/// `CAP_INFO_MEMORY_MAPPINGS` counts the live user leaves naming a frame:
+/// none before a map, one per address space that maps it, one fewer after an
+/// unmap, and none once the last mapping's address space is destroyed. A
+/// region past `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` is refused.
+pub fn memory_mappings(ctx: &TestContext) -> TestResult
+{
+    let memory_cap =
+        crate::frame_pool::alloc().ok_or("cap_info::memory_mappings: frame pool exhausted")?;
+    let result = mappings_probe(ctx, memory_cap);
+    // SAFETY: the probe unmapped the cap from ktest's address space and
+    // destroyed the other one before returning, success or not.
+    unsafe { crate::frame_pool::free(memory_cap) };
+    result?;
+
+    let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
+        .map_err(|_| "cap_info::memory_mappings: cap_info(memory_base, SIZE) failed")?;
+    if size <= CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES * 0x1000
+    {
+        return Err("cap_info::memory_mappings: memory_base is too small to test the bound");
+    }
+    match cap_info(ctx.memory_base, CAP_INFO_MEMORY_MAPPINGS)
+    {
+        Err(e) if e == SyscallError::InvalidArgument as i64 => Ok(()),
+        _ => Err("cap_info::memory_mappings: an over-bound region was not refused"),
+    }
+}
+
+/// Map `memory_cap` into ktest's address space and a fresh one, checking the
+/// count after each step. Leaves the cap unmapped everywhere.
+fn mappings_probe(ctx: &TestContext, memory_cap: u32) -> TestResult
+{
+    let count = || {
+        cap_info(memory_cap, CAP_INFO_MEMORY_MAPPINGS)
+            .map_err(|_| "cap_info::memory_mappings: cap_info(MAPPINGS) failed")
+    };
+    if count()? != 0
+    {
+        return Err("cap_info::memory_mappings: an unmapped frame reported mappings");
+    }
+    let other = cap_create_aspace(ctx.memory_base, 0, 8)
+        .map_err(|_| "cap_info::memory_mappings: cap_create_aspace failed")?;
+    // SAFETY: `MAPPINGS_VA` is a scratch VA (crate docs § Scratch VAs) of
+    // ktest's address space.
+    let own = unsafe { mem_map(memory_cap, ctx.aspace_cap, MAPPINGS_VA, 0, 1, MAP_WRITABLE) };
+    // SAFETY: `other` is an address space this test created, which runs
+    // nothing of ktest's.
+    let theirs = unsafe { mem_map(memory_cap, other, MAPPINGS_VA, 0, 1, MAP_WRITABLE) };
+    let mapped = own.and(theirs);
+    let both = count();
+    // SAFETY: as for the map above.
+    let unmapped = unsafe { mem_unmap(ctx.aspace_cap, MAPPINGS_VA, 1) };
+    let one = count();
+    cap_delete(other).map_err(|_| "cap_info::memory_mappings: cap_delete(aspace) failed")?;
+    let none = count();
+    mapped.map_err(|_| "cap_info::memory_mappings: mem_map failed")?;
+    unmapped.map_err(|_| "cap_info::memory_mappings: mem_unmap failed")?;
+    if both? != 2 || one? != 1 || none? != 0
+    {
+        return Err("cap_info::memory_mappings: the count did not follow the mappings (2, 1, 0)");
+    }
+    Ok(())
+}
 
 /// Memory fields are consistent: `size > 0`, `available <= size`, `has_retype`
 /// is `0` or `1`.

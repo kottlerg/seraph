@@ -330,6 +330,23 @@ pub const CAP_INFO_TLB_ELIDED: u64 = 10;
 /// pool-exhaustion fallback). Pairs with [`CAP_INFO_TLB_ELIDED`].
 pub const CAP_INFO_TLB_PERFORMED: u64 = 11;
 
+/// `Memory` only — how many user leaf mappings, across every address space,
+/// name a frame of the memory region.
+///
+/// Returns the sum, over the region's frames, of each frame's count of user
+/// page-table leaves that name it (or that a CPU may still hold in its TLB).
+/// A frame's count falls only once every CPU has dropped the leaf, so a value
+/// equal to the mappings the caller itself holds means no other address space
+/// can reach the region. A region larger than
+/// [`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES`] pages, or a non-Memory slot, returns
+/// [`SyscallError::InvalidArgument`]. Used by a server that hands a page to a
+/// client and must know the client's mapping is gone before reusing the page.
+pub const CAP_INFO_MEMORY_MAPPINGS: u64 = 12;
+
+/// Largest Memory region, in pages, [`CAP_INFO_MEMORY_MAPPINGS`] answers for:
+/// the query reads one count per page, so the bound keeps the syscall short.
+pub const CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES: u64 = 512;
+
 // ── CapTag discriminants ─────────────────────────────────────────────────────
 //
 // Userspace constants matching the kernel `CapTag` enum, for callers that

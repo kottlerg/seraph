@@ -104,7 +104,10 @@ Revoking a Memory capability invalidates its descendants but does not unmap the
 pages they mapped: a mapping established through a revoked descendant stays in
 place until its address space unmaps it or is torn down, so a server that hands
 out a page and later revokes it cannot rely on the revoke to withdraw the
-client's access (#516).
+client's access. It can instead verify the withdrawal: after the revoke, no other
+holder can map the page again, and `SYS_CAP_INFO`'s mappings count (see
+[Cap introspection](#cap-introspection)) falls to the server's own mappings once the
+client's are gone, so the server reuses the page only then.
 
 Init transfers RAM Memory caps (via the
 [derive-twice pattern](../core/kernel/docs/capability-internals.md#safe-delegation-the-derive-twice-pattern))
@@ -697,7 +700,8 @@ kernel growth path.
 
 `SYS_CAP_INFO` is a read-only inquiry that returns runtime state for
 a held capability: tag and rights for any cap; size, available-bytes,
-retype-rights flag, and physical base for Memory caps; lifecycle state and
+retype-rights flag, physical base, and the number of user mappings of its pages (for a
+region of at most 512 pages) for Memory caps; lifecycle state and
 exit reason for Thread caps; PT growth budget for AddressSpace caps; backed
 slot capacity, slots used, and growth budget for CSpace caps; plus two
 system-wide tagged-TLB diagnostic counters.

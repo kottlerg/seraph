@@ -860,8 +860,9 @@ with TLB shootdown, and IoPort bindings made through a revoked IoPort descendant
 withdrawn, before the call returns; while a concurrent syscall holds the descendant's
 object (any syscall naming it, which pins it), all of that object's mappings and
 bindings are withdrawn when that syscall releases it instead; mappings established
-through a revoked Memory descendant are not withdrawn (see
-[capability-model.md](../../../docs/capability-model.md) § Revocation; #516).
+through a revoked Memory descendant are not withdrawn; a server verifies their withdrawal
+with `SYS_CAP_INFO`'s `CAP_INFO_MEMORY_MAPPINGS` (see
+[capability-model.md](../../../docs/capability-model.md) § Memory).
 Underlying kernel objects are not freed unless a revoked capability was the last
 reference (see [capability-model.md](../../../docs/capability-model.md) § Revocation);
 such a teardown can fail to complete as `SYS_CAP_DELETE` describes for a thread left
@@ -966,11 +967,22 @@ selected by a field code. Read-only inquiry.
 Some fields pack two values into the word — e.g. `TAG_RIGHTS` returns `(tag << 32) |
 rights`, and `THREAD_STATE` returns `(state << 32) | (exit_reason & 0xFFFFFFFF)`.
 
+`CAP_INFO_MEMORY_MAPPINGS` (12) returns, for a Memory cap, the number of user page-table
+leaves in every address space that name a frame of its region, summed over the region's
+frames (the frame map table's counts; see
+[memory-internals.md § Frame Map Table](memory-internals.md#frame-map-table)). A frame's
+count falls only once every CPU has dropped the leaf, so a value equal to the mappings the
+caller itself holds means no other address space can reach the region; the value is a
+snapshot, which stays current only while no one else holds a capability that can map the
+region. The kernel answers only through a Memory cap the caller holds, and only for a region
+of at most `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` (512) pages, so the walk stays bounded.
+
 **Capability requirement:** None — `cap_info` reads the slot without a rights check.
 
 **Errors:** `InvalidCapability` (null/stale handle, empty slot, or a referenced target
-object is gone), `InvalidArgument` (field requires a different capability type, or the
-selector is unknown).
+object is gone), `InvalidArgument` (field requires a different capability type, the
+selector is unknown, or a `CAP_INFO_MEMORY_MAPPINGS` region is larger than
+`CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` pages).
 
 ---
 

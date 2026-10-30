@@ -107,6 +107,11 @@ Power manager. Owns the platform shutdown surface and serves
 `SHUTDOWN` / `REBOOT` IPC. See
 [`services/pwrmgr/README.md`](../services/pwrmgr/README.md).
 
+**timed**
+Wall-clock service. Resolves the platform RTC through devmgr at startup and serves
+`GET_WALL_TIME` from a fixed offset against the kernel's monotonic clock. See
+[`services/timed/README.md`](../services/timed/README.md).
+
 **drivers**
 Isolated userspace processes. Access hardware only through capabilities
 granted by devmgr; see [device-management.md](device-management.md).
@@ -289,4 +294,5 @@ mode.
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [runtime/libc/README.md](../runtime/libc/README.md),
 [services/drivers/README.md](../services/drivers/README.md),
-[services/netd/README.md](../services/netd/README.md)
+[services/netd/README.md](../services/netd/README.md),
+[services/timed/README.md](../services/timed/README.md)

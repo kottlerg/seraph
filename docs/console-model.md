@@ -120,7 +120,8 @@ direct console paths remain as fallbacks for the life of the system.
      driver's rendering. It is run from the shell and is not auto-started.
 
    A compositor / display broker ([#153](https://github.com/kottlerg/seraph/issues/153)) is to
-   resolve the cap through the same name. v1 exposes two verbs, specified in
+   resolve the cap through the same name (design intent; not yet implemented). v1 exposes two
+   verbs, specified in
    [services/drivers/framebuffer/README.md](../services/drivers/framebuffer/README.md)
    § Messages — `FB_WRITE_BYTES`
    (UTF-8 payloads, `\n`/`\r`/`\x08` short-circuited) and `FB_SET_ATTRS` (sticky

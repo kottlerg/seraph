@@ -1,4 +1,4 @@
-# drivers/goldfish-rtc
+# goldfish-rtc
 
 RISC-V Goldfish RTC driver. Serves
 [`rtc_labels::RTC_GET_EPOCH_TIME`](../../../shared/ipc/src/lib.rs).

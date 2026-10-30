@@ -218,7 +218,7 @@ specified in [`docs/storage.md`](storage.md).
 [Device Tree Parsing](../core/boot/docs/dtb.md),
 [Firmware Parsing](../core/boot/docs/firmware-parsing.md), [Architecture Overview](architecture.md),
 [Memory Model](memory-model.md), [Platform Requirements](platform-requirements.md),
-[Storage](storage.md),
+[Storage](storage.md), [services/devmgr/README.md](../services/devmgr/README.md),
 [devmgr Responsibilities and Capabilities](../services/devmgr/docs/responsibilities.md),
 [services/drivers/README.md](../services/drivers/README.md),
 [services/drivers/cmos/README.md](../services/drivers/cmos/README.md),

@@ -30,20 +30,26 @@ mod worker_pool;
 use std::os::seraph::startup_info;
 use std::sync::{Mutex, PoisonError};
 
-use gpt::MAX_GPT_PARTS;
 use ipc::{IpcMessage, blk_labels, ns_labels};
 use namespace_protocol::{GateError, compose_forward_lookup_rights, gate};
 use root_backend::VfsdRootBackend;
 use worker_pool::WorkerPool;
 
-/// Number of threads that recv on the service endpoint. More than one
-/// is required for correctness: when one thread blocks waiting on a
-/// worker pool order (e.g. `CREATE_FROM_FILE` for a fatfs respawn),
-/// procmgr re-enters vfsd's namespace dispatcher (via `FS_READ` on
-/// the supplied file cap) to load the binary; another thread must be
-/// available to service the in-flight MOUNT reply, otherwise the
-/// system deadlocks.
+/// Number of threads that recv on the service endpoint. A concurrency
+/// knob that bounds no capacity: a request past the fourth concurrent one
+/// waits in the endpoint's queue for the next free thread. No
+/// service-endpoint request waits on another one, so the count cannot
+/// deadlock: what a `MOUNT` handler blocks on (the worker pool, procmgr's
+/// `CREATE_FROM_FILE`, whose binary reads go to the fs driver that minted
+/// the file cap, the `NS_LOOKUP` walk the namespace thread serves, and the
+/// driver's `FS_MOUNT` probe) never calls the service endpoint.
 const SERVICE_THREAD_COUNT: usize = 4;
+
+/// Longest mount path a `MOUNT` request can name: the bytes the request's
+/// data words carry after the role and length words. Set by the IPC
+/// message size, not a table; vfsd's only path limit, with each component
+/// bounded by `namespace_protocol::MAX_NAME_LEN`.
+const MAX_MOUNT_PATH_LEN: usize = (syscall_abi::MSG_DATA_WORDS_MAX - 2) * 8;
 
 // ── Data structures ────────────────────────────────────────────────────────
 
@@ -187,26 +193,30 @@ fn main() -> !
     };
 
     // Parse GPT partition table — stored for UUID lookups on MOUNT requests.
-    let mut gpt_parts = gpt::new_gpt_table();
-    match partition::parse_gpt(
-        blk_ep,
-        ipc_buf,
-        &mut gpt_parts,
-        &mut scratch_cap,
-        scratch_va,
-    )
+    let gpt_parts = match partition::parse_gpt(blk_ep, ipc_buf, &mut scratch_cap, scratch_va)
     {
-        Ok(count) => std::os::seraph::log!("GPT parsed, {count} partitions"),
-        Err(gpt::GptError::IoError) => std::os::seraph::log!("GPT parse failed: I/O error"),
-        Err(gpt::GptError::InvalidSignature) =>
+        Ok(parts) =>
         {
-            std::os::seraph::log!("GPT parse failed: invalid signature");
+            std::os::seraph::log!("GPT parsed, {} partitions", parts.len());
+            parts
         }
-        Err(gpt::GptError::InvalidEntrySize) =>
+        Err(e) =>
         {
-            std::os::seraph::log!("GPT parse failed: invalid entry size");
+            match e
+            {
+                gpt::GptError::IoError => std::os::seraph::log!("GPT parse failed: I/O error"),
+                gpt::GptError::InvalidSignature =>
+                {
+                    std::os::seraph::log!("GPT parse failed: invalid signature");
+                }
+                gpt::GptError::InvalidEntrySize =>
+                {
+                    std::os::seraph::log!("GPT parse failed: invalid entry size");
+                }
+            }
+            Vec::new()
         }
-    }
+    };
 
     // Namespace endpoint: separate recv surface for the cap-native
     // protocol (`NS_LOOKUP` / `NS_STAT` / `NS_READDIR`) against vfsd's
@@ -300,7 +310,8 @@ pub struct VfsdRuntime
 {
     pub caps: VfsdCaps,
     pub blk_ep: u32,
-    pub gpt_parts: [gpt::GptEntry; MAX_GPT_PARTS],
+    /// Every used GPT partition entry, parsed once at startup.
+    pub gpt_parts: Vec<gpt::GptEntry>,
     pub pool: WorkerPool,
     /// Boot-module fatfs cap consumed (and zeroed) by the very first MOUNT.
     /// Mutex-guarded because that MOUNT may land on any handler thread.
@@ -344,11 +355,9 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 
 /// Service-handler entry. One copy of this loop runs per
 /// [`SERVICE_THREAD_COUNT`] thread; all share the [`VfsdRuntime`].
-/// Multi-threaded recv on the service endpoint is required so that a
-/// handler blocked on a worker pool order (notably `CREATE_FROM_FILE`
-/// for a fatfs respawn, which triggers procmgr → vfsd namespace
-/// re-entry via `FS_READ` while loading a driver from the now-mounted
-/// root) does not deadlock.
+/// The threads let independent requests proceed while one handler waits
+/// on a fatfs spawn; correctness does not depend on their count (see
+/// [`SERVICE_THREAD_COUNT`]).
 ///
 /// Concurrency invariants. `MOUNT` routes into `do_mount`, and a
 /// successful root `MOUNT` then auto-mounts `/esp` and `/data` through
@@ -453,9 +462,9 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
 /// Dedicated thread that serves `NS_*` requests against vfsd's
 /// synthetic root.
 ///
-/// One thread is sufficient: the synthetic-root tree is bounded by
-/// [`MAX_TREE_NODES`] and every backend operation is constant work in
-/// the tree; the only blocking call is the optional fall-through
+/// One thread is sufficient: every backend operation is an in-memory walk
+/// of one node's children, or of one node's ancestors; the only blocking
+/// call is the optional fall-through
 /// `ipc_call` to a root-fs cap, which yields like any other IPC. A
 /// multi-threaded recv on `namespace_ep` would only buy concurrency
 /// between independent `NS_*` requests and is not load-bearing today.
@@ -468,8 +477,6 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
 /// Any future parallelism here must either give each worker its own
 /// `ipc_buf` page (and an own-cap derivation) or move the fall-through to
 /// a buffer-disjoint shape.
-///
-/// [`MAX_TREE_NODES`]: root_backend::MAX_TREE_NODES
 fn namespace_loop(rt: &'static VfsdRuntime) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -899,8 +906,8 @@ fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
 /// additionally auto-mounts the EFI System Partition at `/esp` and the
 /// data partition at `/data`.
 // cast_possible_truncation: the role byte is the low byte of data[0] by wire
-// contract, and the path length is checked against 1..=64 right after its
-// cast, so neither `as` loses a value the handler accepts.
+// contract, and the path length is checked against 1..=MAX_MOUNT_PATH_LEN
+// right after its cast, so neither `as` loses a value the handler accepts.
 #[allow(clippy::cast_possible_truncation)]
 fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 {
@@ -916,7 +923,7 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
     };
 
     let path_len = recv.word(1) as usize;
-    if path_len == 0 || path_len > 64
+    if path_len == 0 || path_len > MAX_MOUNT_PATH_LEN
     {
         std::os::seraph::log!("MOUNT: invalid path length");
         let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
@@ -925,25 +932,22 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
         return;
     }
 
-    let mut path_buf = [0u8; 64];
     let path_bytes = recv.data_bytes();
     // Path bytes start at word 2 (byte offset 16) under the new wire shape.
     let path_src_start = 2 * 8;
-    let path_src_end = (path_src_start + path_len).min(path_bytes.len());
-    let copy_len = path_src_end.saturating_sub(path_src_start).min(path_len);
-    if copy_len < path_len
+    let Some(path) = path_bytes.get(path_src_start..path_src_start + path_len)
+    else
     {
-        // The data words carry fewer path bytes than `data[1]` claims; a
-        // shorter copy would mount a NUL-padded name.
+        // The data words carry fewer path bytes than `data[1]` claims;
+        // mounting the bytes that are there would name a different path.
         std::os::seraph::log!("MOUNT: path shorter than its stated length");
         let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
-    }
-    path_buf[..path_len].copy_from_slice(&path_bytes[path_src_start..path_src_end]);
+    };
 
-    let reply = match do_mount(rt, ipc_buf, role, &path_buf[..path_len])
+    let reply = match do_mount(rt, ipc_buf, role, path)
     {
         Ok(0) => IpcMessage::new(ipc::vfsd_errors::SUCCESS),
         Ok(cap) => IpcMessage::builder(ipc::vfsd_errors::SUCCESS)
@@ -978,10 +982,7 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 /// driver spawned.
 fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, type_guid: &[u8; 16], mount_path: &str)
 {
-    let present = rt
-        .gpt_parts
-        .iter()
-        .any(|p| p.active && &p.type_guid == type_guid);
+    let present = rt.gpt_parts.iter().any(|p| &p.type_guid == type_guid);
     if !present
     {
         std::os::seraph::log!("MOUNT: no partition for {mount_path}; skipping auto-mount");
@@ -1093,8 +1094,9 @@ fn do_mount_internal(
     );
 
     // Reject a mount the synthetic root would refuse (root already mounted,
-    // `path` already a mount point, an oversize component, or no free tree
-    // node) before registering a partition or spawning a driver for it.
+    // `path` already a mount point, or a component the namespace protocol
+    // cannot name) before registering a partition or spawning a driver for
+    // it.
     let installable = rt
         .root_backend
         .lock()
@@ -1102,7 +1104,7 @@ fn do_mount_internal(
         .can_install(path);
     if !installable
     {
-        std::os::seraph::log!("MOUNT: mount point taken or synthetic-root table full");
+        std::os::seraph::log!("MOUNT: mount point taken or path not installable");
         return Err(ipc::vfsd_errors::TABLE_FULL);
     }
 
@@ -1214,11 +1216,13 @@ fn do_mount_internal(
     let Some(install_result) = install_result
     else
     {
-        // A concurrent MOUNT took the mount point or the last tree node
-        // after the `can_install` check. Revoking the endpoint invalidates
+        // A concurrent MOUNT took the mount point after the `can_install`
+        // check, or the tree could not grow. Revoking the endpoint invalidates
         // `install_cap` and `caller_root_cap` (both derive from it) and
         // stops the driver nothing would reach.
-        std::os::seraph::log!("MOUNT: synthetic-root install full or mount point taken");
+        std::os::seraph::log!(
+            "MOUNT: synthetic-root install failed (no memory or mount point taken)"
+        );
         driver::teardown_driver(fatfs.endpoint);
         return Err(ipc::vfsd_errors::TABLE_FULL);
     };
@@ -1246,26 +1250,23 @@ fn do_mount_internal(
 /// A walk that fails (root mount not yet installed, or the path does
 /// not exist in the root filesystem) leaves `fallthrough_cap = 0`;
 /// subsequent unmatched lookups against that intermediate then reply
-/// `NotFound` instead of forwarding.
+/// `NotFound` instead of forwarding. Every skip is logged.
 fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates: &[u32])
 {
     for &node_idx in intermediates
     {
-        let mut path_buf = [0u8; 256];
-        let path_len_and_cap = {
+        let (path, root_mount_cap) = {
             let backend = rt
                 .root_backend
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let root_mount = backend.root_mount_cap();
-            let path_len = backend.path_of(node_idx, &mut path_buf);
-            (path_len, root_mount)
+            (backend.path_of(node_idx), backend.root_mount_cap())
         };
-        let (Some(path_len), root_mount_cap) = path_len_and_cap
+        let Some(path) = path
         else
         {
             std::os::seraph::log!(
-                "MOUNT: fallthrough skip node_idx={node_idx}: backend.path_of returned None",
+                "MOUNT: fallthrough skip node_idx={node_idx}: no memory for its path",
             );
             continue;
         };
@@ -1276,8 +1277,7 @@ fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates:
             );
             continue;
         }
-        let path = &path_buf[..path_len];
-        if let Some(cap) = walk_root_mount_path(root_mount_cap, path, ipc_buf)
+        if let Some(cap) = walk_root_mount_path(root_mount_cap, &path, ipc_buf)
         {
             let mut backend = rt
                 .root_backend
@@ -1308,9 +1308,9 @@ fn walk_root_mount_path(root_mount_cap: u32, path: &[u8], ipc_buf: *mut u64) -> 
         {
             continue;
         }
-        // Components are bounded by `root_backend::MAX_ENTRY_NAME`
-        // (64), which `install` enforces, so the length fits the label's
-        // name-length field.
+        // Components are bounded by `namespace_protocol::MAX_NAME_LEN`
+        // (255), which `install` enforces, so the length fits the label's
+        // 16-bit name-length field and the request's data words.
         let name_len = component.len() as u64;
         let label = ns_labels::NS_LOOKUP | (name_len << 16);
         let msg = IpcMessage::builder(label)

@@ -39,7 +39,9 @@ pub struct GptEntry
 
 /// Validated GPT header fields needed to walk the partition array. The
 /// `u32` widths of `num_parts` and `entry_size` are the UEFI GPT header's
-/// own field widths.
+/// own field widths; [`parse_header`] has checked that the
+/// `num_parts * entry_size`-byte array lies between LBA 2 and the header's
+/// first usable LBA, so the walk reads no partition data as entries.
 pub struct GptHeader
 {
     pub part_entry_lba: u64,
@@ -58,6 +60,11 @@ pub enum GptError
     /// Partition entry size is not one the GPT spec permits within one
     /// sector: `128 * 2^n` bytes, so `128`, `256`, or `512`.
     InvalidEntrySize,
+    /// The partition-entry array does not lie where the GPT spec places it:
+    /// it starts before LBA 2 (over the protective MBR or the header), or its
+    /// `num_parts * entry_size` bytes run past `first_usable_lba`, the first
+    /// LBA a partition may occupy.
+    InvalidEntryArray,
 }
 
 /// Parse and validate the GPT header from sector 1.
@@ -69,22 +76,41 @@ pub enum GptError
 /// offset only when `entry_size` divides the sector, and `parse_entry` reads 56
 /// bytes per entry.
 ///
+/// Also checks that the entry array lies between LBA 2 and the header's
+/// `first_usable_lba`, as the GPT spec places it. That is the bound on
+/// `num_parts`: without it a corrupt or hostile header could declare up to
+/// `u32::MAX` entries and have the walk decode partition data as entries.
+///
 /// # Errors
 /// Returns [`GptError::InvalidSignature`] when the `EFI PART` signature is
-/// absent, or [`GptError::InvalidEntrySize`] when `entry_size` is not `128`,
-/// `256`, or `512`.
+/// absent, [`GptError::InvalidEntrySize`] when `entry_size` is not `128`,
+/// `256`, or `512`, or [`GptError::InvalidEntryArray`] when the entry array
+/// starts before LBA 2 or ends past `first_usable_lba`.
 pub fn parse_header(sector: &[u8; SECTOR_SIZE]) -> Result<GptHeader, GptError>
 {
     if &sector[0..8] != b"EFI PART"
     {
         return Err(GptError::InvalidSignature);
     }
+    let first_usable_lba = u64::from_le_bytes(sector[40..48].try_into().unwrap_or([0; 8]));
     let part_entry_lba = u64::from_le_bytes(sector[72..80].try_into().unwrap_or([0; 8]));
     let num_parts = u32::from_le_bytes(sector[80..84].try_into().unwrap_or([0; 4]));
     let entry_size = u32::from_le_bytes(sector[84..88].try_into().unwrap_or([0; 4]));
     if !(128..=512).contains(&entry_size) || !entry_size.is_power_of_two()
     {
         return Err(GptError::InvalidEntrySize);
+    }
+    // Cast is range-safe: SECTOR_SIZE is 512.
+    #[allow(clippy::cast_possible_truncation)]
+    let entries_per_sector = SECTOR_SIZE as u32 / entry_size;
+    let array_sectors = u64::from(num_parts.div_ceil(entries_per_sector));
+    let array_fits = part_entry_lba >= 2
+        && part_entry_lba
+            .checked_add(array_sectors)
+            .is_some_and(|end| end <= first_usable_lba);
+    if !array_fits
+    {
+        return Err(GptError::InvalidEntryArray);
     }
     Ok(GptHeader {
         part_entry_lba,
@@ -287,10 +313,13 @@ mod tests
 {
     use super::*;
 
+    /// A header sector whose first usable LBA is 34, where a default
+    /// 128-entry, 128-byte array from LBA 2 ends.
     fn header_sector(sig: &[u8; 8], part_lba: u64, num: u32, esize: u32) -> [u8; SECTOR_SIZE]
     {
         let mut s = [0u8; SECTOR_SIZE];
         s[0..8].copy_from_slice(sig);
+        s[40..48].copy_from_slice(&34u64.to_le_bytes());
         s[72..80].copy_from_slice(&part_lba.to_le_bytes());
         s[80..84].copy_from_slice(&num.to_le_bytes());
         s[84..88].copy_from_slice(&esize.to_le_bytes());
@@ -354,6 +383,39 @@ mod tests
         // per-sector entry walk would read entries at the wrong offsets.
         let s = header_sector(b"EFI PART", 2, 128, 200);
         assert!(matches!(parse_header(&s), Err(GptError::InvalidEntrySize)));
+    }
+
+    #[test]
+    fn parse_header_accepts_an_array_ending_at_the_first_usable_lba()
+    {
+        // 128 entries of 128 bytes from LBA 2 fill LBAs 2..34 exactly.
+        assert!(parse_header(&header_sector(b"EFI PART", 2, 128, 128)).is_ok());
+    }
+
+    #[test]
+    fn parse_header_rejects_an_array_past_the_first_usable_lba()
+    {
+        // One entry more needs LBA 34, the first usable LBA.
+        let s = header_sector(b"EFI PART", 2, 129, 128);
+        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
+        // A `num_parts` near `u32::MAX` is refused rather than walked.
+        let s = header_sector(b"EFI PART", 2, u32::MAX, 128);
+        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
+    }
+
+    #[test]
+    fn parse_header_rejects_an_array_before_lba_2()
+    {
+        let s = header_sector(b"EFI PART", 1, 4, 128);
+        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
+    }
+
+    #[test]
+    fn parse_header_rejects_an_array_whose_end_overflows()
+    {
+        let mut s = header_sector(b"EFI PART", u64::MAX, 8, 128);
+        s[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(parse_header(&s), Err(GptError::InvalidEntryArray)));
     }
 
     #[test]
@@ -474,6 +536,26 @@ mod tests
         let scan = collect_partitions(&header(16, 128), reader(&disk, Some(4), &mut reads));
         assert_eq!(scan.stop, Some(ScanStop::ReadFailed { lba: 4 }));
         assert_eq!(scan.entries.len(), 8);
+    }
+
+    #[test]
+    fn collect_stops_when_the_next_lba_overflows()
+    {
+        // `collect_partitions` takes any header, so it guards the LBA step
+        // itself; one full sector at the last LBA, then no next LBA.
+        let header = GptHeader {
+            part_entry_lba: u64::MAX,
+            num_parts: 8,
+            entry_size: 128,
+        };
+        let mut reads = Vec::new();
+        let scan = collect_partitions(&header, |lba, _| {
+            reads.push(lba);
+            true
+        });
+        assert_eq!(scan.stop, Some(ScanStop::ReadFailed { lba: u64::MAX }));
+        assert!(scan.entries.is_empty());
+        assert_eq!(reads, vec![u64::MAX]);
     }
 
     #[test]

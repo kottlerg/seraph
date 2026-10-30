@@ -36,7 +36,7 @@ use root_backend::VfsdRootBackend;
 use worker_pool::WorkerPool;
 
 /// Number of threads that recv on the service endpoint. A concurrency
-/// knob that bounds no capacity: a request past the fourth concurrent one
+/// knob that bounds no capacity: a request that finds every handler busy
 /// waits in the endpoint's queue for the next free thread. No
 /// service-endpoint request waits on another one, so the count cannot
 /// deadlock: what a `MOUNT` handler blocks on (the worker pool, procmgr's
@@ -212,6 +212,12 @@ fn main() -> !
                 gpt::GptError::InvalidEntrySize =>
                 {
                     std::os::seraph::log!("GPT parse failed: invalid entry size");
+                }
+                gpt::GptError::InvalidEntryArray =>
+                {
+                    std::os::seraph::log!(
+                        "GPT parse failed: entry array outside LBA 2..first_usable_lba"
+                    );
                 }
             }
             Vec::new()
@@ -971,7 +977,7 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 }
 
 /// One-shot best-effort mount of the partition tagged `type_guid` at
-/// `mount_path`. Scans the parsed GPT for an active matching partition; if
+/// `mount_path`. Scans the parsed GPT for a matching partition; if
 /// none is present (or its role lookup is ambiguous), logs a diagnostic
 /// and returns without mounting, leaving `mount_path` to resolve through
 /// the root-fs fall-through. On a match, runs the mount transaction and
@@ -1284,6 +1290,14 @@ fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates:
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             backend.set_fallthrough_cap(node_idx, cap);
+        }
+        else
+        {
+            // Install validated every component as UTF-8 (`validate_name`).
+            let shown = core::str::from_utf8(&path).unwrap_or("<non-UTF-8>");
+            std::os::seraph::log!(
+                "MOUNT: fallthrough skip node_idx={node_idx}: no directory {shown} in the root fs",
+            );
         }
     }
 }

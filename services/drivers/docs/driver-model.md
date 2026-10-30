@@ -3,6 +3,11 @@
 Driver lifecycle specification: device discovery, driver binding, per-device
 capability delegation, service-endpoint delivery, and driver teardown.
 
+Only § Adding a Driver is written here; devmgr's discovery, binding, and delegation are
+specified in
+[services/devmgr/docs/responsibilities.md](../../devmgr/docs/responsibilities.md).
+TODO: specify driver teardown.
+
 ---
 
 ## Adding a Driver

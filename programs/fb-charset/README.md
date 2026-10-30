@@ -18,6 +18,18 @@ itself.
 
 ---
 
+## Source Layout
+
+```
+programs/fb-charset/
+├── Cargo.toml
+├── README.md
+└── src/
+    └── main.rs            # Writes the labelled glyph and colour sample to stdout
+```
+
+---
+
 ## Output
 
 Pure `std`: the sample is written to stdout in labelled sections —
@@ -42,12 +54,16 @@ There are no assertions and no PASS/FAIL — the verdict is visual, which is why
 there is no automated tester (CI cannot inspect rendered pixels). With no stdout
 attached the output silently drops.
 
-## References
+---
 
-- [docs/console-model.md](../../docs/console-model.md) — console/framebuffer
-  output ownership across boot.
-- [services/drivers/framebuffer/README.md](../../services/drivers/framebuffer/README.md)
-  — the driver whose glyph rendering this exercises.
+## Relevant Design Documents
+
+| Document | Content |
+|---|---|
+| [docs/console-model.md](../../docs/console-model.md) | Console and framebuffer output ownership across boot |
+| [services/drivers/framebuffer/README.md](../../services/drivers/framebuffer/README.md) | The driver whose glyph rendering this exercises |
+| [shared/text/README.md](../../shared/text/README.md) | Owner of the ASCII substitute table |
+| [shared/ansi/README.md](../../shared/ansi/README.md) | SGR parser that maps the colour rows to `FB_SET_ATTRS` |
 
 ---
 

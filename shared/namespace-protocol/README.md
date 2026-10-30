@@ -350,5 +350,6 @@ namespace-protocol/
 [Namespace Model](../../docs/namespace-model.md),
 [services/fs/README.md](../../services/fs/README.md),
 [Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md),
+[services/fs/fat/README.md](../../services/fs/fat/README.md),
 [Synthetic Root and Namespace Composition](../../services/vfsd/docs/namespace-composition.md),
 [shared/ns-client/README.md](../ns-client/README.md)

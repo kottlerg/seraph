@@ -38,7 +38,7 @@ Two privilege classes:
   `DONATE_MEMORY_CAPS`, `DELEGATE_ASPACE`) are callable only over the cap
   that init transfers to procmgr at procmgr's bootstrap round. memmgr
   identifies this cap by badge and rejects procmgr-only calls received over
-  any other badged cap, replying `Unauthorized`.
+  any other badged cap, replying `UNAUTHORIZED`.
 - **Universal** labels (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`,
   `QUERY_POOL_STATUS`, `REGISTER_REGION`, `UNREGISTER_REGION`) are callable
   over any badged cap, including those memmgr returned from
@@ -77,7 +77,9 @@ derivation-locked badge, not on badge secrecy.
 
 All requests use `SYS_IPC_CALL` (synchronous call/reply). The message
 label field identifies the operation. Data words and capability slots
-carry arguments; the reply carries results.
+carry arguments; the reply carries results. Error codes below are the
+`memmgr_errors` constants in `shared/ipc`. A label memmgr does not define
+replies `INVALID_ARGUMENT`.
 
 ### Label 1: `REQUEST_MEMORY_CAPS`
 
@@ -130,15 +132,16 @@ Best-effort replies may use the full reply-side capacity.
 | Field | Value |
 |---|---|
 | label | Nonzero error code |
+| data[0..3] | Only on codes 1 and 2: total free pages, free-run count, and the largest free run in pages |
 
 **Error codes:**
 
 | Code | Name | Meaning |
 |---|---|---|
-| 1 | `OutOfMemoryContiguous` | `REQUIRE_CONTIGUOUS` set; no run satisfies |
-| 2 | `OutOfMemoryBestEffort` | Pool cannot cover `want_pages` even fragmented |
-| 3 | `Quota` | Tracking-metadata arena could not grow (system RAM exhausted) |
-| 4 | `InvalidArgument` | `want_pages == 0`, `flags` reserved bits set, or badge unknown |
+| 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Pool cannot cover `want_pages` even fragmented |
+| 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted) |
+| 4 | `INVALID_ARGUMENT` | `want_pages == 0`, `flags` reserved bits set, or badge unknown |
 
 ### Label 2: `RELEASE_MEMORY_CAPS`
 
@@ -178,7 +181,7 @@ as the per-process tracking anchor and uses `phys_base` to find it.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 4 | `InvalidArgument` | caller's badge is unknown |
+| 4 | `INVALID_ARGUMENT` | caller's badge is unknown |
 
 For each `phys_base`, memmgr finds the matching caller-owned grant
 (`FRAME_VA_UNMAPPED`) in the per-process tracking entry, returns its run to
@@ -231,9 +234,9 @@ the eventual `PROCESS_DIED`.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 5 | `Unauthorized` | Caller is not procmgr |
-| 6 | `TooManyProcesses` | The tracking table could not take a new entry, the badge draw failed, or the reply cap could not be derived |
-| 7 | `LabelVersionMismatch` | `data[0]` is not memmgr's `MEMMGR_LABELS_VERSION` |
+| 5 | `UNAUTHORIZED` | Caller is not procmgr |
+| 6 | `TOO_MANY_PROCESSES` | The tracking table could not take a new entry, the badge draw failed, or the reply cap could not be derived |
+| 7 | `LABEL_VERSION_MISMATCH` | `data[0]` is not memmgr's `MEMMGR_LABELS_VERSION` |
 
 ### Label 4: `PROCESS_DIED`
 
@@ -272,7 +275,7 @@ IPC. Idempotent on stale badges (already-reaped or never-registered).
 
 | Code | Name | Meaning |
 |---|---|---|
-| 5 | `Unauthorized` | Caller is not procmgr |
+| 5 | `UNAUTHORIZED` | Caller is not procmgr |
 
 `PROCESS_DIED` for an unknown badge is not an error — memmgr returns
 success. Reclamation is idempotent.
@@ -316,7 +319,7 @@ frame, and boot-module ELF sources. See
 
 | Code | Name | Meaning |
 |---|---|---|
-| 5 | `Unauthorized` | Caller is not procmgr; every transferred cap is deleted and none is counted |
+| 5 | `UNAUTHORIZED` | Caller is not procmgr; every transferred cap is deleted and none is counted |
 
 A procmgr donation always succeeds. memmgr validates each cap with
 `cap_info`; a cap that is not a Memory cap or lacks a required right is
@@ -379,11 +382,11 @@ lazily on fault, and only once procmgr has delegated this process's
 
 | Code | Name | Meaning |
 |---|---|---|
-| 3 | `Quota` | Tracking-metadata arena could not grow (system RAM exhausted) |
-| 4 | `InvalidArgument` | Bad alignment, zero length, W^X violation, unknown prot bit, unknown badge, or overlap |
+| 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted) |
+| 4 | `INVALID_ARGUMENT` | Bad alignment, zero length, W^X violation, unknown prot bit, unknown badge, or overlap |
 
 Per-process region and frame counts are bounded by RAM (the self-hosted
-node arena), not by a fixed constant; `Quota` therefore signals genuine RAM
+node arena), not by a fixed constant; `QUOTA` therefore signals genuine RAM
 exhaustion, not a per-process ceiling. See [`memory-pool.md`](memory-pool.md)
 §"Metadata Arena".
 
@@ -411,8 +414,8 @@ memmgr stores the cap against the child's tracking entry and drops it on
 
 | Code | Name | Meaning |
 |---|---|---|
-| 4 | `InvalidArgument` | Unknown badge or missing cap (a stray transferred cap is dropped) |
-| 5 | `Unauthorized` | Caller is not procmgr |
+| 4 | `INVALID_ARGUMENT` | Unknown badge or missing cap (a stray transferred cap is dropped) |
+| 5 | `UNAUTHORIZED` | Caller is not procmgr |
 
 ### Label 9: `UNREGISTER_REGION`
 
@@ -449,7 +452,7 @@ pool as on `PROCESS_DIED`, so the all-RAM-accounted identity is unaffected.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 4 | `InvalidArgument` | Unknown badge, or no region matches `[va_base, len)` exactly |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, or no region matches `[va_base, len)` exactly |
 
 ### Kernel-origin fault message (`FAULT_LABEL`)
 

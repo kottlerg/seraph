@@ -166,6 +166,9 @@ the PR number, the open Issue list, and for a delta run the `since` head, both m
 the ledger). Save records under `target/xtask/review/pr<N>/`. Push and open the PR as soon as
 `cargo xtask test` and `lint-docs` pass, so CI and the first review run before the host slot.
 
+- Orchestrated, after every review run copy the PR's whole `target/xtask/review/pr<N>/` directory
+  into the orchestrator's checkout at the same relative path (the spawn prompt names that
+  checkout), since this worktree and its records are removed when your session ends.
 - After every review run, `git status -sb` before committing: a reviewer can leave the worktree
   on a detached HEAD, and a push from there moves nothing.
 - `BLOCKING ISSUES`: fix every surface finding in one batch; a batch that changes non-comment
@@ -190,6 +193,8 @@ Stop when CI is green and the head includes `master` (docs/conventions.md § CI 
 the last run completed with no failed agent, its verdict is `READY TO MERGE` or
 `NON-BLOCKING ISSUES ONLY` with every surface finding recorded and no contested finding on the
 surface unresolved, and `AUDIT PASS` is on record for the head. Report the gate with the merge
-command `gh pr merge <N> --merge --delete-branch` and end your turn. The merge decision is the
+command `gh pr merge <N> --merge --delete-branch` and end your turn. Orchestrated, the report
+names the copied records (mode and head of each run) so the orchestrator reads them in its own
+checkout, not in this worktree. The merge decision is the
 maintainer's (`.claude/CLAUDE.md` § PR workflow operations); a worker that merges has failed
 its task.

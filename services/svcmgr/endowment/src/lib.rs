@@ -51,10 +51,16 @@ pub mod caps_slot
     pub const ROOTFS_ROOT: usize = 2;
     /// The badge-0 `SEND|GRANT` source on devmgr's registry endpoint.
     pub const DEVMGR_REGISTRY: usize = 3;
+    /// The `vfsd_labels::MOUNT_AUTHORITY`-badged SEND on vfsd's service
+    /// endpoint (`vfsd.mount`).
+    pub const VFSD_MOUNT: usize = 4;
+    /// The `vfsd_labels::DENY_BADGE`-badged SEND on vfsd's service endpoint
+    /// (`vfsd.deny`).
+    pub const VFSD_DENY: usize = 5;
 }
 
 /// Number of slots in the `CAPS` slot list.
-pub const CAPS_SLOTS: usize = 4;
+pub const CAPS_SLOTS: usize = 6;
 
 /// Number of `CAPS` rounds the slot list takes.
 pub const CAPS_ROUNDS: usize = slot_round_count(CAPS_SLOTS);
@@ -86,6 +92,10 @@ pub struct CapsRound
     pub rootfs_root: u32,
     /// Badge-0 `SEND|GRANT` source on devmgr's registry endpoint, or `0`.
     pub devmgr_registry: u32,
+    /// `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint, or `0`.
+    pub vfsd_mount: u32,
+    /// `DENY_BADGE`-badged SEND on vfsd's service endpoint, or `0`.
+    pub vfsd_deny: u32,
 }
 
 impl CapsRound
@@ -98,6 +108,8 @@ impl CapsRound
         slots[caps_slot::BOOTSTRAP] = self.bootstrap_ep;
         slots[caps_slot::ROOTFS_ROOT] = self.rootfs_root;
         slots[caps_slot::DEVMGR_REGISTRY] = self.devmgr_registry;
+        slots[caps_slot::VFSD_MOUNT] = self.vfsd_mount;
+        slots[caps_slot::VFSD_DENY] = self.vfsd_deny;
         slots
     }
 
@@ -108,6 +120,8 @@ impl CapsRound
             bootstrap_ep: slots[caps_slot::BOOTSTRAP],
             rootfs_root: slots[caps_slot::ROOTFS_ROOT],
             devmgr_registry: slots[caps_slot::DEVMGR_REGISTRY],
+            vfsd_mount: slots[caps_slot::VFSD_MOUNT],
+            vfsd_deny: slots[caps_slot::VFSD_DENY],
         }
     }
 }
@@ -408,6 +422,8 @@ mod tests
             bootstrap_ep: BOOTSTRAP,
             rootfs_root,
             devmgr_registry,
+            vfsd_mount: 0,
+            vfsd_deny: 0,
         }
     }
 
@@ -427,12 +443,19 @@ mod tests
         last
     }
 
+    // The six slots take two rounds; each optional source, in either
+    // window, round-trips present or absent.
     #[test]
     fn caps_round_trips_with_every_source_present_or_absent()
     {
-        for (rootfs, devmgr) in [(0, 0), (0x21, 0), (0, 0x22), (0x21, 0x22)]
+        for mask in 0u32..16
         {
-            let sent = caps_round(rootfs, devmgr);
+            let pick = |bit: u32, cap: u32| if mask & bit != 0 { cap } else { 0 };
+            let sent = CapsRound {
+                vfsd_mount: pick(4, 0x23),
+                vfsd_deny: pick(8, 0x24),
+                ..caps_round(pick(1, 0x21), pick(2, 0x22))
+            };
             assert_eq!(decode_all(&encode_caps(&sent)), Ok(Some(sent)));
         }
     }
@@ -469,8 +492,7 @@ mod tests
     }
 
     // A decoder that stopped at the first round would lose every slot a later
-    // round carries. The `CAPS` list fits one round, so a six-slot list
-    // stands in for a longer one.
+    // round carries.
     #[test]
     fn a_slot_list_past_one_round_is_concatenated_until_the_last()
     {
@@ -489,13 +511,14 @@ mod tests
         let mut list = SlotListDecoder::<6>::new();
         assert_eq!(list.push(&[0x41], 0b1, 0), Err(DecodeError::Malformed));
 
-        // A second, empty CAPS round after the one the list takes.
+        // An empty CAPS round after the rounds the list takes.
         let mut decoder = CapsDecoder::new();
         let rounds = encode_caps(&caps_round(0, 0));
-        assert!(matches!(
-            decoder.push(rounds[0].caps(), rounds[0].data()),
-            Ok(Some(_))
-        ));
+        assert_eq!(decode_all(&rounds).map(|set| set.is_some()), Ok(true));
+        for round in &rounds
+        {
+            assert!(decoder.push(round.caps(), round.data()).is_ok());
+        }
         assert_eq!(
             decoder.push(&[], &[kind::CAPS, VERSION, 0, 0]),
             Err(DecodeError::Malformed)
@@ -540,8 +563,13 @@ mod tests
             );
         }
         // Only the bootstrap endpoint present: the service slot is absent.
+        let mut decoder = CapsDecoder::new();
         assert_eq!(
-            CapsDecoder::new().push(&[BOOTSTRAP], &[kind::CAPS, VERSION, 0b0010, 0]),
+            decoder.push(&[BOOTSTRAP], &[kind::CAPS, VERSION, 0b0010, 1]),
+            Ok(None)
+        );
+        assert_eq!(
+            decoder.push(&[], &[kind::CAPS, VERSION, 0, 0]),
             Err(DecodeError::Malformed)
         );
     }

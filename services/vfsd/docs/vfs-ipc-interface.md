@@ -37,6 +37,17 @@ created and delivered by init at vfsd's bootstrap (round 1, `caps[0]`).
 Init holds a badged `SEED_AUTHORITY` SEND for `GET_SYSTEM_ROOT_CAP`
 during boot; it issues no `MOUNT`, since vfsd self-mounts root (see
 [services/init/docs/bootstrap.md](../../init/docs/bootstrap.md#per-stage-authority-transfers)).
+At handover init endows svcmgr with two more SENDs on the endpoint, each
+badged and so not re-badgeable: one carrying `MOUNT_AUTHORITY` alone,
+which svcmgr publishes seed-only as `vfsd.mount`, and one carrying
+`DENY_BADGE` (`1`, no verb bit), published seed-only as `vfsd.deny`.
+svctest alone seeds both, to drive `MOUNT`'s refusal and rejection
+paths.
+
+| Badge bit | Constant | Gates | Holder |
+|---|---|---|---|
+| 63 | `vfsd_labels::MOUNT_AUTHORITY` | `MOUNT` | svcmgr's `vfsd.mount` |
+| 62 | `vfsd_labels::SEED_AUTHORITY` | `GET_SYSTEM_ROOT_CAP` | init only |
 
 All requests use `SYS_IPC_CALL` (synchronous call/reply). Numeric
 labels live in [`ipc::vfsd_labels`] in `shared/ipc`.
@@ -47,8 +58,10 @@ labels live in [`ipc::vfsd_labels`] in `shared/ipc`.
 
 Runtime explicit-mount surface (foreign-GUID disks, user-invoked
 mounts). vfsd self-mounts root, `/esp`, and `/data` at startup through
-the same resolution path, so no in-tree caller currently issues
-`MOUNT`; the label is retained for runtime mounts.
+the same resolution path; the only in-tree caller is svctest, whose
+cases drive the rejection paths below. The caller's badge MUST carry
+`MOUNT_AUTHORITY`: vfsd replies `UNAUTHORIZED` otherwise, before it
+reads the request.
 
 Mount the partition identified by a Seraph-minted GPT type GUID at the
 given path. vfsd resolves the role byte to a type GUID (arch-conditional
@@ -101,7 +114,8 @@ the arch-neutral `SERAPH_DATA` GUID.
 | `label` | `vfsd_errors::SUCCESS` (0) |
 | `caps[0]` | Badged SEND on the new filesystem's namespace endpoint, addressing its root (omitted if cap derivation failed; the mount itself still landed) |
 
-**Reply (error)**: `label = vfsd_errors::*` (`NOT_FOUND` for an
+**Reply (error)**: `label = vfsd_errors::*` (`UNAUTHORIZED` for a
+badge without `MOUNT_AUTHORITY`, `NOT_FOUND` for an
 unknown role byte or invalid path length, `NO_MOUNT` if no partition
 matches the role GUID or if duplicate-priority partitions are detected,
 `SPAWN_FAILED`, `IO_ERROR`, `TABLE_FULL` if the synthetic-root install

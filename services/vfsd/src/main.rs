@@ -392,7 +392,23 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
 
         match opcode
         {
-            ipc::vfsd_labels::MOUNT => handle_mount_request(&recv, ipc_buf, rt),
+            ipc::vfsd_labels::MOUNT =>
+            {
+                // Verb-bit gate (docs/capability-model.md): MOUNT spawns a
+                // driver and installs a mount, so only a MOUNT_AUTHORITY
+                // badge reaches the handler.
+                if badge & ipc::vfsd_labels::MOUNT_AUTHORITY == 0
+                {
+                    std::os::seraph::log!("MOUNT rejected: badge lacks MOUNT_AUTHORITY");
+                    let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
+                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+                }
+                else
+                {
+                    handle_mount_request(&recv, ipc_buf, rt);
+                }
+            }
             ipc::vfsd_labels::GET_SYSTEM_ROOT_CAP =>
             {
                 if badge & ipc::vfsd_labels::SEED_AUTHORITY == 0
@@ -865,9 +881,11 @@ fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
 
 /// Handle a runtime MOUNT request from an authorized client.
 ///
-/// vfsd self-mounts root, `/esp`, and `/data` at startup ([`self_mount`]),
-/// so no in-tree caller currently issues MOUNT; it remains the explicit /
-/// runtime-mount surface (foreign-GUID disks, user-invoked mounts).
+/// vfsd self-mounts root, `/esp`, and `/data` at startup ([`self_mount`]);
+/// MOUNT remains the explicit / runtime-mount surface (foreign-GUID disks,
+/// user-invoked mounts), and svctest is its only in-tree caller. The
+/// service loop admits a request here only when the caller's badge carries
+/// `vfsd_labels::MOUNT_AUTHORITY`.
 ///
 /// IPC data layout (boot protocol v8+):
 /// - `data[0]` low byte: [`MountRole`] discriminant
@@ -1349,7 +1367,7 @@ fn idle_loop() -> !
 /// Register a partition bound with virtio-blk and receive back a
 /// badged `SEND_GRANT` cap scoped to that partition.
 ///
-/// vfsd's `rt.blk_ep` is itself a badged cap (the `MOUNT_AUTHORITY` cap
+/// vfsd's `rt.blk_ep` is itself a badged cap (the `blk_labels::MOUNT_AUTHORITY` cap
 /// minted by devmgr), so vfsd cannot mint partition caps locally — the
 /// kernel rejects re-badging of a badged source. Partition cap
 /// derivation lives server-side in virtio-blk; this call just sends the

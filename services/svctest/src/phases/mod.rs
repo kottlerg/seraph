@@ -55,6 +55,7 @@ pub mod startup;
 pub mod svcmgr;
 pub mod threading;
 pub mod timed;
+pub mod vfsd;
 
 /// Ordered phase list. Order encodes cross-module dependencies (see
 /// module-level docstring above).
@@ -85,6 +86,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(svcmgr::phases());
     out.extend_from_slice(timed::phases());
     out.extend_from_slice(drivers::phases());
+    out.extend_from_slice(vfsd::phases());
     out.extend_from_slice(memmgr::identity());
     out
 }

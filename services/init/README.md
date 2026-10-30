@@ -62,7 +62,9 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    [logd handover protocol](../logd/docs/handover-protocol.md)).
 3. **Handover** — load svcmgr and serve it the handover endowment over
    the bootstrap-round protocol: its own endpoints, the publish-role
-   source caps (`rootfs.root` SEND, devmgr-registry `SEND|GRANT` source),
+   source caps (`rootfs.root` SEND, devmgr-registry `SEND|GRANT` source,
+   and the `MOUNT_AUTHORITY`- and `DENY_BADGE`-badged SENDs on vfsd's service
+   endpoint),
    one `(name, thread_cap)` round per init-bootstrapped substrate
    service, and a terminal round carrying the reserved log-sink sources
    (master-log endpoint + procmgr `SEND|GRANT`) svcmgr keeps to launch and
@@ -77,7 +79,8 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    completes leaves init-logd serving and init's memory caps held until
    shutdown (a benign hold, not a wedge).
    svcmgr publishes the well-known names it now owns (`rootfs.root`,
-   `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`) and installs
+   `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`, `vfsd.mount`,
+   `vfsd.deny`) and installs
    devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR` from the endowment (see
    [svcmgr IPC interface](../svcmgr/docs/ipc-interface.md)); it then
    launches the non-bootstrap services itself — `timed` and `pwrmgr`

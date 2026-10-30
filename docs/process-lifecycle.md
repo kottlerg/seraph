@@ -81,10 +81,11 @@ Memory caps it solely owns to procmgr (see "Init reap" below). The remaining
 root caps stay in init's CSpace: the RAM roots of memory forwarded to memmgr; the firmware caps;
 the `Interrupt`, `IoPort`, `SbiControl`, and `Mmio` roots; and both halves of the split
 `SchedControl` root (the baseline band init delegated and the elevated remainder it keeps). The
-kernel pins that CSpace (it is the root CSpace; see
-[capability-internals.md § Kernel Object Reference Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)),
-so they remain alive but unreachable; releasing them at the reap is design intent, not yet
-implemented ([#540](https://github.com/kottlerg/seraph/issues/540); see [Init reap](#init-reap)).
+kernel keeps no reference on that CSpace once init runs: it is an ordinary CSpace held by its
+capabilities (see
+[capability-internals.md § Initial CSpace Population](../core/kernel/docs/capability-internals.md#initial-cspace-population)),
+so procmgr's deletion of the last one at the reap frees it and releases those caps (see
+[Init reap](#init-reap)).
 
 ### Init → memmgr
 
@@ -210,18 +211,24 @@ both have exited — init is threadless. The main thread exits at the end of ini
 but init-logd keeps serving the master log endpoint until the svcmgr-launched real-logd pulls its
 handover, so it outlives main; reclaiming init's address space while a thread still runs in it would
 fault that thread. On the last death procmgr tears down init's kernel objects in order (Threads →
-AddressSpace → donate Memory caps to memmgr → drop its CSpace reference), leaving two init residues:
-init's CSpace with the caps init still holds, and the kernel-direct page-table
-nodes behind its bootstrap mappings. Those caps include the remaining root caps (see [Kernel →
-init](#kernel--init)), the endpoints init created, its caps on the kernel objects it created for
-memmgr and procmgr, the intermediate caps it derived, and the bootstrap-arena Memory caps it
-forwarded to memmgr. They stay in init's CSpace, which the kernel pins (it is the root CSpace; see
-[capability-internals.md § Kernel Object Reference
-Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)), so
-procmgr's delete drops only its own reference and they remain alive but unreachable; releasing them
-at the reap is design intent, not yet implemented
-([#540](https://github.com/kottlerg/seraph/issues/540)). The page-table nodes stay consumed after
-init's AddressSpace is gone, an accepted cost owned by [memory-internals.md § Page Table Node
+AddressSpace → donate Memory caps to memmgr → revoke and delete its CSpace capability). Procmgr's
+CSpace capability is the last reference to init's CSpace (the kernel keeps none once init runs; see
+[capability-internals.md § Initial CSpace
+Population](../core/kernel/docs/capability-internals.md#initial-cspace-population)), so its
+deletion frees the CSpace through the ordinary CSpace teardown, which releases every cap init still
+holds: the remaining root caps (see [Kernel → init](#kernel--init)), the endpoints init created,
+its caps on the kernel objects it created for memmgr and procmgr, the intermediate caps it derived,
+and the bootstrap-arena Memory caps it forwarded to memmgr. Releasing a cap is a delete, not a
+revoke: what other processes derived from it is reparented and survives, and an object another
+holder still references (memmgr's RAM and arena copies, devmgr's hardware derivations, the
+memmgr and procmgr kernel objects) stays alive. An `owns_memory` Memory object whose last
+reference sat in init's CSpace would free into the sealed buddy; none does, since init forwards or
+donates every page it owns to memmgr's pool, which holds an `owns_memory` cap on each (the
+all-RAM-accounted identity of
+[userspace-memory-model.md § Ownership Boundaries](userspace-memory-model.md#ownership-boundaries)
+checks it). The one init
+residue is the kernel-direct page-table nodes behind its bootstrap mappings, which stay consumed
+after init's AddressSpace is gone, an accepted cost owned by [memory-internals.md § Page Table Node
 Ownership](../core/kernel/docs/memory-internals.md#page-table-node-ownership). On riscv64 init maps
 the console UART through its boot Mmio capability, whose object records that mapping and holds a
 reference on init's AddressSpace ([capability-model.md § Mmio](capability-model.md#mmio)); init-logd

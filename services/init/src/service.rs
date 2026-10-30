@@ -734,10 +734,9 @@ pub fn create_devmgr_with_caps(
         // Transfer only the power-state extensions — system reset (served to
         // pwrmgr on QUERY_SHUTDOWN_DEVICE, narrowed to Reset there) and suspend
         // (reserved for a future path). The other sanctioned SBI rights are
-        // carried into no surviving cap and become unreachable at init's reap:
-        // the root cap stays alive in init's kernel-pinned root CSpace;
-        // releasing it at the reap is design intent, not yet implemented
-        // (`docs/process-lifecycle.md` § Init reap, #540).
+        // carried into no surviving cap: the root cap stays in init's CSpace
+        // and is released when the reap frees it (`docs/process-lifecycle.md`
+        // § Init reap).
         syscall::cap_derive(
             info.sbi_control_cap,
             syscall::RIGHTS_SBI_RESET | syscall::RIGHTS_SBI_SUSPEND,
@@ -1420,10 +1419,10 @@ fn send_handover_complete(svcmgr_service_ep: u32, ipc_buf: *mut u64)
 
 /// Send one `REGISTER_INIT_TEARDOWN` donate-only round (word 0 = 0)
 /// carrying `slots` as caps. Non-fatal on failure: init exits regardless,
-/// and any un-sent cap stays in init's `CSpace`, which the kernel pins (it is
-/// the root `CSpace`), so it remains alive but unreachable; releasing it at the
-/// reap is design intent, not yet implemented (`docs/process-lifecycle.md`
-/// § Init reap, #540).
+/// and any un-sent cap stays in init's `CSpace` until the reap frees it, when
+/// its pages free into the sealed post-handoff buddy instead of reaching
+/// memmgr's pool (`docs/process-lifecycle.md` § Init reap;
+/// `docs/userspace-memory-model.md` § Ownership Boundaries).
 ///
 /// # Safety
 /// `ipc_buf` must be init's registered IPC buffer; `procmgr_ep` must carry
@@ -1513,9 +1512,9 @@ fn register_init_reap_objects(
 ///
 /// Failures here are logged but otherwise non-fatal — init still calls
 /// `sys_thread_exit` afterward, leaving the un-transferred caps in init's
-/// `CSpace`, which the kernel pins (it is the root `CSpace`), so they remain
-/// alive but unreachable; releasing them at the reap is design intent, not yet
-/// implemented (`docs/process-lifecycle.md` § Init reap, #540).
+/// `CSpace` until the reap frees it, when their pages free into the sealed
+/// post-handoff buddy instead of reaching memmgr's pool
+/// (`docs/process-lifecycle.md` § Init reap).
 fn finish_init_reap_handoff(
     info: &InitInfo,
     procmgr_ep: u32,
@@ -1594,9 +1593,10 @@ fn finish_init_reap_handoff(
         }
         // The free Memory caps MemoryAlloc abandoned while carving bootstrap
         // arenas: memory_split remainders below the floor with no descriptor.
-        // Without this they would stay stranded in init's kernel-pinned root
-        // CSpace after the reap and leak (`docs/process-lifecycle.md` § Init
-        // reap, #540). They carry RETYPE + owns_memory like any RAM memory
+        // Without this the reap's teardown of init's CSpace would free them
+        // into the sealed post-handoff buddy and their pages would never
+        // reach memmgr (`docs/process-lifecycle.md` § Init reap). They carry
+        // RETYPE + owns_memory like any RAM memory
         // cap, so memmgr ingests them into its pool.
         for &slot in orphan_memory_caps
         {

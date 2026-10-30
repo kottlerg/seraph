@@ -226,8 +226,10 @@ impl MemoryAlloc
     }
 
     /// Record a Memory cap `advance_cap` is moving off while it still holds at
-    /// least one free page. Halts if the fixed orphan table overflows: silently
-    /// dropping would leak the cap into the sealed post-handoff buddy.
+    /// least one free page. Halts if the fixed orphan table overflows: a cap
+    /// silently dropped from it would stay in init's `CSpace` until the reap
+    /// frees that `CSpace`, then free into the sealed post-handoff buddy
+    /// instead of reaching memmgr's pool.
     fn record_orphan(&mut self, slot: u32)
     {
         assert!(
@@ -534,10 +536,9 @@ fn run(info_ptr: u64) -> !
     // Split init's full-range root SchedControl into the baseline band the
     // spawn chain distributes ([PRIORITY_MIN, sched_policy::BASELINE_PRIORITY_MAX])
     // and the elevated remainder [29, 30], which stays in init's CSpace — no
-    // spawned process can ever reach it. The kernel pins that CSpace (it is
-    // the root CSpace), so the remainder stays alive but unreachable after
-    // init's reap; releasing it at the reap is design intent, not yet
-    // implemented (`docs/process-lifecycle.md` § Init reap, #540). Both memmgr
+    // spawned process can ever reach it. The reap's teardown of init's
+    // CSpace releases the remainder (`docs/process-lifecycle.md` § Init
+    // reap). Both memmgr
     // and procmgr get a baseline copy; procmgr also uses it as the fan-out
     // source for every process it creates. (#185) Runs after
     // `spawn_log_thread`, which places init-logd from the still-unsplit root

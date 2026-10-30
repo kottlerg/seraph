@@ -94,6 +94,13 @@ const GROW_MAX_PAGES: u64 = 256;
 /// between; the trailing budget check decides either way.
 const PT_FUND_ROUNDS: u32 = 2;
 
+/// Augment rounds `fund_cspace_slot_budget` makes before giving up. A CSpace
+/// donation also gives up a page once per record page of its bookkeeping
+/// (see `SYS_CAP_CREATE_CSPACE`), so, as for `PT_FUND_ROUNDS`, a second round
+/// covers that shortfall unless other threads of the process take the slots
+/// in between; the trailing headroom check decides either way.
+const CSPACE_FUND_ROUNDS: u32 = 2;
+
 // ── Spinlock ────────────────────────────────────────────────────────────────
 
 struct SpinLock {
@@ -1133,12 +1140,12 @@ pub fn cspace_general_headroom(self_cspace: u32) -> u64 {
 /// `slots == 0` is a no-op success. Returns `false` if memmgr is
 /// unreachable, the request/augment fails (the object slab's own cap needs
 /// one free general slot), or the headroom still falls short after
-/// `PT_FUND_ROUNDS` rounds.
+/// `CSPACE_FUND_ROUNDS` rounds.
 pub fn fund_cspace_slot_budget(self_cspace: u32, slots: u64) -> bool {
     if slots == 0 {
         return true;
     }
-    for _ in 0..PT_FUND_ROUNDS {
+    for _ in 0..CSPACE_FUND_ROUNDS {
         let have = cspace_general_headroom(self_cspace);
         if have >= slots {
             return true;

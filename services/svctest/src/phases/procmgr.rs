@@ -848,9 +848,10 @@ fn undeliverable_reply_child_main() -> !
         match unsafe { ipc::ipc_call(info.memmgr_endpoint, &grant, ipc_buf) }
         {
             Ok(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED => break,
-            Ok(_) =>
-            {}
-            Err(_) => std::process::exit(UNDELIVERABLE_CALL_FAILED),
+            Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS && !reply.caps().is_empty() =>
+            {
+            }
+            _ => std::process::exit(UNDELIVERABLE_CALL_FAILED),
         }
     }
 

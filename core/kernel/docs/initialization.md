@@ -694,9 +694,9 @@ the reap-time donation of the segment, InitInfo, and stack pages in
 failed step. Invalid init_image (zero segment_count or zero entry_point) halts with
 "Phase 9: init image missing or has no entry point". A `reclaim_ranges` count above
 `MAX_RECLAIM_RANGES` halts at step 6 with
-"Phase 9: reclaim_ranges count exceeds MAX_RECLAIM_RANGES". Init's segment Memory caps not
-landing in consecutive slots halts with
-"Phase 9: init segment Memory caps are not in consecutive slots".
+"Phase 9: reclaim_ranges count exceeds MAX_RECLAIM_RANGES". Init's segment, stack, or
+InitInfo-region Memory caps not landing in consecutive slots halts with "Phase 9: init segment
+Memory caps are not in consecutive slots" (or the stack's or InitInfo's equivalent).
 
 **Completion criterion:** Init is executing in user mode (ring-3 / U-mode).
 

@@ -68,7 +68,9 @@ The concrete values of `L1_DIRECT`, `L1_INDIRECT`, `DIR_FANOUT`, and
 `L2_SIZE` are implementation constants chosen so that one `CSpacePage` fits
 a single pool page, one `CSpaceDirPage` is exactly one pool page, and every
 slot index fits the cap handle's index field. They are established at
-implementation time and are not part of the public ABI.
+implementation time; `L1_DIRECT`, `L1_INDIRECT`, and `DIR_FANOUT` are not part of the public
+ABI, while `L2_SIZE` is published as `CSPACE_SLOTS_PER_PAGE` (userspace funding arithmetic
+depends on it, and a const assert pins the two together), so changing it is an ABI change.
 `(L1_DIRECT + L1_INDIRECT × DIR_FANOUT) × L2_SIZE` is the directory's
 structural ceiling — the only slot bound a CSpace has; capacity below it is
 whatever the owner-funded slot-page pool backs (see
@@ -150,8 +152,9 @@ usable slots are appended, in ascending order, at `free_tail`. Because a general
 allocation grows while the slots of the IPC receive reserve (below) are still free,
 appending hands those out before the new leaf's, so a run of consecutive inserts gets
 consecutive indices across a leaf boundary: `InitInfo`'s contiguous Memory-cap ranges
-depend on it, and the boot population checks every run it publishes, halting on the first
-slot out of place (`cap::extend_slot_run_or_fatal`;
+depend on it, and the boot population checks every run it publishes (the RAM, hardware,
+ACPI-region, init-segment, init-stack, and InitInfo-region caps), halting on the first slot out
+of place (`cap::extend_slot_run_or_fatal`;
 [initialization.md](initialization.md) § Phase 7 and § Phase 9).
 
 A `Null` tag alone cannot tell a slot that is *linked on the free list* from one that

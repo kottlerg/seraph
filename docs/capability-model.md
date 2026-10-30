@@ -698,10 +698,9 @@ via augment-mode `cap_create_cspace` against its own `CSpace` cap. The
 current backed capacity is observable via `SYS_CAP_INFO`
 (`CAP_INFO_CSPACE_CAPACITY`); subtracting slots used
 (`CAP_INFO_CSPACE_USED`) and the IPC receive reserve yields the headroom
-general allocations may still take. ruststd's `fund_cspace_slot_budget`
-tops that headroom up from memmgr, and the long-lived services hold it
-above a low-water mark: procmgr through ruststd, memmgr from its own
-pool, and fatfs once, for its page cache, at start.
+general allocations may still take; ruststd's `fund_cspace_slot_budget`
+tops it up (see [runtime/ruststd/README.md](../runtime/ruststd/README.md)
+§ CSpace slot headroom).
 
 An `AddressSpace`'s intermediate page tables are also returned to its
 growth budget mid-life when a region is torn down: `SYS_MEM_UNMAP` with
@@ -838,6 +837,7 @@ The kernel does not provide:
 [services/memmgr/README.md](../services/memmgr/README.md),
 [memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md),
 [memmgr Memory Pool](../services/memmgr/docs/memory-pool.md),
+[services/procmgr/README.md](../services/procmgr/README.md),
 [procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md),
 [svcmgr IPC Interface](../services/svcmgr/docs/ipc-interface.md),
 [Synthetic Root and Namespace Composition](../services/vfsd/docs/namespace-composition.md),

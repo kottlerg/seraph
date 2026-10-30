@@ -1038,8 +1038,8 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
         dirs
     }
     const DIRECTORY_PAGES: u64 = directory_pages(SEEDED);
-    // Mirrors the kernel's `L2_SIZE`: slots per leaf page.
-    const SLOTS_PER_LEAF: u64 = 56;
+    // Slots per leaf page: the kernel's `L2_SIZE`, published in the ABI.
+    const SLOTS_PER_LEAF: u64 = syscall_abi::CSPACE_SLOTS_PER_PAGE;
     let memory = ctx.memory_base;
 
     let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)

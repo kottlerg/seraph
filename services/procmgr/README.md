@@ -251,6 +251,7 @@ yet implemented (#26) (see
 
 ## Summarized By
 
+[runtime/ruststd/README.md](../../runtime/ruststd/README.md),
 [Architecture Overview](../../docs/architecture.md),
 [Namespace Model](../../docs/namespace-model.md),
 [Process Lifecycle](../../docs/process-lifecycle.md),

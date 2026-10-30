@@ -1888,7 +1888,12 @@ fn hold_cspace_headroom(self_cspace: u32)
     }
     else
     {
-        let _ = pool.push(FreeRun {
+        // Return the frame to the pool, coalescing to make room. If the pool
+        // still has no run slot for it, the frame stays owned and counted
+        // but out of circulation (its cap stays in memmgr's CSpace, so
+        // nothing is freed into the sealed buddy); memmgr has no log channel
+        // to report it on.
+        let _ = pool.push_or_coalesce(FreeRun {
             cap_slot: outer,
             page_count: pages,
             phys_base: phys,

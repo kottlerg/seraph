@@ -283,6 +283,8 @@ fn donate_to_memmgr(memmgr_ep: u32, caps: &[u32], ipc_buf: *mut u64) -> (u32, u6
     let mut total_caps: u32 = 0;
     let mut total_pages: u64 = 0;
     let mut pool_total: u64 = 0;
+    // One message carries at most `MSG_CAP_SLOTS_MAX` caps; the loop below
+    // sends as many rounds as `caps` needs.
     let chunk_size = MSG_CAP_SLOTS_MAX;
     let mut i = 0;
     while i < caps.len()

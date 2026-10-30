@@ -14,7 +14,9 @@
 //!
 //! # ABI
 //! Register assignment follows `core/kernel/docs/syscalls.md` § Calling
-//! Convention; `arch::current` implements it per architecture.
+//! Convention; `arch::current` implements it per architecture. A wrapper's
+//! argument widths (`u32` cap handles, narrower `u16` and `u8` fields) are
+//! the syscall ABI's, not limits of this crate.
 
 // When pulled into std's dep graph via build-std (feature
 // `rustc-dep-of-std` on), `core` isn't yet a conventional crate — we

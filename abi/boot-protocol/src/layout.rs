@@ -179,6 +179,9 @@ pub fn direct_map_ceiling(
 }
 
 /// Upper bound of entries [`collect_mmio_direct_map_regions`] can produce.
+///
+/// Sixteen is sufficient: the producer writes one LAPIC window plus one per
+/// I/O APIC, at most `1 + MAX_IOAPICS` = 9 entries, so it tracks `MAX_IOAPICS`.
 pub const MAX_MMIO_DIRECT_MAP_REGIONS: usize = 16;
 
 // ── Kernel-internal MMIO regions mapped through the direct map ──────────────

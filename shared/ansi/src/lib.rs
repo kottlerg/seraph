@@ -23,7 +23,9 @@
 /// 24-bit RGB. Indices `0..=7` are the normal set, `8..=15` the bright set.
 /// Index 0 (Campbell `0C0C0C`) and index 15 (Campbell `F2F2F2`) are pinned
 /// to pure black / pure white so the unstyled default — and logd's always-on
-/// framebuffer mirror — stays the pre-colour monochrome output.
+/// framebuffer mirror — stays the pre-colour monochrome output. Sixteen
+/// entries is the SGR colour set the parser maps (`30..=37`, `90..=97` and
+/// their background twins); the size bounds no capacity.
 const ANSI_RGB: [[u8; 3]; 16] = [
     [0x00, 0x00, 0x00], // 0  black        (pinned; Campbell 0C0C0C)
     [0xC5, 0x0F, 0x1F], // 1  red
@@ -84,7 +86,8 @@ pub struct AnsiParser
 {
     phase: Phase,
     /// Current parameter being accumulated (saturating, so a pathological
-    /// run of digits cannot overflow-panic).
+    /// run of digits cannot overflow-panic). Every code the parser acts on
+    /// is below 256, so a saturated value is just another ignored code.
     acc: u16,
     /// Whether any digit has been seen for the current parameter; an
     /// unseen parameter resolves to `0` (e.g. `ESC[m` is `ESC[0m`).

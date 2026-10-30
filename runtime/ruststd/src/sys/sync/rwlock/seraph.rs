@@ -34,6 +34,9 @@ use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 const WRITER_BIT: u32 = 1 << 30;
 const WAITERS_BIT: u32 = 1 << 31;
 const READER_MASK: u32 = (1 << 30) - 1;
+// Provably unreachable: 2^30 concurrent read guards exceed any process's
+// thread count and the memory that could hold the guards. A reader past it
+// waits rather than overflowing the count.
 const MAX_READERS: u32 = READER_MASK - 1;
 
 pub struct RwLock {

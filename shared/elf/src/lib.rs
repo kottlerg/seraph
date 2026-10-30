@@ -871,7 +871,9 @@ where
 
 /// Upper bound on the section name string table size accepted by the
 /// streaming parser. Tier-1/2 binaries land well under 4 KiB; the cap
-/// keeps the on-stack buffer fixed without heap allocation.
+/// keeps the on-stack buffer fixed without heap allocation. The table holds
+/// only section names, a fixed set the linker emits, so program size does
+/// not grow it.
 const MAX_STREAMING_STRTAB: usize = 4096;
 
 /// Upper bound on the note section size accepted by the streaming

@@ -107,6 +107,7 @@ pub fn direct_map_base() -> u64
 }
 
 /// Size of a 2 MiB large page (used for the direct physical map).
+/// Fixed by hardware: an x86-64 PDE leaf and an Sv39 level-1 megapage each map 2 MiB.
 pub const LARGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
 
 /// Convert a physical address to its direct-map virtual address.

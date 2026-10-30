@@ -505,6 +505,10 @@ pub enum SyscallError
 /// userspace priority authority; the kernel mints init's cap with this span.
 pub const PRIORITY_MIN: u8 = 1;
 /// Maximum priority available to userspace threads.
+///
+/// The span is an ABI width: the kernel's run-queue bitmask is a `u32`
+/// (`NUM_PRIORITY_LEVELS` = 32), whose level 0 is the idle band and whose
+/// level 31 is reserved above this one.
 pub const PRIORITY_MAX: u8 = 30;
 
 // ── Event Queue constants ─────────────────────────────────────────────────────
@@ -520,9 +524,18 @@ pub const EVENT_QUEUE_MAX_CAPACITY: u32 = 4096;
 /// Supports transferring a full 512-byte disk sector (64 words) inline.
 /// Data is read from / written to the sender/receiver's IPC buffer page.
 /// Cap metadata starts at word `MSG_DATA_WORDS_MAX` in the IPC buffer.
+///
+/// The value is an ABI width: the cap count and the handles follow it at fixed
+/// word offsets, and all of them fit the one IPC buffer page. It bounds only
+/// the inline payload of one message; bulk data travels as a Memory cap.
 pub const MSG_DATA_WORDS_MAX: usize = 64;
 
 /// Maximum number of capability slots transferable in a single IPC message.
+///
+/// Four is an encoding artefact: the handles travel two `u32`s per transfer
+/// register (`pack_cap_handles`). It bounds caps per message, not per
+/// transfer: every protocol that moves more caps iterates over rounds, as the
+/// `shared/ipc` bootstrap rounds and procmgr's `DONATE_MEMORY_CAPS` rounds do.
 pub const MSG_CAP_SLOTS_MAX: usize = 4;
 
 // The two-word transfer layout (`pack_cap_handles` / `unpack_cap_handles`)
@@ -1002,7 +1015,9 @@ const fn pack_project_version(s: &str) -> u64
 /// version are one number, governed by the project-version semantics in
 /// `docs/conventions.md`. Syscall-ABI compatibility is not expressed here; it
 /// is tracked per protocol by the dedicated `*_VERSION` constants in the
-/// `abi/` crates.
+/// `abi/` crates. The 32/16/16 field widths are an encoding artefact of
+/// fitting one return register and bound no capacity: version components stay
+/// far below 2^16.
 pub const KERNEL_VERSION: u64 = pack_project_version(env!("CARGO_PKG_VERSION"));
 
 /// Discriminant for `SYS_SYSTEM_INFO` queries.

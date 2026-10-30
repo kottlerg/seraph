@@ -68,7 +68,8 @@ use crate::mm::PAGE_SIZE;
 use syscall::SyscallError;
 
 /// Sub-page size classes. Each retype request is rounded up to one of these
-/// or to a page multiple. Tunable as the object catalogue evolves.
+/// or to a page multiple. Tunable as the object catalogue evolves. They set
+/// rounding, not capacity: a request above `BIN_512` takes whole pages.
 const BIN_128: u64 = 128;
 const BIN_512: u64 = 512;
 
@@ -411,6 +412,7 @@ unsafe fn try_alloc_page_block(
     while cur != FREE_LIST_END
     {
         iter += 1;
+        // Tracked by #634: a list longer than 1024 nodes is reported as a cycle.
         if iter > 1024
         {
             crate::kprintln!(

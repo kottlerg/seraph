@@ -55,6 +55,7 @@ const ORDER_COUNT: usize = MAX_ORDER + 1;
 
 /// Maximum simultaneously tracked free blocks across all orders.
 /// 4096 entries ≈ 32 GiB at order 11 (8 MiB per block).
+/// Tracked by #632: the pool exhausts above about 32 GiB of RAM and `push_block` halts the boot.
 const POOL_SIZE: usize = 4096;
 
 /// Sentinel slot index meaning "end of list" or "empty".

@@ -124,6 +124,8 @@ fn orphan_teardown_phase(caps: &Caps)
     // The child reserves ~1 MiB before hanging; the margin absorbs unrelated
     // allocator noise in the sampling window.
     const MARGIN_BYTES: u64 = 128 * 1024;
+    // A test wait bound: it limits only how long the phase polls before it
+    // fails.
     const MAX_POLL: u32 = 4096;
     // `free_bytes` samples memmgr's *whole-pool* free total, so the
     // before/after delta folds in any allocation other services perform in the

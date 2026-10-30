@@ -74,7 +74,8 @@ struct TagPool
     claimed_at: [u64; TAG_CAP],
     /// Number of usable tags; tags `1..num_tags` may be allocated.
     num_tags: usize,
-    /// Monotonic claim counter; never reused (64-bit).
+    /// Monotonic claim counter; never reused (64-bit). A `u64` cannot wrap: at
+    /// one claim per nanosecond it lasts over 500 years.
     alloc_gen: u64,
 }
 

@@ -231,6 +231,8 @@ pub struct Sha512
     h: [u64; 8],
     buf: [u8; BLOCK_LEN],
     buf_len: usize,
+    /// Bytes hashed so far; `u128` because FIPS 180-4 appends the message
+    /// length as a 128-bit field.
     total_len: u128,
 }
 

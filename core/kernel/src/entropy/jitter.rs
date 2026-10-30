@@ -23,7 +23,8 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use super::pool;
 use crate::mm::BuddyAllocator;
 
-/// Staging words per CPU.
+/// Staging words per CPU. Samples fold round-robin into them (`n % ACC_WORDS`),
+/// so the 256-bit buffer bounds no sample count.
 const ACC_WORDS: usize = 4;
 
 /// Distinct event classes sampled, for source diversity (`tick`, `irq`).

@@ -205,7 +205,9 @@ pub fn read_file_data(
     let sector_in_cluster = offset_in_cluster / u32::from(state.bytes_per_sector);
     let offset_in_sector = (offset_in_cluster % u32::from(state.bytes_per_sector)) as usize;
 
-    // Walk the cluster chain to the target cluster.
+    // Walk the cluster chain to the target cluster. `offset` is below the
+    // `u32` file size, so the walk ends within `u32::MAX / cluster_size`
+    // steps even on a cyclic chain.
     let mut cluster = req.start_cluster;
     for _ in 0..cluster_idx
     {

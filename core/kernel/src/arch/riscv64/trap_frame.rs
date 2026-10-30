@@ -104,7 +104,8 @@ impl TrapFrame
     }
 
     /// Read syscall argument `n` (0-indexed).
-    /// Mapping: 0=a0, 1=a1, 2=a2, 3=a3, 4=a4, 5=a5.
+    /// Mapping: 0=a0, 1=a1, 2=a2, 3=a3, 4=a4, 5=a5. Six is the syscall
+    /// register convention's argument count.
     pub fn arg(&self, n: usize) -> u64
     {
         match n

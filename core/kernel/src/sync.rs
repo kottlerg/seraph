@@ -30,6 +30,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// `now_serving` (ticket currently allowed to hold the lock). Fairness is
 /// guaranteed: waiters are served in acquisition order.
 ///
+/// Both counters wrap, which is harmless: `lock_raw` compares tickets only for
+/// equality, and at most one waiter per CPU is outstanding, far below 2^32.
+///
 /// Interrupts are disabled on `lock_raw` and restored on `unlock_raw`,
 /// preventing deadlock from timer preemption.
 pub struct Spinlock

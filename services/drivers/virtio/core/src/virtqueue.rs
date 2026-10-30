@@ -108,7 +108,10 @@ pub struct SplitVirtqueue
     free_head: u16,
     /// Number of free descriptors.
     num_free: u16,
-    /// Last seen used ring index (for polling completions).
+    /// Last seen used ring index (for polling completions). A free-running
+    /// `u16` like the ring's own `idx` (`VirtIO` 1.2 §2.7.8); it wraps by spec,
+    /// and `% queue_size` stays exact because a split ring's size is a power
+    /// of two.
     last_used_idx: u16,
     /// Descriptor count of the chain each outstanding head starts, indexed
     /// by head; 0 marks an index that heads no outstanding chain.

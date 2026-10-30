@@ -150,6 +150,8 @@ fn handle_request(
     else if msg.label & 0xFFFF == fb_labels::FB_WRITE_BYTES
     {
         // The mask bounds the length to 16 bits, so the conversion cannot fail.
+        // 16 label bits exceed the 512 bytes one message's data words carry,
+        // and `n` clamps to those bytes.
         let byte_len = usize::try_from((msg.label >> 16) & 0xFFFF).unwrap_or(0);
         let bytes = msg.data_bytes();
         let n = byte_len.min(bytes.len());

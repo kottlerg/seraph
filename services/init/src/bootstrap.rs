@@ -86,7 +86,9 @@ fn choose_image_bias_or_default() -> u64
 }
 
 /// Log `prefix` followed by a lowercase hex value (init's `log` takes only
-/// plain `&str`; no `core::fmt` in the `no_std` bootstrap path).
+/// plain `&str`; no `core::fmt` in the `no_std` bootstrap path). The 96-byte
+/// buffer is a diagnostic output cap: a longer prefix truncates and nothing
+/// else is bounded.
 fn log_hex(prefix: &str, value: u64)
 {
     let mut buf = [0u8; 96];

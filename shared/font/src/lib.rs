@@ -23,7 +23,8 @@ pub const GLYPH_WIDTH: u32 = 9;
 pub const GLYPH_HEIGHT: u32 = 20;
 
 /// Flat 9×20 bitmap font, CP437-indexed: glyph N row R is at `[N * 20 + R]`;
-/// bits 15–7 of each `u16` are the 9 pixels, MSB leftmost.
+/// bits 15–7 of each `u16` are the 9 pixels, MSB leftmost. Its 256 glyphs
+/// are the 256 CP437 code points.
 pub static FONT_9X20: [u16; 5120] = [
     // glyph 0
     0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
@@ -540,7 +541,9 @@ pub static FONT_9X20: [u16; 5120] = [
     0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
 ];
 
-/// Number of extension glyphs in [`FONT_9X20_EXT`].
+/// Number of extension glyphs in [`FONT_9X20_EXT`]: one per non-CP437 code
+/// point the tree renders. It bounds no input, since a code point with no
+/// glyph renders as slot 0's `U+FFFD`.
 pub const FONT_9X20_EXT_COUNT: usize = 20;
 
 /// Extension bitmap font for codepoints used by the codebase but not

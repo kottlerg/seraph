@@ -303,6 +303,10 @@ pub struct InitSegment
 /// Maximum number of ELF LOAD segments in init.
 ///
 /// Must match the bootloader's segment array capacity.
+///
+/// Eight is provably sufficient: the in-tree init links to four or five LOAD
+/// segments, and the bootloader fails the load with an error on a ninth
+/// rather than truncating.
 pub const INIT_MAX_SEGMENTS: usize = 8;
 
 /// Maximum number of logical CPUs representable in [`BootInfo::cpu_ids`].
@@ -691,6 +695,9 @@ pub struct ReclaimRange
     /// Page-aligned physical base address.
     pub phys_base: u64,
     /// Number of 4 KiB pages covered. Non-zero.
+    ///
+    /// The `u32` width keeps the entry at 16 bytes and still spans 16 TiB,
+    /// far beyond any bootloader scratch range.
     pub page_count: u32,
     /// Per-entry flags. See [`RECLAIM_FLAG_LATE`]. All other bits are
     /// reserved; producers MUST write zero for them.
@@ -897,6 +904,9 @@ pub struct BootInfo
     /// Absorbed directly without raw-source health gating: a conditioned
     /// `EFI_RNG_PROTOCOL` output, or the firmware-supplied bytes of the DTB
     /// fallback (see `core/kernel/docs/entropy.md` § Health tests).
+    ///
+    /// Thirty-two bytes is a 256-bit seed, the security strength of the
+    /// kernel's SHAKE256 pool, so a longer seed would add nothing.
     pub boot_entropy_seed: [u8; 32],
 
     /// Number of valid leading bytes in `boot_entropy_seed`. `0` means the

@@ -24,7 +24,8 @@ pub const MAX_NAME_LEN: usize = 48;
 /// Number of completed log lines retained per slot for future query
 /// surfaces. Bounded to keep total memory predictable at ~10k senders
 /// (10k * 16 * 256 ≈ 40 MiB worst case if every sender saturates;
-/// in practice most slots stay near empty).
+/// in practice most slots stay near empty). A retention tuning value that
+/// bounds no capacity: `push_history` drops the oldest line, never a sender.
 pub const PER_SLOT_HISTORY: usize = 16;
 
 /// One retained completed line. Fields are written at line-flush
@@ -76,6 +77,7 @@ impl Slot
 #[derive(Default)]
 pub struct SlotTable
 {
+    /// Live slots by badge. Grows with the sender count, so it sets no ceiling.
     pub slots: HashMap<u64, Slot>,
 }
 

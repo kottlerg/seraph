@@ -172,6 +172,8 @@ static HIGH_WATER_CSPACE_ID: AtomicU32 = AtomicU32::new(0);
 /// intervening recycle, so a recycled id does not alias a foreign derivation
 /// link into the new tenant beyond that accepted residual (see
 /// `core/kernel/docs/capability-internals.md` § Representation).
+/// The width is `u32` because `SlotId.epoch` fixes it: widening would grow the
+/// 12-byte `SlotId` and the 72-byte `CapabilitySlot` that embeds four of them.
 ///
 /// `align(16)` colocates `ptr` and `epoch` on the same cache line and leaves
 /// room for a future 16-byte CAS if contention warrants it.
@@ -2010,6 +2012,7 @@ fn populate_cspace(
 fn read_dtb_totalsize(phys: u64) -> Option<u64>
 {
     const FDT_MAGIC: u32 = 0xd00d_feed;
+    // Tracked by #635: a larger DTB is not minted.
     const DTB_MAX_SIZE: u64 = 64 * 1024;
 
     // `phys` is in the direct physical map (active since Phase 3). The

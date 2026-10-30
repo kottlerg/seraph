@@ -67,10 +67,13 @@ use process_layout::{INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW};
 /// Degraded-fallback base of the read-only `InitInfo` region mapped into init,
 /// used only when the entropy pool is unavailable at the layout draw. The
 /// region spans up to `INIT_INFO_MAX_PAGES` contiguous pages from this address.
+/// A fixed VA below the 256 GiB Sv39 user top, so the fallback is valid on both
+/// architectures; it bounds no count.
 pub const DEFAULT_INIT_INFO_VA: u64 = 0x3F_FFFF_5000;
 
 /// Degraded-fallback top of init's user stack. `INIT_STACK_PAGES` pages map
-/// immediately below, with one unmapped guard page beneath them.
+/// immediately below, with one unmapped guard page beneath them. A fixed VA
+/// below the 256 GiB Sv39 user top, like `DEFAULT_INIT_INFO_VA`.
 pub const DEFAULT_INIT_STACK_TOP: u64 = 0x3F_FFFF_E000;
 
 /// Bootstrap virtual addresses the kernel chooses for the init process.
@@ -206,6 +209,8 @@ pub struct AddressSpace
     /// Shootdown). The teardown's `tag_allocator::free_tag` reads it under the
     /// lock, so an eviction cannot hand the dying space's tag to another space
     /// between the read and the free (see the `tag_allocator` § Concurrency).
+    /// `u16` holds every hardware tag: x86-64 PCIDs are 12 bits and RISC-V
+    /// ASIDs at most 16 (`satp.ASID`).
     // dead_code: the tag fields are accessed only on `#[cfg(not(test))]` paths
     // (activate / shootdown / destroy), so host-test builds see them as unread.
     #[cfg_attr(test, allow(dead_code))]
@@ -214,7 +219,8 @@ pub struct AddressSpace
     /// current `tag`. Globally unique per claim; distinguishes this space's
     /// claim on a tag from any later space that reuses the same tag value, so a
     /// per-CPU generation check flushes a tag before its first use under a new
-    /// owner.
+    /// owner. A `u64` cannot wrap: at one claim per nanosecond it lasts over 500
+    /// years.
     // dead_code: like `tag`, read only on `#[cfg(not(test))]` paths; unread in host-test builds.
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) tag_gen: AtomicU64,
@@ -223,6 +229,8 @@ pub struct AddressSpace
     /// A CPU switched away from this space compares its last-synced value
     /// against this on reactivation and flushes the tag if it lags, catching
     /// unmaps it missed while it was elsewhere.
+    /// A `u64` cannot wrap: at one modification per nanosecond it lasts over 500
+    /// years.
     // dead_code: like `tag`, read only on `#[cfg(not(test))]` paths; unread in host-test builds.
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) tlb_gen: AtomicU64,

@@ -27,7 +27,7 @@ pub struct CpuRng
     seeded: bool,
     /// VMGENID GUID this generator last reseeded under; a live mismatch means
     /// the whole VM (this generator included) may be a replayed snapshot.
-    /// Zero when the platform has no VMGENID.
+    /// Zero when the platform has no VMGENID. 16 bytes: the GUID is 128 bits.
     guid_seen: [u8; 16],
     /// `elapsed_us` timestamp of the last successful reseed (0 = none/uncalibrated).
     last_reseed_us: u64,

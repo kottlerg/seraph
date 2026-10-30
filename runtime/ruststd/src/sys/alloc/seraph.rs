@@ -51,7 +51,9 @@ use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 const HEAP_BASE_DEFAULT: u64 = 0x0000_0000_4000_0000;
 
 /// Log2 of the number of page-aligned heap-base slots (= bits of base
-/// entropy). The drawn base lies in `[1 GiB, 3 GiB)`.
+/// entropy). The drawn base lies in `[1 GiB, 3 GiB)`. The value is an
+/// encoding artefact of the zone map: 2^19 pages span the 2 GiB draw window
+/// that keeps base plus `HEAP_SPAN` under 4 GiB, so it bounds entropy only.
 const HEAP_BASE_SLOTS_LOG2: u32 = 19;
 
 /// Maximum heap size from the drawn base. Growth beyond `base + HEAP_SPAN`
@@ -333,7 +335,9 @@ impl Heap {
         let mut mapped: u64 = 0;
         // memmgr's reply slot count is bounded; if a single best-effort
         // call satisfies fewer pages than requested, loop. Bound the
-        // retry count so a misbehaving memmgr cannot wedge the caller.
+        // retry count so a misbehaving memmgr cannot wedge the caller. A
+        // correct memmgr never reaches it: `REQUEST_MEMORY_CAPS` grants the
+        // whole request or fails, so one round suffices.
         const MAX_ROUNDS: u32 = 16;
         let mut rounds: u32 = 0;
         let complete = loop {

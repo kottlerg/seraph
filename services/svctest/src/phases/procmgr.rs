@@ -754,7 +754,7 @@ const UNDELIVERABLE_CALL_FAILED: i32 = 6;
 /// and other processes (crasher shares the boot) can move it inside one.
 const UNDELIVERABLE_WINDOWS: u32 = 8;
 /// Pool queries per window while procmgr's teardown of the created child
-/// reaches memmgr.
+/// reaches memmgr. A test wait bound: it limits only how long a window polls.
 const UNDELIVERABLE_POLLS: u32 = 256;
 
 /// Child role: exhaust this process's `CSpace` so procmgr's two-cap create

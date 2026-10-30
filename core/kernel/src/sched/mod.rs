@@ -40,7 +40,7 @@ pub const IDLE_PRIORITY: u8 = 0;
 
 /// Default time-slice length in preemption-timer ticks. Decremented by
 /// `timer_tick` on every tick; a thread is preempted when its counter
-/// reaches zero.
+/// reaches zero. A tuning value; it bounds no capacity.
 pub const TIME_SLICE_TICKS: u32 = 10;
 
 /// Number of 4 KiB pages in each idle thread's kernel stack (16 KiB total).

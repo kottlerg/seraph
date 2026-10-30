@@ -659,7 +659,9 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
     // Pack 2 page_counts per data word: low 32 bits = even index, high
-    // 32 bits = odd index. Mirror this on memmgr's parser.
+    // 32 bits = odd index. Mirror this on memmgr's parser. The 64 words are
+    // `MSG_DATA_WORDS_MAX`, one round's data; `MAX_MEMORY_CAPS` is sized so
+    // the 3-word prefix plus every packed count fits it.
     let mut mm_boot_data = [0u64; 64];
     mm_boot_data[0] = u64::from(mm_final.mm_memory_base);
     mm_boot_data[1] = u64::from(mm_final.mm_memory_count);

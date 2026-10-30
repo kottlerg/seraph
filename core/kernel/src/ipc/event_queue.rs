@@ -40,7 +40,9 @@ pub struct EventQueueState
     /// slots. Owned by the surrounding retype slot, not by this struct;
     /// no separate free is required at drop.
     pub ring: *mut u64,
-    /// User-visible capacity (max concurrent entries).
+    /// User-visible capacity (max concurrent entries). `u32` holds it and the
+    /// `count`, `write_idx` and `read_idx` it bounds: `sys_cap_create_event_queue`
+    /// refuses a capacity above `EVENT_QUEUE_MAX_CAPACITY`.
     pub capacity: u32,
     /// Current number of entries in the ring: the lockless readiness signal that
     /// `wait_set::source_is_ready` reads, mutated only under `lock` with Release

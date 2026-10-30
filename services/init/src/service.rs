@@ -1311,15 +1311,14 @@ pub fn phase3_svcmgr_handover(
 
     // Serve svcmgr its handover endowment: the CAPS rounds carry svcmgr's own
     // endpoints plus the publish-role source caps (rootfs root, devmgr
-    // registry, the two vfsd SENDs), then one round per init-bootstrapped substrate service
-    // carries that service's (name, thread_cap) for death-supervision
-    // binding, and the terminal round carries the reserved log-sink sources.
-    // svcmgr drains it all in `bootstrap_caps`, publishes the well-known
-    // names it owns (`rootfs.root` / `svcmgr` / the `devmgr.*` and `vfsd.*`
-    // names), installs
-    // devmgr's drivers dir, and reconciles `/config/svcmgr/services/` on
-    // HANDOVER_COMPLETE — launching logd/timed/pwrmgr and acquiring their
-    // caps for them.
+    // registry, the two vfsd SENDs), then one round per init-bootstrapped
+    // substrate service carries that service's (name, thread_cap) for
+    // death-supervision binding, and the terminal round carries the reserved
+    // log-sink sources. svcmgr drains it all in `bootstrap_caps`, publishes
+    // the well-known names it owns (`rootfs.root` / `svcmgr` / the `devmgr.*`
+    // and `vfsd.*` names), installs devmgr's drivers dir, and reconciles
+    // `/config/svcmgr/services/` on HANDOVER_COMPLETE — launching
+    // logd/timed/pwrmgr and acquiring their caps for them.
     //
     // The publish source for `rootfs.root` is the seed system-root cap
     // (vfsd's synthetic root): vfsd self-mounts root, so there is no

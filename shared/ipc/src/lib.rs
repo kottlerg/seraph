@@ -900,9 +900,10 @@ pub mod svcmgr_labels
 /// three `devmgr.*` names, [`published_names::VFSD_MOUNT`], and each provider
 /// name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
 /// `pwrmgr.shutdown`) resolve only through a recipe's `seed = ...` line, and
-/// `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`. [`published_names::VFSD_DENY`]
-/// carries no authority but is seed-only too, as svctest's test twin. `svcmgr`, `pwrmgr.deny`, `timed`, and any name
-/// published through [`svcmgr_labels::PUBLISH_ENDPOINT`] are public
+/// `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`.
+/// [`published_names::VFSD_DENY`] carries no authority but is seed-only
+/// too, as svctest's test twin. `svcmgr`, `pwrmgr.deny`, `timed`, and any
+/// name published through [`svcmgr_labels::PUBLISH_ENDPOINT`] are public
 /// (services/svcmgr/docs/ipc-interface.md § Label 4).
 pub mod published_names
 {

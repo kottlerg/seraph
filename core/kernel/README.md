@@ -25,7 +25,7 @@ core/kernel/
 │   ├── framebuffer.rs          # Framebuffer text renderer
 │   ├── irq.rs                  # IRQ routing table: lines to notification objects
 │   ├── percpu.rs               # Per-CPU private state
-│   ├── platform.rs             # Phase 6 platform resource validation
+│   ├── platform.rs             # kernel_mmio cache (Phase 4), Phase 6 MMIO-aperture validation
 │   ├── sync.rs                 # Kernel synchronisation primitives
 │   ├── uaccess.rs              # Fault-recoverable user-memory copies
 │   ├── validate.rs             # Phase 0 boot-info validation

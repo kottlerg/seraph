@@ -840,6 +840,7 @@ The handler then drains the target.
 
 ## Summarized By
 
+[core/kernel/README.md](../README.md),
 [Capability Subsystem Internals](capability-internals.md),
 [Kernel Initialization Sequence](initialization.md), [IPC Subsystem Internals](ipc-internals.md),
 [SMP Scheduler/IPC Hotpath Redesign — per-TCB `sched_lock` (authoritative serializer)](sched-ipc-redesign.md),

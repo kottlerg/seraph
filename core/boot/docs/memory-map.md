@@ -150,6 +150,8 @@ and kernel cannot disagree. See
 §"Phase 3: Kernel Page Tables". The direct-map placement rule is owned by
 [memory-model.md](../../../docs/memory-model.md) § Virtual Address Space Layout.
 
+---
+
 ## What Lives Elsewhere
 
 - The `ExitBootServices` retry protocol and its stale-key semantics

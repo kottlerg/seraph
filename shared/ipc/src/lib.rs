@@ -1385,10 +1385,10 @@ pub mod devmgr_labels
     /// #664); `data[1]`, when sent, selects which: an ordinal over the
     /// running block drivers in PCI segment, bus, device, function order,
     /// not stable across boots (a device added, removed, or failing its
-    /// spawn shifts the ones after it). An absent `data[1]` is 0, the first. Caller's badge must have
-    /// [`BLOCK_DEVICE_AUTHORITY`] set; the handler replies `UNAUTHORIZED`
-    /// otherwise, and `INVALID_REQUEST` when no block driver runs at that
-    /// ordinal or the derivation fails.
+    /// spawn shifts the ones after it). An absent `data[1]` is 0, the first.
+    /// Caller's badge must have [`BLOCK_DEVICE_AUTHORITY`] set; the handler
+    /// replies `UNAUTHORIZED` otherwise, and `INVALID_REQUEST` when no block
+    /// driver runs at that ordinal or the derivation fails.
     pub const QUERY_BLOCK_DEVICE: u64 = 1;
     /// Query a device's startup-info payload from devmgr's catalog.
     ///

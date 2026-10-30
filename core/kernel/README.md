@@ -210,9 +210,8 @@ See [`docs/syscalls.md`](docs/syscalls.md). The audit classifying
 every cross-boundary output (syscall, IPC, fault, exit) for kernel-virtual-address
 disclosure is in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md);
 it records the open disclosures: the exposures through
-donated memory, bootloader-reclaimed frames, and mirrored console output
+donated memory and mirrored console output
 ([#577](https://github.com/kottlerg/seraph/issues/577),
-[#439](https://github.com/kottlerg/seraph/issues/439),
 [#440](https://github.com/kottlerg/seraph/issues/440)).
 
 ---

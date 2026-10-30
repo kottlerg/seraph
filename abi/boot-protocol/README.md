@@ -72,8 +72,28 @@ A compliant bootloader MUST NOT:
 - Leave UEFI boot services active at kernel entry.
 - Assume anything about the kernel's internal layout beyond the ELF
   headers.
-- Include in `BootInfo.mmio_apertures` any region that is inaccessible
-  or reserved for firmware's exclusive use.
+- Include in `BootInfo.mmio_apertures` any region that is inaccessible,
+  RAM (a region the memory map classifies as `Usable`, `Loaded`,
+  `AcpiReclaimable`, or `Persistent`), or reserved for firmware's exclusive
+  use: UEFI runtime-services code and data, ACPI NVS, and firmware-reserved
+  memory that no naming source names as a device's registers or frame buffer.
+  The naming sources are a firmware table, the device tree, the framebuffer,
+  and a register window the bootloader fixes at the address the platform it is
+  built for defines (a UART, RTC, or ECAM window). Such a fixed window holds
+  only on that platform: a bootloader that cannot identify the platform it
+  runs on applies it on every boot of its architecture on which it uses that
+  window (the reference bootloader: every riscv64 boot whose ACPI validates).
+  A region firmware reports as reserved MAY be included where a naming source
+  names it (the GOP framebuffer, an interrupt controller, an ECAM window). A
+  PCI window placed by a layout heuristic rather than named by such a source
+  MUST exclude every range the memory map describes other than MMIO. The
+  reference bootloader's rule, and the platform its riscv64 fixed windows
+  assume, are in
+  [core/boot/docs/firmware-parsing.md](../../core/boot/docs/firmware-parsing.md)
+  § Firmware exclusion. The kernel rejects an aperture that intersects RAM at
+  Phase 6
+  ([core/kernel/docs/initialization.md](../../core/kernel/docs/initialization.md)
+  § Phase 6).
 
 ---
 

@@ -157,9 +157,9 @@ For each PT_LOAD segment:
 1. Reject PF_W | PF_X with BootError::WxViolation; derive flags otherwise.
 2. AllocatePages(AllocateAnyPages, EfiLoaderData, page_count, &phys_base).
    page_count = ceil(((p_vaddr mod PAGE_SIZE) + p_memsz) / PAGE_SIZE).
-3. Copy p_filesz bytes from file offset p_offset into phys_base + (p_vaddr mod PAGE_SIZE).
-4. Zero the BSS tail:
-   memset(phys_base + (p_vaddr mod PAGE_SIZE) + p_filesz, 0, p_memsz - p_filesz).
+3. Zero the whole allocation (page_count * PAGE_SIZE bytes): the slack before the
+   in-page offset and past p_memsz, and the BSS tail [p_filesz, p_memsz).
+4. Copy p_filesz bytes from file offset p_offset into phys_base + (p_vaddr mod PAGE_SIZE).
 5. Record an InitSegment { phys_addr: phys_base + (p_vaddr mod PAGE_SIZE),
    virt_addr: p_vaddr, size: p_memsz, flags }.
 ```

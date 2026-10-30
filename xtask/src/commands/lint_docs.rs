@@ -1125,21 +1125,36 @@ fn strip_line_comments(text: &str) -> String
 
 /// Whether the path pattern `pattern` (`*` within one component) names a
 /// tracked file; a pattern without `/` is a file name in any directory.
-fn path_resolves(pattern: &str, tracked: &[String]) -> std::result::Result<bool, regex::Error>
+fn path_resolves(pattern: &str, tracked: &[String]) -> bool
 {
-    let anchor = if pattern.contains('/')
+    let want: Vec<&str> = pattern.split('/').collect();
+    tracked.iter().any(|path| {
+        let have: Vec<&str> = path.split('/').collect();
+        if want.len() == 1
+        {
+            have.last().is_some_and(|name| glob_matches(want[0], name))
+        }
+        else
+        {
+            want.len() == have.len() && want.iter().zip(&have).all(|(w, h)| glob_matches(w, h))
+        }
+    })
+}
+
+/// Whether `name` matches `glob`, where `*` matches any run of characters and
+/// every other character matches itself.
+fn glob_matches(glob: &str, name: &str) -> bool
+{
+    match glob.split_once('*')
     {
-        "^"
+        None => glob == name,
+        Some((head, rest)) => name.strip_prefix(head).is_some_and(|tail| {
+            tail.char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(tail.len()))
+                .any(|i| glob_matches(rest, &tail[i..]))
+        }),
     }
-    else
-    {
-        "(?:^|/)"
-    };
-    let re = Regex::new(&format!(
-        "{anchor}{}$",
-        regex::escape(pattern).replace(r"\*", "[^/]*")
-    ))?;
-    Ok(tracked.iter().any(|p| re.is_match(p)))
 }
 
 /// Whether the symbol pattern `pattern` matches, as a whole word, in `code`.
@@ -1149,19 +1164,25 @@ fn symbol_resolves(pattern: &str, code: &str) -> std::result::Result<bool, regex
 }
 
 /// Why `name` fails to resolve, or `None` when it resolves.
-fn unresolved(name: &ListedName, code: &str, tracked: &[String]) -> Option<&'static str>
+fn unresolved(name: &ListedName, code: &str, tracked: &[String]) -> Option<String>
 {
-    let resolved = match name.kind
+    match name.kind
     {
-        NameKind::Symbol => symbol_resolves(&name.pattern, code),
-        NameKind::Path => path_resolves(&name.pattern, tracked),
-    };
-    match (resolved, &name.kind)
-    {
-        (Ok(true), _) => None,
-        (Ok(false), NameKind::Symbol) => Some("names nothing in the code of a tracked Rust source"),
-        (Ok(false), NameKind::Path) => Some("names no tracked file"),
-        (Err(_), _) => Some("is not a valid regular expression"),
+        NameKind::Path =>
+        {
+            (!path_resolves(&name.pattern, tracked)).then(|| "names no tracked file".to_owned())
+        }
+        NameKind::Symbol => match symbol_resolves(&name.pattern, code)
+        {
+            Ok(true) => None,
+            Ok(false) => Some("names nothing in the code of a tracked Rust source".to_owned()),
+            // A syntax error renders as the pattern, a caret line, and the
+            // reason; the reason is the last line.
+            Err(err) => Some(format!(
+                "is not a valid regular expression ({})",
+                err.to_string().lines().last().unwrap_or_default().trim()
+            )),
+        },
     }
 }
 
@@ -1661,7 +1682,8 @@ mod tests
         let diags = coverage_check(&coverage_doc("", "|send_(wake"));
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert!(
-            diags[0].1.contains("not a valid regular expression"),
+            diags[0].1.contains("not a valid regular expression (")
+                && diags[0].1.contains("unclosed group"),
             "{}",
             diags[0].1
         );

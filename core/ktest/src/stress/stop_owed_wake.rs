@@ -325,10 +325,10 @@ fn with_children(
     // Deleting a thread tears the child down wherever it is, so the stacks
     // are free for the next test even when a round failed.
     let mut ok = true;
-    for child in children.iter().flatten()
+    for child in children.iter_mut().flatten()
     {
-        ok &= cap_delete(child.th).is_ok();
-        ok &= cap_delete(child.cs).is_ok();
+        ok &= child.delete_thread().is_ok();
+        ok &= child.delete_cspace().is_ok();
     }
     ok &= cap_delete(sig).is_ok();
     let armed = result?;

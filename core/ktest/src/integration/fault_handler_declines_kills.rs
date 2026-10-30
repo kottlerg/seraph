@@ -42,7 +42,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "fault_handler_declines_kills: cap_create_endpoint failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "fault_handler_declines_kills: spawn::new_child failed")?;
     crate::bind_fault_handler(child.th, ep, FAULT_BADGE)
         .map_err(|_| "fault_handler_declines_kills: thread_set_fault_handler failed")?;
@@ -74,8 +74,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("fault_handler_declines_kills: wrong exit reason after KILL");
     }
 
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     cap_delete(ep).ok();
     Ok(())
 }

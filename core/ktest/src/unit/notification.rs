@@ -49,7 +49,7 @@ pub fn send_wait_blocking(ctx: &TestContext) -> TestResult
         .map_err(|_| "create_notification for blocking-wait test failed")?;
 
     // Create a child CSpace + thread, copy the notification cap (NOTIFY right only).
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "spawn::new_child for blocking-wait test failed")?;
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy notification into child CSpace failed")?;
@@ -70,7 +70,9 @@ pub fn send_wait_blocking(ctx: &TestContext) -> TestResult
     }
 
     cap_delete(sig).map_err(|_| "cap_delete sig after blocking-wait test failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after blocking-wait test failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after blocking-wait test failed")?;
     Ok(())
 }
 
@@ -272,7 +274,7 @@ pub fn wait_high_bit_parked_wakeup(ctx: &TestContext) -> TestResult
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for wait_high_bit_parked_wakeup failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "spawn::new_child for wait_high_bit_parked_wakeup failed")?;
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy notification into child CSpace failed")?;
@@ -297,7 +299,9 @@ pub fn wait_high_bit_parked_wakeup(ctx: &TestContext) -> TestResult
     }
 
     cap_delete(sig).map_err(|_| "cap_delete sig after wait_high_bit_parked_wakeup failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after wait_high_bit_parked_wakeup failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after wait_high_bit_parked_wakeup failed")?;
     Ok(())
 }
 

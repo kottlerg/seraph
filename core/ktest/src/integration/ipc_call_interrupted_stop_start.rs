@@ -145,10 +145,10 @@ pub fn run(ctx: &TestContext) -> TestResult
              non-Interrupted result (stale reply surfaced — #361)",
         );
     }
-    cap_delete(client.th)
-        .map_err(|_| "integration::ipc_call_interrupted_stop_start: reap p1 client failed")?;
-    cap_delete(client.cs)
-        .map_err(|_| "integration::ipc_call_interrupted_stop_start: reap p1 cs failed")?;
+    reap(
+        client,
+        "integration::ipc_call_interrupted_stop_start: reap p1 client failed",
+    )?;
     cap_delete(ep1).map_err(|_| "integration::ipc_call_interrupted_stop_start: del ep1 failed")?;
 
     // ── Phase 2: stop while BlockedOnReply (server recvs, never replies). ───
@@ -214,20 +214,30 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // ── Cleanup. The server is parked on `block`; deleting its TCB reaps it. ─
-    cap_delete(client2.th)
-        .map_err(|_| "integration::ipc_call_interrupted_stop_start: reap p2 client failed")?;
-    cap_delete(client2.cs)
-        .map_err(|_| "integration::ipc_call_interrupted_stop_start: reap p2 cs failed")?;
-    cap_delete(server.th)
-        .map_err(|_| "integration::ipc_call_interrupted_stop_start: reap server failed")?;
-    cap_delete(server.cs)
-        .map_err(|_| "integration::ipc_call_interrupted_stop_start: reap server cs failed")?;
+    reap(
+        client2,
+        "integration::ipc_call_interrupted_stop_start: reap p2 client failed",
+    )?;
+    reap(
+        server,
+        "integration::ipc_call_interrupted_stop_start: reap server failed",
+    )?;
     cap_delete(ep2).map_err(|_| "integration::ipc_call_interrupted_stop_start: del ep2 failed")?;
     cap_delete(block)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: del block failed")?;
     cap_delete(done)
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: del done failed")?;
     Ok(())
+}
+
+/// Delete `child`'s Thread and then its `CSpace` capability, failing with
+/// `err` if either delete fails.
+fn reap(mut child: spawn::SpawnedChild, err: &'static str) -> TestResult
+{
+    child
+        .delete_thread()
+        .and(child.delete_cspace())
+        .map_err(|_| err)
 }
 
 /// Accumulate `done` bits into `acc` until any bit of `mask` is present.

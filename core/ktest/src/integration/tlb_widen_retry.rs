@@ -33,9 +33,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use syscall::{
-    MAP_READ, MAP_WRITABLE, cap_delete, mem_map, mem_protect, mem_unmap, system_info, thread_sleep,
-};
+use syscall::{MAP_READ, MAP_WRITABLE, mem_map, mem_protect, mem_unmap, system_info, thread_sleep};
 use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -100,7 +98,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("integration::tlb_widen_retry: mem_map read-only failed");
     }
 
-    let Ok(child) = crate::spawn::new_child(ctx)
+    let Ok(mut child) = crate::spawn::new_child(ctx)
     else
     {
         cleanup(ctx, None, memory_cap);
@@ -121,7 +119,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     .is_err()
     {
-        cleanup(ctx, Some(&child), memory_cap);
+        cleanup(ctx, Some(&mut child), memory_cap);
         return Err("integration::tlb_widen_retry: configure_and_start_pinned failed");
     }
 
@@ -130,7 +128,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Wait for the child to cache the read-only entry on CPU 1.
     if let Err(reason) = await_cached(&child)
     {
-        cleanup(ctx, Some(&child), memory_cap);
+        cleanup(ctx, Some(&mut child), memory_cap);
         return Err(reason);
     }
 
@@ -149,7 +147,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
     .is_err()
     {
-        cleanup(ctx, Some(&child), memory_cap);
+        cleanup(ctx, Some(&mut child), memory_cap);
         return Err("integration::tlb_widen_retry: mem_protect widen failed");
     }
     PHASE.store(PHASE_WIDENED, Ordering::Release);
@@ -158,17 +156,17 @@ pub fn run(ctx: &TestContext) -> TestResult
     // kill.
     if let Err(reason) = await_written(&child)
     {
-        cleanup(ctx, Some(&child), memory_cap);
+        cleanup(ctx, Some(&mut child), memory_cap);
         return Err(reason);
     }
 
     if RESULT.load(Ordering::Acquire) != SENTINEL
     {
-        cleanup(ctx, Some(&child), memory_cap);
+        cleanup(ctx, Some(&mut child), memory_cap);
         return Err("integration::tlb_widen_retry: widened write produced the wrong value");
     }
 
-    cleanup(ctx, Some(&child), memory_cap);
+    cleanup(ctx, Some(&mut child), memory_cap);
     Ok(())
 }
 
@@ -225,7 +223,7 @@ fn await_written(child: &crate::spawn::SpawnedChild) -> TestResult
 
 /// Wait for the child to exit cooperatively, then delete its caps, unmap the
 /// page, and return the cap to the pool. Safe to call on any error path.
-fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, memory_cap: u32)
+fn cleanup(ctx: &TestContext, child: Option<&mut crate::spawn::SpawnedChild>, memory_cap: u32)
 {
     if let Some(child) = child
     {
@@ -243,8 +241,8 @@ fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, memory
             }
             thread_sleep(1).ok();
         }
-        cap_delete(child.th).ok();
-        cap_delete(child.cs).ok();
+        child.delete_thread().ok();
+        child.delete_cspace().ok();
     }
     // SAFETY: `WIDEN_VA` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.

@@ -61,7 +61,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::wait_concurrency: event_recv (drain part A) failed")?;
 
     // ── Part B: Child fires notification — blocking wake. ───────────────────────────
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "integration::wait_concurrency: spawn::new_child failed")?;
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "integration::wait_concurrency: cap_copy sig failed")?;
@@ -115,8 +115,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_delete(eq).ok();
     cap_delete(sig).ok();
     cap_delete(ws).ok();
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 

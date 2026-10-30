@@ -131,7 +131,7 @@ fn handle_child(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "page_fault_present_bit: cap_create_endpoint failed")?;
-    let Ok(child) = crate::spawn::new_child(ctx)
+    let Ok(mut child) = crate::spawn::new_child(ctx)
     else
     {
         cap_delete(ep).ok();
@@ -156,8 +156,8 @@ fn handle_child(ctx: &TestContext) -> TestResult
             crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS)).map(|_| ())
         });
 
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     cap_delete(ep).ok();
     result
 }

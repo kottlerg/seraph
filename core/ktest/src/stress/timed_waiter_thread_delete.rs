@@ -108,7 +108,7 @@ fn cycles(ctx: &TestContext, cpus: u32) -> TestResult
 /// for the next cycle.
 fn one_cycle(ctx: &TestContext, cycle: u32, cpus: u32, sig: u32, eq: u32) -> TestResult
 {
-    let child = spawn::new_child(ctx)
+    let mut child = spawn::new_child(ctx)
         .map_err(|_| "stress::timed_waiter_thread_delete: spawn waiter failed")?;
     let started = start_waiter(&child, cycle, cpus, sig, eq);
     if started.is_ok()
@@ -125,7 +125,7 @@ fn one_cycle(ctx: &TestContext, cycle: u32, cpus: u32, sig: u32, eq: u32) -> Tes
     }
     // The waiter holds no capability to its own thread, so this is the last
     // one: the dealloc stops the waiter wherever it is.
-    let reaped = [cap_delete(child.th), cap_delete(child.cs)]
+    let reaped = [child.delete_thread(), child.delete_cspace()]
         .into_iter()
         .collect::<Result<(), i64>>();
     started?;

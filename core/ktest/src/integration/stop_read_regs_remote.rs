@@ -35,8 +35,8 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
-    cap_delete, system_info, thread_read_regs, thread_set_affinity, thread_sleep, thread_start,
-    thread_stop, thread_write_regs, thread_yield,
+    system_info, thread_read_regs, thread_set_affinity, thread_sleep, thread_start, thread_stop,
+    thread_write_regs, thread_yield,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
@@ -127,7 +127,7 @@ fn scenario(ctx: &TestContext) -> TestResult
     let ran =
         unsafe { spawn::configure_and_start_pinned(&child, spin_entry, stack_top, 0, CHILD_CPU) }
             .and_then(|()| rounds(&child));
-    let released = release(&child);
+    let released = release(child);
     ran?;
     released
 }
@@ -275,15 +275,15 @@ fn elapsed_us() -> Result<u64, &'static str>
 /// Stop the child, so its deletion tears down a thread off its CPU, then
 /// delete its Thread and `CSpace` caps. A stop refused with `InvalidState`
 /// finds the child already stopped (a failed round) or dead.
-fn release(child: &SpawnedChild) -> TestResult
+fn release(mut child: SpawnedChild) -> TestResult
 {
     let stopped = match thread_stop(child.th)
     {
         Ok(()) => true,
         Err(e) => e == SyscallError::InvalidState as i64,
     };
-    let thread_deleted = cap_delete(child.th).is_ok();
-    let cspace_deleted = cap_delete(child.cs).is_ok();
+    let thread_deleted = child.delete_thread().is_ok();
+    let cspace_deleted = child.delete_cspace().is_ok();
     if stopped && thread_deleted && cspace_deleted
     {
         Ok(())

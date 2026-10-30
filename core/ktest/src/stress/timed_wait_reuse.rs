@@ -216,10 +216,10 @@ fn with_waiter(ctx: &TestContext, waiter_cpu: u32) -> Result<Tally, &'static str
     // Deleting the thread stops it wherever it is, so the stack is free for
     // the next test even when a cycle failed.
     let mut ok = true;
-    if let Some(c) = child
+    if let Some(mut c) = child
     {
-        ok &= cap_delete(c.th).is_ok();
-        ok &= cap_delete(c.cs).is_ok();
+        ok &= c.delete_thread().is_ok();
+        ok &= c.delete_cspace().is_ok();
     }
     ok &= cap_delete(eq).is_ok();
     ok &= cap_delete(sig).is_ok();

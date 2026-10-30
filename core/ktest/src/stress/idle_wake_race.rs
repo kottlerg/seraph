@@ -81,7 +81,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let c2p = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::idle_wake_race: cap_create_notification (c2p) failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "stress::idle_wake_race: spawn::new_child failed")?;
 
     let child_p2c = cap_copy(p2c, child.cs, RIGHTS_NOTIFY_WAIT)
@@ -175,8 +175,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     )?;
 
     // Cleanup.
-    cap_delete(child.th).map_err(|_| "stress::idle_wake_race: cap_delete (thread) failed")?;
-    cap_delete(child.cs).map_err(|_| "stress::idle_wake_race: cap_delete (cspace) failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "stress::idle_wake_race: cap_delete (thread) failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "stress::idle_wake_race: cap_delete (cspace) failed")?;
     cap_delete(p2c).map_err(|_| "stress::idle_wake_race: cap_delete (p2c) failed")?;
     cap_delete(c2p).map_err(|_| "stress::idle_wake_race: cap_delete (c2p) failed")?;
 

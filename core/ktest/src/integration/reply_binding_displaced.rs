@@ -189,10 +189,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Deleting a thread tears the child down wherever it is, so the stacks
     // are free for the next test even when a step failed.
     let mut ok = true;
-    for child in parts.callers.iter().chain([&parts.faulter]).flatten()
+    for child in parts
+        .callers
+        .iter_mut()
+        .chain([&mut parts.faulter])
+        .flatten()
     {
-        ok &= cap_delete(child.th).is_ok();
-        ok &= cap_delete(child.cs).is_ok();
+        ok &= child.delete_thread().is_ok();
+        ok &= child.delete_cspace().is_ok();
     }
     for cap in [parts.ep, parts.done, parts.park].into_iter().flatten()
     {

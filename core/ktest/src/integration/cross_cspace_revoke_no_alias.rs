@@ -112,7 +112,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Child CSpace: a SEND|GRANT copy of `ep` (to call), a WAIT copy of `go` (to
     // park on), and a NOTIFY copy of `report` (to answer). `c1` arrives via the
     // reply.
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "cross_cspace_revoke_no_alias: spawn::new_child failed")?;
     let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "cross_cspace_revoke_no_alias: cap_copy (child_ep) failed")?;
@@ -192,8 +192,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         _ => Err("cross_cspace_revoke_no_alias: unexpected report value"),
     };
 
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     cap_delete(ep).ok();
     cap_delete(go).ok();
     cap_delete(report).ok();

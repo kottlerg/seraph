@@ -88,8 +88,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Revoke root — all derived caps become invalid. Children will start
     // getting errors on their sends and exit.
     let mut senders = Senders {
-        threads: [0; NUM_CHILDREN],
-        cspaces: [0; NUM_CHILDREN],
+        children: [const { spawn::SpawnedChild::EMPTY }; NUM_CHILDREN],
         spawned: 0,
     };
     let mut sending_bits = 0u64;
@@ -107,16 +106,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         // Senders whose caps were not revoked loop forever; delete them so
         // none spins on into the following cells.
-        for i in 0..senders.spawned
+        for child in &mut senders.children[..senders.spawned]
         {
-            cap_delete(senders.threads[i]).ok();
-            cap_delete(senders.cspaces[i]).ok();
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
         }
         return Err(e);
     }
-    let Senders {
-        threads, cspaces, ..
-    } = senders;
+    let Senders { mut children, .. } = senders;
 
     // Wait for all children to report done.
     let mut done_bits: u64 = 0;
@@ -135,10 +132,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // Clean up.
-    for i in 0..NUM_CHILDREN
+    for child in &mut children
     {
-        cap_delete(threads[i]).ok();
-        cap_delete(cspaces[i]).ok();
+        child.delete_thread().ok();
+        child.delete_cspace().ok();
     }
     cap_delete(root).map_err(|_| "cap_revoke_under_use: root delete failed (marker leak?)")?;
     cap_delete(done).ok();
@@ -146,11 +143,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// The senders' Thread and `CSpace` caps; the first `spawned` are live.
+/// The senders' guards; the first `spawned` hold live children.
 struct Senders
 {
-    threads: [u32; NUM_CHILDREN],
-    cspaces: [u32; NUM_CHILDREN],
+    children: [spawn::SpawnedChild; NUM_CHILDREN],
     spawned: usize,
 }
 
@@ -167,11 +163,10 @@ fn start_senders(
     let (done, sending) = reports;
     for (i, &derived_cap) in derived.iter().enumerate()
     {
-        let child =
+        senders.children[i] =
             spawn::new_child(ctx).map_err(|_| "cap_revoke_under_use: spawn::new_child failed")?;
-        senders.threads[i] = child.th;
-        senders.cspaces[i] = child.cs;
         senders.spawned = i + 1;
+        let child = &senders.children[i];
         let child_sig = cap_copy(derived_cap, child.cs, RIGHTS_NOTIFY)
             .map_err(|_| "cap_revoke_under_use: cap_copy sig failed")?;
         let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
@@ -196,7 +191,7 @@ fn start_senders(
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
-        unsafe { spawn::configure_and_start(&child, sender_loop_entry, stack_top, arg) }
+        unsafe { spawn::configure_and_start(child, sender_loop_entry, stack_top, arg) }
             .map_err(|_| "cap_revoke_under_use: configure_and_start failed")?;
     }
     Ok(())

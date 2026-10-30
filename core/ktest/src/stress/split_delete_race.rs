@@ -88,6 +88,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         // The sibling shares this CSpace: it deletes `orig` by this handle.
         let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::split_delete_race: create sibling failed")?;
+        let mut sibling = spawn::SpawnedChild { th, cs: 0 };
         // SAFETY: one sibling per cycle, reaped below before the next publish.
         let arg = unsafe { SIBLING_ARGS.publish(0, SiblingArgs { orig, done }) };
         let stack_top = ChildStack::top(core::ptr::addr_of!(SIBLING_STACK));
@@ -133,7 +134,9 @@ pub fn run(ctx: &TestContext) -> TestResult
             cap_delete(child).map_err(|_| "stress::split_delete_race: delete child failed")?;
         }
         spawn::wait_until_exited(th, crate::scaled_polls(EXIT_POLLS))?;
-        cap_delete(th).map_err(|_| "stress::split_delete_race: reap sibling failed")?;
+        sibling
+            .delete_thread()
+            .map_err(|_| "stress::split_delete_race: reap sibling failed")?;
     }
 
     // Cleanup of a notification this test created; the verdict below rests

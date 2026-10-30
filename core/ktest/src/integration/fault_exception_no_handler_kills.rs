@@ -20,7 +20,6 @@
 //! killing would never reach `Exited`, tripping the poll bound rather than
 //! hanging.
 
-use syscall::cap_delete;
 use syscall_abi::EXIT_FAULT_BASE;
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -34,13 +33,13 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "fault_exception_no_handler_kills: spawn::new_child failed")?;
 
     let result = start_and_check(&child);
     // Deleting the thread stops it wherever it is, so a child that never
     // died does not outlive the test on any exit path.
-    let reaped = [cap_delete(child.th), cap_delete(child.cs)]
+    let reaped = [child.delete_thread(), child.delete_cspace()]
         .into_iter()
         .collect::<Result<(), i64>>();
     result?;

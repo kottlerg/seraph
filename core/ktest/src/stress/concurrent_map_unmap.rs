@@ -64,8 +64,7 @@ struct Mappers
 {
     frames: [u32; NUM_CHILDREN],
     allocated: usize,
-    threads: [u32; NUM_CHILDREN],
-    cspaces: [u32; NUM_CHILDREN],
+    children: [spawn::SpawnedChild; NUM_CHILDREN],
     spawned: usize,
 }
 
@@ -88,13 +87,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut mappers = Mappers {
         frames: [0; NUM_CHILDREN],
         allocated: 0,
-        threads: [0; NUM_CHILDREN],
-        cspaces: [0; NUM_CHILDREN],
+        children: [const { spawn::SpawnedChild::EMPTY }; NUM_CHILDREN],
         spawned: 0,
     };
     let result =
         start_mappers(ctx, done, iterations, &mut mappers).and_then(|()| await_mappers(done));
-    let released = release(ctx, &mappers);
+    let released = release(ctx, &mut mappers);
     cap_delete(done).ok();
     result?;
     released
@@ -117,11 +115,10 @@ fn start_mappers(ctx: &TestContext, done: u32, iterations: u32, mappers: &mut Ma
     // CSpace.
     for (i, va_slot) in VA_PER_CHILD.iter().enumerate()
     {
-        let child =
+        mappers.children[i] =
             spawn::new_child(ctx).map_err(|_| "concurrent_map_unmap: spawn::new_child failed")?;
-        mappers.threads[i] = child.th;
-        mappers.cspaces[i] = child.cs;
         mappers.spawned = i + 1;
+        let child = &mappers.children[i];
         let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "concurrent_map_unmap: cap_copy done failed")?;
         // Copy memory and aspace caps into child's CSpace with full rights.
@@ -153,7 +150,7 @@ fn start_mappers(ctx: &TestContext, done: u32, iterations: u32, mappers: &mut Ma
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
-        unsafe { spawn::configure_and_start(&child, mapper_entry, stack_top, arg) }
+        unsafe { spawn::configure_and_start(child, mapper_entry, stack_top, arg) }
             .map_err(|_| "concurrent_map_unmap: configure_and_start failed")?;
     }
     Ok(())
@@ -186,12 +183,12 @@ fn await_mappers(done: u32) -> TestResult
 /// VA is unmapped: a child that failed may have left its frame mapped, and
 /// a frame still mapped stays out of the pool rather than being handed out
 /// again.
-fn release(ctx: &TestContext, mappers: &Mappers) -> TestResult
+fn release(ctx: &TestContext, mappers: &mut Mappers) -> TestResult
 {
-    for i in 0..mappers.spawned
+    for child in &mut mappers.children[..mappers.spawned]
     {
-        cap_delete(mappers.threads[i]).ok();
-        cap_delete(mappers.cspaces[i]).ok();
+        child.delete_thread().ok();
+        child.delete_cspace().ok();
     }
     let mut result = Ok(());
     for i in 0..mappers.allocated

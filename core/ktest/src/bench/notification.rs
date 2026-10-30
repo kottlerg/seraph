@@ -84,7 +84,7 @@ pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
         return;
     };
 
-    let Ok(child) = spawn::new_child(ctx)
+    let Ok(mut child) = spawn::new_child(ctx)
     else
     {
         return;
@@ -165,9 +165,9 @@ pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
         crate::log_u64("ktest: bench  cycles_max=", max);
     }
 
-    cap_delete(child.th).ok();
+    child.delete_thread().ok();
     cap_delete(ping).ok();
     cap_delete(pong).ok();
     cap_delete(done).ok();
-    cap_delete(child.cs).ok();
+    child.delete_cspace().ok();
 }

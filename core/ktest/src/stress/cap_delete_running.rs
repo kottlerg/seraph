@@ -19,11 +19,10 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CHILDREN: usize = 16;
 
-/// The children's Thread and `CSpace` caps; the first `spawned` are live.
+/// The children's guards; the first `spawned` hold live children.
 struct Children
 {
-    threads: [u32; NUM_CHILDREN],
-    cspaces: [u32; NUM_CHILDREN],
+    guards: [spawn::SpawnedChild; NUM_CHILDREN],
     spawned: usize,
 }
 
@@ -32,8 +31,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let running = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_delete_running: cap_create_notification failed")?;
     let mut children = Children {
-        threads: [0; NUM_CHILDREN],
-        cspaces: [0; NUM_CHILDREN],
+        guards: [const { spawn::SpawnedChild::EMPTY }; NUM_CHILDREN],
         spawned: 0,
     };
 
@@ -57,13 +55,13 @@ pub fn run(ctx: &TestContext) -> TestResult
     // the children it started the same way, so none spins on into the
     // following cells.
     let mut deleted = Ok(());
-    for i in 0..children.spawned
+    for child in &mut children.guards[..children.spawned]
     {
-        if cap_delete(children.threads[i]).is_err()
+        if child.delete_thread().is_err()
         {
             deleted = Err("cap_delete_running: cap_delete thread failed");
         }
-        if cap_delete(children.cspaces[i]).is_err()
+        if child.delete_cspace().is_err()
         {
             deleted = Err("cap_delete_running: cap_delete cspace failed");
         }
@@ -80,11 +78,10 @@ fn spawn_children(ctx: &TestContext, running: u32, children: &mut Children) -> T
 {
     for i in 0..NUM_CHILDREN
     {
-        let child =
+        children.guards[i] =
             spawn::new_child(ctx).map_err(|_| "cap_delete_running: spawn::new_child failed")?;
-        children.threads[i] = child.th;
-        children.cspaces[i] = child.cs;
         children.spawned = i + 1;
+        let child = &children.guards[i];
         let child_running = cap_copy(running, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "cap_delete_running: cap_copy running failed")?;
         // arg packs running_slot[31:0] | child index[63:32].
@@ -94,7 +91,7 @@ fn spawn_children(ctx: &TestContext, running: u32, children: &mut Children) -> T
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
-        unsafe { spawn::configure_and_start(&child, spinner_entry, stack_top, arg) }
+        unsafe { spawn::configure_and_start(child, spinner_entry, stack_top, arg) }
             .map_err(|_| "cap_delete_running: configure_and_start failed")?;
     }
     Ok(())

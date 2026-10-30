@@ -19,7 +19,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use syscall::{cap_delete, system_info, thread_exit, thread_sleep};
+use syscall::{system_info, thread_exit, thread_sleep};
 use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -114,9 +114,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     PROGRESS[0].store(0, Ordering::Release);
     PROGRESS[1].store(0, Ordering::Release);
 
-    let child0 =
+    let mut child0 =
         spawn::new_child(ctx).map_err(|_| "irq_preserves_user_regs: spawn::new_child(0) failed")?;
-    let child1 =
+    let mut child1 =
         spawn::new_child(ctx).map_err(|_| "irq_preserves_user_regs: spawn::new_child(1) failed")?;
 
     // Pin both to CPU 0 so the timer round-robins them on one CPU: each
@@ -147,10 +147,18 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mismatches = MISMATCHES.load(Ordering::Acquire);
     let preempted = PREEMPT_OBSERVED.load(Ordering::Acquire);
 
-    cap_delete(child0.th).map_err(|_| "irq_preserves_user_regs: cap_delete child0.th failed")?;
-    cap_delete(child0.cs).map_err(|_| "irq_preserves_user_regs: cap_delete child0.cs failed")?;
-    cap_delete(child1.th).map_err(|_| "irq_preserves_user_regs: cap_delete child1.th failed")?;
-    cap_delete(child1.cs).map_err(|_| "irq_preserves_user_regs: cap_delete child1.cs failed")?;
+    child0
+        .delete_thread()
+        .map_err(|_| "irq_preserves_user_regs: cap_delete child0.th failed")?;
+    child0
+        .delete_cspace()
+        .map_err(|_| "irq_preserves_user_regs: cap_delete child0.cs failed")?;
+    child1
+        .delete_thread()
+        .map_err(|_| "irq_preserves_user_regs: cap_delete child1.th failed")?;
+    child1
+        .delete_cspace()
+        .map_err(|_| "irq_preserves_user_regs: cap_delete child1.cs failed")?;
 
     if done < 2
     {

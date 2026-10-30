@@ -90,9 +90,13 @@ pub fn create_thread(ctx: &TestContext) -> TestResult
     // Thread needs both an address space and a cspace to be bound to.
     // `spawn::new_child` mints a `CSpace` (`cap_create_cspace`) and a thread
     // (`cap_create_thread`) bound to that `CSpace` and to ktest's own address space.
-    let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
-    cap_delete(child.th).map_err(|_| "cap_delete thread failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cspace failed")?;
+    let mut child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete thread failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cspace failed")?;
     Ok(())
 }
 
@@ -919,7 +923,7 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
     let baseline = cap_info(ctx.memory_base, syscall_abi::CAP_INFO_MEMORY_AVAILABLE)
         .map_err(|_| "teardown_batch: cap_info(baseline) failed")?;
 
-    let child =
+    let mut child =
         crate::spawn::new_child(ctx).map_err(|_| "teardown_batch: spawn::new_child failed")?;
     // Headroom for the derive burst (default child pool backs 167 slots).
     cap_create_cspace(ctx.memory_base, child.cs, 4)
@@ -941,8 +945,8 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
     let bits = notification_wait(done).map_err(|_| "teardown_batch: notification_wait failed")?;
     if bits != 0x1
     {
-        cap_delete(child.th).ok();
-        cap_delete(child.cs).ok();
+        child.delete_thread().ok();
+        child.delete_cspace().ok();
         cap_delete(ep).ok();
         cap_delete(done).ok();
         return Err("teardown_batch: child failed its derive burst");
@@ -954,8 +958,8 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
         .map_err(|_| "teardown_batch: cap_info(child USED) failed")?;
     if used < TEARDOWN_BATCH_DERIVES + 2
     {
-        cap_delete(child.th).ok();
-        cap_delete(child.cs).ok();
+        child.delete_thread().ok();
+        child.delete_cspace().ok();
         cap_delete(ep).ok();
         cap_delete(done).ok();
         return Err("teardown_batch: derive burst did not populate the child CSpace");
@@ -963,8 +967,12 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
 
     // Tear down: the child CSpace dies holding one slot with ~300 derived
     // children plus the bootstrap copies — several drain batches.
-    cap_delete(child.th).map_err(|_| "teardown_batch: cap_delete(thread) failed")?;
-    cap_delete(child.cs).map_err(|_| "teardown_batch: cap_delete(cspace) failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "teardown_batch: cap_delete(thread) failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "teardown_batch: cap_delete(cspace) failed")?;
 
     // Pin 2: both child objects were reclaimed — the CSpace dealloc (the
     // only path that runs the drain) returned its pool and wrapper pages.
@@ -1028,9 +1036,8 @@ fn check_stop_observers(ctx: &TestContext, thread: u32, early: u32) -> TestResul
 /// it before the slot pages are reclaimed: a child blocked in
 /// `notification_wait` and a child spinning on `thread_yield` both report
 /// `Exited` afterwards, their objects reclaim through the thread cap alone,
-/// and the parent's Memory cap returns to baseline. Deleting the `CSpace` before
-/// the thread is the order `spawn::SpawnedChild` documents as stopping a still-live
-/// child.
+/// and the parent's Memory cap returns to baseline. This `CSpace` delete is one of the two
+/// deletes a dropped `spawn::SpawnedChild` stops a still-live child with.
 /// A death observer bound before the stop receives nothing from the
 /// teardown; one bound afterwards receives `EXIT_KILLED` through the bind,
 /// once.
@@ -1044,7 +1051,7 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
         cap_create_notification(ctx.memory_base).map_err(|_| "stop_bound: create block failed")?;
 
     // Blocked child: signals ready, then waits on `block` (never signalled).
-    let child = crate::spawn::new_child(ctx).map_err(|_| "stop_bound: new_child failed")?;
+    let mut child = crate::spawn::new_child(ctx).map_err(|_| "stop_bound: new_child failed")?;
     let child_ready = cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "stop_bound: cap_copy ready failed")?;
     let child_block = cap_copy(block, child.cs, syscall_abi::RIGHTS_NTF_WAIT)
@@ -1063,28 +1070,32 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
     thread_bind_notification(child.th, early, STOP_CORR_EARLY)
         .map_err(|_| "stop_bound: thread_bind_notification (early) failed")?;
 
-    cap_delete(child.cs)
+    child
+        .delete_cspace()
         .map_err(|_| "stop_bound: cap_delete(cspace) under blocked child failed")?;
     // Exited is terminal, so the one-poll wait returns the retained reason
     // from the same state read that refuses a child in any other state.
     let reason = crate::spawn::wait_until_exited(child.th, 1)
         .inspect_err(|_| {
-            cap_delete(child.th).ok();
+            child.delete_thread().ok();
         })
         .map_err(|_| "stop_bound: blocked child not Exited after its CSpace was deleted")?;
     if reason != syscall_abi::EXIT_KILLED
     {
-        cap_delete(child.th).ok();
+        child.delete_thread().ok();
         return Err("stop_bound: blocked child's exit reason is not EXIT_KILLED");
     }
     check_stop_observers(ctx, child.th, early).inspect_err(|_| {
-        cap_delete(child.th).ok();
+        child.delete_thread().ok();
     })?;
-    cap_delete(child.th).map_err(|_| "stop_bound: cap_delete(thread, blocked) failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "stop_bound: cap_delete(thread, blocked) failed")?;
 
     // Spinning child: yields forever; on a multi-CPU guest it may be running
     // on another CPU when its CSpace goes.
-    let child = crate::spawn::new_child(ctx).map_err(|_| "stop_bound: new_child (spin) failed")?;
+    let mut child =
+        crate::spawn::new_child(ctx).map_err(|_| "stop_bound: new_child (spin) failed")?;
     let child_ready = cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "stop_bound: cap_copy ready (spin) failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(STOP_SPINNING_STACK));
@@ -1101,20 +1112,23 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
     .map_err(|_| "stop_bound: configure_and_start (spin) failed")?;
     notification_wait(ready).map_err(|_| "stop_bound: wait ready (spin) failed")?;
 
-    cap_delete(child.cs)
+    child
+        .delete_cspace()
         .map_err(|_| "stop_bound: cap_delete(cspace) under spinning child failed")?;
     // As above: one state read reports the retained reason or refuses.
     let reason = crate::spawn::wait_until_exited(child.th, 1)
         .inspect_err(|_| {
-            cap_delete(child.th).ok();
+            child.delete_thread().ok();
         })
         .map_err(|_| "stop_bound: spinning child not Exited after its CSpace was deleted")?;
     if reason != syscall_abi::EXIT_KILLED
     {
-        cap_delete(child.th).ok();
+        child.delete_thread().ok();
         return Err("stop_bound: spinning child's exit reason is not EXIT_KILLED");
     }
-    cap_delete(child.th).map_err(|_| "stop_bound: cap_delete(thread, spin) failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "stop_bound: cap_delete(thread, spin) failed")?;
 
     cap_delete(block).ok();
     cap_delete(ready).ok();
@@ -1139,7 +1153,8 @@ extern "C" fn stop_blocked_child_entry(arg: u64) -> !
     syscall::thread_exit()
 }
 
-/// Child for [`cspace_delete_stops_bound_thread`]: signal, then yield forever.
+/// Child for [`cspace_delete_stops_bound_thread`] and
+/// [`spawned_child_drop_stops_running_child`]: signal, then yield forever.
 extern "C" fn stop_spinning_child_entry(arg: u64) -> !
 {
     let ready_slot = (arg & 0xFFFF_FFFF) as u32;
@@ -1148,6 +1163,67 @@ extern "C" fn stop_spinning_child_entry(arg: u64) -> !
     {
         syscall::thread_yield().ok();
     }
+}
+
+static mut GUARD_DROP_STACK: ChildStack = ChildStack::ZERO;
+
+/// Dropping a `spawn::SpawnedChild` that still holds a running child stops
+/// the child, so a test that returns early leaves nothing running on its
+/// stack. The test keeps a derived copy of the child's Thread cap, so the
+/// guard's Thread delete is not the last and the child stops through the
+/// guard's `CSpace` delete; the copy then reads `Exited` with `EXIT_KILLED`.
+pub fn spawned_child_drop_stops_running_child(ctx: &TestContext) -> TestResult
+{
+    let ready =
+        cap_create_notification(ctx.memory_base).map_err(|_| "guard_drop: create ready failed")?;
+    let observer = spawn_and_drop_spinner(ctx, ready);
+    cap_delete(ready).ok();
+    let observer = observer?;
+    // Exited is terminal, so one state read reports the retained reason or
+    // refuses a child the drop left running.
+    let reason = crate::spawn::wait_until_exited(observer, 1);
+    cap_delete(observer).ok();
+    if reason.map_err(|_| "guard_drop: child still running after its guard dropped")?
+        != syscall_abi::EXIT_KILLED
+    {
+        return Err("guard_drop: child's exit reason is not EXIT_KILLED");
+    }
+    Ok(())
+}
+
+/// Start a child spinning on `thread_yield`, wait until it has run, and drop
+/// its guard with both caps still held; returns a derived copy of its Thread
+/// cap, minted before the start.
+fn spawn_and_drop_spinner(ctx: &TestContext, ready: u32) -> Result<u32, &'static str>
+{
+    let child = crate::spawn::new_child(ctx).map_err(|_| "guard_drop: new_child failed")?;
+    let child_ready = cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
+        .map_err(|_| "guard_drop: cap_copy ready failed")?;
+    let observer = cap_derive(child.th, syscall::RIGHTS_ALL)
+        .map_err(|_| "guard_drop: cap_derive(thread) failed")?;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(GUARD_DROP_STACK));
+    // SAFETY: the stack is `GUARD_DROP_STACK`, this test's own `ChildStack`,
+    // on which no other live thread runs (`ChildStack`'s rule).
+    let started = unsafe {
+        crate::spawn::configure_and_start(
+            &child,
+            stop_spinning_child_entry,
+            stack_top,
+            u64::from(child_ready),
+        )
+    }
+    .and_then(|()| {
+        notification_wait(ready)
+            .map(|_| ())
+            .map_err(|_| "guard_drop: wait ready failed")
+    });
+    if let Err(e) = started
+    {
+        cap_delete(observer).ok();
+        return Err(e);
+    }
+    drop(child);
+    Ok(observer)
 }
 
 /// Poll bound for the self-delete child: ~2 s at 1 ms per poll. Applied
@@ -1172,13 +1248,15 @@ pub fn cspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
         .map_err(|_| "self_delete: cap_info(baseline) failed")?;
     let ready =
         cap_create_notification(ctx.memory_base).map_err(|_| "self_delete: create ready failed")?;
-    let child = crate::spawn::new_child(ctx).map_err(|_| "self_delete: new_child failed")?;
+    let mut child = crate::spawn::new_child(ctx).map_err(|_| "self_delete: new_child failed")?;
     let child_ready = cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "self_delete: cap_copy ready failed")?;
     let own_cs = cap_copy(child.cs, child.cs, syscall_abi::RIGHTS_ALL)
         .map_err(|_| "self_delete: cap_copy cspace into itself failed")?;
     // Drop ktest's capability first, so the child's delete is the last one.
-    cap_delete(child.cs).map_err(|_| "self_delete: cap_delete(cspace) failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "self_delete: cap_delete(cspace) failed")?;
 
     let arg = u64::from(child_ready) | (u64::from(own_cs) << 32);
     let stack_top = ChildStack::top(core::ptr::addr_of!(SELF_DELETE_STACK));
@@ -1190,7 +1268,9 @@ pub fn cspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
 
     let reason =
         crate::spawn::wait_until_exited(child.th, crate::scaled_polls(SELF_DELETE_MAX_POLLS));
-    cap_delete(child.th).map_err(|_| "self_delete: cap_delete(thread) failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "self_delete: cap_delete(thread) failed")?;
     cap_delete(ready).ok();
     if reason? != syscall_abi::EXIT_KILLED
     {

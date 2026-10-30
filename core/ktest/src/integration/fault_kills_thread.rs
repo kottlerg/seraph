@@ -25,7 +25,6 @@
 //! retry forever: such a bug never reaches `Exited`, so the test fails on the
 //! poll bound rather than hanging.
 
-use syscall::cap_delete;
 use syscall_abi::EXIT_FAULT_BASE;
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -44,7 +43,7 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "integration::fault_kills_thread: spawn::new_child failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
@@ -60,8 +59,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("integration::fault_kills_thread: wrong exit reason for fault");
     }
 
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 

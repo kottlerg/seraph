@@ -403,8 +403,9 @@ pub fn pt_budget_exhaustion_returns_oom(ctx: &TestContext) -> TestResult
     for i in 0..16u64
     {
         let va = TEST_VA_BASE + i * 0x4000_0000; // 1 GiB stride
-        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
-        // span holds no Rust object or IPC page of ktest.
+        // SAFETY: `aspace` is a fresh AddressSpace no ktest code runs in, so a
+        // mapping at `va` there (past the scratch band once the stride leaves
+        // it) holds no Rust object or IPC page of ktest.
         match unsafe { mem_map(frame, aspace, va, 0, 1, MAP_WRITABLE) }
         {
             Ok(()) =>
@@ -452,8 +453,9 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
     for i in 0..mappings
     {
         let va = TEST_VA_BASE + i as u64 * stride;
-        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
-        // span holds no Rust object or IPC page of ktest.
+        // SAFETY: `aspace` is a fresh AddressSpace no ktest code runs in, so a
+        // mapping change at `va` there (past the scratch band once the stride
+        // leaves it) touches no Rust object or IPC page of ktest.
         if unsafe { mem_map(frame, aspace, va, 0, 1, MAP_WRITABLE) }.is_err()
         {
             cap_delete(aspace).ok();
@@ -465,8 +467,9 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
     for i in 0..mappings
     {
         let va = TEST_VA_BASE + i as u64 * stride;
-        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
-        // span holds no Rust object or IPC page of ktest.
+        // SAFETY: `aspace` is a fresh AddressSpace no ktest code runs in, so a
+        // mapping change at `va` there (past the scratch band once the stride
+        // leaves it) touches no Rust object or IPC page of ktest.
         unsafe { mem_unmap(aspace, va, 1) }.ok();
     }
 
@@ -587,8 +590,9 @@ pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestR
     for i in 0..N
     {
         let va = TEST_VA_BASE + i * STRIDE;
-        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
-        // span holds no Rust object or IPC page of ktest.
+        // SAFETY: `aspace` is a fresh AddressSpace no ktest code runs in, so a
+        // mapping change at `va` there (past the scratch band once the stride
+        // leaves it) touches no Rust object or IPC page of ktest.
         if unsafe { mem_map(frame, aspace, va, 0, 1, MAP_WRITABLE) }.is_err()
         {
             cap_delete(aspace).ok();
@@ -607,8 +611,9 @@ pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestR
     for i in 0..N
     {
         let va = TEST_VA_BASE + i * STRIDE;
-        // SAFETY: `va` is a scratch VA (crate docs § Scratch VAs), so the
-        // span holds no Rust object or IPC page of ktest.
+        // SAFETY: `aspace` is a fresh AddressSpace no ktest code runs in, so a
+        // mapping change at `va` there (past the scratch band once the stride
+        // leaves it) touches no Rust object or IPC page of ktest.
         if unsafe { mem_unmap_reclaim(aspace, va, 1) }.is_err()
         {
             cap_delete(aspace).ok();

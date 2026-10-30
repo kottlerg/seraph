@@ -90,26 +90,28 @@ cannot shrink a band — it attenuates rights only ([syscalls.md](syscalls.md) �
 
 ### Run Queue Structure
 
-Each CPU has a set of 32 run queues, one per priority level:
+Each CPU has a set of 32 run queues, one per priority level. The excerpt below is abridged to
+the fields this document discusses; `core/kernel/src/sched/run_queue.rs` holds the full
+definition:
 
 ```rust
 pub struct PerCpuScheduler
 {
-    /// Per-priority run queues. Each is an intrusive FIFO of ready TCBs.
-    queues: [RunQueue; NUM_PRIORITY_LEVELS],
+    /// Per-priority run queues. Each is an intrusive FIFO of ready TCBs; owned by `lock`.
+    queues: UnsafeCell<[RunQueue; NUM_PRIORITY_LEVELS]>,
 
     /// Bitmask with one bit set per non-empty priority level.
     /// Allows O(1) selection of the highest non-empty priority.
     non_empty: AtomicU32,
 
     /// Currently running TCB on this CPU.
-    current: *mut ThreadControlBlock,
+    current: AtomicPtr<ThreadControlBlock>,
 
     /// The idle TCB for this CPU.
-    idle: *mut ThreadControlBlock,
+    idle: AtomicPtr<ThreadControlBlock>,
 
-    /// Lock protecting this struct. Held briefly during enqueue/dequeue.
-    lock: Spinlock,
+    /// Lock protecting the run queues. Held briefly during enqueue/dequeue.
+    pub lock: Spinlock,
 
     /// Run-queue load counter; read via current_load() by the load balancer and select_target_cpu.
     load: AtomicU32,
@@ -166,7 +168,8 @@ The TCB is the kernel's per-thread state. A thread's TCB lives in its Thread sla
 thread from the SEED reserve): the kernel stack, then the page holding the `ThreadObject` and
 TCB, then the extended-state area (see
 [memory-internals.md § Kernel Stack Allocation](memory-internals.md#kernel-stack-allocation)).
-Idle threads' TCBs live in a per-CPU array allocated at boot.
+Idle threads' TCBs live in a per-CPU array allocated at boot. The excerpt below is abridged to
+the fields this document discusses; `core/kernel/src/sched/thread.rs` holds the full definition.
 
 ```rust
 pub struct ThreadControlBlock

@@ -473,4 +473,5 @@ burn-in (#314, with #316) is also closed.
 
 ## Summarized By
 
-[IPC Subsystem Internals](ipc-internals.md)
+[core/kernel/README.md](../README.md), [IPC Subsystem Internals](ipc-internals.md),
+[SMP Scheduling and Locking Invariants](scheduling-internals.md)

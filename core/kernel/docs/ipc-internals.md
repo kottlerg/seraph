@@ -432,11 +432,6 @@ bit-63-set bitmasks with negative-Err codes.
 ```rust
 pub struct EventQueueState
 {
-    /// Serialises every non-atomic field that changes after construction:
-    /// the ring contents, `write_idx`, `read_idx`, `waiters`, and the
-    /// wait-set back-pointer pair.
-    pub lock: Spinlock,
-
     /// Ring body, inline after this struct in the retype slot (set at
     /// construction).
     pub ring: *mut u64,
@@ -461,6 +456,11 @@ pub struct EventQueueState
     /// member index in that set.
     pub wait_set: *mut u8,
     pub wait_set_member_idx: u8,
+
+    /// Serialises every non-atomic field that changes after construction:
+    /// the ring contents, `write_idx`, `read_idx`, `waiters`, and the
+    /// wait-set back-pointer pair.
+    pub lock: Spinlock,
 }
 ```
 

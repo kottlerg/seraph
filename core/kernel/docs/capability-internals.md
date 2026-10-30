@@ -1054,6 +1054,7 @@ Path, and
 [Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
+[core/ktest/README.md](../../ktest/README.md),
 [Capability Model](../../../docs/capability-model.md),
 [Coding Standards](../../../docs/coding-standards.md),
 [Fault Handling](../../../docs/fault-handling.md), [IPC Design](../../../docs/ipc-design.md),

@@ -19,7 +19,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use syscall::{cap_delete, system_info, thread_exit, thread_sleep};
+use syscall::{system_info, thread_exit, thread_sleep};
 use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};

@@ -229,7 +229,7 @@ impl Guest
     }
 
     /// Kill QEMU and reap it now rather than at the end of scope (the
-    /// teardown is `Drop`'s).
+    /// teardown is [`Guest::teardown`], which `Drop` runs).
     fn shutdown(self)
     {
         drop(self);
@@ -355,6 +355,26 @@ mod tests
             guest.lines.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn wait_exit_fails_on_a_live_guest_past_its_deadline()
+    {
+        // The stand-in cannot exit while the test holds its stdin, so the
+        // first poll finds it running and the zero deadline has passed.
+        let guest = Guest::from_child(stand_in(Stdio::piped())).unwrap();
+        assert!(guest.wait_exit(Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn wait_exit_succeeds_once_the_guest_has_exited()
+    {
+        // Reaped through the handle first, so the first poll sees the exit
+        // and no deadline is involved.
+        let mut guest = Guest::from_child(stand_in(Stdio::piped())).unwrap();
+        guest.child.kill().unwrap();
+        guest.child.wait().unwrap();
+        assert!(guest.wait_exit(Duration::ZERO).is_ok());
     }
 
     #[test]

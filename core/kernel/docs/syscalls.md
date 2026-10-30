@@ -603,7 +603,7 @@ Notify + Wait rights.
 
 ---
 
-### `SYS_CAP_CREATE_EVENT_QUEUE` (9)
+### `SYS_CAP_CREATE_EVENT_Q` (9)
 
 Retype a Memory capability into a new event queue with a fixed capacity.
 

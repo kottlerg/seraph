@@ -35,7 +35,8 @@ build breaks. Items with no neutral caller are not checked this way: `interrupts
 
 ```
 core/kernel/src/arch/
-├── mod.rs          # The only #[cfg(target_arch)] site; aliases the active arch as `current`
+├── mod.rs          # The only #[cfg(target_arch)] site; aliases the active arch as `current`;
+│                   # defines the shared `ThreadKind`
 ├── x86_64/
 │   ├── mod.rs      # Module declarations and arch constants (ARCH_NAME, …)
 │   ├── paging.rs   ├── context.rs  ├── interrupts.rs ├── timer.rs
@@ -50,7 +51,8 @@ core/kernel/src/arch/
     ├── platform.rs ├── ap_trampoline.rs └── entropy.rs
 ```
 
-`arch/mod.rs` performs the conditional compilation:
+`arch/mod.rs` performs the conditional compilation, and also defines the one type it holds
+itself, `ThreadKind`, which both architectures' `context::new_state` take (see § `context`):
 
 ```rust
 #[cfg(target_arch = "x86_64")]
@@ -326,13 +328,18 @@ The context switch is the most performance-critical path in the kernel.
 /// `user_arg(&self) -> u64`.
 pub struct SavedState { /* arch-specific */ }
 
+/// Which privilege level a new thread runs at (`User` or `Kernel`), selecting
+/// its first-dispatch interrupt state in `new_state`. `arch::ThreadKind`, defined in
+/// `arch/mod.rs` and shared by both architectures.
+pub enum ThreadKind { User, Kernel }
+
 /// Construct a `SavedState` for a freshly created thread. `entry` is the start
 /// PC and `stack_top` the initial kernel SP. `arg` is the first argument:
 /// x86-64 stashes it in `rbx` (read back by `SavedState::user_arg`), RISC-V
-/// delivers it in `a0`. `is_user` selects the first-dispatch interrupt state on
-/// x86-64 (IF clear for a user thread's kernel trampoline, set for a kernel
-/// thread) and is unused on RISC-V.
-pub fn new_state(entry: u64, stack_top: u64, arg: u64, is_user: bool) -> SavedState;
+/// delivers it in `a0`. `kind` selects the first-dispatch interrupt state on
+/// x86-64 (IF clear for a `ThreadKind::User` thread's kernel trampoline, set
+/// for a `ThreadKind::Kernel` thread) and is unused on RISC-V.
+pub fn new_state(entry: u64, stack_top: u64, arg: u64, kind: ThreadKind) -> SavedState;
 
 /// Seed the thread-local-storage base in a `SavedState` before first run
 /// (x86-64 `fs_base`, loaded into `IA32_FS_BASE` on first switch; a no-op on
@@ -542,6 +549,16 @@ pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
 /// Map a faulting PC to the `copy_user` recovery fixup, or `None`. Consulted by
 /// the page-fault handler on a kernel-mode fault to redirect into the fixup.
 pub fn user_copy_fixup(pc: u64) -> Option<u64>;
+
+/// Debug-build check that the user-controlled privileged state a kernel entry
+/// must clear is clear; a no-op in release builds. x86-64 asserts RFLAGS AC,
+/// DF and TF clear (SFMASK and the IDT stubs' `cld` / `clac` establish it) and
+/// is called first in `syscall::dispatch` and the exception, `#PF`, `#NM`, and
+/// IRQ handler bodies. RISC-V asserts `sstatus.SUM` clear, the analogue (SUM,
+/// like AC, lifts the supervisor-access block on user pages), and is called at
+/// syscall dispatch only: a trap taken from S-mode inside a `copy_user` window
+/// carries SUM.
+pub fn debug_assert_kernel_entry_flags();
 ```
 
 The required/opportunistic/unsupported classification and what each arch gates are in

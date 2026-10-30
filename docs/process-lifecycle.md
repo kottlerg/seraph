@@ -84,7 +84,7 @@ the `Interrupt`, `IoPort`, `SbiControl`, and `Mmio` roots; and both halves of th
 kernel pins that CSpace (it is the root CSpace; see
 [capability-internals.md § Kernel Object Reference Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)),
 so they remain alive but unreachable; releasing them at the reap is design intent, not yet
-implemented ([#443](https://github.com/kottlerg/seraph/issues/443); see [Init reap](#init-reap)).
+implemented ([#540](https://github.com/kottlerg/seraph/issues/540); see [Init reap](#init-reap)).
 
 ### Init → memmgr
 
@@ -218,7 +218,7 @@ forwarded to memmgr. They stay in init's CSpace, which the kernel pins (it is th
 Counting](../core/kernel/docs/capability-internals.md#kernel-object-reference-counting)), so
 procmgr's delete drops only its own reference and they remain alive but unreachable; releasing them
 at the reap is design intent, not yet implemented
-([#443](https://github.com/kottlerg/seraph/issues/443)). The page-table nodes stay consumed after
+([#540](https://github.com/kottlerg/seraph/issues/540)). The page-table nodes stay consumed after
 init's AddressSpace is gone, an accepted cost owned by [memory-internals.md § Page Table Node
 Ownership](../core/kernel/docs/memory-internals.md#page-table-node-ownership). On riscv64 a third
 residue follows from the first: init maps the console UART through its boot Mmio capability, whose

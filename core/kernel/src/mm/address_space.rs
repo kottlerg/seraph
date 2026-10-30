@@ -200,7 +200,12 @@ pub struct AddressSpace
     /// untagged (unclaimed, or the full-flush fallback when tagging is
     /// unavailable). Claimed lazily on first `activate` from
     /// [`crate::mm::tag_allocator`]. Written only under the tag-pool lock
-    /// (by the owner's own claim or by eviction); read lock-free by `activate`.
+    /// (by the owner's own claim or by eviction); read lock-free by `activate`
+    /// (a 0 sends it to the locked claim) and by `shootdown_remote` (a revoked
+    /// tag is harmless: core/kernel/docs/memory-internals.md § SMP TLB
+    /// Shootdown). The teardown's `tag_allocator::free_tag` reads it under the
+    /// lock, so an eviction cannot hand the dying space's tag to another space
+    /// between the read and the free (see the `tag_allocator` § Concurrency).
     // dead_code: the tag fields are accessed only on `#[cfg(not(test))]` paths
     // (activate / shootdown / destroy), so host-test builds see them as unread.
     #[cfg_attr(test, allow(dead_code))]

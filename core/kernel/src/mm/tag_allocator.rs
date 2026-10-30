@@ -24,11 +24,24 @@
 //!
 //! `AddressSpace.tag` is written only by the owner's own claim or by eviction,
 //! both under `TAG_POOL_LOCK`. While eviction holds the lock it is the *sole*
-//! writer of any space's `tag`; the only concurrent access is `activate`'s
-//! lock-free read. A racing `activate` that reads `tag == 0` falls into
-//! [`claim`], which blocks on the lock, so it cannot load the evicted tag. The
-//! `SeqCst` fence between revoking a victim's tag and reading its active-CPU
-//! mask is the eviction-side half of the Dekker exclusion with `activate`.
+//! writer of any space's `tag`. Outside the lock the pool and the fields agree:
+//! the pool records space `S` as the owner of tag `t` exactly when `S.tag == t`.
+//! Two readers load `tag` without the lock:
+//!
+//! - `AddressSpace::activate`: a racing `activate` that reads `tag == 0` falls
+//!   into [`claim`], which blocks on the lock, so it cannot load the evicted tag.
+//!   The `SeqCst` fence between revoking a victim's tag and reading its
+//!   active-CPU mask is the eviction-side half of the Dekker exclusion with
+//!   `activate`.
+//! - `AddressSpace::shootdown_remote`: a revoked tag the request carries is
+//!   harmless, because eviction needs the space inactive everywhere (proof:
+//!   core/kernel/docs/memory-internals.md § SMP TLB Shootdown).
+//!
+//! The `AddressSpace` teardown (`dealloc_object`, core/kernel/src/cap/object.rs)
+//! does not read `tag` itself: an eviction can move the dying space's tag to
+//! another space between such a read and the free, so [`free_tag`] re-reads the
+//! tag under the lock and frees it only while the pool still records the dying
+//! space as its owner.
 
 /// Maximum number of tags the pool tracks. The configured count is
 /// `NUM_TAGS = min(hardware tags, TAG_CAP, slab-fit limit)` (see [`enable`]),
@@ -148,13 +161,22 @@ impl TagPool
         self.claimed_at[t] = claim_gen;
     }
 
-    /// Return `tag` to the free pool.
-    fn clear(&mut self, tag: u16)
+    /// Return `tag` to the free pool if `owner` still holds it, and report
+    /// whether it did. A tag eviction has reissued to another space is left as
+    /// recorded, so a release by a space that lost its tag cannot free the new
+    /// owner's live tag; tag 0 (an untagged space) is never in use. `tag` must
+    /// be below [`TAG_CAP`] (every `AddressSpace.tag` value comes from the pool).
+    fn release(&mut self, tag: u16, owner: usize) -> bool
     {
         let t = tag as usize;
+        if !self.is_used(tag) || self.owners[t] != owner
+        {
+            return false;
+        }
         self.in_use[t / 64] &= !(1u64 << (t % 64));
         self.owners[t] = 0;
         self.claimed_at[t] = 0;
+        true
     }
 }
 
@@ -404,10 +426,10 @@ mod glue
                 {
                     let victim = pool.owners[victim_tag as usize] as *const AddressSpace;
                     // Under the pool lock this path is the sole writer of any space's `tag`.
-                    // SAFETY: the victim is a live AddressSpace — its tag was
-                    // claimed under this lock and free_tag() (called before the
-                    // space is dropped) also takes this lock, so the pointer is
-                    // valid here.
+                    // SAFETY: the victim is a live AddressSpace — the pool
+                    // records an owner only while that space holds the tag, and
+                    // free_tag() (called before the space is dropped) clears the
+                    // record under this lock, so the pointer is valid here.
                     unsafe {
                         (*victim).tag.store(0, Ordering::Release);
                     }
@@ -456,18 +478,24 @@ mod glue
         })
     }
 
-    /// Return `tag` to the pool when an address space is destroyed.
+    /// Return `as_ref`'s tag, if it still holds one, to the pool when the
+    /// address space is destroyed.
+    ///
+    /// The tag is read under the pool lock, not by the caller: an eviction on
+    /// another CPU can reissue an inactive dying space's tag to a different
+    /// space, and only the pool's owner record says whether the tag is still
+    /// this space's to free (`TagPool::release`). After this returns the pool
+    /// records no tag for `as_ref`, so eviction never dereferences it again.
     ///
     /// No TLB flush is issued: a CPU that cached this tag is flushed lazily by
     /// the `owner_gen` check the next time it loads the tag for whatever space
     /// claims it next.
-    pub fn free_tag(tag: u16)
+    pub fn free_tag(as_ref: &AddressSpace)
     {
-        if tag == 0
-        {
-            return;
-        }
-        with_tag_pool(|pool| pool.clear(tag));
+        let owner = core::ptr::from_ref(as_ref) as usize;
+        with_tag_pool(|pool| {
+            pool.release(as_ref.tag.load(Ordering::Acquire), owner);
+        });
     }
 }
 
@@ -526,7 +554,7 @@ mod tests
     }
 
     #[test]
-    fn clear_returns_tag_to_free_pool()
+    fn release_by_owner_returns_tag_to_free_pool()
     {
         let mut pool = TagPool::new();
         pool.configure(3);
@@ -535,9 +563,27 @@ mod tests
         let g = pool.next_gen();
         pool.record(2, 0x2, g);
         assert_eq!(pool.find_free(), None);
-        pool.clear(1);
+        assert!(pool.release(1, 0x1));
         assert_eq!(pool.find_free(), Some(1));
         assert!(!pool.is_used(1));
+    }
+
+    // Defect caught: a dying space whose tag eviction reissued to another space
+    // freeing that space's live tag, so a third claim shares it.
+    #[test]
+    fn release_by_non_owner_leaves_tag_recorded()
+    {
+        let mut pool = TagPool::new();
+        pool.configure(3);
+        let g = pool.next_gen();
+        pool.record(1, 0xA, g);
+        // Eviction reissues tag 1 from space 0xA to space 0xB.
+        let g = pool.next_gen();
+        pool.record(1, 0xB, g);
+        assert!(!pool.release(1, 0xA));
+        assert!(pool.is_used(1));
+        assert_eq!(pool.owners[1], 0xB);
+        assert_eq!(pool.claimed_at[1], g);
     }
 
     #[test]

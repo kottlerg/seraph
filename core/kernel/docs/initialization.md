@@ -471,7 +471,8 @@ The scratch pages and bundle layout are described in
    b. Initialise the CPU's idle TCB in place in its slot of the IDLE_TCBS slab (allocated in
       Phase 4):
       - Priority: IDLE_PRIORITY (lowest, reserved; never preempted)
-      - Entry: arch::current::context::new_state(idle_thread_entry, stack_top, cpu_id, false)
+      - Entry: arch::current::context::new_state(idle_thread_entry, stack_top, cpu_id,
+        ThreadKind::Kernel)
       - Idle thread entry calls cpu::halt_until_interrupt() in a loop,
         checking for pending work before each halt
    c. Register the idle TCB as the CPU scheduler's idle and current thread (set_idle,
@@ -605,7 +606,7 @@ calls `sched::enter()`.
 5. Create init's TCB:
    a. Allocate a kernel stack for init (KERNEL_STACK_PAGES = 4 pages = 16 KiB)
    b. new_state(entry=init_image.entry_point, stack_top=kstack_top,
-      arg=choose_init_layout().init_info_va, is_user=true) stores entry_point in
+      arg=choose_init_layout().init_info_va, kind=ThreadKind::User) stores entry_point in
       saved_state.rip (x86-64) or .ra (RISC-V) and the InitInfo VA as the arg
       forwarded to init's a0/rdi on first entry
    c. Priority: INIT_PRIORITY (30)

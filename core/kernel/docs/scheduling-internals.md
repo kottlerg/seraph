@@ -857,13 +857,14 @@ Releasing the lock in Rust on both arches keeps step 3.5 lockless and the deadlo
 `return_to_user`; the user thread becomes interruptible only at the `iretq`/`sret`, which loads the
 user RFLAGS/`sstatus` (IF/SPIE = 1, set by `init_user`) from the `TrapFrame`. The kernel-side
 trampoline itself MUST run with interrupts masked. The invariant: **`new_state` initialises the
-saved interrupt-enable bit to 0 for user threads** (`rflags = 0x002` on x86_64; RISC-V leaves
-`sstatus` untouched so `SIE` stays masked across the swap). If the trampoline runs with IF = 1, a
-timer can preempt it deep on the kstack between the `switch()` `popfq` and the `iretq`; the
-preempted thread is re-enqueued and later resumed through the scheduler, and the convoluted resume
-corrupts a kernel return address, faulting at `RIP = 0` (`#PF`, `cs = 0x8`). **Kernel threads (idle)
-take the other arm** — they have no trampoline and never `iretq` to user, so `new_state` keeps IF =
-1 for them (`rflags = 0x200`) so the idle loop can wake from `hlt`; RISC-V idle instead calls
+saved interrupt-enable bit to 0 for user threads** (`ThreadKind::User`, the `arch::ThreadKind`
+argument its callers pass: `rflags = 0x002` on x86_64; RISC-V leaves `sstatus` untouched so `SIE`
+stays masked across the swap). If the trampoline runs with IF = 1, a timer can preempt it deep on
+the kstack between the `switch()` `popfq` and the `iretq`; the preempted thread is re-enqueued and
+later resumed through the scheduler, and the convoluted resume corrupts a kernel return address,
+faulting at `RIP = 0` (`#PF`, `cs = 0x8`). **Kernel threads (idle) take the other arm**
+(`ThreadKind::Kernel`) — they have no trampoline and never `iretq` to user, so `new_state` keeps IF
+= 1 for them (`rflags = 0x200`) so the idle loop can wake from `hlt`; RISC-V idle instead calls
 `interrupts::enable()` in its entry. This mirrors the #117 invariant (interrupts must not be live on
 a kstack a thread does not exclusively own) but on the *first-run* path rather than the steady-state
 switch.

@@ -127,7 +127,8 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
 - Spawn svcmgr from `/services/svcmgr` with the `Universal` namespace
   policy (`create_svcmgr_from_file`), then serve it the handover
   endowment over the bootstrap-round protocol (`endow_svcmgr`):
-  - **Round 1 (`CAPS`)** — svcmgr's service + bootstrap endpoints
+  - **`CAPS` rounds** (one for these four slots; a longer slot list
+    spans more, each with a rounds-left count) — svcmgr's service + bootstrap endpoints
     (full rights), plus the publish-role source caps: a `SEND` on the
     root filesystem's namespace endpoint (svcmgr publishes it as
     `rootfs.root`) and a badge-0 `SEND|GRANT` source on
@@ -135,7 +136,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     `devmgr.shutdown`, and `devmgr.test` publish caps and the
     `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from it; see
     [Publish authority](../../svcmgr/docs/ipc-interface.md#publish-authority)). `data[1]` carries
-    `SVCMGR_LABELS_VERSION`. An absent source is left off the round and
+    `SVCMGR_LABELS_VERSION`. An absent source is left off its round and
     its bit in the `data[2]` presence word clear, since the kernel refuses
     a null cap slot (the encoding is in the
     [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md#handover-endowment-bootstrap-rounds)).

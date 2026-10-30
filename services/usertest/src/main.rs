@@ -190,14 +190,10 @@ fn bootstrap_pwrmgr_auth() -> u32
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by the
     // boot protocol.
-    let Ok(round) = (unsafe { ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf) })
-    else
-    {
-        return 0;
-    };
-    // Only the present caps ride, named by the round's presence word; an
-    // absent slot decodes as `0`.
-    ipc::bootstrap::unpack_slots(&round).map_or(0, |slots| slots[0])
+    // Only the present caps ride, named by each round's presence word; an
+    // absent slot decodes as `0`. The recipe's later seeds are released.
+    unsafe { ipc::bootstrap::request_slots::<1>(info.creator_endpoint, ipc_buf) }
+        .map_or(0, |[pwrmgr_auth]| pwrmgr_auth)
 }
 
 /// Terminal — pwrmgr powers off and QEMU exits. A reply arrives only on

@@ -6,12 +6,14 @@
 //! Wire codec for init's handover endowment of svcmgr.
 //!
 //! init serves the endowment over the bootstrap-round protocol and svcmgr
-//! drains it; this crate owns the round kinds and the encoding of the two
-//! rounds that carry optional source caps (`CAPS` and `LOGD_SOURCES`). The
-//! kernel refuses a message carrying a null cap slot, so an absent source
-//! cannot ride as a zero slot: each of these rounds lists only the caps
-//! present, and a presence bitmap in a data word names which optional slot
-//! each listed cap fills. The encoding is specified in
+//! drains it; this crate owns the round kinds and the encoding of the rounds
+//! that carry optional source caps (`CAPS` and `LOGD_SOURCES`). The kernel
+//! refuses a message carrying a null cap slot, so an absent source cannot
+//! ride as a zero slot: each of these rounds lists only the caps present,
+//! and a presence bitmap in a data word names which slot each listed cap
+//! fills. The `CAPS` slots are a positional list of any length, split over
+//! as many `CAPS` rounds as it needs with `ipc::bootstrap`'s slot-round
+//! windows. The encoding is specified in
 //! [services/svcmgr/docs/ipc-interface.md](../../docs/ipc-interface.md#handover-endowment-bootstrap-rounds)
 //! (see also the crate [README](../README.md)).
 //! The crate performs no IPC and issues no syscalls, so both sides of the
@@ -20,12 +22,14 @@
 
 #![cfg_attr(not(test), no_std)]
 
+use ipc::bootstrap::{PackedSlots, SlotAccumulator, slot_round_count, slot_rounds};
 use syscall_abi::MSG_CAP_SLOTS_MAX;
 
 /// Round kinds, tagged in `data[0]` of every endowment round.
 pub mod kind
 {
-    /// svcmgr's own endpoints plus the publish-role source caps.
+    /// svcmgr's own endpoints plus the publish-role source caps, over one or
+    /// more consecutive rounds.
     pub const CAPS: u64 = 1;
     /// One substrate `(name, thread_cap)` registration.
     pub const SUBSTRATE: u64 = 2;
@@ -34,14 +38,26 @@ pub mod kind
     pub const LOGD_SOURCES: u64 = 3;
 }
 
-/// Presence bits of the `CAPS` round's optional slots, in `data[2]`.
-pub mod caps_present
+/// Positions in the `CAPS` slot list. Round `k` of the `CAPS` rounds
+/// carries slots `k * MSG_CAP_SLOTS_MAX` onwards, and its presence word
+/// (`data[2]`) is relative to that window.
+pub mod caps_slot
 {
+    /// svcmgr's service endpoint (RECV). Required.
+    pub const SERVICE: usize = 0;
+    /// svcmgr's own bootstrap endpoint (RECV). Required.
+    pub const BOOTSTRAP: usize = 1;
     /// The SEND on the root filesystem's namespace endpoint (`rootfs.root`).
-    pub const ROOTFS_ROOT: u64 = 1 << 0;
+    pub const ROOTFS_ROOT: usize = 2;
     /// The badge-0 `SEND|GRANT` source on devmgr's registry endpoint.
-    pub const DEVMGR_REGISTRY: u64 = 1 << 1;
+    pub const DEVMGR_REGISTRY: usize = 3;
 }
+
+/// Number of slots in the `CAPS` slot list.
+pub const CAPS_SLOTS: usize = 4;
+
+/// Number of `CAPS` rounds the slot list takes.
+pub const CAPS_ROUNDS: usize = slot_round_count(CAPS_SLOTS);
 
 /// Presence bits of the `LOGD_SOURCES` round's slots, in `data[1]`.
 pub mod logd_present
@@ -53,12 +69,12 @@ pub mod logd_present
 }
 
 /// Data words an encoded round carries at most (`CAPS`: kind, version,
-/// presence).
-const ROUND_DATA_WORDS: usize = 3;
+/// presence, rounds left).
+const ROUND_DATA_WORDS: usize = 4;
 
-/// The caps of the `CAPS` round, by role. `0` marks an absent source cap.
-/// The two endpoints are required; in a decoded round they are never `0`
-/// because they are delivered caps, and the kernel refuses a null slot.
+/// The caps of the `CAPS` rounds, by role. `0` marks an absent source cap.
+/// The two endpoints are required; in a decoded round set they are never
+/// `0`, since [`CapsDecoder`] refuses a set that lacks either.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CapsRound
 {
@@ -70,6 +86,30 @@ pub struct CapsRound
     pub rootfs_root: u32,
     /// Badge-0 `SEND|GRANT` source on devmgr's registry endpoint, or `0`.
     pub devmgr_registry: u32,
+}
+
+impl CapsRound
+{
+    /// The positional slot list, indexed by [`caps_slot`].
+    fn slots(&self) -> [u32; CAPS_SLOTS]
+    {
+        let mut slots = [0; CAPS_SLOTS];
+        slots[caps_slot::SERVICE] = self.service_ep;
+        slots[caps_slot::BOOTSTRAP] = self.bootstrap_ep;
+        slots[caps_slot::ROOTFS_ROOT] = self.rootfs_root;
+        slots[caps_slot::DEVMGR_REGISTRY] = self.devmgr_registry;
+        slots
+    }
+
+    fn from_slots(slots: &[u32; CAPS_SLOTS]) -> Self
+    {
+        CapsRound {
+            service_ep: slots[caps_slot::SERVICE],
+            bootstrap_ep: slots[caps_slot::BOOTSTRAP],
+            rootfs_root: slots[caps_slot::ROOTFS_ROOT],
+            devmgr_registry: slots[caps_slot::DEVMGR_REGISTRY],
+        }
+    }
 }
 
 /// The caps of the `LOGD_SOURCES` round, by role. `0` marks an absent source.
@@ -120,11 +160,13 @@ impl Round
         round
     }
 
-    /// Append `cap` to the cap list, unconditionally.
-    fn push(&mut self, cap: u32)
+    /// A round carrying `packed`'s caps.
+    fn with_caps(data: &[u64], packed: &PackedSlots) -> Self
     {
-        self.caps[self.cap_count] = cap;
-        self.cap_count += 1;
+        let mut round = Round::new(data);
+        round.caps[..packed.caps().len()].copy_from_slice(packed.caps());
+        round.cap_count = packed.caps().len();
+        round
     }
 
     /// Append `cap` when it is present, and return `bit` for the presence
@@ -135,7 +177,8 @@ impl Round
         {
             return 0;
         }
-        self.push(cap);
+        self.caps[self.cap_count] = cap;
+        self.cap_count += 1;
         bit
     }
 }
@@ -144,29 +187,42 @@ impl Round
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DecodeError
 {
-    /// The `CAPS` round's handshake word is missing or is not this build's
+    /// A `CAPS` round's handshake word is missing or is not this build's
     /// `SVCMGR_LABELS_VERSION`.
     VersionMismatch,
     /// The round's kind, data words, or caps disagree with its encoding:
-    /// a required cap or the presence word is missing, the bitmap sets a bit
-    /// with no slot, or the bitmap names a different number of caps than
-    /// the round delivered.
+    /// a required cap, the presence word, or the rounds-left word is
+    /// missing, the bitmap sets a bit with no slot, the bitmap names a
+    /// different number of caps than the round delivered, or more `CAPS`
+    /// rounds arrive than the slot list takes.
     Malformed,
 }
 
-/// Encode the `CAPS` round. `service_ep` and `bootstrap_ep` MUST be
-/// non-zero (init derives both before it starts svcmgr); an optional source
-/// of `0` is left off the cap list and its presence bit clear.
+/// Encode the `CAPS` rounds, [`CAPS_ROUNDS`] of them in serving order.
+/// `service_ep` and `bootstrap_ep` MUST be non-zero (init derives both
+/// before it starts svcmgr); an optional source of `0` is left off its
+/// round's cap list and its presence bit clear. Round `k` carries
+/// `data = [CAPS, SVCMGR_LABELS_VERSION, presence, rounds_left]`, where
+/// `rounds_left` counts the `CAPS` rounds after it.
 #[must_use]
-pub fn encode_caps(caps: &CapsRound) -> Round
+pub fn encode_caps(caps: &CapsRound) -> [Round; CAPS_ROUNDS]
 {
-    let mut round = Round::new(&[kind::CAPS, u64::from(ipc::SVCMGR_LABELS_VERSION), 0]);
-    round.push(caps.service_ep);
-    round.push(caps.bootstrap_ep);
-    let presence = round.push_optional(caps.rootfs_root, caps_present::ROOTFS_ROOT)
-        | round.push_optional(caps.devmgr_registry, caps_present::DEVMGR_REGISTRY);
-    round.data[2] = presence;
-    round
+    let slots = caps.slots();
+    let mut windows = slot_rounds(&slots);
+    core::array::from_fn(|k| {
+        let packed = windows
+            .next()
+            .unwrap_or_else(|| ipc::bootstrap::pack_slots(&[]));
+        Round::with_caps(
+            &[
+                kind::CAPS,
+                u64::from(ipc::SVCMGR_LABELS_VERSION),
+                packed.presence(),
+                (CAPS_ROUNDS - 1 - k) as u64,
+            ],
+            &packed,
+        )
+    })
 }
 
 /// Encode the `LOGD_SOURCES` round. A source of `0` is left off the cap
@@ -185,36 +241,72 @@ pub fn encode_logd_sources(sources: &LogdSources) -> Round
     round
 }
 
-/// Decode a received `CAPS` round from its delivered `caps` and its `data`
-/// words.
-///
-/// # Errors
-/// [`DecodeError::VersionMismatch`] when `data[1]` is missing or differs from
-/// this build's `SVCMGR_LABELS_VERSION`; [`DecodeError::Malformed`] when the
-/// kind is not `CAPS`, the presence word or a required endpoint is missing,
-/// or the presence bitmap disagrees with the delivered caps.
-pub fn decode_caps(caps: &[u32], data: &[u64]) -> Result<CapsRound, DecodeError>
+/// Concatenates received `CAPS` rounds into the [`CapsRound`] they encode.
+#[derive(Default)]
+pub struct CapsDecoder
 {
-    if data.first() != Some(&kind::CAPS)
+    slots: SlotAccumulator<CAPS_SLOTS>,
+}
+
+impl CapsDecoder
+{
+    /// A decoder that has received no `CAPS` round.
+    #[must_use]
+    pub const fn new() -> Self
     {
-        return Err(DecodeError::Malformed);
+        CapsDecoder {
+            slots: SlotAccumulator::new(),
+        }
     }
-    if data.get(1) != Some(&u64::from(ipc::SVCMGR_LABELS_VERSION))
+
+    /// Add one received `CAPS` round from its delivered `caps` and its
+    /// `data` words. Returns the decoded [`CapsRound`] once the round whose
+    /// rounds-left word is `0` arrives, and `None` while more are owed.
+    ///
+    /// # Errors
+    /// [`DecodeError::VersionMismatch`] when `data[1]` is missing or differs
+    /// from this build's `SVCMGR_LABELS_VERSION`; [`DecodeError::Malformed`]
+    /// when the kind is not `CAPS`, the presence or rounds-left word is
+    /// missing, the presence bitmap disagrees with the delivered caps, the
+    /// round carries a slot past the list, or the last round leaves a
+    /// required endpoint absent. On an error the round's caps are still the
+    /// caller's to release.
+    pub fn push(&mut self, caps: &[u32], data: &[u64]) -> Result<Option<CapsRound>, DecodeError>
     {
-        return Err(DecodeError::VersionMismatch);
+        if data.first() != Some(&kind::CAPS)
+        {
+            return Err(DecodeError::Malformed);
+        }
+        if data.get(1) != Some(&u64::from(ipc::SVCMGR_LABELS_VERSION))
+        {
+            return Err(DecodeError::VersionMismatch);
+        }
+        let (Some(&presence), Some(&rounds_left)) = (data.get(2), data.get(3))
+        else
+        {
+            return Err(DecodeError::Malformed);
+        };
+        // A slot past the list would come from an encoder with a longer list,
+        // which a matching version rules out: refuse the round.
+        let mut overflowed = false;
+        self.slots
+            .push(caps, presence, |_| overflowed = true)
+            .map_err(|_| DecodeError::Malformed)?;
+        if overflowed
+        {
+            return Err(DecodeError::Malformed);
+        }
+        if rounds_left != 0
+        {
+            return Ok(None);
+        }
+        let decoded = CapsRound::from_slots(self.slots.slots());
+        if decoded.service_ep == 0 || decoded.bootstrap_ep == 0
+        {
+            return Err(DecodeError::Malformed);
+        }
+        Ok(Some(decoded))
     }
-    let (Some(&presence), Some((required, optional))) = (data.get(2), caps.split_at_checked(2))
-    else
-    {
-        return Err(DecodeError::Malformed);
-    };
-    let [rootfs_root, devmgr_registry] = take_optional::<2>(presence, optional)?;
-    Ok(CapsRound {
-        service_ep: required[0],
-        bootstrap_ep: required[1],
-        rootfs_root,
-        devmgr_registry,
-    })
 }
 
 /// Decode a received `LOGD_SOURCES` round from its delivered `caps` and its
@@ -235,33 +327,15 @@ pub fn decode_logd_sources(caps: &[u32], data: &[u64]) -> Result<LogdSources, De
     {
         return Err(DecodeError::Malformed);
     };
-    let [master_log_source, procmgr_death_auth_source] = take_optional::<2>(presence, caps)?;
-    Ok(LogdSources {
-        master_log_source,
-        procmgr_death_auth_source,
-    })
-}
-
-/// Spread the delivered optional `caps` over `N` slots by `presence`: slot
-/// `i` takes the next cap when bit `i` is set and is `0` otherwise. Refuses
-/// a bit at or above `N` and a bitmap naming a different number of caps
-/// than were delivered.
-fn take_optional<const N: usize>(presence: u64, caps: &[u32]) -> Result<[u32; N], DecodeError>
-{
-    if presence >> N != 0 || presence.count_ones() as usize != caps.len()
+    let slots = ipc::bootstrap::spread_slots(caps, presence).map_err(|_| DecodeError::Malformed)?;
+    if presence >> 2 != 0
     {
         return Err(DecodeError::Malformed);
     }
-    let mut slots = [0u32; N];
-    let mut next = caps.iter();
-    for (i, slot) in slots.iter_mut().enumerate()
-    {
-        if presence & (1 << i) != 0
-        {
-            *slot = next.next().copied().ok_or(DecodeError::Malformed)?;
-        }
-    }
-    Ok(slots)
+    Ok(LogdSources {
+        master_log_source: slots[0],
+        procmgr_death_auth_source: slots[1],
+    })
 }
 
 #[cfg(test)]
@@ -271,6 +345,7 @@ mod tests
 
     const SERVICE: u32 = 0x11;
     const BOOTSTRAP: u32 = 0x12;
+    const VERSION: u64 = ipc::SVCMGR_LABELS_VERSION as u64;
 
     fn caps_round(rootfs_root: u32, devmgr_registry: u32) -> CapsRound
     {
@@ -282,14 +357,29 @@ mod tests
         }
     }
 
+    /// Feed every encoded `CAPS` round to a fresh decoder.
+    fn decode_all(rounds: &[Round]) -> Result<Option<CapsRound>, DecodeError>
+    {
+        let mut decoder = CapsDecoder::new();
+        let mut last = Ok(None);
+        for round in rounds
+        {
+            last = decoder.push(round.caps(), round.data());
+            if last.is_err()
+            {
+                break;
+            }
+        }
+        last
+    }
+
     #[test]
     fn caps_round_trips_with_every_source_present_or_absent()
     {
         for (rootfs, devmgr) in [(0, 0), (0x21, 0), (0, 0x22), (0x21, 0x22)]
         {
             let sent = caps_round(rootfs, devmgr);
-            let round = encode_caps(&sent);
-            assert_eq!(decode_caps(round.caps(), round.data()), Ok(sent));
+            assert_eq!(decode_all(&encode_caps(&sent)), Ok(Some(sent)));
         }
     }
 
@@ -313,8 +403,8 @@ mod tests
     fn an_absent_source_is_left_off_the_cap_list()
     {
         let caps = encode_caps(&caps_round(0, 0x22));
-        assert_eq!(caps.caps(), &[SERVICE, BOOTSTRAP, 0x22]);
-        assert_eq!(caps.data()[2], caps_present::DEVMGR_REGISTRY);
+        assert_eq!(caps[0].caps(), &[SERVICE, BOOTSTRAP, 0x22]);
+        assert_eq!(caps[0].data()[2], 0b1011);
 
         let logd = encode_logd_sources(&LogdSources {
             master_log_source: 0x31,
@@ -324,33 +414,69 @@ mod tests
         assert_eq!(logd.data()[1], logd_present::MASTER_LOG);
     }
 
+    // A decoder that stopped at the first `CAPS` round would lose every slot
+    // a later round carries.
+    #[test]
+    fn caps_rounds_with_rounds_left_are_concatenated_until_the_last()
+    {
+        let mut decoder = CapsDecoder::new();
+        let first = [SERVICE, BOOTSTRAP, 0x21, 0x22];
+        assert_eq!(
+            decoder.push(&first, &[kind::CAPS, VERSION, 0b1111, 1]),
+            Ok(None)
+        );
+        assert_eq!(
+            decoder.push(&[], &[kind::CAPS, VERSION, 0, 0]),
+            Ok(Some(caps_round(0x21, 0x22)))
+        );
+    }
+
+    #[test]
+    fn a_caps_round_carrying_a_slot_past_the_list_is_malformed()
+    {
+        let mut decoder = CapsDecoder::new();
+        let first = [SERVICE, BOOTSTRAP];
+        assert_eq!(
+            decoder.push(&first, &[kind::CAPS, VERSION, 0b0011, 1]),
+            Ok(None)
+        );
+        assert_eq!(
+            decoder.push(&[0x25], &[kind::CAPS, VERSION, 0b0001, 0]),
+            Err(DecodeError::Malformed)
+        );
+    }
+
     #[test]
     fn caps_round_with_a_wrong_or_missing_version_is_refused()
     {
-        let round = encode_caps(&caps_round(0x21, 0x22));
+        let rounds = encode_caps(&caps_round(0x21, 0x22));
         let mut data = [0u64; ROUND_DATA_WORDS];
-        data.copy_from_slice(round.data());
-        data[1] = u64::from(ipc::SVCMGR_LABELS_VERSION) + 1;
+        data.copy_from_slice(rounds[0].data());
+        data[1] = VERSION + 1;
         assert_eq!(
-            decode_caps(round.caps(), &data),
+            CapsDecoder::new().push(rounds[0].caps(), &data),
             Err(DecodeError::VersionMismatch)
         );
         assert_eq!(
-            decode_caps(round.caps(), &data[..1]),
+            CapsDecoder::new().push(rounds[0].caps(), &data[..1]),
             Err(DecodeError::VersionMismatch)
         );
     }
 
     #[test]
-    fn caps_round_missing_its_presence_word_or_an_endpoint_is_malformed()
+    fn caps_round_missing_a_word_or_an_endpoint_is_malformed()
     {
-        let round = encode_caps(&caps_round(0, 0));
+        let rounds = encode_caps(&caps_round(0, 0));
+        for words in [2, 3]
+        {
+            assert_eq!(
+                CapsDecoder::new().push(rounds[0].caps(), &rounds[0].data()[..words]),
+                Err(DecodeError::Malformed)
+            );
+        }
+        // Only the bootstrap endpoint present: the service slot is absent.
         assert_eq!(
-            decode_caps(round.caps(), &round.data()[..2]),
-            Err(DecodeError::Malformed)
-        );
-        assert_eq!(
-            decode_caps(&round.caps()[..1], round.data()),
+            CapsDecoder::new().push(&[BOOTSTRAP], &[kind::CAPS, VERSION, 0b0010, 0]),
             Err(DecodeError::Malformed)
         );
     }
@@ -362,11 +488,11 @@ mod tests
         let one = encode_caps(&caps_round(0x21, 0));
         // Bitmap names two optional caps, one delivered; and the reverse.
         assert_eq!(
-            decode_caps(one.caps(), both.data()),
+            CapsDecoder::new().push(one[0].caps(), both[0].data()),
             Err(DecodeError::Malformed)
         );
         assert_eq!(
-            decode_caps(both.caps(), one.data()),
+            CapsDecoder::new().push(both[0].caps(), one[0].data()),
             Err(DecodeError::Malformed)
         );
 
@@ -395,7 +521,7 @@ mod tests
     {
         let caps = encode_caps(&caps_round(0, 0));
         assert_eq!(
-            decode_logd_sources(caps.caps(), caps.data()),
+            decode_logd_sources(caps[0].caps(), caps[0].data()),
             Err(DecodeError::Malformed)
         );
         assert_eq!(
@@ -407,7 +533,7 @@ mod tests
             procmgr_death_auth_source: 0,
         });
         assert_eq!(
-            decode_caps(logd.caps(), logd.data()),
+            CapsDecoder::new().push(logd.caps(), logd.data()),
             Err(DecodeError::Malformed)
         );
     }

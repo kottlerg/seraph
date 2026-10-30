@@ -159,7 +159,7 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.test pwrmgr.deny
 ```
 
 Recognised keys: `binary` (required), `argv`, `env`, `restart`

@@ -102,7 +102,8 @@ the front, from the back, and from both ends at once, and env carries `SERAPH_TE
 
 ## Capabilities
 
-The bootstrap round from the creator endpoint delivers the recipe's seeds in this order;
+The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, the
+fifth in a second round;
 [service-definitions.md § `seed`](../svcmgr/docs/service-definitions.md#seed) defines each
 name's cap shape and the zero slot an unresolved name leaves. With no creator endpoint, every
 slot stays zero.
@@ -113,23 +114,26 @@ slot stays zero.
 | `caps[1]` | `pwrmgr.shutdown` | Authority cap for the final `SHUTDOWN` |
 | `caps[2]` | `devmgr.registry` | devmgr deny phases                     |
 | `caps[3]` | `devmgr.test`     | devmgr orphan-teardown, drivers deny   |
+| `caps[4]` | `pwrmgr.deny`     | Second-round delivery check            |
 
-The svcmgr seed-only phase also reads every slot and fails when any is zero, as evidence that its
-name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the devmgr deny
-phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE`, `QUERY_SHUTDOWN_DEVICE`,
-`TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, and `TEST_QUERY_DENY_DEVICE`. `caps[3]` exists for
-devmgr's test labels (TODO(#165): retire with them): the orphan-teardown phase's `TEST_SPAWN_ORPHAN`
-shim, and `TEST_QUERY_DENY_DEVICE`, which hands the drivers deny phase a SEND on the serial, input,
-or framebuffer driver's endpoint badged with none of the driver's verb bits. That phase requires an
-`UNAUTHORIZED` reply to `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, `SERIAL_REGISTER_RX_NOTIFY`, and
-`INPUT_READ_EVENTS` (at once, without blocking for a key), and to `FB_WRITE_BYTES` and
-`FB_SET_ATTRS` when a framebuffer driver runs; on a headless boot, CI's, devmgr runs none and the
-framebuffer case logs a skip. The input case also logs a skip when `terminal.svc` is staged: the
-input driver serves one request at a time and the terminal keeps a blocking read pending, so the
-deny would wait behind it for a keypress. Every seed is seed-only in svcmgr's registry. The
-no-authority `pwrmgr.deny` cap is public, so svctest resolves it through `QUERY_ENDPOINT` on its
-per-process `service_registry_cap` and spends no seed slot on it; it drives the pwrmgr cap-deny
-phase, which requires an `UNAUTHORIZED` reply to `SHUTDOWN`.
+The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
+that its name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the
+devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE`,
+`QUERY_SHUTDOWN_DEVICE`, `TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, and `TEST_QUERY_DENY_DEVICE`.
+`caps[3]` exists for devmgr's test labels (TODO(#165): retire with them): the orphan-teardown
+phase's `TEST_SPAWN_ORPHAN` shim, and `TEST_QUERY_DENY_DEVICE`, which hands the drivers deny phase a
+SEND on the serial, input, or framebuffer driver's endpoint badged with none of the driver's verb
+bits. That phase requires an `UNAUTHORIZED` reply to `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`,
+`SERIAL_REGISTER_RX_NOTIFY`, and `INPUT_READ_EVENTS` (at once, without blocking for a key), and to
+`FB_WRITE_BYTES` and `FB_SET_ATTRS` when a framebuffer driver runs; on a headless boot, CI's, devmgr
+runs none and the framebuffer case logs a skip. The input case also logs a skip when `terminal.svc`
+is staged: the input driver serves one request at a time and the terminal keeps a blocking read
+pending, so the deny would wait behind it for a keypress. The first four seeds are seed-only in
+svcmgr's registry. The no-authority `pwrmgr.deny` cap is public: the pwrmgr cap-deny phase, which
+requires an `UNAUTHORIZED` reply to `SHUTDOWN`, uses the copy svctest resolves through
+`QUERY_ENDPOINT` on its per-process `service_registry_cap`. `caps[4]` seeds the same name only so
+that every svctest boot receives a seed list longer than one bootstrap round; svctest logs a
+`FATAL:` line, which fails the harness run, when slot 4 arrives empty.
 
 ---
 

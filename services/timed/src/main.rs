@@ -34,14 +34,10 @@ fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
         return None;
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let round = unsafe { ipc::bootstrap::request_round(creator_endpoint, ipc_buf) }.ok()?;
-    if !round.done
-    {
-        return None;
-    }
-    // Only the present caps ride, named by the round's presence word; an
+    // Only the present caps ride, named by each round's presence word; an
     // absent slot decodes as `0`. Both slots are required.
-    let [service_ep, devmgr_registry_ep, ..] = ipc::bootstrap::unpack_slots(&round).ok()?;
+    let [service_ep, devmgr_registry_ep] =
+        unsafe { ipc::bootstrap::request_slots::<2>(creator_endpoint, ipc_buf) }.ok()?;
     if service_ep == 0 || devmgr_registry_ep == 0
     {
         return None;

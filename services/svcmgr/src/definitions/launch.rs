@@ -50,62 +50,54 @@ pub(crate) fn delete_caps(caps: &[u32])
     }
 }
 
-/// Assemble a child's bootstrap cap set: the provider service-endpoint
-/// RECV (`provided_recv`, cap[0]) ahead of the positional `seeds`, capped
-/// at `MSG_CAP_SLOTS_MAX`. A `provided_recv` of `0` (pure consumer) is
-/// skipped. The `.svc` parser bounds a recipe's seeds to the slots left
-/// after the RECV, so the cap is a backstop: an overflow seed is logged and
-/// deleted so it does not leak. Consumes `seeds`.
+/// Assemble a child's positional bootstrap slots: the provider
+/// service-endpoint RECV (`provided_recv`, slot 0) ahead of the positional
+/// `seeds`. A `provided_recv` of `0` (pure consumer) is skipped. Any number
+/// of slots is served, over as many rounds as they need (see
+/// [`serve_boot_slots`]). Consumes `seeds`.
 pub(crate) fn assemble_boot_caps(provided_recv: u32, seeds: Vec<u32>) -> Vec<u32>
 {
-    let mut caps: Vec<u32> = Vec::with_capacity(syscall_abi::MSG_CAP_SLOTS_MAX);
+    let mut caps: Vec<u32> = Vec::with_capacity(seeds.len() + 1);
     if provided_recv != 0
     {
         caps.push(provided_recv);
     }
-    for c in seeds
-    {
-        if caps.len() < syscall_abi::MSG_CAP_SLOTS_MAX
-        {
-            caps.push(c);
-        }
-        else
-        {
-            std::os::seraph::log!("bootstrap round full; dropping seed cap");
-            if c != 0
-            {
-                let _ = syscall::cap_delete(c);
-            }
-        }
-    }
+    caps.extend(seeds);
     caps
 }
 
-/// Serve a child's single bootstrap round from its positional `slots`
-/// (`0` marks an absent cap). The kernel refuses a message carrying a null
-/// cap slot, so the round transfers only the present caps, in slot order,
-/// with the presence word [`ipc::bootstrap::pack_slots`] builds in `data[0]`;
-/// the child spreads them back with [`ipc::bootstrap::unpack_slots`]
-/// (encoding in [service-definitions.md § `seed`](../../docs/service-definitions.md#seed)).
+/// Serve a child's bootstrap rounds from its positional `slots` (`0` marks
+/// an absent cap). A round carries at most `MSG_CAP_SLOTS_MAX` caps, so the
+/// slots are split over [`ipc::bootstrap::slot_rounds`] windows, one round
+/// each, the last marked done. The kernel refuses a message carrying a null
+/// cap slot, so each round transfers only its window's present caps, in slot
+/// order, with the window's presence word in `data[0]`; the child
+/// concatenates the rounds with [`ipc::bootstrap::request_slots`] (encoding
+/// in [service-definitions.md § `seed`](../../docs/service-definitions.md#seed)).
 /// Shared by the launch and restart paths.
 ///
 /// # Errors
-/// The [`ipc::bootstrap::serve_round`] error code.
+/// The [`ipc::bootstrap::serve_round`] error code of the first round that
+/// fails; the caps of the rounds after it are still the caller's.
 pub(crate) fn serve_boot_slots(ctx: &RestartCtx, child_badge: u64, slots: &[u32])
 -> Result<(), u64>
 {
-    let packed = ipc::bootstrap::pack_slots(slots);
-    // SAFETY: `ctx.ipc_buf` is the registered IPC buffer.
-    unsafe {
-        ipc::bootstrap::serve_round(
-            ctx.bootstrap_ep,
-            child_badge,
-            ctx.ipc_buf,
-            true,
-            packed.caps(),
-            &[packed.presence()],
-        )
+    let rounds = ipc::bootstrap::slot_round_count(slots.len());
+    for (k, packed) in ipc::bootstrap::slot_rounds(slots).enumerate()
+    {
+        // SAFETY: `ctx.ipc_buf` is the registered IPC buffer.
+        unsafe {
+            ipc::bootstrap::serve_round(
+                ctx.bootstrap_ep,
+                child_badge,
+                ctx.ipc_buf,
+                k + 1 == rounds,
+                packed.caps(),
+                &[packed.presence()],
+            )
+        }?;
     }
+    Ok(())
 }
 
 /// Which launch of the log-sink service [`mint_logd_boot_caps`] mints for.
@@ -423,9 +415,7 @@ pub fn launch(
 /// Resolve each `seed = ...` name to a derived `RIGHTS_EP_SEND` cap on
 /// the published endpoint. Unresolved names become `0` in their slot
 /// so positional ordering is preserved; [`serve_boot_slots`] leaves an
-/// absent slot off the round and clears its presence bit. Truncated to
-/// `MSG_CAP_SLOTS_MAX` (the bootstrap round's cap limit), a backstop
-/// behind the `.svc` parser's seed bound.
+/// absent slot off the round and clears its presence bit.
 ///
 /// Shared by the launch path and the restart path (which passes the
 /// service's stored [`crate::service::RestartRecipe`] seeds), so a
@@ -437,9 +427,8 @@ pub(crate) fn resolve_seeds(
     registry: &mut registry::Registry<REGISTRY_CAPACITY>,
 ) -> Vec<u32>
 {
-    let cap_max = syscall_abi::MSG_CAP_SLOTS_MAX;
-    let mut caps: Vec<u32> = Vec::with_capacity(seed.len().min(cap_max));
-    for name in seed.iter().take(cap_max)
+    let mut caps: Vec<u32> = Vec::with_capacity(seed.len());
+    for name in seed
     {
         match registry_lookup_derived(registry, name.as_bytes(), Resolver::Seed)
         {
@@ -450,13 +439,6 @@ pub(crate) fn resolve_seeds(
                 caps.push(0);
             }
         }
-    }
-    if seed.len() > cap_max
-    {
-        std::os::seraph::log!(
-            "launch {svc_name}: seed list truncated to {cap_max} entries (had {})",
-            seed.len()
-        );
     }
     caps
 }

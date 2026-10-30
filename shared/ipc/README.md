@@ -21,7 +21,7 @@ shared/ipc/
 ├── README.md
 └── src/
     ├── lib.rs                  # IpcMessage, call/recv/reply wrappers, labels, errors, decoders
-    ├── bootstrap.rs            # Creator-to-child bootstrap rounds; positional-slot codec
+    ├── bootstrap.rs            # Creator-to-child bootstrap rounds; multi-round slot codec
     └── recv_guard.rs           # RecvGuard backoff and EXIT_RECV_WEDGE policy
 ```
 

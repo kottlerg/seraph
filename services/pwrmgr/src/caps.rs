@@ -37,7 +37,7 @@ pub struct Bootstrap
     pub devmgr_registry: u32,
 }
 
-/// Drain the single provider bootstrap round from `creator_endpoint`.
+/// Drain the provider bootstrap rounds from `creator_endpoint`.
 pub fn request_bootstrap(info: &StartupInfo, ipc_buf: *mut u64) -> Option<Bootstrap>
 {
     let creator = info.creator_endpoint;
@@ -46,10 +46,10 @@ pub fn request_bootstrap(info: &StartupInfo, ipc_buf: *mut u64) -> Option<Bootst
         return None;
     }
     // SAFETY: `ipc_buf` is the kernel-registered per-thread IPC buffer.
-    let round = unsafe { ipc::bootstrap::request_round(creator, ipc_buf) }.ok()?;
-    // Only the present caps ride, named by the round's presence word; an
+    // Only the present caps ride, named by each round's presence word; an
     // absent slot decodes as `0`.
-    let [service_ep, devmgr_registry, ..] = ipc::bootstrap::unpack_slots(&round).ok()?;
+    let [service_ep, devmgr_registry] =
+        unsafe { ipc::bootstrap::request_slots::<2>(creator, ipc_buf) }.ok()?;
     Some(Bootstrap {
         service_ep,
         devmgr_registry,

@@ -14,9 +14,11 @@
 //!
 //! Per-(creator, child-type) payload formats are defined in each child's
 //! crate. Beside the generic protocol, this module owns one shared payload
-//! codec: [`pack_slots`] / [`unpack_slots`], for a round whose caps fill
-//! positional slots that may be absent (the rounds svcmgr serves the
-//! children it launches).
+//! codec, for caps that fill positional slots that may be absent:
+//! [`pack_slots`] / [`unpack_slots`] for one round, and [`slot_rounds`] /
+//! [`SlotAccumulator`] / [`request_slots`] for a slot list split over as
+//! many rounds as it needs (the rounds svcmgr serves the children it
+//! launches, and init's `CAPS` endowment of svcmgr).
 
 // When this crate is compiled as a std dep via rustc-dep-of-std, the
 // crate root is `no_core` and the usual prelude is not auto-imported.
@@ -131,7 +133,8 @@ impl PackedSlots
 
 /// Pack positional `slots`, where `0` marks an absent cap, into the caps a
 /// round transfers and its presence word. Slots past `MSG_CAP_SLOTS_MAX`
-/// are not packed; the caller bounds its slot list to the round.
+/// are not packed; a longer slot list is split over rounds by
+/// [`slot_rounds`].
 #[must_use]
 pub fn pack_slots(slots: &[u32]) -> PackedSlots
 {
@@ -166,13 +169,27 @@ pub fn unpack_slots(round: &BootstrapRound) -> Result<[u32; MSG_CAP_SLOTS_MAX], 
     {
         return Err(bootstrap_errors::INVALID);
     }
-    let presence = round.data[0];
-    if presence >> MSG_CAP_SLOTS_MAX != 0 || presence.count_ones() as usize != round.cap_count
+    spread_slots(&round.caps[..round.cap_count], round.data[0])
+}
+
+/// Spread one round's delivered `caps` over its `MSG_CAP_SLOTS_MAX`
+/// positional slots by `presence`: slot `i` takes the next cap when bit `i`
+/// is set and is `0` otherwise. [`unpack_slots`] reads `presence` from
+/// `data[0]`; a protocol that carries it in another word calls this
+/// directly.
+///
+/// # Errors
+/// [`bootstrap_errors::INVALID`] when `presence` sets a bit at or above
+/// `MSG_CAP_SLOTS_MAX` or names a different number of caps than `caps`
+/// holds.
+pub fn spread_slots(caps: &[u32], presence: u64) -> Result<[u32; MSG_CAP_SLOTS_MAX], u64>
+{
+    if presence >> MSG_CAP_SLOTS_MAX != 0 || presence.count_ones() as usize != caps.len()
     {
         return Err(bootstrap_errors::INVALID);
     }
     let mut slots = [0u32; MSG_CAP_SLOTS_MAX];
-    let mut next = round.caps[..round.cap_count].iter();
+    let mut next = caps.iter();
     for (i, slot) in slots.iter_mut().enumerate()
     {
         if presence & (1 << i) != 0
@@ -181,6 +198,107 @@ pub fn unpack_slots(round: &BootstrapRound) -> Result<[u32; MSG_CAP_SLOTS_MAX], 
         }
     }
     Ok(slots)
+}
+
+/// The number of rounds that carry `slot_count` positional slots: one per
+/// `MSG_CAP_SLOTS_MAX`-slot window, and one empty round for no slots.
+#[must_use]
+pub const fn slot_round_count(slot_count: usize) -> usize
+{
+    if slot_count == 0
+    {
+        1
+    }
+    else
+    {
+        slot_count.div_ceil(MSG_CAP_SLOTS_MAX)
+    }
+}
+
+/// Split positional `slots` (`0` marks an absent cap) over consecutive
+/// rounds: round `k` packs the window `slots[k * MSG_CAP_SLOTS_MAX..]` of at
+/// most `MSG_CAP_SLOTS_MAX` slots with [`pack_slots`], so its presence word
+/// is relative to that window. Yields [`slot_round_count`] rounds; no slots
+/// still yield one empty round. A child concatenates the rounds with
+/// [`SlotAccumulator`].
+pub fn slot_rounds(slots: &[u32]) -> impl Iterator<Item = PackedSlots> + '_
+{
+    (0..slot_round_count(slots.len())).map(move |k| {
+        let start = (k * MSG_CAP_SLOTS_MAX).min(slots.len());
+        let end = (start + MSG_CAP_SLOTS_MAX).min(slots.len());
+        pack_slots(&slots[start..end])
+    })
+}
+
+/// Concatenates the windows of consecutive slot rounds (see
+/// [`slot_rounds`]) into `N` positional slots: the `k`-th pushed round fills
+/// slots `k * MSG_CAP_SLOTS_MAX` onwards. A slot no round filled is `0`.
+pub struct SlotAccumulator<const N: usize>
+{
+    slots: [u32; N],
+    rounds: usize,
+}
+
+impl<const N: usize> Default for SlotAccumulator<N>
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
+}
+
+impl<const N: usize> SlotAccumulator<N>
+{
+    /// An accumulator with no round pushed and every slot `0`.
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self {
+            slots: [0; N],
+            rounds: 0,
+        }
+    }
+
+    /// Add the next round's window from its delivered `caps` and its
+    /// `presence` word. A present cap whose slot lies at or past `N` is
+    /// handed to `overflow`, so the caller can release a cap it has no slot
+    /// for instead of leaking it.
+    ///
+    /// # Errors
+    /// [`bootstrap_errors::INVALID`] when the window does not decode (see
+    /// [`spread_slots`]); nothing is recorded and no cap reaches
+    /// `overflow`, so every cap of that round is still the caller's.
+    pub fn push(
+        &mut self,
+        caps: &[u32],
+        presence: u64,
+        mut overflow: impl FnMut(u32),
+    ) -> Result<(), u64>
+    {
+        let window = spread_slots(caps, presence)?;
+        let base = self.rounds.saturating_mul(MSG_CAP_SLOTS_MAX);
+        for (i, &cap) in window.iter().enumerate()
+        {
+            if cap == 0
+            {
+                continue;
+            }
+            match self.slots.get_mut(base.saturating_add(i))
+            {
+                Some(slot) => *slot = cap,
+                None => overflow(cap),
+            }
+        }
+        self.rounds += 1;
+        Ok(())
+    }
+
+    /// The slots filled so far.
+    #[must_use]
+    pub fn slots(&self) -> &[u32; N]
+    {
+        &self.slots
+    }
 }
 
 // ── Child side ──────────────────────────────────────────────────────────────
@@ -240,6 +358,72 @@ pub unsafe fn request_round(creator_ep: u32, ipc_buf: *mut u64) -> Result<Bootst
             })
         }
         err => Err(err),
+    }
+}
+
+/// Drain a creator's slot rounds (see [`slot_rounds`]) into `N` positional
+/// slots: request rounds until one is marked [`DONE`], spreading each over
+/// the next `MSG_CAP_SLOTS_MAX` slots by the presence word in its `data[0]`.
+/// A slot no round filled is `0`; a delivered cap past slot `N` is deleted.
+///
+/// # Safety
+/// `ipc_buf` must point to the caller thread's registered IPC buffer page.
+///
+/// # Errors
+/// The [`request_round`] error of a failed round, or
+/// [`bootstrap_errors::INVALID`] for a round with no presence word or one
+/// that does not decode. On an error every cap received so far is deleted.
+pub unsafe fn request_slots<const N: usize>(
+    creator_ep: u32,
+    ipc_buf: *mut u64,
+) -> Result<[u32; N], u64>
+{
+    let mut acc = SlotAccumulator::<N>::new();
+    loop
+    {
+        // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
+        let round = match unsafe { request_round(creator_ep, ipc_buf) }
+        {
+            Ok(round) => round,
+            Err(code) =>
+            {
+                delete_slots(acc.slots());
+                return Err(code);
+            }
+        };
+        let delivered = &round.caps[..round.cap_count];
+        let pushed = if round.data_words == 0
+        {
+            Err(bootstrap_errors::INVALID)
+        }
+        else
+        {
+            acc.push(delivered, round.data[0], |cap| {
+                let _ = syscall::cap_delete(cap);
+            })
+        };
+        if let Err(code) = pushed
+        {
+            delete_slots(delivered);
+            delete_slots(acc.slots());
+            return Err(code);
+        }
+        if round.done
+        {
+            return Ok(acc.slots);
+        }
+    }
+}
+
+/// Delete every non-zero cap in `caps`.
+fn delete_slots(caps: &[u32])
+{
+    for &cap in caps
+    {
+        if cap != 0
+        {
+            let _ = syscall::cap_delete(cap);
+        }
     }
 }
 
@@ -405,6 +589,71 @@ mod tests
         let mut fewer_bits = received(&pack_slots(&[0x41, 0x42]));
         fewer_bits.data[0] = 0b01;
         assert_eq!(unpack_slots(&fewer_bits), Err(bootstrap_errors::INVALID));
+    }
+
+    /// The slots a child holds after pushing every round of `slot_rounds`,
+    /// and the caps handed to `overflow` (the crate is `no_std`, so a fixed
+    /// buffer and its fill count).
+    fn concatenated<const N: usize>(slots: &[u32]) -> ([u32; N], [u32; 8], usize)
+    {
+        let mut acc = SlotAccumulator::<N>::new();
+        let mut dropped = [0u32; 8];
+        let mut dropped_count = 0;
+        for round in slot_rounds(slots)
+        {
+            acc.push(round.caps(), round.presence(), |cap| {
+                dropped[dropped_count] = cap;
+                dropped_count += 1;
+            })
+            .unwrap();
+        }
+        (*acc.slots(), dropped, dropped_count)
+    }
+
+    #[test]
+    fn slots_past_one_round_split_into_windows_and_concatenate_back()
+    {
+        // Six slots, absent ones in both windows: two rounds, the second's
+        // presence word relative to its own window.
+        let slots = [0x41, 0, 0x43, 0x44, 0, 0x46];
+        assert_eq!(slot_rounds(&slots).count(), 2);
+        let second = slot_rounds(&slots).nth(1).unwrap();
+        assert_eq!(second.caps(), &[0x46]);
+        assert_eq!(second.presence(), 0b10);
+        let (received, _, dropped) = concatenated::<6>(&slots);
+        assert_eq!(received, slots);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn no_slots_still_yield_one_empty_round()
+    {
+        assert_eq!(slot_rounds(&[]).count(), 1);
+        let only = slot_rounds(&[]).next().unwrap();
+        assert!(only.caps().is_empty());
+        assert_eq!(only.presence(), 0);
+    }
+
+    // A child that expects fewer slots than the creator sent must be handed
+    // the extra caps to release, not lose them.
+    #[test]
+    fn caps_past_the_childs_slots_go_to_overflow()
+    {
+        let (slots, dropped, count) = concatenated::<2>(&[0x41, 0x42, 0x43, 0, 0x45]);
+        assert_eq!(slots, [0x41, 0x42]);
+        assert_eq!(&dropped[..count], &[0x43, 0x45]);
+    }
+
+    #[test]
+    fn a_malformed_later_round_is_refused_and_records_nothing()
+    {
+        let mut acc = SlotAccumulator::<8>::new();
+        acc.push(&[0x41], 0b1, |_| panic!("no overflow")).unwrap();
+        assert_eq!(
+            acc.push(&[0x45], 0b11, |_| panic!("no overflow")),
+            Err(bootstrap_errors::INVALID)
+        );
+        assert_eq!(acc.slots(), &[0x41, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]

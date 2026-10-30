@@ -1006,13 +1006,14 @@ pub struct SvcmgrEndowment
 /// Start svcmgr, then serve the handover endowment over the bootstrap
 /// protocol.
 ///
-/// Round 1 (`CAPS`) delivers svcmgr's service + bootstrap endpoints (full
+/// The `CAPS` rounds (one round for the four slots) deliver
+/// svcmgr's service + bootstrap endpoints (full
 /// rights) and the publish-role source caps: a `SEND` on the root
 /// filesystem namespace endpoint (svcmgr publishes it as `rootfs.root`) and
 /// a badge-0 `SEND|GRANT` source on devmgr's registry endpoint (svcmgr mints
 /// the `devmgr.registry` / `devmgr.shutdown` / `devmgr.test` publish caps and
 /// the `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from it). An absent source
-/// cap is left off the round and its presence bit clear (the
+/// cap is left off its round and its presence bit clear (the
 /// `svcmgr_endowment` encoding), since the kernel refuses a null cap slot.
 ///
 /// Each `SUBSTRATE` round then delivers one init-bootstrapped service's
@@ -1094,30 +1095,35 @@ fn endow_svcmgr(
         0
     };
 
-    // Round 1 (CAPS): [service, bootstrap] then whichever of rootfs and
-    // devmgr_reg are present, named by the presence word.
-    // The LOGD_SOURCES round is always terminal, so no earlier round is.
-    let caps_round = svcmgr_endowment::encode_caps(&svcmgr_endowment::CapsRound {
+    // The CAPS rounds: the positional slot list [service, bootstrap, rootfs,
+    // devmgr_reg], split over as many rounds as it needs, each carrying the
+    // present caps of its window, named by its presence word, and the count
+    // of CAPS rounds after it. The LOGD_SOURCES round is always terminal, so
+    // no earlier round is.
+    let caps_rounds = svcmgr_endowment::encode_caps(&svcmgr_endowment::CapsRound {
         service_ep: service_copy,
         bootstrap_ep: boot_copy,
         rootfs_root: rootfs_send,
         devmgr_registry: devmgr_registry_src,
     });
-    if let Err(code) = serve_checked(
-        bootstrap_ep,
-        child_badge,
-        ipc_buf,
-        false,
-        caps_round.caps(),
-        caps_round.data(),
-        "phase 3: svcmgr endowment CAPS round failed",
-    )
+    for caps_round in &caps_rounds
     {
-        if code == ipc::bootstrap_errors::NO_CHILD
+        if let Err(code) = serve_checked(
+            bootstrap_ep,
+            child_badge,
+            ipc_buf,
+            false,
+            caps_round.caps(),
+            caps_round.data(),
+            "phase 3: svcmgr endowment CAPS round failed",
+        )
         {
-            end_endowment(bootstrap_ep, child_badge, ipc_buf);
+            if code == ipc::bootstrap_errors::NO_CHILD
+            {
+                end_endowment(bootstrap_ep, child_badge, ipc_buf);
+            }
+            return false;
         }
-        return false;
     }
 
     // A substrate round that fails on NO_CHILD leaves svcmgr's request
@@ -1279,7 +1285,7 @@ pub fn phase3_svcmgr_handover(
         idle_loop();
     };
 
-    // Serve svcmgr its handover endowment: round 1 carries svcmgr's own
+    // Serve svcmgr its handover endowment: the CAPS rounds carry svcmgr's own
     // endpoints plus the publish-role source caps (rootfs root, devmgr
     // registry), then one round per init-bootstrapped substrate service
     // carries that service's (name, thread_cap) for death-supervision

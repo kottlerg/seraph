@@ -33,32 +33,38 @@ bootstrap endpoint; svcmgr drains them in
 kind in `data[0]`. The kernel refuses a message carrying a null cap slot,
 so a source cap init could not provide is not sent as `0`: the `CAPS` and
 `LOGD_SOURCES` rounds carry only the caps present, in slot order, and a
-presence word sets bit `i` when optional slot `i` is present. A round whose
+presence word sets bit `i` when slot `i` is present. A round whose
 presence word names a bit with no slot, or a different number of caps than
 the round delivered, is malformed. The round kinds and this encoding are
 the [`svcmgr-endowment`](../endowment/README.md) crate, which init encodes
 and svcmgr decodes with.
 
-**Round 1 — `CAPS` (`data[0] = 1`, not terminal):**
+**First rounds — `CAPS` (`data[0] = 1`, not terminal):** a positional
+slot list, split into windows of `MSG_CAP_SLOTS_MAX` slots, one `CAPS`
+round per window (`ipc::bootstrap::slot_rounds`); the four slots below
+take one round, and a longer list takes more with no change to the
+encoding.
 
 | Field | Value |
 |---|---|
-| caps[0] | svcmgr's service endpoint (RECV; required) |
-| caps[1] | svcmgr's own bootstrap endpoint (RECV — serves launched/restarted children; required) |
-| caps[2..] | the present optional slots, in slot order |
-| optional slot 0 | SEND on the root filesystem's namespace endpoint (published as `rootfs.root`; absent if init could not derive it) |
-| optional slot 1 | `SEND\|GRANT`, badge-0 source on devmgr's registry endpoint (absent if init holds none or its derive fails) |
+| slot 0 | svcmgr's service endpoint (RECV; required) |
+| slot 1 | svcmgr's own bootstrap endpoint (RECV — serves launched/restarted children; required) |
+| slot 2 | SEND on the root filesystem's namespace endpoint (published as `rootfs.root`; absent if init could not derive it) |
+| slot 3 | `SEND\|GRANT`, badge-0 source on devmgr's registry endpoint (absent if init holds none or its derive fails) |
+| caps[..] | the present slots of the round's window, in slot order |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `7`) handshake |
-| data[2] | presence word: bit 0 `ROOTFS_ROOT`, bit 1 `DEVMGR_REGISTRY` |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `8`) handshake, in every `CAPS` round |
+| data[2] | presence word, relative to the round's window: bit `i` is set when window slot `i` is present |
+| data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 
 svcmgr mints the `devmgr.registry` publish cap
 (`REGISTRY_QUERY_AUTHORITY`), the `devmgr.shutdown` and `devmgr.test`
 publish caps (`REGISTRY_QUERY_AUTHORITY` plus `SHUTDOWN_DEVICE_AUTHORITY`
 or `TEST_LABEL_AUTHORITY`), and the `SET_DRIVERS_DIR` cap
 (`DRIVERS_DIR_AUTHORITY`) from the devmgr-registry source. A version
-mismatch in `data[1]`, or a malformed `CAPS` round, aborts bootstrap
-(svcmgr exits).
+mismatch in `data[1]`, or a malformed `CAPS` round (including one that
+carries a slot past the list, or a last round that leaves a required
+endpoint absent), aborts bootstrap (svcmgr exits).
 
 **Rounds 2..N — `SUBSTRATE` (`data[0] = 2`, not terminal):**
 one per init-bootstrapped substrate service (memmgr, procmgr, devmgr,

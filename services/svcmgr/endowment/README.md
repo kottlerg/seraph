@@ -3,17 +3,18 @@
 Pure, host-tested wire codec for init's handover endowment of svcmgr.
 
 The crate is the single definition of the endowment's round kinds (`CAPS`, `SUBSTRATE`,
-`LOGD_SOURCES`) and of the encoding of the two rounds that carry optional source caps. The kernel
+`LOGD_SOURCES`) and of the encoding of the rounds that carry optional source caps. The kernel
 refuses a message carrying a null cap slot, so these rounds list only the caps present and name the
-slot each fills with a presence word, as
+slot each fills with a presence word. The `CAPS` slot list spans as many `CAPS` rounds as it needs,
+each a window of `shared/ipc`'s slot-round codec with a rounds-left count, as
 [`docs/ipc-interface.md`](../docs/ipc-interface.md#handover-endowment-bootstrap-rounds) specifies.
 init (`services/init/src/service.rs`, `endow_svcmgr`) drives the encoders and svcmgr
 (`services/svcmgr/src/service.rs`, `bootstrap_caps`) drives the decoders. The crate issues no
 syscall and no IPC, so both ends keep the IPC calls and the codec stays host-reachable, per
 [coding-standards.md § D](../../../docs/coding-standards.md#d-testing-invariants).
 
-`no_std`; depends on `shared/ipc` (`SVCMGR_LABELS_VERSION`) and `abi/syscall`
-(`MSG_CAP_SLOTS_MAX`).
+`no_std`; depends on `shared/ipc` (`SVCMGR_LABELS_VERSION` and the `bootstrap` slot-round
+codec) and `abi/syscall` (`MSG_CAP_SLOTS_MAX`).
 
 ---
 

@@ -50,8 +50,8 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     VFSD_LABELS_VERSION   — vfsd_labels::GET_SYSTEM_ROOT_CAP (init ↔ vfsd)
 //     BLK_LABELS_VERSION    — blk_labels::REGISTER_PARTITION   (vfsd ↔ virtio-blk)
 //     MEMMGR_LABELS_VERSION — memmgr_labels::REGISTER_PROCESS   (procmgr ↔ memmgr)
-//     SVCMGR_LABELS_VERSION — svcmgr handover endowment `CAPS` round, in
-//                             `data[1]` after the round kind (init ↔ svcmgr)
+//     SVCMGR_LABELS_VERSION — every svcmgr handover endowment `CAPS` round,
+//                             in `data[1]` after the round kind (init ↔ svcmgr)
 //
 //   Checked on every request — the caller carries its compiled version in
 //   `data[0]` of each request and the receiver rejects a mismatch per call.
@@ -757,14 +757,14 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 7;
+pub const SVCMGR_LABELS_VERSION: u32 = 8;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
     // The services init started before svcmgr existed (memmgr, procmgr,
     // devmgr, vfsd) are handed to svcmgr over init's bootstrap-round
     // endowment, not a dedicated label (svcmgr launches logd itself, from
-    // its recipe). Round 1 carries svcmgr's own endpoints plus the source
+    // its recipe). The `CAPS` rounds carry svcmgr's own endpoints plus the source
     // caps it needs for its publish role (`rootfs.root` SEND,
     // devmgr-registry `SEND|GRANT` source) and `SVCMGR_LABELS_VERSION` in
     // `data[1]`; each `SUBSTRATE` round carries one `(name, thread_cap)`
@@ -780,10 +780,12 @@ pub mod svcmgr_labels
     // (`services/svcmgr/endowment`); see
     // `services/svcmgr/docs/ipc-interface.md` and
     // `services/svcmgr/docs/service-definitions.md` for the spec. The
-    // bootstrap round svcmgr serves each child it launches (the `seed` and
-    // `log_sink` rounds) carries only the present caps and a presence word
-    // in `data[0]` (`bootstrap::pack_slots` / `bootstrap::unpack_slots`);
-    // that layout is part of this version.
+    // bootstrap rounds svcmgr serves each child it launches (the `seed` and
+    // `log_sink` rounds) split its positional slots into windows of
+    // `MSG_CAP_SLOTS_MAX`, one round each, carrying only the present caps
+    // and a presence word in `data[0]` (`bootstrap::slot_rounds` /
+    // `bootstrap::request_slots`); the endowment's `CAPS` slot list spans
+    // rounds the same way. That layout is part of this version.
 
     /// Internal namespace-policy descriptor stored on `ServiceEntry`
     /// (one of the values below). Parsed by svcmgr from each
@@ -2404,7 +2406,7 @@ pub mod svcmgr_errors
     pub const UNKNOWN_NAME: u64 = 5;
     /// Discovery registry publish: table full or duplicate name.
     pub const REGISTER_REJECTED: u64 = 6;
-    /// Reserved; not emitted by the current svcmgr. The handover-endowment
+    /// Reserved; not emitted by the current svcmgr. Each handover-endowment
     /// `CAPS` round carries the caller's `SVCMGR_LABELS_VERSION` in `data[1]`
     /// (after the `svcmgr_endowment::kind::CAPS` round kind in `data[0]`); on
     /// a mismatch svcmgr's bootstrap fails without replying this code.

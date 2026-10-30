@@ -5,9 +5,9 @@
 
 //! Decode the creator-endpoint bootstrap round into a typed [`Caps`].
 //!
-//! Slot layout (set by whichever launcher minted the round, which carries
-//! only the present caps and names the slot each fills in its presence word;
-//! see `ipc::bootstrap::unpack_slots`):
+//! Slot layout (set by whichever launcher minted the rounds, each of which
+//! carries only its window's present caps and names the slot each fills in
+//! its presence word; see `ipc::bootstrap::request_slots`):
 //!   * `caps[0]`: badged SEND on the unified **root-filesystem**
 //!     namespace at its root directory (`rootfs.root`; zero when the
 //!     launcher could not mint one). This is vfsd's synthetic system
@@ -27,11 +27,16 @@
 //!     `TEST_QUERY_DENY_DEVICE` in the drivers deny phase. TODO(#165):
 //!     retire with those labels.
 //!
-//! The no-authority pwrmgr SEND (`pwrmgr.deny`) is public, so svctest
-//! resolves it itself through `QUERY_ENDPOINT` rather than spending a seed
-//! slot on it (zero when pwrmgr is absent).
+//!   * `caps[4]`: the no-authority pwrmgr SEND (`pwrmgr.deny`). It is the
+//!     fifth seed, so svcmgr delivers it in a second round: every svctest
+//!     boot exercises a seed list longer than one round, and [`request`]
+//!     logs a `FATAL:` line when slot 4 arrives empty.
 //!
-//! The launcher requests the round from `info.creator_endpoint`; if no
+//! `pwrmgr.deny` is also public, and the pwrmgr cap-deny phase uses the
+//! copy svctest resolves through `QUERY_ENDPOINT` (zero when pwrmgr is
+//! absent).
+//!
+//! The launcher requests the rounds from `info.creator_endpoint`; if no
 //! creator endpoint is present (`== 0`), every slot stays zero and
 //! dependent phases self-skip.
 
@@ -56,20 +61,30 @@ pub struct Caps
     /// `TEST_SPAWN_ORPHAN` shim and `TEST_QUERY_DENY_DEVICE`. TODO(#165):
     /// retire with those labels.
     pub devmgr_test: u32,
+    /// `pwrmgr.deny`, seeded in slot 4: the second-round seed whose
+    /// arrival [`request`] checks.
+    pub pwrmgr_deny_seed: u32,
 }
 
-/// Drain the bootstrap round from `creator_endpoint` and pull caps out,
-/// then resolve `pwrmgr.deny`. The lookup follows the round: svcmgr serves
-/// no `QUERY_ENDPOINT` until it has served the round.
+/// Drain the bootstrap rounds from `creator_endpoint` and pull caps out,
+/// then resolve `pwrmgr.deny`. The lookup follows the rounds: svcmgr serves
+/// no `QUERY_ENDPOINT` until it has served them. A launched svctest whose
+/// slot 4 is empty logs `FATAL:`, which fails the boot's harness run
+/// (`cargo xtask run-parallel`'s `--fail` regex), since a seed list longer
+/// than one round then lost its second round.
 pub fn request() -> Caps
 {
     let mut caps = request_round();
+    if startup_info().creator_endpoint != 0 && caps.pwrmgr_deny_seed == 0
+    {
+        std::os::seraph::log!("FATAL: seed slot 4 (pwrmgr.deny) did not arrive in round 2");
+    }
     caps.pwrmgr_noauth =
         std::os::seraph::registry::lookup(ipc::published_names::PWRMGR_DENY).unwrap_or(0);
     caps
 }
 
-/// The seeded slots of the bootstrap round from `creator_endpoint`.
+/// The seeded slots of the bootstrap rounds from `creator_endpoint`.
 fn request_round() -> Caps
 {
     let mut caps = Caps::default();
@@ -83,20 +98,26 @@ fn request_round() -> Caps
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by
     // the boot protocol.
-    let Ok(round) = (unsafe { ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf) })
+    // Five seeds take two rounds; an absent slot decodes as `0`, and a
+    // round that does not decode leaves every slot `0`.
+    let Ok(
+        [
+            root_fs,
+            pwrmgr_auth,
+            devmgr_registry,
+            devmgr_test,
+            pwrmgr_deny_seed,
+        ],
+    ) = (unsafe { ipc::bootstrap::request_slots::<5>(info.creator_endpoint, ipc_buf) })
     else
     {
         return caps;
     };
-
-    // Only the present caps ride, named by the round's presence word; an
-    // absent slot decodes as `0`, and a malformed word leaves every slot `0`.
-    let [root_fs, pwrmgr_auth, devmgr_registry, devmgr_test] =
-        ipc::bootstrap::unpack_slots(&round).unwrap_or_default();
     caps.root_fs = root_fs;
     caps.pwrmgr_auth = pwrmgr_auth;
     caps.devmgr_registry = devmgr_registry;
     caps.devmgr_test = devmgr_test;
+    caps.pwrmgr_deny_seed = pwrmgr_deny_seed;
 
     caps
 }

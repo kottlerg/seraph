@@ -5,7 +5,9 @@
 
 //! Decode the creator-endpoint bootstrap round into a typed [`Caps`].
 //!
-//! Slot layout (set by whichever launcher minted the round):
+//! Slot layout (set by whichever launcher minted the round, which carries
+//! only the present caps and names the slot each fills in its presence word;
+//! see `ipc::bootstrap::unpack_slots`):
 //!   * `caps[0]`: badged SEND on the unified **root-filesystem**
 //!     namespace at its root directory (`rootfs.root`; zero when the
 //!     launcher could not mint one). This is vfsd's synthetic system
@@ -16,12 +18,14 @@
 //!     service endpoint (zero when pwrmgr is absent)
 //!   * `caps[2]`: `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's
 //!     registry endpoint (`devmgr.registry`; zero when devmgr is absent).
-//!     Lacking `SHUTDOWN_DEVICE_AUTHORITY` and `ORPHAN_TEST_AUTHORITY`, it
+//!     Lacking `SHUTDOWN_DEVICE_AUTHORITY` and `TEST_LABEL_AUTHORITY`, it
 //!     drives the devmgr deny phases.
-//!   * `caps[3]`: `REGISTRY_QUERY_AUTHORITY | ORPHAN_TEST_AUTHORITY`-badged
+//!   * `caps[3]`: `REGISTRY_QUERY_AUTHORITY | TEST_LABEL_AUTHORITY`-badged
 //!     SEND on devmgr's registry endpoint (`devmgr.test`; zero when devmgr
-//!     is absent). Drives the `TEST_SPAWN_ORPHAN` fault-injection shim in
-//!     the devmgr orphan-teardown phase. TODO(#165): retire with that shim.
+//!     is absent). Drives devmgr's test labels: the `TEST_SPAWN_ORPHAN`
+//!     fault-injection shim in the devmgr orphan-teardown phase, and
+//!     `TEST_QUERY_DENY_DEVICE` in the drivers deny phase. TODO(#165):
+//!     retire with those labels.
 //!
 //! The no-authority pwrmgr SEND (`pwrmgr.deny`) is public, so svctest
 //! resolves it itself through `QUERY_ENDPOINT` rather than spending a seed
@@ -47,9 +51,10 @@ pub struct Caps
     /// `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry
     /// endpoint (`devmgr.registry`).
     pub devmgr_registry: u32,
-    /// `REGISTRY_QUERY_AUTHORITY | ORPHAN_TEST_AUTHORITY`-badged SEND on
-    /// devmgr's registry endpoint (`devmgr.test`). TODO(#165): retire with
-    /// the `TEST_SPAWN_ORPHAN` shim.
+    /// `REGISTRY_QUERY_AUTHORITY | TEST_LABEL_AUTHORITY`-badged SEND on
+    /// devmgr's registry endpoint (`devmgr.test`), for the
+    /// `TEST_SPAWN_ORPHAN` shim and `TEST_QUERY_DENY_DEVICE`. TODO(#165):
+    /// retire with those labels.
     pub devmgr_test: u32,
 }
 
@@ -84,22 +89,14 @@ fn request_round() -> Caps
         return caps;
     };
 
-    if round.cap_count >= 1
-    {
-        caps.root_fs = round.caps[0];
-    }
-    if round.cap_count >= 2
-    {
-        caps.pwrmgr_auth = round.caps[1];
-    }
-    if round.cap_count >= 3
-    {
-        caps.devmgr_registry = round.caps[2];
-    }
-    if round.cap_count >= 4
-    {
-        caps.devmgr_test = round.caps[3];
-    }
+    // Only the present caps ride, named by the round's presence word; an
+    // absent slot decodes as `0`, and a malformed word leaves every slot `0`.
+    let [root_fs, pwrmgr_auth, devmgr_registry, devmgr_test] =
+        ipc::bootstrap::unpack_slots(&round).unwrap_or_default();
+    caps.root_fs = root_fs;
+    caps.pwrmgr_auth = pwrmgr_auth;
+    caps.devmgr_registry = devmgr_registry;
+    caps.devmgr_test = devmgr_test;
 
     caps
 }

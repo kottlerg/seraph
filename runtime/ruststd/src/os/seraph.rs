@@ -753,14 +753,35 @@ pub fn namespace_lookup_dir(
     Ok(walked.dir_cap)
 }
 
-/// Raw retype debits the kernel charges for one object of each kind, the
-/// `min_bytes` to pass to [`object_slab_retype`]. Re-exported from the ABI
-/// crate, where the kernel pins them to its real object sizes; a size change
-/// is an ABI-visible change by design.
+// Raw retype debits the kernel charges for one object of each kind, the
+// `min_bytes` to pass to `object_slab_retype`. Each item mirrors the ABI
+// crate's, where the kernel pins it to its real object size; a size change is
+// an ABI-visible change by design. They are defined here rather than
+// re-exported because an item reached through the sysroot-private ABI crate
+// is unstable (`rustc_private`) to std's users.
+
+/// Raw retype debit of one `Endpoint`, in bytes (`syscall_abi`'s
+/// `ENDPOINT_RETYPE_BYTES`).
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub use syscall_abi::{
-    ENDPOINT_RETYPE_BYTES, NOTIFICATION_RETYPE_BYTES, WAIT_SET_RETYPE_BYTES, event_queue_retype_bytes,
-};
+pub const ENDPOINT_RETYPE_BYTES: u64 = syscall_abi::ENDPOINT_RETYPE_BYTES;
+
+/// Raw retype debit of one `Notification`, in bytes (`syscall_abi`'s
+/// `NOTIFICATION_RETYPE_BYTES`).
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub const NOTIFICATION_RETYPE_BYTES: u64 = syscall_abi::NOTIFICATION_RETYPE_BYTES;
+
+/// Raw retype debit of one `WaitSet`, in bytes (`syscall_abi`'s
+/// `WAIT_SET_RETYPE_BYTES`).
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub const WAIT_SET_RETYPE_BYTES: u64 = syscall_abi::WAIT_SET_RETYPE_BYTES;
+
+/// Raw retype debit of one `EventQueue` of `capacity` entries, in bytes
+/// (`syscall_abi`'s `event_queue_retype_bytes`).
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+#[must_use]
+pub fn event_queue_retype_bytes(capacity: u64) -> u64 {
+    syscall_abi::event_queue_retype_bytes(capacity)
+}
 
 /// Retype one kernel object out of the runtime's object-slab machinery.
 ///

@@ -1025,7 +1025,7 @@ unsafe extern "C" fn common_irq_trampoline()
 /// # Modification notes
 /// - To add more GSIs: `device_irq_stub!(isr_devN, 33+N)`, then
 ///   `set(33+N, isr_devN, 0)` in `init()`, then widen the `33..=55` device arm
-///   in `irq_dispatch` to include `33+N`.
+///   in `irq_dispatch` to include `33+N`, then raise `ioapic::DEVICE_GSI_COUNT`.
 macro_rules! device_irq_stub {
     ($name:ident, $vector:literal) => {
         #[cfg(not(test))]
@@ -1064,6 +1064,13 @@ device_irq_stub!(isr_dev19, 52);
 device_irq_stub!(isr_dev20, 53);
 device_irq_stub!(isr_dev21, 54);
 device_irq_stub!(isr_dev22, 55);
+
+// The stubs above, their `set` calls in `init`, and the `33..=55` arm of `irq_dispatch` are
+// written for vectors 33-55: the vectors `ioapic::device_vector` assigns to the GSIs
+// `MAX_IRQ_ID` admits. A change to either side without the other routes a GSI to an
+// ungated vector.
+const _: () =
+    assert!(super::ioapic::DEVICE_VECTOR_BASE == 33 && super::ioapic::DEVICE_GSI_COUNT == 23);
 
 // ── Timer and spurious stubs ──────────────────────────────────────────────────
 

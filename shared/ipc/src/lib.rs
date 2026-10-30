@@ -757,7 +757,7 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 5;
+pub const SVCMGR_LABELS_VERSION: u32 = 6;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -775,9 +775,10 @@ pub mod svcmgr_labels
     // a parked name with a definition is bound and supervised using the
     // on-disk recipe; a defined name not parked is launched by svcmgr
     // itself; a parked name with no definition is a hard error (svcmgr
-    // has no recipe to restart it). The endowment layout lives in
-    // `services/init/src/service.rs` and `services/svcmgr/src/service.rs`;
-    // see `services/svcmgr/docs/ipc-interface.md` and
+    // has no recipe to restart it). The round kinds and the encoding of
+    // the endowment are the `svcmgr-endowment` crate
+    // (`services/svcmgr/endowment`); see
+    // `services/svcmgr/docs/ipc-interface.md` and
     // `services/svcmgr/docs/service-definitions.md` for the spec.
 
     /// Internal namespace-policy descriptor stored on `ServiceEntry`
@@ -1844,10 +1845,10 @@ pub mod fb_labels
 
     /// Authority bit in the framebuffer-service-endpoint badge's high
     /// u64 bit. Set on caps devmgr mints in response to
-    /// [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]. Gating
-    /// [`FB_WRITE_BYTES`] and [`FB_SET_ATTRS`] on it is design intent; not
-    /// yet implemented: the framebuffer driver does not check the bit
-    /// (#454). A verb ("may write"), not an identity.
+    /// [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]. It gates
+    /// [`FB_WRITE_BYTES`] and [`FB_SET_ATTRS`]: the driver answers either
+    /// label with [`super::fb_errors::UNAUTHORIZED`] when the caller's
+    /// badge lacks it. A verb ("may write"), not an identity.
     pub const WRITE_AUTHORITY: u64 = 1u64 << 63;
 }
 
@@ -1862,6 +1863,10 @@ pub mod fb_errors
     /// today — `FB_LABELS_VERSION` is marker-only and covered by
     /// `PROCESS_ABI_VERSION` at process startup.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
+    /// Caller's badge lacks [`super::fb_labels::WRITE_AUTHORITY`], which
+    /// gates [`super::fb_labels::FB_WRITE_BYTES`] and
+    /// [`super::fb_labels::FB_SET_ATTRS`].
+    pub const UNAUTHORIZED: u64 = 4;
 }
 
 /// Wire-protocol version of [`input_labels`]; bumped as the block comment above
@@ -1883,9 +1888,9 @@ pub mod input_labels
 {
     /// Read a batch of pending keyboard events (blocking).
     ///
-    /// Request: empty body; the caller's badge is meant to carry
-    /// [`READ_AUTHORITY`] (the driver does not yet check it; see that
-    /// constant).
+    /// Request: empty body; the caller's badge must carry
+    /// [`READ_AUTHORITY`], else the driver replies
+    /// [`super::input_errors::UNAUTHORIZED`] at once.
     /// The driver blocks until at least one event is available, then replies
     /// with up to [`super::keysym::INPUT_MAX_EVENTS_PER_READ`] events.
     ///
@@ -1898,9 +1903,9 @@ pub mod input_labels
 
     /// Authority bit in the input-service-endpoint badge's high u64 bit. Set
     /// on caps devmgr mints in response to
-    /// [`devmgr_labels::QUERY_INPUT_DEVICE`]. Gating [`INPUT_READ_EVENTS`] on
-    /// it is design intent; not yet implemented: the virtio-input driver does
-    /// not check the bit (#454). A verb ("may read"), not an identity.
+    /// [`devmgr_labels::QUERY_INPUT_DEVICE`]. It gates [`INPUT_READ_EVENTS`]:
+    /// the driver answers the label with [`super::input_errors::UNAUTHORIZED`]
+    /// when the caller's badge lacks it. A verb ("may read"), not an identity.
     pub const READ_AUTHORITY: u64 = 1u64 << 63;
 }
 
@@ -1915,6 +1920,9 @@ pub mod input_errors
     /// `INPUT_LABELS_VERSION` is marker-only and covered by
     /// `PROCESS_ABI_VERSION` at process startup.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
+    /// Caller's badge lacks [`super::input_labels::READ_AUTHORITY`], which
+    /// gates [`super::input_labels::INPUT_READ_EVENTS`].
+    pub const UNAUTHORIZED: u64 = 4;
 }
 
 /// Keysym numbering, modifier mask bits, and the
@@ -2374,8 +2382,8 @@ pub mod svcmgr_errors
     pub const REGISTER_REJECTED: u64 = 6;
     /// Reserved; not emitted by the current svcmgr. The handover-endowment
     /// `CAPS` round carries the caller's `SVCMGR_LABELS_VERSION` in `data[1]`
-    /// (after the `endow_kind` discriminant in `data[0]`); on a mismatch
-    /// svcmgr's bootstrap fails without replying this code.
+    /// (after the `svcmgr_endowment::kind::CAPS` round kind in `data[0]`); on
+    /// a mismatch svcmgr's bootstrap fails without replying this code.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
     /// Caller's badge lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
     /// `PUBLISH_ENDPOINT` request or [`svcmgr_labels::HANDOVER_AUTHORITY`] on

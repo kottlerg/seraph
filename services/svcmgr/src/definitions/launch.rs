@@ -23,9 +23,9 @@ use crate::restart::{
     walk_and_create_from_file,
 };
 
-/// Outcome of a successful launch — the bits svcmgr needs to record
-/// on the resulting `ServiceEntry` (or to bind death-notification on
-/// for one-shot consumers).
+/// Outcome of a successful launch — the bits svcmgr records on the
+/// resulting `ServiceEntry`. A one-shot (`restart = never`) caller records
+/// nothing and deletes the handles.
 pub struct Launched
 {
     pub thread_cap: u32,
@@ -107,9 +107,11 @@ pub(crate) enum LaunchKind
 ///   * `[3]` a `REGISTRY_QUERY_AUTHORITY` SEND on devmgr's registry (logd
 ///     resolves the serial driver via `QUERY_SERIAL_DEVICE`).
 ///
-/// A source absent from the endowment yields `0` in its slot; logd then
-/// degrades on first use of that cap. The four slots are positional, so
-/// zeros are preserved (the round still carries `MSG_CAP_SLOTS_MAX` caps).
+/// A source absent from the endowment yields `0` in its slot. The four
+/// slots are positional, so zeros are preserved (the round still carries
+/// `MSG_CAP_SLOTS_MAX` caps). The kernel refuses a round carrying a null
+/// slot, so such a round, and every [`LaunchKind::Restart`] round, fails at
+/// the bootstrap serve (#592).
 pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, kind: LaunchKind) -> Vec<u32>
 {
     let recv = if ctx.master_log_source != 0
@@ -247,8 +249,8 @@ fn assemble_provided_boot_caps(
         ep
     };
 
-    // Resolve seeds AFTER namespace setup so a seed-lookup miss does not leave a
-    // configured-but-orphan partial child; on failure we still tear down here.
+    // Resolve seeds after namespace setup. Resolution cannot fail: an
+    // unresolved name becomes `0` in its slot (see `resolve_seeds`).
     let seed_caps = resolve_seeds(&def.seed, &def.name, registry);
 
     // A provider's own service-endpoint RECV is cap[0], ahead of the positional
@@ -405,7 +407,9 @@ pub fn launch(
 
 /// Resolve each `seed = ...` name to a derived `RIGHTS_EP_SEND` cap on
 /// the published endpoint. Unresolved names become `0` in their slot
-/// so positional ordering is preserved. Truncated to
+/// so positional ordering is preserved; the kernel refuses a round carrying
+/// a null slot, so a launch with an unresolved seed fails at the bootstrap
+/// serve (#592). Truncated to
 /// `MSG_CAP_SLOTS_MAX` (the bootstrap round's cap limit), a backstop
 /// behind the `.svc` parser's seed bound.
 ///

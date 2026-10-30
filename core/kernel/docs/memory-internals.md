@@ -117,6 +117,23 @@ every other userspace object comes from the capability a `cap_create_*` syscall 
 Address spaces and CSpaces additionally own a page pool for their page tables and slot pages
 ([capability-internals.md](capability-internals.md) § Page Pools).
 
+The retype allocator (`core/kernel/src/cap/retype.rs`) rounds each request to a size class: two
+sub-page classes of 128 and 512 bytes, or a page multiple. A sub-page request is placed from its
+class's free list, else at the bump cursor, else, once the bump cursor cannot fit the request, in
+one page taken from the page free list and cut into that class's slots. A page-multiple request
+is placed from the page free list, else at the bump cursor. The carve keeps freed page blocks
+usable by sub-page requests, which SEED depends on: init's bootstrap objects return to it as page
+blocks at init's reap, and its runtime bodies are sub-page apart from x86_64's per-thread
+port-binding tables. Free bytes held in the other sub-page class, or in sub-page slots for a
+page-multiple request, are not placeable, so a request can still fail while the object's
+`available_bytes` counts enough bytes. A carve is permanent while the object holds a live
+retype (only the drain reset, when every retyped byte is freed, undoes it, and SEED never drains,
+as it is pinned), so on SEED the carve trades page blocks for sub-page capacity: sustained
+sub-page demand can leave too few contiguous pages for a port-binding table, and
+`sys_ioport_bind` then returns `OutOfMemory`. A carve happens only once the bump cursor cannot
+serve the class, so SEED is by then already at its shared budget: without the carve, the sub-page
+request fails instead.
+
 Retype and pool allocation are fallible and MUST be handled as fallible at every
 call site; there is no allocation that cannot fail
 ([docs/memory-model.md](../../../docs/memory-model.md) § Kernel Allocation is Fallible).

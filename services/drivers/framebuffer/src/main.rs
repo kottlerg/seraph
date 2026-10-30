@@ -37,12 +37,10 @@
 //! (`core/kernel/src/framebuffer.rs`) remains the early-boot / panic
 //! fallback (see `docs/console-model.md`).
 
-#![allow(clippy::cast_possible_truncation)]
-
 mod arch;
 
 use boot_protocol::FramebufferInfo;
-use framebuffer::render;
+use framebuffer::{authority, render};
 use ipc::{IpcMessage, devmgr_labels, fb_errors, fb_labels};
 use std::os::seraph::startup_info;
 use text::{DecodeOutcome, Utf8Decoder};
@@ -110,9 +108,9 @@ fn query_framebuffer_info(devmgr_ep: u32, ipc_buf: *mut u64) -> Option<Framebuff
     {
         return None;
     }
-    let kind = words[0] as u32;
-    let version = words[1] as u32;
-    let byte_len = words[2] as usize;
+    let kind = u32::try_from(words[0]).ok()?;
+    let version = u32::try_from(words[1]).ok()?;
+    let byte_len = usize::try_from(words[2]).ok()?;
     if kind != ipc::device_info_kind::FRAMEBUFFER
         || version != boot_protocol::FRAMEBUFFER_INFO_VERSION
     {
@@ -148,9 +146,14 @@ fn handle_request(
     // Label encoding mirrors `serial_labels::SERIAL_WRITE_BYTES` and
     // `stream_labels::STREAM_BYTES`: opcode in bits 0-15, payload byte
     // length in bits 16-31.
-    let reply = if msg.label & 0xFFFF == fb_labels::FB_WRITE_BYTES
+    let reply = if !authority::authorized(msg.label, msg.badge)
     {
-        let byte_len = ((msg.label >> 16) & 0xFFFF) as usize;
+        IpcMessage::new(fb_errors::UNAUTHORIZED)
+    }
+    else if msg.label & 0xFFFF == fb_labels::FB_WRITE_BYTES
+    {
+        // The mask bounds the length to 16 bits, so the conversion cannot fail.
+        let byte_len = usize::try_from((msg.label >> 16) & 0xFFFF).unwrap_or(0);
         let bytes = msg.data_bytes();
         let n = byte_len.min(bytes.len());
         for &b in &bytes[..n]

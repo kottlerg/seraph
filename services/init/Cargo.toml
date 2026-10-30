@@ -23,6 +23,8 @@ namespace-protocol = { path = "../../shared/namespace-protocol" }
 ns-client = { path = "../../shared/ns-client" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }
+# The init → svcmgr handover endowment wire contract (init encodes it).
+svcmgr-endowment = { path = "../svcmgr/endowment" }
 
 [lints]
 workspace = true

@@ -30,25 +30,35 @@ protocol (the same mechanism that delivers every service's startup caps),
 not a dedicated registration label. init serves the rounds on its
 bootstrap endpoint; svcmgr drains them in
 [`service::bootstrap_caps`](../src/service.rs). Each round is tagged by
-kind in `data[0]`:
+kind in `data[0]`. The kernel refuses a message carrying a null cap slot,
+so a source cap init could not provide is not sent as `0`: the `CAPS` and
+`LOGD_SOURCES` rounds carry only the caps present, in slot order, and a
+presence word sets bit `i` when optional slot `i` is present. A round whose
+presence word names a bit with no slot, or a different number of caps than
+the round delivered, is malformed. The round kinds and this encoding are
+the [`svcmgr-endowment`](../endowment/README.md) crate, which init encodes
+and svcmgr decodes with.
 
 **Round 1 — `CAPS` (`data[0] = 1`, not terminal):**
 
 | Field | Value |
 |---|---|
-| caps[0] | svcmgr's service endpoint (RECV) |
-| caps[1] | svcmgr's own bootstrap endpoint (RECV — serves launched/restarted children) |
-| caps[2] | SEND on the root filesystem's namespace endpoint (published as `rootfs.root`; `0` if init could not derive it) |
-| caps[3] | `SEND\|GRANT`, badge-0 source on devmgr's registry endpoint (`0` if absent) |
+| caps[0] | svcmgr's service endpoint (RECV; required) |
+| caps[1] | svcmgr's own bootstrap endpoint (RECV — serves launched/restarted children; required) |
+| caps[2..] | the present optional slots, in slot order |
+| optional slot 0 | SEND on the root filesystem's namespace endpoint (published as `rootfs.root`; absent if init could not derive it) |
+| optional slot 1 | `SEND\|GRANT`, badge-0 source on devmgr's registry endpoint (absent if init holds none or its derive fails) |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `5`) handshake |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `6`) handshake |
+| data[2] | presence word: bit 0 `ROOTFS_ROOT`, bit 1 `DEVMGR_REGISTRY` |
 
 svcmgr mints the `devmgr.registry` publish cap
 (`REGISTRY_QUERY_AUTHORITY`), the `devmgr.shutdown` and `devmgr.test`
 publish caps (`REGISTRY_QUERY_AUTHORITY` plus `SHUTDOWN_DEVICE_AUTHORITY`
 or `ORPHAN_TEST_AUTHORITY`), and the `SET_DRIVERS_DIR` cap
-(`DRIVERS_DIR_AUTHORITY`) from caps[3]. A version mismatch in `data[1]`
-aborts bootstrap (svcmgr exits).
+(`DRIVERS_DIR_AUTHORITY`) from the devmgr-registry source. A version
+mismatch in `data[1]`, or a malformed `CAPS` round, aborts bootstrap
+(svcmgr exits).
 
 **Rounds 2..N — `SUBSTRATE` (`data[0] = 2`, not terminal):**
 one per init-bootstrapped substrate service (memmgr, procmgr, devmgr,
@@ -66,18 +76,22 @@ vfsd) whose thread cap init captured; logd is not a substrate. See init's
 
 | Field | Value |
 |---|---|
-| caps[0] | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch and the first-launch handover SEND (the `HANDOVER_PULL` drain then `HANDOVER_RELEASE`; see [`log_sink`](service-definitions.md#log_sink)); holding it keeps the log endpoint alive across a logd crash (`0` if absent) |
-| caps[1] | `procmgr_death_auth_source`: badge-0 `SEND\|GRANT` source on procmgr's service endpoint; svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap from it per launch (`0` if absent) |
+| caps[..] | the present slots, in slot order |
+| slot 0 | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch and the first-launch handover SEND (the `HANDOVER_PULL` drain then `HANDOVER_RELEASE`; see [`log_sink`](service-definitions.md#log_sink)); holding it keeps the log endpoint alive across a logd crash (absent if its derive fails) |
+| slot 1 | `procmgr_death_auth_source`: badge-0 `SEND\|GRANT` source on procmgr's service endpoint; svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap from it per launch (absent if its derive fails) |
 | data[0] | `3` (`LOGD_SOURCES`) |
+| data[1] | presence word: bit 0 `MASTER_LOG`, bit 1 `PROCMGR_DEATH_AUTH` |
+
+After a failed `CAPS` round init ends the endowment with an empty
+`LOGD_SOURCES` round (no caps, presence `0`), so svcmgr leaves its round
+loop and exits. svcmgr logs a malformed `LOGD_SOURCES` round, deletes the
+caps it delivered, and continues with both sources absent.
 
 svcmgr holds both sources for the system's life and mints real-logd's
 [`log_sink`](service-definitions.md#log_sink) bootstrap round from them on
-every (re)launch. svcmgr launches logd whatever the slot values; a zero slot
-reaches logd as a zero cap. Without the death-auth source, logd runs but skips
-`REGISTER_DEATH_EQ` and cannot reclaim per-sender slots. Without the
-master-log source, logd exits at startup; logd is `critical = yes` and its
-clean exit is not an `on_failure` restart, so svcmgr starts a graceful
-shutdown.
+every (re)launch. An absent source leaves a `0` in the matching slot of
+logd's round, and the kernel refuses a round carrying a null slot, so that
+launch of logd fails at the bootstrap serve (#592).
 
 svcmgr parks each substrate pair in its pending-registration table. It does **not**
 bind death-notification at endowment time — the matching `.svc`
@@ -309,6 +323,7 @@ policy + budget):
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
+[services/svcmgr/endowment/README.md](../endowment/README.md),
 [services/svcmgr/README.md](../README.md),
 [services/svctest/README.md](../../svctest/README.md),
 [shared/registry/README.md](../../../shared/registry/README.md),

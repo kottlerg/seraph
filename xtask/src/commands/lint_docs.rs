@@ -1703,16 +1703,19 @@ mod tests
     }
 
     #[test]
-    fn coverage_glob_path_star_matches_any_run_of_its_component_but_not_a_wrong_suffix()
+    fn coverage_glob_path_star_matches_any_run_of_its_component_but_not_a_wrong_end()
     {
         // `ap_*.rs` resolves through an empty run (`ap_.rs`), `*_tramp*.rs` through two
-        // runs; `*.S.rs` names nothing, since `x86_trampoline.S` lacks the `.rs` suffix.
+        // runs. `tramp*.rs` names nothing: its head occurs in `x86_tramp_entry.rs` only
+        // mid-name. `*.S.rs` names nothing: `x86_trampoline.S` lacks the `.rs` suffix.
         let diags = coverage_check(&coverage_doc(
-            " `core/b/ap_*.rs`, `core/b/*_tramp*.rs`, `core/b/*.S.rs`,",
+            " `core/b/ap_*.rs`, `core/b/*_tramp*.rs`, `core/b/tramp*.rs`, `core/b/*.S.rs`,",
             "",
         ));
-        assert_eq!(diags.len(), 1, "{diags:?}");
-        assert!(diags[0].1.contains("`core/b/*.S.rs`"), "{}", diags[0].1);
+        let shown: Vec<&str> = diags.iter().map(|d| d.1.as_str()).collect();
+        assert_eq!(shown.len(), 2, "{shown:?}");
+        assert!(shown[0].contains("`core/b/tramp*.rs`"), "{}", shown[0]);
+        assert!(shown[1].contains("`core/b/*.S.rs`"), "{}", shown[1]);
     }
 
     #[test]

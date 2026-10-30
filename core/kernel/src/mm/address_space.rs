@@ -1063,10 +1063,10 @@ impl AddressSpace
 
         // Clear every leaf in the span and free each now-empty intermediate
         // table whose parent entry carries the pooled-table bit back to the
-        // pool.
+        // pool, batching each cleared frame for its frame-map release.
+        let mut batch = crate::mm::frame_map::ReleaseBatch::new();
         // SAFETY: root_virt is valid; aso wraps this AS; the span is user-range
         // (caller's contract); pt_lock is held.
-        let mut batch = crate::mm::frame_map::ReleaseBatch::new();
         let freed = unsafe {
             unmap_user_region_pooled(self.root_virt, virt_base, page_count, aso, &mut |phys| {
                 self.batch_cleared_frame(&mut batch, phys, virt_base, page_count);

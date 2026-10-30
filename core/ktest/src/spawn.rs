@@ -104,9 +104,13 @@ pub unsafe fn child_args<T: Copy>(arg: u64) -> T
 /// A test that deletes a cap before the guard goes calls
 /// [`delete_thread`](Self::delete_thread) or
 /// [`delete_cspace`](Self::delete_cspace), or drops the guard, rather than
-/// `cap_delete` on the field: each clears its field first, so a handle is
-/// deleted once, and the drop never deletes a stale handle a recycled slot's
-/// wrapped generation would alias to another cap. A zero field holds nothing:
+/// `cap_delete` on the field: each clears its field once the delete has
+/// taken the cap, so a handle is deleted once, and the drop never deletes a
+/// stale handle a recycled slot's wrapped generation would alias to another
+/// cap. A delete refused with `InvalidState` leaves the cap in place (a
+/// revoke, move, or IPC transfer in flight on the slot,
+/// `core/kernel/docs/syscalls.md` § `SYS_CAP_REVOKE`), so the field keeps it
+/// and the drop deletes it again. A zero field holds nothing:
 /// [`EMPTY`](Self::EMPTY) fills a guard array before its children exist, and
 /// a thread bound to ktest's own `CSpace` is guarded with `cs: 0`.
 pub struct SpawnedChild
@@ -120,8 +124,9 @@ impl SpawnedChild
     /// A guard holding no cap.
     pub const EMPTY: SpawnedChild = SpawnedChild { th: 0, cs: 0 };
 
-    /// Delete the Thread cap now, clearing the field so the drop skips it;
-    /// `Ok` at once when the guard holds none.
+    /// Delete the Thread cap now, clearing the field so the drop skips it
+    /// (unless the delete is refused with `InvalidState`, which leaves the cap
+    /// for the drop); `Ok` at once when the guard holds none.
     ///
     /// # Errors
     ///
@@ -131,8 +136,9 @@ impl SpawnedChild
         delete_held(&mut self.th)
     }
 
-    /// Delete the `CSpace` cap now, clearing the field so the drop skips it;
-    /// `Ok` at once when the guard holds none.
+    /// Delete the `CSpace` cap now, clearing the field so the drop skips it
+    /// (unless the delete is refused with `InvalidState`, which leaves the cap
+    /// for the drop); `Ok` at once when the guard holds none.
     ///
     /// # Errors
     ///
@@ -143,14 +149,21 @@ impl SpawnedChild
     }
 }
 
-/// Delete the cap `handle` holds and clear it; a zero handle holds none.
+/// Delete the cap `handle` holds and clear it, unless the delete is refused
+/// with `InvalidState`, which leaves the cap in place; a zero handle holds
+/// none.
 fn delete_held(handle: &mut u32) -> Result<(), i64>
 {
-    match core::mem::take(handle)
+    if *handle == 0
     {
-        0 => Ok(()),
-        held => syscall::cap_delete(held),
+        return Ok(());
     }
+    let deleted = syscall::cap_delete(*handle);
+    if deleted != Err(syscall_abi::SyscallError::InvalidState as i64)
+    {
+        *handle = 0;
+    }
+    deleted
 }
 
 impl Drop for SpawnedChild
@@ -202,6 +215,11 @@ pub fn new_child_at(
 /// in the platform C convention's first argument register, so the entry must
 /// use that convention, not the unspecified Rust ABI.
 ///
+/// # Errors
+///
+/// - `thread_configure` refused the thread, entry, or stack.
+/// - `thread_start` refused the thread.
+///
 /// # Safety
 /// `stack_top` must top a stack (a `ChildStack`, as `ChildStack::top` gives
 /// it) that no other live thread uses and none will until this child exits:
@@ -223,6 +241,11 @@ pub unsafe fn configure_and_start(
 /// one of a set the caller creates in a shared `CSpace` and reaps itself on
 /// every path.
 ///
+/// # Errors
+///
+/// - `thread_configure` refused the thread, entry, or stack.
+/// - `thread_start` refused the thread.
+///
 /// # Safety
 /// The contract of [`configure_and_start`].
 pub unsafe fn configure_and_start_thread(
@@ -242,6 +265,12 @@ pub unsafe fn configure_and_start_thread(
 
 /// Like [`configure_and_start`] but pins the child to `cpu` via
 /// `thread_set_affinity` before starting it.
+///
+/// # Errors
+///
+/// - `thread_configure` refused the thread, entry, or stack.
+/// - `thread_set_affinity` refused `cpu`.
+/// - `thread_start` refused the thread.
 ///
 /// # Safety
 /// The contract of [`configure_and_start`].

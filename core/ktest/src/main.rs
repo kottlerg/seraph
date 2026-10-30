@@ -226,10 +226,10 @@ pub struct TestContext
 /// or never started, which is what `spawn::configure_and_start`'s contract
 /// asks of the caller. Every test reaps each child it starts on one of these
 /// stacks before it returns, on every path: through the child's
-/// `spawn::SpawnedChild` guard,
-/// whose drop deletes the caps the test has not, or, for a set of threads
-/// sharing one `CSpace`, by its own cleanup on every path. So the rule holds
-/// across test boundaries whether the earlier test passed or failed.
+/// `spawn::SpawnedChild` guard, whose drop deletes the caps the test has not,
+/// or, for a set of threads sharing one `CSpace`, by its own cleanup on every
+/// path. So the rule holds across test boundaries whether the earlier test
+/// passed or failed.
 // Field is CPU stack memory; only the hardware stack pointer accesses it, not Rust code.
 #[allow(dead_code)]
 #[repr(align(16))]

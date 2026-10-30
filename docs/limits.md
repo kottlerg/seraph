@@ -119,7 +119,7 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 | `FRAMES_PER_CHUNK` geometry assert | `core/kernel/src/mm/frame_map.rs` | 1 GiB per chunk, 1 MiB counter block | encoding artefact | none | correct as is | Keep |
 | `MAX_RANGES` (`RangeList` usable and work lists) | `core/kernel/src/mm/init.rs` | 64 | current peak plus headroom | about 1 KiB stack per list | raise | `push` drops RAM ranges past 64 silently; size from `memory_map.count` or fail loudly |
 | `MAX_EXCL` | `core/kernel/src/mm/init.rs` | 32 | provably unreachable today (27 at most) only through core/boot's private `MAX_MODULES` | 512 B stack | needs a design | Derive from an ABI constant with a const assert; make overflow fatal |
-| `FREE_RANGE_CAP` (`FREE_RANGES`) | `core/kernel/src/mm/init.rs` | `MAX_RANGES + MAX_EXCL + 1` = 97 | provable unreachability (the usable ranges are disjoint, so each subtracted extent adds at most one piece; `push_counted` asserts it) | about 1.5 KiB BSS | correct as is | None |
+| `FREE_RANGE_CAP` (`FREE_RANGES`) | `core/kernel/src/mm/init.rs` | `MAX_RANGES + MAX_EXCL + 1` = 97 | provable unreachability (the usable ranges are disjoint, so each subtracted extent adds at most one piece; `push_counted` asserts it) | about 1.5 KiB BSS plus transient boot-stack copies of the same size | correct as is | None |
 | `fdt_extent` DTB size check | `core/kernel/src/mm/init.rs` | FDT `u32` `totalsize`, at least the 40-byte header, inside the direct-mapped span | hardware or format spec (FDT header) | none | correct as is | None; a blob outside the bounds halts the boot at Phase 3 |
 | `TAG_CAP` (`TagPool`) | `core/kernel/src/mm/tag_allocator.rs` | 4096 | hardware spec (x86 12-bit PCID); clips riscv64's 16-bit ASID | about 64.5 KiB BSS | make pay-as-you-go | Allocate from the buddy, sized to the probed tag count |
 | `enable` `max_fit` tag trim | `core/kernel/src/mm/tag_allocator.rs` | `2^MAX_ORDER` pages / (`cpu_count` x 16) | BSS budget (one-block slab) | `cpu_count` x tags x 16 B | needs a design | Follows the per-CPU slab design |
@@ -155,9 +155,7 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 ### Kernel: capabilities
 
 Tracked by [#637](https://github.com/kottlerg/seraph/issues/637); the Phase 7 boot buffers by
-[#636](https://github.com/kottlerg/seraph/issues/636); the reference-count wrap by
-[#633](https://github.com/kottlerg/seraph/issues/633); the page free-list walk by
-[#634](https://github.com/kottlerg/seraph/issues/634).
+[#636](https://github.com/kottlerg/seraph/issues/636).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
@@ -185,13 +183,13 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637); the Phase 7 bo
 | `MAX_IOPORT_BINDINGS` (`IoPortBindings.records`) | `core/kernel/src/cap/ioport_bindings.rs` | 16 per thread | unknown | 256 B per bound thread | raise | Spill to a caller-funded page |
 | `TABLE_BYTES` (`IoPortBindings` with `bitmap[IOPB_SIZE]`) | `core/kernel/src/cap/ioport_bindings.rs` | about 8.4 KiB | hardware spec (x86 IOPB) | one SEED allocation per bound thread | needs a design | About 40 bound threads exhaust SEED; fund from the caller |
 | `BIN_128`, `BIN_512`, `NUM_SUBPAGE_BINS` | `core/kernel/src/cap/retype.rs` | 128, 512; 2 | encoding artefact (object size classes) | 16 B per Memory object | correct as is | None |
-| `try_alloc_page_block` walk bound | `core/kernel/src/cap/retype.rs` | 1024 nodes | unknown | none | needs a design | A longer legitimate list is reported as a cycle and gives a false OOM (#634) |
+| Page free-list walk (`try_alloc_page_block`, `push_page_block`, `page_node_ok`) | `core/kernel/src/cap/retype.rs` | `size / PAGE_SIZE` nodes | provably unreachable (the list is address-ordered and coalesced, so a well-formed walk visits at most one node per page; a node below its predecessor's end is corruption, reported once per boot) | none | correct as is | None |
 | EventQueue, Notification size asserts | `core/kernel/src/cap/retype.rs` | wrapper 24, header 16 | encoding artefact | none | correct as is | Keep |
 | `MAX_REVOKE_EDITS` (`REVOKE_OBJECTS`) | `core/kernel/src/cap/derivation.rs` | 256 | batch size (subtrees of any size revoke in batches) | 2 KiB BSS | correct as is | None |
 | `MAX_REPARENT_EDITS` | `core/kernel/src/cap/derivation.rs` | 256 | batch size | none | correct as is | None |
 | `MAX_REPARENT_BATCHES` | `core/kernel/src/cap/derivation.rs` | `1 << 20` | current peak plus headroom (a split rolls back on hitting it, so a retry repeats the work) | none | needs a design | A node with more than about 2.7e8 children (about 19 GiB of slots) can never be split; keep progress across retries |
 | `DerivationLock` reader count | `core/kernel/src/cap/derivation.rs` | `u32`, `u32::MAX` = writer | provably unreachable (readers at most CPUs) | 4 B | correct as is | None |
-| `KernelObjectHeader.ref_count` | `core/kernel/src/cap/object.rs` | `AtomicU32`, unchecked increment | unknown | 4 B per object | needs a design | 2^32 references are reachable from userspace on large machines; wrap frees a live object (#633) |
+| `KernelObjectHeader.ref_count` (`REF_COUNT_LIMIT`) | `core/kernel/src/cap/object.rs` | `AtomicU32`; new slots and retype leases refused at 2^31 (`try_inc_ref`) | provably unreachable (every userspace-amplifiable reference costs a 72-byte slot or a retype child of at least 128 bytes, so 2^31 references hold at least 144 GiB against one object, and reaching the ceiling refuses with `QuotaExceeded` instead of wrapping; the unchecked owners fit the 2^31 headroom) | 4 B per object | correct as is | None |
 | `RANGE_COPY_LIMIT` | `core/kernel/src/cap/object.rs` | 64 per lineage | BSS budget (protects SEED) | none | needs a design | Lift once copies are caller-funded |
 | `ROOT_SHARE` (`RangeLineage.live`) | `core/kernel/src/cap/object.rs` | `1 << 31` in `u32` | encoding artefact | embedded | correct as is | None |
 | `MMIO_MAX_MAPPINGS` (`MmioObject.mappings`) | `core/kernel/src/cap/object.rs` | 4 | BSS budget (`MmioObject` fits the 128 B bin) | 64 B per Mmio object | needs a design | Spill records to a caller-funded page |

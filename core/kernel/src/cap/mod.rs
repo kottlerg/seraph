@@ -2055,7 +2055,7 @@ fn mint_reclaim_pass(
         // Register the range as managed-but-not-free so the buddy's
         // `total_pages` ledger accounts for it. These pages were never in
         // `total_pages` — `mm::init::collect_usable_ranges` filters
-        // `Loaded`-typed regions out of the buddy at Phase 2 — so
+        // `Loaded`-typed regions out of the free ranges at Phase 2 — so
         // `register_owned_range` is the correct ledger entry (not
         // `add_region`, which would also push them onto the free list). The
         // cap routes to memmgr via reap and is not destroyed in the kernel;

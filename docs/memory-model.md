@@ -234,9 +234,10 @@ not user pages.
 At boot, the bootloader provides a memory map via the `BootInfo` structure
 (see [abi/boot-protocol/README.md](../abi/boot-protocol/README.md); type classification in
 [core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md)) describing which physical
-address ranges are usable RAM, reserved, or used by firmware. The kernel parses this map and
-populates the buddy allocator in Phase 2, excluding the frames the boot payload occupies; see
-[initialization.md](../core/kernel/docs/initialization.md) § Phase 2.
+address ranges are usable RAM, reserved, or used by firmware. The kernel parses this map in
+Phase 2, excluding the frames the boot payload occupies, and populates the buddy allocator from
+the surviving ranges once its own page tables map all RAM, at Phase 3; see
+[initialization.md](../core/kernel/docs/initialization.md) § Phase 2 and § Phase 3.
 
 ### Bootloader Scratch Reclamation
 
@@ -276,10 +277,10 @@ devmgr is design intent; not yet implemented, so DMA currently runs unconfined (
 [device-management.md](device-management.md) § DMA Safety Model).
 
 Physical frame 0 (the zero page) is excluded from the allocator. The page-table and
-CSpace growth pools use a physical address of 0 as their free-list "empty" sentinel,
-so admitting frame 0 as a pool page would make an occupied list indistinguishable from
-an empty one. Excluding it (one frame) keeps the sentinel unambiguous regardless of
-how firmware classifies `[0, PAGE_SIZE)`.
+CSpace growth pools, and the allocator's own free lists, use a physical address of 0 as
+their free-list "empty" sentinel, so admitting frame 0 as a pool page or a free block would
+make an occupied list indistinguishable from an empty one. Excluding it (one frame) keeps
+the sentinel unambiguous regardless of how firmware classifies `[0, PAGE_SIZE)`.
 
 ### Frame Allocation is Fallible
 

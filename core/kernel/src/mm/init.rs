@@ -5,14 +5,14 @@
 
 //! Physical memory initialization.
 //!
-//! Parses the boot-time memory map from [`BootInfo`], subtracts the boot
-//! payload's frames (kernel image, init segments, boot modules, `BootInfo`
-//! struct, AP trampoline page, DTB blob), and
-//! populates a caller-supplied [`BuddyAllocator`] with the surviving ranges.
-//!
-//! The allocator is passed by mutable reference rather than returned by value
-//! because it is ~41 KiB — too large for the kernel's boot stack. The caller
-//! should hold the allocator in static storage (BSS).
+//! Phase 2 ([`init_physical_memory`]) parses the boot-time memory map from
+//! [`BootInfo`] and subtracts the boot payload's frames (kernel image, init
+//! segments, boot modules, `BootInfo` struct, AP trampoline page), keeping
+//! the surviving ranges. The first act of Phase 3 after the page-table switch
+//! ([`populate_buddy`]) sizes the device tree blob through the direct map,
+//! subtracts it too, and populates the [`BuddyAllocator`], whose free-list
+//! links live in the free pages and so need the direct map
+//! (core/kernel/docs/initialization.md § Phase 2 and § Phase 3).
 
 // cast_possible_truncation: u64→usize physical address arithmetic; bounded by memory map sizes.
 #![allow(clippy::cast_possible_truncation)]
@@ -22,6 +22,7 @@ use core::mem::size_of;
 use boot_protocol::{BootInfo, MemoryType};
 
 use super::buddy::{BuddyAllocator, PAGE_SIZE};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::kprintln;
 
@@ -304,35 +305,128 @@ fn memory_type_name(ty: MemoryType) -> &'static str
 const MAX_RANGES: usize = 64;
 
 /// Maximum exclusion regions: kernel, `BootInfo`, each init segment (up to
-/// `INIT_MAX_SEGMENTS`, 8), up to 16 boot modules, the AP trampoline page,
-/// and the DTB blob — 28 at most, so 32 is sufficient.
+/// `INIT_MAX_SEGMENTS`, 8), up to 16 boot modules, and the AP trampoline
+/// page — 27 at most, so 32 is sufficient. The DTB blob is subtracted
+/// separately, at population.
 const MAX_EXCL: usize = 32;
 
-/// Populate `alloc` with usable physical frames derived from `info`.
+/// Capacity of the surviving-range list. The usable ranges are disjoint, so
+/// each subtracted extent lies strictly inside at most one of them and adds
+/// at most one piece: the `MAX_RANGES` usable ranges, one piece per
+/// `MAX_EXCL` exclusion, and one for the DTB blob bound the count.
+const FREE_RANGE_CAP: usize = MAX_RANGES + MAX_EXCL + 1;
+
+/// Surviving free ranges, written once in Phase 2 by
+/// [`init_physical_memory`] and consumed once by [`populate_buddy`], both on
+/// the single boot thread.
+static mut FREE_RANGES: RangeList<FREE_RANGE_CAP> = RangeList::new();
+
+/// Physical address of the device tree blob from `BootInfo.device_tree`
+/// (0 when none), recorded in Phase 2 for [`populate_buddy`].
+static DTB_PHYS: AtomicU64 = AtomicU64::new(0);
+
+/// Top of the physical span the direct map covers
+/// (`compute_max_physical_address`), recorded in Phase 2.
+static DIRECT_MAP_TOP: AtomicU64 = AtomicU64::new(0);
+
+/// The DTB blob's page-aligned `(base, size)`, `(0, 0)` when there is none;
+/// written by [`populate_buddy`].
+static DTB_EXTENT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Phase 2: collect the free physical ranges derived from `info`.
 ///
-/// Filters for [`MemoryType::Usable`] entries, subtracts the kernel image,
-/// init segments, boot modules, the `BootInfo` struct, the AP trampoline
-/// page, and the DTB blob, then feeds
-/// the surviving page-aligned sub-ranges to `alloc`.
+/// Filters for [`MemoryType::Usable`] entries and subtracts the kernel image,
+/// init segments, boot modules, the `BootInfo` struct, and the AP trampoline
+/// page. The surviving page-aligned ranges are kept for [`populate_buddy`];
+/// nothing is written to free RAM, which the bootloader's tables do not map
+/// (core/boot/docs/page-tables.md § What Gets Mapped).
 ///
 /// Calls [`crate::fatal`] and halts if no usable memory survives.
 ///
-/// `alloc` must be a freshly-created (empty) allocator — this function does
-/// not reset it first.
-pub fn init_physical_memory(info: &BootInfo, alloc: &mut BuddyAllocator)
+/// Called once, on the single boot thread, while the bootloader's identity
+/// map still covers `info` and its memory map.
+pub fn init_physical_memory(info: &BootInfo)
 {
     let usable = collect_usable_ranges(info);
     let excl = collect_exclusions(info);
 
+    let mut free = RangeList::<FREE_RANGE_CAP>::new();
     for &(r_start, r_end) in usable.iter().filter(|&&(s, e)| s < e)
     {
-        add_surviving_subranges(alloc, r_start, r_end, excl.as_slice());
+        add_surviving_subranges(&mut free, r_start, r_end, excl.as_slice());
+    }
+
+    // Frame 0 never reaches the buddy (`BuddyAllocator::add_region`).
+    if free.iter().all(|&(s, e)| e <= s.max(PAGE_SIZE as u64))
+    {
+        crate::fatal("no usable physical memory after exclusions");
+    }
+
+    DTB_PHYS.store(info.device_tree, Ordering::Relaxed);
+    DIRECT_MAP_TOP.store(
+        super::paging::compute_max_physical_address(info),
+        Ordering::Relaxed,
+    );
+    // SAFETY: single boot thread; FREE_RANGES is written only here, before
+    // `populate_buddy` reads it.
+    unsafe { *core::ptr::addr_of_mut!(FREE_RANGES) = free };
+}
+
+/// First act of Phase 3 after the page-table switch: subtract the device tree
+/// blob from the Phase-2 free ranges and populate `alloc` with the rest.
+///
+/// The blob is sized from its FDT header, read through the direct map
+/// ([`fdt_extent`]); a `BootInfo.device_tree` that does not name a valid blob
+/// inside the direct-mapped span halts the boot, since its pages could not be
+/// kept out of the allocator. The extent is published for [`dtb_extent`].
+///
+/// # Safety
+///
+/// Called once, on the single boot thread, after [`init_physical_memory`] and
+/// after the kernel page tables (with the direct map over all RAM) are
+/// active; `alloc` is empty and nothing has allocated from it.
+pub unsafe fn populate_buddy(alloc: &mut BuddyAllocator)
+{
+    // SAFETY: single boot thread; `init_physical_memory` finished writing.
+    let mut free = unsafe { core::ptr::read(core::ptr::addr_of!(FREE_RANGES)) };
+
+    let dtb_phys = DTB_PHYS.load(Ordering::Relaxed);
+    if dtb_phys != 0
+    {
+        let span_top = DIRECT_MAP_TOP.load(Ordering::Relaxed);
+        let extent = fdt_extent(dtb_phys, span_top, || {
+            let ptr = super::paging::phys_to_virt(dtb_phys) as *const [u8; FDT_SIZE_PREFIX];
+            // SAFETY: `fdt_extent` calls this only when the header lies below
+            // `span_top`, which the active direct map covers.
+            unsafe { core::ptr::read_volatile(ptr) }
+        })
+        .unwrap_or_else(|e| dtb_fatal(dtb_phys, &e));
+        DTB_EXTENT[0].store(extent.0, Ordering::Relaxed);
+        DTB_EXTENT[1].store(extent.1, Ordering::Relaxed);
+        free = subtract(&free, extent.0, extent.0 + extent.1);
+    }
+
+    for &(start, end) in free.iter()
+    {
+        // SAFETY: these ranges are usable RAM holding no live data (the
+        // exclusion subtraction above and in Phase 2), reachable through the
+        // direct map the caller guarantees is live.
+        unsafe { alloc.add_region(start, end) };
     }
 
     if alloc.free_page_count() == 0
     {
         crate::fatal("no usable physical memory after exclusions");
     }
+}
+
+/// The device tree blob's page-aligned `(base, size)`, or `None` when the
+/// bootloader passed none. Valid after [`populate_buddy`].
+#[must_use]
+pub fn dtb_extent() -> Option<(u64, u64)>
+{
+    let size = DTB_EXTENT[1].load(Ordering::Relaxed);
+    (size != 0).then(|| (DTB_EXTENT[0].load(Ordering::Relaxed), size))
 }
 
 // ── Helper types ─────────────────────────────────────────────────────────────
@@ -361,6 +455,16 @@ impl<const N: usize> RangeList<N>
             self.data[self.len] = (start, end);
             self.len += 1;
         }
+    }
+
+    /// Push a range whose slot [`FREE_RANGE_CAP`]'s count guarantees.
+    fn push_counted(&mut self, start: u64, end: u64)
+    {
+        debug_assert!(
+            start >= end || self.len < N,
+            "free-range count exceeds its proven bound"
+        );
+        self.push(start, end);
     }
 
     fn as_slice(&self) -> &[(u64, u64)]
@@ -469,65 +573,113 @@ fn collect_exclusions(info: &BootInfo) -> RangeList<MAX_EXCL>
         );
     }
 
-    // DTB blob pages. Commonly reported as EfiBootServicesData → Usable by
-    // UEFI; userspace parses the DTB through a read-only Memory cap minted
-    // in Phase 7. Excluding the pages from the buddy keeps that cap's
-    // backing memory live.
-    if info.device_tree != 0
-        && let Some(size) = read_dtb_totalsize(info.device_tree)
-    {
-        add(info.device_tree, info.device_tree + size);
-    }
-
     excl
 }
 
-/// Read the `totalsize` field of a flattened device tree blob.
-///
-/// Returns `None` if the magic does not match or the reported size is zero
-/// or exceeds `DTB_MAX_SIZE`; the caller then excludes nothing for the blob.
-/// The Phase-7 DTB Memory cap is sized by `cap::read_dtb_totalsize`.
-fn read_dtb_totalsize(phys: u64) -> Option<u64>
-{
-    /// FDT magic in big-endian: bytes `d0 0d fe ed`.
-    const FDT_MAGIC: u32 = 0xd00d_feed;
-    /// Largest accepted DTB `totalsize` (64 KiB); a larger value is rejected and no
-    /// exclusion is added, not clamped.
-    /// Tracked by #635: a larger DTB gets no exclusion and no cap.
-    const DTB_MAX_SIZE: u64 = 64 * 1024;
+/// FDT magic in big-endian: bytes `d0 0d fe ed`.
+const FDT_MAGIC: u32 = 0xd00d_feed;
 
-    // `phys` is the firmware's DTB physical address. The bootloader's initial
-    // tables do not map the device tree (core/boot/docs/page-tables.md
-    // § Contract at Kernel Entry), so this Phase-2 read is not covered by the
-    // boot identity map. The first 8 bytes of an FDT blob are magic +
-    // totalsize by spec.
-    let ptr = phys as *const u8;
-    // SAFETY: requires `phys` to be mapped here; the bootloader does not
-    // identity-map the device tree (core/boot/docs/page-tables.md § Contract
-    // at Kernel Entry), so this precondition is not established in Phase 2.
-    // The FDT header occupies the first bytes of the blob by spec.
-    let magic_bytes = unsafe { core::ptr::read_volatile(ptr.cast::<[u8; 4]>()) };
-    let magic = u32::from_be_bytes(magic_bytes);
+/// Bytes of the FDT header [`fdt_extent`] reads: `magic` and `totalsize`.
+const FDT_SIZE_PREFIX: usize = 8;
+
+/// Size of the version-17 FDT header; no valid blob is smaller.
+const FDT_HEADER_BYTES: u64 = 40;
+
+/// Why `BootInfo.device_tree` does not name a usable blob.
+#[derive(Debug, PartialEq, Eq)]
+enum DtbError
+{
+    /// The header itself lies past the direct-mapped span.
+    HeaderPastSpan,
+    /// The first word is not the FDT magic.
+    BadMagic(u32),
+    /// `totalsize` is smaller than the FDT header.
+    TooSmall(u64),
+    /// `totalsize` runs the blob past the direct-mapped span.
+    PastSpan(u64),
+}
+
+/// Size the device tree blob at `base` from its header.
+///
+/// The DTB pages are commonly reported as `EfiBootServicesData`, so `Usable`;
+/// userspace parses the blob through the read-only Memory cap Phase 7 mints
+/// from this extent, and keeping the extent out of the buddy keeps that cap's
+/// memory live. `read_prefix` returns the blob's first [`FDT_SIZE_PREFIX`]
+/// bytes and is called only when the header lies below `span_top`. The
+/// blob's only bounds are the FDT format's (a `u32` `totalsize` no smaller
+/// than the header) and the direct-mapped span `[0, span_top)` the kernel
+/// reads it through. Returns the page-aligned extent covering
+/// `[base, base + totalsize)`.
+fn fdt_extent(
+    base: u64,
+    span_top: u64,
+    read_prefix: impl FnOnce() -> [u8; FDT_SIZE_PREFIX],
+) -> Result<(u64, u64), DtbError>
+{
+    if base
+        .checked_add(FDT_HEADER_BYTES)
+        .is_none_or(|end| end > span_top)
+    {
+        return Err(DtbError::HeaderPastSpan);
+    }
+    let prefix = read_prefix();
+    let magic = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
     if magic != FDT_MAGIC
     {
-        return None;
+        return Err(DtbError::BadMagic(magic));
     }
-    // SAFETY: identity-mapped; totalsize is the 4 bytes following the magic.
-    let size_bytes = unsafe { core::ptr::read_volatile(ptr.add(4).cast::<[u8; 4]>()) };
-    let size = u64::from(u32::from_be_bytes(size_bytes));
-    if size == 0 || size > DTB_MAX_SIZE
+    let size = u64::from(u32::from_be_bytes([
+        prefix[4], prefix[5], prefix[6], prefix[7],
+    ]));
+    if size < FDT_HEADER_BYTES
     {
-        return None;
+        return Err(DtbError::TooSmall(size));
     }
-    Some(size)
+    let end = base.saturating_add(size);
+    if end > span_top
+    {
+        return Err(DtbError::PastSpan(size));
+    }
+    let page = PAGE_SIZE as u64;
+    let first = align_down(base, page);
+    Ok((first, align_up(end, page) - first))
+}
+
+/// Halt the boot on a `BootInfo.device_tree` that names no usable blob.
+fn dtb_fatal(phys: u64, err: &DtbError) -> !
+{
+    let top = DIRECT_MAP_TOP.load(Ordering::Relaxed);
+    match *err
+    {
+        DtbError::HeaderPastSpan =>
+        {
+            kprintln!("Phase 3: device tree at {phys:#x}: header past the direct map end {top:#x}");
+        }
+        DtbError::BadMagic(magic) =>
+        {
+            kprintln!("Phase 3: device tree at {phys:#x}: bad FDT magic {magic:#010x}");
+        }
+        DtbError::TooSmall(size) =>
+        {
+            kprintln!("Phase 3: device tree at {phys:#x}: totalsize {size} below the FDT header");
+        }
+        DtbError::PastSpan(size) =>
+        {
+            kprintln!(
+                "Phase 3: device tree at {phys:#x}: totalsize {size:#x} runs past the direct \
+                 map end {top:#x}"
+            );
+        }
+    }
+    crate::fatal("Phase 3: BootInfo.device_tree names no valid FDT blob")
 }
 
 // ── Range subtraction ─────────────────────────────────────────────────────────
 
-/// Feed the sub-ranges of `[r_start, r_end)` that don't overlap any exclusion
-/// in `excls` to the allocator.
+/// Append to `free` the sub-ranges of `[r_start, r_end)` that don't overlap
+/// any exclusion in `excls`.
 fn add_surviving_subranges(
-    alloc: &mut BuddyAllocator,
+    free: &mut RangeList<FREE_RANGE_CAP>,
     r_start: u64,
     r_end: u64,
     excls: &[(u64, u64)],
@@ -556,18 +708,23 @@ fn add_surviving_subranges(
         work = next;
     }
 
-    // Add all surviving sub-ranges to the allocator.
     for &(start, end) in work.iter()
     {
-        if start < end
-        {
-            // SAFETY: These ranges are usable RAM not occupied by any live data,
-            // confirmed by the exclusion subtraction above. `add_region` records the
-            // addresses only and never accesses the pages (free RAM is not
-            // identity-mapped; core/boot/docs/page-tables.md § What Gets Mapped).
-            unsafe { alloc.add_region(start, end) };
-        }
+        free.push_counted(start, end);
     }
+}
+
+/// `list` with `[e_start, e_end)` removed.
+fn subtract(list: &RangeList<FREE_RANGE_CAP>, e_start: u64, e_end: u64)
+-> RangeList<FREE_RANGE_CAP>
+{
+    let mut out = RangeList::new();
+    for &(start, end) in list.iter()
+    {
+        out.push_counted(start, end.min(e_start));
+        out.push_counted(start.max(e_end), end);
+    }
+    out
 }
 
 // ── Alignment utilities ───────────────────────────────────────────────────────
@@ -582,4 +739,86 @@ fn align_up(val: u64, align: u64) -> u64
 fn align_down(val: u64, align: u64) -> u64
 {
     val & !(align - 1)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// The first header bytes of a blob of `totalsize` bytes.
+    fn header(magic: u32, totalsize: u32) -> [u8; FDT_SIZE_PREFIX]
+    {
+        let mut prefix = [0u8; FDT_SIZE_PREFIX];
+        prefix[..4].copy_from_slice(&magic.to_be_bytes());
+        prefix[4..].copy_from_slice(&totalsize.to_be_bytes());
+        prefix
+    }
+
+    const BLOB: u64 = 0x8000_1100;
+
+    #[test]
+    fn fdt_extent_covers_a_blob_ending_exactly_at_the_span_top()
+    {
+        // A 3 MiB blob, past any fixed ceiling, at an unaligned base: the
+        // extent must start on the blob's page and cover its last byte.
+        let size: u32 = 3 << 20;
+        let top = BLOB + u64::from(size);
+        let extent = fdt_extent(BLOB, top, || header(FDT_MAGIC, size));
+        assert_eq!(extent, Ok((0x8000_1000, align_up(top, 4096) - 0x8000_1000)));
+    }
+
+    #[test]
+    fn fdt_extent_rejects_a_blob_one_byte_past_the_span()
+    {
+        let size: u32 = 0x1_0000;
+        let top = BLOB + u64::from(size) - 1;
+        assert_eq!(
+            fdt_extent(BLOB, top, || header(FDT_MAGIC, size)),
+            Err(DtbError::PastSpan(u64::from(size)))
+        );
+    }
+
+    #[test]
+    fn fdt_extent_rejects_a_size_below_the_header()
+    {
+        assert_eq!(
+            fdt_extent(BLOB, u64::MAX, || header(FDT_MAGIC, 39)),
+            Err(DtbError::TooSmall(39))
+        );
+    }
+
+    #[test]
+    fn fdt_extent_rejects_a_bad_magic()
+    {
+        assert_eq!(
+            fdt_extent(BLOB, u64::MAX, || header(0xfeed_d00d, 0x1000)),
+            Err(DtbError::BadMagic(0xfeed_d00d))
+        );
+    }
+
+    #[test]
+    fn fdt_extent_never_reads_a_header_past_the_span()
+    {
+        let read = || -> [u8; FDT_SIZE_PREFIX] { panic!("header read past the span") };
+        assert_eq!(
+            fdt_extent(BLOB, BLOB + FDT_HEADER_BYTES - 1, read),
+            Err(DtbError::HeaderPastSpan)
+        );
+    }
+
+    #[test]
+    fn subtract_splits_only_the_range_holding_the_extent()
+    {
+        let mut list = RangeList::<FREE_RANGE_CAP>::new();
+        list.push(0x1000, 0x9000);
+        list.push(0x10000, 0x20000);
+        let out = subtract(&list, 0x3000, 0x5000);
+        assert_eq!(
+            out.as_slice(),
+            &[(0x1000, 0x3000), (0x5000, 0x9000), (0x10000, 0x20000)]
+        );
+    }
 }

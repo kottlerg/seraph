@@ -47,17 +47,17 @@ pub fn user_va_top() -> u64
     0x0000_8000_0000_0000
 }
 
-/// Physical frame allocator, populated during Phase 2.
+/// Physical frame allocator, populated as the first act of Phase 3
+/// (`init::populate_buddy`).
 ///
-/// Stored as a crate-level static to avoid placing a ~41 KiB struct on the
-/// kernel's 64 KiB boot stack. Phases 2-5 reach it through a direct `&mut`
-/// on the single boot thread, before SMP bringup; every later access goes
-/// through `with_frame_allocator`.
+/// A crate-level static so every phase reaches the one allocator. Phases 3-5
+/// reach it through a direct `&mut` on the single boot thread, before SMP
+/// bringup; every later access goes through `with_frame_allocator`.
 ///
 /// # Safety
 ///
 /// Accessed only from the single boot thread before SMP is enabled, or
-/// through `with_frame_allocator` after Phase 2.
+/// through `with_frame_allocator` after its population in Phase 3.
 pub(crate) static mut FRAME_ALLOCATOR: BuddyAllocator = BuddyAllocator::new();
 
 /// Spin-lock protecting all access to `FRAME_ALLOCATOR`.
@@ -103,8 +103,8 @@ fn release_frame_alloc_lock()
 ///
 /// # Safety
 ///
-/// Must be called after Phase 2 (frame allocator populated). Must not be
-/// called before the direct physical map is active (Phase 3).
+/// Must be called after the frame allocator is populated, which happens once the
+/// direct physical map is active (Phase 3).
 #[cfg(not(test))]
 pub(crate) fn with_frame_allocator<F, R>(f: F) -> R
 where

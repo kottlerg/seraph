@@ -214,6 +214,18 @@ zeroed whole by the bootloader before the image is copied in
 ([core/boot/docs/elf-loading.md](../../boot/docs/elf-loading.md) § Init ELF
 Loading).
 
+From Phase 3 to the Phase 7 drain, the buddy allocator also keeps kernel state in
+free RAM: the first 16 bytes of every free block hold its free-list header, the
+physical address of the next free block and the block's order
+([memory-internals.md](memory-internals.md) § Buddy Allocator). No header reaches
+a user-visible page. Only free blocks carry a header (a merge clears the header
+of every buddy it absorbs), `BuddyAllocator::alloc` zeroes the header bytes of
+every block it hands out, and the pre-drain blocks that reach userspace, init's
+`InitInfo` block and stack pages, are zeroed whole at Phase 9 before they are
+mapped. The drain hands its extents out with their headers in place, and Phase 7
+zeroes all of them, the seed reserve included, before minting any, as above, so
+the Memory caps userspace retypes and maps start from zeroed RAM.
+
 ## Kernel console diagnostics
 
 The kernel's `kprint!` / `kprintln!` macros (`core/kernel/src/console.rs`) and the

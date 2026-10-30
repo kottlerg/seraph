@@ -49,7 +49,12 @@ halts on a rejected blob. The kernel falls back to its compiled-in
 defaults for any zero MMIO base, but on a RISC-V platform whose only hart
 facts come from the DTB (no ACPI RHCT), a rejected blob leaves
 `timebase_freq` zero and `hart_caps` empty, which halts the kernel at
-Phase 5 (see [boot-flow.md](boot-flow.md) §"Step 9").
+Phase 5 (see [boot-flow.md](boot-flow.md) §"Step 9"). The kernel sizes the
+passed-through blob from its own header to keep its pages out of the frame
+allocator, and halts at Phase 3 when the magic is wrong, the `totalsize` is below
+the 40-byte header, or the blob extends past the direct-mapped span (see
+[initialization.md](../../kernel/docs/initialization.md) § Phase 3: Kernel Page
+Tables).
 
 Validation checks:
 - `magic == 0xD00DFEED` (big-endian per the FDT spec).

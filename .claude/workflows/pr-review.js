@@ -45,12 +45,6 @@
 //                or rebased branch still works. Only files the PR diff also
 //                touches are reviewed, so files a merge or rebase of the base
 //                brought in are not.
-//   Every stage takes the PR diff from the local tree (`git diff <base> <head>`,
-//   the merge base resolved against `origin/<baseRefName>`), never from
-//   `gh pr diff` or the `files` field of `gh pr view`, which GitHub caps (300
-//   files or 20000 lines for the diff, 100 files for the field). The script
-//   checks the returned file lists against the count the scope agent reads from
-//   the same local diff, and aborts rather than review a partial list.
 //   ledger       path of the ledger file `.claude/CLAUDE.md` § PR workflow
 //                operations builds; required in 'delta' mode and taken in
 //                every mode once one exists, so a full run after an earlier
@@ -58,6 +52,13 @@
 //                `jq`.
 //   mode 'scope' stops after Scope and returns the shard plan and sample
 //                prompts (one agent); with `since` it scopes as delta would.
+//
+// Every stage takes the PR diff from the local tree (`git diff <base> <head>`,
+// the merge base resolved against `origin/<baseRefName>`), never from
+// `gh pr diff` or the `files` field of `gh pr view`, which GitHub caps (300
+// files or 20000 lines for the diff, 100 files for the field). The script
+// checks the returned file lists against the count the scope agent reads from
+// the same local diff, and aborts rather than review a partial list.
 
 export const meta = {
     name: 'pr-review',
@@ -580,7 +581,8 @@ for (const c of scope.claimed_fixes) c.file = normalize(c.file)
 scope.design_docs = scope.design_docs.map(normalize)
 // A delta reviews only the PR's own files: one a merge or rebase of the base
 // branch changed between `since` and the head is master's, not this PR's. The
-// numstat runs without rename detection, so a renamed file keeps its new path.
+// numstat runs without rename detection, so in both modes a renamed file
+// appears under its old path (a deletion) and its new path (an addition).
 // The scope agent limits the delta to the PR's files, so a delta file outside
 // `pr_files` means one of the two lists is wrong; the run aborts rather than
 // drop a file whose PR-diff membership it cannot confirm. Base hunks inside a

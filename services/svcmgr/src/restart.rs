@@ -56,10 +56,10 @@ pub struct CreatedProcess
 /// Allocate a fresh bootstrap badge — a random `u64` from the kernel entropy
 /// pool, redrawn off the reserved `0` value (an unbadged SEND carries badge 0)
 /// — and mint a badged SEND on `bootstrap_ep` for a soon-to-spawn child. Every
-/// child that receives its bootstrap round on svcmgr's `bootstrap_ep` gets a
-/// distinct badge so svcmgr can correlate the round to the right service entry.
+/// child that receives its bootstrap rounds on svcmgr's `bootstrap_ep` gets a
+/// distinct badge so svcmgr can correlate each round to the right service entry.
 /// Random rather than monotonic so the service-spawn count it would otherwise
-/// leak stays unguessable; svcmgr matches the round by exact badge value, never
+/// leak stays unguessable; svcmgr matches each round by exact badge value, never
 /// by index. Returns `None` if the entropy draw or cap derivation fails.
 pub fn mint_child_creator(bootstrap_ep: u32) -> Option<(u64, u32)>
 {
@@ -385,7 +385,7 @@ fn should_restart(svc: &ServiceEntry, exit_reason: u64) -> bool
 }
 
 /// Release the dead instance, create a new process via procmgr, start it,
-/// serve its bootstrap round, and rebind death notification. Returns `true`
+/// serve its bootstrap rounds, and rebind death notification. Returns `true`
 /// on success; on a failure after the create the new child is destroyed and
 /// `svc.process_handle` is zeroed.
 fn restart_process(

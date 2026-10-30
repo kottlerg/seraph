@@ -198,7 +198,7 @@ svcmgr-launched services.
 
 Space-separated discovery-registry names. svcmgr resolves each name
 to a freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint and
-injects them positionally into the child's bootstrap round:
+injects them positionally into the child's bootstrap rounds:
 
 ```
 seed = rootfs.root pwrmgr.shutdown pwrmgr.deny

@@ -17,7 +17,7 @@ services/svctest/
 ├── README.md
 └── src/
     ├── main.rs                # Child-mode check, bootstrap, phase run, pass marker, shutdown
-    ├── bootstrap.rs           # Decodes the creator-endpoint bootstrap round into `Caps`
+    ├── bootstrap.rs           # Decodes the creator-endpoint bootstrap rounds into `Caps`
     ├── runner.rs              # `Phase` type, per-phase log envelope, failure hooks, markers
     ├── reentry.rs             # argv-role dispatch into each phase module's child mode
     ├── ipc_util/

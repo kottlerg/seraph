@@ -66,8 +66,8 @@ prompt of this shape; nothing in it repeats the agent file:
 > You are orchestrated. Scope `<scope>`; Issues #N, #M (one line each: title and the items in
 > play); branch `<prefix>/<slug>`; report to `main`; review records go to `<path of your
 > checkout>` (the destination of the worker's copy, `.claude/agents/worker.md` § Review). Batch
-> rulings: <the rulings below that the
-> maintainer changed for this batch, and any Issue-specific decision already made>.
+> rulings: <the rulings below that the maintainer changed for this batch, and any
+> Issue-specific decision already made>.
 
 A documentation-only scope may run on `model: sonnet`; everything that compiles stays on the
 agent file's default. Record the agent id, the scope, the branch, the worktree path and, once
@@ -108,17 +108,16 @@ A PR is at its gate when: `gh pr view <N> --json mergeStateStatus,statusCheckRol
 `CLEAN` and every check green (docs/conventions.md § CI Gating, § Branch protection); the
 merge-prompt condition of its § Branch and PR Workflow holds, that is, the last run record
 under `target/xtask/review/pr<N>/` in your checkout, where the worker copied its records, is a
-completed run with no failed agent whose
-verdict is `READY TO MERGE`, or `NON-BLOCKING ISSUES ONLY` with every surface finding recorded
-and no contested finding on the surface unresolved, and `AUDIT PASS` is on record for the
-head; every Issue the body closes carries the current milestone (§ Milestones); and a delta
-since the validated head is comment-only or Markdown-only (§ PR-body checklist discipline;
-`git diff <validated> <head> -- . ':!*.md'` shows only comment lines). Verify each part
-yourself, since a worker's report is a claim; a gate whose records are not readable in your
-checkout is not verified, so ask the worker for the copy before merging rather than merging on
-the report. Then prompt the maintainer, or merge under their
-standing instruction, with `gh pr merge <N> --merge --delete-branch`; fast-forward your own
-checkout, record it, and tell every open PR's worker what moved.
+completed run with no failed agent whose verdict is `READY TO MERGE`, or `NON-BLOCKING ISSUES
+ONLY` with every surface finding recorded and no contested finding on the surface unresolved,
+and `AUDIT PASS` is on record for the head; every Issue the body closes carries the current
+milestone (§ Milestones); and a delta since the validated head is comment-only or
+Markdown-only (§ PR-body checklist discipline; `git diff <validated> <head> -- . ':!*.md'`
+shows only comment lines). Verify each part yourself, since a worker's report is a claim; a
+gate whose records are not readable in your checkout is not verified, so ask the worker for
+the copy before merging rather than merging on the report. Then prompt the maintainer, or
+merge under their standing instruction, with `gh pr merge <N> --merge --delete-branch`;
+fast-forward your own checkout, record it, and tell every open PR's worker what moved.
 
 Order merges to minimize re-validation: a PR whose merge touches only Markdown or comments
 costs the others nothing; among code PRs, merge first the one whose later syncs the others have
@@ -149,11 +148,16 @@ decision, or a case with no clearly best option waits for the maintainer.
   Standing, by the maintainer's ruling of 2026-10-30 ("If you are confident that it won't cause
   broad process issues going forwards, then I can approve that those nits after a ready to
   merge will go on the rolling issue for that scope.", then "approved" to the orchestrator's
-  precise statement of it): a run whose findings are all nits takes no fix round;
-  the worker records them on the scope's follow-up Issue (the Issue the PR drains in that
-  scope, else the rolling Issue, as docs/conventions.md § Branch and PR Workflow defines it)
-  and reports the gate, except that a PR draining a follow-up Issue of that scope records its
-  nits-only findings there and fixes them in the same PR, ticking each `(fixed by PR #<M>)`.
+  statement of it: "after a review returns NON-BLOCKING ISSUES ONLY consisting solely of nits
+  (no should, no critical), the nits are recorded on the scope's rolling Issue and the PR
+  proceeds to its gate instead of taking another fix round; a READY TO MERGE run has nothing to
+  record; should or critical findings always take a fix round"): a run whose findings are all
+  nits takes no fix round; the worker records them on the scope's follow-up Issue (the Issue
+  the PR drains in that scope, the lowest-numbered when it drains several, else the rolling
+  Issue, as docs/conventions.md § Branch and PR Workflow defines it, from which the drain
+  routing follows rather than from the ruling) and reports the gate, except that a PR draining
+  a follow-up Issue of that scope records its nits-only findings there and fixes them in the
+  same PR, ticking each `(fixed by PR #<M>)`.
 - A reviewer's finding that a worker contests, or that the worker cannot fix within its scope
   (a pre-existing code defect in a file a documentation-only PR touches, for instance), is put
   to the maintainer with the worker's and your recommendation. A finding is never waived or

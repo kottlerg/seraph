@@ -3,8 +3,7 @@
 Enumerates every value the kernel emits across the user/kernel boundary and
 classifies it toward the goal that no kernel virtual address or kernel pointer
 escapes to userspace — a prerequisite for kernel address-space layout
-randomization (KASLR). Known open disclosure: mirrored console diagnostics
-([#440](https://github.com/kottlerg/seraph/issues/440)). Accepted residual: the x86-64
+randomization (KASLR). Accepted residual: the x86-64
 descriptor-table registers on a CPU without UMIP (§ Surface inventory).
 
 ---
@@ -14,8 +13,8 @@ descriptor-table registers on a CPU without UMIP (§ Surface inventory).
 KASLR randomizes the kernel's virtual base. A single kernel virtual address (VA),
 kernel pointer, or value derived from one that reaches userspace defeats base
 randomization. This inventory audits the kernel's complete output surface and
-records, per surface, why it carries no kernel VA or, for each known open
-disclosure ([#440](https://github.com/kottlerg/seraph/issues/440)), what it leaks. It is the
+records, per surface, why it carries no kernel VA or, for an accepted residual, what it
+leaks. It is the
 standing reference the coding-standards rule "Cross-Boundary Data Hygiene"
 ([docs/coding-standards.md](../../../docs/coding-standards.md)) requires every new
 cross-boundary output to be added to.
@@ -247,13 +246,21 @@ prints address-free status lines (one for the image, one for the direct map) via
 slide/bases only via `kprintln_serial!`; the Phase-9 init-thread report prints the thread id and
 priority on one `kprintln!` line and init's kernel stack top (a direct-map VA) on a separate
 `kprintln_serial!` line; the watchdog dump's lock-wait line prints the lock kind via `kprintln!` and
-the lock word's address only via `kprintln_serial!`; the bootloader's console (which also mirrors to
-the framebuffer) prints only the opaque `kaslr_flags`. The `KERNEL EXCEPTION` dumps and the riscv64
-`BUG: ecall return sepc` path print `rip`/`sepc` and register values via `kprintln!` and `fatal`
-halts only the faulting CPU, so on SMP they are userspace-recoverable, as is the non-fatal watchdog
-dump's direct-map TCB and endpoint pointers; closing them is
-[#440](https://github.com/kottlerg/seraph/issues/440), which also records the other mirrored
-kernel-VA sites the review found.
+the lock word's address (an image VA for a static lock, revealing the slide, or a direct-map VA for
+a slab-resident one) only via `kprintln_serial!`, and the rest of the watchdog dump (the per-CPU
+snapshot, the sleep list, the registry walk and its blocking-object decode) names threads by id and
+objects by kind, printing no pointer; the bootloader's console (which also mirrors to the
+framebuffer) prints only the opaque `kaslr_flags`. Paths that end in `fatal`, which halts only the
+faulting CPU (so on SMP the rest of the system, userspace included, keeps running), print an
+address-free header via `kprintln!` and every value that can be a kernel VA via `kprintln_serial!`:
+the x86-64 `KERNEL EXCEPTION` dump (`rip`, `cr2`, and the register file serial-only; the vector,
+error code, `cs`, and `rflags` on the console), the riscv64 `KERNEL EXCEPTION` dump (`sepc`,
+`stval`, `satp`, and the register file serial-only; `scause` and `sstatus` on the console), the
+riscv64 unknown-interrupt path (`sepc` serial-only), and the riscv64 `BUG: ecall return sepc` path
+(`sepc`, `ra`, `sp`, and `a7` serial-only). `free_seed_scratch`'s corrupt-lease report, which
+returns rather than halting, prints the lease's size and the seed's physical range via `kprintln!`
+and the lease pointer and its derived physical address, whose difference is the direct-map base,
+only via `kprintln_serial!`.
 
 ## Maintaining this inventory
 

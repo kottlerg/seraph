@@ -1079,9 +1079,11 @@ fn table_is_empty(table: &[PageTableEntry; 512]) -> bool
 /// never freed.
 ///
 /// Issues no TLB flush: the caller (`AddressSpace::unmap_region_pooled`)
-/// performs one invalidation for the whole span and holds `pt_lock` across
-/// it, so a freed frame cannot be popped and reused before that invalidation
-/// completes. When this returns a non-zero count, that invalidation must be a
+/// performs one invalidation for the whole span, plus one span invalidation
+/// each time the cleared frames overflow the frame-map release batch (its
+/// leaf callback's drain), and holds `pt_lock` across them, so a freed frame
+/// cannot be popped and reused before the closing invalidation completes.
+/// When this returns a non-zero count, that closing invalidation must be a
 /// full `rs1 = x0` fence on every hart (`flush_tlb_all` locally, the
 /// full-flush shootdown remotely): a per-VA `sfence.vma` or `sinval.vma`
 /// invalidates only leaf translations for that VA, so cached non-leaf entries

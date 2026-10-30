@@ -593,9 +593,11 @@ pub const MAP_READ: u64 = 0x1;
 /// intermediate page table that the cleared span leaves empty back to the
 /// address space's page-table growth pool, crediting `pt_growth_budget_bytes`
 /// (observable via `cap_info(CAP_INFO_ASPACE_PT_BUDGET)`). A single coarse
-/// TLB + paging-structure-cache shootdown covers the whole teardown. memmgr
-/// sets this at `UNREGISTER_REGION` to release a demand region's page tables
-/// mid-life rather than holding them until address-space death.
+/// TLB and paging-structure-cache shootdown closes the teardown, plus one span
+/// invalidation each time the cleared frames overflow the kernel's frame-map
+/// release batch. memmgr sets this at `UNREGISTER_REGION` to release a demand
+/// region's page tables mid-life rather than holding them until address-space
+/// death.
 ///
 /// Without this bit `SYS_MEM_UNMAP` clears only leaf PTEs and issues a per-page
 /// shootdown; intermediate tables persist until the address space is destroyed.

@@ -567,9 +567,10 @@ unsafe fn carve_page_into_bin(
 /// capacity: on SEED, sustained sub-page demand can leave too few contiguous
 /// pages for an x86-64 port-binding table, whose `sys_ioport_bind` then
 /// returns `OutOfMemory`. A carve happens only once the bump frontier cannot
-/// serve the class, so the cap is by then already at its shared budget:
-/// without the carve, the sub-page request fails instead. Caller must validate
-/// `tag == Memory && rights.contains(RETYPE)` before invoking.
+/// serve the class, so the bump frontier is by then spent and the class's
+/// free list empty: without the carve, the sub-page request fails instead.
+/// Caller must validate `tag == Memory && rights.contains(RETYPE)` before
+/// invoking.
 ///
 /// # Safety
 ///
@@ -946,13 +947,16 @@ pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
     let Some(phys) = virt.checked_sub(crate::mm::paging::direct_map_base())
     else
     {
+        // The pointer is a kernel VA: serial only
+        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+        // diagnostics).
         crate::kprintln!(
-            "SEED SCRATCH FREE CORRUPT: ptr=0x{:x} bytes=0x{:x} base=0x{:x} size=0x{:x} (out of range)",
-            virt,
+            "SEED SCRATCH FREE CORRUPT: bytes=0x{:x} base=0x{:x} size=0x{:x} (out of range)",
             bytes,
             seed.base,
             seed.size
         );
+        crate::kprintln_serial!("  ptr=0x{:x}", virt);
         return;
     };
 
@@ -961,24 +965,24 @@ pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
     // unbalance the lease refcount. The lease is leaked and the anomaly logged;
     // SEED is statically pinned (initial refcount 1 + Phase-7 pin), so the
     // imbalance is inert.
-    match seed_scratch_offset(phys, seed.base, seed.size, bytes)
+    if let Some(offset) = seed_scratch_offset(phys, seed.base, seed.size, bytes)
     {
-        Some(offset) =>
-        {
-            retype_free(seed, offset, bytes);
-            seed.header.dec_ref();
-        }
-        None =>
-        {
-            crate::kprintln!(
-                "SEED SCRATCH FREE CORRUPT: ptr=0x{:x} phys=0x{:x} bytes=0x{:x} base=0x{:x} size=0x{:x} (out of range)",
-                virt,
-                phys,
-                bytes,
-                seed.base,
-                seed.size
-            );
-        }
+        retype_free(seed, offset, bytes);
+        seed.header.dec_ref();
+    }
+    else
+    {
+        // The pointer is a kernel VA and, with `phys`, gives the direct-map
+        // base: both serial only
+        // (core/kernel/docs/cross-boundary-disclosure.md § Kernel console
+        // diagnostics).
+        crate::kprintln!(
+            "SEED SCRATCH FREE CORRUPT: bytes=0x{:x} base=0x{:x} size=0x{:x} (out of range)",
+            bytes,
+            seed.base,
+            seed.size
+        );
+        crate::kprintln_serial!("  ptr=0x{:x} phys=0x{:x}", virt, phys);
     }
 }
 
@@ -1128,8 +1132,8 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
 // Pins the ABI retype-cost constants `dispatch_for` debits (and the reclaim
 // path in cap/object.rs credits back) to the kernel's real object sizes. The
 // ABI EventQueue formula is checked against the kernel's layout formula at
-// the smallest, next and largest capacities `sys_cap_create_event_queue`
-// accepts (both bodies are affine in the capacity).
+// capacities 0, 1 and `EVENT_QUEUE_MAX_CAPACITY` (both bodies are affine in
+// the capacity, so two points and the largest pin them).
 const _: () = {
     assert!(
         24 + core::mem::size_of::<crate::ipc::endpoint::EndpointState>() as u64
@@ -1448,8 +1452,9 @@ mod tests
             let off = retype_allocate(&memory, BIN_512).unwrap();
             assert!(off < p && off.is_multiple_of(BIN_512));
         }
-        // The 384 bytes left above the bump cursor are counted but cannot
-        // hold a 512-byte slot.
+        // Only 384 bytes are counted as available now, so the next request
+        // fails at retype_allocate's `available_bytes < need` check (384 <
+        // 512), before any placement is tried.
         assert_eq!(memory.available_bytes.load(Ordering::Acquire), 384);
         assert_eq!(
             retype_allocate(&memory, BIN_512),

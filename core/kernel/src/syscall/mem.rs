@@ -364,7 +364,8 @@ pub fn sys_mem_unmap(tf: UserFrame) -> Result<u64, SyscallError>
     if flags & MEM_UNMAP_RECLAIM_PTS != 0
     {
         // Region teardown: clear the whole span and reclaim each now-empty
-        // intermediate page table to the AS's pool, with one coarse shootdown.
+        // intermediate page table to the AS's pool, with one coarse shootdown
+        // (plus the span invalidations of the frame-map release batch).
         // SAFETY: as_ptr is valid; aso_raw wraps it; the span is user-range
         // (validated above).
         unsafe { (*as_ptr).unmap_region_pooled(virt_base, page_count, &*aso_raw) };

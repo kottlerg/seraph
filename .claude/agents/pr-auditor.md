@@ -21,8 +21,8 @@ claims.
    Acceptance-checklist closure, § Milestones).
 
 2. Resolve scope from the parent's invocation: PR number, or current-branch
-   PR via `gh pr view --json number,body,title,headRefOid,baseRefName`, or local feature
-   branch if no PR exists yet.
+   PR via `gh pr view --json number,body,title,headRefOid,baseRefName`, or
+   local feature branch if no PR exists yet.
 
 3. Materialize the diff from the local tree: `git diff <base> <head>`, the
    base being `git merge-base <head> origin/<baseRefName>` (or

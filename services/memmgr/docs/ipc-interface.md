@@ -438,7 +438,8 @@ kernel clears the span's leaf PTEs and returns the now-empty intermediate page
 tables to that address space's PT growth budget (observable via
 `CAP_INFO_ASPACE_PT_BUDGET`; see
 [docs/capability-model.md](../../../docs/capability-model.md)
-§"Address-space and CSpace growth budgets") under a single coarse TLB shootdown.
+§"Address-space and CSpace growth budgets") under a single coarse TLB shootdown (plus one span
+invalidation each time the cleared frames overflow the kernel's frame-map release batch).
 memmgr then returns each backing frame to the free pool and frees the region (see
 [`memory-pool.md`](memory-pool.md) §"Reclamation"). The region
 occupies its own VA surface, so the span unmap touches only frames memmgr

@@ -1620,7 +1620,8 @@ fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
     let aspace_cap = record.aspace_cap;
     // Tear down the whole region span in the child AS in one call: clear every
     // leaf PTE and reclaim the now-empty intermediate page tables to the child's
-    // PT growth pool (one coarse shootdown). Done before re-pooling the backing
+    // PT growth pool (one coarse shootdown, plus the span invalidations of the
+    // kernel's frame-map release batch). Done before re-pooling the backing
     // frames so no frame is re-handed to a future fault before its PTE clears.
     // SAFETY: `aspace_cap` is a client address space procmgr delegated
     // (`DELEGATE_ASPACE`), never memmgr's own, so the unmap changes nothing

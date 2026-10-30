@@ -409,6 +409,14 @@ unsafe fn kernel_entry_post_rebase(
     // mapping or the Phase-7 drain.
     unsafe { mm::frame_map::init(allocator, dram_bottom, dram_top) };
 
+    // Carve the CSpace registry arena (one id per DRAM page,
+    // core/kernel/docs/capability-internals.md § CSpace Registry) for the same
+    // reason: before the Phase-7 drain, while the buddy still holds 1 MiB
+    // blocks, and before Phase 7 registers the root CSpace.
+    // SAFETY: the single boot thread, once, after Phase 3 and before the
+    // Phase-7 drain and any CSpace id allocation.
+    unsafe { cap::init_cspace_registry(allocator) };
+
     // Initialize the CPU-to-hardware-id mapping (wakeup and shootdown IPI
     // targets, and the riscv64 PLIC context of each hart). Before Phase 5:
     // riscv64 `interrupts::init` routes the PLIC to the BSP's hart id.

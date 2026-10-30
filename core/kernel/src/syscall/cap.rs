@@ -767,9 +767,10 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
     let Some(id) = alloc_cspace_id()
     else
     {
-        // Free list empty and high-water at MAX_CSPACES — namespace
-        // exhausted. Surface to userspace; the retype carve is undone below
-        // by `retype_free` after the error return.
+        // Every id the registry arena backs is live (one per DRAM page,
+        // so unreachable while the caller's pages still pay for this one).
+        // Surface to userspace; the retype carve is undone below by
+        // `retype_free` after the error return.
         retype_free(memory, offset, entry.raw_bytes);
         return Err(SyscallError::OutOfMemory);
     };
@@ -811,8 +812,8 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
             core::ptr::drop_in_place(cs_kobj_ptr);
             core::ptr::drop_in_place(cs_ptr);
         }
-        // The id was drawn but never registered; return it or the 4096-id
-        // namespace drains one entry per failed create.
+        // The id was drawn but never registered; return it or the
+        // registry leaks one id per failed create.
         crate::cap::free_cspace_id(id);
         retype_free(memory, offset, entry.raw_bytes);
         return Err(SyscallError::OutOfMemory);
@@ -866,8 +867,8 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
             // Roll back the registry slot and its id, the memory inc_ref,
             // the in-place wrapper/CSpace constructions, and the retype
             // carve. Without this rollback, a failed `insert_cap` would leak
-            // a live CSpace registry entry and its id (one of 4096 — a
-            // caller with a full slot pool could drain the namespace), leave
+            // a live CSpace registry entry and its id (a caller with a
+            // full slot pool could drain the registry one id per attempt), leave
             // `memory_obj_nn`'s refcount permanently incremented, and
             // surrender the carved offset back to the retype allocator only
             // when the source memory itself was dec_ref'd to zero.

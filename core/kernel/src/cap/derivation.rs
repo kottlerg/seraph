@@ -684,8 +684,8 @@ unsafe fn unlink_free_collect(id: SlotId) -> Option<NonNull<KernelObjectHeader>>
 /// Each test registers heap-backed CSpaces in the shared test registry
 /// under hard-coded ids unique to that test (the registry is a
 /// process-wide static and `cargo test` runs tests concurrently). The
-/// ids sit far above anything the test-stub `alloc_cspace_id` counter
-/// reaches in this suite and below the recycle test's reserved top id;
+/// ids sit far above any fresh id the host-test registry's `alloc_cspace_id`
+/// hands out in this suite and below the recycle test's reserved top id;
 /// nothing enforces that — a new direct-registration test must pick an
 /// unused id. Leaked Boxes are acceptable — the process exits after the
 /// run. The global DERIVATION_LOCK is taken for fidelity with the

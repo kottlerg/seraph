@@ -674,6 +674,18 @@ code at the failure site:
   [capability-internals.md](../core/kernel/docs/capability-internals.md)
   § Storage: Hybrid Two-Level Radix) that no memory donation can lift.
 
+Both bounds meet general allocations first: every `CSpace` keeps its
+last `CSPACE_IPC_RECV_RESERVE` free slots (one message's
+`MSG_CAP_SLOTS_MAX`) for IPC capability transfer. A `cap_create_*`,
+`cap_copy`, `cap_derive`, split, or `cap_move` that would take one of
+them fails as above while the reserved slots stay free, so a process
+whose general slots are exhausted still receives a cap-bearing message
+or reply. Received caps then spend the reserve, and only a receive into
+a spent reserve fails before blocking (see
+[capability-internals.md](../core/kernel/docs/capability-internals.md)
+§ IPC Receive Reserve and [ipc-design.md](ipc-design.md)
+§ Receive-Failure Policy).
+
 There is no per-CSpace slot quota: capacity below the structural
 ceiling is exactly what the paid pool backs. Containing a child's cap
 footprint is a memory-distribution decision — a supervisor that wants a
@@ -684,7 +696,12 @@ Seeding policy: a CSpace creation site seeds the pool for the process's
 expected startup population; a process that outgrows its seed self-funds
 via augment-mode `cap_create_cspace` against its own `CSpace` cap. The
 current backed capacity is observable via `SYS_CAP_INFO`
-(`CAP_INFO_CSPACE_CAPACITY`); subtracting slots used yields headroom.
+(`CAP_INFO_CSPACE_CAPACITY`); subtracting slots used
+(`CAP_INFO_CSPACE_USED`) and the IPC receive reserve yields the headroom
+general allocations may still take. ruststd's `fund_cspace_slot_budget`
+tops that headroom up from memmgr, and the long-lived services hold it
+above a low-water mark: procmgr through ruststd, memmgr from its own
+pool, and fatfs once, for its page cache, at start.
 
 An `AddressSpace`'s intermediate page tables are also returned to its
 growth budget mid-life when a region is torn down: `SYS_MEM_UNMAP` with

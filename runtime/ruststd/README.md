@@ -159,6 +159,32 @@ death post has already landed), or leaks until process exit when the reaper coul
 the thread at spawn (no death queue, no free slot, or the observer bind failed) or the kernel
 dropped the death post because the process's death queue (128 entries) was full.
 
+### CSpace slot headroom
+
+A `CSpace` keeps its last `CSPACE_IPC_RECV_RESERVE` free slots for IPC capability transfer, so
+its general allocations (`cap_create_*`, `cap_copy`, `cap_derive`, splits) fail with
+`OutOfMemory` before its receives do
+([docs/capability-model.md](../../docs/capability-model.md) § Address-space and CSpace growth
+budgets). Two functions of `std::os::seraph` keep that headroom funded, mirroring the page-table
+budget's `fund_aspace_pt_budget`:
+
+```rust
+let free = std::os::seraph::cspace_slot_headroom(self_cspace);   // slots above the reserve
+std::os::seraph::fund_cspace_slot_budget(self_cspace, n);       // ensure >= n of them
+```
+
+- **`cspace_slot_headroom`** returns `CAP_INFO_CSPACE_CAPACITY` less `CAP_INFO_CSPACE_USED`
+  and the reserve.
+- **`fund_cspace_slot_budget`** requests a memmgr-backed Memory cap through the object slab
+  when the headroom falls short of `n`, and donates it with augment-mode `cap_create_cspace`:
+  one page per `CSPACE_SLOTS_PER_PAGE` missing slots, plus one. It returns `false` if the
+  headroom still falls short after the funding rounds.
+
+A process calls it before a known burst of capability acquisitions; fatfs funds its page cache
+this way. A long-lived service calls it when the headroom drops below a low-water mark, as
+procmgr does ([services/procmgr/README.md](../../services/procmgr/README.md) § CSpace
+headroom).
+
 ### Bootstrap-cross-boundary VAs
 
 `_start` reads `ProcessInfo` to learn the IPC-buffer VA, the memmgr/procmgr

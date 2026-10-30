@@ -160,6 +160,38 @@ allocation, and when `remove_from_free_list` unlinks a specific index);
 
 This gives amortised O(1) allocation and O(1) deallocation.
 
+### IPC Receive Reserve
+
+Every `CSpace` keeps its last `IPC_RECV_RESERVE` free slots (`CSPACE_IPC_RECV_RESERVE` in the
+ABI, equal to `MSG_CAP_SLOTS_MAX`, one message's worth) for IPC capability transfer:
+
+- **General allocations** (`allocate_slot` and the inserts built on it: every `cap_create_*`,
+  `cap_copy`, `cap_derive`, split, kernel boot mint, and `cap_move`, including the
+  explicit-placement `insert_cap_at`) grow the `CSpace` until more than `IPC_RECV_RESERVE`
+  slots are free before they take one. When the pool cannot grow they fail with the grow's
+  error (`PoolExhausted`, `OutOfMemory` to userspace; `OutOfSlots`, `QuotaExceeded`, at the
+  structural ceiling) while the reserved slots stay free.
+- **IPC transfer allocations** (`allocate_transfer_slot`, through `insert_cap_transfer` and
+  `cap::transfer::Placement::IpcTransfer`, the placement `transfer_caps` uses for call, receive,
+  and reply delivery) take any free slot, the reserved ones included, and grow only when none is
+  free.
+
+`pre_allocate(n)` grows until `n` slots are free, counting reserved ones. So the worst-case
+`pre_allocate(MSG_CAP_SLOTS_MAX)` that `SYS_IPC_RECV` makes before parking succeeds without
+growth on a `CSpace` whose general slots are exhausted, and the received caps land in the
+reserve. The degradation is reserve-then-wedge:
+
+1. General allocations fail first, visibly, with `OutOfMemory`.
+2. Receives keep working, and received caps take reserved slots, until transfers have spent the
+   reserve.
+3. Only then does a receive fail before parking, the condition
+   [docs/ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure Policy handles.
+
+Freeing a slot reopens general allocation once more than the reserve is free. The reserve is not
+a lock: two threads sharing a `CSpace` can both receive into it, and a transfer that finds it
+spent fails as any destination shortage does. A process keeps general headroom above the reserve
+by funding its pool (`std::os::seraph::fund_cspace_slot_budget`).
+
 ---
 
 ## CSpace Registry (`cap/registry.rs`)
@@ -1036,7 +1068,8 @@ transfer_caps(sender_tcb, handles, receiver_tcb):
             TCB carries (cspace_id, cspace_epoch); either gone → refuse
         validate every handle: distinct, occupied, generation current,
             not pinned
-        pre-allocate len(handles) slots in the receiver's CSpace
+        pre-allocate len(handles) slots in the receiver's CSpace,
+            the IPC receive reserve included
         begin every move (insert dst, pin both, first batch)
     drive each move that did not finish, one batch per hold
     deliver the destination handles

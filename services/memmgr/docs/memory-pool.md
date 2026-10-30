@@ -167,6 +167,28 @@ accounting) and never breaks the identity.
 
 ---
 
+## CSpace headroom
+
+memmgr's own `CSpace` takes a slot for every frame split and inner derivation a grant makes, so a
+burst of requests draws slots fast. A `CSpace` keeps its last `CSPACE_IPC_RECV_RESERVE` free
+slots for IPC capability transfer, so general allocations fail before receives do
+([docs/capability-model.md](../../../docs/capability-model.md) § Address-space and CSpace growth
+budgets). memmgr cannot request memory from anyone else, so it funds its own slot-page pool:
+
+- Before every receive, memmgr reads its headroom: `CAP_INFO_CSPACE_CAPACITY` less
+  `CAP_INFO_CSPACE_USED` and the reserve.
+- Below `CSPACE_LOW_WATER` (256 slots), it pulls a contiguous run of `CSPACE_TOPUP_PAGES` (16)
+  frames from the pool, or a single frame when no such run is free, and donates it with
+  augment-mode `cap_create_cspace` against its own `CSpace` cap. It then deletes the frame's cap:
+  the donation holds its own reference on the frame.
+- A refused donation pushes the frame back to the pool, and the check runs again before the next
+  receive.
+
+Like arena pages, donated frames leave the free pool for good and stay in `pool_total` as
+memmgr-owned metadata, so the all-RAM-accounted identity is unaffected.
+
+---
+
 ## Reclamation
 
 On `PROCESS_DIED(badge)` from procmgr:

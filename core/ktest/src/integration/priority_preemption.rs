@@ -102,7 +102,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "priority_preemption: cap_create_notification (done) failed")?;
 
     // ── Hog: spawn at low priority (5), pin to CPU 0. ─────────────────────────
-    let hog = crate::spawn::new_child_at(ctx, sched_cap, 5)
+    let mut hog = crate::spawn::new_child_at(ctx, sched_cap, 5)
         .map_err(|_| "priority_preemption: spawn::new_child_at (hog) failed")?;
     let hog_done = cap_copy(done, hog.cs, RIGHTS_NOTIFY)
         .map_err(|_| "priority_preemption: cap_copy hog_done failed")?;
@@ -118,7 +118,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     thread_sleep(20).map_err(|_| "priority_preemption: sleep after hog failed")?;
 
     // ── Elevated: spawn at elevated priority (20), pin to CPU 0. ─────────────
-    let elevated = crate::spawn::new_child_at(ctx, sched_cap, 20)
+    let mut elevated = crate::spawn::new_child_at(ctx, sched_cap, 20)
         .map_err(|_| "priority_preemption: spawn::new_child_at (elevated) failed")?;
     let elevated_done = cap_copy(done, elevated.cs, RIGHTS_NOTIFY)
         .map_err(|_| "priority_preemption: cap_copy elevated_done failed")?;
@@ -182,10 +182,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         seen |= notification_wait_timeout(done, 5_000).unwrap_or(0);
     }
 
-    cap_delete(hog.th).ok();
-    cap_delete(hog.cs).ok();
-    cap_delete(elevated.th).ok();
-    cap_delete(elevated.cs).ok();
+    hog.delete_thread().ok();
+    hog.delete_cspace().ok();
+    elevated.delete_thread().ok();
+    elevated.delete_cspace().ok();
     cap_delete(done).ok();
     Ok(())
 }

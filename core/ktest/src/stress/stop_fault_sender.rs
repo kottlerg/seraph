@@ -63,12 +63,11 @@ use ipc::recv_guard::RecvGuard;
 use syscall::{
     cap_create_endpoint, cap_create_notification, cap_create_thread, cap_delete, ipc_buffer_set,
     mem_map, mem_unmap, notification_send, notification_wait, system_info, thread_configure,
-    thread_exit, thread_set_affinity, thread_set_fault_handler, thread_sleep, thread_start,
-    thread_stop,
+    thread_exit, thread_set_affinity, thread_sleep, thread_start, thread_stop,
 };
 use syscall_abi::{
-    EXIT_FAULT_BASE, EXIT_VOLUNTARY, FAULT_CLASS_ALL, FAULT_LABEL, FAULT_REPLY_KILL,
-    FAULT_REPLY_RESUME, MAP_WRITABLE, SyscallError, SystemInfoType,
+    EXIT_FAULT_BASE, EXIT_VOLUNTARY, FAULT_LABEL, FAULT_REPLY_KILL, FAULT_REPLY_RESUME,
+    MAP_WRITABLE, SyscallError, SystemInfoType,
 };
 
 use crate::tally::{BadTally, log_error};
@@ -474,7 +473,7 @@ fn spawn_faulter(ctx: &TestContext, parts: &mut Parts) -> TestResult
         .faulter
         .ok_or("stress::stop_fault_sender: no faulter")?;
     let ep = parts.ep.ok_or("stress::stop_fault_sender: no endpoint")?;
-    thread_set_fault_handler(th, ep, FAULT_BADGE, FAULT_CLASS_ALL)
+    crate::bind_fault_handler(th, ep, FAULT_BADGE)
         .map_err(|_| "stress::stop_fault_sender: thread_set_fault_handler failed")?;
     thread_start(th).map_err(|_| "stress::stop_fault_sender: start faulter failed")
 }

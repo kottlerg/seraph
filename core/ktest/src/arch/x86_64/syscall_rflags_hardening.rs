@@ -31,7 +31,6 @@
 //!      (`arch::current::cpu::debug_assert_kernel_entry_flags`), and this
 //!      phase's syscall trips that assertion if SYSCALL entry left AC set.
 
-use syscall::cap_delete;
 use syscall_abi::{EXIT_FAULT_BASE, SYS_GETRANDOM, SYS_THREAD_YIELD};
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -201,7 +200,7 @@ unsafe fn run_child(
     stack: *const ChildStack,
 ) -> Result<u64, &'static str>
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "syscall_rflags_hardening: spawn::new_child failed")?;
     // SAFETY: the caller's contract dedicates `stack` to this child.
     let reason =
@@ -210,8 +209,8 @@ unsafe fn run_child(
             .and_then(|()| {
                 crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS))
             });
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     reason
 }
 

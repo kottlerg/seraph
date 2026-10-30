@@ -141,7 +141,7 @@ pub fn configure_start(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for configure_start failed")?;
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::configure_start: spawn::new_child failed")?;
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for configure_start failed")?;
@@ -160,9 +160,13 @@ pub fn configure_start(ctx: &TestContext) -> TestResult
         return Err("thread did not send expected bits (expected 0xBEEF)");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after configure_start failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after configure_start failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after configure_start failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after configure_start failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after configure_start failed")?;
     Ok(())
 }
 
@@ -188,7 +192,7 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
         .map_err(|_| "create_notification (ready) for stop_read_regs failed")?;
     let block = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (block) for stop_read_regs failed")?;
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::stop_read_regs: spawn::new_child failed")?;
     let child_ready = cap_copy(ready, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy (ready) for stop_read_regs failed")?;
@@ -234,10 +238,14 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
         return Err("rip/sepc is zero after thread_stop — TrapFrame not valid");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after stop_read_regs failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after stop_read_regs failed")?;
     cap_delete(ready).map_err(|_| "cap_delete ready after stop_read_regs failed")?;
     cap_delete(block).map_err(|_| "cap_delete block after stop_read_regs failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after stop_read_regs failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after stop_read_regs failed")?;
     Ok(())
 }
 
@@ -250,7 +258,7 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
         .map_err(|_| "create_notification (ready) for double-stop test failed")?;
     let block = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (block) for double-stop test failed")?;
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::stop_again_invalid_state: spawn::new_child failed")?;
     let child_ready = cap_copy(ready, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy (ready) for double-stop test failed")?;
@@ -274,10 +282,14 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
         return Err("double thread_stop did not return InvalidState");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after double-stop test failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after double-stop test failed")?;
     cap_delete(ready).map_err(|_| "cap_delete ready after double-stop test failed")?;
     cap_delete(block).map_err(|_| "cap_delete block after double-stop test failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after double-stop test failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after double-stop test failed")?;
     Ok(())
 }
 
@@ -308,7 +320,7 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
         .map_err(|_| "create_notification (ready) for write_regs_resume failed")?;
     let block = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (block) for write_regs_resume failed")?;
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::write_regs_resume: spawn::new_child failed")?;
     let child_ready = cap_copy(ready, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy (ready) for write_regs_resume failed")?;
@@ -358,10 +370,14 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
         return Err("phase2_entry did not send expected value 0x2 after write_regs resume");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after write_regs_resume failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after write_regs_resume failed")?;
     cap_delete(ready).map_err(|_| "cap_delete ready after write_regs_resume failed")?;
     cap_delete(block).map_err(|_| "cap_delete block after write_regs_resume failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after write_regs_resume failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after write_regs_resume failed")?;
     Ok(())
 }
 
@@ -371,7 +387,7 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
 /// requested level. ktest holds the root cap spanning the full range.
 pub fn set_priority_in_band(ctx: &TestContext) -> TestResult
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::set_priority_in_band: spawn::new_child failed")?;
 
     // 5 and PRIORITY_MAX (30) are both inside the root band [1, PRIORITY_MAX].
@@ -380,8 +396,12 @@ pub fn set_priority_in_band(ctx: &TestContext) -> TestResult
     thread_set_priority(child.th, 30, ctx.sched_control_cap)
         .map_err(|_| "thread_set_priority(30, root) failed")?;
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after set_priority_in_band failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_priority_in_band failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after set_priority_in_band failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after set_priority_in_band failed")?;
     Ok(())
 }
 
@@ -390,7 +410,7 @@ pub fn set_priority_in_band(ctx: &TestContext) -> TestResult
 /// holds no `SchedControl`.)
 pub fn set_priority_no_cap_err(ctx: &TestContext) -> TestResult
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::set_priority_no_cap_err: spawn::new_child failed")?;
 
     let err = thread_set_priority(child.th, 5, 0);
@@ -399,8 +419,12 @@ pub fn set_priority_no_cap_err(ctx: &TestContext) -> TestResult
         return Err("thread_set_priority(5, no_cap) should fail without SchedControl");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after no_cap test failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after no_cap test failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after no_cap test failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after no_cap test failed")?;
     Ok(())
 }
 
@@ -417,7 +441,7 @@ pub fn sched_split_enforces_bands(ctx: &TestContext) -> TestResult
     let (lower, upper) = sched_split(root_copy, 21)
         .map_err(|_| "thread::sched_split_enforces_bands: sched_split failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::sched_split_enforces_bands: spawn::new_child failed")?;
 
     // Lower band [1, 20]: 20 succeeds, 21 rejected.
@@ -434,8 +458,12 @@ pub fn sched_split_enforces_bands(ctx: &TestContext) -> TestResult
         return Err("upper band [21,30] must reject priority 20");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after sched_split test failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after sched_split test failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after sched_split test failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after sched_split test failed")?;
     cap_delete(lower).map_err(|_| "cap_delete lower band failed")?;
     cap_delete(upper).map_err(|_| "cap_delete upper band failed")?;
     Ok(())
@@ -520,7 +548,7 @@ pub fn sched_split_rollback_on_full_cspace(ctx: &TestContext) -> TestResult
         .map_err(|_| "thread::split_rollback: cap_info(baseline) failed")?;
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "thread::split_rollback: create done failed")?;
-    let child =
+    let mut child =
         crate::spawn::new_child(ctx).map_err(|_| "thread::split_rollback: new_child failed")?;
     let child_sched = cap_copy(ctx.sched_control_cap, child.cs, RIGHTS_ALL)
         .map_err(|_| "thread::split_rollback: cap_copy sched failed")?;
@@ -536,8 +564,12 @@ pub fn sched_split_rollback_on_full_cspace(ctx: &TestContext) -> TestResult
     .map_err(|_| "thread::split_rollback: configure_and_start failed")?;
 
     let bits = notification_wait(done).map_err(|_| "thread::split_rollback: wait done failed")?;
-    cap_delete(child.th).map_err(|_| "thread::split_rollback: cap_delete(thread) failed")?;
-    cap_delete(child.cs).map_err(|_| "thread::split_rollback: cap_delete(cspace) failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "thread::split_rollback: cap_delete(thread) failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "thread::split_rollback: cap_delete(cspace) failed")?;
     cap_delete(done).ok();
     if bits != 0x1
     {
@@ -681,21 +713,25 @@ pub fn create_priority_args(ctx: &TestContext) -> TestResult
 /// `thread_set_affinity` with a valid CPU ID succeeds.
 pub fn set_affinity_valid(ctx: &TestContext) -> TestResult
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::set_affinity_valid: spawn::new_child failed")?;
 
     // CPU 0 is always valid on any boot configuration.
     thread_set_affinity(child.th, 0).map_err(|_| "thread_set_affinity(0) failed")?;
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after set_affinity_valid failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_affinity_valid failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after set_affinity_valid failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after set_affinity_valid failed")?;
     Ok(())
 }
 
 /// `thread_set_affinity` with an out-of-range CPU ID returns `InvalidArgument`.
 pub fn set_affinity_invalid_err(ctx: &TestContext) -> TestResult
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::set_affinity_invalid_err: spawn::new_child failed")?;
 
     // CPU 999 is beyond any reasonable CPU count.
@@ -705,8 +741,12 @@ pub fn set_affinity_invalid_err(ctx: &TestContext) -> TestResult
         return Err("thread_set_affinity(999) did not return InvalidArgument");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after set_affinity_invalid test failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_affinity_invalid test failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after set_affinity_invalid test failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after set_affinity_invalid test failed")?;
     Ok(())
 }
 
@@ -715,7 +755,7 @@ pub fn set_affinity_invalid_err(ctx: &TestContext) -> TestResult
 /// than its low word (`0x1_0000_0000` would otherwise pin to CPU 0).
 pub fn set_affinity_wide_arg_err(ctx: &TestContext) -> TestResult
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::set_affinity_wide_arg_err: spawn::new_child failed")?;
 
     // SAFETY: raw_syscall3's four conditions hold. SYS_THREAD_SET_AFFINITY takes
@@ -735,9 +775,62 @@ pub fn set_affinity_wide_arg_err(ctx: &TestContext) -> TestResult
         return Err("thread_set_affinity(0x1_0000_0000) did not return InvalidArgument");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after set_affinity_wide_arg_err failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_affinity_wide_arg_err failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after set_affinity_wide_arg_err failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after set_affinity_wide_arg_err failed")?;
     Ok(())
+}
+
+/// A raw `SYS_THREAD_SET_FAULT_HANDLER` whose reserved badge word is nonzero
+/// returns `InvalidArgument`, and the same call with the word 0 binds: a binder
+/// cannot supply the fault badge, which is the bound Endpoint cap's own
+/// derivation badge (docs/fault-handling.md § Security).
+pub fn set_fault_handler_badge_arg_err(ctx: &TestContext) -> TestResult
+{
+    let ep = syscall::cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "thread::set_fault_handler_badge_arg_err: cap_create_endpoint failed")?;
+    let Ok(mut child) = crate::spawn::new_child(ctx)
+    else
+    {
+        cap_delete(ep).ok();
+        return Err("thread::set_fault_handler_badge_arg_err: spawn::new_child failed");
+    };
+
+    let bind = |badge: u64| {
+        // SAFETY: raw_syscall4's four conditions hold. SYS_THREAD_SET_FAULT_HANDLER
+        // takes no pointer and uses no IPC buffer; it changes no mapping; besides
+        // the registers the call clobbers in this thread, the only thread it
+        // changes is the child, which is never started; and it changes no
+        // CSpace slot.
+        unsafe {
+            syscall::raw_syscall4(
+                syscall_abi::SYS_THREAD_SET_FAULT_HANDLER,
+                u64::from(child.th),
+                u64::from(ep),
+                badge,
+                syscall_abi::FAULT_CLASS_ALL,
+            )
+        }
+    };
+    let forged = bind(0xF0_96ED);
+    let plain = bind(0);
+    let unbound = syscall::thread_set_fault_handler(child.th, 0, syscall_abi::FAULT_CLASS_ALL);
+
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
+    cap_delete(ep).ok();
+    if forged != SyscallError::InvalidArgument as i64
+    {
+        return Err("thread::set_fault_handler_badge_arg_err: nonzero badge word not refused");
+    }
+    if plain != 0
+    {
+        return Err("thread::set_fault_handler_badge_arg_err: zero badge word refused");
+    }
+    unbound.map_err(|_| "thread::set_fault_handler_badge_arg_err: unbind failed")
 }
 
 /// A raw `SYS_THREAD_SET_PRIORITY` whose priority register exceeds 255 returns
@@ -745,7 +838,7 @@ pub fn set_affinity_wide_arg_err(ctx: &TestContext) -> TestResult
 /// covers (0x105 would otherwise set priority 5).
 pub fn set_priority_wide_arg_err(ctx: &TestContext) -> TestResult
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::set_priority_wide_arg_err: spawn::new_child failed")?;
 
     // SAFETY: raw_syscall3's four conditions hold. SYS_THREAD_SET_PRIORITY takes
@@ -765,8 +858,12 @@ pub fn set_priority_wide_arg_err(ctx: &TestContext) -> TestResult
         return Err("thread_set_priority(0x105) did not return InvalidArgument");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after set_priority_wide_arg_err failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_priority_wide_arg_err failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after set_priority_wide_arg_err failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after set_priority_wide_arg_err failed")?;
     Ok(())
 }
 
@@ -810,7 +907,7 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
         .map_err(|_| "create_notification (ready) for configure_running_thread_err failed")?;
     let block = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (block) for configure_running_thread_err failed")?;
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::configure_running_thread_err: spawn::new_child failed")?;
     let child_ready = cap_copy(ready, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy (ready) for configure_running_thread_err failed")?;
@@ -837,10 +934,14 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
 
     // Stop the blocked child before cleanup.
     thread_stop(child.th).ok();
-    cap_delete(child.th).map_err(|_| "cap_delete th after configure_running_thread_err failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after configure_running_thread_err failed")?;
     cap_delete(ready).map_err(|_| "cap_delete ready after configure_running_thread_err failed")?;
     cap_delete(block).map_err(|_| "cap_delete block after configure_running_thread_err failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after configure_running_thread_err failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after configure_running_thread_err failed")?;
 
     if err.is_ok()
     {
@@ -856,7 +957,7 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
 /// Priority 0 is reserved (`core/kernel/docs/scheduler.md` § Priority Levels).
 pub fn set_priority_zero_err(ctx: &TestContext) -> TestResult
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::set_priority_zero_err: spawn::new_child failed")?;
 
     let err = thread_set_priority(child.th, 0, 0);
@@ -865,8 +966,12 @@ pub fn set_priority_zero_err(ctx: &TestContext) -> TestResult
         return Err("thread_set_priority(0) did not return InvalidArgument");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after set_priority_zero_err failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_priority_zero_err failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after set_priority_zero_err failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after set_priority_zero_err failed")?;
     Ok(())
 }
 
@@ -875,7 +980,7 @@ pub fn set_priority_zero_err(ctx: &TestContext) -> TestResult
 /// Priority 31 is reserved (`core/kernel/docs/scheduler.md` § Priority Levels).
 pub fn set_priority_31_err(ctx: &TestContext) -> TestResult
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::set_priority_31_err: spawn::new_child failed")?;
 
     let err = thread_set_priority(child.th, 31, 0);
@@ -884,8 +989,12 @@ pub fn set_priority_31_err(ctx: &TestContext) -> TestResult
         return Err("thread_set_priority(31) did not return InvalidArgument");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after set_priority_31_err failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_priority_31_err failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after set_priority_31_err failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after set_priority_31_err failed")?;
     Ok(())
 }
 
@@ -909,7 +1018,7 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
 
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for affinity_bind_cpu1 failed")?;
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::affinity_bind_cpu1: spawn::new_child failed")?;
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for affinity_bind_cpu1 failed")?;
@@ -936,9 +1045,13 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
         return Err("affinity thread did not send expected bits (expected 0xC1A1)");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after affinity_bind_cpu1 failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after affinity_bind_cpu1 failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after affinity_bind_cpu1 failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after affinity_bind_cpu1 failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after affinity_bind_cpu1 failed")?;
     Ok(())
 }
 
@@ -1006,7 +1119,7 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for affinity_migrate_ready_queued failed")?;
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::affinity_migrate_ready_queued: spawn::new_child failed")?;
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for affinity_migrate_ready_queued failed")?;
@@ -1060,9 +1173,13 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
         return Err("Ready-thread migration did not land on CPU 1");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after affinity_migrate_ready_queued failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after affinity_migrate_ready_queued failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after affinity_migrate_ready_queued failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after affinity_migrate_ready_queued failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after affinity_migrate_ready_queued failed")?;
     Ok(())
 }
 
@@ -1091,7 +1208,7 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
 
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for affinity_migrate_running failed")?;
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::affinity_migrate_running: spawn::new_child failed")?;
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for affinity_migrate_running failed")?;
@@ -1148,9 +1265,13 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
     MIGRATE_SHOULD_EXIT.store(1, Ordering::Relaxed);
     notification_wait(sig).map_err(|_| "notification_wait for migrate_spinner exit failed")?;
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after affinity_migrate_running failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after affinity_migrate_running failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after affinity_migrate_running failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after affinity_migrate_running failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after affinity_migrate_running failed")?;
     Ok(())
 }
 
@@ -1158,7 +1279,7 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
 
 /// Helper: spawn `n` CPU-bound spinners, initially pinned to `initial_cpu`,
 /// then change each one's affinity to `final_affinity`. Returns the
-/// (thread, cspace, notification) cap triples for cleanup.
+/// (guard, notification) pairs for cleanup.
 ///
 /// Each spinner publishes its current CPU into `BALANCE_OBSERVED_CPU[i]`
 /// on every loop iteration and exits when `BALANCE_SHOULD_EXIT` is set.
@@ -1167,9 +1288,9 @@ fn balance_spawn_spinners(
     n: usize,
     initial_cpu: u32,
     final_affinity: u32,
-) -> Result<[(u32, u32, u32); BALANCE_MAX_SPINNERS], &'static str>
+) -> Result<[(crate::spawn::SpawnedChild, u32); BALANCE_MAX_SPINNERS], &'static str>
 {
-    let mut triples = [(0u32, 0u32, 0u32); BALANCE_MAX_SPINNERS];
+    let mut triples = [const { (crate::spawn::SpawnedChild::EMPTY, 0u32) }; BALANCE_MAX_SPINNERS];
 
     for i in 0..n
     {
@@ -1197,16 +1318,16 @@ fn balance_spawn_spinners(
         }
         .map_err(|_| "balance: configure_and_start_pinned failed")?;
 
-        triples[i] = (child.th, child.cs, sig);
+        triples[i] = (child, sig);
     }
 
     // Once started, relax (or fully clear) the affinity. Active migration
     // does NOT trigger here because `AFFINITY_ANY` is the no-migration path
     // — the goal is exactly to leave the threads queued on `initial_cpu`
     // for the periodic balancer to redistribute.
-    for (th, _, _) in triples.iter().take(n)
+    for (child, _) in triples.iter().take(n)
     {
-        thread_set_affinity(*th, final_affinity)
+        thread_set_affinity(child.th, final_affinity)
             .map_err(|_| "balance: relax thread_set_affinity failed")?;
     }
     Ok(triples)
@@ -1214,20 +1335,27 @@ fn balance_spawn_spinners(
 
 /// Helper: tear down the spinners spawned by `balance_spawn_spinners`.
 /// Signals exit, drains each spinner's `notification_send`, and deletes the caps.
-fn balance_teardown(triples: &[(u32, u32, u32); BALANCE_MAX_SPINNERS], n: usize) -> TestResult
+fn balance_teardown(
+    triples: &mut [(crate::spawn::SpawnedChild, u32); BALANCE_MAX_SPINNERS],
+    n: usize,
+) -> TestResult
 {
     BALANCE_SHOULD_EXIT.store(1, Ordering::Relaxed);
-    for &(_, _, sig) in triples.iter().take(n)
+    for &(_, sig) in triples.iter().take(n)
     {
         // Each spinner sends 0xC0FE before exiting.
         notification_wait(sig).map_err(|_| "balance: notification_wait teardown failed")?;
     }
     BALANCE_SHOULD_EXIT.store(0, Ordering::Relaxed);
-    for &(th, cs, sig) in triples.iter().take(n)
+    for (child, sig) in triples.iter_mut().take(n)
     {
-        cap_delete(th).map_err(|_| "balance: cap_delete th failed")?;
-        cap_delete(sig).map_err(|_| "balance: cap_delete sig failed")?;
-        cap_delete(cs).map_err(|_| "balance: cap_delete cs failed")?;
+        child
+            .delete_thread()
+            .map_err(|_| "balance: cap_delete th failed")?;
+        cap_delete(*sig).map_err(|_| "balance: cap_delete sig failed")?;
+        child
+            .delete_cspace()
+            .map_err(|_| "balance: cap_delete cs failed")?;
     }
     Ok(())
 }
@@ -1257,7 +1385,7 @@ pub fn load_balancer_redistributes_skewed(ctx: &TestContext) -> TestResult
         BALANCE_MAX_SPINNERS,
     );
     // `u32::MAX` is the AFFINITY_ANY sentinel (see SYS_THREAD_SET_AFFINITY).
-    let triples = balance_spawn_spinners(ctx, n, 0, u32::MAX)?;
+    let mut triples = balance_spawn_spinners(ctx, n, 0, u32::MAX)?;
 
     // Sleep in short increments so the parent is Blocked and off CPU 0's run
     // queue, leaving the spinners and the idle CPUs' per-tick pull balancer
@@ -1284,7 +1412,7 @@ pub fn load_balancer_redistributes_skewed(ctx: &TestContext) -> TestResult
         syscall::thread_sleep(4).ok();
     }
 
-    balance_teardown(&triples, n)?;
+    balance_teardown(&mut triples, n)?;
     if !converged
     {
         return Err("load balancer did not redistribute work off CPU 0");
@@ -1311,7 +1439,7 @@ pub fn load_balancer_skips_pinned(ctx: &TestContext) -> TestResult
     let n = 4usize.min(BALANCE_MAX_SPINNERS);
 
     // Pin to CPU 0 AND keep the pin (final affinity == 0).
-    let triples = balance_spawn_spinners(ctx, n, 0, 0)?;
+    let mut triples = balance_spawn_spinners(ctx, n, 0, 0)?;
 
     // Give the balancer plenty of wallclock time to misbehave. Sleeping
     // blocks the parent, so the spinners and the idle CPUs both run
@@ -1327,7 +1455,7 @@ pub fn load_balancer_skips_pinned(ctx: &TestContext) -> TestResult
         obs != u32::MAX && obs != 0
     });
 
-    balance_teardown(&triples, n)?;
+    balance_teardown(&mut triples, n)?;
     if violated
     {
         return Err("load balancer migrated a hard-pinned thread off its CPU");
@@ -1357,7 +1485,7 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
 
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for affinity_respected failed")?;
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::affinity_respected: spawn::new_child failed")?;
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for affinity_respected failed")?;
@@ -1385,9 +1513,13 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
         return Err("affinity thread did not send expected bits (expected 0xC1A1)");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after affinity_respected failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after affinity_respected failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after affinity_respected failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after affinity_respected failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after affinity_respected failed")?;
     Ok(())
 }
 
@@ -1412,7 +1544,7 @@ pub fn default_affinity_runs(ctx: &TestContext) -> TestResult
 
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for default_affinity_runs failed")?;
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::default_affinity_runs: spawn::new_child failed")?;
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for default_affinity_runs failed")?;
@@ -1436,9 +1568,13 @@ pub fn default_affinity_runs(ctx: &TestContext) -> TestResult
         return Err("default affinity thread did not send expected bits (expected 0xBEEF)");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after default_affinity_runs failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after default_affinity_runs failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after default_affinity_runs failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after default_affinity_runs failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after default_affinity_runs failed")?;
     Ok(())
 }
 
@@ -1634,7 +1770,7 @@ pub fn bind_notification_fires_on_exit(ctx: &TestContext) -> TestResult
     let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "thread::bind_notification_fires_on_exit: event_queue_create failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::bind_notification_fires_on_exit: spawn::new_child failed")?;
 
     // Bind BEFORE the child starts so the observer is registered when the
@@ -1659,8 +1795,8 @@ pub fn bind_notification_fires_on_exit(ctx: &TestContext) -> TestResult
         return Err("thread::bind_notification_fires_on_exit: wrong correlator on death payload");
     }
 
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     cap_delete(eq).ok();
     Ok(())
 }
@@ -1689,7 +1825,7 @@ pub fn configure_non_user_address_err(ctx: &TestContext) -> TestResult
     /// In the upper half: outside user space in every supported paging mode.
     const UPPER_HALF: u64 = 1 << 63;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::configure_non_user_address_err: spawn::new_child failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE_NON_USER));
     let entry = blocker_entry as *const () as u64;
@@ -1723,9 +1859,11 @@ pub fn configure_non_user_address_err(ctx: &TestContext) -> TestResult
         ),
     ];
 
-    cap_delete(child.th)
+    child
+        .delete_thread()
         .map_err(|_| "cap_delete th after configure_non_user_address_err failed")?;
-    cap_delete(child.cs)
+    child
+        .delete_cspace()
         .map_err(|_| "cap_delete cs after configure_non_user_address_err failed")?;
 
     for (result, case) in cases

@@ -30,11 +30,11 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_wait,
-    thread_read_regs, thread_set_fault_handler, thread_write_regs,
+    thread_read_regs, thread_write_regs,
 };
 use syscall_abi::{
-    FAULT_CLASS_ALL, FAULT_EXC_ILLEGAL_INSTRUCTION, FAULT_KIND_EXCEPTION, FAULT_LABEL,
-    FAULT_REPLY_RESUME, RIGHTS_ALL,
+    FAULT_EXC_ILLEGAL_INSTRUCTION, FAULT_KIND_EXCEPTION, FAULT_LABEL, FAULT_REPLY_RESUME,
+    RIGHTS_ALL,
 };
 
 use crate::arch::IP_OFFSET;
@@ -62,13 +62,13 @@ pub fn run(ctx: &TestContext) -> TestResult
     let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "fault_exception_redirect: cap_create_notification failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "fault_exception_redirect: spawn::new_child failed")?;
     let child_sig = cap_copy(sig, child.cs, RIGHTS_ALL)
         .map_err(|_| "fault_exception_redirect: cap_copy(sig) failed")?;
     RECOVERY_SIG.store(child_sig, Ordering::Release);
 
-    thread_set_fault_handler(child.th, ep, FAULT_BADGE, FAULT_CLASS_ALL)
+    crate::bind_fault_handler(child.th, ep, FAULT_BADGE)
         .map_err(|_| "fault_exception_redirect: thread_set_fault_handler failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
@@ -130,8 +130,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     notification_wait(sig).map_err(|_| "fault_exception_redirect: notification_wait failed")?;
 
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     cap_delete(ep).ok();
     cap_delete(sig).ok();
     Ok(())

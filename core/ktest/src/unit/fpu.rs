@@ -102,8 +102,10 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
 
     let th_a = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs_a, 0, 0)
         .map_err(|_| "cap_create_thread a for fpu::preempt_isolation failed")?;
+    let mut child_a = crate::spawn::SpawnedChild { th: th_a, cs: cs_a };
     let th_b = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs_b, 0, 0)
         .map_err(|_| "cap_create_thread b for fpu::preempt_isolation failed")?;
+    let mut child_b = crate::spawn::SpawnedChild { th: th_b, cs: cs_b };
 
     let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
     let stack_b = ChildStack::top(core::ptr::addr_of!(STACK_B));
@@ -150,12 +152,20 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
     let a_mis = A_MISMATCHES.load(Ordering::Acquire);
     let b_mis = B_MISMATCHES.load(Ordering::Acquire);
 
-    cap_delete(th_a).map_err(|_| "cap_delete th_a after fpu::preempt_isolation failed")?;
-    cap_delete(th_b).map_err(|_| "cap_delete th_b after fpu::preempt_isolation failed")?;
+    child_a
+        .delete_thread()
+        .map_err(|_| "cap_delete th_a after fpu::preempt_isolation failed")?;
+    child_b
+        .delete_thread()
+        .map_err(|_| "cap_delete th_b after fpu::preempt_isolation failed")?;
     cap_delete(sig_a).map_err(|_| "cap_delete sig_a after fpu::preempt_isolation failed")?;
     cap_delete(sig_b).map_err(|_| "cap_delete sig_b after fpu::preempt_isolation failed")?;
-    cap_delete(cs_a).map_err(|_| "cap_delete cs_a after fpu::preempt_isolation failed")?;
-    cap_delete(cs_b).map_err(|_| "cap_delete cs_b after fpu::preempt_isolation failed")?;
+    child_a
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs_a after fpu::preempt_isolation failed")?;
+    child_b
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs_b after fpu::preempt_isolation failed")?;
 
     if a_mis != 0
     {
@@ -251,6 +261,7 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
 
     let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
         .map_err(|_| "cap_create_thread for preempt_isolation_cross_cpu failed")?;
+    let mut child = crate::spawn::SpawnedChild { th, cs };
 
     // Pin to CPU 0 initially: the child must run and load its
     // extended-state registers on CPU 0 before the migration step.
@@ -291,14 +302,18 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
     let mismatches = CROSS_MISMATCHES.load(Ordering::Acquire);
     let observed_cpu = CROSS_OBSERVED_CPU.load(Ordering::Acquire);
 
-    cap_delete(th).map_err(|_| "cap_delete th after preempt_isolation_cross_cpu failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "cap_delete th after preempt_isolation_cross_cpu failed")?;
     cap_delete(sig_ready)
         .map_err(|_| "cap_delete sig_ready after preempt_isolation_cross_cpu failed")?;
     cap_delete(sig_resume)
         .map_err(|_| "cap_delete sig_resume after preempt_isolation_cross_cpu failed")?;
     cap_delete(sig_done)
         .map_err(|_| "cap_delete sig_done after preempt_isolation_cross_cpu failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after preempt_isolation_cross_cpu failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "cap_delete cs after preempt_isolation_cross_cpu failed")?;
 
     crate::log_u64(
         "fpu::preempt_isolation_cross_cpu observed_cpu=",

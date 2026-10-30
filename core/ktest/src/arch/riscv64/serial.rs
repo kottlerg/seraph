@@ -95,6 +95,39 @@ unsafe fn serial_hw_init()
     }
 }
 
+/// The UART's PLIC source on QEMU's virt machine (`UART0_IRQ`).
+pub const UART_IRQ: u32 = 10;
+
+/// UART interrupt-enable register offset, and its THRI bit
+/// (transmit-holding-register-empty interrupt enable).
+const IER: usize = 1;
+const IER_THRI: u8 = 0x02;
+
+/// Raise one UART transmit-empty interrupt: clear IER, then set its THRI bit.
+/// The holding register is empty whenever ktest is not writing, so setting
+/// THRI asserts the line again.
+///
+/// Called only once [`init`] has returned `true`.
+pub fn raise_tx_interrupt()
+{
+    // SAFETY: UART_VA set during init; IER is a register in the mapped region.
+    let base = unsafe { UART_VA } as *mut u8;
+    // SAFETY: as above; volatile writes program the 16550 IER.
+    unsafe {
+        core::ptr::write_volatile(base.add(IER), 0x00);
+        core::ptr::write_volatile(base.add(IER), IER_THRI);
+    }
+}
+
+/// Disable every UART interrupt source (IER = 0), the state [`init`] leaves.
+pub fn quiet_tx_interrupt()
+{
+    // SAFETY: UART_VA set during init; IER is a register in the mapped region.
+    let base = unsafe { UART_VA } as *mut u8;
+    // SAFETY: as above.
+    unsafe { core::ptr::write_volatile(base.add(IER), 0x00) };
+}
+
 /// Write a single byte, spinning until the transmit buffer is empty.
 ///
 /// Called only once [`init`] has returned `true`.

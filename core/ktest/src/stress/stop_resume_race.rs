@@ -152,12 +152,12 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::stop_resume_race: cap_create_notification failed")?;
 
         // ── VICTIM: spin Running on victim_cpu; signal on done. ──────────────
-        let victim =
+        let mut victim =
             spawn::new_child(ctx).map_err(|_| "stress::stop_resume_race: spawn victim failed")?;
         let victim_done = cap_copy(done, victim.cs, RIGHTS_SIGNAL)
             .map_err(|_| "stress::stop_resume_race: cap_copy victim done failed")?;
         // SAFETY: stack index 0 is the victim's; sequential cycles never alias
-        // (cap_delete(victim.th) drains the spinner before the next cycle).
+        // (victim.delete_thread() drains the spinner before the next cycle).
         let victim_stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
         // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
@@ -173,7 +173,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "stress::stop_resume_race: start victim failed")?;
 
         // ── STOPPER: CONTROL on victim + signal on done; pinned stop_cpu. ────
-        let stopper =
+        let mut stopper =
             spawn::new_child(ctx).map_err(|_| "stress::stop_resume_race: spawn stopper failed")?;
         let stopper_victim = cap_copy(victim.th, stopper.cs, RIGHTS_THREAD_CONTROL)
             .map_err(|_| "stress::stop_resume_race: cap_copy stopper victim failed")?;
@@ -198,7 +198,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "stress::stop_resume_race: start stopper failed")?;
 
         // ── STARTER: CONTROL on victim + signal on done; pinned start_cpu. ───
-        let starter =
+        let mut starter =
             spawn::new_child(ctx).map_err(|_| "stress::stop_resume_race: spawn starter failed")?;
         let starter_victim = cap_copy(victim.th, starter.cs, RIGHTS_THREAD_CONTROL)
             .map_err(|_| "stress::stop_resume_race: cap_copy starter victim failed")?;
@@ -258,17 +258,23 @@ pub fn run(ctx: &TestContext) -> TestResult
         // Exited state (which no concurrent start can resume), so the drain
         // deschedules the spinner and completes before the next cycle reuses its
         // stack.
-        cap_delete(stopper.th)
+        stopper
+            .delete_thread()
             .map_err(|_| "stress::stop_resume_race: cap_delete stopper th failed")?;
-        cap_delete(starter.th)
+        starter
+            .delete_thread()
             .map_err(|_| "stress::stop_resume_race: cap_delete starter th failed")?;
-        cap_delete(stopper.cs)
+        stopper
+            .delete_cspace()
             .map_err(|_| "stress::stop_resume_race: cap_delete stopper cs failed")?;
-        cap_delete(starter.cs)
+        starter
+            .delete_cspace()
             .map_err(|_| "stress::stop_resume_race: cap_delete starter cs failed")?;
-        cap_delete(victim.th)
+        victim
+            .delete_thread()
             .map_err(|_| "stress::stop_resume_race: cap_delete victim th failed")?;
-        cap_delete(victim.cs)
+        victim
+            .delete_cspace()
             .map_err(|_| "stress::stop_resume_race: cap_delete victim cs failed")?;
         cap_delete(done).map_err(|_| "stress::stop_resume_race: cap_delete done failed")?;
     }

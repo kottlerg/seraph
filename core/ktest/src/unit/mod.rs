@@ -124,6 +124,10 @@ pub fn run_all(ctx: &TestContext)
         "cap::cspace_self_delete_stops_caller",
         cap::cspace_self_delete_stops_caller(ctx)
     );
+    run_test!(
+        "cap::spawned_child_drop_stops_running_child",
+        cap::spawned_child_drop_stops_running_child(ctx)
+    );
 
     // ── Capability inspection (SYS_CAP_INFO) ──────────────────────────────────
     run_test!(
@@ -494,6 +498,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "thread::set_affinity_wide_arg_err",
         thread::set_affinity_wide_arg_err(ctx)
+    );
+    run_test!(
+        "thread::set_fault_handler_badge_arg_err",
+        thread::set_fault_handler_badge_arg_err(ctx)
     );
     run_test!(
         "thread::set_priority_wide_arg_err",

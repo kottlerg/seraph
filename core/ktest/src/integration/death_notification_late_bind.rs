@@ -96,7 +96,7 @@ fn late_bind_after_death(
     expected_reason: u64,
 ) -> TestResult
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "death_notification_late_bind: spawn::new_child failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
@@ -128,8 +128,8 @@ fn late_bind_after_death(
     }
 
     cap_delete(eq).ok();
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 
@@ -137,7 +137,7 @@ fn late_bind_after_death(
 /// death walk must post exactly once.
 fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
 {
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "death_notification_late_bind: spawn::new_child (control) failed")?;
     let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "death_notification_late_bind: event_queue_create (control) failed")?;
@@ -166,8 +166,8 @@ fn bind_before_start_fires_once(ctx: &TestContext) -> TestResult
     }
 
     cap_delete(eq).ok();
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 

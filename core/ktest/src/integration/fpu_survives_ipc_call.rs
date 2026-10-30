@@ -116,7 +116,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "fpu_survives_ipc_call: cap_create_notification failed")?;
 
-    let child =
+    let mut child =
         spawn::new_child(ctx).map_err(|_| "fpu_survives_ipc_call: spawn::new_child failed")?;
     let child_ep = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "fpu_survives_ipc_call: cap_copy ep failed")?;
@@ -165,8 +165,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mismatches = MISMATCHES.load(Ordering::Acquire);
     let observed_cpu = OBSERVED_CPU.load(Ordering::Acquire);
 
-    cap_delete(child.th).map_err(|_| "fpu_survives_ipc_call: cap_delete child.th failed")?;
-    cap_delete(child.cs).map_err(|_| "fpu_survives_ipc_call: cap_delete child.cs failed")?;
+    child
+        .delete_thread()
+        .map_err(|_| "fpu_survives_ipc_call: cap_delete child.th failed")?;
+    child
+        .delete_cspace()
+        .map_err(|_| "fpu_survives_ipc_call: cap_delete child.cs failed")?;
     cap_delete(ep).map_err(|_| "fpu_survives_ipc_call: cap_delete ep failed")?;
     cap_delete(done).map_err(|_| "fpu_survives_ipc_call: cap_delete done failed")?;
 

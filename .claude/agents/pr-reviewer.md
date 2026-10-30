@@ -19,9 +19,14 @@ discipline below has been applied end-to-end.
    binding.
 
 2. Read the scope information the parent supplied (PR number, branch, or
-   diff reference). Materialize the diff: `gh pr diff <N>` when a PR exists,
-   else `git diff <base>...HEAD` against the supplied base, else
-   `git diff master...HEAD`.
+   diff reference). Materialize the diff from the local tree: when a PR
+   exists, `git diff <base> <head>`, with the head and base ref from
+   `gh pr view <N> --json headRefOid,baseRefName` and the base from
+   `git merge-base <head> origin/<baseRefName>` (a supplied merge base and
+   head take precedence); else `git diff <base>...HEAD` against the supplied
+   base, else `git diff master...HEAD`. Never `gh pr diff` or the `files`
+   field of `gh pr view`: GitHub caps them (300 files or 20000 lines for the
+   diff, 100 files for the field).
 
 2a. If the parent supplied a scope block (shard files, changed items,
     governing documents or, in `delta` mode, the documents that state facts

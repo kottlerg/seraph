@@ -66,11 +66,10 @@ use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, cap_info, ipc_buffer_set,
     notification_send, notification_wait_timeout, system_info, thread_exit, thread_set_affinity,
-    thread_set_fault_handler,
 };
 use syscall_abi::{
-    CAP_INFO_TAG_RIGHTS, FAULT_CLASS_ALL, FAULT_LABEL, FAULT_REPLY_RESUME, RIGHTS_ALL,
-    RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, SyscallError, SystemInfoType,
+    CAP_INFO_TAG_RIGHTS, FAULT_LABEL, FAULT_REPLY_RESUME, RIGHTS_ALL, RIGHTS_EP_RECEIVE,
+    RIGHTS_EP_SEND_GRANT, SyscallError, SystemInfoType,
 };
 
 use crate::tally::{BadTally, await_report};
@@ -241,8 +240,6 @@ struct Round
     gift: u32,
     caller: Option<spawn::SpawnedChild>,
     server: Option<spawn::SpawnedChild>,
-    /// Whether the race already deleted the caller's Thread capability.
-    caller_th_deleted: bool,
 }
 
 /// One round: arm a reply binding, race the reply against the caller's
@@ -264,10 +261,9 @@ fn one_round(ctx: &TestContext, cycle: u32, outcomes: &mut Outcomes) -> TestResu
         gift: 0,
         caller: None,
         server: None,
-        caller_th_deleted: false,
     };
     let verdict = race(ctx, &mut round, kind, cycle);
-    let reaped = reap(&round);
+    let reaped = reap(&mut round);
     let acc = verdict?;
     reaped?;
     classify(acc, outcomes)
@@ -288,7 +284,7 @@ fn race(ctx: &TestContext, round: &mut Round, kind: u32, cycle: u32) -> Result<u
     let (c_ep, c_done) = (c_ep?, c_done?);
     let entry: extern "C" fn(u64) -> ! = if kind == KIND_FAULT
     {
-        thread_set_fault_handler(th, round.ep, FAULT_BADGE, FAULT_CLASS_ALL)
+        crate::bind_fault_handler(th, round.ep, FAULT_BADGE)
             .map_err(|_| "stress::reply_caller_delete: thread_set_fault_handler failed")?;
         faulter_entry
     }
@@ -337,8 +333,11 @@ fn race(ctx: &TestContext, round: &mut Round, kind: u32, cycle: u32) -> Result<u
     {
         core::hint::spin_loop();
     }
-    cap_delete(th).map_err(|_| "stress::reply_caller_delete: delete caller thread failed")?;
-    round.caller_th_deleted = true;
+    round
+        .caller
+        .as_mut()
+        .map_or(Ok(()), spawn::SpawnedChild::delete_thread)
+        .map_err(|_| "stress::reply_caller_delete: delete caller thread failed")?;
 
     await_report(
         round.done,
@@ -399,21 +398,18 @@ fn start_server(ctx: &TestContext, round: &mut Round, kind: u32, cycle: u32) -> 
 /// Delete every capability the round created. Deleting a Thread stops it
 /// wherever it is, so the next round can reuse the stacks and buffers even
 /// after a failed round.
-fn reap(round: &Round) -> TestResult
+fn reap(round: &mut Round) -> TestResult
 {
     let mut deleted: [Result<(), i64>; 7] = [Ok(()); 7];
-    if let Some(server) = round.server.as_ref()
+    if let Some(server) = round.server.as_mut()
     {
-        deleted[0] = cap_delete(server.th);
-        deleted[1] = cap_delete(server.cs);
+        deleted[0] = server.delete_thread();
+        deleted[1] = server.delete_cspace();
     }
-    if let Some(caller) = round.caller.as_ref()
+    if let Some(caller) = round.caller.as_mut()
     {
-        if !round.caller_th_deleted
-        {
-            deleted[2] = cap_delete(caller.th);
-        }
-        deleted[3] = cap_delete(caller.cs);
+        deleted[2] = caller.delete_thread();
+        deleted[3] = caller.delete_cspace();
     }
     if round.gift != 0
     {

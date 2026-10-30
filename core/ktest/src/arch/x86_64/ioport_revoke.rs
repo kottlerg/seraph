@@ -54,15 +54,13 @@ fn check(ctx: &TestContext, held: u32) -> TestResult
 {
     let granted = cap_derive(held, syscall::RIGHTS_ALL)
         .map_err(|_| "integration::ioport_revoke: cap_derive(granted) failed")?;
-    let Ok(child) = crate::spawn::new_child(ctx)
+    let Ok(mut child) = crate::spawn::new_child(ctx)
     else
     {
         cap_delete(granted).ok();
         return Err("integration::ioport_revoke: spawn::new_child failed");
     };
     let abandon = |why: &'static str| -> TestResult {
-        cap_delete(child.cs).ok();
-        cap_delete(child.th).ok();
         cap_delete(granted).ok();
         Err(why)
     };
@@ -108,8 +106,8 @@ fn check(ctx: &TestContext, held: u32) -> TestResult
         return abandon("integration::ioport_revoke: cap_revoke failed");
     }
     let reason = crate::spawn::wait_until_exited(child.th, polls)?;
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     if reason != EXIT_FAULT_BASE + GP_VECTOR
     {
         return Err("integration::ioport_revoke: the reader did not die of #GP");

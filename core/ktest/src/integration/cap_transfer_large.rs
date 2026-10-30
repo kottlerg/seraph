@@ -122,6 +122,7 @@ fn run_round(ctx: &TestContext, round: usize, order: Order) -> TestResult
 
     let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
         .map_err(|_| "integration::cap_transfer_large: cap_create_thread failed")?;
+    let mut child = crate::spawn::SpawnedChild { th, cs };
     // SAFETY: one stack per round; the round's child is the only user.
     let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(CHILD_STACKS[round]) });
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
@@ -174,12 +175,12 @@ fn run_round(ctx: &TestContext, round: usize, order: Order) -> TestResult
     }
 
     cap_delete(recv_sig).ok();
-    cap_delete(th).ok();
+    child.delete_thread().ok();
     cap_delete(ep).ok();
     cap_delete(test_sig).ok();
     cap_delete(sync_sig).ok();
     cap_delete(go_sig).ok();
-    cap_delete(cs).ok();
+    child.delete_cspace().ok();
     Ok(())
 }
 

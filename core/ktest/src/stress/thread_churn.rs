@@ -34,7 +34,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     for _i in 0..iterations
     {
-        let child = spawn::new_child(ctx).map_err(|_| "thread_churn: spawn::new_child failed")?;
+        let mut child =
+            spawn::new_child(ctx).map_err(|_| "thread_churn: spawn::new_child failed")?;
         let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
             .map_err(|_| "thread_churn: cap_copy failed")?;
 
@@ -55,8 +56,12 @@ pub fn run(ctx: &TestContext) -> TestResult
             return Err("thread_churn: child sent unexpected bits");
         }
 
-        cap_delete(child.th).map_err(|_| "thread_churn: cap_delete thread failed")?;
-        cap_delete(child.cs).map_err(|_| "thread_churn: cap_delete cspace failed")?;
+        child
+            .delete_thread()
+            .map_err(|_| "thread_churn: cap_delete thread failed")?;
+        child
+            .delete_cspace()
+            .map_err(|_| "thread_churn: cap_delete cspace failed")?;
     }
 
     cap_delete(done).map_err(|_| "thread_churn: cap_delete done failed")?;

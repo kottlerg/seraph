@@ -66,7 +66,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         |_| "cap_move_into_fresh_cspace_then_ipc: cap_create_notification (done) failed",
     )?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "cap_move_into_fresh_cspace_then_ipc: spawn::new_child failed")?;
 
     let child_done = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
@@ -109,8 +109,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Wait for the child to exit cleanly.
     notification_wait(done).ok();
 
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     cap_delete(ep_parent).ok();
     cap_delete(done).ok();
     Ok(())

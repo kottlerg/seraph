@@ -420,7 +420,7 @@ impl Phase
         Ok(true)
     }
 
-    fn teardown(self) -> TestResult
+    fn teardown(mut self) -> TestResult
     {
         // Revoke deletes the children's copies (derivation children of
         // `obj_cap`); the delete then frees the object, interrupting any
@@ -429,11 +429,13 @@ impl Phase
             .map_err(|_| "integration::queued_waiters_fifo: revoke object failed")?;
         cap_delete(self.obj_cap)
             .map_err(|_| "integration::queued_waiters_fifo: del object failed")?;
-        for child in self.children.iter().flatten()
+        for child in self.children.iter_mut().flatten()
         {
-            cap_delete(child.th)
+            child
+                .delete_thread()
                 .map_err(|_| "integration::queued_waiters_fifo: reap child thread failed")?;
-            cap_delete(child.cs)
+            child
+                .delete_cspace()
                 .map_err(|_| "integration::queued_waiters_fifo: reap child cspace failed")?;
         }
         cap_delete(self.done).map_err(|_| "integration::queued_waiters_fifo: del done failed")

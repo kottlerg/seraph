@@ -26,13 +26,15 @@
 //!
 //! The mitigation is cooperative, and it narrows that window rather than
 //! closing it: workers check `EXIT_REQUESTED` between yields and call
-//! `thread_exit` themselves, so a deleted worker is at most finishing its
-//! last two syscalls (the done send and the exit). By the time the parent
-//! calls `cap_delete`, every worker has sent its done bit and is about to
-//! exit (it may not yet be Exited: the bit precedes `thread_exit`), or
-//! failed to report within the parent's bounded wait (logged); either may
-//! still be running when deleted, which the kernel's Thread teardown
-//! drains.
+//! `thread_exit` themselves, so a deleted worker that reported is at most
+//! finishing its last two syscalls (the done send and the exit). By the time
+//! the parent calls `cap_delete`, every worker has sent its done bit and is
+//! about to exit (it may not yet be Exited: the bit precedes `thread_exit`),
+//! or failed to report within the parent's bounded wait (logged). A worker
+//! that failed to report may never have seen `EXIT_REQUESTED` and may still
+//! be in its `thread_yield` loop when it is deleted, the condition the hang
+//! above arose in. Either may still be running when deleted, which the
+//! kernel's Thread teardown drains.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -68,8 +70,9 @@ static SPINNER_ARGS: spawn::ArgBlock<SpinnerArgs, MAX_PINNED> = spawn::ArgBlock:
 
 /// Set by the parent before its `cap_delete` cleanup. Workers poll this
 /// between yields and exit cleanly when set; the parent then waits, bounded,
-/// on the per-worker exited-bits before deleting any Thread cap, so
-/// `cap_delete` reaps a running thread only after a worker failed to report.
+/// on the per-worker exited-bits before deleting any Thread cap, so each
+/// deleted Thread has either reported and is about to exit (it may still be
+/// running), or failed to report within the bound (logged).
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Worker entry: `notification_send` this worker's unique bit on `ready`, then
@@ -134,14 +137,13 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
         return;
     };
 
-    let mut threads = [0u32; MAX_PINNED];
-    let mut cspaces = [0u32; MAX_PINNED];
+    let mut workers = [const { spawn::SpawnedChild::EMPTY }; MAX_PINNED];
     let mut spawned: usize = 0;
 
     // Spawn one pinned spinner per non-ktest CPU.
     for i in 0..pin_count
     {
-        let Ok(child) = spawn::new_child(ctx)
+        let Ok(mut child) = spawn::new_child(ctx)
         else
         {
             break;
@@ -149,15 +151,15 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
         let Ok(child_ready) = syscall::cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         else
         {
-            cap_delete(child.th).ok();
-            cap_delete(child.cs).ok();
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
             break;
         };
         let Ok(child_done) = syscall::cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         else
         {
-            cap_delete(child.th).ok();
-            cap_delete(child.cs).ok();
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
             break;
         };
         // SAFETY: bench tier runs sequentially; this is the only use of
@@ -184,12 +186,11 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
         }
         .is_err()
         {
-            cap_delete(child.th).ok();
-            cap_delete(child.cs).ok();
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
             break;
         }
-        threads[i] = child.th;
-        cspaces[i] = child.cs;
+        workers[i] = child;
         spawned += 1;
     }
 
@@ -209,7 +210,7 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     {
         // Cooperative teardown even on the early-return path.
         EXIT_REQUESTED.store(true, Ordering::Release);
-        teardown(&threads, &cspaces, spawned, ready, done);
+        teardown(&mut workers, spawned, ready, done);
         return;
     };
 
@@ -276,7 +277,7 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     // done bit (bounded), then cap_delete (each Thread is about to exit, or
     // missed the wait; either may still be running).
     EXIT_REQUESTED.store(true, Ordering::Release);
-    teardown(&threads, &cspaces, spawned, ready, done);
+    teardown(&mut workers, spawned, ready, done);
 
     if let Some(mean) = total.checked_div(completed)
     {
@@ -293,23 +294,17 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 /// exit, though it may not yet be Exited. If a worker does not report
 /// within the bound, the timeout is logged. Either way a Thread may still
 /// be running when deleted, which the kernel's Thread teardown drains.
-fn teardown(
-    threads: &[u32; MAX_PINNED],
-    cspaces: &[u32; MAX_PINNED],
-    spawned: usize,
-    ready: u32,
-    done: u32,
-)
+fn teardown(workers: &mut [spawn::SpawnedChild; MAX_PINNED], spawned: usize, ready: u32, done: u32)
 {
     await_worker_bits(
         done,
         spawned,
         "ktest: bench  tlb: a worker never reported done",
     );
-    for i in 0..spawned
+    for worker in &mut workers[..spawned]
     {
-        cap_delete(threads[i]).ok();
-        cap_delete(cspaces[i]).ok();
+        worker.delete_thread().ok();
+        worker.delete_cspace().ok();
     }
     cap_delete(ready).ok();
     cap_delete(done).ok();
@@ -546,12 +541,11 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         }
     }
 
-    let mut threads = [0u32; MAX_PINNED];
-    let mut cspaces = [0u32; MAX_PINNED];
+    let mut workers = [const { spawn::SpawnedChild::EMPTY }; MAX_PINNED];
     let mut spawned = 0usize;
     for i in 0..allocated
     {
-        let Ok(child) = spawn::new_child(ctx)
+        let Ok(mut child) = spawn::new_child(ctx)
         else
         {
             break;
@@ -559,29 +553,29 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         let Ok(child_ready) = syscall::cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         else
         {
-            cap_delete(child.th).ok();
-            cap_delete(child.cs).ok();
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
             break;
         };
         let Ok(child_done) = syscall::cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         else
         {
-            cap_delete(child.th).ok();
-            cap_delete(child.cs).ok();
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
             break;
         };
         let Ok(child_memory) = syscall::cap_copy(memory_caps[i], child.cs, syscall::RIGHTS_ALL)
         else
         {
-            cap_delete(child.th).ok();
-            cap_delete(child.cs).ok();
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
             break;
         };
         let Ok(child_aspace) = syscall::cap_copy(ctx.aspace_cap, child.cs, syscall::RIGHTS_ALL)
         else
         {
-            cap_delete(child.th).ok();
-            cap_delete(child.cs).ok();
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
             break;
         };
 
@@ -613,12 +607,11 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         }
         .is_err()
         {
-            cap_delete(child.th).ok();
-            cap_delete(child.cs).ok();
+            child.delete_thread().ok();
+            child.delete_cspace().ok();
             break;
         }
-        threads[i] = child.th;
-        cspaces[i] = child.cs;
+        workers[i] = child;
         spawned += 1;
     }
 
@@ -635,7 +628,7 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     // Cooperative teardown: wait every worker's done bit (each is about to
     // thread_exit), then delete caps; a worker may still be running when
     // deleted (its bit precedes thread_exit, or it missed the bounded wait).
-    teardown(&threads, &cspaces, spawned, ready, done);
+    teardown(&mut workers, spawned, ready, done);
 
     for (i, fr) in memory_caps.iter().enumerate().take(allocated)
     {

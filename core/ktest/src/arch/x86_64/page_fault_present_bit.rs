@@ -52,12 +52,11 @@ use boot_protocol::layout::{
 };
 use ipc::IpcMessage;
 use syscall::{
-    cap_create_endpoint, cap_delete, mem_map, mem_unmap, thread_read_regs,
-    thread_set_fault_handler, thread_write_regs,
+    cap_create_endpoint, cap_delete, mem_map, mem_unmap, thread_read_regs, thread_write_regs,
 };
 use syscall_abi::{
-    FAULT_ACCESS_PRESENT, FAULT_ACCESS_READ, FAULT_ACCESS_WRITE, FAULT_CLASS_ALL, FAULT_KIND_VM,
-    FAULT_LABEL, FAULT_REPLY_RESUME, MAP_READ,
+    FAULT_ACCESS_PRESENT, FAULT_ACCESS_READ, FAULT_ACCESS_WRITE, FAULT_KIND_VM, FAULT_LABEL,
+    FAULT_REPLY_RESUME, MAP_READ,
 };
 
 use super::IP_OFFSET;
@@ -132,14 +131,14 @@ fn handle_child(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "page_fault_present_bit: cap_create_endpoint failed")?;
-    let Ok(child) = crate::spawn::new_child(ctx)
+    let Ok(mut child) = crate::spawn::new_child(ctx)
     else
     {
         cap_delete(ep).ok();
         return Err("page_fault_present_bit: spawn::new_child failed");
     };
 
-    let result = thread_set_fault_handler(child.th, ep, FAULT_BADGE, FAULT_CLASS_ALL)
+    let result = crate::bind_fault_handler(child.th, ep, FAULT_BADGE)
         .map_err(|_| "page_fault_present_bit: thread_set_fault_handler failed")
         .and_then(|()| {
             let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
@@ -157,8 +156,8 @@ fn handle_child(ctx: &TestContext) -> TestResult
             crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS)).map(|_| ())
         });
 
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     cap_delete(ep).ok();
     result
 }

@@ -250,7 +250,7 @@ fn with_child(ctx: &TestContext, parts: &Parts) -> TestResult
             }
         })
         .and_then(|()| rounds(&child, parts.done));
-    let released = release(&child);
+    let released = release(child);
     ran?;
     released
 }
@@ -391,15 +391,15 @@ fn read_word(regs: &[u8; BUF], offset: usize) -> u64
 /// Stop the child, so its deletion tears down a thread off its CPU, then
 /// delete its Thread and `CSpace` caps. A stop refused with `InvalidState`
 /// finds the child already stopped (a failed round) or dead.
-fn release(child: &SpawnedChild) -> TestResult
+fn release(mut child: SpawnedChild) -> TestResult
 {
     let stopped = match thread_stop(child.th)
     {
         Ok(()) => true,
         Err(e) => e == SyscallError::InvalidState as i64,
     };
-    let thread_deleted = cap_delete(child.th).is_ok();
-    let cspace_deleted = cap_delete(child.cs).is_ok();
+    let thread_deleted = child.delete_thread().is_ok();
+    let cspace_deleted = child.delete_cspace().is_ok();
     if stopped && thread_deleted && cspace_deleted
     {
         Ok(())

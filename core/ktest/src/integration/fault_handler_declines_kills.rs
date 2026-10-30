@@ -18,8 +18,8 @@
 //! bound rather than hanging.
 
 use ipc::IpcMessage;
-use syscall::{cap_create_endpoint, cap_delete, thread_set_fault_handler};
-use syscall_abi::{EXIT_FAULT_BASE, FAULT_CLASS_ALL, FAULT_LABEL, FAULT_REPLY_KILL};
+use syscall::{cap_create_endpoint, cap_delete};
+use syscall_abi::{EXIT_FAULT_BASE, FAULT_LABEL, FAULT_REPLY_KILL};
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -42,9 +42,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "fault_handler_declines_kills: cap_create_endpoint failed")?;
 
-    let child = crate::spawn::new_child(ctx)
+    let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "fault_handler_declines_kills: spawn::new_child failed")?;
-    thread_set_fault_handler(child.th, ep, FAULT_BADGE, FAULT_CLASS_ALL)
+    crate::bind_fault_handler(child.th, ep, FAULT_BADGE)
         .map_err(|_| "fault_handler_declines_kills: thread_set_fault_handler failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
@@ -74,8 +74,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("fault_handler_declines_kills: wrong exit reason after KILL");
     }
 
-    cap_delete(child.th).ok();
-    cap_delete(child.cs).ok();
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
     cap_delete(ep).ok();
     Ok(())
 }

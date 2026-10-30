@@ -374,11 +374,14 @@ line, then waits, interrupts enabled and preemption disabled, until every line's
 (`irq::unregister_notification`, spin site `dealloc:irq-delivery`), and only then drains the
 waiters and frees the state. Every line is waited on, not only the lines this teardown clears,
 because a route may have stopped naming the state earlier: `SYS_IRQ_REGISTER` replacing it
-with another notification, or the Interrupt cap's teardown clearing it. Every route write (the
-replace, the clear, the teardown's own clears) is `SeqCst`, as are a delivery's raise and route
-read and the teardown's count reads, so a delivery that read the state on any line precedes the
-write that removed it there, and with it the teardown's count read of that line: it is counted
-and waited for, and no delivery on any CPU reaches the state after its free. The wait is bounded:
+with another notification, or the Interrupt cap's teardown clearing it. The teardown runs a
+`SeqCst` compare-exchange on every line, which reads the line's latest route (the value it
+clears, or what an earlier replace or clear left), and a delivery's raise and route read and the
+teardown's count reads are `SeqCst` too. A delivery that read the state on any line therefore
+precedes that compare-exchange, and with it the teardown's count read of that line: it is counted
+and waited for, and no delivery on any CPU reaches the state after its free. (The replace and the
+clear are `SeqCst` stores as well, so every route write takes part in one total order.) The wait
+is bounded:
 each delivery runs interrupts-off without waiting on the teardown, and masks its line until the
 driver's `SYS_IRQ_ACK`, so each line's count falls to zero between deliveries.
 

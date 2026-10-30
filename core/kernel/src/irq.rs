@@ -56,10 +56,10 @@ struct IrqRoute
     /// Number of `dispatch_device_irq` calls on this line between their raise
     /// (before reading `notification`) and their drop (after the last access
     /// to the state and to the woken waiter). The raise and the route read are
-    /// `SeqCst`, as are every route write (`register`, `unregister`, and
-    /// `unregister_notification`'s clears) and `unregister_notification`'s
-    /// count reads, so a dispatcher that read a pointer a later write removed
-    /// is counted when that notification's teardown reads the count.
+    /// `SeqCst`, as are `unregister_notification`'s compare-exchange on every
+    /// line and its count reads. That compare-exchange reads the line's latest
+    /// route, so a dispatcher that read a pointer any write since removed is
+    /// ordered before it, and is counted when the teardown reads the count.
     in_flight: AtomicU32,
 }
 
@@ -90,10 +90,12 @@ static IRQ_TABLE: [IrqRoute; MAX_IRQ] = {
 
 /// Register `notification` to receive notifications for interrupt line `irq`.
 ///
-/// Replaces any previous registration for the same line. The store is
-/// `SeqCst`: a delivery that read the replaced pointer is then ordered before
-/// it, so the replaced notification's later teardown, whose in-flight scan is
-/// `SeqCst` too, sees that delivery counted ([`unregister_notification`]).
+/// Replaces any previous registration for the same line. A delivery that read
+/// the replaced pointer is still waited for by that notification's teardown:
+/// the teardown's `SeqCst` compare-exchange on every line reads this store's
+/// value or a later one, which orders the stale read before it and so before
+/// the teardown's count reads ([`unregister_notification`]). The store is
+/// `SeqCst` as well, so every route write takes part in one total order.
 ///
 /// # Safety
 /// - `irq` must be < [`MAX_IRQ`].
@@ -112,8 +114,9 @@ pub unsafe fn register(irq: u32, notification: *mut NotificationState)
 
 /// Clear the routing entry for `irq` (called when the Interrupt cap is freed).
 ///
-/// The store is `SeqCst`, as [`register`]'s is, so the teardown of the
-/// notification the line routed to waits for a delivery that read it.
+/// The teardown of the notification the line routed to still waits for a
+/// delivery that read it, through its every-line compare-exchange, as for
+/// [`register`]'s replace; the store is `SeqCst` like that one.
 ///
 /// # Safety
 /// - `irq` must be < [`MAX_IRQ`].
@@ -135,12 +138,13 @@ pub unsafe fn unregister(irq: u32)
 ///
 /// After this returns, no `dispatch_device_irq` on any CPU dereferences
 /// `notification`. A delivery reads a route only after raising its line's
-/// in-flight count, and every route write is `SeqCst`: this call's clears,
-/// and the [`register`] replace or [`unregister`] clear that may have removed
-/// `notification` from a line earlier. A delivery that read `notification` on
-/// any line therefore precedes the write that removed it there, and so this
-/// call's in-flight scan, which reads every line's count (`SeqCst`) and waits
-/// while it is nonzero; a delivery that raises its count after a route stopped
+/// in-flight count (both `SeqCst`). This call runs a `SeqCst` compare-exchange
+/// on every line, which reads that line's latest route: the value this call
+/// clears, or the one a [`register`] replace or [`unregister`] clear left
+/// after removing `notification` earlier. A delivery that read `notification`
+/// on any line therefore precedes that compare-exchange, and so this call's
+/// in-flight scan, which reads every line's count (`SeqCst`) and waits while
+/// it is nonzero; a delivery that raises its count after a route stopped
 /// naming `notification` reads a null or a different route. Each line this
 /// call clears is masked, since it no longer has a handler.
 ///

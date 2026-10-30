@@ -1704,8 +1704,8 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// `DERIVATION_LOCK` and the frame allocator and, for a Notification, an
 /// `EventQueue`, or an Endpoint, wakes the waiters it drains (the running
 /// thread among them, when it is parked on the object it released), for a
-/// Notification first waits for the device-IRQ deliveries in flight through
-/// its routes (`irq::unregister_notification`), for a Notification or
+/// Notification first waits out every line's in-flight device-IRQ deliveries
+/// (`irq::unregister_notification`), for a Notification or
 /// `EventQueue` waits for the timer's in-flight wakeup batch
 /// (`sched::sleep_wakeups_quiesce`), and for an Mmio or `IoPort` object
 /// waits for the TLB shootdown or takes the thread registry lock its
@@ -3602,8 +3602,9 @@ unsafe fn dealloc_object_one(
             if !state.is_null()
             {
                 // Clear any IRQ routing table entries that point to this
-                // NotificationState and wait out every device-IRQ delivery
-                // already in flight through them on any CPU, so none reaches
+                // NotificationState and wait out every line's in-flight
+                // device-IRQ deliveries on any CPU, including one through a
+                // route an earlier replace or clear removed, so none reaches
                 // the state after the free below (irq::unregister_notification).
                 // SAFETY: state is live; no IPC source, scheduler, or
                 // sleep-list lock is held, and this is not interrupt context.

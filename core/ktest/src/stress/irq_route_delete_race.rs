@@ -12,10 +12,10 @@
 //! without a reference and signals it. The Notification teardown used to
 //! clear the route with only the local CPU's interrupts masked and then free
 //! the state, so a delivery already running on another CPU could lock, set
-//! bits in, and wake through freed memory. The teardown now waits for every
-//! delivery in flight through a cleared route before the free
-//! (`irq::unregister_notification`; core/kernel/docs/ipc-internals.md
-//! § Notification, Device IRQ delivery).
+//! bits in, and wake through freed memory. The teardown now waits out every
+//! line's in-flight deliveries before the free, including one that read a
+//! route an earlier replace or clear removed (`irq::unregister_notification`;
+//! core/kernel/docs/ipc-internals.md § Notification, Device IRQ delivery).
 //!
 //! ## How this exercises it
 //!
@@ -35,7 +35,8 @@
 //! must still wait out a delivery that read the old route. A raise after the
 //! delete finds the line masked and unrouted (or routed to the spare).
 //! Required: the kernel survives every round, and in some rounds of each kind
-//! the controller began a raise while the deleter's delete was running (the
+//! the controller began a raise while the deleter's delete (and, on a rerouted
+//! round, its reroute before it) was running, and every reroute succeeded (the
 //! race armed). The UART interrupt is disabled again when the cell ends.
 //!
 //! Needs **≥ 2 CPUs**.
@@ -76,8 +77,11 @@ static SIG: AtomicU32 = AtomicU32::new(0);
 /// The carved line and the spare notification the deleter reroutes it to.
 static LINE: AtomicU32 = AtomicU32::new(0);
 static SPARE: AtomicU32 = AtomicU32::new(0);
-/// Round whose delete the deleter has begun.
+/// Round whose delete (with its reroute, on a rerouted round) the deleter has
+/// begun.
 static DELETING: AtomicU32 = AtomicU32::new(0);
+/// Reroutes the deleter's `SYS_IRQ_REGISTER` refused.
+static REROUTE_FAILED: AtomicU32 = AtomicU32::new(0);
 /// Last round whose delete the deleter finished.
 static DELETED: AtomicU32 = AtomicU32::new(0);
 /// Set by the controller to end the deleter.
@@ -153,6 +157,7 @@ fn race(ctx: &TestContext, line: u32, cycles: u32) -> TestResult
     ROUND.store(0, Ordering::Release);
     DELETED.store(0, Ordering::Release);
     DELETING.store(0, Ordering::Release);
+    REROUTE_FAILED.store(0, Ordering::Release);
     QUIT.store(0, Ordering::Release);
     LINE.store(line, Ordering::Release);
     SPARE.store(spare, Ordering::Release);
@@ -171,6 +176,10 @@ fn race(ctx: &TestContext, line: u32, cycles: u32) -> TestResult
     cap_delete(deleter).ok();
     cap_delete(spare).ok();
     let armed = raced?;
+    if REROUTE_FAILED.load(Ordering::Acquire) != 0
+    {
+        return Err("stress::irq_route_delete_race: a reroute to the spare notification failed");
+    }
     exited?;
     crate::log_u64(
         "stress::irq_route_delete_race: armed_routed=",
@@ -299,14 +308,18 @@ extern "C" fn deleter_entry(_arg: u64) -> !
         {
             core::hint::spin_loop();
         }
-        // Reroute first on alternate rounds, so the delete finds its route
-        // already replaced. A failed reroute or delete leaves a route the
+        // The window opens before the reroute on a rerouted round, so a raise
+        // counted there may begin before the reroute lands and deliver
+        // through the route it replaces. A failed delete leaves a route the
         // next round's register replaces; the controller's wait still ends.
-        if rerouted(round)
-        {
-            irq_register(LINE.load(Ordering::Acquire), SPARE.load(Ordering::Acquire)).ok();
-        }
         DELETING.store(round, Ordering::Release);
+        // Reroute first on alternate rounds, so the delete finds its route
+        // already replaced. A failed reroute is counted and fails the cell.
+        if rerouted(round)
+            && irq_register(LINE.load(Ordering::Acquire), SPARE.load(Ordering::Acquire)).is_err()
+        {
+            REROUTE_FAILED.fetch_add(1, Ordering::AcqRel);
+        }
         cap_delete(SIG.load(Ordering::Acquire)).ok();
         DELETED.store(round, Ordering::Release);
     }

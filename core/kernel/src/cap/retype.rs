@@ -25,7 +25,9 @@
 //!
 //! - **Sub-page bins** (`BIN_128`, `BIN_512`) — fixed-size free lists. Each
 //!   freed slot's first 8 bytes hold the next-offset pointer for the bin's
-//!   linked list. New allocations pop from the list, or bump-allocate.
+//!   linked list. New allocations pop from the list, or bump-allocate; once
+//!   the bump frontier is spent, one free page block is carved into the
+//!   bin's slots.
 //! - **Page-aligned blocks** — first-fit free list with split-on-allocate.
 //!   Each freed block's first 16 bytes hold `(size_pages: u64,
 //!   next_offset: u64)`. Allocations walk the list looking for a block
@@ -230,6 +232,34 @@ unsafe fn write_u64_at(phys: u64, offset: u64, value: u64)
     unsafe { core::ptr::write_volatile(virt as *mut u64, value) };
 }
 
+/// Host-test form of `read_u64_at`: a test region's `memory.base` is the
+/// host address of an 8-byte-aligned buffer, so `phys + offset` is read
+/// directly instead of through the direct map, which a host process lacks.
+///
+/// # Safety
+///
+/// `phys + offset` must lie inside the test's live buffer, 8-byte aligned.
+#[cfg(test)]
+unsafe fn read_u64_at(phys: u64, offset: u64) -> u64
+{
+    // SAFETY: caller guarantees the address lies in the live, aligned test buffer.
+    unsafe { core::ptr::read_volatile((phys + offset) as *const u64) }
+}
+
+/// Host-test form of `write_u64_at`; see the host-test `read_u64_at`.
+///
+/// # Safety
+///
+/// `phys + offset` must lie inside the test's live buffer, 8-byte aligned,
+/// and not be aliased by a live reference.
+#[cfg(test)]
+unsafe fn write_u64_at(phys: u64, offset: u64, value: u64)
+{
+    // SAFETY: caller guarantees the address lies in the live, aligned,
+    // unaliased test buffer.
+    unsafe { core::ptr::write_volatile((phys + offset) as *mut u64, value) };
+}
+
 /// True if `link` is a structurally valid sub-page free-list pointer for a
 /// region of `memory_size` bytes: either the empty sentinel, or an in-range
 /// offset aligned to the smallest sub-page class. Mirrors the bounds guard in
@@ -274,7 +304,6 @@ fn seed_scratch_offset(phys: u64, base: u64, size: u64, bytes: u64) -> Option<u6
 /// # Safety
 ///
 /// `memory.base + head_offset` must be a valid kernel direct-map address.
-#[cfg(not(test))]
 unsafe fn try_pop_subpage(alloc: &RetypeAllocator, memory: &MemoryObject, bin: usize)
 -> Option<u64>
 {
@@ -333,7 +362,6 @@ unsafe fn try_pop_subpage(alloc: &RetypeAllocator, memory: &MemoryObject, bin: u
 ///
 /// `memory.base + offset` must be a valid kernel direct-map address; the
 /// slot must not be concurrently aliased.
-#[cfg(not(test))]
 unsafe fn push_subpage(alloc: &RetypeAllocator, memory: &MemoryObject, bin: usize, offset: u64)
 {
     let prev_head = alloc.subpage_free_lists[bin].load(Ordering::Acquire);
@@ -369,7 +397,6 @@ enum PagePrev
 /// # Safety
 ///
 /// `memory.base` must be a valid kernel direct-map address.
-#[cfg(not(test))]
 unsafe fn try_alloc_page_block(
     alloc: &RetypeAllocator,
     memory: &MemoryObject,
@@ -466,7 +493,6 @@ unsafe fn try_alloc_page_block(
 ///
 /// `offset` must be page-aligned and within the cap; the bytes at
 /// `memory.base + offset` must not be concurrently aliased.
-#[cfg(not(test))]
 unsafe fn push_page_block(alloc: &RetypeAllocator, memory: &MemoryObject, offset: u64, pages: u64)
 {
     let prev_head = alloc.page_free_head.load(Ordering::Acquire);
@@ -478,6 +504,42 @@ unsafe fn push_page_block(alloc: &RetypeAllocator, memory: &MemoryObject, offset
     alloc.page_free_head.store(offset, Ordering::Release);
 }
 
+/// Take one page from the page free list and cut it into `class`-byte slots
+/// of sub-page bin `bin`: the first slot is returned to the caller, the rest
+/// are pushed onto the bin's free list. Returns `None` when the page free list
+/// holds no block. `available_bytes` is unchanged: the page's bytes move from
+/// one free list to another, and the caller debits the slot it takes.
+///
+/// A carved page stays sub-page slots until the cap drains (the drain reset
+/// in [`retype_free`] returns the allocator to virgin); the page free list
+/// does not coalesce, so no later free reassembles it.
+///
+/// Caller holds the allocator lock.
+///
+/// # Safety
+///
+/// `memory.base` must be a valid kernel direct-map address.
+unsafe fn carve_page_into_bin(
+    alloc: &RetypeAllocator,
+    memory: &MemoryObject,
+    bin: usize,
+    class: u64,
+) -> Option<u64>
+{
+    // SAFETY: caller holds the allocator lock; memory.base is direct-map.
+    let page = unsafe { try_alloc_page_block(alloc, memory, 1) }?;
+    // Push from the top down so later pops hand the slots out in ascending order.
+    let mut slot = page + PAGE_SIZE as u64;
+    while slot - class > page
+    {
+        slot -= class;
+        // SAFETY: lock held; `slot` lies in the page just unlinked from the
+        // page free list, which no object occupies.
+        unsafe { push_subpage(alloc, memory, bin, slot) };
+    }
+    Some(page)
+}
+
 /// Reserve `bytes` from `memory`'s region. Returns the offset within the cap
 /// where the new kernel object should be placed.
 ///
@@ -487,16 +549,29 @@ unsafe fn push_page_block(alloc: &RetypeAllocator, memory: &MemoryObject, offset
 /// slot is not necessarily 512-aligned) and not page-aligned; page-aligned
 /// allocations are always page-aligned within the cap.
 ///
+/// A sub-page request is served from its bin's free list, else the bump
+/// frontier, else one page carved from the page free list into that bin
+/// ([`carve_page_into_bin`]). A page-aligned request is served from the page
+/// free list, else the bump frontier.
+///
 /// Returns `Err(SyscallError::OutOfMemory)` if the cap doesn't have enough
-/// room. Caller must validate `tag == Memory && rights.contains(RETYPE)`
-/// before invoking.
+/// room: `available_bytes` is below the rounded size, or no path above can
+/// place it (free bytes held only in the other sub-page bin, or only in
+/// sub-page slots for a page-aligned request, stay unusable). A carve is
+/// permanent while the cap holds a live object (the drain reset alone undoes
+/// it, and SEED never drains), so carving trades page blocks for sub-page
+/// capacity: on SEED, sustained sub-page demand can leave too few contiguous
+/// pages for an x86-64 port-binding table, whose `sys_ioport_bind` then
+/// returns `OutOfMemory`. A carve happens only once the bump frontier cannot
+/// serve the class, so the cap is by then already at its shared budget:
+/// without the carve, the sub-page request fails instead. Caller must validate
+/// `tag == Memory && rights.contains(RETYPE)` before invoking.
 ///
 /// # Safety
 ///
 /// `memory` must be a valid, live `MemoryObject` reference. Returned offset
 /// is valid only while `memory` is live; use `memory.base + offset` and
 /// `phys_to_virt` to access the memory.
-#[cfg(not(test))]
 #[track_caller]
 pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, SyscallError>
 {
@@ -560,8 +635,22 @@ pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, Syscall
 
     if new_bump > memory.size
     {
+        // The bump frontier cannot fit the request. A sub-page request can
+        // still be served from a freed page block, whose bytes
+        // `available_bytes` counts: carve one page into the request's bin
+        // rather than fail while those bytes are free. SEED reaches this state
+        // at runtime: init's bootstrap slabs return to it as page blocks at
+        // init's reap, and its runtime bodies are sub-page apart from x86_64's
+        // per-thread port-binding tables.
+        // SAFETY: alloc lock held.
+        let carved = subpage_bin_for(need)
+            .and_then(|bin| unsafe { carve_page_into_bin(alloc, memory, bin, need) });
+        if carved.is_some()
+        {
+            memory.available_bytes.fetch_sub(need, Ordering::AcqRel);
+        }
         alloc.unlock();
-        return Err(SyscallError::OutOfMemory);
+        return carved.ok_or(SyscallError::OutOfMemory);
     }
 
     // Debit only the bytes the caller is consuming. The alignment pad is
@@ -633,7 +722,6 @@ pub fn current_bump(memory: &MemoryObject) -> u64
 /// must match a previous successful [`retype_allocate`] return. The slot
 /// at `offset` must not contain a live kernel object — caller has dropped
 /// any state, drained wait queues, etc., before calling.
-#[cfg(not(test))]
 #[track_caller]
 pub fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 {
@@ -1217,5 +1305,105 @@ mod tests
         assert!(dispatch_for(ObjectType::IoPort, 0).is_none());
         assert!(dispatch_for(ObjectType::SchedControl, 0).is_none());
         assert!(dispatch_for(ObjectType::SbiControl, 0).is_none());
+    }
+
+    /// A Memory object over a zeroed host buffer of `pages` pages, every byte
+    /// available: the host-test `read_u64_at`/`write_u64_at` reach the
+    /// buffer through `base`. The buffer is returned to outlive the object.
+    fn host_region(pages: usize) -> (Vec<u64>, MemoryObject)
+    {
+        let bytes = pages * PAGE_SIZE;
+        let mut buf = vec![0u64; bytes / 8];
+        let memory = MemoryObject {
+            header: KernelObjectHeader::new(ObjectType::Memory),
+            base: buf.as_mut_ptr() as u64,
+            size: bytes as u64,
+            available_bytes: AtomicU64::new(bytes as u64),
+            owns_memory: core::sync::atomic::AtomicBool::new(false),
+            allocator: RetypeAllocator::new_inline(),
+            lock: core::sync::atomic::AtomicU32::new(0),
+        };
+        (buf, memory)
+    }
+
+    #[test]
+    fn sub_page_allocation_carves_a_freed_page_once_the_bump_is_spent()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(2);
+        // Spend the bump frontier on two pages, then free the lower one: its
+        // bytes are available again but only as a page block, the state SEED
+        // reaches after init's reap.
+        let low = retype_allocate(&memory, p).unwrap();
+        let high = retype_allocate(&memory, p).unwrap();
+        assert_eq!((low, high), (0, p));
+        retype_free(&memory, low, p);
+        assert_eq!(memory.available_bytes.load(Ordering::Acquire), p);
+
+        // Every 128-byte slot of the freed page is allocatable, each once.
+        let slots = p / BIN_128;
+        let mut seen = Vec::new();
+        for _ in 0..slots
+        {
+            let off = retype_allocate(&memory, 96).unwrap();
+            assert!(off < p && off.is_multiple_of(BIN_128));
+            assert!(!seen.contains(&off));
+            seen.push(off);
+        }
+        assert_eq!(memory.available_bytes.load(Ordering::Acquire), 0);
+        // With no page block left either, the next request fails.
+        assert_eq!(retype_allocate(&memory, 96), Err(SyscallError::OutOfMemory));
+    }
+
+    #[test]
+    fn a_512_byte_request_carves_once_the_bump_cannot_fit_it()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(2);
+        // Leave 384 bytes of bump room: enough for no 512-byte slot. The page
+        // freed below is then the only place a 512-byte request fits.
+        let low = retype_allocate(&memory, p).unwrap();
+        for _ in 0..29
+        {
+            retype_allocate(&memory, 96).unwrap();
+        }
+        retype_free(&memory, low, p);
+
+        let slots = p / BIN_512;
+        for _ in 0..slots
+        {
+            let off = retype_allocate(&memory, BIN_512).unwrap();
+            assert!(off < p && off.is_multiple_of(BIN_512));
+        }
+        // The 384 bytes left above the bump cursor are counted but cannot
+        // hold a 512-byte slot.
+        assert_eq!(memory.available_bytes.load(Ordering::Acquire), 384);
+        assert_eq!(
+            retype_allocate(&memory, BIN_512),
+            Err(SyscallError::OutOfMemory)
+        );
+    }
+
+    #[test]
+    fn a_page_request_is_not_served_from_carved_sub_page_slots()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(3);
+        let a = retype_allocate(&memory, p).unwrap();
+        let b = retype_allocate(&memory, p).unwrap();
+        let _c = retype_allocate(&memory, p).unwrap();
+        retype_free(&memory, a, p);
+        retype_free(&memory, b, p);
+        // Carve both freed pages into 128-byte slots, then free every slot:
+        // two pages of bytes are available again, but only as sub-page slots.
+        let carved: Vec<u64> = (0..=p / BIN_128)
+            .map(|_| retype_allocate(&memory, 96).unwrap())
+            .collect();
+        for off in carved
+        {
+            retype_free(&memory, off, 96);
+        }
+        assert_eq!(memory.available_bytes.load(Ordering::Acquire), 2 * p);
+        assert_eq!(retype_allocate(&memory, p), Err(SyscallError::OutOfMemory));
     }
 }

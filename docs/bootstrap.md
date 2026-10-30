@@ -125,11 +125,10 @@ At the end of init's Handover stage (logged as `phase 3`), init
 transfers its kernel-object and reclaimable Memory capabilities to
 procmgr via `REGISTER_INIT_TEARDOWN` and exits; once both init threads
 have exited, procmgr tears down init's threads and AddressSpace, donates
-the Memory caps to memmgr's pool, and drops its reference to init's
-CSpace. The caps left in that kernel-pinned root CSpace stay alive but
-unreachable; releasing them is design intent, not yet implemented
-([#540](https://github.com/kottlerg/seraph/issues/540)). See
-[`process-lifecycle.md`](process-lifecycle.md) §"Init reap".
+the Memory caps to memmgr's pool, and deletes its capability on init's
+CSpace, the last reference to it, which frees the CSpace and releases
+the caps left in it. See [`process-lifecycle.md`](process-lifecycle.md)
+§"Init reap".
 
 Once init exits, svcmgr is the resident supervisor. See
 [`services/svcmgr/README.md`](../services/svcmgr/README.md).

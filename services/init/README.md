@@ -110,10 +110,8 @@ transfer table.
   is compiled in).
 - Does not remain resident after bootstrap completes —
   [procmgr](../procmgr/README.md) reaps init's address space and threads
-  after `sys_thread_exit`. The caps left in init's CSpace stay there; the
-  kernel pins that CSpace (it is the root CSpace), so they remain alive but
-  unreachable. Releasing them at the reap is design intent; not yet
-  implemented ([#540](https://github.com/kottlerg/seraph/issues/540); see
+  after `sys_thread_exit`, and its deletion of its capability on init's
+  CSpace frees that CSpace, releasing the caps left in it (see
   [docs/process-lifecycle.md](../../docs/process-lifecycle.md#init-reap)
   § Init reap).
 

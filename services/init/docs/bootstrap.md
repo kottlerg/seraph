@@ -261,15 +261,13 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   revoked + deleted (its pool donations `retype_free`'d, user-page
   mappings vanish), the accumulated Memory caps are `DONATE_MEMORY_CAPS`'d to
   memmgr's pool, and procmgr's cap on init's `CSpace` is revoked +
-  deleted. The caps init still holds stay in init's `CSpace`, which
-  the kernel pins (it is the root CSpace), so they remain alive but
-  unreachable; releasing them at the reap is design intent; not yet
-  implemented ([#540](https://github.com/kottlerg/seraph/issues/540);
-  [Process Lifecycle](../../../docs/process-lifecycle.md#init-reap)
-  § Init reap describes those caps). Every reclaimable Memory cap was donated, so no
-  `owns_memory` cap reaches its last reference and nothing frees to
-  the sealed buddy. Procmgr logs a summary line. Beyond init's pinned
-  `CSpace` and the caps in it, no init-related kernel object remains, except that the kernel-direct
+  deleted; that capability is the last reference to init's `CSpace`, so
+  the deletion frees it and releases the caps init still holds
+  ([Process Lifecycle](../../../docs/process-lifecycle.md#init-reap)
+  § Init reap describes those caps). Every page init owned was forwarded
+  or donated to memmgr's pool, so no `owns_memory` cap reaches its last
+  reference and nothing frees to the sealed buddy. Procmgr logs a summary
+  line. No init-related kernel object remains, except that the kernel-direct
   page-table nodes behind init's bootstrap mappings stay consumed, an
   accepted cost (see
   [Memory Subsystem Internals](../../../core/kernel/docs/memory-internals.md)

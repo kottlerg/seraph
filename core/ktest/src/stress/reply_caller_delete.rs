@@ -96,12 +96,14 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// This cell's log name.
 const CELL: &str = "stress::reply_caller_delete";
 
-/// Reply/delete races to run, rotating over the three kinds.
-const CYCLES: u32 = 600;
+/// Rounds to run, rotating over the three kinds and the four order slots
+/// ([`ORDERS`]); half are race rounds, so a full-width run races the reply
+/// against the delete 600 times.
+const CYCLES: u32 = 1200;
 
-/// Fewest rounds at any width ([`super::scaled_attempts`]): each outcome
-/// occurs in a sizeable share of the rounds, so a few dozen of each kind
-/// still reach both.
+/// Fewest rounds at any width ([`super::scaled_attempts`]): 96 rounds give
+/// each kind 8 reply-first, 8 delete-first and 16 race rounds, so every
+/// (kind, steered order) check runs several times.
 const MIN_CYCLES: u32 = 96;
 
 /// The controller's, the server's, and the caller's CPUs.
@@ -295,8 +297,8 @@ struct Round
     server: Option<spawn::SpawnedChild>,
 }
 
-/// One round: arm a reply binding, race the reply against the caller's
-/// delete, and check the outcome.
+/// One round: arm a reply binding, order the reply and the caller's delete
+/// per the round's order (a race round races them), and check the outcome.
 fn one_round(ctx: &TestContext, cycle: u32, outcomes: &mut Outcomes) -> TestResult
 {
     let kind = cycle % KINDS;
@@ -317,7 +319,7 @@ fn one_round(ctx: &TestContext, cycle: u32, outcomes: &mut Outcomes) -> TestResu
         caller: None,
         server: None,
     };
-    let verdict = race(ctx, &mut round, kind, order, cycle);
+    let verdict = run_round(ctx, &mut round, kind, order, cycle);
     let reaped = reap(&mut round);
     let acc = verdict?;
     reaped?;
@@ -327,7 +329,7 @@ fn one_round(ctx: &TestContext, cycle: u32, outcomes: &mut Outcomes) -> TestResu
 /// Spawn the caller and the server, order the reply and the caller's delete
 /// per `order` (a race round races them), and return every report bit the
 /// round produced.
-fn race(
+fn run_round(
     ctx: &TestContext,
     round: &mut Round,
     kind: u32,
@@ -618,9 +620,10 @@ extern "C" fn server_entry(arg: u64) -> !
     // A child has no other channel to report on; a failed send fails the
     // controller's bounded wait for the bit.
     notification_send(args.done, BIT_ARMED).ok();
-    if args.go != 0 && notification_wait(args.go).is_err()
+    if args.go != 0
+        && let Err(e) = notification_wait(args.go)
     {
-        BAD_SERVER.record(0);
+        BAD_SERVER.record_error(e);
         notification_send(args.done, BIT_SERVER_BAD).ok();
         thread_exit()
     }

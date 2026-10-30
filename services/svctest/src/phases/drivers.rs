@@ -33,12 +33,13 @@ pub fn phases() -> &'static [Phase]
     }]
 }
 
-/// Attempts at the input deny query while devmgr reports `NO_DEVICE`: the
-/// input driver is spawned from disk after devmgr's `SET_DRIVERS_DIR`, so
-/// its endpoint can lag svctest's start. 500 attempts 10 ms apart bound the
-/// wait at about 5 s. devmgr spawns the serial and framebuffer drivers
-/// before it serves any query, so one attempt settles those.
-const INPUT_ATTEMPTS: u32 = 500;
+/// Attempts at an input query while devmgr reports `NO_DEVICE`: the input
+/// driver is spawned from disk after devmgr's `SET_DRIVERS_DIR`, so its
+/// endpoint can lag svctest's start (the bounded wait the `NO_DEVICE`
+/// contract allows). 500 attempts 10 ms apart bound the wait at about 5 s.
+/// devmgr spawns the serial and framebuffer drivers before it serves any
+/// query, so one attempt settles those. Shared with the devmgr ordinal phase.
+pub(crate) const INPUT_ATTEMPTS: u32 = 500;
 
 /// The recipe that starts the terminal, the system's other input reader
 /// (programs/terminal/README.md), when it is staged for this boot.

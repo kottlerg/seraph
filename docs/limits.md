@@ -85,8 +85,7 @@ An entry an existing open Issue already names cites it in the recommendation.
   main stack at 1 MiB.
 - **Silent truncation.** Many tables drop entries past their bound with no diagnostic: boot
   memory-map entries, usable RAM ranges, apertures, ACPI regions, DTB nodes and ranges, named
-  modules, PCI functions, and reserve free runs. Each needs a diagnostic as well as a better
-  bound.
+  modules, and reserve free runs. Each needs a diagnostic as well as a better bound.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
   copies: `MAX_EXCL` and core/boot `MAX_MODULES`, `MAX_MODULES` and `INIT_MAX_NAMED_MODULES`
   (16 against 12), `MAX_MMIO_DIRECT_MAP_REGIONS` and `MAX_IOAPICS`, `REAPER_SLOTS` and
@@ -558,21 +557,21 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643).
 
 ### vfsd and namespace
 
-Tracked by [#644](https://github.com/kottlerg/seraph/issues/644).
+Tracked by [#647](https://github.com/kottlerg/seraph/issues/647) (gpt `SECTOR_SIZE`, with the
+device block-size query and fs-fat's sector size).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `MAX_TREE_NODES` | `services/vfsd/root-backend/src/lib.rs` | 32, never freed | current peak plus headroom | about 2.9 KiB | make pay-as-you-go | Growable mount tree |
-| tree node index (`NONE`) | `services/vfsd/root-backend/src/lib.rs` | `u32` | provably unreachable (below `MAX_TREE_NODES`) | 4 B per link | correct as is | None |
-| `MAX_ENTRY_NAME` | `services/vfsd/root-backend/src/lib.rs` | 64 | unknown | 64 B per node | raise | `MAX_NAME_LEN` is 255 |
-| MOUNT path limit | `services/vfsd/src/main.rs` | literal 64 | unknown | 64 B stack | raise | One path limit |
-| `populate_fallthrough_caps` `path_buf` | `services/vfsd/src/main.rs` | 256 B | unknown | 256 B stack | raise | Shorter than `path_of` can produce; the fall-through is skipped silently |
-| `MAX_GPT_PARTS` | `services/vfsd/gpt/src/lib.rs` | 8 | unknown | about 450 B | raise | GPT defaults to 128 entries; size from `num_parts` |
-| gpt `SECTOR_SIZE` | `services/vfsd/gpt/src/lib.rs` | 512 | hardware spec (512-byte logical sector only) | 512 B stack | needs a design | 4Kn disks |
+| `VfsdRootBackend.nodes` | `services/vfsd/root-backend/src/lib.rs` | heap `Vec`, one node per installed path component, never freed (no unmount) | per-instance (grows with the mount tree; an allocation failure refuses the install) | none | correct as is | None |
+| tree node index (`NONE`) | `services/vfsd/root-backend/src/lib.rs` | `u32` | provably unreachable (`install` refuses a pool of `u32::MAX` nodes, each a heap allocation) | 4 B per link | correct as is | None |
+| tree component limit (`validate_name`) | `services/vfsd/root-backend/src/lib.rs` | `MAX_NAME_LEN` (255) | ABI width (the namespace protocol's name rule) | none (names are heap-allocated to their length) | correct as is | None |
+| `MAX_MOUNT_PATH_LEN` | `services/vfsd/src/main.rs` | `(MSG_DATA_WORDS_MAX - 2) * 8` = 496 | ABI width (the path bytes one MOUNT message carries) | none | correct as is | None |
+| `collect_partitions` entry list | `services/vfsd/gpt/src/lib.rs` | heap `Vec`, every used entry of the header's `num_parts` array | hardware spec (UEFI GPT: `parse_header` requires the array to lie between LBA 2 and the header's own `first_usable_lba`); a header that also inflates `first_usable_lba` is bounded by the device capacity, and a read or allocation failure stops the walk with a log | none | correct as is | None |
+| gpt `SECTOR_SIZE` | `services/vfsd/gpt/src/lib.rs` | 512 | hardware spec (512-byte logical sector only) | 512 B stack | needs a design | 4Kn disks; query the device block size (#647) |
 | `GptHeader.num_parts`, `entry_size` | `services/vfsd/gpt/src/lib.rs` | `u32` | hardware spec (UEFI GPT) | none | correct as is | None |
-| `MAX_PENDING_BOOTSTRAPS`, `MAX_PENDING_ACTIVE_JOBS` | `services/vfsd/src/worker_pool.rs` | 4 / 4 | current peak plus headroom | small | make pay-as-you-go | A fifth request is refused (#254) |
+| `BootstrapState.pending`, `ActiveState.queue` | `services/vfsd/src/worker_pool.rs` | heap `Vec` and `VecDeque`, one entry per in-flight fatfs spawn | per-instance (an allocation failure refuses the order and releases its caps) | none | correct as is | None |
 | `ACTIVE_WORKER_COUNT` | `services/vfsd/src/worker_pool.rs` | 2 | tuning (concurrency knob) | 2 thread stacks | correct as is | None (#254) |
-| `SERVICE_THREAD_COUNT` | `services/vfsd/src/main.rs` | 4 | unknown (re-entrancy depth) | 4 thread stacks | needs a design | Re-entry deeper than 3 can deadlock (#464) |
+| `SERVICE_THREAD_COUNT` | `services/vfsd/src/main.rs` | 4 | tuning (concurrency knob; no service-endpoint request waits on another) | 4 thread stacks | correct as is | None (#254) |
 
 ### init and logd
 
@@ -626,25 +625,29 @@ Every entry here is `correct as is`; none is tracked. services/netd has no code.
 
 ### devmgr
 
-Tracked by [#646](https://github.com/kottlerg/seraph/issues/646).
+Tracked by [#661](https://github.com/kottlerg/seraph/issues/661) and
+[#664](https://github.com/kottlerg/seraph/issues/664).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `MAX_DEVICES` | `services/devmgr/src/pci.rs` | 8 | current peak plus headroom | about 1.5 KiB stack | make pay-as-you-go | The scan drops functions past 8 silently (#165) |
-| `MAX_BARS` | `services/devmgr/src/pci.rs` | 6 | hardware spec (PCI type-0 header) | about 108 B per device | correct as is | None |
-| `read_virtio_pci_caps` loop bound | `services/devmgr/src/pci.rs` | literal 48 | hardware spec ((256 - 64) / 4 capability slots) | none | correct as is | Name it |
-| `pci_enumerate` device, function, bus widths | `services/devmgr/src/pci.rs` | 32 / 8 / 256 | hardware spec (PCI BDF) | none | correct as is | None |
-| caps `MAX_APERTURES` | `services/devmgr/src/caps.rs` | 32 | current peak plus headroom (mirrors init) | 768 B | make pay-as-you-go | Overflow drops apertures, and `carve_subrange` loses MMIO authority |
-| caps `MAX_ACPI_REGIONS` | `services/devmgr/src/caps.rs` | 8 | current peak plus headroom | 192 B | make pay-as-you-go | Tables in a dropped region become unreachable |
-| `driver_module_slots`, `driver_module_kinds` | `services/devmgr/src/caps.rs` | literal 8 | unknown | 96 B | needs a design | Silent drop; tie to the module-kind count |
+| PCI function list (`scan` output) | `services/devmgr/firmware/src/scan.rs` | growable `Vec` | provably unreachable (grows to every function the ECAM windows hold) | about 190 B per function | correct as is | None; a failed growth stops the scan with a log naming the function |
+| `MAX_BARS` | `services/devmgr/firmware/src/scan.rs` | 6 | hardware spec (PCI type-0 header) | about 108 B per device | correct as is | None |
+| `MAX_CAPABILITIES` | `services/devmgr/firmware/src/scan.rs` | 48 | hardware spec ((256 - 64) / 4 capability slots) | none | correct as is | None |
+| `scan` device, function, bus widths | `services/devmgr/firmware/src/scan.rs` | 32 / 8 / 256 | hardware spec (PCI BDF) | none | correct as is | None |
+| `DevmgrCaps.apertures` (`SpanTable`) | `services/devmgr/src/caps.rs` | growable | provably unreachable (one span per held aperture cap) | 24 B per span | correct as is | None; an aperture the table cannot hold is logged and released, and a carve keeps both remainders |
+| `DevmgrCaps.acpi_regions` | `services/devmgr/src/caps.rs` | growable `Vec` | provably unreachable (one entry per delivered region) | 24 B per region | correct as is | None; a region the list cannot hold is logged and released |
+| `DevmgrCaps.driver_modules` | `services/devmgr/src/caps.rs` | `module_kind::COUNT` = 3 | encoding artefact (one module per kind) | 12 B | correct as is | None; an unknown or duplicate kind is logged and released |
 | absorb rounds `.min(4)` | `services/devmgr/src/caps.rs` | literal 4 | ABI width (`MSG_CAP_SLOTS_MAX`) | none | correct as is | Use the constant |
-| `FIRMWARE_MAP_MAX_PAGES` | `services/devmgr/src/main.rs` | 256 (1 MiB) | current peak plus headroom | VA per call | needs a design | Tables past 1 MiB into a region are unreadable |
+| ACPI table window (`table_window`) | `services/devmgr/firmware/src/acpi.rs` | the table's own pages, clamped to its region | firmware spec (the table's reported length) | VA for one table per read | correct as is | None; the per-process reservation arena bounds it, and a failed reservation is logged |
 | `MAX_DEVICE_INFO_PAYLOAD` | `services/devmgr/src/main.rs` | 64 | encoding artefact (largest payload type 56 B) | 76 B per entry | correct as is | None |
-| `device_info` catalog | `services/devmgr/src/main.rs` | `MAX_DEVICES + 4` | current peak plus headroom | about 912 B stack | make pay-as-you-go | Follows `MAX_DEVICES` |
+| `DeviceCatalog.entries` | `services/devmgr/src/main.rs` | growable `Vec` | provably unreachable (one entry per spawned device) | 76 B per entry | correct as is | None; an entry the catalog cannot hold is logged and its device not spawned |
 | `device_badge` | `services/devmgr/src/main.rs` | `u64` | provably unreachable | none | correct as is | None |
-| `IrqRangeAllocator.next_start` | `services/devmgr/src/main.rs` | forward-only `u32` | encoding artefact | none | needs a design | A lower GSI after a higher one gets no IRQ |
-| single virtio-blk, single virtio-input, one BAR | `services/devmgr/src/main.rs` | 1 | current peak plus headroom | none | needs a design | A second disk is ignored (#165) |
-| `parse_mcfg_ecam` | `services/devmgr/firmware/src/acpi.rs` | first segment only | current peak plus headroom | none | needs a design | Multi-segment platforms lose segments |
+| `IrqRangeAllocator.ranges` (`RANGE_END_BOUND`) | `services/devmgr/src/main.rs` | growable, 2^32 lines | ABI width (`SYS_IRQ_SPLIT`'s `u32` line) | 24 B per span | correct as is | None; lines below and above each carve stay held |
+| virtio-blk and virtio-input instances | `services/devmgr/src/main.rs` | every device (virtio-blk: every one with a private IRQ line); registry ordinal in `data[1]` | provably unreachable (`u64` ordinal) | one driver per device | correct as is | None |
+| One IRQ-bearing driver per INTx line (`IrqRangeAllocator::isolate_one`) | `services/devmgr/src/main.rs` | 1 per GSI (riscv64: 4 swizzled lines) | encoding artefact (a single-line cap is carved once) | none | needs a design | A virtio-blk on a line another device holds is not spawned, with a log (#664) |
+| One BAR per `VirtIO` driver (`virtio_second_bar`) | `services/devmgr/firmware/src/scan.rs` | 1 | encoding artefact (the driver bootstrap round carries one BAR) | none | needs a design | A device whose registers span two BARs is refused with a log; multi-BAR delivery is #661 |
+| `mcfg_ecams` | `services/devmgr/firmware/src/acpi.rs` | every entry | firmware spec (MCFG length) | none | correct as is | None |
+| `find_pci_ecams` | `services/devmgr/firmware/src/dtb.rs` | every node | firmware spec (structure block) | 24 B per window | correct as is | None |
 | firmware dtb `MAX_DEPTH` | `services/devmgr/firmware/src/dtb.rs` | 16 | provably unreachable on real trees (under 8 deep) | 256 B stack | correct as is | None |
 | `mint_bootstrap_badge` redraw | `services/devmgr/src/spawn.rs` | unbounded | provably unreachable (2^-64 per draw) | none | correct as is | None |
 | riscv64 platform defaults | `services/devmgr/src/arch/riscv64/mod.rs` | QEMU `virt` constants | hardware spec (QEMU `virt`) | none | correct as is | Data-driven binding is #165 |

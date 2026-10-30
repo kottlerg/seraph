@@ -21,15 +21,10 @@
 //! reply path requires procmgr to re-enter vfsd's OPEN. Offloading the
 //! procmgr call to a worker thread keeps main's reply path intact.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use crate::worker;
-
-/// Maximum number of bootstrap orders that may be in flight at once.
-pub const MAX_PENDING_BOOTSTRAPS: usize = 4;
-
-/// Maximum number of active jobs that may be queued at once.
-pub const MAX_PENDING_ACTIVE_JOBS: usize = 4;
 
 /// Number of active worker threads. A concurrency knob that bounds no
 /// capacity: a queued job waits for the next free worker.
@@ -52,7 +47,7 @@ pub enum WorkOrder
 /// Handing an order to the pool hands over its two caps: from then on the
 /// pool either delivers them to the child (the bootstrap round moves them
 /// out of vfsd's `CSpace`) or deletes them — [`submit_bootstrap`] when its
-/// table is full, the bootstrap worker when a round fails, and
+/// list cannot grow, the bootstrap worker when a round fails, and
 /// [`abandon_bootstrap`] when the order is withdrawn before its child asks.
 pub struct BootstrapOrder
 {
@@ -138,7 +133,9 @@ pub struct PendingBootstrap
 /// thread (consumer/notifier).
 pub struct BootstrapState
 {
-    pub pending: [Option<PendingBootstrap>; MAX_PENDING_BOOTSTRAPS],
+    /// Orders whose child has not yet sent its `REQUEST`. Grows on the heap with
+    /// the number of concurrent spawns, so no fixed count refuses one.
+    pub pending: Vec<PendingBootstrap>,
 }
 
 impl BootstrapState
@@ -146,7 +143,7 @@ impl BootstrapState
     const fn new() -> Self
     {
         Self {
-            pending: [const { None }; MAX_PENDING_BOOTSTRAPS],
+            pending: Vec::new(),
         }
     }
 }
@@ -161,7 +158,9 @@ pub struct ActiveJob
 /// Shared queue between the main thread (submitter) and active worker threads.
 pub struct ActiveState
 {
-    pub queue: Mutex<[Option<ActiveJob>; MAX_PENDING_ACTIVE_JOBS]>,
+    /// Jobs no worker has taken yet, oldest first. Grows on the heap with
+    /// the number of concurrent spawns, so no fixed count refuses one.
+    pub queue: Mutex<VecDeque<ActiveJob>>,
     pub condvar: Condvar,
 }
 
@@ -170,7 +169,7 @@ impl ActiveState
     fn new() -> Self
     {
         Self {
-            queue: Mutex::new([const { None }; MAX_PENDING_ACTIVE_JOBS]),
+            queue: Mutex::new(VecDeque::new()),
             condvar: Condvar::new(),
         }
     }
@@ -229,9 +228,9 @@ impl WorkerPool
         self.bootstrap_ep
     }
 
-    /// Submit a work order. Returns `None` if the relevant slot table is
-    /// full, after deleting every cap the order carries, so a refused order
-    /// leaves nothing of it in vfsd's `CSpace`.
+    /// Submit a work order. Returns `None` if the relevant queue cannot grow
+    /// to hold it (no memory), after deleting every cap the order carries,
+    /// so a refused order leaves nothing of it in vfsd's `CSpace`.
     pub fn submit(&self, order: WorkOrder) -> Option<WorkHandle>
     {
         match order
@@ -245,16 +244,15 @@ impl WorkerPool
                     .queue
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                let Some(slot) = q.iter_mut().find(|s| s.is_none())
-                else
+                if q.try_reserve(1).is_err()
                 {
                     drop(q);
                     let _ = syscall::cap_delete(c.file_cap);
                     let _ = syscall::cap_delete(c.badged_creator);
                     delete_bootstrap_caps(c.bootstrap.blk, c.bootstrap.service);
                     return None;
-                };
-                *slot = Some(ActiveJob {
+                }
+                q.push_back(ActiveJob {
                     order: c,
                     completion: channel.clone(),
                 });
@@ -277,8 +275,8 @@ impl WorkerPool
 /// to its completion channel. Used by `WorkerPool::submit` and directly by
 /// active workers preparing a bootstrap delivery before driving procmgr.
 ///
-/// Returns `None` when every pending slot is occupied, after deleting the
-/// order's caps.
+/// Returns `None` when the pending list cannot grow to hold the order (no
+/// memory), after deleting the order's caps.
 pub fn submit_bootstrap(
     state: &Mutex<BootstrapState>,
     BootstrapOrder {
@@ -290,14 +288,13 @@ pub fn submit_bootstrap(
 {
     let channel = new_channel();
     let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some(slot) = st.pending.iter_mut().find(|s| s.is_none())
-    else
+    if st.pending.try_reserve(1).is_err()
     {
         drop(st);
         delete_bootstrap_caps(blk, service);
         return None;
-    };
-    *slot = Some(PendingBootstrap {
+    }
+    st.pending.push(PendingBootstrap {
         badge,
         blk,
         service,
@@ -309,7 +306,7 @@ pub fn submit_bootstrap(
 /// Withdraw the bootstrap order registered under `badge`, whose child will
 /// not be served (its creation or start failed, or its caller gave up).
 ///
-/// If the order is still pending, its slot is freed and its undelivered
+/// If the order is still pending, it is removed and its undelivered
 /// caps are deleted. Otherwise the bootstrap worker already took it for a
 /// child's REQUEST, and this waits on `handle` until that round ends (the
 /// caps then reached the child, or the worker deleted them). Either way no
@@ -324,20 +321,13 @@ pub fn abandon_bootstrap(state: &Mutex<BootstrapState>, badge: u64, handle: Work
     let _ = handle.wait();
 }
 
-/// Find and remove a pending-bootstrap slot whose badge matches.
+/// Find and remove the pending bootstrap whose badge matches.
 pub fn take_pending_by_badge(state: &Mutex<BootstrapState>, badge: u64)
 -> Option<PendingBootstrap>
 {
     let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
-    for slot in &mut st.pending
-    {
-        if let Some(p) = slot.as_ref()
-            && p.badge == badge
-        {
-            return slot.take();
-        }
-    }
-    None
+    let i = st.pending.iter().position(|p| p.badge == badge)?;
+    Some(st.pending.swap_remove(i))
 }
 
 /// Delete the two caps of a bootstrap order that never reached its child.

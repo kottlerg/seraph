@@ -10,36 +10,8 @@
 //! (MCFG / DTB → ECAM, FADT → `PM1a`) happens later in the `devmgr-firmware`
 //! crate; this module owns only the IPC handshake.
 
+use firmware::resource::SpanTable;
 use std::os::seraph::StartupInfo;
-
-/// Maximum MMIO apertures this devmgr receives from init. Matches init's
-/// `MAX_APERTURE_CAPS`.
-pub const MAX_APERTURES: usize = 32;
-
-/// Maximum ACPI reclaimable-region Memory caps. Matches init's
-/// `MAX_ACPI_REGION_CAPS`.
-pub const MAX_ACPI_REGIONS: usize = 8;
-
-/// An MMIO aperture cap with its physical range.
-#[derive(Clone, Copy)]
-pub struct Aperture
-{
-    pub slot: u32,
-    pub base: u64,
-    pub size: u64,
-}
-
-impl Aperture
-{
-    pub const fn empty() -> Self
-    {
-        Self {
-            slot: 0,
-            base: 0,
-            size: 0,
-        }
-    }
-}
 
 /// An ACPI reclaimable-region Memory cap with its physical range.
 #[derive(Clone, Copy)]
@@ -48,18 +20,6 @@ pub struct AcpiRegion
     pub slot: u32,
     pub base: u64,
     pub size: u64,
-}
-
-impl AcpiRegion
-{
-    pub const fn empty() -> Self
-    {
-        Self {
-            slot: 0,
-            base: 0,
-            size: 0,
-        }
-    }
 }
 
 /// Framebuffer geometry forwarded by init (originally from the
@@ -110,6 +70,15 @@ pub mod module_kind
     pub const VIRTIO_BLK: u64 = 1;
     pub const SERIAL: u64 = 2;
     pub const FRAMEBUFFER: u64 = 3;
+    /// Number of module kinds: the tags run `1..=COUNT`, one module each.
+    pub const COUNT: usize = 3;
+
+    /// Slot of `kind` in a per-kind table, or `None` for an unknown tag.
+    pub fn index(kind: u64) -> Option<usize>
+    {
+        let i = usize::try_from(kind.checked_sub(1)?).ok()?;
+        (i < COUNT).then_some(i)
+    }
 }
 
 /// Presence-bitmap bits on R1's `data[0]`. Mirrors
@@ -131,13 +100,12 @@ pub struct DevmgrCaps
     pub dtb_page_base: u64,
     pub dtb_size: u64,
 
-    // MMIO aperture list — devmgr owns these and splits per-device.
-    pub apertures: [Aperture; MAX_APERTURES],
-    pub aperture_count: usize,
+    // MMIO aperture caps — devmgr owns these and carves per-device caps
+    // out of them, keeping every remainder.
+    pub apertures: SpanTable<u32>,
 
     // ACPI reclaimable-region Memory caps.
-    pub acpi_regions: [AcpiRegion; MAX_ACPI_REGIONS],
-    pub acpi_region_count: usize,
+    pub acpi_regions: Vec<AcpiRegion>,
 
     // From StartupInfo / endpoints.
     pub procmgr_ep: u32,
@@ -145,11 +113,10 @@ pub struct DevmgrCaps
     pub self_bootstrap_ep: u32,
     pub self_aspace: u32,
 
-    // Driver module caps, with a parallel `module_kind::*` tag per slot so
-    // a module is resolved by class rather than by delivery position.
-    pub driver_module_slots: [u32; 8],
-    pub driver_module_kinds: [u64; 8],
-    pub driver_module_count: usize,
+    // Driver module caps, one slot per `module_kind` (indexed by
+    // `module_kind::index`), so a module is resolved by class rather than by
+    // delivery position; 0 where no module of that kind was delivered.
+    pub driver_modules: [u32; module_kind::COUNT],
 
     // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
     // badged on. Reserved for devmgr-initiated publications (who
@@ -179,17 +146,13 @@ impl DevmgrCaps
             dtb_memory_cap: 0,
             dtb_page_base: 0,
             dtb_size: 0,
-            apertures: [Aperture::empty(); MAX_APERTURES],
-            aperture_count: 0,
-            acpi_regions: [AcpiRegion::empty(); MAX_ACPI_REGIONS],
-            acpi_region_count: 0,
+            apertures: SpanTable::new(),
+            acpi_regions: Vec::new(),
             procmgr_ep: info.procmgr_endpoint,
             registry_ep: 0,
             self_bootstrap_ep: 0,
             self_aspace: info.self_aspace,
-            driver_module_slots: [0; 8],
-            driver_module_kinds: [0; 8],
-            driver_module_count: 0,
+            driver_modules: [0; module_kind::COUNT],
             svcmgr_publish_cap: 0,
             arch: crate::arch::current::ArchCaps::empty(),
             fb_info: None,
@@ -200,14 +163,7 @@ impl DevmgrCaps
     /// Returns `0` if no module of that class was delivered.
     pub fn module_cap_for_kind(&self, kind: u64) -> u32
     {
-        for i in 0..self.driver_module_count
-        {
-            if self.driver_module_kinds[i] == kind
-            {
-                return self.driver_module_slots[i];
-            }
-        }
-        0
+        module_kind::index(kind).map_or(0, |i| self.driver_modules[i])
     }
 }
 
@@ -276,9 +232,10 @@ fn bootstrap_round1(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
     Some(())
 }
 
-/// Unpack one aperture-batch round into the aperture array. The `.min(4)` is
+/// Unpack one aperture-batch round into the aperture table. The `.min(4)` is
 /// `MSG_CAP_SLOTS_MAX`, the caps one round carries; init sends more rounds
-/// for more apertures.
+/// for more apertures. An aperture the table cannot record (an empty range,
+/// or the table cannot grow) is logged and its cap released.
 fn absorb_aperture_round(
     round_caps: &[u32],
     round_cap_count: usize,
@@ -294,21 +251,23 @@ fn absorb_aperture_round(
         {
             continue;
         }
-        if caps.aperture_count >= caps.apertures.len()
+        let base = round_data[2 + i * 2];
+        let size = round_data[3 + i * 2];
+        if caps.apertures.insert(slot, base, size) != Ok(true)
         {
-            break;
+            std::os::seraph::log!(
+                "aperture {:#x}+{:#x} not recorded (empty range or no memory); released",
+                base,
+                size
+            );
+            let _ = syscall::cap_delete(slot);
         }
-        caps.apertures[caps.aperture_count] = Aperture {
-            slot,
-            base: round_data[2 + i * 2],
-            size: round_data[3 + i * 2],
-        };
-        caps.aperture_count += 1;
     }
 }
 
 /// Unpack one ACPI-region-batch round. The `.min(4)` is `MSG_CAP_SLOTS_MAX`,
-/// the caps one round carries.
+/// the caps one round carries. A region the list cannot grow to hold is
+/// logged and its cap released.
 fn absorb_acpi_region_round(
     round_caps: &[u32],
     round_cap_count: usize,
@@ -324,22 +283,27 @@ fn absorb_acpi_region_round(
         {
             continue;
         }
-        if caps.acpi_region_count >= caps.acpi_regions.len()
+        let base = round_data[2 + i * 2];
+        let size = round_data[3 + i * 2];
+        if caps.acpi_regions.try_reserve(1).is_err()
         {
-            break;
+            std::os::seraph::log!(
+                "ACPI region {:#x}+{:#x} not recorded (no memory); released",
+                base,
+                size
+            );
+            let _ = syscall::cap_delete(slot);
+            continue;
         }
-        caps.acpi_regions[caps.acpi_region_count] = AcpiRegion {
-            slot,
-            base: round_data[2 + i * 2],
-            size: round_data[3 + i * 2],
-        };
-        caps.acpi_region_count += 1;
+        caps.acpi_regions.push(AcpiRegion { slot, base, size });
     }
 }
 
 /// Unpack one module-cap round. `data[2 + i]` carries the `module_kind`
 /// tag for `caps[i]`. The `.min(4)` is `MSG_CAP_SLOTS_MAX`, the caps one
-/// round carries.
+/// round carries. A module of an unknown kind, or a second module of a kind
+/// already held, is logged and its cap released: a retained module cap pins
+/// init's donated pool run.
 fn absorb_module_round(
     round_caps: &[u32],
     round_cap_count: usize,
@@ -354,13 +318,21 @@ fn absorb_module_round(
         {
             continue;
         }
-        if caps.driver_module_count >= caps.driver_module_slots.len()
+        let kind = round_data[2 + i];
+        match module_kind::index(kind)
         {
-            break;
+            Some(k) if caps.driver_modules[k] == 0 => caps.driver_modules[k] = slot,
+            Some(_) =>
+            {
+                std::os::seraph::log!("second driver module of kind {}; released", kind);
+                let _ = syscall::cap_delete(slot);
+            }
+            None =>
+            {
+                std::os::seraph::log!("driver module of unknown kind {}; released", kind);
+                let _ = syscall::cap_delete(slot);
+            }
         }
-        caps.driver_module_slots[caps.driver_module_count] = slot;
-        caps.driver_module_kinds[caps.driver_module_count] = round_data[2 + i];
-        caps.driver_module_count += 1;
     }
 }
 

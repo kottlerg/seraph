@@ -193,8 +193,9 @@ pub enum DecodeError
     /// The round's kind, data words, or caps disagree with its encoding:
     /// a required cap, the presence word, or the rounds-left word is
     /// missing, the bitmap sets a bit with no slot, the bitmap names a
-    /// different number of caps than the round delivered, or more `CAPS`
-    /// rounds arrive than the slot list takes.
+    /// different number of caps than the round delivered, or a `CAPS` round
+    /// arrives past the rounds the slot list takes or with a rounds-left
+    /// word that disagrees with them.
     Malformed,
 }
 
@@ -241,11 +242,72 @@ pub fn encode_logd_sources(sources: &LogdSources) -> Round
     round
 }
 
+/// Concatenates the rounds of an `N`-slot list split over
+/// [`slot_round_count`]`(N)` rounds, each with a rounds-left count.
+struct SlotListDecoder<const N: usize>
+{
+    slots: SlotAccumulator<N>,
+    received: usize,
+}
+
+impl<const N: usize> SlotListDecoder<N>
+{
+    const ROUNDS: usize = slot_round_count(N);
+
+    const fn new() -> Self
+    {
+        SlotListDecoder {
+            slots: SlotAccumulator::new(),
+            received: 0,
+        }
+    }
+
+    /// Add the next round. Returns the slots once the last round (rounds
+    /// left `0`) arrives, `None` while more are owed. Refuses a round past
+    /// the list's round count, a rounds-left count that disagrees with the
+    /// rounds still owed, and a round that does not decode or carries a cap
+    /// past slot `N`.
+    fn push(
+        &mut self,
+        caps: &[u32],
+        presence: u64,
+        rounds_left: u64,
+    ) -> Result<Option<[u32; N]>, DecodeError>
+    {
+        let owed_after = Self::ROUNDS
+            .checked_sub(self.received + 1)
+            .ok_or(DecodeError::Malformed)?;
+        if rounds_left != owed_after as u64
+        {
+            return Err(DecodeError::Malformed);
+        }
+        // A cap past the list would come from an encoder with a longer list,
+        // which the rounds-left check above rules out; refuse it regardless.
+        let mut overflowed = false;
+        self.slots
+            .push(caps, presence, |_| overflowed = true)
+            .map_err(|_| DecodeError::Malformed)?;
+        if overflowed
+        {
+            return Err(DecodeError::Malformed);
+        }
+        self.received += 1;
+        Ok((owed_after == 0).then(|| *self.slots.slots()))
+    }
+}
+
 /// Concatenates received `CAPS` rounds into the [`CapsRound`] they encode.
-#[derive(Default)]
 pub struct CapsDecoder
 {
-    slots: SlotAccumulator<CAPS_SLOTS>,
+    list: SlotListDecoder<CAPS_SLOTS>,
+}
+
+impl Default for CapsDecoder
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
 }
 
 impl CapsDecoder
@@ -255,7 +317,7 @@ impl CapsDecoder
     pub const fn new() -> Self
     {
         CapsDecoder {
-            slots: SlotAccumulator::new(),
+            list: SlotListDecoder::new(),
         }
     }
 
@@ -268,7 +330,8 @@ impl CapsDecoder
     /// from this build's `SVCMGR_LABELS_VERSION`; [`DecodeError::Malformed`]
     /// when the kind is not `CAPS`, the presence or rounds-left word is
     /// missing, the presence bitmap disagrees with the delivered caps, the
-    /// round carries a slot past the list, or the last round leaves a
+    /// round is past the [`CAPS_ROUNDS`] the list takes or its rounds-left
+    /// word disagrees with the rounds still owed, or the last round leaves a
     /// required endpoint absent. On an error the round's caps are still the
     /// caller's to release.
     pub fn push(&mut self, caps: &[u32], data: &[u64]) -> Result<Option<CapsRound>, DecodeError>
@@ -286,21 +349,12 @@ impl CapsDecoder
         {
             return Err(DecodeError::Malformed);
         };
-        // A slot past the list would come from an encoder with a longer list,
-        // which a matching version rules out: refuse the round.
-        let mut overflowed = false;
-        self.slots
-            .push(caps, presence, |_| overflowed = true)
-            .map_err(|_| DecodeError::Malformed)?;
-        if overflowed
-        {
-            return Err(DecodeError::Malformed);
-        }
-        if rounds_left != 0
+        let Some(slots) = self.list.push(caps, presence, rounds_left)?
+        else
         {
             return Ok(None);
-        }
-        let decoded = CapsRound::from_slots(self.slots.slots());
+        };
+        let decoded = CapsRound::from_slots(&slots);
         if decoded.service_ep == 0 || decoded.bootstrap_ep == 0
         {
             return Err(DecodeError::Malformed);
@@ -414,36 +468,47 @@ mod tests
         assert_eq!(logd.data()[1], logd_present::MASTER_LOG);
     }
 
-    // A decoder that stopped at the first `CAPS` round would lose every slot
-    // a later round carries.
+    // A decoder that stopped at the first round would lose every slot a later
+    // round carries. The `CAPS` list fits one round, so a six-slot list
+    // stands in for a longer one.
     #[test]
-    fn caps_rounds_with_rounds_left_are_concatenated_until_the_last()
+    fn a_slot_list_past_one_round_is_concatenated_until_the_last()
     {
-        let mut decoder = CapsDecoder::new();
-        let first = [SERVICE, BOOTSTRAP, 0x21, 0x22];
+        let mut list = SlotListDecoder::<6>::new();
+        assert_eq!(list.push(&[0x41, 0x42, 0x44], 0b1011, 1), Ok(None));
         assert_eq!(
-            decoder.push(&first, &[kind::CAPS, VERSION, 0b1111, 1]),
-            Ok(None)
-        );
-        assert_eq!(
-            decoder.push(&[], &[kind::CAPS, VERSION, 0, 0]),
-            Ok(Some(caps_round(0x21, 0x22)))
+            list.push(&[0x46], 0b10, 0),
+            Ok(Some([0x41, 0x42, 0, 0x44, 0, 0x46]))
         );
     }
 
     #[test]
-    fn a_caps_round_carrying_a_slot_past_the_list_is_malformed()
+    fn a_round_past_the_list_or_a_wrong_rounds_left_is_malformed()
     {
+        // `rounds_left` must count the rounds still owed.
+        let mut list = SlotListDecoder::<6>::new();
+        assert_eq!(list.push(&[0x41], 0b1, 0), Err(DecodeError::Malformed));
+
+        // A second, empty CAPS round after the one the list takes.
         let mut decoder = CapsDecoder::new();
-        let first = [SERVICE, BOOTSTRAP];
+        let rounds = encode_caps(&caps_round(0, 0));
+        assert!(matches!(
+            decoder.push(rounds[0].caps(), rounds[0].data()),
+            Ok(Some(_))
+        ));
         assert_eq!(
-            decoder.push(&first, &[kind::CAPS, VERSION, 0b0011, 1]),
-            Ok(None)
-        );
-        assert_eq!(
-            decoder.push(&[0x25], &[kind::CAPS, VERSION, 0b0001, 0]),
+            decoder.push(&[], &[kind::CAPS, VERSION, 0, 0]),
             Err(DecodeError::Malformed)
         );
+    }
+
+    #[test]
+    fn a_round_carrying_a_slot_past_the_list_is_malformed()
+    {
+        let mut list = SlotListDecoder::<6>::new();
+        assert_eq!(list.push(&[0x41], 0b1, 1), Ok(None));
+        // Window slot 2 of round 2 is list slot 6, past the list.
+        assert_eq!(list.push(&[0x47], 0b100, 0), Err(DecodeError::Malformed));
     }
 
     #[test]

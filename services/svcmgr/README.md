@@ -94,7 +94,7 @@ svcmgr/
 - **Launch** — for `defined only` services, spawn via the shared
   primitives in [`restart.rs`](src/restart.rs)
   (`walk_and_create_from_file`, `configure_namespace_caps`,
-  `start_process`) and serve the seed bootstrap round; only restart
+  `start_process`) and serve the seed bootstrap rounds; only restart
   resolves the namespace through `apply_namespace_policy`
   ([docs/restart-protocol.md](docs/restart-protocol.md) § Shared spawn primitives).
 - **Health monitoring** — bind every supervised service's main

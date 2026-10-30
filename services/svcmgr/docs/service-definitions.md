@@ -221,8 +221,8 @@ at or above `MSG_CAP_SLOTS_MAX`, or names a different number of caps than the ro
 [`log_sink`](#log_sink) round uses the same encoding. Consumers that tolerate `cap == 0 → skip`
 continue to work; consumers that don't fail on first use, which is the right surface for a real
 misconfiguration. svctest does both: its `ns` phase skips on a zero cap, and its svcmgr seed-only
-phase fails the run on any unresolved seed (per [services/svctest/README.md § Run
-Sequence](../../svctest/README.md#run-sequence)).
+and second-seed-round phases fail the run on any unresolved seed (per [services/svctest/README.md §
+Run Sequence](../../svctest/README.md#run-sequence)).
 
 Well-known names are centralised in
 [`ipc::published_names`](../../../shared/ipc/src/lib.rs). Every name
@@ -322,7 +322,7 @@ At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 | Definition | Pending registration | Outcome |
 |---|---|---|
 | present | present | **bind only** — bind death-notification on the endowed thread cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink flag, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
-| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, `CONFIGURE_NAMESPACE` with the namespace+cwd, bind death-notification (when `restart != never`, so the observer is in place before the thread runs), `START_PROCESS`, serve the seed bootstrap round, and (when `restart != never`) record a `ServiceEntry`. |
+| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, `CONFIGURE_NAMESPACE` with the namespace+cwd, bind death-notification (when `restart != never`, so the observer is in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 
 ## Relevant Design Documents

@@ -66,7 +66,7 @@ mismatch in `data[1]`, or a malformed `CAPS` round (including one that
 carries a slot past the list, or a last round that leaves a required
 endpoint absent), aborts bootstrap (svcmgr exits).
 
-**Rounds 2..N — `SUBSTRATE` (`data[0] = 2`, not terminal):**
+**After the `CAPS` rounds — `SUBSTRATE` (`data[0] = 2`, not terminal):**
 one per init-bootstrapped substrate service (memmgr, procmgr, devmgr,
 vfsd) whose thread cap init captured; logd is not a substrate. See init's
 [Handover](../../init/docs/bootstrap.md#handover) stage.

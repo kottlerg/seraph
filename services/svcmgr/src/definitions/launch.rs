@@ -8,7 +8,7 @@
 //! Mirrors restart's spawn primitives ([`crate::restart`]) so that
 //! services launched by svcmgr post-handover go through exactly the
 //! same procmgr surface (`CREATE_FROM_FILE` → `CONFIGURE_NAMESPACE`
-//! → `START_PROCESS` → bootstrap round) that restart uses. Returns
+//! → `START_PROCESS` → bootstrap rounds) that restart uses. Returns
 //! the [`Launched`] handles; for a supervised launch [`launch`] binds
 //! death-notification itself, before `START_PROCESS`.
 
@@ -301,7 +301,7 @@ fn assemble_provided_boot_caps(
 /// Spawn a service from its parsed `.svc` definition.
 ///
 /// Returns `Some(Launched)` on success, with the child running and
-/// its bootstrap round delivered. Returns `None` if any step fails;
+/// its bootstrap rounds delivered. Returns `None` if any step fails;
 /// in that case the child has been destroyed and any resolved seed caps
 /// have been released; a create whose reply caps never reach svcmgr (see
 /// [`walk_and_create_from_file`]) leaves no child, since procmgr destroys

@@ -322,7 +322,8 @@ impl<const N: usize> SlotAccumulator<N>
 /// * `Err(bootstrap_errors::INVALID)` if the underlying IPC fails, or if
 ///   the reply's label disagrees with its payload: the delivered cap count
 ///   differs from the count the label declares, or the label declares more
-///   data words than a message carries.
+///   data words than a message carries. The caps such a reply delivered
+///   are deleted.
 pub unsafe fn request_round(creator_ep: u32, ipc_buf: *mut u64) -> Result<BootstrapRound, u64>
 {
     let request = IpcMessage::new(REQUEST);
@@ -339,9 +340,11 @@ pub unsafe fn request_round(creator_ep: u32, ipc_buf: *mut u64) -> Result<Bootst
             let declared_cap_count = unpack_cap_count(reply.label);
             let data_words = unpack_data_words(reply.label);
             // The label is the creator's word; a mismatch with what the
-            // kernel delivered is refused in every build.
+            // kernel delivered is refused in every build, and the caps the
+            // kernel did deliver are released rather than leaked.
             if reply_caps.len() != declared_cap_count || data_words > MSG_DATA_WORDS_MAX
             {
+                delete_slots(reply_caps);
                 return Err(bootstrap_errors::INVALID);
             }
             let mut caps = [0u32; MSG_CAP_SLOTS_MAX];

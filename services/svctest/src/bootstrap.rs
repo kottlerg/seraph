@@ -29,14 +29,14 @@
 //!
 //!   * `caps[4]`: the no-authority pwrmgr SEND (`pwrmgr.deny`). It is the
 //!     fifth seed, so svcmgr delivers it in a second round: every svctest
-//!     boot exercises a seed list longer than one round, and [`request`]
-//!     logs a `FATAL:` line when slot 4 arrives empty.
+//!     boot exercises a seed list longer than one round, and the
+//!     `svcmgr_second_seed_round` phase fails the run when slot 4 is empty.
 //!
 //! `pwrmgr.deny` is also public, and the pwrmgr cap-deny phase uses the
 //! copy svctest resolves through `QUERY_ENDPOINT` (zero when pwrmgr is
 //! absent).
 //!
-//! The launcher requests the rounds from `info.creator_endpoint`; if no
+//! svctest requests the rounds from `info.creator_endpoint`; if no
 //! creator endpoint is present (`== 0`), every slot stays zero and
 //! dependent phases self-skip.
 
@@ -62,23 +62,16 @@ pub struct Caps
     /// retire with those labels.
     pub devmgr_test: u32,
     /// `pwrmgr.deny`, seeded in slot 4: the second-round seed whose
-    /// arrival [`request`] checks.
+    /// arrival the `svcmgr_second_seed_round` phase checks.
     pub pwrmgr_deny_seed: u32,
 }
 
 /// Drain the bootstrap rounds from `creator_endpoint` and pull caps out,
 /// then resolve `pwrmgr.deny`. The lookup follows the rounds: svcmgr serves
-/// no `QUERY_ENDPOINT` until it has served them. A launched svctest whose
-/// slot 4 is empty logs `FATAL:`, which fails the boot's harness run
-/// (`cargo xtask run-parallel`'s `--fail` regex), since a seed list longer
-/// than one round then lost its second round.
+/// no `QUERY_ENDPOINT` until it has served them.
 pub fn request() -> Caps
 {
     let mut caps = request_round();
-    if startup_info().creator_endpoint != 0 && caps.pwrmgr_deny_seed == 0
-    {
-        std::os::seraph::log!("FATAL: seed slot 4 (pwrmgr.deny) did not arrive in round 2");
-    }
     caps.pwrmgr_noauth =
         std::os::seraph::registry::lookup(ipc::published_names::PWRMGR_DENY).unwrap_or(0);
     caps

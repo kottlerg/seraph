@@ -47,7 +47,7 @@ services/svctest/
         │   ├── mod.rs         # Own fatfs under block faults: failed writes, removes, renames
         │   └── ramdisk.rs     # RAM FAT16 volume and block server with armed faults
         ├── pwrmgr.rs          # Shutdown cap-deny check and terminal shutdown
-        ├── svcmgr.rs          # Late handover refused; publish gate; badged SEND; seed-only names
+        ├── svcmgr.rs          # Handover refused; publish gate; badged SEND; seed-only; round 2
         └── timed.rs           # `SystemTime::now()` through svcmgr and timed
 ```
 
@@ -61,7 +61,7 @@ identity last).
 ## Run Sequence
 
 `main` registers the log name `svctest`, so every line carries the `[svctest]` prefix. It then
-installs the failure hooks, requests the bootstrap round, hands the hooks the
+installs the failure hooks, requests the bootstrap rounds, hands the hooks the
 authority-badged pwrmgr cap, logs `starting`, and runs each registered phase in order inside
 the envelope `phase=<name> starting` / `phase=<name> passed`. After the last phase it logs
 `ALL TESTS PASSED`, the marker defined in
@@ -80,16 +80,17 @@ marker first logs it, so a run logs exactly one. A failing thread that finds the
 claimed yields until the run ends instead of aborting, so its abort cannot cut off the
 claimant's marker or `SHUTDOWN`.
 
-Some failures still end the run idle. A panic or allocation failure during the bootstrap round
+Some failures still end the run idle. A panic or allocation failure during the bootstrap rounds
 logs `SOME TESTS FAILED` but sends no `SHUTDOWN`, because the hooks get the pwrmgr cap only
-after the round returns. A `SHUTDOWN` that pwrmgr answers, or whose call fails, is logged and
+after the rounds return. A `SHUTDOWN` that pwrmgr answers, or whose call fails, is logged and
 leaves the system idle, as on the pass path. A fault in svctest's own process (a stray access,
 a stack overflow) kills it without running either hook, so it logs neither marker.
 
 The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.deny` cap) log the
 skip and return when their cap is zero; the devmgr deny phases (`caps[2]`), the orphan-teardown and
-drivers deny phases (`caps[3]`), and the svcmgr seed-only phase (every seed, plus the public
-`svcmgr` and `pwrmgr.deny` names it resolves) instead fail their assertions. The seed-only phase
+drivers deny phases (`caps[3]`), the svcmgr seed-only phase (every seed-only seed, plus the
+public `svcmgr` and `pwrmgr.deny` names it resolves), and the svcmgr second-seed-round phase
+(`caps[4]`) instead fail their assertions. The seed-only phase
 thus fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's
 own zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap,
 and the run ends idle.
@@ -133,7 +134,8 @@ svcmgr's registry. The no-authority `pwrmgr.deny` cap is public: the pwrmgr cap-
 requires an `UNAUTHORIZED` reply to `SHUTDOWN`, uses the copy svctest resolves through
 `QUERY_ENDPOINT` on its per-process `service_registry_cap`. `caps[4]` seeds the same name only so
 that every svctest boot receives a seed list longer than one bootstrap round; svctest logs a
-`FATAL:` line, which fails the harness run, when slot 4 arrives empty.
+`FATAL:` line, which fails the harness run through the svcmgr second-seed-round phase when slot 4
+arrives empty.
 
 ---
 

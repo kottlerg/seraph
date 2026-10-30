@@ -9,9 +9,11 @@
 //! Each rule prints `error <rule>: <path>:<line>: <message>` (or `warning`)
 //! per violation; any error-level diagnostic fails the command. The rules
 //! check only what a script can decide: column widths, header layout, the
-//! `## Summarized By` section's shape and forward links, and document
-//! reachability. Whether a passage is a summary, or a statement matches the
-//! code, stays with the pre-merge review.
+//! `## Summarized By` section's shape and forward links, document
+//! reachability, and that every name docs/testing.md § Coverage tiers lists
+//! for its surface screens still names code or a file in the tree. Whether a
+//! passage is a summary, or a statement matches the code, stays with the
+//! pre-merge review.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -56,6 +58,7 @@ const RULES: &[(&str, Level)] = &[
     ("md-summarized-by", Level::Error),
     ("md-backlink-forward", Level::Error),
     ("md-reachable", Level::Error),
+    ("md-coverage-symbols", Level::Error),
     ("md-bare-cite", Level::Warning),
 ];
 
@@ -118,6 +121,7 @@ pub fn run(ctx: &BuildContext, _args: &LintDocsArgs) -> Result<()>
     }
     diags.extend(check_summarized_by(&pat, &markdown));
     diags.extend(check_reachable(&pat, &markdown));
+    diags.extend(check_coverage_symbols(&markdown, &sources, &paths));
 
     report(&diags)
 }
@@ -771,6 +775,405 @@ fn check_direct_links(
     diags
 }
 
+// ── md-coverage-symbols ───────────────────────────────────────────────────────
+
+/// The document whose § Coverage tiers lists the CPU-count and memory surfaces
+/// by name (docs/testing.md § Coverage tiers).
+const COVERAGE_DOC: &str = "docs/testing.md";
+
+/// The section heading and the paragraph leads that bound the surface list: from
+/// the Boundary surface paragraph through the Memory surface screen, up to the
+/// Repeat count paragraph.
+const COVERAGE_HEADING: &str = "## Coverage tiers";
+const SURFACE_START: &str = "**Boundary surface.**";
+const SURFACE_END: &str = "**Repeat count.**";
+
+/// What a listed name must resolve to.
+#[derive(Debug, PartialEq, Eq)]
+enum NameKind
+{
+    /// A Rust item or field path, as a regular expression over source text.
+    Symbol,
+    /// A tracked file path, `*` matching within one path component.
+    Path,
+}
+
+/// One name the surface list states.
+#[derive(Debug)]
+struct ListedName
+{
+    /// 1-based line of `COVERAGE_DOC` the name is stated on.
+    line: usize,
+    /// The name as the diagnostic shows it.
+    shown: String,
+    /// For a symbol, the regular expression the name stands for; for a path,
+    /// the path pattern.
+    pattern: String,
+    kind: NameKind,
+}
+
+/// The 0-based line range `[start, end)` of the surface list in `text`, or a
+/// message naming the bound that is missing.
+fn surface_range(text: &str) -> std::result::Result<(usize, usize), String>
+{
+    let lines: Vec<&str> = text.lines().collect();
+    let heading = lines
+        .iter()
+        .position(|l| l.trim_end() == COVERAGE_HEADING)
+        .ok_or_else(|| format!("no `{COVERAGE_HEADING}` heading"))?;
+    let section_end = lines[heading + 1..]
+        .iter()
+        .position(|l| l.starts_with("## "))
+        .map_or(lines.len(), |i| heading + 1 + i);
+    let find = |from: usize, lead: &str| {
+        lines[from..section_end]
+            .iter()
+            .position(|l| l.starts_with(lead))
+            .map(|i| from + i)
+            .ok_or_else(|| format!("no paragraph starting `{lead}` in `{COVERAGE_HEADING}`"))
+    };
+    let start = find(heading + 1, SURFACE_START)?;
+    let end = find(start + 1, SURFACE_END)?;
+    Ok((start, end))
+}
+
+/// Split `s` on `|` outside parentheses and brackets.
+fn split_alternation(s: &str) -> Vec<&str>
+{
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut in_class = false;
+    let mut escaped = false;
+    let mut begin = 0;
+    for (i, c) in s.char_indices()
+    {
+        if escaped
+        {
+            escaped = false;
+            continue;
+        }
+        match c
+        {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => depth += 1,
+            ')' if !in_class => depth = depth.saturating_sub(1),
+            '|' if !in_class && depth == 0 =>
+            {
+                parts.push(&s[begin..i]);
+                begin = i + 1;
+            }
+            _ =>
+            {}
+        }
+    }
+    parts.push(&s[begin..]);
+    parts
+}
+
+/// Expand the groups of one screen alternative into the concrete patterns it
+/// lists: `(a|b)` into each option, `(x)?` into the pattern with and without it.
+/// Character classes stay as they are, so `IPI_VECTOR_[A-Z_]+` stays one
+/// pattern that some name must match.
+fn expand_groups(alt: &str) -> Vec<String>
+{
+    let bytes = alt.as_bytes();
+    let mut open = None;
+    let mut depth = 0usize;
+    let mut in_class = false;
+    let mut i = 0;
+    while i < bytes.len()
+    {
+        match bytes[i]
+        {
+            b'\\' => i += 1,
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class =>
+            {
+                if depth == 0
+                {
+                    open = Some(i);
+                }
+                depth += 1;
+            }
+            b')' if !in_class && depth > 0 =>
+            {
+                depth -= 1;
+                if depth == 0
+                {
+                    let start = open.unwrap_or(0);
+                    let prefix = &alt[..start];
+                    let inner = &alt[start + 1..i];
+                    let optional = bytes.get(i + 1) == Some(&b'?');
+                    let suffix = &alt[i + 1 + usize::from(optional)..];
+                    let mut options: Vec<&str> = split_alternation(inner);
+                    if optional
+                    {
+                        options.insert(0, "");
+                    }
+                    return options
+                        .into_iter()
+                        .flat_map(|o| expand_groups(&format!("{prefix}{o}{suffix}")))
+                        .collect();
+                }
+            }
+            _ =>
+            {}
+        }
+        i += 1;
+    }
+    vec![alt.to_owned()]
+}
+
+/// The names a screen-variable line (`S='a|b'`, `S="$S|c"`, and the same for
+/// `M`) lists, or `None` when the line assigns no screen variable.
+fn screen_names(line: &str) -> Option<Vec<String>>
+{
+    let (var, rest) = line.trim().split_once('=')?;
+    if var != "S" && var != "M"
+    {
+        return None;
+    }
+    let quote = rest.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    let value = rest.strip_prefix(quote)?.strip_suffix(quote)?;
+    let value = value.strip_prefix(&format!("${var}|")).unwrap_or(value);
+    Some(
+        split_alternation(value)
+            .into_iter()
+            .filter(|a| !a.is_empty())
+            .flat_map(expand_groups)
+            .collect(),
+    )
+}
+
+/// Whether `s` is a Rust item or field path as the prose names one
+/// (`frame_map::init`, `info.cpu_count`), optionally ending in the `_*`
+/// family glob (`init_ap_*`).
+fn is_symbol_span(s: &str) -> bool
+{
+    let s = s.strip_suffix("_*").unwrap_or(s);
+    !s.is_empty()
+        && s.replace("::", ".").split('.').all(|seg| {
+            seg.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
+/// Whether `s` is a path to a Rust source, possibly with `*`: a repository
+/// path, or a bare file name (`idt.rs`).
+fn is_path_span(s: &str) -> bool
+{
+    has_ext(s, "rs")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./*".contains(c))
+}
+
+/// The regular expression a prose symbol span stands for.
+fn prose_symbol_pattern(s: &str) -> String
+{
+    match s.strip_suffix("_*")
+    {
+        Some(stem) => format!("{}_[A-Za-z0-9_]+", regex::escape(stem)),
+        None => regex::escape(s),
+    }
+}
+
+/// Every name the surface list of `text` states, from the prose code spans,
+/// the screen variables, and the whole-surface file paths inside the screens.
+fn listed_names(text: &str) -> std::result::Result<Vec<ListedName>, String>
+{
+    let (start, end) = surface_range(text)?;
+    let mut names = Vec::new();
+    let mut in_fence = false;
+    // A code span may wrap across lines: (start line, text so far).
+    let mut span: Option<(usize, String)> = None;
+    for (idx, line) in text.lines().enumerate().take(end).skip(start)
+    {
+        if line.trim_start().starts_with("```")
+        {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence
+        {
+            if let Some(found) = screen_names(line)
+            {
+                names.extend(found.into_iter().map(|p| ListedName {
+                    line: idx + 1,
+                    shown: p.clone(),
+                    pattern: p,
+                    kind: NameKind::Symbol,
+                }));
+                continue;
+            }
+            for token in line.split_whitespace()
+            {
+                let token = token.trim_matches(|c| c == '\'' || c == '"');
+                if is_path_span(token)
+                {
+                    names.push(ListedName {
+                        line: idx + 1,
+                        shown: token.to_owned(),
+                        pattern: token.to_owned(),
+                        kind: NameKind::Path,
+                    });
+                }
+            }
+            continue;
+        }
+        if line.trim().is_empty()
+        {
+            // A code span does not cross a paragraph break.
+            span = None;
+            continue;
+        }
+        for (i, piece) in line.split('`').enumerate()
+        {
+            if i > 0
+            {
+                // A backtick: close the open span, or open one.
+                match span.take()
+                {
+                    Some((at, content)) => names.extend(prose_name(at, &content)),
+                    None => span = Some((idx + 1, String::new())),
+                }
+            }
+            if let Some((_, content)) = span.as_mut()
+            {
+                if i == 0 && !content.is_empty()
+                {
+                    content.push(' ');
+                }
+                content.push_str(piece);
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// The listed name a prose code span states, if it is one.
+fn prose_name(line: usize, content: &str) -> Option<ListedName>
+{
+    let content = content.trim();
+    let kind = if is_path_span(content)
+    {
+        NameKind::Path
+    }
+    else if is_symbol_span(content)
+    {
+        NameKind::Symbol
+    }
+    else
+    {
+        return None;
+    };
+    let pattern = match kind
+    {
+        NameKind::Symbol => prose_symbol_pattern(content),
+        NameKind::Path => content.to_owned(),
+    };
+    Some(ListedName {
+        line,
+        shown: content.to_owned(),
+        pattern,
+        kind,
+    })
+}
+
+/// `text` with every `//` comment removed, from the `//` to the end of its line.
+fn strip_line_comments(text: &str) -> String
+{
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines()
+    {
+        out.push_str(line.split_once("//").map_or(line, |(code, _)| code));
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether the path pattern `pattern` (`*` within one component) names a
+/// tracked file; a pattern without `/` is a file name in any directory.
+fn path_resolves(pattern: &str, tracked: &[String]) -> bool
+{
+    let anchor = if pattern.contains('/')
+    {
+        "^"
+    }
+    else
+    {
+        "(?:^|/)"
+    };
+    let re = format!(
+        "{anchor}{}$",
+        regex::escape(pattern).replace(r"\*", "[^/]*")
+    );
+    Regex::new(&re).is_ok_and(|re| tracked.iter().any(|p| re.is_match(p)))
+}
+
+/// The listed names of docs/testing.md § Coverage tiers resolve: every symbol
+/// the surface list names matches, as a whole word, the code of a tracked Rust
+/// source outside `xtask/` (comments stripped), and every listed path names a
+/// tracked file. A name left only in a comment, or in a file that is gone, is
+/// one the screen can no longer find.
+fn check_coverage_symbols(
+    markdown: &[&SourceFile],
+    sources: &[&SourceFile],
+    tracked: &[String],
+) -> Vec<Diagnostic>
+{
+    let rule = "md-coverage-symbols";
+    let Some(doc) = markdown.iter().find(|f| f.path == COVERAGE_DOC)
+    else
+    {
+        return vec![Diagnostic::new(
+            rule,
+            COVERAGE_DOC,
+            1,
+            "not a tracked document",
+        )];
+    };
+    let names = match listed_names(&doc.text)
+    {
+        Ok(names) => names,
+        Err(message) => return vec![Diagnostic::new(rule, COVERAGE_DOC, 1, message)],
+    };
+    let code: String = sources
+        .iter()
+        .filter(|f| has_ext(&f.path, "rs") && !f.path.starts_with("xtask/"))
+        .map(|f| strip_line_comments(&f.text))
+        .collect();
+    let mut diags = Vec::new();
+    for name in &names
+    {
+        let resolves = match name.kind
+        {
+            NameKind::Symbol => Regex::new(&format!(r"(?-u:\b)(?:{})(?-u:\b)", name.pattern))
+                .is_ok_and(|re| re.is_match(&code)),
+            NameKind::Path => path_resolves(&name.pattern, tracked),
+        };
+        if !resolves
+        {
+            let what = match name.kind
+            {
+                NameKind::Symbol => "names nothing in the code of a tracked Rust source",
+                NameKind::Path => "names no tracked file",
+            };
+            diags.push(Diagnostic::new(
+                rule,
+                &doc.path,
+                name.line,
+                format!("`{}`, listed in § Coverage tiers, {what}", name.shown),
+            ));
+        }
+    }
+    diags
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -1111,5 +1514,111 @@ mod tests
             "See [the\nother doc](b.md).\n\n```\n[c](c.md)\n```\n",
         );
         assert_eq!(targets, BTreeSet::from(["docs/b.md".to_owned()]));
+    }
+
+    /// A docs/testing.md stand-in whose surface list names, in prose and in
+    /// the screen, the items `coverage_sources` defines, plus `extra` in the
+    /// prose list and `screen_extra` in the screen.
+    fn coverage_doc(extra: &str, screen_extra: &str) -> SourceFile
+    {
+        md(
+            COVERAGE_DOC,
+            &format!(
+                "# Testing\n\n## Coverage tiers\n\n`gone_before_the_list` is outside it.\n\n\
+                 **Boundary surface.** The surface is `core/a/*/tramp.rs` as a whole and\n\
+                 `info.cpu_count`, `per_cpu_init_*`, the `git grep -n -E\n'x|y' <head>` \
+                 command, `--runs 1`,{extra} and `frame::init`.\n\n\
+                 ```sh\n\
+                 git diff --stat \"$B\" <head> -- core/a/mm.rs \\\n    'core/a/*/tramp.rs'\n\
+                 S='MAX_WIDTH|send_(wake|halt)_ipi'\n\
+                 S=\"$S|VECTOR_[A-Z_]+|shoot(_range)?{screen_extra}\"\n\
+                 ```\n\n**Repeat count.** `left_out` is past the list.\n"
+            ),
+        )
+    }
+
+    fn coverage_sources() -> Vec<SourceFile>
+    {
+        vec![
+            md(
+                "core/a/mm.rs",
+                "const MAX_WIDTH: usize = 4;\nfn send_wake_ipi() {}\nfn send_halt_ipi() {}\n\
+                 const VECTOR_WAKE: u8 = 1;\nfn shoot() {}\nfn shoot_range() {}\n\
+                 fn per_cpu_init_slabs() {}\nfn f(info: &Info) { let _ = info.cpu_count; }\n\
+                 mod frame { pub fn init() {} }\nfn g() { frame::init(); }\n\
+                 // only_in_a_comment is named here and nowhere else.\n",
+            ),
+            md("xtask/src/x.rs", "fn only_in_xtask() {}\n"),
+        ]
+    }
+
+    fn coverage_check(doc: &SourceFile) -> Vec<(usize, String)>
+    {
+        let sources = coverage_sources();
+        let sources: Vec<&SourceFile> = sources.iter().collect();
+        let tracked: Vec<String> = ["core/a/mm.rs", "core/a/x86/tramp.rs", "xtask/src/x.rs"]
+            .map(str::to_owned)
+            .to_vec();
+        check_coverage_symbols(&[doc], &sources, &tracked)
+            .into_iter()
+            .map(|d| (d.line, d.message))
+            .collect()
+    }
+
+    #[test]
+    fn coverage_list_that_resolves_passes()
+    {
+        assert!(coverage_check(&coverage_doc("", "")).is_empty());
+    }
+
+    #[test]
+    fn coverage_name_missing_from_the_tree_is_reported_at_its_line()
+    {
+        let diags = coverage_check(&coverage_doc(" `renamed_away`,", ""));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].0, 9);
+        assert!(diags[0].1.contains("`renamed_away`"), "{}", diags[0].1);
+    }
+
+    #[test]
+    fn coverage_screen_group_is_expanded_into_each_alternative()
+    {
+        let diags = coverage_check(&coverage_doc("", "|send_(wake|park)_ipi"));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].0, 15);
+        assert!(diags[0].1.contains("`send_park_ipi`"), "{}", diags[0].1);
+    }
+
+    #[test]
+    fn coverage_name_only_in_a_comment_or_in_xtask_does_not_resolve()
+    {
+        let diags = coverage_check(&coverage_doc(" `only_in_a_comment`, `only_in_xtask`,", ""));
+        assert_eq!(diags.len(), 2, "{diags:?}");
+    }
+
+    #[test]
+    fn coverage_path_that_names_no_tracked_file_is_reported()
+    {
+        let doc = coverage_doc("", "");
+        let doc = md(
+            COVERAGE_DOC,
+            &doc.text.replace("core/a/mm.rs", "core/a/moved.rs"),
+        );
+        let diags = coverage_check(&doc);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].1.contains("`core/a/moved.rs`"), "{}", diags[0].1);
+    }
+
+    #[test]
+    fn coverage_list_without_its_bounding_paragraphs_is_reported()
+    {
+        let doc = coverage_doc("", "");
+        let doc = md(
+            COVERAGE_DOC,
+            &doc.text.replace("**Repeat count.**", "Repeat count."),
+        );
+        let diags = coverage_check(&doc);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].1.contains("**Repeat count.**"), "{}", diags[0].1);
     }
 }

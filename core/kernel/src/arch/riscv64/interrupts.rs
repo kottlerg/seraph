@@ -1454,6 +1454,7 @@ pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
                 ctx.op_name,
                 elapsed_ms
             );
+            crate::sched::ipi_watchdog_report_target(ctx.target_cpu);
             warned = true;
         }
         if !resent && elapsed_ms >= 250

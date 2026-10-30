@@ -67,9 +67,22 @@ impl Spinlock
     {
         let saved = save_and_disable_interrupts();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
-        while self.now_serving.load(Ordering::Acquire) != ticket
+        let serving = self.now_serving.load(Ordering::Acquire);
+        if serving != ticket
         {
-            core::hint::spin_loop();
+            // Contended: name the lock and the queue ahead for the IPI
+            // watchdog, which reports what a CPU that never acknowledges is
+            // waiting in (core/kernel/docs/scheduling-internals.md § IPI
+            // Watchdog Ladder).
+            crate::sched::ticket_wait_enter(
+                core::ptr::from_ref(self) as usize,
+                ticket.wrapping_sub(serving),
+            );
+            while self.now_serving.load(Ordering::Acquire) != ticket
+            {
+                core::hint::spin_loop();
+            }
+            crate::sched::ticket_wait_exit();
         }
         saved
     }

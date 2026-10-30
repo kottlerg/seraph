@@ -596,6 +596,100 @@ pub fn lock_wait_exit()
     }
 }
 
+/// Per-CPU breadcrumb of the ticket [`crate::sync::Spinlock`] a CPU is
+/// waiting for, for the IPI watchdog's escalation report: the lock's address
+/// (0 when no wait is recorded), how many tickets were ahead when the CPU
+/// joined the queue, and when it joined (`timer::elapsed_us`). A ticket lock
+/// spins with interrupts masked, so a CPU queued behind a long convoy cannot
+/// acknowledge an IPI; this names the lock and the convoy. Recorded only once
+/// the first acquisition check fails, so the uncontended path stores nothing.
+/// Diagnostic-only — never gates control flow.
+#[cfg(not(test))]
+static TICKET_WAIT_WORD: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+/// Tickets ahead at the join; see [`TICKET_WAIT_WORD`].
+#[cfg(not(test))]
+static TICKET_WAIT_AHEAD: [core::sync::atomic::AtomicU32; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_CPUS];
+/// Join time in microseconds; see [`TICKET_WAIT_WORD`].
+#[cfg(not(test))]
+static TICKET_WAIT_SINCE_US: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+
+/// Record that the current CPU is queued, `ahead` tickets back, on the ticket
+/// lock at address `word`. Called by `Spinlock::lock_raw` with interrupts
+/// masked, so the CPU index is stable; a lock is contended only once a second
+/// CPU runs, after every running CPU has installed its per-CPU base, which
+/// `current_cpu` reads. The word is published last (Release), so a reader
+/// that sees it sees the other two fields it was recorded with.
+#[cfg(not(test))]
+pub fn ticket_wait_enter(word: usize, ahead: u32)
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    if cpu < MAX_CPUS
+    {
+        let now = crate::arch::current::timer::elapsed_us().unwrap_or(0);
+        TICKET_WAIT_AHEAD[cpu].store(ahead, core::sync::atomic::Ordering::Relaxed);
+        TICKET_WAIT_SINCE_US[cpu].store(now, core::sync::atomic::Ordering::Relaxed);
+        TICKET_WAIT_WORD[cpu].store(word as u64, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Clear the current CPU's ticket-wait breadcrumb once it holds the lock.
+#[cfg(not(test))]
+pub fn ticket_wait_exit()
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    if cpu < MAX_CPUS
+    {
+        TICKET_WAIT_WORD[cpu].store(0, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Report what CPU `cpu` is waiting in, from its breadcrumbs, for the IPI
+/// watchdog's escalation phase: the protocol spin site, the bare-lock wait,
+/// the ticket-lock wait (with the tickets ahead at its join and how long ago
+/// it joined) and the last syscall entered there. Every field is a per-CPU
+/// atomic; another CPU may change them meanwhile, so each pair is reported
+/// only if it reads the same before and after. Serial only: the lock
+/// addresses are kernel VAs (core/kernel/docs/cross-boundary-disclosure.md
+/// § Kernel console diagnostics).
+#[cfg(not(test))]
+pub fn ipi_watchdog_report_target(cpu: usize)
+{
+    use core::sync::atomic::Ordering;
+    if cpu >= MAX_CPUS
+    {
+        return;
+    }
+    let spin = SPIN_SITE[cpu].load(Ordering::Relaxed);
+    let kind_before = LOCK_WAIT_KIND[cpu].load(Ordering::Acquire);
+    let lock_kind = LockKind::from_code(kind_before)
+        .filter(|_| LOCK_WAIT_KIND[cpu].load(Ordering::Acquire) == kind_before);
+    let word = TICKET_WAIT_WORD[cpu].load(Ordering::Acquire);
+    let ahead = TICKET_WAIT_AHEAD[cpu].load(Ordering::Relaxed);
+    let since = TICKET_WAIT_SINCE_US[cpu].load(Ordering::Relaxed);
+    let word_stable = TICKET_WAIT_WORD[cpu].load(Ordering::Acquire) == word;
+    let now = crate::arch::current::timer::elapsed_us().unwrap_or(since);
+    crate::kprintln_serial!(
+        "  target cpu{}: spin={} bare_lock={} last_syscall={}",
+        cpu,
+        spin_site_name(spin),
+        lock_kind.map_or("none", LockKind::name),
+        CPU_SYSCALL_NR[cpu].load(Ordering::Relaxed)
+    );
+    if word != 0 && word_stable
+    {
+        crate::kprintln_serial!(
+            "  target cpu{}: ticket lock @0x{:x} ahead_at_join={} waited_ms={}",
+            cpu,
+            word,
+            ahead,
+            now.saturating_sub(since) / 1_000
+        );
+    }
+}
+
 /// Current CPU index plus one, for lock-holder stamps (0 means no holder).
 #[cfg(not(test))]
 pub fn cpu_stamp() -> u32
@@ -678,6 +772,12 @@ pub fn lock_wait_enter(_kind: LockKind, _word: usize) {}
 /// Test stub; see [`lock_wait_enter`].
 #[cfg(test)]
 pub fn lock_wait_exit() {}
+/// Test stub; see [`ticket_wait_enter`].
+#[cfg(test)]
+pub fn ticket_wait_enter(_word: usize, _ahead: u32) {}
+/// Test stub; see [`ticket_wait_exit`].
+#[cfg(test)]
+pub fn ticket_wait_exit() {}
 /// Test stub; see [`cpu_stamp`].
 #[cfg(test)]
 pub fn cpu_stamp() -> u32

@@ -1138,7 +1138,7 @@ phases keyed off the elapsed-microseconds delta from the start of the wait:
 |---|---|---|
 | A | 0 – 250 ms | Spin with `core::hint::spin_loop()` while `cond()` reports unacked. |
 | B | 250 – 750 ms | Call `ctx.resend()` once at the boundary, then continue spinning. Recovers from a dropped IPI under emulators with non-deterministic LAPIC delivery. |
-| C | 750 ms – 5 s | x86-64: increment the per-CPU request count returned by `nmi_backtrace_request(target_cpu)` and send a vector-2 NMI to that CPU; the target's dedicated NMI handler dumps its `TrapFrame` to serial so the eventual Phase-D panic is diagnosable. RISC-V: emit a single logged warning (no S-mode NMI surface; Phase C degrades to a warn). |
+| C | 750 ms – 5 s | Both arches: print, serial-only, what the target CPU is waiting in, from its per-CPU breadcrumbs (`sched::ipi_watchdog_report_target`): its protocol spin site, its bare-lock wait, its ticket-`Spinlock` wait (the lock, the tickets ahead when it joined the queue, and how long it has waited; `Spinlock::lock_raw` records it once its first check fails), and the last syscall entered there. x86-64 also: increment the per-CPU request count returned by `nmi_backtrace_request(target_cpu)` and send a vector-2 NMI to that CPU; the target's dedicated NMI handler dumps its `TrapFrame` to serial so the eventual Phase-D panic is diagnosable. RISC-V: emit a single logged warning (no S-mode NMI surface; Phase C degrades to a warn). |
 | D | > 5 s | Print `target_cpu`, `op_name`, `elapsed_ms` to serial, then `crate::fatal`. |
 
 `wait_for_ack` MUST be called with preemption disabled and `IF=1` / `sstatus.SIE=1` — the same

@@ -181,9 +181,11 @@ unsafe fn stage_move(
 
     let inserted = match dst_idx
     {
-        // SAFETY: caller contract; the destination lock is held.
         None =>
-        unsafe { (*dst_cspace).insert_cap(tag, rights, object) },
+        {
+            // SAFETY: caller contract; the destination lock is held.
+            unsafe { (*dst_cspace).insert_cap(tag, rights, object) }
+        }
         Some(idx) =>
         {
             // SAFETY: caller contract; the destination lock is held.

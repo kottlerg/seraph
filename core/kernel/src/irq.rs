@@ -23,12 +23,10 @@
 //!
 //! # Sharing
 //! A line routes to at most one notification. Every wired line the kernel serves
-//! has a single owner: devmgr delegates no private Interrupt cap for a shared
-//! `INTx` line, whose driver polls instead
-//! (docs/device-management.md), and devices that share an interrupt source get
-//! per-vector message-signaled interrupts, not a shared wired line (#325). A
-//! second registration on a line replaces the first (`SYS_IRQ_REGISTER`,
-//! core/kernel/docs/syscalls.md).
+//! has a single owner: devmgr delegates a private Interrupt cap only for a line no
+//! other device holds (docs/device-management.md § Interrupt Delivery); serving
+//! shared lines is an open design (#664). A second registration on a line
+//! replaces the first (`SYS_IRQ_REGISTER`, core/kernel/docs/syscalls.md).
 //!
 //! # Thread safety
 //! The interrupt-context lookup in `dispatch_device_irq` is lock-free: it reads

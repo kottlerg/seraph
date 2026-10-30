@@ -249,13 +249,14 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 The entries left open are tracked by the Issue each recommendation names: the vector space by
 [#325](https://github.com/kottlerg/seraph/issues/325), the per-CPU slabs by
 [#636](https://github.com/kottlerg/seraph/issues/636), the vector-register save area by
-[#658](https://github.com/kottlerg/seraph/issues/658), and `IOAPICS` by the boot section's Issue.
+[#658](https://github.com/kottlerg/seraph/issues/658), shared lines by
+[#664](https://github.com/kottlerg/seraph/issues/664), and `IOAPICS` by the boot section's Issue.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
 | IRQ routing table (`irq::init_table`) | `core/kernel/src/irq.rs` | one entry per line the discovered controllers implement (`interrupts::irq_line_count`) | hardware (the discovered I/O APICs' GSIs; the PLIC's `riscv,ndev`) | 24 B per line from the buddy at Phase 5 | correct as is | None |
 | `unregister_notification` walk | `core/kernel/src/irq.rs` | the routed lines (`LineSet`) | provable unreachability (scales with the registrations) | none | correct as is | None |
-| `IrqRoute.notification` | `core/kernel/src/irq.rs` | one per line | single owner per wired line: devmgr delegates no shared `INTx` line, and shared sources get message-signaled interrupts (#325) | none | correct as is | None |
+| `IrqRoute.notification` | `core/kernel/src/irq.rs` | one per line | single owner per wired line: devmgr carves each line once (its "One IRQ-bearing driver per INTx line" row) | none | needs a design | Shared `INTx` lines, with the kernel's notification binding and acknowledgement semantics for them (#664) |
 | x86_64 `DEVICE_VECTOR_COUNT` (`VECTOR_GSI`) | `core/kernel/src/arch/x86_64/ioapic.rs` | 217 device vectors (33-249), one generated stub each | hardware spec (x86 vector space less the exception, timer, IPI and spurious vectors), on one destination's vector space | 868 B BSS, 217 stubs of 16 B | needs a design | GSIs routed at once stop at 217; per-CPU vector spaces belong with the MSI work (#325) |
 | x86_64 `ROOT_IRQ_COUNT`, `MAX_IRQ_ID` | `core/kernel/src/arch/x86_64/mod.rs` | `MAX_IOAPICS` x `IOAPIC_MAX_PINS` = 2048 / 2047 | ABI width (boot protocol) times hardware spec (8-bit redirection-entry count) | none | correct as is | Follows `MAX_IOAPICS`; a GSI above it is logged at boot |
 | `IOAPIC_MAX_PINS` | `core/kernel/src/arch/x86_64/ioapic.rs` | 256 | hardware spec (I/O APIC version register) | none | correct as is | None |

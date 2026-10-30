@@ -154,9 +154,11 @@ that cap's address.
 
 A driver receives a wired interrupt line as a single-line `Interrupt` cap that devmgr splits
 from the root range, and binds it to a Notification with `SYS_IRQ_REGISTER`. A line routes to one
-notification at a time: devmgr delegates no private cap for a shared `INTx` line (that driver
-polls, § Driver binary sources), and devices that need several interrupts get message-signaled
-ones, not a shared wired line (design intent, not yet implemented;
+notification at a time: devmgr delegates a private cap only for a line no other device holds. A
+driver that accepts a round without one (virtio-input) polls, and a virtio-blk disk on a line
+another device holds is not served (§ Relationship to Other Services); serving shared lines is an
+open design ([#664](https://github.com/kottlerg/seraph/issues/664)), and devices that need
+several interrupts are to get message-signaled ones (design intent, not yet implemented;
 [#325](https://github.com/kottlerg/seraph/issues/325)). The kernel delivers each registered line
 to one CPU, chosen when the line is registered by taking the CPUs in turn, so the interrupts of
 several devices spread over the CPUs. On x86-64 only CPUs whose APIC id an I/O APIC can name

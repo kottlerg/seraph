@@ -104,10 +104,11 @@ pub unsafe fn child_args<T: Copy>(arg: u64) -> T
 /// A test that deletes a cap before the guard goes calls
 /// [`delete_thread`](Self::delete_thread) or
 /// [`delete_cspace`](Self::delete_cspace), or drops the guard, rather than
-/// `cap_delete` on the field: each clears its field once the delete has
-/// taken the cap, so a handle is deleted once, and the drop never deletes a
+/// `cap_delete` on the field: each clears its field once the cap is gone (the
+/// delete took it, or was refused with `InvalidCapability` because the handle
+/// names no cap), so a handle is deleted once, and the drop never deletes a
 /// stale handle a recycled slot's wrapped generation would alias to another
-/// cap. Any other refusal leaves the cap in place (`InvalidState` for a
+/// cap. Every other refusal leaves the cap in place (`InvalidState` for a
 /// revoke, move, or IPC transfer in flight on the slot, `Interrupted` for a
 /// delete a concurrent derive cut short; `core/kernel/docs/syscalls.md`
 /// § `SYS_CAP_REVOKE` and § `SYS_CAP_DELETE`), so the field keeps it and the

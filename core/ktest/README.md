@@ -230,11 +230,13 @@ test, apply through `scaled_bound` (`src/main.rs`), or through `scaled_polls` fo
 multiplied past it by the oversubscription factor the width implies (CPUs / 16), by which each
 cross-CPU handoff slows, so the bound still separates a slow step from a stuck or wrong one. They
 are the report bound of `tally::await_report` and `tally::await_all`; the round bounds of
-`configure_start_race`, `stop_target_vanishes`, `thread_cap_delete_under_use` and
-`copy_source_delete`, and the exit polls of the last two; the acknowledgement, result, approach,
-sync and entry bounds of `stop_claimed_delete`, `stop_park_race`, `stop_fault_sender` and
-`timed_wait_reuse`; the acknowledgement and exit bounds of `stop_source_delete`; the preemption
-budget of `integration::priority_preemption`; the expiry and report bounds of
+`configure_start_race`, `stop_target_vanishes`, `thread_cap_delete_under_use`,
+`copy_source_delete` and `affinity_swap_handoff`, and the exit polls of
+`thread_cap_delete_under_use` and `copy_source_delete`; the pinned-CPU report wait of
+`priority_dealloc_race`; the acknowledgement, result, approach, sync and entry bounds of
+`stop_claimed_delete`, `stop_park_race`, `stop_fault_sender` and `timed_wait_reuse`; the
+acknowledgement and exit bounds of `stop_source_delete`; the preemption budget of
+`integration::priority_preemption`; the expiry and report bounds of
 `integration::queued_waiters_fifo`; the observation window and finish wait of
 `integration::irq_preserves_user_regs`; the child waits of `integration::stop_read_regs_remote`; the
 probe and redirect polls of `integration::write_regs_blocked_syscall`; the report bounds of
@@ -244,11 +246,10 @@ probe and redirect polls of `integration::write_regs_blocked_syscall`; the repor
 event and memory polls of `integration::fault_kills_thread`,
 `integration::fault_exception_no_handler_kills`, `integration::fault_handler_declines_kills`,
 `integration::aspace_fault_notification_late_bind`, `integration::death_notification_late_bind`,
-`integration::death_observer_outlives_queue_caps`,
-`integration::reply_binding_displaced`, `integration::syscall_rflags_hardening`,
-`integration::page_fault_present_bit`, `integration::mmio_revoke_unmaps`,
-`integration::ioport_revoke`, `integration::umip_descriptor_reads_fault`,
-`cap::cspace_self_delete_stops_caller` and
+`integration::death_observer_outlives_queue_caps`, `integration::reply_binding_displaced`,
+`integration::syscall_rflags_hardening`, `integration::page_fault_present_bit`,
+`integration::mmio_revoke_unmaps`, `integration::ioport_revoke`,
+`integration::umip_descriptor_reads_fault`, `cap::cspace_self_delete_stops_caller` and
 `retype::aspace_self_delete_stops_caller`; the phase polls, the child's spin bound and the cleanup
 exit wait of `integration::tlb_widen_retry` (the cleanup wait only gives up, and is stretched so its
 `cap_delete` does not race a still-running pinned child); the migration polls of
@@ -274,11 +275,7 @@ pools and racing pairs, whose workload may run long (`concurrent_map_unmap`, `co
 `retype_concurrent`, `load_balance_handoff_steal`, `event_try_recv_post_race`); the per-round
 acknowledgements of `idle_wake_race`, whose untimed `notification_wait` is the path under test;
 and the liveness gates `cap_delete_reply_wake` (its woke wait) and `stop_resume_race` (its done
-wait), where a lost wake is the defect the watchdog reports. One state barrier stays a fixed
-sleep: `priority_dealloc_race` waits 1 ms for each worker it pins in Phase 2 to run on its new
-CPU, because its workers stay pure userspace spinners with no way to report it; workers that report
-their CPU through syscalls wedge the kernel
-([#529](https://github.com/kottlerg/seraph/issues/529)).
+wait), where a lost wake is the defect the watchdog reports.
 
 | File | Scenario | Knobs |
 |---|---|---|
@@ -312,6 +309,7 @@ their CPU through syscalls wedge the kernel
 | `timed_waiter_thread_delete.rs` | Delete a timed waiter's last Thread cap around its deadlines (plain sleep, notification, event queue) (≥ 2 CPUs) | `CYCLES=192`†, `WAIT_MS=1` |
 | `timed_wait_reuse.rs` | A timed wait claimed by a delivery at its deadline, followed by an untimed wait on the same source: the untimed wait never returns a timeout (≥ 2 CPUs) | `CYCLES=400`†, `WAIT_MS=1` |
 | `double_enqueue_storm.rs` | Run-queue double-link guard regression (#244): wake + priority + affinity churn, then wake racing `cap_delete(Thread)` | `NUM_WORKERS=32`, `CYCLES=600`† |
+| `affinity_swap_handoff.rs` | Swap the affinities of pairs of workers that each own one CPU of their pair and report their CPU and yield in a loop, so both CPUs of a pair hand their outgoing thread to the other in `schedule()`'s cross-affinity requeue at once; every round must see every worker on its new CPU (#529, the dispatch wait for an unpublished `next` closing into a cycle) (≥ 2 CPUs) | `MAX_PAIRS=8`, `ROUNDS=400`† |
 | `event_try_recv_post_race.rs` | A non-blocking `SYS_EVENT_RECV` try-once racing a concurrent `event_post` must never leave the poller wakeable (#352) (≥ 2 CPUs) | `CYCLES=1024` |
 | `load_balance_handoff_steal.rs` | Arm the load-balancer mid-handoff steal (#314/#293): unpinned IPC clients vs round-robin-pinned servers expose `pull_unpinned_ready` stealing a `context_saved == 0` thread (≥ 2 CPUs) | `NUM_PAIRS=16`, `ITERS=16000`† |
 | `concurrent_notification.rs` | Multiple threads sending distinct bits to one notification simultaneously | `NUM_SENDERS=64`, `SEND_ITERATIONS=5000` |

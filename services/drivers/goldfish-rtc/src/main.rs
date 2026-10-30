@@ -173,6 +173,9 @@ fn main() -> !
     // arena, owned for the process's lifetime, and devmgr carves the RTC
     // `Mmio` cap as one page (`carve_rtc_authority`), so the whole-region
     // mapping stays inside it: VA no Rust object or IPC page occupies.
+    // `read_epoch_ns` reaches the mapping only through raw `read_volatile`,
+    // never a reference, and the reservation stays held for the process's
+    // lifetime (`mmio_map` § Safety).
     if unsafe { syscall::mmio_map(info.self_aspace, caps.mmio_cap, base_va, 0) }.is_err()
     {
         std::os::seraph::log!("mmio_map failed");

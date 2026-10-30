@@ -78,7 +78,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         let mut children = [const { spawn::SpawnedChild::EMPTY }; NUM_CALLERS];
 
         // Start all callers simultaneously (no yields between starts).
-        for i in 0..NUM_CALLERS
+        for (i, slot) in children.iter_mut().enumerate()
         {
             let child =
                 spawn::new_child(ctx).map_err(|_| "concurrent_ipc: spawn::new_child failed")?;
@@ -109,7 +109,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             unsafe { spawn::configure_and_start(&child, caller_entry, stack_top, arg) }
                 .map_err(|_| "concurrent_ipc: configure_and_start failed")?;
 
-            children[i] = child;
+            *slot = child;
         }
 
         // Server: receive and reply to all callers.

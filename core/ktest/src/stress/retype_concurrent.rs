@@ -67,7 +67,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     let mut workers = [const { crate::spawn::SpawnedChild::EMPTY }; NUM_WORKERS];
 
-    for i in 0..NUM_WORKERS
+    for (i, slot) in workers.iter_mut().enumerate()
     {
         let cs = cap_create_cspace(memory, 0, 4)
             .map_err(|_| "stress::retype_concurrent: create_cspace failed")?;
@@ -81,7 +81,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::retype_concurrent: cap_copy done failed")?;
         let th = cap_create_thread(memory, ctx.aspace_cap, cs, 0, 0)
             .map_err(|_| "stress::retype_concurrent: create_thread failed")?;
-        workers[i] = crate::spawn::SpawnedChild { th, cs };
+        *slot = crate::spawn::SpawnedChild { th, cs };
 
         // SAFETY: worker `i` has not been started yet; the block is reused
         // only after every worker has been reaped.

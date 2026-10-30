@@ -60,7 +60,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Spawn `NUM_SENDERS` sender threads.
     let mut children = [const { spawn::SpawnedChild::EMPTY }; NUM_SENDERS];
 
-    for i in 0..NUM_SENDERS
+    for (i, slot) in children.iter_mut().enumerate()
     {
         let child = spawn::new_child(ctx)
             .map_err(|_| "concurrent_notification: spawn::new_child failed")?;
@@ -90,7 +90,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         unsafe { spawn::configure_and_start(&child, sender_entry, stack_top, arg) }
             .map_err(|_| "concurrent_notification: configure_and_start failed")?;
 
-        children[i] = child;
+        *slot = child;
     }
 
     // Wait for all senders to report done. Each child ORs a unique bit into

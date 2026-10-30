@@ -3,18 +3,10 @@
 
 // services/svctest/src/phases/mod.rs
 
-//! Test-phase registry, organised by **services-tier surface under
-//! test**.
-//!
-//! Rule (durable, codifies the #21 structural refactor):
-//!
-//! > **One module per services-tier surface (or kernel/runtime
-//! > surface) under test. New service ⇒ new module.**
-//!
-//! Adding tests for an as-yet-unwritten service is a new file under
-//! this directory plus one line in [`all`] to register the module's
-//! phases at the right point in the ordered sequence. Files don't
-//! grow unboundedly because each is scoped to one surface.
+//! Test-phase registry. The module layout (one module per surface under
+//! test) is specified in `services/svctest/README.md` § Source Layout; a new
+//! module registers its phases with one line in [`all`], at the point the
+//! ordering constraints below require.
 //!
 //! ### Ordering constraints (encoded by composition order in `all()`)
 //!

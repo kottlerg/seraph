@@ -11,7 +11,8 @@
 //! shell, ls) is a separate tier (tracked under #103); svctest's
 //! scope is the services surface.
 //!
-//! Module layout (see [`phases`] docstring for the durable rule):
+//! Module layout (the layout rule is in `services/svctest/README.md`
+//! § Source Layout):
 //!
 //! * [`bootstrap`] — typed `Caps` from the creator-endpoint round.
 //! * [`runner`] — `Phase` struct + uniform log envelope; the failure

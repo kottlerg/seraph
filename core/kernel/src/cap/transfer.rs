@@ -188,14 +188,18 @@ unsafe fn stage_move(
 
     let dst_idx_nz = match placement
     {
-        // SAFETY: caller contract; the destination lock is held.
         Placement::Any =>
         {
-            unsafe { (*dst_cspace).insert_cap(tag, rights, object) }.map_err(SyscallError::from)?
+            // SAFETY: caller contract; the destination lock is held.
+            let r = unsafe { (*dst_cspace).insert_cap(tag, rights, object) };
+            r.map_err(SyscallError::from)?
         }
-        // SAFETY: caller contract; the destination lock is held.
-        Placement::IpcTransfer => unsafe { (*dst_cspace).insert_cap_transfer(tag, rights, object) }
-            .map_err(SyscallError::from)?,
+        Placement::IpcTransfer =>
+        {
+            // SAFETY: caller contract; the destination lock is held.
+            let r = unsafe { (*dst_cspace).insert_cap_transfer(tag, rights, object) };
+            r.map_err(SyscallError::from)?
+        }
         Placement::At(idx) =>
         {
             // SAFETY: caller contract; the destination lock is held.

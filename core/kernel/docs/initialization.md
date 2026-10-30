@@ -619,7 +619,10 @@ calls `sched::enter()`.
    c. Priority: INIT_PRIORITY (30)
    d. Mint the Thread cap (CONTROL) for init's thread into the root CSpace
    e. Mint the CSpace cap (INSERT | DELETE | DERIVE) for the root CSpace into
-      itself, then patch both slots into InitInfo
+      itself, then patch both slots into InitInfo. The cap takes over the CSpace's
+      creation reference, the kernel's hold on it through boot, so from here the
+      root CSpace is an ordinary CSpace held by its capabilities (capability-internals.md
+      [§ Initial CSpace Population](capability-internals.md#initial-cspace-population))
    f. cspace: take the root CSpace pointer with `cap::take_root_cspace` (which clears
       ROOT_CSPACE) and store it, with its id and registry epoch, in the init TCB
 6. Zero every `BootInfo.reclaim_ranges` entry, late-flagged ones included, through the

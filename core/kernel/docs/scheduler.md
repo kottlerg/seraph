@@ -66,10 +66,9 @@ space is uniform; any partition into tiers is userspace policy, expressed by how
   (`sched_policy::BASELINE_PRIORITY_MAX` in `shared/ipc`) and an elevated
   remainder `[29, PRIORITY_MAX]` that never leaves init — init's own boot thread
   (kernel-placed at `INIT_PRIORITY` = 30) is the only occupant above the
-  baseline. After init's reap the remainder stays in init's CSpace, which the
-  kernel pins (it is the root CSpace), so it remains alive but unreachable;
-  releasing it at the reap is design intent, not yet implemented
-  ([#540](https://github.com/kottlerg/seraph/issues/540); see
+  baseline. The remainder lives until init's reap, whose teardown of init's
+  CSpace releases it, so from then on no process holds authority over
+  `[29, PRIORITY_MAX]` (see
   [process-lifecycle.md § Init reap](../../../docs/process-lifecycle.md#init-reap)).
 - Every spawned process receives a band through
   `ProcessInfo.sched_control_cap`. Init hands memmgr and procmgr each a copy of the

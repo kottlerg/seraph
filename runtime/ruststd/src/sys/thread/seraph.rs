@@ -657,9 +657,7 @@ mod reaper {
         if cur != 0 {
             return cur;
         }
-        // EventQueue retype size = 80 + (capacity + 1) * 8 bytes; over-request a
-        // little so the slab definitely covers it (fresh dedicated cap path).
-        let want = (u64::from(EQ_CAPACITY) + 1) * 8 + 256;
+        let want = syscall_abi::event_queue_retype_bytes(u64::from(EQ_CAPACITY));
         let made = crate::sys::alloc::seraph::object_slab_retype(want, |slab| {
             syscall::event_queue_create(slab, EQ_CAPACITY).ok()
         });

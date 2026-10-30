@@ -3549,12 +3549,10 @@ unsafe fn dealloc_object_one(
             // dispatch_for is total over the kernel's retypable types; the
             // Endpoint arm always returns Some. Unwrap-or-fall-through with
             // a fallback raw size keeps the lint quiet without panicking. The
-            // fallback mirrors dispatch_for's computed value (24 wrapper +
-            // EndpointState) so it cannot drift from the alloc-side size.
-            let raw_bytes = dispatch_for(ObjectType::Endpoint, 0).map_or(
-                24 + core::mem::size_of::<crate::ipc::endpoint::EndpointState>() as u64,
-                |e| e.raw_bytes,
-            );
+            // fallback is the ABI constant the Endpoint arm returns, so it
+            // cannot drift from the alloc-side size.
+            let raw_bytes = dispatch_for(ObjectType::Endpoint, 0)
+                .map_or(syscall::ENDPOINT_RETYPE_BYTES, |e| e.raw_bytes);
 
             // SAFETY: ancestor_ptr is non-null; it was set by `with_ancestor`
             // at retype time and points at the source MemoryObject's header.
@@ -3662,11 +3660,11 @@ unsafe fn dealloc_object_one(
             );
             // Wrapper + state are in-place inside the ancestor Memory cap's
             // region.
-            use crate::cap::retype::{NOTIFICATION_RAW_BYTES, dispatch_for, retype_free};
+            use crate::cap::retype::{dispatch_for, retype_free};
             // dispatch_for always returns Some for Notification; the fallback is
-            // the same constant its Notification arm returns.
+            // the same ABI constant its Notification arm returns.
             let raw_bytes = dispatch_for(ObjectType::Notification, 0)
-                .map_or(NOTIFICATION_RAW_BYTES, |e| e.raw_bytes);
+                .map_or(syscall::NOTIFICATION_RETYPE_BYTES, |e| e.raw_bytes);
 
             // SAFETY: ancestor_ptr is non-null per debug_assert; the
             // MemoryObject is kept alive by the retype-time refcount lease.
@@ -3753,8 +3751,9 @@ unsafe fn dealloc_object_one(
                 !ancestor_ptr.is_null(),
                 "EventQueue: every production cap is retype-backed via cap_create_event_queue"
             );
-            use crate::cap::retype::{event_queue_raw_bytes, retype_free};
-            let raw_bytes = event_queue_raw_bytes(u64::from(capacity));
+            use crate::cap::retype::retype_free;
+            // The same ABI formula `dispatch_for` debited at creation.
+            let raw_bytes = syscall::event_queue_retype_bytes(u64::from(capacity));
             // SAFETY: ancestor_ptr non-null.
             let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
             let header_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);

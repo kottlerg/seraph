@@ -1123,24 +1123,28 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
     }
 }
 
-// Pins the ABI retype-cost constants `dispatch_for` debits to the kernel's
-// real object sizes. The EventQueue formula is linear in the capacity, so
-// agreement at two capacities is agreement at every capacity.
+// Pins the ABI retype-cost constants `dispatch_for` debits (and the reclaim
+// path in cap/object.rs credits back) to the kernel's real object sizes. The
+// ABI EventQueue formula is checked against the kernel's layout formula at
+// the smallest, next and largest capacities `sys_cap_create_event_queue`
+// accepts (both bodies are affine in the capacity).
 const _: () = {
     assert!(
         24 + core::mem::size_of::<crate::ipc::endpoint::EndpointState>() as u64
             == syscall::ENDPOINT_RETYPE_BYTES
     );
     assert!(NOTIFICATION_RAW_BYTES == syscall::NOTIFICATION_RETYPE_BYTES);
-    // The WaitSet debit is a declared budget, the wrapper plus 440: pin that
-    // it is that budget and that the real state fits it.
-    assert!(syscall::WAIT_SET_RETYPE_BYTES == 24 + 440);
+    // The WaitSet debit is a declared budget: the real state must fit it.
     assert!(
         24 + core::mem::size_of::<crate::ipc::wait_set::WaitSetState>() as u64
             <= syscall::WAIT_SET_RETYPE_BYTES
     );
     assert!(event_queue_raw_bytes(0) == syscall::event_queue_retype_bytes(0));
     assert!(event_queue_raw_bytes(1) == syscall::event_queue_retype_bytes(1));
+    assert!(
+        event_queue_raw_bytes(syscall::EVENT_QUEUE_MAX_CAPACITY as u64)
+            == syscall::event_queue_retype_bytes(syscall::EVENT_QUEUE_MAX_CAPACITY as u64)
+    );
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

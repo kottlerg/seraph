@@ -436,9 +436,10 @@ impl Command {
         // observer on the child, so a terminal fault in *any* of the child's
         // threads (not just the main thread) posts the fault class to this
         // queue and `wait()` returns.
-        let bytes = syscall_abi::event_queue_retype_bytes(4);
+        const DEATH_EQ_CAPACITY: u32 = 4;
+        let bytes = syscall_abi::event_queue_retype_bytes(u64::from(DEATH_EQ_CAPACITY));
         let death_eq = crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
-            syscall::event_queue_create(slab, 4).ok()
+            syscall::event_queue_create(slab, DEATH_EQ_CAPACITY).ok()
         })
         .ok_or_else(|| {
                 // The child does not exist yet; just drop the file cap we

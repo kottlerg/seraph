@@ -161,7 +161,8 @@ pub const WAIT_SET_RETYPE_BYTES: u64 = 464;
 
 /// Raw retype debit of one `EventQueue` of user-visible `capacity` entries, in
 /// bytes: the 24-byte wrapper, the 56-byte queue state, and `capacity + 1`
-/// eight-byte ring slots, all inline in the retype slot.
+/// eight-byte ring slots, all inline in the retype slot. `capacity` is one the
+/// kernel accepts, `1..=EVENT_QUEUE_MAX_CAPACITY`; a larger value can overflow.
 #[must_use]
 pub const fn event_queue_retype_bytes(capacity: u64) -> u64
 {

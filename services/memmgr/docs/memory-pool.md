@@ -97,9 +97,9 @@ frees a slot (see [Coalescing](#coalescing)).
    first. Bound the returned-cap count by the IPC reply-side cap-slot limit;
    if the pool cannot satisfy `want_pages` within that bound, return
    `OUT_OF_MEMORY_BEST_EFFORT`. The same code is returned if deriving the
-   caller's copy of a selected cap fails. Either error reply carries three
-   diagnostic data words: total free pages, free-run count, and the largest
-   run in pages.
+   caller's copy of a selected cap fails. A failure of pool selection carries
+   three diagnostic data words (total free pages, free-run count, and the
+   largest run in pages); a failure to derive the caller's copy carries none.
 
 Each Memory cap returned to the caller is a derive-twice copy: memmgr
 retains an intermediary in its own CSpace and hands the second derivation

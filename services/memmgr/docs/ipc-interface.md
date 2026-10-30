@@ -132,7 +132,7 @@ Best-effort replies may use the full reply-side capacity.
 | Field | Value |
 |---|---|
 | label | Nonzero error code |
-| data[0..3] | Only on codes 1 and 2: total free pages, free-run count, and the largest free run in pages |
+| data[0..3] | Only on codes 1 and 2, and only when pool selection fails (not when deriving the caller's copy fails): total free pages, free-run count, and the largest free run in pages |
 
 **Error codes:**
 

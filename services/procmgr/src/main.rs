@@ -388,7 +388,7 @@ const CSPACE_TOPUP_SLOTS: u64 = 1024;
 
 /// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots, so
 /// its allocations never meet an exhausted `CSpace` and its receives keep the
-/// IPC receive reserve (services/procmgr/README.md § CSpace headroom). A
+/// IPC receive reserve (services/procmgr/README.md § `CSpace` headroom). A
 /// failed top-up is retried on the next loop pass; `warned` limits the log
 /// to the first failure of a streak.
 fn hold_cspace_headroom(self_cspace: u32, warned: &mut bool)

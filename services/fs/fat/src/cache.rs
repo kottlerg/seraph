@@ -176,13 +176,13 @@ pub enum InitError
 
 impl PageCache
 {
-    /// Fund `self_cspace` for the cache's caps, allocate `SLOT_COUNT`
+    /// Fund the fs process's own `cspace` for the cache's caps, allocate `SLOT_COUNT`
     /// single-page Memory caps, reserve a contiguous VA window, map each
     /// memory cap into its slot's VA, and return the process-static cache.
     pub fn init(
         memmgr_ep: u32,
         self_aspace: u32,
-        self_cspace: u32,
+        cspace: u32,
         ipc_buf: *mut u64,
     ) -> Result<&'static Self, InitError>
     {
@@ -193,7 +193,7 @@ impl PageCache
         // The slot pages and their quarantine replacements are one Memory cap
         // each; fund the slots up front so filling the cache never meets an
         // exhausted CSpace.
-        if !std::os::seraph::fund_cspace_slot_budget(self_cspace, CACHE_CSPACE_FUNDING)
+        if !std::os::seraph::fund_cspace_slot_budget(cspace, CACHE_CSPACE_FUNDING)
         {
             return Err(InitError::CSpace);
         }

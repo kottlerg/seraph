@@ -885,12 +885,7 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
     // failing reply, which must leave it untouched.
     let xfer = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification(xfer) for reply_oom test failed")?;
-    let mut reserve_caps = [0u32; 4];
-    for c in &mut reserve_caps
-    {
-        *c = cap_create_notification(ctx.memory_base)
-            .map_err(|_| "cap_create_notification(reserve) for reply_oom test failed")?;
-    }
+    let reserve_caps = mint_notifications(ctx.memory_base)?;
 
     // Small child CSpace: a single seeded pool page (55 usable slots)
     // whose general slots the child consumes by creating notifications
@@ -964,14 +959,8 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
     {
         return Err("reply_oom: ipc_recv returned wrong label");
     }
-    let reserve_reply = IpcMessage::builder(0xBEEF)
-        .cap(reserve_caps[0])
-        .cap(reserve_caps[1])
-        .cap(reserve_caps[2])
-        .cap(reserve_caps[3])
-        .build();
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-    unsafe { ipc::ipc_reply(&reserve_reply, ctx.ipc_buf) }
+    unsafe { ipc::ipc_reply(&four_cap_message(0xBEEF, reserve_caps), ctx.ipc_buf) }
         .map_err(|_| "reply_oom: the reply into the caller's reserve failed")?;
 
     // The second call: the reserve is spent.
@@ -1018,6 +1007,30 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
     }
     child.delete_cspace().ok();
     Ok(())
+}
+
+/// Mint `MSG_CAP_SLOTS_MAX` (4) notifications from `memory` for a
+/// cap-bearing message.
+fn mint_notifications(memory: u32) -> Result<[u32; 4], &'static str>
+{
+    let mut caps = [0u32; 4];
+    for c in &mut caps
+    {
+        *c = cap_create_notification(memory)
+            .map_err(|_| "cap_create_notification for a four-cap message failed")?;
+    }
+    Ok(caps)
+}
+
+/// A message labelled `label` carrying the four `caps`.
+fn four_cap_message(label: u64, caps: [u32; 4]) -> IpcMessage
+{
+    IpcMessage::builder(label)
+        .cap(caps[0])
+        .cap(caps[1])
+        .cap(caps[2])
+        .cap(caps[3])
+        .build()
 }
 
 /// Child for `reply_oom_wakes_caller_with_transfer_failed`: registers IPC

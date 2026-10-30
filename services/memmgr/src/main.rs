@@ -1846,7 +1846,7 @@ fn cspace_headroom(self_cspace: u32) -> u64
 /// donating pool frames to its slot-page pool (augment-mode
 /// `cap_create_cspace`), so its own splits and derivations never meet an
 /// exhausted `CSpace` and its receives keep the IPC receive reserve
-/// (services/memmgr/docs/memory-pool.md § CSpace headroom). The donated
+/// (services/memmgr/docs/memory-pool.md § `CSpace` headroom). The donated
 /// pages leave the free pool for good, like the metadata arena's: they stay
 /// in `pool_total` as memmgr-owned metadata. memmgr cannot ask anyone else
 /// for this memory, which is why it funds itself from its own pool. A

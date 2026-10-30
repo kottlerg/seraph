@@ -26,7 +26,9 @@ states. The wrappers whose effect the types cannot bound are `unsafe fn`, each w
 `# Safety` contract:
 `ipc_buffer_set` (the registered page is dedicated to the kernel's IPC access), `mem_map`,
 `mem_unmap`, `mem_unmap_reclaim`, `mem_protect` and `mmio_map` (on the caller's own address
-space, no live object or registered IPC page in the span), and `thread_configure`,
+space, no live object or registered IPC page in the span; for `mmio_map`, also no Rust reference
+into the mapping, which any ancestor holder can withdraw, so `cap_delete`, `cap_revoke` and
+`mmio_split` stay safe), and `thread_configure`,
 `thread_configure_with_tls` and `thread_write_regs` (a thread of the caller's address space
 starts or resumes only on code, a stack, and a TLS block dedicated to it).
 
@@ -63,4 +65,5 @@ shared/syscall/
 
 [Syscall Interface Specification](../../core/kernel/docs/syscalls.md),
 [Build System](../../docs/build-system.md),
+[Capability Model](../../docs/capability-model.md),
 [runtime/ruststd/README.md](../../runtime/ruststd/README.md)

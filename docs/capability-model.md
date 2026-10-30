@@ -526,7 +526,6 @@ with every other slot: a CSpace torn down while the move is in flight releases
 the children hanging under its dying slots as derivation roots. See
 [capability-internals.md](../core/kernel/docs/capability-internals.md) § Move.
 
-
 ---
 
 ## Revocation
@@ -556,7 +555,6 @@ until the syscall stops using it, so the revoke frees the object only after that
 with it (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-two-level-radix)
 § Storage: Hybrid Two-Level Radix).
-
 
 ---
 

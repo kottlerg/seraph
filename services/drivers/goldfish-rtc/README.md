@@ -111,6 +111,18 @@ ships.
 
 ---
 
+## Relevant Design Documents
+
+| Document | Content |
+|---|---|
+| [docs/device-management.md](../../../docs/device-management.md) | Driver binary sources; devmgr spawn and RTC query flow |
+| [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md) | Per-driver capability carve and `QUERY_RTC_DEVICE` |
+| [Firmware Parsing](../../../core/boot/docs/firmware-parsing.md) | Why no DTB reaches the RISC-V boot path |
+| [ACPI Parsing](../../../core/boot/docs/acpi.md) | Platform-default aperture seeding for this device |
+| [services/timed/README.md](../../timed/README.md) | The sole client of this driver |
+
+---
+
 ## Summarized By
 
 None

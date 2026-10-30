@@ -195,6 +195,5 @@ the last run completed with no failed agent, its verdict is `READY TO MERGE` or
 surface unresolved, and `AUDIT PASS` is on record for the head. Report the gate with the merge
 command `gh pr merge <N> --merge --delete-branch` and end your turn. Orchestrated, the report
 names the copied records (mode and head of each run) so the orchestrator reads them in its own
-checkout, not in this worktree. The merge decision is the
-maintainer's (`.claude/CLAUDE.md` § PR workflow operations); a worker that merges has failed
-its task.
+checkout, not in this worktree. The merge decision is the maintainer's (`.claude/CLAUDE.md`
+§ PR workflow operations); a worker that merges has failed its task.

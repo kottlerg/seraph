@@ -687,6 +687,29 @@ fn main() -> !
                 // SAFETY: ipc_buf is the registered IPC buffer.
                 let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             }
+            // TODO(#165): remove with the test labels. Do not `seraph::log!`
+            // here, as in the device queries it mirrors.
+            ipc::devmgr_labels::TEST_QUERY_DENY_DEVICE =>
+            {
+                if !test_label_admitted(&msg, badge, ipc_buf)
+                {
+                    continue;
+                }
+                let driver_ep = match msg.word(1)
+                {
+                    ipc::devmgr_labels::QUERY_SERIAL_DEVICE if serial_spawned => serial_ep,
+                    ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE if fb_spawned => fb_ep,
+                    ipc::devmgr_labels::QUERY_INPUT_DEVICE => input_ep,
+                    ipc::devmgr_labels::QUERY_SERIAL_DEVICE
+                    | ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE => 0,
+                    _ =>
+                    {
+                        reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+                        continue;
+                    }
+                };
+                reply_deny_send(driver_ep, ipc_buf);
+            }
             _ =>
             {
                 let reply = IpcMessage::new(ipc::devmgr_errors::UNKNOWN_OPCODE);
@@ -697,10 +720,10 @@ fn main() -> !
     }
 }
 
-/// TODO(#165): remove with the test labels. Admit a `TEST_SPAWN_ORPHAN` /
-/// `TEST_ORPHAN_RESULT` request: the badge carries `ORPHAN_TEST_AUTHORITY`
-/// and `data[0]` is `DEVMGR_LABELS_VERSION`. Otherwise reply the rejection
-/// and return `false`.
+/// TODO(#165): remove with the test labels. Admit a `TEST_SPAWN_ORPHAN`,
+/// `TEST_ORPHAN_RESULT`, or `TEST_QUERY_DENY_DEVICE` request: the badge
+/// carries `ORPHAN_TEST_AUTHORITY` and `data[0]` is `DEVMGR_LABELS_VERSION`.
+/// Otherwise reply the rejection and return `false`.
 fn test_label_admitted(msg: &IpcMessage, badge: u64, ipc_buf: *mut u64) -> bool
 {
     if badge & ipc::devmgr_labels::ORPHAN_TEST_AUTHORITY == 0
@@ -1075,6 +1098,34 @@ fn locate_acpi_table(
 }
 
 /// Send a bodyless status reply (no caps) on the current request.
+/// TODO(#165): remove with `TEST_QUERY_DENY_DEVICE`. Reply with a SEND on
+/// `driver_ep` badged `TEST_DENY_BADGE`, which carries none of the driver's
+/// verb bits; `NO_DEVICE` when the driver is not running (`driver_ep == 0`)
+/// and `INVALID_REQUEST` when the derive fails.
+fn reply_deny_send(driver_ep: u32, ipc_buf: *mut u64)
+{
+    if driver_ep == 0
+    {
+        reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
+        return;
+    }
+    let Ok(derived) = syscall::cap_derive_badge(
+        driver_ep,
+        syscall::RIGHTS_EP_SEND,
+        ipc::devmgr_labels::TEST_DENY_BADGE,
+    )
+    else
+    {
+        reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+        return;
+    };
+    let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+        .cap(derived)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
 fn reply_status(code: u64, ipc_buf: *mut u64)
 {
     let reply = IpcMessage::new(code);

@@ -20,6 +20,10 @@
 //!   not the capability object.
 //! - A page mapped only into another address space is protected until that
 //!   address space is destroyed, and retypable after.
+//! - A span unmap with `MEM_UNMAP_RECLAIM_PTS` releases every frame it clears,
+//!   including frames past the kernel's release batch: a span of physically
+//!   discontiguous pages, one more than the batch holds runs, is unretypable
+//!   while mapped and retypable in full after the unmap.
 //!
 //! Without the refusal a process holding `WRITE | RETYPE` on a grant could map
 //! it, retype a `CSpace` into the mapped page, and forge capability slots
@@ -30,7 +34,7 @@
 
 use syscall::{
     MAP_WRITABLE, cap_create_aspace, cap_create_cspace, cap_delete, cap_info, mem_map, mem_unmap,
-    memory_merge, memory_split,
+    mem_unmap_reclaim, memory_merge, memory_split,
 };
 use syscall_abi::{CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, SyscallError};
 
@@ -47,6 +51,17 @@ const OWN_VA: u64 = 0x1_5A00_0000;
 
 /// Probe VA in the address space the teardown phase creates.
 const OTHER_AS_VA: u64 = 0x1_5B00_0000;
+
+/// Pages mapped by the span phase: one more than the kernel's frame-map
+/// release batch holds runs (`mm::frame_map::ReleaseBatch`, 16), each its own
+/// run, so the span unmap must drain a full batch mid-walk.
+const SPAN_PAGES: u64 = 17;
+
+/// Pages of the span phase's grant: the span maps every other page of it.
+const SPAN_GRANT_PAGES: u64 = 2 * SPAN_PAGES;
+
+/// Base VA of the span phase's mappings in ktest's own address space.
+const SPAN_VA: u64 = 0x1_5C00_0000;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -80,7 +95,8 @@ fn phases(ctx: &TestContext, grant: u32, other: u32) -> TestResult
 {
     refusal_leaves_ledger(ctx, grant, other)?;
     refusal_survives_split_and_merge(ctx, grant)?;
-    teardown_releases_frames(ctx, grant)
+    teardown_releases_frames(ctx, grant)?;
+    span_unmap_releases_every_frame(ctx)
 }
 
 /// Map `page` of `memory` writable at `va` in `aspace`.
@@ -123,7 +139,13 @@ fn expect_refused(memory: u32) -> TestResult
 /// Assert a one-page `CSpace` retype from `memory` succeeds, and delete it.
 fn expect_retype(memory: u32) -> TestResult
 {
-    let cs = cap_create_cspace(memory, 0, 1)
+    expect_retype_pages(memory, 1)
+}
+
+/// Assert a `pages`-page `CSpace` retype from `memory` succeeds, and delete it.
+fn expect_retype_pages(memory: u32, pages: u64) -> TestResult
+{
+    let cs = cap_create_cspace(memory, 0, pages)
         .map_err(|_| "integration::retype_over_mapped_refused: a retype of free pages failed")?;
     cap_delete(cs).map_err(|_| "integration::retype_over_mapped_refused: cap_delete failed")
 }
@@ -200,4 +222,45 @@ fn teardown_releases_frames(ctx: &TestContext, grant: u32) -> TestResult
         .map_err(|_| "integration::retype_over_mapped_refused: cap_delete(aspace) failed")?;
     refused?;
     expect_retype(grant)
+}
+
+/// A span unmap releases every frame it clears, past the release batch.
+fn span_unmap_releases_every_frame(ctx: &TestContext) -> TestResult
+{
+    let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
+        .map_err(|_| "integration::retype_over_mapped_refused: cap_info(MEMORY_SIZE) failed")?;
+    let at = size
+        .checked_sub(SPAN_GRANT_PAGES * PAGE)
+        .ok_or("integration::retype_over_mapped_refused: memory_base too small for the span")?;
+    let wide = memory_split(ctx.memory_base, at)
+        .map_err(|_| "integration::retype_over_mapped_refused: memory_split (span) failed")?;
+    let result = span_phase(ctx, wide);
+    memory_merge(ctx.memory_base, wide)
+        .map_err(|_| "integration::retype_over_mapped_refused: memory_merge (span) failed")?;
+    result
+}
+
+/// Map page `2 * i` of `wide` at `SPAN_VA + i` pages, so no two adjacent
+/// leaves name adjacent frames, then check the retype refusal before and after
+/// one reclaiming unmap of the span.
+fn span_phase(ctx: &TestContext, wide: u32) -> TestResult
+{
+    let mut mapped = Ok(());
+    for i in 0..SPAN_PAGES
+    {
+        // SAFETY: the span lies in ktest's scratch band (crate docs § Scratch
+        // VAs), so it holds no Rust object or IPC page of ktest.
+        mapped = unsafe { map_one(wide, ctx.aspace_cap, SPAN_VA + i * PAGE, 2 * i) };
+        if mapped.is_err()
+        {
+            break;
+        }
+    }
+    let refused = mapped.and_then(|()| expect_refused(wide));
+    // SAFETY: as for the maps above; a page the loop did not map is skipped.
+    unsafe { mem_unmap_reclaim(ctx.aspace_cap, SPAN_VA, SPAN_PAGES) }
+        .map_err(|_| "integration::retype_over_mapped_refused: mem_unmap_reclaim failed")?;
+    refused?;
+    // The retype covers every page of the grant up to the last one mapped.
+    expect_retype_pages(wide, SPAN_GRANT_PAGES - 1)
 }

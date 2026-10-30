@@ -249,7 +249,8 @@ observers and records the first fault under it before posting outside it.
 
 4. **Destruction**: when the address space's reference count reaches zero (see
    [capability-internals.md](capability-internals.md) § Kernel Object Reference
-   Counting), every
+   Counting), the frame-map count of every frame its user half still maps is lowered
+   (`release_mapped_frames`; see Frame Map Table above), then every
    donation to its page-table pool — the create-time slab included, with the root
    table and the `AddressSpace` itself — is returned to its source Memory cap
    wholesale (see Page Table Node Ownership below and
@@ -519,9 +520,11 @@ donation-record mechanism.
 [Page Tables](../../boot/docs/page-tables.md), [core/kernel/README.md](../README.md),
 [Architecture Abstraction Layer](arch-interface.md),
 [Capability Subsystem Internals](capability-internals.md),
+[Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),
 [Kernel Initialization Sequence](initialization.md), [IPC Subsystem Internals](ipc-internals.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
+[Capability Model](../../../docs/capability-model.md),
 [Coding Standards](../../../docs/coding-standards.md),
 [Memory Model](../../../docs/memory-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),

@@ -853,8 +853,11 @@ impl AddressSpace
     /// (`MmioObject::withdraw_mappings`). Intermediate page tables stay, as with
     /// [`unmap_page`](Self::unmap_page). The span takes one invalidation, per
     /// page up to `RANGE_FLUSH_CEILING_PAGES` and a full flush above, issued
-    /// after `pt_lock` is released; the unmapped frames are device memory the
-    /// kernel never reallocates, so no reuse waits on the shootdown.
+    /// after `pt_lock` is released, and one more under `pt_lock` each time the
+    /// cleared frames overflow the frame-map release batch
+    /// ([`batch_cleared_frame`](Self::batch_cleared_frame)); the unmapped frames
+    /// are device memory the kernel never reallocates, so no reuse waits on the
+    /// shootdown.
     ///
     /// # Safety
     /// The span `[virt_base, virt_base + page_count * PAGE_SIZE)` must lie in

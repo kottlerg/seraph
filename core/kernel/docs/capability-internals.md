@@ -507,7 +507,9 @@ both, so the teardown finds every page a call maps, a partial map included, and 
 record unfilled. The object's dealloc arm runs `withdraw_mappings`: for each record,
 `AddressSpace::unmap_region_if_phys` clears, under `pt_lock`, each leaf that still maps the matching
 device page (a page the user has since remapped to other memory is left alone), then issues one TLB
-invalidation for the span on every CPU that runs the space, after the lock is released; the device
+invalidation for the span on every CPU that runs the space, after the lock is released (plus one
+under the lock each time the span's cleared frames overflow the frame-map release batch; see
+[memory-internals.md § Frame Map Table](memory-internals.md#frame-map-table)); the device
 frames are never reallocated, so no frame reuse waits on the shootdown. The record's address-space
 reference is then released through `release_ref`, so an address space it was the last reference to
 goes to this CPU's deferred reclaim, as for a syscall pin: an Mmio object can be freed in place

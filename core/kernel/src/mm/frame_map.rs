@@ -171,14 +171,6 @@ impl Default for FrameMap
     }
 }
 
-impl Default for ReleaseBatch
-{
-    fn default() -> Self
-    {
-        Self::new()
-    }
-}
-
 /// The kernel's frame map table.
 pub static FRAME_MAP: FrameMap = FrameMap::new();
 
@@ -252,6 +244,14 @@ pub struct ReleaseBatch
     /// `(first frame, frame count)` runs of physically contiguous frames.
     runs: [(u64, u64); RELEASE_RUNS],
     len: usize,
+}
+
+impl Default for ReleaseBatch
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
 }
 
 /// Runs one [`ReleaseBatch`] holds before its owner must invalidate and drain.

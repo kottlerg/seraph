@@ -508,13 +508,15 @@ within the definition of, one of these items: the boot memory map and the direct
 (`translate_memory_map`, `max_ram_address`, `direct_map_ceiling`, `compute_max_physical_address`,
 `init_kernel_page_tables`, and `BOOT_TABLE_POOL_SIZE`), and the drain of RAM into Memory caps
 (`drain_and_install_seed`, `coalesce_ram_blocks`, `MAX_DRAIN_BLOCKS`, `populate_cspace`, and
-`INIT_INFO_MAX_PAGES`). The screen works as the boundary one does:
+`INIT_INFO_MAX_PAGES`), and the frame map table's DRAM-span sizing (`dram_bounds`, `DRAM_BOUNDS`,
+`frame_map::init`, and `CHUNK_ORDER`). The screen works as the boundary one does:
 
 ```sh
 git diff --stat "$B" <head> -- core/kernel/src/mm/buddy.rs core/kernel/src/mm/init.rs
 M='translate_memory_map|max_ram_address|direct_map_ceiling|compute_max_physical_address'
 M="$M|init_kernel_page_tables|BOOT_TABLE_POOL_SIZE|drain_and_install_seed|coalesce_ram_blocks"
 M="$M|MAX_DRAIN_BLOCKS|populate_cspace|INIT_INFO_MAX_PAGES"
+M="$M|dram_bounds|DRAM_BOUNDS|frame_map::init|CHUNK_ORDER"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($M)\b"
 
 # Memory variation (either arch):

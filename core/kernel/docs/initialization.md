@@ -716,7 +716,7 @@ through its drain until a teardown commits `Exited` over it (see
 | 1 | Early console; platform feature gate | Halt: missing required baseline feature (no console is non-fatal) |
 | 2 | Buddy allocator from memory map | Halt: no usable RAM |
 | 3 | Kernel page tables + direct map | Halt: BOOT_TABLE_POOL exhausted; direct map would overlap the kernel image window |
-| 4 | Typed-memory cap surface; per-CPU storage | Halt: per-CPU storage allocation failed |
+| 4 | Typed-memory cap surface; per-CPU storage; frame map table | Halt: per-CPU storage or frame map table allocation failed, or DRAM past 256 GiB |
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped, entries beyond MAX_MMIO_APERTURES dropped |
 | 7 | Capability system + root CSpace | Halt: OOM |

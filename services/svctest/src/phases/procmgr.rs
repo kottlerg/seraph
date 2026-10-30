@@ -813,9 +813,10 @@ const UNDELIVERABLE_WINDOWS: u32 = 8;
 /// reaches memmgr.
 const UNDELIVERABLE_POLLS: u32 = 256;
 
-/// Child role: exhaust this process's `CSpace` so procmgr's two-cap create
-/// reply cannot land, issue `CREATE_FROM_FILE`, and check that the reply
-/// transfer fails and that procmgr then destroys the child it created —
+/// Child role: exhaust this process's `CSpace`, its IPC receive reserve
+/// included, so procmgr's two-cap create reply cannot land, issue
+/// `CREATE_FROM_FILE`, and check that the reply transfer fails and that
+/// procmgr then destroys the child it created —
 /// memmgr's free pool returns to its level before the create, which it does
 /// not while the suspended child holds its pages. Runs without heap
 /// allocation after the exhaustion, since a heap refill needs a free slot.
@@ -832,10 +833,26 @@ fn undeliverable_reply_child_main() -> !
     let (programs, _, _) = lookup(std::os::seraph::root_dir_cap(), b"programs");
     let (mut file, _, size) = lookup(programs, b"hello");
 
-    // Fill every free slot. The create call then moves the file cap out,
-    // freeing one slot, and the reply's two caps cannot both land.
+    // Fill every general slot, then spend the IPC receive reserve, which
+    // general allocations leave free, on one-page memmgr grants: each lands
+    // until the reserve is gone. The create call then moves the file cap
+    // out, freeing one slot, and the reply's two caps cannot both land.
     while syscall::cap_derive(info.procmgr_endpoint, syscall::RIGHTS_EP_SEND).is_ok()
     {}
+    for _ in 0..=syscall_abi::CSPACE_IPC_RECV_RESERVE
+    {
+        let grant = IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
+            .word(0, 1)
+            .build();
+        // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
+        match unsafe { ipc::ipc_call(info.memmgr_endpoint, &grant, ipc_buf) }
+        {
+            Ok(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED => break,
+            Ok(_) =>
+            {}
+            Err(_) => std::process::exit(UNDELIVERABLE_CALL_FAILED),
+        }
+    }
 
     for window in 0..UNDELIVERABLE_WINDOWS
     {

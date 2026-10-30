@@ -89,7 +89,7 @@ struct ScratchMemory
 }
 
 /// Number of cache slots.
-pub const SLOT_COUNT: usize = 256;
+pub const SLOT_COUNT: usize = 128;
 
 /// Most pages the cache holds beyond [`SLOT_COUNT`]: it requests a replacement
 /// page from memmgr only while its quarantined pages (still mapped by a

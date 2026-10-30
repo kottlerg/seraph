@@ -21,7 +21,7 @@ in [crash-safety.md](crash-safety.md).
   with an LFN run packed in reverse-sequence order. The trailing
   `0x40` LFN sequence flag and `LDIR_Chksum` computation match the
   Microsoft FAT specification.
-* **Page cache** (`src/cache.rs`): 256 single-page slots backed by `BLK_READ_INTO_MEMORY` for fills
+* **Page cache** (`src/cache.rs`): 128 single-page slots backed by `BLK_READ_INTO_MEMORY` for fills
   and a process-static scratch memory cap for single-sector `BLK_WRITE_FROM_MEMORY` writebacks and
   single-sector device reads. Before filling the slots, cache init funds the fs's own `CSpace` with
   general headroom for every slot page, the quarantine's replacements, the scratch page, and 64 more

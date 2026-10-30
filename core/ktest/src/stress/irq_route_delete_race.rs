@@ -29,11 +29,15 @@
 //! repeatedly unmasks the line (`SYS_IRQ_ACK`; each delivery masks it again)
 //! and raises the interrupt, so deliveries follow one another, while a
 //! deleter pinned to CPU 1 waits a varying delay and deletes the
-//! notification's only capability. A raise after the delete finds the line
-//! masked and unrouted. Required: the kernel survives every round, and in
-//! some rounds the controller raised the line after the deleter began its
-//! delete and before it finished (the race armed). The UART interrupt is
-//! disabled again when the cell ends.
+//! notification's only capability. On every other round the deleter first
+//! reroutes the line to a spare notification (`SYS_IRQ_REGISTER`), so the
+//! delete meets a route a replace already removed, the path whose teardown
+//! must still wait out a delivery that read the old route. A raise after the
+//! delete finds the line masked and unrouted (or routed to the spare).
+//! Required: the kernel survives every round, and in some rounds of each kind
+//! the controller issued a raise that began after the deleter began its
+//! delete and ended before it finished (the race armed). The UART interrupt
+//! is disabled again when the cell ends.
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -70,6 +74,9 @@ const EXIT_POLLS: u32 = 10_000;
 static ROUND: AtomicU32 = AtomicU32::new(0);
 /// Notification handle the deleter deletes this round.
 static SIG: AtomicU32 = AtomicU32::new(0);
+/// The carved line and the spare notification the deleter reroutes it to.
+static LINE: AtomicU32 = AtomicU32::new(0);
+static SPARE: AtomicU32 = AtomicU32::new(0);
 /// Round whose delete the deleter has begun.
 static DELETING: AtomicU32 = AtomicU32::new(0);
 /// Last round whose delete the deleter finished.
@@ -142,10 +149,14 @@ fn race(ctx: &TestContext, line: u32, cycles: u32) -> TestResult
 {
     probe_delivery(ctx, line)?;
 
+    let spare = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "stress::irq_route_delete_race: create spare notification failed")?;
     ROUND.store(0, Ordering::Release);
     DELETED.store(0, Ordering::Release);
     DELETING.store(0, Ordering::Release);
     QUIT.store(0, Ordering::Release);
+    LINE.store(line, Ordering::Release);
+    SPARE.store(spare, Ordering::Release);
     let deleter = cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
         .map_err(|_| "stress::irq_route_delete_race: create deleter failed")?;
     let top = ChildStack::top(core::ptr::addr_of!(DELETER_STACK));
@@ -159,15 +170,20 @@ fn race(ctx: &TestContext, line: u32, cycles: u32) -> TestResult
     QUIT.store(1, Ordering::Release);
     let exited = spawn::wait_until_exited(deleter, crate::scaled_polls(EXIT_POLLS));
     cap_delete(deleter).ok();
+    cap_delete(spare).ok();
     let armed = raced?;
     exited?;
     crate::log_u64(
-        "stress::irq_route_delete_race: armed_rounds=",
-        u64::from(armed),
+        "stress::irq_route_delete_race: armed_routed=",
+        u64::from(armed[0]),
     );
-    if armed == 0
+    crate::log_u64(
+        "stress::irq_route_delete_race: armed_rerouted=",
+        u64::from(armed[1]),
+    );
+    if armed.contains(&0)
     {
-        return Err("stress::irq_route_delete_race: no raise overlapped a delete");
+        return Err("stress::irq_route_delete_race: no raise overlapped a delete of some kind");
     }
     Ok(())
 }
@@ -192,10 +208,17 @@ fn probe_delivery(ctx: &TestContext, line: u32) -> TestResult
     }
 }
 
-/// The rounds; returns how many raised the line while the delete ran.
-fn rounds(ctx: &TestContext, line: u32, cycles: u32) -> Result<u32, &'static str>
+/// Whether the deleter reroutes the line to the spare before `round`'s delete.
+fn rerouted(round: u32) -> bool
 {
-    let mut armed = 0u32;
+    round % 2 == 0
+}
+
+/// The rounds; returns, for direct and rerouted deletes, how many issued a
+/// raise wholly inside the delete.
+fn rounds(ctx: &TestContext, line: u32, cycles: u32) -> Result<[u32; 2], &'static str>
+{
+    let mut armed = [0u32; 2];
     for round in 1..=cycles
     {
         let sig = cap_create_notification(ctx.memory_base)
@@ -213,19 +236,22 @@ fn rounds(ctx: &TestContext, line: u32, cycles: u32) -> Result<u32, &'static str
         let mut overlapped = false;
         while DELETED.load(Ordering::Acquire) != round && raises < MAX_RAISES
         {
+            // Sampled before the raise, so a raise counts as overlapping only
+            // when it began after the delete began and ended before it ended.
+            let began = DELETING.load(Ordering::Acquire) == round;
             // Unmask before each raise, since each delivery masks the line;
             // after the delete the ack may fail or find the line unrouted.
             irq_ack(line).ok();
             raise_tx_interrupt();
             raises += 1;
-            if DELETING.load(Ordering::Acquire) == round && DELETED.load(Ordering::Acquire) != round
+            if began && DELETED.load(Ordering::Acquire) != round
             {
                 overlapped = true;
             }
         }
         if overlapped
         {
-            armed += 1;
+            armed[usize::from(rerouted(round))] += 1;
         }
         if DELETED.load(Ordering::Acquire) == round
         {
@@ -276,8 +302,13 @@ extern "C" fn deleter_entry(_arg: u64) -> !
         {
             core::hint::spin_loop();
         }
-        // A failed delete would leave the notification routed, which the next
-        // round's register replaces; the controller's wait still completes.
+        // Reroute first on alternate rounds, so the delete finds its route
+        // already replaced. A failed reroute or delete leaves a route the
+        // next round's register replaces; the controller's wait still ends.
+        if rerouted(round)
+        {
+            irq_register(LINE.load(Ordering::Acquire), SPARE.load(Ordering::Acquire)).ok();
+        }
         DELETING.store(round, Ordering::Release);
         cap_delete(SIG.load(Ordering::Acquire)).ok();
         DELETED.store(round, Ordering::Release);

@@ -370,13 +370,17 @@ on the notification. Each route instead counts the deliveries in flight through 
 raises the line's count before it reads the route and drops it after its last access to the
 state and to the waiter it woke (step f above). The Notification teardown
 (`dealloc_object`, Notification arm) first clears every route naming the state and masks its
-line, then waits, interrupts enabled and preemption disabled, until each cleared line's count
-is zero (`irq::unregister_notification`, spin site `dealloc:irq-delivery`), and only then drains
-the waiters and frees the state. The raise and route read, and the clear and count read, are
-`SeqCst`, so a delivery either reads the cleared route and touches nothing, or is counted and
-waited for: no delivery on any CPU reaches the state after its free. The wait is bounded by one
-in-flight delivery per cleared line, since each runs interrupts-off without waiting on the
-teardown, and a masked line raises no new one.
+line, then waits, interrupts enabled and preemption disabled, until every line's count is zero
+(`irq::unregister_notification`, spin site `dealloc:irq-delivery`), and only then drains the
+waiters and frees the state. Every line is waited on, not only the lines this teardown clears,
+because a route may have stopped naming the state earlier: `SYS_IRQ_REGISTER` replacing it
+with another notification, or the Interrupt cap's teardown clearing it. Every route write (the
+replace, the clear, the teardown's own clears) is `SeqCst`, as are a delivery's raise and route
+read and the teardown's count reads, so a delivery that read the state on any line precedes the
+write that removed it there, and with it the teardown's count read of that line: it is counted
+and waited for, and no delivery on any CPU reaches the state after its free. The wait is bounded:
+each delivery runs interrupts-off without waiting on the teardown, and masks its line until the
+driver's `SYS_IRQ_ACK`, so each line's count falls to zero between deliveries.
 
 ### Wait Path
 

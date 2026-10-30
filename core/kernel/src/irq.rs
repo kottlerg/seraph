@@ -24,8 +24,9 @@
 //! route counts the deliveries in flight through it (`IrqRoute::in_flight`),
 //! raised before the route is read and dropped after the woken waiter is
 //! enqueued, and a Notification's teardown clears the routes naming it and
-//! waits for their counts to drain ([`unregister_notification`]) before it
-//! frees the state, so no delivery on any CPU reaches freed memory
+//! waits for every line's count to drain ([`unregister_notification`]) before
+//! it frees the state, so no delivery on any CPU reaches freed memory, even
+//! one that read a route an earlier replace or clear removed
 //! (core/kernel/docs/ipc-internals.md § Notification).
 //!
 //! # Modification notes
@@ -55,9 +56,10 @@ struct IrqRoute
     /// Number of `dispatch_device_irq` calls on this line between their raise
     /// (before reading `notification`) and their drop (after the last access
     /// to the state and to the woken waiter). The raise and the route read are
-    /// `SeqCst`, as are `unregister_notification`'s route clear and count read,
-    /// so a dispatcher that read the cleared pointer is counted when the
-    /// clearer reads the count.
+    /// `SeqCst`, as are every route write (`register`, `unregister`, and
+    /// `unregister_notification`'s clears) and `unregister_notification`'s
+    /// count reads, so a dispatcher that read a pointer a later write removed
+    /// is counted when that notification's teardown reads the count.
     in_flight: AtomicU32,
 }
 
@@ -88,8 +90,10 @@ static IRQ_TABLE: [IrqRoute; MAX_IRQ] = {
 
 /// Register `notification` to receive notifications for interrupt line `irq`.
 ///
-/// Replaces any previous registration for the same line using atomic Release
-/// ordering, ensuring visibility to all CPUs that later load the pointer.
+/// Replaces any previous registration for the same line. The store is
+/// `SeqCst`: a delivery that read the replaced pointer is then ordered before
+/// it, so the replaced notification's later teardown, whose in-flight scan is
+/// `SeqCst` too, sees that delivery counted ([`unregister_notification`]).
 ///
 /// # Safety
 /// - `irq` must be < [`MAX_IRQ`].
@@ -98,15 +102,18 @@ static IRQ_TABLE: [IrqRoute; MAX_IRQ] = {
 pub unsafe fn register(irq: u32, notification: *mut NotificationState)
 {
     debug_assert!((irq as usize) < MAX_IRQ, "irq out of range");
-    // Release ordering makes the stored pointer visible to every CPU that
-    // Acquire-loads it. An out-of-range `irq` panics at the index (the
-    // debug_assert reports it first in debug builds).
+    // SeqCst, for the replaced pointer's teardown (rustdoc above). An
+    // out-of-range `irq` panics at the index (the debug_assert reports it
+    // first in debug builds).
     IRQ_TABLE[irq as usize]
         .notification
-        .store(notification, Ordering::Release);
+        .store(notification, Ordering::SeqCst);
 }
 
 /// Clear the routing entry for `irq` (called when the Interrupt cap is freed).
+///
+/// The store is `SeqCst`, as [`register`]'s is, so the teardown of the
+/// notification the line routed to waits for a delivery that read it.
 ///
 /// # Safety
 /// - `irq` must be < [`MAX_IRQ`].
@@ -114,23 +121,28 @@ pub unsafe fn register(irq: u32, notification: *mut NotificationState)
 pub unsafe fn unregister(irq: u32)
 {
     debug_assert!((irq as usize) < MAX_IRQ, "irq out of range");
-    // Release ordering makes the null write visible to every CPU that
-    // Acquire-loads it. An out-of-range `irq` panics at the index (the
-    // debug_assert reports it first in debug builds).
+    // SeqCst, for the cleared pointer's teardown (rustdoc above). An
+    // out-of-range `irq` panics at the index (the debug_assert reports it
+    // first in debug builds).
     IRQ_TABLE[irq as usize]
         .notification
-        .store(null_mut(), Ordering::Release);
+        .store(null_mut(), Ordering::SeqCst);
 }
 
 /// Clear all routing entries that point to `notification` and wait out every
-/// delivery already in flight through them (called when a Notification object
-/// is being freed, before its state is).
+/// delivery that may have read it (called when a Notification object is being
+/// freed, before its state is).
 ///
 /// After this returns, no `dispatch_device_irq` on any CPU dereferences
-/// `notification`: a dispatch that raised its line's in-flight count before
-/// the clear is waited for here, and one that raises it after the clear reads
-/// a null or a different route. Each cleared line is masked, since it no
-/// longer has a handler.
+/// `notification`. A delivery reads a route only after raising its line's
+/// in-flight count, and every route write is `SeqCst`: this call's clears,
+/// and the [`register`] replace or [`unregister`] clear that may have removed
+/// `notification` from a line earlier. A delivery that read `notification` on
+/// any line therefore precedes the write that removed it there, and so this
+/// call's in-flight scan, which reads every line's count (`SeqCst`) and waits
+/// while it is nonzero; a delivery that raises its count after a route stopped
+/// naming `notification` reads a null or a different route. Each line this
+/// call clears is masked, since it no longer has a handler.
 ///
 /// The wait spins with interrupts enabled and preemption disabled, as
 /// `sched::sleep_wakeups_quiesce` does, under the spin-site breadcrumb
@@ -138,10 +150,10 @@ pub unsafe fn unregister(irq: u32)
 /// softlockup watchdog names if the wait wedges. It is bounded: a counted
 /// delivery runs with interrupts disabled from its raise to its drop, takes
 /// only the notification's and the scheduler's spinlocks, and waits for
-/// nothing this caller holds; a delivery that begins after the clear drops its
-/// count without touching the state; and the cleared line is masked, so it
-/// raises no further delivery. The wait is therefore at most one delivery per
-/// cleared line that was already in flight at the clear.
+/// nothing this caller holds; and every delivery masks its line until its
+/// driver's `SYS_IRQ_ACK`, so a line's count falls to zero between deliveries.
+/// The wait is therefore at most one delivery per line in flight at the scan,
+/// plus any that start on a line before its count is read zero.
 ///
 /// O(`MAX_IRQ`) scan; acceptable since notification deallocation is infrequent.
 ///
@@ -153,8 +165,6 @@ pub unsafe fn unregister(irq: u32)
 #[cfg(not(test))]
 pub unsafe fn unregister_notification(notification: *mut NotificationState)
 {
-    // Lines this call cleared, one bit per IRQ_TABLE index.
-    let mut cleared = [0u64; MAX_IRQ / 64];
     for (i, entry) in IRQ_TABLE.iter().enumerate()
     {
         // Pointer comparison on a possibly-stale value is safe (no deref).
@@ -163,14 +173,17 @@ pub unsafe fn unregister_notification(notification: *mut NotificationState)
             .compare_exchange(notification, null_mut(), Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            cleared[i / 64] |= 1 << (i % 64);
             // Mask the IRQ line since there's no longer a handler.
             // cast_possible_truncation: i < MAX_IRQ (= 256), which fits u32.
             #[allow(clippy::cast_possible_truncation)]
             crate::arch::current::interrupts::mask(i as u32);
         }
     }
-    if cleared.iter().all(|w| *w == 0)
+    // A route a replace or an Interrupt-cap teardown removed earlier leaves no
+    // line for the scan above to clear, so every line's count is read.
+    if IRQ_TABLE
+        .iter()
+        .all(|entry| entry.in_flight.load(Ordering::SeqCst) == 0)
     {
         return;
     }
@@ -180,14 +193,11 @@ pub unsafe fn unregister_notification(notification: *mut NotificationState)
     // SAFETY: ring 0; IDT loaded; preempt disabled.
     unsafe { crate::arch::current::interrupts::enable() };
     crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_IRQ_DELIVERY);
-    for (i, entry) in IRQ_TABLE.iter().enumerate()
+    for entry in &IRQ_TABLE
     {
-        if cleared[i / 64] & (1 << (i % 64)) == 0
-        {
-            continue;
-        }
         // SeqCst pairs with the dispatcher's raise and route read: either the
-        // dispatcher read the null stored above, or this load sees its raise.
+        // dispatcher read a route that no longer names `notification`, or
+        // this load sees its raise.
         while entry.in_flight.load(Ordering::SeqCst) != 0
         {
             core::hint::spin_loop();

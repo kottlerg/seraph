@@ -100,7 +100,7 @@ pub const RELA_ENTRY_SIZE: usize = 24;
 const DYN_ENTRY_SIZE: usize = 16;
 
 /// Upper bound on an accepted `.rela.dyn` table (≈175k relocations).
-/// Tier-1/2 binaries carry a few thousand; the cap bounds loader work on a
+/// In-tree binaries carry a few thousand; the cap bounds loader work on a
 /// malformed or hostile image.
 pub const MAX_RELA_TABLE_SIZE: u64 = 4 * 1024 * 1024;
 
@@ -870,8 +870,10 @@ where
 }
 
 /// Upper bound on the section name string table size accepted by the
-/// streaming parser. Tier-1/2 binaries land well under 4 KiB; the cap
-/// keeps the on-stack buffer fixed without heap allocation.
+/// streaming parser. In-tree binaries land well under 4 KiB; the cap
+/// keeps the on-stack buffer fixed without heap allocation. The table holds
+/// only section names, a fixed set the linker emits, so program size does
+/// not grow it.
 const MAX_STREAMING_STRTAB: usize = 4096;
 
 /// Upper bound on the note section size accepted by the streaming

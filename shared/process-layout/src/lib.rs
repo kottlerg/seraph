@@ -75,7 +75,9 @@ pub struct VaWindow
     /// Lowest (and first) candidate address; page-aligned.
     pub base: u64,
     /// Log2 of the number of page-granular slots (= bits of entropy per
-    /// draw).
+    /// draw). The windows' values are an ASLR budget, not a capacity: they
+    /// are sized so every zone fits below [`LAYOUT_VA_CEILING`], which the
+    /// zone-map asserts check.
     pub slots_log2: u32,
 }
 
@@ -207,7 +209,8 @@ const _: () = {
 };
 
 /// Number of entropy bytes [`choose_process_layout`] consumes: one
-/// little-endian `u64` per drawn surface.
+/// little-endian `u64` per drawn surface. The layout draws exactly four
+/// surfaces, so the count is fixed by the layout, not by any workload.
 pub const LAYOUT_ENTROPY_BYTES: usize = 32;
 
 /// The bootstrap virtual addresses for one new process.

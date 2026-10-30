@@ -147,6 +147,7 @@ impl Drop for ChildGuard
 /// carries badge 0). Random rather than monotonic so the driver-spawn count it
 /// would otherwise leak stays unguessable; both spawn paths match the bootstrap
 /// round by badge value, not index. Returns `None` if the entropy draw fails.
+/// The loop is unbounded but redraws only on a zero draw, at 2^-64 per draw.
 fn mint_bootstrap_badge() -> Option<u64>
 {
     loop

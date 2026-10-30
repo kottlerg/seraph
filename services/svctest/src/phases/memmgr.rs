@@ -473,6 +473,8 @@ pub fn stray_cap_flood_phase(_: &Caps)
 /// the identity.
 pub fn ram_accounted_identity_phase(_: &Caps)
 {
+    // A test wait bound: it limits only how long the phase polls before it
+    // fails.
     const MAX_POLL: u32 = 4096;
 
     let info = startup_info();

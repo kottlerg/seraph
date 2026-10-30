@@ -37,6 +37,7 @@ use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 pub struct NotificationState
 {
     /// Pending notification bits. Senders OR into this; the waiter read-and-clears.
+    /// The 64-bit width is the ABI's signal-bit count.
     pub bits: AtomicU64,
     /// Threads blocked waiting for a non-zero bitmask, in arrival order.
     /// Protected by `lock`.

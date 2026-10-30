@@ -36,14 +36,16 @@ pub struct Message
     /// `fault_dispatch` from the faulting thread's `fault_badge`; delivered to the
     /// receiver via the third return register of `ipc_recv`.
     pub badge: u64,
-    /// Inline data words.
+    /// Inline data words. The width is the IPC buffer layout's
+    /// `MSG_DATA_WORDS_MAX`; bulk data moves through Memory caps instead.
     pub data: [u64; MSG_DATA_WORDS_MAX],
     /// Actual number of valid entries in `data` (`0..=MSG_DATA_WORDS_MAX`).
     pub data_count: usize,
     /// Capability handles in transfer: on the send side, the sender's full
     /// cap handles (index + generation) as unpacked from the syscall's two
     /// packed words; after a completed transfer, rewritten to the
-    /// destination-side handles delivered to the recipient.
+    /// destination-side handles delivered to the recipient. Four because each
+    /// of the two packed words carries two `u32` handles (`MSG_CAP_SLOTS_MAX`).
     pub cap_slots: [u32; MSG_CAP_SLOTS_MAX],
     /// Actual number of valid entries in `cap_slots`.
     pub cap_count: usize,

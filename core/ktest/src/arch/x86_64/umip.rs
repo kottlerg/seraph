@@ -55,7 +55,8 @@ use syscall_abi::{
 
 use crate::{ChildStack, TestContext, TestResult};
 
-/// Up to this many CPUs, every CPU is checked.
+/// Up to this many CPUs, every CPU is checked. Like [`LOW_CPUS`], a test
+/// fixture: it bounds only how many CPUs the check visits on a wide boot.
 const EVERY_CPU_MAX: u32 = 16;
 
 /// Past [`EVERY_CPU_MAX`], the lowest CPUs checked: CPU 0 (the BSP) and the

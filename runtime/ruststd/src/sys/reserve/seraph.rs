@@ -33,7 +33,9 @@ use syscall_abi::PAGE_SIZE;
 const RESERVE_ARENA_BASE_DEFAULT: u64 = 0x0000_0010_0000_0000;
 
 /// Log2 of the number of page-aligned arena-base slots (= bits of base
-/// entropy, ASLR #39). The drawn base lies in `[64 GiB, 128 GiB)`.
+/// entropy, ASLR #39). The drawn base lies in `[64 GiB, 128 GiB)`. The value
+/// is an encoding artefact of the zone map: 2^24 pages span the 64 GiB draw
+/// window, so it bounds entropy only.
 const RESERVE_ARENA_SLOTS_LOG2: u32 = 24;
 
 /// Arena length in 4 KiB pages. 256 MiB total — sized to cover the

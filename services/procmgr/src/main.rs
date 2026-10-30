@@ -643,6 +643,8 @@ fn dispatch_death(
         {
             return;
         };
+        // The kernel packs the correlator into the high half of the `u64`
+        // event payload, leaving the exit reason the low 32 bits.
         let correlator = (payload >> 32) as u32;
         let exit_reason = payload & 0xFFFF_FFFF;
         if correlator == procmgr_labels::INIT_REAP_CORRELATOR

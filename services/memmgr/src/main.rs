@@ -172,6 +172,8 @@ const META_ARENA_BASE_DEFAULT: u64 = 0x0000_0004_4000_0000;
 
 /// Log2 of the number of page-aligned arena-base slots (= bits of base
 /// entropy): the drawn base lies in an 8 GiB window above the default.
+/// It sizes only the ASLR window, not the arena; the zone-map assert below
+/// proves the worst-case draw stays under [`META_ARENA_CEILING`].
 const META_ARENA_SLOTS_LOG2: u32 = 21;
 
 /// Exclusive ceiling for arena growth: the base of the std reservation-arena
@@ -742,7 +744,9 @@ impl ProcessTable
 /// rather than monotonic so the process-registration count it would otherwise
 /// leak across the `REGISTER_PROCESS` boundary stays unguessable; the badge is
 /// matched by equality scan, never used as an array index. Returns `None` if
-/// the entropy draw fails (a kernel-contract violation).
+/// the entropy draw fails (a kernel-contract violation). The `u64` width is
+/// the kernel badge word `cap_derive_badge` stamps, so the space never runs
+/// out and a draw aliases one live badge with probability 2^-64.
 fn mint_process_badge() -> Option<u64>
 {
     loop
@@ -814,6 +818,8 @@ const PHYS_TABLE_TEMP_VA: u64 = 0x0000_0002_0000_0000;
 
 /// Log2 of the number of page-aligned phys-table scratch slots (= bits of
 /// base entropy): the drawn VA lies in an 8 GiB window above the default.
+/// It sizes only the ASLR window for one page; the zone-map assert proves
+/// the window ends below [`META_ARENA_BASE_DEFAULT`].
 const PHYS_TABLE_TEMP_SLOTS_LOG2: u32 = 21;
 
 /// One in-use bootstrap arena delivered by init: a Memory cap covering a
@@ -837,6 +843,8 @@ struct InitBootstrap
     memory_count: u32,
     page_counts: [u32; BOOTSTRAP_MAX_MEMORY_CAPS],
     phys_bases: [u64; BOOTSTRAP_MAX_MEMORY_CAPS],
+    // Cannot fill: init forwards one arena each for memmgr, procmgr and
+    // itself, one under `MAX_IN_USE`.
     in_use: [BootInUse; ipc::memmgr_bootstrap::MAX_IN_USE],
     in_use_count: usize,
     system_ram_bytes: u64,
@@ -1152,6 +1160,9 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let badge = req.badge;
     let arg = req.word(0);
+    // `data[0]` packs `want_pages` in its low half and the flags in its high
+    // half, so one request asks for at most `u32::MAX` pages; a larger need
+    // takes more requests.
     let want_pages = (arg & 0xFFFF_FFFF) as u32;
     let flags = (arg >> 32) as u32;
 
@@ -1792,7 +1803,9 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
 /// This is the `pool_total` of the all-RAM-accounted identity
 /// (`system_ram == kernel_reserved + pool_total`). Surfaced in the
 /// `DONATE_MEMORY_CAPS` reply (`word(2)`) so callers can read it without a separate
-/// IPC. Single-threaded memmgr — plain static suffices.
+/// IPC. Single-threaded memmgr — plain static suffices. The `u64` matches
+/// that reply word, and 2^64 pages exceed any physical address space, so the
+/// saturating add never clamps.
 static mut POOL_TOTAL_PAGES: u64 = 0;
 
 fn pool_total_pages() -> u64

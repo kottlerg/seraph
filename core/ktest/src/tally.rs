@@ -162,7 +162,8 @@ pub fn await_report(done: u32, acc: &mut u64, mask: u64, err: &'static str) -> T
 
 /// Like [`await_report`], but until every bit of `mask` is present: the wait
 /// a cell makes for each of its children to report the same state (one bit
-/// per child).
+/// per child). A cell so awaits at most 64 children, the width of the `u64`
+/// notification word.
 ///
 /// # Errors
 ///

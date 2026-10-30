@@ -50,7 +50,9 @@ use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
 /// Two-Level Radix for the sizing constraints.
 pub const L2_SIZE: usize = 56;
 
-/// Inline root pointers to leaf pages (the direct region).
+/// Inline root pointers to leaf pages (the direct region). Both inline regions
+/// are fixed by the two-level directory embedded in `CSpace`; `MAX_SLOTS_STRUCTURAL`
+/// derives from them and is the only capacity they set.
 const L1_DIRECT: usize = 128;
 
 /// Inline root pointers to directory pages (the indirect region).
@@ -189,12 +191,14 @@ pub struct CSpace
     /// unallocated.
     indirect: [AtomicPtr<CSpaceDirPage>; L1_INDIRECT],
     /// Grow cursor: leaves `0..next_leaf` are allocated (contiguously);
-    /// `next_leaf` is the next leaf `grow` will materialise.
+    /// `next_leaf` is the next leaf `grow` will materialise. A `u32` holds it:
+    /// a compile-time assert bounds `MAX_LEAVES` by `u32::MAX`.
     next_leaf: u32,
     /// Total usable slots allocated across all pages (excludes slot 0).
     allocated_slots: usize,
     /// Slot-page pool exhaustions seen by `grow`, for the throttled
-    /// diagnostic (logged at powers of two).
+    /// diagnostic (logged at powers of two). A wrapping diagnostic counter;
+    /// it bounds no capacity.
     pool_exhaustions: u32,
     /// Head of the intrusive free list; None if no free slots.
     ///

@@ -59,7 +59,8 @@ pub mod caps_slot
     pub const VFSD_DENY: usize = 5;
 }
 
-/// Number of slots in the `CAPS` slot list.
+/// Number of slots in the `CAPS` slot list: one per role in [`caps_slot`],
+/// whose roles are fixed, so the list cannot overflow.
 pub const CAPS_SLOTS: usize = 6;
 
 /// Number of `CAPS` rounds the slot list takes.

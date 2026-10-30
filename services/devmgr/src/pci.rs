@@ -14,6 +14,7 @@ use virtio_core::{
 };
 
 pub const MAX_DEVICES: usize = 8;
+/// BAR registers in a PCI type-0 configuration header (offsets 0x10 to 0x24).
 const MAX_BARS: usize = 6;
 
 #[derive(Clone, Copy)]
@@ -170,6 +171,9 @@ unsafe fn ecam_write32(ecam: Ecam, bus: u8, dev: u8, func: u8, reg: u16, val: u3
 // ── PCI enumeration ─────────────────────────────────────────────────────────
 
 /// Scan PCI bus via ECAM and discover devices.
+///
+/// The device and function loops and the `u8` bus number are the PCI BDF
+/// widths: 32 devices per bus, 8 functions per device, 256 buses.
 ///
 /// # Safety
 /// `ecam_va` must be a valid ECAM MMIO mapping of buses
@@ -447,6 +451,9 @@ unsafe fn read_virtio_pci_caps(ecam: Ecam, dev: &mut PciDevice)
     // SAFETY: ecam is valid.
     let mut cap_ptr = unsafe { ecam_read8(ecam, dev.bus, dev.dev, dev.func, 0x34) } & !3;
 
+    // Capabilities are dword-aligned in the 192 bytes above the 64-byte
+    // standard header, so a list longer than (256 - 64) / 4 = 48 entries
+    // must loop.
     let mut iterations = 0u32;
     while cap_ptr != 0 && iterations < 48
     {

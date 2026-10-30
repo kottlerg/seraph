@@ -215,6 +215,9 @@ pub struct TestContext
 
 /// 16 KiB stack for a child thread, aligned per the System V ABI.
 ///
+/// A test fixture: the size bounds only the call depth of ktest's own child
+/// entry points, not any capacity of the system under test.
+///
 /// Declare one as `static mut CHILD_STACK: ChildStack = ChildStack::ZERO` in
 /// any test module that spawns a child thread. Pass `ChildStack::top(ptr)` to
 /// `thread_configure` as the initial stack pointer.
@@ -255,6 +258,9 @@ impl ChildStack
 
 /// Static IPC buffer — 4 KiB, page-aligned.
 ///
+/// One page is the ABI's IPC buffer size: `SYS_IPC_BUFFER_SET` registers a
+/// single page per thread, which holds the whole message layout.
+///
 /// Registered once in `run()` via `ipc_buffer_set`, for ktest's main thread
 /// alone. The kernel writes received message data and capability slot indices
 /// here; the `ipc::IpcMessage` wrappers snapshot those values into a
@@ -266,7 +272,8 @@ struct IpcBuf([u64; 512]);
 
 pub(crate) static mut IPC_BUF: IpcBuf = IpcBuf([0u64; 512]);
 
-/// A page-aligned IPC buffer page for one child thread.
+/// A page-aligned IPC buffer page for one child thread, one page for the
+/// reason `IPC_BUF` is.
 ///
 /// Declare one per concurrently running child as a `static mut` (or an array
 /// of them), as for [`ChildStack`], and have the child register it with

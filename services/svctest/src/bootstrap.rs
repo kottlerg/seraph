@@ -38,9 +38,10 @@
 //!
 //! svctest requests the rounds from `info.creator_endpoint`; if no
 //! creator endpoint is present (`== 0`), every slot stays zero. The `ns`
-//! and pwrmgr cap-deny phases then skip; the phases that assert on a slot
-//! (the devmgr deny, orphan-teardown, drivers deny, svcmgr seed-only and
-//! second-seed-round phases) fail, per README § Run Sequence.
+//! phase then skips; the phases that assert on a slot (the devmgr deny,
+//! orphan-teardown, drivers deny, svcmgr seed-only and second-seed-round
+//! phases) fail, per README § Run Sequence. The pwrmgr cap-deny phase reads
+//! no slot: it skips only when its queried `pwrmgr.deny` cap is zero.
 
 use std::os::seraph::startup_info;
 

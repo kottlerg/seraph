@@ -807,9 +807,11 @@ pub unsafe fn route_device_irq(_irq: u32) -> Result<(), crate::irq::RouteError>
 
 /// Release GSI `irq`'s route: mask its redirection entry, then free its device vector. An
 /// interrupt already latched on the vector reaches `idt::irq_dispatch` and finds no GSI and
-/// is dropped, unless the vector was reassigned first; vectors are reassigned in turn
-/// (`ioapic::assign_vector`), so that needs every other device vector to be assigned in
-/// between, and it then reaches the new owner as one spurious delivery.
+/// is dropped, unless the vector was reassigned before it was serviced: it then reaches the
+/// new owner as one spurious delivery, which a driver tolerates as it does any interrupt
+/// its device did not raise. Vectors are assigned in turn and the cursor moves past a
+/// released one (`ioapic::assign_vector`), so the next route does not take it while other
+/// vectors are free.
 ///
 /// # Safety
 /// Must be called after Phase 5 init, under `irq`'s routing lock.

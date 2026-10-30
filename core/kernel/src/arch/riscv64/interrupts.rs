@@ -54,14 +54,15 @@
 //!
 //! # Locking
 //! [`plic_enable`] and [`plic_disable`] read-modify-write a 32-source enable word of
-//! the source's target context, and run on any hart (`SYS_IRQ_ACK`, the device-IRQ
+//! the source's target context, and [`acknowledge`] one of the claiming hart's own
+//! context around its completion; all run on any hart (`SYS_IRQ_ACK`, the device-IRQ
 //! dispatch in interrupt context, and the route changes `irq` makes), so each holds
 //! `PLIC_LOCK`, a leaf lock taken with interrupts disabled, across its read and write;
 //! otherwise two updates to sources sharing a word could lose one. `SOURCE_TARGET` is
 //! written only by the route changes, which `irq` serialises under its routing lock.
 //! [`init`] and [`init_ap`] write only the boot hart's or their own hart's context
-//! before any IRQ is routed and take no lock; the claim and complete registers are
-//! per-context and need none.
+//! before any IRQ is routed and take no lock; the claim register is per-context and
+//! needs none.
 //!
 //! # Modification notes
 //! - Device IRQs need no per-device code here: `route_device_irq` picks the source's
@@ -108,8 +109,9 @@ const fn plic_threshold_offset_for(hart: u32) -> u64
 static SOURCE_TARGET: [core::sync::atomic::AtomicU32; PLIC_MAX_SOURCES as usize + 1] =
     [const { core::sync::atomic::AtomicU32::new(0) }; PLIC_MAX_SOURCES as usize + 1];
 
-/// Serialises the enable-word read-modify-write of [`plic_enable`] and [`plic_disable`]
-/// (see the module doc's § Locking). A leaf lock: nothing is acquired while it is held.
+/// Serialises the enable-word read-modify-writes of [`plic_enable`], [`plic_disable`]
+/// and [`acknowledge`] (see the module doc's § Locking). A leaf lock: nothing is acquired
+/// while it is held.
 #[cfg(not(test))]
 static PLIC_LOCK: crate::sync::Spinlock = crate::sync::Spinlock::new();
 

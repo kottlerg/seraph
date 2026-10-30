@@ -85,7 +85,8 @@ pub fn sys_irq_ack(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Unmask at the interrupt controller to re-enable delivery, if the line is
     // routed (`irq::ack` checks and unmasks under the routing lock).
-    // SAFETY: syscall context, not interrupt context.
+    // SAFETY: syscall context, not interrupt context, with no IPC source,
+    // scheduler, or sleep-list lock held.
     unsafe { crate::irq::ack(irq_id) };
 
     Ok(0)

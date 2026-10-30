@@ -2169,9 +2169,9 @@ pub unsafe fn object_for_new_slot(
 ///   takes that (non-recursive) lock for its batched derivation drain, and
 ///   the Memory arm takes the frame-allocator lock.
 /// - Must NOT be called with any IPC source, per-TCB `sched_lock`, per-CPU
-///   scheduler, or sleep-list lock held: the Thread, Notification, and
-///   `EventQueue` arms spin until work on other CPUs that takes those locks
-///   finishes (with interrupts enabled: the Thread drain gates and
+///   scheduler, or sleep-list lock held: the Thread, Notification,
+///   `EventQueue`, and Interrupt arms spin until work on other CPUs that takes
+///   those locks finishes (with interrupts enabled: the Thread drain gates and
 ///   `sched::sleep_wakeups_quiesce`; with interrupts disabled under the IRQ
 ///   routing lock: the Notification and Interrupt arms' wait for in-flight
 ///   device-IRQ deliveries, `irq::unregister_notification` and

@@ -347,7 +347,9 @@ pub unsafe fn register(irq: u32, notification: *mut NotificationState) -> Result
 /// route clear cannot leave the line unmasked behind it.
 ///
 /// # Safety
-/// Must be called outside interrupt context.
+/// Same context as [`register`]: outside interrupt context, with no IPC source,
+/// scheduler, or sleep-list lock held, since a holder of the routing lock may be
+/// draining deliveries that take them.
 #[cfg(not(test))]
 pub unsafe fn ack(irq: u32)
 {

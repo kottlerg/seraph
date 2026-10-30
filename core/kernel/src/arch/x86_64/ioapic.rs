@@ -109,8 +109,11 @@ pub const IOAPIC_MAX_PINS: u32 = 256;
 pub const BROADCAST_APIC_ID: u32 = 0xFF;
 
 /// Where [`assign_vector`]'s search for a free vector starts: one past the vector it last
-/// assigned, so a released vector is reassigned only after the search has passed every
-/// other one (`interrupts::unroute_device_irq`). Written only under `irq`'s routing lock.
+/// assigned, and never the index of a vector just released ([`release_vector`] moves it
+/// past one). The search moves through the vectors in turn, so a released vector is taken
+/// again only once the search comes round to it, not by the next route while other
+/// vectors are free (`interrupts::unroute_device_irq`). Written only under `irq`'s routing
+/// lock.
 #[cfg(not(test))]
 static NEXT_VECTOR_INDEX: AtomicU32 = AtomicU32::new(0);
 
@@ -160,21 +163,29 @@ fn assign_vector_in(table: &[AtomicU32], gsi: u32, start: usize) -> Option<(u8, 
     Some((vector_at(index)?, (index + 1) % table.len()))
 }
 
-/// Free every vector `table` assigns to `gsi`.
-fn release_vector_in(table: &[AtomicU32], gsi: u32)
+/// Free every vector `table` assigns to `gsi`, and return the search cursor `cursor` moved
+/// past each freed index it names, so the next search does not start on a vector just
+/// released.
+fn release_vector_in(table: &[AtomicU32], gsi: u32, cursor: usize) -> usize
 {
     let Some(tag) = gsi.checked_add(1)
     else
     {
-        return;
+        return cursor;
     };
-    for entry in table
+    let mut cursor = cursor;
+    for (index, entry) in table.iter().enumerate()
     {
         if entry.load(Ordering::Relaxed) == tag
         {
             entry.store(0, Ordering::Release);
+            if index == cursor
+            {
+                cursor = (index + 1) % table.len();
+            }
         }
     }
+    cursor
 }
 
 /// Assign `gsi` a device vector: its existing one if it has one, else the next free one in
@@ -197,12 +208,18 @@ pub fn assign_vector(gsi: u32) -> Option<u8>
 #[cfg(not(test))]
 pub fn release_vector(gsi: u32)
 {
-    release_vector_in(&VECTOR_GSI, gsi);
+    let cursor = NEXT_VECTOR_INDEX.load(Ordering::Relaxed) as usize;
+    let cursor = release_vector_in(&VECTOR_GSI, gsi, cursor);
+    // The cursor is below DEVICE_VECTOR_COUNT (217), which fits u32.
+    #[allow(clippy::cast_possible_truncation)]
+    NEXT_VECTOR_INDEX.store(cursor as u32, Ordering::Relaxed);
 }
 
 /// The GSI device vector `vector` is assigned to, or `None` for a free vector or one
 /// outside the device range. Read in interrupt context (`idt::irq_dispatch`): an interrupt
-/// latched before its vector was released finds `None` and is dropped.
+/// latched before its vector was released finds `None` and is dropped, unless the vector
+/// was reassigned before it was serviced, when it reaches the new owner as one spurious
+/// delivery (`interrupts::unroute_device_irq`).
 #[cfg(not(test))]
 #[must_use]
 pub fn gsi_for_vector(vector: u8) -> Option<u32>
@@ -509,29 +526,43 @@ mod tests
     }
 
     #[test]
-    fn a_released_vector_is_reassigned_only_after_the_others()
+    fn a_released_vector_is_not_the_next_assigned()
     {
         // Defect caught: a vector freed while an interrupt is latched on it being
         // handed straight to the next GSI, which would take that interrupt.
         let t = table();
         let (first, next) = assign_vector_in(&t, 3, 0).expect("vector");
-        release_vector_in(&t, 3);
+        let next = release_vector_in(&t, 3, next);
         let (second, _) = assign_vector_in(&t, 4, next).expect("vector");
         assert_ne!(first, second);
     }
 
     #[test]
+    fn a_release_at_the_cursor_moves_the_cursor_past_it()
+    {
+        // GSI 9 keeps vector index 5 while another GSI's route moves the cursor
+        // onto index 5; releasing GSI 9 must not leave the next search starting there.
+        let t = table();
+        let (_, _) = assign_vector_in(&t, 9, 5).expect("vector");
+        let cursor = release_vector_in(&t, 9, 5);
+        assert_eq!(cursor, 6);
+        let (vector, _) = assign_vector_in(&t, 4, cursor).expect("vector");
+        assert_ne!(vector, DEVICE_VECTOR_BASE + 5);
+    }
+
+    #[test]
     fn the_search_wraps_to_a_vector_freed_below_the_cursor()
     {
+        // Every vector but index 1 assigned, and the search starting past index 1:
+        // it must wrap round the end of the table to find index 1.
         let t = table();
-        let mut start = 0;
         for gsi in 0..DEVICE_VECTOR_COUNT as u32
         {
-            start = assign_vector_in(&t, gsi, start).expect("vector").1;
+            assign_vector_in(&t, gsi, gsi as usize).expect("vector");
         }
-        release_vector_in(&t, 0);
-        let (vector, _) = assign_vector_in(&t, 5000, start).expect("vector");
-        assert_eq!(vector, DEVICE_VECTOR_BASE);
+        release_vector_in(&t, 1, 100);
+        let (vector, _) = assign_vector_in(&t, 5000, 100).expect("vector");
+        assert_eq!(vector, DEVICE_VECTOR_BASE + 1);
     }
 
     #[test]
@@ -562,7 +593,7 @@ mod tests
             assert!(assign(&t, gsi).is_some());
         }
         assert_eq!(assign(&t, 1000), None);
-        release_vector_in(&t, 5);
+        release_vector_in(&t, 5, 0);
         assert_eq!(find_vector(&t, 5), None);
         assert!(assign(&t, 1000).is_some());
     }

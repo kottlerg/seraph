@@ -9,13 +9,20 @@ discovery, interrupt routing resolution, and device-to-driver matching.
 
 PCI Express Enhanced Configuration Access Mechanism (ECAM) maps the 4 KiB
 extended configuration space of each PCI function to a contiguous MMIO
-region. devmgr locates the ECAM itself as a `firmware::EcamLocation`
-(`phys_base`, `size`, `start_bus`, `end_bus`) from the ACPI MCFG table, else
-the Device Tree blob's `pci-host-ecam-generic` node, else the riscv64 QEMU
+region. devmgr locates every ECAM window itself, each as a
+`firmware::EcamLocation` (`phys_base`, `size`, `segment`, `start_bus`,
+`end_bus`): one per allocation entry of the ACPI MCFG table, else one per
+`pci-host-ecam-generic` node of the Device Tree blob, else the riscv64 QEMU
 `virt` platform default (`arch::current::platform_default_ecam`), reading the
-firmware tables through the read-only Memory caps init delivers. It then
+firmware tables through the read-only Memory caps init delivers. Each read
+maps only the pages that hold the table, at the table's own offset in its
+ACPI region (`firmware::acpi::table_window`), so a table anywhere in a region
+is readable; the DTB is mapped whole. An MCFG entry or DTB node that yields
+no window is skipped and the walk continues. For each window devmgr then
 carves the ECAM `Mmio` sub-cap from the boot-provided MMIO aperture cap that
-covers it.
+covers it, maps it, and scans it. A window no aperture covers, or that
+cannot be mapped, is logged and not scanned; the boot halts only when no
+window yields a scan.
 
 ### Address Calculation
 
@@ -32,12 +39,24 @@ its `bus-range` property, else bus 0 onward, clamped to the buses its `reg`
 covers and to 255 (the `reg` is decoded in the parent's `#address-cells` /
 `#size-cells`, and its address is the configuration space of the first bus);
 for the platform default, 0..=255. The window's `size` is 1 MiB per bus of
-that range on every path. A table whose window is empty, inverted, or
+that range on every path. Its `segment` is the MCFG entry's PCI segment
+group; for a DTB node, its `linux,pci-domain` property, else the lowest
+segment no other ECAM node's property or earlier fallback takes; for the
+platform default, 0. A DTB node whose `linux,pci-domain` is short or above
+65535 yields no window. A table whose window is empty, inverted, or
 overflows a 64-bit physical address yields no ECAM. The offset arithmetic is
 `firmware::pci::config_offset`; devmgr reads a bus outside
 `start_bus..=end_bus` as all-ones.
 
 ### Scan Procedure
+
+The walk is `firmware::scan::scan`, which reaches configuration space through
+the `ConfigSpace` accessor devmgr implements over the mapped window. It
+collects every present function into a growable list; when the list cannot
+grow, the scan stops, logged with the first function it could not record,
+and keeps the functions found before it (a window that recorded any counts
+as scanned). The functions of every window are
+then ordered by segment, bus, device, and function.
 
 1. Map the ECAM `Mmio` cap into devmgr's address space.
 2. For each bus in range, each device 0-31, function 0:
@@ -83,7 +102,10 @@ VirtIO PCI devices use vendor ID `0x1AF4`. Device IDs:
 
 devmgr matches discovered devices against its driver binaries by vendor and
 device ID: a boot module for virtio-blk, an on-disk driver for virtio-input.
-Class-based matching is design intent (#165).
+Every matching device gets its own driver process, in segment, bus, device,
+function order, except a virtio-blk device that cannot get a private IRQ
+line: virtio-blk requires one, and a line another device already holds is
+not served until shared lines are (#664). Class-based matching is design intent (#165).
 
 ---
 
@@ -91,21 +113,30 @@ Class-based matching is design intent (#165).
 
 For each matched device, devmgr:
 
-1. Carves an `Mmio` sub-cap for the device's VirtIO common-config BAR out of
+1. Refuses the device, logging both BAR indices, when a VirtIO register
+   region it names (notify, ISR, or device configuration) lies in a BAR other
+   than the common-configuration region's: a VirtIO driver is delivered one
+   BAR.
+2. Carves an `Mmio` sub-cap for the device's VirtIO common-config BAR out of
    the boot-provided MMIO aperture that covers it, spanning the BAR's first
    `bar_aperture_pages` pages at most (the reach of its VirtIO capability
    structures). The driver reserves that many pages of VA for the BAR, and
    `SYS_MMIO_MAP` maps a cap's whole region, so a larger cap would map past
-   the driver's reservation.
-2. Splits a single-IRQ `Interrupt` cap for the device's GSI (its
+   the driver's reservation. The aperture's lower and upper remainders stay
+   in devmgr's growable aperture table (`firmware::resource::SpanTable`) as
+   caps of their own.
+3. Splits a single-IRQ `Interrupt` cap for the device's GSI (its
    firmware-programmed IRQ line, else the arch `INTx` fallback) off devmgr's
-   Interrupt range cap.
-3. Requests procmgr to create the driver process: `CREATE_PROCESS` for a
-   boot-module driver (virtio-blk, at enumeration) or `CREATE_FROM_FILE` for
-   an on-disk one (virtio-input, whose steps 3-5 run later, once
-   `SET_DRIVERS_DIR` delivers the drivers directory).
-4. Starts the driver (`START_PROCESS`).
-5. Serves the driver's bootstrap rounds over `ipc::bootstrap`: round 1
+   Interrupt range cap. The lines below and above it stay in devmgr's
+   interrupt table, so devices are served in any GSI order.
+4. Requests procmgr to create the driver process: `CREATE_PROCESS` for a
+   boot-module driver (virtio-blk, at enumeration, from a derived copy of the
+   module cap per device; the original is released once every device is
+   served) or `CREATE_FROM_FILE` for an on-disk one (virtio-input, whose
+   steps 4-6 run later, once `SET_DRIVERS_DIR` delivers the drivers
+   directory).
+5. Starts the driver (`START_PROCESS`).
+6. Serves the driver's bootstrap rounds over `ipc::bootstrap`: round 1
    carries the BAR `Mmio`, the IRQ, and the driver's service endpoint (BAR
    and service only when there is no IRQ, a shape only virtio-input accepts,
    so virtio-blk is not spawned without one); round 2 carries a per-device

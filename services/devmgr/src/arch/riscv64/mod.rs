@@ -49,7 +49,7 @@ impl ArchCaps
 /// devmgr functional on those firmware builds. New RISC-V hardware that
 /// diverges from QEMU virt will need real `_CRS` parsing or a DTB
 /// published by its firmware — replace this stub at that point.
-// The `Option` return is the dispatch surface's shape: `discover_ecam`
+// The `Option` return is the dispatch surface's shape: `discover_ecams`
 // chains it after two fallible firmware probes, and the x86-64 arm has
 // no default to return.
 #[allow(clippy::unnecessary_wraps)]
@@ -58,6 +58,7 @@ pub fn platform_default_ecam() -> Option<EcamLocation>
     Some(EcamLocation {
         phys_base: 0x3000_0000,
         size: 0x1000_0000,
+        segment: 0,
         start_bus: 0,
         end_bus: 255,
     })

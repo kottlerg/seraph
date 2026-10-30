@@ -378,10 +378,11 @@ pub const SPIN_SITE_REGS_SETTLE: u32 = 8;
 /// `sys_thread_stop` save wait (`await_stopped_save`): spinning until a
 /// target that left its CPU before the commit publishes its save.
 pub const SPIN_SITE_STOP_SAVE: u32 = 9;
-/// Notification dealloc gate: spinning until every device-IRQ delivery in
-/// flight through a route the dying notification held has finished
-/// (`irq::unregister_notification`).
-pub const SPIN_SITE_DEALLOC_IRQ_DELIVERY: u32 = 10;
+/// IRQ route drain: spinning, under the IRQ routing lock, until every
+/// device-IRQ delivery in flight through a route a change just replaced or
+/// cleared has finished (`irq::register`, `irq::unregister`, and the
+/// Notification dealloc arm's `irq::unregister_notification`).
+pub const SPIN_SITE_IRQ_ROUTE_DRAIN: u32 = 10;
 
 /// Per-CPU breadcrumb naming the bounded protocol-spin a CPU is currently
 /// executing, for the softlockup watchdog. A wedged CPU (no non-idle dispatch
@@ -391,8 +392,8 @@ pub const SPIN_SITE_DEALLOC_IRQ_DELIVERY: u32 = 10;
 /// The reporting sites are the three `dealloc_object(Thread)` gates (the
 /// first of which `stop_threads_bound_to`'s phase-2 spin shares), the
 /// `dealloc_object(AddressSpace)` root-free gate, the timer-dispatch gate the
-/// Notification, `EventQueue`, and Thread dealloc arms share, the Notification
-/// arm's IRQ-delivery gate (`irq::unregister_notification`), the
+/// Notification, `EventQueue`, and Thread dealloc arms share, the IRQ route
+/// drain (`irq::register`, `irq::unregister`, `irq::unregister_notification`), the
 /// `sys_thread_start` settle loop (`start_under_all_locks`), the register-access
 /// wait (`with_held_frame`), the `sys_thread_stop` save wait
 /// (`await_stopped_save`), and the
@@ -442,7 +443,7 @@ fn spin_site_name(site: u32) -> &'static str
         SPIN_SITE_START_SETTLE => "start:settle",
         SPIN_SITE_REGS_SETTLE => "regs:settle",
         SPIN_SITE_STOP_SAVE => "stop:save",
-        SPIN_SITE_DEALLOC_IRQ_DELIVERY => "dealloc:irq-delivery",
+        SPIN_SITE_IRQ_ROUTE_DRAIN => "irq:route-drain",
         _ => "none",
     }
 }

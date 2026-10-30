@@ -1747,8 +1747,9 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// `DERIVATION_LOCK` and the frame allocator and, for a Notification, an
 /// `EventQueue`, or an Endpoint, wakes the waiters it drains (the running
 /// thread among them, when it is parked on the object it released), for a
-/// Notification first waits out every line's in-flight device-IRQ deliveries
-/// (`irq::unregister_notification`), for a Notification or
+/// Notification first clears its IRQ routes and waits out the device-IRQ
+/// deliveries in flight through them (`irq::unregister_notification`), for a
+/// Notification or
 /// `EventQueue` waits for the timer's in-flight wakeup batch
 /// (`sched::sleep_wakeups_quiesce`), and for an Mmio or `IoPort` object
 /// waits for the TLB shootdown or takes the thread registry lock its
@@ -2257,11 +2258,13 @@ pub unsafe fn object_for_new_slot(
 ///   takes that (non-recursive) lock for its batched derivation drain, and
 ///   the Memory arm takes the frame-allocator lock.
 /// - Must NOT be called with any IPC source, per-TCB `sched_lock`, per-CPU
-///   scheduler, or sleep-list lock held: the Thread, Notification, and
-///   `EventQueue` arms spin, with interrupts enabled, until work on other
-///   CPUs that takes those locks finishes (the Thread drain gates, the
-///   Notification arm's wait for in-flight device-IRQ deliveries,
-///   `irq::unregister_notification`, and `sched::sleep_wakeups_quiesce`).
+///   scheduler, or sleep-list lock held: the Thread, Notification,
+///   `EventQueue`, and Interrupt arms spin until work on other CPUs that takes
+///   those locks finishes (with interrupts enabled: the Thread drain gates and
+///   `sched::sleep_wakeups_quiesce`; with interrupts disabled under the IRQ
+///   routing lock: the Notification and Interrupt arms' wait for in-flight
+///   device-IRQ deliveries, `irq::unregister_notification` and
+///   `irq::unregister`).
 ///
 /// # Cascade handling
 ///
@@ -2490,23 +2493,17 @@ unsafe fn dealloc_object_one(
             // table and program the controller (sys_irq_register asserts
             // `count == 1`). Range caps are delegation authorities; they
             // have no routing-table footprint to clean up. Nor does a
-            // single-id cap outside the routable range: sys_irq_register
-            // refuses it, and on riscv64 a split of the 1024-id root cap can
-            // name an id past the routing table, which `irq::unregister`
-            // must not be handed.
+            // single-id cap outside the routable range, which
+            // sys_irq_register refuses; `irq::unregister` ignores an id
+            // inside it that lies past the discovered routing table.
             if count == 1
                 && (crate::arch::current::MIN_IRQ_ID..=crate::arch::current::MAX_IRQ_ID)
                     .contains(&start)
             {
-                // SAFETY: the routing entry is an atomic pointer (irq.rs § Thread
-                //         safety); disabling interrupts orders the unregister against
-                //         this CPU's dispatch_device_irq.
-                unsafe {
-                    let saved = crate::arch::current::cpu::save_and_disable_interrupts();
-                    crate::irq::unregister(start);
-                    crate::arch::current::cpu::restore_interrupts(saved);
-                }
-                crate::arch::current::interrupts::mask(start);
+                // SAFETY: not interrupt context, and no IPC source, scheduler,
+                // or sleep-list lock is held (this function's contract), as
+                // `irq::unregister` requires; it masks and releases the line.
+                unsafe { crate::irq::unregister(start) };
             }
 
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
@@ -3651,11 +3648,11 @@ unsafe fn dealloc_object_one(
 
             if !state.is_null()
             {
-                // Clear any IRQ routing table entries that point to this
-                // NotificationState and wait out every line's in-flight
-                // device-IRQ deliveries on any CPU, including one through a
-                // route an earlier replace or clear removed, so none reaches
-                // the state after the free below (irq::unregister_notification).
+                // Clear the IRQ routes that point to this NotificationState and
+                // wait out the device-IRQ deliveries in flight through them on
+                // any CPU; a route an earlier replace or clear removed was
+                // drained by that change, so none reaches the state after the
+                // free below (irq::unregister_notification).
                 // SAFETY: state is live; no IPC source, scheduler, or
                 // sleep-list lock is held, and this is not interrupt context.
                 unsafe { crate::irq::unregister_notification(state) };

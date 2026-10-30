@@ -64,7 +64,9 @@ Spawn each worker with the `Agent` tool, `subagent_type` `worker`, worktree isol
 prompt of this shape; nothing in it repeats the agent file:
 
 > You are orchestrated. Scope `<scope>`; Issues #N, #M (one line each: title and the items in
-> play); branch `<prefix>/<slug>`; report to `main`. Batch rulings: <the rulings below that the
+> play); branch `<prefix>/<slug>`; report to `main`; review records go to `<path of your
+> checkout>` (the destination of the worker's copy, `.claude/agents/worker.md` § Review). Batch
+> rulings: <the rulings below that the
 > maintainer changed for this batch, and any Issue-specific decision already made>.
 
 A documentation-only scope may run on `model: sonnet`; everything that compiles stays on the
@@ -105,13 +107,16 @@ produces hangs that then need classifying. One slot at a time:
 A PR is at its gate when: `gh pr view <N> --json mergeStateStatus,statusCheckRollup` shows
 `CLEAN` and every check green (docs/conventions.md § CI Gating, § Branch protection); the
 merge-prompt condition of its § Branch and PR Workflow holds, that is, the last run record
-under the worker's `target/xtask/review/pr<N>/` is a completed run with no failed agent whose
+under `target/xtask/review/pr<N>/` in your checkout, where the worker copied its records, is a
+completed run with no failed agent whose
 verdict is `READY TO MERGE`, or `NON-BLOCKING ISSUES ONLY` with every surface finding recorded
 and no contested finding on the surface unresolved, and `AUDIT PASS` is on record for the
 head; every Issue the body closes carries the current milestone (§ Milestones); and a delta
 since the validated head is comment-only or Markdown-only (§ PR-body checklist discipline;
 `git diff <validated> <head> -- . ':!*.md'` shows only comment lines). Verify each part
-yourself, since a worker's report is a claim. Then prompt the maintainer, or merge under their
+yourself, since a worker's report is a claim; a gate whose records are not readable in your
+checkout is not verified, so ask the worker for the copy before merging rather than merging on
+the report. Then prompt the maintainer, or merge under their
 standing instruction, with `gh pr merge <N> --merge --delete-branch`; fast-forward your own
 checkout, record it, and tell every open PR's worker what moved.
 
@@ -199,6 +204,8 @@ this session. Cancel the watchdog. Close the record with the open-Issue count by
   worktree, and a later message does not resume it. The worker's turn-ending rule
   (`.claude/agents/worker.md` § Reporting) prevents it; the watchdog's liveness check (§ Plan
   step 4) and the respawn prompt (§ Spawn) recover from it.
+- A finished worker's worktree, and every record in it, is gone before you can read it, so a
+  record that exists only there is no record.
 - A worker's provider limit ends its session mid-slot: complete the mechanical steps yourself
   in its worktree (the drivers are plain shell: gate, build, boot, log), then resume the worker
   with the results so it writes the body and runs the review with its own context.

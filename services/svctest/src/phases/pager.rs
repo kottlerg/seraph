@@ -27,6 +27,15 @@
 //! After each spawn/die cycle the all-RAM-accounted identity must still hold,
 //! directly guarding against fault-path accounting drift (a stray
 //! `pool_total` credit on demand allocation would break it).
+//!
+//! A fourth phase, **forged badge**, shows a process cannot make the kernel
+//! stamp its faults with a badge other than its own memmgr cap's: binding its
+//! own thread to its pager cap with a binder-supplied badge (another
+//! process's, as a forger would pass) is refused with `InvalidArgument`, and
+//! the same bind with the reserved word 0 succeeds, so the badge word alone
+//! is the refusal's cause (docs/fault-handling.md § Security). The fault badge
+//! is therefore always the derivation badge of a cap the binder holds, and a
+//! process holding only its own memmgr cap cannot back another's region.
 
 use std::os::seraph::process::CommandExt;
 use std::os::seraph::startup_info;
@@ -49,7 +58,56 @@ pub fn phases() -> &'static [Phase]
             name: "demand_paging_pinned",
             run: demand_paging_pinned_phase,
         },
+        Phase {
+            name: "pager_forged_badge_refused",
+            run: pager_forged_badge_phase,
+        },
     ]
+}
+
+/// Bind this thread to its pager cap with a forged badge word, then with the
+/// reserved 0, through the raw syscall the typed wrapper cannot express.
+fn pager_forged_badge_phase(_: &Caps)
+{
+    use syscall_abi::{FAULT_CLASS_ALL, SYS_THREAD_SET_FAULT_HANDLER, SyscallError};
+
+    let info = startup_info();
+    assert_ne!(
+        info.pager_endpoint_cap, 0,
+        "svctest is demand-paged: its pager cap must be advertised"
+    );
+    // Any other process's badge would do; a value that is not this process's
+    // stands in for one.
+    let forged = info.pager_badge ^ 0x5A5A;
+    let bind = |badge: u64| {
+        // SAFETY: raw_syscall4's four conditions hold. SYS_THREAD_SET_FAULT_HANDLER
+        // takes no pointer and uses no IPC buffer; it changes no mapping; the
+        // only thread it can change is the calling one, whose fault binding it
+        // would set to the pager cap that binding already names (procmgr bound
+        // the main thread to `pager_endpoint_cap`), leaving its registers alone;
+        // and it changes no CSpace slot.
+        unsafe {
+            syscall::raw_syscall4(
+                SYS_THREAD_SET_FAULT_HANDLER,
+                u64::from(info.self_thread),
+                u64::from(info.pager_endpoint_cap),
+                badge,
+                FAULT_CLASS_ALL,
+            )
+        }
+    };
+    let refused = bind(forged);
+    assert_eq!(
+        refused,
+        SyscallError::InvalidArgument as i64,
+        "a fault-handler bind carrying a binder-supplied badge must be refused"
+    );
+    let plain = bind(0);
+    assert_eq!(
+        plain, 0,
+        "the same bind with the reserved badge word 0 must succeed"
+    );
+    std::os::seraph::log!("pager_forged_badge_refused phase passed (forged bind -> {refused})");
 }
 
 fn demand_paging_phase(_: &Caps)

@@ -10,8 +10,8 @@
 //! `#[cfg(target_arch)]` guards (`docs/coding-standards.md` § C. Architecture
 //! Invariants). Every architecture defines the same wrappers: `syscall2` to
 //! `syscall6` (primary return only), `syscall5_ret2`, `syscall1_ret4`,
-//! `syscall6_ret3`, and `syscall3_any` (every argument register declared
-//! clobbered, behind the untyped `raw_syscall3`).
+//! `syscall6_ret3`, and `syscall4_any` (every argument register declared
+//! clobbered, behind the untyped `raw_syscall3` and `raw_syscall4`).
 //!
 //! # Safety
 //!
@@ -35,7 +35,7 @@
 //!   resume it only on code, a stack, and a TLS block the program dedicates to
 //!   that thread.
 //!
-//! The exception is `syscall3_any`, which accepts any `nr` and arguments under
+//! The exception is `syscall4_any`, which accepts any `nr` and arguments under
 //! its own `# Safety`. The kernel ABI's register clobbers are declared in each
 //! wrapper's asm.
 

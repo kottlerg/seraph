@@ -397,8 +397,8 @@ fault episode. The binding is therefore never overwritten
 
 For a call, the badge is the value attached to the sender's endpoint capability via
 `SYS_CAP_DERIVE_BADGE`; it identifies the caller without a forgeable PID. For a
-kernel-synthesized fault message (`FAULT_LABEL`), the badge is the binder-chosen value
-passed to `SYS_THREAD_SET_FAULT_HANDLER`, not a derived-cap badge (see
+kernel-synthesized fault message (`FAULT_LABEL`), the badge is the one attached to the
+Endpoint capability bound by `SYS_THREAD_SET_FAULT_HANDLER` (see
 § `SYS_THREAD_SET_FAULT_HANDLER` and [fault-handling.md](../../../docs/fault-handling.md)
 § Security).
 
@@ -910,12 +910,11 @@ freed under it: the syscall holds a pin on it until it drops it (see
 Two-Level Radix), and a stopped thread's teardown reaches the IPC source it was parked on only
 through a binding that proves the source live (see
 [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md#dealloc_objectthread-drain-protocol) §
-`dealloc_object(Thread)` Drain Protocol, step 11), except where a waker that holds no reference on
-the source has claimed the thread: device IRQ delivery
-([#561](https://github.com/kottlerg/seraph/issues/561)), fault delivery
-([#538](https://github.com/kottlerg/seraph/issues/538)), and the death post
-([#539](https://github.com/kottlerg/seraph/issues/539)). The caller's own `Thread` object is treated
-differently, as below.
+`dealloc_object(Thread)` Drain Protocol, step 11); a waker that claimed the thread holds the source
+live until its wake completes (device IRQ delivery through its line's in-flight count, fault
+delivery through its pin on the endpoint, the death post through the observer binding's reference;
+see [capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel
+Object Reference Counting). The caller's own `Thread` object is treated differently, as below.
 
 Refused for two cases, both returning `InvalidState` with the capability left in
 place: a thread may not delete any capability to its **own running**
@@ -1626,7 +1625,7 @@ handler bound the fault is terminal. See
 |---|---|---|
 | 0 | `thread_cap` | Thread capability (Control rights) — the thread whose handler is set |
 | 1 | `endpoint_cap` | `Endpoint` capability, or `0` to unbind |
-| 2 | `badge` | Caller-chosen value delivered as the fault message badge |
+| 2 | `reserved` | MUST be `0` |
 | 3 | `fault_class_mask` | Fault classes covered; only `FAULT_CLASS_ALL` is accepted |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
@@ -1636,16 +1635,20 @@ or thread destruction releases it (see [fault-handling.md](../../../docs/fault-h
 Liveness). The target Thread and the endpoint are pinned for the call
 ([capability-internals.md](capability-internals.md#storage-hybrid-two-level-radix) § Storage:
 Hybrid Two-Level Radix), so a concurrent delete of either one's last capability frees it only
-after the binding is published. Binding requires
-only a valid `Endpoint` cap — `Control` on the thread is the authority; the endpoint cap merely
-names where the thread's faults are delivered. The kernel synthesizes fault delivery via the
+after the binding is published. The endpoint and its badge are published as one unit under the
+target thread's `sched_lock`; fault delivery reads them once under the same lock and pins the
+endpoint until the faulting thread parks, so a concurrent rebind or unbind neither pairs one
+binding's endpoint with another's badge nor frees the endpoint mid-delivery, and a delivery that
+finds the binding cleared kills the thread as an unhandled fault
+([capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel
+Object Reference Counting). Binding requires only a valid `Endpoint` cap — `Control` on the
+thread is the authority; the endpoint cap names where the thread's faults are delivered and, by
+its derivation badge (`0` for an unbadged cap), how they are attributed: the fault message
+carries that badge, which the binder cannot choose. The kernel synthesizes fault delivery via the
 binding and distributes no send capability to the endpoint, so a handler that hands out no `SEND`
 to it receives `FAULT_LABEL` only from the kernel; a handler that also serves clients on that
-endpoint attributes the message by badge (see [fault-handling.md](../../../docs/fault-handling.md)
-§ Security). The fault badge is binder-chosen and any `Endpoint` cap, a `SEND`-only one included,
-is enough to bind, so any holder of `Control` on some thread can deliver `FAULT_LABEL` messages
-bearing an arbitrary badge; a handler sharing its endpoint with clients can trust the badge only if
-its badges are secret.
+endpoint attributes the message by badge, with the guarantees of an ordinary send's badge (see
+[fault-handling.md](../../../docs/fault-handling.md) § Security).
 
 Both page faults (`FAULT_KIND_VM`) and other kernel-unresolvable ring-3 exceptions
 (`FAULT_KIND_EXCEPTION`) are routed to the bound handler; the handler dispatches on
@@ -1657,8 +1660,8 @@ the fault kind and replies `FAULT_REPLY_KILL` for kinds it does not handle (see
 (when non-zero) MUST refer to an `Endpoint`.
 
 **Errors:** `InvalidCapability` (bad thread or endpoint cap), `InsufficientRights`
-(thread lacks Control), `InvalidArgument` (`fault_class_mask` other than
-`FAULT_CLASS_ALL`).
+(thread lacks Control), `InvalidArgument` (`reserved` nonzero, or `fault_class_mask` other
+than `FAULT_CLASS_ALL`).
 
 ---
 
@@ -1702,6 +1705,14 @@ kernel posts `(correlator << 32) | (exit_reason & 0xFFFFFFFF)` to the bound even
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure. If the target has
 already exited, the retained reason is delivered immediately and the call still returns 0.
+
+**Lifetime:** a binding holds a reference on the event queue object from the bind until the
+target thread is destroyed (its Thread object freed), so deleting every capability to the queue
+leaves it live: the death post still reaches it, and the queue is freed after the post, when the
+thread's teardown releases the binding's reference. A bind onto an already-exited thread posts at
+once and holds no reference
+([capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel
+Object Reference Counting).
 
 **Capability requirements:** `thread_cap` (Control), `eventq_cap` (Post).
 
@@ -2154,6 +2165,13 @@ for the triggers), the kernel posts the fault reason to the bound event queue. V
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure. If the space has
 already terminal-faulted, the retained reason is delivered immediately and the call
 still returns 0.
+
+**Lifetime:** a binding holds a reference on the event queue object from the bind until the
+address space is destroyed, so deleting every capability to the queue leaves it live for the
+terminal-fault post; the address space's teardown releases the reference. A bind onto an
+already-faulted space posts at once and holds no reference
+([capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel
+Object Reference Counting).
 
 **Capability requirements:** `aspace_cap` (Control), `eventq_cap` (Post).
 

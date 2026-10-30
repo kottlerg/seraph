@@ -1691,8 +1691,11 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// the reference a moved capability's freed source slot held
 /// (`cap::transfer::release_moved_object`), of the slot references a range
 /// split's consumed original and a memory merge's consumed tail held, of a
-/// copy's or derive's unpublished new-slot reference, and of the address-space
-/// reference an Mmio mapping record held (`MmioObject::withdraw_mappings`).
+/// copy's or derive's unpublished new-slot reference, of the address-space
+/// reference an Mmio mapping record held (`MmioObject::withdraw_mappings`),
+/// of the fault-handler binding a rebind or unbind replaces
+/// (`sys_thread_set_fault_handler`), and of the endpoint pin a fault delivery
+/// holds until before its park (`ipc::fault::fault_dispatch`).
 /// Pins, moves, and mapping records may name an object bound to the running
 /// thread, so a `Thread`, `CSpace`, or `AddressSpace` whose last reference
 /// goes here is queued for this CPU's deferred reclaim (drained at the next
@@ -1701,8 +1704,10 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// `DERIVATION_LOCK` and the frame allocator and, for a Notification, an
 /// `EventQueue`, or an Endpoint, wakes the waiters it drains (the running
 /// thread among them, when it is parked on the object it released), for a
-/// Notification or `EventQueue` first waits for the timer's in-flight wakeup
-/// batch (`sched::sleep_wakeups_quiesce`), and for an Mmio or `IoPort` object
+/// Notification first waits out every line's in-flight device-IRQ deliveries
+/// (`irq::unregister_notification`), for a Notification or
+/// `EventQueue` waits for the timer's in-flight wakeup batch
+/// (`sched::sleep_wakeups_quiesce`), and for an Mmio or `IoPort` object
 /// waits for the TLB shootdown or takes the thread registry lock its
 /// withdrawal needs — bounded waits that complete only when no IPC,
 /// scheduler, or sleep-list lock is held; hence the lock preconditions below.
@@ -1712,9 +1717,12 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
 /// - `obj` must carry an outstanding reference the caller owns, which this
 ///   call consumes.
 /// - A stable CPU index, which the deferred-reclaim push needs: syscall
-///   context with interrupts disabled, or the idle thread (pinned to its CPU)
-///   draining the deferred-reclaim stack, which reaches here through an Mmio
-///   object's teardown (`MmioObject::withdraw_mappings`).
+///   context with interrupts disabled; fault delivery on the faulting thread
+///   with interrupts disabled, before its park (`ipc::fault::fault_dispatch`,
+///   releasing an Endpoint, which frees in place and never reaches the push);
+///   or the idle thread (pinned to its CPU) draining the deferred-reclaim
+///   stack, which reaches here through an Mmio object's teardown
+///   (`MmioObject::withdraw_mappings`).
 /// - Must NOT be called with `DERIVATION_LOCK` held, nor with any IPC source,
 ///   per-TCB `sched_lock`, per-CPU scheduler, or sleep-list lock held (the
 ///   preconditions `dealloc_object` states).
@@ -1997,6 +2005,35 @@ fn push_cascade(
     }
 }
 
+/// Release the `EventQueueObject` reference each populated death observer in
+/// `observers` holds, queueing a queue whose last reference this was on the
+/// cascade worklist (its dealloc then runs from the caller's loop, not by
+/// recursion). Called by an owner's teardown (the Thread and `AddressSpace`
+/// arms) once no death walk can read the observers.
+#[cfg(not(test))]
+fn release_death_observers(
+    observers: &[crate::sched::thread::DeathObserver],
+    worklist: &mut [Option<NonNull<KernelObjectHeader>>],
+    head: &mut usize,
+)
+{
+    for observer in observers
+    {
+        let Some(eq) = NonNull::new(observer.eq)
+        else
+        {
+            continue;
+        };
+        // SAFETY: a populated observer owns one reference on its live
+        // EventQueueObject (DeathObserver), consumed here; the header is at
+        // offset 0.
+        if unsafe { eq.as_ref().header.dec_ref() } == 0
+        {
+            push_cascade(worklist, head, eq.cast::<KernelObjectHeader>());
+        }
+    }
+}
+
 /// Free the SEED-backed body of an object of concrete type `T`: drop it in
 /// place, return its bytes to its ancestor Memory object, and release the
 /// ancestor reference, pushing the ancestor onto `worklist` if that was the
@@ -2167,16 +2204,18 @@ pub unsafe fn object_for_new_slot(
 ///   or it is a fresh body that was never published (a range split's
 ///   rollback frees such bodies at their initial count of 1).
 /// - The CPU index must be stable — syscall context with interrupts disabled,
-///   or the idle thread's deferred-reclaim drain — because the Mmio arm
-///   releases address-space references through [`release_ref`].
+///   fault delivery with interrupts disabled before its park, or the idle
+///   thread's deferred-reclaim drain — because the Mmio arm releases
+///   address-space references through [`release_ref`].
 /// - Must NOT be called with `DERIVATION_LOCK` held: the `CSpaceObj` arm
 ///   takes that (non-recursive) lock for its batched derivation drain, and
 ///   the Memory arm takes the frame-allocator lock.
 /// - Must NOT be called with any IPC source, per-TCB `sched_lock`, per-CPU
 ///   scheduler, or sleep-list lock held: the Thread, Notification, and
 ///   `EventQueue` arms spin, with interrupts enabled, until work on other
-///   CPUs that takes those locks finishes (the Thread drain gates, and
-///   `sched::sleep_wakeups_quiesce`).
+///   CPUs that takes those locks finishes (the Thread drain gates, the
+///   Notification arm's wait for in-flight device-IRQ deliveries,
+///   `irq::unregister_notification`, and `sched::sleep_wakeups_quiesce`).
 ///
 /// # Cascade handling
 ///
@@ -2952,6 +2991,19 @@ unsafe fn dealloc_object_one(
                     }
                 }
 
+                // Release the death observers' EventQueue references. The
+                // thread runs on no CPU (the gate above), so its death walk is
+                // over or never runs, and no binder can pin it (refcount 0).
+                // SAFETY: tcb valid (not yet freed) and unreachable by any
+                // other path; the array is Copy and read by value.
+                let (observers, count) = unsafe {
+                    let observers = (*tcb).death_observers;
+                    let count = (*tcb).death_observer_count as usize;
+                    (*tcb).death_observer_count = 0;
+                    (observers, count)
+                };
+                release_death_observers(&observers[..count], worklist, head);
+
                 // Wake-in-flight gate (#160): a waker that popped this thread
                 // from a wait object (notification/endpoint/event_queue/wait_set)
                 // under that object's lock sets `wake_in_flight = 1` before
@@ -3157,6 +3209,14 @@ unsafe fn dealloc_object_one(
                 // can reissue this inactive space's tag to another space.
                 // SAFETY: as_ptr is a valid AddressSpace being reclaimed.
                 crate::mm::tag_allocator::free_tag(unsafe { &*as_ptr });
+
+                // Release the terminal-fault observers' EventQueue references.
+                // Every bound thread is stopped and off-CPU (above), so no
+                // terminal-fault post can still read them.
+                // SAFETY: as_ptr valid and uniquely owned; death_lock not held.
+                let (observers, count) =
+                    unsafe { crate::mm::address_space::AddressSpace::take_death_observers(as_ptr) };
+                release_death_observers(&observers[..count], worklist, head);
 
                 // Drop in-place objects before reclaiming their storage.
                 // `AddressSpace` and `AddressSpaceObject` have no Drop logic
@@ -3542,14 +3602,13 @@ unsafe fn dealloc_object_one(
             if !state.is_null()
             {
                 // Clear any IRQ routing table entries that point to this
-                // NotificationState. A hardware interrupt firing after the notification
-                // is freed would otherwise call notification_send on a dead slot.
-                // SAFETY: interrupts disabled to serialize with IRQ delivery.
-                unsafe {
-                    let saved = crate::arch::current::cpu::save_and_disable_interrupts();
-                    crate::irq::unregister_notification(state);
-                    crate::arch::current::cpu::restore_interrupts(saved);
-                }
+                // NotificationState and wait out every line's in-flight
+                // device-IRQ deliveries on any CPU, including one through a
+                // route an earlier replace or clear removed, so none reaches
+                // the state after the free below (irq::unregister_notification).
+                // SAFETY: state is live; no IPC source, scheduler, or
+                // sleep-list lock is held, and this is not interrupt context.
+                unsafe { crate::irq::unregister_notification(state) };
 
                 // Wait-set membership holds a +1 cap-level ref on the source
                 // (see `sys_wait_set_add` / `wait_set_drop`); reaching dealloc

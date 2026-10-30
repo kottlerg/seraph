@@ -76,7 +76,9 @@ field groups rather than mirroring every field, so the two cannot drift. As of
   these VAs per-process (via `process-layout`), so they are runtime fields, not
   ABI constants.
 - **Demand-paging pager** (v18, #34; default-on v19, #225) — `pager_endpoint_cap`,
-  `pager_badge`. The `Endpoint` cap + badge of the process's pager (memmgr).
+  `pager_badge`. The `Endpoint` cap of the process's pager (memmgr) and that
+  cap's derivation badge, which the kernel stamps on the process's fault messages
+  (informational: the bind syscall takes no badge).
   Demand paging is the system-wide default (see
   [docs/fault-handling.md](../../docs/fault-handling.md)), so these are nonzero for ordinary
   processes and zero only for pinned ones (`procmgr_labels::CREATE_PINNED`, e.g.

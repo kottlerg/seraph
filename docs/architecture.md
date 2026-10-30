@@ -288,6 +288,16 @@ mode.
 
 ---
 
+## Limits (summary — [limits.md](limits.md))
+
+What the system can hold is meant to be limited only by the hardware: a bound that would still
+stop the system first on a machine with more RAM, CPUs, devices, or address space is a defect,
+unless a hardware or format specification, a committed ABI width, or provable unreachability
+sets it. The cost of a ceiling is paid in proportion to use, not up front. The catalogue
+classifies every in-tree bound against this test.
+
+---
+
 ## Summarized By
 
 [README.md](../README.md), [core/kernel/README.md](../core/kernel/README.md),

@@ -360,6 +360,16 @@ skipping levels, risks deadlock.
     spins that run preempt-disabled and never park (the `sys_thread_start` settle loop,
     `await_stopped_save`, `with_held_frame`) hold their pin across the spin.
 
+11. **The IRQ routing lock (`irq::ROUTING`) is taken with no IPC source, `sched_lock`,
+    run-queue, or sleep-list lock held, and never in interrupt context.** It serialises every
+    IRQ route change (`irq::register`, `irq::unregister`, `irq::unregister_notification`) and
+    every `SYS_IRQ_ACK` unmask (`irq::ack`). Under it the controller's leaf locks
+    (`IOAPIC_LOCK` on x86-64, `PLIC_LOCK` on riscv64) may be taken, never the reverse. A route
+    change spins under it, interrupts disabled, until the device-IRQ deliveries in flight
+    through the route it removed finish (`irq:route-drain`), and those deliveries take a
+    notification's source lock and the scheduler locks; holding any of them while taking the
+    routing lock would deadlock against that wait.
+
 **Per-CPU scheduler fields (`core/kernel/src/sched/run_queue.rs`).** Every CPU reaches every
 `PerCpuScheduler` through a shared reference (`sched::scheduler_for`); none is reached through a
 `&mut` another CPU could alias. Its `lock` owns the run queues (the per-priority head/tail lists),
@@ -1149,6 +1159,11 @@ phases keyed off the elapsed-microseconds delta from the start of the wait:
 | C | 750 ms – 5 s | x86-64: increment the per-CPU request count returned by `nmi_backtrace_request(target_cpu)` and send a vector-2 NMI to that CPU; the target's dedicated NMI handler dumps its `TrapFrame` to serial so the eventual Phase-D panic is diagnosable. RISC-V: emit a single logged warning (no S-mode NMI surface; Phase C degrades to a warn). |
 | D | > 5 s | Print `target_cpu`, `op_name`, `elapsed_ms` to serial, then `crate::fatal`. |
 
+Before the timer is calibrated `elapsed_us` gives no reading, and the ladder runs on an elapsed
+time estimated from the spin count (`bounded_wait::WaitTimer`, at most `MAX_SPINS_PER_UNIT`
+spins per microsecond), which never overstates the true time, so a clock-less wait is bounded
+and never escalates early. A wait that started without a reading stays on the estimate.
+
 `wait_for_ack` MUST be called with preemption disabled and `IF=1` / `sstatus.SIE=1` — the same
 envelope `mm::tlb_shootdown::shootdown` establishes. The `cond` closure MUST be side-effect-free
 beyond the atomic loads needed to inspect pending state (it runs many times per spin).
@@ -1162,11 +1177,12 @@ whose bit is still set, not the full original mask.
 
 `wait_icr_idle` (x86-64 only; in xAPIC mode polls the LAPIC ICR delivery-status bit, and in x2APIC
 mode returns at once because the ICR MSR has no such bit) is **not** a `wait_for_ack` consumer — it
-spins on a hardware register that clears within microseconds on a healthy LAPIC. A 1 M iteration
-cap is far beyond any architectural timing; exhaustion indicates a hardware-level fault (stuck
-APIC, emulator bug) and calls `crate::fatal` immediately. The five callers (`send_init_ipi`,
-`send_sipi`, `send_tlb_shootdown_ipi`, `send_wakeup_ipi`, `send_nmi_to`) call it for its side
-effect only; the return type is `()`.
+spins on a hardware register that clears within microseconds on a healthy LAPIC. The spin is
+bounded in wall-clock time, 1 s by `timer::elapsed_us` (`ICR_IDLE_BUDGET_US`, through
+`bounded_wait::spin_until`), far beyond any architectural timing; exhaustion indicates a
+hardware-level fault (stuck APIC, emulator bug) and calls `crate::fatal` immediately. The five
+callers (`send_init_ipi`, `send_sipi`, `send_tlb_shootdown_ipi`, `send_wakeup_ipi`,
+`send_nmi_to`) call it for its side effect only; the return type is `()`.
 
 ### `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`
 
@@ -1222,7 +1238,9 @@ the ordering choice is required for correctness; relaxations would introduce a r
 | `park_disposition` (per TCB, `AtomicU8`) | `core/kernel/src/sched/thread.rs` (decl; ops `open_park_episode`, `stamp_park_deposit`, `consume_park_interrupted`; `consume_call_disposition` in `core/kernel/src/syscall/ipc.rs`) | Release `store` of `NONE` by `open_park_episode` (directly or via `open_call_episode`) before the thread becomes claimable; Release `store` of the disposition by the wake-claim winner in `stamp_park_deposit` (directly or via `stamp_cancelled_deposit`) | Acquire `load` on resume in `consume_park_interrupted` / `consume_call_disposition` | The claim winner's Release orders its deposit (`ipc_msg`, `wakeup_value`) before the stamp, so a resuming thread whose Acquire load observes the stamp also observes the deposit; see [ipc-internals.md § Park Dispositions and Episodes](ipc-internals.md#park-dispositions-and-episodes) for the episode protocol. |
 | `deferred_reclaim_head` (per `PerCpuScheduler`, `AtomicPtr<u8>`) | `core/kernel/src/sched/run_queue.rs` (decl); push in `push_deferred_reclaim` and drain in `drain_deferred_reclaim` (`core/kernel/src/cap/object.rs`) | AcqRel `compare_exchange` push (Acquire on failure and on the head load) | Acquire `load` fast-path empty check, then AcqRel `swap(null)` drain | Lock-free Treiber stack: the push's Release publishes the node's intrusive link written before the CAS, and the drain's Acquire swap observes it, so the draining CPU walks fully linked nodes. |
 | `fault_handler` (per TCB) | `core/kernel/src/sched/thread.rs` (decl) | AcqRel `swap` in `sys_thread_set_fault_handler` (bind/rebind/unbind) under the target's `sched_lock`, and the `dealloc_object(Thread)` binding release | Acquire `load` in `ipc::fault::fault_dispatch` (`pin_binding`) under the faulting thread's own `sched_lock`, with `inc_ref` of the loaded endpoint in the same hold; lock-free in the `has_handler` pre-check, which decides nothing | The binder holds the thread's `CONTROL` cap and runs on another CPU than the target. Binder and dispatcher serialise on the target's `sched_lock`: the dispatcher's single load under it sees one binding whole, and its `inc_ref` lands while that binding's reference still holds the endpoint, because the binder releases the previous object (`release_ref`) only after it unlocks, exactly once per rebind (the binder's `lookup_cap` pins the target Thread and the new endpoint for the call; [capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel Object Reference Counting). A null load means no handler: the fault takes the unhandled kill. The `dealloc_object(Thread)` release runs once the thread is off every CPU and no binder can pin it, so it races neither side. |
-| `IrqRoute::in_flight` and `IrqRoute::notification` (per IRQ line) | `core/kernel/src/irq.rs` (decl) | `in_flight`: SeqCst `fetch_add` in `dispatch_device_irq` before the route load, Release `fetch_sub` after `deliver`'s last access to the state and to the woken waiter. `notification`: SeqCst `store` in `register` (a replace) and `unregister` (the Interrupt-cap teardown), SeqCst CAS to null in `unregister_notification` | `notification`: SeqCst `load` in `dispatch_device_irq` after the raise. `in_flight`: SeqCst `load` spin over every line in `unregister_notification` after its clears | A Dekker pair: the raise precedes the route load, and the teardown's `SeqCst` CAS on every line, which reads that line's latest route, precedes its count loads, all `SeqCst`. A delivery that read the state before any write removed it is therefore ordered before that CAS, so it either reads a route that no longer names the state and touches nothing, or its raise is seen by the teardown, which waits for the Release drop. The teardown reads every line, since a replace or an Interrupt-cap teardown may have removed its route before it ran. That drop orders every access the delivery made to the `NotificationState` before the Notification arm frees it ([ipc-internals.md](ipc-internals.md) § Notification, Device IRQ delivery). |
+| `IrqRoute::in_flight` and `IrqRoute::notification` (per IRQ line) | `core/kernel/src/irq.rs` (decl) | `in_flight`: SeqCst `fetch_add` in `dispatch_device_irq` before the route load, Release `fetch_sub` after `deliver`'s last access to the state and to the woken waiter. `notification`: SeqCst `swap` in `register` (a replace) and `unregister` (the Interrupt-cap teardown), SeqCst `store` of null in `unregister_notification`, each under the routing lock | `notification`: SeqCst `load` in `dispatch_device_irq` after the raise, and in `ack` under the routing lock. `in_flight`: SeqCst `load` spin (`drain`) on the line a change just replaced or cleared, before the change releases the routing lock | A Dekker pair: the raise precedes the route load, and a change's `SeqCst` route write precedes its count loads, all `SeqCst`. A delivery that read a notification before a change removed it is therefore ordered before that write, so it either reads the new route and touches nothing of the removed one, or its raise is seen by the change, which waits for the Release drop before releasing the lock. Once the lock is free no delivery holds a notification no line routes to, so the Notification teardown drains only the lines in the routed-line set that name its state. That drop orders every access the delivery made to the `NotificationState` before the Notification arm frees it ([ipc-internals.md](ipc-internals.md) § Notification, Device IRQ delivery). |
+| `TABLE_BASE` and `TABLE_LEN` (the IRQ routing table) | `core/kernel/src/irq.rs` (decl) | Release `store` of the base, then of the length, once in `init_table` (Phase 5, BSP) | Acquire `load` of the length, then of the base, in `route_of` (`dispatch_device_irq`) | Publication: a dispatcher that reads a nonzero length sees the base and the zero-filled table it was stored after. No line is routed before `init_table`, so a delivery before it finds length 0 and is dropped. |
+| `VECTOR_GSI` (x86-64 device vector to GSI) | `core/kernel/src/arch/x86_64/ioapic.rs` (decl) | Release `store` of a GSI tag in `assign_vector_in` and of 0 in `release_vector_in`, both under the IRQ routing lock | Acquire `load` in `gsi_for_vector` (`idt::irq_dispatch`, interrupt context) | Publication: the tag is stored before the redirection entry naming the vector is programmed, so an interrupt on the vector reads the GSI it was routed for; one latched before a release reads 0 and is dropped, unless the vector was reassigned before it was serviced, when it reaches the new owner as one spurious delivery. |
 | `fault_badge` (per TCB) | `core/kernel/src/sched/thread.rs` (decl) | Relaxed `store` in `sys_thread_set_fault_handler`, in the same `sched_lock` hold as the `fault_handler` swap | Relaxed `load` in `fault_dispatch` (`pin_binding`), in the same `sched_lock` hold as the `fault_handler` load | Published with `fault_handler` as one unit: the lock orders the pair, so a faulter reads the badge bound with the endpoint it pins. The value is the derivation badge of the bound Endpoint cap, not a binder-chosen word ([docs/fault-handling.md](../../../docs/fault-handling.md#security) § Security). |
 | `fault_outcome` (per TCB) | `core/kernel/src/sched/thread.rs` (decl) | Release to `Pending` by `fault_dispatch` before delivery; Release to `Resume`/`Kill` by the single wake-claim winner — `sys_ipc_reply` (genuine reply), `dealloc_object(Thread)`'s dying-server arm (handler-thread destruction), `cancel_ipc_block` / endpoint-dealloc send-drain / `release_unreplied_caller` (the receive-entry `reply_tcb` swap) / the `endpoint_call` (including `rollback_uncommitted_call`) and `endpoint_recv` refused-park teardowns (cancellation, through `stamp_cancelled_deposit`); the claim is a `reply_tcb` CAS or `swap(null)`; a dying faulter's own `dealloc_object(Thread)` unlink records none (it never resumes) | Acquire `load` in `fault_dispatch` after `schedule()` returns | The disposition is written only by whoever wins the `reply_tcb` CAS (or, on the send queue, the unlink), so resume-vs-kill is unambiguous; the faulter reads it on resume. Any value other than `Resume` is treated as `Kill`, defensively covering a spurious wake that leaves `Pending`. |
 | `LOAD_BALANCE_TICK` | `core/kernel/src/sched/mod.rs` (decl, balancer) | Relaxed on `fetch_add` (sole writer is the loaded-path victim selection in `try_pull_balance`) | Relaxed on the same `fetch_add` (consumes the previous value) | Advisory random-victim seed; correctness does not depend on ordering — a stale value just biases victim selection slightly. |
@@ -1452,8 +1470,9 @@ never returned to the scheduler is stuck in a protocol-spin, and the
 breadcrumb (`spin_site_enter`/`spin_site_exit`, set around each gate) names
 which one — `dealloc:not-current`, `dealloc:context-saved`,
 `dealloc:wake-in-flight`, `dealloc:as-active`, `dealloc:timer-dispatch`,
-`dealloc:irq-delivery` (the Notification teardown's wait for in-flight device-IRQ
-deliveries, `irq::unregister_notification`), `schedule:context-saved`, `start:settle` (the
+`irq:route-drain` (an IRQ route change's wait for in-flight device-IRQ deliveries through the
+route it replaced or cleared: `irq::register`, `irq::unregister`, and the Notification
+teardown's `irq::unregister_notification`), `schedule:context-saved`, `start:settle` (the
 `sys_thread_start` settle loop of `start_under_all_locks`), `regs:settle` (the register syscalls'
 wait for a fault-blocked thread to finish switching out, `with_held_frame`),
 or `stop:save` (the `sys_thread_stop` save wait, `await_stopped_save`).

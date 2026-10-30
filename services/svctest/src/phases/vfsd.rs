@@ -37,10 +37,11 @@ pub fn phases() -> &'static [Phase]
 const ROLE_ROOT: u64 = 0;
 const ROLE_DATA: u64 = 1;
 
-/// More rejected mounts than vfsd's four per-mount bootstrap slots: a
-/// rejection that registered a partition, spawned a driver, or held a slot
-/// before failing would turn a later reply into `SPAWN_FAILED` (or another
-/// error) instead of `TABLE_FULL`.
+/// Repeated rejected mounts: vfsd checks the mount point before it
+/// registers a partition or spawns a driver, so every round must reply
+/// `TABLE_FULL`; a rejection that started a spawn first would show as
+/// `SPAWN_FAILED` (or another error) in a later round, or as a mount that
+/// no longer answers.
 const REJECT_ROUNDS: usize = 6;
 
 /// A `MOUNT` request for `role` at `path`, with `path_len` as the stated
@@ -109,9 +110,9 @@ fn mount_deny_phase(caps: &Caps)
 }
 
 /// `MOUNT` of the root role at `/` and of the data role at `/esp`, both
-/// already mount points, replies `TABLE_FULL` every time across more
-/// rounds than vfsd has bootstrap slots, and the mounted filesystems
-/// still answer afterwards.
+/// already mount points, replies `TABLE_FULL` in every one of
+/// `REJECT_ROUNDS` rounds, and the mounted filesystems still answer
+/// afterwards.
 fn mount_rejects_mounted_paths_phase(caps: &Caps)
 {
     assert_ne!(caps.vfsd_mount, 0, "vfsd_mount_rejects: no vfsd.mount seed");

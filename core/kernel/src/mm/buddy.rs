@@ -214,9 +214,8 @@ impl<W: PhysWindow> BuddyAllocator<W>
     /// Returns the physical base address, or `None` if no block is available.
     /// Only blocks on a free list carry a header (a merge clears the header of
     /// every buddy it absorbs), and the returned block's own header bytes (its
-    /// first 16) are zeroed, so no free-list
-    /// link survives into an allocated block; the rest of the block keeps
-    /// whatever it held.
+    /// first 16) are zeroed, so no free-list link survives into an allocated
+    /// block; the rest of the block keeps whatever it held.
     ///
     /// An allocation before the first [`add_region`][Self::add_region] halts
     /// the kernel (host test builds return `None`): it is a boot-order defect,
@@ -747,7 +746,9 @@ mod tests
     {
         // Splitting the 4-page block leaves headers at pages 1 (order 0) and
         // 2 (order 1); freeing page 0 merges both back. The order-2 block then
-        // handed out must hold no header at any sub-block base.
+        // handed out must hold no header at any sub-block base. Page 2 is the
+        // one that discriminates: page 1 went onto an empty order-0 list, so
+        // its header reads `{0, 0}` even without the merge-time clear.
         let mut alloc = with_region(4);
         let a = alloc.alloc(0).expect("split alloc");
         // SAFETY: `a` came from this allocator and is unused.

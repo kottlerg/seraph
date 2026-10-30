@@ -14,7 +14,8 @@ The implementation lives in [`core/boot/src/dtb.rs`](../src/dtb.rs).
 
 The bootloader extracts a minimal set of platform resources from the
 DTB: MMIO-backed peripherals matched by known `compatible` strings,
-PLIC interrupt controllers, PCI host bridges, the `/cpus` hart IDs (the
+PLIC interrupt controllers (with their `riscv,ndev` source count), PCI
+host bridges, the `/cpus` hart IDs (the
 CPU-topology fallback when no ACPI is present), the `/cpus` hart
 capabilities (`timebase-frequency` and the `HART_CAP_*` bits) and the
 boot hart's `mmu-type` claim for paging-mode negotiation. It also

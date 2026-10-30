@@ -123,7 +123,12 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     ([`max_ram_address`], [`direct_map_ceiling`],
 ///     [`collect_mmio_direct_map_regions`]) keep the bootloader's window
 ///     selection and the kernel's Phase-3 guard on identical arithmetic.
-pub const BOOT_PROTOCOL_VERSION: u32 = 14;
+/// v15: riscv64 `KernelMmio` gained `plic_ndev: u64`, the number of PLIC
+///     interrupt sources the firmware reports (DTB `riscv,ndev`, or the ACPI
+///     MADT PLIC structure's total external interrupt sources). Zero when
+///     undiscovered. The kernel sizes its PLIC programming and the IRQ
+///     routing table from it.
+pub const BOOT_PROTOCOL_VERSION: u32 = 15;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -563,6 +568,12 @@ pub struct KernelMmio
     pub plic_base: u64,
     /// Size of the PLIC register window in bytes.
     pub plic_size: u64,
+    /// Number of interrupt sources the PLIC implements (sources
+    /// `1..=plic_ndev`), from the DTB `riscv,ndev` property or the ACPI MADT
+    /// PLIC structure's total external interrupt sources. Zero when neither
+    /// source reported it; the kernel then programs the specification's
+    /// full 1023 sources.
+    pub plic_ndev: u64,
     /// Physical base of the kernel console UART (ns16550-compatible).
     pub uart_base: u64,
     /// Size of the UART register window in bytes.
@@ -616,6 +627,7 @@ impl KernelMmio
         Self {
             plic_base: 0,
             plic_size: 0,
+            plic_ndev: 0,
             uart_base: 0,
             uart_size: 0,
             timebase_freq: 0,

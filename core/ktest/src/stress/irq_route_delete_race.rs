@@ -12,9 +12,10 @@
 //! without a reference and signals it. The Notification teardown used to
 //! clear the route with only the local CPU's interrupts masked and then free
 //! the state, so a delivery already running on another CPU could lock, set
-//! bits in, and wake through freed memory. The teardown now waits out every
-//! line's in-flight deliveries before the free, including one that read a
-//! route an earlier replace or clear removed (`irq::unregister_notification`;
+//! bits in, and wake through freed memory. Every route change now waits out the
+//! deliveries in flight through the route it removed before it releases the
+//! routing lock, and the teardown does so for the routes naming the state before
+//! the free (`irq::register`, `irq::unregister_notification`;
 //! core/kernel/docs/ipc-internals.md § Notification, Device IRQ delivery).
 //!
 //! ## How this exercises it
@@ -24,12 +25,16 @@
 //! raises its line (`crate::arch::serial::raise_tx_interrupt`). The cell
 //! carves that one line from a derived copy of the root Interrupt cap and
 //! first proves delivery: a raise must signal a routed notification. Then,
-//! each round, the controller, pinned to CPU 0 (the CPU the x86-64 I/O APIC
-//! entry targets), creates a notification and routes the line to it, then
+//! each round, the controller, pinned to CPU 0, creates a notification and
+//! routes the line to it, then
 //! repeatedly unmasks the line (`SYS_IRQ_ACK`; each delivery masks it again)
 //! and raises the interrupt, so deliveries follow one another, while a
 //! deleter pinned to CPU 1 waits a varying delay and deletes the
-//! notification's only capability. On every other round the deleter first
+//! notification's only capability. Each registration routes the line to the
+//! next CPU in turn (core/kernel/docs/arch-interface.md § `interrupts`), so most
+//! rounds deliver on a CPU other than the deleter's, where the delivery and the
+//! delete race; a round that delivers on CPU 1 serialises them instead, and only
+//! the CPU count bounds how many do. On every other round the deleter first
 //! reroutes the line to a spare notification (`SYS_IRQ_REGISTER`), so the
 //! delete meets a route a replace already removed, the path whose teardown
 //! must still wait out a delivery that read the old route. A raise after the

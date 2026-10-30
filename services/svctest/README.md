@@ -35,7 +35,7 @@ services/svctest/
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
-        ├── devmgr.rs          # Block, shutdown, test-label deny; `TEST_SPAWN_ORPHAN` teardown
+        ├── devmgr.rs          # Block, shutdown, test-label deny; input ordinal; orphan teardown
         ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind
         ├── shmem.rs           # Kernel shared-memory objects
@@ -88,10 +88,10 @@ leaves the system idle, as on the pass path. A fault in svctest's own process (a
 a stack overflow) kills it without running either hook, so it logs neither marker.
 
 The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.deny` cap) log the
-skip and return when their cap is zero; the devmgr deny phases (`caps[2]`), the orphan-teardown and
-drivers deny phases (`caps[3]`), the svcmgr seed-only phase (every seed-only seed, plus the
-public `svcmgr` and `pwrmgr.deny` names it resolves), the svcmgr second-seed-round phase
-(`caps[4]` and `caps[5]`), and the vfsd phases (`caps[4]`, `caps[5]`) instead fail their
+skip and return when their cap is zero; the devmgr deny and input-ordinal phases (`caps[2]`), the
+orphan-teardown and drivers deny phases (`caps[3]`), the svcmgr seed-only phase (every seed-only
+seed, plus the public `svcmgr` and `pwrmgr.deny` names it resolves), the svcmgr second-seed-round
+phase (`caps[4]` and `caps[5]`), and the vfsd phases (`caps[4]`, `caps[5]`) instead fail their
 assertions. The seed-only phase
 thus fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's
 own zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap,
@@ -115,7 +115,7 @@ slot stays zero.
 |-----------|-------------------|----------------------------------------|
 | `caps[0]` | `rootfs.root`     | `ns` phase                             |
 | `caps[1]` | `pwrmgr.shutdown` | Authority cap for the final `SHUTDOWN` |
-| `caps[2]` | `devmgr.registry` | devmgr deny phases                     |
+| `caps[2]` | `devmgr.registry` | devmgr deny and input-ordinal phases   |
 | `caps[3]` | `devmgr.test`     | devmgr orphan-teardown, drivers deny   |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases          |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase                |
@@ -123,7 +123,9 @@ slot stays zero.
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published. `caps[2]` carries `REGISTRY_QUERY_AUTHORITY` alone, so it drives the
 devmgr deny phases, which require an `UNAUTHORIZED` reply to `QUERY_BLOCK_DEVICE`,
-`QUERY_SHUTDOWN_DEVICE`, `TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, and `TEST_QUERY_DENY_DEVICE`.
+`QUERY_SHUTDOWN_DEVICE`, `TEST_SPAWN_ORPHAN`, `TEST_ORPHAN_RESULT`, and `TEST_QUERY_DENY_DEVICE`,
+and the input-ordinal phase, which requires a cap from `QUERY_INPUT_DEVICE` at instance ordinal 0
+(sent and absent) and `NO_DEVICE` past the one keyboard of every boot's device set.
 `caps[3]` exists for devmgr's test labels (TODO(#165): retire with them): the orphan-teardown
 phase's `TEST_SPAWN_ORPHAN` shim, and `TEST_QUERY_DENY_DEVICE`, which hands the drivers deny phase a
 SEND on the serial, input, or framebuffer driver's endpoint badged with none of the driver's verb
@@ -137,15 +139,15 @@ vfsd's service endpoint, badged `MOUNT_AUTHORITY` and the no-authority `DENY_BAD
 (services/vfsd/docs/vfs-ipc-interface.md § Endpoint). The vfsd phases require an `UNAUTHORIZED`
 reply to `MOUNT` on `caps[5]` with nothing mounted; a `TABLE_FULL` reply on `caps[4]` to `MOUNT` of
 the root role at `/` and of the data role at `/esp`, both already mounted, in each of six rounds
-(more than vfsd's four per-mount bootstrap slots, so a rejection that spawned a driver or held a
-slot would change a later reply); a `NOT_FOUND` reply to a `MOUNT` whose path length exceeds the
-path bytes it carries; and that the mounted filesystems still answer afterwards. The two vfsd
-seeds ride in a second bootstrap round, so every svctest boot receives a seed list longer than one
-round, and the svcmgr second-seed-round phase fails the run when either arrives empty. Every seed
-is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is public, so svctest
-resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap` and spends no seed
-slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED` reply to
-`SHUTDOWN`.
+(vfsd checks the mount point before it registers a partition or spawns a driver, so a rejection
+that started a spawn first would change a later reply); a `NOT_FOUND` reply to a `MOUNT` whose
+path length exceeds the path bytes it carries; and that the mounted filesystems still answer
+afterwards. The two vfsd seeds ride in a second bootstrap round, so every svctest boot receives a
+seed list longer than one round, and the svcmgr second-seed-round phase fails the run when either
+arrives empty. Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
+public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`
+and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`
+reply to `SHUTDOWN`.
 
 ---
 

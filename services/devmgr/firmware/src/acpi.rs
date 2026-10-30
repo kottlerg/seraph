@@ -6,7 +6,8 @@
 //! Narrow ACPI walk: RSDP → XSDT → MCFG, plus the FADT's `PM1a_CNT_BLK`.
 //!
 //! Operates on byte-slice views of ACPI tables — the caller is responsible
-//! for mapping RSDP / XSDT pages into its address space first. No alloc.
+//! for mapping the tables into its address space first, and
+//! [`table_window`] computes which pages of a region hold one. No alloc.
 //! MADT-driven IRQ routing is not needed at this stage: devmgr derives
 //! per-device GSIs from the PCI config IRQ line (x86-64) or PCI `INTx`
 //! swizzling (RISC-V). When that changes, extend this module.
@@ -21,7 +22,8 @@ pub const RSDP_LEN: usize = 36;
 const RSDP_OFF_REVISION: usize = 15;
 const RSDP_OFF_XSDT: usize = 24;
 
-const SDT_HDR_LEN: usize = 36;
+/// Bytes of an ACPI system description table header.
+pub const SDT_HDR_LEN: usize = 36;
 const SDT_OFF_LENGTH: usize = 4;
 
 const MCFG_ENTRIES_OFF: usize = SDT_HDR_LEN + 8;
@@ -155,38 +157,41 @@ pub fn fadt_pm1a_cnt_blk(fadt_bytes: &[u8]) -> Option<u16>
 
 // ── MCFG → ECAM ────────────────────────────────────────────────────────
 
-/// Extract the first MCFG allocation entry. The entry's base address is
-/// where bus 0 would decode; the returned `phys_base` is the start of the
-/// window, at `start_bus`.
+/// Iterate the ECAM window of every MCFG allocation entry, one per PCI
+/// segment group and bus range. An entry's base address is where bus 0 would
+/// decode; a window's `phys_base` is the start of the window, at `start_bus`.
 ///
-/// Returns `None` if the signature isn't `MCFG`, no entry is present, or
-/// the entry has a zero base, an end bus below its start bus, or a window
-/// whose start or end overflows a 64-bit physical address.
-#[must_use]
-pub fn parse_mcfg_ecam(mcfg_bytes: &[u8]) -> Option<EcamLocation>
+/// Yields nothing if the signature isn't `MCFG`. The entries are bounded by
+/// the table's reported length and the slice. An entry with a zero base, an
+/// end bus below its start bus, or a window whose start or end overflows a
+/// 64-bit physical address is skipped, and the entries after it are still
+/// yielded.
+pub fn mcfg_ecams(mcfg_bytes: &[u8]) -> impl Iterator<Item = EcamLocation> + '_
 {
-    if sdt_signature(mcfg_bytes) != *b"MCFG"
+    let entry_count = if sdt_signature(mcfg_bytes) == *b"MCFG"
     {
-        return None;
+        sdt_length(mcfg_bytes).map_or(0, |len| {
+            (len as usize)
+                .min(mcfg_bytes.len())
+                .saturating_sub(MCFG_ENTRIES_OFF)
+                / MCFG_ENTRY_SIZE
+        })
     }
-    let total_len = sdt_length(mcfg_bytes)? as usize;
-    let clamped = total_len.min(mcfg_bytes.len());
-    if clamped < MCFG_ENTRIES_OFF + MCFG_ENTRY_SIZE
+    else
     {
-        return None;
-    }
+        0
+    };
+    (0..entry_count)
+        .filter_map(move |i| mcfg_entry_ecam(mcfg_bytes, MCFG_ENTRIES_OFF + i * MCFG_ENTRY_SIZE))
+}
 
-    let entry_bytes = clamped - MCFG_ENTRIES_OFF;
-    let entry_count = entry_bytes / MCFG_ENTRY_SIZE;
-    if entry_count == 0
-    {
-        return None;
-    }
-
-    // First entry: base (u64), segment (u16), start_bus (u8), end_bus (u8),
-    // reserved (u32).
-    let off = MCFG_ENTRIES_OFF;
+/// Decode the MCFG allocation entry at `off`: base (u64), segment (u16),
+/// start bus (u8), end bus (u8), reserved (u32). `None` per [`mcfg_ecams`]'s
+/// skip conditions.
+fn mcfg_entry_ecam(mcfg_bytes: &[u8], off: usize) -> Option<EcamLocation>
+{
     let base = read_u64(mcfg_bytes, off);
+    let segment = u16::from_le_bytes([read_u8(mcfg_bytes, off + 8), read_u8(mcfg_bytes, off + 9)]);
     let start_bus = read_u8(mcfg_bytes, off + 10);
     let end_bus = read_u8(mcfg_bytes, off + 11);
     if base == 0 || end_bus < start_bus
@@ -200,8 +205,63 @@ pub fn parse_mcfg_ecam(mcfg_bytes: &[u8]) -> Option<EcamLocation>
     Some(EcamLocation {
         phys_base,
         size,
+        segment,
         start_bus,
         end_bus,
+    })
+}
+
+// ── Table mapping window ─────────────────────────────────────────────
+
+/// The page window of a firmware Memory cap that holds one table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableWindow
+{
+    /// First page of the window, counted from the start of the region.
+    pub first_page: u64,
+    /// Pages the window spans.
+    pub page_count: u64,
+    /// Byte offset of the table's start inside the window.
+    pub offset: usize,
+    /// Bytes of the table the window holds: its length, clamped to the
+    /// region's end.
+    pub len: usize,
+}
+
+/// The pages of a region `[region_base, region_base + region_size)` that
+/// hold the `len` bytes of a table at physical address `table_phys`, so a
+/// caller maps the table at its own offset instead of the region from its
+/// base. The table is clamped to the region's end.
+///
+/// Returns `None` when `len` or `page_size` is zero, the table does not
+/// start inside the region, or the window does not fit a `usize`.
+#[must_use]
+pub fn table_window(
+    region_base: u64,
+    region_size: u64,
+    table_phys: u64,
+    len: u64,
+    page_size: u64,
+) -> Option<TableWindow>
+{
+    if len == 0 || page_size == 0
+    {
+        return None;
+    }
+    let off = table_phys.checked_sub(region_base)?;
+    if off >= region_size
+    {
+        return None;
+    }
+    let held = len.min(region_size - off);
+    let first_page = off / page_size;
+    let in_window = off - first_page * page_size;
+    let page_count = (in_window + held).div_ceil(page_size);
+    Some(TableWindow {
+        first_page,
+        page_count,
+        offset: usize::try_from(in_window).ok()?,
+        len: usize::try_from(held).ok()?,
     })
 }
 
@@ -235,6 +295,101 @@ mod tests
         b[MCFG_ENTRIES_OFF + 10] = start_bus;
         b[MCFG_ENTRIES_OFF + 11] = end_bus;
         b
+    }
+
+    /// The first window [`mcfg_ecams`] yields.
+    fn first(mcfg_bytes: &[u8]) -> Option<EcamLocation>
+    {
+        mcfg_ecams(mcfg_bytes).next()
+    }
+
+    /// An MCFG with one entry per `(base, segment, start_bus, end_bus)`.
+    fn mcfg_entries(entries: &[(u64, u16, u8, u8)]) -> Vec<u8>
+    {
+        let len = MCFG_ENTRIES_OFF + entries.len() * MCFG_ENTRY_SIZE;
+        let mut b = sdt(b"MCFG", u32::try_from(len).unwrap());
+        for (i, &(base, segment, start, end)) in entries.iter().enumerate()
+        {
+            let off = MCFG_ENTRIES_OFF + i * MCFG_ENTRY_SIZE;
+            b[off..off + 8].copy_from_slice(&base.to_le_bytes());
+            b[off + 8..off + 10].copy_from_slice(&segment.to_le_bytes());
+            b[off + 10] = start;
+            b[off + 11] = end;
+        }
+        b
+    }
+
+    #[test]
+    fn every_mcfg_entry_yields_a_window_and_a_bad_entry_does_not_end_the_walk()
+    {
+        let b = mcfg_entries(&[
+            (0xB000_0000, 0, 0, 255),
+            (0, 1, 0, 3),
+            (0xC000_0000, 2, 4, 5),
+        ]);
+        let got: Vec<_> = mcfg_ecams(&b)
+            .map(|l| (l.phys_base, l.segment, l.start_bus, l.end_bus))
+            .collect();
+        assert_eq!(got, [(0xB000_0000, 0, 0, 255), (0xC040_0000, 2, 4, 5)]);
+    }
+
+    #[test]
+    fn mcfg_entries_past_the_reported_length_are_not_read()
+    {
+        let mut b = mcfg_entries(&[(0xB000_0000, 0, 0, 0), (0xC000_0000, 1, 0, 0)]);
+        let one_entry = u32::try_from(MCFG_ENTRIES_OFF + MCFG_ENTRY_SIZE).unwrap();
+        b[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&one_entry.to_le_bytes());
+        assert_eq!(mcfg_ecams(&b).count(), 1);
+        // A slice shorter than the reported length bounds the walk too.
+        let full = mcfg_entries(&[(0xB000_0000, 0, 0, 0), (0xC000_0000, 1, 0, 0)]);
+        assert_eq!(
+            mcfg_ecams(&full[..MCFG_ENTRIES_OFF + MCFG_ENTRY_SIZE + 8]).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn table_deep_in_a_region_maps_a_window_at_its_own_offset()
+    {
+        // A 64-byte table 2 MiB + 0x10 into a 4 MiB region.
+        let w = table_window(0x1000_0000, 4 << 20, 0x1020_0010, 64, 0x1000).unwrap();
+        assert_eq!(
+            w,
+            TableWindow {
+                first_page: 0x200,
+                page_count: 1,
+                offset: 0x10,
+                len: 64,
+            }
+        );
+    }
+
+    #[test]
+    fn table_straddling_a_page_spans_both_pages()
+    {
+        let w = table_window(0, 0x10_0000, 0x1FF0, 0x20, 0x1000).unwrap();
+        assert_eq!(
+            (w.first_page, w.page_count, w.offset, w.len),
+            (1, 2, 0xFF0, 0x20)
+        );
+    }
+
+    #[test]
+    fn table_running_past_its_region_is_clamped_to_the_region_end()
+    {
+        let w = table_window(0x1000, 0x3000, 0x2800, 1 << 30, 0x1000).unwrap();
+        assert_eq!(
+            (w.first_page, w.page_count, w.offset, w.len),
+            (1, 2, 0x800, 0x1800)
+        );
+    }
+
+    #[test]
+    fn table_outside_its_region_or_empty_has_no_window()
+    {
+        assert!(table_window(0x1000, 0x1000, 0x800, 8, 0x1000).is_none());
+        assert!(table_window(0x1000, 0x1000, 0x2000, 8, 0x1000).is_none());
+        assert!(table_window(0x1000, 0x1000, 0x1000, 0, 0x1000).is_none());
     }
 
     #[test]
@@ -361,7 +516,7 @@ mod tests
     #[test]
     fn mcfg_entry_yields_ecam_sized_by_its_bus_range()
     {
-        let loc = parse_mcfg_ecam(&mcfg(0xB000_0000, 0, 255)).unwrap();
+        let loc = first(&mcfg(0xB000_0000, 0, 255)).unwrap();
         assert_eq!(
             (loc.phys_base, loc.size, loc.start_bus, loc.end_bus),
             (0xB000_0000, 256 << 20, 0, 255)
@@ -371,7 +526,7 @@ mod tests
     #[test]
     fn mcfg_entry_starting_above_bus_zero_places_the_window_at_its_start_bus()
     {
-        let loc = parse_mcfg_ecam(&mcfg(0xB000_0000, 2, 3)).unwrap();
+        let loc = first(&mcfg(0xB000_0000, 2, 3)).unwrap();
         assert_eq!(
             (loc.phys_base, loc.size, loc.start_bus, loc.end_bus),
             (0xB000_0000 + (2 << 20), 2 << 20, 2, 3)
@@ -383,37 +538,37 @@ mod tests
     {
         let mut b = mcfg(0xB000_0000, 0, 255);
         b[..4].copy_from_slice(b"APIC");
-        assert!(parse_mcfg_ecam(&b).is_none());
+        assert!(first(&b).is_none());
     }
 
     #[test]
     fn mcfg_without_an_entry_yields_no_ecam()
     {
         let b = sdt(b"MCFG", MCFG_ENTRIES_OFF as u32);
-        assert!(parse_mcfg_ecam(&b).is_none());
+        assert!(first(&b).is_none());
     }
 
     #[test]
     fn mcfg_entry_with_zero_base_yields_no_ecam()
     {
-        assert!(parse_mcfg_ecam(&mcfg(0, 0, 255)).is_none());
+        assert!(first(&mcfg(0, 0, 255)).is_none());
     }
 
     #[test]
     fn mcfg_entry_with_end_bus_below_start_bus_yields_no_ecam()
     {
-        assert!(parse_mcfg_ecam(&mcfg(0xB000_0000, 4, 3)).is_none());
+        assert!(first(&mcfg(0xB000_0000, 4, 3)).is_none());
     }
 
     #[test]
     fn mcfg_entry_whose_window_start_overflows_yields_no_ecam()
     {
-        assert!(parse_mcfg_ecam(&mcfg(u64::MAX - (1 << 20) + 1, 1, 1)).is_none());
+        assert!(first(&mcfg(u64::MAX - (1 << 20) + 1, 1, 1)).is_none());
     }
 
     #[test]
     fn mcfg_entry_whose_window_end_overflows_yields_no_ecam()
     {
-        assert!(parse_mcfg_ecam(&mcfg(u64::MAX - (1 << 20) + 2, 0, 0)).is_none());
+        assert!(first(&mcfg(u64::MAX - (1 << 20) + 2, 0, 0)).is_none());
     }
 }

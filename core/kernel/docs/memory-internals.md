@@ -466,6 +466,7 @@ donation-record mechanism.
 [Architecture Abstraction Layer](arch-interface.md),
 [Capability Subsystem Internals](capability-internals.md),
 [Kernel Initialization Sequence](initialization.md), [IPC Subsystem Internals](ipc-internals.md),
+[Scheduler Internals](scheduler.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
 [Syscall Interface Specification](syscalls.md),
 [Coding Standards](../../../docs/coding-standards.md),

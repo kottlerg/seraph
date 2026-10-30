@@ -1624,6 +1624,7 @@ adds one lock acquire at thread create/destroy and a walk per `CSpace` or
 
 ## Summarized By
 
+[core/kernel/README.md](../README.md),
 [Architecture Abstraction Layer](arch-interface.md),
 [Capability Subsystem Internals](capability-internals.md),
 [Kernel Cross-Boundary Disclosure Inventory](cross-boundary-disclosure.md),

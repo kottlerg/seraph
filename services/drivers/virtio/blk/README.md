@@ -18,7 +18,7 @@ virtio/blk/
 └── src/
     ├── lib.rs                 # Geometry, transfer-length bound, partition table,
     │                          #   outcome-to-reply mapping (host-tested)
-    ├── main.rs                # Driver entry, IPC service loop, partition table, fail-stop
+    ├── main.rs                # Driver entry, IPC service loop, fail-stop
     └── io.rs                  # IoLayout (header + status DMA), descriptor chain submission
 ```
 

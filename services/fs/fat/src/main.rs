@@ -950,11 +950,10 @@ fn handle_release_memory_node_cap(
 }
 
 /// `FS_CLOSE` against a node cap. Releases any [`OpenFile`] slot
-/// bound to the node (revoking outstanding pages, freeing the slot),
-/// clears [`backend::FatNode::open_slot`] back to [`NO_OPEN_SLOT`], and
-/// drops the reference the closed cap's lookup took on the node, which
-/// frees the node when it was the last ([`NodeTable`]). The kernel-side cap
-/// reference is dropped by the caller's paired `cap_delete`.
+/// bound to the node (revoking outstanding pages, freeing the slot) and
+/// clears [`backend::FatNode::open_slot`] back to [`NO_OPEN_SLOT`]. The node
+/// itself lives until its entry is removed ([`NodeTable`]). The kernel-side
+/// cap reference is dropped by the caller's paired `cap_delete`.
 fn handle_close_node_cap(
     node_id: NodeId,
     nodes: &mut NodeTable,
@@ -969,7 +968,6 @@ fn handle_close_node_cap(
         release_open_file(files, node.open_slot, cache);
         nodes.set_open_slot(node_id, NO_OPEN_SLOT);
     }
-    let _ = nodes.release(node_id);
     let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -1179,7 +1177,7 @@ fn write_file_bytes(
         // write-path frame within the default 32 KiB stack envelope
         // when release LTO inlines the nested helpers
         // (`insert_entry → write_dir_slot → ...`).
-        let mut sector_buf = sector_buffer();
+        let mut sector_buf = sector_buffer()?;
         let full_sector_overwrite = byte_in_sector == 0 && bytes_to_write == state.sector_bytes();
         if !full_sector_overwrite
             && !cache.read_sector(u64::from(sector_lba), block_dev, &mut sector_buf, ipc_buf)

@@ -449,11 +449,11 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
 ///
 /// `devmgr_query_ep` is an optional badged SEND on devmgr's
 /// registry-query endpoint, delivered as a round-2 cap so the driver can
-/// fetch runtime metadata via `QUERY_DEVICE_INFO`. Pass `0` to omit
-/// (single terminal round `[service, hw_cap]`, behaviour identical to
-/// the pre-extension shape used by drivers that need no runtime
-/// platform metadata). When non-zero a two-round protocol is served:
-///   Round 1 (non-terminal): `[service, hw_cap]`
+/// fetch runtime metadata via `QUERY_DEVICE_INFO`. Pass `0` to omit it, for
+/// drivers that need no runtime platform metadata: one terminal round
+/// `[service, hw_cap, irq_cap?]` carrying `round1_words`. When non-zero a
+/// two-round protocol is served:
+///   Round 1 (non-terminal): `[service, hw_cap, irq_cap?]`, `round1_words`
 ///   Round 2 (terminal):     `[devmgr_query_ep]`
 ///
 /// The `devmgr_query_ep` is a generic mechanism — any future simple
@@ -463,7 +463,10 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
 ///
 /// devmgr retains `service_ep` to mint client SEND caps on query; the
 /// `hw_cap` is *moved* into the child (delivered directly, not copied), so
-/// devmgr holds no device-specific authority after a successful spawn. The
+/// devmgr holds no device-specific authority after a successful spawn.
+/// `round1_words` ride round 1 as its data words: the CMOS RTC's century
+/// register index, and empty for every other device. `irq_cap`, when
+/// non-zero, rides round 1 after `hw_cap`. The
 /// caller transfers ownership of `hw_cap` to this function — it is moved to
 /// the child on success and deleted on failure. Returns `false` on any
 /// spawn-path failure.

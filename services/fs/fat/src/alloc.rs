@@ -30,7 +30,8 @@ use crate::fat::chain_next;
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum FatError
 {
-    /// Block-device read or write failure, or cache-acquire failure.
+    /// Block-device read or write failure, cache-acquire failure, or no
+    /// memory for a sector buffer.
     Io,
     /// No free cluster, directory slot run, or short-name alias remains.
     NoSpace,
@@ -157,7 +158,7 @@ pub fn update_fat_entry(
     }
     let (first_fat_sector, ent_off) = fat_entry_location(state, cluster);
 
-    let mut sector_buf = sector_buffer();
+    let mut sector_buf = sector_buffer()?;
 
     for fat_idx in 0..u32::from(state.num_fats)
     {
@@ -426,7 +427,13 @@ pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc_
     {
         return;
     }
-    let mut buf = sector_buffer();
+    let Ok(mut buf) = sector_buffer()
+    else
+    {
+        std::os::seraph::log!("`FSInfo` access: no memory for a sector buffer");
+        state.fsinfo_sector = u32::MAX;
+        return;
+    };
     if !cache.read_sector(u64::from(state.fsinfo_sector), block_dev, &mut buf, ipc_buf)
     {
         std::os::seraph::log!("`FSInfo` sector read failed; allocator falls back to FAT scan");
@@ -465,7 +472,12 @@ pub fn flush_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u32, ipc
     {
         return;
     }
-    let mut buf = sector_buffer();
+    let Ok(mut buf) = sector_buffer()
+    else
+    {
+        std::os::seraph::log!("`FSInfo` access: no memory for a sector buffer");
+        return;
+    };
     if !cache.read_sector(u64::from(state.fsinfo_sector), block_dev, &mut buf, ipc_buf)
     {
         std::os::seraph::log!("`FSInfo` flush: sector read failed");

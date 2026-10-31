@@ -30,9 +30,9 @@ in [crash-safety.md](crash-safety.md).
   `BLK_WRITE_FROM_MEMORY` writebacks and single-sector device reads. A sector is one logical block
   of the device, whose size `FS_MOUNT` reads with `BLK_GET_GEOMETRY` before the BPB; a page holds
   `PAGE_SIZE` over it. A slot takes its page from memmgr the first time a miss finds no free slot,
-  and the cache evicts only once all `SLOT_COUNT` slots hold a page, so an idle mount pays only for
-  the pages it fills. Cache init funds the fs's own `CSpace` with general headroom for every slot
-  page, the quarantine's replacements, the scratch page, and 64 more
+  and the cache evicts only once all `SLOT_COUNT` slots hold a page or memmgr refuses one, so an
+  idle mount pays only for the pages it fills. Cache init funds the fs's own `CSpace` with general
+  headroom for every slot page, the quarantine's replacements, the scratch page, and 64 more
   (`std::os::seraph::fund_cspace_slot_budget`), so growing the cache never meets an exhausted
   `CSpace`; a failed funding fails cache init. Write-through: the cached page is updated in place
   before the on-disk write so any outstanding `FS_READ_MEMORY` cap aliasing the page observes new
@@ -48,12 +48,12 @@ in [crash-safety.md](crash-safety.md).
   `(sector_lba, offset_in_sector)`; two distinct on-disk entries
   always allocate distinct `NodeId`s, even when both are empty files
   at cluster 0. The table is a heap-grown `fat_parse::node_slab::NodeSlab`:
-  a `NodeId` packs a 24-bit index and a 16-bit generation, each lookup or
-  create that mints a cap takes a reference, `FS_CLOSE` drops one, and the
-  last release frees the node. `FS_REMOVE` and `FS_RENAME` free the
-  unlinked slot's node outright, and its open-file slot with it. A freed
-  index is reused under the next generation and retired when the
-  generation would wrap, so a stale cap names no node.
+  a `NodeId` packs a 24-bit index and a 16-bit generation, and every holder
+  of an entry shares its one node. `FS_CLOSE` frees no node, since the
+  driver cannot tell which holder a close comes from; `FS_REMOVE` and
+  `FS_RENAME` free the unlinked slot's node, and its open-file slot with
+  it. A freed index is reused under the next generation and retired when
+  the generation would wrap, so a stale cap names no node.
 * **Open-file table** (`src/file.rs`): one slot per node read through
   `FS_READ_MEMORY`, grown on demand and reused once closed; each slot's
   outstanding-page table grows up to the cache's slot count.

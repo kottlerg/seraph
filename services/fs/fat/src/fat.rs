@@ -161,7 +161,8 @@ pub struct FileRead
     pub max_len: u64,
 }
 
-/// Read up to 512 bytes from a file at a given byte offset.
+/// Read up to one sector (and at most `MAX_SECTOR_SIZE` bytes) from a file at
+/// a given byte offset.
 ///
 /// Walks the cluster chain to find the correct cluster, reads the
 /// relevant sector, and extracts the requested bytes.

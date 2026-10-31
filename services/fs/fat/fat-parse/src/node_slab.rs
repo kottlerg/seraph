@@ -7,17 +7,15 @@
 //!
 //! A [`NodeSlab`] maps a node key (the on-disk slot of a directory entry) to
 //! a value and hands out a 40-bit identifier for it: a 24-bit index into the
-//! slab and a 16-bit generation. An entry counts the references the driver
-//! has minted on it (one per lookup or create that returned a cap) and is
-//! freed when the last is released, or at once when its on-disk entry is
-//! removed. Freeing bumps the index's generation, so an identifier minted
-//! before the free never resolves again: a client that keeps using a cap
-//! after closing it, or after the file was removed, gets "no such node",
-//! never the node that later reuses the index. An index whose generation
-//! would wrap is retired instead of reused. The table grows on the heap with
-//! the live nodes; nothing in it is fixed-size.
+//! slab and a 16-bit generation. Every lookup of one key returns the same
+//! identifier while its entry lives. An entry is freed when its on-disk entry
+//! is removed ([`NodeSlab::remove_key`]); freeing bumps the index's
+//! generation, so an identifier issued before the free never resolves again:
+//! a client that keeps using a cap after its file was removed gets "no such
+//! node", never the node that later reuses the index. An index whose
+//! generation would wrap is retired instead of reused. The table grows on
+//! the heap with the live entries, and every growth is fallible.
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 /// Bits of a node identifier holding the slab index plus one (0 is the
@@ -39,7 +37,6 @@ struct Slot<K, T>
 {
     entry: Option<(K, T)>,
     generation: u16,
-    refs: u32,
 }
 
 /// A recycling, generation-checked table of `T` keyed by `K`; see the module
@@ -47,10 +44,11 @@ struct Slot<K, T>
 pub struct NodeSlab<K, T>
 {
     slots: Vec<Slot<K, T>>,
-    /// Indices of freed slots whose generation has not wrapped.
+    /// Indices of freed slots whose generation has not wrapped. Its capacity
+    /// is kept at least `slots.len()`, so a free never allocates.
     free: Vec<u32>,
-    /// Live entries by key, for deduplication.
-    by_key: BTreeMap<K, u32>,
+    /// Live entries as `(key, index)`, sorted by key, for deduplication.
+    by_key: Vec<(K, u32)>,
 }
 
 impl<K: Ord + Copy, T> Default for NodeSlab<K, T>
@@ -69,24 +67,28 @@ impl<K: Ord + Copy, T> NodeSlab<K, T>
         Self {
             slots: Vec::new(),
             free: Vec::new(),
-            by_key: BTreeMap::new(),
+            by_key: Vec::new(),
         }
     }
 
-    /// Take a reference on the entry for `key`, inserting `make()` when the
-    /// key has none, and return the entry's identifier.
+    /// The identifier of the entry for `key`, inserting `make()` when the key
+    /// has none.
     ///
-    /// Returns `None` when a new entry is needed and the slab already holds
-    /// [`MAX_ENTRIES`] live entries (with every freed index retired), or the
-    /// existing entry's reference count is at `u32::MAX`.
+    /// Returns `None` when a new entry is needed and either the slab already
+    /// holds [`MAX_ENTRIES`] entries with every freed index retired, or the
+    /// heap cannot grow the table.
     pub fn acquire(&mut self, key: K, make: impl FnOnce() -> T) -> Option<u64>
     {
-        if let Some(&idx) = self.by_key.get(&key)
+        let pos = match self.by_key.binary_search_by(|(k, _)| k.cmp(&key))
         {
-            let slot = &mut self.slots[idx as usize];
-            slot.refs = slot.refs.checked_add(1)?;
-            return Some(identifier(idx, slot.generation));
-        }
+            Ok(pos) =>
+            {
+                let idx = self.by_key[pos].1;
+                return Some(identifier(idx, self.slots[idx as usize].generation));
+            }
+            Err(pos) => pos,
+        };
+        self.by_key.try_reserve(1).ok()?;
         let idx = if let Some(idx) = self.free.pop()
         {
             idx
@@ -97,20 +99,20 @@ impl<K: Ord + Copy, T> NodeSlab<K, T>
             {
                 return None;
             }
+            self.slots.try_reserve(1).ok()?;
+            self.free.try_reserve(self.slots.len() + 1).ok()?;
             self.slots.push(Slot {
                 entry: None,
                 generation: 0,
-                refs: 0,
             });
-            // Cast is range-safe: the length is below MAX_ENTRIES < 2^24.
+            // Cast is range-safe: the length is at most MAX_ENTRIES < 2^24.
             #[allow(clippy::cast_possible_truncation)]
             let idx = (self.slots.len() - 1) as u32;
             idx
         };
         let slot = &mut self.slots[idx as usize];
         slot.entry = Some((key, make()));
-        slot.refs = 1;
-        self.by_key.insert(key, idx);
+        self.by_key.insert(pos, (key, idx));
         Some(identifier(idx, slot.generation))
     }
 
@@ -129,27 +131,23 @@ impl<K: Ord + Copy, T> NodeSlab<K, T>
         self.slots[idx].entry.as_mut().map(|(_, v)| v)
     }
 
-    /// Drop one reference on the entry `id` names, freeing it when that was
-    /// the last; the freed value is returned. `None` when `id` names no live
-    /// entry or the entry keeps other references.
-    pub fn release(&mut self, id: u64) -> Option<T>
-    {
-        let idx = self.live_index(id)?;
-        let slot = &mut self.slots[idx];
-        slot.refs = slot.refs.saturating_sub(1);
-        if slot.refs > 0
-        {
-            return None;
-        }
-        self.free_index(idx)
-    }
-
-    /// Free the entry for `key` whatever its references, returning its value:
-    /// every identifier issued for it stops resolving.
+    /// Free the entry for `key`, returning its value: every identifier
+    /// issued for it stops resolving.
     pub fn remove_key(&mut self, key: &K) -> Option<T>
     {
-        let idx = *self.by_key.get(key)?;
-        self.free_index(idx as usize)
+        let pos = self.by_key.binary_search_by(|(k, _)| k.cmp(key)).ok()?;
+        let (_, idx) = self.by_key.remove(pos);
+        let slot = &mut self.slots[idx as usize];
+        let (_, value) = slot.entry.take()?;
+        // Retire an index whose generation would wrap: reissuing generation 0
+        // would let an identifier from the first lifetime resolve again.
+        if let Some(next) = slot.generation.checked_add(1)
+        {
+            slot.generation = next;
+            // Never allocates: `free` holds at least `slots.len()` capacity.
+            self.free.push(idx);
+        }
+        Some(value)
     }
 
     /// Live entries.
@@ -164,24 +162,6 @@ impl<K: Ord + Copy, T> NodeSlab<K, T>
     pub fn is_empty(&self) -> bool
     {
         self.by_key.is_empty()
-    }
-
-    fn free_index(&mut self, idx: usize) -> Option<T>
-    {
-        let slot = &mut self.slots[idx];
-        let (key, value) = slot.entry.take()?;
-        slot.refs = 0;
-        self.by_key.remove(&key);
-        // Retire an index whose generation would wrap: reissuing generation 0
-        // would let an identifier from the first lifetime resolve again.
-        if let Some(next) = slot.generation.checked_add(1)
-        {
-            slot.generation = next;
-            // Cast is range-safe: indices are below MAX_ENTRIES < 2^24.
-            #[allow(clippy::cast_possible_truncation)]
-            self.free.push(idx as u32);
-        }
-        Some(value)
     }
 
     /// The slot index `id` names, when its generation is the slot's current
@@ -207,11 +187,11 @@ mod tests
     use super::*;
 
     #[test]
-    fn a_closed_then_reused_index_never_resolves_the_old_identifier()
+    fn a_removed_then_reused_index_never_resolves_the_old_identifier()
     {
         let mut slab: NodeSlab<u32, &str> = NodeSlab::new();
         let a = slab.acquire(1, || "file A").expect("room");
-        assert_eq!(slab.release(a), Some("file A"));
+        assert_eq!(slab.remove_key(&1), Some("file A"));
         // B takes A's index; A's identifier names B's slot at an older
         // generation and must not return B's content.
         let b = slab.acquire(2, || "file B").expect("room");
@@ -222,33 +202,32 @@ mod tests
     }
 
     #[test]
-    fn a_key_looked_up_twice_is_freed_only_after_both_releases()
+    fn every_lookup_of_a_key_returns_its_one_live_identifier()
     {
         let mut slab: NodeSlab<u32, u8> = NodeSlab::new();
         let first = slab.acquire(7, || 1).expect("room");
         let second = slab.acquire(7, || 2).expect("room");
         assert_eq!(first, second);
-        assert_eq!(slab.release(first), None);
         assert_eq!(slab.get(first), Some(&1));
-        assert_eq!(slab.release(first), Some(1));
-        assert_eq!(slab.get(first), None);
-        // A further release of the dead identifier changes nothing.
-        assert_eq!(slab.release(first), None);
+        assert_eq!(slab.len(), 1);
+        // Keys inserted out of order still dedupe.
+        let other = slab.acquire(3, || 3).expect("room");
+        assert_eq!(slab.acquire(3, || 4), Some(other));
+        assert_eq!(slab.acquire(7, || 5), Some(first));
     }
 
     #[test]
-    fn removing_a_key_invalidates_every_identifier_whatever_its_references()
+    fn a_removed_key_is_looked_up_afresh_under_a_new_identifier()
     {
         let mut slab: NodeSlab<u32, u8> = NodeSlab::new();
         let id = slab.acquire(3, || 9).expect("room");
-        slab.acquire(3, || 9).expect("room");
         assert_eq!(slab.remove_key(&3), Some(9));
-        assert_eq!(slab.get(id), None);
         assert!(slab.is_empty());
-        // The key can be looked up afresh, under a new identifier.
+        assert_eq!(slab.remove_key(&3), None);
         let again = slab.acquire(3, || 10).expect("room");
         assert_ne!(again, id);
         assert_eq!(slab.get(again), Some(&10));
+        assert_eq!(slab.get(id), None);
     }
 
     #[test]
@@ -257,8 +236,7 @@ mod tests
         let mut slab: NodeSlab<u32, u8> = NodeSlab::new();
         let first = slab.acquire(0, || 0).expect("room");
         slab.slots[0].generation = u16::MAX;
-        let last = identifier(0, u16::MAX);
-        assert_eq!(slab.release(last), Some(0));
+        assert_eq!(slab.remove_key(&0), Some(0));
         // Index 0 is not reissued: the next entry takes a new index, so the
         // generation-0 identifier `first` can never name a live entry again.
         let next = slab.acquire(1, || 1).expect("room");

@@ -41,7 +41,9 @@ Bootstrap caps from devmgr (one round, two caps and one data word,
 | `caps[1]` | `IoPort` covering CMOS index/data ports `0x70`–`0x71` |
 
 `data[0]` is the CMOS RAM index of the century register, from the FADT's
-`CENTURY` field, or 0 when the FADT names none.
+`CENTURY` field, or 0 when the FADT names none. The driver reads only an
+index from `0x0E` to `0x7F`: lower ones are the clock and status registers,
+and higher ones lie past the bank its ports reach.
 
 The driver binds the `IoPort` cap to its main thread via
 `syscall::ioport_bind` and uses `in`/`out` to drive the CMOS access

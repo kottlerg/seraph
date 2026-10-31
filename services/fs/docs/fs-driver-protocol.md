@@ -392,15 +392,12 @@ the recorded release endpoint). The slot is per node and shared by
 every client of the file, so one client's `FS_CLOSE` revokes every
 client's outstanding pages on it (a defect, tracked in
 [#530](https://github.com/kottlerg/seraph/issues/530); see
-[`FS_READ_MEMORY`](#label-7-fs_read_memory)). It also drops the
-reference the cap's `NS_LOOKUP` (or `FS_CREATE` / `FS_MKDIR`) took on the
-node: the driver frees a node when every cap minted on it has been closed,
-and when `FS_REMOVE` or `FS_RENAME` unlinks its entry, and reuses the id
-under a new generation. A cap used after its `FS_CLOSE` (or one minted on
-another holder's lookup, once every holder has closed) is answered
-`INVALID_BADGE`, never with another node's content. The kernel-side cap is
-**not** freed here — the holder still `cap_delete`s its node cap to
-drop the kernel reference.
+[`FS_READ_MEMORY`](#label-7-fs_read_memory)). The node itself is not
+freed: every holder of the entry shares it, so it lives until
+[`FS_REMOVE`](#label-14-fs_remove) or [`FS_RENAME`](#label-16-fs_rename)
+unlinks the entry, and a cap used after its `FS_CLOSE` still reaches its
+own file. The kernel-side cap is **not** freed here — the holder still
+`cap_delete`s its node cap to drop the kernel reference.
 
 **Request**
 
@@ -543,7 +540,10 @@ slot back from the device, past its cache:
   on the device without its LFN run.
 
 A node the driver drops no longer names anything, so a later `FS_CREATE`
-that reuses the slot cannot reach a stale node through a held cap.
+that reuses the slot cannot reach a stale node through a held cap. The
+driver reuses a dropped node's id for a later node under a new generation,
+so a held cap on the dropped node is answered `INVALID_BADGE`, never with
+the content of the node that reused the id.
 
 ---
 

@@ -9,7 +9,6 @@
 //! split virtqueue. The caller is responsible for allocating DMA-capable
 //! memory and providing physical addresses.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 /// Largest queue size a split virtqueue may have (`VirtIO` 1.2 §2.7: the
@@ -142,7 +141,8 @@ impl SplitVirtqueue
     /// indices rely on it: `% queue_size` of a wrapping `u16` index is exact
     /// only then), or exceeds [`MAX_QUEUE_SIZE`]. The size derives from the
     /// device's `queue_size` register, so it is checked rather than assumed.
-    /// The driver-private bookkeeping is allocated at `queue_size` entries.
+    /// The driver-private bookkeeping is allocated at `queue_size` entries;
+    /// `None` also when the heap cannot hold it.
     ///
     /// # Safety
     ///
@@ -168,7 +168,13 @@ impl SplitVirtqueue
 
         // Build the free list in driver memory: each descriptor links to the
         // following one; the last link (queue_size) terminates the list.
-        let links: Vec<u16> = (1..=queue_size).collect();
+        let size = usize::from(queue_size);
+        let mut links: Vec<u16> = Vec::new();
+        let mut chain_len: Vec<u16> = Vec::new();
+        links.try_reserve_exact(size).ok()?;
+        chain_len.try_reserve_exact(size).ok()?;
+        links.extend(1..=queue_size);
+        chain_len.resize(size, 0);
 
         Some(Self {
             desc_va,
@@ -178,7 +184,7 @@ impl SplitVirtqueue
             free_head: 0,
             num_free: queue_size,
             last_used_idx: 0,
-            chain_len: vec![0; usize::from(queue_size)],
+            chain_len,
             links,
         })
     }

@@ -28,6 +28,21 @@ pub const REG_YEAR: u8 = 0x09;
 pub const REG_STATUS_A: u8 = 0x0A;
 /// Status B register: BCD/binary and 12/24-hour mode bits.
 pub const REG_STATUS_B: u8 = 0x0B;
+/// The CMOS RAM index of a century register the platform names in `index`
+/// (the FADT `CENTURY` field, carried in a `u64` bootstrap word), when the
+/// driver can read it: 0x0E to 0x7F. 0 names no register. 0x00 to 0x0D are
+/// the clock and status registers, which hold no century. 0x80 and up lie
+/// past the standard bank the driver's ports reach: written to the index
+/// port, bit 7 would disable NMIs on PC chipsets and select another
+/// register.
+#[must_use]
+pub fn century_register(index: u64) -> Option<u8>
+{
+    u8::try_from(index)
+        .ok()
+        .filter(|i| (0x0E..=0x7F).contains(i))
+}
+
 /// Century the two-digit year is read in when the platform names no century
 /// register (the FADT `CENTURY` field is 0) or the register reads as no
 /// plausible century: 2000 to 2099. A two-digit year cannot say more.
@@ -163,6 +178,18 @@ pub fn full_year(year: u8, century: Option<u8>) -> u32
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn century_register_accepts_only_the_standard_bank_past_the_clock()
+    {
+        assert_eq!(century_register(0x32), Some(0x32));
+        assert_eq!(century_register(0x0E), Some(0x0E));
+        assert_eq!(century_register(0x7F), Some(0x7F));
+        for refused in [0, 0x0A, 0x0D, 0x80, 0xFF, 0x132]
+        {
+            assert_eq!(century_register(refused), None, "index {refused:#x}");
+        }
+    }
 
     #[test]
     fn full_year_takes_the_century_register_past_2099()

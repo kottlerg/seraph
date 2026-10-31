@@ -34,7 +34,8 @@ struct BootCaps
     ioport_cap: u32,
     /// CMOS RAM index of the century register, from the FADT `CENTURY`
     /// field devmgr sends as the round's data word; `None` when it names
-    /// none (0) or sent no word.
+    /// none (0), names one the driver cannot read
+    /// ([`cmos_rtc::century_register`]), or sent no word.
     century_reg: Option<u8>,
 }
 
@@ -51,9 +52,8 @@ fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
         return None;
     }
     let century_reg = (round.data_words >= 1)
-        .then(|| u8::try_from(round.data[0]).ok())
-        .flatten()
-        .filter(|&reg| reg != 0);
+        .then(|| cmos_rtc::century_register(round.data[0]))
+        .flatten();
     Some(BootCaps {
         service_ep: round.caps[0],
         ioport_cap: round.caps[1],

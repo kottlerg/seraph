@@ -165,9 +165,9 @@ impl PartitionTable
     /// Register the range `[base_lba, base_lba + length_lba)` and return its
     /// badge, reusing the badge of an identical range already registered.
     ///
-    /// Returns `None` for an empty range or when the fresh-badge counter has
-    /// reached `blk_labels::MOUNT_AUTHORITY`. The caller checks the range
-    /// against the device capacity first.
+    /// Returns `None` for an empty range, when the fresh-badge counter has
+    /// reached `blk_labels::MOUNT_AUTHORITY`, or when the heap cannot grow the
+    /// table. The caller checks the range against the device capacity first.
     pub fn register(&mut self, base_lba: u64, length_lba: u64) -> Option<u64>
     {
         if length_lba == 0
@@ -186,6 +186,7 @@ impl PartitionTable
         {
             return None;
         }
+        self.entries.try_reserve(1).ok()?;
         self.next_badge += 1;
         self.entries.push(PartitionBound {
             badge,

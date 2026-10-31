@@ -89,8 +89,8 @@ An entry an existing open Issue already names cites it in the recommendation.
 - **Unpinned couplings.** Bounds that depend on each other are tied only by comments or literal
   copies: `MAX_EXCL` and core/boot `MAX_MODULES`, `MAX_MODULES` and `INIT_MAX_NAMED_MODULES`
   (16 against 12), `MAX_MMIO_DIRECT_MAP_REGIONS` and `MAX_IOAPICS`, `REAPER_SLOTS` and
-  `GEN_BITS`, the `registry` and `registry-client` copies of `NAME_MAX`, and the ktest mirrors of
-  `MAX_SLEEPING` and `L2_SIZE`.
+  `GEN_BITS`, the `registry` and `registry-client` copies of `NAME_MAX`, the ktest mirrors of
+  `MAX_SLEEPING` and `L2_SIZE`, and vfsd gpt's `MAX_BLOCK_SIZE` and virtio-blk's.
 - **Spin-count timeouts.** Several deadlock detectors and device polls are counted in loop
   iterations, whose wall time depends on CPU and MMIO speed. `wait_for_ack` is the time-based
   model.
@@ -686,7 +686,7 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637) (the `SLOT_COUN
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `node_slab::MAX_ENTRIES` (`NodeTable`) | `services/fs/fat/fat-parse/src/node_slab.rs` | 2^24 - 1 live nodes; freed on the last `FS_CLOSE` and recycled under a 16-bit generation, retired at wrap | encoding artefact (40-bit `NodeId`) | heap, per live node | correct as is | None |
+| `node_slab::MAX_ENTRIES` (`NodeTable`) | `services/fs/fat/fat-parse/src/node_slab.rs` | 2^24 - 1 live nodes, one per distinct live entry looked up; freed when the entry is removed or renamed and recycled under a 16-bit generation, retired at wrap | encoding artefact (40-bit `NodeId`) | heap, per live node | correct as is | None |
 | `NO_OPEN_SLOT` | `services/fs/fat/src/backend.rs` | `u32::MAX` | provably unreachable | none | correct as is | None |
 | open-file table | `services/fs/fat/src/main.rs` | heap `Vec`, at most one slot per live node, closed slots reused | per-instance | none | correct as is | Key by open instance (#530) |
 | `MAX_OUTSTANDING` | `services/fs/fat/src/file.rs` | `SLOT_COUNT` pages per file, the table grown on demand | follows the cache | none | correct as is | None |

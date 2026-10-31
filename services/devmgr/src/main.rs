@@ -1753,9 +1753,7 @@ fn spawn_rtc_from_disk(
         return None;
     };
 
-    let words: Vec<u64> = arch::current::rtc_bootstrap_word(caps)
-        .into_iter()
-        .collect();
+    let word = arch::current::rtc_bootstrap_word(caps);
     let spawned = spawn::spawn_simple_device(
         caps.procmgr_ep,
         caps.self_bootstrap_ep,
@@ -1767,7 +1765,7 @@ fn spawn_rtc_from_disk(
         hw_cap,
         0, // no UART IRQ: RTC is polled
         0, // no devmgr_query_ep: the RTC's one platform datum rides the bootstrap round
-        &words,
+        word.as_slice(),
         ipc::sched_policy::AUX_DRIVER_PRIORITY,
         ipc_buf,
     );

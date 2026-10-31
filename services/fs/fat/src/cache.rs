@@ -330,9 +330,9 @@ impl PageCache
     /// flushed as a unit because the unmodified neighbouring sectors
     /// have no known-good source if the write fails mid-flight.
     ///
-    /// Returns `false` when `data` is shorter than a sector, on cache acquire
-    /// failure, missing scratch memory cap (cache init never ran), or
-    /// block-driver error.
+    /// Returns `false` when `data` is shorter than a sector, when no memory
+    /// holds the sector's prior bytes, on cache acquire failure, missing
+    /// scratch memory cap (cache init never ran), or block-driver error.
     pub fn write_sector(&self, lba: u64, block_dev: u32, data: &[u8], ipc_buf: *mut u64) -> bool
     {
         let len = self.sector_bytes();
@@ -345,6 +345,14 @@ impl PageCache
         {
             return false;
         }
+        // The sector's bytes before the write, put back if the device
+        // refuses it.
+        let mut previous = Vec::new();
+        if previous.try_reserve_exact(len).is_err()
+        {
+            return false;
+        }
+        previous.resize(len, 0);
         let page_base = self.page_base_of(lba);
         let Some(idx) = self.acquire_page(page_base, block_dev, ipc_buf)
         else
@@ -352,7 +360,6 @@ impl PageCache
             return false;
         };
         let sector_va = self.slots[idx].va + self.sector_offset_in_page(lba, page_base);
-        let mut previous = Box::new([0u8; fat_parse::MAX_SECTOR_SIZE]);
 
         // SAFETY: refcount > 0 for the duration of these borrows. The
         // cache page is single-process owned and mapped writable; the

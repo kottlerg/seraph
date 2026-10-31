@@ -251,11 +251,18 @@ fn init_device(transport: &PciTransport) -> Geometry
 }
 
 /// Negotiate the virtqueue size against the device maximum and apply it.
+/// Exits when the device's queue cannot hold one request's three-descriptor
+/// chain, which every request needs.
 fn configure_queue_size(transport: &PciTransport) -> u16
 {
     transport.queue_select(0);
     let max_size = transport.queue_max_size();
     let queue_size = QUEUE_SIZE.min(max_size);
+    if queue_size < 3
+    {
+        std::os::seraph::log!("device requestq of {queue_size} descriptors holds no request chain");
+        syscall::thread_exit();
+    }
     transport.queue_set_size(queue_size);
     queue_size
 }
@@ -504,11 +511,23 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
             }
             _ =>
             {
+                drop_caps(msg.caps());
                 let reply = IpcMessage::new(ipc::blk_errors::UNKNOWN_OPCODE);
                 // SAFETY: ipc_buf is the registered IPC buffer page.
                 let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             }
         }
+    }
+}
+
+/// Delete every cap in `caps` from the driver's `CSpace`: caps a request
+/// carried that its handler neither uses nor returns, which would otherwise
+/// accumulate there for the driver's lifetime.
+fn drop_caps(caps: &[u32])
+{
+    for &cap in caps
+    {
+        let _ = syscall::cap_delete(cap);
     }
 }
 
@@ -523,7 +542,8 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
 /// `INVALID_MEMORY_CAP`.
 ///
 /// `caps[1]` and `caps[2]` are reserved IPC-shape slots and remain null
-/// pre-IOMMU; the driver does not inspect them. Every reply moves the
+/// pre-IOMMU; the driver does not inspect them, and deletes any cap a
+/// request carries past `caps[0]`. Every reply moves the
 /// Memory cap back to the caller in `caps[0]`; leaving it in the driver's
 /// `CSpace` would leak it. A request the device loses (see
 /// [`io::submit_and_wait`]) is answered only after [`quiesce_device`] has
@@ -531,6 +551,7 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
 fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir: io::IoDirection)
 {
     let mem_cap = msg.caps().first().copied().unwrap_or(0);
+    drop_caps(msg.caps().get(1..).unwrap_or(&[]));
 
     let reply_with = |code: u64, ipc_buf: *mut u64| {
         let mut builder = IpcMessage::builder(code);
@@ -554,7 +575,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
         return;
     }
 
-    let sector = if msg.word_count() >= 1
+    let lba = if msg.word_count() >= 1
     {
         msg.word(0)
     }
@@ -562,7 +583,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
     {
         0
     };
-    let sector_count = if msg.word_count() >= 2
+    let block_count = if msg.word_count() >= 2
     {
         msg.word(1)
     }
@@ -572,7 +593,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
     };
     // VirtIO descriptor length is u32; this also bounds total transfer well
     // below any plausible per-cap ask.
-    let Some(data_len) = rt.geometry.transfer_len(sector_count)
+    let Some(data_len) = rt.geometry.transfer_len(block_count)
     else
     {
         reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
@@ -587,7 +608,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
             return;
         }
     };
-    let absolute_sector = match resolve_run(msg.badge, sector, sector_count, rt)
+    let absolute_lba = match resolve_run(msg.badge, lba, block_count, rt)
     {
         Ok(s) => s,
         Err(code) =>
@@ -600,7 +621,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
     let outcome = io::submit_and_wait(
         rt.layout,
         dir,
-        rt.geometry.device_sector(absolute_sector),
+        rt.geometry.device_sector(absolute_lba),
         phys_base,
         data_len,
         rt.vq,
@@ -646,15 +667,15 @@ fn validate_memory_cap(mem_cap: u32, dir: io::IoDirection, data_len: u32) -> Res
     syscall::cap_info(mem_cap, syscall::CAP_INFO_MEMORY_PHYS_BASE).map_err(|_| invalid)
 }
 
-/// Resolve the run of `sector_count` sectors starting at caller-relative
-/// `sector` to its absolute starting LBA, checking that the whole run lies
-/// within the caller badge's partition or the device: [`resolve_sector`]
-/// checks one LBA, so the run's inclusive end is checked too.
-fn resolve_run(badge: u64, sector: u64, sector_count: u64, rt: &BlkRuntime) -> Result<u64, u64>
+/// Resolve the run of `block_count` logical blocks starting at
+/// caller-relative `lba` to its absolute starting LBA, checking that the
+/// whole run lies within the caller badge's partition or the device:
+/// [`resolve_lba`] checks one LBA, so the run's inclusive end is checked too.
+fn resolve_run(badge: u64, lba: u64, block_count: u64, rt: &BlkRuntime) -> Result<u64, u64>
 {
-    let absolute = resolve_sector(badge, sector, rt)?;
-    let last_relative = sector.saturating_add(sector_count.saturating_sub(1));
-    if resolve_sector(badge, last_relative, rt).is_err()
+    let absolute = resolve_lba(badge, lba, rt)?;
+    let last_relative = lba.saturating_add(block_count.saturating_sub(1));
+    if resolve_lba(badge, last_relative, rt).is_err()
     {
         return Err(ipc::blk_errors::OUT_OF_BOUNDS);
     }
@@ -682,9 +703,9 @@ fn quiesce_device(rt: &mut BlkRuntime)
     rt.device_faulted = true;
 }
 
-/// Translate a caller-supplied sector number into an absolute device LBA,
-/// enforcing per-badge partition bounds. Returns a [`blk_errors`] code on
-/// rejection.
+/// Translate a caller-supplied, partition-relative LBA (in logical blocks)
+/// into an absolute device LBA, enforcing per-badge partition bounds.
+/// Returns a [`blk_errors`] code on rejection.
 ///
 /// Badge semantics:
 /// * Badge bit [`MOUNT_AUTHORITY`] set → whole-disk read; bounded only
@@ -695,7 +716,7 @@ fn quiesce_device(rt: &mut BlkRuntime)
 ///   bounded by the registered partition.
 /// * `badge == 0` → un-badged caller; rejected. Every consumer of
 ///   this endpoint holds a badged cap.
-fn resolve_sector(badge: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
+fn resolve_lba(badge: u64, lba: u64, rt: &BlkRuntime) -> Result<u64, u64>
 {
     if badge == 0
     {
@@ -706,11 +727,11 @@ fn resolve_sector(badge: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
     {
         // MOUNT_AUTHORITY holders read the whole disk directly,
         // bounded only by device capacity.
-        if sector >= rt.geometry.capacity
+        if lba >= rt.geometry.capacity
         {
             return Err(ipc::blk_errors::OUT_OF_BOUNDS);
         }
-        return Ok(sector);
+        return Ok(lba);
     }
 
     let Some(bound) = rt.partitions.lookup(badge)
@@ -718,11 +739,11 @@ fn resolve_sector(badge: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
     {
         return Err(ipc::blk_errors::OUT_OF_BOUNDS);
     };
-    if sector >= bound.length_lba
+    if lba >= bound.length_lba
     {
         return Err(ipc::blk_errors::OUT_OF_BOUNDS);
     }
-    let absolute = bound.base_lba.saturating_add(sector);
+    let absolute = bound.base_lba.saturating_add(lba);
     if absolute >= rt.geometry.capacity
     {
         return Err(ipc::blk_errors::OUT_OF_BOUNDS);
@@ -748,6 +769,8 @@ fn resolve_sector(badge: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
 /// caps itself.
 fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
 {
+    // REGISTER_PARTITION takes no cap; one a request carries is deleted.
+    drop_caps(msg.caps());
     let reject = |ipc_buf: *mut u64| {
         let reply = IpcMessage::new(ipc::blk_errors::REGISTER_REJECTED);
         // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -820,6 +843,8 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
 /// [`MOUNT_AUTHORITY`]: ipc::blk_labels::MOUNT_AUTHORITY
 fn handle_get_geometry(msg: &IpcMessage, ipc_buf: *mut u64, rt: &BlkRuntime)
 {
+    // BLK_GET_GEOMETRY takes no cap; one a request carries is deleted.
+    drop_caps(msg.caps());
     let reply = if msg.word(0) == u64::from(ipc::BLK_LABELS_VERSION)
     {
         let length = if msg.badge & ipc::blk_labels::MOUNT_AUTHORITY != 0

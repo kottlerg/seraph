@@ -13,8 +13,7 @@
 //! header (offset 0, 16 bytes) and status byte (offset 1024, 1 byte) live
 //! there permanently. The data segment, `count * block_size` bytes for a
 //! request of `count` logical blocks, is supplied per-request by the caller
-//! as a Memory
-//! cap; [`IoLayout::read_chain`] / [`IoLayout::write_chain`] parameterise
+//! as a Memory cap; [`IoLayout::read_chain`] / [`IoLayout::write_chain`] parameterise
 //! the data segment's physical address and length. The driver's own page
 //! never holds bulk data.
 

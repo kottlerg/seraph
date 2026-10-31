@@ -18,7 +18,7 @@
 //! (`FatType::Fat16` uses the fixed-area sentinel cluster 0; `Fat32`
 //! uses `state.root_cluster`). Non-root nodes are allocated lazily
 //! at lookup time and indexed into [`NodeTable`], which recycles them
-//! under a generation once every cap minted on them is closed.
+//! under a generation once their on-disk entry is removed or renamed.
 
 use fat_parse::node_slab::{self, NodeSlab};
 
@@ -88,15 +88,14 @@ fn node_key(loc: DirEntryLocation) -> NodeKey
 /// `FS_CREATE` / `FS_MKDIR`, over a [`NodeSlab`].
 ///
 /// `NodeId(0)` is reserved as the fatfs root and never appears here. Every
-/// other `NodeId` packs a slab index and its generation. Each lookup or create
-/// that mints a cap takes a reference on the node, and `FS_CLOSE` drops one:
-/// the node is freed with its last reference, and when `FS_REMOVE` or
-/// `FS_RENAME` unlinks its entry. A freed index is reused under a new
-/// generation, so a cap kept past its `FS_CLOSE`, or past the removal of its
-/// file, names no node rather than the one that reused the index. A lookup a
-/// client never closes (ruststd's `stat()` deletes the cap without
-/// `FS_CLOSE`) keeps its node, one per distinct on-disk entry, which the
-/// heap-grown slab holds up to [`node_slab::MAX_ENTRIES`].
+/// other `NodeId` packs a slab index and its generation. Every lookup of one
+/// on-disk entry returns its one node, which lives until `FS_REMOVE` or
+/// `FS_RENAME` unlinks the entry; `FS_CLOSE` frees no node, since the driver
+/// cannot tell which of a node's holders a close comes from. A freed index is
+/// reused under a new generation, so a cap kept past the removal of its file
+/// names no node rather than the one that reused the index. The heap-grown
+/// slab holds one node per distinct live entry looked up, up to
+/// [`node_slab::MAX_ENTRIES`].
 pub struct NodeTable
 {
     slab: NodeSlab<NodeKey, FatNode>,
@@ -117,7 +116,7 @@ impl NodeTable
 
     /// Look up the [`FatNode`] for a non-root [`NodeId`]. Returns `None`
     /// for the reserved root id (0) and for every id whose node was freed
-    /// (closed by its last holder, removed, or renamed). Used by the
+    /// (its entry removed or renamed). Used by the
     /// `service_loop` node-cap dispatch arms in `main.rs`.
     #[must_use]
     pub fn get(&self, id: NodeId) -> Option<FatNode>
@@ -134,22 +133,12 @@ impl NodeTable
         self.alloc(node)
     }
 
-    /// Take a reference on the node for `node`'s on-disk slot, recording
-    /// `node` when the slot has none, and return its id. Every caller mints
-    /// one cap on the id it gets.
+    /// The id of the node for `node`'s on-disk slot, recording `node` when
+    /// the slot has none. `None` when the table cannot grow.
     fn alloc(&mut self, node: FatNode) -> Option<NodeId>
     {
         let raw = self.slab.acquire(node_key(node.loc), || node)?;
         NodeId::new(raw)
-    }
-
-    /// Drop the reference one cap holds on `id` (its `FS_CLOSE`), freeing the
-    /// node with its last reference. Returns the freed node, whose open-file
-    /// slot the caller releases; `None` when the node keeps other references
-    /// or `id` names no node.
-    pub fn release(&mut self, id: NodeId) -> Option<FatNode>
-    {
-        self.slab.release(id.raw())
     }
 
     /// Set or clear the lazy `OpenFile` slot index for `id`. Used by
@@ -166,7 +155,7 @@ impl NodeTable
         }
     }
 
-    /// Free the node whose on-disk slot is `loc`, whatever its references.
+    /// Free the node whose on-disk slot is `loc`.
     /// Called from `FS_REMOVE` / `FS_RENAME`: every cap on the unlinked entry
     /// stops resolving, and a follow-on `FS_CREATE` that lands at the same
     /// disk slot gets a fresh node rather than the stale one. The freed
@@ -177,7 +166,17 @@ impl NodeTable
         if let Some(node) = self.slab.remove_key(&node_key(loc))
             && node.open_slot != NO_OPEN_SLOT
         {
-            self.orphaned_open_slots.push(node.open_slot);
+            if self.orphaned_open_slots.try_reserve(1).is_ok()
+            {
+                self.orphaned_open_slots.push(node.open_slot);
+            }
+            else
+            {
+                std::os::seraph::log!(
+                    "no memory to release open-file slot {} of a removed node",
+                    node.open_slot
+                );
+            }
         }
     }
 

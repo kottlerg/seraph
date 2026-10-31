@@ -115,20 +115,19 @@ pub fn parse_header(block: &[u8]) -> Result<GptHeader, GptError>
     {
         return Err(GptError::InvalidBlockSize);
     };
-    if !block.len().is_power_of_two() || !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&block.len())
+    if !is_block_size(block.len())
     {
         return Err(GptError::InvalidBlockSize);
     }
-    let sector = block;
-    if &sector[0..8] != b"EFI PART"
+    if &block[0..8] != b"EFI PART"
     {
         return Err(GptError::InvalidSignature);
     }
-    let first_usable_lba = u64::from_le_bytes(sector[40..48].try_into().unwrap_or([0; 8]));
-    let part_entry_lba = u64::from_le_bytes(sector[72..80].try_into().unwrap_or([0; 8]));
-    let num_parts = u32::from_le_bytes(sector[80..84].try_into().unwrap_or([0; 4]));
-    let entry_size = u32::from_le_bytes(sector[84..88].try_into().unwrap_or([0; 4]));
-    if !(128..=block_size).contains(&entry_size) || !entry_size.is_power_of_two()
+    let first_usable_lba = u64::from_le_bytes(block[40..48].try_into().unwrap_or([0; 8]));
+    let part_entry_lba = u64::from_le_bytes(block[72..80].try_into().unwrap_or([0; 8]));
+    let num_parts = u32::from_le_bytes(block[80..84].try_into().unwrap_or([0; 4]));
+    let entry_size = u32::from_le_bytes(block[84..88].try_into().unwrap_or([0; 4]));
+    if !is_entry_size(entry_size, block_size)
     {
         return Err(GptError::InvalidEntrySize);
     }
@@ -148,6 +147,20 @@ pub fn parse_header(block: &[u8]) -> Result<GptHeader, GptError>
         entry_size,
         block_size,
     })
+}
+
+/// Whether `size` is a logical block size the parser takes: a power of two
+/// from [`MIN_BLOCK_SIZE`] to [`MAX_BLOCK_SIZE`].
+fn is_block_size(size: usize) -> bool
+{
+    size.is_power_of_two() && (MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&size)
+}
+
+/// Whether `entry_size` is a GPT entry size that tiles a `block_size`-byte
+/// block: `128 * 2^n`, no larger than the block.
+fn is_entry_size(entry_size: u32, block_size: u32) -> bool
+{
+    entry_size.is_power_of_two() && (128..=block_size).contains(&entry_size)
 }
 
 /// Decode one partition entry from the first 56 bytes of `entry`.
@@ -225,15 +238,13 @@ pub struct PartitionScan
 /// would refuse yields an empty scan stopped at its first LBA.
 pub fn collect_partitions(
     header: &GptHeader,
-    mut read_sector: impl FnMut(u64, &mut [u8]) -> bool,
+    mut read_block: impl FnMut(u64, &mut [u8]) -> bool,
 ) -> PartitionScan
 {
     let mut entries = Vec::new();
     let mut block = [0u8; MAX_BLOCK_SIZE];
     let block_size = header.block_size as usize;
-    if block_size > MAX_BLOCK_SIZE
-        || header.entry_size < 128
-        || header.entry_size > header.block_size
+    if !is_block_size(block_size) || !is_entry_size(header.entry_size, header.block_size)
     {
         return PartitionScan {
             entries,
@@ -248,7 +259,7 @@ pub fn collect_partitions(
     let mut lba = header.part_entry_lba;
     while remaining > 0
     {
-        if !read_sector(lba, sector)
+        if !read_block(lba, sector)
         {
             return PartitionScan {
                 entries,
@@ -582,6 +593,27 @@ mod tests
             num_parts,
             entry_size,
             block_size: 512,
+        }
+    }
+
+    #[test]
+    fn collect_refuses_a_header_parse_header_would_refuse_without_reading()
+    {
+        for (block_size, entry_size) in [(4096, 8192), (1000, 128), (256, 128), (512, 200)]
+        {
+            let mut reads = Vec::new();
+            let h = GptHeader {
+                block_size,
+                entry_size,
+                ..header(4, 128)
+            };
+            let scan = collect_partitions(&h, reader(&[], None, &mut reads));
+            assert_eq!(
+                scan.stop,
+                Some(ScanStop::ReadFailed { lba: 2 }),
+                "{block_size}/{entry_size}"
+            );
+            assert!(reads.is_empty());
         }
     }
 

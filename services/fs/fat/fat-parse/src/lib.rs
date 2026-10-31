@@ -1189,7 +1189,7 @@ pub fn tail_of(sfn: &[u8; 11], basis: &[u8; 11]) -> Option<u32>
 /// lies in, since the directory has at most [`DIR_ENTRIES_MAX`] entries.
 pub struct TailSet
 {
-    bits: [u64; TAIL_SET_WORDS],
+    bits: alloc::vec::Vec<u64>,
 }
 
 /// Words of [`TailSet`]'s bitmap: one bit per tail `0..=DIR_ENTRIES_MAX + 1`.
@@ -1197,12 +1197,15 @@ const TAIL_SET_WORDS: usize = (DIR_ENTRIES_MAX as usize + 2).div_ceil(64);
 
 impl TailSet
 {
+    /// An empty set, its 8 KiB bitmap on the heap; `None` when the heap
+    /// cannot hold it.
     #[must_use]
-    pub const fn new() -> Self
+    pub fn try_new() -> Option<Self>
     {
-        Self {
-            bits: [0; TAIL_SET_WORDS],
-        }
+        let mut bits = alloc::vec::Vec::new();
+        bits.try_reserve_exact(TAIL_SET_WORDS).ok()?;
+        bits.resize(TAIL_SET_WORDS, 0);
+        Some(Self { bits })
     }
 
     /// Record the tail `sfn` carries for `basis`, if any.
@@ -1221,14 +1224,6 @@ impl TailSet
     pub fn lowest_free(&self) -> Option<u32>
     {
         (1..=DIR_ENTRIES_MAX + 1).find(|&t| self.bits[t as usize / 64] & (1 << (t % 64)) == 0)
-    }
-}
-
-impl Default for TailSet
-{
-    fn default() -> Self
-    {
-        Self::new()
     }
 }
 
@@ -1384,6 +1379,16 @@ mod tests
     }
 
     #[test]
+    fn parse_bpb_geometry_refuses_a_sector_slice_shorter_than_512_bytes()
+    {
+        let s = fat16_sector();
+        assert!(matches!(
+            parse_bpb_geometry(&s[..511], 512),
+            Err(BpbError::UnsupportedSectorSize)
+        ));
+    }
+
+    #[test]
     fn parse_bpb_geometry_rejects_sectors_other_than_the_device_block()
     {
         // A 4 KiB-sector volume on a 512-byte device, and the reverse: the
@@ -1503,12 +1508,24 @@ mod tests
     }
 
     #[test]
-    fn lowest_free_tail_passes_the_old_six_tail_limit()
+    fn a_set_with_every_covered_tail_used_has_no_free_tail()
+    {
+        let b = basis(b"X", b"");
+        let mut used = TailSet::try_new().expect("heap");
+        for t in 1..=DIR_ENTRIES_MAX + 1
+        {
+            used.note(&compose_tailed_name(&b, t).expect("in range"), &b);
+        }
+        assert_eq!(used.lowest_free(), None);
+    }
+
+    #[test]
+    fn the_seventh_colliding_name_takes_the_lowest_free_tail()
     {
         // Tails 1 through 6 taken, and 8: the seventh colliding name gets ~7
         // where a six-tail scheme failed with NoSpace.
         let b = basis(b"REPORT", b"TXT");
-        let mut used = TailSet::new();
+        let mut used = TailSet::try_new().expect("heap");
         for t in [1, 2, 3, 4, 5, 6, 8]
         {
             used.note(&compose_tailed_name(&b, t).expect("in range"), &b);
@@ -1522,7 +1539,7 @@ mod tests
         // Every entry a directory can hold carries one of the tails
         // 1..=65536: the next is free, within the set's range.
         let b = basis(b"X", b"");
-        let mut used = TailSet::new();
+        let mut used = TailSet::try_new().expect("heap");
         for t in 1..=DIR_ENTRIES_MAX
         {
             used.note(&compose_tailed_name(&b, t).expect("in range"), &b);

@@ -13,14 +13,24 @@
 // crate; the geometry/state machine and block I/O below consume them.
 pub use fat_parse::{FatType, MAX_SECTOR_SIZE};
 
+use crate::alloc::FatError;
+
 /// A zeroed heap buffer of [`MAX_SECTOR_SIZE`] bytes, which holds a sector of
 /// any size the driver mounts; a sector occupies its first
 /// [`FatState::sector_bytes`]. On the heap to keep the write-path frames
 /// within the default thread stack when release LTO inlines the nested
 /// helpers.
-pub fn sector_buffer() -> Box<[u8]>
+///
+/// # Errors
+/// [`FatError::Io`] when the heap cannot hold the buffer; the request fails
+/// as an I/O error would.
+pub fn sector_buffer() -> Result<Box<[u8]>, FatError>
 {
-    vec![0u8; MAX_SECTOR_SIZE].into_boxed_slice()
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(MAX_SECTOR_SIZE)
+        .map_err(|_| FatError::Io)?;
+    buf.resize(MAX_SECTOR_SIZE, 0);
+    Ok(buf.into_boxed_slice())
 }
 
 /// Parsed FAT filesystem geometry and cached FAT sector.

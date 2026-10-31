@@ -77,7 +77,7 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 3;
+pub const PROCMGR_LABELS_VERSION: u32 = 4;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -283,6 +283,20 @@ pub mod procmgr_labels
     /// rejected. Who holds it is in `services/procmgr/docs/ipc-interface.md`
     /// § `REGISTER_DEATH_EQ` — install logd's death observer.
     pub const DEATH_EQ_AUTHORITY: u64 = 1u64 << 62;
+
+    /// List the badges of the live processes procmgr tracks, one page per
+    /// call, for real-logd's death-queue resync; callers whose badge is not
+    /// [`DEATH_EQ_AUTHORITY`] are refused. `data[0]` is 0 to start the walk
+    /// or 1 to resume after the badge in `data[1]`. The reply carries the
+    /// page's count in `data[0]` and the badges, in ascending order, in
+    /// `data[1..=count]`, at most [`LIVE_PROCESSES_PAGE`]; a page shorter
+    /// than that ends the walk. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § `QUERY_LIVE_PROCESSES`.
+    pub const QUERY_LIVE_PROCESSES: u64 = 18;
+
+    /// Badges one [`QUERY_LIVE_PROCESSES`] reply carries at most: every data
+    /// word after the count.
+    pub const LIVE_PROCESSES_PAGE: usize = super::MSG_DATA_WORDS_MAX - 1;
 
     /// Hand init's kernel-object caps and reclaimable Memory caps to
     /// procmgr for the reap after init exits; init calls it on its exit

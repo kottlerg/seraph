@@ -6,9 +6,9 @@
 //! Pure process-table, badge, recent-exit, request-shape, and init-reap logic
 //! for procmgr.
 //!
-//! Holds the plain-data process record ([`ProcessEntry`]), the fixed-size
-//! slot table ([`ProcessTable`]) with its insert/find/take/query operations,
-//! the recently-reaped ring ([`RecentExits`]), the pure badge-acceptance
+//! Holds the plain-data process record ([`ProcessEntry`]), the heap-backed
+//! table ([`ProcessTable`]) with its insert/find/take/query operations, the
+//! time-bounded recently-reaped ring ([`RecentExits`]), the pure badge-acceptance
 //! predicate ([`badge_is_acceptable`]), the argv/env blob decoder for
 //! create requests ([`CreateBlobs`]), which parses client-controlled label
 //! fields and data words, the `CREATE_FROM_FILE` cap-layout split
@@ -32,19 +32,39 @@ pub mod init_reap;
 pub mod request_caps;
 
 pub use create_blobs::{ChildArgs, ChildEnv, CreateBlobs};
-pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal};
+pub use init_reap::{CapDisposition, DeathOutcome, InitReap, Refusal, poll_within};
 pub use request_caps::{FileCreateCaps, split_create_from_file_caps};
 
-/// Maximum concurrent child processes procmgr tracks.
-///
-/// Independent of any wait-set capacity — the shared death queue fans in
-/// all children's exit events with kernel-side multi-bind, so there is no
-/// per-child wait-set slot. Raise this (and the death queue capacity in
-/// `main.rs`) as real workloads demand.
-pub const MAX_PROCESSES: usize = 32;
+extern crate alloc;
 
-/// Slots in the [`RecentExits`] ring.
-const RECENT_EXITS_SLOTS: usize = 16;
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+
+/// How long a reaped child stays in [`RecentExits`], in nanoseconds: 30 s.
+///
+/// A `QUERY_PROCESS` on a reaped badge answers `EXITED` with its reason for
+/// this long, then `UNKNOWN`. The window is a time bound, not a count, so a
+/// burst of later deaths cannot rotate a child out early; the ring's size is
+/// the death rate times the window, paid for on the heap only while it holds
+/// entries.
+pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
+
+/// The death-EQ correlator of a process badge: its low 32 bits.
+///
+/// The kernel's death correlator is a `u32` today, so procmgr binds each
+/// child's observers with the low word of its `u64` badge, and logd keys its
+/// eviction on the same word. [`ProcessTable::insert`] refuses a badge whose
+/// low word a live entry already holds, so the correlator names exactly one
+/// live process.
+#[must_use]
+pub const fn correlator_of(badge: u64) -> u32
+{
+    // The low-32 extraction is the point: it is the correlator the kernel
+    // carries.
+    #[allow(clippy::cast_possible_truncation)]
+    let low = badge as u32;
+    low
+}
 
 // ── Process table ───────────────────────────────────────────────────────────
 
@@ -120,13 +140,13 @@ impl ProcessEntry
 
 /// Ring of recently auto-reaped processes, queried on `QUERY_PROCESS`
 /// table miss to distinguish "exited recently" from "never existed".
-/// Best-effort retention: oldest entries are overwritten as new ones
-/// arrive; queries on rotated-out badges return `None`.
-#[derive(Clone, Copy)]
+/// Each record is kept for [`RECENT_EXIT_RETENTION_NS`] after its death; a
+/// query on an older one returns `None`.
+#[derive(Default)]
 pub struct RecentExits
 {
-    ring: [Option<RecentExit>; RECENT_EXITS_SLOTS],
-    head: usize,
+    /// Records in death order, oldest first.
+    ring: VecDeque<RecentExit>,
 }
 
 #[derive(Clone, Copy)]
@@ -134,6 +154,8 @@ struct RecentExit
 {
     badge: u64,
     exit_reason: u64,
+    /// Monotonic time of the death, in nanoseconds.
+    at_ns: u64,
 }
 
 impl RecentExits
@@ -142,39 +164,78 @@ impl RecentExits
     pub const fn new() -> Self
     {
         Self {
-            ring: [None; RECENT_EXITS_SLOTS],
-            head: 0,
+            ring: VecDeque::new(),
         }
     }
 
-    pub fn record(&mut self, badge: u64, exit_reason: u64)
+    /// Drop every record older than the retention window at `now_ns`.
+    fn expire(&mut self, now_ns: u64)
     {
-        self.ring[self.head] = Some(RecentExit { badge, exit_reason });
-        self.head = (self.head + 1) % RECENT_EXITS_SLOTS;
+        while self
+            .ring
+            .front()
+            .is_some_and(|e| now_ns.saturating_sub(e.at_ns) > RECENT_EXIT_RETENTION_NS)
+        {
+            self.ring.pop_front();
+        }
     }
 
-    #[must_use]
-    pub fn find(&self, badge: u64) -> Option<u64>
+    /// Record `badge`'s death with `exit_reason` at monotonic time `now_ns`.
+    ///
+    /// When the heap cannot grow the ring, the oldest record makes room; an
+    /// empty ring that cannot grow drops the record, so a query on it answers
+    /// `UNKNOWN` rather than procmgr failing.
+    pub fn record(&mut self, badge: u64, exit_reason: u64, now_ns: u64)
     {
+        self.expire(now_ns);
+        if self.ring.try_reserve(1).is_err() && self.ring.pop_front().is_none()
+        {
+            return;
+        }
+        self.ring.push_back(RecentExit {
+            badge,
+            exit_reason,
+            at_ns: now_ns,
+        });
+    }
+
+    /// The exit reason of `badge` if it died within the retention window
+    /// before `now_ns`.
+    pub fn find(&mut self, badge: u64, now_ns: u64) -> Option<u64>
+    {
+        self.expire(now_ns);
         self.ring
             .iter()
-            .filter_map(|s| s.as_ref())
+            .rev()
             .find(|e| e.badge == badge)
             .map(|e| e.exit_reason)
     }
 }
 
-impl Default for RecentExits
+/// Why [`ProcessTable::insert`] refused an entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertError
 {
-    fn default() -> Self
-    {
-        Self::new()
-    }
+    /// A live entry already holds the badge's correlator ([`correlator_of`]).
+    CorrelatorInUse,
+    /// The heap could not grow the table.
+    OutOfMemory,
 }
 
+/// procmgr's live processes, kept on the heap and sorted by badge.
+///
+/// The table grows with the number of live processes and holds no fixed
+/// ceiling; a spawn fails only when the heap cannot grow it. Lookups by badge
+/// are binary searches. The kernel's death correlator is still the badge's
+/// low 32 bits ([`correlator_of`]), and [`Self::insert`] keeps those unique
+/// among live entries, so a death event resolves to one process; once the
+/// correlator carries the full badge, the correlator lookup becomes the badge
+/// lookup and the low-word rule stays as defence in depth.
+#[derive(Default)]
 pub struct ProcessTable
 {
-    entries: [Option<ProcessEntry>; MAX_PROCESSES],
+    /// Entries sorted by badge, no two sharing a badge or a correlator.
+    entries: Vec<ProcessEntry>,
 }
 
 impl ProcessTable
@@ -182,87 +243,139 @@ impl ProcessTable
     #[must_use]
     pub const fn new() -> Self
     {
-        const NONE: Option<ProcessEntry> = None;
         Self {
-            entries: [NONE; MAX_PROCESSES],
+            entries: Vec::new(),
         }
     }
 
-    /// Place `entry` in the first free slot. Returns `false` (changing
-    /// nothing) when all [`MAX_PROCESSES`] slots are occupied.
-    #[must_use]
-    pub fn insert(&mut self, entry: ProcessEntry) -> bool
+    /// Index of the entry whose badge is `badge`, or where one would go.
+    fn search(&self, badge: u64) -> Result<usize, usize>
     {
-        for slot in &mut self.entries
+        self.entries.binary_search_by_key(&badge, |e| e.badge)
+    }
+
+    /// Index of the live entry whose badge is `badge`.
+    fn index_of_badge(&self, badge: u64) -> Option<usize>
+    {
+        self.search(badge).ok()
+    }
+
+    /// Index of the live entry holding `correlator`.
+    fn index_of_correlator(&self, correlator: u32) -> Option<usize>
+    {
+        self.entries
+            .iter()
+            .position(|e| correlator_of(e.badge) == correlator)
+    }
+
+    /// Number of live entries.
+    #[must_use]
+    pub fn len(&self) -> usize
+    {
+        self.entries.len()
+    }
+
+    /// Whether the table holds no live entry.
+    #[must_use]
+    pub fn is_empty(&self) -> bool
+    {
+        self.entries.is_empty()
+    }
+
+    /// Whether a live entry's badge has `correlator` as its low word. Badge
+    /// minting redraws such a candidate, so [`Self::insert`] does not refuse
+    /// it later.
+    #[must_use]
+    pub fn correlator_in_use(&self, correlator: u32) -> bool
+    {
+        self.index_of_correlator(correlator).is_some()
+    }
+
+    /// Insert `entry`, changing nothing on refusal.
+    ///
+    /// # Errors
+    /// [`InsertError::CorrelatorInUse`] when a live entry already holds the
+    /// badge's correlator (a live entry with the same badge holds it too);
+    /// [`InsertError::OutOfMemory`] when the heap cannot grow the table.
+    pub fn insert(&mut self, entry: ProcessEntry) -> Result<(), InsertError>
+    {
+        if self.correlator_in_use(correlator_of(entry.badge))
         {
-            if slot.is_none()
-            {
-                *slot = Some(entry);
-                return true;
-            }
+            return Err(InsertError::CorrelatorInUse);
         }
-        false
+        let Err(idx) = self.search(entry.badge)
+        else
+        {
+            return Err(InsertError::CorrelatorInUse);
+        };
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| InsertError::OutOfMemory)?;
+        self.entries.insert(idx, entry);
+        Ok(())
     }
 
     /// Locate the live entry whose badge matches, for in-place mutation.
     #[must_use]
     pub fn find_mut_by_badge(&mut self, badge: u64) -> Option<&mut ProcessEntry>
     {
-        self.entries
-            .iter_mut()
-            .filter_map(|s| s.as_mut())
-            .find(|e| e.badge == badge)
+        let idx = self.index_of_badge(badge)?;
+        Some(&mut self.entries[idx])
     }
 
-    /// Remove and return the entry whose badge matches, clearing its slot.
+    /// Remove and return the entry whose badge matches.
     #[must_use]
     pub fn take_by_badge(&mut self, badge: u64) -> Option<ProcessEntry>
     {
-        for slot in &mut self.entries
-        {
-            if let Some(entry) = slot.as_ref()
-                && entry.badge == badge
-            {
-                return slot.take();
-            }
-        }
-        None
+        let idx = self.index_of_badge(badge)?;
+        Some(self.entries.remove(idx))
     }
 
-    /// Remove and return the entry whose badge matches `correlator` in its
-    /// low 32 bits. Used by the auto-reap dispatch to resolve a death event
-    /// back to its process. Stale correlators (entry already reaped)
-    /// return `None`; callers drop such events silently.
+    /// Remove and return the entry whose badge's low 32 bits are
+    /// `correlator`. Used by the death dispatch to resolve a death event back
+    /// to its process. Stale correlators (entry already reaped) return
+    /// `None`; callers drop such events silently.
     #[must_use]
     pub fn take_by_correlator(&mut self, correlator: u32) -> Option<ProcessEntry>
     {
-        for slot in &mut self.entries
-        {
-            // The low-32 extraction is intentional: the death-EQ binding
-            // API carries a u32 correlator while badges are u64; matching
-            // mirrors how the correlator was derived (`badge as u32`).
-            #[allow(clippy::cast_possible_truncation)]
-            if let Some(entry) = slot.as_ref()
-                && (entry.badge as u32) == correlator
-            {
-                return slot.take();
-            }
-        }
-        None
+        let idx = self.index_of_correlator(correlator)?;
+        Some(self.entries.remove(idx))
     }
 
-    /// Visit every live entry in insertion order. Used by
+    /// Visit every live entry in badge order. Used by
     /// `install_logd_death_eq` to retroactively bind logd's EQ as a
-    /// second death observer on each child's main thread.
-    pub fn for_each<F: FnMut(&ProcessEntry)>(&self, mut f: F)
+    /// second death observer on each child's main thread, and by the death
+    /// resync to read each child's thread state.
+    pub fn for_each<F: FnMut(&ProcessEntry)>(&self, f: F)
     {
-        for slot in &self.entries
+        self.entries.iter().for_each(f);
+    }
+
+    /// Copy into `out` the badges of the live entries above `after` (every
+    /// entry when `after` is `None`), in badge order, and return how many
+    /// were copied.
+    ///
+    /// A pager that passes the last copied badge as the next `after` sees
+    /// every entry that stays live across the walk exactly once, whatever is
+    /// inserted or removed between pages.
+    pub fn live_badges_after(&self, after: Option<u64>, out: &mut [u64]) -> usize
+    {
+        let start = match after
         {
-            if let Some(entry) = slot.as_ref()
+            None => 0,
+            Some(b) => match self.search(b)
             {
-                f(entry);
-            }
+                Ok(i) => i + 1,
+                Err(i) => i,
+            },
+        };
+        let mut copied = 0;
+        for (slot, entry) in out.iter_mut().zip(&self.entries[start..])
+        {
+            *slot = entry.badge;
+            copied += 1;
         }
+        copied
     }
 
     /// Lightweight status lookup for `QUERY_PROCESS`. Returns
@@ -275,11 +388,9 @@ impl ProcessTable
     #[must_use]
     pub fn query_by_badge(&self, badge: u64) -> Option<(bool, u32)>
     {
-        self.entries
-            .iter()
-            .filter_map(|s| s.as_ref())
-            .find(|e| e.badge == badge)
-            .map(|e| (e.started, e.thread_cap))
+        let idx = self.index_of_badge(badge)?;
+        let e = &self.entries[idx];
+        Some((e.started, e.thread_cap))
     }
 
     /// Band ceiling of the live entry whose badge matches, for
@@ -288,19 +399,8 @@ impl ProcessTable
     #[must_use]
     pub fn band_max_by_badge(&self, badge: u64) -> Option<u8>
     {
-        self.entries
-            .iter()
-            .filter_map(|s| s.as_ref())
-            .find(|e| e.badge == badge)
-            .map(|e| e.band_max)
-    }
-}
-
-impl Default for ProcessTable
-{
-    fn default() -> Self
-    {
-        Self::new()
+        let idx = self.index_of_badge(badge)?;
+        Some(self.entries[idx].band_max)
     }
 }
 
@@ -386,10 +486,7 @@ pub fn resolve_spawn_sched(
 #[must_use]
 pub fn badge_is_acceptable(badge: u64, min_low: u64, reserved_low32: u32, verb_bits: u64) -> bool
 {
-    // The low-32 extraction is intentional: only the truncated u32 reaches
-    // the correlator-bearing death-EQ API and the logd badge.
-    #[allow(clippy::cast_possible_truncation)]
-    let low = badge as u32;
+    let low = correlator_of(badge);
     u64::from(low) >= min_low && low != reserved_low32 && badge & verb_bits == 0
 }
 
@@ -489,23 +586,67 @@ mod tests
     }
 
     #[test]
-    fn insert_fills_first_empty_slot_and_reports_full_table()
+    fn insert_grows_past_any_fixed_count_and_keeps_every_entry_reachable()
     {
         let mut table = ProcessTable::new();
-        for badge in 0..MAX_PROCESSES as u64
+        // Far past the former 32-entry ceiling, inserted out of order.
+        for i in (0..1000u64).rev()
         {
-            assert!(table.insert(entry_with_badge(badge)));
+            assert_eq!(table.insert(entry_with_badge((i << 32) | (i + 16))), Ok(()));
         }
-        // Saturated: the next insert must fail rather than clobber a slot.
-        assert!(!table.insert(entry_with_badge(0xDEAD)));
-        assert!(table.find_mut_by_badge(0xDEAD).is_none());
+        assert_eq!(table.len(), 1000);
+        for i in 0..1000u64
+        {
+            assert!(table.find_mut_by_badge((i << 32) | (i + 16)).is_some());
+        }
+    }
+
+    #[test]
+    fn insert_refuses_a_badge_whose_correlator_a_live_entry_holds()
+    {
+        let mut table = ProcessTable::new();
+        assert_eq!(
+            table.insert(entry_with_badge(0x0000_0001_0000_0020)),
+            Ok(())
+        );
+        assert!(table.correlator_in_use(0x20));
+        // Same low word, different high word: refused, table unchanged.
+        assert_eq!(
+            table.insert(entry_with_badge(0x0000_0002_0000_0020)),
+            Err(InsertError::CorrelatorInUse)
+        );
+        assert_eq!(table.len(), 1);
+        assert!(table.find_mut_by_badge(0x0000_0002_0000_0020).is_none());
+        // Once the holder is reaped, the low word is free again.
+        let _ = table.take_by_correlator(0x20);
+        assert!(!table.correlator_in_use(0x20));
+        assert_eq!(
+            table.insert(entry_with_badge(0x0000_0002_0000_0020)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn badge_lookups_miss_a_badge_that_only_shares_a_live_correlator()
+    {
+        let mut table = ProcessTable::new();
+        assert_eq!(
+            table.insert(entry_with_badge(0x0000_0001_0000_0020)),
+            Ok(())
+        );
+        let alias = 0x0000_0009_0000_0020;
+        assert!(table.find_mut_by_badge(alias).is_none());
+        assert!(table.query_by_badge(alias).is_none());
+        assert!(table.band_max_by_badge(alias).is_none());
+        assert!(table.take_by_badge(alias).is_none());
+        assert_eq!(table.len(), 1);
     }
 
     #[test]
     fn find_mut_by_badge_returns_live_entry_and_none_for_unknown()
     {
         let mut table = ProcessTable::new();
-        assert!(table.insert(entry_with_badge(16)));
+        assert_eq!(table.insert(entry_with_badge(16)), Ok(()));
         assert_eq!(table.find_mut_by_badge(16).map(|e| e.badge()), Some(16));
         assert!(table.find_mut_by_badge(99).is_none());
     }
@@ -514,7 +655,7 @@ mod tests
     fn take_by_badge_removes_matching_entry_and_leaves_slot_empty()
     {
         let mut table = ProcessTable::new();
-        assert!(table.insert(entry_with_badge(16)));
+        assert_eq!(table.insert(entry_with_badge(16)), Ok(()));
         assert_eq!(table.take_by_badge(16).map(|e| e.badge), Some(16));
         // Slot is now free: a second take misses and find no longer sees it.
         assert!(table.take_by_badge(16).is_none());
@@ -527,7 +668,10 @@ mod tests
         let mut table = ProcessTable::new();
         // High bits set; correlator is only the low word. A full-u64 compare
         // would miss this match.
-        assert!(table.insert(entry_with_badge(0x0000_0001_0000_002A)));
+        assert_eq!(
+            table.insert(entry_with_badge(0x0000_0001_0000_002A)),
+            Ok(())
+        );
         assert_eq!(
             table.take_by_correlator(0x2A).map(|e| e.badge),
             Some(0x0000_0001_0000_002A)
@@ -541,7 +685,7 @@ mod tests
         let mut table = ProcessTable::new();
         let mut entry = entry_with_badge(16);
         entry.thread_cap = 7;
-        assert!(table.insert(entry));
+        assert_eq!(table.insert(entry), Ok(()));
         assert_eq!(table.query_by_badge(16), Some((false, 7)));
         table.find_mut_by_badge(16).expect("entry present").started = true;
         assert_eq!(table.query_by_badge(16), Some((true, 7)));
@@ -552,27 +696,46 @@ mod tests
     fn for_each_visits_exactly_the_live_entries()
     {
         let mut table = ProcessTable::new();
-        assert!(table.insert(entry_with_badge(10)));
-        assert!(table.insert(entry_with_badge(20)));
-        assert!(table.insert(entry_with_badge(30)));
+        assert_eq!(table.insert(entry_with_badge(30)), Ok(()));
+        assert_eq!(table.insert(entry_with_badge(10)), Ok(()));
+        assert_eq!(table.insert(entry_with_badge(20)), Ok(()));
         let _ = table.take_by_badge(20);
-        let mut seen = [0u64; MAX_PROCESSES];
-        let mut count = 0usize;
-        table.for_each(|e| {
-            seen[count] = e.badge;
-            count += 1;
-        });
-        assert_eq!(count, 2);
-        assert_eq!(&seen[..2], &[10, 30]);
+        let mut seen = Vec::new();
+        table.for_each(|e| seen.push(e.badge));
+        assert_eq!(seen, [10, 30]);
+    }
+
+    #[test]
+    fn live_badges_after_pages_every_entry_once_in_badge_order()
+    {
+        let mut table = ProcessTable::new();
+        let b = |n: u64| (n << 32) | (n + 16);
+        for n in [4u64, 1, 3, 2, 5]
+        {
+            assert_eq!(table.insert(entry_with_badge(b(n))), Ok(()));
+        }
+        let mut page = [0u64; 2];
+        assert_eq!(table.live_badges_after(None, &mut page), 2);
+        assert_eq!(page, [b(1), b(2)]);
+        // An entry removed and one inserted behind the cursor between pages
+        // do not disturb the walk over the entries that stay live.
+        let _ = table.take_by_badge(b(3));
+        assert_eq!(table.insert(entry_with_badge(b(0))), Ok(()));
+        assert_eq!(table.live_badges_after(Some(page[1]), &mut page), 2);
+        assert_eq!(page, [b(4), b(5)]);
+        // A cursor naming a reaped badge resumes after it.
+        assert_eq!(table.live_badges_after(Some(b(3)), &mut page), 2);
+        assert_eq!(page, [b(4), b(5)]);
+        assert_eq!(table.live_badges_after(Some(b(5)), &mut page), 0);
     }
 
     #[test]
     fn recent_exits_record_then_find_returns_exit_reason()
     {
         let mut recent = RecentExits::new();
-        recent.record(16, 42);
-        assert_eq!(recent.find(16), Some(42));
-        assert_eq!(recent.find(17), None);
+        recent.record(16, 42, 1_000);
+        assert_eq!(recent.find(16, 2_000), Some(42));
+        assert_eq!(recent.find(17, 2_000), None);
     }
 
     #[test]
@@ -581,7 +744,7 @@ mod tests
         let mut table = ProcessTable::new();
         let mut entry = entry_with_badge(16);
         entry.band_max = 21;
-        assert!(table.insert(entry));
+        assert_eq!(table.insert(entry), Ok(()));
         assert_eq!(table.band_max_by_badge(16), Some(21));
         assert_eq!(table.band_max_by_badge(99), None);
     }
@@ -626,18 +789,26 @@ mod tests
     }
 
     #[test]
-    fn recent_exits_ring_overwrites_oldest_after_capacity()
+    fn recent_exits_keep_a_burst_of_deaths_for_the_whole_window()
     {
         let mut recent = RecentExits::new();
-        // One more record than the ring holds: the first badge is evicted.
-        for i in 0..=RECENT_EXITS_SLOTS as u64
+        // Many deaths inside the window: none rotates the first one out.
+        for i in 0..10_000u64
         {
-            recent.record(100 + i, 100 + i);
+            recent.record(100 + i, i, i);
         }
-        assert_eq!(recent.find(100), None);
-        assert_eq!(
-            recent.find(100 + RECENT_EXITS_SLOTS as u64),
-            Some(100 + RECENT_EXITS_SLOTS as u64)
-        );
+        assert_eq!(recent.find(100, 10_000), Some(0));
+        assert_eq!(recent.find(100 + 9_999, 10_000), Some(9_999));
+    }
+
+    #[test]
+    fn recent_exits_forget_a_record_once_the_window_has_passed()
+    {
+        let mut recent = RecentExits::new();
+        recent.record(16, 1, 0);
+        recent.record(17, 2, 5);
+        assert_eq!(recent.find(16, RECENT_EXIT_RETENTION_NS), Some(1));
+        assert_eq!(recent.find(16, RECENT_EXIT_RETENTION_NS + 1), None);
+        assert_eq!(recent.find(17, RECENT_EXIT_RETENTION_NS + 1), Some(2));
     }
 }

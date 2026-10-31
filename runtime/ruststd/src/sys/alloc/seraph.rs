@@ -94,6 +94,13 @@ const GROW_MAX_PAGES: u64 = 256;
 /// between; the trailing budget check decides either way.
 const PT_FUND_ROUNDS: u32 = 2;
 
+/// Augment rounds `fund_cspace_slot_budget` makes before giving up. A CSpace
+/// donation also gives up a page once per record page of its bookkeeping
+/// (see `SYS_CAP_CREATE_CSPACE`), so, as for `PT_FUND_ROUNDS`, a second round
+/// covers that shortfall unless other threads of the process take the slots
+/// in between; the trailing headroom check decides either way.
+const CSPACE_FUND_ROUNDS: u32 = 2;
+
 // ── Spinlock ────────────────────────────────────────────────────────────────
 
 struct SpinLock {
@@ -1105,6 +1112,54 @@ pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
         }
     }
     budget() >= need_bytes
+}
+
+/// General-allocation headroom of `self_cspace`: free slots the kernel lets a
+/// general allocation take, excluding the IPC receive reserve
+/// (`CSPACE_IPC_RECV_RESERVE`). Zero when the queries fail.
+pub fn cspace_general_headroom(self_cspace: u32) -> u64 {
+    let capacity =
+        syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_CAPACITY).unwrap_or(0);
+    let used =
+        syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_USED).unwrap_or(capacity);
+    capacity.saturating_sub(used).saturating_sub(syscall_abi::CSPACE_IPC_RECV_RESERVE)
+}
+
+/// Fund `self_cspace`'s slot-page pool so at least `slots` general
+/// allocations succeed without further growth.
+///
+/// Reads the `CSpace`'s headroom (`CAP_INFO_CSPACE_CAPACITY` less
+/// `CAP_INFO_CSPACE_USED` and the IPC receive reserve) and, when it falls
+/// short, requests Memory from memmgr (via the object slab) and donates it to
+/// the pool with augment-mode `cap_create_cspace`, one page per
+/// `CSPACE_SLOTS_PER_PAGE` missing slots plus one for a directory or
+/// donation-record page. Call before a known burst of cap acquisitions, or
+/// periodically to keep headroom above a low-water mark, so a service never
+/// meets the hard `OutOfMemory` of an exhausted `CSpace`.
+///
+/// `slots == 0` is a no-op success. Returns `false` if memmgr is
+/// unreachable, the request/augment fails (the object slab's own cap needs
+/// one free general slot), or the headroom still falls short after
+/// `CSPACE_FUND_ROUNDS` rounds.
+pub fn fund_cspace_slot_budget(self_cspace: u32, slots: u64) -> bool {
+    if slots == 0 {
+        return true;
+    }
+    for _ in 0..CSPACE_FUND_ROUNDS {
+        let have = cspace_general_headroom(self_cspace);
+        if have >= slots {
+            return true;
+        }
+        let pages = (slots - have).div_ceil(syscall_abi::CSPACE_SLOTS_PER_PAGE) + 1;
+        if object_slab_retype(pages * PAGE_SIZE, |frame| {
+            syscall::cap_create_cspace(frame, self_cspace, pages).ok()
+        })
+        .is_none()
+        {
+            return false;
+        }
+    }
+    cspace_general_headroom(self_cspace) >= slots
 }
 
 /// Abort the calling thread via `SYS_THREAD_EXIT`. Used as the allocation-

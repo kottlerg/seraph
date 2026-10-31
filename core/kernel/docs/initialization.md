@@ -480,7 +480,10 @@ sealed buddy in
 
 **Failure mode:** An allocation or insertion failure during CSpace construction halts
 through `fatal` with a message naming the failed site (for example "Phase 7: cannot allocate
-Mmio capability for aperture").
+Mmio capability for aperture"). A run of caps `InitInfo` names as a `base`/`count` range (the
+RAM Memory caps, the hardware caps, the ACPI-region Memory caps) whose members do not land in
+consecutive slots also halts, naming the run and the first slot out of place (for example
+"Phase 7: RAM Memory caps are not in consecutive slots").
 
 **Completion criterion:** Root CSpace exists and contains capabilities for all
 boot-provided hardware resources, including the reclaimable Memory caps
@@ -699,7 +702,9 @@ the reap-time donation of the segment, InitInfo, and stack pages in
 failed step. Invalid init_image (zero segment_count or zero entry_point) halts with
 "Phase 9: init image missing or has no entry point". A `reclaim_ranges` count above
 `MAX_RECLAIM_RANGES` halts at step 6 with
-"Phase 9: reclaim_ranges count exceeds MAX_RECLAIM_RANGES".
+"Phase 9: reclaim_ranges count exceeds MAX_RECLAIM_RANGES". Init's segment, stack, or
+InitInfo-region Memory caps not landing in consecutive slots halts with "Phase 9: init segment
+Memory caps are not in consecutive slots" (or the stack's or InitInfo's equivalent).
 
 **Completion criterion:** Init is executing in user mode (ring-3 / U-mode).
 

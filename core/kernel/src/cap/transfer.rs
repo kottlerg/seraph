@@ -87,6 +87,21 @@ pub enum MoveStep
     },
 }
 
+/// Where [`move_cap_begin`] places the destination slot.
+#[derive(Clone, Copy, Debug)]
+pub enum Placement
+{
+    /// Any free slot, leaving the destination's IPC receive reserve free
+    /// (`SYS_CAP_MOVE` without an explicit index).
+    Any,
+    /// Any free slot, the IPC receive reserve included (IPC capability
+    /// transfer; core/kernel/docs/capability-internals.md § IPC Receive
+    /// Reserve).
+    IpcTransfer,
+    /// This index (`insert_cap_at`, whose leaves the syscall path pre-grows).
+    At(NonZeroU32),
+}
+
 /// Who holds the source `CSpace` lock when a batch frees the source slot.
 #[derive(Clone, Copy)]
 enum SourceLock
@@ -150,9 +165,8 @@ pub unsafe fn check_transfer_ref_limits(cs: &CSpace, handles: &[u32]) -> Result<
 /// [`MAX_REPARENT_EDITS`] children.
 ///
 /// `src_handle` carries the caller's generation and is validated here,
-/// under the locks, against the slot it names (#349). `dst_idx` `None`
-/// auto-allocates; `Some` places at that index (`insert_cap_at`, whose
-/// leaves the syscall path pre-grows).
+/// under the locks, against the slot it names (#349). `placement` picks the
+/// destination slot ([`Placement`]).
 ///
 /// On error both slots and the object's reference count are as they were;
 /// an explicit-index insert may have materialised leaves in the destination,
@@ -171,12 +185,12 @@ pub unsafe fn move_cap_begin(
     src_cspace: *mut CSpace,
     src_handle: u32,
     dst_cspace: *mut CSpace,
-    dst_idx: Option<NonZeroU32>,
+    placement: Placement,
     dst_ref: DestRef,
 ) -> Result<MoveStep, SyscallError>
 {
     // SAFETY: caller contract.
-    let mv = unsafe { stage_move(src_cspace, src_handle, dst_cspace, dst_idx, dst_ref)? };
+    let mv = unsafe { stage_move(src_cspace, src_handle, dst_cspace, placement, dst_ref)? };
     // SAFETY: DERIVATION_LOCK held (caller contract); both slots live and
     // pinned; the source lock is held by the caller.
     Ok(unsafe { move_cap_step(&mv, SourceLock::Held) })
@@ -194,7 +208,7 @@ unsafe fn stage_move(
     src_cspace: *mut CSpace,
     src_handle: u32,
     dst_cspace: *mut CSpace,
-    dst_idx: Option<NonZeroU32>,
+    placement: Placement,
     dst_ref: DestRef,
 ) -> Result<CapMove, SyscallError>
 {
@@ -245,14 +259,19 @@ unsafe fn stage_move(
         }
     }
 
-    let inserted = match dst_idx
+    let inserted = match placement
     {
-        None =>
+        Placement::Any =>
         {
             // SAFETY: caller contract; the destination lock is held.
             unsafe { (*dst_cspace).insert_cap(tag, rights, object) }
         }
-        Some(idx) =>
+        Placement::IpcTransfer =>
+        {
+            // SAFETY: caller contract; the destination lock is held.
+            unsafe { (*dst_cspace).insert_cap_transfer(tag, rights, object) }
+        }
+        Placement::At(idx) =>
         {
             // SAFETY: caller contract; the destination lock is held.
             unsafe { (*dst_cspace).insert_cap_at(idx.get(), tag, rights, object) }.map(|()| idx)
@@ -717,12 +736,12 @@ mod tests
         src_cs: *mut CSpace,
         src_handle: u32,
         dst_cs: *mut CSpace,
-        dst_idx: Option<NonZeroU32>,
+        placement: Placement,
     ) -> Result<MoveStep, SyscallError>
     {
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; test CSpaces are live and unshared.
-        let r = unsafe { move_cap_begin(src_cs, src_handle, dst_cs, dst_idx, DestRef::Checked) };
+        let r = unsafe { move_cap_begin(src_cs, src_handle, dst_cs, placement, DestRef::Checked) };
         DERIVATION_LOCK.write_unlock();
         r
     }
@@ -764,7 +783,7 @@ mod tests
         let obj = mk_object();
         let (root, src, sib, kids, handle) = mk_tree(a, ID_A, 3, obj);
 
-        let step = begin(a, handle, b, None).expect("begin");
+        let step = begin(a, handle, b, Placement::Any).expect("begin");
         let MoveStep::Done { handle, release } = step
         else
         {
@@ -803,7 +822,7 @@ mod tests
         let kids_n = MAX_REPARENT_EDITS + 44;
         let (root, src, sib, kids, handle) = mk_tree(a, ID_A, kids_n, obj);
 
-        let step = begin(a, handle, b, None).expect("begin");
+        let step = begin(a, handle, b, Placement::Any).expect("begin");
         let MoveStep::Pending(mv) = step
         else
         {
@@ -858,7 +877,7 @@ mod tests
         let (root, src, sib, kids, handle) = mk_tree(a, ID_A, 2, obj);
         let want = NonZeroU32::new(40).expect("non-zero");
 
-        let step = begin(a, handle, b, Some(want)).expect("begin");
+        let step = begin(a, handle, b, Placement::At(want)).expect("begin");
         let MoveStep::Done { handle, release } = step
         else
         {
@@ -887,7 +906,7 @@ mod tests
             syscall::cap_handle_gen(handle).wrapping_add(1),
         );
         assert!(matches!(
-            begin(a, stale, b, None),
+            begin(a, stale, b, Placement::Any),
             Err(SyscallError::InvalidCapability)
         ));
 
@@ -896,7 +915,7 @@ mod tests
         unsafe { resolve_slot_mut(src) }.expect("src").pin();
         DERIVATION_LOCK.write_unlock();
         assert!(matches!(
-            begin(a, handle, b, None),
+            begin(a, handle, b, Placement::Any),
             Err(SyscallError::InvalidState)
         ));
 
@@ -937,7 +956,7 @@ mod tests
         // Three batches' worth, so the second batch is still pending when
         // a backstop of two trips.
         let (root, src, sib, kids, handle) = mk_tree(a, ID_A, 2 * MAX_REPARENT_EDITS + 8, obj);
-        let MoveStep::Pending(mv) = begin(a, handle, b, None).expect("begin")
+        let MoveStep::Pending(mv) = begin(a, handle, b, Placement::Any).expect("begin")
         else
         {
             panic!("expected a pending move");
@@ -982,7 +1001,7 @@ mod tests
         let b = mk_registered_cspace(ID_B);
         let obj = mk_object();
         let (root, src, _sib, _kids, handle) = mk_tree(a, ID_A, MAX_REPARENT_EDITS + 1, obj);
-        let MoveStep::Pending(mv) = begin(a, handle, b, None).expect("begin")
+        let MoveStep::Pending(mv) = begin(a, handle, b, Placement::Any).expect("begin")
         else
         {
             panic!("expected a pending move");
@@ -1013,7 +1032,7 @@ mod tests
         let b = mk_registered_cspace(ID_B);
         let obj = mk_object();
         let (root, src, _sib, _kids, handle) = mk_tree(a, ID_A, MAX_REPARENT_EDITS + 1, obj);
-        let MoveStep::Pending(mv) = begin(a, handle, b, None).expect("begin")
+        let MoveStep::Pending(mv) = begin(a, handle, b, Placement::Any).expect("begin")
         else
         {
             panic!("expected a pending move");
@@ -1047,7 +1066,7 @@ mod tests
         let b = mk_registered_cspace(ID_B);
         let obj = mk_object();
         let (root, src, _sib, kids, handle) = mk_tree(a, ID_A, MAX_REPARENT_EDITS + 1, obj);
-        let MoveStep::Pending(mv) = begin(a, handle, b, None).expect("begin")
+        let MoveStep::Pending(mv) = begin(a, handle, b, Placement::Any).expect("begin")
         else
         {
             panic!("expected a pending move");
@@ -1082,6 +1101,43 @@ mod tests
         crate::cap::unregister_cspace(ID_B);
     }
 
+    #[test]
+    fn ipc_transfer_lands_in_the_reserve_a_general_move_cannot_take()
+    {
+        const ID_A: CSpaceId = 3223;
+        const ID_B: CSpaceId = 3224;
+        let a = mk_registered_cspace(ID_A);
+        let b = mk_registered_cspace(ID_B);
+        // SAFETY: single-threaded test ownership of the leaked CSpace.
+        unsafe {
+            (*b).set_test_page_budget(1);
+            while (*b).allocate_slot().is_ok()
+            {}
+        }
+        let obj = mk_object();
+        let (_root, _src, _sib, _kids, handle) = mk_tree(a, ID_A, 1, obj);
+
+        assert_eq!(
+            begin(a, handle, b, Placement::Any).err(),
+            Some(SyscallError::OutOfMemory),
+            "a general move must not take the IPC receive reserve"
+        );
+        let step = begin(a, handle, b, Placement::IpcTransfer).expect("transfer begin");
+        let MoveStep::Done { handle, release } = step
+        else
+        {
+            panic!("one child completes in one batch: {step:?}");
+        };
+        // SAFETY: the reference handed back by the completed move.
+        unsafe { release_moved_object(release.expect("source reference")) };
+        let dst = dst_of(ID_B, handle);
+        // SAFETY: single-threaded test ownership of the leaked CSpace.
+        let held = unsafe { (*b).slot(dst.index.get()).and_then(|s| s.object) };
+        assert_eq!(held, Some(obj));
+        crate::cap::unregister_cspace(ID_A);
+        crate::cap::unregister_cspace(ID_B);
+    }
+
     // Defect guarded: a checked move that lets the destination's reference
     // past the ceiling, or that refuses but leaves the count or a slot changed.
     #[test]
@@ -1101,7 +1157,7 @@ mod tests
         let before = snap(src);
 
         assert!(matches!(
-            begin(a, handle, b, None),
+            begin(a, handle, b, Placement::Any),
             Err(SyscallError::QuotaExceeded)
         ));
         assert_eq!(refcount(obj), REF_COUNT_LIMIT);
@@ -1145,8 +1201,16 @@ mod tests
         // when the count reached the ceiling after the check.
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; test CSpaces are live and unshared.
-        let step =
-            unsafe { move_cap_begin(a, full_handle, b, None, DestRef::Prechecked) }.expect("begin");
+        let step = unsafe {
+            move_cap_begin(
+                a,
+                full_handle,
+                b,
+                Placement::IpcTransfer,
+                DestRef::Prechecked,
+            )
+        }
+        .expect("begin");
         DERIVATION_LOCK.write_unlock();
         let MoveStep::Done { release, .. } = step
         else
@@ -1176,7 +1240,7 @@ mod tests
         let taken = occupy(b, ID_B);
         let before = refcount(obj);
 
-        assert!(begin(a, handle, b, Some(taken.index)).is_err());
+        assert!(begin(a, handle, b, Placement::At(taken.index)).is_err());
         assert_eq!(refcount(obj), before);
         crate::cap::unregister_cspace(ID_A);
         crate::cap::unregister_cspace(ID_B);

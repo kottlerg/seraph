@@ -68,7 +68,9 @@ The concrete values of `L1_DIRECT`, `L1_INDIRECT`, `DIR_FANOUT`, and
 `L2_SIZE` are implementation constants chosen so that one `CSpacePage` fits
 a single pool page, one `CSpaceDirPage` is exactly one pool page, and every
 slot index fits the cap handle's index field. They are established at
-implementation time and are not part of the public ABI.
+implementation time; `L1_DIRECT`, `L1_INDIRECT`, and `DIR_FANOUT` are not part of the public
+ABI, while `L2_SIZE` is published as `CSPACE_SLOTS_PER_PAGE` (userspace funding arithmetic
+depends on it, and a const assert pins the two together), so changing it is an ABI change.
 `(L1_DIRECT + L1_INDIRECT × DIR_FANOUT) × L2_SIZE` is the directory's
 structural ceiling — the only slot bound a CSpace has; capacity below it is
 whatever the owner-funded slot-page pool backs (see
@@ -134,6 +136,7 @@ pub struct CSpace
 {
     // ... (above fields)
     free_head: Option<NonZeroU32>, // head of the intrusive free list (None = empty)
+    free_tail: Option<NonZeroU32>, // tail of the intrusive free list (None = empty)
     free_count: usize,             // slots currently on the free list (O(1) queries)
 }
 ```
@@ -146,8 +149,15 @@ link never does, so the two uses stay distinguishable. The predecessor link make
 `remove_from_free_list` — the explicit-placement path that unlinks an arbitrary
 index — O(1); a list walk would run under the CSpace spinlock with interrupts
 disabled. Allocation pops `free_head` and clears the slot; deallocation pushes onto
-the head. When the list is empty and more slots are needed, the next leaf page is
-allocated and all its usable slots are threaded onto the list.
+the head. When more free slots are needed, the next leaf page is allocated and all its
+usable slots are appended, in ascending order, at `free_tail`. Because a general
+allocation grows while the slots of the IPC receive reserve (below) are still free,
+appending hands those out before the new leaf's, so a run of consecutive inserts gets
+consecutive indices across a leaf boundary: `InitInfo`'s contiguous Memory-cap ranges
+depend on it, and the boot population checks every run it publishes (the RAM, hardware,
+ACPI-region, init-segment, init-stack, and InitInfo-region caps), halting on the first slot out
+of place (`cap::extend_slot_run_or_fatal`;
+[initialization.md](initialization.md) § Phase 7 and § Phase 9).
 
 A `Null` tag alone cannot tell a slot that is *linked on the free list* from one that
 was just allocated and not yet populated, and the list tail is byte-identical to a
@@ -161,6 +171,38 @@ allocation, and when `remove_from_free_list` unlinks a specific index);
 `allocate_slot` debug-asserts the popped slot was a genuine member.
 
 This gives amortised O(1) allocation and O(1) deallocation.
+
+### IPC Receive Reserve
+
+Every `CSpace` keeps its last `IPC_RECV_RESERVE` free slots (`CSPACE_IPC_RECV_RESERVE` in the
+ABI, equal to `MSG_CAP_SLOTS_MAX`, one message's worth) for IPC capability transfer:
+
+- **General allocations** (`allocate_slot` and the inserts built on it: every `cap_create_*`,
+  `cap_copy`, `cap_derive`, split, kernel boot mint, and `cap_move`, including the
+  explicit-placement `insert_cap_at`) grow the `CSpace` until more than `IPC_RECV_RESERVE`
+  slots are free before they take one. When the pool cannot grow they fail with the grow's
+  error (`PoolExhausted`, `OutOfMemory` to userspace; `OutOfSlots`, `QuotaExceeded`, at the
+  structural ceiling) while the reserved slots stay free.
+- **IPC transfer allocations** (`allocate_transfer_slot`, through `insert_cap_transfer` and
+  `cap::transfer::Placement::IpcTransfer`, the placement `transfer_caps` uses for call, receive,
+  and reply delivery) take any free slot, the reserved ones included, and grow only when none is
+  free.
+
+`pre_allocate(n)` grows until `n` slots are free, counting reserved ones. So the worst-case
+`pre_allocate(MSG_CAP_SLOTS_MAX)` that `SYS_IPC_RECV` makes before parking succeeds without
+growth on a `CSpace` whose general slots are exhausted, and the received caps land in the
+reserve. The degradation is reserve-then-wedge:
+
+1. General allocations fail first, visibly, with `OutOfMemory`.
+2. Receives keep working, and received caps take reserved slots, until transfers have spent the
+   reserve.
+3. Only then does a receive fail before parking, the condition
+   [docs/ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure Policy handles.
+
+Freeing a slot reopens general allocation once more than the reserve is free. The reserve is not
+a lock: two threads sharing a `CSpace` can both receive into it, and a transfer that finds it
+spent fails as any destination shortage does. A process keeps general headroom above the reserve
+by funding its pool (`std::os::seraph::fund_cspace_slot_budget`).
 
 ---
 
@@ -1069,7 +1111,8 @@ transfer_caps(sender_tcb, handles, receiver_tcb):
         validate every handle: distinct, occupied, generation current,
             not pinned
         refuse (QuotaExceeded) if any handle's object is at REF_COUNT_LIMIT
-        pre-allocate len(handles) slots in the receiver's CSpace
+        pre-allocate len(handles) slots in the receiver's CSpace,
+            the IPC receive reserve included
         begin every move (insert dst, its reference unchecked, pin both,
             first batch)
     drive each move that did not finish, one batch per hold

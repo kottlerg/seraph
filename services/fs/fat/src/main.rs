@@ -103,7 +103,12 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    let cache = match PageCache::init(info.memmgr_endpoint, info.self_aspace, ipc_buf)
+    let cache = match PageCache::init(
+        info.memmgr_endpoint,
+        info.self_aspace,
+        info.self_cspace,
+        ipc_buf,
+    )
     {
         Ok(c) => c,
         Err(e) =>

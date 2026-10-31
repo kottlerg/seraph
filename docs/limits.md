@@ -95,8 +95,7 @@ An entry an existing open Issue already names cites it in the recommendation.
   iterations, whose wall time depends on CPU and MMIO speed. `wait_for_ack` is the time-based
   model.
 - **Hidden global pools.** The kernel's 512 KiB SEED also funds split bodies, Mmio and IoPort
-  copies, and IOPB tables at runtime; the memmgr and procmgr CSpaces are seeded once with
-  8231 slots and have no augment path.
+  copies, and IOPB tables at runtime.
 
 ## Catalogue
 
@@ -164,7 +163,7 @@ Tracked by [#637](https://github.com/kottlerg/seraph/issues/637); the Phase 7 bo
 | `RegistryEntry.epoch`, `SlotId.epoch` | `core/kernel/src/cap/registry.rs`, `slot.rs` | `u32`, redrawn on recycle | encoding artefact (12 B `SlotId`, 72 B slot) | 4 B per `SlotId` | correct as is | Freshness-only; the residual per recycle is documented |
 | `CapabilitySlot.pad[1]` (handle generation) | `core/kernel/src/cap/slot.rs` | `u8`, wrapping | ABI width (`u32` handle: 8 generation + 24 index bits) | 1 B per slot | raise | Wraps after 256 recycles of one index; retire at wrap or widen handles |
 | `CAP_INDEX_BITS` | `abi/syscall/src/lib.rs` | 24 | ABI width (`u32` handle) | none | needs a design | About 16.7 M slots per CSpace; decide with the generation (#41) |
-| `L2_SIZE` | `core/kernel/src/cap/cspace.rs` | 56 | encoding artefact (56 x 72 B in one page, asserted) | none | correct as is | None |
+| `L2_SIZE` | `core/kernel/src/cap/cspace.rs` | 56 | encoding artefact (56 x 72 B in one page, asserted; published as `CSPACE_SLOTS_PER_PAGE`) | none | correct as is | None |
 | `L1_DIRECT`, `L1_INDIRECT` | `core/kernel/src/cap/cspace.rs` | 128 / 128 | encoding artefact (two-level directory inline in the CSpace) | 2 KiB per CSpace | correct as is | Add a level, not inline pointers, if `MAX_SLOTS_STRUCTURAL` ever binds (#41) |
 | `MAX_LEAVES`, `MAX_SLOTS_STRUCTURAL` | `core/kernel/src/cap/cspace.rs` | 65 664 leaves, 3 677 184 slots per CSpace | encoding artefact (directory geometry) | none (growth is pool-funded) | needs a design | procmgr's CSpace bounds its children near 1 M; decide with `CAP_INDEX_BITS` |
 | CSpace geometry asserts | `core/kernel/src/cap/cspace.rs` | `MAX_SLOTS_STRUCTURAL <= 1 << CAP_INDEX_BITS`, page fits | encoding artefact | none | correct as is | Keep |
@@ -315,6 +314,8 @@ generation by [#637](https://github.com/kottlerg/seraph/issues/637).
 |---|---|---|---|---|---|---|
 | `MSG_CAP_SLOTS_MAX` | `abi/syscall/src/lib.rs` | 4 | encoding artefact (two transfer registers of two `u32` handles each) | 16 B per TCB message | correct as is | Bounds caps per message, not per transfer: every protocol that moves more iterates (`shared/ipc` bootstrap rounds, DONATE rounds); the protocols that do not are tracked in their own sections |
 | `MSG_CAP_SLOTS_MAX <= 4` assert | `abi/syscall/src/lib.rs` | compile time | encoding artefact | none | correct as is | Keep |
+| `CSPACE_IPC_RECV_RESERVE` | `abi/syscall/src/lib.rs` | `MSG_CAP_SLOTS_MAX` (4) free slots per CSpace | ABI width (one message's caps) | 4 slots per CSpace | correct as is | None: general allocations fail first, receives keep landing caps (#41) |
+| `CSPACE_SLOTS_PER_PAGE` | `abi/syscall/src/lib.rs` | 56 | encoding artefact (kernel `L2_SIZE`, asserted equal) | none | correct as is | None |
 | `MSG_DATA_WORDS_MAX` | `abi/syscall/src/lib.rs` | 64 | ABI width (IPC buffer layout) | about 550 B per TCB | correct as is | Bulk data moves through Memory caps (#36, #40) |
 | IPC buffer layout | `abi/syscall/src/lib.rs` | data words 0..64, count at 64, handles 65..69, in one page | ABI width | 4 KiB per thread | correct as is | None |
 | `CAP_INDEX_BITS + 8 <= 32` assert | `abi/syscall/src/lib.rs` | compile time | ABI width | none | correct as is | Keep |
@@ -392,6 +393,7 @@ Tracked by [#641](https://github.com/kottlerg/seraph/issues/641).
 | `GROW_MIN_PAGES` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 16 | tuning | none | correct as is | None |
 | `MAX_ROUNDS` (`grow_exact`) | `runtime/ruststd/src/sys/alloc/seraph.rs` | 16 | provably unreachable (anti-wedge bound) | none | correct as is | None |
 | `PT_FUND_ROUNDS` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 2 | provably unreachable (record-page argument) | none | correct as is | None |
+| `CSPACE_FUND_ROUNDS` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 2 | provably unreachable (record-page argument) | none | correct as is | None |
 | `SLAB_SHELF_SIZE` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 4 | tuning (overflow strands a run until exit, bounded) | 192 B static | correct as is | None |
 | `ALLOCATOR_METADATA_RESERVE` | `runtime/ruststd/src/sys/alloc/seraph.rs` | 64 | tuning (slack) | none | correct as is | None |
 | `RESERVE_ARENA_SLOTS_LOG2` | `runtime/ruststd/src/sys/reserve/seraph.rs` | 24 | encoding artefact (ASLR window) | none | correct as is | Revisit with the arena zone |
@@ -510,7 +512,8 @@ Tracked by [#642](https://github.com/kottlerg/seraph/issues/642).
 | `InitBootstrap.in_use` | `services/memmgr/src/main.rs` | `MAX_IN_USE` = 4 | provably unreachable (three tier-1 producers) | 96 B stack | correct as is | None |
 | process badges | `services/memmgr/src/main.rs` | random `u64` | ABI width | none | correct as is | None |
 | `POOL_TOTAL_PAGES` | `services/memmgr/src/main.rs` | `u64`, saturating | ABI width | 8 B | correct as is | None |
-| memmgr CSpace slots | `services/init/src/main.rs` (`CSPACE_RETYPE_PAGES`) | 8231 slots, no augment | current peak plus headroom | 149 pages | needs a design | Caps outstanding grants, runs and chunks at about 8 k system-wide |
+| memmgr CSpace slots | `services/init/src/main.rs` (`CSPACE_RETYPE_PAGES`) | 8231-slot seed, self-augmented from memmgr's pool | refillable seed (augment) | 149 pages | correct as is | None (#642, #41) |
+| `CSPACE_LOW_WATER`, `CSPACE_TOPUP_PAGES` | `services/memmgr/src/main.rs` | 256 slots / 16 pages | tuning (headroom over a burst of grants) | none | correct as is | None |
 
 ### procmgr
 
@@ -530,6 +533,7 @@ Tracked by [#643](https://github.com/kottlerg/seraph/issues/643).
 | `MAX_PROCESS_STACK_PAGES` clamp | `services/procmgr/src/process.rs` | 256 | see the process-layout section | none | raise | Reject, do not clamp (#641) |
 | `THREAD_RETYPE_PAGES` | `services/procmgr/src/main.rs` | 6 | encoding artefact (kernel stack, TCB and FPU pages) | none | correct as is | Share with init |
 | `ASPACE_RETYPE_PAGES`, `CSPACE_RETYPE_PAGES` (per child) | `services/procmgr/src/main.rs` | 48 / 7 | refillable seed (augment) | per child | correct as is | None |
+| `CSPACE_LOW_WATER`, `CSPACE_TOPUP_SLOTS` | `services/procmgr/src/main.rs` | 256 / 1024 slots | tuning (headroom over a burst of spawns) | none | correct as is | None |
 | `INIT_THREADS`, `FIRST_ROUND_CAPS` | `services/procmgr/process-table/src/init_reap.rs` | 2 / 4 | provably unreachable (fixed init protocol) | none | correct as is | None |
 | DONATE round size | `services/procmgr/src/init_reap.rs` | `MSG_CAP_SLOTS_MAX` | ABI width | none | correct as is | Loops over every cap |
 | `PROBE_SETTLE_READS` | `services/procmgr/src/init_reap.rs` | 64 reads with a yield between | unknown (yield count) | none | needs a design | When it runs out, the probe page stays out of memmgr's pool; its wall time depends on scheduling. Use a time-based bound |
@@ -586,7 +590,7 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645).
 | `LOG_THREAD_STACK_PAGES` | `services/init/src/logging.rs` | 4 | BSS budget (the tables live in BSS, not on this stack) | 16 KiB | correct as is | None |
 | `STREAM_CHUNK_SIZE` | `services/init/src/logging.rs`, `services/logd/src/main.rs` | 512 | ABI width | 512 B stack | correct as is | None |
 | `MAX_ORPHAN_MEMORY_CAPS` | `services/init/src/main.rs` | 64 | current peak plus headroom | 256 B | raise | Halts on overflow; size from `memory_count` |
-| `CSPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 149 pages (8231 slots) | current peak plus headroom | 149 pages each for memmgr and procmgr | needs a design | Lifetime cap on tier-1 caps; self-augment path |
+| `CSPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 149 pages (8231 slots) | refillable seed (augment) | 149 pages each for memmgr and procmgr | correct as is | None: both self-augment (#642, #643, #41) |
 | `THREAD_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 6 | encoding artefact (kernel stack, TCB and FPU pages) | per tier-1 service | correct as is | Share with procmgr |
 | `ASPACE_RETYPE_PAGES` (tier-1) | `services/init/src/main.rs` | 48 | refillable seed for procmgr; a static seed for memmgr, which has no augment path | 48 pages per tier-1 service | make pay-as-you-go | memmgr's page-table pool caps its metadata-arena growth; fund it from its pool (#642) |
 | `INIT_RETYPE_RESERVE_PAGES` | `services/init/src/bootstrap.rs` | 8 | provably unreachable (asserted against the fixed endpoint count) | 8 pages | correct as is | None |
@@ -690,6 +694,7 @@ Tracked by [#647](https://github.com/kottlerg/seraph/issues/647).
 | `RELEASE_TIMEOUT_MS` | `services/fs/fat/src/eviction.rs` | 100 ms | tuning | none | needs a design | Each timeout leaks one watchdog thread (#31) |
 | `SLOT_COUNT` (`PageCache.slots`) | `services/fs/fat/src/cache.rs` | 128 pages | BSS budget | 512 KiB per mount | make pay-as-you-go | Grow lazily to a RAM-scaled ceiling (#52) |
 | `QUARANTINE_MAX` | `services/fs/fat/src/cache.rs` | 32 | tuning (bounds what non-unmapping clients cost) | 256 B | correct as is | None (#52) |
+| `CACHE_CSPACE_FUNDING` | `services/fs/fat/src/cache.rs` | `SLOT_COUNT + QUARANTINE_MAX + 1 + 64` slots | follows its factors, plus run-time headroom | the slot pages it funds | correct as is | None |
 | `SECTORS_PER_PAGE` | `services/fs/fat/src/cache.rs` | 8 | hardware spec (page over 512 B sector) | none | correct as is | None |
 | `SCRATCH_MEMORY` | `services/fs/fat/src/cache.rs` | one page | encoding artefact (block DMA from offset 0) | one page | correct as is | None (#83) |
 | `FatState.cached_fat_sector` | `services/fs/fat/src/bpb.rs` | one sector | tuning (memo above the cache) | 512 B | correct as is | None |

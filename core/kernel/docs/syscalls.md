@@ -183,6 +183,13 @@ return `UnknownSyscall`.
 
 ## Error Codes
 
+A syscall that inserts a capability into a CSpace (every `SYS_CAP_CREATE_*`, `SYS_CAP_COPY`,
+`SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_CAP_MOVE`, and the split syscalls) leaves the
+destination's IPC receive reserve (`CSPACE_IPC_RECV_RESERVE` free slots) untouched. Its
+"slot-page pool exhausted" `OutOfMemory`, and its structural-ceiling `QuotaExceeded`, therefore
+arise while that many slots are still free; only IPC capability transfer takes them
+([capability-internals.md](capability-internals.md) § IPC Receive Reserve).
+
 All syscalls return one of these error codes on failure. The value is negative in
 `rax`/`a0`. Zero and positive values are success.
 
@@ -408,8 +415,12 @@ Endpoint capability bound by `SYS_THREAD_SET_FAULT_HANDLER` (see
 **Capability requirement:** `endpoint_cap` must have Receive rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights`, `QuotaExceeded` (server's CSpace
-directory cannot supply `MSG_CAP_SLOTS_MAX` free slots), `OutOfMemory` (slot-page pool
-exhausted) — both checked before the receive parks, whether or not a message carries caps
+directory cannot supply `MSG_CAP_SLOTS_MAX` free slots), `OutOfMemory` (fewer than
+`MSG_CAP_SLOTS_MAX` slots free and the slot-page pool exhausted) — both checked before the
+receive parks, whether or not a message carries caps. The free slots counted include the IPC
+receive reserve that general allocations leave free
+([capability-internals.md](capability-internals.md) § IPC Receive Reserve), so only received
+caps that have spent the reserve fail a receive
 (see [ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure Policy),
 `Interrupted`. If an already-queued sender's cap transfer is refused (a source slot went stale
 or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer, a
@@ -2480,6 +2491,8 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 |---|---|---|
 | `MSG_DATA_WORDS_MAX` | 64 | Maximum data words per message |
 | `MSG_CAP_SLOTS_MAX` | 4 | Maximum capabilities per message |
+| `CSPACE_IPC_RECV_RESERVE` | 4 | Free slots every CSpace keeps back from general allocations for IPC capability transfer (§ Error Codes) |
+| `CSPACE_SLOTS_PER_PAGE` | 56 | Capability slots one donated CSpace slot page backs |
 | `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 4096 | Maximum entries in an event queue |

@@ -695,15 +695,20 @@ pub fn cspace_grow_consumes_pool(ctx: &TestContext) -> TestResult
 }
 
 /// Pool exhaustion is refillable: an exhausted slot-page pool fails the
-/// insert with `OutOfMemory` (-8), and an augment-mode donation lifts the
-/// bound — every donated page's worth of inserts then succeeds. Capacity
-/// is whatever the paid pool backs; no quota error exists below the
-/// directory's structural ceiling.
+/// insert with `OutOfMemory` (-8) once only the IPC receive reserve
+/// (`CSPACE_IPC_RECV_RESERVE` slots) is free, and an augment-mode donation
+/// lifts the bound — every donated page's worth of inserts then succeeds.
+/// Capacity is whatever the paid pool backs; no quota error exists below
+/// the directory's structural ceiling.
 pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
 {
+    // Slots one pool page backs (the kernel's `L2_SIZE`).
+    const PAGE_SLOTS: u64 = syscall_abi::CSPACE_SLOTS_PER_PAGE;
+
     let memory = ctx.memory_base;
 
-    // init_pages = 2 → 1 pool page → 55 usable slots.
+    // init_pages = 2 → 1 pool page → PAGE_SLOTS - 1 usable slots (slot 0 is
+    // the null slot).
     let cspace = cap_create_cspace(memory, 0, 2)
         .map_err(|_| "retype::pool_exhaust: cap_create_cspace failed")?;
     let Ok(probe) = cap_create_endpoint(memory)
@@ -713,11 +718,12 @@ pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
         return Err("retype::pool_exhaust: cap_create_endpoint failed");
     };
 
-    // Copy until the first failure: the seeded pool backs 55 slots, so 55
-    // copies succeed and the 56th hits pool exhaustion.
-    let mut ok_before = 0u32;
+    // Copy until the first failure: the seeded pool backs PAGE_SLOTS - 1
+    // slots, of which the IPC receive reserve keeps CSPACE_IPC_RECV_RESERVE
+    // free, so that many fewer copies succeed before pool exhaustion.
+    let mut ok_before = 0u64;
     let mut err_at_pool = 0i64;
-    for _ in 0..=55
+    for _ in 0..PAGE_SLOTS
     {
         match cap_copy(probe, cspace, 1)
         {
@@ -730,12 +736,12 @@ pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
         }
     }
 
-    // Refill the pool (2 more slot pages = 112 slots); every backed slot
-    // must then accept an insert with no error in between.
+    // Refill the pool (2 more slot pages); every backed slot must then accept
+    // an insert with no error in between.
     let augment_ok = cap_create_cspace(memory, cspace, 2).is_ok();
-    let mut ok_after = 0u32;
+    let mut ok_after = 0u64;
     let mut err_after = 0i64;
-    for _ in 0..=112
+    for _ in 0..=2 * PAGE_SLOTS
     {
         match cap_copy(probe, cspace, 1)
         {
@@ -752,20 +758,21 @@ pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
     cap_delete(probe).ok();
     cap_delete(cspace).ok();
 
-    if ok_before != 55 || err_at_pool != SYS_OUT_OF_MEMORY
+    if ok_before != PAGE_SLOTS - 1 - syscall_abi::CSPACE_IPC_RECV_RESERVE
+        || err_at_pool != SYS_OUT_OF_MEMORY
     {
         return Err(
-            "retype::pool_exhaust: pool exhaustion did not surface OutOfMemory after 55 slots",
+            "retype::pool_exhaust: pool exhaustion did not surface OutOfMemory at the reserve",
         );
     }
     if !augment_ok
     {
         return Err("retype::pool_exhaust: augment-mode refill failed");
     }
-    if ok_after != 112 || err_after != SYS_OUT_OF_MEMORY
+    if ok_after != 2 * PAGE_SLOTS || err_after != SYS_OUT_OF_MEMORY
     {
         return Err(
-            "retype::pool_exhaust: augmented pool did not back exactly 112 further inserts",
+            "retype::pool_exhaust: augmented pool did not back exactly two pages of inserts",
         );
     }
     Ok(())
@@ -924,15 +931,16 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
         return Err("retype::dir_survives: cap_create_endpoint failed");
     };
 
-    // Fill the whole direct region so the free list empties exactly at the
-    // direct/indirect boundary. 128 leaf pages total; 127 more than seeded.
+    // Fill the whole direct region, all but the IPC receive reserve, so
+    // general allocations stop exactly at the direct/indirect boundary. 128
+    // leaf pages total; 127 more than seeded.
     if cap_create_cspace(memory, cspace, 127).is_err()
     {
         cap_delete(probe).ok();
         cap_delete(cspace).ok();
         return Err("retype::dir_survives: boundary augment failed");
     }
-    for _ in 0..DIRECT_SLOTS
+    for _ in 0..u64::from(DIRECT_SLOTS) - syscall_abi::CSPACE_IPC_RECV_RESERVE
     {
         if cap_copy(probe, cspace, 1).is_err()
         {
@@ -966,21 +974,31 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
     }
 
     // One more page: the surviving directory page is not re-charged, so a
-    // single page now buys the leaf and the insert lands in leaf 128.
+    // single page now buys leaf 128. Its 56 slots join the 4 the IPC receive
+    // reserve kept free, so exactly 56 more general inserts succeed before
+    // the reserve is reached again.
     if cap_create_cspace(memory, cspace, 1).is_err()
     {
         cap_delete(probe).ok();
         cap_delete(cspace).ok();
         return Err("retype::dir_survives: second refill failed");
     }
-    let landed = cap_copy(probe, cspace, 1);
+    let mut landed = 0u64;
+    for _ in 0..=syscall_abi::CSPACE_SLOTS_PER_PAGE
+    {
+        if cap_copy(probe, cspace, 1).is_err()
+        {
+            break;
+        }
+        landed += 1;
+    }
     cap_delete(probe).ok();
     cap_delete(cspace).ok();
     match landed
     {
-        Ok(handle) if syscall_abi::cap_handle_index(handle) > DIRECT_SLOTS => Ok(()),
-        Ok(_) => Err("retype::dir_survives: post-refill insert landed below the boundary"),
-        Err(_) => Err("retype::dir_survives: insert after refill failed — dir page re-charged?"),
+        syscall_abi::CSPACE_SLOTS_PER_PAGE => Ok(()),
+        0 => Err("retype::dir_survives: insert after refill failed — dir page re-charged?"),
+        _ => Err("retype::dir_survives: the refill page did not back exactly one leaf"),
     }
 }
 
@@ -1024,8 +1042,8 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
         dirs
     }
     const DIRECTORY_PAGES: u64 = directory_pages(SEEDED);
-    // Mirrors the kernel's `L2_SIZE`: slots per leaf page.
-    const SLOTS_PER_LEAF: u64 = 56;
+    // Slots per leaf page: the kernel's `L2_SIZE`, published in the ABI.
+    const SLOTS_PER_LEAF: u64 = syscall_abi::CSPACE_SLOTS_PER_PAGE;
     let memory = ctx.memory_base;
 
     let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
@@ -1050,14 +1068,16 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
     };
 
     // Every seeded page except the directory page backs a leaf; slot 0 of
-    // the first leaf is the null slot.
+    // the first leaf is the null slot, and the IPC receive reserve stays
+    // free behind the general inserts.
     let Ok(probe) = cap_create_endpoint(memory)
     else
     {
         cap_delete(cspace).ok();
         return Err("retype::cspace_augment_many: cap_create_endpoint failed");
     };
-    let expected_copies = (SEEDED - DIRECTORY_PAGES) * SLOTS_PER_LEAF - 1;
+    let expected_copies =
+        (SEEDED - DIRECTORY_PAGES) * SLOTS_PER_LEAF - 1 - syscall_abi::CSPACE_IPC_RECV_RESERVE;
     let mut copies = 0u64;
     let mut terminal = 0i64;
     for _ in 0..=expected_copies

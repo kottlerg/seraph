@@ -96,6 +96,12 @@ pub const SLOT_COUNT: usize = 128;
 /// client) and clean spares number fewer than this.
 pub const QUARANTINE_MAX: usize = 32;
 
+/// General capability slots [`PageCache::init`] funds in the fs process's
+/// own `CSpace` before filling the cache: one per slot page, one per page
+/// the quarantine may add, the scratch page, and headroom for the caps the
+/// fs takes at run time (per-read derivations, block-device replies).
+const CACHE_CSPACE_FUNDING: u64 = (SLOT_COUNT + QUARANTINE_MAX) as u64 + 1 + 64;
+
 /// Number of consecutive sectors held in one cache slot. Fixed by the
 /// page size and the FAT sector size: `PAGE_SIZE / SECTOR_SIZE` = 8.
 pub const SECTORS_PER_PAGE: u64 = PAGE_SIZE / SECTOR_SIZE as u64;
@@ -162,24 +168,34 @@ pub enum InitError
     Memmgr,
     /// VA arena is exhausted.
     Reserve,
+    /// The fs process's `CSpace` could not be funded for the cache's caps.
+    CSpace,
     /// `mem_map` failed for one of the slot memory caps.
     Map,
 }
 
 impl PageCache
 {
-    /// Allocate `SLOT_COUNT` single-page Memory caps, reserve a contiguous
-    /// VA window, map each memory cap into its slot's VA, and return the
-    /// process-static cache.
+    /// Fund the fs process's own `cspace` for the cache's caps, allocate `SLOT_COUNT`
+    /// single-page Memory caps, reserve a contiguous VA window, map each
+    /// memory cap into its slot's VA, and return the process-static cache.
     pub fn init(
         memmgr_ep: u32,
         self_aspace: u32,
+        cspace: u32,
         ipc_buf: *mut u64,
     ) -> Result<&'static Self, InitError>
     {
         if memmgr_ep == 0
         {
             return Err(InitError::NoMemmgr);
+        }
+        // The slot pages and their quarantine replacements are one Memory cap
+        // each; fund the slots up front so filling the cache never meets an
+        // exhausted CSpace.
+        if !std::os::seraph::fund_cspace_slot_budget(cspace, CACHE_CSPACE_FUNDING)
+        {
+            return Err(InitError::CSpace);
         }
         let base_va = {
             // Reservation is held for the fs process's lifetime. ReservedRange

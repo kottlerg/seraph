@@ -194,6 +194,20 @@ no `main()` of either shape `abi/process-abi` describes.
 
 ---
 
+## CSpace headroom
+
+procmgr holds several capabilities per live child (its address space, CSpace, thread, slab, and
+memmgr caps), so spawning draws its own `CSpace`'s slots. A `CSpace` keeps its last
+`CSPACE_IPC_RECV_RESERVE` free slots for IPC capability transfer, and general allocations fail
+first ([docs/capability-model.md](../../docs/capability-model.md) § Address-space and CSpace
+growth budgets). Before every wait, procmgr compares its headroom
+(`std::os::seraph::cspace_slot_headroom`) against `CSPACE_LOW_WATER` (256 slots). Below it,
+procmgr funds the slot-page pool to `CSPACE_TOPUP_SLOTS` (1024) through
+`std::os::seraph::fund_cspace_slot_budget`, which draws the pages from memmgr. A failed top-up is
+logged once per streak of failures and retried on the next pass.
+
+---
+
 ## Relationship to memmgr
 
 procmgr and memmgr are sister tier-1 services with disjoint authority.
@@ -241,4 +255,5 @@ yet implemented (#26) (see
 [Namespace Model](../../docs/namespace-model.md),
 [Process Lifecycle](../../docs/process-lifecycle.md),
 [Userspace Memory Model](../../docs/userspace-memory-model.md),
+[runtime/ruststd/README.md](../../runtime/ruststd/README.md),
 [services/init/README.md](../init/README.md), [services/memmgr/README.md](../memmgr/README.md)

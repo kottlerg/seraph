@@ -716,7 +716,8 @@ pub fn procmgr_refusals_phase(_: &Caps)
          {UNDELIVERABLE_REPLY_DELIVERED}=create reply delivered or not refused, \
          {UNDELIVERABLE_POOL_QUERY_FAILED}=pool query failed, \
          {UNDELIVERABLE_NEVER_RECLAIMED}=the child's pages were never reclaimed, \
-         {UNDELIVERABLE_CALL_FAILED}=the create call failed"
+         {UNDELIVERABLE_CALL_FAILED}=the create call failed, \
+         {UNDELIVERABLE_GRANT_FAILED}=a reserve-spending grant failed"
     );
     std::os::seraph::log!("procmgr_refusals phase passed");
 }
@@ -806,6 +807,9 @@ const UNDELIVERABLE_POOL_QUERY_FAILED: i32 = 4;
 const UNDELIVERABLE_NEVER_RECLAIMED: i32 = 5;
 /// Exit code: the `CREATE_FROM_FILE` call itself failed.
 const UNDELIVERABLE_CALL_FAILED: i32 = 6;
+/// Exit code: a memmgr grant spending the IPC receive reserve neither landed
+/// nor failed its transfer.
+const UNDELIVERABLE_GRANT_FAILED: i32 = 7;
 /// Sample windows the child retries: memmgr's free-pool size is system-wide,
 /// and other processes (crasher shares the boot) can move it inside one.
 const UNDELIVERABLE_WINDOWS: u32 = 8;
@@ -813,9 +817,10 @@ const UNDELIVERABLE_WINDOWS: u32 = 8;
 /// reaches memmgr. A test wait bound: it limits only how long a window polls.
 const UNDELIVERABLE_POLLS: u32 = 256;
 
-/// Child role: exhaust this process's `CSpace` so procmgr's two-cap create
-/// reply cannot land, issue `CREATE_FROM_FILE`, and check that the reply
-/// transfer fails and that procmgr then destroys the child it created —
+/// Child role: exhaust this process's `CSpace`, its IPC receive reserve
+/// included, so procmgr's two-cap create reply cannot land, issue
+/// `CREATE_FROM_FILE`, and check that the reply transfer fails and that
+/// procmgr then destroys the child it created —
 /// memmgr's free pool returns to its level before the create, which it does
 /// not while the suspended child holds its pages. Runs without heap
 /// allocation after the exhaustion, since a heap refill needs a free slot.
@@ -832,10 +837,27 @@ fn undeliverable_reply_child_main() -> !
     let (programs, _, _) = lookup(std::os::seraph::root_dir_cap(), b"programs");
     let (mut file, _, size) = lookup(programs, b"hello");
 
-    // Fill every free slot. The create call then moves the file cap out,
-    // freeing one slot, and the reply's two caps cannot both land.
+    // Fill every general slot, then spend the IPC receive reserve, which
+    // general allocations leave free, on one-page memmgr grants: each lands
+    // until the reserve is gone. The create call then moves the file cap
+    // out, freeing one slot, and the reply's two caps cannot both land.
     while syscall::cap_derive(info.procmgr_endpoint, syscall::RIGHTS_EP_SEND).is_ok()
     {}
+    for _ in 0..=syscall_abi::CSPACE_IPC_RECV_RESERVE
+    {
+        let grant = IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
+            .word(0, 1)
+            .build();
+        // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
+        match unsafe { ipc::ipc_call(info.memmgr_endpoint, &grant, ipc_buf) }
+        {
+            Ok(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED => break,
+            Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS && !reply.caps().is_empty() =>
+            {
+            }
+            _ => std::process::exit(UNDELIVERABLE_GRANT_FAILED),
+        }
+    }
 
     for window in 0..UNDELIVERABLE_WINDOWS
     {

@@ -2256,7 +2256,7 @@ pub fn sys_cap_move(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::CSpaceKernelObject;
     use crate::cap::transfer::{
-        DestRef, MoveStep, move_cap_begin, move_cap_drive, release_moved_object,
+        DestRef, MoveStep, Placement, move_cap_begin, move_cap_drive, release_moved_object,
     };
 
     let src_handle = tf.arg(0) as u32;
@@ -2319,7 +2319,7 @@ pub fn sys_cap_move(tf: UserFrame) -> Result<u64, SyscallError>
 
     let placement = match core::num::NonZeroU32::new(dest_idx)
     {
-        None => None,
+        None => Placement::Any,
         Some(idx) =>
         {
             // Pre-grow for the explicit destination before the heavyweight
@@ -2327,7 +2327,7 @@ pub fn sys_cap_move(tf: UserFrame) -> Result<u64, SyscallError>
             // pre_grow_for_explicit_slot), the destination wrapper pinned
             // across it by `dest_cs_slot`.
             pre_grow_for_explicit_slot(dest_cs_ptr, dest_idx)?;
-            Some(idx)
+            Placement::At(idx)
         }
     };
 

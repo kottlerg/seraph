@@ -1338,10 +1338,12 @@ fn populate_cspace(
                 ptr,
                 "Phase 7: cannot allocate Memory capability for usable memory",
             );
-            if memory_count == 0
-            {
-                memory_base = slot;
-            }
+            extend_slot_run_or_fatal(
+                &mut memory_base,
+                memory_count,
+                slot,
+                "Phase 7: RAM Memory caps are not in consecutive slots",
+            );
             push_descriptor(
                 &mut desc_count,
                 CapDescriptor {
@@ -1395,10 +1397,12 @@ fn populate_cspace(
             ptr,
             "Phase 7: cannot allocate Memory capability for usable memory",
         );
-        if memory_count == 0
-        {
-            memory_base = slot;
-        }
+        extend_slot_run_or_fatal(
+            &mut memory_base,
+            memory_count,
+            slot,
+            "Phase 7: RAM Memory caps are not in consecutive slots",
+        );
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
@@ -1436,10 +1440,12 @@ fn populate_cspace(
             ptr,
             "Phase 7: cannot allocate Mmio capability for console UART",
         );
-        if hw_cap_count == 0
-        {
-            hw_cap_base = slot;
-        }
+        extend_slot_run_or_fatal(
+            &mut hw_cap_base,
+            hw_cap_count,
+            slot,
+            "Phase 7: hardware caps are not in consecutive slots",
+        );
         hw_cap_count += 1;
         push_descriptor(
             &mut desc_count,
@@ -1462,10 +1468,12 @@ fn populate_cspace(
             ptr,
             "Phase 7: cannot allocate Mmio capability for aperture",
         );
-        if hw_cap_count == 0
-        {
-            hw_cap_base = slot;
-        }
+        extend_slot_run_or_fatal(
+            &mut hw_cap_base,
+            hw_cap_count,
+            slot,
+            "Phase 7: hardware caps are not in consecutive slots",
+        );
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
@@ -1583,10 +1591,12 @@ fn populate_cspace(
             ptr,
             "Phase 7: cannot allocate Memory capability for ACPI region",
         );
-        if acpi_region_memory_count == 0
-        {
-            acpi_region_memory_base = slot;
-        }
+        extend_slot_run_or_fatal(
+            &mut acpi_region_memory_base,
+            acpi_region_memory_count,
+            slot,
+            "Phase 7: ACPI region Memory caps are not in consecutive slots",
+        );
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
@@ -2376,6 +2386,45 @@ pub(crate) unsafe fn unlock_cspace_pair(a: *mut CSpace, b: *mut CSpace, saved_a:
     }
 }
 
+/// Whether `slot` may join the published slot run `[base, base + count)`: any
+/// slot starts an empty run, and a later one must be `base + count`.
+fn extends_slot_run(base: u32, count: u32, slot: u32) -> bool
+{
+    count == 0 || base.checked_add(count) == Some(slot)
+}
+
+/// Record `slot` as the next member of the slot run `base`/`count` (setting
+/// `base` for the first), calling [`crate::fatal`] (a panic in host tests)
+/// when it breaks the run. `InitInfo` hands these runs to init as
+/// `[base, base + count)` ranges, so a gap would name a slot outside the run;
+/// the free list's ascending order keeps boot inserts consecutive
+/// (core/kernel/docs/capability-internals.md § Free Slot Tracking).
+pub(crate) fn extend_slot_run_or_fatal(base: &mut u32, count: u32, slot: u32, msg: &'static str)
+{
+    if !extends_slot_run(*base, count, slot)
+    {
+        #[cfg(not(test))]
+        {
+            crate::kprintln!(
+                "{}: slot {} where the run expected {}",
+                msg,
+                slot,
+                base.saturating_add(count)
+            );
+            crate::fatal(msg);
+        }
+        #[cfg(test)]
+        panic!(
+            "{msg}: slot {slot} where the run expected {}",
+            *base + count
+        );
+    }
+    if count == 0
+    {
+        *base = slot;
+    }
+}
+
 /// Insert a capability, calling [`crate::fatal`] on error.
 ///
 /// The tag is derived from the typed rights argument, so a mint site cannot
@@ -2402,6 +2451,49 @@ fn insert_or_fatal<K: slot::CapKind>(
 mod tests
 {
     use super::*;
+
+    // ── published slot runs ───────────────────────────────────────────────────
+
+    #[test]
+    fn slot_run_accepts_any_first_slot_then_only_the_next()
+    {
+        assert!(extends_slot_run(0, 0, 77));
+        assert!(extends_slot_run(77, 1, 78));
+        assert!(extends_slot_run(77, 5, 82));
+    }
+
+    #[test]
+    fn slot_run_rejects_a_gap_a_repeat_and_an_overflow()
+    {
+        assert!(
+            !extends_slot_run(77, 5, 83),
+            "a skipped slot breaks the run"
+        );
+        assert!(
+            !extends_slot_run(77, 5, 81),
+            "a repeated slot breaks the run"
+        );
+        assert!(
+            !extends_slot_run(u32::MAX, 1, 0),
+            "a wrapped base + count breaks the run"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not in consecutive slots")]
+    fn extending_a_run_past_a_gap_is_fatal()
+    {
+        let mut base = 10;
+        extend_slot_run_or_fatal(&mut base, 3, 14, "runs: not in consecutive slots");
+    }
+
+    #[test]
+    fn extending_an_empty_run_sets_its_base()
+    {
+        let mut base = 0;
+        extend_slot_run_or_fatal(&mut base, 0, 42, "runs: not in consecutive slots");
+        assert_eq!(base, 42);
+    }
 
     // ── split_around_span (reclaim scrub) ─────────────────────────────────────
 

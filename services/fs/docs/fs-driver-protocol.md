@@ -76,9 +76,11 @@ its block device endpoint and reply success or a typed error.
 **Reply (error)**: `label = ipc::fs_errors::*`:
 `LABEL_VERSION_MISMATCH` when `data[0]` differs from the driver's
 `FS_LABELS_VERSION` (checked before the BPB is read), else e.g.
-`IO_ERROR`, or `NOT_FOUND` for a malformed BPB, one whose sector size
-is not 512 bytes (the only size the FAT driver reads), or one with fewer
-than 4085 clusters (FAT12, which the driver does not read).
+`IO_ERROR` (the block device's `BLK_GET_GEOMETRY` or the BPB read failed),
+or `NOT_FOUND` for a malformed BPB, one whose sector size is not the
+device's logical block size (the driver reads one block per sector, 512 to
+4096 bytes), or one with fewer than 4085 clusters (FAT12, which the driver
+does not read).
 
 The block device endpoint arrives in the driver's bootstrap round;
 see [Bootstrap caps](#bootstrap-caps).
@@ -390,7 +392,13 @@ the recorded release endpoint). The slot is per node and shared by
 every client of the file, so one client's `FS_CLOSE` revokes every
 client's outstanding pages on it (a defect, tracked in
 [#530](https://github.com/kottlerg/seraph/issues/530); see
-[`FS_READ_MEMORY`](#label-7-fs_read_memory)). The kernel-side cap is
+[`FS_READ_MEMORY`](#label-7-fs_read_memory)). It also drops the
+reference the cap's `NS_LOOKUP` (or `FS_CREATE` / `FS_MKDIR`) took on the
+node: the driver frees a node when every cap minted on it has been closed,
+and when `FS_REMOVE` or `FS_RENAME` unlinks its entry, and reuses the id
+under a new generation. A cap used after its `FS_CLOSE` (or one minted on
+another holder's lookup, once every holder has closed) is answered
+`INVALID_BADGE`, never with another node's content. The kernel-side cap is
 **not** freed here — the holder still `cap_delete`s its node cap to
 drop the kernel reference.
 

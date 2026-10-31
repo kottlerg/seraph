@@ -32,12 +32,16 @@ cmos/
 
 ## Endpoint
 
-Bootstrap caps from devmgr (one round, two caps, `done=true`):
+Bootstrap caps from devmgr (one round, two caps and one data word,
+`done=true`):
 
 | Slot      | Cap                                                  |
 |-----------|------------------------------------------------------|
 | `caps[0]` | Service-endpoint RECV (driver receives on this)      |
 | `caps[1]` | `IoPort` covering CMOS index/data ports `0x70`–`0x71` |
+
+`data[0]` is the CMOS RAM index of the century register, from the FADT's
+`CENTURY` field, or 0 when the FADT names none.
 
 The driver binds the `IoPort` cap to its main thread via
 `syscall::ioport_bind` and uses `in`/`out` to drive the CMOS access
@@ -78,11 +82,11 @@ binary, 0 = BCD) and 12-hour vs 24-hour mode (bit 1: 1 = 24-hour);
 the driver converts both representations to a canonical 24-hour
 binary value.
 
-Year is two-digit. The century register (`0x32`) is read; if it
-returns a sensible BCD century (`0x19`, `0x20`, `0x21`) it is used,
-otherwise the year is interpreted as `2000 + yy` (so seraph runs
-cleanly on QEMU CMOS, which leaves register `0x32` zero, through
-the year 2099).
+Year is two-digit. When the FADT names a century register, the driver
+reads the century from it and uses a value of 19 to 99, so the year does
+not wrap at 2100. With no century register named, or one reading no such
+value, the year is interpreted as `2000 + yy`, which holds through the year
+2099; a two-digit year carries no more.
 
 ---
 

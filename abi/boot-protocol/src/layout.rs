@@ -46,6 +46,13 @@ pub const DIRECT_MAP_BASE_ALIGN: u64 = 1024 * 1024 * 1024;
 /// Guard left between the top of the direct map and the kernel image base.
 pub const DIRECT_MAP_GUARD: u64 = DIRECT_MAP_BASE_ALIGN;
 
+/// Size of the stack the bootloader hands the kernel: page-aligned, and the
+/// stack the kernel's boot phases run on until `kernel_entry` rebases it into
+/// the direct map (core/boot/docs/kernel-handoff.md). The bootloader
+/// allocates exactly this many bytes; the kernel's Phase 3 identity window
+/// over the stack is derived from it.
+pub const HANDOFF_STACK_BYTES: usize = 64 * 1024;
+
 /// Choose a 2 MiB-aligned KASLR image slide from a raw entropy word.
 ///
 /// The image occupies `[KERNEL_LINK_BASE + slide, + slide + span]` inside

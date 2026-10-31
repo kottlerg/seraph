@@ -11,18 +11,10 @@
 
 use std::os::seraph::StartupInfo;
 
+use svcmgr_defs::RestartBudget;
 use svcmgr_endowment::{DecodeError, kind as endow_kind};
 
 use crate::definitions::reconcile::PendingRegistration;
-
-/// Maximum number of monitored services.
-pub const MAX_SERVICES: usize = 16;
-
-/// Maximum restarts over a service's lifetime; a death after the budget is
-/// spent leaves the service permanently down (see
-/// `services/svcmgr/docs/restart-protocol.md` § Decision tree).
-/// `restart_count` is never reset, so the budget has no window.
-pub const MAX_RESTARTS: u32 = 1;
 
 /// Restart policy: restart unconditionally on any exit.
 pub const POLICY_ALWAYS: u8 = 0;
@@ -39,10 +31,9 @@ pub const POLICY_NEVER: u8 = 2;
 /// A monitored service entry in svcmgr's service table.
 pub struct ServiceEntry
 {
-    /// Service name, packed into a fixed-size buffer.
-    pub name: [u8; 32],
-    /// Length of the service name in bytes.
-    pub name_len: u8,
+    /// Service name: its `.svc` file's stem, at most
+    /// `ipc::svcmgr_labels::NAME_MAX` bytes.
+    pub name: String,
     /// Capability slot for the service's thread.
     pub thread_cap: u32,
     /// Persistent service endpoint svcmgr created for a `provides = ...`
@@ -55,10 +46,9 @@ pub struct ServiceEntry
     /// VFS path used to respawn this service via svcmgr-side walk +
     /// `CREATE_FROM_FILE`. The sole restart source: every restartable
     /// service is reloaded from the filesystem.
-    pub vfs_path: [u8; ipc::MAX_PATH_LEN],
-    /// Length of `vfs_path` in bytes. Zero only for an empty slot: every
-    /// reconciled entry carries its recipe's `binary` path.
-    pub vfs_path_len: u8,
+    /// At most `ipc::MAX_PATH_LEN` bytes. Empty only for an empty slot:
+    /// every reconciled entry carries its recipe's `binary` path.
+    pub vfs_path: String,
     /// Restart policy (`POLICY_ALWAYS`, `POLICY_ON_FAILURE`, etc.).
     pub restart_policy: u8,
     /// Whether the system is viable without this service once it is
@@ -66,9 +56,12 @@ pub struct ServiceEntry
     /// unrecoverable death; `false` → the system continues degraded.
     /// Orthogonal to `restart_policy`, which alone decides respawn.
     pub system_critical: bool,
-    /// Number of successful restarts over the service's lifetime; never
-    /// reset.
+    /// Number of successful restarts over the service's lifetime, for the
+    /// restart log line; the budget is [`Self::restart_budget`].
     pub restart_count: u32,
+    /// Windowed restart budget: whether a death may restart the service
+    /// (`services/svcmgr/docs/restart-protocol.md` § Decision tree).
+    pub restart_budget: RestartBudget,
     /// Whether this service is currently active.
     pub active: bool,
     /// Per-child badge used on the svcmgr bootstrap endpoint for restart
@@ -89,11 +82,10 @@ pub struct ServiceEntry
     /// svcmgr re-applies this shape on every restart so attenuation
     /// survives a crash cycle.
     pub ns_policy_kind: u8,
-    /// Length of `ns_subtree_path` in bytes (0 for non-`Subtree`).
-    pub ns_subtree_path_len: u8,
     /// Subtree path svcmgr walks against its own root for
-    /// `NS_POLICY_SUBTREE`.
-    pub ns_subtree_path: [u8; ipc::MAX_PATH_LEN],
+    /// `NS_POLICY_SUBTREE`, at most `ipc::MAX_PATH_LEN` bytes; empty for
+    /// the other policies.
+    pub ns_subtree_path: String,
     /// Rights mask svcmgr requests per hop when walking
     /// `ns_subtree_path`. Only the low 24 bits are meaningful per
     /// `namespace-protocol`.
@@ -106,15 +98,14 @@ impl ServiceEntry
     pub const fn empty() -> Self
     {
         Self {
-            name: [0; 32],
-            name_len: 0,
+            name: String::new(),
             thread_cap: 0,
             provided_endpoint: 0,
-            vfs_path: [0; ipc::MAX_PATH_LEN],
-            vfs_path_len: 0,
+            vfs_path: String::new(),
             restart_policy: 0,
             system_critical: false,
             restart_count: 0,
+            restart_budget: RestartBudget::new(),
             active: false,
             bootstrap_badge: 0,
             process_handle: 0,
@@ -125,21 +116,20 @@ impl ServiceEntry
             // field. Universal would silently grant the most permissive
             // cap on a programmer error.
             ns_policy_kind: ipc::svcmgr_labels::NS_POLICY_NONE,
-            ns_subtree_path_len: 0,
-            ns_subtree_path: [0; ipc::MAX_PATH_LEN],
+            ns_subtree_path: String::new(),
             ns_subtree_rights: 0,
         }
     }
 
-    /// Return the service name as a UTF-8 string slice.
+    /// Return the service name.
     pub fn name_str(&self) -> &str
     {
-        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("???")
+        &self.name
     }
 }
 
-/// Heap-backed launch surfaces that don't fit the fixed-size
-/// [`ServiceEntry`] record but must be replayed on every restart so a
+/// Heap-backed launch surfaces kept beside the [`ServiceEntry`] record that
+/// must be replayed on every restart so a
 /// respawned child comes back with the same argv/env/cwd/seed, log-sink
 /// flag, and scheduling fields it got on first launch. Held in a table on
 /// `SvcmgrState` index-aligned with `services[]` via the death correlator
@@ -218,8 +208,7 @@ pub struct SvcmgrCaps
 pub fn bootstrap_caps(
     info: &StartupInfo,
     ipc_buf: *mut u64,
-    pending: &mut [PendingRegistration],
-    pending_count: &mut usize,
+    pending: &mut Vec<PendingRegistration>,
 ) -> Option<SvcmgrCaps>
 {
     if info.creator_endpoint == 0
@@ -270,7 +259,7 @@ pub fn bootstrap_caps(
                     }
                 }
             }
-            endow_kind::SUBSTRATE => ingest_substrate(&round, pending, pending_count),
+            endow_kind::SUBSTRATE => ingest_substrate(&round, pending),
             endow_kind::LOGD_SOURCES =>
             {
                 // Terminal round (arrives after CAPS). Record the reserved
@@ -326,13 +315,9 @@ pub fn bootstrap_caps(
 }
 
 /// Park one substrate `(name, thread_cap)` round in `pending`. Releases the
-/// delivered thread cap on any reject (invalid name, full table) so a
+/// delivered thread cap on any reject (invalid name, heap exhausted) so a
 /// malformed round cannot leak a cap.
-fn ingest_substrate(
-    round: &ipc::bootstrap::BootstrapRound,
-    pending: &mut [PendingRegistration],
-    pending_count: &mut usize,
-)
+fn ingest_substrate(round: &ipc::bootstrap::BootstrapRound, pending: &mut Vec<PendingRegistration>)
 {
     if round.cap_count < 1
     {
@@ -347,39 +332,34 @@ fn ingest_substrate(
         let _ = syscall::cap_delete(cap);
     };
     let name_len = round.data[1] as usize;
-    if name_len == 0 || name_len > 32
+    let name = round
+        .data
+        .get(2..round.data_words)
+        .and_then(|words| ipc::svcmgr_labels::unpack_name(words, name_len))
+        .and_then(|bytes| {
+            core::str::from_utf8(&bytes[..name_len])
+                .ok()
+                .map(str::to_owned)
+        });
+    let Some(name) = name
+    else
     {
-        std::os::seraph::log!("bootstrap: substrate name_len invalid");
+        std::os::seraph::log!("bootstrap: substrate name invalid");
+        reject(thread_cap);
+        return;
+    };
+    if pending.try_reserve(1).is_err()
+    {
+        std::os::seraph::log!(
+            "bootstrap: no memory for a pending registration; dropping substrate"
+        );
         reject(thread_cap);
         return;
     }
-    if *pending_count >= pending.len()
-    {
-        std::os::seraph::log!("bootstrap: pending table full; dropping substrate");
-        reject(thread_cap);
-        return;
-    }
-    let mut name = [0u8; 32];
-    let words = name_len.div_ceil(8);
-    for w in 0..words
-    {
-        let word = round.data[2 + w];
-        for b in 0..8
-        {
-            let idx = w * 8 + b;
-            if idx < name_len && idx < name.len()
-            {
-                name[idx] = (word >> (b * 8)) as u8;
-            }
-        }
-    }
-    let idx = *pending_count;
-    pending[idx] = PendingRegistration {
+    std::os::seraph::log!("endowed: {name}");
+    pending.push(PendingRegistration {
         name,
-        name_len: name_len as u8,
         thread_cap,
         consumed: false,
-    };
-    *pending_count += 1;
-    std::os::seraph::log!("endowed: {}", pending[idx].name_str());
+    });
 }

@@ -5,23 +5,23 @@
 
 //! Open file table for the FAT driver.
 //!
-//! Tracks open files by badge value (assigned via `cap_derive_badge`).
-//! Each open file carries a fixed-capacity table of outstanding cache
-//! pages handed out via `FS_READ_MEMORY`; each entry holds the cookie the
+//! Tracks open files by badge value (assigned via `cap_derive_badge`) in a
+//! table that grows with the files read through `FS_READ_MEMORY` and reuses
+//! a closed file's slot. Each open file carries a table of outstanding cache
+//! pages handed out via `FS_READ_MEMORY`, grown on demand up to
+//! [`MAX_OUTSTANDING`]; each entry holds the cookie the
 //! client uses to reference the page, the cache slot the page lives in
 //! (so the slot's refcount can be decremented on release), and an
 //! ancestor cap interposed between the slot's parent cap and the
 //! caller-side child cap so per-cookie revocation is possible.
 
-/// Maximum number of simultaneously open files.
-pub const MAX_OPEN_FILES: usize = 8;
-
-/// Maximum outstanding `FS_READ_MEMORY` pages per open file.
-///
-/// The per-call ancestor caps live in the fs's `CSpace` until released
-/// or close. 16 leaves headroom over typical sequential read patterns
-/// without putting `CSpace` pressure on the fs process.
-pub const MAX_OUTSTANDING: usize = 16;
+/// Maximum outstanding `FS_READ_MEMORY` pages per open file: the cache's
+/// slot count. Each outstanding page holds a cache slot, so one file cannot
+/// usefully hold more pages than the cache has slots, and the bound scales
+/// with the cache. The per-call ancestor caps live in the fs's `CSpace`
+/// until released or close; the table grows only with the pages a client
+/// holds.
+pub const MAX_OUTSTANDING: usize = crate::cache::SLOT_COUNT;
 
 /// One outstanding page handed to a client via `FS_READ_MEMORY`.
 #[derive(Clone, Copy)]
@@ -58,7 +58,9 @@ pub struct OpenFile
     /// `FatNode.open_slot` on the cap-native path, so this badge does
     /// not appear on the wire.
     pub badge: u64,
-    pub outstanding: [Option<OutstandingPage>; MAX_OUTSTANDING],
+    /// Outstanding pages; a `None` entry is a free one, reused before the
+    /// table grows.
+    pub outstanding: Vec<Option<OutstandingPage>>,
     /// SEND cap on a client's release endpoint, recorded from `caps[0]`
     /// of the first `FS_READ_MEMORY` reaching this slot that carries one
     /// (services/fs/docs/fs-driver-protocol.md § Label 7); the eviction
@@ -76,35 +78,46 @@ impl OpenFile
     {
         Self {
             badge: 0,
-            outstanding: [None; MAX_OUTSTANDING],
+            outstanding: Vec::new(),
             release_endpoint_cap: 0,
         }
     }
 
-    /// Insert `entry` into a free outstanding slot. Returns `false` if
-    /// the table is full.
+    /// Insert `entry` into a free outstanding slot, growing the table while
+    /// it holds fewer than [`MAX_OUTSTANDING`]. Returns `false` when the
+    /// file already holds that many pages, or the table cannot grow.
     pub fn track_outstanding(&mut self, entry: OutstandingPage) -> bool
     {
-        for slot in &mut self.outstanding
+        if let Some(slot) = self.outstanding.iter_mut().find(|s| s.is_none())
         {
-            if slot.is_none()
-            {
-                *slot = Some(entry);
-                return true;
-            }
+            *slot = Some(entry);
+            return true;
         }
-        false
+        if self.outstanding.len() >= MAX_OUTSTANDING || self.outstanding.try_reserve(1).is_err()
+        {
+            return false;
+        }
+        self.outstanding.push(Some(entry));
+        true
     }
 }
 
 /// Find the file table index for a given badge.
-pub fn find_by_badge(files: &[OpenFile; MAX_OPEN_FILES], badge: u64) -> Option<usize>
+pub fn find_by_badge(files: &[OpenFile], badge: u64) -> Option<usize>
 {
     files.iter().position(|f| f.badge == badge)
 }
 
-/// Allocate a free slot, returning its index.
-pub fn alloc_slot(files: &[OpenFile; MAX_OPEN_FILES]) -> Option<usize>
+/// Allocate a free slot, reusing a closed file's before the table grows,
+/// and return its index; `None` when the table cannot grow. The table holds
+/// at most one slot per live node (`FatNode.open_slot`).
+pub fn alloc_slot(files: &mut Vec<OpenFile>) -> Option<usize>
 {
-    files.iter().position(|f| f.badge == 0)
+    if let Some(idx) = files.iter().position(|f| f.badge == 0)
+    {
+        return Some(idx);
+    }
+    files.try_reserve(1).ok()?;
+    files.push(OpenFile::empty());
+    Some(files.len() - 1)
 }

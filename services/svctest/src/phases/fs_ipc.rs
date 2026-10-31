@@ -106,6 +106,10 @@ pub fn phases_pre_relative() -> &'static [Phase]
             name: "fs_mapping_survives_slot_reuse",
             run: fs_mapping_survives_slot_reuse_phase,
         },
+        Phase {
+            name: "fs_closed_node_id_stays_dead",
+            run: fs_closed_node_id_stays_dead_phase,
+        },
     ]
 }
 
@@ -188,6 +192,59 @@ pub fn fs_release_on_close_phase(_: &Caps)
     }
 
     std::os::seraph::log!("fs_release_on_close phase passed (8 cycles)");
+}
+
+/// A node cap used after its `FS_CLOSE` never reaches the node that reuses
+/// its id. fatfs frees a node when the last cap minted on it is closed and
+/// reuses the freed index for the next new node, under a new generation: the
+/// closed cap of file A, used once file B has taken A's index (the free list
+/// hands back the most recently freed index first), must be refused rather
+/// than read B. Without the generation, A's badge would name B's node and the
+/// read would return B's bytes.
+pub fn fs_closed_node_id_stays_dead_phase(_: &Caps)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let svctest = svctest_dir_cap(ipc_buf);
+    let (name_a, name_b): (&[u8], &[u8]) = (b"epocha.bin", b"epochb.bin");
+    let _ = fs_remove(svctest, name_a, ipc_buf);
+    let _ = fs_remove(svctest, name_b, ipc_buf);
+
+    let (cap_a, _) = fs_create(svctest, name_a, ipc_buf).expect("FS_CREATE epocha failed");
+    fs_write_inline(cap_a, 0, b"AAAA", ipc_buf).expect("FS_WRITE epocha failed");
+    let close = ipc::IpcMessage::new(ipc::fs_labels::FS_CLOSE);
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(cap_a, &close, ipc_buf) }.expect("FS_CLOSE ipc_call");
+    assert_eq!(reply.label, ipc::fs_errors::SUCCESS, "FS_CLOSE epocha");
+
+    let (cap_b, _) = fs_create(svctest, name_b, ipc_buf).expect("FS_CREATE epochb failed");
+    fs_write_inline(cap_b, 0, b"BBBB", ipc_buf).expect("FS_WRITE epochb failed");
+
+    assert_eq!(
+        fs_read_bytes(cap_a, 0, 4, ipc_buf),
+        Err(ipc::fs_errors::INVALID_BADGE),
+        "a closed node cap read another node's content"
+    );
+    assert_eq!(
+        fs_read_bytes(cap_b, 0, 4, ipc_buf).expect("FS_READ epochb"),
+        b"BBBB",
+        "the node that reused the id"
+    );
+    // The file itself is intact: a fresh lookup reaches A's bytes.
+    let (again, _kind, _size) = ns_lookup(svctest, name_a, 0xFFFF, ipc_buf).expect("NS_LOOKUP");
+    assert_eq!(
+        fs_read_bytes(again, 0, 4, ipc_buf).expect("FS_READ epocha"),
+        b"AAAA",
+        "a fresh lookup of the closed file"
+    );
+
+    for cap in [cap_a, cap_b, again]
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    fs_remove(svctest, name_a, ipc_buf).expect("cleanup epocha");
+    fs_remove(svctest, name_b, ipc_buf).expect("cleanup epochb");
+    let _ = syscall::cap_delete(svctest);
+    std::os::seraph::log!("fs_closed_node_id_stays_dead phase passed");
 }
 
 pub fn fs_crossover_bench_phase(_: &Caps)

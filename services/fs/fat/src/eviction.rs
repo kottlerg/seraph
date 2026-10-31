@@ -40,8 +40,15 @@
 //! client eventually replies (or forever, if the client never
 //! does); a dedicated channel-state field ensures the late reply
 //! is silently discarded rather than racing the parent's cleanup.
+//! At most [`MAX_WATCHDOGS`] watchdog threads exist at once: while that
+//! many are still blocked on clients that have not replied, a release
+//! sends nothing and goes straight to the revoke, so a client that never
+//! replies costs the fs a bounded number of threads rather than one per
+//! timeout. Releasing the blocked calls themselves needs an IPC
+//! cancellation the kernel does not offer (#31).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -49,7 +56,7 @@ use std::time::Duration;
 use ipc::{IpcMessage, fs_labels};
 
 use crate::cache::PageCache;
-use crate::file::{MAX_OPEN_FILES, MAX_OUTSTANDING, OpenFile, find_by_badge};
+use crate::file::{OpenFile, find_by_badge};
 
 /// Cooperative release watchdog: how long the worker waits for the
 /// client's reply before revoking the ancestor cap anyway. The worker
@@ -57,11 +64,14 @@ use crate::file::{MAX_OPEN_FILES, MAX_OUTSTANDING, OpenFile, find_by_badge};
 /// client unmapped in time.
 pub const RELEASE_TIMEOUT_MS: u64 = 100;
 
-/// Hard upper bound on queued eviction requests. At
-/// `MAX_OPEN_FILES * MAX_OUTSTANDING` every outstanding page across
-/// the entire fs could be in-flight at once; the cache slot count
-/// matches, so the queue cannot overflow under correct accounting.
-const MAX_PENDING_EVICTIONS: usize = MAX_OPEN_FILES * MAX_OUTSTANDING;
+/// Most cooperative-release watchdog threads alive at once (module docs).
+/// A tuning value that bounds no capacity: past it a release skips the
+/// cooperative round trip, which is advisory, and revokes at once.
+pub const MAX_WATCHDOGS: usize = 4;
+
+/// Watchdog threads alive now: incremented before a spawn, decremented when
+/// the thread's `ipc_call` returns.
+static LIVE_WATCHDOGS: AtomicUsize = AtomicUsize::new(0);
 
 /// One queued eviction: the outstanding page as it stood when queued.
 /// The worker checks it against the open-file table before the
@@ -96,22 +106,22 @@ impl EvictionState
     pub fn new() -> Self
     {
         Self {
-            queue: Mutex::new(VecDeque::with_capacity(MAX_PENDING_EVICTIONS)),
+            queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
         }
     }
 
     /// Submit `req` to the eviction worker. Wakes the worker.
     ///
-    /// On overflow the request is dropped — the queue is sized so
-    /// `MAX_PENDING_EVICTIONS` covers every outstanding page across
-    /// the fs under correct accounting, so a full queue here means
-    /// the per-slot refcount has gone wrong. Log the dropped
-    /// request so the invariant violation is observable.
+    /// The queue holds at most one request per outstanding page: the main
+    /// thread marks a page queued before it enqueues it and never queues it
+    /// again, so the queue is bounded by the pages clients hold, not by a
+    /// constant. A request the heap cannot hold is dropped and logged; its
+    /// page stays outstanding until the client releases it or closes.
     pub fn enqueue(&self, req: EvictReq)
     {
         let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-        if q.len() < MAX_PENDING_EVICTIONS
+        if q.try_reserve(1).is_ok()
         {
             q.push_back(req);
             self.cv.notify_one();
@@ -119,11 +129,10 @@ impl EvictionState
         else
         {
             std::os::seraph::log!(
-                "eviction enqueue overflow: dropped req (badge={}, cookie={}, slot={}, qlen={})",
+                "eviction enqueue: no memory; dropped req (badge={}, cookie={}, slot={})",
                 req.file_badge,
                 req.cookie,
-                req.slot_idx,
-                q.len()
+                req.slot_idx
             );
         }
     }
@@ -136,7 +145,7 @@ impl EvictionState
 /// stay alive for the lifetime of the fs process.
 pub fn worker_loop(
     state: &EvictionState,
-    files: &Mutex<[OpenFile; MAX_OPEN_FILES]>,
+    files: &Mutex<Vec<OpenFile>>,
     cache: &'static PageCache,
 ) -> !
 {
@@ -197,6 +206,7 @@ fn log_outcome(req: &EvictReq, outcome: Release, owned: bool)
         Release::Refused(_) => "FS_RELEASE_MEMORY refused",
         Release::CallFailed => "FS_RELEASE_MEMORY call failed",
         Release::SpawnFailed => "release watchdog spawn failed; no FS_RELEASE_MEMORY sent",
+        Release::WatchdogsBusy => "release watchdogs all blocked; no FS_RELEASE_MEMORY sent",
         Release::TimedOut => "FS_RELEASE_MEMORY timeout",
     };
     let label = if let Release::Refused(l) = outcome
@@ -239,6 +249,9 @@ enum Release
     TimedOut,
     /// The watchdog thread could not be spawned, so nothing was sent.
     SpawnFailed,
+    /// [`MAX_WATCHDOGS`] watchdog threads are still blocked on clients that
+    /// have not replied, so nothing was sent.
+    WatchdogsBusy,
     /// The client delivered no release endpoint, so none was sent.
     NoEndpoint,
     /// The worker could not derive its copy of the client's release SEND,
@@ -255,11 +268,22 @@ enum Release
 /// `Condvar::wait_timeout`. On timeout the orphaned child is
 /// left blocked in `ipc_call`; if the client eventually replies
 /// the child observes the channel state already set and discards
-/// its own write. A truly hung client leaks the child thread,
-/// which is the documented cost of cooperative release without
-/// a kernel-side IPC-cancellation primitive.
+/// its own write. A truly hung client keeps the child thread blocked,
+/// the cost of cooperative release without a kernel-side
+/// IPC-cancellation primitive; [`MAX_WATCHDOGS`] bounds how many such
+/// threads exist, and past it nothing is sent.
 fn cooperative_release(endpoint: u32, cookie: u64) -> Release
 {
+    let reserved = LIVE_WATCHDOGS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < MAX_WATCHDOGS).then_some(n + 1)
+        })
+        .is_ok();
+    if !reserved
+    {
+        let _ = syscall::cap_delete(endpoint);
+        return Release::WatchdogsBusy;
+    }
     let chan: Arc<(Mutex<Option<Release>>, Condvar)> = Arc::new((Mutex::new(None), Condvar::new()));
     let chan_child = chan.clone();
     let ep = endpoint;
@@ -275,6 +299,7 @@ fn cooperative_release(endpoint: u32, cookie: u64) -> Release
             // thread (set in `std::thread`'s entry trampoline).
             let result = unsafe { ipc::ipc_call(ep, &msg, ipc_buf) };
             let _ = syscall::cap_delete(ep);
+            LIVE_WATCHDOGS.fetch_sub(1, Ordering::AcqRel);
             let outcome = match result
             {
                 Ok(reply) if reply.label == fs_labels::FS_RELEASE_ACK => Release::Acked,
@@ -291,6 +316,7 @@ fn cooperative_release(endpoint: u32, cookie: u64) -> Release
         });
     if spawned.is_err()
     {
+        LIVE_WATCHDOGS.fetch_sub(1, Ordering::AcqRel);
         let _ = syscall::cap_delete(ep);
         return Release::SpawnFailed;
     }
@@ -335,10 +361,7 @@ enum Endpoint
 /// so an `FS_CLOSE` that deletes the slot's SEND meanwhile cannot free or
 /// reuse the slot the worker calls on. `None` means the page was already
 /// cleaned up.
-fn live_release_endpoint(
-    files: &Mutex<[OpenFile; MAX_OPEN_FILES]>,
-    req: &EvictReq,
-) -> Option<Endpoint>
+fn live_release_endpoint(files: &Mutex<Vec<OpenFile>>, req: &EvictReq) -> Option<Endpoint>
 {
     let files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
     let file = &files_g[find_by_badge(&files_g, req.file_badge)?];
@@ -364,7 +387,7 @@ fn live_release_endpoint(
 /// whether the entry was still there (same file, cookie, cache slot, and
 /// ancestor cap), in which case the caller owns its cleanup; `false` means
 /// another path already cleaned it up.
-fn take_outstanding(files: &Mutex<[OpenFile; MAX_OPEN_FILES]>, req: &EvictReq) -> bool
+fn take_outstanding(files: &Mutex<Vec<OpenFile>>, req: &EvictReq) -> bool
 {
     let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(idx) = find_by_badge(&files_g, req.file_badge)

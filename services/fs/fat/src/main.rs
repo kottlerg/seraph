@@ -51,7 +51,7 @@ use dir::{
 };
 use eviction::{EvictReq, EvictionState};
 use fat::{chain_next, next_cluster, read_file_data};
-use file::{MAX_OPEN_FILES, OpenFile, OutstandingPage};
+use file::{OpenFile, OutstandingPage};
 use ipc::{IpcMessage, fs_labels, ns_labels};
 use namespace_protocol::{GateError, NamespaceRights, NodeId, NodeKind, gate, pack as pack_badge};
 use syscall_abi::{MSG_DATA_WORDS_MAX, PAGE_SIZE, RIGHTS_MEM_MAP};
@@ -123,16 +123,7 @@ fn main() -> !
     let mut state = FatState::new();
     let mut nodes = NodeTable::new();
 
-    let files = Arc::new(Mutex::new([
-        OpenFile::empty(),
-        OpenFile::empty(),
-        OpenFile::empty(),
-        OpenFile::empty(),
-        OpenFile::empty(),
-        OpenFile::empty(),
-        OpenFile::empty(),
-        OpenFile::empty(),
-    ]));
+    let files = Arc::new(Mutex::new(Vec::new()));
 
     let eviction = Arc::new(EvictionState::new());
 
@@ -285,7 +276,7 @@ fn service_loop(
     caps: &FatCaps,
     state: &mut FatState,
     nodes: &mut NodeTable,
-    files: &Arc<Mutex<[OpenFile; MAX_OPEN_FILES]>>,
+    files: &Arc<Mutex<Vec<OpenFile>>>,
     cache: &'static PageCache,
     ipc_buf: *mut u64,
     eviction: &EvictionState,
@@ -430,6 +421,7 @@ fn service_loop(
             fs_labels::FS_REMOVE =>
             {
                 handle_remove_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+                release_orphaned_open_files(nodes, files, cache);
                 continue;
             }
             fs_labels::FS_MKDIR =>
@@ -449,6 +441,7 @@ fn service_loop(
             fs_labels::FS_RENAME =>
             {
                 handle_rename_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+                release_orphaned_open_files(nodes, files, cache);
                 continue;
             }
             fs_labels::FS_TRUNCATE =>
@@ -599,7 +592,7 @@ fn read_memory_at_slot(
     node: &backend::FatNode,
     idx: usize,
     state: &mut FatState,
-    files: &mut [OpenFile; MAX_OPEN_FILES],
+    files: &mut [OpenFile],
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
@@ -774,7 +767,7 @@ fn read_memory_at_slot(
 /// one page many times. `None` when every outstanding page is already
 /// queued, or none is outstanding (then `acquire_page` failure is a
 /// cache-state bug rather than client-held pressure).
-fn pick_eviction_candidate(files: &mut [OpenFile; MAX_OPEN_FILES]) -> Option<EvictReq>
+fn pick_eviction_candidate(files: &mut [OpenFile]) -> Option<EvictReq>
 {
     for file in files.iter_mut()
     {
@@ -813,7 +806,7 @@ fn handle_read_memory_node_cap(
     msg: &IpcMessage,
     state: &mut FatState,
     nodes: &mut NodeTable,
-    files: &mut [OpenFile; MAX_OPEN_FILES],
+    files: &mut Vec<OpenFile>,
     caps: &FatCaps,
     cache: &PageCache,
     ipc_buf: *mut u64,
@@ -847,10 +840,11 @@ fn handle_read_memory_node_cap(
         let badge = NEXT_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         files[slot_idx] = OpenFile {
             badge,
-            outstanding: [None; file::MAX_OUTSTANDING],
+            outstanding: Vec::new(),
             release_endpoint_cap: 0,
         };
-        // cast_possible_truncation: slot_idx < MAX_OPEN_FILES (8).
+        // cast_possible_truncation: the table holds at most one slot per
+        // live node, fewer than `node_slab::MAX_ENTRIES` (2^24).
         #[allow(clippy::cast_possible_truncation)]
         nodes.set_open_slot(node_id, slot_idx as u32);
         slot_idx
@@ -927,7 +921,7 @@ fn handle_release_memory_node_cap(
     node_id: NodeId,
     msg: &IpcMessage,
     nodes: &NodeTable,
-    files: &mut [OpenFile; MAX_OPEN_FILES],
+    files: &mut [OpenFile],
     cache: &PageCache,
     ipc_buf: *mut u64,
 )
@@ -956,14 +950,15 @@ fn handle_release_memory_node_cap(
 }
 
 /// `FS_CLOSE` against a node cap. Releases any [`OpenFile`] slot
-/// bound to the node (revoking outstanding pages, freeing the slot)
-/// and clears [`backend::FatNode::open_slot`] back to
-/// [`NO_OPEN_SLOT`]. The kernel-side cap reference is dropped by
-/// the caller's paired `cap_delete`.
+/// bound to the node (revoking outstanding pages, freeing the slot),
+/// clears [`backend::FatNode::open_slot`] back to [`NO_OPEN_SLOT`], and
+/// drops the reference the closed cap's lookup took on the node, which
+/// frees the node when it was the last ([`NodeTable`]). The kernel-side cap
+/// reference is dropped by the caller's paired `cap_delete`.
 fn handle_close_node_cap(
     node_id: NodeId,
     nodes: &mut NodeTable,
-    files: &mut [OpenFile; MAX_OPEN_FILES],
+    files: &mut [OpenFile],
     cache: &PageCache,
     ipc_buf: *mut u64,
 )
@@ -971,26 +966,58 @@ fn handle_close_node_cap(
     if let Some(node) = nodes.get(node_id)
         && node.open_slot != NO_OPEN_SLOT
     {
-        let idx = node.open_slot as usize;
-        for entry in files[idx].outstanding.iter().flatten()
-        {
-            let _ = syscall::cap_revoke_all(entry.ancestor_cap);
-            let _ = syscall::cap_delete(entry.ancestor_cap);
-            cache.release_slot(entry.slot_idx);
-        }
-        // Drop the release SEND recorded on the slot; leaving it in our
-        // CSpace would accumulate a stale SEND per opened file across the
-        // fs's lifetime.
-        if files[idx].release_endpoint_cap != 0
-        {
-            let _ = syscall::cap_delete(files[idx].release_endpoint_cap);
-        }
-        files[idx] = OpenFile::empty();
+        release_open_file(files, node.open_slot, cache);
         nodes.set_open_slot(node_id, NO_OPEN_SLOT);
     }
+    let _ = nodes.release(node_id);
     let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Release open-file slot `slot`: revoke and drop each outstanding page,
+/// delete the recorded release SEND (leaving it in the `CSpace` would
+/// accumulate a stale SEND per opened file across the fs's lifetime), and
+/// free the slot for reuse.
+fn release_open_file(files: &mut [OpenFile], slot: u32, cache: &PageCache)
+{
+    let Some(file) = files.get_mut(slot as usize)
+    else
+    {
+        return;
+    };
+    for entry in file.outstanding.iter().flatten()
+    {
+        let _ = syscall::cap_revoke_all(entry.ancestor_cap);
+        let _ = syscall::cap_delete(entry.ancestor_cap);
+        cache.release_slot(entry.slot_idx);
+    }
+    if file.release_endpoint_cap != 0
+    {
+        let _ = syscall::cap_delete(file.release_endpoint_cap);
+    }
+    *file = OpenFile::empty();
+}
+
+/// Release the open-file slots of nodes an `FS_REMOVE` or `FS_RENAME` freed
+/// ([`NodeTable::take_orphaned_open_slots`]), under the open-file lock the
+/// eviction worker shares.
+fn release_orphaned_open_files(
+    nodes: &mut NodeTable,
+    files: &Mutex<Vec<OpenFile>>,
+    cache: &PageCache,
+)
+{
+    let orphaned = nodes.take_orphaned_open_slots();
+    if orphaned.is_empty()
+    {
+        return;
+    }
+    let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
+    for slot in orphaned
+    {
+        release_open_file(&mut files_g, slot, cache);
+    }
 }
 
 // ── Write / mutation handlers ──────────────────────────────────────────────

@@ -9,15 +9,22 @@
 //! (8.3 short names, long-file-name runs, case-insensitive matching) from raw
 //! sector bytes, locates every slot an entry occupies for its removal
 //! ([`RemoveRunScan`]), finds a run of free slots for a new entry
-//! ([`FreeRunScan`]), and bounds cluster numbers to the data region
-//! ([`is_data_cluster`]). This crate performs no I/O and holds no filesystem
-//! state: the `fatfs` service reads sectors over a block-device IPC, hands the
-//! bytes here, and keeps the geometry/cache/mutation engine on its side.
+//! ([`FreeRunScan`]), bounds cluster numbers to the data region
+//! ([`is_data_cluster`]), encodes long names ([`encode_lfn`]), picks
+//! short-name numeric tails ([`TailSet`]), and keeps the node table's
+//! recycling identifiers ([`node_slab::NodeSlab`]). This crate performs no
+//! I/O and holds no filesystem state: the `fatfs` service reads sectors over
+//! a block-device IPC, hands the bytes here, and keeps the
+//! geometry/cache/mutation engine on its side.
 //! Keeping the parse of untrusted on-disk structures pure and host-testable is
 //! the point — see
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+pub mod node_slab;
 
 // ── BIOS Parameter Block ────────────────────────────────────────────────────
 
